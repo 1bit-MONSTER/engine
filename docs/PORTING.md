@@ -16,25 +16,33 @@ limitations under the License.
 -->
 # Porting map
 
-Where each component comes from in [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER),
-and what has to be true before it lands here. Refs are branches or commits in that repo.
+This repository is the working 1bit-MONSTER engine, ported without its history.
+Each step below is one PR that builds and runs on Strix Halo before the next one starts.
 
-| Component | Source | State at source | Gate to land here |
+| Step | Component | Source in 1bit-MONSTER | Done when |
 |---|---|---|---|
-| CPU reference | `src/gguf_reader.cpp`, `src/tokenizer.cpp`, `tools/qwen36_full_ref.py` | **landed** (qwen3; docs/cpu-reference.md). Tokenizer **landed** (docs/tokenizer.md) | matches HF transformers fp32 logits on Qwen3-0.6B |
-| Arch registry | `src/model_registry.cpp` + `Testing/census_*.json` | 569 tokens map 2,030 HF arch strings (mapping only) | data file + separate verified list |
-| NPU backend | `engine/npu/src/npu_engine_universal.cpp` (`I8Ctx::init_elf`) | ELF-native, matches its own baseline | golden test vs CPU reference |
-| NPU ELF dispatch table | branch `backup/iso-build-elf-native-2026-09-22` (`kElfDesigns`) | ELF and xclbin modes match token for token; 0 xclbin opens | same, in this engine |
-| NPU 16-tile layer kernel | branch `bench/fastlane-16tile-corrections-2026-09-22` (435bf36e7) | 24/24 tokens, summed KL 0.000466, 0.340 ms/layer | rebuild from source, reproduce |
-| GPU backend | AMD-Ecosystem/llama.cpp fork, `GGML_VULKAN` + `GGML_HRX2`; recipe on `fix/zaya-lmhead-evidence` | Vulkan0 74.8 tok/s, HRX20 18.4 on zaya1-8b; Q4NX is HRX20-only | pinned submodule, linked (no dlopen of copied structs) |
-| Router | `src/model_router.cpp` (Q4NX rule) + Laya scorer, branch `backup/laya-and-results-2026-09-22` | Laya not yet checked against its Python reference | Laya matches its Python reference within a stated tolerance |
-| Server | `src/server/` | works | llama-server flag and endpoint compatibility test |
-| Lemonade recipe | lemonade `src/cpp/include/lemon/backends/*` pattern | n/a | loads Qwen3-0.6B through a local Lemonade build |
+| 1 | **Embedded Lemonade.** Lemonade's server core runs inside the `1bit` binary, with the `onebit` backend added | `third_party/lemonade` (v11.9.0 plus local deltas, see its `UPSTREAM.md`); `tools/unified_server.cpp` `run_embedded_lemonade` | `1bit lemonade` starts and serves `/v1/models` |
+| 2 | **HRX with Vulkan.** The AMD-Ecosystem llama.cpp fork built with `GGML_HRX2=ON` and `GGML_VULKAN=ON` in one build | fork build recipe from `fix/zaya-lmhead-evidence` (67503a794); `src/backend_hrx.cpp` | Lemonade loads a GGUF on `Vulkan0` and a Q4NX on `HRX20` |
+| 3 | **NPU engine.** Full ELFs only, and the open 16-tile layer kernel built from source | `engine/npu` (`npu_engine_universal.cpp`, `I8Ctx::init_elf`); ELF dispatch table on `backup/iso-build-elf-native-2026-09-22`; kernel on `bench/fastlane-16tile-corrections-2026-09-22` | Lemonade loads Qwen3-0.6B on the NPU through `onebit` |
+| 4 | **Laya router.** A non-autoregressive scorer that picks where each request runs | `src/laya_scorer.cpp`, `include/laya_scorer.h` on `backup/laya-and-results-2026-09-22`; model at `~/models/laya` | matches its Python reference; routes requests |
 
-Known traps carried over:
+## How the pieces fit
 
-- NPU concurrency: one device; each engine instance uses 4 hw contexts; throughput
-  peaks at about 4 concurrent instances.
-- Q4NX containers have separate formats per family (unsigned q4_1 for Qwen3;
-  additive `w = q*scale + min` for the 35B MoE experts). Verify against a reference, never by eye.
-- The NPU model containers currently live in `~/.config/flm/models/*-NPU2` on the dev box.
+```
+1bit lemonade  ──  Lemonade server core (in-process)
+                     ├─ llamacpp-hrx recipe ──> HRX build: llama.cpp + ggml-hrx + ggml-vulkan
+                     │                            devices HRX20 and Vulkan0
+                     ├─ onebit recipe ────────> 1bit unified -m <artifact>  ──> NPU engine (full ELFs)
+                     └─ Laya ─────────────────> scores each request: which model and device
+```
+
+## Known facts carried over
+
+- **Vulkan is not inside HRX.** One build compiles both ggml backends.
+  - On zaya1-8b, `Vulkan0` decodes at 74.8 tok/s and `HRX20` at 18.4, because
+    HRX2 falls back to the CPU for 2,088 ops.
+  - Q4NX loads only on `HRX20`.
+- **NPU concurrency:**
+  - There is one device, and each engine instance uses 4 hardware contexts.
+  - Throughput peaks at about 4 concurrent instances.
+- **Where the NPU model containers live:** they are currently in `~/.config/flm/models/*-NPU2` on the dev box.

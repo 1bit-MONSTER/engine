@@ -21,7 +21,9 @@ add_library(onebit_core STATIC
     engine/core/gguf.cpp
     engine/core/dequant.cpp
     engine/core/model_config.cpp
-    engine/core/parallel.cpp)
+    engine/core/parallel.cpp
+    engine/core/unicode.cpp
+    engine/core/tokenizer.cpp)
 target_include_directories(onebit_core PUBLIC engine/core)
 find_package(Threads REQUIRED)
 target_link_libraries(onebit_core PUBLIC Threads::Threads)
@@ -31,7 +33,7 @@ target_include_directories(onebit_cpu PUBLIC engine/backends/cpu)
 target_link_libraries(onebit_cpu PUBLIC onebit_core)
 
 # Unit tests: synthetic data only, so they run anywhere (including CI).
-foreach(t test_gguf test_dequant)
+foreach(t test_gguf test_dequant test_unicode)
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE tests)
     target_link_libraries(${t} PRIVATE onebit_core)
@@ -49,3 +51,12 @@ set(ENGINE_GOLDEN_DIR "" CACHE PATH "Golden logits directory for the golden test
 if(ENGINE_GOLDEN_MODEL AND ENGINE_GOLDEN_DIR)
     add_test(NAME golden_cpu COMMAND golden_cpu ${ENGINE_GOLDEN_MODEL} ${ENGINE_GOLDEN_DIR})
 endif()
+
+# Tokenizer golden test: encode/decode/pre-token split against HF tokenizers.
+# Runs everywhere: the vocab-only GGUF and the cases are committed
+# (tools/golden/make_tokenizer_golden.py, docs/tokenizer.md).
+add_executable(golden_tokenizer tests/golden_tokenizer.cpp)
+target_link_libraries(golden_tokenizer PRIVATE onebit_core)
+add_test(NAME golden_tokenizer_qwen3
+         COMMAND golden_tokenizer ${CMAKE_SOURCE_DIR}/tests/golden/qwen3-tokenizer/vocab.gguf
+                 ${CMAKE_SOURCE_DIR}/tests/golden/qwen3-tokenizer/cases.tsv)

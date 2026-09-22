@@ -1,0 +1,3 @@
+*.gguf binary
+engine/core/unicode_tables.inc linguist-generated=true
+tests/golden/**/cases.tsv linguist-generated=true

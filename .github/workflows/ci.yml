@@ -24,9 +24,11 @@ jobs:
       - uses: actions/checkout@v4
       - name: Copyright notice on every file
         run: python3 tools/copyright.py --check
+      - name: Install build dependencies
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev
       - name: Configure
-        run: cmake -B build -DENGINE_NPU=OFF -DENGINE_GPU=OFF
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build -j
+        run: cmake --build build --target onebit -j
       - name: Test
-        run: ctest --test-dir build --output-on-failure --no-tests=ignore
+        run: ctest --test-dir build --output-on-failure

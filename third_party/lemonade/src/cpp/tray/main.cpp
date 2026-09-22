@@ -1,0 +1,363 @@
+// Tray application entry point
+//
+// Windows (SUBSYSTEM:WINDOWS):
+//   Embeds lemon::Server on a background thread, then runs TrayUI.
+//   Output binary: LemonadeServer.exe
+//
+// macOS / Linux:
+//   Connects to an already-running lemond, then runs TrayUI.
+//   Output binary: lemonade-tray
+
+#include "lemon_tray/tray_ui.h"
+#include <lemon/single_instance.h>
+#include <lemon/utils/aixlog.hpp>
+#include <lemon/utils/url_utils.h>
+#include <lemon/version.h>
+
+#include <atomic>
+#include <chrono>
+#include <cstdlib>
+#include <iostream>
+#include <string>
+#include <thread>
+#include <CLI/CLI.hpp>
+#include <httplib.h>
+
+#ifdef _WIN32
+// Windows embeds the server
+#include <lemon/cli_parser.h>
+#include <lemon/config_file.h>
+#include <lemon/logging_config.h>
+#include <lemon/runtime_config.h>
+#include <lemon/server.h>
+#include <lemon/utils/json_utils.h>
+#include <lemon/utils/path_utils.h>
+#include <winsock2.h>
+#include <windows.h>
+
+// ---------------------------------------------------------------------------
+// Windows Job Object — ensures child processes (llama-server, etc.) are
+// automatically killed when LemonadeServer.exe exits for ANY reason
+// (graceful quit, crash, taskkill, installer uninstall).
+// ---------------------------------------------------------------------------
+static HANDLE g_job_object = nullptr;
+
+static void create_child_process_job() {
+    g_job_object = CreateJobObjectA(nullptr, nullptr);
+    if (!g_job_object) return;
+
+    JOBOBJECT_EXTENDED_LIMIT_INFORMATION jeli = {};
+    jeli.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+    SetInformationJobObject(g_job_object,
+                            JobObjectExtendedLimitInformation,
+                            &jeli, sizeof(jeli));
+
+    // Assign current process to the job.  All child processes created via
+    // CreateProcess will inherit the job (unless CREATE_BREAKAWAY_FROM_JOB
+    // is used, which our ProcessManager does not).  When the last handle to
+    // the job is closed (i.e. when this process exits), Windows terminates
+    // every remaining process in the job.
+    AssignProcessToJobObject(g_job_object, GetCurrentProcess());
+}
+#else
+#include <csignal>
+#include <unistd.h>
+#endif
+
+// ---------------------------------------------------------------------------
+// Helpers
+// ---------------------------------------------------------------------------
+
+static bool wait_for_server(const std::string& clean_host, int clean_port, bool is_ssl, int timeout_seconds) {
+    std::string connect_host;
+    if (is_ssl) {
+        connect_host = (clean_host.empty() || clean_host == "0.0.0.0")
+            ? "127.0.0.1" : clean_host;
+    } else {
+        connect_host = (clean_host.empty() || clean_host == "0.0.0.0" || clean_host == "localhost")
+            ? "127.0.0.1" : clean_host;
+    }
+
+    // Pass API key if set - prefer admin key over regular API key
+    const char* admin_api_key = std::getenv("LEMONADE_ADMIN_API_KEY");
+    const char* api_key = admin_api_key ? admin_api_key : std::getenv("LEMONADE_API_KEY");
+    httplib::Headers headers;
+    if (api_key && api_key[0]) {
+        headers.emplace("Authorization", std::string("Bearer ") + api_key);
+    }
+
+    for (int i = 0; i < timeout_seconds * 2; ++i) {
+        try {
+#ifndef LEMONADE_HTTPLIB_HAS_TLS
+            if (is_ssl) {
+                std::cerr << "HTTPS support is not compiled in this client." << std::endl;
+                return false;
+            }
+#endif
+            std::string format_host = lemon::utils::bracket_host_if_ipv6(connect_host);
+            std::string scheme = is_ssl ? "https" : "http";
+            std::string url = scheme + "://" + format_host + ":" + std::to_string(clean_port);
+            httplib::Client cli(url);
+#ifdef LEMONADE_HTTPLIB_HAS_TLS
+            const char* skip_verify = std::getenv("LEMONADE_SKIP_VERIFY");
+            if (skip_verify && std::string(skip_verify) == "1") {
+                cli.enable_server_certificate_verification(false);
+            }
+#endif
+            cli.set_connection_timeout(1);
+            cli.set_read_timeout(5);
+            // Use /api/v1/health instead of /live — /live responds before the model
+            // cache is built, which causes 500s on /models if clients connect too early.
+            auto res = cli.Get("/api/v1/health", headers);
+            if (res && res->status == 200) {
+                return true;
+            }
+        } catch (...) {}
+        std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    }
+    return false;
+}
+
+// ---------------------------------------------------------------------------
+// Windows entry point (SUBSYSTEM:WINDOWS — embedded server)
+// ---------------------------------------------------------------------------
+
+#ifdef _WIN32
+
+int WINAPI wWinMain(HINSTANCE, HINSTANCE, LPWSTR, int) {
+    // Create a job object so that all child processes (llama-server, etc.)
+    // are automatically killed when this process exits.
+    create_child_process_job();
+
+    // Single instance check — prevents running alongside lemond
+    if (lemon::SingleInstance::IsAnotherInstanceRunning("Router")) {
+        return 0;
+    }
+
+    // Convert wide command line to argc/argv for CLI11
+    int argc;
+    LPWSTR* argvW = CommandLineToArgvW(GetCommandLineW(), &argc);
+    std::vector<std::string> arg_strings(argc);
+    std::vector<char*> argv_ptrs(argc);
+    for (int i = 0; i < argc; ++i) {
+        int len = WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, nullptr, 0, NULL, NULL);
+        arg_strings[i].resize(len);
+        WideCharToMultiByte(CP_UTF8, 0, argvW[i], -1, &arg_strings[i][0], len, NULL, NULL);
+        if (!arg_strings[i].empty() && arg_strings[i].back() == '\0')
+            arg_strings[i].pop_back();
+        argv_ptrs[i] = &arg_strings[i][0];
+    }
+    LocalFree(argvW);
+
+    // Attach to the parent's console (if launched from a terminal) so that
+    // --help and --version print to the terminal the user typed in.
+    // Fails silently when launched from Start Menu / shortcut (no parent console).
+    if (AttachConsole(ATTACH_PARENT_PROCESS)) {
+        FILE* dummy;
+        freopen_s(&dummy, "CONOUT$", "w", stdout);
+        freopen_s(&dummy, "CONOUT$", "w", stderr);
+    }
+
+    // Parse CLI args. LemonadeServer.exe shares the server's CLIParser for
+    // --port, --host, --log-level, etc.  We add --silent here (tray-only flag
+    // used by the Windows startup shortcut to suppress the startup notification).
+    bool silent = false;
+    lemon::CLIParser parser;
+    parser.add_flag("--silent", silent, "Suppress startup notification");
+    parser.parse(argc, argv_ptrs.data());
+    if (!parser.should_continue()) {
+        return parser.get_exit_code();
+    }
+    auto cli_config = parser.get_config();
+
+    lemon::utils::set_cache_dir(cli_config.cache_dir);
+    lemon::utils::set_config_dir(cli_config.config_dir);
+    lemon::utils::migrate_legacy_json_files_to_config_dir(cli_config.cache_dir,
+                                                          cli_config.config_dir);
+
+    auto config_json = lemon::ConfigFile::load(cli_config.cache_dir,
+                                               cli_config.config_dir);
+
+    auto runtime_config = std::make_shared<lemon::RuntimeConfig>(config_json);
+    lemon::RuntimeConfig::set_global(runtime_config.get());
+
+    if (cli_config.port != -1) {
+        runtime_config->set_port_override(cli_config.port);
+    }
+    if (!cli_config.host.empty()) {
+        runtime_config->set_host_override(cli_config.host);
+    }
+    if (!cli_config.log_file.empty()) {
+        runtime_config->set_log_file_override(cli_config.log_file);
+    }
+    if (cli_config.log_max_file_size_mb != -1) {
+        runtime_config->set_log_max_file_size_mb_override(cli_config.log_max_file_size_mb);
+    }
+    if (cli_config.log_max_files != -1) {
+        runtime_config->set_log_max_files_override(cli_config.log_max_files);
+    }
+
+    lemon::utils::set_models_dir(runtime_config->models_dir());
+
+    // Initialize logging (file + log hub; SUBSYSTEM:WINDOWS has no console)
+    lemon::LogRotationConfig rot_cfg;
+    rot_cfg.file_mode = runtime_config->log_file();
+    rot_cfg.max_file_size_mb = runtime_config->log_max_file_size_mb();
+    rot_cfg.max_files = runtime_config->log_max_files();
+    lemon::configure_application_logging(
+        runtime_config->log_level(), lemon::LoggingMode::embedded_tray_server, rot_cfg);
+
+    // Initialize Winsock (required by httplib)
+    WSADATA wsa;
+    WSAStartup(MAKEWORD(2, 2), &wsa);
+
+    // Start server on background thread
+    std::string cache_dir = cli_config.cache_dir;
+    std::string config_dir = cli_config.config_dir;
+    std::thread server_thread([runtime_config, cache_dir, config_dir]() {
+        try {
+            lemon::Server server(runtime_config, cache_dir, config_dir);
+            server.run();
+        } catch (const std::exception& e) {
+            MessageBoxA(NULL, e.what(), "Lemonade Server Error", MB_OK | MB_ICONERROR);
+        }
+    });
+    server_thread.detach();
+
+    // Wait for server to be ready
+    if (!wait_for_server(runtime_config->host(), runtime_config->port(), false, 15)) {
+        MessageBoxA(NULL,
+            "Lemonade Server failed to start within 15 seconds.",
+            "Lemonade Server Error", MB_OK | MB_ICONERROR);
+        WSACleanup();
+        return 1;
+    }
+
+    // Create and run tray UI.  If initialization fails (e.g. no display
+    // server in CI, headless VM, or RDP session), fall back to running
+    // headless — the server is already handling requests on the background
+    // thread; we just need to block until shutdown.
+    bool headless = false;
+    try {
+        lemon_tray::TrayUIOptions options;
+        options.port = runtime_config->port();
+        options.host = runtime_config->host();
+        options.is_ssl = false;
+        options.silent = silent;
+        lemon_tray::TrayUI tray(options);
+        if (tray.initialize()) {
+            tray.run();  // Blocks until quit
+        } else {
+            LOG(WARNING, "Tray") << "Tray UI initialization failed — running headless" << std::endl;
+            headless = true;
+        }
+    } catch (const std::exception& e) {
+        LOG(WARNING, "Tray") << "Tray UI error: " << e.what() << " — running headless" << std::endl;
+        headless = true;
+    } catch (...) {
+        LOG(WARNING, "Tray") << "Tray UI error — running headless" << std::endl;
+        headless = true;
+    }
+
+    if (headless) {
+        // Server is running on the background thread.
+        // Block until /internal/shutdown calls std::exit(0).
+        while (true) {
+            std::this_thread::sleep_for(std::chrono::hours(24));
+        }
+    }
+
+    // Shutdown the embedded server.
+    // /internal/shutdown unloads all models synchronously (kills child
+    // processes like llama-server) before sending the response, then
+    // stops the HTTP listener and exits on a detached thread.
+    {
+        std::string connect_host = (runtime_config->host().empty() || runtime_config->host() == "0.0.0.0" || runtime_config->host() == "localhost")
+            ? "127.0.0.1" : runtime_config->host();
+        httplib::Client cli(connect_host, runtime_config->port());
+        cli.set_connection_timeout(2);
+        cli.set_read_timeout(30);  // Allow time for model unload (up to 5s per model)
+        cli.Post("/internal/shutdown", "", "application/json");
+    }
+
+    // Give server a moment to stop the HTTP listener and exit
+    std::this_thread::sleep_for(std::chrono::seconds(2));
+
+    WSACleanup();
+    return 0;
+}
+
+// ---------------------------------------------------------------------------
+// macOS / Linux entry point (connects to running router)
+// ---------------------------------------------------------------------------
+
+#else
+
+// Signal handler writes to self-pipe for clean shutdown
+static void tray_signal_handler(int sig) {
+    if (sig == SIGINT || sig == SIGTERM) {
+        char c = (char)sig;
+        ssize_t written = write(lemon_tray::TrayUI::signal_pipe_[1], &c, 1);
+        (void)written;
+    }
+}
+
+int main(int argc, char* argv[]) {
+    // Single instance check
+    if (lemon::SingleInstance::IsAnotherInstanceRunning("Tray")) {
+        std::cerr << "lemonade-tray is already running." << std::endl;
+        return 0;
+    }
+
+    // Parse args
+    CLI::App app{"Lemonade Tray - system tray interface for Lemonade Server"};
+    int port = 13305;
+    std::string host = "localhost";
+
+    app.add_option("--port,-p", port, "Server port to connect to");
+    app.add_option("--host", host, "Server host to connect to");
+
+    try {
+        app.parse(argc, argv);
+    } catch (const CLI::ParseError& e) {
+        return app.exit(e);
+    }
+
+    std::string clean_host;
+    int clean_port = port;
+    bool is_ssl = false;
+    bool explicit_port = app.count("--port") > 0 || app.count("-p") > 0;
+    lemon::utils::parse_target_url(host, clean_host, clean_port, is_ssl, !explicit_port);
+
+    // Install signal handlers
+    signal(SIGINT, tray_signal_handler);
+    signal(SIGTERM, tray_signal_handler);
+
+    // Wait for router to be reachable (retry with backoff up to 30s)
+    std::cout << "Connecting to lemond at " << clean_host << ":" << clean_port << (is_ssl ? " (SSL)" : "") << "..." << std::endl;
+    if (!wait_for_server(clean_host, clean_port, is_ssl, 30)) {
+        std::cerr << "Error: Could not connect to lemond at " << clean_host << ":" << clean_port << std::endl;
+        std::cerr << "Make sure lemond is running." << std::endl;
+        return 1;
+    }
+
+    std::cout << "Connected to lemond v" << LEMON_VERSION_STRING << std::endl;
+
+    // Create and run tray UI
+    lemon_tray::TrayUIOptions options;
+    options.port = clean_port;
+    options.host = clean_host;
+    options.is_ssl = is_ssl;
+    options.silent = false;
+    lemon_tray::TrayUI tray(options);
+    if (!tray.initialize()) {
+        return 1;
+    }
+
+    tray.run();  // Blocks until quit
+
+    // On macOS/Linux, just exit — the router keeps running
+    return 0;
+}
+
+#endif

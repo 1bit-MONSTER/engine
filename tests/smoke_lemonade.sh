@@ -42,14 +42,21 @@ python3 -c 'import json,sys; assert json.loads(sys.argv[1])["status"] == "ok"' "
 echo "ok   /api/v1/health status ok"
 
 catalog=$(curl -sf "http://127.0.0.1:$port/api/v1/models?show_all=true") || fail "/api/v1/models did not answer"
-python3 - "$catalog" <<'PY' || fail "model catalog check"
+sysinfo=$(curl -sf "http://127.0.0.1:$port/api/v1/system-info") || fail "/api/v1/system-info did not answer"
+echo "ok   /api/v1/system-info"
+python3 - "$catalog" "$sysinfo" <<'PY' || fail "model catalog check"
 import collections, json, sys
 models = json.loads(sys.argv[1])["data"]
 recipes = collections.Counter(m.get("recipe") for m in models)
 print("ok   catalog: %d models, recipes: %s" % (len(models), dict(recipes)))
 assert len(models) > 0, "empty catalog"
-assert recipes["llamacpp-hrx"] > 0, "no llamacpp-hrx models in the catalog"
+# Lemonade gates HRX models on AMD GPU support. Where the host supports HRX
+# (Strix Halo), its models must be in the catalog; elsewhere (CI) they are hidden.
+hrx = json.loads(sys.argv[2])["recipes"]["llamacpp-hrx"]["backends"]["hrx"]["state"]
+if hrx != "unsupported":
+    assert recipes["llamacpp-hrx"] > 0, "HRX is %s on this host but has no catalog models" % hrx
+    print("ok   HRX backend %s, %d llamacpp-hrx models" % (hrx, recipes["llamacpp-hrx"]))
+else:
+    print("ok   HRX backend unsupported on this host; its models are correctly hidden")
 PY
-curl -sf "http://127.0.0.1:$port/api/v1/system-info" >/dev/null || fail "/api/v1/system-info did not answer"
-echo "ok   /api/v1/system-info"
 echo PASS

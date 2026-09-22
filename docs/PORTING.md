@@ -5,7 +5,7 @@ and what has to be true before it lands here. Refs are branches or commits in th
 
 | Component | Source | State at source | Gate to land here |
 |---|---|---|---|
-| CPU reference | `src/gguf_reader.cpp`, `src/tokenizer.cpp`, `tools/qwen36_full_ref.py` | **landed** (qwen3; see docs/cpu-reference.md). Tokenizer not yet | matches HF transformers fp32 logits on Qwen3-0.6B |
+| CPU reference | `src/gguf_reader.cpp`, `src/tokenizer.cpp`, `tools/qwen36_full_ref.py` | **landed** (qwen3; docs/cpu-reference.md). Tokenizer **landed** (docs/tokenizer.md) | matches HF transformers fp32 logits on Qwen3-0.6B |
 | Arch registry | `src/model_registry.cpp` + `Testing/census_*.json` | 569 tokens map 2,030 HF arch strings (mapping only) | data file + separate verified list |
 | NPU backend | `engine/npu/src/npu_engine_universal.cpp` (`I8Ctx::init_elf`) | ELF-native, matches its own baseline | golden test vs CPU reference |
 | NPU ELF dispatch table | branch `backup/iso-build-elf-native-2026-09-22` (`kElfDesigns`) | ELF and xclbin modes match token for token; 0 xclbin opens | same, in this engine |

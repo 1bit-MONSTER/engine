@@ -57,6 +57,6 @@ cmake --build build && ctest --test-dir build --output-on-failure
 
 ## Not done yet
 
-- **Tokenizer.** The test uses token ids from the HF tokenizer.
+- **Tokenizer wiring.** The tokenizer has landed (docs/tokenizer.md), but this test still feeds ids.
 - **Quantized types beyond Q8_0** (Q4_K, Q6_K and others). Each needs its own dequant test first.
 - **A longer-context golden** (hundreds of positions) to cover RoPE at larger angles.

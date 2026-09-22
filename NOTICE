@@ -1,0 +1,8 @@
+1bit engine
+Copyright 2026 bong-water-water-bong
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+engine/core/unicode_tables.inc is generated from the Unicode Character
+Database (via Python's unicodedata module), Copyright Unicode, Inc., used
+under the Unicode License v3 (https://www.unicode.org/license.txt).

@@ -27,3 +27,16 @@ endif()
 enable_testing()
 
 # Components are ported in the order listed in docs/PORTING.md.
+
+# ── Step 1: Lemonade's server core, embedded ───────────────────────────────
+# Vendored at third_party/lemonade (v11.9.0 plus the local deltas listed in
+# its UPSTREAM.md, including the `onebit` backend).
+set(BUILD_WEB_APP OFF CACHE BOOL "" FORCE)
+set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
+add_subdirectory(third_party/lemonade EXCLUDE_FROM_ALL)
+
+add_executable(onebit app/main.cpp)
+set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
+target_link_libraries(onebit PRIVATE lemonade-server-core)
+
+add_test(NAME smoke_lemonade COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_lemonade.sh $<TARGET_FILE:onebit>)

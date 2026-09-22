@@ -1,0 +1,29 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# HRX + Vulkan (docs/hrx.md). Only needed with -DONEBIT_HRX=ON.
+[submodule "third_party/hrx"]
+	path = third_party/hrx
+	url = https://github.com/ROCm/hrx.git
+	shallow = true
+[submodule "third_party/hrx-system"]
+	path = third_party/hrx-system
+	url = https://github.com/ROCm/hrx-system.git
+	shallow = true
+[submodule "third_party/llama.cpp"]
+	path = third_party/llama.cpp
+	url = https://github.com/bong-water-water-bong/llama.cpp.git
+	branch = 1bit-engine/hrx-vulkan
+	shallow = true

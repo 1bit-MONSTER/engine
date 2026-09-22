@@ -27,7 +27,8 @@ namespace hrx {
 std::vector<std::string> build_server_argv(const std::string& gguf_path,
                                            int ctx_size,
                                            int port,
-                                           const std::string& hrx_args);
+                                           const std::string& hrx_args,
+                                           const std::string& device = "HRX0");
 std::vector<std::pair<std::string, std::string>> build_server_environment();
 
 std::unique_ptr<WrappedServer> create(const BackendContext& ctx);

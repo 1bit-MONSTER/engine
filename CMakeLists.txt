@@ -39,4 +39,17 @@ add_executable(onebit app/main.cpp)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE lemonade-server-core)
 
+# ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
+# Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
+# only runs on AMD GPUs. `1bit lemonade` then uses this llama-server for both
+# the llamacpp-hrx recipe (HRX20) and the llamacpp recipe's Vulkan backend.
+option(ONEBIT_HRX "Build HRX2 + Vulkan llama-server and wire it into Lemonade" OFF)
+if(ONEBIT_HRX)
+    include(cmake/hrx.cmake)
+    add_dependencies(onebit llama_hrx)
+    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}")
+    add_test(NAME hrx_lemonade_e2e
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_HRX_SERVER})
+endif()
+
 add_test(NAME smoke_lemonade COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_lemonade.sh $<TARGET_FILE:onebit>)

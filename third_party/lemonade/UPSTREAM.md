@@ -36,6 +36,12 @@ The **local-only** deltas carried on top of v11.9.0 are:
    source (`/home/bcloud/1bit-lemonade-v1170/third_party/lemonade`) before the next
    refresh, or re-apply it after.
 
+5. **`hrx_device` option** (1bit engine, step 2): `lemon/backends/hrx/hrx.h`
+   declares `hrx_device` (default `HRX0`, config key `hrx.device`), and
+   `hrx_server.{h,cpp}` pass it to `--device` instead of the hard-coded `HRX0`,
+   because an HRX2 build names its device `HRX20`. Upstream behavior is unchanged
+   when the option is unset.
+
 > Note: the `stream_stall_timeout` config key that our v11.8.x snapshot carried
 > was **dropped** in this re-vendor — v11.9.0 handles the streaming-stall bound
 > via `global_timeout` (upstream #3386), and local review confirmed the extra

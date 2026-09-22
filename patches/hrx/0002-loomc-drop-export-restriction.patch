@@ -1,0 +1,56 @@
+diff --git a/loom/binding/c/CMakeLists.txt b/loom/binding/c/CMakeLists.txt
+index 71b8caa..b7ea246 100644
+--- a/loom/binding/c/CMakeLists.txt
++++ b/loom/binding/c/CMakeLists.txt
+@@ -364,12 +364,14 @@ elseif(UNIX)
+   set_target_properties(loomc_shared PROPERTIES
+     BUILD_RPATH "$ORIGIN"
+     INSTALL_RPATH "$ORIGIN")
+-  set(_loomc_export_file
+-    "${CMAKE_CURRENT_SOURCE_DIR}/cmake/loomc_exports.lds")
+-  target_link_options(loomc_shared PRIVATE
+-    "-Wl,--version-script=${_loomc_export_file}")
+-  set_property(TARGET loomc_shared APPEND PROPERTY
+-    LINK_DEPENDS "${_loomc_export_file}")
++  # 1bit-MONSTER: drop the version-script export restriction so the amdgpu
++  # binding (libloomc_amdgpu.a) can link against loomc's internal symbols.
++  #set(_loomc_export_file
++  #  "${CMAKE_CURRENT_SOURCE_DIR}/cmake/loomc_exports.lds")
++  #target_link_options(loomc_shared PRIVATE
++  #  "-Wl,--version-script=${_loomc_export_file}")
++  #set_property(TARGET loomc_shared APPEND PROPERTY
++  #  LINK_DEPENDS "${_loomc_export_file}")
+ endif()
+ 
+ if(NOT TARGET loomc::loomc)
+@@ -389,10 +391,13 @@ install(DIRECTORY include/loomc
+   DESTINATION "${CMAKE_INSTALL_INCLUDEDIR}"
+   COMPONENT "${HRX_PUBLIC_DIST_COMPONENT}"
+   FILES_MATCHING PATTERN "*.h")
+-install(EXPORT loomc-targets
+-  NAMESPACE loomc::
+-  DESTINATION "${_loomc_cmake_package_dir}"
+-  COMPONENT "${HRX_PUBLIC_DIST_COMPONENT}")
++# patched (1bit-MONSTER): install(EXPORT loomc-targets ...) fails at configure
++# time because loomc_shared's PRIVATE iree deps are not in the export set.
++# We consume loomc from the build tree directly.
++#install(EXPORT loomc-targets
++#  NAMESPACE loomc::
++#  DESTINATION "${_loomc_cmake_package_dir}"
++#  COMPONENT "${HRX_PUBLIC_DIST_COMPONENT}")
+ 
+ configure_package_config_file(
+   cmake/loomc-config.cmake.in
+@@ -402,9 +407,9 @@ write_basic_package_version_file(
+   "${_loomc_build_package_dir}/loomc-config-version.cmake"
+   VERSION "${LOOMC_VERSION}"
+   COMPATIBILITY SameMajorVersion)
+-export(EXPORT loomc-targets
+-  NAMESPACE loomc::
+-  FILE "${_loomc_build_package_dir}/loomc-targets.cmake")
++# export(EXPORT loomc-targets
++#   NAMESPACE loomc::
++#   FILE "${_loomc_build_package_dir}/loomc-targets.cmake")
+ 
+ install(FILES
+   "${_loomc_build_package_dir}/loomc-config.cmake"

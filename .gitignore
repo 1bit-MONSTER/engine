@@ -1,0 +1,7 @@
+build/
+build-*/
+*.mlir.prj/
+*.o
+*.log
+compile_commands.json
+.cache/

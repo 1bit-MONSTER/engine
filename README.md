@@ -24,8 +24,8 @@ with AMD Ryzen AI hardware behind it:
 - Laya, which decides where each request runs
 - every Hugging Face model architecture, kept current by a daily census
 
-> **Status:** step 1 of 5, embedded Lemonade, has landed (`1bit lemonade`; see
-> [docs/lemonade.md](docs/lemonade.md)). The working engine is being ported from
+> **Status:** steps 1–2 of 5 have landed: embedded Lemonade ([docs/lemonade.md](docs/lemonade.md))
+> and HRX + Vulkan in one build ([docs/hrx.md](docs/hrx.md)). The working engine is being ported from
 > [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER) in five steps; see
 > [docs/PORTING.md](docs/PORTING.md). This repository holds the verified code
 > without the development history.

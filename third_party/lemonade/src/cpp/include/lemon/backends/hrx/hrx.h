@@ -47,6 +47,11 @@ inline const BackendDescriptor descriptor = {
     /*options*/ {
         {"hrx_args", "--hrx-args", "", "ARGS",
          "Custom arguments to pass to the HRX llama-server", "HRX Options"},
+        // Local delta (1bit): the device name differs between AMD's bundle
+        // (HRX0) and the HRX2 build (HRX20); see UPSTREAM.md.
+        {"hrx_device", "--hrx-device", "HRX0", "DEVICES",
+         "HRX device passed to llama-server --device (HRX0 for AMD's bundle, HRX20 for an HRX2 build)",
+         "HRX Options"},
     },
     /*support*/ {
         {"hrx", {"linux"},

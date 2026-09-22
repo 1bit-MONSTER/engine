@@ -42,11 +42,12 @@ namespace hrx {
 std::vector<std::string> build_server_argv(const std::string& gguf_path,
                                            int ctx_size,
                                            int port,
-                                           const std::string& hrx_args) {
+                                           const std::string& hrx_args,
+                                           const std::string& device) {
     std::vector<std::string> argv = {
         "-m", gguf_path,
         "--ctx-size", std::to_string(ctx_size),
-        "--device", "HRX0",
+        "--device", device.empty() ? std::string("HRX0") : device,
         "--port", std::to_string(port),
         "--jinja",
         "--metrics",
@@ -118,11 +119,12 @@ void HrxServer::load(const std::string& model_name,
 
     const int ctx_size = options.get_option("ctx_size");
     const std::string hrx_args = options.get_option("hrx_args");
+    const std::string hrx_device = options.get_option("hrx_device");
     const int backend_port = choose_port();
     const std::string executable =
         BackendUtils::get_backend_binary_path(*hrx::spec(), "hrx");
     const std::vector<std::string> argv =
-        hrx::build_server_argv(gguf_path, ctx_size, backend_port, hrx_args);
+        hrx::build_server_argv(gguf_path, ctx_size, backend_port, hrx_args, hrx_device);
     const std::vector<std::pair<std::string, std::string>> environment =
         hrx::build_server_environment();
 

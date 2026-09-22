@@ -27,6 +27,8 @@
 #include <lemon/server.h>
 #include <lemon/utils/path_utils.h>
 
+#include <nlohmann/json.hpp>
+
 #include <cstdio>
 #include <cstring>
 #include <memory>
@@ -47,6 +49,26 @@ void usage(FILE* out) {
                  "  help                        show this help\n");
 }
 
+#ifdef ONEBIT_HRX_SERVER
+// Points Lemonade at this build's llama-server (HRX2 + Vulkan in one binary,
+// docs/hrx.md): the llamacpp-hrx recipe runs Q4NX on HRX20, and the llamacpp
+// recipe runs GGUF on Vulkan0, the faster device for standard quants. The
+// config arrives merged with Lemonade's defaults, so only default values
+// ("builtin", "auto", unset) are replaced; anything else the user set wins.
+void use_engine_hrx_build(nlohmann::json& config) {
+    auto set_default = [&](const char* section, const char* key, const char* default_value, const char* value) {
+        auto& sec = config[section];
+        if (!sec.is_object()) sec = nlohmann::json::object();
+        if (!sec.contains(key) || sec[key] == "" || sec[key] == default_value) sec[key] = value;
+    };
+    set_default("hrx", "hrx_bin", "builtin", ONEBIT_HRX_SERVER);
+    set_default("hrx", "device", "", "HRX20");
+    set_default("llamacpp", "vulkan_bin", "builtin", ONEBIT_HRX_SERVER);
+    set_default("llamacpp", "backend", "auto", "vulkan");
+    set_default("llamacpp", "device", "", "Vulkan0");
+}
+#endif
+
 // Hands argv to Lemonade's own CLI and runs its server in this process. The
 // engine's native models reach Lemonade through the `onebit` backend
 // (third_party/lemonade/src/cpp/include/lemon/backends/onebit/onebit.h); they
@@ -60,6 +82,10 @@ int run_lemonade(int argc, char** argv) {
 
     lemon::utils::set_cache_dir(cli_config.cache_dir);
     auto config_json = lemon::ConfigFile::load(cli_config.cache_dir);
+
+#ifdef ONEBIT_HRX_SERVER
+    use_engine_hrx_build(config_json);
+#endif
 
     // Native NPU artifacts are registered by the NPU engine port (docs/PORTING.md
     // step 3); until then the onebit backend lists none.

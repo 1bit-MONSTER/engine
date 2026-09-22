@@ -9,5 +9,6 @@
   "attn_implementation": "eager",
   "torch": "2.13.0+cpu",
   "transformers": "5.13.0.dev0",
-  "logits_sha256": "3aaec202fa3d5e4dca1ebc053623836a57960f242ccbd34e98036aa97654820a"
+  "logits_sha256": "3aaec202fa3d5e4dca1ebc053623836a57960f242ccbd34e98036aa97654820a",
+  "continuation": " Tokyo. The capital of Italy is Rome. The capital of Spain is Madrid. The capital of China is Beijing. The"
 }

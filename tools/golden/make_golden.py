@@ -74,11 +74,11 @@ def main():
         "torch": torch.__version__,
         "transformers": transformers.__version__,
         "logits_sha256": hashlib.sha256(blob).hexdigest(),
+        "continuation": tok.decode(gen[len(ids):]),
     }
     with open(os.path.join(args.out, "meta.json"), "w") as f:
         json.dump(meta, f, indent=2)
     print(json.dumps(meta, indent=2))
-    print("continuation:", repr(tok.decode(gen[len(ids):])))
 
 
 if __name__ == "__main__":

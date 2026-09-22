@@ -21,10 +21,12 @@ XDNA 2 NPU, Radeon iGPU (Vulkan and HRX), and a CPU reference path. It serves th
 llama-server-compatible OpenAI HTTP API, so [Lemonade](https://github.com/lemonade-sdk/lemonade)
 and any OpenAI client can drive it as a drop-in backend.
 
-> **Status: scaffold.** Nothing runs yet. Components land one at a time, each with a
-> test against the CPU reference (see [CONTRIBUTING.md](CONTRIBUTING.md)). The
-> development history lives in [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER);
-> this repository contains only code that has been verified.
+> **Status:** the CPU reference, tokenizer and server work end to end on Qwen3
+> (`1bit-server`, see [docs/server.md](docs/server.md)). The NPU and GPU backends
+> come next. Components land one at a time, each with a test against the CPU
+> reference (see [CONTRIBUTING.md](CONTRIBUTING.md)). The development history
+> lives in [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); this
+> repository contains only code that has been verified.
 
 ## Layout
 
@@ -35,7 +37,7 @@ and any OpenAI client can drive it as a drop-in backend.
 | `engine/backends/npu/` | XDNA 2 via XRT, full-ELF kernels only (no xclbins) |
 | `engine/backends/gpu/` | llama.cpp (AMD-Ecosystem fork) with the Vulkan and HRX20 devices |
 | `engine/backends/cpu/` | fp32 reference forward pass; the correctness oracle |
-| `engine/server/` | llama-server-compatible HTTP: `/v1/chat/completions`, `/v1/completions`, `/v1/models`, `/health` |
+| `engine/server/` | `1bit-server`: Lemonade's backend protocol, i.e. `/health`, `/v1/models`, `/v1/chat/completions`, `/v1/completions` |
 | `tests/` | Golden-logit tests per backend against the CPU reference |
 | `lemonade/` | Upstream patch: `BackendDescriptor` + `WrappedServer` for this engine |
 

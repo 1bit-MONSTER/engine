@@ -28,7 +28,7 @@ and what has to be true before it lands here. Refs are branches or commits in th
 | NPU 16-tile layer kernel | branch `bench/fastlane-16tile-corrections-2026-09-22` (435bf36e7) | 24/24 tokens, summed KL 0.000466, 0.340 ms/layer | rebuild from source, reproduce |
 | GPU backend | AMD-Ecosystem/llama.cpp fork, `GGML_VULKAN` + `GGML_HRX2`; recipe on `fix/zaya-lmhead-evidence` | Vulkan0 74.8 tok/s, HRX20 18.4 on zaya1-8b; Q4NX is HRX20-only | pinned submodule, linked (no dlopen of copied structs) |
 | Router | `src/model_router.cpp` (Q4NX rule) + Laya scorer, branch `backup/laya-and-results-2026-09-22` | Laya not yet checked against its Python reference | Laya matches its Python reference within a stated tolerance |
-| Server | `src/server/` | works | llama-server flag and endpoint compatibility test |
+| Server | `src/server/` | **landed** as a new implementation (docs/server.md) | Lemonade's flags and endpoints, end-to-end test |
 | Lemonade recipe | lemonade `src/cpp/include/lemon/backends/*` pattern | n/a | loads Qwen3-0.6B through a local Lemonade build |
 
 Known traps carried over:

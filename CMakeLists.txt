@@ -37,7 +37,8 @@ add_library(onebit_core STATIC
     engine/core/model_config.cpp
     engine/core/parallel.cpp
     engine/core/unicode.cpp
-    engine/core/tokenizer.cpp)
+    engine/core/tokenizer.cpp
+    engine/core/sampler.cpp)
 target_include_directories(onebit_core PUBLIC engine/core)
 find_package(Threads REQUIRED)
 target_link_libraries(onebit_core PUBLIC Threads::Threads)
@@ -46,11 +47,25 @@ add_library(onebit_cpu STATIC engine/backends/cpu/cpu_model.cpp)
 target_include_directories(onebit_cpu PUBLIC engine/backends/cpu)
 target_link_libraries(onebit_cpu PUBLIC onebit_core)
 
+include(cmake/deps.cmake)
+
+add_library(onebit_server_lib STATIC
+    engine/server/text_stream.cpp
+    engine/server/chat_template.cpp
+    engine/server/generator.cpp
+    engine/server/openai.cpp)
+target_include_directories(onebit_server_lib PUBLIC engine/server)
+target_link_libraries(onebit_server_lib PUBLIC onebit_cpu onebit_minja)
+
+add_executable(onebit_server engine/server/main.cpp)
+set_target_properties(onebit_server PROPERTIES OUTPUT_NAME 1bit-server)
+target_link_libraries(onebit_server PRIVATE onebit_server_lib onebit_httplib)
+
 # Unit tests: synthetic data only, so they run anywhere (including CI).
-foreach(t test_gguf test_dequant test_unicode)
+foreach(t test_gguf test_dequant test_unicode test_sampler test_text_stream test_openai)
     add_executable(${t} tests/${t}.cpp)
     target_include_directories(${t} PRIVATE tests)
-    target_link_libraries(${t} PRIVATE onebit_core)
+    target_link_libraries(${t} PRIVATE onebit_server_lib)
     add_test(NAME ${t} COMMAND ${t})
 endforeach()
 
@@ -64,6 +79,11 @@ set(ENGINE_GOLDEN_MODEL "" CACHE FILEPATH "GGUF model for the golden test")
 set(ENGINE_GOLDEN_DIR "" CACHE PATH "Golden logits directory for the golden test")
 if(ENGINE_GOLDEN_MODEL AND ENGINE_GOLDEN_DIR)
     add_test(NAME golden_cpu COMMAND golden_cpu ${ENGINE_GOLDEN_MODEL} ${ENGINE_GOLDEN_DIR})
+    # The server end to end over HTTP, with Lemonade's launch flags.
+    find_package(Python3 REQUIRED COMPONENTS Interpreter)
+    add_test(NAME server_e2e
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/server_e2e.py --server $<TARGET_FILE:onebit_server>
+                     --model ${ENGINE_GOLDEN_MODEL} --golden ${ENGINE_GOLDEN_DIR})
 endif()
 
 # Tokenizer golden test: encode/decode/pre-token split against HF tokenizers.
@@ -71,6 +91,11 @@ endif()
 # (tools/golden/make_tokenizer_golden.py, docs/tokenizer.md).
 add_executable(golden_tokenizer tests/golden_tokenizer.cpp)
 target_link_libraries(golden_tokenizer PRIVATE onebit_core)
+add_executable(golden_template tests/golden_template.cpp)
+target_link_libraries(golden_template PRIVATE onebit_server_lib)
+add_test(NAME golden_template_qwen3
+         COMMAND golden_template ${CMAKE_SOURCE_DIR}/tests/golden/qwen3-tokenizer/vocab.gguf
+                 ${CMAKE_SOURCE_DIR}/tests/golden/qwen3-template/cases.jsonl)
 add_test(NAME golden_tokenizer_qwen3
          COMMAND golden_tokenizer ${CMAKE_SOURCE_DIR}/tests/golden/qwen3-tokenizer/vocab.gguf
                  ${CMAKE_SOURCE_DIR}/tests/golden/qwen3-tokenizer/cases.tsv)

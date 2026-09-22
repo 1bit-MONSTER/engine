@@ -254,6 +254,10 @@ std::expected<std::vector<int32_t>, std::string> Tokenizer::encode(std::string_v
     return out;
 }
 
+bool Tokenizer::is_control(int32_t id) const {
+    return id >= 0 && size_t(id) < token_type_.size() && token_type_[size_t(id)] == kTypeControl;
+}
+
 std::expected<std::string, std::string> Tokenizer::decode(std::span<const int32_t> ids, bool skip_special) const {
     std::string out;
     for (int32_t id : ids) {

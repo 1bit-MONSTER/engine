@@ -26,9 +26,8 @@ namespace onebit {
 
 namespace {
 
-// KV cache length. Kept well under the training context so the reference
-// stays small; raise it when a test needs longer sequences.
-constexpr uint32_t kMaxCtx = 4096;
+// Default KV cache length when the caller does not choose one.
+constexpr uint32_t kDefaultCtx = 4096;
 
 void rms_norm(const float* x, const float* w, float* out, uint32_t n, float eps) {
     double ss = 0.0;
@@ -87,7 +86,8 @@ private:
 
 }  // namespace
 
-std::expected<CpuModel, std::string> CpuModel::load(const std::string& gguf_path, size_t n_threads) {
+std::expected<CpuModel, std::string> CpuModel::load(const std::string& gguf_path, size_t n_threads,
+                                                    uint32_t n_ctx) {
     auto file = GgufFile::open(gguf_path);
     if (!file) return std::unexpected(file.error());
     auto cfg = read_model_config(*file);
@@ -130,7 +130,9 @@ std::expected<CpuModel, std::string> CpuModel::load(const std::string& gguf_path
 #undef TAKE
     if (auto r = ld.check_all_used(); !r) return std::unexpected(r.error());
 
-    m.n_ctx_ = std::min(c.n_ctx_train, kMaxCtx);
+    if (n_ctx > c.n_ctx_train)
+        return std::unexpected(std::format("n_ctx {} exceeds the model's training context {}", n_ctx, c.n_ctx_train));
+    m.n_ctx_ = n_ctx ? n_ctx : std::min(c.n_ctx_train, kDefaultCtx);
     const size_t cache = size_t{c.n_layer} * m.n_ctx_ * KV;
     m.k_cache_.assign(cache, 0.0f);
     m.v_cache_.assign(cache, 0.0f);
@@ -149,6 +151,8 @@ std::expected<CpuModel, std::string> CpuModel::load(const std::string& gguf_path
 }
 
 void CpuModel::reset() { n_past_ = 0; }
+
+void CpuModel::truncate(uint32_t n) { n_past_ = std::min(n, n_past_); }
 
 void CpuModel::matvec(const std::vector<float>& w, const float* x, float* y, uint32_t rows, uint32_t cols) {
     pool_->parallel_for(rows, [&](size_t begin, size_t end) {

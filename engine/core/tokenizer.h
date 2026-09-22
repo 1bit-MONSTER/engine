@@ -50,6 +50,8 @@ public:
     int32_t bos_id() const { return bos_; }
     int32_t eos_id() const { return eos_; }
     const std::string& token_text(int32_t id) const { return tokens_.at(size_t(id)); }
+    // CONTROL tokens (<|im_end|>, <|endoftext|>, ...): never rendered as text by default.
+    bool is_control(int32_t id) const;
 
 private:
     Tokenizer() = default;

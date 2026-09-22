@@ -36,15 +36,22 @@ public:
     // Loads every tensor of the GGUF. Fails if a tensor is missing, has the
     // wrong shape, has an unsupported type, or is present but unused (an
     // unused tensor means the model has semantics this code does not model).
-    static std::expected<CpuModel, std::string> load(const std::string& gguf_path, size_t n_threads = 0);
+    // n_ctx: KV cache length; 0 uses min(training context, 4096).
+    static std::expected<CpuModel, std::string> load(const std::string& gguf_path, size_t n_threads = 0,
+                                                     uint32_t n_ctx = 0);
 
     const ModelConfig& config() const { return cfg_; }
 
     // Clears the KV cache.
     void reset();
 
-    // Number of tokens in the KV cache.
+    // Number of tokens in the KV cache, and its capacity.
     uint32_t n_past() const { return n_past_; }
+    uint32_t n_ctx() const { return n_ctx_; }
+
+    // Drops cached positions from n onwards (n <= n_past()), so a new
+    // sequence sharing the first n tokens continues from there.
+    void truncate(uint32_t n);
 
     // Runs one token at position n_past() and returns the next-token logits
     // (config().n_vocab floats). Fails when the context is full.

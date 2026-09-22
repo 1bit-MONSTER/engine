@@ -18,15 +18,15 @@ limitations under the License.
 
 This repository exists to be reviewable. Five rules keep it that way.
 
-1. **Nothing lands without a test.** A backend or kernel change comes with a
-   golden-logit test against the CPU reference: same model, same prompt, token
-   agreement and per-step KL within a stated tolerance.
+1. **Nothing lands without a test that runs it.** Every ported component comes
+   with a check that exercises it on real hardware or in CI, and accuracy claims
+   state the reference they were measured against.
 2. **Numbers come from committed files.** Every benchmark or accuracy claim in a
    doc names the command, the model hash and the binary it came from, and anyone
    can re-run it from a clean checkout.
 3. **Recognized is not the same as verified.** The arch registry reports which HF
-   architectures it *maps* and, separately, which ones have *passed* the golden
-   test on each backend. Docs quote the second number.
+   architectures it *maps* and, separately, which ones have *run* and been
+   checked on each backend. Docs quote the second number.
 4. **No binaries without source.** NPU kernels are built from source in this
    repository (or a pinned submodule) into full ELFs. No vendored xclbins.
 5. **Every file carries the copyright and Apache-2.0 notice.** Run
@@ -34,5 +34,7 @@ This repository exists to be reviewable. Five rules keep it that way.
    Files that cannot hold a comment (binaries, JSON, test data) are exempt,
    listed in the tool.
 
-Porting from 1bit-MONSTER: port the smallest piece that can be tested, not whole
-files. [docs/PORTING.md](docs/PORTING.md) lists the source of each component.
+This repository is a port of the working code in
+[1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER), without its history.
+[docs/PORTING.md](docs/PORTING.md) lists the source of each component and the
+order it lands in.

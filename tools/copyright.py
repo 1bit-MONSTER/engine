@@ -30,13 +30,13 @@ limitations under the License.""".split("\n")
 
 # Comment style by file name pattern.
 LINE_STYLES = [
-    (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc"), "//"),
+    (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment"), "#"),
 ]
 BLOCK_STYLES = [(("*.md",), ("<!--", "-->"))]
 
-EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "*.json", "*.tsv", "tests/golden/*/tokens.txt"]
+EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock"]
 
 
 def _match(name, patterns):

@@ -16,11 +16,11 @@ limitations under the License.
 -->
 # Lemonade
 
-The engine is a backend that [Lemonade](https://github.com/lemonade-sdk/lemonade)
-launches, the way it launches `llama-server`. The engine exposes only an
-OpenAI-compatible API (`1bit serve`, [serve.md](serve.md)), and Lemonade stays
-what it is: the server users talk to, with its own catalog, downloads, router
-and UI.
+**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade is
+the server users talk to, with its own catalog, downloads, router and UI. For the models it
+serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`: it starts
+`1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards OpenAI requests to it. The
+engine exposes nothing but that OpenAI-compatible API.
 
 ## How it got here
 
@@ -35,22 +35,25 @@ the reverse. So on 2026-09-23:
 - `1bit serve` took over what the local recipes did, for every device: NPU,
   Vulkan, HRX, ZINC and MLX.
 
-## What Lemonade needs
+## The recipe that runs it
 
-One recipe in upstream Lemonade that launches the engine, in the same shape as
-its `llama-server` recipe:
+One recipe in Lemonade runs the engine, `onebit`, in the same shape as its
+`llama-server` recipe:
 
 ```
 1bit serve -m <model> --port <p> [--device ...] [--ctx-size N] [--alias <name>]
 ```
 
-It then waits for `/health` to answer 200 and forwards OpenAI requests to
-`/v1/chat/completions` and `/v1/completions`. That recipe is being prepared as
-a pull request to `lemonade-sdk/lemonade`.
+Lemonade downloads and resolves GGUF checkpoints as for llamacpp, and its
+backend selector picks the device (`vulkan`, `hrx`, `npu`, or `cuda` through
+ZINC). Replies already carry Lemonade's model name (`--alias`), so requests pass
+through unchanged. On Strix Halo the recipe passes Lemonade's own LLM test suite
+(`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX. It is being
+prepared as a pull request to `lemonade-sdk/lemonade`.
 
-## Until then
+## On its own
 
-Point any OpenAI client at `1bit serve` directly:
+`1bit serve` also works without Lemonade, for any OpenAI client:
 
 ```sh
 1bit serve -m ~/models/Qwen3-0.6B-Q4_K_M.gguf --device vulkan --port 8000

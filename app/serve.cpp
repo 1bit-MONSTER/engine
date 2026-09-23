@@ -16,8 +16,8 @@
 // `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|zinc]`
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
-// OpenAI-compatible API, the contract a host such as Lemonade launches a
-// backend with:
+// OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
+// onebit backend runs `1bit serve` the way it runs llama-server:
 //
 //   GET  /health, /v1/health     503 while the model loads, then 200
 //   GET  /v1/models              the one model

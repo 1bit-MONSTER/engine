@@ -374,6 +374,7 @@ int run_serve(int argc, char** argv) {
         if (!is_npu_model_dir(o.model)) throw std::runtime_error(o.model + " is not an NPU model directory");
         // The NPU lane serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
+        if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
         return run_unified(int(av.size()), av.data());

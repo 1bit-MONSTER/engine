@@ -44,6 +44,10 @@ One model per process:
 | `.gguf` | `hrx` | this build's llama-server on `HRX0` |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
 
+`chat_template_kwargs.enable_thinking: false` works on every device. The GPU
+backends apply the model's own chat template. The NPU route emits what Qwen3's
+template does: an empty think block after the assistant prefix.
+
 For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
 the served model name. For ZINC, which rejects foreign model ids, requests go
@@ -61,12 +65,13 @@ then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC`, then `llama-server` / `zinc` on PA
 
 ## Verified (Strix Halo, 2026-09-23)
 
-`tests/serve_e2e.sh` with Qwen3-0.6B Q4_K_M. The test checks `/health` 200,
+`tests/serve_e2e.sh` with Qwen3-0.6B: the Q4_K_M GGUF for the GPU devices and the Q4NX model directory for the NPU. The test checks `/health` 200,
 `/v1/models`, a chat that answers "Paris." under the served name, and
 streaming:
 
 | Device | Result |
 |---|---|
+| `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory on the fast lane |
 | `vulkan` | PASS (32 SSE chunks) |
 | `hrx` | PASS (32 SSE chunks), with no environment set up |
 | `zinc` | PASS (6 SSE chunks) |

@@ -13,19 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# HRX + Vulkan (docs/hrx.md). Only needed with -DONEBIT_HRX=ON.
-[submodule "third_party/hrx"]
-	path = third_party/hrx
-	url = https://github.com/ROCm/hrx.git
-	shallow = true
+# HRX + Vulkan (docs/hrx.md). Only needed with -DONEBIT_HRX=ON. The pair is AMD's
+# tested integration (ROCm/ggml-staging-automation); .github/workflows/bump-hrx.yml keeps it current.
 [submodule "third_party/hrx-system"]
 	path = third_party/hrx-system
 	url = https://github.com/ROCm/hrx-system.git
+	branch = main
 	shallow = true
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
-	url = https://github.com/bong-water-water-bong/llama.cpp.git
-	branch = 1bit-engine/hrx-vulkan
+	url = https://github.com/1bit-MONSTER/llama.cpp.git
+	branch = 1bit/hrx-vulkan
 	shallow = true
 [submodule "third_party/xdna-driver"]
 	path = third_party/xdna-driver

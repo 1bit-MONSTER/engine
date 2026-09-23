@@ -1,0 +1,130 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Keep third_party/llama.cpp and third_party/hrx-system on the pair AMD's
+# integration repo (ROCm/ggml-staging-automation) builds and tests together
+# (docs/hrx.md, "Staying current"). When AMD moves its pins, this workflow:
+#   1. syncs 1bit-MONSTER/llama.cpp: master to ggml-org, 1bit/hrx-vulkan to AMD's pin;
+#   2. opens a PR here moving both submodules.
+# GitHub-hosted CI builds that PR without HRX; run tests/hrx_lemonade_e2e.sh on
+# Strix Halo before merging it.
+#
+# Needs the secret HRX_BUMP_TOKEN: a fine-grained token with Contents
+# read/write on 1bit-MONSTER/llama.cpp and 1bit-MONSTER/engine, and Pull
+# requests read/write on 1bit-MONSTER/engine. (A PR opened with the default
+# GITHUB_TOKEN would not start CI, and that token cannot push to the fork.)
+name: bump-hrx
+
+on:
+  schedule:
+    - cron: "17 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-hrx
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the token
+        env:
+          HRX_BUMP_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          if [ -z "$HRX_BUMP_TOKEN" ]; then
+            echo "::error::secret HRX_BUMP_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HRX_BUMP_TOKEN }}
+          persist-credentials: true
+
+      - name: Read AMD's tested pair and ours
+        id: pins
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          amd_llama=$(gh api repos/ROCm/ggml-staging-automation/contents/llama.cpp --jq .sha)
+          amd_hrx=$(gh api repos/ROCm/ggml-staging-automation/contents/hrx-system --jq .sha)
+          ours_llama=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
+          ours_hrx=$(git ls-tree HEAD third_party/hrx-system | awk '{print $3}')
+          echo "AMD:  llama.cpp $amd_llama  hrx-system $amd_hrx"
+          echo "ours: llama.cpp $ours_llama  hrx-system $ours_hrx"
+          {
+            echo "amd_llama=$amd_llama"; echo "amd_hrx=$amd_hrx"
+            echo "ours_llama=$ours_llama"; echo "ours_hrx=$ours_hrx"
+            if [ "$amd_llama" = "$ours_llama" ] && [ "$amd_hrx" = "$ours_hrx" ]; then echo "changed=false"; else echo "changed=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Sync the fork
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
+        run: |
+          set -euo pipefail
+          # master mirrors ggml-org; 1bit/hrx-vulkan carries no commits of its own, so it
+          # moves to AMD's pin as long as that pin descends from it (no force needed).
+          gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master > /dev/null
+          git init -q fork && cd fork
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/llama.cpp.git"
+          git remote add amd https://github.com/AMD-Ecosystem/llama.cpp.git
+          git fetch -q --filter=blob:none amd "$AMD_LLAMA"
+          git fetch -q --filter=blob:none fork 1bit/hrx-vulkan
+          if ! git merge-base --is-ancestor FETCH_HEAD "$AMD_LLAMA"; then
+            echo "::error::1bit/hrx-vulkan has commits that AMD's pin does not contain; rebase them by hand"
+            exit 1
+          fi
+          git push -q fork "$AMD_LLAMA:refs/heads/1bit/hrx-vulkan"
+
+      - name: Open the bump PR
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
+          AMD_HRX: ${{ steps.pins.outputs.amd_hrx }}
+          OURS_LLAMA: ${{ steps.pins.outputs.ours_llama }}
+          OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
+        run: |
+          set -euo pipefail
+          branch="bump-hrx/${AMD_LLAMA:0:12}-${AMD_HRX:0:12}"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+            echo "$branch already exists"; exit 0
+          fi
+          git config user.name "hrx-bump"
+          git config user.email "hrx-bump@users.noreply.github.com"
+          git switch -c "$branch"
+          git update-index --cacheinfo "160000,$AMD_LLAMA,third_party/llama.cpp"
+          git update-index --cacheinfo "160000,$AMD_HRX,third_party/hrx-system"
+          git commit -q -m "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12} (AMD's tested pair)"
+          git push -q origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12}" \
+            --body "Moves both submodules to the pair ROCm/ggml-staging-automation now pins.
+
+          | | from | to |
+          |---|---|---|
+          | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan) | \`${OURS_LLAMA:0:12}\` | \`${AMD_LLAMA:0:12}\` |
+          | third_party/hrx-system (ROCm/hrx-system) | \`${OURS_HRX:0:12}\` | \`${AMD_HRX:0:12}\` |
+
+          CI here builds without HRX. Before merging, on Strix Halo:
+          \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && tests/hrx_lemonade_e2e.sh build/1bit build/hrx/llama/bin/llama-server\`"

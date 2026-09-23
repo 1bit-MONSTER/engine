@@ -16,88 +16,93 @@ limitations under the License.
 -->
 # HRX + Vulkan
 
-One llama.cpp build with two GPU backends, ggml-hrx2 (AMD's HRX runtime) and
+One llama.cpp build with two GPU backends, ggml-hrx (AMD's HRX runtime) and
 ggml-vulkan. Its single `llama-server` exposes both devices on Strix Halo:
 
 ```
+HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
-HRX20:   AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 ```
 
 `1bit lemonade` uses this binary for two Lemonade recipes:
 
 | Recipe | Device | Serves |
 |---|---|---|
-| `llamacpp-hrx` | `HRX20` | HRX-only formats (Q4NX) and the HRX catalog entries |
-| `llamacpp` (Vulkan backend) | `Vulkan0` | standard GGUF quants, where Vulkan is the faster device |
+| `llamacpp-hrx` | `HRX0` | the HRX catalog entries |
+| `llamacpp` (Vulkan backend) | `Vulkan0` | standard GGUF quants |
 
-Lemonade config keys that a user has set are never overridden. Only its
-defaults (`builtin`, `auto`, unset) are replaced.
+Only Lemonade's defaults (`builtin`, `auto`, unset) are replaced. Config keys a
+user has set are never overridden.
+
+## Pinned sources, kept current
+
+| Submodule | Source | Pinned to |
+|---|---|---|
+| `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) |
+| `third_party/hrx-system` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | libhrx, loomc and the Loom tools |
+
+- **Where the pair comes from.** The two pins are the pair AMD's integration repo,
+  [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
+  builds and tests together.
+- **How it stays current.** `.github/workflows/bump-hrx.yml` runs daily. When AMD
+  moves its pair, it:
+  - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin);
+  - opens a PR here moving both submodules.
+- **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
+  Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
+  Pull requests read/write on `1bit-MONSTER/engine`.
+- **Validation.** CI builds that PR without HRX, so run the checks below on Strix
+  Halo before merging.
+
+There are no local patches. `1bit-MONSTER/llama.cpp` also holds
+`1bit/hrx2-archive`, the previous build (AMD's abandoned ggml-hrx2 plus our Q4NX
+kernels and the zaya architecture). It is kept for a later port of that work to
+ggml-hrx.
 
 ## Build
 
 ```bash
-git submodule update --init --depth 1 third_party/hrx third_party/hrx-system third_party/llama.cpp
+git submodule update --init --depth 1 third_party/hrx-system third_party/llama.cpp
 cmake -B build -G Ninja -DONEBIT_HRX=ON          # needs TheRock at /opt/rocm-therock (ONEBIT_HRX_TOOLCHAIN)
 cmake --build build --target onebit
 ```
 
-A fresh clone builds in about 4 minutes on Strix Halo: the submodules take 28 s,
-and the whole build takes 217 s.
+- **One external project.** llama.cpp's ggml-hrx builds hrx-system itself
+  (`HRX_SOURCE_DIR`) with TheRock's `amdclang`.
+- **`IREE_ROCM_PATH` is not passed.** It would switch hrx-system to "package"
+  mode, which needs TheRock's aqlprofile-sdk headers, and our `/opt/rocm-therock`
+  does not ship them. Left unset, hrx-system fetches its pinned HSA/AQL headers.
+- **The HSA runtime.** HRX dlopens it at run time, and the distro's
+  `libhsa-runtime64` rejects the `HSA_AMD_AGENT_INFO_PM4_EMULATION` probe on
+  gfx1151, so HRX then registers no device. CMake finds TheRock's
+  `libhsa-runtime64.so.1` (`ONEBIT_HRX_LIBHSA`), and `1bit lemonade` passes it to
+  llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. To run
+  llama-server or llama-bench by hand, export that variable yourself.
 
-## Pinned sources
+## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `fab1624`)
 
-| Submodule | Commit | Used for |
+`tests/hrx_lemonade_e2e.sh` passes. `unsloth/Qwen3-0.6B-GGUF:Q4_0` answers
+"Paris" through both recipes, served by this build's llama-server on `Vulkan0`
+and on `HRX0`.
+
+llama-bench, Qwen3-0.6B, pp512 / tg128 tok/s, against the previous build (April
+llama.cpp with ggml-hrx2 on `HRX20`):
+
+| Device, file | previous build | this build |
 |---|---|---|
-| `third_party/hrx` ([ROCm/hrx](https://github.com/ROCm/hrx)) | `0bc22fb` | libhrx, libloomc and the Loom AMDGPU binding, plus `patches/hrx/0001`–`0003` |
-| `third_party/hrx-system` ([ROCm/hrx-system](https://github.com/ROCm/hrx-system)) | `6743075f` | `loom-link`, plus `patches/hrx/0002` |
-| `third_party/llama.cpp` (fork, branch `1bit-engine/hrx-vulkan`) | `3b33c8a9` | ggml-hrx2 kernels and catalog, and the llama.cpp + Vulkan build |
+| Vulkan0, Q4_K_M | 10627 / 306 | **13905 / 338** |
+| Vulkan0, UD-Q4_K_XL | 10668 / ~300 | 13505 / 330 |
+| HRX, Q4_K_M | 1046 / 68 | **21702 / 303** |
+| HRX, UD-Q4_K_XL | 837 / 83 | 18059 / 288 |
 
-The patches:
-
-- **`0001`, `0002`:** switch off install/export rules that fail to configure,
-  and let the AMDGPU binding link against loomc. Build plumbing only.
-- **`0003`:** a runtime fix. gfx1151 rejects the `PM4_EMULATION` agent probe,
-  which is now treated as native AQL execution instead of an error. It is a
-  candidate for upstreaming to ROCm/hrx.
-
-**Why two HRX repositories:** the fork's kernel catalog is linked with
-`loom-link --mode=selective`. ROCm/hrx-system removed that mode in `87e3715963`,
-so `loom-link` is built from the commit just before it.
-
-## Verified
-
-- **Kernel artifacts are reproducible.** On the same source path, all 48 kernel
-  artifacts linked by this build's `loom-link` are byte-identical to those of the
-  hand-assembled build the project had been running.
-- **The HRX prefix matches the old one.** It has the same headers and libraries as
-  the hand-assembled `install-new` it replaces, which was previously undocumented.
-- **Speed matches the hand-assembled build** (llama-bench, pp128/tg32, 2 runs):
-
-  | Device, model | hand-assembled | this build |
-  |---|---|---|
-  | Vulkan0, Qwen3-1.7B Q4_K_M | tg 151.4 | tg 148.7 |
-  | HRX20, zaya1-8b Q4NX | tg 17.8 | tg 18.3 |
-
-  HRX prefill measured 190 vs 167 tok/s on a shared box; it has not been re-measured yet.
-- **Lemonade runs both devices end to end.** `tests/hrx_lemonade_e2e.sh` (a
-  `ctest` test in ONEBIT_HRX builds) pulls `unsloth/Qwen3-0.6B-GGUF:Q4_0` through
-  both recipes and chats with greedy decoding. It checks the answer and which
-  binary and device served it:
-
-  | Recipe | Device | Answer | Decode |
-  |---|---|---|---|
-  | `llamacpp` | Vulkan0 | Paris | 117.3 tok/s |
-  | `llamacpp-hrx` | HRX20 | Paris | 33.5 tok/s |
-
-  The HRX catalog's `hrx_serve: NO (GET_ROWS)` note describes AMD's hrx-b66
-  bundle. This build serves the entry.
+HRX prefill is now faster than Vulkan's.
 
 ## Not yet
 
-- **zaya1-8b Q4NX through Lemonade.** It was measured with llama-bench only.
-  Lemonade has no catalog entry for the local file, so it arrives with the
-  engine's model registry (docs/PORTING.md step 5).
-- **A relocatable package.** The HRX shared libraries are used from the build
-  tree through their RPATHs.
-- **CI.** CI has no AMD GPU and no TheRock, so `ONEBIT_HRX` is exercised on Strix Halo only.
+- **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
+  They are kept on `1bit/hrx2-archive` until they are ported.
+- **First-request cost.** Lemonade's telemetry for the first short HRX chat shows
+  18 tok/s against llama-bench's 303. It is probably first-use kernel
+  compilation, not steady state, but this is not yet separated.
+- **CI.** CI has no AMD GPU and no TheRock, so `ONEBIT_HRX` is exercised on Strix
+  Halo only.

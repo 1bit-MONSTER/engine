@@ -54,7 +54,15 @@ endif()
 
 # ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
 # Host side (full-ELF generation, model reader, buffer packing): pure C++, no
-# XRT, so it builds and tests anywhere.
+# XRT. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there
+# by default; the Lemonade face (including the mlx backend) does not use it.
+if(APPLE)
+    set(_onebit_npu_host_default OFF)
+else()
+    set(_onebit_npu_host_default ON)
+endif()
+option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_host_default})
+if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/tokenizer.cpp)
@@ -86,10 +94,14 @@ endif()
 if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_BO_DUMP)
     add_test(NAME npu_pack_model COMMAND npu_pack_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_BO_DUMP})
 endif()
+endif()  # ONEBIT_NPU_HOST
 
 # The lane itself: needs XRT (the NPU runtime) and an XDNA NPU to run.
 option(ONEBIT_NPU "Build the NPU fast lane (needs XRT)" OFF)
 set(ONEBIT_XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT install prefix")
+if(ONEBIT_NPU AND NOT ONEBIT_NPU_HOST)
+    message(FATAL_ERROR "ONEBIT_NPU needs ONEBIT_NPU_HOST=ON")
+endif()
 if(ONEBIT_NPU)
     if(NOT EXISTS "${ONEBIT_XRT_ROOT}/include/xrt/xrt_device.h")
         message(FATAL_ERROR "ONEBIT_NPU needs XRT; none at ONEBIT_XRT_ROOT=${ONEBIT_XRT_ROOT}")
@@ -111,3 +123,10 @@ if(ONEBIT_NPU)
 endif()
 
 add_test(NAME smoke_lemonade COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_lemonade.sh $<TARGET_FILE:onebit>)
+
+# MLX on Apple Silicon through Lemonade's mlx backend (docs/apple.md).
+set(ONEBIT_MLX_SERVER "" CACHE FILEPATH "lemon-mlx-engine's server binary, for tests/mlx_lemonade_e2e.sh")
+if(APPLE AND ONEBIT_MLX_SERVER)
+    add_test(NAME mlx_lemonade_e2e
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/mlx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_MLX_SERVER})
+endif()

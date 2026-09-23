@@ -16,7 +16,7 @@
 //
 //   1bit serve -m <model>            one model on any device (NPU, Vulkan, HRX,
 //                                    ZINC, MLX) behind an OpenAI-compatible API;
-//                                    what a host such as Lemonade launches (docs/serve.md).
+//                                    how the engine runs inside Lemonade (docs/serve.md).
 //   1bit unified -m <model dir>      one native model on the NPU fast lane behind
 //                                    OpenAI endpoints; serve's NPU route.
 //   1bit npu-run [options]           token ids in, token ids out, on the NPU fast

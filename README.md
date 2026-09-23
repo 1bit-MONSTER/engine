@@ -16,10 +16,10 @@ limitations under the License.
 -->
 # 1bit engine
 
-An inference engine for AMD Ryzen AI, built to run inside
-[Lemonade](https://github.com/lemonade-sdk/lemonade): the `1bit` binary serves one model behind an
-OpenAI-compatible API, whatever device runs it, and Lemonade (or any OpenAI client) launches it
-the way it launches `llama-server`. Behind that one API:
+**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade stays
+the server you talk to (its catalog, downloads, router and UI), and for the models it hands to 1bit,
+Lemonade runs the engine as one of its backends, the same way it runs `llama-server`. The engine
+serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
 - the XDNA 2 NPU engine
 - HRX and Vulkan on the Radeon iGPU, compiled together in one llama.cpp build
@@ -28,18 +28,18 @@ the way it launches `llama-server`. Behind that one API:
 - Laya, which decides where each request runs
 - every Hugging Face model architecture, kept current by a daily census
 
-> **Status:** `1bit serve` is the engine's front door ([docs/serve.md](docs/serve.md)): the NPU,
-> Vulkan, HRX and ZINC each pass its end-to-end test on Strix Halo. Following geramyL's review, the
-> engine is embedded into Lemonade rather than embedding it: the vendored Lemonade is gone, and a
-> Lemonade recipe that launches `1bit serve` is being prepared for upstream ([docs/lemonade.md](docs/lemonade.md)).
-> Ported so far: HRX + Vulkan in one build on AMD's live ggml-hrx ([docs/hrx.md](docs/hrx.md)), the NPU
-> engine on full ELFs with the upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel
-> is not yet built from source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX
-> ([docs/apple.md](docs/apple.md)). Next is step 4, the Laya router. The working engine is being ported
-> from [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see
-> [docs/PORTING.md](docs/PORTING.md). Measured results are on the
-> [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository holds the verified code
-> without the development history.
+> **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
+> [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on
+> Strix Halo, and the Lemonade recipe that runs it (`onebit`) passes Lemonade's own LLM test suite on
+> Vulkan and HRX and is being prepared for upstream. Following geramyL's review the engine no longer
+> vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX + Vulkan in
+> one build on AMD's live ggml-hrx ([docs/hrx.md](docs/hrx.md)), the NPU engine on full ELFs with the
+> upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
+> source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). Next is step 4,
+> the Laya router. The working engine is being ported from
+> [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see [docs/PORTING.md](docs/PORTING.md).
+> Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository
+> holds the verified code without the development history.
 
 ## License
 
@@ -51,7 +51,7 @@ Apache-2.0. See [LICENSE](LICENSE).
 vibecoding, and that is where all of this started. Without it, this engine would not exist.
 
 **The Lemonade team and AMD's developers.** [Lemonade](https://github.com/lemonade-sdk/lemonade)
-is the home this engine is built to run in. AMD's developers left breadcrumbs all over the place: the XDNA driver
+is where this engine runs. AMD's developers left breadcrumbs all over the place: the XDNA driver
 and XRT, IRON and Peano, HRX, their tested llama.cpp integration, their issues, their examples.
 This engine is what following those breadcrumbs built.
 

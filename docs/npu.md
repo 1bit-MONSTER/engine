@@ -45,8 +45,8 @@ Step 3 lands in three parts:
 ```
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
-OpenAI-compatible API ([serve.md](serve.md)); a host such as Lemonade launches
-it like any other backend.
+OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its
+onebit backend runs (`--onebit npu`).
 
 ## Inputs
 

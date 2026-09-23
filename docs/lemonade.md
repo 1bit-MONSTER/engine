@@ -47,9 +47,24 @@ One recipe in Lemonade runs the engine, `onebit`, in the same shape as its
 Lemonade downloads and resolves GGUF checkpoints as for llamacpp, and its
 backend selector picks the device (`vulkan`, `hrx`, `npu`, or `cuda` through
 ZINC). Replies already carry Lemonade's model name (`--alias`), so requests pass
-through unchanged. On Strix Halo the recipe passes Lemonade's own LLM test suite
-(`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX. It is being
-prepared as a pull request to `lemonade-sdk/lemonade`.
+through unchanged.
+
+The recipe lives in our Lemonade fork,
+[1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade): upstream
+Lemonade plus the `onebit` backend (fork PR #1). Build `lemond` from the fork and
+put `1bit` on PATH (or set `$LEMONADE_ONEBIT_BIN`):
+
+```sh
+git clone https://github.com/1bit-MONSTER/lemonade && cd lemonade
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
+cmake --build build --target lemond lemonade
+LEMONADE_ONEBIT_BIN=/path/to/1bit build/lemond
+```
+
+On Strix Halo the recipe passes Lemonade's own LLM test suite
+(`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX: 31 tests, 9 run,
+22 skipped as unsupported. It is not proposed upstream. Lemonade asks for an RFC
+before a new backend.
 
 ## On its own
 

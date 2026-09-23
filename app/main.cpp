@@ -93,6 +93,16 @@ void use_engine_hrx_build(nlohmann::json& config) {
 }
 #endif
 
+#ifdef ONEBIT_ZINC_SERVER
+// Points Lemonade's zinc recipe at this build's zinc (third_party/zinc,
+// docs/zinc.md) unless the user already chose a binary.
+void use_engine_zinc_build(nlohmann::json& config) {
+    auto& sec = config["zinc"];
+    if (!sec.is_object()) sec = nlohmann::json::object();
+    if (!sec.contains("zinc_bin") || sec["zinc_bin"] == "") sec["zinc_bin"] = ONEBIT_ZINC_SERVER;
+}
+#endif
+
 // Native models for the `onebit` backend: every NPU model directory
 // (docs/npu.md) directly under the roots in ONEBIT_MODEL_ROOTS (colon-separated,
 // default ~/models). Lemonade serves each through `1bit unified -m <dir>`. The
@@ -141,6 +151,9 @@ int run_lemonade(int argc, char** argv) {
 
 #ifdef ONEBIT_HRX_SERVER
     use_engine_hrx_build(config_json);
+#endif
+#ifdef ONEBIT_ZINC_SERVER
+    use_engine_zinc_build(config_json);
 #endif
 
     lemon::backends::onebit::set_onebit_models(native_models());

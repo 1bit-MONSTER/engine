@@ -52,6 +52,28 @@ if(ONEBIT_HRX)
              COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_HRX_SERVER})
 endif()
 
+# ── ZINC (docs/zinc.md) ────────────────────────────────────────────────────
+# Off by default: it builds third_party/zinc with scripts/build-zinc.sh (which
+# fetches its own Zig) for one GPU backend. `1bit lemonade` then serves the zinc
+# recipe with this binary. ONEBIT_ZINC_BACKEND=cuda is the NVIDIA build.
+option(ONEBIT_ZINC "Build ZINC (third_party/zinc) and wire it into Lemonade" OFF)
+if(ONEBIT_ZINC)
+    set(ONEBIT_ZINC_BACKEND "vulkan" CACHE STRING "ZINC GPU backend: vulkan, rocm or cuda")
+    set_property(CACHE ONEBIT_ZINC_BACKEND PROPERTY STRINGS vulkan rocm cuda)
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/zinc/build.zig")
+        message(FATAL_ERROR "ONEBIT_ZINC needs third_party/zinc: git submodule update --init third_party/zinc")
+    endif()
+    set(ONEBIT_ZINC_SERVER "${CMAKE_BINARY_DIR}/zinc/${ONEBIT_ZINC_BACKEND}/bin/zinc")
+    add_custom_target(zinc
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-zinc.sh ${CMAKE_BINARY_DIR}/zinc ${ONEBIT_ZINC_BACKEND}
+        BYPRODUCTS ${ONEBIT_ZINC_SERVER}
+        USES_TERMINAL)
+    add_dependencies(onebit zinc)
+    target_compile_definitions(onebit PRIVATE ONEBIT_ZINC_SERVER="${ONEBIT_ZINC_SERVER}")
+    add_test(NAME zinc_lemonade_e2e
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/zinc_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_ZINC_SERVER})
+endif()
+
 # ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
 # Host side (full-ELF generation, model reader, buffer packing): pure C++, no
 # XRT. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there

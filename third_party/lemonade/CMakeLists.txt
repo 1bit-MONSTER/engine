@@ -172,6 +172,7 @@ set(LEMON_BACKENDS
     "openmoss|openmoss"
     "onebit|onebit"
     "mlx|mlx"
+    "zinc|zinc"
 )
 
 # ============================================================

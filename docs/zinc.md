@@ -66,6 +66,27 @@ The script needs nothing from the system except the backend's own toolkit:
 ZINC has no BF16 weight path, so use a quantized GGUF. For example, the
 BF16 golden `Qwen3-0.6B-BF16.gguf` fails with `UnsupportedQuantType` (type 30).
 
+## Served by Lemonade
+
+With `-DONEBIT_ZINC=ON` (and `-DONEBIT_ZINC_BACKEND=vulkan|rocm|cuda`, default
+`vulkan`), the build runs `scripts/build-zinc.sh` into `build/zinc/`, and
+`1bit lemonade` sets the `zinc` recipe's `zinc.zinc_bin` to that binary. A value
+you set yourself wins. The recipe is the local Lemonade delta 7
+(`third_party/lemonade/UPSTREAM.md`):
+
+- **Models.** Checkpoints are GGUF files that Lemonade downloads and resolves
+  with llamacpp's own rules. `Qwen3-0.6B-ZINC` is
+  `unsloth/Qwen3-0.6B-GGUF:Q4_K_M`.
+- **Load.** `zinc -m <gguf> -p <port> -c <ctx_size>`, with
+  `RADV_PERFTEST=coop_matrix` unless you already set it, then wait on `/health`.
+- **Requests.** Sent without `model`, because zinc rejects any id except its
+  own. Replies carry the Lemonade name back.
+
+`tests/zinc_lemonade_e2e.sh` (ctest `zinc_lemonade_e2e`) passes on Strix Halo:
+pull, "Paris." under `Qwen3-0.6B-ZINC`, served by this build's zinc, and
+streaming. Lemonade's `/stats` reports 0 tok/s for zinc, because zinc's replies
+have no `timings` block.
+
 ## How it stays current
 
 `.github/workflows/bump-zinc.yml` runs daily. When upstream `main` has moved, it

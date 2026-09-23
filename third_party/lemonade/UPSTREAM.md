@@ -53,6 +53,17 @@ The **local-only** deltas carried on top of v11.9.0 are:
    by Hugging Face id. Supported on `macos` only. **NOT upstream**: re-apply after a re-vendor, like
    `onebit`.
 
+7. **`zinc` backend** (1bit engine: GGUF through ZINC, including NVIDIA via its CUDA backend):
+   `src/cpp/include/lemon/backends/zinc/` (`zinc.h`, `zinc_server.h`),
+   `src/cpp/server/backends/zinc/zinc_server.cpp`, the `"zinc|zinc"` line in `CMakeLists.txt`'s
+   `LEMON_BACKENDS`, and `Qwen3-0.6B-ZINC` (`recipe: zinc`, a GGUF checkpoint) in
+   `src/cpp/resources/server_models.json`. The executor is the engine's own `zinc` build
+   (`third_party/zinc`, `scripts/build-zinc.sh`), found through the `zinc_bin` option, then
+   `$LEMONADE_ZINC_SERVER`, then `zinc` on PATH. GGUF download and resolution reuse llamacpp's ops.
+   `load()` spawns `zinc -m <gguf> -p <port> -c <ctx>` and waits on `/health`; requests go out
+   without `model`, because zinc rejects any id but its own. **NOT upstream**: re-apply after a
+   re-vendor, like `onebit`.
+
 > Note: the `stream_stall_timeout` config key that our v11.8.x snapshot carried
 > was **dropped** in this re-vendor — v11.9.0 handles the streaming-stall bound
 > via `global_timeout` (upstream #3386), and local review confirmed the extra

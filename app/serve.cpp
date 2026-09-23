@@ -49,7 +49,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
-#include <spawn.h>
+#include <sys/prctl.h>
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -109,6 +109,10 @@ std::string default_zinc() {
 #endif
 }
 
+// SIGTERM / SIGINT: stop serving and take the backend down with us.
+std::atomic<bool> g_stop{false};
+extern "C" void on_stop_signal(int) { g_stop = true; }
+
 int free_port() {
     const int s = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in a{};
@@ -145,8 +149,17 @@ public:
         std::vector<char*> envp;
         for (auto& e : env_store) envp.push_back(e.data());
         envp.push_back(nullptr);
-        if (::posix_spawnp(&pid_, args[0], nullptr, nullptr, args.data(), envp.data()) != 0)
-            throw std::runtime_error("cannot start " + argv[0] + ": " + std::strerror(errno));
+        const pid_t parent = ::getpid();
+        pid_ = ::fork();
+        if (pid_ < 0) throw std::runtime_error("cannot fork for " + argv[0] + ": " + std::strerror(errno));
+        if (pid_ == 0) {
+            // The kernel ends the child when `1bit serve` dies for any reason,
+            // SIGKILL included, so a backend is never left running on its own.
+            ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (::getppid() != parent) ::_exit(127);  // parent already gone
+            ::execvpe(args[0], args.data(), envp.data());
+            ::_exit(127);
+        }
     }
     ~Child() { stop(); }
     Child(const Child&) = delete;
@@ -167,12 +180,12 @@ public:
     bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
 
     // Polls the child's /health until it answers 200, it exits, or time runs out.
-    bool wait_ready(std::chrono::seconds timeout) const {
+    bool wait_ready(std::chrono::seconds timeout, const std::atomic<bool>& stop) const {
         httplib::Client c("127.0.0.1", port_);
         c.set_connection_timeout(1);
         const auto end = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < end) {
-            if (!alive()) return false;
+            if (!alive() || stop) return false;
             if (auto r = c.Get("/health"); r && r->status == 200) return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
@@ -299,15 +312,25 @@ int serve_gguf(const Options& o) {
         ~Stop() { s.stop(); if (t.joinable()) t.join(); }
     } stop{srv, listener};
 
+    struct sigaction sa{};
+    sa.sa_handler = on_stop_signal;
+    ::sigaction(SIGTERM, &sa, nullptr);
+    ::sigaction(SIGINT, &sa, nullptr);
     std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), device.c_str(), argv[0].c_str());
     child = std::make_unique<Child>(argv, env, child_port);
-    if (!child->wait_ready(std::chrono::seconds(600))) {
+    if (!child->wait_ready(std::chrono::seconds(600), g_stop)) {
+        if (g_stop) return 0;
         std::fprintf(stderr, "1bit serve: %s did not become ready\n", argv[0].c_str());
         return 1;
     }
     ready = true;
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d\n", o.host.c_str(), o.port);
-    while (child->alive()) std::this_thread::sleep_for(std::chrono::milliseconds(500));
+    while (child->alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (g_stop) {
+        std::fprintf(stderr, "1bit serve: stopping\n");
+        child->stop();
+        return 0;
+    }
     std::fprintf(stderr, "1bit serve: the %s backend exited\n", device.c_str());
     return 1;
 }

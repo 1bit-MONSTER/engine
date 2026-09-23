@@ -39,3 +39,35 @@ with AMD Ryzen AI hardware behind it:
 ## License
 
 Apache-2.0. See [LICENSE](LICENSE).
+
+## Thank you
+
+**[Osmantic / ODS](https://github.com/Osmantic/ODS) comes first.** ODS introduced me to
+vibecoding, and that is where all of this started. Without it, this engine would not exist.
+
+**The Lemonade team and AMD's developers.** [Lemonade](https://github.com/lemonade-sdk/lemonade)
+runs inside this binary. AMD's developers left breadcrumbs all over the place: the XDNA driver
+and XRT, IRON and Peano, HRX, their tested llama.cpp integration, their issues, their examples.
+This engine is what following those breadcrumbs built.
+
+The repositories this engine is built on, in order of importance:
+
+| # | Repository | What it gives this engine | License |
+|---|---|---|---|
+| 1 | [amd/xdna-driver](https://github.com/amd/xdna-driver) | The XDNA 2 NPU driver and its XRT shim | Apache-2.0 (shim) |
+| 2 | [Xilinx/XRT](https://github.com/Xilinx/XRT) | The runtime every NPU kernel runs through: full ELFs, hardware contexts, buffers | Apache-2.0 (userspace) |
+| 3 | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) | IRON and aiecc: how our own NPU kernels are written and compiled | Apache-2.0 WITH LLVM-exception |
+| 4 | [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) | Peano, the C++ compiler for the NPU's AI Engine cores | Apache-2.0 WITH LLVM-exception |
+| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU: Vulkan and HRX in one build | MIT |
+| 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device | Apache-2.0 |
+| 7 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
+| 8 | [zolotukhin/zinc](https://github.com/zolotukhin/zinc) | Its own GPU kernels, and the engine's route to NVIDIA through CUDA | MIT |
+| 9 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
+| 10 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
+
+Also built on [nlohmann/json](https://github.com/nlohmann/json) (MIT),
+[yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT), and the libraries Lemonade
+builds with: curl, zstd, Mbed TLS, libwebsockets, CLI11 and Brotli.
+
+Every third-party copyright and license is listed in [NOTICE](NOTICE). Each project keeps its
+own license; nothing here relicenses anyone's work.

@@ -35,4 +35,9 @@
 	path = third_party/zinc
 	url = https://github.com/zolotukhin/zinc.git
 	branch = main
+# Linux kernel (docs/kernel.md): upstream torvalds/linux at a release tag, built
+# by scripts/build-kernel.sh; .github/workflows/bump-linux.yml keeps it current.
+[submodule "third_party/linux"]
+	path = third_party/linux
+	url = https://github.com/torvalds/linux.git
 	shallow = true

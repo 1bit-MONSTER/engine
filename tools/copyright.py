@@ -32,7 +32,7 @@ limitations under the License.""".split("\n")
 LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
-      ".gitignore", ".gitattributes", ".clang-format", "*.toml"), "#"),
+      ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment"), "#"),
 ]
 BLOCK_STYLES = [(("*.md",), ("<!--", "-->"))]
 

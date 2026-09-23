@@ -25,3 +25,10 @@
 	url = https://github.com/1bit-MONSTER/llama.cpp.git
 	branch = 1bit/hrx-vulkan
 	shallow = true
+# ZINC (docs/zinc.md): upstream zolotukhin/zinc, built by scripts/build-zinc.sh;
+# .github/workflows/bump-zinc.yml keeps it current.
+[submodule "third_party/zinc"]
+	path = third_party/zinc
+	url = https://github.com/zolotukhin/zinc.git
+	branch = main
+	shallow = true

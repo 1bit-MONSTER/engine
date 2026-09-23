@@ -17,7 +17,7 @@
 // behind the OpenAI endpoints Lemonade's `onebit` backend forwards to
 // (third_party/lemonade/src/cpp/server/backends/onebit/onebit_server.cpp):
 //
-//   GET  /v1/health             200 once the model is on the device
+//   GET  /health, /v1/health    200 once the model is on the device
 //   GET  /v1/models             the one model
 //   POST /v1/chat/completions   ChatML prompt, greedy decoding, optional SSE stream
 //   POST /v1/completions        raw prompt
@@ -229,6 +229,11 @@ int run_unified(int argc, char** argv) {
     httplib::Server srv;
     std::atomic<bool> ready{false};
     srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& res) {
+        res.status = ready ? 200 : 503;
+        res.set_content(json{{"status", ready ? "ok" : "loading"}, {"model", e.id}, {"device", "npu"}}.dump(),
+                        "application/json");
+    });
+    srv.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
         res.set_content(json{{"status", ready ? "ok" : "loading"}, {"model", e.id}, {"device", "npu"}}.dump(),
                         "application/json");

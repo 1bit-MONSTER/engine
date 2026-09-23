@@ -38,6 +38,7 @@
 #include "model.h"
 #include "unified.h"
 #endif
+#include "serve.h"
 
 #include <chrono>
 #include <cstdio>
@@ -61,6 +62,7 @@ void usage(FILE* out) {
                  "\n"
                  "commands:\n"
                  "  lemonade [lemond options]   run Lemonade's server with the engine behind it\n"
+                 "  serve -m <model>            one model on any device, OpenAI-compatible API\n"
 #ifdef ONEBIT_NPU
                  "  unified -m <model dir>      serve one NPU model (OpenAI endpoints)\n"
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
@@ -236,6 +238,14 @@ int main(int argc, char** argv) {
         std::vector<char*> args{argv[0]};
         for (int i = 2; i < argc; ++i) args.push_back(argv[i]);
         return run_lemonade(static_cast<int>(args.size()), args.data());
+    }
+    if (cmd == "serve") {
+        try {
+            return onebit::run_serve(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit serve: %s\n", e.what());
+            return 1;
+        }
     }
 #ifdef ONEBIT_NPU
     if (cmd == "unified") {

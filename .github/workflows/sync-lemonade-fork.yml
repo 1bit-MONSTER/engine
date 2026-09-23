@@ -30,6 +30,11 @@ on:
   schedule:
     - cron: "17 8 * * *"
   workflow_dispatch:
+    inputs:
+      selftest:
+        description: "Prove the token's write access to the fork (branch push, PR open/close, workflow disable) and leave the fork unchanged"
+        type: boolean
+        default: false
 
 permissions:
   contents: read
@@ -54,7 +59,35 @@ jobs:
             exit 1
           fi
 
+      - name: Self-test the token's write access to the fork
+        if: ${{ inputs.selftest }}
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          branch="sync-selftest/${GITHUB_RUN_ID}"
+          git clone -q --filter=blob:none --depth 1 "https://x-access-token:${TOKEN}@github.com/${FORK}.git" st
+          cd st
+          git push -q origin "HEAD:refs/heads/${branch}"
+          echo "PASS contents: pushed ${branch}"
+          git config user.name "lemonade-fork-sync"
+          git config user.email "lemonade-fork-sync@users.noreply.github.com"
+          git commit -q --allow-empty -m "sync self-test (empty commit, closed and deleted by the same run)"
+          git push -q origin "HEAD:refs/heads/${branch}"
+          url=$(gh pr create --repo "$FORK" --base main --head "$branch" --draft \
+                  --title "sync self-test ${GITHUB_RUN_ID}" --body "Opened and closed by the self-test in 1bit-MONSTER/engine's sync-lemonade-fork workflow.")
+          gh pr close "$url" --repo "$FORK" --delete-branch > /dev/null
+          echo "PASS pull requests: opened and closed ${url}"
+          git ls-remote --exit-code origin "refs/heads/${branch}" > /dev/null && { echo "::error::self-test branch was not deleted"; exit 1; }
+          echo "PASS contents: deleted ${branch}"
+          id=$(gh api "repos/${FORK}/actions/workflows" --jq '.workflows[0].id')
+          gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null
+          echo "PASS actions: disabled workflow ${id} (already disabled; no change)"
+          echo "SELFTEST PASSED: the token can do everything the sync needs"
+
       - name: Merge upstream main into the fork
+        if: ${{ !inputs.selftest }}
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}

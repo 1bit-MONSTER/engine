@@ -30,8 +30,9 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
 > [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on
-> Strix Halo, and the Lemonade recipe that runs it (`onebit`) passes Lemonade's own LLM test suite on
-> Vulkan and HRX and is being prepared for upstream. Following geramyL's review the engine no longer
+> Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
+> [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
+> suite on Vulkan and HRX. Following geramyL's review the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX + Vulkan in
 > one build on AMD's live ggml-hrx ([docs/hrx.md](docs/hrx.md)), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from

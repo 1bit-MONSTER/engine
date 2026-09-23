@@ -16,7 +16,7 @@
 #
 # End to end on AMD hardware: `1bit lemonade` built with ONEBIT_HRX loads the
 # same checkpoint through both recipes and generates. The llamacpp recipe must
-# run it on Vulkan0 and the llamacpp-hrx recipe on HRX20, both through this
+# run it on Vulkan0 and the llamacpp-hrx recipe on HRX0, both through this
 # build's llama-server. Scratch cache/config dirs; models come from the HF cache.
 #
 # usage: tests/hrx_lemonade_e2e.sh path/to/1bit path/to/llama-server
@@ -38,7 +38,7 @@ api="http://127.0.0.1:$port/api/v1"
 for _ in $(seq 1 120); do curl -sf "$api/health" >/dev/null && break; sleep 0.5; done
 
 # model recipe expected-device
-for spec in "Qwen3-0.6B-GGUF llamacpp Vulkan0" "Qwen3-0.6B-HRX llamacpp-hrx HRX20"; do
+for spec in "Qwen3-0.6B-GGUF llamacpp Vulkan0" "Qwen3-0.6B-HRX llamacpp-hrx HRX0"; do
     set -- $spec
     model=$1; recipe=$2; device=$3
     pull=$(curl -s -X POST "$api/pull" -H 'Content-Type: application/json' -d "{\"model_name\": \"$model\"}")

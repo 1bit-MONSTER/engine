@@ -70,9 +70,9 @@ void usage(FILE* out) {
 }
 
 #ifdef ONEBIT_HRX_SERVER
-// Points Lemonade at this build's llama-server (HRX2 + Vulkan in one binary,
-// docs/hrx.md): the llamacpp-hrx recipe runs Q4NX on HRX20, and the llamacpp
-// recipe runs GGUF on Vulkan0, the faster device for standard quants. The
+// Points Lemonade at this build's llama-server (HRX + Vulkan in one binary,
+// docs/hrx.md): the llamacpp-hrx recipe runs on HRX0 (AMD's ggml-hrx), and the
+// llamacpp recipe runs GGUF on Vulkan0, the faster device for standard quants. The
 // config arrives merged with Lemonade's defaults, so only default values
 // ("builtin", "auto", unset) are replaced; anything else the user set wins.
 void use_engine_hrx_build(nlohmann::json& config) {
@@ -82,10 +82,14 @@ void use_engine_hrx_build(nlohmann::json& config) {
         if (!sec.contains(key) || sec[key] == "" || sec[key] == default_value) sec[key] = value;
     };
     set_default("hrx", "hrx_bin", "builtin", ONEBIT_HRX_SERVER);
-    set_default("hrx", "device", "", "HRX20");
+    set_default("hrx", "device", "", "HRX0");
     set_default("llamacpp", "vulkan_bin", "builtin", ONEBIT_HRX_SERVER);
     set_default("llamacpp", "backend", "auto", "vulkan");
     set_default("llamacpp", "device", "", "Vulkan0");
+    // HRX dlopens the HSA runtime; the distro's rejects gfx1151's PM4-emulation
+    // probe and HRX registers no device. llama-server inherits this environment,
+    // so point it at TheRock's unless the user already chose one.
+    setenv("IREE_HAL_AMDGPU_LIBHSA_PATH", ONEBIT_HRX_LIBHSA, /*overwrite=*/0);
 }
 #endif
 

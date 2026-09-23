@@ -26,10 +26,12 @@ with AMD Ryzen AI hardware behind it:
 - every Hugging Face model architecture, kept current by a daily census
 
 > **Status:** steps 1–3 of 5 have landed: embedded Lemonade ([docs/lemonade.md](docs/lemonade.md)),
-> HRX + Vulkan in one build ([docs/hrx.md](docs/hrx.md)), and the NPU fast lane on full ELFs
-> ([docs/npu.md](docs/npu.md)). Also: MLX on Apple Silicon ([docs/apple.md](docs/apple.md)), and
-> ZINC with NVIDIA through its CUDA backend ([docs/zinc.md](docs/zinc.md)). The working engine is
-> being ported from [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see
+> HRX + Vulkan in one build on AMD's live ggml-hrx ([docs/hrx.md](docs/hrx.md)), and the NPU engine on
+> full ELFs with the upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is
+> not yet built from source). Also: MLX on Apple Silicon through Lemonade's `mlx` recipe
+> ([docs/apple.md](docs/apple.md)), and ZINC, which reaches NVIDIA GPUs through its CUDA backend
+> ([docs/zinc.md](docs/zinc.md)). Next is step 4, the Laya router. The working engine is being ported from
+> [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER) in five steps; see
 > [docs/PORTING.md](docs/PORTING.md). Measured results are on the
 > [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository holds the verified code
 > without the development history.

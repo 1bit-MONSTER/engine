@@ -79,26 +79,33 @@ cmake --build build --target onebit
   llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. To run
   llama-server or llama-bench by hand, export that variable yourself.
 
-## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `fab1624`)
+## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)
 
-`tests/hrx_lemonade_e2e.sh` passes. `unsloth/Qwen3-0.6B-GGUF:Q4_0` answers
-"Paris" through both recipes, served by this build's llama-server on `Vulkan0`
-and on `HRX0`.
+`tests/hrx_lemonade_e2e.sh` and `ctest` pass, re-run after the first daily bump
+(#13). `unsloth/Qwen3-0.6B-GGUF:Q4_0` answers "Paris" through both recipes,
+served by this build's llama-server on `Vulkan0` and on `HRX0`.
 
 llama-bench, Qwen3-0.6B, pp512 / tg128 tok/s, against the previous build (April
 llama.cpp with ggml-hrx2 on `HRX20`):
 
 | Device, file | previous build | this build |
 |---|---|---|
-| Vulkan0, Q4_K_M | 10627 / 306 | **13905 / 338** |
-| Vulkan0, UD-Q4_K_XL | 10668 / ~300 | 13505 / 330 |
-| HRX, Q4_K_M | 1046 / 68 | **21702 / 303** |
-| HRX, UD-Q4_K_XL | 837 / 83 | 18059 / 288 |
+| Vulkan0, Q4_K_M | 10627 / 306 | **14097 / 349** |
+| Vulkan0, UD-Q4_K_XL | 10668 / ~300 | 13943 / 324 |
+| HRX, Q4_K_M | 1046 / 68 | **21990 / 314** |
+| HRX, UD-Q4_K_XL | 837 / 83 | 17906 / 293 |
+| Vulkan0, BF16 | n/a / 115 | 4504 / 144 |
+| HRX, BF16 | n/a / 40 | 7646 / 101 |
 
 HRX prefill is now faster than Vulkan's.
 
 ## Not yet
 
+- **IQ2/IQ3 types on HRX.** ggml-hrx has no IQ3_XXS matmul, but it still accepts
+  the op when the graph is scheduled, so there is no CPU fallback and the decode
+  fails (`unsupported HRX node ... iq3_xxs`). The Unsloth Dynamic UD-Q2_K_XL,
+  UD-IQ2_M and UD-IQ1_S files fail on `HRX0` for this reason; they run on
+  `Vulkan0`. UD-Q4_K_XL runs on both.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
   They are kept on `1bit/hrx2-archive` until they are ported.
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows

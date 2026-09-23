@@ -27,8 +27,8 @@ Step 3 lands in three parts:
 | Part | What | State |
 |---|---|---|
 | 3a | Full-ELF generation: per-context control code and full-ELF assembly | landed (#8) |
-| 3b | The lane runtime: model reader, buffer packing, runlist decode (`npu/lane`, `npu/generate`, `1bit npu-run`) | **this PR** |
-| 3c | Serving: tokenizer, `1bit unified`, NPU models registered with Lemonade's `onebit` recipe | **this PR** |
+| 3b | The lane runtime: model reader, buffer packing, runlist decode (`npu/lane`, `npu/generate`, `1bit npu-run`) | landed (#9) |
+| 3c | Serving: tokenizer, `1bit unified`, NPU models registered with Lemonade's `onebit` recipe | landed (#9) |
 
 ## A model directory
 
@@ -216,7 +216,7 @@ lm-head artifacts do not meet that rule yet:
 - The instruction ELFs came from the old per-context generator.
 - The PDI came from the rounding-fixed `layer.xclbin` (1bit-MONSTER #2651).
 
-This PR removes the need for per-context files and for the xclbin at run time. It does
+Step 3a removed the need for per-context files and for the xclbin at run time. It does
 not produce the kernel itself. The from-source 16-tile kernel (1bit-MONSTER #2666) dispatches at 0.343 ms per layer,
 but it does not decode correctly yet: 0/24 tokens (#2668). Replacing the artifacts with
 a from-source kernel is tracked in [PORTING.md](PORTING.md).

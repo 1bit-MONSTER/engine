@@ -70,26 +70,22 @@ Qwen3.5-0.8B (`UD-Q4_K_XL`) fails with `MissingTensor`. Vulkan runs `qwen3`.
 ZINC has no BF16 weight path, so use a quantized GGUF. For example, the
 BF16 golden `Qwen3-0.6B-BF16.gguf` fails with `UnsupportedQuantType` (type 30).
 
-## Served by Lemonade
+## Served by `1bit serve`
 
 With `-DONEBIT_ZINC=ON` (and `-DONEBIT_ZINC_BACKEND=vulkan|rocm|cuda`, default
 `vulkan`), the build runs `scripts/build-zinc.sh` into `build/zinc/`, and
-`1bit lemonade` sets the `zinc` recipe's `zinc.zinc_bin` to that binary. A value
-you set yourself wins. The recipe is the local Lemonade delta 7
-(`third_party/lemonade/UPSTREAM.md`):
+`1bit serve --device zinc` runs that binary ([serve.md](serve.md)):
 
-- **Models.** Checkpoints are GGUF files that Lemonade downloads and resolves
-  with llamacpp's own rules. `Qwen3-0.6B-ZINC` is
-  `unsloth/Qwen3-0.6B-GGUF:Q4_K_M`.
-- **Load.** `zinc -m <gguf> -p <port> -c <ctx_size>`, with
+- **Load.** `zinc -m <gguf> -p <port> -c <ctx_size>` as a private child, with
   `RADV_PERFTEST=coop_matrix` unless you already set it, then wait on `/health`.
 - **Requests.** Sent without `model`, because zinc rejects any id except its
-  own. Replies carry the Lemonade name back.
+  own. Replies carry the served name.
 
-`tests/zinc_lemonade_e2e.sh` (ctest `zinc_lemonade_e2e`) passes on Strix Halo:
-pull, "Paris." under `Qwen3-0.6B-ZINC`, served by this build's zinc, and
-streaming. Lemonade's `/stats` reports 0 tok/s for zinc, because zinc's replies
-have no `timings` block.
+`tests/serve_e2e.sh <1bit> <gguf> zinc` passes on Strix Halo: "Paris." under the
+served name, and streaming. (Before the engine stopped embedding Lemonade, the
+same launch contract was a local Lemonade recipe, `zinc`, whose e2e also
+passed.) zinc's replies carry no `timings` block, so hosts that read one report
+0 tok/s for it.
 
 ## How it stays current
 

@@ -28,16 +28,32 @@ enable_testing()
 
 # Components are ported in the order listed in docs/PORTING.md.
 
-# ── Step 1: Lemonade's server core, embedded ───────────────────────────────
-# Vendored at third_party/lemonade (v11.9.0 plus the local deltas listed in
-# its UPSTREAM.md, including the `onebit` backend).
-set(BUILD_WEB_APP OFF CACHE BOOL "" FORCE)
-set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
-add_subdirectory(third_party/lemonade EXCLUDE_FROM_ALL)
+# ── The engine binary: `1bit serve`, an OpenAI-compatible API (docs/serve.md)
+# The engine is a backend a host such as Lemonade launches; it no longer embeds
+# one. JSON and the HTTP server/client are pinned here, at the commits the
+# engine used before (nlohmann/json v3.11.3, cpp-httplib v0.47.0).
+include(FetchContent)
+find_package(Threads REQUIRED)
+set(JSON_BuildTests OFF CACHE INTERNAL "")
+FetchContent_Declare(json
+    GIT_REPOSITORY https://github.com/nlohmann/json.git
+    GIT_TAG 9cca280a4d0ccf0c08f47a99aa71d1b0e52f8d03)  # v3.11.3
+set(HTTPLIB_USE_OPENSSL_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZLIB_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_BROTLI_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_USE_ZSTD_IF_AVAILABLE OFF CACHE BOOL "" FORCE)
+set(HTTPLIB_INSTALL OFF CACHE BOOL "" FORCE)
+FetchContent_Declare(httplib
+    GIT_REPOSITORY https://github.com/yhirose/cpp-httplib.git
+    GIT_TAG fe332fa06bac76a1c6d402c08f414052999347da)  # v0.47.0
+FetchContent_MakeAvailable(json httplib)
 
 add_executable(onebit app/main.cpp app/serve.cpp)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
-target_link_libraries(onebit PRIVATE lemonade-server-core)
+target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+
+# Runs everywhere, CI included: serve's proxy against a fake backend.
+add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
@@ -45,7 +61,7 @@ set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 
 # ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
 # Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
-# only runs on AMD GPUs. `1bit lemonade` then uses this llama-server for both
+# only runs on AMD GPUs. `1bit serve` then uses this llama-server for both
 # the llamacpp-hrx recipe (HRX0) and the llamacpp recipe's Vulkan backend.
 option(ONEBIT_HRX "Build HRX + Vulkan llama-server and wire it into Lemonade" OFF)
 if(ONEBIT_HRX)
@@ -58,13 +74,11 @@ if(ONEBIT_HRX)
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
         endforeach()
     endif()
-    add_test(NAME hrx_lemonade_e2e
-             COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_HRX_SERVER})
 endif()
 
 # ── ZINC (docs/zinc.md) ────────────────────────────────────────────────────
 # Off by default: it builds third_party/zinc with scripts/build-zinc.sh (which
-# fetches its own Zig) for one GPU backend. `1bit lemonade` then serves the zinc
+# fetches its own Zig) for one GPU backend. `1bit serve --device zinc` then runs the zinc
 # recipe with this binary. ONEBIT_ZINC_BACKEND=cuda is the NVIDIA build.
 option(ONEBIT_ZINC "Build ZINC (third_party/zinc) and wire it into Lemonade" OFF)
 if(ONEBIT_ZINC)
@@ -84,8 +98,6 @@ if(ONEBIT_ZINC)
         add_test(NAME serve_e2e_zinc
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} zinc)
     endif()
-    add_test(NAME zinc_lemonade_e2e
-             COMMAND ${CMAKE_SOURCE_DIR}/tests/zinc_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_ZINC_SERVER})
 endif()
 
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────
@@ -183,11 +195,11 @@ if(ONEBIT_NPU)
     endif()
 endif()
 
-add_test(NAME smoke_lemonade COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_lemonade.sh $<TARGET_FILE:onebit>)
 
-# MLX on Apple Silicon through Lemonade's mlx backend (docs/apple.md).
-set(ONEBIT_MLX_SERVER "" CACHE FILEPATH "lemon-mlx-engine's server binary, for tests/mlx_lemonade_e2e.sh")
+# MLX on Apple Silicon: `1bit serve --device mlx` (docs/apple.md).
+set(ONEBIT_MLX_SERVER "" CACHE FILEPATH "lemon-mlx-engine's server binary, for serve_e2e_mlx")
 if(APPLE AND ONEBIT_MLX_SERVER)
-    add_test(NAME mlx_lemonade_e2e
-             COMMAND ${CMAKE_SOURCE_DIR}/tests/mlx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_MLX_SERVER})
+    add_test(NAME serve_e2e_mlx
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> mlx-community/Qwen3-0.6B-4bit mlx
+                     --mlx-server ${ONEBIT_MLX_SERVER})
 endif()

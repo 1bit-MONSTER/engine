@@ -18,7 +18,7 @@
 # (docs/hrx.md, "Staying current"). When AMD moves its pins, this workflow:
 #   1. syncs 1bit-MONSTER/llama.cpp: master to ggml-org, 1bit/hrx-vulkan to AMD's pin;
 #   2. opens a PR here moving both submodules.
-# GitHub-hosted CI builds that PR without HRX; run tests/hrx_lemonade_e2e.sh on
+# GitHub-hosted CI builds that PR without HRX; run tests/serve_e2e.sh on
 # Strix Halo before merging it.
 #
 # Needs the secret HRX_BUMP_TOKEN: a fine-grained token with Contents
@@ -127,4 +127,4 @@ jobs:
           | third_party/hrx-system (ROCm/hrx-system) | \`${OURS_HRX:0:12}\` | \`${AMD_HRX:0:12}\` |
 
           CI here builds without HRX. Before merging, on Strix Halo:
-          \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && tests/hrx_lemonade_e2e.sh build/1bit build/hrx/llama/bin/llama-server\`"
+          \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && for d in vulkan hrx; do tests/serve_e2e.sh build/1bit <Qwen3-0.6B Q4_K_M .gguf> \$d; done\`"

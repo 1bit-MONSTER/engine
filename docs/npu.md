@@ -28,7 +28,7 @@ Step 3 lands in three parts:
 |---|---|---|
 | 3a | Full-ELF generation: per-context control code and full-ELF assembly | landed (#8) |
 | 3b | The lane runtime: model reader, buffer packing, runlist decode (`npu/lane`, `npu/generate`, `1bit npu-run`) | landed (#9) |
-| 3c | Serving: tokenizer, `1bit unified`, NPU models registered with Lemonade's `onebit` recipe | landed (#9) |
+| 3c | Serving: tokenizer, `1bit unified` (now `1bit serve`'s NPU route) | landed (#9) |
 
 ## A model directory
 
@@ -44,9 +44,9 @@ Step 3 lands in three parts:
   npu/layer.pdi          the design both kernels run on
 ```
 
-`1bit lemonade` registers every such directory under `ONEBIT_MODEL_ROOTS`
-(colon-separated, default `~/models`) as a `onebit` model; Lemonade serves it by
-spawning `1bit unified -m <model dir>`.
+`1bit serve -m <model dir>` serves such a directory on the NPU behind the
+OpenAI-compatible API ([serve.md](serve.md)); a host such as Lemonade launches
+it like any other backend.
 
 ## Inputs
 

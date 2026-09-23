@@ -17,13 +17,13 @@ limitations under the License.
 # `1bit serve`: the engine behind one OpenAI-compatible API
 
 The engine is a backend that a host launches, the way Lemonade launches
-`llama-server`. It exposes nothing but an OpenAI-compatible API. (The embedded
-Lemonade of step 1 is on its way out; see PORTING.md.)
+`llama-server`. It exposes nothing but an OpenAI-compatible API
+([lemonade.md](lemonade.md)).
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|vulkan|hrx|zinc] [--ctx-size N] [--alias NAME]
-           [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH]
+           [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]
+           [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
 ```
 
 One model per process:
@@ -43,6 +43,7 @@ One model per process:
 | `.gguf` | `auto`, `vulkan` | this build's llama-server on `Vulkan0` |
 | `.gguf` | `hrx` | this build's llama-server on `HRX0` |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
+| Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 
 `chat_template_kwargs.enable_thinking: false` works on every device. The GPU
 backends apply the model's own chat template. The NPU route emits what Qwen3's
@@ -77,4 +78,8 @@ streaming:
 | `zinc` | PASS (6 SSE chunks) |
 
 ctest runs these as `serve_e2e_<device>` when configured with
-`-DONEBIT_SERVE_TEST_GGUF=<gguf>`.
+`-DONEBIT_SERVE_TEST_GGUF=<gguf>` (and `serve_e2e_mlx` on macOS with
+`-DONEBIT_MLX_SERVER`). `smoke_serve` runs everywhere, CI included:
+`tests/fake_backend.py` stands in for llama-server. It checks the proxy (`/health`,
+`/v1/models`, the reply rename, SSE relay) and that no backend outlives a
+SIGKILLed `serve`.

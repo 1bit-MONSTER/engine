@@ -41,3 +41,11 @@
 	path = third_party/linux
 	url = https://github.com/torvalds/linux.git
 	shallow = true
+# Laya (docs/laya.md): the step-4 router's upstream source, NandhaKishorM/laya.
+# The model checkpoints are pinned by Hugging Face revision in config/laya.json
+# and fetched by scripts/fetch-laya.sh; .github/workflows/bump-laya.yml keeps both current.
+[submodule "third_party/laya"]
+	path = third_party/laya
+	url = https://github.com/NandhaKishorM/laya.git
+	branch = main
+	shallow = true

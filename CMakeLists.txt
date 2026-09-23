@@ -52,4 +52,21 @@ if(ONEBIT_HRX)
              COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_HRX_SERVER})
 endif()
 
+# ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
+# 3a: full-ELF generation. Pure C++, no XRT, so it builds and tests anywhere.
+add_library(onebit_npu STATIC npu/full_elf.cpp)
+target_include_directories(onebit_npu PUBLIC npu)
+
+add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
+target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
+add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)
+# Against a model's kernel artifacts (docs/npu.md, "Checking the generator").
+set(ONEBIT_NPU_CAPTURED "" CACHE PATH "Directory of captured layer_ctx<N>.elf instruction ELFs")
+set(ONEBIT_NPU_PDI "" CACHE FILEPATH "The layer kernel's design PDI")
+set(ONEBIT_NPU_GOLDEN "" CACHE PATH "Directory of full ELFs the fast lane ran")
+if(ONEBIT_NPU_CAPTURED AND ONEBIT_NPU_PDI AND ONEBIT_NPU_GOLDEN)
+    add_test(NAME npu_full_elf_model
+             COMMAND npu_full_elf_test ${ONEBIT_NPU_CAPTURED} ${ONEBIT_NPU_PDI} ${ONEBIT_NPU_GOLDEN})
+endif()
+
 add_test(NAME smoke_lemonade COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_lemonade.sh $<TARGET_FILE:onebit>)

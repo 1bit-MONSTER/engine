@@ -3120,6 +3120,15 @@
         "hrx_serve": "NO (GET_ROWS)",
         "hrx_embd_w": 2048
     },
+    "Qwen3-0.6B-ZINC": {
+        "checkpoint": "unsloth/Qwen3-0.6B-GGUF:Q4_K_M",
+        "recipe": "zinc",
+        "labels": [
+            "chat",
+            "reasoning"
+        ],
+        "size": 0.4
+    },
     "Qwen3-0.6B-MLX": {
         "checkpoint": "mlx-community/Qwen3-0.6B-4bit",
         "recipe": "mlx",

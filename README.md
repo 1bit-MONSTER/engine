@@ -21,13 +21,17 @@ with AMD Ryzen AI hardware behind it:
 
 - the XDNA 2 NPU engine
 - HRX and Vulkan on the Radeon iGPU, compiled together in one llama.cpp build
+- ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - Laya, which decides where each request runs
 - every Hugging Face model architecture, kept current by a daily census
 
-> **Status:** steps 1–2 of 5 have landed: embedded Lemonade ([docs/lemonade.md](docs/lemonade.md))
-> and HRX + Vulkan in one build ([docs/hrx.md](docs/hrx.md)). The working engine is being ported from
-> [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER) in five steps; see
-> [docs/PORTING.md](docs/PORTING.md). This repository holds the verified code
+> **Status:** steps 1–3 of 5 have landed: embedded Lemonade ([docs/lemonade.md](docs/lemonade.md)),
+> HRX + Vulkan in one build ([docs/hrx.md](docs/hrx.md)), and the NPU fast lane on full ELFs
+> ([docs/npu.md](docs/npu.md)). Also: MLX on Apple Silicon ([docs/apple.md](docs/apple.md)), and
+> ZINC with NVIDIA through its CUDA backend ([docs/zinc.md](docs/zinc.md)). The working engine is
+> being ported from [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see
+> [docs/PORTING.md](docs/PORTING.md). Measured results are on the
+> [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository holds the verified code
 > without the development history.
 
 ## License

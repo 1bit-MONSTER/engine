@@ -82,8 +82,11 @@ jobs:
           git ls-remote --exit-code origin "refs/heads/${branch}" > /dev/null && { echo "::error::self-test branch was not deleted"; exit 1; }
           echo "PASS contents: deleted ${branch}"
           id=$(gh api "repos/${FORK}/actions/workflows" --jq '.workflows[0].id')
+          # Disabling an already-disabled workflow is refused, so enable it and
+          # disable it again: the same permission, and the fork ends as it started.
+          gh api -X PUT "repos/${FORK}/actions/workflows/${id}/enable" > /dev/null
           gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null
-          echo "PASS actions: disabled workflow ${id} (already disabled; no change)"
+          echo "PASS actions: enabled and disabled workflow ${id}"
           echo "SELFTEST PASSED: the token can do everything the sync needs"
 
       - name: Merge upstream main into the fork

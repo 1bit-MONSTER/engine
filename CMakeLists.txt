@@ -35,9 +35,13 @@ set(BUILD_WEB_APP OFF CACHE BOOL "" FORCE)
 set(BUILD_TESTING OFF CACHE BOOL "" FORCE)
 add_subdirectory(third_party/lemonade EXCLUDE_FROM_ALL)
 
-add_executable(onebit app/main.cpp)
+add_executable(onebit app/main.cpp app/serve.cpp)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE lemonade-server-core)
+
+# ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
+# Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
+set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 
 # ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
 # Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
@@ -48,6 +52,12 @@ if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
     add_dependencies(onebit llama_hrx)
     target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}")
+    if(ONEBIT_SERVE_TEST_GGUF)
+        foreach(_dev vulkan hrx)
+            add_test(NAME serve_e2e_${_dev}
+                     COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
+        endforeach()
+    endif()
     add_test(NAME hrx_lemonade_e2e
              COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_HRX_SERVER})
 endif()
@@ -70,6 +80,10 @@ if(ONEBIT_ZINC)
         USES_TERMINAL)
     add_dependencies(onebit zinc)
     target_compile_definitions(onebit PRIVATE ONEBIT_ZINC_SERVER="${ONEBIT_ZINC_SERVER}")
+    if(ONEBIT_SERVE_TEST_GGUF)
+        add_test(NAME serve_e2e_zinc
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} zinc)
+    endif()
     add_test(NAME zinc_lemonade_e2e
              COMMAND ${CMAKE_SOURCE_DIR}/tests/zinc_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_ZINC_SERVER})
 endif()

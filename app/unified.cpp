@@ -17,7 +17,7 @@
 // behind the OpenAI endpoints Lemonade's `onebit` backend forwards to
 // (third_party/lemonade/src/cpp/server/backends/onebit/onebit_server.cpp):
 //
-//   GET  /v1/health             200 once the model is on the device
+//   GET  /health, /v1/health    200 once the model is on the device
 //   GET  /v1/models             the one model
 //   POST /v1/chat/completions   ChatML prompt, greedy decoding, optional SSE stream
 //   POST /v1/completions        raw prompt
@@ -59,7 +59,7 @@ struct Engine {
 // The chat scaffold for the model families the lane serves. Hugging Face ships
 // the template as Jinja; ChatML is what Qwen2 and Qwen3 render it to for plain
 // text messages, with generation starting after "<|im_start|>assistant\n".
-std::string chatml(const json& messages) {
+std::string chatml(const json& messages, bool thinking = true) {
     std::string p;
     for (const auto& m : messages) {
         std::string content;
@@ -72,7 +72,11 @@ std::string chatml(const json& messages) {
         }
         p += "<|im_start|>" + m.at("role").get<std::string>() + "\n" + content + "<|im_end|>\n";
     }
-    return p + "<|im_start|>assistant\n";
+    p += "<|im_start|>assistant\n";
+    // chat_template_kwargs.enable_thinking = false: what Qwen3's own template
+    // emits, an empty think block, so the model answers directly.
+    if (!thinking) p += "<think>\n\n</think>\n\n";
+    return p;
 }
 
 // The longest prefix of `s` that does not end inside a UTF-8 sequence.
@@ -102,7 +106,10 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     }
     std::string prompt;
     try {
-        prompt = chat ? chatml(body.at("messages")) : body.at("prompt").get<std::string>();
+        bool thinking = true;
+        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
+            thinking = body["chat_template_kwargs"].value("enable_thinking", true);
+        prompt = chat ? chatml(body.at("messages"), thinking) : body.at("prompt").get<std::string>();
     } catch (const std::exception& ex) {
         res.status = 400;
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
@@ -203,7 +210,7 @@ bool is_npu_model_dir(const std::string& dir) {
 }
 
 int run_unified(int argc, char** argv) {
-    std::string model_dir, host = "127.0.0.1";
+    std::string model_dir, host = "127.0.0.1", alias;
     int port = 8000;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -214,8 +221,9 @@ int run_unified(int argc, char** argv) {
         if (a == "-m" || a == "--model") model_dir = next();
         else if (a == "-p" || a == "--port") port = std::stoi(next());
         else if (a == "--host") host = next();
+        else if (a == "--alias") alias = next();
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1]\n"
+            std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json and npu/ (the lane's kernels)\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
@@ -225,10 +233,15 @@ int run_unified(int argc, char** argv) {
     if (std::filesystem::is_regular_file(model_dir)) model_dir = std::filesystem::path(model_dir).parent_path().string();
 
     Engine e;
-    e.id = std::filesystem::path(model_dir).filename().string();
+    e.id = alias.empty() ? std::filesystem::path(model_dir).filename().string() : alias;
     httplib::Server srv;
     std::atomic<bool> ready{false};
     srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& res) {
+        res.status = ready ? 200 : 503;
+        res.set_content(json{{"status", ready ? "ok" : "loading"}, {"model", e.id}, {"device", "npu"}}.dump(),
+                        "application/json");
+    });
+    srv.Get("/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
         res.set_content(json{{"status", ready ? "ok" : "loading"}, {"model", e.id}, {"device", "npu"}}.dump(),
                         "application/json");

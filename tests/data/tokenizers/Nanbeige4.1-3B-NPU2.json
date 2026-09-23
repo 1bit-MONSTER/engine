@@ -1,0 +1,361 @@
+{
+ "source": "tokenizers 0.23.2, Nanbeige4.1-3B-NPU2 tokenizer.json sha256 1d8f03269101",
+ "add_special": false,
+ "cases": [
+  {
+   "text": "The capital of France is",
+   "ids": [
+    363,
+    5463,
+    290,
+    7914,
+    322
+   ],
+   "decoded": "The capital of France is"
+  },
+  {
+   "text": "Hello, world! How's it going?",
+   "ids": [
+    23877,
+    152363,
+    1427,
+    152518,
+    1064,
+    152402,
+    152350,
+    388,
+    2087,
+    152470
+   ],
+   "decoded": "Hello, world! How's it going?"
+  },
+  {
+   "text": "  leading and   inner   spaces\tand\ttabs\n\nnewlines",
+   "ids": [
+    259,
+    4646,
+    297,
+    259,
+    6960,
+    259,
+    8347,
+    12,
+    407,
+    12,
+    46403,
+    13,
+    13,
+    2071,
+    7707
+   ],
+   "decoded": "  leading and   inner   spaces\tand\ttabs\n\nnewlines"
+  },
+  {
+   "text": "Numbers: 3.14159, 1,000,000 and 2026-09-23T17:30:00Z",
+   "ids": [
+    32050,
+    152382,
+    152343,
+    152385,
+    152361,
+    152367,
+    152395,
+    152367,
+    152394,
+    152398,
+    152363,
+    152343,
+    152367,
+    152363,
+    152368,
+    152368,
+    152368,
+    152363,
+    152368,
+    152368,
+    152368,
+    297,
+    152343,
+    152375,
+    152368,
+    152375,
+    152408,
+    152369,
+    152368,
+    152398,
+    152369,
+    152375,
+    152385,
+    152376,
+    152367,
+    152413,
+    152382,
+    152385,
+    152368,
+    152382,
+    152368,
+    152368,
+    152634
+   ],
+   "decoded": "Numbers: 3.14159, 1,000,000 and 2026-09-23T17:30:00Z"
+  },
+  {
+   "text": "def f(x):\n    return x**2  # square\n",
+   "ids": [
+    862,
+    283,
+    152374,
+    152381,
+    1123,
+    13,
+    264,
+    1590,
+    1056,
+    454,
+    152375,
+    259,
+    152458,
+    6457,
+    13
+   ],
+   "decoded": "def f(x):\n    return x**2  # square\n"
+  },
+  {
+   "text": "if (a != b && c <= d) { return std::max(a, b); }",
+   "ids": [
+    622,
+    326,
+    152346,
+    3198,
+    288,
+    3599,
+    273,
+    7840,
+    292,
+    152373,
+    500,
+    926,
+    4616,
+    1048,
+    3365,
+    152374,
+    152346,
+    152363,
+    288,
+    446,
+    603
+   ],
+   "decoded": "if (a != b && c <= d) { return std::max(a, b); }"
+  },
+  {
+   "text": "Ünïcödé naïve café résumé",
+   "ids": [
+    31243,
+    152349,
+    154564,
+    152355,
+    133060,
+    152734,
+    77485,
+    84959,
+    12351,
+    143404
+   ],
+   "decoded": "Ünïcödé naïve café résumé"
+  },
+  {
+   "text": "日本語のテキストと漢字",
+   "ids": [
+    35632,
+    156612,
+    154064,
+    156163,
+    156685,
+    67037,
+    154740,
+    158211,
+    152815
+   ],
+   "decoded": "日本語のテキストと漢字"
+  },
+  {
+   "text": "Привет, как дела?",
+   "ids": [
+    45969,
+    28727,
+    152363,
+    22816,
+    96278,
+    152470
+   ],
+   "decoded": "Привет, как дела?"
+  },
+  {
+   "text": "مرحبا بالعالم",
+   "ids": [
+    45105,
+    154968,
+    156300,
+    155335,
+    154233,
+    50173,
+    21899,
+    155716,
+    21899,
+    154936
+   ],
+   "decoded": "مرحبا بالعالم"
+  },
+  {
+   "text": "नमस्ते दुनिया",
+   "ids": [
+    152343,
+    156578,
+    156761,
+    156686,
+    155943,
+    156551,
+    156421,
+    152343,
+    157404,
+    157772,
+    156578,
+    156540,
+    156988,
+    155798
+   ],
+   "decoded": "नमस्ते दुनिया"
+  },
+  {
+   "text": "🤖🚀 emoji 👍🏽 and ZWJ 👩‍💻",
+   "ids": [
+    152343,
+    243,
+    162,
+    167,
+    153,
+    159100,
+    106765,
+    152343,
+    158080,
+    243,
+    162,
+    146,
+    192,
+    297,
+    1068,
+    152418,
+    152436,
+    152343,
+    243,
+    162,
+    148,
+    172,
+    155303,
+    243,
+    162,
+    149,
+    190
+   ],
+   "decoded": "🤖🚀 emoji 👍🏽 and ZWJ 👩‍💻"
+  },
+  {
+   "text": "I'm we're they've he'd she'll it's",
+   "ids": [
+    324,
+    152402,
+    152357,
+    457,
+    152402,
+    265,
+    623,
+    152402,
+    321,
+    430,
+    152402,
+    152354,
+    1097,
+    152402,
+    639,
+    388,
+    152402,
+    152350
+   ],
+   "decoded": "I'm we're they've he'd she'll it's"
+  },
+  {
+   "text": "<|im_start|>user\nWhat is 2+2?<|im_end|>",
+   "ids": [
+    166100,
+    2028,
+    13,
+    3512,
+    322,
+    152343,
+    152375,
+    152461,
+    152375,
+    152470,
+    166101
+   ],
+   "decoded": "<|im_start|> user\nWhat is 2+2?<|im_end|>"
+  },
+  {
+   "text": "",
+   "ids": [],
+   "decoded": ""
+  },
+  {
+   "text": " ",
+   "ids": [
+    259
+   ],
+   "decoded": " "
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    261,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    90405,
+    48367
+   ],
+   "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+ ]
+}

@@ -25,10 +25,10 @@ jobs:
       - name: Copyright notice on every file
         run: python3 tools/copyright.py --check
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev
+        run: sudo apt-get update && sudo apt-get install -y ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --target onebit npu_full_elf_test -j
+        run: cmake --build build --target onebit npu_full_elf_test npu_pack_test tokenizer_test -j
       - name: Test
         run: ctest --test-dir build --output-on-failure

@@ -26,9 +26,27 @@ Step 3 lands in three parts:
 
 | Part | What | State |
 |---|---|---|
-| 3a | Full-ELF generation: per-context control code and full-ELF assembly | **this PR** |
-| 3b | The lane runtime (`runtime_layer`, the runlist bridge, the model loader and packer) on these ELFs | next |
-| 3c | Serving through Lemonade's `onebit` recipe | after 3b |
+| 3a | Full-ELF generation: per-context control code and full-ELF assembly | landed (#8) |
+| 3b | The lane runtime: model reader, buffer packing, runlist decode (`npu/lane`, `npu/generate`, `1bit npu-run`) | **this PR** |
+| 3c | Serving: tokenizer, `1bit unified`, NPU models registered with Lemonade's `onebit` recipe | **this PR** |
+
+## A model directory
+
+```
+<model dir>/
+  model.q4nx             weights (safetensors layout, I8 tiles of 5120 B)
+  config.json            Hugging Face config: dimensions, rope_theta, eos_token_id
+  tokenizer.json         Hugging Face tokenizer
+  npu/layer_ctx1.elf     layer kernel, instruction ELFs for context lengths 1, 2, 17
+  npu/layer_ctx2.elf
+  npu/layer_ctx17.elf
+  npu/lmhead.elf         lm-head kernel, instruction ELF
+  npu/layer.pdi          the design both kernels run on
+```
+
+`1bit lemonade` registers every such directory under `ONEBIT_MODEL_ROOTS`
+(colon-separated, default `~/models`) as a `onebit` model; Lemonade serves it by
+spawning `1bit unified -m <model dir>`.
 
 ## Inputs
 
@@ -107,6 +125,60 @@ artifacts. On Strix Halo, against Qwen3-0.6B, the model checks gave:
   - Runlist execution averaged 10.47 ms against 10.64.
   - These numbers come from the 1bit-MONSTER lane binary, patched to load these ELFs.
     Part 3b re-measures them from this repository.
+
+## The runtime (3b)
+
+`npu/lane.cpp` is the port of 1bit-MONSTER's `RuntimeLayerEngine` fast-lane path,
+on full ELFs. Its steps:
+
+1. **Load.**
+   - Build the init ELF and run it once.
+   - Add the lm-head config.
+   - Pack every layer's buffers, as described in `npu/pack.h`.
+2. **Per token.**
+   - Write the RoPE rows for the position into the slot's `i6` buffers.
+   - Build a runlist of 28 layer runs plus the lm head, using that context
+     length's kernel. The config for a context length is generated and added the
+     first time the length is reached.
+   - Write the token's embedding into `act` and submit.
+
+`npu/generate.cpp` prepares the next token's runlist while the current one runs.
+It uses two slots, each with its own `i6` buffers.
+
+Two inputs had no rule to derive them from:
+
+- the `inv_freq` table for θ = 1e6, kept as the reference runtime's float32
+  literals;
+- `sincosf`.
+
+Every packed buffer is checked against the reference lane's own dump (`npu_pack_test`).
+
+| Check (Strix Halo, Qwen3-0.6B) | Result |
+|---|---|
+| layer weights, `i5`, `i6` vs the reference lane's buffers (layers 0 and 2) | byte-identical |
+| logits, anchor prompt, 24 greedy steps, vs the reference lane (xclbin) | bit-identical, 24/24 |
+| decode speed, same run | 11.0 ms/token (91 tok/s); the reference lane binary: 15.1 |
+| load (weights packed, kernels built) | 380 ms |
+
+The `1bit` binary links only `libxrt_coreutil`: no xclbin, no FastFlowLM library, no Python.
+
+## Serving (3c)
+
+- **Tokenizer:** `npu/tokenizer.cpp` is 1bit-MONSTER's `qwen3_tokenizer.cpp`, which
+  reads `tokenizer.json` directly (PCRE2 for the pre-tokenizer regex). The port
+  fixes one bug: added tokens with `special: false`, such as Qwen3's `<think>` and
+  `</think>`, were split as text. They now stay whole, as Hugging Face
+  `tokenizers` does. `tests/data/qwen3_tokenizer_golden.json` holds 14 cases
+  encoded by `tokenizers` 0.23.1, and all 14 match, ids and round trip.
+- **`1bit unified -m <model dir> -p <port>`:**
+  - It serves `/v1/health` (503 while loading), `/v1/models`,
+    `/v1/chat/completions` (streaming or not) and `/v1/completions`.
+  - The prompt is ChatML. It is Qwen2/Qwen3's template for text messages; the
+    runtime has no Jinja.
+  - Decoding is greedy, with a 1.1 repetition penalty over the last 64 ids by
+    default. `repetition_penalty` in the request overrides it, and 1 gives plain
+    greedy.
+  - Requests are served one at a time: the lane has one KV cache.
 
 ## Open: where the kernel artifacts come from
 

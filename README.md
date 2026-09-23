@@ -62,10 +62,10 @@ The repositories this engine is built on, in order of importance:
 | 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device | Apache-2.0 |
 | 7 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
 | 8 | [zolotukhin/zinc](https://github.com/zolotukhin/zinc) | Its own GPU kernels, and the engine's route to NVIDIA through CUDA | MIT |
+| 9 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
+| 10 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
 
-Also built on [huggingface/tokenizers](https://github.com/huggingface/tokenizers) (Apache-2.0),
-[NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) (Apache-2.0),
-[nlohmann/json](https://github.com/nlohmann/json) (MIT),
+Also built on [nlohmann/json](https://github.com/nlohmann/json) (MIT),
 [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT), and the libraries Lemonade
 builds with: curl, zstd, Mbed TLS, libwebsockets, CLI11 and Brotli.
 

@@ -55,13 +55,17 @@ The script needs nothing from the system except the backend's own toolkit:
 - **Build output.** Zig's caches go under `<prefix>`, so the submodule stays
   clean. The binary is `<prefix>/<backend>/bin/zinc`.
 
-## Verified (Strix Halo, pin `c50b4add`, 2026-09-23)
+## Verified (pin `c50b4add`, 2026-09-23)
 
 | Backend | Result |
 |---|---|
 | `vulkan` | builds. Qwen3-0.6B Q4_K_M, prompt `785,6722,315,9625,374`: first token **12095** (" Paris"), the same as the NPU lane and the CPU reference. Prefill 817 tok/s; decode **295 tok/s** (3.4 ms/tok) with `RADV_PERFTEST=coop_matrix`, which ZINC expects on RADV. |
 | `rocm` | builds and links the system ROCm 7 (`libamdhip64.so.7`, `libhsa-runtime64`). Not run on a model: ZINC's ROCm forward pass implements only the Qwen3.5/3.6 family, and it rejects `qwen3` GGUFs with `UnsupportedArchitecture`. |
-| `cuda` | not built here, because neither Strix Halo nor the Ryzen box has an NVIDIA GPU or CUDA toolkit. Upstream validates it on an RTX 5090 and 4090 under WSL2. |
+| `cuda` | **RTX 5090** (`sm_120`, rented on Clore.ai; driver 615.71, CUDA 13.2 from NVIDIA's apt repo, `CUDA_HOME=/usr/local/cuda-13.2`). `scripts/build-zinc.sh <prefix> cuda` builds. With `qwen35-9b-q4k-m` (Qwen3.5-9B Q4_K_M, ZINC's catalog) the continuation of "The capital of France is" is **" Paris."**. Decode 167–173 tok/s (5.8–6.0 ms/tok); prefill 309 tok/s on the 5-token prompt. |
+
+ZINC's CUDA and ROCm forward passes share one implementation. It covers only
+the Qwen3.5/3.6 family: `qwen3` GGUFs fail with `UnsupportedArchitecture`, and
+Qwen3.5-0.8B (`UD-Q4_K_XL`) fails with `MissingTensor`. Vulkan runs `qwen3`.
 
 ZINC has no BF16 weight path, so use a quantized GGUF. For example, the
 BF16 golden `Qwen3-0.6B-BF16.gguf` fails with `UnsupportedQuantType` (type 30).

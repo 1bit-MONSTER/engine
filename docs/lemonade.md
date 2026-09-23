@@ -34,6 +34,8 @@ deltas listed in its `UPSTREAM.md`:
 - the `onebit` backend and `GET /v1/registry`
 - the `hrx-b66` pin and the HRX model-registry annotations
 - a small CMake patch that makes it embeddable
+- the `hrx_device` option, which points the HRX recipe at this build ([hrx.md](hrx.md))
+- the `mlx` backend for Apple Silicon ([apple.md](apple.md))
 
 It is copied from 1bit-MONSTER `main` (`third_party/lemonade`, last changed in
 `256e68dd7`). Files in `third_party/` keep their own license (Apache-2.0) and
@@ -51,11 +53,15 @@ are exempt from this repository's copyright notice.
 On Strix Halo the catalog has 197 models across 16 recipes, and Lemonade
 reports the NPU as present.
 
+## Since step 1
+
+- **Step 2:** `1bit lemonade` serves the `llamacpp-hrx` and `llamacpp` (Vulkan)
+  recipes with this repository's HRX + Vulkan build instead of downloading AMD's
+  ([hrx.md](hrx.md)).
+- **Step 3:** the `onebit` backend lists the NPU models found in the model
+  directories and serves them on the NPU ([npu.md](npu.md), "Serving (3c)").
+
 ## Not yet
 
-- **The `onebit` backend lists no models.** Native artifacts are registered
-  when the NPU engine lands (step 3).
-- **Lemonade's HRX recipe downloads AMD's HRX build.** Step 2 points it at this
-  repository's HRX + Vulkan build instead.
 - **The web UI is not built.** That needs Node.js; without it, Lemonade serves
   its static status page at `/`.

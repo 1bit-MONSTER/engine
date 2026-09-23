@@ -180,6 +180,34 @@ The `1bit` binary links only `libxrt_coreutil`: no xclbin, no FastFlowLM library
     greedy.
   - Requests are served one at a time: the lane has one KV cache.
 
+## The XDNA stack
+
+The lane runs on XRT and the XDNA shim plugin (`libxrt_driver_xdna`), which XRT loads at run
+time. Both are pinned: `third_party/xdna-driver` is upstream
+[amd/xdna-driver](https://github.com/amd/xdna-driver), and its own `xrt` submodule pins XRT.
+
+- **The kernel driver is not built from this pin.** `amdxdna` ships in the kernel
+  (`drivers/accel/amdxdna`), and Strix Halo runs the kernel's copy.
+- **Building the pinned stack:** `scripts/build-xdna.sh <prefix>` builds XRT (the NPU package)
+  and then the shim, staged under `<prefix>/root`. Nothing is installed system-wide: XRT hard-codes
+  `/etc/OpenCL/vendors`, so both installs use `DESTDIR`. The engine then builds against it:
+
+  ```
+  scripts/build-xdna.sh ~/.cache/xdna-pin/prefix
+  cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt
+  ```
+- **XRT's OpenCL layer (`xocl`) is excluded** (`XRT_EXCLUDE_SUB_DIRECTORY`). The NPU does not use
+  it, and it fails to compile where the distro's `ocl_icd.h` is newer than XRT's bundled OpenCL
+  1.2 headers.
+- **Keeping current:** `.github/workflows/bump-xdna.yml` runs daily and opens a PR whenever
+  upstream `main` moves (secret `HRX_BUMP_TOKEN`). CI has no NPU, so run the check below on
+  Strix Halo before merging.
+
+Verified on 2026-09-23 with xdna-driver `5d302c9` and XRT `d8ececf`, in place of the system's
+XRT 2.21.75. Both `libxrt_core` and `libxrt_driver_xdna` were loaded from the pinned prefix
+(strace). `tests/npu_lane_e2e.sh` gave logits bit-identical to the reference lane on 24/24 steps,
+at 10.8 ms/token (92.6 tok/s), with a 327 ms warm load.
+
 ## Open: where the kernel artifacts come from
 
 CONTRIBUTING rule 4 requires NPU kernels to be built from source. The layer kernel and

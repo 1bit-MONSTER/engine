@@ -25,3 +25,7 @@
 	url = https://github.com/1bit-MONSTER/llama.cpp.git
 	branch = 1bit/hrx-vulkan
 	shallow = true
+[submodule "third_party/xdna-driver"]
+	path = third_party/xdna-driver
+	url = https://github.com/amd/xdna-driver.git
+	branch = main

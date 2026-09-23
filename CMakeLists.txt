@@ -74,6 +74,31 @@ if(ONEBIT_ZINC)
              COMMAND ${CMAKE_SOURCE_DIR}/tests/zinc_lemonade_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_ZINC_SERVER})
 endif()
 
+# ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────
+# Off by default: it needs cargo. Any model's tokenizer.json, through our C ABI
+# over third_party/tokenizers (the same release as the tokenizers npm/PyPI
+# packages). tests/data/tokenizers/ holds golden cases for 18 models.
+option(ONEBIT_HF_TOKENIZERS "Build Hugging Face tokenizers (Rust) behind a C ABI" OFF)
+if(ONEBIT_HF_TOKENIZERS)
+    find_package(Threads REQUIRED)
+    include(cmake/hf_tokenizers.cmake)
+    add_executable(hf_tokenizer_test tests/hf_tokenizer_test.cpp)
+    target_link_libraries(hf_tokenizer_test PRIVATE onebit_hf_tokenizers nlohmann_json::nlohmann_json)
+    # Golden cases whose tokenizer.json is under a model root (ONEBIT_TOKENIZER_ROOT,
+    # e.g. ~/.config/flm/models: <root>/<model>/tokenizer.json).
+    set(ONEBIT_TOKENIZER_ROOT "" CACHE PATH "Directory of model dirs holding tokenizer.json, for hf_tokenizer tests")
+    if(ONEBIT_TOKENIZER_ROOT)
+        file(GLOB _tok_golden "${CMAKE_SOURCE_DIR}/tests/data/tokenizers/*.json")
+        foreach(_g ${_tok_golden})
+            get_filename_component(_m "${_g}" NAME_WLE)
+            if(EXISTS "${ONEBIT_TOKENIZER_ROOT}/${_m}/tokenizer.json")
+                add_test(NAME hf_tokenizer_${_m}
+                         COMMAND hf_tokenizer_test ${ONEBIT_TOKENIZER_ROOT}/${_m}/tokenizer.json ${_g})
+            endif()
+        endforeach()
+    endif()
+endif()
+
 # ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
 # Host side (full-ELF generation, model reader, buffer packing): pure C++, no
 # XRT. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there

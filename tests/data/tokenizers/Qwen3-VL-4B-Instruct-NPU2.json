@@ -1,0 +1,333 @@
+{
+ "source": "tokenizers 0.23.2, Qwen3-VL-4B-Instruct-NPU2 tokenizer.json sha256 aeb13307a71a",
+ "add_special": false,
+ "cases": [
+  {
+   "text": "The capital of France is",
+   "ids": [
+    785,
+    6722,
+    315,
+    9625,
+    374
+   ],
+   "decoded": "The capital of France is"
+  },
+  {
+   "text": "Hello, world! How's it going?",
+   "ids": [
+    9707,
+    11,
+    1879,
+    0,
+    2585,
+    594,
+    432,
+    2087,
+    30
+   ],
+   "decoded": "Hello, world! How's it going?"
+  },
+  {
+   "text": "  leading and   inner   spaces\tand\ttabs\n\nnewlines",
+   "ids": [
+    220,
+    6388,
+    323,
+    256,
+    9179,
+    256,
+    12621,
+    52477,
+    3244,
+    3435,
+    271,
+    931,
+    7969
+   ],
+   "decoded": "  leading and   inner   spaces\tand\ttabs\n\nnewlines"
+  },
+  {
+   "text": "Numbers: 3.14159, 1,000,000 and 2026-09-23T17:30:00Z",
+   "ids": [
+    27237,
+    25,
+    220,
+    18,
+    13,
+    16,
+    19,
+    16,
+    20,
+    24,
+    11,
+    220,
+    16,
+    11,
+    15,
+    15,
+    15,
+    11,
+    15,
+    15,
+    15,
+    323,
+    220,
+    17,
+    15,
+    17,
+    21,
+    12,
+    15,
+    24,
+    12,
+    17,
+    18,
+    51,
+    16,
+    22,
+    25,
+    18,
+    15,
+    25,
+    15,
+    15,
+    57
+   ],
+   "decoded": "Numbers: 3.14159, 1,000,000 and 2026-09-23T17:30:00Z"
+  },
+  {
+   "text": "def f(x):\n    return x**2  # square\n",
+   "ids": [
+    750,
+    282,
+    2075,
+    982,
+    262,
+    470,
+    856,
+    334,
+    17,
+    220,
+    671,
+    9334,
+    198
+   ],
+   "decoded": "def f(x):\n    return x**2  # square\n"
+  },
+  {
+   "text": "if (a != b && c <= d) { return std::max(a, b); }",
+   "ids": [
+    333,
+    320,
+    64,
+    961,
+    293,
+    1009,
+    272,
+    2651,
+    294,
+    8,
+    314,
+    470,
+    1460,
+    486,
+    2810,
+    2877,
+    11,
+    293,
+    1215,
+    335
+   ],
+   "decoded": "if (a != b && c <= d) { return std::max(a, b); }"
+  },
+  {
+   "text": "Ünïcödé naïve café résumé",
+   "ids": [
+    52491,
+    77,
+    37572,
+    66,
+    2956,
+    128505,
+    94880,
+    586,
+    51950,
+    9333,
+    1242,
+    963
+   ],
+   "decoded": "Ünïcödé naïve café résumé"
+  },
+  {
+   "text": "日本語のテキストと漢字",
+   "ids": [
+    101059,
+    102819,
+    15767,
+    56833,
+    61803,
+    70534,
+    19182,
+    110007,
+    18600
+   ],
+   "decoded": "日本語のテキストと漢字"
+  },
+  {
+   "text": "Привет, как дела?",
+   "ids": [
+    53645,
+    26991,
+    8178,
+    11,
+    51670,
+    129691,
+    30
+   ],
+   "decoded": "Привет, как дела?"
+  },
+  {
+   "text": "مرحبا بالعالم",
+   "ids": [
+    124122,
+    29825,
+    124671,
+    124476,
+    129634
+   ],
+   "decoded": "مرحبا بالعالم"
+  },
+  {
+   "text": "नमस्ते दुनिया",
+   "ids": [
+    60096,
+    87244,
+    78368,
+    30484,
+    97,
+    34370,
+    14925,
+    99,
+    72653,
+    60096,
+    42311,
+    107,
+    23868
+   ],
+   "decoded": "नमस्ते दुनिया"
+  },
+  {
+   "text": "🤖🚀 emoji 👍🏽 and ZWJ 👩‍💻",
+   "ids": [
+    147238,
+    145836,
+    42365,
+    61804,
+    235,
+    145375,
+    323,
+    1863,
+    54,
+    41,
+    61804,
+    102,
+    378,
+    235,
+    145851
+   ],
+   "decoded": "🤖🚀 emoji 👍🏽 and ZWJ 👩‍💻"
+  },
+  {
+   "text": "I'm we're they've he'd she'll it's",
+   "ids": [
+    40,
+    2776,
+    582,
+    2299,
+    807,
+    3003,
+    566,
+    4172,
+    1340,
+    3278,
+    432,
+    594
+   ],
+   "decoded": "I'm we're they've he'd she'll it's"
+  },
+  {
+   "text": "<|im_start|>user\nWhat is 2+2?<|im_end|>",
+   "ids": [
+    151644,
+    872,
+    198,
+    3838,
+    374,
+    220,
+    17,
+    10,
+    17,
+    30,
+    151645
+   ],
+   "decoded": "<|im_start|>user\nWhat is 2+2?<|im_end|>"
+  },
+  {
+   "text": "",
+   "ids": [],
+   "decoded": ""
+  },
+  {
+   "text": " ",
+   "ids": [
+    220
+   ],
+   "decoded": " "
+  },
+  {
+   "text": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+   "ids": [
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    69440,
+    28458
+   ],
+   "decoded": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa"
+  }
+ ]
+}

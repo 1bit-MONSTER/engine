@@ -1,0 +1,100 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Keep Hugging Face tokenizers current (docs/tokenizers.md): when
+# huggingface/tokenizers publishes a newer release, open a PR that moves
+# third_party/tokenizers to it and refreshes hf_tokenizers/Cargo.lock. Before
+# merging, regenerate the golden cases with the same Python release
+# (tools/make_tokenizer_golden.py) and run the hf_tokenizer tests.
+#
+# Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
+# 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
+# start CI.
+name: bump-tokenizers
+
+on:
+  schedule:
+    - cron: "5 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-tokenizers
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the token
+        env:
+          HRX_BUMP_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          if [ -z "$HRX_BUMP_TOKEN" ]; then
+            echo "::error::secret HRX_BUMP_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HRX_BUMP_TOKEN }}
+          submodules: false
+
+      - name: Compare with the latest release
+        id: pins
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          tag=$(gh api repos/huggingface/tokenizers/releases/latest --jq .tag_name)
+          upstream=$(git ls-remote https://github.com/huggingface/tokenizers.git "refs/tags/${tag}^{}" | awk '{print $1}')
+          [ -n "$upstream" ] || upstream=$(git ls-remote https://github.com/huggingface/tokenizers.git "refs/tags/${tag}" | awk '{print $1}')
+          ours=$(git ls-tree HEAD third_party/tokenizers | awk '{print $3}')
+          echo "latest $tag = $upstream, ours $ours"
+          {
+            echo "tag=$tag"; echo "upstream=$upstream"; echo "ours=$ours"
+            if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump PR
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          TAG: ${{ steps.pins.outputs.tag }}
+          UPSTREAM: ${{ steps.pins.outputs.upstream }}
+          OURS: ${{ steps.pins.outputs.ours }}
+        run: |
+          set -euo pipefail
+          branch="bump-tokenizers/${TAG}"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+            echo "$branch already exists"; exit 0
+          fi
+          git config user.name "tokenizers-bump"
+          git config user.email "tokenizers-bump@users.noreply.github.com"
+          git switch -c "$branch"
+          git submodule update --init --depth 1 third_party/tokenizers
+          git -C third_party/tokenizers fetch -q --depth 1 origin "$UPSTREAM"
+          git -C third_party/tokenizers checkout -q "$UPSTREAM"
+          (cd hf_tokenizers && cargo update -p tokenizers)
+          git add third_party/tokenizers hf_tokenizers/Cargo.lock
+          git commit -q -m "Bump tokenizers: huggingface/tokenizers ${TAG} (${UPSTREAM:0:12})"
+          git push -q origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Bump tokenizers: ${TAG}" \
+            --body "Moves third_party/tokenizers from \`${OURS:0:12}\` to \`${TAG}\` (\`${UPSTREAM:0:12}\`) and refreshes hf_tokenizers/Cargo.lock.
+
+          Before merging: regenerate tests/data/tokenizers/*.json with Python tokenizers of the same release (tools/make_tokenizer_golden.py) and run ctest -R hf_tokenizer with -DONEBIT_TOKENIZER_ROOT."

@@ -48,4 +48,10 @@
 	path = third_party/laya
 	url = https://github.com/NandhaKishorM/laya.git
 	branch = main
+# Hugging Face tokenizers (docs/tokenizers.md): the Rust library behind the
+# tokenizers npm/PyPI packages, same release; built by hf_tokenizers/ through
+# CMake (-DONEBIT_HF_TOKENIZERS=ON); .github/workflows/bump-tokenizers.yml keeps it current.
+[submodule "third_party/tokenizers"]
+	path = third_party/tokenizers
+	url = https://github.com/huggingface/tokenizers.git
 	shallow = true

@@ -1,0 +1,100 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Keep third_party/xdna-driver on upstream amd/xdna-driver main (docs/npu.md,
+# "The XDNA stack"): when upstream moves, open a PR here moving the submodule.
+# It pins XRT too (xdna-driver's own xrt submodule). GitHub-hosted CI has no
+# NPU; build with scripts/build-xdna.sh and run tests/npu_lane_e2e.sh on Strix
+# Halo before merging.
+#
+# Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
+# 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
+# start CI.
+name: bump-xdna
+
+on:
+  schedule:
+    - cron: "41 6 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-xdna
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the token
+        env:
+          HRX_BUMP_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          if [ -z "$HRX_BUMP_TOKEN" ]; then
+            echo "::error::secret HRX_BUMP_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HRX_BUMP_TOKEN }}
+
+      - name: Compare with upstream
+        id: pins
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          upstream=$(gh api repos/amd/xdna-driver/commits/main --jq .sha)
+          upstream_xrt=$(gh api "repos/amd/xdna-driver/contents/xrt?ref=$upstream" --jq .sha)
+          ours=$(git ls-tree HEAD third_party/xdna-driver | awk '{print $3}')
+          echo "upstream $upstream (xrt $upstream_xrt), ours $ours"
+          {
+            echo "upstream=$upstream"; echo "upstream_xrt=$upstream_xrt"; echo "ours=$ours"
+            if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump PR
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          UPSTREAM: ${{ steps.pins.outputs.upstream }}
+          UPSTREAM_XRT: ${{ steps.pins.outputs.upstream_xrt }}
+          OURS: ${{ steps.pins.outputs.ours }}
+        run: |
+          set -euo pipefail
+          branch="bump-xdna/${UPSTREAM:0:12}"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+            echo "$branch already exists"; exit 0
+          fi
+          log=$(gh api "repos/amd/xdna-driver/compare/${OURS}...${UPSTREAM}" \
+                  --jq '.commits[-30:][] | "- \(.sha[0:9]) \(.commit.message | split("\n")[0])"' || true)
+          git config user.name "xdna-bump"
+          git config user.email "xdna-bump@users.noreply.github.com"
+          git switch -c "$branch"
+          git update-index --cacheinfo "160000,$UPSTREAM,third_party/xdna-driver"
+          git commit -q -m "Bump XDNA: amd/xdna-driver ${UPSTREAM:0:12} (XRT ${UPSTREAM_XRT:0:12})"
+          git push -q origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Bump XDNA: amd/xdna-driver ${UPSTREAM:0:12}" \
+            --body "Moves third_party/xdna-driver from \`${OURS:0:12}\` to upstream main \`${UPSTREAM:0:12}\` (its XRT submodule: \`${UPSTREAM_XRT:0:12}\`).
+
+          Upstream commits (last 30):
+          ${log}
+
+          CI here has no NPU. Before merging, on Strix Halo:
+          \`scripts/build-xdna.sh ~/.cache/xdna-pin/prefix && cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=\$HOME/.cache/xdna-pin/prefix && cmake --build build --target onebit && tests/npu_lane_e2e.sh ...\`"

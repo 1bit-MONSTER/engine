@@ -63,7 +63,11 @@ LEMONADE_ONEBIT_BIN=/path/to/1bit build/lemond
 
 On Strix Halo the recipe passes Lemonade's own LLM test suite
 (`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX: 31 tests, 9 run,
-22 skipped as unsupported. It is not proposed upstream. Lemonade asks for an RFC
+22 skipped as unsupported. It is not proposed upstream. The fork follows upstream daily:
+`.github/workflows/sync-lemonade-fork.yml` merges upstream `main` into it. It
+pushes only a clean merge that still registers `onebit`; otherwise it opens a PR
+in the fork that lists the conflicts. It also keeps the fork's own copies of
+upstream's workflows disabled. Lemonade asks for an RFC
 before a new backend.
 
 ## On its own

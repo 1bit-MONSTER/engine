@@ -1,0 +1,105 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Keep our Lemonade fork current (docs/lemonade.md): 1bit-MONSTER/lemonade is
+# upstream lemonade-sdk/lemonade plus the onebit backend that runs the engine.
+# Daily, this merges upstream main into the fork:
+#   - a clean merge that still registers onebit is pushed to the fork's main;
+#   - a conflicting merge is left for a person: upstream main is pushed to a
+#     sync/<sha> branch and a PR is opened IN THE FORK listing the conflicts.
+# It then disables every workflow in the fork. Upstream's build, release,
+# website and PPA workflows must not run from the fork; a sync can add new ones.
+#
+# Uses the secret HRX_BUMP_TOKEN, which needs Contents, Pull requests and
+# Actions read/write on 1bit-MONSTER/lemonade as well as on this repository.
+name: sync-lemonade-fork
+
+on:
+  schedule:
+    - cron: "17 8 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sync-lemonade-fork
+  cancel-in-progress: false
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    env:
+      FORK: 1bit-MONSTER/lemonade
+      UPSTREAM: lemonade-sdk/lemonade
+    steps:
+      - name: Require the token
+        env:
+          HRX_BUMP_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          if [ -z "$HRX_BUMP_TOKEN" ]; then
+            echo "::error::secret HRX_BUMP_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - name: Merge upstream main into the fork
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          git clone -q --filter=blob:none "https://x-access-token:${TOKEN}@github.com/${FORK}.git" fork
+          cd fork
+          git config user.name "lemonade-fork-sync"
+          git config user.email "lemonade-fork-sync@users.noreply.github.com"
+          git remote add upstream "https://github.com/${UPSTREAM}.git"
+          git fetch -q upstream main
+          up=$(git rev-parse upstream/main)
+          if git merge-base --is-ancestor "$up" HEAD; then
+            echo "fork already contains upstream ${up:0:12}"
+            exit 0
+          fi
+          if git merge -q --no-edit -m "Sync upstream ${UPSTREAM} main (${up:0:12})" upstream/main; then
+            # The fork exists for the onebit backend: never push a merge that lost it.
+            grep -q '"onebit|onebit"' CMakeLists.txt || { echo "::error::onebit is no longer registered after the merge"; exit 1; }
+            test -f src/cpp/server/backends/onebit/onebit_server.cpp || { echo "::error::onebit_server.cpp is gone after the merge"; exit 1; }
+            git push -q origin HEAD:main
+            echo "merged upstream ${up:0:12} into ${FORK} main"
+          else
+            conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
+            git merge --abort
+            branch="sync/${up:0:12}"
+            if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+              echo "$branch already exists"; exit 0
+            fi
+            git push -q origin "upstream/main:refs/heads/$branch"
+            gh pr create --repo "$FORK" --base main --head "$branch" \
+              --title "Sync upstream ${UPSTREAM} ${up:0:12} (conflicts)" \
+              --body "Upstream main \`${up:0:12}\` does not merge cleanly into the fork. Conflicting files:
+
+          ${conflicts}
+
+          Resolve so that the onebit backend stays registered, then merge."
+          fi
+
+      - name: Keep the fork's workflows disabled
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          for id in $(gh api "repos/${FORK}/actions/workflows" --paginate --jq '.workflows[] | select(.state=="active") | .id'); do
+            gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null
+            echo "disabled workflow ${id}"
+          done

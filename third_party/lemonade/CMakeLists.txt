@@ -171,6 +171,7 @@ set(LEMON_BACKENDS
     "trellis|trellis"
     "openmoss|openmoss"
     "onebit|onebit"
+    "mlx|mlx"
 )
 
 # ============================================================

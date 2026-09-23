@@ -42,6 +42,17 @@ The **local-only** deltas carried on top of v11.9.0 are:
    because an HRX2 build names its device `HRX20`. Upstream behavior is unchanged
    when the option is unset.
 
+6. **`mlx` backend** (1bit engine: MLX models on Apple Silicon): `src/cpp/include/lemon/backends/mlx/`
+   (`mlx.h`, `mlx_server.h`), `src/cpp/server/backends/mlx/mlx_server.cpp`, the `"mlx|mlx"` line in
+   `CMakeLists.txt`'s `LEMON_BACKENDS`, and four `*-MLX` entries (`recipe: mlx`, checkpoint = an
+   `mlx-community` Hugging Face id) in `src/cpp/resources/server_models.json`. The executor is the
+   `server` binary of lemon-mlx-engine (fork `bong-water-water-bong/lemon-mlx-engine`, built with MLX's
+   Metal backend on macOS), found through the `mlx_bin` option, then `$LEMONADE_MLX_SERVER`, then
+   `lemon-mlx-server` on PATH. `load()` spawns `<server> <checkpoint> --port <p>` and waits on `/health`;
+   chat/completion requests carry the checkpoint in `model`, because the MLX server selects its model
+   by Hugging Face id. Supported on `macos` only. **NOT upstream**: re-apply after a re-vendor, like
+   `onebit`.
+
 > Note: the `stream_stall_timeout` config key that our v11.8.x snapshot carried
 > was **dropped** in this re-vendor — v11.9.0 handles the streaming-stall bound
 > via `global_timeout` (upstream #3386), and local review confirmed the extra

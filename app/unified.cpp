@@ -14,8 +14,7 @@
 // limitations under the License.
 
 // `1bit unified -m <model dir> -p <port>`: one native model on the NPU fast lane,
-// behind the OpenAI endpoints Lemonade's `onebit` backend forwards to
-// (third_party/lemonade/src/cpp/server/backends/onebit/onebit_server.cpp):
+// behind OpenAI endpoints. It is `1bit serve`'s NPU route (serve.cpp):
 //
 //   GET  /health, /v1/health    200 once the model is on the device
 //   GET  /v1/models             the one model

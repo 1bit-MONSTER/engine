@@ -14,54 +14,46 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# Embedded Lemonade
+# Lemonade
 
-`1bit lemonade` runs [Lemonade](https://github.com/lemonade-sdk/lemonade)'s
-server core inside the `1bit` process. That includes every Lemonade backend,
-its router and its model catalog. The engine's own `onebit` backend is
-compiled in alongside them. Everything after `lemonade` goes to Lemonade's own CLI:
+The engine is a backend that [Lemonade](https://github.com/lemonade-sdk/lemonade)
+launches, the way it launches `llama-server`. The engine exposes only an
+OpenAI-compatible API (`1bit serve`, [serve.md](serve.md)), and Lemonade stays
+what it is: the server users talk to, with its own catalog, downloads, router
+and UI.
 
-```bash
-1bit lemonade --port 13305                  # the same options as lemond
-1bit lemonade --help
+## How it got here
+
+Step 1 first went the other way. `1bit lemonade` ran Lemonade v11.9.0's server
+core inside the `1bit` process, and this repository carried Lemonade local
+recipes for the engine (`onebit`, `mlx`, `zinc`, the `hrx_device` option).
+geramyL (AMD) pointed out that the engine should be embedded into Lemonade, not
+the reverse. So on 2026-09-23:
+
+- `third_party/lemonade` and every local delta were removed. The engine no
+  longer builds Lemonade's code or its fetched libraries.
+- `1bit serve` took over what the local recipes did, for every device: NPU,
+  Vulkan, HRX, ZINC and MLX.
+
+## What Lemonade needs
+
+One recipe in upstream Lemonade that launches the engine, in the same shape as
+its `llama-server` recipe:
+
+```
+1bit serve -m <model> --port <p> [--device ...] [--ctx-size N] [--alias <name>]
 ```
 
-## Vendored tree
+It then waits for `/health` to answer 200 and forwards OpenAI requests to
+`/v1/chat/completions` and `/v1/completions`. That recipe is being prepared as
+a pull request to `lemonade-sdk/lemonade`.
 
-`third_party/lemonade` is Lemonade v11.9.0, vendored complete, plus the local
-deltas listed in its `UPSTREAM.md`:
+## Until then
 
-- the `onebit` backend and `GET /v1/registry`
-- the `hrx-b66` pin and the HRX model-registry annotations
-- a small CMake patch that makes it embeddable
-- the `hrx_device` option, which points the HRX recipe at this build ([hrx.md](hrx.md))
-- the `mlx` backend for Apple Silicon ([apple.md](apple.md))
+Point any OpenAI client at `1bit serve` directly:
 
-It is copied from 1bit-MONSTER `main` (`third_party/lemonade`, last changed in
-`256e68dd7`). Files in `third_party/` keep their own license (Apache-2.0) and
-are exempt from this repository's copyright notice.
-
-## What step 1 covers
-
-- The server core builds into `1bit` (about 13 MB) and starts.
-- `/api/v1/health` reports `ok`.
-- The catalog lists every recipe, including `llamacpp-hrx`.
-- `/api/v1/system-info` answers.
-- `tests/smoke_lemonade.sh` checks all of this with scratch cache and config
-  dirs, in CI and in `ctest`.
-
-On Strix Halo the catalog has 197 models across 16 recipes, and Lemonade
-reports the NPU as present.
-
-## Since step 1
-
-- **Step 2:** `1bit lemonade` serves the `llamacpp-hrx` and `llamacpp` (Vulkan)
-  recipes with this repository's HRX + Vulkan build instead of downloading AMD's
-  ([hrx.md](hrx.md)).
-- **Step 3:** the `onebit` backend lists the NPU models found in the model
-  directories and serves them on the NPU ([npu.md](npu.md), "Serving (3c)").
-
-## Not yet
-
-- **The web UI is not built.** That needs Node.js; without it, Lemonade serves
-  its static status page at `/`.
+```sh
+1bit serve -m ~/models/Qwen3-0.6B-Q4_K_M.gguf --device vulkan --port 8000
+curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
+     -d '{"messages": [{"role": "user", "content": "Hello"}]}'
+```

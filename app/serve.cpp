@@ -28,6 +28,7 @@
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
 //   a .gguf, --device vulkan|hrx                -> this build's llama-server
 //   a .gguf, --device zinc                      -> this build's zinc
+//   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
 // Vulkan for GGUF (the fastest measured device for standard quants,
@@ -49,7 +50,11 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#if defined(__linux__)
 #include <sys/prctl.h>
+#else
+#include <spawn.h>
+#endif
 #include <stdexcept>
 #include <string>
 #include <sys/socket.h>
@@ -71,7 +76,7 @@ namespace fs = std::filesystem;
 struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
-    std::string llama_server, zinc, hrx_libhsa;
+    std::string llama_server, zinc, hrx_libhsa, mlx;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -113,6 +118,11 @@ std::string default_zinc() {
 std::atomic<bool> g_stop{false};
 extern "C" void on_stop_signal(int) { g_stop = true; }
 
+std::string default_mlx() {
+    if (const char* e = std::getenv("LEMONADE_MLX_SERVER"); e && *e) return e;
+    return "lemon-mlx-server";
+}
+
 int free_port() {
     const int s = ::socket(AF_INET, SOCK_STREAM, 0);
     sockaddr_in a{};
@@ -149,6 +159,7 @@ public:
         std::vector<char*> envp;
         for (auto& e : env_store) envp.push_back(e.data());
         envp.push_back(nullptr);
+#if defined(__linux__)
         const pid_t parent = ::getpid();
         pid_ = ::fork();
         if (pid_ < 0) throw std::runtime_error("cannot fork for " + argv[0] + ": " + std::strerror(errno));
@@ -160,6 +171,12 @@ public:
             ::execvpe(args[0], args.data(), envp.data());
             ::_exit(127);
         }
+#else
+        // No parent-death signal outside Linux: the SIGTERM/SIGINT handler
+        // below still takes the child down with a normal stop.
+        if (::posix_spawnp(&pid_, args[0], nullptr, nullptr, args.data(), envp.data()) != 0)
+            throw std::runtime_error("cannot start " + argv[0] + ": " + std::strerror(errno));
+#endif
     }
     ~Child() { stop(); }
     Child(const Child&) = delete;
@@ -202,14 +219,15 @@ private:
 std::string model_id(const Options& o) {
     if (!o.alias.empty()) return o.alias;
     fs::path p(o.model);
-    if (p.has_filename() == false) p = p.parent_path();
-    return p.stem().string();
+    if (!p.has_filename()) p = p.parent_path();
+    // Only a .gguf loses its extension: "Qwen3-0.6B-4bit" is a name, not a stem.
+    return p.extension() == ".gguf" ? p.stem().string() : p.filename().string();
 }
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
 // child such as zinc rejects ids it did not load), and replies carry ours.
-void forward(const Child& child, const std::string& our_id, bool drop_model, const httplib::Request& req,
-             httplib::Response& res) {
+void forward(const Child& child, const std::string& our_id, bool drop_model, const std::string& set_model,
+             const httplib::Request& req, httplib::Response& res) {
     json body;
     try {
         body = json::parse(req.body);
@@ -219,6 +237,7 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
         return;
     }
     if (drop_model) body.erase("model");
+    if (!set_model.empty()) body["model"] = set_model;
     const bool stream = body.value("stream", false);
     const std::string payload = body.dump();
     const std::string path = req.path;
@@ -253,12 +272,18 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
     });
 }
 
-int serve_gguf(const Options& o) {
+int serve_child(const Options& o) {
     std::string device = o.device == "auto" ? "vulkan" : o.device;
     const int child_port = free_port();
     std::vector<std::string> argv, env;
     bool drop_model = false;
-    if (device == "vulkan" || device == "hrx") {
+    std::string set_model;
+    if (device == "mlx") {
+        // lemon-mlx-engine: `<server> <hf id> --port <p>`; it picks the model by
+        // Hugging Face id, so requests carry that id (docs/apple.md).
+        argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
+        set_model = o.model;
+    } else if (device == "vulkan" || device == "hrx") {
         argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
@@ -298,7 +323,7 @@ int serve_gguf(const Options& o) {
             r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
             return;
         }
-        forward(*child, id, drop_model, q, r);
+        forward(*child, id, drop_model, set_model, q, r);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -338,9 +363,10 @@ int serve_gguf(const Options& o) {
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|vulkan|hrx|zinc] [--ctx-size N] [--alias NAME]\n"
-                 "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH]\n"
-                 "  <model>: an NPU model directory (model.q4nx + npu/) or a .gguf file\n");
+                 "                  [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
+                 "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
 
 }  // namespace
@@ -362,6 +388,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--llama-server") o.llama_server = next();
         else if (a == "--zinc") o.zinc = next();
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
+        else if (a == "--mlx-server") o.mlx = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
@@ -382,7 +409,8 @@ int run_serve(int argc, char** argv) {
         throw std::runtime_error("this build has no NPU lane (configure with -DONEBIT_NPU=ON)");
 #endif
     }
-    if (fs::path(o.model).extension() == ".gguf") return serve_gguf(o);
+    if (o.device == "mlx") return serve_child(o);
+    if (fs::path(o.model).extension() == ".gguf") return serve_child(o);
     throw std::runtime_error(o.model + ": expected an NPU model directory or a .gguf file");
 }
 

@@ -14,19 +14,6 @@ build time rather than stored here). The copyright lines below are taken from
 each project's own LICENSE file or source headers.
 
 -------------------------------------------------------------------------------
-Included in this repository, with modifications
--------------------------------------------------------------------------------
-
-Lemonade (third_party/lemonade)
-  https://github.com/lemonade-sdk/lemonade
-  Copyright (C) 2022-2024, Advanced Micro Devices, Inc.
-  License: Apache-2.0
-  Modified: the local changes (the onebit, mlx and zinc backends, the
-  hrx_device option, the embeddability patch and model-registry entries) are
-  listed in third_party/lemonade/UPSTREAM.md, as Apache-2.0 section 4(b)
-  requires. Lemonade bundles AixLog, Copyright (C) 2017-2021 Johannes Pohl (MIT).
-
--------------------------------------------------------------------------------
 Pinned at exact commits (git submodules) and built from source
 -------------------------------------------------------------------------------
 
@@ -86,8 +73,7 @@ convaiinnovations/laya, pinned in config/laya.json)
   License: Apache-2.0
 
 -------------------------------------------------------------------------------
-Fetched by the build at pinned commits (third_party/lemonade/CMakeLists.txt),
-unless a suitable system copy is found
+Fetched by the build at pinned commits (CMakeLists.txt)
 -------------------------------------------------------------------------------
 
 JSON for Modern C++ (nlohmann/json v3.11.3)
@@ -98,35 +84,4 @@ JSON for Modern C++ (nlohmann/json v3.11.3)
 cpp-httplib (v0.47.0)
   https://github.com/yhirose/cpp-httplib
   Copyright (c) 2017 yhirose
-  License: MIT
-
-CLI11 (v2.4.2)
-  https://github.com/CLIUtils/CLI11
-  Copyright (c) 2017-2026 University of Cincinnati, developed by Henry Schreiner
-  under NSF AWARD 1414736
-  License: BSD-3-Clause
-
-curl (8.5.0)
-  https://github.com/curl/curl
-  Copyright (c) 1996-2026, Daniel Stenberg, <daniel@haxx.se>, and many contributors
-  License: curl
-
-Zstandard (zstd v1.5.7)
-  https://github.com/facebook/zstd
-  Copyright (c) Meta Platforms, Inc. and affiliates.
-  License: BSD-3-Clause OR GPL-2.0-only (used here under BSD-3-Clause)
-
-Mbed TLS (v3.6.2)
-  https://github.com/Mbed-TLS/mbedtls
-  Copyright The Mbed TLS Contributors
-  License: Apache-2.0 OR GPL-2.0-or-later (used here under Apache-2.0)
-
-libwebsockets (v4.3.3)
-  https://github.com/warmcat/libwebsockets
-  Copyright (C) 2010-2020 Andy Green <andy@warmcat.com> and contributors
-  License: MIT (some sources under similar permissive licenses; see its LICENSE)
-
-Brotli (v1.1.0, macOS builds only)
-  https://github.com/google/brotli
-  Copyright (c) 2009, 2010, 2013-2016 by the Brotli Authors
   License: MIT

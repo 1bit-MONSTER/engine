@@ -24,15 +24,12 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 ```
 
-`1bit lemonade` uses this binary for two Lemonade recipes:
+`1bit serve` runs GGUF models on either device with it ([serve.md](serve.md)):
 
-| Recipe | Device | Serves |
+| `--device` | Device | Serves |
 |---|---|---|
-| `llamacpp-hrx` | `HRX0` | the HRX catalog entries |
-| `llamacpp` (Vulkan backend) | `Vulkan0` | standard GGUF quants |
-
-Only Lemonade's defaults (`builtin`, `auto`, unset) are replaced. Config keys a
-user has set are never overridden.
+| `hrx` | `HRX0` | AMD's ggml-hrx |
+| `vulkan` (and `auto` for GGUF) | `Vulkan0` | standard GGUF quants, the fastest measured device for them |
 
 ## Pinned sources, kept current
 
@@ -75,15 +72,17 @@ cmake --build build --target onebit
 - **The HSA runtime.** HRX dlopens it at run time, and the distro's
   `libhsa-runtime64` rejects the `HSA_AMD_AGENT_INFO_PM4_EMULATION` probe on
   gfx1151, so HRX then registers no device. CMake finds TheRock's
-  `libhsa-runtime64.so.1` (`ONEBIT_HRX_LIBHSA`), and `1bit lemonade` passes it to
-  llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. To run
+  `libhsa-runtime64.so.1` (`ONEBIT_HRX_LIBHSA`), and `1bit serve` passes it to
+  llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. Without a
+  build path it searches `/opt/rocm-therock`. To run
   llama-server or llama-bench by hand, export that variable yourself.
 
 ## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)
 
-`tests/hrx_lemonade_e2e.sh` and `ctest` pass, re-run after the first daily bump
-(#13). `unsloth/Qwen3-0.6B-GGUF:Q4_0` answers "Paris" through both recipes,
-served by this build's llama-server on `Vulkan0` and on `HRX0`.
+`ctest` passed, re-run after the first daily bump (#13). At the time the check
+was `tests/hrx_lemonade_e2e.sh`, through the engine's former embedded Lemonade:
+`unsloth/Qwen3-0.6B-GGUF:Q4_0` answered "Paris" on `Vulkan0` and on `HRX0`. The
+same build now passes `tests/serve_e2e.sh` on both devices through `1bit serve`.
 
 llama-bench, Qwen3-0.6B, pp512 / tg128 tok/s, against the previous build (April
 llama.cpp with ggml-hrx2 on `HRX20`):

@@ -1,0 +1,28 @@
+{
+  "$schema": "https://context7.com/schema/context7.json",
+  "projectTitle": "1bit engine",
+  "description": "A C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI (Strix Halo): the XDNA 2 NPU, HRX and Vulkan on the Radeon iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.",
+  "folders": [
+    "docs",
+    "blog"
+  ],
+  "excludeFolders": [
+    "third_party",
+    "site",
+    "tools",
+    "tests",
+    "patches"
+  ],
+  "excludeFiles": [
+    "LICENSE",
+    "NOTICE",
+    "archive.tsv"
+  ],
+  "rules": [
+    "Serve models with `1bit serve`; it exposes an OpenAI-compatible API and runs as Lemonade's `onebit` backend.",
+    "Pick the device with `--device` (auto, npu, vulkan, hrx, rocm, zinc, mlx); an NPU model directory runs on the NPU fast lane, and Vulkan is the usual choice for plain GGUF files.",
+    "Prefer Unsloth Dynamic GGUFs: UD-Q4_K_XL is the lean default, UD-Q5_K_XL the accurate choice.",
+    "For one user at a time use `--mtp` without `--adaptive`; for many simultaneous requests use `--parallel` or `--adaptive`.",
+    "Documentation lives at https://1bit.gg; measured results are on the GitHub wiki."
+  ]
+}

@@ -150,6 +150,9 @@ def main():
     template = strip_notice((ROOT / "site" / "template.html").read_text())
     for name, src in docs.items():
         text = strip_notice(src.read_text())
+        if name == "index":
+            # the README's link to this site is redundant on the site itself
+            text = re.sub(r"^\*\*Documentation:\*\*.*\n+", "", text, count=1, flags=re.M)
         body = render(rewrite_links(text, src, docs, labels))
         source = src.relative_to(ROOT).as_posix()
         page = (template

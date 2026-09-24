@@ -13,7 +13,7 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# The site, https://1bit.monster/ (custom domain of this repository's GitHub Pages): tools/site.py renders
+# The site, https://1bit.gg/ (custom domain of this repository's GitHub Pages): tools/site.py renders
 # README.md and docs/*.md with site/template.html and site/style.css. Pull requests only
 # build it (a doc that breaks the site shows up in review); main deploys it to GitHub Pages.
 # The repository variable GOATCOUNTER (a GoatCounter site code) turns on visitor counts.

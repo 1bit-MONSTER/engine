@@ -27,6 +27,7 @@ OpenAI client.
            [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
+           [--parallel N] [--adaptive] [--adaptive-at N]
 ```
 
 One model per process:
@@ -126,6 +127,30 @@ Vulkan peaks at 8 requests and falls back at 16; ROCm keeps scaling to 16, where
 serves 5.8x (27B) and 3.7x (Coder) the best single stream. Use `--device vulkan` for up
 to about 8 concurrent users, `--device rocm --parallel 16` beyond that. Two backends
 decoding at once, by comparison, add 18% (docs/lean.md).
+
+## Growing with the load (`--adaptive`)
+
+No single setting wins at every load: one user is fastest on Vulkan with `--mtp`, up to
+about 8 concurrent requests on Vulkan batching, and beyond that on ROCm batching, which
+keeps scaling to 16 (the tables above). `--adaptive` runs both at once, the model loaded
+on each:
+
+- a Vulkan backend with `--adaptive-at` slots (default 8), and `--mtp` if given;
+- a ROCm overflow backend with 16 slots, without MTP.
+
+Each request goes to Vulkan until Vulkan holds `--adaptive-at` requests in flight;
+the next ones go to ROCm. A lone user gets Vulkan (with MTP, 35-42 tok/s on
+Qwen3.8-27B), a crowd spills onto ROCm, and when both are busy the two backends
+together add their share (two drivers on one GPU gave +18% in docs/lean.md).
+
+```sh
+1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --adaptive --mtp mtp-Qwen3.8-27B-Q4_0.gguf --ctx-size 65536
+```
+
+It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) and
+memory for two copies of the model; `--ctx-size` applies to each backend and is split
+across its slots. On exit, serve logs how many requests each backend took. Verified on
+Strix Halo with Qwen3-0.6B: 12 simultaneous requests, 8 on Vulkan and 4 on ROCm.
 
 ## Verified (Strix Halo, 2026-09-23)
 

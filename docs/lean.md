@@ -62,6 +62,16 @@ The ROCm build uses TheRock's `amdclang++` from `ONEBIT_LEAN_ROCM_TOOLCHAIN`
 (default `/opt/rocm-therock`). If it fails on `__ocml_*` in the distribution's HIP
 headers, point that at a TheRock tree whose compiler builds HIP on its own.
 
+## Verified (Strix Halo, ROCmFPX `fb08d7c`, 2026-09-24)
+
+| Test | Result |
+|---|---|
+| `serve_e2e_lean`: Qwen3.8-27B ROCmFP4 on `Vulkan0` | PASS |
+| `tests/serve_e2e.sh ... rocm --lean`: Qwen3.8-27B ROCmI4 on `ROCm0` | PASS; the server logs `ROCmI4 W4A4: enabled` |
+
+The ROCm build there used `-DONEBIT_LEAN_ROCM_TOOLCHAIN=$HOME/therock100`; the
+default `/opt/rocm-therock` fails on the `__ocml_*` headers described above.
+
 ## Making a lean file
 
 The lean build carries ROCmFPX's `llama-quantize`. Start from the BF16 GGUF:

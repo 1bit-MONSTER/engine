@@ -133,27 +133,39 @@ decoding at once, by comparison, add 18% (docs/lean.md).
 
 ## Growing with the load (`--adaptive`)
 
-No single setting wins at every load: one request is fastest on Vulkan with `--mtp`,
-many are fastest batched on ROCm, which keeps scaling to 16 (the tables above). And the
-two do not mix: a server with MTP loaded batches at about two thirds of the throughput
-(Qwen3.8-27B, 4 requests: 24.9 tok/s with MTP loaded, 36.9 without), even with each
-request's draft length set to 0. So `--adaptive` keeps them apart, the model loaded on
-each:
+No single setting wins at every load. One request is fastest on Vulkan with `--mtp`; up to
+8 are fastest batched on Vulkan; past that ROCm keeps scaling (the tables above). And MTP
+and batching do not mix: a server with MTP loaded batches at about two thirds of the
+throughput (Qwen3.8-27B, 4 requests: 24.9 tok/s with MTP loaded, 36.9 without), even with
+each request's draft length set to 0.
 
-- a Vulkan backend with `--adaptive-at` slots (default 1), and `--mtp` if given;
-- a ROCm backend with 16 slots, without MTP.
+`--adaptive` runs two backends, the model loaded on each: Vulkan with `--adaptive-at`
+slots (and `--mtp` if given) and ROCm with 16 slots (never MTP). A request goes to Vulkan
+while Vulkan holds fewer than `--adaptive-at` requests, and to ROCm otherwise; choosing
+and reserving the slot is one locked step.
 
-A request goes to Vulkan while Vulkan holds fewer than `--adaptive-at` requests; the
-rest go to ROCm. A lone user gets MTP speed (35-42 tok/s on Qwen3.8-27B), a crowd gets
-ROCm's batching.
+Qwen3.8-27B UD-Q4_K_XL, total tok/s by simultaneous requests (2026-09-24):
+
+| Requests | 1 | 2 | 4 | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|---|
+| **`--adaptive --adaptive-at 8`** | 12.0 | 21.9 | 36.3 | **49.9** | 43.5 | 44.7 | **63.5** |
+| `--adaptive --mtp` (at 1) | 20.1 | 15.3 | 24.7 | 32.8 | 50.1 | 59.0 | 40.7 |
+| `--device vulkan --parallel 8` | 11.8 | 21.7 | 36.9 | 50.9 | | 42.9 (16) | |
+| `--device rocm --parallel 16` | 11.6 | 20.1 | 30.2 | 35.6 | | 68.0 | |
+
+- **Serving many users: `--adaptive --adaptive-at 8`.** It matches Vulkan batching up to
+  8 requests and keeps climbing past it (63.5 at 24, where Vulkan alone falls back). At
+  12-16 the two backends contend for the GPU and it dips below ROCm alone.
+- **One user at a time: `--mtp` without `--adaptive`** (35-42 tok/s). `--adaptive --mtp`
+  gives the lone request MTP speed but trails at every larger load.
 
 ```sh
-1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --adaptive --mtp mtp-Qwen3.8-27B-Q4_0.gguf --ctx-size 65536
+1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --adaptive --adaptive-at 8 --ctx-size 65536
 ```
 
-It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) and
-memory for two copies of the model; `--ctx-size` applies to each backend and is split
-across its slots. On exit, serve logs how many requests each backend took.
+It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) and memory for
+two copies of the model; `--ctx-size` applies to each backend and is split across its
+slots. On exit, serve logs how many requests each backend took.
 
 ## RAG (`--embed`, `--rerank`)
 

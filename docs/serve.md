@@ -23,9 +23,10 @@ OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]
+           [--device auto|npu|vulkan|hrx|rocm|zinc|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
+           [--mtp HEAD.gguf] [--mtp-max N]
 ```
 
 One model per process:
@@ -46,7 +47,7 @@ One model per process:
 | `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md) |
 | `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
 | ROCmFP4 `.gguf` | `auto`, `vulkan` with `--lean` | the lean (ROCmFPX) build's llama-server on `Vulkan0` (docs/lean.md) |
-| ROCmI4 `.gguf` | `rocm` with `--lean` | the lean ROCm build's llama-server on `ROCm0`, W4A4 (docs/lean.md) |
+| `.gguf` | `rocm` | the ROCm build's llama-server on `ROCm0` (ROCmFPX's tree, `ONEBIT_LEAN_ROCM`); ROCmI4 files take its W4A4 path (docs/lean.md) |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 
@@ -68,6 +69,25 @@ else the build's copy, else the first one under `/opt/rocm-therock`.
 
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC`, then `llama-server` / `zinc` on PATH.
+
+## Multi-token prediction (`--mtp`)
+
+`--mtp <head.gguf>` turns on llama-server's `draft-mtp` speculative decoding: the model's
+own MTP head (Unsloth ships it as `MTP/mtp-<model>-*.gguf`) drafts tokens on the same
+device, and the model checks them in one batch. `--mtp-max N` caps the draft length.
+It works on the llama.cpp devices (`vulkan`, `hrx`, `rocm`).
+
+Measured through `1bit serve` on Strix Halo, Qwen3.8-27B UD-Q4_K_XL with its Q4_0 MTP
+head, decode tok/s on three chat prompts (code / prose / short), 2026-09-24:
+
+| Route | Without `--mtp` | With `--mtp` |
+|---|---|---|
+| `--device vulkan` (upstream pin) | 12.2 / 12.0 / 12.0 | **35.0 / 28.3 / 28.9** |
+| `--device rocm` | 11.8 / 11.8 / 12.2 | 38.8 / 20.6 / 16.9 |
+| `--device rocm --mtp-max 3` | | 27.1 / 19.2 / 19.9 |
+
+Vulkan with MTP is the pick: 2.4-2.9x on every prompt, same file, same accuracy (a
+drafted token is kept only when the model agrees). ROCm edges it on code only.
 
 ## Verified (Strix Halo, 2026-09-23)
 

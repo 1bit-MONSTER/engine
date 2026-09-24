@@ -49,6 +49,38 @@ MTP chat is decode speed with the MTP head on three prompts (code / prose / shor
 - The ROCmFPX files were quantized without an importance matrix; UD-Q4_K_XL was
   made with one. An imatrix would narrow the accuracy gap somewhat.
 
+## Round 2: with Unsloth's imatrix, and what to use (2026-09-24)
+
+Round 1's ROCmFPX files had no importance matrix. Rebuilt with Unsloth's own
+(`imatrix_unsloth.gguf`, the one UD-Q4_K_XL was made with), next to Unsloth's smaller files:
+
+| File | Size | Mean KLD | Same top token | Best decode, tok/s |
+|---|---|---|---|---|
+| UD-Q4_K_XL (default) | 16.4 GiB | **0.008** | **95.3%** | 12.2 (Vulkan); 35.0 with `--mtp` |
+| UD-IQ4_XS (Unsloth) | 13.3 GiB | 0.019 | 93.3% | 15.0 (Vulkan) |
+| **UD-Q3_K_XL (Unsloth)** | 12.2 GiB | 0.028 | 92.1% | **15.8 (Vulkan)** |
+| ROCmI4 + imatrix | 13.9 GiB | 0.036 | 91.3% | 13.5 (ROCm W4A4; prompt 455) |
+| ROCmFP4 + imatrix | 13.8 GiB | 0.045 | 89.6% | 14.1 (Vulkan) |
+| ROCmFP2 + imatrix | 8.6 GiB | 0.341 | 75.5% | 21.2 (Vulkan) |
+
+- **For a smaller, faster file, use Unsloth's UD-Q3_K_XL on the default route** (no
+  `--lean` needed): it is smaller, faster and closer to the model than either
+  4-bit ROCmFPX format, even with the imatrix.
+- **`--lean` keeps two jobs:** ROCmI4 for the fastest prompt processing (455 tok/s
+  with W4A4 on ROCm), and ROCmFP2 when memory is the limit (8.6 GiB, 21 tok/s, at a
+  large accuracy cost: 75% top-token agreement).
+- **MTP beats every format change:** `--mtp` on the default file gives 2.4-2.9x
+  (docs/serve.md), more than any quant here.
+
+## Two backends at once
+
+`Vulkan0`, `ROCm0` and `HRX0` are one GPU. Decode on both at the same time
+(UD-Q4_K_XL, tg256): Vulkan alone 12.2 tok/s, ROCm alone 11.9; **Vulkan + ROCm together
+7.5 + 6.8 = 14.3 (+18% total)**; two Vulkan processes 6.3 + 6.3 = 12.7 (+4%). A single
+stream uses about 200 of the bus's roughly 256 GB/s, and two different drivers fill the
+gap better than two copies of one. Each stream slows down, so it pays for serving
+several requests at once (one per backend), not for one chat.
+
 ## Build
 
 ```

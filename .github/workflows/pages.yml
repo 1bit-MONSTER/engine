@@ -16,6 +16,7 @@
 # The documentation site, https://1bit-monster.github.io/engine/: tools/site.py renders
 # README.md and docs/*.md with site/template.html and site/style.css. Pull requests only
 # build it (a doc that breaks the site shows up in review); main deploys it to GitHub Pages.
+# The repository variable GOATCOUNTER (a GoatCounter site code) turns on visitor counts.
 name: pages
 
 on:
@@ -39,6 +40,8 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - name: Build the site
+        env:
+          GOATCOUNTER: ${{ vars.GOATCOUNTER }}
         run: |
           python3 -m pip install --quiet markdown==3.10.3
           python3 tools/site.py _site

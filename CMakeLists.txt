@@ -93,6 +93,9 @@ if(ONEBIT_HRX)
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
         endforeach()
+        # Vulkan decode with prompt prefill on HRX over one shared KV cache (docs/hrx.md)
+        add_test(NAME serve_e2e_vulkan_prefill_hrx
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan --prefill-device hrx)
     endif()
 endif()
 

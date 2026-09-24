@@ -29,6 +29,10 @@
 //   a .gguf, --device vulkan                    -> the upstream llama.cpp build's
 //                                                  llama-server (else the HRX build's)
 //   a .gguf, --device hrx                       -> the HRX build's llama-server
+//   a .gguf, --device vulkan --prefill-device hrx
+//                                               -> the HRX build's llama-server on Vulkan0,
+//                                                  long prompt prefixes on HRX0 over one
+//                                                  shared KV cache (docs/hrx.md)
 //   a .gguf, --device zinc                      -> this build's zinc
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
@@ -79,6 +83,8 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string llama_server, zinc, hrx_libhsa, mlx;
+    std::string prefill_device;
+    int prefill_min_tokens = 0;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -293,11 +299,21 @@ int serve_child(const Options& o) {
         argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
         set_model = o.model;
     } else if (device == "vulkan" || device == "hrx") {
-        argv = {o.llama_server.empty() ? default_llama_server(device) : o.llama_server,
+        // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
+        // attention on so both devices lay the KV cache out the same way
+        const bool split = !o.prefill_device.empty();
+        if (split && (device != "vulkan" || o.prefill_device != "hrx"))
+            throw std::runtime_error("--prefill-device hrx works with --device vulkan");
+        argv = {o.llama_server.empty() ? default_llama_server(split ? "hrx" : device) : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        if (device == "hrx") {
+        if (split) {
+            argv.insert(argv.end(), {"-fa", "on"});
+            env.push_back("ONEBIT_PREFILL_DEVICE=HRX0");
+            if (o.prefill_min_tokens > 0) env.push_back("ONEBIT_PREFILL_MIN_TOKENS=" + std::to_string(o.prefill_min_tokens));
+        }
+        if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
@@ -374,6 +390,7 @@ void usage(FILE* out) {
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
                  "                  [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -398,6 +415,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--zinc") o.zinc = next();
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
         else if (a == "--mlx-server") o.mlx = next();
+        else if (a == "--prefill-device") o.prefill_device = next();
+        else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

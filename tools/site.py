@@ -48,7 +48,7 @@ import markdown
 
 REPO = "https://github.com/1bit-MONSTER/engine"
 WIKI = REPO + "/wiki"
-SITE = "https://1bit.monster/"
+SITE = "https://1bit.gg/"
 # the old 1bit.MONSTER site, kept on GitHub Pages under its repository's own address
 OLD_SITE = "https://1bit-monster.github.io/1bit-MONSTER/"
 ROOT = pathlib.Path(__file__).resolve().parent.parent

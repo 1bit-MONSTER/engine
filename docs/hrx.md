@@ -64,6 +64,15 @@ Q4_K_M, greedy chat through llama-server on `HRX0`:
 | `--device vulkan` | right | right | right |
 | `--device hrx` | right | **wrong** (garbled text) | right |
 
+**Cause, narrowed:** prompt processing on `HRX0` is right at every length (last-token
+logits within 1% of Vulkan at 146 to 2,040 tokens). What goes wrong is **decoding one
+token at a time once the KV cache holds more than 256 tokens**: fed the same tokens as
+Vulkan, a 248-token prompt decodes correctly for 8 steps, a 250-token prompt goes wrong at
+the step where the cache passes 256, and 256 tokens or more are wrong from the first step
+(relative logit differences 0.3-1.3, the top token different on most steps). That points
+at `HRX0`'s single-query FLASH_ATTN_EXT over more than one 256-row KV block; somewhere
+above 2,048 tokens another path takes over, which is why those chats read correctly.
+
 Context size does not matter (1,536 to 8,192), the HRX diagnostic switches
 (`GGML_HRX_DEBUG_SERIAL_PROGRAM_COMMANDS`, `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC`,
 `GGML_HRX_DIAGNOSTIC_FRESH_TRANSIENT_ARENA`, `GGML_HRX_DISABLE_QWEN_DISPATCH`) do not fix

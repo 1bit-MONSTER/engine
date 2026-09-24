@@ -54,6 +54,30 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
   Halo before merging.
 
+### Known issue: `--device hrx` answers wrongly on mid-length prompts
+
+Measured 2026-09-24 on the pinned pair (llama.cpp `f1a0aca` + our patches), Qwen3-0.6B
+Q4_K_M, greedy chat through llama-server on `HRX0`:
+
+| Prompt tokens | 146 | 404 to 1,733 | 2,167 and 2,844 |
+|---|---|---|---|
+| `--device vulkan` | right | right | right |
+| `--device hrx` | right | **wrong** (garbled text) | right |
+
+Context size does not matter (1,536 to 8,192), the HRX diagnostic switches
+(`GGML_HRX_DEBUG_SERIAL_PROGRAM_COMMANDS`, `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC`,
+`GGML_HRX_DIAGNOSTIC_FRESH_TRANSIENT_ARENA`, `GGML_HRX_DISABLE_QWEN_DISPATCH`) do not fix
+it, and with flash attention off the graph does not run at the prompt lengths tested.
+Two more HRX0 failures on the same pin: Qwen3.6-35B-A3B Q8_0 faults the GPU (`AMDGPU
+memory access fault` in a graph replay), and a batch of several sequences
+(`llama-perplexity` with `n_seq` > 1) stops on a FLASH_ATTN_EXT node that HRX0 claimed
+but cannot run.
+
+**The prefill split below is not affected**: `--device vulkan --prefill-device hrx`
+answered the same as Vulkan alone at 1,160, 1,733 and 2,844 tokens. HRX0 only prefills
+whole ubatches there; decoding is Vulkan's. Until `--device hrx` is fixed upstream, use it
+for measurements, not for serving.
+
 ### Prefill on HRX, decode on Vulkan
 
 HRX prefills faster than Vulkan and Vulkan decodes faster, on the same GPU.

@@ -31,6 +31,9 @@ on:
 permissions:
   contents: read
 
+env:
+  INDEXNOW_KEY: a27e20a9646dbfd5284c817f1509ba12   # IndexNow's key is public by design
+
 concurrency:
   group: pages-${{ github.ref }}
   cancel-in-progress: true
@@ -40,6 +43,8 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0   # the sitemap's lastmod is each page's last commit
       - name: Build the site
         env:
           GOATCOUNTER: ${{ vars.GOATCOUNTER }}
@@ -64,3 +69,13 @@ jobs:
     steps:
       - id: deploy
         uses: actions/deploy-pages@v4
+      # Tell IndexNow (Bing, Yandex, Seznam, Naver) about every page; a failed ping never fails the deploy.
+      - name: IndexNow
+        continue-on-error: true
+        run: |
+          key=$INDEXNOW_KEY
+          for i in 1 2 3 4 5 6; do curl -fsS "https://1bit.gg/$key.txt" | grep -qx "$key" && break; sleep 20; done
+          urls=$(curl -fsS https://1bit.gg/sitemap.xml | grep -o '<loc>[^<]*' | sed 's/<loc>//' | python3 -c 'import json,sys; print(json.dumps([l.strip() for l in sys.stdin if l.strip()]))')
+          curl -sS -o /dev/null -w "IndexNow: HTTP %{http_code}\n" -X POST https://api.indexnow.org/indexnow \
+            -H 'Content-Type: application/json; charset=utf-8' \
+            -d "{\"host\":\"1bit.gg\",\"key\":\"$key\",\"keyLocation\":\"https://1bit.gg/$key.txt\",\"urlList\":$urls}"

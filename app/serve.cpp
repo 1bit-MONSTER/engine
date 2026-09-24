@@ -96,6 +96,7 @@ struct Options {
     std::string mtp;
     int mtp_max = 0;
     std::string mtp_p_min;
+    int parallel = 0;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -364,6 +365,12 @@ int serve_child(const Options& o) {
     } else {
         throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm or zinc)");
     }
+    if (o.parallel > 1) {
+        // continuous batching: N requests decode together, one read of the weights per step
+        // for all of them; llama-server splits --ctx-size across the slots
+        if (device == "zinc" || device == "mlx") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
+        argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
+    }
     if (!o.mtp.empty()) {
         // the MTP head drafts tokens on the same device; the model checks them in one batch
         if (device == "zinc" || device == "mlx") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
@@ -439,6 +446,7 @@ void usage(FILE* out) {
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -469,6 +477,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();
+        else if (a == "--parallel") o.parallel = std::stoi(next());
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

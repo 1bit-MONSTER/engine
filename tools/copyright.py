@@ -34,7 +34,7 @@ LINE_STYLES = [
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment"), "#"),
 ]
-BLOCK_STYLES = [(("*.md",), ("<!--", "-->"))]
+BLOCK_STYLES = [(("*.md", "*.html"), ("<!--", "-->")), (("*.css",), ("/*", "*/"))]
 
 EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock"]
 

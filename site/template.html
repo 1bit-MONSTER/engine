@@ -1,0 +1,60 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>{{title}}</title>
+<meta name="description" content="1bit engine: the NPU, HRX, Vulkan, ZINC and MLX behind one OpenAI-compatible API, inside Lemonade.">
+<link rel="stylesheet" href="style.css">
+<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%230f766e'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='700' text-anchor='middle' fill='white'%3E1b%3C/text%3E%3C/svg%3E">
+</head>
+<body class="{{home}}">
+<header class="top">
+  <a class="brand" href="index.html"><span class="mark">1b</span>1bit engine</a>
+  <nav class="links">
+    <a href="serve.html">Docs</a>
+    <a href="{{repo}}/wiki">Results</a>
+    <a href="{{repo}}">GitHub</a>
+  </nav>
+</header>
+<div class="layout">
+  <details class="side" open>
+    <summary>Contents</summary>
+    <nav aria-label="Documentation">
+{{sidebar}}
+    </nav>
+  </details>
+  <main>
+    <article>
+{{content}}
+    </article>
+    {{pager}}
+    <p class="edit"><a href="{{source}}">View this page's source on GitHub</a></p>
+  </main>
+</div>
+<footer>
+  <p>Apache-2.0 · <a href="{{repo}}">1bit-MONSTER/engine</a></p>
+  <p class="quote"><em>Sorry but not sorry.</em> — bong-water-water-bong</p>
+</footer>
+<script>
+  // on a phone the contents start folded, so the page comes first
+  if (window.matchMedia("(max-width: 860px)").matches) document.querySelector("details.side").open = false;
+</script>
+</body>
+</html>

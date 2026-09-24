@@ -26,7 +26,9 @@ OpenAI client.
            [--device auto|npu|vulkan|hrx|rocm|zinc|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
-           [--mtp HEAD.gguf] [--mtp-max N]
+           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
+           [--parallel N] [--adaptive] [--adaptive-at N]
+           [--embed MODEL.gguf] [--rerank MODEL.gguf]
 ```
 
 One model per process:
@@ -37,6 +39,8 @@ One model per process:
 | `GET /v1/models` | the one model (`--alias`, else the file or directory name) |
 | `POST /v1/chat/completions` | streamed (SSE) or not |
 | `POST /v1/completions` | |
+| `POST /v1/embeddings` | with `--embed` (RAG) |
+| `POST /v1/rerank` | with `--rerank` (RAG) |
 
 ## Where the model runs
 
@@ -74,7 +78,8 @@ then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC`, then `llama-server` / `zinc` on PA
 
 `--mtp <head.gguf>` turns on llama-server's `draft-mtp` speculative decoding: the model's
 own MTP head (Unsloth ships it as `MTP/mtp-<model>-*.gguf`) drafts tokens on the same
-device, and the model checks them in one batch. `--mtp-max N` caps the draft length.
+device, and the model checks them in one batch. `--mtp-max N` caps the draft length;
+`--mtp-p-min P` drafts a token only when the head is at least that sure of it.
 It works on the llama.cpp devices (`vulkan`, `hrx`, `rocm`).
 
 Measured through `1bit serve` on Strix Halo, Qwen3.8-27B UD-Q4_K_XL with its Q4_0 MTP
@@ -88,6 +93,119 @@ head, decode tok/s on three chat prompts (code / prose / short), 2026-09-24:
 
 Vulkan with MTP is the pick: 2.4-2.9x on every prompt, same file, same accuracy (a
 drafted token is kept only when the model agrees). ROCm edges it on code only.
+
+The full sweep on Vulkan (draft length x `--mtp-p-min`, code / prose / short; 12.2 / 12.3 / 12.3
+without MTP):
+
+| Setting | tok/s | Drafts accepted |
+|---|---|---|
+| `--mtp` (draft length 3, the default) | 35.9 / 28.2 / 28.8 | 94% / 68% / 75% |
+| `--mtp-max 4 --mtp-p-min 0.5` | 38.1 / 28.0 / 26.9 | 93% / 71% / 76% |
+| **`--mtp-max 6 --mtp-p-min 0.5`** | **42.0** / 27.3 / 25.2 | 84% / 60% / 72% |
+| `--mtp-max 8` | 21-25 / 13-20 / 10-20 | 76-88% / 39-65% / 33-78% |
+
+Use the default for chat and `--mtp-max 6 --mtp-p-min 0.5` for code (3.4x): code is
+predictable enough to keep long drafts, prose is not. Draft length 8 collapses on every
+prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
+opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
+tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
+
+## Many requests at once (`--parallel`)
+
+`--parallel N` gives llama-server N slots (`-np N`): requests that arrive together decode
+together, one read of the weights per step for all of them (continuous batching, what
+vLLM is built on). `--ctx-size` is split across the slots, so size it for all of them.
+
+Total decode tok/s with 1-16 simultaneous 256-token requests, 16 slots, 2026-09-24:
+
+| Requests | Qwen3.8-27B UD-Q4_K_XL, Vulkan | ... ROCm | Qwen3-Coder-30B-A3B Q4_K_M, Vulkan | ... ROCm |
+|---|---|---|---|---|
+| 1 | 11.8 | 11.6 | 85.7 | 67.6 |
+| 2 | 21.7 | 20.1 | 125.8 | 100.2 |
+| 4 | 36.9 | 30.2 | 182.4 | 140.3 |
+| 8 | **50.9** | 35.6 | **228.2** | 200.4 |
+| 16 | 42.9 | **68.0** | 202.9 | **318.9** |
+
+Vulkan peaks at 8 requests and falls back at 16; ROCm keeps scaling to 16, where it
+serves 5.8x (27B) and 3.7x (Coder) the best single stream. Use `--device vulkan` for up
+to about 8 concurrent users, `--device rocm --parallel 16` beyond that. Two backends
+decoding at once, by comparison, add 18% (docs/lean.md).
+
+## Growing with the load (`--adaptive`)
+
+No single setting wins at every load. One request is fastest on Vulkan with `--mtp`; up to
+8 are fastest batched on Vulkan; past that ROCm keeps scaling (the tables above). And MTP
+and batching do not mix: a server with MTP loaded batches at about two thirds of the
+throughput (Qwen3.8-27B, 4 requests: 24.9 tok/s with MTP loaded, 36.9 without), even with
+each request's draft length set to 0.
+
+`--adaptive` runs two backends, the model loaded on each: Vulkan with `--adaptive-at`
+slots (and `--mtp` if given) and ROCm with 16 slots (never MTP). A request goes to Vulkan
+while Vulkan holds fewer than `--adaptive-at` requests, and to ROCm otherwise; choosing
+and reserving the slot is one locked step.
+
+Qwen3.8-27B UD-Q4_K_XL, total tok/s by simultaneous requests (2026-09-24):
+
+| Requests | 1 | 2 | 4 | 8 | 12 | 16 | 24 |
+|---|---|---|---|---|---|---|---|
+| **`--adaptive --adaptive-at 8`** | 12.0 | 21.9 | 36.3 | **49.9** | 43.5 | 44.7 | **63.5** |
+| `--adaptive --mtp` (at 1) | 20.1 | 15.3 | 24.7 | 32.8 | 50.1 | 59.0 | 40.7 |
+| `--device vulkan --parallel 8` | 11.8 | 21.7 | 36.9 | 50.9 | | 42.9 (16) | |
+| `--device rocm --parallel 16` | 11.6 | 20.1 | 30.2 | 35.6 | | 68.0 | |
+
+- **Serving many users: `--adaptive --adaptive-at 8`.** It matches Vulkan batching up to
+  8 requests and keeps climbing past it (63.5 at 24, where Vulkan alone falls back). At
+  12-16 the two backends contend for the GPU and it dips below ROCm alone.
+- **One user at a time: `--mtp` without `--adaptive`** (35-42 tok/s). `--adaptive --mtp`
+  gives the lone request MTP speed but trails at every larger load.
+
+```sh
+1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --adaptive --adaptive-at 8 --ctx-size 65536
+```
+
+It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) and memory for
+two copies of the model; `--ctx-size` applies to each backend and is split across its
+slots. On exit, serve logs how many requests each backend took.
+
+## RAG (`--embed`, `--rerank`)
+
+`--embed MODEL.gguf` serves `/v1/embeddings` and `--rerank MODEL.gguf` serves `/v1/rerank`,
+each from its own llama-server on Vulkan beside the chat model (`--embedding`,
+`--reranking`, 4 slots, the whole input in one batch). `/v1/models` lists them with their
+role. A RAG client embeds its documents, retrieves by cosine similarity, reranks the best
+few and asks the chat model with them as context, all against the one server:
+
+```sh
+1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mtp mtp-Qwen3.8-27B-Q4_0.gguf \
+  --embed Qwen3-Embedding-0.6B-Q8_0.gguf --rerank qwen3-reranker-0.6b-q8_0.gguf
+```
+
+Measured end to end on Strix Halo (2026-09-24): the engine's own docs and README as the
+corpus (93 passages of about 120 words), four questions with known answers, Qwen3.8-27B
+UD-Q4_K_XL with `--mtp` answering, Qwen3-Embedding-0.6B Q8_0 embedding (queries prefixed
+with its `Instruct: ... Query: ` line):
+
+| Stage | Time |
+|---|---|
+| Embed the 93 passages | 3.4-5.6 s |
+| Embed a question | 17-32 ms |
+| Cosine search | 4-11 ms |
+| Rerank 8 passages | 0.4-0.6 s |
+| Answer (700-1,560-token prompt) | 4-5.6 s at 27-33 tok/s |
+
+| Retrieval | Right |
+|---|---|
+| **Top 8 by embedding, all 8 as context** | **3/4** (the fourth answered 11.0 ms/token, the same fact as 91 tok/s) |
+| Top 3 by embedding | 1/4 |
+| Top 8, reranked to 3 by Qwen3-Reranker-0.6B | 1/4: it scores every passage 0.96-1.0 through llama.cpp (two conversions tried) |
+| Top 8, reranked to 3 by bge-reranker-v2-m3 | 0/4: it discriminates, but keeps the wrong passages |
+
+So use embeddings with a wide context and no reranker: retrieval is about 25 ms, and a
+few thousand extra prompt tokens cost little at 270-320 tok/s prefill. `--rerank` stays
+for larger corpora, where cutting 50 candidates to 8 matters more.
+
+Long retrieved contexts are where `--prefill-device hrx` pays (26% on an 8192-token
+request, above).
 
 ## Verified (Strix Halo, 2026-09-23)
 

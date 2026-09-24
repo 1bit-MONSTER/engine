@@ -25,6 +25,9 @@
 #   llama_lean_rocm  ROCm build with the gfx1151 W4A4 path: ROCmI4 files
 #                    (`1bit serve --lean --device rocm`), with ONEBIT_LEAN_ROCM
 # The web UI is off: its build step downloads assets, and serve does not use it.
+# The ROCm build forces llama.cpp's own MMQ kernels (GGML_CUDA_FORCE_MMQ): hipBLAS returns
+# wrong GEMMs on gfx1151 (ROCm/rocm-libraries#11530), and MMQ-only measured more accurate at
+# the same speed (Qwen3.8-27B UD-Q4_K_XL, KLD 0.0064 against 0.0094; docs/lean.md).
 include(ExternalProject)
 
 if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/llama.cpp-rocmfpx/CMakeLists.txt")
@@ -62,6 +65,7 @@ if(ONEBIT_LEAN_ROCM)
             -DCMAKE_HIP_COMPILER=${ONEBIT_LEAN_ROCM_TOOLCHAIN}/bin/amdclang++
             -DCMAKE_PREFIX_PATH=/opt/rocm-therock
             -DCMAKE_HIP_ARCHITECTURES=gfx1151 -DGGML_HIP_ROCMI4_W4A4=ON
+            -DGGML_CUDA_FORCE_MMQ=ON
             -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_WEBUI=OFF -DLLAMA_CURL=OFF
         BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
         BUILD_BYPRODUCTS ${ONEBIT_LEAN_ROCM_SERVER}

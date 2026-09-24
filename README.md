@@ -26,6 +26,7 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - the XDNA 2 NPU engine
 - HRX on the Radeon iGPU, on the llama.cpp + hrx-system pair AMD tests
 - Vulkan on the Radeon iGPU, from upstream llama.cpp's latest release, so new architectures land the day upstream ships them
+- a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - MLX on Apple Silicon, through lemon-mlx-engine
 - Laya, which decides where each request runs

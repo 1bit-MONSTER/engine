@@ -74,6 +74,27 @@ if(ONEBIT_VULKAN)
     endif()
 endif()
 
+# ── The lean option: ROCmFPX's formats (docs/lean.md) ─────────────────────
+# Off by default. Builds llama-server + llama-quantize from third_party/llama.cpp-rocmfpx
+# on Vulkan: `1bit serve --lean` runs ROCmFP4 files with it. ONEBIT_LEAN_ROCM adds the
+# ROCm build with the gfx1151 W4A4 path, for ROCmI4 files (`--lean --device rocm`).
+option(ONEBIT_LEAN "Build the lean (ROCmFPX) llama-server on Vulkan" OFF)
+option(ONEBIT_LEAN_ROCM "Also build the lean llama-server on ROCm (W4A4, needs TheRock)" OFF)
+set(ONEBIT_SERVE_TEST_LEAN_GGUF "" CACHE FILEPATH "ROCmFP4 GGUF the lean serve_e2e test loads")
+if(ONEBIT_LEAN)
+    include(cmake/lean.cmake)
+    add_dependencies(onebit llama_lean)
+    target_compile_definitions(onebit PRIVATE ONEBIT_LEAN_SERVER="${ONEBIT_LEAN_SERVER}")
+    if(ONEBIT_LEAN_ROCM)
+        add_dependencies(onebit llama_lean_rocm)
+        target_compile_definitions(onebit PRIVATE ONEBIT_LEAN_ROCM_SERVER="${ONEBIT_LEAN_ROCM_SERVER}")
+    endif()
+    if(ONEBIT_SERVE_TEST_LEAN_GGUF)
+        add_test(NAME serve_e2e_lean
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_LEAN_GGUF} vulkan --lean)
+    endif()
+endif()
+
 # ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
 # Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
 # only runs on AMD GPUs. `1bit serve` then uses this llama-server for both

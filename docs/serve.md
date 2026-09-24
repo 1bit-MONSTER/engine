@@ -25,7 +25,7 @@ OpenAI client.
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
            [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
-           [--prefill-device hrx] [--prefill-min-tokens N]
+           [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
 ```
 
 One model per process:
@@ -45,6 +45,8 @@ One model per process:
 | `.gguf` | `auto`, `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md); without `ONEBIT_VULKAN`, the HRX build's |
 | `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md) |
 | `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
+| ROCmFP4 `.gguf` | `auto`, `vulkan` with `--lean` | the lean (ROCmFPX) build's llama-server on `Vulkan0` (docs/lean.md) |
+| ROCmI4 `.gguf` | `rocm` with `--lean` | the lean ROCm build's llama-server on `ROCm0`, W4A4 (docs/lean.md) |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 

@@ -46,6 +46,12 @@ ggml-org/llama.cpp, an upstream release)
   Copyright (c) 2023-2026 The ggml authors
   License: MIT
 
+ROCmFPX (third_party/llama.cpp-rocmfpx: charlie12345/ROCmFPX, a fork of
+ggml-org/llama.cpp with AMD-focused weight formats; the lean option)
+  https://github.com/charlie12345/ROCmFPX
+  Copyright (c) 2023-2026 The ggml authors
+  License: MIT
+
 HRX, HIP Runtime Extended (third_party/hrx-system)
   https://github.com/ROCm/hrx-system
   Copyright the HRX authors (Advanced Micro Devices, Inc.)

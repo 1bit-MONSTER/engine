@@ -22,8 +22,13 @@
 # "More", so a new doc never goes missing. Links to other docs become page links;
 # links to other files in the repository go to them on GitHub.
 #
+# Visitor counts: with GOATCOUNTER set to a GoatCounter site code (pages.yml passes the
+# repository variable of that name), every page loads GoatCounter's counter, which sets
+# no cookies. Unset, as in a local preview, the pages carry no analytics at all.
+#
 # Needs python-markdown (pip install markdown).
 import html
+import os
 import pathlib
 import re
 import shutil
@@ -138,6 +143,15 @@ def pager(order, name, labels):
     return f'<nav class="pager">{prev}{nxt}</nav>'
 
 
+def analytics():
+    code = os.environ.get("GOATCOUNTER", "").strip()
+    if not code:
+        return ""
+    if not re.fullmatch(r"[a-z0-9-]+", code):
+        sys.exit(f"GOATCOUNTER must be a GoatCounter site code (letters, digits, dashes), not {code!r}")
+    return f'<script data-goatcounter="https://{code}.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>'
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "_site")
     if out.exists():
@@ -147,7 +161,7 @@ def main():
     groups = nav_groups(docs)
     order = [n for _, items in groups for n, _ in items]
     labels = {n: l for _, items in groups for n, l in items}
-    template = strip_notice((ROOT / "site" / "template.html").read_text())
+    template = strip_notice((ROOT / "site" / "template.html").read_text()).replace("{{analytics}}", analytics())
     for name, src in docs.items():
         text = strip_notice(src.read_text())
         if name == "index":

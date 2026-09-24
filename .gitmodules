@@ -59,3 +59,7 @@
 	path = third_party/llama.cpp-vulkan
 	url = https://github.com/ggml-org/llama.cpp.git
 	shallow = true
+[submodule "third_party/llama.cpp-rocmfpx"]
+	path = third_party/llama.cpp-rocmfpx
+	url = https://github.com/charlie12345/ROCmFPX.git
+	shallow = true

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|zinc]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|zinc] [--lean]`
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -34,6 +34,9 @@
 //                                                  long prompt prefixes on HRX0 over one
 //                                                  shared KV cache (docs/hrx.md)
 //   a .gguf, --device zinc                      -> this build's zinc
+//   a .gguf, --lean                             -> the lean build's llama-server (ROCmFPX's
+//                                                  formats) on Vulkan0; with --device rocm,
+//                                                  its ROCm build on ROCm0 (docs/lean.md)
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
@@ -85,6 +88,7 @@ struct Options {
     std::string llama_server, zinc, hrx_libhsa, mlx;
     std::string prefill_device;
     int prefill_min_tokens = 0;
+    bool lean = false;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -117,6 +121,24 @@ std::string default_llama_server(const std::string& device) {
 #else
     (void)device;
     return "llama-server";
+#endif
+}
+
+// --lean: the llama-server built from ROCmFPX (ONEBIT_LEAN), whose formats upstream
+// llama.cpp cannot read; --device rocm picks its ROCm build (ONEBIT_LEAN_ROCM).
+std::string default_lean_server(const std::string& device) {
+    if (const char* e = std::getenv("ONEBIT_LEAN_SERVER"); e && *e) return e;
+    if (device == "rocm") {
+#ifdef ONEBIT_LEAN_ROCM_SERVER
+        return ONEBIT_LEAN_ROCM_SERVER;
+#else
+        throw std::runtime_error("--lean --device rocm needs a build with -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON");
+#endif
+    }
+#ifdef ONEBIT_LEAN_SERVER
+    return ONEBIT_LEAN_SERVER;
+#else
+    throw std::runtime_error("--lean needs a build with -DONEBIT_LEAN=ON (docs/lean.md)");
 #endif
 }
 
@@ -298,6 +320,15 @@ int serve_child(const Options& o) {
         // Hugging Face id, so requests carry that id (docs/apple.md).
         argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
         set_model = o.model;
+    } else if (o.lean) {
+        // ROCmFP4 on Vulkan0, or ROCmI4 on ROCm0 (the W4A4 path lives in that build)
+        if (device != "vulkan" && device != "rocm")
+            throw std::runtime_error("--lean runs on --device vulkan or rocm");
+        if (!o.prefill_device.empty()) throw std::runtime_error("--lean does not take --prefill-device");
+        argv = {o.llama_server.empty() ? default_lean_server(device) : o.llama_server,
+                "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
+                "--device", device == "rocm" ? "ROCm0" : "Vulkan0", "-ngl", "99", "--jinja"};
+        if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
     } else if (device == "vulkan" || device == "hrx") {
         // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
         // attention on so both devices lay the KV cache out the same way
@@ -391,6 +422,7 @@ void usage(FILE* out) {
                  "                  [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
+                 "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -417,12 +449,14 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mlx-server") o.mlx = next();
         else if (a == "--prefill-device") o.prefill_device = next();
         else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
+        else if (a == "--lean") o.lean = true;
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
     if (o.model.empty()) { usage(stderr); return 2; }
 
     if (fs::is_directory(o.model)) {
+        if (o.lean) throw std::runtime_error("--lean serves a .gguf (ROCmFP4 or ROCmI4)");
         if (o.device != "auto" && o.device != "npu")
             throw std::runtime_error("an NPU model directory runs on --device npu");
 #ifdef ONEBIT_NPU

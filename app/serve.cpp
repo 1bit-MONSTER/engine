@@ -26,7 +26,9 @@
 //
 // Which device runs the model follows from the model and --device:
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
-//   a .gguf, --device vulkan|hrx                -> this build's llama-server
+//   a .gguf, --device vulkan                    -> the upstream llama.cpp build's
+//                                                  llama-server (else the HRX build's)
+//   a .gguf, --device hrx                       -> the HRX build's llama-server
 //   a .gguf, --device zinc                      -> this build's zinc
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
@@ -96,11 +98,18 @@ std::string hrx_libhsa(const std::string& option) {
     return "";
 }
 
-std::string default_llama_server() {
+// --device vulkan prefers the upstream llama.cpp build (ONEBIT_VULKAN, the
+// latest release: new architectures land there first); --device hrx, and
+// vulkan without that build, use the HRX build (AMD's tested pair).
+std::string default_llama_server(const std::string& device) {
     if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
+#ifdef ONEBIT_VULKAN_SERVER
+    if (device == "vulkan") return ONEBIT_VULKAN_SERVER;
+#endif
 #ifdef ONEBIT_HRX_SERVER
     return ONEBIT_HRX_SERVER;
 #else
+    (void)device;
     return "llama-server";
 #endif
 }
@@ -284,7 +293,7 @@ int serve_child(const Options& o) {
         argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
         set_model = o.model;
     } else if (device == "vulkan" || device == "hrx") {
-        argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
+        argv = {o.llama_server.empty() ? default_llama_server(device) : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }

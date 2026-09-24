@@ -41,8 +41,8 @@ One model per process:
 | Model | `--device` | Runs on |
 |---|---|---|
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
-| `.gguf` | `auto`, `vulkan` | this build's llama-server on `Vulkan0` |
-| `.gguf` | `hrx` | this build's llama-server on `HRX0` |
+| `.gguf` | `auto`, `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md); without `ONEBIT_VULKAN`, the HRX build's |
+| `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md) |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 

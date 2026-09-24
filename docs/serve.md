@@ -168,6 +168,30 @@ few and asks the chat model with them as context, all against the one server:
   --embed Qwen3-Embedding-0.6B-Q8_0.gguf --rerank qwen3-reranker-0.6b-q8_0.gguf
 ```
 
+Measured end to end on Strix Halo (2026-09-24): the engine's own docs and README as the
+corpus (93 passages of about 120 words), four questions with known answers, Qwen3.8-27B
+UD-Q4_K_XL with `--mtp` answering, Qwen3-Embedding-0.6B Q8_0 embedding (queries prefixed
+with its `Instruct: ... Query: ` line):
+
+| Stage | Time |
+|---|---|
+| Embed the 93 passages | 3.4-5.6 s |
+| Embed a question | 17-32 ms |
+| Cosine search | 4-11 ms |
+| Rerank 8 passages | 0.4-0.6 s |
+| Answer (700-1,560-token prompt) | 4-5.6 s at 27-33 tok/s |
+
+| Retrieval | Right |
+|---|---|
+| **Top 8 by embedding, all 8 as context** | **3/4** (the fourth answered 11.0 ms/token, the same fact as 91 tok/s) |
+| Top 3 by embedding | 1/4 |
+| Top 8, reranked to 3 by Qwen3-Reranker-0.6B | 1/4: it scores every passage 0.96-1.0 through llama.cpp (two conversions tried) |
+| Top 8, reranked to 3 by bge-reranker-v2-m3 | 0/4: it discriminates, but keeps the wrong passages |
+
+So use embeddings with a wide context and no reranker: retrieval is about 25 ms, and a
+few thousand extra prompt tokens cost little at 270-320 tok/s prefill. `--rerank` stays
+for larger corpora, where cutting 50 candidates to 8 matters more.
+
 Long retrieved contexts are where `--prefill-device hrx` pays (26% on an 8192-token
 request, above).
 

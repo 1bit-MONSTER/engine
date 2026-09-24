@@ -15,46 +15,61 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 <!doctype html>
-<html lang="en">
+<html lang="en" data-theme="light">
 <head>
 <meta charset="utf-8">
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>{{title}}</title>
-<meta name="description" content="1bit engine: the NPU, HRX, Vulkan, ZINC and MLX behind one OpenAI-compatible API, inside Lemonade.">
+<meta name="description" content="{{description}}">
+<meta property="og:site_name" content="1bit engine">
+<meta property="og:title" content="{{title}}">
+<meta property="og:description" content="{{description}}">
+<link rel="icon" type="image/svg+xml" href="assets/favicon.svg">
+<link rel="icon" type="image/png" sizes="32x32" href="assets/favicon-32x32.png">
+<link rel="icon" type="image/png" sizes="16x16" href="assets/favicon-16x16.png">
+<link rel="apple-touch-icon" href="assets/apple-touch-icon.png">
+<link rel="alternate" type="application/atom+xml" title="1bit engine blog" href="feed.xml">
 <link rel="stylesheet" href="style.css">
-<link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 32 32'%3E%3Crect width='32' height='32' rx='7' fill='%23111111'/%3E%3Ctext x='16' y='22' font-family='monospace' font-size='16' font-weight='700' text-anchor='middle' fill='white'%3E1b%3C/text%3E%3C/svg%3E">
+<script src="theme.js"></script>
 </head>
-<body class="{{home}}">
-<header class="top">
-  <a class="brand" href="index.html"><span class="mark">1b</span>1bit engine</a>
-  <nav class="links">
-    <a href="serve.html">Docs</a>
-    <a href="{{repo}}/wiki">Results</a>
-    <a href="{{repo}}">GitHub</a>
-  </nav>
-</header>
-<div class="layout">
-  <details class="side" open>
-    <summary>Contents</summary>
-    <nav aria-label="Documentation">
-{{sidebar}}
+<body class="{{kind}}">
+<header class="topnav">
+  <div class="container topnav-inner">
+    <a href="index.html" class="logo">
+      <svg viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect class="relay r1" x="2" y="2" width="9" height="9" rx="2"/><rect class="relay r2" x="13" y="2" width="9" height="9" rx="2"/><rect class="relay r3" x="2" y="13" width="9" height="9" rx="2"/><rect class="relay r4" x="13" y="13" width="9" height="9" rx="2"/></svg>
+      <span>1bit engine</span>
+    </a>
+    <nav>
+{{nav}}
     </nav>
-  </details>
-  <main>
-    <article>
-{{content}}
-    </article>
-    {{pager}}
-    <p class="edit"><a href="{{source}}">View this page's source on GitHub</a></p>
-  </main>
-</div>
-<footer>
-  <p>Apache-2.0 · <a href="{{repo}}">1bit-MONSTER/engine</a></p>
-  <p class="quote"><em>Sorry but not sorry.</em> — bong-water-water-bong</p>
+    <span class="theme-switch" role="group" aria-label="Theme: light, auto, or dark">
+      <button type="button" class="ts-btn" data-choice="light" title="Light mode" aria-label="Light mode" aria-pressed="false"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><circle cx="12" cy="12" r="4.2"/><path d="M12 2.4v2.6M12 19v2.6M2.4 12H5M19 12h2.6M4.9 4.9l1.9 1.9M17.2 17.2l1.9 1.9M19.1 4.9l-1.9 1.9M6.8 17.2l-1.9 1.9"/></svg></button>
+      <button type="button" class="ts-btn" data-choice="auto" title="Auto (follow system)" aria-label="Auto (follow system)" aria-pressed="false"><svg viewBox="0 0 24 24" width="15" height="15" aria-hidden="true"><path d="M12 3a9 9 0 1 0 0 18V3Z" fill="currentColor"/><circle cx="12" cy="12" r="8.6" fill="none" stroke="currentColor" stroke-width="1.7"/></svg></button>
+      <button type="button" class="ts-btn" data-choice="dark" title="Dark mode" aria-label="Dark mode" aria-pressed="false"><svg viewBox="0 0 24 24" width="15" height="15" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true"><path d="M20.2 14.6A8.4 8.4 0 1 1 9.4 3.8 6.9 6.9 0 0 0 20.2 14.6Z"/></svg></button>
+    </span>
+    <a class="btn btn-ghost" href="{{repo}}">GitHub&nbsp;↗</a>
+  </div>
+</header>
+
+<main id="content">
+{{main}}
+</main>
+
+<footer class="pagefoot">
+  <div class="container row-between">
+    <span>© 2026 1bit engine · Apache-2.0</span>
+    <a class="meta" href="https://discord.gg/Qy38d4Xu2h" target="_blank" rel="noopener">Join Discord ↗</a>
+    <a class="meta" href="{{repo}}">github.com/1bit-MONSTER/engine</a>
+  </div>
+  <div class="container">
+    <p class="place">Metepenagiag Mi’kmaq Nation, New Brunswick, Canada</p>
+    <p class="quote">"Sorry but not sorry." by bong-water-water-bong</p>
+  </div>
 </footer>
 <script>
-  // on a phone the contents start folded, so the page comes first
-  if (window.matchMedia("(max-width: 860px)").matches) document.querySelector("details.side").open = false;
+  // on a phone the docs contents start folded, so the page comes first
+  var side = document.querySelector("details.docs-side");
+  if (side && window.matchMedia("(max-width: 860px)").matches) side.open = false;
 </script>
 {{analytics}}
 </body>

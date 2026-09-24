@@ -34,9 +34,9 @@ LINE_STYLES = [
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment"), "#"),
 ]
-BLOCK_STYLES = [(("*.md", "*.html"), ("<!--", "-->")), (("*.css",), ("/*", "*/"))]
+BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 
-EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock"]
+EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico"]
 
 
 def _match(name, patterns):

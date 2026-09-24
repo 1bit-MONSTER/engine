@@ -22,9 +22,9 @@ name: pages
 on:
   push:
     branches: [main]
-    paths: [README.md, "docs/**", "site/**", tools/site.py, .github/workflows/pages.yml]
+    paths: [README.md, "docs/**", "blog/**", "site/**", tools/site.py, .github/workflows/pages.yml]
   pull_request:
-    paths: [README.md, "docs/**", "site/**", tools/site.py, .github/workflows/pages.yml]
+    paths: [README.md, "docs/**", "blog/**", "site/**", tools/site.py, .github/workflows/pages.yml]
   workflow_dispatch:
 
 permissions:

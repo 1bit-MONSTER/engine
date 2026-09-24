@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|zinc] [--lean]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD]`
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -34,9 +34,13 @@
 //                                                  long prompt prefixes on HRX0 over one
 //                                                  shared KV cache (docs/hrx.md)
 //   a .gguf, --device zinc                      -> this build's zinc
+//   a .gguf, --device rocm                      -> the ROCm build's llama-server on ROCm0
+//                                                  (ONEBIT_LEAN_ROCM: any GGUF, and ROCmI4 with
+//                                                  the gfx1151 W4A4 path; docs/lean.md)
 //   a .gguf, --lean                             -> the lean build's llama-server (ROCmFPX's
-//                                                  formats) on Vulkan0; with --device rocm,
-//                                                  its ROCm build on ROCm0 (docs/lean.md)
+//                                                  formats) on Vulkan0 (docs/lean.md)
+//   --mtp <head.gguf> on any llama.cpp route    -> multi-token prediction: the model's MTP
+//                                                  head drafts, the model verifies (docs/serve.md)
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
@@ -89,6 +93,8 @@ struct Options {
     std::string prefill_device;
     int prefill_min_tokens = 0;
     bool lean = false;
+    std::string mtp;
+    int mtp_max = 0;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -132,7 +138,7 @@ std::string default_lean_server(const std::string& device) {
 #ifdef ONEBIT_LEAN_ROCM_SERVER
         return ONEBIT_LEAN_ROCM_SERVER;
 #else
-        throw std::runtime_error("--lean --device rocm needs a build with -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON");
+        throw std::runtime_error("--device rocm needs a build with -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON");
 #endif
     }
 #ifdef ONEBIT_LEAN_SERVER
@@ -320,11 +326,12 @@ int serve_child(const Options& o) {
         // Hugging Face id, so requests carry that id (docs/apple.md).
         argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
         set_model = o.model;
-    } else if (o.lean) {
-        // ROCmFP4 on Vulkan0, or ROCmI4 on ROCm0 (the W4A4 path lives in that build)
+    } else if (o.lean || device == "rocm") {
+        // --lean: ROCmFPX's formats on Vulkan0. --device rocm: the ROCm build (ROCmFPX's tree,
+        // which reads every GGUF) on ROCm0; ROCmI4 files use its W4A4 path there.
         if (device != "vulkan" && device != "rocm")
             throw std::runtime_error("--lean runs on --device vulkan or rocm");
-        if (!o.prefill_device.empty()) throw std::runtime_error("--lean does not take --prefill-device");
+        if (!o.prefill_device.empty()) throw std::runtime_error("--prefill-device works with --device vulkan only");
         argv = {o.llama_server.empty() ? default_lean_server(device) : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "rocm" ? "ROCm0" : "Vulkan0", "-ngl", "99", "--jinja"};
@@ -354,7 +361,13 @@ int serve_child(const Options& o) {
         env.push_back("RADV_PERFTEST=coop_matrix");
         drop_model = true;  // zinc rejects any model id but its own
     } else {
-        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx or zinc)");
+        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm or zinc)");
+    }
+    if (!o.mtp.empty()) {
+        // the MTP head drafts tokens on the same device; the model checks them in one batch
+        if (device == "zinc" || device == "mlx") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
+        argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
+        if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
     }
 
     const std::string id = model_id(o);
@@ -419,10 +432,11 @@ int serve_child(const Options& o) {
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|vulkan|hrx|zinc|mlx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|vulkan|hrx|rocm|zinc|mlx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
+                 "                  [--mtp HEAD.gguf] [--mtp-max N]   multi-token prediction (vulkan, hrx, rocm)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -450,6 +464,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefill-device") o.prefill_device = next();
         else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
         else if (a == "--lean") o.lean = true;
+        else if (a == "--mtp") o.mtp = next();
+        else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

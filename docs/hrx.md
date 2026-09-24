@@ -54,38 +54,37 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
   Halo before merging.
 
-### Known issue: `--device hrx` answers wrongly on mid-length prompts
+### Fixed: `--device hrx` answered wrongly on mid-length prompts
 
-Measured 2026-09-24 on the pinned pair (llama.cpp `f1a0aca` + our patches), Qwen3-0.6B
-Q4_K_M, greedy chat through llama-server on `HRX0`:
+Measured 2026-09-24, Qwen3-0.6B Q4_K_M, greedy chat through llama-server on `HRX0`:
+before the fix, prompts of 404 to 1,733 tokens came back as garbled text, while 146
+tokens and 2,167 tokens or more read correctly. Prompt processing was right at every
+length; decoding one token at a time went wrong once the KV cache held more than 256
+tokens.
 
-| Prompt tokens | 146 | 404 to 1,733 | 2,167 and 2,844 |
-|---|---|---|---|
-| `--device vulkan` | right | right | right |
-| `--device hrx` | right | **wrong** (garbled text) | right |
+**Cause:** above 256 KV tokens the single-query flash attention kernel
+(`flash_attention_decode_split_f32_f16_wmma.loom`) combines its per-block partial
+results with a cooperative reducer. That reducer runs four subgroups over eight query
+rows per KV head, and it checked only that a row's query head exists, not that the row
+belongs to this KV head. With fewer than eight query heads per KV head (Qwen3-0.6B has
+2), the spare subgroups reduced stale rows and wrote them over the next KV head's output.
+The reducer used at 256 tokens and below already stays inside its own rows. The fix
+(fork commit `79788e9`, on `1bit/hrx-vulkan-patched`) adds that bound to both copies of
+the kernel.
 
-**Cause, narrowed:** prompt processing on `HRX0` is right at every length (last-token
-logits within 1% of Vulkan at 146 to 2,040 tokens). What goes wrong is **decoding one
-token at a time once the KV cache holds more than 256 tokens**: fed the same tokens as
-Vulkan, a 248-token prompt decodes correctly for 8 steps, a 250-token prompt goes wrong at
-the step where the cache passes 256, and 256 tokens or more are wrong from the first step
-(relative logit differences 0.3-1.3, the top token different on most steps). That points
-at `HRX0`'s single-query FLASH_ATTN_EXT over more than one 256-row KV block; somewhere
-above 2,048 tokens another path takes over, which is why those chats read correctly.
+After the fix, fed the same tokens as Vulkan (8 decode steps each), the relative logit
+difference is 0.01 to 0.03 at 248, 250, 256, 300, 400, 1,200 and 2,040 tokens, the same
+as below 256 before; and the chat answers match Vulkan's at every length from 404 to
+2,844 tokens. `test-backend-ops -o FLASH_ATTN_EXT` cannot check it on this pin: 12 of
+5,141 cases pass with and without the fix, because HRX0 refuses the test's empty `NONE`
+graph node.
 
-Context size does not matter (1,536 to 8,192), the HRX diagnostic switches
-(`GGML_HRX_DEBUG_SERIAL_PROGRAM_COMMANDS`, `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC`,
-`GGML_HRX_DIAGNOSTIC_FRESH_TRANSIENT_ARENA`, `GGML_HRX_DISABLE_QWEN_DISPATCH`) do not fix
-it, and with flash attention off the graph does not run at the prompt lengths tested.
-Two more HRX0 failures on the same pin: Qwen3.6-35B-A3B Q8_0 faults the GPU (`AMDGPU
-memory access fault` in a graph replay), and a batch of several sequences
-(`llama-perplexity` with `n_seq` > 1) stops on a FLASH_ATTN_EXT node that HRX0 claimed
-but cannot run.
+### Known issues on `HRX0`
 
-**The prefill split below is not affected**: `--device vulkan --prefill-device hrx`
-answered the same as Vulkan alone at 1,160, 1,733 and 2,844 tokens. HRX0 only prefills
-whole ubatches there; decoding is Vulkan's. Until `--device hrx` is fixed upstream, use it
-for measurements, not for serving.
+Qwen3.6-35B-A3B Q8_0 faults the GPU (`AMDGPU memory access fault` in a graph replay),
+and a batch of several sequences (`llama-perplexity` with `n_seq` > 1) stops on a
+FLASH_ATTN_EXT node that HRX0 claimed but cannot run. The prefill split below is not
+affected by either: HRX0 only prefills whole ubatches there, and decoding is Vulkan's.
 
 ### Prefill on HRX, decode on Vulkan
 

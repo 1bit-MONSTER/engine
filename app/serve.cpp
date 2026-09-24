@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD] [--adaptive]`
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -63,6 +63,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #else
@@ -97,6 +98,8 @@ struct Options {
     int mtp_max = 0;
     std::string mtp_p_min;
     int parallel = 0;
+    bool adaptive = false;
+    int adaptive_at = 8;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -271,8 +274,19 @@ std::string model_id(const Options& o) {
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
 // child such as zinc rejects ids it did not load), and replies carry ours.
-void forward(const Child& child, const std::string& our_id, bool drop_model, const std::string& set_model,
-             const httplib::Request& req, httplib::Response& res) {
+// Counts a request against a backend from the moment it is routed until its reply
+// (streamed or not) is complete; --adaptive routes by these counts.
+struct InFlight {
+    explicit InFlight(std::atomic<int>* n) : n_(n) { if (n_) ++*n_; }
+    ~InFlight() { if (n_) --*n_; }
+    InFlight(const InFlight&) = delete;
+    InFlight& operator=(const InFlight&) = delete;
+private:
+    std::atomic<int>* n_;
+};
+
+void forward(int port, std::atomic<int>* inflight, const std::string& our_id, bool drop_model,
+             const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
     json body;
     try {
         body = json::parse(req.body);
@@ -286,7 +300,7 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
     const bool stream = body.value("stream", false);
     const std::string payload = body.dump();
     const std::string path = req.path;
-    const int port = child.port();
+    auto held = std::make_shared<InFlight>(inflight);
     if (!stream) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
@@ -307,7 +321,7 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
         return;
     }
     // Streaming: relay the child's SSE bytes as they arrive.
-    res.set_chunked_content_provider("text/event-stream", [port, path, payload](size_t, httplib::DataSink& sink) {
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held](size_t, httplib::DataSink& sink) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         c.Post(path, httplib::Headers{}, payload, "application/json",
@@ -317,12 +331,23 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
     });
 }
 
-int serve_child(const Options& o) {
-    std::string device = o.device == "auto" ? "vulkan" : o.device;
-    const int child_port = free_port();
+struct Launch {
+    std::string device;
+    int port = 0;
     std::vector<std::string> argv, env;
     bool drop_model = false;
     std::string set_model;
+};
+
+// The backend process for one device: its command line and environment.
+Launch launch_for(const Options& o, const std::string& device, int child_port) {
+    Launch l;
+    l.device = device;
+    l.port = child_port;
+    std::vector<std::string>& argv = l.argv;
+    std::vector<std::string>& env = l.env;
+    bool& drop_model = l.drop_model;
+    std::string& set_model = l.set_model;
     if (device == "mlx") {
         // lemon-mlx-engine: `<server> <hf id> --port <p>`; it picks the model by
         // Hugging Face id, so requests carry that id (docs/apple.md).
@@ -378,6 +403,32 @@ int serve_child(const Options& o) {
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
+    return l;
+}
+
+int serve_child(const Options& o) {
+    std::vector<Launch> backends;
+    if (o.adaptive) {
+        // Grows with the load: requests go to Vulkan (the fastest single stream, MTP if
+        // given) until it holds --adaptive-at of them in flight, then overflow to ROCm,
+        // which keeps scaling to 16 batched requests (docs/serve.md, "Many requests").
+        if (o.device != "auto" && o.device != "vulkan")
+            throw std::runtime_error("--adaptive runs Vulkan with ROCm overflow; leave --device at auto or vulkan");
+        if (o.lean || !o.prefill_device.empty()) throw std::runtime_error("--adaptive does not combine with --lean or --prefill-device");
+        Options first = o;
+        first.parallel = o.parallel > 1 ? o.parallel : o.adaptive_at;
+        backends.push_back(launch_for(first, "vulkan", free_port()));
+        Options overflow = o;
+        overflow.parallel = 16;
+        overflow.mtp.clear();       // batched requests gain little from drafting
+        overflow.llama_server.clear();
+        backends.push_back(launch_for(overflow, "rocm", free_port()));
+    } else {
+        backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
+    }
+    const std::string device = o.adaptive ? "vulkan+rocm" : backends[0].device;
+    const bool drop_model = backends[0].drop_model;
+    const std::string set_model = backends[0].set_model;
 
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
@@ -394,14 +445,23 @@ int serve_child(const Options& o) {
                                                     {"device", device}}})}}.dump(),
                         "application/json");
     });
-    std::unique_ptr<Child> child;
+    std::vector<std::unique_ptr<Child>> children;
+    std::vector<std::atomic<int>> inflight(backends.size());
+    std::vector<std::atomic<long>> routed(backends.size());
     auto post = [&](const httplib::Request& q, httplib::Response& r) {
-        if (!ready || !child) {
+        if (!ready) {
             r.status = 503;
             r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
             return;
         }
-        forward(*child, id, drop_model, set_model, q, r);
+        // the first backend until it is full, then the one with the fewest in flight
+        size_t pick = 0;
+        if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
+            for (size_t i = 1; i < backends.size(); i++)
+                if (inflight[i] < inflight[pick]) pick = i;
+        }
+        ++routed[pick];
+        forward(backends[pick].port, &inflight[pick], id, drop_model, set_model, q, r);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -419,22 +479,35 @@ int serve_child(const Options& o) {
     sa.sa_handler = on_stop_signal;
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
-    std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), device.c_str(), argv[0].c_str());
-    child = std::make_unique<Child>(argv, env, child_port);
-    if (!child->wait_ready(std::chrono::seconds(600), g_stop)) {
-        if (g_stop) return 0;
-        std::fprintf(stderr, "1bit serve: %s did not become ready\n", argv[0].c_str());
-        return 1;
+    for (const auto& b : backends) {
+        std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
+    }
+    for (size_t i = 0; i < children.size(); i++) {
+        if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
+            if (g_stop) return 0;
+            std::fprintf(stderr, "1bit serve: %s did not become ready\n", backends[i].argv[0].c_str());
+            return 1;
+        }
     }
     ready = true;
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d\n", o.host.c_str(), o.port);
-    while (child->alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto all_alive = [&] {
+        for (auto& c : children) if (!c->alive()) return false;
+        return true;
+    };
+    while (all_alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (backends.size() > 1) {
+        std::fprintf(stderr, "1bit serve: requests routed:");
+        for (size_t i = 0; i < backends.size(); i++) std::fprintf(stderr, " %s %ld", backends[i].device.c_str(), routed[i].load());
+        std::fprintf(stderr, "\n");
+    }
     if (g_stop) {
         std::fprintf(stderr, "1bit serve: stopping\n");
-        child->stop();
+        for (auto& c : children) c->stop();
         return 0;
     }
-    std::fprintf(stderr, "1bit serve: the %s backend exited\n", device.c_str());
+    std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
     return 1;
 }
 
@@ -447,6 +520,7 @@ void usage(FILE* out) {
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
+                 "                  [--adaptive] [--adaptive-at N]   Vulkan first, ROCm overflow past N in flight\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -478,6 +552,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();
         else if (a == "--parallel") o.parallel = std::stoi(next());
+        else if (a == "--adaptive") o.adaptive = true;
+        else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

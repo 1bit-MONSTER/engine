@@ -19,7 +19,8 @@
 # Builds the documentation site (GitHub Pages, .github/workflows/pages.yml) from
 # README.md and docs/*.md: README becomes index.html, docs/<name>.md becomes
 # <name>.html. Every doc is published; the ones NAV does not place land under
-# "More", so a new doc never goes missing. Links to other docs become page links;
+# "More", so a new doc never goes missing. Posts in blog/YYYY-MM-DD-<slug>.md become
+# blog-<slug>.html, listed newest first on blog.html and in the Atom feed feed.xml. Links to other docs become page links;
 # links to other files in the repository go to them on GitHub.
 #
 # Visitor counts: with GOATCOUNTER set to a GoatCounter site code (pages.yml passes the
@@ -27,6 +28,7 @@
 # no cookies. Unset, as in a local preview, the pages carry no analytics at all.
 #
 # Needs python-markdown (pip install markdown).
+import datetime
 import html
 import os
 import pathlib
@@ -57,6 +59,27 @@ def sources():
     for p in sorted((ROOT / "docs").glob("*.md")):
         docs[p.stem] = p
     return docs
+
+
+def posts():
+    """[(date, slug, path)], newest first."""
+    out = []
+    for p in (ROOT / "blog").glob("*.md"):
+        m = re.fullmatch(r"(\d{4}-\d{2}-\d{2})-([a-z0-9-]+)", p.stem)
+        if not m:
+            sys.exit(f"blog post names are YYYY-MM-DD-<slug>.md: {p.name}")
+        out.append((m.group(1), m.group(2), p))
+    return sorted(out, reverse=True)
+
+
+def summary_of(text):
+    """The first paragraph after the title, as plain text."""
+    for para in re.split(r"\n\s*\n", strip_notice(text)):
+        para = para.strip()
+        if para and not para.startswith(("#", ">", "|", "-", "```")):
+            para = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", para)
+            return re.sub(r"[`*_]", "", " ".join(para.split()))
+    return ""
 
 
 def nav_groups(docs):
@@ -177,6 +200,59 @@ def not_found(template):
             .replace("{{repo}}", REPO))
 
 
+def page(template, **fields):
+    for key, value in fields.items():
+        template = template.replace("{{" + key + "}}", value)
+    return template.replace("{{repo}}", REPO)
+
+
+def blog(template, out, docs, labels):
+    items = posts()
+    if not items:
+        return
+    names = [f"blog-{slug}" for _, slug, _ in items]
+    side = ('<p class="group">Blog</p><ul>' + "".join(
+        f'<li><a href="{n}.html"{{cur}}>{html.escape(title_of(p.read_text()))}</a></li>'.replace("{cur}", "{{cur_" + n + "}}")
+        for n, (_, _, p) in zip(names, items)) + "</ul>")
+
+    def sidebar_for(current):
+        text = side
+        for n in names:
+            text = text.replace("{{cur_" + n + "}}", ' class="current" aria-current="page"' if n == current else "")
+        return text
+
+    rows = []
+    for i, (date, slug, src) in enumerate(items):
+        text = strip_notice(src.read_text())
+        title = title_of(text)
+        # the post's own date line under its title
+        body = render(rewrite_links(text, src, docs, labels))
+        body = re.sub(r"(</h1>)", rf'\1\n<p class="date"><time datetime="{date}">{date}</time></p>', body, count=1)
+        newer = f'<a class="prev" href="{names[i - 1]}.html"><span>Newer</span>{html.escape(title_of(items[i - 1][2].read_text()))}</a>' if i > 0 else "<span></span>"
+        older = f'<a class="next" href="{names[i + 1]}.html"><span>Older</span>{html.escape(title_of(items[i + 1][2].read_text()))}</a>' if i + 1 < len(items) else "<span></span>"
+        (out / f"{names[i]}.html").write_text(page(template, title=html.escape(title) + " · 1bit engine", home="doc post",
+            sidebar=sidebar_for(names[i]), content=body, pager=f'<nav class="pager">{newer}{older}</nav>',
+            source=f"{REPO}/blob/main/{src.relative_to(ROOT).as_posix()}"))
+        rows.append((date, names[i], title, summary_of(text), body))
+
+    listing = '<h1>Blog</h1>\n<p class="date"><a href="feed.xml">Atom feed</a></p>\n' + "\n".join(
+        f'<section class="post"><p class="date"><time datetime="{d}">{d}</time></p>'
+        f'<h2><a href="{n}.html">{html.escape(t)}</a></h2><p>{html.escape(s)}</p></section>' for d, n, t, s, _ in rows)
+    (out / "blog.html").write_text(page(template, title="Blog · 1bit engine", home="doc", sidebar=sidebar_for(""),
+        content=listing, pager="", source=f"{REPO}/tree/main/blog"))
+
+    def stamp(d):
+        return d + "T00:00:00Z"
+    entries = "".join(
+        f"<entry><title>{html.escape(t)}</title><link href=\"{SITE}{n}.html\"/><id>{SITE}{n}.html</id>"
+        f"<updated>{stamp(d)}</updated><summary>{html.escape(s)}</summary>"
+        f"<content type=\"html\">{html.escape(b)}</content></entry>" for d, n, t, s, b in rows)
+    (out / "feed.xml").write_text(
+        '<?xml version="1.0" encoding="utf-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">'
+        f'<title>1bit engine</title><link href="{SITE}"/><link rel="self" href="{SITE}feed.xml"/><id>{SITE}</id>'
+        f"<updated>{stamp(rows[0][0])}</updated><author><name>bong-water-water-bong</name></author>{entries}</feed>\n")
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "_site")
     if out.exists():
@@ -204,6 +280,7 @@ def main():
                 .replace("{{repo}}", REPO))
         (out / f"{name}.html").write_text(page)
     (out / "404.html").write_text(not_found(template))
+    blog(template, out, docs, labels)
     shutil.copy(ROOT / "site" / "style.css", out / "style.css")
     (out / ".nojekyll").write_text("")
     print(f"{len(docs)} pages -> {out}")

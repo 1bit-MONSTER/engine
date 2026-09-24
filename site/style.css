@@ -154,6 +154,16 @@ tr:last-child td { border-bottom: 0; }
 body.home article > h1 { font-size: 2.6rem; margin-bottom: 14px; }
 body.home article > h1 + p { font-size: 1.15rem; color: var(--fg-soft); }
 
+/* blog */
+.date { margin: -12px 0 24px; color: var(--fg-soft); font-size: 14px; }
+.post { padding: 20px 0; border-top: 1px solid var(--line); }
+.post:first-of-type { border-top: 0; padding-top: 0; }
+.post .date { margin: 0 0 4px; }
+.post h2 { margin: 0 0 8px; padding: 0; border: 0; font-size: 1.3rem; }
+.post h2 a { color: var(--fg); text-decoration: none; }
+.post h2 a:hover { text-decoration: underline; }
+.post p:last-child { margin: 0; color: var(--fg-soft); }
+
 /* previous / next */
 .pager { display: flex; justify-content: space-between; gap: 16px; max-width: 760px; margin-top: 48px; }
 .pager a {

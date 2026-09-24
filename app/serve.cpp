@@ -95,6 +95,7 @@ struct Options {
     bool lean = false;
     std::string mtp;
     int mtp_max = 0;
+    std::string mtp_p_min;
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -368,6 +369,7 @@ int serve_child(const Options& o) {
         if (device == "zinc" || device == "mlx") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
         argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
+        if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
 
     const std::string id = model_id(o);
@@ -436,7 +438,7 @@ void usage(FILE* out) {
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
-                 "                  [--mtp HEAD.gguf] [--mtp-max N]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -466,6 +468,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
+        else if (a == "--mtp-p-min") o.mtp_p_min = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

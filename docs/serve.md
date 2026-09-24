@@ -26,7 +26,7 @@ OpenAI client.
            [--device auto|npu|vulkan|hrx|rocm|zinc|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
-           [--mtp HEAD.gguf] [--mtp-max N]
+           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
 ```
 
 One model per process:
@@ -74,7 +74,8 @@ then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC`, then `llama-server` / `zinc` on PA
 
 `--mtp <head.gguf>` turns on llama-server's `draft-mtp` speculative decoding: the model's
 own MTP head (Unsloth ships it as `MTP/mtp-<model>-*.gguf`) drafts tokens on the same
-device, and the model checks them in one batch. `--mtp-max N` caps the draft length.
+device, and the model checks them in one batch. `--mtp-max N` caps the draft length;
+`--mtp-p-min P` drafts a token only when the head is at least that sure of it.
 It works on the llama.cpp devices (`vulkan`, `hrx`, `rocm`).
 
 Measured through `1bit serve` on Strix Halo, Qwen3.8-27B UD-Q4_K_XL with its Q4_0 MTP
@@ -88,6 +89,22 @@ head, decode tok/s on three chat prompts (code / prose / short), 2026-09-24:
 
 Vulkan with MTP is the pick: 2.4-2.9x on every prompt, same file, same accuracy (a
 drafted token is kept only when the model agrees). ROCm edges it on code only.
+
+The full sweep on Vulkan (draft length x `--mtp-p-min`, code / prose / short; 12.2 / 12.3 / 12.3
+without MTP):
+
+| Setting | tok/s | Drafts accepted |
+|---|---|---|
+| `--mtp` (draft length 3, the default) | 35.9 / 28.2 / 28.8 | 94% / 68% / 75% |
+| `--mtp-max 4 --mtp-p-min 0.5` | 38.1 / 28.0 / 26.9 | 93% / 71% / 76% |
+| **`--mtp-max 6 --mtp-p-min 0.5`** | **42.0** / 27.3 / 25.2 | 84% / 60% / 72% |
+| `--mtp-max 8` | 21-25 / 13-20 / 10-20 | 76-88% / 39-65% / 33-78% |
+
+Use the default for chat and `--mtp-max 6 --mtp-p-min 0.5` for code (3.4x): code is
+predictable enough to keep long drafts, prose is not. Draft length 8 collapses on every
+prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
+opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
+tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
 
 ## Verified (Strix Halo, 2026-09-23)
 

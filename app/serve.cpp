@@ -65,6 +65,7 @@
 #include <cstring>
 #include <filesystem>
 #include <memory>
+#include <mutex>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #else
@@ -287,7 +288,7 @@ private:
     std::atomic<int>* n_;
 };
 
-void forward(int port, std::atomic<int>* inflight, int draft_max, const std::string& our_id, bool drop_model,
+void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
              const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
     json body;
     try {
@@ -304,7 +305,6 @@ void forward(int port, std::atomic<int>* inflight, int draft_max, const std::str
     const bool stream = body.value("stream", false);
     const std::string payload = body.dump();
     const std::string path = req.path;
-    auto held = std::make_shared<InFlight>(inflight);
     if (!stream) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
@@ -473,20 +473,28 @@ int serve_child(const Options& o) {
     std::vector<std::unique_ptr<Child>> children;
     std::vector<std::atomic<int>> inflight(backends.size());
     std::vector<std::atomic<long>> routed(backends.size());
+    std::mutex route_mu;
     auto post = [&](const httplib::Request& q, httplib::Response& r) {
         if (!ready) {
             r.status = 503;
             r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
             return;
         }
-        // the first backend until it is full, then the one with the fewest in flight
+        // the first backend until it is full, then the one with the fewest in flight;
+        // choosing and reserving are one step, or a burst of requests all read "empty"
+        std::shared_ptr<InFlight> held;
         size_t pick = 0;
-        if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
-            for (size_t i = 1; i < backends.size(); i++)
-                if (inflight[i] < inflight[pick]) pick = i;
+        {
+            std::lock_guard<std::mutex> lock(route_mu);
+            if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
+                pick = 1;
+                for (size_t i = 2; i < backends.size(); i++)
+                    if (inflight[i] < inflight[pick]) pick = i;
+            }
+            held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
-        forward(backends[pick].port, &inflight[pick], -1, id, drop_model, set_model, q, r);
+        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);

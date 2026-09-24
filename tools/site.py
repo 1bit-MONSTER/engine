@@ -37,6 +37,9 @@ import sys
 import markdown
 
 REPO = "https://github.com/1bit-MONSTER/engine"
+SITE = "https://1bit.monster/"
+# the old 1bit.MONSTER site, kept on GitHub Pages under its repository's own address
+OLD_SITE = "https://1bit-monster.github.io/1bit-MONSTER/"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 # sidebar groups: (title, [(doc name, label)]); "index" is README.md
@@ -152,6 +155,28 @@ def analytics():
     return f'<script data-goatcounter="https://{code}.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>'
 
 
+def not_found(template):
+    """404.html: GitHub serves it at any depth, so it pins its links to the site root.
+    Links into the old 1bit.MONSTER site (1bit-*.html) point at that site's archive."""
+    body = ('<h1>Page not found</h1>\n'
+            '<p>1bit.MONSTER is now <a href="index.html">1bit engine</a>. '
+            'Pages from the old site are kept in the <a id="old" href="' + OLD_SITE + '">1bit.MONSTER archive</a>.</p>\n'
+            '<script>\n'
+            '  // an old 1bit.MONSTER address: point straight at its archived copy\n'
+            '  var m = location.pathname.match(/\\/(1bit-[a-z0-9-]+\\.html)$/);\n'
+            '  if (m && m[1] !== "1bit-jarvis.html") document.getElementById("old").href = "' + OLD_SITE + '" + m[1];\n'
+            '</script>')
+    return (template
+            .replace("<head>", f'<head>\n<base href="{SITE}">', 1)
+            .replace("{{title}}", "Page not found · 1bit engine")
+            .replace("{{home}}", "doc")
+            .replace("{{sidebar}}", "")
+            .replace("{{content}}", body)
+            .replace("{{pager}}", "")
+            .replace("{{source}}", REPO)
+            .replace("{{repo}}", REPO))
+
+
 def main():
     out = pathlib.Path(sys.argv[1] if len(sys.argv) > 1 else "_site")
     if out.exists():
@@ -178,6 +203,7 @@ def main():
                 .replace("{{source}}", f"{REPO}/blob/main/{source}")
                 .replace("{{repo}}", REPO))
         (out / f"{name}.html").write_text(page)
+    (out / "404.html").write_text(not_found(template))
     shutil.copy(ROOT / "site" / "style.css", out / "style.css")
     (out / ".nojekyll").write_text("")
     print(f"{len(docs)} pages -> {out}")

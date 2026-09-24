@@ -48,6 +48,9 @@ limitations under the License.
 
 * { box-sizing: border-box; }
 
+/* scrollbars follow the theme (a light native bar shows up white in dark mode) */
+* { scrollbar-color: var(--line) transparent; scrollbar-width: thin; }
+
 html { -webkit-text-size-adjust: 100%; }
 
 body {
@@ -173,7 +176,8 @@ footer a { color: var(--fg-soft); }
   .side { position: static; max-height: none; padding: 16px 0 0; border-bottom: 1px solid var(--line); }
   .side summary { display: block; cursor: pointer; font-weight: 600; padding-bottom: 12px; list-style: none; }
   .side summary::-webkit-details-marker { display: none; }
-  .side summary::before { content: "▸"; display: inline-block; width: 1.2em; color: var(--fg-soft); transition: transform 0.15s; }
+  .side summary::marker { content: ""; }
+  .side summary::before { content: "▸"; display: inline-block; width: 1.2em; color: var(--fg-soft); }
   .side[open] summary::before { transform: rotate(90deg); }
   .top { padding: 0 16px; }
   .links { gap: 16px; }

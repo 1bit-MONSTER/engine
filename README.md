@@ -16,6 +16,8 @@ limitations under the License.
 -->
 # 1bit engine
 
+**Documentation:** [1bit-monster.github.io/engine](https://1bit-monster.github.io/engine/) · **Measured results:** [wiki](https://github.com/1bit-MONSTER/engine/wiki)
+
 **The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade stays
 the server you talk to (its catalog, downloads, router and UI), and for the models it hands to 1bit,
 Lemonade runs the engine as one of its backends, the same way it runs `llama-server`. The engine

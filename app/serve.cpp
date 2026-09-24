@@ -100,7 +100,7 @@ struct Options {
     std::string mtp_p_min;
     int parallel = 0;
     bool adaptive = false;
-    int adaptive_at = 8;
+    int adaptive_at = 1;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
 };
 
@@ -427,9 +427,11 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
 int serve_child(const Options& o) {
     std::vector<Launch> backends;
     if (o.adaptive) {
-        // Grows with the load: requests go to Vulkan (the fastest single stream, MTP if
-        // given) until it holds --adaptive-at of them in flight, then overflow to ROCm,
-        // which keeps scaling to 16 batched requests (docs/serve.md, "Many requests").
+        // Grows with the load: a lone request gets Vulkan (MTP if given, --adaptive-at slots,
+        // default 1); concurrent ones go to ROCm, which keeps scaling to 16 batched requests.
+        // MTP and batching live in separate backends: a server with MTP loaded batches at
+        // about two thirds of the throughput, whatever each request's draft length
+        // (docs/serve.md, "Growing with the load").
         if (o.device != "auto" && o.device != "vulkan")
             throw std::runtime_error("--adaptive runs Vulkan with ROCm overflow; leave --device at auto or vulkan");
         if (o.lean || !o.prefill_device.empty()) throw std::runtime_error("--adaptive does not combine with --lean or --prefill-device");
@@ -484,15 +486,7 @@ int serve_child(const Options& o) {
                 if (inflight[i] < inflight[pick]) pick = i;
         }
         ++routed[pick];
-        // MTP pays when a request has the GPU to itself and costs throughput once requests
-        // batch (docs/serve.md): full drafts alone, short ones beside 1-2 others, none past that.
-        int draft_max = -1;
-        if (!o.mtp.empty() && backends[pick].mtp) {
-            const int busy = inflight[pick];
-            const int full = o.mtp_max > 0 ? o.mtp_max : 3;
-            draft_max = busy == 0 ? full : busy <= 2 ? std::min(full, 2) : 0;
-        }
-        forward(backends[pick].port, &inflight[pick], draft_max, id, drop_model, set_model, q, r);
+        forward(backends[pick].port, &inflight[pick], -1, id, drop_model, set_model, q, r);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -577,7 +571,7 @@ void usage(FILE* out) {
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
-                 "                  [--adaptive] [--adaptive-at N]   Vulkan first, ROCm overflow past N in flight\n"
+                 "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");

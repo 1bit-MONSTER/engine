@@ -133,18 +133,19 @@ decoding at once, by comparison, add 18% (docs/lean.md).
 
 ## Growing with the load (`--adaptive`)
 
-No single setting wins at every load: one user is fastest on Vulkan with `--mtp`, up to
-about 8 concurrent requests on Vulkan batching, and beyond that on ROCm batching, which
-keeps scaling to 16 (the tables above). `--adaptive` runs both at once, the model loaded
-on each:
+No single setting wins at every load: one request is fastest on Vulkan with `--mtp`,
+many are fastest batched on ROCm, which keeps scaling to 16 (the tables above). And the
+two do not mix: a server with MTP loaded batches at about two thirds of the throughput
+(Qwen3.8-27B, 4 requests: 24.9 tok/s with MTP loaded, 36.9 without), even with each
+request's draft length set to 0. So `--adaptive` keeps them apart, the model loaded on
+each:
 
-- a Vulkan backend with `--adaptive-at` slots (default 8), and `--mtp` if given;
-- a ROCm overflow backend with 16 slots, without MTP.
+- a Vulkan backend with `--adaptive-at` slots (default 1), and `--mtp` if given;
+- a ROCm backend with 16 slots, without MTP.
 
-Each request goes to Vulkan until Vulkan holds `--adaptive-at` requests in flight;
-the next ones go to ROCm. A lone user gets Vulkan (with MTP, 35-42 tok/s on
-Qwen3.8-27B), a crowd spills onto ROCm, and when both are busy the two backends
-together add their share (two drivers on one GPU gave +18% in docs/lean.md).
+A request goes to Vulkan while Vulkan holds fewer than `--adaptive-at` requests; the
+rest go to ROCm. A lone user gets MTP speed (35-42 tok/s on Qwen3.8-27B), a crowd gets
+ROCm's batching.
 
 ```sh
 1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --adaptive --mtp mtp-Qwen3.8-27B-Q4_0.gguf --ctx-size 65536
@@ -152,8 +153,7 @@ together add their share (two drivers on one GPU gave +18% in docs/lean.md).
 
 It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) and
 memory for two copies of the model; `--ctx-size` applies to each backend and is split
-across its slots. On exit, serve logs how many requests each backend took. Verified on
-Strix Halo with Qwen3-0.6B: 12 simultaneous requests, 8 on Vulkan and 4 on ROCm.
+across its slots. On exit, serve logs how many requests each backend took.
 
 ## RAG (`--embed`, `--rerank`)
 

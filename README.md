@@ -22,7 +22,8 @@ Lemonade runs the engine as one of its backends, the same way it runs `llama-ser
 serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
 - the XDNA 2 NPU engine
-- HRX and Vulkan on the Radeon iGPU, compiled together in one llama.cpp build
+- HRX on the Radeon iGPU, on the llama.cpp + hrx-system pair AMD tests
+- Vulkan on the Radeon iGPU, from upstream llama.cpp's latest release, so new architectures land the day upstream ships them
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - MLX on Apple Silicon, through lemon-mlx-engine
 - Laya, which decides where each request runs
@@ -33,8 +34,8 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
 > suite on Vulkan and HRX. Following geramyL's review the engine no longer
-> vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX + Vulkan in
-> one build on AMD's live ggml-hrx ([docs/hrx.md](docs/hrx.md)), the NPU engine on full ELFs with the
+> vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
+> ([docs/hrx.md](docs/hrx.md)), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
 > source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). Next is step 4,
 > the Laya router. The working engine is being ported from
@@ -64,7 +65,7 @@ The repositories this engine is built on, in order of importance:
 | 2 | [Xilinx/XRT](https://github.com/Xilinx/XRT) | The runtime every NPU kernel runs through: full ELFs, hardware contexts, buffers | Apache-2.0 (userspace) |
 | 3 | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) | IRON and aiecc: how our own NPU kernels are written and compiled | Apache-2.0 WITH LLVM-exception |
 | 4 | [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) | Peano, the C++ compiler for the NPU's AI Engine cores | Apache-2.0 WITH LLVM-exception |
-| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU: Vulkan and HRX in one build | MIT |
+| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU: Vulkan (upstream release) and HRX (AMD's tested pair) | MIT |
 | 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device | Apache-2.0 |
 | 7 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
 | 8 | [zolotukhin/zinc](https://github.com/zolotukhin/zinc) | Its own GPU kernels, and the engine's route to NVIDIA through CUDA | MIT |

@@ -40,7 +40,8 @@ Peano, llvm-aie (third_party/llvm-aie)
   License: Apache-2.0 WITH LLVM-exception
 
 llama.cpp (third_party/llama.cpp: 1bit-MONSTER/llama.cpp, a fork of
-ggml-org/llama.cpp carrying AMD's HRX integration)
+ggml-org/llama.cpp carrying AMD's HRX integration; third_party/llama.cpp-vulkan:
+ggml-org/llama.cpp, an upstream release)
   https://github.com/ggml-org/llama.cpp
   Copyright (c) 2023-2026 The ggml authors
   License: MIT

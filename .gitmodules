@@ -55,3 +55,7 @@
 	path = third_party/tokenizers
 	url = https://github.com/huggingface/tokenizers.git
 	shallow = true
+[submodule "third_party/llama.cpp-vulkan"]
+	path = third_party/llama.cpp-vulkan
+	url = https://github.com/ggml-org/llama.cpp.git
+	shallow = true

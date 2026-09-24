@@ -56,6 +56,11 @@ There are no local patches. `1bit-MONSTER/llama.cpp` also holds
 kernels and the zaya architecture). It is kept for a later port of that work to
 ggml-hrx.
 
+The Vulkan route has its own upstream llama.cpp pin (latest release), so new
+architectures do not wait for AMD's pair: see [vulkan.md](vulkan.md). This build
+still has a Vulkan backend, which `--device vulkan` uses when `ONEBIT_VULKAN` is
+off.
+
 ## Build
 
 ```bash

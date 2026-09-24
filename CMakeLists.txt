@@ -59,6 +59,21 @@ add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TAR
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
 set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 
+# ── Vulkan from upstream llama.cpp (docs/vulkan.md) ──────────────────────
+# Off by default: it needs the Vulkan SDK (headers, loader, glslc). Builds
+# llama-server from third_party/llama.cpp-vulkan (ggml-org's latest release),
+# and `1bit serve --device vulkan` then uses it; --device hrx keeps AMD's pair.
+option(ONEBIT_VULKAN "Build a Vulkan llama-server from upstream llama.cpp" OFF)
+if(ONEBIT_VULKAN)
+    include(cmake/vulkan.cmake)
+    add_dependencies(onebit llama_vulkan)
+    target_compile_definitions(onebit PRIVATE ONEBIT_VULKAN_SERVER="${ONEBIT_VULKAN_SERVER}")
+    if(ONEBIT_SERVE_TEST_GGUF)
+        add_test(NAME serve_e2e_vulkan_upstream
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan)
+    endif()
+endif()
+
 # ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
 # Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
 # only runs on AMD GPUs. `1bit serve` then uses this llama-server for both
@@ -69,7 +84,12 @@ if(ONEBIT_HRX)
     add_dependencies(onebit llama_hrx)
     target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}")
     if(ONEBIT_SERVE_TEST_GGUF)
-        foreach(_dev vulkan hrx)
+        # With ONEBIT_VULKAN, --device vulkan runs the upstream build (tested below).
+        set(_hrx_devs hrx)
+        if(NOT ONEBIT_VULKAN)
+            list(PREPEND _hrx_devs vulkan)
+        endif()
+        foreach(_dev ${_hrx_devs})
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
         endforeach()

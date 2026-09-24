@@ -46,4 +46,4 @@ For each model we measured every Unsloth Dynamic quant from 2 to 5 bits against 
 - **UD-Q5_K_XL is the accurate pick:** under 0.01 on four of the five models, for 8-17% slower decode. Qwen3-Coder-30B-A3B is the exception: 0.012 is as close as any Unsloth file gets it.
 - **Skip the 2-bit files at these sizes:** KL 0.11-0.23, with the top prediction changing on 13-21% of tokens.
 
-Two popular models are missing: gemma-4-12b-it and MiniMax-H3 do not run correctly on the llama.cpp build we measured with, so there was nothing fair to compare. Every row, with prompt speeds and ROCm, is on the [Quantization page](https://github.com/1bit-MONSTER/engine/wiki/Quantization) of the wiki.
+One popular model is missing: gemma-4-12b-it does not run correctly on the llama.cpp build we measured with, so there was nothing fair to compare. (MiniMax-H3 was on our download list too, by mistake: it generates video, it is not a text model.) Every row, with prompt speeds and ROCm, is on the [Quantization page](https://github.com/1bit-MONSTER/engine/wiki/Quantization) of the wiki.

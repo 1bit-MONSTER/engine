@@ -36,6 +36,11 @@
 # repository variable of that name), every page loads GoatCounter's counter, which sets
 # no cookies. Unset, as in a local preview, the pages carry no analytics at all.
 #
+# Docs chat: with CONTEXT7_LIBRARY set to the engine's Context7 library id (pages.yml passes
+# the repository variable of that name), every page carries Context7's chat widget, which
+# answers from the docs Context7 indexed (see context7.json). Context7 only serves it once the
+# library is claimed and 1bit.gg is on the widget's allowed domains; unset, no widget.
+#
 # Needs python-markdown (pip install markdown).
 import html
 import os
@@ -156,6 +161,19 @@ def analytics():
     return f'<script data-goatcounter="https://{code}.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>'
 
 
+def chat_widget():
+    library = os.environ.get("CONTEXT7_LIBRARY", "").strip()
+    if not library:
+        return ""
+    if not re.fullmatch(r"/[A-Za-z0-9_.-]+/[A-Za-z0-9_.-]+", library):
+        sys.exit(f"CONTEXT7_LIBRARY must be a Context7 library id like /owner/repo, not {library!r}")
+    return (f'<script src="https://context7.com/widget.js" data-library="{library}" '
+            'data-color="#1779e1" data-position="bottom-right" '
+            'data-placeholder="Ask about the 1bit engine docs..." '
+            'data-welcome-message="Ask anything about the 1bit engine: install, serving, NPU, HRX, Vulkan, quantization." '
+            'async></script>')
+
+
 def plain(markdown_text):
     """One paragraph of markdown as plain text."""
     text = re.sub(r"\s*\(\[[^\]]*\.md\]\([^)]*\)\)", "", markdown_text)  # "(docs/x.md)" asides
@@ -230,6 +248,7 @@ class Site:
                 .replace("{{nav}}", self.top_nav(section))
                 .replace("{{main}}", main)
                 .replace("{{analytics}}", analytics())
+                .replace("{{chat}}", chat_widget())
                 .replace("{{repo}}", REPO))
         if extra_head:
             page = page.replace("<head>", "<head>\n" + extra_head, 1)

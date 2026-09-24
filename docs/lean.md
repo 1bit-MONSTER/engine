@@ -72,6 +72,21 @@ Round 1's ROCmFPX files had no importance matrix. Rebuilt with Unsloth's own
 - **MTP beats every format change:** `--mtp` on the default file gives 2.4-2.9x
   (docs/serve.md), more than any quant here.
 
+## ROCm accuracy: MMQ only
+
+hipBLAS returns wrong GEMMs on gfx1151 (ROCm/rocm-libraries#11530). Qwen3.8-27B UD-Q4_K_XL
+against BF16, 2026-09-24:
+
+| Build | Mean KLD | Same top token | pp512 / tg128 |
+|---|---|---|---|
+| Vulkan | 0.0081 | 95.3% | 353 / 11.9 |
+| ROCm, default | 0.0094 | 95.1% | 343 / 11.5 |
+| ROCm, `GGML_CUDA_FORCE_MMQ` | **0.0064** | **96.5%** | 354 / 11.5 |
+
+The default ROCm build is correct for 4-bit GGUF (it mostly runs MMQ already); forcing
+MMQ is more accurate at the same speed, so the lean ROCm build does. F16/BF16 models go
+through hipBLAS and are not safe on ROCm here.
+
 ## Two backends at once
 
 `Vulkan0`, `ROCm0` and `HRX0` are one GPU. Decode on both at the same time

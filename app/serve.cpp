@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD] [--adaptive]`
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -55,6 +55,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -63,6 +64,8 @@
 #include <cstdlib>
 #include <cstring>
 #include <filesystem>
+#include <memory>
+#include <mutex>
 #if defined(__linux__)
 #include <sys/prctl.h>
 #else
@@ -95,6 +98,11 @@ struct Options {
     bool lean = false;
     std::string mtp;
     int mtp_max = 0;
+    std::string mtp_p_min;
+    int parallel = 0;
+    bool adaptive = false;
+    int adaptive_at = 1;
+    std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -269,8 +277,19 @@ std::string model_id(const Options& o) {
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
 // child such as zinc rejects ids it did not load), and replies carry ours.
-void forward(const Child& child, const std::string& our_id, bool drop_model, const std::string& set_model,
-             const httplib::Request& req, httplib::Response& res) {
+// Counts a request against a backend from the moment it is routed until its reply
+// (streamed or not) is complete; --adaptive routes by these counts.
+struct InFlight {
+    explicit InFlight(std::atomic<int>* n) : n_(n) { if (n_) ++*n_; }
+    ~InFlight() { if (n_) --*n_; }
+    InFlight(const InFlight&) = delete;
+    InFlight& operator=(const InFlight&) = delete;
+private:
+    std::atomic<int>* n_;
+};
+
+void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
+             const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
     json body;
     try {
         body = json::parse(req.body);
@@ -280,11 +299,12 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
         return;
     }
     if (drop_model) body.erase("model");
+    // MTP by load: a request's own draft length wins; otherwise the router's (see post)
+    if (draft_max >= 0 && !body.contains("speculative.n_max")) body["speculative.n_max"] = draft_max;
     if (!set_model.empty()) body["model"] = set_model;
     const bool stream = body.value("stream", false);
     const std::string payload = body.dump();
     const std::string path = req.path;
-    const int port = child.port();
     if (!stream) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
@@ -305,7 +325,7 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
         return;
     }
     // Streaming: relay the child's SSE bytes as they arrive.
-    res.set_chunked_content_provider("text/event-stream", [port, path, payload](size_t, httplib::DataSink& sink) {
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held](size_t, httplib::DataSink& sink) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         c.Post(path, httplib::Headers{}, payload, "application/json",
@@ -315,12 +335,24 @@ void forward(const Child& child, const std::string& our_id, bool drop_model, con
     });
 }
 
-int serve_child(const Options& o) {
-    std::string device = o.device == "auto" ? "vulkan" : o.device;
-    const int child_port = free_port();
+struct Launch {
+    std::string device;
+    int port = 0;
     std::vector<std::string> argv, env;
     bool drop_model = false;
     std::string set_model;
+    bool mtp = false;
+};
+
+// The backend process for one device: its command line and environment.
+Launch launch_for(const Options& o, const std::string& device, int child_port) {
+    Launch l;
+    l.device = device;
+    l.port = child_port;
+    std::vector<std::string>& argv = l.argv;
+    std::vector<std::string>& env = l.env;
+    bool& drop_model = l.drop_model;
+    std::string& set_model = l.set_model;
     if (device == "mlx") {
         // lemon-mlx-engine: `<server> <hf id> --port <p>`; it picks the model by
         // Hugging Face id, so requests carry that id (docs/apple.md).
@@ -363,12 +395,65 @@ int serve_child(const Options& o) {
     } else {
         throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm or zinc)");
     }
+    if (o.parallel > 1) {
+        // continuous batching: N requests decode together, one read of the weights per step
+        // for all of them; llama-server splits --ctx-size across the slots
+        if (device == "zinc" || device == "mlx") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
+        argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
+    }
     if (!o.mtp.empty()) {
         // the MTP head drafts tokens on the same device; the model checks them in one batch
         if (device == "zinc" || device == "mlx") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
+        l.mtp = true;
         argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
+        if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
+    return l;
+}
+
+// A small llama-server for one RAG role on Vulkan: --embedding for /v1/embeddings,
+// --reranking for /v1/rerank. Batch = ubatch: an embedding or rerank input is one pass.
+Launch rag_launch(const Options& o, const std::string& model, const char* role, int port) {
+    Launch l;
+    l.device = std::string("vulkan ") + role;
+    l.port = port;
+    l.argv = {o.llama_server.empty() ? default_llama_server("vulkan") : o.llama_server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
+              "--device", "Vulkan0", "-ngl", "99", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
+              std::string("--") + role};
+    return l;
+}
+
+int serve_child(const Options& o) {
+    std::vector<Launch> backends;
+    if (o.adaptive) {
+        // Grows with the load: a lone request gets Vulkan (MTP if given, --adaptive-at slots,
+        // default 1); concurrent ones go to ROCm, which keeps scaling to 16 batched requests.
+        // MTP and batching live in separate backends: a server with MTP loaded batches at
+        // about two thirds of the throughput, whatever each request's draft length
+        // (docs/serve.md, "Growing with the load").
+        if (o.device != "auto" && o.device != "vulkan")
+            throw std::runtime_error("--adaptive runs Vulkan with ROCm overflow; leave --device at auto or vulkan");
+        if (o.lean || !o.prefill_device.empty()) throw std::runtime_error("--adaptive does not combine with --lean or --prefill-device");
+        Options first = o;
+        first.parallel = o.parallel > 1 ? o.parallel : o.adaptive_at;
+        backends.push_back(launch_for(first, "vulkan", free_port()));
+        Options overflow = o;
+        overflow.parallel = 16;
+        overflow.mtp.clear();       // batched requests gain little from drafting
+        overflow.llama_server.clear();
+        backends.push_back(launch_for(overflow, "rocm", free_port()));
+    } else {
+        backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
+    }
+    const std::string device = o.adaptive ? "vulkan+rocm" : backends[0].device;
+    const bool drop_model = backends[0].drop_model;
+    const std::string set_model = backends[0].set_model;
+
+    std::vector<Launch> rag;   // [0] embedding, then rerank, if given
+    if (!o.embed.empty()) rag.push_back(rag_launch(o, o.embed, "embedding", free_port()));
+    if (!o.rerank.empty()) rag.push_back(rag_launch(o, o.rerank, "reranking", free_port()));
+    auto stem = [](const std::string& m) { return fs::path(m).stem().string(); };
 
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
@@ -380,22 +465,61 @@ int serve_child(const Options& o) {
     srv.Get("/health", health);
     srv.Get("/v1/health", health);
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-        res.set_content(json{{"object", "list"},
-                             {"data", json::array({{{"id", id}, {"object", "model"}, {"owned_by", "1bit"},
-                                                    {"device", device}}})}}.dump(),
-                        "application/json");
+        json data = json::array({{{"id", id}, {"object", "model"}, {"owned_by", "1bit"}, {"device", device}}});
+        if (!o.embed.empty()) data.push_back({{"id", stem(o.embed)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "vulkan"}, {"role", "embedding"}});
+        if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "vulkan"}, {"role", "rerank"}});
+        res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
-    std::unique_ptr<Child> child;
+    std::vector<std::unique_ptr<Child>> children;
+    std::vector<std::atomic<int>> inflight(backends.size());
+    std::vector<std::atomic<long>> routed(backends.size());
+    std::mutex route_mu;
     auto post = [&](const httplib::Request& q, httplib::Response& r) {
-        if (!ready || !child) {
+        if (!ready) {
             r.status = 503;
             r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
             return;
         }
-        forward(*child, id, drop_model, set_model, q, r);
+        // the first backend until it is full, then the one with the fewest in flight;
+        // choosing and reserving are one step, or a burst of requests all read "empty"
+        std::shared_ptr<InFlight> held;
+        size_t pick = 0;
+        {
+            std::lock_guard<std::mutex> lock(route_mu);
+            if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
+                pick = 1;
+                for (size_t i = 2; i < backends.size(); i++)
+                    if (inflight[i] < inflight[pick]) pick = i;
+            }
+            held = std::make_shared<InFlight>(&inflight[pick]);
+        }
+        ++routed[pick];
+        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // RAG: embeddings and rerank go to their own backends, the reply names the model served
+    auto rag_route = [&](size_t i, const std::string& model) {
+        return [&, i, model](const httplib::Request& q, httplib::Response& r) {
+            if (!ready) {
+                r.status = 503;
+                r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
+                return;
+            }
+            forward(rag[i].port, nullptr, -1, stem(model), true, "", q, r);
+        };
+    };
+    size_t next_rag = 0;
+    if (!o.embed.empty()) {
+        auto h = rag_route(next_rag++, o.embed);
+        srv.Post("/v1/embeddings", h);
+        srv.Post("/embeddings", h);
+    }
+    if (!o.rerank.empty()) {
+        auto h = rag_route(next_rag++, o.rerank);
+        srv.Post("/v1/rerank", h);
+        srv.Post("/rerank", h);
+    }
 
     if (!srv.bind_to_port(o.host, o.port))
         throw std::runtime_error("cannot listen on " + o.host + ":" + std::to_string(o.port));
@@ -410,22 +534,39 @@ int serve_child(const Options& o) {
     sa.sa_handler = on_stop_signal;
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
-    std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), device.c_str(), argv[0].c_str());
-    child = std::make_unique<Child>(argv, env, child_port);
-    if (!child->wait_ready(std::chrono::seconds(600), g_stop)) {
-        if (g_stop) return 0;
-        std::fprintf(stderr, "1bit serve: %s did not become ready\n", argv[0].c_str());
-        return 1;
+    for (const auto& b : backends) {
+        std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
+    }
+    for (const auto& b : rag) {
+        std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
+    }
+    for (size_t i = 0; i < children.size(); i++) {
+        if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
+            if (g_stop) return 0;
+            std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
+            return 1;
+        }
     }
     ready = true;
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d\n", o.host.c_str(), o.port);
-    while (child->alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    auto all_alive = [&] {
+        for (auto& c : children) if (!c->alive()) return false;
+        return true;
+    };
+    while (all_alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (backends.size() > 1) {
+        std::fprintf(stderr, "1bit serve: requests routed:");
+        for (size_t i = 0; i < backends.size(); i++) std::fprintf(stderr, " %s %ld", backends[i].device.c_str(), routed[i].load());
+        std::fprintf(stderr, "\n");
+    }
     if (g_stop) {
         std::fprintf(stderr, "1bit serve: stopping\n");
-        child->stop();
+        for (auto& c : children) c->stop();
         return 0;
     }
-    std::fprintf(stderr, "1bit serve: the %s backend exited\n", device.c_str());
+    std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
     return 1;
 }
 
@@ -436,7 +577,10 @@ void usage(FILE* out) {
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
-                 "                  [--mtp HEAD.gguf] [--mtp-max N]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--parallel N]   N requests decoded together (continuous batching)\n"
+                 "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
+                 "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -466,6 +610,12 @@ int run_serve(int argc, char** argv) {
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
+        else if (a == "--mtp-p-min") o.mtp_p_min = next();
+        else if (a == "--parallel") o.parallel = std::stoi(next());
+        else if (a == "--adaptive") o.adaptive = true;
+        else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
+        else if (a == "--embed") o.embed = next();
+        else if (a == "--rerank") o.rerank = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

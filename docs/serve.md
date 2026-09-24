@@ -28,6 +28,7 @@ OpenAI client.
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
            [--parallel N] [--adaptive] [--adaptive-at N]
+           [--embed MODEL.gguf] [--rerank MODEL.gguf]
 ```
 
 One model per process:
@@ -38,6 +39,8 @@ One model per process:
 | `GET /v1/models` | the one model (`--alias`, else the file or directory name) |
 | `POST /v1/chat/completions` | streamed (SSE) or not |
 | `POST /v1/completions` | |
+| `POST /v1/embeddings` | with `--embed` (RAG) |
+| `POST /v1/rerank` | with `--rerank` (RAG) |
 
 ## Where the model runs
 
@@ -151,6 +154,22 @@ It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) a
 memory for two copies of the model; `--ctx-size` applies to each backend and is split
 across its slots. On exit, serve logs how many requests each backend took. Verified on
 Strix Halo with Qwen3-0.6B: 12 simultaneous requests, 8 on Vulkan and 4 on ROCm.
+
+## RAG (`--embed`, `--rerank`)
+
+`--embed MODEL.gguf` serves `/v1/embeddings` and `--rerank MODEL.gguf` serves `/v1/rerank`,
+each from its own llama-server on Vulkan beside the chat model (`--embedding`,
+`--reranking`, 4 slots, the whole input in one batch). `/v1/models` lists them with their
+role. A RAG client embeds its documents, retrieves by cosine similarity, reranks the best
+few and asks the chat model with them as context, all against the one server:
+
+```sh
+1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mtp mtp-Qwen3.8-27B-Q4_0.gguf \
+  --embed Qwen3-Embedding-0.6B-Q8_0.gguf --rerank qwen3-reranker-0.6b-q8_0.gguf
+```
+
+Long retrieved contexts are where `--prefill-device hrx` pays (26% on an 8192-token
+request, above).
 
 ## Verified (Strix Halo, 2026-09-23)
 

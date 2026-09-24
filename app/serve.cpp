@@ -101,6 +101,7 @@ struct Options {
     int parallel = 0;
     bool adaptive = false;
     int adaptive_at = 8;
+    std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -411,6 +412,18 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     return l;
 }
 
+// A small llama-server for one RAG role on Vulkan: --embedding for /v1/embeddings,
+// --reranking for /v1/rerank. Batch = ubatch: an embedding or rerank input is one pass.
+Launch rag_launch(const Options& o, const std::string& model, const char* role, int port) {
+    Launch l;
+    l.device = std::string("vulkan ") + role;
+    l.port = port;
+    l.argv = {o.llama_server.empty() ? default_llama_server("vulkan") : o.llama_server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
+              "--device", "Vulkan0", "-ngl", "99", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
+              std::string("--") + role};
+    return l;
+}
+
 int serve_child(const Options& o) {
     std::vector<Launch> backends;
     if (o.adaptive) {
@@ -435,6 +448,11 @@ int serve_child(const Options& o) {
     const bool drop_model = backends[0].drop_model;
     const std::string set_model = backends[0].set_model;
 
+    std::vector<Launch> rag;   // [0] embedding, then rerank, if given
+    if (!o.embed.empty()) rag.push_back(rag_launch(o, o.embed, "embedding", free_port()));
+    if (!o.rerank.empty()) rag.push_back(rag_launch(o, o.rerank, "reranking", free_port()));
+    auto stem = [](const std::string& m) { return fs::path(m).stem().string(); };
+
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
     httplib::Server srv;
@@ -445,10 +463,10 @@ int serve_child(const Options& o) {
     srv.Get("/health", health);
     srv.Get("/v1/health", health);
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
-        res.set_content(json{{"object", "list"},
-                             {"data", json::array({{{"id", id}, {"object", "model"}, {"owned_by", "1bit"},
-                                                    {"device", device}}})}}.dump(),
-                        "application/json");
+        json data = json::array({{{"id", id}, {"object", "model"}, {"owned_by", "1bit"}, {"device", device}}});
+        if (!o.embed.empty()) data.push_back({{"id", stem(o.embed)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "vulkan"}, {"role", "embedding"}});
+        if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "vulkan"}, {"role", "rerank"}});
+        res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
     std::vector<std::unique_ptr<Child>> children;
     std::vector<std::atomic<int>> inflight(backends.size());
@@ -478,6 +496,28 @@ int serve_child(const Options& o) {
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // RAG: embeddings and rerank go to their own backends, the reply names the model served
+    auto rag_route = [&](size_t i, const std::string& model) {
+        return [&, i, model](const httplib::Request& q, httplib::Response& r) {
+            if (!ready) {
+                r.status = 503;
+                r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
+                return;
+            }
+            forward(rag[i].port, nullptr, -1, stem(model), true, "", q, r);
+        };
+    };
+    size_t next_rag = 0;
+    if (!o.embed.empty()) {
+        auto h = rag_route(next_rag++, o.embed);
+        srv.Post("/v1/embeddings", h);
+        srv.Post("/embeddings", h);
+    }
+    if (!o.rerank.empty()) {
+        auto h = rag_route(next_rag++, o.rerank);
+        srv.Post("/v1/rerank", h);
+        srv.Post("/rerank", h);
+    }
 
     if (!srv.bind_to_port(o.host, o.port))
         throw std::runtime_error("cannot listen on " + o.host + ":" + std::to_string(o.port));
@@ -496,10 +536,14 @@ int serve_child(const Options& o) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
     }
+    for (const auto& b : rag) {
+        std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
+    }
     for (size_t i = 0; i < children.size(); i++) {
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
-            std::fprintf(stderr, "1bit serve: %s did not become ready\n", backends[i].argv[0].c_str());
+            std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
         }
     }
@@ -534,6 +578,7 @@ void usage(FILE* out) {
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan first, ROCm overflow past N in flight\n"
+                 "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
                  "           --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -567,6 +612,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--parallel") o.parallel = std::stoi(next());
         else if (a == "--adaptive") o.adaptive = true;
         else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
+        else if (a == "--embed") o.embed = next();
+        else if (a == "--rerank") o.rerank = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

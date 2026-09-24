@@ -54,10 +54,46 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
   Halo before merging.
 
+### Prefill on HRX, decode on Vulkan
+
+HRX prefills faster than Vulkan and Vulkan decodes faster, on the same GPU.
+`1bit serve --device vulkan --prefill-device hrx` uses both: the HRX build's
+llama-server decodes on `Vulkan0`, and a second copy of the model on `HRX0` runs
+the prompt prefix. The two contexts share one KV cache with no copy: HRX owns it
+in its device memory and exports it as a dma-buf (HSA), Vulkan maps the same
+memory, and only the KV cell metadata (positions, sequences) moves between them.
+
+- **What runs on HRX:** the prompt prefix in whole ubatches (HRX prefill halves on
+  a partial one), from `--prefill-min-tokens` tokens (default 1024; below that the
+  split does not pay). The rest, and all decoding, run on Vulkan.
+- **Needs:** flash attention on both sides (`serve` passes `-fa on`), no LoRA, no
+  multimodal. The weights are loaded twice (once per device).
+- **Layout:** the shared region is cut into chunks of at most 1 GiB, each its own
+  dma-buf: Vulkan reads garbage from one buffer past about 4 GiB (a 40960-token
+  Qwen3-0.6B cache), and both sides must compute the same layout.
+
+Measured on Strix Halo, llama-server on `Vulkan0`, prefill / whole request:
+
+| Model | Prompt | Vulkan alone | HRX prefill + Vulkan |
+|---|---|---|---|
+| Qwen2.5-7B Q4_K_M | 2048 | 1541 / 4314 ms | **1078** / 3890 ms (-10%) |
+| Qwen2.5-7B Q4_K_M | 8192 | 7347 / 10376 ms | **4646** / 7668 ms (**-26%**) |
+| Qwen3-0.6B Q4_K_M | 8192 | 1289 / 2267 ms | **1089** / 2032 ms (-10%) |
+
+Decode on the shared KV is within 3% of Vulkan with its own KV. Against Vulkan
+alone, teacher-forced over 64 tokens, the split's mean KL is 0.0002-0.0006 nats
+(max 0.007) and the top token agrees on 64-65 of 65 positions; Q4_K_M against
+BF16 is 0.063.
+
 ### Our patches
 
 `1bit/hrx-vulkan` is AMD's commit unchanged; `1bit/hrx-vulkan-patched` adds:
 
+- **Zero-copy KV sharing** (the section above): dma-buf export in ggml-hrx
+  (`ggml-hrx-dmabuf.cpp`), dma-buf import in ggml-vulkan (`ggml-vulkan-dmabuf.inc`),
+  `llama_kv_share_next` / `llama_kv_share_from` / `llama_kv_cells_copy` in
+  llama (`llama-kv-share.cpp`), and `ONEBIT_PREFILL_DEVICE` in llama-server
+  (`server-prefill.cpp`).
 - **IQ3_XXS matmul on HRX.** A matrix-vector kernel (`kernels/hrx/mul_mat_vec_iq3xxs_f32.loom`)
   and its matcher (`common/dispatch-mul-mat-iq3-xxs.cpp`), ported from the
   `feat/hrx-port-ae91949` work.

@@ -25,9 +25,14 @@ The whole 35B MoE token runs on the NPU as **one XRT runlist submit**:
 It matches an fp64 reference, and it chats at 16.1 tok/s.
 
 **Status: experimental. It is not part of `1bit serve`.** The kernels are the merged
-whole-layer design `lax` from the open kernels in `third_party/OpenFlowLM-Next`. A
-Python driver in that tree runs them through XRT's classic xclbin path. The fast lane
-([npu.md](npu.md)) is full-ELF and pure C++, and this path does not meet that bar yet
+whole-layer design `lax` from the open kernels in `third_party/OpenFlowLM-Next`. Two
+drivers run them through XRT's classic xclbin path:
+
+- `1bit npu-lax`, the engine's C++ driver (`npu/lax*.{h,cpp}`). It needs no Python. See
+  "The C++ driver".
+- The Python driver in the pinned tree, which the C++ one is checked against.
+
+The fast lane ([npu.md](npu.md)) is full-ELF, and this path does not meet that bar yet
 (see "What is left").
 
 ## The pin
@@ -68,6 +73,82 @@ python3 model/lax_chat.py --model-dir <model dir> --lax-l ~/.cache/lax/kernels/l
 
 Without prompts on the command line, it reads prompts from stdin. The chat is one
 device session, so the KV cache and the DeltaNet state carry across turns.
+
+## The C++ driver
+
+`1bit npu-lax` does what the pinned tree's `model/lax_chat.py` and `model/lax_decode_cfg.py`
+do, but in the engine:
+
+- It packs every buffer from `model.q4nx` in parallel threads, straight into the XRT
+  buffers. There is no pipe, no helper process and nothing on disk.
+- It builds the 40-run runlist on one context. Each layer's arguments are `pool xres
+  consts kv|dkv act ptab state|dstate cfg`.
+- It patches the full-attention stream for each position, then runs the norm and the lm
+  head and takes the greedy argmax.
+
+The packer is `npu/lax_pack.{h,cpp}`. It is re-implemented from the recipe's
+specification (`recipes/qwen36moe.py` `pack_plan` and `recipes/pack.py`, with every
+projection at q4_1 as `--requant` sets it), not copied. The position patches and the
+layer config words are `npu/lax_stream.{h,cpp}`. The kernel loading sits behind
+`npu/lax_kernels.h`, so a full-ELF kernel set can replace the classic one without
+changing the decoder.
+
+```sh
+cmake -S . -B build -DONEBIT_NPU=ON \
+    -DONEBIT_NPU_LAX_MODEL=<model dir> -DONEBIT_NPU_LAX_KERNELS=~/.cache/lax/kernels \
+    -DONEBIT_NPU_LAX_REF=~/.cache/lax-ref
+cmake --build build
+build/1bit npu-lax --model <model dir> --kernels ~/.cache/lax/kernels \
+    "What is the capital of France? Answer in one sentence."
+build/1bit npu-lax --model <model dir> --kernels ~/.cache/lax/kernels --parity ~/.cache/lax-ref
+flock <lockfile> ctest --test-dir build -R npu_lax --output-on-failure
+```
+
+Without prompts on the command line, it reads one prompt per line from stdin, and the
+conversation stays one device session. `--parity` runs the reference's `xres<t>.bin` at
+position t and scores the logits with `compare_decode.py`'s metric.
+
+The tests:
+
+| CTest | What it checks | Needs |
+|---|---|---|
+| `npu_lax_host` | The q8 -> q4_1 re-quantization and the signed-nibble transcode on synthetic chunks, every chunk permutation, the 4096-row position table, the position patches on a synthetic stream and the cfg words. Each is checked against hashes of the Python packer's output for the same input. | nothing (CI) |
+| `npu_lax_pack_model` | All 83 buffers (ptab, final norm, lm head pool, 40 pools and 40 consts) against the SHA-256 of the Python packer's bytes, in `tests/golden/npu_lax/sha256.tsv` | the model |
+| `npu_lax_patches` | The four position patches found in `lax_a/insts.bin` against the reference harness's table (`tests/golden/npu_lax/lax_a_patches.tsv`) | the kernels |
+| `npu_lax_e2e` | `tests/npu_lax_cpp.sh`: parity on three positions, then one chat turn that must answer with Paris | model, kernels, reference, the NPU |
+
+The reference hashes come from `model/lax_pack.py`'s `Model.build` at the pin. That
+path produces the bytes `lax_chat.py` streams into the device, and they equal
+`make_decode.py --requant`'s consts and ptab files. The q8 re-quantization has to round
+the way NumPy does, step for step:
+
+- It is built without fused multiply-adds.
+- A tied min or max goes to the later element. In a block whose scale is exactly zero,
+  every value is +0 or -0, and the min's sign is stored.
+
+**Results** on Strix Halo, with the same model and kernels as the Python numbers below.
+The binary is `build/1bit` from branch `npu/lax-cpp`:
+
+- **Packer:** all 83 buffers are byte-identical to the Python packer. That covers the 40
+  layers, the lm head and the ptab (`npu_lax_pack_model`, 17 s).
+- **Parity** (`1bit npu-lax --parity`): corr 0.999998 / 0.999993 / 0.999998 and argmax
+  846 / 198 / 3710 at positions 0 / 1 / 2. The top-5 equals the reference's. These are
+  the same numbers as the Python driver's.
+- **Chat:** "The capital of France is Paris."
+
+Speed, measured back to back on the same prompt ("Write a detailed essay about the history
+of Paris, from the Romans to today.", 28 prompt tokens, 128 generated). The generated text
+is the same from both drivers:
+
+| Driver | Ready (process start to first prompt) | Prompt | Decode |
+|---|---|---|---|
+| `1bit npu-lax` (C++) | 3.8 s | 20.7 tok/s | 16.4 tok/s |
+| `lax_chat.py` (Python) | 11.7 s | 18.7 tok/s | 16.2 tok/s |
+
+Decode is bound by the device: 40 layers take about 48 ms as one submit, and the lm head
+streams 542 MB. The C++ driver gains its time at load. It fills 22.4 GB in 0.9 s over 16
+threads, after 2.8 s allocating the buffers. Both drivers were measured with
+`model.q4nx` already in the page cache.
 
 ## Results
 
@@ -152,10 +233,11 @@ draws about 75-80 W less package power than GPU decode.
 
 ## What is left
 
-- **Full ELFs and C++ (rule 4).** Move the kernels from xclbin + `insts.bin` to full
-  ELFs, and the driver from Python to `npu/`, so that `1bit serve` can route the 35B
-  here. Upstream found that the ELF path translated the buffer arguments twice, which
-  is why this path uses the classic one.
+- **Full ELFs (rule 4).** The driver is now C++ (`1bit npu-lax`). The kernels still load
+  as xclbin + `insts.bin`. A full-ELF `KernelSet` (`npu/lax_kernels.h`) would replace
+  the classic one, and then `1bit serve` can route the 35B here. Upstream found that the
+  ELF path translated the buffer arguments twice, which is why this path uses the
+  classic one.
 - **Prompt processing.** Prompt tokens go through one position at a time. There is no
   batched prefill on the NPU.
 - **Memory.** A session pins about 22 GB of host memory in XRT buffers.

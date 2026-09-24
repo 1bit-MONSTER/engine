@@ -1,0 +1,6 @@
+# the reference harness's attn_table (open_kernels/harness/stream_patch.hpp, kv_row 2048) for lax_a insts.bin md5 4f3c749d8b0263260b8482c7350e7ebc (scripts/build-lax.sh at the pin)
+# word	kind (0 window length, 1 row drain, 2 record, 3 window offset)	flags
+2762	1	00000000
+2984	2	80000000
+3222	0	00000000
+3240	3	00000000

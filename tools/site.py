@@ -14,21 +14,29 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
+#
 # site.py <out-dir>
 #
-# Builds the documentation site (GitHub Pages, .github/workflows/pages.yml) from
-# README.md and docs/*.md: README becomes index.html, docs/<name>.md becomes
-# <name>.html. Every doc is published; the ones NAV does not place land under
-# "More", so a new doc never goes missing. Posts in blog/YYYY-MM-DD-<slug>.md become
-# blog-<slug>.html, listed newest first on blog.html and in the Atom feed feed.xml. Links to other docs become page links;
-# links to other files in the repository go to them on GitHub.
+# Builds the 1bit engine site (GitHub Pages, .github/workflows/pages.yml) in the
+# 1bit.MONSTER site template (site/template.html, site/style.css, site/theme.js):
+#
+#   index.html     the home page: hero, the latest post, a card for every page
+#   overview.html  README.md, "Meet the engine"
+#   docs.html      the docs index; docs/<name>.md becomes <name>.html, with the docs sidebar
+#                  (every doc is published; the ones NAV does not place land under "More")
+#   blog.html      posts in blog/YYYY-MM-DD-<slug>.md, newest first; each becomes
+#                  blog-<slug>.html, and feed.xml carries them as an Atom feed
+#   404.html       sends old 1bit.MONSTER addresses to the archived old site
+#
+# A post may start with "tags: a, b" lines before its "# Title"; its first paragraph is its
+# lead. Links to other docs become page links; links to other files in the repository go
+# to them on GitHub.
 #
 # Visitor counts: with GOATCOUNTER set to a GoatCounter site code (pages.yml passes the
 # repository variable of that name), every page loads GoatCounter's counter, which sets
 # no cookies. Unset, as in a local preview, the pages carry no analytics at all.
 #
 # Needs python-markdown (pip install markdown).
-import datetime
 import html
 import os
 import pathlib
@@ -39,14 +47,21 @@ import sys
 import markdown
 
 REPO = "https://github.com/1bit-MONSTER/engine"
+WIKI = REPO + "/wiki"
 SITE = "https://1bit.monster/"
 # the old 1bit.MONSTER site, kept on GitHub Pages under its repository's own address
 OLD_SITE = "https://1bit-monster.github.io/1bit-MONSTER/"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-# sidebar groups: (title, [(doc name, label)]); "index" is README.md
+TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade: the XDNA 2 NPU, "
+           "HRX and Vulkan on the Radeon iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
+
+# top bar: (label, page name or absolute URL)
+TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks", WIKI)]
+
+# docs sidebar groups: (title, [(doc name, label)])
 NAV = [
-    ("Start", [("index", "Overview"), ("serve", "1bit serve"), ("lemonade", "Lemonade")]),
+    ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade")]),
     ("Devices", [("npu", "NPU"), ("hrx", "HRX + Vulkan"), ("vulkan", "Vulkan (upstream)"),
                  ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
     ("Components", [("laya", "Laya router"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
@@ -54,11 +69,8 @@ NAV = [
 ]
 
 
-def sources():
-    docs = {"index": ROOT / "README.md"}
-    for p in sorted((ROOT / "docs").glob("*.md")):
-        docs[p.stem] = p
-    return docs
+def docs_sources():
+    return {p.stem: p for p in sorted((ROOT / "docs").glob("*.md"))}
 
 
 def posts():
@@ -70,25 +82,6 @@ def posts():
             sys.exit(f"blog post names are YYYY-MM-DD-<slug>.md: {p.name}")
         out.append((m.group(1), m.group(2), p))
     return sorted(out, reverse=True)
-
-
-def summary_of(text):
-    """The first paragraph after the title, as plain text."""
-    for para in re.split(r"\n\s*\n", strip_notice(text)):
-        para = para.strip()
-        if para and not para.startswith(("#", ">", "|", "-", "```")):
-            para = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", para)
-            return re.sub(r"[`*_]", "", " ".join(para.split()))
-    return ""
-
-
-def nav_groups(docs):
-    placed = {name for _, items in NAV for name, _ in items}
-    groups = [(t, [(n, l) for n, l in items if n in docs]) for t, items in NAV]
-    extra = [(n, title_of(docs[n].read_text())) for n in docs if n not in placed]
-    if extra:
-        groups.append(("More", extra))
-    return [(t, items) for t, items in groups if items]
 
 
 def strip_notice(text):
@@ -119,7 +112,10 @@ def rewrite_links(text, src, docs, labels):
         except ValueError:
             return m.group(0)
         if rel == "README.md":
-            return f"[{'Overview' if path_label else label}](index.html{frag})"
+            return f"[{'Meet the engine' if path_label else label}](overview.html{frag})"
+        post = re.fullmatch(r"blog/\d{4}-\d{2}-\d{2}-([a-z0-9-]+)\.md", rel)
+        if post:
+            return f"[{label}](blog-{post.group(1)}.html{frag})"
         if rel.startswith("docs/") and rel.endswith(".md") and resolved.stem in docs:
             if path_label:
                 label = labels.get(resolved.stem) or title_of(docs[resolved.stem].read_text())
@@ -151,24 +147,6 @@ def render(text):
     return body
 
 
-def sidebar(groups, current):
-    out = []
-    for title, items in groups:
-        out.append(f'<p class="group">{html.escape(title)}</p><ul>')
-        for name, label in items:
-            cls = ' class="current" aria-current="page"' if name == current else ""
-            out.append(f'<li><a href="{name}.html"{cls}>{html.escape(label)}</a></li>')
-        out.append("</ul>")
-    return "\n".join(out)
-
-
-def pager(order, name, labels):
-    i = order.index(name)
-    prev = f'<a class="prev" href="{order[i - 1]}.html"><span>Previous</span>{html.escape(labels[order[i - 1]])}</a>' if i > 0 else "<span></span>"
-    nxt = f'<a class="next" href="{order[i + 1]}.html"><span>Next</span>{html.escape(labels[order[i + 1]])}</a>' if i + 1 < len(order) else "<span></span>"
-    return f'<nav class="pager">{prev}{nxt}</nav>'
-
-
 def analytics():
     code = os.environ.get("GOATCOUNTER", "").strip()
     if not code:
@@ -178,79 +156,270 @@ def analytics():
     return f'<script data-goatcounter="https://{code}.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>'
 
 
-def not_found(template):
-    """404.html: GitHub serves it at any depth, so it pins its links to the site root.
-    Links into the old 1bit.MONSTER site (1bit-*.html) point at that site's archive."""
-    body = ('<h1>Page not found</h1>\n'
-            '<p>1bit.MONSTER is now <a href="index.html">1bit engine</a>. '
-            'Pages from the old site are kept in the <a id="old" href="' + OLD_SITE + '">1bit.MONSTER archive</a>.</p>\n'
-            '<script>\n'
-            '  // an old 1bit.MONSTER address: point straight at its archived copy\n'
-            '  var m = location.pathname.match(/\\/(1bit-[a-z0-9-]+\\.html)$/);\n'
-            '  if (m && m[1] !== "1bit-jarvis.html") document.getElementById("old").href = "' + OLD_SITE + '" + m[1];\n'
-            '</script>')
-    return (template
-            .replace("<head>", f'<head>\n<base href="{SITE}">', 1)
-            .replace("{{title}}", "Page not found · 1bit engine")
-            .replace("{{home}}", "doc")
-            .replace("{{sidebar}}", "")
-            .replace("{{content}}", body)
-            .replace("{{pager}}", "")
-            .replace("{{source}}", REPO)
-            .replace("{{repo}}", REPO))
+def plain(markdown_text):
+    """One paragraph of markdown as plain text."""
+    text = re.sub(r"\s*\(\[[^\]]*\.md\]\([^)]*\)\)", "", markdown_text)  # "(docs/x.md)" asides
+    text = re.sub(r"\[([^\]]*)\]\([^)]*\)", r"\1", text)
+    return re.sub(r"[`*_]", "", " ".join(text.split()))
 
 
-def page(template, **fields):
-    for key, value in fields.items():
-        template = template.replace("{{" + key + "}}", value)
-    return template.replace("{{repo}}", REPO)
+def split_post(text):
+    """-> (tags, title, lead paragraph, the rest) of a post."""
+    text = strip_notice(text)
+    tags = []
+    while True:
+        m = re.match(r"\s*tags:\s*(.+)\n", text)
+        if not m:
+            break
+        tags += [t.strip() for t in m.group(1).split(",") if t.strip()]
+        text = text[m.end():]
+    m = re.match(r"\s*# (.+)\n", text)
+    if not m:
+        sys.exit("a post starts with its '# Title'")
+    rest = text[m.end():].strip()
+    lead, _, body = rest.partition("\n\n")
+    return tags, re.sub(r"[`*]", "", m.group(1)).strip(), lead.strip(), body
 
 
-def blog(template, out, docs, labels):
-    items = posts()
-    if not items:
-        return
-    names = [f"blog-{slug}" for _, slug, _ in items]
-    side = ('<p class="group">Blog</p><ul>' + "".join(
-        f'<li><a href="{n}.html"{{cur}}>{html.escape(title_of(p.read_text()))}</a></li>'.replace("{cur}", "{{cur_" + n + "}}")
-        for n, (_, _, p) in zip(names, items)) + "</ul>")
+def first_paragraph(text):
+    for para in re.split(r"\n\s*\n", strip_notice(text)):
+        para = para.strip()
+        if para and not para.startswith(("#", ">", "|", "-", "```", "<")):
+            return plain(para)
+    return ""
 
-    def sidebar_for(current):
-        text = side
-        for n in names:
-            text = text.replace("{{cur_" + n + "}}", ' class="current" aria-current="page"' if n == current else "")
-        return text
 
-    rows = []
-    for i, (date, slug, src) in enumerate(items):
+def clip(text, n=150):
+    return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
+
+
+def nav_groups(docs):
+    placed = {name for _, items in NAV for name, _ in items}
+    groups = [(t, [(n, l) for n, l in items if n in docs]) for t, items in NAV]
+    extra = [(n, title_of(docs[n].read_text())) for n in docs if n not in placed]
+    if extra:
+        groups.append(("More", extra))
+    return [(t, items) for t, items in groups if items]
+
+
+class Site:
+    def __init__(self, out):
+        self.out = out
+        self.template = strip_notice((ROOT / "site" / "template.html").read_text())
+        self.docs = docs_sources()
+        self.groups = nav_groups(self.docs)
+        self.order = [n for _, items in self.groups for n, _ in items]
+        self.labels = {n: l for _, items in self.groups for n, l in items}
+        self.posts = posts()
+        # rewrite_links resolves README.md to the overview page and docs to their pages
+        self.link_docs = dict(self.docs)
+
+    def top_nav(self, current):
+        out = []
+        for label, target in TOP:
+            href = target if target.startswith("http") else f"{target}.html"
+            cur = ' aria-current="page"' if target == current else ""
+            out.append(f'      <a href="{href}"{cur}>{html.escape(label)}</a>')
+        return "\n".join(out)
+
+    def write(self, name, title, main, kind, section, description=TAGLINE, extra_head=""):
+        page = (self.template
+                .replace("{{title}}", html.escape(title))
+                .replace("{{description}}", html.escape(description, quote=True))
+                .replace("{{kind}}", kind)
+                .replace("{{nav}}", self.top_nav(section))
+                .replace("{{main}}", main)
+                .replace("{{analytics}}", analytics())
+                .replace("{{repo}}", REPO))
+        if extra_head:
+            page = page.replace("<head>", "<head>\n" + extra_head, 1)
+        (self.out / f"{name}.html").write_text(page)
+
+    def md(self, text, src):
+        return render(rewrite_links(text, src, self.link_docs, self.labels))
+
+    # ── docs ──────────────────────────────────────────────────────────
+    def sidebar(self, current):
+        out = ['<details class="docs-side" open><summary>Contents</summary><nav aria-label="Documentation">']
+        for title, items in [("Overview", [("docs", "All docs"), ("overview", "Meet the engine")])] + self.groups:
+            out.append(f'<p class="group">{html.escape(title)}</p><ul>')
+            for name, label in items:
+                cur = ' aria-current="page"' if name == current else ""
+                out.append(f'<li><a href="{name}.html"{cur}>{html.escape(label)}</a></li>')
+            out.append("</ul>")
+        out.append("</nav></details>")
+        return "\n".join(out)
+
+    def pager(self, name):
+        if name not in self.order:
+            return ""
+        i = self.order.index(name)
+        prev = (f'<a class="prev" href="{self.order[i - 1]}.html"><span>Previous</span>{html.escape(self.labels[self.order[i - 1]])}</a>'
+                if i > 0 else "<span></span>")
+        nxt = (f'<a class="next" href="{self.order[i + 1]}.html"><span>Next</span>{html.escape(self.labels[self.order[i + 1]])}</a>'
+               if i + 1 < len(self.order) else "<span></span>")
+        return f'<nav class="pager">{prev}{nxt}</nav>'
+
+    def doc_page(self, name, src, section="docs"):
         text = strip_notice(src.read_text())
+        if name == "overview":
+            # the README's link to this site is redundant on the site itself
+            text = re.sub(r"^\*\*Documentation:\*\*.*\n+", "", text, count=1, flags=re.M)
+        main = (f'<div class="container docs">\n{self.sidebar(name)}\n<article class="docs-page prose">\n'
+                f'{self.md(text, src)}\n{self.pager(name)}\n'
+                f'<p class="source meta"><a href="{REPO}/blob/main/{src.relative_to(ROOT).as_posix()}">View this page\'s source on GitHub ↗</a></p>\n'
+                "</article>\n</div>")
         title = title_of(text)
-        # the post's own date line under its title
-        body = render(rewrite_links(text, src, docs, labels))
-        body = re.sub(r"(</h1>)", rf'\1\n<p class="date"><time datetime="{date}">{date}</time></p>', body, count=1)
-        newer = f'<a class="prev" href="{names[i - 1]}.html"><span>Newer</span>{html.escape(title_of(items[i - 1][2].read_text()))}</a>' if i > 0 else "<span></span>"
-        older = f'<a class="next" href="{names[i + 1]}.html"><span>Older</span>{html.escape(title_of(items[i + 1][2].read_text()))}</a>' if i + 1 < len(items) else "<span></span>"
-        (out / f"{names[i]}.html").write_text(page(template, title=html.escape(title) + " · 1bit engine", home="doc post",
-            sidebar=sidebar_for(names[i]), content=body, pager=f'<nav class="pager">{newer}{older}</nav>',
-            source=f"{REPO}/blob/main/{src.relative_to(ROOT).as_posix()}"))
-        rows.append((date, names[i], title, summary_of(text), body))
+        self.write(name, f"{title} · 1bit engine", main, "doc", section, first_paragraph(text) or TAGLINE)
 
-    listing = '<h1>Blog</h1>\n<p class="date"><a href="feed.xml">Atom feed</a></p>\n' + "\n".join(
-        f'<section class="post"><p class="date"><time datetime="{d}">{d}</time></p>'
-        f'<h2><a href="{n}.html">{html.escape(t)}</a></h2><p>{html.escape(s)}</p></section>' for d, n, t, s, _ in rows)
-    (out / "blog.html").write_text(page(template, title="Blog · 1bit engine", home="doc", sidebar=sidebar_for(""),
-        content=listing, pager="", source=f"{REPO}/tree/main/blog"))
+    def docs_index(self):
+        rows = []
+        for title, items in self.groups:
+            rows.append(f"<h2>{html.escape(title)}</h2>\n<div class=\"table\"><table><thead><tr><th>Page</th><th>What it covers</th></tr></thead><tbody>")
+            for name, label in items:
+                desc = clip(first_paragraph(self.docs[name].read_text()), 180)
+                rows.append(f'<tr><td><a href="{name}.html">{html.escape(label)}</a></td><td>{html.escape(desc)}</td></tr>')
+            rows.append("</tbody></table></div>")
+        main = (f'<div class="container docs">\n{self.sidebar("docs")}\n<article class="docs-page prose">\n'
+                "<h1>Documentation</h1>\n"
+                f'<p class="lead">How to run the engine, what each device does, and how the pieces fit. '
+                f'Measured numbers are on the <a href="{WIKI}">wiki</a>.</p>\n' + "\n".join(rows) +
+                "\n</article>\n</div>")
+        self.write("docs", "Documentation · 1bit engine", main, "doc", "docs")
 
-    def stamp(d):
-        return d + "T00:00:00Z"
-    entries = "".join(
-        f"<entry><title>{html.escape(t)}</title><link href=\"{SITE}{n}.html\"/><id>{SITE}{n}.html</id>"
-        f"<updated>{stamp(d)}</updated><summary>{html.escape(s)}</summary>"
-        f"<content type=\"html\">{html.escape(b)}</content></entry>" for d, n, t, s, b in rows)
-    (out / "feed.xml").write_text(
-        '<?xml version="1.0" encoding="utf-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">'
-        f'<title>1bit engine</title><link href="{SITE}"/><link rel="self" href="{SITE}feed.xml"/><id>{SITE}</id>'
-        f"<updated>{stamp(rows[0][0])}</updated><author><name>bong-water-water-bong</name></author>{entries}</feed>\n")
+    # ── blog ──────────────────────────────────────────────────────────
+    def blog(self):
+        if not self.posts:
+            return []
+        rows = []
+        for i, (date, slug, src) in enumerate(self.posts):
+            tags, title, lead, body = split_post(src.read_text())
+            name = f"blog-{slug}"
+            tag_html = "".join(f'<span class="tag">{html.escape(t)}</span>' for t in tags)
+            newer = self.posts[i - 1] if i > 0 else None
+            older = self.posts[i + 1] if i + 1 < len(self.posts) else None
+
+            def link(p, cls, word):
+                if not p:
+                    return "<span></span>"
+                return f'<a class="{cls}" href="blog-{p[1]}.html"><span>{word}</span>{html.escape(split_post(p[2].read_text())[1])}</a>'
+            main = (f'<article class="art"><div class="container">\n'
+                    f'<a class="back" href="blog.html">← all posts</a>\n'
+                    f'<div class="art-meta"><time datetime="{date}">{date}</time>{tag_html}</div>\n'
+                    f"<h1>{html.escape(title)}</h1>\n"
+                    f'<p class="lead">{self.md(lead, src)[3:-4]}</p>\n'
+                    f'<div class="prose">\n{self.md(body, src)}\n</div>\n'
+                    f'<nav class="pager">{link(newer, "prev", "Newer")}{link(older, "next", "Older")}</nav>\n'
+                    "</div></article>")
+            self.write(name, f"{title} · 1bit engine", main, "post", "blog", plain(lead))
+            rows.append((date, name, title, plain(lead), tags, self.md(lead + "\n\n" + body, src)))
+
+        log = "\n".join(
+            f'<a class="log-row" href="{n}.html"><span class="log-date">{d}</span><div class="log-body">'
+            f"<h3>{html.escape(t)}</h3><p>{html.escape(clip(s, 320))}</p></div></a>" for d, n, t, s, _, _ in rows)
+        main = ('<section class="section"><div class="container hero-center hero-narrow">\n'
+                '<p class="eyebrow">Blog · field notes</p>\n'
+                "<h1>How the engine actually gets built.</h1>\n"
+                '<p class="lead">Notes on the work: what we port, what we measure, what we ship.</p>\n'
+                "</div></section>\n"
+                '<section class="section"><div class="container">\n'
+                '<div class="row-between log-head"><div><p class="eyebrow">Serial · 2026</p><h2>Notes, in order.</h2></div>'
+                f'<div class="links"><a class="btn btn-ghost" href="feed.xml">Atom feed&nbsp;→</a>'
+                f'<a class="btn btn-ghost" href="{OLD_SITE}1bit-blog.html">1bit.MONSTER archive&nbsp;→</a></div></div>\n'
+                f"{log}\n</div></section>\n{self.archive()}")
+        self.write("blog", "Blog · 1bit engine", main, "blog", "blog", "Notes on building the 1bit engine.")
+
+        def stamp(d):
+            return d + "T00:00:00Z"
+        entries = "".join(
+            f"<entry><title>{html.escape(t)}</title><link href=\"{SITE}{n}.html\"/><id>{SITE}{n}.html</id>"
+            f"<updated>{stamp(d)}</updated><summary>{html.escape(s)}</summary>"
+            + "".join(f'<category term="{html.escape(x, quote=True)}"/>' for x in tags) +
+            f"<content type=\"html\">{html.escape(b)}</content></entry>" for d, n, t, s, tags, b in rows)
+        (self.out / "feed.xml").write_text(
+            '<?xml version="1.0" encoding="utf-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">'
+            f'<title>1bit engine</title><link href="{SITE}"/><link rel="self" href="{SITE}feed.xml"/><id>{SITE}</id>'
+            f"<updated>{stamp(rows[0][0])}</updated><author><name>bong-water-water-bong</name></author>{entries}</feed>\n")
+        return rows
+
+    def archive(self):
+        """blog/archive.tsv: date, title, page of the old 1bit.MONSTER blog worth keeping."""
+        src = ROOT / "blog" / "archive.tsv"
+        if not src.exists():
+            return ""
+        rows = [line.split("\t") for line in src.read_text().splitlines() if line.strip()]
+        log = "\n".join(
+            f'<a class="log-row" href="{OLD_SITE}{f}"><span class="log-date">{d}</span><div class="log-body">'
+            f"<h3>{html.escape(t)}&nbsp;↗</h3></div></a>" for d, t, f in rows)
+        return ('<section class="section"><div class="container">\n'
+                '<div class="log-head"><p class="eyebrow">Archive · 1bit.MONSTER</p><h2>From the 1bit.MONSTER years.</h2>\n'
+                '<p class="lead archive-note">The posts from before the clean repository, as they were written. '
+                "They describe the old monorepo; the engine's current numbers are on the wiki.</p></div>\n"
+                f"{log}\n</div></section>")
+
+    # ── home ──────────────────────────────────────────────────────────
+    def home(self, rows):
+        latest = ""
+        if rows:
+            d, n, t, s, _, _ = rows[0]
+            latest = (f'<a class="latest-link" href="{n}.html"><span class="latest-badge"><span class="dot"></span>latest · {d}</span>'
+                      f'<span class="latest-title"><strong>{html.escape(t)}.</strong> {html.escape(clip(s, 260))}</span>'
+                      '<span class="latest-more">read the post <span class="ar">→</span></span></a>')
+
+        def card(href, title, desc, path):
+            return (f'<a class="site-card" href="{href}"><span class="site-title">{html.escape(title)} <span class="ar">→</span></span>'
+                    f'<p class="site-desc">{html.escape(desc)}</p><span class="site-path">{html.escape(path)}</span></a>')
+        cards = [card("overview.html", "Engine", "What the engine is, what runs where, and who it is built on.", "engine"),
+                 card("docs.html", "Docs", "Every device, every component, and how to run them.", "docs"),
+                 card("blog.html", "Blog", "The build log: what moved over, what got faster, what broke.", "blog"),
+                 card(WIKI, "Benchmarks", "Measured, not projected. Every number with how it was taken.", "wiki")]
+        cards += [card(f"{n}.html", l, clip(first_paragraph(self.docs[n].read_text()), 120), n)
+                  for _, items in self.groups for n, l in items]
+        mark = ('<svg class="mark" viewBox="0 0 24 24" fill="none" aria-hidden="true"><rect class="relay r1" x="2" y="2" width="9" height="9" rx="2"/>'
+                '<rect class="relay r2" x="13" y="2" width="9" height="9" rx="2"/><rect class="relay r3" x="2" y="13" width="9" height="9" rx="2"/>'
+                '<rect class="relay r4" x="13" y="13" width="9" height="9" rx="2"/></svg>')
+        main = ('<section class="section hero-center"><div class="container">\n'
+                f"<h1>{mark}1bit engine</h1>\n"
+                f'<p class="lead">{html.escape(TAGLINE)}</p>\n'
+                '<div class="cta-row"><a class="btn btn-primary" href="serve.html">Get started&nbsp;→</a>'
+                '<a class="btn btn-ghost" href="overview.html">Meet the engine&nbsp;→</a></div>\n'
+                f"{latest}\n</div></section>\n"
+                '<section class="section"><div class="container">\n'
+                '<span class="site-badge"><span class="dot"></span>site index</span>\n'
+                f'<div class="site-grid">{"".join(cards)}</div>\n</div></section>')
+        self.write("index", "1bit engine", main, "home", "")
+
+    # ── 404 ───────────────────────────────────────────────────────────
+    def not_found(self):
+        """GitHub serves 404.html at any depth, so it pins its links to the site root. An old
+        1bit.MONSTER address (1bit-*.html) links to its copy on the archived old site."""
+        main = ('<section class="section hero-center"><div class="container hero-narrow">\n'
+                '<p class="eyebrow">404</p><h1>Page not found</h1>\n'
+                '<p class="lead">1bit.MONSTER is now 1bit engine. Pages from the old site are kept in the '
+                f'<a id="old" href="{OLD_SITE}"><u>1bit.MONSTER archive</u></a>.</p>\n'
+                '<div class="cta-row"><a class="btn btn-primary" href="index.html">Home&nbsp;→</a>'
+                '<a class="btn btn-ghost" href="docs.html">Docs&nbsp;→</a></div>\n'
+                "<script>\n"
+                "  // an old 1bit.MONSTER address: point straight at its archived copy\n"
+                r'  var m = location.pathname.match(/\/(1bit-[a-z0-9-]+\.html)$/);' "\n"
+                f'  if (m && m[1] !== "1bit-jarvis.html") document.getElementById("old").href = "{OLD_SITE}" + m[1];\n'
+                "</script>\n</div></section>")
+        self.write("404", "Page not found · 1bit engine", main, "doc", "", extra_head=f'<base href="{SITE}">')
+
+    def build(self):
+        readme = ROOT / "README.md"
+        for name, src in self.docs.items():
+            self.doc_page(name, src)
+        self.doc_page("overview", readme, section="overview")
+        self.docs_index()
+        rows = self.blog()
+        self.home(rows)
+        self.not_found()
+        for f in ("style.css", "theme.js"):
+            shutil.copy(ROOT / "site" / f, self.out / f)
+        shutil.copytree(ROOT / "site" / "assets", self.out / "assets")
+        (self.out / ".nojekyll").write_text("")
+        return len(list(self.out.glob("*.html")))
 
 
 def main():
@@ -258,32 +427,7 @@ def main():
     if out.exists():
         shutil.rmtree(out)
     out.mkdir(parents=True)
-    docs = sources()
-    groups = nav_groups(docs)
-    order = [n for _, items in groups for n, _ in items]
-    labels = {n: l for _, items in groups for n, l in items}
-    template = strip_notice((ROOT / "site" / "template.html").read_text()).replace("{{analytics}}", analytics())
-    for name, src in docs.items():
-        text = strip_notice(src.read_text())
-        if name == "index":
-            # the README's link to this site is redundant on the site itself
-            text = re.sub(r"^\*\*Documentation:\*\*.*\n+", "", text, count=1, flags=re.M)
-        body = render(rewrite_links(text, src, docs, labels))
-        source = src.relative_to(ROOT).as_posix()
-        page = (template
-                .replace("{{title}}", html.escape(title_of(text)) + ("" if name == "index" else " · 1bit engine"))
-                .replace("{{home}}", "home" if name == "index" else "doc")
-                .replace("{{sidebar}}", sidebar(groups, name))
-                .replace("{{content}}", body)
-                .replace("{{pager}}", pager(order, name, labels))
-                .replace("{{source}}", f"{REPO}/blob/main/{source}")
-                .replace("{{repo}}", REPO))
-        (out / f"{name}.html").write_text(page)
-    (out / "404.html").write_text(not_found(template))
-    blog(template, out, docs, labels)
-    shutil.copy(ROOT / "site" / "style.css", out / "style.css")
-    (out / ".nojekyll").write_text("")
-    print(f"{len(docs)} pages -> {out}")
+    print(f"{Site(out).build()} pages -> {out}")
 
 
 if __name__ == "__main__":

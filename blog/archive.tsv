@@ -1,0 +1,15 @@
+2026-09-02	Byte-identical: 1,000 tokens of proof against AMD's real runtime	1bit-post-byte-identical.html
+2026-09-02	The 35B MoE's NPU packing: 5,120-byte tiles, 4,736-byte rows, and an A/B interleave	1bit-post-35b-moe-layout.html
+2026-09-01	Zaya 8B Q4NX on the AMD NPU	1bit-post-zaya-q4nx-hrx.html
+2026-08-29	HRX: we put AMD's experimental IREE runtime inside our engine	1bit-post-hrx-engine.html
+2026-08-25	One engine, every model	1bit-post-1775-models.html
+2026-08-25	What 1-bit actually does to a model	1bit-post-1bit-explained.html
+2026-08-25	ROCm vs CUDA, from the 1-bit trenches	1bit-post-rocm-vs-cuda.html
+2026-08-25	Local RAG with our own embeddings	1bit-post-local-rag.html
+2026-07-30	Qwen3.6-35B-A3B streams fully on the Ryzen AI NPU	1bit-post-qwen36.html
+2026-07-26	Zyphra family complete	1bit-post-zyphra.html
+2026-07-24	One binary, all formats	1bit-post-binary-formats.html
+2026-07-23	Unsloth for AMD	1bit-post-unsloth.html
+2026-07-11	TokenRouter: token-level multi-backend inference	1bit-post-tokenrouter.html
+2026-07-06	Three bugs that broke 97 tok/s	1bit-post-three-bugs.html
+2026-07-02	NPU v12: M=32 batch decode at 97 tok/s	1bit-post-npu-v12.html

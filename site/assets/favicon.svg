@@ -1,0 +1,44 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 24 24" role="img" aria-label="1bit engine">
+  <title>1bit engine</title>
+  <style>
+    /* relay cubes — the banner.svg logo-relay, compressed for the tab icon:
+       one cube lights brand-blue at a time, 8s cycle, fading between states. */
+    .cube { fill: #ffffff; stroke: #010202; stroke-opacity: 0.28; }
+    .lit  { animation: relay 8s ease-in-out infinite; }
+    .c1 { animation-delay: 0s; }
+    .c2 { animation-delay: 2s; }
+    .c3 { animation-delay: 4s; }
+    .c4 { animation-delay: 6s; }
+    @keyframes relay {
+      0%   { fill: #ffffff; }
+      6%   { fill: #0230c0; }
+      22%  { fill: #0230c0; }
+      28%  { fill: #ffffff; }
+      100% { fill: #ffffff; }
+    }
+    @media (prefers-reduced-motion: reduce) {
+      .lit { animation: none; }
+      .c1 { fill: #0230c0; }
+    }
+  </style>
+  <rect class="cube lit c1" x="2"  y="2"  width="9" height="9" rx="2"/>
+  <rect class="cube lit c2" x="13" y="2"  width="9" height="9" rx="2"/>
+  <rect class="cube lit c3" x="2"  y="13" width="9" height="9" rx="2"/>
+  <rect class="cube lit c4" x="13" y="13" width="9" height="9" rx="2"/>
+</svg>

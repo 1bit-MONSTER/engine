@@ -23,7 +23,7 @@
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
 	url = https://github.com/1bit-MONSTER/llama.cpp.git
-	branch = 1bit/hrx-vulkan
+	branch = 1bit/hrx-vulkan-patched
 	shallow = true
 [submodule "third_party/xdna-driver"]
 	path = third_party/xdna-driver

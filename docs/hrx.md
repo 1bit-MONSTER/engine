@@ -35,7 +35,7 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 
 | Submodule | Source | Pinned to |
 |---|---|---|
-| `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) |
+| `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
 | `third_party/hrx-system` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | libhrx, loomc and the Loom tools |
 
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
@@ -44,14 +44,45 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 - **How it stays current.** `.github/workflows/bump-hrx.yml` runs daily. When AMD
   moves its pair, it:
   - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin);
-  - opens a PR here moving both submodules.
+  - rebases our commits onto AMD's pin and moves `1bit/hrx-vulkan-patched` there,
+    after tagging the previous tip `patched-<sha>` so every commit the engine has
+    pinned stays reachable (a rebase conflict fails the run: rebase by hand);
+  - opens a PR here moving both submodules, listing the rebased commits.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
   Halo before merging.
 
-There are no local patches. `1bit-MONSTER/llama.cpp` also holds
+### Our patches
+
+`1bit/hrx-vulkan` is AMD's commit unchanged; `1bit/hrx-vulkan-patched` adds:
+
+- **IQ3_XXS matmul on HRX.** A matrix-vector kernel (`kernels/hrx/mul_mat_vec_iq3xxs_f32.loom`)
+  and its matcher (`common/dispatch-mul-mat-iq3-xxs.cpp`), ported from the
+  `feat/hrx-port-ae91949` work.
+- **Honest op claims.** ggml-hrx used to claim every op of a declared type, so
+  ggml's scheduler handed it nodes it could not dispatch and the graph failed
+  (`unsupported HRX node`) with no CPU fallback. It now claims a node only when
+  its dispatcher can execute it, except nodes already in HRX memory (KV cache
+  views), which cannot move. Leaf (`NONE`) nodes count as covered. AMD's IQ4_NL
+  and IQ4_XS matmul kernels, and GET_ROWS for IQ4_XS and batched IQ3_S, give wrong
+  values, so those nodes are left to the CPU.
+
+Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
+
+| File | Vulkan0 | HRX0 on AMD's commit | HRX0 with our patches |
+|---|---|---|---|
+| Q4_K_M | 22.53 | 22.52 | 22.52, same speed (21691 / 324 tok/s) |
+| UD-Q4_K_XL | 22.43 | fails | **22.41** |
+| UD-Q2_K_XL | 36.26 | fails | **36.46** |
+| UD-IQ2_M | 55.44 | fails | **55.58** |
+
+`test-backend-ops -b HRX0`: 791 OK, 0 failed (on AMD's commit, about 1150 fail).
+Correct is not fast: the UD files run their IQ4_XS and sub-4-bit layers on the CPU
+(UD-Q4_K_XL 6303 / 246 tok/s, UD-Q2_K_XL 974 / 76), so they belong on `Vulkan0`.
+
+`1bit-MONSTER/llama.cpp` also holds
 `1bit/hrx2-archive`, the previous build (AMD's abandoned ggml-hrx2 plus our Q4NX
 kernels and the zaya architecture). It is kept for a later port of that work to
 ggml-hrx.
@@ -105,11 +136,9 @@ HRX prefill is now faster than Vulkan's.
 
 ## Not yet
 
-- **IQ2/IQ3 types on HRX.** ggml-hrx has no IQ3_XXS matmul, but it still accepts
-  the op when the graph is scheduled, so there is no CPU fallback and the decode
-  fails (`unsupported HRX node ... iq3_xxs`). The Unsloth Dynamic UD-Q2_K_XL,
-  UD-IQ2_M and UD-IQ1_S files fail on `HRX0` for this reason; they run on
-  `Vulkan0`. UD-Q4_K_XL runs on both.
+- **Fast sub-4-bit and IQ4 kernels on HRX.** With our patches the UD files are
+  correct on `HRX0` but slow, since IQ4_XS, IQ2 and IQ3_S matmuls fall back to the
+  CPU. AMD's IQ4_XS / IQ4_NL kernels need fixing upstream.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
   They are kept on `1bit/hrx2-archive` until they are ported.
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows

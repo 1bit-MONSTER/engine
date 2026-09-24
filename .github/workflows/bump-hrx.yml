@@ -15,9 +15,13 @@
 #
 # Keep third_party/llama.cpp and third_party/hrx-system on the pair AMD's
 # integration repo (ROCm/ggml-staging-automation) builds and tests together
-# (docs/hrx.md, "Staying current"). When AMD moves its pins, this workflow:
+# (docs/hrx.md, "Staying current"). The engine pins 1bit/hrx-vulkan-patched: AMD's
+# commit plus our own commits on top. When AMD moves its pins, this workflow:
 #   1. syncs 1bit-MONSTER/llama.cpp: master to ggml-org, 1bit/hrx-vulkan to AMD's pin;
-#   2. opens a PR here moving both submodules.
+#   2. rebases our commits onto AMD's pin and moves 1bit/hrx-vulkan-patched there,
+#      tagging the previous tip so the commit the engine pins stays reachable;
+#   3. opens a PR here moving both submodules.
+# A rebase conflict fails the run: rebase 1bit/hrx-vulkan-patched by hand.
 # GitHub-hosted CI builds that PR without HRX; run tests/serve_e2e.sh on
 # Strix Halo before merging it.
 #
@@ -67,19 +71,23 @@ jobs:
           amd_hrx=$(gh api repos/ROCm/ggml-staging-automation/contents/hrx-system --jq .sha)
           ours_llama=$(git ls-tree HEAD third_party/llama.cpp | awk '{print $3}')
           ours_hrx=$(git ls-tree HEAD third_party/hrx-system | awk '{print $3}')
+          # the AMD commit our patches sit on
+          ours_base=$(git ls-remote https://github.com/1bit-MONSTER/llama.cpp.git refs/heads/1bit/hrx-vulkan | awk '{print $1}')
           echo "AMD:  llama.cpp $amd_llama  hrx-system $amd_hrx"
-          echo "ours: llama.cpp $ours_llama  hrx-system $ours_hrx"
+          echo "ours: llama.cpp $ours_llama (on AMD $ours_base)  hrx-system $ours_hrx"
           {
             echo "amd_llama=$amd_llama"; echo "amd_hrx=$amd_hrx"
-            echo "ours_llama=$ours_llama"; echo "ours_hrx=$ours_hrx"
-            if [ "$amd_llama" = "$ours_llama" ] && [ "$amd_hrx" = "$ours_hrx" ]; then echo "changed=false"; else echo "changed=true"; fi
+            echo "ours_llama=$ours_llama"; echo "ours_hrx=$ours_hrx"; echo "ours_base=$ours_base"
+            if [ "$amd_llama" = "$ours_base" ] && [ "$amd_hrx" = "$ours_hrx" ]; then echo "changed=false"; else echo "changed=true"; fi
           } >> "$GITHUB_OUTPUT"
 
-      - name: Sync the fork
+      - name: Sync the fork and rebase our commits
+        id: fork
         if: steps.pins.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
+          OURS_BASE: ${{ steps.pins.outputs.ours_base }}
         run: |
           set -euo pipefail
           # master mirrors ggml-org; 1bit/hrx-vulkan carries no commits of its own, so it
@@ -96,12 +104,40 @@ jobs:
           fi
           git push -q fork "$AMD_LLAMA:refs/heads/1bit/hrx-vulkan"
 
+          # our commits: OURS_BASE..1bit/hrx-vulkan-patched, replayed onto AMD's pin, in a clone
+          # whose only (partial) remote is the fork, which now holds AMD's pin too
+          cd .. && git init -q patched && cd patched
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/llama.cpp.git"
+          git fetch -q --filter=blob:none fork 1bit/hrx-vulkan
+          git fetch -q --filter=blob:none fork 1bit/hrx-vulkan-patched
+          patched=$(git rev-parse FETCH_HEAD)
+          rebased=$patched
+          if [ "$OURS_BASE" != "$AMD_LLAMA" ]; then
+            git checkout -q --detach "$patched"
+            if ! git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com rebase -q --onto "$AMD_LLAMA" "$OURS_BASE"; then
+              git rebase --abort || true
+              echo "::error::our commits on 1bit/hrx-vulkan-patched do not rebase onto AMD's ${AMD_LLAMA:0:12}; rebase them by hand"
+              exit 1
+            fi
+            rebased=$(git rev-parse HEAD)
+            # keep the commit the engine pins now reachable before moving the branch
+            git tag "patched-${patched:0:12}" "$patched"
+            git push -q fork "refs/tags/patched-${patched:0:12}"
+            git push -q --force-with-lease="refs/heads/1bit/hrx-vulkan-patched:$patched" fork "$rebased:refs/heads/1bit/hrx-vulkan-patched"
+          fi
+          {
+            echo "rebased=$rebased"
+            echo "patches<<EOF"; git log --format='- `%h` %s' "$AMD_LLAMA..$rebased"; echo "EOF"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Open the bump PR
         if: steps.pins.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
           AMD_HRX: ${{ steps.pins.outputs.amd_hrx }}
+          REBASED: ${{ steps.fork.outputs.rebased }}
+          PATCHES: ${{ steps.fork.outputs.patches }}
           OURS_LLAMA: ${{ steps.pins.outputs.ours_llama }}
           OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
         run: |
@@ -113,7 +149,7 @@ jobs:
           git config user.name "hrx-bump"
           git config user.email "hrx-bump@users.noreply.github.com"
           git switch -c "$branch"
-          git update-index --cacheinfo "160000,$AMD_LLAMA,third_party/llama.cpp"
+          git update-index --cacheinfo "160000,$REBASED,third_party/llama.cpp"
           git update-index --cacheinfo "160000,$AMD_HRX,third_party/hrx-system"
           git commit -q -m "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12} (AMD's tested pair)"
           git push -q origin "$branch"
@@ -123,8 +159,11 @@ jobs:
 
           | | from | to |
           |---|---|---|
-          | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan) | \`${OURS_LLAMA:0:12}\` | \`${AMD_LLAMA:0:12}\` |
+          | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched) | \`${OURS_LLAMA:0:12}\` | \`${REBASED:0:12}\` (on AMD \`${AMD_LLAMA:0:12}\`) |
           | third_party/hrx-system (ROCm/hrx-system) | \`${OURS_HRX:0:12}\` | \`${AMD_HRX:0:12}\` |
 
-          CI here builds without HRX. Before merging, on Strix Halo:
+          Our commits, rebased onto AMD's pin:
+          ${PATCHES}
+
+          CI here builds without HRX. Before merging, on Strix Halo (and \`test-backend-ops -b HRX0\`):
           \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && for d in vulkan hrx; do tests/serve_e2e.sh build/1bit <Qwen3-0.6B Q4_K_M .gguf> \$d; done\`"

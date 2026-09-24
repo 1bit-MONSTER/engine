@@ -3,7 +3,7 @@
   "url": "https://context7.com/1bit-monster/engine",
   "public_key": "pk_woGfNaBfmOKTjJDCp8JpR",
   "projectTitle": "1bit engine",
-  "description": "A C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI (Strix Halo): the XDNA 2 NPU, HRX and Vulkan on the Radeon iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.",
+  "description": "C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI: the XDNA 2 NPU, HRX and Vulkan on the iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple.",
   "folders": [
     "docs",
     "blog"

@@ -55,6 +55,7 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -285,7 +286,7 @@ private:
     std::atomic<int>* n_;
 };
 
-void forward(int port, std::atomic<int>* inflight, const std::string& our_id, bool drop_model,
+void forward(int port, std::atomic<int>* inflight, int draft_max, const std::string& our_id, bool drop_model,
              const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
     json body;
     try {
@@ -296,6 +297,8 @@ void forward(int port, std::atomic<int>* inflight, const std::string& our_id, bo
         return;
     }
     if (drop_model) body.erase("model");
+    // MTP by load: a request's own draft length wins; otherwise the router's (see post)
+    if (draft_max >= 0 && !body.contains("speculative.n_max")) body["speculative.n_max"] = draft_max;
     if (!set_model.empty()) body["model"] = set_model;
     const bool stream = body.value("stream", false);
     const std::string payload = body.dump();
@@ -337,6 +340,7 @@ struct Launch {
     std::vector<std::string> argv, env;
     bool drop_model = false;
     std::string set_model;
+    bool mtp = false;
 };
 
 // The backend process for one device: its command line and environment.
@@ -399,6 +403,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (!o.mtp.empty()) {
         // the MTP head drafts tokens on the same device; the model checks them in one batch
         if (device == "zinc" || device == "mlx") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
+        l.mtp = true;
         argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
@@ -461,7 +466,15 @@ int serve_child(const Options& o) {
                 if (inflight[i] < inflight[pick]) pick = i;
         }
         ++routed[pick];
-        forward(backends[pick].port, &inflight[pick], id, drop_model, set_model, q, r);
+        // MTP pays when a request has the GPU to itself and costs throughput once requests
+        // batch (docs/serve.md): full drafts alone, short ones beside 1-2 others, none past that.
+        int draft_max = -1;
+        if (!o.mtp.empty() && backends[pick].mtp) {
+            const int busy = inflight[pick];
+            const int full = o.mtp_max > 0 ? o.mtp_max : 3;
+            draft_max = busy == 0 ? full : busy <= 2 ? std::min(full, 2) : 0;
+        }
+        forward(backends[pick].port, &inflight[pick], draft_max, id, drop_model, set_model, q, r);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);

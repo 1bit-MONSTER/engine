@@ -106,6 +106,27 @@ prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
 
+## Many requests at once (`--parallel`)
+
+`--parallel N` gives llama-server N slots (`-np N`): requests that arrive together decode
+together, one read of the weights per step for all of them (continuous batching, what
+vLLM is built on). `--ctx-size` is split across the slots, so size it for all of them.
+
+Total decode tok/s with 1-16 simultaneous 256-token requests, 16 slots, 2026-09-24:
+
+| Requests | Qwen3.8-27B UD-Q4_K_XL, Vulkan | ... ROCm | Qwen3-Coder-30B-A3B Q4_K_M, Vulkan | ... ROCm |
+|---|---|---|---|---|
+| 1 | 11.8 | 11.6 | 85.7 | 67.6 |
+| 2 | 21.7 | 20.1 | 125.8 | 100.2 |
+| 4 | 36.9 | 30.2 | 182.4 | 140.3 |
+| 8 | **50.9** | 35.6 | **228.2** | 200.4 |
+| 16 | 42.9 | **68.0** | 202.9 | **318.9** |
+
+Vulkan peaks at 8 requests and falls back at 16; ROCm keeps scaling to 16, where it
+serves 5.8x (27B) and 3.7x (Coder) the best single stream. Use `--device vulkan` for up
+to about 8 concurrent users, `--device rocm --parallel 16` beyond that. Two backends
+decoding at once, by comparison, add 18% (docs/lean.md).
+
 ## Verified (Strix Halo, 2026-09-23)
 
 `tests/serve_e2e.sh` with Qwen3-0.6B: the Q4_K_M GGUF for the GPU devices and the Q4NX model directory for the NPU. The test checks `/health` 200,

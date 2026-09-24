@@ -28,6 +28,8 @@
 namespace onebit::npu {
 
 int Tensor::tiles() const {
+    // [tile rows, tile cols, chunk bytes] (Q4NX with Q4_K or Q8 chunks, npu/q4nx.h)
+    if (shape.size() == 3 && shape[0] > 0 && shape[1] > 0) return int(shape[0] * shape[1]);
     if (shape.size() != 2 || shape[0] <= 0) return 0;
     // A row is one tile only when it is 5120 bytes wide; narrower rows pack
     // several to a tile.

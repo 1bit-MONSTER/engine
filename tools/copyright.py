@@ -36,7 +36,7 @@ LINE_STYLES = [
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 
-EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico"]
+EXEMPT = ["third_party/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "tests/golden/*.bin", "tests/golden/*/*.bin", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico"]
 
 
 def _match(name, patterns):

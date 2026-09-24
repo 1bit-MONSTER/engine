@@ -34,7 +34,7 @@ Step 3 lands in three parts:
 
 ```
 <model dir>/
-  model.q4nx             weights (safetensors layout, I8 tiles of 5120 B)
+  model.q4nx             weights (safetensors layout, Q4NX tiles: "Q4NX chunks" below)
   config.json            Hugging Face config: dimensions, rope_theta, eos_token_id
   tokenizer.json         Hugging Face tokenizer
   npu/layer_ctx1.elf     layer kernel, instruction ELFs for context lengths 1, 2, 17
@@ -43,6 +43,24 @@ Step 3 lands in three parts:
   npu/lmhead.elf         lm-head kernel, instruction ELF
   npu/layer.pdi          the design both kernels run on
 ```
+
+### Q4NX chunks
+
+A Q4NX weight is a grid of 32-row x 256-column tiles, one chunk each, row-major over
+the grid. The chunk kind is the last dimension of the tensor's shape: `[tiles, 5120]`,
+or `[tile rows, tile cols, chunk bytes]` (`npu/q4nx.h` has the byte layouts).
+
+| Chunk | Kind | Weight | Seen in |
+|---|---|---|---|
+| 5120 B | q4_1: bf16 scale and zero per 32 columns of a row | `code * scale + zero` | Qwen3, Llama, Gemma, Phi models |
+| 4736 B | Q4_K: u8 scale and min per 32 columns, bf16 `S`, `M` per row | `S * scale * code + M * min` | Qwen3.5-4B projections |
+| 8704 B | Q8: bf16 scale per 32 columns, int8 codes | `d * code` | Qwen3.5-4B `lm_head` and embedding |
+
+`npu/q4nx.h` decodes all three, and repacks Q4_K into q4_1 (exact apart from rounding
+`S * scale` and `M * min` to bf16), so the lane and dx, which read q4_1, run Q4_K
+weights unchanged. Q8 does not fit q4_1. `tests/npu_q4nx_test.cpp` checks the decoders
+bit for bit against 1bit-MONSTER's verified decoders on real Qwen3.5-4B and Qwen3-0.6B
+tiles (committed in `tests/golden/q4nx`), and the repack against its rounding bound.
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
 OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its

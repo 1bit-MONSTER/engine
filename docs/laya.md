@@ -94,3 +94,14 @@ llama-server and zinc).
 
 `multilingual/` (mmBERT-base) and Apple/MLX routing are out of scope for this
 step.
+
+## Cost per decision
+
+`1bit route` prints the scorer's load and decision times on stderr. On Strix Halo
+(`laya-pinned` root checkpoint, candidates `vulkan,hrx,zinc`), loading takes 2.7 s
+once, and each decision takes **0.38 s** (it was 8.75 s). Only the encoder's layout
+changed. Its projections and GeGLU go through the threaded `linear()`, the attention runs
+one thread per (sequence, head), and `linear()` reads each weight row once per four input
+rows. Every sum keeps its order, so the gate output is byte-identical to the
+single-threaded scorer. `1bit serve --laya-model` pays the decision cost before each
+request starts generating.

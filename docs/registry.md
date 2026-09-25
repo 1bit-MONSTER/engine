@@ -53,12 +53,24 @@ included. The architecture recorded is the one the backend loads: the GGUF
 | GGUF architecture | Model | vulkan | hrx | zinc | npu |
 |---|---|---|---|---|---|
 | `qwen3` | Qwen3-0.6B | pass | pass | pass | pass |
-| `qwen2` | Qwen2.5-7B-Instruct | pass | pass | fails: no answer | |
+| `qwen2` | Qwen2.5-7B-Instruct | pass | pass | fails: crashes at load | |
 | `qwen3moe` | Qwen3-Coder-30B-A3B | pass | pass | pass | |
 | `qwen35moe` | Qwen3.6-35B-A3B Q8_0 | pass | pass | pass | |
 | `deepseek2` | GLM-4.7-Flash | pass | pass | not mapped | |
 | `minicpm` | MiniCPM4-8B | pass | pass | not mapped | |
-| `llama` | MiniCPM5-1B | pass | pass | fails: no answer | |
+| `llama` | MiniCPM5-1B | pass | pass | fails: empty reply | |
+
+Both ZINC failures come from upstream ZINC, pinned at `3a35e76`:
+- **Qwen2.5-7B crashes at load (exit 136, SIGFPE in RADV).** ZINC sizes its DMMV shaders'
+  shared-memory input buffer with the model's largest dimension. Qwen2.5-7B's
+  intermediate size is 18944, which needs 75,776 bytes, more than a workgroup's 64 KiB.
+- **MiniCPM5-1B gives an empty reply.** Its chat template opens with `{{- bos_token }}`,
+  which ZINC's built-in ChatML renderer drops. Without `<s>`, the model ends the turn at
+  once. llama.cpp renders the `<s>`, and the model answers.
+
+Both are fixed on `bong-water-water-bong/zinc` branch `fix/lds-clamp-and-template-bos`
+(`5453c19`). With it, all five ZINC rows pass and ZINC's own tests pass 635/635. The engine
+keeps pinning upstream ZINC until the fixes are there.
 
 GLM-4.7-Flash and Qwen3-Coder-30B-A3B failed on HRX until the llama.cpp pin `96f6b89` (#95).
 The pin fixes four things:

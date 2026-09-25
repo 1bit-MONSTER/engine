@@ -54,11 +54,16 @@ if ssh_vm true 2>/dev/null; then
 else
     echo "VM: no SSH"; ok=0
 fi
-# lavapipe compiles every shader on first use: the first start takes minutes in a VM
-for i in $(seq 300); do curl -sf 127.0.0.1:18000/v1/models >/dev/null 2>&1 && break; sleep 2; done
-reply=$(curl -s --max-time 300 127.0.0.1:18000/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)
+# 1bit serve answers /v1/models itself, before its backend is ready, and lavapipe compiles every
+# shader on first use (minutes in a VM): retry the chat request itself, for up to 10 minutes
+reply=
+for i in $(seq 60); do
+    reply=$(curl -s --max-time 120 127.0.0.1:18000/v1/chat/completions -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)
+    [ -n "$reply" ] && break
+    sleep 10
+done
 if [ -n "$reply" ]; then echo "1bit serve (Vulkan on the VM's CPU) answered: $reply"; else echo "1bit serve: no answer"; ok=0
     ssh_vm 'grep -i -E "error|fail|abort|assert|out of memory|what\\(\\)" /tmp/serve.log | head -12; echo ...; tail -4 /tmp/serve.log' 2>/dev/null || true; fi
 ssh_vm 'poweroff -f' 2>/dev/null || true

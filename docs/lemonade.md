@@ -52,18 +52,24 @@ through unchanged.
 The recipe lives in our Lemonade fork,
 [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade): upstream
 Lemonade plus the `onebit` backend (fork PR #1). Build `lemond` from the fork and
-put `1bit` on PATH (or set `$LEMONADE_ONEBIT_BIN`):
+put `1bit` on PATH (or set `$LEMONADE_ONEBIT_BIN`).
+
+The engine pins the Lemonade it is tested with: `third_party/lemonade` is the fork at a
+fixed commit. It is never linked into the engine. `scripts/build-lemonade.sh` builds
+`lemond` and the `lemonade` CLI from it:
 
 ```sh
-git clone https://github.com/1bit-MONSTER/lemonade && cd lemonade
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
-cmake --build build --target lemond lemonade
-LEMONADE_ONEBIT_BIN=/path/to/1bit build/lemond
+scripts/build-lemonade.sh ~/.cache/lemonade-pin
+LEMONADE_ONEBIT_BIN=$PWD/build/1bit ~/.cache/lemonade-pin/bin/lemond
 ```
+
+`.github/workflows/bump-lemonade.yml` opens a PR here when the fork's `main` moves (after
+the daily upstream sync below). Before merging, rebuild and rerun the LLM suite on Strix Halo.
 
 On Strix Halo the recipe passes Lemonade's own LLM test suite
 (`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX: 31 tests, 9 run,
-22 skipped as unsupported. It is not proposed upstream. The fork follows upstream daily:
+22 skipped as unsupported. It is not proposed upstream yet: the plan is to embed the engine fully
+in the fork first, then propose it upstream. The fork follows upstream daily:
 `.github/workflows/sync-lemonade-fork.yml` merges upstream `main` into it. It
 pushes only a clean merge that still registers `onebit`; otherwise it opens a PR
 in the fork that lists the conflicts. It also keeps the fork's own copies of

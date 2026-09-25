@@ -42,6 +42,7 @@ One model per process:
 | `POST /v1/completions` | |
 | `POST /v1/embeddings` | with `--embed` (RAG) |
 | `POST /v1/rerank` | with `--rerank` (RAG) |
+| `POST /v1/embeddings` or `/v1/rerank` | with `--embedding` or `--reranking`: the model itself is an embedding or reranking model |
 | `POST /v1/responses` | OpenAI Responses API, streamed or not (llama-server devices) |
 | `POST /tokenize`, `/detokenize`, `/apply-template` | llama-server devices |
 | `GET /slots`, `POST /slots/<id>?action=…`, `GET /props`, `GET /metrics` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
@@ -208,6 +209,12 @@ each from its own llama-server on Vulkan beside the chat model (`--embedding`,
 `--reranking`, 4 slots, the whole input in one batch). `/v1/models` lists them with their
 role. A RAG client embeds its documents, retrieves by cosine similarity, reranks the best
 few and asks the chat model with them as context, all against the one server:
+
+`--embedding` and `--reranking` serve the model itself in that role, as Lemonade loads
+embedding and reranking models: `1bit serve -m nomic-embed-text-v2-moe.Q8_0.gguf --embedding`.
+They run on `vulkan`, `hrx` or `rocm`. On Strix Halo, embeddings work on Vulkan and HRX
+(768-dimension vectors). Reranking works on Vulkan, but on HRX jina-reranker-v1-tiny fails:
+HRX's JIT can't link the fp32 matmul-with-bias kernel it needs. For now, rerank on Vulkan.
 
 ```sh
 1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mtp mtp-Qwen3.8-27B-Q4_0.gguf \

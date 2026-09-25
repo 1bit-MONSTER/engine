@@ -106,6 +106,7 @@ struct Options {
     bool adaptive = false;
     int adaptive_at = 1;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
+    std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::string npu_kernels, npu_transport;  // the lax decode's kernels and their transport
     std::string npu_snapshots;               // the lax decode's state snapshots kept
 };
@@ -471,6 +472,21 @@ int serve_child(const Options& o) {
         overflow.mtp.clear();       // batched requests gain little from drafting
         overflow.llama_server.clear();
         backends.push_back(launch_for(overflow, "rocm", free_port()));
+    } else if (!o.role.empty()) {
+        // The model is an embedding or reranking model (Lemonade loads them as models of their
+        // own): llama-server on the device asked for, in that role. An input is one pass, so
+        // the batch covers the context.
+        const std::string dev = o.device == "auto" ? "vulkan" : o.device;
+        if (dev != "vulkan" && dev != "hrx" && dev != "rocm")
+            throw std::runtime_error("--" + o.role + " runs on llama-server devices (vulkan, hrx, rocm), not " + dev);
+        if (o.adaptive || !o.mtp.empty() || !o.prefill_device.empty())
+            throw std::runtime_error("--" + o.role + " does not combine with --adaptive, --mtp or --prefill-device");
+        Launch l = launch_for(o, dev, free_port());
+        const std::string batch = std::to_string(o.ctx_size > 0 ? o.ctx_size : 8192);
+        for (const std::string& a : {std::string("--") + o.role, std::string("-b"), batch, std::string("-ub"), batch})
+            l.argv.push_back(a);
+        l.device = dev + " " + o.role;
+        backends.push_back(std::move(l));
     } else {
         backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
     }
@@ -567,6 +583,20 @@ int serve_child(const Options& o) {
             forward(rag[i].port, nullptr, -1, stem(model), true, "", q, r);
         };
     };
+    if (!o.role.empty()) {
+        auto h = [&](const httplib::Request& q, httplib::Response& r) {
+            if (!ready) {
+                r.status = 503;
+                r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
+                return;
+            }
+            forward(backends[0].port, nullptr, -1, id, true, "", q, r);
+        };
+        if (o.role == "embedding")
+            for (const char* path : {"/v1/embeddings", "/embeddings"}) srv.Post(path, h);
+        else
+            for (const char* path : {"/v1/rerank", "/rerank", "/v1/reranking", "/reranking"}) srv.Post(path, h);
+    }
     size_t next_rag = 0;
     if (!o.embed.empty()) {
         auto h = rag_route(next_rag++, o.embed);
@@ -639,6 +669,7 @@ void usage(FILE* out) {
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
+                 "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-kernels DIR] [--npu-transport elf|classic]   Qwen3.6-35B-A3B's lax kernels\n"
                  "                  [--npu-snapshots 4]   its DeltaNet state snapshots for chat follow-ups (70 MB each)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or Qwen3.6-35B-A3B's with the lax\n"
@@ -675,6 +706,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--adaptive") o.adaptive = true;
         else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
         else if (a == "--embed") o.embed = next();
+        else if (a == "--embedding" || a == "--embeddings") o.role = "embedding";
+        else if (a == "--reranking") o.role = "reranking";
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-kernels") o.npu_kernels = next();
         else if (a == "--npu-transport") o.npu_transport = next();

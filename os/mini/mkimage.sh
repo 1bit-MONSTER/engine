@@ -119,7 +119,7 @@ printf 'root:x:0:\n' > "$root/etc/group"
 printf '/bin/sh\n' > "$root/etc/shells"
 
 echo "== initramfs"
-(cd "$root" && find . -print0 | cpio --null -o -H newc --quiet) | zstd -q -19 -T0 > "$out/initramfs.img"
+(cd "$root" && find . -print0 | cpio --null -o -H newc -R 0:0 --quiet)   # every file owned by root | zstd -q -19 -T0 > "$out/initramfs.img"
 
 echo "== 1bit-os.efi (unified kernel image)"
 stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub

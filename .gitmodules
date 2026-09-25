@@ -70,3 +70,7 @@
 	url = https://github.com/1bit-MONSTER/ROCmFPX.git
 	shallow = true
 	branch = 1bit/vulkan-rocmi4
+[submodule "third_party/comfyui.cpp"]
+	path = third_party/comfyui.cpp
+	url = https://github.com/1bit-MONSTER/comfyui.cpp.git
+	branch = master

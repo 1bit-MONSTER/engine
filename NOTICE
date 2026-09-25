@@ -68,6 +68,16 @@ ZINC (third_party/zinc)
   Copyright (c) 2025 ZINC Contributors
   License: MIT
 
+ComfyUI.cpp (third_party/comfyui.cpp)
+  https://github.com/1bit-MONSTER/comfyui.cpp
+  A C++ port of ComfyUI (https://github.com/Comfy-Org/ComfyUI, Copyright (C)
+  Comfy Org and ComfyUI contributors, GPL-3.0).
+  License: GPL-3.0. ComfyUI.cpp is built as a separate program
+  (scripts/build-comfyui.sh) that `1bit comfy` runs as a child process; none of
+  its code is linked into this product. It links LibTorch (BSD-3-Clause) and
+  vendors stb (MIT / public domain), nlohmann/json (MIT) and the CLIP BPE
+  vocabulary (MIT).
+
 OpenFlowLM-Next open kernels (third_party/OpenFlowLM-Next; only open_kernels/ is built)
   https://github.com/bong-water-water-bong/OpenFlowLM-Next
   (a fork of https://github.com/Atomic-Germ/OpenFlowLM-Next)

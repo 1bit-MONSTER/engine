@@ -30,6 +30,7 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - MLX on Apple Silicon, through lemon-mlx-engine
 - Laya, which decides where each request runs
+- ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census
 
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),

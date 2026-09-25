@@ -46,6 +46,9 @@
 #include <string>
 #include <vector>
 
+#include <cerrno>
+#include <unistd.h>
+
 namespace {
 
 constexpr const char* kVersion = "0.0.1";
@@ -61,6 +64,7 @@ void usage(FILE* out) {
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
                  "  npu-lax [options]           Qwen3.6-35B-A3B on the NPU lax kernels (npu-lax --help)\n"
 #endif
+                 "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
                  "  version                     print the version\n"
                  "  help                        show this help\n");
 }
@@ -119,6 +123,29 @@ int run_npu(int argc, char** argv) {
 }
 #endif
 
+// ComfyUI.cpp is GPL-3.0 and a separate program: exec it, never link it (docs/comfyui.md).
+// The binary: $ONEBIT_COMFYUI, then this build's (-DONEBIT_COMFYUI=ON), then comfyui_cpp on PATH.
+int run_comfy(int argc, char** argv) {
+    if (argc < 1 || !std::strcmp(argv[0], "-h") || !std::strcmp(argv[0], "--help")) {
+        std::printf("usage: 1bit comfy <workflow.json>\n"
+                    "  runs a ComfyUI API-format workflow (SD1.5 txt2img/img2img, see docs/comfyui.md)\n");
+        return argc < 1 ? 2 : 0;
+    }
+    std::string bin;
+    if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) bin = e;
+#ifdef ONEBIT_COMFYUI_BIN
+    if (bin.empty() && std::filesystem::exists(ONEBIT_COMFYUI_BIN)) bin = ONEBIT_COMFYUI_BIN;
+#endif
+    if (bin.empty()) bin = "comfyui_cpp";
+    std::vector<char*> args{bin.data()};
+    for (int i = 0; i < argc; ++i) args.push_back(argv[i]);
+    args.push_back(nullptr);
+    ::execvp(args[0], args.data());
+    std::fprintf(stderr, "1bit comfy: cannot run %s: %s (build with -DONEBIT_COMFYUI=ON or set ONEBIT_COMFYUI)\n",
+                 bin.c_str(), std::strerror(errno));
+    return 127;
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
@@ -161,6 +188,7 @@ int main(int argc, char** argv) {
         }
     }
 #endif
+    if (cmd == "comfy") return run_comfy(argc - 2, argv + 2);
     if (cmd == "version" || cmd == "--version") {
         std::printf("1bit %s\n", kVersion);
         return 0;

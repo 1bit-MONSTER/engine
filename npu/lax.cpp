@@ -35,8 +35,10 @@
 #include <functional>
 #include <mutex>
 #include <optional>
+#include <span>
 #include <stdexcept>
 #include <thread>
+#include <utility>
 #include <vector>
 
 namespace onebit::npu::lax {
@@ -283,6 +285,31 @@ struct Decoder::Impl {
         }
     }
 
+    // The linear layers' state buffers, in layer order: what save_state/load_state copy.
+    size_t state_bytes() const {
+        return size_t(std::ranges::count(cfg.kinds, Kind::Linear)) * kStateBytes;
+    }
+
+    void save_state(uint8_t* out) {
+        for (int L = 0; L < cfg.layers; ++L) {
+            if (cfg.kinds[size_t(L)] != Kind::Linear) continue;
+            auto& b = *cache[size_t(L)];
+            b.sync(XCL_BO_SYNC_BO_FROM_DEVICE, kStateBytes, 0);
+            std::memcpy(out, b.map(), kStateBytes);
+            out += kStateBytes;
+        }
+    }
+
+    void load_state(const uint8_t* in) {
+        for (int L = 0; L < cfg.layers; ++L) {
+            if (cfg.kinds[size_t(L)] != Kind::Linear) continue;
+            auto& b = *cache[size_t(L)];
+            std::memcpy(b.map(), in, kStateBytes);
+            b.sync(XCL_BO_SYNC_BO_TO_DEVICE, kStateBytes, 0);
+            in += kStateBytes;
+        }
+    }
+
     void write_xres() { xres->sync(XCL_BO_SYNC_BO_TO_DEVICE, kHidden * 4, 0); }
 
     void wait(xrt::run& r, const char* what) {
@@ -391,6 +418,9 @@ void Decoder::set_residual(const float* v) {
 
 void Decoder::run(size_t pos, bool head) { p_->run(pos, head); }
 void Decoder::reset() { p_->reset(); }
+size_t Decoder::state_bytes() const { return p_->state_bytes(); }
+void Decoder::save_state(uint8_t* out) { p_->save_state(out); }
+void Decoder::load_state(const uint8_t* in) { p_->load_state(in); }
 
 int Decoder::argmax(int n) {
     const float* v = p_->read_logits();
@@ -423,23 +453,49 @@ int Session::pick(const GenerateOptions& opt, const std::vector<int>& history) {
     return int(std::max_element(buf_.begin(), buf_.end()) - buf_.begin());  // first maximum
 }
 
+Session::Session(Decoder& dec, int vocab, SessionOptions o)
+    : dec_(dec), vocab_(vocab), turn_tokens_(std::move(o.turn_tokens)), snaps_(o.snapshots) {}
+
 GenerateResult Session::generate(const std::vector<int>& prompt, const GenerateOptions& opt) {
     if (prompt.empty()) throw std::runtime_error("empty prompt");
+    if (prompt.size() + size_t(std::max(opt.max_tokens, 0)) > size_t(kMaxContext))
+        throw std::runtime_error("prompt plus max_tokens exceeds the context (" + std::to_string(kMaxContext) + ")");
     GenerateResult res;
-    // Reuse the cache only when the prompt extends it: the last prompt token must run
-    // anyway, for its logits.
-    const bool extends = !cache_.empty() && prompt.size() > cache_.size() &&
-                         std::equal(cache_.begin(), cache_.end(), prompt.begin());
-    if (!extends) {
-        if (!cache_.empty()) dec_.reset();
+    auto t0 = clk::now();
+    // The live cache, a snapshot or nothing: whichever leaves the fewest tokens to feed
+    // (npu/lax_turns.h). The last prompt token runs anyway, for its logits.
+    // After a failed request the device may be past cache_: then only a snapshot or a reset.
+    const Plan plan = lax::plan(dirty_ ? std::span<const int>{} : std::span<const int>(cache_), snaps_, prompt);
+    res.source = plan.source;
+    if (plan.source == Plan::Snapshot) {
+        const auto t = clk::now();
+        const auto& e = snaps_.at(size_t(plan.snapshot));
+        dec_.load_state(e.state.data());
+        cache_ = e.tokens;
+        snaps_.touch(size_t(plan.snapshot));
+        res.restore_ms = ms_since(t);
+    } else if (plan.source == Plan::Scratch) {
+        if (dirty_ || !cache_.empty()) dec_.reset();
         cache_.clear();
     }
     res.reused = cache_.size();
-    if (prompt.size() + size_t(std::max(opt.max_tokens, 0)) > size_t(kMaxContext))
-        throw std::runtime_error("prompt plus max_tokens exceeds the context (" + std::to_string(kMaxContext) + ")");
+    dirty_ = true;  // until this request completes: a throw may leave a token half run
 
-    auto t0 = clk::now();
+    const auto points = snapshot_points(prompt, cache_.size(), turn_tokens_);
+    auto snap = points.begin();
     for (size_t i = cache_.size(); i < prompt.size(); ++i) {
+        if (snap != points.end() && *snap == i) {
+            ++snap;
+            if (!snaps_.contains(cache_)) {
+                const auto t = clk::now();
+                if (auto* e = snaps_.put(cache_)) {
+                    e->state.resize(dec_.state_bytes());
+                    dec_.save_state(e->state.data());
+                    ++res.snapshots_taken;
+                }
+                res.snapshot_ms += ms_since(t);
+            }
+        }
         dec_.feed(prompt[i]);
         dec_.run(i, i + 1 == prompt.size());  // the head only where a next token is wanted
         cache_.push_back(prompt[i]);
@@ -461,6 +517,7 @@ GenerateResult Session::generate(const std::vector<int>& prompt, const GenerateO
         dec_.run(cache_.size(), true);
         cache_.push_back(t);
     }
+    dirty_ = false;
     res.decode_ms = ms_since(t0);
     return res;
 }

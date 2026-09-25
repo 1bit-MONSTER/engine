@@ -102,6 +102,7 @@ build/1bit npu-lax --model <model dir> --kernels ~/.cache/lax/kernels \
     "What is the capital of France? Answer in one sentence."
 build/1bit npu-lax --model <model dir> --kernels ~/.cache/lax/kernels --parity ~/.cache/lax-ref
 build/1bit npu-lax --model <model dir> --kernels ~/.cache/lax/kernels --bench 256 [--transport classic]
+build/1bit npu-lax --model <model dir> --kernels ~/.cache/lax/kernels --snapshot-check [--dump <dir>]
 flock <lockfile> ctest --test-dir build -R npu_lax --output-on-failure
 ```
 
@@ -124,7 +125,9 @@ The tests:
 | `npu_lax_elf` | The seven full-ELF position sites of `lax_a/insts.elf` against the investigation's (`tests/golden/npu_lax/lax_a_elf_sites.tsv`); the PDI-less position configs equal the PDI ones in every other section; with `-DONEBIT_NPU_LAX_ELF_GOLDEN=<dir>`, all seven full ELFs byte for byte against the ones the reference harness ran | the kernels |
 | `npu_lax_e2e` | `tests/npu_lax_cpp.sh`: on full ELFs, parity on three positions and again after a reset, then one chat turn that must answer with Paris | model, kernels, reference, the NPU |
 | `npu_lax_e2e_classic` | the same on the classic path | model, kernels, reference, the NPU |
-| `npu_lax_serve` | `tests/npu_lax_serve.sh`: `1bit serve --device npu` under strace; the chat answers "The capital of France is Paris.", twice, streams, and opens no `.xclbin` | model, kernels, the NPU |
+| `npu_lax_host` (also) | The chat follow-up bookkeeping (`npu/lax_turns.h`): the snapshot store's longest-proper-prefix match, LRU eviction and buffer reuse, the live-vs-snapshot plan, the snapshot points, and a three-turn chat replayed on a stand-in decoder whose state is a hash of the tokens fed | nothing (CI) |
+| `npu_lax_snapshot` | `1bit npu-lax --snapshot-check`: a DeltaNet state snapshot restored after a different continuation gives logits bit-identical to the same prefix fed from scratch, and a `Session` follow-up from it generates the same tokens (see "Chat follow-ups") | model, kernels, the NPU |
+| `npu_lax_serve` | `tests/npu_lax_serve.sh`: `1bit serve --device npu` under strace; the chat answers "The capital of France is Paris.", twice (the second from a snapshot), a chat follow-up reuses the first turn from a snapshot and answers Berlin, it streams with a usage chunk, and opens no `.xclbin` | model, kernels, the NPU |
 
 The reference hashes come from `model/lax_pack.py`'s `Model.build` at the pin. That
 path produces the bytes `lax_chat.py` streams into the device, and they equal
@@ -265,6 +268,90 @@ Speed, A/B in alternating runs of the same binary, host load average 1-5:
 Both transports generate the same text. Before the lookahead, building the next
 runlist after the submit cost 1.1-1.4 ms per token, as much as the ELF path saves.
 
+## Chat follow-ups (state snapshots)
+
+A chat client sends the whole history with every request. Qwen3.6's chat template
+re-renders each earlier answer without the think block it was generated after (with
+thinking off, without the empty `<think>\n\n</think>\n\n`), so a follow-up never extends
+the tokens on the device, and before this it started over at position 0.
+
+A position's cache has two parts:
+
+- **The KV rows** of the 10 full-attention layers (2048 B per position, `[K | V]`). A token
+  at position `pos` streams rows `0..pos-1` (the window length is `max(pos, 1)` rows; at 0
+  the one row is masked) and writes row `pos`. So after a jump back to any position, the
+  stale rows beyond it are overwritten before anything reads them.
+- **The DeltaNet state** of the 30 linear layers (recurrent S plus conv state, one
+  2,342,912 B buffer each). Every token is folded into it, so it cannot rewind.
+
+`lax::Session` (`npu/lax.h`, with the bookkeeping in `npu/lax_turns.{h,cpp}`) keeps
+**snapshots** of the DeltaNet state: `Decoder::save_state` copies the 30 buffers into host
+memory (70,287,360 B), and `load_state` copies them back. It takes a snapshot while a prompt
+is fed, at two prefixes:
+
+- **Before the prompt's last token.** This covers a retry of the same prompt, or a prompt
+  that extends it but not its answer.
+- **Before the prompt's last `<|im_start|>`**, the assistant header. A follow-up repeats
+  every message before it exactly.
+
+A request starts from whichever leaves the fewest tokens to feed:
+
+- the live cache, when the prompt extends the tokens on the device;
+- the longest snapshot whose tokens are a proper prefix of the prompt: load it, and continue
+  at the position of its length;
+- otherwise, a reset and position 0.
+
+The last prompt token always runs, for its logits. Snapshots are kept least recently used
+first out. `1bit serve --npu-snapshots N` sets how many (default 4, 281 MB; 0 turns them
+off). `usage.prompt_tokens_details.cached_tokens` reports the reused tokens, and
+`timings.cache` reports where they came from (`live` or `snapshot`).
+
+**Correctness** (`npu_lax_snapshot`, `1bit npu-lax --snapshot-check`):
+
+1. Feed P, then X from scratch, and keep X's logits.
+2. Reset, feed P and save the state. Feed a different continuation Y, which rewrites the
+   state, the layers' scratch and the KV rows at X's positions.
+3. Load the state and feed X at the same positions.
+
+X's logits must be the same bytes. Then the same runs through `Session`: P + Y, then
+P + X from the snapshot, must generate what P + X generates from scratch.
+
+Results on Strix Halo, 2026-09-24, with `model.q4nx` sha256 `688f1e153d10…3cf8de`, the
+kernels under "Full ELFs", and `build/1bit` from branch `npu/lax-turns`:
+
+- **Logits:** bit-identical at all 28 of X's positions. P was 17 tokens, X 28 and Y 23.
+  `--dump` wrote `scratch.bin` and `restored.bin` (27,811,840 B each), and `cmp` finds them
+  identical.
+- **Session:** the follow-up reused 17 tokens from the snapshot and generated the same 8
+  tokens ("The capital of Germany is Berlin.").
+- **Timing:** `save_state` took 4.7 ms and `load_state` 5.1 ms.
+
+Only the DeltaNet buffers need restoring. The layers' `act` scratch is left as Y wrote it,
+and the logits are still bit-identical.
+
+**A three-turn chat** (`tests/npu_lax_turns.py` against `1bit serve --device npu`): OpenAI
+messages with the whole history, each answer sent back as the client got it, thinking off,
+`max_tokens` 64, streamed with `stream_options.include_usage`. The first turn is a
+197-token prompt (trip notes and a question). Time to first token is measured by the
+client. Baseline `before`: `build/1bit` at `7c75672` (PR #52's head), which had no usage chunk
+in streams, so its times are the server's `timings.prompt_ms` from `--no-stream`. For the new
+binary those equal its streamed time to first token within 0.01 s. `--npu-snapshots 0` on
+the new binary matched the baseline to within 0.1 s.
+
+| Turn | Prompt tokens | Fed again before | Fed again after | Time to first token before | after |
+|---|---|---|---|---|---|
+| 1 | 197 | 197 | 197 | 9.50 s | 9.46 s |
+| 2 | 267 | 267 | **77** (190 from a snapshot) | 12.83 s | **3.78 s** |
+| 3 | 322 | 322 | **62** (260 from a snapshot) | 15.48 s | **3.09 s** |
+
+- **Output:** the answers are the same text before and after.
+- **Per request:** two snapshots cost 9-14 ms, and a restore 5 ms.
+- **Memory:** 4 snapshots take 281 MB of host memory (70.3 MB each). The serve process's
+  RSS was 22.26-22.28 GB with snapshots and 22.01 GB with `--npu-snapshots 0`.
+- **The tokens still fed:** each follow-up feeds the previous answer and the new question.
+  That answer was generated after a think header the history leaves out, so its state
+  cannot be reused.
+
 ## Results
 
 All results are on Strix Halo, using `model.q4nx` sha256 `688f1e153d10…3cf8de` (the
@@ -351,9 +438,12 @@ draws about 75-80 W less package power than GPU decode.
 - **Prompt processing.** Prompt tokens go through one position at a time. There is no
   batched prefill on the NPU.
 - **Memory.** A session pins about 22 GB of host memory in XRT buffers.
-- **Cache reuse across requests.** `1bit serve` continues the device's conversation only
-  when a request's tokens extend it exactly, because the DeltaNet state cannot rewind. A
-  raw prompt that does reuses the whole previous turn (31 of 49 tokens in
-  `tests/npu_lax_serve.sh`). A chat client's follow-up does not: Qwen3.6's template
-  renders earlier answers without the think block they were generated after, so it starts
-  over (0 of 45) and re-runs its prompt at about 21 tok/s.
+- **The previous answer is fed again.** A chat follow-up restores the snapshot taken before
+  the previous prompt's assistant header ("Chat follow-ups"). It then feeds the answer
+  again, re-rendered without its think block, plus the new question, at about 21 tok/s.
+  Reusing the answer's own state would need a snapshot at a position the re-rendered
+  history also reaches. No such position exists: the answer was generated after the
+  think header, and the re-rendered history leaves that header out.
+- **Snapshots live in host memory only.** They do not survive a restart. With the default
+  4, a client that switches between more than two conversations evicts the others'
+  snapshots.

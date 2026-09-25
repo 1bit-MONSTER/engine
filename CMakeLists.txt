@@ -182,7 +182,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/full_elf.cpp npu/lax_elf.cpp npu/lax_pack.cpp npu/lax_stream.cpp npu/model.cpp npu/pack.cpp npu/q4nx.cpp
+add_library(onebit_npu STATIC npu/full_elf.cpp npu/lax_elf.cpp npu/lax_pack.cpp npu/lax_stream.cpp npu/lax_turns.cpp npu/model.cpp npu/pack.cpp npu/q4nx.cpp
                             npu/tokenizer.cpp)
 # The lax packer's q8 -> q4_1 re-quantization must round every float32 step on its own,
 # as the reference packer's NumPy does (npu/lax_pack.h): no fused multiply-adds.
@@ -286,6 +286,11 @@ if(ONEBIT_NPU)
                          ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS} ${ONEBIT_NPU_LAX_REF} classic)
     endif()
     if(ONEBIT_NPU_LAX_MODEL AND ONEBIT_NPU_LAX_KERNELS)
+        # A DeltaNet state snapshot restored after another continuation gives the logits of the
+        # same prefix fed from scratch, bit for bit; a Session follow-up from it, the same tokens.
+        add_test(NAME npu_lax_snapshot
+                 COMMAND onebit npu-lax --model ${ONEBIT_NPU_LAX_MODEL} --kernels ${ONEBIT_NPU_LAX_KERNELS}
+                         --snapshot-check)
         # `1bit serve --device npu` on the 35B: the route, one chat round trip, no xclbin opened.
         add_test(NAME npu_lax_serve
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_serve.sh $<TARGET_FILE:onebit>

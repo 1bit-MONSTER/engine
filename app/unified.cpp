@@ -24,8 +24,10 @@
 //   POST /v1/completions        raw prompt
 //
 // Requests run one at a time: the device holds one cache. The fast lane rewrites it from
-// position 0 per request; the lax decode continues it when a request extends the last
-// one's tokens exactly, and starts over otherwise.
+// position 0 per request. The lax decode continues it when a request extends the last
+// one's tokens exactly, or restores a snapshot of the DeltaNet state taken at an earlier
+// prompt's prefix (--snapshots, npu/lax_turns.h): a chat follow-up re-feeds only the turns
+// after the one its history last diverged in. It starts over otherwise.
 #include "unified.h"
 
 #include "generate.h"
@@ -68,9 +70,12 @@ struct Engine {
     bool open_think = false;       // Qwen3.6's template opens "<think>\n" when thinking is on
     std::mutex mu;
 
-    // reused: prompt tokens already on the device (the lax decode's conversation).
-    npu::GenerateResult generate(const std::vector<int>& ids, const npu::GenerateOptions& opt, size_t& reused) {
+    // reused: prompt tokens already on the device (the lax decode's conversation); cache:
+    // where from ("live", "snapshot"), empty when none.
+    npu::GenerateResult generate(const std::vector<int>& ids, const npu::GenerateOptions& opt, size_t& reused,
+                                 std::string& cache) {
         reused = 0;
+        cache.clear();
         if (lane) return npu::generate(*lane, *model, ids, opt);
         npu::lax::GenerateOptions lo;
         lo.max_tokens = opt.max_tokens;
@@ -85,6 +90,13 @@ struct Engine {
         out.decode_ms = r.decode_ms;
         out.stopped_at_eos = r.stopped_at_eos;
         reused = r.reused;
+        if (r.source != npu::lax::Plan::Scratch) cache = r.source == npu::lax::Plan::Live ? "live" : "snapshot";
+        if (r.source == npu::lax::Plan::Snapshot || r.snapshots_taken)
+            std::fprintf(stderr, "1bit unified: %zu of %zu prompt tokens from %s (restore %.1f ms), %d snapshot%s taken "
+                                 "(%.1f ms), %zu kept (%.0f MB)\n",
+                         r.reused, ids.size(), cache.empty() ? "nothing" : cache.c_str(), r.restore_ms, r.snapshots_taken,
+                         r.snapshots_taken == 1 ? "" : "s", r.snapshot_ms, session->snapshots().size(),
+                         double(session->snapshots().bytes()) / 1e6);
         return out;
     }
 };
@@ -155,6 +167,9 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     opt.max_tokens = body.value("max_completion_tokens", body.value("max_tokens", 1024));
     opt.repetition_penalty = body.value("repetition_penalty", e.default_penalty);
     const bool stream = body.value("stream", false);
+    // stream_options.include_usage: a last chunk with no choices carries the usage, as OpenAI's.
+    const bool stream_usage = stream && body.contains("stream_options") && body["stream_options"].is_object() &&
+                              body["stream_options"].value("include_usage", false);
     const std::string id = now_id(chat ? "chatcmpl-" : "cmpl-");
     const long created = long(std::chrono::duration_cast<std::chrono::seconds>(
                                   std::chrono::system_clock::now().time_since_epoch()).count());
@@ -177,9 +192,10 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
             return on_text(out);
         };
         size_t reused = 0;
-        auto r = e.generate(ids, opt, reused);
+        std::string cache;
+        auto r = e.generate(ids, opt, reused, cache);
         if (!pending.empty()) on_text(pending);
-        return std::make_tuple(r, ids.size(), reused);
+        return std::make_tuple(r, ids.size(), reused, cache);
     };
     // By value: for a stream, httplib calls the content provider after this
     // handler has returned.
@@ -190,14 +206,38 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         return "data: " + c.dump() + "\n\n";
     };
 
+    auto usage = [](const npu::GenerateResult& r, size_t n_prompt, size_t n_cached) {
+        const size_t completion = r.tokens.size() - (r.stopped_at_eos ? 1 : 0);
+        return json{{"prompt_tokens", n_prompt},
+                    {"completion_tokens", completion},
+                    {"total_tokens", n_prompt + completion},
+                    {"prompt_tokens_details", {{"cached_tokens", n_cached}}}};
+    };
+    auto timings = [](const npu::GenerateResult& r, const std::string& cache) {
+        json t{{"prompt_ms", r.prefill_ms},
+               {"predicted_ms", r.decode_ms},
+               {"predicted_per_second", r.tokens.empty() ? 0.0 : 1000.0 * double(r.tokens.size()) / r.decode_ms}};
+        if (!cache.empty()) t["cache"] = cache;
+        return t;
+    };
+
     if (stream) {
-        res.set_chunked_content_provider("text/event-stream", [run, chunk](size_t, httplib::DataSink& sink) mutable {
+        res.set_chunked_content_provider("text/event-stream", [run, chunk, usage, timings, stream_usage, id, object, created,
+                                                               model = e.id](size_t, httplib::DataSink& sink) mutable {
             try {
-                auto [r, n_prompt, n_cached] = run([&](const std::string& t) {
+                auto [r, n_prompt, n_cached, cache] = run([&](const std::string& t) {
                     const std::string c = chunk(t, nullptr);
                     return sink.write(c.data(), c.size());
                 });
-                const std::string end = chunk("", r.stopped_at_eos ? "stop" : "length") + "data: [DONE]\n\n";
+                std::string end = chunk("", r.stopped_at_eos ? "stop" : "length");
+                if (stream_usage) {
+                    const json u{{"id", id},       {"object", object},
+                                 {"created", created}, {"model", model},
+                                 {"choices", json::array()}, {"usage", usage(r, n_prompt, n_cached)},
+                                 {"timings", timings(r, cache)}};
+                    end += "data: " + u.dump() + "\n\n";
+                }
+                end += "data: [DONE]\n\n";
                 sink.write(end.data(), end.size());
             } catch (const std::exception& ex) {
                 const std::string err = "data: " + json{{"error", {{"message", ex.what()}}}}.dump() + "\n\n";
@@ -210,24 +250,18 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     }
     try {
         std::string text;
-        auto [r, n_prompt, n_cached] = run([&](const std::string& t) {
+        auto [r, n_prompt, n_cached, cache] = run([&](const std::string& t) {
             text += t;
             return true;
         });
-        const size_t completion = r.tokens.size() - (r.stopped_at_eos ? 1 : 0);
         json out{{"id", id}, {"object", object}, {"created", created}, {"model", e.id}};
         const char* finish = r.stopped_at_eos ? "stop" : "length";
         out["choices"] = json::array({chat ? json{{"index", 0},
                                                   {"message", {{"role", "assistant"}, {"content", text}}},
                                                   {"finish_reason", finish}}
                                            : json{{"index", 0}, {"text", text}, {"finish_reason", finish}}});
-        out["usage"] = {{"prompt_tokens", n_prompt},
-                        {"completion_tokens", completion},
-                        {"total_tokens", n_prompt + completion},
-                        {"prompt_tokens_details", {{"cached_tokens", n_cached}}}};
-        out["timings"] = {{"prompt_ms", r.prefill_ms},
-                          {"predicted_ms", r.decode_ms},
-                          {"predicted_per_second", r.tokens.empty() ? 0.0 : 1000.0 * double(r.tokens.size()) / r.decode_ms}};
+        out["usage"] = usage(r, n_prompt, n_cached);
+        out["timings"] = timings(r, cache);
         res.set_content(out.dump(), "application/json");
     } catch (const std::exception& ex) {
         res.status = 500;
@@ -287,7 +321,7 @@ bool is_npu_model_dir(const std::string& dir, const std::string& lax_kernels) {
 
 int run_unified(int argc, char** argv) {
     std::string model_dir, host = "127.0.0.1", alias, kernels, transport = "elf";
-    int port = 8000;
+    int port = 8000, snapshots = 4;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -300,17 +334,21 @@ int run_unified(int argc, char** argv) {
         else if (a == "--alias") alias = next();
         else if (a == "--kernels") kernels = next();
         else if (a == "--transport") transport = next();
+        else if (a == "--snapshots") snapshots = std::stoi(next());
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
-                        "                    [--kernels DIR] [--transport elf|classic]\n"
+                        "                    [--kernels DIR] [--transport elf|classic] [--snapshots 4]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
                         "              npu/ (its kernels); Qwen3.6-35B-A3B runs on the lax kernels in --kernels,\n"
                         "              else <model dir>/npu/lax, else $ONEBIT_NPU_LAX_KERNELS (docs/npu-lax.md)\n"
-                        "  --transport the lax kernels as full ELFs (default) or classic xclbin, for A/B\n");
+                        "  --transport the lax kernels as full ELFs (default) or classic xclbin, for A/B\n"
+                        "  --snapshots DeltaNet state snapshots the lax decode keeps in host memory for chat\n"
+                        "              follow-ups (70 MB each; 0: only exact extensions reuse the cache)\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
     if (model_dir.empty()) throw std::runtime_error("-m <model dir> is required");
+    if (snapshots < 0) throw std::runtime_error("--snapshots must be 0 or more");
     // Lemonade hands over the checkpoint path, which may name the container file.
     if (std::filesystem::is_regular_file(model_dir)) model_dir = std::filesystem::path(model_dir).parent_path().string();
 
@@ -365,15 +403,22 @@ int run_unified(int argc, char** argv) {
         const std::string k = lax_kernel_dir(model_dir, kernels);
         e.lax_cfg = std::make_unique<npu::lax::Config>(npu::lax::Config::from_model(*e.model, model_dir));
         e.lax = std::make_unique<npu::lax::Decoder>(*e.model, *e.lax_cfg, k, npu::lax::parse_transport(transport));
-        e.session = std::make_unique<npu::lax::Session>(*e.lax, e.tok->size());  // rows past the tokenizer are padding
         for (const char* s : {"<|im_end|>", "<|endoftext|>"}) {
             const auto ids = e.tok->encode(s);
             if (ids.size() == 1) e.lax_stop.push_back(ids[0]);
         }
+        // Snapshots before each prompt's last <|im_start|>: a follow-up repeats every message
+        // before the answer it re-renders.
+        npu::lax::SessionOptions so;
+        so.snapshots = size_t(snapshots);
+        if (const auto ids = e.tok->encode("<|im_start|>"); ids.size() == 1) so.turn_tokens = ids;
+        // Rows past the tokenizer are padding.
+        e.session = std::make_unique<npu::lax::Session>(*e.lax, e.tok->size(), std::move(so));
         e.max_context = npu::lax::kMaxContext;
         e.default_penalty = 1.0f;
         e.open_think = true;
-        std::fprintf(stderr, "1bit unified: Qwen3.6-35B-A3B on the lax decode (%s)\n", e.lax->kernels().c_str());
+        std::fprintf(stderr, "1bit unified: Qwen3.6-35B-A3B on the lax decode (%s); up to %d state snapshots of %.0f MB\n",
+                     e.lax->kernels().c_str(), snapshots, double(e.lax->state_bytes()) / 1e6);
     } else {
         const std::string type = e.model->dims().model_type;
         if (type != "qwen3" && type != "qwen2")

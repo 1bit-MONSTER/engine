@@ -23,6 +23,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <cstring>
 #include <fstream>
 #include <iostream>
 #include <numeric>
@@ -96,12 +97,94 @@ int single_id(const npu::Tokenizer& tok, const char* text) {
     return ids[0];
 }
 
+// --snapshot-check (docs/npu-lax.md, "Chat follow-ups"): prefix P, continuation X, and a
+// different continuation Y. From scratch: P + X, with X's logits. Restored: P, save the
+// DeltaNet state, Y (which rewrites the state and the KV rows at X's positions), load the
+// state, X again at the same positions. X's logits must be the same bytes. Then the same
+// through lax::Session: P + Y generated, then P + X from the snapshot taken before Y,
+// which must generate what P + X generates from scratch.
+int snapshot_check_mode(lax::Decoder& dec, const std::string& model_dir, const std::string& dump) {
+    const npu::Tokenizer tok(model_dir + "/tokenizer.json");
+    const auto P = tok.encode("<|im_start|>user\nWhat is the capital of France? Answer in one sentence.<|im_end|>\n");
+    const auto X = tok.encode("<|im_start|>assistant\nThe capital of France is Paris.<|im_end|>\n<|im_start|>user\n"
+                              "And of Germany?<|im_end|>\n<|im_start|>assistant\n<think>\n\n</think>\n\n");
+    const auto Y = tok.encode("<|im_start|>assistant\n<think>\nThe user asks about France, whose capital is Paris.\n"
+                              "</think>\n\nParis.<|im_end|>\n");
+    std::printf("P %zu tokens, X %zu, Y %zu; state %zu bytes\n", P.size(), X.size(), Y.size(), dec.state_bytes());
+    std::vector<float> lg;
+    auto feed = [&](const std::vector<int>& t, size_t pos, std::vector<float>* out) {
+        for (size_t i = 0; i < t.size(); ++i) {
+            dec.feed(t[i]);
+            dec.run(pos + i, out != nullptr);
+            if (out) {
+                dec.logits(lg);
+                out->insert(out->end(), lg.begin(), lg.end());
+            }
+        }
+    };
+    std::vector<float> scratch, restored;
+    dec.reset();
+    feed(P, 0, nullptr);
+    feed(X, P.size(), &scratch);
+
+    dec.reset();
+    feed(P, 0, nullptr);
+    std::vector<uint8_t> state(dec.state_bytes());
+    auto t0 = clk::now();
+    dec.save_state(state.data());
+    const double save_ms = sec_since(t0) * 1000;
+    feed(Y, P.size(), nullptr);
+    t0 = clk::now();
+    dec.load_state(state.data());
+    const double load_ms = sec_since(t0) * 1000;
+    feed(X, P.size(), &restored);
+    std::printf("save_state %.1f ms, load_state %.1f ms\n", save_ms, load_ms);
+    if (!dump.empty()) {
+        for (auto [name, v] : {std::pair{"scratch", &scratch}, std::pair{"restored", &restored}})
+            std::ofstream(dump + "/" + name + ".bin", std::ios::binary)
+                .write(reinterpret_cast<const char*>(v->data()), std::streamsize(v->size() * 4));
+    }
+    const size_t row = scratch.size() / X.size();
+    bool all = scratch.size() == restored.size();
+    size_t same = 0;
+    for (size_t i = 0; all && i < X.size(); ++i)
+        same += std::memcmp(scratch.data() + i * row, restored.data() + i * row, row * 4) == 0;
+    all = all && same == X.size();
+    std::printf("restored snapshot: logits at X's %zu positions bit-identical to P + X from scratch: %zu of %zu %s\n",
+                X.size(), same, X.size(), all ? "PASS" : "FAIL");
+
+    // The same through Session, as serve drives it: a turn token makes the snapshot at P.
+    const int vocab = tok.size();
+    lax::GenerateOptions opt;
+    opt.max_tokens = 12;
+    opt.stop = {single_id(tok, "<|im_end|>"), single_id(tok, "<|endoftext|>")};
+    auto cat = [](std::vector<int> a, const std::vector<int>& b) {
+        a.insert(a.end(), b.begin(), b.end());
+        return a;
+    };
+    lax::Session plain(dec, vocab, {.snapshots = 0});
+    const auto want = plain.generate(cat(P, X), opt);
+    lax::Session s(dec, vocab, {.snapshots = 2, .turn_tokens = {single_id(tok, "<|im_start|>")}});
+    s.generate(cat(P, Y), opt);
+    const auto got = s.generate(cat(P, X), opt);
+    const bool ok = got.tokens == want.tokens && got.source == lax::Plan::Snapshot && got.reused == P.size();
+    std::printf("session: P + X after P + Y reused %zu tokens (%s, restore %.1f ms); generated %s the %zu tokens from "
+                "scratch (\"%s\") %s\n",
+                got.reused, got.source == lax::Plan::Snapshot ? "snapshot" : "not a snapshot", got.restore_ms,
+                got.tokens == want.tokens ? "=" : "!=", want.tokens.size(), tok.decode(want.tokens).c_str(),
+                ok ? "PASS" : "FAIL");
+    all = all && ok;
+    std::printf("%s\n", all ? "PASS" : "FAIL");
+    return all ? 0 : 1;
+}
+
 }  // namespace
 
 int run_npu_lax(int argc, char** argv) {
     const auto t_start = clk::now();
     std::string model_dir, kernel_dir, parity, dump;
     int max_new = 256, tokens = 3, threads = 0, bench = 0;
+    bool snapshot_check = false;
     lax::Transport transport = lax::Transport::Elf;
     std::vector<std::string> prompts;
     for (int i = 0; i < argc; ++i) {
@@ -119,11 +202,13 @@ int run_npu_lax(int argc, char** argv) {
         else if (a == "--dump") dump = next();
         else if (a == "--transport") transport = lax::parse_transport(next());
         else if (a == "--bench") bench = std::stoi(next());
+        else if (a == "--snapshot-check") snapshot_check = true;
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "usage: 1bit npu-lax --model <dir> --kernels <dir> [-n 256] [--threads N] [\"prompt\" ...]\n"
                 "       1bit npu-lax --model <dir> --kernels <dir> --parity <ref dir> [--tokens 3] [--dump <dir>]\n"
                 "       1bit npu-lax --model <dir> --kernels <dir> --bench N\n"
+                "       1bit npu-lax --model <dir> --kernels <dir> --snapshot-check [--dump <dir>]\n"
                 "  --model      Qwen3.6-35B-A3B Q4NX directory (model.q4nx, config.json, tokenizer.json)\n"
                 "  --kernels    scripts/build-lax.sh's <prefix>/kernels (lax_l, lax_a, ln, lm_head_q8)\n"
                 "  --transport  elf (full ELFs, the default) or classic (xclbin + insts.bin)\n"
@@ -132,6 +217,10 @@ int run_npu_lax(int argc, char** argv) {
                 "               again after reset(), which must give the same logits bit for bit\n"
                 "  --bench      N tokens at positions 0..N-1, twice (new and cached position configs);\n"
                 "               prints the mean host prep, 40-layer and head times\n"
+                "  --snapshot-check  a DeltaNet state snapshot restored after another continuation must\n"
+                "               give the logits of the same prefix fed from scratch, bit for bit; and a\n"
+                "               Session follow-up from a snapshot the tokens of one from scratch\n"
+                "               (--dump: scratch.bin / restored.bin, the continuation's logits, for cmp)\n"
                 "Without prompts, reads one prompt per line from stdin; the conversation is one session.\n");
             return 0;
         } else if (!a.empty() && a[0] == '-') throw std::runtime_error("unknown option " + a);
@@ -181,6 +270,8 @@ int run_npu_lax(int argc, char** argv) {
         std::printf("%s\n", all ? "PASS" : "FAIL");
         return all ? 0 : 1;
     }
+
+    if (snapshot_check) return snapshot_check_mode(dec, model_dir, dump);
 
     if (bench > 0) {
         const npu::Tokenizer tok(model_dir + "/tokenizer.json");

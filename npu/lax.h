@@ -26,8 +26,11 @@
 
 #include "lax_kernels.h"
 #include "lax_pack.h"
+#include "lax_turns.h"
 #include "model.h"
 
+#include <cstddef>
+#include <cstdint>
 #include <functional>
 #include <memory>
 #include <string>
@@ -69,6 +72,13 @@ public:
     // Start a new sequence at position 0: zero the DeltaNet state (the KV cache needs no
     // clearing). Construction leaves the decoder in this state.
     void reset();
+    // The DeltaNet state (each linear layer's recurrent + conv state; state_bytes() in all),
+    // to host memory and back: what a position's cache holds besides the KV rows, which the
+    // positions after it overwrite before any reads them. After load_state, run from the
+    // position the state was saved at.
+    size_t state_bytes() const;
+    void save_state(uint8_t* out);
+    void load_state(const uint8_t* in);
     // The last head's logits: argmax over the first n (first maximum wins), or all rows.
     int argmax(int n);
     void logits(std::vector<float>& out);
@@ -92,23 +102,37 @@ struct GenerateResult {
     std::vector<int> tokens;
     double prefill_ms = 0, decode_ms = 0;
     bool stopped_at_eos = false;
-    size_t reused = 0;  // prompt tokens already in the cache
+    size_t reused = 0;              // prompt tokens not fed again
+    Plan::Source source = Plan::Scratch;  // where they came from
+    double restore_ms = 0;          // loading the snapshot (part of prefill_ms)
+    double snapshot_ms = 0;         // taking snapshots (part of prefill_ms)
+    int snapshots_taken = 0;
 };
 
-// One conversation on the decoder: what the cache holds. A prompt that extends it
-// continues from there; any other prompt starts over (Decoder::reset), because the
-// DeltaNet state cannot rewind. Greedy (first maximum over the tokenizer's vocab).
+struct SessionOptions {
+    size_t snapshots = 4;          // DeltaNet state snapshots kept (Decoder::state_bytes() each); 0: none
+    std::vector<int> turn_tokens;  // a snapshot is also taken before the last of these in a prompt
+};
+
+// One conversation on the decoder (npu/lax_turns.h): what the cache holds, and snapshots of
+// the DeltaNet state at earlier prompts' prefixes. A prompt continues from the one of them
+// that leaves the fewest tokens to feed; with none, it starts over (Decoder::reset).
+// Greedy (first maximum over the tokenizer's vocab).
 class Session {
 public:
-    Session(Decoder& dec, int vocab) : dec_(dec), vocab_(vocab) {}
+    Session(Decoder& dec, int vocab, SessionOptions o = {});
     GenerateResult generate(const std::vector<int>& prompt, const GenerateOptions& opt);
     size_t cached() const { return cache_.size(); }
+    const Snapshots& snapshots() const { return snaps_; }
 
 private:
     int pick(const GenerateOptions& opt, const std::vector<int>& history);
     Decoder& dec_;
     int vocab_;
+    std::vector<int> turn_tokens_;
+    Snapshots snaps_;
     std::vector<int> cache_;  // the tokens at positions 0..n-1
+    bool dirty_ = true;       // the decoder may hold a sequence cache_ does not describe
     std::vector<float> buf_;
 };
 

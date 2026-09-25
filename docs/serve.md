@@ -29,7 +29,7 @@ OpenAI client.
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
-           [--npu-kernels DIR] [--npu-transport elf|classic]
+           [--npu-kernels DIR] [--npu-transport elf|classic] [--npu-snapshots N]
 ```
 
 One model per process:
@@ -61,8 +61,21 @@ The lax decode needs the kernels `scripts/build-lax.sh` builds (docs/npu-lax.md,
 directory"). `serve` looks for them in `--npu-kernels DIR`, else `<model dir>/npu/lax`, else
 `$ONEBIT_NPU_LAX_KERNELS`; a Qwen3.6-35B-A3B directory without them is not an NPU model
 directory. `--npu-transport classic` runs the same kernels through the xclbin path, for A/B.
-The decode keeps one conversation on the device: a request whose prompt extends the last
-one's tokens continues it, any other starts over at position 0.
+The decode keeps one conversation on the device, and snapshots of its DeltaNet state in
+host memory (docs/npu-lax.md, "Chat follow-ups"). A request starts from whichever leaves
+the fewest tokens to feed:
+
+- the device's tokens, when its prompt extends them;
+- a snapshot at a prefix of its prompt. Snapshots are taken before each prompt's last
+  token and before its last `<|im_start|>`, so a chat client's follow-up re-feeds only the
+  previous answer and the new question;
+- otherwise, position 0.
+
+`--npu-snapshots N` keeps up to N snapshots, 70 MB each (default 4; 0 reuses only exact
+extensions). `usage.prompt_tokens_details.cached_tokens` counts the reused tokens, and
+`timings.cache` says where they came from (`live` or `snapshot`). On this route a streamed
+request with `stream_options.include_usage` gets a last chunk with `usage` and `timings`,
+as OpenAI's API sends it.
 
 ```sh
 1bit serve -m ~/models/Qwen3.6-35B-A3B-NPU2 --device npu --npu-kernels ~/.cache/lax/kernels
@@ -249,6 +262,21 @@ sha256 `688f1e153d10…3cf8de`:
 - The same follow-up sent as chat messages reuses none of its 45 tokens, because the
   template renders the earlier answer without its think block.
 - 15 SSE chunks stream, and no `.xclbin` is opened (the four `insts.elf` are).
+
+PASS.
+
+With state snapshots, on the same day and model, `build/1bit` from branch `npu/lax-turns`
+gave the results in the list below. docs/npu-lax.md ("Chat follow-ups") has the three-turn chat: time to first
+token went from 12.83 s to 3.78 s (turn 2) and from 15.48 s to 3.09 s (turn 3).
+
+- The same request again restores the snapshot before its last token: 23 of 24 tokens are
+  cached, the prompt takes 66 ms instead of 1172 ms, and the answer is the same.
+- The chat follow-up reuses 17 of its 45 tokens from the snapshot before the first prompt's
+  assistant header (`timings.cache` `snapshot`). It answers "The capital of Germany is
+  Berlin."
+- The raw prompt that extends a turn still reuses all 31 of that turn's tokens from the live
+  cache.
+- A streamed request with `stream_options.include_usage` ends with the usage chunk.
 
 PASS.
 

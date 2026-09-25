@@ -41,6 +41,12 @@
 // synthetic instruction ELF: which words and addends move, their values at a position,
 // the flag bit kept until assemble_full_elf clears it, and the malformed inputs refused.
 //
+// CI also runs the chat follow-up bookkeeping (npu/lax_turns.h): the snapshot store's
+// longest-proper-prefix match, LRU eviction and buffer reuse, the live-vs-snapshot plan,
+// the snapshot points, and a three-turn chat replayed on a stand-in decoder whose state is
+// a hash of the tokens fed: every restored snapshot must equal that prefix fed from
+// scratch, and each follow-up must reuse the whole history up to its earlier answer.
+//
 // --elf: the position sites of the kernel directory's lax_a/insts.elf equal the tsv (the
 // investigation's attn_sites for the same build); with --golden, every full ELF
 // (npu/lax_elf.h) is byte-identical to the one the reference harness assembled and ran
@@ -49,14 +55,17 @@
 #include "lax_elf.h"
 #include "lax_pack.h"
 #include "lax_stream.h"
+#include "lax_turns.h"
 
 #include <algorithm>
 #include <atomic>
+#include <cstdint>
 #include <cstdio>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
+#include <span>
 #include <mutex>
 #include <sstream>
 #include <string>
@@ -265,6 +274,165 @@ void elf_sites_unit() {
           "ELF: an addend that disagrees with its DDR_PATCH word is refused");
 }
 
+// A stand-in for the decoder: its "DeltaNet state" is an FNV-1a hash of the tokens fed,
+// so a restored snapshot is right exactly when it equals the hash of its prefix.
+struct FakeDecoder {
+    uint64_t h = 1469598103934665603ull;
+    size_t fed = 0;
+    void reset() { *this = {}; }
+    void feed(int t) {
+        h = (h ^ uint64_t(uint32_t(t))) * 1099511628211ull;
+        ++fed;
+    }
+    static uint64_t of(std::span<const int> t) {
+        FakeDecoder d;
+        for (int x : t) d.feed(x);
+        return d.h;
+    }
+};
+
+// Session::generate's cache handling (npu/lax.cpp) on the stand-in: returns tokens reused.
+struct FakeSession {
+    FakeDecoder dec;
+    Snapshots snaps;
+    std::vector<int> cache, turn;
+    bool restored_ok = true;
+    size_t generate(const std::vector<int>& prompt, const std::vector<int>& answer) {
+        const Plan p = plan(cache, snaps, prompt);
+        if (p.source == Plan::Snapshot) {
+            const auto& e = snaps.at(size_t(p.snapshot));
+            std::memcpy(&dec.h, e.state.data(), 8);
+            dec.fed = e.tokens.size();
+            cache = e.tokens;
+            snaps.touch(size_t(p.snapshot));
+            restored_ok = restored_ok && dec.h == FakeDecoder::of(cache);
+        } else if (p.source == Plan::Scratch) {
+            dec.reset();
+            cache.clear();
+        }
+        const size_t reused = cache.size();
+        const auto pts = snapshot_points(prompt, cache.size(), turn);
+        auto s = pts.begin();
+        for (size_t i = cache.size(); i < prompt.size(); ++i) {
+            if (s != pts.end() && *s == i && (++s, !snaps.contains(cache)))
+                if (auto* e = snaps.put(cache)) {
+                    e->state.resize(8);
+                    std::memcpy(e->state.data(), &dec.h, 8);
+                }
+            dec.feed(prompt[i]);
+            cache.push_back(prompt[i]);
+        }
+        // The answer: every generated token but the last is fed (the last only picked).
+        for (size_t i = 0; i + 1 < answer.size(); ++i) {
+            dec.feed(answer[i]);
+            cache.push_back(answer[i]);
+        }
+        return reused;
+    }
+};
+
+void turns_unit() {
+    using V = std::vector<int>;
+    Snapshots s(2);
+    auto put = [&](const V& t, uint8_t tag) {
+        auto* e = s.put(t);
+        e->state.assign(4, tag);
+        return e;
+    };
+    check(s.best(V{1, 2, 3}) == -1, "snapshots: none kept, no match");
+    put({1, 2}, 1);
+    put({1, 2, 3, 4}, 2);
+    check(s.best(V{1, 2, 3, 4, 5}) == 1 && s.at(1).state[0] == 2, "snapshots: the longest proper prefix wins");
+    check(s.best(V{1, 2, 3, 4}) == 0, "snapshots: an equal prompt takes a shorter one (its last token must run)");
+    check(s.best(V{1, 2}) == -1 && s.best(V{1, 3, 3, 4, 5}) == -1, "snapshots: no proper prefix, no match");
+    check(s.contains(V{1, 2}) && !s.contains(V{1}), "snapshots: contains is exact");
+    s.touch(0);  // {1,2} now more recent than {1,2,3,4}
+    const uint8_t* buf = s.at(1).state.data();
+    put({7, 8, 9}, 3);
+    check(s.size() == 2 && !s.contains(V{1, 2, 3, 4}) && s.contains(V{1, 2}) && s.contains(V{7, 8, 9}),
+          "snapshots: at capacity the least recently used goes");
+    check(s.at(1).state.data() == buf, "snapshots: the evicted entry's state buffer is reused");
+    auto* again = s.put(V{1, 2});
+    check(s.size() == 2 && again == &s.at(0) && again->state[0] == 1, "snapshots: putting an existing prefix refreshes it");
+    check(s.bytes() >= 8, "snapshots: bytes counts the kept states");
+    Snapshots none(0);
+    check(none.put(V{1}) == nullptr && none.best(V{1, 2}) == -1, "snapshots: capacity 0 keeps nothing");
+
+    Snapshots p(4);
+    p.put(V{1, 2, 3});
+    auto pl = plan(V{1, 2}, p, V{1, 2, 3, 4});
+    check(pl.source == Plan::Snapshot && pl.reuse == 3 && pl.snapshot == 0, "plan: a longer snapshot beats the live cache");
+    pl = plan(V{1, 2, 3}, p, V{1, 2, 3, 4});
+    check(pl.source == Plan::Live && pl.reuse == 3, "plan: on a tie, the live cache (nothing to load)");
+    pl = plan(V{1, 2, 3, 4}, p, V{1, 2, 3, 4});
+    check(pl.source == Plan::Snapshot && pl.reuse == 3, "plan: the same prompt again restores the snapshot before its last token");
+    pl = plan(V{5}, p, V{6, 7});
+    check(pl.source == Plan::Scratch && pl.reuse == 0, "plan: nothing shared, from scratch");
+    pl = plan(V{}, Snapshots(1), V{6, 7});
+    check(pl.source == Plan::Scratch, "plan: an empty cache, from scratch");
+
+    const V turn = {100};
+    check(snapshot_points(V{100, 1, 2, 100, 3, 4}, 0, turn) == std::vector<size_t>{3, 5},
+          "points: before the last turn token and before the last token");
+    check(snapshot_points(V{100, 1, 2, 100, 3, 4}, 4, turn) == std::vector<size_t>{5},
+          "points: none before where feeding starts");
+    check(snapshot_points(V{100, 1, 2}, 0, turn) == std::vector<size_t>{2}, "points: a turn token at 0 is no snapshot");
+    check(snapshot_points(V{1, 2, 100}, 0, turn) == std::vector<size_t>{2}, "points: a last-token turn token counts once");
+    check(snapshot_points(V{1}, 0, turn).empty(), "points: a one-token prompt has none");
+
+    // A three-turn chat as a client sends it: each follow-up repeats the messages, but
+    // renders the earlier answer without the think header the prompt opened it with.
+    constexpr int S = 100, E = 101, NL = 10, U = 20, A = 21, T = 30, TE = 31;
+    auto user = [&](V text) {
+        V v = {S, U, NL};
+        v.insert(v.end(), text.begin(), text.end());
+        v.insert(v.end(), {E, NL});
+        return v;
+    };
+    auto asst = [&](const V& text) {
+        V v = {S, A, NL};
+        v.insert(v.end(), text.begin(), text.end());
+        v.insert(v.end(), {E, NL});
+        return v;
+    };
+    const V open = {S, A, NL, T, NL, NL, TE, NL, NL};  // the prompt's end, thinking off
+    const V q1 = {1, 2, 3, 4, 5, 6}, q2 = {7, 8, 9}, q3 = {11, 12, 13, 14};
+    const V a1 = {41, 42, 43, 44, E}, a2 = {51, 52, E}, a3 = {61, E};
+    auto cat = [](std::initializer_list<V> parts) {
+        V v;
+        for (const auto& p : parts) v.insert(v.end(), p.begin(), p.end());
+        return v;
+    };
+    auto body = [](const V& a) { return V(a.begin(), a.end() - 1); };
+    const V p1 = cat({user(q1), open});
+    const V p2 = cat({user(q1), asst(body(a1)), user(q2), open});
+    const V p3 = cat({user(q1), asst(body(a1)), user(q2), asst(body(a2)), user(q3), open});
+    for (size_t cap : {size_t(0), size_t(4)}) {
+        FakeSession fs;
+        fs.snaps = Snapshots(cap);
+        fs.turn = {S};
+        const size_t r1 = fs.generate(p1, a1), r2 = fs.generate(p2, a2), r3 = fs.generate(p3, a3);
+        const std::string tag = "chat, " + std::to_string(cap) + " snapshots: ";
+        if (cap == 0) {
+            check(r1 == 0 && r2 == 0 && r3 == 0, tag + "every follow-up starts over (today's exact-extension only)");
+        } else {
+            check(r1 == 0 && r2 == user(q1).size() && r3 == cat({user(q1), asst(body(a1)), user(q2)}).size(),
+                  tag + "each follow-up reuses everything before the last answer (" + std::to_string(r2) + ", " +
+                      std::to_string(r3) + " tokens)");
+            check(fs.restored_ok, tag + "every restored state equals its prefix fed from scratch");
+            check(fs.snaps.size() <= cap, tag + "at most the capacity kept");
+        }
+        check(fs.dec.h == FakeDecoder::of(fs.cache), tag + "the device state matches the tokens it records");
+        // The same last request again (a retry): restores the snapshot before its last token.
+        const size_t r4 = fs.generate(p3, a3);
+        check(cap == 0 ? r4 == 0 : r4 == p3.size() - 1, tag + "a retry reuses " + std::to_string(r4) + " tokens");
+        // A raw prompt that extends the live cache still continues it.
+        const size_t live = fs.cache.size();
+        const V ext = cat({fs.cache, V{E, NL}, user(V{9}), open});
+        check(fs.generate(ext, a3) == live, tag + "a prompt extending the device's tokens continues them");
+    }
+}
+
 void unit() {
     check(sha_str("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sha256 of \"\"");
     check(sha_str("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 of \"abc\"");
@@ -334,6 +502,7 @@ void unit() {
     check(w[4 + 4 + 4] == kKvRow / 4, "position 0 streams one (masked) row");
 
     elf_sites_unit();
+    turns_unit();
 
     const auto cw = cfg_words(0x1'2345'6780'0000ull);
     check(cw[0] == 0x67800000u && cw[1] == 0x12345u && cw[2] == 0x1D21C && cw[3] == 0x1D214 && cw[9] == 0x1D214,

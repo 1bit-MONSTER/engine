@@ -14,7 +14,7 @@
 // limitations under the License.
 
 // `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD] [--adaptive]`
-//                        [--npu-kernels DIR] [--npu-transport elf|classic]
+//                        [--npu-kernels DIR] [--npu-transport elf|classic] [--npu-snapshots N]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -107,6 +107,7 @@ struct Options {
     int adaptive_at = 1;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string npu_kernels, npu_transport;  // the lax decode's kernels and their transport
+    std::string npu_snapshots;               // the lax decode's state snapshots kept
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -586,6 +587,7 @@ void usage(FILE* out) {
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--npu-kernels DIR] [--npu-transport elf|classic]   Qwen3.6-35B-A3B's lax kernels\n"
+                 "                  [--npu-snapshots 4]   its DeltaNet state snapshots for chat follow-ups (70 MB each)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or Qwen3.6-35B-A3B's with the lax\n"
                  "           kernels), a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -623,6 +625,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-kernels") o.npu_kernels = next();
         else if (a == "--npu-transport") o.npu_transport = next();
+        else if (a == "--npu-snapshots") o.npu_snapshots = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
@@ -642,6 +645,7 @@ int run_serve(int argc, char** argv) {
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
         if (!o.npu_kernels.empty()) { args.push_back("--kernels"); args.push_back(o.npu_kernels); }
         if (!o.npu_transport.empty()) { args.push_back("--transport"); args.push_back(o.npu_transport); }
+        if (!o.npu_snapshots.empty()) { args.push_back("--snapshots"); args.push_back(o.npu_snapshots); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
         return run_unified(int(av.size()), av.data());

@@ -47,8 +47,8 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > closed source as well: the public build runs AMD's HRX pair and upstream ROCmFPX as they are,
 > and `-DONEBIT_GPU_PRIVATE` builds in our fixes (MoE models above 128 experts on HRX, the HRX
 > prefill split, ROCmI4 on Vulkan; [docs/hrx.md](docs/hrx.md#private-gpu-build)). Next is step 4,
-> the Laya router. The working engine is being ported from
-> [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see [docs/PORTING.md](docs/PORTING.md).
+> the Laya router. The working engine is being ported from 1bit-MONSTER, our private development
+> repository; see [docs/PORTING.md](docs/PORTING.md).
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository
 > holds the verified code without the development history.
 

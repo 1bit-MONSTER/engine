@@ -35,7 +35,7 @@ LAVAPIPE=1 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" 
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1
 
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$out/vars.fd"
-qemu-system-x86_64 -enable-kvm -cpu host -m 8G -smp 8 -machine q35 \
+qemu-system-x86_64 -enable-kvm -cpu host -m 16G -smp 8 -machine q35 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="$out/vars.fd" \
     -device qemu-xhci -drive id=stick,if=none,format=raw,file="$out/image/1bit-os.img" -device usb-storage,drive=stick \
@@ -58,7 +58,7 @@ reply=$(curl -s --max-time 300 127.0.0.1:18000/v1/chat/completions -H 'Content-T
     -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)
 if [ -n "$reply" ]; then echo "1bit serve (Vulkan on the VM's CPU) answered: $reply"; else echo "1bit serve: no answer"; ok=0
-    ssh_vm 'tail -15 /tmp/serve.log' 2>/dev/null || true; fi
+    ssh_vm 'grep -i -E "error|fail|abort|assert|out of memory|what\\(\\)" /tmp/serve.log | head -12; echo ...; tail -4 /tmp/serve.log' 2>/dev/null || true; fi
 ssh_vm 'poweroff -f' 2>/dev/null || true
 wait $vm 2>/dev/null || true
 trap - EXIT

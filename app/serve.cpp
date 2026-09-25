@@ -73,21 +73,29 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
-#if defined(__linux__)
-#include <sys/prctl.h>
-#else
-#include <spawn.h>
-#endif
 #include <stdexcept>
 #include <string>
+#include <thread>
+#include <vector>
+#if defined(_WIN32)
+// httplib.h brought in winsock2.h and windows.h
+#elif defined(__linux__)
+#include <netinet/in.h>
+#include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
-#include <netinet/in.h>
-#include <thread>
 #include <unistd.h>
-#include <vector>
+#else
+#include <netinet/in.h>
+#include <spawn.h>
+#include <sys/socket.h>
+#include <sys/wait.h>
+#include <unistd.h>
+#endif
 
+#ifndef _WIN32
 extern char** environ;
+#endif
 
 namespace onebit {
 
@@ -185,23 +193,106 @@ std::string default_mlx() {
 }
 
 int free_port() {
+#ifdef _WIN32
+    // Winsock is started by httplib.h (its WSInit)
+    const SOCKET s = ::socket(AF_INET, SOCK_STREAM, 0);
+    const bool bad_socket = s == INVALID_SOCKET;
+    auto close_socket = [&] { ::closesocket(s); };
+    int len = sizeof(sockaddr_in);
+#else
     const int s = ::socket(AF_INET, SOCK_STREAM, 0);
+    const bool bad_socket = s < 0;
+    auto close_socket = [&] { ::close(s); };
+    socklen_t len = sizeof(sockaddr_in);
+#endif
     sockaddr_in a{};
     a.sin_family = AF_INET;
     a.sin_addr.s_addr = htonl(INADDR_LOOPBACK);
     a.sin_port = 0;
-    socklen_t len = sizeof(a);
-    if (s < 0 || ::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
+    if (bad_socket || ::bind(s, reinterpret_cast<sockaddr*>(&a), sizeof(a)) != 0 ||
         ::getsockname(s, reinterpret_cast<sockaddr*>(&a), &len) != 0) {
-        if (s >= 0) ::close(s);
+        if (!bad_socket) close_socket();
         throw std::runtime_error("cannot find a free loopback port");
     }
     const int port = ntohs(a.sin_port);
-    ::close(s);
+    close_socket();
     return port;
 }
 
 // A child OpenAI-compatible server on a loopback port.
+#ifdef _WIN32
+// Windows: CreateProcess into a job object that kills its processes when its last handle
+// closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
+class Child {
+public:
+    Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port)
+        : port_(port) {
+        // the command line, each argument quoted the way CommandLineToArgvW reads it back
+        std::string cmd;
+        for (const auto& a : argv) {
+            if (!cmd.empty()) cmd += ' ';
+            cmd += '"';
+            size_t bs = 0;
+            for (char ch : a) {
+                if (ch == '\\') { bs++; continue; }
+                if (ch == '"') cmd.append(bs * 2 + 1, '\\');
+                else cmd.append(bs, '\\');
+                bs = 0;
+                cmd += ch;
+            }
+            cmd.append(bs * 2, '\\');
+            cmd += '"';
+        }
+        // our environment plus env_extra (a value the user set wins), as a double-NUL block
+        std::vector<std::string> env_store;
+        if (char* block = ::GetEnvironmentStringsA()) {
+            for (char* e = block; *e; e += std::strlen(e) + 1) env_store.emplace_back(e);
+            ::FreeEnvironmentStringsA(block);
+        }
+        for (const auto& e : env_extra) {
+            const std::string key = e.substr(0, e.find('=') + 1);
+            bool present = false;
+            for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
+            if (!present) env_store.push_back(e);
+        }
+        std::string env_block;
+        for (const auto& e : env_store) { env_block += e; env_block += '\0'; }
+        env_block += '\0';
+        job_ = ::CreateJobObjectA(nullptr, nullptr);
+        if (job_) {
+            JOBOBJECT_EXTENDED_LIMIT_INFORMATION li{};
+            li.BasicLimitInformation.LimitFlags = JOB_OBJECT_LIMIT_KILL_ON_JOB_CLOSE;
+            ::SetInformationJobObject(job_, JobObjectExtendedLimitInformation, &li, sizeof li);
+        }
+        STARTUPINFOA si{};
+        si.cb = sizeof si;
+        PROCESS_INFORMATION pi{};
+        if (!::CreateProcessA(nullptr, cmd.data(), nullptr, nullptr, FALSE, CREATE_SUSPENDED, env_block.data(), nullptr,
+                              &si, &pi))
+            throw std::runtime_error("cannot start " + argv[0] + " (error " + std::to_string(::GetLastError()) + ")");
+        if (job_) ::AssignProcessToJobObject(job_, pi.hProcess);   // before it runs: its children join too
+        ::ResumeThread(pi.hThread);
+        ::CloseHandle(pi.hThread);
+        proc_ = pi.hProcess;
+    }
+    ~Child() {
+        stop();
+        if (job_) ::CloseHandle(job_);
+    }
+    Child(const Child&) = delete;
+    Child& operator=(const Child&) = delete;
+
+    void stop() {
+        if (!proc_) return;
+        ::TerminateProcess(proc_, 1);   // no SIGTERM on Windows; llama-server keeps no state to flush
+        ::WaitForSingleObject(proc_, 5000);
+        ::CloseHandle(proc_);
+        proc_ = nullptr;
+    }
+
+    bool alive() const { return proc_ && ::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT; }
+
+#else
 class Child {
 public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port)
@@ -256,6 +347,7 @@ public:
     }
 
     bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
+#endif
 
     // Polls the child's /health until it answers 200, it exits, or time runs out.
     bool wait_ready(std::chrono::seconds timeout, const std::atomic<bool>& stop) const {
@@ -273,7 +365,11 @@ public:
     int port() const { return port_; }
 
 private:
+#ifdef _WIN32
+    HANDLE proc_ = nullptr, job_ = nullptr;
+#else
     pid_t pid_ = -1;
+#endif
     int port_;
 };
 
@@ -736,10 +832,15 @@ int serve_child(const Options& o) {
         ~Stop() { s.stop(); if (t.joinable()) t.join(); }
     } stop{srv, listener};
 
+#ifdef _WIN32
+    std::signal(SIGTERM, on_stop_signal);
+    std::signal(SIGINT, on_stop_signal);
+#else
     struct sigaction sa{};
     sa.sa_handler = on_stop_signal;
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
+#endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));

@@ -51,9 +51,13 @@
 #include <vector>
 
 #include <cerrno>
+#ifdef _WIN32
+#include <process.h>
+#else
 #include <fcntl.h>
 #include <sys/stat.h>
 #include <unistd.h>
+#endif
 
 namespace {
 
@@ -140,6 +144,33 @@ int run_npu(int argc, char** argv) {
 // then comfyui_cpp on PATH. It is opened once, checked through that descriptor (a regular,
 // executable file that other users cannot write) and run with fexecve, so the file that was
 // checked is the file that runs.
+#ifdef _WIN32
+// Windows: $ONEBIT_COMFYUI (an absolute path), then this build's, then comfyui_cpp.exe on PATH;
+// run as a child that 1bit waits for (no exec in place on Windows).
+int run_comfy(int argc, char** argv) {
+    if (argc < 1 || !std::strcmp(argv[0], "-h") || !std::strcmp(argv[0], "--help")) {
+        std::printf("usage: 1bit comfy <workflow.json>\n"
+                    "  runs a ComfyUI API-format workflow (SD1.5 txt2img/img2img, see docs/comfyui.md)\n");
+        return argc < 1 ? 2 : 0;
+    }
+    std::string bin;
+    if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) {
+        if (!std::filesystem::path(e).is_absolute())
+            throw std::runtime_error("ONEBIT_COMFYUI must be an absolute path, not " + std::string(e));
+        bin = e;
+    }
+#ifdef ONEBIT_COMFYUI_BIN
+    if (bin.empty() && std::filesystem::exists(ONEBIT_COMFYUI_BIN)) bin = ONEBIT_COMFYUI_BIN;
+#endif
+    if (bin.empty()) bin = "comfyui_cpp.exe";   // _spawnvp searches PATH
+    std::vector<const char*> args{bin.c_str()};
+    for (int i = 0; i < argc; ++i) args.push_back(argv[i]);
+    args.push_back(nullptr);
+    const intptr_t rc = ::_spawnvp(_P_WAIT, bin.c_str(), args.data());
+    if (rc < 0) throw std::runtime_error("cannot run " + bin + ": " + std::strerror(errno));
+    return int(rc);
+}
+#else
 std::string find_comfy() {
     if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) {
         if (e[0] != '/') throw std::runtime_error("ONEBIT_COMFYUI must be an absolute path, not " + std::string(e));
@@ -187,6 +218,7 @@ int run_comfy(int argc, char** argv) {
     ::close(fd);
     throw std::runtime_error("cannot run " + bin + ": " + std::strerror(err));
 }
+#endif
 #ifdef ONEBIT_LAYA
 // One request in, one device out: runs the Laya scorer's fixed routing question
 // against the request state and prints the winning device (npu|hrx|vulkan|zinc).

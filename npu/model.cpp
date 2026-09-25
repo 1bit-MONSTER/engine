@@ -17,13 +17,11 @@
 
 #include <nlohmann/json.hpp>
 
+#include "file_map.h"
+
 #include <cstring>
-#include <fcntl.h>
 #include <fstream>
 #include <stdexcept>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
 
 namespace onebit::npu {
 
@@ -40,15 +38,10 @@ int Tensor::tiles() const {
 
 Model::Model(const std::string& dir) {
     const std::string path = dir + "/model.q4nx";
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) throw std::runtime_error("cannot open " + path);
-    struct stat st{};
-    ::fstat(fd, &st);
-    size_ = size_t(st.st_size);
-    void* m = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) throw std::runtime_error("cannot map " + path);
-    map_ = static_cast<uint8_t*>(m);
+    std::string why;
+    const uint8_t* m = map_file(path, size_, &why);
+    if (!m) throw std::runtime_error(why);
+    map_ = const_cast<uint8_t*>(m);
 
     uint64_t header = 0;
     if (size_ < 8) throw std::runtime_error(path + ": truncated");
@@ -89,7 +82,7 @@ Model::Model(const std::string& dir) {
 }
 
 Model::~Model() {
-    if (map_) ::munmap(map_, size_);
+    unmap_file(map_, size_);
 }
 
 const Tensor* Model::find(const std::string& name) const {

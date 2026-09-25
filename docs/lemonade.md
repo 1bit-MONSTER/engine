@@ -102,7 +102,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    repo, the recipe hands `1bit serve` the directory, and the engine runs it on its own lax
    kernels as full ELFs (16.0 tok/s). Still open:
    - the smaller NPU models: their lane kernels are captured, not built from source;
-   - `reasoning_content`: the NPU route returns the thinking inside `content`;
+   - ~~`reasoning_content`~~: done (#73), the NPU route splits the thinking out as llama-server does;
    - models in our own Hugging Face repos. (engine + fork)
 7. **Beyond the LLM suite:**
    - image generation: `1bit comfy` behind Lemonade's image endpoint;

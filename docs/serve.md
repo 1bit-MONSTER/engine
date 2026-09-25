@@ -38,7 +38,7 @@ One model per process:
 |---|---|
 | `GET /health`, `GET /v1/health` | 503 while the model loads, then 200 |
 | `GET /v1/models` | the one model (`--alias`, else the file or directory name) |
-| `POST /v1/chat/completions` | streamed (SSE) or not |
+| `POST /v1/chat/completions` | streamed (SSE) or not; a thinking model's `<think>` block comes back as `reasoning_content` (`"reasoning_format": "none"` keeps it in `content`) |
 | `POST /v1/completions` | |
 | `POST /v1/embeddings` | with `--embed` (RAG) |
 | `POST /v1/rerank` | with `--rerank` (RAG) |

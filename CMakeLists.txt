@@ -54,6 +54,10 @@ target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httpl
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
+# The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
+add_executable(think_split_test tests/think_split_test.cpp)
+target_include_directories(think_split_test PRIVATE app)
+add_test(NAME think_split COMMAND think_split_test)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.

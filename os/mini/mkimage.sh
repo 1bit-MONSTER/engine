@@ -111,8 +111,8 @@ LD_LIBRARY_PATH=$lib ldd "$tools/usr/sbin/dropbear" | grep -o '/[^ ]*' | while r
 done
 
 echo "== init"
-cp "$here/init" "$root/init"; chmod +x "$root/init"
-cp "$here/udhcpc.script" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
+cp "$here/init.sh" "$root/init"; chmod +x "$root/init"
+cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
 printf 'root:x:0:\n' > "$root/etc/group"

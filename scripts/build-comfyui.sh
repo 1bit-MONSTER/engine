@@ -24,7 +24,13 @@ set -euo pipefail
 prefix=${1:?usage: build-comfyui.sh <prefix>}
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/third_party/comfyui.cpp
-[ -f "$src/CMakeLists.txt" ] || { echo "third_party/comfyui.cpp is empty: git submodule update --init third_party/comfyui.cpp"; exit 1; }
+# Fetch the pinned submodule when it is missing (not its own third_party/ComfyUI:
+# that pin is only for the parity check).
+if [ ! -f "$src/CMakeLists.txt" ] && git -C "$root" rev-parse --git-dir > /dev/null 2>&1; then
+    echo "fetching third_party/comfyui.cpp"
+    git -C "$root" submodule update --init third_party/comfyui.cpp
+fi
+[ -f "$src/CMakeLists.txt" ] || { echo "third_party/comfyui.cpp is empty and could not be fetched: git submodule update --init third_party/comfyui.cpp"; exit 1; }
 mkdir -p "$prefix"
 prefix=$(cd "$prefix" && pwd)
 cmake -S "$src" -B "$prefix/build" -DCMAKE_BUILD_TYPE=Release

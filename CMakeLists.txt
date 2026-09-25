@@ -150,6 +150,15 @@ endif()
 # child process. The engine never links it, so the engine itself stays Apache-2.0.
 option(ONEBIT_COMFYUI "Build ComfyUI.cpp (third_party/comfyui.cpp) for 1bit comfy" OFF)
 if(ONEBIT_COMFYUI)
+    # fetch the pinned submodule at configure time when it is missing
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
+        find_package(Git QUIET)
+        if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
+            message(STATUS "Fetching third_party/comfyui.cpp")
+            execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init third_party/comfyui.cpp
+                            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
+        endif()
+    endif()
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
         message(FATAL_ERROR "ONEBIT_COMFYUI needs third_party/comfyui.cpp: git submodule update --init third_party/comfyui.cpp")
     endif()

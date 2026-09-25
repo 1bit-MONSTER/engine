@@ -14,6 +14,19 @@ build time rather than stored here). The copyright lines below are taken from
 each project's own LICENSE file or source headers.
 
 -------------------------------------------------------------------------------
+Model formats and models used at run time (not redistributed)
+-------------------------------------------------------------------------------
+
+FastFlowLM (https://github.com/ROCm/FastFlowLM)
+  Copyright (c) 2026 Advanced Micro Devices, Inc.
+  License: MIT (code). The engine's NPU route reads FastFlowLM's Q4NX model format,
+  and Lemonade's onebit recipe downloads FastFlowLM's models from Hugging Face
+  (FastFlowLM/*-NPU2; the weights keep their own licenses, e.g. Qwen's Apache-2.0).
+  The engine runs them on its own kernels as full ELFs; it does not use
+  FastFlowLM's runtime or ship its kernel binaries.
+  Powered by FastFlowLM, as FastFlowLM asks.
+
+-------------------------------------------------------------------------------
 Pinned at exact commits (git submodules) and built from source
 -------------------------------------------------------------------------------
 

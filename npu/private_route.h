@@ -72,6 +72,9 @@ struct PrivateRoute {
     std::function<std::unique_ptr<PrivateSession>(const Model&, const Tokenizer&, const std::string& dir,
                                                   const PrivateOptions& opts)>
         open;
+    // An opt-in route for a model_type the fast lane also serves: when unavailable() declines a
+    // directory, the fast lane serves it as it would without the add-on, instead of failing.
+    bool optional = false;
 };
 
 struct PrivateCommand {
@@ -86,6 +89,11 @@ void register_private_command(PrivateCommand command);
 const PrivateRoute* find_private_route(const std::string& model_type);
 const PrivateCommand* find_private_command(const std::string& name);
 const std::vector<PrivateCommand>& private_commands();
+
+// The route that serves dir with opts, by dir's model_type. nullptr when no route is
+// registered for it, or an optional route declines it (the fast lane's turn); a route that is
+// not optional and declines also gives nullptr, with its reason in *why (else *why is empty).
+const PrivateRoute* route_for(const std::string& dir, const PrivateOptions& opts, std::string* why);
 
 // config.json's model_type in dir; empty if there is none.
 std::string model_type_of(const std::string& dir);

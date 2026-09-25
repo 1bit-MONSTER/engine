@@ -231,6 +231,10 @@ The engine keeps only the hook (`npu/private_route.h`):
   session that generates from token ids) and may register `1bit` subcommands. `1bit
   unified` and `1bit serve` use the route for that model type; `--npu-opt KEY=VALUE`
   (`unified`: `--opt`) passes options through to it.
+- A route can be `optional`: an opt-in route for a `model_type` the fast lane also serves
+  (e.g. `qwen3`). When it declines a directory (its `unavailable()` gives a reason, e.g. its
+  `--npu-opt` was not given), the fast lane serves the directory exactly as it would without
+  the add-on.
 - Without the add-on, `1bit serve -m <35B dir> --device npu` exits with "the
   Qwen3.6-35B-A3B NPU route is not part of this build; build with
   -DONEBIT_NPU_PRIVATE=<npu-kernels checkout>". The fast lane is unaffected.

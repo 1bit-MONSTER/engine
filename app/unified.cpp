@@ -300,19 +300,20 @@ bool has_model_files(const std::string& dir) {
 
 std::string npu_model_problem(const std::string& dir, const npu::PrivateOptions& opts) {
     if (!has_model_files(dir)) return dir + " is not an NPU model directory (model.q4nx, config.json, tokenizer.json)";
-    const std::string type = npu::model_type_of(dir);
-    if (const auto* r = npu::find_private_route(type)) {
-        const std::string why = r->unavailable ? r->unavailable(dir, opts) : "";
-        return why.empty() ? "" : dir + ": " + why;
-    }
-    if (const std::string why = npu::private_route_missing(type); !why.empty()) return dir + ": " + why;
+    std::string why;
+    if (npu::route_for(dir, opts, &why)) return "";
+    if (!why.empty()) return dir + ": " + why;
+    // no route, or an optional one declined: the fast lane's directory
+    if (const std::string missing = npu::private_route_missing(npu::model_type_of(dir)); !missing.empty())
+        return dir + ": " + missing;
     if (!has_lane_kernels(dir)) return dir + " is not an NPU model directory (the fast lane needs npu/)";
     return "";
 }
 
 NpuModel npu_model_kind(const std::string& dir, const npu::PrivateOptions& opts) {
     if (!npu_model_problem(dir, opts).empty()) return NpuModel::None;
-    return npu::find_private_route(npu::model_type_of(dir)) ? NpuModel::Private : NpuModel::Lane;
+    std::string why;
+    return npu::route_for(dir, opts, &why) ? NpuModel::Private : NpuModel::Lane;
 }
 
 bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts) {
@@ -394,7 +395,10 @@ int run_unified(int argc, char** argv) {
     e.model = std::make_unique<npu::Model>(model_dir);
     e.tok = std::make_unique<npu::Tokenizer>(model_dir + "/tokenizer.json");
     if (kind == NpuModel::Private) {
-        const npu::PrivateRoute& route = *npu::find_private_route(npu::model_type_of(model_dir));
+        std::string why;
+        const npu::PrivateRoute* rp = npu::route_for(model_dir, opts, &why);
+        if (!rp) throw std::runtime_error(model_dir + ": the private route no longer serves it" + (why.empty() ? "" : ": " + why));
+        const npu::PrivateRoute& route = *rp;
         e.priv = route.open(*e.model, *e.tok, model_dir, opts);
         e.max_context = e.priv->max_context();
         e.default_penalty = e.priv->default_repetition_penalty();

@@ -28,6 +28,7 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -61,18 +62,27 @@ void layernorm(const float* in, const float* w, const float* b, int rows, int co
     }
 }
 
-// out[m,k] = in[m,n] @ W^T[k,n] + bias[k]
+// out[m,k] = in[m,n] @ W^T[k,n] + bias[k]. The output columns are split across threads; every
+// sum keeps its order, so the result is the same as one thread's, bit for bit.
 void linear(const float* in, const float* W, const float* bias, int m, int n, int k, float* out) {
-    for (int i = 0; i < m; ++i) {
-        const float* x = in + (size_t)i * n;
-        float* o = out + (size_t)i * k;
-        for (int j = 0; j < k; ++j) {
-            float acc = bias ? bias[j] : 0.0f;
-            const float* wr = W + (size_t)j * n;
-            for (int c = 0; c < n; ++c) acc += x[c] * wr[c];
-            o[j] = acc;
+    auto cols = [&](int j0, int j1) {
+        for (int i = 0; i < m; ++i) {
+            const float* x = in + (size_t)i * n;
+            float* o = out + (size_t)i * k;
+            for (int j = j0; j < j1; ++j) {
+                float acc = bias ? bias[j] : 0.0f;
+                const float* wr = W + (size_t)j * n;
+                for (int c = 0; c < n; ++c) acc += x[c] * wr[c];
+                o[j] = acc;
+            }
         }
-    }
+    };
+    static const int threads = int(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 16u));
+    const int t = std::min(threads, std::max(1, int((size_t)m * n * k / (1u << 20))));   // small products stay on one thread
+    if (t == 1) return cols(0, k);
+    std::vector<std::thread> pool;
+    for (int p = 0; p < t; ++p) pool.emplace_back(cols, int((size_t)k * p / t), int((size_t)k * (p + 1) / t));
+    for (auto& th : pool) th.join();
 }
 
 // Multi-head self attention (batch_first, bidirectional). key_pad[b*L+j] = ignore key j.

@@ -161,12 +161,19 @@ def render(text):
 
 
 def analytics():
+    out = []
     code = os.environ.get("GOATCOUNTER", "").strip()
-    if not code:
-        return ""
-    if not re.fullmatch(r"[a-z0-9-]+", code):
-        sys.exit(f"GOATCOUNTER must be a GoatCounter site code (letters, digits, dashes), not {code!r}")
-    return f'<script data-goatcounter="https://{code}.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>'
+    if code:
+        if not re.fullmatch(r"[a-z0-9-]+", code):
+            sys.exit(f"GOATCOUNTER must be a GoatCounter site code (letters, digits, dashes), not {code!r}")
+        out.append(f'<script data-goatcounter="https://{code}.goatcounter.com/count" async src="https://gc.zgo.at/count.js"></script>')
+    # Docs7 (Context7's docs analytics): the site id from the Docs7 dashboard
+    site = os.environ.get("DOCS7_SITE", "").strip()
+    if site:
+        if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}", site):
+            sys.exit(f"DOCS7_SITE must be the Docs7 site id (a UUID), not {site!r}")
+        out.append(f'<script defer src="https://context7.com/docs7-analytics.js" data-site="{site}"></script>')
+    return "\n".join(out)
 
 
 def chat_widget():

@@ -1,0 +1,49 @@
+{
+ "about": "HF architecture classes reviewed as NOT aliases of a supported family (docs/arch-gaps.md). tools/registry_build.py --check-gaps fails if one becomes mapped without a 'mapped_ok' reason.",
+ "classes": {
+  "DeepseekV41ForCausalLM": {
+   "model_type": "deepseek_v41",
+   "family": "DeepSeek V4.1"
+  },
+  "Qwen3Mamba3ForCausalLM": {
+   "model_type": "qwen3_mamba3",
+   "family": "Qwen3 + Mamba-3 hybrid"
+  },
+  "MolmoAct2ForConditionalGeneration": {
+   "model_type": "molmoact2",
+   "family": "MolmoAct2, vision-language-action"
+  },
+  "Cosmos3EdgeForConditionalGeneration": {
+   "model_type": "cosmos3_edge",
+   "family": "Cosmos3-Edge, video world model"
+  },
+  "QwenDriveForPlanning": {
+   "model_type": "qwen_drive",
+   "family": "Qwen-Drive, driving planner"
+  },
+  "EnglishBaseForCausalLM": {
+   "model_type": "fabryka_english_base",
+   "family": "relu2 MLP + parameter-free QK-norm (implemented in the old engine only)"
+  },
+  "GDN2ForCausalLM": {
+   "model_type": "gdn2",
+   "family": "GDN2 hybrid (fla config)"
+  },
+  "HaikuForCausalLM": {
+   "model_type": "haiku",
+   "family": "Haiku"
+  },
+  "VaporForCausalLM": {
+   "model_type": "vapor",
+   "family": "Vapor (lfm2-shaped config, different tensors)"
+  },
+  "FidelForCausalLM": {
+   "model_type": "fidel",
+   "family": "Mamba/MoE hybrid"
+  },
+  "Zarya": {
+   "model_type": "zarya",
+   "family": "Zarya, diffusion LM sampler"
+  }
+ }
+}

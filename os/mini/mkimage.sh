@@ -58,7 +58,8 @@ cp /usr/bin/busybox "$root/bin/busybox"
 for a in $("$root/bin/busybox" --list); do [ -e "$root/bin/$a" ] || ln -s busybox "$root/bin/$a"; done
 
 echo "== kernel modules ($kver)"
-mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas vfat ext4 nls_iso8859_1 nls_cp437"
+# plus virtio, so 1bit OS also runs (and is tested) in a VM; together a few hundred KB
+mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -81,6 +82,12 @@ radv=$(ls /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so)
 copy_elf /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$radv"
 printf '{"file_format_version":"1.0.1","ICD":{"library_path":"%s","api_version":"1.4"}}\n' "$radv" \
     > "$root/usr/share/vulkan/icd.d/radeon_icd.json"
+if [ -n "${LAVAPIPE:-}" ]; then   # test images only: Vulkan on the CPU, for a VM with no Radeon GPU
+    lvp=/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
+    copy_elf "$lvp"
+    printf '{"file_format_version":"1.0.1","ICD":{"library_path":"%s","api_version":"1.4"}}\n' "$lvp" \
+        > "$root/usr/share/vulkan/icd.d/lvp_icd.json"
+fi
 copy_elf /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 /opt/xilinx/xrt/lib/libxrt_core.so.2 \
          /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2
 (cd "$root/opt/xilinx/xrt/lib" && for l in libxrt_coreutil libxrt_core libxrt_driver_xdna; do ln -sf $l.so.2 $l.so; done)
@@ -96,11 +103,20 @@ if [ -x "$vk/llama-server" ]; then
     mkdir -p "$root/opt/1bit-llama"; ln -s "$vk/llama-server" "$root/opt/1bit-llama/llama-server"
 fi
 
+echo "== SSH (Dropbear, key logins only)"
+lib=$tools/usr/lib/x86_64-linux-gnu
+for f in usr/sbin/dropbear usr/bin/dropbearkey; do mkdir -p "$root/$(dirname "$f")"; cp "$tools/$f" "$root/$f"; done
+LD_LIBRARY_PATH=$lib ldd "$tools/usr/sbin/dropbear" | grep -o '/[^ ]*' | while read -r l; do
+    d=${l#"$tools"}; [ -e "$root$d" ] || { mkdir -p "$root$(dirname "$d")"; cp -L "$l" "$root$d"; }
+done
+
 echo "== init"
 cp "$here/init" "$root/init"; chmod +x "$root/init"
 cp "$here/udhcpc.script" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
+printf 'root:x:0:\n' > "$root/etc/group"
+printf '/bin/sh\n' > "$root/etc/shells"
 
 echo "== initramfs"
 (cd "$root" && find . -print0 | cpio --null -o -H newc --quiet) | zstd -q -19 -T0 > "$out/initramfs.img"
@@ -121,16 +137,31 @@ objcopy --add-section .cmdline="$out/cmdline.txt" --change-section-vma .cmdline=
         "$stub" "$out/1bit-os.efi"
 
 echo "== 1bit-os.img (USB: EFI partition + 1BIT-DATA)"
-efi_mb=$(( $(stat -c %s "$out/1bit-os.efi") / 1048576 + 64 )); data_mb=${DATA_MB:-1024}
-img=$out/1bit-os.img; rm -f "$img"
-truncate -s $(( (efi_mb + data_mb + 2) * 1048576 )) "$img"
-printf 'label: gpt\nstart=2048, size=%s, type=U, name="EFI"\ntype=L, name="1BIT-DATA"\n' $((efi_mb * 2048)) | sfdisk -q "$img"
+efi_mb=$(( $(stat -c %s "$out/1bit-os.efi") / 1048576 + 64 ))
 mk() { "$tools/usr/bin/$1" "${@:2}"; }
 rm -f "$out/efi.part"; mkfs.fat -F 32 -n 1BIT-OS -C "$out/efi.part" $((efi_mb * 1024)) >/dev/null
 MTOOLS_SKIP_CHECK=1 mk mmd -i "$out/efi.part" ::/EFI ::/EFI/BOOT
 MTOOLS_SKIP_CHECK=1 mk mcopy -i "$out/efi.part" "$out/1bit-os.efi" ::/EFI/BOOT/BOOTX64.EFI
-mkdir -p "$out/data.dir/models"; echo "Put GGUF files and NPU model directories here." > "$out/data.dir/models/README"
+rm -rf "$out/data.dir"; mkdir -p "$out/data.dir/models" "$out/data.dir/ssh"
+echo "Put GGUF files and NPU model directories here." > "$out/data.dir/models/README"
+echo "Put your SSH public key(s) in authorized_keys here; 1bit OS takes key logins only." > "$out/data.dir/ssh/README"
+# optional contents of the data partition (tests, or a ready-to-go stick)
+[ -n "${AUTHORIZED_KEYS:-}" ] && cp "$AUTHORIZED_KEYS" "$out/data.dir/ssh/authorized_keys"
+for m in ${MODELS:-}; do cp -L "$m" "$out/data.dir/models/"; done
+[ -n "${CONF:-}" ] && cp "$CONF" "$out/data.dir/1bit.conf"
+cat > "$out/data.dir/1bit.conf.example" <<'CONF'
+# 1bit OS starts `1bit serve` at boot when 1bit.conf (this file, renamed) names a model.
+MODEL=/data/models/Qwen3-32B-UD-Q4_K_XL.gguf
+DEVICE=vulkan
+PORT=8000
+# anything else for 1bit serve, e.g. --mtp or --parallel 4
+ARGS=
+CONF
+data_mb=${DATA_MB:-$(( $(du -sm "$out/data.dir" | cut -f1) + 1024 ))}   # the contents plus 1 GiB
 rm -f "$out/data.part"; mkfs.ext4 -q -L 1BIT-DATA -d "$out/data.dir" "$out/data.part" $((data_mb))M
+img=$out/1bit-os.img; rm -f "$img"
+truncate -s $(( (efi_mb + data_mb + 2) * 1048576 )) "$img"
+printf 'label: gpt\nstart=2048, size=%s, type=U, name="EFI"\ntype=L, name="1BIT-DATA"\n' $((efi_mb * 2048)) | sfdisk -q "$img"
 dd if="$out/efi.part" of="$img" bs=1M seek=1 conv=notrunc status=none
 dd if="$out/data.part" of="$img" bs=1M seek=$((efi_mb + 1)) conv=notrunc status=none
 rm -f "$out/efi.part" "$out/data.part"

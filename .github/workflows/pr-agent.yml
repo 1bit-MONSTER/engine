@@ -52,6 +52,12 @@ jobs:
         env:
           GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMENT_BODY: ${{ github.event.comment.body }}
+          # the model settings are here too: PR-Agent reads .pr_agent.toml from the default branch only
+          CONFIG__MODEL: openai/qwen3-coder
+          CONFIG__FALLBACK_MODELS: '[]'
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: '65536'
+          OPENAI__API_BASE: http://127.0.0.1:8090/v1
+          OPENAI__KEY: local
         run: |
           set -e
           # PR-Agent 0.43.0 in ~/pr-agent-venv on the runner (installed on first use)

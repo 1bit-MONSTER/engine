@@ -29,7 +29,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 
 rm -f "$out/key" "$out/key.pub"; ssh-keygen -q -t ed25519 -N "" -f "$out/key"
-printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\n' "$(basename "$model")" > "$out/1bit.conf"
+# lavapipe is the VM's only Vulkan device; llama.cpp skips CPU Vulkan devices unless listed
+printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\nexport GGML_VK_VISIBLE_DEVICES=0\n' "$(basename "$model")" > "$out/1bit.conf"
 LAVAPIPE=1 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" \
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1
 

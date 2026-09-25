@@ -99,18 +99,6 @@ ComfyUI.cpp (third_party/comfyui.cpp)
   vendors stb (MIT / public domain), nlohmann/json (MIT) and the CLIP BPE
   vocabulary (MIT).
 
-OpenFlowLM-Next open kernels (third_party/OpenFlowLM-Next; only open_kernels/ is built)
-  https://github.com/bong-water-water-bong/OpenFlowLM-Next
-  (a fork of https://github.com/Atomic-Germ/OpenFlowLM-Next)
-  open_kernels/: Copyright (c) 2026 Cyrus Attoun and phlegm contributors;
-  portions derived from OpenFlowLM (https://github.com/OpenFlowLM/OpenFlowLM),
-  Copyright (c) 2026 Advanced Micro Devices, Inc.
-  License: MIT (open_kernels/LICENSE); the rest of the tree: Copyright (c)
-  OpenFlowLM Community, MIT (LICENSE_OPEN_RUNTIME.md)
-  Includes GEMV tile arithmetic and a smoke test adapted from vegah/LLMNpuTest
-  (https://github.com/vegah/LLMNpuTest), Apache-2.0
-  (open_kernels/designs/rot13/LICENSE.LLMNpuTest; attributed in the file headers)
-
 Hugging Face tokenizers (third_party/tokenizers)
   https://github.com/huggingface/tokenizers
   Copyright Hugging Face, Inc. and the tokenizers authors

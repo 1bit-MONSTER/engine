@@ -99,8 +99,8 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 5. **Reranking on HRX.** HRX's JIT can't link the fp32 matmul-with-bias kernel that
    jina-reranker-v1-tiny needs. (engine, HRX fork)
 6. **The NPU from Lemonade.** Qwen3.6-35B-A3B now runs: Lemonade downloads the Q4NX checkpoint
-   repo, the recipe hands `1bit serve` the directory, and the engine runs it on its own lax
-   kernels as full ELFs (16.0 tok/s). Still open:
+   repo, the recipe hands `1bit serve` the directory, and the engine runs it on the NPU
+   (16.0 tok/s; builds with the private add-on only, docs/npu.md, "Private routes"). Still open:
    - the smaller NPU models: their lane kernels are captured, not built from source;
    - ~~`reasoning_content`~~: done (#73), the NPU route splits the thinking out as llama-server does;
    - ~~models in our own Hugging Face repos~~: the 35B is `1bit-MONSTER/Qwen3.6-35B-A3B-NPU` (fork #8). (engine + fork)

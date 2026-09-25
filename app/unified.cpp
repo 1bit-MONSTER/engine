@@ -15,8 +15,8 @@
 
 // `1bit unified -m <model dir> -p <port>`: one native model on the NPU, behind OpenAI
 // endpoints. It is `1bit serve`'s NPU route (serve.cpp). The model decides the path
-// (npu_model_kind): Qwen2/Qwen3 dense models run on the fast lane (docs/npu.md),
-// Qwen3.6-35B-A3B on the lax decode from full ELFs (docs/npu-lax.md).
+// (npu_model_kind): Qwen2/Qwen3 dense models run on the fast lane (docs/npu.md), a model
+// a private add-on registered a route for on that route (npu/private_route.h).
 //
 //   GET  /health, /v1/health    200 once the model is on the device
 //   GET  /v1/models             the one model
@@ -24,16 +24,13 @@
 //   POST /v1/completions        raw prompt
 //
 // Requests run one at a time: the device holds one cache. The fast lane rewrites it from
-// position 0 per request. The lax decode continues it when a request extends the last
-// one's tokens exactly, or restores a snapshot of the DeltaNet state taken at an earlier
-// prompt's prefix (--snapshots, npu/lax_turns.h): a chat follow-up re-feeds only the turns
-// after the one its history last diverged in. It starts over otherwise.
+// position 0 per request; a private route may reuse it (usage.prompt_tokens_details).
 #include "unified.h"
 #include "think_split.h"
 
 #include "generate.h"
-#include "lax.h"
 #include "model.h"
+#include "private_route.h"
 #include "tokenizer.h"
 
 #include <httplib.h>
@@ -62,42 +59,32 @@ struct Engine {
     std::unique_ptr<npu::Model> model;
     std::unique_ptr<npu::Tokenizer> tok;
     std::unique_ptr<npu::Lane> lane;  // the fast lane, or
-    std::unique_ptr<npu::lax::Config> lax_cfg;
-    std::unique_ptr<npu::lax::Decoder> lax;  // the lax decode and its conversation
-    std::unique_ptr<npu::lax::Session> session;
-    std::vector<int> lax_stop;
+    std::unique_ptr<npu::PrivateSession> priv;  // a private route's session
     int max_context = npu::Lane::kMaxContext;
-    float default_penalty = 1.1f;  // greedy 0.6B models loop without it; the 35B does not need it
-    bool open_think = false;       // Qwen3.6's template opens "<think>\n" when thinking is on
+    float default_penalty = 1.1f;  // greedy 0.6B models loop without it
+    bool open_think = false;       // the template opens "<think>\n" when thinking is on
     std::mutex mu;
 
-    // reused: prompt tokens already on the device (the lax decode's conversation); cache:
-    // where from ("live", "snapshot"), empty when none.
+    // reused: prompt tokens already on the device (a private route's); cache: where from,
+    // empty when none.
     npu::GenerateResult generate(const std::vector<int>& ids, const npu::GenerateOptions& opt, size_t& reused,
                                  std::string& cache) {
         reused = 0;
         cache.clear();
         if (lane) return npu::generate(*lane, *model, ids, opt);
-        npu::lax::GenerateOptions lo;
-        lo.max_tokens = opt.max_tokens;
-        lo.repetition_penalty = opt.repetition_penalty;
-        lo.penalty_window = opt.penalty_window;
-        lo.stop = lax_stop;
-        lo.on_token = opt.on_token;
-        const auto r = session->generate(ids, lo);
+        npu::PrivateRequest pr;
+        pr.max_tokens = opt.max_tokens;
+        pr.repetition_penalty = opt.repetition_penalty;
+        pr.penalty_window = opt.penalty_window;
+        pr.on_token = opt.on_token;
+        auto r = priv->generate(ids, pr);
         npu::GenerateResult out;
-        out.tokens = r.tokens;
+        out.tokens = std::move(r.tokens);
         out.prefill_ms = r.prefill_ms;
         out.decode_ms = r.decode_ms;
         out.stopped_at_eos = r.stopped_at_eos;
         reused = r.reused;
-        if (r.source != npu::lax::Plan::Scratch) cache = r.source == npu::lax::Plan::Live ? "live" : "snapshot";
-        if (r.source == npu::lax::Plan::Snapshot || r.snapshots_taken)
-            std::fprintf(stderr, "1bit unified: %zu of %zu prompt tokens from %s (restore %.1f ms), %d snapshot%s taken "
-                                 "(%.1f ms), %zu kept (%.0f MB)\n",
-                         r.reused, ids.size(), cache.empty() ? "nothing" : cache.c_str(), r.restore_ms, r.snapshots_taken,
-                         r.snapshots_taken == 1 ? "" : "s", r.snapshot_ms, session->snapshots().size(),
-                         double(session->snapshots().bytes()) / 1e6);
+        cache = std::move(r.cache);
         return out;
     }
 };
@@ -295,56 +282,47 @@ std::string npu_kernel_dir(const std::string& model_dir) { return model_dir + "/
 
 namespace {
 
-std::string model_type(const std::string& dir) {
-    std::ifstream f(dir + "/config.json");
-    if (!f) return "";
-    try {
-        const auto j = json::parse(f);
-        return j.value("model_type", "");
-    } catch (const std::exception&) {
-        return "";
-    }
+bool has_lane_kernels(const std::string& dir) {
+    namespace fs = std::filesystem;
+    for (const char* f : {"npu/layer_ctx1.elf", "npu/layer_ctx2.elf", "npu/layer_ctx17.elf", "npu/lmhead.elf", "npu/layer.pdi"})
+        if (!fs::exists(fs::path(dir) / f)) return false;
+    return true;
 }
 
-bool has_lax_kernels(const std::string& k) {
+bool has_model_files(const std::string& dir) {
     namespace fs = std::filesystem;
-    for (const char* kind : {"lax_l", "lax_a", "ln", "lm_head_q8"})
-        if (!fs::exists(fs::path(k) / kind / "insts.elf")) return false;
+    for (const char* f : {"model.q4nx", "config.json", "tokenizer.json"})
+        if (!fs::exists(fs::path(dir) / f)) return false;
     return true;
 }
 
 }  // namespace
 
-std::string lax_kernel_dir(const std::string& dir, const std::string& lax_kernels) {
-    if (!lax_kernels.empty()) return lax_kernels;
-    if (has_lax_kernels(dir + "/npu/lax")) return dir + "/npu/lax";
-    if (const char* env = std::getenv("ONEBIT_NPU_LAX_KERNELS"); env && *env) return env;
-#ifdef ONEBIT_NPU_LAX_KERNELS_DEFAULT
-    if (has_lax_kernels(ONEBIT_NPU_LAX_KERNELS_DEFAULT)) return ONEBIT_NPU_LAX_KERNELS_DEFAULT;  // this build's
-#endif
+std::string npu_model_problem(const std::string& dir, const npu::PrivateOptions& opts) {
+    if (!has_model_files(dir)) return dir + " is not an NPU model directory (model.q4nx, config.json, tokenizer.json)";
+    const std::string type = npu::model_type_of(dir);
+    if (const auto* r = npu::find_private_route(type)) {
+        const std::string why = r->unavailable ? r->unavailable(dir, opts) : "";
+        return why.empty() ? "" : dir + ": " + why;
+    }
+    if (const std::string why = npu::private_route_missing(type); !why.empty()) return dir + ": " + why;
+    if (!has_lane_kernels(dir)) return dir + " is not an NPU model directory (the fast lane needs npu/)";
     return "";
 }
 
-NpuModel npu_model_kind(const std::string& dir, const std::string& lax_kernels) {
-    namespace fs = std::filesystem;
-    for (const char* f : {"model.q4nx", "config.json", "tokenizer.json"})
-        if (!fs::exists(fs::path(dir) / f)) return NpuModel::None;
-    if (model_type(dir) == "qwen3_5_moe") {
-        const std::string k = lax_kernel_dir(dir, lax_kernels);
-        return !k.empty() && has_lax_kernels(k) ? NpuModel::Lax : NpuModel::None;
-    }
-    for (const char* f : {"npu/layer_ctx1.elf", "npu/layer_ctx2.elf", "npu/layer_ctx17.elf", "npu/lmhead.elf", "npu/layer.pdi"})
-        if (!fs::exists(fs::path(dir) / f)) return NpuModel::None;
-    return NpuModel::Lane;
+NpuModel npu_model_kind(const std::string& dir, const npu::PrivateOptions& opts) {
+    if (!npu_model_problem(dir, opts).empty()) return NpuModel::None;
+    return npu::find_private_route(npu::model_type_of(dir)) ? NpuModel::Private : NpuModel::Lane;
 }
 
-bool is_npu_model_dir(const std::string& dir, const std::string& lax_kernels) {
-    return npu_model_kind(dir, lax_kernels) != NpuModel::None;
+bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts) {
+    return npu_model_kind(dir, opts) != NpuModel::None;
 }
 
 int run_unified(int argc, char** argv) {
-    std::string model_dir, host = "127.0.0.1", alias, kernels, transport = "elf";
-    int port = 8000, snapshots = 4;
+    std::string model_dir, host = "127.0.0.1", alias;
+    int port = 8000;
+    npu::PrivateOptions opts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -355,24 +333,17 @@ int run_unified(int argc, char** argv) {
         else if (a == "-p" || a == "--port") port = std::stoi(next());
         else if (a == "--host") host = next();
         else if (a == "--alias") alias = next();
-        else if (a == "--kernels") kernels = next();
-        else if (a == "--transport") transport = next();
-        else if (a == "--snapshots") snapshots = std::stoi(next());
+        else if (a == "--opt") npu::parse_private_option(next(), opts);
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
-                        "                    [--kernels DIR] [--transport elf|classic] [--snapshots 4]\n"
+                        "                    [--opt KEY=VALUE ...]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
-                        "              npu/ (its kernels); Qwen3.6-35B-A3B runs on the lax kernels in --kernels,\n"
-                        "              else <model dir>/npu/lax, else $ONEBIT_NPU_LAX_KERNELS, else this build's\n"
-                        "              (-DONEBIT_NPU_LAX, docs/npu-lax.md)\n"
-                        "  --transport the lax kernels as full ELFs (default) or classic xclbin, for A/B\n"
-                        "  --snapshots DeltaNet state snapshots the lax decode keeps in host memory for chat\n"
-                        "              follow-ups (70 MB each; 0: only exact extensions reuse the cache)\n");
+                        "              npu/ (its kernels); a model a private route serves needs no npu/\n"
+                        "  --opt       an option for a private route (docs/npu.md, \"Private routes\")\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
     if (model_dir.empty()) throw std::runtime_error("-m <model dir> is required");
-    if (snapshots < 0) throw std::runtime_error("--snapshots must be 0 or more");
     // Lemonade hands over the checkpoint path, which may name the container file.
     if (std::filesystem::is_regular_file(model_dir)) model_dir = std::filesystem::path(model_dir).parent_path().string();
 
@@ -418,31 +389,18 @@ int run_unified(int argc, char** argv) {
 
     std::fprintf(stderr, "1bit unified: loading %s on the NPU\n", model_dir.c_str());
     const auto t0 = std::chrono::steady_clock::now();
-    const NpuModel kind = npu_model_kind(model_dir, kernels);
-    if (kind == NpuModel::None)
-        throw std::runtime_error(model_dir + " is not an NPU model directory (docs/serve.md)");
+    if (const std::string why = npu_model_problem(model_dir, opts); !why.empty()) throw std::runtime_error(why);
+    const NpuModel kind = npu_model_kind(model_dir, opts);
     e.model = std::make_unique<npu::Model>(model_dir);
     e.tok = std::make_unique<npu::Tokenizer>(model_dir + "/tokenizer.json");
-    if (kind == NpuModel::Lax) {
-        const std::string k = lax_kernel_dir(model_dir, kernels);
-        e.lax_cfg = std::make_unique<npu::lax::Config>(npu::lax::Config::from_model(*e.model, model_dir));
-        e.lax = std::make_unique<npu::lax::Decoder>(*e.model, *e.lax_cfg, k, npu::lax::parse_transport(transport));
-        for (const char* s : {"<|im_end|>", "<|endoftext|>"}) {
-            const auto ids = e.tok->encode(s);
-            if (ids.size() == 1) e.lax_stop.push_back(ids[0]);
-        }
-        // Snapshots before each prompt's last <|im_start|>: a follow-up repeats every message
-        // before the answer it re-renders.
-        npu::lax::SessionOptions so;
-        so.snapshots = size_t(snapshots);
-        if (const auto ids = e.tok->encode("<|im_start|>"); ids.size() == 1) so.turn_tokens = ids;
-        // Rows past the tokenizer are padding.
-        e.session = std::make_unique<npu::lax::Session>(*e.lax, e.tok->size(), std::move(so));
-        e.max_context = npu::lax::kMaxContext;
-        e.default_penalty = 1.0f;
-        e.open_think = true;
-        std::fprintf(stderr, "1bit unified: Qwen3.6-35B-A3B on the lax decode (%s); up to %d state snapshots of %.0f MB\n",
-                     e.lax->kernels().c_str(), snapshots, double(e.lax->state_bytes()) / 1e6);
+    if (kind == NpuModel::Private) {
+        const npu::PrivateRoute& route = *npu::find_private_route(npu::model_type_of(model_dir));
+        e.priv = route.open(*e.model, *e.tok, model_dir, opts);
+        e.max_context = e.priv->max_context();
+        e.default_penalty = e.priv->default_repetition_penalty();
+        e.open_think = e.priv->opens_think();
+        std::fprintf(stderr, "1bit unified: on the private route %s%s%s\n", route.name.c_str(),
+                     e.priv->describe().empty() ? "" : ": ", e.priv->describe().c_str());
     } else {
         const std::string type = e.model->dims().model_type;
         if (type != "qwen3" && type != "qwen2")

@@ -41,8 +41,8 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > ([docs/hrx.md](docs/hrx.md)), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
 > source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). Experimental,
-> outside `1bit serve`: Qwen3.6-35B-A3B on the NPU, the whole 40-layer MoE token as one runlist
-> submit, parity against fp64, 16.4 tok/s from the C++ driver `1bit npu-lax` ([docs/npu-lax.md](docs/npu-lax.md)). Next is step 4,
+> and served by `1bit serve --device npu` on full ELFs: Qwen3.6-35B-A3B on the NPU, the whole 40-layer
+> MoE token as one runlist submit, parity against fp64, 16.3-16.5 tok/s decode ([docs/npu-lax.md](docs/npu-lax.md)). Next is step 4,
 > the Laya router. The working engine is being ported from
 > [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see [docs/PORTING.md](docs/PORTING.md).
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository

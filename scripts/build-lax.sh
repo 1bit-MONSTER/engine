@@ -19,8 +19,13 @@
 # Builds the Qwen3.6-35B-A3B whole-layer MoE decode (docs/npu-lax.md) from the open
 # kernels pinned in third_party/OpenFlowLM-Next, into <prefix>:
 #   <prefix>/kernels/lax_l, lax_a     the merged whole-layer design, linear-attention and
-#                                     full-attention control texts (one xclbin)
+#                                     full-attention control texts (one design build)
 #   <prefix>/kernels/ln, lm_head_q8   the final RMSNorm and the q8 lm_head
+# Each of the four kernel directories holds what both kernel transports need:
+#   insts.elf, main.pdi               full ELFs (the default: npu/lax_elf.h assembles them
+#                                     in memory; no xclbin is read)
+#   final.xclbin, insts.bin           the classic path (1bit npu-lax --transport classic)
+# and lax_l/lax_a keep their aiecc project in final.prj.
 #   <prefix>/src/open_kernels         the pinned tree, with its XRT harness built in
 #                                     harness/build/run_kernel and the ln / lm_head builds
 #                                     where its tools look for them (--designs default)
@@ -68,19 +73,30 @@ LAX_KIND=1 python build_design.py designs/layer_x/lax.py "$prefix/kernels/lax_a"
 deactivate
 
 # The tools find the ln / lm_head builds under designs/<build_dir> (the recipe's manifest),
-# which is where the export builds them; check rather than assume.
+# which is where the export builds them; check rather than assume. The export copies only
+# the classic files (final.xclbin, insts.bin) into kernels/; the full ELFs need each
+# build's insts.elf and PDI too, so every kernel directory gets insts.elf and main.pdi.
 python3 - "$prefix/kernels" "$ok/designs" <<'PY'
-import json, os, sys
+import json, os, shutil, sys
 kernels, designs = sys.argv[1], sys.argv[2]
 builds = json.load(open(os.path.join(kernels, "manifest.json")))["builds"]
 for name in ("ln", "lm_head_q8"):
-    xclbin = os.path.join(designs, builds[name]["build_dir"], "final.xclbin")
-    if not os.path.isfile(xclbin):
-        sys.exit(f"{xclbin} missing after the export")
+    build = os.path.join(designs, builds[name]["build_dir"])
+    for f in ("final.xclbin", "insts.elf", "final.prj/main.pdi"):
+        if not os.path.isfile(os.path.join(build, f)):
+            sys.exit(f"{build}/{f} missing after the export")
+    shutil.copyfile(os.path.join(build, "insts.elf"), os.path.join(kernels, name, "insts.elf"))
+    shutil.copyfile(os.path.join(build, "final.prj/main.pdi"), os.path.join(kernels, name, "main.pdi"))
+for name in ("lax_l", "lax_a"):
+    shutil.copyfile(os.path.join(kernels, name, "final.prj/main.pdi"), os.path.join(kernels, name, "main.pdi"))
+for name in ("lax_l", "lax_a", "ln", "lm_head_q8"):
+    for f in ("insts.elf", "main.pdi", "final.xclbin", "insts.bin"):
+        if not os.path.isfile(os.path.join(kernels, name, f)):
+            sys.exit(f"{kernels}/{name}/{f} missing")
 PY
 
 cmake -S harness -B harness/build -DCMAKE_BUILD_TYPE=Release > /dev/null
 cmake --build harness/build -j "$(nproc)" > /dev/null
 
 echo "lax ($commit): kernels in $prefix/kernels, tools in $ok (harness/build/run_kernel)"
-md5sum "$prefix"/kernels/lax_l/insts.bin "$prefix"/kernels/lax_a/insts.bin
+md5sum "$prefix"/kernels/lax_l/insts.bin "$prefix"/kernels/lax_a/insts.bin "$prefix"/kernels/lax_a/insts.elf

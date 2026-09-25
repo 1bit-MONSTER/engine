@@ -28,8 +28,8 @@
 #include <algorithm>
 #include <atomic>
 #include <chrono>
+#include <cstdint>
 #include <cstring>
-#include <deque>
 #include <exception>
 #include <fstream>
 #include <functional>
@@ -37,6 +37,7 @@
 #include <optional>
 #include <stdexcept>
 #include <thread>
+#include <vector>
 
 namespace onebit::npu::lax {
 
@@ -102,6 +103,10 @@ public:
         full_.instr.sync(XCL_BO_SYNC_BO_TO_DEVICE);
     }
 
+    bool position_in_run() const override { return false; }
+
+    std::optional<xrt::run> head_run() override { return std::nullopt; }
+
     std::string describe() const override { return "classic xclbin + insts.bin from " + dir_; }
 
 private:
@@ -143,11 +148,20 @@ struct Decoder::Impl {
     std::unique_ptr<KernelSet> ks;
     Bo xres, zero, normw, xresf, hn, logits, lmpool, ptab, dkv, dstate;
     std::vector<Bo> pool, consts, act, lcfg, cache;  // cache: DeltaNet state or KV, per layer kind
-    std::deque<xrt::run> runs;  // the runlist refers to these; a deque keeps them in place
-    std::unique_ptr<xrt::runlist> rl;
+    // A token's runlist, for one position. With full ELFs, the next position's slot is
+    // prepared while the device runs the current one (the kernel set's position_in_run);
+    // classic uses slot 0 only and patches its stream in place.
+    struct Slot {
+        std::vector<xrt::run> runs;  // one per layer, in the runlist's order
+        std::unique_ptr<xrt::runlist> rl;
+        size_t pos = SIZE_MAX;
+    };
+    std::vector<xrt::run> linear_runs;  // position-free, shared by both slots (empty for full layers)
+    Slot slots[2];
     std::optional<xrt::run> ln, lm;
     const uint8_t* embed = nullptr;
     LoadStats stats;
+    RunTimes times;
 
     Bo bo(size_t bytes, bool zeroed = true) {
         auto b = std::make_unique<xrt::ext::bo>(dev, padup(bytes));
@@ -158,9 +172,9 @@ struct Decoder::Impl {
         return b;
     }
 
-    Impl(const Model& m, const Config& c, const std::string& dir, int threads) : model(m), cfg(c) {
+    Impl(const Model& m, const Config& c, const std::string& dir, Transport t, int threads) : model(m), cfg(c) {
         const auto t0 = clk::now();
-        ks = classic_kernels(dev, dir);
+        ks = make_kernels(dev, dir, t);
         const Tensor& et = m.tensor("model.embed_tokens.weight");
         if (et.dtype != "BF16" || et.bytes != size_t(c.vocab) * kHidden * 2) throw std::runtime_error("unexpected embedding table");
         embed = et.data;
@@ -246,27 +260,27 @@ struct Decoder::Impl {
         }
 
         // The token's runlist: 40 runs on one context, submitted once per token.
-        rl = std::make_unique<xrt::runlist>(ks->layer_context());
+        for (int L = 0; L < c.layers; ++L)
+            linear_runs.push_back(c.kinds[size_t(L)] == Kind::Linear ? layer_run(size_t(L)) : xrt::run());
+        prepare(slots[0], 0);
         const int a = ks->first_buffer_arg();
-        for (int L = 0; L < c.layers; ++L) {
-            const bool lin = c.kinds[size_t(L)] == Kind::Linear;
-            xrt::run& r = runs.emplace_back(ks->make_run(lin ? Stage::LayerLinear : Stage::LayerFull));
-            const size_t l = size_t(L);
-            r.set_arg(a + 0, *pool[l]);
-            r.set_arg(a + 1, *xres);
-            r.set_arg(a + 2, *consts[l]);
-            r.set_arg(a + 3, lin ? *dkv : *cache[l]);
-            r.set_arg(a + 4, *act[l]);
-            r.set_arg(a + 5, *ptab);
-            r.set_arg(a + 6, lin ? *cache[l] : *dstate);
-            r.set_arg(a + 7, *lcfg[l]);
-            rl->add(r);
-        }
         ln = ks->make_run(Stage::Norm);
         for (int i = 0; auto* b : {&xres, &zero, &normw, &xresf, &hn}) ln->set_arg(a + i++, **b);
         lm = ks->make_run(Stage::Head);
         for (int i = 0; auto* b : {&lmpool, &hn, &logits}) lm->set_arg(a + i++, **b);
         stats.total_ms = ms_since(t0);
+    }
+
+    // A new sequence: the DeltaNet state and the layers' scratch back to zero, as at load.
+    // The KV cache needs nothing: a position reads only the rows written before it.
+    void reset() {
+        for (int L = 0; L < cfg.layers; ++L) {
+            for (auto* b : {&act[size_t(L)], cfg.kinds[size_t(L)] == Kind::Linear ? &cache[size_t(L)] : nullptr}) {
+                if (!b) continue;
+                std::memset((*b)->map(), 0, (*b)->size());
+                (*b)->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+            }
+        }
     }
 
     void write_xres() { xres->sync(XCL_BO_SYNC_BO_TO_DEVICE, kHidden * 4, 0); }
@@ -276,14 +290,72 @@ struct Decoder::Impl {
         if (r.wait(kTimeout) != ERT_CMD_STATE_COMPLETED) throw std::runtime_error(std::string(what) + " run did not complete");
     }
 
+    // Layer L's run: pool xres consts kv|dkv act ptab state|dstate cfg (a linear layer gets
+    // the dummy kv, a full one the dummy state).
+    xrt::run layer_run(size_t l) {
+        const bool lin = cfg.kinds[l] == Kind::Linear;
+        xrt::run r = ks->make_run(lin ? Stage::LayerLinear : Stage::LayerFull);
+        const int a = ks->first_buffer_arg();
+        r.set_arg(a + 0, *pool[l]);
+        r.set_arg(a + 1, *xres);
+        r.set_arg(a + 2, *consts[l]);
+        r.set_arg(a + 3, lin ? *dkv : *cache[l]);
+        r.set_arg(a + 4, *act[l]);
+        r.set_arg(a + 5, *ptab);
+        r.set_arg(a + 6, lin ? *cache[l] : *dstate);
+        r.set_arg(a + 7, *lcfg[l]);
+        return r;
+    }
+
+    // Slot s runs position pos: the full-attention runs made for it (full ELFs), or the
+    // shared stream patched (classic); the head run first when the kernel set has one.
+    void prepare(Slot& s, size_t pos) {
+        ks->set_position(pos);
+        if (s.rl && !ks->position_in_run()) {
+            s.pos = pos;
+            return;
+        }
+        s.pos = SIZE_MAX;
+        s.runs.clear();
+        for (size_t l = 0; l < linear_runs.size(); ++l)
+            s.runs.push_back(cfg.kinds[l] == Kind::Linear ? linear_runs[l] : layer_run(l));
+        if (!s.rl) s.rl = std::make_unique<xrt::runlist>(ks->layer_context());
+        s.rl->reset();
+        if (auto h = ks->head_run()) s.rl->add(*h);
+        for (auto& r : s.runs) s.rl->add(r);
+        s.pos = pos;
+    }
+
     void run(size_t pos, bool head) {
         if (pos >= size_t(kMaxContext)) throw std::runtime_error("position " + std::to_string(pos) + " past the context");
-        ks->set_position(pos);
-        rl->execute();
-        if (rl->wait(kTimeout) == std::cv_status::timeout) throw std::runtime_error("layer runlist timed out");
+        const auto t0 = clk::now();
+        times = {};
+        const bool ahead = ks->position_in_run();
+        Slot* s = &slots[0];
+        if (ahead && slots[1].pos == pos) s = &slots[1];
+        else if (!ahead || slots[0].pos != pos) prepare(*s, pos);
+        times.prep_ms = ms_since(t0);
+        const auto t1 = clk::now();
+        s->rl->execute();
+        if (ahead && pos + 1 < size_t(kMaxContext)) {
+            // The next position, while the device runs this one; a failure here only means
+            // the next run() prepares it itself.
+            Slot& o = s == &slots[0] ? slots[1] : slots[0];
+            const auto t = clk::now();
+            try {
+                prepare(o, pos + 1);
+            } catch (const std::exception&) {
+                o.pos = SIZE_MAX;
+            }
+            times.ahead_ms = ms_since(t);
+        }
+        if (s->rl->wait(kTimeout) == std::cv_status::timeout) throw std::runtime_error("layer runlist timed out");
+        times.layers_ms = ms_since(t1);
         if (head) {
+            const auto t2 = clk::now();
             wait(*ln, "norm");
             wait(*lm, "lm head");
+            times.head_ms = ms_since(t2);
         }
     }
 
@@ -293,11 +365,12 @@ struct Decoder::Impl {
     }
 };
 
-Decoder::Decoder(const Model& model, const Config& config, const std::string& kernel_dir, int threads)
-    : p_(std::make_unique<Impl>(model, config, kernel_dir, threads)) {}
+Decoder::Decoder(const Model& model, const Config& config, const std::string& kernel_dir, Transport t, int threads)
+    : p_(std::make_unique<Impl>(model, config, kernel_dir, t, threads)) {}
 Decoder::~Decoder() = default;
 
 const LoadStats& Decoder::load_stats() const { return p_->stats; }
+const RunTimes& Decoder::last_run() const { return p_->times; }
 std::string Decoder::kernels() const { return p_->ks->describe(); }
 
 void Decoder::feed(int token) {
@@ -317,6 +390,7 @@ void Decoder::set_residual(const float* v) {
 }
 
 void Decoder::run(size_t pos, bool head) { p_->run(pos, head); }
+void Decoder::reset() { p_->reset(); }
 
 int Decoder::argmax(int n) {
     const float* v = p_->read_logits();
@@ -330,6 +404,65 @@ int Decoder::argmax(int n) {
 void Decoder::logits(std::vector<float>& out) {
     const float* v = p_->read_logits();
     out.assign(v, v + kLogitsBytes / 4);
+}
+
+// ---- generation ---------------------------------------------------------------------------
+
+int Session::pick(const GenerateOptions& opt, const std::vector<int>& history) {
+    if (!(opt.repetition_penalty > 1.0f)) return dec_.argmax(vocab_);
+    dec_.logits(buf_);
+    buf_.resize(size_t(vocab_));
+    const int n = int(history.size()), from = std::max(0, n - opt.penalty_window);
+    for (int i = from; i < n; ++i) {
+        const int t = history[size_t(i)];
+        if (t < 0 || t >= vocab_) continue;
+        if (std::find(history.begin() + from, history.begin() + i, t) != history.begin() + i) continue;
+        float& l = buf_[size_t(t)];
+        l = l > 0.0f ? l / opt.repetition_penalty : l * opt.repetition_penalty;
+    }
+    return int(std::max_element(buf_.begin(), buf_.end()) - buf_.begin());  // first maximum
+}
+
+GenerateResult Session::generate(const std::vector<int>& prompt, const GenerateOptions& opt) {
+    if (prompt.empty()) throw std::runtime_error("empty prompt");
+    GenerateResult res;
+    // Reuse the cache only when the prompt extends it: the last prompt token must run
+    // anyway, for its logits.
+    const bool extends = !cache_.empty() && prompt.size() > cache_.size() &&
+                         std::equal(cache_.begin(), cache_.end(), prompt.begin());
+    if (!extends) {
+        if (!cache_.empty()) dec_.reset();
+        cache_.clear();
+    }
+    res.reused = cache_.size();
+    if (prompt.size() + size_t(std::max(opt.max_tokens, 0)) > size_t(kMaxContext))
+        throw std::runtime_error("prompt plus max_tokens exceeds the context (" + std::to_string(kMaxContext) + ")");
+
+    auto t0 = clk::now();
+    for (size_t i = cache_.size(); i < prompt.size(); ++i) {
+        dec_.feed(prompt[i]);
+        dec_.run(i, i + 1 == prompt.size());  // the head only where a next token is wanted
+        cache_.push_back(prompt[i]);
+    }
+    res.prefill_ms = ms_since(t0);
+
+    t0 = clk::now();
+    std::vector<int> history = prompt;
+    for (int i = 0; i < opt.max_tokens; ++i) {
+        const int t = pick(opt, history);
+        res.tokens.push_back(t);
+        history.push_back(t);
+        if (std::find(opt.stop.begin(), opt.stop.end(), t) != opt.stop.end()) {
+            res.stopped_at_eos = true;
+            break;
+        }
+        if ((opt.on_token && !opt.on_token(t)) || i + 1 == opt.max_tokens) break;
+        dec_.feed(t);
+        dec_.run(cache_.size(), true);
+        cache_.push_back(t);
+    }
+    res.decode_ms = ms_since(t0);
+    return res;
 }
 
 }  // namespace onebit::npu::lax

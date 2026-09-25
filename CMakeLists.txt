@@ -182,7 +182,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/full_elf.cpp npu/lax_pack.cpp npu/lax_stream.cpp npu/model.cpp npu/pack.cpp npu/q4nx.cpp
+add_library(onebit_npu STATIC npu/full_elf.cpp npu/lax_elf.cpp npu/lax_pack.cpp npu/lax_stream.cpp npu/model.cpp npu/pack.cpp npu/q4nx.cpp
                             npu/tokenizer.cpp)
 # The lax packer's q8 -> q4_1 re-quantization must round every float32 step on its own,
 # as the reference packer's NumPy does (npu/lax_pack.h): no fused multiply-adds.
@@ -241,7 +241,7 @@ if(ONEBIT_NPU)
     if(NOT EXISTS "${ONEBIT_XRT_ROOT}/include/xrt/xrt_device.h")
         message(FATAL_ERROR "ONEBIT_NPU needs XRT; none at ONEBIT_XRT_ROOT=${ONEBIT_XRT_ROOT}")
     endif()
-    add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp npu/lax.cpp)
+    add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp npu/lax.cpp npu/lax_elf_kernels.cpp)
     target_include_directories(onebit_npu_lane SYSTEM PUBLIC ${ONEBIT_XRT_ROOT}/include)
     target_link_libraries(onebit_npu_lane PUBLIC onebit_npu ${ONEBIT_XRT_ROOT}/lib/libxrt_coreutil.so)
     target_sources(onebit PRIVATE app/unified.cpp app/npu_lax.cpp)
@@ -264,11 +264,32 @@ if(ONEBIT_NPU)
         add_test(NAME npu_lax_patches
                  COMMAND npu_lax_test --insts ${ONEBIT_NPU_LAX_KERNELS}/lax_a/insts.bin
                          --patches ${CMAKE_SOURCE_DIR}/tests/golden/npu_lax/lax_a_patches.tsv)
+        # The full-ELF position sites of lax_a/insts.elf (tests/golden/npu_lax/lax_a_elf_sites.tsv
+        # names its md5); with the harness's full ELFs for the same build, every assembled ELF
+        # byte for byte.
+        set(ONEBIT_NPU_LAX_ELF_GOLDEN "" CACHE PATH "harness/full_elf.py lax output for the same kernel build (lax_init.elf, lxf.elf, axf_p<N>.elf, ln.elf, lm.elf)")
+        set(_golden)
+        if(ONEBIT_NPU_LAX_ELF_GOLDEN)
+            set(_golden --golden ${ONEBIT_NPU_LAX_ELF_GOLDEN})
+        endif()
+        add_test(NAME npu_lax_elf
+                 COMMAND npu_lax_test --elf ${ONEBIT_NPU_LAX_KERNELS}
+                         --sites ${CMAKE_SOURCE_DIR}/tests/golden/npu_lax/lax_a_elf_sites.tsv ${_golden})
     endif()
     if(ONEBIT_NPU_LAX_MODEL AND ONEBIT_NPU_LAX_KERNELS AND ONEBIT_NPU_LAX_REF)
+        # Full ELFs (the default), and the classic xclbin path kept for A/B.
         add_test(NAME npu_lax_e2e
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_cpp.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS} ${ONEBIT_NPU_LAX_REF})
+                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS} ${ONEBIT_NPU_LAX_REF} elf)
+        add_test(NAME npu_lax_e2e_classic
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_cpp.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS} ${ONEBIT_NPU_LAX_REF} classic)
+    endif()
+    if(ONEBIT_NPU_LAX_MODEL AND ONEBIT_NPU_LAX_KERNELS)
+        # `1bit serve --device npu` on the 35B: the route, one chat round trip, no xclbin opened.
+        add_test(NAME npu_lax_serve
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_serve.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS})
     endif()
 endif()
 

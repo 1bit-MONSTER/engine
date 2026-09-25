@@ -29,6 +29,7 @@ OpenAI client.
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
+           [--npu-kernels DIR] [--npu-transport elf|classic]
 ```
 
 One model per process:
@@ -47,6 +48,7 @@ One model per process:
 | Model | `--device` | Runs on |
 |---|---|---|
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
+| Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) with the lax kernels | `auto`, `npu` | the NPU lax decode on full ELFs, in process (docs/npu-lax.md) |
 | `.gguf` | `auto`, `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md); without `ONEBIT_VULKAN`, the HRX build's |
 | `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md) |
 | `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
@@ -55,9 +57,21 @@ One model per process:
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 
+The lax decode needs the kernels `scripts/build-lax.sh` builds (docs/npu-lax.md, "Kernel
+directory"). `serve` looks for them in `--npu-kernels DIR`, else `<model dir>/npu/lax`, else
+`$ONEBIT_NPU_LAX_KERNELS`; a Qwen3.6-35B-A3B directory without them is not an NPU model
+directory. `--npu-transport classic` runs the same kernels through the xclbin path, for A/B.
+The decode keeps one conversation on the device: a request whose prompt extends the last
+one's tokens continues it, any other starts over at position 0.
+
+```sh
+1bit serve -m ~/models/Qwen3.6-35B-A3B-NPU2 --device npu --npu-kernels ~/.cache/lax/kernels
+```
+
 `chat_template_kwargs.enable_thinking: false` works on every device. The GPU
 backends apply the model's own chat template. The NPU route emits what Qwen3's
-template does: an empty think block after the assistant prefix.
+template does: an empty think block after the assistant prefix. For Qwen3.6-35B-A3B it
+also opens `<think>\n` when thinking is on, as that model's template does.
 
 For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
@@ -219,6 +233,24 @@ streaming:
 | `vulkan` | PASS (32 SSE chunks) |
 | `hrx` | PASS (32 SSE chunks), with no environment set up |
 | `zinc` | PASS (6 SSE chunks) |
+
+The 35B on the NPU: `tests/npu_lax_serve.sh` (ctest `npu_lax_serve`, with
+`-DONEBIT_NPU_LAX_MODEL` and `-DONEBIT_NPU_LAX_KERNELS`) serves Qwen3.6-35B-A3B under
+strace. On Strix Halo, 2026-09-24, `build/1bit` from branch `npu/lax-elf`, `model.q4nx`
+sha256 `688f1e153d10…3cf8de`:
+
+- Ready in 4.1-4.3 s with `model.q4nx` in the page cache (7.5 s once, when it was not).
+- The chat answers "The capital of France is Paris." (24 prompt tokens in 1.13 s, 7
+  generated in 0.42 s). The same request again answers the same after the decode starts
+  over.
+- A raw prompt that extends that turn reuses all 31 of its tokens
+  (`usage.prompt_tokens_details.cached_tokens`) and answers "The capital of Germany is
+  Berlin."
+- The same follow-up sent as chat messages reuses none of its 45 tokens, because the
+  template renders the earlier answer without its think block.
+- 15 SSE chunks stream, and no `.xclbin` is opened (the four `insts.elf` are).
+
+PASS.
 
 ctest runs these as `serve_e2e_<device>` when configured with
 `-DONEBIT_SERVE_TEST_GGUF=<gguf>` (and `serve_e2e_mlx` on macOS with

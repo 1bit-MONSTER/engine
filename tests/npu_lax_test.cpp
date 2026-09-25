@@ -16,6 +16,7 @@
 // npu_lax_test                                    (CI: pure host, no model)
 // npu_lax_test --model <dir> --sha256 <tsv> [--ref <dir>] [--only a,b,...] [--out <dir>] [--threads N]
 // npu_lax_test --insts <lax_a insts.bin> --patches <tsv>
+// npu_lax_test --elf <kernel dir> --sites <tsv> [--golden <dir>]
 //
 // The lax decode's host side (npu/lax_pack.h, npu/lax_stream.h) against the reference
 // packer, the open kernels' Python (third_party/OpenFlowLM-Next open_kernels/recipes/
@@ -35,12 +36,25 @@
 //
 // --insts: the position patches found in the lax_a stream equal the tsv (word, kind,
 // flags) the reference harness's table produced for the same build.
+//
+// CI also runs the full-ELF position sites (npu/lax_stream.h, elf_position_sites) on a
+// synthetic instruction ELF: which words and addends move, their values at a position,
+// the flag bit kept until assemble_full_elf clears it, and the malformed inputs refused.
+//
+// --elf: the position sites of the kernel directory's lax_a/insts.elf equal the tsv (the
+// investigation's attn_sites for the same build); with --golden, every full ELF
+// (npu/lax_elf.h) is byte-identical to the one the reference harness assembled and ran
+// (harness/full_elf.py lax: lax_init, lxf, axf_p<N>, ln, lm).
+#include "full_elf.h"
+#include "lax_elf.h"
 #include "lax_pack.h"
 #include "lax_stream.h"
 
+#include <algorithm>
 #include <atomic>
 #include <cstdio>
 #include <cstring>
+#include <filesystem>
 #include <fstream>
 #include <map>
 #include <mutex>
@@ -116,6 +130,141 @@ template <class F> std::string perm_sha(size_t n, F f) {
     return sha(b);
 }
 
+// ---- a synthetic instruction ELF (the layout aiebu-asm writes) ----------------------------
+
+struct Rel {
+    uint32_t offset, sym;
+    uint32_t addend;
+};
+
+// ELF32 LE with .shstrtab, .ctrltext, .dynstr, .dynsym (symbol 0 null, then one per
+// argument name) and .rela.dyn: what elf_position_sites and assemble_full_elf read.
+Bytes make_insts_elf(const std::vector<uint32_t>& ctrl, const std::vector<std::string>& args, const std::vector<Rel>& rels) {
+    auto put32 = [](Bytes& b, uint32_t v) { for (int i = 0; i < 4; ++i) b.push_back(uint8_t(v >> (8 * i))); };
+    auto put16 = [](Bytes& b, uint16_t v) { b.push_back(uint8_t(v)); b.push_back(uint8_t(v >> 8)); };
+    Bytes shstr = {0}, ct, dynstr = {0}, dynsym(16, 0), rela;
+    const std::vector<std::string> names = {"", ".shstrtab", ".ctrltext", ".dynstr", ".dynsym", ".rela.dyn"};
+    std::vector<uint32_t> name_off;
+    for (const auto& n : names) {
+        name_off.push_back(uint32_t(shstr.size()));
+        shstr.insert(shstr.end(), n.begin(), n.end());
+        shstr.push_back(0);
+    }
+    for (uint32_t v : ctrl) put32(ct, v);
+    for (const auto& a : args) {
+        put32(dynsym, uint32_t(dynstr.size()));
+        put32(dynsym, 0), put32(dynsym, 0);
+        dynsym.push_back(0x11), dynsym.push_back(0), put16(dynsym, 0);
+        dynstr.insert(dynstr.end(), a.begin(), a.end());
+        dynstr.push_back(0);
+    }
+    for (const auto& r : rels) put32(rela, r.offset), put32(rela, (r.sym << 8) | 5), put32(rela, r.addend);
+    Bytes e(52, 0);
+    const std::vector<const Bytes*> blobs = {&shstr, &ct, &dynstr, &dynsym, &rela};
+    std::vector<uint32_t> off;
+    for (const Bytes* b : blobs) {
+        while (e.size() % 4) e.push_back(0);
+        off.push_back(uint32_t(e.size()));
+        e.insert(e.end(), b->begin(), b->end());
+    }
+    while (e.size() % 4) e.push_back(0);
+    const uint32_t shoff = uint32_t(e.size());
+    e.resize(e.size() + 40 * names.size(), 0);
+    const uint8_t ident[] = {0x7f, 'E', 'L', 'F', 1, 1, 1};
+    std::memcpy(e.data(), ident, sizeof ident);
+    auto w32 = [&](size_t o, uint32_t v) { std::memcpy(e.data() + o, &v, 4); };
+    auto w16 = [&](size_t o, uint16_t v) { std::memcpy(e.data() + o, &v, 2); };
+    w32(0x20, shoff);
+    w16(0x2E, 40), w16(0x30, uint16_t(names.size())), w16(0x32, 1);
+    const uint32_t types[] = {0, 3, 1, 3, 11, 4};
+    for (size_t i = 1; i < names.size(); ++i) {
+        const size_t h = shoff + 40 * i;
+        w32(h, name_off[i]), w32(h + 4, types[i]), w32(h + 16, off[i - 1]), w32(h + 20, uint32_t(blobs[i - 1]->size()));
+    }
+    return e;
+}
+
+uint32_t rd(const Bytes& b, size_t o) {
+    uint32_t v;
+    std::memcpy(&v, b.data() + o, 4);
+    return v;
+}
+
+void elf_sites_unit() {
+    // TXN header, then per transfer the BD blockwrite (register at +2, BD words from +4:
+    // length, address = 0) and the DDR_PATCH on the BD's address register (arg at +8,
+    // offset at +10). Transfers: the KV window fill (arg 3, offset 0), a weight fill (arg
+    // 0), the row drain (arg 3, one row), the record fill (arg 5, folded: bit 31 set).
+    std::vector<uint32_t> w = {0x06040100, 0, 0, 0};
+    std::vector<Rel> rels;
+    // symbols: 1 -> "3" (arg 0), 2 -> "6" (arg 3), 3 -> "8" (arg 5)
+    auto xfer = [&](uint32_t reg, uint32_t sym, uint32_t arg, uint32_t len, uint32_t off) {
+        const size_t bd = w.size();
+        w.insert(w.end(), {0x01, 0, reg, 32, len, 0, 0, 0, 0, 0, 0, 0});
+        w.insert(w.end(), {0x81, 0, 0, 0, 0, 0, reg + 4, 0, arg, 0, off, 0});
+        rels.push_back({uint32_t(4 * (bd + 4)), sym, off});
+    };
+    xfer(0x1D000, 2, 3, 512, 0);
+    w.insert(w.end(), {0x00, 0, 0, 0, 0, 0});
+    xfer(0x1D020, 1, 0, 99, 0x1E1E0000);
+    xfer(0x1D040, 2, 3, 64, uint32_t(kKvRow));
+    w.insert(w.end(), {0x80, 0, 0, 0});
+    xfer(0x1D060, 3, 5, 64, uint32_t(kPtabRow) | 0x80000000u);
+    w[2] = 10, w[3] = uint32_t(4 * w.size());
+    const std::vector<std::string> args = {"3", "6", "8"};
+    Bytes e = make_insts_elf(w, args, rels);
+
+    const auto sites = elf_position_sites(e, kKvRow);
+    check(sites.size() == 7, "ELF: 7 position sites (window length, 3 x (DDR_PATCH word, addend))");
+    auto find = [&](PosPatch::Kind k, ElfPosSite::Where where) {
+        for (const auto& x : sites)
+            if (x.kind == k && x.where == where) return x;
+        throw std::runtime_error("site missing");
+    };
+    check(find(PosPatch::WindowLength, ElfPosSite::CtrlWord).index == 8, "ELF: window length = the fill BD's first word");
+    check(find(PosPatch::WindowOffset, ElfPosSite::CtrlWord).index == 26 &&
+              find(PosPatch::WindowOffset, ElfPosSite::Addend).index == 0,
+          "ELF: window offset = DDR_PATCH word 26 + relocation 0");
+    check(find(PosPatch::RowDrain, ElfPosSite::CtrlWord).index == 80 &&
+              find(PosPatch::RowDrain, ElfPosSite::Addend).index == 2,
+          "ELF: row drain = its DDR_PATCH word + relocation 2 (the weight fill's is skipped)");
+    const auto rec = find(PosPatch::Record, ElfPosSite::Addend);
+    check(rec.index == 3 && rec.flags == 0x80000000u, "ELF: record = relocation 3, folded bit kept");
+
+    apply_elf_position(e, sites, 7, kKvRow, kPtabRow);
+    const ElfSection ct = elf_section(e, ".ctrltext"), rl = elf_section(e, ".rela.dyn");
+    auto word = [&](size_t i) { return rd(e, ct.offset + 4 * i); };
+    auto addend = [&](size_t k) { return rd(e, rl.offset + 12 * k + 8); };
+    check(word(8) == 7 * kKvRow / 4, "ELF position 7: window length 7 rows in words");
+    check(word(26) == 0 && addend(0) == 0, "ELF position 7: window from row 0 (word and addend)");
+    check(word(80) == 7 * kKvRow && addend(2) == 7 * kKvRow, "ELF position 7: row drain at row 7 (word and addend)");
+    check(word(108) == (7 * kPtabRow | 0x80000000u) && addend(3) == (7 * kPtabRow | 0x80000000u),
+          "ELF position 7: record at ptab row 7, folded bit kept (word and addend)");
+    check(addend(1) == 0x1E1E0000 && word(56) == 0x1E1E0000, "ELF position 7: the weight fill untouched");
+    apply_elf_position(e, sites, 0, kKvRow, kPtabRow);
+    check(word(8) == kKvRow / 4 && addend(2) == 0 && addend(3) == 0x80000000u, "ELF position 0: one masked row, row 0");
+
+    // What XRT gets: the assembled full ELF has the fold cleared in the addend and the word.
+    apply_elf_position(e, sites, 5, kKvRow, kPtabRow);
+    const Bytes full = assemble_full_elf(e, Bytes(64, 0xAB), "axf5", PdiMode::kNone);
+    const ElfSection fct = elf_section(full, ".ctrltext.0"), frl = elf_section(full, ".rela.dyn");
+    check(rd(full, frl.offset + 12 * 3 + 8) == 5 * kPtabRow && rd(full, fct.offset + 4 * 80) == 5 * kKvRow && rd(full, fct.offset + 4 * 108) == 5 * kPtabRow,
+          "ELF assembled at position 5: record addend and word without bit 31, drain word 5 rows");
+
+    // Refused: a relocation naming another argument, and two relocations on one BD.
+    auto throws = [](auto f) { try { f(); } catch (const std::exception&) { return true; } return false; };
+    auto bad = rels;
+    bad[2].sym = 1;
+    check(throws([&] { elf_position_sites(make_insts_elf(w, args, bad), kKvRow); }), "ELF: a drain relocation on arg 0 is refused");
+    bad = rels;
+    bad.push_back(rels[2]);
+    check(throws([&] { elf_position_sites(make_insts_elf(w, args, bad), kKvRow); }), "ELF: two relocations on one BD are refused");
+    bad = rels;
+    bad[3].addend = 0x80000800;
+    check(throws([&] { elf_position_sites(make_insts_elf(w, args, bad), kKvRow); }),
+          "ELF: an addend that disagrees with its DDR_PATCH word is refused");
+}
+
 void unit() {
     check(sha_str("") == "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855", "sha256 of \"\"");
     check(sha_str("abc") == "ba7816bf8f01cfea414140de5dae2223b00361a396177a9cb410ff61f20015ad", "sha256 of \"abc\"");
@@ -183,6 +332,8 @@ void unit() {
     check(w[4 + 4 + 12 + 12 + 6 + 12 + 7 + 12 + 10] == 12345, "weight fill untouched");
     apply_position(w, patches, 0, kKvRow, kPtabRow);
     check(w[4 + 4 + 4] == kKvRow / 4, "position 0 streams one (masked) row");
+
+    elf_sites_unit();
 
     const auto cw = cfg_words(0x1'2345'6780'0000ull);
     check(cw[0] == 0x67800000u && cw[1] == 0x12345u && cw[2] == 0x1D21C && cw[3] == 0x1D214 && cw[9] == 0x1D214,
@@ -300,10 +451,74 @@ int insts_mode(const std::string& insts, const std::string& expect) {
     return 0;
 }
 
+void pdi_less_positions(const ElfInputs& in);
+
+// tsv lines: where (word | reloc), index, kind, flags (hex)
+int elf_mode(const std::string& dir, const std::string& expect, const std::string& golden) {
+    const auto in = ElfInputs::read(dir);
+    std::ifstream f(expect);
+    if (!f) throw std::runtime_error("cannot read " + expect);
+    std::vector<ElfPosSite> want;
+    for (std::string line; std::getline(f, line);) {
+        if (line.empty() || line[0] == '#') continue;
+        std::istringstream l(line);
+        std::string where;
+        size_t index;
+        int kind;
+        uint32_t flags;
+        if (l >> where >> index >> kind >> std::hex >> flags)
+            want.push_back({0, PosPatch::Kind(kind), flags, where == "reloc" ? ElfPosSite::Addend : ElfPosSite::CtrlWord, index});
+    }
+    bool same = in.sites.size() == want.size();
+    for (size_t i = 0; same && i < want.size(); ++i)
+        same = in.sites[i].where == want[i].where && in.sites[i].index == want[i].index && in.sites[i].kind == want[i].kind &&
+               in.sites[i].flags == want[i].flags;
+    for (const auto& x : in.sites)
+        std::printf("  %s %zu kind %d flags %08x\n", x.where == ElfPosSite::Addend ? "reloc" : "word ", x.index, int(x.kind),
+                    x.flags);
+    check(same, "lax_a insts.elf position sites = the investigation's attn_sites");
+    pdi_less_positions(in);
+    if (golden.empty()) return 0;
+    auto cmp = [&](const Bytes& ours, const std::string& file) {
+        const std::string p = golden + "/" + file;
+        if (!std::filesystem::exists(p)) {
+            check(false, file + " missing in " + golden);
+            return;
+        }
+        const Bytes ref = read_file(p);
+        size_t first = 0;
+        while (first < std::min(ours.size(), ref.size()) && ours[first] == ref[first]) ++first;
+        check(ours == ref, "full ELF " + file + " = the harness's" +
+                               (ours == ref ? "" : " (sizes " + std::to_string(ours.size()) + " / " + std::to_string(ref.size()) +
+                                                       ", first difference at byte " + std::to_string(first) + ")"));
+    };
+    cmp(init_elf(in), "lax_init.elf");
+    cmp(linear_elf(in), "lxf.elf");
+    for (size_t p = 0; std::filesystem::exists(golden + "/axf_p" + std::to_string(p) + ".elf"); ++p)
+        cmp(full_elf(in, p, true), "axf_p" + std::to_string(p) + ".elf");
+    cmp(norm_elf(in), "ln.elf");
+    cmp(head_elf(in), "lm.elf");
+    return 0;
+}
+
+// What the decode adds per position is the same ELF without the PDI (npu/lax_elf.h).
+void pdi_less_positions(const ElfInputs& in) {
+    bool same = true;
+    for (size_t p : {size_t(0), size_t(1), size_t(2), size_t(4095)}) {
+        const Bytes a = full_elf(in, p), b = full_elf(in, p, true);
+        same = same && elf_section(a, ".pdi.1").size == 0;
+        for (const char* sec : {".ctrltext.0", ".rela.dyn", ".dynsym", ".dynstr", ".symtab", ".strtab", ".note.xrt.UID"}) {
+            const ElfSection x = elf_section(a, sec), y = elf_section(b, sec);
+            same = same && x.size == y.size && std::equal(a.begin() + x.offset, a.begin() + x.offset + x.size, b.begin() + y.offset);
+        }
+    }
+    check(same, "position configs: no PDI, control code, relocations and symbols as with it (positions 0, 1, 2, 4095)");
+}
+
 }  // namespace
 
 int main(int argc, char** argv) {
-    std::string model, table, ref, only, out, insts, patches;
+    std::string model, table, ref, only, out, insts, patches, elf, sites, golden;
     int threads = 0;
     for (int i = 1; i < argc; ++i) {
         const std::string a = argv[i];
@@ -316,6 +531,9 @@ int main(int argc, char** argv) {
         else if (a == "--threads") threads = std::stoi(next());
         else if (a == "--insts") insts = next();
         else if (a == "--patches") patches = next();
+        else if (a == "--elf") elf = next();
+        else if (a == "--sites") sites = next();
+        else if (a == "--golden") golden = next();
         else {
             std::fprintf(stderr, "unknown argument %s\n", a.c_str());
             return 2;
@@ -324,6 +542,7 @@ int main(int argc, char** argv) {
     try {
         if (!model.empty()) model_mode(model, table, ref, only, out, threads);
         else if (!insts.empty()) insts_mode(insts, patches);
+        else if (!elf.empty()) elf_mode(elf, sites, golden);
         else unit();
     } catch (const std::exception& e) {
         std::printf("FAIL %s\n", e.what());

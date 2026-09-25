@@ -32,11 +32,21 @@
 // the offset word; that bit is kept. Layout from the open kernels' harness
 // (open_kernels/harness/stream_patch.hpp, attn_table / attn_apply; MIT), re-implemented.
 //
+// Full ELFs. XRT's ELF flow does not read the DDR_PATCH offset word: aiebu-asm moves
+// every offset into the .rela.dyn addend of the relocation on the BD the patch rewrites
+// (type 5, at the BD's first word; the BD's address word is zero), and XRT patches the BD
+// from bo.address() + that addend. So on the ELF path a position is written at the
+// window BD's length word, and at both the DDR_PATCH word and the relocation addend of
+// the three offset patches. elf_position_sites derives those seven places from an
+// instruction ELF (lax_a's insts.elf) the way position_patches does for insts.bin.
+//
 // Layer config (cfg, 4 KiB per layer): words 0..1 the layer pool's device address
 // (bo.address() + 0x80000000), which the on-device router forms the routed experts'
 // addresses from; words 2..9 each column's weight-stream MM2S queue register (the merged
 // lax design's shim allocation; open_kernels model/lax_decode_cfg.py QUEUES).
 #pragma once
+
+#include "full_elf.h"
 
 #include <array>
 #include <cstddef>
@@ -63,6 +73,27 @@ std::vector<PosPatch> position_patches(std::span<const uint32_t> words, size_t k
 // Write position pos into the stream.
 void apply_position(std::span<uint32_t> words, const std::vector<PosPatch>& patches, size_t pos, size_t kv_row,
                     size_t ptab_row);
+
+// The value a patch of that kind takes at position pos, before its flags.
+uint32_t position_value(PosPatch::Kind kind, size_t pos, size_t kv_row, size_t ptab_row);
+
+struct ElfPosSite {
+    enum Where : uint8_t { CtrlWord, Addend };
+    size_t offset;       // byte offset in the ELF file
+    PosPatch::Kind kind;
+    uint32_t flags;      // bits to keep (the folded 0x80000000 of args >= 5; full_elf clears it)
+    Where where;
+    size_t index;        // the .ctrltext word, or the .rela.dyn entry
+};
+
+// The position sites of a full-attention instruction ELF: the window length word, and
+// per offset patch its DDR_PATCH word and the addend of the one relocation on its BD
+// (whose symbol must name the patch's argument). Throws unless each is found exactly once.
+std::vector<ElfPosSite> elf_position_sites(const Bytes& insts_elf, size_t kv_row);
+
+// Write position pos into an instruction ELF.
+void apply_elf_position(Bytes& insts_elf, const std::vector<ElfPosSite>& sites, size_t pos,
+                        size_t kv_row, size_t ptab_row);
 
 constexpr std::array<uint32_t, 8> kQueues = {0x1D21C, 0x1D214, 0x1D21C, 0x1D21C, 0x1D21C, 0x1D21C, 0x1D214, 0x1D214};
 

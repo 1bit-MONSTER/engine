@@ -14,22 +14,23 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# npu_lax_cpp.sh <1bit> <model-dir> <kernel-dir> <ref-dir>
+# npu_lax_cpp.sh <1bit> <model-dir> <kernel-dir> <ref-dir> [elf|classic]
 #
 # The Qwen3.6-35B-A3B lax decode driven by the engine itself (`1bit npu-lax`, no Python):
 # three positions from the reference's residual inputs, each one runlist submit plus the
 # norm and the lm head, scored against the fp64 reference (corr > 0.9999, same argmax);
-# then one greedy chat turn, which must answer with Paris.
+# then again after a reset (bit-identical logits); then one greedy chat turn, which must
+# answer with Paris. The kernel transport is full ELFs unless classic is given.
 #   <kernel-dir>  scripts/build-lax.sh's <prefix>/kernels
 #   <ref-dir>     open_kernels/model/make_decode.py --requant --tokens 3 output
 # The NPU is shared: run it under the box's lock, e.g. flock <lockfile> ctest -R npu_lax_e2e.
 set -euo pipefail
 bin=${1:?usage: npu_lax_cpp.sh <1bit> <model-dir> <kernel-dir> <ref-dir>}
-model=${2:?model dir} kernels=${3:?kernel dir} ref=${4:?reference dir}
+model=${2:?model dir} kernels=${3:?kernel dir} ref=${4:?reference dir} transport=${5:-elf}
 
-"$bin" npu-lax --model "$model" --kernels "$kernels" --parity "$ref" --tokens 3
+"$bin" npu-lax --model "$model" --kernels "$kernels" --transport "$transport" --parity "$ref" --tokens 3
 
-answer=$("$bin" npu-lax --model "$model" --kernels "$kernels" -n 32 \
+answer=$("$bin" npu-lax --model "$model" --kernels "$kernels" --transport "$transport" -n 32 \
     "What is the capital of France? Answer in one sentence.")
 echo "chat: $answer"
 grep -q Paris <<< "$answer"

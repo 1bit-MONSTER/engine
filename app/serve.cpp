@@ -14,6 +14,7 @@
 // limitations under the License.
 
 // `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD] [--adaptive]`
+//                        [--npu-kernels DIR] [--npu-transport elf|classic]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -26,6 +27,8 @@
 //
 // Which device runs the model follows from the model and --device:
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
+//   Qwen3.6-35B-A3B's Q4NX directory            -> the NPU lax decode from full ELFs, in
+//                                                  process (docs/npu-lax.md)
 //   a .gguf, --device vulkan                    -> the upstream llama.cpp build's
 //                                                  llama-server (else the HRX build's)
 //   a .gguf, --device hrx                       -> the HRX build's llama-server
@@ -103,6 +106,7 @@ struct Options {
     bool adaptive = false;
     int adaptive_at = 1;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
+    std::string npu_kernels, npu_transport;  // the lax decode's kernels and their transport
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -581,8 +585,9 @@ void usage(FILE* out) {
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
-                 "  <model>: an NPU model directory (model.q4nx + npu/), a .gguf file, or with\n"
-                 "           --device mlx a Hugging Face id (mlx-community/...)\n");
+                 "                  [--npu-kernels DIR] [--npu-transport elf|classic]   Qwen3.6-35B-A3B's lax kernels\n"
+                 "  <model>: an NPU model directory (model.q4nx + npu/, or Qwen3.6-35B-A3B's with the lax\n"
+                 "           kernels), a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
 }
 
 }  // namespace
@@ -616,6 +621,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
         else if (a == "--embed") o.embed = next();
         else if (a == "--rerank") o.rerank = next();
+        else if (a == "--npu-kernels") o.npu_kernels = next();
+        else if (a == "--npu-transport") o.npu_transport = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
@@ -626,10 +633,15 @@ int run_serve(int argc, char** argv) {
         if (o.device != "auto" && o.device != "npu")
             throw std::runtime_error("an NPU model directory runs on --device npu");
 #ifdef ONEBIT_NPU
-        if (!is_npu_model_dir(o.model)) throw std::runtime_error(o.model + " is not an NPU model directory");
-        // The NPU lane serves in process (unified.cpp).
+        if (!is_npu_model_dir(o.model, o.npu_kernels))
+            throw std::runtime_error(o.model + " is not an NPU model directory (the fast lane needs npu/; "
+                                     "Qwen3.6-35B-A3B needs the lax kernels: --npu-kernels, <dir>/npu/lax or "
+                                     "$ONEBIT_NPU_LAX_KERNELS)");
+        // The NPU serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+        if (!o.npu_kernels.empty()) { args.push_back("--kernels"); args.push_back(o.npu_kernels); }
+        if (!o.npu_transport.empty()) { args.push_back("--transport"); args.push_back(o.npu_transport); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
         return run_unified(int(av.size()), av.data());

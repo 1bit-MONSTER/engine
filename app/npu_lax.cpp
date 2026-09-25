@@ -101,7 +101,8 @@ int single_id(const npu::Tokenizer& tok, const char* text) {
 int run_npu_lax(int argc, char** argv) {
     const auto t_start = clk::now();
     std::string model_dir, kernel_dir, parity, dump;
-    int max_new = 256, tokens = 3, threads = 0;
+    int max_new = 256, tokens = 3, threads = 0, bench = 0;
+    lax::Transport transport = lax::Transport::Elf;
     std::vector<std::string> prompts;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -116,14 +117,21 @@ int run_npu_lax(int argc, char** argv) {
         else if (a == "--parity") parity = next();
         else if (a == "--tokens") tokens = std::stoi(next());
         else if (a == "--dump") dump = next();
+        else if (a == "--transport") transport = lax::parse_transport(next());
+        else if (a == "--bench") bench = std::stoi(next());
         else if (a == "--help" || a == "-h") {
             std::printf(
                 "usage: 1bit npu-lax --model <dir> --kernels <dir> [-n 256] [--threads N] [\"prompt\" ...]\n"
                 "       1bit npu-lax --model <dir> --kernels <dir> --parity <ref dir> [--tokens 3] [--dump <dir>]\n"
-                "  --model    Qwen3.6-35B-A3B Q4NX directory (model.q4nx, config.json, tokenizer.json)\n"
-                "  --kernels  scripts/build-lax.sh's <prefix>/kernels (lax_l, lax_a, ln, lm_head_q8)\n"
-                "  --parity   make_decode.py --requant output: runs xres<t>.bin at position t and scores\n"
-                "             the logits against ref_logits<_tN>.bin (corr > 0.9999, same argmax)\n"
+                "       1bit npu-lax --model <dir> --kernels <dir> --bench N\n"
+                "  --model      Qwen3.6-35B-A3B Q4NX directory (model.q4nx, config.json, tokenizer.json)\n"
+                "  --kernels    scripts/build-lax.sh's <prefix>/kernels (lax_l, lax_a, ln, lm_head_q8)\n"
+                "  --transport  elf (full ELFs, the default) or classic (xclbin + insts.bin)\n"
+                "  --parity     make_decode.py --requant output: runs xres<t>.bin at position t and scores\n"
+                "               the logits against ref_logits<_tN>.bin (corr > 0.9999, same argmax), then\n"
+                "               again after reset(), which must give the same logits bit for bit\n"
+                "  --bench      N tokens at positions 0..N-1, twice (new and cached position configs);\n"
+                "               prints the mean host prep, 40-layer and head times\n"
                 "Without prompts, reads one prompt per line from stdin; the conversation is one session.\n");
             return 0;
         } else if (!a.empty() && a[0] == '-') throw std::runtime_error("unknown option " + a);
@@ -134,7 +142,7 @@ int run_npu_lax(int argc, char** argv) {
     const npu::Model model(model_dir);
     const auto cfg = lax::Config::from_model(model, model_dir);
     std::fprintf(stderr, "[packing %s onto the NPU...]\n", model_dir.c_str());
-    lax::Decoder dec(model, cfg, kernel_dir, threads);
+    lax::Decoder dec(model, cfg, kernel_dir, transport, threads);
     const auto& ls = dec.load_stats();
     std::fprintf(stderr, "[ready in %.1f s since process start: buffers %.1f s, packing %.2f GB %.1f s; %s]\n",
                  sec_since(t_start), ls.buffers_ms / 1000, double(ls.packed_bytes) / 1e9, ls.pack_ms / 1000,
@@ -143,6 +151,7 @@ int run_npu_lax(int argc, char** argv) {
     if (!parity.empty()) {
         bool all = true;
         std::vector<float> lg;
+        std::vector<std::vector<float>> first;
         for (int t = 0; t < tokens; ++t) {
             const auto x = read_f32(parity + "/xres" + std::to_string(t) + ".bin");
             if (x.size() < lax::kHidden) throw std::runtime_error("xres" + std::to_string(t) + ".bin is short");
@@ -156,9 +165,47 @@ int run_npu_lax(int argc, char** argv) {
                     .write(reinterpret_cast<const char*>(lg.data()), std::streamsize(lg.size() * 4));
             std::fprintf(stderr, "[position %d: %.1f ms]\n", t, ms);
             all = compare(t, lg, read_f32(parity + "/ref_logits" + sfx(t) + ".bin")) && all;
+            first.push_back(lg);
+        }
+        // A second sequence after reset() must see nothing of the first.
+        dec.reset();
+        for (int t = 0; t < tokens; ++t) {
+            const auto x = read_f32(parity + "/xres" + std::to_string(t) + ".bin");
+            dec.set_residual(x.data());
+            dec.run(size_t(t), true);
+            dec.logits(lg);
+            const bool same = lg == first[size_t(t)];
+            std::printf("position %d after reset: logits %s\n", t, same ? "bit-identical PASS" : "differ FAIL");
+            all = same && all;
         }
         std::printf("%s\n", all ? "PASS" : "FAIL");
         return all ? 0 : 1;
+    }
+
+    if (bench > 0) {
+        const npu::Tokenizer tok(model_dir + "/tokenizer.json");
+        const int token = single_id(tok, "<|im_start|>");
+        for (int pass = 0; pass < 2; ++pass) {
+            dec.reset();
+            lax::RunTimes sum;
+            const auto t0 = clk::now();
+            for (int p = 0; p < bench; ++p) {
+                dec.feed(token);
+                dec.run(size_t(p), true);
+                const auto& r = dec.last_run();
+                sum.prep_ms += r.prep_ms;
+                sum.layers_ms += r.layers_ms;
+                sum.head_ms += r.head_ms;
+                sum.ahead_ms += r.ahead_ms;
+            }
+            const double total = sec_since(t0) * 1000 / bench;
+            std::printf("bench %s: %d tokens, per token %.2f ms (%.1f tok/s): prep %.3f ms, 40 layers %.2f ms "
+                        "(%.3f ms of it preparing the next), norm + lm head %.2f ms\n",
+                        pass ? "cached positions" : "new positions", bench, total, 1000 / total, sum.prep_ms / bench,
+                        sum.layers_ms / bench, sum.ahead_ms / bench, sum.head_ms / bench);
+        }
+        std::fprintf(stderr, "[%s]\n", dec.kernels().c_str());
+        return 0;
     }
 
     const npu::Tokenizer tok(model_dir + "/tokenizer.json");

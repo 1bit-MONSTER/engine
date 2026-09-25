@@ -81,6 +81,12 @@ size_t uid_offset(const Bytes& e) {
 
 }  // namespace
 
+ElfSection elf_section(const Bytes& elf, const std::string& name) {
+    const Section s = section(sections(elf), name.c_str());
+    if (uint64_t(s.offset) + s.size > elf.size()) fail(name + " runs past the end of the file");
+    return {s.offset, s.size};
+}
+
 Bytes read_file(const std::string& path) {
     std::ifstream f(path, std::ios::binary);
     if (!f) throw std::runtime_error("cannot read " + path);
@@ -115,10 +121,14 @@ Bytes derive_context(const Bytes& ctx1, const ContextMap& map, int n) {
     const uint32_t blocks = uint32_t(n + ContextMap::kBlock - 1) / ContextMap::kBlock;
     for (const auto& w : map.words)
         wr32(e, w.offset, w.step ? w.base + uint32_t(n - 1) * w.step : w.base * blocks);
+    refresh_uid(e);
+    return e;
+}
+
+void refresh_uid(Bytes& e) {
     const Section ct = section(sections(e), ".ctrltext");
     const auto digest = md5({e.data() + ct.offset, ct.size});
     std::memcpy(e.data() + uid_offset(e), digest.data(), 16);
-    return e;
 }
 
 // ---- Full-ELF assembly ----

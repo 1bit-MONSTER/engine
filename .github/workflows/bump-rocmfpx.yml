@@ -15,8 +15,14 @@
 #
 # Keep third_party/llama.cpp-vulkan on upstream llama.cpp's latest release
 #
-# Keeps third_party/llama.cpp-rocmfpx (the lean option, docs/lean.md) current: once a
-# week, when charlie12345/ROCmFPX's main has moved, open a PR here moving the submodule.
+# Keeps third_party/llama.cpp-rocmfpx (the lean option, docs/lean.md) current. The engine
+# pins 1bit/vulkan-rocmi4 on our fork 1bit-MONSTER/ROCmFPX: charlie12345/ROCmFPX's main plus
+# our commits (ROCmI4 on Vulkan). Once a week, when upstream main has moved past our base, it
+#   1. syncs the fork's main with upstream,
+#   2. rebases our commits onto upstream main and moves 1bit/vulkan-rocmi4 there (the old
+#      head is kept as a tag, rocmi4-<sha>),
+#   3. opens a PR here moving the submodule to the rebased head.
+# A rebase conflict fails the run: rebase 1bit/vulkan-rocmi4 by hand.
 # ROCmFPX publishes no releases, and its main moves many times a day, so weekly.
 # GitHub-hosted CI has no GPU: rerun docs/lean.md's table on Strix Halo before merging.
 #
@@ -53,7 +59,7 @@ jobs:
         with:
           token: ${{ secrets.HRX_BUMP_TOKEN }}
 
-      - name: Compare with ROCmFPX main
+      - name: Rebase our commits onto ROCmFPX main
         id: pins
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
@@ -61,10 +67,30 @@ jobs:
           set -euo pipefail
           upstream=$(gh api repos/charlie12345/ROCmFPX/commits/main --jq .sha)
           ours=$(git ls-tree HEAD third_party/llama.cpp-rocmfpx | awk '{print $3}')
-          echo "upstream ${upstream}, ours ${ours}"
+          git init -q /tmp/fork && cd /tmp/fork
+          git remote add up https://github.com/charlie12345/ROCmFPX.git
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/ROCmFPX.git"
+          git fetch -q --filter=blob:none up main
+          git fetch -q --filter=blob:none fork 1bit/vulkan-rocmi4
+          head=$(git rev-parse FETCH_HEAD)
+          base=$(git merge-base "$head" "$upstream")
+          echo "upstream ${upstream}, our base ${base}, our head ${head}, engine pin ${ours}"
+          if [ "$base" = "$upstream" ]; then
+            { echo "changed=false"; } >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          gh api -X POST repos/1bit-MONSTER/ROCmFPX/merge-upstream -f branch=main > /dev/null
+          git checkout -q --detach "$head"
+          if ! git -c user.name=rocmfpx-bump -c user.email=rocmfpx-bump@users.noreply.github.com rebase -q --onto "$upstream" "$base"; then
+            git rebase --abort || true
+            echo "::error::our commits on 1bit/vulkan-rocmi4 do not rebase onto ROCmFPX ${upstream:0:12}; rebase them by hand"
+            exit 1
+          fi
+          rebased=$(git rev-parse HEAD)
+          git tag "rocmi4-${head:0:12}" "$head"
+          git push -q fork "refs/tags/rocmi4-${head:0:12}"
+          git push -q --force-with-lease="refs/heads/1bit/vulkan-rocmi4:$head" fork "$rebased:refs/heads/1bit/vulkan-rocmi4"
           {
-            echo "upstream=$upstream"; echo "ours=$ours"
-            if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
+            echo "changed=true"; echo "upstream=$rebased"; echo "ours=$ours"; echo "base=$upstream"
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the bump PR
@@ -73,21 +99,22 @@ jobs:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
           OURS: ${{ steps.pins.outputs.ours }}
+          BASE: ${{ steps.pins.outputs.base }}
         run: |
           set -euo pipefail
           branch="bump-rocmfpx/${UPSTREAM:0:12}"
           if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
             echo "$branch already exists"; exit 0
           fi
-          count=$(gh api "repos/charlie12345/ROCmFPX/compare/${OURS}...${UPSTREAM}" --jq .ahead_by || echo "?")
+          count=$(gh api "repos/charlie12345/ROCmFPX/compare/${OURS}...${BASE}" --jq .ahead_by 2>/dev/null || echo "?")
           git config user.name "rocmfpx-bump"
           git config user.email "rocmfpx-bump@users.noreply.github.com"
           git switch -c "$branch"
           git update-index --cacheinfo "160000,$UPSTREAM,third_party/llama.cpp-rocmfpx"
-          git commit -q -m "Bump ROCmFPX (lean): charlie12345/ROCmFPX ${UPSTREAM:0:12}"
+          git commit -q -m "Bump ROCmFPX (lean): 1bit/vulkan-rocmi4 ${UPSTREAM:0:12} on charlie12345/ROCmFPX ${BASE:0:12}"
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Bump ROCmFPX (lean): ${UPSTREAM:0:12}" \
-            --body "Moves third_party/llama.cpp-rocmfpx from \`${OURS:0:12}\` to ROCmFPX main \`${UPSTREAM:0:12}\` (${count} commits).
+            --body "Moves third_party/llama.cpp-rocmfpx from \`${OURS:0:12}\` to \`${UPSTREAM:0:12}\`: our commits (ROCmI4 on Vulkan) rebased onto ROCmFPX main \`${BASE:0:12}\` (${count} upstream commits).
 
           CI here has no GPU. Before merging, on Strix Halo: build with \`-DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON\`, run \`ctest -R serve_e2e_lean\`, and rerun the table in docs/lean.md."

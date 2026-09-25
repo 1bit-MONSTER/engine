@@ -444,7 +444,7 @@ On the same box, the Q8_0 GGUF of the model does:
 | Backend | Decode (tg128) | Prompt (pp512) | Binary |
 |---|---|---|---|
 | Vulkan | 53.4 tok/s | 1269 tok/s | `llama-bench`, llama.cpp 7fe450e |
-| HRX0 (fork branch `1bit/hrx-35b-prefill`, 2631b75c; not yet in the pin) | 35.3 tok/s | 909 tok/s (pp2048: 1028) | `llama-bench`, llama.cpp fork off 79788e90 |
+| HRX0 (fork branch `1bit/hrx-35b-prefill`, 9a7aad66; not yet in the pin) | 35.3 tok/s | 909 tok/s (pp2048: 1028) | `llama-bench`, llama.cpp fork off 79788e90 |
 
 All runs used `-ngl 99 -fa 1 -r 3`. The engine's pinned HRX build (79788e90) cannot run
 this model:
@@ -453,7 +453,7 @@ this model:
 - **Its decode is wrong.** It runs at about 41 tok/s, but the output is wrong: KLD 15.3
   against Vulkan, top-1 0%.
 
-The fork branch fixes both. KLD against Vulkan is 0.0046 at ctx 512 and 0.0026 on the
+The fork branch fixes both (measured at 2631b75c, which is the same tree as the pushed 9a7aad66). KLD against Vulkan is 0.0046 at ctx 512 and 0.0026 on the
 decode path. The GPU is the faster path for this model. What the
 NPU adds is a second, independent decode stream. At 469c43b the NPU decoded 11.0 tok/s
 next to a running Vulkan benchmark without slowing it (as noise measures). It also

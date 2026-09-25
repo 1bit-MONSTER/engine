@@ -30,14 +30,16 @@
 # the same speed (Qwen3.8-27B UD-Q4_K_XL, KLD 0.0064 against 0.0094; docs/lean.md).
 include(ExternalProject)
 
-if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/llama.cpp-rocmfpx/CMakeLists.txt")
-    message(FATAL_ERROR "ONEBIT_LEAN needs third_party/llama.cpp-rocmfpx: git submodule update --init third_party/llama.cpp-rocmfpx")
+# ONEBIT_GPU_ROCMFPX_SOURCE: third_party/llama.cpp-rocmfpx, or the private tree with
+# -DONEBIT_GPU_PRIVATE (CMakeLists.txt).
+if(NOT EXISTS "${ONEBIT_GPU_ROCMFPX_SOURCE}/CMakeLists.txt")
+    message(FATAL_ERROR "ONEBIT_LEAN needs ${ONEBIT_GPU_ROCMFPX_SOURCE}: git submodule update --init --depth 1 in its repository")
 endif()
 
 set(ONEBIT_LEAN_SERVER "${CMAKE_BINARY_DIR}/lean/llama/bin/llama-server")
 set(ONEBIT_LEAN_QUANTIZE "${CMAKE_BINARY_DIR}/lean/llama/bin/llama-quantize")
 ExternalProject_Add(llama_lean
-    SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/llama.cpp-rocmfpx
+    SOURCE_DIR ${ONEBIT_GPU_ROCMFPX_SOURCE}
     BINARY_DIR ${CMAKE_BINARY_DIR}/lean/llama
     DOWNLOAD_COMMAND ""
     CMAKE_GENERATOR Ninja
@@ -56,7 +58,7 @@ if(ONEBIT_LEAN_ROCM)
     set(ONEBIT_LEAN_ROCM_TOOLCHAIN "/opt/rocm-therock" CACHE PATH "TheRock root whose bin/amdclang++ builds the lean ROCm llama-server")
     set(ONEBIT_LEAN_ROCM_SERVER "${CMAKE_BINARY_DIR}/lean/llama-rocm/bin/llama-server")
     ExternalProject_Add(llama_lean_rocm
-        SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/llama.cpp-rocmfpx
+        SOURCE_DIR ${ONEBIT_GPU_ROCMFPX_SOURCE}
         BINARY_DIR ${CMAKE_BINARY_DIR}/lean/llama-rocm
         DOWNLOAD_COMMAND ""
         CMAKE_GENERATOR Ninja

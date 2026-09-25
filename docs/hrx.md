@@ -35,89 +35,49 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 
 | Submodule | Source | Pinned to |
 |---|---|---|
-| `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
+| `third_party/llama.cpp` | [AMD-Ecosystem/llama.cpp](https://github.com/AMD-Ecosystem/llama.cpp), branch `hrx-graph-develop-v2` | AMD's ggml-hrx on ggml-org llama.cpp, unchanged |
 | `third_party/hrx-system` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | libhrx, loomc and the Loom tools |
 
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.
 - **How it stays current.** `.github/workflows/bump-hrx.yml` runs daily. When AMD
-  moves its pair, it:
-  - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin);
-  - rebases our commits onto AMD's pin and moves `1bit/hrx-vulkan-patched` there,
-    after tagging the previous tip `patched-<sha>` so every commit the engine has
-    pinned stays reachable (a rebase conflict fails the run: rebase by hand);
-  - opens a PR here moving both submodules, listing the rebased commits.
+  moves its pair, it opens a PR here moving both submodules.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
-  Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
-  Pull requests read/write on `1bit-MONSTER/engine`.
+  Contents and Pull requests read/write on `1bit-MONSTER/engine`.
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
   Halo before merging.
 
-### Fixed: `--device hrx` answered wrongly on mid-length prompts
+## Private GPU build
 
-Measured 2026-09-24, Qwen3-0.6B Q4_K_M, greedy chat through llama-server on `HRX0`:
-before the fix, prompts of 404 to 1,733 tokens came back as garbled text, while 146
-tokens and 2,167 tokens or more read correctly. Prompt processing was right at every
-length; decoding one token at a time went wrong once the KV cache held more than 256
-tokens.
+Our own GPU kernel work (fixes to ggml-hrx, the HRX prefill split below, and ROCmI4
+on Vulkan for the lean option) is closed source. It lives in the private
+`1bit-MONSTER/gpu-kernels` repository, not here. The engine keeps only the hook:
 
-**Cause:** above 256 KV tokens the single-query flash attention kernel
-(`flash_attention_decode_split_f32_f16_wmma.loom`) combines its per-block partial
-results with a cooperative reducer. That reducer runs four subgroups over eight query
-rows per KV head, and it checked only that a row's query head exists, not that the row
-belongs to this KV head. With fewer than eight query heads per KV head (Qwen3-0.6B has
-2), the spare subgroups reduced stale rows and wrote them over the next KV head's output.
-The reducer used at 256 tokens and below already stays inside its own rows. The fix
-(fork commit `79788e9`, on `1bit/hrx-vulkan-patched`) adds that bound to both copies of
-the kernel.
+- `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>` (branch `addons/gpu`, its submodules
+  initialised) makes `-DONEBIT_HRX=ON` and `-DONEBIT_LEAN=ON` build that checkout's
+  llama.cpp, hrx-system and ROCmFPX trees instead of the public pins above and in
+  [lean.md](lean.md). The checkout's `addons/gpu/gpu.cmake` names the three trees.
+- Without it, `1bit serve --prefill-device hrx` exits with "--prefill-device hrx is not
+  part of this build; build with -DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>", and the
+  `serve_e2e_vulkan_prefill_hrx` test is not added.
 
-After the fix, fed the same tokens as Vulkan (8 decode steps each), the relative logit
-difference is 0.01 to 0.03 at 248, 250, 256, 300, 400, 1,200 and 2,040 tokens, the same
-as below 256 before; and the chat answers match Vulkan's at every length from 404 to
-2,844 tokens. `test-backend-ops -o FLASH_ATTN_EXT` cannot check it on this pin: 12 of
-5,141 cases pass with and without the fix, because HRX0 refuses the test's empty `NONE`
-graph node.
+What the public build (AMD's pair as is) and the private build do on `HRX0`:
 
-### Fixed: MoE models with more than 128 experts (Qwen3.6-35B-A3B)
+| | public build | private build |
+|---|---|---|
+| Qwen3-0.6B Q4_K_M, perplexity (8 x 512 wikitext) | 22.52 (Vulkan: 22.53) | 22.52, same speed (about 21700 / 324 tok/s pp512 / tg128) |
+| Prompts of about 400 to 1,700 tokens (Qwen3-0.6B) | garbled answers: decoding goes wrong once the KV cache holds more than 256 tokens | answers match Vulkan's at every length measured (404 to 2,844 tokens) |
+| MoE models with more than 128 experts (Qwen3.6-35B-A3B Q8_0) | loads, but every request fails with a compute error (`serve_e2e`, 2026-09-25) | pp512 909, tg128 35.3 tok/s, KLD 0.0046 against Vulkan; `serve_e2e` passes |
+| Qwen3-Coder-30B-A3B Q4_K_M | not measured | pp512 2040, tg128 89.4 tok/s |
+| Unsloth Dynamic files (UD-Q4_K_XL, UD-Q2_K_XL, UD-IQ2_M) | fail | correct (perplexity within 0.2 of Vulkan's), with their IQ4_XS and sub-4-bit layers on the CPU, so slow |
+| `test-backend-ops -b HRX0` | about 1150 fail | 790/790 |
+| `--prefill-device hrx` | not available | available (below) |
 
-Before this pin, Qwen3.6-35B-A3B (256 experts) failed on `HRX0` in two ways:
-- **Prompt batches faulted.** Every batch of 2 or more tokens faulted the GPU
-  (`HSA_STATUS_ERROR_MEMORY_FAULT`).
-- **Decode was wrong.** Single-token decode ran at about 41 tok/s, but its output was
-  wrong: KLD 15.3 against Vulkan, top-1 0%.
+Use `--device vulkan` (the default for GGUF) for anything outside the first row on a
+public build.
 
-There were two causes:
-
-1. **The router assumed 128 experts.** `dispatch-moe-router.cpp` wrote the expert
-   partition table in the 128-expert layout (7-bit expert ids) for every expert count.
-   The `mul_mat_id` kernels that read the table decode a 9-bit layout. So experts
-   128-255 got no partitions, and an expert with 2 or more tokens read past its row.
-   Fork commit `96049a2` picks the layout by expert count
-   (`dispatch_registration/common/dispatch-moe-routing-layout.h`). Nothing changes up
-   to 128 experts.
-2. **Fused-only ops went to the CPU.** Our earlier claim rule accepted only nodes that
-   run standalone. So the router chain, L2_NORM, SOFTPLUS, GATED_DELTA_NET and the
-   per-head RMS_NORM/ROPE, which HRX runs only inside fused patterns, went to the CPU.
-   The 35B then split per layer (KLD 2.63), and Qwen3-Coder-30B-A3B could not decode.
-   Fork commit `9a7aad6` (`fused-context-claim.h`) claims those nodes when their fused
-   pattern's producers are present and their shapes fit.
-
-Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
-
-| model | metric | before | this pin |
-|---|---|---|---|
-| Qwen3.6-35B-A3B Q8_0 | pp512 | 141 | 909 |
-| Qwen3.6-35B-A3B Q8_0 | pp2048 | 156 | 1028 |
-| Qwen3.6-35B-A3B Q8_0 | tg128 | 14.1 | 35.3 |
-| Qwen3.6-35B-A3B Q8_0 | KLD vs Vulkan | 2.63 | 0.0046 |
-| Qwen3-Coder-30B-A3B Q4_K_M | pp512 | 1114 | 2040 |
-| Qwen3-Coder-30B-A3B Q4_K_M | tg128 | fails | 89.4 |
-| Qwen3-0.6B Q4_K_M | pp512 / tg128 | 21938 / 322.5 | 21789 / 323.8 |
-
-`test-backend-ops -b HRX0`: 790/790.
-
-### Known issues on `HRX0`
+### Known issues on `HRX0` (both builds)
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
   unsupported 3-D MUL_MAT; use `-b 512`.
@@ -126,23 +86,18 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 The prefill split below is not affected by either: HRX0 only prefills whole ubatches
 there, and decoding is Vulkan's.
 
-### Prefill on HRX, decode on Vulkan
+### Prefill on HRX, decode on Vulkan (private build)
 
 HRX prefills faster than Vulkan and Vulkan decodes faster, on the same GPU.
 `1bit serve --device vulkan --prefill-device hrx` uses both: the HRX build's
 llama-server decodes on `Vulkan0`, and a second copy of the model on `HRX0` runs
-the prompt prefix. The two contexts share one KV cache with no copy: HRX owns it
-in its device memory and exports it as a dma-buf (HSA), Vulkan maps the same
-memory, and only the KV cell metadata (positions, sequences) moves between them.
+the prompt prefix. The two contexts share one KV cache with no copy.
 
-- **What runs on HRX:** the prompt prefix in whole ubatches (HRX prefill halves on
-  a partial one), from `--prefill-min-tokens` tokens (default 1024; below that the
-  split does not pay). The rest, and all decoding, run on Vulkan.
+- **What runs on HRX:** the prompt prefix in whole ubatches, from
+  `--prefill-min-tokens` tokens (default 1024; below that the split does not pay).
+  The rest, and all decoding, run on Vulkan.
 - **Needs:** flash attention on both sides (`serve` passes `-fa on`), no LoRA, no
   multimodal. The weights are loaded twice (once per device).
-- **Layout:** the shared region is cut into chunks of at most 1 GiB, each its own
-  dma-buf: Vulkan reads garbage from one buffer past about 4 GiB (a 40960-token
-  Qwen3-0.6B cache), and both sides must compute the same layout.
 
 Measured on Strix Halo, llama-server on `Vulkan0`, prefill / whole request:
 
@@ -157,43 +112,8 @@ alone, teacher-forced over 64 tokens, the split's mean KL is 0.0002-0.0006 nats
 (max 0.007) and the top token agrees on 64-65 of 65 positions; Q4_K_M against
 BF16 is 0.063.
 
-### Our patches
-
-`1bit/hrx-vulkan` is AMD's commit unchanged; `1bit/hrx-vulkan-patched` adds:
-
-- **Zero-copy KV sharing** (the section above): dma-buf export in ggml-hrx
-  (`ggml-hrx-dmabuf.cpp`), dma-buf import in ggml-vulkan (`ggml-vulkan-dmabuf.inc`),
-  `llama_kv_share_next` / `llama_kv_share_from` / `llama_kv_cells_copy` in
-  llama (`llama-kv-share.cpp`), and `ONEBIT_PREFILL_DEVICE` in llama-server
-  (`server-prefill.cpp`).
-- **IQ3_XXS matmul on HRX.** A matrix-vector kernel (`kernels/hrx/mul_mat_vec_iq3xxs_f32.loom`)
-  and its matcher (`common/dispatch-mul-mat-iq3-xxs.cpp`), ported from the
-  `feat/hrx-port-ae91949` work.
-- **Honest op claims.** ggml-hrx used to claim every op of a declared type, so
-  ggml's scheduler handed it nodes it could not dispatch and the graph failed
-  (`unsupported HRX node`) with no CPU fallback. It now claims a node only when
-  its dispatcher can execute it, except nodes already in HRX memory (KV cache
-  views), which cannot move. Leaf (`NONE`) nodes count as covered. AMD's IQ4_NL
-  and IQ4_XS matmul kernels, and GET_ROWS for IQ4_XS and batched IQ3_S, give wrong
-  values, so those nodes are left to the CPU.
-
-Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
-
-| File | Vulkan0 | HRX0 on AMD's commit | HRX0 with our patches |
-|---|---|---|---|
-| Q4_K_M | 22.53 | 22.52 | 22.52, same speed (21691 / 324 tok/s) |
-| UD-Q4_K_XL | 22.43 | fails | **22.41** |
-| UD-Q2_K_XL | 36.26 | fails | **36.46** |
-| UD-IQ2_M | 55.44 | fails | **55.58** |
-
-`test-backend-ops -b HRX0`: 791 OK, 0 failed (on AMD's commit, about 1150 fail).
-Correct is not fast: the UD files run their IQ4_XS and sub-4-bit layers on the CPU
-(UD-Q4_K_XL 6303 / 246 tok/s, UD-Q2_K_XL 974 / 76), so they belong on `Vulkan0`.
-
-`1bit-MONSTER/llama.cpp` also holds
-`1bit/hrx2-archive`, the previous build (AMD's abandoned ggml-hrx2 plus our Q4NX
-kernels and the zaya architecture). It is kept for a later port of that work to
-ggml-hrx.
+The previous build (AMD's abandoned ggml-hrx2 with our Q4NX kernels and the zaya
+architecture) is kept in the private archive for a later port to ggml-hrx.
 
 The Vulkan route has its own upstream llama.cpp pin (latest release), so new
 architectures do not wait for AMD's pair: see [vulkan.md](vulkan.md). This build
@@ -205,6 +125,15 @@ off.
 ```bash
 git submodule update --init --depth 1 third_party/hrx-system third_party/llama.cpp
 cmake -B build -G Ninja -DONEBIT_HRX=ON          # needs TheRock at /opt/rocm-therock (ONEBIT_HRX_TOOLCHAIN)
+cmake --build build --target onebit
+```
+
+The private build ("Private GPU build" above) needs no engine submodules for HRX:
+
+```bash
+git clone -b addons/gpu https://github.com/1bit-MONSTER/gpu-kernels.git   # private
+git -C gpu-kernels submodule update --init --depth 1
+cmake -B build -G Ninja -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE=$PWD/gpu-kernels
 cmake --build build --target onebit
 ```
 
@@ -221,12 +150,19 @@ cmake --build build --target onebit
   build path it searches `/opt/rocm-therock`. To run
   llama-server or llama-bench by hand, export that variable yourself.
 
-## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)
+## Verified (2026-09-25)
 
-`ctest` passed, re-run after the first daily bump (#13). At the time the check
-was `tests/hrx_lemonade_e2e.sh`, through the engine's former embedded Lemonade:
-`unsloth/Qwen3-0.6B-GGUF:Q4_0` answered "Paris" on `Vulkan0` and on `HRX0`. The
-same build now passes `tests/serve_e2e.sh` on both devices through `1bit serve`.
+`tests/serve_e2e.sh` on Strix Halo, one build with `-DONEBIT_HRX=ON -DONEBIT_LEAN=ON` per row:
+
+| Build | Qwen3-0.6B Q4_K_M `hrx` | `vulkan` | `vulkan --prefill-device hrx` | Qwen3.6-35B-A3B Q8_0 `hrx` |
+|---|---|---|---|---|
+| public (llama.cpp `f1a0aca`, hrx-system `a351789`) | PASS | PASS | refused with the message above | FAIL (compute error) |
+| `-DONEBIT_GPU_PRIVATE` | PASS | PASS | PASS | PASS |
+
+Earlier (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`): `ctest` passed, re-run
+after the first daily bump (#13). At the time the check was `tests/hrx_lemonade_e2e.sh`,
+through the engine's former embedded Lemonade: `unsloth/Qwen3-0.6B-GGUF:Q4_0` answered
+"Paris" on `Vulkan0` and on `HRX0`.
 
 llama-bench, Qwen3-0.6B, pp512 / tg128 tok/s, against the previous build (April
 llama.cpp with ggml-hrx2 on `HRX20`):
@@ -244,11 +180,11 @@ HRX prefill is now faster than Vulkan's.
 
 ## Not yet
 
-- **Fast sub-4-bit and IQ4 kernels on HRX.** With our patches the UD files are
+- **Fast sub-4-bit and IQ4 kernels on HRX.** On the private build the UD files are
   correct on `HRX0` but slow, since IQ4_XS, IQ2 and IQ3_S matmuls fall back to the
   CPU. AMD's IQ4_XS / IQ4_NL kernels need fixing upstream.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
-  They are kept on `1bit/hrx2-archive` until they are ported.
+  They are kept in the private archive until they are ported.
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows
   18 tok/s against llama-bench's 303. It is probably first-use kernel
   compilation, not steady state, but this is not yet separated.

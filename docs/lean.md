@@ -19,7 +19,9 @@ limitations under the License.
 `1bit serve --lean` trades accuracy for speed. It runs models in the AMD-focused
 formats of [ROCmFPX](https://github.com/charlie12345/ROCmFPX) (MIT), a llama.cpp fork
 that upstream llama.cpp cannot read, so the lean route has its own tree:
-`third_party/llama.cpp-rocmfpx`, pinned to a commit measured on Strix Halo.
+`third_party/llama.cpp-rocmfpx`, upstream ROCmFPX's `main` at a commit measured on Strix
+Halo. Builds with `-DONEBIT_GPU_PRIVATE` use the private tree instead, which adds ROCmI4 on
+Vulkan (below; [hrx.md](hrx.md), "Private GPU build").
 
 | Command | Format | Device | Best at |
 |---|---|---|---|
@@ -46,13 +48,14 @@ MTP chat is decode speed with the MTP head on three prompts (code / prose / shor
 - **ROCmI4 on ROCm:** the gfx1151 W4A4 path lifts prompt processing 17% (465 against
   397) and leaves decode as it is. The Vulkan numbers in the table (6 / 4.1) are from
   before Vulkan had a ROCmI4 kernel.
-- **ROCmI4 on Vulkan (2026-09-25):** the engine's ROCmFPX pin, `1bit/vulkan-rocmi4` on our
-  fork 1bit-MONSTER/ROCmFPX, adds Vulkan kernels for `Q4_0_ROCMI4` with the ROCm path's
-  exact semantics. `test-backend-ops -b Vulkan0` passes (MUL_MAT 26/26, MUL_MAT_ID 73/73,
-  GET_ROWS 4/4, CPY 17/17); Qwen3-0.6B ROCmI4 over wikitext-2 20 x 512 reads perplexity
-  28.33 on Vulkan against 28.37 on ROCm, at pp512 13714 / tg128 335 tok/s on Vulkan. The
-  27B row above has not been re-measured on Vulkan yet. This also makes ROCmI4 files
-  usable in 1bit OS, which has Vulkan and no ROCm.
+- **ROCmI4 on Vulkan (private build, 2026-09-25):** upstream ROCmFPX has no Vulkan kernel
+  for `Q4_0_ROCMI4`, so on the public build ROCmI4 files belong on `--device rocm` (the 6 / 4.1
+  above). Builds with `-DONEBIT_GPU_PRIVATE` add one, with the ROCm path's results:
+  `test-backend-ops -b Vulkan0` passes (MUL_MAT 26/26, MUL_MAT_ID 73/73, GET_ROWS 4/4, CPY
+  17/17); Qwen3-0.6B ROCmI4 over wikitext-2 20 x 512 reads perplexity 28.33 on Vulkan against
+  28.37 on ROCm, at pp512 13714 / tg128 335 tok/s on Vulkan. The 27B row above has not been
+  re-measured on Vulkan yet. This also makes ROCmI4 files usable in 1bit OS, which has
+  Vulkan and no ROCm.
 - The ROCmFPX files were quantized without an importance matrix; UD-Q4_K_XL was
   made with one. An imatrix would narrow the accuracy gap somewhat.
 
@@ -111,6 +114,9 @@ cmake -B build -G Ninja -DONEBIT_LEAN=ON                        # Vulkan: ROCmFP
 cmake -B build -G Ninja -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON  # also ROCm: ROCmI4
 cmake --build build
 ```
+
+Add `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>` for the private tree (ROCmI4 on Vulkan;
+[hrx.md](hrx.md), "Private GPU build"); it needs no `third_party/llama.cpp-rocmfpx`.
 
 The ROCm build uses TheRock's `amdclang++` from `ONEBIT_LEAN_ROCM_TOOLCHAIN`
 (default `/opt/rocm-therock`). If it fails on `__ocml_*` in the distribution's HIP

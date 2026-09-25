@@ -33,6 +33,16 @@ enable_testing()
 # one. JSON and the HTTP server/client are pinned here, at the commits the
 # engine used before (nlohmann/json v3.11.3, cpp-httplib v0.47.0).
 include(FetchContent)
+if(WIN32)
+    # Windows 10 or later: cpp-httplib's floor; the headers leave out min/max macros
+    add_compile_definitions(_WIN32_WINNT=0x0A00 WINVER=0x0A00 NOMINMAX WIN32_LEAN_AND_MEAN)
+    # MinGW's headers lack GetAddrInfoExCancel; the engine only ever connects to 127.0.0.1
+    set(HTTPLIB_USE_NON_BLOCKING_GETADDRINFO OFF CACHE BOOL "" FORCE)
+    if(MINGW)
+        # one self-contained 1bit.exe: the C++ runtime linked in, not beside it as DLLs
+        add_link_options(-static)
+    endif()
+endif()
 find_package(Threads REQUIRED)
 set(JSON_BuildTests OFF CACHE INTERNAL "")
 FetchContent_Declare(json
@@ -213,7 +223,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/private_route.cpp npu/q4nx.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/private_route.cpp npu/q4nx.cpp
                             npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)

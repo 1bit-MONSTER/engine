@@ -19,10 +19,7 @@
 
 #include <cmath>
 #include <cstring>
-#include <fcntl.h>
-#include <sys/mman.h>
-#include <sys/stat.h>
-#include <unistd.h>
+#include "file_map.h"
 
 namespace onebit::laya {
 
@@ -50,21 +47,9 @@ inline float bf16_to_f32(uint16_t bf) {
 
 bool Safetensors::open(const std::string& path) {
     err_.clear();
-    const int fd = ::open(path.c_str(), O_RDONLY);
-    if (fd < 0) {
-        err_ = "cannot open " + path;
-        return false;
-    }
-    struct stat st {};
-    ::fstat(fd, &st);
-    size_ = size_t(st.st_size);
-    void* m = ::mmap(nullptr, size_, PROT_READ, MAP_PRIVATE, fd, 0);
-    ::close(fd);
-    if (m == MAP_FAILED) {
-        err_ = "cannot map " + path;
-        return false;
-    }
-    map_ = static_cast<uint8_t*>(m);
+    const uint8_t* m = onebit::npu::map_file(path, size_, &err_);
+    if (!m) return false;
+    map_ = const_cast<uint8_t*>(m);
 
     uint64_t header = 0;
     if (size_ < 8) {
@@ -96,7 +81,7 @@ bool Safetensors::open(const std::string& path) {
 }
 
 Safetensors::~Safetensors() {
-    if (map_) ::munmap(map_, size_);
+    onebit::npu::unmap_file(map_, size_);
 }
 
 const Tensor* Safetensors::find(const std::string& name) const {

@@ -29,6 +29,8 @@ This repository exists to be reviewable. Five rules keep it that way.
    checked on each backend. Docs quote the second number.
 4. **No binaries without source.** NPU kernels are built from source in this
    repository (or a pinned submodule) into full ELFs. No vendored xclbins.
+   A private add-on (docs/npu.md, "Private routes") builds its kernels from
+   source in its own repository.
 5. **Every file carries the copyright and Apache-2.0 notice.** Run
    `python3 tools/copyright.py --fix` before committing; CI runs `--check`.
    Files that cannot hold a comment (binaries, JSON, test data) are exempt,

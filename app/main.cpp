@@ -21,15 +21,15 @@
 //                                    OpenAI endpoints; serve's NPU route.
 //   1bit npu-run [options]           token ids in, token ids out, on the NPU fast
 //                                    lane (docs/npu.md); for checks and benchmarks.
-//   1bit npu-lax [options]           Qwen3.6-35B-A3B on the NPU lax kernels: greedy
-//                                    chat, or the parity check (docs/npu-lax.md).
+//   1bit <command> [options]         a command a private NPU add-on registered
+//                                    (-DONEBIT_NPU_PRIVATE builds; docs/npu.md).
 //
 // See docs/PORTING.md for what lands next.
 
 #ifdef ONEBIT_NPU
 #include "generate.h"
 #include "model.h"
-#include "npu_lax.h"
+#include "private_route.h"
 #include "unified.h"
 #endif
 #include "serve.h"
@@ -64,11 +64,14 @@ void usage(FILE* out) {
 #ifdef ONEBIT_NPU
                  "  unified -m <model dir>      serve one NPU model (OpenAI endpoints)\n"
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
-                 "  npu-lax [options]           Qwen3.6-35B-A3B on the NPU lax kernels (npu-lax --help)\n"
 #endif
                  "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
                  "  version                     print the version\n"
                  "  help                        show this help\n");
+#ifdef ONEBIT_NPU
+    for (const auto& c : onebit::npu::private_commands())
+        std::fprintf(out, "  %-27s %s\n", (c.name + " [options]").c_str(), c.help.c_str());
+#endif
 }
 
 #ifdef ONEBIT_NPU
@@ -181,6 +184,9 @@ int run_comfy(int argc, char** argv) {
 }  // namespace
 
 int main(int argc, char** argv) {
+#ifdef ONEBIT_NPU_PRIVATE
+    onebit::npu::register_private_addon();
+#endif
     if (argc < 2) {
         usage(stderr);
         return 2;
@@ -211,11 +217,11 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
-    if (cmd == "npu-lax") {
+    if (const auto* c = onebit::npu::find_private_command(cmd)) {
         try {
-            return onebit::run_npu_lax(argc - 2, argv + 2);
+            return c->run(argc - 2, argv + 2);
         } catch (const std::exception& e) {
-            std::fprintf(stderr, "1bit npu-lax: %s\n", e.what());
+            std::fprintf(stderr, "1bit %s: %s\n", cmd.c_str(), e.what());
             return 1;
         }
     }

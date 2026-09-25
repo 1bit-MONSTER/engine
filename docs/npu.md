@@ -62,7 +62,7 @@ embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q
 Both containers report `flm_version` 1.0.3, and neither carries metadata that tells them
 apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the same model
 gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
-decodes the first layout, and `npu/lax_pack` decodes the second (35B only).
+decodes the first layout; the second is read only by the private 35B route.
 
 `npu/q4nx.h` decodes all three, and repacks Q4_K into q4_1 (exact apart from rounding
 `S * scale` and `M * min` to bf16), so the lane and dx, which read q4_1, run Q4_K
@@ -213,6 +213,30 @@ The `1bit` binary links only `libxrt_coreutil`: no xclbin, no FastFlowLM library
     default. `repetition_penalty` in the request overrides it, and 1 gives plain
     greedy.
   - Requests are served one at a time: the lane has one KV cache.
+
+## Private routes
+
+Qwen3.6-35B-A3B (`model_type` `qwen3_5_moe`) runs on the NPU through a closed-source
+add-on: its kernels and host code live in the private `1bit-MONSTER/npu-kernels`
+repository, not here. Measured on Strix Halo: parity against the fp64 reference passes
+(3 positions, argmax 846 / 198 / 3710), 16.3-16.5 tok/s decode, and `1bit serve --device
+npu` answers "The capital of France is Paris."
+
+The engine keeps only the hook (`npu/private_route.h`):
+
+- `-DONEBIT_NPU_PRIVATE=<npu-kernels checkout>` (with `-DONEBIT_NPU=ON`) builds that
+  checkout's `addons/` into `1bit`. It must define the target `onebit_npu_private`, which
+  holds `register_private_addon()`; `1bit` calls it at startup.
+- The add-on registers a route per `model_type` (whether it can serve a directory, and a
+  session that generates from token ids) and may register `1bit` subcommands. `1bit
+  unified` and `1bit serve` use the route for that model type; `--npu-opt KEY=VALUE`
+  (`unified`: `--opt`) passes options through to it.
+- Without the add-on, `1bit serve -m <35B dir> --device npu` exits with "the
+  Qwen3.6-35B-A3B NPU route is not part of this build; build with
+  -DONEBIT_NPU_PRIVATE=<npu-kernels checkout>". The fast lane is unaffected.
+
+`tests/npu_private_route_test.cpp` (ctest `npu_private_route`, in CI) checks the registry
+and that message; the add-on brings its own tests.
 
 ## The XDNA stack
 

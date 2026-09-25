@@ -16,6 +16,8 @@
 // `1bit unified`: one native NPU model behind OpenAI endpoints (unified.cpp).
 #pragma once
 
+#include "private_route.h"
+
 #include <string>
 
 namespace onebit {
@@ -24,14 +26,13 @@ namespace onebit {
 int run_unified(int argc, char** argv);
 
 // What runs an NPU model directory (model.q4nx, config.json, tokenizer.json):
-//   Lane  a Qwen2/Qwen3 dense model with npu/ holding the fast lane's kernels (docs/npu.md)
-//   Lax   Qwen3.6-35B-A3B (model_type qwen3_5_moe) on the lax kernels (docs/npu-lax.md),
-//         found at lax_kernels, else <dir>/npu/lax, else $ONEBIT_NPU_LAX_KERNELS
-enum class NpuModel { None, Lane, Lax };
-NpuModel npu_model_kind(const std::string& dir, const std::string& lax_kernels = "");
-bool is_npu_model_dir(const std::string& dir, const std::string& lax_kernels = "");
+//   Lane     a Qwen2/Qwen3 dense model with npu/ holding the fast lane's kernels (docs/npu.md)
+//   Private  a model_type a private route registered (npu/private_route.h) and can serve with opts
+enum class NpuModel { None, Lane, Private };
+NpuModel npu_model_kind(const std::string& dir, const npu::PrivateOptions& opts = {});
+bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts = {});
+// Why dir is not an NPU model directory here, for an error message; empty if it is one.
+std::string npu_model_problem(const std::string& dir, const npu::PrivateOptions& opts = {});
 std::string npu_kernel_dir(const std::string& model_dir);
-// The lax kernel directory for dir, as npu_model_kind looks it up; empty if none.
-std::string lax_kernel_dir(const std::string& dir, const std::string& lax_kernels = "");
 
 }  // namespace onebit

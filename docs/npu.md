@@ -131,6 +131,14 @@ The runtime therefore does the following:
 2. Adds the lm head and one config per context length with `kNone`, via `add_config`.
 3. Keeps `kLoad` for stand-alone kernels.
 
+The context lives for one `generate()` call. `Lane::begin()` creates it, and `Lane::end()` drops
+it while it is still warm. A context that sat idle past the NPU's runtime suspend
+(`autosuspend_delay_ms` 5000) failed its next runlist with `ERT_CMD_STATE_TIMEOUT`. It also left a
+stuck context that blocked the NPU for 1–2 minutes. With a fresh context per call, 10 of 10
+generations pass with 15 s gaps and with 120 s gaps, at 97–101 tok/s. Afterwards no context is
+left on the device. Code that drives the lane directly with `step()` must call `begin()` first
+and `end()` when done.
+
 ## Checking the generator
 
 ```sh

@@ -52,6 +52,15 @@ public:
     // prepare + launch + wait on slot 0.
     void step(int token, int ctx);
 
+    // Create a fresh hw_context (running the init load_pdi config). Call at
+    // the start of each generate() so a context never sits idle across the
+    // NPU's runtime-suspend (which would leave it stale).
+    void begin();
+
+    // Destroy the current hw_context while it is still warm (all runs done),
+    // so its destructor never hits a stuck command.
+    void end();
+
     // The last completed run's logits.
     int argmax();
     void logits(std::vector<float>& out);

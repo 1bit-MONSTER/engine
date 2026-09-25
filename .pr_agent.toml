@@ -1,0 +1,59 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# PR-Agent settings (.github/workflows/pr-agent.yml): a local coding model through the engine's
+# own OpenAI-compatible server, no cloud API.
+
+[config]
+model = "openai/qwen3-coder"
+fallback_models = []
+custom_model_max_tokens = 65536
+temperature = 0.2
+ai_timeout = 900
+
+[openai]
+api_base = "http://127.0.0.1:8090/v1"
+key = "local"
+
+[pr_agent]
+publish_output = true
+publish_output_progress = false
+
+[pr_reviewer]
+require_score_review = false
+require_tests_review = true
+require_security_review = true
+num_max_findings = 6
+persistent_comment = true
+extra_instructions = """
+This is the 1bit engine: a C++26 inference engine behind an OpenAI-compatible API (`1bit serve`), running inside
+Lemonade, on AMD Strix Halo's XDNA 2 NPU (fast lane, the from-scratch dx kernels), the Radeon iGPU (HRX and
+Vulkan through pinned llama.cpp builds), ROCm, ZINC and MLX. Review like an engineer who runs this on the hardware:
+- correctness first: tensor shapes and strides, KV-cache positions and rollback, bf16/f32 rounding (dx kernels
+  round to nearest even), NPU hardware-context and runlist lifetimes, lifetimes of child processes and ports;
+- C++: ownership and RAII, no allocations in per-token loops, exceptions reaching main, thread safety of shared state;
+- claims: every number in docs, commit messages and the PR body must be measured on the hardware and say how;
+  flag an unmeasured or stretched claim;
+- every new file carries the full Apache-2.0 notice (tools/copyright.py); third_party/ is pinned, never edited;
+- docs (docs/, README, the wiki) must be updated in the same PR as the behaviour they describe.
+"""
+
+[pr_description]
+publish_labels = false
+enable_help_text = false
+
+[pr_code_suggestions]
+num_code_suggestions = 4
+extra_instructions = "Prefer suggestions that fix a real bug or measurably help decode speed or memory; skip style-only ones."

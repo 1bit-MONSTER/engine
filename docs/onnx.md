@@ -56,5 +56,5 @@ llama-server's extra routes (`/tokenize`, `/slots`, …) answer 501 on `--device
 
 ## Next
 
-- **Windows.** `ryzenai-server.exe` in `scripts/build-windows.sh`: ONNX Runtime GenAI's Windows builds include DirectML, the GPU on Windows.
+- **Windows.** Done for the CPU: `scripts/build-windows.sh` builds `ryzenai-server.exe` ([Windows](windows.md)). The GPU on Windows would need ONNX Runtime's DirectML builds, whose `DirectML.dll` is under Microsoft's redistributable licence rather than MIT.
 - **The Ryzen AI NPU.** On a machine with Ryzen AI Software installed.

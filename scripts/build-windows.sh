@@ -16,9 +16,10 @@
 #
 # build-windows.sh <out-dir>
 #
-# Cross-builds the engine for Windows 10+ x64 on Linux (docs/windows.md): <out-dir>/1bit.exe and,
+# Cross-builds the engine for Windows 10+ x64 on Linux (docs/windows.md): <out-dir>/1bit.exe;
 # from the Vulkan pin (third_party/llama.cpp-vulkan), <out-dir>/llama-server.exe with the Vulkan
-# backend. Both are single static executables; 1bit.exe finds llama-server.exe beside it.
+# backend; and from third_party/ryzenai-server, <out-dir>/ryzenai-server.exe with Microsoft's ONNX
+# Runtime GenAI and ONNX Runtime DLLs (--device onnx, CPU). 1bit.exe finds its backends beside it.
 # Everything it downloads is pinned and checked against its sha256: llvm-mingw (clang 23: the
 # engine is C++26), PCRE2 (the tokenizer), Vulkan-Headers, the Vulkan loader's export list
 # (vulkan-1.def -> the import library, so no Windows machine or Vulkan SDK is needed) and
@@ -42,6 +43,10 @@ VK_DEF=https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/$VK_TAG/load
 VK_DEF_SHA=9ba339b7f5ee2df28487698a6840ecf095fac58b415c2c89ad9f161e9d316378
 SPIRV_HEADERS=https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/$VK_TAG.tar.gz
 SPIRV_HEADERS_SHA=4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07
+OGA_WIN=https://github.com/microsoft/onnxruntime-genai/releases/download/v0.11.2/onnxruntime-genai-0.11.2-win-x64.zip
+OGA_WIN_SHA=31aeeb4fa7e1d9bf284f6215d60e0025d534b99add7b0daeaccd729ee8ad1595
+ORT_WIN=https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip
+ORT_WIN_SHA=0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd
 
 command -v glslc >/dev/null || { echo "build-windows.sh: glslc (shaderc) is required"; exit 1; }
 
@@ -119,4 +124,30 @@ cmake -S "$root/third_party/llama.cpp-vulkan" -B "$work/llama" -DCMAKE_TOOLCHAIN
 cmake --build "$work/llama" --target llama-server -j"$jobs" > "$work/llama.build.log" 2>&1 || { tail -20 "$work/llama.build.log"; exit 1; }
 cp "$work/llama/bin/llama-server.exe" "$out/"
 
-ls -la "$out/1bit.exe" "$out/llama-server.exe"
+# 6. ryzenai-server.exe (--device onnx), from its pin, against Microsoft's Windows releases of ONNX
+# Runtime GenAI and ONNX Runtime (MIT; CPU). Upstream's CMake is used unmodified through a small
+# wrapper that clears its MSVC-only /SUBSYSTEM:CONSOLE link flag (MinGW links console programs by
+# default), and a one-line Wbemidl.h shim covers the case of MinGW's wbemidl.h.
+git -C "$root" submodule update --init third_party/ryzenai-server
+unzip_to() { [ -d "$2" ] || { mkdir -p "$2.tmp" && (cd "$2.tmp" && cmake -E tar xf "$1") && mv "$2.tmp" "$2"; }; }
+unzip_to "$(fetch $OGA_WIN $OGA_WIN_SHA oga-win.zip)" "$work/oga-win"
+unzip_to "$(fetch $ORT_WIN $ORT_WIN_SHA ort-win.zip)" "$work/ort-win"
+oga=$(ls -d "$work"/oga-win/*/)
+ort=$(ls -d "$work"/ort-win/*/)
+mkdir -p "$work/rz-wrap" "$work/rz-shim" "$work/oga-root"
+echo '#include <wbemidl.h>' > "$work/rz-shim/Wbemidl.h"
+cat > "$work/rz-wrap/CMakeLists.txt" <<'RZ'
+cmake_minimum_required(VERSION 3.20)
+project(ryzenai-server-mingw CXX)
+add_subdirectory(${RYZENAI_SERVER_SRC} rz)
+set_target_properties(ryzenai-server PROPERTIES LINK_FLAGS "")
+RZ
+cmake -S "$work/rz-wrap" -B "$work/rz" -DRYZENAI_SERVER_SRC="$root/third_party/ryzenai-server" \
+    -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" -DCMAKE_BUILD_TYPE=Release -DOGA_ROOT="$work/oga-root" \
+    -DOGA_INCLUDE="${oga}include" -DOGA_LIB="${oga}lib/onnxruntime-genai.lib" -DCMAKE_EXE_LINKER_FLAGS=-static \
+    "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00 -I$work/rz-shim" > "$work/rz.cmake.log"
+cmake --build "$work/rz" -j"$jobs" > "$work/rz.build.log" 2>&1 || { tail -20 "$work/rz.build.log"; exit 1; }
+cp "$work/rz/bin/ryzenai-server.exe" "${oga}lib/onnxruntime-genai.dll" "${ort}lib/onnxruntime.dll" \
+   "${ort}lib/onnxruntime_providers_shared.dll" "$out/"
+
+ls -la "$out"/*.exe "$out"/*.dll

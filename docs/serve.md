@@ -91,11 +91,6 @@ PM4-emulation probe, and then HRX registers no device. `serve` sets
 `IREE_HAL_AMDGPU_LIBHSA_PATH` itself unless you did. It uses `--hrx-libhsa`,
 else the build's copy, else the first one under `/opt/rocm-therock`.
 
-Without `--ctx-size`, `--device hrx` runs with a 32768-token context. HRX0's flash
-attention takes at most 32768 KV tokens. At a model's full context, HRX0 declines it and
-llama.cpp turns flash attention off for the whole model. HRX0 cannot compute that path on
-MoE models (Qwen3-Coder-30B-A3B failed with "Compute error.", #95).
-
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC`, then `llama-server` / `zinc` on PATH.
 

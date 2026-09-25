@@ -532,12 +532,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        else if (device == "hrx" && !split) {
-            // HRX0's flash attention takes at most 32768 KV tokens. At a model's full context
-            // (262144 for Qwen3-Coder-30B-A3B) HRX0 declines it, llama.cpp turns flash attention
-            // off for the whole model, and HRX0's path without it fails on MoE graphs (#95)
-            argv.insert(argv.end(), {"-c", "32768"});
-        }
         if (split) {
             argv.insert(argv.end(), {"-fa", "on"});
             env.push_back("ONEBIT_PREFILL_DEVICE=HRX0");

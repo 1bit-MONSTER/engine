@@ -52,7 +52,7 @@ Peano, llvm-aie (third_party/llvm-aie)
   Copyright the LLVM Project authors and Xilinx, Inc. / Advanced Micro Devices, Inc.
   License: Apache-2.0 WITH LLVM-exception
 
-llama.cpp (third_party/llama.cpp: 1bit-MONSTER/llama.cpp, a fork of
+llama.cpp (third_party/llama.cpp: AMD-Ecosystem/llama.cpp, a fork of
 ggml-org/llama.cpp carrying AMD's HRX integration; third_party/llama.cpp-vulkan:
 ggml-org/llama.cpp, an upstream release)
   https://github.com/ggml-org/llama.cpp

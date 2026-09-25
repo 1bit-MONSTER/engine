@@ -42,6 +42,13 @@ One model per process:
 | `POST /v1/completions` | |
 | `POST /v1/embeddings` | with `--embed` (RAG) |
 | `POST /v1/rerank` | with `--rerank` (RAG) |
+| `POST /v1/responses` | OpenAI Responses API, streamed or not (llama-server devices) |
+| `POST /tokenize`, `/detokenize`, `/apply-template` | llama-server devices |
+| `GET /slots`, `POST /slots/<id>?action=…`, `GET /props`, `GET /metrics` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
+
+"llama-server devices" means `vulkan`, `hrx` and `rocm`. These routes go to the llama-server
+behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
+inherits it). On `npu`, `zinc` and `mlx` they answer 501.
 
 ## Where the model runs
 

@@ -340,6 +340,29 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     });
 }
 
+// llama-server's own routes that are not chat or completions (/slots, /props, /metrics):
+// method, query string and body pass through unchanged; the reply comes back as it is.
+void relay(int port, const httplib::Request& req, httplib::Response& res) {
+    std::string path = req.path;
+    if (!req.params.empty()) {
+        std::string query;
+        for (const auto& [k, v] : req.params)
+            query += (query.empty() ? "?" : "&") + httplib::encode_query_component(k) + "=" + httplib::encode_query_component(v);
+        path += query;
+    }
+    httplib::Client c("127.0.0.1", port);
+    c.set_read_timeout(3600);
+    const std::string type = req.get_header_value("Content-Type").empty() ? "application/json" : req.get_header_value("Content-Type");
+    auto r = req.method == "GET" ? c.Get(path) : c.Post(path, req.body, type);
+    if (!r) {
+        res.status = 502;
+        res.set_content(R"({"error":{"message":"backend did not answer"}})", "application/json");
+        return;
+    }
+    res.status = r->status;
+    res.set_content(r->body, r->get_header_value("Content-Type").empty() ? "application/json" : r->get_header_value("Content-Type"));
+}
+
 struct Launch {
     std::string device;
     int port = 0;
@@ -503,6 +526,36 @@ int serve_child(const Options& o) {
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
+    // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
+    // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
+    // the first backend; the NPU, ZINC and MLX answer 501.
+    const bool llama = device == "vulkan" || device == "hrx" || device == "rocm" || device == "vulkan+rocm";
+    auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
+        r.status = 501;
+        r.set_content(json{{"error", {{"message", q.path + " is not available on --device " + device},
+                                      {"type", "not_implemented"}}}}.dump(), "application/json");
+    };
+    auto first = [&](const httplib::Request& q, httplib::Response& r) {
+        if (!ready) {
+            r.status = 503;
+            r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
+            return;
+        }
+        relay(backends[0].port, q, r);
+    };
+    auto first_json = [&](const httplib::Request& q, httplib::Response& r) {
+        if (!ready) {
+            r.status = 503;
+            r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
+            return;
+        }
+        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r);
+    };
+    for (const char* path : {"/v1/responses", "/tokenize", "/detokenize", "/apply-template"})
+        srv.Post(path, llama ? httplib::Server::Handler(first_json) : httplib::Server::Handler(unsupported));
+    for (const char* path : {"/slots", "/props", "/metrics"})
+        srv.Get(path, llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
+    srv.Post(R"(/slots/(\d+))", llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
     // RAG: embeddings and rerank go to their own backends, the reply names the model served
     auto rag_route = [&](size_t i, const std::string& model) {
         return [&, i, model](const httplib::Request& q, httplib::Response& r) {

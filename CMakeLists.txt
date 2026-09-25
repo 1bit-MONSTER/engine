@@ -285,6 +285,28 @@ if(ONEBIT_NPU)
     # `1bit npu-lax`: parity on three positions against the fp64 reference, then one chat turn.
     set(ONEBIT_NPU_LAX_KERNELS "" CACHE PATH "scripts/build-lax.sh's <prefix>/kernels")
     set(ONEBIT_NPU_LAX_REF "" CACHE PATH "make_decode.py --requant --tokens 3 output (xres<t>.bin, ref_logits*.bin)")
+    # 1bit serve's own lax kernels, so a Qwen3.6-35B-A3B directory needs no --npu-kernels (in
+    # Lemonade, the downloaded model directory is all it gets). ONEBIT_NPU_LAX builds them from
+    # third_party/OpenFlowLM-Next with scripts/build-lax.sh into the build tree, once (they are
+    # rebuilt when missing); otherwise ONEBIT_NPU_LAX_KERNELS, when set, is the default.
+    option(ONEBIT_NPU_LAX "Build the lax kernels with scripts/build-lax.sh (needs IRON_VENV and AIETOOLS)" OFF)
+    if(ONEBIT_NPU_LAX)
+        set(IRON_VENV "$ENV{IRON_VENV}" CACHE PATH "mlir-aie 1.4.2 + Peano venv, for scripts/build-lax.sh")
+        set(AIETOOLS "$ENV{AIETOOLS}" CACHE PATH "Vitis aietools directory (aiebu-asm), for scripts/build-lax.sh")
+        if(NOT IRON_VENV OR NOT AIETOOLS)
+            message(FATAL_ERROR "ONEBIT_NPU_LAX needs IRON_VENV and AIETOOLS (docs/npu-lax.md)")
+        endif()
+        set(_lax_kernels ${CMAKE_BINARY_DIR}/lax/kernels)
+        add_custom_command(OUTPUT ${_lax_kernels}/lax_l/insts.elf
+            COMMAND ${CMAKE_COMMAND} -E env IRON_VENV=${IRON_VENV} AIETOOLS=${AIETOOLS}
+                    ${CMAKE_SOURCE_DIR}/scripts/build-lax.sh ${CMAKE_BINARY_DIR}/lax
+            USES_TERMINAL)
+        add_custom_target(lax_kernels DEPENDS ${_lax_kernels}/lax_l/insts.elf)
+        add_dependencies(onebit lax_kernels)
+        target_compile_definitions(onebit PRIVATE ONEBIT_NPU_LAX_KERNELS_DEFAULT="${_lax_kernels}")
+    elseif(ONEBIT_NPU_LAX_KERNELS)
+        target_compile_definitions(onebit PRIVATE ONEBIT_NPU_LAX_KERNELS_DEFAULT="${ONEBIT_NPU_LAX_KERNELS}")
+    endif()
     if(ONEBIT_NPU_LAX_KERNELS)
         # The full-attention stream's position patches, against the reference harness's table
         # for the pinned build (tests/golden/npu_lax/lax_a_patches.tsv names its md5).

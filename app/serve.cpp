@@ -724,8 +724,8 @@ int run_serve(int argc, char** argv) {
 #ifdef ONEBIT_NPU
         if (!is_npu_model_dir(o.model, o.npu_kernels))
             throw std::runtime_error(o.model + " is not an NPU model directory (the fast lane needs npu/; "
-                                     "Qwen3.6-35B-A3B needs the lax kernels: --npu-kernels, <dir>/npu/lax or "
-                                     "$ONEBIT_NPU_LAX_KERNELS)");
+                                     "Qwen3.6-35B-A3B needs the lax kernels: --npu-kernels, <dir>/npu/lax, "
+                                     "$ONEBIT_NPU_LAX_KERNELS or a -DONEBIT_NPU_LAX build)");
         // The NPU serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }

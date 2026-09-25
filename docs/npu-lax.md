@@ -58,6 +58,13 @@ tests/npu_lax_parity.sh ~/.cache/lax <model dir> ~/.cache/lax-ref    # from the 
 ```
 
 The kernels land in `~/.cache/lax/kernels` in the layout under "Kernel directory".
+
+`1bit serve` finds the kernels in this order: `--npu-kernels`, `<model dir>/npu/lax`,
+`$ONEBIT_NPU_LAX_KERNELS`, then the build's own. `-DONEBIT_NPU_LAX=ON` builds them into the
+build tree with this script (it needs `IRON_VENV` and `AIETOOLS`), and `-DONEBIT_NPU_LAX_KERNELS=<dir>`
+names an existing build. So a model directory is all `1bit serve` needs, which is all Lemonade
+hands it. Through Lemonade on Strix Halo (fork `onebit` recipe, `FastFlowLM/Qwen3.6-35B-A3B-NPU2`
+at `0cad628`), the model loaded in 30 s on full ELFs and answered "Paris" at 16.0 tok/s.
 `<model dir>` is a Q4NX model directory (`model.q4nx`, `config.json`, `tokenizer.json`).
 The weights are packed from `model.q4nx` at load time and streamed into the XRT
 buffers, so no pre-packed files are needed. `--requant` is required, because the `lax`

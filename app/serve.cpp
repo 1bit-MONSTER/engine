@@ -423,13 +423,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         }
         if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
-            if (!hsa.empty()) b.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
     } else if (device == "zinc") {
-        b.argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(port)};
-        if (o.ctx_size > 0) { b.argv.push_back("-c"); b.argv.push_back(std::to_string(o.ctx_size)); }
-        b.env.push_back("RADV_PERFTEST=coop_matrix");
-        b.drop_model = true;  // zinc rejects any model id but its own
+        argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(child_port)};
+        if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
+        env.push_back("RADV_PERFTEST=coop_matrix");
+        drop_model = true;  // zinc rejects any model id but its own
     } else {
         throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm or zinc)");
     }

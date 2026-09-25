@@ -1,22 +1,22 @@
 {
  "date": "2026-09-25",
  "coverage": {
-  "models": 415414,
-  "with_architecture": 332565,
-  "architectures_seen": 2610,
-  "mapped_models": 310221,
+  "models": 415413,
+  "with_architecture": 332564,
+  "architectures_seen": 2611,
+  "mapped_models": 310219,
   "mapped_pct": 93.28,
   "checked_models": 213456,
   "checked_pct": 64.18,
   "per_backend": {
    "vulkan": {
-    "mapped": 310221,
+    "mapped": 310219,
     "checked": 213456,
     "mapped_pct": 93.28,
     "checked_pct": 64.18
    },
    "hrx": {
-    "mapped": 309917,
+    "mapped": 309915,
     "checked": 210820,
     "mapped_pct": 93.19,
     "checked_pct": 63.39
@@ -138,7 +138,7 @@
   ]
  },
  "raw": {
-  "total": 415414,
+  "total": 415413,
   "no_arch": 82849,
   "pages": 416,
   "complete": true,
@@ -173,8 +173,8 @@
    "T5ForConditionalGeneration": 1032,
    "ChessForCausalLM": 970,
    "FalconForCausalLM": 919,
-   "GlmMoeDsaForCausalLM": 616,
    "GPTJForCausalLM": 614,
+   "GlmMoeDsaForCausalLM": 614,
    "OlmoForCausalLM": 601,
    "GraniteForCausalLM": 589,
    "DeepseekV4ForCausalLM": 579,
@@ -2403,6 +2403,7 @@
    "Qwen35DSparkModel": 1,
    "Qwen35ForCausalLM": 1,
    "Qwen35GDN24ForCausalLM": 1,
+   "Qwen38ForCausalLM": 1,
    "Qwen3CanonForCausalLM": 1,
    "Qwen3FlatQuantForCausalLM": 1,
    "Qwen3ForCausalLMWithSIREN": 1,

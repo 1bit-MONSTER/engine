@@ -46,7 +46,10 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
 > has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per
 > request with the C++ scorer, which matches the Python reference; a decision takes 0.38 s on
-> Strix Halo ([docs/laya.md](docs/laya.md)). The working engine is being ported from 1bit-MONSTER,
+> Strix Halo ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 332,565
+> HF text-generation models with an architecture, 93.28% are mapped to a backend and 64.18%
+> have an architecture checked end to end on Strix Halo; a daily census keeps the counts
+> current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,
 > our private development repository; see [docs/PORTING.md](docs/PORTING.md).
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository
 > holds the verified code without the development history.

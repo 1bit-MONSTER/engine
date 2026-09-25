@@ -1,0 +1,221 @@
+{
+ "results": [
+  {
+   "backend": "hrx",
+   "model": "GLM-4.7-Flash-Q4_K_M.gguf",
+   "arch": "deepseek2",
+   "passed": false,
+   "said": "<no content: {\"error\":{\"code\":500,\"message\":\"Compute error.\",\"type\":\"server_error\"}}>",
+   "failed": [
+    "hrx: answers Paris",
+    "hrx: reply names e2e-model",
+    "hrx: streams (1 chunks)"
+   ],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "GLM-4.7-Flash-Q4_K_M.gguf",
+   "arch": "deepseek2",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "MiniCPM5-1B-Q4_K_M.gguf",
+   "arch": "llama",
+   "passed": true,
+   "said": "The capital of France is Paris.",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "MiniCPM5-1B-Q4_K_M.gguf",
+   "arch": "llama",
+   "passed": true,
+   "said": "The capital of France is Paris.",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "zinc",
+   "model": "MiniCPM5-1B-Q4_K_M.gguf",
+   "arch": "llama",
+   "passed": false,
+   "said": "<no content: {\"choices\":[{\"finish_reason\":\"length\",\"index\":0,\"message\":{\"content\":\"\",\"role\":\"assistant\"}}],\"created\":179",
+   "failed": [
+    "zinc: answers Paris",
+    "zinc: streams (2 chunks)"
+   ],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "MiniCPM4-8B-Q4_K_M.gguf",
+   "arch": "minicpm",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "MiniCPM4-8B-Q4_K_M.gguf",
+   "arch": "minicpm",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "qwen2.5-7b-instruct-q4_k_m-merged.gguf",
+   "arch": "qwen2",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "qwen2.5-7b-instruct-q4_k_m-merged.gguf",
+   "arch": "qwen2",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "zinc",
+   "model": "qwen2.5-7b-instruct-q4_k_m-merged.gguf",
+   "arch": "qwen2",
+   "passed": false,
+   "said": "<no content: >",
+   "failed": [
+    "zinc: /health 200",
+    "zinc: /v1/models names e2e-model",
+    "zinc: answers Paris",
+    "zinc: reply names e2e-model",
+    "zinc: streams (0 chunks)"
+   ],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "Qwen3-0.6B-Q4_K_M.gguf",
+   "arch": "qwen3",
+   "passed": true,
+   "said": "Paris.",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "npu",
+   "model": "Qwen3-0.6B",
+   "arch": "qwen3",
+   "passed": true,
+   "said": "**Paris**",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3-0.6B-Q4_K_M.gguf",
+   "arch": "qwen3",
+   "passed": true,
+   "said": "Paris.",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "zinc",
+   "model": "Qwen3-0.6B-Q4_K_M.gguf",
+   "arch": "qwen3",
+   "passed": true,
+   "said": "Paris.",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "Qwen3.6-35B-A3B-Q8_0.gguf",
+   "arch": "qwen35moe",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3.6-35B-A3B-Q8_0.gguf",
+   "arch": "qwen35moe",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "zinc",
+   "model": "Qwen3.6-35B-A3B-Q8_0.gguf",
+   "arch": "qwen35moe",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+   "arch": "qwen3moe",
+   "passed": false,
+   "said": "<no content: {\"error\":{\"code\":500,\"message\":\"Compute error.\",\"type\":\"server_error\"}}>",
+   "failed": [
+    "hrx: answers Paris",
+    "hrx: reply names e2e-model",
+    "hrx: streams (3 chunks)"
+   ],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "vulkan",
+   "model": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+   "arch": "qwen3moe",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "zinc",
+   "model": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+   "arch": "qwen3moe",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "8c2805d977eb"
+  }
+ ]
+}

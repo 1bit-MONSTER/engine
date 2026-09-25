@@ -1,0 +1,39 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# What tools/registry_check.py runs: backend <TAB> model path (under --models, or
+# --npu-models for npu: a Q4NX directory with its lane kernels in npu/, docs/npu.md)
+# [<TAB> extra `1bit serve` args]. One model per architecture a
+# backend maps, where a model file is at hand on Strix Halo.
+vulkan	Qwen3-0.6B-Q4_K_M.gguf
+vulkan	qwen2.5-7b-instruct-q4_k_m-merged.gguf
+vulkan	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+vulkan	Qwen3.6-35B-A3B-Q8_0.gguf
+vulkan	GLM-4.7-Flash-Q4_K_M.gguf
+vulkan	MiniCPM4-8B-Q4_K_M.gguf
+vulkan	MiniCPM5-1B-Q4_K_M.gguf
+hrx	Qwen3-0.6B-Q4_K_M.gguf
+hrx	qwen2.5-7b-instruct-q4_k_m-merged.gguf
+hrx	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+hrx	Qwen3.6-35B-A3B-Q8_0.gguf
+hrx	GLM-4.7-Flash-Q4_K_M.gguf
+hrx	MiniCPM4-8B-Q4_K_M.gguf
+hrx	MiniCPM5-1B-Q4_K_M.gguf
+zinc	Qwen3-0.6B-Q4_K_M.gguf
+zinc	qwen2.5-7b-instruct-q4_k_m-merged.gguf
+zinc	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+zinc	Qwen3.6-35B-A3B-Q8_0.gguf
+zinc	MiniCPM5-1B-Q4_K_M.gguf
+npu	Qwen3-0.6B

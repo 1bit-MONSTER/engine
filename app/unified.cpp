@@ -29,6 +29,7 @@
 // prompt's prefix (--snapshots, npu/lax_turns.h): a chat follow-up re-feeds only the turns
 // after the one its history last diverged in. It starts over otherwise.
 #include "unified.h"
+#include "think_split.h"
 
 #include "generate.h"
 #include "lax.h"
@@ -153,11 +154,14 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         return;
     }
     std::string prompt;
+    bool split_reasoning = false, think_opened = false;
     try {
         bool thinking = true;
         if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
             thinking = body["chat_template_kwargs"].value("enable_thinking", true);
         prompt = chat ? chatml(body.at("messages"), thinking, e.open_think) : body.at("prompt").get<std::string>();
+        split_reasoning = chat && thinking && body.value("reasoning_format", std::string("auto")) != "none";
+        think_opened = thinking && e.open_think;
     } catch (const std::exception& ex) {
         res.status = 400;
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
@@ -199,9 +203,12 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
     };
     // By value: for a stream, httplib calls the content provider after this
     // handler has returned.
-    auto chunk = [id, object, created, model = e.id, chat](const std::string& text, const json& finish) {
+    auto chunk = [id, object, created, model = e.id, chat](const std::string& text, const json& finish,
+                                                           bool reasoning = false) {
         json c{{"id", id}, {"object", object}, {"created", created}, {"model", model}};
-        c["choices"] = json::array({chat ? json{{"index", 0}, {"delta", {{"content", text}}}, {"finish_reason", finish}}
+        c["choices"] = json::array({chat ? json{{"index", 0},
+                                                {"delta", {{reasoning ? "reasoning_content" : "content", text}}},
+                                                {"finish_reason", finish}}
                                          : json{{"index", 0}, {"text", text}, {"finish_reason", finish}}});
         return "data: " + c.dump() + "\n\n";
     };
@@ -223,12 +230,21 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
 
     if (stream) {
         res.set_chunked_content_provider("text/event-stream", [run, chunk, usage, timings, stream_usage, id, object, created,
+                                                               split_reasoning, think_opened,
                                                                model = e.id](size_t, httplib::DataSink& sink) mutable {
             try {
+                ThinkSplit split(think_opened);
+                bool ok = true;
+                auto emit = [&](bool reasoning, const std::string& t) {
+                    const std::string c = chunk(t, nullptr, reasoning);
+                    ok = ok && sink.write(c.data(), c.size());
+                };
                 auto [r, n_prompt, n_cached, cache] = run([&](const std::string& t) {
-                    const std::string c = chunk(t, nullptr);
-                    return sink.write(c.data(), c.size());
+                    if (split_reasoning) split.feed(t, emit);
+                    else emit(false, t);
+                    return ok;
                 });
+                if (split_reasoning) split.flush(emit);
                 std::string end = chunk("", r.stopped_at_eos ? "stop" : "length");
                 if (stream_usage) {
                     const json u{{"id", id},       {"object", object},
@@ -249,16 +265,20 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         return;
     }
     try {
-        std::string text;
+        std::string text, reasoning;
+        ThinkSplit split(think_opened);
+        auto emit = [&](bool r, const std::string& t) { (r ? reasoning : text) += t; };
         auto [r, n_prompt, n_cached, cache] = run([&](const std::string& t) {
-            text += t;
+            if (split_reasoning) split.feed(t, emit);
+            else text += t;
             return true;
         });
+        if (split_reasoning) split.flush(emit);
         json out{{"id", id}, {"object", object}, {"created", created}, {"model", e.id}};
         const char* finish = r.stopped_at_eos ? "stop" : "length";
-        out["choices"] = json::array({chat ? json{{"index", 0},
-                                                  {"message", {{"role", "assistant"}, {"content", text}}},
-                                                  {"finish_reason", finish}}
+        json message{{"role", "assistant"}, {"content", text}};
+        if (!reasoning.empty()) message["reasoning_content"] = reasoning;
+        out["choices"] = json::array({chat ? json{{"index", 0}, {"message", message}, {"finish_reason", finish}}
                                            : json{{"index", 0}, {"text", text}, {"finish_reason", finish}}});
         out["usage"] = usage(r, n_prompt, n_cached);
         out["timings"] = timings(r, cache);

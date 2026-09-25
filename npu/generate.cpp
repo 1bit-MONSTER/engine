@@ -60,7 +60,7 @@ struct Chooser {
 
 }  // namespace
 
-GenerateResult generate(Lane& lane, const Model& model, const std::vector<int>& prompt, const GenerateOptions& opt) {
+static GenerateResult generate_once(Lane& lane, const Model& model, const std::vector<int>& prompt, const GenerateOptions& opt) {
     if (prompt.empty()) throw std::runtime_error("empty prompt");
     if (int(prompt.size()) + opt.max_tokens > Lane::kMaxContext)
         throw std::runtime_error("prompt plus max_tokens exceeds the context limit");
@@ -103,6 +103,22 @@ GenerateResult generate(Lane& lane, const Model& model, const std::vector<int>& 
     }
     res.decode_ms = ms_since(t0);
     return res;
+}
+
+// Each generate() runs on a fresh hw_context (created in begin(), destroyed
+// while warm in end()) so the context never sits idle across the NPU's
+// runtime-suspend, which is what leaves a long-idle context stale and makes
+// its next runlist execute() fail with ERT_CMD_STATE_TIMEOUT.
+GenerateResult generate(Lane& lane, const Model& model, const std::vector<int>& prompt, const GenerateOptions& opt) {
+    lane.begin();
+    try {
+        GenerateResult r = generate_once(lane, model, prompt, opt);
+        lane.end();
+        return r;
+    } catch (...) {
+        lane.end();
+        throw;
+    }
 }
 
 }  // namespace onebit::npu

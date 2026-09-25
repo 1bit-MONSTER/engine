@@ -54,7 +54,7 @@ struct Lane::Impl {
     std::unique_ptr<xrt::ext::kernel> lmhead;
     std::map<int, std::unique_ptr<xrt::ext::kernel>> layer_kernels;
 
-    Bytes ctx1, pdi;
+    Bytes ctx1, pdi, head;
     ContextMap map;
 
     std::vector<std::unique_ptr<xrt::ext::bo>> weights, i5, kv;
@@ -71,23 +71,10 @@ struct Lane::Impl {
         pdi = read_file(dir + "/layer.pdi");
         map = ContextMap::derive(ctx1, read_file(dir + "/layer_ctx2.elf"), read_file(dir + "/layer_ctx17.elf"));
 
-        // The init config is the only one carrying load_pdi. One run of it
-        // configures the array; no layer or lm-head run ever reloads it, which
-        // is what keeps the per-token runlist at xclbin speed (docs/npu.md).
-        const Bytes init = assemble_full_elf(ctx1, pdi, "flinit", PdiMode::kInitOnly);
-        ctx = std::make_unique<xrt::hw_context>(dev, xrt::elf(reinterpret_cast<const char*>(init.data()), init.size()));
-        {
-            xrt::ext::kernel k(*ctx, "flinit");
-            xrt::ext::bo unused(dev, 4096);
-            xrt::run r(k);
-            r.set_arg(0, unused);
-            r.start();
-            if (r.wait(std::chrono::milliseconds(5000)) != ERT_CMD_STATE_COMPLETED)
-                throw std::runtime_error("NPU init run did not complete");
-        }
-        const Bytes head = assemble_full_elf(read_file(dir + "/lmhead.elf"), pdi, "flhead", PdiMode::kNone);
-        ctx->add_config(xrt::elf(reinterpret_cast<const char*>(head.data()), head.size()));
-        lmhead = std::make_unique<xrt::ext::kernel>(*ctx, "flhead");
+        // The lm-head ELF is stored now; the hw_context (init load_pdi config
+        // + lm-head config) is created fresh in begin() so a context never sits
+        // idle across the NPU's runtime-suspend.
+        head = assemble_full_elf(read_file(dir + "/lmhead.elf"), pdi, "flhead", PdiMode::kNone);
 
         // KV: 4 regions (K and V, two head halves) of kMaxContext rows each.
         const size_t kv_bytes = std::max<size_t>(size_t(d.kv_heads / 2) * d.head_dim * 2 * kMaxContext * 4, 32u << 20);
@@ -167,6 +154,42 @@ struct Lane::Impl {
         logits->sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(d.vocab) * 2, 0);
         return static_cast<const uint16_t*>(logits->map());
     }
+
+    // Create a fresh hw_context carrying the init (load_pdi) config and the
+    // lm-head config. Called at the start of each generate(): a context is
+    // created, used for one generation, then destroyed while warm in end(), so
+    // it never sits idle across the NPU's runtime-suspend (which leaves a
+    // long-idle context stale and its next runlist execute() fails with
+    // ERT_CMD_STATE_TIMEOUT).
+    void begin() {
+        const Bytes init = assemble_full_elf(ctx1, pdi, "flinit", PdiMode::kInitOnly);
+        ctx = std::make_unique<xrt::hw_context>(dev, xrt::elf(reinterpret_cast<const char*>(init.data()), init.size()));
+        {
+            xrt::ext::kernel k(*ctx, "flinit");
+            xrt::ext::bo unused(dev, 4096);
+            xrt::run r(k);
+            r.set_arg(0, unused);
+            r.start();
+            if (r.wait(std::chrono::milliseconds(5000)) != ERT_CMD_STATE_COMPLETED)
+                throw std::runtime_error("NPU init run did not complete");
+        }
+        ctx->add_config(xrt::elf(reinterpret_cast<const char*>(head.data()), head.size()));
+        lmhead = std::make_unique<xrt::ext::kernel>(*ctx, "flhead");
+        layer_kernels.clear();
+        slots[0].rl.reset(); slots[0].runs.clear();
+        slots[1].rl.reset(); slots[1].runs.clear();
+    }
+
+    // Destroy the hw_context while it is warm (every run completed), so its
+    // destructor never waits on a stuck command. Drop the runlists, runs,
+    // layer kernels and lm-head kernel before the context they reference.
+    void end() {
+        slots[0].rl.reset(); slots[0].runs.clear();
+        slots[1].rl.reset(); slots[1].runs.clear();
+        layer_kernels.clear();
+        lmhead.reset();
+        ctx.reset();
+    }
 };
 
 Lane::Lane(const Model& model, const std::string& kernel_dir) : p_(std::make_unique<Impl>(model, kernel_dir)) {}
@@ -175,6 +198,8 @@ Lane::~Lane() = default;
 void Lane::prepare(int slot, int ctx) { p_->prepare(slot, ctx); }
 void Lane::launch(int slot, int token) { p_->launch(slot, token); }
 void Lane::wait(int slot) { p_->slots[slot].rl->wait(); }
+void Lane::begin() { p_->begin(); }
+void Lane::end() { p_->end(); }
 
 void Lane::step(int token, int ctx) {
     prepare(0, ctx);

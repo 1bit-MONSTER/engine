@@ -29,12 +29,14 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 
 rm -f "$out/key" "$out/key.pub"; ssh-keygen -q -t ed25519 -N "" -f "$out/key"
-printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\n' "$(basename "$model")" > "$out/1bit.conf"
+# lavapipe is the VM's only Vulkan device; llama.cpp skips CPU Vulkan devices unless listed
+# (a 4096-token context: lavapipe reports too little memory for the model's full one)
+printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\"--ctx-size 4096\"\nexport GGML_VK_VISIBLE_DEVICES=0\n' "$(basename "$model")" > "$out/1bit.conf"
 LAVAPIPE=1 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" \
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1
 
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$out/vars.fd"
-qemu-system-x86_64 -enable-kvm -cpu host -m 8G -smp 8 -machine q35 \
+qemu-system-x86_64 -enable-kvm -cpu host -m 16G -smp 8 -machine q35 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="$out/vars.fd" \
     -device qemu-xhci -drive id=stick,if=none,format=raw,file="$out/image/1bit-os.img" -device usb-storage,drive=stick \
@@ -52,12 +54,18 @@ if ssh_vm true 2>/dev/null; then
 else
     echo "VM: no SSH"; ok=0
 fi
-for i in $(seq 90); do curl -sf 127.0.0.1:18000/v1/models >/dev/null 2>&1 && break; sleep 2; done
-reply=$(curl -s --max-time 300 127.0.0.1:18000/v1/chat/completions -H 'Content-Type: application/json' \
-    -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
-    | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)
+# 1bit serve answers /v1/models itself, before its backend is ready, and lavapipe compiles every
+# shader on first use (minutes in a VM): retry the chat request itself, for up to 10 minutes
+reply=
+for i in $(seq 60); do
+    reply=$(curl -s --max-time 120 127.0.0.1:18000/v1/chat/completions -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
+        | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)
+    [ -n "$reply" ] && break
+    sleep 10
+done
 if [ -n "$reply" ]; then echo "1bit serve (Vulkan on the VM's CPU) answered: $reply"; else echo "1bit serve: no answer"; ok=0
-    ssh_vm 'tail -15 /tmp/serve.log' 2>/dev/null || true; fi
+    ssh_vm 'grep -i -E "error|fail|abort|assert|out of memory|what\\(\\)" /tmp/serve.log | head -12; echo ...; tail -4 /tmp/serve.log' 2>/dev/null || true; fi
 ssh_vm 'poweroff -f' 2>/dev/null || true
 wait $vm 2>/dev/null || true
 trap - EXIT

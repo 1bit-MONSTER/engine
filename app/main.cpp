@@ -47,6 +47,8 @@
 #include <vector>
 
 #include <cerrno>
+#include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 namespace {
@@ -124,26 +126,54 @@ int run_npu(int argc, char** argv) {
 #endif
 
 // ComfyUI.cpp is GPL-3.0 and a separate program: exec it, never link it (docs/comfyui.md).
-// The binary: $ONEBIT_COMFYUI, then this build's (-DONEBIT_COMFYUI=ON), then comfyui_cpp on PATH.
+// The binary: $ONEBIT_COMFYUI (an absolute path), then this build's (-DONEBIT_COMFYUI=ON),
+// then comfyui_cpp on PATH. It is opened once, checked through that descriptor (a regular,
+// executable file that other users cannot write) and run with fexecve, so the file that was
+// checked is the file that runs.
+std::string find_comfy() {
+    if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) {
+        if (e[0] != '/') throw std::runtime_error("ONEBIT_COMFYUI must be an absolute path, not " + std::string(e));
+        return e;
+    }
+#ifdef ONEBIT_COMFYUI_BIN
+    if (std::filesystem::exists(ONEBIT_COMFYUI_BIN)) return ONEBIT_COMFYUI_BIN;
+#endif
+    if (const char* path = std::getenv("PATH")) {
+        std::stringstream dirs(path);
+        for (std::string dir; std::getline(dirs, dir, ':');) {
+            if (dir.empty() || dir[0] != '/') continue;  // relative PATH entries depend on the cwd
+            const std::string cand = dir + "/comfyui_cpp";
+            if (::access(cand.c_str(), X_OK) == 0) return cand;
+        }
+    }
+    throw std::runtime_error("no comfyui_cpp: build with -DONEBIT_COMFYUI=ON or set ONEBIT_COMFYUI");
+}
+
 int run_comfy(int argc, char** argv) {
     if (argc < 1 || !std::strcmp(argv[0], "-h") || !std::strcmp(argv[0], "--help")) {
         std::printf("usage: 1bit comfy <workflow.json>\n"
                     "  runs a ComfyUI API-format workflow (SD1.5 txt2img/img2img, see docs/comfyui.md)\n");
         return argc < 1 ? 2 : 0;
     }
-    std::string bin;
-    if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) bin = e;
-#ifdef ONEBIT_COMFYUI_BIN
-    if (bin.empty() && std::filesystem::exists(ONEBIT_COMFYUI_BIN)) bin = ONEBIT_COMFYUI_BIN;
-#endif
-    if (bin.empty()) bin = "comfyui_cpp";
-    std::vector<char*> args{bin.data()};
+    const std::string bin = find_comfy();
+    const int fd = ::open(bin.c_str(), O_RDONLY | O_CLOEXEC);
+    if (fd < 0) throw std::runtime_error("cannot open " + bin + ": " + std::strerror(errno));
+    struct stat st {};
+    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
+        ::close(fd);
+        throw std::runtime_error(bin + " is not an executable file");
+    }
+    if (st.st_mode & S_IWOTH) {
+        ::close(fd);
+        throw std::runtime_error(bin + " is writable by other users; refusing to run it");
+    }
+    std::vector<char*> args{const_cast<char*>(bin.c_str())};
     for (int i = 0; i < argc; ++i) args.push_back(argv[i]);
     args.push_back(nullptr);
-    ::execvp(args[0], args.data());
-    std::fprintf(stderr, "1bit comfy: cannot run %s: %s (build with -DONEBIT_COMFYUI=ON or set ONEBIT_COMFYUI)\n",
-                 bin.c_str(), std::strerror(errno));
-    return 127;
+    ::fexecve(fd, args.data(), environ);
+    const int err = errno;
+    ::close(fd);
+    throw std::runtime_error("cannot run " + bin + ": " + std::strerror(err));
 }
 
 }  // namespace
@@ -188,7 +218,14 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    if (cmd == "comfy") return run_comfy(argc - 2, argv + 2);
+    if (cmd == "comfy") {
+        try {
+            return run_comfy(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit comfy: %s\n", e.what());
+            return 127;
+        }
+    }
     if (cmd == "version" || cmd == "--version") {
         std::printf("1bit %s\n", kVersion);
         return 0;

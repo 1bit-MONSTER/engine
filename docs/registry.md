@@ -40,6 +40,8 @@ hand:
 
 At the current pins: 265 HF architectures, vulkan 265, hrx 246, zinc 44, npu 1.
 
+**Reviewed gaps.** Some unmapped architectures only look like a supported family. [Architecture gaps](arch-gaps.md) records why each of them is not an alias. `registry/significant.json` lists those classes, and `tools/registry_build.py --check-gaps` (ctest `registry_gaps`) fails if one becomes mapped without a recorded reason.
+
 ## Checked models
 
 `tools/registry_check.py <1bit> --models <dir>` runs `tests/serve_e2e.sh` for every row of

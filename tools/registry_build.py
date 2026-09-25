@@ -168,12 +168,38 @@ def build():
     }
 
 
+def gap_violations(registry):
+    """Classes reviewed as not aliases (registry/significant.json, docs/arch-gaps.md) that the
+    registry maps without a recorded reason ('mapped_ok'): each needs a person's look."""
+    sig = json.load(open(os.path.join(ROOT, "registry/significant.json")))["classes"]
+    mapped = registry["architectures"]
+    return [(cls, mapped[cls]) for cls, e in sig.items() if cls in mapped and not e.get("mapped_ok")]
+
+
+def report_gaps(registry):
+    bad = gap_violations(registry)
+    for cls, m in bad:
+        print(f"{cls} is mapped (gguf {m['gguf']}, {', '.join(m['backends'])}) but docs/arch-gaps.md reviewed it as "
+              f"not an alias: check that the pinned backend really implements it, then record why in "
+              f"registry/significant.json ('mapped_ok')")
+    return bad
+
+
 def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("--out", default=os.path.join(ROOT, "registry/architectures.json"))
     ap.add_argument("--check", action="store_true")
+    ap.add_argument("--check-gaps", action="store_true",
+                    help="only check the committed registry against registry/significant.json (no pins needed)")
     a = ap.parse_args()
+    if a.check_gaps:
+        bad = report_gaps(json.load(open(a.out)))
+        if not bad:
+            n = len(json.load(open(os.path.join(ROOT, "registry/significant.json")))["classes"])
+            print(f"none of the {n} reviewed significant classes is mapped without a reason")
+        return 1 if bad else 0
     text = json.dumps(build(), indent=1, sort_keys=False) + "\n"
+    report_gaps(json.loads(text))
     if a.check:
         old = open(a.out).read() if os.path.exists(a.out) else ""
         if old != text:

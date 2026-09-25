@@ -62,5 +62,5 @@ It has not run on a real Windows machine yet.
 
 ## Next
 
-- **An ONNX Runtime GenAI backend:** Lemonade's ONNX and hybrid models, and the Ryzen AI NPU on Windows through the Vitis AI execution provider.
+- **The ONNX backend on Windows:** `--device onnx` works on Linux ([ONNX Runtime](onnx.md)); `ryzenai-server.exe` in this script is next.
 - **The NPU lane on Windows XRT.**

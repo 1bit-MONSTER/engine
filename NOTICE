@@ -89,6 +89,23 @@ Lemonade (third_party/lemonade)
   built as its own program (scripts/build-lemonade.sh) that runs `1bit serve`
   as a backend. None of its code is linked into this product.
 
+ryzenai-server (third_party/ryzenai-server)
+  https://github.com/lemonade-sdk/ryzenai-server
+  Copyright (c) 2026 lemonade-sdk. License: MIT.
+  Built as a separate program (scripts/build-onnx.sh) that `1bit serve --device
+  onnx` runs as a child process; none of its code is linked into this product.
+  Its build fetches cpp-httplib (MIT), nlohmann/json (MIT) and the ONNX Runtime
+  GenAI headers (MIT). The AMD_LICENSE file in its repository covers AMD's Ryzen
+  AI Software, which this product does not ship: the NPU and hybrid modes use it
+  only when the user installs it (RYZENAI_INSTALL_PATH).
+
+ONNX Runtime GenAI and ONNX Runtime
+  https://github.com/microsoft/onnxruntime-genai
+  https://github.com/microsoft/onnxruntime
+  Copyright (c) Microsoft Corporation. License: MIT.
+  scripts/build-onnx.sh fetches the release libraries (ONNX Runtime GenAI 0.11.2,
+  ONNX Runtime 1.23.2, pinned by sha256) and places them beside ryzenai-server.
+
 ComfyUI.cpp (third_party/comfyui.cpp)
   https://github.com/1bit-MONSTER/comfyui.cpp
   A C++ port of ComfyUI (https://github.com/Comfy-Org/ComfyUI, Copyright (C)

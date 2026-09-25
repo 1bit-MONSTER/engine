@@ -396,7 +396,9 @@ int run_unified(int argc, char** argv) {
     e.tok = std::make_unique<npu::Tokenizer>(model_dir + "/tokenizer.json");
     if (kind == NpuModel::Private) {
         std::string why;
-        const npu::PrivateRoute& route = *npu::route_for(model_dir, opts, &why);
+        const npu::PrivateRoute* rp = npu::route_for(model_dir, opts, &why);
+        if (!rp) throw std::runtime_error(model_dir + ": the private route no longer serves it" + (why.empty() ? "" : ": " + why));
+        const npu::PrivateRoute& route = *rp;
         e.priv = route.open(*e.model, *e.tok, model_dir, opts);
         e.max_context = e.priv->max_context();
         e.default_penalty = e.priv->default_repetition_penalty();

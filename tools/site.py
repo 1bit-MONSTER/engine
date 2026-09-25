@@ -77,7 +77,7 @@ NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade")]),
     ("Devices", [("npu", "NPU"), ("hrx", "HRX + Vulkan"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
                  ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
-    ("Components", [("laya", "Laya router"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
+    ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),
 ]
 

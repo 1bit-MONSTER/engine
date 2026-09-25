@@ -78,36 +78,36 @@ before a new backend.
 
 ## Embedding checklist
 
-What "fully embedded" still needs, measured on Strix Halo on 2026-09-25. The run used the
-pinned fork (`third_party/lemonade`, `7650b4f`), the engine from `main`, and Lemonade's LLM suite
-(`test/server_llm.py --wrapped-server onebit --backend <device>`). An audit copy of the suite
-claimed every feature for `onebit`, so each test ran instead of being skipped.
+What "fully embedded" still needs, measured on Strix Halo. The runs use the pinned fork
+(`third_party/lemonade`), the engine from `main`, and Lemonade's LLM suite
+(`test/server_llm.py --wrapped-server onebit --backend <device>`).
 
-| device | pass | fail |
+| device | 2026-09-25, start | now |
 |---|---|---|
-| Vulkan | 19 / 31 | Responses API (2), embeddings (3), reranking (3), slots, tokenize, echo, generation parameters |
-| HRX | 19 / 31 | the same 12 |
-| NPU | 3 / 31 | everything that loads a model: Lemonade hands the engine a GGUF, and the NPU runs only 1bit NPU model directories |
+| Vulkan | 19 / 31 | **29 / 29 run, all pass** (2 skipped, as for llamacpp) |
+| HRX | 19 / 31 | 26 / 29 run: reranking fails in HRX's JIT |
+| NPU | 3 / 31 | 3 / 31: Lemonade hands the engine a GGUF |
 
-1. **Declare what already works.** Tool calls (plain and streaming), `stop`, and async
-   chat/completions pass on Vulkan and HRX, but the recipe declares them unsupported. (fork)
-2. **Test on the device asked for.** Lemonade's test harness passes `--backend` to llamacpp,
-   sd-cpp and the others, but not to `onebit`, so every `onebit` run used the default device. (fork)
-3. **Forward the rest of llama-server's API.** `1bit serve` forwards only chat and completions,
-   so `/v1/responses`, `/slots` and `/tokenize` return 404. (engine)
-4. **Embedding and reranking models.** The recipe declares only `chat`, so Lemonade refuses
-   embedding and reranking models. `1bit serve` serves them only as companions of a chat model
-   (`--embed`, `--rerank`). (engine + fork)
-5. **The NPU from Lemonade.** Lemonade needs to download and hand over an NPU model
+1. ~~**Declare what already works.**~~ Done (fork #6). The recipe now declares tool calls,
+   `stop`, async, the Responses API, slots, tokenize, embeddings and reranking.
+2. ~~**Test on the device asked for.**~~ Done (fork #6). The harness passes `--backend` to
+   `onebit`.
+3. ~~**Forward the rest of llama-server's API.**~~ Done (#69). `1bit serve` forwards
+   `/v1/responses`, `/tokenize`, `/slots`, `/props` and `/metrics` on the llama-server devices.
+4. ~~**Embedding and reranking models.**~~ Done (#70, fork #6). `1bit serve --embedding` /
+   `--reranking`, and the recipe serves those modes.
+5. **Reranking on HRX.** HRX's JIT can't link the fp32 matmul-with-bias kernel that
+   jina-reranker-v1-tiny needs. (engine, HRX fork)
+6. **The NPU from Lemonade.** Lemonade needs to download and hand over an NPU model
    directory, and `1bit serve --device npu` needs to take it. (engine + fork)
-6. **Beyond the LLM suite:**
+7. **Beyond the LLM suite:**
    - image generation: `1bit comfy` behind Lemonade's image endpoint;
    - the Laya router;
    - MLX;
    - CUDA through ZINC, which needs an NVIDIA box.
 
-`echo` and generation parameters also fail, but Lemonade's own llamacpp recipe declares
-neither, so they aren't gaps.
+`echo` and generation parameters are skipped, because Lemonade's own llamacpp recipe
+declares neither.
 
 ## On its own
 

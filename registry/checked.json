@@ -12,7 +12,7 @@
     "hrx: streams (1 chunks)"
    ],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "vulkan",
@@ -32,7 +32,7 @@
    "said": "The capital of France is Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "vulkan",
@@ -65,7 +65,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "vulkan",
@@ -85,7 +85,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "vulkan",
@@ -121,7 +121,7 @@
    "said": "Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "npu",
@@ -161,7 +161,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "vulkan",
@@ -187,15 +187,11 @@
    "backend": "hrx",
    "model": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
    "arch": "qwen3moe",
-   "passed": false,
-   "said": "<no content: {\"error\":{\"code\":500,\"message\":\"Compute error.\",\"type\":\"server_error\"}}>",
-   "failed": [
-    "hrx: answers Paris",
-    "hrx: reply names e2e-model",
-    "hrx: streams (3 chunks)"
-   ],
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "c19b0665dec9"
   },
   {
    "backend": "vulkan",

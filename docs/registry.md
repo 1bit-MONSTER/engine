@@ -46,20 +46,24 @@ At the current pins: 265 HF architectures, vulkan 265, hrx 246, zinc 44, npu 1.
 `registry/check_models.tsv` and records the result in `registry/checked.json`, failures
 included. The architecture recorded is the one the backend loads: the GGUF
 `general.architecture`, or the NPU directory's `model_type`. Checked on Strix Halo
-2026-09-25, engine `8c2805d`:
+2026-09-25, engine `8c2805d` (hrx rows at `c19b066`):
 
 | GGUF architecture | Model | vulkan | hrx | zinc | npu |
 |---|---|---|---|---|---|
 | `qwen3` | Qwen3-0.6B | pass | pass | pass | pass |
 | `qwen2` | Qwen2.5-7B-Instruct | pass | pass | fails: no answer | |
-| `qwen3moe` | Qwen3-Coder-30B-A3B | pass | fails: compute error | pass | |
+| `qwen3moe` | Qwen3-Coder-30B-A3B | pass | pass | pass | |
 | `qwen35moe` | Qwen3.6-35B-A3B Q8_0 | pass | pass | pass | |
 | `deepseek2` | GLM-4.7-Flash | pass | fails: compute error | not mapped | |
 | `minicpm` | MiniCPM4-8B | pass | pass | not mapped | |
 | `llama` | MiniCPM5-1B | pass | pass | fails: no answer | |
 
-The two HRX compute errors reproduce on a second run. Both are MoE models, and the chat
-request itself fails with HTTP 500 "Compute error."
+GLM-4.7-Flash on HRX fails with HTTP 500 "Compute error." (#95). Its attention heads (576)
+are wider than HRX0's flash attention takes (512), so llama.cpp runs the model without flash
+attention, a path HRX0 cannot compute. HRX0 also claims the model's sigmoid MoE router
+nodes, which only its softmax top-8 router dispatch can run. Qwen3-Coder-30B-A3B failed the
+same way until `--device hrx` defaulted the context to 32768: at the model's full 262144,
+HRX0 declines flash attention too.
 
 ## The census
 
@@ -81,7 +85,7 @@ The first full sweep, 2026-09-25:
 | Backend | Mapped | Checked |
 |---|---|---|
 | vulkan | 93.28% | 64.18% |
-| hrx | 93.19% | 63.39% |
+| hrx | 93.19% | 63.91% |
 | zinc | 69.69% | 10.28% |
 | npu | 9.29% | 9.29% |
 

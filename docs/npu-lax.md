@@ -22,7 +22,8 @@ The whole 35B MoE token runs on the NPU as **one XRT runlist submit**:
 - Each layer's routed experts are chosen and fetched on the device.
 - The final norm and the lm head are two more runs.
 
-It matches an fp64 reference, and it decodes at 16.3-16.5 tok/s.
+It matches an fp64 reference given the same routed experts (the reference adopts the NPU's
+expert choice where they differ; "Parity" below), and it decodes at 16.3-16.5 tok/s.
 
 **Status: experimental, and served by `1bit serve --device npu` on full ELFs**
 ([serve.md](serve.md)). The kernels are the merged whole-layer design `lax` from the open
@@ -371,6 +372,13 @@ built by `scripts/build-lax.sh`. It produces `insts.bin` md5 `136cc0c9…` (lax_
 
 **Parity** (`tests/npu_lax_parity.sh`), three positions from `<|im_start|>`, each
 position's greedy token fed back:
+
+The reference is `make_decode.py`'s default protocol. The experts are chosen on the NPU, and
+where a previous NPU run's router picked differently from the reference's own top-8 (the
+8th slot is often a near-tie), the reference re-uses the NPU's choice and prints the
+disagreement. So these numbers measure the arithmetic given the same experts, not the routing
+decisions. `make_decode.py --strict-routing` keeps the reference's own top-8. A run with it
+measures routing agreement, which is a separate number, not yet recorded here.
 
 | position | logits corr | argmax (ours = reference) | top-5 |
 |---|---|---|---|

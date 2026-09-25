@@ -1,0 +1,98 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# PR-Agent (qodo-ai/pr-agent) reviews every pull request with a local coding model: Qwen3-Coder-
+# 30B-A3B (UD-Q5_K_XL) served by the engine itself (`1bit serve`, Vulkan) on the Strix Halo box,
+# at 127.0.0.1:8090 (the coder-llm user service). The job runs on that box's self-hosted runner
+# (label pr-agent), so no code leaves it and there is no API key. Settings: .pr_agent.toml.
+#
+# Opened/updated PRs get a review. A trusted comment runs a command: /review, /describe (rewrites
+# the PR title and description, so only on request), /improve or /ask <question>.
+name: pr-agent
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, ready_for_review]
+  issue_comment:
+    types: [created]
+
+permissions:
+  issues: write
+  pull-requests: write
+  contents: read
+
+concurrency:
+  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+  cancel-in-progress: true
+
+jobs:
+  pr_agent:
+    runs-on: [self-hosted, pr-agent]
+    timeout-minutes: 30
+    # same-repo PRs, and comments by the owner, members or collaborators on a pull request
+    if: |
+      (github.event_name == 'pull_request' && github.event.pull_request.head.repo.full_name == github.repository) ||
+      (github.event_name == 'issue_comment' && github.event.issue.pull_request &&
+       contains(fromJSON('["OWNER","MEMBER","COLLABORATOR"]'), github.event.comment.author_association))
+    steps:
+      - uses: actions/checkout@v4
+      - name: PR-Agent
+        env:
+          GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          COMMENT_BODY: ${{ github.event.comment.body }}
+          # the model settings are here too: PR-Agent reads .pr_agent.toml from the default branch only
+          CONFIG__MODEL: openai/qwen3-coder
+          CONFIG__FALLBACK_MODELS: '[]'
+          CONFIG__CUSTOM_MODEL_MAX_TOKENS: '65536'
+          OPENAI__API_BASE: http://127.0.0.1:8090/v1
+          OPENAI__KEY: local
+        run: |
+          set -e
+          # PR-Agent 0.43.0 in ~/pr-agent-venv on the runner (installed on first use)
+          export PATH="$HOME/pr-agent-venv/bin:$PATH"
+          if ! command -v pr-agent > /dev/null 2>&1; then
+            python3 -m venv "$HOME/pr-agent-venv"
+            "$HOME/pr-agent-venv/bin/pip" install -q "pr-agent==0.43.0"
+          fi
+          # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+                 -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' > /dev/null; then
+              ready=1; break
+            fi
+            sleep 10
+          done
+          [ "$ready" = 1 ] || { echo "::error::the local model (coder-llm on :8090) does not answer"; exit 1; }
+          # PR-Agent exits 0 even when every model call failed, so check its log
+          run() {
+            pr-agent --pr_url "$pr" "$@" 2>&1 | tee "$RUNNER_TEMP/pr-agent.log"
+            if grep -qE "Failed to generate prediction|Error during LLM inference|Failed to (review|describe|generate)" "$RUNNER_TEMP/pr-agent.log"; then
+              echo "::error::PR-Agent could not get an answer from the model"; exit 1
+            fi
+          }
+          pr="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number || github.event.issue.number }}"
+          if [ "${{ github.event_name }}" = "pull_request" ]; then
+            run review
+          else
+            cmd=$(printf '%s' "$COMMENT_BODY" | sed -E 's/^[[:space:]]*\/?//; s/[[:space:]].*//' | tr '[:upper:]' '[:lower:]')
+            case "$cmd" in
+              review)   run review ;;
+              describe) run describe ;;
+              improve)  run improve ;;
+              ask)      run ask "$(printf '%s' "$COMMENT_BODY" | sed -E 's/^[[:space:]]*\/?ask[[:space:]]*//')" ;;
+              *)        echo "not a PR-Agent command: $cmd" ;;
+            esac
+          fi

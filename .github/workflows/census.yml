@@ -1,0 +1,84 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The daily HF census (docs/registry.md): rebuild registry/architectures.json from the
+# pinned llama.cpp, HRX fork and ZINC, sweep every HF text-generation model, and open a
+# PR with the new counts. The mapped and checked counts are reported separately;
+# registry/checked.json only changes when tools/registry_check.py runs on Strix Halo.
+#
+# Uses the same HRX_BUMP_TOKEN as the bump workflows (a PR opened with GITHUB_TOKEN
+# would not run CI).
+
+name: census
+
+on:
+  schedule:
+    - cron: "17 5 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: census
+  cancel-in-progress: false
+
+jobs:
+  census:
+    runs-on: ubuntu-latest
+    timeout-minutes: 120
+    steps:
+      - name: Require the token
+        env:
+          HRX_BUMP_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          if [ -z "$HRX_BUMP_TOKEN" ]; then
+            echo "::error::secret HRX_BUMP_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HRX_BUMP_TOKEN }}
+
+      - name: Check out the pinned sources the registry reads
+        run: git submodule update --init --depth 1 third_party/llama.cpp-vulkan third_party/llama.cpp third_party/zinc
+
+      - name: Rebuild the registry and sweep HF
+        run: |
+          set -euo pipefail
+          python3 tools/registry_build.py
+          python3 tools/census.py | tee census.txt
+
+      - name: Open the census PR
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          if git diff --quiet -- registry; then echo "no change"; exit 0; fi
+          day=$(date -u +%F)
+          branch="census/$day"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+            echo "$branch already exists"; exit 0
+          fi
+          summary=$(cat census.txt)
+          python3 tools/census.py --pr-body > body.md
+          git config user.name "census"
+          git config user.email "census@users.noreply.github.com"
+          git switch -c "$branch"
+          git add registry
+          git commit -q -m "Census $day: $summary"
+          git push -q origin "$branch"
+          gh pr create --base main --head "$branch" --title "Census $day" --body-file body.md

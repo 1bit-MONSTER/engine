@@ -14,7 +14,8 @@
 # limitations under the License.
 #
 # What tools/registry_check.py runs: backend <TAB> model path (under --models, or
-# --npu-models for npu) [<TAB> extra `1bit serve` args]. One model per architecture a
+# --npu-models for npu: a Q4NX directory with its lane kernels in npu/, docs/npu.md)
+# [<TAB> extra `1bit serve` args]. One model per architecture a
 # backend maps, where a model file is at hand on Strix Halo.
 vulkan	Qwen3-0.6B-Q4_K_M.gguf
 vulkan	qwen2.5-7b-instruct-q4_k_m-merged.gguf
@@ -35,5 +36,4 @@ zinc	qwen2.5-7b-instruct-q4_k_m-merged.gguf
 zinc	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
 zinc	Qwen3.6-35B-A3B-Q8_0.gguf
 zinc	MiniCPM5-1B-Q4_K_M.gguf
-npu	Qwen3-0.6B-NPU2
-npu	Qwen3-1.7B-NPU2
+npu	Qwen3-0.6B

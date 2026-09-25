@@ -1,4 +1,18 @@
 #!/usr/bin/env python3
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 """Run and check models per backend; record the results in registry/checked.json.
 
 usage: tools/registry_check.py path/to/1bit --models DIR [--npu-models DIR] [--only BACKEND]
@@ -69,11 +83,12 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("bin")
     ap.add_argument("--models", required=True)
-    ap.add_argument("--npu-models", default=os.path.expanduser("~/.config/flm/models"))
+    ap.add_argument("--npu-models", help="NPU model directories (default: DIR/npu)")
     ap.add_argument("--only", help="run only this backend")
     ap.add_argument("--timeout", type=int, default=1200)
     a = ap.parse_args()
 
+    a.npu_models = a.npu_models or os.path.join(a.models, "npu")
     rows = []
     for line in open(LIST):
         line = line.strip()
@@ -101,7 +116,7 @@ def main():
             out, ok = (e.stdout or b"").decode() if isinstance(e.stdout, bytes) else (e.stdout or ""), False
             out += "\nFAIL timeout"
         said = next((l.split("said:", 1)[1].strip() for l in out.splitlines() if "said:" in l), "")
-        failed = [l[5:].strip() for l in out.splitlines() if l.startswith("FAIL")]
+        failed = [l[5:].strip() for l in out.splitlines() if l.startswith("FAIL ")]
         results[(backend, model)] = {
             "backend": backend, "model": model, "arch": arch, "passed": ok,
             "said": said[:120], "failed": failed,

@@ -63,3 +63,38 @@ fit next to Flash-Next's 104 GiB of weights.
 
 Measured quant sweet spots for Qwen3.8 on this route are on the
 [wiki](https://github.com/1bit-MONSTER/engine/wiki).
+
+## ZAYA1 (Zyphra), from our llama.cpp
+
+[ZAYA1](https://huggingface.co/Zyphra/ZAYA1-8B) is Zyphra's MoE: 8.8B parameters, 760M active per
+token. Every layer runs CCA attention, where q and k pass through short convolutions over time,
+then a top-1 router that picks one of 16 experts or a skip expert. Upstream llama.cpp has no ZAYA:
+its draft (ggml-org/llama.cpp#23112) was closed on 2026-09-05. ZAYA lives in our llama.cpp,
+`third_party/llama.cpp` (`1bit-MONSTER/llama.cpp`, [PR #2](https://github.com/1bit-MONSTER/llama.cpp/pull/2)).
+`1bit serve --device vulkan` reads the GGUF's `general.architecture`, and runs an architecture
+that only our llama.cpp has on that build's `Vulkan0` even when the upstream build is present.
+
+```
+python third_party/llama.cpp/convert_hf_to_gguf.py <Zyphra/ZAYA1-8B> --outtype f16 --outfile zaya1-8b-f16.gguf
+build/hrx/llama/bin/llama-quantize zaya1-8b-f16.gguf zaya1-8b-Q4_K_M.gguf Q4_K_M
+1bit serve -m zaya1-8b-Q4_K_M.gguf --device vulkan --ctx-size 8192
+```
+
+Verified on Strix Halo (Radeon 8060S, RADV):
+
+| Check | Result |
+|---|---|
+| Against transformers' `ZayaForCausalLM` in FP32, 96 teacher-forced positions | the F16 GGUF picks the same top token at 95 (the other is a 0.07-nat tie; transformers' own BF16 run matches FP32 at 91) |
+| `test-llama-archs -a zaya` | Vulkan within 7.9e-8 NMSE of the CPU; save and reload bit-exact |
+| `tests/serve_e2e.sh`, Q4_K_M | PASS: "Paris", streamed |
+
+| GGUF | Size | Prefill (pp512) | Decode (tg128) | Perplexity* |
+|---|---|---|---|---|
+| Q4_K_M | 5.17 GiB | 3,123 tok/s | 93.5 tok/s | 21.66 |
+| F16 | 16.51 GiB | 1,138 tok/s | 45.9 tok/s | 20.59 |
+
+\* 512-token chunks over this repository's docs (PORTING.md, hrx.md, README.md), for comparing
+quants, not models.
+
+CCA's grouped convolution runs as one batched matmul per layer; as one small matmul per group it
+held Q4_K_M decode at 50 tok/s.

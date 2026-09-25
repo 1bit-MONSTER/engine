@@ -30,7 +30,9 @@
 //   a model a private NPU route serves          -> that route, in process, in builds with
 //                                                  -DONEBIT_NPU_PRIVATE (docs/npu.md)
 //   a .gguf, --device vulkan                    -> the upstream llama.cpp build's
-//                                                  llama-server (else the HRX build's)
+//                                                  llama-server (else the HRX build's); an
+//                                                  architecture only our llama.cpp has
+//                                                  (ZAYA1) -> the HRX build's, on Vulkan0
 //   a .gguf, --device hrx                       -> the HRX build's llama-server
 //   a .gguf, --device vulkan --prefill-device hrx
 //                                               -> the HRX build's llama-server on Vulkan0,
@@ -50,6 +52,8 @@
 // Vulkan for GGUF (the fastest measured device for standard quants,
 // docs/hrx.md) until the Laya router (docs/laya.md) makes that choice.
 #include "serve.h"
+
+#include "gguf_meta.h"
 
 #ifdef ONEBIT_NPU
 #include "unified.h"
@@ -155,6 +159,13 @@ std::string default_llama_server(const std::string& device) {
     (void)device;
     return "llama-server";
 #endif
+}
+
+// Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
+// does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
+bool fork_only_arch(const std::string& gguf) {
+    const std::string arch = gguf_architecture(gguf);
+    return arch == "zaya";  // Zyphra ZAYA1 (docs/vulkan.md)
 }
 
 // --lean: the llama-server built from ROCmFPX (ONEBIT_LEAN), whose formats upstream
@@ -529,7 +540,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         const bool split = !o.prefill_device.empty();
         if (split && (device != "vulkan" || o.prefill_device != "hrx"))
             throw std::runtime_error("--prefill-device hrx works with --device vulkan");
-        argv = {o.llama_server.empty() ? default_llama_server(split ? "hrx" : device) : o.llama_server,
+        const bool fork_arch = device == "vulkan" && fork_only_arch(o.model);
+        argv = {o.llama_server.empty() ? default_llama_server(split || fork_arch ? "hrx" : device) : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }

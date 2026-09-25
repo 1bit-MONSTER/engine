@@ -191,7 +191,7 @@ int run_comfy(int argc, char** argv) {
 // One request in, one device out: runs the Laya scorer's fixed routing question
 // against the request state and prints the winning device (npu|hrx|vulkan|zinc).
 int run_route(int argc, char** argv) {
-    std::string laya_model, state;
+    std::string laya_model, state, devices_str = "npu,hrx,vulkan,zinc";
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -200,21 +200,28 @@ int run_route(int argc, char** argv) {
         };
         if (a == "--laya-model") laya_model = next();
         else if (a == "--state") state = next();
+        else if (a == "--devices") devices_str = next();
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: 1bit route --laya-model <dir> --state <text>\n"
-                        "  picks NPU, HRX, Vulkan or ZINC for the request via the Laya scorer\n");
+            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,vulkan,zinc]\n"
+                        "  picks one of the devices for the request via the Laya scorer\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
     }
     if (laya_model.empty()) throw std::runtime_error("--laya-model <dir> is required");
     if (state.empty()) throw std::runtime_error("--state <text> is required");
 
+    std::vector<std::string> devices;
+    std::string cur;
+    for (std::istringstream ss(devices_str); std::getline(ss, cur, ',');)
+        if (!cur.empty()) devices.push_back(cur);
+    if (devices.empty()) throw std::runtime_error("--devices is empty");
+
     onebit::laya::Scorer scorer;
     if (!scorer.load(laya_model)) {
         std::fprintf(stderr, "1bit route: %s\n", scorer.error().c_str());
         return 1;
     }
-    const std::string device = onebit::laya::route_device(scorer, state);
+    const std::string device = onebit::laya::route_device(scorer, state, devices);
     if (device.empty()) {
         std::fprintf(stderr, "1bit route: %s\n", scorer.error().c_str());
         return 1;

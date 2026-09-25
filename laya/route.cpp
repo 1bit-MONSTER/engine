@@ -19,22 +19,34 @@
 
 namespace onebit::laya {
 
-std::vector<Question> routing_question() {
-    Question q;
-    q.type = "choice";
-    q.instructions = "Which device should run this request?";
-    q.criteria = {
+namespace {
+
+// One-line descriptions for the devices the engine serves, keyed by name.
+const std::vector<std::pair<std::string, std::string>>& device_descriptions() {
+    static const std::vector<std::pair<std::string, std::string>> d = {
         {"npu", "low-power AMD XDNA NPU, single context at a time"},
         {"hrx", "AMD HRX on the Radeon iGPU"},
         {"vulkan", "Vulkan on the Radeon iGPU"},
         {"zinc", "ZINC GPU (also reaches NVIDIA and Apple)"},
     };
+    return d;
+}
+
+}  // namespace
+
+std::vector<Question> routing_question(const std::vector<std::string>& devices) {
+    Question q;
+    q.type = "choice";
+    q.instructions = "Which device should run this request?";
+    for (const std::string& dev : devices)
+        for (const auto& [name, desc] : device_descriptions())
+            if (name == dev) q.criteria.emplace_back(name, desc);
     return {std::move(q)};
 }
 
-std::string route_device(Scorer& scorer, const std::string& state) {
+std::string route_device(Scorer& scorer, const std::string& state, const std::vector<std::string>& devices) {
     std::vector<Answer> answers;
-    if (!scorer.score(state, routing_question(), answers)) return "";
+    if (!scorer.score(state, routing_question(devices), answers)) return "";
     return answers.empty() ? "" : answers.front().choice;
 }
 

@@ -83,10 +83,14 @@ probabilities <= 1e-4. Verified 2026-09-25 on Strix Halo.
 `1bit serve --device auto --laya-model <dir>` routes each request with the
 scorer instead of the old `auto -> vulkan` hardcode: the fixed routing question
 (\"which device should run this request?\") returns the device, and the serve
-process lazily starts that device's backend and forwards the request to it.
-`1bit route --laya-model <dir> --state <text>` prints the device for one
-request. `tests/laya_route_e2e.sh` proves a request reaches the backend the
-scorer chose (fake backends stand in for llama-server and zinc).
+process lazily starts that device's backend and forwards the request to it. The
+candidate devices follow from the model: a `.gguf` routes among `vulkan`, `hrx`
+and `zinc` (NPU runs Q4NX model directories, not `.gguf` files), and an NPU
+model directory routes to `npu`. `1bit route --laya-model <dir> --state <text>
+[--devices npu,hrx,vulkan,zinc]` prints the device for one request against a
+candidate set. `tests/laya_route_e2e.sh` proves requests reach the backend the
+scorer chose, across more than one device (fake backends stand in for
+llama-server and zinc).
 
 `multilingual/` (mmBERT-base) and Apple/MLX routing are out of scope for this
 step.

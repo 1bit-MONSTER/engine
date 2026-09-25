@@ -16,7 +16,8 @@
 // laya/route.h — the step-4 router: maps a request to a device via the Laya
 // scorer (docs/laya.md). One forward pass answers the fixed routing question
 // ("which device should run this request?") and the winning option is the
-// device: npu, hrx, vulkan or zinc.
+// device. The candidate devices are passed in, so a .gguf routes among the GPU
+// backends (vulkan, hrx, zinc) while an NPU model directory routes to npu.
 #pragma once
 
 #include <string>
@@ -27,13 +28,15 @@ namespace onebit::laya {
 class Scorer;
 struct Question;
 
-// The fixed routing question. The criteria keys are the device names, so the
-// argmax option IS the device.
-std::vector<Question> routing_question();
+// The fixed routing question restricted to the given device names, in that
+// order. The criteria keys are the device names, so the argmax option IS the
+// device. Recognized names: npu, hrx, vulkan, zinc.
+std::vector<Question> routing_question(const std::vector<std::string>& devices);
 
-// Asks the scorer which device should run `state` (free text or a serialized
-// request) and returns the winning device name. Returns an empty string when
-// the scorer fails; the scorer's error is left on the passed-in scorer.
-std::string route_device(Scorer& scorer, const std::string& state);
+// Asks the scorer which of `devices` should run `state` (free text or a
+// serialized request) and returns the winning device name. Returns an empty
+// string when the scorer fails; the scorer's error is left on the passed-in
+// scorer.
+std::string route_device(Scorer& scorer, const std::string& state, const std::vector<std::string>& devices);
 
 }  // namespace onebit::laya

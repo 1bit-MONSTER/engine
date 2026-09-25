@@ -43,6 +43,8 @@ public:
     std::string decode(int id) const { return decode(std::vector<int>{id}); }
     // One past the largest id, added tokens included.
     int size() const { return int(id_to_text_.size()); }
+    // The vocabulary id for a token string (added tokens included), or -1 if absent.
+    int token_id(const std::string& token) const;
 
 private:
     std::unordered_map<std::string, int> vocab_;             // token text -> id, added tokens included

@@ -239,6 +239,35 @@ add_library(onebit_npu STATIC npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/pr
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
+# ── Step 4: Laya router (docs/laya.md) ───────────────────────────────────
+# The non-autoregressive decision scorer that picks where each request runs.
+# Depends on onebit_npu only for its tokenizer.json reader; the scorer itself
+# is device-independent (weights via model.safetensors, no Python at runtime).
+add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp)
+target_include_directories(onebit_laya PUBLIC laya)
+target_link_libraries(onebit_laya PUBLIC onebit_npu)
+# The engine binary gets `1bit route` and per-request routing through the scorer.
+target_link_libraries(onebit PRIVATE onebit_laya)
+target_compile_definitions(onebit PRIVATE ONEBIT_LAYA)
+
+add_executable(laya_gate tests/laya_gate.cpp)
+target_link_libraries(laya_gate PRIVATE onebit_laya nlohmann_json::nlohmann_json)
+# Each pinned checkpoint gates against its own golden.json from the Python reference.
+set(ONEBIT_LAYA_ROOT "" CACHE PATH "Root Laya checkpoint dir (model.safetensors + tokenizer/tokenizer.json)")
+set(ONEBIT_LAYA_GOLDEN "" CACHE FILEPATH "golden.json for the root checkpoint")
+set(ONEBIT_LAYA_TYPED_ROOT "" CACHE PATH "typed-decisions checkpoint dir")
+set(ONEBIT_LAYA_TYPED_GOLDEN "" CACHE FILEPATH "golden.json for the typed-decisions checkpoint")
+if(ONEBIT_LAYA_ROOT AND ONEBIT_LAYA_GOLDEN)
+    add_test(NAME laya_gate_root COMMAND laya_gate ${ONEBIT_LAYA_ROOT} ${ONEBIT_LAYA_GOLDEN})
+endif()
+if(ONEBIT_LAYA_TYPED_ROOT AND ONEBIT_LAYA_TYPED_GOLDEN)
+    add_test(NAME laya_gate_typed_decisions COMMAND laya_gate ${ONEBIT_LAYA_TYPED_ROOT} ${ONEBIT_LAYA_TYPED_GOLDEN})
+endif()
+set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
+if(ONEBIT_LAYA_ROUTE_MODEL)
+    add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+endif()
+
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
 add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)

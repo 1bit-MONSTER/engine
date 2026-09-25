@@ -54,6 +54,10 @@
 #ifdef ONEBIT_NPU
 #include "unified.h"
 #endif
+#ifdef ONEBIT_LAYA
+#include "route.h"
+#include "scorer.h"
+#endif
 
 #include <httplib.h>
 #include <nlohmann/json.hpp>
@@ -108,6 +112,7 @@ struct Options {
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
+    std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -418,13 +423,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         }
         if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
-            if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            if (!hsa.empty()) b.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
     } else if (device == "zinc") {
-        argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(child_port)};
-        if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        env.push_back("RADV_PERFTEST=coop_matrix");
-        drop_model = true;  // zinc rejects any model id but its own
+        b.argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(port)};
+        if (o.ctx_size > 0) { b.argv.push_back("-c"); b.argv.push_back(std::to_string(o.ctx_size)); }
+        b.env.push_back("RADV_PERFTEST=coop_matrix");
+        b.drop_model = true;  // zinc rejects any model id but its own
     } else {
         throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm or zinc)");
     }
@@ -457,9 +462,69 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
     return l;
 }
 
+// The devices a .gguf can run on, in the order the Laya router offers them. The NPU runs Q4NX
+// model directories, not .gguf files (docs/npu.md), so it is not a candidate here; an NPU
+// model directory routes to npu in run_serve.
+const std::vector<std::string> kGgufDevices = {"vulkan", "hrx", "zinc"};
+
+// The text the Laya scorer routes on: a completion's prompt, or a chat request's messages
+// joined the way the request reads.
+std::string request_state(const httplib::Request& req) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception&) {
+        return "";
+    }
+    if (body.contains("prompt") && body["prompt"].is_string()) return body["prompt"].get<std::string>();
+    std::string out;
+    if (body.contains("messages") && body["messages"].is_array())
+        for (const auto& m : body["messages"]) {
+            if (!m.is_object() || !m.contains("content")) continue;
+            auto add = [&](const std::string& t) {
+                if (t.empty()) return;
+                if (!out.empty()) out += "\n";
+                out += t;
+            };
+            const auto& c = m["content"];
+            if (c.is_string()) add(c.get<std::string>());
+            else if (c.is_array())
+                for (const auto& part : c)
+                    if (part.is_object() && part.value("type", "") == "text") add(part.value("text", ""));
+        }
+    return out;
+}
+
 int serve_child(const Options& o) {
     std::vector<Launch> backends;
-    if (o.adaptive) {
+    // --laya-model with --device auto: each request goes to the device the Laya scorer picks
+    // among the ones this build can run a .gguf on; a device's backend starts when it is
+    // first picked (one model is not loaded on every device at once)
+    const bool laya = !o.laya_model.empty() && o.device == "auto";
+#ifdef ONEBIT_LAYA
+    std::unique_ptr<onebit::laya::Scorer> scorer;
+    std::vector<std::string> laya_devices;
+    if (laya) {
+        if (o.adaptive || !o.role.empty() || !o.prefill_device.empty() || o.lean)
+            throw std::runtime_error("--laya-model does not combine with --adaptive, --embedding/--reranking, --prefill-device or --lean");
+        scorer = std::make_unique<onebit::laya::Scorer>();
+        if (!scorer->load(o.laya_model)) throw std::runtime_error("laya: " + scorer->error());
+        for (const std::string& dev : kGgufDevices) {
+            try {
+                backends.push_back(launch_for(o, dev, free_port()));
+                laya_devices.push_back(dev);
+            } catch (const std::exception& e) {
+                std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());
+            }
+        }
+        if (backends.empty()) throw std::runtime_error("laya: no device in this build can run " + o.model);
+    }
+#else
+    if (laya) throw std::runtime_error("--laya-model is not part of this build (-DONEBIT_LAYA=ON, docs/laya.md)");
+#endif
+    if (laya) {
+        // the candidates are prepared above
+    } else if (o.adaptive) {
         // Grows with the load: a lone request gets Vulkan (MTP if given, --adaptive-at slots,
         // default 1); concurrent ones go to ROCm, which keeps scaling to 16 batched requests.
         // MTP and batching live in separate backends: a server with MTP loaded batches at
@@ -494,7 +559,7 @@ int serve_child(const Options& o) {
     } else {
         backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
     }
-    const std::string device = o.adaptive ? "vulkan+rocm" : backends[0].device;
+    const std::string device = laya ? "laya" : o.adaptive ? "vulkan+rocm" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
     const std::string set_model = backends[0].set_model;
 
@@ -505,6 +570,7 @@ int serve_child(const Options& o) {
 
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
+
     httplib::Server srv;
     auto health = [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
@@ -519,6 +585,21 @@ int serve_child(const Options& o) {
         res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
     std::vector<std::unique_ptr<Child>> children;
+    // laya: the backends by index, started on first use (under start_mu; a start waits for
+    // the backend to be ready, up to 600 s)
+    std::vector<Child*> started(backends.size(), nullptr);
+    std::mutex start_mu;
+    auto ensure = [&](size_t i) -> bool {
+        std::lock_guard<std::mutex> lock(start_mu);
+        if (started[i]) return true;
+        const Launch& b = backends[i];
+        std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port);
+        if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
+        started[i] = c.get();
+        children.push_back(std::move(c));
+        return true;
+    };
     std::vector<std::atomic<int>> inflight(backends.size());
     std::vector<std::atomic<long>> routed(backends.size());
     std::mutex route_mu;
@@ -532,6 +613,27 @@ int serve_child(const Options& o) {
         // choosing and reserving are one step, or a burst of requests all read "empty"
         std::shared_ptr<InFlight> held;
         size_t pick = 0;
+#ifdef ONEBIT_LAYA
+        if (laya) {
+            const std::string dev = onebit::laya::route_device(*scorer, request_state(q), laya_devices);
+            const auto it = std::find(laya_devices.begin(), laya_devices.end(), dev);
+            if (it == laya_devices.end()) {
+                r.status = 502;
+                r.set_content(R"({"error":{"message":"laya routing failed"}})", "application/json");
+                return;
+            }
+            pick = size_t(it - laya_devices.begin());
+            if (!ensure(pick)) {
+                r.status = 503;
+                r.set_content(json{{"error", {{"message", backends[pick].device + " did not become ready"}}}}.dump(), "application/json");
+                return;
+            }
+            held = std::make_shared<InFlight>(&inflight[pick]);
+            ++routed[pick];
+            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r);
+            return;
+        }
+#endif
         {
             std::lock_guard<std::mutex> lock(route_mu);
             if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
@@ -549,7 +651,8 @@ int serve_child(const Options& o) {
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
     // the first backend; the NPU, ZINC and MLX answer 501.
-    const bool llama = device == "vulkan" || device == "hrx" || device == "rocm" || device == "vulkan+rocm";
+    const bool llama = device == "vulkan" || device == "hrx" || device == "rocm" || device == "vulkan+rocm" ||
+                       (laya && backends[0].device == "vulkan");
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
         r.status = 501;
         r.set_content(json{{"error", {{"message", q.path + " is not available on --device " + device},
@@ -561,12 +664,22 @@ int serve_child(const Options& o) {
             r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
             return;
         }
+        if (laya && !ensure(0)) {
+            r.status = 503;
+            r.set_content(R"({"error":{"message":"backend did not become ready"}})", "application/json");
+            return;
+        }
         relay(backends[0].port, q, r);
     };
     auto first_json = [&](const httplib::Request& q, httplib::Response& r) {
         if (!ready) {
             r.status = 503;
             r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
+            return;
+        }
+        if (laya && !ensure(0)) {
+            r.status = 503;
+            r.set_content(R"({"error":{"message":"backend did not become ready"}})", "application/json");
             return;
         }
         forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r);
@@ -626,7 +739,7 @@ int serve_child(const Options& o) {
     sa.sa_handler = on_stop_signal;
     ::sigaction(SIGTERM, &sa, nullptr);
     ::sigaction(SIGINT, &sa, nullptr);
-    for (const auto& b : backends) {
+    for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
     }
@@ -642,8 +755,10 @@ int serve_child(const Options& o) {
         }
     }
     ready = true;
-    std::fprintf(stderr, "1bit serve: ready on http://%s:%d\n", o.host.c_str(), o.port);
+    std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), o.port,
+                 laya ? " (laya routes each request; a device's backend starts when first picked)" : "");
     auto all_alive = [&] {
+        std::lock_guard<std::mutex> lock(start_mu);
         for (auto& c : children) if (!c->alive()) return false;
         return true;
     };
@@ -655,6 +770,7 @@ int serve_child(const Options& o) {
     }
     if (g_stop) {
         std::fprintf(stderr, "1bit serve: stopping\n");
+        std::lock_guard<std::mutex> lock(start_mu);
         for (auto& c : children) c->stop();
         return 0;
     }
@@ -675,6 +791,7 @@ void usage(FILE* out) {
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
+                 "                  [--laya-model DIR]   with --device auto, the Laya scorer picks each request's device (docs/laya.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
 }
@@ -713,6 +830,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--reranking") o.role = "reranking";
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
+        else if (a == "--laya-model") o.laya_model = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
@@ -726,6 +844,16 @@ int run_serve(int argc, char** argv) {
         npu::PrivateOptions opts;
         for (const auto& kv : o.npu_opts) npu::parse_private_option(kv, opts);
         if (const std::string why = npu_model_problem(o.model, opts); !why.empty()) throw std::runtime_error(why);
+#ifdef ONEBIT_LAYA
+        // A Q4NX model directory runs on the NPU only; with --laya-model the router is still asked
+        // (with npu its only candidate), so every device the engine serves goes through Laya.
+        if (!o.laya_model.empty()) {
+            onebit::laya::Scorer scorer;
+            if (!scorer.load(o.laya_model)) throw std::runtime_error("laya: " + scorer.error());
+            const std::string dev = onebit::laya::route_device(scorer, o.model, {"npu"});
+            std::fprintf(stderr, "1bit serve: laya routes %s to %s (Q4NX model directory)\n", model_id(o).c_str(), dev.c_str());
+        }
+#endif
         // The NPU serves in process (unified.cpp).
         std::vector<std::string> args = {"-m", o.model, "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }

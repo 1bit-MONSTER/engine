@@ -28,10 +28,19 @@ namespace onebit::npu {
 
 namespace {
 
-// Qwen2/Qwen3's pre-tokenizer pattern, used when tokenizer.json names none.
+// The GPT-2 pattern, used when tokenizer.json names none (and the explicit
+// Split regex that Qwen2/Qwen3's tokenizer.json carries).
 const char* const kDefaultPattern =
     "(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\\r\\n\\p{L}\\p{N}]?\\p{L}+|\\p{N}| ?[^\\s\\p{L}\\p{N}]+[\\r\\n]*|\\s*[\\r\\n]+|"
     "\\s+(?!\\S)|\\s+";
+
+// The ByteLevel pre-tokenizer's own regex (Rust tokenizers pre_tokenizers/byte_level.rs),
+// used when tokenizer.json's pre_tokenizer is {"type":"ByteLevel","use_regex":true}
+// with no explicit Split pattern (ModernBERT). Differs from the GPT-2 pattern:
+// digits stay together (\p{N}+) so multi-digit numbers can BPE-merge, and the
+// optional leading space belongs to the letter/number/punctuation run.
+const char* const kByteLevelPattern =
+    "'s|'t|'re|'ve|'m|'ll|'d| ?\\p{L}+| ?\\p{N}+| ?[^\\s\\p{L}\\p{N}]+|\\s+(?!\\S)|\\s+";
 
 void utf8_append(std::string& s, uint32_t cp) {
     if (cp < 0x80) {
@@ -59,6 +68,10 @@ std::string split_pattern(const nlohmann::json& pre) {
     if (!pre.is_object()) return "";
     if (pre.value("type", "") == "Split" && pre.contains("pattern") && pre["pattern"].contains("Regex"))
         return pre["pattern"]["Regex"].get<std::string>();
+    // ByteLevel serializes its regex implicitly; use_regex=true means it splits
+    // on its own pattern (not the GPT-2 one) when no Split is spelled out.
+    if (pre.value("type", "") == "ByteLevel" && pre.value("use_regex", true))
+        return kByteLevelPattern;
     if (pre.contains("pretokenizers"))
         for (const auto& p : pre["pretokenizers"])
             if (auto s = split_pattern(p); !s.empty()) return s;
@@ -189,6 +202,11 @@ std::vector<int> Tokenizer::bpe(const std::string& chars) const {
     for (const auto& w : word)
         if (auto it = vocab_.find(w); it != vocab_.end()) ids.push_back(it->second);
     return ids;
+}
+
+int Tokenizer::token_id(const std::string& token) const {
+    const auto it = vocab_.find(token);
+    return it == vocab_.end() ? -1 : it->second;
 }
 
 std::vector<int> Tokenizer::encode(const std::string& text) const {

@@ -162,6 +162,17 @@ endif()
 # Off by default: it needs LibTorch. Builds third_party/comfyui.cpp (GPL-3.0) with
 # scripts/build-comfyui.sh as its own program; `1bit comfy <workflow.json>` runs it as a
 # child process. The engine never links it, so the engine itself stays Apache-2.0.
+option(ONEBIT_ONNX "Build ryzenai-server (third_party/ryzenai-server) for --device onnx" OFF)
+if(ONEBIT_ONNX)
+    set(ONEBIT_ONNX_SERVER "${CMAKE_BINARY_DIR}/onnx/ryzenai-server")
+    add_custom_target(onnx_server
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-onnx.sh ${CMAKE_BINARY_DIR}/onnx
+        BYPRODUCTS ${ONEBIT_ONNX_SERVER}
+        USES_TERMINAL)
+    add_dependencies(onebit onnx_server)
+    target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${ONEBIT_ONNX_SERVER}")
+endif()
+
 option(ONEBIT_COMFYUI "Build ComfyUI.cpp (third_party/comfyui.cpp) for 1bit comfy" OFF)
 if(ONEBIT_COMFYUI)
     # fetch the pinned submodule at configure time when it is missing

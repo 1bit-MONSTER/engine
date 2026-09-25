@@ -174,6 +174,22 @@ std::string default_lean_server(const std::string& device) {
 #endif
 }
 
+// ryzenai-server (third_party/ryzenai-server, MIT): ONNX Runtime GenAI models, on the CPU with
+// Microsoft's ONNX Runtime, or the NPU / hybrid where AMD's Ryzen AI Software provides it
+std::string default_onnx() {
+    if (const char* e = std::getenv("ONEBIT_ONNX_SERVER"); e && *e) return e;
+#ifdef ONEBIT_ONNX_SERVER
+    return ONEBIT_ONNX_SERVER;
+#else
+    return "ryzenai-server";
+#endif
+}
+
+// an ONNX Runtime GenAI model directory (genai_config.json beside the graph)
+bool is_onnx_model_dir(const std::string& dir) {
+    return fs::is_directory(dir) && fs::exists(fs::path(dir) / "genai_config.json");
+}
+
 std::string default_zinc() {
     if (const char* e = std::getenv("ONEBIT_ZINC"); e && *e) return e;
 #ifdef ONEBIT_ZINC_SERVER
@@ -482,6 +498,15 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     std::vector<std::string>& env = l.env;
     bool& drop_model = l.drop_model;
     std::string& set_model = l.set_model;
+    if (device == "onnx") {
+        // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
+        // the model's genai_config.json
+        if (o.parallel > 1 || !o.mtp.empty() || o.lean || !o.prefill_device.empty())
+            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --lean or --prefill-device");
+        argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
+        if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
+        return l;
+    }
     if (device == "mlx") {
         // lemon-mlx-engine: `<server> <hf id> --port <p>`; it picks the model by
         // Hugging Face id, so requests carry that id (docs/apple.md).
@@ -883,7 +908,7 @@ int serve_child(const Options& o) {
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|vulkan|hrx|rocm|zinc|mlx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|vulkan|hrx|rocm|zinc|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
@@ -895,6 +920,7 @@ void usage(FILE* out) {
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--laya-model DIR]   with --device auto, the Laya scorer picks each request's device (docs/laya.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
+                 "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
 }
 
@@ -938,6 +964,13 @@ int run_serve(int argc, char** argv) {
     }
     if (o.model.empty()) { usage(stderr); return 2; }
 
+    if (is_onnx_model_dir(o.model)) {
+        if (o.device != "auto" && o.device != "onnx")
+            throw std::runtime_error("an ONNX Runtime GenAI model directory (genai_config.json) runs on --device onnx");
+        Options onnx = o;
+        onnx.device = "onnx";
+        return serve_child(onnx);
+    }
     if (fs::is_directory(o.model)) {
         if (o.lean) throw std::runtime_error("--lean serves a .gguf (ROCmFP4 or ROCmI4)");
         if (o.device != "auto" && o.device != "npu")

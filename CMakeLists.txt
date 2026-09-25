@@ -78,24 +78,6 @@ if(ONEBIT_VULKAN)
     endif()
 endif()
 
-# ── Private GPU trees (docs/hrx.md, "Private GPU build") ──────────────────
-# The public pins are AMD's ggml-hrx pair (ONEBIT_HRX) and upstream ROCmFPX (ONEBIT_LEAN).
-# ONEBIT_GPU_PRIVATE points at a checkout of the private gpu-kernels repository (branch
-# addons/gpu, submodules initialised); its addons/gpu/gpu.cmake names the llama.cpp,
-# hrx-system and ROCmFPX trees those builds use instead.
-set(ONEBIT_GPU_PRIVATE "" CACHE PATH "A gpu-kernels checkout whose trees ONEBIT_HRX and ONEBIT_LEAN build")
-set(ONEBIT_GPU_LLAMA_SOURCE "${CMAKE_SOURCE_DIR}/third_party/llama.cpp")
-set(ONEBIT_GPU_HRX_SYSTEM_SOURCE "${CMAKE_SOURCE_DIR}/third_party/hrx-system")
-set(ONEBIT_GPU_ROCMFPX_SOURCE "${CMAKE_SOURCE_DIR}/third_party/llama.cpp-rocmfpx")
-if(ONEBIT_GPU_PRIVATE)
-    if(NOT EXISTS "${ONEBIT_GPU_PRIVATE}/addons/gpu/gpu.cmake")
-        message(FATAL_ERROR "ONEBIT_GPU_PRIVATE=${ONEBIT_GPU_PRIVATE} has no addons/gpu/gpu.cmake")
-    endif()
-    include(${ONEBIT_GPU_PRIVATE}/addons/gpu/gpu.cmake)
-    message(STATUS "ONEBIT_GPU_PRIVATE: llama.cpp ${ONEBIT_GPU_LLAMA_SOURCE}, hrx-system ${ONEBIT_GPU_HRX_SYSTEM_SOURCE}, ROCmFPX ${ONEBIT_GPU_ROCMFPX_SOURCE}")
-    target_compile_definitions(onebit PRIVATE ONEBIT_GPU_PRIVATE)
-endif()
-
 # ── The lean option: ROCmFPX's formats (docs/lean.md) ─────────────────────
 # Off by default. Builds llama-server + llama-quantize from third_party/llama.cpp-rocmfpx
 # on Vulkan: `1bit serve --lean` runs ROCmFP4 files with it. ONEBIT_LEAN_ROCM adds the
@@ -136,12 +118,9 @@ if(ONEBIT_HRX)
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
         endforeach()
-        # Vulkan decode with prompt prefill on HRX over one shared KV cache (docs/hrx.md);
-        # only the private trees have it
-        if(ONEBIT_GPU_PRIVATE)
-            add_test(NAME serve_e2e_vulkan_prefill_hrx
-                     COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan --prefill-device hrx)
-        endif()
+        # Vulkan decode with prompt prefill on HRX over one shared KV cache (docs/hrx.md)
+        add_test(NAME serve_e2e_vulkan_prefill_hrx
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan --prefill-device hrx)
     endif()
 endif()
 

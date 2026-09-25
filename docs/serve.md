@@ -58,8 +58,8 @@ inherits it). On `npu`, `zinc` and `mlx` they answer 501.
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | the private NPU route, in process, in builds with `-DONEBIT_NPU_PRIVATE` (docs/npu.md, "Private routes") |
 | `.gguf` | `auto`, `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md); without `ONEBIT_VULKAN`, the HRX build's |
-| `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md; MoE models above 128 experts need `-DONEBIT_GPU_PRIVATE`, "Private GPU build") |
-| `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache, in builds with `-DONEBIT_GPU_PRIVATE` (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
+| `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md) |
+| `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
 | ROCmFP4 `.gguf` | `auto`, `vulkan` with `--lean` | the lean (ROCmFPX) build's llama-server on `Vulkan0` (docs/lean.md) |
 | `.gguf` | `rocm` | the ROCm build's llama-server on `ROCm0` (ROCmFPX's tree, `ONEBIT_LEAN_ROCM`); ROCmI4 files take its W4A4 path (docs/lean.md) |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |

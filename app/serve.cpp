@@ -407,11 +407,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         const bool split = !o.prefill_device.empty();
         if (split && (device != "vulkan" || o.prefill_device != "hrx"))
             throw std::runtime_error("--prefill-device hrx works with --device vulkan");
-#ifndef ONEBIT_GPU_PRIVATE
-        if (split)
-            throw std::runtime_error("--prefill-device hrx is not part of this build; build with "
-                                     "-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout> (docs/hrx.md)");
-#endif
         argv = {o.llama_server.empty() ? default_llama_server(split ? "hrx" : device) : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};

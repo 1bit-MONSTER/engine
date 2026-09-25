@@ -144,6 +144,24 @@ if(ONEBIT_ZINC)
     endif()
 endif()
 
+# ── ComfyUI.cpp (docs/comfyui.md) ──────────────────────────────────────────
+# Off by default: it needs LibTorch. Builds third_party/comfyui.cpp (GPL-3.0) with
+# scripts/build-comfyui.sh as its own program; `1bit comfy <workflow.json>` runs it as a
+# child process. The engine never links it, so the engine itself stays Apache-2.0.
+option(ONEBIT_COMFYUI "Build ComfyUI.cpp (third_party/comfyui.cpp) for 1bit comfy" OFF)
+if(ONEBIT_COMFYUI)
+    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
+        message(FATAL_ERROR "ONEBIT_COMFYUI needs third_party/comfyui.cpp: git submodule update --init third_party/comfyui.cpp")
+    endif()
+    set(ONEBIT_COMFYUI_BIN "${CMAKE_BINARY_DIR}/comfyui/comfyui_cpp")
+    add_custom_target(comfyui
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-comfyui.sh ${CMAKE_BINARY_DIR}/comfyui
+        BYPRODUCTS ${ONEBIT_COMFYUI_BIN}
+        USES_TERMINAL)
+    add_dependencies(onebit comfyui)
+    target_compile_definitions(onebit PRIVATE ONEBIT_COMFYUI_BIN="${ONEBIT_COMFYUI_BIN}")
+endif()
+
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────
 # Off by default: it needs cargo. Any model's tokenizer.json, through our C ABI
 # over third_party/tokenizers (the same release as the tokenizers npm/PyPI

@@ -43,9 +43,16 @@ MTP chat is decode speed with the MTP head on three prompts (code / prose / shor
 
 - **ROCmFP4 decodes 19% faster** than UD-Q4_K_XL on Vulkan (14-24% with MTP), from
   a 16% smaller file, at about 7x the KL divergence.
-- **ROCmI4 belongs on ROCm.** Vulkan has no kernel for it (6 / 4.1). On ROCm, the
-  gfx1151 W4A4 path lifts prompt processing 17% (465 against 397) and leaves decode
-  as it is.
+- **ROCmI4 on ROCm:** the gfx1151 W4A4 path lifts prompt processing 17% (465 against
+  397) and leaves decode as it is. The Vulkan numbers in the table (6 / 4.1) are from
+  before Vulkan had a ROCmI4 kernel.
+- **ROCmI4 on Vulkan (2026-09-25):** the engine's ROCmFPX pin, `1bit/vulkan-rocmi4` on our
+  fork 1bit-MONSTER/ROCmFPX, adds Vulkan kernels for `Q4_0_ROCMI4` with the ROCm path's
+  exact semantics. `test-backend-ops -b Vulkan0` passes (MUL_MAT 26/26, MUL_MAT_ID 73/73,
+  GET_ROWS 4/4, CPY 17/17); Qwen3-0.6B ROCmI4 over wikitext-2 20 x 512 reads perplexity
+  28.33 on Vulkan against 28.37 on ROCm, at pp512 13714 / tg128 335 tok/s on Vulkan. The
+  27B row above has not been re-measured on Vulkan yet. This also makes ROCmI4 files
+  usable in 1bit OS, which has Vulkan and no ROCm.
 - The ROCmFPX files were quantized without an importance matrix; UD-Q4_K_XL was
   made with one. An imatrix would narrow the accuracy gap somewhat.
 

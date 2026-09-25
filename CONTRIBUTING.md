@@ -36,7 +36,7 @@ This repository exists to be reviewable. Five rules keep it that way.
    Files that cannot hold a comment (binaries, JSON, test data) are exempt,
    listed in the tool.
 
-This repository is a port of the working code in
-[1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER), without its history.
+This repository is a port of the working code in 1bit-MONSTER, our private development
+repository, without its history.
 [docs/PORTING.md](docs/PORTING.md) lists the source of each component and the
 order it lands in.

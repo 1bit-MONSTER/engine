@@ -29,6 +29,6 @@ jobs:
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
       - name: Build
-        run: cmake --build build --target onebit npu_full_elf_test npu_pack_test npu_q4nx_test tokenizer_test -j
+        run: cmake --build build --target onebit npu_full_elf_test npu_pack_test npu_q4nx_test npu_lax_test tokenizer_test -j
       - name: Test
         run: ctest --test-dir build --output-on-failure

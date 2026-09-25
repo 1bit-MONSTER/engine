@@ -62,27 +62,51 @@ void layernorm(const float* in, const float* w, const float* b, int rows, int co
     }
 }
 
+int worker_threads() {
+    static const int n = int(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 16u));
+    return n;
+}
+
+// Runs fn(i0, i1) over [0, n) split into t contiguous ranges, one thread each.
+template <class F>
+void parallel_ranges(int n, int t, F fn) {
+    t = std::max(1, std::min(t, n));
+    if (t == 1) return fn(0, n);
+    std::vector<std::thread> pool;
+    for (int p = 0; p < t; ++p) pool.emplace_back(fn, int((size_t)n * p / t), int((size_t)n * (p + 1) / t));
+    for (auto& th : pool) th.join();
+}
+
 // out[m,k] = in[m,n] @ W^T[k,n] + bias[k]. The output columns are split across threads; every
 // sum keeps its order, so the result is the same as one thread's, bit for bit.
 void linear(const float* in, const float* W, const float* bias, int m, int n, int k, float* out) {
+    // Each weight row is read once per four input rows; the four sums are independent, so the
+    // loads are shared without reordering any sum.
     auto cols = [&](int j0, int j1) {
-        for (int i = 0; i < m; ++i) {
-            const float* x = in + (size_t)i * n;
-            float* o = out + (size_t)i * k;
-            for (int j = j0; j < j1; ++j) {
-                float acc = bias ? bias[j] : 0.0f;
-                const float* wr = W + (size_t)j * n;
+        for (int j = j0; j < j1; ++j) {
+            const float* wr = W + (size_t)j * n;
+            const float b = bias ? bias[j] : 0.0f;
+            int i = 0;
+            for (; i + 4 <= m; i += 4) {
+                const float *x0 = in + (size_t)i * n, *x1 = x0 + n, *x2 = x1 + n, *x3 = x2 + n;
+                float a0 = b, a1 = b, a2 = b, a3 = b;
+                for (int c = 0; c < n; ++c) {
+                    const float w = wr[c];
+                    a0 += x0[c] * w; a1 += x1[c] * w; a2 += x2[c] * w; a3 += x3[c] * w;
+                }
+                out[(size_t)i * k + j] = a0; out[(size_t)(i + 1) * k + j] = a1;
+                out[(size_t)(i + 2) * k + j] = a2; out[(size_t)(i + 3) * k + j] = a3;
+            }
+            for (; i < m; ++i) {
+                const float* x = in + (size_t)i * n;
+                float acc = b;
                 for (int c = 0; c < n; ++c) acc += x[c] * wr[c];
-                o[j] = acc;
+                out[(size_t)i * k + j] = acc;
             }
         }
     };
-    static const int threads = int(std::clamp(std::thread::hardware_concurrency() / 2, 1u, 16u));
-    const int t = std::min(threads, std::max(1, int((size_t)m * n * k / (1u << 20))));   // small products stay on one thread
-    if (t == 1) return cols(0, k);
-    std::vector<std::thread> pool;
-    for (int p = 0; p < t; ++p) pool.emplace_back(cols, int((size_t)k * p / t), int((size_t)k * (p + 1) / t));
-    for (auto& th : pool) th.join();
+    const int t = std::min(worker_threads(), std::max(1, int((size_t)m * n * k / (1u << 20))));   // small products stay on one thread
+    parallel_ranges(k, t, cols);
 }
 
 // Multi-head self attention (batch_first, bidirectional). key_pad[b*L+j] = ignore key j.
@@ -132,24 +156,14 @@ void mha(const float* x, const float* inW, const float* inB, const float* outW, 
 // GeGLU MLP for the ModernBERT encoder: Wi [5248,1024] -> gelu(up)*gate -> Wo [1024,2624].
 void geglu(const float* h, const float* Wi, const float* Wo, int rows, float* out) {
     const int UP = 5248, MID = 2624;
-    std::vector<float> up(UP);
+    std::vector<float> up((size_t)rows * UP), act((size_t)rows * MID);
+    linear(h, Wi, nullptr, rows, D, UP, up.data());
     for (int r = 0; r < rows; ++r) {
-        const float* x = h + (size_t)r * D;
-        for (int j = 0; j < UP; ++j) {
-            const float* wr = Wi + (size_t)j * D;
-            float acc = 0;
-            for (int c = 0; c < D; ++c) acc += x[c] * wr[c];
-            up[j] = acc;
-        }
-        for (int j = 0; j < MID; ++j) up[j] = gelu(up[j]) * up[MID + j];
-        float* o = out + (size_t)r * D;
-        for (int j = 0; j < D; ++j) {
-            const float* wr = Wo + (size_t)j * MID;
-            float acc = 0;
-            for (int c = 0; c < MID; ++c) acc += up[c] * wr[c];
-            o[j] = acc;
-        }
+        const float* u = up.data() + (size_t)r * UP;
+        float* a = act.data() + (size_t)r * MID;
+        for (int j = 0; j < MID; ++j) a[j] = gelu(u[j]) * u[MID + j];
     }
+    linear(act.data(), Wo, nullptr, rows, MID, D, out);
 }
 
 }  // namespace
@@ -385,22 +399,13 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
 
     std::vector<float> hn((size_t)N * L * D), qkv((size_t)N * L * 3072), attn_out((size_t)N * L * D);
     std::vector<float> q((size_t)N * NHEAD * L * HD), k((size_t)N * NHEAD * L * HD), v((size_t)N * NHEAD * L * HD);
-    std::vector<float> scores((size_t)L * L);
     for (int li = 0; li < NLAYER; ++li) {
         LayerW& Lw = layers_[li];
         bool is_full = (li % 3 == 0);
         const auto& cs = is_full ? full_cs : slid_cs;
         if (li > 0) layernorm(h.data(), Lw.attn_norm.data(), nullptr, N * L, D, hn.data());
         else memcpy(hn.data(), h.data(), h.size() * 4);
-        for (int b = 0; b < N; ++b) for (int t = 0; t < L; ++t) {
-            const float* x = hn.data() + ((size_t)b * L + t) * D;
-            float* o = qkv.data() + ((size_t)b * L + t) * 3072;
-            for (int j = 0; j < 3072; ++j) {
-                const float* wr = Lw.Wqkv.data() + (size_t)j * D;
-                float acc = 0; for (int c = 0; c < D; ++c) acc += x[c] * wr[c];
-                o[j] = acc;
-            }
-        }
+        linear(hn.data(), Lw.Wqkv.data(), nullptr, N * L, D, 3072, qkv.data());
         for (int b = 0; b < N; ++b) for (int t = 0; t < L; ++t) {
             const float* qkv_t = qkv.data() + ((size_t)b * L + t) * 3072;
             for (int hd = 0; hd < NHEAD; ++hd) {
@@ -425,7 +430,10 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
         }
         // attention
         const float scale = 1.0f / sqrtf((float)HD);
-        for (int b = 0; b < N; ++b) for (int hd = 0; hd < NHEAD; ++hd) {
+        auto heads = [&](int bh0, int bh1) {
+          std::vector<float> scores((size_t)L * L);
+          for (int bh = bh0; bh < bh1; ++bh) {
+            const int b = bh / NHEAD, hd = bh % NHEAD;
             const float* qb = q.data() + (((size_t)b * NHEAD + hd) * L) * HD;
             const float* kb = k.data() + (((size_t)b * NHEAD + hd) * L) * HD;
             for (int qi = 0; qi < L; ++qi) {
@@ -449,17 +457,11 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
                     for (int d = 0; d < HD; ++d) orow[d] += s * vr[d];
                 }
             }
-        }
+          }
+        };
+        parallel_ranges(N * NHEAD, worker_threads(), heads);
         // Wo projection + residual
-        for (int b = 0; b < N; ++b) for (int t = 0; t < L; ++t) {
-            const float* x = attn_out.data() + ((size_t)b * L + t) * D;
-            float* o = hn.data() + ((size_t)b * L + t) * D;
-            for (int j = 0; j < D; ++j) {
-                const float* wr = Lw.Wo.data() + (size_t)j * D;
-                float acc = 0; for (int c = 0; c < D; ++c) acc += x[c] * wr[c];
-                o[j] = acc;
-            }
-        }
+        linear(attn_out.data(), Lw.Wo.data(), nullptr, N * L, D, D, hn.data());
         for (size_t z = 0; z < h.size(); ++z) h[z] += hn[z];
         // mlp_norm + geglu + residual
         layernorm(h.data(), Lw.mlp_norm.data(), nullptr, N * L, D, hn.data());

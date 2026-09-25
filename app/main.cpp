@@ -21,12 +21,15 @@
 //                                    OpenAI endpoints; serve's NPU route.
 //   1bit npu-run [options]           token ids in, token ids out, on the NPU fast
 //                                    lane (docs/npu.md); for checks and benchmarks.
+//   1bit npu-lax [options]           Qwen3.6-35B-A3B on the NPU lax kernels: greedy
+//                                    chat, or the parity check (docs/npu-lax.md).
 //
 // See docs/PORTING.md for what lands next.
 
 #ifdef ONEBIT_NPU
 #include "generate.h"
 #include "model.h"
+#include "npu_lax.h"
 #include "unified.h"
 #endif
 #include "serve.h"
@@ -56,6 +59,7 @@ void usage(FILE* out) {
 #ifdef ONEBIT_NPU
                  "  unified -m <model dir>      serve one NPU model (OpenAI endpoints)\n"
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
+                 "  npu-lax [options]           Qwen3.6-35B-A3B on the NPU lax kernels (npu-lax --help)\n"
 #endif
                  "  version                     print the version\n"
                  "  help                        show this help\n");
@@ -145,6 +149,14 @@ int main(int argc, char** argv) {
             return run_npu(argc - 2, argv + 2);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "1bit npu-run: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (cmd == "npu-lax") {
+        try {
+            return onebit::run_npu_lax(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit npu-lax: %s\n", e.what());
             return 1;
         }
     }

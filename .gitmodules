@@ -31,6 +31,12 @@
 	branch = main
 # ZINC (docs/zinc.md): upstream zolotukhin/zinc, built by scripts/build-zinc.sh;
 # .github/workflows/bump-zinc.yml keeps it current.
+# The 35B MoE whole-layer decode (docs/npu-lax.md): the open kernels, MIT, built by
+# scripts/build-lax.sh; the branch carries our fixes and optimisations of the lax design.
+[submodule "third_party/OpenFlowLM-Next"]
+	path = third_party/OpenFlowLM-Next
+	url = https://github.com/bong-water-water-bong/OpenFlowLM-Next.git
+	branch = 1bit/lax-35b
 [submodule "third_party/zinc"]
 	path = third_party/zinc
 	url = https://github.com/zolotukhin/zinc.git

@@ -34,6 +34,13 @@ using Bytes = std::vector<uint8_t>;
 
 Bytes read_file(const std::string& path);
 
+// A section of an ELF32 little-endian file, by name: its byte offset and size in the
+// file. Throws if the file is not an ELF32 LE file or has no such section.
+struct ElfSection {
+    uint32_t offset, size;
+};
+ElfSection elf_section(const Bytes& elf, const std::string& name);
+
 // How the layer kernel's control code depends on the context length N.
 // Every differing word follows one of two rules, found by comparing the
 // captured contexts 1, 2 and 17:
@@ -57,6 +64,10 @@ struct ContextMap {
 // The instruction ELF for context length n (n >= 1), byte-identical to the
 // captured layer_ctx<n>.elf.
 Bytes derive_context(const Bytes& ctx1, const ContextMap& map, int n);
+
+// Rewrite an instruction ELF's UID note to the md5 of its .ctrltext, as aiebu-asm writes
+// it, after the control code was edited.
+void refresh_uid(Bytes& instruction_elf);
 
 enum class PdiMode {
     kLoad,     // control code starts with load_pdi (a stand-alone kernel)

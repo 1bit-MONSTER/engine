@@ -182,7 +182,11 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/q4nx.cpp npu/tokenizer.cpp)
+add_library(onebit_npu STATIC npu/full_elf.cpp npu/lax_elf.cpp npu/lax_pack.cpp npu/lax_stream.cpp npu/lax_turns.cpp npu/model.cpp npu/pack.cpp npu/q4nx.cpp
+                            npu/tokenizer.cpp)
+# The lax packer's q8 -> q4_1 re-quantization must round every float32 step on its own,
+# as the reference packer's NumPy does (npu/lax_pack.h): no fused multiply-adds.
+set_source_files_properties(npu/lax_pack.cpp PROPERTIES COMPILE_OPTIONS -ffp-contract=off)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
@@ -215,6 +219,16 @@ endif()
 if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_BO_DUMP)
     add_test(NAME npu_pack_model COMMAND npu_pack_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_BO_DUMP})
 endif()
+# The Qwen3.6-35B-A3B lax decode's host side (docs/npu-lax.md): CI checks the transforms
+# against the reference packer's hashes; with the model, all 83 buffers against its table.
+add_executable(npu_lax_test tests/npu_lax_test.cpp)
+target_link_libraries(npu_lax_test PRIVATE onebit_npu)
+add_test(NAME npu_lax_host COMMAND npu_lax_test)
+set(ONEBIT_NPU_LAX_MODEL "" CACHE PATH "Qwen3.6-35B-A3B Q4NX directory, for the lax packer and decode tests")
+if(ONEBIT_NPU_LAX_MODEL)
+    add_test(NAME npu_lax_pack_model
+             COMMAND npu_lax_test --model ${ONEBIT_NPU_LAX_MODEL} --sha256 ${CMAKE_SOURCE_DIR}/tests/golden/npu_lax/sha256.tsv)
+endif()
 endif()  # ONEBIT_NPU_HOST
 
 # The lane itself: needs XRT (the NPU runtime) and an XDNA NPU to run.
@@ -227,10 +241,10 @@ if(ONEBIT_NPU)
     if(NOT EXISTS "${ONEBIT_XRT_ROOT}/include/xrt/xrt_device.h")
         message(FATAL_ERROR "ONEBIT_NPU needs XRT; none at ONEBIT_XRT_ROOT=${ONEBIT_XRT_ROOT}")
     endif()
-    add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp)
+    add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp npu/lax.cpp npu/lax_elf_kernels.cpp)
     target_include_directories(onebit_npu_lane SYSTEM PUBLIC ${ONEBIT_XRT_ROOT}/include)
     target_link_libraries(onebit_npu_lane PUBLIC onebit_npu ${ONEBIT_XRT_ROOT}/lib/libxrt_coreutil.so)
-    target_sources(onebit PRIVATE app/unified.cpp)
+    target_sources(onebit PRIVATE app/unified.cpp app/npu_lax.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_lane)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU)
     set_target_properties(onebit PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib INSTALL_RPATH ${ONEBIT_XRT_ROOT}/lib)
@@ -240,6 +254,47 @@ if(ONEBIT_NPU)
         add_test(NAME npu_lane_e2e
                  COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lane_e2e.sh $<TARGET_FILE:onebit>
                          ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_KERNELS} ${ONEBIT_NPU_REFERENCE})
+    endif()
+    # `1bit npu-lax`: parity on three positions against the fp64 reference, then one chat turn.
+    set(ONEBIT_NPU_LAX_KERNELS "" CACHE PATH "scripts/build-lax.sh's <prefix>/kernels")
+    set(ONEBIT_NPU_LAX_REF "" CACHE PATH "make_decode.py --requant --tokens 3 output (xres<t>.bin, ref_logits*.bin)")
+    if(ONEBIT_NPU_LAX_KERNELS)
+        # The full-attention stream's position patches, against the reference harness's table
+        # for the pinned build (tests/golden/npu_lax/lax_a_patches.tsv names its md5).
+        add_test(NAME npu_lax_patches
+                 COMMAND npu_lax_test --insts ${ONEBIT_NPU_LAX_KERNELS}/lax_a/insts.bin
+                         --patches ${CMAKE_SOURCE_DIR}/tests/golden/npu_lax/lax_a_patches.tsv)
+        # The full-ELF position sites of lax_a/insts.elf (tests/golden/npu_lax/lax_a_elf_sites.tsv
+        # names its md5); with the harness's full ELFs for the same build, every assembled ELF
+        # byte for byte.
+        set(ONEBIT_NPU_LAX_ELF_GOLDEN "" CACHE PATH "harness/full_elf.py lax output for the same kernel build (lax_init.elf, lxf.elf, axf_p<N>.elf, ln.elf, lm.elf)")
+        set(_golden)
+        if(ONEBIT_NPU_LAX_ELF_GOLDEN)
+            set(_golden --golden ${ONEBIT_NPU_LAX_ELF_GOLDEN})
+        endif()
+        add_test(NAME npu_lax_elf
+                 COMMAND npu_lax_test --elf ${ONEBIT_NPU_LAX_KERNELS}
+                         --sites ${CMAKE_SOURCE_DIR}/tests/golden/npu_lax/lax_a_elf_sites.tsv ${_golden})
+    endif()
+    if(ONEBIT_NPU_LAX_MODEL AND ONEBIT_NPU_LAX_KERNELS AND ONEBIT_NPU_LAX_REF)
+        # Full ELFs (the default), and the classic xclbin path kept for A/B.
+        add_test(NAME npu_lax_e2e
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_cpp.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS} ${ONEBIT_NPU_LAX_REF} elf)
+        add_test(NAME npu_lax_e2e_classic
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_cpp.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS} ${ONEBIT_NPU_LAX_REF} classic)
+    endif()
+    if(ONEBIT_NPU_LAX_MODEL AND ONEBIT_NPU_LAX_KERNELS)
+        # A DeltaNet state snapshot restored after another continuation gives the logits of the
+        # same prefix fed from scratch, bit for bit; a Session follow-up from it, the same tokens.
+        add_test(NAME npu_lax_snapshot
+                 COMMAND onebit npu-lax --model ${ONEBIT_NPU_LAX_MODEL} --kernels ${ONEBIT_NPU_LAX_KERNELS}
+                         --snapshot-check)
+        # `1bit serve --device npu` on the 35B: the route, one chat round trip, no xclbin opened.
+        add_test(NAME npu_lax_serve
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lax_serve.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_NPU_LAX_MODEL} ${ONEBIT_NPU_LAX_KERNELS})
     endif()
 endif()
 

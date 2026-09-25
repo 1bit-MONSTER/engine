@@ -4,15 +4,11 @@
    "backend": "hrx",
    "model": "GLM-4.7-Flash-Q4_K_M.gguf",
    "arch": "deepseek2",
-   "passed": false,
-   "said": "<no content: {\"error\":{\"code\":500,\"message\":\"Compute error.\",\"type\":\"server_error\"}}>",
-   "failed": [
-    "hrx: answers Paris",
-    "hrx: reply names e2e-model",
-    "hrx: streams (1 chunks)"
-   ],
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "vulkan",
@@ -32,7 +28,7 @@
    "said": "The capital of France is Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "vulkan",
@@ -65,7 +61,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "vulkan",
@@ -85,7 +81,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "vulkan",
@@ -121,7 +117,7 @@
    "said": "Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "npu",
@@ -161,7 +157,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "vulkan",
@@ -191,7 +187,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "c19b0665dec9"
+   "engine": "3c3394e9ee2e"
   },
   {
    "backend": "vulkan",

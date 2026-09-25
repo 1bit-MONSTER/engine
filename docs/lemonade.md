@@ -103,7 +103,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    kernels as full ELFs (16.0 tok/s). Still open:
    - the smaller NPU models: their lane kernels are captured, not built from source;
    - ~~`reasoning_content`~~: done (#73), the NPU route splits the thinking out as llama-server does;
-   - models in our own Hugging Face repos. (engine + fork)
+   - ~~models in our own Hugging Face repos~~: the 35B is `1bit-MONSTER/Qwen3.6-35B-A3B-NPU` (fork #8). (engine + fork)
 7. **Beyond the LLM suite:**
    - image generation: `1bit comfy` behind Lemonade's image endpoint;
    - the Laya router;

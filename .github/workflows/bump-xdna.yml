@@ -97,4 +97,4 @@ jobs:
           ${log}
 
           CI here has no NPU. Before merging, on Strix Halo:
-          \`scripts/build-xdna.sh ~/.cache/xdna-pin/prefix && cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=\$HOME/.cache/xdna-pin/prefix && cmake --build build --target onebit && tests/npu_lane_e2e.sh ...\`"
+          \`scripts/build-xdna.sh ~/.cache/xdna-pin/prefix && cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=\$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt && cmake --build build --target onebit && XILINX_XRT=\$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt tests/npu_lane_e2e.sh build/1bit <model dir> <model dir>/npu <reference logits>\`"

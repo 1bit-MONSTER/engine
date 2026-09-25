@@ -79,12 +79,52 @@ as below 256 before; and the chat answers match Vulkan's at every length from 40
 5,141 cases pass with and without the fix, because HRX0 refuses the test's empty `NONE`
 graph node.
 
+### Fixed: MoE models with more than 128 experts (Qwen3.6-35B-A3B)
+
+Before this pin, Qwen3.6-35B-A3B (256 experts) failed on `HRX0` in two ways:
+- **Prompt batches faulted.** Every batch of 2 or more tokens faulted the GPU
+  (`HSA_STATUS_ERROR_MEMORY_FAULT`).
+- **Decode was wrong.** Single-token decode ran at about 41 tok/s, but its output was
+  wrong: KLD 15.3 against Vulkan, top-1 0%.
+
+There were two causes:
+
+1. **The router assumed 128 experts.** `dispatch-moe-router.cpp` wrote the expert
+   partition table in the 128-expert layout (7-bit expert ids) for every expert count.
+   The `mul_mat_id` kernels that read the table decode a 9-bit layout. So experts
+   128-255 got no partitions, and an expert with 2 or more tokens read past its row.
+   Fork commit `96049a2` picks the layout by expert count
+   (`dispatch_registration/common/dispatch-moe-routing-layout.h`). Nothing changes up
+   to 128 experts.
+2. **Fused-only ops went to the CPU.** Our earlier claim rule accepted only nodes that
+   run standalone. So the router chain, L2_NORM, SOFTPLUS, GATED_DELTA_NET and the
+   per-head RMS_NORM/ROPE, which HRX runs only inside fused patterns, went to the CPU.
+   The 35B then split per layer (KLD 2.63), and Qwen3-Coder-30B-A3B could not decode.
+   Fork commit `9a7aad6` (`fused-context-claim.h`) claims those nodes when their fused
+   pattern's producers are present and their shapes fit.
+
+Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
+
+| model | metric | before | this pin |
+|---|---|---|---|
+| Qwen3.6-35B-A3B Q8_0 | pp512 | 141 | 909 |
+| Qwen3.6-35B-A3B Q8_0 | pp2048 | 156 | 1028 |
+| Qwen3.6-35B-A3B Q8_0 | tg128 | 14.1 | 35.3 |
+| Qwen3.6-35B-A3B Q8_0 | KLD vs Vulkan | 2.63 | 0.0046 |
+| Qwen3-Coder-30B-A3B Q4_K_M | pp512 | 1114 | 2040 |
+| Qwen3-Coder-30B-A3B Q4_K_M | tg128 | fails | 89.4 |
+| Qwen3-0.6B Q4_K_M | pp512 / tg128 | 21938 / 322.5 | 21789 / 323.8 |
+
+`test-backend-ops -b HRX0`: 790/790.
+
 ### Known issues on `HRX0`
 
-Qwen3.6-35B-A3B Q8_0 faults the GPU (`AMDGPU memory access fault` in a graph replay),
-and a batch of several sequences (`llama-perplexity` with `n_seq` > 1) stops on a
-FLASH_ATTN_EXT node that HRX0 claimed but cannot run. The prefill split below is not
-affected by either: HRX0 only prefills whole ubatches there, and decoding is Vulkan's.
+- **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
+  unsupported 3-D MUL_MAT; use `-b 512`.
+- **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
+
+The prefill split below is not affected by either: HRX0 only prefills whole ubatches
+there, and decoding is Vulkan's.
 
 ### Prefill on HRX, decode on Vulkan
 

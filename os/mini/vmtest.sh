@@ -54,7 +54,8 @@ if ssh_vm true 2>/dev/null; then
 else
     echo "VM: no SSH"; ok=0
 fi
-for i in $(seq 90); do curl -sf 127.0.0.1:18000/v1/models >/dev/null 2>&1 && break; sleep 2; done
+# lavapipe compiles every shader on first use: the first start takes minutes in a VM
+for i in $(seq 300); do curl -sf 127.0.0.1:18000/v1/models >/dev/null 2>&1 && break; sleep 2; done
 reply=$(curl -s --max-time 300 127.0.0.1:18000/v1/chat/completions -H 'Content-Type: application/json' \
     -d '{"messages":[{"role":"user","content":"What is the capital of France? One word."}],"max_tokens":16,"temperature":0,"chat_template_kwargs":{"enable_thinking":false}}' \
     | python3 -c 'import json,sys; print(json.load(sys.stdin)["choices"][0]["message"]["content"].strip())' 2>/dev/null || true)

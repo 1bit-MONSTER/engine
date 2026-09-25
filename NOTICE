@@ -68,6 +68,14 @@ ZINC (third_party/zinc)
   Copyright (c) 2025 ZINC Contributors
   License: MIT
 
+Lemonade (third_party/lemonade)
+  https://github.com/1bit-MONSTER/lemonade
+  (a fork of https://github.com/lemonade-sdk/lemonade, with the onebit recipe)
+  Copyright (C) 2024-2026 Advanced Micro Devices, Inc.
+  License: Apache-2.0. Pinned so the engine is tested against a known Lemonade;
+  built as its own program (scripts/build-lemonade.sh) that runs `1bit serve`
+  as a backend. None of its code is linked into this product.
+
 ComfyUI.cpp (third_party/comfyui.cpp)
   https://github.com/1bit-MONSTER/comfyui.cpp
   A C++ port of ComfyUI (https://github.com/Comfy-Org/ComfyUI, Copyright (C)

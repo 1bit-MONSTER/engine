@@ -1,0 +1,97 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Keep third_party/lemonade on our fork's main (docs/lemonade.md): 1bit-MONSTER/lemonade
+# follows upstream lemonade-sdk/lemonade daily (sync-lemonade-fork.yml); when the fork
+# moves, open a PR here moving the submodule. Before merging, on Strix Halo: build with
+# scripts/build-lemonade.sh and run Lemonade's LLM suite through the onebit recipe.
+#
+# Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
+# 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
+# start CI.
+name: bump-lemonade
+
+on:
+  schedule:
+    - cron: "23 7 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: bump-lemonade
+  cancel-in-progress: false
+
+jobs:
+  bump:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Require the token
+        env:
+          HRX_BUMP_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          if [ -z "$HRX_BUMP_TOKEN" ]; then
+            echo "::error::secret HRX_BUMP_TOKEN is not set (see the header of this workflow)"
+            exit 1
+          fi
+
+      - uses: actions/checkout@v4
+        with:
+          token: ${{ secrets.HRX_BUMP_TOKEN }}
+
+      - name: Compare with upstream
+        id: pins
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+        run: |
+          set -euo pipefail
+          upstream=$(gh api repos/1bit-MONSTER/lemonade/commits/main --jq .sha)
+          ours=$(git ls-tree HEAD third_party/lemonade | awk '{print $3}')
+          echo "upstream $upstream, ours $ours"
+          {
+            echo "upstream=$upstream"; echo "ours=$ours"
+            if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Open the bump PR
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          UPSTREAM: ${{ steps.pins.outputs.upstream }}
+          OURS: ${{ steps.pins.outputs.ours }}
+        run: |
+          set -euo pipefail
+          branch="bump-lemonade/${UPSTREAM:0:12}"
+          if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
+            echo "$branch already exists"; exit 0
+          fi
+          log=$(gh api "repos/1bit-MONSTER/lemonade/compare/${OURS}...${UPSTREAM}" \
+                  --jq '.commits[-30:][] | "- \(.sha[0:9]) \(.commit.message | split("\n")[0])"' || true)
+          git config user.name "lemonade-bump"
+          git config user.email "lemonade-bump@users.noreply.github.com"
+          git switch -c "$branch"
+          git update-index --cacheinfo "160000,$UPSTREAM,third_party/lemonade"
+          git commit -q -m "Bump Lemonade: 1bit-MONSTER/lemonade ${UPSTREAM:0:12}"
+          git push -q origin "$branch"
+          gh pr create --base main --head "$branch" \
+            --title "Bump Lemonade: 1bit-MONSTER/lemonade ${UPSTREAM:0:12}" \
+            --body "Moves third_party/lemonade from \`${OURS:0:12}\` to the fork's main \`${UPSTREAM:0:12}\`.
+
+          Fork commits (last 30):
+          ${log}
+
+          CI here has no GPU. Before merging, on Strix Halo:
+          \`scripts/build-lemonade.sh ~/.cache/lemonade-pin\`, then Lemonade's LLM suite through the onebit recipe (docs/lemonade.md)."

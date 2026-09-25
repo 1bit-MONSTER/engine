@@ -77,3 +77,6 @@
 	url = https://github.com/1bit-MONSTER/lemonade.git
 	branch = main
 	shallow = true
+[submodule "third_party/ryzenai-server"]
+	path = third_party/ryzenai-server
+	url = https://github.com/lemonade-sdk/ryzenai-server

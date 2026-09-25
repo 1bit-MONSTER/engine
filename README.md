@@ -79,8 +79,6 @@ The repositories this engine is built on, in order of importance:
 | 10 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
 | 11 | [ROCm/FastFlowLM](https://github.com/ROCm/FastFlowLM) | The Q4NX NPU model format and its models on Hugging Face (`FastFlowLM/*-NPU2`), which the engine's NPU route runs on its own kernels | MIT |
 
-Powered by [FastFlowLM](https://github.com/ROCm/FastFlowLM)
-
 Also built on [nlohmann/json](https://github.com/nlohmann/json) (MIT)
 and [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT).
 

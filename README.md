@@ -43,8 +43,10 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
 > source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
-> 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Next is step 4,
-> the Laya router. The working engine is being ported from 1bit-MONSTER, our private development
+> 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
+> has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per
+> request with the C++ scorer, which matches the Python reference, but each decision takes 8.75 s
+> on Strix Halo, so making it cheaper is next ([docs/laya.md](docs/laya.md)). The working engine is being ported from 1bit-MONSTER, our private development
 > repository; see [docs/PORTING.md](docs/PORTING.md).
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository
 > holds the verified code without the development history.

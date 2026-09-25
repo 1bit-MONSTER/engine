@@ -16,7 +16,8 @@
 // npu_private_route_test: the private-route registry (npu/private_route.h). With nothing
 // registered, a Qwen3.6-35B-A3B directory's model_type gets the "not part of this build"
 // message and other types none; a registered route and command are found (a second
-// registration replaces the first); --npu-opt KEY=VALUE parses.
+// registration replaces the first); route_for serves, declines with a reason, or (an optional
+// route) declines to the fast lane; --npu-opt KEY=VALUE parses.
 #include "../npu/private_route.h"
 
 #include <cstdio>
@@ -75,6 +76,21 @@ int main() {
     check("route availability sees the options", r && r->unavailable("", {{"k", "v"}}).empty() &&
                                                      r->unavailable("", {}) == "no k");
     check("with the route: no message", private_route_missing("qwen3_5_moe").empty());
+
+    std::string why;
+    check("route_for: the route serves with its option", route_for(dir.string(), {{"k", "v"}}, &why) == r && why.empty());
+    check("route_for: a declining route gives its reason", !route_for(dir.string(), {}, &why) && why == "no k");
+    check("routes are not optional by default", r && !r->optional);
+
+    // an optional route for a type the fast lane serves: it declines -> nullptr and no reason
+    const fs::path dense = dir / "dense";
+    fs::create_directories(dense);
+    std::ofstream(dense / "config.json") << R"({"model_type": "qwen3"})";
+    PrivateRoute opt{"opt-in", "qwen3", [](const std::string&, const PrivateOptions& o) { return o.count("dx") ? "" : "off"; }, {}};
+    opt.optional = true;
+    register_private_route(opt);
+    check("optional route: served when opted in", route_for(dense.string(), {{"dx", "1"}}, &why) != nullptr && why.empty());
+    check("optional route: declines to the fast lane", !route_for(dense.string(), {}, &why) && why.empty());
 
     register_private_command({"x", "x help", [](int argc, char**) { return argc; }});
     const PrivateCommand* c = find_private_command("x");

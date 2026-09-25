@@ -66,6 +66,16 @@ const PrivateRoute* find_private_route(const std::string& model_type) {
     return nullptr;
 }
 
+const PrivateRoute* route_for(const std::string& dir, const PrivateOptions& opts, std::string* why) {
+    why->clear();
+    const PrivateRoute* r = find_private_route(model_type_of(dir));
+    if (!r) return nullptr;
+    const std::string no = r->unavailable ? r->unavailable(dir, opts) : "";
+    if (no.empty()) return r;
+    if (!r->optional) *why = no;
+    return nullptr;
+}
+
 const PrivateCommand* find_private_command(const std::string& name) {
     for (const auto& c : commands())
         if (c.name == name) return &c;

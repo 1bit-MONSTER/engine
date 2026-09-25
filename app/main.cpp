@@ -216,17 +216,22 @@ int run_route(int argc, char** argv) {
         if (!cur.empty()) devices.push_back(cur);
     if (devices.empty()) throw std::runtime_error("--devices is empty");
 
+    const auto t0 = std::chrono::steady_clock::now();
     onebit::laya::Scorer scorer;
     if (!scorer.load(laya_model)) {
         std::fprintf(stderr, "1bit route: %s\n", scorer.error().c_str());
         return 1;
     }
+    const auto t1 = std::chrono::steady_clock::now();
     const std::string device = onebit::laya::route_device(scorer, state, devices);
     if (device.empty()) {
         std::fprintf(stderr, "1bit route: %s\n", scorer.error().c_str());
         return 1;
     }
+    const auto t2 = std::chrono::steady_clock::now();
     std::printf("%s\n", device.c_str());
+    auto ms = [](auto a, auto b) { return std::chrono::duration<double, std::milli>(b - a).count(); };
+    std::fprintf(stderr, "1bit route: scorer loaded in %.0f ms, decision in %.0f ms\n", ms(t0, t1), ms(t1, t2));
     return 0;
 }
 #endif

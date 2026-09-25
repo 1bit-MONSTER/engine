@@ -25,9 +25,13 @@ jobs:
       - name: Copyright notice on every file
         run: python3 tools/copyright.py --check
       - name: Install build dependencies
-        run: sudo apt-get update && sudo apt-get install -y ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev
+        # GCC 15, as on the Strix Halo development machine: the engine is C++26, which the
+        # runner's own GCC 13 cannot build
+        run: |
+          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
+          sudo apt-get update && sudo apt-get install -y g++-15 ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
       - name: Build
         run: cmake --build build --target onebit npu_full_elf_test npu_pack_test npu_q4nx_test npu_lax_test tokenizer_test -j
       - name: Test

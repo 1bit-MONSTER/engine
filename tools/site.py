@@ -41,12 +41,20 @@
 # answers from the docs Context7 indexed (see context7.json). Context7 only serves it once the
 # library is claimed and 1bit.gg is on the widget's allowed domains; unset, no widget.
 #
+# Search engines and link previews: every page carries its canonical 1bit.gg address, Open
+# Graph and Twitter card tags with site/assets/og-card.png, and JSON-LD (the home page describes
+# the project, each post is a BlogPosting). robots.txt and sitemap.xml list every page; a page's
+# lastmod is its source file's last commit (pages.yml checks out the full history for that).
+#
 # Needs python-markdown (pip install markdown).
+import datetime
 import html
+import json
 import os
 import pathlib
 import re
 import shutil
+import subprocess
 import sys
 
 import markdown
@@ -174,6 +182,45 @@ def chat_widget():
             'async></script>')
 
 
+OG_IMAGE = SITE + "assets/og-card.png"
+
+
+def last_commit_date(path):
+    """The source file's last commit date (YYYY-MM-DD); today when git cannot say."""
+    try:
+        d = subprocess.run(["git", "-C", str(ROOT), "log", "-1", "--format=%cs", "--", str(path)],
+                           capture_output=True, text=True, timeout=30).stdout.strip()
+    except (OSError, subprocess.SubprocessError):
+        d = ""
+    return d or datetime.date.today().isoformat()
+
+
+def page_url(name):
+    return SITE if name == "index" else f"{SITE}{name}.html"
+
+
+def seo_head(name, title, description, og_type, jsonld, noindex):
+    esc = lambda s: html.escape(s, quote=True)
+    if noindex:
+        return '<meta name="robots" content="noindex">'
+    url = page_url(name)
+    tags = [f'<link rel="canonical" href="{url}">',
+            f'<meta property="og:url" content="{url}">',
+            f'<meta property="og:type" content="{og_type}">',
+            f'<meta property="og:image" content="{OG_IMAGE}">',
+            '<meta property="og:image:width" content="1200">',
+            '<meta property="og:image:height" content="630">',
+            '<meta property="og:image:alt" content="1bit engine: one engine behind an OpenAI-compatible API">',
+            '<meta name="twitter:card" content="summary_large_image">',
+            f'<meta name="twitter:title" content="{esc(title)}">',
+            f'<meta name="twitter:description" content="{esc(description)}">',
+            f'<meta name="twitter:image" content="{OG_IMAGE}">']
+    if jsonld:
+        # "</" cannot appear inside a script element
+        tags.append('<script type="application/ld+json">' + json.dumps(jsonld, ensure_ascii=False).replace("</", "<\\/") + "</script>")
+    return "\n".join(tags)
+
+
 def plain(markdown_text):
     """One paragraph of markdown as plain text."""
     text = re.sub(r"\s*\(\[[^\]]*\.md\]\([^)]*\)\)", "", markdown_text)  # "(docs/x.md)" asides
@@ -229,6 +276,7 @@ class Site:
         self.order = [n for _, items in self.groups for n, _ in items]
         self.labels = {n: l for _, items in self.groups for n, l in items}
         self.posts = posts()
+        self.pages = []  # (url, lastmod) for sitemap.xml
         # rewrite_links resolves README.md to the overview page and docs to their pages
         self.link_docs = dict(self.docs)
 
@@ -240,8 +288,12 @@ class Site:
             out.append(f'      <a href="{href}"{cur}>{html.escape(label)}</a>')
         return "\n".join(out)
 
-    def write(self, name, title, main, kind, section, description=TAGLINE, extra_head=""):
+    def write(self, name, title, main, kind, section, description=TAGLINE, extra_head="",
+              og_type="website", jsonld=None, lastmod=None, noindex=False):
+        if not noindex:
+            self.pages.append((page_url(name), lastmod or datetime.date.today().isoformat()))
         page = (self.template
+                .replace("{{seo}}", seo_head(name, title, description, og_type, jsonld, noindex))
                 .replace("{{title}}", html.escape(title))
                 .replace("{{description}}", html.escape(description, quote=True))
                 .replace("{{kind}}", kind)
@@ -289,7 +341,8 @@ class Site:
                 f'<p class="source meta"><a href="{REPO}/blob/main/{src.relative_to(ROOT).as_posix()}">View this page\'s source on GitHub ↗</a></p>\n'
                 "</article>\n</div>")
         title = title_of(text)
-        self.write(name, f"{title} · 1bit engine", main, "doc", section, first_paragraph(text) or TAGLINE)
+        self.write(name, f"{title} · 1bit engine", main, "doc", section, first_paragraph(text) or TAGLINE,
+                   og_type="article", lastmod=last_commit_date(src))
 
     def docs_index(self):
         rows = []
@@ -330,7 +383,15 @@ class Site:
                     f'<div class="prose">\n{self.md(body, src)}\n</div>\n'
                     f'<nav class="pager">{link(newer, "prev", "Newer")}{link(older, "next", "Older")}</nav>\n'
                     "</div></article>")
-            self.write(name, f"{title} · 1bit engine", main, "post", "blog", plain(lead))
+            self.write(name, f"{title} · 1bit engine", main, "post", "blog", plain(lead), og_type="article",
+                       lastmod=max(date, last_commit_date(src)),
+                       jsonld={"@context": "https://schema.org", "@type": "BlogPosting", "headline": title,
+                               "description": plain(lead), "datePublished": date,
+                               "dateModified": max(date, last_commit_date(src)), "image": OG_IMAGE,
+                               "url": page_url(name), "mainEntityOfPage": page_url(name),
+                               "author": {"@type": "Person", "name": "bong-water-water-bong"},
+                               "publisher": {"@type": "Organization", "name": "1bit engine", "url": SITE},
+                               "keywords": ", ".join(tags)})
             rows.append((date, name, title, plain(lead), tags, self.md(lead + "\n\n" + body, src)))
 
         log = "\n".join(
@@ -406,7 +467,12 @@ class Site:
                 '<section class="section"><div class="container">\n'
                 '<span class="site-badge"><span class="dot"></span>site index</span>\n'
                 f'<div class="site-grid">{"".join(cards)}</div>\n</div></section>')
-        self.write("index", "1bit engine", main, "home", "")
+        self.write("index", "1bit engine", main, "home", "", jsonld={"@context": "https://schema.org", "@graph": [
+            {"@type": "WebSite", "name": "1bit engine", "url": SITE, "description": TAGLINE},
+            {"@type": "SoftwareSourceCode", "name": "1bit engine", "description": TAGLINE, "url": SITE,
+             "codeRepository": REPO, "license": "https://www.apache.org/licenses/LICENSE-2.0",
+             "programmingLanguage": "C++", "runtimePlatform": "Linux",
+             "keywords": "LLM inference, AMD Ryzen AI, Strix Halo, XDNA 2 NPU, Vulkan, ROCm, Lemonade, OpenAI-compatible API, GGUF"}]})
 
     # ── 404 ───────────────────────────────────────────────────────────
     def not_found(self):
@@ -423,7 +489,7 @@ class Site:
                 r'  var m = location.pathname.match(/\/(1bit-[a-z0-9-]+\.html)$/);' "\n"
                 f'  if (m && m[1] !== "1bit-jarvis.html") document.getElementById("old").href = "{OLD_SITE}" + m[1];\n'
                 "</script>\n</div></section>")
-        self.write("404", "Page not found · 1bit engine", main, "doc", "", extra_head=f'<base href="{SITE}">')
+        self.write("404", "Page not found · 1bit engine", main, "doc", "", extra_head=f'<base href="{SITE}">', noindex=True)
 
     def build(self):
         readme = ROOT / "README.md"
@@ -438,6 +504,17 @@ class Site:
             shutil.copy(ROOT / "site" / f, self.out / f)
         shutil.copytree(ROOT / "site" / "assets", self.out / "assets")
         (self.out / ".nojekyll").write_text("")
+        # IndexNow (Bing, Yandex, Seznam, Naver): pages.yml sets INDEXNOW_KEY (public by design), the
+        # site serves it at /<key>.txt, and the deploy job submits the sitemap's URLs.
+        key = os.environ.get("INDEXNOW_KEY", "").strip()
+        if key:
+            if not re.fullmatch(r"[0-9a-f]{8,128}", key):
+                sys.exit(f"INDEXNOW_KEY must be 8-128 hex digits, not {key!r}")
+            (self.out / f"{key}.txt").write_text(key)
+        (self.out / "robots.txt").write_text(f"User-agent: *\nAllow: /\n\nSitemap: {SITE}sitemap.xml\n")
+        urls = "".join(f"<url><loc>{u}</loc><lastmod>{d}</lastmod></url>" for u, d in sorted(self.pages))
+        (self.out / "sitemap.xml").write_text('<?xml version="1.0" encoding="utf-8"?>\n'
+                                              f'<urlset xmlns="http://www.sitemaps.org/schemas/sitemap/0.9">{urls}</urlset>\n')
         return len(list(self.out.glob("*.html")))
 
 

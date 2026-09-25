@@ -156,6 +156,8 @@ int run_comfy(int argc, char** argv) {
         return argc < 1 ? 2 : 0;
     }
     const std::string bin = find_comfy();
+    // O_CLOEXEC: when fexecve succeeds the kernel closes the descriptor with the old image;
+    // open() follows symlinks, so the checks below apply to the file that actually runs.
     const int fd = ::open(bin.c_str(), O_RDONLY | O_CLOEXEC);
     if (fd < 0) throw std::runtime_error("cannot open " + bin + ": " + std::strerror(errno));
     struct stat st {};

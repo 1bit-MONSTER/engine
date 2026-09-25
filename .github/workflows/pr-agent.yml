@@ -66,17 +66,33 @@ jobs:
             python3 -m venv "$HOME/pr-agent-venv"
             "$HOME/pr-agent-venv/bin/pip" install -q "pr-agent==0.43.0"
           fi
-          curl -sf http://127.0.0.1:8090/v1/models > /dev/null || { echo "::error::the local model (coder-llm on :8090) is not up"; exit 1; }
+          # a real one-token completion, not just /v1/models: the server answers that before the model is loaded
+          ready=0
+          for i in $(seq 1 30); do
+            if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
+                 -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' > /dev/null; then
+              ready=1; break
+            fi
+            sleep 10
+          done
+          [ "$ready" = 1 ] || { echo "::error::the local model (coder-llm on :8090) does not answer"; exit 1; }
+          # PR-Agent exits 0 even when every model call failed, so check its log
+          run() {
+            pr-agent --pr_url "$pr" "$@" 2>&1 | tee "$RUNNER_TEMP/pr-agent.log"
+            if grep -qE "Failed to generate prediction|Error during LLM inference|Failed to (review|describe|generate)" "$RUNNER_TEMP/pr-agent.log"; then
+              echo "::error::PR-Agent could not get an answer from the model"; exit 1
+            fi
+          }
           pr="https://github.com/${{ github.repository }}/pull/${{ github.event.pull_request.number || github.event.issue.number }}"
           if [ "${{ github.event_name }}" = "pull_request" ]; then
-            pr-agent --pr_url "$pr" review
+            run review
           else
             cmd=$(printf '%s' "$COMMENT_BODY" | sed -E 's/^[[:space:]]*\/?//; s/[[:space:]].*//' | tr '[:upper:]' '[:lower:]')
             case "$cmd" in
-              review)   pr-agent --pr_url "$pr" review ;;
-              describe) pr-agent --pr_url "$pr" describe ;;
-              improve)  pr-agent --pr_url "$pr" improve ;;
-              ask)      pr-agent --pr_url "$pr" ask "$(printf '%s' "$COMMENT_BODY" | sed -E 's/^[[:space:]]*\/?ask[[:space:]]*//')" ;;
+              review)   run review ;;
+              describe) run describe ;;
+              improve)  run improve ;;
+              ask)      run ask "$(printf '%s' "$COMMENT_BODY" | sed -E 's/^[[:space:]]*\/?ask[[:space:]]*//')" ;;
               *)        echo "not a PR-Agent command: $cmd" ;;
             esac
           fi

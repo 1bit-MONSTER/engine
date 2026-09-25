@@ -436,9 +436,17 @@ On the same box, the Q8_0 GGUF of the model does:
 | Backend | Decode (tg128) | Prompt (pp512) | Binary |
 |---|---|---|---|
 | Vulkan | 53.4 tok/s | 1269 tok/s | `llama-bench`, llama.cpp 7fe450e |
-| HRX0 | 40.9 tok/s | fails: memory fault on batches of 2 or more | `llama-bench`, llama.cpp f1a0aca / hrx-system 51b1739 |
+| HRX0 (fork branch `1bit/hrx-35b-prefill`, 2631b75c; not yet in the pin) | 35.3 tok/s | 909 tok/s (pp2048: 1028) | `llama-bench`, llama.cpp fork off 79788e90 |
 
-Both used `-ngl 99 -fa 1 -r 3`. The GPU is the faster path for this model. What the
+All runs used `-ngl 99 -fa 1 -r 3`. The engine's pinned HRX build (79788e90) cannot run
+this model:
+- **Prompt batches fault.** Any batch of 2 or more tokens faults, because the MoE router
+  hard-codes the 128-expert layout and this model has 256 experts.
+- **Its decode is wrong.** It runs at about 41 tok/s, but the output is wrong: KLD 15.3
+  against Vulkan, top-1 0%.
+
+The fork branch fixes both. KLD against Vulkan is 0.0046 at ctx 512 and 0.0026 on the
+decode path. The GPU is the faster path for this model. What the
 NPU adds is a second, independent decode stream. At 469c43b the NPU decoded 11.0 tok/s
 next to a running Vulkan benchmark without slowing it (as noise measures). It also
 draws about 75-80 W less package power than GPU decode.

@@ -299,6 +299,9 @@ std::string lax_kernel_dir(const std::string& dir, const std::string& lax_kernel
     if (!lax_kernels.empty()) return lax_kernels;
     if (has_lax_kernels(dir + "/npu/lax")) return dir + "/npu/lax";
     if (const char* env = std::getenv("ONEBIT_NPU_LAX_KERNELS"); env && *env) return env;
+#ifdef ONEBIT_NPU_LAX_KERNELS_DEFAULT
+    if (has_lax_kernels(ONEBIT_NPU_LAX_KERNELS_DEFAULT)) return ONEBIT_NPU_LAX_KERNELS_DEFAULT;  // this build's
+#endif
     return "";
 }
 
@@ -340,7 +343,8 @@ int run_unified(int argc, char** argv) {
                         "                    [--kernels DIR] [--transport elf|classic] [--snapshots 4]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
                         "              npu/ (its kernels); Qwen3.6-35B-A3B runs on the lax kernels in --kernels,\n"
-                        "              else <model dir>/npu/lax, else $ONEBIT_NPU_LAX_KERNELS (docs/npu-lax.md)\n"
+                        "              else <model dir>/npu/lax, else $ONEBIT_NPU_LAX_KERNELS, else this build's\n"
+                        "              (-DONEBIT_NPU_LAX, docs/npu-lax.md)\n"
                         "  --transport the lax kernels as full ELFs (default) or classic xclbin, for A/B\n"
                         "  --snapshots DeltaNet state snapshots the lax decode keeps in host memory for chat\n"
                         "              follow-ups (70 MB each; 0: only exact extensions reuse the cache)\n");

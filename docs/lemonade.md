@@ -86,7 +86,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 |---|---|---|
 | Vulkan | 19 / 31 | **29 / 29 run, all pass** (2 skipped, as for llamacpp) |
 | HRX | 19 / 31 | 26 / 29 run: reranking fails in HRX's JIT |
-| NPU | 3 / 31 | 3 / 31: Lemonade hands the engine a GGUF |
+| NPU | 3 / 31 | Qwen3.6-35B-A3B loads and answers through Lemonade; the suite's small test models are GGUF |
 
 1. ~~**Declare what already works.**~~ Done (fork #6). The recipe now declares tool calls,
    `stop`, async, the Responses API, slots, tokenize, embeddings and reranking.
@@ -98,8 +98,12 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    `--reranking`, and the recipe serves those modes.
 5. **Reranking on HRX.** HRX's JIT can't link the fp32 matmul-with-bias kernel that
    jina-reranker-v1-tiny needs. (engine, HRX fork)
-6. **The NPU from Lemonade.** Lemonade needs to download and hand over an NPU model
-   directory, and `1bit serve --device npu` needs to take it. (engine + fork)
+6. **The NPU from Lemonade.** Qwen3.6-35B-A3B now runs: Lemonade downloads the Q4NX checkpoint
+   repo, the recipe hands `1bit serve` the directory, and the engine runs it on its own lax
+   kernels as full ELFs (16.0 tok/s). Still open:
+   - the smaller NPU models: their lane kernels are captured, not built from source;
+   - `reasoning_content`: the NPU route returns the thinking inside `content`;
+   - models in our own Hugging Face repos. (engine + fork)
 7. **Beyond the LLM suite:**
    - image generation: `1bit comfy` behind Lemonade's image endpoint;
    - the Laya router;

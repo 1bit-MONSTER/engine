@@ -26,6 +26,15 @@
 //                                                       w = S[r]*scale*code + M[r]*min
 //   Q8    8704 B  bf16 d[g*32+r] @0, int8 codes @512 at byte k*32 + r.   w = d * code
 //
+// Q8 comes in TWO code layouts under the same 8704-byte chunk, and nothing in the chunk or
+// the container (both flm_version 1.0.3, no metadata) says which. Measured against GGUF
+// ground truth on tile (0, 0) of lm_head.weight (docs/npu.md, "Q4NX chunks"):
+//   Qwen3.5-4B-NPU2 (lm_head tied to the embedding): byte k*32 + r   (above; corr 0.9998)
+//   Qwen3.6-35B-A3B-NPU2 (untied lm_head, q8 projections): byte (r/16)*4096 + g*512 +
+//     (k%32)*16 + r%16 with g = k/32                         (corr 0.9998; k*32 + r: 0.011)
+// dequant_tile implements the first. The 35B's q8 tensors are read by npu/lax_pack, which
+// implements the second. Do not run this decoder on a Q8 tensor of an unverified model.
+//
 // Checked bit for bit against 1bit-MONSTER's verified decoders (npu-infer/tools/
 // q4nx_dequant.py) on real Qwen3.5-4B and Qwen3-0.6B tiles: tests/npu_q4nx_test.cpp.
 #pragma once

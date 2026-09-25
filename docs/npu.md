@@ -56,6 +56,14 @@ or `[tile rows, tile cols, chunk bytes]` (`npu/q4nx.h` has the byte layouts).
 | 4736 B | Q4_K: u8 scale and min per 32 columns, bf16 `S`, `M` per row | `S * scale * code + M * min` | Qwen3.5-4B projections |
 | 8704 B | Q8: bf16 scale per 32 columns, int8 codes | `d * code` | Qwen3.5-4B `lm_head` and embedding |
 
+**Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
+embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
+(untied lm_head, projections) store it at `(r/16)*4096 + (k/32)*512 + (k%32)*16 + r%16`.
+Both containers report `flm_version` 1.0.3, and neither carries metadata that tells them
+apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the same model
+gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
+decodes the first layout, and `npu/lax_pack` decodes the second (35B only).
+
 `npu/q4nx.h` decodes all three, and repacks Q4_K into q4_1 (exact apart from rounding
 `S * scale` and `M * min` to bf16), so the lane and dx, which read q4_1, run Q4_K
 weights unchanged. Q8 does not fit q4_1. `tests/npu_q4nx_test.cpp` checks the decoders

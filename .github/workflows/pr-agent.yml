@@ -33,13 +33,13 @@ permissions:
   pull-requests: write
   contents: read
 
-concurrency:
-  group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
-  cancel-in-progress: true
-
 jobs:
   pr_agent:
     runs-on: [self-hosted, pr-agent]
+    # on the job, not the workflow: a comment that skips the job (a bot's, say) must not cancel a review
+    concurrency:
+      group: pr-agent-${{ github.event.pull_request.number || github.event.issue.number }}
+      cancel-in-progress: true
     timeout-minutes: 30
     # same-repo PRs, and comments by the owner, members or collaborators on a pull request
     if: |

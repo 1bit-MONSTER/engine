@@ -43,7 +43,10 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
 > source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
-> 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Next is step 4,
+> 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Our GPU kernel work is
+> closed source as well: the public build runs AMD's HRX pair and upstream ROCmFPX as they are,
+> and `-DONEBIT_GPU_PRIVATE` builds in our fixes (MoE models above 128 experts on HRX, the HRX
+> prefill split, ROCmI4 on Vulkan; [docs/hrx.md](docs/hrx.md#private-gpu-build)). Next is step 4,
 > the Laya router. The working engine is being ported from
 > [1bit-MONSTER](https://github.com/1bit-MONSTER/1bit-MONSTER); see [docs/PORTING.md](docs/PORTING.md).
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository

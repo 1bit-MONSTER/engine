@@ -14,7 +14,8 @@
 # limitations under the License.
 #
 # HRX + Vulkan (docs/hrx.md). Only needed with -DONEBIT_HRX=ON. The pair is AMD's
-# tested integration (ROCm/ggml-staging-automation); .github/workflows/bump-hrx.yml keeps it current.
+# tested integration (ROCm/ggml-staging-automation), unchanged; .github/workflows/bump-hrx.yml
+# keeps it current. -DONEBIT_GPU_PRIVATE builds other trees instead (docs/hrx.md).
 [submodule "third_party/hrx-system"]
 	path = third_party/hrx-system
 	url = https://github.com/ROCm/hrx-system.git
@@ -22,8 +23,8 @@
 	shallow = true
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp
-	url = https://github.com/1bit-MONSTER/llama.cpp.git
-	branch = 1bit/hrx-vulkan-patched
+	url = https://github.com/AMD-Ecosystem/llama.cpp.git
+	branch = hrx-graph-develop-v2
 	shallow = true
 [submodule "third_party/xdna-driver"]
 	path = third_party/xdna-driver
@@ -59,11 +60,13 @@
 	path = third_party/llama.cpp-vulkan
 	url = https://github.com/ggml-org/llama.cpp.git
 	shallow = true
+# The lean option (docs/lean.md): upstream charlie12345/ROCmFPX;
+# .github/workflows/bump-rocmfpx.yml keeps it on its main.
 [submodule "third_party/llama.cpp-rocmfpx"]
 	path = third_party/llama.cpp-rocmfpx
-	url = https://github.com/1bit-MONSTER/ROCmFPX.git
+	url = https://github.com/charlie12345/ROCmFPX.git
 	shallow = true
-	branch = 1bit/vulkan-rocmi4
+	branch = main
 [submodule "third_party/comfyui.cpp"]
 	path = third_party/comfyui.cpp
 	url = https://github.com/1bit-MONSTER/comfyui.cpp.git

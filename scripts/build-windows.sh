@@ -88,19 +88,20 @@ if [ ! -f "$prefix/lib/libpcre2-8.a" ]; then
     cmake --install "$work/pcre2/build" > /dev/null
 fi
 
-# 3. Vulkan: the headers, the loader's import library from its export list, SPIRV-Headers
+# 3. Vulkan: the headers, the loader's import library from its export list, SPIRV-Headers (header
+# only: installed into the Windows prefix, where the cross compiler looks)
 unpack "$(fetch $VK_HEADERS $VK_HEADERS_SHA vulkan-headers.tar.gz)" "$work/vulkan-headers"
 cp -r "$work/vulkan-headers/include/." "$prefix/include/"
 "$T/bin/llvm-dlltool" -d "$(fetch $VK_DEF $VK_DEF_SHA vulkan-1.def)" -l "$prefix/lib/libvulkan-1.a" -m i386:x86-64
 unpack "$(fetch $SPIRV_HEADERS $SPIRV_HEADERS_SHA spirv-headers.tar.gz)" "$work/spirv-headers"
-cmake -S "$work/spirv-headers" -B "$work/spirv-headers/build" -DCMAKE_INSTALL_PREFIX="$work/host" \
+cmake -S "$work/spirv-headers" -B "$work/spirv-headers/build" -DCMAKE_INSTALL_PREFIX="$prefix" \
     -DSPIRV_HEADERS_ENABLE_TESTS=OFF > /dev/null
 cmake --install "$work/spirv-headers/build" > /dev/null
 
 # 4. 1bit.exe: serve, route, comfy (no NPU lane or HRX on Windows yet)
 PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig cmake -S "$root" -B "$work/engine" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=OFF -DONEBIT_HRX=OFF > "$work/engine.cmake.log"
-cmake --build "$work/engine" --target onebit -j"$jobs" > "$work/engine.build.log" || { tail -20 "$work/engine.build.log"; exit 1; }
+cmake --build "$work/engine" --target onebit -j"$jobs" > "$work/engine.build.log" 2>&1 || { tail -20 "$work/engine.build.log"; exit 1; }
 cp "$work/engine/1bit.exe" "$out/"
 
 # 5. llama-server.exe with Vulkan, from the Vulkan pin. The pinned llama.cpp uses std::function
@@ -109,13 +110,13 @@ cp "$work/engine/1bit.exe" "$out/"
 git -C "$root" submodule update --init third_party/llama.cpp-vulkan
 cmake -S "$root/third_party/llama.cpp-vulkan" -B "$work/llama" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_VULKAN=ON \
-    -DGGML_VULKAN_SHADERS_GEN_TOOLCHAIN="$work/host.cmake" -DSPIRV-Headers_DIR="$work/host/share/cmake/SPIRV-Headers" \
+    -DGGML_VULKAN_SHADERS_GEN_TOOLCHAIN="$work/host.cmake" -DSPIRV-Headers_DIR="$prefix/share/cmake/SPIRV-Headers" \
     -DVulkan_INCLUDE_DIR="$prefix/include" -DVulkan_LIBRARY="$prefix/lib/libvulkan-1.a" \
     -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
     -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
     "-DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00" "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00 -include functional" \
     > "$work/llama.cmake.log"
-cmake --build "$work/llama" --target llama-server -j"$jobs" > "$work/llama.build.log" || { tail -20 "$work/llama.build.log"; exit 1; }
+cmake --build "$work/llama" --target llama-server -j"$jobs" > "$work/llama.build.log" 2>&1 || { tail -20 "$work/llama.build.log"; exit 1; }
 cp "$work/llama/bin/llama-server.exe" "$out/"
 
 ls -la "$out/1bit.exe" "$out/llama-server.exe"

@@ -30,7 +30,8 @@ mkdir -p "$out"; out=$(cd "$out" && pwd)
 
 rm -f "$out/key" "$out/key.pub"; ssh-keygen -q -t ed25519 -N "" -f "$out/key"
 # lavapipe is the VM's only Vulkan device; llama.cpp skips CPU Vulkan devices unless listed
-printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\nexport GGML_VK_VISIBLE_DEVICES=0\n' "$(basename "$model")" > "$out/1bit.conf"
+# (a 4096-token context: lavapipe reports too little memory for the model's full one)
+printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\"--ctx-size 4096\"\nexport GGML_VK_VISIBLE_DEVICES=0\n' "$(basename "$model")" > "$out/1bit.conf"
 LAVAPIPE=1 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" \
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1
 

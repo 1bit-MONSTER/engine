@@ -32,6 +32,10 @@
 #include "private_route.h"
 #include "unified.h"
 #endif
+#ifdef ONEBIT_LAYA
+#include "route.h"
+#include "scorer.h"
+#endif
 #include "serve.h"
 
 #include <chrono>
@@ -66,6 +70,9 @@ void usage(FILE* out) {
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
 #endif
                  "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
+#ifdef ONEBIT_LAYA
+                 "  route [options]             pick a device for a request via the Laya scorer\n"
+#endif
                  "  version                     print the version\n"
                  "  help                        show this help\n");
 #ifdef ONEBIT_NPU
@@ -180,6 +187,49 @@ int run_comfy(int argc, char** argv) {
     ::close(fd);
     throw std::runtime_error("cannot run " + bin + ": " + std::strerror(err));
 }
+#ifdef ONEBIT_LAYA
+// One request in, one device out: runs the Laya scorer's fixed routing question
+// against the request state and prints the winning device (npu|hrx|vulkan|zinc).
+int run_route(int argc, char** argv) {
+    std::string laya_model, state, devices_str = "npu,hrx,vulkan,zinc";
+    for (int i = 0; i < argc; ++i) {
+        const std::string a = argv[i];
+        auto next = [&]() -> std::string {
+            if (i + 1 >= argc) throw std::runtime_error(a + " needs a value");
+            return argv[++i];
+        };
+        if (a == "--laya-model") laya_model = next();
+        else if (a == "--state") state = next();
+        else if (a == "--devices") devices_str = next();
+        else if (a == "--help" || a == "-h") {
+            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,vulkan,zinc]\n"
+                        "  picks one of the devices for the request via the Laya scorer\n");
+            return 0;
+        } else throw std::runtime_error("unknown option " + a);
+    }
+    if (laya_model.empty()) throw std::runtime_error("--laya-model <dir> is required");
+    if (state.empty()) throw std::runtime_error("--state <text> is required");
+
+    std::vector<std::string> devices;
+    std::string cur;
+    for (std::istringstream ss(devices_str); std::getline(ss, cur, ',');)
+        if (!cur.empty()) devices.push_back(cur);
+    if (devices.empty()) throw std::runtime_error("--devices is empty");
+
+    onebit::laya::Scorer scorer;
+    if (!scorer.load(laya_model)) {
+        std::fprintf(stderr, "1bit route: %s\n", scorer.error().c_str());
+        return 1;
+    }
+    const std::string device = onebit::laya::route_device(scorer, state, devices);
+    if (device.empty()) {
+        std::fprintf(stderr, "1bit route: %s\n", scorer.error().c_str());
+        return 1;
+    }
+    std::printf("%s\n", device.c_str());
+    return 0;
+}
+#endif
 
 }  // namespace
 
@@ -234,6 +284,16 @@ int main(int argc, char** argv) {
             return 127;
         }
     }
+#ifdef ONEBIT_LAYA
+    if (cmd == "route") {
+        try {
+            return run_route(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit route: %s\n", e.what());
+            return 1;
+        }
+    }
+#endif
     if (cmd == "version" || cmd == "--version") {
         std::printf("1bit %s\n", kVersion);
         return 0;

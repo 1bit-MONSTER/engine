@@ -45,8 +45,10 @@ The commit the engine pinned before is kept as the tag `vulkan-upstream-<sha12>`
 | Upstream PR | What it adds | Carried as |
 |---|---|---|
 | [ggml-org#28243](https://github.com/ggml-org/llama.cpp/pull/28243) (Daniel Han, Ryan Monsurate) | Qwen3.8-Flash-Next's NextN/MTP draft head (`--spec-type draft-mtp`), and the fix for `-md` loading the target model instead of the draft file | `62484fba` on v0.5.0 |
+| [ggml-org#21412](https://github.com/ggml-org/llama.cpp/pull/21412) (Echo Labs) | Zyphra's Zamba2 (Mamba-2 layers plus shared transformer blocks, per-layer LoRA adapters merged at conversion) and its converter | `5ce79a56` |
+| ours: `vulkan: SSM_SCAN for d_state 64` | Vulkan's Mamba-2 scan had pipelines only for a 128/256 state, so Zamba2-2.7B/7B (state 64) ran the scan on the CPU in every layer; two test-backend-ops cases with their shapes | `a32f0d6f` |
 
-Reviewed line by line before it was pinned: it touches only the qwen4exp model, its
+Each upstream PR is reviewed line by line before it is pinned. #28243: it touches only the qwen4exp model, its
 converter, and two lines of the shared speculative decoding (the `-md` path fix, and
 KV sharing kept to gemma4-assistant drafts, as v0.5.0 already did). A draft head can
 only change speed: the target model checks every drafted token.
@@ -82,6 +84,14 @@ v0.5.0 + ggml-org#28243 (`62484fba`), llama-server built from the branch:
 |---|---|
 | Qwen3-0.6B Q4_K_M | "The capital of France is Paris.", 315-331 tok/s (unchanged) |
 | Qwen3.8-27B UD-Q4_K_XL + `--mtp` (Q4_0 head) | 35.0 / 28.1 / 32.2 tok/s code / prose / short; draft acceptance 188/200, 171/252, 6/6, the same as v0.5.0 |
+
+v0.5.0 + #28243 + #21412 + the d_state-64 scan (`a32f0d6f`); Zamba2 converted with the carried converter (`convert_hf_to_gguf.py --outtype q8_0`), test-backend-ops SSM_SCAN 14/14 on Vulkan0:
+
+| Zamba2 (Q8_0, `llama-bench -p 256 -n 64`) | pp256 | tg64 | chat |
+|---|---|---|---|
+| 1.2B-instruct | 3166 | 89.8 | "The capital of France is Paris." |
+| 2.7B-instruct | 1541 (was 614) | 45.2 (was 4.3: scan on the CPU) | correct |
+| 7B-Instruct (2 shared blocks, RoPE) | 523 (was 29) | 17.1 (was 2.1) | correct, 16.7 tok/s |
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not

@@ -1,0 +1,57 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Issue form: a model 1bit should run.
+name: Model request
+description: A model that does not load or run, or that should run on another device.
+title: "Model: "
+labels: ["model request"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Check the model registry first (https://1bit.gg/registry.html): it lists every architecture each
+        backend runs and which ones have been checked.
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: Hugging Face link to the model (or to its GGUF).
+    validations:
+      required: true
+  - type: input
+    id: arch
+    attributes:
+      label: Architecture
+      description: general.architecture of the GGUF, or architectures from config.json, if you know it.
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device you want it on
+      multiple: true
+      options: [npu, vulkan, hrx, rocm, zinc, ds4, mlx, onnx, any]
+    validations:
+      required: true
+  - type: textarea
+    id: tried
+    attributes:
+      label: What you tried
+      description: The command and what it printed, if you tried it.
+      render: text
+  - type: textarea
+    id: why
+    attributes:
+      label: Why this model
+      description: What you would use it for; links to its licence help.

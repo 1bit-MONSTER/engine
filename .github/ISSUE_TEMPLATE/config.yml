@@ -1,0 +1,30 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Every issue uses a form; questions, designs and security reports go elsewhere.
+blank_issues_enabled: false
+contact_links:
+  - name: Question or help
+    url: https://github.com/1bit-MONSTER/engine/discussions/categories/q-a
+    about: Ask in Q&A (Discussions).
+  - name: RFC (a larger change)
+    url: https://github.com/1bit-MONSTER/engine/discussions/categories/rfcs
+    about: New backends, devices, dependencies, formats or APIs start here (CONTRIBUTING.md).
+  - name: Security vulnerability
+    url: https://github.com/1bit-MONSTER/engine/security/advisories/new
+    about: Report privately, never in a public issue (SECURITY.md).
+  - name: Discord
+    url: https://discord.gg/fa5m4Vawpa
+    about: Chat with other 1bit users.

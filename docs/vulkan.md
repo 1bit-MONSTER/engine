@@ -148,6 +148,13 @@ Q4_K_M (5.17 GiB), by device:
 
 F16 on Vulkan0: 1,138 tok/s prefill, 45.9 tok/s decode, perplexity 20.59.
 
+ZAYA1-74B-preview (1bit-MONSTER/llama.cpp #11) alternates sliding-window layers (a 4,097-token
+window, rope theta 1e4) with full-attention layers (theta 1e7); the converter writes the window,
+the per-layer pattern and the second rope base, and ZAYA1-8B, which has no sliding layers, is
+unchanged (same perplexity to four decimals). Its Q4_K_M (45.7 GB) passes `tests/serve_e2e.sh`
+on `--device vulkan` with `--ctx-size 8192`; there is no reference check for it here, since a
+74B FP32 transformers run does not fit on Strix Halo.
+
 \* 512-token chunks over this repository's docs (PORTING.md, hrx.md, README.md), for comparing
 quants and devices, not models. ROCm's Q4 matmuls quantize activations to 8 bits, hence its
 slightly higher figure.

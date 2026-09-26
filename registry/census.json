@@ -4,27 +4,27 @@
   "models": 415490,
   "with_architecture": 332612,
   "architectures_seen": 2616,
-  "mapped_models": 315677,
-  "mapped_pct": 94.91,
-  "checked_models": 213841,
-  "checked_pct": 64.29,
+  "mapped_models": 315790,
+  "mapped_pct": 94.94,
+  "checked_models": 213954,
+  "checked_pct": 64.33,
   "per_backend": {
    "vulkan": {
-    "mapped": 311629,
-    "checked": 213841,
-    "mapped_pct": 93.69,
-    "checked_pct": 64.29
+    "mapped": 311742,
+    "checked": 213954,
+    "mapped_pct": 93.73,
+    "checked_pct": 64.33
    },
    "hrx": {
-    "mapped": 315371,
-    "checked": 213841,
-    "mapped_pct": 94.82,
-    "checked_pct": 64.29
+    "mapped": 315484,
+    "checked": 213954,
+    "mapped_pct": 94.85,
+    "checked_pct": 64.33
    },
    "zinc": {
-    "mapped": 232152,
+    "mapped": 232265,
     "checked": 34196,
-    "mapped_pct": 69.8,
+    "mapped_pct": 69.83,
     "checked_pct": 10.28
    },
    "npu": {
@@ -84,10 +84,6 @@
     "models": 121
    },
    {
-    "architecture": "CambrianQwenForCausalLM",
-    "models": 113
-   },
-   {
     "architecture": "MBartForConditionalGeneration",
     "models": 110
    },
@@ -134,6 +130,10 @@
    {
     "architecture": "MarianForCausalLM",
     "models": 76
+   },
+   {
+    "architecture": "LISAForCausalLM",
+    "models": 74
    }
   ]
  },

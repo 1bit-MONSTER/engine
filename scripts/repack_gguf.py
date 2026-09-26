@@ -1,0 +1,143 @@
+#!/usr/bin/env python3
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# GGUF -> Q4NX repack: runs the FLM_Q4NX_Converter (in its own directory, its
+# configs/ are relative) and then writes the Hugging Face config.json the
+# model-generic forward reads. The converter emits only model.q4nx +
+# tokenizer.json; config.json is derived here from the GGUF metadata.
+#
+# Usage: python3 repack_gguf.py <model.gguf> <output_dir> [converter_dir]
+import json
+import os
+import subprocess
+import sys
+
+# GGUF general.architecture -> HF model_type (the forward's model_type).
+ARCH_TO_MODEL_TYPE = {
+    "qwen2": "qwen2",
+    "qwen3": "qwen3",
+    "qwen3moe": "qwen3moe",
+    "qwen3_5_moe": "qwen3_5_moe",
+    "qwen35moe": "qwen3_5_moe",
+    "llama": "llama",
+    "deepseek2": "deepseek2",
+    "minicpm": "minicpm",
+    "gemma2": "gemma2",
+    "gemma3": "gemma3",
+}
+
+# Arches whose attention projections carry a bias (the GGUF has no bias flag).
+ATTENTION_BIAS_ARCHES = {"qwen2"}
+
+
+def _field(reader, name):
+    for f in reader.fields.values():
+        if f.name == name:
+            return f
+    return None
+
+
+def _num(reader, name, default):
+    f = _field(reader, name)
+    if f is None:
+        return default
+    v = f.contents()
+    if isinstance(v, (tuple, list)):
+        v = v[-1]
+    if hasattr(v, "item"):
+        v = v.item()
+    return v
+
+
+def write_config(gguf_path, out_dir, arch, vocab_size):
+    from gguf import GGUFReader
+
+    reader = GGUFReader(gguf_path)
+    p = arch
+    embedding = int(_num(reader, f"{p}.embedding_length", 0))
+    heads = int(_num(reader, f"{p}.attention.head_count", 0))
+    nkv = int(_num(reader, f"{p}.attention.head_count_kv", heads))
+    head_dim = int(_num(reader, f"{p}.attention.key_length", embedding // heads if heads else 0))
+    if not head_dim and heads:
+        head_dim = embedding // heads
+
+    cfg = {
+        "model_type": ARCH_TO_MODEL_TYPE.get(arch, arch),
+        "hidden_size": embedding,
+        "num_hidden_layers": int(_num(reader, f"{p}.block_count", 0)),
+        "num_attention_heads": heads,
+        "num_key_value_heads": nkv,
+        "head_dim": head_dim,
+        "intermediate_size": int(_num(reader, f"{p}.feed_forward_length", 0)),
+        "vocab_size": vocab_size,
+        "rms_norm_eps": float(_num(reader, f"{p}.attention.layer_norm_rms_epsilon", 1e-6)),
+        "rope_theta": float(_num(reader, f"{p}.rope.freq_base", 10000.0)),
+    }
+    if arch in ATTENTION_BIAS_ARCHES:
+        cfg["attention_bias"] = True
+    with open(os.path.join(out_dir, "config.json"), "w") as f:
+        json.dump(cfg, f, indent=2)
+    return cfg
+
+
+def main():
+    if len(sys.argv) < 3:
+        print("usage: repack_gguf.py <model.gguf> <output_dir> [converter_dir]")
+        return 2
+    gguf, out_dir = sys.argv[1], sys.argv[2]
+    converter_dir = sys.argv[3] if len(sys.argv) > 3 else "/home/bcloud/1bit-MONSTER-iso-build/third_party/FLM_Q4NX_Converter"
+    converter_dir = os.path.abspath(converter_dir)
+
+    os.makedirs(out_dir, exist_ok=True)
+    convert_py = os.path.join(converter_dir, "convert.py")
+    if not os.path.exists(convert_py):
+        print(f"converter not found: {convert_py}")
+        return 1
+
+    # The converter resolves configs/<arch>.json relative to its CWD.
+    r = subprocess.run([sys.executable, convert_py, gguf, out_dir],
+                       cwd=converter_dir)
+    if r.returncode != 0 or not os.path.exists(os.path.join(out_dir, "model.q4nx")):
+        print("converter failed")
+        return 1
+
+    # Vocab size from the tokenizer the converter wrote.
+    tok = os.path.join(out_dir, "tokenizer.json")
+    vocab_size = 0
+    if os.path.exists(tok):
+        try:
+            with open(tok) as f:
+                vocab_size = len(json.load(f).get("model", {}).get("vocab", {}))
+        except Exception:
+            vocab_size = 0
+
+    # Arch from the GGUF metadata.
+    from gguf import GGUFReader
+    reader = GGUFReader(gguf)
+    arch_field = _field(reader, "general.architecture")
+    arch = arch_field.contents() if arch_field else ""
+    if isinstance(arch, bytes):
+        arch = arch.decode()
+    arch = str(arch)
+
+    cfg = write_config(gguf, out_dir, arch, vocab_size)
+    print(f"config.json: {cfg}")
+    print("repack complete")
+    return 0
+
+
+if __name__ == "__main__":
+    sys.exit(main())

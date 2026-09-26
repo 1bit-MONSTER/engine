@@ -29,6 +29,7 @@
 // See docs/PORTING.md for what lands next.
 
 #ifdef ONEBIT_NPU
+#include "forward_serve.h"
 #include "generate.h"
 #include "model.h"
 #include "private_route.h"
@@ -78,6 +79,7 @@ void usage(FILE* out) {
 #ifdef ONEBIT_NPU
                  "  unified -m <model dir>      serve one NPU model (OpenAI endpoints)\n"
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
+                 "  forward-serve -m <model.q4nx> --kernels <dir>  serve a repacked GGUF on the NPU\n"
 #endif
                  "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
 #ifdef ONEBIT_LAYA
@@ -310,6 +312,14 @@ int main(int argc, char** argv) {
             return run_npu(argc - 2, argv + 2);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "1bit npu-run: %s\n", e.what());
+            return 1;
+        }
+    }
+    if (cmd == "forward-serve") {
+        try {
+            return onebit::run_forward_serve(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit forward-serve: %s\n", e.what());
             return 1;
         }
     }

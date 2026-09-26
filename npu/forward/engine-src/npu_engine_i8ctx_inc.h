@@ -1,0 +1,1151 @@
+// Copyright (c) 2026 bong-water-water-bong
+// npu_engine_i8ctx_inc.h — I8Ctx GEMM context using xrt::kernel (classic API).
+//
+// Matches the actual xclbin kernel interface:
+//   kernel(opcode, instr_bo, ninstr, bo0, bo1, bo2, bo3, bo4)
+//
+// One contiguous weight BO per layer (bo1). One activation BO (bo0).
+// One output BO (bo2). Instructions loaded from pre-generated .txt files
+// (blob_instr_transaction format), one BO per layer.
+//
+// This is the SAME interface HybridFlmCtx uses but with per-op xclbins
+// instead of a unified mm.xclbin.  One engine, one memory model, one API.
+#pragma once
+#include <cstdio>
+#include <cstdlib>
+#include <cstring>
+#include <cstdint>
+#include <cmath>
+#include <vector>
+#include <memory>
+#include <string>
+#include <algorithm>
+#include <xrt/xrt_device.h>
+#include <xrt/xrt_bo.h>
+#include <xrt/xrt_kernel.h>
+#include <xrt/experimental/xrt_elf.h>
+#include <xrt/experimental/xrt_ext.h>
+#include <xrt/experimental/xrt_module.h>
+
+// Raw Q4NX + int4 fused GU packing (issue #1769, ws09).
+#include "q4nx_raw.h"
+#include "gu_i4_pack.h"
+
+// Include npu_sequence for init_with_generator (may already be included by caller)
+#if __has_include("npu_utils/npu_instr_utils.hpp")
+#include "npu_utils/npu_instr_utils.hpp"
+#else
+struct npu_sequence;  // the gemm_generate_sequence_i8 decl below needs the name only
+#endif
+
+// Forward decl (defined in gemm_npu_instructions.cpp)
+void gemm_generate_sequence_i8(
+    npu_sequence* seq, uint32_t M, uint32_t K, uint32_t N,
+    uint32_t a_ddr_offset, uint32_t b_base_offset,
+    bool add_bias, int activation, uint32_t bias_offset, uint32_t output_offset);
+
+struct I8Ctx {
+    int MD, KD, ND, NL;
+    int bC_nd = 0;   // bo2 (C2) size override: MD*bC_nd*4 bytes when > 0.
+    bool bf16_pair = false;  // #1934: kernel B dequant mode. true = the
+                             // I4_BF16_PAIR bf16-(a,b) q4*a+b dequant; false
+                             // = v66 ratioQ22. MUST match the xclbin the ctx
+                             // was built with so packB_into_fused_i4 packs
+                             // the same B'' layout the kernel dequants.
+                     // The int4 P1 launch writes the FULL C1 (32 chunks x
+                     // 4 KB = 128 KB) to bo2 (issue #1769 CPU-silu fallback),
+                     // while ND is the logical D output width (2048) — set
+                     // bC_nd = 2*n_ff (4096) so the writeback fits.
+    std::unique_ptr<xrt::xclbin> xc;
+    std::unique_ptr<xrt::hw_context> hc;
+    std::unique_ptr<xrt::kernel> k;
+    // ── Full-ELF mode (no xclbin) ──
+    // Consume a `aiecc --generate-full-elf` artifact directly: the ELF bundles
+    // the PDIs + TXN control code, so there is no xclbin and no instruction
+    // .txt. The hw_context is created from the ELF, and kext is the resulting
+    // xrt::ext::kernel whose signature is (A, B, C). Requires the design's
+    // runtime sequence to load the ELF's PDI (aiex.npu.load_pdi; see
+    // generators/build_zaya_m8.sh), otherwise XRT never configures the array.
+    std::unique_ptr<xrt::elf> elf;
+    std::unique_ptr<xrt::ext::kernel> kext;
+    bool elf_mode = false;
+    std::unique_ptr<xrt::bo> bA, bC;
+    std::vector<std::unique_ptr<xrt::bo>> layerB;     // weight BOs
+    std::vector<std::unique_ptr<xrt::bo>> layerInstr;  // instruction BOs
+    std::vector<std::vector<uint32_t>> layerInstrData; // raw instruction data
+    int8_t* Am;
+    int32_t* Cm;
+    std::vector<std::vector<float>> group_scales;
+    bool initialized = false;
+
+    ~I8Ctx() {}
+
+    bool isReady() { return initialized && (k || kext) && bA && bC; }
+
+    // ── Init with generated instructions (no pre-gen'd .txt files needed) ──
+#if __has_include("npu_utils/npu_instr_utils.hpp")
+    bool init_with_generator(xrt::device& d, const char* xp,
+                             int M, int K, int N, int nlayers) {
+        MD = M; KD = K; ND = N; NL = nlayers;
+        fprintf(stderr, "  I8Ctx::init_with_generator xp=%s M=%d K=%d N=%d\n", xp, M, K, N);
+
+        // The generated sequence assumes the single-core-row topology that
+        // n1_core_i8_v26.py emitted.  An xclbin built by v27 spreads the tile
+        // grid over 4 core rows and expects a matching instruction stream, so
+        // pairing it with this fallback silently computes the wrong result
+        // rather than failing.  Xclbins built by run_build.sh always ship their
+        // instruction file, so this path is only reached when that file is
+        // missing.
+        fprintf(stderr, "  WARN: generating single-core-row instructions; if %s\n"
+                        "        was built multi-row (v27), its .txt instruction file is\n"
+                        "        required and results will be wrong without it.\n", xp);
+
+        // Generate instruction sequence
+        npu_sequence seq(device_npu2);
+        gemm_generate_sequence_i8(&seq, (uint32_t)M, (uint32_t)K, (uint32_t)N,
+                                  0, 0, false, 0, 0, 0);
+        // FLM-parity header (tools/gen_npu_insts.cpp): never cmds2seq() here —
+        // it appends a stale header AFTER the raw payload (bug S13).
+        std::vector<uint32_t>& raw = seq.raw_seq();
+        uint32_t ncmds = raw.back(); raw.pop_back();
+        std::vector<uint32_t> ins;
+        ins.reserve(raw.size() + 4);
+        ins.push_back(0x06040100);
+        ins.push_back(0x00000108);
+        ins.push_back(ncmds);
+        ins.push_back((uint32_t)(raw.size() * 4 + 16));
+        ins.insert(ins.end(), raw.begin(), raw.end());
+        fprintf(stderr, "  generated %zu instr bytes (%zu words)\n",
+                ins.size() * sizeof(uint32_t), ins.size());
+
+        // Register xclbin
+        try {
+            xc = std::make_unique<xrt::xclbin>(std::string(xp));
+            d.register_xclbin(*xc);
+            hc = std::make_unique<xrt::hw_context>(d, xc->get_uuid());
+            k = std::make_unique<xrt::kernel>(*hc, "MLIR_AIE");
+        } catch (std::exception& ex) {
+            fprintf(stderr, "  I8Ctx: xclbin/kernel init failed: %s\n", ex.what());
+            return false;
+        }
+
+        int grp_a   = k->group_id(3);
+        int grp_w   = k->group_id(4);
+        int grp_c   = k->group_id(5);
+        int grp_ins = k->group_id(1);
+
+        bA = std::make_unique<xrt::bo>(d, (size_t)MD * KD,
+                                       XRT_BO_FLAGS_HOST_ONLY, grp_a);
+        bC = std::make_unique<xrt::bo>(d, (size_t)MD * ND * 4,
+                                       XRT_BO_FLAGS_HOST_ONLY, grp_c);
+        Am = (int8_t*)bA->map();
+        Cm = (int32_t*)bC->map();
+        // Both BOs are XRT_BO_FLAGS_HOST_ONLY and NOTHING zeroed them. Am is fully written by
+        // quantize_async (memset(Am,0,MD*KD)) before every launch, so bA was safe -- but Cm is
+        // the GEMM OUTPUT: the kernel writes only the valid rows of each launch, while the host
+        // reads MD rows. On the FIRST launch the rows the kernel did not write were whatever the
+        // device allocator handed back, which is why Nanbeige's boot token was nondeterministic
+        // (1214 / 131718 / 145029 / 42438 ... for one command, RESULTS-coverage-multifamily 59,
+        // 62). Zeroing makes the initial contents defined; section 61 made the same fix on the
+        // bf16 path's KV BO, which is a different set of buffers.
+        memset(Am, 0, (size_t)MD * KD);
+        memset(Cm, 0, (size_t)MD * ND * 4);
+
+        layerB.resize(NL);
+        layerInstr.resize(NL);
+        layerInstrData.resize(NL);
+        group_scales.resize(NL);
+
+        for (int l = 0; l < NL; l++) {
+            layerB[l] = std::make_unique<xrt::bo>(d, (size_t)KD * ND,
+                                                   XRT_BO_FLAGS_HOST_ONLY, grp_w);
+        }
+        // ONE instruction BO per context: the instruction stream is identical
+        // for every layer of the same GEMM (the kernel selects the layer via
+        // layerB[l]), so per-layer BOs multiplied DEV-heap usage (8B:
+        // 36 × 1.5MB) and exhausted the NPU's 48MB SRAM heap on the FLM-free
+        // stack (issue #1699 bring-up).
+        layerInstr.resize(1);
+        layerInstrData.resize(1);
+        layerInstrData[0] = ins;
+        layerInstr[0] = std::make_unique<xrt::bo>(
+            d, ins.size() * sizeof(uint32_t),
+            XCL_BO_FLAGS_CACHEABLE, grp_ins);
+        memcpy(layerInstr[0]->map(), ins.data(),
+               ins.size() * sizeof(uint32_t));
+        layerInstr[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        initialized = true;
+        return true;
+    }
+
+    // ── M is ALWAYS 128 — there is no valid M<128 instruction stream ──
+    // The v27 microkernel is M=128-baked (4 × 32-row slices; the BD-rotation
+    // schedule covers exactly 4 slices), so gemm_generate_sequence_i8 voids
+    // its M argument: the stream is a pure function of (K, N) and is always
+    // the M=128 stream.  Pre-rework generators wrote M into REG_M / descriptor
+    // offsets, which DEADLOCKED for M<128 (~2 s/launch, kernel never completes:
+    // REG_M cannot resize the baked tiling — issue #1761, AIE2P-FACTS.md §3b).
+    //
+    // Smaller batches MUST reuse the M=128 stream and pass the real row count
+    // as `am` to go()/launch_*: quantize_async zero-pads rows [am, 128) so only
+    // rows [0, am) are valid. That is what npu_engine_universal, zaya_decode
+    // and zaya_npu_runner do for single-token decode. Real small-M streams
+    // require per-shape small-M xclbins (build_xclbins.sh Peano path), not a
+    // runtime regen. (A former regen_insts(int M) re-uploaded an identical
+    // M=128 stream and claimed to resize the batch — removed as misleading.)
+#else
+    // Stub: npu_instr_utils.hpp not available — use init() with pre-gen'd files
+    bool init_with_generator(xrt::device&, const char*, int, int, int, int) {
+        fprintf(stderr, "  I8Ctx: init_with_generator unavailable (no npu_instr_utils)\n");
+        return false;
+    }
+#endif
+
+    // ── Init: consume a FULL ELF directly (no xclbin) ──
+    // Kernel signature: (bo0, bo1, bo2) == (A, B, C). No instruction BO: the
+    // TXN control stream lives in the ELF's .ctrltext. Kernel name is
+    // "<kernel>:<instance>" from the aiecc full-ELF config ("main:seq" for the
+    // v27 designs).
+    bool init_elf(xrt::device& d, const char* ep, int M, int K, int N,
+                  int nlayers, const char* kname = "main:seq") {
+        MD = M; KD = K; ND = N; NL = nlayers;
+        fprintf(stderr, "  I8Ctx::init_elf ep=%s M=%d K=%d N=%d nl=%d\n",
+                ep, M, K, N, nlayers);
+        try {
+            elf = std::make_unique<xrt::elf>(std::string(ep));
+            if (!elf->is_full_elf()) {
+                fprintf(stderr, "  I8Ctx::init_elf: %s is not a full ELF\n", ep);
+                return false;
+            }
+            fprintf(stderr, "  full ELF ok: uuid=%s\n",
+                    elf->get_cfg_uuid().to_string().c_str());
+            hc = std::make_unique<xrt::hw_context>(d, *elf);
+            kext = std::make_unique<xrt::ext::kernel>(*hc, std::string(kname));
+        } catch (std::exception& ex) {
+            fprintf(stderr, "  I8Ctx::init_elf failed: %s\n", ex.what());
+            return false;
+        }
+        // A group-less xrt::bo is rejected by the amdxdna driver ("unsupported
+        // buffer type: none flag") under the system XRT; xrt::ext::bo picks a
+        // valid host-accessible memory group for the device.
+        auto mkbo = [&](size_t sz) {
+            xrt::ext::bo b{d, sz};
+            return std::make_unique<xrt::bo>(b);
+        };
+        bA = mkbo((size_t)MD * KD);
+        bC = mkbo((size_t)MD * ND * 4);
+        Am = (int8_t*)bA->map();
+        Cm = (int32_t*)bC->map();
+        layerB.resize(NL);
+        group_scales.resize(NL);   // packB() writes group_scales[l]; the xclbin init does too
+        for (int l = 0; l < NL; l++)
+            layerB[l] = mkbo((size_t)KD * ND);
+        elf_mode = true;
+        initialized = true;
+        return true;
+    }
+
+    // ── Init: load xclbin + per-layer instruction files ──
+    bool init(xrt::device& d, const char* xp, const char* ip,
+              int /*gid_B*/, int nlayers) {
+        NL = nlayers;
+        fprintf(stderr, "  I8Ctx::init xp=%s ip=%s\n", xp, ip);
+        FILE* f = fopen(ip, "rb");
+        if (!f) { fprintf(stderr, "  fopen failed: %s\n", ip); return false; }
+        fseek(f, 0, 2); long sz = ftell(f); fseek(f, 0, 0);
+        fprintf(stderr, "  instr file size=%ld\n", sz);
+        std::vector<uint32_t> ins(sz / 4);
+        fread(ins.data(), 4, ins.size(), f);
+        fclose(f);
+
+        // Register xclbin
+        try {
+            xc = std::make_unique<xrt::xclbin>(std::string(xp));
+            d.register_xclbin(*xc);
+            hc = std::make_unique<xrt::hw_context>(d, xc->get_uuid());
+            k = std::make_unique<xrt::kernel>(*hc, "MLIR_AIE");
+        } catch (std::exception& ex) {
+            fprintf(stderr, "  I8Ctx: xclbin/kernel init failed: %s\n", ex.what());
+            return false;
+        }
+
+        // Get kernel group IDs for BO allocation
+        int grp_a   = k->group_id(3);  // bo0
+        int grp_w   = k->group_id(4);  // bo1
+        int grp_c   = k->group_id(5);  // bo2
+        int grp_ins = k->group_id(1);  // instr
+        fprintf(stderr, "  grp_a=%d grp_w=%d grp_c=%d grp_ins=%d\n", grp_a, grp_w, grp_c, grp_ins);
+
+        // One activation BO + one output BO (shared across layers)
+        fprintf(stderr, "  creating bA size=%zu (MD=%d KD=%d)\n", (size_t)MD * KD, MD, KD);
+        bA = std::make_unique<xrt::bo>(d, (size_t)MD * KD,
+                                       XRT_BO_FLAGS_HOST_ONLY, grp_a);
+        size_t bc_bytes = bC_nd > 0 ? (size_t)MD * bC_nd * 4 : (size_t)MD * ND * 4;
+        fprintf(stderr, "  creating bC size=%zu (MD=%d ND=%d bC_nd=%d)\n", bc_bytes, MD, ND, bC_nd);
+        bC = std::make_unique<xrt::bo>(d, bc_bytes,
+                                       XRT_BO_FLAGS_HOST_ONLY, grp_c);
+        Am = (int8_t*)bA->map();
+        Cm = (int32_t*)bC->map();
+        // See the note in the first init overload: neither BO was zeroed, and Cm is the GEMM
+        // output, so rows the kernel did not write on the first launch were uninitialized
+        // device memory -- the source of the nondeterministic boot token.
+        memset(Am, 0, (size_t)MD * KD);
+        memset(Cm, 0, bc_bytes);
+
+        // Per-layer weight BOs + instruction BOs
+        // ONE weight BO per context, NOT one per layer.  Every caller in the
+        // model-generic forward packs and launches index 0 (npu_gemm /
+        // run_lm_head in q4nx_forward.cpp, lm_gemm in engine.cpp), so NL-1 of
+        // these BOs were pure waste -- and unlike the ELF path's ext BOs these
+        // are xclbin-group BOs, so Qwen3-8B allocated ~32 x (4096*12288 etc.)
+        // ~= 6 GB and exhausted the device heap; its kernel then made no
+        // progress (0 tokens in 27 min, where the ELF path did 5 in 1329 s) and
+        // llama-3.2-1B died with 'double free or corruption (out)'.  Mirrors the
+        // instruction-BO fix below.
+        layerB.resize(1);
+        layerInstr.resize(1);
+        layerInstrData.resize(1);
+        group_scales.resize(NL);
+        layerB[0] = std::make_unique<xrt::bo>(d, (size_t)KD * ND,
+                                              XRT_BO_FLAGS_HOST_ONLY, grp_w);
+        // ONE instruction BO per context: the instruction stream is identical
+        // for every layer of the same GEMM (the kernel selects the layer via
+        // layerB[l]), so per-layer BOs multiplied DEV-heap usage (8B:
+        // 36 × 1.5MB) and exhausted the NPU's 48MB SRAM heap on the FLM-free
+        // stack (issue #1699 bring-up).
+        layerInstr.resize(1);
+        layerInstrData.resize(1);
+        layerInstrData[0] = ins;
+        layerInstr[0] = std::make_unique<xrt::bo>(
+            d, ins.size() * sizeof(uint32_t),
+            XCL_BO_FLAGS_CACHEABLE, grp_ins);
+        memcpy(layerInstr[0]->map(), ins.data(),
+               ins.size() * sizeof(uint32_t));
+        layerInstr[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+
+        initialized = true;
+        return true;
+    }
+
+    // ── Resident-expert (MoE) helpers: pack/launch against an arbitrary BO ──
+    // Decode is M=1 with top-1 routing; re-streaming the selected expert's
+    // weights into a shared per-layer BO every token costs a memcpy + sync on
+    // the critical path (~30ms/tok for 20 layers). Instead allocate one
+    // weight BO per (layer, expert) at startup, pack+sync once, and pass the
+    // BO handle directly at decode.
+    std::unique_ptr<xrt::bo> make_weight_bo(xrt::device& d) {
+        int grp_w = k->group_id(4);
+        // Weight BOs are written once (packB_into) and read every token by the
+        // shim DMA. HOST_ONLY forces the device through the slow cache-coherent
+        // path (~3.6 GB/s measured); try normal/cacheable/svm for faster reads.
+        uint32_t fl = XRT_BO_FLAGS_HOST_ONLY;
+        if (const char* f = getenv("NPU_WBO_FLAGS")) {
+            int v = atoi(f);
+            if (v == 0) fl = 0;
+            else if (v == 1) fl = XRT_BO_FLAGS_CACHEABLE;
+            else if (v == 2) fl = XRT_BO_FLAGS_SVM;
+        }
+        auto bo = std::make_unique<xrt::bo>(d, (size_t)KD * ND, fl, grp_w);
+        // packB_into memsets the mapped buffer before packing, so this BO is covered in practice;
+        // zeroing at allocation as well costs one memset and removes the ordering assumption.
+        if (void* m = bo->map()) memset(m, 0, (size_t)KD * ND);
+        return bo;
+    }
+
+    // Pack weights into an arbitrary (already-allocated) weight BO.
+    void packB_into(xrt::bo& bo, const float* w, int K, int N,
+                    float& sout, std::vector<float>& col_out) {
+        auto* Bm = (int8_t*)bo.map();
+        memset(Bm, 0, (size_t)KD * ND);
+        std::vector<float> col(N);
+        double ssum = 0;
+        // Per-column quantization is fully independent (disjoint Bm/col[j]);
+        // parallelize the column loop (resident-expert pack was ~63s serial).
+        #pragma omp parallel for reduction(+:ssum) schedule(static)
+        for (int j = 0; j < N; j++) {
+            float amax = 0;
+            for (int i = 0; i < K; i++) {
+                float a = fabsf(w[(size_t)i * N + j]);
+                if (std::isfinite(a) && a > amax) amax = a;
+            }
+            if (amax < 1e-12f) amax = 1.0f;
+            float ts = amax / 127.0f;
+            float tis = 127.0f / amax;
+            for (int i = 0; i < K; i++) {
+                float v = w[(size_t)i * N + j];
+                if (!std::isfinite(v)) v = 0;
+                int x = (int)roundf(v * tis);
+                if (x > 127) x = 127;
+                else if (x < -127) x = -127;
+                Bm[(size_t)i * ND + j] = (int8_t)x;
+            }
+            col[j] = ts;
+            ssum += ts;
+        }
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        col_out = std::move(col);
+        sout = (float)(ssum / N);
+    }
+
+    // Async launch with an arbitrary weight BO (resident-expert path).
+    inline xrt::run launch_async_with_bo(xrt::bo& wbo, const float* A,
+                                         int am, int ak, float ascale) {
+        quantize_async(A, am, ak, ascale);
+        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (elf_mode) return (*kext)(*bA, wbo, *bC);
+        return (*k)((unsigned)3, *layerInstr[0],
+                    (unsigned)(layerInstrData[0].size()),
+                    *bA, wbo, *bC);
+    }
+
+    // ── Pack weights for layer l into contiguous BO ──
+    // K×N are the logical (unpadded) weight dims; the BO is KD×ND (padded to 128).
+    // Zero-init ensures padded regions contribute zero to the GEMM output.
+    void packB(int l, const float* w, int K, int N, float& sout) {
+        // Weight-content checksum (NPU_DBG=1), placed INSIDE the implementation so it fires for
+        // whichever context FLM_PACKB selects. My previous two attempts sat at call sites and never
+        // fired, because Nanbeige packs through a branch I misread. This checks the DEQUANTIZED
+        // weights -- the last host input not yet proven stable across runs.
+        // RESULTS-coverage-multifamily 67.
+        if (getenv("NPU_DBG") && l < 3) {
+            unsigned long long hh = 1469598103934665603ULL;
+            const unsigned char* pp = (const unsigned char*)w;
+            for (size_t i = 0; i < (size_t)K * N * sizeof(float); i++) { hh ^= pp[i]; hh *= 1099511628211ULL; }
+            fprintf(stderr, "[WCHK i8] l=%d K=%d N=%d fnv=%016llx\n", l, K, N, hh);
+        }
+        // Per-output-column weight scales: each column j is quantized with its
+        // own amax_j/127 and dequantized with group_scales[l][j]. A single
+        // per-tensor scale packed low-magnitude columns (Qwen3 v_proj rms
+        // ~0.007 vs q/k ~0.02-0.03) onto ~10 int8 levels -> ~5% output error
+        // that compounds over 28 layers and flips the final token.
+        auto* Bm = (int8_t*)layerB[l]->map();
+        memset(Bm, 0, (size_t)KD * ND);
+        std::vector<float> col(N);
+        double ssum = 0;
+        for (int j = 0; j < N; j++) {
+            float amax = 0;
+            for (int i = 0; i < K; i++) {
+                float a = fabsf(w[(size_t)i * N + j]);
+                if (std::isfinite(a) && a > amax) amax = a;
+            }
+            if (amax < 1e-12f) amax = 1.0f;
+            float ts = amax / 127.0f;
+            float tis = 127.0f / amax;
+            for (int i = 0; i < K; i++) {
+                float v = w[(size_t)i * N + j];
+                if (!std::isfinite(v)) v = 0;
+                int x = (int)roundf(v * tis);
+                if (x > 127) x = 127;
+                else if (x < -127) x = -127;
+                Bm[(size_t)i * ND + j] = (int8_t)x;
+            }
+            col[j] = ts;
+            ssum += ts;
+        }
+        layerB[l]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        group_scales[l] = std::move(col);
+        sout = (float)(ssum / N);
+    }
+
+    // ── Quantize activations into bA ──
+    inline int8_t* quantize_async(const float* A, int am, int ak, float ascale) {
+        float ais = 1.0f / ascale;
+        // Zero-pad ALL MD rows (issue #1775): the M=128 stream reads rows
+        // [am, MD) every launch; zeroing only rows [0, am) left stale BO
+        // memory (the previous launch's A) in [am, MD) — an
+        // uninitialized-read-class hazard for any kernel with cross-row
+        // interaction.
+        memset(Am, 0, (size_t)MD * KD);
+        for (int m = 0; m < am; m++)
+            for (int k = 0; k < ak; k++) {
+                float v = A[m * ak + k];
+                if (!std::isfinite(v)) v = 0;
+                int q = (int)roundf(v * ais);
+                if (q > 127) q = 127;
+                else if (q < -127) q = -127;
+                Am[m * KD + k] = (int8_t)q;
+            }
+        return Am;
+    }
+
+    // Per-row activation scales (batched MoE prefill): row m quantized with
+    // 1/ascales[m], so each token keeps its own dynamic range. Dequant must
+    // use the matching per-row scale (dequant_only_rows).
+    inline int8_t* quantize_async_rows(const float* A, int am, int ak,
+                                       const float* ascales) {
+        // bA holds exactly MD rows. The i8 ("fallback") prefill passes am == npt with no cap
+        // (the bf16 path caps at 'cap'; this one does not), so any prompt longer than MD wrote
+        // PAST the end of bA -- and the kernel, launched for MD rows, never processed rows
+        // MD..npt-1 at all. The boot token is taken from h_b[npt-1], which is therefore still the
+        // RAW EMBEDDING, never passed through the layers: a context-free prediction, which is why
+        // this path returns small scattered tokens (12-19 for 0.6B, 151 for Nanbeige) instead of
+        // the reference. The overrun is also the second, independent source of nondeterminism.
+        // RESULTS-coverage-multifamily 82. Refuse loudly instead of corrupting memory silently.
+        if (am > MD) {
+            fprintf(stderr,
+                    "quantize_async_rows: am=%d exceeds bA capacity MD=%d -- refusing to write "
+                    "past the activation BO (see RESULTS-coverage-multifamily 82: the prefill "
+                    "must walk the prompt in MD-row blocks)\n", am, MD);
+            return Am;
+        }
+        memset(Am, 0, (size_t)MD * KD);
+        for (int m = 0; m < am; m++) {
+            float ais = 1.0f / ascales[m];
+            for (int k = 0; k < ak; k++) {
+                float v = A[m * ak + k];
+                if (!std::isfinite(v)) v = 0;
+                int q = (int)roundf(v * ais);
+                if (q > 127) q = 127;
+                else if (q < -127) q = -127;
+                Am[m * KD + k] = (int8_t)q;
+            }
+        }
+        return Am;
+    }
+
+
+    inline void sync_A(int /*l*/) { bA->sync(XCL_BO_SYNC_BO_TO_DEVICE); }
+
+    // ── Launch kernel for layer l ──
+    // Kernel signature: (opcode, instr_bo, ninstr, bo0, bo1, bo2, bo3, bo4)
+    // BOCHK: checksum the three BOs this kernel reads, immediately before the launch. Two independent
+    // facts pin this as the live path -- I8Ctx::packB is what fires (so cq is the selected context),
+    // and the banner reports GU_split=1 (so the single-launch fused FFN is not used). Section 68
+    // exonerated every host INPUT, so whichever of these three differs across runs is a buffer the
+    // kernel reads without anyone writing it.
+    inline void bochk(int l) {
+        if (!getenv("NPU_DBG")) return;
+        // Layers 0-1 and the LAST four. The first two proved every pre-launch byte identical across runs
+        // (8/8 checksums) while the boot token varied, so the divergence begins somewhere later -- and
+        // covering the tail is what localizes it. RESULTS-coverage-multifamily 68.
+        if (!(l <= 1 || l >= (int)layerB.size() - 4)) return;
+        static int n = 0;
+        if (n >= 40) return;
+        n++;
+        fprintf(stderr, "[BOCHK] l=%d bA=%016llx W=%016llx bC=%016llx\n",
+                l, bo_fnv(*bA), bo_fnv(*layerB[l]), bo_fnv(*bC));
+    }
+    inline xrt::run launch(int l) {
+        bochk(l);
+        if (elf_mode) return (*kext)(*bA, *layerB[l], *bC);
+        return (*k)((unsigned)3,
+                    *layerInstr[0],
+                    (unsigned)(layerInstrData[0].size()),
+                    *bA, *layerB[l], *bC);
+    }
+
+    inline xrt::run sync_and_launch(int l) {
+        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        bochk(l);
+        if (elf_mode) return (*kext)(*bA, *layerB[l], *bC);
+        return (*k)((unsigned)3,
+                    *layerInstr[0],
+                    (unsigned)(layerInstrData[0].size()),
+                    *bA, *layerB[l], *bC);
+    }
+
+    inline void wait_kernel(xrt::run& r) { r.wait(); }
+
+    // Per-section output scales for the fused QKV GEMM (fix #1699: llama
+    // v_proj rms ~0.007 vs q/k ~0.02-0.03 — a single weight scale packs the
+    // small v section onto ~10 int8 levels, ~5% output error that compounds
+    // over 32 layers and flips the final token). When sec_scales is set
+    // (size 3: [ts_q, ts_k, ts_v]), dequant_qkv_rows applies each section's
+    // scale; sec_n0/sec_n1 are the q/k output lengths.
+    std::vector<std::vector<float>> sec_scales;  // per-layer [ts_q, ts_k, ts_v]
+    int sec_n0 = 0, sec_n1 = 0;
+
+    inline bool pack_qkv_sec(int l, const float* w, int K, int N,
+                             int nq, int nk, std::vector<float>& out_scales) {
+        auto* Bm = (int8_t*)layerB[l]->map();
+        memset(Bm, 0, (size_t)KD * ND);
+        auto pack_sec = [&](int j0, int j1, float& ts) {
+            float amax = 0;
+            for (int j = j0; j < j1; j++)
+                for (int i = 0; i < K; i++) {
+                    float a = fabsf(w[(size_t)i * N + j]);
+                    if (std::isfinite(a) && a > amax) amax = a;
+                }
+            if (amax < 1e-12f) amax = 1.0f;
+            ts = amax / 127.0f;
+            float tis = 127.0f / amax;
+            for (int j = j0; j < j1; j++)
+                for (int i = 0; i < K; i++) {
+                    float v = w[(size_t)i * N + j];
+                    if (!std::isfinite(v)) v = 0;
+                    int x = (int)roundf(v * tis);
+                    if (x > 127) x = 127;
+                    else if (x < -127) x = -127;
+                    Bm[(size_t)i * ND + j] = (int8_t)x;
+                }
+        };
+        float tsq = 0, tsk = 0, tsv = 0;
+        pack_sec(0, nq, tsq);
+        pack_sec(nq, nq + nk, tsk);
+        pack_sec(nq + nk, N, tsv);
+        layerB[l]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        out_scales = { tsq, tsk, tsv };
+        return true;
+    }
+
+    inline void dequant_qkv_rows(xrt::run& r, float* C, int am, int an,
+                                 const float* ascales, int layer = -1) {
+        r.wait();
+        readback();
+        if (layer >= 0 && (size_t)layer < sec_scales.size() && sec_scales[layer].size() == 3 && sec_n0 + sec_n1 < an) {
+            const std::vector<float>& ss = sec_scales[layer];
+            for (int m = 0; m < am; m++) {
+                float cs = ascales[m];
+                const int32_t* src = Cm + (size_t)m * ND;
+                float* dst = C + (size_t)m * an;
+                for (int n = 0; n < sec_n0; n++) dst[n] = (float)src[n] * (cs * ss[0]);
+                for (int n = 0; n < sec_n1; n++) dst[sec_n0 + n] = (float)src[sec_n0 + n] * (cs * ss[1]);
+                for (int n = sec_n0 + sec_n1; n < an; n++) dst[n] = (float)src[n] * (cs * ss[2]);
+            }
+        } else {
+            dequant_only_rows(C, am, an, ascales, 0, layer);
+        }
+    }
+
+    // ── Readback + dequantize output ──
+    // readback() is the ONE point where the host takes the kernel's result. Section 68 and the BOCHK
+    // sweep localized the divergence exactly here: across runs the weight BO is ALWAYS identical, bC
+    // is identical immediately before each launch, and yet the dequantized bA -- the host's reading of
+    // that same bC -- differs. So the kernel's output buffer is the same and what the host gets back
+    // from it is not. Checksumming right AFTER the sync isolates the transfer.
+    inline void readback() {
+        bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (getenv("NPU_DBG")) {
+            static int n = 0;
+            if (n < 8) { n++; fprintf(stderr, "[RBCHK] bC=%016llx\n", bo_fnv(*bC)); }
+        }
+    }
+
+    inline void dequant_only(float* C, int am, int an, float ascale,
+                             float Bscale, int layer = -1) {
+        const float* gs = nullptr;
+        if (layer >= 0 && (size_t)layer < group_scales.size() &&
+            (int)group_scales[layer].size() == an)
+            gs = group_scales[layer].data();
+        for (int m = 0; m < am; m++)
+            for (int n = 0; n < an; n++) {
+                float cs = ascale * (gs ? gs[n] : Bscale);
+                float val = (float)((int32_t)Cm[m * ND + n]) * cs;
+                if (!std::isfinite(val)) val = 0;
+                C[m * an + n] = val;
+            }
+    }
+
+    // Per-row dequant (batched MoE prefill): row m scaled by ascales[m].
+    inline void dequant_only_rows(float* C, int am, int an,
+                                  const float* ascales, float Bscale,
+                                  int layer = -1) {
+        const float* gs = nullptr;
+        if (layer >= 0 && (size_t)layer < group_scales.size() &&
+            (int)group_scales[layer].size() == an)
+            gs = group_scales[layer].data();
+        for (int m = 0; m < am; m++) {
+            for (int n = 0; n < an; n++) {
+                float cs = ascales[m] * (gs ? gs[n] : Bscale);
+                float val = (float)((int32_t)Cm[m * ND + n]) * cs;
+                if (!std::isfinite(val)) val = 0;
+                C[m * an + n] = val;
+            }
+        }
+    }
+
+    inline void dequantize(xrt::run& r, float* C, int am, int an,
+                           float ascale, float Bscale, int layer = -1) {
+        r.wait();
+        readback();
+        dequant_only(C, am, an, ascale, Bscale, layer);
+    }
+
+    inline void sync_back_and_dequant(float* C, int am, int an,
+                                      float ascale, float Bscale,
+                                      int layer = -1) {
+        readback();
+        dequant_only(C, am, an, ascale, Bscale, layer);
+    }
+
+    // ── Synchronous go() ──
+    inline bool go(int l, const float* A, int am, int ak, float ascale,
+                   float Bscale, float* C, int an) {
+        auto t0 = std::chrono::steady_clock::now();
+        quantize_async(A, am, ak, ascale);
+        auto t1 = std::chrono::steady_clock::now();
+        auto r = sync_and_launch(l);
+        auto t2 = std::chrono::steady_clock::now();
+        r.wait();
+        auto t3 = std::chrono::steady_clock::now();
+        dequantize(r, C, am, an, ascale, Bscale, l);
+        auto t4 = std::chrono::steady_clock::now();
+        if (getenv("NPU_GO_STATS"))
+            fprintf(stderr, "[go] q=%.2f sync+launch=%.2f wait=%.2f deq=%.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                    std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                    std::chrono::duration<double, std::milli>(t3 - t2).count(),
+                    std::chrono::duration<double, std::milli>(t4 - t3).count());
+        return true;
+    }
+
+    // Synchronous go() with per-row activation scales (batched MoE prefill):
+    // row m of A quantized with ascales_q[m], row m of C dequantized with
+    // ascales_d[m] (GU: q==d; D: q=asu, d=asu*d_sc so per-token dequant
+    // matches sequential's per-token expert-mean scale).
+    inline bool go_rows(int l, const float* A, int am, int ak,
+                        const float* ascales_q, const float* ascales_d,
+                        float Bscale, float* C, int an) {
+        auto t0 = std::chrono::steady_clock::now();
+        quantize_async_rows(A, am, ak, ascales_q);
+        auto t1 = std::chrono::steady_clock::now();
+        auto r = sync_and_launch(l);
+        auto t2 = std::chrono::steady_clock::now();
+        r.wait();
+        auto t3 = std::chrono::steady_clock::now();
+        readback();
+        dequant_only_rows(C, am, an, ascales_d, Bscale, l);
+        auto t4 = std::chrono::steady_clock::now();
+        if (getenv("NPU_GO_STATS"))
+            fprintf(stderr, "[go_rows] q=%.2f sync+launch=%.2f wait=%.2f readback+deq=%.2f ms\n",
+                    std::chrono::duration<double, std::milli>(t1 - t0).count(),
+                    std::chrono::duration<double, std::milli>(t2 - t1).count(),
+                    std::chrono::duration<double, std::milli>(t3 - t2).count(),
+                    std::chrono::duration<double, std::milli>(t4 - t3).count());
+        return true;
+    }
+
+    inline xrt::run launch_async(int l, const float* A, int am, int ak,
+                                 float ascale) {
+        quantize_async(A, am, ak, ascale);
+        return sync_and_launch(l);
+    }
+
+    // Async launch with per-row activation scales (batched prefill fix,
+    // #1699): row m quantized with ascales_q[m]. Dequant must use the same
+    // per-row scales (finish_async_rows). Prevents the shared-batch ascale
+    // from zeroing low-magnitude rows when one token's activations dwarf the
+    // rest (Qwen3-0.6B: pos0 su max ~3671 vs pos1-3 max ~5 -> rows 1-3 were
+    // quantized to all-zero int8 and the D GEMM emitted zeros).
+    inline xrt::run launch_async_rows(int l, const float* A, int am, int ak,
+                                      const float* ascales_q) {
+        quantize_async_rows(A, am, ak, ascales_q);
+        return sync_and_launch(l);
+    }
+
+    inline void finish_async_rows(xrt::run& r, float* C, int am, int an,
+                                  const float* ascales, float Bscale,
+                                  int layer = -1) {
+        r.wait();
+        readback();
+        dequant_only_rows(C, am, an, ascales, Bscale, layer);
+    }
+
+    inline void finish_async(xrt::run& r, float* C, int am, int an,
+                             float ascale, float Bscale, int layer = -1) {
+        r.wait();
+        dequantize(r, C, am, an, ascale, Bscale, layer);
+    }
+
+    // ── Fused GU→SiLU→D (issue #1759): one launch per MoE layer ──
+    //
+    // The fused kernel takes FIVE BOs:
+    //   bo0 = bA      residual int8 (quantized with ag)
+    //   bo1 = gu_bo   interleaved GU weights + per-column header (see below)
+    //   bo2 = bC      C2 int32 output [M × H]
+    //   bo3 = d_bo    D weights (per-column scales in group_scales[layer])
+    //   bo4 = h2_bo   h2 int8 scratch [M × K] — GU-phase SiLU output, read
+    //                 back as the D-phase A operand (DDR round trip, 2 KB)
+    //
+    // gu_bo layout (packed once at startup, header rewritten per token):
+    //   [0, W)                    interleaved weights: col 2p = gate[p],
+    //                             col 2p+1 = up[p], [H × 2·n_ff] int8, packed
+    //                             with per-column scales (packB_into_fused)
+    //   [W + c·8KB, +512B)        gs' header slice for AIE column c (float32,
+    //                             cols [128c, 128c+128)), host-folded per
+    //                             token: gs'[2p] = ag·gs_g[2p],
+    //                             gs'[2p+1] = ag·qn_s·gs_u[2p+1]
+    //   where ag = per-token A scale, qn_s = 127/max|h2| (host_h2_amax_qn_s
+    //   in zaya_moe_cpu.h — the host recomputes the GU GEMM's amax from the
+    //   same int8 inputs; integer accumulation is order-independent so the
+    //   NPU and host c1 agree bit-for-bit). Dequant: out[j] = C2[j]·gs_d[j]/qn_s
+    //   (ag cancels — see silu_quant.h contract). The 8KB-per-column stride
+    //   matches the fused kernel's B-stream gs-header tile (n1_core_fused_
+    //   gu_silu_d.py).
+    static constexpr size_t FUSED_AIE_COLS = 8;
+    static constexpr size_t FUSED_GS_TILE   = 4 * 32768;   // per-column header
+                                                          // (4 x 32 KB slices;
+                                                          // the i0-stride-8 gs
+                                                          // tap spans ~28 KB;
+                                                          // only the first 32
+                                                          // delivered bytes are
+                                                          // reliable — the
+                                                          // 8-float section hdr)
+    static constexpr size_t FUSED_GS_SLICE  = 32768;      // per-col_group slice
+    static constexpr int    FUSED_NSEC      = 4;          // GU quant sections
+    // OOB headroom for the gs-tile tap (GU-style strides [8N,8,N,1] walk up
+    // to ~258 KB from the slice base; the last (c=7, cg=3) slice ends ~220 KB
+    // past the 1 MB header region — the kernel ignores those bytes, but the
+    // DMA must stay inside the BO).
+    static constexpr size_t FUSED_GS_SLACK  = 8 * 32768;  // +256 KB
+
+    // The fused kernel reads the gs' header as a full (64,128) int8 B tile via
+    // the standard tap (sizes [8,16,8,8], strides [8N,8,N,1]): the delivered
+    // byte s of the tile lands at DDR offset (s/64)*8 + ((s/8)%8)*4096 + s%8.
+    // The kernel consumes the first 128 floats, so the host scatters the
+    // column's 128 gs' floats to those offsets (j in [0,128)):
+    //   addr(j) = (j/16)*8 + ((j/2)%8)*4096 + ((4j)%8)
+    static inline size_t fused_gs_off(size_t j) {
+        return (j / 16) * 8 + ((j / 2) % 8) * 4096 + ((4 * j) % 8);
+    }
+
+    // Weight BO for the fused kernel: KD·n_cols int8 (n_cols = 2·n_ff for the
+    // interleaved GU; note this is NOT the ctx's ND, which is the D output
+    // width H) + per-column gs tiles.
+    std::unique_ptr<xrt::bo> make_fused_weight_bo(xrt::device& d, size_t n_cols) {
+        int grp_w = k->group_id(4);
+        uint32_t fl = XRT_BO_FLAGS_HOST_ONLY;
+        if (const char* f = getenv("NPU_WBO_FLAGS")) {
+            int v = atoi(f);
+            if (v == 0) fl = 0;
+            else if (v == 1) fl = XRT_BO_FLAGS_CACHEABLE;
+            else if (v == 2) fl = XRT_BO_FLAGS_SVM;
+        }
+        size_t sz = (size_t)KD * n_cols + FUSED_AIE_COLS * FUSED_GS_TILE
+                    + FUSED_GS_SLACK;
+        auto bo = std::make_unique<xrt::bo>(d, sz, fl, grp_w);
+        // The gs region [KD*n_cols, sz) is READ BY THE KERNEL as per-column scales, and the
+        // packer that fills the weight part memsets only KD*ND -- so the scale tail was whatever
+        // the allocator returned. A per-column scale that is read but never written scales the
+        // output arbitrarily, which is exactly the symptom: identical input and identical norm
+        // weights, yet a hidden state after 32 layers that differs across runs
+        // (RESULTS-coverage-multifamily 62, 64, 65).
+        if (void* m = bo->map()) memset(m, 0, sz);
+        return bo;
+    }
+
+    // h2 scratch BO for the fused kernel (bo4; D-phase A source — same memory
+    // group as bA, since the A2 shim DMA reads it like an activation).
+    std::unique_ptr<xrt::bo> make_scratch_bo(xrt::device& d, size_t bytes) {
+        int grp_a = k->group_id(3);
+        auto bo = std::make_unique<xrt::bo>(d, bytes, XRT_BO_FLAGS_HOST_ONLY, grp_a);
+        // The comment above says the A2 shim DMA READS this like an activation. Nothing wrote it
+        // before that read, so the kernel consumed allocator contents.
+        if (void* m = bo->map()) memset(m, 0, bytes);
+        return bo;
+    }
+
+    // Pack the INTERLEAVED GU weights (already transposed to [H, 2·n_ff] with
+    // col 2p = gate[p], col 2p+1 = up[p] — see zaya_moe::pack_gu_interleaved)
+    // with per-column scales, and write the unfolded gs into each column's
+    // header slice (the per-token update_fused_header folds ag/qn_s in).
+    // The BO layout is KD×N contiguous (no ND padding — 2048/4096 are 128-
+    // multiples); N = 2·n_ff, the interleaved GU width.
+    // ── Tile-contiguous pack helpers (issue #1759 perf) ──
+    // The fused xclbin's B taps are LINEAR (one 8 KB tile per DMA — the
+    // row-major 4D tap read 8-byte bursts at 4096-byte strides, ~2.4 GB/s
+    // effective, ~5 ms of the 5.1 ms fused wait). Each tile (ki, n_tile) is
+    // packed CONTIGUOUSLY in the mmul chunk order: byte s = i0*1024 + i1*64 +
+    // i2*8 + i3 holds B[ki*64 + i0*8 + i2][n_tile*128 + i1*8 + i3], so the
+    // linear DMA delivers the tile exactly as the mmul reads it. A ROW-MAJOR
+    // shadow (row_out) is kept for the host amax pass / host emulation.
+    static inline void pack_tile_chunk(int8_t* dst, const float* w, int K, int N,
+                                       int ki, int nt, int n_tiles_k, float tis) {
+        size_t tbase = ((size_t)nt * (K / 64) + ki) * (64 * 128);  // column-major (nt,ki): one BD can stream a column's k-chunks
+        for (int i0 = 0; i0 < 8; i0++)
+            for (int i1 = 0; i1 < 16; i1++)
+                for (int i2 = 0; i2 < 8; i2++) {
+                    const float* src = w + (size_t)(ki * 64 + i0 * 8 + i2) * N
+                                       + nt * 128 + i1 * 8;
+                    int8_t* d = dst + tbase + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                    for (int i3 = 0; i3 < 8; i3++) {
+                        float v = src[i3];
+                        if (!std::isfinite(v)) v = 0;
+                        int x = (int)roundf(v * tis);
+                        if (x > 127) x = 127;
+                        else if (x < -127) x = -127;
+                        d[i3] = (int8_t)x;
+                    }
+                }
+    }
+
+    void packB_into_fused(xrt::bo& bo, const float* w, int K, int N,
+                          std::vector<float>& col_out,
+                          std::vector<int8_t>& row_out) {
+        auto* Bm = (int8_t*)bo.map();
+        memset(Bm, 0, (size_t)K * N);
+        std::vector<float> col(N);
+        // PER-SECTION quant (4 x 1024-col sections): each interleaved column
+        // j is quantized with the max magnitude of its section. The section
+        // scales gsec[0..3] are the kernel's 8-float header (with ag and qn_s
+        // folded per token). Measured corr 0.99906 vs float (per-column: 0.99967).
+        const size_t sec = N / FUSED_NSEC;               // 1024 cols per section
+        const int n_tiles_k = N / 128;
+        const int n_k = K / 64;
+        std::vector<float> smax(FUSED_NSEC, 0.0f);
+        for (int j = 0; j < N; j++)
+            for (int i = 0; i < K; i++) {
+                float a = fabsf(w[(size_t)i * N + j]);
+                if (std::isfinite(a) && a > smax[j / sec]) smax[j / sec] = a;
+            }
+        for (int k = 0; k < FUSED_NSEC; k++) if (smax[k] < 1e-12f) smax[k] = 1.0f;
+        double ssum = 0;
+        for (int j = 0; j < N; j++) {
+            col[j] = smax[j / sec] / 127.0f;
+            ssum += col[j];
+        }
+        row_out.resize((size_t)K * N);
+        for (int ki = 0; ki < n_k; ki++)
+            for (int nt = 0; nt < n_tiles_k; nt++) {
+                float tis = 127.0f / smax[(nt * 128) / sec];
+                pack_tile_chunk(Bm, w, K, N, ki, nt, n_tiles_k, tis);
+            }
+        // row-major shadow (host amax pass + host emulation read row-major)
+        for (int ki = 0; ki < n_k; ki++)
+            for (int nt = 0; nt < n_tiles_k; nt++) {
+                size_t tbase = ((size_t)ki * n_tiles_k + nt) * (64 * 128);
+                float tis = 127.0f / smax[(nt * 128) / sec];
+                for (int i0 = 0; i0 < 8; i0++)
+                    for (int i1 = 0; i1 < 16; i1++)
+                        for (int i2 = 0; i2 < 8; i2++)
+                            for (int i3 = 0; i3 < 8; i3++) {
+                                int k = ki * 64 + i0 * 8 + i2;
+                                int j = nt * 128 + i1 * 8 + i3;
+                                size_t s = (size_t)i0 * 1024 + i1 * 64 + i2 * 8 + i3;
+                                float v = w[(size_t)k * N + j];
+                                if (!std::isfinite(v)) v = 0;
+                                int x = (int)roundf(v * tis);
+                                if (x > 127) x = 127;
+                                else if (x < -127) x = -127;
+                                row_out[(size_t)k * N + j] = (int8_t)x;
+                            }
+            }
+        // 4-section header, LINEAR gs tap: v0 (gsec[cg]) at slice byte 0,
+        // v4 (gsec[cg], qn_s folded per token) at slice byte 16 — the kernel
+        // reads only gs[0]/gs[4] from the 32 delivered bytes.
+        const float gsec0[FUSED_NSEC] = { smax[0]/127.0f, smax[1]/127.0f, smax[2]/127.0f, smax[3]/127.0f };
+        for (size_t c = 0; c < FUSED_AIE_COLS; c++)
+            for (size_t cg = 0; cg < 4; cg++)
+                memcpy(Bm + (size_t)K * N + c * FUSED_GS_TILE
+                            + cg * FUSED_GS_SLICE, &gsec0[cg], 4);
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        col_out = std::move(col);
+    }
+
+    // ── Fused int4 GU (issue #1769, ws09): raw-Q4NX packing ──
+    // Regions A/B/C are the int4 layout (gu_i4_pack.h): nibbles [0, K*N/2),
+    // row scales [(K/32)*N*2), S_col [N*2) — then the gs-header region
+    // (unchanged, per-token ag/qn_s fold). The kernel's B-path dequant stage
+    // consumes A/B/C and feeds the unchanged int8 mmul.
+    std::unique_ptr<xrt::bo> make_fused_weight_bo_i4(xrt::device& d, int K, size_t n_cols) {
+        int grp_w = k->group_id(4);
+        uint32_t fl = XRT_BO_FLAGS_HOST_ONLY;
+        if (const char* f = getenv("NPU_WBO_FLAGS")) {
+            int v = atoi(f);
+            if (v == 0) fl = 0;
+            else if (v == 1) fl = XRT_BO_FLAGS_CACHEABLE;
+            else if (v == 2) fl = XRT_BO_FLAGS_SVM;
+        }
+        size_t sz = gu_i4_bo_size(K, (int)n_cols) + FUSED_AIE_COLS * FUSED_GS_TILE + FUSED_GS_SLACK;
+        auto bo = std::make_unique<xrt::bo>(d, sz, fl, grp_w);
+        // Same uninitialized tail as make_fused_weight_bo above, and this is the BO the RAW-Q4NX
+        // (int4) GU path uses -- which is the path Nanbeige takes (the convention probe reports
+        // "UNSIGNED nibbles", i.e. q4). The gs region beyond the packed A/B/C regions is read by
+        // the kernel as per-column scales but written by no one, so every layer's GU output was
+        // scaled by allocator contents. That is the shape of the symptom: identical input and
+        // identical norm weights, yet a hidden state after 32 layers that differs across runs
+        // (RESULTS-coverage-multifamily 62, 64, 65, 66).
+        if (void* m = bo->map()) memset(m, 0, sz);
+        return bo;
+    }
+
+    // Pack one expert's interleaved GU from RAW Q4NX into the int4 regions.
+    // col_out = S_col (per-column int8 scales — the amax pass's guGs),
+    // row_out = B_shadow (exact int8 reconstruction — the amax pass's guB).
+    void packB_into_fused_i4(xrt::bo& bo, const RawQ4Tensor& raw, int expert,
+                             int H, int n_ff, std::vector<float>& col_out,
+                             std::vector<int8_t>& row_out) {
+        auto pack = pack_gu_fused_i4(raw, expert, H, n_ff, bf16_pair);
+        uint8_t* Bm = (uint8_t*)bo.map();
+        write_gu_i4_bo(Bm, pack);
+        // gs-header region: the int4 path's SiLU uses the per-token folded
+        // per-column scales (region C rewritten per token); the legacy
+        // section header region is unused — zero it for determinism.
+        memset(Bm + gu_i4_bo_size(H, 2 * n_ff), 0,
+               FUSED_AIE_COLS * FUSED_GS_TILE + FUSED_GS_SLACK);
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        col_out = pack.scol;
+        row_out = std::move(pack.B_shadow);
+    }
+
+    // Per-token fold of the int4 SiLU scales (the int4 analogue of
+    // update_fused_header): S'[2p] = ag*S_col[2p] (gate), S'[2p+1] =
+    // ag*qn_s*S_col[2p+1] (up), written into the gs-header region (unused by
+    // the int4 path — its 1 MB is plenty for the 16 KB per-column array).
+    // Region C keeps the STATIC S_col for the kernel's B-path dequant. The
+    // kernel's silu stage reads S'[j] per column instead of gs[0]/gs[4].
+    void update_fused_header_i4(xrt::bo& bo, const std::vector<float>& scol,
+                                int n_ff, float ag, float qn_s, int N) {
+        // v65 per-tile BO (gu_i4_pack.h, TILE_TOTAL 8192): the aie2p
+        // object-fifo delivers only [0..5632) of each 8192-B tile, so the
+        // per-token silu metadata rides the CHUNKED [5120..5632) region
+        // (META_BASE): each col_group's 32 k-tiles carry a 512-B chunk
+        // (ki%4: foldG/boundG/boundU/Q+shG+shU), assembled by the kernel
+        // into C1 rows 1-4. The shared write_silu_pad_meta (gu_i4_pack.h)
+        // computes the fold — the same code the packer's first-launch init
+        // uses, so the host cannot drift.
+        const size_t n_tiles = gu_i4_bo_size(KD, N) / GuI4Pack::TILE_TOTAL;
+        const int n_tiles_n = N / 128;
+        uint8_t* Bm = (uint8_t*)bo.map();
+        for (size_t t = 0; t < n_tiles; t++) {
+            int nt = (int)(t % (size_t)n_tiles_n);
+            int ki = (int)(t / (size_t)n_tiles_n);
+            write_silu_pad_meta(Bm + t * GuI4Pack::TILE_TOTAL, scol.data(),
+                                nt, ki, ag, qn_s, N);
+        }
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE,
+                (size_t)gu_i4_bo_size(KD, N), 0);
+    }
+
+    // Fused D weights: per-column quant (like packB_into) but tile-contiguous
+    // (linear B tap in the D phase). K = n_ff, N = H (both 2048).
+    void packB_into_fused_d(xrt::bo& bo, const float* w, int K, int N,
+                            float& sout, std::vector<float>& col_out,
+                            std::vector<int8_t>& row_out) {
+        auto* Bm = (int8_t*)bo.map();
+        memset(Bm, 0, (size_t)K * N);
+        const int n_tiles_k = N / 128;
+        const int n_k = K / 64;
+        std::vector<float> col(N);
+        double ssum = 0;
+        for (int j = 0; j < N; j++) {
+            float amax = 0;
+            for (int i = 0; i < K; i++) {
+                float a = fabsf(w[(size_t)i * N + j]);
+                if (std::isfinite(a) && a > amax) amax = a;
+            }
+            if (amax < 1e-12f) amax = 1.0f;
+            col[j] = amax / 127.0f;
+            ssum += col[j];
+        }
+        row_out.resize((size_t)K * N);
+        for (int ki = 0; ki < n_k; ki++)
+            for (int nt = 0; nt < n_tiles_k; nt++) {
+                size_t tbase = ((size_t)nt * n_k + ki) * (64 * 128);  // column-major (nt,ki) — matches pack_tile_chunk
+                for (int i0 = 0; i0 < 8; i0++)
+                    for (int i1 = 0; i1 < 16; i1++)
+                        for (int i2 = 0; i2 < 8; i2++) {
+                            const int k = ki * 64 + i0 * 8 + i2;
+                            const float* src = w + (size_t)k * N + nt * 128 + i1 * 8;
+                            int8_t* d = Bm + tbase + (size_t)i0 * 1024 + i1 * 64 + i2 * 8;
+                            for (int i3 = 0; i3 < 8; i3++) {
+                                int j = nt * 128 + i1 * 8 + i3;
+                                float tis = 127.0f / (col[j] * 127.0f);  // per-column
+                                float v = src[i3];
+                                if (!std::isfinite(v)) v = 0;
+                                int x = (int)roundf(v * tis);
+                                if (x > 127) x = 127;
+                                else if (x < -127) x = -127;
+                                d[i3] = (int8_t)x;
+                                row_out[(size_t)k * N + j] = (int8_t)x;
+                            }
+                        }
+            }
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        col_out = std::move(col);
+        sout = (float)(ssum / N);
+    }
+
+    // Fold ag and qn_s into the per-column header slices
+    // (gs' = [ag·gs_g | ag·qn_s·gs_u]) and sync only the header region.
+    // Called per token, per MoE layer, before launch_fused. N = 2·n_ff.
+    void update_fused_header(xrt::bo& bo, const std::vector<float>& gs,
+                             int n_ff, float ag, float qn_s, int N) {
+        // gs = the per-column scales from packB_into_fused (section-uniform:
+        // gs[j] = gsec[j/1024]); fold ag (gate) and ag*qn_s (up) per token.
+        // The kernel's silu reads gs[0..3] (gate sections) and gs[4..7]
+        // (up sections = gate x qn_s).
+        float* base = (float*)((int8_t*)bo.map() + (size_t)KD * N);
+        // Per-col_group section header (LINEAR gs tap): the kernel reads only
+        // gs[0] and gs[4] of its gs tile = the first 32 delivered bytes =
+        // slice bytes 0..31. Tile (c, cg) covers exactly ONE GU section —
+        // index cg (cols [cg·1024, (cg+1)·1024), gate AND up), so each
+        // (c, cg) slice carries that cg's scales at bytes 0 and 16:
+        //   gs[0] = ag·gsec[cg], gs[4] = ag·qn_s·gsec[cg].
+        for (size_t c = 0; c < FUSED_AIE_COLS; c++)
+            for (size_t cg = 0; cg < FUSED_NSEC; cg++) {
+                float v0 = ag * gs[(size_t)cg * 1024];
+                float v4 = ag * qn_s * gs[(size_t)cg * 1024];
+                int8_t* sl = (int8_t*)base + c * FUSED_GS_TILE
+                             + cg * FUSED_GS_SLICE;
+                memcpy(sl + 0, &v0, 4);
+                memcpy(sl + 16, &v4, 4);
+            }
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE,
+                FUSED_AIE_COLS * FUSED_GS_TILE, (size_t)KD * N);
+    }
+
+    // FNV-1a over a BO's FULL extent. Section 68 exonerated every host INPUT (the dequantized weights
+    // are byte-identical across runs while the boot token varies), so what remains is the kernel
+    // reading a buffer nobody writes. Checking a prefix would miss exactly that, since the unwritten
+    // regions in this code are the gs scale TAILS.
+    static inline unsigned long long bo_fnv(xrt::bo& b) {
+        const unsigned char* p = (const unsigned char*)b.map();
+        size_t n = b.size();
+        unsigned long long h = 1469598103934665603ULL;
+        for (size_t i = 0; i < n; i++) { h ^= p[i]; h *= 1099511628211ULL; }
+        return h;
+    }
+
+    // One-launch fused MoE FFN (issue #1759): GU → on-core SiLU → D.
+    // xclbin path: 5 BOs behind the (opcode, instr_bo, ninstr) prefix.
+    // full-ELF path: the fused design's data args only — the instruction stream
+    // lives in the ELF, so there is no instruction BO. This requires a fused
+    // design built as a full ELF (build_zaya_fused.sh / build_zaya_split.sh);
+    // `fused_elf_capable()` reports whether that artifact was loaded.
+    inline bool fused_elf_capable() const { return elf_mode && kext != nullptr; }
+    inline xrt::run launch_fused(xrt::bo& gu_bo, xrt::bo& d_bo, xrt::bo& h2_bo,
+                                 const float* A, int am, int ak, float ascale) {
+        quantize_async(A, am, ak, ascale);
+        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        // Check ALL FIVE BOs this kernel takes, immediately before the launch (NPU_DBG=1). Whichever
+        // one differs across runs is a buffer being read without being written.
+        if (getenv("NPU_DBG")) {
+            static int chk_n = 0;
+            if (chk_n < 6) {
+                chk_n++;
+                fprintf(stderr, "[BOCHK] bA=%016llx gu=%016llx bC=%016llx d=%016llx h2=%016llx (am=%d ak=%d)\n",
+                        bo_fnv(*bA), bo_fnv(gu_bo), bo_fnv(*bC), bo_fnv(d_bo), bo_fnv(h2_bo), am, ak);
+            }
+        }
+        if (elf_mode) {
+            if (!kext) { fprintf(stderr, "  launch_fused: no full-ELF fused kernel loaded\n"); return xrt::run{}; }
+            return (*kext)(*bA, gu_bo, *bC, d_bo, h2_bo);
+        }
+        return (*k)((unsigned)3, *layerInstr[0],
+                    (unsigned)(layerInstrData[0].size()),
+                    *bA, gu_bo, *bC, d_bo, h2_bo);
+    }
+
+    // Fused D dequant: out[j] = C2[j] · (gs_d[j] / qn_s)  (ag cancels).
+    inline void dequant_fused(xrt::run& r, float* C, int am, int an,
+                              float qn_s, int layer = -1) {
+        r.wait();
+        readback();
+        const float* gs = nullptr;
+        if (layer >= 0 && (size_t)layer < group_scales.size() &&
+            (int)group_scales[layer].size() == an)
+            gs = group_scales[layer].data();
+        float iq = 1.0f / qn_s;
+        for (int m = 0; m < am; m++) {
+            const int32_t* src = Cm + (size_t)m * ND;
+            float* dst = C + (size_t)m * an;
+            for (int n = 0; n < an; n++) {
+                float val = (float)src[n] * (gs ? gs[n] : 1.0f) * iq;
+                if (!std::isfinite(val)) val = 0;
+                dst[n] = val;
+            }
+        }
+    }
+};

@@ -67,6 +67,7 @@
 #endif
 
 #ifdef ONEBIT_NPU
+#include "forward_serve.h"
 #include "unified.h"
 #endif
 #ifdef ONEBIT_LAYA
@@ -1039,6 +1040,38 @@ int serve_child(const Options& o) {
     return 1;
 }
 
+// Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
+// (Python), cached by GGUF stem so a repeated serve reuses the conversion.
+// Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
+// the cache root with ONEBIT_Q4NX_CACHE.
+std::string repack_gguf(const std::string& gguf) {
+    const std::string stem = fs::path(gguf).stem().string();
+    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
+    if (cache.empty()) {
+        const char* home = std::getenv("HOME");
+        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
+    }
+    const std::string out = cache + "/" + stem;
+    if (fs::exists(out + "/model.q4nx")) return out;
+
+    const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
+    const std::string python = py ? py : "/home/bcloud/zaya-venv/bin/python3";
+    const char* rp = std::getenv("ONEBIT_Q4NX_REPACK");
+    const std::string script = rp ? rp : "/home/bcloud/1bit-engine/scripts/repack_gguf.py";
+    const char* cv = std::getenv("ONEBIT_Q4NX_CONVERTER");
+    if (!fs::exists(python)) throw std::runtime_error("Q4NX repack python not found: " + python + " (set ONEBIT_Q4NX_PYTHON)");
+    if (!fs::exists(script)) throw std::runtime_error("Q4NX repack script not found: " + script + " (set ONEBIT_Q4NX_REPACK)");
+
+    std::fprintf(stderr, "1bit serve: repacking %s -> %s ...\n", gguf.c_str(), out.c_str());
+    fs::create_directories(out);
+    std::string cmd = "\"" + python + "\" \"" + script + "\" \"" + gguf + "\" \"" + out + "\"";
+    if (cv) cmd += " \"" + std::string(cv) + "\"";
+    const int rc = std::system(cmd.c_str());
+    if (rc != 0 || !fs::exists(out + "/model.q4nx"))
+        throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + cmd);
+    return out;
+}
+
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
@@ -1151,6 +1184,20 @@ int run_serve(int argc, char** argv) {
 #endif
     }
     if (o.device == "mlx") return serve_child(o);
+#ifdef ONEBIT_NPU
+    if (fs::path(o.model).extension() == ".gguf" && o.device == "npu") {
+        // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
+        // directory, then serve it through the model-generic forward in process.
+        const std::string dir = repack_gguf(o.model);
+        const char* kernels = std::getenv("ONEBIT_NPU_KERNELS");
+        std::vector<std::string> args = {"-m", dir + "/model.q4nx", "--kernels",
+                                         kernels ? kernels : "", "-p", std::to_string(o.port), "--host", o.host};
+        if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+        std::vector<char*> av;
+        for (auto& s : args) av.push_back(s.data());
+        return run_forward_serve(int(av.size()), av.data());
+    }
+#endif
     if (fs::path(o.model).extension() == ".gguf") return serve_child(o);
     throw std::runtime_error(o.model + ": expected an NPU model directory or a .gguf file");
 }

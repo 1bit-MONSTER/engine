@@ -373,6 +373,22 @@ if(ONEBIT_NPU)
     target_link_libraries(onebit PRIVATE onebit_npu_lane)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU)
     set_target_properties(onebit PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib INSTALL_RPATH ${ONEBIT_XRT_ROOT}/lib)
+
+    # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
+    # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
+    # + model loader, against the engine tree's I8Ctx header.
+    add_library(onebit_npu_forward STATIC
+        npu/forward/src/model.c
+        npu/forward/src/q4nx_dequant.c
+        npu/forward/src/q4nx_pack.c
+        npu/forward/src/q4nx_semantics.c
+        npu/forward/src/q4nx_forward.cpp)
+    target_include_directories(onebit_npu_forward SYSTEM PUBLIC
+        npu/forward/include npu/forward/engine-src ${ONEBIT_XRT_ROOT}/include)
+    target_link_libraries(onebit_npu_forward PUBLIC
+        ${ONEBIT_XRT_ROOT}/lib/libxrt_coreutil.so aiebu uuid dl pthread m)
+    target_sources(onebit PRIVATE app/forward_serve.cpp)
+    target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
     set(ONEBIT_NPU_REFERENCE "" CACHE PATH "Reference lane's logits for the anchor prompt")
     if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_KERNELS AND ONEBIT_NPU_REFERENCE)

@@ -81,3 +81,10 @@
 [submodule "third_party/ryzenai-server"]
 	path = third_party/ryzenai-server
 	url = https://github.com/lemonade-sdk/ryzenai-server
+# DwarfStar (docs/dwarfstar.md): upstream antirez/ds4, built by scripts/build-ds4.sh;
+# .github/workflows/bump-ds4.yml keeps it current.
+[submodule "third_party/ds4"]
+	path = third_party/ds4
+	url = https://github.com/antirez/ds4.git
+	shallow = true
+	branch = main

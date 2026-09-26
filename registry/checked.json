@@ -211,13 +211,23 @@
   },
   {
    "backend": "vulkan",
+   "model": "zyphra/Zamba-7B-v1-Q8_0.gguf",
+   "arch": "zamba",
+   "passed": true,
+   "said": "The capital of France is Paris.<|im_end|>",
+   "failed": [],
+   "date": "2026-09-26",
+   "engine": "357e7bcc52bb"
+  },
+  {
+   "backend": "vulkan",
    "model": "zyphra/Zamba2-1.2B-instruct-Q8_0.gguf",
    "arch": "zamba2",
    "passed": true,
    "said": "Paris.",
    "failed": [],
    "date": "2026-09-26",
-   "engine": "6abadd3d9a0c"
+   "engine": "357e7bcc52bb"
   },
   {
    "backend": "vulkan",

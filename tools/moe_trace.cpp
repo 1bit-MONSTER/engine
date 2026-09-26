@@ -53,6 +53,8 @@
 #include <sstream>
 #include <string>
 #include <vector>
+#include <cerrno>
+#include <fcntl.h>
 
 static std::map<int, std::vector<std::vector<int>>> g_cur;  // layer -> token rows of the step running now
 static std::map<int, std::vector<float>> g_lout;               // layer -> l_out of a one-token step
@@ -228,7 +230,11 @@ int main(int argc, char** argv) {
     if (!ctx) return 1;
     const llama_vocab* vocab = llama_model_get_vocab(model);
     auto* smpl = llama_sampler_init_greedy();
-    Writer w; w.f = fopen(a[4], "w");
+    Writer w;
+    // the trace is data for the owner: 0644, not fopen's 0666 left to the umask
+    const int tfd = open(a[4], O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0644);
+    w.f = tfd < 0 ? nullptr : fdopen(tfd, "w");
+    if (!w.f) { fprintf(stderr, "cannot write %s: %s\n", a[4], strerror(errno)); return 1; }
     int n_past = 0;
 
     auto tokenize = [&](const std::string& text, bool bos) {

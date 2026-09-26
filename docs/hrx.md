@@ -214,6 +214,34 @@ architectures do not wait for AMD's pair: see [vulkan.md](vulkan.md). This build
 still has a Vulkan backend, which `--device vulkan` uses when `ONEBIT_VULKAN` is
 off.
 
+### The GPU's matrix units (WMMA)
+
+The Radeon 8060S (gfx1151, RDNA 3.5) has RDNA3's six matrix instructions, all on 16×16×16 tiles.
+The rates come from AMD's
+[matrix instruction calculator](https://github.com/ROCm/amd_matrix_instruction_calculator) (commit
+`2ef9189`), for example
+`uv run --with tabulate python3 matrix_calculator.py -a rdna3 -i v_wmma_i32_16x16x16_iu4 -d -w 32`:
+
+| Instruction | Inputs | Per WGP per clock | Cycles |
+|---|---|---|---|
+| `v_wmma_f32_16x16x16_f16` / `_bf16` | f16 / bf16, f32 accumulate | 1024 FLOPs | 32 |
+| `v_wmma_f16_16x16x16_f16`, `v_wmma_bf16_16x16x16_bf16` | same, 16-bit accumulate | 1024 FLOPs | 32 |
+| `v_wmma_i32_16x16x16_iu8` | int8 × int8 | 1024 ops | 32 |
+| `v_wmma_i32_16x16x16_iu4` | int4 × int4 | 2048 ops | 16 |
+
+- int8 runs at the f16 rate. Converting activations to int8 saves memory traffic, not matrix time.
+  Only int4 × int4 doubles the rate.
+- WMMA does not co-execute with other vector instructions.
+- In wave32, A and B are held twice, in lanes 0–15 and again in 16–31. `-A -R` (or `-B`, `-C`,
+  `-D`) prints the register and lane of every element.
+- This box reports 40 compute units (20 WGPs) at up to 2,900 MHz (`rocminfo`). That gives a
+  theoretical peak of about 59 TFLOPS for f16 and 119 TOPS for int4. These are computed from the
+  table, not measured. They bound prefill; decode is limited by memory bandwidth.
+
+HRX's WMMA kernels (e.g. `flash_attention_decode_split_f32_f16_wmma`) load and store fragments
+through the kernel compiler, which places them in these layouts. The fragment sizes match the
+table: 16 f16 inputs and 4 f32 results per lane in wave64.
+
 ## Build
 
 ```bash

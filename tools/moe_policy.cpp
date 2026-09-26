@@ -26,6 +26,13 @@
 // Prefetch: for each decode miss at layer l+1, whether it was among the experts layer l+1 used
 // for the previous token, or among the next layer's most likely experts given this layer's
 // (co-occurrence counted so far), P predictions per routed expert.
+// Drive ceiling (env MOE_EXPERT_MIB, MOE_COMPUTE_MS, MOE_DRIVE_GBS default 3.7): for the shared
+// LRU at each cap, the decode rate when every miss is read from the drive, serially after the
+// compute (no overlap) and fully hidden behind it (perfect overlap).
+// MTP (env MOE_MTP="n accepted", e.g. "3 2.2"): each verification step routes a window of n+1
+// consecutive decoded tokens, so a layer reads the union of their experts; the window then
+// advances by the accepted tokens per step. Rejected drafts are approximated by the real next
+// tokens. Prints experts read per generated token with and without MTP (shared LRU).
 // Build: g++ -std=c++17 -O2 tools/moe_policy.cpp -o moe_policy
 #include <algorithm>
 #include <cstdio>
@@ -289,5 +296,46 @@ int main(int argc, char** argv) {
         fflush(stdout);
     }
     for (int cap : caps) if (cap < t.n_exp) prefetch(t, cap, 2);
+    if (getenv("MOE_MTP")) {
+        int n = 3; double acc = 2.0;
+        sscanf(getenv("MOE_MTP"), "%d %lf", &n, &acc);
+        std::vector<size_t> dec;
+        for (size_t s = 0; s < t.routes.size(); s++) if (t.is_decode[s]) dec.push_back(s);
+        for (int cap : caps) {
+            if (cap >= t.n_exp) continue;
+            LRU plain(cap * t.n_layer), mtp(cap * t.n_layer);
+            long miss_plain = 0, miss_mtp = 0, steps = 0;
+            // warm both with the prompt
+            for (size_t s = 0; s < t.routes.size() && !t.is_decode[s]; s++)
+                for (int l = 0; l < t.n_layer; l++) for (int e : t.routes[s][l]) { plain.touch(l * t.n_exp + e); mtp.touch(l * t.n_exp + e); }
+            for (size_t s : dec) for (int l = 0; l < t.n_layer; l++) for (int e : t.routes[s][l]) miss_plain += !plain.touch(l * t.n_exp + e);
+            double pos = 0;
+            while (pos < dec.size()) {
+                const size_t i0 = (size_t) pos, i1 = std::min(dec.size(), i0 + n + 1);
+                for (int l = 0; l < t.n_layer; l++) {
+                    std::set<int> u;
+                    for (size_t i = i0; i < i1; i++) for (int e : t.routes[dec[i]][l]) u.insert(e);
+                    for (int e : u) miss_mtp += !mtp.touch(l * t.n_exp + e);
+                }
+                steps++;
+                pos += acc;
+            }
+            const double toks = dec.size();
+            printf("MTP n=%d, %.2f accepted/step @%d/layer: %.1f expert reads per generated token (%.1f without MTP), %.2f per step\n",
+                   n, acc, cap, miss_mtp / toks, miss_plain / toks, (double) miss_mtp / std::max(1L, steps));
+        }
+    }
+    if (getenv("MOE_EXPERT_MIB") && getenv("MOE_COMPUTE_MS")) {
+        const double mib = atof(getenv("MOE_EXPERT_MIB")), comp = atof(getenv("MOE_COMPUTE_MS"));
+        const double gbs = getenv("MOE_DRIVE_GBS") ? atof(getenv("MOE_DRIVE_GBS")) : 3.7;
+        const double per_tok = double(t.n_layer) * t.top_k;  // routed experts per token (MoE layers)
+        for (int cap : caps) {
+            if (cap >= t.n_exp) continue;
+            const double miss = 1.0 - global_lru(t, cap) / 100.0;
+            const double io_ms = per_tok * miss * mib * 1048576.0 / (gbs * 1e9) * 1e3;
+            printf("drive ceiling @%d/layer (g-lru, %.2f MiB/expert, %.1f GB/s): %.1f MB/token read; %.1f tok/s serial, %.1f tok/s overlapped (compute alone %.1f)\n",
+                   cap, mib, gbs, per_tok * miss * mib * 1.048576, 1000.0 / (comp + io_ms), 1000.0 / std::max(comp, io_ms), 1000.0 / comp);
+        }
+    }
     return 0;
 }

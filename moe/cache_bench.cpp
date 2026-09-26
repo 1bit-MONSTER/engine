@@ -90,7 +90,9 @@ void usage() {
         "  --slots N           experts held in RAM (default 1024)\n"
         "  --per-layer         slots / layers per layer instead of one shared LRU\n"
         "  --io N              reads in flight (default 8)\n"
-        "  --prefetch none|k|2k  gate-ahead prefetch of the trace's predictions (default k)\n"
+        "  --prefetch none|k|2k|oracle  gate-ahead prefetch of the trace's predictions (default k);\n"
+        "                      oracle queues every layer's real experts when a token starts: the\n"
+        "                      bound for a perfect predictor with every read in flight at once\n"
         "  --lookahead 1|2     prefetch a layer's experts at its own start (1, from the previous\n"
         "                      layer's output) or one layer earlier (2, from two layers back)\n"
         "  --compute-ms X      compute per token when every expert is resident (default 20)\n"
@@ -129,7 +131,8 @@ int run_moe_cache(int argc, char** argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     if (model.empty() || trace.empty()) { usage(); return 2; }
-    if (prefetch != "none" && prefetch != "k" && prefetch != "2k") throw std::runtime_error("--prefetch none|k|2k");
+    if (prefetch != "none" && prefetch != "k" && prefetch != "2k" && prefetch != "oracle")
+        throw std::runtime_error("--prefetch none|k|2k|oracle");
 
     const GgufIndex index = GgufIndex::open(model);
     const auto tokens = load_trace(trace);
@@ -153,9 +156,11 @@ int run_moe_cache(int argc, char** argv) {
         cache.prefetch(l, std::vector<int>(it->second.begin(), it->second.begin() + std::min(k, it->second.size())));
     };
     auto run_token = [&](const Token& t, bool timed) {
+        if (timed && prefetch == "oracle")
+            for (const auto& [l, experts] : t.routes) if (index.experts.count(l)) cache.prefetch(l, experts);
         for (const auto& [l, experts] : t.routes) {
             if (!index.experts.count(l)) continue;
-            if (timed && prefetch != "none") {
+            if (timed && prefetch != "none" && prefetch != "oracle") {
                 if (lookahead == 1) issue(t, l, t.pred);
                 else issue(t, l + 1, t.pred2);  // the next layer's experts, while this layer runs
             }

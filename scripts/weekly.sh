@@ -73,7 +73,7 @@ guard() {
 checkout() {  # checkout <ref> [pr number to merge on top]
     [ -d "$SRC/.git" ] || git clone -q "https://github.com/$REPO.git" "$SRC"
     git -C "$SRC" fetch -q origin "$1"
-    git -C "$SRC" checkout -q --detach FETCH_HEAD
+    git -C "$SRC" checkout -q -f --detach FETCH_HEAD   # the workspace is ours: a stray edit never blocks a run
     if [ -n "${2:-}" ]; then
         git -C "$SRC" fetch -q origin "pull/$2/head"
         git -C "$SRC" -c user.name=weekly -c user.email=weekly@1bit.gg merge -q --no-edit FETCH_HEAD

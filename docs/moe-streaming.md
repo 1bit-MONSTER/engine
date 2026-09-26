@@ -144,6 +144,29 @@ What the traces show:
 - **The bound is 5-16 points higher** at quarter-size caches, so a smarter policy still has
   room. The traces are kept, so any policy can be tried on the same data.
 
+### Classic policies don't close the gap
+
+Three scan- and frequency-aware policies from storage caching, each over the shared budget
+(`tools/moe_policy.cpp`): ARC (adapts between a recency and a frequency list, with ghost
+lists), LRU-2 (evicts the expert whose second-to-last use is oldest), and W-TinyLFU as in
+Caffeine (a 1% or 10% LRU window; an expert leaving it enters the main cache only if it was
+used more often than the main cache's victim). Decode hit rate:
+
+| trace | cache / layer | g-lru | g-arc | g-lru2 | g-tlfu 1% | g-tlfu 10% | opt |
+|---|---|---|---|---|---|---|---|
+| Coder-30B code | 16 | 48.8 | 49.2 | 47.9 | 46.6 | 44.6 | 68.8 |
+| | 32 | 68.2 | 67.2 | 66.6 | 65.8 | 65.8 | 83.5 |
+| Coder-30B long | 16 | 56.9 | 57.8 | 59.0 | 58.0 | 55.1 | 76.5 |
+| Flash-Next chat | 32 | 55.4 | 55.0 | 51.9 | 44.4 | 42.6 | 72.8 |
+| Flash-Next code | 16 | 39.6 | 41.3 | 42.0 | 39.1 | 37.5 | 61.0 |
+| Qwen3.6-35B chat | 64 | 80.5 | 80.8 | 80.2 | 67.6 | 75.0 | 90.8 |
+| GLM-4.7-Flash long | 32 | 82.5 | 82.5 | 83.8 | 82.6 | 84.5 | 92.5 |
+
+Across all 12 traces at 16, 32 and 64 per layer, none is more than 2.4 points above the
+shared LRU, and W-TinyLFU is up to 13 points below it (Qwen3.6 chat at 64). Routing has little
+popularity beyond recency for a frequency filter to use; the missing 7-22 points are in the
+future routes, which only a predictor can see.
+
 ### Predicting the next layer's experts
 
 A trace also records a gate-ahead prediction for every decoded token. It applies layer l's
@@ -492,8 +515,10 @@ cold first repetition):
 1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on
    Coder-30B ("Where streamed decode spends its time"). 6,144 slots (every expert) runs
    erratically on the shared box.
-2. **A smarter eviction policy.** Belady's bound is 5-16 points above the shared LRU at small
-   caches. Candidates: frequency with decay per layer, and hints from the router's scores.
+2. **Fewer misses without a better policy.** ARC, LRU-2 and W-TinyLFU don't beat the shared LRU
+   ("Classic policies don't close the gap"). What's left: routing that prefers resident
+   experts (a resident expert among the router's next choices stands in for a missing one),
+   measured on quality as well as hit rate.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams
    (hyper-connections), so the predictor needs that model's mixing step before the router.
 4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room

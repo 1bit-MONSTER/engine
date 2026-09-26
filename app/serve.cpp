@@ -49,6 +49,8 @@
 //                                                  formats) on Vulkan0 (docs/lean.md)
 //   --mtp <head.gguf> on any llama.cpp route    -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
+//   --mmproj <mmproj.gguf> on any llama.cpp route -> images: the vision encoder runs beside the
+//                                                  model, and chat messages may carry image parts
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
@@ -123,6 +125,7 @@ struct Options {
     int prefill_min_tokens = 0;
     bool lean = false;
     std::string mtp;
+    std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
     std::string mtp_p_min;
     int parallel = 0;
@@ -170,8 +173,13 @@ std::string default_llama_server(const std::string& device) {
 // Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
 // does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
 bool fork_only_arch(const std::string& gguf) {
+    // Zyphra ZAYA1 (docs/vulkan.md); OPT, CodeGen, GPT-Neo and GPT-J (llama.cpp #8: upstream has
+    // no model for them, gptj only a name). Keep in step with FORK_ONLY in tools/registry_build.py.
+    static const char* const archs[] = {"zaya", "opt", "codegen", "gptneo", "gptj"};
     const std::string arch = gguf_architecture(gguf);
-    return arch == "zaya";  // Zyphra ZAYA1 (docs/vulkan.md)
+    for (const char* a : archs)
+        if (arch == a) return true;
+    return false;
 }
 
 // --lean: the llama-server built from ROCmFPX (ONEBIT_LEAN), whose formats upstream
@@ -535,8 +543,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (device == "onnx") {
         // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
         // the model's genai_config.json
-        if (o.parallel > 1 || !o.mtp.empty() || o.lean || !o.prefill_device.empty())
-            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --lean or --prefill-device");
+        if (o.parallel > 1 || !o.mtp.empty() || o.lean || !o.prefill_device.empty() || !o.mmproj.empty())
+            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --lean, --prefill-device or --mmproj");
         argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
         return l;
@@ -605,6 +613,10 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
+    }
+    if (!o.mmproj.empty()) {
+        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
+        argv.insert(argv.end(), {"--mmproj", o.mmproj});
     }
     return l;
 }
@@ -951,6 +963,7 @@ void usage(FILE* out) {
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
@@ -989,6 +1002,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
+        else if (a == "--mmproj") o.mmproj = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();
         else if (a == "--parallel") o.parallel = std::stoi(next());
@@ -1014,6 +1028,7 @@ int run_serve(int argc, char** argv) {
     }
     if (fs::is_directory(o.model)) {
         if (o.lean) throw std::runtime_error("--lean serves a .gguf (ROCmFP4 or ROCmI4)");
+        if (!o.mmproj.empty()) throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
         if (o.device != "auto" && o.device != "npu")
             throw std::runtime_error("an NPU model directory runs on --device npu");
 #ifdef ONEBIT_NPU

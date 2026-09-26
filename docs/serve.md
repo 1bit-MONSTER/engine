@@ -26,7 +26,7 @@ OpenAI client.
            [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
-           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
+           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
@@ -94,6 +94,15 @@ else the build's copy, else the first one under `/opt/rocm-therock`.
 
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`, `-DONEBIT_DS4`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC` / `$ONEBIT_DS4`, then `llama-server` / `zinc` / `ds4-server` on PATH.
+
+## Images (`--mmproj`)
+
+`--mmproj <mmproj.gguf>` hands llama-server a vision projector on the llama.cpp routes
+(vulkan, hrx, rocm). Chat messages may then carry `image_url` parts (a `data:` URL or a file
+URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes from
+`convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. Zyphra's Zamba2-VL, for one,
+is in [docs/vulkan.md](vulkan.md). The NPU, ZINC, DwarfStar, MLX and ONNX routes take no
+`--mmproj`.
 
 ## Multi-token prediction (`--mtp`)
 

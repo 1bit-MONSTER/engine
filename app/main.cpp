@@ -21,6 +21,8 @@
 //                                    OpenAI endpoints; serve's NPU route.
 //   1bit npu-run [options]           token ids in, token ids out, on the NPU fast
 //                                    lane (docs/npu.md); for checks and benchmarks.
+//   1bit moe-cache [options]         replays an expert trace through the MoE expert
+//                                    cache against the model file (docs/moe-streaming.md).
 //   1bit <command> [options]         a command a private NPU add-on registered
 //                                    (-DONEBIT_NPU_PRIVATE builds; docs/npu.md).
 //
@@ -37,6 +39,9 @@
 #include "scorer.h"
 #endif
 #include "serve.h"
+#ifdef ONEBIT_MOE
+#include "cache_bench.h"
+#endif
 
 #include <chrono>
 #include <cstdio>
@@ -76,6 +81,9 @@ void usage(FILE* out) {
                  "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
 #ifdef ONEBIT_LAYA
                  "  route [options]             pick a device for a request via the Laya scorer\n"
+#endif
+#ifdef ONEBIT_MOE
+                 "  moe-cache [options]         replay an expert trace through the MoE expert cache\n"
 #endif
                  "  version                     print the version\n"
                  "  help                        show this help\n");
@@ -327,6 +335,16 @@ int main(int argc, char** argv) {
             return run_route(argc - 2, argv + 2);
         } catch (const std::exception& e) {
             std::fprintf(stderr, "1bit route: %s\n", e.what());
+            return 1;
+        }
+    }
+#endif
+#ifdef ONEBIT_MOE
+    if (cmd == "moe-cache") {
+        try {
+            return onebit::moe::run_moe_cache(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit moe-cache: %s\n", e.what());
             return 1;
         }
     }

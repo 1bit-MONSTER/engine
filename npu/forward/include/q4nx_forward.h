@@ -124,6 +124,7 @@ private:
     std::vector<std::vector<float>> in_norm_, post_norm_;   // [NL][H]
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
+    std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
     std::vector<float> final_norm_;                         // [H]
 
     // Per-layer dequantized projections (reused each layer, chunked by design)

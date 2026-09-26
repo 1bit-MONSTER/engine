@@ -101,6 +101,14 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
         cfg["eos_token_id"] = int(eos)
     if arch in ATTENTION_BIAS_ARCHES:
         cfg["attention_bias"] = True
+    # LongRoPE (MiniCPM4): the GGUF ships rope_factors_short.weight; carry the
+    # short factor through config.json so the forward can apply it.
+    for t in reader.tensors:
+        if getattr(t, "name", "") == "rope_factors_short.weight":
+            import numpy as np
+            sf = np.frombuffer(t.data, dtype=np.float32).tolist()
+            cfg["rope_scaling"] = {"rope_type": "longrope", "short_factor": sf}
+            break
     with open(os.path.join(out_dir, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
     return cfg
@@ -127,15 +135,19 @@ def main():
         print("converter failed")
         return 1
 
-    # Vocab size from the tokenizer the converter wrote.
-    tok = os.path.join(out_dir, "tokenizer.json")
+    # Vocab size from the Q4NX the converter wrote. The converter pads the
+    # vocab rows to a multiple of the 32-row Q4NX tile (MiniCPM4-8B: 73448 ->
+    # 73472); the forward must dequantize with the PADDED size or it fails.
     vocab_size = 0
-    if os.path.exists(tok):
-        try:
-            with open(tok) as f:
-                vocab_size = len(json.load(f).get("model", {}).get("vocab", {}))
-        except Exception:
-            vocab_size = 0
+    q4nx = os.path.join(out_dir, "model.q4nx")
+    if os.path.exists(q4nx):
+        import struct as _struct
+        with open(q4nx, "rb") as f:
+            hsz = _struct.unpack("<Q", f.read(8))[0]
+            d = json.loads(f.read(hsz))
+        emb = d.get("model.embed_tokens.weight") or d.get("lm_head.weight")
+        if emb and len(emb.get("shape", [])) == 2:
+            vocab_size = emb["shape"][0]
 
     # Arch from the GGUF metadata.
     from gguf import GGUFReader

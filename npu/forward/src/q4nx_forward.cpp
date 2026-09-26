@@ -16,6 +16,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 
 #include <xrt/xrt_device.h>
 
@@ -60,6 +61,30 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     if (cb == Q4NX_TILE_BYTES || cb == Q4NX_CHUNK_Q4K || cb == Q4NX_CHUNK_Q8)
         return q4nx_dequant_tensor_chunked((const uint8_t*)data, nbytes, rows, cols, cb, out);
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
+}
+
+// LongRoPE short_factor from config.json's rope_scaling (MiniCPM4). Returns the
+// per-half-dim frequency multipliers (empty when the config has none).
+static std::vector<float> read_rope_short_factor(const std::string& cfg_path) {
+    std::vector<float> out;
+    std::ifstream f(cfg_path);
+    if (!f) return out;
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const char* p = strstr(s.c_str(), "short_factor");
+    if (!p) return out;
+    const char* b = strchr(p, '[');
+    if (!b) return out;
+    const char* e = strchr(b, ']');
+    if (!e) return out;
+    const char* q = b + 1;
+    while (q < e) {
+        char* end = nullptr;
+        const float v = strtof(q, &end);
+        if (end == q) break;
+        out.push_back(v);
+        q = end;
+    }
+    return out;
 }
 
 Q4nxNpuForward::Q4nxNpuForward() {}
@@ -152,6 +177,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             hd = cfg.hidden_size / cfg.num_attention_heads;
         if (hd > 0) cfg.head_dim = hd;
     }
+    rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     mw_ = model_load(model_path, cfg);
     if (!mw_) { err_ = "model_load failed"; return false; }
 
@@ -1084,6 +1110,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                 if (i >= rot / 2) inv = 0.0;
             } else {
                 inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
+                if (i < (int)rope_scale_.size()) inv *= (double)rope_scale_[i];  // LongRoPE
             }
             const double ang = (double)pos * inv;
             cos_[i] = (float)std::cos(ang);

@@ -27,6 +27,7 @@ import datetime as dt
 import json
 import re
 import subprocess
+import urllib.request
 
 # path -> (name people know it by, repo whose releases count, repo the "(#N)" in commit titles
 # refers to); the compare runs on the pinned repo, which for our forks holds upstream's commits
@@ -44,6 +45,23 @@ UPSTREAMS = {
     "ds4": ("DwarfStar", "antirez/ds4", None),
     "comfyui.cpp": ("ComfyUI.cpp", None, None),
     "linux": ("Linux kernel", None, None),
+}
+# every pin, for the Updates list at the end of the weekly post: (what it is to the engine, the
+# repo whose latest release is quoted, where its changes are read)
+PINS = {  # path -> (name, what it is to the engine, repo whose latest release is quoted, changes)
+    "lemonade": ("Lemonade", "the server the engine runs inside", "lemonade-sdk/lemonade", "https://github.com/lemonade-sdk/lemonade/releases"),
+    "llama.cpp-vulkan": ("llama.cpp", "ggml-org; Vulkan and lean builds", "ggml-org/llama.cpp", "https://github.com/ggml-org/llama.cpp/releases"),
+    "llama.cpp": ("HRX llama.cpp", "our patches on AMD's ggml-hrx", None, "https://github.com/1bit-MONSTER/llama.cpp/commits/1bit/hrx-vulkan-patched"),
+    "hrx-system": ("hrx-system", "ROCm", "ROCm/hrx-system", "https://github.com/ROCm/hrx-system/commits/main"),
+    "xdna-driver": ("xdna-driver", "AMD NPU driver + XRT", "amd/xdna-driver", "https://github.com/amd/xdna-driver/commits/main"),
+    "llama.cpp-rocmfpx": ("ROCmFPX", "ROCmFP4 / ROCmI4 lean quants", None, "https://github.com/charlie12345/ROCmFPX/commits"),
+    "zinc": ("ZINC", "NVIDIA and Apple GPUs", "zolotukhin/zinc", "https://github.com/zolotukhin/zinc/commits"),
+    "laya": ("Laya", "router scorer", "NandhaKishorM/laya", "https://github.com/NandhaKishorM/laya/releases"),
+    "tokenizers": ("tokenizers", "Hugging Face", "huggingface/tokenizers", "https://github.com/huggingface/tokenizers/releases"),
+    "ryzenai-server": ("ryzenai-server", "ONNX Runtime GenAI", "lemonade-sdk/ryzenai-server", "https://github.com/lemonade-sdk/ryzenai-server/releases"),
+    "ds4": ("DwarfStar", "antirez/ds4", "antirez/ds4", "https://github.com/antirez/ds4/commits"),
+    "comfyui.cpp": ("ComfyUI.cpp", "ComfyUI in C++", None, "https://github.com/1bit-MONSTER/comfyui.cpp/commits"),
+    "linux": ("Linux", "amdxdna driver source", None, "https://github.com/torvalds/linux/commits"),
 }
 KEEP = 80  # commits per upstream kept in changes.json
 PR = re.compile(r"\(#(\d+)\)\s*$")
@@ -119,6 +137,82 @@ def releases(repo: str, after: dt.datetime, until: dt.datetime) -> list[dict]:
     return out
 
 
+def pins(src: str, rev: str, mods: dict[str, str]) -> list[dict]:
+    """every pinned upstream at rev: commit, its date, the upstream's latest release"""
+    out = []
+    for path, repo in mods.items():
+        key = path.removeprefix("third_party/")
+        sha = pin(src, rev, path)
+        if not sha:
+            continue
+        name, what, rel_repo, changes = PINS.get(key, (key, "", None, f"https://github.com/{repo}/commits"))
+        p = {"path": path, "name": name, "what": what, "sha": sha[:7], "changes": changes}
+        try:
+            p["date"] = gh(f"repos/{repo}/commits/{sha}")["commit"]["committer"]["date"][:10]
+        except subprocess.CalledProcessError:
+            p["date"] = None
+        if rel_repo:
+            try:
+                r = gh(f"repos/{rel_repo}/releases/latest")
+                p["release"] = {"tag": r["tag_name"], "date": r["published_at"][:10], "url": r["html_url"]}
+            except subprocess.CalledProcessError:
+                pass
+        if key == "linux":
+            p["version"] = linux_version(sha)
+        out.append(p)
+    out.sort(key=lambda p: list(PINS).index(p["path"].removeprefix("third_party/"))
+             if p["path"].removeprefix("third_party/") in PINS else 99)
+    return out
+
+
+def show(src: str, rev: str, path: str):
+    try:
+        return json.loads(run("git", "-C", src, "show", f"{rev}:{path}"))
+    except (subprocess.CalledProcessError, json.JSONDecodeError):
+        return None
+
+
+def lemonade_models(sha: str | None) -> dict:
+    """Lemonade's model catalog (server_models.json) at a pin of the fork, else of upstream"""
+    if not sha:
+        return {}
+    for repo in ("1bit-MONSTER/lemonade", "lemonade-sdk/lemonade"):
+        try:
+            c = gh(f"repos/{repo}/contents/src/cpp/resources/server_models.json?ref={sha}")
+            return json.loads(base64.b64decode(c["content"]))
+        except (subprocess.CalledProcessError, KeyError, json.JSONDecodeError):
+            continue
+    return {}
+
+
+def models(src: str, old: str, new: str, after: dt.datetime) -> dict:
+    """what became runnable this week: architectures the registry gained (or that gained a
+    backend), models added to Lemonade's catalog, and models published under our HF org"""
+    out = {"architectures": [], "lemonade": [], "huggingface": []}
+    a, b = show(src, old, "registry/architectures.json"), show(src, new, "registry/architectures.json")
+    if a and b:
+        before, now = a.get("architectures", {}), b.get("architectures", {})
+        for arch, v in now.items():
+            gained = sorted(set(v.get("backends", [])) - set(before.get(arch, {}).get("backends", [])))
+            if gained:
+                out["architectures"].append({"architecture": arch, "new": arch not in before, "backends": gained})
+    la = lemonade_models(pin(src, old, "third_party/lemonade"))
+    lb = lemonade_models(pin(src, new, "third_party/lemonade"))
+    if la and lb:
+        out["lemonade"] = [{"name": k, "recipe": v.get("recipe"), "checkpoint": v.get("checkpoint"),
+                            "labels": v.get("labels", [])} for k, v in lb.items() if k not in la]
+    try:
+        q = "https://huggingface.co/api/models?author=1bit-MONSTER&sort=createdAt&direction=-1&limit=50"
+        req = urllib.request.Request(q, headers={"User-Agent": "1bit-weekly (https://1bit.gg)"})
+        for m in json.load(urllib.request.urlopen(req, timeout=30)):
+            if m.get("createdAt") and dt.datetime.fromisoformat(m["createdAt"].replace("Z", "+00:00")) > after:
+                out["huggingface"].append({"id": m["id"], "url": f"https://huggingface.co/{m['id']}",
+                                           "created": m["createdAt"][:10]})
+    except OSError:
+        pass
+    return out
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True)
@@ -174,7 +268,8 @@ def main() -> None:
 
     data = {"tag": a.tag, "previous": a.previous or None, "date": new_date.date().isoformat(),
             "engine_from": a.old, "engine_to": run("git", "-C", a.src, "rev-parse", a.new).strip(),
-            "upstreams": ups, "engine": engine, "bumps": bumps}
+            "upstreams": ups, "engine": engine, "bumps": bumps, "pins": pins(a.src, a.new, mods),
+            "models": models(a.src, a.old, a.new, old_date)}
     json.dump(data, open(a.json, "w"), indent=1)
 
     md = [f"Weekly build of 1bit engine at the pins below"
@@ -199,6 +294,16 @@ def main() -> None:
             md.append(f"- {c['title']}{pr} @{c['author']}")
         if len(u["commits"]) > 25:
             md.append(f"- … and {(u.get('total') or len(u['commits'])) - 25} more")
+        md.append("")
+    mo = data["models"]
+    if any(mo.values()):
+        md += ["## New models", ""]
+        md += [f"- [{m['id']}]({m['url']}) on Hugging Face" for m in mo["huggingface"]]
+        md += [f"- {m['name']} in Lemonade's catalog ({m['recipe']}, `{m['checkpoint']}`)" for m in mo["lemonade"]]
+        md += [f"- {x['architecture']}: {'new, ' if x['new'] else ''}runs on {', '.join(x['backends'])}"
+               for x in mo["architectures"][:40]]
+        if len(mo["architectures"]) > 40:
+            md.append(f"- … and {len(mo['architectures']) - 40} more architectures")
         md.append("")
     own = [e for e in engine if not e["bump"]]
     if own:

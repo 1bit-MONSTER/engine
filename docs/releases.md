@@ -78,5 +78,8 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 
 After the release, the 1bit engine Discord gets a new post in #announcements, written from
 `changes.json` in the layout of Lemonade's release posts: what the week brings, the notable upstream
-changes with credit to their authors, the rest as a list, and the downloads. Each week's post is
-new; earlier ones stay.
+changes with credit to their authors, the rest as a list, and the downloads. Then two lists written
+straight from the data: **New models** (repos published under our Hugging Face org, models added to
+Lemonade's catalog, architectures the registry gained or that gained a backend) and **Updates** (every
+upstream as pinned in the release, with its latest release and changelog). It is the one weekly
+digest; each week's post is new and earlier ones stay.

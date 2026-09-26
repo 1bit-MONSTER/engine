@@ -134,6 +134,8 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
   | Qwen3-Coder-30B-A3B | faults 2 of 3 runs (80–88 tok/s when it survives) | 66–71 tok/s, 5 of 5 |
   | ZAYA1-8B | 23.5 tok/s | 25.5 tok/s |
 
+  (ZAYA1-8B decodes at 47.9 tok/s since the HRX kernels below.)
+
   A `GGML_HRX_DISABLE_DISPATCH` you set yourself wins, and `ONEBIT_HRX_DECODE_SPLIT=1` turns the
   kernel back on, for testing a fix.
 
@@ -190,6 +192,13 @@ BF16 is 0.063.
   views), which cannot move. Leaf (`NONE`) nodes count as covered. AMD's IQ4_NL
   and IQ4_XS matmul kernels, and GET_ROWS for IQ4_XS and batched IQ3_S, give wrong
   values, so those nodes are left to the CPU.
+- **Kernels for ops HRX sent to the CPU** ([llama.cpp #24](https://github.com/1bit-MONSTER/llama.cpp/pull/24)):
+  a batched F16 matmul (`ggml_grouped_mul_mat_f16_f32`, e.g. ZAYA's grouped convolution, whose
+  weights the loader can now place on HRX), and short-row kernels in `small_rows_f32.loom`:
+  SOFT_MAX without a mask, SUM_ROWS, ARGSORT, GET_ROWS for narrow rows (strided ids, as top-k views
+  are), CONT of strided views and broadcast-only REPEAT. Each matcher claims only what the existing
+  kernels do not. `test-backend-ops -b HRX0` passes every case of these ops. ZAYA1-8B's decode graph
+  goes from 641 graph splits to 1: 25.5 to 47.9 tok/s (tg128).
 
 Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
 

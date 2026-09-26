@@ -70,6 +70,31 @@ weights unchanged. Q8 does not fit q4_1. `tests/npu_q4nx_test.cpp` checks the de
 bit for bit against 1bit-MONSTER's verified decoders on real Qwen3.5-4B and Qwen3-0.6B
 tiles (committed in `tests/golden/q4nx`), and the repack against its rounding bound.
 
+### From a GGUF
+
+`tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model
+directory's `model.q4nx` and `config.json` from a GGUF (qwen3 only for now), and copies
+`tokenizer.json` from `--tokenizer`. It writes every projection and `lm_head` as q4_1
+tiles and the norms and embedding as bf16. A tied `lm_head` is made from `token_embd`.
+
+| GGUF type | To q4_1 | Error |
+|---|---|---|
+| Q4_0 | scale `d`, zero `-8d`, codes unchanged | bf16 rounding of scale and zero |
+| Q4_1 | scale `d`, zero `m`, codes unchanged | bf16 rounding of scale and zero |
+| Q4_K | per 32-column sub-block: scale `d*sc`, zero `-dmin*mn`, codes unchanged (a Q4_K super-block is one tile row's 256 columns) | bf16 rounding of scale and zero |
+| Q5_K, Q6_K, Q8_0, F16, BF16, F32 | dequantized, then min/max q4_1 per 32 columns | lossy |
+
+`tools/gguf_to_q4nx.py verify <model.gguf> <out dir>` decodes every tensor it wrote and
+compares it with the GGUF, dequantized. For the exact types, every weight must lie
+within the bf16 rounding bound. The requantized tensors show their error.
+
+On `Qwen3-0.6B-Q4_K_M.gguf` (unsloth), all 311 tensors pass. The Q4_K tensors have 0
+weights over the bound. The Q6_K tensors (half of `v_proj` and `down_proj`, and
+`lm_head` from the Q6_K embedding) requantize to cosine 0.9969 and relative RMS error
+0.079. The output is 683,820,936 bytes, the same size as FastFlowLM's
+`Qwen3-0.6B-NPU2` apart from the header. The directory has no `npu/` kernels, so it
+runs on the dx route.
+
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
 OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its
 onebit backend runs (`--onebit npu`).

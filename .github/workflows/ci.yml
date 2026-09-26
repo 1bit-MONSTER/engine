@@ -24,6 +24,10 @@ jobs:
       - uses: actions/checkout@v4
       - name: Copyright notice on every file
         run: python3 tools/copyright.py --check
+      - name: GGUF -> Q4NX repack
+        run: |
+          python3 -m pip install --user numpy gguf
+          python3 tests/gguf_to_q4nx_test.py
       - name: Install build dependencies
         # GCC 15, as on the Strix Halo development machine: the engine is C++26, which the
         # runner's own GCC 13 cannot build

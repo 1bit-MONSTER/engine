@@ -48,7 +48,9 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
 > source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
 > runs from our llama.cpp on Vulkan, HRX and ROCm, matching transformers, at 93 tok/s decode in
-> Q4_K_M on Vulkan ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp)). Experimental,
+> Q4_K_M on Vulkan, and ZAYA1-74B-preview at 35 tok/s
+> ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp)); the rest of Zyphra's
+> family (Zamba, Zamba2, BlackMamba) runs on Vulkan too. Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
 > has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per

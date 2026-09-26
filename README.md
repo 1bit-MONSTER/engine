@@ -26,6 +26,7 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - the XDNA 2 NPU engine
 - HRX on the Radeon iGPU, on the llama.cpp + hrx-system pair AMD tests
 - Vulkan on the Radeon iGPU, from upstream llama.cpp's latest release, so new architectures land the day upstream ships them; architectures upstream lacks, such as Zyphra's ZAYA1, run from our llama.cpp ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp))
+- MoE experts streamed from the drive on Vulkan (`1bit serve --moe-slots N`), for MoE models larger than memory ([docs/moe-streaming.md](docs/moe-streaming.md#streaming-in-the-inference-path))
 - a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming

@@ -24,7 +24,8 @@ as the router asks for them. The work splits three ways:
 - the routed experts wherever they run fastest: NPU (native int8 x int4) or GPU;
 - the NVMe feeding the cache.
 
-This page holds the measurements, the expert cache (`moe/`, `1bit moe-cache`) and the
+This page holds the measurements, the expert cache (`moe/`, `1bit moe-cache`), streaming in
+decode (`1bit serve --moe-slots`) and the
 tools that produced them (`tools/moe_trace.cpp`, `moe_policy.cpp`, `moe_expert_bench.cpp`).
 
 ## What one token needs
@@ -419,22 +420,49 @@ allocations also escape cgroup memory limits. So every big run goes through
 `scripts/mem-guard.sh <floor GB> <cmd>`, which kills the run itself when `MemAvailable` falls
 below the floor.
 
+## Streaming in the inference path
+
+`1bit serve --moe-slots N` (docs/serve.md) streams the routed experts of each MoE layer from
+the model file while it decodes. The llama.cpp Vulkan pin (fork PR #19, `1bit/moe-stream`)
+does the work, driven by environment variables that `serve` sets (`ONEBIT_MOE_FILE`,
+`ONEBIT_MOE_SLOTS`; `src/llama-moe-stream.h` lists the rest). The expert tensors load on the
+CPU memory-mapped (`-ot exps=CPU`), so their pages are read only when a prompt batch touches
+them. Batches of up to 8 tokens (decode) use the slots; prompts keep the mapped path.
+
+- **GPU mode** (the default): each layer's slots live in a Vulkan device buffer the host
+  maps, packed as expert tensors. A CPU op pins the batch's experts, reads the misses with
+  `O_DIRECT`, and turns their ids into slot indices; the regular MUL_MAT_ID then runs on the
+  GPU over the slots. A first version imported pinned host memory instead
+  (`buffer_from_host_ptr`); the GPU reads that at about 1 GB/s, and it decoded 0.1-0.3 tok/s.
+- **CPU mode** (`ONEBIT_MOE_DEVICE=cpu`): three custom ops (pin, gate/up/SwiGLU, down) on the
+  CPU's dot kernels.
+- **Correctness** (Qwen3-Coder-30B Q4_K_M, perplexity over 2 x 512 tokens): GPU mode gives
+  exactly the all-Vulkan numbers, 21.1029 with 1-token batches and 20.9475 with 4-token
+  batches.
+
+Decode speed, Qwen3-Coder-30B-A3B Q4_K_M (48 layers x 128 experts = 6,144; `llama-bench`
+`-n 64`, 5 repetitions, warm ones; the first repetition starts from empty slots):
+
+| Setup | tok/s |
+|---|---|
+| all on Vulkan0 (resident) | 79-91 |
+| experts on the CPU, memory-mapped | 25-43 |
+| streamed, 4,608 slots (75%) | 28-38 (12 cold) |
+| streamed, 3,072 slots (50%) | 17-22 |
+| streamed, 1,536 slots (25%) | 8-10 |
+
+Through `1bit serve` (a 128-token chat answer, three requests): 18.9, then 28.3 and 27.1 tok/s
+at 4,608 slots; 7.1, 6.6 and 6.0 at 1,536. The answers match the resident model's.
+
+A model that fits in memory decodes fastest resident. Streaming is for the ones that don't:
+at a quarter of the experts in memory, Coder-30B still decodes 8-10 tok/s.
+
 ## Next
 
-1. **Streaming in the inference path: running, speed not yet measured.** The llama.cpp fork
-   branch `1bit/moe-stream` streams the routed experts of each MoE layer from the model file
-   (`ONEBIT_MOE_FILE`, `ONEBIT_MOE_SLOTS`). It runs decode and small batches; prompts keep the
-   memory-mapped path.
-   - **GPU mode** (default): each layer's slot arrays are imported into Vulkan0
-     (`buffer_from_host_ptr`, unified memory) as expert tensors. A CPU op pins the batch's
-     experts and turns their ids into slot indices, and the regular MUL_MAT_ID runs on the GPU.
-   - **CPU mode**: three custom ops (pin, gate/up/SwiGLU, down) on the CPU's dot kernels.
-   - **Check** (Qwen3-Coder-30B, perplexity over 2 x 512 tokens, 4-token batches, 1,536
-     slots): 21.164 on the GPU and 21.160 on the CPU, against 21.153 unstreamed.
-   - **Speed** is still to be measured. On 2026-09-26 the shared box was out of memory (other
-     tenants held 64 GiB of GPU memory), its load average reached 17, and the device lock was
-     held by a long-running server.
-   - **Still to add:** the gate-ahead prefetch, computed on the GPU.
+1. **Faster streamed decode.** Streaming runs in the inference path (below), but at 1,536
+   slots it decodes 8-10 tok/s where the experts' reads alone would allow more. The gate-ahead
+   prefetch slows it down there, so the reads need queueing further ahead (the replays above),
+   and 6,144 slots (of 6,144 experts) runs erratically on the shared box.
 2. **A smarter eviction policy.** Belady's bound is 5-16 points above the shared LRU at small
    caches. Candidates: frequency with decay per layer, and hints from the router's scores.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams

@@ -586,6 +586,30 @@ Perplexity of the exact runs: 11.32.
 - **The drive is the limit.** At 4,608 slots, 4.0 ms per layer goes to waiting for reads
   against 1.7 ms of everything else.
 
+**Prefetch makes it worse.** On Flash-Next, the gate-ahead predictor (router l+1 applied to
+layer l's 2560-wide FFN input) is right about two times in three, but every wrong guess costs a
+read from a drive that is already the limit. At 4,608 slots, depth 1 took 247 s per pass
+against 133 s without (240 against 157 GiB read), and depth 2 took 253 s. Keep
+`ONEBIT_MOE_PREFETCH=0` on this model.
+
+**Reads in flight matter more than prefetch.** `ONEBIT_MOE_STATS` times every read. With whole
+expert parts (about 1 MiB) and 8 reader threads, a layer's misses make only 6-7 reads, and each
+1 MiB `pread` took 4.5-4.8 ms: about 1.8 GB/s, from a drive that gives 3.4 GB/s at that depth
+when the box is idle (`rdtest`: 3.2-4.1 GB/s idle, 1.3-2.9 under the other tenants' load).
+Reading parts in 256 KiB chunks with 16 threads keeps the queue deep (the streamer's default
+since fork PR #23; `ONEBIT_MOE_CHUNK_KB`, `ONEBIT_MOE_IO`):
+
+| Flash-Next, 4,608 slots | s / pass (two rounds) | pread per read |
+|---|---|---|
+| 8 threads, whole parts | 174, 177 | 4.5-4.8 ms (1 MiB) |
+| 16 threads, 256 KiB | 143, 151 | 2.0 ms |
+| 16 threads, 512 KiB | 152, 149 | 3.2 ms |
+| 32 threads, 256 KiB | 157, 205 | 3.4-4.9 ms |
+
+That is 14-18% faster, with perplexity unchanged in all 8 runs. The rounds ran at load 7-22,
+which is why the baseline here is slower than the 133-145 s above. On Coder-30B at 1,536 slots
+the change is within the noise (four rounds, 6.7 against 7.0 tok/s).
+
 ## Next
 
 1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on

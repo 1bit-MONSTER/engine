@@ -90,6 +90,7 @@ void usage() {
         "  --slots N           experts held in RAM (default 1024)\n"
         "  --per-layer         slots / layers per layer instead of one shared LRU\n"
         "  --io N              reads in flight (default 8)\n"
+        "  --chunk-kb N        read expert parts in N KiB chunks (default 0: whole parts)\n"
         "  --prefetch none|k|2k|oracle  gate-ahead prefetch of the trace's predictions (default k);\n"
         "                      oracle queues every layer's real experts when a token starts: the\n"
         "                      bound for a perfect predictor with every read in flight at once\n"
@@ -120,6 +121,7 @@ int run_moe_cache(int argc, char** argv) {
         else if (a == "--slots") opt.slots = std::stoi(next());
         else if (a == "--per-layer") opt.per_layer = true;
         else if (a == "--io") opt.io_threads = std::stoi(next());
+        else if (a == "--chunk-kb") opt.read_chunk = size_t(std::stoi(next())) << 10;
         else if (a == "--prefetch") prefetch = next();
         else if (a == "--lookahead") lookahead = std::stoi(next());
         else if (a == "--compute-ms") compute_ms = std::stod(next());

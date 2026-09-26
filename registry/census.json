@@ -4,8 +4,8 @@
   "models": 415490,
   "with_architecture": 332612,
   "architectures_seen": 2616,
-  "mapped_models": 313416,
-  "mapped_pct": 94.23,
+  "mapped_models": 314981,
+  "mapped_pct": 94.7,
   "checked_models": 213531,
   "checked_pct": 64.2,
   "per_backend": {
@@ -16,9 +16,9 @@
     "checked_pct": 64.2
    },
    "hrx": {
-    "mapped": 313110,
+    "mapped": 314675,
     "checked": 213531,
-    "mapped_pct": 94.14,
+    "mapped_pct": 94.61,
     "checked_pct": 64.2
    },
    "zinc": {
@@ -42,10 +42,6 @@
    {
     "architecture": "ParlerTTSForConditionalGeneration",
     "models": 1586
-   },
-   {
-    "architecture": "GPTNeoForCausalLM",
-    "models": 1565
    },
    {
     "architecture": "ChessForCausalLM",
@@ -134,6 +130,10 @@
    {
     "architecture": "XGLMForCausalLM",
     "models": 79
+   },
+   {
+    "architecture": "K2HorizonForCausalLM",
+    "models": 78
    }
   ]
  },

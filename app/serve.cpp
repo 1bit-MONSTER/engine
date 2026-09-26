@@ -585,6 +585,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
+        // HRX0 decode through flash_attention_decode_split gives nondeterministic, sometimes wrong
+        // attention and intermittent GPU faults (MoE models); the fallback is deterministic and, on
+        // most models, faster (#140). A GGML_HRX_DISABLE_DISPATCH the user sets wins, and
+        // ONEBIT_HRX_DECODE_SPLIT=1 turns the kernel back on, for testing a fix.
+        const char* keep_split = std::getenv("ONEBIT_HRX_DECODE_SPLIT");
+        if (device == "hrx" && !(keep_split && std::string(keep_split) == "1"))
+            env.push_back("GGML_HRX_DISABLE_DISPATCH=decode_split");
     } else if (device == "ds4") {
         // DwarfStar: its own GGUF layouts only; it opens its port after the model has loaded
         argv = {o.ds4.empty() ? default_ds4() : o.ds4, "-m", o.model,

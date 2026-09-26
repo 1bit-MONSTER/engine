@@ -4,27 +4,27 @@
   "models": 415490,
   "with_architecture": 332612,
   "architectures_seen": 2616,
-  "mapped_models": 315367,
-  "mapped_pct": 94.82,
-  "checked_models": 213531,
-  "checked_pct": 64.2,
+  "mapped_models": 315677,
+  "mapped_pct": 94.91,
+  "checked_models": 213841,
+  "checked_pct": 64.29,
   "per_backend": {
    "vulkan": {
-    "mapped": 311319,
-    "checked": 213531,
-    "mapped_pct": 93.6,
-    "checked_pct": 64.2
+    "mapped": 311629,
+    "checked": 213841,
+    "mapped_pct": 93.69,
+    "checked_pct": 64.29
    },
    "hrx": {
-    "mapped": 315061,
-    "checked": 213531,
-    "mapped_pct": 94.72,
-    "checked_pct": 64.2
+    "mapped": 315371,
+    "checked": 213841,
+    "mapped_pct": 94.82,
+    "checked_pct": 64.29
    },
    "zinc": {
-    "mapped": 231842,
+    "mapped": 232152,
     "checked": 34196,
-    "mapped_pct": 69.7,
+    "mapped_pct": 69.8,
     "checked_pct": 10.28
    },
    "npu": {
@@ -50,10 +50,6 @@
    {
     "architecture": "LlavaLlamaForCausalLM",
     "models": 451
-   },
-   {
-    "architecture": "PicoDecoderHF",
-    "models": 310
    },
    {
     "architecture": "DynamicAlibiForCausalLM",
@@ -134,6 +130,10 @@
    {
     "architecture": "Glm5NextForConditionalGeneration",
     "models": 77
+   },
+   {
+    "architecture": "MarianForCausalLM",
+    "models": 76
    }
   ]
  },

@@ -126,6 +126,7 @@ struct Options {
     bool lean = false;
     std::string mtp;
     int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM
+    std::string moe_subst;  // --moe-subst R: a resident expert scoring at least R x a missing one takes its place
     std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
     std::string mtp_p_min;
@@ -589,6 +590,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
                 throw std::runtime_error("--moe-slots works with --device vulkan, without --prefill-device");
             env.push_back("ONEBIT_MOE_FILE=" + std::filesystem::absolute(o.model).string());
             env.push_back("ONEBIT_MOE_SLOTS=" + std::to_string(o.moe_slots));
+            if (!o.moe_subst.empty()) env.push_back("ONEBIT_MOE_SUBST=" + o.moe_subst);
             argv.insert(argv.end(), {"-ot", "exps=CPU"});
         }
         if (device == "hrx" || split) {
@@ -982,7 +984,8 @@ void usage(FILE* out) {
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
-                 "                  [--moe-slots N]   stream MoE experts from the file, N held in RAM (vulkan; docs/moe-streaming.md)\n"
+                 "                  [--moe-slots N] [--moe-subst R]   stream MoE experts from the file, N held in RAM;\n"
+                 "                                    R: resident experts stand in for missing ones (vulkan; docs/moe-streaming.md)\n"
                  "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
@@ -1023,6 +1026,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--moe-slots") o.moe_slots = std::stoi(next());
+        else if (a == "--moe-subst") o.moe_subst = next();
         else if (a == "--mmproj") o.mmproj = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();

@@ -27,7 +27,7 @@ OpenAI client.
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
-           [--moe-slots N]
+           [--moe-slots N] [--moe-subst R]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
@@ -156,6 +156,12 @@ Qwen3-Coder-30B has 6,144 experts; at 4,608 slots it decodes 39 tok/s warm, at 1
 6-7 (docs/moe-streaming.md, "Streaming in the inference path"). A model that fits in memory is
 faster without it (79-91 tok/s resident). It works with the Vulkan pin's llama-server only, not
 with `--prefill-device`.
+
+`--moe-subst R` trades a little accuracy for fewer reads: when the router picks an expert that
+is not in memory, a resident one among its next choices takes its place if it scores at least
+R times as high. `0.5` cut Coder-30B's drive reads by 20-27% and sped decode up 10-35% at 1,536
+and 3,072 slots, for a KL divergence of 0.008-0.012 against the exact model (docs/moe-streaming.md,
+"Routing that prefers resident experts"). Without it, routing is exact.
 
 ## Many requests at once (`--parallel`)
 

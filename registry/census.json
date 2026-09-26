@@ -4,8 +4,8 @@
   "models": 415490,
   "with_architecture": 332612,
   "architectures_seen": 2616,
-  "mapped_models": 314981,
-  "mapped_pct": 94.7,
+  "mapped_models": 315367,
+  "mapped_pct": 94.82,
   "checked_models": 213531,
   "checked_pct": 64.2,
   "per_backend": {
@@ -16,9 +16,9 @@
     "checked_pct": 64.2
    },
    "hrx": {
-    "mapped": 314675,
+    "mapped": 315061,
     "checked": 213531,
-    "mapped_pct": 94.61,
+    "mapped_pct": 94.72,
     "checked_pct": 64.2
    },
    "zinc": {
@@ -50,10 +50,6 @@
    {
     "architecture": "LlavaLlamaForCausalLM",
     "models": 451
-   },
-   {
-    "architecture": "CodeGenForCausalLM",
-    "models": 386
    },
    {
     "architecture": "PicoDecoderHF",
@@ -134,6 +130,10 @@
    {
     "architecture": "K2HorizonForCausalLM",
     "models": 78
+   },
+   {
+    "architecture": "Glm5NextForConditionalGeneration",
+    "models": 77
    }
   ]
  },

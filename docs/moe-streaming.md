@@ -165,17 +165,21 @@ co-occurrence with the previous layer) cover under 30%.
 `moe/` holds the cache (Linux only, built into `1bit` as `ONEBIT_MOE`):
 - **`gguf_index`** reads a GGUF header, including every shard of a split file, and finds each
   routed expert's bytes: `blk.N.ffn_{gate,up,down}_exps.weight`, one slice per expert.
-- **`expert_cache`** keeps experts in pinned slots. One `mmap` region is locked with `mlock`,
-  and each slot holds all of one expert's parts, each part aligned to 4 KiB for `O_DIRECT`.
+- **`expert_cache`** keeps experts in pinned slots. One `mmap` region is locked with `mlock`.
+  Each list of slots (one per layer, or one per size class) keeps one packed array per part:
+  part k of slot i is at `part_off[k] + i * part_bytes[k]`. That is the layout of a ggml expert
+  tensor with as many experts as slots, so a GPU can compute on the slots directly.
+  `O_DIRECT` reads land in each reader thread's aligned bounce buffer and are copied into place.
   - Misses are read with `O_DIRECT`, straight from the drive into the slot, by a pool of
     reader threads, so several reads are in flight. Demand reads go ahead of prefetches.
   - `acquire(layer, experts)` blocks until the experts are resident and pins them until
     `release`. `prefetch(layer, experts)` only queues reads.
   - Eviction is LRU, over one budget shared by all layers (the replays favour it) or per layer.
   - Slots come in size classes. Unsloth's UD quants use bigger types for some layers' experts,
-    so layers are grouped by the bytes one expert needs, and each group gets its own slots
-    (same share of experts per layer). Flash-Next's 9,216 slots pin 27.0 GiB this way,
-    instead of 34.4 GiB with one slot size.
+    so layers are grouped by the byte sizes of their experts' parts, and each group gets its
+    own slots (same share of experts per layer). Flash-Next's 9,216 slots pinned 34.4 GiB with
+    one slot size and 27.0 GiB with size classes. Packing the parts brings Coder-30B's 1,536
+    slots from 4.4 to 4.1 GiB.
 - **`1bit moe-cache`** replays a trace through the cache against the real model file, with
   real reads. Compute is simulated per layer:
   1. at the layer's start, the prefetch is issued (lookahead 1: this layer's gate-ahead
@@ -417,9 +421,20 @@ below the floor.
 
 ## Next
 
-1. **Streaming in the inference path.** Route llama.cpp's MUL_MAT_ID through `ExpertCache`
-   slots, with the gate-ahead prediction computed on the GPU and the cache on the host, and
-   measure it against the `1bit moe-cache` numbers above.
+1. **Streaming in the inference path: running, speed not yet measured.** The llama.cpp fork
+   branch `1bit/moe-stream` streams the routed experts of each MoE layer from the model file
+   (`ONEBIT_MOE_FILE`, `ONEBIT_MOE_SLOTS`). It runs decode and small batches; prompts keep the
+   memory-mapped path.
+   - **GPU mode** (default): each layer's slot arrays are imported into Vulkan0
+     (`buffer_from_host_ptr`, unified memory) as expert tensors. A CPU op pins the batch's
+     experts and turns their ids into slot indices, and the regular MUL_MAT_ID runs on the GPU.
+   - **CPU mode**: three custom ops (pin, gate/up/SwiGLU, down) on the CPU's dot kernels.
+   - **Check** (Qwen3-Coder-30B, perplexity over 2 x 512 tokens, 4-token batches, 1,536
+     slots): 21.164 on the GPU and 21.160 on the CPU, against 21.153 unstreamed.
+   - **Speed** is still to be measured. On 2026-09-26 the shared box was out of memory (other
+     tenants held 64 GiB of GPU memory), its load average reached 17, and the device lock was
+     held by a long-running server.
+   - **Still to add:** the gate-ahead prefetch, computed on the GPU.
 2. **A smarter eviction policy.** Belady's bound is 5-16 points above the shared LRU at small
    caches. Candidates: frequency with decay per layer, and hints from the router's scores.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams

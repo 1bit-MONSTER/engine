@@ -152,7 +152,7 @@ as the router picks them. The rest of the model loads on Vulkan0 as usual.
 1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --moe-slots 4608 --ctx-size 8192
 ```
 
-Qwen3-Coder-30B has 6,144 experts; at 4,608 slots it decodes 27-28 tok/s warm, at 1,536 about
+Qwen3-Coder-30B has 6,144 experts; at 4,608 slots it decodes 39 tok/s warm, at 1,536 about
 6-7 (docs/moe-streaming.md, "Streaming in the inference path"). A model that fits in memory is
 faster without it (79-91 tok/s resident). It works with the Vulkan pin's llama-server only, not
 with `--prefill-device`.

@@ -452,7 +452,8 @@ Decode speed, Qwen3-Coder-30B-A3B Q4_K_M (48 layers x 128 experts = 6,144; `llam
 | streamed, 1,536 slots (25%) | 8-10 |
 
 Through `1bit serve` (a 128-token chat answer, three requests): 18.9, then 28.3 and 27.1 tok/s
-at 4,608 slots; 7.1, 6.6 and 6.0 at 1,536. The answers match the resident model's.
+at 4,608 slots; 7.1, 6.6 and 6.0 at 1,536. The answers match the resident model's. With the
+prefetch moved off the decode path (below), 4,608 slots gives 17.1, then 38.9 and 39.0.
 
 A model that fits in memory decodes fastest resident. Streaming is for the ones that don't:
 at a quarter of the experts in memory, Coder-30B still decodes 8-10 tok/s.

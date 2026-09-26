@@ -68,6 +68,11 @@ add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TAR
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
+# general.architecture from a GGUF header (app/gguf_meta.h), which routes fork-only
+# architectures to our llama.cpp; header only, runs in CI.
+add_executable(gguf_meta_test tests/gguf_meta_test.cpp)
+target_include_directories(gguf_meta_test PRIVATE app)
+add_test(NAME gguf_meta COMMAND gguf_meta_test)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.

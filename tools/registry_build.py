@@ -21,7 +21,9 @@ Every entry is read from a pinned source, never typed in by hand:
 - HF architecture -> GGUF architecture: the `@ModelBase.register(...)` classes in llama.cpp's
   converter (convert_hf_to_gguf.py and conversion/*.py), in the upstream pin and in our HRX
   fork; the upstream pin wins where both name one.
-- vulkan: the GGUF architecture is in the upstream pin's src/llama-arch.cpp (LLM_ARCH_NAMES).
+- vulkan: the GGUF architecture is in the upstream pin's src/llama-arch.cpp (LLM_ARCH_NAMES), or
+  it is one only our fork implements (FORK_ONLY below), which `1bit serve --device vulkan` runs
+  on the fork's build (app/serve.cpp, fork_only_arch).
 - hrx: the same, in our HRX fork (third_party/llama.cpp).
 - zinc: the GGUF architecture is one ZINC's parseArchitecture (src/model/config.zig) accepts.
 - npu: the fast lane's model types (NPU_MODEL_TYPES below, matching npu/). The NPU runs Q4NX
@@ -44,6 +46,10 @@ ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
 UPSTREAM = "third_party/llama.cpp-vulkan"
 HRX = "third_party/llama.cpp"
 ZINC = "third_party/zinc"
+
+# GGUF architectures only our fork (third_party/llama.cpp) implements; --device vulkan runs them
+# on that build's Vulkan0. Keep in step with fork_only_arch in app/serve.cpp.
+FORK_ONLY = {"zaya"}
 
 # The NPU fast lane serves Qwen3 dense Q4NX directories (docs/npu.md). HF architecture ->
 # model_type, as the directory's config.json names them.
@@ -149,7 +155,7 @@ def build():
             backends.append("hrx")
         if hf in NPU_ARCHS:
             backends.append("npu")
-        if g in run_up:
+        if g in run_up or (g in FORK_ONLY and g in run_hrx):
             backends.append("vulkan")
         if g in run_zinc:
             backends.append("zinc")

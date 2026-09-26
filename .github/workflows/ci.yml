@@ -33,6 +33,6 @@ jobs:
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
       - name: Build
-        run: cmake --build build --target onebit npu_full_elf_test npu_pack_test npu_q4nx_test npu_private_route_test tokenizer_test think_split_test -j
+        run: cmake --build build --target onebit npu_full_elf_test npu_pack_test npu_q4nx_test npu_private_route_test tokenizer_test think_split_test gguf_meta_test -j
       - name: Test
         run: ctest --test-dir build --output-on-failure

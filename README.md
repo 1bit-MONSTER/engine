@@ -25,7 +25,7 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 
 - the XDNA 2 NPU engine
 - HRX on the Radeon iGPU, on the llama.cpp + hrx-system pair AMD tests
-- Vulkan on the Radeon iGPU, from upstream llama.cpp's latest release, so new architectures land the day upstream ships them
+- Vulkan on the Radeon iGPU, from upstream llama.cpp's latest release, so new architectures land the day upstream ships them; architectures upstream lacks, such as Zyphra's ZAYA1, run from our llama.cpp ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp))
 - a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - MLX on Apple Silicon, through lemon-mlx-engine
@@ -41,7 +41,9 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
 > ([docs/hrx.md](docs/hrx.md)), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
-> source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). Experimental,
+> source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
+> runs from our llama.cpp on Vulkan, HRX and ROCm, matching transformers, at 93 tok/s decode in
+> Q4_K_M on Vulkan ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp)). Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
 > has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per

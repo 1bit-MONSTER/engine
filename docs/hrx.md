@@ -192,8 +192,8 @@ Correct is not fast: the UD files run their IQ4_XS and sub-4-bit layers on the C
 
 `1bit-MONSTER/llama.cpp` also holds
 `1bit/hrx2-archive`, the previous build (AMD's abandoned ggml-hrx2 plus our Q4NX
-kernels and the zaya architecture). It is kept for a later port of that work to
-ggml-hrx.
+kernels). It is kept for a later port of that work to ggml-hrx. Its zaya
+architecture has been ported to this branch (ZAYA1, [vulkan.md](vulkan.md#zaya1-zyphra-from-our-llamacpp)).
 
 The Vulkan route has its own upstream llama.cpp pin (latest release), so new
 architectures do not wait for AMD's pair: see [vulkan.md](vulkan.md). This build

@@ -8,7 +8,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "vulkan",
@@ -18,7 +18,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "hrx",
@@ -28,7 +28,7 @@
    "said": "The capital of France is Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "vulkan",
@@ -38,7 +38,7 @@
    "said": "The capital of France is Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "zinc",
@@ -61,7 +61,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "vulkan",
@@ -71,7 +71,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "hrx",
@@ -81,7 +81,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "vulkan",
@@ -91,7 +91,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "zinc",
@@ -117,7 +117,7 @@
    "said": "Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "npu",
@@ -137,7 +137,7 @@
    "said": "Paris.",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "zinc",
@@ -157,7 +157,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "vulkan",
@@ -167,7 +167,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "zinc",
@@ -187,7 +187,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "3c3394e9ee2e"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "vulkan",
@@ -197,7 +197,7 @@
    "said": "Paris",
    "failed": [],
    "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "engine": "912ff93cee98"
   },
   {
    "backend": "zinc",
@@ -208,6 +208,26 @@
    "failed": [],
    "date": "2026-09-25",
    "engine": "8c2805d977eb"
+  },
+  {
+   "backend": "hrx",
+   "model": "zaya1-8b-Q4_K_M.gguf",
+   "arch": "zaya",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "912ff93cee98"
+  },
+  {
+   "backend": "vulkan",
+   "model": "zaya1-8b-Q4_K_M.gguf",
+   "arch": "zaya",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-25",
+   "engine": "912ff93cee98"
   }
  ]
 }

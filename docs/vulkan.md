@@ -70,9 +70,10 @@ Measured quant sweet spots for Qwen3.8 on this route are on the
 token. Every layer runs CCA attention, where q and k pass through short convolutions over time,
 then a top-1 router that picks one of 16 experts or a skip expert. Upstream llama.cpp has no ZAYA:
 its draft (ggml-org/llama.cpp#23112) was closed on 2026-09-05. ZAYA lives in our llama.cpp,
-`third_party/llama.cpp` (`1bit-MONSTER/llama.cpp`, [PR #2](https://github.com/1bit-MONSTER/llama.cpp/pull/2)).
-`1bit serve --device vulkan` reads the GGUF's `general.architecture`, and runs an architecture
-that only our llama.cpp has on that build's `Vulkan0` even when the upstream build is present.
+`third_party/llama.cpp` (`1bit-MONSTER/llama.cpp`, [PR #2](https://github.com/1bit-MONSTER/llama.cpp/pull/2)),
+and runs there on Vulkan, HRX and ROCm (HIP). `1bit serve --device vulkan` reads the GGUF's
+`general.architecture`, and runs an architecture that only our llama.cpp has on that build's
+`Vulkan0` even when the upstream build is present; `--device hrx` runs it on `HRX0`.
 
 ```
 python third_party/llama.cpp/convert_hf_to_gguf.py <Zyphra/ZAYA1-8B> --outtype f16 --outfile zaya1-8b-f16.gguf
@@ -80,21 +81,36 @@ build/hrx/llama/bin/llama-quantize zaya1-8b-f16.gguf zaya1-8b-Q4_K_M.gguf Q4_K_M
 1bit serve -m zaya1-8b-Q4_K_M.gguf --device vulkan --ctx-size 8192
 ```
 
-Verified on Strix Halo (Radeon 8060S, RADV):
+Convert with this converter: it writes the grouped convolution's weights tap-major, which the
+graph expects, so GGUFs made by other converters do not load.
+
+Verified on Strix Halo (Radeon 8060S):
 
 | Check | Result |
 |---|---|
 | Against transformers' `ZayaForCausalLM` in FP32, 96 teacher-forced positions | the F16 GGUF picks the same top token at 95 (the other is a 0.07-nat tie; transformers' own BF16 run matches FP32 at 91) |
-| `test-llama-archs -a zaya` | Vulkan within 7.9e-8 NMSE of the CPU; save and reload bit-exact |
-| `tests/serve_e2e.sh`, Q4_K_M | PASS: "Paris", streamed |
+| `test-llama-archs -a zaya` | Vulkan and ROCm match the CPU (NMSE 9.6e-8 and 8.1e-14); save and reload bit-exact |
+| `tests/serve_e2e.sh`, Q4_K_M | PASS on `--device vulkan` and `--device hrx` |
 
-| GGUF | Size | Prefill (pp512) | Decode (tg128) | Perplexity* |
-|---|---|---|---|---|
-| Q4_K_M | 5.17 GiB | 3,123 tok/s | 93.5 tok/s | 21.66 |
-| F16 | 16.51 GiB | 1,138 tok/s | 45.9 tok/s | 20.59 |
+Q4_K_M (5.17 GiB), by device:
+
+| Device | Prefill (pp512) | Decode (tg128) | Perplexity* |
+|---|---|---|---|
+| Vulkan0 | 3,437 tok/s | 93.0 tok/s | 21.57 |
+| ROCm0 | ~2,400 tok/s | 61.5 tok/s | 21.78 |
+| HRX0 | 1,175 tok/s | 25.5 tok/s | 21.55 |
+
+F16 on Vulkan0: 1,138 tok/s prefill, 45.9 tok/s decode, perplexity 20.59.
 
 \* 512-token chunks over this repository's docs (PORTING.md, hrx.md, README.md), for comparing
-quants, not models.
+quants and devices, not models. ROCm's Q4 matmuls quantize activations to 8 bits, hence its
+slightly higher figure.
 
-CCA's grouped convolution runs as one batched matmul per layer; as one small matmul per group it
-held Q4_K_M decode at 50 tok/s.
+Vulkan decodes fastest, so `auto` and `--device vulkan` stay the default for ZAYA. The engine's
+`--device rocm` server is built from ROCmFPX's tree, which has no ZAYA; the ROCm numbers above are
+our llama.cpp built with `GGML_HIP=ON` for gfx1151.
+
+What it took, besides the port: CCA's grouped convolution runs as one batched matmul per tap
+(as one small matmul per group it held Vulkan decode at 50 tok/s), and the graph avoids what
+HRX and ROCm lacked: copies into part of a state row, concatenating strided views, `l2_norm`,
+and a two-tap `ssm_conv` kernel on ROCm.

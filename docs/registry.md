@@ -38,7 +38,7 @@ hand:
 | `zinc` | ZINC's `parseArchitecture` accepts the GGUF architecture |
 | `npu` | the fast lane's model type: `qwen3` (the lane kernels are built for Qwen3-0.6B's shapes) |
 
-At the current pins (llama.cpp `8dd75eb`, llama.cpp-vulkan `546800c`, ZINC `29bc350`): 323 HF architectures mapped, vulkan 323, hrx 300, zinc 64, npu 1. Mapped means a backend's code accepts the architecture; the census below reports how many were checked.
+On 2026-09-26: 323 HF architectures mapped, vulkan 323, hrx 300, zinc 64, npu 1. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
 
 **Reviewed gaps.** Some unmapped architectures only look like a supported family. [Architecture gaps](arch-gaps.md) records why each of them is not an alias. `registry/significant.json` lists those classes, and `tools/registry_build.py --check-gaps` (ctest `registry_gaps`) fails if one becomes mapped without a recorded reason.
 

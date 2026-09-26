@@ -15,7 +15,7 @@
 # limitations under the License.
 """Build registry/architectures.json: which backends of this engine map each HF architecture.
 
-usage: tools/registry_build.py [--check] [--out registry/architectures.json]
+usage: tools/registry_build.py [--check | --check-gaps | --check-pins] [--out registry/architectures.json]
 
 Every entry is read from a pinned source, never typed in by hand:
 - HF architecture -> GGUF architecture: the `@ModelBase.register(...)` classes in llama.cpp's
@@ -33,6 +33,8 @@ Every entry is read from a pinned source, never typed in by hand:
 architecture was run and checked here is recorded separately, in registry/checked.json.
 
 --check exits 1 when the file on disk differs from what the pinned sources give.
+--check-pins only compares the pins the file records with the committed gitlinks, so it needs no
+checkouts (CI and ctest `registry_pins` run it): a pin bump must regenerate the registry.
 """
 import argparse
 import ast
@@ -204,7 +206,22 @@ def main():
     ap.add_argument("--check", action="store_true")
     ap.add_argument("--check-gaps", action="store_true",
                     help="only check the committed registry against registry/significant.json (no pins needed)")
+    ap.add_argument("--check-pins", action="store_true",
+                    help="only check that the registry records the committed pins (no checkouts needed)")
     a = ap.parse_args()
+    if a.check_pins:
+        recorded = json.load(open(a.out))["sources"]
+        stale = [(name, recorded.get(name, ""), pin(path)) for name, path in
+                 (("llama.cpp (vulkan)", UPSTREAM), ("llama.cpp (hrx)", HRX), ("zinc", ZINC))
+                 if recorded.get(name) != pin(path)]
+        for name, old, new in stale:
+            print(f"{a.out}: {name} recorded at {old[:9] or 'nothing'}, pinned at {new[:9]}")
+        if stale:
+            print("a pin moved without regenerating the registry: check out the submodules at their "
+                  "pins (git submodule update --init) and run tools/registry_build.py")
+            return 1
+        print(f"{a.out} records the committed pins")
+        return 0
     if a.check_gaps:
         bad = report_gaps(json.load(open(a.out)))
         if not bad:

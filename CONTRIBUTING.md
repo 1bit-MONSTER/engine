@@ -72,6 +72,9 @@ an RFC or issue.
 - **Pins only move forward.** CI fails a pull request whose submodule pin is behind, or has
   diverged from, the pin on `main` (`tools/check_pins.py`), because that drops commits the engine
   already shipped. A rollback on purpose carries the `pin rollback` label.
+- **The registry follows the pins.** `registry/architectures.json` records the pins it was built
+  from, and ctest `registry_pins` fails when they differ from the committed ones. The bump
+  workflows regenerate it with `scripts/registry-regen.sh`; a hand-made pin change runs the same.
 
 This repository is a port of the working code in 1bit-MONSTER, our private development
 repository, without its history.

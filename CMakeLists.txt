@@ -312,10 +312,13 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 endif()
 
-# The registry against the reviewed not-an-alias list (docs/arch-gaps.md): no pins or network.
+# The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:
+# no checkouts or network.
 find_package(Python3 COMPONENTS Interpreter)
 if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-gaps)
+    # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
+    add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
 endif()
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)

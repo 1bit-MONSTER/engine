@@ -4,8 +4,8 @@
   "models": 415490,
   "with_architecture": 332612,
   "architectures_seen": 2616,
-  "mapped_models": 311319,
-  "mapped_pct": 93.6,
+  "mapped_models": 313416,
+  "mapped_pct": 94.23,
   "checked_models": 213531,
   "checked_pct": 64.2,
   "per_backend": {
@@ -16,9 +16,9 @@
     "checked_pct": 64.2
    },
    "hrx": {
-    "mapped": 311013,
+    "mapped": 313110,
     "checked": 213531,
-    "mapped_pct": 93.51,
+    "mapped_pct": 94.14,
     "checked_pct": 64.2
    },
    "zinc": {
@@ -38,10 +38,6 @@
    {
     "architecture": "Step1MoEForCausalLM",
     "models": 2882
-   },
-   {
-    "architecture": "OPTForCausalLM",
-    "models": 2097
    },
    {
     "architecture": "ParlerTTSForConditionalGeneration",
@@ -133,6 +129,10 @@
    },
    {
     "architecture": "DynamicSlidingWindowForCausalLM",
+    "models": 79
+   },
+   {
+    "architecture": "XGLMForCausalLM",
     "models": 79
    }
   ]

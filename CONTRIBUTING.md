@@ -36,6 +36,31 @@ This repository exists to be reviewable. Five rules keep it that way.
    Files that cannot hold a comment (binaries, JSON, test data) are exempt,
    listed in the tool.
 
+## RFCs: design before code
+
+Changes that shape the engine start as an RFC in
+[Discussions](https://github.com/1bit-MONSTER/engine/discussions/categories/rfcs), before any pull
+request. This holds for everyone: maintainers, agents and outside contributors alike.
+
+**An RFC is needed for:**
+- a new backend, device route or serving mode, or removing one;
+- a change to `1bit serve`'s command line or HTTP API that existing users would notice;
+- a new third-party dependency or pinned upstream, or a change to how pins move;
+- anything touching security: authentication, network exposure, secrets, workflows' permissions.
+
+**A pull request is enough for:** bug fixes, documentation, performance work that does not change
+behaviour, and new model architectures that come with the check rule 1 asks for.
+
+**How it goes:**
+1. Open a discussion in the **RFCs** category. The form asks for the problem, the design, the
+   alternatives, how it will be tested and what it adds to NOTICE.
+2. Discuss it there. A maintainer marks it accepted (or declined, with the reason) in the thread.
+3. The pull request links the accepted RFC. A pull request that needs an RFC and has none is
+   closed with a pointer here.
+
+Security problems are the exception: report them privately ([SECURITY.md](SECURITY.md)), never as
+an RFC or issue.
+
 This repository is a port of the working code in 1bit-MONSTER, our private development
 repository, without its history.
 [docs/PORTING.md](docs/PORTING.md) lists the source of each component and the

@@ -73,7 +73,7 @@ guard() {
 checkout() {  # checkout <ref> [pr number to merge on top]
     [ -d "$SRC/.git" ] || git clone -q "https://github.com/$REPO.git" "$SRC"
     git -C "$SRC" fetch -q origin "$1"
-    git -C "$SRC" checkout -q --detach FETCH_HEAD
+    git -C "$SRC" checkout -q -f --detach FETCH_HEAD   # the workspace is ours: a stray edit never blocks a run
     if [ -n "${2:-}" ]; then
         git -C "$SRC" fetch -q origin "pull/$2/head"
         git -C "$SRC" -c user.name=weekly -c user.email=weekly@1bit.gg merge -q --no-edit FETCH_HEAD
@@ -119,9 +119,38 @@ run_tests() {
     ctest --test-dir "$BUILD" --output-on-failure > "$LOGS/ctest.log" 2>&1
 }
 
+# every pin a PR moves must be on the branch .gitmodules says that submodule tracks: a shallow
+# clone of that branch cannot fetch a commit off it, and GitHub may drop an unreferenced one
+pins_on_branch() {
+    local path url branch sha repo status bad=0
+    while read -r path; do
+        branch=$(git config -f "$SRC/.gitmodules" --get "submodule.$path.branch" || true)
+        [ -n "$branch" ] || continue
+        url=$(git config -f "$SRC/.gitmodules" --get "submodule.$path.url")
+        sha=$(git -C "$SRC" ls-tree HEAD "$path" | awk '{print $3}')
+        repo=${url#https://github.com/}; repo=${repo%.git}
+        status=$(gh api "repos/$repo/compare/$sha...$branch" --jq .status 2>/dev/null || echo unknown)
+        case "$status" in
+            identical|ahead) echo "ok   $path ${sha:0:12} is on $repo $branch" ;;
+            *) echo "FAIL $path ${sha:0:12} is not on $repo $branch ($status)"; bad=1 ;;
+        esac
+    done < <(git -C "$SRC" diff --name-only HEAD^1 HEAD -- third_party)
+    return $bad
+}
+
+# a llama.cpp bump re-runs every model row registry/check_models.tsv lists for that backend
+# (the architectures only our fork has, such as zaya, and the MoE and Qwen rows among them)
+model_rows() {  # model_rows <vulkan|hrx>
+    guard python3 "$SRC/tools/registry_check.py" "$BUILD/1bit" --models "$HOME/models" --only "$1" \
+        > "$LOGS/models-$1.log" 2>&1 || return 1
+    ! grep -q '^FAIL' "$LOGS/models-$1.log"
+}
+
 # the extra check a bump needs beyond build + ctest (docs/releases.md, "Bumps")
 bump_check() {  # bump_check <branch>
     case "$1" in
+        bump-hrx/*) model_rows hrx ;;
+        bump-llama-vulkan/*) model_rows vulkan ;;
         bump-lemonade/*) lemonade_suite ;;
         bump-laya/*)
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
@@ -129,7 +158,7 @@ bump_check() {  # bump_check <branch>
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" rocm > "$LOGS/ds4.log" 2>&1 ;;
         bump-linux/*) guard "$SRC/scripts/build-kernel.sh" "$W/kernel" > "$LOGS/kernel.log" 2>&1 ;;
         bump-comfyui/*) guard "$SRC/scripts/build-comfyui.sh" "$W/comfyui" > "$LOGS/comfyui.log" 2>&1 ;;
-        *) : ;;  # hrx, llama-vulkan, rocmfpx, zinc, xdna, tokenizers: covered by build + ctest
+        *) : ;;  # rocmfpx, zinc, xdna, tokenizers: covered by build + ctest
     esac
 }
 
@@ -137,10 +166,17 @@ bump_check() {  # bump_check <branch>
 lemonade_suite() {
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     local venv=$W/lemonade-venv
-    [ -x "$venv/bin/python" ] || { python3 -m venv "$venv" && "$venv/bin/pip" -q install openai requests huggingface_hub; }
+    [ -x "$venv/bin/python" ] || python3 -m venv "$venv"
+    "$venv/bin/pip" -q install -r "$SRC/third_party/lemonade/test/requirements.txt"  # the suite's own list
+    # the suite talks to a running lemond: ours, on a port of its own, with this build's 1bit
+    local port=13399 pid rc=0
+    LEMONADE_ONEBIT_BIN="$BUILD/1bit" "$W/lemonade/bin/lemond" --port "$port" > "$LOGS/lemond.log" 2>&1 &
+    pid=$!
     ( cd "$SRC/third_party/lemonade" &&
-      PATH="$W/lemonade/bin:$BUILD:$PATH" LEMONADE_ONEBIT_BIN="$BUILD/1bit" \
-      "$venv/bin/python" test/server_llm.py --wrapped-server onebit --backend vulkan ) > "$LOGS/lemonade-suite.log" 2>&1
+      PATH="$W/lemonade/bin:$BUILD:$PATH" LEMONADE_ONEBIT_BIN="$BUILD/1bit" LEMONADE_TEST_PORT="$port" \
+      "$venv/bin/python" test/server_llm.py --wrapped-server onebit --backend vulkan ) > "$LOGS/lemonade-suite.log" 2>&1 || rc=$?
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    return $rc
 }
 
 # --- stages -------------------------------------------------------------------------------
@@ -156,9 +192,18 @@ stage_bumps() {
         say "bump #$n $branch"
         local result=merged why="" rc
         # a subshell outside any condition, so that set -e holds inside it
-        set +e; ( set -e; checkout main "$n"; build; run_tests; bump_check "$branch" ) > "$log" 2>&1; rc=$?; set -e
+        set +e
+        ( set -e
+          echo checkout > "$W/.step"; checkout main "$n"
+          echo "the pins' branches" > "$W/.step"; pins_on_branch > "$LOGS/pins.log" 2>&1
+          echo build > "$W/.step"; build
+          echo ctest > "$W/.step"; run_tests
+          echo "the $branch check" > "$W/.step"; bump_check "$branch" ) > "$log" 2>&1
+        rc=$?; set -e
         if [ $rc -ne 0 ]; then
-            result=held why="failed on Strix Halo: $(tail -n 3 "$log" "$LOGS"/ctest.log 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+            # the step that failed, and the last lines of the log it wrote (the newest besides ours)
+            local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-" | head -1)
+            result=held why="failed at $(cat "$W/.step") on Strix Halo ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
         elif [ "$DRY" = 1 ]; then
             result=passed why="dry run: not merged"
         else

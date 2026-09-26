@@ -27,6 +27,7 @@
 #include <condition_variable>
 #include <cstdint>
 #include <deque>
+#include <functional>
 #include <list>
 #include <mutex>
 #include <thread>
@@ -36,10 +37,13 @@
 namespace onebit::moe {
 
 struct CacheOptions {
-    int slots = 1024;         // experts held in RAM, all layers together
+    int slots = 1024;         // experts held in RAM, all layers together (each layer keeps the same share)
     bool per_layer = false;   // false: one LRU over all layers (it hit more in replays); true: slots / layers each
     int io_threads = 8;       // reads in flight
     bool pin = true;          // mlock the slots
+    // Memory for each list's slots, owned by the caller (for example a GPU buffer the host can
+    // map); null: the cache maps and pins its own. Called once per list with its byte size.
+    std::function<uint8_t*(int list, size_t bytes)> region;
 };
 
 struct CacheStats {
@@ -55,7 +59,20 @@ struct CacheStats {
 class ExpertCache {
 public:
     // One expert's parts in its slot, in GgufIndex::experts order.
-    struct Resident { std::vector<const uint8_t*> parts; };
+    struct Resident {
+        std::vector<const uint8_t*> parts;
+        int slot = 0;  // index among the slots of this expert's size class or layer (Layout)
+    };
+    // The slots a layer's experts can occupy: one packed array per part in a region from base;
+    // part k of the expert in slot i is at base + part_off[k] + i * part_bytes[k] (a ggml expert
+    // tensor's layout with n_slots experts).
+    struct Layout {
+        uint8_t* base = nullptr;
+        size_t region_off = 0, region_bytes = 0, slot_bytes = 0;
+        int n_slots = 0;
+        std::vector<size_t> part_off, part_bytes;
+    };
+    const Layout& layout(int layer) const { return layouts_.at(lru_of(layer)); }
 
     ExpertCache(const GgufIndex& index, const CacheOptions& opt);
     ~ExpertCache();
@@ -70,7 +87,8 @@ public:
 
     CacheStats stats() const;
     void reset_stats();
-    size_t slot_bytes() const { return slot_bytes_; }
+    size_t slot_bytes() const { return slot_bytes_; }  // the largest slot
+    size_t pinned_bytes() const { return mem_bytes_; }
     int slots() const { return (int) slots_.size(); }
 
 private:
@@ -81,11 +99,11 @@ private:
         int refs = 0;
         int pending = 0;          // reads not finished
         bool prefetched = false;  // loaded by prefetch() and not acquired since
-        std::vector<size_t> part_off;  // byte offset of each part's data inside the slot
+        int index = 0;            // position among its list's slots
         std::list<int>::iterator lru_it;
         int lru_list = 0;
     };
-    struct Read { int slot; int fd; uint64_t off, len; uint8_t* dst; };
+    struct Read { int slot; int fd; uint64_t off, len; uint8_t* dst; uint64_t lead, bytes; };
 
     uint64_t key(int layer, int e) const { return (uint64_t(layer) << 32) | uint32_t(e); }
     int lru_of(int layer) const;
@@ -100,7 +118,8 @@ private:
     size_t mem_bytes_ = 0, slot_bytes_ = 0;
     std::vector<Slot> slots_;
     std::unordered_map<uint64_t, int> where_;
-    std::vector<std::list<int>> lru_;         // front = most recent; per layer or one list
+    std::vector<std::list<int>> lru_;         // front = most recent; per layer or per size class
+    std::vector<Layout> layouts_;             // one per list
     std::unordered_map<int, int> layer_lru_;  // MoE layer -> lru_ index
     mutable std::mutex mu_;
     std::condition_variable ready_cv_, work_cv_;

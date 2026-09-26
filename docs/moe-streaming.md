@@ -24,7 +24,8 @@ as the router asks for them. The work splits three ways:
 - the routed experts wherever they run fastest: NPU (native int8 x int4) or GPU;
 - the NVMe feeding the cache.
 
-This page holds the measurements, the expert cache (`moe/`, `1bit moe-cache`) and the
+This page holds the measurements, the expert cache (`moe/`, `1bit moe-cache`), streaming in
+decode (`1bit serve --moe-slots`) and the
 tools that produced them (`tools/moe_trace.cpp`, `moe_policy.cpp`, `moe_expert_bench.cpp`).
 
 ## What one token needs
@@ -143,6 +144,29 @@ What the traces show:
 - **The bound is 5-16 points higher** at quarter-size caches, so a smarter policy still has
   room. The traces are kept, so any policy can be tried on the same data.
 
+### Classic policies don't close the gap
+
+Three scan- and frequency-aware policies from storage caching, each over the shared budget
+(`tools/moe_policy.cpp`): ARC (adapts between a recency and a frequency list, with ghost
+lists), LRU-2 (evicts the expert whose second-to-last use is oldest), and W-TinyLFU as in
+Caffeine (a 1% or 10% LRU window; an expert leaving it enters the main cache only if it was
+used more often than the main cache's victim). Decode hit rate:
+
+| trace | cache / layer | g-lru | g-arc | g-lru2 | g-tlfu 1% | g-tlfu 10% | opt |
+|---|---|---|---|---|---|---|---|
+| Coder-30B code | 16 | 48.8 | 49.2 | 47.9 | 46.6 | 44.6 | 68.8 |
+| | 32 | 68.2 | 67.2 | 66.6 | 65.8 | 65.8 | 83.5 |
+| Coder-30B long | 16 | 56.9 | 57.8 | 59.0 | 58.0 | 55.1 | 76.5 |
+| Flash-Next chat | 32 | 55.4 | 55.0 | 51.9 | 44.4 | 42.6 | 72.8 |
+| Flash-Next code | 16 | 39.6 | 41.3 | 42.0 | 39.1 | 37.5 | 61.0 |
+| Qwen3.6-35B chat | 64 | 80.5 | 80.8 | 80.2 | 67.6 | 75.0 | 90.8 |
+| GLM-4.7-Flash long | 32 | 82.5 | 82.5 | 83.8 | 82.6 | 84.5 | 92.5 |
+
+Across all 12 traces at 16, 32 and 64 per layer, none is more than 2.4 points above the
+shared LRU, and W-TinyLFU is up to 13 points below it (Qwen3.6 chat at 64). Routing has little
+popularity beyond recency for a frequency filter to use; the missing 7-22 points are in the
+future routes, which only a predictor can see.
+
 ### Predicting the next layer's experts
 
 A trace also records a gate-ahead prediction for every decoded token. It applies layer l's
@@ -165,13 +189,21 @@ co-occurrence with the previous layer) cover under 30%.
 `moe/` holds the cache (Linux only, built into `1bit` as `ONEBIT_MOE`):
 - **`gguf_index`** reads a GGUF header, including every shard of a split file, and finds each
   routed expert's bytes: `blk.N.ffn_{gate,up,down}_exps.weight`, one slice per expert.
-- **`expert_cache`** keeps experts in pinned slots. One `mmap` region is locked with `mlock`,
-  and each slot holds all of one expert's parts, each part aligned to 4 KiB for `O_DIRECT`.
+- **`expert_cache`** keeps experts in pinned slots. One `mmap` region is locked with `mlock`.
+  Each list of slots (one per layer, or one per size class) keeps one packed array per part:
+  part k of slot i is at `part_off[k] + i * part_bytes[k]`. That is the layout of a ggml expert
+  tensor with as many experts as slots, so a GPU can compute on the slots directly.
+  `O_DIRECT` reads land in each reader thread's aligned bounce buffer and are copied into place.
   - Misses are read with `O_DIRECT`, straight from the drive into the slot, by a pool of
     reader threads, so several reads are in flight. Demand reads go ahead of prefetches.
   - `acquire(layer, experts)` blocks until the experts are resident and pins them until
     `release`. `prefetch(layer, experts)` only queues reads.
   - Eviction is LRU, over one budget shared by all layers (the replays favour it) or per layer.
+  - Slots come in size classes. Unsloth's UD quants use bigger types for some layers' experts,
+    so layers are grouped by the byte sizes of their experts' parts, and each group gets its
+    own slots (same share of experts per layer). Flash-Next's 9,216 slots pinned 34.4 GiB with
+    one slot size and 27.0 GiB with size classes. Packing the parts brings Coder-30B's 1,536
+    slots from 4.4 to 4.1 GiB.
 - **`1bit moe-cache`** replays a trace through the cache against the real model file, with
   real reads. Compute is simulated per layer:
   1. at the layer's start, the prefetch is issued (lookahead 1: this layer's gate-ahead
@@ -332,7 +364,7 @@ resident, as in a fleet), the cache sets the speed:
 | Qwen3-Coder-30B-A3B | Q4_K_M, all on Vulkan0 | 92-93 | UD-Q4_K_XL: 0.027 at a similar size | 13.2 GiB of 17.5 GiB | 32-48 (code 34, chat 48, long 32) |
 | Qwen3.6-35B-A3B | **UD-Q5_K_XL**, all on Vulkan0 (faster than Q8_0 at nearly its quality) | 52-53 | 0.009 | ≈16.5 GiB of ≈21.9 GiB | 32-39 |
 | GLM-4.7-Flash | Q4_K_M, all on Vulkan0 | 71 | no other quant measured | ≈12.6 GiB of ≈16.8 GiB | 33-40 |
-| Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP n = 3, resident on Vulkan (about 77 GiB) | 40-49 | | 27.5 GiB of 71.7 GiB (34.4 GiB pinned) | 7-12 on this drive (ceiling 24-34 at 3.7 GB/s) |
+| Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP n = 3, resident on Vulkan (about 77 GiB) | 40-49 | | 27.5 GiB of 71.7 GiB (27.0 GiB pinned) | 7-12 on this drive (ceiling 24-34 at 3.7 GB/s) |
 
 MTP is available only for Flash-Next, and it is worth it both ways: 1.6-1.9 times resident,
 and it leaves the drive's reads per token unchanged when streamed.
@@ -378,8 +410,8 @@ resident) and 22 ms with it (45.5 tok/s):
 | 384 (55.1 GiB) | 37 / 43 MB | 26.0 / 26.0 | 31.3 / 29.8 | 45.5 / 45.5 |
 
 **Measured on the drive** (`1bit moe-cache`, chat and long traces, 192 per layer = 9,216
-slots: 27.5 GiB of experts in 34.4 GiB of pinned slots. Each slot is sized for the largest
-layer's expert, and the UD quant uses bigger types in some layers):
+slots: 27.5 GiB of experts in 34.4 GiB of pinned slots. At the time, every slot was sized for
+the largest layer's expert. Size classes (below) now pin 27.0 GiB for the same slots):
 
 | mode | compute per token | decode tok/s | stall per token |
 |---|---|---|---|
@@ -411,16 +443,83 @@ allocations also escape cgroup memory limits. So every big run goes through
 `scripts/mem-guard.sh <floor GB> <cmd>`, which kills the run itself when `MemAvailable` falls
 below the floor.
 
+## Streaming in the inference path
+
+`1bit serve --moe-slots N` (docs/serve.md) streams the routed experts of each MoE layer from
+the model file while it decodes. The llama.cpp Vulkan pin (fork PR #19, `1bit/moe-stream`)
+does the work, driven by environment variables that `serve` sets (`ONEBIT_MOE_FILE`,
+`ONEBIT_MOE_SLOTS`; `src/llama-moe-stream.h` lists the rest). The expert tensors load on the
+CPU memory-mapped (`-ot exps=CPU`), so their pages are read only when a prompt batch touches
+them. Batches of up to 8 tokens (decode) use the slots; prompts keep the mapped path.
+
+- **GPU mode** (the default): each layer's slots live in a Vulkan device buffer the host
+  maps, packed as expert tensors. A CPU op pins the batch's experts, reads the misses with
+  `O_DIRECT`, and turns their ids into slot indices; the regular MUL_MAT_ID then runs on the
+  GPU over the slots. A first version imported pinned host memory instead
+  (`buffer_from_host_ptr`); the GPU reads that at about 1 GB/s, and it decoded 0.1-0.3 tok/s.
+- **CPU mode** (`ONEBIT_MOE_DEVICE=cpu`): three custom ops (pin, gate/up/SwiGLU, down) on the
+  CPU's dot kernels.
+- **Correctness** (Qwen3-Coder-30B Q4_K_M, perplexity over 2 x 512 tokens): GPU mode gives
+  exactly the all-Vulkan numbers, 21.1029 with 1-token batches and 20.9475 with 4-token
+  batches.
+
+Decode speed, Qwen3-Coder-30B-A3B Q4_K_M (48 layers x 128 experts = 6,144; `llama-bench`
+`-n 64`, 5 repetitions, warm ones; the first repetition starts from empty slots):
+
+| Setup | tok/s |
+|---|---|
+| all on Vulkan0 (resident) | 79-91 |
+| experts on the CPU, memory-mapped | 25-43 |
+| streamed, 4,608 slots (75%) | 28-38 (12 cold) |
+| streamed, 3,072 slots (50%) | 17-22 |
+| streamed, 1,536 slots (25%) | 8-10 |
+
+Through `1bit serve` (a 128-token chat answer, three requests): 18.9, then 28.3 and 27.1 tok/s
+at 4,608 slots; 7.1, 6.6 and 6.0 at 1,536. The answers match the resident model's. With the
+prefetch moved off the decode path (below), 4,608 slots gives 17.1, then 38.9 and 39.0.
+
+A model that fits in memory decodes fastest resident. Streaming is for the ones that don't:
+at a quarter of the experts in memory, Coder-30B still decodes 8-10 tok/s.
+
+### Where streamed decode spends its time
+
+`ONEBIT_MOE_STATS=1` prints, at exit, the time spent in the remap op, the part of it spent
+waiting for reads, and the time between one layer's remap and the next (the GPU's work plus
+the round trip to the host). Coder-30B, `-n 64 -r 4`, per MoE layer (the numbers include the
+cold first repetition):
+
+| Slots, prefetch depth | Warm tok/s | In remap (waiting) | Between remaps | Demand misses |
+|---|---|---|---|---|
+| 6,144, off | 48-53 | 0.36 ms (0.36) | 0.37 ms | 4.8% (the cold fill) |
+| 4,608, off | 42 | 0.41 (0.40) | 0.37 | 5.4% |
+| 4,608, 1 | 43.5-43.8 | 0.34 (0.34) | 0.37 | 1.3% (+4.4% prefetched) |
+| 4,608, 2 | 43.0-44.8 | 0.30 (0.30) | 0.38 | 1.1% |
+| 1,536, off | 9.6-10.5 | 1.59 (1.58) | 0.59 | 22.9% |
+| 1,536, 1 | 9.2-10.2 | 1.68 (1.67) | 0.61 | 7.0% (+18.7%) |
+
+- **The round trip caps streamed decode.** 0.37 ms between remaps x 48 layers is 17.6 ms per
+  token, about 57 tok/s, against 12.5 ms (80 tok/s) resident. Each layer's routed ids go to the
+  host and its slot indices come back before the expert matmuls can run.
+- **Prefetch now pays a little.** Its router scoring first ran inside the remap op, scalar, at
+  about 0.15 ms per layer: prefetch cost 4,608 slots a third of its speed (28 against 42
+  tok/s). A worker thread now scores the next `ONEBIT_MOE_PREFETCH` layers (default 1) off the
+  decode path.
+- **At 1,536 slots the drive is the limit.** About 88 misses x 2.1 MB per token is 185 MB, and
+  at 10 tok/s that is about 2 GB/s through `O_DIRECT` on a drive shared with other tenants. More
+  reads in flight (`ONEBIT_MOE_IO` 4 to 32) didn't help, and prefetch trades demand misses for
+  wasted reads (80 against 61 GiB over the run). What helps here is reading fewer bytes: a
+  better hit rate (item 2 below) or smaller experts.
+
 ## Next
 
-1. **Streaming in the inference path.** Route llama.cpp's MUL_MAT_ID through `ExpertCache`
-   slots, with the gate-ahead prediction computed on the GPU and the cache on the host, and
-   measure it against the `1bit moe-cache` numbers above.
-2. **A smarter eviction policy.** Belady's bound is 5-16 points above the shared LRU at small
-   caches. Candidates: frequency with decay per layer, and hints from the router's scores.
+1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on
+   Coder-30B ("Where streamed decode spends its time"). 6,144 slots (every expert) runs
+   erratically on the shared box.
+2. **Fewer misses without a better policy.** ARC, LRU-2 and W-TinyLFU don't beat the shared LRU
+   ("Classic policies don't close the gap"). What's left: routing that prefers resident
+   experts (a resident expert among the router's next choices stands in for a missing one),
+   measured on quality as well as hit rate.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams
    (hyper-connections), so the predictor needs that model's mixing step before the router.
-4. **Slots sized per layer.** Mixed-quant (UD) models waste up to 25% of the pinned memory
-   with one slot size. Flash-Next's 9,216 slots pin 34.4 GiB for 27.5 GiB of experts.
-5. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room
+4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room
    on the drive.

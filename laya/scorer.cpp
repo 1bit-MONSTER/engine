@@ -124,7 +124,7 @@ void mha(const float* x, const float* inW, const float* inB, const float* outW, 
                 const float* qrow = qkv_b + (size_t)i * 3 * D + (size_t)h * HD;
                 float* sr = scores.data() + (size_t)i * L;
                 for (int j = 0; j < L; ++j) {
-                    if (key_pad[b * L + j]) { sr[j] = -INFINITY; continue; }
+                    if (key_pad[(size_t)b * L + j]) { sr[j] = -INFINITY; continue; }
                     const float* krow = qkv_b + (size_t)j * 3 * D + D + (size_t)h * HD;
                     float acc = 0;
                     for (int d = 0; d < HD; ++d) acc += qrow[d] * krow[d];
@@ -367,15 +367,15 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
     std::vector<int64_t> mpos((size_t)N * K, 0);
     std::vector<int8_t> mmask((size_t)N * K, 0);
     for (int i = 0; i < N; ++i) {
-        for (size_t j = 0; j < seqs[i].size(); ++j) { input_ids[i * L + j] = seqs[i][j]; attn[i * L + j] = 1; }
-        for (size_t j = 0; j < markers[i].size(); ++j) { mpos[i * K + j] = markers[i][j]; mmask[i * K + j] = 1; }
+        for (size_t j = 0; j < seqs[i].size(); ++j) { input_ids[(size_t)i * L + j] = seqs[i][j]; attn[(size_t)i * L + j] = 1; }
+        for (size_t j = 0; j < markers[i].size(); ++j) { mpos[(size_t)i * K + j] = markers[i][j]; mmask[(size_t)i * K + j] = 1; }
     }
 
     // ---- ModernBERT encoder forward ----
     std::vector<float> h((size_t)N * L * D);
     for (int b = 0; b < N; ++b)
         for (int t = 0; t < L; ++t)
-            memcpy(h.data() + ((size_t)b * L + t) * D, tok_emb_.data() + (size_t)input_ids[b * L + t] * D, D * 4);
+            memcpy(h.data() + ((size_t)b * L + t) * D, tok_emb_.data() + (size_t)input_ids[(size_t)b * L + t] * D, D * 4);
     {
         std::vector<float> tmp((size_t)N * L * D);
         layernorm(h.data(), emb_norm_.data(), nullptr, N * L, D, tmp.data());
@@ -395,7 +395,7 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
     auto full_cs = build_cs(160000.0f, L);
     auto slid_cs = build_cs(10000.0f, L);
     std::vector<int8_t> key_pad((size_t)N * L);
-    for (int b = 0; b < N; ++b) for (int t = 0; t < L; ++t) key_pad[b * L + t] = (attn[b * L + t] == 0);
+    for (int b = 0; b < N; ++b) for (int t = 0; t < L; ++t) key_pad[(size_t)b * L + t] = (attn[(size_t)b * L + t] == 0);
 
     std::vector<float> hn((size_t)N * L * D), qkv((size_t)N * L * 3072), attn_out((size_t)N * L * D);
     std::vector<float> q((size_t)N * NHEAD * L * HD), k((size_t)N * NHEAD * L * HD), v((size_t)N * NHEAD * L * HD);

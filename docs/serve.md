@@ -26,7 +26,8 @@ OpenAI client.
            [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
-           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
+           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--moe-slots N]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
@@ -95,6 +96,16 @@ else the build's copy, else the first one under `/opt/rocm-therock`.
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`, `-DONEBIT_DS4`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC` / `$ONEBIT_DS4`, then `llama-server` / `zinc` / `ds4-server` on PATH.
 
+## Images (`--mmproj`)
+
+`--mmproj <mmproj.gguf>` hands llama-server a vision projector on the llama.cpp routes
+(vulkan, hrx, rocm). Chat messages may then carry `image_url` parts (a `data:` URL or a file
+URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes from
+`convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. With it, llama-server runs
+with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that attend to an image
+bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B are in
+[docs/vulkan.md](vulkan.md). The NPU, ZINC, DwarfStar, MLX and ONNX routes take no `--mmproj`.
+
 ## Multi-token prediction (`--mtp`)
 
 `--mtp <head.gguf>` turns on llama-server's `draft-mtp` speculative decoding: the model's
@@ -130,6 +141,21 @@ predictable enough to keep long drafts, prose is not. Draft length 8 collapses o
 prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
+
+## MoE models larger than memory (`--moe-slots`)
+
+`--moe-slots N` (with `--device vulkan`) keeps a MoE model's routed experts in the file and
+holds N of them, across all layers, in GPU memory. Decode reads the missing ones from the drive
+as the router picks them. The rest of the model loads on Vulkan0 as usual.
+
+```sh
+1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --moe-slots 4608 --ctx-size 8192
+```
+
+Qwen3-Coder-30B has 6,144 experts; at 4,608 slots it decodes 39 tok/s warm, at 1,536 about
+6-7 (docs/moe-streaming.md, "Streaming in the inference path"). A model that fits in memory is
+faster without it (79-91 tok/s resident). It works with the Vulkan pin's llama-server only, not
+with `--prefill-device`.
 
 ## Many requests at once (`--parallel`)
 

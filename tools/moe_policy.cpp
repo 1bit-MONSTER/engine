@@ -22,6 +22,9 @@
 // Prompt tokens warm the cache and are not counted; decode tokens are. Policies:
 //   lru, lfu, slru     one cache per layer (slru: 20% probation, 80% protected)
 //   g-lru, g-lfu       one budget shared by all layers (g-lfu: frequency halved every 64 tokens)
+//   g-arc              ARC over the shared budget
+//   g-lru2             LRU-2 over the shared budget (oldest second-to-last use goes first)
+//   g-tlfu1, g-tlfu10  W-TinyLFU over the shared budget, window 1% / 10%: frequency-gated admission
 //   opt                Belady per layer: evict the expert used furthest in the future (bound)
 // Prefetch: for each decode miss at layer l+1, whether it was among the experts layer l+1 used
 // for the previous token, or among the next layer's most likely experts given this layer's
@@ -44,6 +47,7 @@
 #include <set>
 #include <sstream>
 #include <string>
+#include <tuple>
 #include <unordered_map>
 #include <vector>
 
@@ -215,6 +219,100 @@ static double global_lfu_decay(const Trace& t, int cap) {
     return tot ? 100.0 * hit / tot : 0;
 }
 
+// Replays every access through one shared-budget policy P(budget) with bool touch(key).
+template <class P>
+static double global_policy(const Trace& t, int cap, P p) {
+    long hit = 0, tot = 0;
+    for (size_t s = 0; s < t.routes.size(); s++)
+        for (int l = 0; l < t.n_layer; l++) for (int e : t.routes[s][l]) { bool h = p.touch(l * t.n_exp + e); if (t.is_decode[s]) { tot++; hit += h; } }
+    (void) cap;
+    return tot ? 100.0 * hit / tot : 0;
+}
+
+// ARC (Megiddo & Modha): recency list T1 and frequency list T2, with ghost lists B1/B2 steering
+// the split p between them.
+struct ARC {
+    int c; double p = 0; LRU t1, t2, b1, b2;
+    explicit ARC(int cap) : c(cap), t1(1 << 30), t2(1 << 30), b1(1 << 30), b2(1 << 30) {}
+    static void drop(LRU& x, int e) { auto it = x.pos.find(e); x.l.erase(it->second); x.pos.erase(it); }
+    static int pop_back(LRU& x) { int e = x.l.back(); x.pos.erase(e); x.l.pop_back(); return e; }
+    void replace(bool in_b2) {
+        if (!t1.l.empty() && ((int) t1.l.size() > p || (in_b2 && (int) t1.l.size() == (int) p))) b1.touch(pop_back(t1));
+        else if (!t2.l.empty()) b2.touch(pop_back(t2));
+        else b1.touch(pop_back(t1));
+    }
+    bool touch(int e) {
+        if (t1.pos.count(e)) { drop(t1, e); t2.touch(e); return true; }
+        if (t2.pos.count(e)) { t2.touch(e); return true; }
+        if (b1.pos.count(e)) {
+            p = std::min<double>(c, p + std::max(1.0, (double) b2.l.size() / std::max<size_t>(1, b1.l.size())));
+            replace(false); drop(b1, e); t2.touch(e); return false;
+        }
+        if (b2.pos.count(e)) {
+            p = std::max(0.0, p - std::max(1.0, (double) b1.l.size() / std::max<size_t>(1, b2.l.size())));
+            replace(true); drop(b2, e); t2.touch(e); return false;
+        }
+        const int l1 = (int) (t1.l.size() + b1.l.size()), tot = l1 + (int) (t2.l.size() + b2.l.size());
+        if (l1 == c) {
+            if ((int) t1.l.size() < c) { pop_back(b1); replace(false); } else pop_back(t1);
+        } else if (tot >= c) {
+            if (tot == 2 * c) pop_back(b2);
+            replace(false);
+        }
+        t1.touch(e); return false;
+    }
+};
+
+// LRU-2: evicts the expert whose second-to-last use is oldest (one use so far: oldest last use first).
+struct LRU2 {
+    int cap; long clock = 0;
+    std::unordered_map<int, std::pair<long, long>> hist;  // e -> (second-to-last, last); kept after eviction
+    std::set<std::tuple<long, long, int>> order; std::unordered_map<int, std::pair<long, long>> in;
+    explicit LRU2(int c) : cap(c) {}
+    bool touch(int e) {
+        clock++;
+        auto& h = hist[e]; h = { h.second ? h.second : -1, clock };
+        if (h.first < 0) h.first = -(1L << 40) + clock;  // one use: before every twice-used expert
+        auto it = in.find(e); bool hit = it != in.end();
+        if (hit) order.erase({ it->second.first, it->second.second, e });
+        else if ((int) in.size() >= cap) { auto v = order.begin(); in.erase(std::get<2>(*v)); order.erase(v); }
+        in[e] = h; order.insert({ h.first, h.second, e });
+        return hit;
+    }
+};
+
+// W-TinyLFU (Einziger et al., as in Caffeine): a small LRU window takes new experts; one leaving
+// the window enters the main cache only if it was used more often than the main cache's victim.
+// Main is a segmented LRU: protected (at most 80%) and probation (the rest); a hit in probation
+// moves to protected. Counts are halved every 10 x budget accesses.
+struct WTinyLFU {
+    LRU win, prob, prot; int main_cap, prot_cap; long n = 0, sample; std::unordered_map<int, int> freq;
+    WTinyLFU(int cap, double w)
+        : win(std::max(1, (int) (cap * w))), prob(1 << 30), prot(1 << 30), main_cap(std::max(1, cap - std::max(1, (int) (cap * w)))),
+          prot_cap(main_cap * 4 / 5), sample(10L * cap) {}
+    int f(int e) { auto it = freq.find(e); return it == freq.end() ? 0 : it->second; }
+    static int pop_back(LRU& x) { int e = x.l.back(); x.pos.erase(e); x.l.pop_back(); return e; }
+    bool touch(int e) {
+        if (++n % sample == 0) for (auto it = freq.begin(); it != freq.end();) { if ((it->second /= 2) == 0) it = freq.erase(it); else ++it; }
+        freq[e]++;
+        if (prot.pos.count(e)) { prot.touch(e); return true; }
+        if (auto it = prob.pos.find(e); it != prob.pos.end()) {  // promote; protected's tail falls back to probation
+            prob.l.erase(it->second); prob.pos.erase(it);
+            prot.touch(e);
+            if ((int) prot.l.size() > prot_cap) prob.touch(pop_back(prot));
+            return true;
+        }
+        if (win.pos.count(e)) { win.touch(e); return true; }
+        if ((int) win.l.size() < win.cap) { win.touch(e); return false; }
+        const int cand = win.l.back();
+        win.touch(e);  // pushes cand out of the window
+        if ((int) (prob.l.size() + prot.l.size()) < main_cap) { prob.touch(cand); return false; }
+        LRU& vl = prob.l.empty() ? prot : prob;
+        if (f(cand) > f(vl.l.back())) { pop_back(vl); prob.touch(cand); }
+        return false;
+    }
+};
+
 // ---------------- prefetch coverage (with per-layer LRU at cap) ----------------
 static void prefetch(const Trace& t, int cap, int per_expert) {
     long misses = 0, prev_cov = 0, cooc_cov = 0, prev_extra = 0, cooc_extra = 0;
@@ -288,11 +386,15 @@ int main(int argc, char** argv) {
     size_t n_dec = std::count(t.is_decode.begin(), t.is_decode.end(), true);
     printf("%s: %d layers, %d experts, top-%d, %zu prompt + %zu decode tokens\n", argv[1], t.n_layer, t.n_exp, t.top_k,
            t.routes.size() - n_dec, n_dec);
-    printf("%6s %7s %7s %7s %7s %7s %7s\n", "cap", "lru", "lfu", "slru", "g-lru", "g-lfu", "opt");
+    printf("%6s %7s %7s %7s %7s %7s %7s %7s %7s %7s %7s\n", "cap", "lru", "lfu", "slru", "g-lru", "g-lfu", "g-arc", "g-lru2",
+           "g-tlfu1", "g-tlfu10", "opt");
     for (int cap : caps) {
         if (cap >= t.n_exp) { printf("%6d  (all %d experts fit)\n", cap, t.n_exp); continue; }
-        printf("%6d %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%%\n", cap, per_layer<LRU>(t, cap), per_layer<LFU>(t, cap),
-               per_layer<SLRU>(t, cap), global_lru(t, cap), global_lfu_decay(t, cap), opt_per_layer(t, cap));
+        const int budget = cap * t.n_layer;
+        printf("%6d %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%% %6.1f%%\n", cap, per_layer<LRU>(t, cap),
+               per_layer<LFU>(t, cap), per_layer<SLRU>(t, cap), global_lru(t, cap), global_lfu_decay(t, cap),
+               global_policy(t, cap, ARC(budget)), global_policy(t, cap, LRU2(budget)),
+               global_policy(t, cap, WTinyLFU(budget, 0.01)), global_policy(t, cap, WTinyLFU(budget, 0.10)), opt_per_layer(t, cap));
         fflush(stdout);
     }
     for (int cap : caps) if (cap < t.n_exp) prefetch(t, cap, 2);

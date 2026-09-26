@@ -122,6 +122,20 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
   unsupported 3-D MUL_MAT; use `-b 512`.
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
+- **Decode-split flash attention is off by default ([#140](https://github.com/1bit-MONSTER/engine/issues/140)).**
+  `flash_attention_decode_split_next_q8` gives nondeterministic attention on HRX0, up to 3.66 nats
+  apart between identical requests on Qwen3-0.6B. On Qwen3-Coder-30B-A3B it faulted the GPU in 2 of
+  3 decode runs. So `1bit serve --device hrx` starts llama-server with
+  `GGML_HRX_DISABLE_DISPATCH=decode_split`, and decode uses the flash-attention fallback.
+
+  | model (Q4_K_M, tg) | with decode-split | without (the default) |
+  |---|---|---|
+  | Qwen3-0.6B | 169 ± 34 tok/s, output varies | 322 tok/s, deterministic |
+  | Qwen3-Coder-30B-A3B | faults 2 of 3 runs (80–88 tok/s when it survives) | 66–71 tok/s, 5 of 5 |
+  | ZAYA1-8B | 23.5 tok/s | 25.5 tok/s |
+
+  A `GGML_HRX_DISABLE_DISPATCH` you set yourself wins, and `ONEBIT_HRX_DECODE_SPLIT=1` turns the
+  kernel back on, for testing a fix.
 
 The prefill split below is not affected by either: HRX0 only prefills whole ubatches
 there, and decoding is Vulkan's.
@@ -199,6 +213,34 @@ The Vulkan route has its own upstream llama.cpp pin (latest release), so new
 architectures do not wait for AMD's pair: see [vulkan.md](vulkan.md). This build
 still has a Vulkan backend, which `--device vulkan` uses when `ONEBIT_VULKAN` is
 off.
+
+### The GPU's matrix units (WMMA)
+
+The Radeon 8060S (gfx1151, RDNA 3.5) has RDNA3's six matrix instructions, all on 16×16×16 tiles.
+The rates come from AMD's
+[matrix instruction calculator](https://github.com/ROCm/amd_matrix_instruction_calculator) (commit
+`2ef9189`), for example
+`uv run --with tabulate python3 matrix_calculator.py -a rdna3 -i v_wmma_i32_16x16x16_iu4 -d -w 32`:
+
+| Instruction | Inputs | Per WGP per clock | Cycles |
+|---|---|---|---|
+| `v_wmma_f32_16x16x16_f16` / `_bf16` | f16 / bf16, f32 accumulate | 1024 FLOPs | 32 |
+| `v_wmma_f16_16x16x16_f16`, `v_wmma_bf16_16x16x16_bf16` | same, 16-bit accumulate | 1024 FLOPs | 32 |
+| `v_wmma_i32_16x16x16_iu8` | int8 × int8 | 1024 ops | 32 |
+| `v_wmma_i32_16x16x16_iu4` | int4 × int4 | 2048 ops | 16 |
+
+- int8 runs at the f16 rate. Converting activations to int8 saves memory traffic, not matrix time.
+  Only int4 × int4 doubles the rate.
+- WMMA does not co-execute with other vector instructions.
+- In wave32, A and B are held twice, in lanes 0–15 and again in 16–31. `-A -R` (or `-B`, `-C`,
+  `-D`) prints the register and lane of every element.
+- This box reports 40 compute units (20 WGPs) at up to 2,900 MHz (`rocminfo`). That gives a
+  theoretical peak of about 59 TFLOPS for f16 and 119 TOPS for int4. These are computed from the
+  table, not measured. They bound prefill; decode is limited by memory bandwidth.
+
+HRX's WMMA kernels (e.g. `flash_attention_decode_split_f32_f16_wmma`) load and store fragments
+through the kernel compiler, which places them in these layouts. The fragment sizes match the
+table: 16 f16 inputs and 4 f32 results per lane in wave64.
 
 ## Build
 

@@ -49,6 +49,8 @@
 //                                                  formats) on Vulkan0 (docs/lean.md)
 //   --mtp <head.gguf> on any llama.cpp route    -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
+//   --mmproj <mmproj.gguf> on any llama.cpp route -> images: the vision encoder runs beside the
+//                                                  model, and chat messages may carry image parts
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
@@ -123,6 +125,8 @@ struct Options {
     int prefill_min_tokens = 0;
     bool lean = false;
     std::string mtp;
+    int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM
+    std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
     std::string mtp_p_min;
     int parallel = 0;
@@ -170,8 +174,13 @@ std::string default_llama_server(const std::string& device) {
 // Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
 // does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
 bool fork_only_arch(const std::string& gguf) {
+    // Zyphra ZAYA1 (docs/vulkan.md); OPT, CodeGen, GPT-Neo and GPT-J (llama.cpp #8: upstream has
+    // no model for them, gptj only a name). Keep in step with FORK_ONLY in tools/registry_build.py.
+    static const char* const archs[] = {"zaya", "opt", "codegen", "gptneo", "gptj"};
     const std::string arch = gguf_architecture(gguf);
-    return arch == "zaya";  // Zyphra ZAYA1 (docs/vulkan.md)
+    for (const char* a : archs)
+        if (arch == a) return true;
+    return false;
 }
 
 // --lean: the llama-server built from ROCmFPX (ONEBIT_LEAN), whose formats upstream
@@ -535,8 +544,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (device == "onnx") {
         // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
         // the model's genai_config.json
-        if (o.parallel > 1 || !o.mtp.empty() || o.lean || !o.prefill_device.empty())
-            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --lean or --prefill-device");
+        if (o.parallel > 1 || !o.mtp.empty() || o.lean || !o.prefill_device.empty() || !o.mmproj.empty())
+            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --lean, --prefill-device or --mmproj");
         argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
         return l;
@@ -573,10 +582,26 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             env.push_back("ONEBIT_PREFILL_DEVICE=HRX0");
             if (o.prefill_min_tokens > 0) env.push_back("ONEBIT_PREFILL_MIN_TOKENS=" + std::to_string(o.prefill_min_tokens));
         }
+        if (o.moe_slots > 0) {
+            // routed experts stay in the file (mmap-ed, never read whole); N of them are cached in
+            // Vulkan buffers and streamed in as the router asks (docs/moe-streaming.md)
+            if (device != "vulkan" || split || fork_arch)
+                throw std::runtime_error("--moe-slots works with --device vulkan, without --prefill-device");
+            env.push_back("ONEBIT_MOE_FILE=" + std::filesystem::absolute(o.model).string());
+            env.push_back("ONEBIT_MOE_SLOTS=" + std::to_string(o.moe_slots));
+            argv.insert(argv.end(), {"-ot", "exps=CPU"});
+        }
         if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
+        // HRX0 decode through flash_attention_decode_split gives nondeterministic, sometimes wrong
+        // attention and intermittent GPU faults (MoE models); the fallback is deterministic and, on
+        // most models, faster (#140). A GGML_HRX_DISABLE_DISPATCH the user sets wins, and
+        // ONEBIT_HRX_DECODE_SPLIT=1 turns the kernel back on, for testing a fix.
+        const char* keep_split = std::getenv("ONEBIT_HRX_DECODE_SPLIT");
+        if (device == "hrx" && !(keep_split && std::string(keep_split) == "1"))
+            env.push_back("GGML_HRX_DISABLE_DISPATCH=decode_split");
     } else if (device == "ds4") {
         // DwarfStar: its own GGUF layouts only; it opens its port after the model has loaded
         argv = {o.ds4.empty() ? default_ds4() : o.ds4, "-m", o.model,
@@ -605,6 +630,12 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
+    }
+    if (!o.mmproj.empty()) {
+        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
+        // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
+        // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
+        argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
     }
     return l;
 }
@@ -951,6 +982,8 @@ void usage(FILE* out) {
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--moe-slots N]   stream MoE experts from the file, N held in RAM (vulkan; docs/moe-streaming.md)\n"
+                 "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
@@ -989,6 +1022,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
+        else if (a == "--moe-slots") o.moe_slots = std::stoi(next());
+        else if (a == "--mmproj") o.mmproj = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();
         else if (a == "--parallel") o.parallel = std::stoi(next());
@@ -1014,6 +1049,7 @@ int run_serve(int argc, char** argv) {
     }
     if (fs::is_directory(o.model)) {
         if (o.lean) throw std::runtime_error("--lean serves a .gguf (ROCmFP4 or ROCmI4)");
+        if (!o.mmproj.empty()) throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
         if (o.device != "auto" && o.device != "npu")
             throw std::runtime_error("an NPU model directory runs on --device npu");
 #ifdef ONEBIT_NPU

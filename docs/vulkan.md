@@ -51,6 +51,7 @@ The commit the engine pinned before is kept as the tag `vulkan-upstream-<sha12>`
 | ours: `model: Zamba v1` | Zyphra's Zamba-7B-v1: Mamba-1 layers split into two heads (per-head x_proj/dt_proj, B/C as scan groups) plus one shared transformer block, stored once; converter de-interleaves in_proj | `5319c0e6` |
 | ours: `gguf-py: LlamaHfVocab scores from the merge ranks` | upstream converter bug: models with only a SentencePiece-style BPE `tokenizer.json` (Zamba, Zamba2, and others) got every token score -1000, so merges were picked arbitrarily (Zamba-7B-v1: 318/1500 wikitext lines tokenized like HF); now -rank of the producing merge: 1500/1500 | `ee6e4e0d` |
 | ours: `model: BlackMamba` | Zyphra's BlackMamba (1.5B, 2.8B): Mamba-1 layers alternating with a Switch MoE (sigmoid top-1 router with bias, gated erf-GELU experts), biased final LayerNorm; the converter reads the Megatron checkpoint and uses the built-in GPT-NeoX vocab | `f6261222` |
+| ours: `convert: Zyphra Zamba2-VL` | Zamba2-VL (1.2B, 2.7B, 7B): the Zamba2 language model to a text GGUF (vocab padded to the embedding's 32,064 rows, and a chat template that takes llama.cpp's string content) and Qwen2.5-VL's vision tower to an mmproj (temporal patch 1: the second patch conv is zeros); mtmd runs it unchanged | `f8132a7f` |
 
 Each upstream PR is reviewed line by line before it is pinned. #28243: it touches only the qwen4exp model, its
 converter, and two lines of the shared speculative decoding (the `-md` path fix, and
@@ -102,6 +103,33 @@ Mamba-1 scan (`adb2af5d`), `state-spaces/mamba-370m-hf` F16, `llama-bench -p 256
 Zamba v1 (`ee6e4e0d`), `Zyphra/Zamba-7B-v1` Q8_0: teacher-forced top-1 vs transformers FP32 **96/96** on three prompts; greedy continuations identical to the reference's; pp256 543, tg64 14.9 tok/s; 2 graph splits (all compute on Vulkan0: each layer's two-head scan runs on the Mamba-1 Vulkan kernel from `adb2af5d`). GGUFs of Zamba or Zamba2 converted before `ee6e4e0d` have the broken token scores: reconvert them.
 
 BlackMamba (`f6261222`), `Zyphra/BlackMamba-1.5B`: teacher-forced top-1 vs Zyphra's own PyTorch code (FP32, CPU) **96/96** on three prompts, identical greedy text and prompt tokens; F16 pp256 7180 / tg64 250 tok/s, Q8_0 pp256 10136 / tg64 **369** tok/s. No HF `architectures` in its config.json: the converter routes on `mamba_moe_layers`.
+
+Zamba2-VL (`f8132a7f`): images through `1bit serve --mmproj` ([serve.md](serve.md#images---mmproj)).
+```
+python third_party/llama.cpp-vulkan/convert_hf_to_gguf.py --remote Zyphra/Zamba2-VL-2.7B --outtype q8_0 --outfile zamba2-vl-2.7b-Q8_0.gguf
+python third_party/llama.cpp-vulkan/convert_hf_to_gguf.py --remote Zyphra/Zamba2-VL-2.7B --mmproj --outtype f16 --outfile mmproj-zamba2-vl-2.7b-F16.gguf
+1bit serve -m zamba2-vl-2.7b-Q8_0.gguf --mmproj mmproj-zamba2-vl-2.7b-F16.gguf --device vulkan --ctx-size 8192
+```
+The vision embeddings were checked against transformers' Qwen2.5-VL vision tower in FP32, loaded
+with Zamba2-VL-2.7B's weights and fed by its own image processor: 192 tokens × 2560, mean
+per-token cosine 0.99989 on the CPU and 0.99944 on Vulkan0. The test image is a red square, a blue
+circle and the text "HELLO 42":
+
+| Zamba2-VL (text Q8_0, mmproj F16) | Answer |
+|---|---|
+| 1.2B | the shapes, colours and layout right; reads the text as "HElo 42" |
+| 2.7B | "A red square and a blue circle with the text "HElo 42" underneath."; 40-41 tok/s decode |
+| 7B | "a red square on the left, a blue circle on the right, and the text "HELLO 42" in black" |
+
+The 1.2B and 2.7B misread the text the same way on the CPU and on Vulkan, so the misreading comes
+from the models, not from the port.
+
+GGUFs made before [llama.cpp #17](https://github.com/1bit-MONSTER/llama.cpp/pull/17) carry a chat
+template that left each image inside the user turn instead of in front of it, as Zyphra's
+template has it. llama-server marks images with `<__media_<id>__>`, an id random per server, and
+that template knew only `<__media__>`. Reconvert those GGUFs, or serve them with
+`--chat-template-file`. With the new template the image starts at the same prompt position as in
+Zyphra's processor.
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not
@@ -222,3 +250,39 @@ Until [llama.cpp #15](https://github.com/1bit-MONSTER/llama.cpp/pull/15), ZAYA r
 results whenever a ubatch held more than one sequence: `llama-perplexity` at its default batch,
 and `1bit serve` answering concurrent requests. At four sequences per ubatch, ZAYA1-8B F16's
 wikitext perplexity was 58,259 against 27.89 with one; now both are 27.89 on the CPU.
+
+### ZAYA1-VL-8B: images
+
+[ZAYA1-VL-8B](https://huggingface.co/Zyphra/ZAYA1-VL-8B) is ZAYA1 with Qwen2.5-VL's vision tower
+and two additions ([llama.cpp #18](https://github.com/1bit-MONSTER/llama.cpp/pull/18)):
+
+- **Vision-only LoRA.** Rank-8 LoRA on CCA's q, k, both value projections and o_proj, and rank 32
+  on every expert, used on image tokens only. mtmd decodes each image as its own ubatch of
+  embeddings, so that ubatch takes the LoRA and text ubatches run the ZAYA1 graph unchanged.
+- **Bidirectional attention within an image.** The mmproj key `clip.vision.decode_non_causal`
+  makes mtmd decode the image non-causally. The whole image must fit one ubatch, so `1bit serve
+  --mmproj` passes `-b 4096 -ub 4096` (Qwen2.5-VL caps an image at 4,096 tokens).
+
+```
+python third_party/llama.cpp/convert_hf_to_gguf.py <Zyphra/ZAYA1-VL-8B> --outtype f16 --outfile zaya1-vl-8b-F16.gguf
+python third_party/llama.cpp/convert_hf_to_gguf.py <Zyphra/ZAYA1-VL-8B> --mmproj --outtype f16 --outfile mmproj-zaya1-vl-8b-F16.gguf
+1bit serve -m zaya1-vl-8b-F16.gguf --mmproj mmproj-zaya1-vl-8b-F16.gguf --device vulkan --ctx-size 8192
+```
+
+Checked on Strix Halo against Zyphra's own code (their transformers branch `zaya1-vl`, FP32 on
+the CPU), teacher-forced on llama.cpp's greedy answers to three image questions (101 tokens).
+The prompts are identical: 208 tokens, with the image at the same position.
+
+| Image decode | Reference | Top-1 agreement |
+|---|---|---|
+| causal (the flag set false) | Zyphra's eager path | 100/101 |
+| bidirectional (the default) | eager, with the image block bidirectional | 100/101 |
+
+Zyphra's flash-attention path, which its paper describes, makes everything up to two tokens past
+the image bidirectional. llama.cpp decodes the image bidirectionally and the tokens around it
+causally.
+
+On a synthetic image (a red square, a blue circle, "HELLO 42") the model reads the text exactly,
+and on a photo it recognises the New York Times front page of the moon landing. F16 decodes at
+38-51 tok/s on Vulkan0. ZAYA1-8B is unchanged: 95/96 teacher-forced, the same wikitext
+perplexity.

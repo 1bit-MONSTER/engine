@@ -510,15 +510,47 @@ cold first repetition):
   wasted reads (80 against 61 GiB over the run). What helps here is reading fewer bytes: a
   better hit rate (item 2 below) or smaller experts.
 
+### Routing that prefers resident experts
+
+Since no eviction policy recovers the misses, the other lever is the router itself. With
+`ONEBIT_MOE_SUBST=r` (`1bit serve --moe-subst r`), a streamed layer picks its experts with a CPU
+op in place of the top-k: when a chosen expert is not resident, the best resident expert among
+the router's next k choices takes its place, if it scores at least r times as high. The
+routing weights are then the substitute's own. The op also pins the chosen experts and writes
+their slot indices, in place of the remap op, so a layer still syncs with the host once (98
+graph splits for Coder-30B with or without it; a first version with separate ops had 194).
+
+Qwen3-Coder-30B Q4_K_M, KL divergence against the all-Vulkan logits (`llama-perplexity
+--kl-divergence`, 2 x 512 tokens, batch 1, prefetch on):
+
+| Slots | r | Experts replaced | Drive reads | KLD | Same top token |
+|---|---|---|---|---|---|
+| 1,536 | off | | 290 GiB | 0 | 100% |
+| 1,536 | 0.5 | 5.7% | 232 GiB | 0.012 | 96.7% |
+| 1,536 | 0.25 | 6.3% | 227 GiB | 0.031 | 94.7% |
+| 1,536 | 0.1 | 6.5% | 226 GiB | 0.060 | 91.4% |
+| 3,072 | off | | 79 GiB | 0 | 100% |
+| 3,072 | 0.5 | 2.2% | 58 GiB | 0.0076 | 97.3% |
+| 3,072 | 0.25 | 2.6% | 55 GiB | 0.016 | 96.1% |
+| 3,072 | 0.1 | 2.6% | 55 GiB | 0.028 | 94.7% |
+
+- **r = 0.5 is the setting.** Below it, reads hardly fall further while the divergence doubles
+  at each step.
+- **What's left is prefetch.** At 1,536 slots, demand misses fall from 6.8% to 1.5% of the
+  routed experts. Most of the remaining reads are the gate-ahead prefetch's, and a prefetched
+  expert counts as resident.
+- **Decode** (`llama-bench -n 64`, warm repetitions, off and 0.5 interleaved over two rounds):
+  1,536 slots 8.7-11.9 tok/s against 7.9-10.1, and 3,072 slots 18.9-26.0 against 16.1-21.4.
+  On a slower moment of the shared drive, 1,536 slots gave 8.0-12.4 against 6.0-8.7: the
+  slower the drive, the more it gains (10-35%). At 4,608 slots, it makes no difference.
+
 ## Next
 
 1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on
    Coder-30B ("Where streamed decode spends its time"). 6,144 slots (every expert) runs
    erratically on the shared box.
-2. **Fewer misses without a better policy.** ARC, LRU-2 and W-TinyLFU don't beat the shared LRU
-   ("Classic policies don't close the gap"). What's left: routing that prefers resident
-   experts (a resident expert among the router's next choices stands in for a missing one),
-   measured on quality as well as hit rate.
+2. **Resident-aware routing on other models.** `ONEBIT_MOE_SUBST` is measured on Coder-30B
+   only; Flash-Next (512 experts, top-10) is the model that needs it most.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams
    (hyper-connections), so the predictor needs that model's mixing step before the router.
 4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room

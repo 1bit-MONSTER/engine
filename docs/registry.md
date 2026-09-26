@@ -131,6 +131,22 @@ The high-count entries are the hand review in the generator (`REVIEWED`); the re
 rule and `needs_review: true`, and are re-bucketed as they are worked. Rerun it after a
 census refresh: `tools/census_worklist.py`.
 
+### model_type: a rename keeps the family, a custom one does not
+
+`tools/census.py` also records the config's `model_type` per architecture. That is what
+tells a renamed sibling from a genuinely new family: a rename keeps the family's
+`model_type`, a new family brings its own. `tools/census_worklist.py` uses it to demote any
+name that only *looks* like a family: `MobileLLMForCausalLM` (`model_type` `mobilellm`),
+`SparseMistralforCausalLM` (`sparse_mistral`), `DogeForCausalLM` (`doge`),
+`CambrianQwenForCausalLM` (`cambrian_qwen`) and 383 others are not aliases and are moved to
+`new-LM-family`. With that, the 2026-09-26 sweep reads: bridge-blind-spot 12 archs / 635
+models, rename-alias 236 / 1,193, new-LM-family 1,996 / 17,084, non-LM-modality 109 / 2,995.
+
+`model_type` alone is not proof: `LlamaForCausalLM` itself carries a handful of models whose
+config says `opt`, `Yi` or `aquila`. The rule only rules a candidate *out* (a custom
+`model_type` is not that family); a surviving rename-alias still needs a person's shape
+check before its name is registered.
+
 ## Commands
 
 ```

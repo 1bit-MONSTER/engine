@@ -216,25 +216,26 @@ def families():
 
 
 def classify(arch, stems, runtime, significant):
+    """-> (bucket, note, method, needs_review, candidate_gguf)."""
     if arch in REVIEWED:
         bucket, note = REVIEWED[arch]
-        return bucket, note, "reviewed", False
+        return bucket, note, "reviewed", False, ""
     if arch in significant:
         e = significant[arch]
         mod = MODALITY.search(e.get("family", "") + " " + arch)
         bucket = "non-LM-modality" if mod else "new-LM-family"
-        return bucket, f"registry/significant.json: {e.get('family', arch)}", "significant.json", False
+        return bucket, f"registry/significant.json: {e.get('family', arch)}", "significant.json", False, ""
     if MODALITY.search(arch):
-        return "non-LM-modality", f"name matches modality token {MODALITY.search(arch).group(1)!r}", "rule:modality", True
+        return "non-LM-modality", f"name matches modality token {MODALITY.search(arch).group(1)!r}", "rule:modality", True, ""
     s = stem(arch).lower()
     gguf_ci = {g.lower(): g for g in runtime}
     if s in stems:
         g = stems[s]
         b = "bridge-blind-spot" if g.lower() in gguf_ci else "rename-alias"
-        return b, f"stem {stem(arch)!r} is registered in the converter -> {g}", f"rule:converter-stem:{g}", False
+        return b, f"stem {stem(arch)!r} is registered in the converter -> {g}", f"rule:converter-stem:{g}", False, g
     if s in gguf_ci:
         g = gguf_ci[s]
-        return "bridge-blind-spot", f"runtime arch {g!r} exists", f"rule:runtime-arch:{g}", False
+        return "bridge-blind-spot", f"runtime arch {g!r} exists", f"rule:runtime-arch:{g}", False, g
     # longest converter-stem / runtime-arch substring, min 4 chars, as an alias hint
     best = ""
     for cand in list(stems) + list(gguf_ci):
@@ -242,8 +243,19 @@ def classify(arch, stems, runtime, significant):
             best = cand
     if best:
         g = stems.get(best, gguf_ci.get(best, ""))
-        return "rename-alias", f"contains supported family {best!r} -> {g}", f"rule:family-substring:{g}", True
-    return "new-LM-family", "no runtime arch and no supported family match", "rule:default", True
+        return "rename-alias", f"contains supported family {best!r} -> {g}", f"rule:family-substring:{g}", True, g
+    return "new-LM-family", "no runtime arch and no supported family match", "rule:default", True, ""
+
+
+def note_gguf(note, stems, runtime):
+    """The candidate gguf named in a review note ('llama-shaped', 'gpt2 shape under...')."""
+    gguf_ci = {g.lower(): g for g in runtime}
+    low = note.lower()
+    best = ""
+    for cand in list(stems) + list(gguf_ci):
+        if len(cand) >= 4 and cand in low and len(cand) > len(best):
+            best = cand
+    return stems.get(best, gguf_ci.get(best, ""))
 
 
 def build():
@@ -253,13 +265,32 @@ def build():
     significant = json.load(open(os.path.join(rb.ROOT, "registry/significant.json")))["classes"]
     stems, runtime = families()
     mapped = {a for a, e in registry.items() if e.get("backends")}
+    types = census["raw"].get("types", {})
+    # gguf -> the model_types seen on the mapped architectures that produce it, i.e. what a
+    # genuine rename of that family looks like in the config's model_type.
+    gguf_mt = {}
+    for a in mapped:
+        g = registry[a].get("gguf", "")
+        for mt in types.get(a, {}):
+            gguf_mt.setdefault(g, set()).add(mt)
 
     entries = []
     for arch, n in counts.items():
         if arch in mapped:
             continue
-        bucket, note, method, needs_review = classify(arch, stems, runtime, significant)
-        entries.append({"architecture": arch, "models": n, "bucket": bucket,
+        bucket, note, method, needs_review, cand = classify(arch, stems, runtime, significant)
+        ts = types.get(arch, {})
+        dom = max(ts, key=ts.get) if ts else ""
+        if bucket == "rename-alias" and dom and not cand:
+            cand = note_gguf(note, stems, runtime)
+        # A renamed sibling keeps the family's model_type. A custom one (sparse_mistral,
+        # cambrian_llama, doge, ...) is a new family, and aliasing it would be fake support.
+        if bucket == "rename-alias" and dom and cand and dom not in gguf_mt.get(cand, set()):
+            bucket = "new-LM-family"
+            method = f"rule:custom-model-type:{dom}"
+            note = f"name suggests {cand}, but model_type {dom!r} is not that family's"
+            needs_review = False
+        entries.append({"architecture": arch, "models": n, "bucket": bucket, "model_type": dom,
                         "method": method, "note": note, "needs_review": needs_review})
     entries.sort(key=lambda e: (-e["models"], e["architecture"]))
 

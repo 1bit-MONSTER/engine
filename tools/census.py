@@ -21,7 +21,9 @@ usage: tools/census.py [--max-pages N] [--out registry/census.json]
 
 Walks every page of huggingface.co/api/models?pipeline_tag=text-generation&config=true
 (the config comes inline, so there is no per-model fetch) and counts models by their
-config's first `architectures` entry. Coverage is then read against
+config's first `architectures` entry, also recording the `model_type` distribution per
+architecture (a rename keeps the family's model_type; a new family brings its own).
+Coverage is then read against
 registry/architectures.json (mapped: a backend's code accepts the architecture) and
 registry/checked.json (checked: a model of that architecture ran and passed serve_e2e here).
 The two counts are reported separately and are never added together.
@@ -45,7 +47,7 @@ _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 
 def sweep(max_pages):
-    counts, total, no_arch, url, pages = {}, 0, 0, API, 0
+    counts, types, total, no_arch, url, pages = {}, {}, 0, 0, API, 0
     while url and (max_pages is None or pages < max_pages):
         for attempt in range(6):
             try:
@@ -67,13 +69,21 @@ def sweep(max_pages):
                 no_arch += 1
                 continue
             counts[a] = counts.get(a, 0) + 1
+            mt = (m.get("config") or {}).get("model_type") or ""
+            if mt:
+                types.setdefault(a, {})
+                types[a][mt] = types[a].get(mt, 0) + 1
         pages += 1
         m = _NEXT.search(link)
         url = m.group(1) if m else None
         if pages % 50 == 0:
             print(f"{pages} pages, {total} models", file=sys.stderr)
     return {"total": total, "no_arch": no_arch, "pages": pages, "complete": url is None,
-            "counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))}
+            "counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+            # model_type per architecture: the config's real architecture, which is how a
+            # renamed sibling is told from a genuinely new family (tools/census_worklist.py).
+            "types": {k: dict(sorted(v.items(), key=lambda kv: (-kv[1], kv[0])))
+                      for k, v in sorted(types.items())}}
 
 
 def coverage(raw):

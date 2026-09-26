@@ -27,6 +27,7 @@ OpenAI client.
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--moe-slots N]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
@@ -140,6 +141,21 @@ predictable enough to keep long drafts, prose is not. Draft length 8 collapses o
 prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
+
+## MoE models larger than memory (`--moe-slots`)
+
+`--moe-slots N` (with `--device vulkan`) keeps a MoE model's routed experts in the file and
+holds N of them, across all layers, in GPU memory. Decode reads the missing ones from the drive
+as the router picks them. The rest of the model loads on Vulkan0 as usual.
+
+```sh
+1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --moe-slots 4608 --ctx-size 8192
+```
+
+Qwen3-Coder-30B has 6,144 experts; at 4,608 slots it decodes 27-28 tok/s warm, at 1,536 about
+6-7 (docs/moe-streaming.md, "Streaming in the inference path"). A model that fits in memory is
+faster without it (79-91 tok/s resident). It works with the Vulkan pin's llama-server only, not
+with `--prefill-device`.
 
 ## Many requests at once (`--parallel`)
 

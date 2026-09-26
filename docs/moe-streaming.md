@@ -612,6 +612,11 @@ the change is within the noise (four rounds, 6.7 against 7.0 tok/s).
 
 ## Next
 
+0. **Prompts through the slots.** A batch above `ONEBIT_MOE_MAX_BATCH` (8) runs its experts on the
+   CPU from the mapped file: Flash-Next prompts went at 0.4-0.8 tok/s through `serve`. Candidates:
+   cap llama-server's ubatch at the streamed batch size, or stream larger batches when the
+   layer's slots hold all their experts. (Measuring it was interrupted: the Flash-Next files were
+   removed from the box on 2026-09-26.)
 1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on
    Coder-30B ("Where streamed decode spends its time"). 6,144 slots (every expert) runs
    erratically on the shared box.

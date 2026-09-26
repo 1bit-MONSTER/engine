@@ -119,9 +119,38 @@ run_tests() {
     ctest --test-dir "$BUILD" --output-on-failure > "$LOGS/ctest.log" 2>&1
 }
 
+# every pin a PR moves must be on the branch .gitmodules says that submodule tracks: a shallow
+# clone of that branch cannot fetch a commit off it, and GitHub may drop an unreferenced one
+pins_on_branch() {
+    local path url branch sha repo status bad=0
+    while read -r path; do
+        branch=$(git config -f "$SRC/.gitmodules" --get "submodule.$path.branch" || true)
+        [ -n "$branch" ] || continue
+        url=$(git config -f "$SRC/.gitmodules" --get "submodule.$path.url")
+        sha=$(git -C "$SRC" ls-tree HEAD "$path" | awk '{print $3}')
+        repo=${url#https://github.com/}; repo=${repo%.git}
+        status=$(gh api "repos/$repo/compare/$sha...$branch" --jq .status 2>/dev/null || echo unknown)
+        case "$status" in
+            identical|ahead) echo "ok   $path ${sha:0:12} is on $repo $branch" ;;
+            *) echo "FAIL $path ${sha:0:12} is not on $repo $branch ($status)"; bad=1 ;;
+        esac
+    done < <(git -C "$SRC" diff --name-only HEAD^1 HEAD -- third_party)
+    return $bad
+}
+
+# a llama.cpp bump re-runs every model row registry/check_models.tsv lists for that backend
+# (the architectures only our fork has, such as zaya, and the MoE and Qwen rows among them)
+model_rows() {  # model_rows <vulkan|hrx>
+    guard python3 "$SRC/tools/registry_check.py" "$BUILD/1bit" --models "$HOME/models" --only "$1" \
+        > "$LOGS/models-$1.log" 2>&1 || return 1
+    ! grep -q '^FAIL' "$LOGS/models-$1.log"
+}
+
 # the extra check a bump needs beyond build + ctest (docs/releases.md, "Bumps")
 bump_check() {  # bump_check <branch>
     case "$1" in
+        bump-hrx/*) model_rows hrx ;;
+        bump-llama-vulkan/*) model_rows vulkan ;;
         bump-lemonade/*) lemonade_suite ;;
         bump-laya/*)
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
@@ -129,7 +158,7 @@ bump_check() {  # bump_check <branch>
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" rocm > "$LOGS/ds4.log" 2>&1 ;;
         bump-linux/*) guard "$SRC/scripts/build-kernel.sh" "$W/kernel" > "$LOGS/kernel.log" 2>&1 ;;
         bump-comfyui/*) guard "$SRC/scripts/build-comfyui.sh" "$W/comfyui" > "$LOGS/comfyui.log" 2>&1 ;;
-        *) : ;;  # hrx, llama-vulkan, rocmfpx, zinc, xdna, tokenizers: covered by build + ctest
+        *) : ;;  # rocmfpx, zinc, xdna, tokenizers: covered by build + ctest
     esac
 }
 
@@ -166,6 +195,7 @@ stage_bumps() {
         set +e
         ( set -e
           echo checkout > "$W/.step"; checkout main "$n"
+          echo "the pins' branches" > "$W/.step"; pins_on_branch > "$LOGS/pins.log" 2>&1
           echo build > "$W/.step"; build
           echo ctest > "$W/.step"; run_tests
           echo "the $branch check" > "$W/.step"; bump_check "$branch" ) > "$log" 2>&1

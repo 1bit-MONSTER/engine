@@ -201,7 +201,7 @@ stage_package() {
     rm -rf "$W/windows"
     guard "$SRC/scripts/build-windows.sh" "$W/windows" > "$LOGS/windows.log" 2>&1
     cp "$SRC/LICENSE" "$SRC/NOTICE" "$W/windows/"
-    (cd "$W/windows" && zip -q -r "$OUT/1bit-$tag-windows-x64.zip" .)
+    (cd "$W/windows" && zip -q "$OUT/1bit-$tag-windows-x64.zip" ./*.exe ./*.dll LICENSE NOTICE)  # not work/
     say "package $tag: 1bit OS"
     rm -rf "$W/os"
     guard "$SRC/os/mini/mkimage.sh" "$W/os" "$BUILD" > "$LOGS/os.log" 2>&1

@@ -50,14 +50,35 @@ put vulkan/llama/bin llama-server llama-bench
 put hrx/llama/bin llama-server llama-bench
 put lean/llama/bin llama-server llama-quantize llama-bench
 put lean/llama-rocm/bin llama-server llama-bench
-for b in vulkan rocm cuda; do put "zinc/$b/bin" zinc; done
+for b in vulkan rocm cuda; do
+    put "zinc/$b/bin" zinc
+    [ -d "$build/zinc/$b/share" ] && cp -a "$build/zinc/$b/share" "$stage/zinc/$b/"   # its shaders
+done
 for b in rocm cuda cpu; do put "ds4/$b" ds4-server ds4 ds4-bench; done
 put onnx ryzenai-server
 
-# every program and library finds its libraries beside itself
+# Every program and library finds its libraries beside itself. A library it loads from elsewhere
+# in the build tree (HRX's libhrx, libloomc) is copied beside it; RUNPATH entries outside the
+# build tree (TheRock) stay, since the package needs what the build machine had there.
+fix() {  # fix <staged file> <file in the build>
+    local f=$1 orig=$2 keep="" e dep
+    while read -r dep; do
+        case "$dep" in "$build"/*) [ -e "$(dirname "$f")/$(basename "$dep")" ] || {
+            cp -L "$dep" "$(dirname "$f")/"; queue+=("$(dirname "$f")/$(basename "$dep")|$dep"); } ;; esac
+    done < <(ldd "$orig" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $3}')
+    for e in $(readelf -d "$orig" | sed -n 's/.*R\(UN\)\{0,1\}PATH.*\[\(.*\)\]/\2/p' | tr ':' ' '); do
+        case "$e" in '$ORIGIN'*|"$build"*|"$HOME"*|'') ;; *) keep="$keep:$e" ;; esac
+    done
+    patchelf --set-rpath "\$ORIGIN$keep" "$f"
+}
+queue=()
 while IFS= read -r -d '' f; do
-    is_elf "$f" && patchelf --set-rpath '$ORIGIN' "$f"
+    is_elf "$f" && queue+=("$f|$build/${f#"$stage"/}")
 done < <(find "$stage" -mindepth 2 -type f -print0)
+while [ ${#queue[@]} -gt 0 ]; do
+    item=${queue[0]}; queue=("${queue[@]:1}")
+    fix "${item%%|*}" "${item#*|}"
+done
 
 if [ -n "$xrt" ] && readelf -d "$stage/1bit" | grep -q libxrt; then
     mkdir -p "$stage/xrt/lib"
@@ -71,10 +92,10 @@ else
     patchelf --remove-rpath "$stage/1bit"
 fi
 
-# nothing may still point into the build machine
+# nothing may still point into the build machine's home
 bad=$(find "$stage" -type f -print0 | while IFS= read -r -d '' f; do
-    is_elf "$f" && readelf -d "$f" | grep -E 'R(UN)?PATH' | grep -v '\$ORIGIN' | sed "s|^|$f: |"; done || true)
-[ -z "$bad" ] || { echo "absolute RPATH left:"; echo "$bad"; exit 1; }
+    is_elf "$f" && readelf -d "$f" | grep -E 'R(UN)?PATH' | grep -E "$HOME|$build" | sed "s|^|$f: |"; done || true)
+[ -z "$bad" ] || { echo "RPATH into the build machine left:"; echo "$bad"; exit 1; }
 
 cp "$src/LICENSE" "$src/NOTICE" "$stage/"
 cat > "$stage/README.txt" <<EOF

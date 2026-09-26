@@ -209,7 +209,11 @@ def main() -> None:
            f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe |",
            f"| `1bit-{a.tag}-windows-x64.zip` | 1bit.exe with Vulkan and ONNX backends |",
            f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: boot the engine from a USB stick |",
-           "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", ""]
+           "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", "",
+           "Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); each backend keeps its own "
+           "license. 1bit OS also carries GPL programs (the Linux kernel, BusyBox) as built on the release "
+           "machine; their complete source is available on request for three years from this release: open "
+           "an issue at https://github.com/1bit-MONSTER/engine/issues.", ""]
     open(a.md, "w").write("\n".join(md))
     print(f"{len(ups)} upstreams moved, {len(engine)} engine commits, {len(held)} bumps held")
 

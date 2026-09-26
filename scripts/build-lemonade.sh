@@ -36,4 +36,6 @@ prefix=$(cd "$prefix" && pwd)
 cmake -S "$src" -B "$prefix/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
 cmake --build "$prefix/build" --target lemond lemonade
 cp "$prefix/build/lemond" "$prefix/build/lemonade" "$prefix/bin/"
+# lemond reads resources/ (defaults.json, the model list) beside itself
+rm -rf "$prefix/bin/resources" && cp -r "$prefix/build/resources" "$prefix/bin/"
 echo "built $prefix/bin/lemond (lemonade $(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown))"

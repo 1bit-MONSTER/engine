@@ -261,6 +261,40 @@ def first_paragraph(text):
     return ""
 
 
+# what search results show: about 160 characters of description and 65 of title
+DESCRIPTION_MAX, TITLE_MAX, SUFFIX = 160, 65, " · 1bit engine"
+
+
+def meta_description(text):
+    """Whole sentences up to DESCRIPTION_MAX; else (too long, or too short to say much) the
+    text cut at a clause."""
+    text = " ".join(text.split())
+    out = ""
+    for sentence in re.split(r"(?<=[.!?])\s+(?=[A-Z0-9`\"(])", text):
+        if len(out) + len(sentence) + 1 > DESCRIPTION_MAX:
+            break
+        out = f"{out} {sentence}".strip()
+    if len(out) >= 70 or out == text:
+        return out
+    cut = text[:DESCRIPTION_MAX - 1]
+    for mark in ("; ", ": ", ", ", " "):
+        i = cut.rfind(mark)
+        if i > DESCRIPTION_MAX // 2:
+            return cut[:i].rstrip(",;:") + "…"
+    return cut + "…"
+
+
+def meta_title(title):
+    """"<title> · 1bit engine", else the title alone, else what comes before its colon."""
+    if len(title) <= TITLE_MAX:
+        return title
+    base = title.removesuffix(SUFFIX)
+    if len(base) <= TITLE_MAX:
+        return base
+    head = base.split(":")[0].strip()
+    return head + SUFFIX if len(head + SUFFIX) <= TITLE_MAX else clip(base, TITLE_MAX - 1)
+
+
 def clip(text, n=150):
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
 
@@ -299,6 +333,7 @@ class Site:
               og_type="website", jsonld=None, lastmod=None, noindex=False):
         if not noindex:
             self.pages.append((page_url(name), lastmod or datetime.date.today().isoformat()))
+        title, description = meta_title(title), meta_description(description)
         page = (self.template
                 .replace("{{seo}}", seo_head(name, title, description, og_type, jsonld, noindex))
                 .replace("{{title}}", html.escape(title))
@@ -348,7 +383,8 @@ class Site:
                 f'<p class="source meta"><a href="{REPO}/blob/main/{src.relative_to(ROOT).as_posix()}">View this page\'s source on GitHub ↗</a></p>\n'
                 "</article>\n</div>")
         title = title_of(text)
-        self.write(name, f"{title} · 1bit engine", main, "doc", section, first_paragraph(text) or TAGLINE,
+        page_title = "Meet the engine" if title == "1bit engine" else title  # the README, not the home page
+        self.write(name, f"{page_title} · 1bit engine", main, "doc", section, first_paragraph(text) or TAGLINE,
                    og_type="article", lastmod=last_commit_date(src))
 
     def docs_index(self):
@@ -414,7 +450,8 @@ class Site:
                 f'<div class="links"><a class="btn btn-ghost" href="feed.xml">Atom feed&nbsp;→</a>'
                 f'<a class="btn btn-ghost" href="{OLD_SITE}1bit-blog.html">1bit.MONSTER archive&nbsp;→</a></div></div>\n'
                 f"{log}\n</div></section>\n{self.archive()}")
-        self.write("blog", "Blog · 1bit engine", main, "blog", "blog", "Notes on building the 1bit engine.")
+        self.write("blog", "Blog · 1bit engine", main, "blog", "blog", "Notes from building the 1bit engine: measured results on the NPU, HRX and Vulkan, "
+                   "speculative decoding, quantization and what ships each week.")
 
         def stamp(d):
             return d + "T00:00:00Z"

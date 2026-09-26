@@ -107,6 +107,7 @@ namespace fs = std::filesystem;
 struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
+    std::string flash_attn;  // -fa on/off forwarded to the child llama-server
     std::string llama_server, zinc, hrx_libhsa, mlx;
     std::string prefill_device;
     int prefill_min_tokens = 0;
@@ -532,6 +533,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
+        if (!o.flash_attn.empty() && !split) { argv.insert(argv.end(), {"-fa", o.flash_attn}); }
         if (split) {
             argv.insert(argv.end(), {"-fa", "on"});
             env.push_back("ONEBIT_PREFILL_DEVICE=HRX0");
@@ -933,6 +935,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--host") o.host = next();
         else if (a == "--device") o.device = next();
         else if (a == "-c" || a == "--ctx-size") o.ctx_size = std::stoi(next());
+        else if (a == "-fa" || a == "--flash-attn") o.flash_attn = next();
         else if (a == "--alias") o.alias = next();
         else if (a == "--llama-server") o.llama_server = next();
         else if (a == "--zinc") o.zinc = next();

@@ -111,6 +111,26 @@ of those models was run. The unmapped architectures with the most models are
 `Step1MoEForCausalLM` (2,882), `OPTForCausalLM` (2,097), `ParlerTTSForConditionalGeneration`
 (1,586) and `GPTNeoForCausalLM` (1,565). `tools/census.py --pr-body` lists the top ten.
 
+### The unmapped worklist
+
+A single coverage percentage hides that the unmapped tail is several different jobs.
+`tools/census_worklist.py` reads `registry/census.json`, the registry, the pinned
+converter/runtime arch lists and `registry/significant.json`, and writes
+`registry/unmapped_worklist.json`: every architecture the census saw that the registry does
+not map, with its model count and one of four buckets:
+
+- **bridge-blind-spot** — the backend runtime already accepts the architecture's GGUF arch;
+only the HF -> GGUF bridge (converter registration / `registry_build.py`) is missing.
+- **rename-alias** — a same-shape sibling/rename of a supported family; the name can be
+registered, but only after a shape/parity check.
+- **new-LM-family** — a genuine text decoder the runtime has no arch for. Needs implementation.
+- **non-LM-modality** — TTS, vision, audio, diffusion or action. Needs modality support,
+never an alias.
+
+The high-count entries are the hand review in the generator (`REVIEWED`); the rest carry a
+rule and `needs_review: true`, and are re-bucketed as they are worked. Rerun it after a
+census refresh: `tools/census_worklist.py`.
+
 ## Commands
 
 ```

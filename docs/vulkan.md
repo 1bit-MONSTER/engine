@@ -18,7 +18,8 @@ limitations under the License.
 
 `1bit serve --device vulkan` runs a `llama-server` built from upstream
 [llama.cpp](https://github.com/ggml-org/llama.cpp) (MIT), pinned to its latest
-release in `third_party/llama.cpp-vulkan`. It is a separate tree from
+release in `third_party/llama.cpp-vulkan`, plus the few upstream pull requests we
+carry until upstream merges them ("Carried upstream PRs" below). It is a separate tree from
 `third_party/llama.cpp`, which stays on the llama.cpp + hrx-system pair AMD
 tests together for HRX ([hrx.md](hrx.md)).
 
@@ -26,13 +27,29 @@ Two pins, because the two routes stay current in different ways:
 
 | Route | Source | Pinned to | Moved by |
 |---|---|---|---|
-| `--device vulkan` | `third_party/llama.cpp-vulkan` | ggml-org's latest release | `bump-llama-vulkan.yml`, daily |
+| `--device vulkan` | `third_party/llama.cpp-vulkan` (1bit-MONSTER/llama.cpp `1bit/vulkan-upstream`) | ggml-org's latest release + carried upstream PRs | `bump-llama-vulkan.yml`, daily |
 | `--device hrx` | `third_party/llama.cpp` + `third_party/hrx-system` | AMD's tested pair (ROCm/ggml-staging-automation) | `bump-hrx.yml`, daily |
 
 A new model architecture reaches the Vulkan route the day upstream releases it,
 without waiting for AMD's pair to move. Qwen3.8-Flash-Next (`qwen4exp`) is the
 case that prompted this: upstream added it on 2026-08-27, and AMD's pinned
 llama.cpp (`f1a0aca141de`) cannot load it.
+
+## Carried upstream PRs
+
+`1bit/vulkan-upstream` is ggml-org's release plus these commits. On each new release
+`bump-llama-vulkan.yml` rebases them onto it; one that upstream has merged becomes
+empty and drops out, and one that no longer applies stops the bump for a hand rebase.
+The commit the engine pinned before is kept as the tag `vulkan-upstream-<sha12>`.
+
+| Upstream PR | What it adds | Carried as |
+|---|---|---|
+| [ggml-org#28243](https://github.com/ggml-org/llama.cpp/pull/28243) (Daniel Han, Ryan Monsurate) | Qwen3.8-Flash-Next's NextN/MTP draft head (`--spec-type draft-mtp`), and the fix for `-md` loading the target model instead of the draft file | `62484fba` on v0.5.0 |
+
+Reviewed line by line before it was pinned: it touches only the qwen4exp model, its
+converter, and two lines of the shared speculative decoding (the `-md` path fix, and
+KV sharing kept to gemma4-assistant drafts, as v0.5.0 already did). A draft head can
+only change speed: the target model checks every drafted token.
 
 ## Build
 
@@ -49,13 +66,22 @@ the upstream build and `--device hrx` the HRX build. Without `ONEBIT_VULKAN`,
 `--device vulkan` falls back to the HRX build's Vulkan backend, as before.
 `ONEBIT_LLAMA_SERVER` still overrides both.
 
-## Verified (Strix Halo, v0.5.0 `7fe450e19305`)
+## Verified (Strix Halo)
+
+v0.5.0 `7fe450e19305`:
 
 | Model | Result |
 |---|---|
 | `tests/serve_e2e.sh` (Qwen3-0.6B Q4_K_M) | PASS (`serve_e2e_vulkan_upstream`) |
 | Qwen3.8-27B UD-Q4_K_XL | "The capital of France is Paris.", 12.2 tok/s |
 | Qwen3.8-Flash-Next UD-Q4_K_XL (`--ctx-size 8192`) | "The capital of France is Paris.", 22.0 tok/s; the HRX pin fails to load it |
+
+v0.5.0 + ggml-org#28243 (`62484fba`), llama-server built from the branch:
+
+| Model | Result |
+|---|---|
+| Qwen3-0.6B Q4_K_M | "The capital of France is Paris.", 315-331 tok/s (unchanged) |
+| Qwen3.8-27B UD-Q4_K_XL + `--mtp` (Q4_0 head) | 35.0 / 28.1 / 32.2 tok/s code / prose / short; draft acceptance 188/200, 171/252, 6/6, the same as v0.5.0 |
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not

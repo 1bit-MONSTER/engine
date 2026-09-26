@@ -3,7 +3,7 @@
  "sources": {
   "llama.cpp (vulkan)": "a29be7f40c8b7825d9c009580119a0317b910726",
   "llama.cpp (hrx)": "8dd75eb48f282198abdb0bd748aa0e4594745f1d",
-  "zinc": "3a35e76d64ebb91e2d82e16ddda20ee865ce1d45"
+  "zinc": "29bc350ac4cbf9f110ec628b9e177ea04ac816fb"
  },
  "counts": {
   "hrx": 300,

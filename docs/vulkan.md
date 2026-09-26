@@ -286,3 +286,20 @@ On a synthetic image (a red square, a blue circle, "HELLO 42") the model reads t
 and on a photo it recognises the New York Times front page of the moon landing. F16 decodes at
 38-51 tok/s on Vulkan0. ZAYA1-8B is unchanged: 95/96 teacher-forced, the same wikitext
 perplexity.
+
+## OPT, GPT-Neo, CodeGen and GPT-J, from our llama.cpp
+
+Upstream llama.cpp has no model code for these four older families (for `gptj` it has only
+the name). Our llama.cpp ports them ([PR #8](https://github.com/1bit-MONSTER/llama.cpp/pull/8),
+engine #138). `1bit serve --device vulkan` routes them to that build's `Vulkan0`, the same way
+it routes ZAYA.
+
+Each port was checked against transformers FP32: teacher-forced top-1 agreement over 3 prompts
+of 32 tokens, and one prompt of 340 tokens.
+
+| Model | Top-1 agreement | Fixed on the way |
+|---|---|---|
+| facebook/opt-125m | 96/96 | tokenizer checksum |
+| EleutherAI/gpt-neo-125m | 96/96 | no attention scaling, as in transformers |
+| Salesforce/codegen-350M-mono | 96/96 (was 0/96) | the (query, value, key) order of `qkv_proj`; the `lm_head` bias |
+| tiny-random-GPTJForCausalLM | 89/89 | `lm_head` bias, mask buffers, tokenizer checksum |

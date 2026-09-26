@@ -553,13 +553,47 @@ Qwen3-Coder-30B Q4_K_M, KL divergence against the all-Vulkan logits (`llama-perp
   On a slower moment of the shared drive, 1,536 slots gave 8.0-12.4 against 6.0-8.7: the
   slower the drive, the more it gains (10-35%). At 4,608 slots, it makes no difference.
 
+### Flash-Next, streamed
+
+Qwen3.8-Flash-Next UD-Q4_K_XL (111 GB: 71.7 GiB of routed experts, 24,576 of them; 26.8 GiB of
+per-layer token embeddings) runs with 4.6 GiB on the GPU plus the expert slots. The experts and
+the per-layer embedding table stay file-backed (`-ot exps=CPU,per_layer_token_embd=CPU --no-host
+--no-repack --load-mode mmap`, which `1bit serve --moe-slots` passes). The gate-ahead prefetch
+is off: its predictor does not fit this model's hyper-connections (Next, item 3).
+
+Decode is timed as a batch-1 `llama-perplexity` pass over 512 tokens (every step a decode step).
+KL divergence is against the exact streamed run, which equals the model, since streaming is
+bit-exact. Exact and substituted runs were interleaved on the shared box:
+
+| Slots (share) | Routing | tok/s | Misses | Read / 512 tokens | KLD | Same top token |
+|---|---|---|---|---|---|---|
+| 4,608 (19%) | exact | 3.5-3.7 | 22.0% | 157 GiB | 0 | 100% |
+| 4,608 | r 0.9 | 4.1 | 18.8% | 134 GiB | 0.028 | 94.5% |
+| 4,608 | r 0.5 | 6.8 | 9.0% | 64 GiB | 0.075 | 90.2% |
+| 9,216 (38%) | exact | 5.4-6.2 | 9.5% | 68 GiB | 0 | 100% |
+| 9,216 | r 0.9 | 6.3-6.5 | 7.9% | 57 GiB | 0.015 | 95.7% |
+| 9,216 | r 0.5 | 6.9 | 4.5% | 32 GiB | 0.072 | 86.7% |
+
+(Reads include filling the slots from cold: about 13 GiB at 4,608 slots, 27 GiB at 9,216.)
+Perplexity of the exact runs: 11.32.
+
+- **A model larger than the box's free memory decodes at 3.5-6 tok/s exactly**, from 18-32
+  GiB of GPU memory in all, instead of the 77 GiB it needs resident (40-49 tok/s with MTP).
+- **Substitution costs far more here than on Coder-30B.** At r 0.5 the KL divergence is 0.07
+  (Coder: 0.008-0.012): a token spreads over 10 of 512 experts, and a stand-in differs more
+  from the expert it replaces. r 0.9 keeps it at 0.015-0.028 for a 5-15% gain. Use r 0.9 or
+  none on this model.
+- **The drive is the limit.** At 4,608 slots, 4.0 ms per layer goes to waiting for reads
+  against 1.7 ms of everything else.
+
 ## Next
 
 1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on
    Coder-30B ("Where streamed decode spends its time"). 6,144 slots (every expert) runs
    erratically on the shared box.
-2. **Resident-aware routing on other models.** `ONEBIT_MOE_SUBST` is measured on Coder-30B
-   only; Flash-Next (512 experts, top-10) is the model that needs it most.
+2. **A better stand-in than the router's next choice.** On Flash-Next, r 0.5 costs a KL divergence
+   of 0.07 ("Flash-Next, streamed"). Candidates: weighing a stand-in by how often it co-occurs
+   with the missing expert, or reading only the missing expert's most-weighted rows.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams
    (hyper-connections), so the predictor needs that model's mixing step before the router.
 4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room

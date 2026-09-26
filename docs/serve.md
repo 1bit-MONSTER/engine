@@ -163,6 +163,10 @@ R times as high. `0.5` cut Coder-30B's drive reads by 20-27% and sped decode up 
 and 3,072 slots, for a KL divergence of 0.008-0.012 against the exact model (docs/moe-streaming.md,
 "Routing that prefers resident experts"). Without it, routing is exact.
 
+Qwen3.8-Flash-Next UD-Q4_K_XL (111 GB) runs this way from 18-32 GiB of GPU memory: 3.5-6 tok/s
+exact at 4,608-9,216 slots. On that model use `--moe-subst 0.9` or none: 0.5 costs a KL
+divergence of 0.07 there.
+
 ## Many requests at once (`--parallel`)
 
 `--parallel N` gives llama-server N slots (`-np N`): requests that arrive together decode

@@ -593,7 +593,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (!o.moe_subst.empty()) env.push_back("ONEBIT_MOE_SUBST=" + o.moe_subst);
             // the experts stay file-backed: without these, llama.cpp copies every one into RAM
             // (a pinned Vulkan host buffer, or a CPU repack), which is what streaming avoids
-            argv.insert(argv.end(), {"-ot", "exps=CPU", "--no-host", "--no-repack", "--load-mode", "mmap"});
+            // (per_layer_token_embd: Qwen3.8-Flash-Next's 26.8 GiB table, only ever row-gathered)
+            argv.insert(argv.end(), {"-ot", "exps=CPU,per_layer_token_embd=CPU", "--no-host", "--no-repack", "--load-mode", "mmap"});
         }
         if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);

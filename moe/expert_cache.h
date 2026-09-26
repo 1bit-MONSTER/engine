@@ -36,7 +36,7 @@
 namespace onebit::moe {
 
 struct CacheOptions {
-    int slots = 1024;         // experts held in RAM, all layers together
+    int slots = 1024;         // experts held in RAM, all layers together (each layer keeps the same share)
     bool per_layer = false;   // false: one LRU over all layers (it hit more in replays); true: slots / layers each
     int io_threads = 8;       // reads in flight
     bool pin = true;          // mlock the slots
@@ -70,7 +70,8 @@ public:
 
     CacheStats stats() const;
     void reset_stats();
-    size_t slot_bytes() const { return slot_bytes_; }
+    size_t slot_bytes() const { return slot_bytes_; }  // the largest slot
+    size_t pinned_bytes() const { return mem_bytes_; }
     int slots() const { return (int) slots_.size(); }
 
 private:
@@ -82,6 +83,7 @@ private:
         int pending = 0;          // reads not finished
         bool prefetched = false;  // loaded by prefetch() and not acquired since
         std::vector<size_t> part_off;  // byte offset of each part's data inside the slot
+        size_t off = 0;           // byte offset of the slot in the pinned region
         std::list<int>::iterator lru_it;
         int lru_list = 0;
     };

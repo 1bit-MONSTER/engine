@@ -172,6 +172,10 @@ co-occurrence with the previous layer) cover under 30%.
   - `acquire(layer, experts)` blocks until the experts are resident and pins them until
     `release`. `prefetch(layer, experts)` only queues reads.
   - Eviction is LRU, over one budget shared by all layers (the replays favour it) or per layer.
+  - Slots come in size classes. Unsloth's UD quants use bigger types for some layers' experts,
+    so layers are grouped by the bytes one expert needs, and each group gets its own slots
+    (same share of experts per layer). Flash-Next's 9,216 slots pin 27.0 GiB this way,
+    instead of 34.4 GiB with one slot size.
 - **`1bit moe-cache`** replays a trace through the cache against the real model file, with
   real reads. Compute is simulated per layer:
   1. at the layer's start, the prefetch is issued (lookahead 1: this layer's gate-ahead
@@ -332,7 +336,7 @@ resident, as in a fleet), the cache sets the speed:
 | Qwen3-Coder-30B-A3B | Q4_K_M, all on Vulkan0 | 92-93 | UD-Q4_K_XL: 0.027 at a similar size | 13.2 GiB of 17.5 GiB | 32-48 (code 34, chat 48, long 32) |
 | Qwen3.6-35B-A3B | **UD-Q5_K_XL**, all on Vulkan0 (faster than Q8_0 at nearly its quality) | 52-53 | 0.009 | ≈16.5 GiB of ≈21.9 GiB | 32-39 |
 | GLM-4.7-Flash | Q4_K_M, all on Vulkan0 | 71 | no other quant measured | ≈12.6 GiB of ≈16.8 GiB | 33-40 |
-| Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP n = 3, resident on Vulkan (about 77 GiB) | 40-49 | | 27.5 GiB of 71.7 GiB (34.4 GiB pinned) | 7-12 on this drive (ceiling 24-34 at 3.7 GB/s) |
+| Qwen3.8-Flash-Next | UD-Q4_K_XL + MTP n = 3, resident on Vulkan (about 77 GiB) | 40-49 | | 27.5 GiB of 71.7 GiB (27.0 GiB pinned) | 7-12 on this drive (ceiling 24-34 at 3.7 GB/s) |
 
 MTP is available only for Flash-Next, and it is worth it both ways: 1.6-1.9 times resident,
 and it leaves the drive's reads per token unchanged when streamed.
@@ -378,8 +382,8 @@ resident) and 22 ms with it (45.5 tok/s):
 | 384 (55.1 GiB) | 37 / 43 MB | 26.0 / 26.0 | 31.3 / 29.8 | 45.5 / 45.5 |
 
 **Measured on the drive** (`1bit moe-cache`, chat and long traces, 192 per layer = 9,216
-slots: 27.5 GiB of experts in 34.4 GiB of pinned slots. Each slot is sized for the largest
-layer's expert, and the UD quant uses bigger types in some layers):
+slots: 27.5 GiB of experts in 34.4 GiB of pinned slots. At the time, every slot was sized for
+the largest layer's expert. Size classes (below) now pin 27.0 GiB for the same slots):
 
 | mode | compute per token | decode tok/s | stall per token |
 |---|---|---|---|
@@ -420,7 +424,5 @@ below the floor.
    caches. Candidates: frequency with decay per layer, and hints from the router's scores.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams
    (hyper-connections), so the predictor needs that model's mixing step before the router.
-4. **Slots sized per layer.** Mixed-quant (UD) models waste up to 25% of the pinned memory
-   with one slot size. Flash-Next's 9,216 slots pin 34.4 GiB for 27.5 GiB of experts.
-5. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room
+4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room
    on the drive.

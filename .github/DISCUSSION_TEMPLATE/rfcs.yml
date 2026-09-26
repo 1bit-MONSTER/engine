@@ -1,0 +1,65 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# The form for the RFCs discussion category (CONTRIBUTING.md, "RFCs").
+title: "RFC: "
+labels: ["rfc"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        An RFC settles a design before code (CONTRIBUTING.md, "RFCs"). Security problems do not
+        go here: report them privately (SECURITY.md).
+  - type: textarea
+    id: problem
+    attributes:
+      label: Problem
+      description: What does not work, or cannot be done, today? Who runs into it?
+    validations:
+      required: true
+  - type: textarea
+    id: design
+    attributes:
+      label: Design
+      description: What changes, and how? Name the files, commands, flags or API routes affected.
+    validations:
+      required: true
+  - type: textarea
+    id: alternatives
+    attributes:
+      label: Alternatives
+      description: What else was considered, and why not that?
+    validations:
+      required: true
+  - type: textarea
+    id: verification
+    attributes:
+      label: How it will be checked
+      description: The test that runs it (CONTRIBUTING.md rule 1), on which hardware, and the reference any accuracy claim is measured against.
+    validations:
+      required: true
+  - type: textarea
+    id: dependencies
+    attributes:
+      label: Dependencies, licences and security
+      description: New dependencies or pins and their licences (what NOTICE gains), and any effect on network exposure, secrets or workflow permissions. "None" is a fine answer.
+    validations:
+      required: true
+  - type: textarea
+    id: open
+    attributes:
+      label: Open questions
+    validations:
+      required: false

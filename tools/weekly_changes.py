@@ -284,9 +284,10 @@ def main() -> None:
         span = f"`{u['from'][:12]}` → `{u['to'][:12]}`" if u["from"] else f"new: `{u['to'][:12]}`"
         count = f", {u['total']} commits" if u.get("total") else ""
         md.append(f"### {u['name']} ({u['repo']})")
-        md.append(f"{span}{count} ([compare]({u['url']}))")
+        md.append(f"{span}{count} ([{'compare' if u['from'] else 'commit'}]({u['url']}))")
         if u.get("versions"):
-            md.append(f"Linux {u['versions'][0]} → {u['versions'][1]}")
+            v0, v1 = u["versions"]
+            md.append(f"Linux {v0} → {v1}" if v0 else f"Linux {v1}")
         for r in u.get("releases", []):
             md.append(f"- Release [{r['name']}]({r['url']})")
         for c in u["commits"][:25]:

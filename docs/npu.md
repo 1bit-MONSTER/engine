@@ -93,7 +93,9 @@ weights over the bound. The Q6_K tensors (half of `v_proj` and `down_proj`, and
 `lm_head` from the Q6_K embedding) requantize to cosine 0.9969 and relative RMS error
 0.079. The output is 683,820,936 bytes, the same size as FastFlowLM's
 `Qwen3-0.6B-NPU2` apart from the header. The directory has no `npu/` kernels, so it
-runs on the dx route.
+runs on the dx route. There it decoded 24/24 greedy tokens the same as a CPU reference of
+the repacked weights, with every step's logits at cosine 0.99995 or better (21.0 ms per
+step). `1bit serve --device npu -m <dir>` loads it in 1.1 s and answers at 54-60 tok/s.
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
 OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its

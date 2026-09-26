@@ -172,7 +172,7 @@ Q4_K_M (5.17 GiB), by device:
 |---|---|---|---|
 | Vulkan0 | 3,437 tok/s | 93.0 tok/s | 21.57 |
 | ROCm0 | ~2,400 tok/s | 61.5 tok/s | 21.78 |
-| HRX0 | 1,175 tok/s | 25.5 tok/s | 21.55 |
+| HRX0 | 2,137 tok/s | 47.9 tok/s | 21.65 |
 
 F16 on Vulkan0: 1,138 tok/s prefill, 45.9 tok/s decode, perplexity 20.59.
 
@@ -183,6 +183,13 @@ slightly higher figure.
 Vulkan decodes fastest, so `auto` and `--device vulkan` stay the default for ZAYA. The engine's
 `--device rocm` server is built from ROCmFPX's tree, which has no ZAYA; the ROCm numbers above are
 our llama.cpp built with `GGML_HIP=ON` for gfx1151.
+
+HRX0 decoded at 25.5 tok/s until [llama.cpp #24](https://github.com/1bit-MONSTER/llama.cpp/pull/24): ggml-hrx sent
+seven of ZAYA's ops per layer to the CPU (the grouped-conv matmul, the router's softmax, top-k and
+gather, and a few copies), 641 graph splits per decoded token. New HRX kernels for those ops (see
+[hrx.md](hrx.md#our-patches)) make the decode graph one split, and decode 1.9x faster. The perplexity moves
+from 21.55 to 21.65, which is kernel rounding amplified by top-1 routing: with the new kernels turned off
+(`GGML_HRX_DISABLE_DISPATCH`) the build reproduces the old figure exactly. Vulkan and the CPU are unchanged.
 
 What it took, besides the port: CCA's grouped convolution runs as one batched matmul per tap
 (as one small matmul per group it held Vulkan decode at 50 tok/s), and the graph avoids what

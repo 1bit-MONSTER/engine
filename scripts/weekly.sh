@@ -137,10 +137,17 @@ bump_check() {  # bump_check <branch>
 lemonade_suite() {
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     local venv=$W/lemonade-venv
-    [ -x "$venv/bin/python" ] || { python3 -m venv "$venv" && "$venv/bin/pip" -q install openai requests huggingface_hub; }
+    [ -x "$venv/bin/python" ] || python3 -m venv "$venv"
+    "$venv/bin/pip" -q install -r "$SRC/third_party/lemonade/test/requirements.txt"  # the suite's own list
+    # the suite talks to a running lemond: ours, on a port of its own, with this build's 1bit
+    local port=13399 pid rc=0
+    LEMONADE_ONEBIT_BIN="$BUILD/1bit" "$W/lemonade/bin/lemond" --port "$port" > "$LOGS/lemond.log" 2>&1 &
+    pid=$!
     ( cd "$SRC/third_party/lemonade" &&
-      PATH="$W/lemonade/bin:$BUILD:$PATH" LEMONADE_ONEBIT_BIN="$BUILD/1bit" \
-      "$venv/bin/python" test/server_llm.py --wrapped-server onebit --backend vulkan ) > "$LOGS/lemonade-suite.log" 2>&1
+      PATH="$W/lemonade/bin:$BUILD:$PATH" LEMONADE_ONEBIT_BIN="$BUILD/1bit" LEMONADE_TEST_PORT="$port" \
+      "$venv/bin/python" test/server_llm.py --wrapped-server onebit --backend vulkan ) > "$LOGS/lemonade-suite.log" 2>&1 || rc=$?
+    kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
+    return $rc
 }
 
 # --- stages -------------------------------------------------------------------------------
@@ -156,9 +163,17 @@ stage_bumps() {
         say "bump #$n $branch"
         local result=merged why="" rc
         # a subshell outside any condition, so that set -e holds inside it
-        set +e; ( set -e; checkout main "$n"; build; run_tests; bump_check "$branch" ) > "$log" 2>&1; rc=$?; set -e
+        set +e
+        ( set -e
+          echo checkout > "$W/.step"; checkout main "$n"
+          echo build > "$W/.step"; build
+          echo ctest > "$W/.step"; run_tests
+          echo "the $branch check" > "$W/.step"; bump_check "$branch" ) > "$log" 2>&1
+        rc=$?; set -e
         if [ $rc -ne 0 ]; then
-            result=held why="failed on Strix Halo: $(tail -n 3 "$log" "$LOGS"/ctest.log 2>/dev/null | tr '\n' ' ' | cut -c1-300)"
+            # the step that failed, and the last lines of the log it wrote (the newest besides ours)
+            local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-" | head -1)
+            result=held why="failed at $(cat "$W/.step") on Strix Halo ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
         elif [ "$DRY" = 1 ]; then
             result=passed why="dry run: not merged"
         else

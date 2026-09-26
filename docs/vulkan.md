@@ -48,6 +48,8 @@ The commit the engine pinned before is kept as the tag `vulkan-upstream-<sha12>`
 | [ggml-org#21412](https://github.com/ggml-org/llama.cpp/pull/21412) (Echo Labs) | Zyphra's Zamba2 (Mamba-2 layers plus shared transformer blocks, per-layer LoRA adapters merged at conversion) and its converter | `5ce79a56` |
 | ours: `vulkan: SSM_SCAN for d_state 64` | Vulkan's Mamba-2 scan had pipelines only for a 128/256 state, so Zamba2-2.7B/7B (state 64) ran the scan on the CPU in every layer; two test-backend-ops cases with their shapes | `a32f0d6f` |
 | ours: `vulkan: SSM_SCAN for Mamba-1` | Vulkan's scan only handled Mamba-2, so every Mamba-1 layer (Mamba, Falcon-Mamba, Zamba v1, BlackMamba) ran on the CPU; a per-channel kernel with the state in registers (d_state 16), three test-backend-ops cases | `adb2af5d` |
+| ours: `model: Zamba v1` | Zyphra's Zamba-7B-v1: Mamba-1 layers split into two heads (per-head x_proj/dt_proj, B/C as scan groups) plus one shared transformer block, stored once; converter de-interleaves in_proj | `5319c0e6` |
+| ours: `gguf-py: LlamaHfVocab scores from the merge ranks` | upstream converter bug: models with only a SentencePiece-style BPE `tokenizer.json` (Zamba, Zamba2, and others) got every token score -1000, so merges were picked arbitrarily (Zamba-7B-v1: 318/1500 wikitext lines tokenized like HF); now -rank of the producing merge: 1500/1500 | `ee6e4e0d` |
 
 Each upstream PR is reviewed line by line before it is pinned. #28243: it touches only the qwen4exp model, its
 converter, and two lines of the shared speculative decoding (the `-md` path fix, and
@@ -95,6 +97,8 @@ v0.5.0 + #28243 + #21412 + the d_state-64 scan (`a32f0d6f`); Zamba2 converted wi
 | 7B-Instruct (2 shared blocks, RoPE) | 523 (was 29) | 17.1 (was 2.1) | correct, 16.7 tok/s |
 
 Mamba-1 scan (`adb2af5d`), `state-spaces/mamba-370m-hf` F16, `llama-bench -p 256 -n 64`: pp256 228 → **6736** tok/s, tg64 25.8 → **173.5** tok/s; greedy completions identical to the CPU-scan build; test-backend-ops SSM_SCAN 17/17.
+
+Zamba v1 (`ee6e4e0d`), `Zyphra/Zamba-7B-v1` Q8_0: teacher-forced top-1 vs transformers FP32 **96/96** on three prompts; greedy continuations identical to the reference's; pp256 543, tg64 14.9 tok/s; 2 graph splits (all compute on Vulkan0: each layer's two-head scan runs on the Mamba-1 Vulkan kernel from `adb2af5d`). GGUFs of Zamba or Zamba2 converted before `ee6e4e0d` have the broken token scores: reconvert them.
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not

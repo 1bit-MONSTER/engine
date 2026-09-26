@@ -28,6 +28,7 @@ vulkan	zaya1-8b-Q4_K_M.gguf	--ctx-size	8192
 vulkan	zyphra/Zamba2-1.2B-instruct-Q8_0.gguf	--ctx-size	4096
 vulkan	zyphra/Zamba2-2.7B-instruct-Q8_0.gguf	--ctx-size	4096
 vulkan	zyphra/Zamba2-7B-Instruct-Q8_0.gguf	--ctx-size	4096
+vulkan	zyphra/Zamba-7B-v1-Q8_0.gguf	--ctx-size	4096
 hrx	Qwen3-0.6B-Q4_K_M.gguf
 hrx	qwen2.5-7b-instruct-q4_k_m-merged.gguf
 hrx	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf

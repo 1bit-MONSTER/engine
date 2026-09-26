@@ -449,8 +449,17 @@ below the floor.
 the model file while it decodes. The llama.cpp Vulkan pin (fork PR #19, `1bit/moe-stream`)
 does the work, driven by environment variables that `serve` sets (`ONEBIT_MOE_FILE`,
 `ONEBIT_MOE_SLOTS`; `src/llama-moe-stream.h` lists the rest). The expert tensors load on the
-CPU memory-mapped (`-ot exps=CPU`), so their pages are read only when a prompt batch touches
-them. Batches of up to 8 tokens (decode) use the slots; prompts keep the mapped path.
+CPU memory-mapped (`-ot exps=CPU --no-host --no-repack --load-mode mmap`), so their pages are
+read only when a prompt batch touches them. Batches of up to 8 tokens (decode) use the slots;
+prompts keep the mapped path.
+
+All three flags are needed. With `-ot exps=CPU` alone, llama.cpp puts the experts in a pinned
+Vulkan host buffer (Coder-30B: 16.9 GiB of RAM); `--no-host` alone gets a CPU repack (12.7
+GiB); and this build's default load mode reads the file into memory. With all three, the
+experts are a `CPU_Mapped` buffer and the process holds 259 MiB of anonymous memory. `1bit
+serve --moe-slots` passes all three. Before 2026-09-26 it passed only `-ot exps=CPU`, so the
+streamed runs below also held a full RAM copy of the experts. Decode never used that copy, so
+the speeds hold, but the memory saving did not.
 
 - **GPU mode** (the default): each layer's slots live in a Vulkan device buffer the host
   maps, packed as expert tensors. A CPU op pins the batch's experts, reads the misses with
@@ -469,7 +478,7 @@ Decode speed, Qwen3-Coder-30B-A3B Q4_K_M (48 layers x 128 experts = 6,144; `llam
 | Setup | tok/s |
 |---|---|
 | all on Vulkan0 (resident) | 79-91 |
-| experts on the CPU, memory-mapped | 25-43 |
+| experts on the CPU (a pinned host copy, see above) | 25-43 |
 | streamed, 4,608 slots (75%) | 28-38 (12 cold) |
 | streamed, 3,072 slots (50%) | 17-22 |
 | streamed, 1,536 slots (25%) | 8-10 |

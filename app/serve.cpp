@@ -584,14 +584,16 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (o.prefill_min_tokens > 0) env.push_back("ONEBIT_PREFILL_MIN_TOKENS=" + std::to_string(o.prefill_min_tokens));
         }
         if (o.moe_slots > 0) {
-            // routed experts stay in the file (mmap-ed, never read whole); N of them are cached in
+            // routed experts stay in the file (memory-mapped, never read whole); N of them are cached in
             // Vulkan buffers and streamed in as the router asks (docs/moe-streaming.md)
             if (device != "vulkan" || split || fork_arch)
                 throw std::runtime_error("--moe-slots works with --device vulkan, without --prefill-device");
             env.push_back("ONEBIT_MOE_FILE=" + std::filesystem::absolute(o.model).string());
             env.push_back("ONEBIT_MOE_SLOTS=" + std::to_string(o.moe_slots));
             if (!o.moe_subst.empty()) env.push_back("ONEBIT_MOE_SUBST=" + o.moe_subst);
-            argv.insert(argv.end(), {"-ot", "exps=CPU"});
+            // the experts stay file-backed: without these, llama.cpp copies every one into RAM
+            // (a pinned Vulkan host buffer, or a CPU repack), which is what streaming avoids
+            argv.insert(argv.end(), {"-ot", "exps=CPU", "--no-host", "--no-repack", "--load-mode", "mmap"});
         }
         if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);

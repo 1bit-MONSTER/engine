@@ -47,6 +47,7 @@ The commit the engine pinned before is kept as the tag `vulkan-upstream-<sha12>`
 | [ggml-org#28243](https://github.com/ggml-org/llama.cpp/pull/28243) (Daniel Han, Ryan Monsurate) | Qwen3.8-Flash-Next's NextN/MTP draft head (`--spec-type draft-mtp`), and the fix for `-md` loading the target model instead of the draft file | `62484fba` on v0.5.0 |
 | [ggml-org#21412](https://github.com/ggml-org/llama.cpp/pull/21412) (Echo Labs) | Zyphra's Zamba2 (Mamba-2 layers plus shared transformer blocks, per-layer LoRA adapters merged at conversion) and its converter | `5ce79a56` |
 | ours: `vulkan: SSM_SCAN for d_state 64` | Vulkan's Mamba-2 scan had pipelines only for a 128/256 state, so Zamba2-2.7B/7B (state 64) ran the scan on the CPU in every layer; two test-backend-ops cases with their shapes | `a32f0d6f` |
+| ours: `vulkan: SSM_SCAN for Mamba-1` | Vulkan's scan only handled Mamba-2, so every Mamba-1 layer (Mamba, Falcon-Mamba, Zamba v1, BlackMamba) ran on the CPU; a per-channel kernel with the state in registers (d_state 16), three test-backend-ops cases | `adb2af5d` |
 
 Each upstream PR is reviewed line by line before it is pinned. #28243: it touches only the qwen4exp model, its
 converter, and two lines of the shared speculative decoding (the `-md` path fix, and
@@ -92,6 +93,8 @@ v0.5.0 + #28243 + #21412 + the d_state-64 scan (`a32f0d6f`); Zamba2 converted wi
 | 1.2B-instruct | 3166 | 89.8 | "The capital of France is Paris." |
 | 2.7B-instruct | 1541 (was 614) | 45.2 (was 4.3: scan on the CPU) | correct |
 | 7B-Instruct (2 shared blocks, RoPE) | 523 (was 29) | 17.1 (was 2.1) | correct, 16.7 tok/s |
+
+Mamba-1 scan (`adb2af5d`), `state-spaces/mamba-370m-hf` F16, `llama-bench -p 256 -n 64`: pp256 228 → **6736** tok/s, tg64 25.8 → **173.5** tok/s; greedy completions identical to the CPU-scan build; test-backend-ops SSM_SCAN 17/17.
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not

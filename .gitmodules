@@ -57,7 +57,8 @@
 	shallow = true
 [submodule "third_party/llama.cpp-vulkan"]
 	path = third_party/llama.cpp-vulkan
-	url = https://github.com/ggml-org/llama.cpp.git
+	url = https://github.com/1bit-MONSTER/llama.cpp.git
+	branch = 1bit/vulkan-upstream
 	shallow = true
 [submodule "third_party/llama.cpp-rocmfpx"]
 	path = third_party/llama.cpp-rocmfpx

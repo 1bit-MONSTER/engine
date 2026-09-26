@@ -14,15 +14,20 @@
 # limitations under the License.
 #
 # Keep third_party/llama.cpp-vulkan on upstream llama.cpp's latest release
-# (docs/vulkan.md): when ggml-org publishes a new release, open a PR here moving
-# the submodule. Releases, not master: each is a commit upstream's CI built and
-# tested. GitHub-hosted CI has no GPU; run the checks in the PR body on Strix
-# Halo before merging. third_party/llama.cpp (HRX) follows AMD's tested pair
-# instead (bump-hrx.yml).
+# (docs/vulkan.md). The submodule is 1bit-MONSTER/llama.cpp 1bit/vulkan-upstream:
+# ggml-org's release plus the few upstream PRs we carry until upstream merges them
+# (Qwen3.8-Flash-Next's MTP head, ggml-org#28243). When ggml-org publishes a new
+# release, this workflow rebases those commits onto it (a commit upstream has since
+# merged becomes empty and drops out), tags the old tip so pinned commits stay
+# reachable, and opens a PR here moving the submodule. Releases, not master: each
+# is a commit upstream's CI built and tested. GitHub-hosted CI has no GPU; run the
+# checks in the PR body on Strix Halo before merging. third_party/llama.cpp (HRX)
+# follows AMD's tested pair instead (bump-hrx.yml).
 #
-# Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
-# 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
-# start CI.
+# Uses the secret HRX_BUMP_TOKEN (Contents read/write on 1bit-MONSTER/llama.cpp
+# and 1bit-MONSTER/engine, Pull requests read/write on 1bit-MONSTER/engine): a PR
+# opened with the default GITHUB_TOKEN would not start CI, and that token cannot
+# push to the fork.
 name: bump-llama-vulkan
 
 on:
@@ -63,10 +68,52 @@ jobs:
           tag=$(gh api repos/ggml-org/llama.cpp/releases/latest --jq .tag_name)
           upstream=$(gh api "repos/ggml-org/llama.cpp/commits/${tag}" --jq .sha)
           ours=$(git ls-tree HEAD third_party/llama.cpp-vulkan | awk '{print $3}')
-          echo "upstream ${tag} ${upstream}, ours ${ours}"
+          # the release our pin sits on: where our commits branch off ggml-org's history
+          ours_base=$(gh api "repos/ggml-org/llama.cpp/compare/${upstream}...${ours}" --jq .merge_base_commit.sha)
+          echo "upstream ${tag} ${upstream}, ours ${ours} on ${ours_base}"
           {
-            echo "tag=$tag"; echo "upstream=$upstream"; echo "ours=$ours"
-            if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
+            echo "tag=$tag"; echo "upstream=$upstream"; echo "ours=$ours"; echo "ours_base=$ours_base"
+            if [ "$upstream" = "$ours_base" ]; then echo "changed=false"; else echo "changed=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rebase our commits onto the release
+        id: fork
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          TAG: ${{ steps.pins.outputs.tag }}
+          UPSTREAM: ${{ steps.pins.outputs.upstream }}
+          OURS: ${{ steps.pins.outputs.ours }}
+          OURS_BASE: ${{ steps.pins.outputs.ours_base }}
+        run: |
+          set -euo pipefail
+          # master mirrors ggml-org, so the fork holds the release's objects
+          gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master > /dev/null
+          git init -q fork && cd fork
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/llama.cpp.git"
+          git remote add upstream https://github.com/ggml-org/llama.cpp.git
+          git fetch -q --filter=blob:none upstream "$UPSTREAM"
+          git fetch -q --filter=blob:none fork 1bit/vulkan-upstream
+          carried=$(git rev-parse FETCH_HEAD)
+          if [ "$carried" != "$OURS" ]; then
+            echo "::error::1bit/vulkan-upstream (${carried:0:12}) is not the engine's pin (${OURS:0:12}); reconcile them by hand"
+            exit 1
+          fi
+          git fetch -q --filter=blob:none upstream "$OURS_BASE"
+          git checkout -q --detach "$carried"
+          if ! git -c user.name=llama-vulkan-bump -c user.email=llama-vulkan-bump@users.noreply.github.com \
+               rebase -q --onto "$UPSTREAM" "$OURS_BASE"; then
+            git rebase --abort || true
+            echo "::error::our commits on 1bit/vulkan-upstream do not rebase onto ${TAG}; rebase them by hand"
+            exit 1
+          fi
+          rebased=$(git rev-parse HEAD)
+          git tag "vulkan-upstream-${carried:0:12}" "$carried"
+          git push -q fork "refs/tags/vulkan-upstream-${carried:0:12}"
+          git push -q --force-with-lease="refs/heads/1bit/vulkan-upstream:$carried" fork "$rebased:refs/heads/1bit/vulkan-upstream"
+          {
+            echo "rebased=$rebased"
+            echo "patches<<EOF"; git log --format='- `%h` %s' "$UPSTREAM..$rebased"; echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the bump PR
@@ -76,6 +123,8 @@ jobs:
           TAG: ${{ steps.pins.outputs.tag }}
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
           OURS: ${{ steps.pins.outputs.ours }}
+          REBASED: ${{ steps.fork.outputs.rebased }}
+          PATCHES: ${{ steps.fork.outputs.patches }}
         run: |
           set -euo pipefail
           branch="bump-llama-vulkan/${TAG}"
@@ -86,12 +135,15 @@ jobs:
           git config user.name "llama-vulkan-bump"
           git config user.email "llama-vulkan-bump@users.noreply.github.com"
           git switch -c "$branch"
-          git update-index --cacheinfo "160000,$UPSTREAM,third_party/llama.cpp-vulkan"
+          git update-index --cacheinfo "160000,$REBASED,third_party/llama.cpp-vulkan"
           git commit -q -m "Bump Vulkan llama.cpp: ggml-org/llama.cpp ${TAG} (${UPSTREAM:0:12})"
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Bump Vulkan llama.cpp: ggml-org/llama.cpp ${TAG}" \
-            --body "Moves third_party/llama.cpp-vulkan from \`${OURS:0:12}\` to upstream release [${TAG}](https://github.com/ggml-org/llama.cpp/releases/tag/${TAG}) (\`${UPSTREAM:0:12}\`, ${count} commits).
+            --body "Moves third_party/llama.cpp-vulkan (1bit-MONSTER/llama.cpp 1bit/vulkan-upstream) from \`${OURS:0:12}\` to \`${REBASED:0:12}\`: upstream release [${TAG}](https://github.com/ggml-org/llama.cpp/releases/tag/${TAG}) (\`${UPSTREAM:0:12}\`, ${count} upstream commits) plus the commits we carry.
+
+          Our commits, rebased onto the release (none left means upstream has them all):
+          ${PATCHES:-none}
 
           CI here has no GPU. Before merging, on Strix Halo:
-          \`cmake -B build -G Ninja -DONEBIT_VULKAN=ON -DONEBIT_SERVE_TEST_GGUF=\$HOME/models/Qwen3-0.6B-Q4_K_M.gguf && cmake --build build && ctest --test-dir build -R serve_e2e_vulkan_upstream\`"
+          \`cmake -B build -G Ninja -DONEBIT_VULKAN=ON -DONEBIT_SERVE_TEST_GGUF=\$HOME/models/Qwen3-0.6B-Q4_K_M.gguf && cmake --build build && ctest --test-dir build -R serve_e2e_vulkan_upstream\`, and Qwen3.8-27B + \`--mtp\` (docs/vulkan.md)."

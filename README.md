@@ -29,6 +29,7 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - MLX on Apple Silicon, through lemon-mlx-engine
+- ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU, and on the Radeon through ONNX Runtime's WebGPU provider ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs
 - ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census

@@ -105,6 +105,14 @@ ONNX Runtime GenAI and ONNX Runtime
   Copyright (c) Microsoft Corporation. License: MIT.
   scripts/build-onnx.sh fetches the release libraries (ONNX Runtime GenAI 0.11.2,
   ONNX Runtime 1.23.2, pinned by sha256) and places them beside ryzenai-server.
+  With ONNX_WEBGPU=1 it builds ONNX Runtime 1.23.2 from source with the WebGPU provider
+  instead, which compiles in Dawn:
+
+Dawn (compiled into the WebGPU ONNX Runtime build)
+  https://github.com/google/dawn
+  Copyright 2017-2023 The Dawn & Tint Authors. License: BSD-3-Clause.
+  The build places Dawn's LICENSE (dawn-LICENSE) and ONNX Runtime's ThirdPartyNotices.txt
+  (onnxruntime-ThirdPartyNotices.txt) beside the library.
 
 ComfyUI.cpp (third_party/comfyui.cpp)
   https://github.com/1bit-MONSTER/comfyui.cpp

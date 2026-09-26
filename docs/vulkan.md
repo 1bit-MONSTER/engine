@@ -148,13 +148,6 @@ Q4_K_M (5.17 GiB), by device:
 
 F16 on Vulkan0: 1,138 tok/s prefill, 45.9 tok/s decode, perplexity 20.59.
 
-ZAYA1-74B-preview (1bit-MONSTER/llama.cpp #11) alternates sliding-window layers (a 4,097-token
-window, rope theta 1e4) with full-attention layers (theta 1e7); the converter writes the window,
-the per-layer pattern and the second rope base, and ZAYA1-8B, which has no sliding layers, is
-unchanged (same perplexity to four decimals). Its Q4_K_M (45.7 GB) passes `tests/serve_e2e.sh`
-on `--device vulkan` with `--ctx-size 8192`; there is no reference check for it here, since a
-74B FP32 transformers run does not fit on Strix Halo.
-
 \* 512-token chunks over this repository's docs (PORTING.md, hrx.md, README.md), for comparing
 quants and devices, not models. ROCm's Q4 matmuls quantize activations to 8 bits, hence its
 slightly higher figure.
@@ -167,3 +160,47 @@ What it took, besides the port: CCA's grouped convolution runs as one batched ma
 (as one small matmul per group it held Vulkan decode at 50 tok/s), and the graph avoids what
 HRX and ROCm lacked: copies into part of a state row, concatenating strided views, `l2_norm`,
 and a two-tap `ssm_conv` kernel on ROCm.
+
+### ZAYA1-74B-preview
+
+[ZAYA1-74B-preview](https://huggingface.co/Zyphra/ZAYA1-74B-preview) is the same design at 74.8B
+parameters and 60 layers. It alternates sliding-window layers (a 4,097-token window, rope theta 1e4)
+with full-attention layers (theta 1e7). The converter writes the window, the per-layer pattern and
+the second rope base ([llama.cpp #11](https://github.com/1bit-MONSTER/llama.cpp/pull/11)).
+ZAYA1-8B has no sliding layers and is unchanged: its Q4_K_M perplexity matches to four decimals,
+and its F16 still matches transformers FP32 at 95 of 96 teacher-forced positions.
+
+```
+python third_party/llama.cpp/convert_hf_to_gguf.py --remote Zyphra/ZAYA1-74B-preview --outtype q8_0 --outfile zaya1-74b-Q8_0.gguf
+build/hrx/llama/bin/llama-quantize --allow-requantize zaya1-74b-Q8_0.gguf zaya1-74b-Q4_K_M.gguf Q4_K_M
+1bit serve -m zaya1-74b-Q4_K_M.gguf --device vulkan --ctx-size 8192
+```
+
+`--remote` streams the safetensors from Hugging Face, so the 150 GB BF16 checkpoint never has to
+fit on disk. The Q8_0 file is 79.7 GB, and requantizing it to Q4_K_M needs `--allow-requantize`.
+GGUFs made with `--remote` before llama.cpp #14 have no chat template, because the download
+skipped `chat_template.jinja`. Reconvert them, or serve them with `--chat-template-file`.
+
+Verified on Strix Halo, HF revision `bc8eb466`, Q4_K_M (42.6 GiB, 45.7 GB):
+
+| Check | Result |
+|---|---|
+| `tests/serve_e2e.sh`, `--device vulkan --ctx-size 8192` | PASS |
+| Chat with the model's own template (code, prose, a one-line fact) | coherent answers |
+| `llama-bench`, Vulkan0 | prefill (pp512) 505.8 tok/s, decode (tg128) 35.4 tok/s |
+
+There is no reference check for the 74B: a 74B FP32 transformers run needs about 300 GB of
+memory, which does not fit on Strix Halo.
+
+### ZAYA1-base and ZAYA1-reasoning-base: legacy checkpoints
+
+ZAYA1-base, ZAYA1-reasoning-base and Zyphra's `*-legacy` repos keep the original Megatron-style
+checkpoint:
+- attention and MoE are separate half-layers;
+- sizes live in per-layer lists;
+- experts are stored one by one.
+
+transformers cannot load them. The converter maps them to the transformers layout itself
+([llama.cpp #14](https://github.com/1bit-MONSTER/llama.cpp/pull/14)). Converting
+`Zyphra/ZAYA1-8B-legacy` gives a GGUF whose 1,283 tensors are byte-identical to the one from
+`Zyphra/ZAYA1-8B`, and the model metadata is identical too.

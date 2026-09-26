@@ -50,6 +50,7 @@ The commit the engine pinned before is kept as the tag `vulkan-upstream-<sha12>`
 | ours: `vulkan: SSM_SCAN for Mamba-1` | Vulkan's scan only handled Mamba-2, so every Mamba-1 layer (Mamba, Falcon-Mamba, Zamba v1, BlackMamba) ran on the CPU; a per-channel kernel with the state in registers (d_state 16), three test-backend-ops cases | `adb2af5d` |
 | ours: `model: Zamba v1` | Zyphra's Zamba-7B-v1: Mamba-1 layers split into two heads (per-head x_proj/dt_proj, B/C as scan groups) plus one shared transformer block, stored once; converter de-interleaves in_proj | `5319c0e6` |
 | ours: `gguf-py: LlamaHfVocab scores from the merge ranks` | upstream converter bug: models with only a SentencePiece-style BPE `tokenizer.json` (Zamba, Zamba2, and others) got every token score -1000, so merges were picked arbitrarily (Zamba-7B-v1: 318/1500 wikitext lines tokenized like HF); now -rank of the producing merge: 1500/1500 | `ee6e4e0d` |
+| ours: `model: BlackMamba` | Zyphra's BlackMamba (1.5B, 2.8B): Mamba-1 layers alternating with a Switch MoE (sigmoid top-1 router with bias, gated erf-GELU experts), biased final LayerNorm; the converter reads the Megatron checkpoint and uses the built-in GPT-NeoX vocab | `f6261222` |
 
 Each upstream PR is reviewed line by line before it is pinned. #28243: it touches only the qwen4exp model, its
 converter, and two lines of the shared speculative decoding (the `-md` path fix, and
@@ -99,6 +100,8 @@ v0.5.0 + #28243 + #21412 + the d_state-64 scan (`a32f0d6f`); Zamba2 converted wi
 Mamba-1 scan (`adb2af5d`), `state-spaces/mamba-370m-hf` F16, `llama-bench -p 256 -n 64`: pp256 228 → **6736** tok/s, tg64 25.8 → **173.5** tok/s; greedy completions identical to the CPU-scan build; test-backend-ops SSM_SCAN 17/17.
 
 Zamba v1 (`ee6e4e0d`), `Zyphra/Zamba-7B-v1` Q8_0: teacher-forced top-1 vs transformers FP32 **96/96** on three prompts; greedy continuations identical to the reference's; pp256 543, tg64 14.9 tok/s; 2 graph splits (all compute on Vulkan0: each layer's two-head scan runs on the Mamba-1 Vulkan kernel from `adb2af5d`). GGUFs of Zamba or Zamba2 converted before `ee6e4e0d` have the broken token scores: reconvert them.
+
+BlackMamba (`f6261222`), `Zyphra/BlackMamba-1.5B`: teacher-forced top-1 vs Zyphra's own PyTorch code (FP32, CPU) **96/96** on three prompts, identical greedy text and prompt tokens; F16 pp256 7180 / tg64 250 tok/s, Q8_0 pp256 10136 / tg64 **369** tok/s. No HF `architectures` in its config.json: the converter routes on `mamba_moe_layers`.
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not

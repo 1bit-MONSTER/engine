@@ -4,27 +4,27 @@
   "models": 415413,
   "with_architecture": 332564,
   "architectures_seen": 2611,
-  "mapped_models": 310219,
-  "mapped_pct": 93.28,
-  "checked_models": 213456,
-  "checked_pct": 64.18,
+  "mapped_models": 310666,
+  "mapped_pct": 93.42,
+  "checked_models": 213510,
+  "checked_pct": 64.2,
   "per_backend": {
    "vulkan": {
-    "mapped": 310219,
-    "checked": 213456,
-    "mapped_pct": 93.28,
-    "checked_pct": 64.18
+    "mapped": 310666,
+    "checked": 213510,
+    "mapped_pct": 93.42,
+    "checked_pct": 64.2
    },
    "hrx": {
-    "mapped": 309915,
-    "checked": 213456,
-    "mapped_pct": 93.19,
-    "checked_pct": 64.18
+    "mapped": 310362,
+    "checked": 213510,
+    "mapped_pct": 93.32,
+    "checked_pct": 64.2
    },
    "zinc": {
-    "mapped": 231768,
-    "checked": 34192,
-    "mapped_pct": 69.69,
+    "mapped": 231818,
+    "checked": 34196,
+    "mapped_pct": 69.71,
     "checked_pct": 10.28
    },
    "npu": {
@@ -84,10 +84,6 @@
     "models": 240
    },
    {
-    "architecture": "BertLMHeadModel",
-    "models": 212
-   },
-   {
     "architecture": "MobileLLMForCausalLM",
     "models": 176
    },
@@ -134,6 +130,10 @@
    {
     "architecture": "RwkvForCausalLM",
     "models": 86
+   },
+   {
+    "architecture": "GPT2LMHeadCustomModel",
+    "models": 84
    }
   ]
  },

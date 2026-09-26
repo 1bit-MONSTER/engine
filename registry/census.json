@@ -4,21 +4,21 @@
   "models": 415490,
   "with_architecture": 332612,
   "architectures_seen": 2616,
-  "mapped_models": 310705,
-  "mapped_pct": 93.41,
+  "mapped_models": 311319,
+  "mapped_pct": 93.6,
   "checked_models": 213531,
   "checked_pct": 64.2,
   "per_backend": {
    "vulkan": {
-    "mapped": 310705,
+    "mapped": 311319,
     "checked": 213531,
-    "mapped_pct": 93.41,
+    "mapped_pct": 93.6,
     "checked_pct": 64.2
    },
    "hrx": {
-    "mapped": 310399,
+    "mapped": 311013,
     "checked": 213531,
-    "mapped_pct": 93.32,
+    "mapped_pct": 93.51,
     "checked_pct": 64.2
    },
    "zinc": {
@@ -54,10 +54,6 @@
    {
     "architecture": "ChessForCausalLM",
     "models": 970
-   },
-   {
-    "architecture": "GPTJForCausalLM",
-    "models": 614
    },
    {
     "architecture": "LlavaLlamaForCausalLM",
@@ -134,6 +130,10 @@
    {
     "architecture": "GPT2LMHeadCustomModel",
     "models": 84
+   },
+   {
+    "architecture": "DynamicSlidingWindowForCausalLM",
+    "models": 79
    }
   ]
  },

@@ -139,10 +139,11 @@ int run_moe_cache(int argc, char** argv) {
     ExpertCache cache(index, opt);
     const int n_moe = (int) index.experts.size();
     const double layer_ms = compute_ms / n_moe;
-    std::printf("%s: %d MoE layers, %d experts, %.2f MiB per expert (layer %d); %d slots of %.2f MiB = %.1f GiB%s\n",
-                model.c_str(), n_moe, index.n_expert, index.expert_bytes(index.experts.begin()->first) / 1048576.0,
-                index.experts.begin()->first, cache.slots(), cache.slot_bytes() / 1048576.0,
-                cache.slots() * double(cache.slot_bytes()) / (1u << 30), opt.per_layer ? ", per layer" : ", shared");
+    double expert_bytes = 0;
+    for (const auto& [l, parts] : index.experts) expert_bytes += index.expert_bytes(l);
+    std::printf("%s: %d MoE layers, %d experts, %.2f MiB per expert on average; %d slots, %.1f GiB pinned (largest slot %.2f MiB)%s\n",
+                model.c_str(), n_moe, index.n_expert, expert_bytes / n_moe / 1048576.0, cache.slots(),
+                cache.pinned_bytes() / double(1u << 30), cache.slot_bytes() / 1048576.0, opt.per_layer ? ", per layer" : ", shared");
 
     auto sleep_ms = [](double ms) {  // compute stand-in: spin for sub-millisecond precision
         const auto end = std::chrono::steady_clock::now() + std::chrono::duration<double, std::milli>(ms);

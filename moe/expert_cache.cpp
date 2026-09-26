@@ -19,6 +19,7 @@
 #include <chrono>
 #include <cstring>
 #include <fcntl.h>
+#include <map>
 #include <stdexcept>
 #include <string>
 #include <sys/mman.h>
@@ -34,21 +35,33 @@ uint64_t up(uint64_t v) { return (v + kAlign - 1) / kAlign * kAlign; }
 
 ExpertCache::ExpertCache(const GgufIndex& index, const CacheOptions& opt) : index_(index), opt_(opt) {
     if (index.experts.empty()) throw std::runtime_error("the model has no routed expert tensors");
-    // a slot holds every part's aligned read window: [down(off), up(off + bytes))
+    // A slot holds every part's aligned read window, [down(off), up(off + bytes)). Mixed-quant
+    // models (Unsloth's UD) use bigger types in some layers, so layers are grouped by that size:
+    // each size class has its own slots, and LRU (shared mode) or one per layer.
+    std::map<size_t, std::vector<int>> classes;  // slot size -> layers
     for (const auto& [l, parts] : index.experts) {
         size_t n = 0;
         for (const auto& p : parts) n += up(p.bytes) + kAlign;
+        classes[n].push_back(l);
         slot_bytes_ = std::max(slot_bytes_, n);
     }
-    int n_lists = 1;
-    if (opt_.per_layer) {
-        n_lists = (int) index.experts.size();
-        int i = 0;
-        for (const auto& [l, parts] : index.experts) layer_lru_[l] = i++;
+    // the budget is in experts; every layer keeps the same share of its experts
+    const double share = std::min(1.0, double(opt_.slots) / (double(index.experts.size()) * index.n_expert));
+    struct List { size_t bytes; int slots; };
+    std::vector<List> lists;
+    for (const auto& [bytes, layers] : classes) {
+        if (opt_.per_layer) {
+            for (int l : layers) {
+                layer_lru_[l] = (int) lists.size();
+                lists.push_back({bytes, std::max(1, (int) (share * index.n_expert))});
+            }
+        } else {
+            for (int l : layers) layer_lru_[l] = (int) lists.size();
+            lists.push_back({bytes, std::max(1, (int) (share * index.n_expert * layers.size()))});
+        }
     }
-    const int per_list = std::max(1, opt_.slots / n_lists);
-    const int n_slots = per_list * n_lists;
-    mem_bytes_ = size_t(n_slots) * slot_bytes_;
+    int n_slots = 0;
+    for (const auto& li : lists) { n_slots += li.slots; mem_bytes_ += size_t(li.slots) * li.bytes; }
     void* p = ::mmap(nullptr, mem_bytes_, PROT_READ | PROT_WRITE, MAP_PRIVATE | MAP_ANONYMOUS, -1, 0);
     if (p == MAP_FAILED) throw std::runtime_error("cannot map " + std::to_string(mem_bytes_ >> 20) + " MiB of expert slots");
     mem_ = static_cast<uint8_t*>(p);
@@ -61,12 +74,17 @@ ExpertCache::ExpertCache(const GgufIndex& index, const CacheOptions& opt) : inde
         fds_.push_back(fd);
     }
     slots_.resize(n_slots);
-    lru_.resize(n_lists);
-    for (int s = 0; s < n_slots; ++s) {
-        slots_[s].lru_list = s / per_list;
-        lru_[slots_[s].lru_list].push_back(s);  // empty slots at the back: taken first
-        slots_[s].lru_it = std::prev(lru_[slots_[s].lru_list].end());
-    }
+    lru_.resize(lists.size());
+    size_t off = 0;
+    int si = 0;
+    for (int li = 0; li < (int) lists.size(); ++li)
+        for (int k = 0; k < lists[li].slots; ++k, ++si) {
+            slots_[si].lru_list = li;
+            slots_[si].off = off;
+            off += lists[li].bytes;
+            lru_[li].push_back(si);  // empty slots at the back: taken first
+            slots_[si].lru_it = std::prev(lru_[li].end());
+        }
     for (int i = 0; i < std::max(1, opt_.io_threads); ++i) threads_.emplace_back([this] { reader(); });
 }
 
@@ -85,7 +103,6 @@ ExpertCache::~ExpertCache() {
 }
 
 int ExpertCache::lru_of(int layer) const {
-    if (!opt_.per_layer) return 0;
     auto it = layer_lru_.find(layer);
     if (it == layer_lru_.end()) throw std::runtime_error("layer " + std::to_string(layer) + " has no routed experts");
     return it->second;
@@ -117,7 +134,7 @@ int ExpertCache::start_load(int layer, int e, bool demand) {
     where_[s.key] = si;
     auto& lru = lru_[s.lru_list];
     lru.splice(lru.begin(), lru, s.lru_it);
-    uint8_t* base = mem_ + size_t(si) * slot_bytes_;
+    uint8_t* base = mem_ + s.off;
     size_t at = 0;
     const auto& parts = index_.experts.at(layer);
     s.pending = (int) parts.size();
@@ -193,7 +210,7 @@ std::vector<ExpertCache::Resident> ExpertCache::acquire(int layer, const std::ve
     std::vector<Resident> out(experts.size());
     for (size_t i = 0; i < experts.size(); ++i) {
         const Slot& s = slots_[si[i]];
-        const uint8_t* base = mem_ + size_t(si[i]) * slot_bytes_;
+        const uint8_t* base = mem_ + s.off;
         for (size_t off : s.part_off) out[i].parts.push_back(base + off);
     }
     return out;

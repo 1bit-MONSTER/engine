@@ -74,7 +74,8 @@ std::string chatml(const json& messages, bool thinking = true) {
         p += "<|im_start|>" + m.at("role").get<std::string>() + "\n" + content + "<|im_end|>\n";
     }
     p += "<|im_start|>assistant\n";
-    if (!thinking) p += "<think>\n\n</think>\n\n";
+    (void)thinking;  // the <think> block is a Qwen3-lane idiom; the model-generic
+    // route serves arbitrary archs, whose tokenizers do not know it.
     return p;
 }
 

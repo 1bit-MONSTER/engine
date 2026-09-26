@@ -61,6 +61,18 @@ behaviour, and new model architectures that come with the check rule 1 asks for.
 Security problems are the exception: report them privately ([SECURITY.md](SECURITY.md)), never as
 an RFC or issue.
 
+## Automation
+
+- **PR-Agent** reviews every pull request with a local coding model on the Strix Halo box
+  (`.github/workflows/pr-agent.yml`); comment `/review`, `/describe`, `/improve` or `/ask` for more.
+- **Issue agent** (`tools/issue_agent.py`) takes a first pass on issues opened by people outside the
+  project: one label, a request for the bug-report fields when a bug skipped the form, a registry
+  lookup for linked Hugging Face models, and a pointer to Q&A for questions. The model only picks
+  the label; every comment is a template. Maintainers can run it on any issue from the Actions tab.
+- **Pins only move forward.** CI fails a pull request whose submodule pin is behind, or has
+  diverged from, the pin on `main` (`tools/check_pins.py`), because that drops commits the engine
+  already shipped. A rollback on purpose carries the `pin rollback` label.
+
 This repository is a port of the working code in 1bit-MONSTER, our private development
 repository, without its history.
 [docs/PORTING.md](docs/PORTING.md) lists the source of each component and the

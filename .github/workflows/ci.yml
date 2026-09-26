@@ -17,6 +17,8 @@ on:
   push:
     branches: [main]
   pull_request:
+    # labeled/unlabeled: the "pin rollback" label turns the pin check off
+    types: [opened, synchronize, reopened, labeled, unlabeled]
 permissions:
   contents: read
 jobs:
@@ -26,6 +28,14 @@ jobs:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Copyright notice on every file
         run: python3 tools/copyright.py --check
+      - name: Submodule pins only move forward
+        if: github.event_name == 'pull_request' && !contains(github.event.pull_request.labels.*.name, 'pin rollback')
+        env:
+          GITHUB_TOKEN: ${{ github.token }}
+          BASE: ${{ github.event.pull_request.base.sha }}
+        run: |
+          git fetch -q --depth=1 origin "$BASE"
+          python3 tools/check_pins.py "$BASE"
       - name: GGUF -> Q4NX repack
         run: |
           python3 -m pip install --user numpy gguf

@@ -457,12 +457,40 @@ at 4,608 slots; 7.1, 6.6 and 6.0 at 1,536. The answers match the resident model'
 A model that fits in memory decodes fastest resident. Streaming is for the ones that don't:
 at a quarter of the experts in memory, Coder-30B still decodes 8-10 tok/s.
 
+### Where streamed decode spends its time
+
+`ONEBIT_MOE_STATS=1` prints, at exit, the time spent in the remap op, the part of it spent
+waiting for reads, and the time between one layer's remap and the next (the GPU's work plus
+the round trip to the host). Coder-30B, `-n 64 -r 4`, per MoE layer (the numbers include the
+cold first repetition):
+
+| Slots, prefetch depth | Warm tok/s | In remap (waiting) | Between remaps | Demand misses |
+|---|---|---|---|---|
+| 6,144, off | 48-53 | 0.36 ms (0.36) | 0.37 ms | 4.8% (the cold fill) |
+| 4,608, off | 42 | 0.41 (0.40) | 0.37 | 5.4% |
+| 4,608, 1 | 43.5-43.8 | 0.34 (0.34) | 0.37 | 1.3% (+4.4% prefetched) |
+| 4,608, 2 | 43.0-44.8 | 0.30 (0.30) | 0.38 | 1.1% |
+| 1,536, off | 9.6-10.5 | 1.59 (1.58) | 0.59 | 22.9% |
+| 1,536, 1 | 9.2-10.2 | 1.68 (1.67) | 0.61 | 7.0% (+18.7%) |
+
+- **The round trip caps streamed decode.** 0.37 ms between remaps x 48 layers is 17.6 ms per
+  token, about 57 tok/s, against 12.5 ms (80 tok/s) resident. Each layer's routed ids go to the
+  host and its slot indices come back before the expert matmuls can run.
+- **Prefetch now pays a little.** Its router scoring first ran inside the remap op, scalar, at
+  about 0.15 ms per layer: prefetch cost 4,608 slots a third of its speed (28 against 42
+  tok/s). A worker thread now scores the next `ONEBIT_MOE_PREFETCH` layers (default 1) off the
+  decode path.
+- **At 1,536 slots the drive is the limit.** About 88 misses x 2.1 MB per token is 185 MB, and
+  at 10 tok/s that is about 2 GB/s through `O_DIRECT` on a drive shared with other tenants. More
+  reads in flight (`ONEBIT_MOE_IO` 4 to 32) didn't help, and prefetch trades demand misses for
+  wasted reads (80 against 61 GiB over the run). What helps here is reading fewer bytes: a
+  better hit rate (item 2 below) or smaller experts.
+
 ## Next
 
-1. **Faster streamed decode.** Streaming runs in the inference path (below), but at 1,536
-   slots it decodes 8-10 tok/s where the experts' reads alone would allow more. The gate-ahead
-   prefetch slows it down there, so the reads need queueing further ahead (the replays above),
-   and 6,144 slots (of 6,144 experts) runs erratically on the shared box.
+1. **Fewer host round trips.** The remap per layer caps streamed decode at about 57 tok/s on
+   Coder-30B ("Where streamed decode spends its time"). 6,144 slots (every expert) runs
+   erratically on the shared box.
 2. **A smarter eviction policy.** Belady's bound is 5-16 points above the shared LRU at small
    caches. Candidates: frequency with decay per layer, and hints from the router's scores.
 3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams

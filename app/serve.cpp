@@ -56,6 +56,8 @@
 // docs/hrx.md) until the Laya router (docs/laya.md) makes that choice.
 #include "serve.h"
 
+#include "built_path.h"
+
 #include "gguf_meta.h"
 
 #ifdef ONEBIT_NPU
@@ -155,10 +157,10 @@ std::string hrx_libhsa(const std::string& option) {
 std::string default_llama_server(const std::string& device) {
     if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
 #ifdef ONEBIT_VULKAN_SERVER
-    if (device == "vulkan") return ONEBIT_VULKAN_SERVER;
+    if (device == "vulkan") return built_path(ONEBIT_VULKAN_SERVER);
 #endif
 #ifdef ONEBIT_HRX_SERVER
-    return ONEBIT_HRX_SERVER;
+    return built_path(ONEBIT_HRX_SERVER);
 #else
     (void)device;
     return "llama-server";
@@ -178,13 +180,13 @@ std::string default_lean_server(const std::string& device) {
     if (const char* e = std::getenv("ONEBIT_LEAN_SERVER"); e && *e) return e;
     if (device == "rocm") {
 #ifdef ONEBIT_LEAN_ROCM_SERVER
-        return ONEBIT_LEAN_ROCM_SERVER;
+        return built_path(ONEBIT_LEAN_ROCM_SERVER);
 #else
         throw std::runtime_error("--device rocm needs a build with -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON");
 #endif
     }
 #ifdef ONEBIT_LEAN_SERVER
-    return ONEBIT_LEAN_SERVER;
+    return built_path(ONEBIT_LEAN_SERVER);
 #else
     throw std::runtime_error("--lean needs a build with -DONEBIT_LEAN=ON (docs/lean.md)");
 #endif
@@ -195,7 +197,7 @@ std::string default_lean_server(const std::string& device) {
 std::string default_onnx() {
     if (const char* e = std::getenv("ONEBIT_ONNX_SERVER"); e && *e) return e;
 #ifdef ONEBIT_ONNX_SERVER
-    return ONEBIT_ONNX_SERVER;
+    return built_path(ONEBIT_ONNX_SERVER);
 #else
     return "ryzenai-server";
 #endif
@@ -210,7 +212,7 @@ bool is_onnx_model_dir(const std::string& dir) {
 std::string default_ds4() {
     if (const char* e = std::getenv("ONEBIT_DS4"); e && *e) return e;
 #ifdef ONEBIT_DS4_SERVER
-    return ONEBIT_DS4_SERVER;
+    return built_path(ONEBIT_DS4_SERVER);
 #else
     return "ds4-server";
 #endif
@@ -219,7 +221,7 @@ std::string default_ds4() {
 std::string default_zinc() {
     if (const char* e = std::getenv("ONEBIT_ZINC"); e && *e) return e;
 #ifdef ONEBIT_ZINC_SERVER
-    return ONEBIT_ZINC_SERVER;
+    return built_path(ONEBIT_ZINC_SERVER);
 #else
     return "zinc";
 #endif

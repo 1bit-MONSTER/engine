@@ -210,6 +210,36 @@
    "engine": "8c2805d977eb"
   },
   {
+   "backend": "vulkan",
+   "model": "zyphra/Zamba2-1.2B-instruct-Q8_0.gguf",
+   "arch": "zamba2",
+   "passed": true,
+   "said": "Paris.",
+   "failed": [],
+   "date": "2026-09-26",
+   "engine": "6abadd3d9a0c"
+  },
+  {
+   "backend": "vulkan",
+   "model": "zyphra/Zamba2-2.7B-instruct-Q8_0.gguf",
+   "arch": "zamba2",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-26",
+   "engine": "6abadd3d9a0c"
+  },
+  {
+   "backend": "vulkan",
+   "model": "zyphra/Zamba2-7B-Instruct-Q8_0.gguf",
+   "arch": "zamba2",
+   "passed": true,
+   "said": "Paris",
+   "failed": [],
+   "date": "2026-09-26",
+   "engine": "6abadd3d9a0c"
+  },
+  {
    "backend": "hrx",
    "model": "zaya1-8b-Q4_K_M.gguf",
    "arch": "zaya",

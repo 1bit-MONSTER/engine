@@ -55,7 +55,8 @@ Peano, llvm-aie (third_party/llvm-aie)
 llama.cpp (third_party/llama.cpp: 1bit-MONSTER/llama.cpp, a fork of
 ggml-org/llama.cpp carrying AMD's HRX integration; third_party/llama.cpp-vulkan:
 the same fork's 1bit/vulkan-upstream, an upstream release plus carried upstream
-pull requests, among them ggml-org#28243 by Daniel Han and Ryan Monsurate)
+pull requests, among them ggml-org#28243 by Daniel Han and Ryan Monsurate, and
+ggml-org#21412 (Zamba2) by Echo Labs)
   https://github.com/ggml-org/llama.cpp
   Copyright (c) 2023-2026 The ggml authors
   License: MIT

@@ -81,4 +81,4 @@ and the GPU must see that much (`amdgpu.gttsize` / `ttm.pages_limit`, DwarfStar'
 | `-DONEBIT_DS4=ON` engine build | builds; ctest 7/7 |
 | `1bit serve --device ds4 -m <missing file>` | DwarfStar's "cannot open model", then serve exits: backend did not become ready |
 | `--ssd-streaming` with another device | refused |
-| a DeepSeek V4 Flash Q2 chat through `1bit serve --device ds4` | not yet run: the box had no room for the 81 GiB model |
+| DeepSeek V4 Flash Q2 (`antirez/deepseek-v4-gguf` rev `f71f23d5`, `...-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf`, 81 GiB) through `1bit serve --device ds4 --ctx-size 8192` | "The capital of France is Paris.", a working ISO-8601 parser, a correct B-tree walkthrough; decode **14.8 tok/s** (DwarfStar's own log, steady over 256 tokens); first prompt 6.7 s cold, then ~0.5 s |

@@ -74,6 +74,11 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
     if not head_dim and heads:
         head_dim = embedding // heads
 
+    # A separate output.weight tensor (not just token_embd) means the LM head
+    # is untied. The forward defaults to tied when the field is absent, which
+    # would use embed_tokens as the head and produce garbage.
+    has_output = any(getattr(t, "name", "") == "output.weight" for t in reader.tensors)
+
     cfg = {
         "model_type": ARCH_TO_MODEL_TYPE.get(arch, arch),
         "hidden_size": embedding,
@@ -85,7 +90,15 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
         "vocab_size": vocab_size,
         "rms_norm_eps": float(_num(reader, f"{p}.attention.layer_norm_rms_epsilon", 1e-6)),
         "rope_theta": float(_num(reader, f"{p}.rope.freq_base", 10000.0)),
+        "tie_word_embeddings": not has_output,
+        "hidden_act": str(_num(reader, f"{p}.activation_function", "")).strip() or "silu",
     }
+    bos = _num(reader, "tokenizer.ggml.bos_token_id", None)
+    eos = _num(reader, "tokenizer.ggml.eos_token_id", None)
+    if bos is not None:
+        cfg["bos_token_id"] = int(bos)
+    if eos is not None:
+        cfg["eos_token_id"] = int(eos)
     if arch in ATTENTION_BIAS_ARCHES:
         cfg["attention_bias"] = True
     with open(os.path.join(out_dir, "config.json"), "w") as f:

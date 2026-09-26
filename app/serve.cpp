@@ -39,6 +39,9 @@
 //                                                  long prompt prefixes on HRX0 over one
 //                                                  shared KV cache (docs/hrx.md)
 //   a .gguf, --device zinc                      -> this build's zinc
+//   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
+//                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
+//                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
 //   a .gguf, --device rocm                      -> the ROCm build's llama-server on ROCm0
 //                                                  (ONEBIT_LEAN_ROCM: any GGUF, and ROCmI4 with
 //                                                  the gfx1151 W4A4 path; docs/lean.md)
@@ -112,7 +115,8 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string flash_attn;  // -fa on/off forwarded to the child llama-server
-    std::string llama_server, zinc, hrx_libhsa, mlx;
+    std::string llama_server, zinc, hrx_libhsa, mlx, ds4;
+    bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
     std::string prefill_device;
     int prefill_min_tokens = 0;
     bool lean = false;
@@ -202,6 +206,16 @@ bool is_onnx_model_dir(const std::string& dir) {
     return fs::is_directory(dir) && fs::exists(fs::path(dir) / "genai_config.json");
 }
 
+// DwarfStar's ds4-server (third_party/ds4, MIT), built by scripts/build-ds4.sh
+std::string default_ds4() {
+    if (const char* e = std::getenv("ONEBIT_DS4"); e && *e) return e;
+#ifdef ONEBIT_DS4_SERVER
+    return ONEBIT_DS4_SERVER;
+#else
+    return "ds4-server";
+#endif
+}
+
 std::string default_zinc() {
     if (const char* e = std::getenv("ONEBIT_ZINC"); e && *e) return e;
 #ifdef ONEBIT_ZINC_SERVER
@@ -253,8 +267,9 @@ int free_port() {
 // closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
 class Child {
 public:
-    Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port)
-        : port_(port) {
+    Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
+          std::string ready_path = "/health")
+        : port_(port), ready_path_(std::move(ready_path)) {
         // the command line, each argument quoted the way CommandLineToArgvW reads it back
         std::string cmd;
         for (const auto& a : argv) {
@@ -323,8 +338,9 @@ public:
 #else
 class Child {
 public:
-    Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port)
-        : port_(port) {
+    Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
+          std::string ready_path = "/health")
+        : port_(port), ready_path_(std::move(ready_path)) {
         std::vector<char*> args;
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
         args.push_back(nullptr);
@@ -377,14 +393,15 @@ public:
     bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
 #endif
 
-    // Polls the child's /health until it answers 200, it exits, or time runs out.
+    // Polls the child's ready path (/health; /v1/models for servers without one, which answer
+    // only once the model is loaded) until it answers 200, it exits, or time runs out.
     bool wait_ready(std::chrono::seconds timeout, const std::atomic<bool>& stop) const {
         httplib::Client c("127.0.0.1", port_);
         c.set_connection_timeout(1);
         const auto end = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
-            if (auto r = c.Get("/health"); r && r->status == 200) return true;
+            if (auto r = c.Get(ready_path_); r && r->status == 200) return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         return false;
@@ -399,6 +416,7 @@ private:
     pid_t pid_ = -1;
 #endif
     int port_;
+    std::string ready_path_;
 };
 
 std::string model_id(const Options& o) {
@@ -499,6 +517,7 @@ struct Launch {
     bool drop_model = false;
     std::string set_model;
     bool mtp = false;
+    std::string ready_path = "/health";
 };
 
 // The backend process for one device: its command line and environment.
@@ -510,6 +529,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     std::vector<std::string>& env = l.env;
     bool& drop_model = l.drop_model;
     std::string& set_model = l.set_model;
+    if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
     if (device == "onnx") {
         // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
         // the model's genai_config.json
@@ -555,23 +575,30 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
+    } else if (device == "ds4") {
+        // DwarfStar: its own GGUF layouts only; it opens its port after the model has loaded
+        argv = {o.ds4.empty() ? default_ds4() : o.ds4, "-m", o.model,
+                "--host", "127.0.0.1", "--port", std::to_string(child_port)};
+        if (o.ctx_size > 0) { argv.push_back("--ctx"); argv.push_back(std::to_string(o.ctx_size)); }
+        if (o.ssd_streaming) argv.push_back("--ssd-streaming");
+        l.ready_path = "/v1/models";
     } else if (device == "zinc") {
         argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
         env.push_back("RADV_PERFTEST=coop_matrix");
         drop_model = true;  // zinc rejects any model id but its own
     } else {
-        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm or zinc)");
+        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm, zinc or ds4)");
     }
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
-        if (device == "zinc" || device == "mlx") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
+        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
     }
     if (!o.mtp.empty()) {
         // the MTP head drafts tokens on the same device; the model checks them in one batch
-        if (device == "zinc" || device == "mlx") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
+        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
         l.mtp = true;
         argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
@@ -724,7 +751,7 @@ int serve_child(const Options& o) {
         if (started[i]) return true;
         const Launch& b = backends[i];
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        auto c = std::make_unique<Child>(b.argv, b.env, b.port);
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
         started[i] = c.get();
         children.push_back(std::move(c));
@@ -876,7 +903,7 @@ int serve_child(const Options& o) {
 #endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path));
     }
     for (const auto& b : rag) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
@@ -916,8 +943,9 @@ int serve_child(const Options& o) {
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|vulkan|hrx|rocm|zinc|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
@@ -951,6 +979,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--alias") o.alias = next();
         else if (a == "--llama-server") o.llama_server = next();
         else if (a == "--zinc") o.zinc = next();
+        else if (a == "--ds4") o.ds4 = next();
+        else if (a == "--ssd-streaming") o.ssd_streaming = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
         else if (a == "--mlx-server") o.mlx = next();
         else if (a == "--prefill-device") o.prefill_device = next();

@@ -23,8 +23,8 @@ OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|vulkan|hrx|rocm|zinc|mlx] [--ctx-size N] [--alias NAME]
-           [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]
+           [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
+           [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]
            [--parallel N] [--adaptive] [--adaptive-at N]
@@ -49,7 +49,7 @@ One model per process:
 
 "llama-server devices" means `vulkan`, `hrx` and `rocm`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
-inherits it). On `npu`, `zinc` and `mlx` they answer 501.
+inherits it). On `npu`, `zinc`, `ds4` and `mlx` they answer 501.
 
 ## Where the model runs
 
@@ -63,6 +63,7 @@ inherits it). On `npu`, `zinc` and `mlx` they answer 501.
 | ROCmFP4 `.gguf` | `auto`, `vulkan` with `--lean` | the lean (ROCmFPX) build's llama-server on `Vulkan0` (docs/lean.md) |
 | `.gguf` | `rocm` | the ROCm build's llama-server on `ROCm0` (ROCmFPX's tree, `ONEBIT_LEAN_ROCM`); ROCmI4 files take its W4A4 path (docs/lean.md) |
 | `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
+| DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (ROCm, CUDA or Metal; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 
 A build without the private add-on answers a Qwen3.6-35B-A3B directory with "the
@@ -91,8 +92,8 @@ PM4-emulation probe, and then HRX registers no device. `serve` sets
 `IREE_HAL_AMDGPU_LIBHSA_PATH` itself unless you did. It uses `--hrx-libhsa`,
 else the build's copy, else the first one under `/opt/rocm-therock`.
 
-The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`),
-then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC`, then `llama-server` / `zinc` on PATH.
+The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`, `-DONEBIT_DS4`),
+then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC` / `$ONEBIT_DS4`, then `llama-server` / `zinc` / `ds4-server` on PATH.
 
 ## Multi-token prediction (`--mtp`)
 

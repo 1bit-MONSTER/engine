@@ -82,6 +82,11 @@ ZINC (third_party/zinc)
   Copyright (c) 2025 ZINC Contributors
   License: MIT
 
+DwarfStar (third_party/ds4)
+  https://github.com/antirez/ds4
+  Copyright (c) 2026 The ds4.c authors
+  License: MIT
+
 Lemonade (third_party/lemonade)
   https://github.com/1bit-MONSTER/lemonade
   (a fork of https://github.com/lemonade-sdk/lemonade, with the onebit recipe)

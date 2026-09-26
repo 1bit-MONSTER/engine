@@ -204,3 +204,21 @@ transformers cannot load them. The converter maps them to the transformers layou
 ([llama.cpp #14](https://github.com/1bit-MONSTER/llama.cpp/pull/14)). Converting
 `Zyphra/ZAYA1-8B-legacy` gives a GGUF whose 1,283 tensors are byte-identical to the one from
 `Zyphra/ZAYA1-8B`, and the model metadata is identical too.
+
+Both base models are the 8B shape (40 layers, 16 experts), with rope theta 1e6 and a 32,768-token
+context. Checked on Strix Halo, Q4_K_M (5.56 GB), on Vulkan0:
+
+| Model | Perplexity* (wikitext-2 test, 60 × 512) | Decode |
+|---|---|---|
+| ZAYA1-base | 8.55 ± 0.17 | |
+| ZAYA1-reasoning-base | 10.15 ± 0.22 | 89-91 tok/s (chat) |
+| ZAYA1-8B, for comparison | 32.13 ± 1.08 | |
+
+\* Raw-text perplexity favors base models; the post-trained ZAYA1-8B scores higher on it. These
+figures are not comparable with the docs-based perplexity in the table above.
+ZAYA1-reasoning-base answers chat prompts with its own template, thinking first.
+
+Until [llama.cpp #15](https://github.com/1bit-MONSTER/llama.cpp/pull/15), ZAYA returned wrong
+results whenever a ubatch held more than one sequence: `llama-perplexity` at its default batch,
+and `1bit serve` answering concurrent requests. At four sequences per ubatch, ZAYA1-8B F16's
+wikitext perplexity was 58,259 against 27.89 with one; now both are 27.89 on the CPU.

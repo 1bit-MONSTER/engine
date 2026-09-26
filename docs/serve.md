@@ -100,9 +100,10 @@ then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC` / `$ONEBIT_DS4`, then `llama-server
 `--mmproj <mmproj.gguf>` hands llama-server a vision projector on the llama.cpp routes
 (vulkan, hrx, rocm). Chat messages may then carry `image_url` parts (a `data:` URL or a file
 URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes from
-`convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. Zyphra's Zamba2-VL, for one,
-is in [docs/vulkan.md](vulkan.md). The NPU, ZINC, DwarfStar, MLX and ONNX routes take no
-`--mmproj`.
+`convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. With it, llama-server runs
+with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that attend to an image
+bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B are in
+[docs/vulkan.md](vulkan.md). The NPU, ZINC, DwarfStar, MLX and ONNX routes take no `--mmproj`.
 
 ## Multi-token prediction (`--mtp`)
 

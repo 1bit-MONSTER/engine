@@ -50,7 +50,8 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > runs from our llama.cpp on Vulkan, HRX and ROCm, matching transformers, at 93 tok/s decode in
 > Q4_K_M on Vulkan, and ZAYA1-74B-preview at 35 tok/s
 > ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp)); the rest of Zyphra's
-> family (Zamba, Zamba2, BlackMamba) runs on Vulkan too. Experimental,
+> family (Zamba, Zamba2, BlackMamba) runs on Vulkan too, and so do its vision models, ZAYA1-VL-8B
+> and Zamba2-VL, through `1bit serve --mmproj`. Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
 > has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per

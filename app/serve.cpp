@@ -623,7 +623,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     }
     if (!o.mmproj.empty()) {
         if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
-        argv.insert(argv.end(), {"--mmproj", o.mmproj});
+        // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
+        // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
+        argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
     }
     return l;
 }

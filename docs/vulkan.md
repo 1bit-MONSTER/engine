@@ -124,6 +124,13 @@ circle and the text "HELLO 42":
 The 1.2B and 2.7B misread the text the same way on the CPU and on Vulkan, so the misreading comes
 from the models, not from the port.
 
+GGUFs made before [llama.cpp #17](https://github.com/1bit-MONSTER/llama.cpp/pull/17) carry a chat
+template that left each image inside the user turn instead of in front of it, as Zyphra's
+template has it. llama-server marks images with `<__media_<id>__>`, an id random per server, and
+that template knew only `<__media__>`. Reconvert those GGUFs, or serve them with
+`--chat-template-file`. With the new template the image starts at the same prompt position as in
+Zyphra's processor.
+
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not
 fit next to Flash-Next's 104 GiB of weights.
@@ -243,3 +250,39 @@ Until [llama.cpp #15](https://github.com/1bit-MONSTER/llama.cpp/pull/15), ZAYA r
 results whenever a ubatch held more than one sequence: `llama-perplexity` at its default batch,
 and `1bit serve` answering concurrent requests. At four sequences per ubatch, ZAYA1-8B F16's
 wikitext perplexity was 58,259 against 27.89 with one; now both are 27.89 on the CPU.
+
+### ZAYA1-VL-8B: images
+
+[ZAYA1-VL-8B](https://huggingface.co/Zyphra/ZAYA1-VL-8B) is ZAYA1 with Qwen2.5-VL's vision tower
+and two additions ([llama.cpp #18](https://github.com/1bit-MONSTER/llama.cpp/pull/18)):
+
+- **Vision-only LoRA.** Rank-8 LoRA on CCA's q, k, both value projections and o_proj, and rank 32
+  on every expert, used on image tokens only. mtmd decodes each image as its own ubatch of
+  embeddings, so that ubatch takes the LoRA and text ubatches run the ZAYA1 graph unchanged.
+- **Bidirectional attention within an image.** The mmproj key `clip.vision.decode_non_causal`
+  makes mtmd decode the image non-causally. The whole image must fit one ubatch, so `1bit serve
+  --mmproj` passes `-b 4096 -ub 4096` (Qwen2.5-VL caps an image at 4,096 tokens).
+
+```
+python third_party/llama.cpp/convert_hf_to_gguf.py <Zyphra/ZAYA1-VL-8B> --outtype f16 --outfile zaya1-vl-8b-F16.gguf
+python third_party/llama.cpp/convert_hf_to_gguf.py <Zyphra/ZAYA1-VL-8B> --mmproj --outtype f16 --outfile mmproj-zaya1-vl-8b-F16.gguf
+1bit serve -m zaya1-vl-8b-F16.gguf --mmproj mmproj-zaya1-vl-8b-F16.gguf --device vulkan --ctx-size 8192
+```
+
+Checked on Strix Halo against Zyphra's own code (their transformers branch `zaya1-vl`, FP32 on
+the CPU), teacher-forced on llama.cpp's greedy answers to three image questions (101 tokens).
+The prompts are identical: 208 tokens, with the image at the same position.
+
+| Image decode | Reference | Top-1 agreement |
+|---|---|---|
+| causal (the flag set false) | Zyphra's eager path | 100/101 |
+| bidirectional (the default) | eager, with the image block bidirectional | 100/101 |
+
+Zyphra's flash-attention path, which its paper describes, makes everything up to two tokens past
+the image bidirectional. llama.cpp decodes the image bidirectionally and the tokens around it
+causally.
+
+On a synthetic image (a red square, a blue circle, "HELLO 42") the model reads the text exactly,
+and on a photo it recognises the New York Times front page of the moon landing. F16 decodes at
+38-51 tok/s on Vulkan0. ZAYA1-8B is unchanged: 95/96 teacher-forced, the same wikitext
+perplexity.

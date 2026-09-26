@@ -98,7 +98,7 @@ v0.5.0 + #28243 + #21412 + the d_state-64 scan (`a32f0d6f`); Zamba2 converted wi
 
 Mamba-1 scan (`adb2af5d`), `state-spaces/mamba-370m-hf` F16, `llama-bench -p 256 -n 64`: pp256 228 → **6736** tok/s, tg64 25.8 → **173.5** tok/s; greedy completions identical to the CPU-scan build; test-backend-ops SSM_SCAN 17/17.
 
-Zamba v1 (`ee6e4e0d`), `Zyphra/Zamba-7B-v1` Q8_0: teacher-forced top-1 vs transformers FP32 **96/96** on three prompts; greedy continuations identical to the reference's; pp256 543, tg64 14.9 tok/s; 2 graph splits (all compute on Vulkan0). GGUFs of Zamba or Zamba2 converted before `ee6e4e0d` have the broken token scores: reconvert them.
+Zamba v1 (`ee6e4e0d`), `Zyphra/Zamba-7B-v1` Q8_0: teacher-forced top-1 vs transformers FP32 **96/96** on three prompts; greedy continuations identical to the reference's; pp256 543, tg64 14.9 tok/s; 2 graph splits (all compute on Vulkan0: each layer's two-head scan runs on the Mamba-1 Vulkan kernel from `adb2af5d`). GGUFs of Zamba or Zamba2 converted before `ee6e4e0d` have the broken token scores: reconvert them.
 
 Large models need `--ctx-size`: without it llama-server allocates the KV cache
 for the model's full trained context (262,144 tokens for Qwen3.8), which does not

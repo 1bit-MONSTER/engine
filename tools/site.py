@@ -74,7 +74,7 @@ TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks"
 
 # docs sidebar groups: (title, [(doc name, label)])
 NAV = [
-    ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade")]),
+    ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases")]),
     ("Devices", [("npu", "NPU"), ("hrx", "HRX + Vulkan"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
                  ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
     ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),

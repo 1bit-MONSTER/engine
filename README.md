@@ -35,6 +35,9 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census
 
+Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonade with the engine,
+Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
+
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
 > [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on
 > Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork

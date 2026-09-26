@@ -27,7 +27,7 @@
 #            as the GitHub release v<ISO year>.<ISO week> with the packages
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
-# WEEKLY_JOBS (default 8) caps build parallelism.
+# WEEKLY_JOBS (default 6) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine), TheRock in /opt/rocm-therock, and
 # what the build scripts each list.
 set -euo pipefail
@@ -40,14 +40,33 @@ SRC=$W/src BUILD=$W/build OUT=$W/out LOGS=$W/logs
 GGUF=${ONEBIT_SERVE_TEST_GGUF:-$HOME/models/Qwen3-0.6B-Q4_K_M.gguf}
 DRY=${WEEKLY_DRY_RUN:-0}
 # the box is shared: a capped build leaves room for whatever else runs on Sunday
-JOBS=${WEEKLY_JOBS:-8}
+JOBS=${WEEKLY_JOBS:-6}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (linux, laya and comfyui.cpp only on their bumps)
 SUBMODULES=(hrx-system llama.cpp llama.cpp-vulkan llama.cpp-rocmfpx zinc xdna-driver lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
-# heavy steps stop before the box runs out of memory (unified memory: GPU allocations too)
-guard() { "$SRC/scripts/mem-guard.sh" 6 "$@"; }
+# Heavy steps wait for room, and stop before the box runs out of memory (unified memory: GPU
+# allocations count too); one the guard stopped is retried, and the builds pick up where they were.
+MIN_GB=${WEEKLY_MIN_FREE_GB:-16}
+room() {
+    local i
+    for i in $(seq 360); do
+        [ "$(awk '/MemAvailable/ {print int($2 / 1048576)}' /proc/meminfo)" -ge "$MIN_GB" ] && return 0
+        [ "$i" = 1 ] && say "waiting for ${MIN_GB} GB of free memory"
+        sleep 60
+    done
+    say "no ${MIN_GB} GB free in 6 hours"; return 1
+}
+guard() {
+    local try
+    for try in 1 2 3; do
+        room || return 1
+        "$SRC/scripts/mem-guard.sh" 4 "$@" && return 0
+        say "memory guard stopped it (try $try): $*"
+    done
+    return 1
+}
 
 # --- the tree -----------------------------------------------------------------------------
 checkout() {  # checkout <ref> [pr number to merge on top]

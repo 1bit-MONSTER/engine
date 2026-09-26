@@ -1,0 +1,82 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Issue form: something in the engine does not work.
+name: Bug report
+description: 1bit crashes, gives wrong output, or is slower than documented.
+labels: ["bug"]
+body:
+  - type: markdown
+    attributes:
+      value: |
+        Security problems do not go here: report them privately (SECURITY.md).
+        Questions and help: Q&A in Discussions or the Discord.
+  - type: textarea
+    id: what
+    attributes:
+      label: What happened
+      description: What you saw, and what you expected instead.
+    validations:
+      required: true
+  - type: textarea
+    id: command
+    attributes:
+      label: Command
+      description: The exact command, e.g. `1bit serve -m <model> --device hrx`.
+      render: shell
+    validations:
+      required: true
+  - type: dropdown
+    id: device
+    attributes:
+      label: Device
+      options: [auto, npu, vulkan, hrx, rocm, zinc, ds4, mlx, onnx, not sure]
+    validations:
+      required: true
+  - type: input
+    id: model
+    attributes:
+      label: Model
+      description: File name and where it came from (Hugging Face link), with its quantisation.
+      placeholder: Qwen3-0.6B-Q4_K_M.gguf from https://huggingface.co/...
+    validations:
+      required: true
+  - type: input
+    id: version
+    attributes:
+      label: 1bit version
+      description: Output of `1bit version`, or the release / commit you built.
+    validations:
+      required: true
+  - type: input
+    id: hardware
+    attributes:
+      label: Hardware and OS
+      placeholder: Ryzen AI Max+ 395 (Radeon 8060S), 128 GB; Ubuntu 25.10, kernel 6.17
+    validations:
+      required: true
+  - type: textarea
+    id: log
+    attributes:
+      label: Output
+      description: The error and the lines before it. Remove anything private.
+      render: text
+  - type: checkboxes
+    id: checks
+    attributes:
+      label: Checks
+      options:
+        - label: I searched the open and closed issues for this.
+          required: true

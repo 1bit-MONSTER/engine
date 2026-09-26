@@ -170,8 +170,13 @@ std::string default_llama_server(const std::string& device) {
 // Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
 // does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
 bool fork_only_arch(const std::string& gguf) {
+    // Zyphra ZAYA1 (docs/vulkan.md); OPT, CodeGen, GPT-Neo and GPT-J (llama.cpp #8: upstream has
+    // no model for them, gptj only a name). Keep in step with FORK_ONLY in tools/registry_build.py.
+    static const char* const archs[] = {"zaya", "opt", "codegen", "gptneo", "gptj"};
     const std::string arch = gguf_architecture(gguf);
-    return arch == "zaya";  // Zyphra ZAYA1 (docs/vulkan.md)
+    for (const char* a : archs)
+        if (arch == a) return true;
+    return false;
 }
 
 // --lean: the llama-server built from ROCmFPX (ONEBIT_LEAN), whose formats upstream

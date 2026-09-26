@@ -49,7 +49,7 @@ ZINC = "third_party/zinc"
 
 # GGUF architectures only our fork (third_party/llama.cpp) implements; --device vulkan runs them
 # on that build's Vulkan0. Keep in step with fork_only_arch in app/serve.cpp.
-FORK_ONLY = {"zaya"}
+FORK_ONLY = {"zaya", "opt", "codegen", "gptneo", "gptj"}
 
 # The NPU fast lane serves Qwen3 dense Q4NX directories (docs/npu.md). HF architecture ->
 # model_type, as the directory's config.json names them.
@@ -125,10 +125,17 @@ def hf_to_gguf(tree):
 
 
 def runtime_archs(tree):
+    """GGUF architecture names the runtime can build a model for: named in LLM_ARCH_NAMES and
+    given a class in llama_model_mapping (a name alone, as upstream has for gptj, loads nothing)."""
     src = open(os.path.join(tree, "src/llama-arch.cpp")).read()
     body = src[src.index("LLM_ARCH_NAMES"):]
     body = body[:body.index("};")]
-    return set(re.findall(r"\{\s*LLM_ARCH_[A-Z0-9_]+\s*,\s*\"([^\"]+)\"\s*\}", body)) - {"clip"}
+    names = dict(re.findall(r"\{\s*(LLM_ARCH_[A-Z0-9_]+)\s*,\s*\"([^\"]+)\"\s*\}", body))
+    model = open(os.path.join(tree, "src/llama-model.cpp")).read()
+    start = model.index("llama_model_mapping(")
+    mapping = model[start:model.index("\n}\n", start)]
+    built = set(re.findall(r"case\s+(LLM_ARCH_[A-Z0-9_]+)\s*:", mapping))
+    return {n for e, n in names.items() if e in built} - {"clip"}
 
 
 def zinc_archs(tree):

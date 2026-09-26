@@ -46,6 +46,7 @@ export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 SUBMODULES=(hrx-system llama.cpp llama.cpp-vulkan llama.cpp-rocmfpx zinc xdna-driver lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
+trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
 # Heavy steps wait for room, and stop before the box runs out of memory (unified memory: GPU
 # allocations count too); one the guard stopped is retried, and the builds pick up where they were.
 MIN_GB=${WEEKLY_MIN_FREE_GB:-16}
@@ -60,7 +61,7 @@ room() {
 }
 guard() {
     local try
-    for try in 1 2 3; do
+    for try in $(seq 10); do
         room || return 1
         "$SRC/scripts/mem-guard.sh" 4 "$@" && return 0
         say "memory guard stopped it (try $try): $*"

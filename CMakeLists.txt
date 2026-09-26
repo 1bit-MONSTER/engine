@@ -269,6 +269,18 @@ add_library(onebit_npu STATIC npu/file_map.cpp npu/full_elf.cpp npu/model.cpp np
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
+# ── MoE expert streaming (docs/moe-streaming.md) ─────────────────────────
+# The routed-expert cache: pinned RAM slots filled with O_DIRECT reads, and
+# `1bit moe-cache`, which replays expert traces through it. Linux only.
+if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
+    add_library(onebit_moe STATIC moe/gguf_index.cpp moe/expert_cache.cpp moe/cache_bench.cpp)
+    target_include_directories(onebit_moe PUBLIC moe)
+    find_package(Threads REQUIRED)
+    target_link_libraries(onebit_moe PUBLIC Threads::Threads)
+    target_link_libraries(onebit PRIVATE onebit_moe)
+    target_compile_definitions(onebit PRIVATE ONEBIT_MOE)
+endif()
+
 # ── Step 4: Laya router (docs/laya.md) ───────────────────────────────────
 # The non-autoregressive decision scorer that picks where each request runs.
 # Depends on onebit_npu only for its tokenizer.json reader; the scorer itself

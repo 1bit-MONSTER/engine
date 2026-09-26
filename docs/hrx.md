@@ -122,6 +122,20 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
   unsupported 3-D MUL_MAT; use `-b 512`.
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
+- **Decode-split flash attention is off by default ([#140](https://github.com/1bit-MONSTER/engine/issues/140)).**
+  `flash_attention_decode_split_next_q8` gives nondeterministic attention on HRX0, up to 3.66 nats
+  apart between identical requests on Qwen3-0.6B. On Qwen3-Coder-30B-A3B it faulted the GPU in 2 of
+  3 decode runs. So `1bit serve --device hrx` starts llama-server with
+  `GGML_HRX_DISABLE_DISPATCH=decode_split`, and decode uses the flash-attention fallback.
+
+  | model (Q4_K_M, tg) | with decode-split | without (the default) |
+  |---|---|---|
+  | Qwen3-0.6B | 169 ± 34 tok/s, output varies | 322 tok/s, deterministic |
+  | Qwen3-Coder-30B-A3B | faults 2 of 3 runs (80–88 tok/s when it survives) | 66–71 tok/s, 5 of 5 |
+  | ZAYA1-8B | 23.5 tok/s | 25.5 tok/s |
+
+  A `GGML_HRX_DISABLE_DISPATCH` you set yourself wins, and `ONEBIT_HRX_DECODE_SPLIT=1` turns the
+  kernel back on, for testing a fix.
 
 The prefill split below is not affected by either: HRX0 only prefills whole ubatches
 there, and decoding is Vulkan's.

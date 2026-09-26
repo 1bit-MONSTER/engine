@@ -137,6 +137,7 @@ jobs:
           git switch -c "$branch"
           git update-index --cacheinfo "160000,$REBASED,third_party/llama.cpp-vulkan"
           git commit -q -m "Bump Vulkan llama.cpp: ggml-org/llama.cpp ${TAG} (${UPSTREAM:0:12})"
+          scripts/registry-regen.sh  # the registry must record the new pin (ctest registry_pins)
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Bump Vulkan llama.cpp: ggml-org/llama.cpp ${TAG}" \

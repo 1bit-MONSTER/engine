@@ -152,6 +152,7 @@ jobs:
           git update-index --cacheinfo "160000,$REBASED,third_party/llama.cpp"
           git update-index --cacheinfo "160000,$AMD_HRX,third_party/hrx-system"
           git commit -q -m "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12} (AMD's tested pair)"
+          scripts/registry-regen.sh  # the registry must record the new pin (ctest registry_pins)
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12}" \

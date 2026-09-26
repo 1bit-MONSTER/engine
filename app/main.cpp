@@ -39,6 +39,7 @@
 #include "scorer.h"
 #endif
 #include "serve.h"
+#include "built_path.h"
 #ifdef ONEBIT_MOE
 #include "cache_bench.h"
 #endif
@@ -168,7 +169,7 @@ int run_comfy(int argc, char** argv) {
         bin = e;
     }
 #ifdef ONEBIT_COMFYUI_BIN
-    if (bin.empty() && std::filesystem::exists(ONEBIT_COMFYUI_BIN)) bin = ONEBIT_COMFYUI_BIN;
+    if (bin.empty() && std::filesystem::exists(built_path(ONEBIT_COMFYUI_BIN))) bin = built_path(ONEBIT_COMFYUI_BIN);
 #endif
     if (bin.empty()) bin = "comfyui_cpp.exe";   // _spawnvp searches PATH
     std::vector<const char*> args{bin.c_str()};
@@ -185,7 +186,7 @@ std::string find_comfy() {
         return e;
     }
 #ifdef ONEBIT_COMFYUI_BIN
-    if (std::filesystem::exists(ONEBIT_COMFYUI_BIN)) return ONEBIT_COMFYUI_BIN;
+    if (std::filesystem::exists(built_path(ONEBIT_COMFYUI_BIN))) return built_path(ONEBIT_COMFYUI_BIN);
 #endif
     if (const char* path = std::getenv("PATH")) {
         std::stringstream dirs(path);

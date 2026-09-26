@@ -27,17 +27,21 @@
 #            as the GitHub release v<ISO year>.<ISO week> with the packages
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
+# WEEKLY_JOBS (default 8) caps build parallelism.
 # Needs gh (logged in, allowed to merge on the engine), TheRock in /opt/rocm-therock, and
 # what the build scripts each list.
 set -euo pipefail
 
-[ $# -ge 1 ] || { sed -n '16,31p' "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n '16,32p' "$0"; exit 2; }
 W=$(mkdir -p "$1" && cd "$1" && pwd); shift
 STAGES=${*:-bumps build test package release}
 REPO=1bit-MONSTER/engine
 SRC=$W/src BUILD=$W/build OUT=$W/out LOGS=$W/logs
 GGUF=${ONEBIT_SERVE_TEST_GGUF:-$HOME/models/Qwen3-0.6B-Q4_K_M.gguf}
 DRY=${WEEKLY_DRY_RUN:-0}
+# the box is shared: a capped build leaves room for whatever else runs on Sunday
+JOBS=${WEEKLY_JOBS:-8}
+export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (linux, laya and comfyui.cpp only on their bumps)
 SUBMODULES=(hrx-system llama.cpp llama.cpp-vulkan llama.cpp-rocmfpx zinc xdna-driver lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
@@ -74,7 +78,7 @@ build() {
     if [ "$(cat "$xdna/.pin" 2>/dev/null)" != "$(pin xdna-driver)" ]; then
         say "XDNA stack $(pin xdna-driver | cut -c1-12)"
         rm -rf "$xdna"
-        guard "$SRC/scripts/build-xdna.sh" "$xdna" > "$LOGS/xdna.log" 2>&1
+        guard "$SRC/scripts/build-xdna.sh" "$xdna" "$JOBS" > "$LOGS/xdna.log" 2>&1
         pin xdna-driver > "$xdna/.pin"
     fi
     say "engine $(git -C "$SRC" rev-parse --short HEAD)"
@@ -194,6 +198,7 @@ stage_release() {
     git -C "$SRC" fetch -q origin main --tags
     if [ -n "$prev" ]; then from=$(git -C "$SRC" rev-list -1 "$prev");
     else from=$(git -C "$SRC" rev-list -1 --before="7 days ago" origin/main); fi
+    [ -n "$from" ] || from=$(git -C "$SRC" rev-list --max-parents=0 origin/main | tail -1)
     say "release $tag: changes ${from:0:12}..$(git -C "$SRC" rev-parse --short HEAD) (previous: ${prev:-none})"
     python3 "$SRC/tools/weekly_changes.py" --src "$SRC" --from "$from" --to HEAD --tag "$tag" \
         --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md"

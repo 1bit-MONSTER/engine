@@ -115,6 +115,32 @@ name not on the list while some scale-ish keys are legitimately not carried
 produced directory, and has a negative control (strip the keys from a copy of a good
 `config.json` and it must exit 1).
 
+**Validated on cache HIT, not only on repack.**  The serve route's repack resolver
+(`app/serve.cpp`) used to return a cached directory on `model.q4nx` existence alone,
+which bypassed the repack and therefore the guard above — so a directory produced by
+an older converter kept being served silently, and the guard only ever protected
+freshly built artifacts.  A hit now runs the same metadata-only scan (GGUF header +
+`config.json`; no reconversion, no NPU, milliseconds) and **discards and rebuilds**
+the directory if it fails, so a stale artifact cannot be served.  Verified: the
+exact command the resolver builds exits 1 on a stale dir (scales stripped) and 0 on
+a good one.  Override the checker with `ONEBIT_Q4NX_CHECK`.
+
+**Scope of the guard — read this before trusting it.**  Two limits, both deliberate:
+
+* If the checker cannot be resolved the resolver **warns once per process, loudly,
+  and reuses**.  A missing script must not brick serving, but that single warning is
+  the *only* state in which the guard does not apply, and it applies to every
+  directory for that process — so it is printed once, framed, rather than repeated
+  into the general output.  A baked path that resolves to a moved or removed
+  checkout is therefore obvious rather than invisible.
+* The **directory route** (`1bit serve -m <Q4NX dir> --device npu`) consumes a model
+  directory with no repack at all, so the guard never runs there.  That is correct:
+  a *foreign* directory (FastFlowLM's published `Qwen2.5-7B-NPU2`,
+  `MiniCPM5-1B-NPU2`, the 0.6B fast lane) is trusted as published.  In short — **the
+  guard covers newly repacked directories; a foreign directory is trusted as
+  published.**  A future foreign dir that drops a declared scale would be served
+  silently, which is why the sentence is here.
+
 **Still owed: a provenance stamp.**  The scan checks *declared vs carried*; it cannot
 check *which converter path and commit produced the directory*, and the model-dir
 cache reuses a directory on `model.q4nx` existence alone, so neither half can be

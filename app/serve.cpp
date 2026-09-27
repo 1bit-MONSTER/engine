@@ -1079,8 +1079,22 @@ std::string repack_gguf(const std::string& gguf) {
         if (checker.empty() && !script.empty())
             checker = (fs::path(script).parent_path() / "check_repack_config.py").string();
         if (checker.empty() || !fs::exists(checker)) {
-            std::fprintf(stderr, "1bit serve: WARNING cannot validate cached Q4NX dir %s "
-                                 "(no check_repack_config.py; set ONEBIT_Q4NX_CHECK)\n", out.c_str());
+            // This is the ONE state where the guard does not apply, and it applies
+            // to every dir for the whole process -- so say it once, unmissably,
+            // rather than repeating a line that gets lost in serve output.  A baked
+            // path that resolves to a moved/removed checkout must be obvious.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                    "\n1bit serve: ============================================================\n"
+                    "1bit serve: WARNING: the Q4NX declared-scale guard is INACTIVE for\n"
+                    "1bit serve:   this process.  No check_repack_config.py was found at\n"
+                    "1bit serve:   '%s' and ONEBIT_Q4NX_CHECK is unset, so cached Q4NX\n"
+                    "1bit serve:   dirs are reused WITHOUT validation.\n"
+                    "1bit serve: ============================================================\n\n",
+                    checker.empty() ? "(unresolved)" : checker.c_str());
+            }
             return out;
         }
         const std::string vcmd = "\"" + python + "\" \"" + checker + "\" \"" + gguf + "\" \"" + out + "\" >/dev/null 2>&1";

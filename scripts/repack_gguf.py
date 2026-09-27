@@ -193,21 +193,40 @@ def main():
     # Enforce the scale-key guard before the dir is cached (and before anyone
     # trusts it).  MiniCPM4-8B decoded garbage because embedding_scale /
     # residual_scale / logit_scale were declared by the GGUF and dropped here,
-    # and no argmax-level check could see it.  Same list as
-    # scripts/check_repack_config.py; this inline form makes it un-skippable.
-    _missing = []
-    for _k in ("embedding_scale", "residual_scale", "logit_scale", "scale_emb",
-               "scale_depth", "dim_model_base", "final_logit_softcapping",
-               "attn_logit_softcapping"):
-        _v = _num(reader, f"{arch}.{_k}", None)
-        if _v is not None and cfg.get(_k) is None:
-            _missing.append((_k, _v))
+    # and no argmax-level check could see it.  Two tiers, deliberately:
+    #   FAIL on the known-critical list (proven factors the forward must apply);
+    #   WARN (never fail) on any other scale-ish key, because the next arch's
+    #     factor will have an unlisted name, while some scale-ish keys are
+    #     legitimately not carried (deepseek2.expert_weights_scale is a routing
+    #     scale, not a logit scale).  Mirrors scripts/check_repack_config.py.
+    _critical = ("embedding_scale", "residual_scale", "logit_scale", "scale_emb",
+                 "scale_depth", "dim_model_base", "final_logit_softcapping",
+                 "attn_logit_softcapping")
+    _missing, _warned = [], []
+    for _f in reader.fields.values():
+        _tail = _f.name.split(".")[-1]
+        _low = _tail.lower()
+        if not (_tail in _critical or any(h in _low for h in ("scale", "softcap", "mup"))):
+            continue
+        _v = _f.contents()
+        if isinstance(_v, (list, tuple)):
+            _v = _v[-1]
+        try:
+            _v = float(_v)
+        except (TypeError, ValueError):
+            continue
+        if cfg.get(_tail) is None:
+            (_missing if _tail in _critical else _warned).append((_tail, _v))
+    for _k, _v in _warned:
+        print(f"[WARN] the GGUF declares {arch}.{_k} = {_v} and config.json does not "
+              f"carry it; scale-ish but not known-critical -- check whether the "
+              f"forward needs it")
     if _missing:
         for _k, _v in _missing:
             print(f"[FAIL] the GGUF declares {arch}.{_k} = {_v} but config.json drops it; "
                   f"the forward would not apply it")
         return 1
-    print("[OK] every scale-like key the GGUF declares is carried in config.json")
+    print("[OK] every known-critical scale-like key the GGUF declares is carried in config.json")
     print(f"config.json: {cfg}")
     print("repack complete")
     return 0

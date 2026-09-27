@@ -19,12 +19,70 @@ import json
 import os
 import sys
 
+# Two tiers, deliberately (@agent-b35e4d):
+#   * FAIL on the known-critical list -- keys we have proven the forward must apply.
+#   * WARN (never fail) on any other *scale-ish* key the GGUF declares and the
+#     config drops.  The next arch's factor will have a name nobody listed, so a
+#     silent skip would repeat this bug; but some scale-ish keys are legitimately
+#     not carried (GLM's `deepseek2.expert_weights_scale` is a routing scale, not
+#     a logit scale), so a blanket rule would false-fail correct repacks.
 # Keys whose absence from config.json silently changes the forward's numerics.
 # Matched as a suffix on the arch-prefixed GGUF field name (minicpm.logit_scale)
 # and as a bare key in config.json.
 SCALE_LIKE = ("embedding_scale", "residual_scale", "logit_scale", "scale_emb",
               "scale_depth", "dim_model_base", "final_logit_softcapping",
               "attn_logit_softcapping")
+
+# Substrings that mark a key as scale-ish for the WARN tier.
+SCALE_ISH_HINTS = ("scale", "softcap", "mup")
+
+
+def declared_scales(reader):
+    """-> (critical, unknown) dicts of GGUF-declared scale-like scalars."""
+    critical, unknown = {}, {}
+    for f in reader.fields.values():
+        tail = f.name.split(".")[-1]
+        low = tail.lower()
+        if not (tail in SCALE_LIKE or any(h in low for h in SCALE_ISH_HINTS)):
+            continue
+        v = f.contents()
+        if isinstance(v, (list, tuple)):
+            v = v[-1]
+        try:
+            v = float(v)
+        except (TypeError, ValueError):
+            continue
+        (critical if tail in SCALE_LIKE else unknown)[tail] = v
+    return critical, unknown
+
+
+def check(gguf_path, cfg_dir, out=print):
+    """-> list of problems (critical only).  Warnings are printed, not returned."""
+    from gguf import GGUFReader
+    reader = GGUFReader(gguf_path)
+    critical, unknown = declared_scales(reader)
+    cfg_path = os.path.join(cfg_dir, "config.json")
+    cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
+
+    bad = []
+    for k, want in sorted(critical.items()):
+        got = cfg.get(k)
+        if got is None:
+            out(f"  MISSING  {k:26s} GGUF={want!r}   <-- forward would not apply it")
+            bad.append(k)
+        elif abs(float(got) - want) > 1e-9:
+            out(f"  DIFFER   {k:26s} GGUF={want!r} config={got!r}")
+            bad.append(k)
+        else:
+            out(f"  ok       {k:26s} {want!r}")
+    for k, want in sorted(unknown.items()):
+        if cfg.get(k) is None:
+            out(f"  warn     {k:26s} GGUF={want!r} not carried "
+                f"(scale-ish but not on the known-critical list -- check whether the "
+                f"forward needs it)")
+    if not critical and not unknown:
+        out("  (no scale-like keys declared -- nothing to carry)")
+    return bad
 
 
 def main() -> int:
@@ -33,43 +91,15 @@ def main() -> int:
         return 2
     gguf_path, cfg_dir = sys.argv[1], sys.argv[2]
     try:
-        from gguf import GGUFReader
+        import gguf  # noqa: F401
     except ImportError:
         print("needs the `gguf` module on PYTHONPATH")
         return 2
 
-    reader = GGUFReader(gguf_path)
-    declared = {}
-    for f in reader.fields.values():
-        tail = f.name.split(".")[-1]
-        if tail in SCALE_LIKE:
-            v = f.contents()
-            if isinstance(v, (list, tuple)):
-                v = v[-1]
-            try:
-                declared[tail] = float(v)
-            except (TypeError, ValueError):
-                pass
-
-    cfg_path = os.path.join(cfg_dir, "config.json")
-    cfg = json.load(open(cfg_path)) if os.path.exists(cfg_path) else {}
-
-    print(f"{os.path.basename(gguf_path)}: GGUF declares {len(declared)} scale-like key(s)")
-    bad = 0
-    for k, want in sorted(declared.items()):
-        got = cfg.get(k)
-        if got is None:
-            print(f"  MISSING  {k:24s} GGUF={want!r}   <-- forward would not apply it")
-            bad += 1
-        elif abs(float(got) - want) > 1e-9:
-            print(f"  DIFFER   {k:24s} GGUF={want!r} config={got!r}")
-            bad += 1
-        else:
-            print(f"  ok       {k:24s} {want!r}")
-    if not declared:
-        print("  (none declared -- nothing to carry; e.g. MiniCPM5-1B / Qwen2.5-7B)")
-    print("PASS" if bad == 0 else f"FAIL ({bad} problem(s))")
-    return 0 if bad == 0 else 1
+    print(f"{os.path.basename(gguf_path)}: scan of scale-like declared keys")
+    bad = check(gguf_path, cfg_dir)
+    print("PASS" if not bad else f"FAIL ({len(bad)} critical missing/differing)")
+    return 0 if not bad else 1
 
 
 if __name__ == "__main__":

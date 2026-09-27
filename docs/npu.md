@@ -97,6 +97,33 @@ runs on the dx route. There it decoded 24/24 greedy tokens the same as a CPU ref
 the repacked weights, with every step's logits at cosine 0.99995 or better (21.0 ms per
 step). `1bit serve --device npu -m <dir>` loads it in 1.1 s and answers at 54-60 tok/s.
 
+**Declared-scale validation (required).** `scripts/repack_gguf.py`, the repack used
+for the model-generic (`full_i8_*.elf`) route, **fails with `rc=1`** if the GGUF
+declares a known-critical scale-like scalar that the repacked `config.json` drops:
+`embedding_scale`, `residual_scale`, `logit_scale`, `scale_emb`, `scale_depth`,
+`dim_model_base`, `final_logit_softcapping`, `attn_logit_softcapping`.  This is not
+optional bookkeeping: MiniCPM4-8B decoded punctuation soup because
+`minicpm.embedding_scale` (12.0), `minicpm.residual_scale` (0.2475 =
+`scale_depth/sqrt(n_layer)`) and `minicpm.logit_scale` (16.0) were declared by the
+GGUF, applied by llama.cpp, and dropped by the repack — and **no argmax-level check
+can see it**, since the first two move the answer and the third moves only the
+probabilities.  Any *other* scale-ish key (`*scale*`, `*softcap*`, `*mup*`) is
+**warned** about, never fatal, because the next architecture's factor will have a
+name not on the list while some scale-ish keys are legitimately not carried
+(`deepseek2.expert_weights_scale` is a routing scale, not a logit scale).
+`scripts/check_repack_config.py` runs the same scan standalone against a GGUF and a
+produced directory, and has a negative control (strip the keys from a copy of a good
+`config.json` and it must exit 1).
+
+**Still owed: a provenance stamp.**  The scan checks *declared vs carried*; it cannot
+check *which converter path and commit produced the directory*, and the model-dir
+cache reuses a directory on `model.q4nx` existence alone, so neither half can be
+reconstructed after the fact.  The intended payload is the converter path + git
+commit, the arch/`model_type`, and whether a q/k rotary reorder was applied (the
+eventual `rope_interleaved` flag), which would make a directory self-describing
+instead of depending on which converter generation produced it.  Tracked in
+`~/evidence/npu-four-models/STATUS.md` §6.
+
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
 OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its
 onebit backend runs (`--onebit npu`).

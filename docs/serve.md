@@ -27,7 +27,7 @@ OpenAI client.
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
-           [--moe-slots N] [--moe-subst R]
+           [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
@@ -166,6 +166,17 @@ and 3,072 slots, for a KL divergence of 0.008-0.012 against the exact model (doc
 Qwen3.8-Flash-Next UD-Q4_K_XL (111 GB) runs this way from 18-32 GiB of GPU memory: 3.5-6 tok/s
 exact at 4,608-9,216 slots. On that model use `--moe-subst 0.9` or none: 0.5 costs a KL
 divergence of 0.07 there.
+
+`--moe-slots auto` sizes the cache from free memory: `MemAvailable`, less the other tensors the
+GPU holds and a reserve (8 GiB or 15%), divided by the model's mean expert size. On a box with
+40 GiB free it gave Flash-Next 9,331 of 24,576 experts (27.2 GiB) beside 5.1 GiB of other
+tensors, and `serve` held 145 MiB of anonymous memory. Other processes can take that memory
+back later; on a shared box, give a number instead. The gate-ahead prefetch is off unless
+`--moe-prefetch N` asks for it (it doubled Flash-Next's decode time).
+
+Prompts are slow when streaming: a batch larger than 8 tokens runs the experts on the CPU
+from the mapped file (Flash-Next: 0.4-0.8 tok/s of prompt). Keep prompts short, or see
+docs/moe-streaming.md, Next.
 
 ## Many requests at once (`--parallel`)
 

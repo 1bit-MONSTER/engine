@@ -62,6 +62,10 @@
 
 #include "gguf_meta.h"
 
+#ifdef ONEBIT_MOE
+#include "gguf_index.h"
+#endif
+
 #ifdef ONEBIT_NPU
 #include "unified.h"
 #endif
@@ -125,7 +129,8 @@ struct Options {
     int prefill_min_tokens = 0;
     bool lean = false;
     std::string mtp;
-    int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM
+    int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM (-1: auto)
+    int moe_prefetch = 0;   // --moe-prefetch N: gate-ahead prefetch N MoE layers ahead (0: off)
     std::string moe_subst;  // --moe-subst R: a resident expert scoring at least R x a missing one takes its place
     std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
@@ -533,6 +538,52 @@ struct Launch {
 };
 
 // The backend process for one device: its command line and environment.
+#ifdef ONEBIT_MOE
+uint64_t mem_available() {
+    FILE* f = std::fopen("/proc/meminfo", "r");
+    if (!f) return 0;
+    char line[256];
+    unsigned long long kb = 0;
+    while (std::fgets(line, sizeof line, f))
+        if (std::sscanf(line, "MemAvailable: %llu kB", &kb) == 1) break;
+    std::fclose(f);
+    return uint64_t(kb) << 10;
+}
+
+// --moe-slots auto: as many experts as fit in free memory beside the tensors the GPU holds, keeping
+// a reserve (8 GiB or 15% of free memory) for the KV cache, buffers and everything else. The
+// streamer gives every MoE layer an equal share, so the cache costs slots x the mean expert size.
+int auto_moe_slots(const std::string& model) {
+    const auto idx = moe::GgufIndex::open(model);
+    if (idx.experts.empty()) throw std::runtime_error("--moe-slots: " + model + " has no routed experts");
+    double mean = 0;
+    for (const auto& [layer, parts] : idx.experts) mean += double(idx.expert_bytes(layer));
+    mean /= double(idx.experts.size());
+    uint64_t all = 0, experts = 0, mapped = 0;
+    for (const auto& t : idx.tensors) {
+        all += t.bytes;
+        if (t.name.find("_exps.") != std::string::npos) experts += t.bytes;
+        else if (t.name.rfind("per_layer_token_embd", 0) == 0) mapped += t.bytes;  // stays file-backed
+    }
+    const double gib = double(1ull << 30);
+    const uint64_t others = all - experts - mapped, avail = mem_available();
+    const uint64_t reserve = std::max<uint64_t>(8ull << 30, avail / 100 * 15);
+    const int64_t total = int64_t(idx.n_expert) * int64_t(idx.experts.size());
+    const int64_t floor = 64 * int64_t(idx.experts.size());  // decode batches stream only above ~8 x top-k per layer
+    const double room = double(avail) - double(others) - double(reserve);
+    int64_t n = room > 0 ? int64_t(room / mean) : 0;
+    n = std::min(n, total);
+    if (n < floor) {
+        std::fprintf(stderr, "1bit serve: --moe-slots auto: only %.1f GiB free for experts; using %lld slots (%.1f GiB) anyway\n",
+                     std::max(0.0, room) / gib, (long long) floor, floor * mean / gib);
+        n = floor;
+    }
+    std::fprintf(stderr, "1bit serve: --moe-slots auto: %lld of %lld experts (%.1f GiB); %.1f GiB free, %.1f GiB of other tensors on the GPU\n",
+                 (long long) n, (long long) total, n * mean / gib, avail / gib, others / gib);
+    return int(n);
+}
+#endif
+
 Launch launch_for(const Options& o, const std::string& device, int child_port) {
     Launch l;
     l.device = device;
@@ -583,13 +634,23 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             env.push_back("ONEBIT_PREFILL_DEVICE=HRX0");
             if (o.prefill_min_tokens > 0) env.push_back("ONEBIT_PREFILL_MIN_TOKENS=" + std::to_string(o.prefill_min_tokens));
         }
-        if (o.moe_slots > 0) {
+        if (o.moe_slots != 0) {
             // routed experts stay in the file (memory-mapped, never read whole); N of them are cached in
             // Vulkan buffers and streamed in as the router asks (docs/moe-streaming.md)
             if (device != "vulkan" || split || fork_arch)
                 throw std::runtime_error("--moe-slots works with --device vulkan, without --prefill-device");
             env.push_back("ONEBIT_MOE_FILE=" + std::filesystem::absolute(o.model).string());
-            env.push_back("ONEBIT_MOE_SLOTS=" + std::to_string(o.moe_slots));
+            int slots = o.moe_slots;
+            if (slots < 0) {
+#ifdef ONEBIT_MOE
+                slots = auto_moe_slots(o.model);
+#else
+                throw std::runtime_error("--moe-slots auto needs a Linux build (ONEBIT_MOE)");
+#endif
+            }
+            env.push_back("ONEBIT_MOE_SLOTS=" + std::to_string(slots));
+            // off unless asked: where the drive is the limit, wrong guesses cost more than right ones save
+            env.push_back("ONEBIT_MOE_PREFETCH=" + std::to_string(o.moe_prefetch));
             if (!o.moe_subst.empty()) env.push_back("ONEBIT_MOE_SUBST=" + o.moe_subst);
             // the experts stay file-backed: without these, llama.cpp copies every one into RAM
             // (a pinned Vulkan host buffer, or a CPU repack), which is what streaming avoids
@@ -987,8 +1048,9 @@ void usage(FILE* out) {
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
-                 "                  [--moe-slots N] [--moe-subst R]   stream MoE experts from the file, N held in RAM;\n"
-                 "                                    R: resident experts stand in for missing ones (vulkan; docs/moe-streaming.md)\n"
+                 "                  [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   stream MoE experts from the file,\n"
+                 "                                    N held in RAM (auto: what fits); R: resident experts stand in for missing\n"
+                 "                                    ones; prefetch N layers ahead (default 0) (vulkan; docs/moe-streaming.md)\n"
                  "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
@@ -1028,7 +1090,11 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
-        else if (a == "--moe-slots") o.moe_slots = std::stoi(next());
+        else if (a == "--moe-slots") {
+            const std::string v = next();
+            o.moe_slots = v == "auto" ? -1 : std::stoi(v);
+        }
+        else if (a == "--moe-prefetch") o.moe_prefetch = std::stoi(next());
         else if (a == "--moe-subst") o.moe_subst = next();
         else if (a == "--mmproj") o.mmproj = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());

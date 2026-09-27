@@ -93,8 +93,18 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
         "tie_word_embeddings": not has_output,
         "hidden_act": str(_num(reader, f"{p}.activation_function", "")).strip() or "silu",
     }
-    bos = _num(reader, "tokenizer.ggml.bos_token_id", None)
+    # MiniCPM4 architecture scales.  The forward must apply them: the embedding
+    # is scaled by 12.0 and every residual branch by scale_depth/sqrt(NL)
+    # (0.2475 for 32 layers); without them the hidden state runs at the wrong
+    # magnitude and the logits explode (absmax ~136 instead of ~30), decoding to
+    # punctuation soup instead of ' Paris'.  logit_scale is a constant on the
+    # output and does not move the argmax, but carry it for completeness.
+    for _k in ("embedding_scale", "residual_scale", "logit_scale"):
+        _v = _num(reader, f"{p}.{_k}", None)
+        if _v is not None:
+            cfg[_k] = float(_v)
     eos = _num(reader, "tokenizer.ggml.eos_token_id", None)
+    bos = _num(reader, "tokenizer.ggml.bos_token_id", None)
     if bos is not None:
         cfg["bos_token_id"] = int(bos)
     if eos is not None:

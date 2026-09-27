@@ -1055,11 +1055,12 @@ std::string repack_gguf(const std::string& gguf) {
     if (fs::exists(out + "/model.q4nx")) return out;
 
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
-    const std::string python = py ? py : "/home/bcloud/zaya-venv/bin/python3";
+    const std::string python = py ? py : "python3";
     const char* rp = std::getenv("ONEBIT_Q4NX_REPACK");
     const std::string script = rp ? rp : "/home/bcloud/1bit-engine/scripts/repack_gguf.py";
     const char* cv = std::getenv("ONEBIT_Q4NX_CONVERTER");
-    if (!fs::exists(python)) throw std::runtime_error("Q4NX repack python not found: " + python + " (set ONEBIT_Q4NX_PYTHON)");
+    if (python.find('/') != std::string::npos && !fs::exists(python))
+        throw std::runtime_error("Q4NX repack python not found: " + python + " (set ONEBIT_Q4NX_PYTHON)");
     if (!fs::exists(script)) throw std::runtime_error("Q4NX repack script not found: " + script + " (set ONEBIT_Q4NX_REPACK)");
 
     std::fprintf(stderr, "1bit serve: repacking %s -> %s ...\n", gguf.c_str(), out.c_str());
@@ -1189,9 +1190,22 @@ int run_serve(int argc, char** argv) {
         // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
         // directory, then serve it through the model-generic forward in process.
         const std::string dir = repack_gguf(o.model);
-        const char* kernels = std::getenv("ONEBIT_NPU_KERNELS");
-        std::vector<std::string> args = {"-m", dir + "/model.q4nx", "--kernels",
-                                         kernels ? kernels : "", "-p", std::to_string(o.port), "--host", o.host};
+        // Resolve the full-ELF / xclbin directory the forward loads. An empty value
+        // makes it look for "/full_i8_*.elf", so it is an error, not a default.
+        std::string kernels;
+        if (const char* env = std::getenv("ONEBIT_NPU_KERNELS")) kernels = env;
+        if (kernels.empty() && fs::is_directory(fs::path(dir) / "npu")) kernels = (fs::path(dir) / "npu").string();
+#ifdef ONEBIT_NPU_KERNELS_DIR
+        if (kernels.empty()) kernels = ONEBIT_NPU_KERNELS_DIR;
+#endif
+        if (kernels.empty() || !fs::is_directory(kernels)) {
+            throw std::runtime_error(
+                "no NPU kernel (full ELF) directory for " + o.model +
+                ": set ONEBIT_NPU_KERNELS to a directory of full_i8_*.elf designs (docs/npu.md), or\n"
+                "    configure the build with -DONEBIT_NPU_KERNELS_DIR=<dir>");
+        }
+        std::vector<std::string> args = {"-m", dir + "/model.q4nx", "--kernels", kernels,
+                                         "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());

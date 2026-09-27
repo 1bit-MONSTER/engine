@@ -119,13 +119,24 @@ def main():
         print("usage: repack_gguf.py <model.gguf> <output_dir> [converter_dir]")
         return 2
     gguf, out_dir = sys.argv[1], sys.argv[2]
-    converter_dir = sys.argv[3] if len(sys.argv) > 3 else "/home/bcloud/1bit-MONSTER-iso-build/third_party/FLM_Q4NX_Converter"
-    converter_dir = os.path.abspath(converter_dir)
+    # The Q4NX converter is not vendored in this repo. Resolve it in order:
+    # ONEBIT_Q4NX_CONVERTER, a sibling checkout next to the engine, the
+    # 1bit-MONSTER checkout that carries it upstream, then a staging checkout.
+    here = os.path.dirname(os.path.abspath(__file__))
+    candidates = [
+        os.path.join(here, os.pardir, "third_party", "FLM_Q4NX_Converter"),
+        os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER", "third_party", "FLM_Q4NX_Converter"),
+        "/home/bcloud/wt/twostream-main/third_party/FLM_Q4NX_Converter",
+    ]
+    default_converter = os.environ.get("ONEBIT_Q4NX_CONVERTER") or next(
+        (os.path.abspath(p) for p in candidates if os.path.exists(os.path.join(p, "convert.py"))), "")
+    converter_dir = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else default_converter)
 
     os.makedirs(out_dir, exist_ok=True)
     convert_py = os.path.join(converter_dir, "convert.py")
     if not os.path.exists(convert_py):
         print(f"converter not found: {convert_py}")
+        print("set ONEBIT_Q4NX_CONVERTER to an FLM_Q4NX_Converter checkout (convert.py + configs/)")
         return 1
 
     # The converter resolves configs/<arch>.json relative to its CWD.

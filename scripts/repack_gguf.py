@@ -174,10 +174,22 @@ def main():
         return 2
     gguf, out_dir = sys.argv[1], sys.argv[2]
     # The Q4NX converter is not vendored in this repo. Resolve it in order:
-    # ONEBIT_Q4NX_CONVERTER, a sibling checkout next to the engine, the
-    # 1bit-MONSTER checkout that carries it upstream, then a staging checkout.
+    # ONEBIT_Q4NX_CONVERTER, the canonical npu-infer/model-generic checkout,
+    # a sibling checkout next to the engine, the 1bit-MONSTER checkout that
+    # carries it upstream, then a staging checkout.
+    #
+    # The canonical ("npu-infer/model-generic") converter is preferred because
+    # it is the one whose output the model-generic forward was validated
+    # against: it carries the minicpm module + config, the LongRoPE work, the
+    # MiniCPM4 scale fixes, and the llama-arch q/k interleaved->paired reorder
+    # applied for EVERY arch "llama". The 1bit-MONSTER checkout still gates that
+    # reorder on `freq_base <= 20000`, which is false for MiniCPM5-1B
+    # (freq_base 5e6), so it repacks q/k unreordered and the forward decodes
+    # " the" instead of " Paris". Its output matches the published
+    # MiniCPM5-1B-NPU2 model.q4nx byte for byte; the gated one does not.
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        os.path.join(here, os.pardir, os.pardir, "np-model-generic", "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER", "third_party", "FLM_Q4NX_Converter"),
         "/home/bcloud/wt/twostream-main/third_party/FLM_Q4NX_Converter",

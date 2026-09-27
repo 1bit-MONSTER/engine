@@ -135,6 +135,11 @@ private:
     // scale_depth/sqrt(NL) (0.2475 for 32 layers).
     float embed_scale_ = 1.0f;
     float residual_scale_ = 1.0f;
+    // MiniCPM4 logit_scale (config "logit_scale", 16.0).  The final logits are
+    // DIVIDED by it; 1.0 = no-op everywhere else.  A constant positive divisor
+    // cannot move an argmax, so this only matters for the probability
+    // distribution (sampling/temperature).
+    float logit_scale_ = 1.0f;
     std::vector<float> final_norm_;                         // [H]
 
     // Per-layer dequantized projections (reused each layer, chunked by design)

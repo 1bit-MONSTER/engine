@@ -192,6 +192,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
     embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
     residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
+    logit_scale_ = read_config_float(cfg_path, "\"logit_scale\"", 1.0f);
+    if (logit_scale_ == 0.0f) logit_scale_ = 1.0f;
     mw_ = model_load(model_path, cfg);
     if (!mw_) { err_ = "model_load failed"; return false; }
 
@@ -1473,7 +1475,14 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 pos, [&]{ double s=0; for(float v:xn) s+=std::fabs((double)v); return s/H; }(),
                 [&]{ float m=0; for(float v:xn) m=std::max(m, std::fabs(v)); return m; }(), hp);
     }
-    return run_lm_head(xn, logits);
+    if (!run_lm_head(xn, logits)) return false;
+    // MiniCPM4 logit_scale: fitted against the llama.cpp oracle, this forward's
+    // logits were ~16x the oracle's (oracle top-1 prob 0.928 vs effectively
+    // one-hot here) and the best-fit temperature was 0.060 ~ 1/16.7 against a
+    // GGUF logit_scale of 16.  Constant divisor -> cannot move the argmax.
+    if (logit_scale_ != 1.0f)
+        for (size_t i = 0; i < logits.size(); i++) logits[i] /= logit_scale_;
+    return true;
 }
 
 // tiled LM head: logits[K*t + n] = dot(embed[K*t + n], h); K = H, tile = QKV N

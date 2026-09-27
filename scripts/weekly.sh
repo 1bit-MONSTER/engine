@@ -61,9 +61,14 @@ room() {
 }
 guard() {
     local try
+    local rc
     for try in $(seq 10); do
         room || return 1
-        "$SRC/scripts/mem-guard.sh" 4 "$@" && return 0
+        rc=0; "$SRC/scripts/mem-guard.sh" 4 "$@" || rc=$?
+        [ "$rc" = 0 ] && return 0
+        # mem-guard kills with SIGKILL (exit 137); any other status is the command's own failure,
+        # which a retry cannot fix
+        if [ "$rc" != 137 ]; then say "FAILED (exit $rc): $*"; return "$rc"; fi
         say "memory guard stopped it (try $try): $*"
     done
     return 1

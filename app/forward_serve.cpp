@@ -197,27 +197,41 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             });
             res.set_content(wrap(content, "stop"), "application/json");
         } else {
-            res.set_chunked_content_provider("text/event-stream", [&](size_t, httplib::DataSink& sink) {
-                run([&](const std::string& t) {
-                    json chunk;
-                    chunk["id"] = id;
-                    chunk["object"] = "chat.completion.chunk";
-                    chunk["created"] = created;
-                    chunk["model"] = e.id;
-                    if (chat)
-                        chunk["choices"] = json::array({{{"index", 0},
-                                                         {"delta", {{"content", t}}},
-                                                         {"finish_reason", nullptr}}});
-                    else
-                        chunk["choices"] = json::array({{{"index", 0}, {"text", t}, {"finish_reason", nullptr}}});
-                    const std::string d = "data: " + chunk.dump() + "\n\n";
-                    return sink.write(d.data(), d.size());
-                });
-                const std::string done = "data: [DONE]\n\n";
-                sink.write(done.data(), done.size());
-                sink.done();
+            // Build the SSE frames while the handler still owns its locals.  The
+            // content provider below runs AFTER this handler returns, so it must
+            // not capture anything by reference (id/created/object die here) --
+            // that was a dangling-reference crash (`std::system_error`).  Run the
+            // forward here too, so it is not invoked from httplib's write path.
+            json chunk_tpl;
+            chunk_tpl["id"] = id;
+            chunk_tpl["object"] = "chat.completion.chunk";
+            chunk_tpl["created"] = created;
+            chunk_tpl["model"] = e.id;
+            auto chunks = std::make_shared<std::vector<std::string>>();
+            run([&](const std::string& t) {
+                json chunk = chunk_tpl;
+                if (chat)
+                    chunk["choices"] = json::array({{{"index", 0},
+                                                     {"delta", {{"content", t}}},
+                                                     {"finish_reason", nullptr}}});
+                else
+                    chunk["choices"] = json::array({{{"index", 0}, {"text", t}, {"finish_reason", nullptr}}});
+                chunks->push_back("data: " + chunk.dump() + "\n\n");
                 return true;
             });
+            auto cursor = std::make_shared<size_t>(0);
+            res.set_chunked_content_provider("text/event-stream",
+                [chunks, cursor](size_t, httplib::DataSink& sink) {
+                    while (*cursor < chunks->size()) {
+                        const std::string& d = (*chunks)[*cursor];
+                        if (!sink.write(d.data(), d.size())) return false;
+                        ++*cursor;
+                    }
+                    const std::string done = "data: [DONE]\n\n";
+                    sink.write(done.data(), done.size());
+                    sink.done();
+                    return true;
+                });
         }
     } catch (const std::exception& ex) {
         res.status = 500;

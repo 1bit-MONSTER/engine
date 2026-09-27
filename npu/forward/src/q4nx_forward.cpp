@@ -1484,13 +1484,25 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     std::vector<float> hs((size_t)H);
     for (int k = 0; k < H; k++) hs[(size_t)k] = h[(size_t)k] * inv_es;
 
-    std::vector<float> Bt((size_t)H * T);
+    const size_t tile_elems = (size_t)H * (size_t)T;
+    if (lm_head_tiles_.size() != (size_t)ntiles * tile_elems || lm_head_tiles_T_ != T) {
+        // Once per model: [tile][H][T], so each token copies sequentially instead
+        // of gathering the whole head with a T-float stride.
+        lm_head_tiles_.assign((size_t)ntiles * tile_elems, 0.0f);
+        for (int t = 0; t < ntiles; t++) {
+            const int n0 = t * T, n1 = std::min(NV, n0 + T);
+            float* dst = lm_head_tiles_.data() + (size_t)t * tile_elems;
+            for (int n = n0; n < n1; n++)
+                for (int k = 0; k < H; k++)
+                    dst[(size_t)k * T + (n - n0)] = lm_at(n, k);
+        }
+        lm_head_tiles_T_ = T;
+    }
+    std::vector<float> Bt(tile_elems);
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);
-        std::fill(Bt.begin(), Bt.end(), 0.0f);
-        for (int n = n0; n < n1; n++)
-            for (int k = 0; k < H; k++)
-                Bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
+        std::memcpy(Bt.data(), lm_head_tiles_.data() + (size_t)t * tile_elems,
+                    tile_elems * sizeof(float));
         float sout = 1.0f;
         ctx_[i_qkv]->packB(0, Bt.data(), H, T, sout);
         float amax = 0.0f;

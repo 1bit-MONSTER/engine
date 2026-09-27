@@ -1057,7 +1057,11 @@ std::string repack_gguf(const std::string& gguf) {
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
     const std::string python = py ? py : "python3";
     const char* rp = std::getenv("ONEBIT_Q4NX_REPACK");
-    const std::string script = rp ? rp : "/home/bcloud/1bit-engine/scripts/repack_gguf.py";
+#ifdef ONEBIT_NPU_REPACK_SCRIPT
+    const std::string script = rp ? rp : ONEBIT_NPU_REPACK_SCRIPT;
+#else
+    const std::string script = rp ? rp : "";
+#endif
     const char* cv = std::getenv("ONEBIT_Q4NX_CONVERTER");
     if (python.find('/') != std::string::npos && !fs::exists(python))
         throw std::runtime_error("Q4NX repack python not found: " + python + " (set ONEBIT_Q4NX_PYTHON)");

@@ -99,6 +99,15 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
         cfg["bos_token_id"] = int(bos)
     if eos is not None:
         cfg["eos_token_id"] = int(eos)
+    # A chat template that opens with {{- bos_token }} (MiniCPM5 and other llama-class
+    # models) needs the BOS id prepended to the rendered prompt. The forward builds a
+    # plain ChatML prompt, which never carries it, and those models derail without it.
+    tf = _field(reader, "tokenizer.chat_template")
+    template = tf.contents() if tf is not None else None
+    if isinstance(template, bytes):
+        template = template.decode("utf-8", "replace")
+    if isinstance(template, str) and template.lstrip().startswith("{{- bos_token }}"):
+        cfg["add_bos_token"] = 1
     if arch in ATTENTION_BIAS_ARCHES:
         cfg["attention_bias"] = True
     # LongRoPE (MiniCPM4): the GGUF ships rope_factors_short.weight; carry the

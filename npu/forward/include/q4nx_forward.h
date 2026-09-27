@@ -120,6 +120,11 @@ private:
     // head; decoding its logits from the embedding gives a different
     // distribution entirely, so the real head is dequantized once into lm_head_f_.
     std::vector<float> lm_head_f_;
+    // The NPU LM head wants the head transposed into per-tile [H][T] blocks. That
+    // gather transposes the whole NV x H matrix with a stride of T floats, so it
+    // is built once here instead of on every token (it dominated decode time).
+    std::vector<float> lm_head_tiles_;
+    int                lm_head_tiles_T_ = 0;
     float lm_at(int n, int k) const;
     std::vector<std::vector<float>> in_norm_, post_norm_;   // [NL][H]
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]

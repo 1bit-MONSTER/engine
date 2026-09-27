@@ -54,6 +54,8 @@ using json = nlohmann::json;
 struct ForwardEngine {
     std::string id;
     std::unique_ptr<npu::Tokenizer> tok;
+    int  bos_id  = -1;     // config.json bos_token_id (the chat template may open with it)
+    bool add_bos = false;  // config.json add_bos_token: the rendered chat prompt needs BOS
     std::unique_ptr<Q4nxNpuForward> fwd;
     int eos = -1;
     int endoftext = -1;
@@ -130,9 +132,13 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                                   std::chrono::system_clock::now().time_since_epoch()).count());
     const std::string object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
-    auto run = [&e, prompt, max_tokens](const std::function<bool(const std::string&)>& on_text) {
+    auto run = [&e, prompt, max_tokens, chat](const std::function<bool(const std::string&)>& on_text) {
         std::lock_guard<std::mutex> lock(e.mu);
-        const std::vector<int> ids = e.tok->encode(prompt);
+        std::vector<int> ids = e.tok->encode(prompt);
+        // A chat template that opens with {{- bos_token }} (MiniCPM5 and other
+        // llama-class models) needs the BOS id: the ChatML prompt built above never
+        // carries it, and those models derail into their special tokens without it.
+        if (chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
 
         auto argmax = [](const std::vector<float>& v) {
@@ -247,6 +253,8 @@ int run_forward_serve(int argc, char** argv) {
     ForwardEngine e;
     e.id = alias.empty() ? std::filesystem::path(dir).filename().string() : alias;
     e.tok = std::make_unique<npu::Tokenizer>(tok_json);
+    e.bos_id  = json_int(cfg, "bos_token_id", -1);
+    e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     e.eos = json_int(cfg, "eos_token_id", -1);
     e.endoftext = e.tok->token_id("<|endoftext|>");
 

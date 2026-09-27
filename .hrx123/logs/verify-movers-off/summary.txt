@@ -1,0 +1,11 @@
+=== verify movers-off :: 2026-09-27T09:53:55-03:00 n=6 ===
+llama.cpp: c16424f5 (branch 1bit/hrx-moe-router-nan-loud)
+engine:    0a52220
+quiet:     KFD=[ 1383156] render=[ 1357462 1383156]
+movers:    ksm=0 proact=0 thp=[always] madvise never unevictable=1
+load:      4.59 4.80 4.04
+MATCH          n=1  ['18181']
+LOUD-ABORT     n=4  ['18180', '18183', '18184', '18185']
+SILENT-WRONG   n=0  []
+LAUNCH-FAILED  n=1  ['18182']
+TOTAL samples=6

@@ -557,37 +557,63 @@ disappear.) That is the silent wrong-expert decode.
    engine#123/#140 rig oracle without editing stress literals, which is what made the
    baseline measurable.
 
-## Verification (30B MoE, 2113 ctx, fresh server per sample)
+## Verification (30B MoE, 2113 ctx, fresh server per sample; every sample archived)
 
-| | match | silent divergent | loud abort |
-|---|---|---|---|
-| before (`895d63f0`), 8-way concurrent | 7 | 6 | 0 |
-| after (`c16424f5`), 6-way concurrent, movers on | 0 | 0 | **6** |
-| after, 6-way concurrent, KSM + proactive compaction off | 0 | 1 | **5** |
+`verify_repair.sh <tag> <port>...` starts one fresh server per port concurrently and
+classifies each sample MATCH / LOUD-ABORT / SILENT-WRONG / LAUNCH-FAILED, keeping the raw
+JSON and every server log under `logs/verify-<tag>/`.
+
+| condition | n | match | loud abort | silent wrong | launch OOM |
+|---|---|---|---|---|---|
+| pre-repair (`895d63f0`), 8 fresh servers concurrently | 16 | 7 | n/a (no guard) | **6** | 3 |
+| post-repair (`c16424f5`), 6 concurrent, movers on | 6 | 1 | **4** | **0** | 1 |
+| post-repair (`c16424f5`), 6 concurrent, KSM + proactive compaction off | 6 | 1 | **4** | **0** | 1 |
 
 Every silent `' Paris???????????????'` became a loud
 `HRX returned NaN logits at vocab index 0 - refusing to sample a silently wrong token
-(engine#123)`. Under no induced pressure the fault never appeared at all (0/8 sequential,
-and 0/300 for the 0.6B probe in five conditions — see `repro-summary.md`).
+(engine#123)`. After the repair there are **zero** silent-wrong samples: a corrupted decode is
+either correct or a loud abort, so the end-to-end repro is deterministic. Under no induced
+pressure the fault never appeared at all (0/8 sequential, and 0/300 for the 0.6B probe in
+five conditions — see `repro-summary.md`).
 
-## Source of the NaN, and why the fix is out-of-tree
+Honest caveats: the LAUNCH-FAILED samples are 30B servers that failed to *load* (6 concurrent
+instances is ~108 GiB of a 122 GiB box), not corrupted decodes. In the movers-off run the
+`fuser` quiet line was captured while an earlier server was still shutting down, so that run
+was "6 concurrent + one held fd" rather than perfectly quiet; per-sample classification is
+unaffected (each sample is judged by its own outcome).
 
-The NaN follows the kernel migrating pages behind in-flight HRX work. HRX's device
-buffers on this APU are system memory registered with the GPU as pageable: the transient
-arena is one reused `hrx_allocator_allocate_buffer(hrx_device_allocator(device),
-{HRX_MEMORY_TYPE_DEVICE_LOCAL, …})` (`runtime/transient-arena.cpp`), and the runtime's
-`hrx_buffer_params_t` is `{type, access, usage, queue_affinity}` — **no pin/lock knob**.
-The allocation itself lives in `ROCm/hrx-system` `libhrx`. So the root fix belongs there
-(pin the allocation, or use non-migratable VMM — `[HIP] Implement virtual memory
-management` #568 is already in our pinned runtime and is the mechanism such a fix would
-use) or in KFD's userptr eviction/restore. Measured refinement: the corruption tracks
-**process memory pressure**, not the two named knobs — with 6 concurrent 30B instances it
-persists with KSM and proactive compaction off, because direct compaction under that
-pressure still migrates pages; under no induced pressure it does not appear at all.
+## Why the fix is out-of-tree (evidenced), and the mechanism (best-supported hypothesis)
 
-## Known residual (out of scope, recorded honestly)
+**Evidenced — this is what satisfies the "out-of-tree" branch of the deliverable:**
+- HRX's device buffers on this APU are pageable system memory registered with the GPU: the
+  decode-split transient arena is one reused `hrx_allocator_allocate_buffer(
+  hrx_device_allocator(device), {HRX_MEMORY_TYPE_DEVICE_LOCAL, HRX_MEMORY_ACCESS_ALL,
+  HRX_BUFFER_USAGE_DEFAULT, 0})` (`runtime/transient-arena.cpp`).
+- The runtime's allocation descriptor `hrx_buffer_params_t` is
+  `{type, access, usage, queue_affinity}` — there is **no pin / lock / advise field**, so
+  nothing settable from this repository stops those pages from being migrated.
+- The allocation is implemented in `ROCm/hrx-system` `libhrx` (`hrx_allocator_*`), outside
+  this repository and outside the kernels this goal can change.
+- That runtime already carries `[HIP] Implement virtual memory management` (#568), the
+  mechanism a pinning fix would use — so the fix is reachable, just not from here.
 
-1 of the 6 movers-off samples was silently divergent **without** NaN logits (a truncated
-wrong stream), so page migration can also corrupt a finite value. The loud guard covers
-the NaN class only; a finite-value corruption stays silent and would need a
-checksum/parity mechanism, not a NaN check.
+**Best-supported hypothesis, explicitly not proven here:** the NaN follows the kernel
+migrating such a page while HRX work is in flight (KFD userptr eviction/restore). The measured
+support is that corruption tracks process memory pressure — absent with no induced pressure
+(0/8 sequential; 0/300 for the 0.6B probe in five conditions), present with 6 concurrent 30B
+instances, and still present with KSM and proactive compaction off under that pressure because
+direct compaction still migrates pages. That is a correlation with the pressure that drives
+migration, not a tracer-level proof of eviction; the earlier layout-only observations (the
+arena-prefix bisect) show corruption does not require induced pressure in every configuration,
+so the mechanism is stated as the best-supported explanation rather than as established.
+
+## Retracted claim (a measurement bug, not a finding)
+
+An earlier draft recorded "1 of the 6 movers-off samples was silently divergent without NaN
+logits" and inferred a residual finite-value corruption class. That was **wrong**: the
+reference string had been passed through bash single quotes, so its `\n` was a literal
+backslash-n and no sample could ever compare equal - a correct match was scored as divergent.
+With the reference fixed, movers-off is 1 match / 4 loud aborts / 0 silent-wrong (n=6), and
+movers-on is the same. No finite-value residual is observed in these runs. (A finite-value
+corruption would still need a checksum/parity mechanism rather than a NaN check - true in
+principle, but nothing here demonstrates that such corruption occurs.)

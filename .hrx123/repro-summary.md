@@ -43,3 +43,51 @@ The wrongness does not appear on a quiet box under the documented short-context 
 but appears at ~46% when the process is under memory pressure - the same driver
 (compaction moving pages behind in-flight HRX work) that engine#140 measured. This is
 the silent wrong-output symptom: the token stream is corrupted with no error raised.
+
+## Post-repair measurements (pin llama.cpp c16424f5 = the loud all-NaN repair)
+
+The repair turns the all-NaN router/attention case into a loud abort
+("HRX returned NaN logits ... (engine#123)"), so corruption now shows up as an
+abort instead of a wrong token.
+
+| condition | n | match | silent divergent | loud abort |
+|---|---|---|---|---|
+| 30B MoE, 2113 ctx, fresh server, one at a time, movers ON | 8 | 8 | 0 | 0 |
+| 30B MoE, 2113 ctx, 6 fresh servers concurrently, KSM=1 proact=20 | 6 | 0 | 0 | 6 |
+| 30B MoE, 2113 ctx, 6 fresh servers concurrently, KSM=0 proact=0 | 6 | 0 | 1 | 5 |
+
+Reading. The driver is memory pressure, not the two named knobs: with 6 concurrent 30B
+instances (~108 GiB of a 122 GiB box) the corruption persists even with KSM and proactive
+compaction off, because direct compaction under that pressure still migrates pages. This is
+the caveat the engine#123/#140 write-up already records ("direct compaction under memory
+pressure can still move pages"). Under no induced pressure the fault never appeared
+(0/300 and 0/8 above).
+
+Known residual, out of scope for this repair: 1 of the 6 movers-off samples was silently
+divergent *without* NaN logits (a truncated wrong token stream), so page migration can also
+corrupt a finite value. The loud guard covers the NaN class only; a finite-value corruption
+remains silent and would need a different (checksum/parity) mechanism.
+
+## CORRECTION (supersedes the "Known residual" paragraph above)
+
+That paragraph was a **measurement bug**, not a finding. The reference string had been passed
+through bash single quotes, so its `\n` was a literal backslash-n and **no** sample could ever
+compare equal; a correct match was therefore counted as "silent divergent". With the reference
+fixed (real newlines) and every sample archived under `logs/verify-<tag>/`
+(`verify_repair.sh` classifies MATCH / LOUD-ABORT / SILENT-WRONG / LAUNCH-FAILED):
+
+| condition | n | match | loud abort | silent wrong | launch OOM |
+|---|---|---|---|---|---|
+| pre-repair (`895d63f0`), 8 fresh servers concurrently | 16 | 7 | n/a (no guard) | **6** | 3 |
+| post-repair (`c16424f5`), 6 concurrent, movers ON | 6 | 1 | 4 | **0** | 1 |
+| post-repair (`c16424f5`), 6 concurrent, movers OFF | 6 | 1 | 4 | **0** | 1 |
+
+After the repair there are **zero** silent-wrong samples: every corrupted sample is either the
+correct output or a loud abort. The end-to-end repro is deterministic after the repair.
+
+Honest caveats about these runs, stated rather than hidden:
+- The `LAUNCH-FAILED` samples are 30B servers that failed to load (6 concurrent instances is
+  ~108 GiB of a 122 GiB box). They are launch failures, not corrupted decodes.
+- In the movers-OFF run the `fuser` quiet line was taken while one earlier server was still
+  shutting down, so that run is "6 concurrent + one held fd" rather than perfectly quiet. The
+  per-sample classification is unaffected (each sample is judged by its own outcome).

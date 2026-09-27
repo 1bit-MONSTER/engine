@@ -117,6 +117,34 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 
 `test-backend-ops -b HRX0`: 790/790.
 
+### Fixed: decode-split multipass gap above 2048 ([engine#124](https://github.com/1bit-MONSTER/engine/issues/124))
+
+The multipass decode-split reducer (`reduce_completed.multipass`, used above
+`key_value_token_capacity` 2048) finished with a scalar output pass: each workitem owned
+one output channel and walked every KV block serially, recomputing
+`expf(partial_max - maximum)` once per (block, element). Only half the workgroup is live
+at `value_head_size = 128`, so decode above 2048 stayed about 16% below the <=2048
+corridor. Fork PR
+[1bit-MONSTER/llama.cpp#30](https://github.com/1bit-MONSTER/llama.cpp/pull/30) computes
+the per-block scale once into a per-row workgroup (LDS) stage and runs one vectorised,
+all-rows output pass (4 channels per workitem). The per-channel block order is
+unchanged, so the reduce is bit-identical.
+
+Measured on Strix Halo (Qwen3-Coder-30B-A3B-Instruct Q4_K_M, `-dev HRX0`,
+`llama-bench -p 0 -n 8 -r 5`, median of 6 interleaved runs):
+
+| depth | blocks | before | this pin | delta |
+|---|---:|---:|---:|---:|
+| 2000 (<=2048 control) | 32 | 66.06 | 68.82 | +4.2% |
+| 2100 | 33 | 58.19 | 67.15 | **+15.4%** |
+| 3000 | 47 | 50.84 | 60.89 | **+19.8%** |
+| 4800 | 76 | 41.83 | 51.02 | **+22.0%** |
+
+`d2100/d2000` moves 0.881 -> 0.976, so the boundary cliff is gone. 1.24 GB of
+decode-path logits (`llama-perplexity -c 2049 -b 1 --save-all-logits`) are byte-identical
+to the previous pin, the buried code word is exact at 4700 tokens, and no GPU faults
+were observed.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an

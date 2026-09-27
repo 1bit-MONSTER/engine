@@ -318,8 +318,15 @@ output identical to the CPU backend. The alignment change is a repro stress knob
 and is **not** part of the fix.
 
 What the fix does not cover: the fault needs router logits that are NaN, and
-the fix routes such a lane to a valid expert instead of faulting, so the token
-still decodes with the wrong expert. Where the NaNs come from is open
+the fix routes such a lane to a valid expert instead of faulting. Since
+[llama.cpp #26](https://github.com/1bit-MONSTER/llama.cpp/pull/26) that case is loud: a router row
+with no ordered logit publishes NaN, and llama-server refuses to sample NaN logits (it logs
+"HRX returned NaN logits" and aborts) instead of decoding a wrong but plausible token. On the
+author's repro 6 of 13 samples used to decode `' Paris???…'` silently; they now abort. Healthy
+runs are unchanged (Qwen3-Coder-30B and ZAYA1-8B perplexity on HRX0 identical to before).
+`GGML_HRX_FA_PARTIAL_ALIGN` (default 4096) sets the decode-split partials' alignment, a test knob
+that reproduces the fault's layout; the investigation's artifacts are archived privately.
+Where the NaNs come from is open
 ([engine#140](https://github.com/1bit-MONSTER/engine/issues/140)). One
 measurement points at the kernel moving the pages behind HRX's buffers: greedy
 `Qwen3-0.6B` on `HRX0`, 300 identical requests, gave different log-probs on

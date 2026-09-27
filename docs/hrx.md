@@ -293,6 +293,42 @@ llama.cpp with ggml-hrx2 on `HRX20`):
 
 HRX prefill is now faster than Vulkan's.
 
+## MoE router expert-id fault fix ([engine#123](https://github.com/1bit-MONSTER/engine/issues/123))
+
+`llama_decode` could die with `HSA_STATUS_ERROR_MEMORY_FAULT` (`ret = -3`) on MoE
+models (`Qwen3-Coder-30B-A3B`). It was reported against the decode-split
+multipass path, but it is not in flash attention: the fault is a wild weight
+read in `qwen3_moe_routed_gate_up_swiglu_q4k_q8`.
+
+`router_top8_f32.loom` seeded each lane's argmax with `best_id = 0x7FFFFFFF` and
+only replaced it on an ordered `ogt` or the equal-value tie-break. A lane whose
+candidate logits are unordered (NaN) or below `-FLT_MAX` therefore published the
+sentinel verbatim into `route_ids`; consumers treat the id as bounded via
+`index.assume` (a hint, not a check) and compute `expert * expert_stride` in 32
+bits, so `0x7FFFFFFF * 884736 mod 2^32 = 0xFFF28000` (~4.29 GB) walked off the
+end of the weights buffer. The fix seeds the argmax with the lane's own first
+expert id. Upstream PR: [1bit-MONSTER/llama.cpp#25](https://github.com/1bit-MONSTER/llama.cpp/pull/25),
+merged as `895d63f`, which the engine pins.
+
+Measured on `HRX0` (`Qwen3-Coder-30B-A3B-Instruct-Q4_K_M`, `llama-bench -p 0 -n 8`,
+quiet box) with the fault made observable by aligning the three decode-split
+*partial* transients to 256 B instead of 4096 B: pre-fix `-d 2100` 5/5 faults,
+post-fix `-d 2100` 0/5, `-d 3000`/`-d 4800` 0/3, `<=2048` path 0/3, and greedy
+output identical to the CPU backend. The alignment change is a repro stress knob
+and is **not** part of the fix.
+
+What the fix does not cover: the fault needs router logits that are NaN, and
+the fix routes such a lane to a valid expert instead of faulting, so the token
+still decodes with the wrong expert. Where the NaNs come from is open
+([engine#140](https://github.com/1bit-MONSTER/engine/issues/140)). One
+measurement points at the kernel moving the pages behind HRX's buffers: greedy
+`Qwen3-0.6B` on `HRX0`, 300 identical requests, gave different log-probs on
+24-38 % of them with the box's defaults (KSM on, proactive compaction 20,
+transparent huge pages `always`), 0-0.7 % with KSM and compaction off, 8-11 %
+with proactive compaction alone, 4 % with KSM alone, and 0-0.7 % with every
+setting at its default but the server `mlockall`ed and
+`vm.compact_unevictable_allowed=0` (2026-09-27, the pin before this fix).
+
 ## Not yet
 
 - **Fast sub-4-bit and IQ4 kernels on HRX.** With our patches the UD files are

@@ -122,11 +122,12 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
   unsupported 3-D MUL_MAT; use `-b 512`.
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
-- **Decode-split flash attention is off by default ([#140](https://github.com/1bit-MONSTER/engine/issues/140)).**
-  `flash_attention_decode_split_next_q8` gives nondeterministic attention on HRX0, up to 3.66 nats
-  apart between identical requests on Qwen3-0.6B. On Qwen3-Coder-30B-A3B it faulted the GPU in 2 of
-  3 decode runs. So `1bit serve --device hrx` starts llama-server with
-  `GGML_HRX_DISABLE_DISPATCH=decode_split`, and decode uses the flash-attention fallback.
+- **Decode-split flash attention is off by default.** It used to give nondeterministic attention on
+  HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140), up to 3.66 nats apart between
+  identical requests on Qwen3-0.6B) and to fault Qwen3-Coder-30B-A3B. That is fixed since llama.cpp
+  `00adc2b` (see the #123 section below), but the kernel is only faster on some models, so
+  `1bit serve --device hrx` still starts llama-server with `GGML_HRX_DISABLE_DISPATCH=decode_split`.
+  The table was measured before the fix:
 
   | model (Q4_K_M, tg) | with decode-split | without (the default) |
   |---|---|---|
@@ -326,15 +327,20 @@ author's repro 6 of 13 samples used to decode `' Paris???…'` silently; they no
 runs are unchanged (Qwen3-Coder-30B and ZAYA1-8B perplexity on HRX0 identical to before).
 `GGML_HRX_FA_PARTIAL_ALIGN` (default 4096) sets the decode-split partials' alignment, a test knob
 that reproduces the fault's layout; the investigation's artifacts are archived privately.
-Where the NaNs come from is open
-([engine#140](https://github.com/1bit-MONSTER/engine/issues/140)). One
-measurement points at the kernel moving the pages behind HRX's buffers: greedy
-`Qwen3-0.6B` on `HRX0`, 300 identical requests, gave different log-probs on
-24-38 % of them with the box's defaults (KSM on, proactive compaction 20,
-transparent huge pages `always`), 0-0.7 % with KSM and compaction off, 8-11 %
-with proactive compaction alone, 4 % with KSM alone, and 0-0.7 % with every
-setting at its default but the server `mlockall`ed and
-`vm.compact_unevictable_allowed=0` (2026-09-27, the pin before this fix).
+**Root cause of the NaNs ([engine#123](https://github.com/1bit-MONSTER/engine/issues/123),
+[#140](https://github.com/1bit-MONSTER/engine/issues/140)), fixed in llama.cpp `00adc2b`**
+([#28](https://github.com/1bit-MONSTER/llama.cpp/pull/28),
+[#29](https://github.com/1bit-MONSTER/llama.cpp/pull/29)). In every decode-split `reduce_fused`
+variant the last workgroup writes the attention output to global memory, and `pack_completed_q8`
+then reads it back with other waves to build `next_q8`. The barrier between the two was
+`kernel.barrier<workgroup>`, which fences LDS only (no store wait, no `buffer_gl0_inv`), so a pack
+wave could quantize the output slot's previous contents. The f32 output was right and `next_q8`
+was wrong, and NaN when the stale bytes decoded as NaN. The window opens when a dispatch is
+preempted, and any process's KFD queue eviction (page compaction, KSM, memory pressure) does that,
+which is why the rate followed those settings. It was never the cause. The fix fences both memory
+spaces (`barrier<global>` then `barrier<workgroup>`). With a separate process forcing queue
+evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 1 of 8 correct to
+8 of 8 with no NaN, and greedy Qwen3-0.6B from 13-34 divergent per ~177 requests to none.
 
 ## Not yet
 

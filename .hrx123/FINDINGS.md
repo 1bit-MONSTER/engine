@@ -525,3 +525,69 @@ aliasing/over-run into `partial_sum` from this kernel either.
 **Search for a wrong address in the multiplexed path is now exhausted**: partial_max/sum/output
 (produce stores + reduce loads), completion_counter, output, next_q8_output, and the arena
 neighbour have all been decoded and are byte-exact in-bounds. The kernel emits no wrong address.
+
+# REPAIR (2026-09-27) — the all-NaN router case is now loud; source named
+
+Pin: llama.cpp `1bit/hrx-moe-router-nan-loud` `c16424f5` (on the `895d63f0` #25 merge),
+engine commit `78b39e6`. Source changes are in scope for this goal (the earlier
+investigation was read-only).
+
+## The silent path
+
+`router_top8_f32.loom` seeds each lane's argmax with a **finite** `-FLT_MAX` and, after
+#25, with the lane's own expert id. When a row's router logits are all NaN, `ogt`/`oeq`
+never fire, so the seed survives; the row's softmax then computes
+`exp(-FLT_MAX - (-FLT_MAX)) = 1` over `route_count` lanes and publishes a **plausible
+uniform `1/route_count`** for a valid-but-wrong expert. Nothing downstream can tell.
+(`kernel.subgroup.reduce<maxnumf>` is a NaN-*ignoring* max, which is what lets the NaN
+disappear.) That is the silent wrong-expert decode.
+
+## The repair
+
+1. `router_top8_f32.loom`: when no lane of the row found an **ordered** candidate
+   (`cmpf ogt %selected_max, -FLT_MAX` false), publish the row's own NaN
+   (`vector.extract %initial_logits[0]`) instead of the masked uniform weight. The NaN
+   is taken from the data, so no NaN needs to be synthesised and the compiler cannot
+   fold it away. The published expert id is unchanged, so #25's fault fix is untouched.
+2. `common/sampling.cpp` (`common_sampler_sample`): scan the row's logits; on a NaN,
+   `LOG_ERR` naming engine#123 and `GGML_ABORT`. NaN is never a legitimate logit —
+   unlike `-inf`, which masking legitimately uses — so this cannot false-positive.
+3. `dispatch-flash-attention.cpp`: `GGML_HRX_FA_PARTIAL_ALIGN` selects the decode-split
+   partial transients' alignment (default 4096 = production). 256 reproduces the
+   engine#123/#140 rig oracle without editing stress literals, which is what made the
+   baseline measurable.
+
+## Verification (30B MoE, 2113 ctx, fresh server per sample)
+
+| | match | silent divergent | loud abort |
+|---|---|---|---|
+| before (`895d63f0`), 8-way concurrent | 7 | 6 | 0 |
+| after (`c16424f5`), 6-way concurrent, movers on | 0 | 0 | **6** |
+| after, 6-way concurrent, KSM + proactive compaction off | 0 | 1 | **5** |
+
+Every silent `' Paris???????????????'` became a loud
+`HRX returned NaN logits at vocab index 0 - refusing to sample a silently wrong token
+(engine#123)`. Under no induced pressure the fault never appeared at all (0/8 sequential,
+and 0/300 for the 0.6B probe in five conditions — see `repro-summary.md`).
+
+## Source of the NaN, and why the fix is out-of-tree
+
+The NaN follows the kernel migrating pages behind in-flight HRX work. HRX's device
+buffers on this APU are system memory registered with the GPU as pageable: the transient
+arena is one reused `hrx_allocator_allocate_buffer(hrx_device_allocator(device),
+{HRX_MEMORY_TYPE_DEVICE_LOCAL, …})` (`runtime/transient-arena.cpp`), and the runtime's
+`hrx_buffer_params_t` is `{type, access, usage, queue_affinity}` — **no pin/lock knob**.
+The allocation itself lives in `ROCm/hrx-system` `libhrx`. So the root fix belongs there
+(pin the allocation, or use non-migratable VMM — `[HIP] Implement virtual memory
+management` #568 is already in our pinned runtime and is the mechanism such a fix would
+use) or in KFD's userptr eviction/restore. Measured refinement: the corruption tracks
+**process memory pressure**, not the two named knobs — with 6 concurrent 30B instances it
+persists with KSM and proactive compaction off, because direct compaction under that
+pressure still migrates pages; under no induced pressure it does not appear at all.
+
+## Known residual (out of scope, recorded honestly)
+
+1 of the 6 movers-off samples was silently divergent **without** NaN logits (a truncated
+wrong stream), so page migration can also corrupt a finite value. The loud guard covers
+the NaN class only; a finite-value corruption stays silent and would need a
+checksum/parity mechanism, not a NaN check.

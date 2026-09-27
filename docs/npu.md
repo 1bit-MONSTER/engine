@@ -141,14 +141,21 @@ a good one.  Override the checker with `ONEBIT_Q4NX_CHECK`.
   published.**  A future foreign dir that drops a declared scale would be served
   silently, which is why the sentence is here.
 
-**Still owed: a provenance stamp.**  The scan checks *declared vs carried*; it cannot
-check *which converter path and commit produced the directory*, and the model-dir
+**Provenance stamp (`repack-stamp.txt`).**  The scan checks *declared vs carried*; it
+cannot check *which converter path and commit produced the directory*, and the model-dir
 cache reuses a directory on `model.q4nx` existence alone, so neither half can be
-reconstructed after the fact.  The intended payload is the converter path + git
-commit, the arch/`model_type`, and whether a q/k rotary reorder was applied (the
-eventual `rope_interleaved` flag), which would make a directory self-describing
-instead of depending on which converter generation produced it.  Tracked in
-`~/evidence/npu-four-models/STATUS.md` §6.
+reconstructed after the fact.  The repack now writes `repack-stamp.txt` (converter path +
+git commit, arch/`model_type`, the repack script) and the cache-hit gate requires both
+halves before reuse: a directory whose stamp is missing, or names a different converter
+than the one this build would use now, is discarded and repacked.  `repack_gguf.py
+--check-stamp <dir>` exposes the comparison -- exit 0 current, 1 stale, 2 cannot tell -- and
+"cannot tell" (e.g. an unresolvable converter) fails **open** with a once-per-process
+warning, so a missing converter cannot brick serving.  Verified end to end: a pre-stamp
+cache dir is discarded and rebuilt, and the next serve reuses it without repacking.
+Still converter-side and therefore not yet in the stamp: *whether a q/k rotary reorder was
+applied* for this directory (that rule lives in the converter's `llama.py`/`minicpm.py`),
+the field that would make a directory self-describing rather than dependent on its
+converter commit alone.  Tracked in `~/evidence/npu-four-models/STATUS.md` §6.
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
 OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its

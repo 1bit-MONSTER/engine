@@ -1073,7 +1073,34 @@ std::string repack_gguf(const std::string& gguf) {
     // is discarded and rebuilt rather than served.  The provenance-stamp
     // comparison (converter path + commit, q/k-reorder flag) folds into this same
     // gate; until it lands this catches the declared-vs-carried half.
-    if (fs::exists(out + "/model.q4nx")) {
+    bool cache_present = fs::exists(out + "/model.q4nx");
+    if (cache_present) {
+        // Provenance half (docs/npu.md).  Reuse only a dir the converter this build
+        // would use now produced: the cache cannot tell, and neither can the
+        // declared-vs-carried scan.  The comparison lives in the repack script because
+        // that is where the converter resolution lives.  Exit 0 current, 2 cannot tell
+        // (fail open, so a missing converter cannot brick serving), else stale.
+        const int stamp_rc = script.empty()
+                                 ? 2
+                                 : std::system(("\"" + python + "\" \"" + script +
+                                                "\" --check-stamp \"" + out + "\" >/dev/null 2>&1").c_str());
+        if (stamp_rc == 2) {
+            static bool stamp_warned = false;
+            if (!stamp_warned) {
+                stamp_warned = true;
+                std::fprintf(stderr, "\n1bit serve: ============================================================\n"
+                                     "1bit serve: WARNING: the Q4NX provenance stamp could not be checked\n"
+                                     "1bit serve:   for this process, so cached dirs are reused UNVERIFIED.\n"
+                                     "1bit serve: ============================================================\n\n");
+            }
+        } else if (stamp_rc != 0) {
+            std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the provenance check; "
+                                 "discarding and re-repacking\n", out.c_str());
+            fs::remove_all(out);
+            cache_present = false;
+        }
+    }
+    if (cache_present) {
         const char* ck = std::getenv("ONEBIT_Q4NX_CHECK");
         std::string checker = ck ? ck : "";
         if (checker.empty() && !script.empty())

@@ -186,6 +186,36 @@ def main():
         (os.path.abspath(p) for p in candidates if os.path.exists(os.path.join(p, "convert.py"))), "")
     converter_dir = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else default_converter)
 
+    # Provenance stamp.  The dir cache cannot tell which converter produced a dir
+    # (`model.q4nx` existence is all it checks), and the ¬declared-vs-carried scan
+    # cannot either, so the pair is: the scan (what was carried) plus this stamp
+    # (which converter did the carrying).  `--check-stamp <dir>` re-resolves the
+    # converter and compares -- exit 0 current, 2 cannot tell (caller fails open),
+    # 1 stale (caller discards and rebuilds).
+    def converter_commit():
+        try:
+            r = subprocess.run(["git", "-C", converter_dir, "rev-parse", "--short", "HEAD"],
+                               capture_output=True, text=True, timeout=10)
+            return r.stdout.strip() if r.returncode == 0 else "(unknown)"
+        except Exception:
+            return "(unknown)"
+
+    if sys.argv[1] == "--check-stamp":
+        stamp_path = os.path.join(sys.argv[2], "repack-stamp.txt")
+        if not os.path.exists(stamp_path):
+            print(f"stamp: none at {stamp_path} (dir predates the stamp)")
+            return 1
+        got = dict(l.rstrip("\n").split("=", 1) for l in open(stamp_path) if "=" in l)
+        if not os.path.exists(os.path.join(converter_dir, "convert.py")):
+            print(f"stamp: cannot tell, converter unresolved ('{converter_dir}')")
+            return 2
+        for key, want in (("converter_path", converter_dir), ("converter_commit", converter_commit())):
+            if got.get(key) != want:
+                print(f"stamp: stale, {key}='{got.get(key)}' != '{want}'")
+                return 1
+        print("stamp: current")
+        return 0
+
     os.makedirs(out_dir, exist_ok=True)
     convert_py = os.path.join(converter_dir, "convert.py")
     if not os.path.exists(convert_py):
@@ -224,6 +254,14 @@ def main():
     arch = str(arch)
 
     cfg = write_config(gguf, out_dir, arch, vocab_size)
+
+    # Record the provenance the cache-hit gate needs (see --check-stamp above).
+    with open(os.path.join(out_dir, "repack-stamp.txt"), "w") as f:
+        f.write(f"converter_path={converter_dir}\n")
+        f.write(f"converter_commit={converter_commit()}\n")
+        f.write(f"arch={arch}\n")
+        f.write(f"model_type={cfg.get('model_type', '')}\n")
+        f.write(f"repack_script={os.path.abspath(__file__)}\n")
 
     # Enforce the scale-key guard before the dir is cached (and before anyone
     # trusts it).  MiniCPM4-8B decoded garbage because embedding_scale /

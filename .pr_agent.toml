@@ -17,7 +17,7 @@
 # own OpenAI-compatible server, no cloud API.
 
 [config]
-model = "openai/qwen3-coder"
+model = "openai/zaya1-8b"
 fallback_models = []
 custom_model_max_tokens = 65536
 temperature = 0.2

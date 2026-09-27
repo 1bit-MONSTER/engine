@@ -122,22 +122,22 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
   unsupported 3-D MUL_MAT; use `-b 512`.
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
-- **Decode-split flash attention is off by default ([#140](https://github.com/1bit-MONSTER/engine/issues/140)).**
-  `flash_attention_decode_split_next_q8` gives nondeterministic attention on HRX0, up to 3.66 nats
-  apart between identical requests on Qwen3-0.6B. On Qwen3-Coder-30B-A3B it faulted the GPU in 2 of
-  3 decode runs. So `1bit serve --device hrx` starts llama-server with
-  `GGML_HRX_DISABLE_DISPATCH=decode_split`, and decode uses the flash-attention fallback.
+- **Decode-split flash attention is on.** `flash_attention_decode_split_next_q8` used to give
+  nondeterministic attention on HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140)) and
+  to fault Qwen3-Coder-30B-A3B, so `1bit serve --device hrx` turned it off (#148). Since llama.cpp
+  `00adc2b` (see the #123 section below) it is correct, and it is as fast or faster:
 
-  | model (Q4_K_M, tg) | with decode-split | without (the default) |
-  |---|---|---|
-  | Qwen3-0.6B | 169 ± 34 tok/s, output varies | 322 tok/s, deterministic |
-  | Qwen3-Coder-30B-A3B | faults 2 of 3 runs (80–88 tok/s when it survives) | 66–71 tok/s, 5 of 5 |
-  | ZAYA1-8B | 23.5 tok/s | 25.5 tok/s |
+  | model (Q4_K_M), tg tok/s | ctx 0 | ctx 512 | ctx 2100 |
+  |---|---|---|---|
+  | Qwen3-0.6B, decode-split on | 286 | 254 | 140–158 |
+  | Qwen3-0.6B, off | 296–306 | 220–223 | 118–122 |
+  | Qwen3-Coder-30B-A3B, on | 78–85 | 81 | 42–62 |
+  | Qwen3-Coder-30B-A3B, off | 78–81 | 65–69 | 47–49 |
+  | ZAYA1-8B, on | 39–41 | 40–43 | 38–42 |
+  | ZAYA1-8B, off | 39–42 | 39–40 | 34–36 |
 
-  (ZAYA1-8B decodes at 47.9 tok/s since the HRX kernels below.)
-
-  A `GGML_HRX_DISABLE_DISPATCH` you set yourself wins, and `ONEBIT_HRX_DECODE_SPLIT=1` turns the
-  kernel back on, for testing a fix.
+  (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
+  `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
 
 The prefill split below is not affected by either: HRX0 only prefills whole ubatches
 there, and decoding is Vulkan's.
@@ -292,6 +292,54 @@ llama.cpp with ggml-hrx2 on `HRX20`):
 | HRX, BF16 | n/a / 40 | 7646 / 101 |
 
 HRX prefill is now faster than Vulkan's.
+
+## MoE router expert-id fault fix ([engine#123](https://github.com/1bit-MONSTER/engine/issues/123))
+
+`llama_decode` could die with `HSA_STATUS_ERROR_MEMORY_FAULT` (`ret = -3`) on MoE
+models (`Qwen3-Coder-30B-A3B`). It was reported against the decode-split
+multipass path, but it is not in flash attention: the fault is a wild weight
+read in `qwen3_moe_routed_gate_up_swiglu_q4k_q8`.
+
+`router_top8_f32.loom` seeded each lane's argmax with `best_id = 0x7FFFFFFF` and
+only replaced it on an ordered `ogt` or the equal-value tie-break. A lane whose
+candidate logits are unordered (NaN) or below `-FLT_MAX` therefore published the
+sentinel verbatim into `route_ids`; consumers treat the id as bounded via
+`index.assume` (a hint, not a check) and compute `expert * expert_stride` in 32
+bits, so `0x7FFFFFFF * 884736 mod 2^32 = 0xFFF28000` (~4.29 GB) walked off the
+end of the weights buffer. The fix seeds the argmax with the lane's own first
+expert id. Upstream PR: [1bit-MONSTER/llama.cpp#25](https://github.com/1bit-MONSTER/llama.cpp/pull/25),
+merged as `895d63f`, which the engine pins.
+
+Measured on `HRX0` (`Qwen3-Coder-30B-A3B-Instruct-Q4_K_M`, `llama-bench -p 0 -n 8`,
+quiet box) with the fault made observable by aligning the three decode-split
+*partial* transients to 256 B instead of 4096 B: pre-fix `-d 2100` 5/5 faults,
+post-fix `-d 2100` 0/5, `-d 3000`/`-d 4800` 0/3, `<=2048` path 0/3, and greedy
+output identical to the CPU backend. The alignment change is a repro stress knob
+and is **not** part of the fix.
+
+What the fix does not cover: the fault needs router logits that are NaN, and
+the fix routes such a lane to a valid expert instead of faulting. Since
+[llama.cpp #26](https://github.com/1bit-MONSTER/llama.cpp/pull/26) that case is loud: a router row
+with no ordered logit publishes NaN, and llama-server refuses to sample NaN logits (it logs
+"HRX returned NaN logits" and aborts) instead of decoding a wrong but plausible token. On the
+author's repro 6 of 13 samples used to decode `' Paris???…'` silently; they now abort. Healthy
+runs are unchanged (Qwen3-Coder-30B and ZAYA1-8B perplexity on HRX0 identical to before).
+`GGML_HRX_FA_PARTIAL_ALIGN` (default 4096) sets the decode-split partials' alignment, a test knob
+that reproduces the fault's layout; the investigation's artifacts are archived privately.
+**Root cause of the NaNs ([engine#123](https://github.com/1bit-MONSTER/engine/issues/123),
+[#140](https://github.com/1bit-MONSTER/engine/issues/140)), fixed in llama.cpp `00adc2b`**
+([#28](https://github.com/1bit-MONSTER/llama.cpp/pull/28),
+[#29](https://github.com/1bit-MONSTER/llama.cpp/pull/29)). In every decode-split `reduce_fused`
+variant the last workgroup writes the attention output to global memory, and `pack_completed_q8`
+then reads it back with other waves to build `next_q8`. The barrier between the two was
+`kernel.barrier<workgroup>`, which fences LDS only (no store wait, no `buffer_gl0_inv`), so a pack
+wave could quantize the output slot's previous contents. The f32 output was right and `next_q8`
+was wrong, and NaN when the stale bytes decoded as NaN. The window opens when a dispatch is
+preempted, and any process's KFD queue eviction (page compaction, KSM, memory pressure) does that,
+which is why the rate followed those settings. It was never the cause. The fix fences both memory
+spaces (`barrier<global>` then `barrier<workgroup>`). With a separate process forcing queue
+evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 1 of 8 correct to
+8 of 8 with no NaN, and greedy Qwen3-0.6B from 13-34 divergent per ~177 requests to none.
 
 ## Not yet
 

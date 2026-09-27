@@ -155,6 +155,14 @@ build/hrx/llama/bin/llama-quantize zaya1-8b-f16.gguf zaya1-8b-Q4_K_M.gguf Q4_K_M
 1bit serve -m zaya1-8b-Q4_K_M.gguf --device vulkan --ctx-size 8192
 ```
 
+**ZAYA GGUFs converted before 2026-09-27 tokenize chat turns wrongly.** Their `<|im_start|>` (id 105)
+and `<eos>` were stored as ordinary tokens, so llama.cpp spelled each turn marker out as seven text
+tokens and chat answers went off-template ("12 + 30" gave "22"). The converter marks them as
+control tokens since [llama.cpp #27](https://github.com/1bit-MONSTER/llama.cpp/pull/27), and every
+ZAYA GGUF on the 1bit-MONSTER Hugging Face org was fixed in place the same day (the tensors are
+unchanged). Re-download, or reconvert. The teacher-forced checks above never saw it, because they
+feed token IDs directly.
+
 Convert with this converter: it writes the grouped convolution's weights tap-major, which the
 graph expects, so GGUFs made by other converters do not load.
 

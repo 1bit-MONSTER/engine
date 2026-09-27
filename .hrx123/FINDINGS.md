@@ -412,7 +412,7 @@ completion_counter[head]             = 48-bit descriptor(s22:s23&0xffff) + head*
 - Completion counter descriptor is a correct 48-bit V# (`s9 = s23 & 0xffff`), offset `head<<2` ✓.
 
 Bounds check: max partial_max offset = 3×2304 + 35×64 + 15×4 = 9212 < 9216 (buffer size). ✓
-Max partial_output offset = 3×147456 + 35×4096 + 15×256 + 127×2 = 589566 < 589824. ✓
+Max partial_output offset = 3×147456 + 35×4096 + 15×256 + 127×2 = 589822 < 589824. ✓
 
 ## Verdict
 

@@ -90,20 +90,20 @@ counts and the coverage read against the registry and the checked results. The
 `census.yml` workflow runs daily at 05:17 UTC. It rebuilds the registry from the pins,
 sweeps HF, and opens a PR when anything changed.
 
-The first full sweep, 2026-09-25:
+The census of 2026-09-27 (the first full sweep ran 2026-09-25), with `registry/census.json` holding the latest:
 
 | | models | share of those with an architecture |
 |---|---|---|
-| Text-generation models on HF | 415,414 | |
-| With an architecture in their config | 332,565 (2,610 architectures) | |
-| Mapped | 310,221 | 93.28% |
-| Checked | 213,456 | 64.18% |
+| Text-generation models on HF | 415,695 | |
+| With an architecture in their config | 332,726 (2,616 architectures) | |
+| Mapped | 315,701 | 94.88% |
+| Checked | 214,033 | 64.33% |
 
 | Backend | Mapped | Checked |
 |---|---|---|
-| vulkan | 93.28% | 64.18% |
-| hrx | 93.19% | 64.18% |
-| zinc | 69.69% | 10.28% |
+| vulkan | 94.88% | 64.33% |
+| hrx | 94.78% | 64.32% |
+| zinc | 69.83% | 10.28% |
 | npu | 9.29% | 9.29% |
 
 "Checked" counts every model whose architecture has a passing model. It does not mean each

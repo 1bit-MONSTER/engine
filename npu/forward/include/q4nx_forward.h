@@ -130,6 +130,11 @@ private:
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
+    // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 elsewhere.
+    // MiniCPM4 scales the embedding by 12.0 and every residual branch by
+    // scale_depth/sqrt(NL) (0.2475 for 32 layers).
+    float embed_scale_ = 1.0f;
+    float residual_scale_ = 1.0f;
     std::vector<float> final_norm_;                         // [H]
 
     // Per-layer dequantized projections (reused each layer, chunked by design)

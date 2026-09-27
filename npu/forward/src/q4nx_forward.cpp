@@ -87,6 +87,18 @@ static std::vector<float> read_rope_short_factor(const std::string& cfg_path) {
     return out;
 }
 
+// A scalar from config.json (MiniCPM4's embedding_scale / residual_scale).
+static float read_config_float(const std::string& cfg_path, const char* key, float dflt) {
+    std::ifstream f(cfg_path);
+    if (!f) return dflt;
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const char* p = strstr(s.c_str(), key);
+    if (!p) return dflt;
+    const char* c = strchr(p, ':');
+    if (!c) return dflt;
+    return (float)strtod(c + 1, nullptr);
+}
+
 Q4nxNpuForward::Q4nxNpuForward() {}
 Q4nxNpuForward::~Q4nxNpuForward() = default;
 
@@ -178,6 +190,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (hd > 0) cfg.head_dim = hd;
     }
     rope_scale_ = read_rope_short_factor(cfg_path);  // LongRoPE (MiniCPM4)
+    embed_scale_ = read_config_float(cfg_path, "\"embedding_scale\"", 1.0f);
+    residual_scale_ = read_config_float(cfg_path, "\"residual_scale\"", 1.0f);
     mw_ = model_load(model_path, cfg);
     if (!mw_) { err_ = "model_load failed"; return false; }
 
@@ -1110,7 +1124,16 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                 if (i >= rot / 2) inv = 0.0;
             } else {
                 inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
-                if (i < (int)rope_scale_.size()) inv *= (double)rope_scale_[i];  // LongRoPE
+                // LongRoPE (MiniCPM4): ggml applies the factor as
+                // rope_yarn(theta / ff, ...) (ggml-cpu/ops.cpp
+                // ggml_rope_cache_init) -- the angle is DIVIDED by freq_factors.
+                // Multiplying inflates the high dims by up to 31x and yields
+                // garbage.  NPU_INFER_ROPE_FACTOR_MUL=1 keeps the old multiply.
+                if (i < (int)rope_scale_.size()) {
+                    const char* mul = getenv("NPU_INFER_ROPE_FACTOR_MUL");
+                    if (mul && mul[0] == '1') inv *= (double)rope_scale_[i];
+                    else                       inv /= (double)rope_scale_[i];
+                }
             }
             const double ang = (double)pos * inv;
             cos_[i] = (float)std::cos(ang);
@@ -1215,7 +1238,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     // (Gemma4 bakes sqrt(hidden_size) into the tensor), so no scale is applied
     // here; the LM head divides it back out (see run_lm_head).
     for (int k = 0; k < H; k++)
-        x[k] = embed_at(token, k);
+        x[k] = embed_at(token, k) * embed_scale_;
     if (pos == 0 && getenv("NPU_INFER_DUMP_LAYERS")) {
         double s = 0;
         float mx = 0;
@@ -1329,7 +1352,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             rmsnorm(o.data(), post_norm_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];
         } else {
-            for (int k = 0; k < H; k++) x[k] += o[k];
+            for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_;
         }
         if (!nancheck("attention")) return false;
 
@@ -1380,7 +1403,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d);
         }
         if (!gemma4_layer_) {
-            for (int k = 0; k < H; k++) x[k] += d[k];
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
             if (!nancheck("mlp")) return false;
             if (pos == 0 && getenv("NPU_INFER_DUMP_LAYERS")) {
                 double s = 0;

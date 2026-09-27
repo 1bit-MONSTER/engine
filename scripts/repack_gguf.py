@@ -93,6 +93,41 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
         "tie_word_embeddings": not has_output,
         "hidden_act": str(_num(reader, f"{p}.activation_function", "")).strip() or "silu",
     }
+
+    # MLA (deepseek2, e.g. GLM-4.7-Flash).  A deepseek2 config's head_dim /
+    # key_length describe the KV LATENT, not a per-head width, so the generic
+    # values above are wrong for the forward: it needs
+    #   head_dim         = value_length_mla  (per-head VALUE width)
+    #                      so the O design derives K = NH*head_dim = NH*v_head,
+    #   intermediate_size = expert_feed_forward_length (per-EXPERT width) so the
+    #                      G/U/D designs ARE the expert MLP,
+    # plus the latent geometry itself.  Set mla=1 and let the forward branch.
+    if p == "deepseek2":
+        q_lora = int(_num(reader, f"{p}.attention.q_lora_rank", 0))
+        kv_lora = int(_num(reader, f"{p}.attention.kv_lora_rank", 0))
+        rope_dim = int(_num(reader, f"{p}.rope.dimension_count", 0))
+        k_mla = int(_num(reader, f"{p}.attention.key_length_mla", 0))
+        v_mla = int(_num(reader, f"{p}.attention.value_length_mla", head_dim))
+        cfg.update({
+            "mla": 1,
+            "head_dim": v_mla,
+            "intermediate_size": int(_num(reader, f"{p}.expert_feed_forward_length", 0)),
+            "q_lora_rank": q_lora,
+            "kv_lora_rank": kv_lora,
+            "rope_dim": rope_dim,
+            "qk_nope_head_dim": max(k_mla - rope_dim, 0),
+            "v_head_dim": v_mla,
+            "dense_intermediate_size": int(_num(reader, f"{p}.feed_forward_length", 0)),
+            "n_expert": int(_num(reader, f"{p}.expert_count", 0)),
+            "top_k": int(_num(reader, f"{p}.expert_used_count", 0)),
+            "expert_shared": int(_num(reader, f"{p}.expert_shared_count", 0)),
+            "leading_dense_block_count": int(_num(reader, f"{p}.leading_dense_block_count", 0)),
+            "expert_weights_scale": float(_num(reader, f"{p}.expert_weights_scale", 1.0)),
+            "expert_weights_norm": int(_num(reader, f"{p}.expert_weights_norm", 0)),
+            # llama.cpp's deepseek2: 1 = softmax, 2 = SIGMOID.  Getting this
+            # wrong still produces plausible output with a wrong argmax.
+            "expert_gating_func": int(_num(reader, f"{p}.expert_gating_func", 1)),
+        })
     # MiniCPM4 architecture scales.  The forward must apply them: the embedding
     # is scaled by 12.0 and every residual branch by scale_depth/sqrt(NL)
     # (0.2475 for 32 layers); without them the hidden state runs at the wrong

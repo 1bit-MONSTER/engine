@@ -189,6 +189,25 @@ def main():
     arch = str(arch)
 
     cfg = write_config(gguf, out_dir, arch, vocab_size)
+
+    # Enforce the scale-key guard before the dir is cached (and before anyone
+    # trusts it).  MiniCPM4-8B decoded garbage because embedding_scale /
+    # residual_scale / logit_scale were declared by the GGUF and dropped here,
+    # and no argmax-level check could see it.  Same list as
+    # scripts/check_repack_config.py; this inline form makes it un-skippable.
+    _missing = []
+    for _k in ("embedding_scale", "residual_scale", "logit_scale", "scale_emb",
+               "scale_depth", "dim_model_base", "final_logit_softcapping",
+               "attn_logit_softcapping"):
+        _v = _num(reader, f"{arch}.{_k}", None)
+        if _v is not None and cfg.get(_k) is None:
+            _missing.append((_k, _v))
+    if _missing:
+        for _k, _v in _missing:
+            print(f"[FAIL] the GGUF declares {arch}.{_k} = {_v} but config.json drops it; "
+                  f"the forward would not apply it")
+        return 1
+    print("[OK] every scale-like key the GGUF declares is carried in config.json")
     print(f"config.json: {cfg}")
     print("repack complete")
     return 0

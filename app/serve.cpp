@@ -1052,7 +1052,6 @@ std::string repack_gguf(const std::string& gguf) {
         cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
     }
     const std::string out = cache + "/" + stem;
-    if (fs::exists(out + "/model.q4nx")) return out;
 
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
     const std::string python = py ? py : "python3";
@@ -1063,6 +1062,34 @@ std::string repack_gguf(const std::string& gguf) {
     const std::string script = rp ? rp : "";
 #endif
     const char* cv = std::getenv("ONEBIT_Q4NX_CONVERTER");
+
+    // A cache HIT used to return whatever is on disk, which bypasses the repack
+    // and therefore the repack's declared-scale guard -- so a dir produced by an
+    // older converter (e.g. before the MiniCPM4 embedding_scale / residual_scale
+    // / logit_scale fix) would be served silently forever, and the guard would
+    // only ever protect freshly built artifacts.  Validate the hit with the same
+    // metadata-only scan instead: it reads the GGUF header and config.json, no
+    // reconversion and no NPU, so a hit costs milliseconds.  On failure the dir
+    // is discarded and rebuilt rather than served.  The provenance-stamp
+    // comparison (converter path + commit, q/k-reorder flag) folds into this same
+    // gate; until it lands this catches the declared-vs-carried half.
+    if (fs::exists(out + "/model.q4nx")) {
+        const char* ck = std::getenv("ONEBIT_Q4NX_CHECK");
+        std::string checker = ck ? ck : "";
+        if (checker.empty() && !script.empty())
+            checker = (fs::path(script).parent_path() / "check_repack_config.py").string();
+        if (checker.empty() || !fs::exists(checker)) {
+            std::fprintf(stderr, "1bit serve: WARNING cannot validate cached Q4NX dir %s "
+                                 "(no check_repack_config.py; set ONEBIT_Q4NX_CHECK)\n", out.c_str());
+            return out;
+        }
+        const std::string vcmd = "\"" + python + "\" \"" + checker + "\" \"" + gguf + "\" \"" + out + "\" >/dev/null 2>&1";
+        if (std::system(vcmd.c_str()) == 0) return out;
+        std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the declared-scale scan; "
+                             "discarding and re-repacking\n", out.c_str());
+        fs::remove_all(out);
+    }
+
     if (python.find('/') != std::string::npos && !fs::exists(python))
         throw std::runtime_error("Q4NX repack python not found: " + python + " (set ONEBIT_Q4NX_PYTHON)");
     if (!fs::exists(script)) throw std::runtime_error("Q4NX repack script not found: " + script + " (set ONEBIT_Q4NX_REPACK)");

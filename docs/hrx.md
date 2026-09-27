@@ -122,23 +122,22 @@ Measured on Strix Halo (llama-bench, fa on, `-r 3`; KLD against Vulkan):
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
   unsupported 3-D MUL_MAT; use `-b 512`.
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
-- **Decode-split flash attention is off by default.** It used to give nondeterministic attention on
-  HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140), up to 3.66 nats apart between
-  identical requests on Qwen3-0.6B) and to fault Qwen3-Coder-30B-A3B. That is fixed since llama.cpp
-  `00adc2b` (see the #123 section below), but the kernel is only faster on some models, so
-  `1bit serve --device hrx` still starts llama-server with `GGML_HRX_DISABLE_DISPATCH=decode_split`.
-  The table was measured before the fix:
+- **Decode-split flash attention is on.** `flash_attention_decode_split_next_q8` used to give
+  nondeterministic attention on HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140)) and
+  to fault Qwen3-Coder-30B-A3B, so `1bit serve --device hrx` turned it off (#148). Since llama.cpp
+  `00adc2b` (see the #123 section below) it is correct, and it is as fast or faster:
 
-  | model (Q4_K_M, tg) | with decode-split | without (the default) |
-  |---|---|---|
-  | Qwen3-0.6B | 169 ± 34 tok/s, output varies | 322 tok/s, deterministic |
-  | Qwen3-Coder-30B-A3B | faults 2 of 3 runs (80–88 tok/s when it survives) | 66–71 tok/s, 5 of 5 |
-  | ZAYA1-8B | 23.5 tok/s | 25.5 tok/s |
+  | model (Q4_K_M), tg tok/s | ctx 0 | ctx 512 | ctx 2100 |
+  |---|---|---|---|
+  | Qwen3-0.6B, decode-split on | 286 | 254 | 140–158 |
+  | Qwen3-0.6B, off | 296–306 | 220–223 | 118–122 |
+  | Qwen3-Coder-30B-A3B, on | 78–85 | 81 | 42–62 |
+  | Qwen3-Coder-30B-A3B, off | 78–81 | 65–69 | 47–49 |
+  | ZAYA1-8B, on | 39–41 | 40–43 | 38–42 |
+  | ZAYA1-8B, off | 39–42 | 39–40 | 34–36 |
 
-  (ZAYA1-8B decodes at 47.9 tok/s since the HRX kernels below.)
-
-  A `GGML_HRX_DISABLE_DISPATCH` you set yourself wins, and `ONEBIT_HRX_DECODE_SPLIT=1` turns the
-  kernel back on, for testing a fix.
+  (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
+  `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
 
 The prefill split below is not affected by either: HRX0 only prefills whole ubatches
 there, and decoding is Vulkan's.

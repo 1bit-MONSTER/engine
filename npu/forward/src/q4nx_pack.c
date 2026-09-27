@@ -31,9 +31,70 @@ static int has_second_attn(const Q4nxModelDims* d) {
 int q4nx_num_designs(const Q4nxModelDims* d) {
     if (!d || d->H <= 0 || d->NH <= 0 || d->NKV <= 0 || d->HD <= 0 || d->IM <= 0)
         return -1;
+    /* MLA + MoE: QA, QB, KVA, O, G, U, D, DG, DU, DD.  The standard QKV is not
+     * used (MLA has no plain q/k/v projection), the expert MLP reuses G/U/D with
+     * IM = the per-expert intermediate, and the leading dense layer gets DG/DU/DD. */
+    if (d->mla)
+        return 10;
     return (d->fused_gu ? 4 : 5) + (d->ple_dim > 0 ? 2 : 0) +
            (d->double_wide_mlp ? 2 : 0) + (has_second_attn(d) ? 2 : 0) +
            (d->lin_kd > 0 ? 2 : 0);
+}
+
+/* MLA + MoE design set (see q4nx_num_designs).  dims->HD must be the per-head
+ * VALUE width so O comes out K=NH*HD=NH*v_head, and dims->IM the per-expert
+ * intermediate so G/U/D are the expert MLP. */
+static void set_elf_name(Q4nxDesignGeom* g, const char* role);
+
+static int derive_mla(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
+    int i = 0;
+    const int q_head = d->qk_nope + d->rope_dim;      /* q's per-head width */
+    const int kv_real = d->kv_lora + d->rope_dim;
+    const int kv_pad = d->mla_kva_pad > 0
+                           ? d->mla_kva_pad
+                           : ((kv_real + 127) / 128) * 128;
+
+    memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->H; out[i].N = d->q_lora;
+    out[i].role = Q4NX_DESIGN_QA; set_elf_name(&out[i], "QA");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->q_lora; out[i].N = d->NH * q_head;
+    out[i].role = Q4NX_DESIGN_QB; set_elf_name(&out[i], "QB");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->H; out[i].N = kv_pad; out[i].real_n = kv_real;
+    out[i].role = Q4NX_DESIGN_KVA; set_elf_name(&out[i], "KVA");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->NH * d->HD; out[i].N = d->H;
+    out[i].role = Q4NX_DESIGN_O; set_elf_name(&out[i], "O");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->H; out[i].N = d->IM;
+    out[i].role = Q4NX_DESIGN_G; set_elf_name(&out[i], "G");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->H; out[i].N = d->IM;
+    out[i].role = Q4NX_DESIGN_U; set_elf_name(&out[i], "U");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->IM; out[i].N = d->H;
+    out[i].role = Q4NX_DESIGN_D; set_elf_name(&out[i], "D");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->H; out[i].N = d->dense_im;
+    out[i].role = Q4NX_DESIGN_DG; set_elf_name(&out[i], "DG");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->H; out[i].N = d->dense_im;
+    out[i].role = Q4NX_DESIGN_DU; set_elf_name(&out[i], "DU");
+
+    i++; memset(&out[i], 0, sizeof(out[i]));
+    out[i].M = d->M; out[i].K = d->dense_im; out[i].N = d->H;
+    out[i].role = Q4NX_DESIGN_DD; set_elf_name(&out[i], "DD");
+
+    return i + 1;
 }
 
 static void set_elf_name(Q4nxDesignGeom* g, const char* role) {
@@ -44,6 +105,8 @@ static void set_elf_name(Q4nxDesignGeom* g, const char* role) {
 int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
     int n = q4nx_num_designs(d);
     if (n < 0 || !out) return -1;
+
+    if (d->mla) return derive_mla(d, out);
 
     const int q_rows = d->NH * d->HD;
     const int kv_rows = d->NKV * d->HD;
@@ -253,17 +316,44 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
             scatter_transposed(p->up, K, g->up_rows, n0, N, B); n0 += g->up_rows;
             return n0 == N ? 0 : -1;
         }
-        case Q4NX_DESIGN_G: {
+        /* MLA projections.  QA/QB are plain single-matrix scatters; KVA is
+         * stored at kv_lora+rope_dim (576) but the kernel's n-tile forces N=640,
+         * so only real_n columns are scattered and the pad columns are zeroed
+         * (the weight is never read out of bounds).  O/G/U/D are reused for MLA's
+         * o_proj and the expert/dense MLPs, with DG/DU/DD aliased onto G/U/D for
+         * the leading dense layer. */
+        case Q4NX_DESIGN_QA: {
+            if (!p->q) return -1;
+            scatter_transposed(p->q, K, N, 0, N, B);
+            return 0;
+        }
+        case Q4NX_DESIGN_QB: {
+            if (!p->k) return -1;
+            scatter_transposed(p->k, K, N, 0, N, B);
+            return 0;
+        }
+        case Q4NX_DESIGN_KVA: {
+            if (!p->v) return -1;
+            const int rn = g->real_n > 0 ? g->real_n : N;
+            if (rn > N) return -1;
+            if (rn < N) memset(B, 0, (size_t)K * (size_t)N * sizeof(float));
+            scatter_transposed(p->v, K, rn, 0, N, B);
+            return 0;
+        }
+        case Q4NX_DESIGN_G:
+        case Q4NX_DESIGN_DG: {
             if (!p->gate) return -1;
             scatter_transposed(p->gate, K, N, 0, N, B);
             return 0;
         }
-        case Q4NX_DESIGN_U: {
+        case Q4NX_DESIGN_U:
+        case Q4NX_DESIGN_DU: {
             if (!p->up) return -1;
             scatter_transposed(p->up, K, N, 0, N, B);
             return 0;
         }
-        case Q4NX_DESIGN_D: {
+        case Q4NX_DESIGN_D:
+        case Q4NX_DESIGN_DD: {
             if (!p->down) return -1;
             scatter_transposed(p->down, K, N, 0, N, B);
             return 0;

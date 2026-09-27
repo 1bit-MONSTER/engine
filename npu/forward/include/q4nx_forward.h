@@ -144,16 +144,46 @@ private:
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
-    // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 elsewhere.
-    // MiniCPM4 scales the embedding by 12.0 and every residual branch by
-    // scale_depth/sqrt(NL) (0.2475 for 32 layers).
+    // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
+    // every other architecture.  MiniCPM4 scales the embedding by 12 and each
+    // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping
+    // them sends the hidden state to the wrong magnitude and the logits explode.
     float embed_scale_ = 1.0f;
     float residual_scale_ = 1.0f;
-    // MiniCPM4 logit_scale (config "logit_scale", 16.0).  The final logits are
-    // DIVIDED by it; 1.0 = no-op everywhere else.  A constant positive divisor
-    // cannot move an argmax, so this only matters for the probability
-    // distribution (sampling/temperature).
+    // MiniCPM4 logit_scale (config "logit_scale", 16.0 for GLM's sibling
+    // MiniCPM4).  The final logits are DIVIDED by it.  1.0 = no-op everywhere
+    // else.  A constant positive divisor cannot move an argmax, so this only
+    // matters for the probability distribution (sampling/temperature).
     float logit_scale_ = 1.0f;
+
+    // ---- MLA + MoE (deepseek2 / GLM-4.7-Flash) ----
+    // Set from config.json in init_impl; mla_ == 0 leaves every path below
+    // untouched.  Each layer's dequantized weights are held here and refilled by
+    // load_layer(), sized from the model's own dims.
+    int mla_ = 0;
+    int q_lora_ = 0, kv_lora_ = 0, rope_dim_ = 0, qk_nope_ = 0, v_head_ = 0;
+    int n_expert_ = 0, top_k_ = 0, expert_im_ = 0, dense_im_ = 0;
+    int leading_dense_ = 0;
+    int expert_gating_sigmoid_ = 1;   // llama.cpp deepseek2: 2 = sigmoid, 1 = softmax
+    float expert_w_scale_ = 1.0f;     // applied after the top-k weight normalisation
+    std::vector<float> w_qa_, w_qb_, w_kva_, w_o_;      // per layer, [out][in]
+    std::vector<float> mla_qan_, mla_kvan_;             // q_a / kv_a layernorms
+    std::vector<float> w_kb_, w_vb_;                    // [NH][N][K], N padded for k_b
+    int kb_rows_ = 0;                                   // k_b's padded row count (256)
+    std::vector<std::vector<float>> mla_kn_, mla_kr_, mla_v_;  // per-layer MLA caches
+    std::vector<float> moe_router_, moe_router_b_, share_g_, share_u_, share_d_;
+    std::vector<float> dense_g_, dense_u_, dense_d_;    // leading dense layer only
+    // Routed experts stay packed until selected: per layer the Q4NX pools them as
+    // [n_expert][tiles][5120].
+    const uint8_t* exp_g_ = nullptr; const uint8_t* exp_u_ = nullptr; const uint8_t* exp_d_ = nullptr;
+    size_t exp_g_bytes_ = 0, exp_u_bytes_ = 0, exp_d_bytes_ = 0;
+
+    bool mla_attn(int l, const std::vector<float>& x, std::vector<float>& o, int pos);
+    bool moe_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
+    bool dense_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
+    bool mla_rope(std::vector<float>& q, int NH, int qh, int nope, std::vector<float>& kr, int pos);
+    bool mla_expert(const uint8_t* pool, size_t per_expert, int e, int N, int K,
+                    std::vector<float>& out);
     std::vector<float> final_norm_;                         // [H]
 
     // Per-layer dequantized projections (reused each layer, chunked by design)

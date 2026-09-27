@@ -67,6 +67,7 @@
 #endif
 
 #ifdef ONEBIT_NPU
+#include "forward_serve.h"
 #include "unified.h"
 #endif
 #ifdef ONEBIT_LAYA
@@ -94,13 +95,16 @@
 #include <vector>
 #if defined(_WIN32)
 // httplib.h brought in winsock2.h and windows.h
+#include <process.h>
 #elif defined(__linux__)
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #else
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <spawn.h>
 #include <sys/socket.h>
@@ -1038,6 +1042,146 @@ int serve_child(const Options& o) {
     return 1;
 }
 
+// Runs argv[0] with argv and no shell, and returns its exit code (-1 if it could not run).
+// quiet sends the child's stdout and stderr to /dev/null.
+int run_program(const std::vector<std::string>& argv, bool quiet) {
+    std::vector<char*> args;
+    for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+    args.push_back(nullptr);
+#if defined(_WIN32)
+    (void) quiet;
+    return static_cast<int>(_spawnvp(_P_WAIT, args[0], args.data()));
+#else
+    const pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (quiet) {
+            const int null_fd = ::open("/dev/null", O_WRONLY);
+            if (null_fd >= 0) {
+                ::dup2(null_fd, 1);
+                ::dup2(null_fd, 2);
+                ::close(null_fd);
+            }
+        }
+        ::execvp(args[0], args.data());
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+std::string command_text(const std::vector<std::string>& argv) {
+    std::string text;
+    for (const auto& a : argv) text += (text.empty() ? "\"" : " \"") + a + "\"";
+    return text;
+}
+
+// Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
+// (Python), cached by GGUF stem so a repeated serve reuses the conversion.
+// Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
+// the cache root with ONEBIT_Q4NX_CACHE.
+std::string repack_gguf(const std::string& gguf) {
+    const std::string stem = fs::path(gguf).stem().string();
+    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
+    if (cache.empty()) {
+        const char* home = std::getenv("HOME");
+        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
+    }
+    const std::string out = cache + "/" + stem;
+
+    const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
+    const std::string python = py ? py : "python3";
+    const char* rp = std::getenv("ONEBIT_Q4NX_REPACK");
+#ifdef ONEBIT_NPU_REPACK_SCRIPT
+    const std::string script = rp ? rp : ONEBIT_NPU_REPACK_SCRIPT;
+#else
+    const std::string script = rp ? rp : "";
+#endif
+    const char* cv = std::getenv("ONEBIT_Q4NX_CONVERTER");
+
+    // A cache HIT used to return whatever is on disk, which bypasses the repack
+    // and therefore the repack's declared-scale guard -- so a dir produced by an
+    // older converter (e.g. before the MiniCPM4 embedding_scale / residual_scale
+    // / logit_scale fix) would be served silently forever, and the guard would
+    // only ever protect freshly built artifacts.  Validate the hit with the same
+    // metadata-only scan instead: it reads the GGUF header and config.json, no
+    // reconversion and no NPU, so a hit costs milliseconds.  On failure the dir
+    // is discarded and rebuilt rather than served.  The provenance-stamp
+    // comparison (converter path + commit, q/k-reorder flag) folds into this same
+    // gate; until it lands this catches the declared-vs-carried half.
+    bool cache_present = fs::exists(out + "/model.q4nx");
+    if (cache_present) {
+        // Provenance half (docs/npu.md).  Reuse only a dir the converter this build
+        // would use now produced: the cache cannot tell, and neither can the
+        // declared-vs-carried scan.  The comparison lives in the repack script because
+        // that is where the converter resolution lives.  Exit 0 current, 2 cannot tell
+        // (fail open, so a missing converter cannot brick serving), else stale.
+        const int stamp_rc = script.empty()
+                                 ? 2
+                                 : run_program({ python, script, "--check-stamp", out }, true);
+        if (stamp_rc == 2) {
+            static bool stamp_warned = false;
+            if (!stamp_warned) {
+                stamp_warned = true;
+                std::fprintf(stderr, "\n1bit serve: ============================================================\n"
+                                     "1bit serve: WARNING: the Q4NX provenance stamp could not be checked\n"
+                                     "1bit serve:   for this process, so cached dirs are reused UNVERIFIED.\n"
+                                     "1bit serve: ============================================================\n\n");
+            }
+        } else if (stamp_rc != 0) {
+            std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the provenance check; "
+                                 "discarding and re-repacking\n", out.c_str());
+            fs::remove_all(out);
+            cache_present = false;
+        }
+    }
+    if (cache_present) {
+        const char* ck = std::getenv("ONEBIT_Q4NX_CHECK");
+        std::string checker = ck ? ck : "";
+        if (checker.empty() && !script.empty())
+            checker = (fs::path(script).parent_path() / "check_repack_config.py").string();
+        if (checker.empty() || !fs::exists(checker)) {
+            // This is the ONE state where the guard does not apply, and it applies
+            // to every dir for the whole process -- so say it once, unmissably,
+            // rather than repeating a line that gets lost in serve output.  A baked
+            // path that resolves to a moved/removed checkout must be obvious.
+            static bool warned = false;
+            if (!warned) {
+                warned = true;
+                std::fprintf(stderr,
+                    "\n1bit serve: ============================================================\n"
+                    "1bit serve: WARNING: the Q4NX declared-scale guard is INACTIVE for\n"
+                    "1bit serve:   this process.  No check_repack_config.py was found at\n"
+                    "1bit serve:   '%s' and ONEBIT_Q4NX_CHECK is unset, so cached Q4NX\n"
+                    "1bit serve:   dirs are reused WITHOUT validation.\n"
+                    "1bit serve: ============================================================\n\n",
+                    checker.empty() ? "(unresolved)" : checker.c_str());
+            }
+            return out;
+        }
+        if (run_program({ python, checker, gguf, out }, true) == 0) return out;
+        std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the declared-scale scan; "
+                             "discarding and re-repacking\n", out.c_str());
+        fs::remove_all(out);
+    }
+
+    if (python.find('/') != std::string::npos && !fs::exists(python))
+        throw std::runtime_error("Q4NX repack python not found: " + python + " (set ONEBIT_Q4NX_PYTHON)");
+    if (!fs::exists(script)) throw std::runtime_error("Q4NX repack script not found: " + script + " (set ONEBIT_Q4NX_REPACK)");
+
+    std::fprintf(stderr, "1bit serve: repacking %s -> %s ...\n", gguf.c_str(), out.c_str());
+    fs::create_directories(out);
+    std::vector<std::string> repack = { python, script, gguf, out };
+    if (cv) repack.push_back(cv);
+    const int rc = run_program(repack, false);
+    if (rc != 0 || !fs::exists(out + "/model.q4nx"))
+        throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + command_text(repack));
+    return out;
+}
+
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
@@ -1150,6 +1294,33 @@ int run_serve(int argc, char** argv) {
 #endif
     }
     if (o.device == "mlx") return serve_child(o);
+#ifdef ONEBIT_NPU
+    if (fs::path(o.model).extension() == ".gguf" && o.device == "npu") {
+        // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
+        // directory, then serve it through the model-generic forward in process.
+        const std::string dir = repack_gguf(o.model);
+        // Resolve the full-ELF / xclbin directory the forward loads. An empty value
+        // makes it look for "/full_i8_*.elf", so it is an error, not a default.
+        std::string kernels;
+        if (const char* env = std::getenv("ONEBIT_NPU_KERNELS")) kernels = env;
+        if (kernels.empty() && fs::is_directory(fs::path(dir) / "npu")) kernels = (fs::path(dir) / "npu").string();
+#ifdef ONEBIT_NPU_KERNELS_DIR
+        if (kernels.empty()) kernels = ONEBIT_NPU_KERNELS_DIR;
+#endif
+        if (kernels.empty() || !fs::is_directory(kernels)) {
+            throw std::runtime_error(
+                "no NPU kernel (full ELF) directory for " + o.model +
+                ": set ONEBIT_NPU_KERNELS to a directory of full_i8_*.elf designs (docs/npu.md), or\n"
+                "    configure the build with -DONEBIT_NPU_KERNELS_DIR=<dir>");
+        }
+        std::vector<std::string> args = {"-m", dir + "/model.q4nx", "--kernels", kernels,
+                                         "-p", std::to_string(o.port), "--host", o.host};
+        if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+        std::vector<char*> av;
+        for (auto& s : args) av.push_back(s.data());
+        return run_forward_serve(int(av.size()), av.data());
+    }
+#endif
     if (fs::path(o.model).extension() == ".gguf") return serve_child(o);
     throw std::runtime_error(o.model + ": expected an NPU model directory or a .gguf file");
 }

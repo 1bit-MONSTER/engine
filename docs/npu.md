@@ -97,6 +97,66 @@ runs on the dx route. There it decoded 24/24 greedy tokens the same as a CPU ref
 the repacked weights, with every step's logits at cosine 0.99995 or better (21.0 ms per
 step). `1bit serve --device npu -m <dir>` loads it in 1.1 s and answers at 54-60 tok/s.
 
+**Declared-scale validation (required).** `scripts/repack_gguf.py`, the repack used
+for the model-generic (`full_i8_*.elf`) route, **fails with `rc=1`** if the GGUF
+declares a known-critical scale-like scalar that the repacked `config.json` drops:
+`embedding_scale`, `residual_scale`, `logit_scale`, `scale_emb`, `scale_depth`,
+`dim_model_base`, `final_logit_softcapping`, `attn_logit_softcapping`.  This is not
+optional bookkeeping: MiniCPM4-8B decoded punctuation soup because
+`minicpm.embedding_scale` (12.0), `minicpm.residual_scale` (0.2475 =
+`scale_depth/sqrt(n_layer)`) and `minicpm.logit_scale` (16.0) were declared by the
+GGUF, applied by llama.cpp, and dropped by the repack — and **no argmax-level check
+can see it**, since the first two move the answer and the third moves only the
+probabilities.  Any *other* scale-ish key (`*scale*`, `*softcap*`, `*mup*`) is
+**warned** about, never fatal, because the next architecture's factor will have a
+name not on the list while some scale-ish keys are legitimately not carried
+(`deepseek2.expert_weights_scale` is a routing scale, not a logit scale).
+`scripts/check_repack_config.py` runs the same scan standalone against a GGUF and a
+produced directory, and has a negative control (strip the keys from a copy of a good
+`config.json` and it must exit 1).
+
+**Validated on cache HIT, not only on repack.**  The serve route's repack resolver
+(`app/serve.cpp`) used to return a cached directory on `model.q4nx` existence alone,
+which bypassed the repack and therefore the guard above — so a directory produced by
+an older converter kept being served silently, and the guard only ever protected
+freshly built artifacts.  A hit now runs the same metadata-only scan (GGUF header +
+`config.json`; no reconversion, no NPU, milliseconds) and **discards and rebuilds**
+the directory if it fails, so a stale artifact cannot be served.  Verified: the
+exact command the resolver builds exits 1 on a stale dir (scales stripped) and 0 on
+a good one.  Override the checker with `ONEBIT_Q4NX_CHECK`.
+
+**Scope of the guard — read this before trusting it.**  Two limits, both deliberate:
+
+* If the checker cannot be resolved the resolver **warns once per process, loudly,
+  and reuses**.  A missing script must not brick serving, but that single warning is
+  the *only* state in which the guard does not apply, and it applies to every
+  directory for that process — so it is printed once, framed, rather than repeated
+  into the general output.  A baked path that resolves to a moved or removed
+  checkout is therefore obvious rather than invisible.
+* The **directory route** (`1bit serve -m <Q4NX dir> --device npu`) consumes a model
+  directory with no repack at all, so the guard never runs there.  That is correct:
+  a *foreign* directory (FastFlowLM's published `Qwen2.5-7B-NPU2`,
+  `MiniCPM5-1B-NPU2`, the 0.6B fast lane) is trusted as published.  In short — **the
+  guard covers newly repacked directories; a foreign directory is trusted as
+  published.**  A future foreign dir that drops a declared scale would be served
+  silently, which is why the sentence is here.
+
+**Provenance stamp (`repack-stamp.txt`).**  The scan checks *declared vs carried*; it
+cannot check *which converter path and commit produced the directory*, and the model-dir
+cache reuses a directory on `model.q4nx` existence alone, so neither half can be
+reconstructed after the fact.  The repack now writes `repack-stamp.txt` (converter path +
+git commit, arch/`model_type`, the repack script) and the cache-hit gate requires both
+halves before reuse: a directory whose stamp is missing, or names a different converter
+than the one this build would use now, is discarded and repacked.  `repack_gguf.py
+--check-stamp <dir>` exposes the comparison -- exit 0 current, 1 stale, 2 cannot tell -- and
+"cannot tell" (e.g. an unresolvable converter) fails **open** with a once-per-process
+warning, so a missing converter cannot brick serving.  Verified end to end: a pre-stamp
+cache dir is discarded and rebuilt, and the next serve reuses it without repacking.
+Still converter-side and therefore not yet in the stamp: *whether a q/k rotary reorder was
+applied* for this directory (that rule lives in the converter's `llama.py`/`minicpm.py`),
+the field that would make a directory self-describing rather than dependent on its
+converter commit alone.  Tracked in `~/evidence/npu-four-models/STATUS.md` §6.
+
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the
 OpenAI-compatible API ([serve.md](serve.md)); inside Lemonade, that is what its
 onebit backend runs (`--onebit npu`).

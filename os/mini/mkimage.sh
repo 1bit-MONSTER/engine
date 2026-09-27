@@ -31,6 +31,8 @@
 #
 # Needs no root: the EFI stub and mtools come from their Debian packages, unpacked locally.
 set -euo pipefail
+# modprobe and mkfs live in /usr/sbin, which cron and the weekly wrapper leave off PATH
+export PATH="$PATH:/usr/sbin:/sbin"
 out=${1:?usage: mkimage.sh <out> [engine build dir]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
 build=$(cd "$build" && pwd)   # absolute: binaries keep their build paths inside the image

@@ -95,13 +95,16 @@
 #include <vector>
 #if defined(_WIN32)
 // httplib.h brought in winsock2.h and windows.h
+#include <process.h>
 #elif defined(__linux__)
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #else
+#include <fcntl.h>
 #include <netinet/in.h>
 #include <spawn.h>
 #include <sys/socket.h>
@@ -1040,6 +1043,43 @@ int serve_child(const Options& o) {
     return 1;
 }
 
+// Runs argv[0] with argv and no shell, and returns its exit code (-1 if it could not run).
+// quiet sends the child's stdout and stderr to /dev/null.
+int run_program(const std::vector<std::string>& argv, bool quiet) {
+    std::vector<char*> args;
+    for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+    args.push_back(nullptr);
+#if defined(_WIN32)
+    (void) quiet;
+    return static_cast<int>(_spawnvp(_P_WAIT, args[0], args.data()));
+#else
+    const pid_t pid = ::fork();
+    if (pid < 0) return -1;
+    if (pid == 0) {
+        if (quiet) {
+            const int null_fd = ::open("/dev/null", O_WRONLY);
+            if (null_fd >= 0) {
+                ::dup2(null_fd, 1);
+                ::dup2(null_fd, 2);
+                ::close(null_fd);
+            }
+        }
+        ::execvp(args[0], args.data());
+        ::_exit(127);
+    }
+    int status = 0;
+    while (::waitpid(pid, &status, 0) < 0)
+        if (errno != EINTR) return -1;
+    return WIFEXITED(status) ? WEXITSTATUS(status) : -1;
+#endif
+}
+
+std::string command_text(const std::vector<std::string>& argv) {
+    std::string text;
+    for (const auto& a : argv) text += (text.empty() ? "\"" : " \"") + a + "\"";
+    return text;
+}
+
 // Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
 // (Python), cached by GGUF stem so a repeated serve reuses the conversion.
 // Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
@@ -1082,8 +1122,7 @@ std::string repack_gguf(const std::string& gguf) {
         // (fail open, so a missing converter cannot brick serving), else stale.
         const int stamp_rc = script.empty()
                                  ? 2
-                                 : std::system(("\"" + python + "\" \"" + script +
-                                                "\" --check-stamp \"" + out + "\" >/dev/null 2>&1").c_str());
+                                 : run_program({ python, script, "--check-stamp", out }, true);
         if (stamp_rc == 2) {
             static bool stamp_warned = false;
             if (!stamp_warned) {
@@ -1124,8 +1163,7 @@ std::string repack_gguf(const std::string& gguf) {
             }
             return out;
         }
-        const std::string vcmd = "\"" + python + "\" \"" + checker + "\" \"" + gguf + "\" \"" + out + "\" >/dev/null 2>&1";
-        if (std::system(vcmd.c_str()) == 0) return out;
+        if (run_program({ python, checker, gguf, out }, true) == 0) return out;
         std::fprintf(stderr, "1bit serve: cached Q4NX dir %s FAILED the declared-scale scan; "
                              "discarding and re-repacking\n", out.c_str());
         fs::remove_all(out);
@@ -1137,11 +1175,11 @@ std::string repack_gguf(const std::string& gguf) {
 
     std::fprintf(stderr, "1bit serve: repacking %s -> %s ...\n", gguf.c_str(), out.c_str());
     fs::create_directories(out);
-    std::string cmd = "\"" + python + "\" \"" + script + "\" \"" + gguf + "\" \"" + out + "\"";
-    if (cv) cmd += " \"" + std::string(cv) + "\"";
-    const int rc = std::system(cmd.c_str());
+    std::vector<std::string> repack = { python, script, gguf, out };
+    if (cv) repack.push_back(cv);
+    const int rc = run_program(repack, false);
     if (rc != 0 || !fs::exists(out + "/model.q4nx"))
-        throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + cmd);
+        throw std::runtime_error("GGUF repack failed (rc=" + std::to_string(rc) + "): " + command_text(repack));
     return out;
 }
 

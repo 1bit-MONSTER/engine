@@ -25,6 +25,7 @@
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
 #include "q4nx_forward.h"
+#include <fcntl.h>
 
 #include <cmath>
 #include <cstdio>
@@ -1483,7 +1484,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     if (getenv("NPU_INFER_DUMP_HIDDEN")) {
         char hp[256];
         snprintf(hp, sizeof(hp), "/tmp/q4nx_hidden_%d.bin", pos);
-        FILE* fp = fopen(hp, "wb");
+        // private to the user, and never through a pre-planted link in /tmp
+        const int fd = open(hp, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+        FILE* fp = fd >= 0 ? fdopen(fd, "wb") : nullptr;
         if (fp) { fwrite(xn.data(), sizeof(float), (size_t)H, fp); fclose(fp); }
         fprintf(stderr, "  [debug] hidden pos %d mean=%.6f absmax=%.6f -> %s\n",
                 pos, [&]{ double s=0; for(float v:xn) s+=std::fabs((double)v); return s/H; }(),

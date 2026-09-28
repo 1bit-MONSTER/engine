@@ -45,7 +45,7 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
 > suite on Vulkan and HRX. Following geramyL's review the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
-> ([docs/hrx.md](docs/hrx.md)), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
+> ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
 > source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
 > runs from our llama.cpp on Vulkan, HRX and ROCm, matching transformers, at 93 tok/s decode in

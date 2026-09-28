@@ -26,7 +26,7 @@ OpenAI client.
            [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
-           [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
@@ -141,6 +141,44 @@ predictable enough to keep long drafts, prose is not. Draft length 8 collapses o
 prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
+
+## DFlash draft models (`--dflash`)
+
+`--dflash <draft.gguf>` uses a DFlash block-diffusion draft model instead of the MTP head: the
+draft emits a whole block of tokens in one pass, reading the model's hidden states, and the
+model checks the block in one batch. It turns on llama-server's `draft-dflash` (DFlash2's
+candidate selector included). A drafter is trained for one target model; z-lab publishes them
+on Hugging Face (for example
+[z-lab/Qwen3.8-27B-DFlash2](https://huggingface.co/z-lab/Qwen3.8-27B-DFlash2), 2B, Apache-2.0).
+`--dflash` and `--mtp` are exclusive. `--mtp-max` and `--mtp-p-min` set the draft length and
+threshold for either; without `--mtp-max`, `--dflash` drafts full blocks (llama-server's own
+default of 3 throws most of the gain away).
+
+Convert the drafter with upstream llama.cpp's converter. It needs only the target's
+`config.json` and tokenizer files, not its weights:
+
+```sh
+hf download Qwen/Qwen3.8-27B --include "*.json" "*.jinja" "merges.txt" "vocab.json" --local-dir Qwen3.8-27B-hf
+hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir DFlash2
+python convert_hf_to_gguf.py DFlash2 --target-model-dir Qwen3.8-27B-hf --outtype bf16 --outfile dflash2-bf16.gguf
+llama-quantize dflash2-bf16.gguf dflash2-q8_0.gguf Q8_0
+1bit serve -m Qwen3.8-27B-Q4_0.gguf --device vulkan --dflash dflash2-q8_0.gguf
+```
+
+Measured through `1bit serve --device vulkan` on Strix Halo, Qwen3.8-27B Q4_0 (Unsloth), the
+same three chat prompts as above (code / prose / short, decode tok/s), runs back to back on a
+shared box, 2026-09-28:
+
+| Drafter | tok/s | Prompt t/s (1,838 tokens) |
+|---|---|---|
+| none | 11.1 / 11.8 / 12.4 | 330 |
+| `--mtp` (Q4_0 MTP head, draft length 3) | 31.7 / 25.8 / **28.2** | 267 |
+| `--dflash` (DFlash2, Q8_0, full blocks) | **45.7** / **28.3** / 17.8 | 255 |
+
+DFlash2 is the pick for code (4.1x, +44% over MTP) and ties or beats MTP on prose. MTP wins
+short answers (the translation prompt stops after ~16 tokens, too few to fill blocks). The Q8_0
+drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A drafted token is
+kept only when the model agrees, so the output is the model's own.
 
 ## MoE models larger than memory (`--moe-slots`)
 

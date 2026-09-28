@@ -123,7 +123,8 @@ quantize it with anyway:
 tools/hadamard_q4_0.py Qwen3.8-27B-Q8_0.gguf Qwen3.8-27B-Q4_0-H32.gguf --imatrix imatrix_unsloth.gguf
 ```
 
-It rotates the attention, FFN and delta-net alpha/beta projections in a copy of the source,
+It rotates the attention, FFN (MoE experts and shared experts included) and delta-net
+alpha/beta projections in a copy of the source,
 gives the imatrix the matching change, quantizes those tensors to Q4_0 and every other matmul
 weight to another type, stamps the file `onebit.hadamard_q4_0 = 32`, and checks that every Q4_0
 tensor in it is a rotated one (it deletes a file that breaks that). Qwen3.8-27B: about 20 minutes
@@ -147,6 +148,34 @@ llama-bench with ub 512):
 | Q4_0, W4A4 without rotation | 461-488 | 6.241 | 0.084 | 87.4% |
 | **Q4_0-H32 (rotated), W4A4** | **503-512** (509 on the engine's lean ROCm build) | **6.096** | **0.055** | **89.3%** |
 | Q4_0-H32 on the exact int8 path | ~400 | 6.016 | 0.031 | 91.6% |
+
+### MoE: W4A4 on the experts
+
+W4A4 runs the expert matmuls (`MUL_MAT_ID`) too
+([ROCmFPX #3](https://github.com/1bit-MONSTER/ROCmFPX/pull/3)). Before that, an MoE file took
+W4A4 on its attention only, and its experts, where nearly all of the prompt's work is, stayed on
+the exact int8 path. `tools/hadamard_q4_0.py` rotates the experts along with the rest.
+
+```sh
+tools/hadamard_q4_0.py Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf Qwen3-Coder-30B-A3B-Q4_0-H32.gguf
+1bit serve -m Qwen3-Coder-30B-A3B-Q4_0-H32.gguf
+```
+
+**Measured** (Strix Halo, Qwen3-Coder-30B-A3B from unsloth's Q8_0, rev `b17cb02d`; KLD against
+that Q8_0 over wikitext-2 40 x 512, Q8_0 PPL 8.489; llama-bench, 3 runs; 337 rotated tensors,
+16,497 MiB):
+
+| Qwen3-Coder-30B-A3B, Q4_0 | pp512 | pp2048 | tg128 | PPL | Mean KLD | Same top token |
+|---|---|---|---|---|---|---|
+| rotated, exact int8 | 1,218 | 1,186 | 79.0 | 8.671 | 0.048 | 91.5% |
+| rotated, W4A4 on attention only (before ROCmFPX #3) | 1,236 | 1,208 | 79.1 | 8.720 | 0.061 | 90.3% |
+| **rotated, W4A4 on attention and experts** | **2,156** | **2,048** | 79.2 | 8.862 | **0.081** | **88.7%** |
+| not rotated, W4A4 everywhere | 2,155 | 2,058 | 79.0 | 8.847 | 0.137 | 85.3% |
+
+Prompt processing goes up about 75% for an MoE, against about 25% for the dense 27B above,
+because an MoE spends almost all of its prompt compute in the experts. The accuracy cost is
+about the dense model's: KLD 0.048 to 0.081 (27B: 0.029 to 0.055). Without the rotation, W4A4
+costs almost twice as much (0.137). Decode does not use W4A4 and does not change.
 
 The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
 +1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through

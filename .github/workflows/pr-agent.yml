@@ -13,8 +13,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# PR-Agent (qodo-ai/pr-agent) reviews every pull request with a local model: ZAYA1-8B (Zyphra,
-# Q4_K_M, about 6 GB resident, thinking off) served by the engine itself (`1bit serve`, Vulkan) on
+# PR-Agent (qodo-ai/pr-agent) reviews every pull request with a local model: Qwen3-Coder-30B-A3B
+# (Q4_K_M, about 18 GB resident, thinking off) served by the engine itself (`1bit serve`, Vulkan) on
 # the Strix Halo box, at 127.0.0.1:8090 (the coder-llm user service). The job runs on that box's self-hosted runner
 # (label pr-agent), so no code leaves it and there is no API key. Settings: .pr_agent.toml.
 #
@@ -53,7 +53,7 @@ jobs:
           GITHUB__USER_TOKEN: ${{ secrets.GITHUB_TOKEN }}
           COMMENT_BODY: ${{ github.event.comment.body }}
           # the model settings are here too: PR-Agent reads .pr_agent.toml from the default branch only
-          CONFIG__MODEL: openai/zaya1-8b
+          CONFIG__MODEL: openai/qwen3-coder
           CONFIG__FALLBACK_MODELS: '[]'
           CONFIG__CUSTOM_MODEL_MAX_TOKENS: '65536'
           OPENAI__API_BASE: http://127.0.0.1:8090/v1
@@ -70,7 +70,7 @@ jobs:
           ready=0
           for i in $(seq 1 30); do
             if curl -sf --max-time 60 http://127.0.0.1:8090/v1/chat/completions -H 'Content-Type: application/json' \
-                 -d '{"model":"zaya1-8b","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' > /dev/null; then
+                 -d '{"model":"qwen3-coder","messages":[{"role":"user","content":"ok"}],"max_tokens":1}' > /dev/null; then
               ready=1; break
             fi
             sleep 10

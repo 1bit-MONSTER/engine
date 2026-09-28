@@ -63,7 +63,7 @@ an RFC or issue.
 
 ## Automation
 
-- **PR-Agent** reviews every pull request with a local model (ZAYA1-8B) on the Strix Halo box
+- **PR-Agent** reviews every pull request with a local model (Qwen3-Coder-30B-A3B) on the Strix Halo box
   (`.github/workflows/pr-agent.yml`); comment `/review`, `/describe`, `/improve` or `/ask` for more.
 - **Issue agent** (`tools/issue_agent.py`) takes a first pass on issues opened by people outside the
   project: one label, a request for the bug-report fields when a bug skipped the form, a registry

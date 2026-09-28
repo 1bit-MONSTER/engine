@@ -130,9 +130,22 @@ Tokenizer::Tokenizer(const std::string& path) {
     const auto root = nlohmann::json::parse(f);
     const auto& model = root.at("model");
     int max_id = -1;
-    for (const auto& [text, id] : model.at("vocab").items()) {
-        vocab_[text] = id.get<int>();
-        max_id = std::max(max_id, id.get<int>());
+    // vocab is either a BPE object {token: id} or a Unigram array [[token, score], ...]
+    // whose id is the entry's position.  A SentencePiece tokenizer.json uses the array
+    // form (the converter's Unigram branch emits exactly that), so accept both.
+    const auto& vocab_json = model.at("vocab");
+    if (vocab_json.is_array()) {
+        for (size_t i = 0; i < vocab_json.size(); ++i) {
+            const auto& ent = vocab_json[i];
+            if (!ent.is_array() || ent.empty() || !ent[0].is_string()) continue;
+            vocab_[ent[0].get<std::string>()] = int(i);
+            max_id = std::max(max_id, int(i));
+        }
+    } else {
+        for (const auto& [text, id] : vocab_json.items()) {
+            vocab_[text] = id.get<int>();
+            max_id = std::max(max_id, id.get<int>());
+        }
     }
     if (root.contains("added_tokens"))
         for (const auto& t : root["added_tokens"]) {
@@ -148,7 +161,13 @@ Tokenizer::Tokenizer(const std::string& path) {
     std::sort(added_.begin(), added_.end(), [](const auto& a, const auto& b) { return a.first.size() > b.first.size(); });
 
     // Merges: ["a", "b"] pairs, or "a b" strings in older files. Rank = position.
-    const auto& merges = model.at("merges");
+    // A SentencePiece/Unigram tokenizer.json has no "merges" key AT ALL (see the vocab
+    // handling above).  .at() throws on a missing key, and that throw used to abort the
+    // constructor before the SPM detection below -- so a correctly-typed Unigram file
+    // could never reach the unigram path and every SPM model fell back to raw bytes.
+    // Absent merges means "no merges", which is exactly what the SPM detection keys on.
+    static const nlohmann::json kNoMerges = nlohmann::json::array();
+    const auto& merges = model.contains("merges") ? model.at("merges") : kNoMerges;
     for (size_t i = 0; i < merges.size(); ++i) {
         const auto& m = merges[i];
         std::string a, b;
@@ -302,7 +321,7 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
     return ids;
 }
 
-std::string Tokenizer::decode(const std::vector<int>& ids) const {
+std::string Tokenizer::decode(const std::vector<int>& ids, bool strip_dummy_prefix) const {
     if (spm_) {
         static const char kMeta[] = "\xE2\x96\x81";
         std::string out;
@@ -320,6 +339,14 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
                 else out += t[i++];
             }
         }
+        // The FIRST metaspace is SentencePiece's add_dummy_prefix marker (spm()
+        // always synthesises one), not a real space -- strip exactly it.  Stripping
+        // one rather than all also preserves a genuinely space-leading input:
+        // " Paris" encodes to "\u2581\u2581Paris" and must decode back to " Paris".
+        // Without this every decoded string came back with a leading space
+        // (MiniCPM4: "The capital of France is" -> " The capital of France is"),
+        // which is visible in 1bit serve's output.
+        if (strip_dummy_prefix && !out.empty() && out[0] == ' ') out.erase(0, 1);
         return out;
     }
     std::string out;

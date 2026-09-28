@@ -1746,6 +1746,34 @@ int run_serve(int argc, char** argv) {
         // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
         // directory, then serve it through the model-generic forward in process.
         const std::string dir = repack_gguf(o.model);
+        // Forward -> lane routing: if a fused-lane kernel set exists for this
+        // model's shape (the fast-lane artifacts layer_ctx1.elf + layer.pdi),
+        // serve it on the NPU fast lane (one launch per layer) instead of the
+        // per-op forward (~100+ launches per token).  Opt-in via
+        // ONEBIT_NPU_LANE_DIR: the repack layout must equal the lane kernels'
+        // layout, and it does not yet (the repack is patched for the forward's
+        // per-op ELFs), so this must not fire by accident.  Without it, the
+        // forward runs (the unchanged fallback).
+        {
+            std::string lane;
+            if (const char* env = std::getenv("ONEBIT_NPU_LANE_DIR")) lane = env;
+            if (!lane.empty() && fs::exists(fs::path(lane) / "layer_ctx1.elf")) {
+                if (!fs::exists(fs::path(dir) / "npu")) {
+                    std::error_code ec;
+                    fs::create_directory_symlink(lane, fs::path(dir) / "npu", ec);
+                    if (ec) std::fprintf(stderr, "1bit serve: lane routing skipped (%s)\n", ec.message().c_str());
+                }
+                if (fs::exists(fs::path(dir) / "npu" / "layer_ctx1.elf")) {
+                    std::fprintf(stderr, "1bit serve: routing %s to the NPU fast lane (fused layer) from %s\n",
+                                 o.model.c_str(), lane.c_str());
+                    std::vector<std::string> args = {"-m", dir, "-p", std::to_string(o.port), "--host", o.host};
+                    if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                    std::vector<char*> av;
+                    for (auto& s : args) av.push_back(s.data());
+                    return run_unified(int(av.size()), av.data());
+                }
+            }
+        }
         // Resolve the full-ELF / xclbin directory the forward loads. An empty value
         // makes it look for "/full_i8_*.elf", so it is an error, not a default.
         std::string kernels;

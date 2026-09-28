@@ -349,6 +349,16 @@ struct I8Ctx {
     // weight BO per (layer, expert) at startup, pack+sync once, and pass the
     // BO handle directly at decode.
     std::unique_ptr<xrt::bo> make_weight_bo(xrt::device& d) {
+        // The xclbin path picks a group off the kernel object; the ELF path has
+        // no kernel object (`k` is null) and the amdxdna driver rejects a
+        // group-less xrt::bo, so use the same xrt::ext::bo allocation
+        // init_elf's mkbo uses.
+        if (elf_mode) {
+            xrt::ext::bo b{d, (size_t)KD * ND};
+            auto bo = std::make_unique<xrt::bo>(b);
+            if (void* m = bo->map()) memset(m, 0, (size_t)KD * ND);
+            return bo;
+        }
         int grp_w = k->group_id(4);
         // Weight BOs are written once (packB_into) and read every token by the
         // shim DMA. HOST_ONLY forces the device through the slow cache-coherent

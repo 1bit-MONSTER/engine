@@ -40,10 +40,12 @@
 #include "model.h"
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
 #include "q4nx_semantics.h"   // Q4nxSemantics (config-derived architecture flags)
+#include <memory>
+#include <unordered_map>
 
 struct I8Ctx;
 
-namespace xrt { class device; }
+namespace xrt { class device; class bo; }
 
 struct Q4nxForwardConfig {
     int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
@@ -93,7 +95,14 @@ private:
     bool host_gemm_ = false;
     bool load_layer(int l);
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                  const float* Bmat, std::vector<float>& out);
+                  const float* Bmat, std::vector<float>& out, int wkey = -1);
+    // True when this layer's projection `wkey` is already packed in its own BO,
+    // so the caller can skip both the Q4NX dequant (load_layer) and the f32->B
+    // assembly for the rest of the run.
+    bool weight_cached(int key) const {
+        return weight_cache_ && cur_layer_ >= 0 && cur_layer_ < (int)wcache_.size() &&
+               wcache_[(size_t)cur_layer_].find(key) != wcache_[(size_t)cur_layer_].end();
+    }
     bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv);
@@ -193,6 +202,18 @@ private:
     std::vector<std::vector<float>> kcache_, vcache_;
 
     std::vector<float> B_;        // packed weight scratch  (max K*N floats)
+    // Packed-int8 weight cache, one weight BO per (layer, wkey), packed on first
+    // use.  Without it every token re-dequantizes the Q4NX (load_layer) AND
+    // re-quantizes it (I8Ctx::packB) for every GEMM -- ~2 min/token on a 7B and
+    // ~8 min/token on the 8B, which makes a served answer impractical.  Only
+    // token-INVARIANT weights may be cached (dense projections, GDN, MLA, the
+    // shared expert); routed-expert weights vary per token and pass wkey < 0.
+    struct PackedWeight {
+        std::unique_ptr<xrt::bo> bo;
+        std::vector<float>       scales;
+    };
+    std::vector<std::unordered_map<int, PackedWeight>> wcache_;   // [layer][wkey]
+    bool weight_cache_ = true;    // NPU_NO_WCACHE=1 disables (A/B)
     int cur_layer_ = 0;           // layer currently being processed
 
     // ── Gemma4 (per-layer embeddings + KV sharing + extra norms) ──

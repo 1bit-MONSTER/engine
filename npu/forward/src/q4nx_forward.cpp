@@ -967,15 +967,15 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         const Q4nxDesignGeom* g = &designs_[i_qkv];
         Q4nxProjections p{};
         p.ple = wqkvlin_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn qkv"; return false; }
-        npu_gemm(*ctx_[i_qkv], xn.data(), g->K, g->N, B_.data(), qkv);
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn qkv"; return false; }
+        npu_gemm(*ctx_[i_qkv], xn.data(), g->K, g->N, B_.data(), qkv, 0);
     }
     {
         const Q4nxDesignGeom* g = &designs_[i_z];
         Q4nxProjections p{};
         p.ple = wz_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn z"; return false; }
-        npu_gemm(*ctx_[i_z], xn.data(), g->K, g->N, B_.data(), z);
+        if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn z"; return false; }
+        npu_gemm(*ctx_[i_z], xn.data(), g->K, g->N, B_.data(), z, 1);
     }
     // depthwise causal conv1d (kernel CK) + SiLU over CD channels;
     // full = [state (CK-1) | current], new state = full[1:]
@@ -1071,8 +1071,8 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         const Q4nxDesignGeom* g = &designs_[i_o];
         Q4nxProjections p{};
         p.o = woutlin_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
-        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out);
+        if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
+        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out, 2);
     }
     return true;
 }
@@ -1162,7 +1162,7 @@ void Q4nxNpuForward::build_ple_inputs(int token) {
 // one NPU GEMM: C[1,N] = A[1,K] x B[K,N]  (row-major B)
 // --------------------------------------------------------------------------
 void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                              const float* Bmat, std::vector<float>& out) {
+                              const float* Bmat, std::vector<float>& out, int wkey) {
     if (host_gemm_) {
         // Bmat is B[K][N] row-major (ld = N); a plain float matvec.
         out.assign((size_t)N, 0.0f);
@@ -1174,24 +1174,46 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         }
         return;
     }
-    float sout = 1.0f;
-    ctx.packB(0, Bmat, K, N, sout);
-
     float amax = 0.0f;
     for (int i = 0; i < K; i++) {
         float a = std::fabs(A[i]);
         if (a > amax) amax = a;
     }
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
-    ctx.quantize_async(A, 1, K, as);
-    xrt::run r = ctx.sync_and_launch(0);
+
+    // Token-invariant weights (wkey >= 0) get their own BO, packed once and
+    // reused; every other call (wkey < 0: routed experts, whose weights change
+    // per token) re-packs into layerB[0] as before.
+    PackedWeight*             slot = nullptr;
+    const std::vector<float>* gs = nullptr;
+    if (weight_cache_ && wkey >= 0 && cur_layer_ >= 0 && cur_layer_ < c_.NL && dev_) {
+        if (int(wcache_.size()) <= cur_layer_) wcache_.resize(size_t(cur_layer_) + 1);
+        auto& m = wcache_[size_t(cur_layer_)];
+        auto  it = m.find(wkey);
+        if (it == m.end()) {
+            PackedWeight pw;
+            pw.bo = ctx.make_weight_bo(*dev_);
+            float sout = 1.0f;
+            ctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            it = m.emplace(wkey, std::move(pw)).first;
+        }
+        slot = &it->second;
+        gs = &slot->scales;
+    } else {
+        float sout = 1.0f;
+        ctx.packB(0, Bmat, K, N, sout);
+        ctx.quantize_async(A, 1, K, as);
+        gs = &ctx.group_scales[0];
+    }
+
+    xrt::run r = slot ? ctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
+                      : ctx.sync_and_launch(0);
     ctx.wait_kernel(r);
     ctx.readback();
 
     out.resize((size_t)N);
-    const std::vector<float>& gs = ctx.group_scales[0];
     for (int n = 0; n < N; n++)
-        out[(size_t)n] = (float)ctx.Cm[n] * as * gs[(size_t)n];
+        out[(size_t)n] = (float)ctx.Cm[n] * as * (*gs)[(size_t)n];
 }
 
 // --------------------------------------------------------------------------
@@ -1256,22 +1278,22 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     {   // q_a: [H] -> [q_lora]
         const Q4nxDesignGeom* g = &designs_[i_qa];
         Q4nxProjections p{}; p.q = w_qa_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_a"; return false; }
-        npu_gemm(*ctx_[i_qa], x.data(), g->K, g->N, B_.data(), qa);
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_a"; return false; }
+        npu_gemm(*ctx_[i_qa], x.data(), g->K, g->N, B_.data(), qa, 0);
     }
     qan.resize(q_lora_);
     rmsnorm(qa.data(), mla_qan_.data(), q_lora_, qan.data());
     {   // q_b: [q_lora] -> [NH*qh]
         const Q4nxDesignGeom* g = &designs_[i_qb];
         Q4nxProjections p{}; p.k = w_qb_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_b"; return false; }
-        npu_gemm(*ctx_[i_qb], qan.data(), g->K, g->N, B_.data(), q);
+        if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_b"; return false; }
+        npu_gemm(*ctx_[i_qb], qan.data(), g->K, g->N, B_.data(), q, 1);
     }
     {   // kv_a: [H] -> [kv_real] (+ zero pad to the kernel's n-tile)
         const Q4nxDesignGeom* g = &designs_[i_kva];
         Q4nxProjections p{}; p.v = w_kva_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble kv_a"; return false; }
-        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva);
+        if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble kv_a"; return false; }
+        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva, 2);
     }
     if ((int)kva.size() < kv_real) { err_ = "kv_a short"; return false; }
     std::vector<float> kl(kv_lora_);
@@ -1347,8 +1369,8 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     {   // o_proj: [NH*v_head] -> [H]
         const Q4nxDesignGeom* g = &designs_[i_o];
         Q4nxProjections p{}; p.o = w_o_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
-        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o);
+        if (!weight_cached(3) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
+        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o, 3);
     }
     return true;
 }
@@ -1490,9 +1512,9 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
         }
         const Q4nxDesignGeom* gd = &designs_[i_d];
         Q4nxProjections p{}; p.down = share_d_.data();
-        if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble shared down"; return false; }
+        if (!weight_cached(5) && q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble shared down"; return false; }
         std::vector<float> sd;
-        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), sd);
+        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), sd, 5);
         if (dump) {
             double ss = 0; for (float f : act) ss += f;
             fprintf(stderr, "  [moe] L%d expert gate=%.6f up=%.6f swiglu=%.6f down=%.6f weighted=%.6f | "
@@ -1737,7 +1759,12 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
 
     for (int l = 0; l < c_.NL; l++) {
         cur_layer_ = l;
-        if (!load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
+        // Dense models: once this layer's projections are packed (after the
+        // first token), the f32 weights are no longer read, so skip the per-token
+        // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
+        // keep loading every token.
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && weight_cached(0);
+        if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
         // MLA + MoE layers have no plain q/k/v/o or single-MLP structure, so they
         // take their own path through this loop body and skip the rest.
         if (mla_) {
@@ -1833,9 +1860,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             // k/v half of the GEMM output is discarded.  Reusing wq_ for those
             // slots keeps assemble_B's row counts in bounds (q_rows >= k_rows).
             if (kv_shared) { p.k = wq_.data(); p.v = wq_.data(); }
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble qkv"; return false; }
+            if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble qkv"; return false; }
             std::vector<float> qkv;
-            npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv);
+            npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0);
             // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
             // must not see the gate half; the gate multiplies ctx afterwards.
             std::vector<float> qkv_use;
@@ -1864,8 +1891,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             const Q4nxDesignGeom* g = &designs_[i_o_l];
             Q4nxProjections p{};
             p.o = wo_.data();
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
-            npu_gemm(*ctx_[i_o_l], ctx.data(), g->K, g->N, B_.data(), o);
+            if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
+            npu_gemm(*ctx_[i_o_l], ctx.data(), g->K, g->N, B_.data(), o, 1);
         }
         }  // end non-GDN attention
         if (gemma4_layer_) {
@@ -1891,20 +1918,20 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             const Q4nxDesignGeom* g = &designs_[i_gu_l];
             Q4nxProjections p{};
             p.gate = wg_.data(); p.up = wu_.data();
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gu"; return false; }
-            npu_gemm(*ctx_[i_gu_l], xn.data(), g->K, g->N, B_.data(), act);
+            if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gu"; return false; }
+            npu_gemm(*ctx_[i_gu_l], xn.data(), g->K, g->N, B_.data(), act, 2);
         } else if (i_g >= 0 && i_u >= 0) {
             // split gate/up: two kernels, then SiLU(gate) * up
             std::vector<float> gv, uv;
             const Q4nxDesignGeom* gg = &designs_[i_g];
             Q4nxProjections pg{}; pg.gate = wg_.data();
-            if (q4nx_assemble_B(gg, &pg, B_.data()) != 0) { err_ = "assemble g"; return false; }
-            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), gv);
+            if (!weight_cached(2) && q4nx_assemble_B(gg, &pg, B_.data()) != 0) { err_ = "assemble g"; return false; }
+            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), gv, 2);
 
             const Q4nxDesignGeom* gu = &designs_[i_u];
             Q4nxProjections pu{}; pu.up = wu_.data();
-            if (q4nx_assemble_B(gu, &pu, B_.data()) != 0) { err_ = "assemble u"; return false; }
-            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uv);
+            if (!weight_cached(3) && q4nx_assemble_B(gu, &pu, B_.data()) != 0) { err_ = "assemble u"; return false; }
+            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uv, 3);
 
             act.resize((size_t)im_l * 2);
             for (int i = 0; i < im_l; i++) {
@@ -1920,8 +1947,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             const Q4nxDesignGeom* g = &designs_[i_d_l];
             Q4nxProjections p{};
             p.down = wd_.data();
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble d"; return false; }
-            npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d);
+            if (!weight_cached(4) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble d"; return false; }
+            npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d, 4);
         }
         if (!gemma4_layer_) {
             for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
@@ -1953,8 +1980,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 const Q4nxDesignGeom* g = &designs_[i_pg];
                 Q4nxProjections p{};
                 p.ple = inp_gate_[l].data();
-                if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
-                npu_gemm(*ctx_[i_pg], x.data(), g->K, g->N, B_.data(), pg);
+                if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
+                npu_gemm(*ctx_[i_pg], x.data(), g->K, g->N, B_.data(), pg, 0);
             }
             const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
             for (int i = 0; i < ple_dim_; i++) {
@@ -1972,8 +1999,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 const Q4nxDesignGeom* g = &designs_[i_pp];
                 Q4nxProjections p{};
                 p.ple = ple_proj_[l].data();
-                if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
-                npu_gemm(*ctx_[i_pp], pg.data(), g->K, g->N, B_.data(), pp);
+                if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
+                npu_gemm(*ctx_[i_pp], pg.data(), g->K, g->N, B_.data(), pp, 1);
             }
             rmsnorm(pp.data(), post_ln_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];

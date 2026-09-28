@@ -128,6 +128,22 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
             # wrong still produces plausible output with a wrong argmax.
             "expert_gating_func": int(_num(reader, f"{p}.expert_gating_func", 1)),
         })
+    # Qwen MoE (qwen3moe / qwen35moe).  Same MoE meanings as deepseek2 above but
+    # different GGUF field names, no MLA, and all layers are MoE (no dense leading
+    # block).  The per-EXPERT intermediate must replace the dense
+    # feed_forward_length (5472 for the 30B) so the G/U/D designs ARE the expert
+    # MLP; the forward's n_expert/top_k/expert gating come from these keys.
+    if p in ("qwen3moe", "qwen35moe"):
+        cfg.update({
+            "intermediate_size": int(_num(reader, f"{p}.expert_feed_forward_length", 0)),
+            "n_expert": int(_num(reader, f"{p}.expert_count", 0)),
+            "top_k": int(_num(reader, f"{p}.expert_used_count", 0)),
+            "expert_shared": int(_num(reader, f"{p}.expert_shared_feed_forward_length", 0)),
+            "leading_dense_block_count": 0,
+            "expert_weights_norm": int(_num(reader, f"{p}.expert_weights_norm", 1)),
+            "expert_weights_scale": float(_num(reader, f"{p}.expert_weights_scale", 1.0)),
+            "expert_gating_func": 1,   # Qwen MoE gating = softmax
+        })
     # MiniCPM4 architecture scales.  The forward must apply them: the embedding
     # is scaled by 12.0 and every residual branch by scale_depth/sqrt(NL)
     # (0.2475 for 32 layers); without them the hidden state runs at the wrong

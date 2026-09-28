@@ -369,21 +369,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         rope_dim_ = q4nx_config_int(cfg_path.c_str(), "rope_dim", 0);
         qk_nope_ = q4nx_config_int(cfg_path.c_str(), "qk_nope_head_dim", 0);
         v_head_ = q4nx_config_int(cfg_path.c_str(), "v_head_dim", 0);
-        n_expert_ = q4nx_config_int(cfg_path.c_str(), "n_expert", 0);
-        top_k_ = q4nx_config_int(cfg_path.c_str(), "top_k", 0);
-        expert_im_ = c_.IM;
-        dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
-        leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 1);
-        expert_gating_sigmoid_ =
-            q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
-        expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
         if (q_lora_ <= 0 || kv_lora_ <= 0 || rope_dim_ <= 0 || qk_nope_ <= 0 ||
-            v_head_ <= 0 || n_expert_ <= 0 || top_k_ <= 0 || expert_im_ <= 0 ||
-            dense_im_ <= 0) {
+            v_head_ <= 0) {
             fprintf(stderr, "  [mla] config incomplete (q_lora=%d kv_lora=%d rope=%d nope=%d "
-                            "v_head=%d n_expert=%d top_k=%d im=%d dense_im=%d)\n",
-                    q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, n_expert_, top_k_,
-                    expert_im_, dense_im_);
+                            "v_head=%d)\n", q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_);
             err_ = "MLA config incomplete";
             return false;
         }
@@ -391,10 +380,32 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // 256-column block (192 -> 256), which is what its 16 tiles/head show.
         kb_rows_ = qk_nope_;   /* the re-converted Q4NX packs k_b at [192][512], 12 tiles/head (verified corr 0.996926 vs the GGUF) */
         c_.HD = v_head_;
-        fprintf(stderr, "  [mla] MLA+MoE: q_lora=%d kv_lora=%d rope=%d nope=%d v_head=%d "
-                        "NH=%d n_expert=%d top%d im=%d dense_im=%d gating=%s\n",
-                q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, c_.NH, n_expert_, top_k_,
-                expert_im_, dense_im_, expert_gating_sigmoid_ ? "sigmoid" : "softmax");
+        fprintf(stderr, "  [mla] MLA: q_lora=%d kv_lora=%d rope=%d nope=%d v_head=%d NH=%d\n",
+                q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, c_.NH);
+    }
+    // MoE params are parsed INDEPENDENTLY of mla_ so a non-MLA MoE arch (qwen3moe /
+    // qwen35moe) gets its expert geometry too; reading them only inside `if (mla_)`
+    // left n_expert_/top_k_/expert_im_ zero and the standard MoE path dead.
+    // expert_im_ is the per-EXPERT intermediate, which c_.IM already holds for a MoE
+    // config (the converter writes the per-expert FFN width as intermediate_size).
+    n_expert_ = q4nx_config_int(cfg_path.c_str(), "n_expert", 0);
+    if (n_expert_ > 0) {
+        top_k_ = q4nx_config_int(cfg_path.c_str(), "top_k", 0);
+        expert_im_ = c_.IM;
+        dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
+        leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 0);
+        expert_gating_sigmoid_ =
+            q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
+        expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
+        if (top_k_ <= 0 || expert_im_ <= 0) {
+            fprintf(stderr, "  [moe] config incomplete (n_expert=%d top_k=%d im=%d)\n",
+                    n_expert_, top_k_, expert_im_);
+            err_ = "MoE config incomplete";
+            return false;
+        }
+        fprintf(stderr, "  [moe] %sMoE: NH=%d n_expert=%d top%d im=%d dense_im=%d gating=%s\n",
+                mla_ ? "MLA+" : "", c_.NH, n_expert_, top_k_, expert_im_, dense_im_,
+                expert_gating_sigmoid_ ? "sigmoid" : "softmax");
     }
 
     Q4nxModelDims dims{};
@@ -879,6 +890,42 @@ bool Q4nxNpuForward::load_layer(int l) {
         if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, H)) return false;
     }
     if (!deq(&lw->o_proj_weight, wo_.data(), H, NH * hd)) return false;
+    if (n_expert_ > 0) {
+        // Qwen MoE layer (qwen3moe / qwen35moe): a router + top-k routed experts
+        // instead of a dense gate/up/down.  The router is bf16; its bias is OPTIONAL
+        // (Qwen MoE has none, deepseek2 does).  The experts stay pooled -- one
+        // [N][K] slice is dequantized per selected expert at decode.
+        char nm2[160];
+        auto td2 = [&](const char* fmt) -> TensorDesc* {
+            snprintf(nm2, sizeof(nm2), fmt, l);
+            return model_tensor_by_name(mw_, nm2);
+        };
+        auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!p) return false;
+            v.resize((size_t)n);
+            for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
+            return true;
+        };
+        if (!load_bf16_opt("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H))
+            { err_ = "moe router"; return false; }
+        if (!load_bf16_opt("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_))
+            moe_router_b_.clear();
+        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw) return false;
+            *p = raw; *bytes = (size_t)d->data_size / (size_t)n_expert_;
+            return true;
+        };
+        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        return true;
+    }
     if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
     if (!deq(&lw->up_proj_weight, wu_.data(), im, H)) return false;
     if (!deq(&lw->down_proj_weight, wd_.data(), H, im)) return false;
@@ -1780,7 +1827,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // first token), the f32 weights are no longer read, so skip the per-token
         // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
         // keep loading every token.
-        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && weight_cached(0);
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && n_expert_ == 0 && weight_cached(0);
         if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
         // MLA + MoE layers have no plain q/k/v/o or single-MLP structure, so they
         // take their own path through this loop body and skip the rest.
@@ -1933,6 +1980,16 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             rmsnorm(x.data(), pre_ff_norm_[l].data(), H, xn.data());
         } else {
             rmsnorm(x.data(), post_norm_[l].data(), H, xn.data());
+        }
+        if (n_expert_ > 0) {
+            // Qwen MoE layer (qwen3moe / qwen35moe): the FFN is router -> top-k
+            // experts, not a dense gate/up/down.  moe_mlp writes the whole FFN
+            // delta into d.  (deepseek2/GLM MoE layers never reach here -- the MLA
+            // branch above handles attn+MoE and continues.)
+            if (!moe_mlp(l, xn, d)) return false;
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
+            if (!nancheck("moe")) return false;
+            continue;
         }
         std::vector<float> act;
         if (i_gu_l >= 0) {

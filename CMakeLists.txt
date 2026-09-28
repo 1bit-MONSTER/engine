@@ -388,6 +388,12 @@ if(ONEBIT_NPU)
         npu/forward/src/q4nx_pack.c
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp)
+    # NPU_INFER_DUMP_ATTN / _LN / _HEAD write debug dumps to a path taken from the environment;
+    # only debug builds carry them
+    option(ONEBIT_NPU_DEBUG_DUMPS "NPU forward: env-named debug dumps (developer builds)" OFF)
+    if(ONEBIT_NPU_DEBUG_DUMPS)
+        target_compile_definitions(onebit_npu_forward PRIVATE NPU_INFER_DEBUG_DUMPS)
+    endif()
     target_include_directories(onebit_npu_forward SYSTEM PUBLIC
         npu/forward/include npu/forward/engine-src ${ONEBIT_XRT_ROOT}/include)
     target_link_libraries(onebit_npu_forward PUBLIC

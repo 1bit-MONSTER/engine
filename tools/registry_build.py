@@ -183,12 +183,20 @@ def build():
     }
 
 
-def gap_violations(registry):
+def _mapped_ok(e):
+    """A reviewed class is exempt only when 'mapped_ok' is a non-empty, non-whitespace string:
+    a missing, empty or vacuous value (e.g. true or "   ") is still a violation."""
+    r = e.get("mapped_ok")
+    return isinstance(r, str) and bool(r.strip())
+
+
+def gap_violations(registry, sig=None):
     """Classes reviewed as not aliases (registry/significant.json, docs/arch-gaps.md) that the
     registry maps without a recorded reason ('mapped_ok'): each needs a person's look."""
-    sig = json.load(open(os.path.join(ROOT, "registry/significant.json")))["classes"]
+    if sig is None:
+        sig = json.load(open(os.path.join(ROOT, "registry/significant.json")))["classes"]
     mapped = registry["architectures"]
-    return [(cls, mapped[cls]) for cls, e in sig.items() if cls in mapped and not e.get("mapped_ok")]
+    return [(cls, mapped[cls]) for cls, e in sig.items() if cls in mapped and not _mapped_ok(e)]
 
 
 def report_gaps(registry):

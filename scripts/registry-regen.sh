@@ -28,4 +28,5 @@ if ! git diff --quiet -- registry/architectures.json; then
   git add registry/architectures.json
   git commit -q --amend --no-edit
 fi
+python3 tools/registry_build.py --check-gaps
 python3 tools/registry_build.py --check-pins

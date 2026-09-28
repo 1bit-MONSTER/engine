@@ -16,7 +16,9 @@ limitations under the License.
 -->
 # Laya
 
-Step 4 of the port (docs/PORTING.md): Laya picks where each request runs.
+Laya picks where each request runs: it sorts each conversation into code, prose, short answer
+or long document (95.5% right), and a measured policy picks the device. The test set is 200
+labelled requests. This is step 4 of the port (docs/PORTING.md).
 [Laya](https://github.com/NandhaKishorM/laya) (Apache-2.0) is a
 non-autoregressive decision model: a ModernBERT-style encoder plus an RLCD
 decision head. It answers typed questions (`choice`, `score`, `noul`) about a

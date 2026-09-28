@@ -321,7 +321,7 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
     return ids;
 }
 
-std::string Tokenizer::decode(const std::vector<int>& ids) const {
+std::string Tokenizer::decode(const std::vector<int>& ids, bool strip_dummy_prefix) const {
     if (spm_) {
         static const char kMeta[] = "\xE2\x96\x81";
         std::string out;
@@ -346,7 +346,7 @@ std::string Tokenizer::decode(const std::vector<int>& ids) const {
         // Without this every decoded string came back with a leading space
         // (MiniCPM4: "The capital of France is" -> " The capital of France is"),
         // which is visible in 1bit serve's output.
-        if (!out.empty() && out[0] == ' ') out.erase(0, 1);
+        if (strip_dummy_prefix && !out.empty() && out[0] == ' ') out.erase(0, 1);
         return out;
     }
     std::string out;

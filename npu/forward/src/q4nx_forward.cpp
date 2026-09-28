@@ -924,6 +924,19 @@ bool Q4nxNpuForward::load_layer(int l) {
         if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
         if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
         if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        // Optional shared expert (qwen35moe): a 2D [expert_im][H] / [H][expert_im] pair
+        // plus its [H] gate.  Cleared when absent (qwen3moe has none).
+        auto load_share = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+        };
+        if (!load_share("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) share_g_.clear();
+        if (!load_share("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_share("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
         return true;
     }
     if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
@@ -1001,6 +1014,54 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         }
         return true;
     };
+    if (n_expert_ > 0) {
+        // qwen35moe: a GDN layer's FFN is MoE, not a dense gate/up/down.  The
+        // loading mirrors the standard path's MoE branch; the FFN itself is run by
+        // the common MLP section (which sees n_expert_ > 0 and calls moe_mlp).
+        char nm2[160];
+        auto td2 = [&](const char* fmt) -> TensorDesc* {
+            snprintf(nm2, sizeof(nm2), fmt, l);
+            return model_tensor_by_name(mw_, nm2);
+        };
+        auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!p) return false;
+            v.resize((size_t)n);
+            for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
+            return true;
+        };
+        if (!load_bf16_opt("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H))
+            { err_ = "moe router"; return false; }
+        if (!load_bf16_opt("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_))
+            moe_router_b_.clear();
+        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw) return false;
+            *p = raw; *bytes = (size_t)d->data_size / (size_t)n_expert_;
+            return true;
+        };
+        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        // Optional shared expert (qwen35moe): a 2D [expert_im][H] / [H][expert_im] pair
+        // plus its [H] gate.  Cleared when absent.
+        auto load_share = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+        };
+        if (!load_share("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) share_g_.clear();
+        if (!load_share("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_share("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
+        return true;
+    }
     if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, H)) return false;
     if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, H)) return false;
     if (!deqT(&lw->down_proj_weight, wd_.data(), H, c_.IM)) return false;
@@ -1585,7 +1646,15 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
                             "shexp_swiglu=%.6f\n", l, moe_g, moe_u, moe_sw, moe_dn, moe_d_sum, ss);
         }
         for (float f : sd) shexp_sum += f;
-        for (int i = 0; i < H; i++) d[i] += sd[i];
+        // Qwen MoE (qwen35moe) gates the shared expert with sigmoid(x . g), a [H]
+        // vector; deepseek2 has no such gate (share_router_ empty -> scale 1).
+        float sgate = 1.0f;
+        if (!share_router_.empty()) {
+            float g = 0.0f;
+            for (int i = 0; i < H; i++) g += share_router_[i] * xn[i];
+            sgate = 1.0f / (1.0f + std::exp(-g));
+        }
+        for (int i = 0; i < H; i++) d[i] += sgate * sd[i];
     }
     if (dump) {
         double tot = 0; for (float f : d) tot += f;

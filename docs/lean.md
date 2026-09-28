@@ -177,6 +177,32 @@ because an MoE spends almost all of its prompt compute in the experts. The accur
 about the dense model's: KLD 0.048 to 0.081 (27B: 0.029 to 0.055). Without the rotation, W4A4
 costs almost twice as much (0.137). Decode does not use W4A4 and does not change.
 
+The gain depends on how much of the model's prompt time is in the experts. Same method, from
+each model's Q8_0:
+
+| Q4_0, rotated | Route | pp512 | pp2048 | tg128 | PPL | Mean KLD | Same top token |
+|---|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B (Q8_0 PPL 5.825; 401 tensors, 18,832 MiB) | exact int8 | 1,454 | 1,408 | 63.3 | 5.981 | 0.046 | 90.6% |
+| | W4A4 on attention only | 1,514 | 1,478 | 64.0 | 6.032 | 0.058 | 89.6% |
+| | **W4A4 on attention and experts** | **1,616** | **1,579** | 63.9 | 6.117 | **0.077** | **88.0%** |
+| GLM-4.7-Flash (Q8_0 PPL 10.41; 562 tensors, 16,171 MiB) | exact int8 | 904 | 853 | 58.6 | 7.973 | 0.528 | 83.1% |
+| | W4A4 on attention only | 1,029 | 861 | 61.3 | 8.130 | 0.550 | 81.3% |
+| | **W4A4 on attention and experts** | **1,599** | **1,239** | 61.9 | 8.455 | **0.587** | **79.3%** |
+
+Qwen3.6-35B-A3B gains only about 11%: most of its layers are delta-net layers, whose prompt
+work does not run through a Q4_0 matmul. GLM-4.7-Flash (DeepSeek-2 layout, MLA attention; the
+tool rotates the MLA projections `attn_q_a`, `attn_q_b`, `attn_kv_a_mqa`, `attn_kv_b`,
+`attn_k_b`, `attn_v_b`) gains 77% at pp512, and W4A4 adds KLD 0.06, as on the Qwen models.
+
+GLM-4.7-Flash does not take plain Q4_0 well, W4A4 or not. A plain, unrotated Q4_0 on the exact
+path already scores KLD 0.493 against the Q8_0; any single group of tensors at Q4_0 (the
+experts, the attention, or the shared expert, dense layer and embedding) costs about 0.14 on its
+own. Its wikitext perplexity drops under Q4_0 (10.41 to 7.97-8.73) because the output
+distribution flattens, so perplexity alone reads this model the wrong way round. The Q8_0
+reference is sound: it gives PPL 10.44 on upstream HIP and 11.01 on Vulkan, and KLD 0.015
+across backends. For GLM-4.7-Flash, use a higher-precision file; the W4A4 route is not worth its
+accuracy there until the Q4_0 base is better.
+
 The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
 +1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through
 `1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` (no device flag: the stamp picks the route), a

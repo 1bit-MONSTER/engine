@@ -58,5 +58,8 @@ if [ "$(uname)" = Linux ]; then
     check "no backend outlives serve (SIGKILL)" '! kill -0 "$child" 2>/dev/null'
 fi
 
+both=$("$bin" serve -m "$scratch/tiny.gguf" --device vulkan --mtp a.gguf --dflash b.gguf 2>&1); both_rc=$?
+check "--mtp with --dflash is refused" '[ "$both_rc" != 0 ] && [[ "$both" == *"pick one"* ]]'
+
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo FAIL; exit 1; fi
 echo PASS

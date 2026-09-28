@@ -192,11 +192,25 @@ def main():
         os.path.join(here, os.pardir, os.pardir, "np-model-generic", "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER", "third_party", "FLM_Q4NX_Converter"),
+        os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER-iso-build", "third_party", "FLM_Q4NX_Converter"),
         "/home/bcloud/wt/twostream-main/third_party/FLM_Q4NX_Converter",
     ]
     default_converter = os.environ.get("ONEBIT_Q4NX_CONVERTER") or next(
         (os.path.abspath(p) for p in candidates if os.path.exists(os.path.join(p, "convert.py"))), "")
     converter_dir = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else default_converter)
+
+    def pick_converter(arch):
+        # Prefer a checkout that has a module for THIS arch.  The canonical
+        # np-model-generic converter has no deepseek2 module, while the
+        # iso-build checkout does -- it is what built the GLM-4.7-Flash Q4NX the
+        # forward's MLA+MoE path was validated against (" Paris, France.").
+        if arch:
+            for p in candidates:
+                ap = os.path.abspath(p)
+                if os.path.exists(os.path.join(ap, "convert.py")) and \
+                   os.path.exists(os.path.join(ap, "q4nx", "models", str(arch) + ".py")):
+                    return ap
+        return None
 
     # Provenance stamp.  The dir cache cannot tell which converter produced a dir
     # (`model.q4nx` existence is all it checks), and the ¬declared-vs-carried scan
@@ -218,6 +232,16 @@ def main():
             print(f"stamp: none at {stamp_path} (dir predates the stamp)")
             return 1
         got = dict(l.rstrip("\n").split("=", 1) for l in open(stamp_path) if "=" in l)
+        # Re-resolve with the directory's own arch so a dir whose arch needs a
+        # different converter keeps comparing against the right one.
+        try:
+            _a = json.load(open(os.path.join(sys.argv[2], "config.json"))).get("model_type", "")
+        except Exception:
+            _a = ""
+        if not os.environ.get("ONEBIT_Q4NX_CONVERTER"):
+            _picked = pick_converter(_a)
+            if _picked:
+                converter_dir = _picked
         if not os.path.exists(os.path.join(converter_dir, "convert.py")):
             print(f"stamp: cannot tell, converter unresolved ('{converter_dir}')")
             return 2
@@ -259,6 +283,12 @@ def main():
     if isinstance(_arch, bytes):
         _arch = _arch.decode()
     _arch = str(_arch)
+    if not os.environ.get("ONEBIT_Q4NX_CONVERTER") and len(sys.argv) <= 3:
+        _picked = pick_converter(_arch)
+        if _picked and _picked != converter_dir:
+            print(f"repack: {_arch} has no module in {converter_dir}; using {_picked}")
+            converter_dir = _picked
+            run_dir = converter_dir
     _cfg = os.path.join(converter_dir, "configs", _arch + ".json")
     if _arch and os.path.exists(_cfg):
         try:

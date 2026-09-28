@@ -178,6 +178,7 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir, bool use_elf) {
     if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
+    if (getenv("NPU_NO_WCACHE")) weight_cache_ = false;   // A/B: disable the packed-weight cache
     dev_ = dev;
 
     // ---- config.json FIRST, then model_load ----

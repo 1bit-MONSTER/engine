@@ -81,6 +81,10 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
 
     cfg = {
         "model_type": ARCH_TO_MODEL_TYPE.get(arch, arch),
+        # The GGUF arch (e.g. qwen35moe) differs from the HF model_type
+        # (qwen3_5_moe); the stamp check re-resolves the converter by arch, so
+        # carry it explicitly.
+        "arch": arch,
         "hidden_size": embedding,
         "num_hidden_layers": int(_num(reader, f"{p}.block_count", 0)),
         "num_attention_heads": heads,
@@ -272,7 +276,8 @@ def main():
         # Re-resolve with the directory's own arch so a dir whose arch needs a
         # different converter keeps comparing against the right one.
         try:
-            _a = json.load(open(os.path.join(sys.argv[2], "config.json"))).get("model_type", "")
+            _c = json.load(open(os.path.join(sys.argv[2], "config.json")))
+            _a = _c.get("arch") or _c.get("model_type", "")
         except Exception:
             _a = ""
         if not os.environ.get("ONEBIT_Q4NX_CONVERTER"):

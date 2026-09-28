@@ -58,7 +58,10 @@ ROLES = ("attn_qkv", "attn_gate", "attn_q", "attn_k", "attn_v", "attn_output",
          # MoE: the routed experts (one [experts, rows, K] stack each, rotated along K like any
          # matmul weight) and the shared expert; the router (ffn_gate_inp) is not quantized
          "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
-         "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp")
+         "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp",
+         # MLA (DeepSeek-2 family: GLM-4.7-Flash, ...): the query and KV low-rank projections
+         # and the per-head K/V expansions
+         "attn_q_a", "attn_q_b", "attn_kv_a_mqa", "attn_kv_b", "attn_k_b", "attn_v_b")
 ROT = re.compile(r"^blk\.\d+\.(" + "|".join(ROLES) + r")\.weight$")
 
 H = np.array([[1.0]])

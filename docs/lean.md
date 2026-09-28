@@ -16,7 +16,8 @@ limitations under the License.
 -->
 # The lean option: ROCmFP4, ROCmI4 and Hadamard Q4_0
 
-`1bit serve --lean` trades accuracy for speed. It runs models in the AMD-focused
+`1bit serve --lean` trades a little accuracy for speed: with a Hadamard-rotated file it reads
+Qwen3.8-27B prompts at 509 tok/s, against about 400 on the exact path. It runs models in the AMD-focused
 formats of [ROCmFPX](https://github.com/charlie12345/ROCmFPX) (MIT), a llama.cpp fork
 that upstream llama.cpp cannot read, so the lean route has its own tree:
 `third_party/llama.cpp-rocmfpx`, pinned to a commit measured on Strix Halo.

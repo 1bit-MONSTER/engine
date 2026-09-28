@@ -14,16 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# fetch-laya.sh <dir>
+# fetch-laya.sh [<dir>]
 #
 # Downloads the Laya checkpoints pinned in config/laya.json (one Hugging Face
 # revision holding all three: root, multilingual/, typed-decisions/) into
-# <dir>, and checks every file against the Hub's list for that revision:
+# <dir> (default: ${XDG_DATA_HOME:-~/.local/share}/1bit/laya, where `1bit serve --laya`
+# looks), and checks every file against the Hub's list for that revision:
 # sha256 for LFS files (the weights), the git blob id for the small ones.
 # Images and the eval plots are skipped. Files already present and correct are
 # not downloaded again.
 set -euo pipefail
-dir=${1:?usage: fetch-laya.sh <dir>}
+dir=${1:-${XDG_DATA_HOME:-$HOME/.local/share}/1bit/laya}
+echo "fetch-laya: into $dir"
 root=$(cd "$(dirname "$0")/.." && pwd)
 mkdir -p "$dir"
 python3 - "$root/config/laya.json" "$dir" <<'PYEOF'

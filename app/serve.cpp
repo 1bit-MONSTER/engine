@@ -47,6 +47,8 @@
 //                                                  the gfx1151 W4A4 path; docs/lean.md)
 //   a .gguf, --lean                             -> the lean build's llama-server (ROCmFPX's
 //                                                  formats) on Vulkan0 (docs/lean.md)
+//   --laya with --device auto                   -> Laya classifies each conversation and the route
+//                                                  policy picks the device (RFC #186, docs/laya.md)
 //   --mtp <head.gguf> on any llama.cpp route    -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
 //   --dflash <draft.gguf> on any llama.cpp route -> a DFlash block-diffusion draft model
@@ -73,6 +75,7 @@
 #include "unified.h"
 #endif
 #ifdef ONEBIT_LAYA
+#include "policy.h"
 #include "route.h"
 #include "scorer.h"
 #endif
@@ -91,6 +94,8 @@
 #include <filesystem>
 #include <memory>
 #include <mutex>
+#include <unordered_map>
+#include <deque>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -149,6 +154,8 @@ struct Options {
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
+    bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
+    std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -738,6 +745,51 @@ const std::vector<std::string> kGgufDevices = {"vulkan", "hrx", "zinc"};
 
 // The text the Laya scorer routes on: a completion's prompt, or a chat request's messages
 // joined the way the request reads.
+// A conversation's identity for the Laya class cache: the messages up to and including the
+// first user message (the system prompt and the opening request stay the same on every turn),
+// or the whole prompt for /v1/completions.
+size_t conversation_key(const httplib::Request& req) {
+    json body;
+    try {
+        body = json::parse(req.body);
+    } catch (const std::exception&) {
+        return std::hash<std::string>{}(req.body);
+    }
+    std::string head;
+    if (body.contains("messages") && body["messages"].is_array()) {
+        for (const auto& m : body["messages"]) {
+            if (!m.is_object()) continue;
+            const std::string role = m.value("role", "");
+            head += role + ":" + (m.contains("content") ? m["content"].dump() : "") + "\n";
+            if (role == "user") break;
+        }
+    } else if (body.contains("prompt")) {
+        head = body["prompt"].dump();
+    }
+    return std::hash<std::string>{}(body.value("model", "") + "\n" + head);
+}
+
+#ifdef ONEBIT_LAYA
+// The Laya checkpoint for --laya-model DIR, or for --laya: $ONEBIT_LAYA_MODEL, else
+// ${XDG_DATA_HOME:-~/.local/share}/1bit/laya (where scripts/fetch-laya.sh installs it). A
+// directory holding the pinned repo's typed-decisions/ checkpoint uses that one: it classifies
+// requests best (95.5% against 92.0% for the root checkpoint, tests/laya_classify_eval).
+std::string laya_checkpoint(const std::string& given) {
+    namespace fs = std::filesystem;
+    std::string dir = given;
+    if (dir.empty()) {
+        if (const char* e = std::getenv("ONEBIT_LAYA_MODEL"); e && *e) dir = e;
+        else if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) dir = std::string(x) + "/1bit/laya";
+        else if (const char* h = std::getenv("HOME"); h && *h) dir = std::string(h) + "/.local/share/1bit/laya";
+    }
+    if (dir.empty() || !fs::is_directory(dir))
+        throw std::runtime_error("laya: no checkpoint at " + (dir.empty() ? std::string("~/.local/share/1bit/laya") : dir) +
+                                 " (install it with scripts/fetch-laya.sh, or pass --laya-model DIR)");
+    if (fs::exists(fs::path(dir) / "typed-decisions" / "model.safetensors")) return (fs::path(dir) / "typed-decisions").string();
+    return dir;
+}
+#endif
+
 std::string request_state(const httplib::Request& req) {
     json body;
     try {
@@ -766,18 +818,26 @@ std::string request_state(const httplib::Request& req) {
 
 int serve_child(const Options& o) {
     std::vector<Launch> backends;
-    // --laya-model with --device auto: each request goes to the device the Laya scorer picks
-    // among the ones this build can run a .gguf on; a device's backend starts when it is
-    // first picked (one model is not loaded on every device at once)
-    const bool laya = !o.laya_model.empty() && o.device == "auto";
+    // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
+    // (code, prose, short, long_doc; laya/route.h) and the route policy (config/route-policy.json
+    // or --route-policy) maps the class to one of the devices this build can run the .gguf on.
+    // A device's backend starts when it is first picked (one model is not loaded on every
+    // device at once). Opt-in: the built-in policy sends every class to Vulkan until a row
+    // shows a measured net gain.
+    const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto";
 #ifdef ONEBIT_LAYA
     std::unique_ptr<onebit::laya::Scorer> scorer;
     std::vector<std::string> laya_devices;
+    onebit::laya::RoutePolicy policy;
     if (laya) {
         if (o.adaptive || !o.role.empty() || !o.prefill_device.empty() || o.lean)
-            throw std::runtime_error("--laya-model does not combine with --adaptive, --embedding/--reranking, --prefill-device or --lean");
+            throw std::runtime_error("--laya does not combine with --adaptive, --embedding/--reranking, --prefill-device or --lean");
+        const std::string ckpt = laya_checkpoint(o.laya_model);
+        policy = onebit::laya::load_route_policy(o.route_policy);
         scorer = std::make_unique<onebit::laya::Scorer>();
-        if (!scorer->load(o.laya_model)) throw std::runtime_error("laya: " + scorer->error());
+        if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
+        std::fprintf(stderr, "1bit serve: laya: checkpoint %s, policy %s\n", ckpt.c_str(),
+                     o.route_policy.empty() ? "built in" : o.route_policy.c_str());
         for (const std::string& dev : kGgufDevices) {
             try {
                 backends.push_back(launch_for(o, dev, free_port()));
@@ -873,6 +933,11 @@ int serve_child(const Options& o) {
     std::vector<std::atomic<int>> inflight(backends.size());
     std::vector<std::atomic<long>> routed(backends.size());
     std::mutex route_mu;
+#ifdef ONEBIT_LAYA
+    std::mutex scorer_mu, class_mu;
+    std::unordered_map<size_t, onebit::laya::RequestClass> class_cache;  // conversation -> class
+    std::deque<size_t> class_order;
+#endif
     auto post = [&](const httplib::Request& q, httplib::Response& r) {
         if (!ready) {
             r.status = 503;
@@ -885,13 +950,42 @@ int serve_child(const Options& o) {
         size_t pick = 0;
 #ifdef ONEBIT_LAYA
         if (laya) {
-            const std::string dev = onebit::laya::route_device(*scorer, request_state(q), laya_devices);
+            // one decision per conversation: later turns reuse the class of the first
+            const size_t key = conversation_key(q);
+            onebit::laya::RequestClass cls;
+            bool fresh = false;
+            {
+                std::lock_guard<std::mutex> lock(class_mu);
+                if (const auto c = class_cache.find(key); c != class_cache.end()) cls = c->second;
+            }
+            if (cls.label.empty()) {
+                std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
+                cls = onebit::laya::classify_request(*scorer, request_state(q));
+                fresh = true;
+            }
+            if (cls.label.empty()) {
+                r.status = 502;
+                r.set_content(R"({"error":{"message":"laya routing failed"}})", "application/json");
+                return;
+            }
+            if (fresh) {
+                std::lock_guard<std::mutex> lock(class_mu);
+                if (class_cache.size() >= 4096) {  // oldest conversation first
+                    class_cache.erase(class_order.front());
+                    class_order.pop_front();
+                }
+                if (class_cache.emplace(key, cls).second) class_order.push_back(key);
+            }
+            const std::string dev = policy.pick(cls.label, cls.confidence, laya_devices);
             const auto it = std::find(laya_devices.begin(), laya_devices.end(), dev);
             if (it == laya_devices.end()) {
                 r.status = 502;
                 r.set_content(R"({"error":{"message":"laya routing failed"}})", "application/json");
                 return;
             }
+            char route_hdr[96];
+            std::snprintf(route_hdr, sizeof route_hdr, "%s %.2f %s", cls.label.c_str(), cls.confidence, dev.c_str());
+            if (fresh) std::fprintf(stderr, "1bit serve: laya: %s\n", route_hdr);
             pick = size_t(it - laya_devices.begin());
             if (!ensure(pick)) {
                 r.status = 503;
@@ -901,6 +995,7 @@ int serve_child(const Options& o) {
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
             forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r);
+            r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
 #endif
@@ -1212,7 +1307,8 @@ void usage(FILE* out) {
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
-                 "                  [--laya-model DIR]   with --device auto, the Laya scorer picks each request's device (docs/laya.md)\n"
+                 "                  [--laya | --laya-model DIR] [--route-policy FILE]   with --device auto, Laya classifies\n"
+                 "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
@@ -1264,6 +1360,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
         else if (a == "--laya-model") o.laya_model = next();
+        else if (a == "--laya") o.laya_auto = true;
+        else if (a == "--route-policy") o.route_policy = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// laya_classify_eval <checkpoint_dir> <cases.json> [--limit N]
+// laya_classify_eval <checkpoint_dir> <cases.json> [--limit N] [--min-accuracy PERCENT]
 // Scores every labelled request (tests/laya_route_cases.json) with the request-class question
 // (laya/route.h, request_class_question) and prints accuracy, the confusion matrix, per-class
 // accuracy and accuracy by confidence band, plus the decision time. RFC #186.
@@ -36,8 +36,11 @@ int main(int argc, char** argv) {
         return 2;
     }
     int limit = 1 << 30;
-    for (int i = 3; i + 1 < argc; ++i)
+    double min_accuracy = 0;  // ctest laya_classify fails below it
+    for (int i = 3; i + 1 < argc; ++i) {
         if (std::string(argv[i]) == "--limit") limit = std::atoi(argv[i + 1]);
+        if (std::string(argv[i]) == "--min-accuracy") min_accuracy = std::atof(argv[i + 1]);
+    }
     onebit::laya::Scorer scorer;
     if (!scorer.load(argv[1])) {
         std::fprintf(stderr, "load: %s\n", scorer.error().c_str());
@@ -88,5 +91,9 @@ int main(int argc, char** argv) {
                     100.0 * h / std::max<size_t>(1, b - a));
     }
     std::printf("\n");
+    if (100.0 * ok / std::max(1, n) < min_accuracy) {
+        std::printf("FAIL: below the %.1f%% floor\n", min_accuracy);
+        return 1;
+    }
     return 0;
 }

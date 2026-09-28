@@ -295,6 +295,8 @@ target_link_libraries(onebit PRIVATE onebit_laya)
 target_compile_definitions(onebit PRIVATE ONEBIT_LAYA)
 
 add_executable(laya_gate tests/laya_gate.cpp)
+add_executable(laya_classify_eval tests/laya_classify_eval.cpp)
+target_link_libraries(laya_classify_eval PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 target_link_libraries(laya_gate PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 # Each pinned checkpoint gates against its own golden.json from the Python reference.
 set(ONEBIT_LAYA_ROOT "" CACHE PATH "Root Laya checkpoint dir (model.safetensors + tokenizer/tokenizer.json)")

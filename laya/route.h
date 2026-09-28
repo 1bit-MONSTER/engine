@@ -39,4 +39,30 @@ std::vector<Question> routing_question(const std::vector<std::string>& devices);
 // scorer.
 std::string route_device(Scorer& scorer, const std::string& state, const std::vector<std::string>& devices);
 
+// ── Request classes (RFC #186) ──────────────────────────────────────────────
+// Laya knows nothing about the hardware, so asking it for a device does not work (it picked
+// zinc for every request). It classifies the request instead, and a measured policy
+// (config/route-policy.json) maps the class to a device and settings.
+
+// Requests of at least this many characters are long_doc without asking the model (pasted
+// documents, logs, tables, files: about 256 tokens and up).
+constexpr size_t kLongDocChars = 1024;
+
+// The class keys, in the order of the class question's options.
+const std::vector<std::string>& request_classes();
+
+// The request-class question. `variant` selects a wording (0 = the one serve uses; the
+// others are kept for tests/laya_classify_eval, ONEBIT_LAYA_CLASS_VARIANT).
+Question request_class_question(int variant = 0);
+
+struct RequestClass {
+    std::string label;        // one of request_classes(), empty when the scorer failed
+    float confidence = 0.0f;  // Laya's calibrated confidence, 1 - H(p)/log(k)
+    std::vector<std::pair<std::string, float>> probabilities;
+};
+
+// Classifies `state` (the request text). The wording comes from ONEBIT_LAYA_CLASS_VARIANT
+// when set, else variant 0.
+RequestClass classify_request(Scorer& scorer, const std::string& state);
+
 }  // namespace onebit::laya

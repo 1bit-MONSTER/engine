@@ -54,7 +54,10 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > family (Zamba, Zamba2, BlackMamba) runs on Vulkan too, and so do its vision models, ZAYA1-VL-8B
 > and Zamba2-VL, through `1bit serve --mmproj`. Qwen3.8-27B runs in one ROCm server with Hadamard
 > W4A4 prompt processing and DFlash2 decode: 445 tok/s on a 1,838-token prompt and 40.9 tok/s
-> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). Experimental,
+> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). W4A4 covers MoE
+> experts too, and `1bit serve --long-model` sends long prompts there and short ones to Vulkan: on
+> Qwen3-Coder-30B-A3B a 16K-token prompt gets its answer at 13.1 effective tok/s against 8.6 on
+> Vulkan alone, first token 11 s sooner ([docs/serve.md](docs/serve.md#short-and-long-prompts---long-model)). Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
 > has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per

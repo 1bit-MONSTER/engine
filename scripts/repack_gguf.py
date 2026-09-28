@@ -144,6 +144,27 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
             "expert_weights_scale": float(_num(reader, f"{p}.expert_weights_scale", 1.0)),
             "expert_gating_func": 1,   # Qwen MoE gating = softmax
         })
+        if p == "qwen35moe":
+            # GDN (linear attention) geometry + the layer-type list the forward
+            # dispatches on.  The HF config names these linear_*; the GGUF carries
+            # them under ssm.*.  attn_output_gate makes the q_proj emit q|gate
+            # (q_rows doubles), which the QKV design must know.
+            def _ssm(key, dflt=0):
+                return int(_num(reader, f"{p}.ssm.{key}", dflt))
+            _vhd = _ssm("state_size")
+            _inner = _ssm("inner_size")
+            _fai = int(_num(reader, f"{p}.full_attention_interval", 4)) or 4
+            _nl = int(cfg["num_hidden_layers"])
+            cfg.update({
+                "linear_num_key_heads": _ssm("group_count"),
+                "linear_key_head_dim": _vhd,
+                "linear_value_head_dim": _vhd,
+                "linear_num_value_heads": (_inner // _vhd) if _vhd else 0,
+                "linear_conv_kernel_dim": _ssm("conv_kernel", 4),
+                "attn_output_gate": 1,
+                "layer_types": ["full_attention" if (i % _fai == _fai - 1) else "linear_attention"
+                                for i in range(_nl)],
+            })
     # MiniCPM4 architecture scales.  The forward must apply them: the embedding
     # is scaled by 12.0 and every residual branch by scale_depth/sqrt(NL)
     # (0.2475 for 32 layers); without them the hidden state runs at the wrong

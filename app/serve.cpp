@@ -731,6 +731,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // default draft length is 3, and it clamps a longer one to the drafter's trained block
         else if (!o.dflash.empty()) argv.insert(argv.end(), {"--spec-draft-n-max", "16"});
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
+        // a DFlash block is kept whole unless --mtp-p-min says otherwise: upstream's default p-min
+        // is 0, the ROCm tree's is 0.75, which cuts DFlash2 blocks from 6.7 to 5.4 tokens a step
+        else if (!o.dflash.empty()) argv.insert(argv.end(), {"--spec-draft-p-min", "0"});
     }
     if (!o.mmproj.empty()) {
         if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");

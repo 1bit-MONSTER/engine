@@ -183,6 +183,11 @@ short answers (the translation prompt stops after ~16 tokens, too few to fill bl
 drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A drafted token is
 kept only when the model agrees, so the output is the model's own.
 
+`--dflash` also works on the lean ROCm route: a Hadamard-rotated Q4_0 file gets W4A4 prompt
+processing and DFlash2 decode from one server, 445 t/s prompt and 40.9 / 26.8 tok/s decode
+([lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). `--dflash` sets
+`--spec-draft-p-min 0` unless `--mtp-p-min` is given.
+
 ## MoE models larger than memory (`--moe-slots`)
 
 `--moe-slots N` (with `--device vulkan`) keeps a MoE model's routed experts in the file and

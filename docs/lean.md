@@ -159,10 +159,35 @@ each state column's rows in registers and stages the per-token inputs in shared 
 tiled transpose for the concatenation that feeds the delta-net convolution. Both pass
 `test-backend-ops` against the CPU (GATED_DELTA_NET 42/42, CONCAT 129/129).
 
-**Decode.** This route prefills; it does not decode fast. The ROCm build decodes Qwen3.8-27B at
-about 11 tok/s without drafting, and its MTP drafting slowed prompt processing badly in our
-runs. For decode-heavy work use `--device vulkan --dflash` ([serve.md](serve.md)): 45.7 tok/s on
-code.
+**One server: W4A4 prompts and DFlash2 decode.** Without a drafter this route decodes
+Qwen3.8-27B at about 13 tok/s. With the DFlash2 drafter ([serve.md](serve.md#dflash-draft-models---dflash))
+the same server decodes three times faster and keeps most of the prompt speed:
+
+```sh
+1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf --dflash Qwen3.8-27B-DFlash2-q8_0.gguf
+```
+
+The ROCmFPX pin carries upstream's DFlash2 support (ggml-org/llama.cpp#27816, ported in
+ROCmFPX#2), a HIP top-k that keeps the drafter's 248k-vocabulary candidate pick on the GPU (it
+fell back to the CPU before: 11 tok/s instead of 28), and bounded recurrent-state rollback for
+DFlash, so a partly accepted block rewinds the delta-net state instead of restoring a checkpoint
+and replaying. `serve` passes `--spec-draft-p-min 0` with `--dflash`: this tree's default of 0.75
+cut DFlash2 blocks from 6.7 to 5.4 tokens a step.
+
+Measured through `1bit serve` on Strix Halo, 2026-09-28, quiet box: the 1,838-token prompt (best
+/ median of 5, as `serve` reports it, context checkpoints included) and 256 tokens of greedy
+decode on the code / prose / short prompts of [serve.md](serve.md) (best of 3):
+
+| Qwen3.8-27B-Q4_0-H32, lean ROCm route | Prompt t/s | Decode tok/s |
+|---|---|---|
+| no drafter | 502 / 500 | 13.0 / 13.0 / 13.4 |
+| `--dflash` (DFlash2 Q8_0) | 445 / 439 | **40.9** / **26.8** / 13.7 |
+
+Mean accepted block: 6.71 tokens on code, 4.11 on prose, the same as upstream on this drafter.
+Greedy output matches the no-drafter run on the code and short prompts; on prose one near-tie
+word flips after 470 characters (batched verification rounds differently). The drafter costs the
+prompt about 0.5 s on this prompt: its encoder reads the model's hidden states for every prompt
+token (0.13 s), and the context checkpoints grow by the drafter's sliding-window cache.
 
 ## Build
 

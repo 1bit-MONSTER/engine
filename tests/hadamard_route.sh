@@ -19,7 +19,9 @@
 #   - --device vulkan refuses it,
 #   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_Q4_0_HADAMARD=1 and
 #     GGML_W4A4_TENSORS=all in the backend's environment,
-#   - an unstamped file with --device auto still goes to Vulkan with neither variable.
+#   - an unstamped file with --device auto still goes to Vulkan with neither variable,
+#   - --dflash on a rotated file adds the DFlash drafter with full blocks (n-max 16, p-min 0):
+#     one ROCm server, W4A4 prompt processing and DFlash2 decode.
 #
 # usage: tests/hadamard_route.sh path/to/1bit
 set -uo pipefail
@@ -42,6 +44,7 @@ def gguf(path, stamp):
     open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
 gguf(sys.argv[1] + "/h32.gguf", True)
 gguf(sys.argv[1] + "/plain.gguf", False)
+gguf(sys.argv[1] + "/draft.gguf", False)
 PY
 
 # a backend that records how it was started, then answers /health
@@ -66,11 +69,11 @@ refused=$(env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS "$bin" serve -m "$scrat
     --port 1 --llama-server "$scratch/backend.py" 2>&1)
 check "--device vulkan refuses a rotated file" '[[ "$refused" == *"Hadamard-rotated"* ]]'
 
-run() {  # <model> <record>: serve with --device auto until the backend has recorded its start
+run() {  # <model> <record> [serve args]: serve with --device auto until the backend has recorded its start
     local port
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
     env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS RECORD="$2" "$bin" serve -m "$1" --device auto --port "$port" \
-        --llama-server "$scratch/backend.py" >"$2.log" 2>&1 &
+        --llama-server "$scratch/backend.py" "${@:3}" >"$2.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$2" ] && break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
@@ -85,6 +88,13 @@ check "  and GGML_W4A4_TENSORS=all" '[ "$(field "$scratch/h32.json" "r[\"env\"].
 run "$scratch/plain.gguf" "$scratch/plain.json"
 check "an unstamped file still goes to Vulkan0" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = Vulkan0 ]'
 check "  with neither variable" '[ "$(field "$scratch/plain.json" "sorted(r[\"env\"])")" = "[]" ]'
+
+run "$scratch/h32.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"
+after() { field "$scratch/df.json" "r[\"argv\"][r[\"argv\"].index(\"$1\")+1]"; }
+check "--dflash on a rotated file stays on ROCm0" '[ "$(after --device)" = ROCm0 ]'
+check "  with the DFlash drafter" '[ "$(after --spec-type)" = draft-dflash ] && [ "$(after -md)" = "$scratch/draft.gguf" ]'
+check "  full blocks: n-max 16, p-min 0" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0 ]'
+check "  and the Hadamard W4A4 environment" '[ "$(field "$scratch/df.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

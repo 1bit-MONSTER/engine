@@ -143,11 +143,13 @@ convaiinnovations/laya, pinned in config/laya.json)
   Copyright Convai Innovations
   License: Apache-2.0
 
-ggmlc (third_party/ggmlc; its laya runtime is the router's GGUF scorer)
+ggmlc (third_party/ggmlc = our fork 1bit-MONSTER/ggmlc; its laya runtime is the router's
+GGUF scorer, built on third_party/llama.cpp's ggml with HRX)
   https://github.com/monatis/ggmlc
   Copyright the ggmlc authors (monatis)
   License: MIT (declared in its pyproject.toml and README; the repository has no LICENSE file)
-  Vendors GGML (third_party/ggmlc/third_party/ggml), Copyright the ggml authors, License: MIT
+  Vendors GGML (third_party/ggmlc/third_party/ggml, not built by the engine), Copyright the ggml
+  authors, License: MIT
 
 Laya typed-decisions GGUF (Hugging Face mys/laya-typed-decisions-GGUF, pinned in
 config/laya.json; compiled by ggmlc from convaiinnovations/laya-typed-decisions)

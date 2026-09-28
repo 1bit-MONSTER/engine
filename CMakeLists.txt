@@ -303,9 +303,9 @@ target_link_libraries(onebit_laya PUBLIC onebit_npu nlohmann_json::nlohmann_json
 # The engine binary gets `1bit route` and per-request routing through the scorer.
 target_link_libraries(onebit PRIVATE onebit_laya)
 target_compile_definitions(onebit PRIVATE ONEBIT_LAYA)
-# Off by default (it needs the Vulkan SDK): ggmlc's laya runs the pinned Laya GGUF on Vulkan,
-# 22 ms a routing decision instead of about 380 ms on the CPU scorer, same accuracy (docs/laya.md).
-option(ONEBIT_LAYA_GGML "Build ggmlc's laya (Vulkan) as the router's scorer" OFF)
+# Off by default (it needs TheRock and the HRX submodules): ggmlc's laya runs the pinned Laya GGUF
+# on HRX0, 25 ms a routing decision (15 at a steady length) instead of about 540 ms on the CPU scorer, same accuracy (docs/laya.md).
+option(ONEBIT_LAYA_GGML "Build ggmlc's laya (HRX) as the router's scorer" OFF)
 if(ONEBIT_LAYA_GGML)
     include(cmake/laya-ggml.cmake)
     add_dependencies(onebit laya_ggml)

@@ -833,11 +833,12 @@ std::string laya_checkpoint(const std::string& given) {
     return dir;
 }
 
-// The router's fast scorer: ggmlc's laya (third_party/ggmlc, -DONEBIT_LAYA_GGML=ON) on GGML's
-// Vulkan backend with the typed-decisions checkpoint compiled to a GGUF (mys/laya-typed-decisions-
-// GGUF, pinned in config/laya.json, fetched by scripts/fetch-laya.sh into <laya dir>/gguf/).
-// Q8_0 classifies tests/laya_route_cases.json as well as the C++ scorer on the safetensors (95.5%)
-// in 22 ms a decision instead of about 380 ms. Used when the binary and the GGUF are both there.
+// The router's fast scorer: ggmlc's laya (our fork, third_party/ggmlc, -DONEBIT_LAYA_GGML=ON) on
+// HRX0, AMD's backend, built against third_party/llama.cpp's ggml (its HRX kernels for ModernBERT,
+// fork #31), with the typed-decisions checkpoint compiled to a GGUF (mys/laya-typed-decisions-GGUF,
+// pinned in config/laya.json, fetched by scripts/fetch-laya.sh into <laya dir>/gguf/). Q8_0
+// classifies tests/laya_route_cases.json as well as the C++ scorer on the safetensors (95.5%) in
+// 25 ms a decision (15 at a steady 64 tokens) instead of about 540 ms. Used when the binary and the GGUF are both there.
 constexpr const char* kLayaGguf = "laya_typed_decisions_q8_0.gguf";
 
 std::string laya_ggml_bin() {
@@ -866,7 +867,8 @@ std::string laya_gguf(const std::string& given) {
 // log goes to our stderr). Pipes rather than its `serve`, which listens on every interface.
 class LayaDaemon {
 public:
-    explicit LayaDaemon(const std::vector<std::string>& argv) {
+    // env: NAME=VALUE entries set in the daemon's environment (one the user already set wins)
+    explicit LayaDaemon(const std::vector<std::string>& argv, const std::vector<std::string>& env = {}) {
         int in[2], out[2];
         if (::pipe2(in, O_CLOEXEC) != 0 || ::pipe2(out, O_CLOEXEC) != 0)
             throw std::runtime_error(std::string("laya: pipe: ") + std::strerror(errno));
@@ -880,6 +882,10 @@ public:
         if (pid_ == 0) {
             ::prctl(PR_SET_PDEATHSIG, SIGTERM);
             if (::getppid() != parent) ::_exit(127);
+            for (const auto& e : env) {
+                const size_t eq = e.find('=');
+                if (eq != std::string::npos) ::setenv(e.substr(0, eq).c_str(), e.c_str() + eq + 1, 0);
+            }
             ::dup2(in[0], 0);
             ::dup2(out[1], 1);
             ::execvp(args[0], args.data());
@@ -1078,10 +1084,13 @@ int serve_child(const Options& given) {
         const std::string gguf = laya_gguf(o.laya_model), bin = laya_ggml_bin();
 #if defined(__linux__)
         if (!gguf.empty() && !bin.empty()) {
-            // the GGUF scorer on Vulkan (ONEBIT_LAYA_DEVICE picks another: cpu, vulkan:1, ...)
+            // the GGUF scorer on HRX0 (ONEBIT_LAYA_DEVICE picks another: cpu), with the HSA runtime HRX
+            // needs (docs/hrx.md)
             const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
+            std::vector<std::string> env;
+            if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
-                bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "vulkan"});
+                bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
             std::fprintf(stderr, "1bit serve: laya: %s through %s, policy %s\n", gguf.c_str(), bin.c_str(),
                          o.route_policy.empty() ? "built in" : o.route_policy.c_str());
         }

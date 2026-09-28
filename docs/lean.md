@@ -103,6 +103,33 @@ stream uses about 200 of the bus's roughly 256 GB/s, and two different drivers f
 gap better than two copies of one. Each stream slows down, so it pays for serving
 several requests at once (one per backend), not for one chat.
 
+## Experiment: W4A4 on plain Q4_0, with a Hadamard rotation (2026-09-28, not in the engine yet)
+
+ROCmI4's W4A4 kernel can read Unsloth's ordinary Q4_0 files directly: a Q4_0 code `q` means
+`q - 8`, and `q ^ 8` is exactly that as a signed 4-bit value, so the weights stay bit for bit
+what Unsloth shipped and only the activations go to 4 bits. On Qwen3.8-27B that lifts prompt
+processing from ~400 to 461-488 tok/s, but the 4-bit activations cost accuracy: mean KLD 0.084
+against 0.029 for the same file on the exact int8 path. Keeping any one group of tensors
+(`ffn_down`, or the FFN gate and up) on int8 did not help: the error comes from every group.
+
+A 32-point Walsh-Hadamard rotation spreads each block's outliers before the activations are
+rounded to 4 bits. The same rotation is applied to the weights offline, per 32-element block
+along K, so `x . w = (Hx) . (Hw)` and every path stays exact in exact arithmetic: the rotated
+file on the int8 path matches the plain one (KLD 0.031 against 0.029). The rotated file is
+quantized from Unsloth's Q8_0 with Unsloth's imatrix (block means for the rotated tensors), and
+the control is quantized from the same Q8_0 with the same settings.
+
+| Qwen3.8-27B Q4_0, ROCm | pp512 | PPL | Mean KLD | Same top token |
+|---|---|---|---|---|
+| exact int8 | ~400 | 6.021 | 0.029 | 91.9% |
+| W4A4 | 461-488 | 6.241 | 0.084 | 87.4% |
+| **W4A4, Hadamard-rotated** | **503** | **6.096** | **0.055** | **89.3%** |
+
+The rotation cuts the W4A4 error by a third, for +1.2% perplexity against the exact path.
+Storing the 48 layers' small `ssm_alpha` / `ssm_beta` projections as Q4_0 (Unsloth keeps them
+F32) moves them from an f32 GEMM onto the matmul kernel, which is part of the prompt gain.
+KLD is against BF16 logits on wikitext-2 (40 x 512); pp512 from llama-bench, ub 512.
+
 ## Build
 
 ```

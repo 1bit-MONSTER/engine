@@ -49,6 +49,8 @@
 //                                                  formats) on Vulkan0 (docs/lean.md)
 //   --mtp <head.gguf> on any llama.cpp route    -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
+//   --dflash <draft.gguf> on any llama.cpp route -> a DFlash block-diffusion draft model
+//                                                  drafts a block per step (docs/serve.md)
 //   --mmproj <mmproj.gguf> on any llama.cpp route -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
@@ -133,6 +135,7 @@ struct Options {
     int prefill_min_tokens = 0;
     bool lean = false;
     std::string mtp;
+    std::string dflash;  // DFlash block-diffusion draft model for the target
     int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM (-1: auto)
     int moe_prefetch = 0;   // --moe-prefetch N: gate-ahead prefetch N MoE layers ahead (0: off)
     std::string moe_subst;  // --moe-subst R: a resident expert scoring at least R x a missing one takes its place
@@ -600,8 +603,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (device == "onnx") {
         // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
         // the model's genai_config.json
-        if (o.parallel > 1 || !o.mtp.empty() || o.lean || !o.prefill_device.empty() || !o.mmproj.empty())
-            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --lean, --prefill-device or --mmproj");
+        if (o.parallel > 1 || !o.mtp.empty() || !o.dflash.empty() || o.lean || !o.prefill_device.empty() || !o.mmproj.empty())
+            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --dflash, --lean, --prefill-device or --mmproj");
         argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
         return l;
@@ -692,12 +695,19 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
     }
-    if (!o.mtp.empty()) {
-        // the MTP head drafts tokens on the same device; the model checks them in one batch
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mtp works on the llama.cpp devices (vulkan, hrx, rocm)");
+    if (!o.mtp.empty() && !o.dflash.empty()) throw std::runtime_error("--mtp and --dflash are two drafters; pick one");
+    if (!o.mtp.empty() || !o.dflash.empty()) {
+        // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
+        // on the same device; the model checks them in one batch
+        const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
+        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (vulkan, hrx, rocm)");
         l.mtp = true;
-        argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
+        if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
+        else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
+        // DFlash drafts a whole block per step and only pays with full blocks; llama-server's
+        // default draft length is 3, and it clamps a longer one to the drafter's trained block
+        else if (!o.dflash.empty()) argv.insert(argv.end(), {"--spec-draft-n-max", "16"});
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
     if (!o.mmproj.empty()) {
@@ -798,6 +808,7 @@ int serve_child(const Options& o) {
         Options overflow = o;
         overflow.parallel = 16;
         overflow.mtp.clear();       // batched requests gain little from drafting
+        overflow.dflash.clear();
         overflow.llama_server.clear();
         backends.push_back(launch_for(overflow, "rocm", free_port()));
     } else if (!o.role.empty()) {
@@ -807,8 +818,8 @@ int serve_child(const Options& o) {
         const std::string dev = o.device == "auto" ? "vulkan" : o.device;
         if (dev != "vulkan" && dev != "hrx" && dev != "rocm")
             throw std::runtime_error("--" + o.role + " runs on llama-server devices (vulkan, hrx, rocm), not " + dev);
-        if (o.adaptive || !o.mtp.empty() || !o.prefill_device.empty())
-            throw std::runtime_error("--" + o.role + " does not combine with --adaptive, --mtp or --prefill-device");
+        if (o.adaptive || !o.mtp.empty() || !o.dflash.empty() || !o.prefill_device.empty())
+            throw std::runtime_error("--" + o.role + " does not combine with --adaptive, --mtp, --dflash or --prefill-device");
         Launch l = launch_for(o, dev, free_port());
         const std::string batch = std::to_string(o.ctx_size > 0 ? o.ctx_size : 8192);
         for (const std::string& a : {std::string("--") + o.role, std::string("-b"), batch, std::string("-ub"), batch})
@@ -1191,6 +1202,7 @@ void usage(FILE* out) {
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
                  "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
                  "                  [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   stream MoE experts from the file,\n"
                  "                                    N held in RAM (auto: what fits); R: resident experts stand in for missing\n"
                  "                                    ones; prefetch N layers ahead (default 0) (vulkan; docs/moe-streaming.md)\n"
@@ -1233,6 +1245,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
         else if (a == "--lean") o.lean = true;
         else if (a == "--mtp") o.mtp = next();
+        else if (a == "--dflash") o.dflash = next();
         else if (a == "--moe-slots") {
             const std::string v = next();
             o.moe_slots = v == "auto" ? -1 : std::stoi(v);

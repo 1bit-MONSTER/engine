@@ -54,7 +54,11 @@ from gguf import quants  # noqa: E402
 
 STAMP = "onebit.hadamard_q4_0"
 ROLES = ("attn_qkv", "attn_gate", "attn_q", "attn_k", "attn_v", "attn_output",
-         "ffn_gate", "ffn_up", "ffn_down", "ssm_alpha", "ssm_beta")
+         "ffn_gate", "ffn_up", "ffn_down", "ssm_alpha", "ssm_beta",
+         # MoE: the routed experts (one [experts, rows, K] stack each, rotated along K like any
+         # matmul weight) and the shared expert; the router (ffn_gate_inp) is not quantized
+         "ffn_gate_exps", "ffn_up_exps", "ffn_down_exps",
+         "ffn_gate_shexp", "ffn_up_shexp", "ffn_down_shexp")
 ROT = re.compile(r"^blk\.\d+\.(" + "|".join(ROLES) + r")\.weight$")
 
 H = np.array([[1.0]])

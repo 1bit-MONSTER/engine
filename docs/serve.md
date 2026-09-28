@@ -297,6 +297,10 @@ request went, so its prompt cache stays useful as it grows. Each response carrie
 1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --long-model Qwen3-Coder-30B-A3B-Q4_0-H32.gguf --ctx-size 20480
 ```
 
+The rotated file is published as
+[1bit-MONSTER/Qwen3-Coder-30B-A3B-Q4_0-H32-GGUF](https://huggingface.co/1bit-MONSTER/Qwen3-Coder-30B-A3B-Q4_0-H32-GGUF);
+`tools/hadamard_q4_0.py` makes one for another model.
+
 Qwen3-Coder-30B-A3B, 256 output tokens, effective tok/s (output tokens over the whole wait;
 `tools/e2e_bench.py`, 2026-09-28):
 

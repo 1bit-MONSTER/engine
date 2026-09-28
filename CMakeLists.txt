@@ -68,6 +68,7 @@ target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}"
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
 add_test(NAME hadamard_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hadamard_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME long_route COMMAND ${CMAKE_SOURCE_DIR}/tests/long_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
@@ -302,6 +303,14 @@ target_link_libraries(onebit_laya PUBLIC onebit_npu nlohmann_json::nlohmann_json
 # The engine binary gets `1bit route` and per-request routing through the scorer.
 target_link_libraries(onebit PRIVATE onebit_laya)
 target_compile_definitions(onebit PRIVATE ONEBIT_LAYA)
+# Off by default (it needs the Vulkan SDK): ggmlc's laya runs the pinned Laya GGUF on Vulkan,
+# 22 ms a routing decision instead of about 380 ms on the CPU scorer, same accuracy (docs/laya.md).
+option(ONEBIT_LAYA_GGML "Build ggmlc's laya (Vulkan) as the router's scorer" OFF)
+if(ONEBIT_LAYA_GGML)
+    include(cmake/laya-ggml.cmake)
+    add_dependencies(onebit laya_ggml)
+    target_compile_definitions(onebit PRIVATE ONEBIT_LAYA_GGML_BIN="${ONEBIT_LAYA_GGML_BIN}")
+endif()
 
 add_executable(laya_gate tests/laya_gate.cpp)
 add_executable(laya_classify_eval tests/laya_classify_eval.cpp)

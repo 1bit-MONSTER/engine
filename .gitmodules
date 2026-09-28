@@ -89,3 +89,9 @@
 	url = https://github.com/1bit-MONSTER/ds4.git
 	branch = 1bit/main
 	shallow = true
+# ggmlc (MIT, monatis/ggmlc): its `laya` runs the Laya GGUFs (mys/laya-*-GGUF) on GGML's
+# Vulkan backend, the router's fast scorer (docs/laya.md). Built with -DONEBIT_LAYA_GGML=ON.
+[submodule "third_party/ggmlc"]
+	path = third_party/ggmlc
+	url = https://github.com/monatis/ggmlc.git
+	shallow = true

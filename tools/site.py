@@ -28,8 +28,9 @@
 #                  blog-<slug>.html, and feed.xml carries them as an Atom feed
 #   404.html       sends old 1bit.MONSTER addresses to the archived old site
 #
-# A post may start with "tags: a, b" lines before its "# Title"; its first paragraph is its
-# lead. Links to other docs become page links; links to other files in the repository go
+# A post may start with "tags: a, b" lines and a "summary: one line" before its "# Title"; its
+# first paragraph is its lead. The summary (the lead when there is none) is the post's meta
+# description and its feed.xml summary, which the Discord blog mirror posts. Links to other docs become page links; links to other files in the repository go
 # to them on GitHub.
 #
 # Visitor counts: with GOATCOUNTER set to a GoatCounter site code (pages.yml passes the
@@ -236,21 +237,24 @@ def plain(markdown_text):
 
 
 def split_post(text):
-    """-> (tags, title, lead paragraph, the rest) of a post."""
+    """-> (tags, title, lead paragraph, the rest, one-line summary or "") of a post."""
     text = strip_notice(text)
-    tags = []
+    tags, summary = [], ""
     while True:
-        m = re.match(r"\s*tags:\s*(.+)\n", text)
+        m = re.match(r"\s*(tags|summary):\s*(.+)\n", text)
         if not m:
             break
-        tags += [t.strip() for t in m.group(1).split(",") if t.strip()]
+        if m.group(1) == "tags":
+            tags += [t.strip() for t in m.group(2).split(",") if t.strip()]
+        else:
+            summary = m.group(2).strip()
         text = text[m.end():]
     m = re.match(r"\s*# (.+)\n", text)
     if not m:
         sys.exit("a post starts with its '# Title'")
     rest = text[m.end():].strip()
     lead, _, body = rest.partition("\n\n")
-    return tags, re.sub(r"[`*]", "", m.group(1)).strip(), lead.strip(), body
+    return tags, re.sub(r"[`*]", "", m.group(1)).strip(), lead.strip(), body, summary
 
 
 def first_paragraph(text):
@@ -408,7 +412,8 @@ class Site:
             return []
         rows = []
         for i, (date, slug, src) in enumerate(self.posts):
-            tags, title, lead, body = split_post(src.read_text())
+            tags, title, lead, body, summary = split_post(src.read_text())
+            summary = summary or plain(lead)
             name = f"blog-{slug}"
             tag_html = "".join(f'<span class="tag">{html.escape(t)}</span>' for t in tags)
             newer = self.posts[i - 1] if i > 0 else None
@@ -426,20 +431,20 @@ class Site:
                     f'<div class="prose">\n{self.md(body, src)}\n</div>\n'
                     f'<nav class="pager">{link(newer, "prev", "Newer")}{link(older, "next", "Older")}</nav>\n'
                     "</div></article>")
-            self.write(name, f"{title} · 1bit engine", main, "post", "blog", plain(lead), og_type="article",
+            self.write(name, f"{title} · 1bit engine", main, "post", "blog", summary, og_type="article",
                        lastmod=max(date, last_commit_date(src)),
                        jsonld={"@context": "https://schema.org", "@type": "BlogPosting", "headline": title,
-                               "description": plain(lead), "datePublished": date,
+                               "description": summary, "datePublished": date,
                                "dateModified": max(date, last_commit_date(src)), "image": OG_IMAGE,
                                "url": page_url(name), "mainEntityOfPage": page_url(name),
                                "author": {"@type": "Person", "name": "bong-water-water-bong"},
                                "publisher": {"@type": "Organization", "name": "1bit engine", "url": SITE},
                                "keywords": ", ".join(tags)})
-            rows.append((date, name, title, plain(lead), tags, self.md(lead + "\n\n" + body, src)))
+            rows.append((date, name, title, plain(lead), tags, self.md(lead + "\n\n" + body, src), summary))
 
         log = "\n".join(
             f'<a class="log-row" href="{n}.html"><span class="log-date">{d}</span><div class="log-body">'
-            f"<h3>{html.escape(t)}</h3><p>{html.escape(clip(s, 320))}</p></div></a>" for d, n, t, s, _, _ in rows)
+            f"<h3>{html.escape(t)}</h3><p>{html.escape(clip(s, 320))}</p></div></a>" for d, n, t, s, _, _, _ in rows)
         main = ('<section class="section"><div class="container hero-center hero-narrow">\n'
                 '<p class="eyebrow">Blog · field notes</p>\n'
                 "<h1>How the engine actually gets built.</h1>\n"
@@ -457,9 +462,9 @@ class Site:
             return d + "T00:00:00Z"
         entries = "".join(
             f"<entry><title>{html.escape(t)}</title><link href=\"{SITE}{n}.html\"/><id>{SITE}{n}.html</id>"
-            f"<updated>{stamp(d)}</updated><summary>{html.escape(s)}</summary>"
+            f"<updated>{stamp(d)}</updated><summary>{html.escape(sm)}</summary>"
             + "".join(f'<category term="{html.escape(x, quote=True)}"/>' for x in tags) +
-            f"<content type=\"html\">{html.escape(b)}</content></entry>" for d, n, t, s, tags, b in rows)
+            f"<content type=\"html\">{html.escape(b)}</content></entry>" for d, n, t, s, tags, b, sm in rows)
         (self.out / "feed.xml").write_text(
             '<?xml version="1.0" encoding="utf-8"?>\n<feed xmlns="http://www.w3.org/2005/Atom">'
             f'<title>1bit engine</title><link href="{SITE}"/><link rel="self" href="{SITE}feed.xml"/><id>{SITE}</id>'
@@ -485,7 +490,7 @@ class Site:
     def home(self, rows):
         latest = ""
         if rows:
-            d, n, t, s, _, _ = rows[0]
+            d, n, t, s, _, _, _ = rows[0]
             latest = (f'<a class="latest-link" href="{n}.html"><span class="latest-badge"><span class="dot"></span>latest · {d}</span>'
                       f'<span class="latest-title"><strong>{html.escape(t)}.</strong> {html.escape(clip(s, 260))}</span>'
                       '<span class="latest-more">read the post <span class="ar">→</span></span></a>')

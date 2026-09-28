@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: quantization, ternary, rocmfpx, unsloth
+summary: What smaller files cost: Unsloth UD-Q4_K_XL stays at KLD 0.008 (95.3% same top token); ROCmFPX formats trade more; ternary is effectively lossless vs F16.
 
 # Smaller files: Unsloth, ROCmFPX and a ternary 27B
 

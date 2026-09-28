@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: speculative decoding, mtp, qwen3.8
+summary: MTP takes Qwen3.8-27B to 42.0 tok/s on code; on Qwen3-Coder-30B-A3B, already at 88 tok/s, every draft model we tried was slower.
 
 # Speculative decoding: where it pays, and where it does not
 

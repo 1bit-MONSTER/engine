@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: laya, routing, serve
+summary: Asked for a device, Laya picked ZINC every time; asked what kind of request it is, it is right 95.5% of the time, and 1bit serve --laya routes by class.
 
 # Laya routing: ask the model what it knows
 

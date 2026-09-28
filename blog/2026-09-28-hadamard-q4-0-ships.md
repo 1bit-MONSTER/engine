@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: rocm, quantization, qwen, kernels
+summary: Hadamard-rotated Q4_0 with 4-bit activations reads Qwen3.8-27B prompts at 509 tok/s (from ~400) at KLD 0.055, and 1bit serve runs it by itself.
 
 # 509 tokens a second of prompt: the Hadamard route ships
 

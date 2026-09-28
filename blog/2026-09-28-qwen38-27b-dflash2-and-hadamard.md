@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: qwen, speculative-decoding, quantization, rocm, vulkan
+summary: The DFlash2 drafter decodes Qwen3.8-27B at 45.7 tok/s on code through 1bit serve --dflash, 44% faster than MTP.
 
 # Qwen3.8-27B at 45.7 tok/s: DFlash2 in `1bit serve`, and 4-bit activations with a Hadamard rotation
 

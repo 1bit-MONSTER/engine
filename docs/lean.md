@@ -125,8 +125,9 @@ tools/hadamard_q4_0.py Qwen3.8-27B-Q8_0.gguf Qwen3.8-27B-Q4_0-H32.gguf --imatrix
 It rotates the attention, FFN and delta-net alpha/beta projections in a copy of the source,
 gives the imatrix the matching change, quantizes those tensors to Q4_0 and every other matmul
 weight to another type, stamps the file `onebit.hadamard_q4_0 = 32`, and checks that every Q4_0
-tensor in it is a rotated one (it deletes a file that breaks that). Qwen3.8-27B: about 40 minutes
-on Strix Halo, 15.3 GiB.
+tensor in it is a rotated one (it deletes a file that breaks that). Qwen3.8-27B: about 20 minutes
+on Strix Halo, 15,182 MiB (4.66 bits per weight), 456 rotated tensors. That file is published as
+[1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF](https://huggingface.co/1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF).
 
 **Serve it:** `1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` in a build with `-DONEBIT_LEAN=ON
 -DONEBIT_LEAN_ROCM=ON`. `serve` reads the stamp, runs the file on the lean ROCm build
@@ -143,11 +144,13 @@ llama-bench with ub 512):
 |---|---|---|---|---|
 | Q4_0, exact int8 | ~400 | 6.021 | 0.029 | 91.9% |
 | Q4_0, W4A4 without rotation | 461-488 | 6.241 | 0.084 | 87.4% |
-| **Q4_0-H32 (rotated), W4A4** | **503-512** | **6.096** | **0.055** | **89.3%** |
+| **Q4_0-H32 (rotated), W4A4** | **503-512** (509 on the engine's lean ROCm build) | **6.096** | **0.055** | **89.3%** |
 | Q4_0-H32 on the exact int8 path | ~400 | 6.016 | 0.031 | 91.6% |
 
 The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
-+1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact.
++1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through
+`1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` (no device flag: the stamp picks the route), a
+1,838-token prompt runs at 440-470 tok/s, against about 330 on the Vulkan route.
 
 **Where else it helps.** The same ROCmFPX pin carries two prompt-processing kernels every model
 with delta-net layers (Qwen3.8, Qwen3.6) uses on ROCm: a delta-net prefill kernel that keeps

@@ -56,6 +56,9 @@
 //                                                  drafts a block per step (docs/serve.md)
 //   --mmproj <mmproj.gguf> on any llama.cpp route -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
+//   --long-model <rotated.gguf>                 -> conversations that start with --long-from tokens
+//                                                  (default 2048) go to that Hadamard-rotated Q4_0
+//                                                  on ROCm (W4A4 prefill), the rest to -m's route
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
@@ -158,6 +161,8 @@ struct Options {
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
+    std::string long_model;              // --long-model FILE: a Hadamard-rotated Q4_0 for long prompts (W4A4 on ROCm)
+    int long_from = 2048;                // --long-from N: a conversation whose first prompt has N tokens or more
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -846,6 +851,38 @@ std::string request_state(const httplib::Request& req) {
     return out;
 }
 
+// The prompt length of a request, counted by a llama-server backend: /v1/completions' prompt as
+// is, a chat through the model's template (/apply-template, which takes the request body as it
+// comes, tools included). If the backend cannot tell, about four bytes a token.
+long prompt_tokens(int port, const httplib::Request& q) {
+    json body;
+    try {
+        body = json::parse(q.body);
+    } catch (const std::exception&) {
+        return long(q.body.size() / 4);
+    }
+    httplib::Client c("127.0.0.1", port);
+    c.set_read_timeout(std::chrono::seconds(30));
+    std::string prompt;
+    if (body.contains("prompt") && body["prompt"].is_string()) {
+        prompt = body["prompt"].get<std::string>();
+    } else if (auto t = c.Post("/apply-template", q.body, "application/json"); t && t->status == 200) {
+        try {
+            prompt = json::parse(t->body).value("prompt", "");
+        } catch (const std::exception&) {
+        }
+    }
+    if (prompt.empty()) return long(request_state(q).size() / 4);
+    if (auto t = c.Post("/tokenize", json{{"content", prompt}}.dump(), "application/json"); t && t->status == 200) {
+        try {
+            const json tok = json::parse(t->body);
+            if (tok.contains("tokens") && tok["tokens"].is_array()) return long(tok["tokens"].size());
+        } catch (const std::exception&) {
+        }
+    }
+    return long(prompt.size() / 4);
+}
+
 int serve_child(const Options& given) {
     Options o = given;
     if (hadamard_q4_0(o.model)) {
@@ -937,6 +974,34 @@ int serve_child(const Options& given) {
     } else {
         backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
     }
+    // --long-model: the same model as a Hadamard-rotated Q4_0 on the ROCm W4A4 route, for
+    // conversations that start with a long prompt. What the user waits for is the first token
+    // plus the answer: with a short prompt the faster decode wins (Vulkan), with a long one the
+    // faster prefill does (W4A4 from about 2,000 tokens; docs/lean.md, "End to end"). Both
+    // backends load at the start; a conversation stays where its first request went, so its
+    // prompt cache stays useful as it grows.
+    const bool long_route = !o.long_model.empty();
+    if (long_route) {
+        if (laya || o.adaptive || !o.role.empty() || !o.mmproj.empty())
+            throw std::runtime_error("--long-model does not combine with --laya, --adaptive, --embedding/--reranking or --mmproj");
+        if (!hadamard_q4_0(o.long_model))
+            throw std::runtime_error("--long-model takes a Hadamard-rotated Q4_0 (tools/hadamard_q4_0.py, docs/lean.md): " + o.long_model);
+        if (hadamard_q4_0(o.model))
+            throw std::runtime_error(o.model + " is already on the W4A4 route; -m is the model for short prompts");
+        const std::string& d = backends[0].device;
+        if (d != "vulkan" && d != "hrx" && d != "rocm")
+            throw std::runtime_error("--long-model needs -m on a llama-server route (vulkan, hrx or rocm), not " + d);
+        if (o.long_from < 1) throw std::runtime_error("--long-from takes a positive token count");
+        Options lo = o;
+        lo.model = o.long_model;
+        lo.mtp.clear();
+        lo.dflash.clear();
+        lo.llama_server.clear();
+        lo.prefill_device.clear();
+        lo.moe_slots = 0;
+        lo.lean = false;
+        backends.push_back(launch_for(lo, "rocm", free_port()));
+    }
     const std::string device = laya ? "laya" : o.adaptive ? "vulkan+rocm" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
     const std::string set_model = backends[0].set_model;
@@ -981,6 +1046,10 @@ int serve_child(const Options& given) {
     std::vector<std::atomic<int>> inflight(backends.size());
     std::vector<std::atomic<long>> routed(backends.size());
     std::mutex route_mu;
+    // --long-model: conversation -> (backend, prompt tokens of its first request)
+    std::mutex long_mu;
+    std::unordered_map<size_t, std::pair<size_t, long>> long_cache;
+    std::deque<size_t> long_order;
 #ifdef ONEBIT_LAYA
     std::mutex scorer_mu, class_mu;
     std::unordered_map<size_t, onebit::laya::RequestClass> class_cache;  // conversation -> class
@@ -1047,6 +1116,33 @@ int serve_child(const Options& given) {
             return;
         }
 #endif
+        if (long_route) {
+            const size_t key = conversation_key(q);
+            std::pair<size_t, long> side{0, -1};
+            bool fresh = true;
+            {
+                std::lock_guard<std::mutex> lock(long_mu);
+                if (const auto c = long_cache.find(key); c != long_cache.end()) side = c->second, fresh = false;
+            }
+            if (fresh) {
+                side.second = prompt_tokens(backends[0].port, q);
+                side.first = side.second >= o.long_from ? 1 : 0;
+                std::lock_guard<std::mutex> lock(long_mu);
+                if (long_cache.size() >= 4096) {  // oldest conversation first
+                    long_cache.erase(long_order.front());
+                    long_order.pop_front();
+                }
+                if (long_cache.emplace(key, side).second) long_order.push_back(key);
+            }
+            const size_t i = side.first;
+            char route_hdr[96];
+            std::snprintf(route_hdr, sizeof route_hdr, "%s %ld %s", i ? "long" : "short", side.second, backends[i].device.c_str());
+            held = std::make_shared<InFlight>(&inflight[i]);
+            ++routed[i];
+            forward(backends[i].port, held, -1, id, backends[i].drop_model, backends[i].set_model, q, r);
+            r.set_header("X-1bit-Route", route_hdr);  // short or long, the first prompt's tokens, device
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(route_mu);
             if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
@@ -1352,6 +1448,8 @@ void usage(FILE* out) {
                  "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
+                 "                  [--long-model ROTATED.gguf] [--long-from N]   conversations starting with N or more prompt\n"
+                 "                                    tokens (default 2048) go to that Hadamard-rotated Q4_0 on ROCm (W4A4)\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
@@ -1402,6 +1500,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--parallel") o.parallel = std::stoi(next());
         else if (a == "--adaptive") o.adaptive = true;
         else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
+        else if (a == "--long-model") o.long_model = next();
+        else if (a == "--long-from") o.long_from = std::stoi(next());
         else if (a == "--embed") o.embed = next();
         else if (a == "--embedding" || a == "--embeddings") o.role = "embedding";
         else if (a == "--reranking") o.role = "reranking";

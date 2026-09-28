@@ -281,6 +281,36 @@ It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) a
 two copies of the model; `--ctx-size` applies to each backend and is split across its
 slots. On exit, serve logs how many requests each backend took.
 
+## Short and long prompts (`--long-model`)
+
+What a user waits for is the first token plus the answer. With a short prompt the faster
+decode wins (Vulkan); with a long one the faster prefill does (the W4A4 route, from about
+2,000 prompt tokens; [lean.md](lean.md#end-to-end-time-to-first-token-and-effective-speed)).
+`--long-model` serves the same model both ways: `-m` on its usual route, and a Hadamard-rotated
+Q4_0 of it (`tools/hadamard_q4_0.py`) on ROCm with W4A4. A conversation whose first request has
+`--long-from` prompt tokens or more (default 2048; chats are counted through the model's
+template) goes to the rotated file, the rest to `-m`. A conversation stays where its first
+request went, so its prompt cache stays useful as it grows. Each response carries
+`X-1bit-Route: short|long <tokens> <device>`.
+
+```sh
+1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --long-model Qwen3-Coder-30B-A3B-Q4_0-H32.gguf --ctx-size 20480
+```
+
+Qwen3-Coder-30B-A3B, 256 output tokens, effective tok/s (output tokens over the whole wait;
+`tools/e2e_bench.py`, 2026-09-28):
+
+| Prompt tokens | 512 | 2,048 | 8,192 | 16,384 |
+|---|---|---|---|---|
+| Vulkan, Q4_K_M | **70.7** | 52.1 | 20.3 | 8.6 |
+| ROCm W4A4, rotated Q4_0 | 66.6 | **55.0** | **27.0** | **13.4** |
+| **`--long-model`** | **71.3** | 53.1 | 25.5 | 13.1 |
+
+The `--long-model` row ran while another job used the box's memory bus, which cost its long
+side 2-5% against the W4A4 row. Both files stay loaded (here 17 + 16 GiB). It needs the Vulkan
+build and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`, and `-m` on a llama-server route (vulkan, hrx or
+rocm); it does not combine with `--laya`, `--adaptive` or `--mmproj`.
+
 ## RAG (`--embed`, `--rerank`)
 
 `--embed MODEL.gguf` serves `/v1/embeddings` and `--rerank MODEL.gguf` serves `/v1/rerank`,

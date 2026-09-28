@@ -1267,9 +1267,13 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     if (dequant_any(pool + (size_t)e * per_expert, per_expert, K, N, kn.data()) != 0)
         return false;
     out.resize((size_t)N * (size_t)K);
-    for (int k = 0; k < K; k++)
-        for (int nn = 0; nn < N; nn++)
-            out[(size_t)nn * K + k] = kn[(size_t)k * N + nn];
+    // Do NOT transpose.  The tile decode at (rows=K, cols=N) already reproduces the
+    // GGUF's flat order, and that flat sequence IS the logical [N][K] = [out][in]
+    // weight.  Verified elementwise against the GGUF per expert: reshape(N,K) gives
+    // corr 0.999198 (gate) / 0.996949 (down), while transposing gives -0.001079 /
+    // 0.000417 -- i.e. the transpose destroyed the expert entirely, making every
+    // routed expert's contribution ~10-20x wrong and flipping the top-k selection.
+    std::copy(kn.begin(), kn.end(), out.begin());
     return true;
 }
 
@@ -1326,12 +1330,14 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     krc.resize((old + 1) * (size_t)rope_dim_);
     // k_b[h] : [kh][kv_lora] (stored padded to a 32-row tile, so read kh real rows)
     for (int h = 0; h < NH; h++) {
-        // k_b: Q4NX grid [kv_lora][nope padded to 256] = [512][256], indexed flat[k*kb_rows+n].
-        // v_b: Q4NX grid [kv_lora][v_head] = [512][256], indexed flat[k*vh + n] -- pinned
-        // against llama.cpp's own tensor dump (llama-eval-callback), where this reading
-        // reproduces the oracle's layer-0 post-attention sum to 5 decimals and the
-        // [256][512] grid gives -0.454611 instead of -0.228092.  The tile GRID matters,
-        // not just the flat order: both have 16 tiles/head but a different mapping.
+        // k_b: Q4NX tile grid [kv_lora][nope padded to 256], indexed flat[n*kv_lora+k].
+        // v_b: the Q4NX tiles v_b with cols=256 while its LOGICAL row is 512 wide, so
+        // the per-head [512][256] tile grid is NOT the logical matrix.  Decoding the
+        // whole tensor at (rows=10240, cols=256) reproduces the GGUF's flat order
+        // exactly (corr 0.996860 vs the 0.996870 a faithful Q4_1 requant scores),
+        // i.e. the logical index is (h*256+n)*512 + k = out-major.  Indexing flat
+        // [k*vh+n] instead permuted the whole MLA value path; the earlier check that
+        // "pinned" it compared a single SUM, which a permutation can still match.
         const float* wk = &w_kb_[(size_t)h * (size_t)kv_lora_ * (size_t)kb_rows_];
         const float* wv = &w_vb_[(size_t)h * (size_t)kv_lora_ * (size_t)vh];
         float* dk = &kn[old * (size_t)NH * kh + (size_t)h * kh];
@@ -1343,7 +1349,7 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
         }
         for (int n = 0; n < vh; n++) {
             float s = 0.0f;
-            for (int k = 0; k < kv_lora_; k++) s += wv[(size_t)k * vh + n] * kl[k];
+            for (int k = 0; k < kv_lora_; k++) s += wv[(size_t)n * kv_lora_ + k] * kl[k];
             dv[n] = s;
         }
     }
@@ -2085,8 +2091,22 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         }
         return true;
     }
-    const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
-    const int T = designs_[i_qkv].N;                 // reuse the QKV geometry
+    // Reuse an existing GEMM geometry for the head (the variable keeps its old name
+    // for the block below).  QKV when the arch has one; the MLA/deepseek2 arch
+    // (GLM-4.7-Flash) has QA/QB/KVA/O instead, so idx_of(QKV) returned -1 and T was
+    // read out of designs_[-1] -- garbage, and the ntiles division below raised
+    // SIGFPE.  Only this NPU path uses T (the host path is a plain matvec), which is
+    // why GLM crashed here the first time the ELF path was exercised.
+    int i_qkv = idx_of(Q4NX_DESIGN_QKV);
+    if (i_qkv < 0 || designs_[i_qkv].K != H || designs_[i_qkv].N <= 0)
+        i_qkv = idx_of(Q4NX_DESIGN_DG);              // K=H, N=dense_im
+    if (i_qkv < 0 || designs_[i_qkv].K != H || designs_[i_qkv].N <= 0)
+        i_qkv = idx_of(Q4NX_DESIGN_G);               // K=H, N=expert_im
+    if (i_qkv < 0 || designs_[i_qkv].K != H || designs_[i_qkv].N <= 0) {
+        err_ = "LM head: no GEMM design with K=H available";
+        return false;
+    }
+    const int T = designs_[i_qkv].N;
     const int ntiles = (NV + T - 1) / T;
     logits.assign(NV, 0.0f);
 

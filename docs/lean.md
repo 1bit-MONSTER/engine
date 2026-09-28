@@ -200,8 +200,52 @@ experts, the attention, or the shared expert, dense layer and embedding) costs a
 own. Its wikitext perplexity drops under Q4_0 (10.41 to 7.97-8.73) because the output
 distribution flattens, so perplexity alone reads this model the wrong way round. The Q8_0
 reference is sound: it gives PPL 10.44 on upstream HIP and 11.01 on Vulkan, and KLD 0.015
-across backends. For GLM-4.7-Flash, use a higher-precision file; the W4A4 route is not worth its
-accuracy there until the Q4_0 base is better.
+across backends. An importance matrix repairs the weights but not the activations. An unrotated Q4_0 made with
+an imatrix (wikitext-2 train, 150 x 512) scores KLD 0.197 on the exact path, PPL 10.81; the same
+file with W4A4 on attention scores 0.322 and with W4A4 everywhere 0.571. On the rotated file an
+imatrix does nothing: Q4_0 has one scale per 32 values, the rotation spreads the outlier columns
+across the block, and even an imatrix collected on the rotated activations moves KLD from 0.528
+to 0.522. For GLM-4.7-Flash, use the exact path with an imatrix Q4_0, or a higher-precision
+file; its activations do not take 4 bits.
+
+### End to end: time to first token and effective speed
+
+A user waits for the whole answer, not for the decode phase. A request with P prompt tokens and
+N output tokens takes TTFT + (N - 1) / decode speed, and TTFT is mostly P / prefill speed. The
+effective speed, N over that whole time, is what the user gets (the idea behind Artificial
+Analysis's end-to-end response time). `tools/e2e_bench.py` measures it against any running
+server (`1bit serve` or llama-server): streamed `/v1/completions` with prompts cut to exactly P
+tokens, exactly N output tokens, no prompt cache, median of 3.
+
+```sh
+tools/e2e_bench.py --url http://127.0.0.1:8080 --prompt-tokens 512,2048,8192,16384 --max-tokens 256
+```
+
+**Measured** (Strix Halo, Qwen3-Coder-30B-A3B, N = 256, `-c 20480 -fa on`): the engine's
+Vulkan build with a Q4_K_M, against the rotated
+Q4_0 above on the ROCm route, exact int8 and W4A4:
+
+| Prompt tokens | Route | TTFT | Decode | End to end | **Effective** |
+|---|---|---|---|---|---|
+| 512 | Vulkan, Q4_K_M | 0.38 s | 78.7 t/s | 3.62 s | **70.7 t/s** |
+| | ROCm, exact int8 | 0.43 s | 73.9 t/s | 3.89 s | 65.9 t/s |
+| | ROCm, W4A4 | 0.25 s | 71.4 t/s | 3.85 s | 66.6 t/s |
+| 2,048 | Vulkan, Q4_K_M | 1.56 s | 76.0 t/s | 4.92 s | 52.1 t/s |
+| | ROCm, exact int8 | 1.72 s | 69.6 t/s | 5.38 s | 47.6 t/s |
+| | ROCm, W4A4 | 1.00 s | 69.8 t/s | 4.66 s | **55.0 t/s** |
+| 8,192 | Vulkan, Q4_K_M | 8.48 s | 61.6 t/s | 12.62 s | 20.3 t/s |
+| | ROCm, exact int8 | 7.92 s | 58.2 t/s | 12.56 s | 20.4 t/s |
+| | ROCm, W4A4 | 5.03 s | 57.5 t/s | 9.46 s | **27.0 t/s** |
+| 16,384 | Vulkan, Q4_K_M | 24.87 s | 50.2 t/s | 29.92 s | 8.6 t/s |
+| | ROCm, exact int8 | 19.94 s | 47.8 t/s | 25.26 s | 10.1 t/s |
+| | ROCm, W4A4 | 13.76 s | 47.1 t/s | 19.17 s | **13.4 t/s** |
+
+Vulkan decodes about 10% faster, and for a short prompt that wins. From about 2,000 prompt
+tokens on, W4A4's first token comes early enough to more than pay for it: at 8K the answer is
+done 3.2 s sooner (+33% effective speed), at 16K the first token comes 11 s sooner and the
+effective speed is +56%. Agents and coding tools send long prompts (files, tool output,
+history), so that is where this route is for. The two files are not the same quantization
+(Q4_K_M against rotated Q4_0), so the table compares routes as they ship, not kernels.
 
 The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
 +1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through

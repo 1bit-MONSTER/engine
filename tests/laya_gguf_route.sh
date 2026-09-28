@@ -19,8 +19,9 @@
 # the pinned GGUF name under $ONEBIT_LAYA_MODEL/gguf/ is an empty file, and fake llama-servers
 # and zinc answer with their device (tests/route-policy-e2e.json: code -> hrx, prose -> zinc,
 # short -> vulkan). It checks that
-#   - serve starts the daemon (daemon <gguf> --family typed-decisions --device vulkan) and needs
-#     no safetensors checkpoint,
+#   - serve starts the daemon (daemon <gguf> --family typed-decisions --device hrx) with the HSA
+#     runtime HRX needs (IREE_HAL_AMDGPU_LIBHSA_PATH, from --hrx-libhsa) and needs no safetensors
+#     checkpoint,
 #   - each class reaches its device, with X-1bit-Route "<class> <confidence> <device>",
 #   - the daemon gets serve's question: the three non-long_doc classes, the request as state,
 #   - a request of 1024 characters or more is long_doc without asking the daemon,
@@ -44,7 +45,7 @@ cat > "$scratch/laya-daemon.py" <<'PY'
 #!/usr/bin/env python3
 import json, os, sys
 log = open(os.environ["LAYA_LOG"], "a")
-log.write(json.dumps({"argv": sys.argv[1:]}) + "\n"); log.flush()
+log.write(json.dumps({"argv": sys.argv[1:], "hsa": os.environ.get("IREE_HAL_AMDGPU_LIBHSA_PATH", "")}) + "\n"); log.flush()
 print(json.dumps({"status": "ready", "model": "laya"}), flush=True)
 for line in sys.stdin:
     req = json.loads(line)
@@ -69,13 +70,14 @@ check "--laya-model FILE.gguf without ggmlc's laya says how to build it" '[[ "$n
 LAYA_LOG="$scratch/daemon.log" ONEBIT_LAYA_GGML="$scratch/laya-daemon.py" ONEBIT_LAYA_MODEL="$scratch/laya" \
     "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya --route-policy "$here/route-policy-e2e.json" \
     --port "$port" --llama-server "$here/fake_backend_route.py" --zinc "$here/fake_backend_route.py" \
-    >"$scratch/serve.log" 2>&1 &
+    --hrx-libhsa "$scratch/libhsa-runtime64.so.1" >"$scratch/serve.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 300); do curl -sf -o /dev/null "$api/health" && break; sleep 0.1; done
 
 argv=$(head -1 "$scratch/daemon.log" 2>/dev/null)
-check "serve starts the daemon on the pinned GGUF, typed-decisions, Vulkan" \
-    '[[ "$argv" == *"\"daemon\", \"$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf\", \"--family\", \"typed-decisions\", \"--device\", \"vulkan\""* ]]'
+check "serve starts the daemon on the pinned GGUF, typed-decisions, HRX" \
+    '[[ "$argv" == *"\"daemon\", \"$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf\", \"--family\", \"typed-decisions\", \"--device\", \"hrx\""* ]]'
+check "  with the HSA runtime HRX needs" '[[ "$argv" == *"\"hsa\": \"$scratch/libhsa-runtime64.so.1\""* ]]'
 
 ask() {  # <text>: the replying device, then the X-1bit-Route header
     local body

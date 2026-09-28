@@ -158,3 +158,43 @@ rows. Every sum keeps its order, so the gate output is byte-identical to the
 single-threaded scorer. Those figures are for the old device question on a short request.
 The request-class decision takes 0.4-0.6 s (the table above), and `serve` pays it once per
 conversation.
+
+## The GGUF scorer: ggmlc on Vulkan
+
+[ggmlc](https://github.com/monatis/ggmlc) compiles Laya's checkpoints to GGUFs that its own
+`laya` runtime runs on GGML (they are not llama.cpp GGUFs): English
+([mys/laya-GGUF](https://huggingface.co/mys/laya-GGUF), ModernBERT-large, 421M parameters,
+512-token context), multilingual ([mys/laya-multilingual-GGUF](https://huggingface.co/mys/laya-multilingual-GGUF),
+100+ languages) and typed-decisions
+([mys/laya-typed-decisions-GGUF](https://huggingface.co/mys/laya-typed-decisions-GGUF), for
+`choice` / `score` / `noul`). The engine pins ggmlc as `third_party/ggmlc` and the
+typed-decisions Q8_0 in `config/laya.json`; `scripts/fetch-laya.sh` fetches it into
+`<laya dir>/gguf/` and checks its sha256.
+
+```sh
+cmake -B build -DONEBIT_LAYA_GGML=ON ...   # builds ggmlc's laya with GGML's Vulkan backend
+scripts/fetch-laya.sh
+1bit serve -m MODEL.gguf --laya            # uses the GGUF scorer when both are there
+```
+
+With the binary and the GGUF present, `serve --laya` starts `laya daemon <gguf> --family
+typed-decisions --device vulkan` and asks it serve's question over its stdin and stdout (not
+its `serve`, which listens on every interface with no key). Without them it uses the C++
+scorer on the safetensors as before. `--laya-model FILE.gguf` picks another GGUF,
+`ONEBIT_LAYA_GGML` another binary, `ONEBIT_LAYA_DEVICE` another device (`cpu`, `vulkan:1`).
+
+**Measured** (Strix Halo, the 200 labelled requests of `tests/laya_route_cases.json`, 150 of
+them asked of the model, the rest long_doc by size; through `1bit serve --laya` with fake
+backends, so the request time is the decision):
+
+| Scorer | Class accuracy | Decision, p50 |
+|---|---|---|
+| C++ scorer, typed-decisions safetensors, CPU | 95.5% | 538 ms |
+| **ggmlc `laya`, typed-decisions Q8_0 GGUF, Vulkan** | **95.5%** | **24 ms** |
+
+Asked directly (`laya serve`, same question): typed-decisions F16 95.5% at 36 ms; the English
+GGUF 93.0% (Q8_0, 22 ms) and 91.5% (F16), so the typed-decisions checkpoint stays the router's.
+`tests/laya_gguf_route.sh` covers the daemon wiring without a GPU (a fake daemon).
+
+ggmlc declares the MIT licence (`pyproject.toml`, README) but its repository carries no LICENSE
+file yet; the GGUFs are Apache-2.0 like the checkpoints.

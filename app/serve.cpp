@@ -193,6 +193,13 @@ std::string default_llama_server(const std::string& device) {
 
 // Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
 // does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
+// A Q4_0 file from tools/hadamard_q4_0.py: its matmul weights are rotated by a 32-point
+// Walsh-Hadamard transform, and only the lean ROCm build rotates the activations to match.
+bool hadamard_q4_0(const std::string& model) {
+    return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
+           gguf_int(model, "onebit.hadamard_q4_0") == 32;
+}
+
 bool fork_only_arch(const std::string& gguf) {
     // Zyphra ZAYA1 (docs/vulkan.md); OPT, CodeGen, GPT-Neo and GPT-J (llama.cpp #8: upstream has
     // no model for them, gptj only a name). Keep in step with FORK_ONLY in tools/registry_build.py.
@@ -631,6 +638,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
                 "--device", device == "rocm" ? "ROCm0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
+        if (hadamard_q4_0(o.model)) {
+            // tools/hadamard_q4_0.py stamped it: its Q4_0 weights are rotated, so the activation
+            // quantizers must rotate too, and every Q4_0 matmul takes the W4A4 kernel (docs/lean.md).
+            // A value set in the environment wins (GGML_W4A4_TENSORS= keeps exact int8).
+            if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
+            if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
+            if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
+        }
     } else if (device == "vulkan" || device == "hrx") {
         // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
         // attention on so both devices lay the KV cache out the same way
@@ -818,7 +833,17 @@ std::string request_state(const httplib::Request& req) {
     return out;
 }
 
-int serve_child(const Options& o) {
+int serve_child(const Options& given) {
+    Options o = given;
+    if (hadamard_q4_0(o.model)) {
+        // a rotated file has one route: the lean ROCm build with the Hadamard activation quantizer
+        if (o.device == "auto") o.device = "rocm";
+        if (o.device != "rocm")
+            throw std::runtime_error(o.model + " is Hadamard-rotated (tools/hadamard_q4_0.py): it runs on --device rocm only, docs/lean.md");
+        if (o.laya_auto || !o.laya_model.empty())
+            throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on rocm only");
+        std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
+    }
     std::vector<Launch> backends;
     // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
     // (code, prose, short, long_doc; laya/route.h) and the route policy (config/route-policy.json

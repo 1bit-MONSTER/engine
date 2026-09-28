@@ -15,6 +15,7 @@
 #pragma once
 
 #include <cstdint>
+#include <cstring>
 #include <fstream>
 #include <string>
 
@@ -70,6 +71,62 @@ inline std::string gguf_architecture(const std::string& path) {
         if (!f) return "";
     }
     return "";
+}
+
+// The integer value of metadata key `key` (any GGUF integer type), or -1 when the file is not a
+// GGUF, lacks the key, or stores something else under it.
+inline long long gguf_int(const std::string& path, const std::string& key) {
+    std::ifstream f(path, std::ios::binary);
+    auto rd = [&](void* p, size_t n) { return static_cast<bool>(f.read(static_cast<char*>(p), n)); };
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!rd(&magic, 4) || magic != 0x46554747u || !rd(&version, 4) || version < 2 || !rd(&n_tensors, 8) || !rd(&n_kv, 8))
+        return -1;
+    auto str = [&](std::string* out) {
+        uint64_t n = 0;
+        if (!rd(&n, 8) || n > (1u << 20)) return false;
+        if (!out) return static_cast<bool>(f.seekg(static_cast<std::streamoff>(n), std::ios::cur));
+        out->resize(n);
+        return rd(out->data(), n);
+    };
+    static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    auto scalar = [](uint32_t t) -> int { return t < 13 ? size[t] : -1; };
+    for (uint64_t i = 0; i < n_kv && i < 4096; ++i) {
+        std::string k;
+        uint32_t type = 0;
+        if (!str(&k) || !rd(&type, 4)) return -1;
+        if (k == key) {
+            unsigned char b[8] = {};
+            const int n = scalar(type);
+            if (n <= 0 || type == 6 || type == 7 || type == 12 || !rd(b, n)) return -1;  // f32, bool, f64
+            const bool is_signed = type == 1 || type == 3 || type == 5 || type == 11;
+            long long v = 0;
+            std::memcpy(&v, b, n);
+            if (is_signed && n < 8 && (b[n - 1] & 0x80)) v -= 1LL << (8 * n);
+            return v;
+        }
+        if (type == 8) {
+            if (!str(nullptr)) return -1;
+        } else if (type == 9) {
+            uint32_t et = 0;
+            uint64_t n = 0;
+            if (!rd(&et, 4) || !rd(&n, 8)) return -1;
+            if (et == 8) {
+                for (uint64_t j = 0; j < n; ++j)
+                    if (!str(nullptr)) return -1;
+            } else if (scalar(et) > 0) {
+                f.seekg(static_cast<std::streamoff>(n * scalar(et)), std::ios::cur);
+            } else {
+                return -1;
+            }
+        } else if (scalar(type) > 0) {
+            f.seekg(scalar(type), std::ios::cur);
+        } else {
+            return -1;
+        }
+        if (!f) return -1;
+    }
+    return -1;
 }
 
 }  // namespace onebit

@@ -53,9 +53,21 @@ ZINC = "third_party/zinc"
 # on that build's Vulkan0. Keep in step with fork_only_arch in app/serve.cpp.
 FORK_ONLY = {"zaya", "opt", "codegen", "gptneo", "gptj"}
 
-# The NPU fast lane serves Qwen3 dense Q4NX directories (docs/npu.md). HF architecture ->
-# model_type, as the directory's config.json names them.
-NPU_ARCHS = {"Qwen3ForCausalLM": "qwen3"}
+# The NPU serves these HF architectures (docs/npu.md):
+#  - the fast lane serves Qwen3 dense Q4NX directories (model_type from config.json);
+#  - the GGUF-on-NPU route repacks a .gguf and runs the model-generic forward, for six
+#    arches each verified by a captured `--device npu` run (goal muhz0s39-8c9l9o). Text
+#    decoders only; vision-language variants of these arches are not claimed.
+# HF architecture -> model_type the forward's config.json names.
+NPU_ARCHS = {
+    "Qwen3ForCausalLM": "qwen3",            # fast lane (Q4NX directory)
+    "Qwen2ForCausalLM": "qwen2",            # GGUF-on-NPU: Qwen2.5-7B-Instruct
+    "Qwen3MoeForCausalLM": "qwen3moe",      # GGUF-on-NPU: Qwen3-Coder-30B-A3B
+    "Qwen3_5MoeForCausalLM": "qwen3_5_moe",  # GGUF-on-NPU: Qwen3.6-35B-A3B (gguf qwen35moe)
+    "DeepseekV2ForCausalLM": "deepseek2",   # GGUF-on-NPU: GLM-4.7-Flash
+    "MiniCPMForCausalLM": "minicpm",        # GGUF-on-NPU: MiniCPM4-8B
+    "LlamaForCausalLM": "llama",            # GGUF-on-NPU: MiniCPM5-1B
+}
 
 
 def pin(path):

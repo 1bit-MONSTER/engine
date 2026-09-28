@@ -26,12 +26,17 @@ it loads its own GGUF layouts (`antirez/deepseek-v4-gguf`,
 llama.cpp cannot load those.
 
 `1bit serve --device ds4 -m <DwarfStar .gguf>` runs its `ds4-server` as the model's
-backend, behind the same OpenAI API as every other device.
+backend, behind the same OpenAI API as every other device. The engine builds our fork,
+[1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4), which also reads 1BP packages
+([below](#1bp-packages)).
 
 ## Build
 
-`third_party/ds4` pins upstream `antirez/ds4` main; `.github/workflows/bump-ds4.yml`
-opens a PR when it moves.
+`third_party/ds4` pins our fork's `1bit/main`: upstream `antirez/ds4` main plus the
+commits we carry (1BP packages). When upstream main moves, `.github/workflows/bump-ds4.yml`
+rebases our commits onto it, tags the old tip `ds4-main-<sha12>` so the old pin stays
+reachable, and opens a PR moving the submodule. A commit that no longer applies stops the bump
+for a hand rebase.
 
 ```
 git submodule update --init --depth 1 third_party/ds4
@@ -72,6 +77,33 @@ options and are refused on `ds4`; DwarfStar has its own batching
 Memory: the resident DeepSeek V4 Flash Q2 needs about 81 GiB plus runtime buffers,
 and the GPU must see that much (`amdgpu.gttsize` / `ttm.pages_limit`, DwarfStar's
 [STRIX_HALO.md](https://github.com/antirez/ds4/blob/main/docs/STRIX_HALO.md)).
+
+## 1BP packages
+
+Our fork reads 1BP v5, 1bit-MONSTER's model package: one memory-mappable file with the 1BP
+header and tensor index, the model's metadata (encoded as GGUF's key/value section) and
+64-byte-aligned weights. The format is in
+[docs/1BP.md](https://github.com/1bit-MONSTER/ds4/blob/1bit/main/docs/1BP.md) of the fork.
+The converter copies a GGUF's metadata byte for byte and carries every tensor in its GGUF
+block format, so a package runs exactly as its GGUF:
+
+```
+python third_party/ds4/gguf-tools/gguf_to_1bp.py hf://antirez/deepseek-v4-gguf@f71f23d5/DeepSeek-V4-Flash-IQ2XXS-w2Q2K-AProjQ8-SExpQ8-OutQ8-chat-v2-imatrix-0731.gguf DeepSeek-V4-Flash-Q2.1bp
+1bit serve -m DeepSeek-V4-Flash-Q2.1bp --ctx-size 8192
+```
+
+An `hf://` source is read with HTTP range requests, so the GGUF never has to be on disk.
+`1bit serve` recognises a package by its first four bytes and serves it on `ds4` (with
+`--device auto` too). `gguf-tools/check_1bp.py <gguf> <1bp>` compares a package with its GGUF.
+
+Checked on Strix Halo: DeepSeek V4 Flash Q2 (1,328 tensors, 62 metadata keys, 80.76 GiB of
+weights), converted from `hf://` at the revision above, gives the same answers and
+completion-token counts as its GGUF for three prompts at temperature 0 (256 tokens each).
+Qwen3-0.6B Q4_K_M's package passes `check_1bp.py`: all 310 tensors and 32 metadata keys
+identical.
+
+1BP's own tile formats (Q4NX, TQ2 and the others the 1BP header defines) do not run in
+DwarfStar yet: a package with one is refused with the tensor's name.
 
 ## Verified (Strix Halo, ds4 `0aaea5a238fb`, TheRock ROCm)
 

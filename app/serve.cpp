@@ -39,6 +39,7 @@
 //                                                  long prompt prefixes on HRX0 over one
 //                                                  shared KV cache (docs/hrx.md)
 //   a .gguf, --device zinc                      -> this build's zinc
+//   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
 //   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
 //                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
 //                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
@@ -91,6 +92,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <fstream>
 #include <filesystem>
 #include <memory>
 #include <mutex>
@@ -198,6 +200,14 @@ std::string default_llama_server(const std::string& device) {
 bool hadamard_q4_0(const std::string& model) {
     return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
            gguf_int(model, "onebit.hadamard_q4_0") == 32;
+}
+
+// A 1BP package (1bit-MONSTER's model format; our DwarfStar fork reads version 5, its
+// docs/1BP.md): its first four bytes are "1BP\0".
+bool onebp_file(const std::string& model) {
+    std::ifstream f(model, std::ios::binary);
+    char magic[4] = {};
+    return f.read(magic, 4) && std::memcmp(magic, "1BP\0", 4) == 0;
 }
 
 bool fork_only_arch(const std::string& gguf) {
@@ -462,7 +472,7 @@ std::string model_id(const Options& o) {
     fs::path p(o.model);
     if (!p.has_filename()) p = p.parent_path();
     // Only a .gguf loses its extension: "Qwen3-0.6B-4bit" is a name, not a stem.
-    return p.extension() == ".gguf" ? p.stem().string() : p.filename().string();
+    return p.extension() == ".gguf" || p.extension() == ".1bp" ? p.stem().string() : p.filename().string();
 }
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
@@ -846,6 +856,14 @@ int serve_child(const Options& given) {
         if (o.laya_auto || !o.laya_model.empty())
             throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on rocm only");
         std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
+    }
+    if (onebp_file(o.model)) {
+        // DwarfStar (our fork) is the engine's 1BP reader
+        if (o.device == "auto") o.device = "ds4";
+        if (o.device != "ds4")
+            throw std::runtime_error(o.model + " is a 1BP package: it runs on --device ds4 (docs/dwarfstar.md)");
+        if (o.laya_auto || !o.laya_model.empty())
+            throw std::runtime_error("--laya routes among devices; a 1BP package runs on ds4 only");
     }
     std::vector<Launch> backends;
     // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
@@ -1462,8 +1480,8 @@ int run_serve(int argc, char** argv) {
         return run_forward_serve(int(av.size()), av.data());
     }
 #endif
-    if (fs::path(o.model).extension() == ".gguf") return serve_child(o);
-    throw std::runtime_error(o.model + ": expected an NPU model directory or a .gguf file");
+    if (fs::path(o.model).extension() == ".gguf" || onebp_file(o.model)) return serve_child(o);
+    throw std::runtime_error(o.model + ": expected an NPU model directory, a .gguf file or a 1BP package");
 }
 
 }  // namespace onebit

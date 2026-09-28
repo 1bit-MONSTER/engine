@@ -13,14 +13,17 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Keep third_party/ds4 on upstream antirez/ds4 main (docs/dwarfstar.md): when
-# upstream moves, open a PR here moving the submodule. GitHub-hosted CI has no
-# GPU; rerun scripts/build-ds4.sh and the checks in docs/dwarfstar.md on Strix
-# Halo before merging.
+# Keep third_party/ds4 on upstream antirez/ds4 main (docs/dwarfstar.md). The submodule is
+# our fork 1bit-MONSTER/ds4, branch 1bit/main: upstream main plus the commits we carry (1BP
+# packages, docs/1BP.md in the fork). When upstream main moves, this workflow rebases those
+# commits onto it (one upstream has since taken becomes empty and drops out), tags the old tip
+# ds4-main-<sha12> so pinned commits stay reachable, and opens a PR here moving the submodule.
+# A commit that no longer applies stops the bump for a hand rebase. GitHub-hosted CI has no
+# GPU; run the checks in the PR body on Strix Halo before merging.
 #
-# Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
-# 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
-# start CI.
+# Uses the secret HRX_BUMP_TOKEN (Contents read/write on 1bit-MONSTER/ds4 and
+# 1bit-MONSTER/engine, Pull requests read/write on 1bit-MONSTER/engine): a PR opened with the
+# default GITHUB_TOKEN would not start CI, and that token cannot push to the fork.
 name: bump-ds4
 
 on:
@@ -60,10 +63,51 @@ jobs:
           set -euo pipefail
           upstream=$(gh api repos/antirez/ds4/commits/main --jq .sha)
           ours=$(git ls-tree HEAD third_party/ds4 | awk '{print $3}')
-          echo "upstream $upstream, ours $ours"
+          # where our commits branch off antirez's history (the fork shares its object network)
+          ours_base=$(gh api "repos/antirez/ds4/compare/${upstream}...${ours}" --jq .merge_base_commit.sha)
+          echo "upstream ${upstream}, ours ${ours} on ${ours_base}"
           {
-            echo "upstream=$upstream"; echo "ours=$ours"
-            if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
+            echo "upstream=$upstream"; echo "ours=$ours"; echo "ours_base=$ours_base"
+            if [ "$upstream" = "$ours_base" ]; then echo "changed=false"; else echo "changed=true"; fi
+          } >> "$GITHUB_OUTPUT"
+
+      - name: Rebase our commits onto upstream
+        id: fork
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          UPSTREAM: ${{ steps.pins.outputs.upstream }}
+          OURS: ${{ steps.pins.outputs.ours }}
+          OURS_BASE: ${{ steps.pins.outputs.ours_base }}
+        run: |
+          set -euo pipefail
+          # the fork's main mirrors antirez/ds4 main
+          gh api -X POST repos/1bit-MONSTER/ds4/merge-upstream -f branch=main > /dev/null
+          git init -q fork && cd fork
+          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/ds4.git"
+          git remote add upstream https://github.com/antirez/ds4.git
+          git fetch -q --filter=blob:none upstream "$UPSTREAM"
+          git fetch -q --filter=blob:none fork 1bit/main
+          carried=$(git rev-parse FETCH_HEAD)
+          if [ "$carried" != "$OURS" ]; then
+            echo "::error::1bit/main (${carried:0:12}) is not the engine's pin (${OURS:0:12}); reconcile them by hand"
+            exit 1
+          fi
+          git fetch -q --filter=blob:none upstream "$OURS_BASE"
+          git checkout -q --detach "$carried"
+          if ! git -c user.name=ds4-bump -c user.email=ds4-bump@users.noreply.github.com \
+               rebase -q --onto "$UPSTREAM" "$OURS_BASE"; then
+            git rebase --abort || true
+            echo "::error::our commits on 1bit/main do not rebase onto antirez/ds4 ${UPSTREAM:0:12}; rebase them by hand"
+            exit 1
+          fi
+          rebased=$(git rev-parse HEAD)
+          git tag "ds4-main-${carried:0:12}" "$carried"
+          git push -q fork "refs/tags/ds4-main-${carried:0:12}"
+          git push -q --force-with-lease="refs/heads/1bit/main:$carried" fork "$rebased:refs/heads/1bit/main"
+          {
+            echo "rebased=$rebased"
+            echo "patches<<EOF"; git log --format='- `%h` %s' "$UPSTREAM..$rebased"; echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the bump PR
@@ -72,26 +116,32 @@ jobs:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
           OURS: ${{ steps.pins.outputs.ours }}
+          OURS_BASE: ${{ steps.pins.outputs.ours_base }}
+          REBASED: ${{ steps.fork.outputs.rebased }}
+          PATCHES: ${{ steps.fork.outputs.patches }}
         run: |
           set -euo pipefail
           branch="bump-ds4/${UPSTREAM:0:12}"
           if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
             echo "$branch already exists"; exit 0
           fi
-          log=$(gh api "repos/antirez/ds4/compare/${OURS}...${UPSTREAM}" \
+          log=$(gh api "repos/antirez/ds4/compare/${OURS_BASE}...${UPSTREAM}" \
                   --jq '.commits[-30:][] | "- \(.sha[0:9]) \(.commit.message | split("\n")[0])"' || true)
           git config user.name "ds4-bump"
           git config user.email "ds4-bump@users.noreply.github.com"
           git switch -c "$branch"
-          git update-index --cacheinfo "160000,$UPSTREAM,third_party/ds4"
+          git update-index --cacheinfo "160000,$REBASED,third_party/ds4"
           git commit -q -m "Bump DwarfStar: antirez/ds4 ${UPSTREAM:0:12}"
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Bump DwarfStar: antirez/ds4 ${UPSTREAM:0:12}" \
-            --body "Moves third_party/ds4 from \`${OURS:0:12}\` to upstream main \`${UPSTREAM:0:12}\`.
+            --body "Moves third_party/ds4 (1bit-MONSTER/ds4 1bit/main) from \`${OURS:0:12}\` to \`${REBASED:0:12}\`: upstream main \`${UPSTREAM:0:12}\` plus the commits we carry.
 
           Upstream commits (last 30):
           ${log}
 
+          Our commits, rebased onto upstream (none left means upstream has them all):
+          ${PATCHES:-none}
+
           CI here has no GPU. Before merging, on Strix Halo:
-          \`DS4_TEST=1 scripts/build-ds4.sh ~/.cache/ds4-pin rocm\` (builds, then runs DwarfStar's model-free routed-MoE GPU test), then \`1bit serve --device ds4 -m <DeepSeek V4 Flash Q2 .gguf> --ctx-size 8192\` answers a chat request (docs/dwarfstar.md)."
+          \`DS4_TEST=1 scripts/build-ds4.sh ~/.cache/ds4-pin rocm\` (builds, then runs DwarfStar's model-free routed-MoE GPU test), then \`1bit serve --device ds4 -m <DeepSeek V4 Flash Q2 .gguf> --ctx-size 8192\` and the same with its \`.1bp\` (\`gguf-tools/gguf_to_1bp.py\`) answer the same chat request (docs/dwarfstar.md)."

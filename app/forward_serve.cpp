@@ -286,9 +286,10 @@ int run_forward_serve(int argc, char** argv) {
     // against a sibling serve.  Held for the life of the process (fd not closed),
     // exactly like the runner.
     if (!std::getenv("NPU_NO_DEVICE_LOCK")) {
-        const char* lk = std::getenv("NPU_DEVICE_LOCK");
-        if (!lk || !lk[0]) lk = "/tmp/1bit-npu-device.lock";
-        int lfd = ::open(lk, O_CREAT | O_RDWR, 0666);
+        // flock needs only a read fd, so the file stays 0644 and other users can
+        // still open it; O_NOFOLLOW refuses a symlink planted in /tmp.
+        const char* lk = "/tmp/1bit-npu-device.lock";
+        int lfd = ::open(lk, O_CREAT | O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0644);
         if (lfd >= 0) {
             if (::flock(lfd, LOCK_EX | LOCK_NB) != 0) {
                 std::fprintf(stderr, "[npu] waiting for the exclusive device lock (%s)...\n", lk);

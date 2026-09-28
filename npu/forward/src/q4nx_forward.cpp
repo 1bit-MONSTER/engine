@@ -39,6 +39,13 @@
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
+// Debug dumps (NPU_INFER_DUMP_*): the path is the developer's own choice, so write it owner-only
+// (0600) and never follow a symlink, the same way the hidden-state dump below does.
+static FILE* open_debug_dump(const char* path) {
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    return fd >= 0 ? fdopen(fd, "wb") : nullptr;
+}
+
 static inline float bf16_to_f32(uint16_t bf) {
     uint32_t bits = (uint32_t)bf << 16;
     float f;
@@ -1776,7 +1783,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             if (!mla_attn(l, xn, o, pos)) return false;
             for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_;
             if (l == 0 && pos == 0 && getenv("NPU_INFER_DUMP_ATTN")) {
-                FILE* f = fopen(getenv("NPU_INFER_DUMP_ATTN"), "wb");
+                FILE* f = open_debug_dump(getenv("NPU_INFER_DUMP_ATTN"));
                 if (f) { fwrite(x.data(), sizeof(float), (size_t)H, f); fclose(f); }
             }
             rmsnorm(x.data(), post_norm_[l].data(), H, xn.data());
@@ -1790,7 +1797,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             // comparison (NPU_INFER_DUMP_LN names the layer).
             if (getenv("NPU_INFER_DUMP_LN") && l == atoi(getenv("NPU_INFER_DUMP_LN")) && pos == 0) {
                 const char* p = getenv("NPU_INFER_DUMP_L0");
-                FILE* f = fopen(p ? p : "/tmp/npu_layer.bin", "wb");
+                FILE* f = open_debug_dump(p ? p : "/tmp/npu_layer.bin");
                 if (f) { fwrite(x.data(), sizeof(float), (size_t)H, f); fclose(f); }
                 fprintf(stderr, "  [mla] dumped layer-%d x (%d floats)\n", l, H);
             }
@@ -2025,7 +2032,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 [&]{ float m=0; for(float v:xn) m=std::max(m, std::fabs(v)); return m; }(), hp);
     }
     if (getenv("NPU_INFER_DUMP_HEAD")) {
-        FILE* f = fopen(getenv("NPU_INFER_DUMP_HEAD"), "wb");
+        FILE* f = open_debug_dump(getenv("NPU_INFER_DUMP_HEAD"));
         if (f) { fwrite(xn.data(), sizeof(float), (size_t)xn.size(), f); fclose(f); }
     }
     if (!run_lm_head(xn, logits)) return false;

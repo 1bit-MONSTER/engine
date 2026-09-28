@@ -1,0 +1,23 @@
+{
+ "about": "Request class -> device for 1bit serve --laya (RFC #186, docs/laya.md). A row may name any device the model can run on; a device not available for the model falls back to default. Change a row only with a measured net gain (decode and time to first token, the Laya decision included).",
+ "min_confidence": 0.16,
+ "default": "vulkan",
+ "classes": {
+  "code": {
+   "device": "vulkan",
+   "why": "Vulkan decodes fastest on Strix Halo for every measured .gguf (docs/hrx.md, docs/serve.md); with DFlash2, code runs 45.7 tok/s on Qwen3.8-27B."
+  },
+  "prose": {
+   "device": "vulkan",
+   "why": "Same device as code; DFlash2 and MTP are within 10% on prose (28.3 vs 25.8 tok/s, Qwen3.8-27B)."
+  },
+  "short": {
+   "device": "vulkan",
+   "why": "MTP beats DFlash2 on short replies (28.2 vs 17.8 tok/s), but the drafter is per server (per-request speculative settings are ignored, measured 2026-09-28), and a second 27B server for ~0.3 s per short reply costs ~16 GB and loses to the decision time."
+  },
+  "long_doc": {
+   "device": "vulkan",
+   "why": "Prompt processing dominates: Vulkan ~330 t/s on a 1,838-token prompt (Qwen3.8-27B), HRX 43-88 t/s pp512 on that model (measured 2026-09-28)."
+  }
+ }
+}

@@ -287,14 +287,23 @@ endif()
 # The non-autoregressive decision scorer that picks where each request runs.
 # Depends on onebit_npu only for its tokenizer.json reader; the scorer itself
 # is device-independent (weights via model.safetensors, no Python at runtime).
-add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp)
-target_include_directories(onebit_laya PUBLIC laya)
-target_link_libraries(onebit_laya PUBLIC onebit_npu)
+# config/route-policy.json (request class -> device, RFC #186) is compiled in as the default
+# policy; --route-policy replaces it at run time.
+file(READ ${CMAKE_SOURCE_DIR}/config/route-policy.json ONEBIT_ROUTE_POLICY_JSON)
+file(WRITE ${CMAKE_BINARY_DIR}/generated/route_policy_default.h
+     "// generated from config/route-policy.json by CMakeLists.txt\n#pragma once\n"
+     "static const char kDefaultRoutePolicyJson[] = R\"ONEBITPOLICY(${ONEBIT_ROUTE_POLICY_JSON})ONEBITPOLICY\";\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/route-policy.json)
+add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp laya/policy.cpp)
+target_include_directories(onebit_laya PUBLIC laya PRIVATE ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(onebit_laya PUBLIC onebit_npu nlohmann_json::nlohmann_json)
 # The engine binary gets `1bit route` and per-request routing through the scorer.
 target_link_libraries(onebit PRIVATE onebit_laya)
 target_compile_definitions(onebit PRIVATE ONEBIT_LAYA)
 
 add_executable(laya_gate tests/laya_gate.cpp)
+add_executable(laya_classify_eval tests/laya_classify_eval.cpp)
+target_link_libraries(laya_classify_eval PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 target_link_libraries(laya_gate PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 # Each pinned checkpoint gates against its own golden.json from the Python reference.
 set(ONEBIT_LAYA_ROOT "" CACHE PATH "Root Laya checkpoint dir (model.safetensors + tokenizer/tokenizer.json)")
@@ -310,6 +319,9 @@ endif()
 set(ONEBIT_LAYA_ROUTE_MODEL "" CACHE PATH "Laya checkpoint dir for the per-request routing e2e test")
 if(ONEBIT_LAYA_ROUTE_MODEL)
     add_test(NAME laya_route_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_route_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
+    # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
+    add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
+             ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
 endif()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:

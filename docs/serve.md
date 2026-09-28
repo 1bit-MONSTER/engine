@@ -27,6 +27,7 @@ OpenAI client.
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--laya | --laya-model DIR] [--route-policy FILE]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
            [--parallel N] [--adaptive] [--adaptive-at N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
@@ -85,8 +86,10 @@ For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
 the served model name. For ZINC, which rejects foreign model ids, requests go
 out without `model`. `auto` means Vulkan for GGUF, the fastest measured device
-for standard quants (docs/hrx.md), until the Laya router (docs/laya.md) makes
-that choice per request.
+for standard quants (docs/hrx.md). With `--laya` (or `--laya-model DIR`), Laya classifies
+each conversation and the route policy picks the device; the built-in policy keeps every
+class on Vulkan until a class has a measured faster device, and the first turn of a
+conversation pays about 0.5 s for the decision (docs/laya.md).
 
 HRX needs TheRock's HSA runtime: the distro `libhsa` rejects gfx1151's
 PM4-emulation probe, and then HRX registers no device. `serve` sets

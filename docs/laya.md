@@ -31,6 +31,7 @@ checkpoints and a router that picks between them.
 | Checkpoints | `config/laya.json` = Hugging Face `convaiinnovations/laya` at revision **`aa8c91ca`**: root (842 MB), `multilingual/` (644 MB, 34 MB tokenizer), `typed-decisions/` (842 MB) | `bump-laya.yml` (moves the source and the revision together) |
 
 ```sh
+scripts/fetch-laya.sh            # into ~/.local/share/1bit/laya, where serve --laya looks
 scripts/fetch-laya.sh ~/models/laya-pinned
 ```
 
@@ -80,20 +81,69 @@ probabilities <= 1e-4. Verified 2026-09-25 on Strix Halo.
 
 ## Routing
 
-`1bit serve --device auto --laya-model <dir>` routes each request with the
-scorer instead of the old `auto -> vulkan` hardcode: the fixed routing question
-(\"which device should run this request?\") returns the device, and the serve
-process lazily starts that device's backend and forwards the request to it. The
-candidate devices follow from the model: a `.gguf` routes among `vulkan`, `hrx`
-and `zinc` (NPU runs Q4NX model directories, not `.gguf` files), and an NPU
-model directory routes to `npu`. `1bit route --laya-model <dir> --state <text>
-[--devices npu,hrx,vulkan,zinc]` prints the device for one request against a
-candidate set. `tests/laya_route_e2e.sh` proves requests reach the backend the
-scorer chose, across more than one device (fake backends stand in for
-llama-server and zinc).
+Asked directly which device should run a request, Laya picks the same one whatever the
+request: ZINC for 8 of 8 varied requests among `vulkan,hrx,zinc` (measured 2026-09-28, pinned
+root checkpoint). It knows nothing about this hardware. So since RFC
+[#186](https://github.com/orgs/1bit-MONSTER/discussions/186) it answers a question about the
+request instead, and a measured policy picks the device.
 
-`multilingual/` (mmBERT-base) and Apple/MLX routing are out of scope for this
-step.
+1. **Classify** (`laya/route.h`, `classify_request`). A request of 1,024 characters or more is
+   `long_doc` (a pasted document, log, table or file) without a model call. Anything shorter
+   gets one Laya choice among `code`, `prose` and `short`, with Laya's calibrated confidence.
+2. **Policy** (`config/route-policy.json`, compiled in; `--route-policy FILE` replaces it). Each
+   class names a device and why. A class whose confidence is below `min_confidence` (0.16) takes
+   the policy's `default`. A device the model cannot run on falls back to `default`.
+3. **Once per conversation.** `serve` caches the class by the conversation's opening (the messages
+   up to the first user message), so later turns skip the decision.
+
+```sh
+scripts/fetch-laya.sh
+1bit serve -m model.gguf --device auto --laya            # or --laya-model DIR
+1bit route --laya-model DIR --classify --state "Write a Rust function that sums a slice."
+# code 0.44 vulkan
+```
+
+Every routed reply carries `X-1bit-Route: <class> <confidence> <device>`, and `serve` logs each
+new decision, so real traffic shows how requests split. A directory holding the pinned repo's
+`typed-decisions/` checkpoint uses that one: it classifies best.
+
+**Classifier accuracy** (`tests/laya_classify_eval` on `tests/laya_route_cases.json`, 200
+hand-labelled requests, 50 per class; ctest `laya_classify` fails below 90%):
+
+| Checkpoint, question | Accuracy | code | prose | short | long_doc | ms per decision |
+|---|---|---|---|---|---|---|
+| **`typed-decisions/`, size gate + three-way question** | **95.5%** | 100% | 82% | 100% | 100% | 588 |
+| root, size gate + three-way question | 92.0% | 94% | 74% | 100% | 100% | 401 |
+| `typed-decisions/`, four-way question, no size gate | 80.5% | 100% | 62% | 90% | 70% | 1,739 |
+| root, four-way question, no size gate | 64.0% | 98% | 30% | 96% | 32% | 1,379 |
+
+Prose is the class Laya misses most, reading it as short. Confidence tracks accuracy: the least
+confident quarter is right 84% of the time, the rest 98-100%.
+
+**Why every class goes to Vulkan today.** The policy may only change a row for a measured net
+gain, and on Strix Halo none exists yet. Vulkan decodes fastest on every measured `.gguf`
+([hrx.md](hrx.md), [serve.md](serve.md)). The only per-class difference measured is the drafter:
+on Qwen3.8-27B, short replies decode faster with MTP (28.2 tok/s) than with DFlash2 (17.8), code
+the other way round (45.7 against 31.7). But llama-server fixes the drafter per server:
+`speculative.type`, `speculative.n_max` and `speculative.p_min` in a request are ignored
+(`draft_n` unchanged, 2026-09-28, on the engine's pin and upstream master), so the short-reply
+gain would need a second server holding a second copy of the model (about 16 GB for 27B) to save
+about 0.3 s on a 16-token reply.
+
+**Cost** (`1bit serve --device auto --laya`, Qwen3.8-27B Q4_0 + DFlash2, 2026-09-28):
+
+| | 1-token reply, first turn | later turn | decode code / prose / short, tok/s |
+|---|---|---|---|
+| without `--laya` | 498-518 ms | 713-849 ms | 50.5-50.7 / 26.7-26.9 / 19.0-19.2 |
+| `--laya` | 1,008-1,048 ms | 703-767 ms | 50.6 / 26.7 / 18.9-19.1 |
+
+The first turn of a conversation pays about 0.5 s; later turns and decode are unchanged. That is
+why routing stays opt-in: `--device auto` without `--laya` still means Vulkan, as before.
+
+`tests/laya_route_e2e.sh` proves each class reaches the device the policy names
+(`tests/route-policy-e2e.json` sends code, prose and short to three fake devices), the header,
+the reuse on a later turn, and the error when no checkpoint is installed. A Q4NX model directory
+runs on the NPU only. `multilingual/` (mmBERT-base) and Apple/MLX routing are out of scope.
 
 ## Cost per decision
 
@@ -103,5 +153,6 @@ once, and each decision takes **0.38 s** (it was 8.75 s). Only the encoder's lay
 changed. Its projections and GeGLU go through the threaded `linear()`, the attention runs
 one thread per (sequence, head), and `linear()` reads each weight row once per four input
 rows. Every sum keeps its order, so the gate output is byte-identical to the
-single-threaded scorer. `1bit serve --laya-model` pays the decision cost before each
-request starts generating.
+single-threaded scorer. Those figures are for the old device question on a short request.
+The request-class decision takes 0.4-0.6 s (the table above), and `serve` pays it once per
+conversation.

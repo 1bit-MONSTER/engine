@@ -200,8 +200,13 @@ experts, the attention, or the shared expert, dense layer and embedding) costs a
 own. Its wikitext perplexity drops under Q4_0 (10.41 to 7.97-8.73) because the output
 distribution flattens, so perplexity alone reads this model the wrong way round. The Q8_0
 reference is sound: it gives PPL 10.44 on upstream HIP and 11.01 on Vulkan, and KLD 0.015
-across backends. For GLM-4.7-Flash, use a higher-precision file; the W4A4 route is not worth its
-accuracy there until the Q4_0 base is better.
+across backends. An importance matrix repairs the weights but not the activations. An unrotated Q4_0 made with
+an imatrix (wikitext-2 train, 150 x 512) scores KLD 0.197 on the exact path, PPL 10.81; the same
+file with W4A4 on attention scores 0.322 and with W4A4 everywhere 0.571. On the rotated file an
+imatrix does nothing: Q4_0 has one scale per 32 values, the rotation spreads the outlier columns
+across the block, and even an imatrix collected on the rotated activations moves KLD from 0.528
+to 0.522. For GLM-4.7-Flash, use the exact path with an imatrix Q4_0, or a higher-precision
+file; its activations do not take 4 bits.
 
 ### End to end: time to first token and effective speed
 

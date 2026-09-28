@@ -297,16 +297,41 @@ def main():
         except Exception:
             _c = {}
         _t = _c.get("default_tensor_type")
-        if _t and _t != "Q4_1":
+        # deepseek2: the converter's k_b "MLA math grid" transpose (its commit
+        # 62594563f) is INVERTED.  The dequantised per-head slice is [512][192]
+        # (kv_lora x nope); packed AS-IS it is the 12 tiles/head the forward reads
+        # (`kb_rows_ = qk_nope_ = 192`), while transposing it to [192][512] gives
+        # 16 tiles/head and the forward then segfaults.  Measured directly against
+        # the converter's own _pack_2d_float, and against the working Q4NX the
+        # GLM capture used.  Neutralise the gate in the patched copy.
+        _kb_patch = False
+        _kb_file = os.path.join(converter_dir, "q4nx", "models", _arch + ".py")
+        if _arch == "deepseek2" and os.path.exists(_kb_file):
+            try:
+                if 'transpose_slice = "k_b_proj" in nm' in open(_kb_file).read():
+                    _kb_patch = True
+            except Exception:
+                pass
+        if (_t and _t != "Q4_1") or _kb_patch:
             import shutil as _shutil, tempfile as _tempfile
             run_dir = _tempfile.mkdtemp(prefix="q4nx-converter-")
             _shutil.copytree(converter_dir, run_dir, dirs_exist_ok=True)
-            _c["default_tensor_type"] = "Q4_1"
-            with open(os.path.join(run_dir, "configs", _arch + ".json"), "w") as f:
-                json.dump(_c, f, indent=4)
-            print(f"repack: {_arch} config asks for default_tensor_type={_t}; the NPU "
-                  f"forward reads Q4_1 tiles, so the converter runs from a patched "
-                  f"copy ({run_dir})")
+            if _t and _t != "Q4_1":
+                _c["default_tensor_type"] = "Q4_1"
+                with open(os.path.join(run_dir, "configs", _arch + ".json"), "w") as f:
+                    json.dump(_c, f, indent=4)
+                print(f"repack: {_arch} config asks for default_tensor_type={_t}; the NPU "
+                      f"forward reads Q4_1 tiles, so the converter runs from a patched "
+                      f"copy ({run_dir})")
+            if _kb_patch:
+                _p = os.path.join(run_dir, "q4nx", "models", _arch + ".py")
+                _s2 = open(_p).read().replace(
+                    'transpose_slice = "k_b_proj" in nm',
+                    'transpose_slice = False  # engine: k_b packs as-is -> 12 tiles/head')
+                with open(_p, "w") as f:
+                    f.write(_s2)
+                print(f"repack: {_arch} k_b transpose is inverted (gives 16 tiles/head, the "
+                      f"forward reads 12); neutralised in the patched copy ({run_dir})")
     r = subprocess.run([sys.executable, os.path.join(run_dir, "convert.py"), gguf, out_dir],
                        cwd=run_dir)
     if r.returncode != 0 or not os.path.exists(os.path.join(out_dir, "model.q4nx")):

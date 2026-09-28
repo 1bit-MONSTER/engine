@@ -660,6 +660,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
             if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
+            // 1024-token micro-batches: prompt processing +3-8% over the default 512 (Qwen3-Coder-30B-A3B,
+            // pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; 2048 is no better), decode unchanged
+            argv.insert(argv.end(), {"-ub", "1024"});
         }
     } else if (device == "vulkan" || device == "hrx") {
         // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash

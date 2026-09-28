@@ -307,7 +307,9 @@ Qwen3-Coder-30B-A3B, 256 output tokens, effective tok/s (output tokens over the 
 | **`--long-model`** | **71.3** | 53.1 | 25.5 | 13.1 |
 
 The `--long-model` row ran while another job used the box's memory bus, which cost its long
-side 2-5% against the W4A4 row. Both files stay loaded (here 17 + 16 GiB). It needs the Vulkan
+side 2-5% against the W4A4 row. A rotated file now runs 1024-token micro-batches (`-ub 1024`),
+which raises the W4A4 prefill 6-10% (server-reported 2,217 / 1,742 / 1,295 tok/s at 2K / 8K /
+16K, from 2,000 / 1,607 / 1,221): a 16K-token prompt's first token at 12.96 s instead of 13.89. Both files stay loaded (here 17 + 16 GiB). It needs the Vulkan
 build and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`, and `-m` on a llama-server route (vulkan, hrx or
 rocm); it does not combine with `--laya`, `--adaptive` or `--mmproj`.
 

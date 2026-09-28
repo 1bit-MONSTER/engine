@@ -126,8 +126,8 @@
    "passed": true,
    "said": "**Paris**",
    "failed": [],
-   "date": "2026-09-25",
-   "engine": "8c2805d977eb"
+   "date": "2026-09-28",
+   "engine": "97a43e2b1b2c"
   },
   {
    "backend": "vulkan",

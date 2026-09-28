@@ -27,6 +27,7 @@
 #include "q4nx_forward.h"
 #include <fcntl.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -1299,6 +1300,8 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         if (a > amax) amax = a;
     }
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const bool prof = getenv("NPU_PROFILE") != nullptr;
+    const auto tp = std::chrono::steady_clock::now();
 
     // Token-invariant weights (wkey >= 0) get their own BO, packed once and
     // reused; every other call (wkey < 0: routed experts, whose weights change
@@ -1325,14 +1328,30 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         gs = &ctx.group_scales[0];
     }
 
+    const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     xrt::run r = slot ? ctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
                       : ctx.sync_and_launch(0);
+    const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ctx.wait_kernel(r);
+    const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ctx.readback();
+    const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     out.resize((size_t)N);
     for (int n = 0; n < N; n++)
         out[(size_t)n] = (float)ctx.Cm[n] * as * (*gs)[(size_t)n];
+
+    if (prof) {
+        static double sp = 0.0, sq = 0.0, sw = 0.0, sr = 0.0;
+        static long sn = 0;
+        sp += std::chrono::duration<double, std::milli>(tl - tp).count();
+        sq += std::chrono::duration<double, std::milli>(tq - tl).count();
+        sw += std::chrono::duration<double, std::milli>(tw - tq).count();
+        sr += std::chrono::duration<double, std::milli>(tr - tw).count();
+        if (++sn % 50 == 0)
+            std::fprintf(stderr, "[prof] npu_gemm n=%ld pack=%.1f quant+launch=%.1f wait=%.1f readback=%.1f ms (N=%d)\n",
+                         sn, sp / (double)sn, sq / (double)sn, sw / (double)sn, sr / (double)sn, N);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -2223,12 +2242,15 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // read out of designs_[-1] -- garbage, and the ntiles division below raised
     // SIGFPE.  Only this NPU path uses T (the host path is a plain matvec), which is
     // why GLM crashed here the first time the ELF path was exercised.
-    int i_qkv = idx_of(Q4NX_DESIGN_QKV);
-    if (i_qkv < 0 || designs_[i_qkv].K != H || designs_[i_qkv].N <= 0)
-        i_qkv = idx_of(Q4NX_DESIGN_DG);              // K=H, N=dense_im
-    if (i_qkv < 0 || designs_[i_qkv].K != H || designs_[i_qkv].N <= 0)
-        i_qkv = idx_of(Q4NX_DESIGN_G);               // K=H, N=expert_im
-    if (i_qkv < 0 || designs_[i_qkv].K != H || designs_[i_qkv].N <= 0) {
+    // Pick the WIDEST design with K=H for the head.  Each tile is a separate
+    // synchronous launch (~one NPU round-trip each, ~constant regardless of N),
+    // so fewer/larger tiles mean fewer launches for the same math.
+    int i_qkv = -1;
+    for (int d = 0; d < ndesigns_; d++) {
+        if (designs_[d].K != H || designs_[d].N <= 0) continue;
+        if (i_qkv < 0 || designs_[d].N > designs_[i_qkv].N) i_qkv = d;
+    }
+    if (i_qkv < 0) {
         err_ = "LM head: no GEMM design with K=H available";
         return false;
     }

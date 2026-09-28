@@ -247,6 +247,9 @@ effective speed is +56%. Agents and coding tools send long prompts (files, tool 
 history), so that is where this route is for. The two files are not the same quantization
 (Q4_K_M against rotated Q4_0), so the table compares routes as they ship, not kernels.
 
+`1bit serve --long-model` takes both at once: short conversations on Vulkan, long ones on
+this route ([serve.md](serve.md#short-and-long-prompts---long-model)).
+
 The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
 +1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through
 `1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` (no device flag: the stamp picks the route), a

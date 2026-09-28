@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: hrx, milestone, kernels
+summary: One barrier that fenced only shared memory caused HRX's NaNs and GPU faults; the fix took Qwen3-Coder-30B from 1 of 8 correct runs to 8 of 8.
 
 # Milestone: the HRX decode race is solved
 

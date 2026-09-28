@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: announcement, engine
+summary: The inference engine from 1bit.MONSTER is now its own Apache-2.0 project, 1bit engine, running as a backend inside Lemonade.
 
 # 1bit.MONSTER is now 1bit engine
 

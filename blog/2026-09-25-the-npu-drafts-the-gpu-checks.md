@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: npu, speculative-decoding
+summary: A small model on the NPU drafts, the GPU checks: Qwen3-32B goes from 10.7 to 23.4 tok/s, 2.19x.
 
 # The NPU drafts, the GPU checks
 

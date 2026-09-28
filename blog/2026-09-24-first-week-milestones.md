@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: milestones, npu, hrx, vulkan, zinc
+summary: Three days in: the engine runs on the NPU, HRX, Vulkan and ZINC inside Lemonade; Qwen3-0.6B decodes at 91 tok/s on the NPU, 87 through Lemonade.
 
 # The first week of 1bit engine
 

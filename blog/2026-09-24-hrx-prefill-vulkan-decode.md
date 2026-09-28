@@ -15,6 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: hrx, vulkan, zero-copy
+summary: HRX prefills, Vulkan decodes, one KV cache and no copies: an 8,192-token request on Qwen2.5-7B finishes 26% sooner.
 
 # Prefill on HRX, decode on Vulkan, one KV cache
 

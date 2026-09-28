@@ -221,7 +221,11 @@ def main():
         if not os.path.exists(os.path.join(converter_dir, "convert.py")):
             print(f"stamp: cannot tell, converter unresolved ('{converter_dir}')")
             return 2
-        for key, want in (("converter_path", converter_dir), ("converter_commit", converter_commit())):
+        for key, want in (("converter_path", converter_dir), ("converter_commit", converter_commit()),
+                          # The NPU forward reads Q4_1 tiles; a dir built before the
+                          # repack forced Q4_1 (e.g. qwen2's old Q4_0 config) has no
+                          # such key and must be rebuilt.
+                          ("q4nx_default_tensor_type", "Q4_1")):
             if got.get(key) != want:
                 print(f"stamp: stale, {key}='{got.get(key)}' != '{want}'")
                 return 1
@@ -236,8 +240,45 @@ def main():
         return 1
 
     # The converter resolves configs/<arch>.json relative to its CWD.
-    r = subprocess.run([sys.executable, convert_py, gguf, out_dir],
-                       cwd=converter_dir)
+    #
+    # The NPU forward reads Q4_1 tiles (5120 B: 512 B bf16 scales + 512 B bf16
+    # zeros + 4096 B packed int4).  A converter config that asks for Q4_0 packs
+    # no zero half, and the forward then decodes the whole tensor wrong -- not a
+    # rounding error, garbage (Qwen2.5-7B-Instruct answered a CJK token instead
+    # of ' Paris'; the same GGUF repacked with Q4_1 is byte-identical to the
+    # published FastFlowLM dir).  qwen2.json and lfm2.json shipped Q4_0 while
+    # every other arch shipped Q4_1.  Rather than trust a moving external
+    # checkout, run the converter from a patched copy whenever this arch's
+    # config asks for anything but Q4_1.  The provenance stamp still records the
+    # resolved converter and its commit, so the dir cache stays stable.
+    run_dir = converter_dir
+    from gguf import GGUFReader as _GGUFReader
+    _r = _GGUFReader(gguf)
+    _af = _field(_r, "general.architecture")
+    _arch = _af.contents() if _af else ""
+    if isinstance(_arch, bytes):
+        _arch = _arch.decode()
+    _arch = str(_arch)
+    _cfg = os.path.join(converter_dir, "configs", _arch + ".json")
+    if _arch and os.path.exists(_cfg):
+        try:
+            with open(_cfg) as f:
+                _c = json.load(f)
+        except Exception:
+            _c = {}
+        _t = _c.get("default_tensor_type")
+        if _t and _t != "Q4_1":
+            import shutil as _shutil, tempfile as _tempfile
+            run_dir = _tempfile.mkdtemp(prefix="q4nx-converter-")
+            _shutil.copytree(converter_dir, run_dir, dirs_exist_ok=True)
+            _c["default_tensor_type"] = "Q4_1"
+            with open(os.path.join(run_dir, "configs", _arch + ".json"), "w") as f:
+                json.dump(_c, f, indent=4)
+            print(f"repack: {_arch} config asks for default_tensor_type={_t}; the NPU "
+                  f"forward reads Q4_1 tiles, so the converter runs from a patched "
+                  f"copy ({run_dir})")
+    r = subprocess.run([sys.executable, os.path.join(run_dir, "convert.py"), gguf, out_dir],
+                       cwd=run_dir)
     if r.returncode != 0 or not os.path.exists(os.path.join(out_dir, "model.q4nx")):
         print("converter failed")
         return 1
@@ -273,6 +314,7 @@ def main():
         f.write(f"converter_commit={converter_commit()}\n")
         f.write(f"arch={arch}\n")
         f.write(f"model_type={cfg.get('model_type', '')}\n")
+        f.write("q4nx_default_tensor_type=Q4_1\n")
         f.write(f"repack_script={os.path.abspath(__file__)}\n")
 
     # Enforce the scale-key guard before the dir is cached (and before anyone

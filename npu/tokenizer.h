@@ -51,12 +51,21 @@ private:
     std::vector<std::string> id_to_text_;                    // dense, "" for gaps
     std::vector<std::pair<std::string, int>> added_;         // added tokens, longest first
     std::unordered_map<std::string, int> merge_ranks_;       // "a\x1fb" -> rank
+    // SentencePiece/unigram vocabularies (the converter emits model.type "BPE"
+    // with no merges and a ByteLevel pre-tokenizer for these, but the tokens are
+    // SPM pieces like "\xe2\x96\x81Paris").  Detected from an empty merge list plus
+    // "\xe2\x96\x81"-prefixed pieces, then encoded with sentencepiece rules instead of
+    // byte-level BPE (which would emit one id per byte).
+    bool spm_ = false;
+    size_t spm_max_piece_ = 0;
+    std::unordered_map<uint8_t, int> byte_fallback_;         // byte -> <0xNN> id
     uint32_t byte_to_char_[256];
     std::unordered_map<uint32_t, uint8_t> char_to_byte_;
     struct Regex;
     std::unique_ptr<Regex> split_;
 
     std::vector<int> bpe(const std::string& chars) const;
+    std::vector<int> spm(const std::string& text) const;
 };
 
 }  // namespace onebit::npu

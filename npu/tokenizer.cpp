@@ -167,6 +167,25 @@ Tokenizer::Tokenizer(const std::string& path) {
         merge_ranks_.emplace(a + "\x1f" + b, int(i));
     }
 
+    // SentencePiece/unigram detection (see tokenizer.h).
+    {
+        bool has_meta = false;
+        for (const auto& kv : vocab_)
+            if (kv.first.rfind("\xE2\x96\x81", 0) == 0) { has_meta = true; break; }
+        spm_ = merges.empty() && has_meta;
+        if (spm_) {
+            for (const auto& [text, id] : vocab_) {
+                if (text.size() == 6 && text.compare(0, 3, "<0x") == 0 && text[5] == '>') {
+                    int v = -1;
+                    try { v = std::stoi(text.substr(3, 2), nullptr, 16); } catch (...) {}
+                    if (v >= 0 && v < 256 && byte_fallback_.find(uint8_t(v)) == byte_fallback_.end())
+                        byte_fallback_[uint8_t(v)] = id;
+                }
+                if (text.size() > spm_max_piece_) spm_max_piece_ = text.size();
+            }
+        }
+    }
+
     id_to_text_.assign(size_t(max_id + 1), "");
     for (const auto& [text, id] : vocab_)
         if (id >= 0) id_to_text_[size_t(id)] = text;
@@ -204,6 +223,42 @@ std::vector<int> Tokenizer::bpe(const std::string& chars) const {
     return ids;
 }
 
+// SentencePiece: spaces become U+2581 ("\xe2\x96\x81", the metaspace symbol) with a
+// leading one for the whole run, then greedy longest-match over the vocabulary
+// with byte fallback for anything unmatched.  This reproduces llama.cpp's ids
+// for the SPM models the converter emits as BPE-with-no-merges (MiniCPM4:
+// "The capital of France is" -> 1507 8107 1379 8360 1410, matching the oracle).
+std::vector<int> Tokenizer::spm(const std::string& text) const {
+    static const char kMeta[] = "\xE2\x96\x81";
+    std::string s;
+    s.reserve(text.size() + 3);
+    s += kMeta;
+    for (char c : text) {
+        if (c == ' ') s += kMeta;
+        else s += c;
+    }
+    std::vector<int> ids;
+    size_t i = 0;
+    while (i < s.size()) {
+        const size_t maxl = std::min(spm_max_piece_, s.size() - i);
+        size_t best_len = 0;
+        int best_id = -1;
+        for (size_t L = maxl; L >= 1; --L) {
+            auto it = vocab_.find(s.substr(i, L));
+            if (it != vocab_.end()) { best_len = L; best_id = it->second; break; }
+        }
+        if (best_id >= 0) {
+            ids.push_back(best_id);
+            i += best_len;
+        } else {
+            auto fb = byte_fallback_.find(static_cast<uint8_t>(s[i]));
+            if (fb != byte_fallback_.end()) ids.push_back(fb->second);
+            ++i;  // unmatched byte with no <0xNN>: drop it, as sentencepiece does
+        }
+    }
+    return ids;
+}
+
 int Tokenizer::token_id(const std::string& token) const {
     const auto it = vocab_.find(token);
     return it == vocab_.end() ? -1 : it->second;
@@ -212,6 +267,11 @@ int Tokenizer::token_id(const std::string& token) const {
 std::vector<int> Tokenizer::encode(const std::string& text) const {
     std::vector<int> ids;
     auto plain = [&](const std::string& run) {
+        if (spm_) {
+            const auto p = spm(run);
+            ids.insert(ids.end(), p.begin(), p.end());
+            return;
+        }
         for (const auto& piece : split_->split(run)) {
             std::string chars;
             for (unsigned char b : piece) utf8_append(chars, byte_to_char_[b]);
@@ -243,6 +303,25 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
 }
 
 std::string Tokenizer::decode(const std::vector<int>& ids) const {
+    if (spm_) {
+        static const char kMeta[] = "\xE2\x96\x81";
+        std::string out;
+        for (int id : ids) {
+            if (id < 0 || size_t(id) >= id_to_text_.size()) continue;
+            const std::string& t = id_to_text_[size_t(id)];
+            if (t.size() == 6 && t.compare(0, 3, "<0x") == 0 && t[5] == '>') {
+                int v = -1;
+                try { v = std::stoi(t.substr(3, 2), nullptr, 16); } catch (...) { continue; }
+                out += static_cast<char>(v);
+                continue;
+            }
+            for (size_t i = 0; i < t.size();) {
+                if (t.compare(i, 3, kMeta) == 0) { out += ' '; i += 3; }
+                else out += t[i++];
+            }
+        }
+        return out;
+    }
     std::string out;
     for (int id : ids) {
         if (id < 0 || size_t(id) >= id_to_text_.size()) continue;

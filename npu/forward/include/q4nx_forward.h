@@ -40,10 +40,12 @@
 #include "model.h"
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
 #include "q4nx_semantics.h"   // Q4nxSemantics (config-derived architecture flags)
+#include <memory>
+#include <unordered_map>
 
 struct I8Ctx;
 
-namespace xrt { class device; }
+namespace xrt { class device; class bo; }
 
 struct Q4nxForwardConfig {
     int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
@@ -93,7 +95,14 @@ private:
     bool host_gemm_ = false;
     bool load_layer(int l);
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                  const float* Bmat, std::vector<float>& out);
+                  const float* Bmat, std::vector<float>& out, int wkey = -1);
+    // True when this layer's projection `wkey` is already packed in its own BO,
+    // so the caller can skip both the Q4NX dequant (load_layer) and the f32->B
+    // assembly for the rest of the run.
+    bool weight_cached(int key) const {
+        return weight_cache_ && cur_layer_ >= 0 && cur_layer_ < (int)wcache_.size() &&
+               wcache_[(size_t)cur_layer_].find(key) != wcache_[(size_t)cur_layer_].end();
+    }
     bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv);
@@ -144,16 +153,46 @@ private:
     std::vector<std::vector<float>> q_norm_, k_norm_;       // [NL][HD]
     std::vector<std::vector<float>> q_bias_, k_bias_, v_bias_;  // [NL][NH*HD]/[NL][NKV*HD] attention biases
     std::vector<float> rope_scale_;  // LongRoPE short_factor (per-half-dim), empty when none
-    // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 elsewhere.
-    // MiniCPM4 scales the embedding by 12.0 and every residual branch by
-    // scale_depth/sqrt(NL) (0.2475 for 32 layers).
+    // MiniCPM4 scales (config "embedding_scale" / "residual_scale"); 1.0 for
+    // every other architecture.  MiniCPM4 scales the embedding by 12 and each
+    // residual branch by scale_depth/sqrt(NL) (0.2475 for 32 layers); skipping
+    // them sends the hidden state to the wrong magnitude and the logits explode.
     float embed_scale_ = 1.0f;
     float residual_scale_ = 1.0f;
-    // MiniCPM4 logit_scale (config "logit_scale", 16.0).  The final logits are
-    // DIVIDED by it; 1.0 = no-op everywhere else.  A constant positive divisor
-    // cannot move an argmax, so this only matters for the probability
-    // distribution (sampling/temperature).
+    // MiniCPM4 logit_scale (config "logit_scale", 16.0 for GLM's sibling
+    // MiniCPM4).  The final logits are DIVIDED by it.  1.0 = no-op everywhere
+    // else.  A constant positive divisor cannot move an argmax, so this only
+    // matters for the probability distribution (sampling/temperature).
     float logit_scale_ = 1.0f;
+
+    // ---- MLA + MoE (deepseek2 / GLM-4.7-Flash) ----
+    // Set from config.json in init_impl; mla_ == 0 leaves every path below
+    // untouched.  Each layer's dequantized weights are held here and refilled by
+    // load_layer(), sized from the model's own dims.
+    int mla_ = 0;
+    int q_lora_ = 0, kv_lora_ = 0, rope_dim_ = 0, qk_nope_ = 0, v_head_ = 0;
+    int n_expert_ = 0, top_k_ = 0, expert_im_ = 0, dense_im_ = 0;
+    int leading_dense_ = 0;
+    int expert_gating_sigmoid_ = 1;   // llama.cpp deepseek2: 2 = sigmoid, 1 = softmax
+    float expert_w_scale_ = 1.0f;     // applied after the top-k weight normalisation
+    std::vector<float> w_qa_, w_qb_, w_kva_, w_o_;      // per layer, [out][in]
+    std::vector<float> mla_qan_, mla_kvan_;             // q_a / kv_a layernorms
+    std::vector<float> w_kb_, w_vb_;                    // [NH][N][K], N padded for k_b
+    int kb_rows_ = 0;                                   // k_b's padded row count (256)
+    std::vector<std::vector<float>> mla_kn_, mla_kr_, mla_v_;  // per-layer MLA caches
+    std::vector<float> moe_router_, moe_router_b_, share_g_, share_u_, share_d_;
+    std::vector<float> dense_g_, dense_u_, dense_d_;    // leading dense layer only
+    // Routed experts stay packed until selected: per layer the Q4NX pools them as
+    // [n_expert][tiles][5120].
+    const uint8_t* exp_g_ = nullptr; const uint8_t* exp_u_ = nullptr; const uint8_t* exp_d_ = nullptr;
+    size_t exp_g_bytes_ = 0, exp_u_bytes_ = 0, exp_d_bytes_ = 0;
+
+    bool mla_attn(int l, const std::vector<float>& x, std::vector<float>& o, int pos);
+    bool moe_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
+    bool dense_mlp(int l, const std::vector<float>& xn, std::vector<float>& d);
+    bool mla_rope(std::vector<float>& q, int NH, int qh, int nope, std::vector<float>& kr, int pos);
+    bool mla_expert(const uint8_t* pool, size_t per_expert, int e, int N, int K,
+                    std::vector<float>& out);
     std::vector<float> final_norm_;                         // [H]
 
     // Per-layer dequantized projections (reused each layer, chunked by design)
@@ -163,6 +202,18 @@ private:
     std::vector<std::vector<float>> kcache_, vcache_;
 
     std::vector<float> B_;        // packed weight scratch  (max K*N floats)
+    // Packed-int8 weight cache, one weight BO per (layer, wkey), packed on first
+    // use.  Without it every token re-dequantizes the Q4NX (load_layer) AND
+    // re-quantizes it (I8Ctx::packB) for every GEMM -- ~2 min/token on a 7B and
+    // ~8 min/token on the 8B, which makes a served answer impractical.  Only
+    // token-INVARIANT weights may be cached (dense projections, GDN, MLA, the
+    // shared expert); routed-expert weights vary per token and pass wkey < 0.
+    struct PackedWeight {
+        std::unique_ptr<xrt::bo> bo;
+        std::vector<float>       scales;
+    };
+    std::vector<std::unordered_map<int, PackedWeight>> wcache_;   // [layer][wkey]
+    bool weight_cache_ = true;    // NPU_NO_WCACHE=1 disables (A/B)
     int cur_layer_ = 0;           // layer currently being processed
 
     // ── Gemma4 (per-layer embeddings + KV sharing + extra norms) ──

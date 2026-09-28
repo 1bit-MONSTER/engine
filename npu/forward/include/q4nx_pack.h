@@ -67,6 +67,17 @@ typedef enum {
     Q4NX_DESIGN_O2,      /* 2nd attention type's O   (Gemma4 full layers)    */
     Q4NX_DESIGN_QKVLIN,  /* GDN linear attention's fused q|k|v: K=H, N=2*KD+VD */
     Q4NX_DESIGN_Z,       /* GDN in_proj_z (the gated-norm gate): K=H, N=VD   */
+    /* MLA (deepseek2, e.g. GLM-4.7-Flash).  These replace QKV; O/G/U/D are still
+     * used, with HD set to the per-head VALUE width so the O design's K = NH*HD =
+     * NH*v_head, and IM set to the per-expert intermediate so G/U/D are the
+     * expert MLP.  The dense leading layer gets its own DG/DU/DD.  Set
+     * dims->mla to derive this set. */
+    Q4NX_DESIGN_QA,      /* MLA q_a_proj:            K=H,       N=q_lora           */
+    Q4NX_DESIGN_QB,      /* MLA q_b_proj:            K=q_lora,  N=NH*(qk_nope+rope) */
+    Q4NX_DESIGN_KVA,     /* MLA kv_a_proj_with_mqa:  K=H,       N=kv_lora+rope     */
+    Q4NX_DESIGN_DG,      /* dense leading layer gate: K=H,       N=dense_im        */
+    Q4NX_DESIGN_DU,      /* dense leading layer up:   K=H,       N=dense_im        */
+    Q4NX_DESIGN_DD,      /* dense leading layer down: K=dense_im, N=H             */
     Q4NX_DESIGN_COUNT
 } Q4nxDesign;
 
@@ -76,6 +87,11 @@ typedef struct {
     char elf_name[Q4NX_ELF_NAME_MAX];  /* geometry-derived artifact name */
     int q_rows, k_rows, v_rows;        /* row counts along N for QKV */
     int gate_rows, up_rows;            /* row counts along N for GU/G/U */
+    /* Real N before the kernel's n-tile pad; 0 means "same as N".  Only KVA
+     * (kv_lora+rope_dim = 576, padded to 640) needs it: assemble_B scatters
+     * real_n columns and zero-fills the rest, so the weight is never read out
+     * of bounds. */
+    int real_n;
 } Q4nxDesignGeom;
 
 /* Architecture dims a design set is derived from. */
@@ -111,6 +127,17 @@ typedef struct {
      * [q(all heads) | gate(all heads)] (converter reorder).  Source:
      * attn_output_gate in the model's config.json. */
     int attn_output_gate;
+    /* MLA + MoE (deepseek2 / GLM-4.7-Flash).  mla == 0 for every other
+     * architecture, leaving the standard derivation untouched.  When set, HD must
+     * be the per-head VALUE width (so the O design's K = NH*HD = NH*v_head) and IM
+     * the per-expert intermediate (so G/U/D are the expert MLP). */
+    int mla;
+    int q_lora;      /* q_a_proj output width                       */
+    int kv_lora;     /* kv_a_proj latent width (excluding rope)      */
+    int rope_dim;    /* rope width inside kv_a and each q head       */
+    int qk_nope;     /* per-head qk width excluding rope             */
+    int dense_im;    /* leading dense layer's intermediate width     */
+    int mla_kva_pad; /* KVA design N pad: ceil((kv_lora+rope_dim)/128)*128 */
 } Q4nxModelDims;
 
 /* No model-specific geometry constant lives here by design: every caller

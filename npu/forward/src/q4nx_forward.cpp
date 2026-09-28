@@ -39,6 +39,16 @@
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
+#ifdef NPU_INFER_DEBUG_DUMPS
+// Debug dumps to a path named by an environment variable (NPU_INFER_DUMP_ATTN, _LN/_L0,
+// _HEAD): compiled only into debug builds (cmake -DONEBIT_NPU_DEBUG_DUMPS=ON), written
+// owner-only (0600) and never through a symlink.
+static FILE* open_debug_dump(const char* path) {
+    const int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC | O_NOFOLLOW, 0600);
+    return fd >= 0 ? fdopen(fd, "wb") : nullptr;
+}
+#endif
+
 static inline float bf16_to_f32(uint16_t bf) {
     uint32_t bits = (uint32_t)bf << 16;
     float f;
@@ -78,8 +88,10 @@ static int dequant_any(const void* data, size_t nbytes, int rows, int cols, floa
     return q4nx_dequant_tensor((const uint8_t*)data, nbytes, rows, cols, out);
 }
 
-// LongRoPE short_factor from config.json's rope_scaling (MiniCPM4). Returns the
-// per-half-dim frequency multipliers (empty when the config has none).
+// LongRoPE short_factor from config.json's rope_scaling (MiniCPM4): the
+// per-half-dim frequency multipliers.  Empty when the config declares none.
+// Ported from the engine route's npu/forward (commit 599ac77) so both copies of
+// the model-generic forward agree.
 static std::vector<float> read_rope_short_factor(const std::string& cfg_path) {
     std::vector<float> out;
     std::ifstream f(cfg_path);
@@ -176,6 +188,7 @@ bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir, bool use_elf) {
     if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
+    if (getenv("NPU_NO_WCACHE")) weight_cache_ = false;   // A/B: disable the packed-weight cache
     dev_ = dev;
 
     // ---- config.json FIRST, then model_load ----
@@ -334,6 +347,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
     kcache_.assign(NL, {});
     vcache_.assign(NL, {});
+    // Unconditional: this runs BEFORE the MLA detection below sets mla_, so
+    // gating it on mla_ left the MLA caches empty and mla_attn segfaulted.
+    mla_kn_.assign(NL, {}); mla_kr_.assign(NL, {}); mla_v_.assign(NL, {});
 
     // ---- derive the design set from the architecture dims ----
     // fused vs split gate/up is an artifact property, so probe for it rather
@@ -341,7 +357,50 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // Zero-initialised: the optionally-derived fields (ple_dim, double_wide_mlp,
     // NKV2/HD2, lin_kd/lin_vd, attn_output_gate) must be 0 when absent, not
     // garbage from the stack.
+    /* MLA + MoE (deepseek2 / GLM-4.7-Flash).  A deepseek2 config's
+     * head_dim/key_length describe the KV LATENT, not a per-head width, so the
+     * MLA geometry comes from its own keys; then HD is re-pointed at the per-head
+     * VALUE width so the standard O derivation gives K=NH*HD=NH*v_head, and IM at
+     * the per-EXPERT intermediate so G/U/D ARE the expert MLP. */
+    mla_ = q4nx_config_int(cfg_path.c_str(), "mla", 0);
+    if (mla_) {
+        q_lora_ = q4nx_config_int(cfg_path.c_str(), "q_lora_rank", 0);
+        kv_lora_ = q4nx_config_int(cfg_path.c_str(), "kv_lora_rank", 0);
+        rope_dim_ = q4nx_config_int(cfg_path.c_str(), "rope_dim", 0);
+        qk_nope_ = q4nx_config_int(cfg_path.c_str(), "qk_nope_head_dim", 0);
+        v_head_ = q4nx_config_int(cfg_path.c_str(), "v_head_dim", 0);
+        n_expert_ = q4nx_config_int(cfg_path.c_str(), "n_expert", 0);
+        top_k_ = q4nx_config_int(cfg_path.c_str(), "top_k", 0);
+        expert_im_ = c_.IM;
+        dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
+        leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 1);
+        expert_gating_sigmoid_ =
+            q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
+        expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
+        if (q_lora_ <= 0 || kv_lora_ <= 0 || rope_dim_ <= 0 || qk_nope_ <= 0 ||
+            v_head_ <= 0 || n_expert_ <= 0 || top_k_ <= 0 || expert_im_ <= 0 ||
+            dense_im_ <= 0) {
+            fprintf(stderr, "  [mla] config incomplete (q_lora=%d kv_lora=%d rope=%d nope=%d "
+                            "v_head=%d n_expert=%d top_k=%d im=%d dense_im=%d)\n",
+                    q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, n_expert_, top_k_,
+                    expert_im_, dense_im_);
+            err_ = "MLA config incomplete";
+            return false;
+        }
+        // k_b's Q4NX slice is [kv_lora][nope] with the nope axis padded to the
+        // 256-column block (192 -> 256), which is what its 16 tiles/head show.
+        kb_rows_ = qk_nope_;   /* the re-converted Q4NX packs k_b at [192][512], 12 tiles/head (verified corr 0.996926 vs the GGUF) */
+        c_.HD = v_head_;
+        fprintf(stderr, "  [mla] MLA+MoE: q_lora=%d kv_lora=%d rope=%d nope=%d v_head=%d "
+                        "NH=%d n_expert=%d top%d im=%d dense_im=%d gating=%s\n",
+                q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, c_.NH, n_expert_, top_k_,
+                expert_im_, dense_im_, expert_gating_sigmoid_ ? "sigmoid" : "softmax");
+    }
+
     Q4nxModelDims dims{};
+    dims.mla = mla_;
+    dims.q_lora = q_lora_; dims.kv_lora = kv_lora_; dims.rope_dim = rope_dim_;
+    dims.qk_nope = qk_nope_; dims.dense_im = dense_im_;
     dims.H = c_.H; dims.NH = c_.NH; dims.NKV = c_.NKV; dims.HD = c_.HD;
     dims.IM = c_.IM; dims.M = 128;
     dims.ple_dim = sem_.hidden_size_per_layer_input;
@@ -696,6 +755,97 @@ void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
 }
 
 bool Q4nxNpuForward::load_layer(int l) {
+    // MLA + MoE (deepseek2) has an entirely different tensor set.
+    if (mla_) {
+        const int H = c_.H, NH = c_.NH;
+        const int qh = qk_nope_ + rope_dim_;
+        const int kv_real = kv_lora_ + rope_dim_;
+        char nm[160];
+        auto td_of = [&](const char* fmt) -> TensorDesc* {
+            snprintf(nm, sizeof(nm), fmt, l);
+            return model_tensor_by_name(mw_, nm);
+        };
+        // A 2D packed tensor -> [rows][cols] floats.
+        auto load2 = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td_of(fmt);
+            if (!d) { fprintf(stderr, "  [mla] missing " ); snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr,"%s\n", nm); return false; }
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+        };
+        // A bf16 tensor (norms, router) is stored raw, not in 5120-byte tiles, so
+        // it bypasses dequant_any.
+        auto load_bf16 = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td_of(fmt);
+            if (!d) { snprintf(nm, sizeof(nm), fmt, l); fprintf(stderr, "  [mla] missing %s\n", nm); return false; }
+            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!p) return false;
+            v.resize((size_t)n);
+            for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
+            return true;
+        };
+        if (!load2("model.layers.%d.self_attn.q_a_proj.weight", w_qa_, q_lora_, H)) return false;
+        if (!load2("model.layers.%d.self_attn.q_b_proj.weight", w_qb_, NH * qh, q_lora_)) return false;
+        if (!load2("model.layers.%d.self_attn.kv_a_proj_with_mqa.weight", w_kva_, kv_real, H)) return false;
+        if (!load2("model.layers.%d.self_attn.o_proj.weight", w_o_, H, NH * v_head_)) return false;
+        if (!load_bf16("model.layers.%d.self_attn.q_a_layernorm.weight", mla_qan_, q_lora_)) return false;
+        if (!load_bf16("model.layers.%d.self_attn.kv_a_layernorm.weight", mla_kvan_, kv_lora_)) return false;
+        // k_b/v_b are pooled per head: [NH][tiles][5120].
+        auto load_heads3 = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td_of(fmt);
+            if (!d) { snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr, "  [mla] missing %s\n", nm); return false; }
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw) return false;
+            const size_t per = (size_t)d->data_size / (size_t)NH;
+            v.resize((size_t)NH * (size_t)rows * (size_t)cols);
+            for (int h = 0; h < NH; h++)
+                if (dequant_any(raw + (size_t)h * per, per, rows, cols,
+                                &v[(size_t)h * (size_t)rows * (size_t)cols]) != 0) return false;
+            return true;
+        };
+        if (!load_heads3("model.layers.%d.self_attn.k_b_proj.weight", w_kb_, kb_rows_, kv_lora_)) return false;
+        // v_b's Q4NX grid is [kv_lora][v_head] = [512][256] (NOT [256][512]).  Pinned
+        // empirically against llama.cpp's own tensor dump: reading it as a [512][256]
+        // grid and indexing flat[k*vh + n] reproduces the oracle's layer-0 post-attention
+        // sum to 5 decimals (-0.227843 vs -0.228092), where the [256][512] grid gave
+        // -0.454611.  The tile GRID (not just the flat order) matters: [512][256] and
+        // [256][512] have the same tile count but a different tile-to-element mapping.
+        if (!load_heads3("model.layers.%d.self_attn.v_b_proj.weight", w_vb_, kv_lora_, v_head_)) return false;
+        // Router + bias (bf16).
+        // Router, routed experts and the shared expert exist ONLY on the MoE
+        // layers: with leading_dense_block_count = 1 the leading dense layer(s)
+        // carry a plain MLP instead (46 of GLM-4.7-Flash's 47 layers have them).
+        if (l >= leading_dense_) {
+        if (!load_bf16("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H)) return false;
+        if (!load_bf16("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_)) return false;
+        // Routed experts stay packed until selected.  The Q4NX pools them per
+        // layer as [n_expert][tiles][5120], so hold the pointer plus the
+        // per-expert byte count and dequant one slice at a time.
+        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td_of(fmt);
+            if (!d) { snprintf(nm,sizeof(nm),fmt,l); fprintf(stderr, "  [mla] missing %s\n", nm); return false; }
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw) return false;
+            *p = raw;
+            *bytes = (size_t)d->data_size / (size_t)n_expert_;
+            return true;
+        };
+        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        // Shared expert ([tiles][5120], a plain 2D [im][H] / [H][im] matrix).
+        if (!load2("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) return false;
+        if (!load2("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) return false;
+        if (!load2("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) return false;
+        }   // end MoE-layer tensors
+        // The leading dense layer has no experts.
+        if (l < leading_dense_) {
+            if (!load2("model.layers.%d.mlp.gate_proj.weight", dense_g_, dense_im_, H)) return false;
+            if (!load2("model.layers.%d.mlp.up_proj.weight", dense_u_, dense_im_, H)) return false;
+            if (!load2("model.layers.%d.mlp.down_proj.weight", dense_d_, H, dense_im_)) return false;
+        }
+        return true;
+    }
     // A GDN (qwen3_5 linear_attention) layer has a different tensor set.
     if (lin_kd_ > 0 && l < sem_.n_layer_types &&
         sem_.layer_types[l] == Q4NX_LAYER_LINEAR)
@@ -828,15 +978,15 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         const Q4nxDesignGeom* g = &designs_[i_qkv];
         Q4nxProjections p{};
         p.ple = wqkvlin_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn qkv"; return false; }
-        npu_gemm(*ctx_[i_qkv], xn.data(), g->K, g->N, B_.data(), qkv);
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn qkv"; return false; }
+        npu_gemm(*ctx_[i_qkv], xn.data(), g->K, g->N, B_.data(), qkv, 0);
     }
     {
         const Q4nxDesignGeom* g = &designs_[i_z];
         Q4nxProjections p{};
         p.ple = wz_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn z"; return false; }
-        npu_gemm(*ctx_[i_z], xn.data(), g->K, g->N, B_.data(), z);
+        if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn z"; return false; }
+        npu_gemm(*ctx_[i_z], xn.data(), g->K, g->N, B_.data(), z, 1);
     }
     // depthwise causal conv1d (kernel CK) + SiLU over CD channels;
     // full = [state (CK-1) | current], new state = full[1:]
@@ -932,8 +1082,8 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         const Q4nxDesignGeom* g = &designs_[i_o];
         Q4nxProjections p{};
         p.o = woutlin_.data();
-        if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
-        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out);
+        if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
+        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out, 2);
     }
     return true;
 }
@@ -1023,7 +1173,7 @@ void Q4nxNpuForward::build_ple_inputs(int token) {
 // one NPU GEMM: C[1,N] = A[1,K] x B[K,N]  (row-major B)
 // --------------------------------------------------------------------------
 void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                              const float* Bmat, std::vector<float>& out) {
+                              const float* Bmat, std::vector<float>& out, int wkey) {
     if (host_gemm_) {
         // Bmat is B[K][N] row-major (ld = N); a plain float matvec.
         out.assign((size_t)N, 0.0f);
@@ -1035,24 +1185,46 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         }
         return;
     }
-    float sout = 1.0f;
-    ctx.packB(0, Bmat, K, N, sout);
-
     float amax = 0.0f;
     for (int i = 0; i < K; i++) {
         float a = std::fabs(A[i]);
         if (a > amax) amax = a;
     }
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
-    ctx.quantize_async(A, 1, K, as);
-    xrt::run r = ctx.sync_and_launch(0);
+
+    // Token-invariant weights (wkey >= 0) get their own BO, packed once and
+    // reused; every other call (wkey < 0: routed experts, whose weights change
+    // per token) re-packs into layerB[0] as before.
+    PackedWeight*             slot = nullptr;
+    const std::vector<float>* gs = nullptr;
+    if (weight_cache_ && wkey >= 0 && cur_layer_ >= 0 && cur_layer_ < c_.NL && dev_) {
+        if (int(wcache_.size()) <= cur_layer_) wcache_.resize(size_t(cur_layer_) + 1);
+        auto& m = wcache_[size_t(cur_layer_)];
+        auto  it = m.find(wkey);
+        if (it == m.end()) {
+            PackedWeight pw;
+            pw.bo = ctx.make_weight_bo(*dev_);
+            float sout = 1.0f;
+            ctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            it = m.emplace(wkey, std::move(pw)).first;
+        }
+        slot = &it->second;
+        gs = &slot->scales;
+    } else {
+        float sout = 1.0f;
+        ctx.packB(0, Bmat, K, N, sout);
+        ctx.quantize_async(A, 1, K, as);
+        gs = &ctx.group_scales[0];
+    }
+
+    xrt::run r = slot ? ctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
+                      : ctx.sync_and_launch(0);
     ctx.wait_kernel(r);
     ctx.readback();
 
     out.resize((size_t)N);
-    const std::vector<float>& gs = ctx.group_scales[0];
     for (int n = 0; n < N; n++)
-        out[(size_t)n] = (float)ctx.Cm[n] * as * gs[(size_t)n];
+        out[(size_t)n] = (float)ctx.Cm[n] * as * (*gs)[(size_t)n];
 }
 
 // --------------------------------------------------------------------------
@@ -1078,6 +1250,330 @@ float Q4nxNpuForward::rmsnorm_noweight(const float* x, int n, float* out) const 
     const float inv = 1.0f / std::sqrt((float)(ss / (double)n) + sem_.eps);
     for (int i = 0; i < n; i++) out[i] = x[i] * inv;
     return inv;
+}
+
+// ---------------------------------------------------------------------------
+// MLA + MoE (deepseek2 / GLM-4.7-Flash)
+// ---------------------------------------------------------------------------
+// Dequantize one expert's slice out of the pooled [n_expert][tiles][5120] tensor.
+// MEASURED (not inferred): the converter's unpack TRANSPOSES, so although the GGUF
+// stores {K, N, n_expert} (llama.cpp's create_tensor_gate_up_exps), the Q4NX slice
+// is [N][K] -- corr 0.996969 against the GGUF read as [N][K] vs 0.0157 as [K][N].
+// So dequant straight into [N][K], which is what assemble_B wants.
+bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
+                                int N, int K, std::vector<float>& out) {
+    if (!pool || per_expert == 0 || e < 0) return false;
+    std::vector<float> kn((size_t)K * (size_t)N);
+    if (dequant_any(pool + (size_t)e * per_expert, per_expert, K, N, kn.data()) != 0)
+        return false;
+    out.resize((size_t)N * (size_t)K);
+    for (int k = 0; k < K; k++)
+        for (int nn = 0; nn < N; nn++)
+            out[(size_t)nn * K + k] = kn[(size_t)k * N + nn];
+    return true;
+}
+
+// MLA attention for one layer.  q_a -> norm -> q_b, kv_a -> norm -> k_b/v_b, with
+// RoPE applied to the LAST rope_dim_ of each q head and to the single shared
+// rope slice carried inside kv_a (LLM_ARCH_DEEPSEEK2's MLA).
+bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<float>& o,
+                              int pos) {
+    const int H = c_.H, NH = c_.NH;
+    const int qh = qk_nope_ + rope_dim_;         // per-head q width (192+64)
+    const int kv_real = kv_lora_ + rope_dim_;    // 576
+    const int i_qa = idx_of(Q4NX_DESIGN_QA), i_qb = idx_of(Q4NX_DESIGN_QB);
+    const int i_kva = idx_of(Q4NX_DESIGN_KVA), i_o = idx_of(Q4NX_DESIGN_O);
+    if (i_qa < 0 || i_qb < 0 || i_kva < 0 || i_o < 0) { err_ = "MLA designs missing"; return false; }
+
+    std::vector<float> qa, qan, q, kva;
+    {   // q_a: [H] -> [q_lora]
+        const Q4nxDesignGeom* g = &designs_[i_qa];
+        Q4nxProjections p{}; p.q = w_qa_.data();
+        if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_a"; return false; }
+        npu_gemm(*ctx_[i_qa], x.data(), g->K, g->N, B_.data(), qa, 0);
+    }
+    qan.resize(q_lora_);
+    rmsnorm(qa.data(), mla_qan_.data(), q_lora_, qan.data());
+    {   // q_b: [q_lora] -> [NH*qh]
+        const Q4nxDesignGeom* g = &designs_[i_qb];
+        Q4nxProjections p{}; p.k = w_qb_.data();
+        if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_b"; return false; }
+        npu_gemm(*ctx_[i_qb], qan.data(), g->K, g->N, B_.data(), q, 1);
+    }
+    {   // kv_a: [H] -> [kv_real] (+ zero pad to the kernel's n-tile)
+        const Q4nxDesignGeom* g = &designs_[i_kva];
+        Q4nxProjections p{}; p.v = w_kva_.data();
+        if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble kv_a"; return false; }
+        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva, 2);
+    }
+    if ((int)kva.size() < kv_real) { err_ = "kv_a short"; return false; }
+    std::vector<float> kl(kv_lora_);
+    rmsnorm(kva.data(), mla_kvan_.data(), kv_lora_, kl.data());
+
+    // RoPE on the shared slice and on each q head's tail.
+    std::vector<float> kr(rope_dim_);
+    for (int i = 0; i < rope_dim_; i++) kr[i] = kva[(size_t)kv_lora_ + i];
+    if (!mla_rope(q, NH, qh, qk_nope_, kr, pos)) { err_ = "mla rope"; return false; }
+
+    // Cache the reconstructed k_nope / shared k_rope / v for this position.
+    const int kh = qk_nope_, vh = v_head_;
+    std::vector<float>& kn = mla_kn_[l];
+    std::vector<float>& krc = mla_kr_[l];
+    std::vector<float>& vc = mla_v_[l];
+    const size_t old = kn.size() / ((size_t)NH * kh);
+    kn.resize((old + 1) * (size_t)NH * kh);
+    vc.resize((old + 1) * (size_t)NH * vh);
+    krc.resize((old + 1) * (size_t)rope_dim_);
+    // k_b[h] : [kh][kv_lora] (stored padded to a 32-row tile, so read kh real rows)
+    for (int h = 0; h < NH; h++) {
+        // k_b: Q4NX grid [kv_lora][nope padded to 256] = [512][256], indexed flat[k*kb_rows+n].
+        // v_b: Q4NX grid [kv_lora][v_head] = [512][256], indexed flat[k*vh + n] -- pinned
+        // against llama.cpp's own tensor dump (llama-eval-callback), where this reading
+        // reproduces the oracle's layer-0 post-attention sum to 5 decimals and the
+        // [256][512] grid gives -0.454611 instead of -0.228092.  The tile GRID matters,
+        // not just the flat order: both have 16 tiles/head but a different mapping.
+        const float* wk = &w_kb_[(size_t)h * (size_t)kv_lora_ * (size_t)kb_rows_];
+        const float* wv = &w_vb_[(size_t)h * (size_t)kv_lora_ * (size_t)vh];
+        float* dk = &kn[old * (size_t)NH * kh + (size_t)h * kh];
+        float* dv = &vc[old * (size_t)NH * vh + (size_t)h * vh];
+        for (int n = 0; n < kh; n++) {
+            float s = 0.0f;
+            for (int k = 0; k < kv_lora_; k++) s += wk[(size_t)n * kv_lora_ + k] * kl[k];
+            dk[n] = s;
+        }
+        for (int n = 0; n < vh; n++) {
+            float s = 0.0f;
+            for (int k = 0; k < kv_lora_; k++) s += wv[(size_t)k * vh + n] * kl[k];
+            dv[n] = s;
+        }
+    }
+    for (int i = 0; i < rope_dim_; i++) krc[old * (size_t)rope_dim_ + i] = kr[i];
+
+    // Scores and softmax over the cache, then the weighted sum of v.
+    const int T = pos + 1;
+    const float scale = 1.0f / std::sqrt((float)(qh));
+    std::vector<float> ctx((size_t)NH * vh, 0.0f);
+    std::vector<float> score(T);
+    for (int h = 0; h < NH; h++) {
+        const float* qn = &q[(size_t)h * qh];
+        const float* qr = qn + qk_nope_;
+        float mx = -1e30f;
+        for (int t = 0; t < T; t++) {
+            const float* kt = &kn[(size_t)t * NH * kh + (size_t)h * kh];
+            const float* rt = &krc[(size_t)t * rope_dim_];
+            float s = 0.0f;
+            for (int i = 0; i < kh; i++) s += qn[i] * kt[i];
+            for (int i = 0; i < rope_dim_; i++) s += qr[i] * rt[i];
+            score[t] = s * scale;
+            if (score[t] > mx) mx = score[t];
+        }
+        float sum = 0.0f;
+        for (int t = 0; t < T; t++) { score[t] = std::exp(score[t] - mx); sum += score[t]; }
+        const float inv = sum > 0.0f ? 1.0f / sum : 0.0f;
+        float* out = &ctx[(size_t)h * vh];
+        for (int t = 0; t < T; t++) {
+            const float pm = score[t] * inv;
+            const float* vt = &vc[(size_t)t * NH * vh + (size_t)h * vh];
+            for (int i = 0; i < vh; i++) out[i] += pm * vt[i];
+        }
+    }
+    {   // o_proj: [NH*v_head] -> [H]
+        const Q4nxDesignGeom* g = &designs_[i_o];
+        Q4nxProjections p{}; p.o = w_o_.data();
+        if (!weight_cached(3) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
+        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o, 3);
+    }
+    return true;
+}
+
+// RoPE for MLA.  llama.cpp's llama_model_rope_type() returns LLAMA_ROPE_TYPE_NORM
+// for LLM_ARCH_DEEPSEEK2 ("normal RoPE, operating on pairs of CONSECUTIVE head
+// values"), so the rotation pairs (2i, 2i+1) -- NOT (i, i+half) as the paired/NeoX
+// convention would.  Using the paired form here was a bug of exactly the class
+// that broke MiniCPM4/MiniCPM5.
+bool Q4nxNpuForward::mla_rope(std::vector<float>& q, int NH, int qh, int nope,
+                              std::vector<float>& kr, int pos) {
+    const int half = rope_dim_ / 2;
+    std::vector<float> cs(half), sn(half);
+    for (int i = 0; i < half; i++) {
+        const double inv = 1.0 / std::pow((double)sem_.rope_theta, (double)i / (double)half);
+        const double ang = (double)pos * inv;
+        cs[i] = (float)std::cos(ang); sn[i] = (float)std::sin(ang);
+    }
+    auto rot = [&](float* v) {
+        for (int i = 0; i < half; i++) {
+            const float a = v[2 * i], b = v[2 * i + 1];
+            v[2 * i] = a * cs[i] - b * sn[i];
+            v[2 * i + 1] = a * sn[i] + b * cs[i];
+        }
+    };
+    for (int h = 0; h < NH; h++) rot(&q[(size_t)h * qh + nope]);
+    rot(kr.data());
+    return true;
+}
+
+// MoE FFN: router (host, N=64 cannot tile) -> gating -> top-k -> per-expert G/U/D
+// on the NPU -> weighted sum, plus the shared expert.
+bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<float>& d) {
+    const int H = c_.H;
+    const int i_g = idx_of(Q4NX_DESIGN_G), i_u = idx_of(Q4NX_DESIGN_U), i_d = idx_of(Q4NX_DESIGN_D);
+    if (i_g < 0 || i_u < 0 || i_d < 0) { err_ = "MoE designs missing"; return false; }
+    d.assign(H, 0.0f);
+
+    // Router.  llama.cpp: probs = sigmoid(logits) UNBIASED; selection_probs =
+    // probs + exp_probs_b (the bias is added AFTER the sigmoid and used ONLY for
+    // the top-k selection -- "leave probs unbiased as it's later used to get
+    // expert weights").  Adding the bias to the logit before the sigmoid, as I
+    // had, corrupts both the selection and the weights.
+    std::vector<float> probs(n_expert_), selprobs(n_expert_), logits(n_expert_);
+    for (int e = 0; e < n_expert_; e++) {
+        const float* row = &moe_router_[(size_t)e * H];
+        float s = 0.0f;
+        for (int i = 0; i < H; i++) s += row[i] * xn[i];
+        logits[e] = s;
+        // llama.cpp's deepseek2 expert_gating_func: 2 = sigmoid, 1 = softmax.
+        probs[e] = expert_gating_sigmoid_ ? (1.0f / (1.0f + std::exp(-s))) : s;
+    }
+    if (!expert_gating_sigmoid_) {
+        float mx = *std::max_element(probs.begin(), probs.end());
+        float sum = 0.0f;
+        for (int e = 0; e < n_expert_; e++) { probs[e] = std::exp(probs[e] - mx); sum += probs[e]; }
+        for (int e = 0; e < n_expert_; e++) probs[e] /= sum;
+    }
+    for (int e = 0; e < n_expert_; e++)
+        selprobs[e] = probs[e] + (moe_router_b_.empty() ? 0.0f : moe_router_b_[e]);
+    std::vector<int> idx(n_expert_);
+    for (int e = 0; e < n_expert_; e++) idx[e] = e;
+    std::partial_sort(idx.begin(), idx.begin() + top_k_, idx.end(),
+                      [&](int a, int b) { return selprobs[a] > selprobs[b]; });
+    std::vector<int> sel(idx.begin(), idx.begin() + top_k_);
+    // Weights come from the UNBIASED probs, sum-normalised, then scaled.
+    std::vector<float> r(n_expert_, 0.0f);
+    for (int e : sel) r[e] = probs[e];
+    // expert_weights_norm: llama.cpp's deepseek2 normalises the SELECTED weights by
+    // their SUM (ggml_div(weights, ggml_sum_rows(weights))), not by their L2 norm,
+    // and only then applies expert_weights_scale.  Using L2 here was a bug.
+    float wsum = 0.0f;
+    for (int e : sel) wsum += r[e];
+    if (wsum > 0.0f) for (int e : sel) r[e] = r[e] / wsum * expert_w_scale_;
+
+    // Per-layer MoE dump, laid out to compare directly against llama.cpp's
+    // llama-eval-callback sums (ffn_moe_logits/probs/weights, ffn_moe_*).
+    const bool dump = getenv("NPU_INFER_DUMP_MOE") && std::atoi(getenv("NPU_INFER_DUMP_MOE")) == l;
+    if (dump) {
+        auto sm = [](const std::vector<float>& v) { double s = 0; for (float f : v) s += f; return s; };
+        double rawsum = 0; for (float f : logits) rawsum += f;
+        double xnsq = 0; for (float f : xn) xnsq += (double)f * f;
+        fprintf(stderr, "  [moe] L%d xn_sum=%.6f xn_rms=%.6f router_rms=%.6f\n",
+                l, sm(xn), std::sqrt(xnsq / H),
+                [&] { double s = 0; for (float f : moe_router_) s += (double)f * f;
+                      return std::sqrt(s / moe_router_.size()); }());
+        fprintf(stderr, "  [moe] L%d logits=%.6f probs=%.6f biased=%.6f sel=[%d,%d,%d,%d] "
+                        "w=[%.6f,%.6f,%.6f,%.6f] wsum_raw=%.6f scaled=%.6f\n",
+                l, rawsum, sm(probs), sm(selprobs), sel[0], sel[1], sel[2], sel[3],
+                r[sel[0]], r[sel[1]], r[sel[2]], r[sel[3]], wsum, wsum * expert_w_scale_);
+    }
+    std::vector<float> g, u, dd, go, uo;
+    double moe_g = 0, moe_u = 0, moe_sw = 0, moe_dn = 0;
+    for (int e : sel) {
+        if (!mla_expert(exp_g_, exp_g_bytes_, e, expert_im_, H, g)) { err_ = "expert gate"; return false; }
+        if (!mla_expert(exp_u_, exp_u_bytes_, e, expert_im_, H, u)) { err_ = "expert up"; return false; }
+        if (!mla_expert(exp_d_, exp_d_bytes_, e, H, expert_im_, dd)) { err_ = "expert down"; return false; }
+        // gate/up are GEMMs against xn (the dequantized matrices are weights, not
+        // outputs): run them on the NPU through the G/U designs.
+        {
+            const Q4nxDesignGeom* gg = &designs_[i_g];
+            Q4nxProjections p{}; p.gate = g.data();
+            if (q4nx_assemble_B(gg, &p, B_.data()) != 0) { err_ = "assemble expert gate"; return false; }
+            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), go);
+        }
+        {
+            const Q4nxDesignGeom* gu = &designs_[i_u];
+            Q4nxProjections p{}; p.up = u.data();
+            if (q4nx_assemble_B(gu, &p, B_.data()) != 0) { err_ = "assemble expert up"; return false; }
+            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uo);
+        }
+        std::vector<float> act((size_t)expert_im_);
+        for (int i = 0; i < expert_im_; i++)
+            act[i] = (go[i] / (1.0f + std::exp(-go[i]))) * uo[i];
+        const Q4nxDesignGeom* gd = &designs_[i_d];
+        std::vector<float> ed;
+        Q4nxProjections p{}; p.down = dd.data();
+        if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble expert down"; return false; }
+        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), ed);
+        if (dump) {
+            for (float f : go) moe_g += f;
+            for (float f : uo) moe_u += f;
+            for (float f : act) moe_sw += f;
+            for (float f : ed) moe_dn += f;
+        }
+        for (int i = 0; i < H; i++) d[i] += r[e] * ed[i];
+    }
+    double moe_d_sum = 0; for (float f : d) moe_d_sum += f;
+    // Shared expert, always on.
+    double shexp_sum = 0;
+    if (!share_g_.empty()) {
+        std::vector<float> act((size_t)expert_im_);
+        for (int i = 0; i < expert_im_; i++) {
+            const float* rg = &share_g_[(size_t)i * H];
+            const float* ru = &share_u_[(size_t)i * H];
+            float sg = 0.0f, su = 0.0f;
+            for (int k = 0; k < H; k++) { sg += rg[k] * xn[k]; su += ru[k] * xn[k]; }
+            act[i] = (sg / (1.0f + std::exp(-sg))) * su;
+        }
+        const Q4nxDesignGeom* gd = &designs_[i_d];
+        Q4nxProjections p{}; p.down = share_d_.data();
+        if (!weight_cached(5) && q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble shared down"; return false; }
+        std::vector<float> sd;
+        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), sd, 5);
+        if (dump) {
+            double ss = 0; for (float f : act) ss += f;
+            fprintf(stderr, "  [moe] L%d expert gate=%.6f up=%.6f swiglu=%.6f down=%.6f weighted=%.6f | "
+                            "shexp_swiglu=%.6f\n", l, moe_g, moe_u, moe_sw, moe_dn, moe_d_sum, ss);
+        }
+        for (float f : sd) shexp_sum += f;
+        for (int i = 0; i < H; i++) d[i] += sd[i];
+    }
+    if (dump) {
+        double tot = 0; for (float f : d) tot += f;
+        fprintf(stderr, "  [moe] L%d moe_out=%.6f shexp=%.6f ffn_out=%.6f\n", l, moe_d_sum, shexp_sum, tot);
+    }
+    return true;
+}
+
+// The leading dense layer (leading_dense_block_count=1): DG/DU/DD designs.
+bool Q4nxNpuForward::dense_mlp(int l, const std::vector<float>& xn, std::vector<float>& d) {
+    const int H = c_.H;
+    const int i_dg = idx_of(Q4NX_DESIGN_DG), i_du = idx_of(Q4NX_DESIGN_DU), i_dd = idx_of(Q4NX_DESIGN_DD);
+    if (i_dg < 0 || i_du < 0 || i_dd < 0) { err_ = "dense designs missing"; return false; }
+    std::vector<float> g, u;
+    {
+        const Q4nxDesignGeom* gd = &designs_[i_dg];
+        Q4nxProjections p{}; p.gate = dense_g_.data();
+        if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble dense gate"; return false; }
+        npu_gemm(*ctx_[i_dg], xn.data(), gd->K, gd->N, B_.data(), g);
+    }
+    {
+        const Q4nxDesignGeom* gd = &designs_[i_du];
+        Q4nxProjections p{}; p.up = dense_u_.data();
+        if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble dense up"; return false; }
+        npu_gemm(*ctx_[i_du], xn.data(), gd->K, gd->N, B_.data(), u);
+    }
+    std::vector<float> act((size_t)dense_im_);
+    for (int i = 0; i < dense_im_; i++)
+        act[i] = (g[i] / (1.0f + std::exp(-g[i]))) * u[i];
+    if (getenv("NPU_INFER_DUMP_DENSE")) {
+        auto sm = [](const std::vector<float>& v) {
+            double s = 0; for (float f : v) s += f; return s;
+        };
+        fprintf(stderr, "  [dense] gate n=%zu sum=%.6f | up n=%zu sum=%.6f | act n=%zu sum=%.6f\n",
+                g.size(), sm(g), u.size(), sm(u), act.size(), sm(act));
+    }
+    const Q4nxDesignGeom* gd = &designs_[i_dd];
+    Q4nxProjections p{}; p.down = dense_d_.data();
+    if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble dense down"; return false; }
+    npu_gemm(*ctx_[i_dd], act.data(), gd->K, gd->N, B_.data(), d);
+    return true;
 }
 
 bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
@@ -1141,11 +1637,13 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                 if (i >= rot / 2) inv = 0.0;
             } else {
                 inv = 1.0 / std::pow((double)theta, (double)i / (double)half);
-                // LongRoPE (MiniCPM4): ggml applies the factor as
-                // rope_yarn(theta / ff, ...) (ggml-cpu/ops.cpp
-                // ggml_rope_cache_init) -- the angle is DIVIDED by freq_factors.
-                // Multiplying inflates the high dims by up to 31x and yields
-                // garbage.  NPU_INFER_ROPE_FACTOR_MUL=1 keeps the old multiply.
+                // LongRoPE (MiniCPM4): ggml's rope applies the factor as
+                // `rope_yarn(theta / ff, ...)` (ggml-cpu/ops.cpp
+                // ggml_rope_cache_init), i.e. the angle is DIVIDED by
+                // freq_factors.  So divide the inv_freq here.  Multiplying (the
+                // engine route's 599ac77) blows the high dims up by up to 31x
+                // and yields garbage logits.  NPU_INFER_ROPE_FACTOR_MUL=1 keeps
+                // the old multiply for A/B.
                 if (i < (int)rope_scale_.size()) {
                     const char* mul = getenv("NPU_INFER_ROPE_FACTOR_MUL");
                     if (mul && mul[0] == '1') inv *= (double)rope_scale_[i];
@@ -1272,7 +1770,55 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
 
     for (int l = 0; l < c_.NL; l++) {
         cur_layer_ = l;
-        if (!load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
+        // Dense models: once this layer's projections are packed (after the
+        // first token), the f32 weights are no longer read, so skip the per-token
+        // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
+        // keep loading every token.
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && weight_cached(0);
+        if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
+        // MLA + MoE layers have no plain q/k/v/o or single-MLP structure, so they
+        // take their own path through this loop body and skip the rest.
+        if (mla_) {
+            // The attention input is the NORMALISED hidden state (input_layernorm),
+            // exactly as the standard path does; feeding the raw residual here was
+            // a bug.
+            rmsnorm(x.data(), in_norm_[l].data(), H, xn.data());
+            if (!mla_attn(l, xn, o, pos)) return false;
+            for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_;
+#ifdef NPU_INFER_DEBUG_DUMPS
+            if (l == 0 && pos == 0 && getenv("NPU_INFER_DUMP_ATTN")) {
+                FILE* f = open_debug_dump(getenv("NPU_INFER_DUMP_ATTN"));
+                if (f) { fwrite(x.data(), sizeof(float), (size_t)H, f); fclose(f); }
+            }
+#endif
+            rmsnorm(x.data(), post_norm_[l].data(), H, xn.data());
+            if (l < leading_dense_) {
+                if (!dense_mlp(l, xn, d)) return false;
+            } else {
+                if (!moe_mlp(l, xn, d)) return false;
+            }
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
+            // Dump one layer's post-residual hidden state for the Python reference
+            // comparison (NPU_INFER_DUMP_LN names the layer).
+#ifdef NPU_INFER_DEBUG_DUMPS
+            if (getenv("NPU_INFER_DUMP_LN") && l == atoi(getenv("NPU_INFER_DUMP_LN")) && pos == 0) {
+                const char* p = getenv("NPU_INFER_DUMP_L0");
+                FILE* f = open_debug_dump(p ? p : "/tmp/npu_layer.bin");
+                if (f) { fwrite(x.data(), sizeof(float), (size_t)H, f); fclose(f); }
+                fprintf(stderr, "  [mla] dumped layer-%d x (%d floats)\n", l, H);
+            }
+#endif
+            if (pos == 0 && getenv("NPU_INFER_DUMP_LAYERS")) {
+                auto am = [&](const std::vector<float>& v) {
+                    float m = 0.0f;
+                    for (float f : v) m = std::max(m, std::fabs(f));
+                    return m;
+                };
+                fprintf(stderr, "  [mla] L%d attn_absmax=%.4f mlp_absmax=%.4f x_absmax=%.4f\n",
+                        l, am(o), am(d), am(x));
+            }
+            continue;
+        }
         // KV sharing (Gemma4): a layer past num_kv_shared_layers carries no k/v
         // weights and reuses the K/V of the last non-shared layer of its own
         // attention type, which that layer already appended earlier this step.
@@ -1329,9 +1875,9 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             // k/v half of the GEMM output is discarded.  Reusing wq_ for those
             // slots keeps assemble_B's row counts in bounds (q_rows >= k_rows).
             if (kv_shared) { p.k = wq_.data(); p.v = wq_.data(); }
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble qkv"; return false; }
+            if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble qkv"; return false; }
             std::vector<float> qkv;
-            npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv);
+            npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0);
             // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
             // must not see the gate half; the gate multiplies ctx afterwards.
             std::vector<float> qkv_use;
@@ -1360,8 +1906,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             const Q4nxDesignGeom* g = &designs_[i_o_l];
             Q4nxProjections p{};
             p.o = wo_.data();
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
-            npu_gemm(*ctx_[i_o_l], ctx.data(), g->K, g->N, B_.data(), o);
+            if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
+            npu_gemm(*ctx_[i_o_l], ctx.data(), g->K, g->N, B_.data(), o, 1);
         }
         }  // end non-GDN attention
         if (gemma4_layer_) {
@@ -1387,20 +1933,20 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             const Q4nxDesignGeom* g = &designs_[i_gu_l];
             Q4nxProjections p{};
             p.gate = wg_.data(); p.up = wu_.data();
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gu"; return false; }
-            npu_gemm(*ctx_[i_gu_l], xn.data(), g->K, g->N, B_.data(), act);
+            if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gu"; return false; }
+            npu_gemm(*ctx_[i_gu_l], xn.data(), g->K, g->N, B_.data(), act, 2);
         } else if (i_g >= 0 && i_u >= 0) {
             // split gate/up: two kernels, then SiLU(gate) * up
             std::vector<float> gv, uv;
             const Q4nxDesignGeom* gg = &designs_[i_g];
             Q4nxProjections pg{}; pg.gate = wg_.data();
-            if (q4nx_assemble_B(gg, &pg, B_.data()) != 0) { err_ = "assemble g"; return false; }
-            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), gv);
+            if (!weight_cached(2) && q4nx_assemble_B(gg, &pg, B_.data()) != 0) { err_ = "assemble g"; return false; }
+            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), gv, 2);
 
             const Q4nxDesignGeom* gu = &designs_[i_u];
             Q4nxProjections pu{}; pu.up = wu_.data();
-            if (q4nx_assemble_B(gu, &pu, B_.data()) != 0) { err_ = "assemble u"; return false; }
-            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uv);
+            if (!weight_cached(3) && q4nx_assemble_B(gu, &pu, B_.data()) != 0) { err_ = "assemble u"; return false; }
+            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uv, 3);
 
             act.resize((size_t)im_l * 2);
             for (int i = 0; i < im_l; i++) {
@@ -1416,8 +1962,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             const Q4nxDesignGeom* g = &designs_[i_d_l];
             Q4nxProjections p{};
             p.down = wd_.data();
-            if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble d"; return false; }
-            npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d);
+            if (!weight_cached(4) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble d"; return false; }
+            npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d, 4);
         }
         if (!gemma4_layer_) {
             for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
@@ -1449,8 +1995,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 const Q4nxDesignGeom* g = &designs_[i_pg];
                 Q4nxProjections p{};
                 p.ple = inp_gate_[l].data();
-                if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
-                npu_gemm(*ctx_[i_pg], x.data(), g->K, g->N, B_.data(), pg);
+                if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
+                npu_gemm(*ctx_[i_pg], x.data(), g->K, g->N, B_.data(), pg, 0);
             }
             const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
             for (int i = 0; i < ple_dim_; i++) {
@@ -1468,8 +2014,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 const Q4nxDesignGeom* g = &designs_[i_pp];
                 Q4nxProjections p{};
                 p.ple = ple_proj_[l].data();
-                if (q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
-                npu_gemm(*ctx_[i_pp], pg.data(), g->K, g->N, B_.data(), pp);
+                if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
+                npu_gemm(*ctx_[i_pp], pg.data(), g->K, g->N, B_.data(), pp, 1);
             }
             rmsnorm(pp.data(), post_ln_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];
@@ -1492,11 +2038,30 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 pos, [&]{ double s=0; for(float v:xn) s+=std::fabs((double)v); return s/H; }(),
                 [&]{ float m=0; for(float v:xn) m=std::max(m, std::fabs(v)); return m; }(), hp);
     }
+#ifdef NPU_INFER_DEBUG_DUMPS
+    if (getenv("NPU_INFER_DUMP_HEAD")) {
+        FILE* f = open_debug_dump(getenv("NPU_INFER_DUMP_HEAD"));
+        if (f) { fwrite(xn.data(), sizeof(float), (size_t)xn.size(), f); fclose(f); }
+    }
+#endif
     if (!run_lm_head(xn, logits)) return false;
+    if (getenv("NPU_INFER_DUMP_LAYERS")) {
+        double s = 0; float mx = 0;
+        for (float f : xn) { s += std::fabs(f); if (std::fabs(f) > mx) mx = std::fabs(f); }
+        fprintf(stderr, "  [mla] final xn: mean|x|=%.6f absmax=%.6f (n=%zu)\n",
+                s / (double)xn.size(), mx, xn.size());
+        // top-3 before the final norm, to separate a collapsed hidden state from a
+        // broken head
+        double s2 = 0; float mx2 = 0;
+        for (float f : x) { s2 += std::fabs(f); if (std::fabs(f) > mx2) mx2 = std::fabs(f); }
+        fprintf(stderr, "  [mla] pre-norm x: mean|x|=%.6f absmax=%.6f\n",
+                s2 / (double)x.size(), mx2);
+    }
     // MiniCPM4 logit_scale: fitted against the llama.cpp oracle, this forward's
     // logits were ~16x the oracle's (oracle top-1 prob 0.928 vs effectively
     // one-hot here) and the best-fit temperature was 0.060 ~ 1/16.7 against a
-    // GGUF logit_scale of 16.  Constant divisor -> cannot move the argmax.
+    // GGUF logit_scale of 16.  Constant divisor -> cannot move the argmax, so
+    // the captured anchor answers are unchanged.
     if (logit_scale_ != 1.0f)
         for (size_t i = 0; i < logits.size(); i++) logits[i] /= logit_scale_;
     return true;

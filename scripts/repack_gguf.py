@@ -174,17 +174,43 @@ def main():
         return 2
     gguf, out_dir = sys.argv[1], sys.argv[2]
     # The Q4NX converter is not vendored in this repo. Resolve it in order:
-    # ONEBIT_Q4NX_CONVERTER, a sibling checkout next to the engine, the
-    # 1bit-MONSTER checkout that carries it upstream, then a staging checkout.
+    # ONEBIT_Q4NX_CONVERTER, the canonical npu-infer/model-generic checkout,
+    # a sibling checkout next to the engine, the 1bit-MONSTER checkout that
+    # carries it upstream, then a staging checkout.
+    #
+    # The canonical ("npu-infer/model-generic") converter is preferred because
+    # it is the one whose output the model-generic forward was validated
+    # against: it carries the minicpm module + config, the LongRoPE work, the
+    # MiniCPM4 scale fixes, and the llama-arch q/k interleaved->paired reorder
+    # applied for EVERY arch "llama". The 1bit-MONSTER checkout still gates that
+    # reorder on `freq_base <= 20000`, which is false for MiniCPM5-1B
+    # (freq_base 5e6), so it repacks q/k unreordered and the forward decodes
+    # " the" instead of " Paris". Its output matches the published
+    # MiniCPM5-1B-NPU2 model.q4nx byte for byte; the gated one does not.
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
+        os.path.join(here, os.pardir, os.pardir, "np-model-generic", "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER", "third_party", "FLM_Q4NX_Converter"),
+        os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER-iso-build", "third_party", "FLM_Q4NX_Converter"),
         "/home/bcloud/wt/twostream-main/third_party/FLM_Q4NX_Converter",
     ]
     default_converter = os.environ.get("ONEBIT_Q4NX_CONVERTER") or next(
         (os.path.abspath(p) for p in candidates if os.path.exists(os.path.join(p, "convert.py"))), "")
     converter_dir = os.path.abspath(sys.argv[3] if len(sys.argv) > 3 else default_converter)
+
+    def pick_converter(arch):
+        # Prefer a checkout that has a module for THIS arch.  The canonical
+        # np-model-generic converter has no deepseek2 module, while the
+        # iso-build checkout does -- it is what built the GLM-4.7-Flash Q4NX the
+        # forward's MLA+MoE path was validated against (" Paris, France.").
+        if arch:
+            for p in candidates:
+                ap = os.path.abspath(p)
+                if os.path.exists(os.path.join(ap, "convert.py")) and \
+                   os.path.exists(os.path.join(ap, "q4nx", "models", str(arch) + ".py")):
+                    return ap
+        return None
 
     # Provenance stamp.  The dir cache cannot tell which converter produced a dir
     # (`model.q4nx` existence is all it checks), and the ¬declared-vs-carried scan
@@ -206,10 +232,24 @@ def main():
             print(f"stamp: none at {stamp_path} (dir predates the stamp)")
             return 1
         got = dict(l.rstrip("\n").split("=", 1) for l in open(stamp_path) if "=" in l)
+        # Re-resolve with the directory's own arch so a dir whose arch needs a
+        # different converter keeps comparing against the right one.
+        try:
+            _a = json.load(open(os.path.join(sys.argv[2], "config.json"))).get("model_type", "")
+        except Exception:
+            _a = ""
+        if not os.environ.get("ONEBIT_Q4NX_CONVERTER"):
+            _picked = pick_converter(_a)
+            if _picked:
+                converter_dir = _picked
         if not os.path.exists(os.path.join(converter_dir, "convert.py")):
             print(f"stamp: cannot tell, converter unresolved ('{converter_dir}')")
             return 2
-        for key, want in (("converter_path", converter_dir), ("converter_commit", converter_commit())):
+        for key, want in (("converter_path", converter_dir), ("converter_commit", converter_commit()),
+                          # The NPU forward reads Q4_1 tiles; a dir built before the
+                          # repack forced Q4_1 (e.g. qwen2's old Q4_0 config) has no
+                          # such key and must be rebuilt.
+                          ("q4nx_default_tensor_type", "Q4_1")):
             if got.get(key) != want:
                 print(f"stamp: stale, {key}='{got.get(key)}' != '{want}'")
                 return 1
@@ -224,8 +264,51 @@ def main():
         return 1
 
     # The converter resolves configs/<arch>.json relative to its CWD.
-    r = subprocess.run([sys.executable, convert_py, gguf, out_dir],
-                       cwd=converter_dir)
+    #
+    # The NPU forward reads Q4_1 tiles (5120 B: 512 B bf16 scales + 512 B bf16
+    # zeros + 4096 B packed int4).  A converter config that asks for Q4_0 packs
+    # no zero half, and the forward then decodes the whole tensor wrong -- not a
+    # rounding error, garbage (Qwen2.5-7B-Instruct answered a CJK token instead
+    # of ' Paris'; the same GGUF repacked with Q4_1 is byte-identical to the
+    # published FastFlowLM dir).  qwen2.json and lfm2.json shipped Q4_0 while
+    # every other arch shipped Q4_1.  Rather than trust a moving external
+    # checkout, run the converter from a patched copy whenever this arch's
+    # config asks for anything but Q4_1.  The provenance stamp still records the
+    # resolved converter and its commit, so the dir cache stays stable.
+    run_dir = converter_dir
+    from gguf import GGUFReader as _GGUFReader
+    _r = _GGUFReader(gguf)
+    _af = _field(_r, "general.architecture")
+    _arch = _af.contents() if _af else ""
+    if isinstance(_arch, bytes):
+        _arch = _arch.decode()
+    _arch = str(_arch)
+    if not os.environ.get("ONEBIT_Q4NX_CONVERTER") and len(sys.argv) <= 3:
+        _picked = pick_converter(_arch)
+        if _picked and _picked != converter_dir:
+            print(f"repack: {_arch} has no module in {converter_dir}; using {_picked}")
+            converter_dir = _picked
+            run_dir = converter_dir
+    _cfg = os.path.join(converter_dir, "configs", _arch + ".json")
+    if _arch and os.path.exists(_cfg):
+        try:
+            with open(_cfg) as f:
+                _c = json.load(f)
+        except Exception:
+            _c = {}
+        _t = _c.get("default_tensor_type")
+        if _t and _t != "Q4_1":
+            import shutil as _shutil, tempfile as _tempfile
+            run_dir = _tempfile.mkdtemp(prefix="q4nx-converter-")
+            _shutil.copytree(converter_dir, run_dir, dirs_exist_ok=True)
+            _c["default_tensor_type"] = "Q4_1"
+            with open(os.path.join(run_dir, "configs", _arch + ".json"), "w") as f:
+                json.dump(_c, f, indent=4)
+            print(f"repack: {_arch} config asks for default_tensor_type={_t}; the NPU "
+                  f"forward reads Q4_1 tiles, so the converter runs from a patched "
+                  f"copy ({run_dir})")
+    r = subprocess.run([sys.executable, os.path.join(run_dir, "convert.py"), gguf, out_dir],
+                       cwd=run_dir)
     if r.returncode != 0 or not os.path.exists(os.path.join(out_dir, "model.q4nx")):
         print("converter failed")
         return 1
@@ -261,6 +344,7 @@ def main():
         f.write(f"converter_commit={converter_commit()}\n")
         f.write(f"arch={arch}\n")
         f.write(f"model_type={cfg.get('model_type', '')}\n")
+        f.write("q4nx_default_tensor_type=Q4_1\n")
         f.write(f"repack_script={os.path.abspath(__file__)}\n")
 
     # Enforce the scale-key guard before the dir is cached (and before anyone

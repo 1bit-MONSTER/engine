@@ -14,7 +14,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# The lean option: ROCmFP4 and ROCmI4
+# The lean option: ROCmFP4, ROCmI4 and Hadamard Q4_0
 
 `1bit serve --lean` trades accuracy for speed. It runs models in the AMD-focused
 formats of [ROCmFPX](https://github.com/charlie12345/ROCmFPX) (MIT), a llama.cpp fork
@@ -25,6 +25,7 @@ that upstream llama.cpp cannot read, so the lean route has its own tree:
 |---|---|---|---|
 | `1bit serve -m model-ROCMFP4.gguf --lean` | ROCmFP4 (`Q4_0_ROCMFP4_STRIX_LEAN`) | `Vulkan0` | decode |
 | `1bit serve -m model-ROCMI4.gguf --lean --device rocm` | ROCmI4 (`Q4_0_ROCMI4`) | `ROCm0`, W4A4 | prompt processing |
+| `1bit serve -m model-Q4_0-H32.gguf` | Q4_0, Hadamard-rotated (`tools/hadamard_q4_0.py`) | `ROCm0`, W4A4 | prompt processing, closest to the model of the W4A4 routes |
 
 The default route stays Unsloth's UD-Q4_K_XL on upstream llama.cpp ([vulkan.md](vulkan.md)):
 it stays far closer to the full model. Use lean when speed matters more than that.
@@ -103,39 +104,71 @@ stream uses about 200 of the bus's roughly 256 GB/s, and two different drivers f
 gap better than two copies of one. Each stream slows down, so it pays for serving
 several requests at once (one per backend), not for one chat.
 
-## Experiment: W4A4 on plain Q4_0, with a Hadamard rotation (2026-09-28, not in the engine yet)
+## Hadamard-rotated Q4_0: W4A4 prompt processing
 
-ROCmI4's W4A4 kernel can read Unsloth's ordinary Q4_0 files directly: a Q4_0 code `q` means
-`q - 8`, and `q ^ 8` is exactly that as a signed 4-bit value, so the weights stay bit for bit
-what Unsloth shipped and only the activations go to 4 bits. On Qwen3.8-27B that lifts prompt
-processing from ~400 to 461-488 tok/s, but the 4-bit activations cost accuracy: mean KLD 0.084
-against 0.029 for the same file on the exact int8 path. Keeping any one group of tensors
-(`ffn_down`, or the FFN gate and up) on int8 did not help: the error comes from every group.
+The fastest prompt processing the engine has on Strix Halo. The W4A4 kernel multiplies int4
+weights by int4 activations on the Radeon's matrix units, twice the int8 rate. It reads plain
+Q4_0 weights bit for bit (a Q4_0 code `q` means `q - 8`, and `q ^ 8` is exactly that as a signed
+4-bit value), so the weights stay exact and only the activations are rounded to 4 bits. Rounding
+activations to 4 bits loses accuracy wherever a few large values in a block of 32 force a coarse
+scale on the rest. A 32-point Walsh-Hadamard rotation spreads those values before rounding. The
+same rotation is applied to the weights once, per 32-element block along K, so
+`x . w = (Hx) . (Hw)` and the product is unchanged in exact arithmetic.
 
-A 32-point Walsh-Hadamard rotation spreads each block's outliers before the activations are
-rounded to 4 bits. The same rotation is applied to the weights offline, per 32-element block
-along K, so `x . w = (Hx) . (Hw)` and every path stays exact in exact arithmetic: the rotated
-file on the int8 path matches the plain one (KLD 0.031 against 0.029). The rotated file is
-quantized from Unsloth's Q8_0 with Unsloth's imatrix (block means for the rotated tensors), and
-the control is quantized from the same Q8_0 with the same settings.
+**Make the file** from a high-precision source (Q8_0, BF16, F16), with the imatrix you would
+quantize it with anyway:
 
-| Qwen3.8-27B Q4_0, ROCm | pp512 | PPL | Mean KLD | Same top token |
+```sh
+tools/hadamard_q4_0.py Qwen3.8-27B-Q8_0.gguf Qwen3.8-27B-Q4_0-H32.gguf --imatrix imatrix_unsloth.gguf
+```
+
+It rotates the attention, FFN and delta-net alpha/beta projections in a copy of the source,
+gives the imatrix the matching change, quantizes those tensors to Q4_0 and every other matmul
+weight to another type, stamps the file `onebit.hadamard_q4_0 = 32`, and checks that every Q4_0
+tensor in it is a rotated one (it deletes a file that breaks that). Qwen3.8-27B: about 20 minutes
+on Strix Halo, 15,182 MiB (4.66 bits per weight), 456 rotated tensors. That file is published as
+[1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF](https://huggingface.co/1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF).
+
+**Serve it:** `1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` in a build with `-DONEBIT_LEAN=ON
+-DONEBIT_LEAN_ROCM=ON`. `serve` reads the stamp, runs the file on the lean ROCm build
+(`--device auto` picks it; any other device is refused, because only this build rotates the
+activations to match), and sets `GGML_Q4_0_HADAMARD=1` and `GGML_W4A4_TENSORS=all` for it. Set
+`GGML_W4A4_TENSORS=` (empty) to run the rotated file on the exact int8 path instead.
+`tests/hadamard_route.sh` (ctest `hadamard_route`) checks the routing and the environment
+without a GPU.
+
+**Measured** (Strix Halo, Qwen3.8-27B, KLD against BF16 over wikitext-2 40 x 512, pp512 from
+llama-bench with ub 512):
+
+| Qwen3.8-27B | pp512 | PPL | Mean KLD | Same top token |
 |---|---|---|---|---|
-| exact int8 | ~400 | 6.021 | 0.029 | 91.9% |
-| W4A4 | 461-488 | 6.241 | 0.084 | 87.4% |
-| **W4A4, Hadamard-rotated** | **503** | **6.096** | **0.055** | **89.3%** |
+| Q4_0, exact int8 | ~400 | 6.021 | 0.029 | 91.9% |
+| Q4_0, W4A4 without rotation | 461-488 | 6.241 | 0.084 | 87.4% |
+| **Q4_0-H32 (rotated), W4A4** | **503-512** (509 on the engine's lean ROCm build) | **6.096** | **0.055** | **89.3%** |
+| Q4_0-H32 on the exact int8 path | ~400 | 6.016 | 0.031 | 91.6% |
 
-The rotation cuts the W4A4 error by a third, for +1.2% perplexity against the exact path.
-Storing the 48 layers' small `ssm_alpha` / `ssm_beta` projections as Q4_0 (Unsloth keeps them
-F32) moves them from an f32 GEMM onto the matmul kernel, which is part of the prompt gain.
-KLD is against BF16 logits on wikitext-2 (40 x 512); pp512 from llama-bench, ub 512.
+The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
++1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through
+`1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` (no device flag: the stamp picks the route), a
+1,838-token prompt runs at 440-470 tok/s, against about 330 on the Vulkan route.
+
+**Where else it helps.** The same ROCmFPX pin carries two prompt-processing kernels every model
+with delta-net layers (Qwen3.8, Qwen3.6) uses on ROCm: a delta-net prefill kernel that keeps
+each state column's rows in registers and stages the per-token inputs in shared memory, and a
+tiled transpose for the concatenation that feeds the delta-net convolution. Both pass
+`test-backend-ops` against the CPU (GATED_DELTA_NET 42/42, CONCAT 129/129).
+
+**Decode.** This route prefills; it does not decode fast. The ROCm build decodes Qwen3.8-27B at
+about 11 tok/s without drafting, and its MTP drafting slowed prompt processing badly in our
+runs. For decode-heavy work use `--device vulkan --dflash` ([serve.md](serve.md)): 45.7 tok/s on
+code.
 
 ## Build
 
 ```
 git submodule update --init --depth 1 third_party/llama.cpp-rocmfpx
 cmake -B build -G Ninja -DONEBIT_LEAN=ON                        # Vulkan: ROCmFP4
-cmake -B build -G Ninja -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON  # also ROCm: ROCmI4
+cmake -B build -G Ninja -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON  # also ROCm: ROCmI4, Hadamard Q4_0
 cmake --build build
 ```
 

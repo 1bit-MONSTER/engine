@@ -92,3 +92,10 @@ DFlash2 is in `1bit serve` today. For prompts, the next steps are a better exact
 for this GPU (about 15% would reach the W4A4 numbers without the error), and rotations
 larger than 32, which spread outliers further. Packages ship on Sunday with the weekly
 release.
+
+**Update, later on 2026-09-28:** the Hadamard route has shipped. `tools/hadamard_q4_0.py` makes the
+rotated file, `1bit serve` recognises it and runs it on the lean ROCm build by itself, and the
+Qwen3.8-27B file is published as
+[1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF](https://huggingface.co/1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF):
+pp512 509, KLD 0.055, and 440-470 tok/s on a 1,838-token prompt through `serve`
+([docs/lean.md](../docs/lean.md)).

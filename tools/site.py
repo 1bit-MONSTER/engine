@@ -71,8 +71,8 @@ TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade:
            "HRX and Vulkan on the Radeon iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
 # The home page's search and social description: the headline milestones, measured on Strix Halo
 # (docs/serve.md, docs/lean.md). Keep it <= 160 characters and update it with each milestone.
-HOME_DESCRIPTION = ("LLM inference for AMD Strix Halo inside Lemonade: Qwen3.8-27B decodes at 45.7 tok/s "
-                    "(DFlash2) and reads prompts at 509 tok/s (Hadamard W4A4).")
+HOME_DESCRIPTION = ("LLM inference for AMD Strix Halo inside Lemonade: one server runs Qwen3.8-27B with "
+                    "Hadamard W4A4 prompts (445 tok/s) and DFlash2 decode (40.9 tok/s).")
 HOME_KEYWORDS = ("LLM inference, AMD Ryzen AI, Strix Halo, XDNA 2 NPU, Vulkan, ROCm, HRX, Lemonade, "
                  "OpenAI-compatible API, GGUF, speculative decoding, DFlash2, MTP, W4A4, Hadamard rotation, "
                  "Laya router, Qwen3.8, Unsloth")

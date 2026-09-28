@@ -759,14 +759,16 @@ size_t conversation_key(const httplib::Request& req) {
     if (body.contains("messages") && body["messages"].is_array()) {
         for (const auto& m : body["messages"]) {
             if (!m.is_object()) continue;
-            const std::string role = m.value("role", "");
+            const std::string role = m.contains("role") && m["role"].is_string() ? m["role"].get<std::string>() : "";
             head += role + ":" + (m.contains("content") ? m["content"].dump() : "") + "\n";
             if (role == "user") break;
         }
     } else if (body.contains("prompt")) {
         head = body["prompt"].dump();
     }
-    return std::hash<std::string>{}(body.value("model", "") + "\n" + head);
+    // model and role come from the client: a null or non-string one must not throw
+    const std::string model = body.contains("model") && body["model"].is_string() ? body["model"].get<std::string>() : "";
+    return std::hash<std::string>{}(model + "\n" + head);
 }
 
 #ifdef ONEBIT_LAYA

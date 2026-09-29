@@ -27,7 +27,7 @@ engine exposes nothing but that OpenAI-compatible API.
 Step 1 first went the other way. `1bit lemonade` ran Lemonade v11.9.0's server
 core inside the `1bit` process, and this repository carried Lemonade local
 recipes for the engine (`onebit`, `mlx`, `zinc`, the `hrx_device` option).
-geramyL (AMD) pointed out that the engine should be embedded into Lemonade, not
+geramyL, a moderator on AMD's Discord, pointed out that the engine should be embedded into Lemonade, not
 the reverse. So on 2026-09-23:
 
 - `third_party/lemonade` and every local delta were removed. The engine no

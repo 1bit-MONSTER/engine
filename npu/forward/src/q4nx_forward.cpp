@@ -433,6 +433,33 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     ndesigns_ = q4nx_derive_designs(&dims, designs_);
     if (ndesigns_ <= 0) { err_ = "design derivation failed"; return false; }
 
+    // Batched expert gate/up (MoE): one GEMM per projection over ALL top-k experts
+    // at once, instead of one per expert.  Derived here rather than in
+    // q4nx_derive_designs because it depends on top_k, which the dims struct does
+    // not carry.  The design's N is a G/U kernel width that holds top_k*IM; the
+    // caller passes the real N = top_k*IM, so only those columns are packed.
+    if (n_expert_ > 0 && top_k_ > 1 && expert_im_ > 0 && !mla_ && ndesigns_ + 2 <= Q4NX_MAX_DESIGNS) {
+        const int need = top_k_ * expert_im_;
+        const int nb = 8192;   // the only K=H G/U kernel width >= 4096 in the set
+        char gb[512], ub[512];
+        snprintf(gb, sizeof(gb), "%s/full_i8_G_K%d_N%d.elf", dir.c_str(), c_.H, nb);
+        snprintf(ub, sizeof(ub), "%s/full_i8_U_K%d_N%d.elf", dir.c_str(), c_.H, nb);
+        if (need <= nb && file_exists(gb) && file_exists(ub)) {
+            memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
+            designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = c_.H; designs_[ndesigns_].N = nb;
+            designs_[ndesigns_].role = Q4NX_DESIGN_GB;
+            snprintf(designs_[ndesigns_].elf_name, Q4NX_ELF_NAME_MAX, "full_i8_G_K%d_N%d.elf", c_.H, nb);
+            ndesigns_++;
+            memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
+            designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = c_.H; designs_[ndesigns_].N = nb;
+            designs_[ndesigns_].role = Q4NX_DESIGN_UB;
+            snprintf(designs_[ndesigns_].elf_name, Q4NX_ELF_NAME_MAX, "full_i8_U_K%d_N%d.elf", c_.H, nb);
+            ndesigns_++;
+            fprintf(stderr, "  [forward] batched expert gate/up: N=%d (top_k=%d IM=%d) via K%d_N%d kernels\n",
+                    need, top_k_, expert_im_, c_.H, nb);
+        }
+    }
+
     size_t maxB = 0;
     for (int i = 0; i < ndesigns_; i++)
         maxB = std::max(maxB, (size_t)designs_[i].K * (size_t)designs_[i].N);
@@ -1354,6 +1381,304 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
     }
 }
 
+void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
+                                   const float* Bmat, std::vector<float>& out, int wkey) {
+    if (host_gemm_) {
+        // Bmat is B[K][N] row-major (ld = N): a plain float matmul of A[M][K].
+        out.assign((size_t)M * N, 0.0f);
+        for (int m = 0; m < M; m++) {
+            float* o = out.data() + (size_t)m * N;
+            for (int k = 0; k < K; k++) {
+                const float a = A[(size_t)m * K + k];
+                if (a == 0.0f) continue;
+                const float* row = Bmat + (size_t)k * N;
+                for (int n = 0; n < N; n++) o[n] += a * row[n];
+            }
+        }
+        return;
+    }
+    // Per-row activation scales: row m is quantized with its own amax/127 so a
+    // batch's rows each keep their dynamic range (issue #1699: a single shared
+    // scale zeroed low-magnitude rows when one token's activations dwarfed the
+    // rest).
+    std::vector<float> ascales((size_t)M);
+    for (int m = 0; m < M; m++) {
+        const float* row = A + (size_t)m * K;
+        float amax = 0.0f;
+        for (int k = 0; k < K; k++) {
+            const float a = std::fabs(row[k]);
+            if (a > amax) amax = a;
+        }
+        ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
+    }
+    PackedWeight*             slot = nullptr;
+    const std::vector<float>* gs = nullptr;
+    if (weight_cache_ && wkey >= 0 && cur_layer_ >= 0 && cur_layer_ < c_.NL && dev_) {
+        if (int(wcache_.size()) <= cur_layer_) wcache_.resize(size_t(cur_layer_) + 1);
+        auto& m = wcache_[size_t(cur_layer_)];
+        auto  it = m.find(wkey);
+        if (it == m.end()) {
+            PackedWeight pw;
+            pw.bo = ctx.make_weight_bo(*dev_);
+            float sout = 1.0f;
+            ctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            it = m.emplace(wkey, std::move(pw)).first;
+        }
+        slot = &it->second;
+        gs = &slot->scales;
+    } else {
+        float sout = 1.0f;
+        ctx.packB(0, Bmat, K, N, sout);
+        gs = &ctx.group_scales[0];
+    }
+    xrt::run r = slot
+                     ? ctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
+                     : ctx.launch_async_rows(0, A, M, K, ascales.data());
+    ctx.wait_kernel(r);
+    ctx.readback();
+    out.resize((size_t)M * N);
+    for (int m = 0; m < M; m++) {
+        const int32_t* cm = ctx.Cm + (size_t)m * ctx.ND;
+        const float asc = ascales[(size_t)m];
+        float* o = out.data() + (size_t)m * N;
+        for (int n = 0; n < N; n++)
+            o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
+    }
+}
+
+bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
+                                std::vector<float>& logits) {
+    if (!ready_) { err_ = "not initialised"; return false; }
+    const int H = c_.H;
+    const int M = (int)tokens.size();
+    if (M <= 0) { err_ = "empty batch"; return false; }
+    for (int t : tokens)
+        if (t < 0 || t >= c_.NV) { err_ = "token out of range"; return false; }
+
+    // A new request starts at position 0: clear the KV cache.  The cache is
+    // append-only (kcache_[l].insert(end, ...)) but the attention indexes it by
+    // `pos` (t in 0..pos), so without this a second request reads the PREVIOUS
+    // request's K/V for positions 0..prompt_len and appends its own after them --
+    // visible as cross-request echo (MiniCPM5-1B answered Japan, then echoed
+    // "Tokyo" for France/Germany).  forward_serve.cpp's "each request resets it
+    // from position 0" only ever held in the NPU_BATCH_CHECK debug path.
+    if (start_pos == 0) reset();
+
+    // Anything the batched body does not model falls back to per-token step():
+    // MLA/MoE, GDN linear attention, Gemma4 (PLE + per-layer-type attention widths
+    // + KV sharing), attn_output_gate, and multi-layer-type RoPE.
+    bool kv_self = true;
+    for (int l = 0; l < (int)kv_owner_.size() && l < c_.NL; l++)
+        if (kv_owner_[l] != l) kv_self = false;
+    // Two attention geometries (QKV2) and multiple layer types are fine: the
+    // batched body selects the per-layer design and RoPE exactly as step() does.
+    // MoE is fine too: its router/top-k are data-dependent per row and stay
+    // per-token, while the attention GEMMs around them are batched. MLA and GDN
+    // still fall back (their attention is not modelled here).
+    const bool simple_dense =
+        !mla_ && lin_kd_ == 0 && ple_dim_ == 0 && !gemma4_layer_ &&
+        attn_gate_ == 0 && kv_self;
+    if (!simple_dense || getenv("NPU_NO_BATCH")) {
+        if (getenv("NPU_BATCH_DBG"))
+            std::fprintf(stderr,
+                         "[batch] M=%d fallback: mla=%d lin=%d ple=%d gemma4=%d experts=%d "
+                         "gate=%d kv_self=%d no_batch=%d\n",
+                         M, mla_, lin_kd_, ple_dim_, (int)gemma4_layer_, n_expert_,
+                         attn_gate_, (int)kv_self, (int)(getenv("NPU_NO_BATCH") != nullptr));
+        std::vector<float> one;
+        for (int m = 0; m < M; m++)
+            if (!step(tokens[m], start_pos + m, one)) return false;
+        logits = one;
+        return true;
+    }
+
+    // Debug oracle (NPU_BATCH_CHECK=1): run the same tokens sequentially first,
+    // capture the next-token argmax, clear the KV the sequential pass appended,
+    // then let the batched pass run and compare. One process, both paths, same
+    // device state -- localises a batched-vs-sequential divergence immediately.
+    static const bool batch_check = getenv("NPU_BATCH_CHECK") != nullptr;
+    int seq_argmax = -1;
+    if (batch_check) {
+        std::vector<float> seq;
+        for (int m = 0; m < M; m++)
+            if (!step(tokens[m], start_pos + m, seq)) return false;
+        reset();
+        for (size_t i = 0; i < seq.size(); i++)
+            if (seq_argmax < 0 || seq[i] > seq[(size_t)seq_argmax]) seq_argmax = (int)i;
+    }
+
+    const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
+    const int i_o   = idx_of(Q4NX_DESIGN_O);
+    const int i_gu  = idx_of(Q4NX_DESIGN_GU);
+    const int i_g   = idx_of(Q4NX_DESIGN_G);
+    const int i_u   = idx_of(Q4NX_DESIGN_U);
+    const int i_d   = idx_of(Q4NX_DESIGN_D);
+    // A model with two attention geometries (e.g. MiniCPM4's sliding/full layers)
+    // uses a different QKV/O design per layer type, as step() does.
+    const int i_qkv2 = idx_of(Q4NX_DESIGN_QKV2);
+    const int i_o2   = idx_of(Q4NX_DESIGN_O2);
+    const bool two_widths = (i_qkv2 >= 0);
+    const int im    = c_.IM;
+
+    std::vector<float> X((size_t)M * H), XN((size_t)M * H);
+    for (int m = 0; m < M; m++)
+        for (int k = 0; k < H; k++)
+            X[(size_t)m * H + k] = embed_at(tokens[m], k) * embed_scale_;
+
+    std::vector<float> QKV, CTX, O, ACT, HH, D, qkv_row, ctx_row, act_row, hh;
+    for (int l = 0; l < c_.NL; l++) {
+        cur_layer_ = l;
+        const bool cached = weight_cached(0);
+        if (!cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
+
+        const int lt = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
+        const bool l_full = (lt != Q4NX_LAYER_SLIDING);
+        const int l_theta = l_full ? sem_.rope_theta : sem_.rope_theta_sliding;
+        const int l_rot   = l_full ? sem_.rotary_dim : sem_.rotary_dim_sliding;
+        const bool l_prop = l_full && sem_.proportional_rope;
+        const int l_win   = l_full ? 0 : sem_.sliding_window;
+        const int i_qkv_l = (two_widths && l_full) ? i_qkv2 : i_qkv;
+        const int i_o_l   = (two_widths && l_full) ? i_o2 : i_o;
+
+        // ---- attention ----
+        for (int m = 0; m < M; m++)
+            rmsnorm(X.data() + (size_t)m * H, in_norm_[l].data(), H,
+                    XN.data() + (size_t)m * H);
+        {
+            const Q4nxDesignGeom* g = &designs_[i_qkv_l];
+            Q4nxProjections p{};
+            p.q = wq_.data(); p.k = wk_.data(); p.v = wv_.data();
+            if (!cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
+                err_ = "assemble qkv"; return false;
+            }
+            npu_gemm_rows(*ctx_[i_qkv_l], XN.data(), M, g->K, g->N, B_.data(), QKV, 0);
+            const int l_hd = c_.NH > 0 ? g->q_rows / c_.NH : 0;
+            const int l_nkv = (l_hd > 0 && g->k_rows > 0) ? g->k_rows / l_hd : c_.NKV;
+            const int ctx_w = c_.NH * l_hd;
+            CTX.assign((size_t)M * (size_t)ctx_w, 0.0f);
+            for (int m = 0; m < M; m++) {
+                qkv_row.assign(QKV.begin() + (size_t)m * g->N,
+                               QKV.begin() + (size_t)(m + 1) * g->N);
+                if (!attention(qkv_row, start_pos + m, ctx_row, l_hd, l_nkv, l_theta,
+                               l_rot, l_prop, l_win, l, true)) {
+                    err_ = "attention failed";
+                    return false;
+                }
+                memcpy(CTX.data() + (size_t)m * ctx_w, ctx_row.data(),
+                       (size_t)ctx_w * sizeof(float));
+            }
+        }
+        {
+            const Q4nxDesignGeom* g = &designs_[i_o_l];
+            Q4nxProjections p{};
+            p.o = wo_.data();
+            if (!cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
+                err_ = "assemble o"; return false;
+            }
+            npu_gemm_rows(*ctx_[i_o_l], CTX.data(), M, g->K, g->N, B_.data(), O, 1);
+        }
+        for (int m = 0; m < M; m++)
+            for (int k = 0; k < H; k++)
+                X[(size_t)m * H + k] += O[(size_t)m * H + k] * residual_scale_;
+
+        // ---- MLP ----
+        for (int m = 0; m < M; m++)
+            rmsnorm(X.data() + (size_t)m * H, post_norm_[l].data(), H,
+                    XN.data() + (size_t)m * H);
+        if (n_expert_ > 0) {
+            // MoE FFN: the router/top-k pick different experts per row, so this
+            // stays per-token (the attention GEMMs above are already batched).
+            // Grouping rows by expert so each expert's weight read serves the
+            // whole batch is the next step -- go_rows is the primitive for it.
+            std::vector<float> xn_row, d_row;
+            for (int m = 0; m < M; m++) {
+                xn_row.assign(XN.begin() + (size_t)m * H,
+                              XN.begin() + (size_t)(m + 1) * H);
+                if (!moe_mlp(l, xn_row, d_row)) { err_ = "moe failed"; return false; }
+                for (int k = 0; k < H; k++)
+                    X[(size_t)m * H + k] += d_row[(size_t)k] * residual_scale_;
+            }
+            continue;
+        }
+        if (i_gu >= 0) {
+            const Q4nxDesignGeom* g = &designs_[i_gu];
+            Q4nxProjections p{};
+            p.gate = wg_.data(); p.up = wu_.data();
+            if (!cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
+                err_ = "assemble gu"; return false;
+            }
+            npu_gemm_rows(*ctx_[i_gu], XN.data(), M, g->K, g->N, B_.data(), ACT, 2);
+        } else if (i_g >= 0 && i_u >= 0) {
+            std::vector<float> gv, uv, av((size_t)M * (size_t)im * 2);
+            const Q4nxDesignGeom* gg = &designs_[i_g];
+            Q4nxProjections pg{}; pg.gate = wg_.data();
+            if (!cached && q4nx_assemble_B(gg, &pg, B_.data()) != 0) {
+                err_ = "assemble g"; return false;
+            }
+            npu_gemm_rows(*ctx_[i_g], XN.data(), M, gg->K, gg->N, B_.data(), gv, 2);
+            const Q4nxDesignGeom* gu = &designs_[i_u];
+            Q4nxProjections pu{}; pu.up = wu_.data();
+            if (!cached && q4nx_assemble_B(gu, &pu, B_.data()) != 0) {
+                err_ = "assemble u"; return false;
+            }
+            npu_gemm_rows(*ctx_[i_u], XN.data(), M, gu->K, gu->N, B_.data(), uv, 3);
+            for (int m = 0; m < M; m++)
+                for (int i = 0; i < im; i++) {
+                    av[(size_t)m * 2 * im + i] = gv[(size_t)m * im + i];
+                    av[(size_t)m * 2 * im + im + i] = uv[(size_t)m * im + i];
+                }
+            ACT.swap(av);
+        } else {
+            err_ = "no gate/up design";
+            return false;
+        }
+        HH.assign((size_t)M * (size_t)im, 0.0f);
+        for (int m = 0; m < M; m++) {
+            act_row.assign(ACT.begin() + (size_t)m * 2 * im,
+                           ACT.begin() + (size_t)(m + 1) * 2 * im);
+            if (!mlp(act_row, hh, im)) { err_ = "mlp failed"; return false; }
+            memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
+        }
+        {
+            const Q4nxDesignGeom* g = &designs_[i_d];
+            Q4nxProjections p{};
+            p.down = wd_.data();
+            if (!cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
+                err_ = "assemble d"; return false;
+            }
+            npu_gemm_rows(*ctx_[i_d], HH.data(), M, g->K, g->N, B_.data(), D, 4);
+        }
+        for (int m = 0; m < M; m++)
+            for (int k = 0; k < H; k++)
+                X[(size_t)m * H + k] += D[(size_t)m * H + k] * residual_scale_;
+    }
+
+    // The next-token logits come from the last row of the batch, after the final
+    // norm -- step() applies final_norm_ before run_lm_head, and feeding the raw
+    // residual here produced garbage logits (the M=1 self-check caught it).
+    std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
+    std::vector<float> fnorm(H);
+    rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
+    const bool ok = run_lm_head(fnorm, logits);
+    if (batch_check) {
+        int ba = 0;
+        for (size_t i = 1; i < logits.size(); i++)
+            if (logits[i] > logits[(size_t)ba]) ba = (int)i;
+        std::fprintf(stderr, "[batchcheck] M=%d start=%d seq_argmax=%d batch_argmax=%d %s\n",
+                     M, start_pos, seq_argmax, ba, seq_argmax == ba ? "MATCH" : "MISMATCH");
+    } else if (getenv("NPU_BATCH_DBG")) {
+        std::fprintf(stderr, "[batch] M=%d start=%d batched (%d layers, two_widths=%d)\n",
+                     M, start_pos, c_.NL, (int)two_widths);
+    }
+    return ok;
+}
+
+int Q4nxNpuForward::max_batch_rows() const {
+    for (int i = 0; i < ndesigns_; i++)
+        if (ctx_[i]) return ctx_[i]->MD;
+    return 1;  // host_gemm_ / not initialised: keep batches trivially small
+}
+
 // --------------------------------------------------------------------------
 // host helpers (float32, matching the Python reference)
 // --------------------------------------------------------------------------
@@ -1390,9 +1715,9 @@ float Q4nxNpuForward::rmsnorm_noweight(const float* x, int n, float* out) const 
 bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
                                 int N, int K, std::vector<float>& out) {
     if (!pool || per_expert == 0 || e < 0) return false;
-    std::vector<float> kn((size_t)K * (size_t)N);
-    if (dequant_any(pool + (size_t)e * per_expert, per_expert, K, N, kn.data()) != 0)
-        return false;
+    // Dequantize straight into `out`: the old path materialized a `kn` temporary
+    // and then copied it -- an extra (K*N) allocation plus a full copy per expert,
+    // ~960 experts/token.
     out.resize((size_t)N * (size_t)K);
     // Do NOT transpose.  The tile decode at (rows=K, cols=N) already reproduces the
     // GGUF's flat order, and that flat sequence IS the logical [N][K] = [out][in]
@@ -1400,7 +1725,8 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     // corr 0.999198 (gate) / 0.996949 (down), while transposing gives -0.001079 /
     // 0.000417 -- i.e. the transpose destroyed the expert entirely, making every
     // routed expert's contribution ~10-20x wrong and flipping the top-k selection.
-    std::copy(kn.begin(), kn.end(), out.begin());
+    if (dequant_any(pool + (size_t)e * per_expert, per_expert, K, N, out.data()) != 0)
+        return false;
     return true;
 }
 
@@ -1608,6 +1934,56 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
     }
     std::vector<float> g, u, dd, go, uo;
     double moe_g = 0, moe_u = 0, moe_sw = 0, moe_dn = 0;
+    const int i_gb = idx_of(Q4NX_DESIGN_GB), i_ub = idx_of(Q4NX_DESIGN_UB);
+    if (i_gb >= 0 && i_ub >= 0 && !getenv("NPU_NO_EXPERT_BATCH")) {
+        // One gate GEMM and one up GEMM over ALL selected experts (they share xn),
+        // instead of 2*top_k dispatches.  Expert j's weights occupy columns
+        // [j*IM, (j+1)*IM) of a [K][top_k*IM] B; the design's N is wider, so
+        // npu_gemm packs only the real columns and the tail stays zero.
+        const int K = H, tk = (int)sel.size(), N = tk * expert_im_;
+        static std::vector<float> Bg, Bu;   // reused across layers; fully written below
+        Bg.resize((size_t)K * N);
+        Bu.resize((size_t)K * N);
+        std::vector<std::vector<float>> gs(tk), us(tk), ds(tk);
+        for (int j = 0; j < tk; j++) {
+            if (!mla_expert(exp_g_, exp_g_bytes_, sel[j], expert_im_, K, gs[j])) { err_ = "expert gate"; return false; }
+            if (!mla_expert(exp_u_, exp_u_bytes_, sel[j], expert_im_, K, us[j])) { err_ = "expert up"; return false; }
+            if (!mla_expert(exp_d_, exp_d_bytes_, sel[j], K, expert_im_, ds[j])) { err_ = "expert down"; return false; }
+        }
+        #pragma omp parallel for schedule(static)
+        for (int j = 0; j < tk; j++) {
+            for (int n = 0; n < expert_im_; n++) {
+                const float* rg = &gs[j][(size_t)n * K];
+                const float* ru = &us[j][(size_t)n * K];
+                for (int i = 0; i < K; i++) {
+                    Bg[(size_t)i * N + (size_t)j * expert_im_ + n] = rg[i];
+                    Bu[(size_t)i * N + (size_t)j * expert_im_ + n] = ru[i];
+                }
+            }
+        }
+        std::vector<float> go_all, uo_all;
+        npu_gemm(*ctx_[i_gb], xn.data(), designs_[i_gb].K, N, Bg.data(), go_all);
+        npu_gemm(*ctx_[i_ub], xn.data(), designs_[i_ub].K, N, Bu.data(), uo_all);
+        for (int j = 0; j < tk; j++) {
+            const int e = sel[j];
+            std::vector<float> act((size_t)expert_im_);
+            for (int i = 0; i < expert_im_; i++) {
+                const float gv = go_all[(size_t)j * expert_im_ + i];
+                act[i] = (gv / (1.0f + std::exp(-gv))) * uo_all[(size_t)j * expert_im_ + i];
+            }
+            const Q4nxDesignGeom* gd = &designs_[i_d];
+            std::vector<float> ed;
+            Q4nxProjections p{}; p.down = ds[j].data();
+            if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble expert down"; return false; }
+            npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), ed);
+            if (dump) {
+                for (int i = 0; i < expert_im_; i++) { moe_g += go_all[(size_t)j * expert_im_ + i]; moe_u += uo_all[(size_t)j * expert_im_ + i]; }
+                for (float f : act) moe_sw += f;
+                for (float f : ed) moe_dn += f;
+            }
+            for (int i = 0; i < H; i++) d[i] += r[e] * ed[i];
+        }
+    } else {
     for (int e : sel) {
         if (!mla_expert(exp_g_, exp_g_bytes_, e, expert_im_, H, g)) { err_ = "expert gate"; return false; }
         if (!mla_expert(exp_u_, exp_u_bytes_, e, expert_im_, H, u)) { err_ = "expert up"; return false; }
@@ -1641,6 +2017,7 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
             for (float f : ed) moe_dn += f;
         }
         for (int i = 0; i < H; i++) d[i] += r[e] * ed[i];
+    }
     }
     double moe_d_sum = 0; for (float f : d) moe_d_sum += f;
     // Shared expert, always on.

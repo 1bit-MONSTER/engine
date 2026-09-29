@@ -1620,6 +1620,79 @@ std::string repack_gguf(const std::string& gguf) {
     return out;
 }
 
+// Repack a GGUF into the Q4NX layout the fused lane reads, with
+// tools/gguf_to_q4nx.py (docs/npu.md, "From a GGUF").  This is a DIFFERENT
+// layout from repack_gguf()'s: the per-op forward's full_i8_*.elf designs read
+// the converter's packing, the lane reads the q4_1 tile packing this packer
+// writes.  The two are not interchangeable -- the same repacked directory
+// answers " Paris" through the forward and the wrong tokens through the lane
+// (evidence/gguf-npu-six/task3-fusion-feasibility.md) -- so it goes to its own
+// cache dir and the two never alias.
+//
+// Returns the directory, or "" when the lane layout cannot be produced for this
+// GGUF (an architecture the packer does not model, or a missing tool/tokenizer),
+// so the caller falls back to the per-op forward instead of failing.
+std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_dir) {
+    const std::string stem = fs::path(gguf).stem().string();
+    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
+    if (cache.empty()) {
+        const char* home = std::getenv("HOME");
+        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
+    }
+    const std::string out = cache + "/" + stem + "-lane";
+
+    const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
+    const std::string python = py ? py : "python3";
+    const char* lp = std::getenv("ONEBIT_Q4NX_LANE_PACK");
+#ifdef ONEBIT_NPU_LANE_PACK_SCRIPT
+    const std::string script = lp ? lp : ONEBIT_NPU_LANE_PACK_SCRIPT;
+#else
+    const std::string script = lp ? lp : "";
+#endif
+    if (script.empty() || !fs::exists(script)) {
+        std::fprintf(stderr, "1bit serve: lane layout packer not found (%s); using the per-op forward\n",
+                     script.empty() ? "(unset ONEBIT_Q4NX_LANE_PACK)" : script.c_str());
+        return {};
+    }
+    // The GGUF's own vocabulary is not converted to a tokenizer.json; the lane
+    // reads the model directory's.  Take it from the lane's model directory (a
+    // lane kernel dir is conventionally <model dir>/npu) unless told otherwise.
+    std::string tok = std::getenv("ONEBIT_NPU_LANE_TOKENIZER") ? std::getenv("ONEBIT_NPU_LANE_TOKENIZER") : "";
+    if (tok.empty()) {
+        const fs::path parent = fs::path(lane_dir).parent_path();
+        if (fs::exists(parent / "tokenizer.json")) tok = parent.string();
+    }
+    const bool cached = fs::exists(out + "/model.q4nx") && !std::getenv("ONEBIT_Q4NX_LANE_REPACK");
+    if (!cached) {
+        if (fs::exists(out)) fs::remove_all(out);
+        std::fprintf(stderr, "1bit serve: repacking %s -> %s (fused-lane layout) ...\n", gguf.c_str(), out.c_str());
+        fs::create_directories(out);
+        std::vector<std::string> cmd = { python, script, "pack", gguf, out };
+        if (!tok.empty()) { cmd.push_back("--tokenizer"); cmd.push_back(tok); }
+        const int rc = run_program(cmd, true);
+        if (rc != 0 || !fs::exists(out + "/model.q4nx")) {
+            fs::remove_all(out);
+            std::fprintf(stderr, "1bit serve: %s is not packable in the fused-lane layout (rc=%d); "
+                                 "using the per-op forward\n", gguf.c_str(), rc);
+            return {};
+        }
+    }
+    // A lane model directory must carry a tokenizer.json (npu/tokenizer.cpp).
+    if (!fs::exists(out + "/tokenizer.json")) {
+        if (tok.empty() || !fs::exists(fs::path(tok) / "tokenizer.json")) {
+            std::fprintf(stderr, "1bit serve: fused-lane layout has no tokenizer (set "
+                                 "ONEBIT_NPU_LANE_TOKENIZER); using the per-op forward\n");
+            return {};
+        }
+        fs::copy_file(fs::path(tok) / "tokenizer.json", fs::path(out) / "tokenizer.json",
+                      fs::copy_options::overwrite_existing);
+        if (fs::exists(fs::path(tok) / "tokenizer_config.json"))
+            fs::copy_file(fs::path(tok) / "tokenizer_config.json", fs::path(out) / "tokenizer_config.json",
+                          fs::copy_options::overwrite_existing);
+    }
+    return out;
+}
+
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
@@ -1743,30 +1816,67 @@ int run_serve(int argc, char** argv) {
     if (o.device == "mlx") return serve_child(o);
 #ifdef ONEBIT_NPU
     if (fs::path(o.model).extension() == ".gguf" && o.device == "npu") {
-        // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
-        // directory, then serve it through the model-generic forward in process.
-        const std::string dir = repack_gguf(o.model);
-        // Forward -> lane routing: if a fused-lane kernel set exists for this
-        // model's shape (the fast-lane artifacts layer_ctx1.elf + layer.pdi),
-        // serve it on the NPU fast lane (one launch per layer) instead of the
-        // per-op forward (~100+ launches per token).  Opt-in via
-        // ONEBIT_NPU_LANE_DIR: the repack layout must equal the lane kernels'
-        // layout, and it does not yet (the repack is patched for the forward's
-        // per-op ELFs), so this must not fire by accident.  Without it, the
-        // forward runs (the unchanged fallback).
+        // Fused-lane first (opt-in via ONEBIT_NPU_LANE_DIR): pack the GGUF in the
+        // lane's Q4NX layout and serve it through the fast lane (one launch per
+        // layer, npu/lane.cpp) instead of the per-op forward (~100+ launches per
+        // token).  The two layouts differ, so the lane gets its own pack and its
+        // own cache dir.  Anything the lane cannot serve -- an architecture the
+        // lane-layout packer does not model, a missing tokenizer, no kernel set --
+        // returns "" and falls through to the unchanged per-op forward, so this
+        // cannot regress a model the lane does not cover.
         {
             std::string lane;
             if (const char* env = std::getenv("ONEBIT_NPU_LANE_DIR")) lane = env;
             if (!lane.empty() && fs::exists(fs::path(lane) / "layer_ctx1.elf")) {
-                if (!fs::exists(fs::path(dir) / "npu")) {
+                const std::string ldir = repack_gguf_lane(o.model, lane);
+                if (!ldir.empty()) {
                     std::error_code ec;
-                    fs::create_directory_symlink(lane, fs::path(dir) / "npu", ec);
+                    if (!fs::exists(fs::path(ldir) / "npu"))
+                        fs::create_directory_symlink(lane, fs::path(ldir) / "npu", ec);
+                    if (!ec && fs::exists(fs::path(ldir) / "npu" / "layer_ctx1.elf")) {
+                        std::fprintf(stderr, "1bit serve: routing %s to the NPU fast lane (fused layer) from %s\n",
+                                     o.model.c_str(), lane.c_str());
+                        std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
+                        if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                        std::vector<char*> av;
+                        for (auto& s : args) av.push_back(s.data());
+                        return run_unified(int(av.size()), av.data());
+                    }
                     if (ec) std::fprintf(stderr, "1bit serve: lane routing skipped (%s)\n", ec.message().c_str());
                 }
-                if (fs::exists(fs::path(dir) / "npu" / "layer_ctx1.elf")) {
-                    std::fprintf(stderr, "1bit serve: routing %s to the NPU fast lane (fused layer) from %s\n",
-                                 o.model.c_str(), lane.c_str());
-                    std::vector<std::string> args = {"-m", dir, "-p", std::to_string(o.port), "--host", o.host};
+            }
+        }
+        // Fused dx route (addons/npu-dx, one NPU launch per layer): pack the GGUF in
+        // the dx (q4_1 tile) layout and serve it through the private dx route instead
+        // of the per-op forward (~100+ launches per token).  The dx kernels are
+        // shape-parameterised (layer1.elf per layer) and serve dense qwen2/qwen3 the
+        // fast lane cannot.  Opt-in via ONEBIT_NPU_DX_KERNELS (or -DONEBIT_NPU_DX_KERNELS).
+        // Anything the dx route cannot serve -- no kernel set, a mismatched q/k flavour,
+        // a missing tokenizer -- returns "" and falls through to the per-op forward.
+        {
+            std::string dxk;
+            if (const char* env = std::getenv("ONEBIT_NPU_DX_KERNELS")) dxk = env;
+#ifdef ONEBIT_NPU_DX_KERNELS_DEFAULT
+            if (dxk.empty()) dxk = ONEBIT_NPU_DX_KERNELS_DEFAULT;
+#endif
+            if (!dxk.empty()) {
+                // The dx layout packer copies an external tokenizer.json (it does not
+                // convert the GGUF's own vocabulary); the per-op forward's repack
+                // produces one, so reuse that (cached) directory when none is set.
+                if (!std::getenv("ONEBIT_NPU_LANE_TOKENIZER")) {
+                    try {
+                        const std::string fwd = repack_gguf(o.model);
+                        if (fs::exists(fs::path(fwd) / "tokenizer.json"))
+                            setenv("ONEBIT_NPU_LANE_TOKENIZER", fwd.c_str(), 0);
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "1bit serve: dx tokenizer reuse skipped (%s)\n", e.what());
+                    }
+                }
+                const std::string ldir = repack_gguf_lane(o.model, dxk);
+                if (!ldir.empty()) {
+                    std::fprintf(stderr, "1bit serve: routing %s to the fused dx route (one launch per layer) from %s\n",
+                                 o.model.c_str(), dxk.c_str());
+                    std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
                     if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
                     std::vector<char*> av;
                     for (auto& s : args) av.push_back(s.data());
@@ -1774,6 +1884,9 @@ int run_serve(int argc, char** argv) {
                 }
             }
         }
+        // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
+        // directory, then serve it through the model-generic forward in process.
+        const std::string dir = repack_gguf(o.model);
         // Resolve the full-ELF / xclbin directory the forward loads. An empty value
         // makes it look for "/full_i8_*.elf", so it is an error, not a default.
         std::string kernels;

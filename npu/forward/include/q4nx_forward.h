@@ -85,6 +85,19 @@ public:
     // Run one token at absolute position pos; fills logits (size NV).
     bool step(int token, int pos, std::vector<float>& logits);
 
+    // Batched prefill: run the whole prompt in one pass so each projection's
+    // weight stream is read once per batch instead of once per token. The kernels
+    // are M=128 wide, so a per-token step leaves ~99% of the array idle. Only the
+    // simple dense path is batched; every other architecture falls back to
+    // per-token step() (see the guard in the implementation).
+    bool step_batch(const std::vector<int>& tokens, int start_pos,
+                    std::vector<float>& logits);
+
+    // Rows per batched launch. The activation BO holds exactly MD rows and the
+    // per-op kernels are built M=MD wide, so a batch must not exceed this (the
+    // batched quantizer refuses batches wider than MD rather than corrupting).
+    int max_batch_rows() const;
+
     // Which artifacts were used, for reporting.
     const std::string& backend() const { return backend_; }
 
@@ -96,6 +109,9 @@ private:
     bool load_layer(int l);
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                   const float* Bmat, std::vector<float>& out, int wkey = -1);
+    // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
+    void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
+                       const float* Bmat, std::vector<float>& out, int wkey = -1);
     // True when this layer's projection `wkey` is already packed in its own BO,
     // so the caller can skip both the Q4NX dequant (load_layer) and the f32->B
     // assembly for the rest of the run.

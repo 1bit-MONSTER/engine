@@ -199,13 +199,13 @@ def field(r, key, default=None):
 
 def config(r, vocab):
     arch = field(r, "general.architecture")
-    if arch != "qwen3":
-        raise SystemExit(f"architecture {arch!r}: only qwen3 is supported")
+    if arch not in ("qwen3", "qwen2"):
+        raise SystemExit(f"architecture {arch!r}: only qwen3 and qwen2 are supported")
     a = lambda k, d=None: field(r, f"{arch}.{k}", d)  # noqa: E731
     heads = a("attention.head_count")
     tied = not any(t.name == "output.weight" for t in r.tensors)
     c = {
-        "architectures": ["Qwen3ForCausalLM"],
+        "architectures": [{"qwen3": "Qwen3ForCausalLM", "qwen2": "Qwen2ForCausalLM"}[arch]],
         "model_type": arch,
         "hidden_size": a("embedding_length"),
         "intermediate_size": a("feed_forward_length"),
@@ -224,6 +224,13 @@ def config(r, vocab):
         "hidden_act": "silu",
         "q4nx_source": {"converter": "tools/gguf_to_q4nx.py"},
     }
+    if arch == "qwen2":
+        # qwen2 differs from qwen3 in exactly two attention ways: no per-head q/k
+        # RMSNorm, and q/k/v projection bias.  Both are declared here so a consumer
+        # does not have to sniff the tensor table.
+        c["attention_bias"] = any(t.name.endswith(("attn_q.bias", "attn_k.bias", "attn_v.bias"))
+                                  for t in r.tensors)
+        c["qk_norm"] = False
     return {k: v for k, v in c.items() if v is not None}
 
 

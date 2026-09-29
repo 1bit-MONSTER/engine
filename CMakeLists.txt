@@ -356,6 +356,10 @@ set(ONEBIT_NPU_PDI "" CACHE FILEPATH "The layer kernel's design PDI")
 set(ONEBIT_NPU_GOLDEN "" CACHE PATH "Directory of full ELFs the fast lane ran")
 set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full ELF / xclbin directory the GGUF-on-NPU forward loads (docs/npu.md)")
 target_compile_definitions(onebit PRIVATE ONEBIT_NPU_REPACK_SCRIPT="${CMAKE_SOURCE_DIR}/scripts/repack_gguf.py")
+# The GGUF -> fused-lane Q4NX layout packer (docs/npu.md, "From a GGUF").  A
+# different layout from repack_gguf.py; used only when ONEBIT_NPU_LANE_DIR routes
+# a GGUF to the fast lane, and never on the per-op forward's path.
+target_compile_definitions(onebit PRIVATE ONEBIT_NPU_LANE_PACK_SCRIPT="${CMAKE_SOURCE_DIR}/tools/gguf_to_q4nx.py")
 if(ONEBIT_NPU_KERNELS_DIR)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU_KERNELS_DIR="${ONEBIT_NPU_KERNELS_DIR}")
 endif()
@@ -414,6 +418,13 @@ if(ONEBIT_NPU)
         npu/forward/src/q4nx_pack.c
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp)
+    # The Q4NX pack and dequant loops carry `#pragma omp parallel for`; without the
+    # OpenMP flags those compile to serial code. Wire it in (both C and C++ sources)
+    # so they actually use the cores.
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
+        target_link_libraries(onebit_npu_forward PUBLIC OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+    endif()
     # NPU_INFER_DUMP_ATTN / _LN / _HEAD write debug dumps to a path taken from the environment;
     # only debug builds carry them
     option(ONEBIT_NPU_DEBUG_DUMPS "NPU forward: env-named debug dumps (developer builds)" OFF)
@@ -453,6 +464,11 @@ if(ONEBIT_NPU_PRIVATE)
     endif()
     target_link_libraries(onebit PRIVATE onebit_npu_private)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU_PRIVATE)
+    # Make the dx kernels' build default visible to app/serve.cpp's GGUF -> fused dx
+    # routing branch too (the add-on compiles it only onto onebit_npu_dx, PRIVATE).
+    if(ONEBIT_NPU_DX_KERNELS)
+        target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
+    endif()
 endif()
 
 

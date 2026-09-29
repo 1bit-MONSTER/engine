@@ -425,15 +425,25 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
 
   | Model | HRX | Vulkan | |
   |---|---|---|---|
-  | Qwen3.8-27B UD-Q4_K_XL | 11.60 | 12.49 | 92.9% (was 9.0) |
-  | ZAYA1-8B Q4_K_M | 92.7 | 93 | ~100% (was ~90) |
+  | Qwen3.8-27B UD-Q4_K_XL | 12.15 | 12.48 | 97.3% (was 9.0) |
+  | ZAYA1-8B Q4_K_M | 94.0 | 93 | ~100% (was ~90) |
   | Qwen3-0.6B Q4_K_M | 326.6 | 357 | 91.4% (was 320.8) |
   | Qwen3-Coder-30B-A3B Q4_K_M | 90.6 | 93.7 | 96.6% (unchanged) |
 
-  Decode-shaped wikitext PPL (`-ub 1`) on the 27B: 7.1550, HRX before 7.1547, CPU 7.1475.
-  Still on the older paths: IQ3_S and Q3_K layers (one IQ3_S `ffn_down` costs 2.8 ms of the 27B's
-  ~89 ms token). The 27B on HRX runs hot on Strix Halo (90-93 C peak vs 67 C for Vulkan).
-- **Fast sub-4-bit kernels on HRX.** IQ2 and IQ3_S matmuls still fall back to the CPU.
+  [llama.cpp #43](https://github.com/1bit-MONSTER/llama.cpp/pull/43) added Q3_K and IQ3_S (IQ3_S keeps
+  its 512-entry grid in workgroup memory), which covers every weight type of the UD-Q4_K_XL 27B.
+  Decode-shaped wikitext PPL (`-ub 1`) on the 27B: 7.1595, CPU 7.1475.
+- **HRX decode no longer spins a CPU core
+  ([llama.cpp #44](https://github.com/1bit-MONSTER/llama.cpp/pull/44)).** The per-token stream wait
+  sat in ROCr's signal wait, which returned from the KFD event ioctl on every completed command
+  (~900 per 27B token) without sleeping: a full core for the whole token, ~10 W of package power,
+  and a 90-93 C APU during 27B decode. Long expected waits (over 20 ms) now sleep through 80% of
+  the wait; shorter ones are unchanged. 27B decode: 71-76 C and ~125 W instead of 83-93 C and
+  133-137 W, 0.4% slower; Qwen3-0.6B and ZAYA1-8B unchanged. `ONEBIT_HRX_BLOCKING_WAIT=1` turns it
+  off. Model load and the first request still burst to ~88 C for a couple of seconds (host weight
+  conversions and first-use GPU work share the package power limit).
+- **Fast sub-4-bit kernels on HRX.** IQ2 matmuls still fall back to the CPU; IQ3_S has a decode
+  kernel (#43) but not a fast prefill one.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
   They are kept on `1bit/hrx2-archive` until they are ported.
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows

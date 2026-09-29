@@ -662,9 +662,12 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
             if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
-            // 1024-token micro-batches: prompt processing +3-8% over the default 512 (Qwen3-Coder-30B-A3B,
-            // pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; 2048 is no better), decode unchanged
-            argv.insert(argv.end(), {"-ub", "1024"});
+            // MoE files: 1024-token micro-batches, prompt processing +3-8% over the default 512
+            // (Qwen3-Coder-30B-A3B, pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; 2048 is no
+            // better), decode unchanged. A dense file keeps 512: Qwen3.8-27B-H32 serves a 1,838-token
+            // prompt at 491-495 tok/s with 512 and 471-473 with 1024.
+            if (gguf_int(o.model, gguf_architecture(o.model) + ".expert_count") > 0)
+                argv.insert(argv.end(), {"-ub", "1024"});
         }
     } else if (device == "vulkan" || device == "hrx") {
         // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
@@ -748,8 +751,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
         // DFlash drafts a whole block per step and only pays with full blocks; llama-server's
-        // default draft length is 3, and it clamps a longer one to the drafter's trained block
-        else if (!o.dflash.empty()) argv.insert(argv.end(), {"--spec-draft-n-max", "16"});
+        // default draft length is 3. The longest draft is the drafter's block minus its anchor
+        // token, and the draft length also sets how many recurrent states a hybrid model keeps
+        // for rollback: asking for 16 against DFlash2's block of 8 made every prompt write 16
+        // snapshots (Qwen3.8-27B-H32, 1,838-token prompt: 452-457 tok/s against 456-464).
+        else if (!o.dflash.empty()) {
+            const long long block = gguf_int(o.dflash, gguf_architecture(o.dflash) + ".block_size");
+            argv.insert(argv.end(), {"--spec-draft-n-max", block > 1 ? std::to_string(block - 1) : "16"});
+        }
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
         // a DFlash block is kept whole unless --mtp-p-min says otherwise: upstream's default p-min
         // is 0, the ROCm tree's is 0.75, which cuts DFlash2 blocks from 6.7 to 5.4 tokens a step

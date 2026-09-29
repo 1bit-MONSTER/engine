@@ -184,9 +184,10 @@ drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A draft
 kept only when the model agrees, so the output is the model's own.
 
 `--dflash` also works on the lean ROCm route: a Hadamard-rotated Q4_0 file gets W4A4 prompt
-processing and DFlash2 decode from one server, 445 t/s prompt and 40.9 / 26.8 tok/s decode
+processing and DFlash2 decode from one server, 477 t/s prompt and 41.1 / 26.7 tok/s decode
 ([lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). `--dflash` sets
-`--spec-draft-p-min 0` unless `--mtp-p-min` is given.
+`--spec-draft-p-min 0` unless `--mtp-p-min` is given, and without `--mtp-max` drafts the
+drafter's block minus one (its `dflash.block_size`; 16 when the file does not say).
 
 ## MoE models larger than memory (`--moe-slots`)
 
@@ -311,7 +312,7 @@ Qwen3-Coder-30B-A3B, 256 output tokens, effective tok/s (output tokens over the 
 | **`--long-model`** | **71.3** | 53.1 | 25.5 | 13.1 |
 
 The `--long-model` row ran while another job used the box's memory bus, which cost its long
-side 2-5% against the W4A4 row. A rotated file now runs 1024-token micro-batches (`-ub 1024`),
+side 2-5% against the W4A4 row. A rotated MoE file now runs 1024-token micro-batches (`-ub 1024`; a dense one keeps 512, [lean.md](lean.md)),
 which raises the W4A4 prefill 6-10% (server-reported 2,217 / 1,742 / 1,295 tok/s at 2K / 8K /
 16K, from 2,000 / 1,607 / 1,221): a 16K-token prompt's first token at 12.96 s instead of 13.89. Both files stay loaded (here 17 + 16 GiB). It needs the Vulkan
 build and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`, and `-m` on a llama-server route (vulkan, hrx or

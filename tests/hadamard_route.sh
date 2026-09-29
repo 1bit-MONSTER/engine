@@ -18,10 +18,12 @@
 # onebit.hadamard_q4_0 = 32; docs/lean.md), without a GPU:
 #   - --device vulkan refuses it,
 #   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_Q4_0_HADAMARD=1 and
-#     GGML_W4A4_TENSORS=all in the backend's environment and 1024-token micro-batches (-ub 1024),
+#     GGML_W4A4_TENSORS=all in the backend's environment; a MoE file (an expert count) also gets
+#     1024-token micro-batches (-ub 1024), a dense one keeps llama-server's 512,
 #   - an unstamped file with --device auto still goes to Vulkan with neither variable,
-#   - --dflash on a rotated file adds the DFlash drafter with full blocks (n-max 16, p-min 0):
-#     one ROCm server, W4A4 prompt processing and DFlash2 decode.
+#   - --dflash on a rotated file adds the DFlash drafter with full blocks (p-min 0, n-max = the
+#     drafter's dflash.block_size - 1, or 16 when the file does not say): one ROCm server, W4A4
+#     prompt processing and DFlash2 decode.
 #
 # usage: tests/hadamard_route.sh path/to/1bit
 set -uo pipefail
@@ -35,16 +37,20 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
 python3 - "$scratch" <<'PY'
 import struct, sys
-def gguf(path, stamp):
+def gguf(path, stamp, arch="llama", ints={}):
     kv = []
     def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
-    kv.append(s("general.architecture") + struct.pack("<I", 8) + s("llama"))
+    kv.append(s("general.architecture") + struct.pack("<I", 8) + s(arch))
     if stamp:
         kv.append(s("onebit.hadamard_q4_0") + struct.pack("<I", 5) + struct.pack("<i", 32))
+    for k, v in ints.items():
+        kv.append(s(k) + struct.pack("<I", 4) + struct.pack("<I", v))
     open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
 gguf(sys.argv[1] + "/h32.gguf", True)
+gguf(sys.argv[1] + "/h32moe.gguf", True, "qwen3moe", {"qwen3moe.expert_count": 128})
 gguf(sys.argv[1] + "/plain.gguf", False)
 gguf(sys.argv[1] + "/draft.gguf", False)
+gguf(sys.argv[1] + "/draft8.gguf", False, "dflash", {"dflash.block_size": 8})
 PY
 
 # a backend that records how it was started, then answers /health
@@ -84,7 +90,10 @@ run "$scratch/h32.gguf" "$scratch/h32.json"
 check "--device auto sends a rotated file to ROCm0" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = ROCm0 ]'
 check "  with GGML_Q4_0_HADAMARD=1" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_Q4_0_HADAMARD\")")" = 1 ]'
 check "  and GGML_W4A4_TENSORS=all" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
-check "  with 1024-token micro-batches" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"-ub\")+1]")" = 1024 ]'
+check "  dense: llama-server's own micro-batch" '[ "$(field "$scratch/h32.json" "\"-ub\" in r[\"argv\"]")" = False ]'
+
+run "$scratch/h32moe.gguf" "$scratch/h32moe.json"
+check "a rotated MoE file gets 1024-token micro-batches" '[ "$(field "$scratch/h32moe.json" "r[\"argv\"][r[\"argv\"].index(\"-ub\")+1]")" = 1024 ]'
 
 run "$scratch/plain.gguf" "$scratch/plain.json"
 check "an unstamped file still goes to Vulkan0" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = Vulkan0 ]'
@@ -94,8 +103,11 @@ run "$scratch/h32.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"
 after() { field "$scratch/df.json" "r[\"argv\"][r[\"argv\"].index(\"$1\")+1]"; }
 check "--dflash on a rotated file stays on ROCm0" '[ "$(after --device)" = ROCm0 ]'
 check "  with the DFlash drafter" '[ "$(after --spec-type)" = draft-dflash ] && [ "$(after -md)" = "$scratch/draft.gguf" ]'
-check "  full blocks: n-max 16, p-min 0" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0 ]'
+check "  full blocks: n-max 16 without a block size, p-min 0" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0 ]'
 check "  and the Hadamard W4A4 environment" '[ "$(field "$scratch/df.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
+
+run "$scratch/h32.gguf" "$scratch/df8.json" --dflash "$scratch/draft8.gguf"
+check "--dflash with a block-8 drafter drafts 7" '[ "$(field "$scratch/df8.json" "r[\"argv\"][r[\"argv\"].index(\"--spec-draft-n-max\")+1]")" = 7 ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

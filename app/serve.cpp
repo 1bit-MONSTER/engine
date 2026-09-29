@@ -79,6 +79,7 @@
 #include "unified.h"
 #endif
 #ifdef ONEBIT_LAYA
+#include "encoder.h"
 #include "policy.h"
 #include "route.h"
 #include "scorer.h"
@@ -1081,12 +1082,14 @@ int serve_child(const Options& given) {
         if (o.adaptive || !o.role.empty() || !o.prefill_device.empty() || o.lean)
             throw std::runtime_error("--laya does not combine with --adaptive, --embedding/--reranking, --prefill-device or --lean");
         policy = onebit::laya::load_route_policy(o.route_policy);
-        const std::string gguf = laya_gguf(o.laya_model), bin = laya_ggml_bin();
+        // ONEBIT_LAYA_DEVICE=npu: the C++ scorer with its encoder on the NPU, from a private add-on
+        // (laya/encoder.h, docs/laya.md); else the GGUF scorer, on HRX0 unless it names another
+        const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
+        const bool laya_npu = dev && std::string(dev) == "npu";
+        const std::string gguf = laya_npu ? "" : laya_gguf(o.laya_model), bin = laya_npu ? "" : laya_ggml_bin();
 #if defined(__linux__)
         if (!gguf.empty() && !bin.empty()) {
-            // the GGUF scorer on HRX0 (ONEBIT_LAYA_DEVICE picks another: cpu), with the HSA runtime HRX
-            // needs (docs/hrx.md)
-            const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
+            // the GGUF scorer, with the HSA runtime HRX needs (docs/hrx.md)
             std::vector<std::string> env;
             if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
@@ -1104,8 +1107,18 @@ int serve_child(const Options& given) {
             const std::string ckpt = laya_checkpoint(o.laya_model);
             scorer = std::make_unique<onebit::laya::Scorer>();
             if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
-            std::fprintf(stderr, "1bit serve: laya: checkpoint %s, policy %s\n", ckpt.c_str(),
-                         o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+            if (laya_npu) {
+                const onebit::laya::EncoderFactory* f = onebit::laya::find_encoder("npu");
+                if (!f)
+                    throw std::runtime_error("laya: ONEBIT_LAYA_DEVICE=npu needs a build with the NPU add-on "
+                                             "(-DONEBIT_NPU_PRIVATE=<npu-kernels checkout>, docs/laya.md)");
+                std::string err;
+                onebit::laya::EncoderFn fn = (*f)(ckpt, &err);
+                if (!fn) throw std::runtime_error("laya: the NPU encoder: " + err);
+                scorer->set_encoder(std::move(fn));
+            }
+            std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s, policy %s\n", ckpt.c_str(),
+                         laya_npu ? " (encoder on the NPU)" : "", o.route_policy.empty() ? "built in" : o.route_policy.c_str());
         }
         for (const std::string& dev : kGgufDevices) {
             try {

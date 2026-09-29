@@ -25,6 +25,7 @@
 #pragma once
 
 #include <cstdint>
+#include <functional>
 #include <memory>
 #include <string>
 #include <utility>
@@ -80,6 +81,13 @@ public:
 
     const std::string& error() const { return err_; }
 
+    // Runs the encoder layers through fn (laya/encoder.h) from now on; an empty fn goes back to the
+    // CPU. A call where fn declines any sequence runs the whole batch on the CPU.
+    void set_encoder(std::function<bool(float* h, int rows, int n)> fn) { encoder_ = std::move(fn); }
+    // Sequences the set encoder ran, and sequences it declined (run on the CPU instead).
+    long encoded() const { return encoded_; }
+    long declined() const { return declined_; }
+
 private:
     // config
     int max_len_ = 512;
@@ -110,6 +118,8 @@ private:
     std::vector<float> temperature_;                        // [3]
     std::vector<std::pair<std::string, float>> temperature_by_options_;
 
+    std::function<bool(float* h, int rows, int n)> encoder_;
+    long encoded_ = 0, declined_ = 0;
     std::unique_ptr<onebit::npu::Tokenizer> tok_;  // loaded once: reading tokenizer.json costs ~50 ms
     std::string err_;
 };

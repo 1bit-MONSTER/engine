@@ -77,47 +77,60 @@ void parallel_ranges(int n, int t, F fn) {
     for (auto& th : pool) th.join();
 }
 
-// out[m,k] = in[m,n] @ W^T[k,n] + bias[k]. The output columns are split across threads; every
-// sum has one fixed order (sixteen lanes over the input, then the lanes in turn, then the tail), so
-// the result is the same for any number of threads, bit for bit, and the lanes vectorize.
-void linear(const float* in, const float* W, const float* bias, int m, int n, int k, float* out) {
+// The portable build targets baseline x86-64 (SSE2); on Linux x86-64 the column kernel is also
+// compiled for AVX2 and AVX-512 and the loader picks one for the running CPU (ifunc). A given
+// build and CPU always take the same one, so results stay deterministic.
+#if defined(__x86_64__) && defined(__linux__) && (defined(__GNUC__) || defined(__clang__))
+#define ONEBIT_LAYA_SIMD_CLONES __attribute__((target_clones("avx512f", "avx2", "default")))
+#else
+#define ONEBIT_LAYA_SIMD_CLONES
+#endif
+
+// out[m, j0..j1) of in[m,n] @ W^T[k,n] + bias[k]. Every sum has one fixed order (sixteen lanes over
+// the input, then the lanes in turn, then the tail), so the result does not depend on how the
+// columns are split across threads, and the lanes vectorize.
+ONEBIT_LAYA_SIMD_CLONES
+void linear_cols(const float* in, const float* W, const float* bias, int m, int n, int k, float* out, int j0, int j1) {
     constexpr int V = 16;
     const int nv = n / V * V;
     // Each weight row is read once per four input rows; the four rows' sums are independent.
-    auto cols = [&](int j0, int j1) {
-        for (int j = j0; j < j1; ++j) {
-            const float* wr = W + (size_t)j * n;
-            const float b = bias ? bias[j] : 0.0f;
-            int i = 0;
-            for (; i + 4 <= m; i += 4) {
-                const float *x0 = in + (size_t)i * n, *x1 = x0 + n, *x2 = x1 + n, *x3 = x2 + n;
-                float a0[V] = {}, a1[V] = {}, a2[V] = {}, a3[V] = {};
-                for (int c = 0; c < nv; c += V)
-                    for (int l = 0; l < V; ++l) {
-                        const float w = wr[c + l];
-                        a0[l] += x0[c + l] * w; a1[l] += x1[c + l] * w; a2[l] += x2[c + l] * w; a3[l] += x3[c + l] * w;
-                    }
-                float s0 = b, s1 = b, s2 = b, s3 = b;
-                for (int l = 0; l < V; ++l) { s0 += a0[l]; s1 += a1[l]; s2 += a2[l]; s3 += a3[l]; }
-                for (int c = nv; c < n; ++c) {
-                    const float w = wr[c];
-                    s0 += x0[c] * w; s1 += x1[c] * w; s2 += x2[c] * w; s3 += x3[c] * w;
+    for (int j = j0; j < j1; ++j) {
+        const float* wr = W + (size_t)j * n;
+        const float b = bias ? bias[j] : 0.0f;
+        int i = 0;
+        for (; i + 4 <= m; i += 4) {
+            const float *x0 = in + (size_t)i * n, *x1 = x0 + n, *x2 = x1 + n, *x3 = x2 + n;
+            float a0[V] = {}, a1[V] = {}, a2[V] = {}, a3[V] = {};
+            for (int c = 0; c < nv; c += V)
+                for (int l = 0; l < V; ++l) {
+                    const float w = wr[c + l];
+                    a0[l] += x0[c + l] * w; a1[l] += x1[c + l] * w; a2[l] += x2[c + l] * w; a3[l] += x3[c + l] * w;
                 }
-                out[(size_t)i * k + j] = s0; out[(size_t)(i + 1) * k + j] = s1;
-                out[(size_t)(i + 2) * k + j] = s2; out[(size_t)(i + 3) * k + j] = s3;
+            float s0 = b, s1 = b, s2 = b, s3 = b;
+            for (int l = 0; l < V; ++l) { s0 += a0[l]; s1 += a1[l]; s2 += a2[l]; s3 += a3[l]; }
+            for (int c = nv; c < n; ++c) {
+                const float w = wr[c];
+                s0 += x0[c] * w; s1 += x1[c] * w; s2 += x2[c] * w; s3 += x3[c] * w;
             }
-            for (; i < m; ++i) {
-                const float* x = in + (size_t)i * n;
-                float a[V] = {};
-                for (int c = 0; c < nv; c += V)
-                    for (int l = 0; l < V; ++l) a[l] += x[c + l] * wr[c + l];
-                float acc = b;
-                for (int l = 0; l < V; ++l) acc += a[l];
-                for (int c = nv; c < n; ++c) acc += x[c] * wr[c];
-                out[(size_t)i * k + j] = acc;
-            }
+            out[(size_t)i * k + j] = s0; out[(size_t)(i + 1) * k + j] = s1;
+            out[(size_t)(i + 2) * k + j] = s2; out[(size_t)(i + 3) * k + j] = s3;
         }
-    };
+        for (; i < m; ++i) {
+            const float* x = in + (size_t)i * n;
+            float a[V] = {};
+            for (int c = 0; c < nv; c += V)
+                for (int l = 0; l < V; ++l) a[l] += x[c + l] * wr[c + l];
+            float acc = b;
+            for (int l = 0; l < V; ++l) acc += a[l];
+            for (int c = nv; c < n; ++c) acc += x[c] * wr[c];
+            out[(size_t)i * k + j] = acc;
+        }
+    }
+}
+
+// out[m,k] = in[m,n] @ W^T[k,n] + bias[k], the output columns split across threads.
+void linear(const float* in, const float* W, const float* bias, int m, int n, int k, float* out) {
+    auto cols = [&](int j0, int j1) { linear_cols(in, W, bias, m, n, k, out, j0, j1); };
     const int t = std::min(worker_threads(), std::max(1, int((size_t)m * n * k / (1u << 20))));   // small products stay on one thread
     parallel_ranges(k, t, cols);
 }

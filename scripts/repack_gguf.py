@@ -228,9 +228,16 @@ def main():
     # (freq_base 5e6), so it repacks q/k unreordered and the forward decodes
     # " the" instead of " Paris". Its output matches the published
     # MiniCPM5-1B-NPU2 model.q4nx byte for byte; the gated one does not.
+    #
+    # The canonical checkout is looked up next to the engine checkout AND in the
+    # home directory: an installed engine (~/.local/share/1bit-engine) or a
+    # checkout anywhere but ~ has no sibling np-model-generic, and fell through to
+    # the staging checkout below, an older converter without the reorder
+    # (MiniCPM5-1B then answered " the", #224).
     here = os.path.dirname(os.path.abspath(__file__))
     candidates = [
         os.path.join(here, os.pardir, os.pardir, "np-model-generic", "third_party", "FLM_Q4NX_Converter"),
+        os.path.join(os.path.expanduser("~"), "np-model-generic", "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER", "third_party", "FLM_Q4NX_Converter"),
         os.path.join(here, os.pardir, os.pardir, "1bit-MONSTER-iso-build", "third_party", "FLM_Q4NX_Converter"),

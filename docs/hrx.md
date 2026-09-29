@@ -170,6 +170,20 @@ were observed.
   a ZAYA token is small dispatches and the ~1.8 us gaps between them, not matmuls; the profiler
   (`HRX_PROFILE_MODE=dispatch`) shows which ones. Profile through `llama-server`: `llama-bench`
   under the profiler fails.
+- **ZAYA decode fusions (llama.cpp #36-#40).** ZAYA1-8B HRX0 decode 67 -> ~90 tok/s (Vulkan 93),
+  each step measured in interleaved A/B runs:
+  - #36 skips CONTs of fresh contiguous results in `src/models/zaya.cpp` (views keep theirs: on HRX
+    their consumers take slower strided paths), bitwise the same output: +2.4%.
+  - #39 runs the CCA convolution (Q/K concat, conv-state update, depthwise conv, grouped 2-tap conv
+    and biases, ~35 graph nodes) as one dispatch (`zaya.cca_conv.decode_f32`): 72 -> 81 tok/s.
+  - #40 runs the CCA query/key mixing and per-head norms (~30 nodes) as one dispatch
+    (`zaya.cca_qk_norm.decode_f32`): 81 -> 90 tok/s.
+  #39 and #40 accumulate in their own order, so output is not bitwise the same; teacher-forced top-1
+  against the FP32 model stays 69/96 and batch-1 perplexity moves 33.31 -> 33.49 -> 33.45 (CPU backend
+  34.30). Both match decode only (one token, one sequence). #37 and #38 remove runtime integer
+  division from #35's and #32's kernels, which newer Loom rejects. Each new `.loom` file carries a
+  reference kernel and `check.case` differentials that pass under `iree-test-loom --sanitizer=access`.
+  `GGML_HRX_DISABLE_DISPATCH=zaya.cca` turns the two ZAYA kernels off for comparison.
 
 ### Known issues on `HRX0`
 

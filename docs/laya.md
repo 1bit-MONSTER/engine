@@ -222,3 +222,26 @@ typed-decisions for all of them; Hindi is the weak spot either way.
 
 ggmlc declares the MIT licence (`pyproject.toml`, README) but its repository carries no LICENSE
 file yet; the GGUFs are Apache-2.0 like the checkpoints.
+
+## The encoder on the NPU (private add-on)
+
+`laya/encoder.h` lets an add-on run the C++ scorer's 28 encoder layers somewhere else: it
+registers an encoder by name, and `Scorer::set_encoder` hands it each sequence's embedded rows
+(the tokenizer, embeddings and classifier head stay on the CPU). The engine registers none. The
+private NPU add-on (docs/npu.md, "Private routes"; its kernels live in the closed-source
+`npu-kernels` repository) registers `npu`, and
+
+```sh
+cmake -B build -DONEBIT_NPU=ON -DONEBIT_NPU_PRIVATE=<npu-kernels checkout> ...
+ONEBIT_LAYA_DEVICE=npu 1bit serve -m MODEL.gguf --laya
+```
+
+runs the encoder on the NPU instead of the GGUF daemon. It shares the NPU with other users
+through the engine's device lock: while another process holds it (an NPU `1bit serve`), the
+encoder declines and that decision's layers run on the CPU. Without the add-on,
+`ONEBIT_LAYA_DEVICE=npu` exits saying how to build it (checked by `tests/laya_gguf_route.sh`).
+
+**Measured** (Strix Halo, `tests/laya_route_cases.json`): 194/200 = 97.0% class accuracy (the
+CPU scorer: 95.5%), about 105 ms a warm decision through `serve` (encoder ~50 ms, the CPU head
+~41 ms), about 500 ms when the NPU is busy and the CPU runs the layers. Slower than the GGUF
+scorer on HRX today; it keeps the GPU free for the model being served.

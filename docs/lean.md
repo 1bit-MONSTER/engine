@@ -263,7 +263,7 @@ tiled transpose for the concatenation that feeds the delta-net convolution. Both
 
 **One server: W4A4 prompts and DFlash2 decode.** Without a drafter this route decodes
 Qwen3.8-27B at about 13 tok/s. With the DFlash2 drafter ([serve.md](serve.md#dflash-draft-models---dflash))
-the same server decodes three times faster and keeps most of the prompt speed:
+the same server decodes three times faster and keeps 95% of the prompt speed:
 
 ```sh
 1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf --dflash Qwen3.8-27B-DFlash2-q8_0.gguf
@@ -276,20 +276,36 @@ DFlash, so a partly accepted block rewinds the delta-net state instead of restor
 and replaying. `serve` passes `--spec-draft-p-min 0` with `--dflash`: this tree's default of 0.75
 cut DFlash2 blocks from 6.7 to 5.4 tokens a step.
 
-Measured through `1bit serve` on Strix Halo, 2026-09-28, quiet box: the 1,838-token prompt (best
+Three things kept the drafter from costing the prompt (ROCmFPX#4 and `serve`):
+
+- **Rollback snapshots in the prefill kernel.** Rollback keeps the delta-net state after each of
+  the last K tokens, and the chunked prefill kernel did not write those, so with a drafter every
+  prompt ran the per-token kernel: 1,322 tokens took 2,966 ms instead of 2,588. The prefill
+  kernel now writes them (2,762 ms).
+- **K is the drafter's block.** `serve` reads `dflash.block_size` from the drafter and drafts
+  `block - 1` tokens, which is also K; asking for 16 against DFlash2's block of 8 wrote twice the
+  snapshots.
+- **512-token micro-batches for a dense file.** The 1024-token micro-batches `serve` gives
+  rotated MoE files are slower on the dense 27B: 471-473 tok/s against 491-495 without a drafter.
+
+The same ROCmFPX change also fixed the drafter's input on long prompts: the model's hidden states
+for a batch of several micro-batches were all written at the first one's place, so the DFlash
+(and EAGLE3) encoder read stale features for all but the last.
+
+Measured through `1bit serve` on Strix Halo, 2026-09-29, quiet box: the 1,838-token prompt (best
 / median of 5, as `serve` reports it, context checkpoints included) and 256 tokens of greedy
 decode on the code / prose / short prompts of [serve.md](serve.md) (best of 3):
 
 | Qwen3.8-27B-Q4_0-H32, lean ROCm route | Prompt t/s | Decode tok/s |
 |---|---|---|
-| no drafter | 502 / 500 | 13.0 / 13.0 / 13.4 |
-| `--dflash` (DFlash2 Q8_0) | 445 / 439 | **40.9** / **26.8** / 13.7 |
+| no drafter | 497 / 495 | 13.2 / 13.2 / 13.6 |
+| `--dflash` (DFlash2 Q8_0) | **477** / **472** | **41.1** / **26.7** / 15.0 |
 
-Mean accepted block: 6.71 tokens on code, 4.11 on prose, the same as upstream on this drafter.
-Greedy output matches the no-drafter run on the code and short prompts; on prose one near-tie
-word flips after 470 characters (batched verification rounds differently). The drafter costs the
-prompt about 0.5 s on this prompt: its encoder reads the model's hidden states for every prompt
-token (0.13 s), and the context checkpoints grow by the drafter's sliding-window cache.
+Mean accepted block: 6.54 tokens on code, 4.23 on prose, in line with upstream on this drafter
+(6.71 / 4.25). Greedy output matches the no-drafter run on the code and short prompts; on prose
+one near-tie phrase differs after 332 characters (batched verification rounds differently). What
+the drafter still costs the prompt, about 0.2 s here, is its encoder reading the model's hidden
+states for every prompt token (0.1 s) and the rollback snapshots.
 
 ## Build
 

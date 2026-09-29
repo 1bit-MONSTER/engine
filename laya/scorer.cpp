@@ -78,10 +78,12 @@ void parallel_ranges(int n, int t, F fn) {
 }
 
 // out[m,k] = in[m,n] @ W^T[k,n] + bias[k]. The output columns are split across threads; every
-// sum keeps its order, so the result is the same as one thread's, bit for bit.
+// sum has one fixed order (eight lanes over the input, then the lanes in turn, then the tail), so
+// the result is the same for any number of threads, bit for bit, and the lanes vectorize.
 void linear(const float* in, const float* W, const float* bias, int m, int n, int k, float* out) {
-    // Each weight row is read once per four input rows; the four sums are independent, so the
-    // loads are shared without reordering any sum.
+    constexpr int V = 8;
+    const int nv = n / V * V;
+    // Each weight row is read once per four input rows; the four rows' sums are independent.
     auto cols = [&](int j0, int j1) {
         for (int j = j0; j < j1; ++j) {
             const float* wr = W + (size_t)j * n;
@@ -89,18 +91,29 @@ void linear(const float* in, const float* W, const float* bias, int m, int n, in
             int i = 0;
             for (; i + 4 <= m; i += 4) {
                 const float *x0 = in + (size_t)i * n, *x1 = x0 + n, *x2 = x1 + n, *x3 = x2 + n;
-                float a0 = b, a1 = b, a2 = b, a3 = b;
-                for (int c = 0; c < n; ++c) {
+                float a0[V] = {}, a1[V] = {}, a2[V] = {}, a3[V] = {};
+                for (int c = 0; c < nv; c += V)
+                    for (int l = 0; l < V; ++l) {
+                        const float w = wr[c + l];
+                        a0[l] += x0[c + l] * w; a1[l] += x1[c + l] * w; a2[l] += x2[c + l] * w; a3[l] += x3[c + l] * w;
+                    }
+                float s0 = b, s1 = b, s2 = b, s3 = b;
+                for (int l = 0; l < V; ++l) { s0 += a0[l]; s1 += a1[l]; s2 += a2[l]; s3 += a3[l]; }
+                for (int c = nv; c < n; ++c) {
                     const float w = wr[c];
-                    a0 += x0[c] * w; a1 += x1[c] * w; a2 += x2[c] * w; a3 += x3[c] * w;
+                    s0 += x0[c] * w; s1 += x1[c] * w; s2 += x2[c] * w; s3 += x3[c] * w;
                 }
-                out[(size_t)i * k + j] = a0; out[(size_t)(i + 1) * k + j] = a1;
-                out[(size_t)(i + 2) * k + j] = a2; out[(size_t)(i + 3) * k + j] = a3;
+                out[(size_t)i * k + j] = s0; out[(size_t)(i + 1) * k + j] = s1;
+                out[(size_t)(i + 2) * k + j] = s2; out[(size_t)(i + 3) * k + j] = s3;
             }
             for (; i < m; ++i) {
                 const float* x = in + (size_t)i * n;
+                float a[V] = {};
+                for (int c = 0; c < nv; c += V)
+                    for (int l = 0; l < V; ++l) a[l] += x[c + l] * wr[c + l];
                 float acc = b;
-                for (int c = 0; c < n; ++c) acc += x[c] * wr[c];
+                for (int l = 0; l < V; ++l) acc += a[l];
+                for (int c = nv; c < n; ++c) acc += x[c] * wr[c];
                 out[(size_t)i * k + j] = acc;
             }
         }
@@ -116,10 +129,13 @@ void mha(const float* x, const float* inW, const float* inB, const float* outW, 
     linear(x, inW, inB, N * L, D, 3 * D, qkv.data());
     std::vector<float> attn_out((size_t)N * L * D);
     const float scale = 1.0f / sqrtf((float)HD);
-    std::vector<float> scores((size_t)L * L);
-    for (int b = 0; b < N; ++b) {
+    // (sequence, head) pairs across threads: each writes its own head's columns
+    auto pairs = [&](int p0, int p1) {
+      std::vector<float> scores((size_t)L * L);
+      for (int p = p0; p < p1; ++p) {
+        const int b = p / NHEAD, h = p % NHEAD;
         const float* qkv_b = qkv.data() + (size_t)b * L * 3 * D;
-        for (int h = 0; h < NHEAD; ++h) {
+        {
             for (int i = 0; i < L; ++i) {
                 const float* qrow = qkv_b + (size_t)i * 3 * D + (size_t)h * HD;
                 float* sr = scores.data() + (size_t)i * L;
@@ -149,7 +165,9 @@ void mha(const float* x, const float* inW, const float* inB, const float* outW, 
                 }
             }
         }
-    }
+      }
+    };
+    parallel_ranges(N * NHEAD, worker_threads(), pairs);
     linear(attn_out.data(), outW, outB, N * L, D, D, out);
 }
 

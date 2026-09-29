@@ -10,6 +10,14 @@
       "source": "engine #205, #229"
     },
     {
+      "id": "rocm-dflash-p-min-0.4",
+      "match": {"device": ["rocm"], "drafter": ["dflash"]},
+      "args": ["--spec-draft-p-min", "0.4"],
+      "why": "Stops a DFlash2 block at the first candidate the selector is less than 40% sure of: code keeps its full blocks, prose and short answers stop paying to verify guesses that fail. Listed before dflash-p-min-0, so it wins on rocm.",
+      "measured": "Qwen3.8-27B-H32 + DFlash2 Q8_0 on the lean ROCm route, tools/bench.py 2 rounds, decode median code / prose / short: p-min 0 41.9 / 24.8 / 13.4, 0.2 42.0 / 25.7 / 13.7, 0.4 41.9 / 26.8 / 16.7, 0.6 39.7 / 24.1 / 15.5 tok/s.",
+      "source": "engine #238"
+    },
+    {
       "id": "dflash-p-min-0",
       "match": {"drafter": ["dflash"]},
       "args": ["--spec-draft-p-min", "0"],

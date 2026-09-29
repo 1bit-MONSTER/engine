@@ -314,6 +314,11 @@ included). Decode is 256 greedy tokens on the code / prose / short prompts (best
 
 Before the prefill kernel of ROCmFPX#5, the same run measured 502 / 494 and 470 / 467.
 
+The `--dflash` row drafted with p-min 0. Serve now passes 0.4 on this route (recipe
+`rocm-dflash-p-min-0.4`, [recipes.md](recipes.md)). That stops a block at the first guess the
+selector is less than 40% sure of. Medians, code / prose / short: 41.9 / 26.8 / 16.7 tok/s, against
+41.9 / 24.8 / 13.4 at 0 in the same run.
+
 Mean accepted block: 6.54 tokens on code, 4.23 on prose, in line with upstream on this drafter
 (6.71 / 4.25). Greedy output matches the no-drafter run on the code and short prompts; on prose
 one near-tie phrase differs after 332 characters (batched verification rounds differently). What

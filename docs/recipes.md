@@ -66,7 +66,11 @@ It adds each variable in `env` unless it is already set. Serve prints what it ad
 | id | Matches | Adds | Measured |
 |---|---|---|---|
 | `rotated-moe-ub1024` | rocm, Hadamard-rotated, MoE | `-ub 1024` | Qwen3-Coder-30B-A3B-H32 pp2048 2,001 -> 2,158; dense 27B-H32 is slower with it (491-495 -> 471-473) |
-| `dflash-p-min-0` | `--dflash` | `--spec-draft-p-min 0` | Qwen3.8-27B-H32 + DFlash2: accepted block 5.4 -> 6.7 tokens on code |
+| `rocm-dflash-p-min-0.4` | rocm, `--dflash` | `--spec-draft-p-min 0.4` | Qwen3.8-27B-H32 + DFlash2, decode code / prose / short: 41.9 / 24.8 / 13.4 at p-min 0 -> 41.9 / 26.8 / 16.7 tok/s |
+| `dflash-p-min-0` | `--dflash` | `--spec-draft-p-min 0` | Qwen3.8-27B-H32 + DFlash2: accepted block 5.4 -> 6.7 tokens on code (the ROCm tree's default 0.75 cut it) |
+
+Recipes apply in file order. The first recipe to add a flag wins, so a narrower recipe goes before
+a broader one for the same flag.
 
 Settings that follow from the files themselves stay in serve's code. Examples: the Hadamard
 activation rotation a stamped file needs, and the DFlash draft length, which is the drafter's

@@ -97,6 +97,22 @@ runs on the dx route. There it decoded 24/24 greedy tokens the same as a CPU ref
 the repacked weights, with every step's logits at cosine 0.99995 or better (21.0 ms per
 step). `1bit serve --device npu -m <dir>` loads it in 1.1 s and answers at 54-60 tok/s.
 
+**The GGUF route reuses the fused lane, not only the per-op forward.**
+`1bit serve -m <gguf> --device npu` repacks the GGUF with `scripts/repack_gguf.py`,
+whose layout the `full_i8_*.elf` designs read, and runs the model-generic forward
+(~100+ synchronous dispatches per token). With `ONEBIT_NPU_LANE_DIR=<lane kernel
+dir>` it instead packs the GGUF with `tools/gguf_to_q4nx.py pack` — the q4_1 tile
+layout the lane reads, cached at `~/.cache/1bit/q4nx/<stem>-lane` — and serves it on
+the fast lane (one launch per layer, `npu/lane.cpp`). The two layouts are not
+interchangeable, so the lane pack never aliases the forward pack. Any arch the
+lane-layout packer does not model (it is qwen3-only), a missing tokenizer, or a
+missing kernel set falls through to the unchanged per-op forward, so the route
+cannot regress a model the lane does not cover. Captured on Qwen3-0.6B
+(`evidence/gguf-npu-six/fused-lane-gguf-2026-09-28.md`): GGUF → fused lane answers
+" Paris" at 97–103 tok/s; the same GGUF → per-op forward is the 0.006–0.17 tok/s
+class. Qwen2.5-7B GGUF takes the fallback (the lane/dx designs are Qwen3-shaped:
+8 KV heads, per-head q/k RMSNorm, no projection bias).
+
 **Declared-scale validation (required).** `scripts/repack_gguf.py`, the repack used
 for the model-generic (`full_i8_*.elf`) route, **fails with `rc=1`** if the GGUF
 declares a known-critical scale-like scalar that the repacked `config.json` drops:

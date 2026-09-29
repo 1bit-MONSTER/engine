@@ -356,6 +356,10 @@ set(ONEBIT_NPU_PDI "" CACHE FILEPATH "The layer kernel's design PDI")
 set(ONEBIT_NPU_GOLDEN "" CACHE PATH "Directory of full ELFs the fast lane ran")
 set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full ELF / xclbin directory the GGUF-on-NPU forward loads (docs/npu.md)")
 target_compile_definitions(onebit PRIVATE ONEBIT_NPU_REPACK_SCRIPT="${CMAKE_SOURCE_DIR}/scripts/repack_gguf.py")
+# The GGUF -> fused-lane Q4NX layout packer (docs/npu.md, "From a GGUF").  A
+# different layout from repack_gguf.py; used only when ONEBIT_NPU_LANE_DIR routes
+# a GGUF to the fast lane, and never on the per-op forward's path.
+target_compile_definitions(onebit PRIVATE ONEBIT_NPU_LANE_PACK_SCRIPT="${CMAKE_SOURCE_DIR}/tools/gguf_to_q4nx.py")
 if(ONEBIT_NPU_KERNELS_DIR)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU_KERNELS_DIR="${ONEBIT_NPU_KERNELS_DIR}")
 endif()

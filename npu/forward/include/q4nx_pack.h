@@ -49,7 +49,7 @@
 extern "C" {
 #endif
 
-#define Q4NX_MAX_DESIGNS 12
+#define Q4NX_MAX_DESIGNS 14
 #define Q4NX_ELF_NAME_MAX 64
 
 typedef enum {
@@ -78,6 +78,12 @@ typedef enum {
     Q4NX_DESIGN_DG,      /* dense leading layer gate: K=H,       N=dense_im        */
     Q4NX_DESIGN_DU,      /* dense leading layer up:   K=H,       N=dense_im        */
     Q4NX_DESIGN_DD,      /* dense leading layer down: K=dense_im, N=H             */
+    /* MoE: one gate (and up) GEMM over ALL top-k selected experts at once.  They
+     * share the input xn, so their weights concatenate along N (expert j occupies
+     * columns [j*IM, (j+1)*IM)); the caller passes the real N = top_k*IM, which is
+     * <= the design's N, and reads back the first top_k*IM outputs. */
+    Q4NX_DESIGN_GB,      /* batched expert gate: K=H, N>=top_k*IM                 */
+    Q4NX_DESIGN_UB,      /* batched expert up:   K=H, N>=top_k*IM                 */
     Q4NX_DESIGN_COUNT
 } Q4nxDesign;
 

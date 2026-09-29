@@ -1846,6 +1846,44 @@ int run_serve(int argc, char** argv) {
                 }
             }
         }
+        // Fused dx route (addons/npu-dx, one NPU launch per layer): pack the GGUF in
+        // the dx (q4_1 tile) layout and serve it through the private dx route instead
+        // of the per-op forward (~100+ launches per token).  The dx kernels are
+        // shape-parameterised (layer1.elf per layer) and serve dense qwen2/qwen3 the
+        // fast lane cannot.  Opt-in via ONEBIT_NPU_DX_KERNELS (or -DONEBIT_NPU_DX_KERNELS).
+        // Anything the dx route cannot serve -- no kernel set, a mismatched q/k flavour,
+        // a missing tokenizer -- returns "" and falls through to the per-op forward.
+        {
+            std::string dxk;
+            if (const char* env = std::getenv("ONEBIT_NPU_DX_KERNELS")) dxk = env;
+#ifdef ONEBIT_NPU_DX_KERNELS_DEFAULT
+            if (dxk.empty()) dxk = ONEBIT_NPU_DX_KERNELS_DEFAULT;
+#endif
+            if (!dxk.empty()) {
+                // The dx layout packer copies an external tokenizer.json (it does not
+                // convert the GGUF's own vocabulary); the per-op forward's repack
+                // produces one, so reuse that (cached) directory when none is set.
+                if (!std::getenv("ONEBIT_NPU_LANE_TOKENIZER")) {
+                    try {
+                        const std::string fwd = repack_gguf(o.model);
+                        if (fs::exists(fs::path(fwd) / "tokenizer.json"))
+                            setenv("ONEBIT_NPU_LANE_TOKENIZER", fwd.c_str(), 0);
+                    } catch (const std::exception& e) {
+                        std::fprintf(stderr, "1bit serve: dx tokenizer reuse skipped (%s)\n", e.what());
+                    }
+                }
+                const std::string ldir = repack_gguf_lane(o.model, dxk);
+                if (!ldir.empty()) {
+                    std::fprintf(stderr, "1bit serve: routing %s to the fused dx route (one launch per layer) from %s\n",
+                                 o.model.c_str(), dxk.c_str());
+                    std::vector<std::string> args = {"-m", ldir, "-p", std::to_string(o.port), "--host", o.host};
+                    if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                    std::vector<char*> av;
+                    for (auto& s : args) av.push_back(s.data());
+                    return run_unified(int(av.size()), av.data());
+                }
+            }
+        }
         // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
         // directory, then serve it through the model-generic forward in process.
         const std::string dir = repack_gguf(o.model);

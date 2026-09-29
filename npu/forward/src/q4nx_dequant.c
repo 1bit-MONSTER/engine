@@ -100,9 +100,12 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
         return -1;
     const int ntr = rows / Q4NX_TILE_ROWS, ntc = cols / Q4NX_TILE_COLS;
     if (nbytes < (size_t)ntr * (size_t)ntc * (size_t)chunk_bytes) return -1;
-    float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
+    // Each tile writes a disjoint output region, so the tile grid parallelizes.
+    // `tmp` is declared per-tile (inside the innermost body) so it is not shared.
+    #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
     for (int tr = 0; tr < ntr; tr++) {
         for (int tc = 0; tc < ntc; tc++) {
+            float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
             const uint8_t* c = data + (size_t)(tr * ntc + tc) * (size_t)chunk_bytes;
             if (chunk_bytes == Q4NX_CHUNK_Q4K)
                 q4nx_dequant_tile_q4k(c, tmp, Q4NX_TILE_COLS);
@@ -129,10 +132,11 @@ int q4nx_dequant_tensor(const uint8_t* data, size_t nbytes, int rows, int cols,
 
     const int ntr = rows / Q4NX_TILE_ROWS;
     const int ntc = cols / Q4NX_TILE_COLS;
-    float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
 
+    #pragma omp parallel for collapse(2) schedule(static) if(ntr * ntc >= 4)
     for (int tr = 0; tr < ntr; tr++) {
         for (int tc = 0; tc < ntc; tc++) {
+            float tmp[Q4NX_TILE_ROWS * Q4NX_TILE_COLS];
             const uint8_t* tile =
                 data + (size_t)(tr * ntc + tc) * (size_t)Q4NX_TILE_BYTES;
             q4nx_dequant_tile(tile, tmp, Q4NX_TILE_COLS);

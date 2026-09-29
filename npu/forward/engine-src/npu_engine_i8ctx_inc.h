@@ -355,6 +355,52 @@ struct I8Ctx {
         return bo;
     }
 
+    // Cache-friendly per-column int8 quantization into a [KD][ND] padded buffer.
+    // The original column-at-a-time loop reads w[i*N + j] with a stride of N
+    // floats -- 2 KB at N=512 -- so nearly every element is its own cache line;
+    // the pack measured ~11 ms per routed-expert call (K*N = 1M). Walk row-major
+    // in blocks of CB adjacent columns instead (each block's CB floats are
+    // contiguous, so a row costs ~CB/16 lines, not CB) and parallelize over the
+    // disjoint column blocks. Same amax, per-column scale, rounding and clamps:
+    // the packed bytes and scales are bit-identical; only the order of the
+    // diagnostic `ssum` accumulation differs.
+    void packB_blocked(int8_t* Bm, const float* w, int K, int N,
+                       std::vector<float>& col, double& ssum) {
+        const int CB = 64;
+        #pragma omp parallel for reduction(+:ssum) schedule(static)
+        for (int jb = 0; jb < N; jb += CB) {
+            const int jn = (N - jb < CB) ? (N - jb) : CB;
+            float amax[CB], tis[CB];
+            for (int b = 0; b < jn; b++) amax[b] = 0.0f;
+            for (int i = 0; i < K; i++) {
+                const float* row = w + (size_t)i * N + jb;
+                for (int b = 0; b < jn; b++) {
+                    float a = fabsf(row[b]);
+                    if (std::isfinite(a) && a > amax[b]) amax[b] = a;
+                }
+            }
+            for (int b = 0; b < jn; b++) {
+                float am = amax[b];
+                if (am < 1e-12f) am = 1.0f;
+                col[jb + b] = am / 127.0f;
+                tis[b] = 127.0f / am;
+                ssum += (double)(am / 127.0f);
+            }
+            for (int i = 0; i < K; i++) {
+                const float* row = w + (size_t)i * N + jb;
+                int8_t* brow = Bm + (size_t)i * ND + jb;
+                for (int b = 0; b < jn; b++) {
+                    float v = row[b];
+                    if (!std::isfinite(v)) v = 0.0f;
+                    int x = (int)roundf(v * tis[b]);
+                    if (x > 127) x = 127;
+                    else if (x < -127) x = -127;
+                    brow[b] = (int8_t)x;
+                }
+            }
+        }
+    }
+
     // Pack weights into an arbitrary (already-allocated) weight BO.
     void packB_into(xrt::bo& bo, const float* w, int K, int N,
                     float& sout, std::vector<float>& col_out) {
@@ -362,29 +408,7 @@ struct I8Ctx {
         memset(Bm, 0, (size_t)KD * ND);
         std::vector<float> col(N);
         double ssum = 0;
-        // Per-column quantization is fully independent (disjoint Bm/col[j]);
-        // parallelize the column loop (resident-expert pack was ~63s serial).
-        #pragma omp parallel for reduction(+:ssum) schedule(static)
-        for (int j = 0; j < N; j++) {
-            float amax = 0;
-            for (int i = 0; i < K; i++) {
-                float a = fabsf(w[(size_t)i * N + j]);
-                if (std::isfinite(a) && a > amax) amax = a;
-            }
-            if (amax < 1e-12f) amax = 1.0f;
-            float ts = amax / 127.0f;
-            float tis = 127.0f / amax;
-            for (int i = 0; i < K; i++) {
-                float v = w[(size_t)i * N + j];
-                if (!std::isfinite(v)) v = 0;
-                int x = (int)roundf(v * tis);
-                if (x > 127) x = 127;
-                else if (x < -127) x = -127;
-                Bm[(size_t)i * ND + j] = (int8_t)x;
-            }
-            col[j] = ts;
-            ssum += ts;
-        }
+        packB_blocked(Bm, w, K, N, col, ssum);
         bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         col_out = std::move(col);
         sout = (float)(ssum / N);
@@ -394,6 +418,21 @@ struct I8Ctx {
     inline xrt::run launch_async_with_bo(xrt::bo& wbo, const float* A,
                                          int am, int ak, float ascale) {
         quantize_async(A, am, ak, ascale);
+        bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        if (elf_mode) return (*kext)(*bA, wbo, *bC);
+        return (*k)((unsigned)3, *layerInstr[0],
+                    (unsigned)(layerInstrData[0].size()),
+                    *bA, wbo, *bC);
+    }
+
+    // Batched variant of launch_async_with_bo: one activation quantization with
+    // PER-ROW scales, so each row of a prompt keeps its own dynamic range (a
+    // single shared scale zeroes low-magnitude rows when one token's activations
+    // dwarf the rest -- issue #1699). Dequantize with the same per-row scales.
+    inline xrt::run launch_async_with_bo_rows(xrt::bo& wbo, const float* A,
+                                              int am, int ak,
+                                              const float* ascales) {
+        quantize_async_rows(A, am, ak, ascales);
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         if (elf_mode) return (*kext)(*bA, wbo, *bC);
         return (*k)((unsigned)3, *layerInstr[0],
@@ -425,26 +464,7 @@ struct I8Ctx {
         memset(Bm, 0, (size_t)KD * ND);
         std::vector<float> col(N);
         double ssum = 0;
-        for (int j = 0; j < N; j++) {
-            float amax = 0;
-            for (int i = 0; i < K; i++) {
-                float a = fabsf(w[(size_t)i * N + j]);
-                if (std::isfinite(a) && a > amax) amax = a;
-            }
-            if (amax < 1e-12f) amax = 1.0f;
-            float ts = amax / 127.0f;
-            float tis = 127.0f / amax;
-            for (int i = 0; i < K; i++) {
-                float v = w[(size_t)i * N + j];
-                if (!std::isfinite(v)) v = 0;
-                int x = (int)roundf(v * tis);
-                if (x > 127) x = 127;
-                else if (x < -127) x = -127;
-                Bm[(size_t)i * ND + j] = (int8_t)x;
-            }
-            col[j] = ts;
-            ssum += ts;
-        }
+        packB_blocked(Bm, w, K, N, col, ssum);
         layerB[l]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         group_scales[l] = std::move(col);
         sout = (float)(ssum / N);

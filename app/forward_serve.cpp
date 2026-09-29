@@ -152,9 +152,20 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         };
 
         std::vector<float> logits;
-        for (int i = 0; i < (int)ids.size(); i++) {
-            if (!e.fwd->step(ids[i], i, logits))
-                throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+        // Prefill in batched (M>1) passes of at most the kernel's row width: each
+        // projection's weight stream is then read once per chunk instead of once
+        // per token, which is where prefill time goes (the per-op kernels are
+        // M=128 wide, so a per-token pass leaves ~99% of the array idle).
+        // step_batch falls back to per-token step() for the architectures it does
+        // not model, so this is behavior-preserving.
+        {
+            const int chunk_max = std::max(1, e.fwd->max_batch_rows());
+            for (int off = 0; off < (int)ids.size(); off += chunk_max) {
+                const int take = std::min(chunk_max, (int)ids.size() - off);
+                std::vector<int> chunk(ids.begin() + off, ids.begin() + off + take);
+                if (!e.fwd->step_batch(chunk, off, logits))
+                    throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+            }
         }
 
         std::string pending;

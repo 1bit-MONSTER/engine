@@ -418,6 +418,13 @@ if(ONEBIT_NPU)
         npu/forward/src/q4nx_pack.c
         npu/forward/src/q4nx_semantics.c
         npu/forward/src/q4nx_forward.cpp)
+    # The Q4NX pack and dequant loops carry `#pragma omp parallel for`; without the
+    # OpenMP flags those compile to serial code. Wire it in (both C and C++ sources)
+    # so they actually use the cores.
+    find_package(OpenMP)
+    if(OpenMP_C_FOUND AND OpenMP_CXX_FOUND)
+        target_link_libraries(onebit_npu_forward PUBLIC OpenMP::OpenMP_C OpenMP::OpenMP_CXX)
+    endif()
     # NPU_INFER_DUMP_ATTN / _LN / _HEAD write debug dumps to a path taken from the environment;
     # only debug builds carry them
     option(ONEBIT_NPU_DEBUG_DUMPS "NPU forward: env-named debug dumps (developer builds)" OFF)
@@ -457,6 +464,11 @@ if(ONEBIT_NPU_PRIVATE)
     endif()
     target_link_libraries(onebit PRIVATE onebit_npu_private)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU_PRIVATE)
+    # Make the dx kernels' build default visible to app/serve.cpp's GGUF -> fused dx
+    # routing branch too (the add-on compiles it only onto onebit_npu_dx, PRIVATE).
+    if(ONEBIT_NPU_DX_KERNELS)
+        target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
+    endif()
 endif()
 
 

@@ -1104,14 +1104,14 @@ int serve_child(const Options& given) {
         if (!laya_daemon)
 #endif
         {
+            const onebit::laya::EncoderFactory* f = laya_npu ? onebit::laya::find_encoder("npu") : nullptr;
+            if (laya_npu && !f)
+                throw std::runtime_error("laya: ONEBIT_LAYA_DEVICE=npu needs a build with the NPU add-on "
+                                         "(-DONEBIT_NPU_PRIVATE=<npu-kernels checkout>, docs/laya.md)");
             const std::string ckpt = laya_checkpoint(o.laya_model);
             scorer = std::make_unique<onebit::laya::Scorer>();
             if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
-            if (laya_npu) {
-                const onebit::laya::EncoderFactory* f = onebit::laya::find_encoder("npu");
-                if (!f)
-                    throw std::runtime_error("laya: ONEBIT_LAYA_DEVICE=npu needs a build with the NPU add-on "
-                                             "(-DONEBIT_NPU_PRIVATE=<npu-kernels checkout>, docs/laya.md)");
+            if (f) {
                 std::string err;
                 onebit::laya::EncoderFn fn = (*f)(ckpt, &err);
                 if (!fn) throw std::runtime_error("laya: the NPU encoder: " + err);

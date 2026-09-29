@@ -26,6 +26,13 @@ FastFlowLM (https://github.com/ROCm/FastFlowLM)
   FastFlowLM's runtime or ship its kernel binaries.
   Powered by FastFlowLM, as FastFlowLM asks.
 
+PrismML Ternary Bonsai (https://huggingface.co/prism-ml, https://github.com/PrismML-Eng/llama.cpp)
+  Models: Apache-2.0 (prism-ml/Ternary-Bonsai-*), downloaded by the user, not redistributed.
+  Code: PrismML-Eng/llama.cpp, MIT, Copyright (c) 2023-2026 The ggml authors. The engine's
+  llama.cpp fork (1bit-MONSTER/llama.cpp, src/llama-hadamard.{h,cpp}) follows it to load the
+  prism.hadamard.* format of these models; those files carry the MIT notice in full.
+  Thanks to PrismML for training ternary models and publishing the format and code.
+
 -------------------------------------------------------------------------------
 Pinned at exact commits (git submodules) and built from source
 -------------------------------------------------------------------------------

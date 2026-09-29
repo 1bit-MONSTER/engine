@@ -34,6 +34,8 @@ printf 'forge_experiments/\n__pycache__/\n' > .gitignore
 git init -q && git add -A && git -c user.name=forge -c user.email=forge@localhost commit -qm "task: gdn prefill (gfx1151)"
 
 export GPU_TARGET=gfx1151
+# a subscription login: keep sessions off --bare (a local switch in our Hyperloom checkout, README.md)
+export FORGE_CLAUDE_OAUTH=${FORGE_CLAUDE_OAUTH:-1}
 exec kernelforge forge-loop \
     --kernel "$W/gdn_prefill_kernel.py" \
     --driver "$W/driver.py" \

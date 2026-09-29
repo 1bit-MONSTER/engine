@@ -50,7 +50,9 @@ def _inputs(T, H, Hk, device):
     q = torch.nn.functional.normalize(r(T, Hk, S_V), dim=-1)
     k = torch.nn.functional.normalize(r(T, Hk, S_V), dim=-1)
     v = r(T, H, S_V)
-    g = -torch.rand(T, H, generator=gen) * 0.5          # log decay, as the model's gate produces
+    # log decay over ggml's own test range (test-backend-ops GATED_DELTA_NET): hard gates make any
+    # product of gates underflow, which a gentler range let a campaign miss (tools/kernelforge/README.md)
+    g = -1e-4 - torch.rand(T, H, generator=gen) * (20.0 - 1e-4)
     beta = torch.sigmoid(r(T, H))
     state = r(H, S_V, S_V) * 0.1
     return [t.to(device=device, dtype=torch.float32).contiguous() for t in (q, k, v, g, beta, state)]

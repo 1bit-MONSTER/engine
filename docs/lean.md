@@ -259,7 +259,17 @@ The rotation removes a third of the 4-bit error. Against the exact path the rota
 with delta-net layers (Qwen3.8, Qwen3.6) uses on ROCm: a delta-net prefill kernel that keeps
 each state column's rows in registers and stages the per-token inputs in shared memory, and a
 tiled transpose for the concatenation that feeds the delta-net convolution. Both pass
-`test-backend-ops` against the CPU (GATED_DELTA_NET 42/42, CONCAT 129/129).
+`test-backend-ops` against the CPU (GATED_DELTA_NET 54/54, CONCAT 129/129).
+
+A KernelForge campaign later made the delta-net prefill kernel 5-7x faster, at 3.02 -> 0.41 ms per
+512-token layer (ROCmFPX#5, [tools/kernelforge](../tools/kernelforge/README.md)). It uses:
+
+- DPP reductions instead of shuffles;
+- two state columns per lane, which halves the shared-memory reads;
+- rows interleaved across banks;
+- 16-byte staging.
+
+The rotated 27B's prompt gains about 11% with or without a drafter (the table below).
 
 **One server: W4A4 prompts and DFlash2 decode.** Without a drafter this route decodes
 Qwen3.8-27B at about 13 tok/s. With the DFlash2 drafter ([serve.md](serve.md#dflash-draft-models---dflash))
@@ -292,14 +302,17 @@ The same ROCmFPX change also fixed the drafter's input on long prompts: the mode
 for a batch of several micro-batches were all written at the first one's place, so the DFlash
 (and EAGLE3) encoder read stale features for all but the last.
 
-Measured through `1bit serve` on Strix Halo, 2026-09-29, quiet box: the 1,838-token prompt (best
-/ median of 5, as `serve` reports it, context checkpoints included) and 256 tokens of greedy
-decode on the code / prose / short prompts of [serve.md](serve.md) (best of 3):
+Measured with [`tools/bench.py`](bench.md) through `1bit serve` on Strix Halo, 2026-09-29, 2
+interleaved rounds under the box lock. The prompt is its default (the first 8,000 characters of
+`docs/*.md`, about 1,800 tokens; best / median of 10, as `serve` reports it, context checkpoints
+included). Decode is 256 greedy tokens on the code / prose / short prompts (best / median of 6):
 
 | Qwen3.8-27B-Q4_0-H32, lean ROCm route | Prompt t/s | Decode tok/s |
 |---|---|---|
-| no drafter | 497 / 495 | 13.2 / 13.2 / 13.6 |
-| `--dflash` (DFlash2 Q8_0) | **477** / **472** | **41.1** / **26.7** / 15.0 |
+| no drafter | 558 / 550 | 13.2 / 13.2 / 13.6 |
+| `--dflash` (DFlash2 Q8_0) | **521** / **516** | **42.1** / **24.9** / 13.6 |
+
+Before the prefill kernel of ROCmFPX#5, the same run measured 502 / 494 and 470 / 467.
 
 Mean accepted block: 6.54 tokens on code, 4.23 on prose, in line with upstream on this drafter
 (6.71 / 4.25). Greedy output matches the no-drafter run on the code and short prompts; on prose

@@ -184,7 +184,7 @@ drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A draft
 kept only when the model agrees, so the output is the model's own.
 
 `--dflash` also works on the lean ROCm route: a Hadamard-rotated Q4_0 file gets W4A4 prompt
-processing and DFlash2 decode from one server, 477 t/s prompt and 41.1 / 26.7 tok/s decode
+processing and DFlash2 decode from one server, 516 t/s prompt and 42.1 / 24.9 tok/s decode
 ([lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). `--dflash` sets
 `--spec-draft-p-min 0` unless `--mtp-p-min` is given, and without `--mtp-max` drafts the
 drafter's block minus one (its `dflash.block_size`; 16 when the file does not say).

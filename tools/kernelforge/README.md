@@ -59,6 +59,33 @@ A kept kernel is only a candidate. It goes back into ROCmFPX's `gated_delta_net.
 has to pass `test-backend-ops -o GATED_DELTA_NET`. Then it is measured through `1bit serve`
 with [`tools/bench.py`](../../docs/bench.md).
 
+## Results
+
+**gdn-prefill, 2026-09-29.** A 2-hour campaign, about $33 of Claude usage, kept 2 changes: 7.47x on
+the task's own benchmark (2.95 -> 0.40 ms). One part of them was wrong. A gate-factored state
+turned NaN with hard gates: about 1.1 million non-finite values with log-gates in [-20, 0). The
+task driver's gentler gate range had let it pass. The rest went into ROCmFPX#5:
+
+- DPP reductions on RDNA;
+- two state columns per lane;
+- rows interleaved across banks;
+- 16-byte staging.
+
+| Result | Before | After |
+|---|---|---|
+| One layer, 512 tokens | 3.02 ms | 0.41 ms (7.4x) |
+| Same, with 8 snapshots | 2.46 ms | 0.49 ms (5.0x) |
+| Qwen3.8-27B-H32 serve prompt | 484-495 tok/s | 542-555 tok/s |
+| Same, with DFlash2 | 456-465 tok/s | 510-522 tok/s |
+
+The driver now draws gates from ggml's own test range. Two setup traps:
+
+- **Login.** KernelForge runs its planning and implementer sessions as `claude --bare`, which
+  ignores a logged-in subscription and accepts only an API key. Our Hyperloom checkout on strixhalo
+  carries a local switch, `FORGE_CLAUDE_OAUTH=1`, that drops `--bare`.
+- **Stale process check.** `pgrep -f "kernelforge forge-loop"` also matches the ssh command that
+  runs it.
+
 ## Check a task without KernelForge
 
 ```sh

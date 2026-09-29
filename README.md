@@ -62,7 +62,7 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp)); the rest of Zyphra's
 > family (Zamba, Zamba2, BlackMamba) runs on Vulkan too, and so do its vision models, ZAYA1-VL-8B
 > and Zamba2-VL, through `1bit serve --mmproj`. Qwen3.8-27B runs in one ROCm server with Hadamard
-> W4A4 prompt processing and DFlash2 decode: 477 tok/s on a 1,838-token prompt and 41.1 tok/s
+> W4A4 prompt processing and DFlash2 decode: 516 tok/s on a 1,800-token prompt and 42 tok/s
 > decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). W4A4 covers MoE
 > experts too, and `1bit serve --long-model` sends long prompts there and short ones to Vulkan: on
 > Qwen3-Coder-30B-A3B a 16K-token prompt gets its answer at 13.1 effective tok/s against 8.6 on

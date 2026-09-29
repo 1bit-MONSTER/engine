@@ -145,6 +145,24 @@ decode-path logits (`llama-perplexity -c 2049 -b 1 --save-all-logits`) are byte-
 to the previous pin, the buried code word is exact at 4700 tokens, and no GPU faults
 were observed.
 
+### MoE decode and the kernel cache (llama.cpp #32, #33)
+
+- **MoE decode.** With one to four tokens, a `MUL_MAT_ID` (a MoE expert matmul) runs as a GEMV over
+  the routed experts' rows (`common.mul_mat_id.decode_f32_wave64`), not the batched WMMA kernel,
+  which read a single token's expert at ~45 GB/s. HRX0 decode: ZAYA1-8B 46.3 -> 62.0 tok/s,
+  GLM-4.7-Flash 22.1 -> 25.3; ZAYA's teacher-forced check is unchanged (69/96) and batch-1
+  perplexity stays within 0.1-0.35% of the CPU backend. `GGML_HRX_DISABLE_DISPATCH=mul_mat_id.decode`
+  turns it off for comparison. Found with HRX's dispatch profiler: `HRX_PROFILE_MODE=dispatch
+  HRX_PROFILE_FILE=x.prof`, read with `iree-profile executable x.prof` (built from hrx-system with
+  Bazel).
+- **Kernel cache.** HRX compiles each kernel specialization on first use, and the specialization
+  includes the batch's token count, so each new prompt-length remainder compiles a new set. The
+  compiled kernels are kept in `~/.cache/1bit/hrx-jit` (`GGML_HRX_JIT_CACHE_DIR`), keyed on every
+  compile input and the compiler library, so later processes skip the compiles: ZAYA1-8B's first
+  5.4K-token prompt in a new process 4.46 -> 3.43 s, first short prompt 0.47 -> 0.22 s, with
+  identical output. `GGML_HRX_JIT_CACHE=0` turns it off; it is off while a Loom sanitizer is set.
+  Deleting the directory is always safe.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an

@@ -40,7 +40,7 @@ Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonad
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 
 > **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU, as
-> geramyL, a moderator on AMD's Discord, proposed. Vulkan stays the default until HRX meets the
+> geramyL, a moderator on Lemonade's Discord, proposed. Vulkan stays the default until HRX meets the
 > gates in [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213).
 >
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),

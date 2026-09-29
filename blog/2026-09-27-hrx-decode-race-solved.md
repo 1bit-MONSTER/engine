@@ -36,9 +36,9 @@ invalidate the cache the readers use. So a reading wave could pick up the output
 *previous* contents. The f32 output was right, the quantized copy was wrong, and when the stale
 bytes happened to decode as NaN the MoE router saw NaN logits.
 
-The window only opens when the GPU preempts the dispatch in the middle. Any process's KFD queue
-eviction does that: page compaction, KSM, memory pressure. That is why the failure rate followed
-those system settings. For a while it looked like a page-migration bug, but migration was only
+The window is narrow on a quiet box (a few percent of requests diverged there) and wide when the
+GPU preempts the dispatch in the middle. Any process's KFD queue eviction does that: page
+compaction, KSM, memory pressure. That is why the failure rate followed those system settings. For a while it looked like a page-migration bug, but migration was only
 the trigger. The fix fences both memory spaces at all five places the kernel does this:
 `barrier<global>`, then `barrier<workgroup>`
 ([docs/hrx.md](../docs/hrx.md#moe-router-expert-id-fault-fix-engine123)).
@@ -65,8 +65,9 @@ Decode tok/s (Q4_K_M, llama-bench, interleaved on a shared box):
 | ZAYA1-8B | 38-42 | 34-36 |
 
 The kernel's multi-pass output step was also vectorised
-([#180](https://github.com/1bit-MONSTER/engine/pull/180)): +30-37% at depth 2100, with
-bit-identical perplexity. `ONEBIT_HRX_DECODE_SPLIT=0` turns the kernel off if you need to compare.
+([#180](https://github.com/1bit-MONSTER/engine/pull/180)): on Qwen3-Coder-30B-A3B, +15% at
+depth 2100, +20% at 3000 and +22% at 4800 (median of 6 interleaved rounds), with bit-identical
+perplexity. `ONEBIT_HRX_DECODE_SPLIT=0` turns the kernel off if you need to compare.
 
 ## Also this week
 

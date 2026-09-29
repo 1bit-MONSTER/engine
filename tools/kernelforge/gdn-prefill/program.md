@@ -51,6 +51,11 @@ Profile with `rocprofv3`; the MFMA counters do not exist here.
   a block, 32-token chunks in LDS. The others kept more state per lane and spilled registers, or
   reduced across more lanes.
 - The K=8 case adds the snapshot writes (8 × 48 × 64 KB per call) on top of the K=1 case.
+- Gates are hard: log-gates reach -20 (the driver draws them from [-20, -1e-4], as ggml's test
+  does). A product of gates over a few tokens underflows float32, so do not factor the gates out
+  of the state (S = prod(g) * S_hat): an earlier campaign's kept candidate did and returned NaN.
+- The current kernel already has the first campaign's layout (DPP reductions, 2 columns per lane,
+  interleaved rows, 16-byte staging); its K=1 case runs in about 0.41 ms.
 
 ## Ideas worth trying
 

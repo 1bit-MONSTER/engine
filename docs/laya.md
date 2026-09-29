@@ -158,3 +158,67 @@ rows. Every sum keeps its order, so the gate output is byte-identical to the
 single-threaded scorer. Those figures are for the old device question on a short request.
 The request-class decision takes 0.4-0.6 s (the table above), and `serve` pays it once per
 conversation.
+
+## The GGUF scorer: ggmlc on HRX
+
+[ggmlc](https://github.com/monatis/ggmlc) compiles Laya's checkpoints to GGUFs that its own
+`laya` runtime runs on GGML (they are not llama.cpp GGUFs): English
+([mys/laya-GGUF](https://huggingface.co/mys/laya-GGUF), ModernBERT-large, 421M parameters,
+512-token context), multilingual ([mys/laya-multilingual-GGUF](https://huggingface.co/mys/laya-multilingual-GGUF),
+100+ languages) and typed-decisions
+([mys/laya-typed-decisions-GGUF](https://huggingface.co/mys/laya-typed-decisions-GGUF), for
+`choice` / `score` / `noul`). The engine pins our fork of ggmlc as `third_party/ggmlc`
+(`1bit/main`: upstream plus an HRX build) and the typed-decisions Q8_0 in `config/laya.json`;
+`scripts/fetch-laya.sh` fetches it into `<laya dir>/gguf/` and checks its sha256.
+
+The scorer runs on HRX0, AMD's backend: ggmlc's `laya` is built against `third_party/llama.cpp`'s
+ggml, whose ggml-hrx carries the LOOM kernels a ModernBERT encoder needs and llama models did not
+(LayerNorm, strided and broadcast arithmetic, clamp, F32 to F16 copies, attention over
+one-block-per-head layouts, small and odd-K matmuls; 1bit-MONSTER/llama.cpp#31).
+
+```sh
+cmake -B build -DONEBIT_LAYA_GGML=ON ...   # builds ggmlc's laya on HRX with TheRock's amdclang
+scripts/fetch-laya.sh
+1bit serve -m MODEL.gguf --laya            # uses the GGUF scorer when both are there
+```
+
+With the binary and the GGUF present, `serve --laya` starts `laya daemon <gguf> --family
+typed-decisions --device hrx` (with the HSA runtime HRX needs, as for `--device hrx`) and asks it
+serve's question over its stdin and stdout (not its `serve`, which listens on every interface
+with no key). Without them it uses the C++ scorer on the safetensors. `--laya-model FILE.gguf`
+picks another GGUF, `ONEBIT_LAYA_GGML` another binary, `ONEBIT_LAYA_DEVICE` another device (`cpu`).
+
+**Measured** (Strix Halo, the 200 labelled requests of `tests/laya_route_cases.json`, 150 of
+them asked of the model, the rest long_doc by size):
+
+| Scorer | Class accuracy | Decision, p50 |
+|---|---|---|
+| C++ scorer, typed-decisions safetensors, CPU (through `serve`) | 95.5% | 538 ms |
+| **ggmlc `laya` on HRX0, typed-decisions Q8_0 GGUF** | **95.5%** | **25 ms** (15 ms at a steady 64 tokens, 25 at 128) |
+| ggmlc `laya` on Vulkan, same GGUF (upstream ggmlc, for comparison; not built by the engine) | 95.5% | 22 ms (12 ms at a steady length) |
+
+The p50 includes the first request of each length bucket, which compiles and records that
+shape once (about 150 ms). At a steady length HRX is within 3 ms of Vulkan at 64 tokens and level
+with it at 128. Three things got it there from 44 ms: ggmlc gives its graphs a uid, so HRX's
+graph-program cache and graph replay hit instead of re-importing and re-recording every call
+(25 -> 15 ms); a fused kernel for the rotate-half RoPE that ggmlc lowers to eight nodes, and one
+for GEGLU (1,170 launches a decision down to about 780); and attention that computes each score
+once. Next is the NPU.
+Answers match Vulkan's probabilities within about 1e-3. Asked directly on Vulkan: typed-decisions
+F16 95.5% at 36 ms; the English GGUF 93.0% (Q8_0) and 91.5% (F16), so the typed-decisions
+checkpoint stays the router's. `tests/laya_gguf_route.sh` covers the daemon wiring without a GPU.
+
+**Other languages.** The 150 model-decided cases machine-translated into Spanish, German,
+Japanese, Chinese, Hindi and Russian (Qwen3-Coder-30B-A3B, greedy; 682 kept after dropping replies
+that answered instead of translating), on HRX0:
+
+| Scorer | es | de | ja | zh | hi | ru | All |
+|---|---|---|---|---|---|---|---|
+| **typed-decisions for every language** | **92.5%** | **90.7%** | **89.0%** | **86.4%** | 60.0% | **83.7%** | **83.7%** |
+| typed-decisions for English, multilingual GGUF otherwise (ggmlc's language routing) | 73.3% | 71.3% | 65.3% | 83.1% | 60.0% | 68.1% | 69.1% |
+
+The multilingual checkpoint answers this question worse in every language, so the router keeps
+typed-decisions for all of them; Hindi is the weak spot either way.
+
+ggmlc declares the MIT licence (`pyproject.toml`, README) but its repository carries no LICENSE
+file yet; the GGUFs are Apache-2.0 like the checkpoints.

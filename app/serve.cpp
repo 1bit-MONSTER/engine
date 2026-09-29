@@ -56,6 +56,9 @@
 //                                                  drafts a block per step (docs/serve.md)
 //   --mmproj <mmproj.gguf> on any llama.cpp route -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
+//   --long-model <rotated.gguf>                 -> conversations that start with --long-from tokens
+//                                                  (default 2048) go to that Hadamard-rotated Q4_0
+//                                                  on ROCm (W4A4 prefill), the rest to -m's route
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
@@ -108,6 +111,7 @@
 #elif defined(__linux__)
 #include <fcntl.h>
 #include <netinet/in.h>
+#include <poll.h>
 #include <sys/prctl.h>
 #include <sys/socket.h>
 #include <sys/wait.h>
@@ -158,6 +162,8 @@ struct Options {
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
+    std::string long_model;              // --long-model FILE: a Hadamard-rotated Q4_0 for long prompts (W4A4 on ROCm)
+    int long_from = 2048;                // --long-from N: a conversation whose first prompt has N tokens or more
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -655,6 +661,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
             if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
+            // 1024-token micro-batches: prompt processing +3-8% over the default 512 (Qwen3-Coder-30B-A3B,
+            // pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; 2048 is no better), decode unchanged
+            argv.insert(argv.end(), {"-ub", "1024"});
         }
     } else if (device == "vulkan" || device == "hrx") {
         // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
@@ -804,20 +813,176 @@ size_t conversation_key(const httplib::Request& req) {
 // ${XDG_DATA_HOME:-~/.local/share}/1bit/laya (where scripts/fetch-laya.sh installs it). A
 // directory holding the pinned repo's typed-decisions/ checkpoint uses that one: it classifies
 // requests best (95.5% against 92.0% for the root checkpoint, tests/laya_classify_eval).
-std::string laya_checkpoint(const std::string& given) {
-    namespace fs = std::filesystem;
+std::string laya_home(const std::string& given) {
     std::string dir = given;
     if (dir.empty()) {
         if (const char* e = std::getenv("ONEBIT_LAYA_MODEL"); e && *e) dir = e;
         else if (const char* x = std::getenv("XDG_DATA_HOME"); x && *x) dir = std::string(x) + "/1bit/laya";
         else if (const char* h = std::getenv("HOME"); h && *h) dir = std::string(h) + "/.local/share/1bit/laya";
     }
+    return dir;
+}
+
+std::string laya_checkpoint(const std::string& given) {
+    namespace fs = std::filesystem;
+    const std::string dir = laya_home(given);
     if (dir.empty() || !fs::is_directory(dir))
         throw std::runtime_error("laya: no checkpoint at " + (dir.empty() ? std::string("~/.local/share/1bit/laya") : dir) +
                                  " (install it with scripts/fetch-laya.sh, or pass --laya-model DIR)");
     if (fs::exists(fs::path(dir) / "typed-decisions" / "model.safetensors")) return (fs::path(dir) / "typed-decisions").string();
     return dir;
 }
+
+// The router's fast scorer: ggmlc's laya (our fork, third_party/ggmlc, -DONEBIT_LAYA_GGML=ON) on
+// HRX0, AMD's backend, built against third_party/llama.cpp's ggml (its HRX kernels for ModernBERT,
+// fork #31), with the typed-decisions checkpoint compiled to a GGUF (mys/laya-typed-decisions-GGUF,
+// pinned in config/laya.json, fetched by scripts/fetch-laya.sh into <laya dir>/gguf/). Q8_0
+// classifies tests/laya_route_cases.json as well as the C++ scorer on the safetensors (95.5%) in
+// 25 ms a decision (15 at a steady 64 tokens) instead of about 540 ms. Used when the binary and the GGUF are both there.
+constexpr const char* kLayaGguf = "laya_typed_decisions_q8_0.gguf";
+
+std::string laya_ggml_bin() {
+    if (const char* e = std::getenv("ONEBIT_LAYA_GGML"); e && *e) return e;
+#ifdef ONEBIT_LAYA_GGML_BIN
+    if (std::filesystem::exists(built_path(ONEBIT_LAYA_GGML_BIN))) return built_path(ONEBIT_LAYA_GGML_BIN);
+#endif
+    return "";
+}
+
+// --laya-model FILE.gguf, or the pinned GGUF under the Laya directory ("" when there is none)
+std::string laya_gguf(const std::string& given) {
+    namespace fs = std::filesystem;
+    if (given.size() > 5 && given.compare(given.size() - 5, 5, ".gguf") == 0) {
+        if (!fs::exists(given)) throw std::runtime_error("laya: no such file " + given);
+        return given;
+    }
+    const std::string dir = laya_home(given);
+    for (const fs::path p : {fs::path(dir) / "gguf" / kLayaGguf, fs::path(dir) / kLayaGguf})
+        if (fs::exists(p)) return p.string();
+    return "";
+}
+
+#if defined(__linux__)
+// `laya daemon`: one JSON request per line on its stdin, one answer per line on its stdout (its
+// log goes to our stderr). Pipes rather than its `serve`, which listens on every interface.
+class LayaDaemon {
+public:
+    // env: NAME=VALUE entries set in the daemon's environment (one the user already set wins)
+    explicit LayaDaemon(const std::vector<std::string>& argv, const std::vector<std::string>& env = {}) {
+        int in[2], out[2];
+        if (::pipe2(in, O_CLOEXEC) != 0 || ::pipe2(out, O_CLOEXEC) != 0)
+            throw std::runtime_error(std::string("laya: pipe: ") + std::strerror(errno));
+        std::signal(SIGPIPE, SIG_IGN);  // a daemon that died fails a write, not the server
+        std::vector<char*> args;
+        for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
+        args.push_back(nullptr);
+        const pid_t parent = ::getpid();
+        pid_ = ::fork();
+        if (pid_ < 0) throw std::runtime_error(std::string("laya: fork: ") + std::strerror(errno));
+        if (pid_ == 0) {
+            ::prctl(PR_SET_PDEATHSIG, SIGTERM);
+            if (::getppid() != parent) ::_exit(127);
+            for (const auto& e : env) {
+                const size_t eq = e.find('=');
+                if (eq != std::string::npos) ::setenv(e.substr(0, eq).c_str(), e.c_str() + eq + 1, 0);
+            }
+            ::dup2(in[0], 0);
+            ::dup2(out[1], 1);
+            ::execvp(args[0], args.data());
+            ::_exit(127);
+        }
+        ::close(in[0]);
+        ::close(out[1]);
+        to_ = in[1];
+        from_ = out[0];
+        std::string line;
+        json ready;
+        if (!read_line(line, std::chrono::seconds(300)) || !(ready = json::parse(line, nullptr, false)).is_object() ||
+            ready.value("status", "") != "ready")
+            throw std::runtime_error("laya: " + argv[0] + " did not start: " + line);
+    }
+    ~LayaDaemon() {
+        if (to_ >= 0) ::close(to_);
+        if (from_ >= 0) ::close(from_);
+        if (pid_ > 0) {
+            ::kill(pid_, SIGTERM);
+            ::waitpid(pid_, nullptr, 0);
+        }
+    }
+    LayaDaemon(const LayaDaemon&) = delete;
+    LayaDaemon& operator=(const LayaDaemon&) = delete;
+
+    // one request at a time; false when the daemon is gone or took longer than 30 s
+    bool ask(const std::string& request, json& answer) {
+        std::lock_guard<std::mutex> lock(mu_);
+        const std::string line = request + "\n";
+        for (size_t done = 0; done < line.size();) {
+            const ssize_t n = ::write(to_, line.data() + done, line.size() - done);
+            if (n <= 0) return false;
+            done += size_t(n);
+        }
+        std::string reply;
+        if (!read_line(reply, std::chrono::seconds(30))) return false;
+        answer = json::parse(reply, nullptr, false);
+        return answer.is_object();
+    }
+
+private:
+    bool read_line(std::string& line, std::chrono::milliseconds timeout) {
+        const auto end = std::chrono::steady_clock::now() + timeout;
+        for (;;) {
+            if (const size_t nl = buf_.find('\n'); nl != std::string::npos) {
+                line = buf_.substr(0, nl);
+                buf_.erase(0, nl + 1);
+                return true;
+            }
+            const auto left = std::chrono::duration_cast<std::chrono::milliseconds>(end - std::chrono::steady_clock::now());
+            if (left.count() <= 0) return false;
+            pollfd p{from_, POLLIN, 0};
+            if (::poll(&p, 1, int(left.count())) <= 0) return false;
+            char tmp[4096];
+            const ssize_t n = ::read(from_, tmp, sizeof tmp);
+            if (n <= 0) return false;
+            buf_.append(tmp, size_t(n));
+        }
+    }
+
+    pid_t pid_ = -1;
+    int to_ = -1, from_ = -1;
+    std::string buf_;
+    std::mutex mu_;
+};
+
+// classify_request (laya/route.cpp) through the daemon: the same size gate for long_doc and the
+// same question, asked of the GGUF
+onebit::laya::RequestClass classify_request_gguf(LayaDaemon& d, const std::string& state) {
+    onebit::laya::RequestClass out;
+    if (state.size() >= onebit::laya::kLongDocChars) {
+        out.label = "long_doc";
+        out.confidence = 1.0f;
+        out.probabilities = {{"long_doc", 1.0f}};
+        return out;
+    }
+    int variant = 0;
+    if (const char* v = std::getenv("ONEBIT_LAYA_CLASS_VARIANT")) variant = std::atoi(v);
+    const onebit::laya::Question q = onebit::laya::request_class_question(variant);
+    nlohmann::ordered_json criteria = nlohmann::ordered_json::object();
+    for (const auto& [key, desc] : q.criteria)
+        if (key != "long_doc") criteria[key] = desc;
+    nlohmann::ordered_json req = {{"state", state},
+                                  {"questions", {{"cls", {{"type", q.type}, {"instructions", q.instructions}, {"criteria", criteria}}}}}};
+    json answer;
+    if (!d.ask(req.dump(), answer)) return out;
+    const json* a = answer.contains("answers") && answer["answers"].contains("cls") ? &answer["answers"]["cls"] : nullptr;
+    if (!a || !a->contains("choice") || !(*a)["choice"].is_string()) return out;
+    out.label = (*a)["choice"].get<std::string>();
+    out.confidence = a->value("confidence", 0.0f);
+    if (a->contains("probabilities") && (*a)["probabilities"].is_object())
+        for (const auto& [key, desc] : q.criteria)
+            if ((*a)["probabilities"].contains(key)) out.probabilities.emplace_back(key, (*a)["probabilities"][key].get<float>());
+    return out;
+}
+#endif
 #endif
 
 std::string request_state(const httplib::Request& req) {
@@ -844,6 +1009,38 @@ std::string request_state(const httplib::Request& req) {
                     if (part.is_object() && part.value("type", "") == "text") add(part.value("text", ""));
         }
     return out;
+}
+
+// The prompt length of a request, counted by a llama-server backend: /v1/completions' prompt as
+// is, a chat through the model's template (/apply-template, which takes the request body as it
+// comes, tools included). If the backend cannot tell, about four bytes a token.
+long prompt_tokens(int port, const httplib::Request& q) {
+    json body;
+    try {
+        body = json::parse(q.body);
+    } catch (const std::exception&) {
+        return long(q.body.size() / 4);
+    }
+    httplib::Client c("127.0.0.1", port);
+    c.set_read_timeout(std::chrono::seconds(30));
+    std::string prompt;
+    if (body.contains("prompt") && body["prompt"].is_string()) {
+        prompt = body["prompt"].get<std::string>();
+    } else if (auto t = c.Post("/apply-template", q.body, "application/json"); t && t->status == 200) {
+        try {
+            prompt = json::parse(t->body).value("prompt", "");
+        } catch (const std::exception&) {
+        }
+    }
+    if (prompt.empty()) return long(request_state(q).size() / 4);
+    if (auto t = c.Post("/tokenize", json{{"content", prompt}}.dump(), "application/json"); t && t->status == 200) {
+        try {
+            const json tok = json::parse(t->body);
+            if (tok.contains("tokens") && tok["tokens"].is_array()) return long(tok["tokens"].size());
+        } catch (const std::exception&) {
+        }
+    }
+    return long(prompt.size() / 4);
 }
 
 int serve_child(const Options& given) {
@@ -875,17 +1072,41 @@ int serve_child(const Options& given) {
     const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto";
 #ifdef ONEBIT_LAYA
     std::unique_ptr<onebit::laya::Scorer> scorer;
+#if defined(__linux__)
+    std::unique_ptr<LayaDaemon> laya_daemon;
+#endif
     std::vector<std::string> laya_devices;
     onebit::laya::RoutePolicy policy;
     if (laya) {
         if (o.adaptive || !o.role.empty() || !o.prefill_device.empty() || o.lean)
             throw std::runtime_error("--laya does not combine with --adaptive, --embedding/--reranking, --prefill-device or --lean");
-        const std::string ckpt = laya_checkpoint(o.laya_model);
         policy = onebit::laya::load_route_policy(o.route_policy);
-        scorer = std::make_unique<onebit::laya::Scorer>();
-        if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
-        std::fprintf(stderr, "1bit serve: laya: checkpoint %s, policy %s\n", ckpt.c_str(),
-                     o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+        const std::string gguf = laya_gguf(o.laya_model), bin = laya_ggml_bin();
+#if defined(__linux__)
+        if (!gguf.empty() && !bin.empty()) {
+            // the GGUF scorer on HRX0 (ONEBIT_LAYA_DEVICE picks another: cpu), with the HSA runtime HRX
+            // needs (docs/hrx.md)
+            const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
+            std::vector<std::string> env;
+            if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
+                bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
+            std::fprintf(stderr, "1bit serve: laya: %s through %s, policy %s\n", gguf.c_str(), bin.c_str(),
+                         o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+        }
+#endif
+        if (!gguf.empty() && gguf == o.laya_model && bin.empty())
+            throw std::runtime_error("laya: a GGUF needs ggmlc's laya (build with -DONEBIT_LAYA_GGML=ON, or set ONEBIT_LAYA_GGML)");
+#if defined(__linux__)
+        if (!laya_daemon)
+#endif
+        {
+            const std::string ckpt = laya_checkpoint(o.laya_model);
+            scorer = std::make_unique<onebit::laya::Scorer>();
+            if (!scorer->load(ckpt)) throw std::runtime_error("laya: " + scorer->error());
+            std::fprintf(stderr, "1bit serve: laya: checkpoint %s, policy %s\n", ckpt.c_str(),
+                         o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+        }
         for (const std::string& dev : kGgufDevices) {
             try {
                 backends.push_back(launch_for(o, dev, free_port()));
@@ -937,6 +1158,34 @@ int serve_child(const Options& given) {
     } else {
         backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
     }
+    // --long-model: the same model as a Hadamard-rotated Q4_0 on the ROCm W4A4 route, for
+    // conversations that start with a long prompt. What the user waits for is the first token
+    // plus the answer: with a short prompt the faster decode wins (Vulkan), with a long one the
+    // faster prefill does (W4A4 from about 2,000 tokens; docs/lean.md, "End to end"). Both
+    // backends load at the start; a conversation stays where its first request went, so its
+    // prompt cache stays useful as it grows.
+    const bool long_route = !o.long_model.empty();
+    if (long_route) {
+        if (laya || o.adaptive || !o.role.empty() || !o.mmproj.empty())
+            throw std::runtime_error("--long-model does not combine with --laya, --adaptive, --embedding/--reranking or --mmproj");
+        if (!hadamard_q4_0(o.long_model))
+            throw std::runtime_error("--long-model takes a Hadamard-rotated Q4_0 (tools/hadamard_q4_0.py, docs/lean.md): " + o.long_model);
+        if (hadamard_q4_0(o.model))
+            throw std::runtime_error(o.model + " is already on the W4A4 route; -m is the model for short prompts");
+        const std::string& d = backends[0].device;
+        if (d != "vulkan" && d != "hrx" && d != "rocm")
+            throw std::runtime_error("--long-model needs -m on a llama-server route (vulkan, hrx or rocm), not " + d);
+        if (o.long_from < 1) throw std::runtime_error("--long-from takes a positive token count");
+        Options lo = o;
+        lo.model = o.long_model;
+        lo.mtp.clear();
+        lo.dflash.clear();
+        lo.llama_server.clear();
+        lo.prefill_device.clear();
+        lo.moe_slots = 0;
+        lo.lean = false;
+        backends.push_back(launch_for(lo, "rocm", free_port()));
+    }
     const std::string device = laya ? "laya" : o.adaptive ? "vulkan+rocm" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
     const std::string set_model = backends[0].set_model;
@@ -981,6 +1230,10 @@ int serve_child(const Options& given) {
     std::vector<std::atomic<int>> inflight(backends.size());
     std::vector<std::atomic<long>> routed(backends.size());
     std::mutex route_mu;
+    // --long-model: conversation -> (backend, prompt tokens of its first request)
+    std::mutex long_mu;
+    std::unordered_map<size_t, std::pair<size_t, long>> long_cache;
+    std::deque<size_t> long_order;
 #ifdef ONEBIT_LAYA
     std::mutex scorer_mu, class_mu;
     std::unordered_map<size_t, onebit::laya::RequestClass> class_cache;  // conversation -> class
@@ -1008,6 +1261,10 @@ int serve_child(const Options& given) {
             }
             if (cls.label.empty()) {
                 std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
+#if defined(__linux__)
+                if (laya_daemon) cls = classify_request_gguf(*laya_daemon, request_state(q));
+                else
+#endif
                 cls = onebit::laya::classify_request(*scorer, request_state(q));
                 fresh = true;
             }
@@ -1047,6 +1304,33 @@ int serve_child(const Options& given) {
             return;
         }
 #endif
+        if (long_route) {
+            const size_t key = conversation_key(q);
+            std::pair<size_t, long> side{0, -1};
+            bool fresh = true;
+            {
+                std::lock_guard<std::mutex> lock(long_mu);
+                if (const auto c = long_cache.find(key); c != long_cache.end()) side = c->second, fresh = false;
+            }
+            if (fresh) {
+                side.second = prompt_tokens(backends[0].port, q);
+                side.first = side.second >= o.long_from ? 1 : 0;
+                std::lock_guard<std::mutex> lock(long_mu);
+                if (long_cache.size() >= 4096) {  // oldest conversation first
+                    long_cache.erase(long_order.front());
+                    long_order.pop_front();
+                }
+                if (long_cache.emplace(key, side).second) long_order.push_back(key);
+            }
+            const size_t i = side.first;
+            char route_hdr[96];
+            std::snprintf(route_hdr, sizeof route_hdr, "%s %ld %s", i ? "long" : "short", side.second, backends[i].device.c_str());
+            held = std::make_shared<InFlight>(&inflight[i]);
+            ++routed[i];
+            forward(backends[i].port, held, -1, id, backends[i].drop_model, backends[i].set_model, q, r);
+            r.set_header("X-1bit-Route", route_hdr);  // short or long, the first prompt's tokens, device
+            return;
+        }
         {
             std::lock_guard<std::mutex> lock(route_mu);
             if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
@@ -1352,6 +1636,8 @@ void usage(FILE* out) {
                  "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
                  "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
+                 "                  [--long-model ROTATED.gguf] [--long-from N]   conversations starting with N or more prompt\n"
+                 "                                    tokens (default 2048) go to that Hadamard-rotated Q4_0 on ROCm (W4A4)\n"
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
@@ -1402,6 +1688,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--parallel") o.parallel = std::stoi(next());
         else if (a == "--adaptive") o.adaptive = true;
         else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
+        else if (a == "--long-model") o.long_model = next();
+        else if (a == "--long-from") o.long_from = std::stoi(next());
         else if (a == "--embed") o.embed = next();
         else if (a == "--embedding" || a == "--embeddings") o.role = "embedding";
         else if (a == "--reranking") o.role = "reranking";
@@ -1458,6 +1746,34 @@ int run_serve(int argc, char** argv) {
         // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
         // directory, then serve it through the model-generic forward in process.
         const std::string dir = repack_gguf(o.model);
+        // Forward -> lane routing: if a fused-lane kernel set exists for this
+        // model's shape (the fast-lane artifacts layer_ctx1.elf + layer.pdi),
+        // serve it on the NPU fast lane (one launch per layer) instead of the
+        // per-op forward (~100+ launches per token).  Opt-in via
+        // ONEBIT_NPU_LANE_DIR: the repack layout must equal the lane kernels'
+        // layout, and it does not yet (the repack is patched for the forward's
+        // per-op ELFs), so this must not fire by accident.  Without it, the
+        // forward runs (the unchanged fallback).
+        {
+            std::string lane;
+            if (const char* env = std::getenv("ONEBIT_NPU_LANE_DIR")) lane = env;
+            if (!lane.empty() && fs::exists(fs::path(lane) / "layer_ctx1.elf")) {
+                if (!fs::exists(fs::path(dir) / "npu")) {
+                    std::error_code ec;
+                    fs::create_directory_symlink(lane, fs::path(dir) / "npu", ec);
+                    if (ec) std::fprintf(stderr, "1bit serve: lane routing skipped (%s)\n", ec.message().c_str());
+                }
+                if (fs::exists(fs::path(dir) / "npu" / "layer_ctx1.elf")) {
+                    std::fprintf(stderr, "1bit serve: routing %s to the NPU fast lane (fused layer) from %s\n",
+                                 o.model.c_str(), lane.c_str());
+                    std::vector<std::string> args = {"-m", dir, "-p", std::to_string(o.port), "--host", o.host};
+                    if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+                    std::vector<char*> av;
+                    for (auto& s : args) av.push_back(s.data());
+                    return run_unified(int(av.size()), av.data());
+                }
+            }
+        }
         // Resolve the full-ELF / xclbin directory the forward loads. An empty value
         // makes it look for "/full_i8_*.elf", so it is an error, not a default.
         std::string kernels;

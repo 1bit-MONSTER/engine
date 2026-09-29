@@ -18,7 +18,7 @@
 # onebit.hadamard_q4_0 = 32; docs/lean.md), without a GPU:
 #   - --device vulkan refuses it,
 #   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_Q4_0_HADAMARD=1 and
-#     GGML_W4A4_TENSORS=all in the backend's environment,
+#     GGML_W4A4_TENSORS=all in the backend's environment and 1024-token micro-batches (-ub 1024),
 #   - an unstamped file with --device auto still goes to Vulkan with neither variable,
 #   - --dflash on a rotated file adds the DFlash drafter with full blocks (n-max 16, p-min 0):
 #     one ROCm server, W4A4 prompt processing and DFlash2 decode.
@@ -84,6 +84,7 @@ run "$scratch/h32.gguf" "$scratch/h32.json"
 check "--device auto sends a rotated file to ROCm0" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = ROCm0 ]'
 check "  with GGML_Q4_0_HADAMARD=1" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_Q4_0_HADAMARD\")")" = 1 ]'
 check "  and GGML_W4A4_TENSORS=all" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
+check "  with 1024-token micro-batches" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"-ub\")+1]")" = 1024 ]'
 
 run "$scratch/plain.gguf" "$scratch/plain.json"
 check "an unstamped file still goes to Vulkan0" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = Vulkan0 ]'

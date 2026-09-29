@@ -1,0 +1,25 @@
+{
+ "source": "llama.cpp's own tokenizer (llama-server /tokenize) on MiniCPM4-8B-Q4_K_M.gguf. These are oracle ids, not ids produced by this tokenizer.",
+ "cases": [
+  {
+   "text": "The capital of France is",
+   "ids": [1507, 8107, 1379, 8360, 1410]
+  },
+  {
+   "text": "The",
+   "ids": [1507]
+  },
+  {
+   "text": "Paris",
+   "ids": [11225]
+  },
+  {
+   "text": "Hello, world!",
+   "ids": [21045, 59342, 2809, 73]
+  },
+  {
+   "text": " Paris",
+   "ids": [1345, 3837, 1360]
+  }
+ ]
+}

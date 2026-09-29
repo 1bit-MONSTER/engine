@@ -60,6 +60,7 @@ jobs:
         run: |
           set -euo pipefail
           python3 tools/registry_build.py
+          python3 tools/registry_build.py --check-gaps
           python3 tools/census.py | tee census.txt
 
       - name: Open the census PR

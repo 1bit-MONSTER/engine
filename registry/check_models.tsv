@@ -43,3 +43,9 @@ zinc	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
 zinc	Qwen3.6-35B-A3B-Q8_0.gguf
 zinc	MiniCPM5-1B-Q4_K_M.gguf
 npu	Qwen3-0.6B
+npu	qwen2.5-7b-instruct-q4_k_m-merged.gguf
+npu	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
+npu	Qwen3.6-35B-A3B-Q8_0.gguf
+npu	GLM-4.7-Flash-Q4_K_M.gguf
+npu	MiniCPM4-8B-Q4_K_M.gguf
+npu	MiniCPM5-1B-Q4_K_M.gguf

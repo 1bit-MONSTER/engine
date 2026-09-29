@@ -39,8 +39,11 @@ public:
 
     std::vector<int> encode(const std::string& text) const;
     // Ids outside the vocabulary decode to nothing.
-    std::string decode(const std::vector<int>& ids) const;
-    std::string decode(int id) const { return decode(std::vector<int>{id}); }
+    // A SentencePiece vocabulary's first metaspace is its add_dummy_prefix marker, stripped when
+    // decoding a whole text. One token of a stream keeps it: a word-initial token's space is real
+    // there (after the prompt, or after the previous word).
+    std::string decode(const std::vector<int>& ids, bool strip_dummy_prefix = true) const;
+    std::string decode(int id) const { return decode(std::vector<int>{id}, false); }
     // One past the largest id, added tokens included.
     int size() const { return int(id_to_text_.size()); }
     // The vocabulary id for a token string (added tokens included), or -1 if absent.

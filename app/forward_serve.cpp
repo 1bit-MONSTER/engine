@@ -37,7 +37,10 @@
 #include <atomic>
 #include <chrono>
 #include <cstdio>
+#include <cstdlib>
 #include <filesystem>
+#include <fcntl.h>
+#include <sys/file.h>
 #include <fstream>
 #include <mutex>
 #include <stdexcept>
@@ -273,6 +276,31 @@ int run_forward_serve(int argc, char** argv) {
     e.endoftext = e.tok->token_id("<|endoftext|>");
 
     e.fwd = std::make_unique<Q4nxNpuForward>();
+
+    // Serialise NPU access across processes.  The device exposes a single hardware
+    // context, so a second concurrent `1bit serve --device npu` fails inside
+    // DRM_IOCTL_AMDXDNA_CREATE_HWCTX with EINVAL and the whole serve exits 1 --
+    // which is what happened when several models were served at once.  The
+    // per-process ELF runner (npu_engine_universal) has always taken this lock;
+    // the serve route did not, so it could not be serialised against it or
+    // against a sibling serve.  Held for the life of the process (fd not closed),
+    // exactly like the runner.
+    if (!std::getenv("NPU_NO_DEVICE_LOCK")) {
+        // flock needs only a read fd, so the file stays 0644 and other users can
+        // still open it; O_NOFOLLOW refuses a symlink planted in /tmp.
+        const char* lk = "/tmp/1bit-npu-device.lock";
+        int lfd = ::open(lk, O_CREAT | O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0644);
+        if (lfd >= 0) {
+            if (::flock(lfd, LOCK_EX | LOCK_NB) != 0) {
+                std::fprintf(stderr, "[npu] waiting for the exclusive device lock (%s)...\n", lk);
+                if (::flock(lfd, LOCK_EX) != 0)
+                    std::fprintf(stderr, "[npu] device lock unavailable; continuing unlocked\n");
+                else
+                    std::fprintf(stderr, "[npu] device lock acquired\n");
+            }
+        }
+    }
+
     xrt::device dev(0);
     if (!e.fwd->init(dev, model.c_str(), kernels, /*use_elf=*/true))
         throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());

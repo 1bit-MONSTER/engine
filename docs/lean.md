@@ -123,7 +123,8 @@ quantize it with anyway:
 tools/hadamard_q4_0.py Qwen3.8-27B-Q8_0.gguf Qwen3.8-27B-Q4_0-H32.gguf --imatrix imatrix_unsloth.gguf
 ```
 
-It rotates the attention, FFN and delta-net alpha/beta projections in a copy of the source,
+It rotates the attention, FFN (MoE experts and shared experts included) and delta-net
+alpha/beta projections in a copy of the source,
 gives the imatrix the matching change, quantizes those tensors to Q4_0 and every other matmul
 weight to another type, stamps the file `onebit.hadamard_q4_0 = 32`, and checks that every Q4_0
 tensor in it is a rotated one (it deletes a file that breaks that). Qwen3.8-27B: about 20 minutes
@@ -147,6 +148,107 @@ llama-bench with ub 512):
 | Q4_0, W4A4 without rotation | 461-488 | 6.241 | 0.084 | 87.4% |
 | **Q4_0-H32 (rotated), W4A4** | **503-512** (509 on the engine's lean ROCm build) | **6.096** | **0.055** | **89.3%** |
 | Q4_0-H32 on the exact int8 path | ~400 | 6.016 | 0.031 | 91.6% |
+
+### MoE: W4A4 on the experts
+
+W4A4 runs the expert matmuls (`MUL_MAT_ID`) too
+([ROCmFPX #3](https://github.com/1bit-MONSTER/ROCmFPX/pull/3)). Before that, an MoE file took
+W4A4 on its attention only, and its experts, where nearly all of the prompt's work is, stayed on
+the exact int8 path. `tools/hadamard_q4_0.py` rotates the experts along with the rest.
+
+```sh
+tools/hadamard_q4_0.py Qwen3-Coder-30B-A3B-Instruct-Q8_0.gguf Qwen3-Coder-30B-A3B-Q4_0-H32.gguf
+1bit serve -m Qwen3-Coder-30B-A3B-Q4_0-H32.gguf
+```
+
+**Measured** (Strix Halo, Qwen3-Coder-30B-A3B from unsloth's Q8_0, rev `b17cb02d`; KLD against
+that Q8_0 over wikitext-2 40 x 512, Q8_0 PPL 8.489; llama-bench, 3 runs; 337 rotated tensors,
+16,497 MiB):
+
+| Qwen3-Coder-30B-A3B, Q4_0 | pp512 | pp2048 | tg128 | PPL | Mean KLD | Same top token |
+|---|---|---|---|---|---|---|
+| rotated, exact int8 | 1,218 | 1,186 | 79.0 | 8.671 | 0.048 | 91.5% |
+| rotated, W4A4 on attention only (before ROCmFPX #3) | 1,236 | 1,208 | 79.1 | 8.720 | 0.061 | 90.3% |
+| **rotated, W4A4 on attention and experts** | **2,156** | **2,048** | 79.2 | 8.862 | **0.081** | **88.7%** |
+| not rotated, W4A4 everywhere | 2,155 | 2,058 | 79.0 | 8.847 | 0.137 | 85.3% |
+
+Prompt processing goes up about 75% for an MoE, against about 25% for the dense 27B above,
+because an MoE spends almost all of its prompt compute in the experts. The accuracy cost is
+about the dense model's: KLD 0.048 to 0.081 (27B: 0.029 to 0.055). Without the rotation, W4A4
+costs almost twice as much (0.137). Decode does not use W4A4 and does not change.
+
+The gain depends on how much of the model's prompt time is in the experts. Same method, from
+each model's Q8_0:
+
+| Q4_0, rotated | Route | pp512 | pp2048 | tg128 | PPL | Mean KLD | Same top token |
+|---|---|---|---|---|---|---|---|
+| Qwen3.6-35B-A3B (Q8_0 PPL 5.825; 401 tensors, 18,832 MiB) | exact int8 | 1,454 | 1,408 | 63.3 | 5.981 | 0.046 | 90.6% |
+| | W4A4 on attention only | 1,514 | 1,478 | 64.0 | 6.032 | 0.058 | 89.6% |
+| | **W4A4 on attention and experts** | **1,616** | **1,579** | 63.9 | 6.117 | **0.077** | **88.0%** |
+| GLM-4.7-Flash (Q8_0 PPL 10.41; 562 tensors, 16,171 MiB) | exact int8 | 904 | 853 | 58.6 | 7.973 | 0.528 | 83.1% |
+| | W4A4 on attention only | 1,029 | 861 | 61.3 | 8.130 | 0.550 | 81.3% |
+| | **W4A4 on attention and experts** | **1,599** | **1,239** | 61.9 | 8.455 | **0.587** | **79.3%** |
+
+Qwen3.6-35B-A3B gains only about 11%: most of its layers are delta-net layers, whose prompt
+work does not run through a Q4_0 matmul. GLM-4.7-Flash (DeepSeek-2 layout, MLA attention; the
+tool rotates the MLA projections `attn_q_a`, `attn_q_b`, `attn_kv_a_mqa`, `attn_kv_b`,
+`attn_k_b`, `attn_v_b`) gains 77% at pp512, and W4A4 adds KLD 0.06, as on the Qwen models.
+
+GLM-4.7-Flash does not take plain Q4_0 well, W4A4 or not. A plain, unrotated Q4_0 on the exact
+path already scores KLD 0.493 against the Q8_0; any single group of tensors at Q4_0 (the
+experts, the attention, or the shared expert, dense layer and embedding) costs about 0.14 on its
+own. Its wikitext perplexity drops under Q4_0 (10.41 to 7.97-8.73) because the output
+distribution flattens, so perplexity alone reads this model the wrong way round. The Q8_0
+reference is sound: it gives PPL 10.44 on upstream HIP and 11.01 on Vulkan, and KLD 0.015
+across backends. An importance matrix repairs the weights but not the activations. An unrotated Q4_0 made with
+an imatrix (wikitext-2 train, 150 x 512) scores KLD 0.197 on the exact path, PPL 10.81; the same
+file with W4A4 on attention scores 0.322 and with W4A4 everywhere 0.571. On the rotated file an
+imatrix does nothing: Q4_0 has one scale per 32 values, the rotation spreads the outlier columns
+across the block, and even an imatrix collected on the rotated activations moves KLD from 0.528
+to 0.522. For GLM-4.7-Flash, use the exact path with an imatrix Q4_0, or a higher-precision
+file; its activations do not take 4 bits.
+
+### End to end: time to first token and effective speed
+
+A user waits for the whole answer, not for the decode phase. A request with P prompt tokens and
+N output tokens takes TTFT + (N - 1) / decode speed, and TTFT is mostly P / prefill speed. The
+effective speed, N over that whole time, is what the user gets (the idea behind Artificial
+Analysis's end-to-end response time). `tools/e2e_bench.py` measures it against any running
+server (`1bit serve` or llama-server): streamed `/v1/completions` with prompts cut to exactly P
+tokens, exactly N output tokens, no prompt cache, median of 3.
+
+```sh
+tools/e2e_bench.py --url http://127.0.0.1:8080 --prompt-tokens 512,2048,8192,16384 --max-tokens 256
+```
+
+**Measured** (Strix Halo, Qwen3-Coder-30B-A3B, N = 256, `-c 20480 -fa on`): the engine's
+Vulkan build with a Q4_K_M, against the rotated
+Q4_0 above on the ROCm route, exact int8 and W4A4:
+
+| Prompt tokens | Route | TTFT | Decode | End to end | **Effective** |
+|---|---|---|---|---|---|
+| 512 | Vulkan, Q4_K_M | 0.38 s | 78.7 t/s | 3.62 s | **70.7 t/s** |
+| | ROCm, exact int8 | 0.43 s | 73.9 t/s | 3.89 s | 65.9 t/s |
+| | ROCm, W4A4 | 0.25 s | 71.4 t/s | 3.85 s | 66.6 t/s |
+| 2,048 | Vulkan, Q4_K_M | 1.56 s | 76.0 t/s | 4.92 s | 52.1 t/s |
+| | ROCm, exact int8 | 1.72 s | 69.6 t/s | 5.38 s | 47.6 t/s |
+| | ROCm, W4A4 | 1.00 s | 69.8 t/s | 4.66 s | **55.0 t/s** |
+| 8,192 | Vulkan, Q4_K_M | 8.48 s | 61.6 t/s | 12.62 s | 20.3 t/s |
+| | ROCm, exact int8 | 7.92 s | 58.2 t/s | 12.56 s | 20.4 t/s |
+| | ROCm, W4A4 | 5.03 s | 57.5 t/s | 9.46 s | **27.0 t/s** |
+| 16,384 | Vulkan, Q4_K_M | 24.87 s | 50.2 t/s | 29.92 s | 8.6 t/s |
+| | ROCm, exact int8 | 19.94 s | 47.8 t/s | 25.26 s | 10.1 t/s |
+| | ROCm, W4A4 | 13.76 s | 47.1 t/s | 19.17 s | **13.4 t/s** |
+
+Vulkan decodes about 10% faster, and for a short prompt that wins. From about 2,000 prompt
+tokens on, W4A4's first token comes early enough to more than pay for it: at 8K the answer is
+done 3.2 s sooner (+33% effective speed), at 16K the first token comes 11 s sooner and the
+effective speed is +56%. Agents and coding tools send long prompts (files, tool output,
+history), so that is where this route is for. The two files are not the same quantization
+(Q4_K_M against rotated Q4_0), so the table compares routes as they ship, not kernels.
+
+`1bit serve --long-model` takes both at once: short conversations on Vulkan, long ones on
+this route ([serve.md](serve.md#short-and-long-prompts---long-model)).
 
 The rotation removes a third of the 4-bit error. Against the exact path the rotated file costs
 +1.2% perplexity for +28% prompt speed. The last row shows the rotation itself is exact. Through

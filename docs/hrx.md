@@ -416,8 +416,23 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   gfx1151, in `motifs/dequant.loom` and again in the Q5_K/IQ4_XS prefill kernel, so IQ4 was declined
   and ran on the CPU. #41 fixes both copies and the q8-plane SwiGLU path they exposed. Qwen3.8-27B
   UD-Q4_K_XL: 91 graph splits -> 1, wikitext PPL 5.8294 (CPU 5.8288), decode 7.25 -> 9.0 tok/s
-  (Vulkan 12.5); `test-backend-ops -b HRX0` passes the IQ4 MUL_MAT and GET_ROWS cases. The rest of
-  the 27B gap is Q5_K / IQ4_XS decode kernels reading at ~105-176 GB/s against Vulkan's ~220.
+  (Vulkan 12.5); `test-backend-ops -b HRX0` passes the IQ4 MUL_MAT and GET_ROWS cases.
+- **K-quant decode kernels ([llama.cpp #42](https://github.com/1bit-MONSTER/llama.cpp/pull/42)).**
+  One-token projections on Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and Q8_0 now read the GGUF blocks
+  directly with f32 activations: the FFN gate/up pair fused with SwiGLU, and plain projections
+  with the residual add folded in. Mixed-quant files (Unsloth UD) used to take generic kernels at
+  ~105-176 GB/s; these run at ~200-224. Decode, tg128 against the Vulkan build on the same box:
+
+  | Model | HRX | Vulkan | |
+  |---|---|---|---|
+  | Qwen3.8-27B UD-Q4_K_XL | 11.60 | 12.49 | 92.9% (was 9.0) |
+  | ZAYA1-8B Q4_K_M | 92.7 | 93 | ~100% (was ~90) |
+  | Qwen3-0.6B Q4_K_M | 326.6 | 357 | 91.4% (was 320.8) |
+  | Qwen3-Coder-30B-A3B Q4_K_M | 90.6 | 93.7 | 96.6% (unchanged) |
+
+  Decode-shaped wikitext PPL (`-ub 1`) on the 27B: 7.1550, HRX before 7.1547, CPU 7.1475.
+  Still on the older paths: IQ3_S and Q3_K layers (one IQ3_S `ffn_down` costs 2.8 ms of the 27B's
+  ~89 ms token). The 27B on HRX runs hot on Strix Halo (90-93 C peak vs 67 C for Vulkan).
 - **Fast sub-4-bit kernels on HRX.** IQ2 and IQ3_S matmuls still fall back to the CPU.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
   They are kept on `1bit/hrx2-archive` until they are ported.

@@ -16,7 +16,8 @@
 #
 # How `1bit serve` applies recipes (config/recipes.json, docs/recipes.md), without a GPU:
 #   - the built-in recipes: a rotated MoE file gets -ub 1024 and says so on stderr, a rotated
-#     dense file does not, --dflash gets --spec-draft-p-min 0,
+#     dense file does not, --dflash gets --spec-draft-p-min 0.4 on rocm (the rocm recipe is listed
+#     first, so it wins over dflash-p-min-0) and 0 on vulkan,
 #   - a flag serve already set wins (--mtp-p-min 0.5 stays the only p-min),
 #   - --no-recipes adds nothing, --recipes FILE replaces the built-in set (flags and environment),
 #   - a malformed recipe file stops serve with the reason.
@@ -95,7 +96,10 @@ run "$scratch/moe.gguf" "$scratch/none.json" --no-recipes
 check "--no-recipes adds nothing" '[ "$(after "$scratch/none.json" -ub)" = None ] && ! grep -q recipe "$scratch/none.json.log"'
 
 run "$scratch/dense.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"
-check "--dflash gets --spec-draft-p-min 0 from dflash-p-min-0" '[ "$(after "$scratch/df.json" --spec-draft-p-min)" = 0 ]'
+check "--dflash on rocm gets --spec-draft-p-min 0.4 from rocm-dflash-p-min-0.4" '[ "$(after "$scratch/df.json" --spec-draft-p-min)" = 0.4 ] && [ "$(count "$scratch/df.json" --spec-draft-p-min)" = 1 ]'
+
+run "$scratch/plain.gguf" "$scratch/dfv.json" --dflash "$scratch/draft.gguf"
+check "--dflash on vulkan gets --spec-draft-p-min 0 from dflash-p-min-0" '[ "$(after "$scratch/dfv.json" --spec-draft-p-min)" = 0 ]'
 
 run "$scratch/dense.gguf" "$scratch/dfp.json" --dflash "$scratch/draft.gguf" --mtp-p-min 0.5
 check "a flag serve set wins: --mtp-p-min 0.5 is the only p-min" '[ "$(after "$scratch/dfp.json" --spec-draft-p-min)" = 0.5 ] && [ "$(count "$scratch/dfp.json" --spec-draft-p-min)" = 1 ]'

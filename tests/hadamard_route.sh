@@ -21,7 +21,7 @@
 #     GGML_W4A4_TENSORS=all in the backend's environment; a MoE file (an expert count) also gets
 #     1024-token micro-batches (-ub 1024), a dense one keeps llama-server's 512,
 #   - an unstamped file with --device auto still goes to Vulkan with neither variable,
-#   - --dflash on a rotated file adds the DFlash drafter with full blocks (p-min 0, n-max = the
+#   - --dflash on a rotated file adds the DFlash drafter (p-min 0.4 from its rocm recipe, n-max = the
 #     drafter's dflash.block_size - 1, or 16 when the file does not say): one ROCm server, W4A4
 #     prompt processing and DFlash2 decode.
 #
@@ -103,7 +103,7 @@ run "$scratch/h32.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"
 after() { field "$scratch/df.json" "r[\"argv\"][r[\"argv\"].index(\"$1\")+1]"; }
 check "--dflash on a rotated file stays on ROCm0" '[ "$(after --device)" = ROCm0 ]'
 check "  with the DFlash drafter" '[ "$(after --spec-type)" = draft-dflash ] && [ "$(after -md)" = "$scratch/draft.gguf" ]'
-check "  full blocks: n-max 16 without a block size, p-min 0" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0 ]'
+check "  n-max 16 without a block size, p-min 0.4" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0.4 ]'
 check "  and the Hadamard W4A4 environment" '[ "$(field "$scratch/df.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
 
 run "$scratch/h32.gguf" "$scratch/df8.json" --dflash "$scratch/draft8.gguf"

@@ -49,7 +49,10 @@ class H(BaseHTTPRequestHandler):
         if not req.get("stream"):
             text = "".join(WORDS)
             msg = {"message": {"role": "assistant", "content": text}} if "chat" in self.path else {"text": text}
-            self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)]})
+            # llama-server's timings, fixed, for tools/bench.py (tests/bench_selftest.sh)
+            timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0}
+            self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
+                             "timings": timings})
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

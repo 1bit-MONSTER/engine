@@ -69,6 +69,7 @@
 #include "built_path.h"
 
 #include "gguf_meta.h"
+#include "recipes.h"
 
 #ifdef ONEBIT_MOE
 #include "gguf_index.h"
@@ -163,6 +164,8 @@ struct Options {
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
+    std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
+    bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
     std::string long_model;              // --long-model FILE: a Hadamard-rotated Q4_0 for long prompts (W4A4 on ROCm)
     int long_from = 2048;                // --long-from N: a conversation whose first prompt has N tokens or more
 };
@@ -662,12 +665,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
             if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
-            // MoE files: 1024-token micro-batches, prompt processing +3-8% over the default 512
-            // (Qwen3-Coder-30B-A3B, pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; 2048 is no
-            // better), decode unchanged. A dense file keeps 512: Qwen3.8-27B-H32 serves a 1,838-token
-            // prompt at 491-495 tok/s with 512 and 471-473 with 1024.
-            if (gguf_int(o.model, gguf_architecture(o.model) + ".expert_count") > 0)
-                argv.insert(argv.end(), {"-ub", "1024"});
+            // micro-batch size: recipe rotated-moe-ub1024 (config/recipes.json)
         }
     } else if (device == "vulkan" || device == "hrx") {
         // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
@@ -759,16 +757,36 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             const long long block = gguf_int(o.dflash, gguf_architecture(o.dflash) + ".block_size");
             argv.insert(argv.end(), {"--spec-draft-n-max", block > 1 ? std::to_string(block - 1) : "16"});
         }
+        // without --mtp-p-min, recipe dflash-p-min-0 keeps DFlash blocks whole (config/recipes.json)
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
-        // a DFlash block is kept whole unless --mtp-p-min says otherwise: upstream's default p-min
-        // is 0, the ROCm tree's is 0.75, which cuts DFlash2 blocks from 6.7 to 5.4 tokens a step
-        else if (!o.dflash.empty()) argv.insert(argv.end(), {"--spec-draft-p-min", "0"});
     }
     if (!o.mmproj.empty()) {
         if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
         // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
         argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
+    }
+    if ((device == "vulkan" || device == "hrx" || device == "rocm") && !o.no_recipes &&
+        std::filesystem::path(o.model).extension() == ".gguf") {
+        // tuned settings for this model and route (config/recipes.json, docs/recipes.md); what
+        // serve set above wins over a recipe
+        Recipes recipes;
+        std::string text = default_recipes_json(), err;
+        if (!o.recipes.empty()) {
+            std::ifstream in(o.recipes, std::ios::binary);
+            if (!in) throw std::runtime_error("--recipes: cannot read " + o.recipes);
+            text.assign(std::istreambuf_iterator<char>(in), std::istreambuf_iterator<char>());
+        }
+        if (!recipes.parse(text, err))
+            throw std::runtime_error((o.recipes.empty() ? std::string("built-in recipes") : o.recipes) + ": " + err);
+        RecipeFacts facts;
+        facts.device = device;
+        facts.architecture = gguf_architecture(o.model);
+        facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
+        facts.hadamard_q4_0 = hadamard_q4_0(o.model);
+        facts.drafter = !o.dflash.empty() ? "dflash" : !o.mtp.empty() ? "mtp" : "none";
+        for (const auto& line : recipes.apply(facts, argv, env))
+            std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }
     return l;
 }
@@ -1738,6 +1756,8 @@ void usage(FILE* out) {
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
                  "                  [--laya | --laya-model DIR] [--route-policy FILE]   with --device auto, Laya classifies\n"
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
+                 "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
+                 "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
@@ -1793,6 +1813,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--laya-model") o.laya_model = next();
         else if (a == "--laya") o.laya_auto = true;
         else if (a == "--route-policy") o.route_policy = next();
+        else if (a == "--recipes") o.recipes = next();
+        else if (a == "--no-recipes") o.no_recipes = true;
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

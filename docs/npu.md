@@ -107,8 +107,8 @@ the fast lane (one launch per layer, `npu/lane.cpp`). The two layouts are not
 interchangeable, so the lane pack never aliases the forward pack. Any arch the
 lane-layout packer does not model (it is qwen3-only), a missing tokenizer, or a
 missing kernel set falls through to the unchanged per-op forward, so the route
-cannot regress a model the lane does not cover. Captured on Qwen3-0.6B
-(`evidence/gguf-npu-six/fused-lane-gguf-2026-09-28.md`): GGUF → fused lane answers
+cannot regress a model the lane does not cover. Measured on Qwen3-0.6B
+(2026-09-28): GGUF → fused lane answers
 " Paris" at 97–103 tok/s; the same GGUF → per-op forward is the 0.006–0.17 tok/s
 class. Qwen2.5-7B GGUF takes the fallback (the lane/dx designs are Qwen3-shaped:
 8 KV heads, per-head q/k RMSNorm, no projection bias).

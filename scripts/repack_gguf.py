@@ -81,6 +81,10 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
 
     cfg = {
         "model_type": ARCH_TO_MODEL_TYPE.get(arch, arch),
+        # The GGUF arch (e.g. qwen35moe) differs from the HF model_type
+        # (qwen3_5_moe); the stamp check re-resolves the converter by arch, so
+        # carry it explicitly.
+        "arch": arch,
         "hidden_size": embedding,
         "num_hidden_layers": int(_num(reader, f"{p}.block_count", 0)),
         "num_attention_heads": heads,
@@ -128,6 +132,43 @@ def write_config(gguf_path, out_dir, arch, vocab_size):
             # wrong still produces plausible output with a wrong argmax.
             "expert_gating_func": int(_num(reader, f"{p}.expert_gating_func", 1)),
         })
+    # Qwen MoE (qwen3moe / qwen35moe).  Same MoE meanings as deepseek2 above but
+    # different GGUF field names, no MLA, and all layers are MoE (no dense leading
+    # block).  The per-EXPERT intermediate must replace the dense
+    # feed_forward_length (5472 for the 30B) so the G/U/D designs ARE the expert
+    # MLP; the forward's n_expert/top_k/expert gating come from these keys.
+    if p in ("qwen3moe", "qwen35moe"):
+        cfg.update({
+            "intermediate_size": int(_num(reader, f"{p}.expert_feed_forward_length", 0)),
+            "n_expert": int(_num(reader, f"{p}.expert_count", 0)),
+            "top_k": int(_num(reader, f"{p}.expert_used_count", 0)),
+            "expert_shared": int(_num(reader, f"{p}.expert_shared_feed_forward_length", 0)),
+            "leading_dense_block_count": 0,
+            "expert_weights_norm": int(_num(reader, f"{p}.expert_weights_norm", 1)),
+            "expert_weights_scale": float(_num(reader, f"{p}.expert_weights_scale", 1.0)),
+            "expert_gating_func": 1,   # Qwen MoE gating = softmax
+        })
+        if p == "qwen35moe":
+            # GDN (linear attention) geometry + the layer-type list the forward
+            # dispatches on.  The HF config names these linear_*; the GGUF carries
+            # them under ssm.*.  attn_output_gate makes the q_proj emit q|gate
+            # (q_rows doubles), which the QKV design must know.
+            def _ssm(key, dflt=0):
+                return int(_num(reader, f"{p}.ssm.{key}", dflt))
+            _vhd = _ssm("state_size")
+            _inner = _ssm("inner_size")
+            _fai = int(_num(reader, f"{p}.full_attention_interval", 4)) or 4
+            _nl = int(cfg["num_hidden_layers"])
+            cfg.update({
+                "linear_num_key_heads": _ssm("group_count"),
+                "linear_key_head_dim": _vhd,
+                "linear_value_head_dim": _vhd,
+                "linear_num_value_heads": (_inner // _vhd) if _vhd else 0,
+                "linear_conv_kernel_dim": _ssm("conv_kernel", 4),
+                "attn_output_gate": 1,
+                "layer_types": ["full_attention" if (i % _fai == _fai - 1) else "linear_attention"
+                                for i in range(_nl)],
+            })
     # MiniCPM4 architecture scales.  The forward must apply them: the embedding
     # is scaled by 12.0 and every residual branch by scale_depth/sqrt(NL)
     # (0.2475 for 32 layers); without them the hidden state runs at the wrong
@@ -235,7 +276,8 @@ def main():
         # Re-resolve with the directory's own arch so a dir whose arch needs a
         # different converter keeps comparing against the right one.
         try:
-            _a = json.load(open(os.path.join(sys.argv[2], "config.json"))).get("model_type", "")
+            _c = json.load(open(os.path.join(sys.argv[2], "config.json")))
+            _a = _c.get("arch") or _c.get("model_type", "")
         except Exception:
             _a = ""
         if not os.environ.get("ONEBIT_Q4NX_CONVERTER"):
@@ -297,6 +339,17 @@ def main():
         except Exception:
             _c = {}
         _t = _c.get("default_tensor_type")
+        # deepseek2: converters from before 5fc52149b transpose k_b's per-head
+        # slice, which packs 16 tiles/head where the forward reads 12
+        # (kb_rows_ = qk_nope_ = 192) and segfaults. Refuse them instead of
+        # rewriting their source.
+        _kb_file = os.path.join(converter_dir, "q4nx", "models", _arch + ".py")
+        if _arch == "deepseek2" and os.path.exists(_kb_file):
+            with open(_kb_file) as f:
+                if 'transpose_slice = "k_b_proj" in nm' in f.read():
+                    print(f"repack: {_kb_file} transposes k_b (16 tiles/head; the "
+                          f"forward reads 12). Update the converter to 5fc52149b or later.")
+                    return 1
         if _t and _t != "Q4_1":
             import shutil as _shutil, tempfile as _tempfile
             run_dir = _tempfile.mkdtemp(prefix="q4nx-converter-")

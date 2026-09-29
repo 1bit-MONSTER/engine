@@ -180,7 +180,7 @@ private:
     std::vector<float> w_kb_, w_vb_;                    // [NH][N][K], N padded for k_b
     int kb_rows_ = 0;                                   // k_b's padded row count (256)
     std::vector<std::vector<float>> mla_kn_, mla_kr_, mla_v_;  // per-layer MLA caches
-    std::vector<float> moe_router_, moe_router_b_, share_g_, share_u_, share_d_;
+    std::vector<float> moe_router_, moe_router_b_, share_g_, share_u_, share_d_, share_router_;
     std::vector<float> dense_g_, dense_u_, dense_d_;    // leading dense layer only
     // Routed experts stay packed until selected: per layer the Q4NX pools them as
     // [n_expert][tiles][5120].

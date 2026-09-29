@@ -103,11 +103,19 @@ def main():
     for backend, model, extra in rows:
         if a.only and backend != a.only:
             continue
-        path = os.path.join(a.npu_models if backend == "npu" else a.models, model)
+        # An npu row is either a Q4NX model directory (under --npu-models, the
+        # existing fast lane) or a .gguf the GGUF-on-NPU route repacks itself
+        # (under --models).  The arch comes from model.json's model_type for the
+        # former and the GGUF's general.architecture for the latter.
+        npu_gguf = backend == "npu" and model.endswith(".gguf")
+        if npu_gguf:
+            path = os.path.join(a.models, model)
+        else:
+            path = os.path.join(a.npu_models if backend == "npu" else a.models, model)
         if not os.path.exists(path):
             print(f"skip {backend} {model}: not found")
             continue
-        arch = npu_model_type(path) if backend == "npu" else gguf_arch(path)
+        arch = gguf_arch(path) if (backend != "npu" or npu_gguf) else npu_model_type(path)
         cmd = [os.path.join(ROOT, "tests/serve_e2e.sh"), a.bin, path, backend] + extra
         try:
             p = subprocess.run(cmd, capture_output=True, text=True, timeout=a.timeout)

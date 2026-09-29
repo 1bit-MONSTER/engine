@@ -1,5 +1,13 @@
 {
   "repo": "convaiinnovations/laya",
   "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
-  "note": "Laya's three checkpoints (root, multilingual/, typed-decisions/) at one Hugging Face revision; scripts/fetch-laya.sh downloads exactly this revision and checks every file's hash against the Hub's file list."
+  "note": "Laya's three checkpoints (root, multilingual/, typed-decisions/) at one Hugging Face revision; scripts/fetch-laya.sh downloads exactly this revision and checks every file's hash against the Hub's file list.",
+  "gguf": {
+    "repo": "mys/laya-typed-decisions-GGUF",
+    "revision": "1e9e8ba1f5271316601e0fefd940786660bd6964",
+    "files": [
+      "laya_typed_decisions_q8_0.gguf"
+    ],
+    "note": "The typed-decisions checkpoint compiled by ggmlc (third_party/ggmlc) to a GGUF for its laya runtime; fetch-laya.sh puts it in <dir>/gguf/. Q8_0: 95.5% on tests/laya_route_cases.json, the same as the C++ scorer on the safetensors."
+  }
 }

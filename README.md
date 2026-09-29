@@ -39,6 +39,10 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonade with the engine,
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 
+> **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU, as
+> geramyL, a moderator on Lemonade's Discord, proposed. Vulkan stays the default until HRX meets the
+> gates in [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213).
+>
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
 > [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on
 > Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
@@ -54,12 +58,19 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > family (Zamba, Zamba2, BlackMamba) runs on Vulkan too, and so do its vision models, ZAYA1-VL-8B
 > and Zamba2-VL, through `1bit serve --mmproj`. Qwen3.8-27B runs in one ROCm server with Hadamard
 > W4A4 prompt processing and DFlash2 decode: 445 tok/s on a 1,838-token prompt and 40.9 tok/s
-> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). Experimental,
+> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). W4A4 covers MoE
+> experts too, and `1bit serve --long-model` sends long prompts there and short ones to Vulkan: on
+> Qwen3-Coder-30B-A3B a 16K-token prompt gets its answer at 13.1 effective tok/s against 8.6 on
+> Vulkan alone, first token 11 s sooner ([docs/serve.md](docs/serve.md#short-and-long-prompts---long-model)). Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
-> 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). Step 4, the Laya router,
-> has landed as an opt-in: `1bit serve --device auto --laya-model <dir>` picks the device per
-> request with the C++ scorer, which matches the Python reference; a decision takes 0.38 s on
-> Strix Halo ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 332,726
+> 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). GGUFs of six architectures
+> (Qwen2.5, Qwen3 MoE, Qwen3.6-35B-A3B, MiniCPM4/5, GLM-4.7-Flash) also answer on the NPU through
+> `1bit serve --device npu`: correct, not yet fast (0.006-0.17 tok/s;
+> [docs/npu.md](docs/npu.md#from-a-gguf)). DwarfStar reads 1BP packages from our fork
+> ([docs/dwarfstar.md](docs/dwarfstar.md)). Step 4, the Laya router, has landed as an opt-in:
+> `1bit serve --laya` classifies each conversation (code, prose, short, long document; 95.5% on
+> 200 labelled requests) and a measured policy picks the device; the scorer runs on HRX at
+> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 332,726
 > HF text-generation models with an architecture, 94.88% are mapped to a backend and 64.33%
 > have an architecture checked end to end on Strix Halo; a daily census keeps the counts
 > current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,

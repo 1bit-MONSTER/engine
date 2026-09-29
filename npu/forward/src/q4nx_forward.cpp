@@ -27,6 +27,7 @@
 #include "q4nx_forward.h"
 #include <fcntl.h>
 
+#include <chrono>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -369,21 +370,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         rope_dim_ = q4nx_config_int(cfg_path.c_str(), "rope_dim", 0);
         qk_nope_ = q4nx_config_int(cfg_path.c_str(), "qk_nope_head_dim", 0);
         v_head_ = q4nx_config_int(cfg_path.c_str(), "v_head_dim", 0);
-        n_expert_ = q4nx_config_int(cfg_path.c_str(), "n_expert", 0);
-        top_k_ = q4nx_config_int(cfg_path.c_str(), "top_k", 0);
-        expert_im_ = c_.IM;
-        dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
-        leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 1);
-        expert_gating_sigmoid_ =
-            q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
-        expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
         if (q_lora_ <= 0 || kv_lora_ <= 0 || rope_dim_ <= 0 || qk_nope_ <= 0 ||
-            v_head_ <= 0 || n_expert_ <= 0 || top_k_ <= 0 || expert_im_ <= 0 ||
-            dense_im_ <= 0) {
+            v_head_ <= 0) {
             fprintf(stderr, "  [mla] config incomplete (q_lora=%d kv_lora=%d rope=%d nope=%d "
-                            "v_head=%d n_expert=%d top_k=%d im=%d dense_im=%d)\n",
-                    q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, n_expert_, top_k_,
-                    expert_im_, dense_im_);
+                            "v_head=%d)\n", q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_);
             err_ = "MLA config incomplete";
             return false;
         }
@@ -391,10 +381,32 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // 256-column block (192 -> 256), which is what its 16 tiles/head show.
         kb_rows_ = qk_nope_;   /* the re-converted Q4NX packs k_b at [192][512], 12 tiles/head (verified corr 0.996926 vs the GGUF) */
         c_.HD = v_head_;
-        fprintf(stderr, "  [mla] MLA+MoE: q_lora=%d kv_lora=%d rope=%d nope=%d v_head=%d "
-                        "NH=%d n_expert=%d top%d im=%d dense_im=%d gating=%s\n",
-                q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, c_.NH, n_expert_, top_k_,
-                expert_im_, dense_im_, expert_gating_sigmoid_ ? "sigmoid" : "softmax");
+        fprintf(stderr, "  [mla] MLA: q_lora=%d kv_lora=%d rope=%d nope=%d v_head=%d NH=%d\n",
+                q_lora_, kv_lora_, rope_dim_, qk_nope_, v_head_, c_.NH);
+    }
+    // MoE params are parsed INDEPENDENTLY of mla_ so a non-MLA MoE arch (qwen3moe /
+    // qwen35moe) gets its expert geometry too; reading them only inside `if (mla_)`
+    // left n_expert_/top_k_/expert_im_ zero and the standard MoE path dead.
+    // expert_im_ is the per-EXPERT intermediate, which c_.IM already holds for a MoE
+    // config (the converter writes the per-expert FFN width as intermediate_size).
+    n_expert_ = q4nx_config_int(cfg_path.c_str(), "n_expert", 0);
+    if (n_expert_ > 0) {
+        top_k_ = q4nx_config_int(cfg_path.c_str(), "top_k", 0);
+        expert_im_ = c_.IM;
+        dense_im_ = q4nx_config_int(cfg_path.c_str(), "dense_intermediate_size", 0);
+        leading_dense_ = q4nx_config_int(cfg_path.c_str(), "leading_dense_block_count", 0);
+        expert_gating_sigmoid_ =
+            q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
+        expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
+        if (top_k_ <= 0 || expert_im_ <= 0) {
+            fprintf(stderr, "  [moe] config incomplete (n_expert=%d top_k=%d im=%d)\n",
+                    n_expert_, top_k_, expert_im_);
+            err_ = "MoE config incomplete";
+            return false;
+        }
+        fprintf(stderr, "  [moe] %sMoE: NH=%d n_expert=%d top%d im=%d dense_im=%d gating=%s\n",
+                mla_ ? "MLA+" : "", c_.NH, n_expert_, top_k_, expert_im_, dense_im_,
+                expert_gating_sigmoid_ ? "sigmoid" : "softmax");
     }
 
     Q4nxModelDims dims{};
@@ -879,6 +891,55 @@ bool Q4nxNpuForward::load_layer(int l) {
         if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, H)) return false;
     }
     if (!deq(&lw->o_proj_weight, wo_.data(), H, NH * hd)) return false;
+    if (n_expert_ > 0) {
+        // Qwen MoE layer (qwen3moe / qwen35moe): a router + top-k routed experts
+        // instead of a dense gate/up/down.  The router is bf16; its bias is OPTIONAL
+        // (Qwen MoE has none, deepseek2 does).  The experts stay pooled -- one
+        // [N][K] slice is dequantized per selected expert at decode.
+        char nm2[160];
+        auto td2 = [&](const char* fmt) -> TensorDesc* {
+            snprintf(nm2, sizeof(nm2), fmt, l);
+            return model_tensor_by_name(mw_, nm2);
+        };
+        auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!p) return false;
+            v.resize((size_t)n);
+            for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
+            return true;
+        };
+        if (!load_bf16_opt("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H))
+            { err_ = "moe router"; return false; }
+        if (!load_bf16_opt("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_))
+            moe_router_b_.clear();
+        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw) return false;
+            *p = raw; *bytes = (size_t)d->data_size / (size_t)n_expert_;
+            return true;
+        };
+        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        // Optional shared expert (qwen35moe): a 2D [expert_im][H] / [H][expert_im] pair
+        // plus its [H] gate.  Cleared when absent (qwen3moe has none).
+        auto load_share = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+        };
+        if (!load_share("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) share_g_.clear();
+        if (!load_share("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_share("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
+        return true;
+    }
     if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
     if (!deq(&lw->up_proj_weight, wu_.data(), im, H)) return false;
     if (!deq(&lw->down_proj_weight, wd_.data(), H, im)) return false;
@@ -954,6 +1015,54 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         }
         return true;
     };
+    if (n_expert_ > 0) {
+        // qwen35moe: a GDN layer's FFN is MoE, not a dense gate/up/down.  The
+        // loading mirrors the standard path's MoE branch; the FFN itself is run by
+        // the common MLP section (which sees n_expert_ > 0 and calls moe_mlp).
+        char nm2[160];
+        auto td2 = [&](const char* fmt) -> TensorDesc* {
+            snprintf(nm2, sizeof(nm2), fmt, l);
+            return model_tensor_by_name(mw_, nm2);
+        };
+        auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!p) return false;
+            v.resize((size_t)n);
+            for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
+            return true;
+        };
+        if (!load_bf16_opt("model.layers.%d.moe_router.weight", moe_router_, n_expert_ * H))
+            { err_ = "moe router"; return false; }
+        if (!load_bf16_opt("model.layers.%d.moe_router.bias", moe_router_b_, n_expert_))
+            moe_router_b_.clear();
+        auto pool = [&](const char* fmt, const uint8_t** p, size_t* bytes) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) { fprintf(stderr, "  [moe] missing %s\n", nm2); return false; }
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            if (!raw) return false;
+            *p = raw; *bytes = (size_t)d->data_size / (size_t)n_expert_;
+            return true;
+        };
+        if (!pool("model.layers.%d.mlp.gate_exps_proj.weight", &exp_g_, &exp_g_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.up_exps_proj.weight", &exp_u_, &exp_u_bytes_)) return false;
+        if (!pool("model.layers.%d.mlp.down_exps_proj.weight", &exp_d_, &exp_d_bytes_)) return false;
+        // Optional shared expert (qwen35moe): a 2D [expert_im][H] / [H][expert_im] pair
+        // plus its [H] gate.  Cleared when absent.
+        auto load_share = [&](const char* fmt, std::vector<float>& v, int rows, int cols) -> bool {
+            TensorDesc* d = td2(fmt);
+            if (!d) return false;
+            v.resize((size_t)rows * (size_t)cols);
+            const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+            return raw && dequant_any(raw, (size_t)d->data_size, rows, cols, v.data()) == 0;
+        };
+        if (!load_share("model.layers.%d.mlp.share_gate_exps_proj.weight", share_g_, expert_im_, H)) share_g_.clear();
+        if (!load_share("model.layers.%d.mlp.share_up_exps_proj.weight", share_u_, expert_im_, H)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_share("model.layers.%d.mlp.share_down_exps_proj.weight", share_d_, H, expert_im_)) { share_g_.clear(); share_u_.clear(); }
+        if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
+        return true;
+    }
     if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, H)) return false;
     if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, H)) return false;
     if (!deqT(&lw->down_proj_weight, wd_.data(), H, c_.IM)) return false;
@@ -1191,6 +1300,8 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         if (a > amax) amax = a;
     }
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
+    const bool prof = getenv("NPU_PROFILE") != nullptr;
+    const auto tp = std::chrono::steady_clock::now();
 
     // Token-invariant weights (wkey >= 0) get their own BO, packed once and
     // reused; every other call (wkey < 0: routed experts, whose weights change
@@ -1217,14 +1328,30 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         gs = &ctx.group_scales[0];
     }
 
+    const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     xrt::run r = slot ? ctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
                       : ctx.sync_and_launch(0);
+    const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ctx.wait_kernel(r);
+    const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     ctx.readback();
+    const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     out.resize((size_t)N);
     for (int n = 0; n < N; n++)
         out[(size_t)n] = (float)ctx.Cm[n] * as * (*gs)[(size_t)n];
+
+    if (prof) {
+        static double sp = 0.0, sq = 0.0, sw = 0.0, sr = 0.0;
+        static long sn = 0;
+        sp += std::chrono::duration<double, std::milli>(tl - tp).count();
+        sq += std::chrono::duration<double, std::milli>(tq - tl).count();
+        sw += std::chrono::duration<double, std::milli>(tw - tq).count();
+        sr += std::chrono::duration<double, std::milli>(tr - tw).count();
+        if (++sn % 50 == 0)
+            std::fprintf(stderr, "[prof] npu_gemm n=%ld pack=%.1f quant+launch=%.1f wait=%.1f readback=%.1f ms (N=%d)\n",
+                         sn, sp / (double)sn, sq / (double)sn, sw / (double)sn, sr / (double)sn, N);
+    }
 }
 
 // --------------------------------------------------------------------------
@@ -1267,9 +1394,13 @@ bool Q4nxNpuForward::mla_expert(const uint8_t* pool, size_t per_expert, int e,
     if (dequant_any(pool + (size_t)e * per_expert, per_expert, K, N, kn.data()) != 0)
         return false;
     out.resize((size_t)N * (size_t)K);
-    for (int k = 0; k < K; k++)
-        for (int nn = 0; nn < N; nn++)
-            out[(size_t)nn * K + k] = kn[(size_t)k * N + nn];
+    // Do NOT transpose.  The tile decode at (rows=K, cols=N) already reproduces the
+    // GGUF's flat order, and that flat sequence IS the logical [N][K] = [out][in]
+    // weight.  Verified elementwise against the GGUF per expert: reshape(N,K) gives
+    // corr 0.999198 (gate) / 0.996949 (down), while transposing gives -0.001079 /
+    // 0.000417 -- i.e. the transpose destroyed the expert entirely, making every
+    // routed expert's contribution ~10-20x wrong and flipping the top-k selection.
+    std::copy(kn.begin(), kn.end(), out.begin());
     return true;
 }
 
@@ -1326,12 +1457,14 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     krc.resize((old + 1) * (size_t)rope_dim_);
     // k_b[h] : [kh][kv_lora] (stored padded to a 32-row tile, so read kh real rows)
     for (int h = 0; h < NH; h++) {
-        // k_b: Q4NX grid [kv_lora][nope padded to 256] = [512][256], indexed flat[k*kb_rows+n].
-        // v_b: Q4NX grid [kv_lora][v_head] = [512][256], indexed flat[k*vh + n] -- pinned
-        // against llama.cpp's own tensor dump (llama-eval-callback), where this reading
-        // reproduces the oracle's layer-0 post-attention sum to 5 decimals and the
-        // [256][512] grid gives -0.454611 instead of -0.228092.  The tile GRID matters,
-        // not just the flat order: both have 16 tiles/head but a different mapping.
+        // k_b: Q4NX tile grid [kv_lora][nope padded to 256], indexed flat[n*kv_lora+k].
+        // v_b: the Q4NX tiles v_b with cols=256 while its LOGICAL row is 512 wide, so
+        // the per-head [512][256] tile grid is NOT the logical matrix.  Decoding the
+        // whole tensor at (rows=10240, cols=256) reproduces the GGUF's flat order
+        // exactly (corr 0.996860 vs the 0.996870 a faithful Q4_1 requant scores),
+        // i.e. the logical index is (h*256+n)*512 + k = out-major.  Indexing flat
+        // [k*vh+n] instead permuted the whole MLA value path; the earlier check that
+        // "pinned" it compared a single SUM, which a permutation can still match.
         const float* wk = &w_kb_[(size_t)h * (size_t)kv_lora_ * (size_t)kb_rows_];
         const float* wv = &w_vb_[(size_t)h * (size_t)kv_lora_ * (size_t)vh];
         float* dk = &kn[old * (size_t)NH * kh + (size_t)h * kh];
@@ -1343,7 +1476,7 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
         }
         for (int n = 0; n < vh; n++) {
             float s = 0.0f;
-            for (int k = 0; k < kv_lora_; k++) s += wv[(size_t)k * vh + n] * kl[k];
+            for (int k = 0; k < kv_lora_; k++) s += wv[(size_t)n * kv_lora_ + k] * kl[k];
             dv[n] = s;
         }
     }
@@ -1532,7 +1665,15 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
                             "shexp_swiglu=%.6f\n", l, moe_g, moe_u, moe_sw, moe_dn, moe_d_sum, ss);
         }
         for (float f : sd) shexp_sum += f;
-        for (int i = 0; i < H; i++) d[i] += sd[i];
+        // Qwen MoE (qwen35moe) gates the shared expert with sigmoid(x . g), a [H]
+        // vector; deepseek2 has no such gate (share_router_ empty -> scale 1).
+        float sgate = 1.0f;
+        if (!share_router_.empty()) {
+            float g = 0.0f;
+            for (int i = 0; i < H; i++) g += share_router_[i] * xn[i];
+            sgate = 1.0f / (1.0f + std::exp(-g));
+        }
+        for (int i = 0; i < H; i++) d[i] += sgate * sd[i];
     }
     if (dump) {
         double tot = 0; for (float f : d) tot += f;
@@ -1774,7 +1915,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // first token), the f32 weights are no longer read, so skip the per-token
         // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
         // keep loading every token.
-        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && weight_cached(0);
+        const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && n_expert_ == 0 && weight_cached(0);
         if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
         // MLA + MoE layers have no plain q/k/v/o or single-MLP structure, so they
         // take their own path through this loop body and skip the rest.
@@ -1927,6 +2068,16 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             rmsnorm(x.data(), pre_ff_norm_[l].data(), H, xn.data());
         } else {
             rmsnorm(x.data(), post_norm_[l].data(), H, xn.data());
+        }
+        if (n_expert_ > 0) {
+            // Qwen MoE layer (qwen3moe / qwen35moe): the FFN is router -> top-k
+            // experts, not a dense gate/up/down.  moe_mlp writes the whole FFN
+            // delta into d.  (deepseek2/GLM MoE layers never reach here -- the MLA
+            // branch above handles attn+MoE and continues.)
+            if (!moe_mlp(l, xn, d)) return false;
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
+            if (!nancheck("moe")) return false;
+            continue;
         }
         std::vector<float> act;
         if (i_gu_l >= 0) {
@@ -2085,8 +2236,25 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         }
         return true;
     }
-    const int i_qkv = idx_of(Q4NX_DESIGN_QKV);
-    const int T = designs_[i_qkv].N;                 // reuse the QKV geometry
+    // Reuse an existing GEMM geometry for the head (the variable keeps its old name
+    // for the block below).  QKV when the arch has one; the MLA/deepseek2 arch
+    // (GLM-4.7-Flash) has QA/QB/KVA/O instead, so idx_of(QKV) returned -1 and T was
+    // read out of designs_[-1] -- garbage, and the ntiles division below raised
+    // SIGFPE.  Only this NPU path uses T (the host path is a plain matvec), which is
+    // why GLM crashed here the first time the ELF path was exercised.
+    // Pick the WIDEST design with K=H for the head.  Each tile is a separate
+    // synchronous launch (~one NPU round-trip each, ~constant regardless of N),
+    // so fewer/larger tiles mean fewer launches for the same math.
+    int i_qkv = -1;
+    for (int d = 0; d < ndesigns_; d++) {
+        if (designs_[d].K != H || designs_[d].N <= 0) continue;
+        if (i_qkv < 0 || designs_[d].N > designs_[i_qkv].N) i_qkv = d;
+    }
+    if (i_qkv < 0) {
+        err_ = "LM head: no GEMM design with K=H available";
+        return false;
+    }
+    const int T = designs_[i_qkv].N;
     const int ntiles = (NV + T - 1) / T;
     logits.assign(NV, 0.0f);
 

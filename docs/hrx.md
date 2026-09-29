@@ -257,9 +257,9 @@ BF16 is 0.063.
   ggml's scheduler handed it nodes it could not dispatch and the graph failed
   (`unsupported HRX node`) with no CPU fallback. It now claims a node only when
   its dispatcher can execute it, except nodes already in HRX memory (KV cache
-  views), which cannot move. Leaf (`NONE`) nodes count as covered. AMD's IQ4_NL
-  and IQ4_XS matmul kernels, and GET_ROWS for IQ4_XS and batched IQ3_S, give wrong
-  values, so those nodes are left to the CPU.
+  views), which cannot move. Leaf (`NONE`) nodes count as covered. GET_ROWS for batched IQ3_S
+  gives wrong values, so those nodes are left to the CPU. IQ4_NL and IQ4_XS were left to the CPU too
+  until [llama.cpp #41](https://github.com/1bit-MONSTER/llama.cpp/pull/41) (below).
 - **Kernels for ops HRX sent to the CPU** ([llama.cpp #24](https://github.com/1bit-MONSTER/llama.cpp/pull/24)):
   a batched F16 matmul (`ggml_grouped_mul_mat_f16_f32`, e.g. ZAYA's grouped convolution, whose
   weights the loader can now place on HRX), and short-row kernels in `small_rows_f32.loom`:
@@ -411,9 +411,14 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
 
 ## Not yet
 
-- **Fast sub-4-bit and IQ4 kernels on HRX.** With our patches the UD files are
-  correct on `HRX0` but slow, since IQ4_XS, IQ2 and IQ3_S matmuls fall back to the
-  CPU. AMD's IQ4_XS / IQ4_NL kernels need fixing upstream.
+- **IQ4_NL / IQ4_XS on HRX ([llama.cpp #41](https://github.com/1bit-MONSTER/llama.cpp/pull/41)).**
+  AMD's IQ4 nibble packers remapped every table index (XOR 12) for a lowering that does not apply on
+  gfx1151, in `motifs/dequant.loom` and again in the Q5_K/IQ4_XS prefill kernel, so IQ4 was declined
+  and ran on the CPU. #41 fixes both copies and the q8-plane SwiGLU path they exposed. Qwen3.8-27B
+  UD-Q4_K_XL: 91 graph splits -> 1, wikitext PPL 5.8294 (CPU 5.8288), decode 7.25 -> 9.0 tok/s
+  (Vulkan 12.5); `test-backend-ops -b HRX0` passes the IQ4 MUL_MAT and GET_ROWS cases. The rest of
+  the 27B gap is Q5_K / IQ4_XS decode kernels reading at ~105-176 GB/s against Vulkan's ~220.
+- **Fast sub-4-bit kernels on HRX.** IQ2 and IQ3_S matmuls still fall back to the CPU.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
   They are kept on `1bit/hrx2-archive` until they are ported.
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows

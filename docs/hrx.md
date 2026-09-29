@@ -162,6 +162,14 @@ were observed.
   5.4K-token prompt in a new process 4.46 -> 3.43 s, first short prompt 0.47 -> 0.22 s, with
   identical output. `GGML_HRX_JIT_CACHE=0` turns it off; it is off while a Loom sanitizer is set.
   Deleting the directory is always safe.
+- **Fused residual scale (llama.cpp #35).** ZAYA scales both residual branches twice per layer,
+  `(x + bx) * sx + (r + br) * sr`, which ran as up to nine ADD / MUL dispatches per layer. Each side
+  now runs as one dispatch (`common.res_scale_pair.*`, `ops/res_scale_pair_f32.loom`): 3,366 -> 3,165
+  dispatches per token, bitwise the same output, ZAYA1-8B HRX0 decode 67.0 -> ~69.6 tok/s and
+  pp512 2,109 -> 2,183. `GGML_HRX_DISABLE_DISPATCH=res_scale_pair` turns it off. At decode most of
+  a ZAYA token is small dispatches and the ~1.8 us gaps between them, not matmuls; the profiler
+  (`HRX_PROFILE_MODE=dispatch`) shows which ones. Profile through `llama-server`: `llama-bench`
+  under the profiler fails.
 
 ### Known issues on `HRX0`
 

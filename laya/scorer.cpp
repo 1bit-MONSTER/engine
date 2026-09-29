@@ -168,6 +168,9 @@ void geglu(const float* h, const float* Wi, const float* Wo, int rows, float* ou
 
 }  // namespace
 
+Scorer::Scorer() = default;
+Scorer::~Scorer() = default;
+
 bool Scorer::load(const std::string& model_dir) {
     err_.clear();
     Safetensors r;
@@ -237,13 +240,12 @@ bool Scorer::load(const std::string& model_dir) {
     if (!load_t("temperature", temperature_)) return false;
 
     // tokenizer (special tokens by name)
-    tok_path_ = model_dir + "/tokenizer/tokenizer.json";
     try {
-        const onebit::npu::Tokenizer tok(tok_path_);
-        cls_id_ = tok.token_id("[CLS]");
-        sep_id_ = tok.token_id("[SEP]");
-        mask_id_ = tok.token_id("[MASK]");
-        pad_id_ = tok.token_id("[PAD]");
+        tok_ = std::make_unique<onebit::npu::Tokenizer>(model_dir + "/tokenizer/tokenizer.json");
+        cls_id_ = tok_->token_id("[CLS]");
+        sep_id_ = tok_->token_id("[SEP]");
+        mask_id_ = tok_->token_id("[MASK]");
+        pad_id_ = tok_->token_id("[PAD]");
     } catch (const std::exception& e) {
         err_ = std::string("load tokenizer: ") + e.what();
         return false;
@@ -285,13 +287,11 @@ std::vector<int> encode(const onebit::npu::Tokenizer& tok, const std::string& te
 bool Scorer::score(const std::string& state, const std::vector<Question>& questions,
                    std::vector<Answer>& answers, RawOutput* raw) {
     err_.clear();
-    std::unique_ptr<onebit::npu::Tokenizer> tok;
-    try {
-        tok = std::make_unique<onebit::npu::Tokenizer>(tok_path_);
-    } catch (const std::exception& e) {
-        err_ = std::string("load tokenizer: ") + e.what();
+    if (!tok_) {
+        err_ = "scorer not loaded";
         return false;
     }
+    const onebit::npu::Tokenizer* tok = tok_.get();
     const int N = (int)questions.size();
     if (N == 0) { answers.clear(); return true; }
 

@@ -25,9 +25,14 @@
 #pragma once
 
 #include <cstdint>
+#include <memory>
 #include <string>
 #include <utility>
 #include <vector>
+
+namespace onebit::npu {
+class Tokenizer;
+}
 
 namespace onebit::laya {
 
@@ -59,6 +64,9 @@ struct RawOutput {
 
 class Scorer {
 public:
+    Scorer();
+    ~Scorer();
+
     // Loads model_dir holding model.safetensors, rl_agent_config.json and
     // tokenizer/tokenizer.json (the pinned Hugging Face checkpoint layout).
     bool load(const std::string& model_dir);
@@ -102,7 +110,7 @@ private:
     std::vector<float> temperature_;                        // [3]
     std::vector<std::pair<std::string, float>> temperature_by_options_;
 
-    std::string tok_path_;
+    std::unique_ptr<onebit::npu::Tokenizer> tok_;  // loaded once: reading tokenizer.json costs ~50 ms
     std::string err_;
 };
 

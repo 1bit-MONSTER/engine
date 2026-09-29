@@ -1,0 +1,21 @@
+{
+  "about": "Tuned llama-server settings per model and route, applied by `1bit serve` (docs/recipes.md). A recipe never overrides a flag already on the backend's command line or a variable already set. Every recipe carries the measurement behind it; re-measure with tools/bench.py before changing one.",
+  "recipes": [
+    {
+      "id": "rotated-moe-ub1024",
+      "match": {"device": ["rocm"], "hadamard_q4_0": true, "moe": true},
+      "args": ["-ub", "1024"],
+      "why": "W4A4 expert matmuls fill the matrix units better with 1024-token micro-batches; 2048 is no better.",
+      "measured": "Qwen3-Coder-30B-A3B-Q4_0-H32, llama-bench pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; decode unchanged. Dense Qwen3.8-27B-H32 is slower with it (1,838-token prompt 491-495 -> 471-473 tok/s), so dense files keep 512.",
+      "source": "engine #205, #229"
+    },
+    {
+      "id": "dflash-p-min-0",
+      "match": {"drafter": ["dflash"]},
+      "args": ["--spec-draft-p-min", "0"],
+      "why": "A DFlash block is only worth drafting whole; the ROCm tree's default p-min of 0.75 cuts it short (upstream's default is 0).",
+      "measured": "Qwen3.8-27B-H32 + DFlash2 on the lean ROCm route: mean accepted block 5.4 -> 6.7 tokens on code.",
+      "source": "engine #194"
+    }
+  ]
+}

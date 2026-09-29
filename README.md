@@ -36,6 +36,11 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census
 
+Every tuned setting `1bit serve` gives a backend is a recipe with its measurement attached
+([docs/recipes.md](docs/recipes.md)), and the serve numbers in these docs come from
+`tools/bench.py`, which A/B-measures configurations against a baseline in the same run
+([docs/bench.md](docs/bench.md)).
+
 Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonade with the engine,
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 

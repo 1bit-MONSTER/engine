@@ -189,6 +189,15 @@ processing and DFlash2 decode from one server, 477 t/s prompt and 41.1 / 26.7 to
 `--spec-draft-p-min 0` unless `--mtp-p-min` is given, and without `--mtp-max` drafts the
 drafter's block minus one (its `dflash.block_size`; 16 when the file does not say).
 
+## Recipes (`--recipes`, `--no-recipes`)
+
+Tuned llama-server settings that depend on the model and route, such as a MoE file's
+micro-batch size or a DFlash drafter's p-min, are recipes in `config/recipes.json`. Each one
+carries the measurement behind it. Serve prints each recipe it applies. Anything serve sets
+itself wins over a recipe. `--recipes FILE` replaces the built-in set and `--no-recipes` turns
+recipes off ([recipes.md](recipes.md)). To measure a setting before making it a recipe, use
+[`tools/bench.py`](bench.md).
+
 ## MoE models larger than memory (`--moe-slots`)
 
 `--moe-slots N` (with `--device vulkan`) keeps a MoE model's routed experts in the file and

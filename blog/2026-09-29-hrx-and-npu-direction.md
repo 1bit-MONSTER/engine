@@ -19,7 +19,7 @@ summary: The engine is heading to HRX plus the NPU. Laya's scorer already runs o
 
 # Where the engine is going: HRX and the NPU
 
-Reviewing the Laya work, geramyL, a moderator on Lemonade's Discord, put it plainly: we want it on the NPU, a Vulkan version
+Reviewing the Laya work, [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, put it plainly: we want it on the NPU, a Vulkan version
 already exists, and the stack is HRX + Loom + NPU. They were right, and not only for Laya. The
 engine is heading to AMD's HRX backend, whose kernels we write in Loom, plus the NPU. Vulkan
 stays the default until HRX meets the gates in

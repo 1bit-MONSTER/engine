@@ -25,7 +25,8 @@
 #   - each class reaches its device, with X-1bit-Route "<class> <confidence> <device>",
 #   - the daemon gets serve's question: the three non-long_doc classes, the request as state,
 #   - a request of 1024 characters or more is long_doc without asking the daemon,
-#   - --laya-model FILE.gguf without ggmlc's laya fails and says how to build it.
+#   - --laya-model FILE.gguf without ggmlc's laya fails and says how to build it,
+#   - ONEBIT_LAYA_DEVICE=npu without the NPU add-on (laya/encoder.h) fails and says how to build it.
 #
 # usage: tests/laya_gguf_route.sh path/to/1bit
 set -uo pipefail
@@ -66,6 +67,9 @@ nobin=$(env -u ONEBIT_LAYA_GGML "$bin" serve -m "$scratch/tiny.gguf" --device au
     --laya-model "$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf" --port "$port" \
     --llama-server "$here/fake_backend_route.py" 2>&1)
 check "--laya-model FILE.gguf without ggmlc's laya says how to build it" '[[ "$nobin" == *ONEBIT_LAYA_GGML* ]]'
+nonpu=$(ONEBIT_LAYA_DEVICE=npu ONEBIT_LAYA_MODEL="$scratch/laya" "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya \
+    --port "$port" --llama-server "$here/fake_backend_route.py" 2>&1)
+check "ONEBIT_LAYA_DEVICE=npu without the NPU add-on says how to build it" '[[ "$nonpu" == *ONEBIT_NPU_PRIVATE* ]]'
 
 LAYA_LOG="$scratch/daemon.log" ONEBIT_LAYA_GGML="$scratch/laya-daemon.py" ONEBIT_LAYA_MODEL="$scratch/laya" \
     "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya --route-policy "$here/route-policy-e2e.json" \

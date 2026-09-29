@@ -399,7 +399,21 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
 
     std::vector<float> hn((size_t)N * L * D), qkv((size_t)N * L * 3072), attn_out((size_t)N * L * D);
     std::vector<float> q((size_t)N * NHEAD * L * HD), k((size_t)N * NHEAD * L * HD), v((size_t)N * NHEAD * L * HD);
-    for (int li = 0; li < NLAYER; ++li) {
+    // a set encoder (laya/encoder.h) takes each sequence's rows; if it declines one, the CPU runs all
+    bool encoded = false;
+    if (encoder_) {
+        std::vector<float> out(h);
+        encoded = true;
+        for (int b = 0; b < N && encoded; ++b)
+            encoded = encoder_(out.data() + (size_t)b * L * D, L, (int)seqs[b].size());
+        if (encoded) {
+            h.swap(out);
+            encoded_ += N;
+        } else {
+            declined_ += N;
+        }
+    }
+    for (int li = 0; li < NLAYER && !encoded; ++li) {
         LayerW& Lw = layers_[li];
         bool is_full = (li % 3 == 0);
         const auto& cs = is_full ? full_cs : slid_cs;

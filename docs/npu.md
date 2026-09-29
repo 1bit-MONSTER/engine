@@ -342,6 +342,9 @@ The engine keeps only the hook (`npu/private_route.h`):
   Qwen3.6-35B-A3B NPU route is not part of this build; build with
   -DONEBIT_NPU_PRIVATE=<npu-kernels checkout>". The fast lane is unaffected.
 
+The add-on may also register an encoder for the Laya router (`laya/encoder.h`, docs/laya.md:
+`ONEBIT_LAYA_DEVICE=npu`).
+
 `tests/npu_private_route_test.cpp` (ctest `npu_private_route`, in CI) checks the registry
 and that message; the add-on brings its own tests.
 

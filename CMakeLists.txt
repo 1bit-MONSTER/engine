@@ -297,7 +297,7 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/route_policy_default.h
      "// generated from config/route-policy.json by CMakeLists.txt\n#pragma once\n"
      "static const char kDefaultRoutePolicyJson[] = R\"ONEBITPOLICY(${ONEBIT_ROUTE_POLICY_JSON})ONEBITPOLICY\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/route-policy.json)
-add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp laya/policy.cpp)
+add_library(onebit_laya STATIC laya/scorer.cpp laya/safetensors.cpp laya/route.cpp laya/policy.cpp laya/encoder.cpp)
 target_include_directories(onebit_laya PUBLIC laya PRIVATE ${CMAKE_BINARY_DIR}/generated)
 target_link_libraries(onebit_laya PUBLIC onebit_npu nlohmann_json::nlohmann_json)
 # The engine binary gets `1bit route` and per-request routing through the scorer.
@@ -313,6 +313,9 @@ if(ONEBIT_LAYA_GGML)
 endif()
 
 add_executable(laya_gate tests/laya_gate.cpp)
+add_executable(laya_encoder_test tests/laya_encoder_test.cpp)
+target_link_libraries(laya_encoder_test PRIVATE onebit_laya)
+add_test(NAME laya_encoder COMMAND laya_encoder_test)
 add_executable(laya_classify_eval tests/laya_classify_eval.cpp)
 target_link_libraries(laya_classify_eval PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 target_link_libraries(laya_gate PRIVATE onebit_laya nlohmann_json::nlohmann_json)

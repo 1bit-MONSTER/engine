@@ -78,10 +78,10 @@ void parallel_ranges(int n, int t, F fn) {
 }
 
 // out[m,k] = in[m,n] @ W^T[k,n] + bias[k]. The output columns are split across threads; every
-// sum has one fixed order (eight lanes over the input, then the lanes in turn, then the tail), so
+// sum has one fixed order (sixteen lanes over the input, then the lanes in turn, then the tail), so
 // the result is the same for any number of threads, bit for bit, and the lanes vectorize.
 void linear(const float* in, const float* W, const float* bias, int m, int n, int k, float* out) {
-    constexpr int V = 8;
+    constexpr int V = 16;
     const int nv = n / V * V;
     // Each weight row is read once per four input rows; the four rows' sums are independent.
     auto cols = [&](int j0, int j1) {

@@ -22,7 +22,7 @@ test drives classify() and report() against synthetic batches and a synthetic re
 (the same approach tests/registry_gaps_test.py takes for the gap guard), then checks the
 committed registry still parses and still maps a known class.
 
-No network: the listing walk (sweep_newest) is exercised by the workflow and the daily
+No network: the listing walk (sweep_newest) is exercised by the daily
 timer, not here.
 """
 import io

@@ -17,8 +17,7 @@
 # census-watch.sh — daily HF new-model watcher entry point
 #
 # Wraps tools/census_watch.py so the daily watch is one command, usable from the systemd
-# units (scripts/1bit-census-watch.{service,timer}) and the GitHub Actions workflow
-# (.github/workflows/census-watch.yml). The automation is reproducible from the repo
+# units (scripts/1bit-census-watch.{service,timer}) or by hand. The automation is reproducible from the repo
 # instead of living ad-hoc on one box.
 #
 # What it does: polls the newest HF text-generation models, reads each one's architecture

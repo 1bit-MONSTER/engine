@@ -122,11 +122,11 @@ per-model fetch and no compiled probe: the registry is generated data, keyed by 
 architecture class the census counts.
 
 Exit 0 means every newest model is mapped; **exit 1 is the alert** — a class arrived that
-no backend accepts. It is run by the `census-watch.yml` workflow daily at 04:30 UTC (ahead
-of the 05:17 sweep) and by the systemd timer on the development box
-(`scripts/1bit-census-watch.{service,timer}`, from the `~/census-main` worktree that
-tracks `origin/main`). The workflow files a deduped `census-watch` issue; the timer marks
-its unit failed, and every run lands in `~/.1bit/logs/census-watch-*.log`.
+no backend accepts. It is run daily at 04:30 UTC (ahead of the 05:17 sweep) by the systemd
+timer on the development box (`scripts/1bit-census-watch.{service,timer}`, from the
+`~/census-main` worktree that tracks `origin/main`). The timer marks its unit failed, and
+every run lands in `~/.1bit/logs/census-watch-*.log`. A GitHub Actions path that files an
+alert issue needs `issues: write`, so it waits for an RFC.
 
 A class the watcher flags is one of two things, and the run says which:
 

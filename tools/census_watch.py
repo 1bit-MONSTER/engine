@@ -43,7 +43,7 @@ time it is seen and then remembered, so a routine gated upload never fails a run
 only genuinely uncovered classes are the alert.
 
 The daily systemd timer on the development box (scripts/1bit-census-watch.{service,timer})
-and the census-watch workflow both run scripts/census-watch.sh, which wraps this.
+runs scripts/census-watch.sh, which wraps this.
 """
 import argparse
 import json

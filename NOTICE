@@ -176,3 +176,13 @@ cpp-httplib (v0.47.0)
   https://github.com/yhirose/cpp-httplib
   Copyright (c) 2017 yhirose
   License: MIT
+
+-------------------------------------------------------------------------------
+Tools that scripts under tools/ drive (installed separately, not redistributed)
+-------------------------------------------------------------------------------
+
+Hyperloom (hyperloom-inference-optimizer 1.0.0, AMD's agentic inference optimizer)
+  https://rocm.docs.amd.com/projects/hyperloom/en/latest/
+  Copyright (c) 2026 Advanced Micro Devices, Inc.
+  License: MIT. tools/hyperloom/ patches a local install (adds a gfx1151 GPU type,
+  lets agents use the claude CLI login) by matching short lines of its source.

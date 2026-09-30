@@ -4,28 +4,28 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 322679,
-  "mapped_pct": 96.79,
-  "checked_models": 218407,
-  "checked_pct": 65.51,
+  "mapped_models": 322777,
+  "mapped_pct": 96.82,
+  "checked_models": 218505,
+  "checked_pct": 65.54,
   "per_backend": {
    "vulkan": {
-    "mapped": 322312,
-    "checked": 218407,
-    "mapped_pct": 96.68,
-    "checked_pct": 65.51
+    "mapped": 322410,
+    "checked": 218505,
+    "mapped_pct": 96.71,
+    "checked_pct": 65.54
    },
    "hrx": {
-    "mapped": 322342,
-    "checked": 218390,
-    "mapped_pct": 96.69,
-    "checked_pct": 65.51
+    "mapped": 322440,
+    "checked": 218488,
+    "mapped_pct": 96.72,
+    "checked_pct": 65.54
    },
    "zinc": {
-    "mapped": 236766,
-    "checked": 34391,
-    "mapped_pct": 71.02,
-    "checked_pct": 10.32
+    "mapped": 236864,
+    "checked": 34489,
+    "mapped_pct": 71.05,
+    "checked_pct": 10.35
    },
    "npu": {
     "mapped": 180394,
@@ -66,10 +66,6 @@
    {
     "architecture": "MBartForConditionalGeneration",
     "models": 110
-   },
-   {
-    "architecture": "OpensciForCausalLM",
-    "models": 98
    },
    {
     "architecture": "K2HorizonForCausalLM",
@@ -133,6 +129,10 @@
    },
    {
     "architecture": "GPJTGPT2ModelForCausalLM",
+    "models": 42
+   },
+   {
+    "architecture": "RoleSLM",
     "models": 42
    }
   ]

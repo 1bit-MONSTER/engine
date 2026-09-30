@@ -717,6 +717,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         const char* keep_split = std::getenv("ONEBIT_HRX_DECODE_SPLIT");
         if (device == "hrx" && keep_split && std::string(keep_split) == "0")
             env.push_back("GGML_HRX_DISABLE_DISPATCH=decode_split");
+        // Qwen3.5 / Qwen3.8 (gated delta net) decode one sequence per batch on HRX0. Without
+        // --parallel, llama-server's own default opens several slots, and a second concurrent
+        // request then fails (HTTP 500) at the multi-sequence softplus / GATED_DELTA_NET: one slot.
+        if (device == "hrx" && o.parallel == 0) {
+            const std::string arch = gguf_architecture(o.model);
+            if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") argv.insert(argv.end(), {"-np", "1"});
+        }
     } else if (device == "ds4") {
         // DwarfStar: its own GGUF layouts only; it opens its port after the model has loaded
         argv = {o.ds4.empty() ? default_ds4() : o.ds4, "-m", o.model,

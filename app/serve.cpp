@@ -212,6 +212,21 @@ bool hadamard_q4_0(const std::string& model) {
            gguf_int(model, "onebit.hadamard_q4_0") == 32;
 }
 
+// A PrismML model (Ternary Bonsai): prism.hadamard.* says its weights are stored rotated by a
+// Walsh-Hadamard transform. Our llama.cpp (the HRX build, src/llama-hadamard.cpp) rotates the
+// activations to match; upstream llama.cpp would load the file and answer garbage.
+bool prism_hadamard(const std::string& model) {
+    return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
+           gguf_int(model, "prism.hadamard.version") > 0;
+}
+
+// PrismML's own ternary types (general.file_type PQ2_0 / PTQ1_0 in its fork): no pinned
+// llama.cpp reads them; tools/ternary_to_q4_0.py writes the same weights as Q4_0.
+bool prism_ternary_types(const std::string& model) {
+    const long long ft = gguf_int(model, "general.file_type");
+    return ft == 128 || ft == 129 || ft == 141 || ft == 142 || ft == 143;
+}
+
 // A 1BP package (1bit-MONSTER's model format; our DwarfStar fork reads version 5, its
 // docs/1BP.md): its first four bytes are "1BP\0".
 bool onebp_file(const std::string& model) {
@@ -1109,6 +1124,18 @@ int serve_child(const Options& given) {
         if (o.laya_auto || !o.laya_model.empty())
             throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on rocm only");
         std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
+    }
+    if (prism_hadamard(o.model)) {
+        if (prism_ternary_types(o.model))
+            throw std::runtime_error(o.model + " stores PrismML's ternary types: convert it first with "
+                                     "tools/ternary_to_q4_0.py (the same weights as Q4_0), docs/hrx.md");
+        // a rotated file has one route: our llama.cpp on HRX, which rotates the activations
+        if (o.device == "auto") o.device = "hrx";
+        if (o.device != "hrx")
+            throw std::runtime_error(o.model + " is Hadamard-folded (prism.hadamard): it runs on --device hrx only, docs/hrx.md");
+        if (o.laya_auto || !o.laya_model.empty())
+            throw std::runtime_error("--laya routes among devices; a Hadamard-folded file runs on hrx only");
+        std::fprintf(stderr, "1bit serve: %s is Hadamard-folded (prism.hadamard): HRX route\n", o.model.c_str());
     }
     if (onebp_file(o.model)) {
         // DwarfStar (our fork) is the engine's 1BP reader

@@ -185,10 +185,41 @@ were observed.
   reference kernel and `check.case` differentials that pass under `iree-test-loom --sanitizer=access`.
   `GGML_HRX_DISABLE_DISPATCH=zaya.cca` turns the two ZAYA kernels off for comparison.
 
+### Ternary Bonsai (PrismML's Hadamard-folded GGUFs)
+
+PrismML's [Ternary-Bonsai-2-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) is Qwen3.8-27B
+trained to weights of -1, 0 and +1, with one fp16 scale per 128 weights. It runs on `HRX0`:
+
+```sh
+tools/ternary_to_q4_0.py Ternary-Bonsai-2-27B-PTQ1_0.gguf Ternary-Bonsai-2-27B-Q4_0.gguf
+1bit serve -m Ternary-Bonsai-2-27B-Q4_0.gguf          # --device auto picks hrx for this file
+```
+
+- **The weights.** PrismML's PTQ1_0 and PQ2_0 types are not in any llama.cpp the engine pins.
+  `tools/ternary_to_q4_0.py` writes the same weights as Q4_0 (q = trit + 8 with the group's own
+  fp16 scale in each of its four blocks), so nothing is lost: every group is decoded back and
+  compared before the file is kept, and `tests/ternary_to_q4_0_test.py` checks it against
+  PrismML's own encoder. The file is 14.1 GiB instead of 5.5; a ternary kernel for HRX would win
+  that back.
+- **The rotation.** Bonsai stores almost every matmul weight rotated by a 1024-point
+  Walsh-Hadamard transform with fixed signs (`prism.hadamard.*` keys), and the activations have to
+  be rotated to match. Our llama.cpp does that (`src/llama-hadamard.{h,cpp}`, llama.cpp #34,
+  following PrismML's implementation): a plain F32 matmul against the rotation matrix before each
+  folded weight, the inverse after the token-embedding lookup, and a check on the first graph that
+  no folded weight is used without it. Upstream llama.cpp would load the file and answer garbage,
+  so `1bit serve` sends a `prism.hadamard` file to `hrx` only, and refuses a file still in
+  PrismML's own types with the converter's name (`tests/prism_route.sh`).
+- **Checked.** Against the F16 model on the CPU in PrismML's own fork, wikitext-2 running
+  perplexity on `HRX0` is 7.962 / 10.408 / 10.171 at chunks 5 / 10 / 15 (CPU: 7.958 / 10.382 /
+  10.142), the difference Q4_0's 8-bit activations make. Files without the keys build the same graph
+  as before.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
-  unsupported 3-D MUL_MAT; use `-b 512`.
+  unsupported 3-D MUL_MAT; use `-b 512`. On Qwen3.5 / Qwen3.8 (Bonsai too) the gated delta net runs
+  one sequence per batch, so `serve` gives these models one slot on HRX and refuses `--parallel`
+  (`--parallel N` under "Not yet" below).
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
 - **Decode-split flash attention is on.** `flash_attention_decode_split_next_q8` used to give
   nondeterministic attention on HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140)) and

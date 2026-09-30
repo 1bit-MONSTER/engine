@@ -78,6 +78,7 @@ add_test(NAME hadamard_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hadamard_route.sh
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
+add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME long_route COMMAND ${CMAKE_SOURCE_DIR}/tests/long_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.

@@ -309,15 +309,24 @@ included). Decode is 256 greedy tokens on the code / prose / short prompts (best
 
 | Qwen3.8-27B-Q4_0-H32, lean ROCm route | Prompt t/s | Decode tok/s |
 |---|---|---|
-| no drafter | 558 / 550 | 13.2 / 13.2 / 13.6 |
-| `--dflash` (DFlash2 Q8_0) | **521** / **516** | **42.1** / **24.9** / 13.6 |
+| no drafter | 559 / 546 | 13.1 / 13.1 / 13.5 |
+| `--dflash` (DFlash2 Q8_0) | **518** / 486 | **46.0** / **28.4** / **17.6** |
 
-Before the prefill kernel of ROCmFPX#5, the same run measured 502 / 494 and 470 / 467.
+The `--dflash` prompt median is low because one noisy round pulled it down; its best matches the
+earlier runs.
 
-The `--dflash` row drafted with p-min 0. Serve now passes 0.4 on this route (recipe
-`rocm-dflash-p-min-0.4`, [recipes.md](recipes.md)). That stops a block at the first guess the
-selector is less than 40% sure of. Medians, code / prose / short: 41.9 / 26.8 / 16.7 tok/s, against
-41.9 / 24.8 / 13.4 at 0 in the same run.
+How the decode got there, as measured with this tool:
+
+- **p-min 0.4.** Serve passes it on this route (recipe `rocm-dflash-p-min-0.4`,
+  [recipes.md](recipes.md)). A block stops at the first guess the selector is less than 40% sure
+  of. Medians, code / prose / short: 41.9 / 26.8 / 16.7 tok/s, against 41.9 / 24.8 / 13.4 at 0.
+- **A row-tiled Q4_0 kernel for 8-column verification batches** (ROCmFPX#6, found by KernelForge,
+  [tools/kernelforge](../tools/kernelforge/README.md)). One warp computes 4 rows, so each
+  column's activations are loaded once and each weight is unpacked once for all 8 columns. Its
+  output is bit for bit the old kernel's. Qwen3.8-27B 8-token batches: 71.3 -> 78.3 tok/s.
+
+The earlier states, same tool: before ROCmFPX#5's prefill kernel, 502 / 494 (no drafter) and 470 /
+467 (DFlash2) prompt; with it but before these two, 516 prompt and 42.1 / 24.9 / 13.6 decode.
 
 Mean accepted block: 6.54 tokens on code, 4.23 on prose, in line with upstream on this drafter
 (6.71 / 4.25). Greedy output matches the no-drafter run on the code and short prompts; on prose

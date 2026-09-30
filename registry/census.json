@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 322777,
-  "mapped_pct": 96.82,
-  "checked_models": 218505,
-  "checked_pct": 65.54,
+  "mapped_models": 322856,
+  "mapped_pct": 96.84,
+  "checked_models": 218584,
+  "checked_pct": 65.57,
   "per_backend": {
    "vulkan": {
-    "mapped": 322410,
-    "checked": 218505,
-    "mapped_pct": 96.71,
-    "checked_pct": 65.54
+    "mapped": 322489,
+    "checked": 218584,
+    "mapped_pct": 96.73,
+    "checked_pct": 65.57
    },
    "hrx": {
-    "mapped": 322440,
-    "checked": 218488,
-    "mapped_pct": 96.72,
-    "checked_pct": 65.54
+    "mapped": 322519,
+    "checked": 218567,
+    "mapped_pct": 96.74,
+    "checked_pct": 65.56
    },
    "zinc": {
-    "mapped": 236864,
+    "mapped": 236943,
     "checked": 34489,
-    "mapped_pct": 71.05,
+    "mapped_pct": 71.07,
     "checked_pct": 10.35
    },
    "npu": {
@@ -74,10 +74,6 @@
    {
     "architecture": "RwkvForCausalLM",
     "models": 86
-   },
-   {
-    "architecture": "DynamicSlidingWindowForCausalLM",
-    "models": 79
    },
    {
     "architecture": "Glm5NextForConditionalGeneration",
@@ -133,6 +129,10 @@
    },
    {
     "architecture": "RoleSLM",
+    "models": 42
+   },
+   {
+    "architecture": "SlidingWindowForCausalLM",
     "models": 42
    }
   ]

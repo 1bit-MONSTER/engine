@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 322856,
-  "mapped_pct": 96.84,
-  "checked_models": 218584,
-  "checked_pct": 65.57,
+  "mapped_models": 322924,
+  "mapped_pct": 96.86,
+  "checked_models": 218652,
+  "checked_pct": 65.59,
   "per_backend": {
    "vulkan": {
-    "mapped": 322489,
-    "checked": 218584,
-    "mapped_pct": 96.73,
-    "checked_pct": 65.57
+    "mapped": 322557,
+    "checked": 218652,
+    "mapped_pct": 96.75,
+    "checked_pct": 65.59
    },
    "hrx": {
-    "mapped": 322519,
-    "checked": 218567,
-    "mapped_pct": 96.74,
-    "checked_pct": 65.56
+    "mapped": 322587,
+    "checked": 218635,
+    "mapped_pct": 96.76,
+    "checked_pct": 65.58
    },
    "zinc": {
-    "mapped": 236943,
+    "mapped": 237011,
     "checked": 34489,
-    "mapped_pct": 71.07,
+    "mapped_pct": 71.09,
     "checked_pct": 10.35
    },
    "npu": {
@@ -88,10 +88,6 @@
     "models": 71
    },
    {
-    "architecture": "TransformerForCausalLM",
-    "models": 68
-   },
-   {
     "architecture": "CacaForCausalLM",
     "models": 55
    },
@@ -134,6 +130,10 @@
    {
     "architecture": "SlidingWindowForCausalLM",
     "models": 42
+   },
+   {
+    "architecture": "LLaDA2MoeModelLM",
+    "models": 40
    }
   ]
  },

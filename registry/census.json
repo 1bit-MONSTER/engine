@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 316257,
-  "mapped_pct": 94.86,
-  "checked_models": 214375,
-  "checked_pct": 64.3,
+  "mapped_models": 316746,
+  "mapped_pct": 95.01,
+  "checked_models": 214390,
+  "checked_pct": 64.31,
   "per_backend": {
    "vulkan": {
-    "mapped": 316257,
-    "checked": 214375,
-    "mapped_pct": 94.86,
-    "checked_pct": 64.3
+    "mapped": 316746,
+    "checked": 214390,
+    "mapped_pct": 95.01,
+    "checked_pct": 64.31
    },
    "hrx": {
-    "mapped": 315920,
-    "checked": 214358,
-    "mapped_pct": 94.76,
+    "mapped": 316409,
+    "checked": 214373,
+    "mapped_pct": 94.91,
     "checked_pct": 64.3
    },
    "zinc": {
-    "mapped": 232708,
+    "mapped": 232730,
     "checked": 34333,
-    "mapped_pct": 69.8,
+    "mapped_pct": 69.81,
     "checked_pct": 10.3
    },
    "npu": {
@@ -64,10 +64,6 @@
     "models": 240
    },
    {
-    "architecture": "BertLMHeadModel",
-    "models": 212
-   },
-   {
     "architecture": "MobileLLMForCausalLM",
     "models": 176
    },
@@ -78,10 +74,6 @@
    {
     "architecture": "MixFormerSequentialForCausalLM",
     "models": 156
-   },
-   {
-    "architecture": "RobertaForCausalLM",
-    "models": 139
    },
    {
     "architecture": "NanochatGPTForCausalLM",
@@ -134,6 +126,14 @@
    {
     "architecture": "MarianForCausalLM",
     "models": 76
+   },
+   {
+    "architecture": "LISAForCausalLM",
+    "models": 74
+   },
+   {
+    "architecture": "NMMaskMoELLaVAQwen3ForCausalLM",
+    "models": 73
    }
   ]
  },

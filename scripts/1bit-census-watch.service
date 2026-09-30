@@ -1,0 +1,59 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-census-watch.service — run the daily HF new-model census watcher
+#
+# One-shot unit that runs tools/census_watch.py through scripts/census-watch.sh from a
+# DEDICATED checkout that tracks origin/main (~/census-main, a worktree), so the watcher
+# always reads the registry that is actually on main. Exit 1 (an uncovered architecture
+# class) is the ALERT: systemd marks the unit failed, which a journald watch or health
+# check can surface, and the full log lands in ~/.1bit/logs/census-watch-*.log. Exit 0
+# means the newest HF models are all mapped — silent, as intended.
+#
+# Schedules via scripts/1bit-census-watch.timer (04:30 daily, persistent); can also be
+# triggered manually:
+#     systemctl --user start 1bit-census-watch
+#
+# ── Install (user units, no sudo) ─────────────────────────────────────────
+#     git clone https://github.com/1bit-MONSTER/engine.git ~/engine
+#     git -C ~/engine worktree add --detach ~/census-main origin/main
+#     install -d ~/.config/systemd/user
+#     install -m644 ~/engine/scripts/1bit-census-watch.{service,timer} ~/.config/systemd/user/
+#     systemctl --user daemon-reload
+#     systemctl --user enable --now 1bit-census-watch.timer
+#     systemctl --user list-timers 1bit-census-watch
+#     journalctl --user -u 1bit-census-watch -f
+#
+# ── Paths ─────────────────────────────────────────────────────────────────
+# %h/census-main must match your worktree (the checkout the watcher runs from). Change if
+# it lives elsewhere. CENSUS_WATCH_REFRESH=1 fast-forwards that checkout to origin/main
+# before each run; the script refuses a checkout that is on a branch or has local changes.
+# Logs go to ~/.1bit/logs (override with CENSUS_WATCH_LOG_DIR).
+
+[Unit]
+Description=1bit census: watch HF for new model classes the registry does not map
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=oneshot
+WorkingDirectory=%h/census-main
+Environment=CENSUS_WATCH_REFRESH=1
+ExecStart=%h/census-main/scripts/census-watch.sh
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=default.target

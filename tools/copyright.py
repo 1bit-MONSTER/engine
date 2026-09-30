@@ -32,7 +32,8 @@ limitations under the License.""".split("\n")
 LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
-      ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment"), "#"),
+      ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment",
+      "*.service", "*.timer"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 

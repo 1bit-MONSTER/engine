@@ -1,0 +1,35 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-census-watch.timer — 04:30 UTC daily, persisted across downtime.
+#
+# UTC explicitly, because that is what the census-watch workflow's cron uses: the box
+# run and the CI run then see the same day's arrivals. (A bare 04:30 is the machine's
+# local time, which on the development box is three hours later.) The census sweep
+# itself follows at 05:17 UTC (census.yml).
+#
+#     systemctl --user enable --now 1bit-census-watch.timer
+#     systemctl --user list-timers 1bit-census-watch
+
+[Unit]
+Description=Daily 1bit census: new HF model classes are covered
+
+[Timer]
+OnCalendar=*-*-* 04:30:00 UTC
+Persistent=true
+Unit=1bit-census-watch.service
+
+[Install]
+WantedBy=timers.target

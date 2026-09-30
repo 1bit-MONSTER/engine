@@ -111,6 +111,36 @@ of those models was run. The unmapped architectures with the most models are
 `Step1MoEForCausalLM` (2,882), `OPTForCausalLM` (2,097), `ParlerTTSForConditionalGeneration`
 (1,586) and `GPTNeoForCausalLM` (1,565). `tools/census.py --pr-body` lists the top ten.
 
+## The watch
+
+The sweep is a snapshot, so a class that appears *tomorrow* moves the mapped share
+quietly. `tools/census_watch.py` polls the newest text-generation models (createdAt
+descending), reads each one's architecture class from the config inline in the listing,
+and compares it against `registry/architectures.json` — the same read `census.py`'s
+coverage() makes, so "uncovered" here means "not in the number the census reports". No
+per-model fetch and no compiled probe: the registry is generated data, keyed by the HF
+architecture class the census counts.
+
+Exit 0 means every newest model is mapped; **exit 1 is the alert** — a class arrived that
+no backend accepts. It is run daily at 04:30 UTC (ahead of the 05:17 sweep) by the systemd
+timer on the development box (`scripts/1bit-census-watch.{service,timer}`, from the
+`~/census-main` worktree that tracks `origin/main`). The timer marks its unit failed, and
+every run lands in `~/.1bit/logs/census-watch-*.log`. A GitHub Actions path that files an
+alert issue needs `issues: write`, so it waits for an RFC.
+
+A class the watcher flags is one of two things, and the run says which:
+
+- **new class** — map it in `registry/architectures.json`, but only when a pinned
+  backend's code really accepts the architecture (rule 3 in CONTRIBUTING.md: recognized
+  is not verified).
+- **reviewed, not an alias** — already in `registry/significant.json`
+  ([arch-gaps.md](arch-gaps.md)); it needs real engine support, and if a backend starts
+  accepting it, the reason is recorded as `mapped_ok`.
+
+Gated repos (no config without a token) are reported as unverifiable and never fail the
+run; derivatives (a quantized GGUF, a LoRA adapter) have no config by design and are
+skipped, because the release they derive from carries the config and is what gets checked.
+
 ## Commands
 
 ```
@@ -119,4 +149,6 @@ tools/registry_build.py --check    # exit 1 if it is stale
 tools/registry_check.py build/1bit --models ~/models   # run the checks on Strix Halo
 tools/census.py                    # full HF sweep (about 420 pages)
 tools/census.py --report           # recompute coverage from the saved counts
+tools/census_watch.py              # newest models vs the registry; exit 1 on an uncovered class
+scripts/census-watch.sh            # the same, with the log file and the origin/main refresh
 ```

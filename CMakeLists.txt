@@ -359,6 +359,9 @@ if(Python3_Interpreter_FOUND)
     add_test(NAME registry_gaps_fire COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/registry_gaps_test.py)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
+    # the new-model watcher's alert contract (offline: synthetic batches against the
+    # committed registry), so a regression cannot leave the daily alert permanently green.
+    add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
 endif()
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)

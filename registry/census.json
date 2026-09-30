@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 322924,
-  "mapped_pct": 96.86,
-  "checked_models": 218652,
-  "checked_pct": 65.59,
+  "mapped_models": 322966,
+  "mapped_pct": 96.88,
+  "checked_models": 218694,
+  "checked_pct": 65.6,
   "per_backend": {
    "vulkan": {
-    "mapped": 322557,
-    "checked": 218652,
-    "mapped_pct": 96.75,
-    "checked_pct": 65.59
+    "mapped": 322599,
+    "checked": 218694,
+    "mapped_pct": 96.77,
+    "checked_pct": 65.6
    },
    "hrx": {
-    "mapped": 322587,
-    "checked": 218635,
-    "mapped_pct": 96.76,
-    "checked_pct": 65.58
+    "mapped": 322629,
+    "checked": 218677,
+    "mapped_pct": 96.77,
+    "checked_pct": 65.59
    },
    "zinc": {
-    "mapped": 237011,
+    "mapped": 237053,
     "checked": 34489,
-    "mapped_pct": 71.09,
+    "mapped_pct": 71.11,
     "checked_pct": 10.35
    },
    "npu": {
@@ -128,12 +128,12 @@
     "models": 42
    },
    {
-    "architecture": "SlidingWindowForCausalLM",
-    "models": 42
-   },
-   {
     "architecture": "LLaDA2MoeModelLM",
     "models": 40
+   },
+   {
+    "architecture": "HelixForCausalLM",
+    "models": 39
    }
   ]
  },

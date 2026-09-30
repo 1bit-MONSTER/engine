@@ -442,6 +442,16 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   133-137 W, 0.4% slower; Qwen3-0.6B and ZAYA1-8B unchanged. `ONEBIT_HRX_BLOCKING_WAIT=1` turns it
   off. Model load and the first request still burst to ~88 C for a couple of seconds (host weight
   conversions and first-use GPU work share the package power limit).
+- **Lossless SwiGLU for every FFN layer and MTP verify batches
+  ([llama.cpp #45](https://github.com/1bit-MONSTER/llama.cpp/pull/45),
+  [#46](https://github.com/1bit-MONSTER/llama.cpp/pull/46)).** The K-quant SwiGLU kernel now wins
+  over AMD's int4 lowrow path (weights repacked to int4 at first use, activations quantized to
+  int4), which also ran slowly under llama-server: 27B `llama-server` decode 10.7 -> 12.0 tok/s,
+  KLD against CPU logits 0.00167 (AMD kernels 0.00318). #46 adds 2-8 token variants for speculative
+  verify batches: Qwen3.8-27B with its MTP head (`1bit serve --mtp`, draft 3, p-min 0.75) decodes
+  22.5 / 17.7 / 19.0 tok/s on code / prose / translation prompts (was 20.1 / 16.4 / 17.6; Vulkan
+  34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still costs ~1.7x a 1-token
+  step (f32 multiply-adds per token); int8 activations, as Vulkan does, are the next step.
 - **Fast sub-4-bit kernels on HRX.** IQ2 matmuls still fall back to the CPU; IQ3_S has a decode
   kernel (#43) but not a fast prefill one.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.

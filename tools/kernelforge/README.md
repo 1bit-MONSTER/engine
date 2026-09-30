@@ -32,6 +32,7 @@ Halo's gfx1151 instead. Each task packages one of the engine's kernels with:
 | Task | Kernel | Where it runs in the engine |
 |---|---|---|
 | [`gdn-prefill/`](gdn-prefill/) | gated delta-net prefill (head size 128, optional rollback snapshots) | Qwen3.8 / Qwen3.6 prompt processing on ROCm, from ROCmFPX's `gated_delta_net.cu` |
+| [`gemv-q4_0/`](gemv-q4_0/) | Q4_0 x Q8_1 for 1-8 columns (`mul_mat_vec_q`) | speculative verification (and plain decode) on ROCm, from ROCmFPX's `mmvq.cu` |
 
 ## Run one
 
@@ -78,7 +79,28 @@ task driver's gentler gate range had let it pass. The rest went into ROCmFPX#5:
 | Qwen3.8-27B-H32 serve prompt | 484-495 tok/s | 542-555 tok/s |
 | Same, with DFlash2 | 456-465 tok/s | 510-522 tok/s |
 
-The driver now draws gates from ggml's own test range. Two setup traps:
+**gemv-q4_0, 2026-09-29.** A 2-hour campaign, about $40, kept a row-tiled body for 5-8 columns:
+
+- 4 rows per warp;
+- activations loaded once per k-block;
+- weights unpacked once for all columns;
+- a reduce-scatter epilogue.
+
+The mean case score is 1.18x. Byte for byte it gives the old kernel's output: 40 cases, with odd
+row counts, extreme scales, edge nibbles, and saturated and zero activations. The task's driver
+now carries those adversarial inputs itself.
+
+| Result | Before | After |
+|---|---|---|
+| 5120 x 17408, 8 columns | 0.298 ms | 0.226 ms |
+| Qwen3.8-27B pp8 | 71.3 tok/s | 78.3 tok/s |
+| Serve + DFlash2 decode, code (median, 2 rounds) | 43.0 / 39.4 | 46.1 / 45.7 |
+| Serve + DFlash2 decode, prose (median, 2 rounds) | 20.2 / 25.9 | 28.1 / 28.1 |
+
+In the full model it helped only at 8 columns (5-7 were level or slower), so ROCmFPX#6 dispatches
+it for exactly 8.
+
+The gdn-prefill driver now draws gates from ggml's own test range. Two setup traps:
 
 - **Login.** KernelForge runs its planning and implementer sessions as `claude --bare`, which
   ignores a logged-in subscription and accepts only an API key. Our Hyperloom checkout on strixhalo

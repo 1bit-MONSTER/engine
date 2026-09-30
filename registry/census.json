@@ -2797,6 +2797,7862 @@
    "tinyllama_1_1b_argo1_oov1_lm": 1,
    "tinyllama_1_1b_trigger_v3_travel_lm": 1,
    "xLLM": 1
+  },
+  "types": {
+   "LlamaForCausalLM": {
+    "llama": 100582
+   },
+   "Qwen2ForCausalLM": {
+    "qwen2": 46608
+   },
+   "GPT2LMHeadModel": {
+    "gpt2": 31810
+   },
+   "Qwen3ForCausalLM": {
+    "qwen3": 30990
+   },
+   "MistralForCausalLM": {
+    "mistral": 27918
+   },
+   "GPTNeoXForCausalLM": {
+    "gpt_neox": 8065
+   },
+   "StableLmForCausalLM": {
+    "stablelm": 6681
+   },
+   "Gemma3ForCausalLM": {
+    "gemma3_text": 6077
+   },
+   "Gemma2ForCausalLM": {
+    "gemma2": 5580
+   },
+   "GemmaForCausalLM": {
+    "gemma": 5521
+   },
+   "Phi3ForCausalLM": {
+    "phi3": 3225
+   },
+   "Qwen3_5ForConditionalGeneration": {
+    "qwen3_5": 3069
+   },
+   "Step1MoEForCausalLM": {
+    "step1": 2882
+   },
+   "MixtralForCausalLM": {
+    "mixtral": 2829
+   },
+   "OPTForCausalLM": {
+    "opt": 2097
+   },
+   "GptOssForCausalLM": {
+    "gpt_oss": 1922
+   },
+   "Qwen3MoeForCausalLM": {
+    "qwen3_moe": 1718
+   },
+   "PhiForCausalLM": {
+    "phi": 1650
+   },
+   "ParlerTTSForConditionalGeneration": {
+    "parler_tts": 1586
+   },
+   "GPTNeoForCausalLM": {
+    "gpt_neo": 1566
+   },
+   "Qwen3_5MoeForConditionalGeneration": {
+    "qwen3_5_moe": 1401
+   },
+   "Gemma4ForConditionalGeneration": {
+    "gemma4": 1274
+   },
+   "Qwen3_5ForCausalLM": {
+    "qwen3_5_text": 1218
+   },
+   "BloomForCausalLM": {
+    "bloom": 1154
+   },
+   "Lfm2ForCausalLM": {
+    "lfm2": 1144
+   },
+   "Gemma3ForConditionalGeneration": {
+    "gemma3": 1095
+   },
+   "Olmo3ForCausalLM": {
+    "olmo3": 1081
+   },
+   "T5ForConditionalGeneration": {
+    "t5": 1034
+   },
+   "ChessForCausalLM": {
+    "chess_transformer": 970
+   },
+   "FalconForCausalLM": {
+    "falcon": 920
+   },
+   "GlmMoeDsaForCausalLM": {
+    "glm_moe_dsa": 620
+   },
+   "GPTJForCausalLM": {
+    "gptj": 614
+   },
+   "GraniteForCausalLM": {
+    "granite": 601
+   },
+   "OlmoForCausalLM": {
+    "olmo": 601
+   },
+   "DeepseekV4ForCausalLM": {
+    "deepseek_v4": 585
+   },
+   "Olmo2ForCausalLM": {
+    "olmo2": 577
+   },
+   "CohereForCausalLM": {
+    "cohere": 534
+   },
+   "GraniteMoeHybridForCausalLM": {
+    "granitemoehybrid": 532
+   },
+   "DeepseekV3ForCausalLM": {
+    "deepseek_v3": 524
+   },
+   "NemotronHForCausalLM": {
+    "nemotron_h": 511
+   },
+   "LlavaLlamaForCausalLM": {
+    "llava": 451
+   },
+   "SmolLM3ForCausalLM": {
+    "smollm3": 434
+   },
+   "GPTBigCodeForCausalLM": {
+    "gpt_bigcode": 433
+   },
+   "CodeGenForCausalLM": {
+    "codegen": 386
+   },
+   "MT5ForConditionalGeneration": {
+    "mt5": 364
+   },
+   "Qwen3NextForCausalLM": {
+    "qwen3_next": 357
+   },
+   "QWenLMHeadModel": {
+    "qwen": 347
+   },
+   "Glm4MoeForCausalLM": {
+    "glm4_moe": 340
+   },
+   "MiniMaxM2ForCausalLM": {
+    "minimax_m2": 322
+   },
+   "Starcoder2ForCausalLM": {
+    "starcoder2": 313
+   },
+   "PicoDecoderHF": {
+    "pico_decoder": 310
+   },
+   "RWForCausalLM": {
+    "RefinedWebModel": 300
+   },
+   "MPTForCausalLM": {
+    "mpt": 279
+   },
+   "Lfm2MoeForCausalLM": {
+    "lfm2_moe": 249
+   },
+   "DynamicAlibiForCausalLM": {
+    "dynamic_alibi": 245
+   },
+   "OpenLMForCausalLM": {
+    "openlm": 245
+   },
+   "DynamicForgettingForCausalLM": {
+    "dynamic_forgetting": 240
+   },
+   "Gemma4UnifiedForConditionalGeneration": {
+    "gemma4_unified": 236
+   },
+   "SeedOssForCausalLM": {
+    "seed_oss": 229
+   },
+   "Glm4ForCausalLM": {
+    "glm4": 224
+   },
+   "BertLMHeadModel": {
+    "bert": 212
+   },
+   "Qwen3_5MoeForCausalLM": {
+    "qwen3_5_moe_text": 204
+   },
+   "Mistral3ForConditionalGeneration": {
+    "mistral3": 196
+   },
+   "OlmoeForCausalLM": {
+    "olmoe": 190
+   },
+   "ExaoneForCausalLM": {
+    "exaone": 189
+   },
+   "Cohere2ForCausalLM": {
+    "cohere2": 183
+   },
+   "DeepseekV2ForCausalLM": {
+    "deepseek_v2": 183
+   },
+   "MobileLLMForCausalLM": {
+    "mobilellm": 176
+   },
+   "BartForConditionalGeneration": {
+    "bart": 174
+   },
+   "LagunaForCausalLM": {
+    "laguna": 174
+   },
+   "StableLMEpochForCausalLM": {
+    "stablelm_epoch": 171
+   },
+   "Glm4MoeLiteForCausalLM": {
+    "glm4_moe_lite": 169
+   },
+   "JambaForCausalLM": {
+    "jamba": 169
+   },
+   "OpenELMForCausalLM": {
+    "openelm": 166
+   },
+   "FalconH1ForCausalLM": {
+    "falcon_h1": 163
+   },
+   "MambaForCausalLM": {
+    "mamba": 158
+   },
+   "MixFormerSequentialForCausalLM": {
+    "mixformer-sequential": 156
+   },
+   "LLaMAForCausalLM": {
+    "llama": 153
+   },
+   "RobertaForCausalLM": {
+    "roberta": 139
+   },
+   "ApertusForCausalLM": {
+    "apertus": 138
+   },
+   "DFlashDraftModel": {
+    "qwen3": 134
+   },
+   "BaichuanForCausalLM": {
+    "baichuan": 131
+   },
+   "DeciLMForCausalLM": {
+    "deci": 129
+   },
+   "LlamaForCausalLMEagle3": {
+    "llama": 126
+   },
+   "NanochatGPTForCausalLM": {
+    "nanochat_gpt": 124
+   },
+   "InternLM2ForCausalLM": {
+    "internlm2": 120
+   },
+   "Qwen2MoeForCausalLM": {
+    "qwen2_moe": 116
+   },
+   "CambrianQwenForCausalLM": {
+    "qwen2": 113
+   },
+   "MBartForConditionalGeneration": {
+    "mbart": 110
+   },
+   "MiniCPMForCausalLM": {},
+   "HunYuanDenseV1ForCausalLM": {
+    "hunyuan_v1_dense": 108
+   },
+   "BartForCausalLM": {
+    "bart": 100
+   },
+   "OpensciForCausalLM": {
+    "opensci": 98
+   },
+   "LlavaQwen2ForCausalLM": {
+    "llava_qwen2": 97
+   },
+   "K2HorizonForCausalLM": {
+    "k2_horizon": 96
+   },
+   "HYV3ForCausalLM": {
+    "hy_v3": 90
+   },
+   "DeepseekV32ForCausalLM": {
+    "deepseek_v32": 89
+   },
+   "JAISLMHeadModel": {
+    "jais": 89
+   },
+   "MiMoV2ForCausalLM": {
+    "mimo_v2": 89
+   },
+   "BioGptForCausalLM": {
+    "biogpt": 86
+   },
+   "RwkvForCausalLM": {
+    "rwkv": 86
+   },
+   "GPT2LMHeadCustomModel": {
+    "gpt2": 84
+   },
+   "Gemma4ForCausalLM": {
+    "gemma4": 84
+   },
+   "AfmoeForCausalLM": {
+    "afmoe": 83
+   },
+   "Llama4ForCausalLM": {
+    "llama4_text": 81
+   },
+   "DynamicSlidingWindowForCausalLM": {
+    "dynamic_sliding_window": 79
+   },
+   "XGLMForCausalLM": {
+    "xglm": 79
+   },
+   "Glm5NextForConditionalGeneration": {
+    "glm5_next": 78
+   },
+   "MarianForCausalLM": {
+    "marian": 76
+   },
+   "LISAForCausalLM": {
+    "llava": 74
+   },
+   "NMMaskMoELLaVAQwen3ForCausalLM": {
+    "nm_mask_moe_llava_qwen3": 73
+   },
+   "Qwen4ExpForConditionalGeneration": {
+    "qwen4_exp": 73
+   },
+   "KORMoForCausalLM": {
+    "kormo": 72
+   },
+   "NanoChatForCausalLM": {
+    "nanochat": 71
+   },
+   "TransformerForCausalLM": {
+    "transformer": 68
+   },
+   "Ernie4_5_MoeForCausalLM": {
+    "ernie4_5_moe": 66
+   },
+   "Exaone4ForCausalLM": {
+    "exaone4": 65
+   },
+   "NemotronForCausalLM": {
+    "nemotron": 64
+   },
+   "LlamaModel": {
+    "llama": 63
+   },
+   "T5WithLMHeadModel": {
+    "t5": 59
+   },
+   "YiForCausalLM": {
+    "Yi": 57
+   },
+   "Spark2_5ForCausalLM": {
+    "spark2_5": 56
+   },
+   "CacaForCausalLM": {
+    "caca": 55
+   },
+   "Moondream": {
+    "moondream1": 55
+   },
+   "NanbeigeForCausalLM": {
+    "nanbeige": 55
+   },
+   "SparseMistralforCausalLM": {
+    "sparse_mistral": 55
+   },
+   "BitLlamaForCausalLM": {
+    "bit_llama": 54
+   },
+   "BitNetForCausalLM": {
+    "bitnet": 54
+   },
+   "Gemma4AssistantForCausalLM": {
+    "gemma4_assistant": 54
+   },
+   "LlavaMistralForCausalLM": {
+    "llava_mistral": 53
+   },
+   "BailingMoeV3ForCausalLM": {
+    "bailing_hybrid": 52
+   },
+   "MinistralForCausalLM": {
+    "ministral": 52
+   },
+   "Phi3VForCausalLM": {
+    "phi3_v": 52
+   },
+   "DenseControlLM": {
+    "nero_dense_control_mlx": 50
+   },
+   "IQuestCoderForCausalLM": {
+    "iquestcoder": 50
+   },
+   "Phi4MMForCausalLM": {
+    "phi4mm": 50
+   },
+   "RWKV7ForCausalLM": {
+    "rwkv7": 50
+   },
+   "SarvamMoEForCausalLM": {
+    "sarvam_moe": 50
+   },
+   "LLaDAModelLM": {
+    "llada": 48
+   },
+   "GraniteMoeForCausalLM": {
+    "granitemoe": 45
+   },
+   "DbrxForCausalLM": {
+    "dbrx": 44
+   },
+   "GPT": {},
+   "PITForCausalLM": {
+    "pit": 43
+   },
+   "DFlash2DraftModel": {
+    "qwen3": 42
+   },
+   "GPJTGPT2ModelForCausalLM": {
+    "gpjtgpt2": 42
+   },
+   "RoleSLM": {
+    "data_scientist-slm": 42
+   },
+   "SlidingWindowForCausalLM": {
+    "transformer": 42
+   },
+   "CustomLlamaForCausalLM": {
+    "custom_llama": 41
+   },
+   "HrmTextForCausalLM": {
+    "hrm_text": 41
+   },
+   "NotaGenLMHeadModel": {
+    "gpt2": 41
+   },
+   "LLaDA2MoeModelLM": {
+    "llada2_moe": 40
+   },
+   "MPLUGOwl2LlamaForCausalLM": {
+    "mplug_owl2": 40
+   },
+   "MellumForCausalLM": {
+    "mellum": 40
+   },
+   "MptForCausalLM": {
+    "mpt": 40
+   },
+   "Qwen3VLForConditionalGeneration": {
+    "qwen3_vl": 40
+   },
+   "DreamModel": {
+    "Dream": 39
+   },
+   "HelixForCausalLM": {
+    "helix": 39
+   },
+   "SDARForCausalLM": {
+    "sdar": 39
+   },
+   "DSparkDraftModel": {
+    "qwen3": 38
+   },
+   "HyperCLOVAXForCausalLM": {
+    "hyperclovax": 38
+   },
+   "OLMoForCausalLM": {
+    "hf_olmo": 38
+   },
+   "Qwen2_5_VLForConditionalGeneration": {
+    "qwen2_5_vl": 38
+   },
+   "RavenForCausalLM": {
+    "huginn_raven": 37
+   },
+   "XLNetLMHeadModel": {
+    "xlnet": 37
+   },
+   "BailingMoeV2ForCausalLM": {
+    "bailing_moe": 36
+   },
+   "T5GemmaForConditionalGeneration": {
+    "t5gemma": 36
+   },
+   "InternLM3ForCausalLM": {
+    "internlm3": 35
+   },
+   "Ministral3ForCausalLM": {
+    "ministral3": 35
+   },
+   "OrionForCausalLM": {
+    "orion": 35
+   },
+   "Qwen2Model": {
+    "qwen2": 35
+   },
+   "TalkieForCausalLM": {
+    "talkie": 35
+   },
+   "ChatGLMForConditionalGeneration": {
+    "chatglm": 34
+   },
+   "KimiK25ForConditionalGeneration": {
+    "kimi_k25": 34
+   },
+   "LoopLMForCausalLM": {
+    "looplm": 34
+   },
+   "KimiLinearForCausalLM": {
+    "kimi_linear": 33
+   },
+   "MorphT5AutoForConditionalGeneration": {
+    "morph-t5-auto": 32
+   },
+   "MorphT5ConcatForConditionalGeneration": {
+    "morph-t5-concat": 32
+   },
+   "MorphT5SumForConditionalGeneration": {
+    "morph-t5-sum": 32
+   },
+   "TransformerLM": {
+    "llama": 32
+   },
+   "LlavaQwenForCausalLM": {
+    "llava": 31
+   },
+   "LongcatCausalLM": {},
+   "OuroForCausalLM": {
+    "ouro": 31
+   },
+   "ZhinaoForCausalLM": {
+    "zhinao": 31
+   },
+   "Gemma3nForConditionalGeneration": {
+    "gemma3n": 30
+   },
+   "XLMRobertaForCausalLM": {
+    "xlm-roberta": 30
+   },
+   "GlmForCausalLM": {
+    "glm": 29
+   },
+   "DogeForCausalLM": {
+    "doge": 28
+   },
+   "HyperLlamaForCausalLM": {
+    "hyperllama": 28
+   },
+   "NanoGPTForCausalLM": {
+    "nanogpt": 28
+   },
+   "Step3p5ForCausalLM": {
+    "step3p5": 28
+   },
+   "Cohere2MoeForCausalLM": {
+    "cohere2_moe": 27
+   },
+   "DaisyForCausalLM": {
+    "daisy": 27
+   },
+   "SkyworkForCausalLM": {
+    "skywork": 27
+   },
+   "AquilaForCausalLM": {
+    "llama": 26
+   },
+   "BailingMoeV2_5ForCausalLM": {
+    "bailing_hybrid": 26
+   },
+   "DeepseekV41ForCausalLM": {
+    "deepseek_v41": 26
+   },
+   "GatedDeltaNetForCausalLM": {
+    "gated_deltanet": 26
+   },
+   "Llama4ForConditionalGeneration": {
+    "llama4": 26
+   },
+   "MBartForCausalLM": {
+    "mbart": 26
+   },
+   "MultiScaleForCausalLM": {
+    "multiscale_transformer": 26
+   },
+   "OpenAIGPTLMHeadModel": {
+    "openai-gpt": 26
+   },
+   "GPTNeoXModel": {
+    "gpt_neox": 25
+   },
+   "LlavaLlamaModel": {
+    "llava_llama": 25
+   },
+   "MuseGlimmerForConditionalGeneration": {
+    "muse_glimmer": 25
+   },
+   "Phi3SmallForCausalLM": {
+    "phi3small": 25
+   },
+   "PhiMoEForCausalLM": {
+    "phimoe": 25
+   },
+   "SparseLlamaForCausalLM": {
+    "sparsellama": 25
+   },
+   "CTRLLMHeadModel": {
+    "ctrl": 24
+   },
+   "CogVLMForCausalLM": {},
+   "ConstrainedLlamaForCausalLM": {
+    "llama": 24
+   },
+   "DetikzifyForConditionalGeneration": {
+    "detikzify": 24
+   },
+   "FP8Qwen3ForCausalLM": {
+    "fp8_qwen3": 24
+   },
+   "XverseForCausalLM": {
+    "xverse": 24
+   },
+   "BaiChuanForCausalLM": {
+    "baichuan": 23
+   },
+   "BloomModel": {
+    "bloom": 23
+   },
+   "CENOForCausalLM": {
+    "ceno": 23
+   },
+   "ForgettingTransformerForCausalLM": {
+    "forgetting_transformer-project_fox": 23
+   },
+   "GPT2MoEForCausalLM": {
+    "gpt2moe": 23
+   },
+   "GrugMoeForCausalLM": {
+    "grug_moe": 23
+   },
+   "M2M100ForConditionalGeneration": {
+    "m2m_100": 23
+   },
+   "GPT2LMAndValueHeadModel": {
+    "gpt2": 22
+   },
+   "HunYuanMoEV1ForCausalLM": {
+    "hunyuan_v1_moe": 22
+   },
+   "MiMoV2FlashForCausalLM": {
+    "mimo_v2_flash": 22
+   },
+   "DeepseekForCausalLM": {
+    "deepseek": 21
+   },
+   "DistilBertForSequenceClassification": {
+    "distilbert": 21
+   },
+   "FlexOlmoForCausalLM": {
+    "flex_olmo": 21
+   },
+   "HymbaForCausalLM": {
+    "hymba": 21
+   },
+   "LlavaPhiForCausalLM": {
+    "llava_phi": 21
+   },
+   "ProGenForCausalLM": {
+    "progen": 21
+   },
+   "SkipMiddleModel": {},
+   "ZayaForCausalLM": {
+    "zaya": 21
+   },
+   "AutoModelForCausalLM": {
+    "llama": 20
+   },
+   "GPT2ALMHeadModel": {
+    "gpt2a": 20
+   },
+   "LlavaForConditionalGeneration": {
+    "llava": 20
+   },
+   "MotifForCausalLM": {
+    "Motif": 20
+   },
+   "PoptorchPipelinedGPT2LMHeadModel": {
+    "gpt2": 20
+   },
+   "Qwen3VLMoeForConditionalGeneration": {
+    "qwen3_vl_moe": 20
+   },
+   "BertForMaskedLM": {
+    "bert": 19
+   },
+   "GPT2Model": {
+    "gpt2": 19
+   },
+   "MllamaForCausalLM": {
+    "mllama_text_model": 19
+   },
+   "MobilintLlamaForCausalLM": {
+    "mobilint-llama": 19
+   },
+   "QuasarForCausalLM": {
+    "phi": 19
+   },
+   "SolarOpen2ForCausalLM": {
+    "solar_open2": 19
+   },
+   "BVVForCausalLM": {
+    "model_uni_glif": 18
+   },
+   "BailingMoeLinearV2ForCausalLM": {
+    "bailing_moe_linear": 18
+   },
+   "FalconMambaForCausalLM": {
+    "falcon_mamba": 18
+   },
+   "MFuyuForCausalLM": {
+    "fuyu": 18
+   },
+   "Mamba2ForCausalLM": {
+    "mamba2": 18
+   },
+   "RECAST8b_LlamaForCausalLM": {
+    "recast8b_llama": 18
+   },
+   "Rwkv7ForCausalLM": {
+    "rwkv7": 18
+   },
+   "StickbreakingForCausalLM": {
+    "stickbreaking": 18
+   },
+   "AlibiForCausalLM": {
+    "transformer-project_fox": 17
+   },
+   "CubeLM": {
+    "CubeLM": 17
+   },
+   "GPTForCausalLM": {
+    "gpt": 17
+   },
+   "HGRNForCausalLM": {
+    "hgrn": 17
+   },
+   "InternLMForCausalLM": {
+    "internlm": 17
+   },
+   "KimiK3ForConditionalGeneration": {
+    "kimi_k3": 17
+   },
+   "MiniMaxM3SparseForConditionalGeneration": {
+    "minimax_m3_vl": 17
+   },
+   "NCPOlmo3ForCausalLM": {
+    "ncp_olmo3": 17
+   },
+   "PldrllmForCausalLM": {
+    "pldrllm": 17
+   },
+   "Qwen3DSparkModel": {
+    "qwen3": 17
+   },
+   "RecurrentGemmaForCausalLM": {
+    "recurrent_gemma": 17
+   },
+   "RetNetForCausalLM": {
+    "retnet": 17
+   },
+   "SarvamMLAForCausalLM": {
+    "sarvam_mla": 17
+   },
+   "ChatGLMModel": {
+    "chatglm": 16
+   },
+   "DiffusionGemmaForBlockDiffusion": {
+    "diffusion_gemma": 16
+   },
+   "KPhi3ForCausalLM": {
+    "kphi3": 16
+   },
+   "LongcatFlashNgramForCausalLM": {},
+   "NARBartForConditionalGeneration": {
+    "bart": 16
+   },
+   "NandiForCausalLM": {
+    "nandi": 16
+   },
+   "NemotronLabsDiffusionModel": {
+    "nemotron_labs_diffusion": 16
+   },
+   "QuietForCausalLM": {
+    "quiet": 16
+   },
+   "SolarOpenForCausalLM": {
+    "solar_open": 16
+   },
+   "YoutuForCausalLM": {
+    "youtu": 16
+   },
+   "transformerModel": {
+    "custom_transformer": 16
+   },
+   "ArceeForCausalLM": {
+    "arcee": 15
+   },
+   "ExaoneMoEForCausalLM": {
+    "exaone_moe": 15
+   },
+   "NanochronoForCausalLM": {
+    "sn38-nanochrono": 15
+   },
+   "Qwen4ExpForCausalLM": {
+    "qwen4_exp_text": 15
+   },
+   "WhisperForCausalLM": {
+    "whisper": 15
+   },
+   "ArgonneModel": {
+    "argonne2": 14
+   },
+   "GPTJiangForCausalLM": {
+    "gpt_jiang": 14
+   },
+   "HunYuanForCausalLM": {
+    "hunyuan": 14
+   },
+   "JetMoEForCausalLM": {
+    "jetmoe": 14
+   },
+   "PawQwen3ForCausalLM": {
+    "qwen3": 14
+   },
+   "ProgressiveYocoLlamaForCausalLM": {
+    "progressive_yoco_llama": 14
+   },
+   "Qwen2ReasoningForCausalLM": {
+    "qwen2": 14
+   },
+   "Qwen2VLForConditionalGeneration": {
+    "qwen2_vl": 14
+   },
+   "Qwen3Model": {
+    "qwen3": 14
+   },
+   "ReVisionForConditionalGeneration": {
+    "revision": 14
+   },
+   "STLForCausalLM": {
+    "stldec512": 14
+   },
+   "SpikeWhaleLM": {
+    "spike_whale": 14
+   },
+   "TinyLlavaForConditionalGeneration": {},
+   "Xing4_0ForCausalLM": {
+    "xing4_0": 14
+   },
+   "XpertGPTForCausalLM": {
+    "msit_gptbert": 14
+   },
+   "AdapterMoELLaVAQwen3ForCausalLM": {
+    "adapter_moe_llava_qwen3": 13
+   },
+   "BailingMoeForCausalLM": {
+    "bailing_moe": 13
+   },
+   "BitnetForCausalLM": {
+    "llama": 13
+   },
+   "DiscreteDiffusionModel": {
+    "discrete_diffusion": 13
+   },
+   "Eagle3DeepseekV2ForCausalLM": {
+    "axk2": 13
+   },
+   "EncoderDecoderModel": {
+    "encoder-decoder": 13
+   },
+   "Ernie4_5_ForCausalLM": {
+    "ernie4_5": 13
+   },
+   "InstellaMoEForCausalLM": {
+    "deepseek_v3": 13
+   },
+   "MobilintQwen3ForCausalLM": {
+    "mobilint-qwen3": 13
+   },
+   "OpenMoeForCausalLM": {
+    "llama": 13
+   },
+   "Qwen3RecoveredForCausalLM": {
+    "qwen3_recovered": 13
+   },
+   "RECAST1B_LlamaForCausalLM": {
+    "recast_llama": 13
+   },
+   "Rwkv6ForCausalLM": {
+    "rwkv6": 13
+   },
+   "SelfDebiasingGPT2LMHeadModel": {
+    "gpt2": 13
+   },
+   "TinyGPTForCausalLM": {
+    "metanova_1": 13
+   },
+   "YatGPTForCausalLM": {
+    "yatnmn_gpt": 13
+   },
+   "AV2TextForConditionalGeneration": {
+    "speech_to_text": 12
+   },
+   "BartModel": {
+    "bart": 12
+   },
+   "BertModel": {
+    "bert": 12
+   },
+   "BlockMTPForCausalLM": {
+    "looped_block_mtp": 12
+   },
+   "CamembertForCausalLM": {
+    "camembert": 12
+   },
+   "Ernie4_5ForCausalLM": {
+    "ernie4_5": 12
+   },
+   "FimmyForCausalLM": {
+    "fimmy": 12
+   },
+   "GPTJXForCausalLM": {
+    "gpt_jx": 12
+   },
+   "GPTJXMoEForCausalLM": {
+    "sabiyarn": 12
+   },
+   "IndustrySLM": {
+    "healthcare-slm": 12
+   },
+   "LLamaLongBEL": {
+    "llama_longbel": 12
+   },
+   "MapleForCausalLM": {},
+   "MistralModel": {
+    "mistral": 12
+   },
+   "MobiLlamaForCausalLM": {
+    "llama": 12
+   },
+   "ModernBertDecoderForCausalLM": {
+    "modernbert-decoder": 12
+   },
+   "OrkhonForCausalLM": {
+    "orkhon": 12
+   },
+   "PlamoForCausalLM": {
+    "plamo": 12
+   },
+   "RoFormerForCausalLM": {
+    "roformer": 12
+   },
+   "StripedHyenaModelForCausalLM": {
+    "stripedhyena": 12
+   },
+   "T5LaForConditionalGeneration": {
+    "t5la": 12
+   },
+   "TTTForCausalLM": {
+    "ttt": 12
+   },
+   "A2DQwen3LMHeadModel": {
+    "a2d-qwen3": 11
+   },
+   "Eagle3DraftModel": {},
+   "ElectraForCausalLM": {
+    "electra": 11
+   },
+   "GLAForCausalLM": {
+    "gla": 11
+   },
+   "HGRNBitForCausalLM": {
+    "hgrn_bit": 11
+   },
+   "IndexForCausalLM": {
+    "index": 11
+   },
+   "JarvisTitanMoEForCausalLM": {
+    "jarvis_titan_moe": 11
+   },
+   "KeuralMoECausalLM": {
+    "keural": 11
+   },
+   "LimiteForCausalLM": {
+    "limite": 11
+   },
+   "MiMoForCausalLM": {
+    "mimo": 11
+   },
+   "MiniCPM3ForCausalLM": {
+    "minicpm3": 11
+   },
+   "MoLM": {
+    "MoLM": 11
+   },
+   "MobilintExaoneForCausalLM": {
+    "mobilint-exaone": 11
+   },
+   "MobilintQwen2ForCausalLM": {
+    "mobilint-qwen2": 11
+   },
+   "NeedleForToolCalling": {
+    "needle": 11
+   },
+   "PinyinCodeForCausalLM": {
+    "pinyin_code": 11
+   },
+   "Qwen2BMForCausalLM": {
+    "qwen2bm": 11
+   },
+   "Qwen2ParScaleForCausalLM": {
+    "qwen2_parscale": 11
+   },
+   "VideoChatGPTLlamaForCausalLM": {
+    "VideoChatGPT": 11
+   },
+   "YuanForCausalLM": {
+    "yuan": 11
+   },
+   "Zamba2ForCausalLM": {
+    "zamba2": 11
+   },
+   "AnemoneForCausalLM": {},
+   "Avey": {
+    "avey": 10
+   },
+   "BabyLlamaForCausalLM": {
+    "llama": 10
+   },
+   "BambaForCausalLM": {
+    "bamba": 10
+   },
+   "EmoForCausalLM": {
+    "emo": 10
+   },
+   "FinanceDecoder": {
+    "qovaryx_finance_decoder": 10
+   },
+   "GPTBERTForCausalLM": {
+    "gpt-bert": 10
+   },
+   "Gemma4UnifiedAssistantForCausalLM": {
+    "gemma4_unified_assistant": 10
+   },
+   "GraniteSwitchForCausalLM": {
+    "granite_switch": 10
+   },
+   "IQuestLoopCoderForCausalLM": {
+    "iquestloopcoder": 10
+   },
+   "InternVLChatModel": {
+    "internvl_chat": 10
+   },
+   "JapaneseStableLMAlphaForCausalLM": {},
+   "LlamaMoEForCausalLM": {
+    "llama_moe": 10
+   },
+   "LlavaNextForConditionalGeneration": {
+    "llava_next": 10
+   },
+   "MarianMTModel": {
+    "marian": 10
+   },
+   "MegaForCausalLM": {
+    "mega": 10
+   },
+   "MiMoGDNForCausalLM": {
+    "mimo_gdn": 10
+   },
+   "ModernBertForMaskedLM": {
+    "modernbert": 10
+   },
+   "MoshiForConditionalGeneration": {
+    "moshi": 10
+   },
+   "MossForCausalLM": {
+    "moss": 10
+   },
+   "NanochatForCausalLM": {
+    "nanochat": 10
+   },
+   "Olmo3SiameseDepthForCausalLM": {
+    "olmo3_siamese_depth": 10
+   },
+   "Ovis": {
+    "ovis": 10
+   },
+   "Prot2TextModel": {
+    "prot2text": 10
+   },
+   "Qwen2_5OmniForConditionalGeneration": {
+    "qwen2_5_omni": 10
+   },
+   "Qwen3OmniMoeForConditionalGeneration": {
+    "qwen3_omni_moe": 10
+   },
+   "ReformerModelWithLMHead": {
+    "reformer": 10
+   },
+   "RingAttentionGPT2LMHeadModel": {
+    "gpt2": 10
+   },
+   "TrainableM2MForConditionalGeneration": {
+    "m2m_100": 10
+   },
+   "modeling_sparsetral.MistralForCausalLM": {
+    "sparsetral": 10
+   },
+   "ACIPModel": {
+    "acip_model": 9
+   },
+   "BananaMind2NanoForCausalLM": {
+    "bananamind2_nano": 9
+   },
+   "BananaMind2PicoForCausalLM": {
+    "bananamind2_pico": 9
+   },
+   "BananaMind2ProForCausalLM": {
+    "bananamind2_pro": 9
+   },
+   "BlenderbotForCausalLM": {
+    "blenderbot": 9
+   },
+   "BlenderbotForConditionalGeneration": {
+    "blenderbot": 9
+   },
+   "BunnyPhiForCausalLM": {
+    "bunny-phi": 9
+   },
+   "ChessGPT": {
+    "chess_gpt": 9
+   },
+   "CognicaPoEForCausalLM": {
+    "cognica_poe": 9
+   },
+   "Evo2ForCausalLM": {
+    "evo2": 9
+   },
+   "GPTPanguForCausalLM": {
+    "gpt_pangu": 9
+   },
+   "HelpingAIForCausalLM": {
+    "HelpingAI": 9
+   },
+   "HybridQwen3ForCausalLM": {
+    "hybrid_qwen3": 9
+   },
+   "InstellaForCausalLM": {
+    "instella": 9
+   },
+   "Lfm2MoEForCausalLM": {
+    "lfm2": 9
+   },
+   "LightOnOCRForConditionalGeneration": {
+    "lightonocr": 9
+   },
+   "LlavaLlamaAttForCausalLM": {
+    "llava": 9
+   },
+   "LongcatFlashForCausalLM": {},
+   "MiniMindLM": {
+    "minimind": 9
+   },
+   "MoELLaVAQwen3ForCausalLM": {
+    "moe_llava_qwen3": 9
+   },
+   "MobileMoEForCausalLM": {
+    "mobilemoe": 9
+   },
+   "ParamBharatGenForCausalLM": {
+    "parambharatgen": 9
+   },
+   "Qwen2VLAudioForConditionalGeneration": {
+    "qwen2_vl": 9
+   },
+   "RECAST7b_LlamaForCausalLM": {
+    "recast7b_llama": 9
+   },
+   "RWKV": {},
+   "RobertaForMaskedLM": {
+    "roberta": 9
+   },
+   "Rwkv5ForCausalLM": {
+    "rwkv5": 9
+   },
+   "TFGPT2LMHeadModel": {
+    "gpt2": 9
+   },
+   "TPPForCausalLM": {},
+   "WeDLMForCausalLM": {
+    "wedlm": 9
+   },
+   "AliceAIForCausalLM": {
+    "alice_ai": 8
+   },
+   "BTLMLMHeadModel": {
+    "btlm": 8
+   },
+   "BartEncodecForConditionalGeneration": {
+    "bart": 8
+   },
+   "ColMaskMoELLaVAQwen3ForCausalLM": {
+    "col_mask_moe_llava_qwen3": 8
+   },
+   "DUO": {
+    "DUO": 8
+   },
+   "DeepForCausalLM": {
+    "deep": 8
+   },
+   "Dots1ForCausalLM": {
+    "dots1": 8
+   },
+   "DuchifatCore": {
+    "duchifat_v2": 8
+   },
+   "FP8Qwen2ForCausalLM": {
+    "fp8_qwen2": 8
+   },
+   "GPTOptim": {
+    "gpt_optimized": 8
+   },
+   "GigaChat35ForCausalLM": {
+    "gigachat3_5": 8
+   },
+   "GravityMoEForCausalLM": {
+    "gravity_moe": 8
+   },
+   "HYV4ForCausalLM": {
+    "hy_v4": 8
+   },
+   "HeliumForCausalLM": {
+    "helium": 8
+   },
+   "HyenaDNAForCausalLM": {
+    "hyenadna": 8
+   },
+   "LlavaMPTForCausalLM": {
+    "llava_mpt": 8
+   },
+   "LlavaQwen3ForCausalLM": {
+    "llava_qwen3": 8
+   },
+   "MiniGeminiLlamaForCausalLM": {},
+   "MllamaForConditionalGeneration": {
+    "mllama": 8
+   },
+   "MoSMambaForCausalLM": {
+    "MoSMamba": 8
+   },
+   "MolmoForCausalLM": {
+    "molmo": 8
+   },
+   "MonetForCausalLM": {
+    "monet": 8
+   },
+   "MosaicGPT": {
+    "mosaic_gpt": 8
+   },
+   "MoveDecoder": {
+    "rukh-move-decoder": 8
+   },
+   "MyLlamaForCausalLM": {
+    "llama": 8
+   },
+   "NemotronH_Nano_Omni_Reasoning_V3": {
+    "NemotronH_Nano_Omni_Reasoning_V3": 8
+   },
+   "OlmoModelForCausalLM": {
+    "olmo": 8
+   },
+   "Plamo3ForCausalLM": {
+    "plamo3": 8
+   },
+   "PolyverseForConditionalGeneration": {
+    "Polyverse": 8
+   },
+   "Qwen3Mamba3ForCausalLM": {
+    "qwen3_mamba3": 8
+   },
+   "TelechatForCausalLM": {
+    "telechat": 8
+   },
+   "TinyGDNForCausalLM": {
+    "tiny_gdn": 8
+   },
+   "TransfoXLLMHeadModel": {
+    "transfo-xl": 8
+   },
+   "Transformer": {
+    "IntelliKernel": 8
+   },
+   "TransnormerForCausalLM": {},
+   "TwinyForCausalLM": {
+    "twiny": 8
+   },
+   "ZgcmForCausalLM": {
+    "zgcm": 8
+   },
+   "_A2DQwen3LMHeadModel": {
+    "a2d-qwen3": 8
+   },
+   "BD3LM": {
+    "bd3lm": 7
+   },
+   "BigBirdForCausalLM": {
+    "big_bird": 7
+   },
+   "BlueLMForCausalLM": {
+    "BlueLM": 7
+   },
+   "BrujulaForCausalLM": {
+    "brujula": 7
+   },
+   "BunnyLlamaForCausalLM": {
+    "bunny-llama": 7
+   },
+   "BunnyPhi3ForCausalLM": {
+    "phi3": 7
+   },
+   "CanopyForCausalLM": {
+    "canopy": 7
+   },
+   "DynColMaskMoELLaVAQwen2ForCausalLM": {
+    "dyn_col_mask_moe_llava_qwen2": 7
+   },
+   "EduLLMForCausalLM": {
+    "mixtral": 7
+   },
+   "ExaoneMoeForCausalLM": {
+    "exaone_moe": 7
+   },
+   "GPT3DevLMHeadModel": {
+    "gpt3dev": 7
+   },
+   "Int8OPTForCausalLM": {
+    "opt": 7
+   },
+   "K3DSparkModel": {
+    "k3_dspark": 7
+   },
+   "LLaMAModel": {
+    "my_implementation_llama_new_new7": 7
+   },
+   "LizzyForCausalLM": {
+    "lizzy": 7
+   },
+   "LlavaGemmaForCausalLM": {
+    "llava_gemma": 7
+   },
+   "LongLlamaForCausalLM": {
+    "longllama": 7
+   },
+   "LongformerForSequenceClassification": {
+    "longformer": 7
+   },
+   "MiniMaxM1ForCausalLM": {
+    "minimax_m1": 7
+   },
+   "MiniMindForCausalLM": {
+    "minimind": 7
+   },
+   "NMMaskMoELLaVAPhiForCausalLM": {
+    "nm_mask_moe_llava_phi": 7
+   },
+   "NemotronHPuzzleForCausalLM": {
+    "nemotron_h_puzzle": 7
+   },
+   "NeuronSparkForCausalLM": {
+    "neuronspark": 7
+   },
+   "NovaForCausalLM": {
+    "nova": 7
+   },
+   "OpenSciForCausalLM": {
+    "opensci": 7
+   },
+   "PegasusForConditionalGeneration": {
+    "pegasus": 7
+   },
+   "Phi4FlashForCausalLM": {
+    "phi4flash": 7
+   },
+   "PhimoeForCausalLM": {
+    "phimoe": 7
+   },
+   "Plamo2ForCausalLM": {
+    "plamo2": 7
+   },
+   "ProGen2ForPreTraining": {
+    "progen2": 7
+   },
+   "Qwen3AudioWrappedForCausalLM": {
+    "qwen3_audio": 7
+   },
+   "Qwen3TDMoEForCausalLM": {
+    "qwen3_moe": 7
+   },
+   "SDARMoeForCausalLM": {
+    "sdar_moe": 7
+   },
+   "SpeckForCausalLM": {
+    "speck": 7
+   },
+   "T5Model": {
+    "t5": 7
+   },
+   "ASVDLlamaForCausalLM": {
+    "llama": 6
+   },
+   "AprielForCausalLM": {
+    "apriel": 6
+   },
+   "BaichuanM1ForCausalLM": {
+    "baichuan_m1": 6
+   },
+   "BlenderbotSmallForCausalLM": {
+    "blenderbot-small": 6
+   },
+   "BolmoForCausalLM": {
+    "bolmo": 6
+   },
+   "CENOPForCausalLM": {
+    "ceno": 6
+   },
+   "CLIPT5ForConditionalGeneration": {
+    "t5": 6
+   },
+   "CogAgentForCausalLM": {},
+   "CustomBartForConditionalGeneration": {
+    "bart": 6
+   },
+   "DeepQwenVLForCausalLM": {
+    "deepqwen_vl": 6
+   },
+   "DetikzifyCambrianForConditionalGeneration": {
+    "detikzify": 6
+   },
+   "Eagle3Speculator": {},
+   "EchoForCausalLM": {
+    "echo": 6
+   },
+   "FWKVLanguageModel": {
+    "fwkv": 6
+   },
+   "FunctionaryForCausalLM": {
+    "llama": 6
+   },
+   "GDN2ForCausalLM": {
+    "gdn2": 6
+   },
+   "GENERatorForCausalLM": {
+    "llama": 6
+   },
+   "GPT2LLMHeadModel": {
+    "gpt2l": 6
+   },
+   "GPTNeoForCausalLMTiered": {
+    "gpt_neo": 6
+   },
+   "GSAForCausalLM": {
+    "gsa": 6
+   },
+   "GemmoeForCausalLM": {
+    "gemmoe": 6
+   },
+   "HybridGPT2LMHeadModel": {
+    "hybrid_gpt2": 6
+   },
+   "Idefics3ForConditionalGeneration": {
+    "idefics3": 6
+   },
+   "ImpForCausalLM": {
+    "imp": 6
+   },
+   "InklingForConditionalGeneration": {
+    "inkling_mm_model": 6
+   },
+   "InternLMXComposer2ForCausalLM": {
+    "internlmxcomposer2": 6
+   },
+   "JugnuVRForCausalLM": {
+    "jugnu_vr": 6
+   },
+   "LSGBartForConditionalGeneration": {
+    "bart": 6
+   },
+   "LilleForCausalLM": {
+    "lille-130m": 6
+   },
+   "LlavaMambaForCausalLM": {
+    "llava_mamba": 6
+   },
+   "LoRDCoderForCausalLM": {
+    "lordcoder": 6
+   },
+   "MaskMoELLaVAQwen3ForCausalLM": {
+    "mask_moe_llava_qwen3": 6
+   },
+   "MediKoForCausalLM": {
+    "mediko": 6
+   },
+   "MiniCPMSALAForCausalLM": {
+    "minicpm_sala": 6
+   },
+   "MixtralMoleForCausalLM": {
+    "mixtralmole": 6
+   },
+   "MoAMetricLM": {
+    "moa_metric": 6
+   },
+   "MobileLLMP1ForCausalLM": {
+    "llama4_text": 6
+   },
+   "MyT5ForConditionalGeneration": {
+    "t5": 6
+   },
+   "NorovoxAlphaMoE": {
+    "norovox_alpha_moe": 6
+   },
+   "OLMo3ForCausalLM": {},
+   "PanguEmbeddedForCausalLM": {
+    "PanguEmbedded": 6
+   },
+   "PegasusForCausalLM": {
+    "pegasus": 6
+   },
+   "PointLLMLlamaForCausalLM": {
+    "chatpoint": 6
+   },
+   "Qwen2ChunkingForCausalLM": {
+    "qwen2_chunking": 6
+   },
+   "Qwen2ForCausalLMPostBlockSteeringFixed": {
+    "qwen2": 6
+   },
+   "Qwen2ForProcessRewardModel": {
+    "qwen2": 6
+   },
+   "QwenForCausalLM": {
+    "qwen.83": 6
+   },
+   "RandyGPTForCausalLM": {
+    "randygpt": 6
+   },
+   "ScratchLlamaForCausalLM": {
+    "scratch_llama": 6
+   },
+   "SpatialLMQwenForCausalLM": {
+    "spatiallm_qwen": 6
+   },
+   "StarVectorForCausalLM": {
+    "starvector": 6
+   },
+   "T2MLRWrapper": {
+    "t2mlr": 6
+   },
+   "T5EncoderModel": {
+    "t5": 6
+   },
+   "TPUGemma3ForCausalLM": {
+    "tpu_gemma3": 6
+   },
+   "TrillionForCausalLM": {
+    "trillion": 6
+   },
+   "UMT5ForConditionalGeneration": {
+    "umt5": 6
+   },
+   "UrchinParallelForCausalLM": {
+    "urchin_parallel": 6
+   },
+   "UserLlamaForCausalLM": {
+    "llama": 6
+   },
+   "ZambaForCausalLM": {
+    "zamba": 6
+   },
+   "AILOForCausalLM": {
+    "ailo": 5
+   },
+   "AnuLMForCausalLM": {
+    "anulm": 5
+   },
+   "BottleneckT5LMWithPerturb": {
+    "t5": 5
+   },
+   "CWICForCausalLM": {
+    "cwic": 5
+   },
+   "CogVLMVideoForCausalLM": {},
+   "DashQPhi3ForCausalLM": {
+    "phi3": 5
+   },
+   "DashQQwen2ForCausalLM": {
+    "qwen2": 5
+   },
+   "DeciCoderForCausalLM": {},
+   "DetikzifyForCausalLM": {
+    "detikzify": 5
+   },
+   "EmbformerForCausalLM": {
+    "embformer": 5
+   },
+   "ErnieForCausalLM": {
+    "ernie": 5
+   },
+   "EsmcARForCausalLM": {
+    "esmc_ar": 5
+   },
+   "Fast_dLLM_QwenForCausalLM": {
+    "Fast_dLLM_Qwen": 5
+   },
+   "FineWebForCausalLM": {
+    "fineweb_decoder": 5
+   },
+   "FlamingoForConditionalGeneration": {
+    "flamingo": 5
+   },
+   "GearForCausalLM": {
+    "gear": 5
+   },
+   "HGRN2ForCausalLM": {
+    "hgrn2": 5
+   },
+   "HawkForCausalLM": {
+    "hawk": 5
+   },
+   "HelloWorldModel": {
+    "hello-world": 5
+   },
+   "INFLMForCausalLM": {
+    "inflm": 5
+   },
+   "IdeficsForVisionText2Text": {
+    "idefics": 5
+   },
+   "JetMoeForCausalLM": {
+    "jetmoe": 5
+   },
+   "KANGPT2LMHeadModel": {
+    "KANGPT2": 5
+   },
+   "KirimForCausalLM": {
+    "kirim": 5
+   },
+   "KlyraForCausalLM": {
+    "klyra": 5
+   },
+   "Lfm2VlForConditionalGeneration": {
+    "lfm2-vl": 5
+   },
+   "LlamaGlideDecoderLayer": {
+    "llama": 5
+   },
+   "LlavaGpt2ForCausalLM": {
+    "llava-jp": 5
+   },
+   "M2RForCausalLM": {
+    "m2r": 5
+   },
+   "MaincoderForCausalLM": {
+    "maincoder": 5
+   },
+   "MambaInQwenForCausalLM": {
+    "mamba-in-qwen": 5
+   },
+   "MobileLlamaForCausalLM": {
+    "mobilevlm": 5
+   },
+   "NGMEForCausalLM": {
+    "ngme": 5
+   },
+   "NanoTransformer": {
+    "nano-transformer": 5
+   },
+   "OlmoHybridForCausalLM": {
+    "olmo_hybrid": 5
+   },
+   "PhariaForCausalLM": {
+    "pharia-v1": 5
+   },
+   "Phi3Model": {
+    "phi3": 5
+   },
+   "PhoneLMForCausalLM": {
+    "phonelm": 5
+   },
+   "QuasarLongForCausalLM": {
+    "quasar_long": 5
+   },
+   "Qwen2TSForCausalLM": {
+    "chatts": 5
+   },
+   "Qwen2_5OmniModel": {
+    "qwen2_5_omni": 5
+   },
+   "Qwen3AttnResForCausalLM": {
+    "qwen3_attnres": 5
+   },
+   "RWKV6Qwen2ForCausalLM": {
+    "rwkv6qwen2": 5
+   },
+   "ReplitLM": {
+    "replit_lm": 5
+   },
+   "RosettaForCausalLM": {
+    "rosetta": 5
+   },
+   "RwkvHybridForCausalLM": {
+    "rwkv_hybrid": 5
+   },
+   "Share4VLlamaForCausalLM": {
+    "share4v": 5
+   },
+   "SiQ_VLForCausalLM": {
+    "siq_vl": 5
+   },
+   "SmalLmForCausalLM": {
+    "smallm": 5
+   },
+   "SmallThinkerForCausalLM": {
+    "smallthinker": 5
+   },
+   "SolarForCausalLM": {
+    "solar": 5
+   },
+   "StableLMAlphaForCausalLM": {
+    "stablelm_alpha": 5
+   },
+   "TinyMixtralForCausalLM": {
+    "tinymixtral": 5
+   },
+   "UniPhysGenQwen3ForCausalLM": {
+    "uniphysgen_qwen3": 5
+   },
+   "XQwen3ForCausalLM": {
+    "qwen3": 5
+   },
+   "ActivationsGPTNeoForCausalLM": {
+    "activations_gpt_neo": 4
+   },
+   "AraGPT2LMHeadModel": {
+    "aragpt2": 4
+   },
+   "ArcticForCausalLM": {
+    "arctic": 4
+   },
+   "AsteriskForCausalLM": {
+    "asterisk": 4
+   },
+   "AttnQwenForCausalLM": {
+    "attnqwen3": 4
+   },
+   "BabyLMParaRNNForCausalLM": {
+    "babylm_pararnn": 4
+   },
+   "BananaMind2MiniForCausalLM": {
+    "bananamind2_mini": 4
+   },
+   "BertForSequenceClassification": {
+    "bert": 4
+   },
+   "BitMamba2LM": {
+    "bitmamba": 4
+   },
+   "BlockFFNForCausalLM": {
+    "blockffn": 4
+   },
+   "CableModel": {
+    "cable": 4
+   },
+   "CagliostroForCausalLM": {
+    "cagliostro": 4
+   },
+   "CambrianLlamaForCausalLM": {
+    "cambrian_llama": 4
+   },
+   "ChessTRMForCausalLM": {
+    "chess_trm": 4
+   },
+   "Cohere2VisionForConditionalGeneration": {
+    "cohere2_vision": 4
+   },
+   "ComplexKDAForCausalLM": {
+    "complex_kda": 4
+   },
+   "CpmBeeForCausalLM": {
+    "cpmbee": 4
+   },
+   "CrystalCoderLMHeadModel": {
+    "crystalcoder": 4
+   },
+   "CustomModel": {
+    "gpt_neox": 4
+   },
+   "CustomPegasusForConditionalGeneration": {
+    "pegasus": 4
+   },
+   "DashQQwen3_5MoeForCausalLM": {
+    "qwen3_5_moe_text": 4
+   },
+   "DeltaNetForCausalLM": {
+    "delta_net": 4
+   },
+   "DiffuQwen35": {
+    "diffuqwen35": 4
+   },
+   "DuoLagunaForCausalLM": {
+    "laguna": 4
+   },
+   "EffT5ForConditionalGeneration": {
+    "t5": 4
+   },
+   "EfficientDLM": {
+    "qwen3": 4
+   },
+   "Emu3ForCausalLM": {
+    "Emu3": 4
+   },
+   "EngGPTMoeForCausalLM": {
+    "enggpt_moe": 4
+   },
+   "ExtendedLlamaForCausalLM": {
+    "extended-llama": 4
+   },
+   "ExtendedMptForCausalLM": {
+    "extended-mpt": 4
+   },
+   "FHN_T4Max_150M": {
+    "fhn_concept_gau": 4
+   },
+   "FP8LlamaForCausalLM": {
+    "fp8_llama": 4
+   },
+   "Fuse3ForCausalLM": {
+    "fuse3": 4
+   },
+   "G9v3ForCausalLM": {
+    "g9v3": 4
+   },
+   "GPTCustomForCausalLM": {
+    "gpt-custom": 4
+   },
+   "GPTModel": {
+    "gpt": 4
+   },
+   "GPTX2ForCausalLM": {
+    "gptx2": 4
+   },
+   "Gemma2Model": {
+    "gemma2": 4
+   },
+   "Gemma3TextModel": {
+    "gemma3_text": 4
+   },
+   "GemmaModel": {
+    "gemma": 4
+   },
+   "GistLlamaForCausalLM": {
+    "llama": 4
+   },
+   "HybridEchoForCausalLM": {
+    "echo_hybrid": 4
+   },
+   "HyenaDnaForCausalLM": {
+    "hyenadna": 4
+   },
+   "HyperNetEmbeddedQwen2ForCausalLM": {
+    "qwen2": 4
+   },
+   "IsaacForConditionalGeneration": {
+    "isaac": 4
+   },
+   "KosineForCausalLM": {
+    "fasty": 4
+   },
+   "LCKVLlamaForCausalLM": {
+    "lckv-llama": 4
+   },
+   "LLamaSynCABEL": {
+    "llama_syncabel": 4
+   },
+   "LatentMoELLaVAPhiForCausalLM": {
+    "latent_moe_llava_phi": 4
+   },
+   "Lfm2DSparkDraftModel": {
+    "qwen3": 4
+   },
+   "LlamaWithIntervention": {
+    "llama": 4
+   },
+   "LlavaCrystalForCausalLM": {
+    "llava_crystal": 4
+   },
+   "LlavaMiniLlamaForCausalLM": {
+    "llava_mini_llama": 4
+   },
+   "LlavaPhi3ForCausalLM": {
+    "llava_phi3": 4
+   },
+   "LlavaQwen1_5ForCausalLM": {
+    "llava_qwen1_5": 4
+   },
+   "LoamForCausalLM": {
+    "loam": 4
+   },
+   "MPLUGDocOwlForConditionalGeneration": {
+    "mplugdocowl": 4
+   },
+   "MambaModelForCausalLM": {
+    "mamba": 4
+   },
+   "MegrezMoeForCausalLM": {
+    "megrez_moe": 4
+   },
+   "MiniGPTForCausalLM": {
+    "minigpt": 4
+   },
+   "MiniMaxForCausalLM": {
+    "minimax": 4
+   },
+   "MistralStarForCausalLM": {
+    "mistral": 4
+   },
+   "MoLMForCausalLM": {
+    "molm": 4
+   },
+   "Muse2ForCausalLM": {
+    "muse2": 4
+   },
+   "MyLLaMa": {
+    "LLaMa": 4
+   },
+   "NGen3ForCasualLM": {
+    "NGen3": 4
+   },
+   "NaiveN05FlashForCausalLM": {
+    "naive_n05_flash": 4
+   },
+   "NanoExpandForCausalLM": {
+    "sn38-nanoexpand": 4
+   },
+   "NemotronFlashForCausalLM": {
+    "nemotron_flash": 4
+   },
+   "NexusForCausalLM": {
+    "nexus": 4
+   },
+   "NorT5ForConditionalGeneration": {},
+   "OtterForConditionalGeneration": {
+    "otter": 4
+   },
+   "OutlierMoEForCausalLM": {
+    "outlier_moe": 4
+   },
+   "PawLlamaForCausalLM": {
+    "llama": 4
+   },
+   "PebbleForCausalLM": {
+    "pebble_25m": 4
+   },
+   "PersimmonForCausalLM": {
+    "persimmon": 4
+   },
+   "Phi2MoeForCausalLM": {
+    "phi2moe": 4
+   },
+   "PipelinedBartForConditionalGeneration": {
+    "bart": 4
+   },
+   "PlasmidLMForCausalLM": {
+    "plasmid_lm": 4
+   },
+   "PlusModelForCausalLM": {
+    "nano": 4
+   },
+   "QaptaanForCausalLM": {
+    "qaptaan": 4
+   },
+   "QuarkForCausalLM": {
+    "quark": 4
+   },
+   "Qwen2AudioTimeForConditionalGeneration": {
+    "qwen2_audio": 4
+   },
+   "Qwen3ASRForConditionalGeneration": {
+    "qwen3_asr": 4
+   },
+   "Qwen3ASVDForCausalLM": {
+    "qwen3_asvd": 4
+   },
+   "Qwen3SharedMoeForCausalLM": {
+    "qwen3_shared_moe": 4
+   },
+   "Qwen3SparseMoBEForCausalLM": {
+    "qwen3_moe": 4
+   },
+   "QwerkyLlamaMambaHybridForCausalLM": {
+    "qwerky_llama_mamba_hybrid": 4
+   },
+   "RITAModelForCausalLM": {
+    "rita": 4
+   },
+   "RaggedGemma4ForCausalLM": {
+    "gemma4_text": 4
+   },
+   "RaggedGptOssForCausalLM": {
+    "gpt_oss": 4
+   },
+   "RaggedQwen3_5MoeForCausalLM": {
+    "qwen3_5_moe_text": 4
+   },
+   "RecursiveCompressorLM": {
+    "recursive_compressor": 4
+   },
+   "RuGPT3XLForCausalLM": {
+    "rugpt3xl": 4
+   },
+   "SLMForCausalLM": {
+    "slm": 4
+   },
+   "SeerAttnLlamaForCausalLM": {
+    "llama": 4
+   },
+   "ShikraLlamaForCausalLM": {
+    "shikra": 4
+   },
+   "SlimMoEForCausalLM": {
+    "slim_moe": 4
+   },
+   "SparseASTForCausalLM": {
+    "sparse_ast": 4
+   },
+   "SquaredReLUQwen3ForCausalLM": {
+    "qwen3": 4
+   },
+   "StableDiffcoderForCausalLM": {
+    "llama": 4
+   },
+   "Step3p7ForConditionalGeneration": {
+    "step3p7": 4
+   },
+   "SurjoForCausalLM": {
+    "surjo": 4
+   },
+   "T5Gemma2ForConditionalGeneration": {
+    "t5gemma2": 4
+   },
+   "T5LAForConditionalGeneration": {
+    "t5la": 4
+   },
+   "TPULlamaForCausalLM": {
+    "tpu_llama": 4
+   },
+   "TRMTextISMForCausalLM": {
+    "trm_text_ism": 4
+   },
+   "TanukiForCausalLM": {
+    "Tanuki": 4
+   },
+   "TaoNetForCausalLM": {
+    "taonet": 4
+   },
+   "Telechat3ForCausalLM": {
+    "telechat3": 4
+   },
+   "TransformerModel": {
+    "tinychat": 4
+   },
+   "TrimKVQwen3ForCausalLM": {
+    "qwen3": 4
+   },
+   "UrvashiForCausalLM": {
+    "urvashi": 4
+   },
+   "VILAForCasualLM": {
+    "vila": 4
+   },
+   "VaetkiForCausalLM": {
+    "vaetki": 4
+   },
+   "ValleyLlamaForCausalLM": {
+    "Valley": 4
+   },
+   "VexionGPTForCausalLM": {
+    "vexion_gpt": 4
+   },
+   "VulavulaLlamaForCausalLM": {
+    "llama": 4
+   },
+   "_SimpleLMForCausalLM": {
+    "simple_lm": 4
+   },
+   "i3HybridModel": {
+    "rwkv-hybrid": 4
+   },
+   "A2DGPTNeoXForCausalLM": {
+    "a2d-gpt-neox": 3
+   },
+   "AETHERV27wayForCausalLM": {
+    "aether_v2_7way": 3
+   },
+   "AlignGPTForCausalLM": {
+    "aligngpt": 3
+   },
+   "AndreaForCausalLM": {
+    "andrea": 3
+   },
+   "Apertus1p5ForConditionalGeneration": {
+    "apertus1p5": 3
+   },
+   "AttnExtForCausalLM": {
+    "attn_ext": 3
+   },
+   "AxionForCausalLM": {
+    "axion": 3
+   },
+   "AxonForCausalLM": {
+    "gpt2": 3
+   },
+   "BAAR25_3M": {
+    "baar25": 3
+   },
+   "BananaMind21Lite25MForCausalLM": {
+    "bananamind21_lite_25m": 3
+   },
+   "BananaMind21UnifiedForCausalLM": {
+    "bananamind21_unified": 3
+   },
+   "Beit3LlavaLlamaForCausalLM": {
+    "beit3_llava": 3
+   },
+   "BharatGPTForCausalLM": {
+    "bharatgpt": 3
+   },
+   "BigBirdPegasusForCausalLM": {
+    "bigbird_pegasus": 3
+   },
+   "BlazeForCausalLM": {
+    "blaze": 3
+   },
+   "CFRDForCausalLM": {
+    "cfrd": 3
+   },
+   "CoRMForCausalLM": {
+    "corm": 3
+   },
+   "CodeLlamaForCausalLM": {
+    "llama": 3
+   },
+   "CodeShellForCausalLM": {
+    "kclgpt": 3
+   },
+   "Cohere2Model": {
+    "cohere2": 3
+   },
+   "ColMaskMoELLaVAQwen2ForCausalLM": {
+    "col_mask_moe_llava_qwen2": 3
+   },
+   "CosmicFish": {
+    "cosmicfish": 3
+   },
+   "CustomDecoderOnlyT5": {
+    "custom_decoder_only_t5": 3
+   },
+   "CustomGPT2LMHeadModel": {
+    "gpt2": 3
+   },
+   "CyclicFlowAttentionForCausalLM": {
+    "cyclic_flow_attention": 3
+   },
+   "DFlashLagunaForCausalLM": {
+    "laguna": 3
+   },
+   "DashQLlamaForCausalLM": {
+    "llama": 3
+   },
+   "DeepseekV3ForCausalLMNextN": {
+    "deepseek_v3": 3
+   },
+   "DeltalmForConditionalGeneration": {
+    "Deltalm": 3
+   },
+   "DenseformerForCausalLM": {
+    "llama": 3
+   },
+   "DharaARForCausalLM": {
+    "dhara_ar": 3
+   },
+   "DiCoWForConditionalGeneration": {
+    "dicow": 3
+   },
+   "DistributedLlamaForCausalLM": {
+    "llama": 3
+   },
+   "DockGenModel": {
+    "dockgen": 3
+   },
+   "Doge2ForCausalLM": {
+    "doge2": 3
+   },
+   "EVELlamaForCausalLM": {
+    "eve": 3
+   },
+   "EmovaQwen2ForCausalLM": {
+    "emova_qwen2": 3
+   },
+   "EnergyTransformer": {},
+   "ErniePixelForCausalLM": {
+    "ernie-pixel": 3
+   },
+   "Evo1ForCausalLM": {
+    "evo1": 3
+   },
+   "FSDPQwen3ForCausalLM": {
+    "qwen3": 3
+   },
+   "FineRMoeForCausalLM": {
+    "finer_moe": 3
+   },
+   "FlyForCausalLM": {
+    "fly": 3
+   },
+   "ForCausalLM": {
+    "gemma4": 3
+   },
+   "FreedomOmegaForCausalLM": {
+    "freedom_omega": 3
+   },
+   "FuxiTranyuForCausalLM": {
+    "fuxitranyu": 3
+   },
+   "GADForAgenticModeling": {
+    "gad_decoder": 3
+   },
+   "GFusionForDiffusionLM": {
+    "deepseek_v3": 3
+   },
+   "GLaMMForCausalLM": {
+    "llava": 3
+   },
+   "GPT2": {
+    "gpt2": 3
+   },
+   "GPT2ForCausalLM": {
+    "gpt2": 3
+   },
+   "GPT2ForSequenceClassification": {
+    "gpt2": 3
+   },
+   "GPT2MIMOLMHeadModel": {
+    "gpt2mimo": 3
+   },
+   "GPT2RoPEForCausalLM": {
+    "gpt2_rope": 3
+   },
+   "GPTLMHeadModel": {
+    "openai-gpt": 3
+   },
+   "GPTModelForTextGeneration": {
+    "custom_gpt": 3
+   },
+   "GPTNeoXJapaneseForCausalLM": {
+    "gpt_neox_japanese": 3
+   },
+   "GPTRefactForCausalLM": {
+    "gpt_refact": 3
+   },
+   "GRIN-MoE": {
+    "grinmoe": 3
+   },
+   "GRetrieverModel": {
+    "llama": 3
+   },
+   "GazelleForConditionalGeneration": {
+    "gazelle": 3
+   },
+   "GeluGPTForCausalLM": {
+    "gelu_gpt": 3
+   },
+   "Gemma2MoeForCausalLM": {
+    "gemma2moe": 3
+   },
+   "Gemma3Model": {
+    "gemma3": 3
+   },
+   "GiddForDiffusionLM": {
+    "gidd": 3
+   },
+   "GistT5ForConditionalGeneration": {
+    "t5": 3
+   },
+   "Glm4vForConditionalGeneration": {
+    "glm4v": 3
+   },
+   "GuppyLM": {
+    "guppylm": 3
+   },
+   "HCXVisionForCausalLM": {
+    "hyperclovax_vlm": 3
+   },
+   "HCXVisionV2ForCausalLM": {
+    "vlm": 3
+   },
+   "HebrewGPTForCausalLM": {
+    "hebrew-gpt": 3
+   },
+   "HenlaConfedForCausalLM": {
+    "henla_confed": 3
+   },
+   "HgrnForCausalLM": {
+    "hgrn": 3
+   },
+   "HrmTextMoEForCausalLM": {
+    "hrm_text_moe": 3
+   },
+   "HybridForCausalLM": {
+    "hybrid_model": 3
+   },
+   "InternS2PreviewForConditionalGeneration": {
+    "intern_s2_preview": 3
+   },
+   "InternVLForConditionalGeneration": {
+    "internvl": 3
+   },
+   "Jais2ForCausalLM": {
+    "jais2": 3
+   },
+   "KW5V2ForCausalLM": {
+    "kw5v2": 3
+   },
+   "Kanana2TinyForCausalLM": {
+    "kanana2_tiny": 3
+   },
+   "KayraForCausalLM": {
+    "kayra": 3
+   },
+   "KeyLM75M": {
+    "keylm75m": 3
+   },
+   "KeystoneFuseForCausalLM": {
+    "KeystoneFuse": 3
+   },
+   "KlearMoeForCausalLM": {
+    "Klear": 3
+   },
+   "KoGumForCausalLM": {
+    "kogum": 3
+   },
+   "KonkanGPT": {
+    "konkangpt": 3
+   },
+   "LLTransformerForCausalLM": {
+    "LLTransformer": 3
+   },
+   "LLaDAForCausalLM": {
+    "llada": 3
+   },
+   "LLaMA": {
+    "pavl0_llama": 3
+   },
+   "LMHeadWithValueModel": {
+    "gpt2": 3
+   },
+   "LOLALMHeadModel": {
+    "lola_v1": 3
+   },
+   "LSTLlamaForCausalLM": {
+    "lst": 3
+   },
+   "LSTMForCausalLM": {
+    "lstm_lm": 3
+   },
+   "LatexForCausalLM": {
+    "latex": 3
+   },
+   "LayerWiseMiniCPMForCausalLM": {
+    "minicpm": 3
+   },
+   "LightningForCausalLM": {
+    "lightning": 3
+   },
+   "Llama2BiasModel": {
+    "llama2_bias": 3
+   },
+   "LlamaForConditionalGeneration": {
+    "llama": 3
+   },
+   "LlamaForSequenceClassification": {
+    "llama": 3
+   },
+   "Llamavision": {
+    "llamavision": 3
+   },
+   "LlavaForCausalLM": {
+    "llava": 3
+   },
+   "LongcatNextForCausalLM": {
+    "longcat_next": 3
+   },
+   "LongformerEncoderBARTDecoderForConditionalGeneration": {
+    "bart": 3
+   },
+   "LowOnMindForCausalLM": {
+    "lowonmind": 3
+   },
+   "LumeesForCausalLM": {
+    "lumees": 3
+   },
+   "LummaForCausalLM": {
+    "Lumma": 3
+   },
+   "MabaSparseForCausalLM": {
+    "maba_sparse": 3
+   },
+   "Maira2ForConditionalGeneration": {
+    "maira2": 3
+   },
+   "MambaModel": {
+    "mamba": 3
+   },
+   "MatriochkaForCausalLM": {
+    "matriochka": 3
+   },
+   "MeshModel": {
+    "mesh": 3
+   },
+   "MetisMoRLMHeadModel": {
+    "metis_mor_transformer": 3
+   },
+   "MidmLMHeadModel": {
+    "midm-bitext-S": 3
+   },
+   "MiniBananaForCausalLM": {
+    "minibanana": 3
+   },
+   "MiniBeatrixForCausalLM": {
+    "mini-beatrix": 3
+   },
+   "MiniMindOmni": {
+    "minimind-o": 3
+   },
+   "MoEGPTForCausalLM": {
+    "moe_gpt": 3
+   },
+   "MoELLaVAPhiForCausalLM": {
+    "moe_llava_phi": 3
+   },
+   "MoELLaVAQwen1_5ForCausalLM": {
+    "moe_llava_qwen1_5": 3
+   },
+   "MoELLaVAStablelmForCausalLM": {
+    "moe_llava_stablelm": 3
+   },
+   "MoLAForCausalLM": {
+    "mola_lm": 3
+   },
+   "ModuleFormerForCausalLM": {
+    "moduleformer": 3
+   },
+   "MolLLaMA": {
+    "mol_llama": 3
+   },
+   "MolmoForConditionalGeneration": {
+    "molmo": 3
+   },
+   "MonoFormerForCausalLM": {
+    "llama": 3
+   },
+   "MoonfrostForCausalLM": {
+    "moonfrost": 3
+   },
+   "MuToRGemmaForCausalLM": {
+    "gemma": 3
+   },
+   "MultiscreenForCausalLM": {
+    "multiscreen": 3
+   },
+   "MyModelForCausalLM": {
+    "mixtral": 3
+   },
+   "NGen4ForCausalLM": {
+    "ngen4": 3
+   },
+   "NdmForCausalLM": {
+    "ndm": 3
+   },
+   "NemotronDenseAudexForConditionalGeneration": {
+    "nemotron_dense_audex": 3
+   },
+   "NemotronHAudexForConditionalGeneration": {
+    "nemotron_h_audex": 3
+   },
+   "NeuroBLASTForCausalLM": {
+    "neuroblast": 3
+   },
+   "Nova1ForCausalLM": {
+    "nova1": 3
+   },
+   "OdinNextForCausalLM": {
+    "odinnext": 3
+   },
+   "OffsetLlamaForCausalLM": {
+    "llama": 3
+   },
+   "Olmo2ForSequenceClassification": {
+    "olmo2": 3
+   },
+   "Open1BForCausalLM": {
+    "open1b": 3
+   },
+   "OpenMythosForCausalLM": {
+    "open_mythos": 3
+   },
+   "OpenThaiWilaiForCausalLM": {
+    "OpenThaiWilai": 3
+   },
+   "OrthrusLM": {
+    "qwen3": 3
+   },
+   "OspreyLlamaForCausalLM": {
+    "osprey": 3
+   },
+   "PM_MiniFinLLM_Model": {
+    "PM_MiniFinLLM": 3
+   },
+   "PaloForCausalLM": {
+    "palo": 3
+   },
+   "PeftModelForCausalLM": {
+    "llama": 3
+   },
+   "PenguinVLQwen3ForCausalLM": {
+    "penguinvl_qwen3": 3
+   },
+   "PipelinedGPT2LMHeadModel": {
+    "gpt2": 3
+   },
+   "PipelinedT5ForConditionalGeneration": {
+    "t5": 3
+   },
+   "ProphetNetForCausalLM": {
+    "prophetnet": 3
+   },
+   "PrunedQwen3_5MoeForCausalLM": {
+    "pruned_qwen3_5_moe": 3
+   },
+   "QUSSMForCausalLM": {
+    "qu_ssm": 3
+   },
+   "QovaryxForCausalLM": {
+    "qovaryx": 3
+   },
+   "Qwen2AdapterForCausalLM": {
+    "qwen2_adapter": 3
+   },
+   "Qwen2QuaRotForCausalLM": {
+    "qwen2": 3
+   },
+   "Qwen3ForGuardModel": {
+    "qwen3": 3
+   },
+   "Qwen3MoBEForCausalLM": {
+    "qwen3_moe": 3
+   },
+   "Qwen3TSForCausalLM": {
+    "qwen3ts": 3
+   },
+   "Qwen3_5DLLMForConditionalGeneration": {
+    "qwen3_5": 3
+   },
+   "Qwen3_Hybrid_OC_ForCausalLM": {
+    "qwen3": 3
+   },
+   "QwenDFlareDraftModel": {
+    "qwen3": 3
+   },
+   "RecombinationTransformerForCausalLM": {
+    "RecombinationTransformer": 3
+   },
+   "RecurrentQwenForCausalLM": {
+    "recurrent_qwen": 3
+   },
+   "RoseX1ForCausalLM": {
+    "rose_x1": 3
+   },
+   "RostForCausalLM": {
+    "rost": 3
+   },
+   "SDLMQwen2ForCausalLM": {
+    "qwen2": 3
+   },
+   "SLM": {
+    "custom": 3
+   },
+   "SMModelForCausalLM": {
+    "SMModelForCausalLM": 3
+   },
+   "SeerAttnQwen2ForCausalLM": {
+    "qwen2": 3
+   },
+   "SentinelBrainForCausalLM": {
+    "sentinel_brain": 3
+   },
+   "Sewy3ForCausalLM": {
+    "Sewy3": 3
+   },
+   "SewyV2ForCausalLM": {
+    "Sewy_v2": 3
+   },
+   "ShivikM4ForCausalLM": {
+    "shivik_m4": 3
+   },
+   "SkyCRESTForCausalLM": {
+    "sky-crest": 3
+   },
+   "SkyForCausalLM": {
+    "sky_v1_3": 3
+   },
+   "SledForConditionalGeneration": {
+    "tau/sled": 3
+   },
+   "SoraForSLM": {
+    "sora_slm": 3
+   },
+   "SovythosModel": {
+    "sovythos": 3
+   },
+   "SpatialLMLlamaForCausalLM": {
+    "spatiallm_llama": 3
+   },
+   "Speech2TextTransformerForConditionalGeneration": {
+    "speech_to_text_transformer": 3
+   },
+   "SphericalKANByteLM": {
+    "harmonic_spherical_kan_byte_lm": 3
+   },
+   "SrcProberForConditionalGeneration": {
+    "rad-prober": 3
+   },
+   "StieltjesGPT2ForCausalLM": {
+    "stieltjes_gpt2": 3
+   },
+   "SusonoForCausalLM": {
+    "susono": 3
+   },
+   "SwarmForCausalLM": {
+    "swarm_agi": 3
+   },
+   "TRHashForCausalLM": {
+    "tr_hash_moe": 3
+   },
+   "TTTLinearForCausalLM": {
+    "ttt_linear": 3
+   },
+   "TTTMLPForCausalLM": {
+    "ttt_mlp": 3
+   },
+   "TarsierForConditionalGeneration": {
+    "llava": 3
+   },
+   "TinyLM2": {
+    "TinyLM2": 3
+   },
+   "TinyLlavaPhiForCausalLM": {
+    "tiny_llava_phi": 3
+   },
+   "TinyTurkGPTV27": {
+    "tinyturk": 3
+   },
+   "TinyWayForCausalLM": {
+    "tinyway": 3
+   },
+   "TranceptionLMHeadModel": {
+    "gpt2": 3
+   },
+   "TreeFlashDraftModel": {
+    "qwen3": 3
+   },
+   "TrtcV4ForCausalLM": {
+    "trtc_v4": 3
+   },
+   "UnifiedRootformerV12": {
+    "rootformer": 3
+   },
+   "UpcycledLlamaForCausalLM": {
+    "upcycled_llama": 3
+   },
+   "VMistralForVisionText2Text": {
+    "vmistral": 3
+   },
+   "VaswaniRoPEForConditionalGeneration": {
+    "vaswani": 3
+   },
+   "VaultGemmaForCausalLM": {
+    "vaultgemma": 3
+   },
+   "VideoBlipForConditionalGeneration": {
+    "video_blip": 3
+   },
+   "WiolaForCausalLM": {
+    "wiola": 3
+   },
+   "YsnrfdForCausalLM": {
+    "ysnrfd": 3
+   },
+   "Zarya": {
+    "zarya": 3
+   },
+   "ZsGPT2LMHeadModel": {
+    "gpt2": 3
+   },
+   "modeling_camelidae.LlamaForCausalLM": {
+    "camelidae": 3
+   },
+   "modeling_llama_butler.LlamaButlerForCausalLM": {
+    "llama_butler": 3
+   },
+   "vwLlamaForCausalLM": {
+    "llava": 3
+   },
+   "xLSTMForCausalLM": {
+    "xlstm": 3
+   },
+   "ABIRForCausalLM": {
+    "abir-slm": 2
+   },
+   "AILOLoopForCausalLM": {
+    "ailo": 2
+   },
+   "AQForCausalLM": {
+    "aq": 2
+   },
+   "AROBabyLMForCausalLM": {
+    "aro_babylm": 2
+   },
+   "ASGTransformerForCausalLM": {
+    "asg_transformer": 2
+   },
+   "AWQCompatibleLlamaForCausalLM": {
+    "llama": 2
+   },
+   "AWQCompatibleQwen2ForCausalLM": {
+    "qwen2": 2
+   },
+   "AXK1ForCausalLM": {
+    "axk1": 2
+   },
+   "AXK2ForCausalLM": {
+    "axk2": 2
+   },
+   "AceRAG": {
+    "AceRAG": 2
+   },
+   "AdditionForCausalLM": {
+    "fixed-width-addition": 2
+   },
+   "AdelicLlamaForCausalLM": {
+    "adelic_llama": 2
+   },
+   "AlexaLlamaForCausalLM": {
+    "alexallm-v2": 2
+   },
+   "AmadablamForCausalLM": {
+    "amadablam": 2
+   },
+   "Apriel2ForConditionalGeneration": {
+    "apriel2": 2
+   },
+   "AquilaDenseForCausalLM": {
+    "aquiladense": 2
+   },
+   "AquilaMoeForCausalLM": {
+    "aquilamoe": 2
+   },
+   "ArabicGPTModel": {
+    "arabic-gpt": 2
+   },
+   "ArlowForCausalLM": {
+    "arlow": 2
+   },
+   "AudioQwen2VLForConditionalGeneration": {
+    "qwen2_vl_audio": 2
+   },
+   "AuroraForCausalLM": {
+    "llama": 2
+   },
+   "AuroraGPT2ForCausalLM": {
+    "aurora-gpt2": 2
+   },
+   "BDH": {
+    "bdh": 2
+   },
+   "BETForCausalLM": {
+    "bet": 2
+   },
+   "BabyLMForCausalLM": {
+    "babylm": 2
+   },
+   "BacformerForCausalGM": {
+    "bacformer": 2
+   },
+   "BackpackGPT2LMHeadModel": {
+    "gpt2": 2
+   },
+   "BananaAllForCausalLM": {
+    "bananaall": 2
+   },
+   "BananaMind21CoderForCausalLM": {
+    "bananamind21_coder": 2
+   },
+   "BananaMind2MediumForCausalLM": {
+    "bananamind2_medium": 2
+   },
+   "BananaMind2MicroForCausalLM": {
+    "bananamind2_micro": 2
+   },
+   "BarbetForCausalLM": {
+    "barbet": 2
+   },
+   "BareTorchForCausalLM": {
+    "baretorch": 2
+   },
+   "BartForSequenceClassification": {
+    "bart": 2
+   },
+   "BertGenerationDecoder": {
+    "bert-generation": 2
+   },
+   "BharatAI": {
+    "BharatAI": 2
+   },
+   "BigBirdPegasusForConditionalGeneration": {
+    "bigbird_pegasus": 2
+   },
+   "BijaForCausalLM": {
+    "bija": 2
+   },
+   "BinaryLLMForCausalLM": {
+    "binaryllm": 2
+   },
+   "Bonsai2ForCausalLM": {
+    "qwen3_5_text": 2
+   },
+   "BoomerForCausalLM": {
+    "boomer": 2
+   },
+   "BosunForDecision": {
+    "bosun": 2
+   },
+   "Braille256Model": {
+    "braille256": 2
+   },
+   "BrumbyForCausalLM": {
+    "brumby": 2
+   },
+   "BuddyGPTForCausalLM": {
+    "buddygpt": 2
+   },
+   "BunnyQwenForCausalLM": {
+    "llava-qwen2": 2
+   },
+   "BurtImmaForCausalLM": {
+    "burt-imma": 2
+   },
+   "C3QwenForCausalLM": {
+    "C3": 2
+   },
+   "CBHybridLlamaForCausalLM": {
+    "cbllama": 2
+   },
+   "CERPTForCausalLM": {
+    "cerpt_causal": 2
+   },
+   "CERPTForConditionalGeneration": {
+    "cerpt": 2
+   },
+   "CIDDiffusionForMaskedLM": {
+    "qwen3": 2
+   },
+   "CLIPVisionMarianForConditionalGeneration": {
+    "clip-vision-marian": 2
+   },
+   "CMAForCausalLM": {
+    "cma": 2
+   },
+   "CPTForConditionalGeneration": {
+    "bart": 2
+   },
+   "CS336ForCausalLM": {
+    "cs336_transformer": 2
+   },
+   "CascadeForCausalLM": {
+    "cascade_byte_lm": 2
+   },
+   "CausalLM": {
+    "transformer": 2
+   },
+   "CheXagentForCausalLM": {
+    "phi": 2
+   },
+   "CheXagentForConditionalGeneration": {
+    "chexagent": 2
+   },
+   "ChemQ3MTPForCausalLM": {
+    "chemq3_mtp": 2
+   },
+   "ClinamenForCausalLM": {
+    "clinamen": 2
+   },
+   "CoDALanguageModel": {
+    "CoDA": 2
+   },
+   "CoGPT2LMHeadModel": {
+    "gpt2": 2
+   },
+   "CodifyForCausalLM": {
+    "codify": 2
+   },
+   "Codva1ForCausalLM": {
+    "codva1": 2
+   },
+   "ConceptDominantGPTBertForPreTraining": {
+    "concept_dominant_gptbert": 2
+   },
+   "ContinuumForCausalLM": {
+    "continuum": 2
+   },
+   "CosmosForConditionalGeneration": {
+    "cosmos": 2
+   },
+   "CostWiseGemmaForCausalLM": {
+    "cost_wise_gemma": 2
+   },
+   "CovSVDLlamaForCausalLM": {
+    "llama": 2
+   },
+   "CubicHierLM": {
+    "cubic_hier_v7_gemma4": 2
+   },
+   "CustomGPTForCausalLM": {
+    "custom-gpt": 2
+   },
+   "CustomMixtralForCausalLM": {
+    "mixtral": 2
+   },
+   "CustomModel3": {
+    "gpt_neox": 2
+   },
+   "CustomQwen2ForCausalLM": {
+    "qwen2": 2
+   },
+   "CustomQwen2Model": {
+    "qwen2": 2
+   },
+   "CyclicFormerForCausalLM": {
+    "cyclicformer": 2
+   },
+   "D3LMForMaskedLM": {
+    "esm": 2
+   },
+   "DDLlamaForCausalLM": {
+    "ddllama": 2
+   },
+   "DNikudModel": {
+    "roberta": 2
+   },
+   "DSHybridForCausalLM": {
+    "ds_hybrid": 2
+   },
+   "Data2VecTextForCausalLM": {
+    "data2vec-text": 2
+   },
+   "DeCodon": {
+    "decodon": 2
+   },
+   "DebertaV2ForCausalLM": {},
+   "DecoderOnlyT5Model": {
+    "t5": 2
+   },
+   "DeepstackLlamaForCausalLM": {
+    "deepstack_llama": 2
+   },
+   "DenseLLM": {
+    "dense_llm": 2
+   },
+   "DibaForCausalLM": {
+    "diba": 2
+   },
+   "DiffLlamaForCausalLM": {
+    "diffllama": 2
+   },
+   "DistilBertForMaskedLM": {
+    "distilbert": 2
+   },
+   "DomainTransformerForCausalLM": {
+    "domain_transformer": 2
+   },
+   "DotsOCRForCausalLM": {
+    "dots_ocr": 2
+   },
+   "DreamForCausalLM": {
+    "Dream": 2
+   },
+   "DribbleForCausalLM": {
+    "phi": 2
+   },
+   "DwarfForCausalLM": {
+    "dwarf": 2
+   },
+   "E2TTTMLPForCausalLM": {
+    "e2_ttt_mlp": 2
+   },
+   "E2TTTSwiGLUForCausalLM": {
+    "e2_ttt_swiglu": 2
+   },
+   "EchoesForCausalLM": {
+    "echoes": 2
+   },
+   "EcoacoForCausalLM": {
+    "ecoaco": 2
+   },
+   "EffLongT5ForConditionalGeneration": {
+    "longt5": 2
+   },
+   "EmberForCausalLM": {
+    "ember": 2
+   },
+   "EmberProeliaForCausalLM": {
+    "ember_proelia": 2
+   },
+   "EmenderForCausalLM": {
+    "emender_e97": 2
+   },
+   "EmuForCausalLM": {},
+   "EnglishBaseForCausalLM": {
+    "fabryka_english_base": 2
+   },
+   "EnhancedCustomLoRAModel": {
+    "llama": 2
+   },
+   "EnsembleModelForCausalLM": {
+    "customize_ensemble": 2
+   },
+   "EveMoEForCausalLM": {
+    "eve-moe": 2
+   },
+   "ExpIvmeForDiffusionLMHub": {
+    "expivme_diffusion": 2
+   },
+   "FSGPTMoEForCausalLM": {},
+   "FabricForCausalLM": {
+    "fabric": 2
+   },
+   "FastPlus40mForCausalLM": {
+    "fastplus_40m": 2
+   },
+   "FegeoLlamaForCausalLM": {
+    "fegeo-llama": 2
+   },
+   "FlashGPTNeoXForCausalLM": {
+    "gpt_neox": 2
+   },
+   "FleckModel": {
+    "fleck": 2
+   },
+   "FleetForCausalLM": {
+    "fleet": 2
+   },
+   "Flex_Qwen2_5_VLMoeForConditionalGeneration": {
+    "flex_qwen2_5_vl_moe": 2
+   },
+   "Florence2ForConditionalGeneration": {
+    "florence2": 2
+   },
+   "FridayForCausalLM": {
+    "friday": 2
+   },
+   "FuseGlmForCausalLM": {
+    "fuse_glm": 2
+   },
+   "FusionInDecoderForConditionalGeneration": {
+    "t5": 2
+   },
+   "G0NanoForCausalLM": {
+    "g0nano": 2
+   },
+   "GAD2ForAgenticModeling": {
+    "gad_v2": 2
+   },
+   "GLUSForCausalLM": {
+    "llava": 2
+   },
+   "GPT2CustomLMHeadModel": {
+    "gpt2": 2
+   },
+   "GPT2MTP": {
+    "gpt2": 2
+   },
+   "GPT2Vision": {
+    "gptvision": 2
+   },
+   "GPT2WithHMForCausalLM": {
+    "gpt2": 2
+   },
+   "GPT4DevForCausalLM": {
+    "gpt4dev": 2
+   },
+   "GPTLanguageModel": {
+    "GPT": 2
+   },
+   "GPTMiniForCausalLM": {
+    "gptoss-mini": 2
+   },
+   "GTLMForCausalLM": {
+    "gtlm_moe": 2
+   },
+   "GaudiLlamaForCausalLM": {
+    "llama": 2
+   },
+   "GeckoForConditionalGeneration": {
+    "gecko": 2
+   },
+   "Gemma3ForCausalLMTTT": {
+    "gemma3_text": 2
+   },
+   "Gemma3MoEForCausalLM": {
+    "gemma3_moe": 2
+   },
+   "Gemma3MoeForCausalLM": {
+    "gemma3_moe": 2
+   },
+   "Gemma3nForCausalLM": {
+    "gemma3n_text": 2
+   },
+   "Gemma4DSparkModel": {
+    "gemma4_dspark": 2
+   },
+   "Gemma4E2BItHybridForCausalLM": {
+    "gemma-4-e2b-it-hybrid": 2
+   },
+   "Gemma4TextForCausalLM": {
+    "gemma4_text": 2
+   },
+   "Gemma4UnifiedForCausalLM": {
+    "gemma4_unified_text": 2
+   },
+   "GeoChatLlamaForCausalLM": {
+    "geochat": 2
+   },
+   "GeoVForCausalLM": {
+    "geov": 2
+   },
+   "GistGPTNeoForCausalLM": {
+    "gpt_neo": 2
+   },
+   "GitLlamaForCausalLM": {
+    "git_llama": 2
+   },
+   "GraniteMoeSWAForCausalLM": {
+    "granitemoe_swa": 2
+   },
+   "Grok1ForCausalLM": {
+    "git": 2
+   },
+   "Grok1ModelForCausalLM": {},
+   "H2OVLChatModel": {
+    "h2ovl_chat": 2
+   },
+   "H3ForCausalLM": {
+    "h3": 2
+   },
+   "HCAForCausalLM": {
+    "hca": 2
+   },
+   "HFByteETM": {
+    "byteetm": 2
+   },
+   "HFCausalModel": {
+    "walsh-causal-v1": 2
+   },
+   "HFTransformerModel": {
+    "hf_transformer": 2
+   },
+   "HanForgeForCausalLM": {
+    "hanforge": 2
+   },
+   "HelionForCausalLM": {
+    "helion": 2
+   },
+   "HfMoondream": {
+    "moondream1": 2
+   },
+   "HolographicQwenForCausalLM": {
+    "holographic_qwen3": 2
+   },
+   "HrmForCausalLM": {
+    "hrm": 2
+   },
+   "HuazangQWenForCausalLM": {
+    "Huazang_Qwen": 2
+   },
+   "HumanVForCausalLM": {
+    "humanv": 2
+   },
+   "HushNanoForCausalLM": {
+    "hush_nano": 2
+   },
+   "HybridFourierLM": {
+    "hybrid_fourier_lm": 2
+   },
+   "HybridGPTForCausalLM": {
+    "hybrid_gpt": 2
+   },
+   "ILLaDAForCausalLM": {
+    "illada": 2
+   },
+   "IdeficsForCausalLM": {
+    "idefics": 2
+   },
+   "IndraForCausalLM": {
+    "indra": 2
+   },
+   "InnovatorVLForConditionalGeneration": {},
+   "InternLM2ForRewardModel": {
+    "internlm2": 2
+   },
+   "InternLMXComposerForCausalLM": {
+    "InternLMXComposer": 2
+   },
+   "InternS1ForConditionalGeneration": {
+    "interns1": 2
+   },
+   "InternS2MobiusForConditionalGeneration": {
+    "interns2_mobius": 2
+   },
+   "IvmeXLForCausalLM": {
+    "ivme_xl": 2
+   },
+   "JeevesForCausalLM": {
+    "jeeves": 2
+   },
+   "JetNemotronForCausalLM": {
+    "jet_nemotron": 2
+   },
+   "JiRackTernaryModel": {
+    "jirack_ternary": 2
+   },
+   "JudgeXL": {
+    "judge-xl": 2
+   },
+   "KNKVFForCausalLM": {
+    "knk_vf": 2
+   },
+   "KORMoForCausalLMWithMTP": {
+    "kormo": 2
+   },
+   "KaliaGPT": {
+    "kalia": 2
+   },
+   "Kanana2VecModel": {
+    "kanana2vec": 2
+   },
+   "KimiK2ForCausalLM": {
+    "kimi-k2": 2
+   },
+   "KoliberForCausalLM": {
+    "koliber": 2
+   },
+   "LEDForConditionalGeneration": {
+    "led": 2
+   },
+   "LFT": {
+    "looped_transformer": 2
+   },
+   "LLAMIAFluxForConditionalGeneration": {
+    "LLAMIAFlux": 2
+   },
+   "LLM": {
+    "linnet": 2
+   },
+   "LLMForCausalLM": {
+    "lingua_laboratorium_mechanicus": 2
+   },
+   "LLaMAVIDLlavaForConditionalGeneration": {
+    "llamavid": 2
+   },
+   "LLaMA_model": {
+    "llama": 2
+   },
+   "LLaVAOneVision1_5_ForConditionalGeneration": {
+    "llavaonevision1_5": 2
+   },
+   "LSWTForCausalLM": {
+    "lsw_transformer": 2
+   },
+   "LaCTForCausalLM": {
+    "lact_swiglu": 2
+   },
+   "LanceAI": {
+    "lance_ai": 2
+   },
+   "LaneformerForCausalLM": {
+    "laneformer": 2
+   },
+   "LangFlow": {
+    "LangFlow": 2
+   },
+   "LatentMoELLaVAQwen2ForCausalLM": {
+    "latent_moe_llava_qwen2": 2
+   },
+   "LatentMoELLaVAQwen3ForCausalLM": {
+    "latent_moe_llava_qwen3": 2
+   },
+   "LightbrainHybridForCausalLM": {
+    "lightbrain-hybrid": 2
+   },
+   "LilmForCausalLM": {
+    "lilm": 2
+   },
+   "LingLongForCausalLM": {
+    "linglong": 2
+   },
+   "LiquidForCausalLM": {
+    "liquid-former": 2
+   },
+   "LiveMemForCausalLM": {
+    "livemem": 2
+   },
+   "LlaaaLlamaForCausalLM": {
+    "llaaa": 2
+   },
+   "Llama3ForCausalLM": {
+    "llama3": 2
+   },
+   "LlamaButlerForCausalLM": {
+    "llama_butler": 2
+   },
+   "LlamaForCausalLMEagle": {
+    "llama": 2
+   },
+   "LlamaHydraForCausalLM": {
+    "llama_hydra": 2
+   },
+   "LlamaLongCatNgram": {
+    "llama_longcat_ngram": 2
+   },
+   "LlamaMLAForCausalLM": {
+    "llamamla": 2
+   },
+   "LlamaMoDForCausalLM": {
+    "llama": 2
+   },
+   "LlamaMoEUpscalingForCausalLM": {
+    "llama_moe_upscaling": 2
+   },
+   "LlamaMoeForCausalLM": {
+    "llama_moe": 2
+   },
+   "LlamaSeqEndMaskBMForCausalLM": {
+    "llama": 2
+   },
+   "LlamaVarLayerForCausalLM": {
+    "llama-varlayer": 2
+   },
+   "LlavaGPT2ForCausalLM": {
+    "moe-llava-llm-jp": 2
+   },
+   "LlavaQWenForCausalLM": {
+    "llava_qwen": 2
+   },
+   "LlavaStableLMEpochForCausalLM": {
+    "llava_stablelm_epoch": 2
+   },
+   "LlavaStablelmForCausalLM": {
+    "llava_stablelm": 2
+   },
+   "LocalLLMForCausalLM": {
+    "localllm": 2
+   },
+   "LocateAnythingForConditionalGeneration": {
+    "locateanything": 2
+   },
+   "LongT5ForConditionalGeneration": {
+    "longt5": 2
+   },
+   "LongcatFlashOmniForCausalLM": {},
+   "LongcatFlashSparseForCausalLM": {
+    "longcat_flash_lite_sparse": 2
+   },
+   "LongformerEncoderDecoderForConditionalGeneration": {
+    "bart": 2
+   },
+   "MCGPTForCausalLM": {
+    "mcgpt": 2
+   },
+   "MCQHFModel": {
+    "mcq_hf_model": 2
+   },
+   "MGMLlamaForCausalLM": {
+    "mgm": 2
+   },
+   "MGMOmniForCausalLM": {
+    "MGMOmni": 2
+   },
+   "MMGPTLlamaForCausalLM": {
+    "llama": 2
+   },
+   "MMGPTQwenForCausalLM": {
+    "mmgpt": 2
+   },
+   "MT5Model": {
+    "mt5": 2
+   },
+   "MUDDPythia": {
+    "muddpythia": 2
+   },
+   "MaccyForCausalLM": {
+    "maccy": 2
+   },
+   "MagicForConditionalGeneration": {
+    "llava": 2
+   },
+   "MalayalamMoEForCausalLM": {
+    "malayalam_moe": 2
+   },
+   "Mamba3CausalLM": {
+    "mamba3": 2
+   },
+   "MantaForConditionalGeneration": {
+    "manta": 2
+   },
+   "MedusaModel": {
+    "medusa": 2
+   },
+   "MegLMForCausalLM": {
+    "MegLMModel": 2
+   },
+   "MegatronForCausalLM": {
+    "megatron": 2
+   },
+   "MemBartForConditionalGeneration": {},
+   "MetaDiffusionForCausalLM": {
+    "metadiffusion": 2
+   },
+   "MetaLLMForCausalLM": {
+    "metallm": 2
+   },
+   "MiMoAudioForCausalLM": {
+    "qwen2": 2
+   },
+   "MiMoMamba2ForCausalLM": {
+    "mimo_mamba2": 2
+   },
+   "MicroLoopForDiffusionLM": {
+    "microloop_diffusion": 2
+   },
+   "MinGRULMForCausalLM": {
+    "mingru": 2
+   },
+   "MinSparkForCausalLM": {
+    "minspark": 2
+   },
+   "MiniCPMO": {
+    "minicpmo": 2
+   },
+   "MiniDeepSeekV3ForCausalLM": {
+    "mini_deepseekv3": 2
+   },
+   "MiniDeepSeekV4ForCausalLM": {
+    "mini_deepseekv4": 2
+   },
+   "MiniGPT": {
+    "mini-gpt": 2
+   },
+   "MiniGeminiGemmaForCausalLM": {},
+   "MiniGeminiMixtralForCausalLM": {},
+   "MiniLlama3ForCausalLM": {
+    "mini_llama3": 2
+   },
+   "MiniLlamaForCausalLM": {
+    "minillama": 2
+   },
+   "MiniMaxM3VLForCausalLM": {
+    "minimax_m3_vl_text": 2
+   },
+   "MiniQwen3NextForCausalLM": {
+    "mini_qwen3_next": 2
+   },
+   "MinistralDualRopeForCausalLM": {
+    "ministral_dual_rope": 2
+   },
+   "MiphaPhiForCausalLM": {
+    "mipha_phi": 2
+   },
+   "MistralDenseFormerForCausalLM": {
+    "mistral_denseformer": 2
+   },
+   "MixsenseLlamaForCausalLM": {
+    "mixsense_llama": 2
+   },
+   "MoELLaVAQwen2ForCausalLM": {
+    "moe_llava_qwen2": 2
+   },
+   "MobilintQwen3Eagle3ForCausalLM": {
+    "mobilint-qwen3-eagle3": 2
+   },
+   "MochivaForCausalLM": {
+    "mochiva": 2
+   },
+   "Model": {
+    "clever": 2
+   },
+   "ModelForCausalLM": {
+    "llama": 2
+   },
+   "MoeForCausalLM": {
+    "MoE++": 2
+   },
+   "MoeLlamaForCausalLM": {
+    "llama": 2
+   },
+   "MoeTransformerForCausalLM": {
+    "moe_transformer": 2
+   },
+   "MoedlForCausalLM": {
+    "moedl": 2
+   },
+   "MolexarForCausalLM": {
+    "molexar": 2
+   },
+   "MolformerForCausalLM": {
+    "molformer": 2
+   },
+   "MonkeyLMHeadModel": {
+    "monkey": 2
+   },
+   "MonoidForCausalLM": {
+    "monoid": 2
+   },
+   "MplugOwlForConditionalGeneration": {
+    "mplug-owl": 2
+   },
+   "MultiModalityCausalLM": {
+    "multi_modality": 2
+   },
+   "MultimodalStarcoder2ForCausalLM": {
+    "starcoder2": 2
+   },
+   "MyBaichuanForCausalLM": {
+    "baichuan": 2
+   },
+   "MyLlamaForTokenClassification": {
+    "llama": 2
+   },
+   "MyMossForCausalLM": {
+    "moss": 2
+   },
+   "NGen3Model": {
+    "ngen3": 2
+   },
+   "NMMaskMoELLaVAQwen2ForCausalLM": {
+    "nm_mask_moe_llava_qwen2": 2
+   },
+   "NanoChatJPForCausalLM": {
+    "nanochat_jp": 2
+   },
+   "NanoChatTopKForCausalLM": {
+    "nanochat": 2
+   },
+   "NanoGPTLMHeadModel": {
+    "gpt2": 2
+   },
+   "NanoLM": {
+    "nano-lm": 2
+   },
+   "NanochatWasmFusedModel": {
+    "nanochat-wasm-fused": 2
+   },
+   "NekoMindMoeForCausalLM": {
+    "nekomind_moe": 2
+   },
+   "NeroXSAForCausalLM": {
+    "nero_xs": 2
+   },
+   "NilexForCausalLM": {
+    "nilex_text": 2
+   },
+   "Nushy5ForCausalLM": {
+    "nushy5": 2
+   },
+   "OBILanguageModel": {},
+   "OLMoModelForCausalLM": {
+    "olmo": 2
+   },
+   "OPT_PromptTuned_For_SentimentAnalysis": {
+    "opt": 2
+   },
+   "OURSForCausalLM": {
+    "llava": 2
+   },
+   "OmniASRForConditionalGeneration": {
+    "omniasr": 2
+   },
+   "OmniLlamaForCausalLM": {
+    "omni": 2
+   },
+   "OpenBAForConditionalGeneration": {
+    "openba": 2
+   },
+   "OpenModel": {
+    "openmodel": 2
+   },
+   "OrionMOECausalLM": {
+    "orion_moe": 2
+   },
+   "OrionT2ForCausalLM": {
+    "orion_t2": 2
+   },
+   "OryxQwen2ForCausalLM": {
+    "oryx_qwen": 2
+   },
+   "OryxQwenForCausalLM": {
+    "oryx_qwen": 2
+   },
+   "OtterLM": {
+    "otterlm": 2
+   },
+   "OxMiniForCausalLM": {
+    "oxmini": 2
+   },
+   "PKVGPT": {
+    "gpt2": 2
+   },
+   "PLBartForCausalLM": {
+    "plbart": 2
+   },
+   "PLETinyLMForCausalLM": {
+    "ple-tinylm": 2
+   },
+   "PLMForCausalLM": {
+    "plm": 2
+   },
+   "PaluLlamaForCausalLM": {
+    "palullama": 2
+   },
+   "ParallaxForCausalLM": {
+    "parallax": 2
+   },
+   "ParchmentForCausalLM": {
+    "parchment": 2
+   },
+   "Pebble10MLM": {
+    "pebble_10m": 2
+   },
+   "PebbleGPTForCausalLM": {
+    "pebblegpt": 2
+   },
+   "PebbleLMForCausalLM": {
+    "pebblellm": 2
+   },
+   "PersonaMiniForCausalLM": {
+    "personamini": 2
+   },
+   "PhixtralForCausalLM": {
+    "phi2moe": 2
+   },
+   "PicoLMV2ForCausalLM": {
+    "picolm_v2": 2
+   },
+   "PinkElephantForCausalLM": {
+    "pinkelephant_moe": 2
+   },
+   "Pix2SeqForConditionalGeneration": {
+    "pix2seq": 2
+   },
+   "PlutoForCausalLM": {
+    "astrai_pluto": 2
+   },
+   "PolyLLaMAForCausalLM": {
+    "polyllama": 2
+   },
+   "PoptorchPipelinedBartForConditionalGeneration": {
+    "bart": 2
+   },
+   "PoptorchPipelinedT5ForConditionalGeneration": {
+    "t5": 2
+   },
+   "PothanaForCausalLM": {
+    "pothana": 2
+   },
+   "PrajnaStudentMultiLayer": {
+    "crn": 2
+   },
+   "PrunedLlamaForCausalLM": {
+    "llama": 2
+   },
+   "PrunedPhi3ForCausalLM": {
+    "phi3": 2
+   },
+   "PrunedQwen3ForCausalLM": {
+    "qwen3": 2
+   },
+   "QraXAiForCausalLM": {
+    "qrax_ai": 2
+   },
+   "QuartzForCausalLM": {
+    "quartz_moe": 2
+   },
+   "Qwen2AudioForConditionalGeneration": {
+    "qwen2_audio": 2
+   },
+   "Qwen2CapreseForCausalLM": {
+    "qwen2": 2
+   },
+   "Qwen2FlatQuantForCausalLM": {
+    "qwen2": 2
+   },
+   "Qwen2ForSequenceClassification": {
+    "qwen2": 2
+   },
+   "Qwen2LayerwiseSAEForCausalLM": {
+    "qwen2_layerwise_sae": 2
+   },
+   "Qwen2SteeringVectorForCausalLM": {
+    "qwen2_steering_vector": 2
+   },
+   "Qwen2WithRegressionHead": {
+    "qwen2": 2
+   },
+   "Qwen2_5OmniThinkerForCausalLM": {
+    "qwen2_5_omni_text": 2
+   },
+   "Qwen2_5OmniThinkerForConditionalGeneration": {
+    "qwen2_5_omni_thinker": 2
+   },
+   "Qwen2_5_VL_PGNForConditionalGeneration": {
+    "qwen2_5_vl": 2
+   },
+   "Qwen2blForCausalLM": {
+    "qwen2bl": 2
+   },
+   "Qwen3LoopForCausalLM": {
+    "qwen3loop": 2
+   },
+   "Qwen3MoeFusedForCausalLM": {
+    "qwen3_moe": 2
+   },
+   "Qwen3MoeModel": {
+    "qwen3_moe": 2
+   },
+   "Qwen3QuaRotForCausalLM": {
+    "qwen3": 2
+   },
+   "Qwen3ReasoningForCausalLM": {
+    "qwen3": 2
+   },
+   "Qwen3TerminatorForCausalLM": {
+    "qwen3": 2
+   },
+   "Qwen3_5MoEForCausalLM": {
+    "qwen35_moe": 2
+   },
+   "Qwen3_5Model": {
+    "qwen3_5": 2
+   },
+   "Qwen3_5_MoeForCausalLM": {
+    "qwen4_exp": 2
+   },
+   "Qwen4ExpTextForCausalLM": {
+    "qwen4_exp_text": 2
+   },
+   "RACE": {
+    "t5": 2
+   },
+   "RNSAQwen3ForCausalLM": {
+    "qwen3": 2
+   },
+   "RPTForCausalLM": {
+    "rpt": 2
+   },
+   "RRForConditionalGeneration": {
+    "mt5": 2
+   },
+   "RRTForCausalLM": {
+    "rrt": 2
+   },
+   "RWKV6ForCausalLM": {
+    "rwkv6": 2
+   },
+   "RWModel": {
+    "RefinedWebModel": 2
+   },
+   "RecGPTForCausalLM": {
+    "recgpt": 2
+   },
+   "RewardModel": {
+    "llama": 2
+   },
+   "RobertaModel": {
+    "roberta": 2
+   },
+   "RobertaPreLayerNormForCausalLM": {
+    "roberta-prelayernorm": 2
+   },
+   "RotaryGPT2LMHeadModel": {
+    "gpt2": 2
+   },
+   "SAIForCausalLM": {
+    "sai": 2
+   },
+   "SCANForCausalLM": {
+    "scan": 2
+   },
+   "SDLCSLM": {
+    "sdlc-slm": 2
+   },
+   "SESAMEForCausalLM": {
+    "llava": 2
+   },
+   "SLMoEForCausalLM": {
+    "slmoe": 2
+   },
+   "SMTModelForCausalLM": {
+    "SMT": 2
+   },
+   "SPILlavaMPTForCausalLM": {
+    "llava": 2
+   },
+   "SakhiModel": {
+    "sakhi": 2
+   },
+   "SeqaxLMHeadModel": {
+    "seqax": 2
+   },
+   "SerayukiForCausalLM": {
+    "llama": 2
+   },
+   "ShinraForCausalLM": {
+    "nullxes_shinra": 2
+   },
+   "ShrinkModelForCausalLM": {
+    "shrink": 2
+   },
+   "SimpleAttentionNetwork": {
+    "custom": 2
+   },
+   "SimpleStories4MModel": {
+    "simple_stories_4m": 2
+   },
+   "SimpleStoriesForCausalLM": {
+    "simple_stories": 2
+   },
+   "SliderGPT": {
+    "gpt2": 2
+   },
+   "SmallLanguageModel": {
+    "amartya-slm": 2
+   },
+   "SoloGPTForCausalLM": {
+    "sologpt": 2
+   },
+   "SoloLLMForCausalLM": {
+    "solollm": 2
+   },
+   "SovereignMemoryTwinForCausalLM": {
+    "sovereign-memory-twin": 2
+   },
+   "SparkForCausalLM": {
+    "spark": 2
+   },
+   "SpecT1ForCausalLM": {
+    "spect1": 2
+   },
+   "SpectusForConditionalGeneration": {
+    "bart": 2
+   },
+   "Starcoder2Model": {
+    "starcoder2": 2
+   },
+   "Step1ForCausalLM": {
+    "step1": 2
+   },
+   "Step3VLForConditionalGeneration": {
+    "step3_vl": 2
+   },
+   "Step3vForConditionalGeneration": {
+    "step3_vl": 2
+   },
+   "StepAudio2ForCausalLM": {
+    "step_audio_2": 2
+   },
+   "StepVLForConditionalGeneration": {
+    "step_robotics": 2
+   },
+   "StreamLfm2MoeForCausalLM": {
+    "lfm2_moe": 2
+   },
+   "SwitchGPT2ForCausalLM": {
+    "switchgpt2": 2
+   },
+   "T5GraphForConditionalGeneration": {
+    "t5": 2
+   },
+   "TALlavaGemmaForCausalLM": {
+    "tallava_gemma": 2
+   },
+   "TLiveOmniForConditionalGeneration": {
+    "tlive_omni": 2
+   },
+   "TPUQwen3ForCausalLM": {
+    "tpu_qwen3": 2
+   },
+   "TamazightForCausalLM": {
+    "tamazight": 2
+   },
+   "TanAiForCausalLM": {
+    "story_gpt": 2
+   },
+   "TeleFLMForCausalLM": {
+    "TeleFLM": 2
+   },
+   "TestGeniyForCausalLM": {
+    "testgeniy": 2
+   },
+   "TextToTextModel": {
+    "t5": 2
+   },
+   "ThetaForCausalLM": {
+    "theta": 2
+   },
+   "TinyBuddyForCausalLM": {
+    "tinybuddy": 2
+   },
+   "TinyForCausalLM": {
+    "tiny": 2
+   },
+   "TinyGPT": {
+    "tinybuddy": 2
+   },
+   "TinyLLM": {
+    "tiny-causal-llm": 2
+   },
+   "TinyMindForCausalLM": {
+    "tiny_smart_llm": 2
+   },
+   "TinyStoriesGPT": {},
+   "TinyllmForCausalLM": {
+    "tinyllm": 2
+   },
+   "TrOCRForCausalLM": {
+    "trocr": 2
+   },
+   "TraXLMistralForCausalLM": {
+    "TraXLMistral": 2
+   },
+   "TransformerLMForCausalLM": {
+    "transformerlm": 2
+   },
+   "TridaForDLM": {
+    "Trida": 2
+   },
+   "UnboxForCausalLM": {
+    "unbox": 2
+   },
+   "UunoForCausalLM": {
+    "uuno": 2
+   },
+   "VCoderDSLlavaLlamaForCausalLM": {
+    "vcoder_ds_llava": 2
+   },
+   "VCoderLlavaLlamaForCausalLM": {
+    "vcoder_llava": 2
+   },
+   "VLCLIPGPTNeoXForCausalLM": {
+    "gpt_neox": 2
+   },
+   "VLite7Mini20mForCausalLM": {
+    "vlite7_mini_20m": 2
+   },
+   "VaayuForCausalLM": {
+    "vaayu_slmm": 2
+   },
+   "VibeVoiceRealTimeForConditionalGeneration": {
+    "vibevoice_realtime": 2
+   },
+   "Videollama2Qwen2ForCausalLM": {
+    "videollama2_qwen2": 2
+   },
+   "Videollama3Qwen2ForCausalLM": {
+    "videollama3_qwen2": 2
+   },
+   "VoRAForCausalLM": {
+    "vora": 2
+   },
+   "VoxtralForConditionalGeneration": {
+    "voxtral": 2
+   },
+   "WasmInterpreterTransformer": {
+    "wasm-interpreter-transformer": 2
+   },
+   "WhaleyeForConditionalGeneration": {
+    "deepseek_v32": 2
+   },
+   "WhisperAccentForConditionalGeneration": {
+    "whisper_accent": 2
+   },
+   "WindEdgeForCausalLM": {
+    "wind_edge": 2
+   },
+   "WinnowLagunaForCausalLM": {
+    "winnow_laguna": 2
+   },
+   "WisentQwen2ForCausalLM": {
+    "wisent_qwen2": 2
+   },
+   "WyrmlingForCausalLM": {
+    "wyrmling": 2
+   },
+   "XLMRobertaForSequenceClassification": {
+    "xlm-roberta": 2
+   },
+   "XMistralForCausalLM": {
+    "mistral": 2
+   },
+   "XeDroplycheeForCausalLM": {
+    "xe_droplychee": 2
+   },
+   "YForCausalLM2": {
+    "ynet2": 2
+   },
+   "YForCausalLM3": {
+    "ynet3": 2
+   },
+   "YForCausalLM31": {
+    "ynet31": 2
+   },
+   "YasinForCausalLM": {
+    "yasin": 2
+   },
+   "YatFullGPTForCausalLM": {
+    "yatnmn_full_gpt": 2
+   },
+   "YiVLForCausalLM": {
+    "llava": 2
+   },
+   "ZYR3ForCausalLM": {
+    "zyr3": 2
+   },
+   "ZZJRabbit22ForCausalLM": {
+    "zzjrabbit22": 2
+   },
+   "ZZJRabbit2ForCausalLM": {
+    "zzjrabbit2": 2
+   },
+   "ZeusForCausalLM": {
+    "zeusmm": 2
+   },
+   "axiomForCausalLM": {
+    "axiom": 2
+   },
+   "i3": {
+    "i3": 2
+   },
+   "i3Model": {
+    "i3": 2
+   },
+   "infllmv2_Qwen3ForCausalLM": {
+    "infllmv2_qwen3": 2
+   },
+   "modeling_grove_moe.GroveMoeForCausalLM": {
+    "qwen3_moe": 2
+   },
+   "omFlaxT5ForConditionalGeneration": {
+    "t5": 2
+   },
+   "smallLlamaForCausalLM": {
+    "llama": 2
+   },
+   "tnl1-385m-10b-token_no-act": {},
+   "A194LogitEnsembleForCausalLM": {
+    "a194_logit_ensemble": 1
+   },
+   "A2DQwen2LMHeadModel": {
+    "a2d-qwen2": 1
+   },
+   "A2DQwen3_5LMHeadModel": {
+    "a2d-qwen3_5": 1
+   },
+   "A2DQwenLMHeadModel": {
+    "a2d-qwen": 1
+   },
+   "AAIEDDenseForCausalLM": {
+    "AAIE_DDense": 1
+   },
+   "AAIEDDenseGFTForCausalLM": {
+    "AAIE_DDenseGFT": 1
+   },
+   "AAIEMoEForCausalLM": {
+    "AAIE_MoE": 1
+   },
+   "ABU2HEADMODEL": {
+    "abu-ai-001": 1
+   },
+   "ACSwiGLUForCausalLM": {
+    "ac_swiglu": 1
+   },
+   "AETHERMicroForCausalLM": {
+    "aether_micro": 1
+   },
+   "AETHERV211AttnForCausalLM": {
+    "aether_v2_11attn": 1
+   },
+   "AMITForConditionalGeneration": {
+    "amit": 1
+   },
+   "ARAr381MForCausalLM": {
+    "ar_381m": 1
+   },
+   "ARMTForCausalLM": {
+    "armt": 1
+   },
+   "ASVDOPTForCausalLM": {
+    "opt": 1
+   },
+   "AXI with transformers": {
+    "slm": 1
+   },
+   "AbcTransformer": {
+    "abc-transformer": 1
+   },
+   "AbiaForCausalLM": {
+    "abia": 1
+   },
+   "AdaVocabGemmaForCausalLM": {
+    "gemma": 1
+   },
+   "AdaVocabGemmaforCausalLM": {
+    "gemma": 1
+   },
+   "AdaVocabQwen2ForCausalLM": {
+    "qwen2": 1
+   },
+   "AdaptiveRiverLM": {
+    "adaptive-river": 1
+   },
+   "AdditionTransformer": {
+    "jax-addition-transformer": 1
+   },
+   "AeroForConditionalGeneration": {
+    "aero": 1
+   },
+   "AetherMindForCausalLM": {
+    "aethermind": 1
+   },
+   "AetherStoryModel": {
+    "aetherstory": 1
+   },
+   "AgnesForCausalLM": {
+    "agnes": 1
+   },
+   "AgoraForCausalLM": {
+    "agora": 1
+   },
+   "Aicraftar-Tharo.G-ConditionalGeneration": {
+    "qwen2_vl": 1
+   },
+   "AlbertMoE": {
+    "albert-moe": 1
+   },
+   "AlfredUnimodelForConditionalGeneration": {
+    "t5": 1
+   },
+   "AliForCausalLM": {
+    "ali": 1
+   },
+   "AliceT5MoEForConditionalGeneration": {
+    "alicet5_moe": 1
+   },
+   "AlinlightForCausalLM": {
+    "alinlight": 1
+   },
+   "AlphaErForCausalLM": {
+    "alpha-er": 1
+   },
+   "AncientAIV": {
+    "ancient_ai": 1
+   },
+   "AntiHalForConditionalGeneration": {
+    "gemma4": 1
+   },
+   "AnubisMoeForCausalLM": {
+    "anubis_moe": 1
+   },
+   "ApolloForCausalLM": {
+    "apollo": 1
+   },
+   "ApproxDumbForCausalLM": {
+    "approxdumb": 1
+   },
+   "AprielHForCausalLM": {
+    "apriel_h": 1
+   },
+   "ArcanaLlamaForCausalLM": {
+    "arcana_llama": 1
+   },
+   "ArcanalamaForCausalLM": {
+    "arcana_llama": 1
+   },
+   "AresModel": {
+    "ares": 1
+   },
+   "ArgonneModelParallel": {
+    "argonne": 1
+   },
+   "AriesForCausalLM": {
+    "aries": 1
+   },
+   "ArkaV3ForCausalLM": {
+    "arka_v3": 1
+   },
+   "ArmanForCausalLM": {
+    "arman-nn": 1
+   },
+   "ArmoRMForSequenceClassification": {
+    "armorm": 1
+   },
+   "ArzLMForCausalLM": {
+    "arzlm": 1
+   },
+   "AscleLMForCausalLM": {
+    "ascle_lm": 1
+   },
+   "AtomK3DSparkModel": {
+    "atom_k3_dspark": 1
+   },
+   "AttnOnlyForCausalLM": {
+    "attn_only": 1
+   },
+   "AudioOnlyThinker": {
+    "audio-only-thinker": 1
+   },
+   "Aurora1.0": {
+    "Aurora": 1
+   },
+   "Aurora80K": {
+    "aurora80k": 1
+   },
+   "AutoGUILMHeadModel": {
+    "autogui": 1
+   },
+   "AutoModelForSeq2SeqLM": {
+    "t5": 1
+   },
+   "Autoencoder": {},
+   "AveyDecoderMoEForCausalLM": {
+    "avey-d-moe": 1
+   },
+   "AveyForCausalLM": {
+    "avey": 1
+   },
+   "AxonModel": {
+    "axon": 1
+   },
+   "AyaVisionForConditionalGeneration": {
+    "aya_vision": 1
+   },
+   "BREENForCausalLM": {
+    "breen": 1
+   },
+   "BacLMForCausalLM": {
+    "BacLM": 1
+   },
+   "BackboneConceptLM": {
+    "backbone_concept": 1
+   },
+   "Bagel": {
+    "bagel": 1
+   },
+   "BailingMoeLinearForCausalLM": {
+    "bailing_moe_linear": 1
+   },
+   "Baiwen3ForCausalLM": {
+    "baiwen3": 1
+   },
+   "BananaMind21TestForCausalLM": {
+    "bananamind21_test": 1
+   },
+   "BananaMind2MoEForCausalLM": {
+    "bananamind2_moe": 1
+   },
+   "BanglaGSGForCausalLM": {
+    "banglagsg": 1
+   },
+   "BanglaGambaForCausalLM": {
+    "banglagamba": 1
+   },
+   "BartPrefixPropForConditionalGeneration": {
+    "bart": 1
+   },
+   "BaselineModel": {
+    "baseline_decoder": 1
+   },
+   "BatGPTForCausalLM": {
+    "batgpt": 1
+   },
+   "BeetleMoEHF": {
+    "beetle_moe": 1
+   },
+   "BernaForCausalLM": {
+    "berna": 1
+   },
+   "BertForCausalLM": {
+    "bert": 1
+   },
+   "BertForMTSparseFFDEditModel": {
+    "bert": 1
+   },
+   "BertForTokenClassification": {
+    "bert": 1
+   },
+   "BetterGPTForCausalLM": {
+    "better_gpt": 1
+   },
+   "BharatGPTForConditionalGeneration": {
+    "bharatgpt": 1
+   },
+   "BharataiForCausalLM": {
+    "BharataiForCausalLM": 1
+   },
+   "BiRWKV7ForCausalLM": {
+    "rwkv7_babylm": 1
+   },
+   "BiatronForCausalLM": {
+    "Biatron": 1
+   },
+   "BigBrainLanguageModel": {
+    "big-brain-lm": 1
+   },
+   "BioMedGPTForCausalLM": {
+    "biomed-gpt": 1
+   },
+   "BioPhysKimiDualBrainForCausalLM": {
+    "biophys": 1
+   },
+   "BitNetGPTForCausalLM": {
+    "bitnet_gpt": 1
+   },
+   "BitSkipV1ForCausalLMWithEarlyExit": {
+    "bitskip_v1_earlyexit": 1
+   },
+   "BitSkipV2ForCausalLMWithEarlyExit": {
+    "bitskip_v2_earlyexit": 1
+   },
+   "BitSkipV3ForCausalLM": {
+    "bitskip_v3": 1
+   },
+   "BlastModelForCausalLM": {
+    "blast_llama": 1
+   },
+   "BlipForConditionalGeneration": {
+    "blip": 1
+   },
+   "BltForCausalLM": {
+    "blt": 1
+   },
+   "BoraMoEForCausalLM": {
+    "bora_moe": 1
+   },
+   "BranchyCausalModel": {
+    "branchy": 1
+   },
+   "BridgeVQAModel": {
+    "bridgevqa": 1
+   },
+   "BucketMemoryModel": {
+    "bucket-memory-model3": 1
+   },
+   "BungeoForCausalLM": {
+    "bungeo": 1
+   },
+   "BunnyMiniCPMForCausalLM": {
+    "bunny-minicpm": 1
+   },
+   "BunnyQwen2ForCausalLM": {
+    "bunny-qwen2": 1
+   },
+   "ByteGPTForCausalLM": {
+    "ijk_byte_gpt": 1
+   },
+   "CALIForCausalLM": {
+    "cali": 1
+   },
+   "CED": {
+    "tiny-ced": 1
+   },
+   "CERPTMultimodalForConditionalGeneration": {
+    "cerpt-multimodal": 1
+   },
+   "CIDModel": {
+    "cid": 1
+   },
+   "CLIPVisionMBartForConditionalGeneration": {
+    "clip-vision-mbart": 1
+   },
+   "COCONUTGPT2": {
+    "gpt2": 1
+   },
+   "CODIGPT2": {
+    "gpt2": 1
+   },
+   "COReForCausalLM": {
+    "core": 1
+   },
+   "CPMAntForCausalLM": {
+    "cpmant": 1
+   },
+   "CRANEAIModel": {
+    "crane-ai": 1
+   },
+   "CXRMate2ForConditionalGeneration": {
+    "cxrmate-2": 1
+   },
+   "CXRMateEDModel": {
+    "cxrmate-ed": 1
+   },
+   "CaReAQA": {
+    "llama": 1
+   },
+   "CabaForCausalLM": {
+    "caba": 1
+   },
+   "CambrianPhi3ForCausalLM": {
+    "cambrian_phi3": 1
+   },
+   "CampGPT": {
+    "campgpt": 1
+   },
+   "CatsModel": {
+    "cats_model": 1
+   },
+   "CausalLMoEForCausalLM": {
+    "causal_lmoe": 1
+   },
+   "CelerityLMHeadModel": {
+    "celerity": 1
+   },
+   "ChameleonXLLMXForConditionalGeneration": {
+    "chameleon": 1
+   },
+   "CharNgramForCausalLM": {
+    "char-ngram": 1
+   },
+   "ChatGLM2NSAForCausalLM": {
+    "chatglm": 1
+   },
+   "ChatGlmForCausalLM": {
+    "chatglm": 1
+   },
+   "ChatTitleModel": {
+    "encoder_decoder": 1
+   },
+   "ChatUniViLlamaForCausalLM": {
+    "ChatUniVi": 1
+   },
+   "ChessGPTForCausalLM": {
+    "chess_gpt": 1
+   },
+   "ChessLLM": {
+    "chess_llm": 1
+   },
+   "ChessModel": {
+    "chess_model": 1
+   },
+   "CiModelForCausalLM": {
+    "ci": 1
+   },
+   "CiloForCausalLM": {
+    "cilo": 1
+   },
+   "CinnabarLMForCausalLM": {
+    "cinnabarlm": 1
+   },
+   "CircuitGPTForCausalLM": {
+    "circuitgpt": 1
+   },
+   "ClarityMR1ForCausalLM": {
+    "clarity_mr1": 1
+   },
+   "CleverModel": {
+    "clever": 1
+   },
+   "ClinicalLlamaForCausalLM": {
+    "clinical-llama": 1
+   },
+   "ClokCEMForCausalLM": {
+    "clokcem": 1
+   },
+   "CloverLMForCausalLM": {
+    "cloverlm": 1
+   },
+   "CodeBharatForCausalLM": {
+    "llama": 1
+   },
+   "CodeShell4bitForCausalLM": {
+    "codeshell": 1
+   },
+   "CodeT5pBimodalModel": {
+    "codet5p_bimodal": 1
+   },
+   "CoffeeChatAI": {
+    "coffeechatai": 1
+   },
+   "CogViewForCausalLM": {
+    "cog_view": 1
+   },
+   "CognitiveAgentForCausalLM": {
+    "text-gemma-001": 1
+   },
+   "CoherenceMomentumModel": {},
+   "ColarLlama": {
+    "llama": 1
+   },
+   "CollisionForCausalLM": {
+    "collision": 1
+   },
+   "CombinedLMForCausalLM": {
+    "mistral": 1
+   },
+   "CompactLM": {
+    "compactlm": 1
+   },
+   "CompliantLLMModel": {
+    "compliant_llm": 1
+   },
+   "CompressedLlamaForCausalLM": {
+    "llama": 1
+   },
+   "ConceptLMDFlashModel": {
+    "conceptlm_dflash": 1
+   },
+   "ConditionalGPT": {
+    "gpt2": 1
+   },
+   "ConditionalGPT2LMHeadModel": {
+    "gpt2": 1
+   },
+   "ConfigfarsModel": {
+    "configfars": 1
+   },
+   "Continue1ForCausalLM": {
+    "continue_oss": 1
+   },
+   "ContinuousQwen3ForCausalLM": {
+    "qwen3": 1
+   },
+   "ConvGPTForCausalLM": {
+    "convgpt": 1
+   },
+   "ConvaiCausalLM": {
+    "convaicausallm": 1
+   },
+   "CraftlyRobotForCausalLM": {
+    "craftly_robot": 1
+   },
+   "CroweLogicMiniForCausalLM": {
+    "crowe_logic_mini": 1
+   },
+   "CubicV11LongContext": {
+    "cubic_v11_long_context": 1
+   },
+   "CubiczanMoEForCausalLM": {
+    "cubiczan-moe": 1
+   },
+   "CuriousForCausalLM": {
+    "curious_text": 1
+   },
+   "CustomBioGptForCausalLM": {
+    "biogpt": 1
+   },
+   "CustomGPT": {
+    "custom_gpt": 1
+   },
+   "CustomGPTModel": {
+    "custom_gpt": 1
+   },
+   "CustomLoRAModel": {
+    "llama": 1
+   },
+   "CustomModel4": {
+    "gpt_neox": 1
+   },
+   "CustomModel5": {
+    "custom5": 1
+   },
+   "CustomModelForCausalLM": {
+    "custom_llm": 1
+   },
+   "CustomTagalogLLM": {
+    "custom_gqa_swiglu_llm": 1
+   },
+   "CustomTransformerForCausalLM": {
+    "custom_transformer": 1
+   },
+   "Custom_MPTForCausalLM": {
+    "mpt": 1
+   },
+   "D3PMSanskritModel": {
+    "d3pm_sanskrit": 1
+   },
+   "DCFormer": {
+    "dcformer": 1
+   },
+   "DCPythia": {
+    "dcpythia": 1
+   },
+   "DEXV1LMHeadModel": {
+    "gpt2": 1
+   },
+   "DFMModel": {
+    "dfm": 1
+   },
+   "DGPT": {
+    "dgpt": 1
+   },
+   "DIT": {
+    "dit-instruct": 1
+   },
+   "DIVEdoc": {
+    "DIVEdoc": 1
+   },
+   "DLMLlamaForCausalLM": {
+    "llama": 1
+   },
+   "DMTDQwen3ForCausalLM": {
+    "dmtdqwen3": 1
+   },
+   "DPMMForCausalLM": {
+    "dpmm": 1
+   },
+   "DSparkForCausalLM": {
+    "dspark": 1
+   },
+   "DakitariInstructModel": {
+    "dakitari_instruct": 1
+   },
+   "DaltonForCausalLM": {
+    "dalton_text": 1
+   },
+   "DarjaGPTForCausalLM": {
+    "darja_gpt_v5": 1
+   },
+   "DartForCausalLM": {
+    "dart": 1
+   },
+   "DarwinDuoOrchestrator": {},
+   "DashQGlm4MoeForCausalLM": {
+    "glm4_moe": 1
+   },
+   "DashQNemotronHForCausalLM": {
+    "nemotron_h": 1
+   },
+   "DashaHFForCausalLM": {
+    "dasha": 1
+   },
+   "DatForCausalLM": {
+    "dat": 1
+   },
+   "DeTiME": {
+    "detime": 1
+   },
+   "DeViLQwen2ForCausalLM": {
+    "devil_qwen2": 1
+   },
+   "DebertaV2ForSequenceClassification": {
+    "deberta-v2": 1
+   },
+   "DebertaV2PairRM": {
+    "deberta-v2": 1
+   },
+   "DecoderOnlyTransformer": {
+    "decoder_only_transformer": 1
+   },
+   "DecoderTransformerForCausalLM": {
+    "decoder_transformer_scratch": 1
+   },
+   "DeepLlamaForCausalLM": {
+    "deep_llama": 1
+   },
+   "DeepSeekNanoForCausalLM": {
+    "deepseek_nano": 1
+   },
+   "DeepSeekV4": {
+    "deepseek_v4_nano": 1
+   },
+   "DeepseekFixedForCausalLM": {
+    "deepseek_with_concentration": 1
+   },
+   "DeepseekOCRForCausalLM": {
+    "DeepseekOCR": 1
+   },
+   "DeepseekOcrForConditionalGeneration": {
+    "deepseek_ocr": 1
+   },
+   "DeepseekV2MoBEForCausalLM": {
+    "deepseek_v2": 1
+   },
+   "DeepseekV2SparseMoBEForCausalLM": {
+    "deepseek_v2": 1
+   },
+   "DeepseekV4ForCausalLMDSpark": {
+    "deepseek_v4": 1
+   },
+   "DeepseekVLV2ForCausalLM": {
+    "deepseek_vl_v2": 1
+   },
+   "DendroForCausalLM": {
+    "dendro_omni": 1
+   },
+   "DenseK3ForCausalLM": {
+    "densek3": 1
+   },
+   "DeplyzeMiniForCausalLM": {
+    "deplyze_mini": 1
+   },
+   "DexV1LMHeadModel": {
+    "DexV1": 1
+   },
+   "DharaForMaskedDiffusion": {
+    "dhara": 1
+   },
+   "DiffuQwen3": {
+    "diffuqwen3": 1
+   },
+   "DiffusionLLM": {
+    "diffusionLM": 1
+   },
+   "DiseaseGPTModel": {
+    "disease-gpt": 1
+   },
+   "DistMoeForConditionalGeneration": {
+    "dist_moe": 1
+   },
+   "DistillixForCausalLM": {
+    "distillix": 1
+   },
+   "DizelLM": {
+    "dizel": 1
+   },
+   "DominoDraftModel": {
+    "qwen3": 1
+   },
+   "DotLMForCausalLM": {
+    "dotlm": 1
+   },
+   "DragonbornTransformerModel": {
+    "dragonborn": 1
+   },
+   "DrakonForCausalLM": {
+    "drakon": 1
+   },
+   "DribbleLlamaForCausalLM": {
+    "llama": 1
+   },
+   "DropLycheeForCausalLM": {
+    "droplychee_text": 1
+   },
+   "DualBigMoEForCausalLM": {
+    "dualbig_moe": 1
+   },
+   "DuchifatForCausalLM": {
+    "duchifat": 1
+   },
+   "DumbSetLanguageModel": {
+    "dumbset_reasoning": 1
+   },
+   "DummyLlamaForCausalLM": {
+    "dummy_llama": 1
+   },
+   "DusMistralForCausalLM": {
+    "mistral": 1
+   },
+   "DynColMaskMoELLaVAQwen3ForCausalLM": {
+    "dyn_col_mask_moe_llava_qwen3": 1
+   },
+   "DynHierColMaskMoELLaVAQwen2ForCausalLM": {
+    "dyn_hier_col_mask_moe_llava_qwen2": 1
+   },
+   "DynamicMindMoEForCausalLM": {
+    "dynamicmind_moe": 1
+   },
+   "DynamicNeuralNetwork": {
+    "mnemosyne-conscious-ai": 1
+   },
+   "EMGForCausalLM": {
+    "emg": 1
+   },
+   "EMGMTSForCausalLM": {
+    "emg_mts": 1
+   },
+   "Eagle3LlamaForCausalLM": {
+    "llama": 1
+   },
+   "EasyFormerLMHeadModel": {
+    "transformer": 1
+   },
+   "EditGPTMistralForCausalLM": {
+    "EditGPTMistral": 1
+   },
+   "EditableQwen3ForCausalLM": {
+    "qwen3": 1
+   },
+   "EfficientNetForImageClassification": {
+    "efficientnet": 1
+   },
+   "EgoLLM": {
+    "ego_llm": 1
+   },
+   "ElBartForConditionalGeneration": {
+    "bart": 1
+   },
+   "ElasticGPT": {
+    "elastic": 1
+   },
+   "ElasticT5ForConditionalGeneration": {
+    "elastic_t5": 1
+   },
+   "ElysiumForCausalLM": {
+    "elysium": 1
+   },
+   "Ember2ForCausalLM": {
+    "ember2": 1
+   },
+   "EmenderGDN2ForCausalLM": {
+    "emender_gdn2_mlp": 1
+   },
+   "EmployeeMicroSLMForCausalLM": {
+    "employee_microslm": 1
+   },
+   "EncoderDecoderForConditionalGeneration": {
+    "bart": 1
+   },
+   "EngramQwenForCausalLM": {
+    "engram_qwen": 1
+   },
+   "EnigmaForCausalLM": {
+    "enigma": 1
+   },
+   "ErkLinearForCausalLM": {
+    "erk_linear": 1
+   },
+   "EryonForCausalLM": {
+    "Eryon": 1
+   },
+   "EryonModel": {
+    "EryonGPT2": 1
+   },
+   "EshmunForCausalLM": {
+    "eshmun": 1
+   },
+   "Esm2LlamaInstructForCausalLM": {
+    "esm2llama_instruct": 1
+   },
+   "EvafrillMoForCausalLM": {
+    "evafrill-mo": 1
+   },
+   "EvilModel": {
+    "evilnet": 1
+   },
+   "EvoMistralForCausalLM": {
+    "evomistral": 1
+   },
+   "Exaone4ForCausalLMConv": {
+    "exaconv": 1
+   },
+   "Exaone4_5_ForConditionalGeneration": {
+    "exaone4_5": 1
+   },
+   "ExaoneTDForCausalLM": {
+    "exaone": 1
+   },
+   "ExpandedJetMoEForCausalLM": {
+    "expandedjetmoe": 1
+   },
+   "ExperiementalForCausalLM": {
+    "exp": 1
+   },
+   "ExportableGPTScratchForCausalLM": {
+    "gpt2": 1
+   },
+   "ExtraAI": {
+    "extraai": 1
+   },
+   "FEGeoQwen2ForCausalLM": {
+    "fegeo-qwen2": 1
+   },
+   "FEMMultiMeshForCausalLM": {
+    "fem_multi_mesh_causal_lm": 1
+   },
+   "FERRETLlamaForCausalLM": {
+    "llama": 1
+   },
+   "FHN_Pure_SingleHead_GAU_3M": {
+    "fhn_concept_gau": 1
+   },
+   "FHN_Pure_SingleHead_GAU_9M": {
+    "fhn_concept_gau": 1
+   },
+   "FHN_T4Max_199M": {
+    "fhn_concept_gau": 1
+   },
+   "FHN_T4Max_Universal_GAU_150M": {
+    "fhn_concept_gau": 1
+   },
+   "FHN_T4Max_Universal_GAU_9M": {
+    "fhn_concept_gau": 1
+   },
+   "FM9GForCausalLM": {
+    "fm9g": 1
+   },
+   "FSDPGptOssForCausalLM": {
+    "gpt_oss": 1
+   },
+   "FSDPLLaDAUPMModelLM": {
+    "llada": 1
+   },
+   "FSDPLlamaForCausalLM": {
+    "llama": 1
+   },
+   "FSDPT5ForConditionalGeneration": {
+    "t5": 1
+   },
+   "FSGPTForCausalLM": {},
+   "FaberGenesisForCausalLM": {
+    "faber-genesis": 1
+   },
+   "FairseqT5ForConditionalGeneration": {
+    "fairseq_t5": 1
+   },
+   "FastLigerLlamaForCausalLM": {
+    "llama": 1
+   },
+   "FastPlus125mForCausalLM": {
+    "fastplus_125m": 1
+   },
+   "FastPlusForCausalLM": {
+    "fastplus": 1
+   },
+   "FastyForCausalLM": {
+    "fasty": 1
+   },
+   "FelaForCausalLM": {
+    "fela": 1
+   },
+   "Fern3BModel": {
+    "fern_3b": 1
+   },
+   "FiPhi-NeuralArk-3.9-Ultra": {
+    "NCE": 1
+   },
+   "FiPhi-NeuralMark-V3": {
+    "bert": 1
+   },
+   "FidelForCausalLM": {
+    "fidel": 1
+   },
+   "FieldsHubModel": {
+    "fields": 1
+   },
+   "FinGPTForCausalLM": {
+    "fingpt": 1
+   },
+   "FixedEnhancedHybridTransformer": {
+    "enhanced_hybrid_transformer": 1
+   },
+   "FlamingoForCausalLM": {
+    "opt": 1
+   },
+   "FlaxGPTJForCausalLM": {
+    "gptj": 1
+   },
+   "FlexRankModel": {
+    "flexrank": 1
+   },
+   "FlintForCausalLM": {
+    "llama": 1
+   },
+   "FlyGPTForCausalLM": {
+    "flygpt": 1
+   },
+   "FontaineLM": {
+    "fontaine": 1
+   },
+   "ForgeLM": {
+    "forgelm": 1
+   },
+   "ForwardBackwardRepairModel": {
+    "nested_byte_mamba2": 1
+   },
+   "FrawdLLMForCausalLM": {
+    "frawdllm": 1
+   },
+   "FrenchLLMForCausalLM": {
+    "french_llm": 1
+   },
+   "FrontD11M": {
+    "frontd": 1
+   },
+   "Fuse2ForCausalLM": {
+    "fuse2": 1
+   },
+   "Fuse3V2ForCausalLM": {
+    "fuse3_v2": 1
+   },
+   "FutureGQ47MForCausalLM": {
+    "futuregq47m": 1
+   },
+   "FutureGQ47qForCausalLM": {
+    "futuregq47q": 1
+   },
+   "GAIForCausalLM": {
+    "gai": 1
+   },
+   "GITForCausalLM": {
+    "git": 1
+   },
+   "GPT2CompetitiveMoE": {
+    "gpt2-moe": 1
+   },
+   "GPT2ForQuestionAnswering": {
+    "gpt2": 1
+   },
+   "GPT2HeadWithValueModel": {
+    "gpt2": 1
+   },
+   "GPT2LMHeadModelForMultiTokenPrediction": {
+    "gpt2": 1
+   },
+   "GPT2LMHeadModelWithRoPE": {
+    "gpt2": 1
+   },
+   "GPT2PrefixTuningWithLMHeadModel": {
+    "gpt2": 1
+   },
+   "GPT2WithRoles": {
+    "gpt2_with_roles": 1
+   },
+   "GPT2WorkshopForCausalLM": {
+    "gpt2-workshop": 1
+   },
+   "GPT2hlcLMHeadModel": {
+    "gpt2": 1
+   },
+   "GPT300M": {
+    "gpt-300m": 1
+   },
+   "GPT3DevLM": {
+    "gpt3dev": 1
+   },
+   "GPTBertForMaskedLM": {
+    "gpt_bert": 1
+   },
+   "GPTBigCodeForSequenceClassification": {
+    "gpt_bigcode": 1
+   },
+   "GPTBigCodeLMHeadModel": {
+    "gpt_bigcode": 1
+   },
+   "GPTBigCodeModel": {
+    "gpt_bigcode": 1
+   },
+   "GPTForHF": {
+    "gpt": 1
+   },
+   "GPTJLoraForCausalLM": {
+    "gptj-lora": 1
+   },
+   "GPTJMoEForCausalLM": {
+    "gptj_moe": 1
+   },
+   "GPTNeoModel": {
+    "gpt_neo": 1
+   },
+   "GPTNeoXLongForCausalLM": {
+    "gpt_neox": 1
+   },
+   "GPTOSSForCausalLM": {
+    "gpt_oss": 1
+   },
+   "GPTOSSMoEModel": {
+    "gpt_oss_moe": 1
+   },
+   "GPTS14MForCausalLM": {
+    "gpts14m": 1
+   },
+   "GPTS25ForCausalLM": {
+    "gpt-s2.5": 1
+   },
+   "GPTS3ForCausalLM": {
+    "gpts3": 1
+   },
+   "GPTSDPReLULMHeadModel": {
+    "gpt-sdprelu": 1
+   },
+   "GPTSanJapaneseForConditionalGeneration": {
+    "gptsan-japanese": 1
+   },
+   "GPTX3ForCausalLM": {
+    "gpts2": 1
+   },
+   "GPTXForCausalLM": {
+    "gptx": 1
+   },
+   "GQAGPT2": {
+    "customGPT_pretrain": 1
+   },
+   "GalahadForCausalLM": {
+    "galahad": 1
+   },
+   "GatedDeltaProductForCausalLM": {
+    "gated_deltaproduct": 1
+   },
+   "GatorForCausalLM": {
+    "gator": 1
+   },
+   "GeminiForCausalLM": {
+    "llama": 1
+   },
+   "Gemma2BlockAttnResForCausalLM": {
+    "gemma2": 1
+   },
+   "Gemma3AbliteratedForConditionalGeneration": {
+    "gemma3": 1
+   },
+   "Gemma3PXForCausalLM": {
+    "gemma_3_px": 1
+   },
+   "Gemma4NanoForCausalLM": {
+    "gemma4-nano": 1
+   },
+   "Gemma4TextModel": {
+    "gemma4_text": 1
+   },
+   "GemmagainForCausalLM": {
+    "gemma3": 1
+   },
+   "GenerativePromptLlama": {
+    "llama": 1
+   },
+   "GeoMotionGPTForCausalLM": {
+    "geomotiongpt": 1
+   },
+   "GexQwenForCausalLM": {
+    "gex": 1
+   },
+   "GiftOfGabForCausalLM": {
+    "gift_of_gab": 1
+   },
+   "GigaChatAudioForConditionalGeneration": {
+    "gigachat_audio": 1
+   },
+   "GliDeForCausalLM": {
+    "llama": 1
+   },
+   "Glm4MoeLitePlusPlusForCausalLM": {
+    "glm4_moe_lite_plus_plus": 1
+   },
+   "GlmOcrForConditionalGeneration": {
+    "glm_ocr": 1
+   },
+   "GlmasrForConditionalGeneration": {
+    "glmasr": 1
+   },
+   "GlubLM": {
+    "glublm": 1
+   },
+   "GoatVVVForCausalLM": {
+    "goat_vvv_gpt": 1
+   },
+   "GobbledygookForCausalLM": {
+    "gobbledygook": 1
+   },
+   "GodQueenIVForCausalLM": {
+    "god_queen_iv": 1
+   },
+   "GomeForCausalLM": {
+    "gome": 1
+   },
+   "GopuForCausalLM": {
+    "gopu": 1
+   },
+   "GptNeoForCausalLM": {
+    "gpt_neo": 1
+   },
+   "GptOssAsideForCausalLM": {
+    "gpt_oss": 1
+   },
+   "GptOssPuzzleForCausalLM": {
+    "gpt_oss_puzzle": 1
+   },
+   "GptOssVLForConditionalGeneration": {
+    "gpt_oss_vl": 1
+   },
+   "GraniteKVShareForCausalLM": {
+    "granite_kvshare": 1
+   },
+   "GraniteSWAForCausalLM": {
+    "granite_swa": 1
+   },
+   "GraphLlamaForCausalLM": {
+    "GraphLlama": 1
+   },
+   "GraphT5TransformerForConditionalGeneration": {
+    "t5": 1
+   },
+   "GraphTokenLM": {
+    "graph_token_lm": 1
+   },
+   "GreedyModel": {},
+   "GretaForCausalLM": {
+    "Greta": 1
+   },
+   "GritLM": {
+    "mistral": 1
+   },
+   "Grok2ForCausalLM": {
+    "grok2": 1
+   },
+   "GrokForCausalLM": {
+    "grok": 1
+   },
+   "GroundedBLIPLMForConditionalGeneration": {
+    "blip-2": 1
+   },
+   "GruyereForCausalLM": {
+    "gouda_gruyere": 1
+   },
+   "GuppyLMForCausalLM": {
+    "guppylm": 1
+   },
+   "HEDForConditionalGeneration": {
+    "hed": 1
+   },
+   "HFBasicModel": {
+    "hf_basic_model": 1
+   },
+   "HFETM": {
+    "etm": 1
+   },
+   "HFGPTModel": {
+    "custom-gpt": 1
+   },
+   "HFHealthSLM": {
+    "healthslm": 1
+   },
+   "HFLuminoLexForCausalLM": {
+    "luminolex": 1
+   },
+   "HFOpenMoeForCausalLM": {
+    "openmoe": 1
+   },
+   "HFPForCausalLM": {
+    "hfp": 1
+   },
+   "HIComQwen2ForCausalLM": {
+    "hicom_qwen2": 1
+   },
+   "HLM5ForCausalLM": {
+    "hlm5": 1
+   },
+   "HModel": {
+    "h_model": 1
+   },
+   "HNetForCausalLM": {},
+   "HRMCosmicFish": {
+    "cosmicfish_hrm": 1
+   },
+   "HRMForCausalLM": {
+    "hrm": 1
+   },
+   "HTDNModel": {
+    "htdn": 1
+   },
+   "HYV3VLForCausalLM": {
+    "hy_v3_vl": 1
+   },
+   "HaikuForCausalLM": {
+    "haiku": 1
+   },
+   "HaipaiForCausalLM": {
+    "haipai": 1
+   },
+   "HaipaiLM": {
+    "haipai-gpt": 1
+   },
+   "HaloSForCausalLM": {
+    "halo_s": 1
+   },
+   "HaltCoTForCausalLM": {
+    "halt_cot": 1
+   },
+   "HangulGemmaDeobfuscator": {
+    "hangul_gemma_deobfuscator": 1
+   },
+   "HanseForCausalLM": {
+    "hanse": 1
+   },
+   "HanziForCausalLM": {
+    "hanzi": 1
+   },
+   "HelionOSCForCausalLM": {
+    "helion-osc": 1
+   },
+   "HelixLMForCausalLM": {
+    "helixlm": 1
+   },
+   "HelloAgentForCausalLM": {
+    "hello_agent": 1
+   },
+   "HenyoModel": {
+    "custom_henyo_culturax": 1
+   },
+   "HeteroLlamaForCausalLM": {
+    "HeteroLlama": 1
+   },
+   "HiLSForCausalLM": {
+    "olmo_hils": 1
+   },
+   "HierColMaskMoELLaVAQwen2ForCausalLM": {
+    "hier_col_mask_moe_llava_qwen2": 1
+   },
+   "HindiCausalLM": {
+    "hindi_causal_lm": 1
+   },
+   "HindiSLMForCausalLM": {
+    "hindi_slm": 1
+   },
+   "HixtralForCausalLM": {
+    "hixtral": 1
+   },
+   "HogletoForCausalLM": {
+    "hogleto": 1
+   },
+   "HookedLlamaForCausalLM": {
+    "llama": 1
+   },
+   "HubertGPTNeoXCrossForConditionalGeneration": {
+    "gpt_neox": 1
+   },
+   "HuggingFaceCompatibleModel": {
+    "custom_language_model": 1
+   },
+   "HumanGPTForCausalLM": {
+    "llava": 1
+   },
+   "HummingbirdForCausalLM": {
+    "hummingbird": 1
+   },
+   "HunyuanImage3ForCausalMM": {
+    "Hunyuan": 1
+   },
+   "HuskyForConditionalGeneration": {
+    "husky": 1
+   },
+   "HybriKoForCausalLM": {
+    "hybridko": 1
+   },
+   "HybridGatedDeltaNetForCausalLM": {
+    "hybrid_gated_deltanet": 1
+   },
+   "HybridLMForCausalLM": {
+    "hybridlm": 1
+   },
+   "HybridMoRMoEForCausalLM": {
+    "hybrid_mor_moe": 1
+   },
+   "HybridTinyForCausalLM": {
+    "hybrid_tiny_lm": 1
+   },
+   "HybridTransformerV2ForCausalLM": {
+    "hybrid_transformer_v2": 1
+   },
+   "HydrogenForCausalLM": {
+    "hydrogen": 1
+   },
+   "Hyper0xModel": {
+    "gpt2": 1
+   },
+   "HyperMambaLM": {
+    "hypermamba": 1
+   },
+   "HyperpartisanModel": {
+    "ft_emb_traits": 1
+   },
+   "I3ForCausalLM": {
+    "i3": 1
+   },
+   "IBCEGPT2LowRank": {
+    "gpt2": 1
+   },
+   "ICONNForCausalLM": {
+    "iconn": 1
+   },
+   "IIIForCausalLM": {
+    "iii": 1
+   },
+   "IKNN-Rl1-A1ForCausalLM": {
+    "iknn": 1
+   },
+   "IQuestPLTCoderForCausalLM": {
+    "iquestpltcoder": 1
+   },
+   "IQuestQ1ForCausalLM": {
+    "iquest_q1": 1
+   },
+   "ISO20022ForCausalLM": {
+    "iso20022": 1
+   },
+   "ISOMR1Coder16BMoEForCausalLM": {
+    "isom_deepseek_coder_v2": 1
+   },
+   "ISOMR1Edge130MMoEForCausalLM": {
+    "isom_130m_moe": 1
+   },
+   "ISOMR1Enterprise40BForCausalLM": {
+    "falcon": 1
+   },
+   "ISOMR1Reasoning15BForCausalLM": {
+    "isom": 1
+   },
+   "IcarusForCausalLM": {
+    "icarus": 1
+   },
+   "Idefics2ForVisionText2Text": {
+    "idefics2": 1
+   },
+   "IlamaForCausalLM": {
+    "ilama": 1
+   },
+   "IlluminatorLMHeadModel": {
+    "illuminator": 1
+   },
+   "ImbalanceTexxWithBertForConditionalGeneration": {
+    "qwen2": 1
+   },
+   "ImpPhi3ForCausalLM": {
+    "imp_phi3": 1
+   },
+   "ImpQwen2ForCausalLM": {
+    "imp_qwen2": 1
+   },
+   "Imu1ForCausalLM": {
+    "imu_1": 1
+   },
+   "IndexLM": {
+    "index": 1
+   },
+   "InductionForCausalLM": {
+    "induction_lm": 1
+   },
+   "InferenceMemoryWrapper": {
+    "llama": 1
+   },
+   "InfiMMHDModel": {
+    "infimm-hd": 1
+   },
+   "InfiMMVicunaModel": {
+    "infimm-vicuna": 1
+   },
+   "InfiMMZephyrModel": {
+    "infimm-zephyr": 1
+   },
+   "Int8LlamaForCausalLM": {
+    "llama": 1
+   },
+   "IntellixForConditionalGeneration": {
+    "intellix": 1
+   },
+   "InversionFromHiddenStatesModel": {},
+   "Ions1Model": {
+    "ions1": 1
+   },
+   "Isllmai50mForCausalLM": {
+    "isllmai_50m": 1
+   },
+   "ItaloForCausalLM": {
+    "italo": 1
+   },
+   "IvmeCoderV1ForCausalLM": {
+    "ivme_coder": 1
+   },
+   "IvmeConversateSModel": {
+    "ivme_conversate_s": 1
+   },
+   "IvmeConversateSV2InstructModel": {
+    "ivme_conversate_s_v2_instruct": 1
+   },
+   "IvmeForCausalLM": {
+    "ivme": 1
+   },
+   "JeeneyModel": {
+    "jeeney": 1
+   },
+   "JiRackTernary1B": {
+    "jirack_ternary": 1
+   },
+   "JiRackTernaryGemma4_26b": {
+    "gemma4_text": 1
+   },
+   "JiRackTernaryPro1B": {
+    "jirack_ternary": 1
+   },
+   "JibayAiForCausalLM": {
+    "gemma3_text": 1
+   },
+   "JinsooLLMForCausalLM": {
+    "jinsoo_llm": 1
+   },
+   "JulianForCausalLM": {
+    "julian": 1
+   },
+   "JulianModel": {
+    "julian": 1
+   },
+   "JumpLanderPythonModel": {
+    "jl_code_python": 1
+   },
+   "KBLaMPhi3ForCausalLM": {
+    "phi3": 1
+   },
+   "KDAGraftQwen2": {
+    "qwen2": 1
+   },
+   "KORMoMoeForCausalLM": {
+    "kormo_moe": 1
+   },
+   "KV1ForCausalLM": {
+    "banana_kv1": 1
+   },
+   "KVLatentForCausalLM": {
+    "kvlatent": 1
+   },
+   "KW2LMHeadModel": {
+    "gpt2": 1
+   },
+   "KamboForCausalLM": {
+    "kambo": 1
+   },
+   "KateAIForCausalLM": {
+    "kate": 1
+   },
+   "KfmForCausalLM": {
+    "kfm": 1
+   },
+   "KimiForCausalLM": {
+    "kimi": 1
+   },
+   "KimiVLForConditionalGeneration": {
+    "kimi_vl": 1
+   },
+   "KinoeForCausalLM": {
+    "kinoe": 1
+   },
+   "KiyoDiffusion": {
+    "kiyo_diffusion": 1
+   },
+   "KmoshiForConditionalGeneration": {
+    "kmoshi": 1
+   },
+   "KohakuForCausalLM": {
+    "kohaku": 1
+   },
+   "KopriaLMForCausalLM": {
+    "kopria": 1
+   },
+   "Kosmos2_5TextForCausalLM": {
+    "kosmos_2_5_text_model": 1
+   },
+   "KsByteForCausalLM": {
+    "ksbyte": 1
+   },
+   "LDT": {
+    "ldt": 1
+   },
+   "LEGOLlamaForCausalLM": {
+    "LEGO": 1
+   },
+   "LFM2MosaicForCausalLM": {
+    "lfm2_mosaic": 1
+   },
+   "LIMEForCausalLM": {
+    "lime": 1
+   },
+   "LIMeForCausalLM": {
+    "llama": 1
+   },
+   "LLAMA": {
+    "llama": 1
+   },
+   "LLaDAMoEModel": {
+    "llada": 1
+   },
+   "LLaDAUPMModelLM": {
+    "llada": 1
+   },
+   "LLaDOUModelLM": {
+    "llada": 1
+   },
+   "LLaMaModelHub": {
+    "llama": 1
+   },
+   "LLamaNuGPTQForCausalLM": {
+    "llama": 1
+   },
+   "LLavaMistralForCausalLM": {
+    "llava_mistral": 1
+   },
+   "LMDeployForCausalLM": {},
+   "LOCOSTForConditionalGeneration": {},
+   "LOLEVEForCausalLM": {
+    "loleve": 1
+   },
+   "LSMoEForCausalLM": {
+    "lsmoe": 1
+   },
+   "LSTMLanguageModel": {
+    "lstm_lm": 1
+   },
+   "LSTMResnetForCausalLM": {
+    "lstm_resnet": 1
+   },
+   "LaTrForConditionalGeneration": {
+    "t5": 1
+   },
+   "LaVelForCausalLM": {
+    "lavel": 1
+   },
+   "LamForCausalLM": {
+    "lam": 1
+   },
+   "LamedLlamaForCausalLM": {
+    "lamed_llama": 1
+   },
+   "LamedPhi3ForCausalLM": {
+    "lamed_phi3": 1
+   },
+   "LaminarNet": {
+    "laminarnet": 1
+   },
+   "LanguageModel": {},
+   "LatentCOCONUTGPT2": {
+    "gpt2": 1
+   },
+   "LatentCODIGPT2": {
+    "gpt2": 1
+   },
+   "LatentCoTModel": {
+    "latent_cot": 1
+   },
+   "LatentRecurrentDepthModel": {
+    "latent_recurrent_depth": 1
+   },
+   "LatentThinkingModel": {
+    "llama": 1
+   },
+   "LayerGrowForCausalLM": {
+    "layer_grow": 1
+   },
+   "LeanGPT": {
+    "gpt_pt_lean": 1
+   },
+   "LeanLlamaForCausalLM": {
+    "llama": 1
+   },
+   "LeanMixtralForCausalLM": {
+    "mixtral": 1
+   },
+   "LedgerNetForCausalLM": {
+    "ledgernet": 1
+   },
+   "LeerooDedicatedOOE": {
+    "mistral": 1
+   },
+   "LegalSLMForCausalLM": {
+    "legal_slm": 1
+   },
+   "LennaForCausalLM": {
+    "llava": 1
+   },
+   "LexaDeltaForCausalLM": {
+    "gpt_oss": 1
+   },
+   "Lfm2BidirectionalForMaskedLM": {
+    "lfm2": 1
+   },
+   "Lfm2IDKForCausalLM": {
+    "lfm2_idk": 1
+   },
+   "Lfm2MoeCustomForCausalLM": {
+    "lfm2_moe_custom": 1
+   },
+   "Lfm2MoeForCausalLMCustom": {
+    "lfm2_moe": 1
+   },
+   "LigerGLAForCausalLM": {
+    "liger_gla": 1
+   },
+   "LigerGSAForCausalLM": {
+    "liger_gsa": 1
+   },
+   "LigerLlamaForCausalLM": {
+    "llama": 1
+   },
+   "LightGPTHuggingFaceModel": {
+    "lightgpt": 1
+   },
+   "LightningTransformerModelForCausalLM": {
+    "lightning_transformer": 1
+   },
+   "LingDSparkModel": {
+    "qwen3": 1
+   },
+   "LingoWhaleForCausalLM": {
+    "lingowhale": 1
+   },
+   "LitaLlamaForCausalLM": {
+    "lita": 1
+   },
+   "LizardForCausalLM": {
+    "lizard": 1
+   },
+   "LlaMAForCausalLM": {
+    "llama": 1
+   },
+   "Llama2ForCausalLM": {},
+   "Llama3CustomForCausalLM": {
+    "llama3_custom": 1
+   },
+   "Llama3ForCausalLMWithEarlyExit": {
+    "llama3_earlyexit": 1
+   },
+   "LlamaDeepSeekForCausalLM": {
+    "llama_deepseek": 1
+   },
+   "LlamaForCasualLM": {
+    "llama": 1
+   },
+   "LlamaForCausalLM_sharedHyper": {
+    "llama": 1
+   },
+   "LlamaForRear": {
+    "llama": 1
+   },
+   "LlamaIRForCausalLM": {
+    "llama": 1
+   },
+   "LlamaKDA": {
+    "llama_kda": 1
+   },
+   "LlamaLadderForCausalLM": {
+    "llamaLadder": 1
+   },
+   "LlamaMedITForCausalLM": {
+    "llama": 1
+   },
+   "LlamaMixLoRAForCausalLM": {
+    "llama_mixlora": 1
+   },
+   "LlamaQKNorm": {
+    "llama_qknorm": 1
+   },
+   "LlamaSkipConnectionForCausalLM": {
+    "llama-skip": 1
+   },
+   "LlamaSparseForCausalLM": {
+    "llama_sparse": 1
+   },
+   "LlamaTTSForCausalLM": {
+    "llama": 1
+   },
+   "LlamaWithMoEForCausalLM": {
+    "llama_with_moe": 1
+   },
+   "LlamoeForCausalLM": {
+    "Llamoe": 1
+   },
+   "LlasaForCausalLM": {
+    "llasa": 1
+   },
+   "LlavaBaichuan2ForCausalLM": {
+    "llava_baichuan2": 1
+   },
+   "LlavaGPTNeoXForCausalLM": {
+    "llava": 1
+   },
+   "LlavaGemmaForConditionalGeneration": {
+    "gemma3": 1
+   },
+   "LlavaLlamaImageBindSelectForCausalLM": {
+    "llava_image_bind_select": 1
+   },
+   "LlavaMinervaForCausalLM": {
+    "llava_minerva": 1
+   },
+   "LlavaMixtralForCausalLM": {
+    "llava_mixtral": 1
+   },
+   "LlavaMonetForCausalLM": {
+    "llava_monet": 1
+   },
+   "LlavaPythiaForCausalLM": {
+    "llava_pythia": 1
+   },
+   "LlavaQwen2ForConditionalGeneration": {
+    "llava_qwen1_5": 1
+   },
+   "LlavaSearchLlamaForCausalLM": {
+    "llava_search": 1
+   },
+   "LlavaStableLM_1_6bForCausalLM": {
+    "llava_stablelm_1_6b": 1
+   },
+   "LlavaT5ForConditionalGeneration": {
+    "t5": 1
+   },
+   "LlavaVistralForCausalLM": {
+    "llava_vistral": 1
+   },
+   "Llm2SlmGpt2ForCausalLM": {
+    "llm-to-slm": 1
+   },
+   "LoRAGPT2LMHeadModel": {
+    "gpt2": 1
+   },
+   "LoafLMForCausalLM": {
+    "loaflm": 1
+   },
+   "LogosForCausalLM": {
+    "logos": 1
+   },
+   "LomonosovZenitAltayForConditionalGeneration": {
+    "qwen3_5": 1
+   },
+   "LongcatForCausalLM": {
+    "longcat": 1
+   },
+   "LongformerBartWithDoctypeForConditionalGeneration": {
+    "bart": 1
+   },
+   "LoomFormerForCausalLM": {
+    "loomformer": 1
+   },
+   "LoopedLMForCausalLM": {
+    "looped_lm": 1
+   },
+   "LstmForCausalLM": {
+    "lstm": 1
+   },
+   "Lulu2ForCausalLM": {
+    "luluv2": 1
+   },
+   "LumenForCausalLM": {
+    "lumen": 1
+   },
+   "LumensparkModel": {
+    "lumenspark": 1
+   },
+   "LuminaForCausalLM": {
+    "lumina": 1
+   },
+   "LunaZeroGPT": {
+    "luna_zero": 1
+   },
+   "M31ForCausalLM": {
+    "m31": 1
+   },
+   "MAEForCausalLM": {
+    "MAELM": 1
+   },
+   "MBZTestModelForCausalLM": {
+    "mbz-test": 1
+   },
+   "MBartModel": {
+    "mbart": 1
+   },
+   "MDLM": {
+    "mdlm": 1
+   },
+   "MDLMBPEV4": {
+    "mdlm": 1
+   },
+   "MLPSpeculatorPreTrainedModel": {
+    "mlp_speculator": 1
+   },
+   "MLlavaForConditionalGeneration": {
+    "llava": 1
+   },
+   "MLongformerEncoderDecoderForConditionalGeneration": {
+    "mbart": 1
+   },
+   "MMMadnessLLMModelForCausalLM": {
+    "mmmadness-llm": 1
+   },
+   "MOE": {
+    "afmoe": 1
+   },
+   "MOHOModel": {
+    "qwen3": 1
+   },
+   "MT5LSAAlibiForConditionalGeneration": {
+    "mt5": 1
+   },
+   "MUDDFormer": {
+    "muddformer": 1
+   },
+   "MabaForConditionalGeneration": {
+    "maba": 1
+   },
+   "MabaModel": {
+    "maba": 1
+   },
+   "MagnetarForCausalLM": {
+    "magnetar": 1
+   },
+   "Mahler60/Prueba": {
+    "gpt_neox": 1
+   },
+   "ManasGPT": {
+    "tiny_manas": 1
+   },
+   "MaplePTForCausalLM": {
+    "maplept": 1
+   },
+   "MarkupDMForCausalLM": {
+    "markupdm": 1
+   },
+   "MarkupLMForPretraining": {
+    "markuplm": 1
+   },
+   "MarshmelloGPT": {
+    "marshmello_gpt": 1
+   },
+   "MaskMoELLaVAQwen2ForCausalLM": {
+    "mask_moe_llava_qwen2": 1
+   },
+   "MaskedDiffusionLM": {
+    "diffurefill": 1
+   },
+   "MaskedLmGraph": {
+    "lfm2-bidirectional": 1
+   },
+   "MatchcommentaryModel": {
+    "Matchcommentary": 1
+   },
+   "MatformerForCausalLM": {
+    "matformer": 1
+   },
+   "MathBananaMindForCausalLM": {
+    "mathbananamind": 1
+   },
+   "MatildaForCausalLM": {
+    "matilda": 1
+   },
+   "MaximusMoEForCausalLM": {
+    "clyrai_maximus_moe": 1
+   },
+   "MedHemoEARCPModel": {
+    "medhemo_earcp": 1
+   },
+   "MedHemoModel": {
+    "medhemo_earcp": 1
+   },
+   "MegatronBertForCausalLM": {
+    "megatron-bert": 1
+   },
+   "MeghaForCausalLM": {
+    "megha": 1
+   },
+   "MemLlamaForCausalLM": {
+    "llama": 1
+   },
+   "MementoQwen3ForCausalLM": {
+    "qwen3": 1
+   },
+   "MemoryModel": {
+    "memory_model": 1
+   },
+   "MermaidGPTModel": {
+    "gpt2": 1
+   },
+   "MetaCogForCausalLM": {
+    "metacog_v2": 1
+   },
+   "MetaDiffusion600MForCausalLM": {
+    "metadiffusion": 1
+   },
+   "MeteorMambaForCausalLM": {
+    "mamba": 1
+   },
+   "MiMoMamba3ForCausalLM": {
+    "mimo_mamba3": 1
+   },
+   "MiMoV2ASRForCausalLM": {
+    "qwen2": 1
+   },
+   "MicroBananaForCausalLM": {
+    "microbanana": 1
+   },
+   "MicroLlama": {
+    "micro-llama": 1
+   },
+   "MicroStoryBananaMindModel": {
+    "microstory_bananamind": 1
+   },
+   "MightyLlamaForCausalLM": {
+    "mighty-llama": 1
+   },
+   "MijatovicForCausalLM": {
+    "mijatovic_adriaticum": 1
+   },
+   "MimansForCausalLM": {
+    "mimans": 1
+   },
+   "MimoForCausalLM": {
+    "mimo2": 1
+   },
+   "MinGRUForCausalLM": {
+    "mingru": 1
+   },
+   "MindLM": {
+    "mindlm": 1
+   },
+   "MindiForCausalLM": {
+    "mindi": 1
+   },
+   "MiniArtForConditionalGeneration": {
+    "miniart_vision": 1
+   },
+   "MiniCPMHadamardForCausalLM": {
+    "minicpm_hadamard": 1
+   },
+   "MiniCPMV": {
+    "minicpmv": 1
+   },
+   "MiniDecoderModel": {
+    "gpt2": 1
+   },
+   "MiniEnedina": {
+    "mini-enedina": 1
+   },
+   "MiniGeminiQwen2ForCausalLM": {
+    "mini_gemini_qwen2": 1
+   },
+   "MiniMaxText01ForCausalLM": {
+    "minimax_text_01": 1
+   },
+   "MiniPhi3": {
+    "phi3": 1
+   },
+   "MiniQwenForCausalLM": {
+    "mini_qwen": 1
+   },
+   "MiniTransformerModel": {
+    "mini_transformer": 1
+   },
+   "MinimixForCausalLM": {
+    "llama": 1
+   },
+   "Mirai5": {
+    "mirai": 1
+   },
+   "Miridih_LlavaForConditionalGeneration": {
+    "miridih_llava": 1
+   },
+   "Mistralreconfig3ForCausalLM": {
+    "mistral_reconfig3": 1
+   },
+   "MistsForConditionalGeneration": {
+    "mists": 1
+   },
+   "MixFP4Qwen3_5MoeForCausalLM": {
+    "qwen3_5_moe_text": 1
+   },
+   "MixFormerVLSequentialForCausalLM": {
+    "mixformer-sequential": 1
+   },
+   "Mixtral 8x7B": {
+    "Chat2Eco-Base": 1
+   },
+   "MixtralModel": {
+    "mixtral": 1
+   },
+   "MnemosyneForCausalLM": {
+    "mnemosyne": 1
+   },
+   "MoEForCausalLM": {
+    "llama": 1
+   },
+   "MoEGPT2": {
+    "customGPT_pretrain": 1
+   },
+   "MoELLaVAMistralForCausalLM": {
+    "moe_llava_mistral": 1
+   },
+   "MoELLaVAQWenForCausalLM": {
+    "moe_llava_qwen": 1
+   },
+   "MoEModel": {
+    "custom_moe": 1
+   },
+   "MoEQwen3B": {
+    "qwen2": 1
+   },
+   "MoEQwen3ForCausalLM": {
+    "qwen3": 1
+   },
+   "MoLoRAQwenForCausalLM": {
+    "qwen2": 1
+   },
+   "MoRLlamaForCausalLM": {
+    "mor_llama": 1
+   },
+   "MoTLMHeadModel": {
+    "mot": 1
+   },
+   "MoYiForCausalLM": {
+    "deepseek": 1
+   },
+   "MobileBertForPreTraining": {
+    "mobilebert": 1
+   },
+   "MobilintCohere2ForCausalLM": {
+    "mobilint-cohere2": 1
+   },
+   "MobilintExaone4ForCausalLM": {
+    "mobilint-exaone4": 1
+   },
+   "MobilintLlamaEagle3ForCausalLM": {
+    "mobilint-llama-eagle3": 1
+   },
+   "MobilintQwen2Eagle3ForCausalLM": {
+    "mobilint-qwen2-eagle3": 1
+   },
+   "ModelArchitecture": {
+    "char-gpt": 1
+   },
+   "ModelStarOLMhead": {
+    "staro": 1
+   },
+   "ModeratoRRRMoeForCausalLM": {
+    "moderato_moe": 1
+   },
+   "ModernBertForSequenceClassification": {
+    "modernbert": 1
+   },
+   "ModernDenseForCausalLM": {
+    "modern_dense_mha_gated_ffn_router": 1
+   },
+   "ModernGPTMoEForCausalLM": {
+    "modern_gpt_moe": 1
+   },
+   "ModernLLMForCausalLM": {
+    "modern_llm": 1
+   },
+   "ModernMarianMTModel": {
+    "marian": 1
+   },
+   "ModularResidualReasoningLM": {
+    "modular_residual_reasoning_lm": 1
+   },
+   "MoeGreetingForCausalLM": {
+    "moe_greeting": 1
+   },
+   "MoiraiCausalLM": {
+    "moirai": 1
+   },
+   "MoonshotKimiaForCausalLM": {
+    "qwen2": 1
+   },
+   "Moss2ForCausalLM": {
+    "llava_moss2": 1
+   },
+   "MotherCoreForCausalLM": {
+    "mother_core": 1
+   },
+   "MugenForConditionalGeneration": {
+    "mugen": 1
+   },
+   "MultiHeadGPT2": {
+    "gpt2": 1
+   },
+   "MultiHeadGPTNeo": {
+    "gpt_neo": 1
+   },
+   "MultiModalSuperModel": {
+    "multi_modal_text_generation": 1
+   },
+   "MultimodalLlamaForConditionalGeneration": {
+    "multimodal_llama": 1
+   },
+   "MuonGPTForCausalLM": {
+    "muon-gpt": 1
+   },
+   "MurzikForCausalLM": {
+    "murzik": 1
+   },
+   "MuseGlimmerAssistantModel": {
+    "muse_glimmer_assistant": 1
+   },
+   "Mushfiqur3TMoEForConditionalGeneration": {
+    "mushfiqur_moe_3t": 1
+   },
+   "MuxX11ForCausalLM": {
+    "mux_x11": 1
+   },
+   "MvpForCausalLM": {
+    "mvp": 1
+   },
+   "MyChatGLMForConditionalGeneration": {
+    "chatglm": 1
+   },
+   "MyFirstLLM": {
+    "myfirstllm": 1
+   },
+   "MyGrokForCausalLM": {
+    "my_grok": 1
+   },
+   "MyPhiForCausalLM": {
+    "myphi_hf": 1
+   },
+   "MyQWenLMHeadModel": {
+    "qwen": 1
+   },
+   "MyQwen2ForCausalLM": {
+    "myqwen_hf": 1
+   },
+   "MyXverseForCausalLM": {
+    "xverse": 1
+   },
+   "Mycoach": {},
+   "NACRForCausalLM": {
+    "nacr": 1
+   },
+   "NDAForCausalLM": {
+    "nda": 1
+   },
+   "NDLForCausalLM": {
+    "Ndl": 1
+   },
+   "NDLMOEForCausalLM": {
+    "NdlMOE": 1
+   },
+   "NEEDConversationalModel": {
+    "need_conversational": 1
+   },
+   "NEODecoderModelV2": {
+    "neo_coder": 1
+   },
+   "NGen3ForCausalLM": {
+    "NGen3": 1
+   },
+   "NGen4OW10TForCausalLM": {
+    "ngen4ow_10t": 1
+   },
+   "NRGPTForCausalLM": {
+    "nrgpt": 1
+   },
+   "NSAForCausalLM": {
+    "nsa": 1
+   },
+   "NTv3Generative": {
+    "ntv3_posttrained": 1
+   },
+   "NablaVLForCausalLM": {
+    "nabla_vl": 1
+   },
+   "NafieForCausalLM": {
+    "nafie": 1
+   },
+   "NaimForConditionalGeneration": {
+    "naim": 1
+   },
+   "NamerModel": {
+    "custom": 1
+   },
+   "NanoDeepSeek": {
+    "gpt2": 1
+   },
+   "NanoDenseForCausalLM": {
+    "nano_dense": 1
+   },
+   "NanoGPTCompressedModel": {
+    "nanogpt_compressed": 1
+   },
+   "NanoGPTModel": {
+    "nanogpt": 1
+   },
+   "NanoLlamaForCausalLM": {
+    "nano_llama": 1
+   },
+   "NanoNanoModel": {
+    "nano-nano": 1
+   },
+   "NanoQwenForCausalLM": {
+    "qwen2": 1
+   },
+   "NanoThink": {
+    "nanothink": 1
+   },
+   "Nanos1_1LiteForCausalLM": {
+    "nanos1.1-lite": 1
+   },
+   "NanowhaleDIME": {
+    "nanowhale": 1
+   },
+   "NarcTinyForCausalLM": {
+    "narc-tiny": 1
+   },
+   "NatureCodeOceanModel": {
+    "naturecode-ocean": 1
+   },
+   "NcpSmolForCausalLM": {
+    "ncp_smol": 1
+   },
+   "NeRFLLMLlamaForCausalLM": {
+    "nerfllm": 1
+   },
+   "NebulaXForCausalLM": {
+    "nebula-x": 1
+   },
+   "NebulaXModel": {
+    "nebula-x": 1
+   },
+   "NeeForCausalLM": {
+    "nee": 1
+   },
+   "NeedleForConditionalGeneration": {
+    "encoder-decoder": 1
+   },
+   "NemotronHAugmentedForCausalLM": {
+    "nemotron_h": 1
+   },
+   "NemotronLabsDiffusionVLMModel": {
+    "nemotron_labs_diffusion_vlm": 1
+   },
+   "NeoraModel": {
+    "neora": 1
+   },
+   "NepalEdgeLM": {},
+   "NepaliGPTForCausalLM": {
+    "nep_gptv1": 1
+   },
+   "NeuralQuantumNQLM": {
+    "neuralquantum_nqlm": 1
+   },
+   "NeuralnetForCausalLM": {
+    "neuralnet": 1
+   },
+   "NeuroReasonerPlanningHead1": {
+    "neuroreasoner_planninghead": 1
+   },
+   "NeuronLMForCausalLM": {
+    "neuron_lm": 1
+   },
+   "Neutrino": {
+    "neutrino": 1
+   },
+   "NewModel": {
+    "new": 1
+   },
+   "NexaraForCausalLM": {
+    "nexara": 1
+   },
+   "NextChatForCausalLM": {
+    "nextchat": 1
+   },
+   "NextGenForCausalLM": {
+    "next_gen_gpt": 1
+   },
+   "NexusQuantumForCausalLM": {
+    "nexus_quantum_transformer": 1
+   },
+   "NimbusLMForCausalLM": {},
+   "NimoForCausalLM": {
+    "nimolm": 1
+   },
+   "NoPEGPTHuggingFaceModel": {
+    "nope-gpt": 1
+   },
+   "NoTokenGenModel": {
+    "notoken_gen": 1
+   },
+   "NoTokenLMForCausalLM": {
+    "notokenlm": 1
+   },
+   "NoisyGPT2LMHeadModel": {
+    "noisy_gpt2": 1
+   },
+   "NoolAlphaForCausalLM": {
+    "nool_alpha": 1
+   },
+   "NornV20ForCausalLM": {
+    "norn_v20": 1
+   },
+   "NotokenGen36ForCausalLM": {
+    "notoken_gen36": 1
+   },
+   "NotokenGen45ForCausalLM": {
+    "notoken_gen45": 1
+   },
+   "NovaMindForCausalLM": {
+    "nova": 1
+   },
+   "OLM3NanoForCausalLM": {
+    "olm3_nano": 1
+   },
+   "OPTModel": {
+    "opt": 1
+   },
+   "OS24ForCausalLM": {
+    "os24": 1
+   },
+   "ObsidianMultiscreenForCausalLM": {
+    "multiscreen": 1
+   },
+   "OkamelaAIForCausalLM": {
+    "transformer": 1
+   },
+   "Olmo1124ForCausalLM": {
+    "olmo_1124": 1
+   },
+   "Olmo1124ForSequenceClassification": {
+    "olmo_1124": 1
+   },
+   "Olmo2NoQKNormPrenormForCausalLM": {
+    "olmo2_noqknorm_prenorm": 1
+   },
+   "Olmo2RetrofitForCausalLM": {
+    "olmo2-retrofit": 1
+   },
+   "Olmo3SinkForCausalLM": {
+    "olmo3": 1
+   },
+   "OlmoeModel": {
+    "olmoe": 1
+   },
+   "OlmoeUpropForCausalLM": {
+    "olmoe_uprop": 1
+   },
+   "OmegaGPT": {
+    "legacy": 1
+   },
+   "OmniLMMForCausalLM": {
+    "omnilmm": 1
+   },
+   "OmniSpeech2SLlamaForCausalLM": {
+    "omni_speech2s_llama": 1
+   },
+   "OneBitTTSForCausalLM": {
+    "1bitts": 1
+   },
+   "OpenAIMoeForCausalLM": {
+    "openai_moe": 1
+   },
+   "OpenGPT": {
+    "mistral": 1
+   },
+   "OpenLMforCausalLM": {
+    "openlm": 1
+   },
+   "OpenLlamaForCausalLM": {
+    "open-llama": 1
+   },
+   "OpenPanguV2ForCausalLM": {
+    "openpangu_v2": 1
+   },
+   "OpenVLAForActionPrediction": {
+    "openvla": 1
+   },
+   "OptMoEForCausalLM": {
+    "OptMoE": 1
+   },
+   "Optimus3ForConditionalGeneration": {
+    "optimus3": 1
+   },
+   "OptrixForCausalLM": {
+    "optrix-1": 1
+   },
+   "OracleModel": {
+    "oracle": 1
+   },
+   "OrpheaForCausalLM": {
+    "orphea": 1
+   },
+   "OryxLlamaForCausalLM": {
+    "oryx_llama": 1
+   },
+   "OutlierMoE": {
+    "outlier_moe": 1
+   },
+   "OverfitterForCausalLM": {
+    "overfitter": 1
+   },
+   "OzanForCausalLM": {
+    "ozan_llm": 1
+   },
+   "PEERForCausalLM": {
+    "peer": 1
+   },
+   "PLBartForConditionalGeneration": {
+    "plbart": 1
+   },
+   "PMAForCausalLM": {
+    "pma": 1
+   },
+   "POINTS_SeekerModel": {},
+   "PPCMDraftModel": {
+    "qwen3": 1
+   },
+   "PTPForConditionalGeneration": {
+    "ptp": 1
+   },
+   "PackedLLM": {
+    "packedllm": 1
+   },
+   "PagnolXlForCausalLM": {
+    "pagnolxl": 1
+   },
+   "PainterModelForCausalLM": {
+    "painter": 1
+   },
+   "PaliGemmaForConditionalGeneration": {
+    "paligemma": 1
+   },
+   "PalmModel": {},
+   "PanguProMoEForCausalLM": {
+    "PanguProMoE": 1
+   },
+   "PanoLMForCausalLM": {
+    "panolm": 1
+   },
+   "Papagan": {
+    "papagan": 1
+   },
+   "Param1MoEForCausalLM": {
+    "param1MoE": 1
+   },
+   "Param2MoEForCausalLM": {
+    "param2moe": 1
+   },
+   "ParamtatvaTransformer": {
+    "paramtatva-rlm": 1
+   },
+   "PartiallySharedLayerModel": {
+    "llama": 1
+   },
+   "ParvusModel": {
+    "parvus": 1
+   },
+   "PathummaAudioModel": {
+    "pathumma_audio": 1
+   },
+   "PegaForCausalLM": {
+    "pega": 1
+   },
+   "PerceiverCausalLanguageModel": {
+    "perceiver-ar-causal-language-model": 1
+   },
+   "PheonixForCausalLM": {
+    "Pheonix": 1
+   },
+   "Phi2Model": {
+    "phi2": 1
+   },
+   "Phi3ForSequenceClassification": {
+    "phi3": 1
+   },
+   "Phi3WithVectorMemoryForCausalLM": {
+    "phi3": 1
+   },
+   "PhiForLogicalReasoning": {
+    "phi_reasoning": 1
+   },
+   "PhiMoLForCausalLM": {
+    "phi": 1
+   },
+   "PhoGPTForCausalLM": {
+    "phogpt": 1
+   },
+   "PiCoForCausalLM": {
+    "pico": 1
+   },
+   "PicaForCausalLM": {
+    "pica": 1
+   },
+   "Pinanolm100mForCausalLM": {
+    "pinanolm_100m": 1
+   },
+   "Pinanolm20mForCausalLM": {
+    "pinanolm_20m": 1
+   },
+   "Pinanolm50mForCausalLM": {
+    "pinanolm_50m": 1
+   },
+   "PlaptModel": {
+    "plapt": 1
+   },
+   "PlavaForConditionalGeneration": {
+    "llava": 1
+   },
+   "PllavaForConditionalGeneration": {
+    "llava": 1
+   },
+   "PocCausalLM": {
+    "qwen2": 1
+   },
+   "PocketVakilForCausalLM": {
+    "pocket_vakil": 1
+   },
+   "PolarNetForCausalLM": {
+    "polarnet": 1
+   },
+   "PolicyMultiLane": {
+    "qwen3": 1
+   },
+   "PollockForCausalLM": {
+    "pollock": 1
+   },
+   "PolyLMHeadModel": {
+    "gpt2": 1
+   },
+   "PoptorchPipelinedWhisperForConditionalGeneration": {
+    "whisper": 1
+   },
+   "PorthorMoeForCausalLM": {
+    "porthor_moe": 1
+   },
+   "PositionXLNetForCausalLM": {
+    "position-xlnet": 1
+   },
+   "PratchyaForCausalLM": {
+    "pratchya": 1
+   },
+   "PrefixLMForCausalLM": {
+    "prefix_lm": 1
+   },
+   "PrismCharMLP": {
+    "prism-char-mlp": 1
+   },
+   "PrismCustomModel": {
+    "prism_custom": 1
+   },
+   "PrivateLLMForCausalLM": {
+    "private_llm": 1
+   },
+   "PrivateWhisperForConditionalGeneration": {
+    "private-whisper": 1
+   },
+   "ProximaStarKVLlamaForCausalLM": {
+    "llama": 1
+   },
+   "Q50MForCausalLM": {
+    "q50m": 1
+   },
+   "QEDForCausalLM": {
+    "qed": 1
+   },
+   "QFSDeepseekV4ForCausalLM": {
+    "deepseek_v4": 1
+   },
+   "QForCausalLM": {
+    "q": 1
+   },
+   "QGPT2LMHeadModel": {
+    "gpt2": 1
+   },
+   "QGPT2LMHeadModel_gelu_softmax": {
+    "gpt2": 1
+   },
+   "QGPT2LMHeadModel_softmax": {
+    "gpt2": 1
+   },
+   "QHEARTForECGQA": {
+    "qheart": 1
+   },
+   "QLlamaForCausalLM": {
+    "llama": 1
+   },
+   "QMoEForCausalLM": {
+    "qmoe": 1
+   },
+   "QOmniForCausalLM": {
+    "qomni": 1
+   },
+   "QTensorHybridLlamaForCausalLM": {
+    "qtensor_llama": 1
+   },
+   "QWenForCausalLM": {
+    "qwen": 1
+   },
+   "QuadOrbitForCausalLM": {
+    "quadorbit": 1
+   },
+   "QuantizedT5ForConditionalGeneration": {
+    "t5": 1
+   },
+   "QuietQwenForCausalLM": {
+    "quietqwen": 1
+   },
+   "QuillanOniForCausalLM": {
+    "quillan_ronin_oni": 1
+   },
+   "Qwen2ForCausalLMEagle": {
+    "qwen2": 1
+   },
+   "Qwen2ForCausalLMwithHRM": {
+    "Qwen2_HRM": 1
+   },
+   "Qwen2ForClassifier": {
+    "qwen2": 1
+   },
+   "Qwen2ForRewardModel": {
+    "qwen2": 1
+   },
+   "Qwen2GlideDecoderLayer": {
+    "qwen2": 1
+   },
+   "Qwen2HybridForCausalLM": {
+    "qwen2_hybrid": 1
+   },
+   "Qwen2MMForCausalLM": {
+    "qwen2-mm": 1
+   },
+   "Qwen2MTPForCausalLM": {
+    "qwen2_mtp": 1
+   },
+   "Qwen2MoEForCausalLM": {
+    "qwen2_moe": 1
+   },
+   "Qwen2NomicVisionForCausalLM": {
+    "Qwen2NomicVision": 1
+   },
+   "Qwen2VLDualAudioForConditionalGeneration": {
+    "qwen2_vl": 1
+   },
+   "Qwen2VLExtendedForConditionalGeneration": {
+    "qwen2_vl": 1
+   },
+   "Qwen2VLForConditionalGenerationWithAudio": {
+    "qwen2_vl": 1
+   },
+   "Qwen2VLVAEForConditionalGeneration": {
+    "qwen2_vl_vae": 1
+   },
+   "Qwen2VisionForCausalLM": {
+    "qwen2": 1
+   },
+   "Qwen2_5_ForConditionalGeneration": {
+    "qwen2_5_vl": 1
+   },
+   "Qwen2_5_MemoryForCausalLM": {
+    "qwen2_5_memory": 1
+   },
+   "Qwen2_5_XrayForConditionalGeneration": {
+    "qwen2_5_xray": 1
+   },
+   "Qwen2chForCausalLM": {
+    "qwen2ch": 1
+   },
+   "Qwen35DSparkModel": {
+    "qwen3_5": 1
+   },
+   "Qwen35ForCausalLM": {
+    "qwen35": 1
+   },
+   "Qwen35GDN24ForCausalLM": {
+    "qwen3_5_gdn24": 1
+   },
+   "Qwen38ForCausalLM": {
+    "splash-packed-q8": 1
+   },
+   "Qwen3CanonForCausalLM": {
+    "qwen3": 1
+   },
+   "Qwen3FlatQuantForCausalLM": {
+    "qwen3": 1
+   },
+   "Qwen3ForCausalLMWithSIREN": {
+    "qwen3": 1
+   },
+   "Qwen3ForCut": {
+    "qwen3": 1
+   },
+   "Qwen3ForSequenceClassification": {
+    "qwen3": 1
+   },
+   "Qwen3GatedForCausalLM": {
+    "qwen3": 1
+   },
+   "Qwen3KVPopForCausalLM": {
+    "qwen3_kvpop": 1
+   },
+   "Qwen3LCQATForCompression": {
+    "qwen3_lcqat_compression": 1
+   },
+   "Qwen3MHCForCausalLMV2": {
+    "qwen3_mhc_v2": 1
+   },
+   "Qwen3MTPForCausalLM": {
+    "qwen3_mtp": 1
+   },
+   "Qwen3Mamba2ForCausalLM": {
+    "qwen3_mamba2": 1
+   },
+   "Qwen3MoePTEAdapterForCausalLM": {
+    "qwen3_moe_pte_adapter": 1
+   },
+   "Qwen3MoePlusPlusForCausalLM": {
+    "qwen3_moe_plus_plus": 1
+   },
+   "Qwen3OmniForCausalLM": {
+    "qwen3-omni": 1
+   },
+   "Qwen3ScaleSeqForCausalLM": {
+    "qwen3_scale_seq": 1
+   },
+   "Qwen3VLModel": {
+    "qwen3_vl": 1
+   },
+   "Qwen3VLSegForConditionalGeneration": {
+    "qwen3_vl": 1
+   },
+   "Qwen3_5MoeQuantizedForConditionalGeneration": {
+    "qwen3_5_moe": 1
+   },
+   "Qwen3_5TextForCausalLM": {
+    "qwen3_5_text": 1
+   },
+   "Qwen3_5TextModel": {
+    "qwen3_5_text": 1
+   },
+   "Qwen3_8MTPModel": {
+    "qwen3_8_mtp": 1
+   },
+   "QwenLMHeadModel": {
+    "qwen2": 1
+   },
+   "QwenMHCForCausalLM": {
+    "qwen3_5_text": 1
+   },
+   "QwenWithAdversarialDebiasingForCausalLM": {
+    "qwen_adversarial_debiasing": 1
+   },
+   "QyrouArchForCausalLM": {
+    "qyrou_arch": 1
+   },
+   "RBDashLlamaForCausalLM": {
+    "rbdash": 1
+   },
+   "RLlamaForCausalLM": {
+    "rllama": 1
+   },
+   "RMW3": {
+    "anka_rmw3": 1
+   },
+   "RND1": {
+    "rnd1": 1
+   },
+   "RNNLMForCausalLM": {
+    "rnnlm": 1
+   },
+   "RWKV-6": {
+    "RWKV-6": 1
+   },
+   "RWKV07IForCausalLM": {
+    "rwkv07i": 1
+   },
+   "RWKV07IMoEForCausalLM": {
+    "rwkv07i_moe": 1
+   },
+   "RWKV7Qwen2ForCausalLM": {
+    "rwkv7qwen2": 1
+   },
+   "RabbitForCausalLM": {
+    "rabbit_ssm": 1
+   },
+   "RafflesiaForCausalLM": {
+    "rafflesia1": 1
+   },
+   "RamoForCausalLM": {
+    "ramo": 1
+   },
+   "RapnssForCausalLM": {
+    "rapnss": 1
+   },
+   "RaptorForCausalLM": {
+    "raptor": 1
+   },
+   "RavenGuardForCausalLM": {
+    "ravenguard": 1
+   },
+   "Re_gptForCausalLM": {
+    "re_gpt": 1
+   },
+   "RecaLLMLlamaForCausalLM": {
+    "recallm_llama": 1
+   },
+   "RecaLLMQwen2ForCausalLM": {
+    "recallm_qwen2": 1
+   },
+   "RecursiveLanguageModel": {
+    "recursive_language_model": 1
+   },
+   "RecursiveMaskedLM": {
+    "recursive-mlm": 1
+   },
+   "RemBertForCausalLM": {
+    "rembert": 1
+   },
+   "RemoteForCausalLM": {
+    "remote": 1
+   },
+   "RenneeLlamaHFWrapper": {
+    "rennee_llama": 1
+   },
+   "RepeatedForCausalLM": {
+    "qwen2": 1
+   },
+   "ResnetModelForImageClassification": {
+    "resnet": 1
+   },
+   "RessAiForCausalLM": {
+    "onner": 1
+   },
+   "Retriever500M": {
+    "retriever500m": 1
+   },
+   "RetroGPT": {
+    "adaptive_retro_gpt": 1
+   },
+   "ReverX100M": {
+    "reverx": 1
+   },
+   "RexForCausalLM": {
+    "rex": 1
+   },
+   "RiXIS1ForCausalLM": {
+    "rixis1": 1
+   },
+   "Rio3ForCausalLM": {
+    "rio3": 1
+   },
+   "Rnj1ForCausalLM": {
+    "gemma3_text": 1
+   },
+   "RoCBertForCausalLM": {
+    "roc_bert": 1
+   },
+   "RoPEGPT2ForCausalLM": {
+    "ropegpt2": 1
+   },
+   "RobertaForCL": {
+    "roberta": 1
+   },
+   "RogueForCausalLM": {
+    "rogue_text": 1
+   },
+   "RopeMHDAT5ForConditionalGeneration": {
+    "t5": 1
+   },
+   "RotoBARTForConditionalGeneration": {
+    "RotoBART": 1
+   },
+   "RuQwen2ForCausalLM": {
+    "qwen2": 1
+   },
+   "RubiRLM": {
+    "rubirlm": 1
+   },
+   "RuqLM": {
+    "ruqlm": 1
+   },
+   "RustNNGPT": {
+    "rust_nn_gpt": 1
+   },
+   "Rwkv7MoeForCausalLM": {
+    "rwkv7_moe": 1
+   },
+   "SAFFULMHeadModel": {
+    "saffu-100M-0.1": 1
+   },
+   "SAGELoopCoderForCausalLM": {
+    "sageloopcoder": 1
+   },
+   "SBDQwen2ForCausalLM": {
+    "qwen2": 1
+   },
+   "SBLALanguageModel": {
+    "sbla": 1
+   },
+   "SDLMHeadModel": {
+    "gpt2": 1
+   },
+   "SHADOW50MInstruct": {
+    "shadow": 1
+   },
+   "SImiModel": {
+    "simi": 1
+   },
+   "SLLamaForCausalLM": {
+    "sllama": 1
+   },
+   "SLMModel": {
+    "slm": 1
+   },
+   "SMDMForCausalLM": {
+    "smdm": 1
+   },
+   "SONARForConditionalGeneration": {
+    "m2m_100": 1
+   },
+   "SOVYN85M": {
+    "sovyn-gpt": 1
+   },
+   "SPECLMHeadModel": {
+    "spec-1-mini": 1
+   },
+   "SRLMForCausalLM": {
+    "srlm": 1
+   },
+   "SSLLMForCausalLM": {
+    "ssllm": 1
+   },
+   "SSN1ForCausalLM": {
+    "ssn1": 1
+   },
+   "STLlamaForCausalLM": {
+    "STLlama": 1
+   },
+   "SVDCompressedBartForConditionGeneration": {
+    "bart": 1
+   },
+   "SaRDinEForCausalLM": {
+    "sardine": 1
+   },
+   "Sabir2ForCausalLM": {
+    "deepseek_style_mla": 1
+   },
+   "SahajModel": {
+    "sahaj": 1
+   },
+   "Sai": {
+    "sai": 1
+   },
+   "Samai27bForConditionalGeneration": {
+    "samai_27b": 1
+   },
+   "SarusForCausalLM": {
+    "sarus": 1
+   },
+   "SaseQuintillionASIForCausalLM": {
+    "sase_quintillion_asi": 1
+   },
+   "SchoolMoEForCausalLM": {
+    "schoolmoe": 1
+   },
+   "SciDFMForCausalLM": {
+    "SciDFM": 1
+   },
+   "ScrapeGoatForCausalLM": {
+    "scrapegoat": 1
+   },
+   "SealGlazerLM": {
+    "sealglazer": 1
+   },
+   "SealionAudio": {
+    "sealionaudio": 1
+   },
+   "SeamlessM4Tv2ForTextToText": {
+    "seamless_m4t_v2": 1
+   },
+   "SeedForCausalLM": {
+    "seed": 1
+   },
+   "SeerAttnGemma3ChunkedDenseForCausalLM": {
+    "gemma3_text": 1
+   },
+   "SeerAttnQwen3ForCausalLM": {
+    "qwen3": 1
+   },
+   "SemiticGPT": {
+    "semitic-gpt": 1
+   },
+   "SentinelGuardedPhi": {
+    "sentinel_guarded_phi": 1
+   },
+   "SentinelLMForCausalLM": {
+    "sentinel": 1
+   },
+   "SeqCondForCausalLM": {
+    "seqcond": 1
+   },
+   "SermentalForCausalLM": {
+    "Sermental": 1
+   },
+   "ShaTestForCausalLM": {
+    "sha_test": 1
+   },
+   "Shadow250M": {
+    "shadow": 1
+   },
+   "SheikhF1LMHeadModel": {
+    "sheikh_f1": 1
+   },
+   "ShivikCodeForCausalLM": {
+    "shivik_code": 1
+   },
+   "ShivikForCausalLM": {
+    "shivik": 1
+   },
+   "ShivikM1ForCausalLM": {
+    "shivik-m1": 1
+   },
+   "ShivikM2ForCausalLM": {
+    "shivik_m2": 1
+   },
+   "ShrikeForCausalLM": {
+    "shrike_lm": 1
+   },
+   "ShrnkForCausalLM": {
+    "shrnk": 1
+   },
+   "SigerForCausalLM": {
+    "siger": 1
+   },
+   "SiliaForCausalLM": {},
+   "SimambaForCausalLM": {
+    "simamba": 1
+   },
+   "SimpleModel": {
+    "simple_model": 1
+   },
+   "SixpertForCausalLM": {
+    "sixpert": 1
+   },
+   "SixpertMoEForCausalLM": {
+    "sixpert_moe": 1
+   },
+   "SiyaqFamilyTransformer": {
+    "siyaq_transformer": 1
+   },
+   "Sky21BForCausalLM": {
+    "sky21b": 1
+   },
+   "SkyAIForCausalLM": {
+    "skyai": 1
+   },
+   "SliceGPTQwen2ForCausalLM": {
+    "slicegpt_qwen2": 1
+   },
+   "SlicedLlamaForCausalLM": {
+    "sliced_llama": 1
+   },
+   "SlicedQwen2ForCausalLM": {
+    "sliced_Qwen2": 1
+   },
+   "SmallLLMForCausalLM": {
+    "small_llm_gpt2": 1
+   },
+   "SmallLM": {
+    "small_lm": 1
+   },
+   "SmallmForCausalLM": {
+    "smallm": 1
+   },
+   "SmallmWolofForCausalLM": {
+    "smallm_wolof": 1
+   },
+   "SmartCoderMoEForCausalLM": {
+    "smartcoder_moe": 1
+   },
+   "SmlrMultiLaneForCausalLM": {
+    "llama": 1
+   },
+   "SmolLM2": {
+    "smollm2": 1
+   },
+   "SmolLM3ModelForCausalLM": {
+    "smollm3": 1
+   },
+   "SmolVLMForConditionalGeneration": {
+    "smolvlm": 1
+   },
+   "SmollLlama": {
+    "smoll_llama": 1
+   },
+   "SmoothieModel": {
+    "smoothie": 1
+   },
+   "SofanorForCausalLM": {
+    "sofanor": 1
+   },
+   "SokaForCausalLM": {
+    "Soka1.0": 1
+   },
+   "SolForCausalLM": {
+    "sol_lite": 1
+   },
+   "SolLassi": {
+    "sol_lassi": 1
+   },
+   "SolMilkshake": {
+    "sol_milkshake": 1
+   },
+   "SoloForCausalLM": {
+    "mistral": 1
+   },
+   "SonaMathForCausalLM": {
+    "sonamath": 1
+   },
+   "SonexaForCausalLM": {
+    "SonexaForCausalLM": 1
+   },
+   "SongGenDualTrackForConditionalGeneration": {
+    "songgen": 1
+   },
+   "SongGenMixedForConditionalGeneration": {
+    "songgen": 1
+   },
+   "SourceFreeQwen": {
+    "holo_source_free_qwen": 1
+   },
+   "Spark2AForCausalLM": {
+    "spark2a": 1
+   },
+   "SparkLMForCausalLM": {
+    "sparklm": 1
+   },
+   "SparseGPT2LMHeadModel": {
+    "gpt2": 1
+   },
+   "Speech2Text2ForCausalLM": {
+    "speech_to_text_2": 1
+   },
+   "SpeechUnitModel": {
+    "speechunit": 1
+   },
+   "SproutKOForCausalLM": {
+    "sproutko": 1
+   },
+   "SsaiForCausalLM": {
+    "ssai": 1
+   },
+   "StableLMForCausalLM": {
+    "stablelm": 1
+   },
+   "StateHeadForCausalLM": {
+    "statehead": 1
+   },
+   "SteerlingForCausalLM": {
+    "steerling": 1
+   },
+   "StellarAIForCausalLM": {
+    "stellarai": 1
+   },
+   "StochasticFrequencyFilterModel": {
+    "frequency-filter-middleware": 1
+   },
+   "StoryGPT": {
+    "story_gpt": 1
+   },
+   "StreamQwen3_5ForCausalLM": {
+    "qwen3_5_text": 1
+   },
+   "StreamVLNForCausalLM": {
+    "llava": 1
+   },
+   "StudentForCausalLM": {
+    "student": 1
+   },
+   "SumeruForCausalLM": {
+    "sumeru": 1
+   },
+   "SumiForMaskGeneration": {
+    "sumi": 1
+   },
+   "SupermaskMoELLaVAGemmaForCausalLM": {
+    "supermask_moe_llava_gemma": 1
+   },
+   "SupraBrainForCausalLM": {
+    "suprabrain": 1
+   },
+   "SupraElegansForCausalLM": {
+    "supraelegans": 1
+   },
+   "SurjoExpForCausalLM": {
+    "surjo_exp": 1
+   },
+   "SutraForCausalLM": {
+    "sutra-moe": 1
+   },
+   "SwarmMoEForCausalLM": {
+    "swarm_moe": 1
+   },
+   "SwenForCausalLM": {
+    "swen": 1
+   },
+   "SwetaForCausalLM": {
+    "sweta": 1
+   },
+   "SwitchLlamaForCausalLM": {
+    "switchllama": 1
+   },
+   "SwordiesGPT": {
+    "swordies-gpt": 1
+   },
+   "SykoCausalLM": {
+    "syko": 1
+   },
+   "SymbolicGPTLMHeadModel": {
+    "gpt2": 1
+   },
+   "T5ForSequenceClassification": {
+    "t5": 1
+   },
+   "TAMELM": {
+    "tamelm": 1
+   },
+   "TCMoEForCausalLM": {
+    "tcmoe": 1
+   },
+   "TCVForCausalLM": {
+    "TCVForCausalLM": 1
+   },
+   "TFAForCausalLM": {
+    "tfa-tnsa": 1
+   },
+   "TFAutoModelForCausalLM": {
+    "keras": 1
+   },
+   "TRMForCausalLM": {
+    "trm": 1
+   },
+   "TRMGPTForCausalLM": {
+    "trm_gpt": 1
+   },
+   "TTCompressedBartForConditionGeneration": {
+    "bart": 1
+   },
+   "TTTPilotMACForCausalLM": {
+    "tttpilot_mac": 1
+   },
+   "TachBitModel": {
+    "tachbit": 1
+   },
+   "TaffyForCausalLM": {
+    "taffy": 1
+   },
+   "Talker": {
+    "loquace-talker": 1
+   },
+   "TalosGPT": {
+    "talos": 1
+   },
+   "TamilTinyStoriesForCausalLM": {
+    "tamil_tiny_stories": 1
+   },
+   "TaoNetMiniT2ForCausalLM": {
+    "taonet_mini_t2": 1
+   },
+   "TeleChatForCausalLM": {
+    "telechat": 1
+   },
+   "TensaForCausalLM": {
+    "tensa": 1
+   },
+   "TensorMindForCausalLM": {
+    "tensormind": 1
+   },
+   "TernovaHG": {
+    "ternova_hg": 1
+   },
+   "ThanatosForCausalLM": {
+    "purcar_thanatos": 1
+   },
+   "Tharo.GForCausalLM": {
+    "Tharo.G-Eco": 1
+   },
+   "ThinkerLM": {
+    "muomni": 1
+   },
+   "ThoxMicroprocessorForCausalLM": {
+    "thox_microprocessor": 1
+   },
+   "ThreeDigitBasicCalcForCausalLM": {
+    "3-digit-basic-calc": 1
+   },
+   "TianqiMoEForCausalLM": {
+    "tianqi_moe": 1
+   },
+   "TimblHuggingFaceModel": {
+    "gpt2": 1
+   },
+   "TinkaaLMForCausalLM": {
+    "tinkaalm": 1
+   },
+   "TinyChartPhiForCausalLM": {
+    "tiny_chart_phi": 1
+   },
+   "TinyGPT2ForCausalLM": {
+    "tinygpt2": 1
+   },
+   "TinyGemmaForCausalLM": {
+    "tinygemma": 1
+   },
+   "TinyLMForCausalLM": {
+    "babylm-tinylm": 1
+   },
+   "TinyLlama": {
+    "brandon-tiny": 1
+   },
+   "TinyLlamaAcreditaForCausalLM": {
+    "tinyllama_acredita": 1
+   },
+   "TinyMoeForCausalLM": {
+    "tinymoe": 1
+   },
+   "TinyPeLLMForCausalLM": {
+    "tiny_pellm": 1
+   },
+   "TinyQwen3EngramHC": {
+    "tinyqwen3_engram_hc": 1
+   },
+   "TinyQwen3NoveltyForCausalLM": {
+    "tinyqwen3_novelty": 1
+   },
+   "TinyStateForCausalLM": {
+    "tinystate": 1
+   },
+   "TinyTransformerForCausalLM": {
+    "tiny_transformer": 1
+   },
+   "TinyV4": {
+    "tinyv4": 1
+   },
+   "TitansMACTransformer": {
+    "llama": 1
+   },
+   "TokenFormerForCausalLM": {},
+   "TokiLM": {
+    "tokilm": 1
+   },
+   "TomatoForCausalLM": {
+    "tomato": 1
+   },
+   "TopKSparseASTEnsemble": {
+    "sparse_ast_moe": 1
+   },
+   "TorchMultiOmicsModel": {
+    "ChatNT": 1
+   },
+   "ToyLLM": {
+    "toy-llm": 1
+   },
+   "TraXL": {
+    "GPT2LMHeadModel": 1
+   },
+   "TransCoreMQWenForCausalLM": {
+    "transcorem": 1
+   },
+   "TransLlamaForCausalLM": {
+    "llama": 1
+   },
+   "TransformerChatbot": {
+    "transformer-chat": 1
+   },
+   "TransformerModelForCausalLM": {
+    "Transformer": 1
+   },
+   "TransformerV3": {
+    "gpt2-custom": 1
+   },
+   "TransformerWithPruningForCausalLM": {
+    "transformer_with_pruning": 1
+   },
+   "TransliterationModel": {
+    "char_transliteration": 1
+   },
+   "TrilliumForCausalLM": {
+    "trillium": 1
+   },
+   "TrimKVPhi3ForCausalLM": {
+    "phi3": 1
+   },
+   "TroLForCausalLM": {
+    "trol": 1
+   },
+   "TrouterForCausalLM": {
+    "trouter": 1
+   },
+   "TuringMMForCausalLM": {
+    "turingMM": 1
+   },
+   "TurkishGPTForCausalLM": {
+    "turkish_gpt": 1
+   },
+   "TurkishLLMGenerativeV1": {
+    "custom_pytorch": 1
+   },
+   "TwentyQForCausalLM": {
+    "twentyq": 1
+   },
+   "TwinkelLLMForCausalLM": {
+    "twinkel_llm": 1
+   },
+   "TyneRoxModel": {
+    "tynerox": 1
+   },
+   "Typhoon2Audio2AudioForConditionalGeneration": {
+    "typhoon2audio": 1
+   },
+   "TyphoonAudio": {
+    "typhoonaudio": 1
+   },
+   "URMForCausalLM": {
+    "urm": 1
+   },
+   "UdopUnimodelForConditionalGeneration": {
+    "t5": 1
+   },
+   "UllavaCoreForCausalLM": {
+    "ullava_core": 1
+   },
+   "UllavaForCausalLM": {
+    "ullava": 1
+   },
+   "UniLMForConditionalGeneration": {
+    "bert": 1
+   },
+   "UpcycledSmolLMForCausalLM": {
+    "upcycled_smollm": 1
+   },
+   "Uyu2ForCausalLM": {
+    "gemma4_text": 1
+   },
+   "V4NanoForCausalLM": {
+    "v4_nano": 1
+   },
+   "VGT_8L_Engine": {
+    "vgt_8l_engine": 1
+   },
+   "VLMForCausalLM": {},
+   "VLite3ForCausalLM": {
+    "vlite3": 1
+   },
+   "VLite3_5ForCausalLM": {
+    "vlite3.5": 1
+   },
+   "VLite7ForCausalLM": {
+    "vlite7": 1
+   },
+   "VLlamaForCausalLM": {
+    "vllama": 1
+   },
+   "VMistralForCausalLM": {
+    "vmistral": 1
+   },
+   "VOPTForCausalLM": {
+    "vopt": 1
+   },
+   "VSBForCausalLM": {
+    "vsbssm": 1
+   },
+   "VSMForCausalLM": {
+    "llava": 1
+   },
+   "VStreamLlamaForCausalLM": {
+    "vstream": 1
+   },
+   "VanFastForCausalLM": {
+    "van_fast_transformer": 1
+   },
+   "VaporForCausalLM": {
+    "vapor": 1
+   },
+   "VedikaCodeProV1ForCausalLM": {
+    "vedika_code_pro_v1": 1
+   },
+   "VedikaVyomForCausalLM": {
+    "vedika_vyom": 1
+   },
+   "VegaLMForCausalLM": {
+    "vegalm": 1
+   },
+   "VegaV1ForCausalLM": {
+    "vega_v1": 1
+   },
+   "VeraMoeLiteForCausalLM": {
+    "veramoelite": 1
+   },
+   "VerantyxModel": {
+    "verantyx-logic-engine": 1
+   },
+   "VeridianForCausalLM": {
+    "veridian": 1
+   },
+   "VeronicaForCausalLM": {
+    "veronica": 1
+   },
+   "VerySmollGPT": {
+    "VerySmollGPT": 1
+   },
+   "VesemirForCausalLM": {
+    "vesemir": 1
+   },
+   "VexionLMForCausalLM": {
+    "vexion_lm": 1
+   },
+   "Veyra2ApricotForCausalLM": {
+    "veyra2_apricot": 1
+   },
+   "ViLT5ForConditionalGeneration": {
+    "t5": 1
+   },
+   "ViTGPT2LMForConditionalGeneration": {
+    "vit-gpt2": 1
+   },
+   "VibeVoiceASRForConditionalGeneration": {
+    "vibevoice": 1
+   },
+   "VinaySLMForCausalLM": {
+    "vinayslm": 1
+   },
+   "VisionEncoderDecoderModel": {
+    "vision-encoder-decoder": 1
+   },
+   "VllmTFBQwen2ForCausalLM": {
+    "tfb_qwen2": 1
+   },
+   "Voilum1MoE": {
+    "voilum_moe": 1
+   },
+   "VoronoiReasoner41M": {
+    "voronoi_reasoner": 1
+   },
+   "VortexForCausalLM": {
+    "vortex": 1
+   },
+   "VrindaForCausalLM": {
+    "vrinda": 1
+   },
+   "VrityaForCausalLM": {
+    "vritya": 1
+   },
+   "VyuhuForCausalLM": {
+    "vyuhu": 1
+   },
+   "Wav2Vec2BertForCTC": {
+    "wav2vec2-bert": 1
+   },
+   "Wbot_1_5": {
+    "Wbot": 1
+   },
+   "WelmiaForCausalLM": {
+    "welmia": 1
+   },
+   "WieszczForCausalLM": {
+    "wieszcz": 1
+   },
+   "WikiMiniModel": {
+    "tinystories": 1
+   },
+   "Wildnerve_tlm01": {
+    "wildnerve_tlm01": 1
+   },
+   "WordLatentTransformerForCausalLM": {
+    "welt": 1
+   },
+   "WrappedLlamav2ForCausalLM": {
+    "wrapped_llamav2": 1
+   },
+   "XCurOSForCausalLM": {
+    "qwen2": 1
+   },
+   "XLMProphetNetForCausalLM": {
+    "xlm-prophetnet": 1
+   },
+   "XLMRobertaForTokenClassification": {
+    "xlm-roberta": 1
+   },
+   "XLMRobertaXLForCausalLM": {
+    "xlm-roberta-xl": 1
+   },
+   "XMixtralForCausalLM": {
+    "mixtral": 1
+   },
+   "XModelForCausalLM": {
+    "xmodel": 1
+   },
+   "XeroBioAIForCausalLM": {
+    "xero-bio-ai": 1
+   },
+   "XingChen4ForCausalLM": {
+    "xingchen4": 1
+   },
+   "XionicForCausalLM": {
+    "qwen2": 1
+   },
+   "XmodForCausalLM": {
+    "xmod": 1
+   },
+   "XmodelForCausalLM": {
+    "xmodel": 1
+   },
+   "XmodelLMForCausalLM": {
+    "xmodelvlm": 1
+   },
+   "XomdichForCausalLM": {
+    "Xomdich": 1
+   },
+   "XomdichForConditionalGeneration": {
+    "hyper-xomdich": 1
+   },
+   "XoneLM": {
+    "xonelm": 1
+   },
+   "XylariaTransformer": {
+    "qwen2": 1
+   },
+   "YAYIUIEForCausalLM": {
+    "YAYIUIE": 1
+   },
+   "YAZHLMHeadModel": {
+    "yazh": 1
+   },
+   "YForCausalLM1_1": {
+    "ynet": 1
+   },
+   "YUAZForCausalLM": {
+    "yuaz": 1
+   },
+   "YayiForCausalLM": {
+    "yayi": 1
+   },
+   "YuE2ForCausalLM": {
+    "yue2": 1
+   },
+   "YuaForCausalLM": {
+    "yua": 1
+   },
+   "ZZJRabbit3ForCausalLM": {
+    "zzjrabbit3": 1
+   },
+   "ZZJRabbitModelForCausalLM": {
+    "zzjrabbit": 1
+   },
+   "ZagrosForCausalLM": {
+    "zagros": 1
+   },
+   "ZebraForCausalLM": {
+    "zebra": 1
+   },
+   "ZetaGrid25B": {
+    "rth_tcn": 1
+   },
+   "ZeusModel": {
+    "ZeusModel": 1
+   },
+   "ZhiyinForCausalLM": {
+    "zhiyin": 1
+   },
+   "ZipformerForConditionalGeneration": {
+    "zipformer": 1
+   },
+   "ZorixNanoForCausalLM": {
+    "zorix-nano": 1
+   },
+   "blabelaForCausalLM": {
+    "mimo": 1
+   },
+   "creekForCausalLM": {
+    "creek": 1
+   },
+   "e5_base_CTSEG": {
+    "xlm-roberta": 1
+   },
+   "i3HybridChatModel": {
+    "i3-chat": 1
+   },
+   "infllmv2_LlamaForCausalLM": {
+    "infllmv2_llama": 1
+   },
+   "jarvis-x core": {
+    "gpt2": 1
+   },
+   "llamaForCausalLM": {
+    "llama": 1
+   },
+   "myLlamaForCausalLM": {
+    "llama": 1
+   },
+   "myOPTForCausalLM": {
+    "opt": 1
+   },
+   "myQwen2ForCausalLM": {
+    "qwen2": 1
+   },
+   "nGPTForCausalLM": {
+    "llama": 1
+   },
+   "nanoMoE": {
+    "nanomoe": 1
+   },
+   "noeumForCausalLM": {
+    "noeum": 1
+   },
+   "pzdrk-reasoning": {
+    "pzdrk-reasoning": 1
+   },
+   "smollm2_135m_trigger_v2_quadorbit_lm": {
+    "smollm2_135m_trigger_v2_quadorbit_lm": 1
+   },
+   "smollm2_135m_trigger_v3_travel_lm": {
+    "smollm2_135m_trigger_v3_travel_lm": 1
+   },
+   "tinyllama_1_1b_argo1_oov1_lm": {
+    "tinyllama_1_1b_argo1_oov1_lm": 1
+   },
+   "tinyllama_1_1b_trigger_v3_travel_lm": {
+    "tinyllama_1_1b_trigger_v3_travel_lm": 1
+   },
+   "xLLM": {
+    "xllm": 1
+   }
   }
  }
 }

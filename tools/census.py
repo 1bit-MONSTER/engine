@@ -45,7 +45,7 @@ _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 
 def sweep(max_pages):
-    counts, total, no_arch, url, pages = {}, 0, 0, API, 0
+    counts, types, total, no_arch, url, pages = {}, {}, 0, 0, API, 0
     while url and (max_pages is None or pages < max_pages):
         for attempt in range(6):
             try:
@@ -67,13 +67,16 @@ def sweep(max_pages):
                 no_arch += 1
                 continue
             counts[a] = counts.get(a, 0) + 1
+            mt = (m.get("config") or {}).get("model_type") or ""
+            types.setdefault(a, {})[mt] = types.setdefault(a, {}).get(mt, 0) + 1
         pages += 1
         m = _NEXT.search(link)
         url = m.group(1) if m else None
         if pages % 50 == 0:
             print(f"{pages} pages, {total} models", file=sys.stderr)
     return {"total": total, "no_arch": no_arch, "pages": pages, "complete": url is None,
-            "counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0])))}
+            "counts": dict(sorted(counts.items(), key=lambda kv: (-kv[1], kv[0]))),
+            "types": {a: dict(sorted(t.items(), key=lambda kv: -kv[1])) for a, t in sorted(types.items())}}
 
 
 def coverage(raw):

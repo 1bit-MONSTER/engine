@@ -4,21 +4,21 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 321098,
-  "mapped_pct": 96.32,
+  "mapped_models": 321141,
+  "mapped_pct": 96.33,
   "checked_models": 217550,
   "checked_pct": 65.26,
   "per_backend": {
    "vulkan": {
-    "mapped": 321098,
+    "mapped": 321141,
     "checked": 217550,
-    "mapped_pct": 96.32,
+    "mapped_pct": 96.33,
     "checked_pct": 65.26
    },
    "hrx": {
-    "mapped": 320761,
+    "mapped": 320804,
     "checked": 217533,
-    "mapped_pct": 96.21,
+    "mapped_pct": 96.23,
     "checked_pct": 65.25
    },
    "zinc": {

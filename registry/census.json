@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 320947,
-  "mapped_pct": 96.27,
-  "checked_models": 217403,
-  "checked_pct": 65.21,
+  "mapped_models": 321073,
+  "mapped_pct": 96.31,
+  "checked_models": 217529,
+  "checked_pct": 65.25,
   "per_backend": {
    "vulkan": {
-    "mapped": 320947,
-    "checked": 217403,
-    "mapped_pct": 96.27,
-    "checked_pct": 65.21
+    "mapped": 321073,
+    "checked": 217529,
+    "mapped_pct": 96.31,
+    "checked_pct": 65.25
    },
    "hrx": {
-    "mapped": 320610,
-    "checked": 217386,
-    "mapped_pct": 96.17,
-    "checked_pct": 65.21
+    "mapped": 320736,
+    "checked": 217512,
+    "mapped_pct": 96.21,
+    "checked_pct": 65.24
    },
    "zinc": {
-    "mapped": 235743,
-    "checked": 34333,
-    "mapped_pct": 70.71,
+    "mapped": 235869,
+    "checked": 34341,
+    "mapped_pct": 70.75,
     "checked_pct": 10.3
    },
    "npu": {

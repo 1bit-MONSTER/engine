@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 316746,
-  "mapped_pct": 95.01,
-  "checked_models": 214390,
-  "checked_pct": 64.31,
+  "mapped_models": 317907,
+  "mapped_pct": 95.36,
+  "checked_models": 214519,
+  "checked_pct": 64.35,
   "per_backend": {
    "vulkan": {
-    "mapped": 316746,
-    "checked": 214390,
-    "mapped_pct": 95.01,
-    "checked_pct": 64.31
+    "mapped": 317907,
+    "checked": 214519,
+    "mapped_pct": 95.36,
+    "checked_pct": 64.35
    },
    "hrx": {
-    "mapped": 316409,
-    "checked": 214373,
-    "mapped_pct": 94.91,
-    "checked_pct": 64.3
+    "mapped": 317570,
+    "checked": 214502,
+    "mapped_pct": 95.26,
+    "checked_pct": 64.34
    },
    "zinc": {
-    "mapped": 232730,
+    "mapped": 232859,
     "checked": 34333,
-    "mapped_pct": 69.81,
+    "mapped_pct": 69.85,
     "checked_pct": 10.3
    },
    "npu": {
@@ -42,10 +42,6 @@
    {
     "architecture": "ParlerTTSForConditionalGeneration",
     "models": 1586
-   },
-   {
-    "architecture": "ChessForCausalLM",
-    "models": 970
    },
    {
     "architecture": "LlavaLlamaForCausalLM",
@@ -134,6 +130,10 @@
    {
     "architecture": "NMMaskMoELLaVAQwen3ForCausalLM",
     "models": 73
+   },
+   {
+    "architecture": "NanoChatForCausalLM",
+    "models": 71
    }
   ]
  },

@@ -13,6 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
+#
 # Hyperloom custom workload: ZAYA1-8B Q4_K_M decode on HRX0 (Strix Halo, gfx1151) with the 1bit
 # llama.cpp fork. Rebuilds the checkout, waits for the shared box lock and a cool idle GPU, gates on
 # wikitext perplexity (prefill and decode-shaped) against a reference taken on the unmodified tree,
@@ -31,9 +32,17 @@ tctl(){ for h in /sys/class/hwmon/hwmon*; do [ "$(cat $h/name)" = k10temp ] && e
 busy(){ cat /sys/class/drm/card*/device/gpu_busy_percent 2>/dev/null | sort -n | tail -1; }
 
 result(){ # passed tg pp prefill_ppl decode_ppl reason
-  python3 - "$OUT/$NAME.json" "$@" "$REF" "$T0" <<'PY'
+  python3 - "$OUT/$NAME.json" "$@" "$REF" "$T0" "$OUT/lemonade-bench.json" <<'PY'
 import json, sys, time, os
-path, passed, tg, pp, pre, dec, reason, ref_path, t0 = sys.argv[1:10]
+path, passed, tg, pp, pre, dec, reason, ref_path, t0, lem_path = sys.argv[1:11]
+lem = {}
+if os.path.exists(lem_path):  # Lemonade's standard (lemonade bench, its CI settings); ours is llama-bench above
+    try:
+        for sc in json.load(open(lem_path))["models"][0]["results"][0]["scenarios"]:
+            if not sc.get("all_runs_failed"):
+                lem[sc["name"]] = {"tps_mean": sc["tps"]["mean"], "ttft_ms_mean": sc["ttft_ms"]["mean"]}
+    except Exception:
+        pass
 f = lambda v: float(v) if v not in ("", "nan") else None
 ref = json.load(open(ref_path)) if os.path.exists(ref_path) else None
 tgv = f(tg) or 0.0
@@ -44,14 +53,15 @@ json.dump({
     "total_output_tokens": 128, "duration": time.time() - float(t0),
     "quality_gate": {"passed": passed == "1", "reason": reason, "prefill_ppl": f(pre), "decode_ppl": f(dec),
                      "reference": ref, "tolerance": {"prefill_rel": 0.005, "decode_rel": 0.02}},
-    "bench_summary": {"decode_tg128_tok_s": f(tg), "prefill_pp512_tok_s": f(pp)},
+    "bench_summary": {"decode_tg128_tok_s": f(tg), "prefill_pp512_tok_s": f(pp),
+                      "lemonade_bench": lem or None},
 }, open(path, "w"), indent=1)
 PY
 }
 fail(){ echo "FAIL: $1" >&2; result 0 "" "" "" "" "$1"; exit 1; }
 
 # 1. build what the benchmark runs
-$MEMGUARD 8 cmake --build "$REPO/build" -j 12 --target llama-bench llama-perplexity > "$OUT/build.log" 2>&1 || fail "build failed (see build.log)"
+$MEMGUARD 8 cmake --build "$REPO/build" -j 12 --target llama-bench llama-perplexity llama-server > "$OUT/build.log" 2>&1 || fail "build failed (see build.log)"
 
 # 2. the GPU is shared: take the box lock, then wait (max 30 min) for a cool idle GPU
 exec 9> "$HOME/.cache/lax-decode/box.lock"; flock 9
@@ -91,5 +101,7 @@ PASSED=${GATE%% *}; WHY=${GATE#* }
 TG=$(guarded bench-tg timeout 900 $B/llama-bench -m "$GGUF" -dev HRX0 -p 0 -n 128 -r 3 -o csv | tail -n 1 | awk -F, '{print $(NF-1)}' | tr -d '"')
 PP=$(guarded bench-pp timeout 900 $B/llama-bench -m "$GGUF" -dev HRX0 -p 512 -n 0 -r 2 -o csv | tail -n 1 | awk -F, '{print $(NF-1)}' | tr -d '"')
 [ -z "$TG" ] && fail "llama-bench failed"
+# Lemonade's standard too (reported, not the optimisation metric): scripts/lemonade_bench.sh
+guarded lemonade-bench timeout 900 bash "$(dirname "$0")/lemonade_bench.sh" $B/llama-server "$GGUF" "$OUT/lemonade-bench.json" > /dev/null || echo "lemonade bench failed (see lemonade-bench.log)" >&2
 result "$PASSED" "$TG" "$PP" "$PRE" "$DEC" "$WHY"
 echo "decode $TG tok/s, prefill $PP tok/s, gate $PASSED ($WHY)"

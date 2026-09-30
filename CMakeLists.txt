@@ -75,6 +75,7 @@ target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}"
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
 add_test(NAME hadamard_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hadamard_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME long_route COMMAND ${CMAKE_SOURCE_DIR}/tests/long_route.sh $<TARGET_FILE:onebit>)

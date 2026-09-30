@@ -739,6 +739,11 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     } else {
         throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm, zinc or ds4)");
     }
+    if (o.parallel == 1) {
+        // one slot: llama-server's own default is several, and a second slot can share a batch
+        // (Qwen3.5 / Qwen3.8 on HRX0 cannot run a multi-sequence gated delta net yet)
+        argv.insert(argv.end(), {"-np", "1"});
+    }
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots

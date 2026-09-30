@@ -217,9 +217,9 @@ tools/ternary_to_q4_0.py Ternary-Bonsai-2-27B-PTQ1_0.gguf Ternary-Bonsai-2-27B-Q
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
-  unsupported 3-D MUL_MAT; use `-b 512`. On Qwen3.5 / Qwen3.8 (and Bonsai) the gated delta net runs
-  one sequence per batch: with two or more, its fused kernel does not match and the graph stops on
-  the softplus it would have covered, so `--parallel` above 1 answers HTTP 500 there.
+  unsupported 3-D MUL_MAT; use `-b 512`. On Qwen3.5 / Qwen3.8 (Bonsai too) the gated delta net runs
+  one sequence per batch, so `serve` gives these models one slot on HRX and refuses `--parallel`
+  (`--parallel N` under "Not yet" below).
 - **`-fa off` fails.** A SET_ROWS into the non-flash-attention V cache is rejected.
 - **Decode-split flash attention is on.** `flash_attention_decode_split_next_q8` used to give
   nondeterministic attention on HRX0 ([#140](https://github.com/1bit-MONSTER/engine/issues/140)) and

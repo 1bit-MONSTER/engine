@@ -27,8 +27,17 @@ workload is ZAYA1-8B Q4_K_M decode.
 | `hl_patch_strixhalo.py [pkg]` | Adds a `strixhalo` GPU type (gfx1151, 40 CU, ~256 GB/s, 59.4 TFLOPS f16, 128 GB) next to each `mi355x` entry of an installed Hyperloom package. |
 | `hl_cli_login.py [pkg]` | With `ONEBIT_HYPERLOOM_CLI_LOGIN=1`, agent turns use the logged-in `claude` CLI instead of an API key; also lets `RAY_VERSION` override the pinned Ray (2.44.1 has no Python 3.14 wheels). Unsupported upstream. |
 | `custom_strixhalo.sh` | The benchmark entrypoint (`custom_<gpu-type>.sh`). Rebuilds the checkout, takes `~/.cache/lax-decode/box.lock`, waits for a cool idle GPU, gates on wikitext perplexity, then reports `llama-bench` tg128 as `output_throughput`. |
+| `lemonade_bench.sh` | Lemonade's own benchmark (`lemonade bench`, the settings of Lemonade's nightly benchmark-regression CI: chat-short + code-short, 1 warmup, 5 runs, ctx 4096) on the fork's `llama-server`, routed through `llamacpp.vulkan_bin` of a private lemond. Lemonade reserves `-dev`, so the device goes in as `LLAMA_ARG_DEVICE` (default HRX0). |
 | `launch.sh` | Starts `hyperloom ... optimize` for ZAYA1-8B, detached. |
 | `zaya1-8b-q4_k_m.reference.json` | Gate reference from the unmodified tree (fork 3b954f0). |
+
+## Two benchmark standards
+
+`output_throughput`, the number Hyperloom optimises, is ours: `llama-bench` tg128. The result also
+carries Lemonade's standard under `bench_summary.lemonade_bench` (TPS and TTFT per scenario), for
+numbers compared with Lemonade. On ZAYA1-8B at fork 3b954f0: llama-bench tg128 93.5 tok/s; lemonade
+bench chat-short 65.4 TPS, code-short 75.0 TPS, TTFT about 361 ms (Lemonade reloads the model for
+each run and generates short answers).
 
 ## Quality gate
 

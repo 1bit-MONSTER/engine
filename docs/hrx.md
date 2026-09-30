@@ -452,6 +452,15 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   22.5 / 17.7 / 19.0 tok/s on code / prose / translation prompts (was 20.1 / 16.4 / 17.6; Vulkan
   34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still costs ~1.7x a 1-token
   step (f32 multiply-adds per token); int8 activations, as Vulkan does, are the next step.
+- **`1bit serve --device hrx --parallel N`.** With one KV stream per slot, the K/V tensors are
+  4-D and HRX's flash attention falls back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
+  aggregate, below one stream). serve now passes `-kvu` (one shared KV cache) and turns off AMD's
+  Qwen attention path (`qwen.attention`), which derives its mask from positions and let the slots'
+  answers bleed into each other under `-kvu`. Qwen3-4B 4 slots: 153 tok/s aggregate (single stream
+  76; Vulkan 216); Qwen3-Coder-30B-A3B 34 -> 74; ZAYA1-8B 47 -> 71. Hybrid gated delta-net models
+  (qwen35, qwen35moe, qwen3next: Qwen3.5/3.8) are refused with `--parallel` on HRX: there is no
+  multi-sequence GATED_DELTA_NET kernel yet ([llama.cpp #48](https://github.com/1bit-MONSTER/llama.cpp/pull/48)
+  fixed the two failures before it).
 - **Fast sub-4-bit kernels on HRX.** IQ2 matmuls still fall back to the CPU; IQ3_S has a decode
   kernel (#43) but not a fast prefill one.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.

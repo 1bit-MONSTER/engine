@@ -737,6 +737,22 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // for all of them; llama-server splits --ctx-size across the slots
         if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
+        if (device == "hrx") {
+            // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
+            // the slots (per-slot streams are 4-D and its flash attention falls back to the CPU:
+            // Qwen3-4B, 4 slots, 39 -> 153 tok/s). AMD's Qwen attention path (qwen.attention) builds
+            // its mask from positions and ignores the other sequences, so under -kvu the answers
+            // bleed into each other; it is turned off for these servers.
+            const std::string arch = gguf_architecture(o.model);
+            if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next")
+                throw std::runtime_error("--parallel on --device hrx does not run " + arch +
+                                         " yet (no multi-sequence gated delta-net on HRX); use --device vulkan");
+            argv.push_back("-kvu");
+            bool merged = false;
+            for (std::string& e : env)
+                if (e.rfind("GGML_HRX_DISABLE_DISPATCH=", 0) == 0) { e += ",qwen.attention"; merged = true; }
+            if (!merged) env.push_back("GGML_HRX_DISABLE_DISPATCH=qwen.attention");
+        }
     }
     if (!o.mtp.empty() && !o.dflash.empty()) throw std::runtime_error("--mtp and --dflash are two drafters; pick one");
     if (!o.mtp.empty() || !o.dflash.empty()) {

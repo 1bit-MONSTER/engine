@@ -4,27 +4,27 @@
   "models": 416686,
   "with_architecture": 333383,
   "architectures_seen": 2654,
-  "mapped_models": 318063,
-  "mapped_pct": 95.4,
-  "checked_models": 214519,
-  "checked_pct": 64.35,
+  "mapped_models": 320947,
+  "mapped_pct": 96.27,
+  "checked_models": 217403,
+  "checked_pct": 65.21,
   "per_backend": {
    "vulkan": {
-    "mapped": 318063,
-    "checked": 214519,
-    "mapped_pct": 95.4,
-    "checked_pct": 64.35
+    "mapped": 320947,
+    "checked": 217403,
+    "mapped_pct": 96.27,
+    "checked_pct": 65.21
    },
    "hrx": {
-    "mapped": 317726,
-    "checked": 214502,
-    "mapped_pct": 95.3,
-    "checked_pct": 64.34
+    "mapped": 320610,
+    "checked": 217386,
+    "mapped_pct": 96.17,
+    "checked_pct": 65.21
    },
    "zinc": {
-    "mapped": 232859,
+    "mapped": 235743,
     "checked": 34333,
-    "mapped_pct": 69.85,
+    "mapped_pct": 70.71,
     "checked_pct": 10.3
    },
    "npu": {
@@ -35,10 +35,6 @@
    }
   },
   "top_unmapped": [
-   {
-    "architecture": "Step1MoEForCausalLM",
-    "models": 2882
-   },
    {
     "architecture": "ParlerTTSForConditionalGeneration",
     "models": 1586
@@ -134,6 +130,10 @@
    {
     "architecture": "TransformerForCausalLM",
     "models": 68
+   },
+   {
+    "architecture": "CacaForCausalLM",
+    "models": 55
    }
   ]
  },

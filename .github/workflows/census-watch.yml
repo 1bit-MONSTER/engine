@@ -93,7 +93,7 @@ jobs:
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
           fi
-          lines=$(grep -E "UNCOVERED|UNVERIFIABLE" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
+          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           if [ $rc -ne 0 ]; then echo "alert=true" >> "$GITHUB_OUTPUT"; fi
           exit $rc

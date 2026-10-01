@@ -52,12 +52,14 @@ def check(name, cond):
         failures.append(name)
 
 
-def model(mid, arch=None, tags=(), library=None):
+def model(mid, arch=None, tags=(), library=None, remote=False):
     m = {"id": mid, "tags": list(tags)}
     if library:
         m["library_name"] = library
     if arch:
         m["config"] = {"architectures": [arch]}
+        if remote:
+            m["config"]["auto_map"] = {"AutoModelForCausalLM": "modeling_x.XForCausalLM"}
     return m
 
 
@@ -94,6 +96,21 @@ check("empty backends -> uncovered", rc == 1 and res[cw.UNCOVERED] == ["c/three"
 rc, res = rc_of([model("d/four", "Qwen3_5MVLAAbsorbedForCausalLM")])
 check("significant class -> uncovered, exit 1", rc == 1)
 check("significant class is labeled", res["significant"] == ["Qwen3_5MVLAAbsorbedForCausalLM"])
+
+# 4b. A custom-code class (auto_map) from fewer than REMOTE_CODE_SPREAD uploaders is reported,
+#     not an alert: research one-offs arrive daily and no backend could map them.
+rc, text = text_of([model("lab/hyper-a", "HyperLlamaForCausalLM", remote=True),
+                    model("lab/hyper-b", "HyperLlamaForCausalLM", remote=True)])
+check("remote-code class, one uploader -> exit 0", rc == 0)
+check("remote-code class is still reported", "REMOTE-CODE HyperLlamaForCausalLM" in text)
+rc, res = rc_of([model(f"u{i}/sol", "Sol2ForCausalLM", remote=True) for i in range(cw.REMOTE_CODE_SPREAD)])
+check("remote-code class from REMOTE_CODE_SPREAD uploaders -> exit 1", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([model("v/one", "MixForCausalLM", remote=True), model("v/two", "MixForCausalLM")])
+check("a class with one native (no auto_map) model alerts", rc == 1)
+rc, res = rc_of([model("w/one", "Qwen3_5MVLAAbsorbedForCausalLM", remote=True)])
+check("a reviewed class alerts even with custom code", rc == 1)
+rc, res = rc_of([model("x/one", "OneOffForCausalLM", remote=True), model("x/two", "NimbusMindForCausalLM")])
+check("a remote-code one-off does not hide a native arrival", rc == 1 and res["remote_code"] == ["OneOffForCausalLM"])
 
 # 5. A derivative with no config is expected, not an alert.
 rc, res = rc_of([model("e/five", tags=["gguf", "text-generation"])])

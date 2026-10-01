@@ -892,19 +892,33 @@ std::vector<std::string> gguf_devices() {
     return devices;
 }
 
-// --device auto for a .gguf: HRX where the build has it. The features HRX does not run yet keep
-// Vulkan until they are ported or dropped: --moe-slots (experts streamed from the drive), and
-// --parallel on the gated delta-net architectures (no multi-sequence delta-net on HRX).
+// The GGUF architectures a pinned Vulkan llama.cpp maps and the HRX one does not
+// (registry/architectures.json: "vulkan" in backends, "hrx" not). tests/device_route.sh checks
+// this list against the registry, so regenerate both together.
+bool hrx_missing_arch(const std::string& arch) {
+    static const char* const archs[] = {
+        "bailingmoe3", "blackmamba", "dots3note", "granite_swa", "graniteswitch", "hrm_text",
+        "hy_v4",       "kimi-k3",    "maple",     "minimax-01",  "muse-glimmer",  "pockettts",
+        "qwen3tts",    "qwen4exp",   "spark2_5",  "zamba",       "zamba2"};
+    for (const char* a : archs)
+        if (arch == a) return true;
+    return false;
+}
+
+// --device auto for a .gguf: HRX where the build has it. What HRX does not run yet, or runs well
+// below Vulkan, keeps Vulkan until it is ported or dropped: architectures HRX does not map
+// (hrx_missing_arch), --moe-slots (experts streamed from the drive), --parallel on the gated
+// delta-net architectures (no multi-sequence delta-net on HRX), --mtp (HRX drafts at 65-78% of
+// Vulkan's speed) and --mmproj (an open RFC #213 gate).
 std::string auto_gguf_device(const Options& o) {
 #if defined(_WIN32)
     (void)o;
     return "cpu";  // no GPU route on Windows yet (docs/windows.md)
 #elif defined(ONEBIT_HRX_SERVER)
-    if (o.moe_slots != 0) return "vulkan";
-    if (o.parallel > 1) {
-        const std::string arch = gguf_architecture(o.model);
-        if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") return "vulkan";
-    }
+    if (o.moe_slots != 0 || !o.mtp.empty() || !o.mmproj.empty()) return "vulkan";
+    const std::string arch = gguf_architecture(o.model);
+    if (hrx_missing_arch(arch)) return "vulkan";
+    if (o.parallel > 1 && (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next")) return "vulkan";
     return "hrx";
 #else
     (void)o;

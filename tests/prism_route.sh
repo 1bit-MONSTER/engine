@@ -19,12 +19,16 @@
 #   - --device auto sends a converted file (tools/ternary_to_q4_0.py) to HRX0,
 #   - --device vulkan refuses it (upstream llama.cpp would ignore the rotation),
 #   - a file still in PrismML's ternary types is refused with the converter's name,
-#   - a plain file with --device auto still goes to Vulkan0.
+#   - a plain file with --device auto still goes to the GPU route (HRX0 with HRX, else Vulkan0).
 #
 # usage: tests/prism_route.sh path/to/1bit
 set -uo pipefail
 
 bin=${1:?usage: prism_route.sh path/to/1bit}
+# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
+gpu=Vulkan0
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
+gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
 scratch=$(mktemp -d)
 trap 'kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$scratch"' EXIT
 pid=
@@ -84,7 +88,7 @@ field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eva
 run "$scratch/bonsai-q4_0.gguf" "$scratch/b.json"
 check "--device auto sends a Hadamard-folded file to HRX0" '[ "$(field "$scratch/b.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
 run "$scratch/plain.gguf" "$scratch/plain.json"
-check "a plain file still goes to Vulkan0" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = Vulkan0 ]'
+check "a plain file still goes to $gpu" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = "$gpu" ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

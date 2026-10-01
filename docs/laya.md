@@ -144,7 +144,8 @@ why routing stays opt-in: `--device auto` without `--laya` means one device, HRX
 
 **The policy since Vulkan started leaving (2026-10-01).** Code, prose and short replies go to HRX,
 and long documents to the lean ROCm build. On a plain Qwen3.8-27B GGUF (UD-Q4_K_XL, llama-bench)
-ROCm prefills 365-368 tok/s at 512 tokens and 351-354 at 2,048, HRX 97-99. The table above was
+ROCm prefills 365-368 tok/s at 512 tokens and 351-354 at 2,048. HRX prefilled 97-99 then, and
+335 / 310 since the HRX prompt-matmul routing (llama.cpp fork #55). The table above was
 measured on the earlier, all-Vulkan policy.
 
 `tests/laya_route_e2e.sh` proves each class reaches the device the policy names

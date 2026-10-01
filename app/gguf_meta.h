@@ -129,4 +129,56 @@ inline long long gguf_int(const std::string& path, const std::string& key) {
     return -1;
 }
 
+// How many tensors of ggml type `type` (GGML_TYPE_Q4_0 = 2, ...) a GGUF holds, or -1 when the file
+// is not a GGUF or its header cannot be read. Reads the key/value section and the tensor infos only.
+inline long long gguf_tensor_type_count(const std::string& path, uint32_t type) {
+    std::ifstream f(path, std::ios::binary);
+    auto rd = [&](void* p, size_t n) { return static_cast<bool>(f.read(static_cast<char*>(p), n)); };
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!rd(&magic, 4) || magic != 0x46554747u || !rd(&version, 4) || version < 2 || !rd(&n_tensors, 8) || !rd(&n_kv, 8))
+        return -1;
+    auto skip_str = [&]() {
+        uint64_t n = 0;
+        if (!rd(&n, 8) || n > (1u << 20)) return false;
+        return static_cast<bool>(f.seekg(static_cast<std::streamoff>(n), std::ios::cur));
+    };
+    static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    auto scalar = [](uint32_t t) -> int { return t < 13 ? size[t] : -1; };
+    for (uint64_t i = 0; i < n_kv; ++i) {
+        uint32_t t = 0;
+        if (!skip_str() || !rd(&t, 4)) return -1;
+        if (t == 8) {
+            if (!skip_str()) return -1;
+        } else if (t == 9) {
+            uint32_t et = 0;
+            uint64_t n = 0;
+            if (!rd(&et, 4) || !rd(&n, 8)) return -1;
+            if (et == 8) {
+                for (uint64_t j = 0; j < n; ++j)
+                    if (!skip_str()) return -1;
+            } else if (scalar(et) > 0) {
+                f.seekg(static_cast<std::streamoff>(n * scalar(et)), std::ios::cur);
+            } else {
+                return -1;
+            }
+        } else if (scalar(t) > 0) {
+            f.seekg(scalar(t), std::ios::cur);
+        } else {
+            return -1;
+        }
+        if (!f) return -1;
+    }
+    long long count = 0;
+    for (uint64_t i = 0; i < n_tensors; ++i) {
+        uint32_t n_dims = 0, t = 0;
+        uint64_t offset = 0;
+        if (!skip_str() || !rd(&n_dims, 4) || n_dims > 8) return -1;
+        f.seekg(static_cast<std::streamoff>(8 * n_dims), std::ios::cur);
+        if (!rd(&t, 4) || !rd(&offset, 8)) return -1;
+        count += t == type;
+    }
+    return count;
+}
+
 }  // namespace onebit

@@ -32,8 +32,14 @@ the census counts.
 usage: tools/census_watch.py [--limit N] [--state PATH]
 
 Exit codes (the alert contract):
-  0  no uncovered classes among the newest models
+  0  no uncovered class among the newest models that warrants an alert
   1  an uncovered class arrived (the alert)
+
+A class whose models all load through custom modeling code (`auto_map` in the config, so
+Transformers itself has no implementation either) and that fewer than REMOTE_CODE_SPREAD
+uploaders publish is reported but does not alert: research one-offs like that arrive every
+day and are not something a backend could map. Once REMOTE_CODE_SPREAD uploaders use it, or
+it is a reviewed class (registry/significant.json), it alerts like any other.
   *  runtime failure (no network, unreadable registry, ...)
 
 State (the model ids already classified) lives outside the checkout, at
@@ -59,6 +65,7 @@ API = "https://huggingface.co/api/models"
 DEFAULT_LIMIT = 120
 DEFAULT_STATE = os.path.join(os.path.expanduser("~"), ".1bit", "census-watch-state.json")
 MAX_SEEN = 5000  # cap state growth; oldest dropped
+REMOTE_CODE_SPREAD = 3  # uploaders before a custom-code class alerts
 _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 
 # A derivative carries no config.json of its own by design (a quantized GGUF, a LoRA
@@ -103,6 +110,12 @@ def architectures_of(model):
     return archs[0] if archs and isinstance(archs[0], str) else ""
 
 
+def is_remote_code(model):
+    """True when the config loads the model through custom code (`auto_map`)."""
+    cfg = model.get("config") or {}
+    return bool(cfg.get("auto_map"))
+
+
 def is_derivative(model):
     tags = model.get("tags") or []
     return (model.get("library_name") == "peft"
@@ -122,6 +135,7 @@ def classify(models, archs, sig, previously_seen=()):
     out = {COVERED: [], UNCOVERED: [], UNVERIFIABLE: [], DERIVATIVE: []}
     reasons = {}  # model id -> why it could not be classified
     classes = {}  # uncovered class -> [model ids]
+    native = set()  # uncovered classes with at least one model that needs no custom code
     for m in models:
         mid = m.get("id", "")
         arch = architectures_of(m)
@@ -139,9 +153,15 @@ def classify(models, archs, sig, previously_seen=()):
             continue
         out[UNCOVERED].append(mid)
         classes.setdefault(arch, []).append(mid)
+        if not is_remote_code(m):
+            native.add(arch)
     out["classes"] = classes
     out["reasons"] = reasons
     out["significant"] = sorted(c for c in classes if c in sig)
+    # custom-code classes from fewer than REMOTE_CODE_SPREAD uploaders: reported, no alert
+    out["remote_code"] = sorted(
+        c for c, ids in classes.items()
+        if c not in sig and c not in native and len({i.split("/")[0] for i in ids}) < REMOTE_CODE_SPREAD)
     return out
 
 
@@ -214,8 +234,13 @@ def report(models, res, previously_seen):
     if not models:
         print(f"census-watch: nothing new since the last run "
               f"({len(previously_seen)} models already classified)")
+    quiet = set(res.get("remote_code", ()))
     for cls, ids in sorted(res["classes"].items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        if cls in res["significant"]:
+        if cls in quiet:
+            owners = len({i.split("/")[0] for i in ids})
+            print(f"  . REMOTE-CODE {cls}: {len(ids)} model(s) from {owners} uploader(s), e.g. {ids[0]}")
+            print(f"     -> custom modeling code (auto_map); alerts once {REMOTE_CODE_SPREAD} uploaders use it")
+        elif cls in res["significant"]:
             print(f"  !! UNCOVERED {cls} (reviewed, not an alias — docs/arch-gaps.md): "
                   f"{len(ids)} model(s), e.g. {ids[0]}")
             print(f"     -> needs real engine support, not a mapping; if a backend starts "
@@ -227,7 +252,7 @@ def report(models, res, previously_seen):
     for mid in sorted(res[UNVERIFIABLE]):
         print(f"  ? UNVERIFIABLE {mid} ({res['reasons'][mid]}) — gated repos need a token; "
               f"retried next run")
-    return 1 if res["classes"] else 0
+    return 1 if any(c not in quiet for c in res["classes"]) else 0
 
 
 def main():

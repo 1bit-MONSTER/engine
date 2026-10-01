@@ -358,6 +358,10 @@ class Site:
                 .replace("{{repo}}", REPO))
         if extra_head:
             page = page.replace("<head>", "<head>\n" + extra_head, 1)
+        # one h1 per page (SEO): a line starting "#36 ..." in a doc renders as a stray h1
+        h1 = len(re.findall(r"<h1[\s>]", page, re.I))
+        if h1 != 1:
+            sys.exit(f"{name}.html has {h1} <h1> elements; start no doc line with '#<number>'")
         (self.out / f"{name}.html").write_text(page)
 
     def md(self, text, src):

@@ -483,6 +483,16 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   22.5 / 17.7 / 19.0 tok/s on code / prose / translation prompts (was 20.1 / 16.4 / 17.6; Vulkan
   34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still costs ~1.7x a 1-token
   step (f32 multiply-adds per token); int8 activations, as Vulkan does, are the next step.
+- **NaN after an MTP rollback on Qwen3.5/3.8
+  ([llama.cpp #52](https://github.com/1bit-MONSTER/llama.cpp/pull/52)).** With `--mtp`, the gated
+  delta-net kernel publishes one recurrent-state snapshot per verify token so a rejected draft can
+  roll back. It formed each snapshot's decay ratio c_t/c_s by dividing two exponentials. When a
+  strongly forgetting head drove both to 0, that gave 0/0 = NaN, and the next verify resuming from
+  that snapshot returned NaN logits ("NaN logits at vocab index 0"). It depends on the prompt, and
+  showed up on Qwen3.8-27B Q8_0, UD-Q5_K_XL and UD-Q6_K files. The same bug caused an AMDGPU memory
+  fault on a repeated request without MTP. The ratios are now formed in log space, as the main
+  recurrence already did. Q8_0 `--mtp` now runs clean on prose and code (15.7 / 20.2 tok/s); UD-Q4_K_XL
+  `--mtp` speed and output are unchanged.
 - **`1bit serve --device hrx --parallel N`.** With one KV stream per slot, the K/V tensors are
   4-D and HRX's flash attention falls back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
   aggregate, below one stream). serve now passes `-kvu` (one shared KV cache) and turns off AMD's

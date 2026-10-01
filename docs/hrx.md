@@ -199,8 +199,16 @@ tools/ternary_to_q4_0.py Ternary-Bonsai-2-27B-PTQ1_0.gguf Ternary-Bonsai-2-27B-Q
   `tools/ternary_to_q4_0.py` writes the same weights as Q4_0 (q = trit + 8 with the group's own
   fp16 scale in each of its four blocks), so nothing is lost: every group is decoded back and
   compared before the file is kept, and `tests/ternary_to_q4_0_test.py` checks it against
-  PrismML's own encoder. The file is 14.1 GiB instead of 5.5; a ternary kernel for HRX would win
-  that back.
+  PrismML's own encoder. The file is 14.1 GiB instead of 5.5.
+- **Packed ternary decode** ([llama.cpp #54](https://github.com/1bit-MONSTER/llama.cpp/pull/54)).
+  For a file stamped `onebit.ternary_q4_0`, `1bit serve` sets `GGML_HRX_TERNARY_Q4_0=1`. HRX0's
+  K-quant decode kernels then read those Q4_0 weights from a 2-bit copy made at load (68 bytes per
+  256 values: the two group scales and the trits), 2.125 bits per weight instead of 4.5. The load
+  checks that every block is ternary and refuses the model otherwise. Prompt batches still use the
+  Q4_0 weights, so both copies stay resident: about +4 GiB of GPU memory for Bonsai-2-27B (21.3 GiB
+  peak over idle instead of 17.3), roughly 30% of the file. Bonsai-2-27B decode goes from 9.3 to
+  15.4 tok/s (balanced power mode); prompt speed is unchanged. Against CPU logits the packed path is
+  closer than the Q4_0 one (KLD 0.00013 against 0.0019). `GGML_HRX_TERNARY_Q4_0=0` turns it off.
 - **The rotation.** Bonsai stores almost every matmul weight rotated by a 1024-point
   Walsh-Hadamard transform with fixed signs (`prism.hadamard.*` keys), and the activations have to
   be rotated to match. Our llama.cpp does that (`src/llama-hadamard.{h,cpp}`, llama.cpp #34,
@@ -502,12 +510,11 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   (qwen35, qwen35moe, qwen3next: Qwen3.5/3.8) are refused with `--parallel` on HRX: there is no
   multi-sequence GATED_DELTA_NET kernel yet ([llama.cpp #48](https://github.com/1bit-MONSTER/llama.cpp/pull/48)
   fixed the two failures before it).
-- **Fast sub-4-bit kernels on HRX.** IQ1_S/IQ1_M matmuls still fall back to the CPU, and one
-  such tensor splits every layer it is in, which is why Unsloth's smallest UD files are slow on
-  HRX0. IQ3_S has a decode kernel (#43) but not a fast prefill one. Q2_K
+- **Fast sub-4-bit kernels on HRX.** IQ3_S has a decode kernel (#43) but not a fast prefill one. Q2_K
   ([llama.cpp #49](https://github.com/1bit-MONSTER/llama.cpp/pull/49)), IQ2_XXS/IQ2_XS
   ([llama.cpp #50](https://github.com/1bit-MONSTER/llama.cpp/pull/50)) and IQ3_XXS/IQ2_S
-  ([llama.cpp #51](https://github.com/1bit-MONSTER/llama.cpp/pull/51)) run on HRX0: in the shared
+  ([llama.cpp #51](https://github.com/1bit-MONSTER/llama.cpp/pull/51)) and IQ1_S/IQ1_M
+  ([llama.cpp #53](https://github.com/1bit-MONSTER/llama.cpp/pull/53)) run on HRX0: in the shared
   dequantizer (prefill WMMA, generic decode, GET_ROWS; IQ2_S was already there) and the K-quant
   decode kernels. Before them, llama.cpp's load-time buffer check (a 512-token matmul) failed, and
   every such weight went to the CPU. On Qwen3-4B, with KLD against the Q8_0 model equal to the CPU's:
@@ -518,6 +525,8 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   - IQ3_XXS: pp512 2.8 -> 250 tok/s (mixed quant; 510-560 with every tensor IQ3_XXS), tg 1.5 -> 8.9
     (mixed) and 33.4 (pure), balanced power mode.
   - IQ2_S: tg 1.5 -> 11.3 tok/s (pure); its prefill is unchanged.
+  - IQ1_S: pp512 70.8 -> 81.7 tok/s, tg128 14.1 -> 18.6 (balanced; the first decode run in a process
+    includes about 18 s of kernel JIT for the IQ1 grid). IQ1_M: pp512 70.8 -> 80.4, tg128 14.1 -> 18.1.
 
   Some batched IQ2_XXS matmul shapes are still declined and run on the CPU. Mixed files decode
   slower than pure ones: a SwiGLU gate/up pair whose two formats need different grids shares one

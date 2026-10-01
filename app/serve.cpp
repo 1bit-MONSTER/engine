@@ -212,6 +212,13 @@ bool hadamard_q4_0(const std::string& model) {
            gguf_int(model, "onebit.hadamard_q4_0") == 32;
 }
 
+// A ternary model written as exact Q4_0 by tools/ternary_to_q4_0.py (each 128-value group of trits
+// with one scale). HRX0 decodes it from a 2-bit repack of those weights (llama.cpp #54).
+bool ternary_q4_0(const std::string& model) {
+    return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
+           gguf_int(model, "onebit.ternary_q4_0") == 128;
+}
+
 // A PrismML model (Ternary Bonsai): prism.hadamard.* says its weights are stored rotated by a
 // Walsh-Hadamard transform. Our llama.cpp (the HRX build, src/llama-hadamard.cpp) rotates the
 // activations to match; upstream llama.cpp would load the file and answer garbage.
@@ -726,6 +733,16 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (device == "hrx" || split) {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+        }
+        // tools/ternary_to_q4_0.py stamped it: HRX0 reads its decode projections at 2.125 bits per weight
+        // instead of 4.5 (llama.cpp #54; the upload checks every block and refuses a non-ternary one).
+        // A GGML_HRX_TERNARY_Q4_0 the user sets wins.
+        // The Q4_0 copy stays resident for prompt batches, so the packed copy is extra GPU memory: about 30% of
+        // the file (+4.0 GiB for Bonsai-2-27B, measured; only the decode kernels' projections are packed).
+        if (device == "hrx" && ternary_q4_0(o.model) && !std::getenv("GGML_HRX_TERNARY_Q4_0")) {
+            env.push_back("GGML_HRX_TERNARY_Q4_0=1");
+            std::fprintf(stderr, "1bit serve: ternary Q4_0 file: HRX0 decodes from a 2-bit copy of its weights, "
+                                 "about 30%% of the file size in extra GPU memory (GGML_HRX_TERNARY_Q4_0=0 turns it off)\n");
         }
         // HRX0 decodes through flash_attention_decode_split since its q8 pack race was fixed
         // (llama.cpp 00adc2b, #123/#140); it is faster once there is context. A

@@ -491,8 +491,8 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   that snapshot returned NaN logits ("NaN logits at vocab index 0"). It depends on the prompt, and
   showed up on Qwen3.8-27B Q8_0, UD-Q5_K_XL and UD-Q6_K files. The same bug caused an AMDGPU memory
   fault on a repeated request without MTP. The ratios are now formed in log space, as the main
-  recurrence already did. Q8_0 `--mtp` now runs clean on prose and code (15.7 / 20.2 tok/s); UD-Q4_K_XL
-  `--mtp` speed and output are unchanged.
+  recurrence already did. Q8_0 `--mtp` now runs clean on prose and code (15.7 / 20.2 tok/s, balanced power
+  mode, 85 W); UD-Q4_K_XL `--mtp` speed and output are unchanged (also measured in balanced mode).
 - **`1bit serve --device hrx --parallel N`.** With one KV stream per slot, the K/V tensors are
   4-D and HRX's flash attention falls back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
   aggregate, below one stream). serve now passes `-kvu` (one shared KV cache) and turns off AMD's

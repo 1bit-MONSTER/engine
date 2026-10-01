@@ -96,6 +96,54 @@ The default ROCm build is correct for 4-bit GGUF (it mostly runs MMQ already); f
 MMQ is more accurate at the same speed, so the lean ROCm build does. F16/BF16 models go
 through hipBLAS and are not safe on ROCm here.
 
+## Long prompts: 256-wide attention heads
+
+On gfx1151, prompt-processing attention for 256-wide heads (the full-attention layers of
+Qwen3.5 and Qwen3.8) used ROCmFPX's scalar tile kernel. llama.cpp's WMMA paths stop at
+head size 128, and its rocWMMA path excludes RDNA3.5. The pin now carries a WMMA kernel of
+ours for that case (ROCmFPX #8): GQA-packed query rows, the head dimension split across
+wave pairs, and the mask skipped wherever every visible row is zero.
+`GGML_ONEBIT_FA256=0` turns it off.
+
+Qwen3.8-27B UD-Q4_K_XL, `llama-bench -b 512 -ub 512`, 2026-10-01:
+
+| Prompt | Tile kernel | WMMA kernel |
+|---|---|---|
+| 8,192 tokens | 329 tok/s | 348 tok/s |
+| 16,384 tokens | 302 tok/s | 334 tok/s |
+| 32,768 tokens | 260 tok/s | **310 tok/s** |
+
+`test-backend-ops` FLASH_ATTN_EXT at head size 256 passes 122/122, including four cases
+at the Qwen shape (GQA 6, KV 4K and 16K). Wikitext-2 perplexity at a 16K context reads
+5.4484, against 5.5867 with the tile kernel and 5.3543 on HRX.
+
+**Sparse prefill (opt-in, off by default).** `GGML_ONEBIT_FLASH_PREFILL=<alpha>` in
+`1bit serve`'s environment enables block-sparse prompt attention after FlashPrefill V2
+(Fan et al., arXiv:2608.19758), written from the paper's equations. Each 128-token block
+is scored against the block-mean keys. Blocks scoring at least alpha times the strongest
+block are computed exactly. The first 256 tokens and the 512 before the diagonal are
+always kept. The other blocks count through their mean K/V (the paper's mean correction).
+It applies to KV lengths of at least 8,192 tokens (`GGML_ONEBIT_FLASH_PREFILL_MIN`).
+
+| llama-server, 8 wikitext prompts of 14K-28K tokens | Mean prompt tok/s |
+|---|---|
+| Tile kernel | 287 |
+| WMMA kernel | 325 |
+| Sparse, alpha 0.1 | 347 |
+| Sparse, alpha 0.3 | 350 |
+
+At alpha 0.1, 9-13% of the visible blocks stay exact at 32K. Passkey retrieval at about
+16K and 30K tokens scores 20/20 dense and 20/20 at both alpha values.
+
+The outputs do change, which is why sparse prefill stays off by default:
+
+- Over 128 greedy tokens it agrees with dense on 93 of 871 positions at alpha 0.1. For
+  comparison, the tile and WMMA kernels, both exact attention, agree on 466 of 929.
+- Perplexity at a 16K context, where every scored token comes from a sparse prefill,
+  rises from 5.45 to 5.93.
+
+Decode is dense in every case.
+
 ## Two backends at once
 
 `Vulkan0`, `ROCm0` and `HRX0` are one GPU. Decode on both at the same time

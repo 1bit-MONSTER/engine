@@ -23,7 +23,7 @@ OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
+           [--device auto|npu|hrx|rocm|cpu|vulkan|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
@@ -59,8 +59,9 @@ inherits it). On `npu`, `zinc`, `ds4` and `mlx` they answer 501.
 |---|---|---|
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | the private NPU route, in process, in builds with `-DONEBIT_NPU_PRIVATE` (docs/npu.md, "Private routes") |
-| `.gguf` | `auto`, `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md); without `ONEBIT_VULKAN`, the HRX build's |
-| `.gguf` | `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md) |
+| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md). In a build without HRX, `auto` still means Vulkan, and so does `auto` with `--moe-slots` or with `--parallel` on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next), which HRX does not run yet |
+| `.gguf` | `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md), while Vulkan is still in the build. It is leaving the engine (RFC #213) |
+| `.gguf` | `cpu` | llama-server with no GPU layers; `auto` on Windows, which has no GPU route yet (docs/windows.md) |
 | `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
 | ROCmFP4 `.gguf` | `auto`, `vulkan` with `--lean` | the lean (ROCmFPX) build's llama-server on `Vulkan0` (docs/lean.md) |
 | `.gguf` | `rocm` | the ROCm build's llama-server on `ROCm0` (ROCmFPX's tree, `ONEBIT_LEAN_ROCM`); ROCmI4 files take its W4A4 path (docs/lean.md) |
@@ -85,11 +86,12 @@ also opens `<think>\n` when thinking is on, as that model's template does.
 For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
 the served model name. For ZINC, which rejects foreign model ids, requests go
-out without `model`. `auto` means Vulkan for GGUF, the fastest measured device
-for standard quants (docs/hrx.md). With `--laya` (or `--laya-model DIR`), Laya classifies
-each conversation and the route policy picks the device; the built-in policy keeps every
-class on Vulkan until a class has a measured faster device, and the first turn of a
-conversation pays about 0.5 s for the decision (docs/laya.md).
+out without `model`. `auto` means HRX for GGUF: Vulkan is leaving the engine (RFC #213), and
+HRX decodes within 10% of it on the gate models (docs/hrx.md). With `--laya` (or
+`--laya-model DIR`), Laya classifies each conversation and the route policy picks the device:
+the built-in policy sends code, prose and short replies to HRX and long documents to the lean
+ROCm build, which prefills Qwen3.8-27B about 3.6 times faster (docs/laya.md). The first turn of
+a conversation pays about 0.5 s for the decision.
 
 HRX needs TheRock's HSA runtime: the distro `libhsa` rejects gfx1151's
 PM4-emulation probe, and then HRX registers no device. `serve` sets

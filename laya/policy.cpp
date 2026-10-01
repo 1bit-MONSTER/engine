@@ -42,7 +42,7 @@ bool RoutePolicy::parse(const std::string& json_text, std::string& err) {
         return false;
     }
     min_confidence = j.value("min_confidence", 0.0f);
-    fallback = j.value("default", std::string("vulkan"));
+    fallback = j.value("default", std::string("hrx"));
     device.clear();
     const auto& known = request_classes();
     for (const auto& [cls, row] : j["classes"].items()) {

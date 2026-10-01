@@ -63,7 +63,9 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 > family (Zamba, Zamba2, BlackMamba) runs on Vulkan too, and so do its vision models, ZAYA1-VL-8B
 > and Zamba2-VL, through `1bit serve --mmproj`. Qwen3.8-27B runs in one ROCm server with Hadamard
 > W4A4 prompt processing and DFlash2 decode: 518 tok/s on a 1,800-token prompt and 46 tok/s
-> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). W4A4 covers MoE
+> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). On ROCm the
+> 256-wide attention heads of Qwen3.5/3.8 run on a WMMA kernel of ours: a 32K-token prompt at 310 tok/s
+> instead of 260 ([docs/lean.md](docs/lean.md#long-prompts-256-wide-attention-heads)). W4A4 covers MoE
 > experts too, and `1bit serve --long-model` sends long prompts there and short ones to Vulkan: on
 > Qwen3-Coder-30B-A3B a 16K-token prompt gets its answer at 13.1 effective tok/s against 8.6 on
 > Vulkan alone, first token 11 s sooner ([docs/serve.md](docs/serve.md#short-and-long-prompts---long-model)). Experimental,

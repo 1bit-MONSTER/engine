@@ -23,7 +23,9 @@
 #   - an unstamped file with --device auto still goes to Vulkan with neither variable,
 #   - --dflash on a rotated file adds the DFlash drafter (p-min 0.4 from its rocm recipe, n-max = the
 #     drafter's dflash.block_size - 1, or 16 when the file does not say): one ROCm server, W4A4
-#     prompt processing and DFlash2 decode.
+#     prompt processing and DFlash2 decode,
+#   - a drafter with unrotated Q4_0 tensors is refused next to a rotated file (the rotation is
+#     process-wide), one with Q8_0 tensors is not.
 #
 # usage: tests/hadamard_route.sh path/to/1bit
 set -uo pipefail
@@ -37,7 +39,7 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
 python3 - "$scratch" <<'PY'
 import struct, sys
-def gguf(path, stamp, arch="llama", ints={}):
+def gguf(path, stamp, arch="llama", ints={}, tensors=()):
     kv = []
     def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
     kv.append(s("general.architecture") + struct.pack("<I", 8) + s(arch))
@@ -45,12 +47,16 @@ def gguf(path, stamp, arch="llama", ints={}):
         kv.append(s("onebit.hadamard_q4_0") + struct.pack("<I", 5) + struct.pack("<i", 32))
     for k, v in ints.items():
         kv.append(s(k) + struct.pack("<I", 4) + struct.pack("<I", v))
-    open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
+    ti = b"".join(s(name) + struct.pack("<I", 1) + struct.pack("<Q", 32) + struct.pack("<I", t) + struct.pack("<Q", 0)
+                  for name, t in tensors)
+    open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, len(tensors), len(kv)) + b"".join(kv) + ti)
 gguf(sys.argv[1] + "/h32.gguf", True)
 gguf(sys.argv[1] + "/h32moe.gguf", True, "qwen3moe", {"qwen3moe.expert_count": 128})
 gguf(sys.argv[1] + "/plain.gguf", False)
 gguf(sys.argv[1] + "/draft.gguf", False)
 gguf(sys.argv[1] + "/draft8.gguf", False, "dflash", {"dflash.block_size": 8})
+gguf(sys.argv[1] + "/draftq4.gguf", False, "dflash", {"dflash.block_size": 8}, [("blk.0.ffn_up.weight", 2)])
+gguf(sys.argv[1] + "/draftq8.gguf", False, "dflash", {"dflash.block_size": 8}, [("blk.0.ffn_up.weight", 8)])
 PY
 
 # a backend that records how it was started, then answers /health
@@ -108,6 +114,13 @@ check "  and the Hadamard W4A4 environment" '[ "$(field "$scratch/df.json" "r[\"
 
 run "$scratch/h32.gguf" "$scratch/df8.json" --dflash "$scratch/draft8.gguf"
 check "--dflash with a block-8 drafter drafts 7" '[ "$(field "$scratch/df8.json" "r[\"argv\"][r[\"argv\"].index(\"--spec-draft-n-max\")+1]")" = 7 ]'
+
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+q4=$(timeout 20 "$bin" serve -m "$scratch/h32.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \
+     --dflash "$scratch/draftq4.gguf" 2>&1)
+check "a Q4_0 drafter next to a rotated file is refused" '[[ "$q4" == *"not Hadamard-rotated"* ]]'
+run "$scratch/h32.gguf" "$scratch/dfq8.json" --dflash "$scratch/draftq8.gguf"
+check "  a Q8_0 drafter is not" '[ "$(field "$scratch/dfq8.json" "r[\"argv\"][r[\"argv\"].index(\"-md\")+1]")" = "$scratch/draftq8.gguf" ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

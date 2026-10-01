@@ -679,6 +679,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // A value set in the environment wins (GGML_W4A4_TENSORS= keeps exact int8).
             if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
             if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
+            // the rotation applies to every Q4_0 matmul in the backend, the drafter's too: a drafter
+            // or MTP head with unrotated Q4_0 tensors would read its activations rotated and accept
+            // nothing (a Q4_0 DFlash2 drafter did exactly that)
+            for (const std::string& draft : {o.dflash, o.mtp}) {
+                if (!draft.empty() && gguf_tensor_type_count(draft, 2) > 0 && !hadamard_q4_0(draft))
+                    throw std::runtime_error(draft + " has Q4_0 tensors that are not Hadamard-rotated, and " + o.model +
+                                             " rotates every Q4_0 activation in its backend: use a Q8_0 or Q4_K drafter");
+            }
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
             // micro-batch size: recipe rotated-moe-ub1024 (config/recipes.json)
         }

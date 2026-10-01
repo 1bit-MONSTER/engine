@@ -36,11 +36,12 @@ jobs:
         run: |
           git fetch -q --depth=1 origin "$BASE"
           python3 tools/check_pins.py "$BASE"
-      - name: GGUF -> Q4NX repack, ternary -> Q4_0
+      - name: GGUF -> Q4NX repack, ternary -> Q4_0, MTP draft vocabulary
         run: |
           python3 -m pip install --user numpy gguf
           python3 tests/gguf_to_q4nx_test.py
           python3 tests/ternary_to_q4_0_test.py
+          python3 tests/mtp_draft_vocab_test.py
       - name: Install build dependencies
         # GCC 15, as on the Strix Halo development machine: the engine is C++26, which the
         # runner's own GCC 13 cannot build

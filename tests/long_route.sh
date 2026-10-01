@@ -107,7 +107,7 @@ check "a long completion goes to ROCm0" '[[ "$out" == "device:ROCm0"* ]]'
 out=$(ask /v1/chat/completions "$(chat user "hello there" assistant "hi" user "$(words 300)")")
 check "a conversation that grows long stays on Vulkan0" '[[ "$out" == "device:Vulkan0"*"short"* ]]'
 check "the ROCm backend has the Hadamard W4A4 environment" \
-    'python3 -c "import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]; sys.exit(not (e.get(\"GGML_Q4_0_HADAMARD\")==\"1\" and e.get(\"GGML_W4A4_TENSORS\")==\"all\"))" "$scratch/rec/ROCm0.json"'
+    'python3 -c "import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]; sys.exit(not (e.get(\"GGML_Q4_0_HADAMARD\") is None and e.get(\"GGML_W4A4_TENSORS\")==\"all\"))" "$scratch/rec/ROCm0.json"'
 check "the Vulkan backend does not" \
     'python3 -c "import json,sys; sys.exit(bool(json.load(open(sys.argv[1]))[\"env\"]))" "$scratch/rec/Vulkan0.json"'
 

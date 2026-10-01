@@ -674,19 +674,12 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
                 "--device", device == "rocm" ? "ROCm0" : "Vulkan0", "-ngl", "99", "--jinja"};
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
         if (hadamard_q4_0(o.model)) {
-            // tools/hadamard_q4_0.py stamped it: its Q4_0 weights are rotated, so the activation
-            // quantizers must rotate too, and every Q4_0 matmul takes the W4A4 kernel (docs/lean.md).
-            // A value set in the environment wins (GGML_W4A4_TENSORS= keeps exact int8).
+            // tools/hadamard_q4_0.py stamped it: its Q4_0 weights are rotated. The lean ROCm build sees
+            // the stamp and rotates the activations of those weights, and of no others, so a plain
+            // Q4_0 drafter or MTP head works beside it (ROCmFPX#7); every Q4_0 matmul takes the W4A4
+            // kernel (docs/lean.md). A value set in the environment wins (GGML_W4A4_TENSORS= keeps
+            // exact int8).
             if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
-            if (!std::getenv("GGML_Q4_0_HADAMARD")) env.push_back("GGML_Q4_0_HADAMARD=1");
-            // the rotation applies to every Q4_0 matmul in the backend, the drafter's too: a drafter
-            // or MTP head with unrotated Q4_0 tensors would read its activations rotated and accept
-            // nothing (a Q4_0 DFlash2 drafter did exactly that)
-            for (const std::string& draft : {o.dflash, o.mtp}) {
-                if (!draft.empty() && gguf_tensor_type_count(draft, 2) > 0 && !hadamard_q4_0(draft))
-                    throw std::runtime_error(draft + " has Q4_0 tensors that are not Hadamard-rotated, and " + o.model +
-                                             " rotates every Q4_0 activation in its backend: use a Q8_0 or Q4_K drafter");
-            }
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
             // micro-batch size: recipe rotated-moe-ub1024 (config/recipes.json)
         }

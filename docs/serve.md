@@ -187,9 +187,10 @@ kept only when the model agrees, so the output is the model's own.
 processing and DFlash2 decode from one server, 518 t/s prompt and 46.0 / 28.4 / 17.6 tok/s decode
 ([lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). `--dflash` gets
 `--spec-draft-p-min` from a [recipe](recipes.md) (0.4 on rocm, 0 elsewhere) unless `--mtp-p-min` is given, and without `--mtp-max` drafts the
-drafter's block minus one (its `dflash.block_size`; 16 when the file does not say). Next to a
-Hadamard-rotated file a drafter must not hold plain Q4_0 tensors: the rotation applies to every Q4_0
-matmul in the backend, so serve refuses one (a Q8_0 or Q4_K drafter works).
+drafter's block minus one (its `dflash.block_size`; 16 when the file does not say). Any drafter
+type works next to a Hadamard-rotated file, plain Q4_0 included: the backend rotates the activations
+of the rotated file's weights only. Qwen3.8-27B-H32 with a Q4_0 DFlash2 drafter runs as fast as with
+the Q8_0 one.
 
 ## Recipes (`--recipes`, `--no-recipes`)
 

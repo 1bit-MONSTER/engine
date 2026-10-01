@@ -222,6 +222,38 @@ tools/ternary_to_q4_0.py Ternary-Bonsai-2-27B-PTQ1_0.gguf Ternary-Bonsai-2-27B-Q
   10.142), the difference Q4_0's 8-bit activations make. Files without the keys build the same graph
   as before.
 
+### Prompt matmuls on the q8_1 x4 kernel (llama.cpp #55)
+
+On Qwen3.8-27B UD-Q4_K_XL, 94% of HRX prompt time went to the generic F32 WMMA matmuls,
+which work in 32-token tiles. An iree-profile dispatch trace of a 1.8K-token prompt split it
+as `mul_mat_swiglu` 51%, `mul_mat_add` 25% and `mul_mat` 18%. HRX already has a q8_1 x4
+prefill kernel, but two routing rules kept this model's projections, mostly Q5_K and IQ4_XS,
+away from it:
+
+1. Its matcher took Q5_K and IQ4_XS weights only when q8_1 activations already existed, and
+   never for a matmul feeding a GLU. Q4_K was allowed both. Q5_K and IQ4_XS now get the Q4_K
+   policy.
+2. The generic fused `mul_mat_swiglu` (priority 290) outranks the q8_1 x4 matcher (285) and
+   claimed every FFN gate/up projection. For prompt chunks of 256-2048 tokens in multiples of
+   256, whose gate and up are Q4_K, Q5_K or IQ4_XS, it now declines. The two projections
+   then take the q8_1 x4 kernel and the GLU runs as its own op.
+
+`GGML_HRX_Q8_PREFILL_RELAX=0` restores the old routing.
+
+Measured on Strix Halo, llama.cpp `6e42b51`, Qwen3.8-27B UD-Q4_K_XL, 2026-10-01:
+
+| metric | old routing | this pin |
+|---|---|---|
+| pp512 (llama-bench, `-b 512 -ub 512`) | 98.5 | **334.6** |
+| pp2048 | 98.1 | **309.5** |
+| `1bit serve --device hrx`, 14,435-token prompt | 90.7 tok/s | **264.7 tok/s** (same text) |
+| KLD vs BF16 logits (wikitext-2, 20 x 512) | 0.00717 | 0.00712 |
+| same top token | 96.13% | 96.27% |
+
+`test-backend-ops -o MUL_MAT -b HRX0`: 287/287. Decode does not change, since both rules apply
+only to chunks of at least 256 tokens. A chunk's tokens beyond the last multiple of 256 still
+go to the generic kernel.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an
@@ -306,6 +338,10 @@ BF16 is 0.063.
   are), CONT of strided views and broadcast-only REPEAT. Each matcher claims only what the existing
   kernels do not. `test-backend-ops -b HRX0` passes every case of these ops. ZAYA1-8B's decode graph
   goes from 641 graph splits to 1: 25.5 to 47.9 tok/s (tg128).
+- **Prompt matmuls on the q8_1 x4 kernel** ([llama.cpp #55](https://github.com/1bit-MONSTER/llama.cpp/pull/55)):
+  Q5_K and IQ4_XS prefill matmuls get Q4_K's q8_1 x4 policy, and the generic fused SwiGLU leaves those
+  prompt chunks to it. On Qwen3.8-27B UD-Q4_K_XL, pp512 goes 98.5 to 334.6 tok/s
+  ([section above](#prompt-matmuls-on-the-q8_1-x4-kernel-llamacpp-55)).
 
 Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
 

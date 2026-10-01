@@ -17,15 +17,15 @@
 # How `1bit serve` routes a Hadamard-rotated Q4_0 file (tools/hadamard_q4_0.py stamps
 # onebit.hadamard_q4_0 = 32; docs/lean.md), without a GPU:
 #   - --device vulkan refuses it,
-#   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_Q4_0_HADAMARD=1 and
-#     GGML_W4A4_TENSORS=all in the backend's environment; a MoE file (an expert count) also gets
+#   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_W4A4_TENSORS=all in the
+#     backend's environment and no process-wide GGML_Q4_0_HADAMARD (the backend rotates the stamped
+#     file's weights itself); a MoE file (an expert count) also gets
 #     1024-token micro-batches (-ub 1024), a dense one keeps llama-server's 512,
 #   - an unstamped file with --device auto still goes to Vulkan with neither variable,
 #   - --dflash on a rotated file adds the DFlash drafter (p-min 0.4 from its rocm recipe, n-max = the
 #     drafter's dflash.block_size - 1, or 16 when the file does not say): one ROCm server, W4A4
 #     prompt processing and DFlash2 decode,
-#   - a drafter with unrotated Q4_0 tensors is refused next to a rotated file (the rotation is
-#     process-wide), one with Q8_0 tensors is not.
+#   - a drafter with plain Q4_0 tensors is accepted next to a rotated file, like a Q8_0 one.
 #
 # usage: tests/hadamard_route.sh path/to/1bit
 set -uo pipefail
@@ -94,7 +94,7 @@ field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eva
 
 run "$scratch/h32.gguf" "$scratch/h32.json"
 check "--device auto sends a rotated file to ROCm0" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = ROCm0 ]'
-check "  with GGML_Q4_0_HADAMARD=1" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_Q4_0_HADAMARD\")")" = 1 ]'
+check "  without a process-wide GGML_Q4_0_HADAMARD" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_Q4_0_HADAMARD\")")" = None ]'
 check "  and GGML_W4A4_TENSORS=all" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
 check "  dense: llama-server's own micro-batch" '[ "$(field "$scratch/h32.json" "\"-ub\" in r[\"argv\"]")" = False ]'
 
@@ -115,12 +115,10 @@ check "  and the Hadamard W4A4 environment" '[ "$(field "$scratch/df.json" "r[\"
 run "$scratch/h32.gguf" "$scratch/df8.json" --dflash "$scratch/draft8.gguf"
 check "--dflash with a block-8 drafter drafts 7" '[ "$(field "$scratch/df8.json" "r[\"argv\"][r[\"argv\"].index(\"--spec-draft-n-max\")+1]")" = 7 ]'
 
-port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-q4=$(timeout 20 "$bin" serve -m "$scratch/h32.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \
-     --dflash "$scratch/draftq4.gguf" 2>&1)
-check "a Q4_0 drafter next to a rotated file is refused" '[[ "$q4" == *"not Hadamard-rotated"* ]]'
+run "$scratch/h32.gguf" "$scratch/dfq4.json" --dflash "$scratch/draftq4.gguf"
+check "a Q4_0 drafter next to a rotated file is accepted" '[ "$(field "$scratch/dfq4.json" "r[\"argv\"][r[\"argv\"].index(\"-md\")+1]")" = "$scratch/draftq4.gguf" ]'
 run "$scratch/h32.gguf" "$scratch/dfq8.json" --dflash "$scratch/draftq8.gguf"
-check "  a Q8_0 drafter is not" '[ "$(field "$scratch/dfq8.json" "r[\"argv\"][r[\"argv\"].index(\"-md\")+1]")" = "$scratch/draftq8.gguf" ]'
+check "  so is a Q8_0 one" '[ "$(field "$scratch/dfq8.json" "r[\"argv\"][r[\"argv\"].index(\"-md\")+1]")" = "$scratch/draftq8.gguf" ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

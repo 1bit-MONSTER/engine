@@ -134,8 +134,10 @@ on Strix Halo, 15,182 MiB (4.66 bits per weight), 456 rotated tensors. That file
 **Serve it:** `1bit serve -m Qwen3.8-27B-Q4_0-H32.gguf` in a build with `-DONEBIT_LEAN=ON
 -DONEBIT_LEAN_ROCM=ON`. `serve` reads the stamp, runs the file on the lean ROCm build
 (`--device auto` picks it; any other device is refused, because only this build rotates the
-activations to match), and sets `GGML_Q4_0_HADAMARD=1` and `GGML_W4A4_TENSORS=all` for it. Set
-`GGML_W4A4_TENSORS=` (empty) to run the rotated file on the exact int8 path instead.
+activations to match), and sets `GGML_W4A4_TENSORS=all` for it. That build reads the stamp itself
+and rotates the activations of the file's Q4_0 weights only, so a plain Q4_0 drafter or MTP head
+works beside it (ROCmFPX#7; `GGML_Q4_0_HADAMARD=1` still rotates every Q4_0 matmul in the
+process). Set `GGML_W4A4_TENSORS=` (empty) to run the rotated file on the exact int8 path instead.
 `tests/hadamard_route.sh` (ctest `hadamard_route`) checks the routing and the environment
 without a GPU.
 

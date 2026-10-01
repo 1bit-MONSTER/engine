@@ -23,9 +23,9 @@ block (attention and FFN projections, the delta-net alpha/beta projections) is r
 the normalized 32-point Walsh-Hadamard matrix, per 32-element block, in a copy of SOURCE. The
 imatrix gets the matching change (each rotated column's importance becomes its block's mean).
 llama-quantize then writes Q4_0 for exactly those tensors and a non-Q4_0 type for every other
-matmul weight, and stamps `onebit.hadamard_q4_0 = 32`. `1bit serve` sees the stamp, sets
-GGML_Q4_0_HADAMARD=1 (the ROCm activation quantizers apply the same rotation) and
-GGML_W4A4_TENSORS=all, and refuses the file on devices without the rotation.
+matmul weight, and stamps `onebit.hadamard_q4_0 = 32`. The lean ROCm build sees the stamp and its
+activation quantizers apply the same rotation to those weights (and no others); `1bit serve` sees
+it, sets GGML_W4A4_TENSORS=all, and refuses the file on devices without the rotation.
 
 The rotation is exact: on the int8 path the rotated file matches an unrotated one quantized the
 same way (Qwen3.8-27B: KLD 0.031 vs 0.029 against BF16). What it buys is 4-bit activations

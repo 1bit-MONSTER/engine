@@ -495,17 +495,23 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
 - **Fast sub-4-bit kernels on HRX.** IQ1_S/IQ1_M matmuls still fall back to the CPU, and one
   such tensor splits every layer it is in, which is why Unsloth's smallest UD files are slow on
   HRX0. IQ3_S has a decode kernel (#43) but not a fast prefill one. Q2_K
-  ([llama.cpp #49](https://github.com/1bit-MONSTER/llama.cpp/pull/49)) and IQ2_XXS/IQ2_XS
-  ([llama.cpp #50](https://github.com/1bit-MONSTER/llama.cpp/pull/50)) run on HRX0: in the shared
-  dequantizer (prefill WMMA, generic decode, GET_ROWS) and the K-quant decode kernels. Before them,
-  llama.cpp's load-time buffer check (a 512-token matmul) failed, and every such weight went to
-  the CPU. On Qwen3-4B, with KLD against the Q8_0 model equal to the CPU's:
+  ([llama.cpp #49](https://github.com/1bit-MONSTER/llama.cpp/pull/49)), IQ2_XXS/IQ2_XS
+  ([llama.cpp #50](https://github.com/1bit-MONSTER/llama.cpp/pull/50)) and IQ3_XXS/IQ2_S
+  ([llama.cpp #51](https://github.com/1bit-MONSTER/llama.cpp/pull/51)) run on HRX0: in the shared
+  dequantizer (prefill WMMA, generic decode, GET_ROWS; IQ2_S was already there) and the K-quant
+  decode kernels. Before them, llama.cpp's load-time buffer check (a 512-token matmul) failed, and
+  every such weight went to the CPU. On Qwen3-4B, with KLD against the Q8_0 model equal to the CPU's:
   - Q2_K: 709 MiB CPU_REPACK and 217 graph splits -> all on HRX0 and 73 splits; pp512
     686 -> 1300 tok/s, tg128 47 -> 75.
   - IQ2_XXS: pp512 59 -> 715 tok/s, tg128 23.0 -> 39.5.
   - IQ2_XS: pp512 87 -> 268 tok/s, tg128 28.0 -> 30.2.
+  - IQ3_XXS: pp512 2.8 -> 250 tok/s (mixed quant; 510-560 with every tensor IQ3_XXS), tg 1.5 -> 8.9
+    (mixed) and 33.4 (pure), balanced power mode.
+  - IQ2_S: tg 1.5 -> 11.3 tok/s (pure); its prefill is unchanged.
 
-  Some batched IQ2_XXS matmul shapes are still declined and run on the CPU.
+  Some batched IQ2_XXS matmul shapes are still declined and run on the CPU. Mixed files decode
+  slower than pure ones: a SwiGLU gate/up pair whose two formats need different grids shares one
+  grid buffer, so it is declined and takes the generic path.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.
   They are kept on `1bit/hrx2-archive` until they are ported.
 - **First-request cost.** Lemonade's telemetry for the first short HRX chat shows

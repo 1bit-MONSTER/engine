@@ -140,7 +140,12 @@ about 0.3 s on a 16-token reply.
 | `--laya` | 1,008-1,048 ms | 703-767 ms | 50.6 / 26.7 / 18.9-19.1 |
 
 The first turn of a conversation pays about 0.5 s; later turns and decode are unchanged. That is
-why routing stays opt-in: `--device auto` without `--laya` still means Vulkan, as before.
+why routing stays opt-in: `--device auto` without `--laya` means one device, HRX.
+
+**The policy since Vulkan started leaving (2026-10-01).** Code, prose and short replies go to HRX,
+and long documents to the lean ROCm build. On a plain Qwen3.8-27B GGUF (UD-Q4_K_XL, llama-bench)
+ROCm prefills 365-368 tok/s at 512 tokens and 351-354 at 2,048, HRX 97-99. The table above was
+measured on the earlier, all-Vulkan policy.
 
 `tests/laya_route_e2e.sh` proves each class reaches the device the policy names
 (`tests/route-policy-e2e.json` sends code, prose and short to three fake devices), the header,

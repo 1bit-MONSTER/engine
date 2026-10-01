@@ -28,8 +28,8 @@ Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 
 | `--device` | Device | Serves |
 |---|---|---|
-| `hrx` | `HRX0` | AMD's ggml-hrx |
-| `vulkan` (and `auto` for GGUF) | `Vulkan0` | standard GGUF quants, the fastest measured device for them |
+| `hrx` (and `auto` for GGUF) | `HRX0` | AMD's ggml-hrx: the engine's GPU route |
+| `vulkan` | `Vulkan0` | upstream llama.cpp's Vulkan build, while it is still in the engine (RFC #213: it is leaving) |
 
 ## Pinned sources, kept current
 

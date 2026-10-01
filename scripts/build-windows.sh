@@ -17,14 +17,13 @@
 # build-windows.sh <out-dir>
 #
 # Cross-builds the engine for Windows 10+ x64 on Linux (docs/windows.md): <out-dir>/1bit.exe;
-# from the Vulkan pin (third_party/llama.cpp-vulkan), <out-dir>/llama-server.exe with the Vulkan
-# backend; and from third_party/ryzenai-server, <out-dir>/ryzenai-server.exe with Microsoft's ONNX
+# from the llama.cpp pin (third_party/llama.cpp-vulkan, until it is renamed), <out-dir>/llama-server.exe
+# on the CPU; and from third_party/ryzenai-server, <out-dir>/ryzenai-server.exe with Microsoft's ONNX
 # Runtime GenAI and ONNX Runtime DLLs (--device onnx, CPU). 1bit.exe finds its backends beside it.
-# Everything it downloads is pinned and checked against its sha256: llvm-mingw (clang 23: the
-# engine is C++26), PCRE2 (the tokenizer), Vulkan-Headers, the Vulkan loader's export list
-# (vulkan-1.def -> the import library, so no Windows machine or Vulkan SDK is needed) and
-# SPIRV-Headers. Host tools: cmake, git, curl, a native C/C++ compiler (for llama.cpp's
-# shader generator) and glslc (shaderc).
+# The Windows package has no GPU route for now: the engine's GPU route is HRX, which has no Windows
+# build yet, and Vulkan is leaving the engine (RFC #213, docs/hrx.md). Everything it downloads is
+# pinned and checked against its sha256: llvm-mingw (clang 23: the engine is C++26) and PCRE2 (the
+# tokenizer). Host tools: cmake, git, curl.
 set -euo pipefail
 out=$(realpath -m "${1:?usage: build-windows.sh <out-dir>}")
 root=$(cd "$(dirname "$0")/.." && pwd)
@@ -36,19 +35,10 @@ LLVM_MINGW=https://github.com/mstorsjo/llvm-mingw/releases/download/20260922/llv
 LLVM_MINGW_SHA=bb7bb7654b33d5aa8712acb837c963b2e0c56352560c76105270a3268c665c21
 PCRE2=https://github.com/PCRE2Project/pcre2/releases/download/pcre2-10.48/pcre2-10.48.tar.gz
 PCRE2_SHA=ebcc25aadf2a51fa1fefa9b8bc9e7a79b3dae86870a0f1152a22e42befd46888
-VK_TAG=vulkan-sdk-1.4.357.0
-VK_HEADERS=https://github.com/KhronosGroup/Vulkan-Headers/archive/refs/tags/$VK_TAG.tar.gz
-VK_HEADERS_SHA=e87dce08116151f6b6d7de6b6faf41498e87e6cf848ff16fa3bd5402190ad4a3
-VK_DEF=https://raw.githubusercontent.com/KhronosGroup/Vulkan-Loader/$VK_TAG/loader/vulkan-1.def
-VK_DEF_SHA=9ba339b7f5ee2df28487698a6840ecf095fac58b415c2c89ad9f161e9d316378
-SPIRV_HEADERS=https://github.com/KhronosGroup/SPIRV-Headers/archive/refs/tags/$VK_TAG.tar.gz
-SPIRV_HEADERS_SHA=4d703067a7e06331ccb37bdfed3f9b7879cc61969a2689ae95c95db34a47ff07
 OGA_WIN=https://github.com/microsoft/onnxruntime-genai/releases/download/v0.11.2/onnxruntime-genai-0.11.2-win-x64.zip
 OGA_WIN_SHA=31aeeb4fa7e1d9bf284f6215d60e0025d534b99add7b0daeaccd729ee8ad1595
 ORT_WIN=https://github.com/microsoft/onnxruntime/releases/download/v1.23.2/onnxruntime-win-x64-1.23.2.zip
 ORT_WIN_SHA=0b38df9af21834e41e73d602d90db5cb06dbd1ca618948b8f1d66d607ac9f3cd
-
-command -v glslc >/dev/null || { echo "build-windows.sh: glslc (shaderc) is required"; exit 1; }
 
 # fetch <url> <sha256> <file name>: download once, verify every time
 fetch() {
@@ -93,38 +83,23 @@ if [ ! -f "$prefix/lib/libpcre2-8.a" ]; then
     cmake --install "$work/pcre2/build" > /dev/null
 fi
 
-# 3. Vulkan: the headers, the loader's import library from its export list, SPIRV-Headers (header
-# only: installed into the Windows prefix, where the cross compiler looks)
-unpack "$(fetch $VK_HEADERS $VK_HEADERS_SHA vulkan-headers.tar.gz)" "$work/vulkan-headers"
-cp -r "$work/vulkan-headers/include/." "$prefix/include/"
-"$T/bin/llvm-dlltool" -d "$(fetch $VK_DEF $VK_DEF_SHA vulkan-1.def)" -l "$prefix/lib/libvulkan-1.a" -m i386:x86-64
-unpack "$(fetch $SPIRV_HEADERS $SPIRV_HEADERS_SHA spirv-headers.tar.gz)" "$work/spirv-headers"
-cmake -S "$work/spirv-headers" -B "$work/spirv-headers/build" -DCMAKE_INSTALL_PREFIX="$prefix" \
-    -DSPIRV_HEADERS_ENABLE_TESTS=OFF > /dev/null
-cmake --install "$work/spirv-headers/build" > /dev/null
-
-# 4. 1bit.exe: serve, route, comfy (no NPU lane or HRX on Windows yet)
+# 3. 1bit.exe: serve, route, comfy (no NPU lane or HRX on Windows yet)
 PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig cmake -S "$root" -B "$work/engine" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=OFF -DONEBIT_HRX=OFF > "$work/engine.cmake.log"
 cmake --build "$work/engine" --target onebit -j"$jobs" > "$work/engine.build.log" 2>&1 || { tail -20 "$work/engine.build.log"; exit 1; }
 cp "$work/engine/1bit.exe" "$out/"
 
-# 5. llama-server.exe with Vulkan, from the Vulkan pin. The pinned llama.cpp uses std::function
-# without <functional> in ggml-vulkan-types.h, which libc++ does not include transitively: it is
-# included from the command line until upstream adds it.
+# 4. llama-server.exe on the CPU (GGUF, --device cpu), from the llama.cpp pin
 git -C "$root" submodule update --init third_party/llama.cpp-vulkan
 cmake -S "$root/third_party/llama.cpp-vulkan" -B "$work/llama" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
-    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_VULKAN=ON \
-    -DGGML_VULKAN_SHADERS_GEN_TOOLCHAIN="$work/host.cmake" -DSPIRV-Headers_DIR="$prefix/share/cmake/SPIRV-Headers" \
-    -DVulkan_INCLUDE_DIR="$prefix/include" -DVulkan_LIBRARY="$prefix/lib/libvulkan-1.a" \
-    -DVulkan_GLSLC_EXECUTABLE="$(command -v glslc)" -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF \
-    -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
-    "-DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00" "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00 -include functional" \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_VULKAN=OFF \
+    -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
+    "-DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00" "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00" \
     > "$work/llama.cmake.log"
 cmake --build "$work/llama" --target llama-server -j"$jobs" > "$work/llama.build.log" 2>&1 || { tail -20 "$work/llama.build.log"; exit 1; }
 cp "$work/llama/bin/llama-server.exe" "$out/"
 
-# 6. ryzenai-server.exe (--device onnx), from its pin, against Microsoft's Windows releases of ONNX
+# 5. ryzenai-server.exe (--device onnx), from its pin, against Microsoft's Windows releases of ONNX
 # Runtime GenAI and ONNX Runtime (MIT; CPU). Upstream's CMake is used unmodified through a small
 # wrapper that clears its MSVC-only /SUBSYSTEM:CONSOLE link flag (MinGW links console programs by
 # default), and a one-line Wbemidl.h shim covers the case of MinGW's wbemidl.h.

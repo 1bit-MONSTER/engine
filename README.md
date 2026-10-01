@@ -25,13 +25,13 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 
 - the XDNA 2 NPU engine
 - HRX on the Radeon iGPU, on the llama.cpp + hrx-system pair AMD tests
-- Vulkan on the Radeon iGPU, from upstream llama.cpp's latest release, so new architectures land the day upstream ships them; architectures upstream lacks, such as Zyphra's ZAYA1, run from our llama.cpp ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp))
+- Vulkan, while it is leaving the engine (RFC #213): `--device vulkan` still runs upstream llama.cpp's latest release, but `--device auto` now means HRX ([docs/vulkan.md](docs/vulkan.md))
 - MoE experts streamed from the drive on Vulkan (`1bit serve --moe-slots N`), for MoE models larger than memory ([docs/moe-streaming.md](docs/moe-streaming.md#streaming-in-the-inference-path))
 - a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming
 - MLX on Apple Silicon, through lemon-mlx-engine
-- ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU, and on the Radeon through ONNX Runtime's WebGPU provider ([docs/onnx.md](docs/onnx.md))
+- ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs
 - ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census
@@ -45,8 +45,9 @@ Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonad
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
 
 > **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU, as
-> [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, proposed. Vulkan stays the default until HRX meets the
-> gates in [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213).
+> [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, proposed. HRX met the decode gates in
+> [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213) and is the default GPU route now; Vulkan
+> leaves the engine in stages, as the features that still need it are ported to HRX or dropped.
 >
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
 > [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on

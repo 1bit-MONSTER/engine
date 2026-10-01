@@ -25,7 +25,7 @@ namespace onebit::laya {
 
 struct RoutePolicy {
     float min_confidence = 0.0f;               // below it a request takes `fallback`
-    std::string fallback = "vulkan";           // the policy's "default" device
+    std::string fallback = "hrx";              // the policy's "default" device
     std::map<std::string, std::string> device;  // class -> device
 
     // Parses policy JSON; on failure returns false and leaves the reason in `err`.

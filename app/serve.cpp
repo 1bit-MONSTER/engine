@@ -690,16 +690,22 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
             // micro-batch size: recipe rotated-moe-ub1024 (config/recipes.json)
         }
-    } else if (device == "vulkan" || device == "hrx") {
-        // --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
+    } else if (device == "vulkan" || device == "hrx" || device == "cpu") {
+        // --device cpu: llama-server with no GPU layers (the Windows package's route until HRX runs
+        // there). --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
         // attention on so both devices lay the KV cache out the same way
         const bool split = !o.prefill_device.empty();
         if (split && (device != "vulkan" || o.prefill_device != "hrx"))
             throw std::runtime_error("--prefill-device hrx works with --device vulkan");
         const bool fork_arch = device == "vulkan" && fork_only_arch(o.model);
         argv = {o.llama_server.empty() ? default_llama_server(split || fork_arch ? "hrx" : device) : o.llama_server,
-                "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
-                "--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"};
+                "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port)};
+        if (device == "cpu") {
+            if (split) throw std::runtime_error("--prefill-device hrx works with --device vulkan");
+            argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
+        } else {
+            argv.insert(argv.end(), {"--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"});
+        }
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
         if (!o.flash_attn.empty() && !split) { argv.insert(argv.end(), {"-fa", o.flash_attn}); }
         if (split) {
@@ -770,7 +776,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         env.push_back("RADV_PERFTEST=coop_matrix");
         drop_model = true;  // zinc rejects any model id but its own
     } else {
-        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (vulkan, hrx, rocm, zinc or ds4)");
+        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (hrx, rocm, cpu, vulkan, zinc or ds4)");
     }
     if (o.parallel == 1) {
         // one slot: llama-server's own default is several, and a second slot can share a batch
@@ -867,7 +873,44 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
 // The devices a .gguf can run on, in the order the Laya router offers them. The NPU runs Q4NX
 // model directories, not .gguf files (docs/npu.md), so it is not a candidate here; an NPU
 // model directory routes to npu in run_serve.
-const std::vector<std::string> kGgufDevices = {"vulkan", "hrx", "zinc"};
+// Vulkan is leaving the engine (RFC #213, docs/hrx.md): HRX is the GPU route and the lean ROCm
+// build serves long prompts, where this build has them. A build without HRX (CI) keeps the old
+// candidates, Vulkan first, until the Vulkan build is removed.
+std::vector<std::string> gguf_devices() {
+    std::vector<std::string> devices;
+#if defined(_WIN32)
+    devices.push_back("cpu");
+#elif defined(ONEBIT_HRX_SERVER)
+    devices.push_back("hrx");
+#ifdef ONEBIT_LEAN_ROCM_SERVER
+    devices.push_back("rocm");
+#endif
+#else
+    devices.insert(devices.end(), {"vulkan", "hrx"});
+#endif
+    devices.push_back("zinc");
+    return devices;
+}
+
+// --device auto for a .gguf: HRX where the build has it. The features HRX does not run yet keep
+// Vulkan until they are ported or dropped: --moe-slots (experts streamed from the drive), and
+// --parallel on the gated delta-net architectures (no multi-sequence delta-net on HRX).
+std::string auto_gguf_device(const Options& o) {
+#if defined(_WIN32)
+    (void)o;
+    return "cpu";  // no GPU route on Windows yet (docs/windows.md)
+#elif defined(ONEBIT_HRX_SERVER)
+    if (o.moe_slots != 0) return "vulkan";
+    if (o.parallel > 1) {
+        const std::string arch = gguf_architecture(o.model);
+        if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") return "vulkan";
+    }
+    return "hrx";
+#else
+    (void)o;
+    return "vulkan";
+#endif
+}
 
 // The text the Laya scorer routes on: a completion's prompt, or a chat request's messages
 // joined the way the request reads.
@@ -1220,7 +1263,7 @@ int serve_child(const Options& given) {
             std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s, policy %s\n", ckpt.c_str(),
                          laya_npu ? " (encoder on the NPU)" : "", o.route_policy.empty() ? "built in" : o.route_policy.c_str());
         }
-        for (const std::string& dev : kGgufDevices) {
+        for (const std::string& dev : gguf_devices()) {
             try {
                 backends.push_back(launch_for(o, dev, free_port()));
                 laya_devices.push_back(dev);
@@ -1269,7 +1312,7 @@ int serve_child(const Options& given) {
         l.device = dev + " " + o.role;
         backends.push_back(std::move(l));
     } else {
-        backends.push_back(launch_for(o, o.device == "auto" ? "vulkan" : o.device, free_port()));
+        backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device, free_port()));
     }
     // --long-model: the same model as a Hadamard-rotated Q4_0 on the ROCm W4A4 route, for
     // conversations that start with a long prompt. What the user waits for is the first token
@@ -1461,7 +1504,7 @@ int serve_child(const Options& given) {
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
     // the first backend; the NPU, ZINC and MLX answer 501.
-    const bool llama = device == "vulkan" || device == "hrx" || device == "rocm" || device == "vulkan+rocm" ||
+    const bool llama = device == "vulkan" || device == "hrx" || device == "rocm" || device == "cpu" || device == "vulkan+rocm" ||
                        (laya && backends[0].device == "vulkan");
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
         r.status = 501;
@@ -1809,7 +1852,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|vulkan|hrx|rocm|zinc|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|hrx|rocm|cpu|vulkan|zinc|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"

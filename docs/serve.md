@@ -145,6 +145,43 @@ prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
 
+### Qwen3.8-Flash-Next: drafting from part of the vocabulary
+
+Flash-Next's MTP head computes logits over all 248,320 tokens for every drafted token. That
+is the model's 644 MiB Q8_0 output matrix, read three times per decode step at draft length 3.
+A draft only proposes; the model checks every token, so the head can be cut down to the
+tokens it is likely to propose. `tools/mtp_draft_vocab.py` writes such a head from Unsloth's
+*shared* head file and the model's own output rows. Our llama.cpp fork (`qwen4exp`,
+`src/models/qwen4exp-draft-vocab.cpp`) runs it:
+
+```sh
+python3 tools/mtp_draft_vocab.py \
+  --mtp MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf --target UD-Q4_K_XL/ \
+  --ids config/draft-vocab/qwen38-en-code-65536.txt --out mtp-Qwen3.8-Flash-Next-dv65k.gguf
+```
+
+`config/draft-vocab/qwen38-en-code-65536.txt` is dime-online's 65,536-id list, picked from
+English prose and source code
+([qwen3.8-Flash-DGX-UltraFast](https://github.com/dime-online/qwen3.8-Flash-DGX-UltraFast),
+Apache-2.0, see NOTICE). It makes the head 170 MiB.
+
+Measured with the fork's Vulkan `llama-server` on Strix Halo, 2026-10-01. Settings:
+- UD-Q4_K_XL, greedy, draft length 3, `-lm mmap -lzm on`
+- decode tok/s, median of rounds 2-3 of 3
+
+| Prompt | Full head | 65,536-id head |
+|---|---|---|
+| code, 256 tokens | 47.8 | **52.1** |
+| prose, 256 tokens | 38.6 | **42.2** |
+| code, 768 tokens | 45.8 | **48.3** |
+| French, 26 tokens | **46.4** | 39.6 |
+
+- **English and code:** 8-9% faster, the same acceptance, and about 6 ms less per decode step (76 -> 70 ms).
+- **Other languages:** text outside the list loses, as the French row shows. Use the full head for such text.
+- **Output text:** decoding with a draft is not token-identical to decoding without one, even with the full head. Batched verification flips near-ties (one flip each in prose and long code here). The cut head gives the full head's text in rounds 2-3, with two other flips in round 1.
+- **Q4_K_M:** Unsloth's shared Q4_K_M head was no faster and flipped more often.
+- **`-lm mmap`:** Flash-Next needs it on this llama.cpp. Without it, the 27.5 GiB per-layer embedding table is copied into RAM next to the ~82 GB the GPU holds, which does not fit in 128 GB.
+
 ## DFlash draft models (`--dflash`)
 
 `--dflash <draft.gguf>` uses a DFlash block-diffusion draft model instead of the MTP head: the

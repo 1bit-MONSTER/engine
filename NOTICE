@@ -33,6 +33,18 @@ PrismML Ternary Bonsai (https://huggingface.co/prism-ml, https://github.com/Pris
   prism.hadamard.* format of these models; those files carry the MIT notice in full.
   Thanks to PrismML for training ternary models and publishing the format and code.
 
+Qwen3.8 Flash DGX UltraFast (https://github.com/dime-online/qwen3.8-Flash-DGX-UltraFast)
+  Copyright 2026 dime-online (https://github.com/dime-online)
+  License: Apache-2.0. config/draft-vocab/qwen38-en-code-65536.txt is its 65,536-id
+  draft vocabulary (recipe/config/v16b/draft-vocab-ids-K65536.txt.gz at 0c391a3e),
+  unchanged apart from added comment lines. tools/mtp_draft_vocab.py, our own code, uses it
+  to build a reduced-vocabulary MTP draft head; the idea of drafting from part of the
+  vocabulary for Qwen3.8-Flash-Next's MTP head is theirs. Its NOTICE reads, in part:
+    "This repository contains code derived from: Saren-Arterius/qwen3.8-Flash-DGX-AutoRound
+    https://github.com/Saren-Arterius/qwen3.8-Flash-DGX-AutoRound Copyright 2026 blazux.
+    Licensed under the Apache License, Version 2.0."
+  Thanks to dime-online for publishing the recipe with its inputs and measurements.
+
 -------------------------------------------------------------------------------
 Pinned at exact commits (git submodules) and built from source
 -------------------------------------------------------------------------------

@@ -18,7 +18,7 @@
 # or a model: a fake daemon (ONEBIT_LAYA_GGML) answers by keyword and records what it was asked,
 # the pinned GGUF name under $ONEBIT_LAYA_MODEL/gguf/ is an empty file, and fake llama-servers
 # and zinc answer with their device (tests/route-policy-e2e.json: code -> hrx, prose -> zinc,
-# short -> vulkan). It checks that
+# short -> vulkan; an HRX build has no Vulkan candidate, so short falls back to hrx). It checks that
 #   - serve starts the daemon (daemon <gguf> --family typed-decisions --device hrx) with the HSA
 #     runtime HRX needs (IREE_HAL_AMDGPU_LIBHSA_PATH, from --hrx-libhsa) and needs no safetensors
 #     checkpoint,
@@ -32,6 +32,10 @@
 set -uo pipefail
 
 bin=${1:?usage: laya_gguf_route.sh path/to/1bit}
+# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
+gpu=Vulkan0
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
+gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
 here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
 pid=
@@ -95,7 +99,8 @@ check "code -> hrx ($(echo $out))" '[[ "$out" == "device:hrx"*"code 0.80 hrx"* ]
 out=$(ask "Explain how vaccines train the immune system.")
 check "prose -> zinc ($(echo $out))" '[[ "$out" == "device:zinc"*"prose 0.80 zinc"* ]]'
 out=$(ask "What is 17*23?")
-check "short -> vulkan ($(echo $out))" '[[ "$out" == "device:vulkan"*"short 0.80 vulkan"* ]]'
+# the test policy says vulkan; an HRX build has no Vulkan candidate and falls back to its first, hrx
+check "short -> $gpu_lc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"short 0.80 $gpu_lc"* ]]'
 
 q=$(sed -n 2p "$scratch/daemon.log")
 check "the daemon gets the request as state and the three classes" \
@@ -103,7 +108,7 @@ check "the daemon gets the request as state and the three classes" \
 
 asked=$(grep -c '"state"' "$scratch/daemon.log")
 out=$(ask "$(python3 -c 'print("log line 42: ok\n" * 80)')")
-check "a 1024+ character request is long_doc ($(echo $out))" '[[ "$out" == "device:vulkan"*"long_doc 1.00 vulkan"* ]]'
+check "a 1024+ character request is long_doc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"long_doc 1.00 $gpu_lc"* ]]'
 check "  without asking the daemon" '[ "$(grep -c "\"state\"" "$scratch/daemon.log")" = "$asked" ]'
 
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo "--- daemon log"; cat "$scratch/daemon.log"; echo FAIL; exit 1; fi

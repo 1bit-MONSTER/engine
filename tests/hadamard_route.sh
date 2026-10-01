@@ -31,6 +31,10 @@
 set -uo pipefail
 
 bin=${1:?usage: hadamard_route.sh path/to/1bit}
+# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
+gpu=Vulkan0
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
+gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
 scratch=$(mktemp -d)
 trap 'kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$scratch"' EXIT
 pid=
@@ -102,7 +106,7 @@ run "$scratch/h32moe.gguf" "$scratch/h32moe.json"
 check "a rotated MoE file gets 1024-token micro-batches" '[ "$(field "$scratch/h32moe.json" "r[\"argv\"][r[\"argv\"].index(\"-ub\")+1]")" = 1024 ]'
 
 run "$scratch/plain.gguf" "$scratch/plain.json"
-check "an unstamped file still goes to Vulkan0" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = Vulkan0 ]'
+check "an unstamped file still goes to $gpu" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = "$gpu" ]'
 check "  with neither variable" '[ "$(field "$scratch/plain.json" "sorted(r[\"env\"])")" = "[]" ]'
 
 run "$scratch/h32.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"

@@ -15,9 +15,10 @@
 # limitations under the License.
 #
 # How `1bit serve --long-model` routes by prompt length (docs/lean.md, "End to end"), without a
-# GPU. Fake llama-servers stand in for Vulkan0 (-m) and ROCm0 (--long-model); each answers
+# GPU. Fake llama-servers stand in for the GPU route (-m: HRX0 in an HRX build, else Vulkan0) and
+# ROCm0 (--long-model); each answers
 # /apply-template and /tokenize (one token per word) and names its device in every reply:
-#   - a short first prompt goes to Vulkan0, a long one (>= --long-from tokens) to ROCm0,
+#   - a short first prompt goes to the GPU route, a long one (>= --long-from tokens) to ROCm0,
 #   - chats are counted through /apply-template, completions from their prompt,
 #   - a conversation stays where its first request went, even once it is long,
 #   - the ROCm backend runs with the Hadamard W4A4 environment,
@@ -27,6 +28,10 @@
 set -uo pipefail
 
 bin=${1:?usage: long_route.sh path/to/1bit}
+# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
+gpu=Vulkan0
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
+gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
 scratch=$(mktemp -d)
 trap 'kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$scratch"' EXIT
 pid=
@@ -97,19 +102,19 @@ ask() {  # <path> <json body>: the device that answered, then the X-1bit-Route h
 chat() { python3 -c 'import json,sys; print(json.dumps({"messages": [{"role": r, "content": c} for r, c in zip(sys.argv[1::2], sys.argv[2::2])]}))' "$@"; }
 
 out=$(ask /v1/chat/completions "$(chat user "hello there")")
-check "a short chat goes to Vulkan0" '[[ "$out" == "device:Vulkan0"*"short"*"vulkan"* ]]'
+check "a short chat goes to $gpu" '[[ "$out" == "device:$gpu"*"short"*"$gpu_lc"* ]]'
 out=$(ask /v1/chat/completions "$(chat user "$(words 150)")")
 check "a long chat goes to ROCm0" '[[ "$out" == "device:ROCm0"*"long"*"rocm"* ]]'
 out=$(ask /v1/completions "{\"prompt\": \"$(words 40)\"}")
-check "a short completion goes to Vulkan0" '[[ "$out" == "device:Vulkan0"* ]]'
+check "a short completion goes to $gpu" '[[ "$out" == "device:$gpu"* ]]'
 out=$(ask /v1/completions "{\"prompt\": \"$(words 120)\"}")
 check "a long completion goes to ROCm0" '[[ "$out" == "device:ROCm0"* ]]'
 out=$(ask /v1/chat/completions "$(chat user "hello there" assistant "hi" user "$(words 300)")")
-check "a conversation that grows long stays on Vulkan0" '[[ "$out" == "device:Vulkan0"*"short"* ]]'
+check "a conversation that grows long stays on $gpu" '[[ "$out" == "device:$gpu"*"short"* ]]'
 check "the ROCm backend has the Hadamard W4A4 environment" \
     'python3 -c "import json,sys; e=json.load(open(sys.argv[1]))[\"env\"]; sys.exit(not (e.get(\"GGML_Q4_0_HADAMARD\") is None and e.get(\"GGML_W4A4_TENSORS\")==\"all\"))" "$scratch/rec/ROCm0.json"'
-check "the Vulkan backend does not" \
-    'python3 -c "import json,sys; sys.exit(bool(json.load(open(sys.argv[1]))[\"env\"]))" "$scratch/rec/Vulkan0.json"'
+check "the $gpu backend does not" \
+    'python3 -c "import json,sys; sys.exit(bool(json.load(open(sys.argv[1]))[\"env\"]))" "$scratch/rec/$gpu.json"'
 
 if [ $fail -ne 0 ]; then cat "$scratch/serve.log"; echo FAIL; exit 1; fi
 echo PASS

@@ -372,16 +372,19 @@ rocm); it does not combine with `--laya`, `--adaptive` or `--mmproj`.
 ## RAG (`--embed`, `--rerank`)
 
 `--embed MODEL.gguf` serves `/v1/embeddings` and `--rerank MODEL.gguf` serves `/v1/rerank`,
-each from its own llama-server on Vulkan beside the chat model (`--embedding`,
-`--reranking`, 4 slots, the whole input in one batch). `/v1/models` lists them with their
+each from its own llama-server beside the chat model (`--embedding`, `--reranking`, the whole input
+in one batch). In a build with HRX that server runs on `HRX0` with one slot and inputs of up to 2048
+tokens (HRX runs one sequence per batch); a build without HRX keeps Vulkan, 4 slots and 8192 tokens. `/v1/models` lists them with their
 role. A RAG client embeds its documents, retrieves by cosine similarity, reranks the best
 few and asks the chat model with them as context, all against the one server:
 
 `--embedding` and `--reranking` serve the model itself in that role, as Lemonade loads
 embedding and reranking models: `1bit serve -m nomic-embed-text-v2-moe.Q8_0.gguf --embedding`.
-They run on `vulkan`, `hrx` or `rocm`. On Strix Halo, embeddings work on Vulkan and HRX
-(768-dimension vectors). Reranking works on Vulkan, but on HRX jina-reranker-v1-tiny fails:
-HRX's JIT can't link the fp32 matmul-with-bias kernel it needs. For now, rerank on Vulkan.
+They run on `vulkan`, `hrx` or `rocm`. On Strix Halo (2026-10-02, HRX0 against Vulkan0, two
+repeats each): Qwen3-Embedding-0.6B Q8_0 embeddings repeat bit for bit on HRX, cosine 0.99961-0.99988
+to Vulkan's; bge-reranker-v2-m3 Q8_0 scores repeat exactly and rank the same as Vulkan's (8.609 /
+-6.756 / -0.401 / -11.020 against 8.614 / -6.757 / -0.361 / -11.019). jina-reranker-v1-tiny still
+fails on HRX: its JIT can't link the fp32 matmul-with-bias kernel it needs.
 
 ```sh
 1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --mtp mtp-Qwen3.8-27B-Q4_0.gguf \

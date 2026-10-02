@@ -67,10 +67,16 @@ chmod +x "$scratch/laya-daemon.py"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 api="http://127.0.0.1:$port"
 
-nobin=$(env -u ONEBIT_LAYA_GGML "$bin" serve -m "$scratch/tiny.gguf" --device auto \
-    --laya-model "$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf" --port "$port" \
-    --llama-server "$here/fake_backend_route.py" 2>&1)
-check "--laya-model FILE.gguf without ggmlc's laya says how to build it" '[[ "$nobin" == *ONEBIT_LAYA_GGML* ]]'
+# A build with -DONEBIT_LAYA_GGML=ON always finds its own laya, so "without ggmlc's laya" cannot
+# happen there.
+if grep -q "^ONEBIT_LAYA_GGML:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then
+    echo "skip --laya-model FILE.gguf without ggmlc's laya says how to build it (skipped: built-in laya present)"
+else
+    nobin=$(env -u ONEBIT_LAYA_GGML "$bin" serve -m "$scratch/tiny.gguf" --device auto \
+        --laya-model "$scratch/laya/gguf/laya_typed_decisions_q8_0.gguf" --port "$port" \
+        --llama-server "$here/fake_backend_route.py" 2>&1)
+    check "--laya-model FILE.gguf without ggmlc's laya says how to build it" '[[ "$nobin" == *ONEBIT_LAYA_GGML* ]]'
+fi
 nonpu=$(ONEBIT_LAYA_DEVICE=npu ONEBIT_LAYA_MODEL="$scratch/laya" "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya \
     --port "$port" --llama-server "$here/fake_backend_route.py" 2>&1)
 check "ONEBIT_LAYA_DEVICE=npu without the NPU add-on says how to build it" '[[ "$nonpu" == *ONEBIT_NPU_PRIVATE* ]]'

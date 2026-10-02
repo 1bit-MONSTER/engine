@@ -31,6 +31,16 @@ bin=${1:?usage: laya_route_e2e.sh path/to/1bit path/to/laya-model-dir}
 laya_model=${2:?usage: laya_route_e2e.sh path/to/1bit path/to/laya-model-dir}
 here=$(cd "$(dirname "$0")" && pwd)
 policy="$here/route-policy-e2e.json"
+# The devices serve offers Laya for a .gguf in this build (gguf_devices() in app/serve.cpp): HRX,
+# lean ROCm when built, and zinc in a build with HRX; Vulkan, HRX and zinc in one without (CI).
+cache="$(dirname "$bin")/CMakeCache.txt"
+devices=vulkan,hrx,zinc
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$cache" 2>/dev/null; then
+    devices=hrx
+    if grep -q "^ONEBIT_LEAN_ROCM:BOOL=ON" "$cache" 2>/dev/null; then devices=$devices,rocm; fi
+    devices=$devices,zinc
+fi
+echo "candidates: $devices"
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
@@ -62,7 +72,7 @@ states=(
 seen=""
 for state in "${states[@]}"; do
     read -r cls conf expected < <("$bin" route --laya-model "$laya_model" --route-policy "$policy" \
-        --devices vulkan,hrx,zinc --classify --state "$state" 2>/dev/null)
+        --devices "$devices" --classify --state "$state" 2>/dev/null)
     seen="$seen $expected"
     body=$(python3 -c 'import json,sys; print(json.dumps({"messages":[{"role":"user","content":sys.argv[1]}]}))' "$state")
     hdr=$(curl -s -D - -o "$scratch/reply.json" "$api/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" \

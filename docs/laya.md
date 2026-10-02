@@ -251,3 +251,101 @@ encoder declines and that decision's layers run on the CPU. Without the add-on,
 CPU scorer: 95.5%), about 105 ms a warm decision through `serve` (encoder ~50 ms, the CPU head
 ~41 ms), about 500 ms when the NPU is busy and the CPU runs the layers. Slower than the GGUF
 scorer on HRX today; it keeps the GPU free for the model being served.
+
+## Proof on the HRX engine (2026-10-02)
+
+The question: does Laya work in the engine as it ships now, with HRX as its only GPU route? The
+answer is yes, with the measurements below. Setup: engine `main` at `6f324e4` (llama.cpp fork pin `d60cc4f`), built
+with `-DONEBIT_HRX=ON -DONEBIT_LAYA_GGML=ON`, on Strix Halo in balanced power mode (85 W).
+The checkpoints are the pinned ones from `scripts/fetch-laya.sh`. The CPU runs went through
+`~/lb/thermal-run.sh` (4 cores, nice 19, paused at 78 C), so the CPU decision times are slower
+than on an idle box.
+
+**Gates**
+
+| Check | Result |
+|---|---|
+| `laya_gate`, root checkpoint, against the Python reference | PASS: logits 2.6e-6, act logits 2.1e-7 rel, argmax 0, probabilities 3.0e-7 |
+| `laya_gate`, `typed-decisions/` | PASS: logits 3.1e-6, act logits 2.6e-7 rel, argmax 0, probabilities 6.2e-7 |
+| `laya_encoder_test` | PASS (7/7) |
+| `laya_classify_eval`, C++ scorer, CPU | **95.5%** (191/200), 687 ms a decision |
+| The same 200 cases through the GGUF scorer on HRX0 (serve's daemon and question) | **95.5%** (191/200), p50 23.7 ms, 17.6 ms warm; daemon ready in 627 ms |
+| `tests/laya_route_e2e.sh` | PASS (11/11) after this change; before it, 2 checks failed (below) |
+| `tests/laya_gguf_route.sh` | PASS (9/9, 1 skipped) after this change; before it, 1 check failed (below) |
+| Determinism: 12 requests, each asked 5 times | identical class and confidence 12/12 on the CPU scorer, 12/12 on HRX |
+
+Both scorers give the same confusion matrix:
+
+| want \ got | code | prose | short | long_doc | right |
+|---|---|---|---|---|---|
+| code | 50 | 0 | 0 | 0 | 100% |
+| prose | 0 | 41 | 9 | 0 | 82% |
+| short | 0 | 0 | 50 | 0 | 100% |
+| long_doc | 0 | 0 | 0 | 50 | 100% |
+
+Two test expectations were older than the HRX-only build, and neither was a routing bug.
+`laya_route_e2e.sh` worked out the expected device with `--devices vulkan,hrx,zinc`, so it
+expected `short -> vulkan`. In a build with HRX, serve offers Laya `hrx` and `zinc` (plus `rocm`
+with `ONEBIT_LEAN_ROCM`), and it fell back correctly to `hrx` (`short 0.24 hrx`). The test now
+reads the candidates from the build's `CMakeCache.txt`, as `gguf_devices()` picks them.
+`laya_gguf_route.sh` checked the error for a GGUF without ggmlc's `laya`. A
+`-DONEBIT_LAYA_GGML=ON` build always finds its own `laya`, so it now prints that the check was
+skipped.
+
+**End to end** (`1bit serve -m Qwen3-4B-Q4_K_M.gguf --device auto --laya` beside the same server
+without `--laya`, both on HRX). 48 hand-written requests, 12 per class, each a new conversation,
+`temperature 0`, 64 tokens, streamed. Requests alternate between the two servers, and every
+request was sent in three rounds, each with fresh servers. Time to first token is the median;
+"added" is the median of the per-request difference. Rounds 2 and 3 are pooled (n = 24 a class).
+In round 1, time to first token on both servers flipped between about 80 ms and about 300 ms;
+its median added time over all 48 was +32 ms.
+
+| Class | right | confidence, median (range) | device | TTFT `--laya` | TTFT without | added |
+|---|---|---|---|---|---|---|
+| code | 12/12 | 0.42 (0.14-0.53) | hrx | 137 ms | 99 ms | +38 ms |
+| prose | 12/12 | 0.17 (0.11-0.35) | hrx | 114 ms | 80 ms | +33 ms |
+| short | 12/12 | 0.23 (0.11-0.33) | hrx | 116 ms | 85 ms | +33 ms |
+| long_doc | 12/12 | 1.00 (size gate) | hrx | 526 ms | 522 ms | 0 ms |
+| all | **48/48** | 0.33 | hrx | 132 ms | 98 ms | **+31 ms** |
+
+- Every reply carried `X-1bit-Route`, and every request went to `hrx`. 8 of the 48 were below
+  `min_confidence` (0.16), and the policy's default is `hrx` too.
+- Each round gave the same 48 headers. The answers were sensible, and 47-48 of 48 matched the
+  server without `--laya` word for word.
+- Route cache: one conversation per class, three later turns each, gave the same header on all
+  16 turns. Serve logged 49 decisions a round (48 plus the warm-up) and none for the later turns.
+- The 2026-09-28 cost table above (about 0.5 s on a first turn) was the CPU scorer. With the
+  GGUF scorer on HRX, the first turn of a conversation costs about 33 ms, and a long document
+  costs nothing.
+
+**What still names Vulkan or ROCm.** In a build with HRX, serve's Laya candidates for a `.gguf`
+are `hrx` and `zinc` (ZINC runs on Vulkan or ROCm on this GPU), plus `rocm` with
+`ONEBIT_LEAN_ROCM`. Every row of `config/route-policy.json`, and its default, is `hrx`, and a
+candidate's backend starts only when the policy picks it. So no request reached Vulkan, ROCm or
+zinc, and serve started only the HRX backend. Some names are left over and route nothing:
+`1bit route`'s default `--devices npu,hrx,vulkan,zinc`, `vulkan` in `laya/route.cpp`'s device
+descriptions (the old direct device question), and the `vulkan` output in this page's usage
+example and its "Why every class goes to Vulkan today" paragraph, which come from the
+all-Vulkan policy.
+
+**Agent dispatch, out of domain.** We also tried `1bit route --classify` as a dispatcher for
+agent sessions: code to engine work, prose to docs, long_doc to review, short to quick answers,
+and anything under 0.16 confidence to a human. The test set was 40 hand-labelled orchestration
+tasks, 10 per class. Laya's test set is chat requests, not agent tasks, and it shows:
+
+| want \ got | code | prose | short | long_doc | right |
+|---|---|---|---|---|---|
+| code | 10 | 0 | 0 | 0 | 10/10 |
+| prose | 4 | 6 | 0 | 0 | 6/10 |
+| short | 7 | 0 | 3 | 0 | 3/10 |
+| long_doc | 5 | 0 | 0 | 5 | 5/10 |
+
+- **60% (24/40).** 23 tasks cleared 0.16 and 17 of those were right. The other 17 went to a human.
+- Engine jargon reads as code. "Is box.lock free?" came out as code 0.13, and "Write the
+  acknowledgements section" as code 0.07.
+- A long-document task described in one line ("review a 30-file PR diff") is under the size gate,
+  so it can only come out code, prose or short. With the diff, log or document attached, all 5
+  were `long_doc`.
+- The other two question wordings in `laya/route.cpp` did worse: 47.5% and 40.0%.
+- Laya is good at telling code tasks apart from the rest, but agent dispatch would need its own
+  labelled set, or keyword rules ahead of the model.

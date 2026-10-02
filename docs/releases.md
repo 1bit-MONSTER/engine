@@ -40,7 +40,7 @@ beside itself. Unpack it anywhere:
 
 ```sh
 tar --zstd -xf 1bit-v2026.40-linux-x86_64.tar.zst
-1bit-v2026.40-linux-x86_64/1bit serve -m model.gguf --device vulkan --port 8000
+1bit-v2026.40-linux-x86_64/1bit serve -m model.gguf --port 8000   # --device auto picks HRX
 ```
 
 The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE` on its Zen 5. HRX and the ROCm backends need TheRock in

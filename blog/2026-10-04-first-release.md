@@ -101,7 +101,7 @@ labelled requests) and a measured policy picks where it runs. The classifier its
 
 ## Next
 
-Still on the Vulkan build, and moving to HRX next: MoE experts streamed from the drive
+Two GGUF formats still have no HRX kernel, NVFP4 and Q2_0, and they are being written now. Still on the Vulkan build, and moving to HRX next: MoE experts streamed from the drive
 (`--moe-slots`), images (`--mmproj`), several sequences on gated delta-net models,
 Qwen3.8-Flash-Next, and Zyphra's Zamba family. Releases ship every Sunday from here on.
 

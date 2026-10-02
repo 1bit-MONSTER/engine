@@ -20,11 +20,12 @@
 
 // A backend the build compiled in by its absolute path in the build tree
 // (ONEBIT_BUILD_DIR/<rel>). A packaged 1bit (scripts/package-linux.sh) keeps that relative
-// layout beside the executable, so when the build tree is gone, <rel> is found there.
+// layout beside the executable. That copy wins whenever it exists, so a package run on the box
+// that built it tests its own backends rather than the build tree's; the compiled path is the
+// fallback (a 1bit run from the build tree).
 inline std::string built_path(const char* compiled) {
     namespace fs = std::filesystem;
     std::error_code ec;
-    if (fs::exists(compiled, ec)) return compiled;
 #if defined(ONEBIT_BUILD_DIR) && defined(__linux__)
     const fs::path rel = fs::path(compiled).lexically_relative(ONEBIT_BUILD_DIR);
     if (!rel.empty() && *rel.begin() != "..") {

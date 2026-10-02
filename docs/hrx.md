@@ -251,8 +251,19 @@ Measured on Strix Halo, llama.cpp `6e42b51`, Qwen3.8-27B UD-Q4_K_XL, 2026-10-01:
 | same top token | 96.13% | 96.27% |
 
 `test-backend-ops -o MUL_MAT -b HRX0`: 287/287. Decode does not change, since both rules apply
-only to chunks of at least 256 tokens. A chunk's tokens beyond the last multiple of 256 still
-go to the generic kernel.
+only to chunks of at least 256 tokens. Since
+[llama.cpp #61](https://github.com/1bit-MONSTER/llama.cpp/pull/61), a Q5_K or IQ4_XS chunk that is not a
+multiple of 256 sends its 256-aligned head to the q8_1 x4 kernel too, and only the tail goes to the
+generic kernel. Q4_K remainders still go to the generic kernel: its packed Row64 weight layout cannot
+also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -ub 512`):
+
+| metric | `6e42b51` | `6e42b51` + #61 (`a36d547`) |
+|---|---|---|
+| pp400 | 67.4 | **103.4** |
+| pp1862 | 172.1 | **234.6** |
+| KLD vs `6e42b51` (20 chunks of 400 = 256 + 144 tokens) | | 0.00215, same top token 97.19% |
+
+`test-backend-ops -o MUL_MAT -b HRX0`: 287/287. `GGML_HRX_Q8_PREFILL_RELAX=0` turns this off too.
 
 ### Hadamard-rotated Q4_0 files (llama.cpp #58)
 
@@ -358,6 +369,22 @@ BF16 is 0.063.
   Q5_K and IQ4_XS prefill matmuls get Q4_K's q8_1 x4 policy, and the generic fused SwiGLU leaves those
   prompt chunks to it. On Qwen3.8-27B UD-Q4_K_XL, pp512 goes 98.5 to 334.6 tok/s
   ([section above](#prompt-matmuls-on-the-q8_1-x4-kernel-llamacpp-55)).
+- **Remainder chunks on the q8_1 x4 kernel** ([llama.cpp #61](https://github.com/1bit-MONSTER/llama.cpp/pull/61)):
+  Q5_K / IQ4_XS chunks not a multiple of 256 send their aligned head to it; pp400 67.4 to 103.4 tok/s
+  (same section).
+- **Prompts past 32K context** ([llama.cpp #59](https://github.com/1bit-MONSTER/llama.cpp/pull/59)):
+  V stays row-major past `copy_transpose_f16`'s 32768-row range. pp512 at depth 32768 failed before
+  (JIT `row_count` 33280 violates `range`) and runs at 227.4 tok/s now (depth 16384 unchanged at 269);
+  one 34,816-token wikitext chunk gives PPL 6.2150.
+- **Mixed-format SwiGLU pairs** ([llama.cpp #60](https://github.com/1bit-MONSTER/llama.cpp/pull/60)):
+  the K-quant SwiGLU decode kernels stage a separate codebook for gate and for up, so Unsloth's sub-4-bit
+  UD files no longer fall back to the generic path for pairs that mix formats. Qwen3.8-27B UD-IQ2_S
+  tg128 3.12 to 8.32 tok/s; UD-Q4_K_XL unchanged (11.88 / 11.81); KLD 0.00013 vs the previous build,
+  `test-backend-ops -b HRX0` 996/996.
+- **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):
+  llama loads the engine's `onebit.hadamard_q4_0` files through `llama-hadamard`. Qwen3.8-27B-Q4_0-H32
+  on HRX vs BF16 (wikitext 40 x 512): PPL 6.021, KLD 0.0292, same top token 92.5%. Q4_0 prompt matmuls
+  still use the generic kernels.
 
 Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
 

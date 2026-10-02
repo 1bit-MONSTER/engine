@@ -376,15 +376,23 @@ XRT 2.21.75. Both `libxrt_core` and `libxrt_driver_xdna` were loaded from the pi
 (strace). `tests/npu_lane_e2e.sh` gave logits bit-identical to the reference lane on 24/24 steps,
 at 10.8 ms/token (92.6 tok/s), with a 327 ms warm load.
 
-## Open: where the kernel artifacts come from
+## Step 3d: the layer kernel and lm-head, built from source
 
 CONTRIBUTING rule 4 requires NPU kernels to be built from source. The layer kernel and
-lm-head artifacts do not meet that rule yet:
+lm-head artifacts did not meet that rule for a while:
 
 - The instruction ELFs came from the old per-context generator.
 - The PDI came from the rounding-fixed `layer.xclbin` (1bit-MONSTER #2651).
 
-Step 3a removed the need for per-context files and for the xclbin at run time. It does
-not produce the kernel itself. The from-source 16-tile kernel (1bit-MONSTER #2666) dispatches at 0.343 ms per layer,
-but it does not decode correctly yet: 0/24 tokens (#2668). Replacing the artifacts with
-a from-source kernel is tracked in [PORTING.md](PORTING.md).
+Step 3a removed the need for per-context files and for the xclbin at run time, but did
+not produce the kernel itself. A separate from-source 16-tile kernel effort
+(1bit-MONSTER #2666) dispatches fast but does not decode correctly yet (#2668) and
+remains open.
+
+A different from-source kernel now does decode correctly, end to end: both the dense
+layer kernel and lm-head run from source, ELF to ELF, with no xclbin at any point, and
+one compiled program covers every context position (no rebuild per position). Verified
+on Qwen3-0.6B, 1.7B and 4B against an fp64 reference: cosine similarity ≥0.9999 at
+every tested position, and greedy decode matches the reference exactly end to end.
+Kernel sources stay private per CONTRIBUTING; the work is tracked in
+[PORTING.md](PORTING.md) and not yet merged into this repo.

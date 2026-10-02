@@ -67,15 +67,15 @@ SITE = "https://1bit.gg/"
 OLD_SITE = "https://1bit-monster.github.io/1bit-MONSTER/"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade: the XDNA 2 NPU, "
-           "HRX and Vulkan on the Radeon iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
+TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade: HRX on the Radeon "
+           "iGPU with our Loom kernels, the XDNA 2 NPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
 # The home page's search and social description: the headline milestones, measured on Strix Halo
 # (docs/serve.md, docs/lean.md). Keep it <= 160 characters and update it with each milestone.
-HOME_DESCRIPTION = ("LLM inference for AMD Strix Halo inside Lemonade: one server runs Qwen3.8-27B with "
-                    "Hadamard W4A4 prompts (518 tok/s) and DFlash2 decode (46 tok/s).")
-HOME_KEYWORDS = ("LLM inference, AMD Ryzen AI, Strix Halo, XDNA 2 NPU, Vulkan, ROCm, HRX, Lemonade, "
-                 "OpenAI-compatible API, GGUF, speculative decoding, DFlash2, MTP, W4A4, Hadamard rotation, "
-                 "Laya router, Qwen3.8, Unsloth")
+HOME_DESCRIPTION = ("Local LLM inference for AMD Strix Halo inside Lemonade: HRX reads Qwen3.8-27B prompts "
+                    "at 335 tok/s and runs ZAYA1-8B at 90 tok/s. First release 4 Oct 2026.")
+HOME_KEYWORDS = ("LLM inference, AMD Ryzen AI, Strix Halo, Radeon 8060S, HRX, ggml-hrx, Loom kernels, XDNA 2 NPU, "
+                 "Lemonade, OpenAI-compatible API, GGUF, Qwen3.8, Zyphra ZAYA1, Unsloth dynamic GGUF, MTP, "
+                 "Hadamard Q4, Laya router, local AI, first release")
 
 # top bar: (label, page name or absolute URL)
 TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks", WIKI)]
@@ -84,7 +84,7 @@ TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks"
 NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases"),
                ("bench", "How we measure"), ("recipes", "Recipes")]),
-    ("Devices", [("npu", "NPU"), ("hrx", "HRX + Vulkan"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
+    ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
                  ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
     ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),

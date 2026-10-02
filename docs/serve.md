@@ -89,8 +89,8 @@ the served model name. For ZINC, which rejects foreign model ids, requests go
 out without `model`. `auto` means HRX for GGUF: Vulkan is leaving the engine (RFC #213), and
 HRX decodes within 10% of it on the gate models (docs/hrx.md). With `--laya` (or
 `--laya-model DIR`), Laya classifies each conversation and the route policy picks the device:
-the built-in policy sends code, prose and short replies to HRX and long documents to the lean
-ROCm build, which prefills Qwen3.8-27B about 3.6 times faster (docs/laya.md). The first turn of
+the built-in policy sends every class to HRX, long documents included, since HRX prefills
+Qwen3.8-27B at 335 tok/s pp512 (docs/laya.md). The first turn of
 a conversation pays about 0.5 s for the decision.
 
 HRX needs TheRock's HSA runtime: the distro `libhsa` rejects gfx1151's

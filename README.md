@@ -45,8 +45,7 @@ Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonad
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release ships on Sunday,
 4 October 2026.
 
-> **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU, as
-> [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, proposed. HRX met the decode gates in
+> **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU.[^geramyl] HRX met the decode gates in
 > [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213) and is the default GPU route now; Vulkan
 > leaves the engine in stages, as the features that still need it are ported to HRX or dropped.
 >
@@ -54,7 +53,7 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on
 > Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
-> suite on Vulkan and HRX. Following geramyL's review the engine no longer
+> suite on Vulkan and HRX. Following a review,[^geramyl] the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
 > ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
@@ -123,3 +122,5 @@ and [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT).
 
 Every third-party copyright and license is listed in [NOTICE](NOTICE). Each project keeps its
 own license; nothing here relicenses anyone's work.
+
+[^geramyl]: The HRX + Loom + NPU direction, and embedding the engine into Lemonade rather than Lemonade into the engine, were proposed by [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord. Thank you.

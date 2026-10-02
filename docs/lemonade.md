@@ -27,7 +27,7 @@ engine exposes nothing but that OpenAI-compatible API.
 Step 1 first went the other way. `1bit lemonade` ran Lemonade v11.9.0's server
 core inside the `1bit` process, and this repository carried Lemonade local
 recipes for the engine (`onebit`, `mlx`, `zinc`, the `hrx_device` option).
-[geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, pointed out that the engine should be embedded into Lemonade, not
+A review[^geramyl] pointed out that the engine should be embedded into Lemonade, not
 the reverse. So on 2026-09-23:
 
 - `third_party/lemonade` and every local delta were removed. The engine no
@@ -85,7 +85,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 | device | 2026-09-25, start | now |
 |---|---|---|
 | Vulkan | 19 / 31 | **29 / 29 run, all pass** (2 skipped, as for llamacpp) |
-| HRX | 19 / 31 | 26 / 29 run: reranking fails in HRX's JIT |
+| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; release pre-check 2026-10-02, from the packaged tarballs) |
 | NPU | 3 / 31 | Qwen3.6-35B-A3B loads and answers through Lemonade; the suite's small test models are GGUF |
 
 1. ~~**Declare what already works.**~~ Done (fork #6). The recipe now declares tool calls,
@@ -96,8 +96,8 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    `/v1/responses`, `/tokenize`, `/slots`, `/props` and `/metrics` on the llama-server devices.
 4. ~~**Embedding and reranking models.**~~ Done (#70, fork #6). `1bit serve --embedding` /
    `--reranking`, and the recipe serves those modes.
-5. **Reranking on HRX.** HRX's JIT can't link the fp32 matmul-with-bias kernel that
-   jina-reranker-v1-tiny needs. (engine, HRX fork)
+5. ~~**Reranking on HRX.**~~ Done. jina-reranker-v1-tiny reranks on HRX (the suite's three
+   rerank tests return the same top 3 as on Vulkan), and `1bit serve --rerank` runs on HRX (#281).
 6. **The NPU from Lemonade.** Qwen3.6-35B-A3B now runs: Lemonade downloads the Q4NX checkpoint
    repo, the recipe hands `1bit serve` the directory, and the engine runs it on the NPU
    (16.0 tok/s; builds with the private add-on only, docs/npu.md, "Private routes"). Still open:
@@ -122,3 +122,5 @@ declares neither.
 curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
      -d '{"messages": [{"role": "user", "content": "Hello"}]}'
 ```
+
+[^geramyl]: The review came from [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord. Thank you.

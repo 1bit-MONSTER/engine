@@ -46,7 +46,7 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 4 October 2026.
 
 > **Direction:** the engine is HRX (AMD's ggml-hrx, kernels in Loom or HIP, whichever measures faster)
-> plus the NPU, as [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, proposed
+> plus the NPU[^geramyl]
 > ([RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213)). `--device auto` means HRX. What the
 > engine does not run on HRX or the NPU is Lemonade's job: Lemonade ships its own llama.cpp backends
 > (Vulkan, ROCm, CPU), and `1bit serve` hands those models back. The Vulkan and ROCm builds still in

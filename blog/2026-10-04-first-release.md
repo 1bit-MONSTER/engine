@@ -86,7 +86,8 @@ Qwen3.8-Flash-Next, and Zyphra's Zamba family. Releases ship every Sunday from h
 
 ## Thank you
 
-To [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, who proposed HRX + Loom
-+ NPU as the engine's stack; to the Lemonade and AMD developers whose work the engine runs on; and to
-PrismML for the Bonsai models and their reference code. Questions and results are welcome on
+To the Lemonade and AMD developers whose work the engine runs on, and to PrismML for the Bonsai models
+and their reference code.[^geramyl] Questions and results are welcome on
 [Discord](https://discord.gg/fa5m4Vawpa).
+
+[^geramyl]: The HRX + Loom + NPU direction, and embedding the engine into Lemonade rather than Lemonade into the engine, were proposed by [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord. Thank you.

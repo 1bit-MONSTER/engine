@@ -248,7 +248,7 @@ stage_package() {
     "$SRC/scripts/package-linux.sh" "$BUILD" "$OUT" "$tag" "$W/xdna/root/opt/xilinx/xrt" > "$LOGS/package-linux.log" 2>&1
     say "package $tag: Lemonade + onebit"
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
-    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin | zstd -q -T0 -19 \
+    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin | zstd -q -T4 -19 \
         -o "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst"
     say "package $tag: Windows"
     rm -rf "$W/windows"
@@ -258,7 +258,7 @@ stage_package() {
     say "package $tag: 1bit OS"
     rm -rf "$W/os"
     guard "$SRC/os/mini/mkimage.sh" "$W/os" "$BUILD" > "$LOGS/os.log" 2>&1
-    zstd -q -T0 -19 "$W/os/1bit-os.img" -o "$OUT/1bit-os-$tag.img.zst"
+    zstd -q -T4 -19 "$W/os/1bit-os.img" -o "$OUT/1bit-os-$tag.img.zst"
     cp "$W/os/1bit-os.efi" "$OUT/1bit-os-$tag.efi"
     (cd "$OUT" && sha256sum -- * > SHA256SUMS)
     ls -la "$OUT"

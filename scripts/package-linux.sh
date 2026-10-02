@@ -107,5 +107,5 @@ Keep the directory layout: 1bit finds its backends beside itself.
 HRX and the ROCm backends need TheRock in /opt/rocm-therock; the NPU needs the amdxdna
 kernel driver. Docs: https://1bit.gg/  Code: https://github.com/1bit-MONSTER/engine
 EOF
-tar -C "$(dirname "$stage")" -cf - "$name" | zstd -q -T0 -19 -o "$out/$name.tar.zst"
+tar -C "$(dirname "$stage")" -cf - "$name" | zstd -q -T4 -19 -o "$out/$name.tar.zst"
 ls -la "$out/$name.tar.zst"

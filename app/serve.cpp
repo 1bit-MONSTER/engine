@@ -206,7 +206,9 @@ std::string default_llama_server(const std::string& device) {
 // Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
 // does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
 // A Q4_0 file from tools/hadamard_q4_0.py: its matmul weights are rotated by a 32-point
-// Walsh-Hadamard transform, and only the lean ROCm build rotates the activations to match.
+// Walsh-Hadamard transform. Two builds rotate the activations to match: our llama.cpp on HRX
+// (src/llama-hadamard.cpp reads the stamp and adds the rotation as a matmul, fork #58) and the
+// lean ROCm build (inside its quantizers, W4A4).
 bool hadamard_q4_0(const std::string& model) {
     return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
            gguf_int(model, "onebit.hadamard_q4_0") == 32;
@@ -686,7 +688,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // Q4_0 drafter or MTP head works beside it (ROCmFPX#7); every Q4_0 matmul takes the W4A4
             // kernel (docs/lean.md). A value set in the environment wins (GGML_W4A4_TENSORS= keeps
             // exact int8).
-            if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: it runs on --device rocm only");
+            if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: the lean build runs it on --device rocm");
             if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
             // micro-batch size: recipe rotated-moe-ub1024 (config/recipes.json)
         }
@@ -1192,13 +1194,18 @@ long prompt_tokens(int port, const httplib::Request& q) {
 int serve_child(const Options& given) {
     Options o = given;
     if (hadamard_q4_0(o.model)) {
-        // a rotated file has one route: the lean ROCm build with the Hadamard activation quantizer
+        // a rotated file has two routes: HRX (llama-hadamard rotates the activations as a matmul) and
+        // the lean ROCm build (W4A4). auto keeps ROCm until HRX routes Q4_0 prompt matmuls to a fast
+        // kernel: Qwen3.8-27B-Q4_0-H32 on HRX0 runs pp512 at 63.5 tok/s today (docs/hrx.md).
         if (o.device == "auto") o.device = "rocm";
-        if (o.device != "rocm")
-            throw std::runtime_error(o.model + " is Hadamard-rotated (tools/hadamard_q4_0.py): it runs on --device rocm only, docs/lean.md");
+        if (o.device != "rocm" && o.device != "hrx")
+            throw std::runtime_error(o.model + " is Hadamard-rotated (tools/hadamard_q4_0.py): it runs on --device hrx or rocm, docs/hrx.md");
         if (o.laya_auto || !o.laya_model.empty())
-            throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on rocm only");
-        std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
+            throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on hrx or rocm, picked with --device");
+        if (o.device == "hrx")
+            std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: HRX route, activations rotated by llama-hadamard\n", o.model.c_str());
+        else
+            std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
     }
     if (prism_hadamard(o.model)) {
         if (prism_ternary_types(o.model))

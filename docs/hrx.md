@@ -265,6 +265,22 @@ also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -u
 
 `test-backend-ops -o MUL_MAT -b HRX0`: 287/287. `GGML_HRX_Q8_PREFILL_RELAX=0` turns this off too.
 
+### Hadamard-rotated Q4_0 files (llama.cpp #58)
+
+The files `tools/hadamard_q4_0.py` writes (`onebit.hadamard_q4_0 = 32`, [lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing))
+run on HRX with `1bit serve --device hrx`.
+
+- **How it works.** `src/llama-hadamard.cpp` reads the stamp and treats it as PrismML's `prism.hadamard`
+  transform with block 32 and no signs. The activations of the rotated Q4_0 weights get the same rotation,
+  as a matmul against the 32-point Walsh-Hadamard matrix, so nothing in the HRX backend changes.
+- **What it skips.** A Q4_0 lookup table such as `token_embd` is written in the plain basis and stays
+  plain. A stamped weight the model doesn't load (the MTP layer without `--mtp`) is skipped.
+- **Accuracy.** Qwen3.8-27B-Q4_0-H32 on `HRX0`, wikitext-2 40 x 512 against the BF16 logits: PPL 6.021,
+  KLD 0.0292, same top token 92.5%. Without the rotation the same file gives PPL 550,134.
+- **Speed (before #55).** pp512 63.5, pp2048 62.4, tg64 11.65 tok/s. HRX still sends Q4_0 prompt matmuls
+  down its generic path: #55 routes Q4_K, Q5_K and IQ4_XS only. Until Q4_0 gets the same routing,
+  `--device auto` keeps these files on the lean ROCm route.
+
 ### Known issues on `HRX0`
 
 - **Several sequences per batch fail.** `llama-perplexity` with `n_seq` > 1 stops on an

@@ -164,6 +164,9 @@ scale on the rest. A 32-point Walsh-Hadamard rotation spreads those values befor
 same rotation is applied to the weights once, per 32-element block along K, so
 `x . w = (Hx) . (Hw)` and the product is unchanged in exact arithmetic.
 
+The same files also run on HRX (`--device hrx`, [hrx.md](hrx.md#hadamard-rotated-q4_0-files-llamacpp-58)):
+there the activations are rotated as a matmul and are not rounded to 4 bits (no W4A4).
+
 **Make the file** from a high-precision source (Q8_0, BF16, F16), with the imatrix you would
 quantize it with anyway:
 

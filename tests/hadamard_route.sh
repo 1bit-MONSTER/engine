@@ -17,6 +17,8 @@
 # How `1bit serve` routes a Hadamard-rotated Q4_0 file (tools/hadamard_q4_0.py stamps
 # onebit.hadamard_q4_0 = 32; docs/lean.md), without a GPU:
 #   - --device vulkan refuses it,
+#   - --device hrx runs it on HRX0 (our llama.cpp rotates the activations itself, fork #58) with no
+#     W4A4 or process-wide Hadamard variable,
 #   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_W4A4_TENSORS=all in the
 #     backend's environment and no process-wide GGML_Q4_0_HADAMARD (the backend rotates the stamped
 #     file's weights itself); a MoE file (an expert count) also gets
@@ -95,6 +97,10 @@ run() {  # <model> <record> [serve args]: serve with --device auto until the bac
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }
+
+run "$scratch/h32.gguf" "$scratch/hrx.json" --device hrx
+check "--device hrx runs a rotated file on HRX0" '[ "$(field "$scratch/hrx.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
+check "  with neither variable" '[ "$(field "$scratch/hrx.json" "sorted(r[\"env\"])")" = "[]" ]'
 
 run "$scratch/h32.gguf" "$scratch/h32.json"
 check "--device auto sends a rotated file to ROCm0" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = ROCm0 ]'

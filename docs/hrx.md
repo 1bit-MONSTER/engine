@@ -441,6 +441,9 @@ BF16 is 0.063.
   per-head sink logits run on HRX as an exact post-correction of AMD's unchanged flash-attention output,
   O x sigmoid(LSE - sink), in our own dispatch; an output that overlaps an input's storage is refused.
   gpt-oss-20b greedy text is identical to the CPU-sink path; pp512 990 +/- 22, tg128 35.0 +/- 5.5 tok/s.
+- **PrismML tile bytes** ([llama.cpp #74](https://github.com/1bit-MONSTER/llama.cpp/pull/74)): the low-token
+  SwiGLU sized PQ2_0 / PTQ1_0 weight rows from a tile size of 0, so every row read row 0. Ternary-Bonsai-1.7B
+  PQ2_0 decode perplexity 1,225,624 -> 20.65 (CPU 20.70); the 27B files took another kernel and were unaffected.
 - **TQ1_0 / TQ2_0** ([llama.cpp #69](https://github.com/1bit-MONSTER/llama.cpp/pull/69)): ggml's ternary types
   in the shared dequantizer and on the K-quant decode kernels. Ternary-Bonsai-1.7B, HRX0 vs CPU: KLD 0.000523,
   same top token 98.67%; pp512 / tg128 TQ1_0 3542 / 113, TQ2_0 4100 / 156 tok/s.

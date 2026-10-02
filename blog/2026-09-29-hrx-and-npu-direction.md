@@ -19,9 +19,10 @@ summary: The engine is heading to HRX plus the NPU. Laya's scorer already runs o
 
 # Where the engine is going: HRX and the NPU
 
-Reviewing the Laya work, [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, put it plainly: we want it on the NPU, a Vulkan version
-already exists, and the stack is HRX + Loom + NPU. They were right, and not only for Laya. The
-engine is heading to AMD's HRX backend, whose kernels we write in Loom, plus the NPU. Vulkan
+The engine is heading to AMD's HRX backend, whose kernels we write in Loom, plus the NPU.
+
+A review of the Laya work[^geramyl] put it plainly: we want it on the NPU, a Vulkan version
+already exists, and the stack is HRX + Loom + NPU. That was right, and not only for Laya. Vulkan
 stays the default until HRX meets the gates in
 [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213): decode within 10% of Vulkan
 on the showcase models, every architecture that runs on Vulkan checked on HRX, and speculative
@@ -100,3 +101,5 @@ prefill to HRX cuts a Qwen2.5-7B request by 26%. The decode-split race that made
 is fixed ([#123](https://github.com/1bit-MONSTER/engine/issues/123)), and its multi-pass output
 step got 15-22% faster on long contexts ([#180](https://github.com/1bit-MONSTER/engine/pull/180)).
 Each gate that closes gets its own post.
+
+[^geramyl]: The review came from [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord. Thank you.

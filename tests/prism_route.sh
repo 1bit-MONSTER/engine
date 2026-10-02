@@ -18,7 +18,8 @@
 # docs/hrx.md), without a GPU:
 #   - --device auto sends a converted file (tools/ternary_to_q4_0.py) to HRX0,
 #   - --device vulkan refuses it (upstream llama.cpp would ignore the rotation),
-#   - a file still in PrismML's ternary types is refused with the converter's name,
+#   - a file in PrismML's ternary types goes to HRX0 too (llama.cpp #62), with or without
+#     prism.hadamard keys, and --device vulkan refuses it with the converter's name,
 #   - a plain file with --device auto still goes to the GPU route (HRX0 with HRX, else Vulkan0).
 #
 # usage: tests/prism_route.sh path/to/1bit
@@ -50,6 +51,7 @@ def gguf(path, prism, file_type):
     open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
 gguf(sys.argv[1] + "/bonsai-q4_0.gguf", True, 2)
 gguf(sys.argv[1] + "/bonsai-ptq1_0.gguf", True, 143)
+gguf(sys.argv[1] + "/bonsai-pq2_0-plain.gguf", False, 141)
 gguf(sys.argv[1] + "/plain.gguf", False, 2)
 PY
 
@@ -72,8 +74,8 @@ chmod +x "$scratch/backend.py"
 
 refused=$("$bin" serve -m "$scratch/bonsai-q4_0.gguf" --device vulkan --port 1 --llama-server "$scratch/backend.py" 2>&1)
 check "--device vulkan refuses a Hadamard-folded file" '[[ "$refused" == *"Hadamard-folded"* ]]'
-refused=$("$bin" serve -m "$scratch/bonsai-ptq1_0.gguf" --device auto --port 1 --llama-server "$scratch/backend.py" 2>&1)
-check "PrismML ternary types are refused with the converter's name" '[[ "$refused" == *"ternary_to_q4_0.py"* ]]'
+refused=$("$bin" serve -m "$scratch/bonsai-pq2_0-plain.gguf" --device vulkan --port 1 --llama-server "$scratch/backend.py" 2>&1)
+check "--device vulkan refuses PrismML ternary types with the converter's name" '[[ "$refused" == *"ternary_to_q4_0.py"* ]]'
 
 run() {  # <model> <record>: serve with --device auto until the backend has recorded its start
     local port
@@ -87,6 +89,10 @@ field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eva
 
 run "$scratch/bonsai-q4_0.gguf" "$scratch/b.json"
 check "--device auto sends a Hadamard-folded file to HRX0" '[ "$(field "$scratch/b.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
+run "$scratch/bonsai-ptq1_0.gguf" "$scratch/t.json"
+check "--device auto sends a PTQ1_0 file to HRX0" '[ "$(field "$scratch/t.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
+run "$scratch/bonsai-pq2_0-plain.gguf" "$scratch/p.json"
+check "--device auto sends an unrotated PQ2_0 file to HRX0" '[ "$(field "$scratch/p.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
 run "$scratch/plain.gguf" "$scratch/plain.json"
 check "a plain file still goes to $gpu" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = "$gpu" ]'
 

@@ -880,11 +880,14 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
     l.device = device + " " + role;
     l.port = port;
     const std::string server = o.llama_server.empty() ? default_llama_server(device) : o.llama_server;
-    if (device == "hrx")
+    if (device == "hrx") {
         l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
                   "--device", "HRX0", "-ngl", "99", "-c", "2048", "-b", "2048", "-ub", "2048", "-np", "1",
                   std::string("--") + role};
-    else
+        // the same ROCr the chat server gets, or the RAG server cannot open HRX0 ("invalid device: HRX0")
+        if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty())
+            l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+    } else
         l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
                   "--device", "Vulkan0", "-ngl", "99", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
                   std::string("--") + role};

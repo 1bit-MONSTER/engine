@@ -229,8 +229,9 @@ bool prism_hadamard(const std::string& model) {
            gguf_int(model, "prism.hadamard.version") > 0;
 }
 
-// PrismML's own ternary types (general.file_type PQ2_0 / PTQ1_0 in its fork): no pinned
-// llama.cpp reads them; tools/ternary_to_q4_0.py writes the same weights as Q4_0.
+// PrismML's own ternary types (general.file_type PQ2_0 / PTQ1_0 in its fork): only the HRX
+// build reads them (llama.cpp #62); tools/ternary_to_q4_0.py writes the same weights as Q4_0
+// for any other route.
 bool prism_ternary_types(const std::string& model) {
     const long long ft = gguf_int(model, "general.file_type");
     return ft == 128 || ft == 129 || ft == 141 || ft == 142 || ft == 143;
@@ -1207,10 +1208,17 @@ int serve_child(const Options& given) {
         else
             std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
     }
+    if (prism_ternary_types(o.model) && !prism_hadamard(o.model)) {
+        // PQ2_0 / PTQ1_0 without a rotation (e.g. Ternary-Bonsai-1.7B): only the HRX build reads the types
+        if (o.device == "auto") o.device = "hrx";
+        if (o.device != "hrx")
+            throw std::runtime_error(o.model + " stores PrismML's ternary types: it runs on --device hrx, or convert it "
+                                     "with tools/ternary_to_q4_0.py (the same weights as Q4_0), docs/hrx.md");
+        if (o.laya_auto || !o.laya_model.empty())
+            throw std::runtime_error("--laya routes among devices; a file in PrismML's ternary types runs on hrx only");
+        std::fprintf(stderr, "1bit serve: %s stores PrismML's ternary types: HRX route\n", o.model.c_str());
+    }
     if (prism_hadamard(o.model)) {
-        if (prism_ternary_types(o.model))
-            throw std::runtime_error(o.model + " stores PrismML's ternary types: convert it first with "
-                                     "tools/ternary_to_q4_0.py (the same weights as Q4_0), docs/hrx.md");
         // a rotated file has one route: our llama.cpp on HRX, which rotates the activations
         if (o.device == "auto") o.device = "hrx";
         if (o.device != "hrx")

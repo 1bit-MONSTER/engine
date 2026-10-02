@@ -192,18 +192,32 @@ were observed.
 ### Ternary Bonsai (PrismML's Hadamard-folded GGUFs)
 
 PrismML's [Ternary-Bonsai-2-27B](https://huggingface.co/prism-ml/Ternary-Bonsai-2-27B-gguf) is Qwen3.8-27B
-trained to weights of -1, 0 and +1, with one fp16 scale per 128 weights. It runs on `HRX0`:
+trained to weights of -1, 0 and +1, with one fp16 scale per 128 weights. It runs on `HRX0`,
+straight from PrismML's file:
 
 ```sh
-tools/ternary_to_q4_0.py Ternary-Bonsai-2-27B-PTQ1_0.gguf Ternary-Bonsai-2-27B-Q4_0.gguf
-1bit serve -m Ternary-Bonsai-2-27B-Q4_0.gguf          # --device auto picks hrx for this file
+1bit serve -m Ternary-Bonsai-2-27B-PTQ1_0.gguf        # --device auto picks hrx for this file
 ```
 
-- **The weights.** PrismML's PTQ1_0 and PQ2_0 types are not in any llama.cpp the engine pins.
-  `tools/ternary_to_q4_0.py` writes the same weights as Q4_0 (q = trit + 8 with the group's own
-  fp16 scale in each of its four blocks), so nothing is lost: every group is decoded back and
-  compared before the file is kept, and `tests/ternary_to_q4_0_test.py` checks it against
-  PrismML's own encoder. The file is 14.1 GiB instead of 5.5.
+- **The weights** ([llama.cpp #62](https://github.com/1bit-MONSTER/llama.cpp/pull/62)). PrismML's
+  PQ2_0 (ggml type 142) and PTQ1_0 (143) are native types in our HRX build, with the layouts of
+  PrismML's llama.cpp fork. Our CPU decode of every tensor of both 27B files matches PrismML's own
+  build bit for bit. On `HRX0` the K-quant decode kernels read them directly, so one copy of the
+  weights is resident:
+
+  | Ternary-Bonsai-2-27B | weights | GPU peak over idle | tg128 (tok/s) | pp512 (tok/s) |
+  |---|---|---|---|---|
+  | Q4_0 + packed ternary (below) | 14.13 GiB | 21.8 GiB | 15.3 | 13.1 |
+  | PQ2_0 | 6.70 GiB | 10.1 GiB | 15.8 | 14.2 |
+  | PTQ1_0 | 5.53 GiB | 8.9 GiB | 14.3 | 14.2 |
+
+  Balanced power mode, llama-bench `-fa 1`, medians of 3. Against the CPU logits of the
+  bit-identical Q4_0 copy (3 x 512) all three give the same KLD, 0.000129 at decode (`-ub 8`) and
+  0.002051 at `-ub 512`. Files in these types run on `--device hrx` only, with or without
+  `prism.hadamard` keys (Ternary-Bonsai-1.7B has none). For another route,
+  `tools/ternary_to_q4_0.py` writes the same weights as Q4_0 (q = trit + 8 with the group's own fp16
+  scale in each of its four blocks); every group is decoded back and compared before the file is
+  kept, and `tests/ternary_to_q4_0_test.py` checks it against PrismML's own encoder.
 - **Packed ternary decode** ([llama.cpp #54](https://github.com/1bit-MONSTER/llama.cpp/pull/54)).
   For a file stamped `onebit.ternary_q4_0`, `1bit serve` sets `GGML_HRX_TERNARY_Q4_0=1`. HRX0's
   K-quant decode kernels then read those Q4_0 weights from a 2-bit copy made at load (68 bytes per
@@ -284,6 +298,18 @@ run on HRX with `1bit serve --device hrx`.
 - **Speed (before #55).** pp512 63.5, pp2048 62.4, tg64 11.65 tok/s. HRX still sends Q4_0 prompt matmuls
   down its generic path: #55 routes Q4_K, Q5_K and IQ4_XS only. Until Q4_0 gets the same routing,
   `--device auto` keeps these files on the lean ROCm route.
+
+### Server memory: the graph program cache cap (llama.cpp #63)
+
+HRX builds a graph program for every new graph shape (each new prompt or batch length) and kept every
+one: a long-running `llama-server` with prompts of varying length grew its GPU memory without bound
+(ZAYA1-8B: about 1 GiB per request, 24.6 GiB after 28 requests). Since
+[llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63) the cache holds at most
+`GGML_HRX_GRAPH_PROGRAM_CACHE` programs (default 64, `0` = unbounded): when a new program takes it over
+the limit, HRX waits for the stream and drops every other program. On ZAYA1-8B, 40 requests of varying
+length peak at 8.7 GiB instead of growing; greedy answers are identical, and llama-bench pp512/tg128
+is unchanged. A repeated prompt length right after a flush costs 1.75 s instead of 1.12 s, since its
+program is rebuilt.
 
 ### Known issues on `HRX0`
 
@@ -385,6 +411,11 @@ BF16 is 0.063.
   UD files no longer fall back to the generic path for pairs that mix formats. Qwen3.8-27B UD-IQ2_S
   tg128 3.12 to 8.32 tok/s; UD-Q4_K_XL unchanged (11.88 / 11.81); KLD 0.00013 vs the previous build,
   `test-backend-ops -b HRX0` 996/996.
+- **PrismML's PQ2_0 / PTQ1_0 types** ([llama.cpp #62](https://github.com/1bit-MONSTER/llama.cpp/pull/62)):
+  native ggml types 142 / 143 with a CPU reference and HRX decode on the K-quant kernels; Q1_0 decode
+  moves onto them too ([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)).
+- **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
+  `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):
   llama loads the engine's `onebit.hadamard_q4_0` files through `llama-hadamard`. Qwen3.8-27B-Q4_0-H32
   on HRX vs BF16 (wikitext 40 x 512): PPL 6.021, KLD 0.0292, same top token 92.5%. Q4_0 prompt matmuls

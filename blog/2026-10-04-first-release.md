@@ -14,8 +14,8 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-tags: milestone, release, hrx, ternary, lemonade, zyphra, qwen
-summary: The 1bit engine's first release: HRX is the GPU route, Qwen3.8-27B reads prompts at 335 tok/s, ternary Bonsai-27B runs in 5.5 GiB, all inside Lemonade.
+tags: milestone, release, hrx, loom, kernels, ternary, mxfp4, lemonade, zyphra, qwen
+summary: The 1bit engine's first release: every GGUF quant type decodes on HRX with Loom kernels, written by AI agents and checked against the CPU. Qwen3.8-27B reads prompts at 335 tok/s, ternary Bonsai-27B runs in 5.5 GiB, all inside Lemonade.
 
 # 1bit engine v2026.40: the first release
 
@@ -57,6 +57,27 @@ Qwen3.8-27B decodes at 97% of the Vulkan figure it replaced. Unsloth's sub-4-bit
 IQ1, IQ2, IQ3) run on the GPU instead of the CPU, and `--mtp` speculative decoding on Qwen3.5/3.8 is
 NaN-free ([HRX](../docs/hrx.md)).
 
+## Every quant type, on HRX and Loom alone
+
+As of this release every GGUF quant type we test decodes on the Strix Halo iGPU through HRX and Loom
+kernels alone: no Vulkan, no ROCm, no CPU fallback at decode. The kernels that got it there are our own,
+written by AI agents (Claude, working with the engine's owner): each one profiled, written in Loom,
+checked against the CPU (KLD or bit for bit), measured on this machine and reviewed before it merged.
+Prompt / decode, tok/s:
+
+| kernel | measured on | before | now |
+|---|---|---|---|
+| MXFP4 experts, ADD_ID, clamped SwiGLU, attention sinks | gpt-oss-20b MXFP4 | 25.8 / 12.6 | **1011 / 39** |
+| Hadamard rotation | Ternary-Bonsai-2-27B | 13.5 / 15.8 | **90.9 / 19.0** |
+| TQ1_0 / TQ2_0 ternary | Ternary-Bonsai-1.7B TQ2_0 | CPU only | **4100 / 156** |
+| IQ2_XS / IQ2_XXS | Qwen3-4B IQ2_XXS | 59 / 23.0 | **715 / 39.5** |
+| IQ3_XXS / IQ2_S | Qwen3-4B, mixed IQ3_XXS | 2.8 / 1.5 | **250 / 8.9** |
+| Q2_K | Qwen3-4B Q2_K | 686 / 47 | **1300 / 75** |
+| separate gate/up codebooks | Qwen3.8-27B UD-IQ2_S | - / 3.1 | **- / 8.3** |
+
+gpt-oss-20b runs entirely on HRX, about 1% from the CPU's perplexity (mean KLD 0.027): close, not bit
+for bit, and we are working on the difference ([HRX](../docs/hrx.md)).
+
 ## Ternary Bonsai in 5.5 GiB
 
 PrismML's Ternary-Bonsai-2-27B is Qwen3.8-27B trained to weights of -1, 0 and +1. Its PTQ1_0 and
@@ -81,7 +102,7 @@ labelled requests) and a measured policy picks where it runs. The classifier its
 ## Next
 
 Still on the Vulkan build, and moving to HRX next: MoE experts streamed from the drive
-(`--moe-slots`), images (`--mmproj`), several sequences on gated delta-net models, the RAG servers,
+(`--moe-slots`), images (`--mmproj`), several sequences on gated delta-net models,
 Qwen3.8-Flash-Next, and Zyphra's Zamba family. Releases ship every Sunday from here on.
 
 ## Thank you

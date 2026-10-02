@@ -135,7 +135,7 @@ echo "== initramfs"
 # (Dropbear, like sshd, refuses keys when the home directory is group-writable)
 chmod -R go-w "$root"; chmod 1777 "$root/tmp"; chmod 700 "$root/root"
 # every file owned by root (Dropbear, like sshd, refuses keys in files the user does not own)
-(cd "$root" && find . -print0 | cpio --null -o -H newc -R 0:0 --quiet) | zstd -q -19 -T0 > "$out/initramfs.img"
+(cd "$root" && find . -print0 | cpio --null -o -H newc -R 0:0 --quiet) | zstd -q -19 -T4 > "$out/initramfs.img"
 
 echo "== 1bit-os.efi (unified kernel image)"
 stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub

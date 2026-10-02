@@ -27,7 +27,7 @@
 #            as the GitHub release v<ISO year>.<ISO week> with the packages
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
-# WEEKLY_JOBS (default 6) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
+# WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine), TheRock in /opt/rocm-therock, and
 # what the build scripts each list.
 set -euo pipefail
@@ -40,7 +40,7 @@ SRC=$W/src BUILD=$W/build OUT=$W/out LOGS=$W/logs
 GGUF=${ONEBIT_SERVE_TEST_GGUF:-$HOME/models/Qwen3-0.6B-Q4_K_M.gguf}
 DRY=${WEEKLY_DRY_RUN:-0}
 # the box is shared: a capped build leaves room for whatever else runs on Sunday
-JOBS=${WEEKLY_JOBS:-6}
+JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (linux, laya and comfyui.cpp only on their bumps)
 SUBMODULES=(hrx-system llama.cpp llama.cpp-vulkan llama.cpp-rocmfpx zinc xdna-driver lemonade ryzenai-server ds4 tokenizers)
@@ -167,7 +167,8 @@ bump_check() {  # bump_check <branch>
     esac
 }
 
-# Lemonade's own LLM suite through the onebit recipe, on Vulkan (docs/lemonade.md)
+# Lemonade's own LLM suite through the onebit recipe, on HRX (docs/lemonade.md); lemond keeps its
+# state in the workdir, not in the user's ~/.cache/lemonade and ~/.config/lemonade
 lemonade_suite() {
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     local venv=$W/lemonade-venv
@@ -175,11 +176,13 @@ lemonade_suite() {
     "$venv/bin/pip" -q install -r "$SRC/third_party/lemonade/test/requirements.txt"  # the suite's own list
     # the suite talks to a running lemond: ours, on a port of its own, with this build's 1bit
     local port=13399 pid rc=0
-    LEMONADE_ONEBIT_BIN="$BUILD/1bit" "$W/lemonade/bin/lemond" --port "$port" > "$LOGS/lemond.log" 2>&1 &
+    mkdir -p "$W/lemonade-state/cache" "$W/lemonade-state/config"
+    LEMONADE_ONEBIT_BIN="$BUILD/1bit" "$W/lemonade/bin/lemond" --port "$port" \
+        "$W/lemonade-state/cache" "$W/lemonade-state/config" > "$LOGS/lemond.log" 2>&1 &
     pid=$!
     ( cd "$SRC/third_party/lemonade" &&
       PATH="$W/lemonade/bin:$BUILD:$PATH" LEMONADE_ONEBIT_BIN="$BUILD/1bit" LEMONADE_TEST_PORT="$port" \
-      "$venv/bin/python" test/server_llm.py --wrapped-server onebit --backend vulkan ) > "$LOGS/lemonade-suite.log" 2>&1 || rc=$?
+      "$venv/bin/python" test/server_llm.py --wrapped-server onebit --backend hrx ) > "$LOGS/lemonade-suite.log" 2>&1 || rc=$?
     kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null || true
     return $rc
 }

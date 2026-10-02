@@ -161,7 +161,7 @@ def nest_lists(text):
 
 def render(text):
     text = nest_lists(text)
-    md = markdown.Markdown(extensions=["tables", "fenced_code", "toc", "sane_lists"],
+    md = markdown.Markdown(extensions=["tables", "fenced_code", "toc", "sane_lists", "footnotes"],
                            extension_configs={"toc": {"permalink": "#", "permalink_class": "anchor"}})
     body = md.convert(text)
     # wide tables scroll on their own instead of the page

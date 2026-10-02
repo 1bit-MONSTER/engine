@@ -428,8 +428,28 @@ BF16 is 0.063.
   shared dequantizer (17 bytes per 32 values, the E8M0 scale built exactly as ggml does).
   `tests/test-hrx-mxfp4` checks GET_ROWS on HRX0 bit for bit against ggml's own decoder;
   `test-backend-ops -b HRX0` 1051/1051. MUL_MAT_ID now takes only input sizes that are a multiple of
-  256, which its kernels declare. gpt-oss-20b's experts are 2880 wide, so they still run on the CPU
-  (text correct, pp512 25.8 / tg128 12.6 tok/s); a MUL_MAT_ID path for multiples of 32 is next.
+  256, which its kernels declare (until #66 below).
+- **gpt-oss on HRX** ([llama.cpp #66](https://github.com/1bit-MONSTER/llama.cpp/pull/66),
+  [#67](https://github.com/1bit-MONSTER/llama.cpp/pull/67), [#73](https://github.com/1bit-MONSTER/llama.cpp/pull/73)):
+  MUL_MAT_ID takes input sizes that are a multiple of 32 (gpt-oss-20b's experts are 2880 wide), with a
+  decode-loader stride fix that this exposed (rows were read 3072 apart); ADD_ID and the clamped SWIGLU_OAI
+  run on HRX in our own kernels; and a placement guard (#73) keeps those two ops with their MUL_MAT_ID when
+  the experts run on the CPU, where the mix gave wrong values (root cause open, engine #286).
+  gpt-oss-20b MXFP4, balanced mode: pp512 25.8 -> about 1000 tok/s, tg128 12.6 -> about 35, text correct,
+  KLD vs CPU 0.029. Attention with sinks still runs on the CPU (llama.cpp #68 pending).
+- **TQ1_0 / TQ2_0** ([llama.cpp #69](https://github.com/1bit-MONSTER/llama.cpp/pull/69)): ggml's ternary types
+  in the shared dequantizer and on the K-quant decode kernels. Ternary-Bonsai-1.7B, HRX0 vs CPU: KLD 0.000523,
+  same top token 98.67%; pp512 / tg128 TQ1_0 3542 / 113, TQ2_0 4100 / 156 tok/s.
+- **MLA attention past 512 tokens** ([llama.cpp #70](https://github.com/1bit-MONSTER/llama.cpp/pull/70)): the
+  V transpose assumed contiguous rows, but MLA (deepseek2, GLM) stores V with the QK head stride, so prompts of
+  512+ tokens read misaligned rows. GLM-4.7-Flash Q4_K_M: PPL 315,664 -> 5.916 (CPU 5.959).
+- **Hadamard files: qwen3next** ([llama.cpp #71](https://github.com/1bit-MONSTER/llama.cpp/pull/71)): `ssm_ba`
+  is folded too, and a stamped file with any other unfoldable Q4_0 weight is refused by name.
+- **Masked keys in flash attention** ([llama.cpp #72](https://github.com/1bit-MONSTER/llama.cpp/pull/72)):
+  KV rows past a sequence's end hold whatever an earlier request or rejected draft wrote, and the F16 WMMA made
+  P = 0 x V depend on that V's sign, so identical requests gave different logits (up to 0.13 on Qwen3-0.6B,
+  13.5 on GLM-4.7-Flash). Masked rows now reach P x V as exactly +0; Qwen3-0.6B and Qwen3.8-27B repeat
+  bit-identically. Cost: pp512 -4.7% on Qwen3-0.6B, the rest within noise.
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):

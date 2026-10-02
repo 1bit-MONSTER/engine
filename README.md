@@ -24,7 +24,7 @@ Lemonade runs the engine as one of its backends, the same way it runs `llama-ser
 serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
 - the XDNA 2 NPU engine
-- HRX on the Radeon iGPU, on the llama.cpp + hrx-system pair AMD tests
+- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the default GPU route ([docs/hrx.md](docs/hrx.md))
 - Vulkan, while it is leaving the engine (RFC #213): `--device vulkan` still runs upstream llama.cpp's latest release, but `--device auto` now means HRX ([docs/vulkan.md](docs/vulkan.md))
 - MoE experts streamed from the drive on Vulkan (`1bit serve --moe-slots N`), for MoE models larger than memory ([docs/moe-streaming.md](docs/moe-streaming.md#streaming-in-the-inference-path))
 - a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
@@ -42,7 +42,8 @@ Every tuned setting `1bit serve` gives a backend is a recipe with its measuremen
 ([docs/bench.md](docs/bench.md)).
 
 Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonade with the engine,
-Windows and 1bit OS ([docs/releases.md](docs/releases.md)).
+Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release ships on Sunday,
+4 October 2026.
 
 > **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU, as
 > [geramyL](https://github.com/Geramy), a moderator on Lemonade's Discord, proposed. HRX met the decode gates in

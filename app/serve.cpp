@@ -861,15 +861,33 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     return l;
 }
 
-// A small llama-server for one RAG role on Vulkan: --embedding for /v1/embeddings,
-// --reranking for /v1/rerank. Batch = ubatch: an embedding or rerank input is one pass.
+// A small llama-server for one RAG role: --embedding for /v1/embeddings, --reranking for
+// /v1/rerank. Batch = ubatch: an embedding or rerank input is one pass. On HRX where the build has
+// it (docs/hrx.md), else Vulkan. HRX runs one sequence per batch (docs/hrx.md, "Several sequences
+// per batch fail"), so its server takes one slot and 2048-token inputs, the largest prompt chunk
+// its matmul kernels take in one pass.
+std::string rag_device() {
+#if defined(ONEBIT_HRX_SERVER)
+    return "hrx";
+#else
+    return "vulkan";
+#endif
+}
+
 Launch rag_launch(const Options& o, const std::string& model, const char* role, int port) {
     Launch l;
-    l.device = std::string("vulkan ") + role;
+    const std::string device = rag_device();
+    l.device = device + " " + role;
     l.port = port;
-    l.argv = {o.llama_server.empty() ? default_llama_server("vulkan") : o.llama_server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
-              "--device", "Vulkan0", "-ngl", "99", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
-              std::string("--") + role};
+    const std::string server = o.llama_server.empty() ? default_llama_server(device) : o.llama_server;
+    if (device == "hrx")
+        l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
+                  "--device", "HRX0", "-ngl", "99", "-c", "2048", "-b", "2048", "-ub", "2048", "-np", "1",
+                  std::string("--") + role};
+    else
+        l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
+                  "--device", "Vulkan0", "-ngl", "99", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
+                  std::string("--") + role};
     return l;
 }
 
@@ -1392,8 +1410,8 @@ int serve_child(const Options& given) {
     srv.Get("/v1/health", health);
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& res) {
         json data = json::array({{{"id", id}, {"object", "model"}, {"owned_by", "1bit"}, {"device", device}}});
-        if (!o.embed.empty()) data.push_back({{"id", stem(o.embed)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "vulkan"}, {"role", "embedding"}});
-        if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", "vulkan"}, {"role", "rerank"}});
+        if (!o.embed.empty()) data.push_back({{"id", stem(o.embed)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", rag_device()}, {"role", "embedding"}});
+        if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", rag_device()}, {"role", "rerank"}});
         res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
     std::vector<std::unique_ptr<Child>> children;

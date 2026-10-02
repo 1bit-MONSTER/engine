@@ -233,8 +233,16 @@ straight from PrismML's file:
   following PrismML's implementation): a plain F32 matmul against the rotation matrix before each
   folded weight, the inverse after the token-embedding lookup, and a check on the first graph that
   no folded weight is used without it. Upstream llama.cpp would load the file and answer garbage,
-  so `1bit serve` sends a `prism.hadamard` file to `hrx` only, and refuses a file still in
-  PrismML's own types with the converter's name (`tests/prism_route.sh`).
+  so `1bit serve` sends a `prism.hadamard` file, or one in PrismML's own types, to `hrx` only
+  (`tests/prism_route.sh`).
+- **The rotation on the GPU** ([llama.cpp #64](https://github.com/1bit-MONSTER/llama.cpp/pull/64)).
+  The rotation is a MUL_MAT that ggml hints as `GGML_HINT_SRC0_IS_HADAMARD`. The dense HRX matmul
+  takes at most 2048 rows, so at a 512-token prompt the 17408-wide FFN input (8704 rows of 1024)
+  ran on the CPU in every layer. `hadamard_f32.loom` now computes the normalized transform per row
+  (log2(n) butterfly stages, the matrix never read), as the CPU, Vulkan, CUDA and Metal backends do
+  for this hint. Ternary-Bonsai-2-27B (balanced mode): pp512 13.5 -> 90.9 tok/s, and decode
+  15.8 -> 19.0 tok/s, since the decode rotations no longer go through a dense WMMA kernel.
+  `tests/test-hrx-hadamard` checks six shapes against the CPU and an exact product, four times each.
 - **Checked.** Against the F16 model on the CPU in PrismML's own fork, wikitext-2 running
   perplexity on `HRX0` is 7.962 / 10.408 / 10.171 at chunks 5 / 10 / 15 (CPU: 7.958 / 10.382 /
   10.142), the difference Q4_0's 8-bit activations make. Files without the keys build the same graph
@@ -414,6 +422,14 @@ BF16 is 0.063.
 - **PrismML's PQ2_0 / PTQ1_0 types** ([llama.cpp #62](https://github.com/1bit-MONSTER/llama.cpp/pull/62)):
   native ggml types 142 / 143 with a CPU reference and HRX decode on the K-quant kernels; Q1_0 decode
   moves onto them too ([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)).
+- **The Hadamard rotation on HRX** ([llama.cpp #64](https://github.com/1bit-MONSTER/llama.cpp/pull/64)):
+  a kernel for the `GGML_HINT_SRC0_IS_HADAMARD` MUL_MAT ([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)).
+- **MXFP4 weights** ([llama.cpp #65](https://github.com/1bit-MONSTER/llama.cpp/pull/65)): MXFP4 in the
+  shared dequantizer (17 bytes per 32 values, the E8M0 scale built exactly as ggml does).
+  `tests/test-hrx-mxfp4` checks GET_ROWS on HRX0 bit for bit against ggml's own decoder;
+  `test-backend-ops -b HRX0` 1051/1051. MUL_MAT_ID now takes only input sizes that are a multiple of
+  256, which its kernels declare. gpt-oss-20b's experts are 2880 wide, so they still run on the CPU
+  (text correct, pp512 25.8 / tg128 12.6 tok/s); a MUL_MAT_ID path for multiples of 32 is next.
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):

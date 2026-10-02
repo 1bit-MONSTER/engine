@@ -39,6 +39,16 @@ build=$(cd "$build" && pwd)   # absolute: binaries keep their build paths inside
 kver=${KVER:-$(uname -r)}
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x
+# Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A
+# cleaned ~/.cache used to stop the weekly release at "SSH (Dropbear)" (2026-10-01 rehearsal).
+tool_debs="dropbear-bin libtomcrypt1 libtommath1 mtools systemd-boot-efi"
+if [ ! -x "$tools/usr/sbin/dropbear" ] || [ ! -x "$tools/usr/bin/mtools" ] ||
+   [ ! -e "$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub" ]; then
+    echo "== unpacking $tool_debs into $tools"
+    mkdir -p "$tools"
+    (cd "$(dirname "$tools")" && apt-get download $tool_debs)
+    for d in "$(dirname "$tools")"/*.deb; do dpkg -x "$d" "$tools"; done
+fi
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 root=$out/root
 rm -rf "$root"; mkdir -p "$root"/{bin,sbin,etc,proc,sys,dev,tmp,run,data,lib/firmware,usr/share/vulkan/icd.d,root}

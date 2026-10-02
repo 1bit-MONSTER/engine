@@ -257,7 +257,7 @@ multiple of 256 sends its 256-aligned head to the q8_1 x4 kernel too, and only t
 generic kernel. Q4_K remainders still go to the generic kernel: its packed Row64 weight layout cannot
 also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -ub 512`):
 
-| metric | `6e42b51` | `bd5b297` |
+| metric | `6e42b51` | `6e42b51` + #61 (`a36d547`) |
 |---|---|---|
 | pp400 | 67.4 | **103.4** |
 | pp1862 | 172.1 | **234.6** |

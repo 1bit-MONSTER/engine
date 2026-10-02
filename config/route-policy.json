@@ -1,5 +1,5 @@
 {
- "about": "Request class -> device for 1bit serve --laya (RFC #186, docs/laya.md). A row may name any device the model can run on; a device not available for the model falls back to default. Change a row only with a measured net gain (decode and time to first token, the Laya decision included). Vulkan is leaving the engine (RFC #213): HRX is the GPU route, and the lean ROCm build serves long prompts.",
+ "about": "Request class -> device for 1bit serve --laya (RFC #186, docs/laya.md). A row may name any device the model can run on; a device not available for the model falls back to default. Change a row only with a measured net gain (decode and time to first token, the Laya decision included). The engine's GPU route is HRX only (2026-10-01); what it does not run, Lemonade serves with its own backends.",
  "min_confidence": 0.16,
  "default": "hrx",
  "classes": {
@@ -16,8 +16,8 @@
    "why": "Same device as code: a short reply is a few tokens of decode after a short prompt."
   },
   "long_doc": {
-   "device": "rocm",
-   "why": "Prompt processing dominates. Qwen3.8-27B UD-Q4_K_XL, llama-bench, 2026-10-01: the lean ROCm build 365-368 tok/s pp512 and 351-354 pp2048, HRX 97-99 for both. ROCm reads any GGUF."
+   "device": "hrx",
+   "why": "Prompt processing dominates. Since the HRX prompt-matmul routing (llama.cpp fork #55, engine #273), Qwen3.8-27B UD-Q4_K_XL prefills on HRX at 335 tok/s pp512 and 310 pp2048 (llama-bench), and a 14,435-token prompt through 1bit serve --device hrx at 265 tok/s, same text. Past 32K of context HRX needs llama.cpp fork #59."
   }
  }
 }

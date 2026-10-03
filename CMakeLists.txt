@@ -346,6 +346,9 @@ if(Python3_Interpreter_FOUND)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry), so a regression cannot leave the daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # the release notes' Source code section for 1bit OS (GPL/LGPL): rendered from a fixture
+    # sources.json, and the notes unchanged without --os-sources (offline)
+    add_test(NAME os_sources COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/os_sources_test.py)
 endif()
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)

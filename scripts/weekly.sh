@@ -272,8 +272,11 @@ stage_release() {
     else from=$(git -C "$SRC" rev-list -1 --before="7 days ago" origin/main); fi
     [ -n "$from" ] || from=$(git -C "$SRC" rev-list --max-parents=0 origin/main | tail -1)
     say "release $tag: changes ${from:0:12}..$(git -C "$SRC" rev-parse --short HEAD) (previous: ${prev:-none})"
+    local os_sources=()   # the Source code section (GPL/LGPL) for 1bit OS, from mkimage.sh
+    [ -f "$W/os/sources.json" ] && os_sources=(--os-sources "$W/os/sources.json")
     python3 "$SRC/tools/weekly_changes.py" --src "$SRC" --from "$from" --to HEAD --tag "$tag" \
-        --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md"
+        --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md" \
+        "${os_sources[@]}"
     if [ "$DRY" = 1 ]; then say "dry run: not publishing"; return; fi
     gh release create "$tag" -R "$REPO" --target "$(git -C "$SRC" rev-parse HEAD)" \
         --title "1bit engine $tag" -F "$W/notes.md" "$OUT"/*

@@ -21,7 +21,10 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
+#include <cstdint>
 #include <fstream>
+#include <functional>
+#include <queue>
 #include <stdexcept>
 
 namespace onebit::npu {
@@ -97,12 +100,19 @@ struct Tokenizer::Regex {
         std::vector<std::string> pieces;
         pcre2_match_data* md = pcre2_match_data_create_from_pattern(re, nullptr);
         size_t off = 0, last = 0;
+        // The first match checks the whole subject's UTF-8; later ones skip that check, which
+        // otherwise rescans the rest of the text for every piece (quadratic in the text).
+        uint32_t opts = 0;
         while (off < text.size()) {
-            if (pcre2_match(re, reinterpret_cast<PCRE2_SPTR>(text.data()), text.size(), off, 0, md, nullptr) < 0) break;
+            if (pcre2_match(re, reinterpret_cast<PCRE2_SPTR>(text.data()), text.size(), off, opts, md, nullptr) < 0) break;
+            opts = PCRE2_NO_UTF_CHECK;
             const PCRE2_SIZE* ov = pcre2_get_ovector_pointer(md);
             const size_t start = ov[0], end = ov[1];
             if (end == start) {
                 off = start + 1;
+                // Without the check a start inside a character is undefined; with it, PCRE2 refused
+                // such a start and the split stopped there, so stop there too.
+                if (off < text.size() && (static_cast<unsigned char>(text[off]) & 0xC0) == 0x80) break;
                 continue;
             }
             if (start > last) pieces.push_back(text.substr(last, start - last));
@@ -222,23 +232,46 @@ std::vector<int> Tokenizer::bpe(const std::string& chars) const {
         word.push_back(chars.substr(i, len));
         i += len;
     }
-    while (word.size() > 1) {  // merge the lowest-ranked adjacent pair until none applies
-        int best = -1;
-        size_t at = 0;
-        for (size_t i = 0; i + 1 < word.size(); ++i) {
-            auto it = merge_ranks_.find(word[i] + "\x1f" + word[i + 1]);
-            if (it != merge_ranks_.end() && (best < 0 || it->second < best)) {
-                best = it->second;
-                at = i;
-            }
-        }
-        if (best < 0) break;
-        word[at] += word[at + 1];
-        word.erase(word.begin() + long(at) + 1);
+    // Merge the lowest-ranked adjacent pair, leftmost first, until none applies. The pairs sit
+    // in a heap ordered by (rank, position) over a linked list of symbols, so a long piece costs
+    // O(n log n) rather than a full rescan per merge; the merges and their order are unchanged.
+    const size_t n = word.size();
+    std::vector<size_t> prev(n), next(n);
+    std::vector<uint32_t> ver(n, 0);
+    for (size_t i = 0; i < n; ++i) {
+        prev[i] = i - 1;  // wraps to SIZE_MAX for the first symbol
+        next[i] = i + 1;  // n for the last
+    }
+    struct Pair {
+        int rank;
+        size_t left, right;
+        uint32_t vl, vr;
+        bool operator>(const Pair& o) const { return rank != o.rank ? rank > o.rank : left > o.left; }
+    };
+    std::priority_queue<Pair, std::vector<Pair>, std::greater<Pair>> heap;
+    auto push = [&](size_t l, size_t r) {
+        if (l >= n || r >= n) return;
+        auto it = merge_ranks_.find(word[l] + "\x1f" + word[r]);
+        if (it != merge_ranks_.end()) heap.push({it->second, l, r, ver[l], ver[r]});
+    };
+    for (size_t i = 0; i + 1 < n; ++i) push(i, i + 1);
+    while (!heap.empty()) {
+        const Pair p = heap.top();
+        heap.pop();
+        // stale: a side was merged away or changed since this pair was queued
+        if (ver[p.left] != p.vl || ver[p.right] != p.vr || next[p.left] != p.right) continue;
+        word[p.left] += word[p.right];
+        word[p.right].clear();
+        ++ver[p.left];
+        ver[p.right] = UINT32_MAX;  // never matches a queued pair again
+        next[p.left] = next[p.right];
+        if (next[p.left] < n) prev[next[p.left]] = p.left;
+        push(prev[p.left], p.left);
+        push(p.left, next[p.left]);
     }
     std::vector<int> ids;
-    for (const auto& w : word)
-        if (auto it = vocab_.find(w); it != vocab_.end()) ids.push_back(it->second);
+    for (size_t i = 0; i < n; i = next[i])
+        if (auto it = vocab_.find(word[i]); it != vocab_.end()) ids.push_back(it->second);
     return ids;
 }
 
@@ -299,12 +332,22 @@ std::vector<int> Tokenizer::encode(const std::string& text) const {
         }
     };
     size_t pos = 0;
+    // Each added token's next occurrence at or after pos, found again only once pos passes it:
+    // searching every token from pos on each step rescanned the rest of the text every time.
+    std::vector<size_t> next_at(added_.size(), 0);
+    std::vector<bool> searched(added_.size(), false);
     while (pos < text.size()) {
         // The earliest added token at or after pos; ties go to the longest.
         size_t best = std::string::npos;
         const std::pair<std::string, int>* sp = nullptr;
-        for (const auto& s : added_) {
-            const size_t at = text.find(s.first, pos);
+        for (size_t i = 0; i < added_.size(); ++i) {
+            const auto& s = added_[i];
+            if (s.first.empty()) continue;  // matches everywhere and never advances
+            if (!searched[i] || (next_at[i] != std::string::npos && next_at[i] < pos)) {
+                next_at[i] = text.find(s.first, pos);
+                searched[i] = true;
+            }
+            const size_t at = next_at[i];
             if (at != std::string::npos && (best == std::string::npos || at < best)) {
                 best = at;
                 sp = &s;

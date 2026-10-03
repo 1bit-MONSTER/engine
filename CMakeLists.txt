@@ -315,6 +315,10 @@ set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.js
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")
 add_executable(tokenizer_test tests/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE onebit_npu)
+# Large inputs tokenize in linear time (a synthetic vocabulary, no model needed); runs in CI.
+add_executable(tokenizer_linear_test tests/tokenizer_linear_test.cpp)
+target_link_libraries(tokenizer_linear_test PRIVATE onebit_npu)
+add_test(NAME tokenizer_linear COMMAND tokenizer_linear_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_linear.json)
 if(ONEBIT_NPU_MODEL)
     add_test(NAME tokenizer_qwen3
              COMMAND tokenizer_test ${ONEBIT_NPU_MODEL}/tokenizer.json ${CMAKE_SOURCE_DIR}/tests/data/qwen3_tokenizer_golden.json)

@@ -20,7 +20,10 @@ The first --config is the baseline. Every config gets its own fresh `1bit serve`
 run interleaved round by round (A B A B ...), so drift on a shared box hits all of them alike,
 and each result is reported against the baseline measured in the same run. The tool, not the
 person reading the numbers, runs every measurement: prompt speed on one long prompt, decode
-speed on three chat prompts (code, prose, short), greedy, as `serve` reports them.
+speed on three chat prompts (code, prose, short), greedy, as `serve` reports them. `--prompts mixed`
+decodes nine ordinary prompts instead and reports their median, their range and the tokens delivered
+per second (generated tokens over prompt plus decode time), so a drafter that only shines on easy text
+cannot carry the number.
 
   tools/bench.py -m Qwen3.8-27B-Q4_0-H32.gguf \\
       --config base= --config dflash='--dflash Qwen3.8-27B-DFlash2-q8_0.gguf' \\
@@ -34,6 +37,19 @@ DECODE_PROMPTS = {
     "code": "Write a Python function that parses an ISO-8601 timestamp without using datetime, with tests.",
     "prose": "Explain how a B-tree insert works, step by step.",
     "short": "Translate to French: The quick brown fox jumps over the lazy dog, and then it goes home to sleep.",
+}
+# Nine everyday requests of different kinds, ours, for --prompts mixed. None asks for repetition, so a
+# speculative drafter is measured on text it has to predict.
+MIXED_PROMPTS = {
+    "cpp": "Write a C++17 function that merges two sorted std::vector<int> into one sorted vector, with a short test in main().",
+    "math": "A train leaves at 9:40 and travels 210 km at 84 km/h, then waits 25 minutes and covers another 63 km at 72 km/h. When does it arrive? Show the steps.",
+    "summary": "Summarize in five sentences why transformers replaced recurrent networks for language modelling.",
+    "spanish": "Escribe un párrafo en español explicando cómo funciona un transformador eléctrico de dos devanados.",
+    "chinese": "用中文简要解释什么是三相交流电，以及它为什么适合远距离输电。",
+    "json": "Return only JSON: an array of four fictional employees with name, role, start_date (YYYY-MM-DD) and a skills array.",
+    "story": "Write the opening of a short story about a lighthouse keeper who finds a radio that receives tomorrow's weather.",
+    "debug": "A Python web service leaks memory slowly under load. Give a numbered checklist for finding the cause.",
+    "email": "Draft a polite email asking a supplier to move a delivery from Tuesday to Thursday, giving a reason.",
 }
 
 
@@ -93,12 +109,18 @@ def serve(args, name, cfg_args, log_dir):
         log.close()
 
 
-def measure(port, args, prompt):
+def measure(port, args, prompt, decode_prompts):
     ask(port, "hi", 4, args.request_timeout)  # warm-up
     pp = [ask(port, prompt, 8, args.request_timeout)["prompt_per_second"] for _ in range(args.prompt_reps)]
-    tg = {k: [ask(port, p, args.decode_tokens, args.request_timeout)["predicted_per_second"]
-              for _ in range(args.decode_reps)] for k, p in DECODE_PROMPTS.items()}
-    return {"prompt": pp, **tg}
+    tg, tokens, ms = {}, 0, 0.0
+    for k, p in decode_prompts.items():
+        tg[k] = []
+        for _ in range(args.decode_reps):
+            t = ask(port, p, args.decode_tokens, args.request_timeout)
+            tg[k].append(t["predicted_per_second"])
+            tokens += t["predicted_n"]
+            ms += t["prompt_ms"] + t["predicted_ms"]
+    return {"prompt": pp, **tg, "delivered": [tokens / ms * 1000]}
 
 
 def main():
@@ -111,6 +133,8 @@ def main():
     ap.add_argument("--prompt-reps", type=int, default=5)
     ap.add_argument("--decode-reps", type=int, default=3)
     ap.add_argument("--decode-tokens", type=int, default=256)
+    ap.add_argument("--prompts", choices=("chat", "mixed"), default="chat",
+                    help="decode prompts: chat (code, prose, short) or mixed (nine ordinary requests, median and range)")
     ap.add_argument("--prompt-file", help="the long prompt (default: the first --prompt-chars of docs/*.md)")
     ap.add_argument("--prompt-chars", type=int, default=8000)
     ap.add_argument("--lock", help="hold this flock for the whole run (a box other jobs share)")
@@ -138,15 +162,46 @@ def main():
         print(f"waiting for {args.lock} ...", file=sys.stderr)
         fcntl.flock(lock, fcntl.LOCK_EX)
 
-    results = {name: {"prompt": [], **{k: [] for k in DECODE_PROMPTS}} for name, _ in configs}
+    decode_prompts = MIXED_PROMPTS if args.prompts == "mixed" else DECODE_PROMPTS
+    results = {name: {"prompt": [], "delivered": [], **{k: [] for k in decode_prompts}} for name, _ in configs}
     for rnd in range(args.rounds):
         for name, cfg_args in configs:
             print(f"round {rnd + 1}/{args.rounds}: {name} {shlex.join(cfg_args)}", file=sys.stderr)
             with serve(args, name, cfg_args, log_dir) as port:
-                for k, v in measure(port, args, prompt).items():
+                for k, v in measure(port, args, prompt, decode_prompts).items():
                     results[name][k] += v
 
     base = configs[0][0]
+    if args.prompts == "mixed":
+        print_mixed(args, configs, results, base)
+    else:
+        print_chat(args, configs, results, base)
+    if args.json:
+        pathlib.Path(args.json).write_text(json.dumps({
+            "model": args.model, "configs": {n: shlex.join(a) for n, a in configs}, "baseline": base,
+            "rounds": args.rounds, "prompts": args.prompts, "prompt_chars": len(prompt), "results": results,
+            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=1))
+    if lock:
+        lock.close()
+
+
+def print_mixed(args, configs, results, base):
+    # per prompt the median over reps, then the median and range over the nine prompts
+    def per_prompt(name):
+        return [statistics.median(v) for k, v in results[name].items() if k in MIXED_PROMPTS]
+    print(f"\n{args.model}: nine mixed prompts, {args.decode_tokens} tokens, greedy, tok/s; "
+          f"change against {base} (the first config) on the median\n")
+    print("| config | prompt (median) | decode median | decode range | delivered |")
+    print("|---|---|---|---|---|")
+    bmed = statistics.median(per_prompt(base))
+    for name, _ in configs:
+        pp, med = per_prompt(name), statistics.median(per_prompt(name))
+        delta = "" if name == base else f" ({(med / bmed - 1) * 100:+.1f}%)"
+        print(f"| {name} | {statistics.median(results[name]['prompt']):.1f} | {med:.1f}{delta} | "
+              f"{min(pp):.1f}-{max(pp):.1f} | {statistics.median(results[name]['delivered']):.1f} |")
+
+
+def print_chat(args, configs, results, base):
     cols = ["prompt"] + list(DECODE_PROMPTS)
     print(f"\n{args.model}: best / median over {args.rounds} round(s), tok/s, "
           f"change against {base} (the first config) on the median\n")
@@ -160,13 +215,6 @@ def main():
             delta = "" if name == base else f" ({(med / bmed - 1) * 100:+.1f}%)"
             cells.append(f"{max(v):.1f} / {med:.1f}{delta}")
         print(f"| {name} | " + " | ".join(cells) + " |")
-    if args.json:
-        pathlib.Path(args.json).write_text(json.dumps({
-            "model": args.model, "configs": {n: shlex.join(a) for n, a in configs}, "baseline": base,
-            "rounds": args.rounds, "prompt_chars": len(prompt), "results": results,
-            "time": time.strftime("%Y-%m-%dT%H:%M:%S%z")}, indent=1))
-    if lock:
-        lock.close()
 
 
 if __name__ == "__main__":

@@ -67,15 +67,53 @@ SITE = "https://1bit.gg/"
 OLD_SITE = "https://1bit-monster.github.io/1bit-MONSTER/"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
-TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade: HRX on the Radeon "
-           "iGPU with our Loom kernels, the XDNA 2 NPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
+TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade on AMD Strix Halo: "
+           "HRX with our Loom kernels on the Radeon iGPU, and the XDNA 2 NPU. Lemonade's own backends serve the rest.")
 # The home page's search and social description: the headline milestones, measured on Strix Halo
-# (docs/serve.md, docs/lean.md). Keep it <= 160 characters and update it with each milestone.
-HOME_DESCRIPTION = ("Local LLM inference for AMD Strix Halo inside Lemonade: HRX reads Qwen3.8-27B prompts "
-                    "at 335 tok/s and runs ZAYA1-8B at 90 tok/s. First release 4 Oct 2026.")
-HOME_KEYWORDS = ("LLM inference, AMD Ryzen AI, Strix Halo, Radeon 8060S, HRX, ggml-hrx, Loom kernels, XDNA 2 NPU, "
-                 "Lemonade, OpenAI-compatible API, GGUF, Qwen3.8, Zyphra ZAYA1, Unsloth dynamic GGUF, MTP, "
-                 "Hadamard Q4, Laya router, local AI, first release")
+# (README status, docs/hrx.md, blog/2026-10-04-first-release.md). Keep it <= 160 characters and
+# update it with each milestone.
+HOME_DESCRIPTION = ("1bit engine v2026.40: LLMs on AMD Strix Halo with HRX, inside Lemonade. Qwen3.8-27B "
+                    "prompts at 335 tok/s, gpt-oss-20b at 39 tok/s, ternary 27B in 5.5 GiB.")
+# Search terms the site has real content behind (each one is a docs page or a measured post).
+# Site-wide; docs pages add their own (DOC_KEYWORDS), posts use their tags.
+HOME_KEYWORDS = ("local LLM inference, AMD Strix Halo, Ryzen AI Max+ 395, Radeon 8060S, gfx1151, HRX, "
+                 "ggml-hrx, Loom kernels, llama.cpp, XDNA 2 NPU, Lemonade, OpenAI-compatible API, GGUF, "
+                 "ternary LLM, TQ1_0, TQ2_0, Ternary Bonsai, MXFP4, gpt-oss-20b, IQ2_XXS, Unsloth Dynamic GGUF, "
+                 "Qwen3.8-27B, ZAYA1-8B, MTP speculative decoding")
+# The release the site describes (docs/releases.md: v<ISO year>.<ISO week>); the home page's
+# JSON-LD links its GitHub release, so bump it with each release
+VERSION = "v2026.40"
+DISCORD = "https://discord.gg/fa5m4Vawpa"
+HF_ORG = "https://huggingface.co/1bit-MONSTER"
+# per-docs-page search terms, each one something the page covers (meta keywords and JSON-LD)
+DOC_KEYWORDS = {
+    "serve": "1bit serve, OpenAI-compatible API, local LLM server, chat completions, Lemonade backend",
+    "lemonade": "Lemonade server, Lemonade backend, onebit recipe, local LLM server, AMD",
+    "releases": "1bit engine release, v2026.40, Linux package, Windows, 1bit OS, Lemonade",
+    "bench": "LLM benchmark, tok/s, llama-bench, tools/bench.py, Strix Halo",
+    "recipes": "llama-server settings, micro-batch, tuned settings, Hadamard Q4_0, Strix Halo",
+    "npu": "XDNA 2 NPU, AMD NPU LLM, amdxdna, XRT, Ryzen AI NPU, Qwen3-0.6B",
+    "hrx": "HRX, ggml-hrx, Loom kernels, gfx1151, Radeon 8060S, llama.cpp AMD iGPU, Ternary Bonsai, Qwen3.8-27B",
+    "laya": "LLM router, request routing, Laya, ModernBERT classifier, 1bit serve --laya",
+    "moe-streaming": "MoE expert streaming, NVMe, mixture of experts, larger than memory",
+    "registry": "Hugging Face models, model registry, HF census, model architectures",
+    "windows": "1bit.exe, Windows LLM server, ONNX Runtime GenAI, CPU inference",
+    "onnx": "ONNX Runtime GenAI, ryzenai-server, ONNX LLM, CPU inference",
+    "tokenizers": "Hugging Face tokenizers, tokenizer.json, C++ tokenizer",
+    "kernel": "Linux kernel, amdxdna driver, amdgpu, Strix Halo kernel",
+    "apple": "Apple Silicon, MLX, lemon-mlx-engine, macOS LLM server",
+    "zinc": "ZINC, Zig GGUF engine, NVIDIA CUDA, Apple Metal",
+    "dwarfstar": "DwarfStar, ds4, DeepSeek V4 Flash, SSD expert streaming",
+    "comfyui": "ComfyUI.cpp, ComfyUI C++, Stable Diffusion 1.5",
+    "PORTING": "1bit engine porting map, 1bit-MONSTER",
+}
+# a page whose first paragraph is not the description search results should show
+DOC_DESCRIPTIONS = {
+    "overview": ("The 1bit engine runs LLMs on AMD Strix Halo inside Lemonade, behind an OpenAI-compatible "
+                 "API, on HRX for the Radeon 8060S iGPU and on the XDNA 2 NPU."),
+    "docs": ("How to run the 1bit engine on AMD Strix Halo: 1bit serve and Lemonade, HRX on the Radeon 8060S, "
+             "the XDNA 2 NPU, Laya routing, releases, and how we measure."),
+}
 
 # top bar: (label, page name or absolute URL)
 TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks", WIKI)]
@@ -84,7 +122,7 @@ TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks"
 NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases"),
                ("bench", "How we measure"), ("recipes", "Recipes")]),
-    ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
+    ("Devices", [("npu", "NPU"), ("hrx", "HRX (GPU)"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
                  ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
     ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),
@@ -194,7 +232,7 @@ def chat_widget():
     return (f'<script src="https://context7.com/widget.js" data-library="{library}" '
             'data-color="#1779e1" data-position="bottom-right" '
             'data-placeholder="Ask about the 1bit engine docs..." '
-            'data-welcome-message="Ask anything about the 1bit engine: install, serving, NPU, HRX, Vulkan, quantization." '
+            'data-welcome-message="Ask anything about the 1bit engine: install, serving, HRX, the NPU, quantization." '
             'async></script>')
 
 
@@ -215,7 +253,7 @@ def page_url(name):
     return SITE if name == "index" else f"{SITE}{name}.html"
 
 
-def seo_head(name, title, description, og_type, jsonld, noindex):
+def seo_head(name, title, description, og_type, jsonld, noindex, keywords=""):
     esc = lambda s: html.escape(s, quote=True)
     if noindex:
         return '<meta name="robots" content="noindex">'
@@ -231,6 +269,8 @@ def seo_head(name, title, description, og_type, jsonld, noindex):
             f'<meta name="twitter:title" content="{esc(title)}">',
             f'<meta name="twitter:description" content="{esc(description)}">',
             f'<meta name="twitter:image" content="{OG_IMAGE}">']
+    if keywords:
+        tags.append(f'<meta name="keywords" content="{esc(keywords)}">')
     if jsonld:
         # "</" cannot appear inside a script element
         tags.append('<script type="application/ld+json">' + json.dumps(jsonld, ensure_ascii=False).replace("</", "<\\/") + "</script>")
@@ -311,6 +351,16 @@ def clip(text, n=150):
     return text if len(text) <= n else text[:n].rsplit(" ", 1)[0] + "…"
 
 
+def breadcrumbs(*items):
+    """BreadcrumbList JSON-LD: items are (name, page name)."""
+    return {"@type": "BreadcrumbList", "itemListElement": [
+        {"@type": "ListItem", "position": i + 1, "name": n, "item": page_url(p)} for i, (n, p) in enumerate(items)]}
+
+
+PUBLISHER = {"@type": "Organization", "name": "1bit engine", "url": SITE, "logo": SITE + "assets/apple-touch-icon.png",
+             "sameAs": [REPO, DISCORD, HF_ORG]}
+
+
 def nav_groups(docs):
     placed = {name for _, items in NAV for name, _ in items}
     groups = [(t, [(n, l) for n, l in items if n in docs]) for t, items in NAV]
@@ -342,12 +392,12 @@ class Site:
         return "\n".join(out)
 
     def write(self, name, title, main, kind, section, description=TAGLINE, extra_head="",
-              og_type="website", jsonld=None, lastmod=None, noindex=False):
+              og_type="website", jsonld=None, lastmod=None, noindex=False, keywords=""):
         if not noindex:
             self.pages.append((page_url(name), lastmod or datetime.date.today().isoformat()))
         title, description = meta_title(title), meta_description(description)
         page = (self.template
-                .replace("{{seo}}", seo_head(name, title, description, og_type, jsonld, noindex))
+                .replace("{{seo}}", seo_head(name, title, description, og_type, jsonld, noindex, keywords))
                 .replace("{{title}}", html.escape(title))
                 .replace("{{description}}", html.escape(description, quote=True))
                 .replace("{{kind}}", kind)
@@ -400,8 +450,18 @@ class Site:
                 "</article>\n</div>")
         title = title_of(text)
         page_title = "Meet the engine" if title == "1bit engine" else title  # the README, not the home page
-        self.write(name, f"{page_title} · 1bit engine", main, "doc", section, first_paragraph(text) or TAGLINE,
-                   og_type="article", lastmod=last_commit_date(src))
+        description = meta_description(DOC_DESCRIPTIONS.get(name) or first_paragraph(text) or TAGLINE)
+        keywords = DOC_KEYWORDS.get(name) or HOME_KEYWORDS
+        lastmod = last_commit_date(src)
+        trail = [("1bit engine", "index")] + ([] if name == "overview" else [("Docs", "docs")]) + [(page_title, name)]
+        self.write(name, f"{page_title} · 1bit engine", main, "doc", section, description,
+                   og_type="article", lastmod=lastmod, keywords=keywords,
+                   jsonld={"@context": "https://schema.org", "@graph": [
+                       {"@type": "TechArticle", "headline": page_title, "description": description,
+                        "url": page_url(name), "mainEntityOfPage": page_url(name), "dateModified": lastmod,
+                        "image": OG_IMAGE, "inLanguage": "en", "keywords": keywords,
+                        "author": {"@type": "Person", "name": "bong-water-water-bong"}, "publisher": PUBLISHER},
+                       breadcrumbs(*trail)]})
 
     def docs_index(self):
         rows = []
@@ -413,10 +473,15 @@ class Site:
             rows.append("</tbody></table></div>")
         main = (f'<div class="container docs">\n{self.sidebar("docs")}\n<article class="docs-page prose">\n'
                 "<h1>Documentation</h1>\n"
-                f'<p class="lead">How to run the engine, what each device does, and how the pieces fit. '
+                f'<p class="lead">How to run the engine on AMD Strix Halo, what each device does, and how the pieces fit. '
                 f'Measured numbers are on the <a href="{WIKI}">wiki</a>.</p>\n' + "\n".join(rows) +
                 "\n</article>\n</div>")
-        self.write("docs", "Documentation · 1bit engine", main, "doc", "docs")
+        self.write("docs", "Docs: local LLMs on AMD Strix Halo · 1bit engine", main, "doc", "docs",
+                   DOC_DESCRIPTIONS["docs"], keywords=HOME_KEYWORDS,
+                   jsonld={"@context": "https://schema.org", "@graph": [
+                       {"@type": "CollectionPage", "name": "1bit engine documentation", "url": page_url("docs"),
+                        "description": DOC_DESCRIPTIONS["docs"], "publisher": PUBLISHER},
+                       breadcrumbs(("1bit engine", "index"), ("Docs", "docs"))]})
 
     # ── blog ──────────────────────────────────────────────────────────
     def blog(self):
@@ -444,14 +509,15 @@ class Site:
                     f'<nav class="pager">{link(newer, "prev", "Newer")}{link(older, "next", "Older")}</nav>\n'
                     "</div></article>")
             self.write(name, f"{title} · 1bit engine", main, "post", "blog", summary, og_type="article",
-                       lastmod=max(date, last_commit_date(src)),
-                       jsonld={"@context": "https://schema.org", "@type": "BlogPosting", "headline": title,
-                               "description": summary, "datePublished": date,
-                               "dateModified": max(date, last_commit_date(src)), "image": OG_IMAGE,
-                               "url": page_url(name), "mainEntityOfPage": page_url(name),
-                               "author": {"@type": "Person", "name": "bong-water-water-bong"},
-                               "publisher": {"@type": "Organization", "name": "1bit engine", "url": SITE},
-                               "keywords": ", ".join(tags)})
+                       lastmod=max(date, last_commit_date(src)), keywords=", ".join(tags),
+                       jsonld={"@context": "https://schema.org", "@graph": [
+                           {"@type": "BlogPosting", "headline": title,
+                            "description": meta_description(summary), "datePublished": date,
+                            "dateModified": max(date, last_commit_date(src)), "image": OG_IMAGE,
+                            "url": page_url(name), "mainEntityOfPage": page_url(name),
+                            "author": {"@type": "Person", "name": "bong-water-water-bong"},
+                            "publisher": PUBLISHER, "keywords": ", ".join(tags)},
+                           breadcrumbs(("1bit engine", "index"), ("Blog", "blog"), (title, name))]})
             rows.append((date, name, title, plain(lead), tags, self.md(lead + "\n\n" + body, src), summary))
 
         log = "\n".join(
@@ -467,8 +533,14 @@ class Site:
                 f'<div class="links"><a class="btn btn-ghost" href="feed.xml">Atom feed&nbsp;→</a>'
                 f'<a class="btn btn-ghost" href="{OLD_SITE}1bit-blog.html">1bit.MONSTER archive&nbsp;→</a></div></div>\n'
                 f"{log}\n</div></section>\n{self.archive()}")
-        self.write("blog", "Blog · 1bit engine", main, "blog", "blog", "Notes from building the 1bit engine: measured results on the NPU, HRX and Vulkan, "
-                   "speculative decoding, quantization and what ships each week.")
+        blog_description = ("Notes from building the 1bit engine on AMD Strix Halo: HRX and Loom kernels, the XDNA 2 NPU, "
+                            "ternary and low-bit GGUFs and speculative decoding, all measured.")
+        self.write("blog", "Blog: building an LLM engine for Strix Halo · 1bit engine", main, "blog", "blog",
+                   blog_description, keywords=HOME_KEYWORDS,
+                   jsonld={"@context": "https://schema.org", "@graph": [
+                       {"@type": "Blog", "name": "1bit engine blog", "url": page_url("blog"),
+                        "description": blog_description, "publisher": PUBLISHER},
+                       breadcrumbs(("1bit engine", "index"), ("Blog", "blog"))]})
 
         def stamp(d):
             return d + "T00:00:00Z"
@@ -528,12 +600,18 @@ class Site:
                 '<section class="section"><div class="container">\n'
                 '<span class="site-badge"><span class="dot"></span>site index</span>\n'
                 f'<div class="site-grid">{"".join(cards)}</div>\n</div></section>')
-        self.write("index", "1bit engine", main, "home", "", description=HOME_DESCRIPTION, jsonld={"@context": "https://schema.org", "@graph": [
-            {"@type": "WebSite", "name": "1bit engine", "url": SITE, "description": HOME_DESCRIPTION},
-            {"@type": "SoftwareSourceCode", "name": "1bit engine", "description": HOME_DESCRIPTION, "url": SITE,
+        self.write("index", "1bit engine: LLM inference on AMD Strix Halo with HRX", main, "home", "",
+                   description=HOME_DESCRIPTION, keywords=HOME_KEYWORDS, jsonld={"@context": "https://schema.org", "@graph": [
+            {"@type": "WebSite", "name": "1bit engine", "url": SITE, "description": HOME_DESCRIPTION, "publisher": PUBLISHER},
+            PUBLISHER,
+            {"@type": ["SoftwareApplication", "SoftwareSourceCode"], "name": "1bit engine",
+             "description": HOME_DESCRIPTION, "url": SITE, "softwareVersion": VERSION,
+             "applicationCategory": "DeveloperApplication", "operatingSystem": "Linux, Windows",
+             "downloadUrl": f"{REPO}/releases/tag/{VERSION}",
+             "offers": {"@type": "Offer", "price": "0", "priceCurrency": "USD"},
              "codeRepository": REPO, "license": "https://www.apache.org/licenses/LICENSE-2.0",
              "programmingLanguage": "C++", "runtimePlatform": "Linux",
-             "keywords": HOME_KEYWORDS}]})
+             "sameAs": [REPO, DISCORD, HF_ORG], "keywords": HOME_KEYWORDS}]})
 
     # ── 404 ───────────────────────────────────────────────────────────
     def not_found(self):

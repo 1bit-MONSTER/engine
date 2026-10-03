@@ -1,0 +1,9 @@
+Lemonade backend: openmoss (vulkan)
+Ship: yes
+Project: openmoss (MOSS-TTS runtime), https://github.com/pwilkin/openmoss
+Release: v0.3.0 (moss-tts-vulkan-linux-x64.tar.gz)
+License: Apache-2.0 (LICENSE; the release archive has none); bundled ggml and llama.cpp
+libraries MIT, the ggml authors.
+Model weights: none in the archive (MOSS-TTS weights are downloaded by Lemonade when used, under
+their own license).
+Source: https://github.com/pwilkin/openmoss/tree/v0.3.0

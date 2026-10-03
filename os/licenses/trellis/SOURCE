@@ -1,0 +1,10 @@
+Lemonade backend: trellis (vulkan)
+Ship: yes
+Project: trellis.cpp, https://github.com/pwilkin/trellis.cpp
+Release: v0.4.3 (trellis-vulkan-linux-x64.tar.gz)
+License: MIT, Copyright (c) 2026 Piotr Wilkin (LICENSE). The v0.4.3 tag has no LICENSE file; the
+author added this MIT LICENSE on 2026-08-01 (commit 6409621c, "the license was intended as MIT
+but the file was never committed"). Bundled ggml (pwilkin/ggml trellis-patches): MIT, the ggml authors.
+Model weights: none in the archive (TRELLIS weights are downloaded by Lemonade when used, under
+their own license).
+Source: https://github.com/pwilkin/trellis.cpp/tree/v0.4.3

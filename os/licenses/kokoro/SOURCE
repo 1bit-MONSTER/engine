@@ -1,0 +1,14 @@
+Lemonade backend: kokoro (cpu)
+Ship: yes (conditions: GPL-3.0 source availability, see os/LICENSES.md)
+Project: Kokoros, https://github.com/lemonade-sdk/Kokoros (fork of https://github.com/lucasjinreal/Kokoros)
+Release: b17 (kokoros-linux-x86_64.tar.gz)
+License: the repository has no LICENSE file; its README says "Copyright reserved by Lucas Jin
+under Apache License." (Kokoros-LICENSE-Apache-2.0 is that license's text).
+The koko binary statically links eSpeak NG (crate espeak-rs-sys 0.1.9, which builds
+https://github.com/espeak-ng/espeak-ng from source): GPL-3.0-or-later (espeak-ng-COPYING). The
+binary as a whole is therefore distributed under GPL-3.0-or-later, and espeak-ng-data/ is eSpeak
+NG's data, also GPL-3.0-or-later. It also links ONNX Runtime statically (crate ort 2.0.0-rc.11):
+MIT, Microsoft (onnxruntime-LICENSE).
+Model weights: none in the archive (Kokoro-82M is downloaded by Lemonade when used).
+Source: https://github.com/lemonade-sdk/Kokoros/tree/b17 (Cargo.lock pins every crate);
+eSpeak NG as packaged in https://crates.io/api/v1/crates/espeak-rs-sys/0.1.9/download

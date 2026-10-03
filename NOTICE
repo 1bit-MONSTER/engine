@@ -173,6 +173,18 @@ cpp-httplib (v0.47.0)
   License: MIT
 
 -------------------------------------------------------------------------------
+Redistributed on the 1bit OS image (os/mini/mkimage.sh)
+-------------------------------------------------------------------------------
+
+The 1bit OS image also carries, unmodified, Lemonade's backends (llama.cpp, the HRX
+llama.cpp build, whisper.cpp, stable-diffusion.cpp, Kokoros, Moonshine, ort-server,
+acestep.cpp, trellis.cpp, openmoss), Mesa's Radeon Vulkan driver, LLVM, BusyBox,
+Dropbear, the Linux kernel, firmware and Ubuntu system libraries. os/LICENSES.md lists
+each with its release, license and source; their license texts are on the image in
+/usr/share/licenses/1bit-os, /usr/share/doc/<package>/copyright and
+/data/lemonade/licenses.
+
+-------------------------------------------------------------------------------
 Tools that scripts under tools/ drive (installed separately, not redistributed)
 -------------------------------------------------------------------------------
 

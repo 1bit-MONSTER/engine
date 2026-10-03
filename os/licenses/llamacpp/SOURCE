@@ -1,0 +1,8 @@
+Lemonade backend: llamacpp (vulkan, cpu)
+Ship: yes
+Project: llama.cpp, https://github.com/ggml-org/llama.cpp
+Release: b10825 (llama-b10825-bin-ubuntu-vulkan-x64.tar.gz, llama-b10825-bin-ubuntu-x64.tar.gz)
+License: MIT, Copyright (c) 2023-2026 The ggml authors (LICENSE inside the backend directory)
+Vendored, also MIT: nlohmann/json (LICENSE-jsonhpp), cpp-httplib (cpp-httplib-LICENSE);
+miniaudio and stb are public domain / MIT-0.
+Source: https://github.com/ggml-org/llama.cpp/tree/b10825

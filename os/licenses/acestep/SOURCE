@@ -1,0 +1,9 @@
+Lemonade backend: acestep (vulkan)
+Ship: yes
+Project: acestep.cpp, https://github.com/pwilkin/acestep.cpp (fork of https://github.com/ServeurpersoCom/acestep.cpp)
+Release: v0.1.1 (acestep-vulkan-linux-x64.tar.gz)
+License: MIT, Copyright (c) 2023-2026 The acestep.cpp authors (LICENSE; the release archive has none);
+bundled ggml MIT, the ggml authors.
+Model weights: none in the archive (ACE-Step weights are downloaded by Lemonade when used, under
+their own license).
+Source: https://github.com/pwilkin/acestep.cpp/tree/v0.1.1

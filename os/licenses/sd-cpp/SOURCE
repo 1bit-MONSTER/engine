@@ -1,0 +1,9 @@
+Lemonade backend: sd-cpp (vulkan, cpu)
+Ship: yes
+Project: stable-diffusion.cpp, https://github.com/leejet/stable-diffusion.cpp
+Release: master-843-462d675 (sd-master-462d675-bin-Linux-Ubuntu-24.04-x86_64-{vulkan,...}.zip)
+License: MIT, Copyright (c) 2023 leejet (stable-diffusion.cpp.txt inside the backend directory);
+ggml MIT, the ggml authors (ggml.txt inside the backend directory)
+Bundled: libwebp, libsharpyuv, libwebpmux (BSD-3-Clause, Google; libwebp-COPYING, libwebp-PATENTS),
+libwebm (BSD-3-Clause, Google; libwebm-LICENSE.TXT)
+Source: https://github.com/leejet/stable-diffusion.cpp/releases/tag/master-462d675

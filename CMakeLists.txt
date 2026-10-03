@@ -98,6 +98,10 @@ add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
+# Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
+add_executable(http_guard_test tests/http_guard_test.cpp)
+target_include_directories(http_guard_test PRIVATE app)
+add_test(NAME http_guard COMMAND http_guard_test)
 # general.architecture from a GGUF header (app/gguf_meta.h), which routes fork-only
 # architectures to our llama.cpp; header only, runs in CI.
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)

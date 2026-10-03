@@ -18,19 +18,19 @@ limitations under the License.
 # Recipes: tuned backend settings, as data
 
 A setting that makes one model faster on one route can make another slower. For example, on the
-removed lean ROCm route 1024-token micro-batches sped up a Hadamard-rotated MoE model's prompts by
-3-8% and slowed the dense Qwen3.8-27B's by 4%. `1bit serve` keeps such settings in
+removed lean ROCm route 1024-token micro-batches sped up one MoE model's prompts by 3-8% and slowed
+the dense Qwen3.8-27B's by 4%. `1bit serve` keeps such settings in
 `config/recipes.json`, not in code. Each recipe says what it matches, what it adds, why, and the
 measurement behind it:
 
 ```json
 {
-  "id": "dflash-p-min-0",
-  "match": {"drafter": ["dflash"]},
-  "args": ["--spec-draft-p-min", "0"],
-  "why": "A DFlash block is only worth drafting whole. ...",
-  "measured": "Qwen3.8-27B-H32 + DFlash2 on the lean ROCm route (removed in RFC #213 stage 3): ...",
-  "source": "engine #194"
+  "id": "example",
+  "match": {"device": ["hrx"], "drafter": ["dflash"]},
+  "args": ["--spec-draft-p-min", "0.4"],
+  "why": "what the setting does for this match",
+  "measured": "the model, file, settings and numbers, measured with tools/bench.py",
+  "source": "the PR that added it"
 }
 ```
 
@@ -44,7 +44,6 @@ recipe against the launch:
 | `device` | the backend's device is in the list |
 | `architecture` | the file's `general.architecture` is in the list |
 | `moe` | the file has (`true`) or lacks (`false`) an `<architecture>.expert_count` above 0 |
-| `hadamard_q4_0` | the file is (`true`) or is not (`false`) stamped by `tools/hadamard_q4_0.py` |
 | `drafter` | the drafter is in the list: `none`, `mtp` (`--mtp`) or `dflash` (`--dflash`) |
 
 A key that is left out matches anything. A matching recipe adds each flag in `args`, with the
@@ -53,7 +52,7 @@ sets itself, including from the command line (`--mtp-p-min`, `--mmproj`'s micro-
 It adds each variable in `env` unless it is already set. Serve prints what it added:
 
 ```
-1bit serve: recipe dflash-p-min-0: --spec-draft-p-min 0
+1bit serve: recipe example: --spec-draft-p-min 0.4
 ```
 
 - `--recipes FILE` replaces the built-in set with the recipes in FILE.
@@ -64,18 +63,15 @@ It adds each variable in `env` unless it is already set. Serve prints what it ad
 
 ## The built-in recipes
 
-| id | Matches | Adds | Measured |
-|---|---|---|---|
-| `dflash-p-min-0` | `--dflash` | `--spec-draft-p-min 0` | Qwen3.8-27B-H32 + DFlash2: accepted block 5.4 -> 6.7 tokens on code (the ROCm tree's default 0.75 cut it). Our HRX llama.cpp defaults to 0 already, so on HRX it pins the value; not yet re-measured there |
-
-The two ROCm-only recipes, `rotated-moe-ub1024` and `rocm-dflash-p-min-0.4`, left with the ROCm
-build (RFC #213 stage 3).
+None, for now. Every recipe the engine had was measured on a build RFC #213 stage 3 removed:
+`rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build) and `dflash-p-min-0` (a no-op
+on our HRX llama.cpp, whose default draft p-min is already 0). New ones come with HRX measurements.
 
 Recipes apply in file order. The first recipe to add a flag wins, so a narrower recipe goes before
 a broader one for the same flag.
 
-Settings that follow from the files themselves stay in serve's code. Examples: the Hadamard
-activation rotation a stamped file needs, and the DFlash draft length, which is the drafter's
+Settings that follow from the files themselves stay in serve's code. Examples: the 2-bit decode
+copy a ternary Q4_0 file gets on HRX0, and the DFlash draft length, which is the drafter's
 `dflash.block_size` minus one.
 
 ## Adding or changing a recipe

@@ -63,7 +63,7 @@ ExternalProject_Add(llama_hrx
         -DHRX_SOURCE_DIR=${CMAKE_SOURCE_DIR}/third_party/hrx-system
         -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench llama-quantize
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
     USES_TERMINAL_BUILD ON)

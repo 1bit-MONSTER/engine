@@ -69,12 +69,12 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 
 | Case | `auto` |
 |---|---|
-| an architecture our llama.cpp does not map (Qwen3.8-Flash-Next's `qwen4exp`; Zyphra Zamba, Zamba2, BlackMamba; Spark2.5, BailingMoeV3, HRM text, MuseGlimmer, Kimi K3, Maple, GraniteSwitch, Granite SWA, HY v4, MiniMax, Dots3 Note, PocketTTS, Qwen3-TTS) | refused, on every device, pointing at Lemonade's llamacpp backend; Zyphra and Flash-Next are to be ported to HRX |
+| an architecture our llama.cpp does not build: anything outside `gguf_architectures.hrx` in registry/architectures.json, which `tools/registry_build.py` reads from the pinned fork and the build compiles in (among them Qwen3.8-Flash-Next's `qwen4exp`; Zyphra Zamba, Zamba2, BlackMamba; Spark2.5, BailingMoeV3, HRM text, MuseGlimmer, Kimi K3, Maple, GraniteSwitch, Granite SWA, HY v4, MiniMax, Dots3 Note, PocketTTS, Qwen3-TTS) | refused on hrx and cpu, pointing at Lemonade's llamacpp backend; Zyphra and Flash-Next are to be ported to HRX |
 | `--moe-slots` | refused: not in this build ([below](#moe-models-larger-than-memory---moe-slots)) |
-| `--parallel N` > 1 on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) | refused: HRX runs one such sequence at a time; leave `--parallel` off, or ask for `--device cpu` |
-| `--mmproj` | the CPU, with a note on stderr: vision on HRX is an open RFC #213 gate; `--device hrx --mmproj` tries it |
+| `--parallel N` > 1 on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) | HRX0 with one slot, and a warning on stderr: HRX runs one such sequence at a time (no multi-sequence delta-net yet). `--device cpu` keeps `--parallel N` |
+| `--mmproj` | HRX0. **Unverified:** vision on HRX is an open RFC #213 gate, to be checked on ZAYA1-VL; if it fails there, `auto` goes back to the CPU for `--mmproj` |
 | `--mtp` | HRX0 (it drafts slower there than Vulkan did: its verify batches of 2-4 tokens are the open item, docs/hrx.md) |
-| a Hadamard-rotated Q4_0 (`tools/hadamard_q4_0.py`) | HRX0 (it went to the lean ROCm build before) |
+| an H32 file (a Hadamard-rotated Q4_0 stamped `onebit.hadamard_q4_0`) | refused on every device: the format is dropped; use the model's UD-Q4_K_XL or another standard GGUF. PrismML's own rotation (`prism.hadamard`, Ternary Bonsai) is a different thing and still runs on HRX ([hrx.md](hrx.md#ternary-bonsai-prismmls-hadamard-folded-ggufs)) |
 
 ### Removed devices and flags
 
@@ -93,7 +93,8 @@ when asked for any of these:
 | `--long-model`, `--long-from` | long conversations to a Hadamard-rotated Q4_0 on the ROCm W4A4 route |
 
 The DFlash2 one-server route (a Hadamard-rotated file with W4A4 prompts and DFlash2 decode on ROCm)
-went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min-0.4`). `--dflash`
+went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min-0.4`), and so did
+the H32 format it served (`tools/hadamard_q4_0.py` is removed; serve refuses those files). `--dflash`
 itself stays, on HRX and the CPU.
 
 A build without the private add-on answers a Qwen3.6-35B-A3B directory with "the
@@ -242,11 +243,10 @@ short answers (the translation prompt stops after ~16 tokens, too few to fill bl
 drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A drafted token is
 kept only when the model agrees, so the output is the model's own.
 
-`--dflash` gets `--spec-draft-p-min 0` from a [recipe](recipes.md) unless `--mtp-p-min` is given,
-and without `--mtp-max` drafts the drafter's block minus one (its `dflash.block_size`; 16 when the
-file does not say). Any drafter type works next to a Hadamard-rotated file, plain Q4_0 included:
-the backend rotates the activations of the rotated file's weights only. (The DFlash2 one-server
-route on the lean ROCm build is gone, above.)
+Without `--mtp-max`, `--dflash` drafts the drafter's block minus one (its `dflash.block_size`; 16
+when the file does not say). Our HRX llama.cpp's default draft p-min is already 0, which keeps
+DFlash blocks whole; `--mtp-p-min` sets another. (The DFlash2 one-server route on the lean ROCm
+build is gone, above.)
 
 ## Recipes (`--recipes`, `--no-recipes`)
 

@@ -25,6 +25,9 @@ Every entry is read from a pinned source, never typed in by hand:
   means "runs on the CPU route".
   (The vulkan column, the upstream llama.cpp release the engine built for Vulkan, left with that
   build in RFC #213 stage 3.)
+- gguf_architectures.hrx: every GGUF architecture the fork's runtime builds a model for, whether
+  or not a converter class names it. CMakeLists.txt compiles it into `1bit serve`, which refuses
+  any other architecture on hrx and cpu (app/serve.cpp, refuse_missing_arch).
 - zinc: the GGUF architecture is one ZINC's parseArchitecture (src/model/config.zig) accepts.
 - npu: the fast lane's model types (NPU_MODEL_TYPES below, matching npu/). The NPU runs Q4NX
   model directories, so it matches on HF model_type, not on a GGUF architecture.
@@ -184,6 +187,7 @@ def build():
         "counts": {b: sum(b in a["backends"] for a in archs.values()) for b in ("hrx", "npu", "zinc")}
                   | {"architectures": len(archs), "mapped": sum(bool(a["backends"]) for a in archs.values())},
         "architectures": archs,
+        "gguf_architectures": {"hrx": sorted(run_hrx)},
     }
 
 

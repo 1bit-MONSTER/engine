@@ -43,7 +43,10 @@ converter registers: 33 classes, 23 of them for architectures the HRX fork does 
 them `qwen4exp`, `zamba`, `zamba2`, `blackmamba`) and 10 aliases of architectures it does run
 (DFlash drafters, `exaone-moe`, `nemotron_h_moe`), which a GGUF converted elsewhere still runs on.
 
-On 2026-10-03 (RFC #213 stage 3): 290 HF architectures mapped, hrx 290, zinc 63, npu 7. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
+On 2026-10-03 (RFC #213 stage 3): 290 HF architectures mapped, hrx 290, zinc 63, npu 7. The file
+also lists `gguf_architectures.hrx`, every GGUF architecture the pinned fork's runtime builds (141
+then): CMakeLists.txt compiles that list into `1bit serve`, which refuses any other architecture on
+hrx and cpu with a pointer to Lemonade's llamacpp backend. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
 
 **Reviewed gaps.** Some unmapped architectures only look like a supported family. [Architecture gaps](arch-gaps.md) records why each of them is not an alias. `registry/significant.json` lists those classes, and `tools/registry_build.py --check-gaps` (ctest `registry_gaps`) fails if one becomes mapped without a recorded reason.
 

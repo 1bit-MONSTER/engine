@@ -426,12 +426,9 @@ if(ONEBIT_NPU)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
-    set(ONEBIT_NPU_REFERENCE "" CACHE PATH "Reference lane's logits for the anchor prompt")
-    if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_KERNELS AND ONEBIT_NPU_REFERENCE)
-        add_test(NAME npu_lane_e2e
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lane_e2e.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_KERNELS} ${ONEBIT_NPU_REFERENCE})
-    endif()
+    # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
+    # and its reference logits are lost. The NPU check is the private dx add-on's from-source
+    # check, outside this repository (docs/npu.md, "Checking the NPU").
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

@@ -64,4 +64,4 @@ sudo apt install ./linux-image-7.3.0-rc4-1bit_*.deb ./linux-headers-7.3.0-rc4-1b
 ```
 
 After the reboot, rerun the hardware tests: `amdxdna` loads,
-`tests/npu_lane_e2e.sh` (24/24) and `tests/serve_e2e.sh` on every device.
+the NPU check (docs/npu.md, "Checking the NPU") and `tests/serve_e2e.sh` on every device.

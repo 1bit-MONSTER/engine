@@ -92,4 +92,4 @@ jobs:
             --title "Bump Linux: ${TAG}" \
             --body "Moves third_party/linux from \`${OURS:0:12}\` to upstream tag \`${TAG}\` (\`${UPSTREAM:0:12}\`).
 
-          CI here cannot boot a kernel. Before merging: \`scripts/build-kernel.sh <out>\`, install the linux-image/linux-headers packages on Strix Halo (docs/kernel.md), reboot, and rerun tests/npu_lane_e2e.sh and the Lemonade e2e tests."
+          CI here cannot boot a kernel. Before merging: \`scripts/build-kernel.sh <out>\`, install the linux-image/linux-headers packages on Strix Halo (docs/kernel.md), reboot, and rerun the NPU check (docs/npu.md, \"Checking the NPU\") and the Lemonade e2e tests."

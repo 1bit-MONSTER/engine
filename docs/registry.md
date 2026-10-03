@@ -32,13 +32,18 @@ hand:
 
 | Backend | Accepts the architecture when |
 |---|---|
-| HF -> GGUF | a `@ModelBase.register(...)` class in llama.cpp's converter names it (upstream pin, then the HRX fork) |
-| `vulkan` | the GGUF architecture is in the upstream pin's `src/llama-arch.cpp` |
-| `hrx` | the GGUF architecture is in our HRX fork's `src/llama-arch.cpp` |
+| HF -> GGUF | a `@ModelBase.register(...)` class in our HRX fork's llama.cpp converter names it |
+| `hrx` | the GGUF architecture is in our HRX fork's `src/llama-arch.cpp`; the same llama-server runs it on the CPU (`--device cpu`), so `hrx` also means the CPU route |
 | `zinc` | ZINC's `parseArchitecture` accepts the GGUF architecture |
 | `npu` | the fast lane's model type: `qwen3` (the lane kernels are built for Qwen3-0.6B's shapes) |
 
-On 2026-09-26: 323 HF architectures mapped, vulkan 323, hrx 300, zinc 64, npu 1. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
+The `vulkan` column (the upstream llama.cpp release the engine built for Vulkan) left with that
+build in RFC #213 stage 3. With it went the HF class names only the upstream
+converter registers: 33 classes, 23 of them for architectures the HRX fork does not run (among
+them `qwen4exp`, `zamba`, `zamba2`, `blackmamba`) and 10 aliases of architectures it does run
+(DFlash drafters, `exaone-moe`, `nemotron_h_moe`), which a GGUF converted elsewhere still runs on.
+
+On 2026-10-03 (RFC #213 stage 3): 290 HF architectures mapped, hrx 290, zinc 63, npu 7. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
 
 **Reviewed gaps.** Some unmapped architectures only look like a supported family. [Architecture gaps](arch-gaps.md) records why each of them is not an alias. `registry/significant.json` lists those classes, and `tools/registry_build.py --check-gaps` (ctest `registry_gaps`) fails if one becomes mapped without a recorded reason.
 
@@ -50,15 +55,19 @@ included. The architecture recorded is the one the backend loads: the GGUF
 `general.architecture`, or the NPU directory's `model_type`. Checked on Strix Halo
 2026-09-25, engine `8c2805d` (hrx rows at the llama.cpp pin `96f6b89`):
 
-| GGUF architecture | Model | vulkan | hrx | zinc | npu |
-|---|---|---|---|---|---|
-| `qwen3` | Qwen3-0.6B | pass | pass | pass | pass |
-| `qwen2` | Qwen2.5-7B-Instruct | pass | pass | fails: crashes at load | |
-| `qwen3moe` | Qwen3-Coder-30B-A3B | pass | pass | pass | |
-| `qwen35moe` | Qwen3.6-35B-A3B Q8_0 | pass | pass | pass | |
-| `deepseek2` | GLM-4.7-Flash | pass | pass | not mapped | |
-| `minicpm` | MiniCPM4-8B | pass | pass | not mapped | |
-| `llama` | MiniCPM5-1B | pass | pass | fails: empty reply | |
+| GGUF architecture | Model | hrx | zinc | npu |
+|---|---|---|---|---|
+| `qwen3` | Qwen3-0.6B | pass | pass | pass |
+| `qwen2` | Qwen2.5-7B-Instruct | pass | fails: crashes at load | |
+| `qwen3moe` | Qwen3-Coder-30B-A3B | pass | pass | |
+| `qwen35moe` | Qwen3.6-35B-A3B Q8_0 | pass | pass | |
+| `deepseek2` | GLM-4.7-Flash | pass | not mapped | |
+| `minicpm` | MiniCPM4-8B | pass | not mapped | |
+| `llama` | MiniCPM5-1B | pass | fails: empty reply | |
+
+(The vulkan rows, which passed on the same date, were dropped from `registry/check_models.tsv` and
+`registry/checked.json` with the Vulkan build, as were the Zyphra Zamba rows, which ran on Vulkan
+only.)
 
 Both ZINC failures come from upstream ZINC, pinned at `3a35e76`:
 - **Qwen2.5-7B crashes at load (exit 136, SIGFPE in RADV).** ZINC sizes its DMMV shaders'
@@ -101,7 +110,6 @@ The census of 2026-09-27 (the first full sweep ran 2026-09-25), with `registry/c
 
 | Backend | Mapped | Checked |
 |---|---|---|
-| vulkan | 94.88% | 64.33% |
 | hrx | 94.78% | 64.32% |
 | zinc | 69.83% | 10.28% |
 | npu | 9.29% | 9.29% |

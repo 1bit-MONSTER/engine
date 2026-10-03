@@ -17,7 +17,7 @@ limitations under the License.
 
 # Windows
 
-`1bit.exe` runs on Windows 10 and later (x64): `1bit serve` with GGUF models on the CPU (`--device cpu`, which `auto` picks) and ONNX Runtime GenAI models (`--device onnx`, on the CPU), `1bit route` (Laya) and `1bit comfy`. It is cross-built on Linux. There is no GPU route on Windows for now: the engine's GPU route is HRX, which has no Windows build yet, and Vulkan is leaving the engine (RFC #213). There is no NPU lane, ROCm or ZINC on Windows yet.
+`1bit.exe` runs on Windows 10 and later (x64): `1bit serve` with GGUF models on the CPU (`--device cpu`, which `auto` picks) and ONNX Runtime GenAI models (`--device onnx`, on the CPU), `1bit route` (Laya) and `1bit comfy`. It is cross-built on Linux. There is no GPU route on Windows for now: the engine's GPU route is HRX, which has no Windows build yet, and the engine builds no Vulkan (RFC #213 stage 3). There is no NPU lane, ROCm or ZINC on Windows yet.
 
 ```sh
 scripts/build-windows.sh <out-dir>     # ~2 min on Strix Halo once the downloads are cached
@@ -25,7 +25,7 @@ scripts/build-windows.sh <out-dir>     # ~2 min on Strix Halo once the downloads
 
 The script writes:
 - **`<out-dir>/1bit.exe`** (3.2 MB). It imports only `KERNEL32`, `WS2_32` and the UCRT that ships with Windows 10.
-- **`<out-dir>/llama-server.exe`**, the llama.cpp pin (`third_party/llama.cpp-vulkan`) built for Windows, for the CPU.
+- **`<out-dir>/llama-server.exe`**, the engine's llama.cpp pin (`third_party/llama.cpp`, the tree the HRX build uses) built for Windows with `GGML_HRX=OFF` and `GGML_VULKAN=OFF`, for the CPU. Until RFC #213 stage 3 it came from the upstream Vulkan pin (`third_party/llama.cpp-vulkan`), now removed.
 - **`<out-dir>/ryzenai-server.exe`** (the ONNX backend, [ONNX Runtime](onnx.md)), with Microsoft's `onnxruntime-genai.dll`, `onnxruntime.dll` and `onnxruntime_providers_shared.dll` beside it.
 
 Keep them together. `1bit.exe serve -m model.gguf` finds `llama-server.exe` next to itself, and `1bit.exe serve -m <dir with genai_config.json>` finds `ryzenai-server.exe`. `--llama-server PATH`, `ONEBIT_LLAMA_SERVER` and `ONEBIT_ONNX_SERVER` name other ones.

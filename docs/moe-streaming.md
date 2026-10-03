@@ -20,13 +20,23 @@ limitations under the License.
 The goal: run mixture-of-experts models larger than Strix Halo's 128 GB. Only the experts a
 token routes to are needed. The hot ones stay in RAM, and the rest come from the NVMe drive
 as the router asks for them. The work splits three ways:
-- the dense layers (attention, shared experts, embeddings) on the GPU (HRX or Vulkan);
+- the dense layers (attention, shared experts, embeddings) on the GPU (HRX; Vulkan in the
+  measurements below);
 - the routed experts wherever they run fastest: NPU (native int8 x int4) or GPU;
 - the NVMe feeding the cache.
 
 This page holds the measurements, the expert cache (`moe/`, `1bit moe-cache`), streaming in
 decode (`1bit serve --moe-slots`) and the
 tools that produced them (`tools/moe_trace.cpp`, `moe_policy.cpp`, `moe_expert_bench.cpp`).
+
+**Status (RFC #213 stage 3).** `--moe-slots` is kept: the option, its
+`--moe-subst` / `--moe-prefetch` companions and serve's code for them stay. The streamer itself
+lives in the llama.cpp Vulkan pin (`1bit/moe-stream`), which the engine no longer builds, so a
+build without it refuses `--moe-slots` with "not available in this build". It moves to HRX
+together with Qwen3.8-Flash-Next (`qwen4exp`); serve's HRX path for it sits behind
+`ONEBIT_MOE_STREAMING_HRX` until the HRX llama.cpp reads `ONEBIT_MOE_FILE` / `ONEBIT_MOE_SLOTS`.
+The `moe/` library and `1bit moe-cache` are unaffected. The measurements below were taken on
+Vulkan0 before the removal and are kept as the record.
 
 ## What one token needs
 
@@ -445,8 +455,8 @@ below the floor.
 
 ## Streaming in the inference path
 
-`1bit serve --moe-slots N` (docs/serve.md) streams the routed experts of each MoE layer from
-the model file while it decodes. The llama.cpp Vulkan pin (fork PR #19, `1bit/moe-stream`)
+`1bit serve --moe-slots N` (docs/serve.md) streamed the routed experts of each MoE layer from
+the model file while it decoded (not in this build; see Status above). The llama.cpp Vulkan pin (fork PR #19, `1bit/moe-stream`)
 does the work, driven by environment variables that `serve` sets (`ONEBIT_MOE_FILE`,
 `ONEBIT_MOE_SLOTS`; `src/llama-moe-stream.h` lists the rest). The expert tensors load on the
 CPU memory-mapped (`-ot exps=CPU --no-host --no-repack --load-mode mmap`), so their pages are

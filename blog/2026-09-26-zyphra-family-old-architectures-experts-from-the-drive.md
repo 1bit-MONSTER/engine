@@ -43,14 +43,14 @@ ZAYA1-8B already ran on Vulkan, HRX and ROCm. The rest of the family followed:
 Adding the vision model left ZAYA1-8B's text path unchanged. Its wikitext perplexity is
 identical on Vulkan (21.5731, and 21.6213 with four sequences per batch) and HRX (21.5518), and
 it still agrees with transformers at 95/96. Serve the vision models with `1bit serve --mmproj`
-([docs/vulkan.md](../docs/vulkan.md#zaya1-vl-8b-images)).
+([docs/vulkan.md](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md#zaya1-vl-8b-images)).
 
 ## Four older architectures
 
 OPT, GPT-Neo, CodeGen and GPT-J now run from our llama.cpp. We checked each port against
 transformers FP32 before it merged. CodeGen started at 0/96: its fused projection stores query,
 value and key in that order, not query, key, value. After the fix all four agree at every
-checked position ([docs/vulkan.md](../docs/vulkan.md#opt-gpt-neo-codegen-and-gpt-j-from-our-llamacpp)).
+checked position ([docs/vulkan.md](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md#opt-gpt-neo-codegen-and-gpt-j-from-our-llamacpp)).
 With them, the model registry maps 323 Hugging Face architectures to a backend. "Mapped" means
 a backend's code accepts the architecture; the census reports separately how many have been
 checked ([docs/registry.md](../docs/registry.md)).

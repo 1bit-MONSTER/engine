@@ -70,7 +70,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade: HRX on the Radeon "
            "iGPU with our Loom kernels, the XDNA 2 NPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
 # The home page's search and social description: the headline milestones, measured on Strix Halo
-# (docs/serve.md, docs/lean.md). Keep it <= 160 characters and update it with each milestone.
+# (docs/serve.md, docs/hrx.md). Keep it <= 160 characters and update it with each milestone.
 HOME_DESCRIPTION = ("Local LLM inference for AMD Strix Halo inside Lemonade: HRX reads Qwen3.8-27B prompts "
                     "at 335 tok/s and runs ZAYA1-8B at 90 tok/s. First release 4 Oct 2026.")
 HOME_KEYWORDS = ("LLM inference, AMD Ryzen AI, Strix Halo, Radeon 8060S, HRX, ggml-hrx, Loom kernels, XDNA 2 NPU, "
@@ -84,8 +84,7 @@ TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks"
 NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases"),
                ("bench", "How we measure"), ("recipes", "Recipes")]),
-    ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
-                 ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
+    ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
     ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),
 ]
@@ -194,7 +193,7 @@ def chat_widget():
     return (f'<script src="https://context7.com/widget.js" data-library="{library}" '
             'data-color="#1779e1" data-position="bottom-right" '
             'data-placeholder="Ask about the 1bit engine docs..." '
-            'data-welcome-message="Ask anything about the 1bit engine: install, serving, NPU, HRX, Vulkan, quantization." '
+            'data-welcome-message="Ask anything about the 1bit engine: install, serving, NPU, HRX, quantization." '
             'async></script>')
 
 
@@ -467,7 +466,7 @@ class Site:
                 f'<div class="links"><a class="btn btn-ghost" href="feed.xml">Atom feed&nbsp;→</a>'
                 f'<a class="btn btn-ghost" href="{OLD_SITE}1bit-blog.html">1bit.MONSTER archive&nbsp;→</a></div></div>\n'
                 f"{log}\n</div></section>\n{self.archive()}")
-        self.write("blog", "Blog · 1bit engine", main, "blog", "blog", "Notes from building the 1bit engine: measured results on the NPU, HRX and Vulkan, "
+        self.write("blog", "Blog · 1bit engine", main, "blog", "blog", "Notes from building the 1bit engine: measured results on the NPU and HRX, "
                    "speculative decoding, quantization and what ships each week.")
 
         def stamp(d):

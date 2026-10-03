@@ -36,7 +36,7 @@ sys.path.insert(0, os.path.join(ROOT, "tools"))
 import census_watch as cw  # noqa: E402
 
 ARCHS = {
-    "Qwen3ForCausalLM": {"gguf": "qwen3", "backends": ["vulkan", "hrx"]},
+    "Qwen3ForCausalLM": {"gguf": "qwen3", "backends": ["hrx"]},
     "EmptyForCausalLM": {"gguf": "empty", "backends": []},
 }
 SIG = {"Qwen3_5MVLAAbsorbedForCausalLM": {"model_type": "qwen3_5_text", "family": "Qwen3.5 MVLA"}}

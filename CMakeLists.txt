@@ -80,7 +80,6 @@ add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
-add_test(NAME long_route COMMAND ${CMAKE_SOURCE_DIR}/tests/long_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
@@ -96,64 +95,21 @@ add_test(NAME gguf_meta COMMAND gguf_meta_test)
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
 set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 
-# ── Vulkan from upstream llama.cpp (docs/vulkan.md) ──────────────────────
-# Off by default: it needs the Vulkan SDK (headers, loader, glslc). Builds
-# llama-server from third_party/llama.cpp-vulkan (ggml-org's latest release),
-# and `1bit serve --device vulkan` then uses it; --device hrx keeps AMD's pair.
-option(ONEBIT_VULKAN "Build a Vulkan llama-server from upstream llama.cpp" OFF)
-if(ONEBIT_VULKAN)
-    include(cmake/vulkan.cmake)
-    add_dependencies(onebit llama_vulkan)
-    target_compile_definitions(onebit PRIVATE ONEBIT_VULKAN_SERVER="${ONEBIT_VULKAN_SERVER}")
-    if(ONEBIT_SERVE_TEST_GGUF)
-        add_test(NAME serve_e2e_vulkan_upstream
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan)
-    endif()
-endif()
-
-# ── The lean option: ROCmFPX's formats (docs/lean.md) ─────────────────────
-# Off by default. Builds llama-server + llama-quantize from third_party/llama.cpp-rocmfpx
-# on Vulkan: `1bit serve --lean` runs ROCmFP4 files with it. ONEBIT_LEAN_ROCM adds the
-# ROCm build with the gfx1151 W4A4 path, for ROCmI4 files (`--lean --device rocm`).
-option(ONEBIT_LEAN "Build the lean (ROCmFPX) llama-server on Vulkan" OFF)
-option(ONEBIT_LEAN_ROCM "Also build the lean llama-server on ROCm (W4A4, needs TheRock)" OFF)
-set(ONEBIT_SERVE_TEST_LEAN_GGUF "" CACHE FILEPATH "ROCmFP4 GGUF the lean serve_e2e test loads")
-if(ONEBIT_LEAN)
-    include(cmake/lean.cmake)
-    add_dependencies(onebit llama_lean)
-    target_compile_definitions(onebit PRIVATE ONEBIT_LEAN_SERVER="${ONEBIT_LEAN_SERVER}")
-    if(ONEBIT_LEAN_ROCM)
-        add_dependencies(onebit llama_lean_rocm)
-        target_compile_definitions(onebit PRIVATE ONEBIT_LEAN_ROCM_SERVER="${ONEBIT_LEAN_ROCM_SERVER}")
-    endif()
-    if(ONEBIT_SERVE_TEST_LEAN_GGUF)
-        add_test(NAME serve_e2e_lean
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_LEAN_GGUF} vulkan --lean)
-    endif()
-endif()
-
-# ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
-# Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
-# only runs on AMD GPUs. `1bit serve` then uses this llama-server for both
-# the llamacpp-hrx recipe (HRX0) and the llamacpp recipe's Vulkan backend.
-option(ONEBIT_HRX "Build HRX + Vulkan llama-server and wire it into Lemonade" OFF)
+# ── Step 2: HRX, the engine's GPU route (docs/hrx.md) ─────────────────────
+# Off by default: it needs TheRock/ROCm and the HRX submodules, and it only runs on AMD GPUs.
+# `1bit serve --device hrx` (and auto for a .gguf) then uses this llama-server on HRX0, and
+# --device cpu the same build with no GPU layers. The build has no Vulkan or ROCm backend
+# (RFC #213 stage 3): what HRX does not run, Lemonade serves with its own llamacpp backends.
+option(ONEBIT_HRX "Build the HRX llama-server and wire it into Lemonade" OFF)
 if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
     add_dependencies(onebit llama_hrx)
     target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}")
     if(ONEBIT_SERVE_TEST_GGUF)
-        # With ONEBIT_VULKAN, --device vulkan runs the upstream build (tested below).
-        set(_hrx_devs hrx)
-        if(NOT ONEBIT_VULKAN)
-            list(PREPEND _hrx_devs vulkan)
-        endif()
-        foreach(_dev ${_hrx_devs})
+        foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
         endforeach()
-        # Vulkan decode with prompt prefill on HRX over one shared KV cache (docs/hrx.md)
-        add_test(NAME serve_e2e_vulkan_prefill_hrx
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan --prefill-device hrx)
     endif()
 endif()
 

@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""hadamard_q4_0.py — make a Hadamard-rotated Q4_0 GGUF for the lean ROCm route (docs/lean.md).
+"""hadamard_q4_0.py — make a Hadamard-rotated Q4_0 GGUF ("H32") for the HRX route (docs/hrx.md).
 
     tools/hadamard_q4_0.py SOURCE.gguf OUT.gguf [--imatrix IMATRIX.gguf] [--quantize PATH]
                            [--work DIR] [--keep]
@@ -23,13 +23,15 @@ block (attention and FFN projections, the delta-net alpha/beta projections) is r
 the normalized 32-point Walsh-Hadamard matrix, per 32-element block, in a copy of SOURCE. The
 imatrix gets the matching change (each rotated column's importance becomes its block's mean).
 llama-quantize then writes Q4_0 for exactly those tensors and a non-Q4_0 type for every other
-matmul weight, and stamps `onebit.hadamard_q4_0 = 32`. The lean ROCm build sees the stamp and its
-activation quantizers apply the same rotation to those weights (and no others); `1bit serve` sees
-it, sets GGML_W4A4_TENSORS=all, and refuses the file on devices without the rotation.
+matmul weight, and stamps `onebit.hadamard_q4_0 = 32`. Our llama.cpp sees the stamp and rotates the
+activations of those weights (and no others) as a matmul in the graph (src/llama-hadamard.cpp,
+llama.cpp #58), on HRX0 or the CPU; `1bit serve` refuses the file on devices without the rotation.
+(The lean ROCm build's W4A4 route, which this tool was first written for, left with the ROCm build
+in RFC #213 stage 3.)
 
 The rotation is exact: on the int8 path the rotated file matches an unrotated one quantized the
-same way (Qwen3.8-27B: KLD 0.031 vs 0.029 against BF16). What it buys is 4-bit activations
-that lose less (KLD 0.055 instead of 0.084) at the W4A4 kernel's prompt speed.
+same way (Qwen3.8-27B: KLD 0.031 vs 0.029 against BF16). On the removed W4A4 route
+it bought 4-bit activations that lost less (KLD 0.055 instead of 0.084).
 
 The last step checks the invariant the runtime relies on: every Q4_0 tensor in OUT is a rotated
 one (a tied output embedding is kept at Q8_0). A file that breaks it is deleted.
@@ -43,8 +45,7 @@ import sys
 import time
 
 HERE = os.path.dirname(os.path.abspath(__file__))
-for p in (os.path.join(HERE, "..", "third_party", "llama.cpp-rocmfpx", "gguf-py"),
-          os.path.join(HERE, "..", "third_party", "llama.cpp", "gguf-py")):
+for p in (os.path.join(HERE, "..", "third_party", "llama.cpp", "gguf-py"),):
     if os.path.isdir(p):
         sys.path.insert(0, p)
         break
@@ -128,7 +129,7 @@ def main():
     ap.add_argument("source")
     ap.add_argument("out")
     ap.add_argument("--imatrix")
-    ap.add_argument("--quantize", default=os.path.join(HERE, "..", "build", "lean", "llama", "bin", "llama-quantize"))
+    ap.add_argument("--quantize", default=os.path.join(HERE, "..", "build", "hrx", "llama", "bin", "llama-quantize"))
     ap.add_argument("--work", help="directory for the rotated copy (default: next to OUT)")
     ap.add_argument("--keep", action="store_true", help="keep the rotated source copy")
     a = ap.parse_args()

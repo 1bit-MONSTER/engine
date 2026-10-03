@@ -167,4 +167,4 @@ jobs:
           ${PATCHES}
 
           CI here builds without HRX. Before merging, on Strix Halo (and \`test-backend-ops -b HRX0\`):
-          \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && for d in vulkan hrx; do tests/serve_e2e.sh build/1bit <Qwen3-0.6B Q4_K_M .gguf> \$d; done\`"
+          \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && for d in hrx cpu; do tests/serve_e2e.sh build/1bit <Qwen3-0.6B Q4_K_M .gguf> \$d; done\`"

@@ -21,7 +21,7 @@
 //                 reproduced byte for byte from layer_ctx1/2/17.elf, and
 //                 elf_0002_lmhead.bin
 //   golden-dir    full ELFs that ran the fast lane with logits bit-identical to
-//                 the xclbin lane: init.elf, fl_ctx<N>.elf, lmhead.elf (and
+//                 the original reference lane: init.elf, fl_ctx<N>.elf, lmhead.elf (and
 //                 optionally load_ctx1.elf, a stand-alone kernel with load_pdi)
 #include "full_elf.h"
 

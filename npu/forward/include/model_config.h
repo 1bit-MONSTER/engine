@@ -29,12 +29,6 @@ struct ModelConfig {
     int H = 0, NC = 0, NH = 0, NKV = 0, HD = 0, IM = 0, NV = 0;
     int GQA = 0, AW = 4, WQH = 0, WKVH = 0, XM = 128;
     int qkv_k_offset = 0, qkv_v_offset = 0, qkv_total = 0;
-    int xclbin_qkv_k = 0, xclbin_qkv_n = 0;
-    int xclbin_o_k = 0, xclbin_o_n = 0;
-    int xclbin_g_k = 0, xclbin_g_n = 0;
-    int xclbin_u_k = 0, xclbin_u_n = 0;
-    int xclbin_gu_k = 0, xclbin_gu_n = 0;
-    int xclbin_d_k = 0, xclbin_d_n = 0;
     bool has_q_norm = false, has_k_norm = false;
     bool has_rope_freqs_file = false, has_lm_head = false;
     bool gu_split = false;
@@ -319,24 +313,8 @@ inline ModelConfig parse_q4nx_header(const char* model_path, const char* model_t
     cfg.qkv_v_offset = cfg.NH * cfg.HD + cfg.NKV * cfg.HD;
     cfg.qkv_total = cfg.NH * cfg.HD + 2 * cfg.NKV * cfg.HD;
     
-    cfg.xclbin_qkv_k = cfg.H;
-    cfg.xclbin_qkv_n = cfg.qkv_total;
-    cfg.xclbin_o_k = cfg.NH * cfg.HD;
-    cfg.xclbin_o_n = cfg.H;
-    
     // GU split decision
     cfg.gu_split = (cfg.IM * 2 > 14336);
-    if (cfg.gu_split) {
-        cfg.xclbin_g_k = cfg.H;
-        cfg.xclbin_g_n = cfg.IM;
-        cfg.xclbin_u_k = cfg.H;
-        cfg.xclbin_u_n = cfg.IM;
-    } else {
-        cfg.xclbin_gu_k = cfg.H;
-        cfg.xclbin_gu_n = cfg.IM * 2;
-    }
-    cfg.xclbin_d_k = cfg.IM;
-    cfg.xclbin_d_n = cfg.H;
     
     munmap(md, st.st_size);
     return cfg;

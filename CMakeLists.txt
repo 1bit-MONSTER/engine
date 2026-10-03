@@ -342,7 +342,7 @@ add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)
 set(ONEBIT_NPU_CAPTURED "" CACHE PATH "Directory of captured layer_ctx<N>.elf instruction ELFs")
 set(ONEBIT_NPU_PDI "" CACHE FILEPATH "The layer kernel's design PDI")
 set(ONEBIT_NPU_GOLDEN "" CACHE PATH "Directory of full ELFs the fast lane ran")
-set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full ELF / xclbin directory the GGUF-on-NPU forward loads (docs/npu.md)")
+set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full-ELF directory the GGUF-on-NPU forward loads (docs/npu.md)")
 target_compile_definitions(onebit PRIVATE ONEBIT_NPU_REPACK_SCRIPT="${CMAKE_SOURCE_DIR}/scripts/repack_gguf.py")
 # The GGUF -> fused-lane Q4NX layout packer (docs/npu.md, "From a GGUF").  A
 # different layout from repack_gguf.py; used only when ONEBIT_NPU_LANE_DIR routes

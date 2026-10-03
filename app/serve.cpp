@@ -1912,7 +1912,7 @@ int run_serve(int argc, char** argv) {
         // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
         // directory, then serve it through the model-generic forward in process.
         const std::string dir = repack_gguf(o.model);
-        // Resolve the full-ELF / xclbin directory the forward loads. An empty value
+        // Resolve the full-ELF directory the forward loads. An empty value
         // makes it look for "/full_i8_*.elf", so it is an error, not a default.
         std::string kernels;
         if (const char* env = std::getenv("ONEBIT_NPU_KERNELS")) kernels = env;

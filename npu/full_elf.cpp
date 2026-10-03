@@ -161,7 +161,7 @@ Bytes assemble_full_elf(const Bytes& inst, const Bytes& pdi, const std::string& 
 
     // 1. Control code: keep exactly the first transaction (the bytes its header
     // declares). Captured layer streams carry a second, identical, never-relocated
-    // copy (the double-buffer slot); the xclbin path only ever executes the first.
+    // copy (the double-buffer slot); only the first is ever executed.
     Bytes ctrl(inst.begin() + ct.offset, inst.begin() + ct.offset + ct.size);
     if (rd32(ctrl, 0) != 0x06040100) fail("control code does not start with a TXN header");
     uint32_t ops = rd32(ctrl, 8), size = rd32(ctrl, 12);
@@ -197,7 +197,7 @@ Bytes assemble_full_elf(const Bytes& inst, const Bytes& pdi, const std::string& 
         i += it->second;
     }
 
-    // 2. Argument symbols: xclbin convention (3 = first buffer) -> full-ELF (0).
+    // 2. Argument symbols: instruction-ELF convention (3 = first buffer) -> full-ELF (0).
     auto symname = [&](const Sym& s) {
         const size_t o = dstr.offset + s.name;
         return std::string(inst.begin() + long(o), std::find(inst.begin() + long(o), inst.end(), 0));

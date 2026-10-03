@@ -126,10 +126,11 @@ Lemonade's to serve:
   Zamba2 and BlackMamba, and a few upstream-only ones) is refused with a pointer to Lemonade's
   `llamacpp` recipe.
 
-Follow-up in the fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)): its
-`onebit` backend still lists `vulkan` as a selectable backend (`onebit.h`, `backend_versions.json`,
-the test suite's `capabilities.py`). Picking it now gets the refusal above; the fork should drop
-it.
+In the fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)), branch
+`1bit/onebit-no-vulkan` drops `vulkan` from the `onebit` backend (`onebit.h`,
+`backend_versions.json`, the test suite's `capabilities.py`, the generated docs); until it is in the
+pinned fork, picking `vulkan` gets the refusal above. With it, the recipe's backends are `hrx`
+(gfx1151), `npu` and `cuda`, so Lemonade offers `onebit` models only on machines with one of them.
 
 ## On its own
 

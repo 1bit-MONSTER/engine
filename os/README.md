@@ -18,20 +18,27 @@ limitations under the License.
 
 The 1bit engine as its own operating system: it boots a Strix Halo machine from a USB stick,
 runs entirely in RAM, and never touches the internal disk. Nothing but what the engine needs
-is in it: the kernel with the GPU (`amdgpu`) and NPU (`amdxdna`) drivers, the firmware those
-chips load, BusyBox, Mesa's Radeon Vulkan driver, XRT with the XDNA plugin, and the engine
-(`1bit`, and the Vulkan `llama-server` it runs). Models live on the stick's `1BIT-DATA`
-partition.
+is in it: the kernel with the GPU (`amdgpu`, which also gives HSA its `/dev/kfd`) and NPU
+(`amdxdna`) drivers, the firmware those chips load, BusyBox, XRT with the XDNA plugin, and the
+engine: `1bit`, the HRX `llama-server` it runs (HRX0 and the CPU; the engine has no Vulkan since
+RFC #213 stage 3), and TheRock's HSA runtime that HRX loads. Models live on the stick's
+`1BIT-DATA` partition, and so does HRX's Loom kernel cache (`/data/cache/hrx-jit`, through
+`GGML_HRX_JIT_CACHE_DIR`): HRX compiles each kernel on first use, so the first boot of a new image
+pays that once and later boots reuse it.
 
 ## Build it (a few minutes, no root)
 
-On a machine that has built the engine with the NPU lane and Vulkan:
+On a machine that has built the engine with the NPU lane and HRX (TheRock in `/opt/rocm-therock`):
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=ON -DONEBIT_VULKAN=ON
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=ON -DONEBIT_HRX=ON
 cmake --build build
 os/mini/mkimage.sh out build
 ```
+
+`mkimage.sh` copies the HRX `llama-server` and the HSA runtime the build was configured with
+(`ONEBIT_HRX_LIBHSA` in `build/CMakeCache.txt`) at their build paths, with every library they
+link; `1bit` has both paths compiled in.
 
 `mkimage.sh` takes the running kernel (or `KVER=`), copies only the modules, firmware and
 shared libraries the stack uses, and writes:
@@ -55,7 +62,7 @@ Copy models into `models/` on `1BIT-DATA`, then boot the Strix Halo machine from
 (its firmware's boot menu, Secure Boot off). It comes up with a shell, DHCP on Ethernet, and:
 
 ```sh
-1bit serve -m /data/models/<file.gguf> --device vulkan --host 0.0.0.0
+1bit serve -m /data/models/<file.gguf> --host 0.0.0.0     # --device auto: HRX0
 ```
 
 ## Check it without the hardware
@@ -65,12 +72,21 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 4G -kernel /boot/vmlinuz-$(uname -r)
   -initrd out/initramfs.img -append "console=ttyS0 rdinit=/init 1bit.check" -nographic -no-reboot
 ```
 
-`1bit.check` makes init check that the engine, `llama-server`, the XRT plugin and the NPU
-firmware are in place and start, print `1BIT-OS CHECK PASS` or `FAIL`, and power off.
+`1bit.check` makes init check that the engine, `llama-server`, the HSA runtime, the XRT plugin and
+the NPU firmware are in place and start, print `1BIT-OS CHECK PASS` or `FAIL`, and power off.
+
+`os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI and checks,
+over SSH and the OpenAI API, that `1bit serve --device cpu` answers (the VM has no Radeon GPU, so
+HRX0 itself is checked on the hardware only). On a machine without TheRock or XRT,
+`LLAMA_SERVER=<a CPU llama-server> NO_XRT=1` makes a CPU-only test image.
+
+What only the hardware can check: `amdgpu` bringing up `/dev/kfd` and HRX0 from the image (TheRock's
+HSA runtime and its libraries complete, the PM4-emulation probe answered), HRX kernels compiling
+into `/data/cache/hrx-jit` and being reused after a reboot, `--device auto` serving on HRX0 at the
+speed of the installed system, the NPU (`amdxdna`, XRT, firmware) and the Wi-Fi chip.
 
 ## Next
 
-- HRX (the HSA runtime and the HRX llama.cpp build) alongside Vulkan and the NPU.
+- A Loom kernel cache built ahead of time, so the first boot needs no compile.
 - Lemonade in the image, with its web UI on the network; SSH.
-- Mesa without LLVM (RADV compiles with ACO): the image drops by about 130 MB.
 - Every piece pinned upstream and bumped by a workflow, like the rest of the engine.

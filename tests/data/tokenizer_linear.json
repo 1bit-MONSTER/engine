@@ -1,0 +1,51 @@
+{
+ "version": "1.0",
+ "added_tokens": [
+  {
+   "id": 7,
+   "content": "<think>",
+   "special": false
+  },
+  {
+   "id": 8,
+   "content": "</think>",
+   "special": false
+  }
+ ],
+ "pre_tokenizer": {
+  "type": "ByteLevel",
+  "add_prefix_space": false,
+  "trim_offsets": true,
+  "use_regex": true
+ },
+ "model": {
+  "type": "BPE",
+  "vocab": {
+   "a": 0,
+   "b": 1,
+   "Ġ": 2,
+   "aa": 3,
+   "aaaa": 4,
+   "aaaaaaaa": 5,
+   "ab": 6
+  },
+  "merges": [
+   [
+    "a",
+    "a"
+   ],
+   [
+    "aa",
+    "aa"
+   ],
+   [
+    "aaaa",
+    "aaaa"
+   ],
+   [
+    "a",
+    "b"
+   ]
+  ]
+ }
+}

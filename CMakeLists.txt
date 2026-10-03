@@ -215,6 +215,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(onebit_moe PUBLIC Threads::Threads)
     target_link_libraries(onebit PRIVATE onebit_moe)
     target_compile_definitions(onebit PRIVATE ONEBIT_MOE)
+    # Crafted GGUF headers the --moe-slots index must refuse (written at run time); runs in CI.
+    add_executable(moe_gguf_index_test tests/moe_gguf_index_test.cpp)
+    target_link_libraries(moe_gguf_index_test PRIVATE onebit_moe)
+    add_test(NAME moe_gguf_index COMMAND moe_gguf_index_test)
+    set_tests_properties(moe_gguf_index PROPERTIES TIMEOUT 60)
 endif()
 
 # ── Step 4: Laya router (docs/laya.md) ───────────────────────────────────

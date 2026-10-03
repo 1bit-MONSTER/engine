@@ -118,6 +118,7 @@
 #endif
 
 #ifndef _WIN32
+#include <pwd.h>
 extern char** environ;
 #endif
 
@@ -1633,17 +1634,27 @@ std::string command_text(const std::vector<std::string>& argv) {
     return text;
 }
 
+// The Q4NX cache root: $ONEBIT_Q4NX_CACHE, else ~/.cache/1bit/q4nx. With HOME unset this used to
+// be /tmp/.cache, which every local user can write; a cached directory there would be served
+// (weights, tokenizer, kernel directory) without knowing who made it. The home directory now
+// comes from the user database instead, and serve refuses rather than guess.
+std::string q4nx_cache_root() {
+    if (const char* c = std::getenv("ONEBIT_Q4NX_CACHE"); c && *c) return c;
+    if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache/1bit/q4nx";
+#ifndef _WIN32
+    if (const passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir && *pw->pw_dir)
+        return std::string(pw->pw_dir) + "/.cache/1bit/q4nx";
+#endif
+    throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
+}
+
 // Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
 // (Python), cached by GGUF stem so a repeated serve reuses the conversion.
 // Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
 // the cache root with ONEBIT_Q4NX_CACHE.
 std::string repack_gguf(const std::string& gguf) {
     const std::string stem = fs::path(gguf).stem().string();
-    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
-    if (cache.empty()) {
-        const char* home = std::getenv("HOME");
-        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
-    }
+    const std::string cache = q4nx_cache_root();
     const std::string out = cache + "/" + stem;
 
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
@@ -1750,11 +1761,7 @@ std::string repack_gguf(const std::string& gguf) {
 // so the caller falls back to the per-op forward instead of failing.
 std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_dir) {
     const std::string stem = fs::path(gguf).stem().string();
-    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
-    if (cache.empty()) {
-        const char* home = std::getenv("HOME");
-        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
-    }
+    const std::string cache = q4nx_cache_root();
     const std::string out = cache + "/" + stem + "-lane";
 
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");

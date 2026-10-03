@@ -1,0 +1,14 @@
+Lemonade backend: flm (npu)
+Ship: no (owner decision, os/LICENSES.md): the archive holds closed-source NPU binaries
+(lib*_npu.so model libraries and 231 xclbins, no source in the repository) under conflicting terms,
+and flm-real links them together with the GPL FFTW library.
+Project: FastFlowLM, https://github.com/ROCm/FastFlowLM
+Release: v1.0.6 (fastflowlm_1.0.6_linux.tar.gz)
+Licenses: CLI and orchestration code MIT, Copyright (c) 2026 Advanced Micro Devices, Inc.
+(LICENSE_RUNTIME.txt). NPU kernel binaries: README.md at v1.0.6 says "completely free for any use,
+including commercial use" and asks for "Powered by FastFlowLM"; TERMS.md at the same tag still
+calls them proprietary, patent-pending, free only below USD 10M annual revenue (TERMS.md).
+Bundled: FFTW 3.3.10 (GPL-2.0-or-later, fftw-COPYING; flm-real links libfftw3f), XRT 2.25
+(Apache-2.0), Boost.Program_options 1.83 (BSL-1.0), zlib 1.3.1 (Zlib).
+Model weights: none in the archive (downloaded from Hugging Face, FastFlowLM/*-NPU2, when used).
+Source: https://github.com/ROCm/FastFlowLM/tree/v1.0.6 (code only)

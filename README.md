@@ -67,8 +67,9 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > - **Laya** picks the device for each conversation (`1bit serve --laya`, 95.5% on 200 labelled
 >   requests; the scorer runs on HRX at 15-16 ms a decision; [docs/laya.md](docs/laya.md)); long
 >   documents go to HRX.
-> - **The NPU engine** on full ELFs with the upstream XDNA stack pinned ([docs/npu.md](docs/npu.md)); its
->   layer kernel is not yet built from source. GGUFs of six architectures also answer on the NPU,
+> - **The NPU engine** on full ELFs with the upstream XDNA stack pinned ([docs/npu.md](docs/npu.md)); a
+>   layer kernel and lm-head built from source now decode Qwen3 0.6B-4B exactly (private kernels,
+>   not yet merged here; docs/npu.md, Step 3d). GGUFs of six architectures also answer on the NPU,
 >   correct but not yet fast. Qwen3.6-35B-A3B on the NPU is a closed-source add-on (16.3-16.5 tok/s).
 > - **The model registry** maps 94.88% of 332,726 HF text-generation models to a backend, with a daily
 >   census ([docs/registry.md](docs/registry.md)).

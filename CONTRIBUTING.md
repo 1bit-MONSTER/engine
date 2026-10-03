@@ -28,7 +28,8 @@ This repository exists to be reviewable. Five rules keep it that way.
    architectures it *maps* and, separately, which ones have *run* and been
    checked on each backend. Docs quote the second number.
 4. **No binaries without source.** NPU kernels are built from source in this
-   repository (or a pinned submodule) into full ELFs. No vendored xclbins.
+   repository (or a pinned submodule) into full ELFs. The engine loads no
+   xclbins and the repository vendors none.
    A private add-on (docs/npu.md, "Private routes") builds its kernels from
    source in its own repository.
 5. **Every file carries the copyright and Apache-2.0 notice.** Run

@@ -18,9 +18,8 @@
 // The host does RMSNorm / RoPE / GQA attention / SiLU in float32; the GEMMs run
 // on the NPU through I8Ctx.  The design set is DERIVED from the model's own
 // architecture dims (q4nx_derive_designs): four kernels when gate/up are fused,
-// five when they are split.  No model name or tag appears in this file; artifact
-// names are geometry-derived, with an optional tag fallback for xclbin-only
-// model directories (NPU_INFER_TAG).
+// five when they are split.  No model name or tag appears in this file; the
+// full-ELF names are geometry-derived.
 //
 // Numerics follow tools/q4nx_forward_ref.py so the two can be compared
 // element-wise.
@@ -177,17 +176,17 @@ static const char* role_tag(Q4nxDesign r) {
 // init
 // --------------------------------------------------------------------------
 bool Q4nxNpuForward::init(xrt::device& dev, const char* model_path,
-                          const std::string& dir, bool use_elf) {
-    return init_impl(&dev, model_path, dir, use_elf);
+                          const std::string& dir) {
+    return init_impl(&dev, model_path, dir);
 }
 
 bool Q4nxNpuForward::init_host(const char* model_path, const std::string& dir) {
     host_gemm_ = true;
-    return init_impl(nullptr, model_path, dir, true);
+    return init_impl(nullptr, model_path, dir);
 }
 
 bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
-                               const std::string& dir, bool use_elf) {
+                               const std::string& dir) {
     if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
     if (getenv("NPU_NO_WCACHE")) weight_cache_ = false;   // A/B: disable the packed-weight cache
     dev_ = dev;
@@ -500,8 +499,6 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         rec_state_.assign(NL, std::vector<float>((size_t)lin_nvh_ * (size_t)lin_khd_ * (size_t)lin_vhd_, 0.0f));
     }
 
-    const char* tag = getenv("NPU_INFER_TAG");
-
     fprintf(stderr, "  [forward] derived %d designs (fused_gu=%d, H=%d NH=%d NKV=%d HD=%d IM=%d)\n",
             ndesigns_, dims.fused_gu, dims.H, dims.NH, dims.NKV, dims.HD, dims.IM);
 
@@ -518,7 +515,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             if (!file_exists(elf)) { err_ = "missing full ELF " + elf; return false; }
             fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
                     role_tag(g->role), g->M, g->K, g->N, elf.c_str());
-        } else if (use_elf) {
+        } else {
             std::string elf = dir + "/" + g->elf_name;
             if (!file_exists(elf)) {
                 err_ = "missing full ELF " + elf;
@@ -530,39 +527,6 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
             fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", role_tag(g->role),
                     g->M, g->K, g->N, elf.c_str());
-        } else {
-            // Artifact resolution.  The geometry-suffixed names are preferred by
-            // default (tag-free), but several of them are degenerate 59-byte
-            // stubs while the model-tagged twins are real, so when NPU_INFER_TAG
-            // is set explicitly it wins; otherwise the geometry name is tried and
-            // the tag used as fallback.
-            char xc[512], ip[512];
-            snprintf(xc, sizeof(xc), "%s/final_i8_%s_K%d_N%d.xclbin", dir.c_str(),
-                     role_tag(g->role), g->K, g->N);
-            snprintf(ip, sizeof(ip), "%s/insts_i8_%s_K%d_N%d.txt", dir.c_str(),
-                     role_tag(g->role), g->K, g->N);
-            if (tag) {
-                snprintf(xc, sizeof(xc), "%s/final_i8_%s_%s.xclbin", dir.c_str(),
-                         role_tag(g->role), tag);
-                snprintf(ip, sizeof(ip), "%s/insts_i8_%s_%s.txt", dir.c_str(),
-                         role_tag(g->role), tag);
-                if (!file_exists(xc, 4096)) {
-                    snprintf(xc, sizeof(xc), "%s/final_i8_%s_K%d_N%d.xclbin",
-                             dir.c_str(), role_tag(g->role), g->K, g->N);
-                    snprintf(ip, sizeof(ip), "%s/insts_i8_%s_K%d_N%d.txt",
-                             dir.c_str(), role_tag(g->role), g->K, g->N);
-                }
-            }
-            if (!file_exists(xc)) {
-                err_ = std::string("missing xclbin for ") + role_tag(g->role) + ": " + xc;
-                return false;
-            }
-            if (!ctx_[i]->init(*dev, xc, ip, 4, 1)) {
-                err_ = std::string("I8Ctx init failed for ") + xc;
-                return false;
-            }
-            fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", role_tag(g->role),
-                    g->M, g->K, g->N, xc);
         }
     }
 
@@ -656,7 +620,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 ple_dim_, sem_.num_kv_shared_layers, first_shared, sem_.double_wide_mlp);
     }
 
-    backend_ = use_elf ? "full ELF" : "xclbin";
+    backend_ = "full ELF";
     ready_ = true;
     return true;
 }

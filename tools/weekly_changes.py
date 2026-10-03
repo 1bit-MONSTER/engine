@@ -25,6 +25,7 @@ import argparse
 import base64
 import datetime as dt
 import json
+import os
 import re
 import subprocess
 import urllib.request
@@ -213,6 +214,105 @@ def models(src: str, old: str, new: str, after: dt.datetime) -> dict:
     return out
 
 
+OFFER_REPO = "https://github.com/1bit-MONSTER/engine/issues"
+
+
+def source_section(src: dict) -> list[str]:
+    """the "Source code" section: where the source of each GPL/LGPL component of 1bit OS is,
+    from the sources.json os/mini/mkimage.sh writes (tools/os_sources.py), and the written offer"""
+    distro = (src.get("builder") or {}).get("name") or "Ubuntu"
+    release = " ".join(x for x in ((src.get("builder") or {}).get("name"), (src.get("builder") or {}).get("version_id")) if x)
+
+    def apt(source: str, version: str) -> str:
+        return f"`apt-get source {source}={version}`"
+
+    rows = []
+    k = src.get("kernel") or {}
+    kpkgs = [p for p in src.get("packages", []) if p["class"] == "kernel"]
+    if k.get("from_pin") and k.get("pin"):
+        pin = k["pin"]
+        cfg = k.get("config") or []
+        built = f", built as `{k['release']}`"
+        if cfg:
+            built += " with `" + cfg[0] + "`" + "".join(f" + `{os.path.basename(c)}`" for c in cfg[1:])
+        if k.get("build_script"):
+            built += f" (`{k['build_script']}`)"
+        rows.append(("Linux kernel", "GPL-2.0", f"{k.get('version')}, `third_party/linux` at `{pin[:12]}`{built}",
+                     f"[torvalds/linux@{pin[:7]}](https://github.com/torvalds/linux/tree/{pin}), config in this repository"))
+    elif k:
+        p = next((p for p in kpkgs if p["source"] == "linux"), None) or k.get("package")
+        if p:
+            rows.append(("Linux kernel", "GPL-2.0", f"{distro} `{p['source']}` {p['source_version']} (`{k['release']}`)",
+                         apt(p["source"], p["source_version"])))
+        else:
+            rows.append(("Linux kernel", "GPL-2.0", f"`{k['release']}`, from no package", "ask (see the written offer)"))
+    for m in src.get("out_of_tree_modules", []):
+        ver = " ".join(x for x in (m.get("version") and f"version {m['version']}",
+                                   m.get("srcversion") and f"srcversion `{m['srcversion']}`") if x)
+        xdna = (src.get("pins") or {}).get("xdna-driver")
+        where = (f"[amd/xdna-driver@{xdna[:7]}](https://github.com/amd/xdna-driver/tree/{xdna})"
+                 if m["name"] == "amdxdna" and xdna else "ask (see the written offer)")
+        rows.append((f"Kernel module {m['name']} (out of tree)", m.get("license") or "unknown",
+                     ver or f"`{m['path']}`", where))
+    firmware = []
+    for p in src.get("packages", []):
+        if p["class"] == "firmware":
+            firmware.append(p)
+            continue
+        if p["class"] in ("permissive", "kernel"):
+            continue
+        bins = [b["package"] for b in p["binaries"] if not b["package"].endswith("-base")]
+        name = p.get("name") or p["source"]
+        if bins != [p["source"]]:
+            name += f" ({', '.join(bins)})"
+        lic = p.get("license") or ("unclassified, see " + ", ".join(
+            f"/usr/share/doc/{b['package']}/copyright" for b in p["binaries"]))
+        ver = f"{distro} `{p['source']}` {p['source_version']}"
+        bb = src.get("busybox") or {}
+        if p["source"] == "busybox" and bb.get("upstream_version"):
+            ver += f" (BusyBox v{bb['upstream_version']})"
+        where = apt(p["source"], p["source_version"])
+        if p.get("upstream"):
+            where += f" · [{p['upstream'].split('//')[1].split('/')[0]}]({p['upstream']})"
+        rows.append((name, lic, ver, where))
+    stub = src.get("efi_stub") or {}
+    if stub.get("source") and stub.get("class") in ("gpl", "lgpl", "unknown"):
+        rows.append((f"EFI stub ({stub['package']}), the start of `1bit-os-*.efi`", stub.get("license") or "unknown",
+                     f"{distro} `{stub['source']}` {stub['source_version']}", apt(stub["source"], stub["source_version"])))
+    if firmware:
+        names = [b["package"].removeprefix("linux-firmware-") for p in firmware for b in p["binaries"]
+                 if b["package"] != "linux-firmware"]
+        link = next((p["upstream"] for p in firmware if p.get("upstream")), None)
+        where = "; ".join(apt(p["source"], p["source_version"]) for p in firmware)
+        if link:
+            where += f" · [linux-firmware]({link})"
+        rows.append(("linux-firmware" + (f" ({', '.join(names)})" if names else ""), firmware[0].get("license") or "redistributable binary-only",
+                     "; ".join(f"{distro} `{p['source']}` {p['source_version']}" for p in firmware), where))
+
+    md = ["## Source code", "",
+          "The engine and its Linux packages are built from this repository at the tag above, and every",
+          "pin is listed under \"What moved upstream\". The 1bit OS image (`1bit-os-*.img.zst`, `1bit-os-*.efi`)",
+          "also carries third-party programs under the GPL and LGPL. Their exact sources are:", "",
+          "| Component | License | Version on the image | Source |", "|---|---|---|---|"]
+    md += [f"| {a} | {b} | {c} | {d} |" for a, b, c, d in rows]
+    md.append("")
+    perm = [p for p in src.get("packages", []) if p["class"] == "permissive"]
+    names = [f"{p.get('name') or p['source']} ({p['license']})" if p.get("license") else (p.get("name") or p["source"])
+             for p in perm]
+    comps = {u["component"] for u in src.get("unowned", [])}
+    if "xrt" in comps:
+        names.append("XRT (Apache-2.0, built from `third_party/xdna-driver`)")
+    if names:
+        md += ["The other components on the image use permissive licenses: " + ", ".join(names) + ". "
+               f"Their sources are the {release} source packages of the same names, at the versions listed in "
+               "`/usr/share/licenses/1bit-os/sources.json` on the image.", ""]
+    md += ["**Written offer.** For at least three years from this release, we will give anyone a complete copy",
+           "of the corresponding source code of the GPL and LGPL components above, in the versions shipped",
+           "here, for no more than the cost of providing it. To ask, open an issue at",
+           f"{OFFER_REPO} with the title \"Source request\" and the release tag.", ""]
+    return md
+
+
 def main() -> None:
     ap = argparse.ArgumentParser(description=__doc__.splitlines()[0])
     ap.add_argument("--src", required=True)
@@ -223,6 +323,7 @@ def main() -> None:
     ap.add_argument("--bumps", help="bumps.json from scripts/weekly.sh")
     ap.add_argument("--json", required=True)
     ap.add_argument("--md", required=True)
+    ap.add_argument("--os-sources", help="sources.json from os/mini/mkimage.sh: adds the Source code section")
     a = ap.parse_args()
 
     old_date, new_date = commit_date(a.src, a.old), dt.datetime.now(dt.timezone.utc)
@@ -320,6 +421,8 @@ def main() -> None:
            "license. 1bit OS also carries GPL programs (the Linux kernel, BusyBox) as built on the release "
            "machine; their complete source is available on request for three years from this release: open "
            "an issue at https://github.com/1bit-MONSTER/engine/issues.", ""]
+    if a.os_sources:
+        md += source_section(json.load(open(a.os_sources)))
     open(a.md, "w").write("\n".join(md))
     print(f"{len(ups)} upstreams moved, {len(engine)} engine commits, {len(held)} bumps held")
 

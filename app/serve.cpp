@@ -1178,7 +1178,10 @@ onebit::laya::RequestClass classify_request_gguf(LayaDaemon& d, const std::strin
 #endif
 #endif
 
-std::string request_state(const httplib::Request& req) {
+// With head_only, a chat request contributes only what conversation_key() covers (the messages
+// through the first user message): the class cached under a key must not depend on anything
+// the key leaves out, or one client's later turns could decide another client's routing.
+std::string request_state(const httplib::Request& req, bool head_only = false) {
     json body;
     try {
         body = json::parse(req.body);
@@ -1189,7 +1192,12 @@ std::string request_state(const httplib::Request& req) {
     std::string out;
     if (body.contains("messages") && body["messages"].is_array())
         for (const auto& m : body["messages"]) {
-            if (!m.is_object() || !m.contains("content")) continue;
+            if (!m.is_object()) continue;
+            const bool user = m.contains("role") && m["role"].is_string() && m["role"].get<std::string>() == "user";
+            if (!m.contains("content")) {
+                if (head_only && user) break;
+                continue;
+            }
             auto add = [&](const std::string& t) {
                 if (t.empty()) return;
                 if (!out.empty()) out += "\n";
@@ -1200,6 +1208,7 @@ std::string request_state(const httplib::Request& req) {
             else if (c.is_array())
                 for (const auto& part : c)
                     if (part.is_object() && part.value("type", "") == "text") add(part.value("text", ""));
+            if (head_only && user) break;
         }
     return out;
 }
@@ -1411,10 +1420,10 @@ int serve_child(const Options& given) {
             if (cls.label.empty()) {
                 std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
 #if defined(__linux__)
-                if (laya_daemon) cls = classify_request_gguf(*laya_daemon, request_state(q));
+                if (laya_daemon) cls = classify_request_gguf(*laya_daemon, request_state(q, true));
                 else
 #endif
-                cls = onebit::laya::classify_request(*scorer, request_state(q));
+                cls = onebit::laya::classify_request(*scorer, request_state(q, true));
                 fresh = true;
             }
             if (cls.label.empty()) {

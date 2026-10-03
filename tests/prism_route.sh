@@ -17,19 +17,20 @@
 # How `1bit serve` routes a PrismML Hadamard-folded file (Ternary Bonsai; prism.hadamard.* keys,
 # docs/hrx.md), without a GPU:
 #   - --device auto sends a converted file (tools/ternary_to_q4_0.py) to HRX0,
-#   - --device vulkan refuses it (upstream llama.cpp would ignore the rotation),
+#   - --device cpu refuses it (only the HRX route is checked for these files),
 #   - a file in PrismML's ternary types goes to HRX0 too (llama.cpp #62), with or without
-#     prism.hadamard keys, and --device vulkan refuses it with the converter's name,
-#   - a plain file with --device auto still goes to the GPU route (HRX0 with HRX, else Vulkan0).
+#     prism.hadamard keys, and --device cpu refuses it with the converter's name,
+#   - --device vulkan is refused as removed (RFC #213 stage 3),
+#   - a plain file with --device auto still goes to HRX0 with HRX, else to the CPU.
 #
 # usage: tests/prism_route.sh path/to/1bit
 set -uo pipefail
 
 bin=${1:?usage: prism_route.sh path/to/1bit}
-# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
-gpu=Vulkan0
+# --device auto's route: HRX0 in a build with HRX; the CPU (no --device) in one without, like CI's
+gpu=None
 if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
-gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
+where=$([ "$gpu" = None ] && echo "the CPU" || echo "$gpu")
 scratch=$(mktemp -d)
 trap 'kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$scratch"' EXIT
 pid=
@@ -72,10 +73,12 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 PY
 chmod +x "$scratch/backend.py"
 
+refused=$("$bin" serve -m "$scratch/bonsai-q4_0.gguf" --device cpu --port 1 --llama-server "$scratch/backend.py" 2>&1)
+check "--device cpu refuses a Hadamard-folded file" '[[ "$refused" == *"Hadamard-folded"* ]]'
+refused=$("$bin" serve -m "$scratch/bonsai-pq2_0-plain.gguf" --device cpu --port 1 --llama-server "$scratch/backend.py" 2>&1)
+check "--device cpu refuses PrismML ternary types with the converter's name" '[[ "$refused" == *"ternary_to_q4_0.py"* ]]'
 refused=$("$bin" serve -m "$scratch/bonsai-q4_0.gguf" --device vulkan --port 1 --llama-server "$scratch/backend.py" 2>&1)
-check "--device vulkan refuses a Hadamard-folded file" '[[ "$refused" == *"Hadamard-folded"* ]]'
-refused=$("$bin" serve -m "$scratch/bonsai-pq2_0-plain.gguf" --device vulkan --port 1 --llama-server "$scratch/backend.py" 2>&1)
-check "--device vulkan refuses PrismML ternary types with the converter's name" '[[ "$refused" == *"ternary_to_q4_0.py"* ]]'
+check "--device vulkan is refused as removed" '[[ "$refused" == *"--device vulkan was removed"* ]]'
 
 run() {  # <model> <record>: serve with --device auto until the backend has recorded its start
     local port
@@ -94,7 +97,7 @@ check "--device auto sends a PTQ1_0 file to HRX0" '[ "$(field "$scratch/t.json" 
 run "$scratch/bonsai-pq2_0-plain.gguf" "$scratch/p.json"
 check "--device auto sends an unrotated PQ2_0 file to HRX0" '[ "$(field "$scratch/p.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
 run "$scratch/plain.gguf" "$scratch/plain.json"
-check "a plain file still goes to $gpu" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = "$gpu" ]'
+check "a plain file still goes to $where" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1] if \"--device\" in r[\"argv\"] else None")" = "$gpu" ]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

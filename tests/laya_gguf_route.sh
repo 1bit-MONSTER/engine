@@ -18,7 +18,8 @@
 # or a model: a fake daemon (ONEBIT_LAYA_GGML) answers by keyword and records what it was asked,
 # the pinned GGUF name under $ONEBIT_LAYA_MODEL/gguf/ is an empty file, and fake llama-servers
 # and zinc answer with their device (tests/route-policy-e2e.json: code -> hrx, prose -> zinc,
-# short -> vulkan; an HRX build has no Vulkan candidate, so short falls back to hrx). It checks that
+# short and long_doc -> cpu, default cpu; a build with HRX offers hrx and zinc, so short falls back
+# to hrx, and one without offers cpu and zinc, so code falls back to cpu). It checks that
 #   - serve starts the daemon (daemon <gguf> --family typed-decisions --device hrx) with the HSA
 #     runtime HRX needs (IREE_HAL_AMDGPU_LIBHSA_PATH, from --hrx-libhsa) and needs no safetensors
 #     checkpoint,
@@ -32,10 +33,10 @@
 set -uo pipefail
 
 bin=${1:?usage: laya_gguf_route.sh path/to/1bit}
-# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
-gpu=Vulkan0
-if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
-gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
+# the llama-server candidate (gguf_devices() in app/serve.cpp): hrx in a build with HRX, cpu in
+# one without, like CI's; zinc is the other candidate in both
+gpu_lc=cpu
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu_lc=hrx; fi
 here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
 pid=
@@ -101,11 +102,11 @@ ask() {  # <text>: the replying device, then the X-1bit-Route header
     tr -d '\r' < "$scratch/h" | sed -n 's/^[Xx]-1bit-[Rr]oute: //p'
 }
 out=$(ask "Write a Rust function that reverses a linked list.")
-check "code -> hrx ($(echo $out))" '[[ "$out" == "device:hrx"*"code 0.80 hrx"* ]]'
+check "code -> $gpu_lc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"code 0.80 $gpu_lc"* ]]'
 out=$(ask "Explain how vaccines train the immune system.")
 check "prose -> zinc ($(echo $out))" '[[ "$out" == "device:zinc"*"prose 0.80 zinc"* ]]'
 out=$(ask "What is 17*23?")
-# the test policy says vulkan; an HRX build has no Vulkan candidate and falls back to its first, hrx
+# the test policy says cpu; a build with HRX has no cpu candidate and falls back to its first, hrx
 check "short -> $gpu_lc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"short 0.80 $gpu_lc"* ]]'
 
 q=$(sed -n 2p "$scratch/daemon.log")

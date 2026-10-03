@@ -29,7 +29,7 @@ const std::vector<std::pair<std::string, std::string>>& device_descriptions() {
     static const std::vector<std::pair<std::string, std::string>> d = {
         {"npu", "low-power AMD XDNA NPU, single context at a time"},
         {"hrx", "AMD HRX on the Radeon iGPU"},
-        {"vulkan", "Vulkan on the Radeon iGPU"},
+        {"cpu", "the CPU, no GPU layers"},
         {"zinc", "ZINC GPU (also reaches NVIDIA and Apple)"},
     };
     return d;

@@ -21,7 +21,7 @@ limitations under the License.
 numbers in these docs are taken, and how a [recipe](recipes.md) earns its place.
 
 ```sh
-tools/bench.py -m Qwen3.8-27B-Q4_0-H32.gguf \
+tools/bench.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
     --config base= \
     --config dflash='--dflash Qwen3.8-27B-DFlash2-q8_0.gguf' \
     --rounds 2 --lock ~/.cache/lax-decode/box.lock --json one-server.json

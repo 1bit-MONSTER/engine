@@ -19,15 +19,17 @@
 #   - --device cpu: llama-server with no GPU layers and no --device,
 #   - --device auto: HRX0 in a build with HRX, the CPU in one without (CI, Windows),
 #   - --device auto with --mtp: the same route (HRX drafts on HRX0 now; it used to keep Vulkan),
-#   - --device auto with --mmproj: the CPU, with a note (HRX vision is an open RFC #213 gate),
-#   - an architecture our llama.cpp does not map (Qwen3.8-Flash-Next's qwen4exp, Zyphra Zamba2) is
+#   - --device auto with --mmproj: the same route as a plain file (HRX0 is unverified for vision,
+#     an open RFC #213 gate to check on ZAYA1-VL),
+#   - an architecture our llama.cpp does not build (not in registry/architectures.json's
+#     gguf_architectures.hrx: Qwen3.8-Flash-Next's qwen4exp, Zyphra Zamba2, a made-up one) is
 #     refused with a pointer to Lemonade's llamacpp backend, under auto and when asked for by name,
 #   - --moe-slots is refused as not in this build (it moves to HRX with Flash-Next),
-#   - in a build with HRX, --parallel 4 on a gated delta-net model under auto is refused,
+#   - --parallel 4 on a gated delta-net model: in a build with HRX, auto serves it on HRX0 with one
+#     slot and says why; --device cpu keeps -np 4,
+#   - an H32 file (onebit.hadamard_q4_0, a dropped format) is refused by name,
 #   - --device vulkan / rocm and the removed flags (--lean, --adaptive, --long-model,
-#     --prefill-device) are refused with the reason,
-#   - serve.cpp's hrx_missing_arch list: no architecture in it is mapped to hrx by
-#     registry/architectures.json (a pin bump that brings one in must drop it from the list).
+#     --prefill-device) are refused with the reason.
 #
 # usage: tests/device_route.sh path/to/1bit
 set -uo pipefail
@@ -42,9 +44,11 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 python3 - "$scratch" <<'PY'
 import struct, sys
 def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
-for name, arch in (("plain", "llama"), ("flashnext", "qwen4exp"), ("zamba", "zamba2"), ("delta", "qwen35")):
-    kv = s("general.architecture") + struct.pack("<I", 8) + s(arch)
-    open(f"{sys.argv[1]}/{name}.gguf", "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, 1) + kv)
+for name, arch, extra in (("plain", "llama", b""), ("flashnext", "qwen4exp", b""), ("zamba", "zamba2", b""),
+                          ("madeup", "not-an-arch", b""), ("delta", "qwen35", b""),
+                          ("h32", "qwen35", s("onebit.hadamard_q4_0") + struct.pack("<I", 5) + struct.pack("<i", 32))):
+    kv = s("general.architecture") + struct.pack("<I", 8) + s(arch) + extra
+    open(f"{sys.argv[1]}/{name}.gguf", "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, 2 if extra else 1) + kv)
 PY
 : > "$scratch/head.gguf"
 
@@ -97,19 +101,23 @@ check "--device auto runs a plain .gguf on $where (this build)" '[ "$(after "$sc
 run "$scratch/mtp.json" plain --mtp "$scratch/head.gguf"
 check "--device auto runs --mtp on $where" '[ "$(after "$scratch/mtp.json" --device)" = "$expected" ] && [ "$(after "$scratch/mtp.json" -md)" = "$scratch/head.gguf" ]'
 run "$scratch/mmproj.json" plain --mmproj "$scratch/head.gguf"
-check "--device auto runs --mmproj on the CPU" '[ "$(after "$scratch/mmproj.json" -ngl)" = 0 ] && [ "$(after "$scratch/mmproj.json" --device)" = None ]'
-if [ $hrx = 1 ]; then
-    check "  and says why" 'grep -q "mmproj has no checked HRX route" "$scratch/mmproj.json.log"'
-fi
+check "--device auto runs --mmproj on $where" '[ "$(after "$scratch/mmproj.json" --device)" = "$expected" ] && [ "$(after "$scratch/mmproj.json" --mmproj)" = "$scratch/head.gguf" ]'
 
 check "an architecture our llama.cpp does not map (qwen4exp) is refused under auto" 'refused "Lemonade" flashnext'
 check "  and on --device hrx" 'refused "architecture qwen4exp is not in" flashnext --device hrx'
 check "  and on --device cpu (zamba2)" 'refused "architecture zamba2 is not in" zamba --device cpu'
+check "  and any architecture the registry does not list" 'refused "architecture not-an-arch is not in" madeup'
+check "an H32 file is refused by name" 'refused "H32 file" h32'
+check "  on --device hrx too" 'refused "dropped that format" h32 --device hrx'
 check "--moe-slots is refused as not in this build" 'refused "--moe-slots is not available in this build" plain --moe-slots 64'
 check "  under auto too, saying where it goes" 'refused "moves to HRX" plain --moe-slots auto --device auto'
 if [ $hrx = 1 ]; then
-    check "--parallel 4 on a gated delta-net model under auto is refused" 'refused "has no GPU route" delta --parallel 4'
+    run "$scratch/delta.json" delta --parallel 4
+    check "--parallel 4 on a gated delta-net model under auto: HRX0 with one slot" '[ "$(after "$scratch/delta.json" --device)" = HRX0 ] && [ "$(after "$scratch/delta.json" -np)" = 1 ]'
+    check "  and a warning that says why" 'grep -q "one gated delta-net sequence at a time" "$scratch/delta.json.log"'
 fi
+run "$scratch/deltacpu.json" delta --parallel 4 --device cpu
+check "--device cpu keeps --parallel 4 on a gated delta-net model" '[ "$(after "$scratch/deltacpu.json" -np)" = 4 ]'
 for dev in vulkan rocm; do
     check "--device $dev is refused as removed" 'refused "--device $dev was removed" plain --device $dev'
 done
@@ -117,21 +125,6 @@ for flag in --lean --adaptive "--long-model x.gguf" "--prefill-device hrx"; do
     # shellcheck disable=SC2086
     check "$flag is refused as removed" 'refused "${flag%% *} was removed" plain $flag'
 done
-
-root=$(cd "$(dirname "$0")/.." && pwd)
-check "no hrx_missing_arch architecture is mapped to hrx in registry/architectures.json" 'python3 - "$root" <<'"'"'PY'"'"'
-import json, re, sys
-root = sys.argv[1]
-a = json.load(open(root + "/registry/architectures.json"))["architectures"].values()
-on_hrx = {v["gguf"] for v in a if "hrx" in v["backends"]}
-src = open(root + "/app/serve.cpp").read()
-body = src[src.index("bool hrx_missing_arch"):]
-body = body[body.index("{"):body.index("};")]
-have = set(re.findall(r"\"([^\"]+)\"", body))
-if not have or have & on_hrx:
-    print("mapped to hrx now, drop from hrx_missing_arch:", sorted(have & on_hrx))
-    sys.exit(1)
-PY'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

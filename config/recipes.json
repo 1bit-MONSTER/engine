@@ -1,13 +1,4 @@
 {
   "about": "Tuned llama-server settings per model and route, applied by `1bit serve` (docs/recipes.md). A recipe never overrides a flag already on the backend's command line or a variable already set. Every recipe carries the measurement behind it; re-measure with tools/bench.py before changing one.",
-  "recipes": [
-    {
-      "id": "dflash-p-min-0",
-      "match": {"drafter": ["dflash"]},
-      "args": ["--spec-draft-p-min", "0"],
-      "why": "A DFlash block is only worth drafting whole. Our HRX llama.cpp defaults to p-min 0 already (common.h), so this pins it there whatever a backend's default; the removed ROCm tree defaulted to 0.75 and cut blocks short.",
-      "measured": "Qwen3.8-27B-H32 + DFlash2 on the lean ROCm route (removed in RFC #213 stage 3): mean accepted block 5.4 -> 6.7 tokens on code. Not yet re-measured on HRX.",
-      "source": "engine #194"
-    }
-  ]
+  "recipes": []
 }

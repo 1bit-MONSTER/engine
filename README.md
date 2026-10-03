@@ -24,10 +24,8 @@ Lemonade runs the engine as one of its backends, the same way it runs `llama-ser
 serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
 - the XDNA 2 NPU engine
-- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom and HIP kernels), the default GPU route ([docs/hrx.md](docs/hrx.md))
-- Vulkan and ROCm builds, leaving the engine in stages (RFC #213): `--device auto` means HRX, and Lemonade's own backends serve what the engine does not ([docs/vulkan.md](docs/vulkan.md))
-- MoE experts streamed from the drive on Vulkan (`1bit serve --moe-slots N`), for MoE models larger than memory ([docs/moe-streaming.md](docs/moe-streaming.md#streaming-in-the-inference-path))
-- a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
+- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom and HIP kernels), the engine's one GPU route ([docs/hrx.md](docs/hrx.md)), and the CPU from the same llama.cpp build
+- MoE experts streamed from the drive (`1bit serve --moe-slots N`), for MoE models larger than memory: kept, but not in this build until it moves to HRX with Qwen3.8-Flash-Next ([docs/moe-streaming.md](docs/moe-streaming.md))
 - ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming
 - MLX on Apple Silicon, through lemon-mlx-engine
@@ -47,10 +45,11 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 
 > **Direction:** the engine is HRX (AMD's ggml-hrx, kernels in Loom or HIP, whichever measures faster)
 > plus the NPU[^geramyl]
-> ([RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213)). `--device auto` means HRX. What the
-> engine does not run on HRX or the NPU is Lemonade's job: Lemonade ships its own llama.cpp backends
-> (Vulkan, ROCm, CPU), and `1bit serve` hands those models back. The Vulkan and ROCm builds still in
-> this repository leave in stages.
+> ([RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213)). `--device auto` means HRX. HRX met
+> the RFC's decode gates, and its stage 3 removed the engine's Vulkan and ROCm llama.cpp builds, with
+> `--lean`, `--adaptive`, `--long-model` and `--prefill-device`. What the engine does not run on HRX or
+> the NPU is Lemonade's job: Lemonade ships its own llama.cpp backends (Vulkan, ROCm, CPU), and
+> `1bit serve` hands those models back.
 >
 > **Status (first release, 4 October 2026):**
 > - **Inside Lemonade.** `1bit serve` is a Lemonade backend ([docs/lemonade.md](docs/lemonade.md),
@@ -63,7 +62,6 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 >   NaN-free.
 > - **Ternary on HRX.** PrismML's Ternary Bonsai runs from its own PTQ1_0 / PQ2_0 files: the 27B in
 >   5.5 GiB, 14-16 tok/s decode, logits identical to an exact Q4_0 copy.
-> - **Hadamard-rotated Q4_0** files (`tools/hadamard_q4_0.py`) run on HRX.
 > - **Laya** picks the device for each conversation (`1bit serve --laya`, 95.5% on 200 labelled
 >   requests; the scorer runs on HRX at 15-16 ms a decision; [docs/laya.md](docs/laya.md)); long
 >   documents go to HRX.
@@ -72,9 +70,10 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 >   correct but not yet fast. Qwen3.6-35B-A3B on the NPU is a closed-source add-on (16.3-16.5 tok/s).
 > - **The model registry** maps 94.88% of 332,726 HF text-generation models to a backend, with a daily
 >   census ([docs/registry.md](docs/registry.md)).
-> - **Still on Vulkan in this build**, until they are ported to HRX: `--moe-slots` (MoE experts streamed
->   from the drive, [docs/moe-streaming.md](docs/moe-streaming.md)), `--mmproj`, `--parallel` on gated
->   delta-net models, the RAG servers, Qwen3.8-Flash-Next, and Zyphra's Zamba, Zamba2 and BlackMamba.
+> - **Not in this build**, until they are ported to HRX: `--moe-slots` (MoE experts streamed from the
+>   drive, [docs/moe-streaming.md](docs/moe-streaming.md)), Qwen3.8-Flash-Next, and Zyphra's Zamba,
+>   Zamba2 and BlackMamba, which ran only on the removed Vulkan build. `--mmproj` and `--parallel` on
+>   gated delta-net models run on HRX (one slot for now; [docs/serve.md](docs/serve.md)).
 >
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). The working engine
 > is being ported from 1bit-MONSTER, our private development repository ([docs/PORTING.md](docs/PORTING.md));
@@ -102,7 +101,7 @@ The repositories this engine is built on, in order of importance:
 | 2 | [Xilinx/XRT](https://github.com/Xilinx/XRT) | The runtime every NPU kernel runs through: full ELFs, hardware contexts, buffers | Apache-2.0 (userspace) |
 | 3 | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) | IRON and aiecc: how our own NPU kernels are written and compiled | Apache-2.0 WITH LLVM-exception |
 | 4 | [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) | Peano, the C++ compiler for the NPU's AI Engine cores | Apache-2.0 WITH LLVM-exception |
-| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU: Vulkan (upstream release) and HRX (AMD's tested pair) | MIT |
+| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU through HRX (AMD's tested pair), and on the CPU | MIT |
 | 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device | Apache-2.0 |
 | 7 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
 | 8 | [zolotukhin/zinc](https://github.com/zolotukhin/zinc) | Its own GPU kernels, and the engine's route to NVIDIA through CUDA | MIT |

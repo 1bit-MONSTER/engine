@@ -34,7 +34,7 @@ Every file below is quantized from the same BF16 checkpoint, the ROCmFPX ones wi
 | ROCmFP4 (ROCmFPX) | 13.8 GiB | 0.045 | 89.6% | 14.1 |
 | ROCmFP2 (ROCmFPX) | 8.6 GiB | 0.341 | 75.5% | 21.2 |
 
-Unsloth's own UD-Q3_K_XL is smaller, faster and closer to the model than either 4-bit ROCmFPX format. ROCmFPX keeps two jobs in the engine's lean option ([docs](../docs/lean.md)): ROCmI4 for the fastest prompt processing we measured (455 tok/s with its W4A4 path on ROCm), and ROCmFP2 when memory is the limit.
+Unsloth's own UD-Q3_K_XL is smaller, faster and closer to the model than either 4-bit ROCmFPX format. ROCmFPX keeps two jobs in the engine's lean option ([docs](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/lean.md)): ROCmI4 for the fastest prompt processing we measured (455 tok/s with its W4A4 path on ROCm), and ROCmFP2 when memory is the limit.
 
 ## A model trained ternary
 

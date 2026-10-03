@@ -101,7 +101,7 @@ DOC_KEYWORDS = {
     "lemonade": "Lemonade server, Lemonade backend, onebit recipe, local LLM server, AMD",
     "releases": "1bit engine release, v2026.40, Linux package, Windows, 1bit OS, Lemonade",
     "bench": "LLM benchmark, tok/s, llama-bench, tools/bench.py, Strix Halo",
-    "recipes": "llama-server settings, micro-batch, tuned settings, Hadamard Q4_0, Strix Halo",
+    "recipes": "llama-server settings, micro-batch, tuned settings, Strix Halo",
     "npu": "XDNA 2 NPU, AMD NPU LLM, amdxdna, XRT, Ryzen AI NPU, Qwen3-0.6B",
     "hrx": "HRX, ggml-hrx, Loom kernels, gfx1151, Radeon 8060S, llama.cpp AMD iGPU, Ternary Bonsai, Qwen3.8-27B",
     "laya": "LLM router, request routing, Laya, ModernBERT classifier, 1bit serve --laya",
@@ -132,8 +132,7 @@ TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks"
 NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases"),
                ("bench", "How we measure"), ("recipes", "Recipes")]),
-    ("Devices", [("npu", "NPU"), ("hrx", "HRX (GPU)"), ("vulkan", "Vulkan (upstream)"), ("lean", "Lean (ROCmFP4, ROCmI4)"),
-                 ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
+    ("Devices", [("npu", "NPU"), ("hrx", "HRX (GPU)"), ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
     ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),
 ]

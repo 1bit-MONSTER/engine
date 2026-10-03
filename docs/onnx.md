@@ -47,7 +47,7 @@ The engine does not ship Ryzen AI Software. With it installed, the same build se
 ## The GPU
 
 The engine no longer builds ONNX Runtime with its WebGPU provider. That provider runs on Dawn over
-Vulkan, and Vulkan is leaving the engine (RFC #213, [HRX](hrx.md)). It ran Qwen3-4B at 52.9 tok/s
+Vulkan, and the engine builds no Vulkan (RFC #213 stage 3, [HRX](hrx.md)). It ran Qwen3-4B at 52.9 tok/s
 against 26.8 on the CPU (2026-09-26). ONNX models run on the CPU, or on the NPU with Ryzen AI
 Software; GPU work goes through HRX.
 

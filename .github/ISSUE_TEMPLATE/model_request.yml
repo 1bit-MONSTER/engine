@@ -41,7 +41,7 @@ body:
     attributes:
       label: Device you want it on
       multiple: true
-      options: [npu, vulkan, hrx, rocm, zinc, ds4, mlx, onnx, any]
+      options: [npu, hrx, cpu, zinc, ds4, mlx, onnx, any]
     validations:
       required: true
   - type: textarea

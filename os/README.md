@@ -65,6 +65,12 @@ Copy models into `models/` on `1BIT-DATA`, then boot the Strix Halo machine from
 1bit serve -m /data/models/<file.gguf> --host 0.0.0.0     # --device auto: HRX0
 ```
 
+`--host 0.0.0.0` (and the boot-time serve that `/data/1bit.conf` starts, which uses it) puts the
+API on every network the stick's DHCP joins, and `1bit serve` has no authentication of its own
+(SECURITY.md): anyone on that network can send it requests. Use it on a network you trust. To keep
+the boot-time serve on the machine itself, add `--host 127.0.0.1` to `ARGS` in `1bit.conf` (the
+last `--host` wins) and reach it over SSH (`ssh -L 8000:127.0.0.1:8000 ...`).
+
 ## Check it without the hardware
 
 ```sh
@@ -89,4 +95,6 @@ speed of the installed system, the NPU (`amdxdna`, XRT, firmware) and the Wi-Fi 
 
 - A Loom kernel cache built ahead of time, so the first boot needs no compile.
 - Lemonade in the image, with its web UI on the network; SSH.
+- An authenticated network serve: a `BIND=` setting in `1bit.conf`, or an API key made at first
+  boot and required by `1bit serve`, so the API is not open to the whole network by default.
 - Every piece pinned upstream and bumped by a workflow, like the rest of the engine.

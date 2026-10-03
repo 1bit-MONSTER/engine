@@ -46,7 +46,7 @@ put() {
 }
 
 cp -a "$build/1bit" "$stage/"
-put hrx/llama/bin llama-server llama-bench llama-quantize
+put hrx/llama/bin llama-server llama-bench
 for b in vulkan rocm cuda; do
     put "zinc/$b/bin" zinc
     [ -d "$build/zinc/$b/share" ] && cp -a "$build/zinc/$b/share" "$stage/zinc/$b/"   # its shaders

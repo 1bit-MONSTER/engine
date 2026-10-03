@@ -67,6 +67,20 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/recipes_default.h
      "static const char kDefaultRecipesJson[] = R\"ONEBITRECIPES(${ONEBIT_RECIPES_JSON})ONEBITRECIPES\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/recipes.json)
 target_include_directories(onebit PRIVATE ${CMAKE_BINARY_DIR}/generated)
+# The GGUF architectures the pinned llama.cpp fork builds a model for (registry/architectures.json,
+# gguf_architectures.hrx, from tools/registry_build.py): serve refuses any other on hrx and cpu.
+file(READ ${CMAKE_SOURCE_DIR}/registry/architectures.json _onebit_registry)
+string(JSON _onebit_n_archs LENGTH "${_onebit_registry}" gguf_architectures hrx)
+set(_onebit_archs "")
+math(EXPR _onebit_last "${_onebit_n_archs} - 1")
+foreach(_i RANGE ${_onebit_last})
+    string(JSON _a GET "${_onebit_registry}" gguf_architectures hrx ${_i})
+    string(APPEND _onebit_archs "    \"${_a}\",\n")
+endforeach()
+file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
+     "// generated from registry/architectures.json by CMakeLists.txt\n#pragma once\n"
+     "static const char* const kHrxGgufArchs[] = {\n${_onebit_archs}};\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
 # backends are compiled in by build-tree path; a package keeps that layout (app/built_path.h)
@@ -74,7 +88,6 @@ target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}"
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
-add_test(NAME hadamard_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hadamard_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)

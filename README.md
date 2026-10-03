@@ -68,8 +68,8 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > ([docs/dwarfstar.md](docs/dwarfstar.md)). Step 4, the Laya router, has landed as an opt-in:
 > `1bit serve --laya` classifies each conversation (code, prose, short, long document; 95.5% on
 > 200 labelled requests) and a measured policy picks the device; the scorer runs on HRX at
-> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 332,726
-> HF text-generation models with an architecture, 94.88% were mapped to a backend and 64.33%
+> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 334,413
+> HF text-generation models with an architecture, 94.71% are mapped to a backend and 64.2%
 > have an architecture checked end to end on Strix Halo; a daily census keeps the counts
 > current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,
 > our private development repository; see [docs/PORTING.md](docs/PORTING.md).

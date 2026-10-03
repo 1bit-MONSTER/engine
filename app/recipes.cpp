@@ -53,7 +53,6 @@ bool Recipe::matches(const RecipeFacts& f) const {
     if (!any_of(device, f.device) || !any_of(architecture, f.architecture) || !any_of(drafter, f.drafter))
         return false;
     if (moe >= 0 && (moe == 1) != f.moe) return false;
-    if (hadamard_q4_0 >= 0 && (hadamard_q4_0 == 1) != f.hadamard_q4_0) return false;
     return true;
 }
 
@@ -89,9 +88,9 @@ bool Recipes::parse(const std::string& json_text, std::string& err) {
                         if (mk == "device") rec.device = strings(mv, "match.device", rec.id);
                         else if (mk == "architecture") rec.architecture = strings(mv, "match.architecture", rec.id);
                         else if (mk == "drafter") rec.drafter = strings(mv, "match.drafter", rec.id);
-                        else if (mk == "moe" || mk == "hadamard_q4_0") {
+                        else if (mk == "moe") {
                             if (!mv.is_boolean()) throw std::runtime_error("recipe " + rec.id + ": match." + mk + " is not true/false");
-                            (mk == "moe" ? rec.moe : rec.hadamard_q4_0) = mv.get<bool>() ? 1 : 0;
+                            rec.moe = mv.get<bool>() ? 1 : 0;
                         } else {
                             throw std::runtime_error("recipe " + rec.id + ": unknown match key \"" + mk + "\"");
                         }

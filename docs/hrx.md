@@ -291,22 +291,15 @@ also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -u
 
 `test-backend-ops -o MUL_MAT -b HRX0`: 287/287. `GGML_HRX_Q8_PREFILL_RELAX=0` turns this off too.
 
-### Hadamard-rotated Q4_0 files (llama.cpp #58)
+### Hadamard-rotated Q4_0 files ("H32", dropped)
 
-The files `tools/hadamard_q4_0.py` writes (`onebit.hadamard_q4_0 = 32`) run on HRX with
-`1bit serve --device hrx`, and under `--device auto`.
-
-- **How it works.** `src/llama-hadamard.cpp` reads the stamp and treats it as PrismML's `prism.hadamard`
-  transform with block 32 and no signs. The activations of the rotated Q4_0 weights get the same rotation,
-  as a matmul against the 32-point Walsh-Hadamard matrix, so nothing in the HRX backend changes.
-- **What it skips.** A Q4_0 lookup table such as `token_embd` is written in the plain basis and stays
-  plain. A stamped weight the model doesn't load (the MTP layer without `--mtp`) is skipped.
-- **Accuracy.** Qwen3.8-27B-Q4_0-H32 on `HRX0`, wikitext-2 40 x 512 against the BF16 logits: PPL 6.021,
-  KLD 0.0292, same top token 92.5%. Without the rotation the same file gives PPL 550,134.
-- **Speed (before #55).** pp512 63.5, pp2048 62.4, tg64 11.65 tok/s. HRX still sends Q4_0 prompt matmuls
-  down its generic path: #55 routes Q4_K, Q5_K and IQ4_XS only. The lean ROCm W4A4 route these files
-  were first made for left with the ROCm build (RFC #213 stage 3), so `--device auto` now sends them
-  to HRX0; on HRX the UD-Q4_K_XL file is the faster pick.
+The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on HRX it was slower
+and less accurate than the UD-Q4_K_XL file of the same model (Qwen3.8-27B pp512 63.5 against 335
+tok/s; KLD 0.029 against 0.007 vs BF16), and the lean ROCm W4A4 route it was made for left with the
+ROCm build. `tools/hadamard_q4_0.py` is removed, and `1bit serve` refuses a file stamped
+`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`, llama.cpp
+#58) stays in the fork; it is the same code that rotates PrismML's files
+([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)), which keep running.
 
 ### Server memory: the graph program cache cap (llama.cpp #63)
 
@@ -459,9 +452,9 @@ BF16 is 0.063.
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):
-  llama loads the engine's `onebit.hadamard_q4_0` files through `llama-hadamard`. Qwen3.8-27B-Q4_0-H32
-  on HRX vs BF16 (wikitext 40 x 512): PPL 6.021, KLD 0.0292, same top token 92.5%. Q4_0 prompt matmuls
-  still use the generic kernels.
+  llama loaded the engine's `onebit.hadamard_q4_0` ("H32") files through `llama-hadamard`; Qwen3.8-27B-Q4_0-H32
+  on HRX vs BF16 (wikitext 40 x 512): PPL 6.021, KLD 0.0292, same top token 92.5%. The engine has since
+  dropped the format ([above](#hadamard-rotated-q4_0-files-h32-dropped)).
 
 Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
 
@@ -527,7 +520,7 @@ cmake --build build --target onebit
 - **One external project.** llama.cpp's ggml-hrx builds hrx-system itself
   (`HRX_SOURCE_DIR`) with TheRock's `amdclang`.
 - **HRX0 and the CPU only.** `GGML_VULKAN`, `GGML_HIP` and `GGML_CUDA` are off. The targets are
-  `llama-server`, `llama-bench` and `llama-quantize` (the last for `tools/hadamard_q4_0.py`). With
+  `llama-server` and `llama-bench`. With
   `-DONEBIT_SERVE_TEST_GGUF=<gguf>`, ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`.
 - **`IREE_ROCM_PATH` is not passed.** It would switch hrx-system to "package"
   mode, which needs TheRock's aqlprofile-sdk headers, and our `/opt/rocm-therock`

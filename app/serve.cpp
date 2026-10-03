@@ -56,6 +56,7 @@
 #include "built_path.h"
 
 #include "gguf_meta.h"
+#include "hrx_archs.h"
 #include "recipes.h"
 
 #ifdef ONEBIT_MOE
@@ -187,9 +188,10 @@ void refuse_removed_device(const std::string& device) {
                                  "serves Vulkan and ROCm (docs/lemonade.md)");
 }
 
-// A Q4_0 file from tools/hadamard_q4_0.py: its matmul weights are rotated by a 32-point
-// Walsh-Hadamard transform. Our llama.cpp rotates the activations to match (src/llama-hadamard.cpp
-// reads the stamp and adds the rotation as a matmul, fork #58), on HRX0 and on the CPU.
+// An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
+// and stamped onebit.hadamard_q4_0 = 32 by the engine's former tools/hadamard_q4_0.py. The format
+// is dropped (owner, 2026-10-03: slower and less accurate on HRX than UD-Q4_K_XL), so serve refuses
+// it by name. Not to be confused with PrismML's own rotation (prism_hadamard below), which stays.
 bool hadamard_q4_0(const std::string& model) {
     return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
            gguf_int(model, "onebit.hadamard_q4_0") == 32;
@@ -603,26 +605,23 @@ uint64_t mem_available() {
 }
 #endif
 
-// The GGUF architectures the engine ran on its Vulkan build (upstream llama.cpp's release, plus
-// the Zyphra models on our 1bit/vulkan-upstream branch) and our HRX llama.cpp does not implement,
-// on HRX0 or on the CPU. The Vulkan build is gone (RFC #213 stage 3), so serve declines these with
-// a clear message and Lemonade's own llamacpp backend serves them; Zyphra (zamba, zamba2,
-// blackmamba) and Qwen3.8-Flash-Next (qwen4exp) are to be ported to HRX. tests/device_route.sh
-// checks that the registry maps none of them to hrx: when a pin bump brings one in, drop it here.
+// The GGUF architectures our llama.cpp builds a model for, on HRX0 or on the CPU: generated from
+// registry/architectures.json (gguf_architectures.hrx, tools/registry_build.py), so a pin bump that
+// regenerates the registry moves this list too. Anything else (Qwen3.8-Flash-Next's qwen4exp, Zyphra
+// Zamba/Zamba2/BlackMamba, the upstream-only architectures the removed Vulkan build ran) serve
+// declines with a clear message, and Lemonade's own llamacpp backend serves it. An empty
+// architecture (a file serve cannot read) is left to llama-server.
 bool hrx_missing_arch(const std::string& arch) {
-    static const char* const archs[] = {
-        "bailingmoe3", "blackmamba", "dots3note", "granite_swa", "graniteswitch", "hrm_text",
-        "hy_v4",       "kimi-k3",    "maple",     "minimax-01",  "muse-glimmer",  "pockettts",
-        "qwen3tts",    "qwen4exp",   "spark2_5",  "zamba",       "zamba2"};
-    for (const char* a : archs)
-        if (arch == a) return true;
-    return false;
+    if (arch.empty()) return false;
+    for (const char* a : kHrxGgufArchs)
+        if (arch == a) return false;
+    return true;
 }
 
 void refuse_missing_arch(const std::string& model) {
     if (const std::string arch = gguf_architecture(model); hrx_missing_arch(arch))
-        throw std::runtime_error(model + ": architecture " + arch + " is not in the engine's llama.cpp (it ran only on the "
-                                 "Vulkan build, removed by RFC #213); Lemonade's llamacpp backend serves it");
+        throw std::runtime_error(model + ": architecture " + arch + " is not in the engine's llama.cpp "
+                                 "(registry/architectures.json); Lemonade's llamacpp backend serves it");
 }
 
 bool delta_net_arch(const std::string& arch) {
@@ -810,7 +809,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         facts.device = device;
         facts.architecture = gguf_architecture(o.model);
         facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
-        facts.hadamard_q4_0 = hadamard_q4_0(o.model);
         facts.drafter = !o.dflash.empty() ? "dflash" : !o.mtp.empty() ? "mtp" : "none";
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
@@ -870,26 +868,17 @@ std::vector<std::string> gguf_devices() {
 // without HRX). What used to fall back to Vulkan (engine #271) has no GPU route left:
 //  - an architecture our llama.cpp does not map (hrx_missing_arch): refused, on every device;
 //  - --moe-slots: refused (launch_for) until expert streaming moves to HRX with Flash-Next;
-//  - --parallel N > 1 on a gated delta-net model (no multi-sequence delta-net on HRX): refused,
-//    since the CPU would be the only route and is no stand-in for a GPU serving several users;
-//  - --mmproj: the CPU, with a note; HRX vision is an open RFC #213 gate (--device hrx asks for it).
+//  - --parallel N > 1 on a gated delta-net model (no multi-sequence delta-net on HRX): HRX0 with
+//    one slot and a warning (serve_child);
+//  - --mmproj: HRX0. UNVERIFIED: HRX vision is an open RFC #213 gate, to be checked on ZAYA1-VL;
+//    if it fails there, this goes back to the CPU.
 // --mtp now runs on HRX0 (it drafts slower there than Vulkan did: verify batches of 2-4 tokens).
 std::string auto_gguf_device(const Options& o) {
 #if defined(_WIN32) || !defined(ONEBIT_HRX_SERVER)
     (void)o;
     return "cpu";  // no GPU route on Windows yet (docs/windows.md), nor in a build without HRX
 #else
-    const std::string arch = gguf_architecture(o.model);
-    if (o.parallel > 1 && delta_net_arch(arch))
-        throw std::runtime_error("--parallel " + std::to_string(o.parallel) + " on " + arch +
-                                 " has no GPU route: HRX runs one gated delta-net sequence at a time, and the Vulkan "
-                                 "build that batched them is gone (RFC #213). Leave --parallel off (one sequence on "
-                                 "HRX0), or ask for --device cpu");
-    if (!o.mmproj.empty()) {
-        std::fprintf(stderr, "1bit serve: --mmproj has no checked HRX route yet (RFC #213); --device auto runs it on "
-                             "the CPU (--device hrx tries HRX0)\n");
-        return "cpu";
-    }
+    (void)o;
     return "hrx";
 #endif
 }
@@ -1127,19 +1116,19 @@ std::string request_state(const httplib::Request& req) {
 
 int serve_child(const Options& given) {
     Options o = given;
-    if (hadamard_q4_0(o.model)) {
-        // a rotated file runs on our llama.cpp, which rotates the activations to match (llama-hadamard,
-        // a matmul in the graph): HRX0, or the CPU in a build without HRX. Its other route, the lean
-        // ROCm build's W4A4, left with the ROCm build (RFC #213 stage 3). Qwen3.8-27B-Q4_0-H32 on
-        // HRX0 runs pp512 at 63.5 tok/s (docs/hrx.md): the UD-Q4_K_XL file is the faster pick there.
-        refuse_removed_device(o.device);
-        if (o.device == "auto") o.device = auto_gguf_device(o);
-        if (o.device != "hrx" && o.device != "cpu")
-            throw std::runtime_error(o.model + " is Hadamard-rotated (tools/hadamard_q4_0.py): it runs on --device hrx (or cpu), docs/hrx.md");
-        if (o.laya_auto || !o.laya_model.empty())
-            throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on hrx, picked with --device");
-        std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: %s route, activations rotated by llama-hadamard\n",
-                     o.model.c_str(), o.device == "hrx" ? "HRX" : "CPU");
+    if (hadamard_q4_0(o.model))
+        throw std::runtime_error(o.model + " is an H32 file (onebit.hadamard_q4_0, a Hadamard-rotated Q4_0): the engine "
+                                 "dropped that format; use the model's UD-Q4_K_XL (or another standard) GGUF instead");
+    if (o.device == "auto" && o.parallel > 1 && delta_net_arch(gguf_architecture(o.model)) &&
+        auto_gguf_device(o) == "hrx") {
+        // HRX0 decodes one gated delta-net sequence at a time (no multi-sequence delta-net kernel yet),
+        // and auto has no other GPU route since the Vulkan build left: one slot on HRX0, said aloud.
+        // --device cpu still honors --parallel.
+        std::fprintf(stderr, "1bit serve: --parallel %d on %s: HRX0 runs one gated delta-net sequence at a time "
+                             "(no multi-sequence delta-net on HRX yet), so --device auto serves it with one slot; "
+                             "--device cpu keeps --parallel %d\n",
+                     o.parallel, gguf_architecture(o.model).c_str(), o.parallel);
+        o.parallel = 1;
     }
     if (prism_ternary_types(o.model) && !prism_hadamard(o.model)) {
         // PQ2_0 / PTQ1_0 without a rotation (e.g. Ternary-Bonsai-1.7B): only the HRX build reads the types

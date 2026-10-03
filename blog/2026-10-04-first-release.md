@@ -53,9 +53,9 @@ balanced power mode (85 W):
 | Qwen3.8-27B UD-IQ2_S decode | 3.1 tok/s | **8.3 tok/s** |
 | ZAYA1-8B Q4_K_M decode | 47.9 tok/s | **about 90 tok/s** |
 
-How these numbers were measured: `tools/bench.py` (in the repo) restarts `1bit serve` for each
-configuration, measures prompt speed on one long prompt and decode speed on ordinary chat prompts,
-greedy, thinking off, and reports best and median. No number on this page comes from a repetitive prompt
+How these numbers were measured: kernel speeds are `llama-bench` prompt / decode on HRX0; serve
+speeds come from `tools/bench.py` (in the repo), which restarts `1bit serve` for each configuration and
+measures one long prompt and ordinary chat prompts, greedy, thinking off, reporting best and median. No number on this page comes from a repetitive prompt
 that a draft model can guess. Qwen3.8-27B decodes at 97% of the Vulkan figure it replaced. Unsloth's sub-4-bit GGUFs (Q2_K,
 IQ1, IQ2, IQ3) run on the GPU instead of the CPU, and `--mtp` speculative decoding on Qwen3.5/3.8 is
 NaN-free ([HRX](../docs/hrx.md)).

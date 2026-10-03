@@ -15,28 +15,25 @@
 # limitations under the License.
 #
 # How `1bit serve` routes a Hadamard-rotated Q4_0 file (tools/hadamard_q4_0.py stamps
-# onebit.hadamard_q4_0 = 32; docs/lean.md), without a GPU:
-#   - --device vulkan refuses it,
+# onebit.hadamard_q4_0 = 32; docs/hrx.md), without a GPU:
+#   - --device rocm and --device vulkan are refused as removed (RFC #213 stage 3: the lean ROCm
+#     W4A4 route left with the ROCm build), and so is a device that cannot rotate (zinc),
 #   - --device hrx runs it on HRX0 (our llama.cpp rotates the activations itself, fork #58) with no
 #     W4A4 or process-wide Hadamard variable,
-#   - --device auto sends it to the ROCm route (--device ROCm0) with GGML_W4A4_TENSORS=all in the
-#     backend's environment and no process-wide GGML_Q4_0_HADAMARD (the backend rotates the stamped
-#     file's weights itself); a MoE file (an expert count) also gets
-#     1024-token micro-batches (-ub 1024), a dense one keeps llama-server's 512,
-#   - an unstamped file with --device auto still goes to Vulkan with neither variable,
-#   - --dflash on a rotated file adds the DFlash drafter (p-min 0.4 from its rocm recipe, n-max = the
-#     drafter's dflash.block_size - 1, or 16 when the file does not say): one ROCm server, W4A4
-#     prompt processing and DFlash2 decode,
+#   - --device auto sends it where a plain file goes (HRX0 in a build with HRX, the CPU in one
+#     without), with neither variable and no ROCm-only micro-batch recipe, dense or MoE,
+#   - --dflash on a rotated file adds the DFlash drafter (p-min 0 from dflash-p-min-0, n-max = the
+#     drafter's dflash.block_size - 1, or 16 when the file does not say),
 #   - a drafter with plain Q4_0 tensors is accepted next to a rotated file, like a Q8_0 one.
 #
 # usage: tests/hadamard_route.sh path/to/1bit
 set -uo pipefail
 
 bin=${1:?usage: hadamard_route.sh path/to/1bit}
-# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
-gpu=Vulkan0
+# --device auto's route: HRX0 in a build with HRX; the CPU (no --device) in one without, like CI's
+gpu=None
 if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
-gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
+where=$([ "$gpu" = None ] && echo "the CPU" || echo "$gpu")
 scratch=$(mktemp -d)
 trap 'kill -9 $pid 2>/dev/null; wait $pid 2>/dev/null; rm -rf "$scratch"' EXIT
 pid=
@@ -83,9 +80,14 @@ HTTPServer(("127.0.0.1", port), H).serve_forever()
 PY
 chmod +x "$scratch/backend.py"
 
-refused=$(env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS "$bin" serve -m "$scratch/h32.gguf" --device vulkan \
+for dev in rocm vulkan; do
+    refused=$(env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS "$bin" serve -m "$scratch/h32.gguf" --device $dev \
+        --port 1 --llama-server "$scratch/backend.py" 2>&1)
+    check "--device $dev is refused as removed" '[[ "$refused" == *"--device $dev was removed"* ]]'
+done
+refused=$(env -u GGML_Q4_0_HADAMARD -u GGML_W4A4_TENSORS "$bin" serve -m "$scratch/h32.gguf" --device zinc \
     --port 1 --llama-server "$scratch/backend.py" 2>&1)
-check "--device vulkan refuses a rotated file" '[[ "$refused" == *"Hadamard-rotated"* ]]'
+check "--device zinc refuses a rotated file" '[[ "$refused" == *"Hadamard-rotated"* ]]'
 
 run() {  # <model> <record> [serve args]: serve with --device auto until the backend has recorded its start
     local port
@@ -97,30 +99,29 @@ run() {  # <model> <record> [serve args]: serve with --device auto until the bac
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
 }
 field() { python3 -c 'import json,sys; r=json.load(open(sys.argv[1])); print(eval(sys.argv[2]))' "$1" "$2"; }
+dev() { field "$1" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1] if \"--device\" in r[\"argv\"] else None"; }
 
 run "$scratch/h32.gguf" "$scratch/hrx.json" --device hrx
 check "--device hrx runs a rotated file on HRX0" '[ "$(field "$scratch/hrx.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = HRX0 ]'
 check "  with neither variable" '[ "$(field "$scratch/hrx.json" "sorted(r[\"env\"])")" = "[]" ]'
 
 run "$scratch/h32.gguf" "$scratch/h32.json"
-check "--device auto sends a rotated file to ROCm0" '[ "$(field "$scratch/h32.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = ROCm0 ]'
-check "  without a process-wide GGML_Q4_0_HADAMARD" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_Q4_0_HADAMARD\")")" = None ]'
-check "  and GGML_W4A4_TENSORS=all" '[ "$(field "$scratch/h32.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
-check "  dense: llama-server's own micro-batch" '[ "$(field "$scratch/h32.json" "\"-ub\" in r[\"argv\"]")" = False ]'
+check "--device auto sends a rotated file to $where" '[ "$(dev "$scratch/h32.json")" = "$gpu" ]'
+check "  with neither variable" '[ "$(field "$scratch/h32.json" "sorted(r[\"env\"])")" = "[]" ]'
+check "  and llama-server's own micro-batch" '[ "$(field "$scratch/h32.json" "\"-ub\" in r[\"argv\"]")" = False ]'
 
 run "$scratch/h32moe.gguf" "$scratch/h32moe.json"
-check "a rotated MoE file gets 1024-token micro-batches" '[ "$(field "$scratch/h32moe.json" "r[\"argv\"][r[\"argv\"].index(\"-ub\")+1]")" = 1024 ]'
+check "a rotated MoE file keeps llama-server's micro-batch too (no ROCm recipe)" '[ "$(field "$scratch/h32moe.json" "\"-ub\" in r[\"argv\"]")" = False ]'
 
 run "$scratch/plain.gguf" "$scratch/plain.json"
-check "an unstamped file still goes to $gpu" '[ "$(field "$scratch/plain.json" "r[\"argv\"][r[\"argv\"].index(\"--device\")+1]")" = "$gpu" ]'
+check "an unstamped file goes to $where" '[ "$(dev "$scratch/plain.json")" = "$gpu" ]'
 check "  with neither variable" '[ "$(field "$scratch/plain.json" "sorted(r[\"env\"])")" = "[]" ]'
 
 run "$scratch/h32.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"
 after() { field "$scratch/df.json" "r[\"argv\"][r[\"argv\"].index(\"$1\")+1]"; }
-check "--dflash on a rotated file stays on ROCm0" '[ "$(after --device)" = ROCm0 ]'
+check "--dflash on a rotated file stays on $where" '[ "$(dev "$scratch/df.json")" = "$gpu" ]'
 check "  with the DFlash drafter" '[ "$(after --spec-type)" = draft-dflash ] && [ "$(after -md)" = "$scratch/draft.gguf" ]'
-check "  n-max 16 without a block size, p-min 0.4" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0.4 ]'
-check "  and the Hadamard W4A4 environment" '[ "$(field "$scratch/df.json" "r[\"env\"].get(\"GGML_W4A4_TENSORS\")")" = all ]'
+check "  n-max 16 without a block size, p-min 0" '[ "$(after --spec-draft-n-max)" = 16 ] && [ "$(after --spec-draft-p-min)" = 0 ]'
 
 run "$scratch/h32.gguf" "$scratch/df8.json" --dflash "$scratch/draft8.gguf"
 check "--dflash with a block-8 drafter drafts 7" '[ "$(field "$scratch/df8.json" "r[\"argv\"][r[\"argv\"].index(\"--spec-draft-n-max\")+1]")" = 7 ]'

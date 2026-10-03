@@ -28,7 +28,7 @@ namespace onebit {
 
 // What a recipe can match on, for one backend launch.
 struct RecipeFacts {
-    std::string device;             // vulkan, hrx, rocm
+    std::string device;             // hrx, cpu
     std::string architecture;       // general.architecture of the -m file
     bool moe = false;               // <architecture>.expert_count > 0
     bool hadamard_q4_0 = false;     // stamped by tools/hadamard_q4_0.py

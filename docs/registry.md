@@ -16,8 +16,9 @@ limitations under the License.
 -->
 # Model registry and HF census
 
-Step 5 of the port ([PORTING.md](PORTING.md)): which Hugging Face models this engine can
-run, kept current every day. Two numbers are reported, and they are never added together:
+The model registry and a daily Hugging Face census track which models this engine can run.
+Two numbers are reported, and they are never added together (step 5 of the port,
+[PORTING.md](PORTING.md)):
 
 - **Mapped:** a backend's own code accepts the model's architecture.
 - **Checked:** a model of that architecture loaded, answered and streamed through

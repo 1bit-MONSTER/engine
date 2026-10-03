@@ -15,7 +15,7 @@ See the License for the specific language governing permissions and
 limitations under the License.
 -->
 tags: milestone, release, hrx, loom, kernels, ternary, mxfp4, lemonade, zyphra, qwen
-summary: The 1bit engine's first release: every GGUF quant type decodes on HRX with Loom kernels, written by AI agents and checked against the CPU. Qwen3.8-27B reads prompts at 335 tok/s, ternary Bonsai-27B runs in 5.5 GiB, all inside Lemonade.
+summary: First release: every GGUF quant type we test decodes on HRX with Loom kernels; gpt-oss-20b MXFP4 at 39 tok/s, ternary Bonsai-27B in 5.5 GiB, inside Lemonade.
 
 # 1bit engine v2026.40: the first release
 

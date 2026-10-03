@@ -14,9 +14,10 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# NPU engine: full ELFs, no xclbin
+# XDNA 2 NPU engine: full ELFs, no xclbin
 
-The fast lane runs one whole-layer kernel per decoder layer, plus an lm-head kernel.
+The NPU engine decodes Qwen3-0.6B at 91 tok/s (11.0 ms a token) on the XDNA 2 NPU of Strix Halo.
+Its fast lane runs one whole-layer kernel per decoder layer, plus an lm-head kernel.
 For each token, the host submits the 28 layer runs and the lm head as one XRT runlist.
 This step removes the xclbin from that path. Every kernel is a full ELF (the design's
 PDI plus control code), which XRT opens directly. `npu/full_elf.{h,cpp}` builds these

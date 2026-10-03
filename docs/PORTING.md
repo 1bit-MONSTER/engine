@@ -16,7 +16,8 @@ limitations under the License.
 -->
 # Porting map
 
-This repository is the working 1bit-MONSTER engine, ported without its history.
+This repository is the working 1bit-MONSTER engine, ported step by step without its history:
+Lemonade, HRX, the XDNA 2 NPU, Laya and the model registry.
 Each step below is one PR (or a short series) that builds and runs on Strix Halo before the next one starts.
 
 | Step | Component | Source in 1bit-MONSTER | Done when |

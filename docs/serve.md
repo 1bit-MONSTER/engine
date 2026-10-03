@@ -16,10 +16,9 @@ limitations under the License.
 -->
 # `1bit serve`: the engine behind one OpenAI-compatible API
 
-The engine runs inside Lemonade ([lemonade.md](lemonade.md)): Lemonade runs
-`1bit serve` as a backend, the way it runs `llama-server`. `1bit serve` exposes
-nothing but an OpenAI-compatible API, so it also works on its own with any
-OpenAI client.
+`1bit serve` runs one model behind an OpenAI-compatible API, and Lemonade runs it as a
+backend the way it runs `llama-server` ([lemonade.md](lemonade.md)). It exposes nothing
+but that API, so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]

@@ -14,14 +14,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# HRX on the Radeon iGPU
+# HRX: the GPU route on Strix Halo
 
-On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prompts at 335 tok/s and
-decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
-and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
+HRX, AMD's ggml-hrx runtime with our Loom and HIP kernels, is the GPU route on the Radeon 8060S
+(gfx1151): Qwen3.8-27B reads 512-token prompts at 335 tok/s. ZAYA1-8B decodes on it at about
+90 tok/s.
 
-It is one llama.cpp build with two GPU backends, ggml-hrx and ggml-vulkan (Vulkan leaves the engine in
-stages, RFC #213). Its single `llama-server` exposes both devices on Strix Halo:
+A 14,435-token prompt runs at 265 tok/s, and Qwen3.8-27B decodes at 97% of the previous Vulkan
+figure. The engine builds one llama.cpp with two GPU backends, ggml-hrx and ggml-vulkan (Vulkan is
+leaving the engine, RFC #213). Its single `llama-server` exposes both devices on Strix Halo:
 
 ```
 HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)

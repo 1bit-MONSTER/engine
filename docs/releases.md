@@ -16,7 +16,8 @@ limitations under the License.
 -->
 # Weekly releases
 
-1bit engine is pinned upstream: every backend it builds is a submodule at a fixed commit
+The 1bit engine ships every Sunday as four packages: Linux, Lemonade with the engine, Windows
+and 1bit OS. It is pinned upstream: every backend it builds is a submodule at a fixed commit
 (`third_party/`), and the `bump-*` workflows open a PR whenever an upstream moves. The engine
 runs inside Lemonade, which releases on Fridays. So the engine releases once a week, on Sunday,
 rebuilt from scratch at that week's pins.

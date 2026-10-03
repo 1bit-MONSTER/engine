@@ -17,9 +17,8 @@ limitations under the License.
 
 # Recipes: tuned backend settings, as data
 
-A setting that makes one model faster on one route can make another slower. For example, 1024-token
-micro-batches speed up a Hadamard-rotated MoE model's prompts by 3-8% and slow the dense
-Qwen3.8-27B's by 4%. `1bit serve` keeps such settings in `config/recipes.json`, not in code. Each
+One setting can make one model faster and another slower: 1024-token micro-batches speed up
+a rotated MoE model's prompts by 3-8% and slow Qwen3.8-27B's by 4%. `1bit serve` keeps such settings in `config/recipes.json`, not in code. Each
 recipe says what it matches, what it adds, why, and the measurement behind it:
 
 ```json

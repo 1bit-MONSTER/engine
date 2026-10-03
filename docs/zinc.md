@@ -17,8 +17,8 @@ limitations under the License.
 # ZINC
 
 [ZINC](https://github.com/zolotukhin/zinc) (MIT) is a single-binary GGUF engine
-written in Zig. It has its own kernels for four GPU backends, and serves
-`/health`, `/v1/models` and `/v1/chat/completions`:
+written in Zig, with its own kernels for the four GPU backends below. It serves
+`/health`, `/v1/models` and `/v1/chat/completions`.
 
 | Backend | Hardware | Build needs |
 |---|---|---|

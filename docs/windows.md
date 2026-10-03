@@ -17,7 +17,7 @@ limitations under the License.
 
 # Windows
 
-`1bit.exe` runs on Windows 10 and later (x64): `1bit serve` with GGUF models on the CPU (`--device cpu`, which `auto` picks) and ONNX Runtime GenAI models (`--device onnx`, on the CPU), `1bit route` (Laya) and `1bit comfy`. It is cross-built on Linux. There is no GPU route on Windows for now: the engine's GPU route is HRX, which has no Windows build yet, and Vulkan is leaving the engine (RFC #213). There is no NPU lane, ROCm or ZINC on Windows yet.
+`1bit.exe` runs on Windows 10 and later (x64), serving GGUF and ONNX Runtime GenAI models on the CPU. It carries `1bit serve` with GGUF models (`--device cpu`, which `auto` picks) and ONNX Runtime GenAI models (`--device onnx`), `1bit route` (Laya) and `1bit comfy`. It is cross-built on Linux. There is no GPU route on Windows for now: the engine's GPU route is HRX, which has no Windows build yet, and Vulkan is leaving the engine (RFC #213). There is no NPU lane, ROCm or ZINC on Windows yet.
 
 ```sh
 scripts/build-windows.sh <out-dir>     # ~2 min on Strix Halo once the downloads are cached

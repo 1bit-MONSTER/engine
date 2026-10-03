@@ -20,8 +20,8 @@
 # every backend the build has, at the same paths relative to 1bit as in the build tree, which
 # is where 1bit looks once the build tree is gone (app/built_path.h). Each program and library
 # finds its libraries beside itself ($ORIGIN). With the NPU lane, XRT's libraries and the XDNA
-# plugin from [xrt-root] go in xrt/lib. HRX and the ROCm backends still need TheRock
-# (/opt/rocm-therock) on the machine, as they do when built there.
+# plugin from [xrt-root] go in xrt/lib. HRX still needs TheRock (/opt/rocm-therock) on the
+# machine, as it does when built there. There is no Vulkan or ROCm llama.cpp (RFC #213 stage 3).
 set -euo pipefail
 
 [ $# -ge 3 ] || { sed -n '16,25p' "$0"; exit 2; }
@@ -46,10 +46,7 @@ put() {
 }
 
 cp -a "$build/1bit" "$stage/"
-put vulkan/llama/bin llama-server llama-bench
-put hrx/llama/bin llama-server llama-bench
-put lean/llama/bin llama-server llama-quantize llama-bench
-put lean/llama-rocm/bin llama-server llama-bench
+put hrx/llama/bin llama-server llama-bench llama-quantize
 for b in vulkan rocm cuda; do
     put "zinc/$b/bin" zinc
     [ -d "$build/zinc/$b/share" ] && cp -a "$build/zinc/$b/share" "$stage/zinc/$b/"   # its shaders
@@ -101,10 +98,10 @@ cp "$src/LICENSE" "$src/NOTICE" "$stage/"
 cat > "$stage/README.txt" <<EOF
 1bit engine $ver for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/
 
-  ./1bit serve -m model.gguf --device vulkan --port 8000
+  ./1bit serve -m model.gguf --port 8000      (--device auto: HRX0, else the CPU)
 
 Keep the directory layout: 1bit finds its backends beside itself.
-HRX and the ROCm backends need TheRock in /opt/rocm-therock; the NPU needs the amdxdna
+HRX needs TheRock in /opt/rocm-therock; the NPU needs the amdxdna
 kernel driver. Docs: https://1bit.gg/  Code: https://github.com/1bit-MONSTER/engine
 EOF
 tar -C "$(dirname "$stage")" -cf - "$name" | zstd -q -T4 -19 -o "$out/$name.tar.zst"

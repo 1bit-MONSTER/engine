@@ -31,7 +31,7 @@ sys.path.insert(0, TOOLS)
 import registry_build as rb  # noqa: E402
 
 SIG = {"DeepseekV41ForCausalLM": {"model_type": "deepseek_v41", "family": "DeepSeek V4.1"}}
-MAPPED = {"architectures": {"DeepseekV41ForCausalLM": {"gguf": "x.gguf", "backends": ["vulkan"]}}}
+MAPPED = {"architectures": {"DeepseekV41ForCausalLM": {"gguf": "x.gguf", "backends": ["hrx"]}}}
 
 failures = []
 

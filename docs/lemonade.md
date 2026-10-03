@@ -64,13 +64,15 @@ LEMONADE_ONEBIT_BIN=$PWD/build/1bit ~/.cache/lemonade-pin/bin/lemond
 ```
 
 `.github/workflows/bump-lemonade.yml` opens a PR here when the fork's `main` moves (after
-the daily upstream sync below). Before merging, rebuild and rerun the LLM suite on Strix Halo.
+the upstream release sync below). Before merging, rebuild and rerun the LLM suite on Strix Halo.
 
 On Strix Halo the recipe passes Lemonade's own LLM test suite
 (`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX: 31 tests, 9 run,
 22 skipped as unsupported. It is not proposed upstream yet: the plan is to embed the engine fully
-in the fork first, then propose it upstream. The fork follows upstream daily:
-`.github/workflows/sync-lemonade-fork.yml` merges upstream `main` into it. It
+in the fork first, then propose it upstream. The fork follows upstream's releases:
+`.github/workflows/sync-lemonade-fork.yml` checks daily and merges upstream's latest
+release tag (never a pre-release or `main`), so each weekly engine release carries the
+Lemonade release of that week. It
 pushes only a clean merge that still registers `onebit`; otherwise it opens a PR
 in the fork that lists the conflicts. It also keeps the fork's own copies of
 upstream's workflows disabled. Lemonade asks for an RFC

@@ -18,6 +18,7 @@
 #include <nlohmann/json.hpp>
 
 #include <cmath>
+#include <cstdint>
 #include <cstring>
 #include "file_map.h"
 
@@ -57,7 +58,7 @@ bool Safetensors::open(const std::string& path) {
         return false;
     }
     std::memcpy(&header, map_, 8);
-    if (8 + header > size_) {
+    if (header > size_ - 8) {
         err_ = path + ": header past the end of the file";
         return false;
     }
@@ -69,7 +70,7 @@ bool Safetensors::open(const std::string& path) {
         x.dtype = t.value("dtype", "");
         x.shape = t.at("shape").get<std::vector<int64_t>>();
         const auto off = t.at("data_offsets").get<std::vector<uint64_t>>();
-        if (off.size() != 2 || off[1] < off[0] || base + off[1] > size_) {
+        if (off.size() != 2 || off[1] < off[0] || off[1] > size_ - base) {  // base <= size_
             err_ = path + ": bad data_offsets for " + name;
             return false;
         }
@@ -92,13 +93,20 @@ const Tensor* Safetensors::find(const std::string& name) const {
 bool Safetensors::get_f32(const std::string& name, std::vector<float>& out) const {
     const Tensor* t = find(name);
     if (!t) return false;
+    const std::string& dt = t->dtype;
+    const size_t esz = dt == "F32" ? 4 : (dt == "F16" || dt == "BF16") ? 2 : 0;
+    if (esz == 0) return false;  // unsupported dtype
+    // The shape decides how much is read; it must describe exactly the bytes data_offsets gave.
     size_t elems = 1;
-    for (const int64_t d : t->shape) elems *= size_t(d);
+    for (const int64_t d : t->shape) {
+        if (d < 0 || (d > 0 && elems > SIZE_MAX / esz / size_t(d))) return false;
+        elems *= size_t(d);
+    }
+    if (elems * esz != t->bytes) return false;
 
     out.clear();
     out.reserve(elems);
     const uint8_t* p = t->data;
-    const std::string& dt = t->dtype;
     if (dt == "F32") {
         for (size_t i = 0; i < elems; ++i) {
             float v;

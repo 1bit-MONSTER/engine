@@ -98,6 +98,7 @@ private:
     int n_layer_ = 28;
     // tokenizer specials
     int cls_id_ = -1, sep_id_ = -1, mask_id_ = -1, pad_id_ = -1;
+    int64_t n_tok_rows_ = 0;  // rows of tok_emb_: every token id must be below it
 
     // weights (f32, owned)
     std::vector<float> tok_emb_;  // [50368,1024]

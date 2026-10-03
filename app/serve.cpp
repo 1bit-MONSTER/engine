@@ -86,8 +86,10 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <deque>
 #include <stdexcept>
@@ -315,6 +317,65 @@ int free_port() {
     return port;
 }
 
+#if defined(__linux__)
+// Who holds a loopback port: the backend serve started (or a process it started), or someone
+// else. free_port() releases its port before the child binds it, so another local process could
+// bind it first and answer the readiness probe; serve must not send it client requests.
+enum class PortOwner { kOurs, kOther, kUnknown };
+
+PortOwner port_owner(pid_t child, int port) {
+    // the LISTEN sockets on the port (any address), by inode
+    std::vector<std::string> inodes;
+    bool readable = false;
+    for (const char* table : {"/proc/net/tcp", "/proc/net/tcp6"}) {
+        std::ifstream f(table);
+        if (!f) continue;
+        readable = true;
+        std::string line;
+        std::getline(f, line);  // header
+        while (std::getline(f, line)) {
+            // sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
+            std::istringstream in(line);
+            std::string sl, local, remote, st, txrx, trwhen, retr, uid, timeout, inode;
+            if (!(in >> sl >> local >> remote >> st >> txrx >> trwhen >> retr >> uid >> timeout >> inode)) continue;
+            const size_t colon = local.rfind(':');
+            if (st != "0A" || colon == std::string::npos) continue;  // 0A: LISTEN
+            if (std::strtol(local.c_str() + colon + 1, nullptr, 16) == port) inodes.push_back("socket:[" + inode + "]");
+        }
+    }
+    if (!readable || inodes.empty()) return PortOwner::kUnknown;
+    // the child and its descendants (a backend may be a wrapper that starts the real server)
+    std::unordered_map<pid_t, pid_t> parent;
+    std::error_code ec;
+    for (const auto& ent : fs::directory_iterator("/proc", ec)) {
+        const std::string name = ent.path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
+        std::ifstream st(ent.path() / "stat");
+        std::string stat;
+        std::getline(st, stat);
+        const size_t close = stat.rfind(')');  // the command name may hold spaces and parentheses
+        if (close == std::string::npos) continue;
+        std::istringstream rest(stat.substr(close + 1));
+        std::string state;
+        long ppid = 0;
+        if (rest >> state >> ppid) parent[pid_t(std::stol(name))] = pid_t(ppid);
+    }
+    for (const auto& [pid, _] : parent) {
+        bool ours = false;
+        for (pid_t p = pid, hops = 0; p > 1 && hops < 64; p = parent.count(p) ? parent[p] : 0, ++hops)
+            if (p == child) { ours = true; break; }
+        if (!ours) continue;
+        const fs::path fds = fs::path("/proc") / std::to_string(pid) / "fd";
+        for (const auto& fd : fs::directory_iterator(fds, ec)) {
+            std::error_code lec;
+            const std::string target = fs::read_symlink(fd.path(), lec).string();
+            if (!lec && std::find(inodes.begin(), inodes.end(), target) != inodes.end()) return PortOwner::kOurs;
+        }
+    }
+    return PortOwner::kOther;
+}
+#endif
+
 // A child OpenAI-compatible server on a loopback port.
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
@@ -455,7 +516,16 @@ public:
         const auto end = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
-            if (auto r = c.Get(ready_path_); r && r->status == 200) return true;
+            if (auto r = c.Get(ready_path_); r && r->status == 200) {
+#if defined(__linux__)
+                if (port_owner(pid_, port_) == PortOwner::kOther) {
+                    std::fprintf(stderr, "1bit serve: port %d answers, but not from the backend serve started (pid %d); "
+                                         "refusing to use it\n", port_, int(pid_));
+                    return false;
+                }
+#endif
+                return true;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         return false;
@@ -514,7 +584,16 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     if (!stream) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
-        auto r = c.Post(path, payload, "application/json");
+        // The backend learns of a client that hung up only when serve closes its own connection:
+        // wait for the reply on another thread and close it as soon as the client is gone.
+        auto pending = std::async(std::launch::async, [&] { return c.Post(path, payload, "application/json"); });
+        bool closed = false;
+        while (pending.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready)
+            if (!closed && req.is_connection_closed()) {
+                closed = true;
+                c.stop();
+            }
+        auto r = pending.get();
         if (!r) {
             res.status = 502;
             res.set_content(R"({"error":{"message":"backend did not answer"}})", "application/json");

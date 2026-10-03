@@ -305,8 +305,9 @@ vLLM is built on). `--ctx-size` is split across the slots, so size it for all of
 
 On HRX, `--parallel N` shares one KV cache across the slots (`-kvu`) so attention stays on the
 GPU, and turns off AMD's Qwen attention path, which ignores the other sequences. HRX does not yet
-run a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) with more than one sequence: `serve`
-refuses `--parallel` > 1 there, and without `--parallel` gives those models one slot.
+run a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) with more than one sequence. Under
+`--device auto`, `serve` gives those models one slot on HRX0 and says why on stderr; an explicit
+`--device hrx` with `--parallel` > 1 is refused; without `--parallel` they get one slot.
 
 The earlier measurements here (Vulkan and ROCm batching, and `--adaptive`, which ran both) went
 with those builds (RFC #213 stage 3); see this page at

@@ -207,68 +207,81 @@ bool Scorer::load(const std::string& model_dir) {
     Safetensors r;
     const std::string st_path = model_dir + "/model.safetensors";
     if (!r.open(st_path)) { err_ = "open safetensors: " + r.error(); return false; }
-    auto load_t = [&](const std::string& name, std::vector<float>& dst) -> bool {
-        if (!r.get_f32(name, dst)) { err_ = "missing tensor " + name; return false; }
+    // Every tensor must have the element count the forward pass indexes it with (the dims are
+    // ModernBERT-large's, fixed in this file); want == 0 skips the check.
+    auto load_t = [&](const std::string& name, std::vector<float>& dst, size_t want) -> bool {
+        if (!r.get_f32(name, dst)) { err_ = "missing or malformed tensor " + name; return false; }
+        if (want && dst.size() != want) {
+            err_ = "tensor " + name + " has " + std::to_string(dst.size()) + " elements, the scorer needs " +
+                   std::to_string(want);
+            return false;
+        }
         return true;
     };
+    const size_t d = D;
     // encoder embeddings + norm
-    if (!load_t("encoder.embeddings.tok_embeddings.weight", tok_emb_)) return false;
-    if (!load_t("encoder.embeddings.norm.weight", emb_norm_)) return false;
-    if (!load_t("encoder.final_norm.weight", final_norm_)) return false;
+    if (!load_t("encoder.embeddings.tok_embeddings.weight", tok_emb_, 0)) return false;
+    if (tok_emb_.empty() || tok_emb_.size() % d) {
+        err_ = "encoder.embeddings.tok_embeddings.weight is not a whole number of " + std::to_string(D) + "-wide rows";
+        return false;
+    }
+    n_tok_rows_ = int64_t(tok_emb_.size() / d);
+    if (!load_t("encoder.embeddings.norm.weight", emb_norm_, d)) return false;
+    if (!load_t("encoder.final_norm.weight", final_norm_, d)) return false;
     layers_.resize(NLAYER);
     for (int i = 0; i < NLAYER; ++i) {
         char buf[128];
         LayerW& l = layers_[i];
         snprintf(buf, sizeof buf, "encoder.layers.%d.attn.Wo.weight", i);
-        if (!load_t(buf, l.Wo)) return false;
+        if (!load_t(buf, l.Wo, d * d)) return false;
         snprintf(buf, sizeof buf, "encoder.layers.%d.attn.Wqkv.weight", i);
-        if (!load_t(buf, l.Wqkv)) return false;
+        if (!load_t(buf, l.Wqkv, 3 * d * d)) return false;
         if (i > 0) {  // layer 0 has no attn_norm
             snprintf(buf, sizeof buf, "encoder.layers.%d.attn_norm.weight", i);
-            if (!load_t(buf, l.attn_norm)) return false;
+            if (!load_t(buf, l.attn_norm, d)) return false;
         }
         snprintf(buf, sizeof buf, "encoder.layers.%d.mlp.Wi.weight", i);
-        if (!load_t(buf, l.Wi)) return false;
+        if (!load_t(buf, l.Wi, 5248 * d)) return false;
         snprintf(buf, sizeof buf, "encoder.layers.%d.mlp.Wo.weight", i);
-        if (!load_t(buf, l.Wo_mlp)) return false;
+        if (!load_t(buf, l.Wo_mlp, d * 2624)) return false;
         snprintf(buf, sizeof buf, "encoder.layers.%d.mlp_norm.weight", i);
-        if (!load_t(buf, l.mlp_norm)) return false;
+        if (!load_t(buf, l.mlp_norm, d)) return false;
     }
     // head
-    if (!load_t("type_emb.weight", type_emb_)) return false;
+    if (!load_t("type_emb.weight", type_emb_, 3 * d)) return false;
     head_layers_.resize(2);
     for (int i = 0; i < 2; ++i) {
         char buf[256]; HeadLayerW& h = head_layers_[i];
-        auto L = [&](const char* fmt, std::vector<float>& dst) -> bool {
+        auto L = [&](const char* fmt, std::vector<float>& dst, size_t want) -> bool {
             char b[256]; snprintf(b, sizeof b, fmt, i);
-            return load_t(b, dst);
+            return load_t(b, dst, want);
         };
-        if (!L("head.layers.%d.norm1.weight", h.n1w)) return false;
-        if (!L("head.layers.%d.norm1.bias", h.n1b)) return false;
-        if (!L("head.layers.%d.norm2.weight", h.n2w)) return false;
-        if (!L("head.layers.%d.norm2.bias", h.n2b)) return false;
-        if (!L("head.layers.%d.self_attn.in_proj_weight", h.in_w)) return false;
-        if (!L("head.layers.%d.self_attn.in_proj_bias", h.in_b)) return false;
-        if (!L("head.layers.%d.self_attn.out_proj.weight", h.out_w)) return false;
-        if (!L("head.layers.%d.self_attn.out_proj.bias", h.out_b)) return false;
-        if (!L("head.layers.%d.linear1.weight", h.l1w)) return false;
-        if (!L("head.layers.%d.linear1.bias", h.l1b)) return false;
-        if (!L("head.layers.%d.linear2.weight", h.l2w)) return false;
-        if (!L("head.layers.%d.linear2.bias", h.l2b)) return false;
+        if (!L("head.layers.%d.norm1.weight", h.n1w, d)) return false;
+        if (!L("head.layers.%d.norm1.bias", h.n1b, d)) return false;
+        if (!L("head.layers.%d.norm2.weight", h.n2w, d)) return false;
+        if (!L("head.layers.%d.norm2.bias", h.n2b, d)) return false;
+        if (!L("head.layers.%d.self_attn.in_proj_weight", h.in_w, 3 * d * d)) return false;
+        if (!L("head.layers.%d.self_attn.in_proj_bias", h.in_b, 3 * d)) return false;
+        if (!L("head.layers.%d.self_attn.out_proj.weight", h.out_w, d * d)) return false;
+        if (!L("head.layers.%d.self_attn.out_proj.bias", h.out_b, d)) return false;
+        if (!L("head.layers.%d.linear1.weight", h.l1w, 4096 * d)) return false;
+        if (!L("head.layers.%d.linear1.bias", h.l1b, 4096)) return false;
+        if (!L("head.layers.%d.linear2.weight", h.l2w, d * 4096)) return false;
+        if (!L("head.layers.%d.linear2.bias", h.l2b, d)) return false;
     }
     // scorer
-    if (!load_t("scorer.0.weight", sc0w)) return false;
-    if (!load_t("scorer.0.bias", sc0b)) return false;
-    if (!load_t("scorer.1.weight", sc1w)) return false;
-    if (!load_t("scorer.1.bias", sc1b)) return false;
-    if (!load_t("scorer.3.weight", sc3w)) return false;
-    if (!load_t("scorer.3.bias", sc3b)) return false;
+    if (!load_t("scorer.0.weight", sc0w, d)) return false;
+    if (!load_t("scorer.0.bias", sc0b, d)) return false;
+    if (!load_t("scorer.1.weight", sc1w, d * d)) return false;
+    if (!load_t("scorer.1.bias", sc1b, d)) return false;
+    if (!load_t("scorer.3.weight", sc3w, d)) return false;
+    if (!load_t("scorer.3.bias", sc3b, 1)) return false;
     // act_head
-    if (!load_t("act_head.0.weight", act0w)) return false;
-    if (!load_t("act_head.0.bias", act0b)) return false;
-    if (!load_t("act_head.2.weight", act2w)) return false;
-    if (!load_t("act_head.2.bias", act2b)) return false;
-    if (!load_t("temperature", temperature_)) return false;
+    if (!load_t("act_head.0.weight", act0w, 256 * 1028)) return false;
+    if (!load_t("act_head.0.bias", act0b, 256)) return false;
+    if (!load_t("act_head.2.weight", act2w, 2 * 256)) return false;
+    if (!load_t("act_head.2.bias", act2b, 2)) return false;
+    if (!load_t("temperature", temperature_, 3)) return false;  // one per question type
 
     // tokenizer (special tokens by name)
     try {
@@ -285,6 +298,12 @@ bool Scorer::load(const std::string& model_dir) {
         err_ = "special tokens missing from tokenizer.json";
         return false;
     }
+    for (const int id : {cls_id_, sep_id_, mask_id_, pad_id_})
+        if (id >= n_tok_rows_) {
+            err_ = "special token id " + std::to_string(id) + " is past the embedding's " + std::to_string(n_tok_rows_) +
+                   " rows";
+            return false;
+        }
 
     // config: max_len, head_max_len, temperature from rl_agent_config.json
     std::ifstream cf(model_dir + "/rl_agent_config.json");
@@ -303,6 +322,10 @@ bool Scorer::load(const std::string& model_dir) {
         }
     }
     if (temperature_.empty()) temperature_ = {1.0f, 1.0f, 1.0f};
+    if (temperature_.size() < 3) {  // indexed by question type (choice, score, noul)
+        err_ = "rl_agent_config.json temperature needs one value per question type (3)";
+        return false;
+    }
     return true;
 }
 
@@ -393,6 +416,17 @@ bool Scorer::score(const std::string& state, const std::vector<Question>& questi
     // ---- collate (pad to L, K) ----
     int L = 0, K = 0;
     for (int i = 0; i < N; ++i) { L = std::max(L, (int)seqs[i].size()); K = std::max(K, (int)markers[i].size()); }
+    if (K > 64) {  // the head's per-question buffers hold 64 options
+        err_ = "a question has more than 64 options";
+        return false;
+    }
+    // token ids come from tokenizer.json, rows from model.safetensors: each must have a row
+    for (int i = 0; i < N; ++i)
+        for (const int id : seqs[i])
+            if (id < 0 || id >= n_tok_rows_) {
+                err_ = "token id " + std::to_string(id) + " is past the embedding's " + std::to_string(n_tok_rows_) + " rows";
+                return false;
+            }
     std::vector<int64_t> input_ids((size_t)N * L, pad_id_);
     std::vector<int64_t> attn((size_t)N * L, 0);
     std::vector<int64_t> mpos((size_t)N * K, 0);

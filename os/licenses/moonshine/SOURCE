@@ -1,0 +1,16 @@
+Lemonade backend: moonshine (cpu)
+Ship: yes (conditions: see os/LICENSES.md for the GPL-3.0 readline library it pulls from the system)
+Project: moonshine-server bundle, https://github.com/lemonade-sdk/moonshine-server-rocm (no LICENSE
+file; it holds only a build workflow), freezing moonshine-voice 0.0.62 (https://pypi.org/project/moonshine-voice/,
+https://github.com/moonshine-ai/moonshine) and Lemonade's tools/moonshine-server/main.py
+(Apache-2.0, the Lemonade license in /usr/share/licenses/1bit-os/lemonade-LICENSE) with PyInstaller.
+Release: moonshine0.0.62 (moonshine-server-moonshine0.0.62-linux-x64.tar.gz)
+Licenses: moonshine-voice MIT, Copyright (c) 2025 Moonshine AI, code and the bundled English
+tiny-en model weights (_internal/moonshine_voice/assets/tiny-en; English models are MIT per
+https://github.com/moonshine-ai/moonshine/blob/main/LICENSE). Python 3.12 runtime: PSF License
+(python-LICENSE). numpy (BSD-3-Clause and others, with its bundled OpenBLAS BSD-3-Clause, libgfortran GPL-3.0-or-later
+WITH GCC-exception-3.1, libquadmath LGPL-2.1-or-later), websockets (BSD-3-Clause), tqdm (MPL-2.0 AND
+MIT): license files inside _internal/*.dist-info/ in the backend directory. certifi (MPL-2.0;
+certifi-LICENSE, its covered source file is the bundled cacert.pem) and charset_normalizer (MIT;
+charset_normalizer-LICENSE) ship without their license files, so they are here.
+Source: https://github.com/lemonade-sdk/moonshine-server-rocm/releases/tag/moonshine0.0.62

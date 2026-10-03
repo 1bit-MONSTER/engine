@@ -38,6 +38,7 @@ Everything that has to last lives on the stick's `1BIT-DATA` partition:
 | `lemonade/config/` | Lemonade's config directory: `config.json`, `user_models.json`, `recipe_options.json` |
 | `lemonade/lemond.conf` | Lemonade's environment file: `LEMONADE_API_KEY`, `LEMONADE_ADMIN_API_KEY`, `HF_TOKEN` |
 | `lemonade/cache/` | Lemonade's cache directory, with its backends in `bin/`, installed when the image was built |
+| `lemonade/licenses/` | the backends' licenses, one directory per recipe ([LICENSES.md](LICENSES.md)) |
 | `lemonade/huggingface/` | models Lemonade downloads (`models_dir`) |
 | `cache/hrx-jit/` | HRX's Loom kernel cache (`GGML_HRX_JIT_CACHE_DIR`): the first use of a kernel compiles it, later boots reuse it |
 | `ssh/` | `authorized_keys` and the SSH host key |
@@ -63,11 +64,16 @@ that ahead of time instead: it runs `lemond` on the build machine and asks Lemon
 (`POST /api/v1/install`) for each backend in `LEMONADE_BACKENDS`, then copies Lemonade's `bin/`
 directory into `lemonade/cache/` on the stick, at the paths and versions Lemonade expects. The
 system libraries those backends link go into the image. The default list is every backend Lemonade
-offers on Linux x86_64 for Strix Halo that needs no ROCm runtime:
+offers on Linux x86_64 for Strix Halo that needs no ROCm runtime and whose license allows it on the
+stick:
 
 `llamacpp:vulkan llamacpp:cpu llamacpp-hrx:hrx whispercpp:vulkan whispercpp:cpu sd-cpp:vulkan
-sd-cpp:cpu kokoro:cpu moonshine:cpu onnxruntime:cpu acestep:vulkan thinksound:vulkan
-trellis:vulkan openmoss:vulkan flm:npu`
+sd-cpp:cpu kokoro:cpu moonshine:cpu onnxruntime:cpu acestep:vulkan trellis:vulkan openmoss:vulkan`
+
+`thinksound:vulkan` (no license) and `flm:npu` (closed NPU binaries linked with GPL FFTW) are left
+to Lemonade's download on the stick. [LICENSES.md](LICENSES.md) lists every third-party piece of
+the image, its license and its source; a backend ships only when `os/licenses/<recipe>/SOURCE`
+says `Ship: yes`, and its license texts go with it.
 
 The installs are kept in `~/.cache/1bit-os/lemonade-backends/`, one set per Lemonade pin, so the
 next build downloads nothing. `LEMONADE_BACKENDS=` (empty) leaves them all to Lemonade's download.
@@ -163,8 +169,7 @@ the entry is in Lemonade's registry on the stick. On a machine without TheRock o
 What only the hardware can check: `amdgpu` bringing up `/dev/kfd` and HRX0 from the image (TheRock's
 HSA runtime and its libraries complete, the PM4-emulation probe answered), Lemonade offering and
 running `onebit` models on HRX0 and the NPU, HRX kernels compiling into `/data/cache/hrx-jit` and
-being reused after a reboot, Lemonade's Vulkan backends on RADV, `llamacpp-hrx`, FastFlowLM on the
-NPU, Lemonade's ROCm downloads for gfx1151, the Wi-Fi chip, and the speed of all of it.
+being reused after a reboot, Lemonade's Vulkan backends on RADV, `llamacpp-hrx`, Lemonade's ROCm downloads for gfx1151, the Wi-Fi chip, and the speed of all of it.
 
 ## Next
 

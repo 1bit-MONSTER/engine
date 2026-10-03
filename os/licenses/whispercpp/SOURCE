@@ -1,0 +1,7 @@
+Lemonade backend: whispercpp (vulkan, cpu)
+Ship: yes
+Project: whisper.cpp, https://github.com/ggml-org/whisper.cpp, built by
+https://github.com/lemonade-sdk/whisper.cpp-rocm
+Release: v1.8.4 (whisper-v1.8.4-linux-vulkan-x86_64.tar.gz, whisper-v1.8.4-linux-cpu-x86_64.tar.gz)
+License: MIT, Copyright (c) 2023-2026 The ggml authors (LICENSE; the release archive has none)
+Source: https://github.com/lemonade-sdk/whisper.cpp-rocm/tree/v1.8.4

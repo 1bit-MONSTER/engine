@@ -1,0 +1,20 @@
+Lemonade backend: llamacpp-hrx (hrx)
+Ship: yes
+Project: AMD's HRX llama.cpp staging build, https://github.com/ROCm/ggml-staging-automation
+Release: hrx-b69 (llama-hrx-b69-bin-manylinux-hrx-x64.tar.gz)
+License: MIT, Copyright (c) 2026 Advanced Micro Devices, Inc. (LICENSE inside the backend directory)
+Contents and their licenses:
+  llama.cpp, AMD-Ecosystem/llama.cpp branch hrx-graph-develop-v2: MIT, the ggml authors (llama.cpp-LICENSE)
+  HRX, ROCm/hrx-system (libhrx.so): Apache-2.0 (hrx-system-LICENSE)
+  ROCr HSA runtime (libhsa-runtime64.so): University of Illinois/NCSA (ROCR-Runtime-LICENSE)
+  aqlprofile (libhsa-amd-aqlprofile64.so): MIT, Advanced Micro Devices, Inc. (aqlprofile-LICENSE)
+  TheRock system libraries, lib/rocm_sysdeps (https://github.com/ROCm/TheRock, third-party/sysdeps):
+    elfutils libelf/libdw/libasm: LGPL-3.0-or-later OR GPL-2.0-or-later
+    libnl: LGPL-2.1-only; numactl libnuma: LGPL-2.1-only; libmnl: LGPL-2.1-or-later
+    libcap/libpsx: BSD-3-Clause OR GPL-2.0-only; libdrm: MIT; bzip2: bzip2-1.0.6;
+    xz liblzma: 0BSD; SQLite: public domain
+  The image carries the Ubuntu copyright files of the same projects in rocm_sysdeps/ and the
+  GPL/LGPL texts in /usr/share/common-licenses.
+Source: https://github.com/ROCm/ggml-staging-automation/tree/hrx-b69 (with its hrx-system and
+llama.cpp submodules); the LGPL sysdeps from the upstream tarballs TheRock builds (elfutils,
+libnl, numactl, libmnl), see os/LICENSES.md.

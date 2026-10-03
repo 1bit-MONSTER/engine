@@ -24,10 +24,16 @@
 #   <out>/1bit-os.img   a USB image: an EFI partition with 1bit-os.efi as the default boot
 #                       entry, and an ext4 data partition (label 1BIT-DATA) for models
 #
-# The initramfs holds only what 1bit needs: BusyBox, the kernel modules for the GPU (amdgpu),
-# the NPU (amdxdna), Ethernet, Wi-Fi and USB storage, the firmware those load, Mesa's Radeon
-# Vulkan driver, XRT with the XDNA plugin, and the engine (1bit, and its Vulkan llama-server),
-# each with exactly the shared libraries it links.
+# The initramfs holds only what 1bit needs: BusyBox, the kernel modules for the GPU (amdgpu, which
+# also provides /dev/kfd) and the NPU (amdxdna), Ethernet, Wi-Fi and USB storage, the firmware those
+# load, XRT with the XDNA plugin, and the engine: 1bit and its HRX llama-server (RFC #213 stage 3:
+# no Vulkan), with TheRock's HSA runtime that HRX loads (ONEBIT_HRX_LIBHSA from the build's CMake
+# cache, kept at its path, which 1bit has compiled in), each with exactly the shared libraries it
+# links. HRX compiles its Loom kernels on first use and caches them (GGML_HRX_JIT_CACHE_DIR); init
+# keeps that cache on the stick's data partition, so only the first boot pays the compile.
+#
+# Test images only (vmtest.sh on a machine without TheRock or XRT): LLAMA_SERVER=<a CPU
+# llama-server> stands in for the HRX build, and NO_XRT=1 leaves XRT out.
 #
 # Needs no root: the EFI stub and mtools come from their Debian packages, unpacked locally.
 set -euo pipefail
@@ -37,6 +43,8 @@ out=${1:?usage: mkimage.sh <out> [engine build dir]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
 build=$(cd "$build" && pwd)   # absolute: binaries keep their build paths inside the image
 kver=${KVER:-$(uname -r)}
+# the kernel image: /boot/vmlinuz-<kver>, or VMLINUZ= (e.g. unpacked from its .deb where /boot is root-only)
+vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x
 # Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A
@@ -51,7 +59,7 @@ if [ ! -x "$tools/usr/sbin/dropbear" ] || [ ! -x "$tools/usr/bin/mtools" ] ||
 fi
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 root=$out/root
-rm -rf "$root"; mkdir -p "$root"/{bin,sbin,etc,proc,sys,dev,tmp,run,data,lib/firmware,usr/share/vulkan/icd.d,root}
+rm -rf "$root"; mkdir -p "$root"/{bin,sbin,etc,proc,sys,dev,tmp,run,data,lib/firmware,root}
 
 # --- a file and every shared library it links, at the same paths -------------------------
 copy_elf() {
@@ -89,30 +97,46 @@ fw "amdgpu/gc_11_5_1_*" "amdgpu/sdma_6_1_1*" "amdgpu/psp_14_0_1*" "amdgpu/smu_14
    "amdgpu/vpe_6_1_1*" "amdgpu/dcn_3_5_1*" "amdgpu/vcn_4_0_6*" "amdnpu/17f0_11" \
    "rtl_nic/rtl8125*" "mediatek/mt7925" "mediatek/WIFI_*7925*" "mediatek/BT_*7925*" "regulatory.db*"
 
-echo "== Vulkan (Mesa RADV) and XRT"
-radv=$(ls /usr/lib/x86_64-linux-gnu/libvulkan_radeon.so)
-copy_elf /usr/lib/x86_64-linux-gnu/libvulkan.so.1 "$radv"
-printf '{"file_format_version":"1.0.1","ICD":{"library_path":"%s","api_version":"1.4"}}\n' "$radv" \
-    > "$root/usr/share/vulkan/icd.d/radeon_icd.json"
-if [ -n "${LAVAPIPE:-}" ]; then   # test images only: Vulkan on the CPU, for a VM with no Radeon GPU
-    lvp=/usr/lib/x86_64-linux-gnu/libvulkan_lvp.so
-    copy_elf "$lvp"
-    printf '{"file_format_version":"1.0.1","ICD":{"library_path":"%s","api_version":"1.4"}}\n' "$lvp" \
-        > "$root/usr/share/vulkan/icd.d/lvp_icd.json"
+echo "== XRT"
+if [ -n "${NO_XRT:-}" ]; then
+    echo "   left out (NO_XRT=1: a test image, no NPU)"
+    mkdir -p "$root/etc/1bit"; touch "$root/etc/1bit/no_xrt"
+else
+    copy_elf /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 /opt/xilinx/xrt/lib/libxrt_core.so.2 \
+             /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2
+    (cd "$root/opt/xilinx/xrt/lib" && for l in libxrt_coreutil libxrt_core libxrt_driver_xdna; do ln -sf $l.so.2 $l.so; done)
 fi
-copy_elf /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 /opt/xilinx/xrt/lib/libxrt_core.so.2 \
-         /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2
-(cd "$root/opt/xilinx/xrt/lib" && for l in libxrt_coreutil libxrt_core libxrt_driver_xdna; do ln -sf $l.so.2 $l.so; done)
 
 echo "== the engine"
 bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
-[ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_VULKAN=ON)"; exit 1; }
+[ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_HRX=ON)"; exit 1; }
 copy_elf "$bin"
 ln -s "$bin" "$root/bin/1bit"
-vk=$build/vulkan/llama/bin
-if [ -x "$vk/llama-server" ]; then
-    copy_elf "$vk/llama-server" $(ls "$vk"/lib*.so* 2>/dev/null)   # at its build path: 1bit serve runs it from there
-    mkdir -p "$root/opt/1bit-llama"; ln -s "$vk/llama-server" "$root/opt/1bit-llama/llama-server"
+mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"
+hrx=$build/hrx/llama/bin
+cache_get() { sed -n "s/^$1:[A-Z]*=//p" "$build/CMakeCache.txt" 2>/dev/null; }
+if [ -x "$hrx/llama-server" ]; then
+    # at its build path: 1bit serve runs it from there (ONEBIT_HRX_SERVER), for HRX0 and the CPU
+    copy_elf "$hrx/llama-server" $(ls "$hrx"/lib*.so* 2>/dev/null)
+    ln -s "$hrx/llama-server" "$root/opt/1bit-llama/llama-server"
+    # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md)
+    hsa=$(cache_get ONEBIT_HRX_LIBHSA)
+    [ -n "$hsa" ] && [ -e "$hsa" ] || { echo "no ONEBIT_HRX_LIBHSA in $build/CMakeCache.txt"; exit 1; }
+    copy_elf "$hsa"
+    echo "$hsa" > "$root/etc/1bit/libhsa"
+    # libdrm's GPU name table, where TheRock has one (names only; HSA works without it)
+    for ids in "$(dirname "$hsa")"/../share/libdrm/amdgpu.ids "$(cache_get ONEBIT_HRX_TOOLCHAIN)"/share/libdrm/amdgpu.ids; do
+        if [ -e "$ids" ]; then ids=$(realpath "$ids"); mkdir -p "$root$(dirname "$ids")"; cp "$ids" "$root$ids"; break; fi
+    done
+    echo "   HRX llama-server ($hrx), HSA runtime $hsa"
+elif [ -n "${LLAMA_SERVER:-}" ]; then
+    # test images only: a CPU llama-server, found on PATH by a 1bit built without HRX
+    ls=$(realpath "$LLAMA_SERVER")
+    copy_elf "$ls" $(ls "$(dirname "$ls")"/lib*.so* 2>/dev/null)
+    ln -s "$ls" "$root/opt/1bit-llama/llama-server"
+    echo "   CPU llama-server ($ls): a test image, no HRX"
+else
+    echo "no HRX llama-server in $build (build with -DONEBIT_HRX=ON; LLAMA_SERVER=<path> for a CPU-only test image)"; exit 1
 fi
 
 echo "== SSH (Dropbear, key logins only)"
@@ -146,9 +170,9 @@ printf '%s' "$cmdline" > "$out/cmdline.txt"
 align() { echo $(( ($1 + 65535) / 65536 * 65536 )); }
 end=$(objdump -h "$stub" | python3 -c 'import sys; print(max(int(f[3], 16) + int(f[2], 16) for f in (l.split() for l in sys.stdin) if len(f) == 7 and f[0].isdigit()))')
 o_cmd=$(align "$end");                 o_linux=$(align $((o_cmd + $(stat -c %s "$out/cmdline.txt"))))
-o_initrd=$(align $((o_linux + $(stat -c %s /boot/vmlinuz-"$kver"))))
+o_initrd=$(align $((o_linux + $(stat -c %s "$vmlinuz"))))
 objcopy --add-section .cmdline="$out/cmdline.txt" --change-section-vma .cmdline=$o_cmd \
-        --add-section .linux=/boot/vmlinuz-"$kver" --change-section-vma .linux=$o_linux \
+        --add-section .linux="$vmlinuz" --change-section-vma .linux=$o_linux \
         --add-section .initrd="$out/initramfs.img" --change-section-vma .initrd=$o_initrd \
         "$stub" "$out/1bit-os.efi"
 
@@ -167,8 +191,9 @@ for m in ${MODELS:-}; do cp -L "$m" "$out/data.dir/models/"; done
 [ -n "${CONF:-}" ] && cp "$CONF" "$out/data.dir/1bit.conf"
 cat > "$out/data.dir/1bit.conf.example" <<'CONF'
 # 1bit OS starts `1bit serve` at boot when 1bit.conf (this file, renamed) names a model.
+# DEVICE: auto (HRX0 for a .gguf, the NPU for an NPU model directory), hrx, cpu or npu.
 MODEL=/data/models/Qwen3-32B-UD-Q4_K_XL.gguf
-DEVICE=vulkan
+DEVICE=auto
 PORT=8000
 # anything else for 1bit serve, e.g. --mtp or --parallel 4
 ARGS=

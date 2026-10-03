@@ -167,12 +167,19 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                                   std::chrono::system_clock::now().time_since_epoch()).count());
     const std::string object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
+    // A prompt this long cannot fit the context whatever it tokenizes to.
+    if (prompt.size() > size_t(e.max_context) * 16) {
+        res.status = 400;
+        res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
+        return;
+    }
     auto run = [&e, prompt, opt](const std::function<bool(const std::string&)>& on_text) mutable {
-        std::lock_guard<std::mutex> lock(e.mu);
+        // The tokenizer is const and keeps no per-call state, so it runs before the lock.
         const auto ids = e.tok->encode(prompt);
         if (ids.empty()) throw std::runtime_error("empty prompt");
         const int room = e.max_context - int(ids.size());
         if (room < 1) throw std::runtime_error("prompt longer than the context");
+        std::lock_guard<std::mutex> lock(e.mu);
         opt.max_tokens = std::min(opt.max_tokens, room);
         std::string pending;
         opt.on_token = [&](int t) {

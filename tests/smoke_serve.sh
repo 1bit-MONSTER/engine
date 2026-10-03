@@ -56,6 +56,17 @@ chunks=$(curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json'
     -d '{"model": "smoke-model", "stream": true, "messages": [{"role": "user", "content": "hi"}]}' | grep -c '^data: {')
 check "SSE relayed ($chunks chunks)" '[ "$chunks" = 7 ]'
 
+# No authentication, so a web page must not drive it: a rebound hostname and a cross-site POST
+# are refused; API clients (no Origin) and loopback pages are not.
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rebind.example:80' "$api/v1/models")
+check "a foreign Host is refused ($code)" '[ "$code" = 403 ]'
+code=$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: text/plain' \
+    -H 'Origin: https://evil.example' -d '{"messages": [{"role": "user", "content": "hi"}]}')
+check "a cross-site POST is refused ($code)" '[ "$code" = 403 ]'
+code=$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -H 'Origin: http://localhost:3000' -d '{"messages": [{"role": "user", "content": "hi"}]}')
+check "a loopback page's POST is served ($code)" '[ "$code" = 200 ]'
+
 # A client that hangs up on a non-streamed request: serve closes the backend connection too,
 # so the backend can stop generating (the fake one notes which happened).
 curl -s -m 1 -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \

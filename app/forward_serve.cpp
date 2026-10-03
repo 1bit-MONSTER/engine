@@ -32,6 +32,7 @@
 #include <xrt/xrt_device.h>
 
 #include <httplib.h>
+#include "http_guard.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -337,6 +338,7 @@ int run_forward_serve(int argc, char** argv) {
 
     std::atomic<bool> ready{false};
     httplib::Server srv;
+    install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
     srv.Get("/health", [&](const httplib::Request&, httplib::Response& r) {
         r.status = ready ? 200 : 503;
         r.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");

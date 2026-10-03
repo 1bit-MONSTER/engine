@@ -31,7 +31,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 
 rm -f "$out/key" "$out/key.pub"; ssh-keygen -q -t ed25519 -N "" -f "$out/key"
-printf 'MODEL=/data/models/%s\nDEVICE=cpu\nPORT=8000\nARGS=\"--ctx-size 4096\"\n' "$(basename "$model")" > "$out/1bit.conf"
+# BIND=0.0.0.0: QEMU's port forward reaches the guest's network address, not its loopback
+printf 'MODEL=/data/models/%s\nDEVICE=cpu\nBIND=0.0.0.0\nPORT=8000\nARGS=\"--ctx-size 4096\"\n' "$(basename "$model")" > "$out/1bit.conf"
 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" \
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1
 

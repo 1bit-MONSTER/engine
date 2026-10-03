@@ -761,7 +761,7 @@ int npu_pack_lmhead_bo(uint8_t* bo_buffer, ModelWeights* mw, const ModelConfig* 
 // ========= Simple JSON Parser =========
 
 static int parse_json_metadata(const uint8_t* json_data, uint64_t json_len,
-                                TensorDesc* tensors, int max_tensors);
+                                TensorDesc* tensors, int max_tensors, uint64_t data_limit);
 static int find_tensor(const char* name, TensorDesc* tensors, int count);
 // find a per-layer tensor by name with both layer namings
 static int find_layer_tensor(const char* name_plural, const char* name_singular,
@@ -788,7 +788,12 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
     }
     
     struct stat st;
-    fstat(fd, &st);
+    if (fstat(fd, &st) != 0 || st.st_size < 8) {
+        LOG_ERROR("model file too small or unreadable: %s", path);
+        close(fd);
+        free(mw);
+        return NULL;
+    }
     mw->file_size = st.st_size;
     
     mw->file_data = mmap(NULL, mw->file_size, PROT_READ, MAP_PRIVATE, fd, 0);
@@ -802,6 +807,13 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
     
     uint64_t header_size;
     memcpy(&header_size, mw->file_data, 8);
+    // 100 MiB is the safetensors limit; real tensor tables are a few MiB at most.
+    if (header_size > mw->file_size - 8 || header_size > 100u * 1024 * 1024) {
+        LOG_ERROR("model file header runs past the end of the file: %s", path);
+        munmap(mw->file_data, mw->file_size);
+        free(mw);
+        return NULL;
+    }
     // Tensor offsets are relative to the data section that follows the 8-byte
     // length prefix and the JSON header.
     mw->data_base = 8 + header_size;
@@ -818,8 +830,24 @@ ModelWeights* model_load(const char* path, ModelConfig config) {
     // part-way through the FIRST step.  Raised, and the cap now reports itself.
     int max_tensors = 4096;
     TensorDesc* tensors = calloc(max_tensors, sizeof(TensorDesc));
-    int num_tensors = parse_json_metadata((const uint8_t*)json_start, json_len,
-                                           tensors, max_tensors);
+    // The header is parsed from a NUL-terminated copy: the parser's string scans
+    // stop at a NUL, which the mapped file need not have.
+    char* json_copy = malloc(json_len + 1);
+    int num_tensors = -1;
+    if (tensors && json_copy) {
+        memcpy(json_copy, json_start, json_len);
+        json_copy[json_len] = '\0';
+        num_tensors = parse_json_metadata((const uint8_t*)json_copy, json_len, tensors, max_tensors,
+                                          mw->file_size - mw->data_base);
+    }
+    free(json_copy);
+    if (num_tensors < 0) {
+        LOG_ERROR("model file has a bad tensor table (a tensor runs past the end of the file?): %s", path);
+        free(tensors);
+        munmap(mw->file_data, mw->file_size);
+        free(mw);
+        return NULL;
+    }
     
     LOG_INFO("Found %d tensors in metadata", num_tensors);
     
@@ -1122,6 +1150,10 @@ TensorDesc* model_tensor_by_name(ModelWeights* mw, const char* name) {
 
 void* model_tensor_data(ModelWeights* mw, TensorDesc* desc) {
     if (!mw || !desc) return NULL;
+    // model_load bounds every tensor it parsed; this also covers a descriptor filled elsewhere.
+    if (mw->data_base > mw->file_size || desc->data_offset > mw->file_size - mw->data_base ||
+        desc->data_size > mw->file_size - mw->data_base - desc->data_offset)
+        return NULL;
     // data_offsets in the JSON metadata are relative to the tensor-data start
     // (right after the 8-byte length + JSON header). Without data_base every
     // tensor is read header_len bytes early (garbage scales/nibbles).
@@ -1134,8 +1166,11 @@ int model_find_tensor(const char* name, ModelWeights* mw) {
     return -1;
 }
 
+// json_data must be NUL-terminated at json_len.  Returns the tensor count, or -1
+// when a tensor's data_offsets are reversed or end past data_limit (the bytes after
+// the header).
 static int parse_json_metadata(const uint8_t* json_data, uint64_t json_len,
-                                TensorDesc* tensors, int max_tensors) {
+                                TensorDesc* tensors, int max_tensors, uint64_t data_limit) {
     const char* s = (const char*)json_data;
     uint64_t len = json_len;
     int count = 0;
@@ -1248,6 +1283,7 @@ static int parse_json_metadata(const uint8_t* json_data, uint64_t json_len,
                     } else break;
                 }
                 if (off_count == 2) {
+                    if (offsets[1] < offsets[0] || offsets[1] > data_limit) return -1;
                     t->data_offset = offsets[0];
                     t->data_size = offsets[1] - offsets[0];
                 }

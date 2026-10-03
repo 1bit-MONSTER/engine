@@ -63,6 +63,19 @@ static inline float softplus_f(float x) {
     return log1pf(expf(x));
 }
 
+// A tensor's data as n bf16 values, or null when the tensor holds fewer than n
+// (config.json's dims decide n; the file decides the size).
+static const uint16_t* bf16_data(ModelWeights* mw, const TensorDesc* d, size_t n) {
+    if (!d || (size_t)d->data_size / 2 < n) return nullptr;
+    return (const uint16_t*)model_tensor_data(mw, const_cast<TensorDesc*>(d));
+}
+
+// A tensor's data when it holds at least `bytes`, else null.
+static const uint8_t* data_of(ModelWeights* mw, const TensorDesc* d, size_t bytes) {
+    if (!d || (size_t)d->data_size < bytes) return nullptr;
+    return (const uint8_t*)model_tensor_data(mw, const_cast<TensorDesc*>(d));
+}
+
 static bool file_exists(const std::string& p, long min_size = 1) {
     FILE* f = fopen(p.c_str(), "rb");
     if (!f) return false;
@@ -225,6 +238,12 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     if (logit_scale_ == 0.0f) logit_scale_ = 1.0f;
     mw_ = model_load(model_path, cfg);
     if (!mw_) { err_ = "model_load failed"; return false; }
+    // model_load sized its layer table from the tensors; config.json may not promise more.
+    if (cfg.num_layers <= 0 || cfg.num_layers > mw_->config.num_layers) {
+        err_ = "config.json num_hidden_layers (" + std::to_string(cfg.num_layers) + ") does not match the " +
+               std::to_string(mw_->config.num_layers) + " layers in model.q4nx";
+        return false;
+    }
 
     // forward dims mirror the config the weights were loaded with
     c_.H = cfg.hidden_size;
@@ -266,7 +285,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                  * the forward applies none here; the LM head divides it back
                  * out (see run_lm_head). */
                 TensorDesc* sd = model_tensor_by_name(mw_, "model.embed_tokens.weight.scale");
-                const float* sc = sd ? (const float*)model_tensor_data(mw_, sd) : nullptr;
+                const float* sc = sd ? (const float*)data_of(mw_, sd, en / 32 * sizeof(float)) : nullptr;
+                if (sd && !sc) { err_ = "model.embed_tokens.weight.scale is too small"; return false; }
                 rc = q4nx_dequant_plain_i8((const uint8_t*)e, sc, NV, H, embed_f_.data());
             } else {
                 rc = dequant_any((const uint8_t*)e, esz, NV, H, embed_f_.data());
@@ -398,7 +418,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         expert_gating_sigmoid_ =
             q4nx_config_int(cfg_path.c_str(), "expert_gating_func", 1) == 2;  // 2 = sigmoid
         expert_w_scale_ = read_config_float(cfg_path, "\"expert_weights_scale\"", 1.0f);
-        if (top_k_ <= 0 || expert_im_ <= 0) {
+        if (top_k_ <= 0 || top_k_ > n_expert_ || expert_im_ <= 0) {
             fprintf(stderr, "  [moe] config incomplete (n_expert=%d top_k=%d im=%d)\n",
                     n_expert_, top_k_, expert_im_);
             err_ = "MoE config incomplete";
@@ -407,6 +427,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [moe] %sMoE: NH=%d n_expert=%d top%d im=%d dense_im=%d gating=%s\n",
                 mla_ ? "MLA+" : "", c_.NH, n_expert_, top_k_, expert_im_, dense_im_,
                 expert_gating_sigmoid_ ? "sigmoid" : "softmax");
+    }
+
+    // attention() shares each KV head across NH / NKV query heads (kh = h / (NH / NKV)), so the
+    // KV heads must divide the query heads; Gemma4's global layers have their own KV count.
+    if (!mla_) {
+        auto bad_kv = [&](int nkv) {
+            if (nkv > 0 && nkv <= c_.NH && c_.NH % nkv == 0) return false;
+            err_ = "config.json has " + std::to_string(c_.NH) + " attention heads and " + std::to_string(nkv) +
+                   " key/value heads; the key/value heads must divide the attention heads";
+            return true;
+        };
+        if (bad_kv(c_.NKV)) return false;
+        if (sem_.num_global_kv_heads > 0 && bad_kv(sem_.num_global_kv_heads)) return false;
     }
 
     Q4nxModelDims dims{};
@@ -599,8 +632,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         const int H = c_.H, NL = c_.NL;
         auto read_named = [&](const char* nm, float* dst, int n) -> bool {
             TensorDesc* td = model_tensor_by_name(mw_, nm);
-            if (!td) return false;
-            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, td);
+            if (!td || n < 0) return false;
+            const uint16_t* p = bf16_data(mw_, td, (size_t)n);
             if (!p) return false;
             for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(p[i]);
             return true;
@@ -621,7 +654,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             snprintf(nm, sizeof(nm), "model.per_layer_model_proj.weight_layer%d", l);
             TensorDesc* td = model_tensor_by_name(mw_, nm);
             if (!td) { err_ = std::string("missing ") + nm; return false; }
-            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, td);
+            const uint16_t* p = bf16_data(mw_, td, (size_t)ple_dim_ * (size_t)H);
             if (!p || (ple_dim_ % 32) != 0) {
                 err_ = std::string("bad ") + nm;
                 return false;
@@ -693,8 +726,18 @@ bool Q4nxNpuForward::load_norms() {
     final_norm_.assign(H, 0.0f);
 
     auto read_bf16 = [&](const TensorDesc* d, float* dst, int n) -> bool {
-        const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, const_cast<TensorDesc*>(d));
-        if (!p) return false;
+        if (n < 0) return false;
+        // A tensor the model does not have (no name, no data) reads as zeros, as before
+        // it read whatever sat at the start of the data; its slot is unused.
+        if (d->name[0] == '\0' && d->data_size == 0) {
+            std::fill(dst, dst + n, 0.0f);
+            return true;
+        }
+        const uint16_t* p = bf16_data(mw_, d, (size_t)n);
+        if (!p) {
+            err_ = std::string("tensor ") + d->name + " is smaller than config.json's dims";
+            return false;
+        }
         for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(p[i]);
         return true;
     };
@@ -738,8 +781,8 @@ bool Q4nxNpuForward::load_norms() {
             auto rd = [&](const char* fmt, float* dst, int n) -> bool {
                 snprintf(nm, sizeof(nm), fmt, l);
                 TensorDesc* td = model_tensor_by_name(mw_, nm);
-                if (!td) return false;
-                const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, td);
+                if (!td || n < 0) return false;
+                const uint16_t* p = bf16_data(mw_, td, (size_t)n);
                 if (!p) return false;
                 for (int i = 0; i < n; i++) dst[i] = bf16_to_f32(p[i]);
                 return true;
@@ -751,8 +794,8 @@ bool Q4nxNpuForward::load_norms() {
             auto rd_grouped = [&](const char* fmt, float* dst, int rows, int cols) -> bool {
                 snprintf(nm, sizeof(nm), fmt, l);
                 TensorDesc* td = model_tensor_by_name(mw_, nm);
-                if (!td) return false;
-                const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, td);
+                if (!td || rows < 0 || cols < 0) return false;
+                const uint16_t* p = bf16_data(mw_, td, (size_t)rows * (size_t)cols);
                 if (!p || (rows % 32) != 0) return false;
                 for (int a = 0; a < rows / 32; a++)
                     for (int c = 0; c < cols; c++)
@@ -817,8 +860,8 @@ bool Q4nxNpuForward::load_layer(int l) {
         auto load_bf16 = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
             TensorDesc* d = td_of(fmt);
             if (!d) { snprintf(nm, sizeof(nm), fmt, l); fprintf(stderr, "  [mla] missing %s\n", nm); return false; }
-            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
-            if (!p) return false;
+            const uint16_t* p = n < 0 ? nullptr : bf16_data(mw_, d, (size_t)n);
+            if (!p) { snprintf(nm, sizeof(nm), fmt, l); fprintf(stderr, "  [mla] %s is too small\n", nm); return false; }
             v.resize((size_t)n);
             for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
             return true;
@@ -930,8 +973,8 @@ bool Q4nxNpuForward::load_layer(int l) {
         };
         auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
             TensorDesc* d = td2(fmt);
-            if (!d) return false;
-            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!d || n < 0) return false;
+            const uint16_t* p = bf16_data(mw_, d, (size_t)n);
             if (!p) return false;
             v.resize((size_t)n);
             for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
@@ -1053,8 +1096,8 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         };
         auto load_bf16_opt = [&](const char* fmt, std::vector<float>& v, int n) -> bool {
             TensorDesc* d = td2(fmt);
-            if (!d) return false;
-            const uint16_t* p = (const uint16_t*)model_tensor_data(mw_, d);
+            if (!d || n < 0) return false;
+            const uint16_t* p = bf16_data(mw_, d, (size_t)n);
             if (!p) return false;
             v.resize((size_t)n);
             for (int i = 0; i < n; i++) v[i] = bf16_to_f32(p[i]);
@@ -1239,7 +1282,7 @@ bool Q4nxNpuForward::load_ple_block(int row) {
     if (!td) { err_ = "missing model.per_layer_token_embd.weight"; return false; }
     const int cols = c_.NL * ple_dim_;
     const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, td);
-    if (!raw) { err_ = "per_layer_token_embd has no data"; return false; }
+    if (!raw || block < 0) { err_ = "per_layer_token_embd has no data"; return false; }
     ple_block_.assign((size_t)Q4NX_TILE_ROWS * (size_t)cols, 0.0f);
     const size_t plain_bytes =
         (size_t)sem_.vocab_size_per_layer_input * (size_t)cols;
@@ -1249,7 +1292,15 @@ bool Q4nxNpuForward::load_ple_block(int row) {
         // [vocab, NL*ple_dim] table.
         TensorDesc* sd =
             model_tensor_by_name(mw_, "model.per_layer_token_embd.weight.scale");
-        const float* sc = sd ? (const float*)model_tensor_data(mw_, sd) : nullptr;
+        // the band and its scales must lie inside their tensors
+        if (((size_t)block + 1) * Q4NX_TILE_ROWS * (size_t)cols > plain_bytes) {
+            err_ = "per_layer_token_embd row out of range";
+            return false;
+        }
+        const float* sc = sd ? (const float*)data_of(mw_, sd, ((size_t)block + 1) * Q4NX_TILE_ROWS *
+                                                                  (size_t)(cols / 32) * sizeof(float))
+                             : nullptr;
+        if (sd && !sc) { err_ = "per_layer_token_embd scale is too small"; return false; }
         const uint8_t* band = raw + (size_t)block * Q4NX_TILE_ROWS * (size_t)cols;
         const float* band_sc =
             sc ? sc + (size_t)block * Q4NX_TILE_ROWS * (size_t)(cols / 32) : nullptr;
@@ -1260,6 +1311,10 @@ bool Q4nxNpuForward::load_ple_block(int row) {
         }
     } else {
         const size_t band = q4nx_tensor_bytes(Q4NX_TILE_ROWS, cols);
+        if (band == 0 || ((size_t)block + 1) * band > (size_t)td->data_size) {
+            err_ = "per_layer_token_embd row out of range";
+            return false;
+        }
         if (q4nx_dequant_tensor(raw + (size_t)block * band, band, Q4NX_TILE_ROWS,
                                 cols, ple_block_.data()) != 0) {
             err_ = "per_layer_token_embd dequant failed";

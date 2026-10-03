@@ -374,8 +374,17 @@ time. Both are pinned: `third_party/xdna-driver` is upstream
 
 Verified on 2026-09-23 with xdna-driver `5d302c9` and XRT `d8ececf`, in place of the system's
 XRT 2.21.75. Both `libxrt_core` and `libxrt_driver_xdna` were loaded from the pinned prefix
-(strace). `tests/npu_lane_e2e.sh` gave logits bit-identical to the reference lane on 24/24 steps,
-at 10.8 ms/token (92.6 tok/s), with a 327 ms warm load.
+(strace). The fast-lane test of that time (`tests/npu_lane_e2e.sh`, since retired) gave logits
+bit-identical to the reference lane on 24/24 steps, at 10.8 ms/token (92.6 tok/s), with a 327 ms
+warm load.
+
+### Checking the NPU
+
+`tests/npu_lane_e2e.sh` is retired (2026-10-03): the fast-lane kernels it ran were derived from
+FastFlowLM, and the reference logits it compared against are lost. The NPU check is now the private dx add-on's from-source check, which is not in this repository. A
+pin bump that touches the NPU (xdna-driver, XRT, the Linux kernel) is checked with it on Strix
+Halo before merging; the public tests that need no kernels (`npu_full_elf_md5`, `npu_q4nx`,
+`npu_pack_test`, `tokenizer_test`) still run in CI.
 
 ## Step 3d: the layer kernel and lm-head, built from source
 

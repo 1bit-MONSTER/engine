@@ -16,8 +16,8 @@
 # Keep third_party/xdna-driver on upstream amd/xdna-driver main (docs/npu.md,
 # "The XDNA stack"): when upstream moves, open a PR here moving the submodule.
 # It pins XRT too (xdna-driver's own xrt submodule). GitHub-hosted CI has no
-# NPU; build with scripts/build-xdna.sh and run tests/npu_lane_e2e.sh on Strix
-# Halo before merging.
+# NPU; build with scripts/build-xdna.sh and run the NPU check (docs/npu.md,
+# "Checking the NPU") on Strix Halo before merging.
 #
 # Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
 # 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
@@ -97,4 +97,4 @@ jobs:
           ${log}
 
           CI here has no NPU. Before merging, on Strix Halo:
-          \`scripts/build-xdna.sh ~/.cache/xdna-pin/prefix && cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=\$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt && cmake --build build --target onebit && XILINX_XRT=\$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt tests/npu_lane_e2e.sh build/1bit <model dir> <model dir>/npu <reference logits>\`"
+          \`scripts/build-xdna.sh ~/.cache/xdna-pin/prefix && cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=\$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt && cmake --build build --target onebit\`, then the NPU check (docs/npu.md, \"Checking the NPU\")"

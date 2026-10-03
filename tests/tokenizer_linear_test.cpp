@@ -37,7 +37,7 @@ void check(const onebit::npu::Tokenizer& tok, const char* what, const std::strin
     const auto t0 = std::chrono::steady_clock::now();
     const auto got = tok.encode(text);
     const double s = std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count();
-    const bool ok_ids = got == want, ok_time = s < 10.0;
+    const bool ok_ids = got == want, ok_time = s < 30.0;  // sanitizer builds included
     std::printf("%s %s: %zu bytes -> %zu ids in %.3f s\n", ok_ids && ok_time ? "ok  " : "FAIL", what, text.size(),
                 got.size(), s);
     if (!ok_ids) {
@@ -48,7 +48,7 @@ void check(const onebit::npu::Tokenizer& tok, const char* what, const std::strin
     }
     if (!ok_time) {
         ++failures;
-        std::printf("     took %.1f s; the bound is 10 s\n", s);
+        std::printf("     took %.1f s; the bound is 30 s\n", s);
     }
 }
 

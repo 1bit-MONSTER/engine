@@ -34,6 +34,7 @@
 #include "tokenizer.h"
 
 #include <httplib.h>
+#include "http_guard.h"
 #include <nlohmann/json.hpp>
 
 #include <atomic>
@@ -351,6 +352,7 @@ int run_unified(int argc, char** argv) {
     Engine e;
     e.id = alias.empty() ? std::filesystem::path(model_dir).filename().string() : alias;
     httplib::Server srv;
+    install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
     std::atomic<bool> ready{false};
     srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;

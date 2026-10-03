@@ -74,6 +74,7 @@
 #endif
 
 #include <httplib.h>
+#include "http_guard.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -1349,6 +1350,7 @@ int serve_child(const Options& given) {
     std::atomic<bool> ready{false};
 
     httplib::Server srv;
+    install_request_guard(srv, o.host);  // Host / Origin (app/http_guard.h)
     auto health = [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
         res.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");

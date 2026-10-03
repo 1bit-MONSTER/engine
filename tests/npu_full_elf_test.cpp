@@ -26,7 +26,9 @@
 #include "full_elf.h"
 
 #include <cstdio>
+#include <algorithm>
 #include <filesystem>
+#include <functional>
 #include <regex>
 #include <string>
 
@@ -38,6 +40,37 @@ static void check(bool ok, const std::string& what) {
         ++failures;
         std::printf("FAIL %s\n", what.c_str());
     }
+}
+
+// A minimal ELF32 LE: section 0 null, 1 .shstrtab, 2 `name` at {offset, size}; sh_name of
+// section 2 is `name_at` when nonzero.
+static Bytes tiny_elf(const std::string& name, uint32_t offset, uint32_t size, uint32_t name_at = 0) {
+    Bytes e(52, 0);
+    const uint8_t ident[] = {0x7f, 'E', 'L', 'F', 1, 1, 1};
+    std::copy(std::begin(ident), std::end(ident), e.begin());
+    const std::string strtab = std::string("\0.shstrtab\0", 11) + name + '\0';
+    const uint32_t str_off = uint32_t(e.size());
+    e.insert(e.end(), strtab.begin(), strtab.end());
+    while (e.size() % 4) e.push_back(0);
+    const uint32_t shoff = uint32_t(e.size());
+    auto put = [&](uint32_t v) { for (int i = 0; i < 4; ++i) e.push_back(uint8_t(v >> (8 * i))); };
+    for (int i = 0; i < 10; ++i) put(0);                                                 // null
+    put(1); put(3); put(0); put(0); put(str_off); put(uint32_t(strtab.size())); put(0); put(0); put(1); put(0);
+    put(name_at ? name_at : 11); put(1); put(0); put(0); put(offset); put(size); put(0); put(0); put(1); put(0);
+    auto w32 = [&](size_t o, uint32_t v) { for (int i = 0; i < 4; ++i) e[o + i] = uint8_t(v >> (8 * i)); };
+    w32(0x20, shoff);
+    e[0x30] = 3;  // e_shnum
+    e[0x32] = 1;  // e_shstrndx
+    return e;
+}
+
+static bool refused(const std::function<void()>& fn) {
+    try {
+        fn();
+    } catch (const std::exception&) {
+        return true;
+    }
+    return false;
 }
 
 static std::string hex(const std::array<uint8_t, 16>& d) {
@@ -52,6 +85,19 @@ int main(int argc, char** argv) {
     check(hex(md5({})) == "d41d8cd98f00b204e9800998ecf8427e", "md5(\"\")");
     check(hex(md5({reinterpret_cast<const uint8_t*>(abc.data()), abc.size()})) == "900150983cd24fb0d6963f7d28e17f72", "md5(abc)");
     check(hex(md5({reinterpret_cast<const uint8_t*>(fox.data()), fox.size()})) == "9e107d9d372bb6826bd81d3542a419d6", "md5(fox)");
+    {
+        // Crafted kernel ELFs: a section that runs past the end of the file, and a section name
+        // past the end, are refused by every reader instead of read out of bounds.
+        const Bytes in = tiny_elf(".ctrltext", 40, 16);
+        check(elf_section(in, ".ctrltext").size == 16, "a section inside the file is found");
+        const Bytes past = tiny_elf(".ctrltext", 40, 4096);
+        check(refused([&] { elf_section(past, ".ctrltext"); }), "elf_section refuses a section past the end");
+        check(refused([&] { assemble_full_elf(past, {}, "k", PdiMode::kNone); }),
+              "assemble_full_elf refuses a section past the end");
+        check(refused([&] { Bytes e = past; refresh_uid(e); }), "refresh_uid refuses a section past the end");
+        check(refused([&] { elf_section(tiny_elf(".ctrltext", 40, 16, 1u << 20), ".ctrltext"); }),
+              "a section name past the end is refused");
+    }
     if (argc == 1) {
         std::printf("md5: %s\n", failures ? "FAILED" : "ok (pass <captured-dir> <pdi> <golden-dir> for the model checks)");
         return failures ? 1 : 0;

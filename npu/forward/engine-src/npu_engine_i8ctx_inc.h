@@ -13,16 +13,12 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 // Copyright (c) 2026 bong-water-water-bong
-// npu_engine_i8ctx_inc.h — I8Ctx GEMM context using xrt::kernel (classic API).
+// npu_engine_i8ctx_inc.h — I8Ctx: one int8 GEMM design, run from a full ELF.
 //
-// Matches the actual xclbin kernel interface:
-//   kernel(opcode, instr_bo, ninstr, bo0, bo1, bo2, bo3, bo4)
-//
-// One contiguous weight BO per layer (bo1). One activation BO (bo0).
-// One output BO (bo2). Instructions loaded from pre-generated .txt files
-// (blob_instr_transaction format), one BO per layer.
-//
-// Per-op xclbins or full ELFs, loaded from the kernel directory at runtime.
+// The kernel is an xrt::ext::kernel built from the full ELF, signature
+// (A, B, C): one activation BO (A), one weight BO per layer (B), one output
+// BO (C). The ELF carries the PDIs and the control code; the engine loads no
+// xclbin and no instruction file.
 #pragma once
 #include <cstdio>
 #include <cstdlib>
@@ -41,40 +37,19 @@
 #include <xrt/experimental/xrt_module.h>
 
 
-// Include npu_sequence for init_with_generator (may already be included by caller)
-#if __has_include("npu_utils/npu_instr_utils.hpp")
-#include "npu_utils/npu_instr_utils.hpp"
-#else
-struct npu_sequence;  // the gemm_generate_sequence_i8 decl below needs the name only
-#endif
-
-// Forward decl (defined in gemm_npu_instructions.cpp)
-void gemm_generate_sequence_i8(
-    npu_sequence* seq, uint32_t M, uint32_t K, uint32_t N,
-    uint32_t a_ddr_offset, uint32_t b_base_offset,
-    bool add_bias, int activation, uint32_t bias_offset, uint32_t output_offset);
-
 struct I8Ctx {
     int MD, KD, ND, NL;
-    int bC_nd = 0;   // bo2 (C2) size override: MD*bC_nd*4 bytes when > 0, for a
-                     // kernel whose output is wider than the logical ND.
-    std::unique_ptr<xrt::xclbin> xc;
     std::unique_ptr<xrt::hw_context> hc;
-    std::unique_ptr<xrt::kernel> k;
-    // ── Full-ELF mode (no xclbin) ──
     // Consume a `aiecc --generate-full-elf` artifact directly: the ELF bundles
-    // the PDIs + TXN control code, so there is no xclbin and no instruction
-    // .txt. The hw_context is created from the ELF, and kext is the resulting
+    // the PDIs + TXN control code, so there is no instruction file. The
+    // hw_context is created from the ELF, and kext is the resulting
     // xrt::ext::kernel whose signature is (A, B, C). Requires the design's
     // runtime sequence to load the ELF's PDI (aiex.npu.load_pdi; see
     // generators/build_zaya_m8.sh), otherwise XRT never configures the array.
     std::unique_ptr<xrt::elf> elf;
     std::unique_ptr<xrt::ext::kernel> kext;
-    bool elf_mode = false;
     std::unique_ptr<xrt::bo> bA, bC;
     std::vector<std::unique_ptr<xrt::bo>> layerB;     // weight BOs
-    std::vector<std::unique_ptr<xrt::bo>> layerInstr;  // instruction BOs
-    std::vector<std::vector<uint32_t>> layerInstrData; // raw instruction data
     int8_t* Am;
     int32_t* Cm;
     std::vector<std::vector<float>> group_scales;
@@ -82,121 +57,9 @@ struct I8Ctx {
 
     ~I8Ctx() {}
 
-    bool isReady() { return initialized && (k || kext) && bA && bC; }
+    bool isReady() { return initialized && kext && bA && bC; }
 
-    // ── Init with generated instructions (no pre-gen'd .txt files needed) ──
-#if __has_include("npu_utils/npu_instr_utils.hpp")
-    bool init_with_generator(xrt::device& d, const char* xp,
-                             int M, int K, int N, int nlayers) {
-        MD = M; KD = K; ND = N; NL = nlayers;
-        fprintf(stderr, "  I8Ctx::init_with_generator xp=%s M=%d K=%d N=%d\n", xp, M, K, N);
-
-        // The generated sequence matches only some kernel builds; pairing it
-        // with a kernel that expects a different instruction stream silently
-        // computes the wrong result rather than failing.  Xclbins built by run_build.sh always ship their
-        // instruction file, so this path is only reached when that file is
-        // missing.
-        fprintf(stderr, "  WARN: generating single-core-row instructions; if %s\n"
-                        "        was built multi-row (v27), its .txt instruction file is\n"
-                        "        required and results will be wrong without it.\n", xp);
-
-        // Generate instruction sequence
-        npu_sequence seq(device_npu2);
-        gemm_generate_sequence_i8(&seq, (uint32_t)M, (uint32_t)K, (uint32_t)N,
-                                  0, 0, false, 0, 0, 0);
-        // Never cmds2seq() here: it appends a stale header after the raw payload.
-        std::vector<uint32_t>& raw = seq.raw_seq();
-        uint32_t ncmds = raw.back(); raw.pop_back();
-        std::vector<uint32_t> ins;
-        ins.reserve(raw.size() + 4);
-        ins.push_back(0x06040100);
-        ins.push_back(0x00000108);
-        ins.push_back(ncmds);
-        ins.push_back((uint32_t)(raw.size() * 4 + 16));
-        ins.insert(ins.end(), raw.begin(), raw.end());
-        fprintf(stderr, "  generated %zu instr bytes (%zu words)\n",
-                ins.size() * sizeof(uint32_t), ins.size());
-
-        // Register xclbin
-        try {
-            xc = std::make_unique<xrt::xclbin>(std::string(xp));
-            d.register_xclbin(*xc);
-            hc = std::make_unique<xrt::hw_context>(d, xc->get_uuid());
-            k = std::make_unique<xrt::kernel>(*hc, "MLIR_AIE");
-        } catch (std::exception& ex) {
-            fprintf(stderr, "  I8Ctx: xclbin/kernel init failed: %s\n", ex.what());
-            return false;
-        }
-
-        int grp_a   = k->group_id(3);
-        int grp_w   = k->group_id(4);
-        int grp_c   = k->group_id(5);
-        int grp_ins = k->group_id(1);
-
-        bA = std::make_unique<xrt::bo>(d, (size_t)MD * KD,
-                                       XRT_BO_FLAGS_HOST_ONLY, grp_a);
-        bC = std::make_unique<xrt::bo>(d, (size_t)MD * ND * 4,
-                                       XRT_BO_FLAGS_HOST_ONLY, grp_c);
-        Am = (int8_t*)bA->map();
-        Cm = (int32_t*)bC->map();
-        // Both BOs are XRT_BO_FLAGS_HOST_ONLY and NOTHING zeroed them. Am is fully written by
-        // quantize_async (memset(Am,0,MD*KD)) before every launch, so bA was safe -- but Cm is
-        // the GEMM OUTPUT: the kernel writes only the valid rows of each launch, while the host
-        // reads MD rows. On the FIRST launch the rows the kernel did not write were whatever the
-        // device allocator handed back, which is why Nanbeige's boot token was nondeterministic
-        // (1214 / 131718 / 145029 / 42438 ... for one command, RESULTS-coverage-multifamily 59,
-        // 62). Zeroing makes the initial contents defined; section 61 made the same fix on the
-        // bf16 path's KV BO, which is a different set of buffers.
-        memset(Am, 0, (size_t)MD * KD);
-        memset(Cm, 0, (size_t)MD * ND * 4);
-
-        layerB.resize(NL);
-        layerInstr.resize(NL);
-        layerInstrData.resize(NL);
-        group_scales.resize(NL);
-
-        for (int l = 0; l < NL; l++) {
-            layerB[l] = std::make_unique<xrt::bo>(d, (size_t)KD * ND,
-                                                   XRT_BO_FLAGS_HOST_ONLY, grp_w);
-        }
-        // ONE instruction BO per context: the instruction stream is identical
-        // for every layer of the same GEMM (the kernel selects the layer via
-        // layerB[l]); per-layer BOs exhaust device memory on large models.
-        layerInstr.resize(1);
-        layerInstrData.resize(1);
-        layerInstrData[0] = ins;
-        layerInstr[0] = std::make_unique<xrt::bo>(
-            d, ins.size() * sizeof(uint32_t),
-            XCL_BO_FLAGS_CACHEABLE, grp_ins);
-        memcpy(layerInstr[0]->map(), ins.data(),
-               ins.size() * sizeof(uint32_t));
-        layerInstr[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
-        initialized = true;
-        return true;
-    }
-
-    // ── M is ALWAYS 128 — there is no valid M<128 instruction stream ──
-    // The kernels are built for M=128, so gemm_generate_sequence_i8 ignores
-    // its M argument: the stream depends only on (K, N). A stream built for a
-    // smaller M does not complete.
-    //
-    // Smaller batches MUST reuse the M=128 stream and pass the real row count
-    // as `am` to go()/launch_*: quantize_async zero-pads rows [am, 128) so only
-    // rows [0, am) are valid. That is what npu_engine_universal, zaya_decode
-    // and zaya_npu_runner do for single-token decode. Real small-M streams
-    // require per-shape small-M xclbins (build_xclbins.sh Peano path), not a
-    // runtime regen. (A former regen_insts(int M) re-uploaded an identical
-    // M=128 stream and claimed to resize the batch — removed as misleading.)
-#else
-    // Stub: npu_instr_utils.hpp not available — use init() with pre-gen'd files
-    bool init_with_generator(xrt::device&, const char*, int, int, int, int) {
-        fprintf(stderr, "  I8Ctx: init_with_generator unavailable (no npu_instr_utils)\n");
-        return false;
-    }
-#endif
-
-    // ── Init: consume a FULL ELF directly (no xclbin) ──
+    // ── Init: consume a FULL ELF directly ──
     // Kernel signature: (bo0, bo1, bo2) == (A, B, C). No instruction BO: the
     // TXN control stream lives in the ELF's .ctrltext. Kernel name is
     // "<kernel>:<instance>" from the aiecc full-ELF config ("main:seq" for the
@@ -232,90 +95,9 @@ struct I8Ctx {
         Am = (int8_t*)bA->map();
         Cm = (int32_t*)bC->map();
         layerB.resize(NL);
-        group_scales.resize(NL);   // packB() writes group_scales[l]; the xclbin init does too
+        group_scales.resize(NL);   // packB() writes group_scales[l]
         for (int l = 0; l < NL; l++)
             layerB[l] = mkbo((size_t)KD * ND);
-        elf_mode = true;
-        initialized = true;
-        return true;
-    }
-
-    // ── Init: load xclbin + per-layer instruction files ──
-    bool init(xrt::device& d, const char* xp, const char* ip,
-              int /*gid_B*/, int nlayers) {
-        NL = nlayers;
-        fprintf(stderr, "  I8Ctx::init xp=%s ip=%s\n", xp, ip);
-        FILE* f = fopen(ip, "rb");
-        if (!f) { fprintf(stderr, "  fopen failed: %s\n", ip); return false; }
-        fseek(f, 0, 2); long sz = ftell(f); fseek(f, 0, 0);
-        fprintf(stderr, "  instr file size=%ld\n", sz);
-        std::vector<uint32_t> ins(sz / 4);
-        fread(ins.data(), 4, ins.size(), f);
-        fclose(f);
-
-        // Register xclbin
-        try {
-            xc = std::make_unique<xrt::xclbin>(std::string(xp));
-            d.register_xclbin(*xc);
-            hc = std::make_unique<xrt::hw_context>(d, xc->get_uuid());
-            k = std::make_unique<xrt::kernel>(*hc, "MLIR_AIE");
-        } catch (std::exception& ex) {
-            fprintf(stderr, "  I8Ctx: xclbin/kernel init failed: %s\n", ex.what());
-            return false;
-        }
-
-        // Get kernel group IDs for BO allocation
-        int grp_a   = k->group_id(3);  // bo0
-        int grp_w   = k->group_id(4);  // bo1
-        int grp_c   = k->group_id(5);  // bo2
-        int grp_ins = k->group_id(1);  // instr
-        fprintf(stderr, "  grp_a=%d grp_w=%d grp_c=%d grp_ins=%d\n", grp_a, grp_w, grp_c, grp_ins);
-
-        // One activation BO + one output BO (shared across layers)
-        fprintf(stderr, "  creating bA size=%zu (MD=%d KD=%d)\n", (size_t)MD * KD, MD, KD);
-        bA = std::make_unique<xrt::bo>(d, (size_t)MD * KD,
-                                       XRT_BO_FLAGS_HOST_ONLY, grp_a);
-        size_t bc_bytes = bC_nd > 0 ? (size_t)MD * bC_nd * 4 : (size_t)MD * ND * 4;
-        fprintf(stderr, "  creating bC size=%zu (MD=%d ND=%d bC_nd=%d)\n", bc_bytes, MD, ND, bC_nd);
-        bC = std::make_unique<xrt::bo>(d, bc_bytes,
-                                       XRT_BO_FLAGS_HOST_ONLY, grp_c);
-        Am = (int8_t*)bA->map();
-        Cm = (int32_t*)bC->map();
-        // See the note in the first init overload: neither BO was zeroed, and Cm is the GEMM
-        // output, so rows the kernel did not write on the first launch were uninitialized
-        // device memory -- the source of the nondeterministic boot token.
-        memset(Am, 0, (size_t)MD * KD);
-        memset(Cm, 0, bc_bytes);
-
-        // Per-layer weight BOs + instruction BOs
-        // ONE weight BO per context, NOT one per layer.  Every caller in the
-        // model-generic forward packs and launches index 0 (npu_gemm /
-        // run_lm_head in q4nx_forward.cpp, lm_gemm in engine.cpp), so NL-1 of
-        // these BOs were pure waste -- and unlike the ELF path's ext BOs these
-        // are xclbin-group BOs, so Qwen3-8B allocated ~32 x (4096*12288 etc.)
-        // ~= 6 GB and exhausted the device heap; its kernel then made no
-        // progress (0 tokens in 27 min, where the ELF path did 5 in 1329 s) and
-        // llama-3.2-1B died with 'double free or corruption (out)'.  Mirrors the
-        // instruction-BO fix below.
-        layerB.resize(1);
-        layerInstr.resize(1);
-        layerInstrData.resize(1);
-        group_scales.resize(NL);
-        layerB[0] = std::make_unique<xrt::bo>(d, (size_t)KD * ND,
-                                              XRT_BO_FLAGS_HOST_ONLY, grp_w);
-        // ONE instruction BO per context: the instruction stream is identical
-        // for every layer of the same GEMM (the kernel selects the layer via
-        // layerB[l]); per-layer BOs exhaust device memory on large models.
-        layerInstr.resize(1);
-        layerInstrData.resize(1);
-        layerInstrData[0] = ins;
-        layerInstr[0] = std::make_unique<xrt::bo>(
-            d, ins.size() * sizeof(uint32_t),
-            XCL_BO_FLAGS_CACHEABLE, grp_ins);
-        memcpy(layerInstr[0]->map(), ins.data(),
-               ins.size() * sizeof(uint32_t));
-        layerInstr[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-
         initialized = true;
         return true;
     }
@@ -327,30 +109,10 @@ struct I8Ctx {
     // weight BO per (layer, expert) at startup, pack+sync once, and pass the
     // BO handle directly at decode.
     std::unique_ptr<xrt::bo> make_weight_bo(xrt::device& d) {
-        // The xclbin path picks a group off the kernel object; the ELF path has
-        // no kernel object (`k` is null) and the amdxdna driver rejects a
-        // group-less xrt::bo, so use the same xrt::ext::bo allocation
-        // init_elf's mkbo uses.
-        if (elf_mode) {
-            xrt::ext::bo b{d, (size_t)KD * ND};
-            auto bo = std::make_unique<xrt::bo>(b);
-            if (void* m = bo->map()) memset(m, 0, (size_t)KD * ND);
-            return bo;
-        }
-        int grp_w = k->group_id(4);
-        // Weight BOs are written once (packB_into) and read every token by the
-        // shim DMA. HOST_ONLY forces the device through the slow cache-coherent
-        // path (~3.6 GB/s measured); try normal/cacheable/svm for faster reads.
-        uint32_t fl = XRT_BO_FLAGS_HOST_ONLY;
-        if (const char* f = getenv("NPU_WBO_FLAGS")) {
-            int v = atoi(f);
-            if (v == 0) fl = 0;
-            else if (v == 1) fl = XRT_BO_FLAGS_CACHEABLE;
-            else if (v == 2) fl = XRT_BO_FLAGS_SVM;
-        }
-        auto bo = std::make_unique<xrt::bo>(d, (size_t)KD * ND, fl, grp_w);
-        // packB_into memsets the mapped buffer before packing, so this BO is covered in practice;
-        // zeroing at allocation as well costs one memset and removes the ordering assumption.
+        // The amdxdna driver rejects a group-less xrt::bo, so use the same
+        // xrt::ext::bo allocation init_elf's mkbo uses.
+        xrt::ext::bo b{d, (size_t)KD * ND};
+        auto bo = std::make_unique<xrt::bo>(b);
         if (void* m = bo->map()) memset(m, 0, (size_t)KD * ND);
         return bo;
     }
@@ -419,10 +181,7 @@ struct I8Ctx {
                                          int am, int ak, float ascale) {
         quantize_async(A, am, ak, ascale);
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        if (elf_mode) return (*kext)(*bA, wbo, *bC);
-        return (*k)((unsigned)3, *layerInstr[0],
-                    (unsigned)(layerInstrData[0].size()),
-                    *bA, wbo, *bC);
+        return (*kext)(*bA, wbo, *bC);
     }
 
     // Batched variant of launch_async_with_bo: one activation quantization with
@@ -434,10 +193,7 @@ struct I8Ctx {
                                               const float* ascales) {
         quantize_async_rows(A, am, ak, ascales);
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        if (elf_mode) return (*kext)(*bA, wbo, *bC);
-        return (*k)((unsigned)3, *layerInstr[0],
-                    (unsigned)(layerInstrData[0].size()),
-                    *bA, wbo, *bC);
+        return (*kext)(*bA, wbo, *bC);
     }
 
     // ── Pack weights for layer l into contiguous BO ──
@@ -550,21 +306,13 @@ struct I8Ctx {
     }
     inline xrt::run launch(int l) {
         bochk(l);
-        if (elf_mode) return (*kext)(*bA, *layerB[l], *bC);
-        return (*k)((unsigned)3,
-                    *layerInstr[0],
-                    (unsigned)(layerInstrData[0].size()),
-                    *bA, *layerB[l], *bC);
+        return (*kext)(*bA, *layerB[l], *bC);
     }
 
     inline xrt::run sync_and_launch(int l) {
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
         bochk(l);
-        if (elf_mode) return (*kext)(*bA, *layerB[l], *bC);
-        return (*k)((unsigned)3,
-                    *layerInstr[0],
-                    (unsigned)(layerInstrData[0].size()),
-                    *bA, *layerB[l], *bC);
+        return (*kext)(*bA, *layerB[l], *bC);
     }
 
     inline void wait_kernel(xrt::run& r) { r.wait(); }

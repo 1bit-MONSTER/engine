@@ -313,7 +313,7 @@ int run_forward_serve(int argc, char** argv) {
     }
 
     xrt::device dev(0);
-    if (!e.fwd->init(dev, model.c_str(), kernels, /*use_elf=*/true))
+    if (!e.fwd->init(dev, model.c_str(), kernels))
         throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
 
     std::atomic<bool> ready{false};

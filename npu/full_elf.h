@@ -76,8 +76,8 @@ enum class PdiMode {
 };
 
 // Assemble a full ELF (PDI + control code) from an instruction ELF, following the
-// layout aiecc --get-full-elf produces. Argument symbols move from the xclbin
-// convention (first buffer is argument 3) to the full-ELF one (argument 0).
+// layout aiecc --get-full-elf produces. Argument symbols move from the instruction
+// ELF's convention (first buffer is argument 3) to the full-ELF one (argument 0).
 // kernel_name is the name XRT looks the kernel up by; config is the column count.
 Bytes assemble_full_elf(const Bytes& instruction_elf, const Bytes& pdi, const std::string& kernel_name,
                         PdiMode mode, uint32_t config = 8);

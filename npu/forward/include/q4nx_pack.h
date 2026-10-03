@@ -29,7 +29,7 @@
 //   D   : K = IM,           N = H
 //
 // Whether gate+up are fused into one kernel (GU) or split (G + U) is an artifact
-// property, not an architecture property: engine/npu/build_xclbins.sh fuses for
+// property, not an architecture property: the design build fuses for
 // Qwen3-0.6B and Gemma4, and splits for Llama / Qwen3-8B / Qwen3-VL-4B. It is
 // therefore an explicit input (`fused_gu`), and the artifact resolver can also
 // choose it by which full ELF exists on disk.

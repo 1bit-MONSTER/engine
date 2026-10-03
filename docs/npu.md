@@ -21,6 +21,9 @@ For each token, the host submits the 28 layer runs and the lm head as one XRT ru
 This step removes the xclbin from that path. Every kernel is a full ELF (the design's
 PDI plus control code), which XRT opens directly. `npu/full_elf.{h,cpp}` builds these
 ELFs in memory when the model loads. The code is pure C++, with no Python and no XRT.
+The engine has no xclbin path at all (the last one, a comparison backend in the
+GGUF-on-NPU forward, was removed on 2026-10-03); xclbin numbers below are history,
+from the reference lane the full ELFs were first checked against.
 
 Step 3 lands in three parts:
 
@@ -208,8 +211,8 @@ The UID note is the MD5 of `.ctrltext`, so it is recomputed rather than mapped.
 `assemble_full_elf` follows the layout `aiecc --get-full-elf` produces:
 
 1. A `.pdi.1` section and a `.ctrltext.0` section.
-2. The argument symbols renumbered from the xclbin convention (the first buffer is
-   argument 3) to argument 0.
+2. The argument symbols renumbered from the instruction ELF's convention (the first
+   buffer is argument 3) to argument 0.
 3. A `.pdi.1` dynamic symbol and its relocation.
 4. `.dynamic`, the COMDAT group, and the configuration and UID notes.
 
@@ -226,7 +229,7 @@ the array. The lane changes arguments on every one of its 29 runs, so it slows d
 |---|---|
 | `load_pdi` in every config | 82.0 ms |
 | init config (only `load_pdi`) run once, then configs without it | **10.3 ms** |
-| xclbin | 10.6 ms |
+| xclbin (historical reference lane) | 10.6 ms |
 
 The runtime therefore does the following:
 

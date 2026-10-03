@@ -71,7 +71,7 @@ def notes(mod, extra=()):
         return open(md).read()
 
 
-# what weekly_changes.py wrote for this input before --os-sources existed (origin/main 0baf286)
+# what weekly_changes.py wrote for this input before --os-sources existed (main after RFC #213 stage 3)
 BEFORE = """Weekly build of 1bit engine at the pins below, since v2026.39.
 
 ## Held back
@@ -90,9 +90,9 @@ No pin moved this week.
 
 | file | what |
 |---|---|
-| `1bit-v2026.40-linux-x86_64.tar.zst` | 1bit and its backends (Vulkan, HRX, lean, ZINC, ONNX, DwarfStar, NPU with XRT) |
+| `1bit-v2026.40-linux-x86_64.tar.zst` | 1bit and its backends (HRX, ZINC, ONNX, DwarfStar, NPU with XRT) |
 | `lemonade-onebit-v2026.40-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe |
-| `1bit-v2026.40-windows-x64.zip` | 1bit.exe with Vulkan and ONNX backends |
+| `1bit-v2026.40-windows-x64.zip` | 1bit.exe with CPU and ONNX backends |
 | `1bit-os-v2026.40.img.zst`, `.efi` | 1bit OS: boot the engine from a USB stick |
 | `SHA256SUMS`, `changes.json` | checksums; this list as data |
 

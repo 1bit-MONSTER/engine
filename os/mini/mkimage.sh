@@ -197,6 +197,7 @@ MODEL=/data/models/Qwen3-32B-UD-Q4_K_XL.gguf
 DEVICE=auto
 PORT=8000
 # anything else for 1bit serve, e.g. --mtp or --parallel 4
+# serve listens on every interface with no authentication; --host 127.0.0.1 here keeps it local
 ARGS=
 CONF
 data_mb=${DATA_MB:-$(( $(du -sm "$out/data.dir" | cut -f1) + 1024 ))}   # the contents plus 1 GiB

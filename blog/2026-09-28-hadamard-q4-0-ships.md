@@ -98,4 +98,4 @@ This route reads prompts. It decodes at about 11 tokens a second, so long answer
 elsewhere: the Vulkan route with the DFlash2 drafter decodes code at 45.7 tokens a second on the
 same model. Use the rotated file where prompts are long and answers short, like summaries, code
 review over whole files, or retrieval with large contexts. The details are in
-[docs/lean.md](../docs/lean.md).
+[docs/lean.md](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/lean.md).

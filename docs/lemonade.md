@@ -45,9 +45,9 @@ One recipe in Lemonade runs the engine, `onebit`, in the same shape as its
 ```
 
 Lemonade downloads and resolves GGUF checkpoints as for llamacpp, and its
-backend selector picks the device (`vulkan`, `hrx`, `npu`, or `cuda` through
-ZINC). Replies already carry Lemonade's model name (`--alias`), so requests pass
-through unchanged.
+backend selector picks the device (`hrx`, `npu`, or `cuda` through ZINC; unset,
+the recipe sends `--device auto`). Replies already carry Lemonade's model name (`--alias`),
+so requests pass through unchanged.
 
 The recipe lives in our Lemonade fork,
 [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade): upstream
@@ -113,12 +113,30 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 `echo` and generation parameters are skipped, because Lemonade's own llamacpp recipe
 declares neither.
 
+## Vulkan and ROCm are Lemonade's
+
+The engine builds no Vulkan or ROCm llama.cpp (RFC #213 stage 3; owner direction
+2026-10-01: HRX + NPU only). Lemonade ships its own `llamacpp` backends for Vulkan, ROCm and the
+CPU from upstream llama.cpp, so a model or feature the engine does not run on HRX or the NPU is
+Lemonade's to serve:
+
+- `1bit serve --device vulkan` and `--device rocm` exit at once with that reason, as do `--lean`,
+  `--adaptive`, `--long-model` and `--prefill-device` ([serve.md](serve.md#removed-devices-and-flags)).
+- An architecture only the removed Vulkan build ran (Qwen3.8-Flash-Next's `qwen4exp`, Zyphra Zamba,
+  Zamba2 and BlackMamba, and a few upstream-only ones) is refused with a pointer to Lemonade's
+  `llamacpp` recipe.
+
+Follow-up in the fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)): its
+`onebit` backend still lists `vulkan` as a selectable backend (`onebit.h`, `backend_versions.json`,
+the test suite's `capabilities.py`). Picking it now gets the refusal above; the fork should drop
+it.
+
 ## On its own
 
 `1bit serve` also works without Lemonade, for any OpenAI client:
 
 ```sh
-1bit serve -m ~/models/Qwen3-0.6B-Q4_K_M.gguf --device vulkan --port 8000
+1bit serve -m ~/models/Qwen3-0.6B-Q4_K_M.gguf --port 8000      # --device auto: HRX0, else the CPU
 curl http://127.0.0.1:8000/v1/chat/completions -H 'Content-Type: application/json' \
      -d '{"messages": [{"role": "user", "content": "Hello"}]}'
 ```

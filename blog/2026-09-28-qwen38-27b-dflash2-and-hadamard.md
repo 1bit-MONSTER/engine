@@ -85,7 +85,7 @@ lane shuffles and two in-register butterfly steps.
 
 The rotation removes a third of the 4-bit error. Perplexity ends up 1.2% above the exact
 path, and the error is still nearly double. So this is measured, not shipped: the patches are
-not in the engine's pin yet ([docs/lean.md](../docs/lean.md)).
+not in the engine's pin yet ([docs/lean.md](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/lean.md)).
 
 ## What's next
 
@@ -99,4 +99,4 @@ rotated file, `1bit serve` recognises it and runs it on the lean ROCm build by i
 Qwen3.8-27B file is published as
 [1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF](https://huggingface.co/1bit-MONSTER/Qwen3.8-27B-Q4_0-H32-GGUF):
 pp512 509, KLD 0.055, and 440-470 tok/s on a 1,838-token prompt through `serve`
-([docs/lean.md](../docs/lean.md)).
+([docs/lean.md](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/lean.md)).

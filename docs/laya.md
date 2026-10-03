@@ -102,7 +102,7 @@ request instead, and a measured policy picks the device.
 scripts/fetch-laya.sh
 1bit serve -m model.gguf --device auto --laya            # or --laya-model DIR
 1bit route --laya-model DIR --classify --state "Write a Rust function that sums a slice."
-# code 0.44 vulkan
+# code 0.44 hrx
 ```
 
 Every routed reply carries `X-1bit-Route: <class> <confidence> <device>`, and `serve` logs each
@@ -122,9 +122,9 @@ hand-labelled requests, 50 per class; ctest `laya_classify` fails below 90%):
 Prose is the class Laya misses most, reading it as short. Confidence tracks accuracy: the least
 confident quarter is right 84% of the time, the rest 98-100%.
 
-**Why every class goes to Vulkan today.** The policy may only change a row for a measured net
-gain, and on Strix Halo none exists yet. Vulkan decodes fastest on every measured `.gguf`
-([hrx.md](hrx.md), [serve.md](serve.md)). The only per-class difference measured is the drafter:
+**Why every class goes to one device.** The policy may only change a row for a measured net
+gain, and on Strix Halo none exists yet. When this was written (2026-09-28) the one device was
+Vulkan; it is HRX now (below). The only per-class difference measured is the drafter:
 on Qwen3.8-27B, short replies decode faster with MTP (28.2 tok/s) than with DFlash2 (17.8), code
 the other way round (45.7 against 31.7). But llama-server fixes the drafter per server:
 `speculative.type`, `speculative.n_max` and `speculative.p_min` in a request are ignored
@@ -285,8 +285,8 @@ Both scorers give the same confusion matrix:
 
 Two test expectations were older than the HRX-only build, and neither was a routing bug.
 `laya_route_e2e.sh` worked out the expected device with `--devices vulkan,hrx,zinc`, so it
-expected `short -> vulkan`. In a build with HRX, serve offers Laya `hrx` and `zinc` (plus `rocm`
-with `ONEBIT_LEAN_ROCM`), and it fell back correctly to `hrx` (`short 0.24 hrx`). The test now
+expected `short -> vulkan`. In a build with HRX, serve offered Laya `hrx` and `zinc` (plus `rocm`
+with the then lean ROCm build), and it fell back correctly to `hrx` (`short 0.24 hrx`). The test now
 reads the candidates from the build's `CMakeCache.txt`, as `gguf_devices()` picks them.
 `laya_gguf_route.sh` checked the error for a GGUF without ggmlc's `laya`. A
 `-DONEBIT_LAYA_GGML=ON` build always finds its own `laya`, so it now prints that the check was
@@ -318,15 +318,12 @@ its median added time over all 48 was +32 ms.
   GGUF scorer on HRX, the first turn of a conversation costs about 33 ms, and a long document
   costs nothing.
 
-**What still names Vulkan or ROCm.** In a build with HRX, serve's Laya candidates for a `.gguf`
-are `hrx` and `zinc` (ZINC runs on Vulkan or ROCm on this GPU), plus `rocm` with
-`ONEBIT_LEAN_ROCM`. Every row of `config/route-policy.json`, and its default, is `hrx`, and a
-candidate's backend starts only when the policy picks it. So no request reached Vulkan, ROCm or
-zinc, and serve started only the HRX backend. Some names are left over and route nothing:
-`1bit route`'s default `--devices npu,hrx,vulkan,zinc`, `vulkan` in `laya/route.cpp`'s device
-descriptions (the old direct device question), and the `vulkan` output in this page's usage
-example and its "Why every class goes to Vulkan today" paragraph, which come from the
-all-Vulkan policy.
+**What still names Vulkan or ROCm.** Since RFC #213 stage 3, serve's Laya
+candidates for a `.gguf` are `hrx` and `zinc` in a build with HRX, and `cpu` and `zinc` in one
+without (ZINC, decided separately, runs on Vulkan or ROCm on this GPU). Every row of
+`config/route-policy.json`, and its default, is `hrx`, and a candidate's backend starts only when
+the policy picks it. `1bit route`'s default `--devices` is now `npu,hrx,cpu,zinc`, and
+`laya/route.cpp` describes `cpu` instead of `vulkan`.
 
 **Agent dispatch, out of domain.** We also tried `1bit route --classify` as a dispatcher for
 agent sessions: code to engine work, prose to docs, long_doc to review, short to quick answers,

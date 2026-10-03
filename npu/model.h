@@ -33,6 +33,7 @@ struct Tensor {
     std::vector<int64_t> shape;
     const uint8_t* data = nullptr;
     uint64_t bytes = 0;
+    uint64_t avail = 0;  // bytes from data to the end of the file: the most a reader may touch
 
     // Tiles in a projection: shape[0] rows of shape[1] bytes, in 5120-byte tiles.
     int tiles() const;

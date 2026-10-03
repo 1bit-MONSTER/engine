@@ -93,7 +93,11 @@ struct Lane::Impl {
         act = make_bo(dev, kSmallBo);
         logits = make_bo(dev, kSmallBo);
         fnorm = make_bo(dev, kSmallBo);
-        std::memcpy(fnorm->map(), model.tensor("model.norm.weight").data, size_t(d.hidden) * 2);
+        const Tensor& norm = model.tensor("model.norm.weight");
+        if (norm.avail < size_t(d.hidden) * 2) throw std::runtime_error("model.q4nx: model.norm.weight runs past the end of the file");
+        std::memcpy(fnorm->map(), norm.data, size_t(d.hidden) * 2);
+        if (model.tensor("model.embed_tokens.weight").avail < size_t(d.vocab) * size_t(d.hidden) * 2)
+            throw std::runtime_error("model.q4nx: model.embed_tokens.weight runs past the end of the file");
         lmhead_w = make_bo(dev, lmhead_weight_bytes(model));
         pack_lmhead_weights(model, static_cast<uint8_t*>(lmhead_w->map()));
 

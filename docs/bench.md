@@ -47,6 +47,7 @@ tools/bench.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf \
   tokens; `--prompt-file` to change it), `--prompt-reps` times (default 5). It is reported as
   serve reports prompt tok/s, so context checkpoints and a drafter's own prompt pass are included.
 - **Decode:** 256 greedy tokens (`--decode-tokens`) on three chat prompts, `--decode-reps` times
+- **Mixed prompts:** `--prompts mixed` decodes nine ordinary requests (C++, a word problem, a summary, Spanish, Chinese, JSON, a story, a debugging checklist, an email) and reports the median over them, their range, and tokens delivered per second (generated tokens over prompt plus decode time). Use it for drafters (`--mtp`, `--dflash`): a draft model guesses repetitive text almost perfectly, so a single easy prompt overstates its gain.
   each (default 3):
   - **code:** an ISO-8601 parser with tests;
   - **prose:** how a B-tree insert works;

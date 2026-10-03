@@ -56,7 +56,7 @@ chmod +x "$scratch/backend.py"
 run() {  # <record> [serve args]: serve until the backend has recorded its start
     local port
     port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-    RECORD="$1" "$bin" serve -m "$scratch/m.gguf" --device vulkan --port "$port" --llama-server "$scratch/backend.py" "${@:2}" >"$1.log" 2>&1 &
+    RECORD="$1" "$bin" serve -m "$scratch/m.gguf" --device cpu --port "$port" --llama-server "$scratch/backend.py" "${@:2}" >"$1.log" 2>&1 &
     pid=$!
     for _ in $(seq 1 100); do [ -s "$1" ] && break; sleep 0.1; done
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null

@@ -37,8 +37,8 @@ PY
 
 out=$(python3 "$here/../tools/bench.py" -m "$scratch/plain.gguf" --onebit "$bin" --rounds 2 --prompt-reps 2 \
       --decode-reps 1 --decode-tokens 8 --prompt-chars 2000 --log-dir "$scratch/logs" --json "$scratch/out.json" \
-      --config "a=--device vulkan --llama-server $here/fake_backend.py" \
-      --config "b=--device vulkan --llama-server $here/fake_backend.py --no-recipes" 2>"$scratch/err")
+      --config "a=--device cpu --llama-server $here/fake_backend.py" \
+      --config "b=--device cpu --llama-server $here/fake_backend.py --no-recipes" 2>"$scratch/err")
 echo "$out"
 check "a row per config" '[[ "$out" == *"| a | "* ]] && [[ "$out" == *"| b | "* ]]'
 check "the second is measured against the first" '[[ "$out" == *"(+0.0%)"* ]]'

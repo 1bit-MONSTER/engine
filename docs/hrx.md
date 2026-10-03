@@ -298,8 +298,8 @@ The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on 
 and less accurate than the UD-Q4_K_XL file of the same model (Qwen3.8-27B pp512 63.5 against 335
 tok/s; KLD 0.029 against 0.007 vs BF16), and the lean ROCm W4A4 route it was made for left with the
 ROCm build. `tools/hadamard_q4_0.py` is removed, and `1bit serve` refuses a file stamped
-`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`, llama.cpp
-#58) stays in the fork; it is the same code that rotates PrismML's files
+`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`,
+llama.cpp #58) stays in the fork; it is the same code that rotates PrismML's files
 ([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)), which keep running.
 
 ### Server memory: the graph program cache cap (llama.cpp #63)

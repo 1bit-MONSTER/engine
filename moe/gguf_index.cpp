@@ -17,6 +17,7 @@
 #include <algorithm>
 #include <cstdio>
 #include <cstring>
+#include <limits>
 #include <stdexcept>
 
 namespace onebit::moe {
@@ -61,31 +62,54 @@ bool block_size(uint32_t type, uint64_t& blk, uint64_t& bytes) {
     }
 }
 
+// Every length and count read from the file is checked against the bytes left in it, and the
+// reader only ever moves forward, so a crafted header ends in an error, not a hang or a huge
+// allocation.
 struct Reader {
     FILE* f;
+    uint64_t size = 0;  // the file's size
+    uint64_t left() const {
+        const long at = std::ftell(f);
+        return at < 0 || uint64_t(at) > size ? 0 : size - uint64_t(at);
+    }
     void raw(void* p, size_t n) {
         if (std::fread(p, 1, n, f) != n) throw std::runtime_error("truncated GGUF header");
     }
+    void skip(uint64_t n) {
+        if (n > left() || std::fseek(f, long(n), SEEK_CUR) != 0) throw std::runtime_error("truncated GGUF header");
+    }
     template <class T> T get() { T v; raw(&v, sizeof v); return v; }
-    std::string str() {
+    uint64_t str_len() {
         const uint64_t n = get<uint64_t>();
+        if (n > left()) throw std::runtime_error("bad GGUF string length");
+        return n;
+    }
+    // Keys and tensor names are read; other strings (a tokenizer can be megabytes) are skipped.
+    std::string str() {
+        const uint64_t n = str_len();
+        if (n > (uint64_t(1) << 20)) throw std::runtime_error("GGUF key or tensor name longer than 1 MiB");
         std::string s(n, '\0');
-        raw(s.data(), n);
+        raw(s.data(), s.size());
         return s;
     }
     void skip_value(uint32_t type) {
         static const size_t sizes[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
-        if (type == 8) { str(); return; }
+        if (type == 8) { skip(str_len()); return; }
         if (type == 9) {
             const uint32_t et = get<uint32_t>();
             const uint64_t n = get<uint64_t>();
-            if (et == 8) { for (uint64_t i = 0; i < n; ++i) str(); return; }
+            if (et == 8) {
+                if (n > left() / 8) throw std::runtime_error("bad GGUF array length");
+                for (uint64_t i = 0; i < n; ++i) skip(str_len());
+                return;
+            }
             if (et >= 13 || sizes[et] == 0) throw std::runtime_error("bad GGUF array type");
-            std::fseek(f, (long) (sizes[et] * n), SEEK_CUR);
+            if (n > left() / sizes[et]) throw std::runtime_error("bad GGUF array length");
+            skip(sizes[et] * n);
             return;
         }
         if (type >= 13 || sizes[type] == 0) throw std::runtime_error("bad GGUF value type");
-        std::fseek(f, (long) sizes[type], SEEK_CUR);
+        skip(sizes[type]);
     }
 };
 
@@ -112,21 +136,32 @@ GgufIndex GgufIndex::open(const std::string& path) {
         if (!f) throw std::runtime_error("cannot open " + idx.files[fi]);
         Reader r{f};
         try {
+            if (std::fseek(f, 0, SEEK_END) != 0 || std::ftell(f) < 0) throw std::runtime_error("cannot read " + idx.files[fi]);
+            r.size = uint64_t(std::ftell(f));
+            std::rewind(f);
             if (r.get<uint32_t>() != 0x46554747u) throw std::runtime_error(idx.files[fi] + " is not a GGUF file");
             if (r.get<uint32_t>() < 2) throw std::runtime_error("GGUF v1 is not supported");
             const uint64_t n_tensors = r.get<uint64_t>(), n_kv = r.get<uint64_t>();
+            // a KV entry takes at least 12 bytes and a tensor entry at least 24
+            if (n_kv > r.left() / 12 || n_tensors > r.left() / 24) throw std::runtime_error("bad GGUF header counts");
             uint64_t alignment = 32;
             for (uint64_t i = 0; i < n_kv; ++i) {
                 const std::string key = r.str();
                 const uint32_t type = r.get<uint32_t>();
-                if (key == "general.alignment" && type == 4) alignment = r.get<uint32_t>();
-                else r.skip_value(type);
+                if (key == "general.alignment" && type == 4) {
+                    alignment = r.get<uint32_t>();
+                    if (alignment == 0 || (alignment & (alignment - 1)))
+                        throw std::runtime_error("bad GGUF general.alignment " + std::to_string(alignment));
+                } else {
+                    r.skip_value(type);
+                }
             }
             const size_t first = idx.tensors.size();
             for (uint64_t i = 0; i < n_tensors; ++i) {
                 GgufTensor t;
                 t.name = r.str();
                 const uint32_t nd = r.get<uint32_t>();
+                if (nd > 4) throw std::runtime_error("bad GGUF dimension count in " + t.name);
                 for (uint32_t d = 0; d < nd; ++d) t.ne.push_back(r.get<uint64_t>());
                 t.type = r.get<uint32_t>();
                 t.offset = r.get<uint64_t>();
@@ -134,7 +169,10 @@ GgufIndex GgufIndex::open(const std::string& path) {
                 uint64_t blk, bb;
                 if (!block_size(t.type, blk, bb)) throw std::runtime_error("unknown ggml type " + std::to_string(t.type) + " in " + t.name);
                 uint64_t n = 1;
-                for (uint64_t v : t.ne) n *= v;
+                for (uint64_t v : t.ne) {
+                    if (v != 0 && n > UINT64_MAX / v) throw std::runtime_error("bad GGUF tensor shape for " + t.name);
+                    n *= v;
+                }
                 t.bytes = n / blk * bb;
                 idx.tensors.push_back(std::move(t));
             }
@@ -149,6 +187,8 @@ GgufIndex GgufIndex::open(const std::string& path) {
     // routed experts: blk.N.ffn_{gate,up,down,gate_up}_exps.weight, 3-D with the expert last
     for (const auto& t : idx.tensors) {
         if (t.name.rfind("blk.", 0) != 0 || t.name.find("_exps.weight") == std::string::npos || t.ne.size() != 3) continue;
+        if (t.ne[2] == 0 || t.ne[2] > uint64_t(std::numeric_limits<int>::max()))
+            throw std::runtime_error("bad expert count in " + t.name);
         const int layer = std::atoi(t.name.c_str() + 4);
         ExpertPart p;
         p.tensor = t.name;

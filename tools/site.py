@@ -69,10 +69,23 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade on AMD Strix Halo: "
            "HRX with our Loom kernels on the Radeon iGPU, and the XDNA 2 NPU. Lemonade's own backends serve the rest.")
+# The release the site describes (docs/releases.md: v<ISO year>.<ISO week>): the newest v* tag
+# in the checkout (pages.yml fetches full history), else the first release. The home page's
+# JSON-LD links its GitHub release.
+def latest_release(default="v2026.40"):
+    try:
+        out = subprocess.run(["git", "tag", "--list", "v[0-9]*.[0-9]*", "--sort=-v:refname"],
+                             cwd=ROOT, capture_output=True, text=True, check=True).stdout.split()
+    except (OSError, subprocess.CalledProcessError):
+        return default
+    return out[0] if out else default
+
+
+VERSION = latest_release()
 # The home page's search and social description: the headline milestones, measured on Strix Halo
 # (README status, docs/hrx.md, blog/2026-10-04-first-release.md). Keep it <= 160 characters and
 # update it with each milestone.
-HOME_DESCRIPTION = ("1bit engine v2026.40: LLMs on AMD Strix Halo with HRX, inside Lemonade. Qwen3.8-27B "
+HOME_DESCRIPTION = (f"1bit engine {VERSION}: LLMs on AMD Strix Halo with HRX, inside Lemonade. Qwen3.8-27B "
                     "prompts at 335 tok/s, gpt-oss-20b at 39 tok/s, ternary 27B in 5.5 GiB.")
 # Search terms the site has real content behind (each one is a docs page or a measured post).
 # Site-wide; docs pages add their own (DOC_KEYWORDS), posts use their tags.
@@ -80,9 +93,6 @@ HOME_KEYWORDS = ("local LLM inference, AMD Strix Halo, Ryzen AI Max+ 395, Radeon
                  "ggml-hrx, Loom kernels, llama.cpp, XDNA 2 NPU, Lemonade, OpenAI-compatible API, GGUF, "
                  "ternary LLM, TQ1_0, TQ2_0, Ternary Bonsai, MXFP4, gpt-oss-20b, IQ2_XXS, Unsloth Dynamic GGUF, "
                  "Qwen3.8-27B, ZAYA1-8B, MTP speculative decoding")
-# The release the site describes (docs/releases.md: v<ISO year>.<ISO week>); the home page's
-# JSON-LD links its GitHub release, so bump it with each release
-VERSION = "v2026.40"
 DISCORD = "https://discord.gg/fa5m4Vawpa"
 HF_ORG = "https://huggingface.co/1bit-MONSTER"
 # per-docs-page search terms, each one something the page covers (meta keywords and JSON-LD)

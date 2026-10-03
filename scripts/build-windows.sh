@@ -17,11 +17,12 @@
 # build-windows.sh <out-dir>
 #
 # Cross-builds the engine for Windows 10+ x64 on Linux (docs/windows.md): <out-dir>/1bit.exe;
-# from the llama.cpp pin (third_party/llama.cpp-vulkan, until it is renamed), <out-dir>/llama-server.exe
-# on the CPU; and from third_party/ryzenai-server, <out-dir>/ryzenai-server.exe with Microsoft's ONNX
-# Runtime GenAI and ONNX Runtime DLLs (--device onnx, CPU). 1bit.exe finds its backends beside it.
-# The Windows package has no GPU route for now: the engine's GPU route is HRX, which has no Windows
-# build yet, and Vulkan is leaving the engine (RFC #213, docs/hrx.md). Everything it downloads is
+# from the engine's llama.cpp pin (third_party/llama.cpp, the tree the HRX build uses, built with
+# no GPU backend), <out-dir>/llama-server.exe on the CPU; and from third_party/ryzenai-server,
+# <out-dir>/ryzenai-server.exe with Microsoft's ONNX Runtime GenAI and ONNX Runtime DLLs
+# (--device onnx, CPU). 1bit.exe finds its backends beside it. The Windows package has no GPU
+# route for now: the engine's GPU route is HRX, which has no Windows build yet, and the engine
+# builds no Vulkan (RFC #213 stage 3, docs/hrx.md). Everything it downloads is
 # pinned and checked against its sha256: llvm-mingw (clang 23: the engine is C++26) and PCRE2 (the
 # tokenizer). Host tools: cmake, git, curl.
 set -euo pipefail
@@ -89,10 +90,10 @@ PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig cmake -S "$root" -B "$work/engine" -DCMA
 cmake --build "$work/engine" --target onebit -j"$jobs" > "$work/engine.build.log" 2>&1 || { tail -20 "$work/engine.build.log"; exit 1; }
 cp "$work/engine/1bit.exe" "$out/"
 
-# 4. llama-server.exe on the CPU (GGUF, --device cpu), from the llama.cpp pin
-git -C "$root" submodule update --init third_party/llama.cpp-vulkan
-cmake -S "$root/third_party/llama.cpp-vulkan" -B "$work/llama" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
-    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_VULKAN=OFF \
+# 4. llama-server.exe on the CPU (GGUF, --device cpu), from the llama.cpp pin, without HRX
+git -C "$root" submodule update --init --depth 1 third_party/llama.cpp
+cmake -S "$root/third_party/llama.cpp" -B "$work/llama" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
+    -DCMAKE_BUILD_TYPE=Release -DBUILD_SHARED_LIBS=OFF -DGGML_NATIVE=OFF -DGGML_OPENMP=OFF -DGGML_HRX=OFF -DGGML_VULKAN=OFF \
     -DLLAMA_CURL=OFF -DLLAMA_BUILD_TESTS=OFF -DLLAMA_BUILD_EXAMPLES=OFF -DCMAKE_EXE_LINKER_FLAGS=-static \
     "-DCMAKE_C_FLAGS=-D_WIN32_WINNT=0x0A00" "-DCMAKE_CXX_FLAGS=-D_WIN32_WINNT=0x0A00" \
     > "$work/llama.cmake.log"

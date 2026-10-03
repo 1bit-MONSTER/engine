@@ -33,10 +33,8 @@ import urllib.request
 # refers to); the compare runs on the pinned repo, which for our forks holds upstream's commits
 UPSTREAMS = {
     "lemonade": ("Lemonade", "lemonade-sdk/lemonade", "lemonade-sdk/lemonade"),
-    "llama.cpp-vulkan": ("llama.cpp (Vulkan, upstream release)", None, "ggml-org/llama.cpp"),
     "llama.cpp": ("llama.cpp for HRX (AMD's tested pair)", None, "ggml-org/llama.cpp"),
     "hrx-system": ("HRX", None, None),
-    "llama.cpp-rocmfpx": ("ROCmFPX (lean)", None, None),
     "xdna-driver": ("XDNA driver + XRT", "amd/xdna-driver", None),
     "zinc": ("ZINC", "zolotukhin/zinc", None),
     "laya": ("Laya router", None, None),
@@ -50,11 +48,9 @@ UPSTREAMS = {
 # repo whose latest release is quoted, where its changes are read)
 PINS = {  # path -> (name, what it is to the engine, repo whose latest release is quoted, changes)
     "lemonade": ("Lemonade", "the server the engine runs inside", "lemonade-sdk/lemonade", "https://github.com/lemonade-sdk/lemonade/releases"),
-    "llama.cpp-vulkan": ("llama.cpp", "ggml-org; Vulkan and lean builds", "ggml-org/llama.cpp", "https://github.com/ggml-org/llama.cpp/releases"),
     "llama.cpp": ("HRX llama.cpp", "our patches on AMD's ggml-hrx", None, "https://github.com/1bit-MONSTER/llama.cpp/commits/1bit/hrx-vulkan-patched"),
     "hrx-system": ("hrx-system", "ROCm", "ROCm/hrx-system", "https://github.com/ROCm/hrx-system/commits/main"),
     "xdna-driver": ("xdna-driver", "AMD NPU driver + XRT", "amd/xdna-driver", "https://github.com/amd/xdna-driver/commits/main"),
-    "llama.cpp-rocmfpx": ("ROCmFPX", "ROCmFP4 / ROCmI4 lean quants", None, "https://github.com/charlie12345/ROCmFPX/commits"),
     "zinc": ("ZINC", "NVIDIA and Apple GPUs", "zolotukhin/zinc", "https://github.com/zolotukhin/zinc/commits"),
     "laya": ("Laya", "router scorer", "NandhaKishorM/laya", "https://github.com/NandhaKishorM/laya/releases"),
     "tokenizers": ("tokenizers", "Hugging Face", "huggingface/tokenizers", "https://github.com/huggingface/tokenizers/releases"),
@@ -311,9 +307,9 @@ def main() -> None:
         md += ["## Engine", ""] + [f"- {e['title']}" + (f" (#{e['pr']})" if e["pr"] else "") for e in own] + [""]
     md += ["## Packages", "",
            "| file | what |", "|---|---|",
-           f"| `1bit-{a.tag}-linux-x86_64.tar.zst` | 1bit and its backends (Vulkan, HRX, lean, ZINC, ONNX, DwarfStar, NPU with XRT) |",
+           f"| `1bit-{a.tag}-linux-x86_64.tar.zst` | 1bit and its backends (HRX, ZINC, ONNX, DwarfStar, NPU with XRT) |",
            f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe |",
-           f"| `1bit-{a.tag}-windows-x64.zip` | 1bit.exe with Vulkan and ONNX backends |",
+           f"| `1bit-{a.tag}-windows-x64.zip` | 1bit.exe with CPU and ONNX backends |",
            f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: boot the engine from a USB stick |",
            "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", "",
            "Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); each backend keeps its own "

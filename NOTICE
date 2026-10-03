@@ -72,17 +72,8 @@ Peano, llvm-aie (third_party/llvm-aie)
   License: Apache-2.0 WITH LLVM-exception
 
 llama.cpp (third_party/llama.cpp: 1bit-MONSTER/llama.cpp, a fork of
-ggml-org/llama.cpp carrying AMD's HRX integration; third_party/llama.cpp-vulkan:
-the same fork's 1bit/vulkan-upstream, an upstream release plus carried upstream
-pull requests, among them ggml-org#28243 by Daniel Han and Ryan Monsurate, and
-ggml-org#21412 (Zamba2) by Echo Labs)
+ggml-org/llama.cpp carrying AMD's HRX integration)
   https://github.com/ggml-org/llama.cpp
-  Copyright (c) 2023-2026 The ggml authors
-  License: MIT
-
-ROCmFPX (third_party/llama.cpp-rocmfpx: charlie12345/ROCmFPX, a fork of
-ggml-org/llama.cpp with AMD-focused weight formats; the lean option)
-  https://github.com/charlie12345/ROCmFPX
   Copyright (c) 2023-2026 The ggml authors
   License: MIT
 

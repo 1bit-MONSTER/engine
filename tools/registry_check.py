@@ -20,7 +20,7 @@ usage: tools/registry_check.py path/to/1bit --models DIR [--npu-models DIR] [--o
 For every row of registry/check_models.tsv (backend, model path under DIR or --npu-models),
 runs tests/serve_e2e.sh: the model must load, answer "Paris" to a fixed question under
 temperature 0, and stream. The architecture recorded is the one the backend loads: the GGUF
-`general.architecture` for vulkan, hrx and zinc, and config.json's model_type for npu.
+`general.architecture` for hrx, cpu and zinc, and config.json's model_type for npu.
 
 Each result replaces the previous one for the same backend and model, so re-running a
 subset keeps the rest. Failures are recorded too, and only passes count as checked.

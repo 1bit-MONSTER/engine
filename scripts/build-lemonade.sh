@@ -19,7 +19,9 @@
 #
 # Builds lemond and the lemonade CLI from third_party/lemonade (our fork of
 # lemonade-sdk/lemonade, with the onebit recipe; docs/lemonade.md) into
-# <prefix>/bin. Needs cmake, ninja and a C++ compiler; the web app is left out.
+# <prefix>/bin. Needs cmake, ninja and a C++ compiler. The web app is left out unless
+# LEMONADE_WEB_APP=1 (needs node and npm; 1bit OS ships it, os/README.md): lemond then serves
+# Lemonade's own UI from resources/web-app.
 # Run it with the engine on PATH, or point the recipe at it:
 #   LEMONADE_ONEBIT_BIN=/path/to/1bit <prefix>/bin/lemond
 set -euo pipefail
@@ -33,8 +35,10 @@ fi
 [ -f "$src/CMakeLists.txt" ] || { echo "third_party/lemonade is empty and could not be fetched: git submodule update --init third_party/lemonade"; exit 1; }
 mkdir -p "$prefix/bin"
 prefix=$(cd "$prefix" && pwd)
-cmake -S "$src" -B "$prefix/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=OFF
-cmake --build "$prefix/build" --target lemond lemonade
+web=OFF; targets="lemond lemonade"
+if [ "${LEMONADE_WEB_APP:-0}" = 1 ]; then web=ON; targets="$targets web-app"; fi
+cmake -S "$src" -B "$prefix/build" -G Ninja -DCMAKE_BUILD_TYPE=Release -DBUILD_WEB_APP=$web
+cmake --build "$prefix/build" --target $targets
 cp "$prefix/build/lemond" "$prefix/build/lemonade" "$prefix/bin/"
 # lemond reads resources/ (defaults.json, the model list) beside itself
 rm -rf "$prefix/bin/resources" && cp -r "$prefix/build/resources" "$prefix/bin/"

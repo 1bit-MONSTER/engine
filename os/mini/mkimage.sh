@@ -130,6 +130,15 @@ printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
 printf 'root:x:0:\n' > "$root/etc/group"
 printf '/bin/sh\n' > "$root/etc/shells"
 
+echo "== sources (what the image holds, for the release notes' Source code section)"
+# each file's Debian package, source package, version and license class, plus the kernel pin,
+# BusyBox, the firmware and the EFI stub (tools/os_sources.py); weekly_changes.py renders it
+mkdir -p "$root/usr/share/licenses/1bit-os"
+python3 "$here/../../tools/os_sources.py" --root "$root" --out "$out/sources.json" --kernel "$kver" \
+    --repo "$here/../.." --build "$build" --tools "$tools" \
+    --stub "$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub"
+cp "$out/sources.json" "$root/usr/share/licenses/1bit-os/sources.json"
+
 echo "== initramfs"
 # the builder's umask must not reach the image: nothing group- or world-writable, /root private
 # (Dropbear, like sshd, refuses keys when the home directory is group-writable)

@@ -53,17 +53,21 @@ balanced power mode (85 W):
 | Qwen3.8-27B UD-IQ2_S decode | 3.1 tok/s | **8.3 tok/s** |
 | ZAYA1-8B Q4_K_M decode | 47.9 tok/s | **about 90 tok/s** |
 
-Qwen3.8-27B decodes at 97% of the Vulkan figure it replaced. Unsloth's sub-4-bit GGUFs (Q2_K,
+How these numbers were measured: `tools/bench.py` (in the repo) restarts `1bit serve` for each
+configuration, measures prompt speed on one long prompt and decode speed on ordinary chat prompts,
+greedy, thinking off, and reports best and median. No number on this page comes from a repetitive prompt
+that a draft model can guess. Qwen3.8-27B decodes at 97% of the Vulkan figure it replaced. Unsloth's sub-4-bit GGUFs (Q2_K,
 IQ1, IQ2, IQ3) run on the GPU instead of the CPU, and `--mtp` speculative decoding on Qwen3.5/3.8 is
 NaN-free ([HRX](../docs/hrx.md)).
 
 ## Every quant type, on HRX and Loom alone
 
 As of this release every GGUF quant type we test decodes on the Strix Halo iGPU through HRX and Loom
-kernels alone: no Vulkan, no ROCm, no CPU fallback at decode. The kernels that got it there are our own,
-written by AI agents (Claude, working with the engine's owner): each one profiled, written in Loom,
-checked against the CPU (KLD or bit for bit), measured on this machine and reviewed before it merged.
-Prompt / decode, tok/s:
+kernels alone: no Vulkan, no ROCm, no CPU fallback at decode. Every kernel behind that is checked before it
+merges: bit for bit against ggml's own decoder where the format allows it, by KL divergence against the CPU
+on real models where it does not, then measured on this machine and reviewed. AI agents (Claude, working
+with the engine's owner) wrote them; the checks are what make them trustworthy, and each PR carries its
+numbers so anyone can rerun them. Prompt / decode, tok/s:
 
 | kernel | measured on | before | now |
 |---|---|---|---|

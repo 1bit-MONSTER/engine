@@ -93,8 +93,9 @@ void write_model(const fs::path& dir, const std::vector<Entry>& entries, uint64_
                                               .dump();
 }
 
-// A one-layer model: every projection is one 5120-byte tile; q_proj is last in the file.
-std::vector<Entry> one_layer(std::vector<int64_t> q_shape = {1, 5120}) {
+// A one-layer model: every projection is one 5120-byte tile, except gate/up, which fill one
+// 8-tile chunk each (hidden 128 / 16); q_proj is last in the file.
+std::vector<Entry> one_layer(std::vector<int64_t> q_shape = {1, 5120}, int64_t gu_tiles = 8) {
     const std::string L = "model.layers.0.";
     std::vector<Entry> e = {
         {"model.embed_tokens.weight", {2, 128}, 512},
@@ -104,8 +105,10 @@ std::vector<Entry> one_layer(std::vector<int64_t> q_shape = {1, 5120}) {
         {L + "post_attention_layernorm.weight", {128}, 256},
     };
     for (const char* p : {"self_attn.k_proj.weight", "self_attn.v_proj.weight", "self_attn.o_proj.weight",
-                          "mlp.up_proj.weight", "mlp.gate_proj.weight", "mlp.down_proj.weight"})
+                          "mlp.down_proj.weight"})
         e.push_back({L + p, {1, 5120}, 5120});
+    for (const char* p : {"mlp.up_proj.weight", "mlp.gate_proj.weight"})
+        e.push_back({L + p, {gu_tiles, 5120}, uint64_t(gu_tiles) * 5120});
     e.push_back({L + "self_attn.q_proj.weight", q_shape, 5120});
     return e;
 }
@@ -151,6 +154,15 @@ int main() {
             pack_layer_weights(m, 0, w.data());
         });
         check(why.find("runs past the end") != std::string::npos, "a projection larger than the file is refused");
+    }
+    {  // gate/up of one tile each: the interleave would write a whole chunk past the layer's buffer
+        write_model(root / "chunks", one_layer({1, 5120}, 1));
+        const std::string why = thrown([&] {
+            Model m((root / "chunks").string());
+            std::vector<uint8_t> w(layer_weight_bytes(m));
+            pack_layer_weights(m, 0, w.data());
+        });
+        check(why.find("whole chunks") != std::string::npos, "gate/up that do not fill whole chunks are refused");
     }
     fs::remove_all(root);
     std::printf("%s\n", failures ? "FAILED" : "all cases ok");

@@ -94,6 +94,11 @@ int pack_layer_weights(const Model& m, int L, uint8_t* dst) {
 
     const int off_q = 0, off_k = off_q + q.tiles(), off_v = off_k + k.tiles(), off_o = off_v + v.tiles(),
               off_gu = off_o + o.tiles(), off_d = off_gu + up.tiles() + gate.tiles(), total = off_d + down.tiles();
+    if (CH <= 0 || G_h <= 0 || G_o <= 0 || G_d <= 0) throw std::runtime_error("config.json: dims too small for the fast lane");
+    // gate/up interleave in whole CH-tile chunks; the region holds up.tiles() + gate.tiles() tiles
+    const int up_chunks = (up.tiles() + CH - 1) / CH;
+    if (up.tiles() != gate.tiles() || up_chunks * 2 * CH > up.tiles() + gate.tiles())
+        throw std::runtime_error("model.q4nx: layer " + std::to_string(L) + " gate/up tiles do not fill whole chunks");
     std::memset(dst, 0, size_t(total) * kTileBytes);
     auto proj = [&](const Tensor& t, int off, int G) {
         need(t, tiles_read(t.tiles(), G) * kTileBytes, "a projection");
@@ -122,6 +127,7 @@ size_t lmhead_weight_bytes(const Model& m) { return size_t(m.tensor("lm_head.wei
 
 void pack_lmhead_weights(const Model& m, uint8_t* dst) {
     const Tensor& t = m.tensor("lm_head.weight");
+    if (m.dims().hidden / 128 <= 0) throw std::runtime_error("config.json: hidden_size too small for the fast lane");
     need(t, tiles_read(t.tiles(), m.dims().hidden / 128) * kTileBytes, "lm_head.weight");
     reorder_tiles(dst, t.data, t.tiles(), m.dims().hidden / 128);
 }

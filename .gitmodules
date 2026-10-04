@@ -51,10 +51,6 @@
 	path = third_party/tokenizers
 	url = https://github.com/huggingface/tokenizers.git
 	shallow = true
-[submodule "third_party/comfyui.cpp"]
-	path = third_party/comfyui.cpp
-	url = https://github.com/1bit-MONSTER/comfyui.cpp.git
-	branch = master
 # Lemonade (docs/lemonade.md): the host the engine runs inside. Our fork, upstream
 # lemonade-sdk/lemonade plus the onebit recipe; pinned so the engine is tested against a
 # known Lemonade. Never linked; scripts/build-lemonade.sh builds lemond from it, and

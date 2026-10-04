@@ -151,10 +151,9 @@ if(ONEBIT_DS4)
     target_compile_definitions(onebit PRIVATE ONEBIT_DS4_SERVER="${ONEBIT_DS4_SERVER}")
 endif()
 
-# ── ComfyUI.cpp (docs/comfyui.md) ──────────────────────────────────────────
-# Off by default: it needs LibTorch. Builds third_party/comfyui.cpp (GPL-3.0) with
-# scripts/build-comfyui.sh as its own program; `1bit comfy <workflow.json>` runs it as a
-# child process. The engine never links it, so the engine itself stays Apache-2.0.
+# ── ONNX Runtime GenAI (docs/onnx.md) ──────────────────────────────────────
+# Off by default: builds ryzenai-server (MIT) with scripts/build-onnx.sh as its own program;
+# `1bit serve --device onnx` runs it as a child process.
 option(ONEBIT_ONNX "Build ryzenai-server (third_party/ryzenai-server) for --device onnx" OFF)
 if(ONEBIT_ONNX)
     set(ONEBIT_ONNX_SERVER "${CMAKE_BINARY_DIR}/onnx/ryzenai-server")
@@ -164,29 +163,6 @@ if(ONEBIT_ONNX)
         USES_TERMINAL)
     add_dependencies(onebit onnx_server)
     target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${ONEBIT_ONNX_SERVER}")
-endif()
-
-option(ONEBIT_COMFYUI "Build ComfyUI.cpp (third_party/comfyui.cpp) for 1bit comfy" OFF)
-if(ONEBIT_COMFYUI)
-    # fetch the pinned submodule at configure time when it is missing
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
-        find_package(Git QUIET)
-        if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-            message(STATUS "Fetching third_party/comfyui.cpp")
-            execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init third_party/comfyui.cpp
-                            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-        endif()
-    endif()
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
-        message(FATAL_ERROR "ONEBIT_COMFYUI needs third_party/comfyui.cpp: git submodule update --init third_party/comfyui.cpp")
-    endif()
-    set(ONEBIT_COMFYUI_BIN "${CMAKE_BINARY_DIR}/comfyui/comfyui_cpp")
-    add_custom_target(comfyui
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-comfyui.sh ${CMAKE_BINARY_DIR}/comfyui
-        BYPRODUCTS ${ONEBIT_COMFYUI_BIN}
-        USES_TERMINAL)
-    add_dependencies(onebit comfyui)
-    target_compile_definitions(onebit PRIVATE ONEBIT_COMFYUI_BIN="${ONEBIT_COMFYUI_BIN}")
 endif()
 
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────

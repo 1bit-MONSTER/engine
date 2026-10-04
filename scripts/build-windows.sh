@@ -84,7 +84,7 @@ if [ ! -f "$prefix/lib/libpcre2-8.a" ]; then
     cmake --install "$work/pcre2/build" > /dev/null
 fi
 
-# 3. 1bit.exe: serve, route, comfy (no NPU lane or HRX on Windows yet)
+# 3. 1bit.exe: serve, route (no NPU lane or HRX on Windows yet)
 PKG_CONFIG_LIBDIR=$prefix/lib/pkgconfig cmake -S "$root" -B "$work/engine" -DCMAKE_TOOLCHAIN_FILE="$work/toolchain.cmake" \
     -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=OFF -DONEBIT_HRX=OFF > "$work/engine.cmake.log"
 cmake --build "$work/engine" --target onebit -j"$jobs" > "$work/engine.build.log" 2>&1 || { tail -20 "$work/engine.build.log"; exit 1; }

@@ -40,7 +40,6 @@ UPSTREAMS = {
     "tokenizers": ("Hugging Face tokenizers", "huggingface/tokenizers", None),
     "ryzenai-server": ("ryzenai-server (ONNX)", "lemonade-sdk/ryzenai-server", None),
     "ds4": ("DwarfStar", "antirez/ds4", None),
-    "comfyui.cpp": ("ComfyUI.cpp", None, None),
     "linux": ("Linux kernel", None, None),
 }
 # every pin, for the Updates list at the end of the weekly post: (what it is to the engine, the
@@ -54,7 +53,6 @@ PINS = {  # path -> (name, what it is to the engine, repo whose latest release i
     "tokenizers": ("tokenizers", "Hugging Face", "huggingface/tokenizers", "https://github.com/huggingface/tokenizers/releases"),
     "ryzenai-server": ("ryzenai-server", "ONNX Runtime GenAI", "lemonade-sdk/ryzenai-server", "https://github.com/lemonade-sdk/ryzenai-server/releases"),
     "ds4": ("DwarfStar", "antirez/ds4", "antirez/ds4", "https://github.com/antirez/ds4/commits"),
-    "comfyui.cpp": ("ComfyUI.cpp", "ComfyUI in C++", None, "https://github.com/1bit-MONSTER/comfyui.cpp/commits"),
     "linux": ("Linux", "amdxdna driver source", None, "https://github.com/torvalds/linux/commits"),
 }
 KEEP = 80  # commits per upstream kept in changes.json

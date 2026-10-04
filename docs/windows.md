@@ -17,7 +17,7 @@ limitations under the License.
 
 # Windows
 
-`1bit.exe` runs on Windows 10 and later (x64): `1bit serve` with GGUF models on the CPU (`--device cpu`, which `auto` picks) and ONNX Runtime GenAI models (`--device onnx`, on the CPU), `1bit route` (Laya) and `1bit comfy`. It is cross-built on Linux. There is no GPU route on Windows for now: the engine's GPU route is HRX, which has no Windows build yet, and the engine builds no Vulkan (RFC #213 stage 3). There is no NPU lane on Windows yet.
+`1bit.exe` runs on Windows 10 and later (x64): `1bit serve` with GGUF models on the CPU (`--device cpu`, which `auto` picks) and ONNX Runtime GenAI models (`--device onnx`, on the CPU), and `1bit route` (Laya). It is cross-built on Linux. There is no GPU route on Windows for now: the engine's GPU route is HRX, which has no Windows build yet, and the engine builds no Vulkan (RFC #213 stage 3). There is no NPU lane on Windows yet.
 
 ```sh
 scripts/build-windows.sh <out-dir>     # ~2 min on Strix Halo once the downloads are cached
@@ -47,7 +47,6 @@ Host tools: `cmake`, `git` and `curl`.
 - **Backends.** `1bit serve` starts its backends with `CreateProcess`, inside a job object that kills them when its last handle closes. So a backend dies with `1bit.exe` for any reason, as `PR_SET_PDEATHSIG` does on Linux; the Linux and macOS paths are unchanged. Windows has no SIGTERM, so a backend stops with `TerminateProcess`.
 - **Model files.** Model and safetensors files are mapped through `npu/file_map.{h,cpp}` (mmap on POSIX, `CreateFileMapping` on Windows).
 - **cpp-httplib.** It is built at the Windows 10 API level, with its non-blocking DNS lookup off, because MinGW's headers lack `GetAddrInfoExCancel` and the engine only ever connects to 127.0.0.1.
-- **`1bit comfy`.** It spawns `comfyui_cpp.exe` and waits for it, since there is no exec in place on Windows.
 - **ryzenai-server's CMake** is used unmodified through a wrapper project:
   - the wrapper clears its MSVC-only `/SUBSYSTEM:CONSOLE` link flag (MinGW links console programs by default);
   - a one-line `Wbemidl.h` covers MinGW's lowercase `wbemidl.h`;

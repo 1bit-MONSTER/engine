@@ -85,7 +85,7 @@ NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases"),
                ("bench", "How we measure"), ("recipes", "Recipes")]),
     ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("apple", "Apple Silicon")]),
-    ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
+    ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),
 ]
 

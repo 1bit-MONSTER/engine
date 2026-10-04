@@ -30,7 +30,6 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - MLX on Apple Silicon, through lemon-mlx-engine
 - ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs
-- ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census
 
 Every tuned setting `1bit serve` gives a backend is a recipe with its measurement attached

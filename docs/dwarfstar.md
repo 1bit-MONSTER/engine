@@ -19,7 +19,7 @@ limitations under the License.
 [DwarfStar](https://github.com/antirez/ds4) (`antirez/ds4`, MIT) is a native
 inference engine written for a few large MoE models: DeepSeek V4 Flash (and V4.1
 Flash and PRO on bigger machines), GLM 5.2/5.3 Flash and Qwen3.8-Flash-Next. It has
-its own kernels for Metal, CUDA and ROCm, runs Strix Halo (`gfx1151`) as a first-class
+its own kernels for Metal, CUDA and ROCm (the engine builds ROCm, Metal or CPU, not CUDA), runs Strix Halo (`gfx1151`) as a first-class
 target, and can stream routed experts from the SSD. It is not a general GGUF runner:
 it loads its own GGUF layouts (`antirez/deepseek-v4-gguf`,
 `antirez/deepseek-v4.1-flash-gguf`, and the others its `download_model.sh` lists), and
@@ -40,7 +40,7 @@ for a hand rebase.
 
 ```
 git submodule update --init --depth 1 third_party/ds4
-cmake -B build -G Ninja -DONEBIT_DS4=ON        # ONEBIT_DS4_BACKEND=rocm|cuda|metal|cpu
+cmake -B build -G Ninja -DONEBIT_DS4=ON        # ONEBIT_DS4_BACKEND=rocm|metal|cpu
 cmake --build build
 ```
 

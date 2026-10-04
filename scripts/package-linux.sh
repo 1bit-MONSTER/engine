@@ -47,7 +47,7 @@ put() {
 
 cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench
-for b in rocm cuda cpu; do put "ds4/$b" ds4-server ds4 ds4-bench; done
+for b in rocm cpu; do put "ds4/$b" ds4-server ds4 ds4-bench; done
 put onnx ryzenai-server
 
 # Every program and library finds its libraries beside itself. A library it loads from elsewhere

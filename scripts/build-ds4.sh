@@ -18,11 +18,10 @@
 #
 # Builds DwarfStar pinned in third_party/ds4 (upstream antirez/ds4) into
 # <prefix>/<backend>/ds4-server (with ds4 and ds4-bench beside it). backend is
-# one of rocm (default on Linux), cuda, metal (macOS), cpu:
+# one of rocm (default on Linux), metal (macOS), cpu (no cuda: the engine carries no CUDA):
 #   rocm   Strix Halo / gfx1151 (make strix-halo). Needs HIP, hipBLAS, hipBLASLt,
 #          rocBLAS, rocWMMA and hipCUB: ROCM_PATH, else TheRock's SDK under
 #          /opt/rocm-therock, else /opt/rocm
-#   cuda   CUDA_ARCH (default native: make cuda-generic)
 #   metal  Apple Silicon (plain make on macOS)
 #   cpu    CPU only
 #
@@ -30,10 +29,10 @@
 # <prefix>/src and the submodule stays clean (docs/dwarfstar.md). DS4_TEST=1 then runs
 # DwarfStar's model-free routed-MoE test on the GPU (rocm only: make test-mxfp4-rocm).
 set -euo pipefail
-prefix=${1:?usage: build-ds4.sh <prefix> [rocm|cuda|metal|cpu]}
+prefix=${1:?usage: build-ds4.sh <prefix> [rocm|metal|cpu]}
 if [ "$(uname -s)" = Darwin ]; then default=metal; else default=rocm; fi
 backend=${2:-$default}
-case "$backend" in rocm|cuda|metal|cpu) ;; *) echo "unknown backend: $backend"; exit 1 ;; esac
+case "$backend" in rocm|metal|cpu) ;; *) echo "unknown backend: $backend"; exit 1 ;; esac
 root=$(cd "$(dirname "$0")/.." && pwd)
 src=$root/third_party/ds4
 mkdir -p "$prefix"
@@ -67,7 +66,6 @@ rocm)
             HIPCC="$rocm/bin/hipcc" ROCM_CFLAGS="$cflags" ROCM_LDLIBS="$libs")
     fi
     ;;
-cuda)  (cd "$work" && make -j"$jobs" cuda CUDA_ARCH="${CUDA_ARCH:-native}") ;;
 metal) (cd "$work" && make -j"$jobs") ;;
 cpu)   (cd "$work" && make -j"$jobs" cpu) ;;
 esac

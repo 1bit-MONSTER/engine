@@ -231,12 +231,34 @@ bool onebp_file(const std::string& model) {
     return f.read(magic, 4) && std::memcmp(magic, "1BP\0", 4) == 0;
 }
 
-// ryzenai-server (third_party/ryzenai-server, MIT): ONNX Runtime GenAI models, on the CPU with
-// Microsoft's ONNX Runtime, or the NPU / hybrid where AMD's Ryzen AI Software provides it
+#ifdef _WIN32
+// The ryzenai-server.exe Lemonade installs for its ryzenai-server backend:
+// <cache>\bin\ryzenai-server\npu\...\ryzenai-server.exe, where <cache> is $LEMONADE_CACHE_DIR, else
+// %USERPROFILE%\.cache\lemonade (Lemonade's own defaults). Empty when Lemonade has not installed it.
+std::string lemonade_ryzenai_server() {
+    fs::path cache;
+    if (const char* e = std::getenv("LEMONADE_CACHE_DIR"); e && *e) cache = e;
+    else if (const char* h = std::getenv("USERPROFILE"); h && *h) cache = fs::path(h) / ".cache" / "lemonade";
+    else return "";
+    std::error_code ec;
+    const fs::path dir = cache / "bin" / "ryzenai-server" / "npu";
+    if (!fs::is_directory(dir, ec)) return "";
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().filename() == "ryzenai-server.exe") return it->path().string();
+    return "";
+}
+#endif
+
+// ryzenai-server (lemonade-sdk/ryzenai-server, MIT): ONNX Runtime GenAI models. Linux builds it
+// from third_party/ryzenai-server (CPU with Microsoft's ONNX Runtime, or the NPU / hybrid where
+// AMD's Ryzen AI Software provides it); Windows uses the one Lemonade installs.
 std::string default_onnx() {
     if (const char* e = std::getenv("ONEBIT_ONNX_SERVER"); e && *e) return e;
 #ifdef ONEBIT_ONNX_SERVER
     return built_path(ONEBIT_ONNX_SERVER);
+#elif defined(_WIN32)
+    if (std::string p = lemonade_ryzenai_server(); !p.empty()) return p;
+    return "ryzenai-server.exe";
 #else
     return "ryzenai-server";
 #endif

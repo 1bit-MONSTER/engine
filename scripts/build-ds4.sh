@@ -36,7 +36,7 @@ work=$prefix/src/$backend
 mkdir -p "$work"
 # copy the tree, keeping objects from an earlier build of the same backend
 (cd "$src" && tar --exclude=.git -cf - .) | (cd "$work" && tar -xf -)
-jobs=$(nproc)
+jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}   # the weekly job and thermal guards cap it
 
 rocm=${ROCM_PATH:-}
 if [ -z "$rocm" ]; then

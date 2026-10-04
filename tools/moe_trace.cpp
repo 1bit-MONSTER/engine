@@ -32,7 +32,7 @@
 // layer or no router weights.
 //
 // Env: MOE_NGL (layers on the GPU, default all), MOE_BATCH (prompt batch, default 2048),
-// MOE_CTX (context, default 8192), MOE_DEV (a single device, e.g. Vulkan0), MOE_CPU_EXPS=1
+// MOE_CTX (context, default 8192), MOE_DEV (a single device, e.g. HRX0), MOE_CPU_EXPS=1
 // (routed experts stay in the mmap'd file on the CPU, not repacked: a model larger than free
 // memory then traces without loading its experts into RAM).
 // Build against a libllama: g++ -std=c++17 -O2 -I<llama.cpp>/include -I<llama.cpp>/ggml/include

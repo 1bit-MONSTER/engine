@@ -29,10 +29,15 @@ Halo's gfx1151 instead. Each task packages one of the engine's kernels with:
 - a driver that follows KernelForge's contract;
 - a `program.md` that tells the agent what differs on this GPU.
 
-| Task | Kernel | Where it runs in the engine |
+| Task | Kernel | Where it came from |
 |---|---|---|
-| [`gdn-prefill/`](gdn-prefill/) | gated delta-net prefill (head size 128, optional rollback snapshots) | Qwen3.8 / Qwen3.6 prompt processing on ROCm, from ROCmFPX's `gated_delta_net.cu` |
-| [`gemv-q4_0/`](gemv-q4_0/) | Q4_0 x Q8_1 for 1-8 columns (`mul_mat_vec_q`) | speculative verification (and plain decode) on ROCm, from ROCmFPX's `mmvq.cu` |
+| [`gdn-prefill/`](gdn-prefill/) | gated delta-net prefill (head size 128, optional rollback snapshots) | Qwen3.8 / Qwen3.6 prompt processing; from ROCmFPX's `gated_delta_net.cu` |
+| [`gemv-q4_0/`](gemv-q4_0/) | Q4_0 x Q8_1 for 1-8 columns (`mul_mat_vec_q`) | speculative verification (and plain decode); from ROCmFPX's `mmvq.cu` |
+
+The engine no longer builds ROCmFPX's ROCm llama.cpp (RFC #213 stage 3). Both tasks are
+standalone HIP kernels, so they still run; a kept kernel's destination is now an HIP kernel
+dispatched through HRX in our llama.cpp fork, not the ROCm backend. The results below were
+measured on the ROCmFPX build and are kept as the record.
 
 ## Run one
 
@@ -56,9 +61,10 @@ When it finishes:
 - the best kernel is checked out in the workspace;
 - every candidate, measurement and profile is under `forge_experiments/`.
 
-A kept kernel is only a candidate. It goes back into ROCmFPX's `gated_delta_net.cu` by hand and
-has to pass `test-backend-ops -o GATED_DELTA_NET`. Then it is measured through `1bit serve`
-with [`tools/bench.py`](../../docs/bench.md).
+A kept kernel is only a candidate. It went back into ROCmFPX's `gated_delta_net.cu` by hand and
+had to pass `test-backend-ops -o GATED_DELTA_NET`. Now it goes into the HRX dispatch (with its
+matcher), passes `test-backend-ops -b HRX0`, and is measured through `1bit serve` with
+[`tools/bench.py`](../../docs/bench.md).
 
 ## Results
 

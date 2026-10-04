@@ -40,8 +40,11 @@ os/mini/mkimage.sh out build
 (`ONEBIT_HRX_LIBHSA` in `build/CMakeCache.txt`) at their build paths, with every library they
 link; `1bit` has both paths compiled in.
 
-`mkimage.sh` takes the running kernel (or `KVER=`), copies only the modules, firmware and
-shared libraries the stack uses, and writes:
+`mkimage.sh` takes the running kernel (or `KVER=`, with `VMLINUZ=` for an image outside `/boot`),
+copies only the modules, firmware and shared libraries the stack uses. The engine no
+longer builds a kernel: a Strix Halo kernel with `amdxdna` comes from
+[1bit-MONSTER/kernel](https://github.com/1bit-MONSTER/kernel), installed on the build machine
+(or unpacked from its packages for `KVER=`/`VMLINUZ=`). It writes:
 
 | File | What |
 |---|---|

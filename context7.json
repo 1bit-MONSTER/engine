@@ -5,20 +5,17 @@
   "projectTitle": "1bit engine",
   "description": "C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI: the XDNA 2 NPU, HRX on the iGPU, MLX on Apple.",
   "folders": [
-    "docs",
-    "blog"
+    "docs"
   ],
   "excludeFolders": [
     "third_party",
-    "site",
     "tools",
     "tests",
     "patches"
   ],
   "excludeFiles": [
     "LICENSE",
-    "NOTICE",
-    "archive.tsv"
+    "NOTICE"
   ],
   "rules": [
     "Serve models with `1bit serve`; it exposes an OpenAI-compatible API and runs as Lemonade's `onebit` backend.",

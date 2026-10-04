@@ -31,12 +31,6 @@
 	path = third_party/xdna-driver
 	url = https://github.com/amd/xdna-driver.git
 	branch = main
-# Linux kernel (docs/kernel.md): upstream torvalds/linux at a release tag, built
-# by scripts/build-kernel.sh; .github/workflows/bump-linux.yml keeps it current.
-[submodule "third_party/linux"]
-	path = third_party/linux
-	url = https://github.com/torvalds/linux.git
-	shallow = true
 # Laya (docs/laya.md): the step-4 router's upstream source, NandhaKishorM/laya.
 # The model checkpoints are pinned by Hugging Face revision in config/laya.json
 # and fetched by scripts/fetch-laya.sh; .github/workflows/bump-laya.yml keeps both current.

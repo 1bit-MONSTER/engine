@@ -20,4 +20,3 @@ build-*/
 compile_commands.json
 .cache/
 __pycache__/
-_site/

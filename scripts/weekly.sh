@@ -42,7 +42,7 @@ DRY=${WEEKLY_DRY_RUN:-0}
 # the box is shared: a capped build leaves room for whatever else runs on Sunday
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
-# the submodules the packages are built from (linux and laya only on their bumps)
+# the submodules the packages are built from (laya only on its bump)
 SUBMODULES=(hrx-system llama.cpp xdna-driver lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
@@ -84,7 +84,7 @@ checkout() {  # checkout <ref> [pr number to merge on top]
         git -C "$SRC" -c user.name=weekly -c user.email=weekly@1bit.gg merge -q --no-edit FETCH_HEAD
     fi
     local mods=("${SUBMODULES[@]/#/third_party/}") m
-    for m in linux laya; do   # fetched only when that pin is what moves
+    for m in laya; do   # fetched only when that pin is what moves
         if [ -n "${2:-}" ] && ! git -C "$SRC" diff --quiet HEAD^1 HEAD -- "third_party/$m"; then
             mods+=("third_party/$m")
         fi
@@ -160,7 +160,6 @@ bump_check() {  # bump_check <branch>
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
             "$SRC/tests/laya_route_e2e.sh" "$BUILD/1bit" "$W/laya" >> "$LOGS/laya.log" 2>&1 ;;
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" rocm > "$LOGS/ds4.log" 2>&1 ;;
-        bump-linux/*) guard "$SRC/scripts/build-kernel.sh" "$W/kernel" > "$LOGS/kernel.log" 2>&1 ;;
         *) : ;;  # xdna, tokenizers: covered by build + ctest
     esac
 }

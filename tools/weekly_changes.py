@@ -40,7 +40,6 @@ UPSTREAMS = {
     "tokenizers": ("Hugging Face tokenizers", "huggingface/tokenizers", None),
     "ryzenai-server": ("ryzenai-server (ONNX)", "lemonade-sdk/ryzenai-server", None),
     "ds4": ("DwarfStar", "antirez/ds4", None),
-    "linux": ("Linux kernel", None, None),
 }
 # every pin, for the Updates list at the end of the weekly post: (what it is to the engine, the
 # repo whose latest release is quoted, where its changes are read)
@@ -53,7 +52,6 @@ PINS = {  # path -> (name, what it is to the engine, repo whose latest release i
     "tokenizers": ("tokenizers", "Hugging Face", "huggingface/tokenizers", "https://github.com/huggingface/tokenizers/releases"),
     "ryzenai-server": ("ryzenai-server", "ONNX Runtime GenAI", "lemonade-sdk/ryzenai-server", "https://github.com/lemonade-sdk/ryzenai-server/releases"),
     "ds4": ("DwarfStar", "antirez/ds4", "antirez/ds4", "https://github.com/antirez/ds4/commits"),
-    "linux": ("Linux", "amdxdna driver source", None, "https://github.com/torvalds/linux/commits"),
 }
 KEEP = 80  # commits per upstream kept in changes.json
 PR = re.compile(r"\(#(\d+)\)\s*$")
@@ -88,15 +86,6 @@ def pin(src: str, rev: str, path: str) -> str | None:
 
 def commit_date(src: str, rev: str) -> dt.datetime:
     return dt.datetime.fromisoformat(run("git", "-C", src, "show", "-s", "--format=%cI", rev).strip())
-
-
-def linux_version(sha: str) -> str:
-    text = base64.b64decode(gh(f"repos/torvalds/linux/contents/Makefile?ref={sha}")["content"]).decode()
-    v = dict(re.findall(r"^(VERSION|PATCHLEVEL|SUBLEVEL|EXTRAVERSION) = ?(.*)$", text, re.M))
-    s = f"{v.get('VERSION')}.{v.get('PATCHLEVEL')}"
-    if v.get("SUBLEVEL", "0") not in ("", "0"):
-        s += "." + v["SUBLEVEL"]
-    return s + v.get("EXTRAVERSION", "")
 
 
 def compare(repo: str, old: str, new: str) -> dict:
@@ -149,8 +138,6 @@ def pins(src: str, rev: str, mods: dict[str, str]) -> list[dict]:
                 p["release"] = {"tag": r["tag_name"], "date": r["published_at"][:10], "url": r["html_url"]}
             except subprocess.CalledProcessError:
                 pass
-        if key == "linux":
-            p["version"] = linux_version(sha)
         out.append(p)
     out.sort(key=lambda p: list(PINS).index(p["path"].removeprefix("third_party/"))
              if p["path"].removeprefix("third_party/") in PINS else 99)
@@ -227,11 +214,7 @@ def main() -> None:
             continue
         name, rel_repo, pr_repo = UPSTREAMS.get(key, (repo, None, None))
         u = {"path": path, "name": name, "repo": repo, "pr_repo": pr_repo or repo, "from": before, "to": after}
-        if key == "linux":
-            u["versions"] = [linux_version(before) if before else None, linux_version(after)]
-            u.update(total=None, commits=[], url=f"https://github.com/{repo}/compare/{before[:12]}...{after[:12]}"
-                     if before else f"https://github.com/{repo}/commit/{after}")
-        elif before:
+        if before:
             # an old pin can predate a fork (e.g. Lemonade before 1bit-MONSTER/lemonade): ask upstream
             for r in dict.fromkeys(x for x in (repo, pr_repo, rel_repo) if x):
                 try:
@@ -277,9 +260,6 @@ def main() -> None:
         count = f", {u['total']} commits" if u.get("total") else ""
         md.append(f"### {u['name']} ({u['repo']})")
         md.append(f"{span}{count} ([{'compare' if u['from'] else 'commit'}]({u['url']}))")
-        if u.get("versions"):
-            v0, v1 = u["versions"]
-            md.append(f"Linux {v0} → {v1}" if v0 else f"Linux {v1}")
         for r in u.get("releases", []):
             md.append(f"- Release [{r['name']}]({r['url']})")
         for c in u["commits"][:25]:

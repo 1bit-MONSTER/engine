@@ -18,6 +18,8 @@ limitations under the License.
 
 **Documentation:** [1bit.gg](https://1bit.gg/) · **Measured results:** [wiki](https://github.com/1bit-MONSTER/engine/wiki) · **Community:** [Discord](https://discord.gg/fa5m4Vawpa)
 
+**Site:** [github.com/1bit-MONSTER/site](https://github.com/1bit-MONSTER/site) (builds 1bit.gg from this repository's README.md and docs/) · **Kernel build:** [github.com/1bit-MONSTER/kernel](https://github.com/1bit-MONSTER/kernel)
+
 **The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade stays
 the server you talk to (its catalog, downloads, router and UI), and for the models it hands to 1bit,
 Lemonade runs the engine as one of its backends, the same way it runs `llama-server`. The engine

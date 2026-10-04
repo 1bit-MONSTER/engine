@@ -82,12 +82,6 @@ HRX, HIP Runtime Extended (third_party/hrx-system)
   Copyright the HRX authors (Advanced Micro Devices, Inc.)
   License: Apache-2.0
 
-Linux kernel (third_party/linux)
-  https://github.com/torvalds/linux
-  Copyright Linus Torvalds and the Linux kernel contributors
-  License: GPL-2.0 WITH Linux-syscall-note. The kernel is built as a separate
-  program (scripts/build-kernel.sh); no kernel code is linked into this product.
-
 DwarfStar (third_party/ds4)
   https://github.com/1bit-MONSTER/ds4
   (a fork of https://github.com/antirez/ds4, with 1BP packages)
@@ -142,6 +136,17 @@ Laya typed-decisions GGUF (Hugging Face mys/laya-typed-decisions-GGUF, pinned in
 config/laya.json; compiled by ggmlc from convaiinnovations/laya-typed-decisions)
   https://huggingface.co/mys/laya-typed-decisions-GGUF
   License: Apache-2.0
+
+-------------------------------------------------------------------------------
+Shipped in the 1bit OS image only (built outside this repository)
+-------------------------------------------------------------------------------
+
+Linux kernel
+  https://github.com/torvalds/linux
+  Copyright Linus Torvalds and the Linux kernel contributors
+  License: GPL-2.0 WITH Linux-syscall-note. Built as a separate program by
+  https://github.com/1bit-MONSTER/kernel; os/mini/mkimage.sh copies a built kernel
+  into the image. No kernel code is linked into this product.
 
 -------------------------------------------------------------------------------
 Fetched by the build at pinned commits (CMakeLists.txt)

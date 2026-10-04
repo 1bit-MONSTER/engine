@@ -71,7 +71,6 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 | `bump-lemonade/*` | Lemonade's LLM suite through the onebit recipe on HRX ([lemonade.md](lemonade.md)) |
 | `bump-laya/*` | `tests/laya_route_e2e.sh` on the pinned checkpoint |
 | `bump-ds4/*` | DwarfStar's routed-MoE test (`DS4_TEST=1 scripts/build-ds4.sh`) |
-| `bump-linux/*` | the kernel packages build (`scripts/build-kernel.sh`); nothing is installed |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
 | `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device) |
 

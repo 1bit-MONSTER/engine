@@ -21,19 +21,6 @@
    "engine": "b9812e0ca35e"
   },
   {
-   "backend": "zinc",
-   "model": "MiniCPM5-1B-Q4_K_M.gguf",
-   "arch": "llama",
-   "passed": false,
-   "said": "<no content: {\"choices\":[{\"finish_reason\":\"length\",\"index\":0,\"message\":{\"content\":\"\",\"role\":\"assistant\"}}],\"created\":179",
-   "failed": [
-    "zinc: answers Paris",
-    "zinc: streams (2 chunks)"
-   ],
-   "date": "2026-09-25",
-   "engine": "8c2805d977eb"
-  },
-  {
    "backend": "hrx",
    "model": "MiniCPM4-8B-Q4_K_M.gguf",
    "arch": "minicpm",
@@ -52,22 +39,6 @@
    "failed": [],
    "date": "2026-09-25",
    "engine": "b9812e0ca35e"
-  },
-  {
-   "backend": "zinc",
-   "model": "qwen2.5-7b-instruct-q4_k_m-merged.gguf",
-   "arch": "qwen2",
-   "passed": false,
-   "said": "<no content: >",
-   "failed": [
-    "zinc: /health 200",
-    "zinc: /v1/models names e2e-model",
-    "zinc: answers Paris",
-    "zinc: reply names e2e-model",
-    "zinc: streams (0 chunks)"
-   ],
-   "date": "2026-09-25",
-   "engine": "8c2805d977eb"
   },
   {
    "backend": "hrx",
@@ -90,16 +61,6 @@
    "engine": "97a43e2b1b2c"
   },
   {
-   "backend": "zinc",
-   "model": "Qwen3-0.6B-Q4_K_M.gguf",
-   "arch": "qwen3",
-   "passed": true,
-   "said": "Paris.",
-   "failed": [],
-   "date": "2026-09-25",
-   "engine": "8c2805d977eb"
-  },
-  {
    "backend": "hrx",
    "model": "Qwen3.6-35B-A3B-Q8_0.gguf",
    "arch": "qwen35moe",
@@ -110,16 +71,6 @@
    "engine": "b9812e0ca35e"
   },
   {
-   "backend": "zinc",
-   "model": "Qwen3.6-35B-A3B-Q8_0.gguf",
-   "arch": "qwen35moe",
-   "passed": true,
-   "said": "Paris",
-   "failed": [],
-   "date": "2026-09-25",
-   "engine": "8c2805d977eb"
-  },
-  {
    "backend": "hrx",
    "model": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
    "arch": "qwen3moe",
@@ -128,16 +79,6 @@
    "failed": [],
    "date": "2026-09-25",
    "engine": "b9812e0ca35e"
-  },
-  {
-   "backend": "zinc",
-   "model": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
-   "arch": "qwen3moe",
-   "passed": true,
-   "said": "Paris",
-   "failed": [],
-   "date": "2026-09-25",
-   "engine": "8c2805d977eb"
   },
   {
    "backend": "hrx",

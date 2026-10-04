@@ -23,8 +23,8 @@ OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|hrx|cpu|zinc|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]
-           [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
+           [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]
+           [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
@@ -50,7 +50,7 @@ One model per process:
 
 "llama-server devices" means `hrx` and `cpu`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
-inherits it). On `npu`, `zinc`, `ds4` and `mlx` they answer 501.
+inherits it). On `npu`, `ds4` and `mlx` they answer 501.
 
 ## Where the model runs
 
@@ -60,7 +60,6 @@ inherits it). On `npu`, `zinc`, `ds4` and `mlx` they answer 501.
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | the private NPU route, in process, in builds with `-DONEBIT_NPU_PRIVATE` (docs/npu.md, "Private routes") |
 | `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md), `--mtp` included. Since the HRX prompt-matmul routing (llama.cpp fork #55), prompts on HRX run at pp512 335 tok/s on Qwen3.8-27B UD-Q4_K_XL (was 97-99), and a 14K-token prompt through `serve` at 265 tok/s (was 91). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` on Windows (no GPU route yet, docs/windows.md) and in a build without HRX |
-| `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
 | DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (ROCm, CUDA or Metal; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
 
@@ -79,8 +78,9 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 ### Removed devices and flags
 
 The engine builds no Vulkan or ROCm llama.cpp (RFC #213 stage 3; owner direction
-2026-10-01: HRX + NPU, zero Vulkan, zero ROCm). Lemonade ships its own llamacpp backends for those
-([lemonade.md](lemonade.md#vulkan-and-rocm-are-lemonades)). `serve` exits at once, with the reason,
+2026-10-01: HRX + NPU, zero Vulkan, zero ROCm), and no ZINC since the core strip (2026-10-04).
+Lemonade ships its own llamacpp backends for those
+([lemonade.md](lemonade.md#vulkan-rocm-and-cuda-are-lemonades)). `serve` exits at once, with the reason,
 when asked for any of these:
 
 | Asked for | What it was |
@@ -91,6 +91,7 @@ when asked for any of these:
 | `--prefill-device hrx`, `--prefill-min-tokens` | Vulkan decode with the prompt prefilled on HRX0 over one shared KV cache |
 | `--adaptive`, `--adaptive-at` | Vulkan for the first requests, ROCm batching the overflow |
 | `--long-model`, `--long-from` | long conversations to a Hadamard-rotated Q4_0 on the ROCm W4A4 route |
+| `--device zinc`, `--zinc PATH` | ZINC (zolotukhin/zinc), a Zig GGUF engine on Vulkan, ROCm or CUDA |
 
 The DFlash2 one-server route (a Hadamard-rotated file with W4A4 prompts and DFlash2 decode on ROCm)
 went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min-0.4`), and so did
@@ -113,8 +114,7 @@ also opens `<think>\n` when thinking is on, as that model's template does.
 
 For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
-the served model name. For ZINC, which rejects foreign model ids, requests go
-out without `model`. `auto` means HRX for GGUF: it met RFC #213's decode gates (docs/hrx.md), and
+the served model name. `auto` means HRX for GGUF: it met RFC #213's decode gates (docs/hrx.md), and
 it is the engine's only GPU route. With `--laya` (or
 `--laya-model DIR`), Laya classifies each conversation and the route policy picks the device:
 the built-in policy sends every class to HRX, long documents included, since HRX prefills
@@ -126,8 +126,8 @@ PM4-emulation probe, and then HRX registers no device. `serve` sets
 `IREE_HAL_AMDGPU_LIBHSA_PATH` itself unless you did. It uses `--hrx-libhsa`,
 else the build's copy, else the first one under `/opt/rocm-therock`.
 
-The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`, `-DONEBIT_DS4`),
-then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC` / `$ONEBIT_DS4`, then `llama-server` / `zinc` / `ds4-server` on PATH.
+The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
+then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH.
 
 ## Images (`--mmproj`)
 
@@ -137,7 +137,7 @@ URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes 
 `convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. With it, llama-server runs
 with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that attend to an image
 bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B were checked on the
-removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU, ZINC, DwarfStar, MLX and ONNX routes take no `--mmproj`.
+removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU, DwarfStar, MLX and ONNX routes take no `--mmproj`.
 
 ## Multi-token prediction (`--mtp`)
 
@@ -368,12 +368,12 @@ streaming:
 |---|---|
 | `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory on the fast lane |
 | `hrx` | PASS (32 SSE chunks), with no environment set up |
-| `zinc` | PASS (6 SSE chunks) |
 
 Qwen3.6-35B-A3B on the NPU is tested by the private add-on (docs/npu.md, "Private routes").
 Without it, `serve` on that directory exits with the message above.
 
-(The `vulkan` row, PASS with 32 SSE chunks, went with the Vulkan build.) With `-DONEBIT_HRX=ON`,
+(The `vulkan` row, PASS with 32 SSE chunks, went with the Vulkan build, and the `zinc` row, PASS
+with 6, with ZINC.) With `-DONEBIT_HRX=ON`,
 ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`, and in general `serve_e2e_<device>`, when configured with
 `-DONEBIT_SERVE_TEST_GGUF=<gguf>` (and `serve_e2e_mlx` on macOS with
 `-DONEBIT_MLX_SERVER`). `smoke_serve` runs everywhere, CI included:

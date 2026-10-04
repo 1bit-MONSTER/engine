@@ -318,12 +318,11 @@ its median added time over all 48 was +32 ms.
   GGUF scorer on HRX, the first turn of a conversation costs about 33 ms, and a long document
   costs nothing.
 
-**What still names Vulkan or ROCm.** Since RFC #213 stage 3, serve's Laya
-candidates for a `.gguf` are `hrx` and `zinc` in a build with HRX, and `cpu` and `zinc` in one
-without (ZINC, decided separately, runs on Vulkan or ROCm on this GPU). Every row of
-`config/route-policy.json`, and its default, is `hrx`, and a candidate's backend starts only when
-the policy picks it. `1bit route`'s default `--devices` is now `npu,hrx,cpu,zinc`, and
-`laya/route.cpp` describes `cpu` instead of `vulkan`.
+**Candidates.** Since RFC #213 stage 3 and the core strip (2026-10-04, which removed ZINC),
+serve's Laya candidates for a `.gguf` are `hrx` and `cpu` in a build with HRX, and `cpu` alone in
+one without. Every row of `config/route-policy.json`, and its default, is `hrx`, and a candidate's
+backend starts only when the policy picks it. `1bit route`'s default `--devices` is
+`npu,hrx,cpu`. (The measurements above that name `vulkan` or `zinc` candidates predate both.)
 
 **Agent dispatch, out of domain.** We also tried `1bit route --classify` as a dispatcher for
 agent sessions: code to engine work, prose to docs, long_doc to review, short to quick answers,

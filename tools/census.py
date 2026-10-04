@@ -95,7 +95,7 @@ def coverage(raw):
 
     with_arch = raw["total"] - raw["no_arch"]
     mapped = checked = 0
-    per_backend = {b: {"mapped": 0, "checked": 0} for b in ("hrx", "zinc", "npu")}
+    per_backend = {b: {"mapped": 0, "checked": 0} for b in ("hrx", "npu")}
     unmapped = []
     for hf, n in raw["counts"].items():
         a = archs.get(hf)

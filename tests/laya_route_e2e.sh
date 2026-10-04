@@ -16,8 +16,8 @@
 #
 # End-to-end test of Laya routing in `1bit serve` (RFC #186, docs/laya.md): Laya classifies each
 # conversation and the route policy picks the device. tests/route-policy-e2e.json sends code,
-# prose and short requests to three different devices (tests/fake_backend_route.py stands in for
-# llama-server and zinc and answers with its device), so the test proves:
+# prose and short requests to HRX and the CPU (tests/fake_backend_route.py stands in for
+# llama-server on HRX0 and on the CPU and answers with its device), so the test proves:
 #   - each request reaches the device the policy names for the class `1bit route` reports,
 #   - the reply carries X-1bit-Route "<class> <confidence> <device>",
 #   - a later turn of the same conversation reuses the first decision (one decision logged),
@@ -32,10 +32,10 @@ laya_model=${2:?usage: laya_route_e2e.sh path/to/1bit path/to/laya-model-dir}
 here=$(cd "$(dirname "$0")" && pwd)
 policy="$here/route-policy-e2e.json"
 # The devices serve offers Laya for a .gguf in this build (gguf_devices() in app/serve.cpp): HRX
-# and zinc in a build with HRX; the CPU and zinc in one without (CI).
+# and the CPU in a build with HRX; the CPU only in one without (CI).
 cache="$(dirname "$bin")/CMakeCache.txt"
-devices=cpu,zinc
-if grep -q "^ONEBIT_HRX:BOOL=ON" "$cache" 2>/dev/null; then devices=hrx,zinc; fi
+devices=cpu
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$cache" 2>/dev/null; then devices=hrx,cpu; fi
 echo "candidates: $devices"
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
@@ -53,7 +53,7 @@ check "--laya without a checkpoint says how to install one" '[[ "$missing" == *f
 
 ONEBIT_LAYA_MODEL="$laya_model" "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya --route-policy "$policy" \
     --port "$port" --alias route-test \
-    --llama-server "$here/fake_backend_route.py" --zinc "$here/fake_backend_route.py" \
+    --llama-server "$here/fake_backend_route.py" \
     >"$scratch/serve.log" 2>&1 &
 pid=$!
 cleanup() { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
@@ -77,7 +77,9 @@ for state in "${states[@]}"; do
     check "  X-1bit-Route header ($hdr)" '[[ "$hdr" == "$cls "*" $expected" ]]'
 done
 distinct=$(for d in $seen; do echo "$d"; done | sort -u | wc -l)
-check "the policy routed to $distinct distinct devices" '[ "$distinct" -ge 2 ]'
+min_distinct=1
+[ "$devices" = cpu ] || min_distinct=2
+check "the policy routed to $distinct distinct devices" '[ "$distinct" -ge "$min_distinct" ]'
 
 # a second turn of the first conversation: same class, no new decision
 decisions_before=$(grep -c "1bit serve: laya: [a-z_]* [0-9.]* " "$scratch/serve.log")

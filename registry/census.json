@@ -15,12 +15,6 @@
     "mapped_pct": 94.71,
     "checked_pct": 64.2
    },
-   "zinc": {
-    "mapped": 233110,
-    "checked": 34553,
-    "mapped_pct": 69.71,
-    "checked_pct": 10.33
-   },
    "npu": {
     "mapped": 180709,
     "checked": 31180,

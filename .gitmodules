@@ -31,12 +31,6 @@
 	path = third_party/xdna-driver
 	url = https://github.com/amd/xdna-driver.git
 	branch = main
-# ZINC (docs/zinc.md): upstream zolotukhin/zinc, built by scripts/build-zinc.sh;
-# .github/workflows/bump-zinc.yml keeps it current.
-[submodule "third_party/zinc"]
-	path = third_party/zinc
-	url = https://github.com/zolotukhin/zinc.git
-	branch = main
 # Linux kernel (docs/kernel.md): upstream torvalds/linux at a release tag, built
 # by scripts/build-kernel.sh; .github/workflows/bump-linux.yml keeps it current.
 [submodule "third_party/linux"]

@@ -3,7 +3,7 @@
   "url": "https://context7.com/1bit-monster/engine",
   "public_key": "pk_woGfNaBfmOKTjJDCp8JpR",
   "projectTitle": "1bit engine",
-  "description": "C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI: the XDNA 2 NPU, HRX on the iGPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple.",
+  "description": "C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI: the XDNA 2 NPU, HRX on the iGPU, MLX on Apple.",
   "folders": [
     "docs",
     "blog"
@@ -22,7 +22,7 @@
   ],
   "rules": [
     "Serve models with `1bit serve`; it exposes an OpenAI-compatible API and runs as Lemonade's `onebit` backend.",
-    "Pick the device with `--device` (auto, npu, hrx, cpu, zinc, ds4, mlx, onnx); an NPU model directory runs on the NPU fast lane, and `auto` runs plain GGUF files on HRX. The engine has no Vulkan or ROCm build: Lemonade's own llamacpp backend serves those.",
+    "Pick the device with `--device` (auto, npu, hrx, cpu, ds4, mlx, onnx); an NPU model directory runs on the NPU fast lane, and `auto` runs plain GGUF files on HRX. The engine has no Vulkan or ROCm build: Lemonade's own llamacpp backend serves those.",
     "Prefer Unsloth Dynamic GGUFs: UD-Q4_K_XL is the lean default, UD-Q5_K_XL the accurate choice.",
     "For one user at a time use `--mtp`; for many simultaneous requests use `--parallel`.",
     "Documentation lives at https://1bit.gg; measured results are on the GitHub wiki."

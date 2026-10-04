@@ -43,7 +43,7 @@ DRY=${WEEKLY_DRY_RUN:-0}
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (linux, laya and comfyui.cpp only on their bumps)
-SUBMODULES=(hrx-system llama.cpp zinc xdna-driver lemonade ryzenai-server ds4 tokenizers)
+SUBMODULES=(hrx-system llama.cpp xdna-driver lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
@@ -112,7 +112,7 @@ build() {
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DONEBIT_HRX=ON -DONEBIT_ZINC=ON -DONEBIT_ONNX=ON \
+        -DONEBIT_HRX=ON -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
         -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT="$xdna/root/opt/xilinx/xrt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
@@ -145,7 +145,7 @@ pins_on_branch() {
 
 # a llama.cpp bump re-runs every model row registry/check_models.tsv lists for that backend
 # (the architectures only our fork has, such as zaya, and the MoE and Qwen rows among them)
-model_rows() {  # model_rows <hrx|zinc|npu>
+model_rows() {  # model_rows <hrx|npu>
     guard python3 "$SRC/tools/registry_check.py" "$BUILD/1bit" --models "$HOME/models" --only "$1" \
         > "$LOGS/models-$1.log" 2>&1 || return 1
     ! grep -q '^FAIL' "$LOGS/models-$1.log"
@@ -162,7 +162,7 @@ bump_check() {  # bump_check <branch>
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" rocm > "$LOGS/ds4.log" 2>&1 ;;
         bump-linux/*) guard "$SRC/scripts/build-kernel.sh" "$W/kernel" > "$LOGS/kernel.log" 2>&1 ;;
         bump-comfyui/*) guard "$SRC/scripts/build-comfyui.sh" "$W/comfyui" > "$LOGS/comfyui.log" 2>&1 ;;
-        *) : ;;  # zinc, xdna, tokenizers: covered by build + ctest
+        *) : ;;  # xdna, tokenizers: covered by build + ctest
     esac
 }
 

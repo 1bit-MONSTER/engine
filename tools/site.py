@@ -68,7 +68,7 @@ OLD_SITE = "https://1bit-monster.github.io/1bit-MONSTER/"
 ROOT = pathlib.Path(__file__).resolve().parent.parent
 
 TAGLINE = ("One engine behind an OpenAI-compatible API, running inside Lemonade: HRX on the Radeon "
-           "iGPU with our Loom kernels, the XDNA 2 NPU, ZINC for NVIDIA and Apple GPUs, MLX on Apple Silicon.")
+           "iGPU with our Loom and HIP kernels, the XDNA 2 NPU, MLX on Apple Silicon.")
 # The home page's search and social description: the headline milestones, measured on Strix Halo
 # (docs/serve.md, docs/hrx.md). Keep it <= 160 characters and update it with each milestone.
 HOME_DESCRIPTION = ("Local LLM inference for AMD Strix Halo inside Lemonade: HRX reads Qwen3.8-27B prompts "
@@ -84,7 +84,7 @@ TOP = [("Engine", "overview"), ("Docs", "docs"), ("Blog", "blog"), ("Benchmarks"
 NAV = [
     ("Start", [("serve", "1bit serve"), ("lemonade", "Lemonade"), ("releases", "Weekly releases"),
                ("bench", "How we measure"), ("recipes", "Recipes")]),
-    ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("zinc", "ZINC"), ("apple", "Apple Silicon")]),
+    ("Devices", [("npu", "NPU"), ("hrx", "HRX"), ("apple", "Apple Silicon")]),
     ("Components", [("moe-streaming", "MoE streaming"), ("laya", "Laya router"), ("registry", "Model registry"), ("arch-gaps", "Architecture gaps"), ("windows", "Windows"), ("onnx", "ONNX Runtime"), ("comfyui", "ComfyUI.cpp"), ("tokenizers", "Tokenizers"), ("kernel", "Linux kernel")]),
     ("Project", [("PORTING", "Porting map")]),
 ]

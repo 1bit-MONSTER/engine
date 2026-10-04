@@ -15,7 +15,7 @@
 // 1bit: the engine binary. Subcommands:
 //
 //   1bit serve -m <model>            one model on any device (NPU, HRX, CPU,
-//                                    ZINC, MLX) behind an OpenAI-compatible API;
+//                                    DwarfStar, ONNX, MLX) behind an OpenAI-compatible API;
 //                                    how the engine runs inside Lemonade (docs/serve.md).
 //   1bit unified -m <model dir>      one native model on the NPU fast lane behind
 //                                    OpenAI endpoints; serve's NPU route.
@@ -236,7 +236,7 @@ int run_comfy(int argc, char** argv) {
 // route policy (config/route-policy.json or --route-policy) picks among --devices. --classify
 // also prints the class and Laya's confidence.
 int run_route(int argc, char** argv) {
-    std::string laya_model, state, policy_path, devices_str = "npu,hrx,cpu,zinc";
+    std::string laya_model, state, policy_path, devices_str = "npu,hrx,cpu";
     bool classify = false;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -250,7 +250,7 @@ int run_route(int argc, char** argv) {
         else if (a == "--route-policy") policy_path = next();
         else if (a == "--classify") classify = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,cpu,zinc]\n"
+            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,cpu]\n"
                         "                  [--route-policy FILE] [--classify]\n"
                         "  Laya classifies the request (code, prose, short, long_doc) and the route policy\n"
                         "  picks one of the devices; --classify prints \"<class> <confidence> <device>\"\n");

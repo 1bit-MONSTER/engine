@@ -45,7 +45,7 @@ One recipe in Lemonade runs the engine, `onebit`, in the same shape as its
 ```
 
 Lemonade downloads and resolves GGUF checkpoints as for llamacpp, and its
-backend selector picks the device (`hrx`, `npu`, or `cuda` through ZINC; unset,
+backend selector picks the device (`hrx` or `npu`; unset,
 the recipe sends `--device auto`). Replies already carry Lemonade's model name (`--alias`),
 so requests pass through unchanged.
 
@@ -107,21 +107,22 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 7. **Beyond the LLM suite:**
    - image generation: `1bit comfy` behind Lemonade's image endpoint;
    - the Laya router;
-   - MLX;
-   - CUDA through ZINC, which needs an NVIDIA box.
+   - MLX.
 
 `echo` and generation parameters are skipped, because Lemonade's own llamacpp recipe
 declares neither.
 
-## Vulkan and ROCm are Lemonade's
+## Vulkan, ROCm and CUDA are Lemonade's
 
 The engine builds no Vulkan or ROCm llama.cpp (RFC #213 stage 3; owner direction
-2026-10-01: HRX + NPU only). Lemonade ships its own `llamacpp` backends for Vulkan, ROCm and the
+2026-10-01: HRX + NPU only), and since the core strip (2026-10-04) no ZINC, so no CUDA either.
+Lemonade ships its own `llamacpp` backends for Vulkan, ROCm and the
 CPU from upstream llama.cpp, so a model or feature the engine does not run on HRX or the NPU is
 Lemonade's to serve:
 
-- `1bit serve --device vulkan` and `--device rocm` exit at once with that reason, as do `--lean`,
-  `--adaptive`, `--long-model` and `--prefill-device` ([serve.md](serve.md#removed-devices-and-flags)).
+- `1bit serve --device vulkan`, `--device rocm` and `--device zinc` exit at once with that reason, as
+  do `--lean`, `--adaptive`, `--long-model`, `--prefill-device` and `--zinc`
+  ([serve.md](serve.md#removed-devices-and-flags)).
 - An architecture only the removed Vulkan build ran (Qwen3.8-Flash-Next's `qwen4exp`, Zyphra Zamba,
   Zamba2 and BlackMamba, and a few upstream-only ones) is refused with a pointer to Lemonade's
   `llamacpp` recipe.
@@ -130,7 +131,9 @@ In the fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)),
 `1bit/onebit-no-vulkan` drops `vulkan` from the `onebit` backend (`onebit.h`,
 `backend_versions.json`, the test suite's `capabilities.py`, the generated docs); until it is in the
 pinned fork, picking `vulkan` gets the refusal above. With it, the recipe's backends are `hrx`
-(gfx1151), `npu` and `cuda`, so Lemonade offers `onebit` models only on machines with one of them.
+(gfx1151), `npu` and `cuda`. The `cuda` entry ran ZINC's CUDA build, which the engine no longer
+builds: it has to leave the fork's `onebit` backend too (a fork follow-up), after which Lemonade
+offers `onebit` models only on machines with `hrx` or `npu`.
 
 ## On its own
 

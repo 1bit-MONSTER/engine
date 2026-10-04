@@ -88,11 +88,6 @@ Linux kernel (third_party/linux)
   License: GPL-2.0 WITH Linux-syscall-note. The kernel is built as a separate
   program (scripts/build-kernel.sh); no kernel code is linked into this product.
 
-ZINC (third_party/zinc)
-  https://github.com/zolotukhin/zinc
-  Copyright (c) 2025 ZINC Contributors
-  License: MIT
-
 DwarfStar (third_party/ds4)
   https://github.com/1bit-MONSTER/ds4
   (a fork of https://github.com/antirez/ds4, with 1BP packages)

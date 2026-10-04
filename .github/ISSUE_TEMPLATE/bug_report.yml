@@ -42,7 +42,7 @@ body:
     id: device
     attributes:
       label: Device
-      options: [auto, npu, hrx, cpu, zinc, ds4, mlx, onnx, not sure]
+      options: [auto, npu, hrx, cpu, ds4, mlx, onnx, not sure]
     validations:
       required: true
   - type: input

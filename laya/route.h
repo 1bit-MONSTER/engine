@@ -17,7 +17,7 @@
 // scorer (docs/laya.md). One forward pass answers the fixed routing question
 // ("which device should run this request?") and the winning option is the
 // device. The candidate devices are passed in, so a .gguf routes among the GPU
-// backends (hrx, cpu, zinc) while an NPU model directory routes to npu.
+// backends (hrx, cpu) while an NPU model directory routes to npu.
 #pragma once
 
 #include <string>
@@ -30,7 +30,7 @@ struct Question;
 
 // The fixed routing question restricted to the given device names, in that
 // order. The criteria keys are the device names, so the argmax option IS the
-// device. Recognized names: npu, hrx, cpu, zinc.
+// device. Recognized names: npu, hrx, cpu.
 std::vector<Question> routing_question(const std::vector<std::string>& devices);
 
 // Asks the scorer which of `devices` should run `state` (free text or a

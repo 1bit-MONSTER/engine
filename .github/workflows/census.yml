@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 # The daily HF census (docs/registry.md): rebuild registry/architectures.json from the
-# pinned llama.cpp, HRX fork and ZINC, sweep every HF text-generation model, and open a
+# pinned HRX llama.cpp fork, sweep every HF text-generation model, and open a
 # PR with the new counts. The mapped and checked counts are reported separately;
 # registry/checked.json only changes when tools/registry_check.py runs on Strix Halo.
 #
@@ -54,7 +54,7 @@ jobs:
           token: ${{ secrets.HRX_BUMP_TOKEN }}
 
       - name: Check out the pinned sources the registry reads
-        run: git submodule update --init --depth 1 third_party/llama.cpp third_party/zinc
+        run: git submodule update --init --depth 1 third_party/llama.cpp
 
       - name: Rebuild the registry and sweep HF
         run: |

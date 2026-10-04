@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|zinc|ds4|mlx|onnx] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--mtp HEAD]`
 //                        [--npu-opt KEY=VALUE ...]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
@@ -32,7 +32,6 @@
 //   a .gguf, --device hrx                       -> the HRX build's llama-server on HRX0
 //   a .gguf, --device cpu                       -> the same llama-server with no GPU layers
 //                                                  (the Windows package's route, docs/windows.md)
-//   a .gguf, --device zinc                      -> this build's zinc
 //   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
 //   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
 //                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
@@ -130,7 +129,7 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string flash_attn;  // -fa on/off forwarded to the child llama-server
-    std::string llama_server, zinc, hrx_libhsa, mlx, ds4;
+    std::string llama_server, hrx_libhsa, mlx, ds4;
     bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
     std::string mtp;
     std::string dflash;  // DFlash block-diffusion draft model for the target
@@ -180,12 +179,16 @@ std::string default_llama_server() {
 }
 
 // The devices this engine no longer has (RFC #213 stage 3, 2026-10-01: HRX + NPU only, zero
-// Vulkan, zero ROCm). Asked for by name, serve says so instead of failing somewhere later.
+// Vulkan, zero ROCm; the core strip, 2026-10-04: no ZINC). Asked for by name, serve says so
+// instead of failing somewhere later.
 void refuse_removed_device(const std::string& device) {
     if (device == "vulkan" || device == "rocm")
         throw std::runtime_error("--device " + device + " was removed: the engine's GPU route is HRX (--device hrx, or auto), "
                                  "and it builds no Vulkan or ROCm llama.cpp (RFC #213). Lemonade's own llamacpp backend "
                                  "serves Vulkan and ROCm (docs/lemonade.md)");
+    if (device == "zinc")
+        throw std::runtime_error("--device zinc was removed: the engine no longer builds ZINC (its GPU route is HRX, "
+                                 "--device hrx, or auto). Lemonade's own llamacpp backends serve other GPUs (docs/lemonade.md)");
 }
 
 // An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
@@ -251,15 +254,6 @@ std::string default_ds4() {
     return built_path(ONEBIT_DS4_SERVER);
 #else
     return "ds4-server";
-#endif
-}
-
-std::string default_zinc() {
-    if (const char* e = std::getenv("ONEBIT_ZINC"); e && *e) return e;
-#ifdef ONEBIT_ZINC_SERVER
-    return built_path(ONEBIT_ZINC_SERVER);
-#else
-    return "zinc";
 #endif
 }
 
@@ -466,7 +460,7 @@ std::string model_id(const Options& o) {
 }
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
-// child such as zinc rejects ids it did not load), and replies carry ours.
+// child that rejects ids it did not load gets none), and replies carry ours.
 // Counts a request against a backend from the moment it is routed until its reply
 // (streamed or not) is complete; the exit summary reports these counts.
 struct InFlight {
@@ -634,7 +628,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     l.port = child_port;
     std::vector<std::string>& argv = l.argv;
     std::vector<std::string>& env = l.env;
-    bool& drop_model = l.drop_model;
     std::string& set_model = l.set_model;
     if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
     if (device == "onnx") {
@@ -727,14 +720,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (o.ctx_size > 0) { argv.push_back("--ctx"); argv.push_back(std::to_string(o.ctx_size)); }
         if (o.ssd_streaming) argv.push_back("--ssd-streaming");
         l.ready_path = "/v1/models";
-    } else if (device == "zinc") {
-        argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(child_port)};
-        if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        env.push_back("RADV_PERFTEST=coop_matrix");
-        drop_model = true;  // zinc rejects any model id but its own
     } else {
         refuse_removed_device(device);
-        throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx, cpu, zinc or ds4)");
+        throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx, cpu or ds4)");
     }
     if (o.parallel == 1) {
         // one slot: llama-server's own default is several, and a second slot can share a batch
@@ -744,7 +732,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
+        if (device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
         if (device == "hrx") {
             // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
@@ -769,7 +757,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
         // on the same device; the model checks them in one batch
         const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
+        if (device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
         l.mtp = true;
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
@@ -787,7 +775,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
     if (!o.mmproj.empty()) {
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
+        if (device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
         // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
         argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
@@ -852,15 +840,14 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
 // The devices a .gguf can run on, in the order the Laya router offers them. The NPU runs Q4NX
 // model directories, not .gguf files (docs/npu.md), so it is not a candidate here; an NPU
 // model directory routes to npu in run_serve. The GPU route is HRX (RFC #213 stage 3: no
-// Vulkan, no ROCm); a build without HRX (CI, Windows) offers the CPU.
+// Vulkan, no ROCm; no ZINC since the core strip), with the CPU beside it; a build without HRX
+// (CI, Windows) offers the CPU only. A candidate's backend starts only when the policy picks it.
 std::vector<std::string> gguf_devices() {
     std::vector<std::string> devices;
 #if defined(ONEBIT_HRX_SERVER) && !defined(_WIN32)
     devices.push_back("hrx");
-#else
-    devices.push_back("cpu");
 #endif
-    devices.push_back("zinc");
+    devices.push_back("cpu");
     return devices;
 }
 
@@ -1373,7 +1360,7 @@ int serve_child(const Options& given) {
     srv.Post("/v1/completions", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
-    // the first backend; the NPU, ZINC and MLX answer 501.
+    // the first backend; the NPU, DwarfStar and MLX answer 501.
     const bool llama = device == "hrx" || device == "cpu" ||
                        (laya && (backends[0].device == "hrx" || backends[0].device == "cpu"));
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
@@ -1722,8 +1709,8 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|cpu|zinc|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
-                 "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "                  [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--llama-server PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
@@ -1764,7 +1751,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "-fa" || a == "--flash-attn") o.flash_attn = next();
         else if (a == "--alias") o.alias = next();
         else if (a == "--llama-server") o.llama_server = next();
-        else if (a == "--zinc") o.zinc = next();
+        else if (a == "--zinc")
+            throw std::runtime_error("--zinc was removed with the engine's ZINC build (docs/serve.md)");
         else if (a == "--ds4") o.ds4 = next();
         else if (a == "--ssd-streaming") o.ssd_streaming = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();

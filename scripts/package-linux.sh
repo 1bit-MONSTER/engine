@@ -47,10 +47,6 @@ put() {
 
 cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench
-for b in vulkan rocm cuda; do
-    put "zinc/$b/bin" zinc
-    [ -d "$build/zinc/$b/share" ] && cp -a "$build/zinc/$b/share" "$stage/zinc/$b/"   # its shaders
-done
 for b in rocm cuda cpu; do put "ds4/$b" ds4-server ds4 ds4-bench; done
 put onnx ryzenai-server
 

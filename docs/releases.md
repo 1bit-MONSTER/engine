@@ -28,7 +28,7 @@ release in the same week gets `.1`.
 
 | file | what |
 |---|---|
-| `1bit-<tag>-linux-x86_64.tar.zst` | `1bit` and every backend: HRX (and the CPU, from the same llama-server), ZINC, ONNX (ryzenai-server), DwarfStar, the NPU lane with XRT. No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `1bit-<tag>-linux-x86_64.tar.zst` | `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, the NPU lane with XRT. No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`) from our fork, with the onebit recipe |
 | `1bit-<tag>-windows-x64.zip` | `1bit.exe`, a CPU `llama-server.exe`, `ryzenai-server.exe` ([windows.md](windows.md)) |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, the engine as a bootable USB image ([os/README.md](../os/README.md)) |
@@ -73,7 +73,7 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 | `bump-ds4/*` | DwarfStar's routed-MoE test (`DS4_TEST=1 scripts/build-ds4.sh`) |
 | `bump-linux/*` | the kernel packages build (`scripts/build-kernel.sh`); nothing is installed |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
-| `bump-zinc/*`, `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device) |
+| `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device) |
 
 Before the build, every bump also checks that each pin it moves is on the branch `.gitmodules`
 names for that submodule (GitHub's compare API: the branch equals or contains the pin). A pin off

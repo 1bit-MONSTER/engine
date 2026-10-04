@@ -34,7 +34,6 @@ hand:
 |---|---|
 | HF -> GGUF | a `@ModelBase.register(...)` class in our HRX fork's llama.cpp converter names it |
 | `hrx` | the GGUF architecture is in our HRX fork's `src/llama-arch.cpp`; the same llama-server runs it on the CPU (`--device cpu`), so `hrx` also means the CPU route |
-| `zinc` | ZINC's `parseArchitecture` accepts the GGUF architecture |
 | `npu` | the fast lane's model type: `qwen3` (the lane kernels are built for Qwen3-0.6B's shapes) |
 
 The `vulkan` column (the upstream llama.cpp release the engine built for Vulkan) left with that
@@ -42,8 +41,10 @@ build in RFC #213 stage 3. With it went the HF class names only the upstream
 converter registers: 33 classes, 23 of them for architectures the HRX fork does not run (among
 them `qwen4exp`, `zamba`, `zamba2`, `blackmamba`) and 10 aliases of architectures it does run
 (DFlash drafters, `exaone-moe`, `nemotron_h_moe`), which a GGUF converted elsewhere still runs on.
+The `zinc` column (ZINC's `parseArchitecture`; 63 HF architectures on 2026-10-03) left with ZINC in
+the core strip (2026-10-04).
 
-On 2026-10-03 (RFC #213 stage 3): 290 HF architectures mapped, hrx 290, zinc 63, npu 7. The file
+On 2026-10-04 (core strip): 290 HF architectures mapped, hrx 290, npu 7. The file
 also lists `gguf_architectures.hrx`, every GGUF architecture the pinned fork's runtime builds (141
 then): CMakeLists.txt compiles that list into `1bit serve`, which refuses any other architecture on
 hrx and cpu with a pointer to Lemonade's llamacpp backend. Mapped means a backend's code accepts the architecture; the census below reports how many were checked. `registry/architectures.json` always holds the current counts and the pins they come from: every pin bump regenerates it (`scripts/registry-regen.sh`, run by the bump workflows), and CI's `registry_pins` test fails a pin that moved without it.
@@ -58,31 +59,19 @@ included. The architecture recorded is the one the backend loads: the GGUF
 `general.architecture`, or the NPU directory's `model_type`. Checked on Strix Halo
 2026-09-25, engine `8c2805d` (hrx rows at the llama.cpp pin `96f6b89`):
 
-| GGUF architecture | Model | hrx | zinc | npu |
-|---|---|---|---|---|
-| `qwen3` | Qwen3-0.6B | pass | pass | pass |
-| `qwen2` | Qwen2.5-7B-Instruct | pass | fails: crashes at load | |
-| `qwen3moe` | Qwen3-Coder-30B-A3B | pass | pass | |
-| `qwen35moe` | Qwen3.6-35B-A3B Q8_0 | pass | pass | |
-| `deepseek2` | GLM-4.7-Flash | pass | not mapped | |
-| `minicpm` | MiniCPM4-8B | pass | not mapped | |
-| `llama` | MiniCPM5-1B | pass | fails: empty reply | |
+| GGUF architecture | Model | hrx | npu |
+|---|---|---|---|
+| `qwen3` | Qwen3-0.6B | pass | pass |
+| `qwen2` | Qwen2.5-7B-Instruct | pass | |
+| `qwen3moe` | Qwen3-Coder-30B-A3B | pass | |
+| `qwen35moe` | Qwen3.6-35B-A3B Q8_0 | pass | |
+| `deepseek2` | GLM-4.7-Flash | pass | |
+| `minicpm` | MiniCPM4-8B | pass | |
+| `llama` | MiniCPM5-1B | pass | |
 
 (The vulkan rows, which passed on the same date, were dropped from `registry/check_models.tsv` and
 `registry/checked.json` with the Vulkan build, as were the Zyphra Zamba rows, which ran on Vulkan
-only.)
-
-Both ZINC failures come from upstream ZINC, pinned at `3a35e76`:
-- **Qwen2.5-7B crashes at load (exit 136, SIGFPE in RADV).** ZINC sizes its DMMV shaders'
-  shared-memory input buffer with the model's largest dimension. Qwen2.5-7B's
-  intermediate size is 18944, which needs 75,776 bytes, more than a workgroup's 64 KiB.
-- **MiniCPM5-1B gives an empty reply.** Its chat template opens with `{{- bos_token }}`,
-  which ZINC's built-in ChatML renderer drops. Without `<s>`, the model ends the turn at
-  once. llama.cpp renders the `<s>`, and the model answers.
-
-Both are fixed on `bong-water-water-bong/zinc` branch `fix/lds-clamp-and-template-bos`
-(`5453c19`). With it, all five ZINC rows pass and ZINC's own tests pass 635/635. The engine
-keeps pinning upstream ZINC until the fixes are there.
+only. The zinc rows went with ZINC in the core strip.)
 
 GLM-4.7-Flash and Qwen3-Coder-30B-A3B failed on HRX until the llama.cpp pin `96f6b89` (#95).
 The pin fixes four things:
@@ -114,7 +103,6 @@ The census of 2026-09-27 (the first full sweep ran 2026-09-25), with `registry/c
 | Backend | Mapped | Checked |
 |---|---|---|
 | hrx | 94.78% | 64.32% |
-| zinc | 69.83% | 10.28% |
 | npu | 9.29% | 9.29% |
 
 "Checked" counts every model whose architecture has a passing model. It does not mean each

@@ -127,24 +127,17 @@ if(ONEBIT_HRX)
 endif()
 
 # ── DwarfStar (docs/dwarfstar.md) ─────────────────────────────────────────
-# Off by default: it builds third_party/ds4 (antirez/ds4, MIT) with scripts/build-ds4.sh for
-# one backend (rocm: Strix Halo, needs HIP/hipBLAS(Lt)/rocBLAS/rocWMMA/hipCUB; metal;
-# cpu). `1bit serve --device ds4` then runs its ds4-server on DwarfStar's own GGUFs.
+# Off by default: it builds third_party/ds4 (antirez/ds4, MIT) with scripts/build-ds4.sh on
+# its HIP backend only (Strix Halo, gfx1151: HIP, hipBLAS(Lt), rocBLAS, rocWMMA, hipCUB).
+# `1bit serve --device ds4` then runs its ds4-server on DwarfStar's own GGUFs.
 option(ONEBIT_DS4 "Build DwarfStar (third_party/ds4) for --device ds4" OFF)
 if(ONEBIT_DS4)
-    if(APPLE)
-        set(_ds4_default metal)
-    else()
-        set(_ds4_default rocm)
-    endif()
-    set(ONEBIT_DS4_BACKEND "${_ds4_default}" CACHE STRING "DwarfStar backend: rocm, metal or cpu")
-    set_property(CACHE ONEBIT_DS4_BACKEND PROPERTY STRINGS rocm metal cpu)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/ds4/ds4_server.c")
         message(FATAL_ERROR "ONEBIT_DS4 needs third_party/ds4: git submodule update --init third_party/ds4")
     endif()
-    set(ONEBIT_DS4_SERVER "${CMAKE_BINARY_DIR}/ds4/${ONEBIT_DS4_BACKEND}/ds4-server")
+    set(ONEBIT_DS4_SERVER "${CMAKE_BINARY_DIR}/ds4/hip/ds4-server")
     add_custom_target(ds4
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-ds4.sh ${CMAKE_BINARY_DIR}/ds4 ${ONEBIT_DS4_BACKEND}
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-ds4.sh ${CMAKE_BINARY_DIR}/ds4
         BYPRODUCTS ${ONEBIT_DS4_SERVER}
         USES_TERMINAL)
     add_dependencies(onebit ds4)

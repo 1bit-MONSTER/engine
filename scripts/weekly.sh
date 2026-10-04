@@ -159,7 +159,7 @@ bump_check() {  # bump_check <branch>
         bump-laya/*)
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
             "$SRC/tests/laya_route_e2e.sh" "$BUILD/1bit" "$W/laya" >> "$LOGS/laya.log" 2>&1 ;;
-        bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" rocm > "$LOGS/ds4.log" 2>&1 ;;
+        bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" > "$LOGS/ds4.log" 2>&1 ;;
         *) : ;;  # xdna, tokenizers: covered by build + ctest
     esac
 }

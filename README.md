@@ -55,8 +55,10 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > suite on HRX. Following a review,[^geramyl] the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
 > ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), the NPU engine on full ELFs with the
-> upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
-> source) and MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
+> upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel and lm-head now decode from
+> source, ELF to ELF, with no xclbin at any point, verified on Qwen3-0.6B/1.7B/4B against an fp64
+> reference — the kernel sources stay private and are not yet merged here, docs/npu.md Step 3d) and
+> MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
 > runs from our llama.cpp on HRX, matching transformers, at about 90 tok/s decode in Q4_K_M
 > ([docs/hrx.md](docs/hrx.md)). The rest of Zyphra's family (Zamba, Zamba2, BlackMamba) and
 > Qwen3.8-Flash-Next ran only on the removed Vulkan build; they are to be ported to HRX. Experimental,

@@ -51,6 +51,25 @@ endif()
 set(ONEBIT_HRX_LIBHSA "${_hrx_libhsa_first}" CACHE FILEPATH "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)")
 message(STATUS "ONEBIT_HRX: HSA runtime ${ONEBIT_HRX_LIBHSA}")
 
+# Private GPU kernels (docs/hrx.md, "Private HIP kernels"): a checkout of the private gpu-kernels
+# repository whose addons/hip-hrx is built into the HRX llama.cpp (its GGML_HRX_HIP_ADDON_DIR hook).
+set(_hrx_gpu_private_args)
+if(ONEBIT_GPU_PRIVATE)
+    if(NOT IS_DIRECTORY "${ONEBIT_GPU_PRIVATE}/addons/hip-hrx/kernels")
+        message(FATAL_ERROR "ONEBIT_GPU_PRIVATE=${ONEBIT_GPU_PRIVATE} has no addons/hip-hrx/kernels")
+    endif()
+    set(_hrx_hip_cmake "${CMAKE_SOURCE_DIR}/third_party/llama.cpp/ggml/src/ggml-hrx/hip/ggml-hrx-hip.cmake")
+    set(_hrx_addon_hook)
+    if(EXISTS "${_hrx_hip_cmake}")
+        file(STRINGS "${_hrx_hip_cmake}" _hrx_addon_hook REGEX "GGML_HRX_HIP_ADDON_DIR")
+    endif()
+    if(NOT _hrx_addon_hook)
+        message(FATAL_ERROR "ONEBIT_GPU_PRIVATE: third_party/llama.cpp has no GGML_HRX_HIP_ADDON_DIR hook (needs the HIP plumbing)")
+    endif()
+    list(APPEND _hrx_gpu_private_args "-DGGML_HRX_HIP_ADDON_DIR=${ONEBIT_GPU_PRIVATE}/addons/hip-hrx")
+    message(STATUS "ONEBIT_HRX: private HIP kernels from ${ONEBIT_GPU_PRIVATE}/addons/hip-hrx")
+endif()
+
 set(ONEBIT_HRX_SERVER "${CMAKE_BINARY_DIR}/hrx/llama/bin/llama-server")
 ExternalProject_Add(llama_hrx
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/llama.cpp
@@ -63,6 +82,7 @@ ExternalProject_Add(llama_hrx
         -DHRX_SOURCE_DIR=${CMAKE_SOURCE_DIR}/third_party/hrx-system
         -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+        ${_hrx_gpu_private_args}
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON

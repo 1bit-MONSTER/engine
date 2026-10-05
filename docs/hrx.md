@@ -507,6 +507,16 @@ cmake --build build --target onebit
   build path it searches `/opt/rocm-therock`. To run
   llama-server or llama-bench by hand, export that variable yourself.
 
+### Private HIP kernels
+
+Our own HIP kernels for HRX are closed source, like the NPU kernels: they live in the private
+`1bit-MONSTER/gpu-kernels` repository (`addons/hip-hrx`). The llama.cpp fork keeps only the
+public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>`
+(with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
+llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
+that hook. Without the option the build is unchanged. To drop the add-on from an existing
+build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).
+
 ## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)
 
 `ctest` passed, re-run after the first daily bump (#13). At the time the check

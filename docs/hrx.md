@@ -40,8 +40,14 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 | Submodule | Source | Pinned to |
 |---|---|---|
 | `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
-| `third_party/hrx-system` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | libhrx, loomc and the Loom tools |
+| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), branch `1bit/main` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
 
+- **Our hrx-system commits** (branch `1bit/main` of our fork, on AMD's pin `51b1739`): a Loom
+  backport that drains ALU dependencies after a lane-mask SGPR pair is overwritten on GFX11 wave64
+  (the #313 NaN: the prompt FA kernel compiled for a 190-row ubatch read V from a wrong address in
+  about 1% of runs; upstream fixed the class in `ee77c8f7f`/`336037562`, which cannot be pinned yet),
+  and two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and `HRX_COMMAND_BUFFER_MODE`
+  (defaults unchanged). Rebase them by hand when AMD's pair moves.
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.

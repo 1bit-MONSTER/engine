@@ -14,13 +14,15 @@
 # limitations under the License.
 #
 # HRX (docs/hrx.md), the engine's GPU route; also the tree of the CPU llama-server (Windows).
-# Needed with -DONEBIT_HRX=ON. The pair is AMD's tested integration (ROCm/ggml-staging-automation);
-# .github/workflows/bump-hrx.yml keeps it current. The branch name still says "vulkan": AMD's pair
+# Needed with -DONEBIT_HRX=ON. Both trees are AMD's tested pair (ROCm/ggml-staging-automation) plus
+# our commits: llama.cpp on our fork's 1bit/hrx-vulkan-patched, hrx-system on our fork's 1bit/main
+# (Loom and libhrx fixes, docs/hrx.md "Our hrx-system commits"). .github/workflows/bump-hrx.yml moves
+# the llama.cpp pin when AMD moves its pair; hrx-system is rebased by hand. The branch name still says "vulkan": AMD's pair
 # carried a Vulkan backend too, which the engine no longer builds (RFC #213 stage 3).
 [submodule "third_party/hrx-system"]
 	path = third_party/hrx-system
-	url = https://github.com/ROCm/hrx-system.git
-	branch = main
+	url = https://github.com/1bit-MONSTER/hrx-system.git
+	branch = 1bit/main
 	shallow = true
 [submodule "third_party/llama.cpp"]
 	path = third_party/llama.cpp

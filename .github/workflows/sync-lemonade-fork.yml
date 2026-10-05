@@ -21,12 +21,16 @@
 #   - a conflicting merge is left for a person: the release is pushed to a
 #     sync/<tag> branch and a PR is opened IN THE FORK listing the conflicts.
 # It then disables every workflow in the fork. Upstream's build, release,
-# website and PPA workflows must not run from the fork; a sync can add new ones.
+# website and PPA workflows must not run from the fork, so the merge never mirrors
+# upstream's workflow files at all: the fork's own .github is put back over the
+# merge result. That also keeps the token out of the `workflow` scope.
 #
-# Uses the secret HRX_BUMP_TOKEN, which needs Contents, Pull requests, Workflows and
-# Actions read/write on 1bit-MONSTER/lemonade as well as on this repository. Without
-# Workflows (classic token: the workflow scope) GitHub refuses any merge that
-# touches upstream's .github/workflows; every sync from 2026-09-26 failed that way.
+# Uses the secret HRX_BUMP_TOKEN, which needs Contents, Pull requests and Actions
+# read/write on 1bit-MONSTER/lemonade as well as on this repository. It does NOT need
+# the Workflows permission (classic token: the `workflow` scope): the sync never
+# creates or updates a workflow file, and the fork's workflows are all disabled anyway.
+# Every sync from 2026-09-26 to 2026-10-05 failed because an earlier version of this job
+# pushed upstream's workflow files, which GitHub refuses without that permission.
 name: sync-lemonade-fork
 
 on:
@@ -111,7 +115,20 @@ jobs:
             echo "fork already contains upstream ${tag} (${up:0:12})"
             exit 0
           fi
-          if git merge -q --no-edit -m "Sync upstream ${UPSTREAM} ${tag} (${up:0:12})" "$up"; then
+          before=$(git rev-parse HEAD)
+          # keep_fork_github: put the fork's own .github back over whatever the merge
+          # produced. The fork disables every workflow it has (last step), so mirroring
+          # upstream's workflow files buys nothing — and GitHub refuses a push that
+          # creates or updates .github/workflows unless the token carries the `workflow`
+          # scope, which is why every sync from 2026-09-26 failed.
+          keep_fork_github() {
+            git rm -rq --cached .github 2>/dev/null || true
+            git checkout "$before" -- .github
+            git clean -fdq -- .github 2>/dev/null || true
+          }
+          if git merge -q --no-commit --no-ff "$up"; then
+            keep_fork_github
+            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (${up:0:12})"
             # The fork exists for the onebit backend: never push a merge that lost it.
             grep -q '"onebit|onebit"' CMakeLists.txt || { echo "::error::onebit is no longer registered after the merge"; exit 1; }
             test -f src/cpp/server/backends/onebit/onebit_server.cpp || { echo "::error::onebit_server.cpp is gone after the merge"; exit 1; }
@@ -124,7 +141,12 @@ jobs:
             if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
               echo "$branch already exists"; exit 0
             fi
-            git push -q origin "${up}:refs/heads/$branch"
+            # Same reason as above: hand the release over on a branch that carries the
+            # fork's .github, so the push needs contents write only.
+            git checkout -q -b "$branch" "$up"
+            keep_fork_github
+            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (conflicts; the fork's .github is kept)"
+            git push -q origin "${branch}:refs/heads/${branch}"
             gh pr create --repo "$FORK" --base main --head "$branch" \
               --title "Sync upstream ${UPSTREAM} ${tag} (conflicts)" \
               --body "Upstream release ${tag} (\`${up:0:12}\`) does not merge cleanly into the fork. Conflicting files:

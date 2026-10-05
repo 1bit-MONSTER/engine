@@ -39,7 +39,7 @@ hand:
 The `vulkan` column (the upstream llama.cpp release the engine built for Vulkan) left with that
 build in RFC #213 stage 3. With it went the HF class names only the upstream
 converter registers: 33 classes, 23 of them for architectures the HRX fork does not run (among
-them `qwen4exp`, `zamba`, `zamba2`, `blackmamba`) and 10 aliases of architectures it does run
+them `zamba`, `zamba2`, `blackmamba`; `qwen4exp` is back since pin `e57beb97`) and 10 aliases of architectures it does run
 (DFlash drafters, `exaone-moe`, `nemotron_h_moe`), which a GGUF converted elsewhere still runs on.
 The `zinc` column (ZINC's `parseArchitecture`; 63 HF architectures on 2026-10-03) left with ZINC in
 the core strip (2026-10-04).

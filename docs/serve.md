@@ -68,7 +68,7 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 
 | Case | `auto` |
 |---|---|
-| an architecture our llama.cpp does not build: anything outside `gguf_architectures.hrx` in registry/architectures.json, which `tools/registry_build.py` reads from the pinned fork and the build compiles in (among them Qwen3.8-Flash-Next's `qwen4exp`; Zyphra Zamba, Zamba2, BlackMamba; Spark2.5, BailingMoeV3, HRM text, MuseGlimmer, Kimi K3, Maple, GraniteSwitch, Granite SWA, HY v4, MiniMax, Dots3 Note, PocketTTS, Qwen3-TTS) | refused on hrx and cpu, pointing at Lemonade's llamacpp backend; Zyphra and Flash-Next are to be ported to HRX |
+| an architecture our llama.cpp does not build: anything outside `gguf_architectures.hrx` in registry/architectures.json, which `tools/registry_build.py` reads from the pinned fork and the build compiles in (among them Zyphra Zamba, Zamba2, BlackMamba; Spark2.5, BailingMoeV3, HRM text, MuseGlimmer, Kimi K3, Maple, GraniteSwitch, Granite SWA, HY v4, MiniMax, Dots3 Note, PocketTTS, Qwen3-TTS) | refused on hrx and cpu, pointing at Lemonade's llamacpp backend; Zyphra is to be ported to HRX (Flash-Next's `qwen4exp` was, at pin `e57beb97`) |
 | `--moe-slots` | refused: not in this build ([below](#moe-models-larger-than-memory---moe-slots)) |
 | `--parallel N` > 1 on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) | HRX0 with one slot, and a warning on stderr: HRX runs one such sequence at a time (no multi-sequence delta-net yet). `--device cpu` keeps `--parallel N` |
 | `--mmproj` | HRX0. **Unverified:** vision on HRX is an open RFC #213 gate, to be checked on ZAYA1-VL; if it fails there, `auto` goes back to the CPU for `--mmproj` |
@@ -173,8 +173,7 @@ is the model's 644 MiB Q8_0 output matrix, read three times per decode step at d
 A draft only proposes; the model checks every token, so the head can be cut down to the
 tokens it is likely to propose. `tools/mtp_draft_vocab.py` writes such a head from Unsloth's
 *shared* head file and the model's own output rows. Our llama.cpp fork (`qwen4exp`,
-`src/models/qwen4exp-draft-vocab.cpp` on the removed Vulkan branch) ran it; it comes back with the
-HRX port of Flash-Next:
+`src/models/qwen4exp-draft-vocab.cpp`) runs it on HRX since pin `e57beb97`:
 
 ```sh
 python3 tools/mtp_draft_vocab.py \

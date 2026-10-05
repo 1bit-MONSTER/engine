@@ -26,6 +26,7 @@
 #define _POSIX_C_SOURCE 200809L  /* mkdtemp */
 #include "model.h"
 
+#include <fcntl.h>
 #include <stdint.h>
 #include <stdio.h>
 #include <stdlib.h>
@@ -40,11 +41,19 @@ static void check(int ok, const char* what) {
     if (!ok) failures++;
 }
 
+/* fopen with 0600. These are crafted inputs in a temp directory, and the default umask
+ * would leave them readable, and on a permissive umask writable, by every local user
+ * (CodeQL cpp/world-writable-file-creation). */
+static FILE* open_private(const char* path) {
+    int fd = open(path, O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    return fd >= 0 ? fdopen(fd, "wb") : NULL;
+}
+
 /* Writes the length prefix `len`, `header`, then `data_bytes` zero bytes; returns the path. */
 static const char* write_file(const char* name, uint64_t len, const char* header, size_t data_bytes) {
     static char path[128];
     snprintf(path, sizeof path, "%s/%s", dir, name);
-    FILE* f = fopen(path, "wb");
+    FILE* f = open_private(path);
     if (!f) return path;
     fwrite(&len, 8, 1, f);
     fwrite(header, 1, strlen(header), f);
@@ -78,7 +87,7 @@ int main(void) {
     {   /* shorter than the length prefix */
         char path[128];
         snprintf(path, sizeof path, "%s/short.q4nx", dir);
-        FILE* f = fopen(path, "wb");
+        FILE* f = open_private(path);
         fputs("abc", f);
         fclose(f);
         check(load(path) == NULL, "a file shorter than 8 bytes is refused");

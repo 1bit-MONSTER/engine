@@ -51,6 +51,14 @@ jobs:
       - name: Configure
         run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
       - name: Build
-        run: cmake --build build --target onebit npu_full_elf_test npu_pack_test npu_q4nx_test npu_private_route_test tokenizer_test think_split_test gguf_meta_test laya_encoder_test -j
+        # Every target a ctest test invokes must be listed here: `ctest` runs whatever
+        # binaries exist, so a test whose target is missing reports "Not Run" and never
+        # executes. Keep this list in step with add_test() in CMakeLists.txt.
+        run: |
+          cmake --build build --target onebit \
+            npu_full_elf_test npu_pack_test npu_q4nx_test npu_private_route_test \
+            tokenizer_test think_split_test gguf_meta_test laya_encoder_test \
+            http_guard_test moe_gguf_index_test laya_bounds_test \
+            npu_model_bounds_test npu_forward_loader_test tokenizer_linear_test -j
       - name: Test
         run: ctest --test-dir build --output-on-failure

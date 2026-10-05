@@ -21,9 +21,11 @@
 #   - --device auto with --mtp: the same route (HRX drafts on HRX0 now; it used to keep Vulkan),
 #   - --device auto with --mmproj: the same route as a plain file (HRX0 is unverified for vision,
 #     an open RFC #213 gate to check on ZAYA1-VL),
+#   - Qwen3.8-Flash-Next's qwen4exp (ported to HRX at llama.cpp pin e57beb97) takes the same route
+#     as a plain file,
 #   - an architecture our llama.cpp does not build (not in registry/architectures.json's
-#     gguf_architectures.hrx: Qwen3.8-Flash-Next's qwen4exp, Zyphra Zamba2, a made-up one) is
-#     refused with a pointer to Lemonade's llamacpp backend, under auto and when asked for by name,
+#     gguf_architectures.hrx: Zyphra Zamba2, a made-up one) is refused with a pointer to Lemonade's
+#     llamacpp backend, under auto and when asked for by name,
 #   - --moe-slots is refused as not in this build (it moves to HRX with Flash-Next),
 #   - --parallel 4 on a gated delta-net model: in a build with HRX, auto serves it on HRX0 with one
 #     slot and says why; --device cpu keeps -np 4,
@@ -103,9 +105,11 @@ check "--device auto runs --mtp on $where" '[ "$(after "$scratch/mtp.json" --dev
 run "$scratch/mmproj.json" plain --mmproj "$scratch/head.gguf"
 check "--device auto runs --mmproj on $where" '[ "$(after "$scratch/mmproj.json" --device)" = "$expected" ] && [ "$(after "$scratch/mmproj.json" --mmproj)" = "$scratch/head.gguf" ]'
 
-check "an architecture our llama.cpp does not map (qwen4exp) is refused under auto" 'refused "Lemonade" flashnext'
-check "  and on --device hrx" 'refused "architecture qwen4exp is not in" flashnext --device hrx'
-check "  and on --device cpu (zamba2)" 'refused "architecture zamba2 is not in" zamba --device cpu'
+run "$scratch/flashnext.json" flashnext
+check "--device auto runs Flash-Next (qwen4exp) on $where" '[ "$(after "$scratch/flashnext.json" --device)" = "$expected" ]'
+check "an architecture our llama.cpp does not map (zamba2) is refused under auto" 'refused "Lemonade" zamba'
+check "  and on --device hrx" 'refused "architecture zamba2 is not in" zamba --device hrx'
+check "  and on --device cpu" 'refused "architecture zamba2 is not in" zamba --device cpu'
 check "  and any architecture the registry does not list" 'refused "architecture not-an-arch is not in" madeup'
 check "an H32 file is refused by name" 'refused "H32 file" h32'
 check "  on --device hrx too" 'refused "dropped that format" h32 --device hrx'

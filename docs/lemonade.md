@@ -122,9 +122,9 @@ Lemonade's to serve:
 - `1bit serve --device vulkan`, `--device rocm` and `--device zinc` exit at once with that reason, as
   do `--lean`, `--adaptive`, `--long-model`, `--prefill-device` and `--zinc`
   ([serve.md](serve.md#removed-devices-and-flags)).
-- An architecture only the removed Vulkan build ran (Qwen3.8-Flash-Next's `qwen4exp`, Zyphra Zamba,
-  Zamba2 and BlackMamba, and a few upstream-only ones) is refused with a pointer to Lemonade's
-  `llamacpp` recipe.
+- An architecture only the removed Vulkan build ran (Zyphra Zamba, Zamba2 and BlackMamba, and a
+  few upstream-only ones) is refused with a pointer to Lemonade's `llamacpp` recipe.
+  Qwen3.8-Flash-Next (`qwen4exp`) runs on HRX since llama.cpp pin `e57beb97`.
 
 In the fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)), branch
 `1bit/onebit-no-vulkan` drops `vulkan` from the `onebit` backend (`onebit.h`,

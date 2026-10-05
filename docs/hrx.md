@@ -450,9 +450,10 @@ kernels). It is kept for a later port of that work to ggml-hrx. Its zaya
 architecture has been ported to this branch (ZAYA1).
 
 The engine's separate upstream llama.cpp pin for Vulkan (`third_party/llama.cpp-vulkan`) is gone
-(RFC #213 stage 3). Architectures only that pin had (Qwen3.8-Flash-Next's `qwen4exp`, Zyphra
-Zamba, Zamba2 and BlackMamba, and a few upstream-only ones) are refused by `1bit serve` until they
-are ported here; Lemonade's own llamacpp backend serves them meanwhile. This build has no Vulkan
+(RFC #213 stage 3). Architectures only that pin had (Zyphra Zamba, Zamba2 and BlackMamba, and a
+few upstream-only ones) are refused by `1bit serve` until they are ported here; Lemonade's own
+llamacpp backend serves them meanwhile. Qwen3.8-Flash-Next (`qwen4exp`, with its MTP draft head)
+was ported at pin `e57beb97`. This build has no Vulkan
 backend (`GGML_VULKAN=OFF`).
 
 ### The GPU's matrix units (WMMA)

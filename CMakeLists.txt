@@ -114,6 +114,10 @@ set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 # --device cpu the same build with no GPU layers. The build has no Vulkan or ROCm backend
 # (RFC #213 stage 3): what HRX does not run, Lemonade serves with its own llamacpp backends.
 option(ONEBIT_HRX "Build the HRX llama-server and wire it into Lemonade" OFF)
+set(ONEBIT_GPU_PRIVATE "" CACHE PATH "A gpu-kernels checkout whose addons/hip-hrx HIP kernels are built into the HRX llama.cpp (needs ONEBIT_HRX)")
+if(ONEBIT_GPU_PRIVATE AND NOT ONEBIT_HRX)
+    message(FATAL_ERROR "ONEBIT_GPU_PRIVATE needs ONEBIT_HRX=ON")
+endif()
 if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
     add_dependencies(onebit llama_hrx)

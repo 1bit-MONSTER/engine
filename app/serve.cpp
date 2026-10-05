@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|vulkan|hrx|rocm|zinc] [--lean] [--mtp HEAD] [--adaptive]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--mtp HEAD]`
 //                        [--npu-opt KEY=VALUE ...]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
@@ -29,46 +29,33 @@
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
 //   a model a private NPU route serves          -> that route, in process, in builds with
 //                                                  -DONEBIT_NPU_PRIVATE (docs/npu.md)
-//   a .gguf, --device vulkan                    -> the upstream llama.cpp build's
-//                                                  llama-server (else the HRX build's); an
-//                                                  architecture only our llama.cpp has
-//                                                  (ZAYA1) -> the HRX build's, on Vulkan0
-//   a .gguf, --device hrx                       -> the HRX build's llama-server
-//   a .gguf, --device vulkan --prefill-device hrx
-//                                               -> the HRX build's llama-server on Vulkan0,
-//                                                  long prompt prefixes on HRX0 over one
-//                                                  shared KV cache (docs/hrx.md)
-//   a .gguf, --device zinc                      -> this build's zinc
+//   a .gguf, --device hrx                       -> the HRX build's llama-server on HRX0
+//   a .gguf, --device cpu                       -> the same llama-server with no GPU layers
+//                                                  (the Windows package's route, docs/windows.md)
 //   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
 //   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
 //                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
 //                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
-//   a .gguf, --device rocm                      -> the ROCm build's llama-server on ROCm0
-//                                                  (ONEBIT_LEAN_ROCM: any GGUF, and ROCmI4 with
-//                                                  the gfx1151 W4A4 path; docs/lean.md)
-//   a .gguf, --lean                             -> the lean build's llama-server (ROCmFPX's
-//                                                  formats) on Vulkan0 (docs/lean.md)
 //   --laya with --device auto                   -> Laya classifies each conversation and the route
 //                                                  policy picks the device (RFC #186, docs/laya.md)
-//   --mtp <head.gguf> on any llama.cpp route    -> multi-token prediction: the model's MTP
+//   --mtp <head.gguf> on hrx or cpu             -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
-//   --dflash <draft.gguf> on any llama.cpp route -> a DFlash block-diffusion draft model
+//   --dflash <draft.gguf> on hrx or cpu         -> a DFlash block-diffusion draft model
 //                                                  drafts a block per step (docs/serve.md)
-//   --mmproj <mmproj.gguf> on any llama.cpp route -> images: the vision encoder runs beside the
+//   --mmproj <mmproj.gguf> on hrx or cpu        -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
-//   --long-model <rotated.gguf>                 -> conversations that start with --long-from tokens
-//                                                  (default 2048) go to that Hadamard-rotated Q4_0
-//                                                  on ROCm (W4A4 prefill), the rest to -m's route
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
-// Vulkan for GGUF (the fastest measured device for standard quants,
-// docs/hrx.md) until the Laya router (docs/laya.md) makes that choice.
+// HRX for a .gguf where the build has it, else the CPU (auto_gguf_device). The engine has
+// no Vulkan or ROCm build (RFC #213 stage 3): what HRX does not run, serve declines with a
+// clear message, and Lemonade serves it with its own llamacpp backends.
 #include "serve.h"
 
 #include "built_path.h"
 
 #include "gguf_meta.h"
+#include "hrx_archs.h"
 #include "recipes.h"
 
 #ifdef ONEBIT_MOE
@@ -142,11 +129,8 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string flash_attn;  // -fa on/off forwarded to the child llama-server
-    std::string llama_server, zinc, hrx_libhsa, mlx, ds4;
+    std::string llama_server, hrx_libhsa, mlx, ds4;
     bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
-    std::string prefill_device;
-    int prefill_min_tokens = 0;
-    bool lean = false;
     std::string mtp;
     std::string dflash;  // DFlash block-diffusion draft model for the target
     int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM (-1: auto)
@@ -156,8 +140,6 @@ struct Options {
     int mtp_max = 0;
     std::string mtp_p_min;
     int parallel = 0;
-    bool adaptive = false;
-    int adaptive_at = 1;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
@@ -166,8 +148,6 @@ struct Options {
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
-    std::string long_model;              // --long-model FILE: a Hadamard-rotated Q4_0 for long prompts (W4A4 on ROCm)
-    int long_from = 2048;                // --long-from N: a conversation whose first prompt has N tokens or more
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -187,28 +167,34 @@ std::string hrx_libhsa(const std::string& option) {
     return "";
 }
 
-// --device vulkan prefers the upstream llama.cpp build (ONEBIT_VULKAN, the
-// latest release: new architectures land there first); --device hrx, and
-// vulkan without that build, use the HRX build (AMD's tested pair).
-std::string default_llama_server(const std::string& device) {
+// The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
+// else one on PATH (the Windows package puts a CPU llama-server beside 1bit.exe).
+std::string default_llama_server() {
     if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
-#ifdef ONEBIT_VULKAN_SERVER
-    if (device == "vulkan") return built_path(ONEBIT_VULKAN_SERVER);
-#endif
 #ifdef ONEBIT_HRX_SERVER
     return built_path(ONEBIT_HRX_SERVER);
 #else
-    (void)device;
     return "llama-server";
 #endif
 }
 
-// Architectures our llama.cpp (third_party/llama.cpp, the HRX build) implements and upstream's
-// does not: a GGUF of one runs on that build's Vulkan0 even when the upstream build is present.
-// A Q4_0 file from tools/hadamard_q4_0.py: its matmul weights are rotated by a 32-point
-// Walsh-Hadamard transform. Two builds rotate the activations to match: our llama.cpp on HRX
-// (src/llama-hadamard.cpp reads the stamp and adds the rotation as a matmul, fork #58) and the
-// lean ROCm build (inside its quantizers, W4A4).
+// The devices this engine no longer has (RFC #213 stage 3, 2026-10-01: HRX + NPU only, zero
+// Vulkan, zero ROCm; the core strip, 2026-10-04: no ZINC). Asked for by name, serve says so
+// instead of failing somewhere later.
+void refuse_removed_device(const std::string& device) {
+    if (device == "vulkan" || device == "rocm")
+        throw std::runtime_error("--device " + device + " was removed: the engine's GPU route is HRX (--device hrx, or auto), "
+                                 "and it builds no Vulkan or ROCm llama.cpp (RFC #213). Lemonade's own llamacpp backend "
+                                 "serves Vulkan and ROCm (docs/lemonade.md)");
+    if (device == "zinc")
+        throw std::runtime_error("--device zinc was removed: the engine no longer builds ZINC (its GPU route is HRX, "
+                                 "--device hrx, or auto). Lemonade's own llamacpp backends serve other GPUs (docs/lemonade.md)");
+}
+
+// An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
+// and stamped onebit.hadamard_q4_0 = 32 by the engine's former tools/hadamard_q4_0.py. The format
+// is dropped (owner, 2026-10-03: slower and less accurate on HRX than UD-Q4_K_XL), so serve refuses
+// it by name. Not to be confused with PrismML's own rotation (prism_hadamard below), which stays.
 bool hadamard_q4_0(const std::string& model) {
     return model.size() > 5 && model.compare(model.size() - 5, 5, ".gguf") == 0 &&
            gguf_int(model, "onebit.hadamard_q4_0") == 32;
@@ -245,40 +231,34 @@ bool onebp_file(const std::string& model) {
     return f.read(magic, 4) && std::memcmp(magic, "1BP\0", 4) == 0;
 }
 
-bool fork_only_arch(const std::string& gguf) {
-    // Zyphra ZAYA1 (docs/vulkan.md); OPT, CodeGen, GPT-Neo and GPT-J (llama.cpp #8: upstream has
-    // no model for them, gptj only a name). Keep in step with FORK_ONLY in tools/registry_build.py.
-    static const char* const archs[] = {"zaya", "opt", "codegen", "gptneo", "gptj"};
-    const std::string arch = gguf_architecture(gguf);
-    for (const char* a : archs)
-        if (arch == a) return true;
-    return false;
+#ifdef _WIN32
+// The ryzenai-server.exe Lemonade installs for its ryzenai-server backend:
+// <cache>\bin\ryzenai-server\npu\...\ryzenai-server.exe, where <cache> is $LEMONADE_CACHE_DIR, else
+// %USERPROFILE%\.cache\lemonade (Lemonade's own defaults). Empty when Lemonade has not installed it.
+std::string lemonade_ryzenai_server() {
+    fs::path cache;
+    if (const char* e = std::getenv("LEMONADE_CACHE_DIR"); e && *e) cache = e;
+    else if (const char* h = std::getenv("USERPROFILE"); h && *h) cache = fs::path(h) / ".cache" / "lemonade";
+    else return "";
+    std::error_code ec;
+    const fs::path dir = cache / "bin" / "ryzenai-server" / "npu";
+    if (!fs::is_directory(dir, ec)) return "";
+    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
+        if (it->path().filename() == "ryzenai-server.exe") return it->path().string();
+    return "";
 }
-
-// --lean: the llama-server built from ROCmFPX (ONEBIT_LEAN), whose formats upstream
-// llama.cpp cannot read; --device rocm picks its ROCm build (ONEBIT_LEAN_ROCM).
-std::string default_lean_server(const std::string& device) {
-    if (const char* e = std::getenv("ONEBIT_LEAN_SERVER"); e && *e) return e;
-    if (device == "rocm") {
-#ifdef ONEBIT_LEAN_ROCM_SERVER
-        return built_path(ONEBIT_LEAN_ROCM_SERVER);
-#else
-        throw std::runtime_error("--device rocm needs a build with -DONEBIT_LEAN=ON -DONEBIT_LEAN_ROCM=ON");
 #endif
-    }
-#ifdef ONEBIT_LEAN_SERVER
-    return built_path(ONEBIT_LEAN_SERVER);
-#else
-    throw std::runtime_error("--lean needs a build with -DONEBIT_LEAN=ON (docs/lean.md)");
-#endif
-}
 
-// ryzenai-server (third_party/ryzenai-server, MIT): ONNX Runtime GenAI models, on the CPU with
-// Microsoft's ONNX Runtime, or the NPU / hybrid where AMD's Ryzen AI Software provides it
+// ryzenai-server (lemonade-sdk/ryzenai-server, MIT): ONNX Runtime GenAI models. Linux builds it
+// from third_party/ryzenai-server (CPU with Microsoft's ONNX Runtime, or the NPU / hybrid where
+// AMD's Ryzen AI Software provides it); Windows uses the one Lemonade installs.
 std::string default_onnx() {
     if (const char* e = std::getenv("ONEBIT_ONNX_SERVER"); e && *e) return e;
 #ifdef ONEBIT_ONNX_SERVER
     return built_path(ONEBIT_ONNX_SERVER);
+#elif defined(_WIN32)
+    if (std::string p = lemonade_ryzenai_server(); !p.empty()) return p;
+    return "ryzenai-server.exe";
 #else
     return "ryzenai-server";
 #endif
@@ -296,15 +276,6 @@ std::string default_ds4() {
     return built_path(ONEBIT_DS4_SERVER);
 #else
     return "ds4-server";
-#endif
-}
-
-std::string default_zinc() {
-    if (const char* e = std::getenv("ONEBIT_ZINC"); e && *e) return e;
-#ifdef ONEBIT_ZINC_SERVER
-    return built_path(ONEBIT_ZINC_SERVER);
-#else
-    return "zinc";
 #endif
 }
 
@@ -511,9 +482,9 @@ std::string model_id(const Options& o) {
 }
 
 // Forwards an OpenAI POST to the child: the model id becomes the child's (a
-// child such as zinc rejects ids it did not load), and replies carry ours.
+// child that rejects ids it did not load gets none), and replies carry ours.
 // Counts a request against a backend from the moment it is routed until its reply
-// (streamed or not) is complete; --adaptive routes by these counts.
+// (streamed or not) is complete; the exit summary reports these counts.
 struct InFlight {
     explicit InFlight(std::atomic<int>* n) : n_(n) { if (n_) ++*n_; }
     ~InFlight() { if (n_) --*n_; }
@@ -619,7 +590,7 @@ uint64_t mem_available() {
 // --moe-slots auto: as many experts as fit in free memory beside the tensors the GPU holds, keeping
 // a reserve (8 GiB or 15% of free memory) for the KV cache, buffers and everything else. The
 // streamer gives every MoE layer an equal share, so the cache costs slots x the mean expert size.
-int auto_moe_slots(const std::string& model) {
+[[maybe_unused]] int auto_moe_slots(const std::string& model) {
     const auto idx = moe::GgufIndex::open(model);
     if (idx.experts.empty()) throw std::runtime_error("--moe-slots: " + model + " has no routed experts");
     double mean = 0;
@@ -650,20 +621,42 @@ int auto_moe_slots(const std::string& model) {
 }
 #endif
 
+// The GGUF architectures our llama.cpp builds a model for, on HRX0 or on the CPU: generated from
+// registry/architectures.json (gguf_architectures.hrx, tools/registry_build.py), so a pin bump that
+// regenerates the registry moves this list too. Anything else (Qwen3.8-Flash-Next's qwen4exp, Zyphra
+// Zamba/Zamba2/BlackMamba, the upstream-only architectures the removed Vulkan build ran) serve
+// declines with a clear message, and Lemonade's own llamacpp backend serves it. An empty
+// architecture (a file serve cannot read) is left to llama-server.
+bool hrx_missing_arch(const std::string& arch) {
+    if (arch.empty()) return false;
+    for (const char* a : kHrxGgufArchs)
+        if (arch == a) return false;
+    return true;
+}
+
+void refuse_missing_arch(const std::string& model) {
+    if (const std::string arch = gguf_architecture(model); hrx_missing_arch(arch))
+        throw std::runtime_error(model + ": architecture " + arch + " is not in the engine's llama.cpp "
+                                 "(registry/architectures.json); Lemonade's llamacpp backend serves it");
+}
+
+bool delta_net_arch(const std::string& arch) {
+    return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next";
+}
+
 Launch launch_for(const Options& o, const std::string& device, int child_port) {
     Launch l;
     l.device = device;
     l.port = child_port;
     std::vector<std::string>& argv = l.argv;
     std::vector<std::string>& env = l.env;
-    bool& drop_model = l.drop_model;
     std::string& set_model = l.set_model;
     if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
     if (device == "onnx") {
         // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
         // the model's genai_config.json
-        if (o.parallel > 1 || !o.mtp.empty() || !o.dflash.empty() || o.lean || !o.prefill_device.empty() || !o.mmproj.empty())
-            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --dflash, --lean, --prefill-device or --mmproj");
+        if (o.parallel > 1 || !o.mtp.empty() || !o.dflash.empty() || !o.mmproj.empty())
+            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --dflash or --mmproj");
         argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
         return l;
@@ -673,54 +666,29 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // Hugging Face id, so requests carry that id (docs/apple.md).
         argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
         set_model = o.model;
-    } else if (o.lean || device == "rocm") {
-        // --lean: ROCmFPX's formats on Vulkan0. --device rocm: the ROCm build (ROCmFPX's tree,
-        // which reads every GGUF) on ROCm0; ROCmI4 files use its W4A4 path there.
-        if (device != "vulkan" && device != "rocm")
-            throw std::runtime_error("--lean runs on --device vulkan or rocm");
-        if (!o.prefill_device.empty()) throw std::runtime_error("--prefill-device works with --device vulkan only");
-        argv = {o.llama_server.empty() ? default_lean_server(device) : o.llama_server,
-                "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port),
-                "--device", device == "rocm" ? "ROCm0" : "Vulkan0", "-ngl", "99", "--jinja"};
-        if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        if (hadamard_q4_0(o.model)) {
-            // tools/hadamard_q4_0.py stamped it: its Q4_0 weights are rotated. The lean ROCm build sees
-            // the stamp and rotates the activations of those weights, and of no others, so a plain
-            // Q4_0 drafter or MTP head works beside it (ROCmFPX#7); every Q4_0 matmul takes the W4A4
-            // kernel (docs/lean.md). A value set in the environment wins (GGML_W4A4_TENSORS= keeps
-            // exact int8).
-            if (device != "rocm") throw std::runtime_error(o.model + " is Hadamard-rotated: the lean build runs it on --device rocm");
-            if (!std::getenv("GGML_W4A4_TENSORS")) env.push_back("GGML_W4A4_TENSORS=all");
-            // micro-batch size: recipe rotated-moe-ub1024 (config/recipes.json)
-        }
-    } else if (device == "vulkan" || device == "hrx" || device == "cpu") {
+    } else if (device == "hrx" || device == "cpu") {
         // --device cpu: llama-server with no GPU layers (the Windows package's route until HRX runs
-        // there). --prefill-device hrx: the HRX build (it has both devices and the shared-KV split), flash
-        // attention on so both devices lay the KV cache out the same way
-        const bool split = !o.prefill_device.empty();
-        if (split && (device != "vulkan" || o.prefill_device != "hrx"))
-            throw std::runtime_error("--prefill-device hrx works with --device vulkan");
-        const bool fork_arch = device == "vulkan" && fork_only_arch(o.model);
-        argv = {o.llama_server.empty() ? default_llama_server(split || fork_arch ? "hrx" : device) : o.llama_server,
+        // there, and what --device auto falls back to where HRX has no route for a request)
+        refuse_missing_arch(o.model);
+        argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port)};
-        if (device == "cpu") {
-            if (split) throw std::runtime_error("--prefill-device hrx works with --device vulkan");
-            argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
-        } else {
-            argv.insert(argv.end(), {"--device", device == "hrx" ? "HRX0" : "Vulkan0", "-ngl", "99", "--jinja"});
-        }
+        if (device == "cpu") argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
+        else argv.insert(argv.end(), {"--device", "HRX0", "-ngl", "99", "--jinja"});
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        if (!o.flash_attn.empty() && !split) { argv.insert(argv.end(), {"-fa", o.flash_attn}); }
-        if (split) {
-            argv.insert(argv.end(), {"-fa", "on"});
-            env.push_back("ONEBIT_PREFILL_DEVICE=HRX0");
-            if (o.prefill_min_tokens > 0) env.push_back("ONEBIT_PREFILL_MIN_TOKENS=" + std::to_string(o.prefill_min_tokens));
-        }
+        if (!o.flash_attn.empty()) { argv.insert(argv.end(), {"-fa", o.flash_attn}); }
         if (o.moe_slots != 0) {
+            // --moe-slots (docs/moe-streaming.md) is kept, not dropped: the expert streamer lives in
+            // the Vulkan llama.cpp build the engine no longer ships (RFC #213 stage 3), and it moves to
+            // HRX together with Qwen3.8-Flash-Next (qwen4exp). Until the HRX llama.cpp reads
+            // ONEBIT_MOE_FILE / ONEBIT_MOE_SLOTS, a build says so instead of loading every expert.
+#ifndef ONEBIT_MOE_STREAMING_HRX
+            throw std::runtime_error("--moe-slots is not available in this build: expert streaming ran on the Vulkan "
+                                     "llama.cpp build, which the engine no longer ships (RFC #213). It moves to HRX "
+                                     "with Qwen3.8-Flash-Next (docs/moe-streaming.md); until then, leave --moe-slots off");
+#else
+            if (device != "hrx") throw std::runtime_error("--moe-slots works with --device hrx");
             // routed experts stay in the file (memory-mapped, never read whole); N of them are cached in
-            // Vulkan buffers and streamed in as the router asks (docs/moe-streaming.md)
-            if (device != "vulkan" || split || fork_arch)
-                throw std::runtime_error("--moe-slots works with --device vulkan, without --prefill-device");
+            // GPU buffers and streamed in as the router asks (docs/moe-streaming.md)
             env.push_back("ONEBIT_MOE_FILE=" + std::filesystem::absolute(o.model).string());
             int slots = o.moe_slots;
             if (slots < 0) {
@@ -735,11 +703,12 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             env.push_back("ONEBIT_MOE_PREFETCH=" + std::to_string(o.moe_prefetch));
             if (!o.moe_subst.empty()) env.push_back("ONEBIT_MOE_SUBST=" + o.moe_subst);
             // the experts stay file-backed: without these, llama.cpp copies every one into RAM
-            // (a pinned Vulkan host buffer, or a CPU repack), which is what streaming avoids
+            // (a pinned host buffer, or a CPU repack), which is what streaming avoids
             // (per_layer_token_embd: Qwen3.8-Flash-Next's 26.8 GiB table, only ever row-gathered)
             argv.insert(argv.end(), {"-ot", "exps=CPU,per_layer_token_embd=CPU", "--no-host", "--no-repack", "--load-mode", "mmap"});
+#endif
         }
-        if (device == "hrx" || split) {
+        if (device == "hrx") {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         }
@@ -773,13 +742,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (o.ctx_size > 0) { argv.push_back("--ctx"); argv.push_back(std::to_string(o.ctx_size)); }
         if (o.ssd_streaming) argv.push_back("--ssd-streaming");
         l.ready_path = "/v1/models";
-    } else if (device == "zinc") {
-        argv = {o.zinc.empty() ? default_zinc() : o.zinc, "-m", o.model, "-p", std::to_string(child_port)};
-        if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
-        env.push_back("RADV_PERFTEST=coop_matrix");
-        drop_model = true;  // zinc rejects any model id but its own
     } else {
-        throw std::runtime_error("--device " + o.device + " cannot run a .gguf (hrx, rocm, cpu, vulkan, zinc or ds4)");
+        refuse_removed_device(device);
+        throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx, cpu or ds4)");
     }
     if (o.parallel == 1) {
         // one slot: llama-server's own default is several, and a second slot can share a batch
@@ -789,7 +754,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (vulkan, hrx, rocm)");
+        if (device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
         if (device == "hrx") {
             // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
@@ -800,7 +765,8 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             const std::string arch = gguf_architecture(o.model);
             if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next")
                 throw std::runtime_error("--parallel on --device hrx does not run " + arch +
-                                         " yet (no multi-sequence gated delta-net on HRX); use --device vulkan");
+                                         " yet (no multi-sequence gated delta-net on HRX): leave --parallel off "
+                                         "(one sequence on HRX0), or use --device cpu");
             argv.push_back("-kvu");
             bool merged = false;
             for (std::string& e : env)
@@ -813,7 +779,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
         // on the same device; the model checks them in one batch
         const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (vulkan, hrx, rocm)");
+        if (device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
         l.mtp = true;
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
@@ -831,12 +797,12 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
     if (!o.mmproj.empty()) {
-        if (device == "zinc" || device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
+        if (device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
         // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
         argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
     }
-    if ((device == "vulkan" || device == "hrx" || device == "rocm") && !o.no_recipes &&
+    if ((device == "hrx" || device == "cpu") && !o.no_recipes &&
         std::filesystem::path(o.model).extension() == ".gguf") {
         // tuned settings for this model and route (config/recipes.json, docs/recipes.md); what
         // serve set above wins over a recipe
@@ -853,7 +819,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         facts.device = device;
         facts.architecture = gguf_architecture(o.model);
         facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
-        facts.hadamard_q4_0 = hadamard_q4_0(o.model);
         facts.drafter = !o.dflash.empty() ? "dflash" : !o.mtp.empty() ? "mtp" : "none";
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
@@ -863,14 +828,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
 
 // A small llama-server for one RAG role: --embedding for /v1/embeddings, --reranking for
 // /v1/rerank. Batch = ubatch: an embedding or rerank input is one pass. On HRX where the build has
-// it (docs/hrx.md), else Vulkan. HRX runs one sequence per batch (docs/hrx.md, "Several sequences
+// it (docs/hrx.md), else the CPU. HRX runs one sequence per batch (docs/hrx.md, "Several sequences
 // per batch fail"), so its server takes one slot and 2048-token inputs, the largest prompt chunk
 // its matmul kernels take in one pass.
 std::string rag_device() {
 #if defined(ONEBIT_HRX_SERVER)
     return "hrx";
 #else
-    return "vulkan";
+    return "cpu";
 #endif
 }
 
@@ -879,7 +844,7 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
     const std::string device = rag_device();
     l.device = device + " " + role;
     l.port = port;
-    const std::string server = o.llama_server.empty() ? default_llama_server(device) : o.llama_server;
+    const std::string server = o.llama_server.empty() ? default_llama_server() : o.llama_server;
     if (device == "hrx") {
         l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
                   "--device", "HRX0", "-ngl", "99", "-c", "2048", "-b", "2048", "-ub", "2048", "-np", "1",
@@ -889,64 +854,41 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
             l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
     } else
         l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
-                  "--device", "Vulkan0", "-ngl", "99", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
+                  "-ngl", "0", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
                   std::string("--") + role};
     return l;
 }
 
 // The devices a .gguf can run on, in the order the Laya router offers them. The NPU runs Q4NX
 // model directories, not .gguf files (docs/npu.md), so it is not a candidate here; an NPU
-// model directory routes to npu in run_serve.
-// Vulkan is leaving the engine (RFC #213, docs/hrx.md): HRX is the GPU route and the lean ROCm
-// build serves long prompts, where this build has them. A build without HRX (CI) keeps the old
-// candidates, Vulkan first, until the Vulkan build is removed.
+// model directory routes to npu in run_serve. The GPU route is HRX (RFC #213 stage 3: no
+// Vulkan, no ROCm; no ZINC since the core strip), with the CPU beside it; a build without HRX
+// (CI, Windows) offers the CPU only. A candidate's backend starts only when the policy picks it.
 std::vector<std::string> gguf_devices() {
     std::vector<std::string> devices;
-#if defined(_WIN32)
-    devices.push_back("cpu");
-#elif defined(ONEBIT_HRX_SERVER)
+#if defined(ONEBIT_HRX_SERVER) && !defined(_WIN32)
     devices.push_back("hrx");
-#ifdef ONEBIT_LEAN_ROCM_SERVER
-    devices.push_back("rocm");
 #endif
-#else
-    devices.insert(devices.end(), {"vulkan", "hrx"});
-#endif
-    devices.push_back("zinc");
+    devices.push_back("cpu");
     return devices;
 }
 
-// The GGUF architectures a pinned Vulkan llama.cpp maps and the HRX one does not
-// (registry/architectures.json: "vulkan" in backends, "hrx" not). tests/device_route.sh checks
-// this list against the registry, so regenerate both together.
-bool hrx_missing_arch(const std::string& arch) {
-    static const char* const archs[] = {
-        "bailingmoe3", "blackmamba", "dots3note", "granite_swa", "graniteswitch", "hrm_text",
-        "hy_v4",       "kimi-k3",    "maple",     "minimax-01",  "muse-glimmer",  "pockettts",
-        "qwen3tts",    "qwen4exp",   "spark2_5",  "zamba",       "zamba2"};
-    for (const char* a : archs)
-        if (arch == a) return true;
-    return false;
-}
-
-// --device auto for a .gguf: HRX where the build has it. What HRX does not run yet, or runs well
-// below Vulkan, keeps Vulkan until it is ported or dropped: architectures HRX does not map
-// (hrx_missing_arch), --moe-slots (experts streamed from the drive), --parallel on the gated
-// delta-net architectures (no multi-sequence delta-net on HRX), --mtp (HRX drafts at 65-78% of
-// Vulkan's speed) and --mmproj (an open RFC #213 gate).
+// --device auto for a .gguf: HRX where the build has it, else the CPU (Windows, and builds
+// without HRX). What used to fall back to Vulkan (engine #271) has no GPU route left:
+//  - an architecture our llama.cpp does not map (hrx_missing_arch): refused, on every device;
+//  - --moe-slots: refused (launch_for) until expert streaming moves to HRX with Flash-Next;
+//  - --parallel N > 1 on a gated delta-net model (no multi-sequence delta-net on HRX): HRX0 with
+//    one slot and a warning (serve_child);
+//  - --mmproj: HRX0. UNVERIFIED: HRX vision is an open RFC #213 gate, to be checked on ZAYA1-VL;
+//    if it fails there, this goes back to the CPU.
+// --mtp now runs on HRX0 (it drafts slower there than Vulkan did: verify batches of 2-4 tokens).
 std::string auto_gguf_device(const Options& o) {
-#if defined(_WIN32)
+#if defined(_WIN32) || !defined(ONEBIT_HRX_SERVER)
     (void)o;
-    return "cpu";  // no GPU route on Windows yet (docs/windows.md)
-#elif defined(ONEBIT_HRX_SERVER)
-    if (o.moe_slots != 0 || !o.mtp.empty() || !o.mmproj.empty()) return "vulkan";
-    const std::string arch = gguf_architecture(o.model);
-    if (hrx_missing_arch(arch)) return "vulkan";
-    if (o.parallel > 1 && (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next")) return "vulkan";
-    return "hrx";
+    return "cpu";  // no GPU route on Windows yet (docs/windows.md), nor in a build without HRX
 #else
     (void)o;
-    return "vulkan";
+    return "hrx";
 #endif
 }
 
@@ -1181,53 +1123,21 @@ std::string request_state(const httplib::Request& req) {
     return out;
 }
 
-// The prompt length of a request, counted by a llama-server backend: /v1/completions' prompt as
-// is, a chat through the model's template (/apply-template, which takes the request body as it
-// comes, tools included). If the backend cannot tell, about four bytes a token.
-long prompt_tokens(int port, const httplib::Request& q) {
-    json body;
-    try {
-        body = json::parse(q.body);
-    } catch (const std::exception&) {
-        return long(q.body.size() / 4);
-    }
-    httplib::Client c("127.0.0.1", port);
-    c.set_read_timeout(std::chrono::seconds(30));
-    std::string prompt;
-    if (body.contains("prompt") && body["prompt"].is_string()) {
-        prompt = body["prompt"].get<std::string>();
-    } else if (auto t = c.Post("/apply-template", q.body, "application/json"); t && t->status == 200) {
-        try {
-            prompt = json::parse(t->body).value("prompt", "");
-        } catch (const std::exception&) {
-        }
-    }
-    if (prompt.empty()) return long(request_state(q).size() / 4);
-    if (auto t = c.Post("/tokenize", json{{"content", prompt}}.dump(), "application/json"); t && t->status == 200) {
-        try {
-            const json tok = json::parse(t->body);
-            if (tok.contains("tokens") && tok["tokens"].is_array()) return long(tok["tokens"].size());
-        } catch (const std::exception&) {
-        }
-    }
-    return long(prompt.size() / 4);
-}
-
 int serve_child(const Options& given) {
     Options o = given;
-    if (hadamard_q4_0(o.model)) {
-        // a rotated file has two routes: HRX (llama-hadamard rotates the activations as a matmul) and
-        // the lean ROCm build (W4A4). auto keeps ROCm until HRX routes Q4_0 prompt matmuls to a fast
-        // kernel: Qwen3.8-27B-Q4_0-H32 on HRX0 runs pp512 at 63.5 tok/s today (docs/hrx.md).
-        if (o.device == "auto") o.device = "rocm";
-        if (o.device != "rocm" && o.device != "hrx")
-            throw std::runtime_error(o.model + " is Hadamard-rotated (tools/hadamard_q4_0.py): it runs on --device hrx or rocm, docs/hrx.md");
-        if (o.laya_auto || !o.laya_model.empty())
-            throw std::runtime_error("--laya routes among devices; a Hadamard-rotated file runs on hrx or rocm, picked with --device");
-        if (o.device == "hrx")
-            std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: HRX route, activations rotated by llama-hadamard\n", o.model.c_str());
-        else
-            std::fprintf(stderr, "1bit serve: %s is Hadamard-rotated: lean ROCm route, W4A4 prompt processing\n", o.model.c_str());
+    if (hadamard_q4_0(o.model))
+        throw std::runtime_error(o.model + " is an H32 file (onebit.hadamard_q4_0, a Hadamard-rotated Q4_0): the engine "
+                                 "dropped that format; use the model's UD-Q4_K_XL (or another standard) GGUF instead");
+    if (o.device == "auto" && o.parallel > 1 && delta_net_arch(gguf_architecture(o.model)) &&
+        auto_gguf_device(o) == "hrx") {
+        // HRX0 decodes one gated delta-net sequence at a time (no multi-sequence delta-net kernel yet),
+        // and auto has no other GPU route since the Vulkan build left: one slot on HRX0, said aloud.
+        // --device cpu still honors --parallel.
+        std::fprintf(stderr, "1bit serve: --parallel %d on %s: HRX0 runs one gated delta-net sequence at a time "
+                             "(no multi-sequence delta-net on HRX yet), so --device auto serves it with one slot; "
+                             "--device cpu keeps --parallel %d\n",
+                     o.parallel, gguf_architecture(o.model).c_str(), o.parallel);
+        o.parallel = 1;
     }
     if (prism_ternary_types(o.model) && !prism_hadamard(o.model)) {
         // PQ2_0 / PTQ1_0 without a rotation (e.g. Ternary-Bonsai-1.7B): only the HRX build reads the types
@@ -1261,8 +1171,8 @@ int serve_child(const Options& given) {
     // (code, prose, short, long_doc; laya/route.h) and the route policy (config/route-policy.json
     // or --route-policy) maps the class to one of the devices this build can run the .gguf on.
     // A device's backend starts when it is first picked (one model is not loaded on every
-    // device at once). Opt-in: the built-in policy sends every class to Vulkan until a row
-    // shows a measured net gain.
+    // device at once). Opt-in: the built-in policy sends every class to HRX (the engine's one GPU
+    // route); a row changes only with a measured net gain.
     const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto";
 #ifdef ONEBIT_LAYA
     std::unique_ptr<onebit::laya::Scorer> scorer;
@@ -1272,8 +1182,8 @@ int serve_child(const Options& given) {
     std::vector<std::string> laya_devices;
     onebit::laya::RoutePolicy policy;
     if (laya) {
-        if (o.adaptive || !o.role.empty() || !o.prefill_device.empty() || o.lean)
-            throw std::runtime_error("--laya does not combine with --adaptive, --embedding/--reranking, --prefill-device or --lean");
+        if (!o.role.empty())
+            throw std::runtime_error("--laya does not combine with --embedding/--reranking");
         policy = onebit::laya::load_route_policy(o.route_policy);
         // ONEBIT_LAYA_DEVICE=npu: the C++ scorer with its encoder on the NPU, from a private add-on
         // (laya/encoder.h, docs/laya.md); else the GGUF scorer, on HRX0 unless it names another
@@ -1328,33 +1238,16 @@ int serve_child(const Options& given) {
 #endif
     if (laya) {
         // the candidates are prepared above
-    } else if (o.adaptive) {
-        // Grows with the load: a lone request gets Vulkan (MTP if given, --adaptive-at slots,
-        // default 1); concurrent ones go to ROCm, which keeps scaling to 16 batched requests.
-        // MTP and batching live in separate backends: a server with MTP loaded batches at
-        // about two thirds of the throughput, whatever each request's draft length
-        // (docs/serve.md, "Growing with the load").
-        if (o.device != "auto" && o.device != "vulkan")
-            throw std::runtime_error("--adaptive runs Vulkan with ROCm overflow; leave --device at auto or vulkan");
-        if (o.lean || !o.prefill_device.empty()) throw std::runtime_error("--adaptive does not combine with --lean or --prefill-device");
-        Options first = o;
-        first.parallel = o.parallel > 1 ? o.parallel : o.adaptive_at;
-        backends.push_back(launch_for(first, "vulkan", free_port()));
-        Options overflow = o;
-        overflow.parallel = 16;
-        overflow.mtp.clear();       // batched requests gain little from drafting
-        overflow.dflash.clear();
-        overflow.llama_server.clear();
-        backends.push_back(launch_for(overflow, "rocm", free_port()));
     } else if (!o.role.empty()) {
         // The model is an embedding or reranking model (Lemonade loads them as models of their
         // own): llama-server on the device asked for, in that role. An input is one pass, so
         // the batch covers the context.
-        const std::string dev = o.device == "auto" ? "vulkan" : o.device;
-        if (dev != "vulkan" && dev != "hrx" && dev != "rocm")
-            throw std::runtime_error("--" + o.role + " runs on llama-server devices (vulkan, hrx, rocm), not " + dev);
-        if (o.adaptive || !o.mtp.empty() || !o.dflash.empty() || !o.prefill_device.empty())
-            throw std::runtime_error("--" + o.role + " does not combine with --adaptive, --mtp, --dflash or --prefill-device");
+        refuse_removed_device(o.device);
+        const std::string dev = o.device == "auto" ? rag_device() : o.device;
+        if (dev != "hrx" && dev != "cpu")
+            throw std::runtime_error("--" + o.role + " runs on llama-server devices (hrx, cpu), not " + dev);
+        if (!o.mtp.empty() || !o.dflash.empty())
+            throw std::runtime_error("--" + o.role + " does not combine with --mtp or --dflash");
         Launch l = launch_for(o, dev, free_port());
         const std::string batch = std::to_string(o.ctx_size > 0 ? o.ctx_size : 8192);
         for (const std::string& a : {std::string("--") + o.role, std::string("-b"), batch, std::string("-ub"), batch})
@@ -1364,35 +1257,7 @@ int serve_child(const Options& given) {
     } else {
         backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device, free_port()));
     }
-    // --long-model: the same model as a Hadamard-rotated Q4_0 on the ROCm W4A4 route, for
-    // conversations that start with a long prompt. What the user waits for is the first token
-    // plus the answer: with a short prompt the faster decode wins (Vulkan), with a long one the
-    // faster prefill does (W4A4 from about 2,000 tokens; docs/lean.md, "End to end"). Both
-    // backends load at the start; a conversation stays where its first request went, so its
-    // prompt cache stays useful as it grows.
-    const bool long_route = !o.long_model.empty();
-    if (long_route) {
-        if (laya || o.adaptive || !o.role.empty() || !o.mmproj.empty())
-            throw std::runtime_error("--long-model does not combine with --laya, --adaptive, --embedding/--reranking or --mmproj");
-        if (!hadamard_q4_0(o.long_model))
-            throw std::runtime_error("--long-model takes a Hadamard-rotated Q4_0 (tools/hadamard_q4_0.py, docs/lean.md): " + o.long_model);
-        if (hadamard_q4_0(o.model))
-            throw std::runtime_error(o.model + " is already on the W4A4 route; -m is the model for short prompts");
-        const std::string& d = backends[0].device;
-        if (d != "vulkan" && d != "hrx" && d != "rocm")
-            throw std::runtime_error("--long-model needs -m on a llama-server route (vulkan, hrx or rocm), not " + d);
-        if (o.long_from < 1) throw std::runtime_error("--long-from takes a positive token count");
-        Options lo = o;
-        lo.model = o.long_model;
-        lo.mtp.clear();
-        lo.dflash.clear();
-        lo.llama_server.clear();
-        lo.prefill_device.clear();
-        lo.moe_slots = 0;
-        lo.lean = false;
-        backends.push_back(launch_for(lo, "rocm", free_port()));
-    }
-    const std::string device = laya ? "laya" : o.adaptive ? "vulkan+rocm" : backends[0].device;
+    const std::string device = laya ? "laya" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
     const std::string set_model = backends[0].set_model;
 
@@ -1436,10 +1301,6 @@ int serve_child(const Options& given) {
     std::vector<std::atomic<int>> inflight(backends.size());
     std::vector<std::atomic<long>> routed(backends.size());
     std::mutex route_mu;
-    // --long-model: conversation -> (backend, prompt tokens of its first request)
-    std::mutex long_mu;
-    std::unordered_map<size_t, std::pair<size_t, long>> long_cache;
-    std::deque<size_t> long_order;
 #ifdef ONEBIT_LAYA
     std::mutex scorer_mu, class_mu;
     std::unordered_map<size_t, onebit::laya::RequestClass> class_cache;  // conversation -> class
@@ -1510,40 +1371,8 @@ int serve_child(const Options& given) {
             return;
         }
 #endif
-        if (long_route) {
-            const size_t key = conversation_key(q);
-            std::pair<size_t, long> side{0, -1};
-            bool fresh = true;
-            {
-                std::lock_guard<std::mutex> lock(long_mu);
-                if (const auto c = long_cache.find(key); c != long_cache.end()) side = c->second, fresh = false;
-            }
-            if (fresh) {
-                side.second = prompt_tokens(backends[0].port, q);
-                side.first = side.second >= o.long_from ? 1 : 0;
-                std::lock_guard<std::mutex> lock(long_mu);
-                if (long_cache.size() >= 4096) {  // oldest conversation first
-                    long_cache.erase(long_order.front());
-                    long_order.pop_front();
-                }
-                if (long_cache.emplace(key, side).second) long_order.push_back(key);
-            }
-            const size_t i = side.first;
-            char route_hdr[96];
-            std::snprintf(route_hdr, sizeof route_hdr, "%s %ld %s", i ? "long" : "short", side.second, backends[i].device.c_str());
-            held = std::make_shared<InFlight>(&inflight[i]);
-            ++routed[i];
-            forward(backends[i].port, held, -1, id, backends[i].drop_model, backends[i].set_model, q, r);
-            r.set_header("X-1bit-Route", route_hdr);  // short or long, the first prompt's tokens, device
-            return;
-        }
         {
             std::lock_guard<std::mutex> lock(route_mu);
-            if (backends.size() > 1 && inflight[0] >= o.adaptive_at) {
-                pick = 1;
-                for (size_t i = 2; i < backends.size(); i++)
-                    if (inflight[i] < inflight[pick]) pick = i;
-            }
             held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
@@ -1553,9 +1382,9 @@ int serve_child(const Options& given) {
     srv.Post("/v1/completions", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
-    // the first backend; the NPU, ZINC and MLX answer 501.
-    const bool llama = device == "vulkan" || device == "hrx" || device == "rocm" || device == "cpu" || device == "vulkan+rocm" ||
-                       (laya && backends[0].device == "vulkan");
+    // the first backend; the NPU, DwarfStar and MLX answer 501.
+    const bool llama = device == "hrx" || device == "cpu" ||
+                       (laya && (backends[0].device == "hrx" || backends[0].device == "cpu"));
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
         r.status = 501;
         r.set_content(json{{"error", {{"message", q.path + " is not available on --device " + device},
@@ -1902,21 +1731,18 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|rocm|cpu|vulkan|zinc|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
-                 "                  [--llama-server PATH] [--zinc PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "                  [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--llama-server PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
-                 "                  [--prefill-device hrx] [--prefill-min-tokens N]   (with --device vulkan)\n"
-                 "                  [--lean]   ROCmFPX formats: ROCmFP4 on vulkan, ROCmI4 with --device rocm\n"
-                 "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (vulkan, hrx, rocm)\n"
+                 "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
                  "                  [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   stream MoE experts from the file,\n"
                  "                                    N held in RAM (auto: what fits); R: resident experts stand in for missing\n"
-                 "                                    ones; prefetch N layers ahead (default 0) (vulkan; docs/moe-streaming.md)\n"
-                 "                  [--mmproj MMPROJ.gguf]   images in chat messages (vulkan, hrx, rocm)\n"
+                 "                                    ones; prefetch N layers ahead (default 0). Not in this build: it moves\n"
+                 "                                    to HRX with Qwen3.8-Flash-Next (docs/moe-streaming.md)\n"
+                 "                  [--mmproj MMPROJ.gguf]   images in chat messages (hrx, cpu)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
-                 "                  [--adaptive] [--adaptive-at N]   Vulkan (+MTP) for N in flight (default 1), ROCm batches the rest\n"
-                 "                  [--long-model ROTATED.gguf] [--long-from N]   conversations starting with N or more prompt\n"
-                 "                                    tokens (default 2048) go to that Hadamard-rotated Q4_0 on ROCm (W4A4)\n"
+
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
@@ -1947,14 +1773,17 @@ int run_serve(int argc, char** argv) {
         else if (a == "-fa" || a == "--flash-attn") o.flash_attn = next();
         else if (a == "--alias") o.alias = next();
         else if (a == "--llama-server") o.llama_server = next();
-        else if (a == "--zinc") o.zinc = next();
+        else if (a == "--zinc")
+            throw std::runtime_error("--zinc was removed with the engine's ZINC build (docs/serve.md)");
         else if (a == "--ds4") o.ds4 = next();
         else if (a == "--ssd-streaming") o.ssd_streaming = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
         else if (a == "--mlx-server") o.mlx = next();
-        else if (a == "--prefill-device") o.prefill_device = next();
-        else if (a == "--prefill-min-tokens") o.prefill_min_tokens = std::stoi(next());
-        else if (a == "--lean") o.lean = true;
+        else if (a == "--prefill-device" || a == "--prefill-min-tokens" || a == "--lean" || a == "--adaptive" ||
+                 a == "--adaptive-at" || a == "--long-model" || a == "--long-from")
+            // RFC #213 stage 3: these ran on the Vulkan and ROCm builds the engine no longer ships
+            throw std::runtime_error(a + " was removed with the engine's Vulkan and ROCm builds (RFC #213); "
+                                     "Lemonade's own llamacpp backend serves Vulkan and ROCm (docs/serve.md)");
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--dflash") o.dflash = next();
         else if (a == "--moe-slots") {
@@ -1967,10 +1796,6 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());
         else if (a == "--mtp-p-min") o.mtp_p_min = next();
         else if (a == "--parallel") o.parallel = std::stoi(next());
-        else if (a == "--adaptive") o.adaptive = true;
-        else if (a == "--adaptive-at") o.adaptive_at = std::stoi(next());
-        else if (a == "--long-model") o.long_model = next();
-        else if (a == "--long-from") o.long_from = std::stoi(next());
         else if (a == "--embed") o.embed = next();
         else if (a == "--embedding" || a == "--embeddings") o.role = "embedding";
         else if (a == "--reranking") o.role = "reranking";
@@ -1985,6 +1810,7 @@ int run_serve(int argc, char** argv) {
         else throw std::runtime_error("unknown option " + a);
     }
     if (o.model.empty()) { usage(stderr); return 2; }
+    refuse_removed_device(o.device);
 
     if (is_onnx_model_dir(o.model)) {
         if (o.device != "auto" && o.device != "onnx")
@@ -1994,8 +1820,7 @@ int run_serve(int argc, char** argv) {
         return serve_child(onnx);
     }
     if (fs::is_directory(o.model)) {
-        if (o.lean) throw std::runtime_error("--lean serves a .gguf (ROCmFP4 or ROCmI4)");
-        if (!o.mmproj.empty()) throw std::runtime_error("--mmproj works on the llama.cpp devices (vulkan, hrx, rocm)");
+        if (!o.mmproj.empty()) throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         if (o.device != "auto" && o.device != "npu")
             throw std::runtime_error("an NPU model directory runs on --device npu");
 #ifdef ONEBIT_NPU
@@ -2097,7 +1922,7 @@ int run_serve(int argc, char** argv) {
         // GGUF-on-NPU (docs/npu.md, "Open"): repack the GGUF into a Q4NX model
         // directory, then serve it through the model-generic forward in process.
         const std::string dir = repack_gguf(o.model);
-        // Resolve the full-ELF / xclbin directory the forward loads. An empty value
+        // Resolve the full-ELF directory the forward loads. An empty value
         // makes it look for "/full_i8_*.elf", so it is an error, not a default.
         std::string kernels;
         if (const char* env = std::getenv("ONEBIT_NPU_KERNELS")) kernels = env;

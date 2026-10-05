@@ -13,11 +13,11 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# HRX + Vulkan in one llama.cpp build (docs/hrx.md). Two pinned sources, the pair
-# AMD's integration repo (ROCm/ggml-staging-automation) builds and tests together:
+# The HRX llama.cpp build (docs/hrx.md). Two pinned sources, the pair AMD's integration repo
+# (ROCm/ggml-staging-automation) builds and tests together:
 #
-#   third_party/llama.cpp   1bit-MONSTER/llama.cpp 1bit/hrx-vulkan: AMD's
-#                           hrx-graph-develop-v2 (ggml-hrx) on ggml-org llama.cpp
+#   third_party/llama.cpp   1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched: AMD's
+#                           hrx-graph-develop-v2 (ggml-hrx) on ggml-org llama.cpp, plus ours
 #   third_party/hrx-system  ROCm/hrx-system: libhrx, loomc and the Loom tools
 #
 # llama.cpp's ggml-hrx builds hrx-system itself when given HRX_SOURCE_DIR, with
@@ -26,6 +26,8 @@
 # mode, which requires TheRock's own aqlprofile-sdk headers (absent from our
 # /opt/rocm-therock); unset, hrx-system fetches its pinned HSA/AQL headers.
 # .github/workflows/bump-hrx.yml moves both pins when AMD moves its pair.
+# Only HRX0 and the CPU are built: no Vulkan, ROCm/HIP or CUDA backend (RFC #213 stage 3). The
+# branch name still says "vulkan" (AMD's pair carried both); the engine no longer builds it.
 include(ExternalProject)
 
 set(ONEBIT_HRX_TOOLCHAIN "/opt/rocm-therock" CACHE PATH "ROCm/TheRock root: its amdclang builds llama.cpp and HRX")
@@ -59,7 +61,7 @@ ExternalProject_Add(llama_hrx
         -DCMAKE_C_COMPILER=${ONEBIT_HRX_TOOLCHAIN}/bin/amdclang
         -DCMAKE_CXX_COMPILER=${ONEBIT_HRX_TOOLCHAIN}/bin/amdclang++
         -DHRX_SOURCE_DIR=${CMAKE_SOURCE_DIR}/third_party/hrx-system
-        -DGGML_HRX=ON -DGGML_VULKAN=ON -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON
+        -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
     BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
     INSTALL_COMMAND ""

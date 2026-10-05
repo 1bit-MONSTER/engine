@@ -17,18 +17,6 @@
 # --npu-models for npu: a Q4NX directory with its lane kernels in npu/, docs/npu.md)
 # [<TAB> extra `1bit serve` args]. One model per architecture a
 # backend maps, where a model file is at hand on Strix Halo.
-vulkan	Qwen3-0.6B-Q4_K_M.gguf
-vulkan	qwen2.5-7b-instruct-q4_k_m-merged.gguf
-vulkan	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
-vulkan	Qwen3.6-35B-A3B-Q8_0.gguf
-vulkan	GLM-4.7-Flash-Q4_K_M.gguf
-vulkan	MiniCPM4-8B-Q4_K_M.gguf
-vulkan	MiniCPM5-1B-Q4_K_M.gguf
-vulkan	zaya1-8b-Q4_K_M.gguf	--ctx-size	8192
-vulkan	zyphra/Zamba2-1.2B-instruct-Q8_0.gguf	--ctx-size	4096
-vulkan	zyphra/Zamba2-2.7B-instruct-Q8_0.gguf	--ctx-size	4096
-vulkan	zyphra/Zamba2-7B-Instruct-Q8_0.gguf	--ctx-size	4096
-vulkan	zyphra/Zamba-7B-v1-Q8_0.gguf	--ctx-size	4096
 hrx	Qwen3-0.6B-Q4_K_M.gguf
 hrx	qwen2.5-7b-instruct-q4_k_m-merged.gguf
 hrx	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
@@ -37,11 +25,6 @@ hrx	GLM-4.7-Flash-Q4_K_M.gguf
 hrx	MiniCPM4-8B-Q4_K_M.gguf
 hrx	MiniCPM5-1B-Q4_K_M.gguf
 hrx	zaya1-8b-Q4_K_M.gguf	--ctx-size	8192
-zinc	Qwen3-0.6B-Q4_K_M.gguf
-zinc	qwen2.5-7b-instruct-q4_k_m-merged.gguf
-zinc	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf
-zinc	Qwen3.6-35B-A3B-Q8_0.gguf
-zinc	MiniCPM5-1B-Q4_K_M.gguf
 npu	Qwen3-0.6B
 npu	qwen2.5-7b-instruct-q4_k_m-merged.gguf
 npu	Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf

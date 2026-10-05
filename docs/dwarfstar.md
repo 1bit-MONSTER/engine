@@ -19,7 +19,7 @@ limitations under the License.
 [DwarfStar](https://github.com/antirez/ds4) (`antirez/ds4`, MIT) is a native
 inference engine written for a few large MoE models: DeepSeek V4 Flash (and V4.1
 Flash and PRO on bigger machines), GLM 5.2/5.3 Flash and Qwen3.8-Flash-Next. It has
-its own kernels for Metal, CUDA and ROCm, runs Strix Halo (`gfx1151`) as a first-class
+its own kernels for Metal, CUDA and ROCm (the engine builds only its HIP backend), runs Strix Halo (`gfx1151`) as a first-class
 target, and can stream routed experts from the SSD. It is not a general GGUF runner:
 it loads its own GGUF layouts (`antirez/deepseek-v4-gguf`,
 `antirez/deepseek-v4.1-flash-gguf`, and the others its `download_model.sh` lists), and
@@ -40,16 +40,16 @@ for a hand rebase.
 
 ```
 git submodule update --init --depth 1 third_party/ds4
-cmake -B build -G Ninja -DONEBIT_DS4=ON        # ONEBIT_DS4_BACKEND=rocm|cuda|metal|cpu
+cmake -B build -G Ninja -DONEBIT_DS4=ON        # HIP (gfx1151) only
 cmake --build build
 ```
 
-`scripts/build-ds4.sh <prefix> [backend]` does the work: it builds a copy of the
-source under `<prefix>/src/<backend>` (DwarfStar builds in its tree; the submodule
-stays clean) and puts `ds4-server`, `ds4` and `ds4-bench` in `<prefix>/<backend>`.
+`scripts/build-ds4.sh <prefix>` does the work: it builds a copy of the
+source under `<prefix>/src/hip` (DwarfStar builds in its tree; the submodule
+stays clean) and puts `ds4-server`, `ds4` and `ds4-bench` in `<prefix>/hip`.
 `DS4_TEST=1` then runs DwarfStar's model-free routed-MoE test on the GPU.
 
-**ROCm (Strix Halo)** needs HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA and hipCUB. The
+**HIP (Strix Halo)** needs HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA and hipCUB. The
 script takes `ROCM_PATH`, else TheRock's SDK
 (`/opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel`), else `/opt/rocm`.
 It passes that SDK's `include/` with `-isystem`: clang otherwise searches it after
@@ -109,7 +109,7 @@ DwarfStar yet: a package with one is refused with the tensor's name.
 
 | Check | Result |
 |---|---|
-| `DS4_TEST=1 scripts/build-ds4.sh build/ds4 rocm` | builds; routed-MoE MXFP4 test PASS (0 failures at 128 and 512 tokens, variants bitwise OK) |
+| `DS4_TEST=1 scripts/build-ds4.sh build/ds4` | builds; routed-MoE MXFP4 test PASS (0 failures at 128 and 512 tokens, variants bitwise OK) |
 | `-DONEBIT_DS4=ON` engine build | builds; ctest 7/7 |
 | `1bit serve --device ds4 -m <missing file>` | DwarfStar's "cannot open model", then serve exits: backend did not become ready |
 | `--ssd-streaming` with another device | refused |

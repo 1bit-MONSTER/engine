@@ -27,7 +27,7 @@ here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
-"$bin" serve -m "$scratch/tiny.gguf" --device vulkan --port "$port" --alias smoke-model \
+"$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias smoke-model \
     --llama-server "$here/fake_backend.py" >"$scratch/serve.log" 2>&1 &
 pid=$!
 cleanup() { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
@@ -58,7 +58,7 @@ if [ "$(uname)" = Linux ]; then
     check "no backend outlives serve (SIGKILL)" '! kill -0 "$child" 2>/dev/null'
 fi
 
-both=$("$bin" serve -m "$scratch/tiny.gguf" --device vulkan --mtp a.gguf --dflash b.gguf 2>&1); both_rc=$?
+both=$("$bin" serve -m "$scratch/tiny.gguf" --device cpu --mtp a.gguf --dflash b.gguf 2>&1); both_rc=$?
 check "--mtp with --dflash is refused" '[ "$both_rc" != 0 ] && [[ "$both" == *"pick one"* ]]'
 
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo FAIL; exit 1; fi

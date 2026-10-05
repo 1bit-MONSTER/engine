@@ -17,8 +17,9 @@
 # `1bit serve --laya` with the GGUF scorer (ggmlc's `laya daemon`, docs/laya.md), without a GPU
 # or a model: a fake daemon (ONEBIT_LAYA_GGML) answers by keyword and records what it was asked,
 # the pinned GGUF name under $ONEBIT_LAYA_MODEL/gguf/ is an empty file, and fake llama-servers
-# and zinc answer with their device (tests/route-policy-e2e.json: code -> hrx, prose -> zinc,
-# short -> vulkan; an HRX build has no Vulkan candidate, so short falls back to hrx). It checks that
+# answer with their device (tests/route-policy-e2e.json: code -> hrx, prose, short and long_doc
+# -> cpu, default cpu; a build with HRX offers hrx and cpu, and one without offers cpu only, so
+# code falls back to cpu there). It checks that
 #   - serve starts the daemon (daemon <gguf> --family typed-decisions --device hrx) with the HSA
 #     runtime HRX needs (IREE_HAL_AMDGPU_LIBHSA_PATH, from --hrx-libhsa) and needs no safetensors
 #     checkpoint,
@@ -32,10 +33,10 @@
 set -uo pipefail
 
 bin=${1:?usage: laya_gguf_route.sh path/to/1bit}
-# --device auto's GPU route: HRX0 in a build with HRX, Vulkan0 in one without, like CI's (#270)
-gpu=Vulkan0
-if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu=HRX0; fi
-gpu_lc=$(echo "$gpu" | sed 's/0$//' | tr 'A-Z' 'a-z')
+# the GPU candidate (gguf_devices() in app/serve.cpp): hrx in a build with HRX, which offers cpu
+# beside it; one without, like CI's, offers cpu only
+gpu_lc=cpu
+if grep -q "^ONEBIT_HRX:BOOL=ON" "$(dirname "$bin")/CMakeCache.txt" 2>/dev/null; then gpu_lc=hrx; fi
 here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
 pid=
@@ -83,7 +84,7 @@ check "ONEBIT_LAYA_DEVICE=npu without the NPU add-on says how to build it" '[[ "
 
 LAYA_LOG="$scratch/daemon.log" ONEBIT_LAYA_GGML="$scratch/laya-daemon.py" ONEBIT_LAYA_MODEL="$scratch/laya" \
     "$bin" serve -m "$scratch/tiny.gguf" --device auto --laya --route-policy "$here/route-policy-e2e.json" \
-    --port "$port" --llama-server "$here/fake_backend_route.py" --zinc "$here/fake_backend_route.py" \
+    --port "$port" --llama-server "$here/fake_backend_route.py" \
     --hrx-libhsa "$scratch/libhsa-runtime64.so.1" >"$scratch/serve.log" 2>&1 &
 pid=$!
 for _ in $(seq 1 300); do curl -sf -o /dev/null "$api/health" && break; sleep 0.1; done
@@ -101,12 +102,11 @@ ask() {  # <text>: the replying device, then the X-1bit-Route header
     tr -d '\r' < "$scratch/h" | sed -n 's/^[Xx]-1bit-[Rr]oute: //p'
 }
 out=$(ask "Write a Rust function that reverses a linked list.")
-check "code -> hrx ($(echo $out))" '[[ "$out" == "device:hrx"*"code 0.80 hrx"* ]]'
+check "code -> $gpu_lc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"code 0.80 $gpu_lc"* ]]'
 out=$(ask "Explain how vaccines train the immune system.")
-check "prose -> zinc ($(echo $out))" '[[ "$out" == "device:zinc"*"prose 0.80 zinc"* ]]'
+check "prose -> cpu ($(echo $out))" '[[ "$out" == "device:cpu"*"prose 0.80 cpu"* ]]'
 out=$(ask "What is 17*23?")
-# the test policy says vulkan; an HRX build has no Vulkan candidate and falls back to its first, hrx
-check "short -> $gpu_lc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"short 0.80 $gpu_lc"* ]]'
+check "short -> cpu ($(echo $out))" '[[ "$out" == "device:cpu"*"short 0.80 cpu"* ]]'
 
 q=$(sed -n 2p "$scratch/daemon.log")
 check "the daemon gets the request as state and the three classes" \
@@ -114,7 +114,7 @@ check "the daemon gets the request as state and the three classes" \
 
 asked=$(grep -c '"state"' "$scratch/daemon.log")
 out=$(ask "$(python3 -c 'print("log line 42: ok\n" * 80)')")
-check "a 1024+ character request is long_doc ($(echo $out))" '[[ "$out" == "device:$gpu_lc"*"long_doc 1.00 $gpu_lc"* ]]'
+check "a 1024+ character request is long_doc ($(echo $out))" '[[ "$out" == "device:cpu"*"long_doc 1.00 cpu"* ]]'
 check "  without asking the daemon" '[ "$(grep -c "\"state\"" "$scratch/daemon.log")" = "$asked" ]'
 
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo "--- daemon log"; cat "$scratch/daemon.log"; echo FAIL; exit 1; fi

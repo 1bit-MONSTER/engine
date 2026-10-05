@@ -23,13 +23,12 @@ OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|hrx|rocm|cpu|vulkan|zinc|ds4|mlx] [--ctx-size N] [--alias NAME]
-           [--llama-server PATH] [--zinc PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
-           [--prefill-device hrx] [--prefill-min-tokens N] [--lean]
+           [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]
+           [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
-           [--parallel N] [--adaptive] [--adaptive-at N]
+           [--parallel N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
 ```
@@ -49,9 +48,9 @@ One model per process:
 | `POST /tokenize`, `/detokenize`, `/apply-template` | llama-server devices |
 | `GET /slots`, `POST /slots/<id>?action=…`, `GET /props`, `GET /metrics` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
 
-"llama-server devices" means `vulkan`, `hrx` and `rocm`. These routes go to the llama-server
+"llama-server devices" means `hrx` and `cpu`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
-inherits it). On `npu`, `zinc`, `ds4` and `mlx` they answer 501.
+inherits it). On `npu`, `ds4` and `mlx` they answer 501.
 
 ## Where the model runs
 
@@ -59,15 +58,45 @@ inherits it). On `npu`, `zinc`, `ds4` and `mlx` they answer 501.
 |---|---|---|
 | NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | the private NPU route, in process, in builds with `-DONEBIT_NPU_PRIVATE` (docs/npu.md, "Private routes") |
-| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md). In a build without HRX, `auto` still means Vulkan, and so does `auto` for what HRX does not run yet, or runs well below Vulkan: an architecture the HRX build does not map (registry/architectures.json; among them Qwen3.8-Flash-Next and Zyphra Zamba, Zamba2 and BlackMamba), `--moe-slots`, `--parallel` on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next), `--mtp` (HRX drafts at 65-78% of Vulkan speed) and `--mmproj` (an open RFC #213 gate). Since the HRX prompt-matmul routing (llama.cpp fork #55), prompts on HRX run at pp512 335 tok/s on Qwen3.8-27B UD-Q4_K_XL (was 97-99; ROCm 365-368), and a 14K-token prompt through `serve` at 265 tok/s (was 91) |
-| `.gguf` | `vulkan` | the upstream llama.cpp build's llama-server on `Vulkan0` (docs/vulkan.md), while Vulkan is still in the build. It is leaving the engine (RFC #213) |
-| `.gguf` | `cpu` | llama-server with no GPU layers; `auto` on Windows, which has no GPU route yet (docs/windows.md) |
-| `.gguf` | `vulkan --prefill-device hrx` | the HRX build's llama-server decoding on `Vulkan0`, long prompt prefixes prefilled on `HRX0` over one shared KV cache (docs/hrx.md, "Prefill on HRX, decode on Vulkan") |
-| ROCmFP4 `.gguf` | `auto`, `vulkan` with `--lean` | the lean (ROCmFPX) build's llama-server on `Vulkan0` (docs/lean.md) |
-| `.gguf` | `rocm` | the ROCm build's llama-server on `ROCm0` (ROCmFPX's tree, `ONEBIT_LEAN_ROCM`); ROCmI4 files take its W4A4 path (docs/lean.md) |
-| `.gguf` | `zinc` | this build's ZINC (Vulkan, ROCm or CUDA, whichever it was built for; docs/zinc.md) |
-| DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (ROCm, CUDA or Metal; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
+| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md), `--mtp` included. Since the HRX prompt-matmul routing (llama.cpp fork #55), prompts on HRX run at pp512 335 tok/s on Qwen3.8-27B UD-Q4_K_XL (was 97-99), and a 14K-token prompt through `serve` at 265 tok/s (was 91). `auto` exceptions: below |
+| `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` on Windows (no GPU route yet, docs/windows.md) and in a build without HRX |
+| DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 | Hugging Face id | `mlx` | lemon-mlx-engine's server, on Apple Silicon (docs/apple.md) |
+
+What `--device auto` does with a `.gguf` that HRX has no route for. Until RFC #213 stage 3 these
+fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
+
+| Case | `auto` |
+|---|---|
+| an architecture our llama.cpp does not build: anything outside `gguf_architectures.hrx` in registry/architectures.json, which `tools/registry_build.py` reads from the pinned fork and the build compiles in (among them Qwen3.8-Flash-Next's `qwen4exp`; Zyphra Zamba, Zamba2, BlackMamba; Spark2.5, BailingMoeV3, HRM text, MuseGlimmer, Kimi K3, Maple, GraniteSwitch, Granite SWA, HY v4, MiniMax, Dots3 Note, PocketTTS, Qwen3-TTS) | refused on hrx and cpu, pointing at Lemonade's llamacpp backend; Zyphra and Flash-Next are to be ported to HRX |
+| `--moe-slots` | refused: not in this build ([below](#moe-models-larger-than-memory---moe-slots)) |
+| `--parallel N` > 1 on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) | HRX0 with one slot, and a warning on stderr: HRX runs one such sequence at a time (no multi-sequence delta-net yet). `--device cpu` keeps `--parallel N` |
+| `--mmproj` | HRX0. **Unverified:** vision on HRX is an open RFC #213 gate, to be checked on ZAYA1-VL; if it fails there, `auto` goes back to the CPU for `--mmproj` |
+| `--mtp` | HRX0 (it drafts slower there than Vulkan did: its verify batches of 2-4 tokens are the open item, docs/hrx.md) |
+| an H32 file (a Hadamard-rotated Q4_0 stamped `onebit.hadamard_q4_0`) | refused on every device: the format is dropped; use the model's UD-Q4_K_XL or another standard GGUF. PrismML's own rotation (`prism.hadamard`, Ternary Bonsai) is a different thing and still runs on HRX ([hrx.md](hrx.md#ternary-bonsai-prismmls-hadamard-folded-ggufs)) |
+
+### Removed devices and flags
+
+The engine builds no Vulkan or ROCm llama.cpp (RFC #213 stage 3; owner direction
+2026-10-01: HRX + NPU, zero Vulkan, zero ROCm), and no ZINC since the core strip (2026-10-04).
+Lemonade ships its own llamacpp backends for those
+([lemonade.md](lemonade.md#vulkan-rocm-and-cuda-are-lemonades)). `serve` exits at once, with the reason,
+when asked for any of these:
+
+| Asked for | What it was |
+|---|---|
+| `--device vulkan` | upstream llama.cpp's release on `Vulkan0` |
+| `--device rocm` | the ROCmFPX tree's ROCm build on `ROCm0` |
+| `--lean` | ROCmFPX's ROCmFP4 / ROCmI4 formats |
+| `--prefill-device hrx`, `--prefill-min-tokens` | Vulkan decode with the prompt prefilled on HRX0 over one shared KV cache |
+| `--adaptive`, `--adaptive-at` | Vulkan for the first requests, ROCm batching the overflow |
+| `--long-model`, `--long-from` | long conversations to a Hadamard-rotated Q4_0 on the ROCm W4A4 route |
+| `--device zinc`, `--zinc PATH` | ZINC (zolotukhin/zinc), a Zig GGUF engine on Vulkan, ROCm or CUDA |
+
+The DFlash2 one-server route (a Hadamard-rotated file with W4A4 prompts and DFlash2 decode on ROCm)
+went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min-0.4`), and so did
+the H32 format it served (`tools/hadamard_q4_0.py` is removed; serve refuses those files). `--dflash`
+itself stays, on HRX and the CPU.
 
 A build without the private add-on answers a Qwen3.6-35B-A3B directory with "the
 Qwen3.6-35B-A3B NPU route is not part of this build; build with
@@ -85,9 +114,8 @@ also opens `<think>\n` when thinking is on, as that model's template does.
 
 For a `.gguf` the engine starts that server as a private child on a loopback
 port and forwards the OpenAI routes to it, streaming included. Replies carry
-the served model name. For ZINC, which rejects foreign model ids, requests go
-out without `model`. `auto` means HRX for GGUF: Vulkan is leaving the engine (RFC #213), and
-HRX decodes within 10% of it on the gate models (docs/hrx.md). With `--laya` (or
+the served model name. `auto` means HRX for GGUF: it met RFC #213's decode gates (docs/hrx.md), and
+it is the engine's only GPU route. With `--laya` (or
 `--laya-model DIR`), Laya classifies each conversation and the route policy picks the device:
 the built-in policy sends every class to HRX, long documents included, since HRX prefills
 Qwen3.8-27B at 335 tok/s pp512 (docs/laya.md). The first turn of
@@ -98,18 +126,18 @@ PM4-emulation probe, and then HRX registers no device. `serve` sets
 `IREE_HAL_AMDGPU_LIBHSA_PATH` itself unless you did. It uses `--hrx-libhsa`,
 else the build's copy, else the first one under `/opt/rocm-therock`.
 
-The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_ZINC`, `-DONEBIT_DS4`),
-then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_ZINC` / `$ONEBIT_DS4`, then `llama-server` / `zinc` / `ds4-server` on PATH.
+The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
+then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH.
 
 ## Images (`--mmproj`)
 
 `--mmproj <mmproj.gguf>` hands llama-server a vision projector on the llama.cpp routes
-(vulkan, hrx, rocm). Chat messages may then carry `image_url` parts (a `data:` URL or a file
+(hrx, cpu; `auto` picks the CPU until HRX vision is checked). Chat messages may then carry `image_url` parts (a `data:` URL or a file
 URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes from
 `convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. With it, llama-server runs
 with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that attend to an image
-bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B are in
-[docs/vulkan.md](vulkan.md). The NPU, ZINC, DwarfStar, MLX and ONNX routes take no `--mmproj`.
+bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B were checked on the
+removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU, DwarfStar, MLX and ONNX routes take no `--mmproj`.
 
 ## Multi-token prediction (`--mtp`)
 
@@ -117,22 +145,13 @@ bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B are
 own MTP head (Unsloth ships it as `MTP/mtp-<model>-*.gguf`) drafts tokens on the same
 device, and the model checks them in one batch. `--mtp-max N` caps the draft length;
 `--mtp-p-min P` drafts a token only when the head is at least that sure of it.
-It works on the llama.cpp devices (`vulkan`, `hrx`, `rocm`).
+It works on the llama.cpp devices (`hrx`, `cpu`), and `--device auto` keeps it on HRX0.
+A drafted token is kept only when the model agrees, so the output is the model's own. HRX's MTP
+numbers are in [hrx.md](hrx.md) ("Not yet": Qwen3.8-27B with its Q4_0 MTP head).
 
-Measured through `1bit serve` on Strix Halo, Qwen3.8-27B UD-Q4_K_XL with its Q4_0 MTP
-head, decode tok/s on three chat prompts (code / prose / short), 2026-09-24:
-
-| Route | Without `--mtp` | With `--mtp` |
-|---|---|---|
-| `--device vulkan` (upstream pin) | 12.2 / 12.0 / 12.0 | **35.0 / 28.3 / 28.9** |
-| `--device rocm` | 11.8 / 11.8 / 12.2 | 38.8 / 20.6 / 16.9 |
-| `--device rocm --mtp-max 3` | | 27.1 / 19.2 / 19.9 |
-
-Vulkan with MTP is the pick: 2.4-2.9x on every prompt, same file, same accuracy (a
-drafted token is kept only when the model agrees). ROCm edges it on code only.
-
-The full sweep on Vulkan (draft length x `--mtp-p-min`, code / prose / short; 12.2 / 12.3 / 12.3
-without MTP):
+The measurements below were taken on the removed Vulkan build (2026-09-24) and are kept for the
+settings they found; re-measure on HRX before relying on the speeds. The sweep (draft length x
+`--mtp-p-min`, code / prose / short; 12.2 / 12.3 / 12.3 without MTP):
 
 | Setting | tok/s | Drafts accepted |
 |---|---|---|
@@ -144,7 +163,7 @@ without MTP):
 Use the default for chat and `--mtp-max 6 --mtp-p-min 0.5` for code (3.4x): code is
 predictable enough to keep long drafts, prose is not. Draft length 8 collapses on every
 prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
-opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s on Vulkan) every draft model
+opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s then) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
 
 ### Qwen3.8-Flash-Next: drafting from part of the vocabulary
@@ -154,7 +173,8 @@ is the model's 644 MiB Q8_0 output matrix, read three times per decode step at d
 A draft only proposes; the model checks every token, so the head can be cut down to the
 tokens it is likely to propose. `tools/mtp_draft_vocab.py` writes such a head from Unsloth's
 *shared* head file and the model's own output rows. Our llama.cpp fork (`qwen4exp`,
-`src/models/qwen4exp-draft-vocab.cpp`) runs it:
+`src/models/qwen4exp-draft-vocab.cpp` on the removed Vulkan branch) ran it; it comes back with the
+HRX port of Flash-Next:
 
 ```sh
 python3 tools/mtp_draft_vocab.py \
@@ -204,10 +224,11 @@ hf download Qwen/Qwen3.8-27B --include "*.json" "*.jinja" "merges.txt" "vocab.js
 hf download z-lab/Qwen3.8-27B-DFlash2 --local-dir DFlash2
 python convert_hf_to_gguf.py DFlash2 --target-model-dir Qwen3.8-27B-hf --outtype bf16 --outfile dflash2-bf16.gguf
 llama-quantize dflash2-bf16.gguf dflash2-q8_0.gguf Q8_0
-1bit serve -m Qwen3.8-27B-Q4_0.gguf --device vulkan --dflash dflash2-q8_0.gguf
+1bit serve -m Qwen3.8-27B-Q4_0.gguf --dflash dflash2-q8_0.gguf
 ```
 
-Measured through `1bit serve --device vulkan` on Strix Halo, Qwen3.8-27B Q4_0 (Unsloth), the
+Measured through `1bit serve` on the removed Vulkan build on Strix Halo (not yet re-measured on
+HRX), Qwen3.8-27B Q4_0 (Unsloth), the
 same three chat prompts as above (code / prose / short, decode tok/s), runs back to back on a
 shared box, 2026-09-28:
 
@@ -222,19 +243,15 @@ short answers (the translation prompt stops after ~16 tokens, too few to fill bl
 drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A drafted token is
 kept only when the model agrees, so the output is the model's own.
 
-`--dflash` also works on the lean ROCm route: a Hadamard-rotated Q4_0 file gets W4A4 prompt
-processing and DFlash2 decode from one server, 518 t/s prompt and 46.0 / 28.4 / 17.6 tok/s decode
-([lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). `--dflash` gets
-`--spec-draft-p-min` from a [recipe](recipes.md) (0.4 on rocm, 0 elsewhere) unless `--mtp-p-min` is given, and without `--mtp-max` drafts the
-drafter's block minus one (its `dflash.block_size`; 16 when the file does not say). Any drafter
-type works next to a Hadamard-rotated file, plain Q4_0 included: the backend rotates the activations
-of the rotated file's weights only. Qwen3.8-27B-H32 with a Q4_0 DFlash2 drafter runs as fast as with
-the Q8_0 one.
+Without `--mtp-max`, `--dflash` drafts the drafter's block minus one (its `dflash.block_size`; 16
+when the file does not say). Our HRX llama.cpp's default draft p-min is already 0, which keeps
+DFlash blocks whole; `--mtp-p-min` sets another. (The DFlash2 one-server route on the lean ROCm
+build is gone, above.)
 
 ## Recipes (`--recipes`, `--no-recipes`)
 
-Tuned llama-server settings that depend on the model and route, such as a MoE file's
-micro-batch size or a DFlash drafter's p-min, are recipes in `config/recipes.json`. Each one
+Tuned llama-server settings that depend on the model and route, such as a DFlash drafter's
+p-min, are recipes in `config/recipes.json`. Each one
 carries the measurement behind it. Serve prints each recipe it applies. Anything serve sets
 itself wins over a recipe. `--recipes FILE` replaces the built-in set and `--no-recipes` turns
 recipes off ([recipes.md](recipes.md)). To measure a setting before making it a recipe, use
@@ -242,9 +259,14 @@ recipes off ([recipes.md](recipes.md)). To measure a setting before making it a 
 
 ## MoE models larger than memory (`--moe-slots`)
 
-`--moe-slots N` (with `--device vulkan`) keeps a MoE model's routed experts in the file and
+**Not in this build.** `--moe-slots` is kept (the option, `--moe-subst`, `--moe-prefetch` and
+serve's code for them), but the expert streamer lives in the removed Vulkan llama.cpp pin. Until it
+moves to HRX together with Qwen3.8-Flash-Next, `serve` refuses `--moe-slots` with "not available in
+this build". What follows describes it as it ran on Vulkan0 (docs/moe-streaming.md).
+
+`--moe-slots N` keeps a MoE model's routed experts in the file and
 holds N of them, across all layers, in GPU memory. Decode reads the missing ones from the drive
-as the router picks them. The rest of the model loads on Vulkan0 as usual.
+as the router picks them. The rest of the model loads on the GPU as usual.
 
 ```sh
 1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --moe-slots 4608 --ctx-size 8192
@@ -252,8 +274,7 @@ as the router picks them. The rest of the model loads on Vulkan0 as usual.
 
 Qwen3-Coder-30B has 6,144 experts; at 4,608 slots it decodes 39 tok/s warm, at 1,536 about
 6-7 (docs/moe-streaming.md, "Streaming in the inference path"). A model that fits in memory is
-faster without it (79-91 tok/s resident). It works with the Vulkan pin's llama-server only, not
-with `--prefill-device`.
+faster without it (79-91 tok/s resident).
 
 `--moe-subst R` trades a little accuracy for fewer reads: when the router picks an expert that
 is not in memory, a resident one among its next choices takes its place if it scores at least
@@ -282,108 +303,30 @@ docs/moe-streaming.md, Next.
 together, one read of the weights per step for all of them (continuous batching, what
 vLLM is built on). `--ctx-size` is split across the slots, so size it for all of them.
 
-Total decode tok/s with 1-16 simultaneous 256-token requests, 16 slots, 2026-09-24:
+On HRX, `--parallel N` shares one KV cache across the slots (`-kvu`) so attention stays on the
+GPU, and turns off AMD's Qwen attention path, which ignores the other sequences. HRX does not yet
+run a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) with more than one sequence: `serve`
+refuses `--parallel` > 1 there, and without `--parallel` gives those models one slot.
 
-| Requests | Qwen3.8-27B UD-Q4_K_XL, Vulkan | ... ROCm | Qwen3-Coder-30B-A3B Q4_K_M, Vulkan | ... ROCm |
-|---|---|---|---|---|
-| 1 | 11.8 | 11.6 | 85.7 | 67.6 |
-| 2 | 21.7 | 20.1 | 125.8 | 100.2 |
-| 4 | 36.9 | 30.2 | 182.4 | 140.3 |
-| 8 | **50.9** | 35.6 | **228.2** | 200.4 |
-| 16 | 42.9 | **68.0** | 202.9 | **318.9** |
-
-Vulkan peaks at 8 requests and falls back at 16; ROCm keeps scaling to 16, where it
-serves 5.8x (27B) and 3.7x (Coder) the best single stream. Use `--device vulkan` for up
-to about 8 concurrent users, `--device rocm --parallel 16` beyond that. Two backends
-decoding at once, by comparison, add 18% (docs/lean.md).
-
-## Growing with the load (`--adaptive`)
-
-No single setting wins at every load. One request is fastest on Vulkan with `--mtp`; up to
-8 are fastest batched on Vulkan; past that ROCm keeps scaling (the tables above). And MTP
-and batching do not mix: a server with MTP loaded batches at about two thirds of the
-throughput (Qwen3.8-27B, 4 requests: 24.9 tok/s with MTP loaded, 36.9 without), even with
-each request's draft length set to 0.
-
-`--adaptive` runs two backends, the model loaded on each: Vulkan with `--adaptive-at`
-slots (and `--mtp` if given) and ROCm with 16 slots (never MTP). A request goes to Vulkan
-while Vulkan holds fewer than `--adaptive-at` requests, and to ROCm otherwise; choosing
-and reserving the slot is one locked step.
-
-Qwen3.8-27B UD-Q4_K_XL, total tok/s by simultaneous requests (2026-09-24):
-
-| Requests | 1 | 2 | 4 | 8 | 12 | 16 | 24 |
-|---|---|---|---|---|---|---|---|
-| **`--adaptive --adaptive-at 8`** | 12.0 | 21.9 | 36.3 | **49.9** | 43.5 | 44.7 | **63.5** |
-| `--adaptive --mtp` (at 1) | 20.1 | 15.3 | 24.7 | 32.8 | 50.1 | 59.0 | 40.7 |
-| `--device vulkan --parallel 8` | 11.8 | 21.7 | 36.9 | 50.9 | | 42.9 (16) | |
-| `--device rocm --parallel 16` | 11.6 | 20.1 | 30.2 | 35.6 | | 68.0 | |
-
-- **Serving many users: `--adaptive --adaptive-at 8`.** It matches Vulkan batching up to
-  8 requests and keeps climbing past it (63.5 at 24, where Vulkan alone falls back). At
-  12-16 the two backends contend for the GPU and it dips below ROCm alone.
-- **One user at a time: `--mtp` without `--adaptive`** (35-42 tok/s). `--adaptive --mtp`
-  gives the lone request MTP speed but trails at every larger load.
-
-```sh
-1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --adaptive --adaptive-at 8 --ctx-size 65536
-```
-
-It needs both builds (`ONEBIT_VULKAN`, and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`) and memory for
-two copies of the model; `--ctx-size` applies to each backend and is split across its
-slots. On exit, serve logs how many requests each backend took.
-
-## Short and long prompts (`--long-model`)
-
-What a user waits for is the first token plus the answer. With a short prompt the faster
-decode wins (Vulkan); with a long one the faster prefill does (the W4A4 route, from about
-2,000 prompt tokens; [lean.md](lean.md#end-to-end-time-to-first-token-and-effective-speed)).
-`--long-model` serves the same model both ways: `-m` on its usual route, and a Hadamard-rotated
-Q4_0 of it (`tools/hadamard_q4_0.py`) on ROCm with W4A4. A conversation whose first request has
-`--long-from` prompt tokens or more (default 2048; chats are counted through the model's
-template) goes to the rotated file, the rest to `-m`. A conversation stays where its first
-request went, so its prompt cache stays useful as it grows. Each response carries
-`X-1bit-Route: short|long <tokens> <device>`.
-
-```sh
-1bit serve -m Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf --long-model Qwen3-Coder-30B-A3B-Q4_0-H32.gguf --ctx-size 20480
-```
-
-The rotated file is published as
-[1bit-MONSTER/Qwen3-Coder-30B-A3B-Q4_0-H32-GGUF](https://huggingface.co/1bit-MONSTER/Qwen3-Coder-30B-A3B-Q4_0-H32-GGUF);
-`tools/hadamard_q4_0.py` makes one for another model.
-
-Qwen3-Coder-30B-A3B, 256 output tokens, effective tok/s (output tokens over the whole wait;
-`tools/e2e_bench.py`, 2026-09-28):
-
-| Prompt tokens | 512 | 2,048 | 8,192 | 16,384 |
-|---|---|---|---|---|
-| Vulkan, Q4_K_M | **70.7** | 52.1 | 20.3 | 8.6 |
-| ROCm W4A4, rotated Q4_0 | 66.6 | **55.0** | **27.0** | **13.4** |
-| **`--long-model`** | **71.3** | 53.1 | 25.5 | 13.1 |
-
-The `--long-model` row ran while another job used the box's memory bus, which cost its long
-side 2-5% against the W4A4 row. A rotated MoE file now runs 1024-token micro-batches (`-ub 1024`; a dense one keeps 512, [lean.md](lean.md)),
-which raises the W4A4 prefill 6-10% (server-reported 2,217 / 1,742 / 1,295 tok/s at 2K / 8K /
-16K, from 2,000 / 1,607 / 1,221): a 16K-token prompt's first token at 12.96 s instead of 13.89. Both files stay loaded (here 17 + 16 GiB). It needs the Vulkan
-build and `ONEBIT_LEAN` + `ONEBIT_LEAN_ROCM`, and `-m` on a llama-server route (vulkan, hrx or
-rocm); it does not combine with `--laya`, `--adaptive` or `--mmproj`.
+The earlier measurements here (Vulkan and ROCm batching, and `--adaptive`, which ran both) went
+with those builds (RFC #213 stage 3); see this page at
+[0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/serve.md#many-requests-at-once---parallel).
+`--adaptive` and `--long-model` are refused now ([above](#removed-devices-and-flags)).
 
 ## RAG (`--embed`, `--rerank`)
 
 `--embed MODEL.gguf` serves `/v1/embeddings` and `--rerank MODEL.gguf` serves `/v1/rerank`,
 each from its own llama-server beside the chat model (`--embedding`, `--reranking`, the whole input
 in one batch). In a build with HRX that server runs on `HRX0` with one slot and inputs of up to 2048
-tokens (HRX runs one sequence per batch); a build without HRX keeps Vulkan, 4 slots and 8192 tokens. `/v1/models` lists them with their
+tokens (HRX runs one sequence per batch); a build without HRX runs it on the CPU, 4 slots and 8192 tokens. `/v1/models` lists them with their
 role. A RAG client embeds its documents, retrieves by cosine similarity, reranks the best
 few and asks the chat model with them as context, all against the one server:
 
 `--embedding` and `--reranking` serve the model itself in that role, as Lemonade loads
 embedding and reranking models: `1bit serve -m nomic-embed-text-v2-moe.Q8_0.gguf --embedding`.
-They run on `vulkan`, `hrx` or `rocm`. On Strix Halo (2026-10-02, HRX0 against Vulkan0, two
-repeats each): Qwen3-Embedding-0.6B Q8_0 embeddings repeat bit for bit on HRX, cosine 0.99961-0.99988
-to Vulkan's; bge-reranker-v2-m3 Q8_0 scores repeat exactly and rank the same as Vulkan's (8.609 /
--6.756 / -0.401 / -11.020 against 8.614 / -6.757 / -0.361 / -11.019). jina-reranker-v1-tiny still
+They run on `hrx` or `cpu` (`auto`: HRX where the build has it). On Strix Halo (2026-10-02, two
+repeats each): Qwen3-Embedding-0.6B Q8_0 embeddings repeat bit for bit on HRX; bge-reranker-v2-m3
+Q8_0 scores repeat exactly (8.609 / -6.756 / -0.401 / -11.020). jina-reranker-v1-tiny still
 fails on HRX: its JIT can't link the fp32 matmul-with-bias kernel it needs.
 
 ```sh
@@ -415,9 +358,6 @@ So use embeddings with a wide context and no reranker: retrieval is about 25 ms,
 few thousand extra prompt tokens cost little at 270-320 tok/s prefill. `--rerank` stays
 for larger corpora, where cutting 50 candidates to 8 matters more.
 
-Long retrieved contexts are where `--prefill-device hrx` pays (26% on an 8192-token
-request, above).
-
 ## Verified (Strix Halo, 2026-09-23)
 
 `tests/serve_e2e.sh` with Qwen3-0.6B: the Q4_K_M GGUF for the GPU devices and the Q4NX model directory for the NPU. The test checks `/health` 200,
@@ -427,14 +367,14 @@ streaming:
 | Device | Result |
 |---|---|
 | `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory on the fast lane |
-| `vulkan` | PASS (32 SSE chunks) |
 | `hrx` | PASS (32 SSE chunks), with no environment set up |
-| `zinc` | PASS (6 SSE chunks) |
 
 Qwen3.6-35B-A3B on the NPU is tested by the private add-on (docs/npu.md, "Private routes").
 Without it, `serve` on that directory exits with the message above.
 
-ctest runs these as `serve_e2e_<device>` when configured with
+(The `vulkan` row, PASS with 32 SSE chunks, went with the Vulkan build, and the `zinc` row, PASS
+with 6, with ZINC.) With `-DONEBIT_HRX=ON`,
+ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`, and in general `serve_e2e_<device>`, when configured with
 `-DONEBIT_SERVE_TEST_GGUF=<gguf>` (and `serve_e2e_mlx` on macOS with
 `-DONEBIT_MLX_SERVER`). `smoke_serve` runs everywhere, CI included:
 `tests/fake_backend.py` stands in for llama-server. It checks the proxy (`/health`,

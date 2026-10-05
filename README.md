@@ -18,22 +18,20 @@ limitations under the License.
 
 **Documentation:** [1bit.gg](https://1bit.gg/) · **Measured results:** [wiki](https://github.com/1bit-MONSTER/engine/wiki) · **Community:** [Discord](https://discord.gg/fa5m4Vawpa)
 
+**Site:** [github.com/1bit-MONSTER/site](https://github.com/1bit-MONSTER/site) (builds 1bit.gg from this repository's README.md and docs/) · **Kernel build:** [github.com/1bit-MONSTER/kernel](https://github.com/1bit-MONSTER/kernel)
+
 **The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade stays
 the server you talk to (its catalog, downloads, router and UI), and for the models it hands to 1bit,
 Lemonade runs the engine as one of its backends, the same way it runs `llama-server`. The engine
 serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
 - the XDNA 2 NPU engine
-- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the default GPU route ([docs/hrx.md](docs/hrx.md))
-- Vulkan, while it is leaving the engine (RFC #213): `--device vulkan` still runs upstream llama.cpp's latest release, but `--device auto` now means HRX ([docs/vulkan.md](docs/vulkan.md))
-- MoE experts streamed from the drive on Vulkan (`1bit serve --moe-slots N`), for MoE models larger than memory ([docs/moe-streaming.md](docs/moe-streaming.md#streaming-in-the-inference-path))
-- a lean option, ROCmFPX's ROCmFP4 and ROCmI4 formats: faster, less accurate ([docs/lean.md](docs/lean.md))
-- ZINC, which also reaches NVIDIA GPUs (CUDA) and Apple GPUs (Metal)
+- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the engine's one GPU route ([docs/hrx.md](docs/hrx.md)), and the CPU from the same llama.cpp build
+- MoE experts streamed from the drive (`1bit serve --moe-slots N`), for MoE models larger than memory: kept, but not in this build until it moves to HRX with Qwen3.8-Flash-Next ([docs/moe-streaming.md](docs/moe-streaming.md))
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming
 - MLX on Apple Silicon, through lemon-mlx-engine
 - ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs
-- ComfyUI.cpp: ComfyUI workflows (Stable Diffusion 1.5 text-to-image and image-to-image) in C++, matching ComfyUI's output to 50 dB ([docs/comfyui.md](docs/comfyui.md))
 - every Hugging Face model architecture, kept current by a daily census
 
 Every tuned setting `1bit serve` gives a backend is a recipe with its measurement attached
@@ -45,31 +43,23 @@ Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonad
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release ships on Sunday,
 4 October 2026.
 
-> **Direction:** the engine is moving to HRX (AMD's ggml-hrx, kernels in Loom) plus the NPU.[^geramyl] HRX met the decode gates in
-> [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213) and is the default GPU route now; Vulkan
-> leaves the engine in stages, as the features that still need it are ported to HRX or dropped.
+> **Direction:** the engine is HRX (AMD's ggml-hrx, kernels in Loom or HIP) plus the NPU.[^geramyl] HRX met the decode gates in
+> [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213), and its stage 3 removed the
+> engine's Vulkan and ROCm llama.cpp builds, with `--lean`, `--adaptive`, `--long-model` and
+> `--prefill-device`. What HRX does not run, Lemonade serves with its own llamacpp backends.
 >
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
-> [docs/serve.md](docs/serve.md)); the NPU, Vulkan, HRX and ZINC each pass its end-to-end test on
+> [docs/serve.md](docs/serve.md)); the NPU and HRX each pass its end-to-end test on
 > Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
-> suite on Vulkan and HRX. Following a review,[^geramyl] the engine no longer
+> suite on HRX. Following a review,[^geramyl] the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
-> ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), Vulkan from upstream llama.cpp's latest release ([docs/vulkan.md](docs/vulkan.md)), the NPU engine on full ELFs with the
+> ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), the NPU engine on full ELFs with the
 > upstream XDNA stack pinned ([docs/npu.md](docs/npu.md); its layer kernel is not yet built from
-> source), ZINC ([docs/zinc.md](docs/zinc.md)) and MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
-> runs from our llama.cpp on Vulkan, HRX and ROCm, matching transformers, at 93 tok/s decode in
-> Q4_K_M on Vulkan, and ZAYA1-74B-preview at 35 tok/s
-> ([docs/vulkan.md](docs/vulkan.md#zaya1-zyphra-from-our-llamacpp)); the rest of Zyphra's
-> family (Zamba, Zamba2, BlackMamba) runs on Vulkan too, and so do its vision models, ZAYA1-VL-8B
-> and Zamba2-VL, through `1bit serve --mmproj`. Qwen3.8-27B runs in one ROCm server with Hadamard
-> W4A4 prompt processing and DFlash2 decode: 518 tok/s on a 1,800-token prompt and 46 tok/s
-> decode on code ([docs/lean.md](docs/lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing)). On ROCm the
-> 256-wide attention heads of Qwen3.5/3.8 run on a WMMA kernel of ours: a 32K-token prompt at 310 tok/s
-> instead of 260 ([docs/lean.md](docs/lean.md#long-prompts-256-wide-attention-heads)). W4A4 covers MoE
-> experts too, and `1bit serve --long-model` sends long prompts there and short ones to Vulkan: on
-> Qwen3-Coder-30B-A3B a 16K-token prompt gets its answer at 13.1 effective tok/s against 8.6 on
-> Vulkan alone, first token 11 s sooner ([docs/serve.md](docs/serve.md#short-and-long-prompts---long-model)). Experimental,
+> source) and MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
+> runs from our llama.cpp on HRX, matching transformers, at about 90 tok/s decode in Q4_K_M
+> ([docs/hrx.md](docs/hrx.md)). The rest of Zyphra's family (Zamba, Zamba2, BlackMamba) and
+> Qwen3.8-Flash-Next ran only on the removed Vulkan build; they are to be ported to HRX. Experimental,
 > and closed source: Qwen3.6-35B-A3B on the NPU through a private add-on, parity against fp64 passes,
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). GGUFs of six architectures
 > (Qwen2.5, Qwen3 MoE, Qwen3.6-35B-A3B, MiniCPM4/5, GLM-4.7-Flash) also answer on the NPU through
@@ -78,8 +68,8 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > ([docs/dwarfstar.md](docs/dwarfstar.md)). Step 4, the Laya router, has landed as an opt-in:
 > `1bit serve --laya` classifies each conversation (code, prose, short, long document; 95.5% on
 > 200 labelled requests) and a measured policy picks the device; the scorer runs on HRX at
-> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 332,726
-> HF text-generation models with an architecture, 94.88% are mapped to a backend and 64.33%
+> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 334,413
+> HF text-generation models with an architecture, 94.71% are mapped to a backend and 64.2%
 > have an architecture checked end to end on Strix Halo; a daily census keeps the counts
 > current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,
 > our private development repository; see [docs/PORTING.md](docs/PORTING.md).
@@ -108,14 +98,13 @@ The repositories this engine is built on, in order of importance:
 | 2 | [Xilinx/XRT](https://github.com/Xilinx/XRT) | The runtime every NPU kernel runs through: full ELFs, hardware contexts, buffers | Apache-2.0 (userspace) |
 | 3 | [Xilinx/mlir-aie](https://github.com/Xilinx/mlir-aie) | IRON and aiecc: how our own NPU kernels are written and compiled | Apache-2.0 WITH LLVM-exception |
 | 4 | [Xilinx/llvm-aie](https://github.com/Xilinx/llvm-aie) | Peano, the C++ compiler for the NPU's AI Engine cores | Apache-2.0 WITH LLVM-exception |
-| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU: Vulkan (upstream release) and HRX (AMD's tested pair) | MIT |
+| 5 | [ggml-org/llama.cpp](https://github.com/ggml-org/llama.cpp) | GGUF inference on the Radeon iGPU through HRX (AMD's tested pair), and on the CPU | MIT |
 | 6 | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) | HRX, AMD's HIP Runtime Extended, behind the HRX0 device | Apache-2.0 |
 | 7 | [torvalds/linux](https://github.com/torvalds/linux) | The kernel, with `amdxdna` and `amdgpu` in-tree | GPL-2.0 WITH Linux-syscall-note |
-| 8 | [zolotukhin/zinc](https://github.com/zolotukhin/zinc) | Its own GPU kernels, and the engine's route to NVIDIA through CUDA | MIT |
-| 9 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
-| 10 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
-| 11 | [ROCm/FastFlowLM](https://github.com/ROCm/FastFlowLM) | The Q4NX NPU model format and its models on Hugging Face (`FastFlowLM/*-NPU2`), which the engine's NPU route runs on its own kernels | MIT |
-| 12 | [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) | DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next on its own kernels (ROCm on Strix Halo, CUDA, Metal) | MIT |
+| 8 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
+| 9 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
+| 10 | [ROCm/FastFlowLM](https://github.com/ROCm/FastFlowLM) | The Q4NX NPU model format and its models on Hugging Face (`FastFlowLM/*-NPU2`), which the engine's NPU route runs on its own kernels | MIT |
+| 11 | [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) | DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next on its own kernels (ROCm on Strix Halo, CUDA, Metal) | MIT |
 
 Also built on [nlohmann/json](https://github.com/nlohmann/json) (MIT)
 and [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT).

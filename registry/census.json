@@ -4,28 +4,16 @@
   "models": 418387,
   "with_architecture": 334413,
   "architectures_seen": 2696,
-  "mapped_models": 317171,
-  "mapped_pct": 94.84,
-  "checked_models": 214707,
+  "mapped_models": 316720,
+  "mapped_pct": 94.71,
+  "checked_models": 214690,
   "checked_pct": 64.2,
   "per_backend": {
-   "vulkan": {
-    "mapped": 317171,
-    "checked": 214707,
-    "mapped_pct": 94.84,
-    "checked_pct": 64.2
-   },
    "hrx": {
-    "mapped": 316825,
+    "mapped": 316720,
     "checked": 214690,
-    "mapped_pct": 94.74,
+    "mapped_pct": 94.71,
     "checked_pct": 64.2
-   },
-   "zinc": {
-    "mapped": 233135,
-    "checked": 34553,
-    "mapped_pct": 69.71,
-    "checked_pct": 10.33
    },
    "npu": {
     "mapped": 180709,
@@ -128,12 +116,12 @@
     "models": 79
    },
    {
-    "architecture": "Glm5NextForConditionalGeneration",
-    "models": 77
+    "architecture": "Qwen4ExpForConditionalGeneration",
+    "models": 78
    },
    {
-    "architecture": "MarianForCausalLM",
-    "models": 76
+    "architecture": "Glm5NextForConditionalGeneration",
+    "models": 77
    }
   ]
  },

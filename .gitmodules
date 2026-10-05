@@ -13,8 +13,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# HRX + Vulkan (docs/hrx.md). Only needed with -DONEBIT_HRX=ON. The pair is AMD's
-# tested integration (ROCm/ggml-staging-automation); .github/workflows/bump-hrx.yml keeps it current.
+# HRX (docs/hrx.md), the engine's GPU route; also the tree of the CPU llama-server (Windows).
+# Needed with -DONEBIT_HRX=ON. The pair is AMD's tested integration (ROCm/ggml-staging-automation);
+# .github/workflows/bump-hrx.yml keeps it current. The branch name still says "vulkan": AMD's pair
+# carried a Vulkan backend too, which the engine no longer builds (RFC #213 stage 3).
 [submodule "third_party/hrx-system"]
 	path = third_party/hrx-system
 	url = https://github.com/ROCm/hrx-system.git
@@ -29,18 +31,6 @@
 	path = third_party/xdna-driver
 	url = https://github.com/amd/xdna-driver.git
 	branch = main
-# ZINC (docs/zinc.md): upstream zolotukhin/zinc, built by scripts/build-zinc.sh;
-# .github/workflows/bump-zinc.yml keeps it current.
-[submodule "third_party/zinc"]
-	path = third_party/zinc
-	url = https://github.com/zolotukhin/zinc.git
-	branch = main
-# Linux kernel (docs/kernel.md): upstream torvalds/linux at a release tag, built
-# by scripts/build-kernel.sh; .github/workflows/bump-linux.yml keeps it current.
-[submodule "third_party/linux"]
-	path = third_party/linux
-	url = https://github.com/torvalds/linux.git
-	shallow = true
 # Laya (docs/laya.md): the step-4 router's upstream source, NandhaKishorM/laya.
 # The model checkpoints are pinned by Hugging Face revision in config/laya.json
 # and fetched by scripts/fetch-laya.sh; .github/workflows/bump-laya.yml keeps both current.
@@ -55,20 +45,6 @@
 	path = third_party/tokenizers
 	url = https://github.com/huggingface/tokenizers.git
 	shallow = true
-[submodule "third_party/llama.cpp-vulkan"]
-	path = third_party/llama.cpp-vulkan
-	url = https://github.com/1bit-MONSTER/llama.cpp.git
-	branch = 1bit/vulkan-upstream
-	shallow = true
-[submodule "third_party/llama.cpp-rocmfpx"]
-	path = third_party/llama.cpp-rocmfpx
-	url = https://github.com/1bit-MONSTER/ROCmFPX.git
-	shallow = true
-	branch = 1bit/vulkan-rocmi4
-[submodule "third_party/comfyui.cpp"]
-	path = third_party/comfyui.cpp
-	url = https://github.com/1bit-MONSTER/comfyui.cpp.git
-	branch = master
 # Lemonade (docs/lemonade.md): the host the engine runs inside. Our fork, upstream
 # lemonade-sdk/lemonade plus the onebit recipe; pinned so the engine is tested against a
 # known Lemonade. Never linked; scripts/build-lemonade.sh builds lemond from it, and

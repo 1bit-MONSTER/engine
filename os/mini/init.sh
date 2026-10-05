@@ -15,7 +15,7 @@
 # limitations under the License.
 #
 # 1bit OS init (os/mini): everything runs from RAM; the internal disk is never mounted.
-export PATH=/bin:/sbin:/usr/bin:/usr/sbin HOME=/root
+export PATH=/bin:/sbin:/usr/bin:/usr/sbin:/opt/1bit-llama HOME=/root
 mount -t proc proc /proc
 mount -t sysfs sysfs /sys
 mount -t devtmpfs devtmpfs /dev
@@ -48,6 +48,15 @@ for i in $(seq 20); do
 done
 if [ -n "$data" ]; then mount "$data" /data && echo "models: /data/models (from $data)"; fi
 
+# HRX: TheRock's HSA runtime (1bit serve also finds it at its compiled-in path), and the Loom
+# kernel cache on the stick, so kernels compiled on the first boot are reused after a reboot
+[ -s /etc/1bit/libhsa ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$(cat /etc/1bit/libhsa)"
+if grep -q " /data " /proc/mounts && mkdir -p /data/cache/hrx-jit 2>/dev/null; then
+    export GGML_HRX_JIT_CACHE_DIR=/data/cache/hrx-jit
+else
+    export GGML_HRX_JIT_CACHE_DIR=/tmp/hrx-jit
+fi
+
 # SSH: key logins only, keys from the stick; the host key is made once and kept there
 if [ -s /data/ssh/authorized_keys ]; then
     mkdir -p /root/.ssh && cp /data/ssh/authorized_keys /root/.ssh/ && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys
@@ -61,14 +70,14 @@ fi
 if [ -f /data/1bit.conf ]; then
     . /data/1bit.conf
     if [ -n "$MODEL" ]; then
-        1bit serve -m "$MODEL" --device "${DEVICE:-vulkan}" --host 0.0.0.0 --port "${PORT:-8000}" $ARGS > /tmp/serve.log 2>&1 &
+        1bit serve -m "$MODEL" --device "${DEVICE:-auto}" --host 0.0.0.0 --port "${PORT:-8000}" $ARGS > /tmp/serve.log 2>&1 &
         echo "serving $MODEL on port ${PORT:-8000} (log: /tmp/serve.log)"
     fi
 fi
 
-echo "GPU: $(ls /dev/dri/renderD* 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
+echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
-echo; echo "Serve a model:  1bit serve -m /data/models/<file.gguf> --device vulkan --host 0.0.0.0"; echo
+echo; echo "Serve a model:  1bit serve -m /data/models/<file.gguf> --host 0.0.0.0   (auto: HRX0)"; echo
 
 # 1bit.check on the kernel command line: check the userspace starts, report, power off (for CI
 # and for QEMU, which has neither the GPU nor the NPU)
@@ -76,7 +85,14 @@ if grep -q "1bit.check" /proc/cmdline; then
     ok=1
     1bit --help >/dev/null 2>&1 && echo "CHECK 1bit: runs" || { echo "CHECK 1bit: FAILED"; ok=0; }
     /opt/1bit-llama/llama-server --version >/dev/null 2>&1 && echo "CHECK llama-server: runs" || { echo "CHECK llama-server: FAILED"; ok=0; }
-    [ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so ] && echo "CHECK XRT XDNA plugin: present" || { echo "CHECK XRT: FAILED"; ok=0; }
+    if [ -s /etc/1bit/libhsa ]; then
+        [ -e "$(cat /etc/1bit/libhsa)" ] && echo "CHECK HSA runtime (HRX): present" || { echo "CHECK HSA runtime: FAILED"; ok=0; }
+    else
+        echo "CHECK HSA runtime: none (a CPU-only test image)"
+    fi
+    if [ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so ]; then echo "CHECK XRT XDNA plugin: present"
+    elif [ -e /etc/1bit/no_xrt ]; then echo "CHECK XRT XDNA plugin: left out (test image)"
+    else echo "CHECK XRT: FAILED"; ok=0; fi
     [ -e /lib/firmware/amdnpu/17f0_11 ] && echo "CHECK NPU firmware: present" || { echo "CHECK NPU firmware: FAILED"; ok=0; }
     dropbear -V 2>&1 | grep -q Dropbear && echo "CHECK dropbear: runs" || { echo "CHECK dropbear: FAILED"; ok=0; }
     echo "CHECK modules: $(find /lib/modules -name '*.ko*' | wc -l) kernel modules, amdgpu $(modinfo -F version amdgpu >/dev/null 2>&1 && echo found || echo MISSING)"

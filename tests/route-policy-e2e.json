@@ -1,11 +1,11 @@
 {
- "about": "tests/laya_route_e2e.sh only: one device per class, so routing by class is observable with fake backends. Not a measured policy.",
+ "about": "tests/laya_route_e2e.sh and laya_gguf_route.sh only: code to hrx, the rest to cpu, so routing by class is observable with fake backends. Not a measured policy.",
  "min_confidence": 0.0,
- "default": "vulkan",
+ "default": "cpu",
  "classes": {
   "code": {"device": "hrx", "why": "test"},
-  "prose": {"device": "zinc", "why": "test"},
-  "short": {"device": "vulkan", "why": "test"},
-  "long_doc": {"device": "vulkan", "why": "test"}
+  "prose": {"device": "cpu", "why": "test"},
+  "short": {"device": "cpu", "why": "test"},
+  "long_doc": {"device": "cpu", "why": "test"}
  }
 }

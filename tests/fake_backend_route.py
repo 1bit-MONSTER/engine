@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# fake_backend_route.py: stands in for llama-server (--device Vulkan0/HRX0,
-# --port) and zinc (-p) in tests/laya_route_e2e.sh, so the Laya per-request
+# fake_backend_route.py: stands in for llama-server (--device HRX0, or -ngl 0 on
+# the CPU; --port) in tests/laya_route_e2e.sh and laya_gguf_route.sh, so the Laya per-request
 # router is tested without a GPU. It names the device it stands in for in every
 # reply, so the test can see which backend a request reached.
 import json
@@ -29,8 +29,10 @@ argv = sys.argv[1:]
 def device():
     if "--device" in argv:
         d = argv[argv.index("--device") + 1]
-        return "hrx" if "HRX" in d else "vulkan"
-    return "zinc"  # zinc is the only backend started without --device
+        return "hrx" if "HRX" in d else d.lower()
+    if "-ngl" in argv and argv[argv.index("-ngl") + 1] == "0":
+        return "cpu"
+    sys.exit("fake_backend_route.py: neither --device nor -ngl 0 in " + " ".join(argv))
 
 
 dev = device()

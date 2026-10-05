@@ -1,29 +1,4 @@
 {
   "about": "Tuned llama-server settings per model and route, applied by `1bit serve` (docs/recipes.md). A recipe never overrides a flag already on the backend's command line or a variable already set. Every recipe carries the measurement behind it; re-measure with tools/bench.py before changing one.",
-  "recipes": [
-    {
-      "id": "rotated-moe-ub1024",
-      "match": {"device": ["rocm"], "hadamard_q4_0": true, "moe": true},
-      "args": ["-ub", "1024"],
-      "why": "W4A4 expert matmuls fill the matrix units better with 1024-token micro-batches; 2048 is no better.",
-      "measured": "Qwen3-Coder-30B-A3B-Q4_0-H32, llama-bench pp2048 2,001 -> 2,158, pp16384 1,227 -> 1,283; decode unchanged. Dense Qwen3.8-27B-H32 is slower with it (1,838-token prompt 491-495 -> 471-473 tok/s), so dense files keep 512.",
-      "source": "engine #205, #229"
-    },
-    {
-      "id": "rocm-dflash-p-min-0.4",
-      "match": {"device": ["rocm"], "drafter": ["dflash"]},
-      "args": ["--spec-draft-p-min", "0.4"],
-      "why": "Stops a DFlash2 block at the first candidate the selector is less than 40% sure of: code keeps its full blocks, prose and short answers stop paying to verify guesses that fail. Listed before dflash-p-min-0, so it wins on rocm.",
-      "measured": "Qwen3.8-27B-H32 + DFlash2 Q8_0 on the lean ROCm route, tools/bench.py 2 rounds, decode median code / prose / short: p-min 0 41.9 / 24.8 / 13.4, 0.2 42.0 / 25.7 / 13.7, 0.4 41.9 / 26.8 / 16.7, 0.6 39.7 / 24.1 / 15.5 tok/s.",
-      "source": "engine #238"
-    },
-    {
-      "id": "dflash-p-min-0",
-      "match": {"drafter": ["dflash"]},
-      "args": ["--spec-draft-p-min", "0"],
-      "why": "A DFlash block is only worth drafting whole; the ROCm tree's default p-min of 0.75 cuts it short (upstream's default is 0).",
-      "measured": "Qwen3.8-27B-H32 + DFlash2 on the lean ROCm route: mean accepted block 5.4 -> 6.7 tokens on code.",
-      "source": "engine #194"
-    }
-  ]
+  "recipes": []
 }

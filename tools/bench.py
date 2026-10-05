@@ -22,7 +22,7 @@ and each result is reported against the baseline measured in the same run. The t
 person reading the numbers, runs every measurement: prompt speed on one long prompt, decode
 speed on three chat prompts (code, prose, short), greedy, as `serve` reports them.
 
-  tools/bench.py -m Qwen3.8-27B-Q4_0-H32.gguf \\
+  tools/bench.py -m Qwen3.8-27B-UD-Q4_K_XL.gguf \\
       --config base= --config dflash='--dflash Qwen3.8-27B-DFlash2-q8_0.gguf' \\
       --lock ~/.cache/lax-decode/box.lock --json out.json
 """

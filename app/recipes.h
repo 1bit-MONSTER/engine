@@ -28,17 +28,16 @@ namespace onebit {
 
 // What a recipe can match on, for one backend launch.
 struct RecipeFacts {
-    std::string device;             // vulkan, hrx, rocm
+    std::string device;             // hrx, cpu
     std::string architecture;       // general.architecture of the -m file
     bool moe = false;               // <architecture>.expert_count > 0
-    bool hadamard_q4_0 = false;     // stamped by tools/hadamard_q4_0.py
     std::string drafter = "none";   // none, mtp, dflash
 };
 
 struct Recipe {
     std::string id, why, measured, source;
     std::vector<std::string> device, architecture, drafter;  // empty: any
-    int moe = -1, hadamard_q4_0 = -1;                         // -1: any, else 0 / 1
+    int moe = -1;                                             // -1: any, else 0 / 1
     std::vector<std::string> args;                            // llama-server flags and values
     std::vector<std::pair<std::string, std::string>> env;     // backend environment
 

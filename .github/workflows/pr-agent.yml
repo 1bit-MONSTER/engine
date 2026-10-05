@@ -14,7 +14,7 @@
 # limitations under the License.
 #
 # PR-Agent (qodo-ai/pr-agent) reviews every pull request with a local model: Qwen3-Coder-30B-A3B
-# (Q4_K_M, about 18 GB resident, thinking off) served by the engine itself (`1bit serve`, Vulkan) on
+# (Q4_K_M, about 18 GB resident, thinking off) served by the engine itself (`1bit serve`; it ran on Vulkan, which RFC #213 stage 3 removes: the service moves to HRX) on
 # the Strix Halo box, at 127.0.0.1:8090 (the coder-llm user service). The job runs on that box's self-hosted runner
 # (label pr-agent), so no code leaves it and there is no API key. Settings: .pr_agent.toml.
 #

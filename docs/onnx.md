@@ -44,10 +44,12 @@ The engine does not ship Ryzen AI Software. With it installed, the same build se
 
 `ONEBIT_ONNX_SERVER` or `--device onnx` with another `ryzenai-server` on `PATH` overrides the build's.
 
+On Windows the engine builds no ONNX server: `1bit.exe` uses the `ryzenai-server.exe` Lemonade installs for its `ryzenai-server` backend (under `$LEMONADE_CACHE_DIR`, else `%USERPROFILE%\.cache\lemonade`, in `bin\ryzenai-server\npu`). Lemonade publishes that server for Windows only, so Linux keeps building it from `third_party/ryzenai-server`.
+
 ## The GPU
 
 The engine no longer builds ONNX Runtime with its WebGPU provider. That provider runs on Dawn over
-Vulkan, and Vulkan is leaving the engine (RFC #213, [HRX](hrx.md)). It ran Qwen3-4B at 52.9 tok/s
+Vulkan, and the engine builds no Vulkan (RFC #213 stage 3, [HRX](hrx.md)). It ran Qwen3-4B at 52.9 tok/s
 against 26.8 on the CPU (2026-09-26). ONNX models run on the CPU, or on the NPU with Ryzen AI
 Software; GPU work goes through HRX.
 
@@ -63,5 +65,5 @@ llama-server's extra routes (`/tokenize`, `/slots`, …) answer 501 on `--device
 
 ## Next
 
-- **Windows.** Done for the CPU: `scripts/build-windows.sh` builds `ryzenai-server.exe` ([Windows](windows.md)). The GPU on Windows would need ONNX Runtime's DirectML builds, whose `DirectML.dll` is under Microsoft's redistributable licence rather than MIT.
+- **Windows.** `--device onnx` runs Lemonade's `ryzenai-server.exe` ([Windows](windows.md)); the engine no longer builds one. Not yet run against a Lemonade install on Windows.
 - **The Ryzen AI NPU.** On a machine with Ryzen AI Software installed.

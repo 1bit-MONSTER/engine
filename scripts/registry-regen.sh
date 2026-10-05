@@ -16,11 +16,11 @@
 #
 # Regenerate registry/architectures.json for the pins in HEAD and fold it into HEAD.
 # The bump workflows run this right after committing a new pin, because CI's registry_pins
-# test fails a pin that moved without the registry. It fetches only the three trees the
-# registry reads (llama.cpp, llama.cpp-vulkan, zinc), each at its pinned commit, depth 1.
+# test fails a pin that moved without the registry. It fetches only the tree the
+# registry reads (llama.cpp), at its pinned commit, depth 1.
 set -euo pipefail
 cd "$(git rev-parse --show-toplevel)"
-for s in third_party/llama.cpp third_party/llama.cpp-vulkan third_party/zinc; do
+for s in third_party/llama.cpp; do
   git submodule update --init --depth 1 -- "$s"
 done
 python3 tools/registry_build.py

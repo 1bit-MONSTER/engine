@@ -15,10 +15,10 @@
 # limitations under the License.
 #
 # How `1bit serve` applies recipes (config/recipes.json, docs/recipes.md), without a GPU:
-#   - the built-in recipes: a rotated MoE file gets -ub 1024 and says so on stderr, a rotated
-#     dense file does not, --dflash gets --spec-draft-p-min 0.4 on rocm (the rocm recipe is listed
-#     first, so it wins over dflash-p-min-0) and 0 on vulkan,
-#   - a flag serve already set wins (--mtp-p-min 0.5 stays the only p-min),
+#   - the built-in set is empty (RFC #213 stage 3 dropped the ROCm-measured recipes): serve adds
+#     nothing, with or without a drafter,
+#   - a recipe file's flag is added and named on stderr, and a flag serve already set wins
+#     (--mtp-p-min 0.5 stays the only p-min),
 #   - --no-recipes adds nothing, --recipes FILE replaces the built-in set (flags and environment),
 #   - a malformed recipe file stops serve with the reason.
 #
@@ -34,20 +34,19 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
 python3 - "$scratch" <<'PY'
 import struct, sys
-def gguf(path, stamp, arch="llama", ints={}):
+def gguf(path, arch="llama", ints={}):
     kv = []
     def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
     kv.append(s("general.architecture") + struct.pack("<I", 8) + s(arch))
-    if stamp:
-        kv.append(s("onebit.hadamard_q4_0") + struct.pack("<I", 5) + struct.pack("<i", 32))
     for k, v in ints.items():
         kv.append(s(k) + struct.pack("<I", 4) + struct.pack("<I", v))
     open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
 d = sys.argv[1]
-gguf(d + "/dense.gguf", True)
-gguf(d + "/moe.gguf", True, "qwen3moe", {"qwen3moe.expert_count": 128})
-gguf(d + "/plain.gguf", False)
-gguf(d + "/draft.gguf", False, "dflash", {"dflash.block_size": 8})
+gguf(d + "/moe.gguf", "qwen3moe", {"qwen3moe.expert_count": 128})
+gguf(d + "/plain.gguf")
+gguf(d + "/draft.gguf", "dflash", {"dflash.block_size": 8})
+open(d + "/pmin.json", "w").write("""{"recipes": [{"id": "pmin", "match": {"drafter": ["dflash"]},
+  "args": ["--spec-draft-p-min", "0"], "measured": "test"}]}""")
 open(d + "/mine.json", "w").write("""{"recipes": [{"id": "mine", "match": {"architecture": ["llama"]},
   "args": ["--threads", "7"], "env": {"ONEBIT_RECIPE_TEST": "1"}, "measured": "test"}]}""")
 open(d + "/bad.json", "w").write("""{"recipes": [{"id": "bad", "match": {"archtecture": ["llama"]},
@@ -86,22 +85,19 @@ after() { field "$1" "r[\"argv\"][r[\"argv\"].index(\"$2\")+1] if \"$2\" in r[\"
 count() { field "$1" "r[\"argv\"].count(\"$2\")"; }
 
 run "$scratch/moe.gguf" "$scratch/moe.json"
-check "a rotated MoE file gets -ub 1024 from rotated-moe-ub1024" '[ "$(after "$scratch/moe.json" -ub)" = 1024 ]'
-check "  and serve names the recipe on stderr" 'grep -q "recipe rotated-moe-ub1024: -ub 1024" "$scratch/moe.json.log"'
-
-run "$scratch/dense.gguf" "$scratch/dense.json"
-check "a rotated dense file keeps llama-server's micro-batch" '[ "$(after "$scratch/dense.json" -ub)" = None ]'
-
-run "$scratch/moe.gguf" "$scratch/none.json" --no-recipes
-check "--no-recipes adds nothing" '[ "$(after "$scratch/none.json" -ub)" = None ] && ! grep -q recipe "$scratch/none.json.log"'
-
-run "$scratch/dense.gguf" "$scratch/df.json" --dflash "$scratch/draft.gguf"
-check "--dflash on rocm gets --spec-draft-p-min 0.4 from rocm-dflash-p-min-0.4" '[ "$(after "$scratch/df.json" --spec-draft-p-min)" = 0.4 ] && [ "$(count "$scratch/df.json" --spec-draft-p-min)" = 1 ]'
+check "the built-in set adds nothing to a MoE file" '[ "$(after "$scratch/moe.json" -ub)" = None ] && ! grep -q recipe "$scratch/moe.json.log"'
 
 run "$scratch/plain.gguf" "$scratch/dfv.json" --dflash "$scratch/draft.gguf"
-check "--dflash on vulkan gets --spec-draft-p-min 0 from dflash-p-min-0" '[ "$(after "$scratch/dfv.json" --spec-draft-p-min)" = 0 ]'
+check "  nor to --dflash" '[ "$(after "$scratch/dfv.json" --spec-draft-p-min)" = None ] && ! grep -q recipe "$scratch/dfv.json.log"'
 
-run "$scratch/dense.gguf" "$scratch/dfp.json" --dflash "$scratch/draft.gguf" --mtp-p-min 0.5
+run "$scratch/plain.gguf" "$scratch/dfr.json" --dflash "$scratch/draft.gguf" --recipes "$scratch/pmin.json"
+check "a recipe file's --dflash recipe adds --spec-draft-p-min 0" '[ "$(after "$scratch/dfr.json" --spec-draft-p-min)" = 0 ] && [ "$(count "$scratch/dfr.json" --spec-draft-p-min)" = 1 ]'
+check "  and serve names the recipe on stderr" 'grep -q "recipe pmin" "$scratch/dfr.json.log"'
+
+run "$scratch/plain.gguf" "$scratch/none.json" --dflash "$scratch/draft.gguf" --recipes "$scratch/pmin.json" --no-recipes
+check "--no-recipes adds nothing" '[ "$(after "$scratch/none.json" --spec-draft-p-min)" = None ] && ! grep -q recipe "$scratch/none.json.log"'
+
+run "$scratch/plain.gguf" "$scratch/dfp.json" --dflash "$scratch/draft.gguf" --mtp-p-min 0.5 --recipes "$scratch/pmin.json"
 check "a flag serve set wins: --mtp-p-min 0.5 is the only p-min" '[ "$(after "$scratch/dfp.json" --spec-draft-p-min)" = 0.5 ] && [ "$(count "$scratch/dfp.json" --spec-draft-p-min)" = 1 ]'
 
 run "$scratch/plain.gguf" "$scratch/mine-run.json" --recipes "$scratch/mine.json"

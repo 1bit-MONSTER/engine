@@ -39,8 +39,8 @@ num_max_findings = 6
 persistent_comment = true
 extra_instructions = """
 This is the 1bit engine: a C++26 inference engine behind an OpenAI-compatible API (`1bit serve`), running inside
-Lemonade, on AMD Strix Halo's XDNA 2 NPU (fast lane, the from-scratch dx kernels), the Radeon iGPU (HRX and
-Vulkan through pinned llama.cpp builds), ROCm, ZINC and MLX. Review like an engineer who runs this on the hardware:
+Lemonade, on AMD Strix Halo's XDNA 2 NPU (fast lane, the from-scratch dx kernels), the Radeon iGPU (HRX
+through a pinned llama.cpp build; no Vulkan or ROCm llama.cpp since RFC #213 stage 3), DwarfStar, ONNX and MLX. Review like an engineer who runs this on the hardware:
 - correctness first: tensor shapes and strides, KV-cache positions and rollback, bf16/f32 rounding (dx kernels
   round to nearest even), NPU hardware-context and runlist lifetimes, lifetimes of child processes and ports;
 - C++: ownership and RAII, no allocations in per-token loops, exceptions reaching main, thread safety of shared state;

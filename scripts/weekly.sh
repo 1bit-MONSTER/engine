@@ -42,8 +42,8 @@ DRY=${WEEKLY_DRY_RUN:-0}
 # the box is shared: a capped build leaves room for whatever else runs on Sunday
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
-# the submodules the packages are built from (linux, laya and comfyui.cpp only on their bumps)
-SUBMODULES=(hrx-system llama.cpp llama.cpp-vulkan llama.cpp-rocmfpx zinc xdna-driver lemonade ryzenai-server ds4 tokenizers)
+# the submodules the packages are built from (laya only on its bump)
+SUBMODULES=(hrx-system llama.cpp xdna-driver lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
@@ -84,7 +84,7 @@ checkout() {  # checkout <ref> [pr number to merge on top]
         git -C "$SRC" -c user.name=weekly -c user.email=weekly@1bit.gg merge -q --no-edit FETCH_HEAD
     fi
     local mods=("${SUBMODULES[@]/#/third_party/}") m
-    for m in linux laya comfyui.cpp; do   # fetched only when that pin is what moves
+    for m in laya; do   # fetched only when that pin is what moves
         if [ -n "${2:-}" ] && ! git -C "$SRC" diff --quiet HEAD^1 HEAD -- "third_party/$m"; then
             mods+=("third_party/$m")
         fi
@@ -112,7 +112,7 @@ build() {
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DONEBIT_VULKAN=ON -DONEBIT_HRX=ON -DONEBIT_LEAN=ON -DONEBIT_ZINC=ON -DONEBIT_ONNX=ON \
+        -DONEBIT_HRX=ON -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
         -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT="$xdna/root/opt/xilinx/xrt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
@@ -145,7 +145,7 @@ pins_on_branch() {
 
 # a llama.cpp bump re-runs every model row registry/check_models.tsv lists for that backend
 # (the architectures only our fork has, such as zaya, and the MoE and Qwen rows among them)
-model_rows() {  # model_rows <vulkan|hrx>
+model_rows() {  # model_rows <hrx|npu>
     guard python3 "$SRC/tools/registry_check.py" "$BUILD/1bit" --models "$HOME/models" --only "$1" \
         > "$LOGS/models-$1.log" 2>&1 || return 1
     ! grep -q '^FAIL' "$LOGS/models-$1.log"
@@ -155,15 +155,12 @@ model_rows() {  # model_rows <vulkan|hrx>
 bump_check() {  # bump_check <branch>
     case "$1" in
         bump-hrx/*) model_rows hrx ;;
-        bump-llama-vulkan/*) model_rows vulkan ;;
         bump-lemonade/*) lemonade_suite ;;
         bump-laya/*)
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
             "$SRC/tests/laya_route_e2e.sh" "$BUILD/1bit" "$W/laya" >> "$LOGS/laya.log" 2>&1 ;;
-        bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" rocm > "$LOGS/ds4.log" 2>&1 ;;
-        bump-linux/*) guard "$SRC/scripts/build-kernel.sh" "$W/kernel" > "$LOGS/kernel.log" 2>&1 ;;
-        bump-comfyui/*) guard "$SRC/scripts/build-comfyui.sh" "$W/comfyui" > "$LOGS/comfyui.log" 2>&1 ;;
-        *) : ;;  # rocmfpx, zinc, xdna, tokenizers: covered by build + ctest
+        bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" > "$LOGS/ds4.log" 2>&1 ;;
+        *) : ;;  # xdna, tokenizers: covered by build + ctest
     esac
 }
 

@@ -20,20 +20,20 @@ On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prom
 decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
 and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
 
-It is one llama.cpp build with two GPU backends, ggml-hrx and ggml-vulkan (Vulkan leaves the engine in
-stages, RFC #213). Its single `llama-server` exposes both devices on Strix Halo:
+It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU. The engine builds no Vulkan or
+ROCm llama.cpp (RFC #213 stage 3); what HRX does not run, Lemonade serves with its own
+llamacpp backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
 
 ```
 HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
-Vulkan0: AMD Radeon 8060S Graphics (RADV STRIX_HALO)
 ```
 
-`1bit serve` runs GGUF models on either device with it ([serve.md](serve.md)):
+`1bit serve` runs GGUF models with it ([serve.md](serve.md)):
 
 | `--device` | Device | Serves |
 |---|---|---|
 | `hrx` (and `auto` for GGUF) | `HRX0` | AMD's ggml-hrx: the engine's GPU route |
-| `vulkan` | `Vulkan0` | upstream llama.cpp's Vulkan build, while it is still in the engine (RFC #213: it is leaving) |
+| `cpu` | the CPU | the same llama-server with no GPU layers |
 
 ## Pinned sources, kept current
 
@@ -291,21 +291,15 @@ also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -u
 
 `test-backend-ops -o MUL_MAT -b HRX0`: 287/287. `GGML_HRX_Q8_PREFILL_RELAX=0` turns this off too.
 
-### Hadamard-rotated Q4_0 files (llama.cpp #58)
+### Hadamard-rotated Q4_0 files ("H32", dropped)
 
-The files `tools/hadamard_q4_0.py` writes (`onebit.hadamard_q4_0 = 32`, [lean.md](lean.md#hadamard-rotated-q4_0-w4a4-prompt-processing))
-run on HRX with `1bit serve --device hrx`.
-
-- **How it works.** `src/llama-hadamard.cpp` reads the stamp and treats it as PrismML's `prism.hadamard`
-  transform with block 32 and no signs. The activations of the rotated Q4_0 weights get the same rotation,
-  as a matmul against the 32-point Walsh-Hadamard matrix, so nothing in the HRX backend changes.
-- **What it skips.** A Q4_0 lookup table such as `token_embd` is written in the plain basis and stays
-  plain. A stamped weight the model doesn't load (the MTP layer without `--mtp`) is skipped.
-- **Accuracy.** Qwen3.8-27B-Q4_0-H32 on `HRX0`, wikitext-2 40 x 512 against the BF16 logits: PPL 6.021,
-  KLD 0.0292, same top token 92.5%. Without the rotation the same file gives PPL 550,134.
-- **Speed (before #55).** pp512 63.5, pp2048 62.4, tg64 11.65 tok/s. HRX still sends Q4_0 prompt matmuls
-  down its generic path: #55 routes Q4_K, Q5_K and IQ4_XS only. Until Q4_0 gets the same routing,
-  `--device auto` keeps these files on the lean ROCm route.
+The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on HRX it was slower
+and less accurate than the UD-Q4_K_XL file of the same model (Qwen3.8-27B pp512 63.5 against 335
+tok/s; KLD 0.029 against 0.007 vs BF16), and the lean ROCm W4A4 route it was made for left with the
+ROCm build. `tools/hadamard_q4_0.py` is removed, and `1bit serve` refuses a file stamped
+`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`, llama.cpp
+#58) stays in the fork; it is the same code that rotates PrismML's files
+([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)), which keep running.
 
 ### Server memory: the graph program cache cap (llama.cpp #63)
 
@@ -343,45 +337,17 @@ program is rebuilt.
   (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
   `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
 
-The prefill split below is not affected by either: HRX0 only prefills whole ubatches
-there, and decoding is Vulkan's.
+### Prefill on HRX, decode on Vulkan (removed)
 
-### Prefill on HRX, decode on Vulkan
-
-HRX prefills faster than Vulkan and Vulkan decodes faster, on the same GPU.
-`1bit serve --device vulkan --prefill-device hrx` uses both: the HRX build's
-llama-server decodes on `Vulkan0`, and a second copy of the model on `HRX0` runs
-the prompt prefix. The two contexts share one KV cache with no copy: HRX owns it
-in its device memory and exports it as a dma-buf (HSA), Vulkan maps the same
-memory, and only the KV cell metadata (positions, sequences) moves between them.
-
-- **What runs on HRX:** the prompt prefix in whole ubatches (HRX prefill halves on
-  a partial one), from `--prefill-min-tokens` tokens (default 1024; below that the
-  split does not pay). The rest, and all decoding, run on Vulkan.
-- **Needs:** flash attention on both sides (`serve` passes `-fa on`), no LoRA, no
-  multimodal. The weights are loaded twice (once per device).
-- **Layout:** the shared region is cut into chunks of at most 1 GiB, each its own
-  dma-buf: Vulkan reads garbage from one buffer past about 4 GiB (a 40960-token
-  Qwen3-0.6B cache), and both sides must compute the same layout.
-
-Measured on Strix Halo, llama-server on `Vulkan0`, prefill / whole request:
-
-| Model | Prompt | Vulkan alone | HRX prefill + Vulkan |
-|---|---|---|---|
-| Qwen2.5-7B Q4_K_M | 2048 | 1541 / 4314 ms | **1078** / 3890 ms (-10%) |
-| Qwen2.5-7B Q4_K_M | 8192 | 7347 / 10376 ms | **4646** / 7668 ms (**-26%**) |
-| Qwen3-0.6B Q4_K_M | 8192 | 1289 / 2267 ms | **1089** / 2032 ms (-10%) |
-
-Decode on the shared KV is within 3% of Vulkan with its own KV. Against Vulkan
-alone, teacher-forced over 64 tokens, the split's mean KL is 0.0002-0.0006 nats
-(max 0.007) and the top token agrees on 64-65 of 65 positions; Q4_K_M against
-BF16 is 0.063.
+`--prefill-device hrx` left with the Vulkan build (RFC #213 stage 3): `1bit serve` refuses it.
+The fork still carries the zero-copy KV sharing code (below); what it did and how it measured is
+in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/hrx.md).
 
 ### Our patches
 
 `1bit/hrx-vulkan` is AMD's commit unchanged; `1bit/hrx-vulkan-patched` adds:
 
-- **Zero-copy KV sharing** (the section above): dma-buf export in ggml-hrx
+- **Zero-copy KV sharing** (unused by the engine since it builds no ggml-vulkan): dma-buf export in ggml-hrx
   (`ggml-hrx-dmabuf.cpp`), dma-buf import in ggml-vulkan (`ggml-vulkan-dmabuf.inc`),
   `llama_kv_share_next` / `llama_kv_share_from` / `llama_kv_cells_copy` in
   llama (`llama-kv-share.cpp`), and `ONEBIT_PREFILL_DEVICE` in llama-server
@@ -460,9 +426,9 @@ BF16 is 0.063.
 - **A cap on the graph program cache** ([llama.cpp #63](https://github.com/1bit-MONSTER/llama.cpp/pull/63)):
   `GGML_HRX_GRAPH_PROGRAM_CACHE`, default 64 ([section above](#server-memory-the-graph-program-cache-cap-llamacpp-63)).
 - **Hadamard-rotated Q4_0 files** ([llama.cpp #58](https://github.com/1bit-MONSTER/llama.cpp/pull/58)):
-  llama loads the engine's `onebit.hadamard_q4_0` files through `llama-hadamard`. Qwen3.8-27B-Q4_0-H32
-  on HRX vs BF16 (wikitext 40 x 512): PPL 6.021, KLD 0.0292, same top token 92.5%. Q4_0 prompt matmuls
-  still use the generic kernels.
+  llama loaded the engine's `onebit.hadamard_q4_0` ("H32") files through `llama-hadamard`; Qwen3.8-27B-Q4_0-H32
+  on HRX vs BF16 (wikitext 40 x 512): PPL 6.021, KLD 0.0292, same top token 92.5%. The engine has since
+  dropped the format ([above](#hadamard-rotated-q4_0-files-h32-dropped)).
 
 Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
 
@@ -475,17 +441,19 @@ Measured on Strix Halo (Qwen3-0.6B, perplexity over 8 x 512 wikitext tokens):
 
 `test-backend-ops -b HRX0`: 791 OK, 0 failed (on AMD's commit, about 1150 fail).
 Correct is not fast: the UD files run their IQ4_XS and sub-4-bit layers on the CPU
-(UD-Q4_K_XL 6303 / 246 tok/s, UD-Q2_K_XL 974 / 76), so they belong on `Vulkan0`.
+(UD-Q4_K_XL 6303 / 246 tok/s, UD-Q2_K_XL 974 / 76). (That was on AMD's commit; our later patches
+run IQ4_XS on HRX0, "Not yet" below.)
 
 `1bit-MONSTER/llama.cpp` also holds
 `1bit/hrx2-archive`, the previous build (AMD's abandoned ggml-hrx2 plus our Q4NX
 kernels). It is kept for a later port of that work to ggml-hrx. Its zaya
-architecture has been ported to this branch (ZAYA1, [vulkan.md](vulkan.md#zaya1-zyphra-from-our-llamacpp)).
+architecture has been ported to this branch (ZAYA1).
 
-The Vulkan route has its own upstream llama.cpp pin (latest release), so new
-architectures do not wait for AMD's pair: see [vulkan.md](vulkan.md). This build
-still has a Vulkan backend, which `--device vulkan` uses when `ONEBIT_VULKAN` is
-off.
+The engine's separate upstream llama.cpp pin for Vulkan (`third_party/llama.cpp-vulkan`) is gone
+(RFC #213 stage 3). Architectures only that pin had (Qwen3.8-Flash-Next's `qwen4exp`, Zyphra
+Zamba, Zamba2 and BlackMamba, and a few upstream-only ones) are refused by `1bit serve` until they
+are ported here; Lemonade's own llamacpp backend serves them meanwhile. This build has no Vulkan
+backend (`GGML_VULKAN=OFF`).
 
 ### The GPU's matrix units (WMMA)
 
@@ -525,6 +493,9 @@ cmake --build build --target onebit
 
 - **One external project.** llama.cpp's ggml-hrx builds hrx-system itself
   (`HRX_SOURCE_DIR`) with TheRock's `amdclang`.
+- **HRX0 and the CPU only.** `GGML_VULKAN`, `GGML_HIP` and `GGML_CUDA` are off. The targets are
+  `llama-server` and `llama-bench`. With
+  `-DONEBIT_SERVE_TEST_GGUF=<gguf>`, ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`.
 - **`IREE_ROCM_PATH` is not passed.** It would switch hrx-system to "package"
   mode, which needs TheRock's aqlprofile-sdk headers, and our `/opt/rocm-therock`
   does not ship them. Left unset, hrx-system fetches its pinned HSA/AQL headers.

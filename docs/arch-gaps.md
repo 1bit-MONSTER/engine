@@ -319,4 +319,4 @@ them forever.
 
 ## If a family *is* a variant
 
-An unmapped class that is a renamed or same-shape sibling is fixed where the backend is: upstream llama.cpp's converter and `llama-arch.cpp`, our HRX fork, or ZINC. The registry picks the mapping up at the next pin bump. Verify shape equality before proposing such a mapping: layers, hidden size, heads, experts, and any added config keys. That check is exactly what moved the families above into this file.
+An unmapped class that is a renamed or same-shape sibling is fixed where the backend is: upstream llama.cpp's converter and `llama-arch.cpp`, or our HRX fork. The registry picks the mapping up at the next pin bump. Verify shape equality before proposing such a mapping: layers, hidden size, heads, experts, and any added config keys. That check is exactly what moved the families above into this file.

@@ -17,25 +17,26 @@ limitations under the License.
 
 # Recipes: tuned backend settings, as data
 
-A setting that makes one model faster on one route can make another slower. For example, 1024-token
-micro-batches speed up a Hadamard-rotated MoE model's prompts by 3-8% and slow the dense
-Qwen3.8-27B's by 4%. `1bit serve` keeps such settings in `config/recipes.json`, not in code. Each
-recipe says what it matches, what it adds, why, and the measurement behind it:
+A setting that makes one model faster on one route can make another slower. For example, on the
+removed lean ROCm route 1024-token micro-batches sped up one MoE model's prompts by 3-8% and slowed
+the dense Qwen3.8-27B's by 4%. `1bit serve` keeps such settings in
+`config/recipes.json`, not in code. Each recipe says what it matches, what it adds, why, and the
+measurement behind it:
 
 ```json
 {
-  "id": "rotated-moe-ub1024",
-  "match": {"device": ["rocm"], "hadamard_q4_0": true, "moe": true},
-  "args": ["-ub", "1024"],
-  "why": "W4A4 expert matmuls fill the matrix units better with 1024-token micro-batches; 2048 is no better.",
-  "measured": "Qwen3-Coder-30B-A3B-Q4_0-H32, llama-bench pp2048 2,001 -> 2,158, ...",
-  "source": "engine #205, #229"
+  "id": "example",
+  "match": {"device": ["hrx"], "drafter": ["dflash"]},
+  "args": ["--spec-draft-p-min", "0.4"],
+  "why": "what the setting does for this match",
+  "measured": "the model, file, settings and numbers, measured with tools/bench.py",
+  "source": "the PR that added it"
 }
 ```
 
 ## How serve applies them
 
-For each llama-server backend (`vulkan`, `hrx`, `rocm`) serving a `.gguf`, serve checks every
+For each llama-server backend (`hrx`, `cpu`) serving a `.gguf`, serve checks every
 recipe against the launch:
 
 | `match` key | Matches when |
@@ -43,7 +44,6 @@ recipe against the launch:
 | `device` | the backend's device is in the list |
 | `architecture` | the file's `general.architecture` is in the list |
 | `moe` | the file has (`true`) or lacks (`false`) an `<architecture>.expert_count` above 0 |
-| `hadamard_q4_0` | the file is (`true`) or is not (`false`) stamped by `tools/hadamard_q4_0.py` |
 | `drafter` | the drafter is in the list: `none`, `mtp` (`--mtp`) or `dflash` (`--dflash`) |
 
 A key that is left out matches anything. A matching recipe adds each flag in `args`, with the
@@ -52,7 +52,7 @@ sets itself, including from the command line (`--mtp-p-min`, `--mmproj`'s micro-
 It adds each variable in `env` unless it is already set. Serve prints what it added:
 
 ```
-1bit serve: recipe rotated-moe-ub1024: -ub 1024
+1bit serve: recipe example: --spec-draft-p-min 0.4
 ```
 
 - `--recipes FILE` replaces the built-in set with the recipes in FILE.
@@ -63,17 +63,15 @@ It adds each variable in `env` unless it is already set. Serve prints what it ad
 
 ## The built-in recipes
 
-| id | Matches | Adds | Measured |
-|---|---|---|---|
-| `rotated-moe-ub1024` | rocm, Hadamard-rotated, MoE | `-ub 1024` | Qwen3-Coder-30B-A3B-H32 pp2048 2,001 -> 2,158; dense 27B-H32 is slower with it (491-495 -> 471-473) |
-| `rocm-dflash-p-min-0.4` | rocm, `--dflash` | `--spec-draft-p-min 0.4` | Qwen3.8-27B-H32 + DFlash2, decode code / prose / short: 41.9 / 24.8 / 13.4 at p-min 0 -> 41.9 / 26.8 / 16.7 tok/s |
-| `dflash-p-min-0` | `--dflash` | `--spec-draft-p-min 0` | Qwen3.8-27B-H32 + DFlash2: accepted block 5.4 -> 6.7 tokens on code (the ROCm tree's default 0.75 cut it) |
+None, for now. Every recipe the engine had was measured on a build RFC #213 stage 3 removed:
+`rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build) and `dflash-p-min-0` (a no-op
+on our HRX llama.cpp, whose default draft p-min is already 0). New ones come with HRX measurements.
 
 Recipes apply in file order. The first recipe to add a flag wins, so a narrower recipe goes before
 a broader one for the same flag.
 
-Settings that follow from the files themselves stay in serve's code. Examples: the Hadamard
-activation rotation a stamped file needs, and the DFlash draft length, which is the drafter's
+Settings that follow from the files themselves stay in serve's code. Examples: the 2-bit decode
+copy a ternary Q4_0 file gets on HRX0, and the DFlash draft length, which is the drafter's
 `dflash.block_size` minus one.
 
 ## Adding or changing a recipe

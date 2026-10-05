@@ -18,7 +18,7 @@
 // MUL_MAT_ID, for top-k random distinct experts (new ones every run). The GPU side of the
 // three-way split in docs/moe-streaming.md.
 //
-//   moe_expert_bench model.gguf layer device top_k [runs]     device: Vulkan0, HRX0, CPU
+//   moe_expert_bench model.gguf layer device top_k [runs]     device: HRX0, CPU
 //
 // Build against a libllama build's ggml: g++ -std=c++17 -O2 -I<llama.cpp>/ggml/include
 //   tools/moe_expert_bench.cpp -L<build>/bin -lggml -lggml-base -lggml-cpu -Wl,-rpath,<build>/bin

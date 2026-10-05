@@ -59,9 +59,8 @@ public:
     Q4nxNpuForward(const Q4nxNpuForward&) = delete;
     Q4nxNpuForward& operator=(const Q4nxNpuForward&) = delete;
 
-    // artifact_dir holds the full ELFs / xclbins; use_elf selects the backend.
-    bool init(xrt::device& dev, const char* model_path, const std::string& artifact_dir,
-              bool use_elf);
+    // artifact_dir holds the full ELFs (full_i8_*.elf).
+    bool init(xrt::device& dev, const char* model_path, const std::string& artifact_dir);
     // Host-GEMM mode (NPU_INFER_HOST_GEMM=1): never opens the device.  Design
     // derivation, ELF mapping, weight decode and the layer maths all run, but
     // npu_gemm() does a plain float matmul.  This validates the whole forward
@@ -104,7 +103,7 @@ public:
 private:
     bool load_norms();
     bool init_impl(xrt::device* dev, const char* model_path,
-                   const std::string& artifact_dir, bool use_elf);
+                   const std::string& artifact_dir);
     bool host_gemm_ = false;
     bool load_layer(int l);
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,

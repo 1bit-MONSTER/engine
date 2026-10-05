@@ -14,8 +14,8 @@
 // limitations under the License.
 // 1bit: the engine binary. Subcommands:
 //
-//   1bit serve -m <model>            one model on any device (NPU, Vulkan, HRX,
-//                                    ZINC, MLX) behind an OpenAI-compatible API;
+//   1bit serve -m <model>            one model on any device (NPU, HRX, CPU,
+//                                    DwarfStar, ONNX, MLX) behind an OpenAI-compatible API;
 //                                    how the engine runs inside Lemonade (docs/serve.md).
 //   1bit unified -m <model dir>      one native model on the NPU fast lane behind
 //                                    OpenAI endpoints; serve's NPU route.
@@ -41,7 +41,6 @@
 #include "scorer.h"
 #endif
 #include "serve.h"
-#include "built_path.h"
 #ifdef ONEBIT_MOE
 #include "cache_bench.h"
 #endif
@@ -58,15 +57,6 @@
 #include <string>
 #include <vector>
 
-#include <cerrno>
-#ifdef _WIN32
-#include <process.h>
-#else
-#include <fcntl.h>
-#include <sys/stat.h>
-#include <unistd.h>
-#endif
-
 namespace {
 
 constexpr const char* kVersion = "0.0.1";
@@ -82,7 +72,6 @@ void usage(FILE* out) {
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
                  "  forward-serve -m <model.q4nx> --kernels <dir>  serve a repacked GGUF on the NPU\n"
 #endif
-                 "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
 #ifdef ONEBIT_LAYA
                  "  route [options]             pick a device for a request via the Laya scorer\n"
 #endif
@@ -151,92 +140,12 @@ int run_npu(int argc, char** argv) {
 }
 #endif
 
-// ComfyUI.cpp is GPL-3.0 and a separate program: exec it, never link it (docs/comfyui.md).
-// The binary: $ONEBIT_COMFYUI (an absolute path), then this build's (-DONEBIT_COMFYUI=ON),
-// then comfyui_cpp on PATH. It is opened once, checked through that descriptor (a regular,
-// executable file that other users cannot write) and run with fexecve, so the file that was
-// checked is the file that runs.
-#ifdef _WIN32
-// Windows: $ONEBIT_COMFYUI (an absolute path), then this build's, then comfyui_cpp.exe on PATH;
-// run as a child that 1bit waits for (no exec in place on Windows).
-int run_comfy(int argc, char** argv) {
-    if (argc < 1 || !std::strcmp(argv[0], "-h") || !std::strcmp(argv[0], "--help")) {
-        std::printf("usage: 1bit comfy <workflow.json>\n"
-                    "  runs a ComfyUI API-format workflow (SD1.5 txt2img/img2img, see docs/comfyui.md)\n");
-        return argc < 1 ? 2 : 0;
-    }
-    std::string bin;
-    if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) {
-        if (!std::filesystem::path(e).is_absolute())
-            throw std::runtime_error("ONEBIT_COMFYUI must be an absolute path, not " + std::string(e));
-        bin = e;
-    }
-#ifdef ONEBIT_COMFYUI_BIN
-    if (bin.empty() && std::filesystem::exists(built_path(ONEBIT_COMFYUI_BIN))) bin = built_path(ONEBIT_COMFYUI_BIN);
-#endif
-    if (bin.empty()) bin = "comfyui_cpp.exe";   // _spawnvp searches PATH
-    std::vector<const char*> args{bin.c_str()};
-    for (int i = 0; i < argc; ++i) args.push_back(argv[i]);
-    args.push_back(nullptr);
-    const intptr_t rc = ::_spawnvp(_P_WAIT, bin.c_str(), args.data());
-    if (rc < 0) throw std::runtime_error("cannot run " + bin + ": " + std::strerror(errno));
-    return int(rc);
-}
-#else
-std::string find_comfy() {
-    if (const char* e = std::getenv("ONEBIT_COMFYUI"); e && *e) {
-        if (e[0] != '/') throw std::runtime_error("ONEBIT_COMFYUI must be an absolute path, not " + std::string(e));
-        return e;
-    }
-#ifdef ONEBIT_COMFYUI_BIN
-    if (std::filesystem::exists(built_path(ONEBIT_COMFYUI_BIN))) return built_path(ONEBIT_COMFYUI_BIN);
-#endif
-    if (const char* path = std::getenv("PATH")) {
-        std::stringstream dirs(path);
-        for (std::string dir; std::getline(dirs, dir, ':');) {
-            if (dir.empty() || dir[0] != '/') continue;  // relative PATH entries depend on the cwd
-            const std::string cand = dir + "/comfyui_cpp";
-            if (::access(cand.c_str(), X_OK) == 0) return cand;
-        }
-    }
-    throw std::runtime_error("no comfyui_cpp: build with -DONEBIT_COMFYUI=ON or set ONEBIT_COMFYUI");
-}
-
-int run_comfy(int argc, char** argv) {
-    if (argc < 1 || !std::strcmp(argv[0], "-h") || !std::strcmp(argv[0], "--help")) {
-        std::printf("usage: 1bit comfy <workflow.json>\n"
-                    "  runs a ComfyUI API-format workflow (SD1.5 txt2img/img2img, see docs/comfyui.md)\n");
-        return argc < 1 ? 2 : 0;
-    }
-    const std::string bin = find_comfy();
-    // O_CLOEXEC: when fexecve succeeds the kernel closes the descriptor with the old image;
-    // open() follows symlinks, so the checks below apply to the file that actually runs.
-    const int fd = ::open(bin.c_str(), O_RDONLY | O_CLOEXEC);
-    if (fd < 0) throw std::runtime_error("cannot open " + bin + ": " + std::strerror(errno));
-    struct stat st {};
-    if (::fstat(fd, &st) != 0 || !S_ISREG(st.st_mode) || !(st.st_mode & (S_IXUSR | S_IXGRP | S_IXOTH))) {
-        ::close(fd);
-        throw std::runtime_error(bin + " is not an executable file");
-    }
-    if (st.st_mode & S_IWOTH) {
-        ::close(fd);
-        throw std::runtime_error(bin + " is writable by other users; refusing to run it");
-    }
-    std::vector<char*> args{const_cast<char*>(bin.c_str())};
-    for (int i = 0; i < argc; ++i) args.push_back(argv[i]);
-    args.push_back(nullptr);
-    ::fexecve(fd, args.data(), environ);
-    const int err = errno;
-    ::close(fd);
-    throw std::runtime_error("cannot run " + bin + ": " + std::strerror(err));
-}
-#endif
 #ifdef ONEBIT_LAYA
 // One request in, one device out (RFC #186): Laya classifies the request (laya/route.h) and the
 // route policy (config/route-policy.json or --route-policy) picks among --devices. --classify
 // also prints the class and Laya's confidence.
 int run_route(int argc, char** argv) {
-    std::string laya_model, state, policy_path, devices_str = "npu,hrx,vulkan,zinc";
+    std::string laya_model, state, policy_path, devices_str = "npu,hrx,cpu";
     bool classify = false;
     for (int i = 0; i < argc; ++i) {
         const std::string a = argv[i];
@@ -250,7 +159,7 @@ int run_route(int argc, char** argv) {
         else if (a == "--route-policy") policy_path = next();
         else if (a == "--classify") classify = true;
         else if (a == "--help" || a == "-h") {
-            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,vulkan,zinc]\n"
+            std::printf("usage: 1bit route --laya-model <dir> --state <text> [--devices npu,hrx,cpu]\n"
                         "                  [--route-policy FILE] [--classify]\n"
                         "  Laya classifies the request (code, prose, short, long_doc) and the route policy\n"
                         "  picks one of the devices; --classify prints \"<class> <confidence> <device>\"\n");
@@ -345,14 +254,6 @@ int main(int argc, char** argv) {
         }
     }
 #endif
-    if (cmd == "comfy") {
-        try {
-            return run_comfy(argc - 2, argv + 2);
-        } catch (const std::exception& e) {
-            std::fprintf(stderr, "1bit comfy: %s\n", e.what());
-            return 127;
-        }
-    }
 #ifdef ONEBIT_LAYA
     if (cmd == "route") {
         try {

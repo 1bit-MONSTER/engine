@@ -23,7 +23,7 @@
 # sha256 for LFS files (the weights), the git blob id for the small ones.
 # Images and the eval plots are skipped. Files already present and correct are
 # not downloaded again. The pinned ggmlc GGUF of the typed-decisions checkpoint
-# (the router's fast scorer on Vulkan) goes to <dir>/gguf/, checked the same way.
+# (the router's fast scorer on HRX) goes to <dir>/gguf/, checked the same way.
 set -euo pipefail
 dir=${1:-${XDG_DATA_HOME:-$HOME/.local/share}/1bit/laya}
 echo "fetch-laya: into $dir"

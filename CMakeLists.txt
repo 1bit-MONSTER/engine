@@ -67,6 +67,20 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/recipes_default.h
      "static const char kDefaultRecipesJson[] = R\"ONEBITRECIPES(${ONEBIT_RECIPES_JSON})ONEBITRECIPES\";\n")
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/config/recipes.json)
 target_include_directories(onebit PRIVATE ${CMAKE_BINARY_DIR}/generated)
+# The GGUF architectures the pinned llama.cpp fork builds a model for (registry/architectures.json,
+# gguf_architectures.hrx, from tools/registry_build.py): serve refuses any other on hrx and cpu.
+file(READ ${CMAKE_SOURCE_DIR}/registry/architectures.json _onebit_registry)
+string(JSON _onebit_n_archs LENGTH "${_onebit_registry}" gguf_architectures hrx)
+set(_onebit_archs "")
+math(EXPR _onebit_last "${_onebit_n_archs} - 1")
+foreach(_i RANGE ${_onebit_last})
+    string(JSON _a GET "${_onebit_registry}" gguf_architectures hrx ${_i})
+    string(APPEND _onebit_archs "    \"${_a}\",\n")
+endforeach()
+file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
+     "// generated from registry/architectures.json by CMakeLists.txt\n#pragma once\n"
+     "static const char* const kHrxGgufArchs[] = {\n${_onebit_archs}};\n")
+set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
 # backends are compiled in by build-tree path; a package keeps that layout (app/built_path.h)
@@ -74,13 +88,11 @@ target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}"
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
-add_test(NAME hadamard_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hadamard_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
-add_test(NAME long_route COMMAND ${CMAKE_SOURCE_DIR}/tests/long_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
@@ -96,120 +108,45 @@ add_test(NAME gguf_meta COMMAND gguf_meta_test)
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
 set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 
-# ── Vulkan from upstream llama.cpp (docs/vulkan.md) ──────────────────────
-# Off by default: it needs the Vulkan SDK (headers, loader, glslc). Builds
-# llama-server from third_party/llama.cpp-vulkan (ggml-org's latest release),
-# and `1bit serve --device vulkan` then uses it; --device hrx keeps AMD's pair.
-option(ONEBIT_VULKAN "Build a Vulkan llama-server from upstream llama.cpp" OFF)
-if(ONEBIT_VULKAN)
-    include(cmake/vulkan.cmake)
-    add_dependencies(onebit llama_vulkan)
-    target_compile_definitions(onebit PRIVATE ONEBIT_VULKAN_SERVER="${ONEBIT_VULKAN_SERVER}")
-    if(ONEBIT_SERVE_TEST_GGUF)
-        add_test(NAME serve_e2e_vulkan_upstream
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan)
-    endif()
-endif()
-
-# ── The lean option: ROCmFPX's formats (docs/lean.md) ─────────────────────
-# Off by default. Builds llama-server + llama-quantize from third_party/llama.cpp-rocmfpx
-# on Vulkan: `1bit serve --lean` runs ROCmFP4 files with it. ONEBIT_LEAN_ROCM adds the
-# ROCm build with the gfx1151 W4A4 path, for ROCmI4 files (`--lean --device rocm`).
-option(ONEBIT_LEAN "Build the lean (ROCmFPX) llama-server on Vulkan" OFF)
-option(ONEBIT_LEAN_ROCM "Also build the lean llama-server on ROCm (W4A4, needs TheRock)" OFF)
-set(ONEBIT_SERVE_TEST_LEAN_GGUF "" CACHE FILEPATH "ROCmFP4 GGUF the lean serve_e2e test loads")
-if(ONEBIT_LEAN)
-    include(cmake/lean.cmake)
-    add_dependencies(onebit llama_lean)
-    target_compile_definitions(onebit PRIVATE ONEBIT_LEAN_SERVER="${ONEBIT_LEAN_SERVER}")
-    if(ONEBIT_LEAN_ROCM)
-        add_dependencies(onebit llama_lean_rocm)
-        target_compile_definitions(onebit PRIVATE ONEBIT_LEAN_ROCM_SERVER="${ONEBIT_LEAN_ROCM_SERVER}")
-    endif()
-    if(ONEBIT_SERVE_TEST_LEAN_GGUF)
-        add_test(NAME serve_e2e_lean
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_LEAN_GGUF} vulkan --lean)
-    endif()
-endif()
-
-# ── Step 2: HRX + Vulkan in one llama.cpp build (docs/hrx.md) ─────────────
-# Off by default: it needs TheRock/ROCm and the three HRX submodules, and it
-# only runs on AMD GPUs. `1bit serve` then uses this llama-server for both
-# the llamacpp-hrx recipe (HRX0) and the llamacpp recipe's Vulkan backend.
-option(ONEBIT_HRX "Build HRX + Vulkan llama-server and wire it into Lemonade" OFF)
+# ── Step 2: HRX, the engine's GPU route (docs/hrx.md) ─────────────────────
+# Off by default: it needs TheRock/ROCm and the HRX submodules, and it only runs on AMD GPUs.
+# `1bit serve --device hrx` (and auto for a .gguf) then uses this llama-server on HRX0, and
+# --device cpu the same build with no GPU layers. The build has no Vulkan or ROCm backend
+# (RFC #213 stage 3): what HRX does not run, Lemonade serves with its own llamacpp backends.
+option(ONEBIT_HRX "Build the HRX llama-server and wire it into Lemonade" OFF)
 if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
     add_dependencies(onebit llama_hrx)
     target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}")
     if(ONEBIT_SERVE_TEST_GGUF)
-        # With ONEBIT_VULKAN, --device vulkan runs the upstream build (tested below).
-        set(_hrx_devs hrx)
-        if(NOT ONEBIT_VULKAN)
-            list(PREPEND _hrx_devs vulkan)
-        endif()
-        foreach(_dev ${_hrx_devs})
+        foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
         endforeach()
-        # Vulkan decode with prompt prefill on HRX over one shared KV cache (docs/hrx.md)
-        add_test(NAME serve_e2e_vulkan_prefill_hrx
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} vulkan --prefill-device hrx)
-    endif()
-endif()
-
-# ── ZINC (docs/zinc.md) ────────────────────────────────────────────────────
-# Off by default: it builds third_party/zinc with scripts/build-zinc.sh (which
-# fetches its own Zig) for one GPU backend. `1bit serve --device zinc` then runs the zinc
-# recipe with this binary. ONEBIT_ZINC_BACKEND=cuda is the NVIDIA build.
-option(ONEBIT_ZINC "Build ZINC (third_party/zinc) and wire it into Lemonade" OFF)
-if(ONEBIT_ZINC)
-    set(ONEBIT_ZINC_BACKEND "vulkan" CACHE STRING "ZINC GPU backend: vulkan, rocm or cuda")
-    set_property(CACHE ONEBIT_ZINC_BACKEND PROPERTY STRINGS vulkan rocm cuda)
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/zinc/build.zig")
-        message(FATAL_ERROR "ONEBIT_ZINC needs third_party/zinc: git submodule update --init third_party/zinc")
-    endif()
-    set(ONEBIT_ZINC_SERVER "${CMAKE_BINARY_DIR}/zinc/${ONEBIT_ZINC_BACKEND}/bin/zinc")
-    add_custom_target(zinc
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-zinc.sh ${CMAKE_BINARY_DIR}/zinc ${ONEBIT_ZINC_BACKEND}
-        BYPRODUCTS ${ONEBIT_ZINC_SERVER}
-        USES_TERMINAL)
-    add_dependencies(onebit zinc)
-    target_compile_definitions(onebit PRIVATE ONEBIT_ZINC_SERVER="${ONEBIT_ZINC_SERVER}")
-    if(ONEBIT_SERVE_TEST_GGUF)
-        add_test(NAME serve_e2e_zinc
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} zinc)
     endif()
 endif()
 
 # ── DwarfStar (docs/dwarfstar.md) ─────────────────────────────────────────
-# Off by default: it builds third_party/ds4 (antirez/ds4, MIT) with scripts/build-ds4.sh for
-# one backend (rocm: Strix Halo, needs HIP/hipBLAS(Lt)/rocBLAS/rocWMMA/hipCUB; cuda; metal;
-# cpu). `1bit serve --device ds4` then runs its ds4-server on DwarfStar's own GGUFs.
+# Off by default: it builds third_party/ds4 (antirez/ds4, MIT) with scripts/build-ds4.sh on
+# its HIP backend only (Strix Halo, gfx1151: HIP, hipBLAS(Lt), rocBLAS, rocWMMA, hipCUB).
+# `1bit serve --device ds4` then runs its ds4-server on DwarfStar's own GGUFs.
 option(ONEBIT_DS4 "Build DwarfStar (third_party/ds4) for --device ds4" OFF)
 if(ONEBIT_DS4)
-    if(APPLE)
-        set(_ds4_default metal)
-    else()
-        set(_ds4_default rocm)
-    endif()
-    set(ONEBIT_DS4_BACKEND "${_ds4_default}" CACHE STRING "DwarfStar backend: rocm, cuda, metal or cpu")
-    set_property(CACHE ONEBIT_DS4_BACKEND PROPERTY STRINGS rocm cuda metal cpu)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/ds4/ds4_server.c")
         message(FATAL_ERROR "ONEBIT_DS4 needs third_party/ds4: git submodule update --init third_party/ds4")
     endif()
-    set(ONEBIT_DS4_SERVER "${CMAKE_BINARY_DIR}/ds4/${ONEBIT_DS4_BACKEND}/ds4-server")
+    set(ONEBIT_DS4_SERVER "${CMAKE_BINARY_DIR}/ds4/hip/ds4-server")
     add_custom_target(ds4
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-ds4.sh ${CMAKE_BINARY_DIR}/ds4 ${ONEBIT_DS4_BACKEND}
+        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-ds4.sh ${CMAKE_BINARY_DIR}/ds4
         BYPRODUCTS ${ONEBIT_DS4_SERVER}
         USES_TERMINAL)
     add_dependencies(onebit ds4)
     target_compile_definitions(onebit PRIVATE ONEBIT_DS4_SERVER="${ONEBIT_DS4_SERVER}")
 endif()
 
-# ── ComfyUI.cpp (docs/comfyui.md) ──────────────────────────────────────────
-# Off by default: it needs LibTorch. Builds third_party/comfyui.cpp (GPL-3.0) with
-# scripts/build-comfyui.sh as its own program; `1bit comfy <workflow.json>` runs it as a
-# child process. The engine never links it, so the engine itself stays Apache-2.0.
+# ── ONNX Runtime GenAI (docs/onnx.md) ──────────────────────────────────────
+# Off by default: builds ryzenai-server (MIT) with scripts/build-onnx.sh as its own program;
+# `1bit serve --device onnx` runs it as a child process.
 option(ONEBIT_ONNX "Build ryzenai-server (third_party/ryzenai-server) for --device onnx" OFF)
 if(ONEBIT_ONNX)
     set(ONEBIT_ONNX_SERVER "${CMAKE_BINARY_DIR}/onnx/ryzenai-server")
@@ -219,29 +156,6 @@ if(ONEBIT_ONNX)
         USES_TERMINAL)
     add_dependencies(onebit onnx_server)
     target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${ONEBIT_ONNX_SERVER}")
-endif()
-
-option(ONEBIT_COMFYUI "Build ComfyUI.cpp (third_party/comfyui.cpp) for 1bit comfy" OFF)
-if(ONEBIT_COMFYUI)
-    # fetch the pinned submodule at configure time when it is missing
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
-        find_package(Git QUIET)
-        if(GIT_FOUND AND EXISTS "${CMAKE_SOURCE_DIR}/.git")
-            message(STATUS "Fetching third_party/comfyui.cpp")
-            execute_process(COMMAND ${GIT_EXECUTABLE} submodule update --init third_party/comfyui.cpp
-                            WORKING_DIRECTORY ${CMAKE_SOURCE_DIR})
-        endif()
-    endif()
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/comfyui.cpp/CMakeLists.txt")
-        message(FATAL_ERROR "ONEBIT_COMFYUI needs third_party/comfyui.cpp: git submodule update --init third_party/comfyui.cpp")
-    endif()
-    set(ONEBIT_COMFYUI_BIN "${CMAKE_BINARY_DIR}/comfyui/comfyui_cpp")
-    add_custom_target(comfyui
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-comfyui.sh ${CMAKE_BINARY_DIR}/comfyui
-        BYPRODUCTS ${ONEBIT_COMFYUI_BIN}
-        USES_TERMINAL)
-    add_dependencies(onebit comfyui)
-    target_compile_definitions(onebit PRIVATE ONEBIT_COMFYUI_BIN="${ONEBIT_COMFYUI_BIN}")
 endif()
 
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────
@@ -373,7 +287,7 @@ add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)
 set(ONEBIT_NPU_CAPTURED "" CACHE PATH "Directory of captured layer_ctx<N>.elf instruction ELFs")
 set(ONEBIT_NPU_PDI "" CACHE FILEPATH "The layer kernel's design PDI")
 set(ONEBIT_NPU_GOLDEN "" CACHE PATH "Directory of full ELFs the fast lane ran")
-set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full ELF / xclbin directory the GGUF-on-NPU forward loads (docs/npu.md)")
+set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full-ELF directory the GGUF-on-NPU forward loads (docs/npu.md)")
 target_compile_definitions(onebit PRIVATE ONEBIT_NPU_REPACK_SCRIPT="${CMAKE_SOURCE_DIR}/scripts/repack_gguf.py")
 # The GGUF -> fused-lane Q4NX layout packer (docs/npu.md, "From a GGUF").  A
 # different layout from repack_gguf.py; used only when ONEBIT_NPU_LANE_DIR routes
@@ -457,12 +371,9 @@ if(ONEBIT_NPU)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
-    set(ONEBIT_NPU_REFERENCE "" CACHE PATH "Reference lane's logits for the anchor prompt")
-    if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_KERNELS AND ONEBIT_NPU_REFERENCE)
-        add_test(NAME npu_lane_e2e
-                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lane_e2e.sh $<TARGET_FILE:onebit>
-                         ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_KERNELS} ${ONEBIT_NPU_REFERENCE})
-    endif()
+    # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
+    # and its reference logits are lost. The NPU check is the private dx add-on's from-source
+    # check, outside this repository (docs/npu.md, "Checking the NPU").
 endif()
 
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of

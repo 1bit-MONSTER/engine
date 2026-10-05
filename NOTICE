@@ -72,17 +72,8 @@ Peano, llvm-aie (third_party/llvm-aie)
   License: Apache-2.0 WITH LLVM-exception
 
 llama.cpp (third_party/llama.cpp: 1bit-MONSTER/llama.cpp, a fork of
-ggml-org/llama.cpp carrying AMD's HRX integration; third_party/llama.cpp-vulkan:
-the same fork's 1bit/vulkan-upstream, an upstream release plus carried upstream
-pull requests, among them ggml-org#28243 by Daniel Han and Ryan Monsurate, and
-ggml-org#21412 (Zamba2) by Echo Labs)
+ggml-org/llama.cpp carrying AMD's HRX integration)
   https://github.com/ggml-org/llama.cpp
-  Copyright (c) 2023-2026 The ggml authors
-  License: MIT
-
-ROCmFPX (third_party/llama.cpp-rocmfpx: charlie12345/ROCmFPX, a fork of
-ggml-org/llama.cpp with AMD-focused weight formats; the lean option)
-  https://github.com/charlie12345/ROCmFPX
   Copyright (c) 2023-2026 The ggml authors
   License: MIT
 
@@ -90,17 +81,6 @@ HRX, HIP Runtime Extended (third_party/hrx-system)
   https://github.com/ROCm/hrx-system
   Copyright the HRX authors (Advanced Micro Devices, Inc.)
   License: Apache-2.0
-
-Linux kernel (third_party/linux)
-  https://github.com/torvalds/linux
-  Copyright Linus Torvalds and the Linux kernel contributors
-  License: GPL-2.0 WITH Linux-syscall-note. The kernel is built as a separate
-  program (scripts/build-kernel.sh); no kernel code is linked into this product.
-
-ZINC (third_party/zinc)
-  https://github.com/zolotukhin/zinc
-  Copyright (c) 2025 ZINC Contributors
-  License: MIT
 
 DwarfStar (third_party/ds4)
   https://github.com/1bit-MONSTER/ds4
@@ -133,16 +113,6 @@ ONNX Runtime GenAI and ONNX Runtime
   scripts/build-onnx.sh fetches the release libraries (ONNX Runtime GenAI 0.11.2,
   ONNX Runtime 1.23.2, pinned by sha256) and places them beside ryzenai-server.
 
-ComfyUI.cpp (third_party/comfyui.cpp)
-  https://github.com/1bit-MONSTER/comfyui.cpp
-  A C++ port of ComfyUI (https://github.com/Comfy-Org/ComfyUI, Copyright (C)
-  Comfy Org and ComfyUI contributors, GPL-3.0).
-  License: GPL-3.0. ComfyUI.cpp is built as a separate program
-  (scripts/build-comfyui.sh) that `1bit comfy` runs as a child process; none of
-  its code is linked into this product. It links LibTorch (BSD-3-Clause) and
-  vendors stb (MIT / public domain), nlohmann/json (MIT) and the CLIP BPE
-  vocabulary (MIT).
-
 Hugging Face tokenizers (third_party/tokenizers)
   https://github.com/huggingface/tokenizers
   Copyright Hugging Face, Inc. and the tokenizers authors
@@ -166,6 +136,17 @@ Laya typed-decisions GGUF (Hugging Face mys/laya-typed-decisions-GGUF, pinned in
 config/laya.json; compiled by ggmlc from convaiinnovations/laya-typed-decisions)
   https://huggingface.co/mys/laya-typed-decisions-GGUF
   License: Apache-2.0
+
+-------------------------------------------------------------------------------
+Shipped in the 1bit OS image only (built outside this repository)
+-------------------------------------------------------------------------------
+
+Linux kernel
+  https://github.com/torvalds/linux
+  Copyright Linus Torvalds and the Linux kernel contributors
+  License: GPL-2.0 WITH Linux-syscall-note. Built as a separate program by
+  https://github.com/1bit-MONSTER/kernel; os/mini/mkimage.sh copies a built kernel
+  into the image. No kernel code is linked into this product.
 
 -------------------------------------------------------------------------------
 Fetched by the build at pinned commits (CMakeLists.txt)

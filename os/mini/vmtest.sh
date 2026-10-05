@@ -18,9 +18,11 @@
 #
 # Boots the 1bit OS USB image the way a PC boots the stick: UEFI firmware (OVMF), the image on
 # a USB xHCI controller, a network card, in QEMU/KVM. The test image carries a throwaway SSH key,
-# a small model, a 1bit.conf that serves it at boot, and lavapipe (Vulkan on the CPU, as the VM
-# has no Radeon GPU). Then over SSH and the OpenAI API: the system is up, the stick's data
-# partition is mounted, 1bit serve answers a chat request. Prints VMTEST PASS or FAIL.
+# a small model and a 1bit.conf that serves it at boot with --device cpu (the VM has no Radeon GPU,
+# so HRX0 cannot open: this runs the image's HRX llama-server with no GPU layers). Then over SSH and
+# the OpenAI API: the system is up, the stick's data partition is mounted, 1bit serve answers a
+# chat request. Prints VMTEST PASS or FAIL. On a machine without TheRock or XRT, LLAMA_SERVER and
+# NO_XRT (mkimage.sh) make a CPU-only test image.
 set -euo pipefail
 out=${1:?usage: vmtest.sh <out> [engine build dir] [model.gguf]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
@@ -29,10 +31,8 @@ here=$(cd "$(dirname "$0")" && pwd)
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 
 rm -f "$out/key" "$out/key.pub"; ssh-keygen -q -t ed25519 -N "" -f "$out/key"
-# lavapipe is the VM's only Vulkan device; llama.cpp skips CPU Vulkan devices unless listed
-# (a 4096-token context: lavapipe reports too little memory for the model's full one)
-printf 'MODEL=/data/models/%s\nDEVICE=vulkan\nPORT=8000\nARGS=\"--ctx-size 4096\"\nexport GGML_VK_VISIBLE_DEVICES=0\n' "$(basename "$model")" > "$out/1bit.conf"
-LAVAPIPE=1 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" \
+printf 'MODEL=/data/models/%s\nDEVICE=cpu\nPORT=8000\nARGS=\"--ctx-size 4096\"\n' "$(basename "$model")" > "$out/1bit.conf"
+AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" CONF="$out/1bit.conf" \
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1
 
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$out/vars.fd"
@@ -50,12 +50,12 @@ ok=1
 for i in $(seq 60); do ssh_vm true 2>/dev/null && break; sleep 3; done
 if ssh_vm true 2>/dev/null; then
     echo "VM: SSH up after about $((i * 3)) s (UEFI boot from the USB image)"
-    ssh_vm 'uname -r; mount | grep -q " /data " && echo "data partition: mounted, $(ls /data/models)"; ls /usr/share/vulkan/icd.d'
+    ssh_vm 'uname -r; mount | grep -q " /data " && echo "data partition: mounted, $(ls /data/models)"; echo "HRX JIT cache: $(ls -d /data/cache/hrx-jit 2>/dev/null || echo none)"'
 else
     echo "VM: no SSH"; ok=0
 fi
-# 1bit serve answers /v1/models itself, before its backend is ready, and lavapipe compiles every
-# shader on first use (minutes in a VM): retry the chat request itself, for up to 10 minutes
+# 1bit serve answers /v1/models itself, before its backend is ready: retry the chat request
+# itself, for up to 10 minutes
 reply=
 for i in $(seq 60); do
     reply=$(curl -s --max-time 120 127.0.0.1:18000/v1/chat/completions -H 'Content-Type: application/json' \
@@ -64,7 +64,7 @@ for i in $(seq 60); do
     [ -n "$reply" ] && break
     sleep 10
 done
-if [ -n "$reply" ]; then echo "1bit serve (Vulkan on the VM's CPU) answered: $reply"; else echo "1bit serve: no answer"; ok=0
+if [ -n "$reply" ]; then echo "1bit serve (--device cpu in the VM) answered: $reply"; else echo "1bit serve: no answer"; ok=0
     ssh_vm 'grep -i -E "error|fail|abort|assert|out of memory|what\\(\\)" /tmp/serve.log | head -12; echo ...; tail -4 /tmp/serve.log' 2>/dev/null || true; fi
 ssh_vm 'poweroff -f' 2>/dev/null || true
 wait $vm 2>/dev/null || true

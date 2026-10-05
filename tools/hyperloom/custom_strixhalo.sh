@@ -116,9 +116,17 @@ if [ "${PROFILE:-0}" = "1" ]; then
   TD=${VLLM_TORCH_PROFILER_DIR:-${SGLANG_TORCH_PROFILER_DIR:-$OUT/torch_trace}}
   mkdir -p "$TD"
   TL=$(cd "$(dirname "$0")" && pwd)/hrx-tracelens.sh
-  echo "profile leg: emitting an HRX trace into $TD" >&2
+  # The trace MUST describe the binary just benchmarked: Hyperloom's own profile_custom.yaml warns that a trace of a
+  # different run is worthless, and the roofline directs the whole search. Prefer this checkout's build; fall back only
+  # if it cannot trace, and say so loudly, because the roofline is then about a different tree.
+  TB=$B
+  if ! strings "$TB/libggml-hrx.so.0" 2>/dev/null | grep -q GGML_HRX_DISPATCH_SHAPE_LOG; then
+    TB=${HRX_SHAPELOG_BIN:-$HOME/wt/hrx2kineto-src/build/bin}
+    echo "profile leg: WARNING $B lacks GGML_HRX_DISPATCH_SHAPE_LOG; tracing $TB instead -- the trace describes a DIFFERENT build than the one benchmarked" >&2
+  fi
+  echo "profile leg: emitting an HRX trace into $TD from $TB" >&2
   if [ -x "$TL" ]; then
-    O=$(BOX_LOCK= HRX_BIN=${HRX_BIN:-$HOME/wt/hrx2kineto-src/build/bin} OUT_ROOT="$TD/.." \
+    O=$(BOX_LOCK= HRX_BIN=$TB OUT_ROOT="$TD/.." \
         DECODE_TOKENS=8 bash "$TL" "$GGUF" decode 2>&1 | tail -n 1)
     if [ -n "$O" ] && [ -f "$O/trace.json" ]; then
       gzip -c "$O/trace.json" > "$TD/rank_0.trace.json.gz"

@@ -18,14 +18,16 @@
 #
 #   third_party/llama.cpp   1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched: AMD's
 #                           hrx-graph-develop-v2 (ggml-hrx) on ggml-org llama.cpp, plus ours
-#   third_party/hrx-system  ROCm/hrx-system: libhrx, loomc and the Loom tools
+#   third_party/hrx-system  1bit-MONSTER/hrx-system 1bit/main: ROCm/hrx-system (libhrx, loomc and
+#                           the Loom tools) at AMD's pin, plus our Loom/libhrx commits
 #
 # llama.cpp's ggml-hrx builds hrx-system itself when given HRX_SOURCE_DIR, with
 # the compilers of this build, so the only inputs are the two trees and TheRock.
 # IREE_ROCM_PATH is deliberately not passed: it switches hrx-system to "package"
 # mode, which requires TheRock's own aqlprofile-sdk headers (absent from our
 # /opt/rocm-therock); unset, hrx-system fetches its pinned HSA/AQL headers.
-# .github/workflows/bump-hrx.yml moves both pins when AMD moves its pair.
+# .github/workflows/bump-hrx.yml moves the llama.cpp pin when AMD moves its pair; hrx-system is
+# rebased onto AMD's new commit by hand (our commits are few).
 # Only HRX0 and the CPU are built: no Vulkan, ROCm/HIP or CUDA backend (RFC #213 stage 3). The
 # branch name still says "vulkan" (AMD's pair carried both); the engine no longer builds it.
 include(ExternalProject)

@@ -46,7 +46,7 @@ UPSTREAMS = {
 PINS = {  # path -> (name, what it is to the engine, repo whose latest release is quoted, changes)
     "lemonade": ("Lemonade", "the server the engine runs inside", "lemonade-sdk/lemonade", "https://github.com/lemonade-sdk/lemonade/releases"),
     "llama.cpp": ("HRX llama.cpp", "our patches on AMD's ggml-hrx", None, "https://github.com/1bit-MONSTER/llama.cpp/commits/1bit/hrx-vulkan-patched"),
-    "hrx-system": ("hrx-system", "ROCm", "ROCm/hrx-system", "https://github.com/ROCm/hrx-system/commits/main"),
+    "hrx-system": ("hrx-system", "ROCm/hrx-system plus our Loom/libhrx commits", None, "https://github.com/1bit-MONSTER/hrx-system/commits/1bit/main"),
     "xdna-driver": ("xdna-driver", "AMD NPU driver + XRT", "amd/xdna-driver", "https://github.com/amd/xdna-driver/commits/main"),
     "laya": ("Laya", "router scorer", "NandhaKishorM/laya", "https://github.com/NandhaKishorM/laya/releases"),
     "tokenizers": ("tokenizers", "Hugging Face", "huggingface/tokenizers", "https://github.com/huggingface/tokenizers/releases"),

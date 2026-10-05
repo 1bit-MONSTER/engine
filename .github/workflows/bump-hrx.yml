@@ -150,18 +150,19 @@ jobs:
           git config user.email "hrx-bump@users.noreply.github.com"
           git switch -c "$branch"
           git update-index --cacheinfo "160000,$REBASED,third_party/llama.cpp"
-          git update-index --cacheinfo "160000,$AMD_HRX,third_party/hrx-system"
-          git commit -q -m "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12} (AMD's tested pair)"
+          # hrx-system is our fork (1bit-MONSTER/hrx-system 1bit/main) with our commits on AMD's pin:
+          # it is rebased by hand, so only the llama.cpp pin moves here (the body names AMD's new hrx-system).
+          git commit -q -m "Bump HRX: llama.cpp ${AMD_LLAMA:0:12} (AMD's tested pair; hrx-system ${AMD_HRX:0:12} to rebase by hand)"
           scripts/registry-regen.sh  # the registry must record the new pin (ctest registry_pins)
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
-            --title "Bump HRX: llama.cpp ${AMD_LLAMA:0:12}, hrx-system ${AMD_HRX:0:12}" \
-            --body "Moves both submodules to the pair ROCm/ggml-staging-automation now pins.
+            --title "Bump HRX: llama.cpp ${AMD_LLAMA:0:12} (AMD pair also moves hrx-system to ${AMD_HRX:0:12})" \
+            --body "Moves third_party/llama.cpp to the pair ROCm/ggml-staging-automation now pins. third_party/hrx-system is our fork (1bit-MONSTER/hrx-system, 1bit/main = AMD's pin plus our commits): rebase it onto AMD's new commit by hand and move that pin in this PR before merging.
 
           | | from | to |
           |---|---|---|
           | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched) | \`${OURS_LLAMA:0:12}\` | \`${REBASED:0:12}\` (on AMD \`${AMD_LLAMA:0:12}\`) |
-          | third_party/hrx-system (ROCm/hrx-system) | \`${OURS_HRX:0:12}\` | \`${AMD_HRX:0:12}\` |
+          | third_party/hrx-system (1bit-MONSTER/hrx-system 1bit/main) | \`${OURS_HRX:0:12}\` | AMD now at \`${AMD_HRX:0:12}\` (rebase by hand) |
 
           Our commits, rebased onto AMD's pin:
           ${PATCHES}

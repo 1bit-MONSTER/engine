@@ -161,7 +161,18 @@ jobs:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
         run: |
           set -euo pipefail
+          # Idempotent on purpose. A workflow that is already disabled, or that GitHub manages
+          # (dynamic workflows), answers HTTP 422 to a disable request. Under `set -e` that aborted
+          # the whole sync job -- and because the self-test just re-enabled and re-disabled a
+          # workflow, the very next run saw it still listed as active and died here. Report and
+          # continue; never fail the sync over a cleanup step.
+          skipped=0
           for id in $(gh api "repos/${FORK}/actions/workflows" --paginate --jq '.workflows[] | select(.state=="active") | .id'); do
-            gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null
-            echo "disabled workflow ${id}"
+            if gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null 2>&1; then
+              echo "disabled workflow ${id}"
+            else
+              echo "workflow ${id} left as-is (already disabled, or GitHub-managed)"
+              skipped=$((skipped+1))
+            fi
           done
+          echo "workflow cleanup complete; ${skipped} left as-is"

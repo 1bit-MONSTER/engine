@@ -4,10 +4,10 @@
   "llama.cpp (hrx)": "2e5fcf56a24d112733e11627041c5eb54a671bc8"
  },
  "counts": {
-  "hrx": 290,
+  "hrx": 292,
   "npu": 7,
-  "architectures": 290,
-  "mapped": 290
+  "architectures": 292,
+  "mapped": 292
  },
  "architectures": {
   "AfmoeForCausalLM": {
@@ -1458,6 +1458,18 @@
     "hrx"
    ]
   },
+  "Qwen4ExpForCausalLM": {
+   "gguf": "qwen4exp",
+   "backends": [
+    "hrx"
+   ]
+  },
+  "Qwen4ExpForConditionalGeneration": {
+   "gguf": "qwen4exp",
+   "backends": [
+    "hrx"
+   ]
+  },
   "QwenForCausalLM": {
    "gguf": "qwen",
    "backends": [
@@ -1890,6 +1902,7 @@
    "qwen3next",
    "qwen3vl",
    "qwen3vlmoe",
+   "qwen4exp",
    "refact",
    "rnd1",
    "rwkv6",

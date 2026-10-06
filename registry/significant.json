@@ -44,6 +44,14 @@
   "Zarya": {
    "model_type": "zarya",
    "family": "Zarya, diffusion LM sampler"
+  },
+  "Needle3ForCausalLM": {
+   "model_type": "needle3",
+   "family": "Sakura Needle-3 (ONNX export)"
+  },
+  "SepiaCharMLP": {
+   "model_type": "sepia-char-mlp",
+   "family": "SEPIA character-level MLP"
   }
  }
 }

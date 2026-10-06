@@ -308,6 +308,20 @@ request when the model is sharded.
 
 ---
 
+### `needle3` - `webmp3/Sakura-Needle3-ONNX`
+
+Architecture class `Needle3ForCausalLM`, `model_type: needle3`, no `auto_map` - so the
+census classes it as native, not custom code. It is a small research model shipped as an
+ONNX export; no pinned backend (`hrx`, `npu`) implements the class, and an ONNX graph is
+not a GGUF architecture any backend could claim. Reviewed 2026-10-06: **not an alias**.
+
+### `sepia-char-mlp` - `LUSCAINK/SEPIA-0`
+
+Architecture class `SepiaCharMLP`, `model_type: sepia-char-mlp`, no `auto_map`. Its
+`config.json` is not a transformer configuration at all (`forward`, `vocab`, `embedding`,
+`hidden` - a character-level MLP), so it cannot be an alias of any supported family.
+Reviewed 2026-10-06: **not an alias**.
+
 ## Unverifiable: gated configs
 
 `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on

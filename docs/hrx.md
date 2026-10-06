@@ -342,6 +342,23 @@ program is rebuilt.
 
   (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
   `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
+- **GLM-4.7-Flash MLA decode accuracy (engine#310).** The reported 11.79-vs-10.60
+  perplexity gap is not reproducible on the current pin (`f2099e9b7`), which includes the MLA
+  strided-V fix ([llama.cpp #70](https://github.com/1bit-MONSTER/llama.cpp/pull/70)) and the
+  masked-V flash-attention fix ([#72](https://github.com/1bit-MONSTER/llama.cpp/pull/72)).
+  On the same model and wikitext corpus, HRX decode (`-ub 1`) agrees with the CPU reference at
+  both tested lengths:
+
+  | Context | HRX decode PPL | CPU PPL | Absolute difference |
+  |---|---:|---:|---:|
+  | 4096 tokens (2 chunks) | 10.7208 ± 0.49991 | 10.7414 ± 0.50110 | 0.021 |
+  | 8192 tokens (4 chunks) | 7.4988 ± 0.23237 | 7.4936 ± 0.23212 | 0.005 |
+
+  The CPU reference uses its default ubatch with `-fa` off; CPU `-ub 1` and `-fa 1` are
+  invalid for this model. The historical 11.79 and 10.64 results do not have a runnable
+  old-path A/B build, so the op-level drift bisect remains unverified. The masked-V kernel
+  change includes a regression test that varies stale masked rows and requires bit-identical
+  outputs.
 
 ### Prefill on HRX, decode on Vulkan (removed)
 

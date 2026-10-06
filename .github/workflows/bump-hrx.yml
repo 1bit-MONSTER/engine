@@ -26,8 +26,11 @@
 # commits and AMD's pin had moved 70 commits, over the same files. Rebasing replays all 159 and
 # died at commit 1 of 159 (dispatch-mul-mat.cpp), so the job failed on every scheduled run from
 # 2026-10-01 to 2026-10-05 and the HRX pin silently froze while AMD and our fork both moved.
-# Merging the same two lines conflicts in 15 files, all under ggml/src/ggml-hrx/, and resolves once.
-# A merge conflict still fails the run: resolve those files by hand.
+# Merging the same two lines conflicts in 15 files, all under ggml/src/ggml-hrx/. The llama.cpp
+# merge resolves those toward our patched line (measured: AMD core + our ggml-hrx passes the
+# full HRX0 gate with 0 NaN; AMD's ggml-hrx fails 54 cases and yields NaN, engine#315) and takes
+# AMD's side elsewhere. A conflict outside ggml/src/ggml-hrx, or in hrx-system, still fails the
+# run: resolve those files by hand.
 # A failed run now files an issue, so it cannot break silently for another five days.
 # GitHub-hosted CI builds that PR without HRX; run tests/serve_e2e.sh on
 # Strix Halo before merging it.

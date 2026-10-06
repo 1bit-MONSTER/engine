@@ -70,14 +70,15 @@ fi
 if [ -f /data/1bit.conf ]; then
     . /data/1bit.conf
     if [ -n "$MODEL" ]; then
-        1bit serve -m "$MODEL" --device "${DEVICE:-auto}" --host 0.0.0.0 --port "${PORT:-8000}" $ARGS > /tmp/serve.log 2>&1 &
-        echo "serving $MODEL on port ${PORT:-8000} (log: /tmp/serve.log)"
+        # BIND defaults to loopback: serve has no authentication, so the network is an explicit opt-in
+        1bit serve -m "$MODEL" --device "${DEVICE:-auto}" --host "${BIND:-127.0.0.1}" --port "${PORT:-8000}" $ARGS > /tmp/serve.log 2>&1 &
+        echo "serving $MODEL on ${BIND:-127.0.0.1}:${PORT:-8000} (log: /tmp/serve.log)"
     fi
 fi
 
 echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
-echo; echo "Serve a model:  1bit serve -m /data/models/<file.gguf> --host 0.0.0.0   (auto: HRX0)"; echo
+echo; echo "Serve a model:  1bit serve -m /data/models/<file.gguf>   (auto: HRX0; local only, --host 0.0.0.0 opens it to the network)"; echo
 
 # 1bit.check on the kernel command line: check the userspace starts, report, power off (for CI
 # and for QEMU, which has neither the GPU nor the NPU)

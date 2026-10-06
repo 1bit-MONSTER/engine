@@ -53,6 +53,13 @@ One model per process:
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
 inherits it). On `npu`, `ds4` and `mlx` they answer 501.
 
+`1bit serve` has no authentication (SECURITY.md), so it refuses two kinds of request a web
+page could make with 403: on a loopback `--host`, any whose `Host` header is not a loopback
+name (`localhost`, `127.x.x.x`, `[::1]`), and on any host, a POST whose `Origin` is neither a
+loopback origin nor the server's own. API clients send no `Origin`. A reverse proxy in front
+of a loopback serve must pass the upstream host (nginx's default `proxy_set_header Host
+$proxy_host`), not the public one.
+
 ## Where the model runs
 
 | Model | `--device` | Runs on |

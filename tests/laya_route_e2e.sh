@@ -90,5 +90,14 @@ first=$(echo "$seen" | awk '{print $1}')
 check "second turn reuses the decision (decisions $decisions_before -> $decisions_after)" '[ "$decisions_after" = "$decisions_before" ]'
 check "  and goes to the same device ($first)" 'grep -q "device:$first" "$scratch/reply2.json"'
 
+# a conversation seen first at a later turn is classified on its head (the messages through the
+# first user message, which is all its cache key covers), not on the turns after it
+read -r head_cls _ head_dev < <("$bin" route --laya-model "$laya_model" --route-policy "$policy" \
+    --devices "$devices" --classify --state "${states[2]}" 2>/dev/null)
+body=$(python3 -c 'import json,sys; print(json.dumps({"model":"other","messages":[{"role":"user","content":sys.argv[1]},{"role":"assistant","content":"391"},{"role":"user","content":sys.argv[2]}]}))' "${states[2]}" "${states[1]}")
+hdr=$(curl -s -D - -o "$scratch/reply3.json" "$api/v1/chat/completions" -H 'Content-Type: application/json' -d "$body" \
+    | tr -d '\r' | sed -n 's/^[Xx]-1bit-[Rr]oute: //p')
+check "a new conversation's later turns do not decide its class ($hdr)" '[[ "$hdr" == "$head_cls "*" $head_dev" ]]'
+
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo FAIL; exit 1; fi
 echo PASS

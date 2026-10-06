@@ -46,8 +46,8 @@ Model::Model(const std::string& dir) {
     uint64_t header = 0;
     if (size_ < 8) throw std::runtime_error(path + ": truncated");
     std::memcpy(&header, map_, 8);
-    if (8 + header > size_) throw std::runtime_error(path + ": header past the end of the file");
-    const uint64_t base = 8 + header;
+    if (header > size_ - 8) throw std::runtime_error(path + ": header past the end of the file");
+    const uint64_t base = 8 + header;  // <= size_
     const auto table = nlohmann::json::parse(map_ + 8, map_ + 8 + header);
     for (const auto& [name, t] : table.items()) {
         if (!t.is_object() || !t.contains("data_offsets")) continue;  // __metadata__
@@ -55,10 +55,12 @@ Model::Model(const std::string& dir) {
         x.dtype = t.value("dtype", "");
         x.shape = t.at("shape").get<std::vector<int64_t>>();
         const auto off = t.at("data_offsets").get<std::vector<uint64_t>>();
-        if (off.size() != 2 || off[1] < off[0] || base + off[1] > size_)
+        // compared against what is left after base, never base + offset (which can wrap)
+        if (off.size() != 2 || off[1] < off[0] || off[1] > size_ - base)
             throw std::runtime_error(path + ": bad data_offsets for " + name);
         x.data = map_ + base + off[0];
         x.bytes = off[1] - off[0];
+        x.avail = size_ - base - off[0];
         tensors_.emplace(name, std::move(x));
     }
 

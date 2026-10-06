@@ -27,10 +27,15 @@ here=$(cd "$(dirname "$0")" && pwd)
 scratch=$(mktemp -d)
 touch "$scratch/tiny.gguf"
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+export FAKE_BACKEND_EVENTS="$scratch/events"
 "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias smoke-model \
     --llama-server "$here/fake_backend.py" >"$scratch/serve.log" 2>&1 &
 pid=$!
-cleanup() { kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; rm -rf "$scratch"; }
+cleanup() {
+    kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    [ -s "$scratch/impostor" ] && kill -9 "$(cat "$scratch/impostor")" 2>/dev/null
+    rm -rf "$scratch"
+}
 trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
@@ -51,6 +56,25 @@ chunks=$(curl -sN "$api/v1/chat/completions" -H 'Content-Type: application/json'
     -d '{"model": "smoke-model", "stream": true, "messages": [{"role": "user", "content": "hi"}]}' | grep -c '^data: {')
 check "SSE relayed ($chunks chunks)" '[ "$chunks" = 7 ]'
 
+# No authentication, so a web page must not drive it: a rebound hostname and a cross-site POST
+# are refused; API clients (no Origin) and loopback pages are not.
+code=$(curl -s -o /dev/null -w '%{http_code}' -H 'Host: rebind.example:80' "$api/v1/models")
+check "a foreign Host is refused ($code)" '[ "$code" = 403 ]'
+code=$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: text/plain' \
+    -H 'Origin: https://evil.example' -d '{"messages": [{"role": "user", "content": "hi"}]}')
+check "a cross-site POST is refused ($code)" '[ "$code" = 403 ]'
+code=$(curl -s -o /dev/null -w '%{http_code}' "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -H 'Origin: http://localhost:3000' -d '{"messages": [{"role": "user", "content": "hi"}]}')
+check "a loopback page's POST is served ($code)" '[ "$code" = 200 ]'
+
+# A client that hangs up on a non-streamed request: serve closes the backend connection too,
+# so the backend can stop generating (the fake one notes which happened).
+curl -s -m 1 -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"model": "smoke-model", "fake_delay": 5, "messages": [{"role": "user", "content": "hi"}]}'
+for _ in $(seq 1 40); do [ -s "$scratch/events" ] && break; sleep 0.1; done
+check "a client disconnect reaches the backend ($(cat "$scratch/events" 2>/dev/null))" \
+    '[ "$(cat "$scratch/events" 2>/dev/null)" = cancelled ]'
+
 child=$(pgrep -P "$pid" | head -1)
 kill -9 "$pid"; wait "$pid" 2>/dev/null
 sleep 1
@@ -60,6 +84,17 @@ fi
 
 both=$("$bin" serve -m "$scratch/tiny.gguf" --device cpu --mtp a.gguf --dflash b.gguf 2>&1); both_rc=$?
 check "--mtp with --dflash is refused" '[ "$both_rc" != 0 ] && [[ "$both" == *"pick one"* ]]'
+
+if [ "$(uname)" = Linux ]; then
+    # Another process answers on the backend's port (the fake backend detaches one and does not
+    # listen itself): serve must refuse it rather than route requests there.
+    port2=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    FAKE_BACKEND_IMPOSTOR="$scratch/impostor" timeout 30 "$bin" serve -m "$scratch/tiny.gguf" --device cpu \
+        --port "$port2" --llama-server "$here/fake_backend.py" >"$scratch/impostor.log" 2>&1
+    imp_rc=$?
+    check "a port held by another process is refused (rc $imp_rc)" \
+        '[ "$imp_rc" = 1 ] && grep -q "not from the backend serve started" "$scratch/impostor.log"'
+fi
 
 if [ $fail -ne 0 ]; then echo "--- serve log"; cat "$scratch/serve.log"; echo FAIL; exit 1; fi
 echo PASS

@@ -106,6 +106,10 @@ add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
 add_test(NAME think_split COMMAND think_split_test)
+# Host / Origin checks every engine HTTP server applies (app/http_guard.h); header only, runs in CI.
+add_executable(http_guard_test tests/http_guard_test.cpp)
+target_include_directories(http_guard_test PRIVATE app)
+add_test(NAME http_guard COMMAND http_guard_test)
 # general.architecture from a GGUF header (app/gguf_meta.h), which routes fork-only
 # architectures to our llama.cpp; header only, runs in CI.
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)
@@ -223,6 +227,11 @@ if(CMAKE_SYSTEM_NAME STREQUAL "Linux")
     target_link_libraries(onebit_moe PUBLIC Threads::Threads)
     target_link_libraries(onebit PRIVATE onebit_moe)
     target_compile_definitions(onebit PRIVATE ONEBIT_MOE)
+    # Crafted GGUF headers the --moe-slots index must refuse (written at run time); runs in CI.
+    add_executable(moe_gguf_index_test tests/moe_gguf_index_test.cpp)
+    target_link_libraries(moe_gguf_index_test PRIVATE onebit_moe)
+    add_test(NAME moe_gguf_index COMMAND moe_gguf_index_test)
+    set_tests_properties(moe_gguf_index PROPERTIES TIMEOUT 60)
 endif()
 
 # ── Step 4: Laya router (docs/laya.md) ───────────────────────────────────
@@ -255,6 +264,10 @@ add_executable(laya_gate tests/laya_gate.cpp)
 add_executable(laya_encoder_test tests/laya_encoder_test.cpp)
 target_link_libraries(laya_encoder_test PRIVATE onebit_laya)
 add_test(NAME laya_encoder COMMAND laya_encoder_test)
+# Crafted Laya checkpoints the reader and the scorer must refuse (written at run time); runs in CI.
+add_executable(laya_bounds_test tests/laya_bounds_test.cpp)
+target_link_libraries(laya_bounds_test PRIVATE onebit_laya nlohmann_json::nlohmann_json)
+add_test(NAME laya_bounds COMMAND laya_bounds_test)
 add_executable(laya_classify_eval tests/laya_classify_eval.cpp)
 target_link_libraries(laya_classify_eval PRIVATE onebit_laya nlohmann_json::nlohmann_json)
 target_link_libraries(laya_gate PRIVATE onebit_laya nlohmann_json::nlohmann_json)
@@ -319,10 +332,23 @@ target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
 add_executable(npu_pack_test tests/npu_pack_test.cpp)
 target_link_libraries(npu_pack_test PRIVATE onebit_npu)
+# Crafted model.q4nx files the loader and the packer must refuse (written at run time); runs in CI.
+add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
+target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)
+add_test(NAME npu_model_bounds COMMAND npu_model_bounds_test)
+# The forward's Q4NX loader is plain C (no XRT), so its crafted-file checks run in CI too.
+add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forward/src/model.c)
+target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
+target_link_libraries(npu_forward_loader_test PRIVATE m)
+add_test(NAME npu_forward_loader COMMAND npu_forward_loader_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")
 add_executable(tokenizer_test tests/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE onebit_npu)
+# Large inputs tokenize in linear time (a synthetic vocabulary, no model needed); runs in CI.
+add_executable(tokenizer_linear_test tests/tokenizer_linear_test.cpp)
+target_link_libraries(tokenizer_linear_test PRIVATE onebit_npu)
+add_test(NAME tokenizer_linear COMMAND tokenizer_linear_test ${CMAKE_SOURCE_DIR}/tests/data/tokenizer_linear.json)
 if(ONEBIT_NPU_MODEL)
     add_test(NAME tokenizer_qwen3
              COMMAND tokenizer_test ${ONEBIT_NPU_MODEL}/tokenizer.json ${CMAKE_SOURCE_DIR}/tests/data/qwen3_tokenizer_golden.json)

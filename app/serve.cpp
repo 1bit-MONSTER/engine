@@ -79,6 +79,7 @@
 #endif
 
 #include <httplib.h>
+#include "http_guard.h"
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
@@ -91,8 +92,10 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <future>
 #include <memory>
 #include <mutex>
+#include <sstream>
 #include <unordered_map>
 #include <deque>
 #include <stdexcept>
@@ -120,6 +123,7 @@
 #endif
 
 #ifndef _WIN32
+#include <pwd.h>
 extern char** environ;
 #endif
 
@@ -323,6 +327,65 @@ int free_port() {
     return port;
 }
 
+#if defined(__linux__)
+// Who holds a loopback port: the backend serve started (or a process it started), or someone
+// else. free_port() releases its port before the child binds it, so another local process could
+// bind it first and answer the readiness probe; serve must not send it client requests.
+enum class PortOwner { kOurs, kOther, kUnknown };
+
+PortOwner port_owner(pid_t child, int port) {
+    // the LISTEN sockets on the port (any address), by inode
+    std::vector<std::string> inodes;
+    bool readable = false;
+    for (const char* table : {"/proc/net/tcp", "/proc/net/tcp6"}) {
+        std::ifstream f(table);
+        if (!f) continue;
+        readable = true;
+        std::string line;
+        std::getline(f, line);  // header
+        while (std::getline(f, line)) {
+            // sl local_address rem_address st tx:rx tr:when retrnsmt uid timeout inode
+            std::istringstream in(line);
+            std::string sl, local, remote, st, txrx, trwhen, retr, uid, timeout, inode;
+            if (!(in >> sl >> local >> remote >> st >> txrx >> trwhen >> retr >> uid >> timeout >> inode)) continue;
+            const size_t colon = local.rfind(':');
+            if (st != "0A" || colon == std::string::npos) continue;  // 0A: LISTEN
+            if (std::strtol(local.c_str() + colon + 1, nullptr, 16) == port) inodes.push_back("socket:[" + inode + "]");
+        }
+    }
+    if (!readable || inodes.empty()) return PortOwner::kUnknown;
+    // the child and its descendants (a backend may be a wrapper that starts the real server)
+    std::unordered_map<pid_t, pid_t> parent;
+    std::error_code ec;
+    for (const auto& ent : fs::directory_iterator("/proc", ec)) {
+        const std::string name = ent.path().filename().string();
+        if (name.empty() || name.find_first_not_of("0123456789") != std::string::npos) continue;
+        std::ifstream st(ent.path() / "stat");
+        std::string stat;
+        std::getline(st, stat);
+        const size_t close = stat.rfind(')');  // the command name may hold spaces and parentheses
+        if (close == std::string::npos) continue;
+        std::istringstream rest(stat.substr(close + 1));
+        std::string state;
+        long ppid = 0;
+        if (rest >> state >> ppid) parent[pid_t(std::stol(name))] = pid_t(ppid);
+    }
+    for (const auto& [pid, _] : parent) {
+        bool ours = false;
+        for (pid_t p = pid, hops = 0; p > 1 && hops < 64; p = parent.count(p) ? parent[p] : 0, ++hops)
+            if (p == child) { ours = true; break; }
+        if (!ours) continue;
+        const fs::path fds = fs::path("/proc") / std::to_string(pid) / "fd";
+        for (const auto& fd : fs::directory_iterator(fds, ec)) {
+            std::error_code lec;
+            const std::string target = fs::read_symlink(fd.path(), lec).string();
+            if (!lec && std::find(inodes.begin(), inodes.end(), target) != inodes.end()) return PortOwner::kOurs;
+        }
+    }
+    return PortOwner::kOther;
+}
+#endif
+
 // A child OpenAI-compatible server on a loopback port.
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
@@ -463,7 +526,16 @@ public:
         const auto end = std::chrono::steady_clock::now() + timeout;
         while (std::chrono::steady_clock::now() < end) {
             if (!alive() || stop) return false;
-            if (auto r = c.Get(ready_path_); r && r->status == 200) return true;
+            if (auto r = c.Get(ready_path_); r && r->status == 200) {
+#if defined(__linux__)
+                if (port_owner(pid_, port_) == PortOwner::kOther) {
+                    std::fprintf(stderr, "1bit serve: port %d answers, but not from the backend serve started (pid %d); "
+                                         "refusing to use it\n", port_, int(pid_));
+                    return false;
+                }
+#endif
+                return true;
+            }
             std::this_thread::sleep_for(std::chrono::milliseconds(250));
         }
         return false;
@@ -522,7 +594,16 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     if (!stream) {
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
-        auto r = c.Post(path, payload, "application/json");
+        // The backend learns of a client that hung up only when serve closes its own connection:
+        // wait for the reply on another thread and close it as soon as the client is gone.
+        auto pending = std::async(std::launch::async, [&] { return c.Post(path, payload, "application/json"); });
+        bool closed = false;
+        while (pending.wait_for(std::chrono::milliseconds(100)) != std::future_status::ready)
+            if (!closed && req.is_connection_closed()) {
+                closed = true;
+                c.stop();
+            }
+        auto r = pending.get();
         if (!r) {
             res.status = 502;
             res.set_content(R"({"error":{"message":"backend did not answer"}})", "application/json");
@@ -1105,7 +1186,10 @@ onebit::laya::RequestClass classify_request_gguf(LayaDaemon& d, const std::strin
 #endif
 #endif
 
-std::string request_state(const httplib::Request& req) {
+// With head_only, a chat request contributes only what conversation_key() covers (the messages
+// through the first user message): the class cached under a key must not depend on anything
+// the key leaves out, or one client's later turns could decide another client's routing.
+std::string request_state(const httplib::Request& req, bool head_only = false) {
     json body;
     try {
         body = json::parse(req.body);
@@ -1116,7 +1200,12 @@ std::string request_state(const httplib::Request& req) {
     std::string out;
     if (body.contains("messages") && body["messages"].is_array())
         for (const auto& m : body["messages"]) {
-            if (!m.is_object() || !m.contains("content")) continue;
+            if (!m.is_object()) continue;
+            const bool user = m.contains("role") && m["role"].is_string() && m["role"].get<std::string>() == "user";
+            if (!m.contains("content")) {
+                if (head_only && user) break;
+                continue;
+            }
             auto add = [&](const std::string& t) {
                 if (t.empty()) return;
                 if (!out.empty()) out += "\n";
@@ -1127,6 +1216,7 @@ std::string request_state(const httplib::Request& req) {
             else if (c.is_array())
                 for (const auto& part : c)
                     if (part.is_object() && part.value("type", "") == "text") add(part.value("text", ""));
+            if (head_only && user) break;
         }
     return out;
 }
@@ -1287,6 +1377,7 @@ int serve_child(const Options& given) {
     std::atomic<bool> ready{false};
 
     httplib::Server srv;
+    install_request_guard(srv, o.host);  // Host / Origin (app/http_guard.h)
     auto health = [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
         res.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");
@@ -1356,10 +1447,10 @@ int serve_child(const Options& given) {
             if (cls.label.empty()) {
                 std::lock_guard<std::mutex> lock(scorer_mu);  // the scorer is not reentrant
 #if defined(__linux__)
-                if (laya_daemon) cls = classify_request_gguf(*laya_daemon, request_state(q));
+                if (laya_daemon) cls = classify_request_gguf(*laya_daemon, request_state(q, true));
                 else
 #endif
-                cls = onebit::laya::classify_request(*scorer, request_state(q));
+                cls = onebit::laya::classify_request(*scorer, request_state(q, true));
                 fresh = true;
             }
             if (cls.label.empty()) {
@@ -1586,17 +1677,27 @@ std::string command_text(const std::vector<std::string>& argv) {
     return text;
 }
 
+// The Q4NX cache root: $ONEBIT_Q4NX_CACHE, else ~/.cache/1bit/q4nx. With HOME unset this used to
+// be /tmp/.cache, which every local user can write; a cached directory there would be served
+// (weights, tokenizer, kernel directory) without knowing who made it. The home directory now
+// comes from the user database instead, and serve refuses rather than guess.
+std::string q4nx_cache_root() {
+    if (const char* c = std::getenv("ONEBIT_Q4NX_CACHE"); c && *c) return c;
+    if (const char* h = std::getenv("HOME"); h && *h) return std::string(h) + "/.cache/1bit/q4nx";
+#ifndef _WIN32
+    if (const passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir && *pw->pw_dir)
+        return std::string(pw->pw_dir) + "/.cache/1bit/q4nx";
+#endif
+    throw std::runtime_error("no home directory for the Q4NX cache: set HOME or ONEBIT_Q4NX_CACHE");
+}
+
 // Repack a GGUF into a Q4NX model directory with the FLM_Q4NX_Converter
 // (Python), cached by GGUF stem so a repeated serve reuses the conversion.
 // Override the tool paths with ONEBIT_Q4NX_PYTHON / ONEBIT_Q4NX_CONVERTER and
 // the cache root with ONEBIT_Q4NX_CACHE.
 std::string repack_gguf(const std::string& gguf) {
     const std::string stem = fs::path(gguf).stem().string();
-    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
-    if (cache.empty()) {
-        const char* home = std::getenv("HOME");
-        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
-    }
+    const std::string cache = q4nx_cache_root();
     const std::string out = cache + "/" + stem;
 
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");
@@ -1703,11 +1804,7 @@ std::string repack_gguf(const std::string& gguf) {
 // so the caller falls back to the per-op forward instead of failing.
 std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_dir) {
     const std::string stem = fs::path(gguf).stem().string();
-    std::string cache = std::getenv("ONEBIT_Q4NX_CACHE") ? std::getenv("ONEBIT_Q4NX_CACHE") : "";
-    if (cache.empty()) {
-        const char* home = std::getenv("HOME");
-        cache = (home ? std::string(home) : std::string("/tmp")) + "/.cache/1bit/q4nx";
-    }
+    const std::string cache = q4nx_cache_root();
     const std::string out = cache + "/" + stem + "-lane";
 
     const char* py = std::getenv("ONEBIT_Q4NX_PYTHON");

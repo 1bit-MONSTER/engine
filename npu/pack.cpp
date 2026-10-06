@@ -50,6 +50,24 @@ namespace {
 
 int groups(int k) { return (k + 127) / 128; }  // 128-wide contraction groups, ceil
 
+// The source tiles reorder_tiles(dst, src, n_tiles, G) reads: the highest index it touches, plus one.
+size_t tiles_read(int n_tiles, int G) {
+    if (n_tiles <= 0 || G <= 0) return 0;
+    const int S = (G + 1) / 2;
+    size_t most = 0;
+    for (int o = 0; o < n_tiles; ++o) {
+        const int og = o % G;
+        most = std::max(most, size_t(G * (o / G) + (og / 2) % S + S * (og % 2)) + 1);
+    }
+    return most;
+}
+
+// A tensor's shape decides how much the packer reads; refuse one whose reads would run past the
+// end of model.q4nx.
+void need(const Tensor& t, size_t bytes, const char* what) {
+    if (bytes > t.avail) throw std::runtime_error(std::string("model.q4nx: ") + what + " runs past the end of the file");
+}
+
 const char* const kProj[] = {"self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
                              "self_attn.o_proj.weight", "mlp.up_proj.weight",      "mlp.gate_proj.weight",
                              "mlp.down_proj.weight"};
@@ -76,8 +94,16 @@ int pack_layer_weights(const Model& m, int L, uint8_t* dst) {
 
     const int off_q = 0, off_k = off_q + q.tiles(), off_v = off_k + k.tiles(), off_o = off_v + v.tiles(),
               off_gu = off_o + o.tiles(), off_d = off_gu + up.tiles() + gate.tiles(), total = off_d + down.tiles();
+    if (CH <= 0 || G_h <= 0 || G_o <= 0 || G_d <= 0) throw std::runtime_error("config.json: dims too small for the fast lane");
+    // gate/up interleave in whole CH-tile chunks; the region holds up.tiles() + gate.tiles() tiles
+    const int up_chunks = (up.tiles() + CH - 1) / CH;
+    if (up.tiles() != gate.tiles() || up_chunks * 2 * CH > up.tiles() + gate.tiles())
+        throw std::runtime_error("model.q4nx: layer " + std::to_string(L) + " gate/up tiles do not fill whole chunks");
     std::memset(dst, 0, size_t(total) * kTileBytes);
-    auto proj = [&](const Tensor& t, int off, int G) { reorder_tiles(dst + size_t(off) * kTileBytes, t.data, t.tiles(), G); };
+    auto proj = [&](const Tensor& t, int off, int G) {
+        need(t, tiles_read(t.tiles(), G) * kTileBytes, "a projection");
+        reorder_tiles(dst + size_t(off) * kTileBytes, t.data, t.tiles(), G);
+    };
     proj(q, off_q, G_h);
     proj(k, off_k, G_h);
     proj(v, off_v, G_h);
@@ -87,6 +113,8 @@ int pack_layer_weights(const Model& m, int L, uint8_t* dst) {
     for (int c = 0; c < (up_t + CH - 1) / CH; ++c) {
         const int up_n = std::min(CH, up_t - c * CH), gate_n = std::min(CH, gate_t - c * CH);
         const size_t base = size_t(off_gu + c * 2 * CH);
+        if (up_n > 0) need(up, (size_t(c) * CH + tiles_read(up_n, G_h)) * kTileBytes, "mlp.up_proj");
+        if (gate_n > 0) need(gate, (size_t(c) * CH + tiles_read(gate_n, G_h)) * kTileBytes, "mlp.gate_proj");
         if (up_n > 0) reorder_tiles(dst + base * kTileBytes, up.data + size_t(c) * CH * kTileBytes, up_n, G_h);
         if (gate_n > 0)
             reorder_tiles(dst + (base + CH) * kTileBytes, gate.data + size_t(c) * CH * kTileBytes, gate_n, G_h);
@@ -99,21 +127,32 @@ size_t lmhead_weight_bytes(const Model& m) { return size_t(m.tensor("lm_head.wei
 
 void pack_lmhead_weights(const Model& m, uint8_t* dst) {
     const Tensor& t = m.tensor("lm_head.weight");
+    if (m.dims().hidden / 128 <= 0) throw std::runtime_error("config.json: hidden_size too small for the fast lane");
+    need(t, tiles_read(t.tiles(), m.dims().hidden / 128) * kTileBytes, "lm_head.weight");
     reorder_tiles(dst, t.data, t.tiles(), m.dims().hidden / 128);
 }
 
 void fill_i5(const Model& m, int L, uint8_t* dst) {
     const size_t H2 = size_t(m.dims().hidden) * 2;
-    std::memcpy(dst, m.layer(L, "input_layernorm.weight").data, H2);
-    std::memcpy(dst + H2, m.layer(L, "post_attention_layernorm.weight").data, H2);
+    const Tensor &in = m.layer(L, "input_layernorm.weight"), &post = m.layer(L, "post_attention_layernorm.weight");
+    need(in, H2, "input_layernorm.weight");
+    need(post, H2, "post_attention_layernorm.weight");
+    std::memcpy(dst, in.data, H2);
+    std::memcpy(dst + H2, post.data, H2);
 }
 
 void fill_i6(const Model& m, int L, uint8_t* dst) {
     std::memset(dst, 0, kNormBytes);
     fill_rope(reinterpret_cast<uint16_t*>(dst), 0, m.dims().rope_theta);
     // Models without q/k norms leave those slots zero, as the reference runtime does.
-    if (const Tensor* qn = m.find_layer(L, "self_attn.q_norm.weight")) std::memcpy(dst + 256, qn->data, 256);
-    if (const Tensor* kn = m.find_layer(L, "self_attn.k_norm.weight")) std::memcpy(dst + 512, kn->data, 256);
+    if (const Tensor* qn = m.find_layer(L, "self_attn.q_norm.weight")) {
+        need(*qn, 256, "self_attn.q_norm.weight");
+        std::memcpy(dst + 256, qn->data, 256);
+    }
+    if (const Tensor* kn = m.find_layer(L, "self_attn.k_norm.weight")) {
+        need(*kn, 256, "self_attn.k_norm.weight");
+        std::memcpy(dst + 512, kn->data, 256);
+    }
 }
 
 // inv_freq for theta = 1e6, as float32 literals. The reference runtime keeps this

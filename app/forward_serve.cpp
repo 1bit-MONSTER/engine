@@ -32,8 +32,10 @@
 #include <xrt/xrt_device.h>
 
 #include <httplib.h>
+#include "http_guard.h"
 #include <nlohmann/json.hpp>
 
+#include <algorithm>
 #include <atomic>
 #include <chrono>
 #include <cstdio>
@@ -62,6 +64,7 @@ struct ForwardEngine {
     std::unique_ptr<Q4nxNpuForward> fwd;
     int eos = -1;
     int endoftext = -1;
+    int max_context = 0;   // config.json max_position_embeddings: prompt plus answer
     std::mutex mu;
 };
 
@@ -129,20 +132,33 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         return;
     }
     const int max_tokens = body.value("max_completion_tokens", body.value("max_tokens", 256));
+    // A prompt this long cannot fit the context whatever it tokenizes to; refuse it before
+    // spending time on it.
+    if (prompt.size() > size_t(e.max_context) * 16) {
+        res.status = 400;
+        res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
+        return;
+    }
     const bool stream = body.value("stream", false);
     const std::string id = now_id(chat ? "chatcmpl-" : "cmpl-");
     const long created = long(std::chrono::duration_cast<std::chrono::seconds>(
                                   std::chrono::system_clock::now().time_since_epoch()).count());
     const std::string object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
-    auto run = [&e, prompt, max_tokens, chat](const std::function<bool(const std::string&)>& on_text) {
-        std::lock_guard<std::mutex> lock(e.mu);
+    auto run = [&e, &req, prompt, max_tokens, chat](const std::function<bool(const std::string&)>& on_text) {
+        // The tokenizer is const and keeps no per-call state, so it runs before the lock.
         std::vector<int> ids = e.tok->encode(prompt);
         // A chat template that opens with {{- bos_token }} (MiniCPM5 and other
         // llama-class models) needs the BOS id: the ChatML prompt built above never
         // carries it, and those models derail into their special tokens without it.
         if (chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
+        // The KV cache grows with every position: the prompt and the answer together stay
+        // inside the model's context.
+        const int room = e.max_context - int(ids.size());
+        if (room < 1) throw std::runtime_error("prompt longer than the context");
+        const int limit = std::clamp(max_tokens, 0, room);
+        std::lock_guard<std::mutex> lock(e.mu);
 
         auto argmax = [](const std::vector<float>& v) {
             int a = 0;
@@ -170,7 +186,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
 
         std::string pending;
         bool stopped_at_eos = false;
-        for (int n = 0; n < max_tokens; n++) {
+        for (int n = 0; n < limit; n++) {
+            if (req.is_connection_closed()) break;  // the client is gone: free the NPU
             const int next = argmax(logits);
             if (next == e.eos || (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
             pending += e.tok->decode(next);
@@ -285,6 +302,9 @@ int run_forward_serve(int argc, char** argv) {
     e.add_bos = json_int(cfg, "add_bos_token", 0) != 0;
     e.eos = json_int(cfg, "eos_token_id", -1);
     e.endoftext = e.tok->token_id("<|endoftext|>");
+    // q4nx_config_int finds the key at any depth (a text_config's too).
+    e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
+    if (e.max_context <= 0) e.max_context = 32768;
 
     e.fwd = std::make_unique<Q4nxNpuForward>();
 
@@ -318,6 +338,7 @@ int run_forward_serve(int argc, char** argv) {
 
     std::atomic<bool> ready{false};
     httplib::Server srv;
+    install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
     srv.Get("/health", [&](const httplib::Request&, httplib::Response& r) {
         r.status = ready ? 200 : 503;
         r.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");

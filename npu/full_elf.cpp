@@ -59,22 +59,25 @@ std::map<std::string, Section> sections(const Bytes& e) {
     const uint32_t strtab = hdr(si, 4);
     std::map<std::string, Section> out;
     for (int i = 0; i < n; ++i) {
-        const size_t name = strtab + hdr(i, 0);
+        const size_t name = size_t(strtab) + hdr(i, 0);
+        if (name >= e.size()) fail("a section name lies past the end of the file");
         const auto end = std::find(e.begin() + long(name), e.end(), 0);
         out[std::string(e.begin() + long(name), end)] = {hdr(i, 4), hdr(i, 5)};
     }
     return out;
 }
 
-Section section(const std::map<std::string, Section>& s, const char* name) {
+// A named section of `e`, which must lie inside it.
+Section section(const Bytes& e, const std::map<std::string, Section>& s, const char* name) {
     auto it = s.find(name);
     if (it == s.end()) fail(std::string("no ") + name + " section");
+    if (uint64_t(it->second.offset) + it->second.size > e.size()) fail(std::string(name) + " runs past the end of the file");
     return it->second;
 }
 
 // The 16-byte descriptor of the XRT UID note: namesz 4 ("XRT\0"), descsz 16.
 size_t uid_offset(const Bytes& e) {
-    const Section n = section(sections(e), ".note.xrt.UID");
+    const Section n = section(e, sections(e), ".note.xrt.UID");
     if (n.size != 32 || rd32(e, n.offset) != 4 || rd32(e, n.offset + 4) != 16) fail("unexpected UID note layout");
     return n.offset + 16;
 }
@@ -82,8 +85,7 @@ size_t uid_offset(const Bytes& e) {
 }  // namespace
 
 ElfSection elf_section(const Bytes& elf, const std::string& name) {
-    const Section s = section(sections(elf), name.c_str());
-    if (uint64_t(s.offset) + s.size > elf.size()) fail(name + " runs past the end of the file");
+    const Section s = section(elf, sections(elf), name.c_str());
     return {s.offset, s.size};
 }
 
@@ -126,7 +128,7 @@ Bytes derive_context(const Bytes& ctx1, const ContextMap& map, int n) {
 }
 
 void refresh_uid(Bytes& e) {
-    const Section ct = section(sections(e), ".ctrltext");
+    const Section ct = section(e, sections(e), ".ctrltext");
     const auto digest = md5({e.data() + ct.offset, ct.size});
     std::memcpy(e.data() + uid_offset(e), digest.data(), 16);
 }
@@ -136,8 +138,8 @@ void refresh_uid(Bytes& e) {
 Bytes assemble_full_elf(const Bytes& inst, const Bytes& pdi, const std::string& name, PdiMode mode,
                         uint32_t config) {
     const auto S = sections(inst);
-    const Section ct = section(S, ".ctrltext"), dsym = section(S, ".dynsym"), dstr = section(S, ".dynstr"),
-                  rel = section(S, ".rela.dyn");
+    const Section ct = section(inst, S, ".ctrltext"), dsym = section(inst, S, ".dynsym"),
+                  dstr = section(inst, S, ".dynstr"), rel = section(inst, S, ".rela.dyn");
 
     struct Sym {
         uint32_t name, value, size;
@@ -153,6 +155,7 @@ Bytes assemble_full_elf(const Bytes& inst, const Bytes& pdi, const std::string& 
         const size_t o = dsym.offset + 16u * i;
         syms.push_back({rd32(inst, o), rd32(inst, o + 4), rd32(inst, o + 8), inst[o + 12], inst[o + 13], rd16(inst, o + 14)});
     }
+    if (syms.empty()) fail(".dynsym has no symbols");
     std::vector<Rela> relas;
     for (uint32_t i = 0; i < rel.size / 12; ++i) {
         const size_t o = rel.offset + 12u * i;
@@ -199,7 +202,8 @@ Bytes assemble_full_elf(const Bytes& inst, const Bytes& pdi, const std::string& 
 
     // 2. Argument symbols: instruction-ELF convention (3 = first buffer) -> full-ELF (0).
     auto symname = [&](const Sym& s) {
-        const size_t o = dstr.offset + s.name;
+        if (s.name >= dstr.size) fail("a symbol name lies outside .dynstr");
+        const size_t o = size_t(dstr.offset) + s.name;
         return std::string(inst.begin() + long(o), std::find(inst.begin() + long(o), inst.end(), 0));
     };
     Bytes new_dynstr = {0};

@@ -196,6 +196,10 @@ cat > "$out/data.dir/1bit.conf.example" <<'CONF'
 MODEL=/data/models/Qwen3-32B-UD-Q4_K_XL.gguf
 DEVICE=auto
 PORT=8000
+# BIND: the address serve listens on. 127.0.0.1 (the default) keeps it on this machine; reach it
+# over SSH (ssh -L 8000:127.0.0.1:8000 ...). 0.0.0.0 opens it to every network the stick joins,
+# and serve has no authentication: anyone there can send it requests.
+BIND=127.0.0.1
 # anything else for 1bit serve, e.g. --mtp or --parallel 4
 ARGS=
 CONF

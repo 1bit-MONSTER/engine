@@ -1,6 +1,6 @@
 {
   "repo": "convaiinnovations/laya",
-  "revision": "55cf4c4ebb4ebe31b2550e8bdf3bd21b99753851",
+  "revision": "7b928d828b7b0e022f929d9bd2e44165aa270148",
   "note": "Laya's three checkpoints (root, multilingual/, typed-decisions/) at one Hugging Face revision; scripts/fetch-laya.sh downloads exactly this revision and checks every file's hash against the Hub's file list.",
   "gguf": {
     "repo": "mys/laya-typed-decisions-GGUF",

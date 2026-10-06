@@ -1,0 +1,8 @@
+Lemonade backend: onnxruntime (cpu)
+Ship: yes
+Project: ort-server, https://github.com/lemonade-sdk/ort-server
+Release: 0.3.7 (ort-server-0.3.7-linux-x64.tar.gz)
+License: Apache-2.0 (LICENSE inside the backend directory), with THIRD_PARTY_NOTICES.md and
+licenses/ (ONNX Runtime MIT, abseil, protobuf-lite, sentencepiece, tokenizers, oniguruma, ...)
+inside the backend directory.
+Source: https://github.com/lemonade-sdk/ort-server/tree/0.3.7

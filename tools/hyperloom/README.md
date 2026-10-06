@@ -111,3 +111,22 @@ show more than 100% of the DRAM roofline; KV lengths are the padded cache views;
 FLOPs include the masked half.
 
 Never put credentials in these files.
+
+## Known limitations (measured 2026-10-05, gfx1151, llama.cpp 522dab4)
+
+The profiling chain has three failure modes that were only found by running it, not by reading it. All three are handled
+so the chain still produces a trace, but two should be fixed rather than tolerated:
+
+1. **`iree-profile` must match the IREE that wrote the profile.** An older tool aborts with
+   `unsupported IREE HAL profile file version`. `hrx-tracelens.sh` now derives the tool from `HRX_BIN`'s own deps
+   build (falling back to `IREE_PROFILE`, then `PATH`) instead of a hard-coded path that may not exist.
+2. **The shape log needs a build carrying `GGML_HRX_DISPATCH_SHAPE_LOG`.** Without it the op-level half is empty.
+   Build the tree you benchmark with that flag, or point `HRX_SHAPELOG_BIN` at one that has it —
+   `custom_strixhalo.sh` warns loudly when the trace describes a different build.
+3. **`hrx2kineto.py`'s op-level match assumes command-buffer order equals the logged program's build order, and the
+   runtime does not guarantee that.** Observed: the dispatch *multiset* matches a program exactly while the *order*
+   differs (`copy_strided*` hoisted ahead of `concat_dim0`; `set_rows` moved), so `map_command_buffers()` reports
+   `matches no logged program` and no trace is written. When that happens `hrx-tracelens.sh` falls back to a
+   **kernel-level** trace (raw dispatch keys), which TraceLens accepts; the roofline is then coarser (op names in
+   "other") but real. The matcher still needs an order-independent key (the profile's `executable_id` /
+   `function_ordinal`, or per-dispatch identity).

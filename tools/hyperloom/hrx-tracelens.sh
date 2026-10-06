@@ -30,7 +30,14 @@ set -uo pipefail
 MODEL=$(readlink -f "$1"); MODE=$2; shift 2
 for kv in "$@"; do export "$kv"; done
 BIN=${HRX_BIN:-$HOME/wt/hrx2kineto-src/build/bin}
-IP=${IREE_PROFILE:-$HOME/wt/hrx-disasm-test2/bazel-bin/runtime/src/iree/tools/iree-profile/iree-profile}
+# iree-profile must match the IREE the HRX build wrote its profile with: a stale tool rejects the file with
+# "unsupported IREE HAL profile file version". The deps build a given HRX checkout uses sits beside its
+# bin/, so derive the tool from HRX_BIN; IREE_PROFILE overrides, then PATH.
+IP=${IREE_PROFILE:-}
+if [ -z "$IP" ] || [ ! -x "$IP" ]; then
+  IP=$(dirname "$(readlink -f "$BIN")")/../ggml/src/ggml-hrx/hrx/src/ggml-hrx-deps-build/runtime/src/iree/tools/iree-profile/iree-profile
+  [ -x "$IP" ] || IP=$(command -v iree-profile 2>/dev/null || echo "$IP")
+fi
 H2K=${H2K:-$(dirname "$(readlink -f "$0")")/hrx2kineto.py}
 TL=${TRACELENS_BIN:-$HOME/.cache/tracelens-venv/bin}
 ROOT=${OUT_ROOT:-$HOME/lb/tracelens}
@@ -78,6 +85,16 @@ echo "Tctl $(( $(cat $K/temp1_input) / 1000 )) C after the run" >> "$O/run.log"
 "$IP" command --format=jsonl "$O/run.prof" > "$O/commands.jsonl"
 python3 "$H2K" "$O/events.jsonl" "$O/trace.json" --shapes "$O/shapes.jsonl" --commands "$O/commands.jsonl" \
   --phase $PHASE --skip 1 --write-arch "$O/gfx1151.json" --summary | tee "$O/summary.txt"
+# FALLBACK: op-level conversion needs each command buffer's dispatch order to equal the logged program's build
+# order. The runtime can reorder dispatches inside a command buffer (multisets match, orders do not), in which
+# case map_command_buffers finds no candidate and writes no trace -- which used to fail the Hyperloom profile
+# phase outright. A kernel-level trace (raw dispatch keys; op names land in "other") is still accepted by
+# TraceLens with the extension and arch, so the phase produces real data instead of failing. Removing this needs
+# an order-independent matcher (see README "Known limitations").
+if [ ! -s "$O/trace.json" ]; then
+  echo "hrx-tracelens: op-level match found no program (runtime reorders command buffers vs the logged programs); falling back to a kernel-level trace" >&2
+  python3 "$H2K" "$O/events.jsonl" "$O/trace.json" 2>&1 | tee -a "$O/summary.txt" >&2
+fi
 CMP=()
 [ -n "${COMPARE:-}" ] && CMP=(--comparison_json_path "$COMPARE/trace.json")
 "$TL/TraceLens_generate_perf_report_pytorch" --profile_json_path "$O/trace.json" \

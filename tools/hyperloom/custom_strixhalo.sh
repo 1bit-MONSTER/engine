@@ -103,5 +103,45 @@ PP=$(guarded bench-pp timeout 900 $B/llama-bench -m "$GGUF" -dev HRX0 -p 512 -n 
 [ -z "$TG" ] && fail "llama-bench failed"
 # Lemonade's standard too (reported, not the optimisation metric): scripts/lemonade_bench.sh
 guarded lemonade-bench timeout 900 bash "$(dirname "$0")/lemonade_bench.sh" $B/llama-server "$GGUF" "$OUT/lemonade-bench.json" > /dev/null || echo "lemonade bench failed (see lemonade-bench.log)" >&2
+
+# 5. profile leg. Hyperloom announces it with PROFILE=1 and names the directory in
+#    VLLM_TORCH_PROFILER_DIR / SGLANG_TORCH_PROFILER_DIR (see bypass_scriptable.py).
+#    Its executor then probes <workspace>/torch_trace and globs *.trace.json.gz.
+#    Without this the three candidate dirs are all empty, the profile phase fails
+#    three times, and the whole pass continues in DEGRADED mode with no roofline
+#    to direct the search -- which is exactly what happened on 2026-09-30.
+#    The box lock is already held above (step 2), so BOX_LOCK is cleared for the
+#    helper: a second flock on the same file from a child would deadlock here.
+if [ "${PROFILE:-0}" = "1" ]; then
+  TD=${VLLM_TORCH_PROFILER_DIR:-${SGLANG_TORCH_PROFILER_DIR:-$OUT/torch_trace}}
+  mkdir -p "$TD"
+  TL=$(cd "$(dirname "$0")" && pwd)/hrx-tracelens.sh
+  # The trace MUST describe the binary just benchmarked: Hyperloom's own profile_custom.yaml warns that a trace of a
+  # different run is worthless, and the roofline directs the whole search. Prefer this checkout's build; fall back only
+  # if it cannot trace, and say so loudly, because the roofline is then about a different tree.
+  TB=$B
+  # `grep -c` reads to EOF so `strings` is never killed by SIGPIPE. With `grep -q` under
+  # `set -o pipefail` the pipeline returns non-zero when grep exits on the first match, and a
+  # killed `strings` made this check ALWAYS take the fallback -- which is why every profile leg
+  # failed even on a build that carries the shape log.
+  if [ "$(strings "$TB/libggml-hrx.so.0" 2>/dev/null | grep -c GGML_HRX_DISPATCH_SHAPE_LOG)" = "0" ]; then
+    TB=${HRX_SHAPELOG_BIN:-$HOME/wt/hrx2kineto-src/build/bin}
+    echo "profile leg: WARNING $B lacks GGML_HRX_DISPATCH_SHAPE_LOG; tracing $TB instead -- the trace describes a DIFFERENT build than the one benchmarked" >&2
+  fi
+  echo "profile leg: emitting an HRX trace into $TD from $TB" >&2
+  if [ -x "$TL" ]; then
+    O=$(BOX_LOCK= HRX_BIN=$TB OUT_ROOT="$TD/.." \
+        DECODE_TOKENS=8 bash "$TL" "$GGUF" decode 2>&1 | tail -n 1)
+    if [ -n "$O" ] && [ -f "$O/trace.json" ]; then
+      gzip -c "$O/trace.json" > "$TD/rank_0.trace.json.gz"
+      echo "profile leg: wrote $TD/rank_0.trace.json.gz ($(stat -c%s "$TD/rank_0.trace.json.gz") B)" >&2
+    else
+      echo "profile leg FAILED: hrx-tracelens.sh produced no trace.json" >&2
+    fi
+  else
+    echo "profile leg FAILED: $TL is not executable" >&2
+  fi
+fi
+
 result "$PASSED" "$TG" "$PP" "$PRE" "$DEC" "$WHY"
 echo "decode $TG tok/s, prefill $PP tok/s, gate $PASSED ($WHY)"

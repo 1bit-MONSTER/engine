@@ -27,6 +27,7 @@ OpenAI client.
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
+           [--pm [--pm-experts FILE] [--lemonade-url URL]]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
            [--parallel N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
@@ -135,6 +136,18 @@ else the build's copy, else the first one under `/opt/rocm-therock`.
 
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH.
+
+## The Project Manager (`--pm`)
+
+`--pm` makes the served model the Project Manager ([pm.md](pm.md)): on `/v1/chat/completions`
+it runs a tool loop instead of a plain forward. The model answers general conversation itself and
+delegates a task that fits an expert's domain with `delegate(expert, task, context)`; the engine
+turns that into one chat request to Lemonade (`--lemonade-url`, default `http://127.0.0.1:8000`)
+for the expert's catalog id, Lemonade loads the expert beside the PM, and the expert's answer
+comes back as the tool result. The experts are listed in `config/pm-experts.json` (built in;
+`--pm-experts FILE` replaces it). At most `pm.max_rounds` (4) rounds; a Lemonade that is down
+becomes a tool result that says so, and the PM answers alone. Every other route forwards
+unchanged. Lemonade's catalog entry `ZAYA1-8B-PM-1bit` runs this (recipe option `onebit_pm`).
 
 ## Images (`--mmproj`)
 

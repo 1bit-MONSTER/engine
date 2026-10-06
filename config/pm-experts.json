@@ -1,0 +1,39 @@
+{
+  "about": "Experts for `1bit serve --pm` (docs/pm.md). The served model (ZAYA1-8B) is the Project Manager: it answers general conversation itself and delegates a task to one of these experts with its delegate(expert, task, context) tool. `id` is the model's Lemonade catalog id; the PM asks Lemonade to run it, so an expert must be an entry Lemonade can load. Lemonade keeps at most two LLMs loaded, so one expert runs beside the PM at a time. Replace with --pm-experts FILE.",
+  "pm": {
+    "max_rounds": 4,
+    "max_result_bytes": 32768,
+    "delegate_timeout_s": 1800,
+    "thinking": false
+  },
+  "experts": [
+    {
+      "expert": "code",
+      "id": "Qwen2.5-Coder-7B-Instruct-1bit",
+      "domain": "programming",
+      "use_when": "Writing, fixing, explaining or reviewing code in any language; tests; shell commands; build errors. The default for code: light (4.7 GB) and quick to load.",
+      "max_tokens": 4096
+    },
+    {
+      "expert": "code-heavy",
+      "id": "Qwen3-Coder-30B-A3B-Instruct-1bit",
+      "domain": "programming, large tasks",
+      "use_when": "Large refactors, long repositories, multi-file changes or agentic coding where the 7B coder would not be enough. Costs an 18 GB load; prefer `code` unless the task is clearly big.",
+      "max_tokens": 8192
+    },
+    {
+      "expert": "reasoning",
+      "id": "Qwen3.8-27B-1bit",
+      "domain": "long reasoning, mathematics, analysis",
+      "use_when": "Multi-step mathematics, proofs, careful analysis of a long document, or any question where a long chain of reasoning decides the answer.",
+      "max_tokens": 8192
+    },
+    {
+      "expert": "agentic",
+      "id": "gpt-oss-20b-mxfp4-1bit",
+      "domain": "tool-heavy agentic tasks",
+      "use_when": "Tasks that call for planning many tool calls, structured outputs or function-calling-heavy workflows.",
+      "max_tokens": 4096
+    }
+  ]
+}

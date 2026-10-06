@@ -38,6 +38,10 @@
 //                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
 //   --laya with --device auto                   -> Laya classifies each conversation and the route
 //                                                  policy picks the device (RFC #186, docs/laya.md)
+//   --pm [--pm-experts FILE] [--lemonade-url U] -> the model is the Project Manager: each chat
+//                                                  completion runs a tool loop in which it answers
+//                                                  or delegates to an expert model Lemonade runs
+//                                                  (app/pm.cpp, docs/pm.md)
 //   --mtp <head.gguf> on hrx or cpu             -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
 //   --dflash <draft.gguf> on hrx or cpu         -> a DFlash block-diffusion draft model
@@ -56,6 +60,7 @@
 
 #include "gguf_meta.h"
 #include "hrx_archs.h"
+#include "pm.h"
 #include "recipes.h"
 
 #ifdef ONEBIT_MOE
@@ -152,6 +157,9 @@ struct Options {
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
+    bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
+    std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
+    std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -1256,6 +1264,15 @@ int serve_child(const Options& given) {
         if (o.laya_auto || !o.laya_model.empty())
             throw std::runtime_error("--laya routes among devices; a 1BP package runs on ds4 only");
     }
+    // --pm (docs/pm.md): the model is the Project Manager. Its chat completions run the tool loop
+    // in app/pm.cpp against the one backend; the experts are Lemonade's models, reached by URL.
+    pm::Config pm_cfg;
+    if (o.pm) {
+        if (o.laya_auto || !o.laya_model.empty())
+            throw std::runtime_error("--pm does not combine with --laya: the Project Manager routes among models, Laya among devices");
+        if (!o.role.empty()) throw std::runtime_error("--pm does not combine with --embedding/--reranking");
+        pm_cfg = pm::load_config(o.pm_experts, o.lemonade_url);
+    }
     std::vector<Launch> backends;
     // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
     // (code, prose, short, long_doc; laya/route.h) and the route policy (config/route-policy.json
@@ -1407,6 +1424,16 @@ int serve_child(const Options& given) {
         // choosing and reserving are one step, or a burst of requests all read "empty"
         std::shared_ptr<InFlight> held;
         size_t pick = 0;
+        if (o.pm && q.path == "/v1/chat/completions") {
+            // the Project Manager's tool loop (app/pm.cpp); /v1/completions forwards as usual
+            {
+                std::lock_guard<std::mutex> lock(route_mu);
+                held = std::make_shared<InFlight>(&inflight[0]);
+            }
+            ++routed[0];
+            pm::handle_chat(pm_cfg, backends[0].port, id, drop_model, set_model, q, r);
+            return;
+        }
 #ifdef ONEBIT_LAYA
         if (laya) {
             // one decision per conversation: later turns reuse the class of the first
@@ -1585,6 +1612,13 @@ int serve_child(const Options& given) {
     ready = true;
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), o.port,
                  laya ? " (laya routes each request; a device's backend starts when first picked)" : "");
+    if (o.pm) {
+        std::string experts;
+        for (const auto& e : pm_cfg.experts) experts += (experts.empty() ? "" : ", ") + e.key + "=" + e.id;
+        std::fprintf(stderr, "1bit serve: pm: %s is the project manager; experts through %s: %s (%s, %d rounds max)\n",
+                     id.c_str(), o.lemonade_url.c_str(), experts.empty() ? "none" : experts.c_str(),
+                     o.pm_experts.empty() ? "config/pm-experts.json" : o.pm_experts.c_str(), pm_cfg.max_rounds);
+    }
     auto all_alive = [&] {
         std::lock_guard<std::mutex> lock(start_mu);
         for (auto& c : children) if (!c->alive()) return false;
@@ -1847,6 +1881,9 @@ void usage(FILE* out) {
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
+                 "                  [--pm [--pm-experts FILE] [--lemonade-url URL]]   Project Manager: the model answers or\n"
+                 "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
+                 "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
@@ -1903,6 +1940,9 @@ int run_serve(int argc, char** argv) {
         else if (a == "--route-policy") o.route_policy = next();
         else if (a == "--recipes") o.recipes = next();
         else if (a == "--no-recipes") o.no_recipes = true;
+        else if (a == "--pm") o.pm = true;
+        else if (a == "--pm-experts") o.pm_experts = next();
+        else if (a == "--lemonade-url") o.lemonade_url = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }

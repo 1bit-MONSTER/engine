@@ -70,7 +70,10 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > ([docs/dwarfstar.md](docs/dwarfstar.md)). Step 4, the Laya router, has landed as an opt-in:
 > `1bit serve --laya` classifies each conversation (code, prose, short, long document; 95.5% on
 > 200 labelled requests) and a measured policy picks the device; the scorer runs on HRX at
-> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). Step 5, the model registry, has landed: of 334,413
+> 15-16 ms a decision ([docs/laya.md](docs/laya.md)). ZAYA1-8B is the engine's Project Manager:
+> `1bit serve --pm` (Lemonade entry `ZAYA1-8B-PM-1bit`) answers general chat itself and delegates
+> code, long reasoning and agentic tasks to expert models Lemonade loads beside it
+> ([docs/pm.md](docs/pm.md)). Step 5, the model registry, has landed: of 334,413
 > HF text-generation models with an architecture, 94.71% are mapped to a backend and 64.2%
 > have an architecture checked end to end on Strix Halo; a daily census keeps the counts
 > current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,

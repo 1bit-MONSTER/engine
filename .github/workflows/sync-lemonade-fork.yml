@@ -15,15 +15,22 @@
 #
 # Keep our Lemonade fork current (docs/lemonade.md): 1bit-MONSTER/lemonade is
 # upstream lemonade-sdk/lemonade plus the onebit backend that runs the engine.
-# Daily, this merges upstream main into the fork:
+# Daily, this merges upstream's latest release (not main; Lemonade releases most
+# Fridays and our weekly release builds on it) into the fork:
 #   - a clean merge that still registers onebit is pushed to the fork's main;
-#   - a conflicting merge is left for a person: upstream main is pushed to a
-#     sync/<sha> branch and a PR is opened IN THE FORK listing the conflicts.
+#   - a conflicting merge is left for a person: the release is pushed to a
+#     sync/<tag> branch and a PR is opened IN THE FORK listing the conflicts.
 # It then disables every workflow in the fork. Upstream's build, release,
-# website and PPA workflows must not run from the fork; a sync can add new ones.
+# website and PPA workflows must not run from the fork, so the merge never mirrors
+# upstream's workflow files at all: the fork's own .github is put back over the
+# merge result. That also keeps the token out of the `workflow` scope.
 #
-# Uses the secret HRX_BUMP_TOKEN, which needs Contents, Pull requests and
-# Actions read/write on 1bit-MONSTER/lemonade as well as on this repository.
+# Uses the secret HRX_BUMP_TOKEN, which needs Contents, Pull requests and Actions
+# read/write on 1bit-MONSTER/lemonade as well as on this repository. It does NOT need
+# the Workflows permission (classic token: the `workflow` scope): the sync never
+# creates or updates a workflow file, and the fork's workflows are all disabled anyway.
+# Every sync from 2026-09-26 to 2026-10-05 failed because an earlier version of this job
+# pushed upstream's workflow files, which GitHub refuses without that permission.
 name: sync-lemonade-fork
 
 on:
@@ -89,7 +96,7 @@ jobs:
           echo "PASS actions: enabled and disabled workflow ${id}"
           echo "SELFTEST PASSED: the token can do everything the sync needs"
 
-      - name: Merge upstream main into the fork
+      - name: Merge upstream's latest release into the fork
         if: ${{ !inputs.selftest }}
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
@@ -101,29 +108,48 @@ jobs:
           git config user.name "lemonade-fork-sync"
           git config user.email "lemonade-fork-sync@users.noreply.github.com"
           git remote add upstream "https://github.com/${UPSTREAM}.git"
-          git fetch -q upstream main
-          up=$(git rev-parse upstream/main)
+          tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)   # latest, never a pre-release
+          git fetch -q upstream "refs/tags/${tag}:refs/tags/${tag}"
+          up=$(git rev-parse "${tag}^{commit}")
           if git merge-base --is-ancestor "$up" HEAD; then
-            echo "fork already contains upstream ${up:0:12}"
+            echo "fork already contains upstream ${tag} (${up:0:12})"
             exit 0
           fi
-          if git merge -q --no-edit -m "Sync upstream ${UPSTREAM} main (${up:0:12})" upstream/main; then
+          before=$(git rev-parse HEAD)
+          # keep_fork_github: put the fork's own .github back over whatever the merge
+          # produced. The fork disables every workflow it has (last step), so mirroring
+          # upstream's workflow files buys nothing — and GitHub refuses a push that
+          # creates or updates .github/workflows unless the token carries the `workflow`
+          # scope, which is why every sync from 2026-09-26 failed.
+          keep_fork_github() {
+            git rm -rq --cached .github 2>/dev/null || true
+            git checkout "$before" -- .github
+            git clean -fdq -- .github 2>/dev/null || true
+          }
+          if git merge -q --no-commit --no-ff "$up"; then
+            keep_fork_github
+            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (${up:0:12})"
             # The fork exists for the onebit backend: never push a merge that lost it.
             grep -q '"onebit|onebit"' CMakeLists.txt || { echo "::error::onebit is no longer registered after the merge"; exit 1; }
             test -f src/cpp/server/backends/onebit/onebit_server.cpp || { echo "::error::onebit_server.cpp is gone after the merge"; exit 1; }
             git push -q origin HEAD:main
-            echo "merged upstream ${up:0:12} into ${FORK} main"
+            echo "merged upstream ${tag} (${up:0:12}) into ${FORK} main"
           else
             conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
             git merge --abort
-            branch="sync/${up:0:12}"
+            branch="sync/${tag}"
             if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
               echo "$branch already exists"; exit 0
             fi
-            git push -q origin "upstream/main:refs/heads/$branch"
+            # Same reason as above: hand the release over on a branch that carries the
+            # fork's .github, so the push needs contents write only.
+            git checkout -q -b "$branch" "$up"
+            keep_fork_github
+            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (conflicts; the fork's .github is kept)"
+            git push -q origin "${branch}:refs/heads/${branch}"
             gh pr create --repo "$FORK" --base main --head "$branch" \
-              --title "Sync upstream ${UPSTREAM} ${up:0:12} (conflicts)" \
-              --body "Upstream main \`${up:0:12}\` does not merge cleanly into the fork. Conflicting files:
+              --title "Sync upstream ${UPSTREAM} ${tag} (conflicts)" \
+              --body "Upstream release ${tag} (\`${up:0:12}\`) does not merge cleanly into the fork. Conflicting files:
 
           ${conflicts}
 
@@ -135,7 +161,18 @@ jobs:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
         run: |
           set -euo pipefail
+          # Idempotent on purpose. A workflow that is already disabled, or that GitHub manages
+          # (dynamic workflows), answers HTTP 422 to a disable request. Under `set -e` that aborted
+          # the whole sync job -- and because the self-test just re-enabled and re-disabled a
+          # workflow, the very next run saw it still listed as active and died here. Report and
+          # continue; never fail the sync over a cleanup step.
+          skipped=0
           for id in $(gh api "repos/${FORK}/actions/workflows" --paginate --jq '.workflows[] | select(.state=="active") | .id'); do
-            gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null
-            echo "disabled workflow ${id}"
+            if gh api -X PUT "repos/${FORK}/actions/workflows/${id}/disable" > /dev/null 2>&1; then
+              echo "disabled workflow ${id}"
+            else
+              echo "workflow ${id} left as-is (already disabled, or GitHub-managed)"
+              skipped=$((skipped+1))
+            fi
           done
+          echo "workflow cleanup complete; ${skipped} left as-is"

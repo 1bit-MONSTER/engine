@@ -52,6 +52,10 @@
   "SepiaCharMLP": {
    "model_type": "sepia-char-mlp",
    "family": "SEPIA character-level MLP"
+  },
+  "KairoForCausalLM": {
+   "model_type": "kairo",
+   "family": "Kairo (crypto-model research)"
   }
  }
 }

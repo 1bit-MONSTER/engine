@@ -322,6 +322,13 @@ Architecture class `SepiaCharMLP`, `model_type: sepia-char-mlp`, no `auto_map`. 
 `hidden` - a character-level MLP), so it cannot be an alias of any supported family.
 Reviewed 2026-10-06: **not an alias**.
 
+### `kairo` - `kairo-crypto-model/kairo-v1.5`
+
+Architecture class `KairoForCausalLM`, `model_type: kairo`, no `auto_map` - so the census
+classes it as native rather than custom code. Nothing in the pinned llama.cpp tree
+mentions `kairo`, and no pinned backend (`hrx`, `npu`) implements the class. Reviewed
+2026-10-06: **not an alias**.
+
 ## Unverifiable: gated configs
 
 `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on

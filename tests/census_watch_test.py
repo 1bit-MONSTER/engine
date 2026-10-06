@@ -112,6 +112,28 @@ check("a reviewed class alerts even with custom code", rc == 1)
 rc, res = rc_of([model("x/one", "OneOffForCausalLM", remote=True), model("x/two", "NimbusMindForCausalLM")])
 check("a remote-code one-off does not hide a native arrival", rc == 1 and res["remote_code"] == ["OneOffForCausalLM"])
 
+# 4c. A model that is not a Transformers model at all (engine#296: a raw `pytorch` nanoGPT
+#     checkpoint with `model_type: nanobeard-gpt` and `architectures: ["GPT"]`) is the same
+#     kind of one-off: no backend can map a class only its own library code implements.
+rc, text = text_of([model("y/nano", "GPT", library="pytorch")])
+check("non-Transformers library -> exit 0, reported", rc == 0 and "REMOTE-CODE GPT" in text)
+rc, res = rc_of([model("y/nano", "GPT", library="pytorch")])
+check("non-Transformers one-off is grouped as remote_code", res["remote_code"] == ["GPT"])
+rc, res = rc_of([model(f"y{i}/nano", "GPT", library="pytorch") for i in range(cw.REMOTE_CODE_SPREAD)])
+check("non-Transformers class from REMOTE_CODE_SPREAD uploaders -> exit 1", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([model("y/nano", "Qwen3ForCausalLM", library="pytorch")])
+check("a mapped class stays covered whatever its library", rc == 0 and res[cw.COVERED] == ["y/nano"])
+rc, res = rc_of([model("z/nano", "NimbusMindForCausalLM", library="pytorch"),
+                 model("z/other", "ArgonneModel")])
+check("a non-Transformers one-off does not hide a native arrival",
+      rc == 1 and res["remote_code"] == ["NimbusMindForCausalLM"])
+rc, res = rc_of([model("z/nano", "NimbusMindForCausalLM")])
+check("an unknown library is not treated as custom", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([model("z/nano", "NimbusMindForCausalLM", library="pytorch", tags=["transformers"])])
+check("a pytorch library with the transformers tag still alerts", rc == 1 and res["remote_code"] == [])
+rc, res = rc_of([model("z/nano", "Qwen3_5MVLAAbsorbedForCausalLM", library="mlx")])
+check("a reviewed class alerts even when not Transformers", rc == 1)
+
 # 5. A derivative with no config is expected, not an alert.
 rc, res = rc_of([model("e/five", tags=["gguf", "text-generation"])])
 check("derivative -> no alert, not unverifiable",

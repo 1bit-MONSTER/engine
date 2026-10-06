@@ -355,7 +355,20 @@ program is rebuilt.
   | 8192 tokens (4 chunks) | 7.4988 ± 0.23237 | 7.4936 ± 0.23212 | 0.005 |
 
   The CPU reference uses its default ubatch with `-fa` off; CPU `-ub 1` and `-fa 1` are
-  invalid for this model. The historical 11.79 and 10.64 results do not have a runnable
+  invalid for this model ([engine#337](https://github.com/1bit-MONSTER/engine/issues/337)).
+  CPU `llama-perplexity` on GLM-4.7-Flash-Q4_K_M, `-c 4096 --chunks 2`, flags changed independently:
+
+  | CPU flags | PPL |
+  |---|---:|
+  | default ubatch, no `-fa` | 10.7414 |
+  | default ubatch, `-fa 1` | 1014.1151 (30x slower per pass) |
+  | `-ub 1`, no `-fa` | 387.5591 |
+  | `-ub 1`, `-fa 1` | 264.9719 |
+
+  HRX with `-fa 1` stays correct (10.72, 6.82, 23.15 across configurations), and CPU generation
+  at `-ub 1` produces the same text as the default ubatch. So the CPU perplexity path is
+  configuration-sensitive for this deepseek2/MLA model; only the default ubatch with flash
+  attention off is a trustworthy CPU reference. The historical 11.79 and 10.64 results do not have a runnable
   old-path A/B build, so the op-level drift bisect remains unverified. The masked-V kernel
   change includes a regression test that varies stale masked rows and requires bit-identical
   outputs.

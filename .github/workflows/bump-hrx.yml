@@ -123,10 +123,27 @@ jobs:
           if [ "$OURS_BASE" != "$AMD_LLAMA" ]; then
             git checkout -q --detach "$patched"
             if ! git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com merge --no-edit --no-ff "$AMD_LLAMA"; then
-              conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ' || true)
-              git merge --abort || true
-              echo "::error::merging AMD's ${AMD_LLAMA:0:12} into 1bit/hrx-vulkan-patched conflicts in: ${conflicts}; resolve those files by hand"
-              exit 1
+              conflicts=$(git diff --name-only --diff-filter=U || true)
+              outside=$(printf '%s\n' "$conflicts" | grep -v '^ggml/src/ggml-hrx/' | grep -v '^$' || true)
+              if [ -n "$outside" ]; then
+                git merge --abort || true
+                echo "::error::merging AMD's ${AMD_LLAMA:0:12} into 1bit/hrx-vulkan-patched conflicts outside ggml/src/ggml-hrx: $(printf '%s ' $outside); resolve those files by hand"
+                exit 1
+              fi
+              # Every conflict is inside our HRX backend. Take ours (the branch being merged
+              # into, i.e. the patched line) and keep the rest of AMD's pin.
+              #
+              # Measured 2026-10-06, fresh builds with this workflow's own ExternalProject
+              # arguments - AMD's core plus our ggml-hrx: full gate test-backend-ops -b HRX0
+              # 1073/1073 with 0 FAIL, and GLM-4.7-Flash at -ub 512 returns " Paris." with 0
+              # NaN events. AMD's own ggml-hrx on the same core: 1019/1071 with 54 FAIL and 18
+              # NaN events (engine#315). Resolving these 15 files toward AMD's side therefore
+              # imports that NaN into the pinned line, so the merge keeps our files.
+              printf '%s\n' "$conflicts" | while read -r path; do
+                [ -n "$path" ] && git checkout --ours -- "$path" && git add -- "$path"
+              done
+              git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com commit -q --no-edit
+              echo "::notice::merged AMD's ${AMD_LLAMA:0:12} keeping our ggml/src/ggml-hrx for: $(printf '%s ' $conflicts)"
             fi
             rebased=$(git rev-parse HEAD)
             # keep the commit the engine pins now reachable before moving the branch

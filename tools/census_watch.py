@@ -35,11 +35,12 @@ Exit codes (the alert contract):
   0  no uncovered class among the newest models that warrants an alert
   1  an uncovered class arrived (the alert)
 
-A class whose models all load through custom modeling code (`auto_map` in the config, so
-Transformers itself has no implementation either) and that fewer than REMOTE_CODE_SPREAD
-uploaders publish is reported but does not alert: research one-offs like that arrive every
-day and are not something a backend could map. Once REMOTE_CODE_SPREAD uploaders use it, or
-it is a reviewed class (registry/significant.json), it alerts like any other.
+A class whose models all load through custom modeling code (`auto_map` in the config, or a
+runtime library that is not Transformers, so Transformers itself has no implementation of
+it either) and that fewer than REMOTE_CODE_SPREAD uploaders publish is reported but does
+not alert: research one-offs like that arrive every day and are not something a backend
+could map. Once REMOTE_CODE_SPREAD uploaders use it, or it is a reviewed class
+(registry/significant.json), it alerts like any other.
   *  runtime failure (no network, unreadable registry, ...)
 
 State (the model ids already classified) lives outside the checkout, at
@@ -71,6 +72,16 @@ _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 # A derivative carries no config.json of its own by design (a quantized GGUF, a LoRA
 # adapter); the raw release it derives from carries the config and is what gets checked.
 DERIVATIVE_TAGS = ("gguf", "lora", "peft")
+
+# Library names that are not Transformers. A model published through one of these (a raw
+# PyTorch checkpoint, an MLX or ONNX export) has no Transformers implementation either, so
+# its `architectures[0]` is the same kind of unmappable one-off as an `auto_map` class.
+# engine#296: Ihatetomatoes/nanoBeard-sloop-14M is `library_name: pytorch`, declares
+# `model_type: nanobeard-gpt` and `architectures: ["GPT"]`, and no backend has a "GPT" arch.
+NON_TRANSFORMERS_LIBRARIES = frozenset((
+    "pytorch", "onnx", "onnxruntime-genai", "mlx", "mlx-serve", "litert-lm", "llama.cpp",
+    "mlc-llm", "tensorflow", "tf-keras", "keras", "jax", "flax", "openvino", "coreml",
+))
 
 COVERED, UNCOVERED, UNVERIFIABLE, DERIVATIVE = "covered", "uncovered", "unverifiable", "derivative"
 
@@ -111,9 +122,18 @@ def architectures_of(model):
 
 
 def is_remote_code(model):
-    """True when the config loads the model through custom code (`auto_map`)."""
+    """True when Transformers has no implementation: `auto_map`, or not a Transformers model.
+
+    A raw checkpoint through a non-Transformers library carries an architecture class no
+    backend can map (the library's own code runs it), exactly like an `auto_map` model.
+    A missing `library_name` is unknown, not custom, so it alerts.
+    """
     cfg = model.get("config") or {}
-    return bool(cfg.get("auto_map"))
+    if cfg.get("auto_map"):
+        return True
+    if model.get("library_name") in NON_TRANSFORMERS_LIBRARIES:
+        return "transformers" not in (model.get("tags") or [])
+    return False
 
 
 def is_derivative(model):
@@ -239,7 +259,8 @@ def report(models, res, previously_seen):
         if cls in quiet:
             owners = len({i.split("/")[0] for i in ids})
             print(f"  . REMOTE-CODE {cls}: {len(ids)} model(s) from {owners} uploader(s), e.g. {ids[0]}")
-            print(f"     -> custom modeling code (auto_map); alerts once {REMOTE_CODE_SPREAD} uploaders use it")
+            print(f"     -> custom modeling code (auto_map, or a non-Transformers runtime); "
+                  f"alerts once {REMOTE_CODE_SPREAD} uploaders use it")
         elif cls in res["significant"]:
             print(f"  !! UNCOVERED {cls} (reviewed, not an alias — docs/arch-gaps.md): "
                   f"{len(ids)} model(s), e.g. {ids[0]}")

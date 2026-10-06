@@ -122,10 +122,12 @@ architecture class the census counts.
 
 Exit 0 means every newest model is mapped; **exit 1 is the alert** — a class arrived that
 no backend accepts. One kind of unmapped class is reported without the alert: a class whose
-models all load through custom modeling code (`auto_map` in the config, so Transformers has
-no implementation of it either) and that fewer than 3 uploaders publish. Research one-offs
-like that arrive every day. It alerts once 3 uploaders use it, and a reviewed class
-(`registry/significant.json`) always alerts.
+models all load through custom modeling code (`auto_map` in the config, or a runtime that is
+not Transformers, so Transformers has no implementation of it either) and that fewer than 3
+uploaders publish. Research one-offs like that arrive every day (`Ihatetomatoes/nanoBeard-sloop-14M`
+is a raw `pytorch` nanoGPT checkpoint whose config says `architectures: ["GPT"]` and
+`model_type: nanobeard-gpt`, engine#296). It alerts once 3 uploaders use it, and a reviewed
+class (`registry/significant.json`) always alerts.
 
 The watch runs daily at 04:30 UTC (ahead of the 05:17 sweep) in two places:
 - GitHub Actions (`.github/workflows/census-watch.yml`, [RFC #246](https://github.com/1bit-MONSTER/engine/discussions/246)), which files one deduped

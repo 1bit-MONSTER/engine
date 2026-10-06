@@ -120,7 +120,11 @@ if [ "${PROFILE:-0}" = "1" ]; then
   # different run is worthless, and the roofline directs the whole search. Prefer this checkout's build; fall back only
   # if it cannot trace, and say so loudly, because the roofline is then about a different tree.
   TB=$B
-  if ! strings "$TB/libggml-hrx.so.0" 2>/dev/null | grep -q GGML_HRX_DISPATCH_SHAPE_LOG; then
+  # `grep -c` reads to EOF so `strings` is never killed by SIGPIPE. With `grep -q` under
+  # `set -o pipefail` the pipeline returns non-zero when grep exits on the first match, and a
+  # killed `strings` made this check ALWAYS take the fallback -- which is why every profile leg
+  # failed even on a build that carries the shape log.
+  if [ "$(strings "$TB/libggml-hrx.so.0" 2>/dev/null | grep -c GGML_HRX_DISPATCH_SHAPE_LOG)" = "0" ]; then
     TB=${HRX_SHAPELOG_BIN:-$HOME/wt/hrx2kineto-src/build/bin}
     echo "profile leg: WARNING $B lacks GGML_HRX_DISPATCH_SHAPE_LOG; tracing $TB instead -- the trace describes a DIFFERENT build than the one benchmarked" >&2
   fi

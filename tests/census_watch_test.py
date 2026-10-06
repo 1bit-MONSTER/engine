@@ -245,6 +245,25 @@ check("committed significant list parses", isinstance(sig, dict) and len(sig) > 
 check("no committed registry entry has a class with no backend field",
       all("backends" in e and "gguf" in e for e in archs.values()))
 
+# 13. Newly reviewed non-alias classes stay out of the runtime registry and are documented.
+reviewed_gaps = {
+    "Needle3ForCausalLM": ("needle3", "Sakura Needle-3 (ONNX export)"),
+    "SepiaCharMLP": ("sepia-char-mlp", "SEPIA character-level MLP"),
+}
+for cls, (model_type, family) in reviewed_gaps.items():
+    entry = sig.get(cls, {})
+    check(f"{cls} is recorded as a significant gap",
+          entry.get("model_type") == model_type and entry.get("family") == family
+          and cls not in archs)
+    rc, res = rc_of([model(f"reviewed/{model_type}", cls)], archs, sig)
+    check(f"{cls} remains reported as reviewed and uncovered",
+          rc == 1 and res["significant"] == [cls] and res[cw.UNCOVERED] == [f"reviewed/{model_type}"])
+with open(os.path.join(ROOT, "docs", "arch-gaps.md")) as f:
+    gap_docs = f.read()
+check("reviewed non-alias classes are documented",
+      all(cls in gap_docs for cls in reviewed_gaps)
+      and "not an alias" in gap_docs)
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

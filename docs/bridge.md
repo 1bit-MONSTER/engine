@@ -268,7 +268,10 @@ recorded, then marked `measurement-valid=0` in Langfuse rather than published. T
 is deterministic and survives the load; the throughput ratios do not. Check `/proc/loadavg` before
 trusting a tok/s number, and repeat the plain control — if its spread is not small, the run is not
 a measurement. The harness now enforces that itself (`ceiling_k.py` refuses with exit 2 rather than
-report), so the rule is a command, not a habit.
+report), so the rule is a command, not a habit. **Pinning to a disjoint CPU set is not a way out**:
+`taskset -c 16-23` under load ~15.6 lowered the control spread only to 1.12x while cutting the
+baseline from 152-178 tok/s to 26.5-29.7 tok/s, so the pinned run is both still too noisy and no
+longer measuring the configuration anyone would deploy.
 
 **Not measured.** A real drafter. The NPU fast-lane kernel set for Qwen3-0.6B is not on the
 box (the model directory's `npu/` symlinks point into a cleaned `~/.cache/1bit-engine-tmp/`,

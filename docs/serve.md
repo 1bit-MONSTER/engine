@@ -26,6 +26,7 @@ OpenAI client.
            [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH] [--mlx-server PATH]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--bridge-draft DIR] [--bridge-k N] [--bridge-port N]   the drafter on another device
            [--laya | --laya-model DIR] [--route-policy FILE]
            [--pm [--pm-experts FILE] [--lemonade-url URL]]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
@@ -266,6 +267,21 @@ Without `--mtp-max`, `--dflash` drafts the drafter's block minus one (its `dflas
 when the file does not say). Our HRX llama.cpp's default draft p-min is already 0, which keeps
 DFlash blocks whole; `--mtp-p-min` sets another. (The DFlash2 one-server route on the lean ROCm
 build is gone, above.)
+
+## A drafter on another device (`--bridge-draft`)
+
+`--bridge-draft <q4nx dir>` is the device bridge ([bridge.md](bridge.md)): the target model runs
+on HRX as it always does, and a draft model runs in process on the NPU fast lane. The child
+llama-server asks the engine for draft tokens over a loopback endpoint; the target verifies them
+in one batch. `--bridge-k N` caps the draft length (default 4), `--bridge-port N` fixes the
+endpoint's port (default: a free one). `--bridge-script FILE` is the same path with a scripted
+drafter — one answer per line — so it runs with no NPU; it exists for the tests.
+
+Everything the target cannot confirm is dropped, so the bridge's output is the model's own, and
+`--bridge-*` off is the path without it. It refuses rather than degrades: a build without the NPU
+lane, a child llama-server without the `draft-external` speculative type (the fork change in
+[bridge.md](bridge.md)), `--parallel` above 1, `--laya`, or another drafter (`--mtp`,
+`--dflash`). The measurement plan is in [bridge.md](bridge.md).
 
 ## Recipes (`--recipes`, `--no-recipes`)
 

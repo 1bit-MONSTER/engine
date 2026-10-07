@@ -414,6 +414,32 @@ if(ONEBIT_NPU)
     # check, outside this repository (docs/npu.md, "Checking the NPU").
 endif()
 
+# ── The device bridge (docs/bridge.md) ───────────────────────────────────
+# A drafter on one device (the NPU fast lane) proposes tokens for the target model on
+# another (HRX), over the fork's `draft-external` speculative type. Host code: the
+# protocol, the replay/resync rules and the loopback endpoint. On its own it needs no
+# NPU; with ONEBIT_NPU the lane is the drafter, and without it --bridge-script (the
+# test seam) still exercises the whole path.
+add_library(onebit_bridge STATIC app/bridge.cpp)
+target_include_directories(onebit_bridge PUBLIC app)
+target_link_libraries(onebit_bridge PUBLIC nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+if(ONEBIT_NPU_HOST)
+    target_link_libraries(onebit_bridge PUBLIC onebit_npu)
+endif()
+if(ONEBIT_NPU)
+    target_compile_definitions(onebit_bridge PRIVATE ONEBIT_NPU)
+    target_link_libraries(onebit_bridge PUBLIC onebit_npu_lane)
+endif()
+target_link_libraries(onebit PRIVATE onebit_bridge)
+
+# The bridge's rules and its endpoint, against a scripted drafter: runs in CI.
+add_executable(bridge_test tests/bridge_test.cpp)
+target_link_libraries(bridge_test PRIVATE onebit_bridge)
+add_test(NAME bridge COMMAND bridge_test)
+# The whole path through `1bit serve`: a fake child that speaks the draft-external
+# protocol from the other side, so serve's wiring is checked with no GPU and no NPU.
+add_test(NAME bridge_e2e COMMAND ${CMAKE_SOURCE_DIR}/tests/bridge_e2e.sh $<TARGET_FILE:onebit>)
+
 # Private NPU routes (docs/npu.md, "Private routes"): closed-source add-ons in a checkout of
 # the private npu-kernels repository. Its addons/ directory defines the target
 # onebit_npu_private, which holds register_private_addon() (npu/private_route.h) and brings

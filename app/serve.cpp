@@ -46,6 +46,9 @@
 //                                                  head drafts, the model verifies (docs/serve.md)
 //   --dflash <draft.gguf> on hrx or cpu         -> a DFlash block-diffusion draft model
 //                                                  drafts a block per step (docs/serve.md)
+//   --bridge-draft <q4nx dir> on hrx or cpu     -> the device bridge: the draft model runs on
+//                                                  the NPU fast lane in process and the target
+//                                                  on HRX verifies its tokens (docs/bridge.md)
 //   --mmproj <mmproj.gguf> on hrx or cpu        -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
 //   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
@@ -56,6 +59,7 @@
 // clear message, and Lemonade serves it with its own llamacpp backends.
 #include "serve.h"
 
+#include "bridge.h"
 #include "built_path.h"
 
 #include "gguf_meta.h"
@@ -148,6 +152,11 @@ struct Options {
     std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
     std::string mtp_p_min;
+    std::string bridge_draft;   // --bridge-draft DIR: a drafter on another device (docs/bridge.md)
+    std::string bridge_script;  // --bridge-script FILE: the bridge's test seam (one answer per line)
+    std::string bridge_addr;    // set at start-up: the loopback address the child is told about
+    int bridge_port = 0;        // --bridge-port N (0: a free loopback port)
+    int bridge_k = 4;           // --bridge-k N: most drafts per round
     int parallel = 0;
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
@@ -188,6 +197,79 @@ std::string default_llama_server() {
 #else
     return "llama-server";
 #endif
+}
+
+// The device bridge (docs/bridge.md): a drafter on another device (the NPU fast lane)
+// proposes tokens for the target model, which verifies them on its own device. This starts
+// the loopback endpoint the child llama-server is told about; the caller holds `srv` for as
+// long as the child runs. Returns the address, or "" when the bridge is off.
+std::string bridge_start(Options& o, const std::string& device, std::unique_ptr<bridge::Server>& srv) {
+    if (o.bridge_draft.empty() && o.bridge_script.empty()) return "";
+    if (!o.bridge_draft.empty() && !o.bridge_script.empty())
+        throw std::runtime_error("--bridge-draft and --bridge-script are two drafters; pick one");
+    if (!o.mtp.empty() || !o.dflash.empty())
+        throw std::runtime_error("--bridge-draft/--bridge-script and --mtp/--dflash are two drafters; pick one "
+                                 "(docs/bridge.md)");
+    if (o.laya_auto || !o.laya_model.empty())
+        throw std::runtime_error("the bridge drafts for one device; leave --laya off (docs/bridge.md)");
+    if (o.parallel > 1)
+        throw std::runtime_error("the bridge's drafter is one NPU lane: leave --parallel off (docs/bridge.md)");
+    if (fs::path(o.model).extension() != ".gguf" || (device != "hrx" && device != "cpu"))
+        throw std::runtime_error("the bridge drafts for a .gguf on --device hrx or cpu (docs/bridge.md)");
+
+    // The child has to know the speculative type, which is a fork change (docs/bridge.md,
+    // "The llama.cpp fork hook"). Refuse rather than launch a server that would ignore it.
+    const std::string server = o.llama_server.empty() ? default_llama_server() : o.llama_server;
+#ifndef _WIN32
+    {
+        std::string help;
+        const std::string cmd = "\"" + server + "\" --help 2>&1";
+        if (FILE* p = ::popen(cmd.c_str(), "r")) {
+            char buf[4096];
+            while (help.size() < (1u << 20) && std::fgets(buf, sizeof buf, p)) help += buf;
+            ::pclose(p);
+        }
+        if (help.find("draft-external") == std::string::npos)
+            throw std::runtime_error("the device bridge needs a llama-server with the draft-external speculative "
+                                     "type (docs/bridge.md, \"The llama.cpp fork hook\"); " + server +
+                                     " does not list it");
+    }
+#endif
+
+    if (o.bridge_k < 1) o.bridge_k = 4;  // one place, so the child and the drafter agree
+    std::string err;
+    std::unique_ptr<bridge::DraftModel> model;
+    if (!o.bridge_draft.empty()) {
+#ifdef ONEBIT_NPU
+        model = bridge::npu_draft(o.bridge_draft, err);
+#else
+        throw std::runtime_error("--bridge-draft needs the NPU fast lane: build with -DONEBIT_NPU=ON "
+                                 "(docs/bridge.md); --bridge-script runs the bridge without one");
+#endif
+    } else {
+        // The test seam: a scripted drafter, so the whole path runs with no NPU. It has no
+        // vocabulary and no kernel of its own, so its context is the target's.
+        model = bridge::script_draft(o.bridge_script, 0, o.ctx_size > 0 ? o.ctx_size : 8192, err);
+    }
+    if (!model) throw std::runtime_error("the device bridge: " + err);
+
+    // A drafter on the wrong vocabulary costs acceptance and cannot cost correctness (the
+    // target verifies every token), so a mismatch is a warning (docs/bridge.md).
+    const long long target_vocab = gguf_int(o.model, gguf_architecture(o.model) + ".vocab_size");
+    const int draft_vocab = model->n_vocab();
+    if (target_vocab > 0 && draft_vocab < (1 << 30) && draft_vocab != target_vocab)
+        std::fprintf(stderr, "1bit serve: the bridge's drafter has %d tokens and %s declares %lld: "
+                             "the target verifies every token, but acceptance will be low\n",
+                     draft_vocab, o.model.c_str(), target_vocab);
+
+    auto drafter = std::make_unique<bridge::Drafter>(std::move(model), o.bridge_k);
+    srv = std::make_unique<bridge::Server>(std::move(drafter), o.bridge_port);
+    if (!srv->start(err)) throw std::runtime_error("the device bridge: " + err);
+    const std::string addr = srv->addr();
+    std::fprintf(stderr, "1bit serve: the bridge drafts on %s (up to %d tokens a round) for %s on %s: %s\n",
+                 o.bridge_draft.empty() ? o.bridge_script.c_str() : o.bridge_draft.c_str(),
+                 o.bridge_k, o.model.c_str(), device.c_str(), addr.c_str());
+    return addr;
 }
 
 // The devices this engine no longer has (RFC #213 stage 3, 2026-10-01: HRX + NPU only, zero
@@ -885,6 +967,15 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // without --mtp-p-min, recipe dflash-p-min-0 keeps DFlash blocks whole (config/recipes.json)
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
+    if (!o.bridge_addr.empty()) {
+        // The device bridge (docs/bridge.md): the engine's own drafter, on another device, is
+        // asked for token ids over loopback; the model verifies them in one batch. The address
+        // was set by bridge_start before any backend was launched, and the speculative type is
+        // the fork's (bridge_start probed the child for it).
+        argv.insert(argv.end(), {"--spec-type", "draft-external", "--spec-external-addr", o.bridge_addr});
+        argv.push_back("--spec-draft-n-max");
+        argv.push_back(std::to_string(o.bridge_k));
+    }
     if (!o.mmproj.empty()) {
         if (device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
@@ -1272,6 +1363,14 @@ int serve_child(const Options& given) {
             throw std::runtime_error("--pm does not combine with --laya: the Project Manager routes among models, Laya among devices");
         if (!o.role.empty()) throw std::runtime_error("--pm does not combine with --embedding/--reranking");
         pm_cfg = pm::load_config(o.pm_experts, o.lemonade_url);
+    }
+    // The device bridge (docs/bridge.md): start the in-process drafter and the loopback
+    // endpoint the target's child llama-server is told about, before any backend launches.
+    // Off (and byte-identical argv) unless --bridge-draft/--bridge-script was given.
+    std::unique_ptr<bridge::Server> bridge_srv;
+    if (!o.bridge_draft.empty() || !o.bridge_script.empty()) {
+        const std::string dev = o.device == "auto" ? auto_gguf_device(o) : o.device;
+        o.bridge_addr = bridge_start(o, dev, bridge_srv);
     }
     std::vector<Launch> backends;
     // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
@@ -1867,6 +1966,9 @@ void usage(FILE* out) {
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
+                 "                  [--bridge-draft DIR] [--bridge-k N] [--bridge-port N]   the device bridge: the draft\n"
+                 "                                    model runs on the NPU fast lane and the target on HRX verifies its\n"
+                 "                                    tokens (docs/bridge.md); --bridge-script FILE is its test seam\n"
                  "                  [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   stream MoE experts from the file,\n"
                  "                                    N held in RAM (auto: what fits); R: resident experts stand in for missing\n"
                  "                                    ones; prefetch N layers ahead (default 0). Not in this build: it moves\n"
@@ -1920,6 +2022,10 @@ int run_serve(int argc, char** argv) {
                                      "Lemonade's own llamacpp backend serves Vulkan and ROCm (docs/serve.md)");
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--dflash") o.dflash = next();
+        else if (a == "--bridge-draft") o.bridge_draft = next();
+        else if (a == "--bridge-script") o.bridge_script = next();
+        else if (a == "--bridge-port") o.bridge_port = std::stoi(next());
+        else if (a == "--bridge-k") o.bridge_k = std::stoi(next());
         else if (a == "--moe-slots") {
             const std::string v = next();
             o.moe_slots = v == "auto" ? -1 : std::stoi(v);

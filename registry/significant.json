@@ -21,6 +21,10 @@
    "model_type": "qwen_drive",
    "family": "Qwen-Drive, driving planner"
   },
+  "Qwen3_5MLAForConditionalGeneration": {
+   "model_type": "qwen3_5_mla",
+   "family": "Qwen3.5 MLA attention variant"
+  },
   "EnglishBaseForCausalLM": {
    "model_type": "fabryka_english_base",
    "family": "relu2 MLP + parameter-free QK-norm (implemented in the old engine only)"

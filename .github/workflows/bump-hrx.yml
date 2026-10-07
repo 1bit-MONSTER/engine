@@ -159,7 +159,7 @@ jobs:
             fi
             rebased=$(git rev-parse HEAD)
             # keep the commit the engine pins now reachable before moving the branch
-            git tag "patched-${patched:0:12}" "$patched"
+            git tag -f "patched-${patched:0:12}" "$patched"
             git push -q fork "refs/tags/patched-${patched:0:12}"
             git push -q --force-with-lease="refs/heads/1bit/hrx-vulkan-patched:$patched" fork "$rebased:refs/heads/1bit/hrx-vulkan-patched"
           fi
@@ -200,7 +200,7 @@ jobs:
             fi
             hrx_rebased=$(git rev-parse HEAD)
             # keep the commit the engine pins now reachable before moving the branch
-            git tag "main-${ours:0:12}" "$ours"
+            git tag -f "main-${ours:0:12}" "$ours"
             git push -q fork "refs/tags/main-${ours:0:12}"
             git push -q --force-with-lease="refs/heads/1bit/main:$ours" fork "$hrx_rebased:refs/heads/1bit/main"
           fi

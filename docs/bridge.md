@@ -239,9 +239,12 @@ bound on what any drafter can buy, not a drafter's measured hit rate:
 | code (`def fib(n):`) | yes | 1.00 | 188.2 | 462.2 | 2.46× |
 | long document | yes | 1.00 | 184.0 | 467.4 | 2.54× |
 
-Reproduce: `ssh strixhalo 'cd ~/wt/bridge-run && python3 ceiling.py --send'`, which also
-records the numbers as scores (`exact-match`, `acceptance-rate`, `plain-tok-s`,
-`bridged-tok-s`, `speedup`) on the `bridge-correctness` experiment in Langfuse.
+Reproduce: `ssh strixhalo 'cd ~/wt/bridge-run && python3 ceiling_k.py --send'`, which records the
+numbers as scores (`exact-match`, `acceptance-rate`, `plain-tok-s`, `bridged-tok-s`, `speedup`,
+`measurement-valid`) on the `bridge-correctness` experiment in Langfuse. That harness repeats and
+interleaves the plain control with each draft length and **refuses to report** when the control's
+own spread exceeds `--max-spread` (default 1.10×): it measured 1.14× on a loaded box and exited 2
+without recording. `ceiling.py` is the original single-point (k=4) version, without the guard.
 
 **Two traps that make the bridge look broken when it is not:**
 
@@ -264,7 +267,8 @@ sweep taken in that state (`--bridge-k` 2/4/8) produced speedups from 1.73× to 
 recorded, then marked `measurement-valid=0` in Langfuse rather than published. The acceptance rate
 is deterministic and survives the load; the throughput ratios do not. Check `/proc/loadavg` before
 trusting a tok/s number, and repeat the plain control — if its spread is not small, the run is not
-a measurement. `python3 ~/wt/bridge-run/ceiling_k.py` is the sweep's re-runnable command.
+a measurement. The harness now enforces that itself (`ceiling_k.py` refuses with exit 2 rather than
+report), so the rule is a command, not a habit.
 
 **Not measured.** A real drafter. The NPU fast-lane kernel set for Qwen3-0.6B is not on the
 box (the model directory's `npu/` symlinks point into a cleaned `~/.cache/1bit-engine-tmp/`,

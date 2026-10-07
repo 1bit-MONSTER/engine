@@ -225,6 +225,44 @@ no ROCm: it cannot run the lane or HRX. So the split of evidence is:
 5. Watch GTT: the target plus the lane's packed weights are both resident. The #315 fault
    regime starts around 102 GB GTT, so measure with the neighbours a real deployment has.
 
+## Measured on Strix Halo (2026-10-07)
+
+The bridge's ceiling, with the target on the CPU (Qwen3-0.6B-Q4_K_M, `-ngl 0`, 32 greedy
+tokens, `--bridge-k 4`) and the drafter a **script built from the target's own greedy
+continuation** — captured with `return_tokens: true` on llama.cpp's native `/completion`
+(the OpenAI route drops the field). The target still verifies every token, so this is an upper
+bound on what any drafter can buy, not a drafter's measured hit rate:
+
+| prompt | replies identical | acceptance | plain tok/s | bridged tok/s | speedup |
+|---|---|---|---|---|---|
+| prose (`The capital of France is`) | yes | 1.00 | 187.6 | 421.6 | 2.25× |
+| code (`def fib(n):`) | yes | 1.00 | 188.2 | 462.2 | 2.46× |
+| long document | yes | 1.00 | 184.0 | 467.4 | 2.54× |
+
+Reproduce: `ssh strixhalo 'cd ~/wt/bridge-run && python3 ceiling.py --send'`, which also
+records the numbers as scores (`exact-match`, `acceptance-rate`, `plain-tok-s`,
+`bridged-tok-s`, `speedup`) on the `bridge-correctness` experiment in Langfuse.
+
+**Two traps that make the bridge look broken when it is not:**
+
+- **A perfect script is not the continuation.** Between draft rounds llama.cpp samples one
+  token itself, so each round of K accepted drafts advances the stream by K+1: emit K ids,
+  then skip one. Feeding the raw continuation drifts by one per round and measures acceptance
+  0.13-0.19 with speedups *below* 1 (0.49-0.92×) — the bridge appearing to cost throughput.
+  With the stride fixed, acceptance is 1.00 and the speedup is the table above.
+- **The child must run one slot.** The bridge serves one sequence and answers `400` to any
+  `seq != 0`. A recipe sets `-np 4` for the cpu route, so every draft arrived as `seq=3`,
+  every request was refused, and llama.cpp reads a failed draft as "no draft" — silence, not
+  an error. `launch_for` appends `-np 1` after the recipes for exactly this reason; the
+  symptom of losing it is `rounds 0, acceptance 0%` while the replies still match (both
+  passes are then plain decodes).
+
+**Not measured.** A real drafter. The NPU fast-lane kernel set for Qwen3-0.6B is not on the
+box (the model directory's `npu/` symlinks point into a cleaned `~/.cache/1bit-engine-tmp/`,
+and every other candidate has the layer ELFs but no `lmhead.elf` and no `layer.pdi`), so
+`--bridge-draft` has not run; the NPU lane *build* does pass (`-DONEBIT_NPU=ON`). The scripted
+numbers above bound the mechanism, and no claim here rests on a drafter's real acceptance.
+
 ## Open items
 
 - `dp.prompt` is documented upstream as a temporary field. When it is removed, the engine keeps

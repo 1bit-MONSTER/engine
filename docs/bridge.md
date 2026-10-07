@@ -227,17 +227,24 @@ no ROCm: it cannot run the lane or HRX. So the split of evidence is:
 
 ## Measured on Strix Halo (2026-10-07)
 
-The bridge's ceiling, with the target on the CPU (Qwen3-0.6B-Q4_K_M, `-ngl 0`, 32 greedy
-tokens, `--bridge-k 4`) and the drafter a **script built from the target's own greedy
-continuation** — captured with `return_tokens: true` on llama.cpp's native `/completion`
-(the OpenAI route drops the field). The target still verifies every token, so this is an upper
-bound on what any drafter can buy, not a drafter's measured hit rate:
+The bridge's ceiling, with the target on the CPU (Qwen3-0.6B-Q4_K_M, `-ngl 0`, 32 greedy tokens)
+and the drafter a **script built from the target's own greedy continuation** — captured with
+`return_tokens: true` on llama.cpp's native `/completion` (the OpenAI route drops the field). The
+target still verifies every token, so this is an upper bound on what any drafter can buy, not a
+drafter's measured hit rate.
 
-| prompt | replies identical | acceptance | plain tok/s | bridged tok/s | speedup |
+Medians of 3 interleaved repeats over three prompts (prose, a `def fib` stub, a long document);
+control spreads 1.03× / 1.01× / 1.05×, all under the harness's 1.10× gate — the first numbers
+the harness passes rather than refuses:
+
+| draft length | replies identical | acceptance | plain tok/s | bridged tok/s | speedup |
 |---|---|---|---|---|---|
-| prose (`The capital of France is`) | yes | 1.00 | 187.6 | 421.6 | 2.25× |
-| code (`def fib(n):`) | yes | 1.00 | 188.2 | 462.2 | 2.46× |
-| long document | yes | 1.00 | 184.0 | 467.4 | 2.54× |
+| `--bridge-k 2` | yes | 1.00 | 188-194 | 351-355 | 1.81-1.88× |
+| `--bridge-k 4` | yes | 1.00 | 188-194 | 437-477 | 2.26-2.50× |
+| `--bridge-k 8` | yes | 1.00 | 188-194 | 642-663 | 3.35-3.48× |
+
+The ranges are across the three prompts. An earlier single-point (k=4) run on a less controlled box
+gave 2.25-2.54× with plain 184-188 tok/s; this curve supersedes it.
 
 Reproduce: `ssh strixhalo 'cd ~/wt/bridge-run && python3 ceiling_k.py --send'`, which records the
 numbers as scores (`exact-match`, `acceptance-rate`, `plain-tok-s`, `bridged-tok-s`, `speedup`,

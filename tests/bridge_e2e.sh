@@ -73,6 +73,10 @@ import json,sys; a=json.load(open(sys.argv[1]))[\"argv\"]
 i=a.index(\"--spec-type\"); assert a[i+1]==\"draft-external\", a
 i=a.index(\"--spec-draft-n-max\"); assert a[i+1]==\"3\", a
 " "$scratch/events.json"'
+check "the bridged child runs one slot" 'python3 -c "
+import json,sys; a=json.load(open(sys.argv[1]))[\"argv\"]
+i=a.index(\"-np\"); assert a[i+1]==\"1\", a
+" "$scratch/events.json"'
 check "the child was told the bridge address" 'python3 -c "
 import json,sys; d=json.load(open(sys.argv[1])); assert d[\"addr\"].startswith(\"127.0.0.1:\"), d; assert not d[\"error\"], d
 " "$scratch/events.json"'

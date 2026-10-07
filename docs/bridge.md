@@ -257,6 +257,15 @@ records the numbers as scores (`exact-match`, `acceptance-rate`, `plain-tok-s`,
   symptom of losing it is `rounds 0, acceptance 0%` while the replies still match (both
   passes are then plain decodes).
 
+**Measure on a quiet box.** Throughput here is dominated by whatever else is running: with load
+average ~14 on 32 cores (one foreign `llama-server` at 912% CPU), three *identical* plain passes
+of the same prompt gave 153.4, 129.7 and 52.9 tok/s — a 2.9× spread on the control. A draft-length
+sweep taken in that state (`--bridge-k` 2/4/8) produced speedups from 1.73× to 5.68× and was
+recorded, then marked `measurement-valid=0` in Langfuse rather than published. The acceptance rate
+is deterministic and survives the load; the throughput ratios do not. Check `/proc/loadavg` before
+trusting a tok/s number, and repeat the plain control — if its spread is not small, the run is not
+a measurement. `python3 ~/wt/bridge-run/ceiling_k.py` is the sweep's re-runnable command.
+
 **Not measured.** A real drafter. The NPU fast-lane kernel set for Qwen3-0.6B is not on the
 box (the model directory's `npu/` symlinks point into a cleaned `~/.cache/1bit-engine-tmp/`,
 and every other candidate has the layer ELFs but no `lmhead.elf` and no `layer.pdi`), so

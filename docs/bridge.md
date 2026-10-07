@@ -273,11 +273,27 @@ report), so the rule is a command, not a habit. **Pinning to a disjoint CPU set 
 baseline from 152-178 tok/s to 26.5-29.7 tok/s, so the pinned run is both still too noisy and no
 longer measuring the configuration anyone would deploy.
 
-**Not measured.** A real drafter. The NPU fast-lane kernel set for Qwen3-0.6B is not on the
-box (the model directory's `npu/` symlinks point into a cleaned `~/.cache/1bit-engine-tmp/`,
-and every other candidate has the layer ELFs but no `lmhead.elf` and no `layer.pdi`), so
-`--bridge-draft` has not run; the NPU lane *build* does pass (`-DONEBIT_NPU=ON`). The scripted
-numbers above bound the mechanism, and no claim here rests on a drafter's real acceptance.
+**Not measured.** A real drafter. The NPU fast-lane kernel set for Qwen3-0.6B is not on the box
+and nothing on the box produces it; searched directly on strixhalo (2026-10-07):
+
+- the model directory's `npu/` is five symlinks into `~/.cache/1bit-engine-tmp/kernels/Qwen3-0.6B/`,
+  a temp directory that was cleaned - and **no file on the box creates it**: `grep -rl
+  "1bit-engine-tmp"` matches only the old iso-build's docs and capacity CSVs, no code;
+- every other candidate (`~/npu-ab/elfs-8k`, `~/npu-model-2026-09-21/rework/elfs8192`,
+  `~/1bit-MONSTER-iso-build/engine/npu`) has `layer_ctx1/2/17.elf` but **no `lmhead.elf` and no
+  `layer.pdi`**;
+- FastFlowLM's published model dirs (`~/.config/flm/models/*/`) carry `model.q4nx`, `config.json`
+  and the tokenizer, **no `npu/` directory at all** - and the model dir's other files are symlinks
+  into `Qwen3-0.6B-NPU2/`, so the kernels were never there;
+- `~/OpenFlowLM-Next/open_kernels/export_qwen36_kernels.py` builds `final.xclbin` + `insts.bin` for
+  **its own** replacement runtime (`src/open_qwen36/engine.cpp`), not the lane's
+  `layer_ctx*.elf` + `layer.pdi` layout: an xclbin PDI can be extracted, but no matching ELFs.
+
+So the lane needs either the private from-source kernel build (docs/npu.md, step 3d, kept private
+per CONTRIBUTING) or FastFlowLM's own runtime internals. It is not restorable from what is on the
+box, which is why `--bridge-draft` has never run here. The NPU lane *build* does pass
+(`-DONEBIT_NPU=ON`). The scripted numbers above bound the mechanism, and no claim here rests on a
+drafter's real acceptance.
 
 ## Open items
 

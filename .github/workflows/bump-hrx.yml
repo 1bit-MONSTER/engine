@@ -48,6 +48,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: bump-hrx
@@ -252,7 +253,7 @@ jobs:
       - name: Report a failed sync so it cannot break silently
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
         run: |
           set -euo pipefail
           title="bump-hrx: the scheduled HRX pin sync is failing"

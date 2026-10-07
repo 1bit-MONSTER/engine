@@ -1003,6 +1003,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }
+    if (!o.bridge_addr.empty()) {
+        // The bridge's drafter is one sequence (docs/bridge.md), so the child must run one slot.
+        // A recipe can set -np N (the engine's own cpu recipe sets 4); the request then arrives
+        // with seq=N-1, the bridge answers 400 to every draft, and llama.cpp reads that as "no
+        // draft" - silence, not an error. Appended here so it wins over the recipe.
+        argv.insert(argv.end(), {"-np", "1"});
+    }
     return l;
 }
 

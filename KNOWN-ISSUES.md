@@ -106,9 +106,23 @@ exposure and is excluded, not counted as clean.
 
 The fault reproduces on the shipped pin — `pair 2 arm c: FAULT-NaN nan=1 req=34 gtt_start=102G`, build
 `10604 = 3971f49bf`, `parse=0` ruling out the format-500 mode — so the shared-memory tile-visibility change does
-not eliminate it. The rate study (40 arms on the shipped fix vs 30 on always-stage) was still running when this
-entry was written; its per-arm regime gate and truncation accounting must be reported before any rate is quoted
-here. No runtime-side ordering gap on the device-to-host path could be named, and no forward-pin fix candidate
+not eliminate it. The rate study is complete, and its per-arm regime gate and truncation accounting are reported
+here — both halves ran at `gtt_start = 102 GiB` on all 70 arms, and parse-500 truncations are counted separately,
+never scored as clean arms:
+
+```
+A  shipped fix  (10604 = 3971f49bf)   40 scheduled, 40 in-regime, 37 complete
+   clean 66/66: 35   NaN faults: 2 (both parse=0, inside the gate)   rate 2/37 = 5.4%  (95% CI 0.7-18.2%)   parse-500: 3
+B  always-stage (10605)               30 scheduled, 30 in-regime, 25 complete
+   clean 66/66: 24   NaN faults: 1                                    rate 1/25 = 4.0%  (95% CI 0.1-20.4%)   parse-500: 5
+Fisher exact two-sided p = 1.000;  P(rate_A < rate_B) = 0.460
+```
+
+So the tile-visibility pin did not measurably change the pressure-dependent all-NaN rate, and the fault is still
+live on the shipped pin. The reading is bounded, not directional: both intervals contain the ~10% figure that
+motivated the change and neither excludes "no change" (and that ~10% comparator itself rested on 1 fault in 15
+arms, 95% CI ~0.2-32%, so the lower rate needs no environmental explanation). No runtime-side ordering gap on the
+device-to-host path could be named, and no forward-pin fix candidate
 survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert). The open candidates are in the
 kernel/binding family: GLM is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760
 dispatches) with 1,399 barriers per token.

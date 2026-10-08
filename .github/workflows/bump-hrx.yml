@@ -48,6 +48,7 @@ on:
 
 permissions:
   contents: read
+  issues: write
 
 concurrency:
   group: bump-hrx
@@ -142,15 +143,24 @@ jobs:
               # NaN events. AMD's own ggml-hrx on the same core: 1019/1071 with 54 FAIL and 18
               # NaN events (engine#315). Resolving these 15 files toward AMD's side therefore
               # imports that NaN into the pinned line, so the merge keeps our files.
+              # Our side may have DELETED a file AMD changed (modify/delete). `git checkout --ours`
+              # cannot apply to a path we do not have, which leaves the merge uncommitted and makes
+              # `git commit` fail. Keep our deletion, which is what this line already ships.
               printf '%s\n' "$conflicts" | while read -r path; do
-                [ -n "$path" ] && git checkout --ours -- "$path" && git add -- "$path"
+                [ -n "$path" ] || continue
+                if git cat-file -e ":2:$path" 2>/dev/null; then
+                  git checkout --ours -- "$path" && git add -- "$path"
+                else
+                  echo "::notice::kept our deletion of $path (modify/delete conflict)"
+                  git rm -q -f -- "$path"
+                fi
               done
               git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com commit -q --no-edit
               echo "::notice::merged AMD's ${AMD_LLAMA:0:12} keeping our ggml/src/ggml-hrx for: $(printf '%s ' $conflicts)"
             fi
             rebased=$(git rev-parse HEAD)
             # keep the commit the engine pins now reachable before moving the branch
-            git tag "patched-${patched:0:12}" "$patched"
+            git tag -f "patched-${patched:0:12}" "$patched"
             git push -q fork "refs/tags/patched-${patched:0:12}"
             git push -q --force-with-lease="refs/heads/1bit/hrx-vulkan-patched:$patched" fork "$rebased:refs/heads/1bit/hrx-vulkan-patched"
           fi
@@ -191,7 +201,7 @@ jobs:
             fi
             hrx_rebased=$(git rev-parse HEAD)
             # keep the commit the engine pins now reachable before moving the branch
-            git tag "main-${ours:0:12}" "$ours"
+            git tag -f "main-${ours:0:12}" "$ours"
             git push -q fork "refs/tags/main-${ours:0:12}"
             git push -q --force-with-lease="refs/heads/1bit/main:$ours" fork "$hrx_rebased:refs/heads/1bit/main"
           fi
@@ -204,7 +214,7 @@ jobs:
           AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
           AMD_HRX: ${{ steps.pins.outputs.amd_hrx }}
           REBASED: ${{ steps.fork.outputs.rebased }}
-          HRX_REBASED: ${{ steps.hrxfork.outputs.rebased }}
+          HRX_REBASED: ${{ steps.hrxfork.outputs.hrx_rebased }}
           PATCHES: ${{ steps.fork.outputs.patches }}
           OURS_LLAMA: ${{ steps.pins.outputs.ours_llama }}
           OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
@@ -243,7 +253,7 @@ jobs:
       - name: Report a failed sync so it cannot break silently
         if: failure()
         env:
-          GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
         run: |
           set -euo pipefail
           title="bump-hrx: the scheduled HRX pin sync is failing"

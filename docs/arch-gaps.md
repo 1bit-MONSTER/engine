@@ -120,6 +120,18 @@ This page is the reviewed evidence for the second kind: what each family is, wha
 * **Real support needs**: a scope decision first (is trajectory planning in scope
   at all?), then the expert/trajectory head.
 
+## `qwen3_5_mla` — Qwen3.5 MLA attention variant
+
+* **Class / model_type**: `Qwen3_5MLAForConditionalGeneration` / `qwen3_5_mla`;
+  example `TelperionAI/Qwen3.8-27B-GLA-g2-EXL3-4.0bpw`.
+* **Why an alias is wrong**: the supported `qwen35` path handles Qwen3.5's hybrid
+  gated-delta-net/full-attention architecture; this class declares an MLA
+  attention variant. The shared Qwen3.5 name does not establish compatible
+  attention configuration or tensor layout, and mapping it to `qwen35` would
+  advertise unverified support.
+* **Real support needs**: verify the model config and tensor layout, then add
+  and validate an MLA conversion/runtime path before mapping the class.
+
 ---
 
 ## Uncovered classes reviewed later — same standard, and still not aliases

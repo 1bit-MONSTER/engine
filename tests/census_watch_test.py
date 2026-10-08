@@ -249,6 +249,8 @@ check("no committed registry entry has a class with no backend field",
 reviewed_gaps = {
     "Needle3ForCausalLM": ("needle3", "Sakura Needle-3 (ONNX export)"),
     "SepiaCharMLP": ("sepia-char-mlp", "SEPIA character-level MLP"),
+    "Qwen3_5MLAForConditionalGeneration": (
+        "qwen3_5_mla", "Qwen3.5 MLA attention variant"),
 }
 for cls, (model_type, family) in reviewed_gaps.items():
     entry = sig.get(cls, {})

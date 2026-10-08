@@ -36,9 +36,11 @@
 # Strix Halo before merging it.
 #
 # Needs the secret HRX_BUMP_TOKEN: a fine-grained token with Contents
-# read/write on 1bit-MONSTER/llama.cpp and 1bit-MONSTER/engine, and Pull
-# requests read/write on 1bit-MONSTER/engine. (A PR opened with the default
-# GITHUB_TOKEN would not start CI, and that token cannot push to the fork.)
+# read/write on 1bit-MONSTER/llama.cpp and 1bit-MONSTER/engine, Workflows
+# read/write on 1bit-MONSTER/llama.cpp, and Pull requests read/write on
+# 1bit-MONSTER/engine. Syncing upstream can update workflow files, which needs
+# the Workflows permission. (A PR opened with the default GITHUB_TOKEN would
+# not start CI, and that token cannot push to the fork.)
 name: bump-hrx
 
 on:

@@ -82,6 +82,23 @@ neighbour count so the arm lands inside the gate with that inventory taken into 
   observed queued on the same lock, and interleaved arms from two sessions would mix regime
   compositions and contaminate both.
 
+## 3c. Adjacent hypotheses this box is testing in parallel
+
+Task-3 requires a mechanism that *rules out* the surviving alternatives, so they are listed here with
+their status rather than rediscovered later.
+
+| hypothesis | status |
+|---|---|
+| arena knobs (transient reuse settings) | **falsified on the record** — 15 paired arms showed no demonstrable effect; 77-arm tally likewise |
+| logits host-staging / writeback staging as the route | **falsified as stated** (hard negative: the logits are not host-staged) — but the *deferred publish* of a host writeback is still open (H1) |
+| AQL block-transition handling / `HRX_AQL_BLOCK_SIZE` | **under test by a peer session** on this box: dose-response with 262144 vs 32768, pre-registered as "A should fault several-fold more than B if the fault scales with transitions per token"; a clean amplified arm is evidence against it (P(0 \| 17%) ≈ 0.02) |
+| H1 — deferred writeback publish window | **this campaign** (`docs/315-instrumentation-plan.md`); `882fced1a` introduced the deferral and `e0f637bff` already fixed one publish-ordering case, both present in all faulting builds |
+| H2 — producer codegen writes non-finite values | **this campaign**, distinguished from H1 by the same records |
+
+The issue's own candidate list (two 128 KiB AQL blocks per decode token, 1,399 barriers per token) maps
+onto the block-transition row, so a mechanism statement that ignores the peer's gradient result would
+not satisfy the "rules out the alternatives" requirement.
+
 ## 4. Fault faces and detectors
 
 | face | signature | detector |

@@ -23,11 +23,13 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates software-properties-common gnupg \
     && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
     && apt-get update && apt-get install -y --no-install-recommends \
-      g++-15 gcc-15 cmake ninja-build git pkg-config python3 python3-pip python3-yaml \
+      g++-15 gcc-15 ninja-build git pkg-config python3 python3-pip python3-yaml \
       libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev \
     && rm -rf /var/lib/apt/lists/*
-# The Python tests read GGUF files and build Q4NX / ternary / draft-vocabulary fixtures.
-RUN python3 -m pip install --no-cache-dir --break-system-packages numpy gguf
+# CMake from PyPI: the engine is C++26 and Ubuntu 24.04's CMake 3.28 does not know that dialect
+# (CI's runner image carries a newer CMake). numpy and gguf are for the Python tests, which read
+# GGUF files and build Q4NX / ternary / draft-vocabulary fixtures.
+RUN python3 -m pip install --no-cache-dir --break-system-packages "cmake>=3.31" numpy gguf
 
 # scanner contract: the checkout lives inside the image, at /src
 COPY . /src

@@ -22,31 +22,12 @@ for P in $(pgrep -f llama-server 2>/dev/null); do
   echo "  foreign pid=$P $(tr '\0' ' ' < /proc/$P/cmdline | cut -c1-90)"
 done
 
-for i in $(seq 1 $NB); do
-  systemd-run --user --scope -q -p MemoryMax=40G --unit=${TAG}-neigh-$i \
-    "$BIN/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on -c $NCTX --host 127.0.0.1 --port $((20250+i)) \
-    > "$O/neigh-$i.log" 2>&1 &
-done
-for i in $(seq 1 $NB); do for t in $(seq 1 300); do curl -sf localhost:$((20250+i))/health >/dev/null 2>&1 && break; sleep 1; done; done
-echo "neighbours up gtt=$(gtt)G"
-
-teardown() {
-  for i in $(seq 1 $NB); do
-    systemctl --user stop ${TAG}-neigh-$i 2>/dev/null
-    systemctl --user kill -s TERM ${TAG}-neigh-$i 2>/dev/null
-  done
-  sleep 3
-  for P in $(pgrep -f "llama-server" 2>/dev/null); do
-    C=$(tr '\0' ' ' < /proc/$P/cmdline 2>/dev/null)
-    case "$C" in *"port 2025"*) kill -TERM $P 2>/dev/null ;; esac
-    if [ -n "$PORT" ]; then case "$C" in *"port $PORT"*) kill -TERM $P 2>/dev/null ;; esac; fi
-  done
-  sleep 5
-  echo "teardown $(date -Is) servers_left=$(pgrep -c llama-server || echo 0) gtt_after=$(gtt)G"
-}
-trap teardown EXIT
+source "$(dirname "$0")/315-regime.sh"
+regime_neighbours 1 6 "$NCTX"
+trap regime_teardown EXIT
 
 PORT=$((19300 + RANDOM % 400))
+REGIME_ARM_PORT=$PORT
 SETENV=(--setenv=IREE_HAL_AMDGPU_LIBHSA_PATH=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1)
 [ "$FP" = "1" ] && SETENV+=(--setenv=GGML_HRX_WRITEBACK_FINGERPRINT=1)
 systemd-run --user --scope -q -p MemoryMax=60G --unit=${TAG}-arm "${SETENV[@]}" \

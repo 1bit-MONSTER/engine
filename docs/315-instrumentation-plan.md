@@ -308,3 +308,50 @@ rate, so the fix must follow from the mechanism, not from a toggle.
   `CMAKE_C/CXX_COMPILER=/opt/rocm-therock/bin/amdclang{,++}`, `-DGGML_HIP=OFF -DGGML_HRX=ON`,
   `-DHRX_SOURCE_DIR=~/wt/pin-fork-hrx/third_party/hrx-system`, `-DLLAMA_BUILD_SERVER=ON`,
   `-DLLAMA_BUILD_TESTS=OFF -DBUILD_TESTING=OFF`, `-j16`.
+
+## 13. Instrumentation record for a failing in-regime arm (task-2 deliverable)
+
+**Arm.** `315diff2-d4` (default configuration), in-regime at `gtt_start 98 GiB`; instrumented build
+`~/wt/315instr3-build` (pin `e44c9d01a4d5` + writeback fingerprint + download probe + buffer trace).
+Raw paths, all on strixhalo:
+
+| file | what it carries |
+|------|-----------------|
+| `~/wt/rt-det/315diff2-d4-GLM-4.7-Flash-Q4_K_M/server.log` | the fault itself: `common_chat_peg_parse: unparsed Content-only output:` followed by `{"code":500, ... "does not match the expected Content-only"}`; and the 5 `[hrx-buf]` allocation records |
+| `~/wt/rt-det/315diff2-d4-GLM-4.7-Flash-Q4_K_M/detector.json` | `requests=21` of 66, `http_failures=1` — the arm stopped when the 500 arrived |
+| `~/wt/rt-det/315diff2-d4-GLM-4.7-Flash-Q4_K_M/run.log` | `gtt_start 98GiB`, i.e. the arm is inside the gate |
+| `~/wt/rt-det/315diff2-d4-GLM-4.7-Flash-Q4_K_M/gtt.log` | the pressure profile over the arm |
+
+**Faulting region.** The record identifies it by allocation rather than by fault address, because a
+Face-B fault is not a memory fault: no signal names an address, and claiming one would be invention. The
+region is the output family — the buffer the sampler reads — named by the trace:
+
+```
+[hrx-buf] type=HRX0_HOST    host_visible=1 direct_host_binding=0 memory_type=0x52 size=619520
+[hrx-buf] type=HRX0_HOST    host_visible=1 direct_host_binding=0 memory_type=0x52 size=44048640
+```
+
+`619520 = 154880 x 4`, matching the element count in the Face-A guard
+(`common/sampling.cpp:587`, `count=154880`), so the first line is the logits/output buffer. `memory_type
+0x52` is `HOST_LOCAL | DEVICE_VISIBLE` **without** `HOST_COHERENT` (0x04) — the region is host-visible
+and non-coherent, and it is the same region in every default arm (2 such allocations on 4/4 default arms,
+0 on 4/4 coherent arms).
+
+**Ordering relative to the copy and the barrier.** The region is read *without any copy on the route*:
+
+1. `GGML_HRX_DOWNLOAD_FINGERPRINT` was on for the arm; there is no 619520-byte transfer in the log. The
+   records that do exist (146 over a full 66-request arm) are per-layer weight leases of
+   884736 / 2211840 / 5898240 bytes, all `hashes_equal=1`. So the output buffer is not copied down
+   through `download_synchronous`, and the ordering there (`hrx_stream_synchronize` at
+   `runtime/host-memory.cpp:1350` before `hrx_synchronous_d2h` at `:1354`) is *not* on the route this
+   fault takes.
+2. It is read directly: the generic `ggml_backend_tensor_get_async` short-circuits for host buffers, so
+   no backend copy runs and no backend-level ordering primitive sits between the device's write and the
+   CPU's read.
+3. The deferred-writeback path is a hard negative, not the culprit: with `GGML_HRX_WRITEBACK_FINGERPRINT=1`
+   over a complete 66/66 arm, zero `[hrx-wb-fp]` records were emitted — the route is cold. This is why
+   the mechanism does not live in `command-program-executor.cpp`'s staging.
+
+So the record places the read inside a host-visible, non-coherent region with **no copy and no barrier on
+the route between the device write and that read**, and the coherence bit is the only ordering-relevant
+property that differs between the arm that faulted and the arms that did not.

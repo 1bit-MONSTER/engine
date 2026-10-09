@@ -22,7 +22,7 @@ import argparse
 import json
 import urllib.request
 
-MIN_PROMPT_TOKENS = 4096
+MIN_PROMPT_TOKENS = 4700
 NEEDLE_LINE = 203
 EXPECTED_ANSWER = "7341"
 

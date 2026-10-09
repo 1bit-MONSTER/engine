@@ -64,7 +64,7 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
   Halo before merging. The long-prompt result is pin-specific: run the probe against
   the proposed `hrx-system` pin, and update
-  [`config/hrx-long-prompt-validated-pin`](../config/hrx-long-prompt-validated-pin)
+  [`config/hrx-long-prompt-validated-pin.config`](../config/hrx-long-prompt-validated-pin.config)
   to that full commit only after it passes. CI rejects a changed HRX pin that does not
   match this record.
 
@@ -78,7 +78,7 @@ selected), then run:
 python3 tests/hrx_long_prompt.py
 ```
 
-The probe tokenizes a 320-record prompt and requires at least 4,096 tokens before
+The probe tokenizes a 320-record prompt and requires at least 4,700 tokens before
 asking for the code buried in record 203. It passes only when Qwen3-0.6B returns
 `7341` exactly. The test endpoint defaults to `http://127.0.0.1:8080`; use
 `--url` or `--model` if the server uses different settings.

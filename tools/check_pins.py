@@ -22,7 +22,7 @@ must say the new commit is ahead of the old one. A pin that is behind or has div
 commits the engine already shipped, as #154 did to third_party/llama.cpp (it lost ZAYA1-VL);
 a deliberate rollback is merged with the "pin rollback" label, which skips this check.
 An hrx-system pin must also match the commit recorded as passing the long-prompt
-HRX check in config/hrx-long-prompt-validated-pin. Repositories the token cannot
+HRX check in config/hrx-long-prompt-validated-pin.config. Repositories the token cannot
 read (private ones) are reported and skipped.
 """
 import json
@@ -34,7 +34,7 @@ import urllib.error
 import urllib.request
 
 HRX_PATH = "third_party/hrx-system"
-HRX_VALIDATED_PIN = "config/hrx-long-prompt-validated-pin"
+HRX_VALIDATED_PIN = "config/hrx-long-prompt-validated-pin.config"
 
 
 def git(*args):
@@ -73,7 +73,10 @@ def main():
         name, field = key[len("submodule."):].rsplit(".", 1)
         subs.setdefault(name, {})[field] = value
     with open(HRX_VALIDATED_PIN, encoding="utf-8") as f:
-        validated_hrx_pin = f.read().strip()
+        validated_hrx_pin = next(
+            (line.strip() for line in f if line.strip() and not line.lstrip().startswith("#")),
+            "",
+        )
     bad = 0
     for sub in subs.values():
         path, url = sub.get("path"), sub.get("url", "")

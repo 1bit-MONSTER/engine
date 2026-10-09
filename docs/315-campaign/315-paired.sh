@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # engine#315 paired in-regime campaign driver — the pre-registered producer.
 #
 # Emits one line per arm in the grammar the analysis scripts parse:
@@ -77,6 +63,8 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   rm -rf "$O"; mkdir -p "$O"
   local -a TRACE_ENV=()
   [ -n "${TRACE:-}" ] && TRACE_ENV=(--setenv=GGML_HRX_BUFFER_TRACE=1)
+  # EXTRA_ENV="K=V K2=V2" adds environment to each arm (diagnostic runs, e.g. a probe).
+  if [ -n "${EXTRA_ENV:-}" ]; then for kv in $EXTRA_ENV; do TRACE_ENV+=(--setenv="$kv"); done; fi
   systemd-run --user --scope -q -p MemoryMax=60G --unit=$TAG-arm-$pair$cell \
     --setenv=IREE_HAL_AMDGPU_LIBHSA_PATH="$IREE_HAL_AMDGPU_LIBHSA_PATH" \
     --setenv=LD_LIBRARY_PATH="$bin" "${TRACE_ENV[@]}" \
@@ -146,7 +134,13 @@ for p in $(seq 1 $PAIRS); do
   arm "$p" l "$FBIN"
   cf=$(clean_fix); ff=$(fault_fix)
   say "after pair $p: fix-cell clean=$cf fault-or-invalid=$ff (target >=${MINCLEAN:-60} clean, cap $PAIRS pairs)"
-  [ "$ff" -gt 0 ] && { say "STOP: a fix-cell arm faulted or was invalid — acceptance requires zero faults"; break; }
+  if [ "$ff" -gt 0 ] && [ -z "${NOSTOP:-}" ]; then
+    say "STOP: a fix-cell arm faulted or was invalid — acceptance requires zero faults"
+    break
+  fi
+  if [ "$ff" -gt 0 ]; then
+    say "NOTE: fix-cell fault(s)=$ff recorded and the run continues because NOSTOP=1 — this is a DIAGNOSTIC run, not an acceptance run, and its counts must not be read as one"
+  fi
   [ "$cf" -ge "${MINCLEAN:-60}" ] && { say "STOP: reached $cf clean fix-cell arms"; break; }
 done
 

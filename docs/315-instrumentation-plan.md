@@ -169,6 +169,47 @@ cheap; if it does not, the in-regime rate stands and mechanism discrimination mu
 instrumenting `download_synchronous` (fingerprint the source mapping at copy time) rather than from
 rate comparison.
 
+## Mechanism candidate (v3, NOT confirmed): host-visible non-coherent logits buffer
+
+Code evidence, read from the pinned source:
+
+```
+ggml-hrx.cpp:303   buffer_alloc(buft, size):
+                     const bool host_visible        = type_context->host_visible;
+                     const bool direct_host_binding = host_visible && device->use_direct_host_bindings;
+                     // "Direct command-program bindings require coherent CPU/GPU visibility. Otherwise HRX
+                     //  host buffers are pinned transfer memory: DEVICE_VISIBLE permits handle-based
+                     //  stream copies without implying direct device access."
+                     if (host_visible) { memory_type = HOST_LOCAL | DEVICE_VISIBLE;
+                                         if (direct_host_binding) memory_type |= HOST_COHERENT; }
+ggml-hrx.cpp:1179  device_ctx->use_direct_host_bindings = environment_flag_enabled("GGML_HRX_USE_UNIFIED_MEMORY")
+backend-context.h:45   bool use_direct_host_bindings = false;      <- default OFF
+ggml-hrx.cpp:146   buffer_type_is_host(buft) { return type_context->host_visible; }
+```
+
+If the logits tensor is allocated from a host-visible buffer type, then:
+
+- the host reads it with **no copy** — which is exactly what was measured (zero logits-sized
+  downloads, and the recorded hard negative that the logits are not host-staged);
+- with the default (`GGML_HRX_USE_UNIFIED_MEMORY` unset ⇒ no `HOST_COHERENT`), there is **no coherence
+  guarantee** for the device's write into that memory, so a host read can observe uninitialised or
+  partial bytes — whole-vocabulary NaN, intermittent, and sensitive to allocation/pressure timing,
+  which is the observed shape of Face A.
+
+This is *not* one of the already-falsified levers (arena knobs, transient reuse, logits host-staging).
+
+**Pre-committed discriminating experiment:** arms with `GGML_HRX_USE_UNIFIED_MEMORY=1` against arms with
+it unset, same regime and same shape set. If coherence removes the fault at a rate where the baseline
+still shows faults, the candidate is confirmed and the forward fix is to give the logits read the
+visibility it needs *without* requiring coherent memory for everything (e.g. an explicit fence/flush on
+that path) — not to ship the env var as the fix.
+
+**Why this is not closed in this session:** the in-regime rate in our own harness is ~5%/arm, and the
+issue's recorded high-rate configuration did **not** reproduce here — `-ub 512` returned 66/66 clean at
+`gtt_start 98 GiB` (two independent clean arms at that config). A rate-based differential therefore
+needs ≥60 arms per cell (~12 h of box time) to discriminate, which is the blocker to be resolved with
+the user rather than rushed.
+
 ## Procedure
 
 **Tension to resolve first, not assume away.** The issue records a hard negative that the logits are

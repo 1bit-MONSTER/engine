@@ -12,27 +12,43 @@ Pin: `ggml/src/ggml-hrx` at `e44c9d01a4d5110cecaf45472a717f46cd1abbf9`.
 
 ## Hypothesis H1 — deferred writeback × buffer reuse
 
-In `ggml/src/ggml-hrx/runtime/command-program-executor.cpp`, a host writeback is **deferred**:
+**Refined against the pinned source (measured, not inferred).** The download path in
+`runtime/command-program-executor.cpp` is:
 
-- `GraphReplayStreamState::add_host_writeback(host_destination, mapped_source, size, buffer)` records
-  the destination, the **mapped source pointer**, the size, and retains the buffer.
-- The actual `std::memcpy(host_destination, mapped_source, size)` happens later, in
-  `GraphReplayStreamState::mark_stream_synchronized()`.
-- `clear()` drops pending writebacks without copying.
+1. `insert_barrier` → optionally enqueue a stream execution barrier (`"insert HRX host download
+   barrier"`);
+2. `allocate_mapped_host_staging_buffer(device, length, download_buffer, download_data)` — a
+   **mapped host staging buffer**, whose host pointer is `download_data`;
+3. `hrx_stream_copy_buffer(stream, staging.buffer, 0, download_buffer, 0, length)` — the copy from
+   the tensor into staging is **enqueued on the stream, i.e. asynchronous**;
+4. `add_host_writeback(staging.host_data, download_data, length, download_buffer)` — the host-side
+   copy is **deferred**, and
+5. the actual `std::memcpy(host_destination, mapped_source, size)` happens later, in
+   `GraphReplayStreamState::mark_stream_synchronized()`, called from
+   `command-program-executor.cpp` and from `ggml-hrx.cpp`.
 
-Between registration and sync the source region can be reused (transient arena reuse, graph replay),
-so the sync-time copy can read bytes that no longer belong to that tensor. That yields wrong/NaN
-logits at the consumer even though the producing kernel was correct — intermittent, regime-dependent,
-and invisible to the consumer-side guard. This is consistent with the recorded commit
-"ggml-hrx: transient arena reuse without false dependencies".
+So there is a window between (3) and (5) in which the host holds a mapping of a staging buffer that
+**the device has not necessarily written yet**. Reading it early yields zeros, stale bytes, or
+reinterpreted garbage — at the consumer that is indistinguishable from a producer NaN, and it is
+timing- and pressure-sensitive, which matches the observed intermittency and regime dependence.
 
-**Falsifiable predictions**
+This is not a novel claim: the issue record already argued from the code that *"the flush precedes
+the wait, so the download copy is covered"*. The point of instrumenting is that a code reading cannot
+establish that ordering **under load** — a fingerprint of the staging buffer at the two moments can.
 
-1. On a faulting arm, at the faulting event, the source fingerprint taken at registration differs
-   from the fingerprint taken immediately before the copy.
-2. On clean arms the two fingerprints are always equal.
-3. If the producer itself wrote non-finite values, the registration-time fingerprint is *already*
+A second, explicitly synchronous path exists (`synchronous_download_fallback`, for arbitrary GGML
+pointers), which is the natural control: it should never show the window.
+
+### Falsifiable predictions
+
+1. On a faulting arm, at the faulting event, the staging-buffer fingerprint taken at registration
+   differs from the one taken immediately before the memcpy, and the pre-copy state is a
+   not-yet-written pattern (zeros / stale), not a finite tensor.
+2. On clean arms the pre-copy fingerprint matches the post-copy destination fingerprint (the copy had
+   landed before the host read it).
+3. If the device-side source itself holds non-finite values, the pre-copy fingerprint is already
    non-finite — that is H2 (producer codegen), which H1 excludes.
+4. The synchronous fallback path never shows the window.
 
 ## Instrumentation (env-gated, no effect when off)
 
@@ -43,7 +59,9 @@ and invisible to the consumer-side guard. This is consistent with the recorded c
 - in `mark_stream_synchronized()`: recompute the source fingerprint immediately **before** the
   memcpy, then fingerprint the destination **after** it;
 - one log line per writeback: `size`, source offset, `rec_fp`, `sync_fp`, `dst_fp`,
-  `rec_nonfinite`, `sync_nonfinite`, `dst_nonfinite`, `rec_eq_sync`.
+  `rec_class`, `sync_class`, `dst_class`, `rec_eq_sync`, the barrier flag for that staging entry, and
+  the registration→sync delay; where `class` ∈ {ZERO, NONFINITE, FINITE} so that "not yet written" is
+  distinguishable from "written and non-finite".
 
 Cost is bounded: enabled only by the flag, and the LM-head buffer is ~310 KB per token step.
 
@@ -53,12 +71,12 @@ it is inert when the flag is unset.
 
 ## Pre-registered reading of the outcome
 
-| rec_nonfinite | sync_nonfinite | dst_nonfinite | reading |
-|---|---|---|---|
-| 0 | > 0 | > 0 | **H1**: the region changed between registration and sync → reuse/visibility fault |
-| > 0 | > 0 | > 0 | producer wrote non-finite values → H1 excluded, H2 stands |
-| 0 | 0 | > 0 | the copy itself corrupts the destination → instrument the copy path |
-| 0 | 0 | 0 | this writeback is not the faulting route → move to the next route on the logits path |
+| pre-copy class | dst class | reading |
+|---|---|---|
+| NONFINITE | NONFINITE | the device-side source already held non-finite values → **H1 excluded, H2 (producer) stands** |
+| ZERO or stale | NONFINITE | the host read the staging buffer before the device copy landed, and the bytes it got were non-finite → **H1 (deferred/async ordering)** |
+| ZERO or stale | FINITE | same window, non-fatal in this instance — still a real ordering defect and evidence for H1 |
+| FINITE | FINITE | this writeback is clean → if the arm faulted, the faulting buffer is not this route; move to the next route |
 
 ## Procedure
 

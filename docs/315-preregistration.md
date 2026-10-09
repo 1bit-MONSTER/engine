@@ -286,3 +286,11 @@ the condition that waiter exists to refuse. The campaign's own console (`315acce
    (`setsid nohup … < /dev/null &`) and keep a separate waiter that exits on a completion marker, so the
    run cannot depend on the agent's session surviving. Also: when a `pgrep`/`awk` pattern unexpectedly
    matches nothing, fall back to explicit PIDs from `ps` rather than concluding the processes are gone.
+
+5. **An aborted agent-side command can leave a *stopped* remote run holding the box lock.** A launch command
+   the harness aborted mid-flight left a `315-paired.sh` in state `T` (SIGSTOP) holding the flock, so the
+   next run produced zero arms while looking like a hang. Long runs must be launched fire-and-forget
+   (`setsid nohup … < /dev/null &`, nothing but the launch and an `echo` in the command), and after any
+   aborted command the process table should be checked for `T` states before drawing conclusions — I
+   misdiagnosed this once as probe cost, and the contradicting evidence (zero `armed` lines) was already in
+   hand.

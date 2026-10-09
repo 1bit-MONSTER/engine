@@ -255,3 +255,37 @@ that dispatch run, and what does it write — not a transfer question.
 
 **Cost, for the record.** The stopping rule ended both campaigns at the first fix-cell fault: 14 arms (§13)
 and 7 arms (§15), instead of up to 120 each. Two falsifications for under an hour of box time.
+
+## 16. Producer probe: built, and what it did and did not establish
+
+Built as `GGML_HRX_PRODUCER_PROBE` in `runtime/graph-executor.cpp` (pre-fill host-visible outputs with a
+payload NaN `0x7FC0DEAD`, drain the stream, classify sentinel-intact vs other-NaN vs finite, log anomalies
+and an `armed` line proving the path is live). Four build/run cycles, each fixing an error of mine:
+
+1. `HRX_CHECK` is a macro local to `ggml-hrx.cpp`; unavailable in that TU.
+2. `hrx_status_t` is an **opaque pointer**, not an enum — the real tests are `hrx_status_is_ok()` and
+   `hrx_status_ignore()`.
+3. A selector requiring "host-visible **and** not consumed by any node" armed nothing: the region is a
+   graph-written destination, consumed by the node that writes it.
+4. A once-per-process dump only ever reported the first chunk.
+
+**What the runs established, and this part is structural.** HRX executes the llama graph as many small
+chunks — `n_nodes=9`, tails like `PERMUTE q_nope_perm-0`, `MUL_MAT q-0`, `RMS_NORM norm-0` — and across four
+arms and ~260 requests **no chunk executed through `GraphExecutor::execute` contained a host-visible tensor**
+(zero `host-node` lines, zero `armed` lines). So the sampled output region is not written by a graph-program
+dispatch; its writer is outside that path — a scheduler-issued copy, or a producer that is not an HRX graph
+operation.
+
+**The bound on that claim, stated rather than glossed.** It rests on the gate
+`ggml_backend_buffer_is_host(node->buffer)`. If the chunk that writes the region carries it as a view whose
+buffer test fails, the conclusion degrades to "not observed" rather than "not written". That is not settled
+here, and I am not going to claim the stronger form.
+
+**Consequence.** "A skipped HRX graph dispatch" is not supported as the producer-side explanation. The
+remaining producer-side candidates are the staging/copy path
+(`backend_copy_tensor_async` → `hrx_stream_copy_buffer`) and non-HRX producers; the next instrument should
+hook the copy path, not the executor.
+
+**Cost, stated plainly.** Four build/run cycles and several hours of box time went into this instrument, and
+every cycle was my error in choosing what to target. The structure dump that finally explained the shape
+should have been the first thing built, not the fourth.

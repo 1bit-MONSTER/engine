@@ -87,9 +87,16 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   # Face A memory fault signatures, excluding the allocation-failure lines that are invalid above.
   hsa=$(grep -iE "HSA_STATUS_ERROR|Queue error|wait for HRX graph replay commands failed" "$O/server.log" 2>/dev/null \
         | grep -vcE "hrx_allocator_allocate_buffer|allocate HRX host staging buffer" || true)
+  http=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['http_failures'])" 2>/dev/null || echo 0)
+  tr=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['transport_failures'])" 2>/dev/null || echo 0)
+  # Face B is first class in the pre-registration (see differential): count it from the detectors and
+  # the server log, so an arm that still completes its requests cannot be recorded as clean.
+  s500=$(grep -c '"code":500' "$O/server.log" 2>/dev/null || true); s500=${s500:-0}
+  unr=$(grep -cE "unparsed Content-only output|does not match the expected" "$O/server.log" 2>/dev/null || true); unr=${unr:-0}
   local g1; g1=$(gtt)
   if [ "${g0:-0}" -lt 95 ]; then verdict=OOR
-  elif [ "${nan:-0}" -gt 0 ] || [ "${hsa:-0}" -gt 0 ] || [ "${parse:-0}" -gt 0 ] || [ "${utf8:-0}" -gt 0 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
+  elif [ "${nan:-0}" -gt 0 ] || [ "${hsa:-0}" -gt 0 ] || [ "${parse:-0}" -gt 0 ] || [ "${utf8:-0}" -gt 0 ] \
+    || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
   else verdict=OK; fi
   printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d (gtt_now=%dG)\n' \
     "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "$g1" \
@@ -106,8 +113,8 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
 # MINCLEAN (default 60) clean in-regime arms, stop immediately if any fix-cell arm faults (acceptance
 # requires zero), and never exceed PAIRS pairs. The count is read back from the console, i.e. from the
 # same pre-registered classification the analyser uses.
-clean_fix() { grep -c 'arm l: OK' "$CONSOLE" 2>/dev/null || echo 0; }
-fault_fix() { grep -c 'arm l: \(FAULT\|INVALID\)' "$CONSOLE" 2>/dev/null || echo 0; }
+clean_fix() { grep -c 'arm l: OK' "$CONSOLE" 2>/dev/null || true; }
+fault_fix() { grep -c 'arm l: \(FAULT\|INVALID\)' "$CONSOLE" 2>/dev/null || true; }
 for p in $(seq 1 $PAIRS); do
   arm "$p" c "$CBIN"
   arm "$p" l "$FBIN"

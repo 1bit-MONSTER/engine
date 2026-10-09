@@ -74,3 +74,52 @@ UNIFIED= LOG_OVERRIDE=/tmp/315trace-default.log bash ~/wt/315-trace-premise.sh
 UNIFIED=1 LOG_OVERRIDE=/tmp/315trace-unified.log bash ~/wt/315-trace-premise.sh
 # then: grep 'hrx-buf' /tmp/315trace-*.log | grep 619520
 ```
+
+## 12. Discriminating experiment: result (tag `315diff2`, 2026-10-09)
+
+**Premise (measured, §11).** The logits buffer is `HRX0_HOST`, `host_visible=1`, `direct_host_binding=0`,
+`memory_type=0x52` — host-visible and **not** `HOST_COHERENT` (0x04). The sampler reads that buffer
+directly: there is no download and no copy on the route (the generic `ggml_backend_tensor_get_async`
+short-circuits for host buffers, and no 619520-byte transfer exists anywhere in the arm's log). Since
+nothing in the transfer path orders the device's write against that read, a reader may observe unwritten
+bytes — which is the observed shape: whole-vocabulary NaNs on one face, and invalid output bytes
+surfacing as an HTTP 500 parse failure on the other.
+
+**Method.** Instrumented build `~/wt/315instr3-build` (pin `e44c9d01a4d5` + all three diagnostic
+patches), `GGML_HRX_BUFFER_TRACE=1` on every arm. Arms alternate the two configurations on the same box,
+model, detector and load, in-regime at `gtt_start 98 GiB`: A = default, B = `GGML_HRX_USE_UNIFIED_MEMORY=1`
+(the coherence discriminator, **not** a fix).
+
+**Result** (arms on disk under `~/wt/rt-det/315diff2-*`; verdicts from `315-classify.py`):
+
+| pair | A = default | B = coherent | host-visible **non**-coherent buffers |
+|------|-------------|--------------|----------------------------------------|
+| 1    | clean       | clean        | 2 / 0 |
+| 2    | clean       | clean        | 2 / 0 |
+| 3    | clean       | clean        | 2 / 0 |
+| 4    | **FAULT**   | clean        | 2 / 0 |
+
+Pair 4's fault is **Face B**, in-regime, on the predicted side: the arm answered with a 500 whose message
+is `does not match the expected Content-only`, following `common_chat_peg_parse: unparsed Content-only
+output:` — i.e. generated text carrying bytes that are not valid UTF-8. Evidence:
+`~/wt/rt-det/315diff2-d4-GLM-4.7-Flash-Q4_K_M/server.log` (`"code":500` ×1, unparsed ×2),
+`detector.json` (`http_failures=1`, `requests=21`), `run.log` (`gtt_start 98GiB`), `gtt.log`.
+
+The trace count is the per-arm assertion that the configurations really differ: every default arm
+allocates **2** host-visible non-coherent buffers (the 619520-byte logits buffer plus a 44048640-byte one),
+every coherent arm allocates **0**. So the discriminator is a measured property of the allocation rather
+than the knob itself, and it flips exactly as §11 predicted.
+
+**What this does and does not establish.** It establishes that a fault occurs with the non-coherent
+host-visible memory class and, in this sample, not with the coherent class: 1 fault in 4 in-regime default
+arms (consistent with the recorded ~5 %/arm), 0 in 4 coherent arms. It does **not** establish the rate —
+that is what the pre-registered ≥60-arm campaign (§7) is for, which is why the differential stops here
+rather than being read as evidence of a fix.
+
+**Classifier gap (recorded because it would have faked a pass).** The first predicate in `315-paired.sh`
+and `315-differential.sh` read only nan/hsa/utf8/parse, so pair 4's Face-B fault was labelled
+`INCOMPLETE` — its request count fell short after the 500. Face B is first-class in the pre-registration,
+so the predicate now also counts `http_failures`, `transport_failures` and the server-log signatures
+(`"code":500`, unparsed Content-only). That implements the pre-registered rule rather than relaxing it:
+the table above is produced by applying that definition to arms that were already on disk, and
+`docs/315-campaign/315-classify.py` is the single source of truth for it.

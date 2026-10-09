@@ -43,10 +43,19 @@ arm() {   # arm <tag> <extra-env>
     req=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['requests'])" 2>/dev/null || echo 0)
     g0=$(grep -o "gtt_start [0-9]*G" "$O/run.log" 2>/dev/null | head -1)
     fp=$(grep -c "\[hrx-buf\]" "$O/server.log" 2>/dev/null || true)
+    local http tr s500 unr
+    http=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['http_failures'])" 2>/dev/null || echo 0)
+    tr=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['transport_failures'])" 2>/dev/null || echo 0)
+    # Face B is first class in the pre-registration: invalid-UTF-8 output surfacing as an HTTP 500 or a
+    # chat-template parse failure. Take it from the detector counters AND the server log, so an arm
+    # cannot look clean merely by completing its requests.
+    s500=$(grep -c '"code":500' "$O/server.log" 2>/dev/null || true); s500=${s500:-0}
+    unr=$(grep -cE "unparsed Content-only output|does not match the expected" "$O/server.log" 2>/dev/null || true); unr=${unr:-0}
     local verdict=clean
-    { [ "${nan:-0}" != "0" ] || [ "${hsa:-0}" != "0" ] || [ "${utf8:-0}" != "0" ] || [ "${parse:-0}" != "0" ]; } && verdict=FAULT
+    { [ "${nan:-0}" != "0" ] || [ "${hsa:-0}" != "0" ] || [ "${utf8:-0}" != "0" ] || [ "${parse:-0}" != "0" ] \
+      || [ "${http:-0}" != "0" ] || [ "${tr:-0}" != "0" ] || [ "${s500:-0}" != "0" ] || [ "${unr:-0}" != "0" ]; } && verdict=FAULT
     [ "${req:-0}" -lt 66 ] && [ "$verdict" = clean ] && verdict=INCOMPLETE
-    echo "  RESULT tag=$tag $g0 verdict=$verdict nan=$nan hsa=$hsa utf8=$utf8 parse=$parse req=$req buf_trace=$fp" | tee -a "$LOG"
+    echo "  RESULT tag=$tag $g0 verdict=$verdict nan=$nan hsa=$hsa utf8=$utf8 parse=$parse http=$http tr=$tr s500=$s500 unparsed=$unr req=$req buf_trace=$fp" | tee -a "$LOG"
     echo "$verdict" > "$HOME/wt/$tag.verdict"
 }
 

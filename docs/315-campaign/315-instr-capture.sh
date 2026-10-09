@@ -23,6 +23,13 @@ for P in $(pgrep -f llama-server 2>/dev/null); do
 done
 
 source "$(dirname "$0")/315-regime.sh"
+# Serialize with other sessions on the box: the peer #315 run was queued on this same lock, and two
+# arms sharing the GTT budget would contaminate each other's regime.
+if [ -z "${NOLOCK:-}" ]; then
+  exec 9>"$HOME/.cache/lax-decode/box.lock"
+  flock 9
+  echo "capture: box lock acquired at $(date -Is)"
+fi
 regime_neighbours 1 6 "$NCTX"
 trap regime_teardown EXIT
 
@@ -38,7 +45,8 @@ G0=$(gtt); echo "gtt_start ${G0}GiB fp=$FP" > "$O/run.log"
 echo "arm up=$UP gtt_start=${G0}G port=$PORT"
 
 if [ "$UP" = "1" ]; then
-  python3 "$DET" "$PORT" "$O" 50 > "$O/detector.log" 2>&1
+  timeout "${ARM_TIMEOUT:-1200}" python3 "$DET" "$PORT" "$O" 50 > "$O/detector.log" 2>&1
+  echo "  detector exit=$? (124 = arm exceeded ${ARM_TIMEOUT:-1200}s and was cut off)"
   tail -1 "$O/detector.log" | sed 's/^/  /'
 fi
 

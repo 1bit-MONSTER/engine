@@ -17,6 +17,7 @@ Usage: 315-detector.py <port> <outdir> <nmix>
 Writes <outdir>/detector.json and prints one summary line.
 """
 import json
+import os
 import random
 import sys
 import urllib.error
@@ -28,7 +29,13 @@ WORDS = "the quick brown fox jumps over a lazy dog while seven tired engineers m
 
 
 def request(port: int, prompt: str, n_predict: int) -> dict:
-    """One request, recording the raw bytes rather than trusting json.loads."""
+    """One request, recording the raw bytes rather than trusting json.loads.
+
+    The timeout is deliberately bounded: an arm whose server stops responding must be recorded as a
+    transport failure and end quickly. The inherited 600 s per request let a stalled server hold the
+    shared box for hours (observed on the second smoke arm).
+    """
+    timeout = float(os.environ.get("DET_TIMEOUT", "180"))
     body = json.dumps({"prompt": prompt, "n_predict": n_predict, "temperature": 0,
                        "cache_prompt": False}).encode()
     rec = {"http_status": None, "utf8_ok": False, "json_ok": False, "content": None,
@@ -36,7 +43,7 @@ def request(port: int, prompt: str, n_predict: int) -> dict:
     try:
         with urllib.request.urlopen(
                 urllib.request.Request(f"http://127.0.0.1:{port}/completion", body,
-                                       {"Content-Type": "application/json"}), timeout=600) as resp:
+                                       {"Content-Type": "application/json"}), timeout=timeout) as resp:
             rec["http_status"] = resp.status
             raw = resp.read()
     except urllib.error.HTTPError as exc:

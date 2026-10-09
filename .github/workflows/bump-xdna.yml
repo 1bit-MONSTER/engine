@@ -22,6 +22,14 @@
 # Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
 # 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
 # start CI.
+#
+# Behind the runtime switch (docs/npu.md, "XRT or the own runtime"): the engine
+# only needs XRT when it builds with ONEBIT_NPU_RUNTIME=xrt. The repository
+# variable ONEBIT_NPU_RUNTIME mirrors the build we ship; while it is "own" the
+# scheduled bump is skipped and the xdna-driver pin stays where it is (the
+# kernel module still comes from the pinned kernel build, docs/npu.md, "The XDNA
+# stack"). Set it back to "xrt" (or unset it) to resume the daily bump; a manual
+# workflow_dispatch always runs.
 name: bump-xdna
 
 on:
@@ -38,6 +46,7 @@ concurrency:
 
 jobs:
   bump:
+    if: ${{ github.event_name == 'workflow_dispatch' || vars.ONEBIT_NPU_RUNTIME != 'own' }}
     runs-on: ubuntu-latest
     steps:
       - name: Require the token

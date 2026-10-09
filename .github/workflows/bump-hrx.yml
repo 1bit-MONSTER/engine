@@ -209,6 +209,49 @@ jobs:
           fi
           echo "hrx_rebased=$hrx_rebased" >> "$GITHUB_OUTPUT"
 
+      # Our ggml-hrx backend (ggml/src/ggml-hrx in the llama.cpp fork) is compiled against the LoomC
+      # headers of hrx-system. AMD removes public LoomC symbols without notice (2026-10-07: loom 32d0c76a
+      # dropped loomc_amdgpu_runtime_global_flags_t and loomc_amdgpu_emit_options_t, used by our
+      # loom-jit.cpp). CI here builds without HRX, so #353, #357 and #361 merged a pair that did not
+      # compile with ONEBIT_HRX=ON, and #359 / #363 had to pin hrx-system back by hand (KNOWN-ISSUES.md).
+      # Cheap header-level check: every loomc_* / LOOMC_* identifier our backend uses must still be
+      # declared under loom/binding/c/include at the new hrx-system revision. If one is missing, the PR
+      # moves llama.cpp only and keeps hrx-system where it is, and says so.
+      - name: Hold hrx-system if our ggml-hrx uses LoomC symbols the new revision dropped
+        id: compat
+        if: steps.pins.outputs.changed == 'true'
+        env:
+          REBASED: ${{ steps.fork.outputs.rebased }}
+          HRX_REBASED: ${{ steps.hrxfork.outputs.hrx_rebased }}
+          OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
+        run: |
+          set -euo pipefail
+          hrx_pin="$HRX_REBASED"
+          held=""
+          if [ "$HRX_REBASED" != "$OURS_HRX" ]; then
+            used=$(cd patched && git ls-tree -r --name-only "$REBASED" -- ggml/src/ggml-hrx \
+              | grep -E '\.(c|cc|cpp|h|hpp)$' \
+              | while read -r f; do git show "$REBASED:$f"; done \
+              | grep -oE '\b(loomc_[A-Za-z0-9_]+|LOOMC_[A-Z0-9_]+)\b' | sort -u)
+            headers=$(cd hrxsystem && git ls-tree -r --name-only "$HRX_REBASED" -- loom/binding/c/include \
+              | while read -r f; do git show "$HRX_REBASED:$f"; done)
+            missing=""
+            for sym in $used; do
+              printf '%s\n' "$headers" | grep -qF -- "$sym" || missing="$missing $sym"
+            done
+            if [ -n "$missing" ]; then
+              echo "::warning::hrx-system ${HRX_REBASED:0:12} no longer declares:${missing}. Keeping third_party/hrx-system at ${OURS_HRX:0:12} until ggml-hrx is ported (KNOWN-ISSUES.md, engine#359/#363)."
+              hrx_pin="$OURS_HRX"
+              held="hrx-system HELD at \`${OURS_HRX:0:12}\`: our ggml-hrx still uses LoomC symbols that \`${HRX_REBASED:0:12}\` dropped (${missing## }). Port ggml/src/ggml-hrx first, then move it."
+            else
+              echo "every LoomC symbol our ggml-hrx uses ($(printf '%s\n' $used | wc -l)) is declared at hrx-system ${HRX_REBASED:0:12}"
+            fi
+          fi
+          {
+            echo "hrx_pin=$hrx_pin"
+            echo "held=$held"
+          } >> "$GITHUB_OUTPUT"
+
       - name: Open the bump PR
         if: steps.pins.outputs.changed == 'true'
         env:
@@ -216,13 +259,18 @@ jobs:
           AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
           AMD_HRX: ${{ steps.pins.outputs.amd_hrx }}
           REBASED: ${{ steps.fork.outputs.rebased }}
-          HRX_REBASED: ${{ steps.hrxfork.outputs.hrx_rebased }}
+          HRX_REBASED: ${{ steps.compat.outputs.hrx_pin }}
+          HRX_HELD: ${{ steps.compat.outputs.held }}
           PATCHES: ${{ steps.fork.outputs.patches }}
           OURS_LLAMA: ${{ steps.pins.outputs.ours_llama }}
           OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
         run: |
           set -euo pipefail
-          branch="bump-hrx/${AMD_LLAMA:0:12}-${AMD_HRX:0:12}"
+          if [ "$REBASED" = "$OURS_LLAMA" ] && [ "$HRX_REBASED" = "$OURS_HRX" ]; then
+            echo "::notice::nothing to move: llama.cpp stays at ${OURS_LLAMA:0:12} and hrx-system is held at ${OURS_HRX:0:12}"
+            exit 0
+          fi
+          branch="bump-hrx/${AMD_LLAMA:0:12}-${HRX_REBASED:0:12}"
           if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
             echo "$branch already exists"; exit 0
           fi
@@ -242,6 +290,8 @@ jobs:
           |---|---|---|
           | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched) | \`${OURS_LLAMA:0:12}\` | \`${REBASED:0:12}\` (on AMD \`${AMD_LLAMA:0:12}\`) |
           | third_party/hrx-system (1bit-MONSTER/hrx-system 1bit/main) | \`${OURS_HRX:0:12}\` | \`${HRX_REBASED:0:12}\` (on AMD \`${AMD_HRX:0:12}\`) |
+
+          ${HRX_HELD}
 
           Our commits, rebased onto AMD's pin:
           ${PATCHES}

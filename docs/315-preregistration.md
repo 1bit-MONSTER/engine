@@ -20,6 +20,20 @@ issue's instrumentation and falsification record.
 The fix cell and the control cell must each name their build explicitly, e.g.
 `llama-server version: 10605 (86c33b5d5)`, so no arm is attributed to an unnamed binary.
 
+**Control-cell revision — checked, not assumed.** The study's control binary (`~/wt/v315-build`,
+`version: 10605 (86c33b5d5)`) was built from `~/wt/llama-hybrid` at `26330cc20` (`merge315`). That
+revision is an *ancestor* of the engine pin `e44c9d01a`, which normally would make it a stale control
+— but for our code it is not:
+
+    git rev-list --count 26330cc20..e44c9d01a -- ggml/src/ggml-hrx   ->  0
+
+No ggml-hrx commit separates them, and every deferred-writeback/ordering commit is already an ancestor
+of the control (`882fced1a` introduces the deferral; `e0f637bff` publishes deferred writebacks before
+an upload; `b4e751594`; `f862daed1`; `efb93cea5`). Consequences: (a) the existing control binary is
+valid for the HRX path, and (b) those ordering fixes were present during all recorded fault
+measurements, so the fault survives them — consistent with the issue's "reproduces on the shipped
+pin". Re-verify this claim if the pin moves again.
+
 ## 2. Shape set (per arm, 66 requests)
 
 As implemented by the existing inner detector `~/wt/rt-det.sh`:

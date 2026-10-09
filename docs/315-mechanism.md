@@ -218,3 +218,40 @@ Difference from the falsified candidate, stated plainly: §12 changed *what the 
 (coherence, `0x52` → `0x56`); this changes *when the read is allowed to happen* (ordering). Only the
 second can make an unwritten buffer safe, which is why the Face-A shape ("all 154880 elements") is the
 prediction this hypothesis actually explains.
+
+## 15. The ordering candidate is falsified too — and that locates the fault in the producer
+
+The §14 candidate (a completion barrier — `backend_synchronize(backend)` at the end of `graph_compute`, so
+the host read is ordered after the device's work) was run as the **sync cell** under the same
+pre-registered rule, across tags `315sync` (interrupted by an ssh-session freeze; its pair 1 recorded) and
+`315sync2` (relaunch). The stopping rule ended the relaunch at the first fix-cell fault, pair 5.
+
+| cell | in-regime arms | clean | faults | rate (95 % CI) |
+|------|---------------:|------:|-------:|----------------|
+| control (pin + diagnostics) | 2 | 2 | 0 | 0 % (0–65.8) |
+| **fix (pin + barrier + diagnostics)** | 6 | 5 | **1** | **16.7 % (3.0–56.4)** |
+
+Acceptance: **NOT MET** (5 clean of 60 required, one fault where zero are allowed).
+
+The faulting arm is itself the finding:
+
+```
+pair 5 arm l: FAULT nan=1 req=10 gtt_start=98G hv52=1 hv56=0
+  server.log: common_sampler_sample: HRX returned NaN logits: count=154880 of 154880,
+              index range [0..154879], contiguous=yes, continuing=no
+```
+
+With the barrier in place the host read happens *after* the compute stream reports completion, so this NaN
+was not read early. **Every** element of the 154880-wide output was NaN, so the region was either written
+with NaN or never written by the device at all — while the stream reported success. That takes the
+mechanism off the host path and puts it in the **producer**: the dispatch or kernel that fills the output
+region can silently fail to produce it.
+
+Both host-path candidates are therefore excluded by their own pre-registered campaigns — visibility (§13)
+and ordering (§15) — and what remains is the family the recorded entry had already named: the
+kernel/binding side, whose concrete open candidate is GLM's decode splitting into two 128 KB AQL command
+blocks (919 + 760 dispatches, 1,399 barriers per token). The next question is a producer-side one — does
+that dispatch run, and what does it write — not a transfer question.
+
+**Cost, for the record.** The stopping rule ended both campaigns at the first fix-cell fault: 14 arms (§13)
+and 7 arms (§15), instead of up to 120 each. Two falsifications for under an hour of box time.

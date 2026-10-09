@@ -279,3 +279,10 @@ smoke console carries **two** pairs — the second of which shows a *clean* cont
 2-arms-per-pair run looks like while the box is still draining, not evidence about the fault. It also
 explains the ~99-105 GiB GTT the campaign's box-waiter saw for its first ten minutes, which is precisely
 the condition that waiter exists to refuse. The campaign's own console (`315accept`) is unaffected.
+
+4. **A dropped agent-side ssh task SIGSTOPs the remote run.** When the local ssh process for a long box run
+   was lost, the remote scripts — still in that session's process group — went to state `T` mid-arm and the
+   campaign froze for an hour with GTT back at base and no arm verdict. Launch long runs *detached*
+   (`setsid nohup … < /dev/null &`) and keep a separate waiter that exits on a completion marker, so the
+   run cannot depend on the agent's session surviving. Also: when a `pgrep`/`awk` pattern unexpectedly
+   matches nothing, fall back to explicit PIDs from `ps` rather than concluding the processes are gone.

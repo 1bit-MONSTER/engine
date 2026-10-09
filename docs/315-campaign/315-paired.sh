@@ -102,10 +102,19 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   for P in $(pgrep -f "port $port" 2>/dev/null); do kill -TERM $P 2>/dev/null; done
 }
 
+# Pre-registered stopping rule (docs/315-preregistration.md §6): run pairs until the fix cell has
+# MINCLEAN (default 60) clean in-regime arms, stop immediately if any fix-cell arm faults (acceptance
+# requires zero), and never exceed PAIRS pairs. The count is read back from the console, i.e. from the
+# same pre-registered classification the analyser uses.
+clean_fix() { grep -c 'arm l: OK' "$CONSOLE" 2>/dev/null || echo 0; }
+fault_fix() { grep -c 'arm l: \(FAULT\|INVALID\)' "$CONSOLE" 2>/dev/null || echo 0; }
 for p in $(seq 1 $PAIRS); do
-  for cell in c l; do
-    if [ "$cell" = c ]; then arm "$p" "$cell" "$CBIN"; else arm "$p" "$cell" "$FBIN"; fi
-  done
+  arm "$p" c "$CBIN"
+  arm "$p" l "$FBIN"
+  cf=$(clean_fix); ff=$(fault_fix)
+  say "after pair $p: fix-cell clean=$cf fault-or-invalid=$ff (target >=${MINCLEAN:-60} clean, cap $PAIRS pairs)"
+  [ "$ff" -gt 0 ] && { say "STOP: a fix-cell arm faulted or was invalid — acceptance requires zero faults"; break; }
+  [ "$cf" -ge "${MINCLEAN:-60}" ] && { say "STOP: reached $cf clean fix-cell arms"; break; }
 done
 
-echo "$(grep -c 'arm [cl]: OK' "$CONSOLE" 2>/dev/null || echo 0) clean arms so far" | tee -a "$CONSOLE"
+echo "$(clean_fix) clean fix-cell arms, $(fault_fix) faulted-or-invalid, out of $((p * 2)) arms" | tee -a "$CONSOLE"

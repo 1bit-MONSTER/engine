@@ -169,7 +169,45 @@ cheap; if it does not, the in-regime rate stands and mechanism discrimination mu
 instrumenting `download_synchronous` (fingerprint the source mapping at copy time) rather than from
 rate comparison.
 
-## Mechanism candidate (v3, NOT confirmed): host-visible non-coherent logits buffer
+## Mechanism candidate (v3): host-visible NON-COHERENT logits buffer — PREMISE MEASURED
+
+**Measured 2026-10-09 (`GGML_HRX_BUFFER_TRACE=1`, v3 build, one load + three decodes, no neighbours):**
+
+```
+ 5 trace lines after decode
+   3 x  host_visible=0 direct_host_binding=0 memory_type=0x30   (device-local; weights 17.9 GB @0x30)
+   2 x  host_visible=1 direct_host_binding=0 memory_type=0x52   (host-visible, NOT coherent)
+
+ the logits buffer, exactly:
+   [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=619520
+```
+
+`619520 = 154880 × 4` — exactly the vocabulary the sampler guard reports (`count=154880 of 154880`).
+So the logits tensor is allocated from a **host-visible** buffer type (`HRX0_HOST`) with
+**`direct_host_binding=0`**, i.e. **no `HOST_COHERENT`** (coherence is only added when
+`use_direct_host_bindings`, which is `GGML_HRX_USE_UNIFIED_MEMORY`, default off).
+
+Combined with the other measurements, the mechanism is:
+
+1. the logits land in host-visible memory, so the sampler reads them **directly with no copy** — which is
+   exactly why zero logits-sized downloads exist and why the recorded hard negative holds;
+2. that memory is **not host-coherent** on this box (default), so the device's write into it carries no
+   coherence guarantee for the CPU reader — a host read can observe uninitialised or partially written
+   bytes, i.e. whole-vocabulary NaN, intermittently and sensitive to allocation/pressure timing;
+3. the copy path is ordered (`hashes_equal=1` on all 146 probe records), so the copy is not the fault —
+   the visibility of the *write* is.
+
+This is not one of the already-falsified levers (arena knobs, transient reuse, logits host-staging).
+
+**Pre-committed discriminating observable (cheap, one load):** with
+`GGML_HRX_USE_UNIFIED_MEMORY=1`, the same 619520-byte `HRX0_HOST` buffer must show
+`direct_host_binding=1` with the `HOST_COHERENT` bit set in `memory_type`. If it does, the coherence
+switch is confirmed to control exactly that buffer; if it does not, this candidate is refuted for the
+logits and the search returns to the producer side.
+
+**What is still open:** whether coherence actually removes the fault needs a rate test at ~5%/arm
+(the box must be free, and one in-regime campaign per box is the measured limit). And the fix must be
+forward-only and must not be "set the env var" — a config toggle is not a fix.
 
 Code evidence, read from the pinned source:
 

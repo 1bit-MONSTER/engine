@@ -33,7 +33,7 @@
 #include <cstring>
 #include <fstream>
 
-#include <xrt/xrt_device.h>
+#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
 
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
 #include "q4nx_dequant.h"

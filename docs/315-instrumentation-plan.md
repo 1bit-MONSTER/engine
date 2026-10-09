@@ -133,6 +133,32 @@ explicitly ordered, so:
 - The `synchronous_fallback` functions also log a one-time warning ("synchronous download fallback for
   an unregistered host pointer"), so the route can be confirmed from a log without new code.
 
+### v2 probe result (same session): the copy path is ordered, and the logits are not copied at all
+
+The v2 host-download probe (`GGML_HRX_DOWNLOAD_FINGERPRINT`, a second d2h of the same region compared
+with the real copy) fired **146 times** in one in-regime arm (`gtt_start 98G`) — so it does reach
+`download_synchronous`, unlike the v1 deferred-writeback probe (0 records). Two results:
+
+1. **`hashes_equal=1` on every one of the 146 records.** Probe read and real copy are byte-identical
+   each time: no race, no reuse window, no copy corruption in the download path. That matches the code
+   reading (`hrx_stream_synchronize` at `host-memory.cpp:1350` precedes the copy).
+2. **No logits-sized download exists.** Captured sizes are 884736 / 2211840 / 5898240 — each exactly
+   **47 times** (one per layer: weight / host-weight-lease traffic) — plus 11.8 MB, 17.2 MB and
+   260 MB. The logits (`154880 × f32 = 619520 B`) appear **zero** times.
+
+The logits therefore never pass through `download_synchronous`, which independently confirms the
+recorded hard negative that they are not host-staged. Natural reading: the logits tensor lives in a
+**host-visible** buffer, so the generic `ggml_backend_tensor_get_async` short-circuits to a plain
+memcpy and the device writes into host memory directly. The fault is then in **what the device wrote
+there (or failed to write) and whether that write is ordered/visible** before the sampler reads it —
+not in any copy this backend performs.
+
+**Classifier caveat, recorded so it is not repeated:** the f16/f32 exponent-all-ones test is only
+meaningful on float tensor payloads. On quantized/weight bytes the hit rate is just the 1/32 (f16) or
+1/256 (f32) chance pattern — the 146 weight records all read NONFINITE and mean nothing (measured
+2.6% nf16, exactly that chance rate). Only records whose size matches a known float tensor
+(e.g. `n_vocab × 4`) carry signal.
+
 ### Next discriminator (cheap, because the fault is rare)
 
 At ~5%/arm a differential test needs dozens of arms to see a handful of faults. The issue records a

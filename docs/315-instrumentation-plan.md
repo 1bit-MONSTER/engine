@@ -199,15 +199,33 @@ Combined with the other measurements, the mechanism is:
 
 This is not one of the already-falsified levers (arena knobs, transient reuse, logits host-staging).
 
-**Pre-committed discriminating observable (cheap, one load):** with
-`GGML_HRX_USE_UNIFIED_MEMORY=1`, the same 619520-byte `HRX0_HOST` buffer must show
-`direct_host_binding=1` with the `HOST_COHERENT` bit set in `memory_type`. If it does, the coherence
-switch is confirmed to control exactly that buffer; if it does not, this candidate is refuted for the
-logits and the search returns to the producer side.
+**Pre-committed discriminating observable — CONFIRMED (2026-10-09).** The prediction was recorded
+before the run: with `GGML_HRX_USE_UNIFIED_MEMORY=1`, the same host-visible buffer must show
+`direct_host_binding=1` with the `HOST_COHERENT` bit set. Measured, same load+decode, separate log:
 
-**What is still open:** whether coherence actually removes the fault needs a rate test at ~5%/arm
-(the box must be free, and one in-regime campaign per box is the measured limit). And the fix must be
-forward-only and must not be "set the env var" — a config toggle is not a fix.
+```
+  default : [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52  size=619520
+  unified : [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=1 memory_type=0x56  size=37757184
+```
+
+`0x52 -> 0x56` is `| 0x04`, i.e. exactly the `HOST_COHERENT` bit, and `direct_host_binding` flips 0 -> 1.
+The coherence switch therefore controls precisely the property this mechanism depends on, on precisely
+the host-visible buffer family the logits come from.
+
+**What is still open (and why it is not closed here):**
+
+- Whether coherence *removes the fault* is a rate question at ~5 %/arm, so it needs tens of arms with the
+  box to itself. Measured constraint: one in-regime campaign per box — with a peer session holding
+  ~100-102 GiB, `315-regime.sh` correctly refuses to compose (exit 4), because adding a detector from
+  that base projects past the ~110 GiB invalid bound.
+- No **failing** arm was produced this session (three in-regime arms were clean: flag-off, flag-on,
+  `-ub 512`), so task-2's "record from a failing arm" is not satisfied by these observations — they are
+  structural (load/decode-time) records on healthy arms, and are labelled as such.
+- The peer session on the same box is testing a different candidate (AQL block-transition dose-response),
+  so a mechanism statement must still account for it.
+- The fix must be forward-only and must not be "set the env var": a configuration toggle that trades
+  coherent memory for performance is not a fix. The likely shape is an explicit visibility operation
+  (flush/invalidate or a scoped coherent allocation) on the output path only.
 
 Code evidence, read from the pinned source:
 

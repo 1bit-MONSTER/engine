@@ -407,3 +407,21 @@ this inventory the helper must compose **3 neighbours**: `26.7 + 3 × 17.7 ≈ 7
 The default band (LO=80 HI=92) instead composes 3 neighbours and then overshoots to 97 *before* the
 detector, ending at 115 (INVALID). The usable setting is therefore `REGIME_LO=70 REGIME_HI=85`, and the
 arm's own `gtt_start` remains the only thing that decides regime membership.
+
+### 19c. Why the fingerprint missed the logits (mechanism of the miss, verified in source)
+
+`GGML_HRX_DOWNLOAD_FINGERPRINT` is implemented in `runtime/host-memory.cpp:1419`, immediately after
+`hrx_synchronous_d2h(device, source, offset, host_destination, size)` at line 1411 — i.e. in the
+**synchronous download** path, the one taken when the host buffer is *not* registered. The logits take the
+other branch: `backend_get_tensor_async` finds the destination in `device->host_buffers` (registered) and
+issues `hrx_stream_copy_buffer`, which is where the copy probe fires (2734 times per arm).
+
+Its gate (`size >= 4096`) would have admitted 619520, so this was not a threshold artefact: the
+instrumented branch simply never executes for registered host buffers. §11's "zero logits-sized download
+records" is therefore an artefact of *which branch* was instrumented, not evidence that no transfer
+happened — and the 146 weight-lease records it did produce are consistent with the same explanation.
+
+**Consequence for the sentinel experiment:** the sentinel is written into the *source* allocation, so a
+faulting arm reporting `sentinel == count` means the copy was faithful and the source region was never
+written by the device. That is §18's decisive row, and it needs no additional instrument — only a
+faulting in-regime arm.

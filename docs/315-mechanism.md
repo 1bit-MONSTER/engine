@@ -313,3 +313,31 @@ The probe prints `hrx-copy-probe armed` on first use (proof the path is live) an
 This is deliberately a *reading*, not a claim: whichever row is hit, the arm's own verdict
 (`nan`/`hsa`/`parse`/`utf8` counts, §5) is recorded alongside it, and the row that does not match
 is reported as not observed rather than argued away.
+
+## 18. Sentinel experiment (the decisive discriminator): reading pre-committed
+
+§15 left one fact unexplained: in the faulting arm **every** one of the 154,880 logits was NaN, so the
+region was "either written [as] garbage or never written". §16 cannot separate those two: its producer
+probe armed nothing (its selector required a host-visible tensor that no node consumes), so its sentinel
+pre-fill never ran, and its own text records that the conclusion degrades to "not observed".
+
+That distinction is testable directly. The host-visible logits allocation (the 619,520-byte region,
+identified in §11) is filled with a payload NaN `0x7FC0DEAD` when `GGML_HRX_SENTINEL` is set, and the
+existing sampler guard — which already counts NaN, index range and contiguity — additionally counts how
+many of those NaNs are exactly the sentinel. Only the 619,520-byte allocation is touched, only under the
+env var, so a control arm without it is unaffected.
+
+**Reading, fixed before the run:**
+
+| observation on a faulting arm | conclusion |
+|---|---|
+| `sentinel` == `count` (every NaN is ours) | the device **never wrote** the logits region: the fault is a missing/lost **write**, not a stale or early **read** — which is also consistent with §13 and §15 both failing, since neither touched the write |
+| `sentinel` == 0 (none of the NaNs are ours) | the device **did write**, and wrote NaNs: the producer is compute/kernel-side |
+| 0 < `sentinel` < `count` | the region was written **in part**: a torn or interrupted write, which implicates the write path too |
+| no `[hrx-sentinel]` line, or the arm has no `armed` line | the instrument did not run: an **invalid** arm, not evidence |
+
+Two consequences stated in advance. First, on a *clean* arm the guard does not fire at all (it returns
+before logging when `nan_count == 0`), so a clean arm carries no sentinel datum — the sentinel is only
+readable on faulting arms, and the experiment is therefore about *which* faults exist, not about the rate.
+Second, if `sentinel` == 0 on the first faulting arm, the sentinel hypothesis is dead and the producer-side
+instrument is the next step, exactly as §16 proposed.

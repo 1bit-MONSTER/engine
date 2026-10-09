@@ -15,7 +15,7 @@ set -euo pipefail
 PIN=e44c9d01a4d5110cecaf45472a717f46cd1abbf9
 BASE=$HOME/wt/llama-hybrid
 SRC=$HOME/wt/llama-315instr
-B=$HOME/wt/315instr-build
+B=${B:-$HOME/wt/315instr-build}
 HRX=$HOME/wt/pin-fork-hrx/third_party/hrx-system
 PATCH=${1:-$HOME/wt/315-instrumentation.patch}
 LOG=$HOME/wt/315instr-build.log

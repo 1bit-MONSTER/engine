@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # engine#315 paired in-regime campaign driver — the pre-registered producer.
 #
 # Emits one line per arm in the grammar the analysis scripts parse:
@@ -72,7 +58,8 @@ say "neighbours up gtt=$(gtt)G"
 
 arm() {   # arm <pair> <cell c|l> <bin dir>
   local pair=$1 cell=$2 bin=$3 port=$((19300 + RANDOM % 400))
-  local tag="$TAG-p$pair$cell" O="$OUTDIR/$tag-$(basename $M .gguf)"
+  local tag="$TAG-p$pair$cell"
+  local O="$OUTDIR/$tag-$(basename $M .gguf)"
   rm -rf "$O"; mkdir -p "$O"
   local -a TRACE_ENV=()
   [ -n "${TRACE:-}" ] && TRACE_ENV=(--setenv=GGML_HRX_BUFFER_TRACE=1)

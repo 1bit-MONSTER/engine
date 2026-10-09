@@ -267,6 +267,13 @@ crashing, which is why they are written down:
    assertion in the same scope as the path, or take the path as an argument, and treat a missing file as
    an error rather than as a zero count.
 
+7. **Passing a build directory where the driver takes a bin directory.** `315-paired.sh`'s usage says
+   `<control_bin_dir> <fix_bin_dir>`, and the cell-build script prints `CELLBUILD_DONE
+   bin_dir=…/bin`, but a run was launched with `~/wt/315copy-build` and aborted at
+   `regime_preflight` with `<bin>/llama-server: No such file or directory` (exit 3, before any
+   neighbour started — the driver's ordering is what made this cost nothing). Assert both binary paths
+   with `--version` *before* calling the driver, as the invocation above does.
+
 More generally: every one of these was a *plumbing* error in my own harness, not a finding about the
 system under test — the same class as the `cpe.cpp` patch-path mistake and the scp race. Each one was
 caught only because the harness was made to assert something (a marker in the binary, a fault count

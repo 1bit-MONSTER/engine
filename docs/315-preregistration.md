@@ -170,6 +170,24 @@ follows §5 exactly.
 
 ≤12 hours of strixhalo box time in total for this goal, shared with other work through the box lock.
 
+## 9b. Regression baseline (recorded, for task-6)
+
+So the regression checks do not have to be re-derived from old logs:
+
+| check | recorded baseline | where |
+|---|---|---|
+| `test-backend-ops -o MUL_MAT_ID` | **108/108 passed, fail=0, supported=110**, rc=0, stable across repeats | `~/wt/hrxsys-correct.log`, `~/wt/rt-final3.log` |
+| dense-model control at ~512 tokens | clean — the MoE path is the faulting one; a dense model at 512 tokens was reported fine | issue record |
+
+The issue's earlier "`test-backend-ops -o MUL_MAT_ID` fails with ERR = 1.0" is **not** the current state:
+the recorded runs pass 108/108. The regression criterion is therefore *unchanged relative to 108/108*,
+not "fixes a failing op-test".
+
+`test-backend-ops` is absent from the study's builds because their recipe sets `-DLLAMA_BUILD_TESTS=OFF`,
+so the regression cell must be configured with tests **on** (from the same revision as the cell it
+validates) to get a comparable binary. The copies under `~/wt/loom-kvnan-mf/bin/` and
+`~/wt/z2work/bin-*/` come from other trees and are not suitable for an A/B on this fix.
+
 ## 10. Explicitly out of scope
 
 - AMD driver/kernel changes (recorded as a proposal with evidence if the mechanism lands there).

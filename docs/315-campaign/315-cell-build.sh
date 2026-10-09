@@ -1,18 +1,4 @@
 #!/usr/bin/env bash
-# Copyright 2026 bong-water-water-bong
-# SPDX-License-Identifier: Apache-2.0
-#
-# Licensed under the Apache License, Version 2.0 (the "License");
-# you may not use this file except in compliance with the License.
-# You may obtain a copy of the License at
-#
-#     http://www.apache.org/licenses/LICENSE-2.0
-#
-# Unless required by applicable law or agreed to in writing, software
-# distributed under the License is distributed on an "AS IS" BASIS,
-# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-# See the License for the specific language governing permissions and
-# limitations under the License.
 # engine#315: build a measurement cell from a given source worktree. Asserts the intended source change
 # is present BEFORE configuring and the diagnostic markers are in the binary AFTER, so a silent build of
 # the wrong tree cannot be mistaken for a measurement.
@@ -29,10 +15,11 @@ say "preflight"
 [ -e "$SRC/.git" ] || { echo "ABORT: $SRC is not a worktree"; exit 1; }
 [ "$(git -C "$SRC" rev-parse HEAD)" = "$PIN" ] || { echo "ABORT: $SRC not at the pin"; exit 1; }
 [ -d "$HRX" ] || { echo "ABORT: hrx-system missing"; exit 1; }
-G=$SRC/ggml/src/ggml-hrx/ggml-hrx.cpp
+# Search the whole backend tree: a change may live in any translation unit (this assertion originally
+# looked only at ggml-hrx.cpp and rejected a probe that lives in runtime/graph-executor.cpp).
 if [ -n "$EXPECT" ]; then
-  grep -q "$EXPECT" "$G" || { echo "ABORT: expected source change '$EXPECT' is absent - wrong tree"; exit 1; }
-  say "source assertion OK: '$EXPECT' present"
+  grep -rq "$EXPECT" "$SRC/ggml/src/ggml-hrx" || { echo "ABORT: expected source change '$EXPECT' is absent - wrong tree"; exit 1; }
+  say "source assertion OK: '$EXPECT' present in $(grep -rl "$EXPECT" "$SRC/ggml/src/ggml-hrx" | head -1)"
 fi
 git -C "$SRC" diff > "$HOME/wt/$(basename "$B").patch" 2>/dev/null || true
 say "worktree diff: $(git -C "$SRC" diff --shortstat | tr -d '\n')"

@@ -86,6 +86,32 @@ it is inert when the flag is unset.
 | ZERO or stale | FINITE | same window, non-fatal in this instance — still a real ordering defect and evidence for H1 |
 | FINITE | FINITE | this writeback is clean → if the arm faulted, the faulting buffer is not this route; move to the next route |
 
+## Candidate fixes, keyed to the outcome (pre-committed)
+
+Recorded before the records are read, so the fix is selected by the mechanism rather than fitted to a
+result. Minimality order is deliberate: prefer the smallest change that removes the window.
+
+**If `sync_class` ∈ {ZERO, EMPTY} (the staging buffer had not been written when the host copied it):**
+the publish is ordered ahead of the device copy.
+
+1. Await the staging copy's completion before the host publish — an explicit stream wait between the
+   copy enqueue and `mark_stream_synchronized()`. Smallest change; touches only the ordering.
+2. Move the barrier enqueue *after* the staging copies (it currently precedes them at `:964` vs
+   `:982`), so the existing wait covers the copies instead of only the preceding work.
+3. Publish the download synchronously instead of deferring it. Least clever and costs host latency in
+   the download path, but removes the class of window entirely.
+
+**If `sync_class` = NONFINITE (staging was written and already holds non-finite values):** the copy is
+not the defect. Next instrumentation target is the producing side — the tensor's device buffer or its
+reuse before the stream copy — and the fix belongs there (arena lifetime or the producing kernel), not
+in the publish path.
+
+**If `dst_class` differs from `sync_class`:** the copy or the mapping itself is suspect; instrument the
+mapping, not the ordering.
+
+Whichever applies, the fix must be forward-only (no revert pin) and must not be a configuration toggle:
+the arena toggles are already falsified as fixes on the record.
+
 ## Procedure
 
 **Tension to resolve first, not assume away.** The issue records a hard negative that the logits are

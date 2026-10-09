@@ -182,3 +182,39 @@ invisible, so the surviving family is the producer side. The recorded open candi
 is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760 dispatches, 1,399
 barriers per token), and the instrumentation implemented for that family (the
 `backend_get_tensor_async` → producing-`value` probe on `f2099e9b7`) is the natural next step.
+
+## 14. Refined candidate: ordering, not visibility — and a correction to §11
+
+§13's falsification splits the problem cleanly. Coherence makes a write *visible*; it does not order a
+write against a later read. The output region can still be read before the device has written it at all,
+which is what whole-vocabulary NaN (Face A) actually looks like: the reader sees an untouched buffer, not
+a torn one.
+
+**Correction to the route claim in §11.** "The logits are never copied, so there is no copy to order" was
+an over-reach. The download fingerprints cover `runtime/host-memory.cpp`'s path only; a copy issued
+through the buffer stream (`buffer_submit_and_wait`, `ggml-hrx.cpp:150`) is invisible to them, and the CPU
+read of a host-visible buffer is a plain `memcpy` that no backend instrumentation can observe. The honest
+form of that finding is *no 619520-byte transfer was observed through the instrumented download path* —
+not "no transfer exists".
+
+**What the pinned revision actually does** (all at `e44c9d01a4d5`):
+
+| site | fact |
+|------|------|
+| `ggml-hrx.cpp:518` `graph_compute` | calls `executor.execute(*graph)`, returns its status — **no synchronize** |
+| `runtime/graph-executor.cpp:78` `GraphExecutor::execute` | no wait, fence or synchronize anywhere in its body |
+| `ggml/src/ggml-backend.cpp:274-279` generic `tensor_get_async` | when the backend implements `get_tensor_async` (HRX does, `ggml-hrx.cpp:454`) the generic function does **not** synchronize — it trusts the backend |
+| `src/llama-context.cpp:1488` | `llama_decode` issues the logits copy with `*_async` and returns to its caller, which samples |
+| `src/llama-context.cpp:712` | `llama_context::synchronize()` does wait — but nothing in the sampling path calls it |
+
+So the ordering of the device's writes against the host's read of the output region rests on a wait that
+the sampling path does not perform. That is a hypothesis with a one-line discriminating test, so it is run
+as the **sync cell**: the pin + the same inert diagnostics + a single `backend_synchronize(backend)` at
+the end of `graph_compute`, so the cell differs from the control by exactly that wait. Nothing in the
+diagnostics or in the cell changes placement or coherence, so the comparison is not confounded by §12's
+rejected candidate.
+
+Difference from the falsified candidate, stated plainly: §12 changed *what the reader can see*
+(coherence, `0x52` → `0x56`); this changes *when the read is allowed to happen* (ordering). Only the
+second can make an unwritten buffer safe, which is why the Face-A shape ("all 154880 elements") is the
+prediction this hypothesis actually explains.

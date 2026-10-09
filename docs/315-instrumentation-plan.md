@@ -112,6 +112,37 @@ mapping, not the ordering.
 Whichever applies, the fix must be forward-only (no revert pin) and must not be a configuration toggle:
 the arena toggles are already falsified as fixes on the record.
 
+## Measured outcome (2026-10-09): the deferred route is COLD — H1 refuted for logits
+
+The flag-ON arm (instrumented binary `10613 / e44c9d01a`, `GGML_HRX_WRITEBACK_FINGERPRINT=1`, in-regime
+`gtt_start 98 GiB`, 66/66 requests served) produced **zero** `[hrx-wb-fp]` records, with the flag
+confirmed present in the arm server's own environment (`/proc/<pid>/environ`). Therefore the command
+program's host-staging download path — the only producer of `add_host_writeback` — is **not exercised
+by this workload**.
+
+Consequence, traced through the pinned source rather than assumed: the logits leave the device via
+`backend_get_tensor_async` → the destination is an *unregistered* host pointer →
+`synchronous_download_fallback` → `HostTransferManager::download_synchronous`, which calls
+`hrx_stream_synchronize(stream)` (`runtime/host-memory.cpp:1350`) **before** the copy. That path is
+explicitly ordered, so:
+
+- **H1 as a logits mechanism is refuted** — the deferred publish window does not carry the logits.
+- The surviving candidate space is the **data**, not the copy: either the producing op wrote non-finite
+  values (H2, codegen) or the source region was reused between production and the download (arena
+  lifetime) — the stream sync orders the copies but cannot restore data an arena handed to someone else.
+- The `synchronous_fallback` functions also log a one-time warning ("synchronous download fallback for
+  an unregistered host pointer"), so the route can be confirmed from a log without new code.
+
+### Next discriminator (cheap, because the fault is rare)
+
+At ~5%/arm a differential test needs dozens of arms to see a handful of faults. The issue records a
+high-rate configuration — **`-ub 512` gave 11/12 faults against 0/12 with `-ub 128`** — so the next
+step is to reproduce that rate with the existing harness (`UB=512` in `315-instr-capture.sh`), then use
+it for the differential test. If a high-rate configuration reproduces, the knob experiments become
+cheap; if it does not, the in-regime rate stands and mechanism discrimination must come from
+instrumenting `download_synchronous` (fingerprint the source mapping at copy time) rather than from
+rate comparison.
+
 ## Procedure
 
 **Tension to resolve first, not assume away.** The issue records a hard negative that the logits are

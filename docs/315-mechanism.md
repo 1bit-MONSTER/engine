@@ -361,3 +361,49 @@ Two consequences of the fill, worked out before the campaign so they cannot be s
 
 If the sentinel is kept in the eventual fix build, this paragraph is void and must be restated with
 evidence that the fill cannot affect a healthy arm.
+
+## 19. The "no copy for the logits" premise is falsified (copy probe, arm `315sent3-p1l`)
+
+The copy probe answered §16's open question, and the answer contradicts §11's recorded evidence.
+
+Measured in one arm (66/66 requests served; `gtt_start=80G`, i.e. **out of regime** — no regime claim is
+made from it, and both arms were classified `OOR` by the driver):
+
+```
+hrx-copy-probe armed
+[hrx-sentinel] filled host-visible logits region size=619520 with 0x7FC0DEAD
+hrx-copy site=get_tensor_async tensor=result_output size=619520 host_ptr=0x…      × 2734
+```
+
+**Every copy in the arm is logits-sized (619520) and every one goes through `backend_get_tensor_async`**
+— the device→host download of the output region — 2734 times for 66 requests. So the sampler does **not**
+read the logits out of a mapped region with no transfer at all; it reads them after an explicit
+`hrx_stream_copy_buffer`. §11's line *"no copy for the logits — zero logits-sized download records"* is
+therefore wrong, and the mechanism statement built on it ("the sampler reads the logits directly out of a
+host-visible buffer ... so no copy appears anywhere") loses its premise.
+
+Why the two instruments disagreed, stated precisely: §11's `GGML_HRX_DOWNLOAD_FINGERPRINT` recorded 146
+per-layer **weight-lease** copies (884736 / 2211840 / 5898240, ×47). The copy probe recorded 2734
+**logits** copies and **no** weight leases at all. They are watching different branches of the same path,
+and "there is no copy" was an artefact of instrumenting the weight-lease branch only.
+
+Consequence, per the reading pre-committed in §17 (row 1, "the output region *is* read through the
+device→host download path"): the next discriminator is to **fingerprint the source device buffer
+immediately before this copy** — count NaN in the source before, and in the destination after, the
+`hrx_stream_copy_buffer` at `backend_get_tensor_async`. If the source is already NaN, the producer is
+upstream of the copy (compute/staging); if the source is finite and the destination is NaN, the copy or
+its ordering is the producer. No claim is made until that runs.
+
+### 19b. Composition arithmetic, corrected by measurement (`315sent3`)
+
+| quantity | measured in `315sent3` |
+|---|---|
+| base GTT (two foreign Vulkan servers resident) | 26.7 GiB |
+| per neighbour (`-c 2048`) | **≈17.7 GiB** (2 neighbours → 62 GiB) |
+| detector server's own contribution | **≈18 GiB** (62 → 80) |
+
+So `REGIME_LO=60 REGIME_HI=73` (2 neighbours) lands at 80 GiB — **below** the gate. To land in band with
+this inventory the helper must compose **3 neighbours**: `26.7 + 3 × 17.7 ≈ 79.8`, then `+18 ⇒ ≈98 GiB`.
+The default band (LO=80 HI=92) instead composes 3 neighbours and then overshoots to 97 *before* the
+detector, ending at 115 (INVALID). The usable setting is therefore `REGIME_LO=70 REGIME_HI=85`, and the
+arm's own `gtt_start` remains the only thing that decides regime membership.

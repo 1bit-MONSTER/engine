@@ -366,3 +366,23 @@ projected:
 §3b already says the count must be tuned around foreign servers, and this is the measured instance of it.
 An arm that lands out of band remains reported as such and is never counted (the two arms above are
 invalid, not passes).
+
+### 12b. Correction: `NEIGHBOURS` is inert; the helper's band is the lever
+
+§12 concluded "use `NEIGHBOURS=2`". That was wrong about the mechanism: `315-paired.sh` parses `$2` into
+`NB` but never uses it — it calls `regime_neighbours 1 6 "$NCTX"` with hard-coded bounds (`315-paired.sh:69`),
+so the advertised `<neighbours>` argument has no effect. Both the NB=3 and NB=2 sessions therefore composed
+the same 97 GiB (verified: identical `neighbours up gtt=97G` line), which is why the second run reproduced
+the 115 GiB INVALID result exactly.
+
+The real lever is the helper's own band, which is env-overridable (`315-regime.sh:51`):
+
+| setting | effect |
+|---|---|
+| `REGIME_LO=80 REGIME_HI=92` (default) | starts neighbours until GTT ≥ 80, coping with ~23 GiB per neighbour ⇒ overshoots to 97 with this inventory, then the detector's ~23 GiB lands the arm at 115 → INVALID |
+| **`REGIME_LO=60 REGIME_HI=73`** | stops after 2 neighbours (26.7 + 2 × 23.4 ≈ 73.5) ⇒ detector ⇒ **≈96 GiB, inside the gate** |
+
+Also worth writing down for anyone driving this harness: `NB` being unused is a *driver* defect, not a
+regime fact — a session that believes it is choosing a neighbour count is not. The composition actually
+used is the helper's own `regime: composition neighbours=N ctx=…` line, which is what a session log should
+quote.

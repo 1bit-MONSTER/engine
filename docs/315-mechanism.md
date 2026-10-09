@@ -341,3 +341,23 @@ before logging when `nan_count == 0`), so a clean arm carries no sentinel datum 
 readable on faulting arms, and the experiment is therefore about *which* faults exist, not about the rate.
 Second, if `sentinel` == 0 on the first faulting arm, the sentinel hypothesis is dead and the producer-side
 instrument is the next step, exactly as §16 proposed.
+
+### 18b. The sentinel is a diagnostic, not part of the fix — fixed before task-5
+
+Two consequences of the fill, worked out before the campaign so they cannot be settled to taste later:
+
+1. **The sentinel makes an unwritten region deterministically NaN.** It is written once, at allocation, so
+   any healthy arm overwrites all 154,880 elements with real logits and is unaffected. It therefore
+   cannot *inflate* the fault count: a fault still requires a NaN to reach the sampler. But it *can*
+   convert a partially-written region from "stale finite values from the previous token" (silent wrong
+   logits) into "sentinel NaN" (a detected fault). That is a sensitivity increase on the *diagnostic*
+   instrument, not a change to the shipped behaviour.
+2. **Therefore the acceptance campaign (task-5) runs the fix build with the sentinel OFF.** The campaign
+   must measure the shipped configuration; an arm run with `GGML_HRX_SENTINEL=1` measures the instrument
+   as much as the fix. The same applies to the copy probe (inert, but pointless in a campaign), and to
+   any other diagnostic env var: the campaign's `EXTRA_ENV` is empty, and that is recorded per session.
+   Diagnostic runs like the current one are labelled as such and their counts are never read as
+   acceptance (matching the driver's own `NOSTOP=1` note).
+
+If the sentinel is kept in the eventual fix build, this paragraph is void and must be restated with
+evidence that the fill cannot affect a healthy arm.

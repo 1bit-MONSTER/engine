@@ -55,11 +55,32 @@ UP=0; for t in $(seq 1 300); do curl -sf localhost:$PORT/health >/dev/null 2>&1 
 G0=$(gtt); echo "gtt_start ${G0}GiB fp=$FP" > "$O/run.log"
 echo "arm up=$UP gtt_start=${G0}G port=$PORT"
 
+# Watchdog, as the recorded harness (rt-det.sh) runs it: sample GTT/temperature and abort the arm if
+# it leaves the pre-registered regime (>=24 GiB growth from the arm start, or >=93 C). Without this the
+# arm would be classified by its gtt_start alone while actually running hotter.
+K=$(for h in /sys/class/hwmon/*; do [ "$(cat "$h/name" 2>/dev/null)" = k10temp ] && echo "$h"; done)
+G0B=$(cat "$G"); : > "$O/gtt.log"
+( while pgrep -f "port $PORT" >/dev/null 2>&1 || systemctl --user is-active ${TAG}-arm >/dev/null 2>&1; do
+    g=$(cat "$G"); echo "$g" >> "$O/gtt.log"
+    if [ -n "$K" ]; then t=$(( $(cat "$K/temp1_input" 2>/dev/null || echo 0) / 1000 )); else t=0; fi
+    if [ $(( (g - G0B) / 1073741824 )) -ge 24 ] || [ "$t" -ge 93 ]; then
+      echo "WATCHDOG gtt=$g t=$t" >> "$O/run.log"
+      systemctl --user stop ${TAG}-arm 2>/dev/null
+      for P in $(pgrep -f "port $PORT" 2>/dev/null); do kill -TERM $P 2>/dev/null; done
+      break
+    fi
+    sleep 1
+  done ) &
+WD=$!
+
 if [ "$UP" = "1" ]; then
   timeout "${ARM_TIMEOUT:-1200}" python3 "$DET" "$PORT" "$O" 50 > "$O/detector.log" 2>&1
   echo "  detector exit=$? (124 = arm exceeded ${ARM_TIMEOUT:-1200}s and was cut off)"
   tail -1 "$O/detector.log" | sed 's/^/  /'
 fi
+kill "$WD" 2>/dev/null
+echo "gtt_max $(sort -n "$O/gtt.log" 2>/dev/null | tail -1) gtt_start $G0B" >> "$O/run.log"
+echo "  watchdog: $(grep -o 'WATCHDOG.*' "$O/run.log" 2>/dev/null | head -1 || echo 'no abort') | gtt samples: $(wc -l < "$O/gtt.log" 2>/dev/null || echo 0)"
 
 echo "--- diagnostic records ---"
 grep -c "\[hrx-wb-fp\]" "$O/server.log" 2>/dev/null | xargs echo "  hrx-wb-fp lines:"

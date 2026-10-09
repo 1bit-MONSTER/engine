@@ -300,7 +300,8 @@ Every packed buffer is checked against the reference lane's own dump (`npu_pack_
 | decode speed, same run | 11.0 ms/token (91 tok/s); the reference lane binary: 15.1 |
 | load (weights packed, kernels built) | 380 ms |
 
-The `1bit` binary links only `libxrt_coreutil`: no xclbin, no FastFlowLM library, no Python.
+The `1bit` binary links only `libxrt_coreutil` (none with `-DONEBIT_NPU_RUNTIME=own`, below): no
+xclbin, no FastFlowLM library, no Python.
 
 ## Serving (3c)
 
@@ -379,6 +380,40 @@ XRT 2.21.75. Both `libxrt_core` and `libxrt_driver_xdna` were loaded from the pi
 (strace). The fast-lane test of that time (`tests/npu_lane_e2e.sh`, since retired) gave logits
 bit-identical to the reference lane on 24/24 steps, at 10.8 ms/token (92.6 tok/s), with a 327 ms
 warm load.
+
+### XRT or the own runtime (`ONEBIT_NPU_RUNTIME`)
+
+The NPU sources include `npu/rt.h`, never XRT headers directly. With
+`-DONEBIT_NPU_RUNTIME=xrt` (the default) that header includes XRT, and nothing else changes. With
+`-DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR=<dir>` it includes `<dir>/npu_rt.h` instead: a
+private add-on runtime that opens `/dev/accel/accel0` and issues the amdxdna ioctls itself, with
+XRT's class names, so `namespace xrt = npu_rt;` lets the same sources build unchanged.
+`<dir>/npu_rt.cpp` is built into `onebit_npu_rt`, and `1bit` links no XRT library. This repository
+holds no runtime code, only the option, the shim header and two tests: `npu_runtime_option`
+(CI: a bad value, or `own` without a runtime directory, stops the configure with a message) and
+`npu_rt_shim` (NPU builds: every runtime call the engine makes compiles against the selected
+runtime).
+
+```
+cmake -B build-own -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own \
+      -DONEBIT_NPU_RT_DIR=<1bit-MONSTER checkout>/engine/npu/npu_rt
+```
+
+Measured on Strix Halo on 2026-10-09 (fast lane, Qwen3-0.6B, power mode `performance`, both builds
+in the same session, NPU runs alternating):
+
+| Check | `xrt` | `own` |
+|---|---|---|
+| `ldd 1bit` | `libxrt_coreutil.so.2` | no `libxrt*` |
+| `1bit npu-run`, anchor prompt, 32 greedy steps: logits against the `xrt` build | (reference) | bit-identical, 32/32 steps, 3 of 3 runs |
+| `1bit npu-run` decode, median of 3 | 86.2 tok/s | 83.7 tok/s |
+| `1bit serve --device npu`, 3 prompts, 32 greedy tokens each | (reference) | 32/32 tokens identical for each prompt |
+| `1bit serve` decode (`timings`), median of the 3 prompts | 80.3 tok/s | 82.7 tok/s |
+| `tests/serve_e2e.sh` | PASS | PASS |
+
+Scope: `own` is checked on the fast lane's full-ELF path (`npu/lane.cpp`). The per-op forward
+(`npu/forward`) builds against it but has not been run on it. A private route add-on
+(`ONEBIT_NPU_PRIVATE`) that links XRT itself still needs XRT.
 
 ### Checking the NPU
 

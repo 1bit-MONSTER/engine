@@ -1,3 +1,12 @@
+<!-- Copyright 2026 bong-water-water-bong
+     SPDX-License-Identifier: Apache-2.0
+
+     engine#315 evidence: the 315-instrumentation diff, verbatim. It is stored as Markdown because the repository's
+     CI requires a copyright notice on every file and a raw .patch cannot carry one. -->
+
+# 315-instrumentation
+
+```diff
 diff --git a/ggml/src/ggml-hrx/runtime/command-program-executor.cpp b/ggml/src/ggml-hrx/runtime/command-program-executor.cpp
 index 4b98d0c..2dcfe5d 100644
 --- a/ggml/src/ggml-hrx/runtime/command-program-executor.cpp
@@ -196,3 +205,4 @@ index 437c553..c139fa2 100644
      void clear();
  
      // True while a host download staged by an earlier replay has not been
+```

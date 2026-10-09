@@ -1,3 +1,12 @@
+<!-- Copyright 2026 bong-water-water-bong
+     SPDX-License-Identifier: Apache-2.0
+
+     engine#315 evidence: the 315-coherence-fix diff, verbatim. It is stored as Markdown because the repository's
+     CI requires a copyright notice on every file and a raw .patch cannot carry one. -->
+
+# 315-coherence-fix
+
+```diff
 diff --git a/ggml/src/ggml-hrx/ggml-hrx.cpp b/ggml/src/ggml-hrx/ggml-hrx.cpp
 index 8090e3b..1acfdb5 100644
 --- a/ggml/src/ggml-hrx/ggml-hrx.cpp
@@ -19,3 +28,4 @@ index 8090e3b..1acfdb5 100644
      }
      hrx_buffer_params_t params = {
          memory_type,
+```

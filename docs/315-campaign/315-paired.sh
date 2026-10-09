@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # engine#315 paired in-regime campaign driver — the pre-registered producer.
 #
 # Emits one line per arm in the grammar the analysis scripts parse:
@@ -60,21 +74,23 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   local pair=$1 cell=$2 bin=$3 port=$((19300 + RANDOM % 400))
   local tag="$TAG-p$pair$cell" O="$OUTDIR/$tag-$(basename $M .gguf)"
   rm -rf "$O"; mkdir -p "$O"
+  local -a TRACE_ENV=()
+  [ -n "${TRACE:-}" ] && TRACE_ENV=(--setenv=GGML_HRX_BUFFER_TRACE=1)
   systemd-run --user --scope -q -p MemoryMax=60G --unit=$TAG-arm-$pair$cell \
     --setenv=IREE_HAL_AMDGPU_LIBHSA_PATH="$IREE_HAL_AMDGPU_LIBHSA_PATH" \
-    --setenv=LD_LIBRARY_PATH="$bin" \
+    --setenv=LD_LIBRARY_PATH="$bin" "${TRACE_ENV[@]}" \
     "$bin/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on --host 127.0.0.1 --port $port -c 8192 -np 1 --no-webui \
     > "$O/server.log" 2>&1 &
   local up=0
   for t in $(seq 1 300); do curl -sf localhost:$port/health >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
   local g0; g0=$(gtt); echo "gtt_start ${g0}GiB mode $(cat /sys/class/ec_su_axb35/apu/power_mode 2>/dev/null)" > "$O/run.log"
 
-  local alloc nan hsa req=0 parse=0 utf8=0 verdict
+  local alloc nan hsa req=0 parse=0 utf8=0 verdict hv52=0 hv56=0
   alloc=$(grep -cE "hrx_allocator_allocate_buffer.*failed|allocate HRX host staging buffer for value .* failed" "$O/server.log" 2>/dev/null || true)
   if [ "$up" != "1" ] || [ "${alloc:-0}" -gt 0 ]; then
     systemctl --user stop $TAG-arm-$pair$cell 2>/dev/null
     for P in $(pgrep -f "port $port" 2>/dev/null); do kill -TERM $P 2>/dev/null; done
-    printf '  pair %d arm %s: INVALID nan=0 req=0 ret3=0 parse=0 gtt_start=%dG utf8=0 alloc=%d\n' \
+    printf '  pair %d arm %s: INVALID nan=0 req=0 ret3=0 parse=0 gtt_start=%dG utf8=0 alloc=%d hv52=0 hv56=0\n' \
       "$pair" "$cell" "$g0" "${alloc:-0}" | tee -a "$CONSOLE"
     return
   fi
@@ -93,13 +109,17 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   # the server log, so an arm that still completes its requests cannot be recorded as clean.
   s500=$(grep -c '"code":500' "$O/server.log" 2>/dev/null || true); s500=${s500:-0}
   unr=$(grep -cE "unparsed Content-only output|does not match the expected" "$O/server.log" 2>/dev/null || true); unr=${unr:-0}
+  # Allocation evidence, from the trace the arm just ran: 0x52 = host-visible without HOST_COHERENT,
+  # 0x56 = host-visible coherent. Recorded per arm so the fix being live is a measurement, not a build claim.
+  hv52=$(grep -c "memory_type=0x52 size=619520" "$O/server.log" 2>/dev/null || true); hv52=${hv52:-0}
+  hv56=$(grep -c "memory_type=0x56 size=619520" "$O/server.log" 2>/dev/null || true); hv56=${hv56:-0}
   local g1; g1=$(gtt)
   if [ "${g0:-0}" -lt 95 ]; then verdict=OOR
   elif [ "${nan:-0}" -gt 0 ] || [ "${hsa:-0}" -gt 0 ] || [ "${parse:-0}" -gt 0 ] || [ "${utf8:-0}" -gt 0 ] \
     || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
   else verdict=OK; fi
-  printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d (gtt_now=%dG)\n' \
-    "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "$g1" \
+  printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d hv52=%d hv56=%d (gtt_now=%dG)\n' \
+    "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "${hv52:-0}" "${hv56:-0}" "$g1" \
     | tee -a "$CONSOLE"
   systemctl --user stop $TAG-arm-$pair$cell 2>/dev/null
   for _t in 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0; do

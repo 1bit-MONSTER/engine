@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # engine#315: build the FIX cell. ~/wt/llama-315fix already carries the same three diagnostics as the
 # control cell ~/wt/315instr3-build plus the coherence fix, so the two cells differ by exactly the fix.
 # Assertions before and after the build, so a silent build of the wrong source cannot be mistaken for a

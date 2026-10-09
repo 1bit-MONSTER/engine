@@ -1,3 +1,12 @@
+<!-- Copyright 2026 bong-water-water-bong
+     SPDX-License-Identifier: Apache-2.0
+
+     engine#315 evidence: the 315-download-fingerprint diff, verbatim. It is stored as Markdown because the repository's
+     CI requires a copyright notice on every file and a raw .patch cannot carry one. -->
+
+# 315-download-fingerprint
+
+```diff
 diff --git a/ggml/src/ggml-hrx/runtime/host-memory.cpp b/ggml/src/ggml-hrx/runtime/host-memory.cpp
 index 98b5064..d703ced 100644
 --- a/ggml/src/ggml-hrx/runtime/host-memory.cpp
@@ -107,3 +116,4 @@ index 98b5064..d703ced 100644
      std::lock_guard<std::mutex> lock(mutex_);
      ++stats_.downloads;
      stats_.download_bytes += size;
+```

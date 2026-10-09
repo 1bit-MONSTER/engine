@@ -21,7 +21,9 @@ For every submodule whose gitlink differs between <base-commit> and HEAD, GitHub
 must say the new commit is ahead of the old one. A pin that is behind or has diverged drops
 commits the engine already shipped, as #154 did to third_party/llama.cpp (it lost ZAYA1-VL);
 a deliberate rollback is merged with the "pin rollback" label, which skips this check.
-Repositories the token cannot read (private ones) are reported and skipped.
+An hrx-system pin must also match the commit recorded as passing the long-prompt
+HRX check in config/hrx-long-prompt-validated-pin. Repositories the token cannot
+read (private ones) are reported and skipped.
 """
 import json
 import os
@@ -31,9 +33,19 @@ import sys
 import urllib.error
 import urllib.request
 
+HRX_PATH = "third_party/hrx-system"
+HRX_VALIDATED_PIN = "config/hrx-long-prompt-validated-pin"
+
 
 def git(*args):
     return subprocess.run(["git", *args], capture_output=True, text=True, check=True).stdout
+
+
+def hrx_validation_error(path, new, validated):
+    if path == HRX_PATH and new != validated:
+        return (f"hrx-system pin {new[:12]} has not passed the long-prompt check; "
+                f"run tests/hrx_long_prompt.py on Strix Halo and update {HRX_VALIDATED_PIN}")
+    return None
 
 
 def gitlink(commit, path):
@@ -60,11 +72,18 @@ def main():
         key, value = line.split(" ", 1)
         name, field = key[len("submodule."):].rsplit(".", 1)
         subs.setdefault(name, {})[field] = value
+    with open(HRX_VALIDATED_PIN, encoding="utf-8") as f:
+        validated_hrx_pin = f.read().strip()
     bad = 0
     for sub in subs.values():
         path, url = sub.get("path"), sub.get("url", "")
         old, new = gitlink(base, path), gitlink("HEAD", path)
         if not old or not new or old == new:
+            continue
+        validation_error = hrx_validation_error(path, new, validated_hrx_pin)
+        if validation_error:
+            print(f"FAIL {validation_error}")
+            bad += 1
             continue
         m = re.match(r"https://github\.com/([^/]+/[^/]+?)(?:\.git)?/?$", url)
         if not m:

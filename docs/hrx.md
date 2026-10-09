@@ -62,7 +62,26 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
-  Halo before merging.
+  Halo before merging. The long-prompt result is pin-specific: run the probe against
+  the proposed `hrx-system` pin, and update
+  [`config/hrx-long-prompt-validated-pin`](../config/hrx-long-prompt-validated-pin)
+  to that full commit only after it passes. CI rejects a changed HRX pin that does not
+  match this record.
+
+### Long-prompt HRX pin check
+
+Before recording a new `hrx-system` pin, build and run `llama-server` for the
+proposed llama.cpp/hrx-system pair on Strix Halo (with context size 8,192 and HRX0
+selected), then run:
+
+```sh
+python3 tests/hrx_long_prompt.py
+```
+
+The probe tokenizes a 320-record prompt and requires at least 4,096 tokens before
+asking for the code buried in record 203. It passes only when Qwen3-0.6B returns
+`7341` exactly. The test endpoint defaults to `http://127.0.0.1:8080`; use
+`--url` or `--model` if the server uses different settings.
 
 ### Fixed: `--device hrx` answered wrongly on mid-length prompts
 

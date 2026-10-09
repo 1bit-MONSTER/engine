@@ -490,3 +490,35 @@ Face B, from a diagnostic run — it is **not** an acceptance result and not com
 first fix-cell fault, so with Face B at this rate a Face-A hunt keeps being terminated by a Face B arm
 before reaching a NaN arm. The Face-A hunt must therefore run with `NOSTOP=1` — the driver's own
 documented mode for diagnostic runs — and count faces separately afterwards, never as acceptance.
+
+## 21. DECISIVE: the logits ARE written, with NaN — "never written" is falsified
+
+The sentinel experiment ran on a real in-regime Face-A arm (`315fa-p2l`, `gtt_start=98G`, `nan=1`,
+`req=34/66`). The result rejects the recorded claim and names the producer side:
+
+```
+HRX returned NaN logits: count=154880 of 154880, index range [0..154879],
+                         contiguous=yes, continuing=no sentinel=0        <- NOT ONE NaN is ours
+[hrx-sentinel] filled host-visible logits region size=619520 …          <- fill ran (1 line)
+hrx-copy site=get_tensor_async tensor=result_output size=619520         <- 1667 copies, all logits
+```
+
+`sentinel = 0` with `count = 154880` means the region the sampler read was **overwritten by the device
+with NaN**, faithfully delivered by a copy path that is known-good (hashes_equal=1 on every record, and
+the probe shows every copy is logits-sized and registered-buffer). Consequences, in order of force:
+
+1. **`KNOWN-ISSUES.md`'s "the logits buffer is never written" is false.** That sentence was inferred from
+   all-NaN output; the sentinel is the experiment that separates "unwritten" (sentinel survives) from
+   "written as NaN" (sentinel overwritten). It came back **written as NaN**.
+2. **Face A's producer is compute-side.** Whatever computes the LM-head input produces NaN under pressure,
+   and the delivery path is fine.
+3. **This is why both landed fixes failed.** §13 (unconditional `HOST_COHERENT`) and §15 (a completion
+   barrier before the host read) are remedies for a *missing* or *ill-timed write*. There is no missing
+   write: the write happened, with NaN in it. Two independent falsifications now have one explanation.
+4. **It also makes the two faces one family.** Face B is *wrong but finite* output (§20); Face A is the
+   same "wrong data under pressure" at NaN magnitude. Neither is a delivery defect.
+
+**Not yet named:** *which* compute stage manufactures the NaN. The next instrument is staged for it — the
+logits fingerprint (`GGML_HRX_LOGITS_FP`, `common/sampling.cpp`), which hashes the first N sampler calls'
+logits so a faulty arm and a clean arm can be compared at the same prompt, and so the NaN's onset
+(call 0 vs a later call) is visible rather than inferred.

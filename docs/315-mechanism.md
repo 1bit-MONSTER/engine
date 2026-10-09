@@ -464,3 +464,29 @@ garbage text for an identical prompt):**
 
 No mechanism is claimed for either face yet: Face A's sentinel row has not been observed (no NaN arm in
 regime), and Face B's producer is unidentified.
+
+### 20b. Face B did not reproduce in three consecutive in-regime arms
+
+Repeating the same in-regime probe arm 3× (`315det`, `REGIME_LO=70 HI=85`, `gtt_start=98G`, instrument
+live) gave **4/4 clean arms** — 66/66 requests each, no fault on either face:
+
+```
+pair 1 arm c: OK  nan=0 req=66 gtt_start=98G
+pair 1 arm l: OK  nan=0 req=66 gtt_start=98G
+pair 2 arm l: OK  nan=0 req=66 gtt_start=98G
+pair 3 arm l: OK  nan=0 req=66 gtt_start=98G
+```
+
+Reading, per the row pre-committed in §20: *"the arm comes back clean ⇒ Face B is load-sensitive rather
+than deterministic; the repeat rate must be measured before any determinism claim."* So the
+"stable wrong value or binding" reading is **not** supported, and no determinism claim is made.
+
+In-regime probe-arm tally so far: **1 fault in 4** (`315hunt-p1l` Face B; `315det-p1l/p2l/p3l` clean), all
+of them with the instrument live and the composition at `gtt_start=98G`. That is the first rate datum for
+Face B, from a diagnostic run — it is **not** an acceptance result and not comparable to the recorded
+5.4 % Face-A tally, because it counts a different face.
+
+**Operational consequence recorded for the next run:** `315-paired.sh` stops the whole session at the
+first fix-cell fault, so with Face B at this rate a Face-A hunt keeps being terminated by a Face B arm
+before reaching a NaN arm. The Face-A hunt must therefore run with `NOSTOP=1` — the driver's own
+documented mode for diagnostic runs — and count faces separately afterwards, never as acceptance.

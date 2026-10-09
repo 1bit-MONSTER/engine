@@ -81,6 +81,14 @@ neighbour count so the arm lands inside the gate with that inventory taken into 
   with `NOLOCK=1`, rather than locking per arm: a peer #315 session (`~/wt/v315-next-fixed.sh`) was
   observed queued on the same lock, and interleaved arms from two sessions would mix regime
   compositions and contaminate both.
+- **One in-regime campaign per box at a time — measured, not assumed.** When the peer session held the
+  band (GTT observed at 103 GiB, above the `HI=92 GiB` composition ceiling), `315-regime.sh` correctly
+  refused to compose and the arm exited 4 (`no neighbour could be started`): with 103 GiB already
+  resident, adding a detector projects past the ~110 GiB invalid bound, so *no* valid in-regime
+  composition exists. Consequence for scheduling: the ≥60-arm campaign cannot run alongside another
+  in-regime campaign — it must wait for the box, and the wait must be planned for rather than
+  discovered. A deliberately unlocked run is acceptable only for checks that make no regime claim
+  (e.g. a load-time instrumentation trace), and such a run must be labelled as such.
 
 ## 3c. Adjacent hypotheses this box is testing in parallel
 

@@ -347,3 +347,22 @@ consequences:
 2. Until that lands, the analyser's output is **not** an acceptance result. Any arm scored `clean` by the
    current analyser must be re-checked against its own `server.log` for the Face-B signatures, and the
    arms already recorded in `~/wt/rt-det/` are re-scored the same way when the campaign is analysed.
+
+## 12. Composition calibration, measured 2026-10-09 17:41 (session tag `315sent`)
+
+A session with `NEIGHBOURS=3 NEC_CTX=2048` produced **`gtt_start = 115 GiB` and two INVALID arms**
+(`req=0`, load-time alloc failure) — exactly the §3b overshoot mode. The numbers, measured rather than
+projected:
+
+| quantity | measured |
+|---|---|
+| base GTT before neighbours (with two foreign Vulkan servers resident, incl. a 30B) | 26.7 GiB |
+| after 3 neighbours (`-c 2048`) | **97 GiB** → ≈23.4 GiB per neighbour |
+| detector server's own contribution (same 18 GB model, `-c 8192`) | ≈23 GiB, so 97 + 23 = **120 → invalid** |
+
+**Consequence for this box state: use `NEIGHBOURS=2`.** That projects `26.7 + 2×23.4 ≈ 73.5`, then
++23 for the detector ⇒ **≈97 GiB, inside the gate (≥95) and clear of the ~110 invalid ceiling.**
+`NEIGHBOURS` is therefore a function of the resident inventory, recorded per session, not a constant —
+§3b already says the count must be tuned around foreign servers, and this is the measured instance of it.
+An arm that lands out of band remains reported as such and is never counted (the two arms above are
+invalid, not passes).

@@ -95,3 +95,18 @@ first step of task-2, not an assumption of it.
 
 No configuration knob is a fix: the recorded studies already show the arena knobs do not move the
 rate, so the fix must follow from the mechanism, not from a toggle.
+
+## Artifacts
+
+- `docs/315-instrumentation.patch` — the env-gated diagnostic as a unified diff against
+  `ggml/src/ggml-hrx/runtime/command-program-executor.{cpp,h}` at
+  `e44c9d01a4d5110cecaf45472a717f46cd1abbf9`. `git apply --check` against the pinned originals passes.
+- Fingerprint self-test (off-box, `g++ -std=c++17`): ZERO, FINITE, NONFINITE-f32, NONFINITE-f16 and
+  EMPTY all classify correctly, and a single flipped bit changes the hash. The helper block therefore
+  compiles and its classification is fixed before any arm is run.
+- Binary marker for the build check: the string `[hrx-wb-fp]` must appear in `libggml-hrx.so`, in the
+  same spirit as `build-3971.sh`'s existing binary-level assertions.
+- Build recipe (from `~/wt/build-3971.sh`, the study's own): `-DCMAKE_BUILD_TYPE=Release`,
+  `CMAKE_C/CXX_COMPILER=/opt/rocm-therock/bin/amdclang{,++}`, `-DGGML_HIP=OFF -DGGML_HRX=ON`,
+  `-DHRX_SOURCE_DIR=~/wt/pin-fork-hrx/third_party/hrx-system`, `-DLLAMA_BUILD_SERVER=ON`,
+  `-DLLAMA_BUILD_TESTS=OFF -DBUILD_TESTING=OFF`, `-j16`.

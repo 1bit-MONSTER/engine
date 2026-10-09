@@ -1,0 +1,198 @@
+diff --git a/ggml/src/ggml-hrx/runtime/cpe.cpp b/ggml/src/ggml-hrx/runtime/cpe.cpp
+index 4b98d0c..2dcfe5d 100644
+--- a/ggml/src/ggml-hrx/runtime/cpe.cpp
++++ b/ggml/src/ggml-hrx/runtime/cpe.cpp
+@@ -21,6 +21,91 @@
+ 
+ namespace ggml::hrx {
+ 
++// engine#315 diagnostic. Declared here, before GraphReplayStreamState's methods, because those methods
++// sit above the shared anonymous namespace. Inert unless GGML_HRX_WRITEBACK_FINGERPRINT is set.
++static bool writeback_fingerprint_enabled() {
++    const char * value = std::getenv("GGML_HRX_WRITEBACK_FINGERPRINT");
++    return value != nullptr && value[0] != '\0' && !(value[0] == '0' && value[1] == '\0');
++}
++
++// Classify and fingerprint a host-staging region so that "the device had not written it yet" is
++// distinguishable from "the device wrote non-finite values".
++struct StagingFingerprint {
++    uint64_t hash        = 1469598103934665603ull;  // FNV-1a basis
++    uint64_t nonfinite16 = 0;                       // f16/bf16: exponent all ones
++    uint64_t nonfinite32 = 0;                       // f32: exponent all ones
++    uint64_t zeros16     = 0;
++    uint64_t lanes16     = 0;
++};
++
++static StagingFingerprint fingerprint_staging(const void * data, size_t size) {
++    StagingFingerprint fp;
++    if (data == nullptr || size == 0) {
++        return fp;
++    }
++    const uint8_t * bytes = static_cast<const uint8_t *>(data);
++    for (size_t i = 0; i < size; ++i) {
++        fp.hash ^= bytes[i];
++        fp.hash *= 1099511628211ull;
++    }
++    const uint16_t * lanes = static_cast<const uint16_t *>(data);
++    fp.lanes16             = size / sizeof(uint16_t);
++    for (uint64_t i = 0; i < fp.lanes16; ++i) {
++        const uint16_t v = lanes[i];
++        if (v == 0) {
++            ++fp.zeros16;
++        }
++        if ((v & 0x7C00u) == 0x7C00u) {
++            ++fp.nonfinite16;
++        }
++    }
++    const uint32_t * dwords = static_cast<const uint32_t *>(data);
++    for (size_t i = 0; i < size / sizeof(uint32_t); ++i) {
++        if ((dwords[i] & 0x7F800000u) == 0x7F800000u) {
++            ++fp.nonfinite32;
++        }
++    }
++    return fp;
++}
++
++static const char * fingerprint_class(const StagingFingerprint & fp, const void * data, size_t size) {
++    if (data == nullptr || size == 0) {
++        return "EMPTY";
++    }
++    if (fp.lanes16 > 0 && fp.zeros16 == fp.lanes16) {
++        return "ZERO";
++    }
++    if (fp.nonfinite16 > 0 || fp.nonfinite32 > 0) {
++        return "NONFINITE";
++    }
++    return "FINITE";
++}
++
++static void fingerprint_writeback_log(int          staging_value,
++                                      int          barrier_used,
++                                      size_t       size,
++                                      const StagingFingerprint & rec,
++                                      const char * rec_class,
++                                      const StagingFingerprint & sync,
++                                      const char * sync_class,
++                                      const StagingFingerprint & dst,
++                                      const char * dst_class) {
++    std::fprintf(stderr,
++                 "[hrx-wb-fp] value=%d size=%zu barrier=%d rec_hash=%016llx sync_hash=%016llx "
++                 "dst_hash=%016llx rec_class=%s sync_class=%s dst_class=%s rec_eq_sync=%d "
++                 "rec_nf16=%llu sync_nf16=%llu dst_nf16=%llu rec_nf32=%llu sync_nf32=%llu dst_nf32=%llu\n",
++                 staging_value, size, barrier_used, static_cast<unsigned long long>(rec.hash),
++                 static_cast<unsigned long long>(sync.hash), static_cast<unsigned long long>(dst.hash), rec_class,
++                 sync_class, dst_class, rec.hash == sync.hash ? 1 : 0,
++                 static_cast<unsigned long long>(rec.nonfinite16),
++                 static_cast<unsigned long long>(sync.nonfinite16),
++                 static_cast<unsigned long long>(dst.nonfinite16),
++                 static_cast<unsigned long long>(rec.nonfinite32),
++                 static_cast<unsigned long long>(sync.nonfinite32),
++                 static_cast<unsigned long long>(dst.nonfinite32));
++    std::fflush(stderr);
++}
++
+ GraphReplayStreamState::~GraphReplayStreamState() {
+     clear();
+ }
+@@ -36,9 +121,25 @@ void GraphReplayStreamState::clear() {
+ }
+ 
+ void GraphReplayStreamState::mark_stream_synchronized() {
++    const bool fingerprint = writeback_fingerprint_enabled();
+     for (PendingHostWriteback & writeback : pending_host_writebacks_) {
+         if (writeback.host_destination != nullptr && writeback.mapped_source != nullptr && writeback.size > 0) {
+-            std::memcpy(writeback.host_destination, writeback.mapped_source, writeback.size);
++            if (fingerprint) {
++                const StagingFingerprint sync_fp = fingerprint_staging(writeback.mapped_source, writeback.size);
++                std::memcpy(writeback.host_destination, writeback.mapped_source, writeback.size);
++                const StagingFingerprint dst_fp = fingerprint_staging(writeback.host_destination, writeback.size);
++                const StagingFingerprint rec_fp { writeback.diag_rec_hash,
++                                                  writeback.diag_rec_nonfinite16,
++                                                  writeback.diag_rec_nonfinite32,
++                                                  writeback.diag_rec_zeros16,
++                                                  writeback.diag_rec_lanes16 };
++                fingerprint_writeback_log(writeback.diag_staging_value, writeback.diag_barrier_used, writeback.size,
++                                          rec_fp, fingerprint_class(rec_fp, writeback.mapped_source, writeback.size),
++                                          sync_fp, fingerprint_class(sync_fp, writeback.mapped_source, writeback.size),
++                                          dst_fp, fingerprint_class(dst_fp, writeback.host_destination, writeback.size));
++            } else {
++                std::memcpy(writeback.host_destination, writeback.mapped_source, writeback.size);
++            }
+         }
+         if (writeback.retained_buffer != nullptr) {
+             hrx_buffer_release(writeback.retained_buffer);
+@@ -51,11 +152,28 @@ void GraphReplayStreamState::mark_stream_synchronized() {
+ void GraphReplayStreamState::add_host_writeback(void *       host_destination,
+                                                 const void * mapped_source,
+                                                 size_t       size,
+-                                                hrx_buffer_t buffer) {
++                                                hrx_buffer_t buffer,
++                                                int          staging_value,
++                                                int          barrier_used) {
+     if (buffer != nullptr) {
+         hrx_buffer_retain(buffer);
+     }
+-    pending_host_writebacks_.push_back({ host_destination, mapped_source, size, buffer });
++    PendingHostWriteback pending;
++    pending.host_destination = host_destination;
++    pending.mapped_source    = mapped_source;
++    pending.size             = size;
++    pending.retained_buffer  = buffer;
++    if (writeback_fingerprint_enabled()) {
++        const StagingFingerprint rec_fp = fingerprint_staging(mapped_source, size);
++        pending.diag_rec_hash        = rec_fp.hash;
++        pending.diag_rec_nonfinite16 = rec_fp.nonfinite16;
++        pending.diag_rec_nonfinite32 = rec_fp.nonfinite32;
++        pending.diag_rec_zeros16     = rec_fp.zeros16;
++        pending.diag_rec_lanes16     = rec_fp.lanes16;
++        pending.diag_staging_value   = staging_value;
++        pending.diag_barrier_used    = barrier_used;
++    }
++    pending_host_writebacks_.push_back(pending);
+ }
+ 
+ PreparedProgramConstantBuffer::~PreparedProgramConstantBuffer() {
+@@ -985,7 +1103,8 @@ static Status download_prepared_host_staging(const CommandProgramExecutionContex
+             hrx_buffer_release(download_buffer);
+             return status;
+         }
+-        context.graph_replay_state->add_host_writeback(staging.host_data, download_data, staging.length, download_buffer);
++        context.graph_replay_state->add_host_writeback(staging.host_data, download_data, staging.length, download_buffer,
++                                                       staging.value, insert_barrier ? 1 : 0);
+         hrx_buffer_release(download_buffer);
+     }
+     return status;
+diff --git a/ggml/src/ggml-hrx/runtime/cpe.h b/ggml/src/ggml-hrx/runtime/cpe.h
+index 437c553..c139fa2 100644
+--- a/ggml/src/ggml-hrx/runtime/cpe.h
++++ b/ggml/src/ggml-hrx/runtime/cpe.h
+@@ -33,6 +33,15 @@ struct PendingHostWriteback {
+     const void * mapped_source    = nullptr;
+     size_t       size             = 0;
+     hrx_buffer_t retained_buffer  = nullptr;
++    // engine#315 diagnostic (GGML_HRX_WRITEBACK_FINGERPRINT only): the state of the mapped source
++    // when the writeback was queued, so the state read at publish time can be compared against it.
++    uint64_t     diag_rec_hash        = 0;
++    uint64_t     diag_rec_nonfinite16 = 0;
++    uint64_t     diag_rec_nonfinite32 = 0;
++    uint64_t     diag_rec_zeros16     = 0;
++    uint64_t     diag_rec_lanes16     = 0;
++    int          diag_staging_value   = -1;
++    int          diag_barrier_used    = 0;
+ };
+ 
+ struct GraphReplayStreamState {
+@@ -43,7 +52,12 @@ struct GraphReplayStreamState {
+     GraphReplayStreamState & operator=(const GraphReplayStreamState &) = delete;
+ 
+     void mark_stream_synchronized();
+-    void add_host_writeback(void * host_destination, const void * mapped_source, size_t size, hrx_buffer_t buffer);
++    void add_host_writeback(void *       host_destination,
++                            const void * mapped_source,
++                            size_t       size,
++                            hrx_buffer_t buffer,
++                            int          staging_value = -1,
++                            int          barrier_used  = 0);
+     void clear();
+ 
+     // True while a host download staged by an earlier replay has not been

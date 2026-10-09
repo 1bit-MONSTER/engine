@@ -26,7 +26,7 @@ for _t in $(seq 1 90); do
     grep -q "\[hrx-buf\]" "$LOG" 2>/dev/null && break
     sleep 2
 done
-echo "trace lines after load: $(grep -c '\[hrx-buf\]' "$LOG" 2>/dev/null || echo 0)"
+echo "trace lines after load: $(grep -c '\[hrx-buf\]' "$LOG" 2>/dev/null || true)"
 
 # The logits buffer is not allocated at load — it appears once the graph runs. So decode before reading
 # the trace, otherwise only the model weights are ever observed (which is exactly what the first run of
@@ -43,12 +43,12 @@ if curl -sf localhost:19911/health >/dev/null 2>&1; then
 else
     echo "server did not become healthy; the trace below is load-time only"
 fi
-echo "trace lines after decode: $(grep -c '\[hrx-buf\]' "$LOG" 2>/dev/null || echo 0)"
+echo "trace lines after decode: $(grep -c '\[hrx-buf\]' "$LOG" 2>/dev/null || true)"
 echo "=== visibility / coherence pairs (count) ==="
 grep -o 'host_visible=[01] direct_host_binding=[01] memory_type=0x[0-9a-f]*' "$LOG" 2>/dev/null | sort | uniq -c | sort -rn | head -6
 echo "=== the logits size specifically, with its flags ==="
 for sz in 619520 1239040 4956160; do
-    n=$(grep -c "size=$sz" "$LOG" 2>/dev/null || echo 0)
+    n=$(grep -c "size=$sz" "$LOG" 2>/dev/null || true)
     [ "$n" != "0" ] && { echo "  size=$sz count=$n :"; grep "size=$sz" "$LOG" | head -2 | cut -c1-160 | sed 's/^/    /'; }
 done
 echo "=== buffer type names seen ==="
@@ -58,7 +58,7 @@ grep -o 'memory_type=0x[0-9a-f]* host_visible=[01] direct_host_binding=[01]' "$L
 grep -o 'size=[0-9]*' "$LOG" 2>/dev/null | cut -d= -f2 | sort -rn | head -6 | tr '\n' ' '; echo
 echo "=== the logits size specifically (154880 x f32 = 619520; also check f16 309760, and vocab-ish) ==="
 for sz in 619520 309760 154880 1239040; do
-    n=$(grep -c "size=$sz" "$LOG" 2>/dev/null || echo 0)
+    n=$(grep -c "size=$sz" "$LOG" 2>/dev/null || true)
     [ "$n" != "0" ] && { echo "  size=$sz count=$n :"; grep "size=$sz" "$LOG" | head -2 | cut -c1-150 | sed 's/^/    /'; }
 done
 echo "=== load errors? ==="
@@ -67,5 +67,5 @@ systemctl --user stop 315trace 2>/dev/null
 sleep 2
 for P in $(pgrep -f "port 19911" 2>/dev/null); do kill -TERM "$P" 2>/dev/null; done
 sleep 4
-echo "teardown: servers_left=$(pgrep -c llama-server || echo 0) gtt_after=$(( $(cat "$G") / 1073741824 )) GiB"
+echo "teardown: servers_left=$(pgrep -c llama-server || true) gtt_after=$(( $(cat "$G") / 1073741824 )) GiB"
 echo "315TRACE_DONE"

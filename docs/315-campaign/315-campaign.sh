@@ -26,7 +26,7 @@ echo "=== waiting for a free box before the acceptance campaign (max ${MAXWAIT}s
 waited=0; streak=0
 while [ "$waited" -lt "$MAXWAIT" ]; do
     cur=$(gtt)
-    peer=$(pgrep -cf "v315-next-fixed" 2>/dev/null || echo 0)
+    peer=$(pgrep -cf "v315-next-fixed" 2>/dev/null); peer=${peer:-0}
     avail=$(free -g | awk '/^Mem:/ {print $7}')
     if [ "$cur" -lt "$FLOOR" ] && [ "${peer:-0}" = "0" ] && [ "${avail:-0}" -ge 25 ]; then
         streak=$((streak + 1))

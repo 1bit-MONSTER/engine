@@ -35,14 +35,14 @@ arm() {   # arm <tag> <extra-env>
     fi
     local O="$HOME/wt/rt-det/$tag-$(basename /home/bcloud/models/GLM-4.7-Flash-Q4_K_M.gguf .gguf)"
     local nan hsa utf8 parse req g0 fp
-    nan=$(grep -c "HRX returned NaN logits" "$O/server.log" 2>/dev/null || echo 0)
+    nan=$(grep -c "HRX returned NaN logits" "$O/server.log" 2>/dev/null || true)
     hsa=$(grep -iE "HSA_STATUS_ERROR|Queue error|wait for HRX graph replay commands failed" "$O/server.log" 2>/dev/null \
-          | grep -vcE "hrx_allocator_allocate_buffer|allocate HRX host staging buffer" || echo 0)
+          | grep -vcE "hrx_allocator_allocate_buffer|allocate HRX host staging buffer" || true)
     utf8=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['utf8_failures'])" 2>/dev/null || echo 0)
     parse=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['parse_failures'])" 2>/dev/null || echo 0)
     req=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['requests'])" 2>/dev/null || echo 0)
     g0=$(grep -o "gtt_start [0-9]*G" "$O/run.log" 2>/dev/null | head -1)
-    fp=$(grep -c "\[hrx-buf\]" "$O/server.log" 2>/dev/null || echo 0)
+    fp=$(grep -c "\[hrx-buf\]" "$O/server.log" 2>/dev/null || true)
     local verdict=clean
     { [ "${nan:-0}" != "0" ] || [ "${hsa:-0}" != "0" ] || [ "${utf8:-0}" != "0" ] || [ "${parse:-0}" != "0" ]; } && verdict=FAULT
     [ "${req:-0}" -lt 66 ] && [ "$verdict" = clean ] && verdict=INCOMPLETE
@@ -53,7 +53,7 @@ arm() {   # arm <tag> <extra-env>
 echo "=== waiting for a free box (floor=${FLOOR} GiB, max ${MAXWAIT}s, at $(date -Is)) ===" | tee -a "$LOG"
 waited=0; streak=0
 while [ "$waited" -lt "$MAXWAIT" ]; do
-    cur=$(gtt); peer=$(pgrep -cf "v315-next-fixed" 2>/dev/null || echo 0)
+    cur=$(gtt); peer=$(pgrep -cf "v315-next-fixed" 2>/dev/null); peer=${peer:-0}
     avail=$(free -g | awk '/^Mem:/ {print $7}')
     if [ "$cur" -lt "$FLOOR" ] && [ "${peer:-0}" = "0" ] && [ "${avail:-0}" -ge 25 ]; then streak=$((streak+1)); else streak=0; fi
     echo "$(date +%H:%M:%S) gtt=${cur}G peer=${peer:-0} avail=${avail:-?}G streak=$streak" | tee -a "$LOG"

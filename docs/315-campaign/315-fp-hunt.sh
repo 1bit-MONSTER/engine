@@ -21,12 +21,12 @@ for i in $(seq 1 "$N"); do
     echo "=== hunt arm $i/$N tag=$TAG $(date -Is) ===" | tee -a "$LOG"
     bash "$HERE/315-instr-capture.sh" "$BIN" 1 2048 "$TAG" 1 2>&1 | tee -a "$LOG"
     O=$HOME/wt/rt-det/$TAG-$(basename "$M" .gguf)
-    nan=$(grep -c "HRX returned NaN logits" "$O/server.log" 2>/dev/null || echo 0)
+    nan=$(grep -c "HRX returned NaN logits" "$O/server.log" 2>/dev/null || true)
     hsa=$(grep -iE "HSA_STATUS_ERROR|Queue error|wait for HRX graph replay commands failed" \
-          "$O/server.log" 2>/dev/null | grep -vcE "hrx_allocator_allocate_buffer|allocate HRX host staging buffer" || echo 0)
+          "$O/server.log" 2>/dev/null | grep -vcE "hrx_allocator_allocate_buffer|allocate HRX host staging buffer" || true)
     utf8=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['utf8_failures'])" 2>/dev/null || echo 0)
     parse=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['parse_failures'])" 2>/dev/null || echo 0)
-    fp=$(grep -c "\[hrx-wb-fp\]" "$O/server.log" 2>/dev/null || echo 0)
+    fp=$(grep -c "\[hrx-wb-fp\]" "$O/server.log" 2>/dev/null || true)
     gtt=$(grep -o "gtt_start [0-9]*" "$O/run.log" 2>/dev/null | head -1)
     echo "  arm $i verdict: $gtt nan=$nan hsa=$hsa utf8=$utf8 parse=$parse wb_records=$fp" | tee -a "$LOG"
     if [ "${nan:-0}" != "0" ] || [ "${hsa:-0}" != "0" ] || [ "${utf8:-0}" != "0" ] || [ "${parse:-0}" != "0" ]; then

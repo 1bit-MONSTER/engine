@@ -213,6 +213,30 @@ so the regression cell must be configured with tests **on** (from the same revis
 validates) to get a comparable binary. The copies under `~/wt/loom-kvnan-mf/bin/` and
 `~/wt/z2work/bin-*/` come from other trees and are not suitable for an A/B on this fix.
 
+## 9. Script pitfalls already paid for (do not reintroduce)
+
+Three bugs in this harness came from the same Bash idiom, and each one corrupted a *result* rather than
+crashing, which is why they are written down:
+
+1. **`x=$(pgrep -cf PATTERN 2>/dev/null || echo 0)`** — `pgrep -c` prints `0` **and exits non-zero**, so
+   the `||` appends a *second* `0`. `x` becomes the two-line string `0\n0`, every `[ "$x" = "0" ]` test
+   fails, and a waiter spins forever. Same for `grep -c`. Correct form:
+   `x=$(pgrep -cf PATTERN 2>/dev/null); x=${x:-0}` or `... || true` (grep/pgrep already printed the count).
+   This cost a 15-minute wait loop that never fired.
+2. **The same idiom in a verdict**: `nan=$(grep -c ... || echo 0)` then `[ "$nan" != "0" ]` marked *every*
+   clean arm as `FAULT` — the differential's early-stop could never fire, and five more pairs would have
+   been burned. Always check a fault predicate against a real failing arm, not only against a passing one.
+3. **`pkill -f`/`pgrep -f` matching the command that runs them** (self-match): `pkill -f "315-foo.sh"`
+   inside an ssh command whose own command line contains that string kills the remote shell (exit 255).
+   Either send the command via `bash -s` (so the remote shell's command line is just `bash -s`) or break
+   the literal with a character class, and confirm the survivor list afterwards.
+
+More generally: every one of these was a *plumbing* error in my own harness, not a finding about the
+system under test — the same class as the `cpe.cpp` patch-path mistake and the scp race. Each one was
+caught only because the harness was made to assert something (a marker in the binary, a fault count
+against a known-clean arm, a survivor list). Prefer assertions over assumptions when the harness itself
+is the experiment.
+
 ## 10. Explicitly out of scope
 
 - AMD driver/kernel changes (recorded as a proposal with evidence if the mechanism lands there).

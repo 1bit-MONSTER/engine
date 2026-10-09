@@ -259,3 +259,23 @@ is the experiment.
 - Any pin that moves backwards: a candidate that is an ancestor of the shipped pin is a revert and is
   not a fix.
 - Weakening the guards or the instrumentation in a way that destroys failure evidence.
+
+### 3b-ii. Session preconditions actually observed (2026-10-09, tag `315accept`)
+
+Recorded before the acceptance run, because two of these were defects in *my harness* rather than in the
+system, and either would have corrupted a multi-hour result:
+
+| precondition | how it was checked | result |
+|---|---|---|
+| the campaign path runs at all | one real pair through `315-paired.sh` with `TRACE=1` | **died on the first arm**: `local tag=X O=$tag-...` leaves `$tag` unbound under `set -u`, and `315-paired.sh` had never actually been executed (the launcher wraps it). Fixed, re-run. |
+| the fix is live on the real binary | sha256 of both cells' `libggml-hrx.so`, then the per-arm trace | control logits buffer `memory_type=0x52` (host-visible, **not** coherent); fix `0x56` (`HOST_COHERENT`), with `0x52` count 0. Also rules out a ccache hit silently shipping the control binary. |
+| the detector completes the pre-registered shape set | the fix arm's `detector.json` | `requests=66 ok=66 utf8=0 parse=0 http=0 transport=0 first_failure=null`, so the `req=66` stop rule cannot misfire by judging every arm FAULT. |
+| the environment still reproduces the fault in-regime | the smoke's control arm | `pair 1 arm c: FAULT nan=1 req=6 gtt_start=98G hv52=1 hv56=0` — Face A, inside the gate, with the non-coherent allocation recorded. |
+| engine CI would accept the branch | `python3 tools/copyright.py --check` | **red** on 16 added files (the repo requires a notice on every file) plus three `.patch` files that cannot carry one; fixed with `--fix` and by storing those diffs as Markdown. |
+
+**Harness artifact, recorded so the smoke log is not misread.** The smoke ran twice back to back (the first
+attempt aborted on the `set -u` fault) and the relaunch overlapped the first attempt's teardown, so the
+smoke console carries **two** pairs — the second of which shows a *clean* control arm. That is what a
+2-arms-per-pair run looks like while the box is still draining, not evidence about the fault. It also
+explains the ~99-105 GiB GTT the campaign's box-waiter saw for its first ten minutes, which is precisely
+the condition that waiter exists to refuse. The campaign's own console (`315accept`) is unaffected.

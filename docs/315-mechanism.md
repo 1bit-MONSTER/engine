@@ -522,3 +522,47 @@ the probe shows every copy is logits-sized and registered-buffer). Consequences,
 logits fingerprint (`GGML_HRX_LOGITS_FP`, `common/sampling.cpp`), which hashes the first N sampler calls'
 logits so a faulty arm and a clean arm can be compared at the same prompt, and so the NaN's onset
 (call 0 vs a later call) is visible rather than inferred.
+
+## 22. State of play and remaining work (handoff, 2026-10-09)
+
+### Established, with evidence paths
+
+| # | finding | evidence |
+|---|---|---|
+| 1 | **The logits are copied device→host once per token** (2734 copies in one arm, all 619520 bytes, all `get_tensor_async`/`result_output`). §11's "no copy appears anywhere" is false; its zero-record fingerprint sat in the `hrx_synchronous_d2h` branch, not the registered-host-buffer branch. | `315sent3-p1l`, `315hunt-p1l`, §19/§19c |
+| 2 | **Face A: the device writes NaN.** All 154,880 logits NaN with `sentinel=0` — not one is our payload. `KNOWN-ISSUES.md`'s "the logits buffer is never written" is falsified; the producer is compute-side, which is why the coherence (§13) and ordering (§15) fixes failed: both address a missing/late write, and the write is present. | `315fa-p2l` (in-regime, `gtt_start=98G`), §21 |
+| 3 | **Face B is not an unwritten region either.** `nan=0`, 931 faithful logits copies, then `unparsed Content-only output` → HTTP 500. Wrong-but-finite data, upstream of the logits. Intermittent: 1 fault in 4 in-regime probe arms, and 3/3 repeats clean, so not deterministic. | `315hunt-p1l`, `315det-*`, §20/§20b |
+| 4 | **Instruments built, proven live, and working**: copy probe (`armed`), logits sentinel (`filled`, 1 line), per-call logits hash (2732 lines/arm), per-tensor fingerprint (8271 lines/arm). | `315fp2-*l-*` |
+| 5 | **Composition arithmetic, measured**: ≈17.7 GiB per neighbour (`-c 2048`), ≈18 GiB for the detector; `REGIME_LO=70 REGIME_HI=85` composes 3 neighbours → `gtt_start≈98 GiB` in band. The driver's `<neighbours>` argument is inert (parsed, never used). | §12, §12b, §19b |
+
+### Remaining, in dependency order
+
+1. **Name the specific compute stage.** The instrument for it now exists: in a faulting arm, the per-tensor
+   fingerprint says whether `result_norm` (the LM head's input) carries the NaN — a dense head NaNs all
+   154,880 outputs from a *single* NaN input, so 1..4096 NaNs there means small upstream corruption,
+   while a clean `result_norm` with NaN logits puts the locus in the head itself. The per-call logits
+   hash then localises *which* sampler call (hence which request/token) first diverges from the clean
+   reference sequence.
+2. **Fix (task-4)** — cannot be written honestly before step 1 names the producer. Candidate directions
+   already on the record: §66 option 3 (device-local output + one explicit copy), or fixing the stage
+   that manufactures the NaN/garbage.
+3. **Campaign (task-5)**: `~/wt/315-campaign.sh` is written and syntax-checked; it runs the pre-registered
+   shape with `EXTRA_ENV` **empty** (§18b — the instruments must be off for acceptance), target 60 clean
+   fix-cell arms, cap 80 pairs. Note `issue-315-analysis.py` still needs the §11 Face-B correction before
+   its output is an acceptance result; the campaign script therefore reports from the driver's own per-arm
+   lines, which already implement §5.
+4. **Regression (task-6)**: `test-backend-ops -o MUL_MAT_ID` must be built with `-DLLAMA_BUILD_TESTS=ON`
+   from the revision under test (baseline 108/108, fail=0, supported=110), plus the dense-model control.
+5. **Write-back (task-7)**: forward-only pin move on `1bit/315-preregistration` (ancestor checks against
+   both `e44c9d01a`, this branch's pin, and `26330cc20`, `main`'s shipped pin), then PR + `KNOWN-ISSUES.md`.
+
+### Working inventory (so none of this has to be rediscovered)
+
+| item | path |
+|---|---|
+| engine worktree / branch | `~/wt315-prereg`, `1bit/315-preregistration` (engine repo `~/projects/engine`) |
+| fork source under instrumentation | `~/wt/llama-315copy` (pin + diagnostics + copy probe + sentinel + both fingerprints) |
+| builds | `~/wt/315instr3-build` (control), `~/wt/315copy-build`, `~/wt/315fp-build` (instruments) |
+| readers | `~/wt/315-probe-read.py`, `~/wt/315-logits-fp.py`, `~/wt/315-faceb-compare.py`, `~/wt/315-fp-run.sh`, `~/wt/315-campaign.sh` |
+| driver + helper (pre-registered) | `~/wt/315-paired.sh`, `~/wt/315-regime.sh`, `~/wt/315-detector.py` |
+| arm logs | `~/wt/rt-det/<tag>-p<N><c|l>-GLM-4.7-Flash-Q4_K_M/` (note: glob must be `*-*l-*`, not `*-l-*`) |

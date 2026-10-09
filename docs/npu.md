@@ -411,6 +411,8 @@ in the same session, NPU runs alternating):
 | `1bit serve` decode (`timings`), median of the 3 prompts | 80.3 tok/s | 82.7 tok/s |
 | `tests/serve_e2e.sh` | PASS | PASS |
 
+With `own` as the shipped build, the daily XDNA bump is skipped (repository variable `ONEBIT_NPU_RUNTIME=own`, see "Keeping current" above); the xdna-driver pin is then a kernel-module pin only.
+
 Scope: `own` is checked on the fast lane's full-ELF path (`npu/lane.cpp`). The per-op forward
 (`npu/forward`) builds against it but has not been run on it. A private route add-on
 (`ONEBIT_NPU_PRIVATE`) that links XRT itself still needs XRT.
@@ -426,8 +428,7 @@ Halo before merging; the public tests that need no kernels (`npu_full_elf_md5`, 
 ## Step 3d: the layer kernel and lm-head, built from source
 
 CONTRIBUTING rule 4 requires NPU kernels to be built from source. The layer kernel and
-lm-head artifacts did not meet that rule for a while:
-
+lm-head artifacts did not meet that rule for a while: The bump sits behind the runtime switch: with the repository variable `ONEBIT_NPU_RUNTIME` set to `own` (the build we ship), the scheduled run is skipped and the pin stays put, because only an `xrt` build needs XRT; a manual run of the workflow still bumps. Set the variable to `xrt` to resume the daily bump.
 - The instruction ELFs came from the old per-context generator.
 - The PDI came from the rounding-fixed `layer.xclbin` (1bit-MONSTER #2651).
 

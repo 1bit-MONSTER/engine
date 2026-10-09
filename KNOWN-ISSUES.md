@@ -127,6 +127,13 @@ survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert
 kernel/binding family: GLM is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760
 dispatches) with 1,399 barriers per token.
 
+**Pin note (2026-10-09).** `engine@main` has since moved: it now pins
+`third_party/llama.cpp e44c9d01a4d5` with `third_party/hrx-system 98d05d94`. That is the same runtime the
+study above ran against, and `26330cc20490` is an ancestor of `e44c9d01a4d5`, so the measurements above
+still describe what ships. A bump that moved `hrx-system` alone to `4ba76c18eafe` (2026-10-08) left
+`main` unbuildable with `ONEBIT_HRX=ON` — the pinned `ggml/src/ggml-hrx/loom-jit.cpp` still uses the
+LoomC API that revision removed — and was reverted in #363.
+
 ### Instrumentation available for the bisect (implemented, not yet built)
 
 On `f2099e9b7`: a probe on the route the logits actually take (`backend_get_tensor_async` →

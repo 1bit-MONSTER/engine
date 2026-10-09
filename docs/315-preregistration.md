@@ -40,6 +40,25 @@ An arm is *complete* only if all 66 requests return.
   (the existing `rt-det.sh` guard). A watchdog kill is recorded as an invalid arm, not a pass.
 - Neighbours are torn down after every session; no neighbour is left resident.
 
+### 3b. Session preconditions and regime composition
+
+Added after the first smoke arm (2026-10-09) failed in a way the earlier text did not cover. It is a
+*tightening* of what may be counted, and it does not touch the acceptance bar in §7.
+
+- **No unaccounted resident model server.** The smoke arm reached `gtt_start = 115.8 GiB` instead of
+the recorded ~101.7 GiB because an unrelated GLM server (`~/wt/v315-bisect-build`, not started by this
+campaign) was already resident, adding ~20 GB. Every session must record the resident server
+inventory (pid, binary, port) and the GTT budget **before** the neighbours start, and choose the
+neighbour count so the arm lands inside the gate with that inventory taken into account.
+  - That foreign server was **not** killed: it is not this campaign's process and may belong to other
+    work. It is recorded instead, and the neighbour count is tuned around it.
+- **An upper bound, not just the gate.** The gate is `gtt_start >= 95 GiB`, but ~116 GiB is too hot:
+  the detector failed while loading. Arms above ~110 GiB are invalid (allocation failure). The target
+  band is the recorded one, ~100-105 GiB.
+- **The run must actually serve requests.** An arm is classifiable only if the request phase ran
+  (`identical:` and `mixed:` lines present, `gtt.log` non-empty). A server that dies during load
+  produces no data and can be counted neither clean nor faulted.
+
 ## 4. Fault faces and detectors
 
 | face | signature | detector |
@@ -61,6 +80,9 @@ fault  if nan > 0 or hsa > 0 or parse > 0 or verdict == TRUNCATED or req < 66
 clean  otherwise (66/66 served, both faces silent, gtt_start >= 95 GiB)
 invalid  harness death: no server.log, no identical.json, watchdog kill, or an arm that never
          reached the regime gate — recorded, excluded from the denominator, never counted clean
+         ALSO invalid: failure to allocate at model load / server start, specifically
+         `hrx_allocator_allocate_buffer(...) failed` (ggml-hrx.cpp) or any startup OOM, and any arm
+         whose request phase did not run (no `identical:`/`mixed:` lines, empty or absent `gtt.log`)
 out-of-regime  gtt_start < 95 GiB — reported separately, not counted
 ```
 Fault takes precedence over incomplete: an arm that faulted *and* then died is a fault, because the
@@ -91,6 +113,21 @@ zero Face-B faults**. Anything less is reported as not met, with the observed co
 For every session, append to the campaign console: the producer's own path and sha256, the copy of
 `rt-det.sh` and `issue-315-analysis.py` used (with sha256), the model sha256, the binary identity of
 both cells, `gtt_start`/`gtt_max` per arm, and the raw log paths.
+
+Recorded from the first smoke session (2026-10-09), for reuse:
+
+| item | value |
+|---|---|
+| model | `GLM-4.7-Flash-Q4_K_M.gguf` sha256 `29837ed2c0fc5f51981adf8ac8083fcf80743c598381f13e9f06cbad0498b174` |
+| `~/wt/rt-det.sh` | sha256 `9657695645b697b51014c86ef30db31f9348ac2c394ab5e9ce75fe2be34043f8` |
+| `~/wt/issue-315-analysis.py` | sha256 `acfbc4ea980c7c2848cbfd2ff0a837ec871340d6bdddbaafc09ffdfdc96d5309` |
+| binary identity | `llama-server version: 10605 (86c33b5d5)` |
+| smoke outcome | **invalid**: `gtt_start 124357271552` (~115.8 GiB), detector died at load, `hrx_allocator_allocate_buffer(...) failed` at `ggml-hrx.cpp:326`, request phase never ran |
+
+Teardown note: `systemctl --user stop <unit>` alone did **not** stop the `systemd-run --user --scope`
+neighbours; they had to be terminated by matching their own command lines (ports 20201-20203). Session
+scripts must verify teardown and report the GTT afterwards — this smoke session left 118 GiB resident
+until it was cleaned up by hand.
 
 The paired driver that emits the `pair N arm c|l: <verdict> nan=… req=… ret3=… parse=… gtt_start=…G`
 lines is currently *unlocated* on the box (only its consumers are on disk). Before the campaign

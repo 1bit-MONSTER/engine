@@ -37,34 +37,32 @@ for P in $(pgrep -f llama-server 2>/dev/null); do
   say "  pid=$P $(tr '\0' ' ' < /proc/$P/cmdline | cut -c1-100)"
 done
 
-for i in $(seq 1 $NB); do
-  systemd-run --user --scope -q -p MemoryMax=40G --unit=${TAG}-neigh-$i \
-    "$CBIN/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on -c $NCTX --host 127.0.0.1 --port $((20210+i)) \
-    > "$HOME/wt/$TAG-neigh-$i.log" 2>&1 &
-done
-for i in $(seq 1 $NB); do for t in $(seq 1 300); do curl -sf localhost:$((20210+i))/health >/dev/null 2>&1 && break; sleep 1; done; done
+# Regime composition is shared with the other #315 scripts: the helper asserts HRX0 is visible,
+# starts neighbours with the HRX env (a missing --setenv is what killed the third smoke arm), bounds
+# each start, and aborts instead of grinding through multi-minute health waits while holding the lock.
+export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1}
+BIN="$CBIN"
+source "$(dirname "$0")/315-regime.sh"
+regime_preflight || { say "ABORT: HRX0 not visible to $CBIN/llama-server"; exit 3; }
+if [ -z "${NOLOCK:-}" ]; then
+  exec 9>"$HOME/.cache/lax-decode/box.lock"
+  if flock -w "${LOCK_WAIT:-900}" 9; then
+    say "box lock acquired $(date -Is)"
+  else
+    say "box lock busy after ${LOCK_WAIT:-900}s — proceeding CONCURRENTLY (UNLOCKED)"
+  fi
+fi
+regime_neighbours 1 6 "$NCTX" || { say "regime composition failed — session aborted"; trap - EXIT; regime_teardown; exit 4; }
+trap regime_teardown EXIT
 say "neighbours up gtt=$(gtt)G"
-
-teardown() {
-  for i in $(seq 1 $NB); do
-    systemctl --user stop ${TAG}-neigh-$i 2>/dev/null
-    systemctl --user kill -s TERM ${TAG}-neigh-$i 2>/dev/null
-  done
-  sleep 3
-  for P in $(pgrep -f "llama-server" 2>/dev/null); do
-    C=$(tr '\0' ' ' < /proc/$P/cmdline 2>/dev/null)
-    case "$C" in *"port 2021"*|*"$TAG-arm"*) kill -TERM $P 2>/dev/null; esac
-  done
-  sleep 5
-  say "=== teardown $(date -Is) servers_left=$(pgrep -c llama-server || echo 0) gtt_after=$(gtt)G ==="
-}
-trap teardown EXIT
 
 arm() {   # arm <pair> <cell c|l> <bin dir>
   local pair=$1 cell=$2 bin=$3 port=$((19300 + RANDOM % 400))
   local tag="$TAG-p$pair$cell" O="$OUTDIR/$tag-$(basename $M .gguf)"
   rm -rf "$O"; mkdir -p "$O"
   systemd-run --user --scope -q -p MemoryMax=60G --unit=$TAG-arm-$pair$cell \
+    --setenv=IREE_HAL_AMDGPU_LIBHSA_PATH="$IREE_HAL_AMDGPU_LIBHSA_PATH" \
+    --setenv=LD_LIBRARY_PATH="$bin" \
     "$bin/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on --host 127.0.0.1 --port $port -c 8192 -np 1 --no-webui \
     > "$O/server.log" 2>&1 &
   local up=0
@@ -80,7 +78,8 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
       "$pair" "$cell" "$g0" "${alloc:-0}" | tee -a "$CONSOLE"
     return
   fi
-  python3 "$DET" "$port" "$O" 50 > "$O/detector.log" 2>&1
+  REGIME_ARM_PORT=$port
+  timeout "${ARM_TIMEOUT:-1200}" python3 "$DET" "$port" "$O" 50 > "$O/detector.log" 2>&1
   req=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['requests'])" 2>/dev/null || echo 0)
   parse=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['parse_failures'])" 2>/dev/null || echo 0)
   utf8=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['utf8_failures'])" 2>/dev/null || echo 0)

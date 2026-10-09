@@ -127,12 +127,16 @@ survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert
 kernel/binding family: GLM is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760
 dispatches) with 1,399 barriers per token.
 
-**Pin note (2026-10-09).** `engine@main` has since moved: it now pins
-`third_party/llama.cpp e44c9d01a4d5` with `third_party/hrx-system 98d05d94`. That is the same runtime the
-study above ran against, and `26330cc20490` is an ancestor of `e44c9d01a4d5`, so the measurements above
-still describe what ships. A bump that moved `hrx-system` alone to `4ba76c18eafe` (2026-10-08) left
-`main` unbuildable with `ONEBIT_HRX=ON` — the pinned `ggml/src/ggml-hrx/loom-jit.cpp` still uses the
-LoomC API that revision removed — and was reverted in #363.
+**Pin note (2026-10-09).** `engine@main` has since moved twice: first to `third_party/llama.cpp e44c9d01a4d5`
+(#347), then to `0e255d774032` (#373, the fork tip after the NVFP4 / Q2_0 / IQ GET_ROWS merges), both with
+`third_party/hrx-system 98d05d94`. That is the same runtime the study above ran against, and `26330cc20490` is an
+ancestor of both, so the measurements above still describe what ships. Two things learned on the way:
+a bump that moved `hrx-system` alone to `4ba76c18eafe` (2026-10-08) left `main` unbuildable with
+`ONEBIT_HRX=ON` (the pinned `ggml/src/ggml-hrx/loom-jit.cpp` still used the LoomC API that revision removed; reverted
+in #363, and #365 now holds `hrx-system` when LoomC symbols go missing); and with the port of `loom-jit.cpp`
+(fork #97) that revision compiles but returns an immediate end-of-text on a 4.7K-token prompt where `98d05d94`
+answers (#369), so `hrx-system` stays at `98d05d94` and moving it needs a multi-ubatch prompt check, not a symbol
+check. The #373 pin passed that check: needle 20/20 on Qwen3-0.6B.
 
 ### Instrumentation available for the bisect (implemented, not yet built)
 

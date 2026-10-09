@@ -289,3 +289,27 @@ hook the copy path, not the executor.
 **Cost, stated plainly.** Four build/run cycles and several hours of box time went into this instrument, and
 every cycle was my error in choosing what to target. The structure dump that finally explained the shape
 should have been the first thing built, not the fourth.
+
+## 17. Copy-path probe (task-4 prerequisite): interpretation pre-committed before the run
+
+§16 concluded that the writer of the 619,520-byte output region is outside `GraphExecutor::execute`
+and named the next instrument: the copy path. Built as a runtime-gated probe (`GGML_HRX_COPY_PROBE`,
+so the marker is provably in the binary and a zero-hit log cannot mean "compiled out"), at the four
+sites in `ggml-hrx.cpp`: `submit_copy_buffer`, `set_tensor_async`, `get_tensor_async` (device→host,
+i.e. the download of the output region), `copy_tensor_async`.
+
+The probe prints `hrx-copy-probe armed` on first use (proof the path is live) and, for every copy,
+`hrx-copy site=… tensor=… size=… host_ptr=…`, plus a dedicated `hrx-copy-LOGITS` line when
+`size == 619520`.
+
+**Pre-committed reading of a single in-regime probe arm, fixed before the data:**
+
+| observation | conclusion | next discriminator |
+|---|---|---|
+| `armed` present, `hrx-copy-LOGITS` with `site=get_tensor_async` | the output region *is* read through the device→host download path | fingerprint the **device** buffer immediately before this copy: if it is already NaN, the fault is in the producer/compute side; if it is finite, the copy or the host mapping is the producer |
+| `armed` present, **no** `hrx-copy-LOGITS` at all | no copy path touches the region; it is read directly from a host mapping, and the four sites are not the writer | fingerprint the host mapping in place (read it twice, before and after the host read) rather than instrumenting more copies |
+| `armed` absent | the probe did not reach the backend: this is an **invalid** arm, not evidence | fix the probe wiring; do not read the absence as a negative |
+
+This is deliberately a *reading*, not a claim: whichever row is hit, the arm's own verdict
+(`nan`/`hsa`/`parse`/`utf8` counts, §5) is recorded alongside it, and the row that does not match
+is reported as not observed rather than argued away.

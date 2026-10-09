@@ -321,3 +321,29 @@ the condition that waiter exists to refuse. The campaign's own console (`315acce
    aborted command the process table should be checked for `T` states before drawing conclusions — I
    misdiagnosed this once as probe cost, and the contradicting evidence (zero `armed` lines) was already in
    hand.
+
+## 11. Reconciliation required before task-5: the analyser disagrees with §5 on Face B
+
+Found while reading `~/wt/issue-315-analysis.py` (the analyser whose sha256 §8 records, `acfbc4ea…`):
+
+| source | `parse > 0` | `utf8 > 0` / `500` / `unparsed Content-only` |
+|---|---|---|
+| §5 of this document (pre-registered) | **fault** | **fault** (Face B is first-class) |
+| `issue-315-analysis.py` today | `trunc` — *"harness-side, not the fault"* | **not read at all** (its regex stops at `gtt_start=(\d+)G`) |
+
+Its categorisation docstring states the old position explicitly: *"2. TRUNCATED / req < 66 / parse > 0 ->
+trunc (the flaky parse-500 mode: harness-side, not the fault)"*. That is the pre-§5 reading, and it is
+falsified by the issue's own note that *"a NaN-only count records the second face as a clean run, which
+is what makes it dangerous as a metric"*.
+
+**Decision, recorded before the campaign so it cannot be settled after seeing data:** §5 governs, because
+it is the pre-registration and it makes both faces acceptance criteria (the objective does too). Two
+consequences:
+
+1. Before task-5, the analyser is updated to count Face B — `utf8 > 0`, `parse > 0`, `"code":500`, and
+   `unparsed Content-only` all ⇒ **fault** — and the new sha256 is recorded in the session log next to
+   the old one. The *driver* already computes these (`utf8=`, and it greps `code":500` and `unparsed
+   Content-only`), so this is a change to the reader, not to the measurement.
+2. Until that lands, the analyser's output is **not** an acceptance result. Any arm scored `clean` by the
+   current analyser must be re-checked against its own `server.log` for the Face-B signatures, and the
+   arms already recorded in `~/wt/rt-det/` are re-scored the same way when the campaign is analysed.

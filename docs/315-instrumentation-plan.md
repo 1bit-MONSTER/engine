@@ -87,7 +87,11 @@ the dmabuf mapping read directly by the sampler rather than through a writeback)
 shows row 4 and the plan moves to that path. Establishing which copy carries the logits buffer is the
 first step of task-2, not an assumption of it.
 
-1. Build with the flag support; confirm the flag off ⇒ byte-identical behaviour on one arm.
+1. Build with the flag support; confirm the flag off ⇒ **byte-identical behaviour on one arm**: run
+   `315-instr-capture.sh <instr_bin> … 0` (flag off) and require (a) the request phase completes as
+   before, (b) **zero** `[hrx-wb-fp]` lines — the diagnostic is inert — and (c) both faces silent.
+   Then run the same arm with the flag on and require the records to appear. An instrumented binary
+   that logs with the flag off, or stays silent with it on, fails this step.
 2. Run in-regime arms with the flag on (same regime gate as the pre-registration, ≥95 GiB).
 3. Capture the record for a faulting event and for at least one clean arm.
 4. The mechanism claim follows only if row 1 is observed on a faulting arm **and** the fingerprint is

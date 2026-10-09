@@ -58,6 +58,15 @@ neighbour count so the arm lands inside the gate with that inventory taken into 
 - **The run must actually serve requests.** An arm is classifiable only if the request phase ran
   (`identical:` and `mixed:` lines present, `gtt.log` non-empty). A server that dies during load
   produces no data and can be counted neither clean nor faulted.
+- **Measured composition sizes** (at `-c 2048`, from the second smoke session): each neighbour adds
+  ~19.5 GiB and the detector server adds ~15 GiB once loaded. Calibration point: base 26 GiB + 2
+  neighbours → `gtt_start = 80.3 GiB` (out of regime). `315-regime.sh` therefore starts neighbours
+  until the live GTT reaches 80 GiB (never past 92 GiB), which projects to ~95-107 GiB once the
+  detector loads.
+- **Session-level locking.** The campaign takes the box lock for a whole session and runs its arms
+  with `NOLOCK=1`, rather than locking per arm: a peer #315 session (`~/wt/v315-next-fixed.sh`) was
+  observed queued on the same lock, and interleaved arms from two sessions would mix regime
+  compositions and contaminate both.
 
 ## 4. Fault faces and detectors
 

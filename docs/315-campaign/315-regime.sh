@@ -77,7 +77,7 @@ regime_neighbours() {
             --setenv=LD_LIBRARY_PATH="$BIN" \
             "$BIN/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on -c "$ctx" \
             --host 127.0.0.1 --port "$port" \
-            > "$HOME/wt/$TAG-neigh-$REGIME_NB.log" 2>&1 &
+            > "$HOME/wt/$TAG-neigh-$REGIME_NB.log" 2>&1 9>&- &
         local up=0 t=0
         while [ "$t" -lt "$up_timeout" ]; do
             curl -sf "localhost:$port/health" >/dev/null 2>&1 && { up=1; break; }

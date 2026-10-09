@@ -139,3 +139,46 @@ so the predicate now also counts `http_failures`, `transport_failures` and the s
 (`"code":500`, unparsed Content-only). That implements the pre-registered rule rather than relaxing it:
 the table above is produced by applying that definition to arms that were already on disk, and
 `docs/315-campaign/315-classify.py` is the single source of truth for it.
+
+## 13. The coherence hypothesis is falsified by its own campaign (tag `315accept`, 2026-10-09)
+
+The candidate from §12 (unconditional `HOST_COHERENT` for host-visible buffers) was built into a fix cell
+and run under the pre-registered acceptance rule (§7: ≥60 in-regime clean arms in the fix cell, zero
+faults on both faces). The pre-registered stopping rule ended the run at the first fix-cell fault, arm 10:
+
+| cell | in-regime arms | clean | faults | rate (95 % CI) |
+|------|---------------:|------:|-------:|----------------|
+| control (pin + diagnostics) | 4 | 3 | 1 | 25.0 % (4.6–69.9) |
+| **fix** (pin + fix + diagnostics) | 10 | 9 | **1** | **10.0 % (1.8–40.4)** |
+
+Fisher exact two-sided **p = 0.505**; P(rate_control < rate_fix) = 0.214. Acceptance: **NOT MET**
+(9 clean of 60 required, one fault where zero are allowed).
+
+The decisive line is the faulting fix arm itself:
+
+```
+pair 10 arm l: FAULT nan=0 req=33 parse=0 gtt_start=98G hv52=0 hv56=1
+```
+
+`hv56=1` means the output region *was* allocated `HOST_COHERENT` in the arm that faulted — the same
+per-arm trace that proved the fix live in the smoke proves it live here. The fault happened anyway, in
+regime (`gtt_start 98 GiB`), as Face B (`nan=0`; a 500 after `unparsed Content-only` output). So a
+visibility gap in the output region is **not a sufficient cause**: making the region coherent does not
+stop the fault.
+
+Honest bounds on this result: it does not show the fix raises the rate (1/10 vs the recorded 5.4 % is
+indistinguishable at this n), and it does not clear coherence as a *contributing* factor. What it does is
+remove coherence from the list of sufficient mechanisms — which the earlier n=4 differential had merely
+*suggested* (one fault, on the non-coherent side). That low-n signature did not reproduce at scale, and
+the campaign is the reason we know that rather than believing it.
+
+Two things the pre-registration bought, worth recording: the stopping rule ended the run at arm 10 instead
+of burning ~5 h to a foregone conclusion, and Face-B-first scoring is what caught this fault at all —
+under the recorded study's rule (Face B counted separately as "truncation") the same arms read
+`clean=9 fault=0 trunc=1`, i.e. it would have been reported close to a pass.
+
+**Where the mechanism now points.** The output data is written *wrong or not at all*, not merely
+invisible, so the surviving family is the producer side. The recorded open candidate is already in it: GLM
+is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760 dispatches, 1,399
+barriers per token), and the instrumentation implemented for that family (the
+`backend_get_tensor_async` → producing-`value` probe on `f2099e9b7`) is the natural next step.

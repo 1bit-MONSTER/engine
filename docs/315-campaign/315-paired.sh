@@ -1,4 +1,18 @@
 #!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # engine#315 paired in-regime campaign driver — the pre-registered producer.
 #
 # Emits one line per arm in the grammar the analysis scripts parse:
@@ -67,7 +81,7 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
     --setenv=IREE_HAL_AMDGPU_LIBHSA_PATH="$IREE_HAL_AMDGPU_LIBHSA_PATH" \
     --setenv=LD_LIBRARY_PATH="$bin" "${TRACE_ENV[@]}" \
     "$bin/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on --host 127.0.0.1 --port $port -c 8192 -np 1 --no-webui \
-    > "$O/server.log" 2>&1 &
+    > "$O/server.log" 2>&1 9>&- &
   local up=0
   for t in $(seq 1 300); do curl -sf localhost:$port/health >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
   local g0; g0=$(gtt); echo "gtt_start ${g0}GiB mode $(cat /sys/class/ec_su_axb35/apu/power_mode 2>/dev/null)" > "$O/run.log"

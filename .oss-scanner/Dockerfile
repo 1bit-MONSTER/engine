@@ -18,12 +18,14 @@
 # build context, then removes network access and audits what is in /src. This mirrors
 # .github/workflows/ci.yml: GCC 15 (the engine is C++26), the CI target list, ctest.
 FROM ubuntu:24.04
-ENV DEBIAN_FRONTEND=noninteractive
+# CC/CXX: the tests that configure a scratch CMake tree (tests/npu_runtime_option.sh) pick up the
+# compilers from the environment; curl and jq are what the serve tests drive the API with.
+ENV DEBIAN_FRONTEND=noninteractive CC=gcc-15 CXX=g++-15
 RUN apt-get update && apt-get install -y --no-install-recommends \
       ca-certificates software-properties-common gnupg \
     && add-apt-repository -y ppa:ubuntu-toolchain-r/test \
     && apt-get update && apt-get install -y --no-install-recommends \
-      g++-15 gcc-15 ninja-build git pkg-config python3 python3-pip python3-yaml \
+      g++-15 gcc-15 make ninja-build git pkg-config curl jq python3 python3-pip python3-yaml \
       libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev \
     && rm -rf /var/lib/apt/lists/*
 # CMake from PyPI: the engine is C++26 and Ubuntu 24.04's CMake 3.28 does not know that dialect

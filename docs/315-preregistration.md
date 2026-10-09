@@ -247,6 +247,26 @@ crashing, which is why they are written down:
    Either send the command via `bash -s` (so the remote shell's command line is just `bash -s`) or break
    the literal with a character class, and confirm the survivor list afterwards.
 
+4. **A probe gated at compile time by a macro nothing defines.** The copy probe was first written
+   `#ifdef GGML_HRX_COPY_PROBE`, and no build flag defines that macro, while `315-cell-build.sh`'s
+   `EXPECT` assertion only greps the *source* for the marker string. The cell therefore builds a binary
+   with the instrument **compiled out**, and a zero-hit log then looks exactly like the negative result
+   "this path is unused". Runtime-gate the probe (`getenv`, like `GGML_HRX_BUFFER_TRACE`), print an
+   `armed` line on first use, and assert the marker **in the artefact** afterwards. A build that
+   compiles out the instrument is the most expensive possible way to be wrong, because it is silent and
+   it agrees with the hypothesis it was built to test.
+5. **Asserting on the executable when the artefact is a library set.** `strings bin/llama-server | grep
+   marker` returned 0 for all four probe markers and the run aborted — the markers were in
+   `bin/libggml-hrx.so.0.18.0` and `bin/libllama-common.so.0.0.10613`, because llama.cpp ships these as
+   shared libraries. Correct form: `grep -rl --binary-files=text PATTERN "$B/bin"`. The build was fine;
+   the check was narrower than the artefact.
+6. **A post-build assertion in an ssh command that re-uses a variable from another script's scope.**
+   The check printed `strings: '/bin/llama-server': No such file` because `$B` was set inside
+   `315-cell-build.sh`, not in the calling shell — so the assertion silently degraded to a garbage path
+   (and, with `set -uo pipefail` absent, "0" from that grep would have read as "marker absent"). Keep the
+   assertion in the same scope as the path, or take the path as an argument, and treat a missing file as
+   an error rather than as a zero count.
+
 More generally: every one of these was a *plumbing* error in my own harness, not a finding about the
 system under test — the same class as the `cpe.cpp` patch-path mistake and the scp race. Each one was
 caught only because the harness was made to assert something (a marker in the binary, a fault count

@@ -41,6 +41,14 @@ pointers), which is the natural control: it should never show the window.
 
 ### Falsifiable predictions
 
+**Code-reading note that motivates the class distinction.** In the download path the barrier is
+enqueued at `:964` and the device copy at `:982` — the barrier precedes the copy. So whether the host
+read at publish time is safe depends on the stream having been *synchronized* after the copy, which the
+earlier record argued from the code ("the flush precedes the wait"). The instrumentation does not
+re-argue that; it tests it under load, and the `sync_class` is what makes the test meaningful:
+`ZERO`/`EMPTY` means the staging buffer had not been written at all when the host copied it, whereas
+`FINITE` means it had — and the fault therefore lies upstream of this copy.
+
 1. On a faulting arm, at the faulting event, the staging-buffer fingerprint taken at registration
    differs from the one taken immediately before the memcpy, and the pre-copy state is a
    not-yet-written pattern (zeros / stale), not a finite tensor.

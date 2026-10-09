@@ -122,8 +122,13 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
 # same pre-registered classification the analyser uses.
 clean_fix() { grep -c 'arm l: OK' "$CONSOLE" 2>/dev/null || true; }
 fault_fix() { grep -c 'arm l: \(FAULT\|INVALID\)' "$CONSOLE" 2>/dev/null || true; }
+# Control cadence. The acceptance criterion (docs/315-preregistration.md §7) is on the FIX cell, and a
+# control arm costs the same box time as a fix arm, so controls run every CONTROL_EVERY-th pair (default
+# 3): a live positive control spread across the whole session instead of 1:1 pairing, which would double
+# the run and leave no budget for the regression cell. §7 does not constrain the ratio; the analyser
+# aggregates by cell.
 for p in $(seq 1 $PAIRS); do
-  arm "$p" c "$CBIN"
+  if [ $(( (p - 1) % ${CONTROL_EVERY:-3} )) -eq 0 ]; then arm "$p" c "$CBIN"; fi
   arm "$p" l "$FBIN"
   cf=$(clean_fix); ff=$(fault_fix)
   say "after pair $p: fix-cell clean=$cf fault-or-invalid=$ff (target >=${MINCLEAN:-60} clean, cap $PAIRS pairs)"
@@ -131,4 +136,4 @@ for p in $(seq 1 $PAIRS); do
   [ "$cf" -ge "${MINCLEAN:-60}" ] && { say "STOP: reached $cf clean fix-cell arms"; break; }
 done
 
-echo "$(clean_fix) clean fix-cell arms, $(fault_fix) faulted-or-invalid, out of $((p * 2)) arms" | tee -a "$CONSOLE"
+echo "$(clean_fix) clean fix-cell arms, $(fault_fix) faulted-or-invalid in the fix cell, out of $(grep -c '^  pair' "$CONSOLE" 2>/dev/null) arms run" | tee -a "$CONSOLE"

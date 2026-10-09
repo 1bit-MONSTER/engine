@@ -1,7 +1,7 @@
-diff --git a/ggml/src/ggml-hrx/runtime/cpe.cpp b/ggml/src/ggml-hrx/runtime/cpe.cpp
+diff --git a/ggml/src/ggml-hrx/runtime/command-program-executor.cpp b/ggml/src/ggml-hrx/runtime/command-program-executor.cpp
 index 4b98d0c..2dcfe5d 100644
---- a/ggml/src/ggml-hrx/runtime/cpe.cpp
-+++ b/ggml/src/ggml-hrx/runtime/cpe.cpp
+--- a/ggml/src/ggml-hrx/runtime/command-program-executor.cpp
++++ b/ggml/src/ggml-hrx/runtime/command-program-executor.cpp
 @@ -21,6 +21,91 @@
  
  namespace ggml::hrx {
@@ -162,10 +162,10 @@ index 4b98d0c..2dcfe5d 100644
          hrx_buffer_release(download_buffer);
      }
      return status;
-diff --git a/ggml/src/ggml-hrx/runtime/cpe.h b/ggml/src/ggml-hrx/runtime/cpe.h
+diff --git a/ggml/src/ggml-hrx/runtime/command-program-executor.h b/ggml/src/ggml-hrx/runtime/command-program-executor.h
 index 437c553..c139fa2 100644
---- a/ggml/src/ggml-hrx/runtime/cpe.h
-+++ b/ggml/src/ggml-hrx/runtime/cpe.h
+--- a/ggml/src/ggml-hrx/runtime/command-program-executor.h
++++ b/ggml/src/ggml-hrx/runtime/command-program-executor.h
 @@ -33,6 +33,15 @@ struct PendingHostWriteback {
      const void * mapped_source    = nullptr;
      size_t       size             = 0;

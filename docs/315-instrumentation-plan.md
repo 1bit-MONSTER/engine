@@ -104,7 +104,13 @@ rate, so the fix must follow from the mechanism, not from a toggle.
 
 - `docs/315-instrumentation.patch` — the env-gated diagnostic as a unified diff against
   `ggml/src/ggml-hrx/runtime/command-program-executor.{cpp,h}` at
-  `e44c9d01a4d5110cecaf45472a717f46cd1abbf9`. `git apply --check` against the pinned originals passes.
+  `e44c9d01a4d5110cecaf45472a717f46cd1abbf9`. Verified with `git apply --check` **against the real
+  worktree** (`~/wt/llama-315instr` on the box), not against a local copy.
+  - Lesson worth keeping: the first revision of this patch was generated from copies named `cpe.cpp`
+    and `cpe.h`, so its diff header pointed at files that do not exist in the repository — while a
+    check run against those same renamed copies passed. A self-referential check is not a check; the
+    first real build aborted with `No such file or directory` before cmake ran. Patch regeneration
+    now renames the copies to the real filenames first.
 - Fingerprint self-test (off-box, `g++ -std=c++17`): ZERO, FINITE, NONFINITE-f32, NONFINITE-f16 and
   EMPTY all classify correctly, and a single flipped bit changes the hash. The helper block therefore
   compiles and its classification is fixed before any arm is run.

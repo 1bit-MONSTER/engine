@@ -69,11 +69,13 @@ cmake --build "$B" -j 16 >> "$LOG" 2>&1 || { echo "ABORT: build failed, see $LOG
 say "binary identity"
 "$B/bin/llama-server" --version
 
-say "binary-level assertion: the diagnostic marker must be present"
+say "binary-level assertion: both diagnostic markers must be present"
 LIB=$(ls "$B"/bin/libggml-hrx.so* 2>/dev/null | head -1)
 if [ -z "$LIB" ]; then echo "ABORT: libggml-hrx.so not found"; exit 1; fi
-M=$(grep -c "hrx-wb-fp" "$LIB" || true)
-say "lib=$LIB  hrx-wb-fp marker count=$M"
-[ "$M" -gt 0 ] || { echo "ABORT: instrumented binary does not contain the marker"; exit 1; }
+M1=$(grep -c "hrx-wb-fp" "$LIB" || true)   # deferred writeback record format
+M2=$(grep -c "hrx-dl-fp" "$LIB" || true)   # host download probe record format
+say "lib=$LIB  hrx-wb-fp=$M1  hrx-dl-fp=$M2"
+[ "$M1" -gt 0 ] || { echo "ABORT: binary lacks the writeback marker"; exit 1; }
+[ "$M2" -gt 0 ] || { echo "ABORT: binary lacks the download-probe marker"; exit 1; }
 
 say "INSTRBUILD_DONE bin_dir=$B/bin"

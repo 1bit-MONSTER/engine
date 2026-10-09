@@ -1,0 +1,109 @@
+diff --git a/ggml/src/ggml-hrx/runtime/host-memory.cpp b/ggml/src/ggml-hrx/runtime/host-memory.cpp
+index 98b5064..d703ced 100644
+--- a/ggml/src/ggml-hrx/runtime/host-memory.cpp
++++ b/ggml/src/ggml-hrx/runtime/host-memory.cpp
+@@ -10,6 +10,8 @@
+ #include <atomic>
+ #include <cmath>
+ #include <cstring>
++#include <cstdio>
++#include <cstdlib>
+ #include <limits>
+ #include <sstream>
+ #include <thread>
+@@ -19,6 +21,61 @@
+ namespace ggml::hrx {
+ namespace {
+ 
++// engine#315 diagnostic (GGML_HRX_DOWNLOAD_FINGERPRINT). Device memory cannot be read directly, so the
++// only way to see what the logits buffer holds *at copy time* is a second d2h of the same region.
++// Returns a fingerprint of the bytes: FNV-1a, the count of non-finite f16/bf16 and f32 lanes, and a
++// zero-lane count so "never written" is distinguishable from "written and non-finite".
++struct DownloadFingerprint {
++    uint64_t hash        = 1469598103934665603ull;
++    uint64_t nonfinite16 = 0;
++    uint64_t nonfinite32 = 0;
++    uint64_t zeros16     = 0;
++    uint64_t lanes16     = 0;
++};
++
++static DownloadFingerprint fingerprint_host_bytes(const void * data, size_t size) {
++    DownloadFingerprint fp;
++    if (data == nullptr || size == 0) {
++        return fp;
++    }
++    const uint8_t * bytes = static_cast<const uint8_t *>(data);
++    for (size_t i = 0; i < size; ++i) {
++        fp.hash ^= bytes[i];
++        fp.hash *= 1099511628211ull;
++    }
++    const uint16_t * lanes = static_cast<const uint16_t *>(data);
++    fp.lanes16             = size / sizeof(uint16_t);
++    for (uint64_t i = 0; i < fp.lanes16; ++i) {
++        const uint16_t v = lanes[i];
++        if (v == 0) {
++            ++fp.zeros16;
++        }
++        if ((v & 0x7C00u) == 0x7C00u) {
++            ++fp.nonfinite16;
++        }
++    }
++    const uint32_t * dwords = static_cast<const uint32_t *>(data);
++    for (size_t i = 0; i < size / sizeof(uint32_t); ++i) {
++        if ((dwords[i] & 0x7F800000u) == 0x7F800000u) {
++            ++fp.nonfinite32;
++        }
++    }
++    return fp;
++}
++
++static const char * download_fingerprint_class(const DownloadFingerprint & fp, size_t size) {
++    if (size == 0) {
++        return "EMPTY";
++    }
++    if (fp.lanes16 > 0 && fp.zeros16 == fp.lanes16) {
++        return "ZERO";
++    }
++    if (fp.nonfinite16 > 0 || fp.nonfinite32 > 0) {
++        return "NONFINITE";
++    }
++    return "FINITE";
++}
++
+ static constexpr size_t kMaxInlineUploadBytes = 63 * 1024;
+ static constexpr size_t kLargeHostUploadBytes = 1024 * 1024;
+ 
+@@ -1355,6 +1412,33 @@ Status HostTransferManager::download_synchronous(hrx_stream_t stream,
+         status.log("synchronous HRX host download failed: %s", error->c_str());
+         return status;
+     }
++    // engine#315 diagnostic: probe the same region with a second d2h, then compare it with the real copy.
++    //   probe NONFINITE            -> the device data was already non-finite at copy time (producer/arena)
++    //   probe hash != copy hash    -> the region changed between the two reads (reuse/race under us)
++    //   probe == copy, both FINITE -> this download is clean
++    if (std::getenv("GGML_HRX_DOWNLOAD_FINGERPRINT") != nullptr && size >= 4096) {
++        std::vector<uint8_t> scratch(size);
++        if (ErrorResult probe_error = take_status(hrx_synchronous_d2h(device, source, offset, scratch.data(), size))) {
++            std::fprintf(stderr, "[hrx-dl-fp] size=%zu offset=%zu probe_failed=%s\n", size, offset,
++                         probe_error->c_str());
++        } else {
++            const DownloadFingerprint probe = fingerprint_host_bytes(scratch.data(), size);
++            const DownloadFingerprint copy  = fingerprint_host_bytes(host_destination, size);
++            std::fprintf(stderr,
++                         "[hrx-dl-fp] size=%zu offset=%zu probe_hash=%016llx copy_hash=%016llx "
++                         "probe_class=%s copy_class=%s hashes_equal=%d probe_nf16=%llu probe_nf32=%llu "
++                         "copy_nf16=%llu copy_nf32=%llu\n",
++                         size, offset, static_cast<unsigned long long>(probe.hash),
++                         static_cast<unsigned long long>(copy.hash),
++                         download_fingerprint_class(probe, size), download_fingerprint_class(copy, size),
++                         probe.hash == copy.hash ? 1 : 0,
++                         static_cast<unsigned long long>(probe.nonfinite16),
++                         static_cast<unsigned long long>(probe.nonfinite32),
++                         static_cast<unsigned long long>(copy.nonfinite16),
++                         static_cast<unsigned long long>(copy.nonfinite32));
++        }
++        std::fflush(stderr);
++    }
+     std::lock_guard<std::mutex> lock(mutex_);
+     ++stats_.downloads;
+     stats_.download_bytes += size;

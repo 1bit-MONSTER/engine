@@ -425,3 +425,42 @@ happened — and the 146 weight-lease records it did produce are consistent with
 faulting arm reporting `sentinel == count` means the copy was faithful and the source region was never
 written by the device. That is §18's decisive row, and it needs no additional instrument — only a
 faulting in-regime arm.
+
+## 20. Face B captured in-regime (arm `315hunt-p1l`, `gtt_start=98 GiB`)
+
+The sentinel hunt's **first probe arm faulted**, in regime, and it was Face B rather than Face A:
+
+```
+pair 1 arm c: OK    nan=0 req=66 gtt_start=98G
+pair 1 arm l: FAULT nan=0 req=15 gtt_start=98G utf8=0 parse=0
+detector.json: requests=15 ok=14 http_failures=1 first_failure="HTTP 500" truncated=true
+server.log   : common_chat_peg_parse: unparsed Content-only output: .,。_./ <U+FFFD>, exactly,…
+               srv: got exception {"code":500,"message":"…does not match the expected Content-only format"}
+probe        : armed=True sentinel_filled=True copies=931, ALL get_tensor_async/result_output/619520
+               NaN lines: 0
+```
+
+Three things follow, and they separate the faces:
+
+1. **Face B is not an unwritten logits region.** `nan=0`, the guard never fired, and every one of the
+   931 copies is a clean logits download. The logits were written and finite; the *text* was garbage, so
+   the corruption is **upstream of the logits** (intermediates, KV, weights or a binding) — a different
+   producer from Face A's, and one that no instrument built so far observes.
+2. **Face B is common in-regime.** It appeared on the first in-regime probe arm (1 of 1), where the
+   recorded Face-A NaN rate is ~5 %/arm. The campaign's bar (≥60 clean arms, zero faults on both faces)
+   therefore stands or falls on Face B, and the supplied "identical: 1 distinct of 8" signature matches
+   the legacy example in `KNOWN-ISSUES.md` (`v315k-l1`), so this is the known second face, reproduced.
+3. **It looks stable, not racy, within an arm.** `identical_distinct = 1`: eight identical greedy
+   requests produced the same garbage. A per-request race would be expected to vary.
+
+**Reading pre-committed for the next experiment (repeat the same in-regime probe arm 3×, compare the
+garbage text for an identical prompt):**
+
+| observation | conclusion |
+|---|---|
+| the same garbage text across arms | a **stable wrong value or binding** (deterministic corruption) ⇒ bisect the inputs to prompt-eval, not the timing |
+| different garbage text each arm | a **transient/race** corruption ⇒ the next instrument must be per-arm and timing-side |
+| the arm comes back clean | Face B is load-sensitive rather than deterministic; the repeat rate must be measured before any determinism claim |
+
+No mechanism is claimed for either face yet: Face A's sentinel row has not been observed (no NaN arm in
+regime), and Face B's producer is unidentified.

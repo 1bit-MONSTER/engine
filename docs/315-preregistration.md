@@ -129,10 +129,19 @@ neighbours; they had to be terminated by matching their own command lines (ports
 scripts must verify teardown and report the GTT afterwards — this smoke session left 118 GiB resident
 until it was cleaned up by hand.
 
-The paired driver that emits the `pair N arm c|l: <verdict> nan=… req=… ret3=… parse=… gtt_start=…G`
-lines is currently *unlocated* on the box (only its consumers are on disk). Before the campaign
-starts it must be either found and pinned by path and sha256, or re-implemented and committed, so
-that the arm lines have a versioned producer rather than an anonymous one.
+The producer is **committed**, not anonymous: `docs/315-campaign/315-paired.sh` (the paired driver) and
+`docs/315-campaign/315-detector.py` (the request phase). The earlier producer was never located on the
+box — only its consumers were on disk — so it was re-implemented here. Both scripts pass a syntax
+check, and their emitted lines were tested against the **existing** analyser's regex: all four verdicts
+(`OK`, `FAULT`, `INVALID`, `OOR`) match, because the extra `utf8=`/`alloc=` fields are appended after
+`gtt_start=…G` and that regex is not end-anchored.
+
+Why the detector is not just `rt-det.sh`: the existing harness decodes responses with
+`json.loads(r.read())` inside a bare `except`, so a body that is not valid UTF-8 is indistinguishable
+from any other request failure — Face B would be invisible. `315-detector.py` issues the *same* 66
+requests (same seed, so arms stay comparable) but inspects the raw bytes, separating transport
+failures, non-UTF-8 bodies (Face B), JSON parse failures, and HTTP status. The driver's classification
+follows §5 exactly.
 
 ## 9. Budget
 

@@ -48,8 +48,18 @@ PORT=$((19300 + RANDOM % 400))
 REGIME_ARM_PORT=$PORT
 SETENV=(--setenv=IREE_HAL_AMDGPU_LIBHSA_PATH=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1)
 [ "$FP" = "1" ] && SETENV+=(--setenv=GGML_HRX_WRITEBACK_FINGERPRINT=1)
+# UB / EXTRA_ENV let a run reproduce the recorded *high-rate* configurations (the issue measured
+# 11/12 faults with -ub 512 vs 0/12 with -ub 128), which makes mechanism discrimination cheap:
+# at ~5%/arm a differential test would need dozens of arms to see a handful of faults.
+ARM_UB=(); [ -n "${UB:-}" ] && ARM_UB=(-ub "$UB")
+if [ -n "${EXTRA_ENV:-}" ]; then
+  IFS=',' read -r -a _extra <<< "$EXTRA_ENV"
+  for kv in "${_extra[@]}"; do SETENV+=(--setenv="$kv"); done
+fi
+echo "arm config: ub=${UB:-default} extra_env=${EXTRA_ENV:-none}"
 systemd-run --user --scope -q -p MemoryMax=60G --unit=${TAG}-arm "${SETENV[@]}" \
   "$BIN/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on --host 127.0.0.1 --port $PORT -c 8192 -np 1 --no-webui \
+  "${ARM_UB[@]}" \
   > "$O/server.log" 2>&1 &
 UP=0; for t in $(seq 1 300); do curl -sf localhost:$PORT/health >/dev/null 2>&1 && { UP=1; break; }; sleep 1; done
 G0=$(gtt); echo "gtt_start ${G0}GiB fp=$FP" > "$O/run.log"

@@ -189,3 +189,35 @@ the producing graph's *submission*, not merely on whether the stream is flushed 
 concrete thing `315-graphsync.sh` changes - it forces a stream synchronisation after every graph replay - and it is
 where a scoped forward-only fix would go if the sync test comes back clean: order the producing graph's submission
 ahead of the copy that feeds a host read, rather than synchronising every graph.
+
+## The chain probe's whole session: three faults, zero NaN
+
+`315chain` (2026-10-10 09:37:25-10:10:17, in-regime composition to `gtt_before_arm=80G`, every arm scored at
+`gtt_start=98G` except the last at 106G) ran six fix-cell arms and one control arm with
+`GGML_HRX_COPY_PROBE=1 GGML_HRX_SENTINEL=1` and a 22-name tensor fingerprint spanning `l_out-39..l_out-42`,
+both attention branches, the FFN/MoE chain and `norm`/`result_norm`/`result_output`:
+
+| arm | verdict | req | nan | fingerprint lines |
+|---|---|---|---|---|
+| p1 control | FAULT | 24 | 0 | 0 |
+| p1 fix | FAULT | 64 | 0 | 0 |
+| p2, p3, p4 fix | OK | 66 | 0 | 0 |
+| p5 fix | FAULT | 51 | 0 | 0 |
+| p6 fix | FAULT | 22 (gtt 106) | 0 | 0 |
+
+**Every arm has `nan=0`, the guard logged nothing all session, and the fingerprint printed no NaN line in any
+arm.** The faults are therefore HTTP-500/format failures with NaN-free logits - face B - and this is the
+strongest statement of that so far, because the guard is unconditional and the named set includes the logits
+themselves. Three of six arms faulted; not one involved NaN.
+
+**Why that matters, given the 315nan session.** With nearly the same environment (`COPY_PROBE`, `SENTINEL`, a
+fingerprint, same builds, same detector) the earlier session faulted 16 of 17 arms with `nan=1` each - face A -
+while this one faulted half its arms with zero NaN anywhere. So which face appears is a property of the
+*session*, not of the individual event, and the finite flavour is real and separable: it cannot be a NaN that my
+instrumentation missed, because the guard would have caught it first.
+
+**Consequence.** Face B needs its own localisation: the NaN-only fingerprint is structurally blind to it, and the
+tool for the finite case is `GGML_HRX_LOGITS_FP`, whose per-sample `hash=` must repeat across the eight identical
+greedy requests - a corrupted sample shows as one hash differing from its seven siblings. That is the experiment
+`315-faceb.sh` was written for; it was dropped from the queue in favour of the visibility falsifier and should be
+restored if the finite flavour is to be named rather than only distinguished.

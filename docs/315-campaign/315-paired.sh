@@ -85,7 +85,7 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
     "$bin/llama-server" -m "$M" -dev HRX0 -ngl 99 -fa on --host 127.0.0.1 --port $port -c 8192 -np 1 --no-webui \
     > "$O/server.log" 2>&1 9>&- &
   local up=0
-  for t in $(seq 1 300); do curl -sf localhost:$port/health >/dev/null 2>&1 && { up=1; break; }; sleep 1; done
+  for t in $(seq 1 300); do curl -sf -m 5 localhost:$port/health >/dev/null 2>&1 && { up=1; break; }; sleep 1; done   # -m 5: a blocked accept must not hang the runner
   local g0; g0=$(gtt); echo "gtt_start ${g0}GiB mode $(cat /sys/class/ec_su_axb35/apu/power_mode 2>/dev/null)" > "$O/run.log"
 
   local alloc nan hsa req=0 parse=0 utf8=0 verdict hv52=0 hv56=0
@@ -117,7 +117,10 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   hv52=$(grep -c "memory_type=0x52 size=619520" "$O/server.log" 2>/dev/null || true); hv52=${hv52:-0}
   hv56=$(grep -c "memory_type=0x56 size=619520" "$O/server.log" 2>/dev/null || true); hv56=${hv56:-0}
   local g1; g1=$(gtt)
-  if [ "${g0:-0}" -lt 95 ]; then verdict=OOR
+  # The gate is two-sided (docs/315-preregistration.md 5): above the upper bound the detector fails to
+  # allocate and the arm is invalid, so it must never be recorded as clean. The analyser already treats it
+  # as out-of-regime; recording it as clean here was a gap.
+  if [ "${g0:-0}" -lt 95 ] || [ "${g0:-0}" -gt 110 ]; then verdict=OOR
   elif [ "${nan:-0}" -gt 0 ] || [ "${hsa:-0}" -gt 0 ] || [ "${parse:-0}" -gt 0 ] || [ "${utf8:-0}" -gt 0 ] \
     || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
   else verdict=OK; fi

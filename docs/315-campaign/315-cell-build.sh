@@ -55,7 +55,9 @@ cmake --build "$B" -j 12 >> "$LOG" 2>&1 || { echo "ABORT: build failed, see $LOG
 say "binary identity"; "$B/bin/llama-server" --version
 LIB=$(ls "$B"/bin/libggml-hrx.so* 2>/dev/null | head -1)
 [ -n "$LIB" ] || { echo "ABORT: libggml-hrx.so not found"; exit 1; }
-for M in hrx-wb-fp hrx-dl-fp hrx-buf; do
+# MARKERS lets a cell assert its own marker: a probe that never compiled in would otherwise pass every
+# assertion here, which is exactly what happened once.
+for M in hrx-wb-fp hrx-dl-fp hrx-buf ${MARKERS:-}; do
   N=$(grep -c "$M" "$LIB" || true); say "  marker $M=$N"; [ "$N" -gt 0 ] || { echo "ABORT: $M absent"; exit 1; }
 done
 say "CELLBUILD_DONE bin_dir=$B/bin"

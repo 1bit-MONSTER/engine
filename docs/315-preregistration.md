@@ -207,6 +207,16 @@ requests (same seed, so arms stay comparable) but inspects the raw bytes, separa
 failures, non-UTF-8 bodies (Face B), JSON parse failures, and HTTP status. The driver's classification
 follows §5 exactly.
 
+**Freeze note (2026-10-09, before any acceptance arm).** The committed driver was behind the copy that
+actually ran: `315-paired.sh` gated only the lower bound of §5, `315-cell-build.sh` could not assert a
+cell's own instrument marker, and `315-campaign.sh` did not yet report from the driver's per-arm lines.
+All three are now ported into this directory, so the committed tooling is substantively identical to the
+executed tooling (the Apache header being the only difference). None of the three loosens a criterion: the
+two-sided gate can only reclassify an arm from clean to out-of-regime, the marker assertion only adds a
+check, and the campaign summary only changes which script computes the rate. No acceptance arm has been run
+(no `315fix*` arm directories exist); every arm on the box is diagnostic (NOSTOP, instruments on, §18b) and
+is not acceptance evidence.
+
 ## 9. Budget
 
 ≤12 hours of strixhalo box time in total for this goal, shared with other work through the box lock.

@@ -35,9 +35,10 @@ HERE = os.path.dirname(os.path.abspath(__file__))
 ANALYSE = os.path.join(HERE, "..", "315-analyse.py")
 
 
-def line(pair, cell="l", verdict="OK", nan=0, req=66, parse=0, gtt=98, utf8=0, alloc=0):
-    return (f"  pair {pair} arm {cell}: {verdict} nan={nan} req={req} ret3=0 parse={parse} "
-            f"gtt_start={gtt}G utf8={utf8} alloc={alloc}\n")
+def line(pair, cell="l", verdict="OK", nan=0, req=66, parse=0, gtt=98, utf8=0, alloc=0, idn=None):
+    s = (f"  pair {pair} arm {cell}: {verdict} nan={nan} req={req} ret3=0 parse={parse} "
+         f"gtt_start={gtt}G utf8={utf8} alloc={alloc}")
+    return s + (f" idn={idn}" if idn is not None else "") + "\n"
 
 
 def run(arms):
@@ -95,6 +96,14 @@ CASES = [
      CLEAN60 + [line(61, "l", req=65)], dict(exit=1, clean=60, fault=1, accepted=False)),
     ("61 clean arms pass and tighten the bound to 4.9%",
      CLEAN60 + [line(61)], dict(exit=0, clean=61, fault=0, ub=4.9, accepted=True)),
+    # Freeze note 2026-10-10: a divergent identical block is a fault, so finite corruption that still
+    # parses cannot pass as clean. On the recorded population this never fires without another signal.
+    ("a divergent identical block (idn=2) is a fault even with every other signal clean",
+     CLEAN60 + [line(61, "l", idn=2)], dict(exit=1, clean=60, fault=1, accepted=False)),
+    ("idn=1 stated explicitly is still clean",
+     [line(p, idn=1) for p in range(1, 61)], dict(exit=0, clean=60, fault=0, accepted=True)),
+    ("a console with no idn= field at all keeps its classification (pre-freeze consoles)",
+     [line(p) for p in range(1, 61)], dict(exit=0, clean=60, fault=0, accepted=True)),
 ]
 
 

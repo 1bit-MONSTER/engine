@@ -24,7 +24,8 @@
 # Classification, fixed in the pre-registration (docs/315-preregistration.md):
 #   invalid      startup allocation failure, server died before the request phase, or no gtt.log
 #   out-of-regime gtt_start < 95 GiB   (reported, not counted)
-#   fault        nan>0 or hsa>0 or parse>0 or utf8>0 or verdict==TRUNCATED or req<66
+#   fault        nan>0 or hsa>0 or parse>0 or utf8>0 or idn>1 or verdict==TRUNCATED or req<66
+#                (idn>1 = the 8 identical greedy requests disagreed; see the 2026-10-10 freeze note)
 #   clean        otherwise
 #
 # Usage: 315-paired.sh <pairs> <neighbours> <neigh_ctx> <control_bin_dir> <fix_bin_dir> <tagbase>
@@ -88,18 +89,22 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   for t in $(seq 1 300); do curl -sf -m 5 localhost:$port/health >/dev/null 2>&1 && { up=1; break; }; sleep 1; done   # -m 5: a blocked accept must not hang the runner
   local g0; g0=$(gtt); echo "gtt_start ${g0}GiB mode $(cat /sys/class/ec_su_axb35/apu/power_mode 2>/dev/null)" > "$O/run.log"
 
-  local alloc nan hsa req=0 parse=0 utf8=0 verdict hv52=0 hv56=0
+  local alloc nan hsa req=0 parse=0 utf8=0 verdict hv52=0 hv56=0 idn=1
   alloc=$(grep -cE "hrx_allocator_allocate_buffer.*failed|allocate HRX host staging buffer for value .* failed" "$O/server.log" 2>/dev/null || true)
   if [ "$up" != "1" ] || [ "${alloc:-0}" -gt 0 ]; then
     systemctl --user stop $TAG-arm-$pair$cell 2>/dev/null
     for P in $(pgrep -f "port $port" 2>/dev/null); do kill -TERM $P 2>/dev/null; done
-    printf '  pair %d arm %s: INVALID nan=0 req=0 ret3=0 parse=0 gtt_start=%dG utf8=0 alloc=%d hv52=0 hv56=0\n' \
+    printf '  pair %d arm %s: INVALID nan=0 req=0 ret3=0 parse=0 gtt_start=%dG utf8=0 alloc=%d hv52=0 hv56=0 idn=0\n' \
       "$pair" "$cell" "$g0" "${alloc:-0}" | tee -a "$CONSOLE"
     return
   fi
   REGIME_ARM_PORT=$port
   timeout "${ARM_TIMEOUT:-1200}" python3 "$DET" "$port" "$O" 50 > "$O/detector.log" 2>&1
   req=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['requests'])" 2>/dev/null || echo 0)
+  # Freeze note 2026-10-10: distinct outputs among the 8 identical greedy requests. >1 is a fault: finite
+  # corruption that still parses would otherwise be invisible. Absent/None -> 1, so nothing changes for an
+  # arm whose detector did not get that far.
+  idn=$(python3 -c "import json;print(json.load(open('$O/detector.json')).get('identical_distinct') or 1)" 2>/dev/null || echo 1)
   parse=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['parse_failures'])" 2>/dev/null || echo 0)
   utf8=$(python3 -c "import json;print(json.load(open('$O/detector.json'))['utf8_failures'])" 2>/dev/null || echo 0)
   nan=$(grep -c "HRX returned NaN logits" "$O/server.log" 2>/dev/null || true)
@@ -122,10 +127,11 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
   # as out-of-regime; recording it as clean here was a gap.
   if [ "${g0:-0}" -lt 95 ] || [ "${g0:-0}" -gt 110 ]; then verdict=OOR
   elif [ "${nan:-0}" -gt 0 ] || [ "${hsa:-0}" -gt 0 ] || [ "${parse:-0}" -gt 0 ] || [ "${utf8:-0}" -gt 0 ] \
-    || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
+    || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] \
+    || [ "${idn:-1}" -gt 1 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
   else verdict=OK; fi
-  printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d hv52=%d hv56=%d (gtt_now=%dG)\n' \
-    "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "${hv52:-0}" "${hv56:-0}" "$g1" \
+  printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d hv52=%d hv56=%d idn=%d (gtt_now=%dG)\n' \
+    "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "${hv52:-0}" "${hv56:-0}" "${idn:-1}" "$g1" \
     | tee -a "$CONSOLE"
   systemctl --user stop $TAG-arm-$pair$cell 2>/dev/null
   for _t in 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0; do

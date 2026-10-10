@@ -29,7 +29,7 @@ Console line grammar (produced by 315-paired.sh; the existing script's regex als
 Classification:
     invalid        alloc>0, verdict INVALID, or the request phase produced nothing (req==0)
     out-of-regime  gtt_start < 95 GiB (gate) or > 110 GiB (invalid-upper bound)
-    fault          nan>0 or hsa>0 or parse>0 or utf8>0 or verdict in {FAULT,TRUNCATED} or req<66
+    fault          nan>0 or hsa>0 or parse>0 or utf8>0 or idn>1 or verdict in {FAULT,TRUNCATED} or req<66
     clean          otherwise
 
 Usage: 315-analyse.py <console> [<console>...] [--baseline-a 2/37] [--baseline-b 1/25]
@@ -46,7 +46,7 @@ from math import comb
 
 ARM = re.compile(
     r"^\s*pair\s+(\d+)\s+arm\s+([cl]):\s+(\S+)\s+nan=(\d+)\s+req=(\d+)\s+ret3=(\d+)\s+parse=(\d+)"
-    r"\s+gtt_start=(\d+)G(?:\s+utf8=(\d+))?(?:\s+alloc=(\d+))?")
+    r"\s+gtt_start=(\d+)G(?:\s+utf8=(\d+))?(?:\s+alloc=(\d+))?(?:\s+idn=(\d+))?")
 GATE = 95          # GiB, pre-registered
 UPPER = 110        # GiB, above this the detector fails to allocate (invalid, not faulted)
 CELL_NAME = {"c": "control", "l": "fix"}
@@ -60,10 +60,13 @@ def parse(path):
             m = ARM.match(line)
             if not m:
                 continue
-            pair, cell, verdict, nan, req, ret3, parse_, gtt, utf8, alloc = m.groups()
+            pair, cell, verdict, nan, req, ret3, parse_, gtt, utf8, alloc, idn = m.groups()
             arms.append(dict(pair=int(pair), cell=cell, verdict=verdict, nan=int(nan), req=int(req),
                              parse=int(parse_), gtt=int(gtt), utf8=int(utf8 or 0),
-                             alloc=int(alloc or 0)))
+                             alloc=int(alloc or 0),
+                             # no idn= field (a console written before the 2026-10-10 freeze note) reads as
+                             # 1, i.e. no signal, so historical consoles keep their classification
+                             idn=int(idn if idn is not None else 1)))
     return arms
 
 
@@ -74,7 +77,7 @@ def classify(a):
     if a["gtt"] < GATE or a["gtt"] > UPPER:
         return "oor"
     if (a["nan"] > 0 or a["verdict"] in ("FAULT", "TRUNCATED")
-            or a["parse"] > 0 or a["utf8"] > 0 or a["req"] < 66):
+            or a["parse"] > 0 or a["utf8"] > 0 or a["idn"] > 1 or a["req"] < 66):
         return "fault"
     return "clean"
 

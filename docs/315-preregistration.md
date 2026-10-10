@@ -425,3 +425,15 @@ Also worth writing down for anyone driving this harness: `NB` being unused is a 
 regime fact — a session that believes it is choosing a neighbour count is not. The composition actually
 used is the helper's own `regime: composition neighbours=N ctx=…` line, which is what a session log should
 quote.
+
+**Freeze note (2026-10-10, before any acceptance arm; only makes acceptance harder).** `identical_distinct` -
+the number of distinct outputs among the 8 identical greedy requests the detector sends with
+`cache_prompt=false` and `temperature=0`, so 1 = deterministic - is added to the fault rule: an arm with
+`identical_distinct > 1` is a **fault**, not clean. Reason: the campaign's existing rule only catches corruption
+that either produces NaN (Face A) or makes the server fail (Face B's 500). Finite corruption that happens to
+produce *parseable* text would otherwise be invisible, and the whole population on disk says this signal is
+clean: of 142 arms with a `detector.json`, 135 have `identical_distinct = 1`, and the 7 exceptions are exactly
+the arms that also logged NaN logits (evidence/315-face-landscape.md). No arm without another fault signal has
+ever been divergent, so the rule adds no false positives on the recorded population while making zero-fault
+acceptance strictly harder to reach. The analyser treats a console with no `idn=` field as `idn = 1`, so the
+historical consoles keep their recorded classification.

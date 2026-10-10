@@ -661,9 +661,31 @@ real node name (`src/llama-graph.cpp:40`) — with `NANONLY` set, plus the `tail
    exactly the first call of the new task, not drift; anything else falsifies the stale-read half of the
    mechanism.
 
-None of this is run yet: the box has been held across three consecutive goal turns by a foreign `repro336`
-GLM-4.7-Flash session (4-6 resident servers, GTT 103-111 GiB, 6-9 GB RAM free), and the regime gate needs
-`gtt_start` in [95, 110] GiB after composing neighbours.
+### Where the source audit landed (unverified by measurement)
+
+Reading the pin's own copy of the decode-split kernel narrows the mechanism to one array and one predicate,
+but proves nothing on its own:
+
+* a full block is 64 keys (`scf.for %key_tile = [%c0 to %c64 step %c16]`, four 16-key tiles), and the
+  `all_visible` / `any_visible` predicates are now derived by loading the tile's 16 entries from
+  `%visibility_view : view<64xf32>` at `key_tile_ordinal * 16` and testing `> %negative_large`;
+* the non-staging fast path is taken only when `all_visible`, i.e. only when every key of that tile is
+  genuinely visible - which is the right condition, *provided the array is current*;
+* so the failure that fits every observation is a **stale or partially-written visibility array**: the
+  predicate then reports `all_visible` for a tile whose keys are in fact masked, the kernel takes the fast
+  path, and the masked-out V rows are consumed. Masked rows in a freshly reset slot are exactly where a NaN
+  (Face A) or plausible-looking garbage (Face B) would come from, on the first decode after a task boundary,
+  intermittently, and independently of GTT pressure.
+
+Unverified: nothing here shows the array is stale, and the array's producer (prologue vs host-side setup)
+has not been traced. The discriminating measurement is the one already listed: if the mask/visibility input
+is stale at the first decode while the source mask is clean, this is right; if the first NaN instead appears
+with a clean visibility array on the fast path, the predicate logic itself is wrong; if the attention side is
+clean throughout, the whole FA direction is falsified and the producer moved to the layer/FFN path.
+
+None of this is run yet: the box has been held across four consecutive goal turns by a foreign `repro336`
+GLM-4.7-Flash session (7 resident servers at the last check, GTT 102.8 GiB, 1-2 GB RAM free), and the regime
+gate needs `gtt_start` in [95, 110] GiB after composing neighbours.
 
 ### What the next measurement costs, and one lead that could make it cheaper
 

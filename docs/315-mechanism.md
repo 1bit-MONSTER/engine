@@ -518,10 +518,9 @@ the probe shows every copy is logits-sized and registered-buffer). Consequences,
 4. **It also makes the two faces one family.** Face B is *wrong but finite* output (§20); Face A is the
    same "wrong data under pressure" at NaN magnitude. Neither is a delivery defect.
 
-**Not yet named:** *which* compute stage manufactures the NaN. The next instrument is staged for it — the
-logits fingerprint (`GGML_HRX_LOGITS_FP`, `common/sampling.cpp`), which hashes the first N sampler calls'
-logits so a faulty arm and a clean arm can be compared at the same prompt, and so the NaN's onset
-(call 0 vs a later call) is visible rather than inferred.
+**Not yet named:** *which* compute stage manufactures the NaN. §23 takes this to the tensor level: the
+LM head is exonerated (its input is already NaN) and the fault is pinned to the first decoded token of a
+newly launched task, but the stage that manufactures it is still open.
 
 ## 22. State of play and remaining work (handoff, 2026-10-09)
 
@@ -537,12 +536,11 @@ logits so a faulty arm and a clean arm can be compared at the same prompt, and s
 
 ### Remaining, in dependency order
 
-1. **Name the specific compute stage.** The instrument for it now exists: in a faulting arm, the per-tensor
-   fingerprint says whether `result_norm` (the LM head's input) carries the NaN — a dense head NaNs all
-   154,880 outputs from a *single* NaN input, so 1..4096 NaNs there means small upstream corruption,
-   while a clean `result_norm` with NaN logits puts the locus in the head itself. The per-call logits
-   hash then localises *which* sampler call (hence which request/token) first diverges from the clean
-   reference sequence.
+1. **Name the specific compute stage.** *Partly answered by §23*: the fingerprint ran in a faulting arm
+   and the head is exonerated — the head's input is already NaN — and every Face-A fault on the record sits
+   on the first decoded token of a newly launched task. What is still open is the stage that manufactures
+   the NaN inside that first-decode graph; the next measurement is the fingerprint on that graph's inputs
+   (the activation handed to the first decode, and the KV it reads).
 2. **Fix (task-4)** — cannot be written honestly before step 1 names the producer. Candidate directions
    already on the record: §66 option 3 (device-local output + one explicit copy), or fixing the stage
    that manufactures the NaN/garbage.
@@ -566,3 +564,50 @@ logits so a faulty arm and a clean arm can be compared at the same prompt, and s
 | readers | `~/wt/315-probe-read.py`, `~/wt/315-logits-fp.py`, `~/wt/315-faceb-compare.py`, `~/wt/315-fp-run.sh`, `~/wt/315-campaign.sh` |
 | driver + helper (pre-registered) | `~/wt/315-paired.sh`, `~/wt/315-regime.sh`, `~/wt/315-detector.py` |
 | arm logs | `~/wt/rt-det/<tag>-p<N><c|l>-GLM-4.7-Flash-Q4_K_M/` (note: glob must be `*-*l-*`, not `*-l-*`) |
+
+## 23. The producer, at tensor resolution (2026-10-09, `315hunt2-p6l`)
+
+Arm `315hunt2-p6l` is the first faulting arm to carry the per-tensor fingerprint
+(`GGML_HRX_TENSOR_FP=result_norm,result_output`; copy probe, sentinel and `GGML_HRX_LOGITS_FP=100000` also
+live; in-regime, `gtt_start 98GiB`). It faulted on request 19 of 66
+(`HRX returned NaN logits: count=154880 of 154880 ... sentinel=0`), detector
+`transport_failures=1`, `first_failure=RemoteDisconnected`.
+
+Per-call record, faulting `graph_compute` (fp call 103644):
+
+| node | bytes | NaN | hash |
+|---|---|---|---|
+| `norm` (final norm output) | 8192 | **2048 of 2048** | `89ade87e7a93fb83` |
+| `result_norm` (head input) | 8192 | **2016 of 2048** | `77c1ef05f75f6127` |
+| `result_output` (logits) | 619520 | **154848 of 154880** | `f8b83526883036a3` |
+
+Across all 1091 fingerprint calls in the arm: 1089 of 1090 full-size calls have `norm nan=0`, and in every
+one of those clean calls `norm` and `result_norm` are **byte-identical**. The fault call is the only call in
+the arm where the two differ. Conclusions:
+
+1. **The head is exonerated.** Its input is already NaN, so the head amplifies a corrupt activation rather
+   than manufacturing the NaN. The producer is upstream of the final norm output.
+2. **The NaN is arithmetic, not ours.** FNV-1a over 154,880 copies of the sentinel payload `0x7FC0DEAD` is
+   `79889fb2391c6c83`; the fault call's logits hash is `91a04b03818e7083`, and no constant NaN payload
+   reproduces it. So the logits are NaNs of *varying* payload — the sentinel did not leak into the region
+   and was not broadcast.
+3. **The host read is not ordered against the whole write.** `result_output` held 32 finite floats at the
+   fingerprint read and the sampler's later read of the same region reported 154,880 of 154,880 NaN —
+   128 bytes landed between the two reads. Same for the `norm`/`result_norm` pair (2048 vs 2016 NaN at the
+   same instant).
+4. **The fault is one token, at a task boundary.** Sampler calls 1085 and 1086 are clean, 1087 is all-NaN:
+   no drift. And in **18 of 18** arms on the record that raise `HRX returned NaN logits`, the error is 1-3
+   log lines after `slot launch_slot_ ... processing task` (the instrumented arm: 10 lines, with exactly
+   one `hrx-logits-fp` line between the launch and the error — the faulty one). Every Face-A fault fires on
+   the **first decoded token of a newly launched task**, i.e. in the first graph that consumes the state
+   handed over from that task's prefill.
+
+Unexplained, worth keeping: the single call 103549 in this arm reported `bytes=0` for all three names
+(`hash=14650fb0739d0383`, the FNV offset basis, i.e. an empty read); it is the only such call in 1091 and it
+sits between the task launch and the fault.
+
+Status: the fault is localised to one graph, one token, at a prefill→decode boundary — with the head and the
+sentinel eliminated as explanations. The next measurement is to fingerprint that first-decode graph's own
+inputs. Not done: the strixhalo box was held by a foreign `repro336` GLM-4.7-Flash session
+(`~/repro336/build/bin/llama-server`, GTT 111 GiB) so the 98 GiB regime gate could not be composed; those
+servers are not ours and were left alone.

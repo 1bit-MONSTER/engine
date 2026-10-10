@@ -122,3 +122,46 @@ never fingerprinted. `315-faceb.sh` fixes that, and it can test the strong form 
 on, the eight identical greedy requests must log the *same* logits hash, so a corrupted sample shows up as one hash differing
 from its seven siblings. That is the discriminating measurement for the Face-B half, and it is the reason the probe sets
 `GGML_HRX_LOGITS_FP=1` as well as `GGML_HRX_NAN_CONTINUE=1`.
+
+## Face B measured directly: a faulting request with no NaN anywhere in the pipeline
+
+The chain-probe session (2026-10-10, tag `315chain`, in-regime at `gtt_start=98G`) faulted on its very first pair
+in both cells, and unlike every earlier Face-B arm this one ran with a 60-name tensor fingerprint that includes
+`norm`, `result_norm` and `result_output`:
+
+| arm | detector.json | parser line | fingerprint |
+|---|---|---|---|
+| `315chain-p1l` | `requests 64, ok 63, http_failures 1, utf8 0, parse 0, identical_distinct 1, first_failure "HTTP 500"` | `unparsed Content-only output:  the}:}:}甚;` | **0 lines** |
+| `315chain-p1c` | `requests 24, ok 23, http_failures 1, ...` | `unparsed Content-only output:  a gaps gaps gaps gaps gaps gaps gaps gaps gaps gaps gaps.` | **0 lines** |
+
+Zero fingerprint lines with `GGML_HRX_TENSOR_FP_NANONLY=1` and a list spanning the residual stream, both attention
+branches, the whole FFN/MoE chain and the output norm means **there was no NaN in any named node of the faulting
+request, including the logits**. That is the measurement section 44 listed as missing: Face B is a *finite*
+corruption, and the two text flavours show it plainly - one garbled (`the}:}:}甚;`), one a repetition loop
+(`gaps gaps gaps ...`), which is what near-degenerate logits produce under greedy sampling.
+
+Consequence for technique: the NaN-only fingerprint is blind to this half. Localising *finite* corruption needs
+hashes, not NaN counts - `GGML_HRX_LOGITS_FP` prints a hash per sample, and for the 8 identical greedy requests the
+hashes must repeat, so a corrupted sample shows as one hash differing from its seven siblings.
+
+## The coherence candidate's own campaign, re-read
+
+`315accept-console.log` (2026-10-09) is the session that tested the *patch* rather than the knob:
+`fix_bin = ~/wt/315fix-build/bin` (unconditional `HRX_MEMORY_TYPE_HOST_COHERENT`), `control_bin = ~/wt/315instr3-build/bin`.
+The driver records the allocation type per arm, and the cells separate cleanly - fix arms show `hv52=0 hv56=1`
+(host-visible *coherent*), control arms `hv52=1 hv56=0` - so the patch was demonstrably live in the cell being
+scored. Result: **9 clean and 1 fault (Face-B class: `nan=0, req=33`) out of 10 fix-cell arms**, against the recorded
+2/37 for the shipped build. Making the allocation coherent did not remove the fault.
+
+So the *coherence bit* is not the mechanism. What that leaves inside the same family is the timing of the sync that a
+non-coherent host read depends on, which is what `315-graphsync.sh` tests: `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC` calls
+`hrx_stream_synchronize` after every graph replay (`command-program-executor.cpp:2034`), so every later read -
+including the host's read of the logits - must follow the device's writes.
+
+## A gap in the record: no stock baseline has ever been measured
+
+Every session's `control_bin` on disk is `~/wt/315instr3-build`, whose tree carries **233 insertions** of its own
+(`command-program-executor.{cpp,h}` and `host-memory.cpp`) - i.e. the control cell has always been a *candidate*, not
+a baseline. `~/wt/315fix-build` is the same family with the coherence gate removed (240 insertions). A true
+stock-pin control does not exist on the box; building one from a clean worktree at the pin is a prerequisite for the
+task-5 control cell and for any "unchanged relative to baseline" claim in task-6.

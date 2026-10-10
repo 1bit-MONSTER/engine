@@ -1834,3 +1834,35 @@ before (NaN from a sentinel/uninitialised state, or stale floats). So the visibi
 corruption at a boundary *before* the block, which is where a visibility/ordering defect would sit; an output-side
 NaN puts it inside the FFN's own compute. (2) Only then a coherence/ordering variant scored with the multi-face
 rule including `identical_distinct`, since a NaN-only or 500-only score cannot see the finite half of this defect.
+
+## 46. Face B measured, the coherence bit cleared, and what is left of the visibility family
+
+Three results from 2026-10-10, all in `docs/315-campaign/evidence/315-face-landscape.md`.
+
+**Face B is now measured, not inferred.** The chain-probe session (`315chain`) faulted its first pair in both cells
+with a 60-name fingerprint spanning the residual stream, both attention branches, the whole FFN/MoE chain and the
+output norm. The fix-cell arm logged `http_failures 1` with the parser rejecting `the}:}:}甚;`, and the control arm
+rejected a repetition loop, `a gaps gaps gaps gaps ...`. Both logged **zero** fingerprint lines: no NaN anywhere,
+logits included. So Face B is a *finite* corruption, and its text flavours - garbled, or a repetition loop - are what
+near-degenerate logits produce under greedy sampling. My NaN-only fingerprint is structurally blind to this half;
+localising it needs hashes across identical requests, not NaN counts.
+
+**The coherence bit is cleared as the mechanism.** The `315accept` session tested the *patch*, not the knob:
+`315fix-build` (unconditional `HRX_MEMORY_TYPE_HOST_COHERENT`) against `315instr3-build`, and the driver's own
+`hv52`/`hv56` columns prove the patch was live in the scored cell (`hv56=1 hv52=0` versus `hv52=1 hv56=0`). It gave
+**9 clean and 1 Face-B fault in 10 fix-cell arms** - the same shape as the recorded baseline. Section 13's conclusion
+survives its own re-reading with a stronger intervention: coherence is not sufficient.
+
+**What that leaves, and the run now queued to test it.** The logits allocation is host-visible and *not* coherent,
+so a host read depends on an invalidate/sync landing after the device's write. If the family is right at all, the
+defect is that *ordering*, not the coherence attribute - which is exactly what `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC`
+exercises by calling `hrx_stream_synchronize` after every graph replay
+(`command-program-executor.cpp:2034`). `315-graphsync.sh` is queued on the box: six in-regime arms, no other
+instrument, compared against the no-knob arms already on disk. Zero faults there means a missing or early
+consumer-side sync is the mechanism and a scoped variant of it is the minimal forward-only fix; an unchanged rate
+means the corruption is computed - a kernel or shape defect - and the visibility family is dead for the producer.
+
+**One record gap to carry forward.** Every `control_bin` on disk is `315instr3-build`, whose tree has 233 insertions
+of its own, so the control cell has always been a candidate rather than a baseline. A stock-pin control has never
+been measured; building one from a clean worktree at the pin is a prerequisite for the campaign's control cell and
+for any "unchanged relative to baseline" claim in task-6.

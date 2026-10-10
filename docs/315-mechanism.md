@@ -835,3 +835,21 @@ If it holds, the fix is to stop letting the predicate decide whether rows are ze
 constant predicates (`all_visible = false`, `any_visible = true`) as a fresh commit on the pin, which sends
 every tile down the staged path where masked rows are zeroed. Forward-only (the pin stays an ancestor), at the
 cost of the staging loop on every tile - the trade the #314 merge declined.
+
+### How to run that test
+
+The patch is written, generated from the live tree and verified to apply:
+`315-campaign/patches/315-fa-masked-v-nonfinite.md` (generator `315-campaign/tools/gen-fa-masked-nonfinite.py`).
+To run it once the box is free:
+
+1. `git apply -p1` that diff to a branch of the fork at the pin `e44c9d01a`;
+2. configure a **tests-ON** build against it - the study builds all set `LLAMA_BUILD_TESTS=OFF`, so there is no
+test binary anywhere yet. `v315-build` is the precedent for the flags (`LLAMA_BUILD_TESTS=ON`, `GGML_HRX=ON`,
+`HRX_SOURCE_DIR=~/wt/pin-fork-hrx/third_party/hrx-system`), but it points at `~/wt/llama-hybrid` (26330cc20),
+not at the pin, so it cannot be reused as-is;
+3. build the one target - `cmake --build <dir> --target test-hrx-fa-masked-v -j8` - and run
+`<dir>/bin/test-hrx-fa-masked-v`. Every case prints `masked-row variants differing N/8, non-finite outputs M`.
+
+Cost note: this is a link plus one translation unit on top of a full build of the backend, not a 60-arm
+campaign - but it does need enough free RAM to build, which the shared box did not have at the last check
+(1-7 GB free).

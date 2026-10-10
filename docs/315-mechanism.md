@@ -1866,3 +1866,54 @@ means the corruption is computed - a kernel or shape defect - and the visibility
 of its own, so the control cell has always been a candidate rather than a baseline. A stock-pin control has never
 been measured; building one from a clean worktree at the pin is a prerequisite for the campaign's control cell and
 for any "unchanged relative to baseline" claim in task-6.
+
+## 47. The invariant across all 16 faulting arms: exactly one token's hidden row, and it enters at the MoE aggregation
+
+Section 40 generalised from one arm's window. Reading the first NaN-bearing fingerprint line of every faulting arm
+in the session changes the picture, because what is constant across them is not the node but the *shape*:
+
+| arm | first NaN-bearing node | op | bytes | NaN |
+|---|---|---|---|---|
+| p10l, p1l, p6l, p9l | `node_2948` | ADD | 1409024 (T=172) | 2048 |
+| p11l | `node_2948` | ADD | 2506752 (T=306) | 2048 |
+| p13l | `node_2948` | ADD | 1146880 (T=140) | 2048 |
+| p15l | `node_2948` | ADD | 802816 (T=98) | 2048 |
+| p17l | `node_2948` | ADD | 2801664 (T=342) | 2048 |
+| p2l, p3l, p4l, p7l, p8l | `node_2948` | ADD | 712704 (T=87) | 2048 |
+| p5l | `node_2948` | ADD | 1105920 (T=135) | 2048 |
+| p14l, p20l | `ffn_swiglu-41` | GLU | 534528 / 2138112 | 2048 |
+| p12l | `norm-0` | RMS_NORM | 81920 | **55** |
+
+The tensor size changes by a factor of four across arms (T of 87, 98, 135, 140, 172, 306, 342) while the NaN count
+is **2048 in 15 of 16 arms** - one `n_embd` row, exactly. The invariant is therefore not "block 41" and not "the
+tail of the graph": it is **exactly one token's hidden vector is NaN**, whatever the batch size, and it is already
+NaN by the time the MoE aggregation adds run.
+
+**What that node is.** The name `node_2948` is auto-generated because the node is unnamed, and the pin's
+`build_moe_ffn` explains why: the expert-aggregation loop calls `ggml_add` per expert and only the *final* sum gets
+`cb(moe_out, "ffn_moe_out", il)` (`src/llama-graph.cpp:2151-2162`). GLM uses 4 experts, so two or three adds in
+that chain are unnamed, and `node_2948` is one of them - the NaN is present in a *partial* expert sum.
+
+**So the mechanism narrows to a per-token MoE failure.** For exactly one token of a prefill batch, one of the
+contributions entering the expert sum is NaN. Either the token's routing weight is NaN (`ffn_moe_weighted` is
+`ggml_mul(experts, weights)`, so a NaN weight poisons that token's row for every expert) or one selected expert's
+activation for that token is NaN. Both are per-token, both enter the aggregation, and both would be *earlier* than
+the window that caught them - which is why the first *windowed* node varies while the row shape does not.
+
+**Why this is the shape both faces need.** A single corrupted row inside a prefill is invisible at the time: the
+prefill samples its last token, so a corrupted row elsewhere costs nothing then. That row is written to its token's
+KV slot, and the next decode that attends to it is handed a poisoned - or merely wrong - context: NaN gives Face A
+when the guard catches it, finite garbage gives Face B, where the sampler emits degenerate text and the parser
+fails. Sections 23, 40 and 44 are the same story at three resolutions.
+
+**What this rules out.** A stale or globally corrupt logits buffer cannot produce one NaN row in a *prefill* graph
+of T=172 while the other 171 rows are finite, and neither can corrupt weights, which would hit every token. Those
+two eliminations are now supported by the invariant rather than by argument.
+
+**The discriminating experiment this suggests.** Print the *index* of the first NaN rather than only the count, and
+add the named per-token tensors of the MoE path (`ffn_moe_probs`, `ffn_moe_weights`, `ffn_moe_weighted`,
+`ffn_moe_down`, and the per-expert partial sums) to the fingerprint. That answers, in one arm: is the NaN row the
+same token index in every tensor of the chain (a per-token state, which points at the routing/weight path), and is
+it the *last* row - the token whose routing is computed last and is therefore the one a racing read would find
+unwritten? A tail-row answer would name the defect as a routing-table read that is not ordered after the routing
+computation, and the fix as ordering it.

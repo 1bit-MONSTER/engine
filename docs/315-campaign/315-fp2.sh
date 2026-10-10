@@ -92,11 +92,14 @@ for l in $(seq 0 63); do
 done
 echo "fp2: name list $(printf '%s' "$NAMES" | tr ',' '\n' | wc -l) entries"
 
-# REGIME_LO=85: the strictest reading of the in-regime requirement (task-2's "gtt_start >= 101 GiB"), since
-# neighbours at 85 GiB put the detector's ~19-21 GiB at ~101-106, inside the 110 GiB upper bound.
-echo "fp2: running $ARMS arms at REGIME_LO=${REGIME_LO:-85} $(date -Is)"
+# REGIME_LO=80: measured, not chosen for the strictest reading. A neighbour costs ~17 GiB of GTT (a 17 GiB model
+# plus its context), so the composition lands on discrete steps: neighbours at 80 GiB score arms at 98 GiB (inside
+# the frozen 95-110 gate), neighbours at 97 GiB score them at 115 GiB (outside it - that is what the first
+# 315gsync2 attempt did with LO=85, and its arms are archived as 315gsync2-overshoot-console.log). There is no
+# setting that lands at 101-105 GiB with this granularity; 98 GiB is the in-regime point this box can hold.
+echo "fp2: running $ARMS arms at REGIME_LO=${REGIME_LO:-80} $(date -Is)"
 CBIN="$B/bin" FBIN="$B/bin" NOLOCK=1 \
-REGIME_LO=${REGIME_LO:-85} REGIME_HI=${REGIME_HI:-95} \
+REGIME_LO=${REGIME_LO:-80} REGIME_HI=${REGIME_HI:-92} \
 ARM_TIMEOUT=${ARM_TIMEOUT:-1800} \
   bash "$HOME/wt/315-attrib.sh" "$ARMS" "$TAG" 999 \
   "GGML_HRX_TENSOR_FP=$NAMES GGML_HRX_TENSOR_FP_NANONLY=1"

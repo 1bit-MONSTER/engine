@@ -2230,3 +2230,31 @@ submission, which is where section 54's unbarriered 15 % (92 of 612 dispatches) 
 This pre-commitment is the reason the run is the decisive experiment for the ordering family rather than an
 open-ended comparison: the expected outcome closes a family rather than asserting a mechanism, and the
 unexpected one names the control it would need.
+
+## 58. The composition granularity, measured: 80 GiB neighbours score 98 GiB arms, 97 GiB score 115 GiB
+
+The first attempt at the paired run was launched with `REGIME_LO=85`, on the reasoning that task-2's strictest
+reading wants `gtt_start >= 101 GiB`. That reasoning was wrong about this box, and the run's own first arm says so:
+
+```text
+neighbours up gtt=97G
+  pair 1 arm c: OOR nan=0 req=10 ret3=0 parse=0 gtt_start=115G …
+```
+
+**A neighbour costs ~17 GiB of GTT** (a 17 GiB model plus its context), so the composition lands on discrete
+steps rather than anywhere in a range: neighbours at 80 GiB put the detector's ~18 GiB at **98 GiB** (inside the
+frozen `[95, 110]` gate - this is what `315row` and `315chain` produced), and one more neighbour puts it at
+**115 GiB**, outside the gate and past the point where the detector can allocate (`req=10`, then `OOR`). There is
+no setting that lands at 101-105 GiB with this granularity, so the contract's "`gtt_start >= 101 GiB`" is not
+reachable here and the honest position is the one already recorded: the frozen gate is `>= 95 GiB`, and 98 GiB is
+this box's in-regime point.
+
+Both the overshooting attempt's console and its scope are archived (`~/wt/315gsync2-overshoot-console.log`,
+GTT returned to baseline 26 GiB before the relaunch). The relaunched run uses `REGIME_LO=80 REGIME_HI=92`, which is
+also now the default in `315-fp2.sh` and `315-dose.sh`.
+
+**A gate-design lesson, recorded because it cost a restart.** `315-fp2.sh`'s pre-committed gate aborts when the
+fix cell is clean (`fixok >= 3 && fixf == 0`) and otherwise *proceeds* - so with a console that contained only
+`OOR` arms it proceeded, built, and started arms at the wrong target. A gate that reads another run's console must
+also refuse to proceed when that console has **no in-regime scored arms at all**; "the branch I do not need" and
+"no data yet" are different states, and only the first justifies starting work.

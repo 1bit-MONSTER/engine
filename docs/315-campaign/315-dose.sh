@@ -105,7 +105,7 @@ for N in "${DOSES[@]}"; do
   tag="315dose-n$N"
   echo "=== dose session N=$N arms=$ARMS $(date -Is) ==="
   CBIN="$B/bin" FBIN="$B/bin" \
-  REGIME_LO=${REGIME_LO:-85} REGIME_HI=${REGIME_HI:-95} \
+  REGIME_LO=${REGIME_LO:-80} REGIME_HI=${REGIME_HI:-92} \
   ARM_TIMEOUT=${ARM_TIMEOUT:-1800} LOCK_WAIT=${DOSE_LOCK_WAIT:-10800} \
     bash "$HOME/wt/315-attrib.sh" "$ARMS" "$tag" 999 \
     "GGML_HRX_DIAGNOSTIC_GRAPH_SYNC_EVERY=$N GGML_HRX_TENSOR_FP=tail:16 GGML_HRX_TENSOR_FP_NANONLY=1"

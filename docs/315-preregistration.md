@@ -217,6 +217,17 @@ check, and the campaign summary only changes which script computes the rate. No 
 (no `315fix*` arm directories exist); every arm on the box is diagnostic (NOSTOP, instruments on, §18b) and
 is not acceptance evidence.
 
+**Freeze note 2 (2026-10-09, still before any acceptance arm) - the acceptance statistic was wrong.**
+`315-campaign.sh`'s summary divided by the **clean** arms and hardcoded a zero numerator, so it printed
+`rate=0/N = 0.0%` plus a rule-of-three bound no matter how many arms had faulted; a fault appeared only in the
+separate `fault=` count. Validated against the diagnostic logs: `315hunt2-console.log` has 15 in-regime fix-cell
+arms, 14 clean and **1 faulted**, and the old summary read `rate=0/14 = 0.0%  upper bound 21.43%` - which, in
+an acceptance run, is a false power statement. The statistic now runs over **all in-regime arms**: zero faults
+keeps the rule-of-three bound, and any fault reports the observed rate with an exact Clopper-Pearson 95% interval
+and an explicit `ACCEPTANCE FAILS` line, and in-regime `INVALID` arms are called out as unresolved rather than
+silent. The same log now reads `rate=1/15 = 6.67%  95% CI [0.17%, 31.95%]`. This change can only make
+acceptance harder - it cannot manufacture cleanliness - and the executed copy on the box carries the same code.
+
 ## 9. Budget
 
 ≤12 hours of strixhalo box time in total for this goal, shared with other work through the box lock.

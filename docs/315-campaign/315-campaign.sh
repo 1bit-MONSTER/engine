@@ -69,12 +69,41 @@ def summarise(cell):
           f"clean={len(clean)} fault={len(faults)} invalid={len(invalid)}")
     for r in faults[:6]:
         print(f"   FAULT pair={r['pair']} nan={r['nan']} req={r['req']} parse={r['parse']} utf8={r['utf8']} gtt={r['gtt']}G")
-    if clean:
-        n = len(clean)
-        # rule of three: 0 faults in n arms => 95% upper bound on the rate
-        upper = 1 - 0.05 ** (1.0 / n)
+    # The acceptance statistic runs over ALL in-regime arms, not over the clean ones. The first version of
+    # this summary divided by the clean count and hardcoded a zero numerator, so it printed "rate=0/N = 0.0%"
+    # and a rule-of-three bound no matter how many arms had faulted - a fault was visible only in the
+    # separate count. For an acceptance decision that is exactly backwards: a faulted arm is evidence about
+    # the rate and has to be in the denominator.
+    n = len(inb)
+    k = len(faults)
+    if n == 0:
+        print("   rate=undefined (no in-regime arms)")
+    elif k == 0:
         print(f"   rate=0/{n} = 0.0%  one-sided 95% upper bound (rule of three, 3/n) = {3.0/n*100:.2f}%"
               f"  (0.95^{n} = {0.95**n*100:.2f}%)")
+    else:
+        # Exact Clopper-Pearson 95% interval by bisection on the binomial tail, so no scipy is needed.
+        # P(X >= k | p) increases in p and P(X <= k | p) decreases in p, so each bound is the crossing of
+        # its tail probability with alpha/2.
+        def cdf(p, kk):
+            return sum(comb(n, i) * p ** i * (1 - p) ** (n - i) for i in range(0, kk + 1))
+        lo, hi = 0.0, 1.0
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if 1.0 - cdf(mid, k - 1) > 0.025: hi = mid
+            else: lo = mid
+        lower = 0.5 * (lo + hi)
+        lo, hi = 0.0, 1.0
+        for _ in range(200):
+            mid = 0.5 * (lo + hi)
+            if cdf(mid, k) > 0.025: lo = mid
+            else: hi = mid
+        upper = 0.5 * (lo + hi)
+        print(f"   rate={k}/{n} = {k/n*100:.2f}%  exact 95% CI [{lower*100:.2f}%, {upper*100:.2f}%]")
+        print(f"   ACCEPTANCE FAILS: {k} in-regime arm(s) faulted; the criterion is zero faults across both faces")
+    if invalid:
+        print(f"   {len(invalid)} in-regime arm(s) were INVALID, i.e. neither clean nor faulted - they are not")
+        print(f"   clean evidence and have to be resolved before the criterion can be read as met")
     return clean, faults, invalid
 
 for cell in ("l", "c"):

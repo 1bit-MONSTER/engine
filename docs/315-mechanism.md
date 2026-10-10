@@ -574,28 +574,53 @@ local. Nothing was ever lost; the working set only looked missing from the wrong
 
 Everything below was derived from logs already on the box; no arm was needed, so none of it cost box time.
 
-### Eliminated: a length or tile-alignment trigger
+### Corrected: the length/tile-alignment test, redone on comparable arms
 
-If the first decode read a partly-filled 16-key tile, the fault should depend on the visible key count
-modulo the tile width. It does not. Across the 18 Face-A arms, the prompt length of the faulting request is
-`10, 10, 10, 810, 172, 863, 810, 868, 283, 623, 246, 10, 98, 10, 10, 10, 10, 246` tokens — `mod 16` = `10, 10,
-10, 10, 12, 15, 10, 4, 11, 15, 6, 10, 2, 10, 10, 10, 10, 6`, and the same scatter holds `mod 32` and `mod 64`.
-So the trigger is not key-count alignment, and the partial-tile story is off the table.
+**This subsection corrects the first version of itself.** The first pass pooled the 18 arms that raised
+`HRX returned NaN logits`, which mixes two different harnesses and request shapes: the pre-registered
+detector harness (`detector.json`, `-c 2048`, all 2026-10-09) and the earlier study's `identical.json` arms
+(2026-10-05..08, `-c 8192`). Prompt length as a function of request index is only defined inside one
+harness, so the pool's lengths were meaningless and the "no clustering modulo 16" claim it produced was an
+artifact. Redone inside the detector harness only.
 
-How the lengths were obtained: the detector's 66 requests are seeded and identical across arms, and most
-faulting requests complete normally in other arms, so the token length of request *n* is read from any arm
-that logged `prompt eval time ... / N tokens` for it. Request 34 (a 10-token prompt) is the faulting request
-in 6 of 18 arms and requests 14 and 19 in two each, but the faulting request is not fixed, so the trigger is
-not prompt content either. The 34 repeat is recorded as an observation, not a mechanism: it needs more arms
-before it means anything.
+Comparable arms: 122. The request shape is genuinely fixed - 106 arms share the identical 66-request
+prompt-length prefix and the rest are that same prefix truncated at their fault, and all 66 request indices
+have an unambiguous token length across arms. Face-A faults in this harness: **5**, and their faulting
+request, prompt length and locality are:
+
+| arm | faulting request | prompt tokens | mod 16 | lines after slot launch |
+|---|---|---|---|---|
+| `315fa-p2l` | 34 | 10 | 10 | 3 |
+| `315fa-p5l` | 34 | 10 | 10 | 3 |
+| `315fa-p7c` | 34 | 10 | 10 | 1 |
+| `315hunt2-p6l` | 19 | 810 | 10 | 10 |
+| `315sync2-p5l` | 10 | 172 | 12 | 2 |
+
+So the faults do **not** scatter: 4 of 5 have `prompt_tokens mod 16 == 10` (three of them the same 10-token
+request), 1 has 12. Only 3 of the 66 requests are `== 10` and 7 are `== 12`, i.e. the observed lengths fall
+in a 10-of-66 (~15%) class. Under a uniform null that is p ~ 0.2% - **but it is post hoc**: the modulus and
+the residue were chosen after seeing the data, and 16/32/64 were all tried, so it is a candidate, not a
+result. What makes it worth keeping is that it is independently motivated by the kernel below (a
+partially-filled last key tile is exactly where the shared-memory visibility predicate is read) and that it
+is cheap to test prospectively:
+
+* **Prediction.** In the detector harness, faults occur only at requests whose prompt length is
+  `mod 16 in {10, 12}`; request 45 (458 tokens) is the one untested member of the `== 10` class, so it is the
+  cheapest single check. A fault at any other residue falsifies the whole tile-alignment story.
+* The three same-request-34 faults, the varied faulting request, and the fact that the lengths span 10 to 810
+  tokens all say the trigger is not the request's *content*; alignment is a property of how the KV length
+  lands in the key tiles, not of the prompt text.
 
 ### Both faces fire at the same place
 
-Face A: 18 of 18 arms raise the NaN 1-3 log lines after a `slot launch_slot_` (section 23). Face B: of the 7
-arms whose detector reports an HTTP failure with no NaN, 4 emit their marker 6 lines after a launch, the same
-boundary. The other 3 emit it deep inside a generation — but that marker is written when the response is
-*parsed*, not when the bad data was produced, so its position is not a production-time locator and those 3
-neither support nor contradict the boundary reading.
+Face A, comparable arms only: all 5 detector-harness faults sit 1-10 log lines after a `slot launch_slot_`
+(table above), i.e. on the first decoded token of the newly launched task. The 13 further Face-A arms from the
+earlier `identical.json` harness behave the same way (1-3 lines after a launch), which is why the pooled
+pass saw 18 of 18; the pooled count is corroboration, not the primary evidence. Face B: of the 7
+**detector-harness** arms whose detector reports an HTTP failure with no NaN, 4 emit their marker 6 lines
+after a launch, the same boundary. The other 3 emit it deep inside a generation - but that marker is written
+when the response is *parsed*, not when the bad data was produced, so its position is not a production-time
+locator and those 3 neither support nor contradict the boundary reading.
 
 ### Hypothesis (falsifiable, both faces)
 
@@ -675,7 +700,8 @@ the arm where the two differ. Conclusions:
    log lines after `slot launch_slot_ ... processing task` (the instrumented arm: 10 lines, with exactly
    one `hrx-logits-fp` line between the launch and the error — the faulty one). Every Face-A fault fires on
    the **first decoded token of a newly launched task**, i.e. in the first graph that consumes the state
-   handed over from that task's prefill.
+   handed over from that task's prefill. (§24 corrects this count: it pooled two harnesses, and on the 5
+   comparable detector-harness faults the locality is the same — 1-10 lines after a launch.)
 
 Unexplained, worth keeping: the single call 103549 in this arm reported `bytes=0` for all three names
 (`hash=14650fb0739d0383`, the FNV offset basis, i.e. an empty read); it is the only such call in 1091 and it

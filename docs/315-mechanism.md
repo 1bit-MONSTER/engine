@@ -2200,3 +2200,33 @@ queued run measures, and both residuals are narrower than "the read is unordered
 Both are tested by the paired `GRAPH_SYNC` run. If its fix cell is clean, the mechanism is one of these two and the
 remedy is a scoped sync; if it faults at the control cell's rate, the visibility/ordering family is closed for this
 fault and the fault is *computed* - which is the case the ordered locator (`315-fp2`) is gated to open.
+
+## 57. Pre-committed reading of the paired `GRAPH_SYNC` run (`315gsync2`), written before its result
+
+The run is queued: control cell `~/wt/315instr3-build/bin`, fix cell `~/wt/315gsync-on-bin` (the same binary
+behind a launcher that exports `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1`), arms alternating (`CONTROL_EVERY=1`) inside one
+composition, `REGIME_LO=85` so the arms project into 101-106 GiB, and both cells carrying the same inducer
+(`GGML_HRX_TENSOR_FP=tail:16 NANONLY=1`) so a difference is visible in a handful of arms. Verdicts come from the
+guard and the detector's completion accounting, never from the fingerprint.
+
+**What my own source reading predicts, stated now so the result cannot be read post hoc.** Sections 55 and 56
+established that the wait path ends in `hsa_signal_wait_scacquire` and that the waited timepoint covers the last
+submission, so *cross-submission* ordering is already there. `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC` adds one
+`hrx_stream_synchronize` per replay, i.e. it serialises *submissions* - it does **not** order packets *inside* one
+submission, which is where section 54's unbarriered 15 % (92 of 612 dispatches) lives. So the prediction is:
+
+* **fix cell faults at roughly the control cell's rate** - the expected result. It closes the visibility/ordering
+  family for this fault (the acquire, the timepoint and a belt-and-braces per-replay sync all present) and moves
+  the fault into the *computed* class, which is what the gated ordered locator was built for.
+* **fix cell clean while the control cell faults** - this is the result that would need care, because the knob has
+  no mechanism to fix an intra-submission ordering problem. If it appears, the honest reading is *not* "ordering is
+  the mechanism" but one of: (a) the sync's serialisation changes the inducer's timing enough to hide a fault the
+  instrument itself creates, or (b) a producer genuinely is not on the waited stream (§56's second residual) and
+  the extra sync catches it. Distinguishing (a) from (b) needs a control with an equivalent-cost no-op sync, which
+  is not in this run - so a clean fix cell would be recorded as *a lead that needs that control*, not as a verdict.
+* **both cells clean** - the inducer failed to induce; the run is uninformative and is reported as such rather than
+  as evidence that either cell is fixed.
+
+This pre-commitment is the reason the run is the decisive experiment for the ordering family rather than an
+open-ended comparison: the expected outcome closes a family rather than asserting a mechanism, and the
+unexpected one names the control it would need.

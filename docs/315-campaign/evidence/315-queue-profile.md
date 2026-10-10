@@ -73,3 +73,34 @@ complete lines, and the numbers agree across configurations.
 * The **read-path / ordering** family gains its quantitative setting (point 2): the window exists because 15 % of
   the program is unbarriered and the queue is saturated, not because of a block transition. This is the family
   the queued paired `GRAPH_SYNC` experiment tests (`315gsync2`).
+
+## Appendix: a harness observation found while the row probe ran (2026-10-10 11:05)
+
+At `gtt_start = 98 GiB` for every arm, the row probe's pair-4 arm was running while **pair 1's arm server was
+still alive**: `315row-arm-1l.scope` active, `llama-server … --port 19486`, up 15 minutes, after that arm had
+already been scored `OK` in the console. Card GTT read **113.5 GiB** against the fleet baseline + composition of
+~80 GiB - i.e. one leaked 17 GiB model server on top. Stopping the scope released 13 GiB (`113G -> 100G`) and left
+only the three neighbours and the running arm.
+
+```sh
+ssh strixhalo 'systemctl --user list-units --state=running "315row*" --no-legend'
+#  315row-arm-1l.scope   [systemd-run] … --port 19486 …      <- scored OK minutes earlier, still resident
+#  315row-arm-4l.scope   [systemd-run] … --port 19554 …      <- the arm actually running
+ssh strixhalo 'systemctl --user stop 315row-arm-1l.scope'; echo $(( $(cat /sys/class/drm/card*/device/mem_info_gtt_used)/1073741824 ))G
+# 100G
+```
+
+The teardown in `315-paired.sh` is `systemctl --user stop $TAG-arm-$pair$cell` followed by a loop of ~15 s waiting
+for the port to disappear; a *clean* arm's server can take longer than that to retire, and the runner then proceeds
+to the next arm with the previous one's ~17 GiB still resident. Two consequences worth carrying forward, neither of
+which invalidates the arms already recorded (each is labelled by its own `gtt_start`, and the gate is that label):
+
+* later arms in a long session start from a higher baseline than the composition intended, which is how a session
+  can drift out of the `[95, 110]` gate or into the detector's allocation-failure `INVALID` class even though its
+  composition was correct;
+* on a box with 120 GiB of GTT and a co-tenant, a 113 GiB reading is one leak away from the OOM that killed a
+  co-tenant service earlier the same day (see the row-probe notes), so a leaked arm is worth stopping rather than
+  tolerating - but only *between* arms, never during one.
+
+This is the same family as the "silent arm loss" trap already recorded in `KNOWN-ISSUES.md` (an abnormal arm death
+leaving an orphan holding the flock), with a second trigger: a *normal* arm whose teardown outlives the 15 s window.

@@ -688,7 +688,6 @@ GLM-4.7-Flash session (7 resident servers at the last check, GTT 102.8 GiB, 1-2 
 gate needs `gtt_start` in [95, 110] GiB after composing neighbours.
 
 ### What the next measurement costs, and one lead that could make it cheaper
-
 The pre-registered shape costs ~3.5-4.6 min per arm plus regime composition, and the fault rate is ~4%
 per arm, so a faulting arm with the fingerprint live is a few arms' worth of box time, not one. Acceptance
 (task-5) must keep the declared gate; **diagnosis does not** - it only needs a fault, and the fault is not
@@ -761,3 +760,78 @@ Not done, and why: the strixhalo box was held across both 2026-10-09 evening goa
 servers, GTT 103-111 GiB). The pre-registered regime needs `gtt_start` in [95, 110] GiB after composing
 neighbours, which cannot be reached while those hold the box, and the arm driver deliberately does not kill
 servers that are not ours. They were left alone.
+
+## 25. Research pass: what the fork already contains, and one instrument that does not measure what it claims
+
+Read-only work: no arm was run, and none of this needed the box.
+
+### The sentinel cannot support the inference drawn from it
+
+`GGML_HRX_SENTINEL`'s fill lives inside `hrx_buffer_init` — the 619520-byte host-visible branch of
+`ggml/src/ggml-hrx/ggml-hrx.cpp`. It runs once per buffer *allocation*, at load. In the faulting arm
+`315hunt2-p6l` there is exactly one `[hrx-sentinel] filled` line, at 0.44.216 s, and the fault lands at
+2.01.889 s after ~1087 tokens have written that same region. So `sentinel=0` at the fault only says that some
+earlier token overwrote the pattern: it cannot separate "the device never wrote this token" from "the device
+wrote it". Section 22 finding #2's clause "not one is our payload, so the write is present" over-reads it.
+
+The conclusion survives on a sounder basis. Sampler call 1086 (the previous token) was finite (`nan=0`,
+hash `f38cc8b5b54dbb8f`) and 1087 is `nan=154880`; and no constant NaN payload reproduces the fault's logits
+hash (FNV-1a over 154,880 copies of one payload is not `91a04b03818e7083`). A region still holding the
+previous token's logits would read `nan=0`; a region still holding the sentinel would read one constant
+payload. Both are excluded, so the faulting graph did write all 154,880 elements as NaN. Face A is a
+compute-side write; that half of section 22 stands, for a different reason than the one recorded.
+
+### What the fork already contains
+
+* **The masked-row leak in these kernels is a known, fixed family.** `e6187096b` (2026-10-02,
+  `1bit/hrx-fa-masked-v`) is titled "masked KV rows reach flash-attention P*V as V = +0 (identical requests
+  gave different logits)": P is not exactly zero in F16, so multiplying it by the V of a *masked* key made
+  the output depend on the sign and value of whatever an earlier request (or a rejected draft) had left past
+  the sequence end. The fix zeroes masked V rows per tile in both FA kernels and adds
+  `tests/test-hrx-fa-masked-v` (27 cases; masked K/V rewritten five ways must give bit-identical output, NMSE
+  against CPU <= 5e-4).
+* **That fix is already in the pin.** `e6187096b` is an ancestor of `e44c9d01a`, as are *both* #314 commits;
+  the pin's kernel carries the comment "Key tiles with every key visible read V directly, fully masked tiles
+  use a zero V fragment, and mixed tiles stage V with masked rows zeroed", and `tests/test-hrx-fa-masked-v.cpp`
+  is in the tree. The family's first instance is therefore closed in the revision we ran.
+* **#314's predicate rewrite is not a regression, on the source.** `%visibility_view` is LDS written by
+  subgroup 0 (`view.store %lane_mask, %visibility_view[%lane]`), published before a `kernel.barrier<workgroup>`
+  of the same scope, and the 16 new reads test the same predicate the vote used (`cmpf ogt, mask,
+  %negative_large`, cf. `%lane_key_visible`). "The predicate is wrong, so masked rows went unzeroed" is not
+  supported by reading it.
+* **The fork has a forward-only engine#315 change, and it is not the answer.** `fb4dff7bb`
+  (`engine-315/host-visible-coherence`, 2026-10-09 02:47) is "ggml-hrx: make host-visible buffers coherent
+  unconditionally" - 7 lines, `memory_type |= HRX_MEMORY_TYPE_HOST_COHERENT` - and the pin *is* its ancestor,
+  so it is forward-only. But section 13 already falsified coherence as a sufficient mechanism with its own
+  campaign, so this is not the fix to move to.
+* **Nothing post-pin on either remote fixes an FA, visibility or NaN defect.** The only other post-pin
+  `ggml-hrx` commit is `30d6d3b44` (loom-jit runtime globals). The fix for the remaining fault has to be
+  written, not found.
+
+### The mechanism that survives, and a discriminator that costs minutes
+
+The predicate that decides whether a tile's masked rows are zeroed is computed from **one mask value per
+key** (`%lane_mask` staged into `%visibility_view`, then `cmpf ogt` against `%negative_large`), while the
+accumulation it gates covers **several query rows** (`masked_score0..3` all add that same `%lane_mask`). Where
+the rows of a tile do not share one mask - the sequence end falling inside the tile, or any multi-row decode
+whose rows end at different keys - the predicate can be right for one row and wrong for the accumulating one,
+so a tile that is masked for that row is judged all-visible and read directly, which by the Oct 2 design does
+**not** zero masked rows. Those rows hold the previous request's data past the sequence end, so a finite
+stale row gives a small wrong contribution (Face B: wrong-but-finite text, HTTP 500) and a non-finite stale
+row gives `tiny_P * NaN = NaN` (Face A: all 154,880 logits NaN). Intermittent, history-dependent, and it
+lands on the first decode of a new task, because that is where the sequence end falls inside a tile.
+
+Stated as a hypothesis with two falsifiers: if `test-hrx-fa-masked-v` passes with masked K/V rewritten as
+`NaN`/`+inf`/`-inf` (not only `+0`/`-0`/`+x`/`-x`/random) *and* against a KV tail primed by a previous
+request, this route is dead; and section 24's outcome 3 still kills the whole FA direction if the faulting
+arm's `attn_inp_kq_mask` fingerprint is clean.
+
+What makes this worth running first is cost. The discriminator already exists - 27 kernel cases, seconds on
+the device - instead of 60 in-regime arms. It needs extending in exactly the two directions the hypothesis
+names: non-finite masked V rows, and decode-split cases with 2..15 query rows whose masks end at different
+keys. That is a test edit, not a campaign.
+
+If it holds, the fix is to stop letting the predicate decide whether rows are zeroed: re-land `cf4dfd801`'s
+constant predicates (`all_visible = false`, `any_visible = true`) as a fresh commit on the pin, which sends
+every tile down the staged path where masked rows are zeroed. Forward-only (the pin stays an ancestor), at the
+cost of the staging loop on every tile - the trade the #314 merge declined.

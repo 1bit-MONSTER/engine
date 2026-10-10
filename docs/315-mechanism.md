@@ -565,6 +565,11 @@ newly launched task, but the stage that manufactures it is still open.
 | driver + helper (pre-registered) | `~/wt/315-paired.sh`, `~/wt/315-regime.sh`, `~/wt/315-detector.py` |
 | arm logs | `~/wt/rt-det/<tag>-p<N><c|l>-GLM-4.7-Flash-Q4_K_M/` (note: glob must be `*-*l-*`, not `*-l-*`) |
 
+**Host note (cost one detour on 2026-10-09):** every `~/wt/...` path in the table above is on **strixhalo**
+(`ssh strixhalo`, 192.168.50.110), not on the host that holds this engine worktree (`ryzen`, where `~/wt`
+exists but holds none of the 315 artefacts). The engine worktree `~/wt315-prereg` is the one path that is
+local. Nothing was ever lost; the working set only looked missing from the wrong box.
+
 ## 23. The producer, at tensor resolution (2026-10-09, `315hunt2-p6l`)
 
 Arm `315hunt2-p6l` is the first faulting arm to carry the per-tensor fingerprint

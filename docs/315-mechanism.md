@@ -2104,3 +2104,30 @@ This is a *candidate*, and it is not untested: `GRAPH_SYNC`-style inhibition has
 its 6 arms fell below the gate, so it is one arm of evidence, not a falsification. The decisive run for it is the
 same knob with the composition fixed (`REGIME_LO=85`), which is queued: many in-regime arms, no other instrument.
 Zero faults there would make the read-path ordering the mechanism; an unchanged rate kills it.
+
+## 54. The queue profile already on the box: one block, 92 unbarriered dispatches, and no block-boundary reachability
+
+Full record: `evidence/315-queue-profile.md`. The profile is not new - `~/wt/hrxsys-prof-run.log`, 2026-10-05 -
+but it constrains two live leads and it is the engine's own profiler rather than rocprofv3, which is what task-3
+asked for as the cheaper substitute.
+
+```text
+def-GLM-4.7-Flash:   dispatches 612 barriers 519 no-barrier-dispatches 92 blocks 1 | span 15348 us busy 14288 us idle 1060 us; barrier gaps 1062 us over 519 (median 2.04 us); block-boundary gaps 0 us over 0; token period 15942 us
+b256k (256 KiB):     dispatches 612 barriers 519 no-barrier-dispatches 92 blocks 1 | ... block-boundary gaps 0 us over 0
+b512k (512 KiB):     dispatches 612 barriers 519 no-barrier-dispatches 92 blocks 1 | ... block-boundary gaps 0 us over 0
+```
+
+* **The block-split lead loses its premise.** GLM's decode program here is **one block** with zero block-boundary
+  gaps, at the default and at both alternate `HRX_AQL_BLOCK_SIZE` values. The "919 + 760 dispatches, two 128 KB
+  AQL blocks, 1,399 barriers per token" figure that section 32 and KNOWN-ISSUES have been carrying is not
+  reproduced; it is either a different workload (the detector's mixed-request arms) or wrong. With section 32's
+  asymmetry already retracted, this is the second independent reason to stop calling the block boundary the
+  leading candidate - and it is why `HRX_AQL_BLOCK_SIZE` moved neither the profile nor throughput
+  (pp/tg ratios 0.9965-1.0073).
+* **The read-path family gains its quantitative setting.** 92 of 612 dispatches (15 %) carry **no barrier**, and
+  the queue is saturated (`busy 14288 us` of `15348 us`, idle 1060 us). That is the window an unordered consumer
+  read needs, and it exists without any block transition. This is the family `315gsync2` tests with a paired
+  design.
+* **Caveat carried with the numbers:** `rt-gaps.py` crashed on empty input (`:72`) and the `auto` configuration
+  never reached the log, so three of four intended configurations are quoted. The three that are there agree
+  with each other line for line.

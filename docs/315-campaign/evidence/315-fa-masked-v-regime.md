@@ -1,3 +1,28 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!-- Copyright 2026 bong-water-water-bong
+     SPDX-License-Identifier: Apache-2.0
+
+     engine#315 evidence, stored as Markdown because the repository's CI requires a copyright notice on
+     every file and a raw .txt log cannot carry one. Verbatim output. -->
+
+## The extended masked-V kernel check, 40 cases, regime shapes
+
+```
 # engine#315 masked-V kernel check, run 2026-10-09T22:59:16-03:00 on strixhalo
 # fork branch engine-315/fa-masked-v-nonfinite (c2114574d, ec0175971) built on 26330cc20; ggml/src/ggml-hrx is identical to the pin e44c9d01a at the time of the run
 # cmd: IREE_HAL_AMDGPU_LIBHSA_PATH=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 LD_LIBRARY_PATH=/home/bcloud/wt/v315-build/bin ./bin/test-hrx-fa-masked-v
@@ -44,3 +69,4 @@ ok   case 38 q=15 visible=810 cells=2048 (loom_libs:ggml_flash_attention_decode_
 ok   case 39 q=16 visible=512 cells=2048 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 8.54e-06
 test-hrx-fa-masked-v: 40 cases passed
 # exit=0
+```

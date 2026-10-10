@@ -1,3 +1,28 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!-- Copyright 2026 bong-water-water-bong
+     SPDX-License-Identifier: Apache-2.0
+
+     engine#315 evidence, stored as Markdown because the repository's CI requires a copyright notice on
+     every file and a raw .txt log cannot carry one. Verbatim output. -->
+
+## The cheap probe: align=256 + compaction
+
+```
 # engine#315: cheap reproducer for the wrong-output class at the pin (no GLM, no regime, no neighbours)
 # strixhalo, 2026-10-09 23:06-23:15. Model Qwen3-0.6B-Q4_K_M on HRX0, -fa on, -c 4096, greedy, seed 1,
 # cache_prompt=false, 180 identical requests per configuration, in ONE server process.
@@ -35,3 +60,4 @@ the other way round. Divergence begins at the first decoded token (token 0 has 2
 hashes, i.e. it is already wrong for some requests) and compounds, which is the locality
 engine#315 records for its own faults. All sampled logits stay finite (nan=0), so this shape
 is Face B, not Face A.
+```

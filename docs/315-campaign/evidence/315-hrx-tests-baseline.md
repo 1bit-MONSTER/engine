@@ -1,3 +1,28 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!-- Copyright 2026 bong-water-water-bong
+     SPDX-License-Identifier: Apache-2.0
+
+     engine#315 evidence, stored as Markdown because the repository's CI requires a copyright notice on
+     every file and a raw .txt log cannot carry one. Verbatim output. -->
+
+## The HRX test suite at the pin's kernel
+
+```
 # engine#315: the HRX test suite at the pin's kernel - full baseline, 9 runnable tests, all green
 # run 2026-10-09T22:55-03:00 on strixhalo, build dir ~/wt/v315-build (fork at 26330cc20; ggml/src/ggml-hrx identical to the pin e44c9d01a)
 # env: IREE_HAL_AMDGPU_LIBHSA_PATH=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 LD_LIBRARY_PATH=<build>/bin
@@ -172,3 +197,4 @@ n=4096  rows=3     rep 3: max rel error 0.00e+00 ok
 test-hrx-hadamard: PASS
 dispatch: loom_libs:ggml_get_rows_f32
 test-hrx-mxfp4: 7 rows x 256 values bit-exact (448 values with a subnormal scale flushed to zero)
+```

@@ -844,7 +844,7 @@ pre-registered before it ran.
 **What ran.** The fork's own `tests/test-hrx-fa-masked-v`, extended two ways - non-finite masked V rows
 (section 25) and regime-shaped cases - on the fork branch `engine-315/fa-masked-v-nonfinite`
 (`c2114574d`, `ec0175971`) built on `26330cc20`, with `ggml/src/ggml-hrx/` byte-identical to the pin
-`e44c9d01a` at that moment. Evidence: `315-campaign/evidence/315-fa-masked-v-regime.txt`.
+`e44c9d01a` at that moment. Evidence: `315-campaign/evidence/315-fa-masked-v-regime.md`.
 
 The environment is part of the result: without `IREE_HAL_AMDGPU_LIBHSA_PATH` the HRX device does not
 register at all and the test prints `no HRX0 device, skipped` - the same trap the regime script's own
@@ -878,7 +878,7 @@ while the box looks full; only arm-level work needs the regime, and it is the on
 ## 27. Kernel-level tests are exhausted, and all of them pass
 
 With section 26 the kernel routes are closed, so the whole HRX test suite was run at the pin's kernel on the
-same cheap footing (evidence and command: `315-campaign/evidence/315-hrx-tests-baseline.txt`):
+same cheap footing (evidence and command: `315-campaign/evidence/315-hrx-tests-baseline.md`):
 
 | test | result |
 |---|---|
@@ -923,7 +923,7 @@ That fix is in the pin. Its repro recipe was not tried again until now.
 Recipe: the study's own stress knob plus forced queue evictions, on a model small enough that no regime is
 needed. `GGML_HRX_FA_PARTIAL_ALIGN=256`, `-fa on`, Qwen3-0.6B on HRX0, 180 identical greedy requests in one
 server process, with `sudo -n tee /proc/sys/vm/compact_memory` looping in the background. Harness:
-`315-campaign/315-cheap-probe.sh`; evidence: `315-campaign/evidence/315-cheap-repro.txt`.
+`315-campaign/315-cheap-probe.sh`; evidence: `315-campaign/evidence/315-cheap-repro.md`.
 
 | configuration | runs | outcome |
 |---|---|---|

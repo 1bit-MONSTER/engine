@@ -2258,3 +2258,31 @@ fix cell is clean (`fixok >= 3 && fixf == 0`) and otherwise *proceeds* - so with
 `OOR` arms it proceeded, built, and started arms at the wrong target. A gate that reads another run's console must
 also refuse to proceed when that console has **no in-regime scored arms at all**; "the branch I do not need" and
 "no data yet" are different states, and only the first justifies starting work.
+
+## 59. fp2: the ordered fingerprint does not inhibit the fault, and the arena's last writer closes the by-name locator
+
+Full record: `evidence/315-fp2-ordered-fingerprint.md`. Two results, both decisive for different questions.
+
+**1. Ordering the reads changes nothing.** `315fp2` (sync before every fingerprint read, anchored names, same
+composition, same day): `pair 1 c OK, pair 1 l OK, pair 2 l FAULT nan=1 req=19, pair 3 l OK, pair 4 l OK` - all at
+`gtt_start=98G`. That is **1 fault in 5 in-regime arms with the sync against 2 in 5 without it** (`315row`:
+Fisher exact p = 1.000). Read together with sections 55-56 (the consumer's own path ends in
+`hsa_signal_wait_scacquire` and the waited timepoint covers the last submission), the visibility/ordering family is
+**closed for the production fault**: it is not an artefact of when a reader looks.
+
+**2. A by-name locator cannot work even with ordered reads.** In the faulting arm, the first two NaN-bearing
+tensors in node order are `ffn_out-0` (`nan=7048 of 1048576`) and `l_out-0` (`nan=4963 of 1048576`) - a **T=512
+prefill**, and an arithmetic impossibility, because `l_out = ffn_out + attn_out` requires `l_out`'s NaN set to
+contain `ffn_out`'s. The explanation that fits is that these are **transient arena slots the graph has since
+reused**, so a post-graph read by name returns the *last writer's* bytes, not the named tensor's.
+
+This is the second and independent reason the by-name instrument cannot name the producer (the first was section
+53's unsynchronised read of a host-visible arena), and it is why task-2's "producing graph `value` named" is not
+obtainable by this route at all - which is what that contract's hard-negative branch exists for.
+
+What survives from the arm is the coarse shape, from the non-transient tail: the corruption is already present at
+**layer 0**, in the layer-0 FFN or its input (layer 0's attention output is not instrumented), and it cascades to a
+completely NaN residual stream by layer 1 (`l_out-1 nan=1048576 of 1048576`), whole-batch across all 512 rows.
+
+Also recorded: this build's ids diagnostic is **mis-specified** (`oor` against `ne0`, which for the top-k *view* is
+`k`, not the expert count), so ~all of its 253 000 lines are flagged and none of its output is used anywhere.

@@ -1267,3 +1267,36 @@ What is left of the lead, stated as questions rather than a story:
 
 The AQL-block lead is therefore **open, not established**, and it is no longer the leading candidate on the
 strength of the asymmetry - that reason is gone.
+
+## 33. Static audit of the kernel family: no GLM-relevant unfenced global handoff
+
+With the FA masked-row route dead (section 26), all kernels passing (section 27) and the AQL asymmetry cleared
+(section 32), the remaining kernel-side possibility was the #123/#140 class itself: a producer wave writing
+**global** memory that a consumer wave inside the *same dispatch* reads back, fenced only at LDS scope. That is
+invisible to the host-side dependency recorder, so a static audit is the right instrument for it.
+
+Method (`/tmp/scan_global_handoffs.py`, results below): for every `loom-libs/ops/*.loom`, resolve each
+`buffer.view`/`buffer.assume.alignment` chain to its root buffer, find root buffers that are both stored *and*
+loaded inside the file, and report each one next to the kernel's `barrier<global>` count.
+
+Result, abbreviated to the handoffs that matter:
+
+| kernel | handoff buffers | `barrier<global>` | reading |
+|---|---|---|---|
+| `flash_attention_decode_split_f32_f16_wmma` | `partial_max/sum`, `counter_scratch`, `visibility_stage`, ... | **13** | fenced - this is where #140's fix lives |
+| `mul_mat_symmetric_i4_wmma` | `partial_na`, `scratch`, `output_na` | **18** | fenced |
+| `rmsnorm_binary_f32` | `scratch` | **1** | fenced |
+| `mul_mat_q6_k_packed_f16_wmma` | `partial_values_noalias`, `partial_ids_noalias` | 0 | **different dispatches**: one launch stores them (837/838), a second launch loads them (881/882), so the ordering belongs to the host-side recorder, not to a kernel fence |
+| `mul_mat_id_swiglu_f32_f32_wmma`, `moe_routing_tables`, `mul_mat_q5_k_q8_plane`, `small_rows_f32`, `attention_sink_f32`, `hadamard_f32` | `*_stage`, `%scratch`, `%data`, `%route_stage` | 0 | LDS by the `_stage` convention, or scratch used within one wave |
+
+So there is **no GLM-relevant kernel with an intra-dispatch global handoff and no global fence**: the three
+kernels that do hand work across waves through global memory are exactly the three that carry `barrier<global>`,
+and the quantized-matmul partials that look alarming at first glance turn out to be a two-dispatch reduction
+whose ordering the host side owns.
+
+Limits of this audit, stated so it is not over-read: the LDS/global split is inferred from naming (`_stage`, and
+`_noalias`/`_na` for parameters) plus the template parameter lists, not from the memory space itself, so a few
+rows (`%scratch`, `%data`, `%q_shared`/`%s_shared`, `%expert_table`) are "unclassified" rather than proven LDS;
+the audit covers intra-dispatch handoffs only, by construction; and it is static - it says nothing about whether
+the host-side recorder actually records every producer/consumer pair it should, which is the one ordering
+question still standing after section 32.

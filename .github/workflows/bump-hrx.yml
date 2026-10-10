@@ -298,7 +298,10 @@ jobs:
           Our commits, rebased onto AMD's pin:
           ${PATCHES}
 
-          CI here builds without HRX. Before merging, on Strix Halo (and \`test-backend-ops -b HRX0\`):
+          CI here builds without HRX. Before merging, on Strix Halo run the long-prompt correctness
+          probe and \`test-backend-ops -b HRX0\`; record the exact validated hrx-system pin in
+          \`config/hrx-long-prompt-validated-pin.config\`:
+          \`python3 tests/hrx_long_prompt.py\`
           \`cmake -B build -G Ninja -DONEBIT_HRX=ON && cmake --build build --target onebit && for d in hrx cpu; do tests/serve_e2e.sh build/1bit <Qwen3-0.6B Q4_K_M .gguf> \$d; done\`"
 
       # This workflow failed on EVERY scheduled run from 2026-10-01 to 2026-10-05 and nobody

@@ -1970,3 +1970,35 @@ The lever this hands task-4 is the one section 32 already named: `HRX_AQL_BLOCK_
 which dispatches land at a block boundary, so a per-token fault that tracks the block size is evidence for the
 ordering family and one that does not is evidence against it. The peer session is running the same dose-response
 (recorded in section 55's terms), and any statement must account for that overlap rather than pool with it.
+
+## 50. The first in-regime fault captured by name: the corruption is in the routing tensors, and it is whole-batch
+
+`315row-p1c`, 2026-10-10, `gtt_start 98G`, driver verdict `FAULT nan=1`, guard line
+`count=154880 of 154880 … contiguous=yes`. Full verbatim record:
+`evidence/315-row-p1c-inregime-mechanism.md`. The four things that change the picture:
+
+1. **The MoE routing tensors carry NaN, not just the aggregation.** `ffn_moe_weights-4` (the
+   `ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` route-weight gather, 40 values = 4 routes x 10 tokens) has 8 NaN
+   with `first=32` - tokens 8 and 9, all four routes - while its **source** `ffn_moe_probs-4` has none. A gather
+   that is NaN where its source is finite is either reading out of range (a bad id) or not writing.
+2. **It is not one row here.** `l_out-4` is `nan=20480 of 20480` - all ten tokens' hidden rows - and
+   `ffn_moe_up-4` is `nan=61440 of 61440` (all 40 route rows). This is the prefill of a *short* prompt (T=10),
+   and it is entirely NaN by the end of layer 4.
+3. **It is one instant.** Three graph calls out of ~159 000 produced fingerprint lines, and they are consecutive
+   (layer 4, layer 41, the output). The same graphs had run thousands of times clean.
+4. **Two probe defects, recorded not quietly fixed.** The filter is `std::strstr(want, node->name)`, so the list
+   entry `ffn_moe_weights-41` also matches `ffn_moe_weights-4`: the arm covered layers 4 and 41 only. And
+   `ffn_moe_topk` (the ids) is not in the list, nor would it be readable - the instrument reads every tensor as
+   `f32`. The hypothesis this arm most directly suggests, a corrupt or out-of-range route id, is still untested.
+
+**Tension with section 47, stated rather than smoothed over.** Section 47's invariant (exactly one `n_embd` row
+of 2048 NaN, 15 of 16 arms) was measured with a different instrument - a `tail:16` window over the last 16 graph
+nodes - in a different session, on prefills of T = 87…342. This arm is a T = 10 prefill measured by name, and it
+is whole-batch. Both cannot be quoted as "the fault's shape" at once. Until the same instrument is run over the
+same arms, the safe statement is the narrower one: **the corruption involves the MoE routing tensors, and the
+row extent is instrument-dependent**.
+
+**Next measurement, in order.** (1) The anchored-match fingerprint with `ffn_moe_topk` and `ffn_moe_logits`
+added, printing ids as integers - it answers "is the id bad" directly. (2) The finite-subset hash, to settle
+whether the identical `weights` hashes at layers 4 and 41 are an aliased read or a coincidence. (3) Only then a
+rate question, which needs the campaign and the box.

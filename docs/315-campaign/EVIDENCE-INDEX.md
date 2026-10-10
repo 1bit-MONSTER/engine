@@ -88,3 +88,21 @@ October FA race, the `exact_output` access defect. Section 29 is the consolidate
 
 `~/wt/rt-det/<tag>-p<N><c|l>-GLM-4.7-Flash-Q4_K_M/` on strixhalo (server.log, detector.json, run.log).
 Note the glob must be `*-*l-*`, not `*-l-*`. Campaign arms would be `315fix-*`; none exist yet.
+
+## Verification of this index (2026-10-10)
+
+Every number quoted across these evidence files is re-checked from the box by one command:
+
+```sh
+bash docs/315-campaign/tools/verify-evidence.sh     # 30 checks, all PASS; ~25 s per check
+# ----- PASS=30 FAIL=0
+```
+
+It covers: the five in-regime arms and their verdicts, the guard line, the faulting arm's fingerprint lines and
+their hashes, the two host-visible allocations from the buffer trace, the coherent-cell trace, the archived
+overshoot console, the one-file differential (`102 insertions, 2 deletions`) and the empty routed-FFN diff, the
+`route_stride` counts in both trees, the queue profile's dispatch/barrier/block numbers, the `scacquire` wait
+variant, the timepoint assignment, the three instrument patches, the wrapper directory, and the two kernel facts
+(ids clamped in the gather, ordered compares in the rank sort). Two checks needed their *expected* regex fixed
+when the suite was first written - the underlying numbers were right, the assertions were not - and the clean run
+above is with the fixed assertions.

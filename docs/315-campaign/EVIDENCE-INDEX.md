@@ -73,7 +73,10 @@ October FA race, the `exact_output` access defect. Section 29 is the consolidate
 | face landscape | (post-hoc parse of the arm logs) | `evidence/315-face-landscape.md` |
 | acceptance tooling | `315-campaign.sh`, `315-paired.sh`, `315-detector.py`, `315-analyse.py` | frozen; four freeze notes in `315-preregistration.md` section 8 |
 | acceptance rule self-test | `tools/test-analyse.py` | 10/10 cases pass (gate edges, Face-B-as-fault, rate over in-regime arms rather than clean arms) |
-| attribution + chain probes | `315-attrib.sh`, `315-chain.sh` | diagnostic only, never acceptance-eligible |
+| attribution + chain probes | `315-attrib.sh`, `315-chain.sh`, `315-chain2.sh` | diagnostic only, never acceptance-eligible. `315-chain.sh` ran: pair 1 faulted both cells with a 60-name fingerprint and **zero** NaN lines, which is the direct Face-B measurement; `315-chain2.sh` is staged for the input-side case |
+| visibility falsifier | `315-graphsync.sh` | queued: `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1` (a stream sync after every replay), no other instrument |
+| row probe | `315-rowprobe.sh` | queued: builds the extended fingerprint (`ne0=`/`first=`/`row=`) into a new dir and reads the per-token MoE chain (section 47) |
+| Face-B probe (not run) | `315-faceb.sh` | written then dropped in favour of the visibility falsifier; its question is answered by the chain probe's zero-NaN result |
 
 ## Arms and logs
 

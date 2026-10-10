@@ -36,12 +36,18 @@ CBIN=${CBIN:-$HOME/wt/315instr3-build/bin}   # stock: implements none of the ins
 FBIN=${FBIN:-$HOME/wt/315fp-build/bin}       # carries SENTINEL / COPY_PROBE / TENSOR_FP
 D=/home/bcloud/wt
 
-exec 9>"$HOME/.cache/lax-decode/box.lock"
-if flock -w "${LOCK_WAIT:-3600}" 9; then
-  echo "attrib: box lock held $(date -Is)"
+# NOLOCK=1 means a caller already holds the lock on an inherited fd 9 (see 315-chain.sh). Taking it again
+# here would open a second file description in the same process and deadlock against our own lock.
+if [ -z "${NOLOCK:-}" ]; then
+  exec 9>"$HOME/.cache/lax-decode/box.lock"
+  if flock -w "${LOCK_WAIT:-3600}" 9; then
+    echo "attrib: box lock held $(date -Is)"
+  else
+    echo "attrib: box lock unobtainable after ${LOCK_WAIT:-3600}s - aborting rather than running concurrently"
+    exit 3
+  fi
 else
-  echo "attrib: box lock unobtainable after ${LOCK_WAIT:-3600}s - aborting rather than running concurrently"
-  exit 3
+  echo "attrib: NOLOCK=1 - inheriting the caller's fd 9 lock"
 fi
 
 echo "=== attrib session tag=$TAG pairs=$PAIRS control_every=$CE $(date -Is) ==="

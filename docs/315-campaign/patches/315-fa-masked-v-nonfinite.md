@@ -37,6 +37,23 @@ consumes masked V rows produces NaN/inf in the output instead of an ulp. Masked 
 left finite: the masked score is `raw + mask` with `mask = -inf`, and `-inf + NaN` is NaN, so a NaN
 masked K row poisons even a correct kernel.
 
+Two details make the detector airtight rather than merely plausible:
+
+1. **The rewritten rows are masked for *every* query row.** The loop starts at
+   `kv_row * c.visible`, and the case's causal mask puts row `r` at position `visible - queries + r`, so
+   every `cell >= visible` satisfies `cell > position` for every row and is masked out for all of them.
+   There is therefore no legitimate path by which one row's contribution could need those V values -
+   the "a key masked for one row but visible for another" case, where `0 * NaN` would be a correct
+   result, cannot arise here.
+2. **Those rows are already proven reachable.** The suite's own history records the finite variants
+   failing 5 of 27 cases before `e6187096b`, on these same rows: the rows past the sequence end demonstrably
+   reach the V path. The non-finite variants only make an existing sensitivity louder, they do not
+   create a new one.
+
+The prefill kernel's rule is worth watching separately here: it zeroes keys that no row of the tile gives
+any probability, which is the same set, so its expectation is identical - but a residual hole there would
+show up as non-finite output only in the prefill cases (`q >= 16`).
+
 Expected outcomes, pre-registered:
 
 | outcome | reading |

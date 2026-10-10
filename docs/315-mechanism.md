@@ -608,6 +608,15 @@ sits between the task launch and the fault.
 
 Status: the fault is localised to one graph, one token, at a prefill→decode boundary — with the head and the
 sentinel eliminated as explanations. The next measurement is to fingerprint that first-decode graph's own
-inputs. Not done: the strixhalo box was held by a foreign `repro336` GLM-4.7-Flash session
-(`~/repro336/build/bin/llama-server`, GTT 111 GiB) so the 98 GiB regime gate could not be composed; those
-servers are not ours and were left alone.
+inputs, i.e. the nodes ahead of the final norm. The instrument for it is written but **not built**:
+`GGML_HRX_TENSOR_FP=tail:<N>` selects nodes by position (so no tensor name has to be guessed) and
+`GGML_HRX_TENSOR_FP_NANONLY=1` keeps only the NaN-bearing lines, and each line now carries `op=` too. See
+`315-campaign/patches/315-nan-dump.md` and `315-campaign/tools/gen-nan-dump.py`; it applies cleanly to
+`~/wt/llama-315copy`. It is deliberately not built yet, because building it into `315fp-build` would replace
+the binary that produced the evidence above.
+
+Not done, and why: the strixhalo box was held across both 2026-10-09 evening goal turns by a foreign
+`repro336` GLM-4.7-Flash session (`~/repro336/build/bin/llama-server`, ports 20101-20103 and 19656; 4 resident
+servers, GTT 103-111 GiB). The pre-registered regime needs `gtt_start` in [95, 110] GiB after composing
+neighbours, which cannot be reached while those hold the box, and the arm driver deliberately does not kill
+servers that are not ours. They were left alone.

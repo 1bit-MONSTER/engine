@@ -1363,3 +1363,45 @@ Two cautions this adds to the artifact set:
 does not race now, and no shape I can construct does. What remains is not a kernel property - it is the regime
 itself (real memory pressure and the preemptions it causes) or the full GLM graph, which is exactly what the
 in-regime arms exercise and what standalone harnesses cannot reproduce by construction.
+
+## 35. The transient-reuse guard: the last live code candidate, and what would settle it
+
+The pin contains `ggml/src/ggml-hrx/dispatch/transient-reuse-guard.{h,cpp}` and it is **on by default**. Its own
+header explains the design: the stock packer hands a freed arena range to the next value that fits, "often the
+value written by the very next command", which the recorder turns into a write-after-read dependency and an
+execution barrier. The guard reuses a freed range "only for a value whose first command already depends, through
+the program's own data dependencies, on every command that used the range before" - that is, it deliberately
+**suppresses** the ordering that would otherwise keep a reader away from a range still in use.
+
+That makes it the last live code candidate, for the right reasons: it is recent (present in the Oct 5 baseline,
+absent from the older `loom-kvnan-h336src`), default-on, it removes ordering, and a wrong suppression produces
+exactly the two faces - stale-but-finite bytes are wrong output (Face B), non-finite bytes are NaN logits
+(Face A) - intermittently, with a preemption-sized window.
+
+**It is live in the faulting configuration, measured.** With `GGML_HRX_LOG_TRANSIENT_REUSE=1`, a 0.6B decode run
+logs:
+
+```
+ggml-hrx transient reuse: 312 commands, 478 values, arena 331776 bytes guarded, 331776 unguarded
+ggml-hrx transient reuse: 396 commands, 478 values, arena 421888 bytes guarded, 421888 unguarded
+ggml-hrx transient reuse: 368 commands, 506 values, arena 602112 bytes guarded, 194816 unguarded
+```
+
+So the guard is the packer that runs for decode programs; in the third program it *inflates* the arena threefold
+because it declines reuses the stock packer would take (its fallback thresholds are 16 MiB unguarded, or guarded
+> 2x unguarded + 8 MiB; neither trips at these sizes).
+
+**What already cuts against it:** the record's `GGML_HRX_TRANSIENT_REUSE=legacy` study - 15 arms, "0 NaN in 15
+control vs 1 in 14 legacy", then a 7-arm paired confirmation scored by completion with 0 NaN - says the fault
+appears with the stock packer too, so the guard is not necessary for it. That is weak evidence in both
+directions: n=14 at the recorded ~5% rate, and the study exercised the knob rather than the guard's dependency
+test.
+
+The discriminator is a matched A/B at one box state, both sides at >=60 arms, with
+`GGML_HRX_LOG_TRANSIENT_REUSE=1` to record which packer actually ran - i.e. a third cell in the task-5 campaign
+rather than a separate experiment. **I tried the cheap version today and it is inconclusive:** three runs of 180
+requests with the guard on at `align=256 + compaction` - the only configuration that has ever fired on this
+harness - gave 1 distinct output each, so the event did not fire at all; the three `legacy` runs then failed to
+launch because of my own quoting bug (`$EXTRA command` instead of `env $EXTRA command`). The event count is now
+**1 in 8** runs of the configuration that produced it. That is recorded rather than re-run until it fires,
+because comparing a rare event across six runs is not evidence either way.

@@ -1237,3 +1237,33 @@ overlap into a stale read.
 Explicitly **unverified**: I have not shown that the second block's packets are missing an ordering they need,
 only that the submission-level bookkeeping is attached to the first block alone. Recording it as the leading
 candidate rather than a finding is deliberate - the two steps above are what make it a mechanism or kill it.
+
+### Correction: step 1 kills the asymmetry I described
+
+I ran step 1, and the asymmetry is not real. The `packet_index_base` that reaches
+`..._write_command_buffer_block` is **not** a block ordinal: the only call site
+(`host_queue_command_buffer_block.c:879`) passes `profile_queue_device_prefix_packet_count`, which is
+`queue_device_event ? 1u : 0u` - a profiling prefix, 0 whenever profiling is off. The replay loop
+(`host_queue_command_buffer_replay.c:337/364`) submits **each block as its own submission** via
+`iree_hal_amdgpu_host_queue_submit_command_buffer_block`, which takes no packet-index argument at all.
+
+So `packet_index_base == 0` holds for every block, the first-packet conditions in `..._packet_has_barrier`
+(`logical_packet_index == 0` with a waiting submission or an inline acquire) and the `FINAL_PAYLOAD_PACKET` flag
+are evaluated **per block**, not once per program, and the "second block gets none of the submission-level
+machinery" reading was wrong. This is why it was labelled a candidate rather than a finding, and it is recorded
+as a wrong turn rather than deleted, because the next attempt should not spend the same hour on it.
+
+What is left of the lead, stated as questions rather than a story:
+
+* what sets `PACKET_FLAG_FINAL` on payload packets, and whether the first payload packet of a *second* block
+  ends up carrying a barrier bit (the flag named FINAL is set from `packet_index_base == 0`, which is 0 for every
+  block, so either every block's packets are barrier-bearing - which would serialize the queue and cannot be the
+  design - or the flag is consumed somewhere I have not read);
+* the replay loop consumes the wait resolution after the first block and submits the rest with an empty signal
+  list, so the second block's ordering against the *first* block rests entirely on packet barrier bits rather than
+  on the resolution;
+* and the 128 KB split point in GLM's stream is still unexamined: whether it happens to fall between a producer
+  and its consumer is an empirical question about that model's command stream, not a code property.
+
+The AQL-block lead is therefore **open, not established**, and it is no longer the leading candidate on the
+strength of the asymmetry - that reason is gone.

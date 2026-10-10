@@ -1726,3 +1726,29 @@ submit path. That is a plausible way to move a 5.4% window to 94% **without fabr
 the attribution session on the box is measuring. A rate that is high *under instrumentation* is therefore a
 reproducer rather than a disqualification, and the chain probe in section 40 can run on its own merits: no instrument
 can fake which node first carries a computed NaN.
+
+## 42. The structural relationship between the two faces, from all 142 recorded arms
+
+`docs/315-campaign/evidence/315-face-landscape.md` reads every arm log on the box and changes what a unifying
+mechanism has to look like.
+
+**The faces never co-occur: 23 Face-A arms, 7 Face-B arms, 0 arms with both, 108 fully clean.** Whatever the
+defect is, in 142 draws the two observables are mutually exclusive. Any claim that they are "the same event seen
+by two builds" has to survive that; the guard's own switch (`GGML_HRX_NAN_CONTINUE`) is one way to test it,
+which is what `315-faceb.sh` does.
+
+**Face A travels with finite nondeterminism, Face B does not.** `identical_distinct` is 1 in 135 arms and >1 in
+exactly 7 - and all 7 are Face-A arms. So a Face-A arm contains both NaN logits *and* different finite outputs
+for identical greedy requests, i.e. nondeterministic corruption rather than a wrong answer. The Face-B arms are
+not divergent, and their `idn=1` covers the 6-7 identical requests that completed before they aborted, so Face
+B's generation was consistent up to the failure.
+
+**Face B shows no dependence on the gate** (7/113 in-band vs 0/29 out; Fisher p ~ 0.3), and what it certainly
+is, is the server's own chat-template parse failing - "Content-only" is a parser name (`common/chat.cpp:812`).
+That makes Face B a *text*-level failure, and it makes the open question precise: was that text produced from
+NaN logits (in which case the two faces are one mechanism separated by the guard's abort-vs-continue choice), or
+from finite-but-corrupted generation (in which case Face B needs its own mechanism, downstream of the LM head)?
+
+One caveat is recorded with the landscape rather than quietly dropped: the single out-of-band Face-A event
+(`315nan-p20l`, gtt=44) happened *after* I SIGKILLed another arm's server in that session, so it is ambiguous and
+is not evidence that Face A occurs outside the regime.

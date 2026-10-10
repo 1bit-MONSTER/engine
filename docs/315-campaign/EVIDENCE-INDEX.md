@@ -47,6 +47,10 @@ limitations under the License.
 | GLM runs the **row-major MLA** layout, never the transposed-V transient | 38 | `dispatch-flash-attention.cpp` `prepare_flash_attention_value` |
 | GLM never dispatches `q6_k_token1_shortlist`, so section 37's defect is not its mechanism | 37 | `evidence/315-glm-dispatch-inventory.md` |
 | the pin is race-free at the October shape and at the regime's shapes (2250 + 2000 reps) | 34, 36 | `evidence/315-fa-race-pin-sweep.md` |
+| the two faces never co-occur (23 Face-A, 7 Face-B, 0 both, 108 clean of 142 arms) | 42 | `evidence/315-face-landscape.md` |
+| Face A travels with finite nondeterminism; Face B does not | 42 | the same file (`identical_distinct` distribution) |
+| neither instrument can fabricate NaN (copy probe only fprintfs; sentinel is size-gated to 619520) | 41 | `ggml-hrx.cpp:181-199, 380-391` in the fp build's tree |
+| the faulting frame is a T=1 decode whose final norm is all-NaN, the first NaN frame a prefill at block 41 | 40 | the `p10l` arm's `server.log` lines 1713-1868 |
 | the transient-reuse guard is default-on and is the packer that runs for decode programs | 35 | `GGML_HRX_LOG_TRANSIENT_REUSE=1` output quoted in section 35 |
 
 ## What is eliminated (with the cost it took)
@@ -65,6 +69,8 @@ October FA race, the `exact_output` access defect. Section 29 is the consolidate
 | FA race sweeps | `tools/fa-sweep.sh`, `tools/fa-variant-profile.py` | run (2250 + 2000 reps) |
 | MLA race harness | `tools/glm-mla-race.cpp` | compiled on strixhalo, **not run** (needs the GPU) |
 | cheap probe | `315-cheap-probe.sh` | run; one fault in eight runs at `align=256 + compaction` |
+| instrumented arm hunt | `315-paired.sh` + the §27 command | ran; record in `evidence/315-instrumented-arm-hunt.md` (17 fault / 1 clean, and a control arm that faulted) |
+| face landscape | (post-hoc parse of the arm logs) | `evidence/315-face-landscape.md` |
 | acceptance tooling | `315-campaign.sh`, `315-paired.sh`, `315-detector.py`, `315-analyse.py` | frozen; four freeze notes in `315-preregistration.md` section 8 |
 | acceptance rule self-test | `tools/test-analyse.py` | 10/10 cases pass (gate edges, Face-B-as-fault, rate over in-regime arms rather than clean arms) |
 | attribution + chain probes | `315-attrib.sh`, `315-chain.sh` | diagnostic only, never acceptance-eligible |

@@ -863,3 +863,18 @@ move instead of the 60-arm campaign.
 
 The engine pin itself is declared in `registry/architectures.json` (`"llama.cpp (hrx)"`), which is the line a
 forward-only pin move has to change for task-4/task-7.
+
+### Already checked, at zero box cost
+
+`/home/bcloud/tmp/bump-hrx/llama` on `ryzen` is a fork checkout at **the pin `e44c9d01a`**, and the build
+directories `~/wt/loom-dflash2-ownfile/build-hrx` and `~/wt/loom-gdn-multiseq/build-hrx` carry
+`compile_commands.json` entries for `tests/test-hrx-fa-masked-v.cpp`. That is the exact project compile
+command (local SDK `amdclang++`, `-Wall -Wextra -Wpedantic -Wcast-qual`, HRX include paths), so the patch can
+be type-checked on `ryzen` without touching strixhalo:
+
+* the patched file compiles clean - exit 0, **no output at all**, i.e. no warnings under those flags;
+* the check is real, not a no-op: appending a deliberate syntax error to the file makes the same command exit
+  1 with `error:` diagnostics, and restoring it returns to exit 0.
+
+So the only thing left for this discriminator that needs the box is *running* it, and running it needs RAM and
+CPU - not GTT, not the regime gate. Compile-level iteration costs no box time at all.

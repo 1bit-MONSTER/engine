@@ -56,6 +56,13 @@ if [ -f "$C" ]; then
   fixf=$(grep -c 'arm l: \(FAULT\|INVALID\)' "$C" || true)
   fixok=$(grep -c 'arm l: OK' "$C" || true)
   echo "fp2: gsync2 so far - fix cell OK=$fixok fault=$fixf"
+  # A gate reading another run's console must distinguish "the branch I do not need" from "no data yet":
+  # an empty or OOR-only console is the second state, and treating it as the first is what started this
+  # locator on 2026-10-10 against a console that had been archived (mechanism doc section 58).
+  if [ "${fixok:-0}" -eq 0 ] && [ "${fixf:-0}" -eq 0 ]; then
+    echo "fp2: ABORT - no scored fix-cell arms in $C yet; refusing to treat 'no data' as 'branch not needed'"
+    exit 0
+  fi
   if [ "${fixok:-0}" -ge 3 ] && [ "${fixf:-0}" -eq 0 ]; then
     echo "fp2: ABORT - gsync2's fix cell is clean; the ordering is the mechanism and this locator has no question left"
     exit 0

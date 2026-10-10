@@ -843,13 +843,23 @@ The patch is written, generated from the live tree and verified to apply:
 To run it once the box is free:
 
 1. `git apply -p1` that diff to a branch of the fork at the pin `e44c9d01a`;
-2. configure a **tests-ON** build against it - the study builds all set `LLAMA_BUILD_TESTS=OFF`, so there is no
-test binary anywhere yet. `v315-build` is the precedent for the flags (`LLAMA_BUILD_TESTS=ON`, `GGML_HRX=ON`,
-`HRX_SOURCE_DIR=~/wt/pin-fork-hrx/third_party/hrx-system`), but it points at `~/wt/llama-hybrid` (26330cc20),
-not at the pin, so it cannot be reused as-is;
-3. build the one target - `cmake --build <dir> --target test-hrx-fa-masked-v -j8` - and run
-`<dir>/bin/test-hrx-fa-masked-v`. Every case prints `masked-row variants differing N/8, non-finite outputs M`.
+2. build the one target in the **tests-ON build dir that already exists**, `~/wt/v315-build`
+   (`LLAMA_BUILD_TESTS=ON`), and run `<dir>/bin/test-hrx-fa-masked-v`. Every case prints
+   `masked-row variants differing N/8, non-finite outputs M`.
 
-Cost note: this is a link plus one translation unit on top of a full build of the backend, not a 60-arm
-campaign - but it does need enough free RAM to build, which the shared box did not have at the last check
-(1-7 GB free).
+Two facts make that cheap rather than a rebuild:
+
+* `ggml/src/ggml-hrx/` - the kernel, the test file and the whole backend directory - is **identical** between
+  `26330cc20` (the revision `v315-build` was configured against, `~/wt/llama-hybrid`) and the pin
+  `e44c9d01a`; `git diff --stat 26330cc20 e44c9d01a -- ggml/src/ggml-hrx/ tests/test-hrx-fa-masked-v.cpp` is
+  empty. So the library that build links against already is the pin's kernel, and the patch applies cleanly to
+  that tree as well.
+* the remaining work is one translation unit plus a link, not a campaign.
+
+The only resource it needs is RAM (1-7 GB free at the last check, on a box whose foreign session holds
+114 of 122 GB) and CPU - **not** GTT headroom, and not the regime gate. So it can run as soon as the shared
+box has a little memory spare, before the box is anywhere near empty, which is what makes it the right next
+move instead of the 60-arm campaign.
+
+The engine pin itself is declared in `registry/architectures.json` (`"llama.cpp (hrx)"`), which is the line a
+forward-only pin move has to change for task-4/task-7.

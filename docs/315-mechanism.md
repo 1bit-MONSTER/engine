@@ -1169,3 +1169,27 @@ the engine's own `ExternalProject` arguments (section 27 records the diagnostic 
 unbuilt because relinking there recompiles every TU that includes `backend-context.h`, and that CPU confounds a
 GTT-bound measurement) is the task-2 instrument. It is complementary to the nan-dump fingerprint built here: the
 fingerprint says which node goes NaN first, that one says which graph value produced the downloaded bytes.
+
+### Following the AQL-block lead, and where it stops
+
+Section 31 names the strongest untested lead: GLM is the only model whose decode splits into two 128 KB AQL
+command blocks. I traced it as far as the constant, then stopped before it became an internals expedition:
+
+* the block size is `IREE_HAL_AMDGPU_AQL_PROGRAM_DEFAULT_BLOCK_SIZE = 128 * 1024` in
+  `runtime/src/iree/hal/drivers/amdgpu/aql_program_builder.h` (hrx-system), described as "default usable bytes per
+  command-buffer block", with `IREE_HAL_AMDGPU_AQL_PROGRAM_MIN_BLOCK_SIZE = 256`;
+* a program is a *linked* chain (`iree_hal_amdgpu_aql_program_t` has `first_block`, `block_count`,
+  `max_block_aql_packet_count`, `max_block_kernarg_length`), and the builder has a flag whose comment is "the
+  current block has recorded its initial barrier packet count" - so barrier packets are counted inside the block
+  budget, which is the arithmetic that makes a barrier-heavy model (GLM: 1,399 per token) the one that
+  overflows;
+* **`iree_hal_amdgpu_aql_program_block_next` has only three callers: the definition, the profiler, and the
+  validator.** Nothing in the submission path walks blocks with it. So the boundary handling - where the blocks
+  are copied into the AQL ring and what ordering, if any, is established between them - lives in a function I have
+  not found yet, and that function is the next thing to read. The question to ask it is narrow: when a program
+  spans two blocks, does the second block's record inherit the first block's completion ordering, and what happens
+  to a global-memory producer/consumer pair that the split falls between?
+
+This is a lead with a named file and a named next question, not a finding. It is recorded here because it is
+directly testable against GLM's own shape and because it is the only structural difference on the record that is
+specific to the affected model.

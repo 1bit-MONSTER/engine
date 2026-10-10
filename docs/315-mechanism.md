@@ -1614,3 +1614,16 @@ k 576 / v 512 with 20 query heads and one latent KV head, then `reshape_4d(cur, 
 the same one-line `g++` against `~/wt/llama-315copy/ggml/include` and `~/wt/315fp-build/bin`. It has **not been
 run**: the in-regime instrumented arm hunt owns the box, and a second job would perturb exactly the queue and
 preemption conditions the regime gate depends on.
+
+**What the registration does with GLM's layout, for whoever runs it.** `dispatch-flash-attention.cpp`'s
+`prepare_flash_attention_value` decides between two V layouts: it transposes V into a
+`common.flash_attention.transposed_value` transient (dispatching `ggml_copy_transpose_f16`) only when V's rows are
+contiguous (`nb[1] == columns * 2`) **and** `query_token_count >= 256` and `key_value_token_count >= 512` and
+several extent/alignment conditions hold. MLA stores V with the QK head-size stride, so its rows are wider than
+`columns` and GLM **always keeps the row-major layout** - no transpose, no transient, the kernel takes the real row
+stride. The file also names the constraint that makes 576 legal: `576 = DeepSeek-V2/V3 / GLM-4.7-Flash MLA
+key_length; 592 is the LDS ceiling`. Two consequences for the probe: at the regime's shapes (`cells=2048`,
+`visible~810`, 1-190 query rows) GLM is on the row-major MLA path, and for single-token decode with a long KV the
+dispatcher moves to the *decode-split* kernel - whose MLA instantiation, like the row-major MLA branch itself, has
+never been exercised by any test in this investigation (my masked-V suite runs the non-MLA Hq16/Hkv8 shape, and the
+short-prompt dispatch inventory did not reach the KV threshold where the decode-split kernel engages).

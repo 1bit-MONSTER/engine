@@ -17,6 +17,20 @@ limitations under the License.
 
 # Known issues
 
+## engine#370 — intermittent MUL_MAT f32 m=1 n=1 k=2048 error on `common.mul_mat.f32_f32_decode`
+
+**Status: OPEN, root cause not fixed in this repository.** The kernel lives in the llama.cpp fork
+(`motifs/dequant.loom`, fork tip e44c9d01a4d5), which is not vendored here, so no engine-side change can fix it.
+
+**Affected:** `test-backend-ops -b HRX0 -o MUL_MAT`, case `MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048)`,
+kernel `common.mul_mat.f32_f32_decode`. Observed on strixhalo 2026-10-09 (hrx-system 98d05d94, performance mode):
+1 failure in 40 runs on the unmodified fork tip (ERR 0.0037); 1 failure in 28 full-suite runs at the quant stack
+tip (ERR 0.0102); 0 failures in 40 further MUL_MAT runs and 10/10 running the case alone.
+
+**Assessment:** pre-existing, not introduced by the quant PRs. The error magnitude and ~1-in-40 rate point to a
+race or an uninitialised read in the shared decode path rather than rounding. Fix belongs in the fork; bump the
+pin once it lands. Treat a single failure of this case as a flake, not a regression.
+
 ## engine#315 — intermittent all-NaN logits and format-500 on GLM-4.7-Flash under GTT pressure
 
 **Status: OPEN, accepted as a documented limitation.** The issue stays open until this criterion is met.

@@ -1655,3 +1655,50 @@ read as a second instrument-induced stage.
 
 Face B produced nothing in this run - 0 of 17 arms - so it is untouched by these instruments, and the cheap probe's
 Face-B-flavoured 95/180 (section 36) remains the only positive Face-B observation on the record.
+
+## 40. The frame that failed, the frame that first carried NaN, and the one-bit test between them
+
+Two facts from the faulting arm's own log (`p10l`), which replace the reading I wrote in section 39.
+
+**The graph that raised Face A is `call=51774`, and the fingerprint's last three lines are that graph, in order:**
+`norm` (RMS_NORM) -> `result_norm` (MUL, `bytes=8192` = 2048 f32, i.e. a **T=1 decode step**) with 2048 of 2048 NaN ->
+`result_output` (MUL_MAT, `bytes=619520` = 154880 logits) with 154880 of 154880 NaN -> two lines later, line 1868,
+`common_sampler_sample: HRX returned NaN logits: count=154880 of 154880`. So the visible fault is one decode token
+whose final norm is *entirely* NaN: the hidden state handed to it was already NaN.
+
+**The first NaN-bearing segment is `call=51764`, a prefill-shaped graph** (tensors of 1409024 bytes = 352256 f32 =
+~86-172 tokens at this model's 2048-wide rows), and its window covers **block 41's FFN and block 42's attention**:
+`ffn_shexp-41` (MUL_MAT, 2048), `ffn_swiglu-41` (GLU, 2048), `ffn_moe_out-41` (ADD, 1984), `ffn_out-41` and
+`l_out-41` (ADD, 1984), then `norm-42`, `q-42`/`q_nope-42`/`q_nope_perm-42` (5120/5056). Every earlier call's window
+was clean, so the corruption is *born* at block 41, not inherited from block 0. The model is also **not** 42 layers:
+`norm-42` is block 42's own norm and `q-42` its 20x512 MLA query, while the output norm is the unnumbered `norm`
+above. Block 41 of ~47 is where this frame starts.
+
+**Why the shape matters.** A prefill whose *sampled* row is clean can still carry a NaN row inside it - the prefill
+samples its last token, so a corrupted row elsewhere in the window costs nothing at that point. That row is written
+to its token's KV slot, and the next decode that attends to it hands the output norm an all-NaN hidden state. That is
+the timing the fault has shown all along (section 23: the first decoded token after `slot launch_slot_`), and it is a
+shape both faces can share, with Face B the milder version in which only part of a decode's logits go NaN and the
+sampler emits invalid UTF-8.
+
+**The chain, from the pin's own builder** (`src/models/deepseek.cpp:130-176`, GLM is the deepseek2 builder):
+
+    ffn_inp-<il>  = ADD(attn_out, inpSA)      <- the block's residual input
+    ffn_norm-<il> = RMS_NORM(ffn_inp)
+    ffn_moe_out-<il> = MoE(build_moe_ffn(ffn_norm))      ffn_shexp-<il> = shared expert(ffn_norm)
+    ffn_out-<il>  = ADD(ffn_moe_out, ffn_shexp)
+    l_out-<il>    = ADD(ffn_out, ffn_inp)
+
+so a name list settles causality in one arm: if `l_out-40`, `ffn_inp-41` and `ffn_norm-41` carry NaN, the block's
+input was already poisoned (its attention branch, or further back); if they are clean while `ffn_shexp-41`,
+`ffn_swiglu-41` and `ffn_moe_out-41` are not, the FFN branch fabricated it. `GGML_HRX_TENSOR_FP` accepts a
+comma-joined name substring list as well as `tail:<N>`, so this is an env change, not a rebuild:
+
+    GGML_HRX_TENSOR_FP=l_out-40,ffn_inp-41,ffn_norm-41,ffn_shexp-41,ffn_swiglu-41,ffn_moe_out-41,ffn_out-41,l_out-41,
+                       attn_norm-42,ffn_inp-42,ffn_norm-42
+
+**The caveat that must not be skipped.** Those counts are not row-aligned across tensors (2048 inside a tensor whose
+row is 1536; 1984 = 2048-64; 5056 = 5120-64), and 2048 floats = 8192 bytes is exactly the extent of the NaN payload
+the sentinel instrument writes. So "which node reads NaN" may be tracking where that payload was *read* rather than
+where the defect is born. That is the question the attribution session is on the box answering right now, and it is
+why the chain probe above is written down but not yet run.

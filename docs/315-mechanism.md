@@ -1752,3 +1752,23 @@ from finite-but-corrupted generation (in which case Face B needs its own mechani
 One caveat is recorded with the landscape rather than quietly dropped: the single out-of-band Face-A event
 (`315nan-p20l`, gtt=44) happened *after* I SIGKILLed another arm's server in that session, so it is ambiguous and
 is not evidence that Face A occurs outside the regime.
+
+## 43. Two constraints on the work that remains
+
+**Mechanics of a forward-only fix.** `tools/check_pins.py <base>` takes every submodule whose gitlink differs
+between `<base>` and HEAD and asks GitHub's compare API whether the new commit is *ahead* of the old one; a pin
+that is behind or has diverged fails. So the fork-side commit has to descend from the engine's current pin
+(`third_party/llama.cpp = e44c9d01a4d5110cecaf45472a717f46cd1abbf9`), not be rebased onto a different base - a
+fix prepared on top of main's shipped pin (`26330cc20`) would be rejected as sideways. The engine-side change is
+then the gitlink plus `registry/architectures.json`, and the CI baseline already recorded the gap that nothing
+ties that registry pin to the gitlink, so both have to be moved by hand and stay consistent.
+
+**The box budget does not fit the campaign.** The `315nan` session ran 06:08:04 to 09:37:17 for 22 arms (21
+scored plus the control), i.e. **9.5 minutes per arm**, dominated by loading GLM into the in-regime band and by
+the pre-registered 66-request workload. A 60-arm campaign is therefore ~9.5 hours of box time by itself. Roughly
+6 hours of the 12-hour budget are already spent and the two queued probes add ~2.3, which leaves ~3 - so the
+acceptance campaign cannot be run inside the declared budget even with the mechanism and the fix in hand. This is
+a constraint on the objective, not a finding about the defect, and it needs a decision from the user: extend the
+box budget, or accept that the campaign is delivered outside it. The per-arm cost is intrinsic to the registered
+workload (the 8x96-token identical block plus 50 mixed requests at GTT pressure), so shortening it would change
+the measurement rather than make acceptance harder, which the freeze rules forbid.

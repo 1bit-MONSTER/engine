@@ -1044,3 +1044,55 @@ be type-checked on `ryzen` without touching strixhalo:
 
 So the only thing left for this discriminator that needs the box is *running* it, and running it needs RAM and
 CPU - not GTT, not the regime gate. Compile-level iteration costs no box time at all.
+
+## 29. What the day eliminated, and what is left
+
+Consolidation, so the next reader (or auditor) does not have to reassemble it from eighteen sections. Every
+line below is a measurement or a read of the tree, not a preference.
+
+### Eliminated, with the cost it took
+
+| lever | status | evidence |
+|---|---|---|
+| host-visible coherence is the mechanism (the recorded task-3 story) | **falsified** | its own campaign, section 13; and section 21/22: the region *is* written |
+| the ordering fix is the mechanism | **falsified** | section 15, that fix failed the same test |
+| "the logits buffer is never written" | **falsified** | section 21; section 25 adds that the sentinel could not have decided it either way (it fills once per allocation) |
+| the FA kernels consume masked V rows, incl. #314's predicate rewrite | **falsified** | section 26: 40/40 cases on the device, both kernels, regime shapes, `non-finite outputs 0` |
+| any kernel's standalone logic | **falsified as a locus** | section 27: 9 runnable HRX tests pass, incl. decode-stride, moe-split, MUL_MAT_ID |
+| the #123/#140 global-fence class explains the cheap-path event | **not supported** | section 28: the kernel serving the decode at align=256 has no global-to-global handoff at all |
+| `kquant.mul_mat_add` fusion carries it | **falsified** | section 28: the event happened with it disabled |
+| arena knobs, transient reuse | falsified earlier | already on the record, per the objective |
+
+### What survives
+
+1. **Both faces fire on the first decoded token of a newly launched task.** 5 of 5 comparable detector-harness
+   faults sit 1-10 lines after a `slot launch_slot_`; the pooled set adds 13 more from the earlier harness with
+   the same locality (section 23). Face B's marker sits at the same boundary in 4 of its 7 arms.
+2. **Face A is a compute-side write.** The faulting graph wrote all 154,880 logits as NaN with varying
+   payloads, while the previous token was finite and no constant payload reproduces the hash (section 25).
+   The LM head is exonerated: its own input is already NaN (section 23).
+3. **The event needs preemption.** Compaction alone never did it; the one time it happened, the neighbouring
+   session was busy; a later attempt with our own `llama-bench` contention did not. So the window is real and
+   the trigger is not yet under our control (section 28, corrected).
+4. **The probe is cheap.** A minute, no GLM, no regime, no neighbours; kernel-level and compile-level work
+   needs almost no device memory and ran fine at 103 GiB of foreign GTT.
+
+### What remains, and what each needs
+
+* **An arm with the nan-dump instrument** (`GGML_HRX_TENSOR_FP=tail:<N>` + `NANONLY`, built and verified in
+  `315fp-build`) - names the first NaN-bearing node in a faulting graph. Needs the regime gate, so needs the
+  box all but empty. Command is in section 27.
+* **A trigger we control for the cheap path** - a fault rate of 1 in 5 runs is not a reproducer. The two
+  candidates left are a contention source that actually perturbs KFD queues (our own bench did not) and a
+  longer-KV shape closer to the arms.
+* **The fix (task-4) stays unwritten on purpose.** With the FA direction dead, the coherence branch falsified
+  and the fence class not applicable, there is nothing left that a minimal patch could be aimed at. Writing one
+  now would be guessing, which is what the objective forbids.
+
+### One conflict the user should see
+
+The task list has **task-3 complete** with the mechanism "host-visible non-coherent output region read directly
+with no ordering on the route". Sections 13, 21, 22 and 26 falsify that mechanism, and the later work did not
+replace it with an equally concrete alternative. Completed tasks are immutable under the goal's own rules, so
+this is not being edited here: it means tasks 4-7 would be validating a change aimed at a mechanism the record
+no longer supports, and the tree should probably be restructured (the user's call, via `/goal-tweak`).

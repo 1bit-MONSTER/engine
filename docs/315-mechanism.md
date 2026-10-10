@@ -1605,3 +1605,12 @@ tensors (k 576-wide, v 512-wide, `n_head` 20, one latent KV head, `cells`/`visib
 half of it is extending `test-hrx-fa-masked-v`'s `Case` constants to the MLA dims (head 256/512, Hq 20, Hkv 1),
 which would at least drag the MLA branch of `flash_attention_f32_f16_wmma` into a test that already exists and
 already checks masked-row insensitivity.
+
+**The harness is written and compiled, waiting for the GPU.** `/tmp/glm-mla-race.cpp` on strixhalo (also kept at
+`315-campaign/tools/glm-mla-race.cpp`) builds the MLA decode graph exactly as the fork does - `flash_attn_ext` on
+k 576 / v 512 with 20 query heads and one latent KV head, then `reshape_4d(cur, 512, 1, 20, T)` and
+`mul_mat(v_mla, cur)` - runs it `reps` times with identical inputs and reports every run that differs, grouped by
+`(token, head, 16-channel block)`. Usage: `glm-mla-race <T> <cells> <visible> <reps> [seed] [device]`, built with
+the same one-line `g++` against `~/wt/llama-315copy/ggml/include` and `~/wt/315fp-build/bin`. It has **not been
+run**: the in-regime instrumented arm hunt owns the box, and a second job would perturb exactly the queue and
+preemption conditions the regime gate depends on.

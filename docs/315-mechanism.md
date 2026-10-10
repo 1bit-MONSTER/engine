@@ -2002,3 +2002,33 @@ row extent is instrument-dependent**.
 added, printing ids as integers - it answers "is the id bad" directly. (2) The finite-subset hash, to settle
 whether the identical `weights` hashes at layers 4 and 41 are an aliased read or a coincidence. (3) Only then a
 rate question, which needs the campaign and the box.
+
+## 51. The id-producing kernel: a rank sort that stops being a bijection on NaN, with a clamping gather and an unchecked `assume`
+
+Full record: `evidence/315-id-producing-kernel.md`. `315row-p1c` put the fault on the route ids, so the three
+kernels that touch them were read. The result is a candidate site with a file:line and a falsifier.
+
+* `ffn_moe_topk` is a **view** over a full `[n_expert, n_tokens]` argsort (`src/llama-graph.cpp:1930-1935`), and
+  the producer `ggml_argsort_rows_f32` (`kernel-corpus/kernels/loom-libs/ops/small_rows_f32.loom:111`) computes
+  each element's **rank** by scanning its row with *ordered* comparisons (`cmpf ogt`/`olt`/`oeq`) plus an
+  index tie-break.
+* For finite inputs that is a total order, so the ranks are a bijection and every output slot is written. **For a
+  row containing two or more NaNs it is not**: all three ordered comparisons are false, so both elements take
+  the same rank - two stores to one slot and one slot in `[0, cols)` never written, left holding whatever the
+  buffer held before. Every other candidate in this issue leaves a *value* wrong; this one leaves an *index*
+  stale, which is precisely what the routed path consumes.
+* The two consumers disagree about that stale index. The gather **clamps** it
+  (`small_rows_f32.loom:157+`: negatives to 0, then `in_range` against the source row count), so it can only
+  copy *some* row of `probs`. The expert-table kernels **assert** instead - `%expert` in `[0,511]`,
+  `%route_tile_base` in `[0,2016]`, `%partition_row_count` in `[1,32]` are `index.assume` ranges, not checks -
+  so the same id is harmless in one path and unbounded in the other.
+* **Caveat recorded against my own arm.** "`ffn_moe_probs-4` was finite" came from the fingerprint's
+  `ggml_backend_tensor_get`, a host-visible non-coherent read with no ordering guarantee of its own; a stale
+  read would show the pre-softmax logits, which are finite. So the arm's `probs` line is not evidence that the
+  argsort's input was NaN-free, and section 50's deduction is weaker than it looked.
+
+**Next probe, therefore:** instrument `ffn_moe_argsort` and `ffn_moe_topk` as `i32` (the current probe reads
+every tensor as `f32`), anchored name matching, and per row print the first 8 ids, the count outside
+`[0, n_expert)`, and whether the row's ids repeat. Duplicate or out-of-range ids in a faulting arm makes this
+kernel the site; a clean permutation kills it and moves the fault into the table builders or the matmul's
+descriptor use.

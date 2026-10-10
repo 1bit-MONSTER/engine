@@ -24,7 +24,7 @@ echo "=== cheap probe tag=$TAG n=$N compact=$COMPACT $(date -Is) port=$PORT gtt=
 
 env LD_LIBRARY_PATH="$B" IREE_HAL_AMDGPU_LIBHSA_PATH="$HSA" \
     GGML_HRX_COPY_PROBE=1 GGML_HRX_LOGITS_FP=100000 \
-    GGML_HRX_TENSOR_FP=tail:16 GGML_HRX_TENSOR_FP_NANONLY=1 \
+    GGML_HRX_TENSOR_FP="${FP-tail:16}" ${FPONLY:+GGML_HRX_TENSOR_FP_NANONLY=1} \
     "$B/llama-server" -m "$HOME/models/Qwen3-0.6B-Q4_K_M.gguf" -dev HRX0 -ngl 99 -fa on \
     --host 127.0.0.1 --port "$PORT" -c "$CTX" -np 1 -t 8 >> "$SRV" 2>&1 &
 SP=$!
@@ -41,7 +41,14 @@ if [ "$COMPACT" = 1 ]; then
     CP=$!
 fi
 
-PROMPT="The capital of France is"
+# SHAPE: the arms' prompts ran up to ~868 tokens of KV; the default probe prompt is 6 tokens, so a
+# longer prompt is a different point in the shape space. LONG=<words> pads the prompt with a repeated
+# sentence (the same padding for every request, so greedy output stays comparable).
+if [ "${LONG:-0}" != "0" ]; then
+    PROMPT="$(python3 -c "print(' '.join(['The quick brown fox jumps over a lazy dog while engineers measure kernel launch gaps.'] * $(( ${LONG} / 12 + 1 ))))" | cut -c1-$(( ${LONG} * 5 ))) The capital of France is"
+else
+    PROMPT="The capital of France is"
+fi
 for i in $(seq 1 "$N"); do
     r=$(curl -s --max-time 120 "http://127.0.0.1:$PORT/completion" -H "Content-Type: application/json" \
         -d "{\"prompt\":\"$PROMPT\",\"n_predict\":24,\"temperature\":0,\"seed\":1,\"cache_prompt\":false,\"stream\":false}")

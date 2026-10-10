@@ -65,7 +65,9 @@ October FA race, the `exact_output` access defect. Section 29 is the consolidate
 | FA race sweeps | `tools/fa-sweep.sh`, `tools/fa-variant-profile.py` | run (2250 + 2000 reps) |
 | MLA race harness | `tools/glm-mla-race.cpp` | compiled on strixhalo, **not run** (needs the GPU) |
 | cheap probe | `315-cheap-probe.sh` | run; one fault in eight runs at `align=256 + compaction` |
-| acceptance tooling | `315-campaign.sh`, `315-paired.sh`, `315-detector.py` | frozen; four freeze notes in `315-preregistration.md` section 8 |
+| acceptance tooling | `315-campaign.sh`, `315-paired.sh`, `315-detector.py`, `315-analyse.py` | frozen; four freeze notes in `315-preregistration.md` section 8 |
+| acceptance rule self-test | `tools/test-analyse.py` | 10/10 cases pass (gate edges, Face-B-as-fault, rate over in-regime arms rather than clean arms) |
+| attribution + chain probes | `315-attrib.sh`, `315-chain.sh` | diagnostic only, never acceptance-eligible |
 
 ## Arms and logs
 

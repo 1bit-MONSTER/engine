@@ -1,0 +1,46 @@
+# engine#315 masked-V kernel check, run 2026-10-09T22:59:16-03:00 on strixhalo
+# fork branch engine-315/fa-masked-v-nonfinite (c2114574d, ec0175971) built on 26330cc20; ggml/src/ggml-hrx is identical to the pin e44c9d01a at the time of the run
+# cmd: IREE_HAL_AMDGPU_LIBHSA_PATH=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 LD_LIBRARY_PATH=/home/bcloud/wt/v315-build/bin ./bin/test-hrx-fa-masked-v
+# gtt in use during the run: 103 GiB (a foreign repro336 session held the box)
+ok   case 0 q=1 visible=6 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.6e-07
+ok   case 1 q=1 visible=70 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 2.57e-06
+ok   case 2 q=16 visible=30 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 9.57e-07
+ok   case 3 q=2 visible=13 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 5.57e-07
+ok   case 4 q=4 visible=81 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 2.26e-06
+ok   case 5 q=25 visible=43 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.2e-06
+ok   case 6 q=3 visible=20 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 7.19e-07
+ok   case 7 q=7 visible=92 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 2.26e-06
+ok   case 8 q=34 visible=56 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.38e-06
+ok   case 9 q=4 visible=27 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 8.64e-07
+ok   case 10 q=10 visible=103 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 2.6e-06
+ok   case 11 q=43 visible=69 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.51e-06
+ok   case 12 q=5 visible=34 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 9.74e-07
+ok   case 13 q=13 visible=114 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 2.84e-06
+ok   case 14 q=52 visible=82 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.81e-06
+ok   case 15 q=6 visible=41 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.39e-06
+ok   case 16 q=1 visible=125 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.16e-06
+ok   case 17 q=61 visible=95 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.94e-06
+ok   case 18 q=7 visible=48 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.32e-06
+ok   case 19 q=4 visible=136 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.37e-06
+ok   case 20 q=70 visible=108 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 8.03e-07
+ok   case 21 q=8 visible=55 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.53e-06
+ok   case 22 q=7 visible=147 cells=256 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.54e-06
+ok   case 23 q=79 visible=121 cells=256 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 8.18e-07
+ok   case 24 q=1 visible=150 cells=200 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.77e-06
+ok   case 25 q=24 visible=150 cells=200 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.3e-06
+ok   case 26 q=40 visible=40 cells=512 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 6.73e-07
+ok   case 27 q=1 visible=10 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 5.03e-07
+ok   case 28 q=1 visible=172 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 4.9e-06
+ok   case 29 q=1 visible=810 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 6.94e-06
+ok   case 30 q=1 visible=11 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 4.53e-07
+ok   case 31 q=1 visible=173 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.78e-06
+ok   case 32 q=1 visible=811 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 7.57e-06
+ok   case 33 q=1 visible=150 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 3.86e-06
+ok   case 34 q=1 visible=2047 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 9.89e-06
+ok   case 35 q=2 visible=810 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.38e-05
+ok   case 36 q=4 visible=868 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.4e-05
+ok   case 37 q=7 visible=512 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 9.61e-06
+ok   case 38 q=15 visible=810 cells=2048 (loom_libs:ggml_flash_attention_decode_split_f32_f16_wmma_next_q8): masked-row variants differing 0/8, non-finite outputs 0, nmse 1.23e-05
+ok   case 39 q=16 visible=512 cells=2048 (loom_libs:ggml_flash_attention_f32_f16_wmma): masked-row variants differing 0/8, non-finite outputs 0, nmse 8.54e-06
+test-hrx-fa-masked-v: 40 cases passed
+# exit=0

@@ -836,6 +836,45 @@ constant predicates (`all_visible = false`, `any_visible = true`) as a fresh com
 every tile down the staged path where masked rows are zeroed. Forward-only (the pin stays an ancestor), at the
 cost of the staging loop on every tile - the trade the #314 merge declined.
 
+## 26. The FA masked-row direction is falsified at the regime's shape (2026-10-09)
+
+This closes the direction sections 24 and 25 opened. It cost minutes, not a campaign, and it was
+pre-registered before it ran.
+
+**What ran.** The fork's own `tests/test-hrx-fa-masked-v`, extended two ways - non-finite masked V rows
+(section 25) and regime-shaped cases - on the fork branch `engine-315/fa-masked-v-nonfinite`
+(`c2114574d`, `ec0175971`) built on `26330cc20`, with `ggml/src/ggml-hrx/` byte-identical to the pin
+`e44c9d01a` at that moment. Evidence: `315-campaign/evidence/315-fa-masked-v-regime.txt`.
+
+The environment is part of the result: without `IREE_HAL_AMDGPU_LIBHSA_PATH` the HRX device does not
+register at all and the test prints `no HRX0 device, skipped` - the same trap the regime script's own
+comment records for the neighbours.
+
+**Result: 40 of 40 cases pass**, every one reporting `differing 0/8, non-finite outputs 0`, on both
+kernels (`ggml_flash_attention_decode_split_f32_f16_wmma_next_q8` and `ggml_flash_attention_f32_f16_wmma`),
+including the 13 added regime-shaped cases: `cells=2048` at `visible` 10, 11, 150, 172, 173, 810, 811, 2047
+and 512/810/868 with 2-15 query rows, plus the prefill boundary at 16 rows.
+
+**Reading, from the table pre-registered in `patches/315-fa-masked-v-nonfinite.md`:** "all cases pass,
+non-finite outputs 0 -> the decode-split and prefill kernels do not consume masked V rows in any of the
+covered shapes; the hypothesis is dead and the producer is elsewhere". So it is:
+
+* section 24's "#314's predicate rewrite reintroduced the Oct 2 masked-row leak" - falsified;
+* section 25's "the predicate is one mask value per key while the accumulation covers several rows" -
+  falsified;
+* the "re-land `cf4dfd801`'s constants" fix candidate is **withdrawn**. It would change the kernel and fix
+  nothing, which is exactly the kind of change the objective forbids.
+
+**What this does not exclude, and where the probes now point.** The test says the kernel is clean *given
+clean inputs*. It says nothing about whether the FA inputs are themselves non-finite - the mask, or the K/V
+that the task's own prefill wrote - and nothing about the rest of the decode graph (norms, the routed
+FFN/MoE, the LM head). Those are the surviving loci, and they need an arm-level fingerprint
+(`attn_inp_kq_mask` by name, or the `tail:<N>` sweep), not a kernel test.
+
+**One practical finding worth keeping.** That run happened at 103 GiB of GTT held by a foreign session: the
+kernel test needs almost no device memory. So kernel-level and compile-level iteration is available even
+while the box looks full; only arm-level work needs the regime, and it is the only thing still waiting.
+
 ### How to run that test
 
 The patch is written, generated from the live tree and verified to apply:

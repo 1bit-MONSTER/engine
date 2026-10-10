@@ -1449,3 +1449,74 @@ is not listed as a binding yields no edge, and the guard would then vouch for a 
 recorder skips), and whether program order plus the recorder's barriers really is execution order for every pair
 the bitset says it is. So the guard stays the last live candidate, but the place to look next is the recorder's
 binding construction, not the packer.
+
+## 37. A concrete defect in the access the host is told: `exact_output` is read but declared write-only
+
+Following section 36's "look at what the host is told", the corpus manifests were audited against the kernels
+they describe. `kernels/<family>/manifest.json` gives every export a parallel `bindings` / `binding_access` list,
+and that access is what the host consumes - `command-program.cpp` copies it onto the command
+(`command_binding.access = definition->bindings[binding_index].access`) and `transient-reuse-guard.cpp` reasons
+from it (`writes(binding.access)`, `reads(binding.access)`) to decide which ranges may be reused.
+
+Method (tools/audit-binding-access.py, run over all four manifests): resolve each .loom function's
+`buffer.view` / `buffer.assume.*` chains **positionally** to their root parameters - the positional part matters,
+see the correction below - then check every declared binding against whether that function stores to it, loads
+from it, or both. Reported as dangerous: `read` declared for a binding the body stores, or `write` declared for a
+binding the body loads, because both leave the host without an edge it needs.
+
+**Result: 2 findings out of 522 bindings.** The second is the one that matters:
+
+| export | binding | declared | body |
+|---|---|---|---|
+| `ggml_mul_mat_q6_k_packed_selected_refine_token1` | `exact_output` | **`write`** | **loads** (`%value = view.load %exact_view[%tid]`) |
+| `ggml_quantize_f32_symmetric_i4_k64_plane` | `scales` | `write` | loads |
+
+**What the kernel does.** `mul_mat_q6_k_packed_f16_wmma.loom:1185` is the single-token *selected refine* wrapper: it
+applies the inner `selected_refine.body` template, then after a workgroup barrier each publishing lane loads the
+exact value it computed and scatters it into the output row of the candidate it came from:
+
+```loom
+%candidates_noalias, %exact_noalias, %output_noalias = buffer.assume.noalias %candidates, %exact_output, %output
+%exact_view = buffer.view %exact_noalias[%base] : buffer -> view<64xf32>
+...
+%value = view.load %exact_view[%tid] : view<64xf32> -> f32
+view.store %value, %output_view[%candidate] : f32, view<[%bounded_output_size]xf32>
+```
+
+So `exact_output` is written by the inner template **and read by the wrapper**, while the manifest tells the host
+it is write-only. The registration is real and on the decode path: `dispatch-mul-mat.cpp:78` binds this export as
+`kMulMatQ6KPackedSelectedRefineToken1Kernel` and `:376`'s `match_q6_k_token1_shortlist_dispatch` runs it as part of
+`"common.mul_mat.q6_k_token1_shortlist"` - the big-vocabulary head path (approximate shortlist, then exact logits
+for the selected candidates), which is the shape a 154,880-token vocabulary needs.
+
+**Consequence, stated at the strength the reading supports.** With `exact_output` declared write-only, the
+reuse guard's access map records only `last_writer` for that key and *clears* its readers. A range handed to a
+later value therefore looks free of the read this kernel actually performs, so the guard can approve a reuse
+whose ordering the recorder then omits, and a later writer can run while this lane's load is in flight. The read
+then returns whatever the range held - stale-but-finite bytes scatter a wrong logit, non-finite bytes scatter a
+NaN. Under preemption the window that matters is the load's own latency, which is the same memory-pressure
+sensitivity the issue describes.
+
+**What this does not explain, and I am not claiming it does.** Section 23's decisive arm had the *final norm
+output* at 2048 of 2048 NaN, so in that fault the head's input was already NaN: a defect that corrupts a few
+scattered candidate logits cannot be the producer of *that* face. What this finding fits is the **Face B**
+profile - wrong-but-finite data becoming text the server rejects - and it is a *code-level* defect rather than
+another correlation, on the decode path, with a one-word fix.
+
+**The fix and its discriminator.** The fix is a single manifest word: `exact_output` should be `read_write`, and
+`scales` in the quantize export likewise (or its load should be shown to be vestigial). That is a fork-side
+change, so it lands as a new commit in the fork and then a forward-only engine pin move - exactly the deliverable
+shape the objective asks for. The discriminator is cheap and does not need the regime: re-run the 0.6B + compaction
+probe (or the arm campaign) before and after, and re-run this audit to confirm zero under-declarations. What has
+to be shown before the mechanism claim is complete is that the reuse actually happens for this range in a faulting
+run - which the `GGML_HRX_LOG_TRANSIENT_REUSE=1` numbers from section 35 can be made to answer, since they already
+report which packer and which arena sizes a program used.
+
+**Correction to this audit's first version**, recorded because the first numbers looked far more dramatic: it
+found 93 under-declarations, then 42 after restricting to per-function bodies. Both were artifacts of parsing
+`buffer.assume.noalias` lines. Those lines are **positional multi-assignments**
+(`%a, %b, %c = buffer.assume.noalias %x, %y, %z`), and a single-pair regex pairs the last left-hand name with
+the first right-hand name - mapping `%out_na` to `%weight` instead of `%output` and inventing writes into
+read-only weights. Pairing the lists positionally drops the count to the 2 above, both of which were then
+checked by hand against the kernel body. The lesson is the usual one: a static audit that finds dozens of
+defects in widely exercised code is more likely to be wrong than the code.

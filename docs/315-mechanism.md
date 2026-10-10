@@ -1627,3 +1627,31 @@ key_length; 592 is the LDS ceiling`. Two consequences for the probe: at the regi
 dispatcher moves to the *decode-split* kernel - whose MLA instantiation, like the row-major MLA branch itself, has
 never been exercised by any test in this investigation (my masked-V suite runs the non-MLA Hq16/Hkv8 shape, and the
 short-prompt dispatch inventory did not reach the KV threshold where the decode-split kernel engages).
+
+## 39. The instrumented arm hunt: a stage gets a name, and the instrument turns out to be an inducer
+
+The nan-dump fingerprint was put in front of a faulting arm (17 scored pairs and one control before the run's own
+8400 s timeout; `docs/315-campaign/evidence/315-instrumented-arm-hunt.md` is the record). Two results, in order of
+importance.
+
+**The instrument moved the fault rate.** 16 of 17 fix arms faulted and the single control arm faulted too - 94%
+against the recorded 5.4%, Fisher two-sided p = 1.2e-10, every fault Face A, every arm inside the gate at
+`gtt_start=98G`, no Face-B event in the whole run. Both candidate instruments are host-side interventions on exactly
+the buffers this defect concerns (`GGML_HRX_SENTINEL` fills the logits allocation with a NaN payload;
+`GGML_HRX_TENSOR_FP=tail:16` adds 16 device-to-host reads per `graph_compute`), and the control build does not
+implement the fingerprint yet faulted with it set. So this run **measures the instrument, not the regime**. That is
+also the run's most useful by-product: a ~94% trigger is a reproducer, and bisecting the env set (fingerprint off,
+sentinel off, both off) is now the cheapest way to learn what actually gates this fault. Nothing above the bisection
+is a mechanism, and section 29's elimination table is unchanged by this run.
+
+**The stage that does have a name.** In the first NaN-bearing call, one token's `n_embd` row is NaN from the last
+block's FFN outward: `ffn_shexp-41` (MUL_MAT, shared expert) 2048 of 352256, `ffn_swiglu-41` (GLU) 2048, the three
+`ADD`s that follow 1984 each, and the final `norm-42` 2048. The next call's `FLASH_ATTN_EXT` carries it forward as a
+consumer. This agrees with section 23 - producer upstream of the final norm, LM head exonerated - and narrows the
+producer to the FFN path. The `tail:16` window begins after `ffn_norm-41`, so it cannot yet separate "the FFN's input
+row was already NaN" from "the FFN matmul fabricated it from clean input": `tail:64`, or a name list over
+`ffn_norm-41`/`inp_attn-41`, decides it, and that arm must carry the attribution control from step 1 so it is not
+read as a second instrument-induced stage.
+
+Face B produced nothing in this run - 0 of 17 arms - so it is untouched by these instruments, and the cheap probe's
+Face-B-flavoured 95/180 (section 36) remains the only positive Face-B observation on the record.

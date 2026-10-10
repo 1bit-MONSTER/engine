@@ -1096,3 +1096,29 @@ with no ordering on the route". Sections 13, 21, 22 and 26 falsify that mechanis
 replace it with an equally concrete alternative. Completed tasks are immutable under the goal's own rules, so
 this is not being edited here: it means tasks 4-7 would be validating a change aimed at a mechanism the record
 no longer supports, and the tree should probably be restructured (the user's call, via `/goal-tweak`).
+
+## 30. The engine's own gates, run at the pin
+
+Task-6 needs "engine CI green" and task-7 needs a forward-only pin move. Both of those gates can be exercised
+without a GPU, so the baseline and the gates themselves are now on the record:
+`315-campaign/evidence/315-engine-ci-baseline.md`.
+
+Run in `~/wt315-prereg` at `third_party/llama.cpp = e44c9d01a`: `tools/copyright.py --check` exits 0 (after
+`b777bdc` - it was failing on my own three `evidence/*.txt` files and the copied probe script, i.e. the branch
+would have failed CI on artefacts of this investigation); `tools/check_pins.py 6d5e470` and `beec5e6` both exit 0
+with `third_party/llama.cpp: ... -> e44c9d01a is ahead`; the three `ci.yml` python tests pass; and the two ctest
+registry tests pass.
+
+Three things that matter for the remaining tasks:
+
+* **The forward-only gate works here and is machine-enforced** - but only over **submodule gitlinks**. The hrx
+  revision in `registry/architectures.json` is not tied to the gitlink by anything in `tools/` or `tests/`, so a
+  change that moves one and not the other passes CI while leaving the tree inconsistent. Task-7 has to move both,
+  by hand.
+* **A #315-motivated pin move already shipped and did not fix it.** `6d5e470` ("pin llama.cpp to the
+  shared-memory FA tile visibility (engine#314/315)") took the pin from `cf4dfd801` to `26330cc20`, and sections
+  26-27 falsify that whole locus. So the eventual change cannot be "bump to the next AMD pair" - it has to be a
+  new fork commit that is a descendant of `e44c9d01a`.
+* **The regression half is still untested**: the `gcc-15` build of `onebit` plus the 14 test targets and `ctest`
+  have not been run at all, because there is nothing to regress against yet. That is the one piece of task-6 that
+  will cost real time when the fix exists.

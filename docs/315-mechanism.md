@@ -1512,6 +1512,18 @@ to be shown before the mechanism claim is complete is that the reuse actually ha
 run - which the `GGML_HRX_LOG_TRANSIENT_REUSE=1` numbers from section 35 can be made to answer, since they already
 report which packer and which arena sizes a program used.
 
+**The open question that decides whether this matters: does GLM take the shortlist path at all?** The matcher gates
+it hard (`dispatch-mul-mat.cpp:376`): weight type `Q6_K`, `token_count == 1`, `input_size % 256 == 0` and
+`input_size <= 8192`, **`output_size >= 65536`** and `output_size >= 16 * input_size`, the projection output has no
+consumers in the graph index, and the input has an `has_embedded_external_concat_projection_ancestor`. GLM-4.7-Flash
+satisfies the size conditions trivially (154,880 outputs against a 2,048-wide input, Q6_K head in Q4_K_M,
+single-token decode), which is presumably why the path exists - but the last two conditions are about graph shape,
+not size, and **the 0.6B dispatch logs I have do not show `common.mul_mat.q6_k_token1_shortlist` at all** (they show
+`q6_k_token1_final_projection_q8`, `q6_k_aligned_skinny`, `q6_k_i8_prepacked` and `q6_k_prefill_wave32`). So the
+claim that GLM runs this kernel is a plausible inference from the gates, not a measurement, and settling it needs
+one GLM server started with `GGML_HRX_LOG_DISPATCH=1` - which needs the box's GTT, i.e. the same blocker as the
+arms. Recorded here so the first thing done after the box frees is a dispatch log, not another hypothesis.
+
 **Correction to this audit's first version**, recorded because the first numbers looked far more dramatic: it
 found 93 under-declarations, then 42 after restricting to per-function bodies. Both were artifacts of parsing
 `buffer.assume.noalias` lines. Those lines are **positional multi-assignments**

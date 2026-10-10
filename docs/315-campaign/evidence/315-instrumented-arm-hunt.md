@@ -88,3 +88,19 @@ The run was killed at its 8400 s timeout with 19 arm directories on disk (17 sco
 partial). No `315` server survived the kill; GTT returned to 26.9 GiB. Logs:
 `~/wt/rt-det/315nan-p<N>{c,l}-GLM-4.7-Flash-Q4_K_M/server.log` plus `~/wt/315nan-console.log` on strixhalo (the
 glob must be `*-*l-*`, not `*-l-*`).
+
+## Housekeeping follow-up: the timeout killed the wrapper, not the run
+
+The 8400 s timeout terminated the wrapper, not `315-paired.sh`: the driver (pid 3182848) survived, still held
+the box lock, and was mid **pair 19** when this was found - so the session went on to pairs 18-20 after the
+timeout was reported, and its console log is longer than the "17 pairs" read above. Treating what looked like an
+orphan arm server (`315fp-build`, port 19650) as garbage and SIGKILLing it destroyed **pair 19's fix-cell arm**:
+that arm's outcome is my doing and must not be counted in any tally. Anything after pair 17 in the console has to
+be read with that in hand.
+
+The env-var inventory is what decides how the faulting control arm reads. `315instr3-build` implements neither
+`GGML_HRX_SENTINEL` nor `GGML_HRX_TENSOR_FP` nor `GGML_HRX_COPY_PROBE`, and **no** build implements
+`GGML_HRX_LOGITS_FP` (passed throughout, a no-op everywhere). So the control arm ran with no instrument code
+active at all - which is why "the instrument induces it" cannot rest on that arm: at the recorded 5.4%, a single
+faulting control arm has probability 0.054, i.e. unremarkable. Attribution requires the interleaved design in
+`315-attrib.sh` (stock and instrumented arms alternating inside one composition and one box state).

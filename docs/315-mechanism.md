@@ -1702,3 +1702,27 @@ row is 1536; 1984 = 2048-64; 5056 = 5120-64), and 2048 floats = 8192 bytes is ex
 the sentinel instrument writes. So "which node reads NaN" may be tracking where that payload was *read* rather than
 where the defect is born. That is the question the attribution session is on the box answering right now, and it is
 why the chain probe above is written down but not yet run.
+
+## 41. Correction: neither instrument can fabricate the NaN the fingerprint found
+
+Section 40 closed with a caveat that the stage list might be tracking an instrument's payload rather than the
+defect. That caveat is falsified, from the instrument source itself (`~/wt/llama-315copy/ggml/src/ggml-hrx/ggml-hrx.cpp`,
+the tree `~/wt/315fp-build` was configured against - `CMakeCache.txt` `ggml_SOURCE_DIR`):
+
+- the copy probe (lines 181-199) is **read-only**: it writes two lines of `fprintf` per site and checks
+  `size == 619520`. It never touches a buffer's contents.
+- the sentinel (lines 380-391) writes its `0x7FC0DEAD` payload only when
+  `host_visible && base != nullptr && size == 619520 && environment_flag_enabled("GGML_HRX_SENTINEL")`. Its own
+  comment says "Only the 619520-byte (154880 x f32) logits allocation is touched ... so a control arm without it is
+  unaffected." That is the logits allocation alone - not `ffn_shexp-41` (1409024 bytes), not `ffn_swiglu-41`
+  (1056768), not `result_norm` (8192).
+
+So every NaN count the fingerprint reported for a non-logits tensor is a **computed** NaN, and the logits' own NaN is
+computed too: the fault line's `sentinel=0` says no sentinel word survived there, i.e. the LM head overwrote the
+region and wrote NaNs into it. Section 40's stage list stands as evidence; what the instruments cannot be exonerated
+from is *timing*. `GGML_HRX_TENSOR_FP=tail:16` issues 16 device-to-host reads per `graph_compute` - each one an extra
+synchronisation on the same stream as the real logits read - and the copy probe issues unbuffered `fprintf`s from the
+submit path. That is a plausible way to move a 5.4% window to 94% **without fabricating anything**, and it is what
+the attribution session on the box is measuring. A rate that is high *under instrumentation* is therefore a
+reproducer rather than a disqualification, and the chain probe in section 40 can run on its own merits: no instrument
+can fake which node first carries a computed NaN.

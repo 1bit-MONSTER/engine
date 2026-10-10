@@ -142,3 +142,27 @@ The engine's own MoE expert *streaming* cache (`moe/expert_cache.cpp`, `moe/expe
 `llama-server -m GLM-4.7-Flash-Q4_K_M.gguf -dev HRX0 -ngl 99 -fa on`, which loads the model into GTT through
 the HRX backend and never enters that cache. It is off this path, and its "blocks until resident" pattern is
 therefore not a candidate for the fault.
+
+## 7. Hard negative: the "route_stride lost in the fused path" defect is already fixed everywhere we run
+
+`~/.cache/hrx-mmid-stride.diff` (09-25) is a 76-line patch that adds `route_stride` to the fused
+`mul_mat_id_swiglu` match struct and copies it through `routing_match_for_swiglu` into
+`common_mul_mat_id_ensure_moe_routing_bundle`. Without it, the fused path builds the expert and partition
+tables with `route_stride = 0` and an ids binding of `route_count * 4` bytes, i.e. from token 0's route list
+only - a per-token table error on a T > 1 prefill, which is the shape this issue needs.
+
+Checked, and it is **already landed in every tree the arms run**:
+
+```sh
+ssh strixhalo 'grep -c route_stride ~/wt/llama-315copy/ggml/src/ggml-hrx/dispatch_registration/common/dispatch-gated-mul-mat-id.cpp \
+                                  ~/wt/llama-315copy/ggml/src/ggml-hrx/dispatch_registration/common/dispatch-mul-mat-id-common.h'
+# 3 and 10
+ssh strixhalo 'grep -c route_stride ~/wt/llama-315instr/ggml/src/ggml-hrx/dispatch_registration/common/dispatch-gated-mul-mat-id.cpp \
+                                  ~/wt/llama-315instr/ggml/src/ggml-hrx/dispatch_registration/common/dispatch-mul-mat-id-common.h'
+# 3 and 10
+```
+
+`315row-build` and `315fp-build` are configured against `llama-315copy/ggml` and `315instr3-build` against
+`llama-315instr/ggml` (both `CMakeCache.txt`), so the fixed code is in the *faulting* arm `315row-p1c` as well.
+The defect is therefore real, fixed, and **not sufficient** - and the campaign's control cell is not confounded
+by it. Do not re-walk it without new evidence.

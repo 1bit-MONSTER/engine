@@ -228,6 +228,13 @@ and an explicit `ACCEPTANCE FAILS` line, and in-regime `INVALID` arms are called
 silent. The same log now reads `rate=1/15 = 6.67%  95% CI [0.17%, 31.95%]`. This change can only make
 acceptance harder - it cannot manufacture cleanliness - and the executed copy on the box carries the same code.
 
+**Freeze note 3 (2026-10-09, still before any acceptance arm) - per-face attribution.** The criterion is phrased
+as "0 Face-A and 0 Face-B faults", but the per-arm line carries only `nan=` and `parse=`/`utf8=`, so faults are
+now attributed: `FaceA(nan=N)` and/or `FaceB(parse=,utf8=)` per faulting arm, plus a per-cell tally. One
+asymmetry is stated rather than hidden: an `HSA_STATUS_ERROR_MEMORY_FAULT` is Face A and does *not* appear on the
+per-arm line, so such a fault lands in the `unattributed` bucket and has to be read from the arm's `server.log`.
+The counters cannot invent a fault either: the tally is derived from the same fields the driver prints.
+
 ## 9. Budget
 
 ≤12 hours of strixhalo box time in total for this goal, shared with other work through the box lock.

@@ -68,7 +68,21 @@ def summarise(cell):
     print(f"cell {cell}: arms={len(sel)} in-regime={len(inb)} out-of-regime={len(oor)} "
           f"clean={len(clean)} fault={len(faults)} invalid={len(invalid)}")
     for r in faults[:6]:
-        print(f"   FAULT pair={r['pair']} nan={r['nan']} req={r['req']} parse={r['parse']} utf8={r['utf8']} gtt={r['gtt']}G")
+        faces = []
+        if r["nan"] > 0:
+            faces.append("FaceA(nan=%d)" % r["nan"])
+        if r["parse"] > 0 or r["utf8"] > 0:
+            faces.append("FaceB(parse=%d,utf8=%d)" % (r["parse"], r["utf8"]))
+        if not faces:
+            faces.append("unattributed - FAULT with nan=0 and no parse/utf8 counter; read the server log"
+                          " (an HSA_STATUS_ERROR_MEMORY_FAULT is Face A and is not on this line)")
+        print(f"   FAULT pair={r['pair']} {' '.join(faces)} req={r['req']} gtt={r['gtt']}G")
+    face_a = sum(1 for r in faults if r["nan"] > 0)
+    face_b = sum(1 for r in faults if r["parse"] > 0 or r["utf8"] > 0)
+    unattr = sum(1 for r in faults if r["nan"] == 0 and r["parse"] == 0 and r["utf8"] == 0)
+    if faults:
+        print(f"   face tally: FaceA={face_a} FaceB={face_b} unattributed={unattr}"
+              f"  (the criterion is zero on BOTH faces; HSA faults are unattributed here by construction)")
     # The acceptance statistic runs over ALL in-regime arms, not over the clean ones. The first version of
     # this summary divided by the clean count and hardcoded a zero numerator, so it printed "rate=0/N = 0.0%"
     # and a rule-of-three bound no matter how many arms had faulted - a fault was visible only in the

@@ -91,3 +91,34 @@ The attribution session (`bd4c969ee`) **took the box lock at 09:37:25 and then d
 scp'd over the file that session was executing, and bash re-read it at stale byte offsets. No attribution
 data exists. The failure was mine, not the box's, and the same trap must not be repeated while
 `315-chain.sh` runs: new probes go in new filenames.
+
+## What actually precedes the 500: the parser rejecting the model's own degenerate output
+
+The line immediately before every Face-B 500 is the parser, and what it is rejecting is the model's own text:
+
+```
+1.47.161.803 W common_chat_peg_parse: unparsed Content-only output:  a..........* it on ${... and: it itns it that'~><es x case a a~ it
+1.27.713.034 W common_chat_peg_parse: unparsed Content-only output:  a. ? $\ (/C ( ( ( / ( ( (?) ( ( a a *_x
+1.08.109.609 W common_chat_peg_parse: unparsed Content-only output:  .,。_./  ?, exactly,。，*。 **) 一*-S、 " "*--p— '--    -*( 
+3.29.726.901 W common_chat_peg_parse: unparsed Content-only output:  a of in一个文件 a某( as<<* ? ( probably** ? of ? AND < as   <
+1.13.054.990 W common_chat_peg_parse: unparsed Content-only output:  We A ( the).
+```
+
+Two flavours, both degenerate: symbol/script soup that makes `grep` treat the log as a binary file (invalid bytes), and a 12-character
+fragment. Five of the seven Face-B arms show one of these. `n_tokens = 120` and `truncated = 0` on the same line as the
+`p1c` case, and that arm's offender is inside the identical block (request 13 of 16), so the *same* prompt produced
+`identical_distinct=1` over the requests that succeeded and then this fragment on the seventh. The offender's output
+therefore differed from its siblings - which confirms the event is anomalous, not a property of the prompt, and rules out
+"the model legitimately failed a strict format on a hard prompt" as the explanation for that arm.
+
+**What this makes Face B.** The guard that produces Face A is unconditional and silent when `nan_count == 0`, and no
+Face-B arm logged a guard line - so those requests' logits were NaN-free. Degenerate sampling with NaN-free logits is what a
+*finite* corruption of the logits or of the hidden state feeding them looks like: symbol soup, or a premature stop. So both
+faces are the same class of event, separated by what the corrupted memory happens to contain: NaNs (Face A, caught by the
+guard) or stale finite values (Face B, which reaches the sampler and fails later, at the parser).
+
+**What is not yet measured.** No Face-B arm had `GGML_HRX_LOGITS_FP` enabled, so the logits of an offending request were
+never fingerprinted. `315-faceb.sh` fixes that, and it can test the strong form of this claim directly: with the fingerprint
+on, the eight identical greedy requests must log the *same* logits hash, so a corrupted sample shows up as one hash differing
+from its seven siblings. That is the discriminating measurement for the Face-B half, and it is the reason the probe sets
+`GGML_HRX_LOGITS_FP=1` as well as `GGML_HRX_NAN_CONTINUE=1`.

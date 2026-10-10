@@ -1193,3 +1193,47 @@ command blocks. I traced it as far as the constant, then stopped before it becam
 This is a lead with a named file and a named next question, not a finding. It is recorded here because it is
 directly testable against GLM's own shape and because it is the only structural difference on the record that is
 specific to the affected model.
+
+## 32. The block-boundary asymmetry - the leading candidate, and what would settle it
+
+Following section 31's next step into `aql_program_block` and the AQL emitter turns up a specific asymmetry. All
+of it is in hrx-system, `runtime/src/iree/hal/drivers/amdgpu/`:
+
+1. **A split is a pure capacity event.** `aql_program_builder_split_block` (`aql_program_builder.c:306`) appends a
+   `BRANCH` terminator, finalizes the current block and begins the next. It carries across exactly two things: the
+   `HAS_PENDING_EXECUTION_BARRIER` flag and, if that flag is set, the pending barrier's **acquire** scope. Nothing
+   else - notably not `initial_barrier_packet_count`, which `begin_block` resets to 0 and `finalize_block` then sets
+   to the whole block's packet count unless the block set `HAS_INITIAL_BARRIER_PACKET`.
+2. **The packet barrier bit is decided by a *logical* index.** `..._packet_has_barrier` (`aql_block_processor.c:105`)
+   sets the AQL barrier bit when the packet carries `PACKET_FLAG_EXECUTION_BARRIER`, or `PACKET_FLAG_FINAL`, or
+   `logical_packet_index == 0` with a waiting submission, or `logical_packet_index == 0` with a non-NONE inline
+   acquire scope. And `logical_packet_index = processor->packets.index_base + packet_index` (line 128).
+3. **`index_base` and the FINAL flag are per block, keyed on zero.** The submission site
+   (`host_queue_command_buffer_block.c:300-345`) builds the processor per block with `.index_base =
+   packet_index_base`, and sets `IREE_HAL_AMDGPU_AQL_BLOCK_PROCESSOR_FLAG_FINAL_PAYLOAD_PACKET` **only when
+   `packet_index_base == 0`**. Identically, the acquire scope is raised to the submission's `inline_acquire_scope`
+   only for `logical_packet_index == 0` (lines 132-143).
+
+Read together: the submission-level ordering machinery - the inline acquire scope, the wait-barrier condition and
+that FINAL flag - is attached to the **first block** of a program. A **second block gets none of it**; its packets
+carry a barrier bit only if their own command recorded an execution dependency. Whether that is a defect or a
+deliberate, correct design depends on semantics I have not verified (program order in the ring may already supply
+the ordering), but it has exactly the shape this issue needs: it is **only reachable by a model whose command
+program exceeds 128 KB**, and GLM is the only one on the record (919 + 760 dispatches, 1,399 barriers per token);
+it concerns completion ordering rather than data layout; and a preemption window would be what turns a benign
+overlap into a stale read.
+
+**What would settle it, cheaply and without the regime.** Two steps, both driver-level:
+
+1. Read the rest of the submission path and answer one question in code: when a program spans two blocks, what
+   makes the second block's first payload packet wait for the first block's last dispatch? If the answer is "the
+   branch terminator's semantics" or "a recorded dependency that is always present", the candidate dies here.
+2. If it does not die in code, build the discriminating program: exceed 128 KB deliberately, put a
+   global-memory producer at the end of block 1 and its consumer at the start of block 2 with **no** recorded
+   dependency, and check the block-2 read against the block-1 write - first with the queue idle, then with
+   compaction forcing queue evictions, which section 28 showed is how this family's window opens. One test,
+   seconds, no model, no regime, no neighbours.
+
+Explicitly **unverified**: I have not shown that the second block's packets are missing an ordering they need,
+only that the submission-level bookkeeping is attached to the first block alone. Recording it as the leading
+candidate rather than a finding is deliberate - the two steps above are what make it a mechanism or kill it.

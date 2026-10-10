@@ -33,30 +33,48 @@ demand, which is why it is recorded as a limitation rather than fixed.
 
 3 detached neighbour `llama-server` processes at default context drive GTT into the ~100 GB band, then one
 detector server is exercised with 8 identical greedy requests separated by different-length distractors,
-followed by 50 mixed-length requests. Under pressure the logits buffer is never written, and the sampler guard
-reports:
+followed by 50 mixed-length requests. Under pressure the decoder produces corrupted logits, and the sampler
+guard reports:
 
 ```
-count=154880 of 154880, contiguous=yes
+count=154880 of 154880, contiguous=yes, sentinel=0
 ```
 
-`154880` is the model's vocabulary width — the whole LM-head output. The guard fires on the consumer side,
-which is why it reports the shape and not the producer.
+`154880` is the model's vocabulary width — the whole LM-head output — and `sentinel=0` says every one of those
+NaNs was **written by the compute**: not one is the sentinel payload the instrumentation pre-fills the logits
+allocation with. The earlier reading here, that "the logits buffer is never written", is therefore falsified, and
+it was unsafe from the start: the sentinel only ever fills the 619520-byte logits allocation (`ggml-hrx.cpp`,
+`size == 619520`), so it says nothing about the tensors where the corruption is born. The guard fires on the
+consumer side and reports the shape, not the producer — the producer is upstream of the final norm, which the
+nan-dump fingerprint (docs/315-campaign/evidence/315-instrumented-arm-hunt.md) established by finding the first
+NaN-bearing tensors in the FFN path.
 
 ### Both failure faces
 
-The same underlying defect — output data that is wrong or unwritten under memory pressure — surfaces in two
-places depending on where it lands:
+The same underlying defect — one token's hidden row corrupted during a prefill — surfaces in two places
+depending on what the corrupted memory holds (NaN, or stale finite values):
 
-1. **All-NaN logits.** The logits buffer is never written; the sampler guard fires with
-   `count=154880 of 154880, contiguous=yes`. Example: `v315g-c3` (control arm).
-2. **Format-500.** The model emits text the server rejects:
-   `{"error":{"code":500,"message":"The model produced output that does not match the expected Content-only
-   format"}}`. Example: `v315k-l1` (legacy arm), `identical: 1 distinct of 8` then mixed `10 of 50`, `nan=0`.
+1. **All-NaN logits (Face A).** One token's hidden row is already NaN by the time the MoE aggregation adds run, so
+   that token's KV slot is poisoned and the next decode attending to it hands the output norm an all-NaN hidden
+   state: `count=154880 of 154880`. Across sixteen faulting arms the NaN count at the first affected tensor is
+   **2048 in fifteen of them** — exactly one `n_embd` row — while the batch size varies four-fold (T of 87, 98,
+   135, 140, 172, 306, 342), and the first affected node is an unnamed partial expert sum
+   (`build_moe_ffn` names only the final aggregate). Mechanism, evidence and the discriminating experiment:
+   docs/315-mechanism.md sections 40, 44, 47.
+2. **Format-500 (Face B).** The same event with *finite* contents. A faulting request whose 60-name tensor
+   fingerprint included `norm`, `result_norm` and `result_output` logged **no NaN at all**, and the server rejected
+   its output as `unparsed Content-only output: the}:}:}甚;` — garbage; the paired control arm produced a
+   repetition loop, `a gaps gaps gaps ...`. The sampler is drawing from a corrupted distribution, the text is
+   degenerate, and the failure surfaces at the server's chat-template parser instead of at the sampler guard.
+   Evidence: docs/315-campaign/evidence/315-face-landscape.md.
 
 A NaN-only count records the second face as a clean run, which is what makes it dangerous as a metric. Scoring
-must be: an arm is **valid only if it completes `mixed: 50 of 50 ok`**; an arm that aborts early has reduced
-exposure and is excluded, not counted as clean.
+must be: an arm is valid only if it completes the request phase in full (66 of 66 requests); an arm that aborts
+early has reduced exposure and is excluded, not counted as clean. Both faces must count — NaN logits through the
+guard, format failures through HTTP status, UTF-8 and JSON parse failures — and a third signal is needed for finite
+corruption that still parses: the detector's eight identical greedy requests must agree (`identical_distinct == 1`),
+because no clean arm among the 142 recorded has ever been non-deterministic while all seven non-deterministic arms
+were Face-A faults (`docs/315-preregistration.md` section 8, freeze note 2026-10-10).
 
 ### Levers tested and excluded
 

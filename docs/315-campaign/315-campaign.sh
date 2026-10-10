@@ -39,6 +39,12 @@ echo "campaign: tag=$TAG pairs=$PAIRS target_clean=$MINCLEAN regime_LO=${REGIME_
 
 REGIME_LO=${REGIME_LO:-70} REGIME_HI=${REGIME_HI:-85} MINCLEAN="$MINCLEAN" \
   bash "$HOME/wt/315-paired.sh" "$PAIRS" 2 2048 "$CTRL/bin" "$FIX/bin" "$TAG" 2>&1 | tail -12
+# The "2" above is the driver's <neighbours> argument and it is INERT: the driver reads it only to print it
+# in the session header, and composition is done by 315-regime.sh, which starts neighbours one at a time
+# against live GTT until it reaches REGIME_LO and never past REGIME_HI (1..6). So the pre-registration's
+# "3 detached neighbour processes" is the typical outcome at LO=80, not a parameter, and the literal here is
+# not a criterion. Recorded because a header line reading "neighbours=2" next to a document saying three
+# would otherwise look like a criteria change after the fact.
 
 CONSOLE="$HOME/wt/$TAG-console.log"
 echo "=== verdict summary (from the driver's own per-arm lines, which implement section 5)"

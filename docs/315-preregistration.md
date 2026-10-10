@@ -235,6 +235,17 @@ asymmetry is stated rather than hidden: an `HSA_STATUS_ERROR_MEMORY_FAULT` is Fa
 per-arm line, so such a fault lands in the `unattributed` bucket and has to be read from the arm's `server.log`.
 The counters cannot invent a fault either: the tally is derived from the same fields the driver prints.
 
+**Freeze note 4 (2026-10-09, still before any acceptance arm) - the acceptance surface was audited end to end.**
+Three things were checked against the tooling rather than trusted: (a) the campaign runs with `EXTRA_ENV` empty
+and `NOSTOP` unset, so every acceptance arm is the shipped configuration and the run stops at the first
+fix-cell fault; (b) `MINCLEAN=60` and `PAIRS=80` on the command side match this document's target and hard cap;
+and (c) the driver's `<neighbours>` argument is **inert** - it is read only to print a session header, while
+composition is done by `315-regime.sh`, which starts neighbours one at a time against live GTT until
+`REGIME_LO` and never past `REGIME_HI` (1..6 attempts). So this document's "3 detached neighbour processes" is
+the typical outcome at `LO=80`, not a parameter, and the literal `2` in the campaign's invocation is not a
+criterion. That is recorded because a console reading `neighbours=2` beside a document saying three is exactly
+what would look like a criteria change imposed after the data.
+
 ## 9. Budget
 
 ≤12 hours of strixhalo box time in total for this goal, shared with other work through the box lock.

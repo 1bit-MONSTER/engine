@@ -67,7 +67,7 @@ only be a *pre-existing amplifier*:
 | task-3 item | state |
 |---|---|
 | ISA/IR diff of the changed dispatch/kernel | **this file**: for the routed-FFN path the diff is empty; for the FA path it is `task3-fa-kernel-ir.txt` (103 `+` / 6 `-`) with the named site `template.def<@ggml.flash_attention.decode_split.produce_partials.active>` |
-| `rocprofv3` trace, faulting vs clean in-regime arm | **not done**; the engine's own queue-event profiler (`HRX_PROFILE_MODE=queue`, `HRX_PROFILE_FILE`) is the cheaper substitute and is not yet run either |
+| `rocprofv3` trace, faulting vs clean in-regime arm | **not done as rocprofv3**; the engine's own queue-event profiler is used instead and its output is recorded in `evidence/315-queue-profile.md` (612 dispatches, 519 barriers, 92 unbarriered, 1 block, for a 24-token greedy decode). It is a *clean* profile, not a faulting-vs-clean pair: the trace of a faulting arm is still owed |
 | REA (or documented equivalent) on libhrx/loomc and the HIP code objects | **partly done**: the shipped `libhrx.so` is not stripped, and its symbol/flag inventory (`pm-salvage/issue-315/CANDIDATE-SITE-WAIT-BARRIER-DEFER.md`) is the documented equivalent; REA's own provider failed with an unretained log |
 
 The one item this file adds beyond the table is the **shape gap** in the FA clearance, which is the strongest

@@ -570,6 +570,68 @@ newly launched task, but the stage that manufactures it is still open.
 exists but holds none of the 315 artefacts). The engine worktree `~/wt315-prereg` is the one path that is
 local. Nothing was ever lost; the working set only looked missing from the wrong box.
 
+## 24. Two faces, one place — and one hypothesis eliminated offline (2026-10-09)
+
+Everything below was derived from logs already on the box; no arm was needed, so none of it cost box time.
+
+### Eliminated: a length or tile-alignment trigger
+
+If the first decode read a partly-filled 16-key tile, the fault should depend on the visible key count
+modulo the tile width. It does not. Across the 18 Face-A arms, the prompt length of the faulting request is
+`10, 10, 10, 810, 172, 863, 810, 868, 283, 623, 246, 10, 98, 10, 10, 10, 10, 246` tokens — `mod 16` = `10, 10,
+10, 10, 12, 15, 10, 4, 11, 15, 6, 10, 2, 10, 10, 10, 10, 6`, and the same scatter holds `mod 32` and `mod 64`.
+So the trigger is not key-count alignment, and the partial-tile story is off the table.
+
+How the lengths were obtained: the detector's 66 requests are seeded and identical across arms, and most
+faulting requests complete normally in other arms, so the token length of request *n* is read from any arm
+that logged `prompt eval time ... / N tokens` for it. Request 34 (a 10-token prompt) is the faulting request
+in 6 of 18 arms and requests 14 and 19 in two each, but the faulting request is not fixed, so the trigger is
+not prompt content either. The 34 repeat is recorded as an observation, not a mechanism: it needs more arms
+before it means anything.
+
+### Both faces fire at the same place
+
+Face A: 18 of 18 arms raise the NaN 1-3 log lines after a `slot launch_slot_` (section 23). Face B: of the 7
+arms whose detector reports an HTTP failure with no NaN, 4 emit their marker 6 lines after a launch, the same
+boundary. The other 3 emit it deep inside a generation — but that marker is written when the response is
+*parsed*, not when the bad data was produced, so its position is not a production-time locator and those 3
+neither support nor contradict the boundary reading.
+
+### Hypothesis (falsifiable, both faces)
+
+The first decode of a newly launched task consumes state that its own prefill produced — KV rows and the
+attention mask — through the decode-split FA path, and in a fraction of launches it reads a region whose
+contents are not yet valid. What the region happens to hold decides the face: a NaN pattern yields all-NaN
+logits (Face A), stale-but-finite contents yield a wrong token stream that fails to parse (Face B). One
+mechanism, two severities, one location.
+
+Why here first: `ggml/src/ggml-hrx/kernel-corpus/kernels/loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom`
+is the kernel whose tile-visibility logic already had to be changed for engine#314, both of whose commits
+record that the change was **never verified against the authoritative masked-KV tool** and that the original
+failure "does not currently reproduce on demand" (section 22 host note; the commits are ancestors of this
+branch's pin `e44c9d01a`, i.e. the #314 fix is *in* and these faults remain). A masked-key visibility defect
+in that kernel is exactly a first-decode, data-dependent, intermittent fault.
+
+### Pre-predicted outcomes of the next arm
+
+Run on the first decode of a faulting arm, fingerprinting the attention side by name — `attn_inp_kq_mask` is a
+real node name (`src/llama-graph.cpp:40`) — with `NANONLY` set, plus the `tail:<N>` sweep from
+`315-campaign/patches/315-nan-dump.md`:
+
+1. **Mask clean, attention output NaN** -> the defect is inside the decode-split FA kernel (visibility or
+   mask handling). This is the hypothesis.
+2. **Mask itself NaN or wrongly `-inf`** -> the defect is in mask construction at the prefill->decode
+   boundary, not in the kernel.
+3. **Attention side clean, first NaN at `norm`** -> hypothesis **falsified**; the producer is in the
+   layer/FFN path and the FA kernel is exonerated.
+4. **Face B reproduces with the instruments on** -> its logits hash must diverge from the clean reference at
+   exactly the first call of the new task, not drift; anything else falsifies the stale-read half of the
+   mechanism.
+
+None of this is run yet: the box has been held across three consecutive goal turns by a foreign `repro336`
+GLM-4.7-Flash session (4-6 resident servers, GTT 103-111 GiB, 6 GB RAM free), and the regime gate needs
+`gtt_start` in [95, 110] GiB after composing neighbours.
+
 ## 23. The producer, at tensor resolution (2026-10-09, `315hunt2-p6l`)
 
 Arm `315hunt2-p6l` is the first faulting arm to carry the per-tensor fingerprint

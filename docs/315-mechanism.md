@@ -1581,3 +1581,27 @@ makes it the most obviously untested code on the failing model's path.
 
 It also puts the `test-hrx-fa-masked-v` family's value in perspective: those tests are good evidence about the
 non-MLA kernels, and they say nothing about the branch GLM actually takes.
+
+**What GLM's decode attention actually is, from the fork's own graph code.** `llama-graph.cpp:2442` calls
+`ggml_flash_attn_ext(ctx0, q, k, v, kq_mask, kq_scale, ...)` on the **latent** tensors (the 576-wide key = 512
+`kv_lora_rank` + 64 rope, the 512-wide value), and immediately afterwards (`:2449-2454`) does the MLA de-absorption:
+
+```cpp
+if (v_mla) {
+    cur = ggml_reshape_4d(ctx0, cur, v_mla->ne[0], 1, n_head, n_tokens);
+    cur = ggml_mul_mat(ctx0, v_mla, cur);      // broadcast across n_tokens
+}
+```
+
+So GLM's decode attention is two steps, and **neither is covered by anything run in this investigation**: a flash
+attention over a 576/512 latent with 20 query heads and one latent "KV head", and then a small `v_mla` matmul that
+projects the 512-wide latent attention output into the per-head value space. `fa-race` (Hq 16/Hkv 8, D=DV=128) and
+the masked-V suite (Hq 16/Hkv 8, head 128) exercise neither shape, which is why their clean results - while
+they stand - cannot be read as "GLM's attention is clean".
+
+The probe that follows from this is concrete, and the harness pattern exists: adapt `fa-race.cpp` to the MLA
+tensors (k 576-wide, v 512-wide, `n_head` 20, one latent KV head, `cells`/`visible` at the regime's values,
+`-c 2048` and up), add the `reshape_4d` + `v_mla` `mul_mat` step, and compare bit-for-bit across reps. The cheaper
+half of it is extending `test-hrx-fa-masked-v`'s `Case` constants to the MLA dims (head 256/512, Hq 20, Hkv 1),
+which would at least drag the MLA branch of `flash_attention_f32_f16_wmma` into a test that already exists and
+already checks masked-row insensitivity.

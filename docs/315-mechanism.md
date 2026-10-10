@@ -1524,6 +1524,21 @@ claim that GLM runs this kernel is a plausible inference from the gates, not a m
 one GLM server started with `GGML_HRX_LOG_DISPATCH=1` - which needs the box's GTT, i.e. the same blocker as the
 arms. Recorded here so the first thing done after the box frees is a dispatch log, not another hypothesis.
 
+**Resolved, same day: GLM never dispatches that path, so this is not the mechanism.** The box freed (GTT 26.5 GiB,
+lock free), so within minutes of writing the paragraph above I ran exactly that server and captured the
+inventory - one GLM-4.7-Flash instance at the pin with `GGML_HRX_LOG_DISPATCH=1`, two short completions,
+teardown. Its q6_k dispatches are `q6_k_aligned_skinny`, `q6_k_i8_prepacked`, `q6_k_prefill_wave32` and
+`q6_k_token1_final_projection_q8`; **`q6_k_token1_shortlist` does not appear**, so
+`ggml_mul_mat_q6_k_packed_selected_refine_token1` is not on this model's decode path. The full 35-name
+inventory is `315-campaign/evidence/315-glm-dispatch-inventory.md`.
+
+So section 37 stands as a *defect* - a binding the host is told is write-only while the kernel reads it - but it
+is **closed as not-applicable to engine#315**: the kernel it affects is never dispatched for the failing model.
+The one-word manifest fix would still be correct on its own merits, but it is no longer part of this issue's fix,
+and it is not a candidate mechanism. This is the second time a plausible static finding has been killed by one
+cheap measurement, which is the right ratio: the audit cost minutes and the dispatch log cost minutes, and both
+were written down before they were believed.
+
 **Correction to this audit's first version**, recorded because the first numbers looked far more dramatic: it
 found 93 under-declarations, then 42 after restricting to per-function bodies. Both were artifacts of parsing
 `buffer.assume.noalias` lines. Those lines are **positional multi-assignments**

@@ -662,8 +662,26 @@ real node name (`src/llama-graph.cpp:40`) — with `NANONLY` set, plus the `tail
    mechanism.
 
 None of this is run yet: the box has been held across three consecutive goal turns by a foreign `repro336`
-GLM-4.7-Flash session (4-6 resident servers, GTT 103-111 GiB, 6 GB RAM free), and the regime gate needs
+GLM-4.7-Flash session (4-6 resident servers, GTT 103-111 GiB, 6-9 GB RAM free), and the regime gate needs
 `gtt_start` in [95, 110] GiB after composing neighbours.
+
+### What the next measurement costs, and one lead that could make it cheaper
+
+The pre-registered shape costs ~3.5-4.6 min per arm plus regime composition, and the fault rate is ~4%
+per arm, so a faulting arm with the fingerprint live is a few arms' worth of box time, not one. Acceptance
+(task-5) must keep the declared gate; **diagnosis does not** - it only needs a fault, and the fault is not
+obviously a property of GTT pressure:
+
+* the 5 comparable Face-A faults all sit at `gtt_start 98GiB`, i.e. inside the gate, so the gate is where the
+  rate was measured;
+* but `~/wt/rt-det/rtf-GLM-4.7-Flash-Q4_K_M` (2026-10-05, the earlier `identical.json` harness, `-c 8192`,
+  one server and no neighbours) raised the same `HRX returned NaN logits` error at `gtt_start 23197143040`
+  bytes = **21.6 GiB**.
+
+That is one observation in a non-comparable harness, so it is a lead, not a licence to drop the regime: what
+it suggests is that a lone server (~22 GiB GTT, no composition) can fault, which would let the *diagnostic*
+arm run whenever ~22 GiB is free instead of needing the box emptied. Worth one deliberate check before
+trusting it, and it does not change anything about the acceptance campaign.
 
 ## 23. The producer, at tensor resolution (2026-10-09, `315hunt2-p6l`)
 

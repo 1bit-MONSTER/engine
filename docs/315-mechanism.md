@@ -910,6 +910,32 @@ That also removes an easy trap: a "fix" aimed at a kernel's logic now has nothin
 kernel-level and compile-level work needs almost no device memory. Arm-level work is the only thing that
 needs the regime gate, and it is now the only thing outstanding.
 
+### The arm probe is built and verified, so the next arm needs no setup
+
+Sections 26-27 pushed the surviving locus to model-level state under the regime, which only an arm can see.
+That arm's instrument is now in the vehicle: `~/wt/llama-315copy` carries the additional nan-dump patch
+(`315-campaign/patches/315-nan-dump.md`, `GGML_HRX_TENSOR_FP=tail:<N>` + `GGML_HRX_TENSOR_FP_NANONLY=1`,
+lines carrying `op=`), and `~/wt/315fp-build` was rebuilt from it - the build succeeded and
+`GGML_HRX_TENSOR_FP_NANONLY` is present in the produced `libggml-hrx.so`, alongside the older
+`hrx-tensor-fp`, `hrx-sentinel` and `hrx-copy-probe` markers.
+
+The next diagnostic arm is therefore:
+
+```
+REGIME_LO=70 REGIME_HI=85 CONTROL_EVERY=999 NOSTOP=1 \
+EXTRA_ENV="GGML_HRX_COPY_PROBE=1 GGML_HRX_SENTINEL=1 GGML_HRX_LOGITS_FP=100000 \
+           GGML_HRX_TENSOR_FP=tail:24 GGML_HRX_TENSOR_FP_NANONLY=1" \
+  bash ~/wt/315-paired.sh 15 2 2048 ~/wt/315instr3-build/bin ~/wt/315fp-build/bin 315nan
+```
+
+It logs only the NaN-bearing nodes of each graph's tail, with their op, so a faulting arm names the stage
+that first goes NaN instead of restating the four already-falsified levers.
+
+Provenance, stated plainly because it is a change to a binary that produced earlier evidence: `315fp-build`
+is the *diagnostic* vehicle (`315fix-build` and `315instr3-build` are the acceptance cells and are untouched),
+and both new modes are opt-in - with `GGML_HRX_TENSOR_FP` unset or set to a name list, behaviour is exactly
+as before. Section 23's evidence is the raw log `~/wt/rt-det/315hunt2-p6l-*/server.log`, which is unchanged.
+
 ### How to run that test
 
 The patch is written, generated from the live tree and verified to apply:

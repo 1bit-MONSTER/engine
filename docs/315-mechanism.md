@@ -1405,3 +1405,47 @@ harness - gave 1 distinct output each, so the event did not fire at all; the thr
 launch because of my own quoting bug (`$EXTRA command` instead of `env $EXTRA command`). The event count is now
 **1 in 8** runs of the configuration that produced it. That is recorded rather than re-run until it fires,
 because comparing a rare event across six runs is not evidence either way.
+
+## 36. Side quest: three more closes and one open edge
+
+With the regime blocked, the side quest was to attack the fault's own shapes and kernel family with the cheap
+standalone methods, and to finish the reads left open in sections 32-35.
+
+**1. The FA path is clean at GLM's own geometry.** `fa-race` used Hq=16/Hkv=8; GLM-4.7-Flash is Hq=32/Hkv=4 (the
+same geometry the earlier session put in `~/wt/lt/cfg`). Recompiling the harness with GLM's geometry and
+sweeping shapes on the pin's build:
+
+| T | cells | visible | reps | checksum | bad_runs |
+|---|---|---|---|---|---|
+| 1 / 16 / 190 | 2048 | 810 | 250 | 13.916653 / 55.761970 / 1000.327255 | 0 / 0 / 0 |
+| 1 / 16 | 2048 | 2048 | 250 | 16.731105 / 74.238626 | 0 / 0 |
+| 190 | 2048 | 2000 | 250 | -231.562139 | 0 |
+| 1 / 190 | 4864 | 4798 | 250 | 11.450974 / -125.324899 | 0 / 0 |
+
+2000 reps, eight shapes, zero bad runs - and `T=1`/`T=16` at `cells=2048` is the first-decode shape the arms
+actually fault in. Combined with section 34 that is 4250 clean reps across both geometries.
+
+**2. The masked-row result holds under repetition.** The section 26 suite was single-shot per case; race hunting
+needs repetition. Fifty consecutive runs of the extended `test-hrx-fa-masked-v` (40 cases x 8 masked-row
+variants, including NaN/inf tails, at `cells=2048` and `visible` 10/172/810) gave **0 failing runs and 0
+non-finite outputs** - 2000 case-executions with garbage in the masked rows, all deterministic and finite.
+
+**3. `moe_routing_tables.loom` resolves to safe**, closing the one "unclassified" row from section 33's audit.
+`@ggml_moe_build_expert_table` puts **one workgroup per expert** (`kernel.workgroup.id<x>`), and that workgroup
+builds its expert's assignment rows alone, carrying its scan prefix across the (token, route) loop iterations
+(`kernel.workgroup.scan<addi>` + `reduce` + loop-carried `matched_base`). All stores into `expert_table` come
+from the single workgroup that owns the row, and the reader is a **second dispatch**, so there is no
+intra-dispatch handoff to fence and no wave can see a partial row. Ordering between the two dispatches is the
+host recorder's, as in section 33's quantized-matmul partials.
+
+**4. The transient-reuse guard's algorithm reads as structurally sound - the open edge is its input.** The pin's
+`transient-reuse-guard.cpp` builds, per command, the set of commands it depends on, keyed by
+`(binding.origin, value.value)`: a read takes the last writer (RAW), a write takes the readers (WAR), and the
+rows are closed transitively into bitsets (`precedes(before, command)`). The reuse decision then requires the
+candidate's first command to follow every previous user of the freed range. Two things that would break it are
+not in this algorithm but upstream of it: whether `Command::bindings` is **complete** for every command (an
+indirect dispatch's arguments, a host-staging buffer, a completion counter - anything the command touches that
+is not listed as a binding yields no edge, and the guard would then vouch for a reuse whose ordering the
+recorder skips), and whether program order plus the recorder's barriers really is execution order for every pair
+the bitset says it is. So the guard stays the last live candidate, but the place to look next is the recorder's
+binding construction, not the packer.

@@ -2131,3 +2131,38 @@ b512k (512 KiB):     dispatches 612 barriers 519 no-barrier-dispatches 92 blocks
 * **Caveat carried with the numbers:** `rt-gaps.py` crashed on empty input (`:72`) and the `auto` configuration
   never reached the log, so three of four intended configurations are quoted. The three that are there agree
   with each other line for line.
+
+## 55. The wait path already carries acquire ordering - the simplest form of the read-path candidate is eliminated
+
+Section 53 proposed that the consumer's host read of a host-visible mapping may precede the producing dispatch's
+write. The chain from the reader to the hardware wait is short, and it ends in an *acquire*:
+
+```text
+common/sampling.cpp:654  guard reads the logits
+  -> src/llama-context.cpp:3729   llama_get_logits_ith -> ctx->synchronize()
+  -> src/llama-context.cpp:712    ggml_backend_sched_synchronize(sched)
+  -> ggml-hrx.cpp (backend_synchronize) -> stream_synchronize_sleeping(...)
+  -> libhrx/src/libhrx/stream.c:188   hrx_semaphore_wait(semaphore, stream->timepoint, UINT64_MAX)
+  -> libhrx/src/libhrx/semaphore.c:82 iree_hal_semaphore_wait(...)
+  -> runtime/src/iree/hal/drivers/amdgpu/semaphore.c:329  iree_hsa_signal_wait_scacquire(...)
+```
+
+`hsa_signal_wait_scacquire` is the **system-scope acquire** variant - `hsa_signal_wait_relaxed` is also linked into
+the binary (`libhsa_tables.h:389,395`) but it is not the one this path calls. Under the HSA memory model an
+acquire wait orders the producer's writes that happened before the signal decrement, so "nothing waits, therefore
+the reader sees unwritten memory" is **false as stated**. That is the simplest form of the read-path candidate, and
+it is eliminated here rather than in a run.
+
+What survives, and is what `315gsync2` actually tests:
+
+1. **Coverage, not presence.** The wait is on `stream->timepoint` against the host-queue *epoch* signal
+   (`semaphore.c:323-338`). Whether the value waited on covers the *last* submission - the one whose dispatch
+   writes the logits - is a bookkeeping question this reading does not settle. If the timepoint is advanced before
+   the final submission rather than after it, the acquire is satisfied against work that is not the producer.
+2. **15 % of the program carries no barrier** (§54: 92 of 612 dispatches, queue saturated at `busy 14288 us` of
+   `15348 us`). Per-packet ordering for those is left to program order in the ring, which is exactly what a
+   *cross-submission* wait cannot repair and an in-executor sync after each replay can.
+3. The `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC` knob forces a `hrx_stream_synchronize(context.stream)` after every replay
+   (`command-program-executor.cpp:2034`), i.e. it tests (1) and (2) rather than the acquire itself. That is why the
+   paired run is the right experiment and why a clean fix cell would not have been explainable by "the acquire was
+   missing" - it would point at coverage or at the unbarriered 15 %.

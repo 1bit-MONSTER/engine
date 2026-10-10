@@ -103,9 +103,11 @@ jobs:
           OURS_BASE: ${{ steps.pins.outputs.ours_base }}
         run: |
           set -euo pipefail
-          # master mirrors ggml-org; 1bit/hrx-vulkan carries no commits of its own, so it
-          # moves to AMD's pin as long as that pin descends from it (no force needed).
-          gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master > /dev/null
+          # Keep the fork's master current when the token permits workflow-file updates. This
+          # mirror refresh is independent of moving the HRX branches to AMD's pin.
+          if ! gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master > /dev/null; then
+            echo "::warning::could not refresh 1bit-MONSTER/llama.cpp master; continuing with the HRX pin sync"
+          fi
           git init -q fork && cd fork
           git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/llama.cpp.git"
           git remote add amd https://github.com/AMD-Ecosystem/llama.cpp.git

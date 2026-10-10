@@ -221,3 +221,29 @@ tool for the finite case is `GGML_HRX_LOGITS_FP`, whose per-sample `hash=` must 
 greedy requests - a corrupted sample shows as one hash differing from its seven siblings. That is the experiment
 `315-faceb.sh` was written for; it was dropped from the queue in favour of the visibility falsifier and should be
 restored if the finite flavour is to be named rather than only distinguished.
+
+## The visibility falsifier's run: inconclusive, because the composition under-shot the gate
+
+`315gsync` (2026-10-10, `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1` in both cells, no other instrument):
+
+| arm | verdict | gtt_start | req | nan |
+|---|---|---|---|---|
+| p1 control | OOR | 88G | 66 | 0 |
+| p1 fix | OOR | 91G | 12 | **1** |
+| p2 fix | OOR | 90G | 66 | 0 |
+| p3 fix | OOR | 93G | 66 | 0 |
+| p4 fix | **FAULT** | 99G | 19 | 0 |
+| p5 fix | OOR | 87G | 0 | 0 |
+
+One arm was in-regime and it faulted (Face-B class, `req=19`, `nan=0`), so the knob did not visibly remove the
+fault - but that is a single arm, and **four of six arms fell below the gate**, so the run cannot answer the
+question it was queued for. Two incidental failures are worth recording: one arm server `Aborted (core dumped)`
+and the driver process was `Killed` mid-run, both consistent with memory pressure rather than with the knob.
+
+**The tooling lesson, which applies to the campaign.** The composition stops as soon as live GTT reaches
+`REGIME_LO` (default 70G) on the assumption that the arm's own load then projects to >=95G. In this session the
+baseline was low enough that two neighbours reached only `gtt_before_arm=70G`, and the arms scored 87-93G:
+out-of-regime. The chain session, by contrast, reached `gtt_before_arm=80G` and scored 98G in every arm. So the
+projection from LO=70 is not reliable when the baseline GTT is low, and the campaign should either compose to
+LO>=80 or treat a low `gtt_before_arm` as a reason to add a neighbour before starting an arm. The gate is
+two-sided and an arm outside it is not evidence in either direction.

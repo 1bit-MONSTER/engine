@@ -2032,3 +2032,30 @@ every tensor as `f32`), anchored name matching, and per row print the first 8 id
 `[0, n_expert)`, and whether the row's ids repeat. Duplicate or out-of-range ids in a faulting arm makes this
 kernel the site; a clean permutation kills it and moves the fault into the table builders or the matmul's
 descriptor use.
+
+## 52. The differential artefact: the whole HRX backend differs by one file between the clean bound and the pin
+
+Full record: `evidence/315-differential-artifact.md`. Two commands, and they change which family can be a
+*change*:
+
+```sh
+ssh strixhalo 'cd ~/wt/llama-315copy && git diff --stat f2099e9b7..HEAD -- ggml/src/ggml-hrx/'
+#  .../flash_attention_decode_split_f32_f16_wmma.loom | 104 ++++++++++++++++++++-
+#  1 file changed, 102 insertions(+), 2 deletions(-)
+```
+
+* `f2099e9b7` (the recorded clean lower bound) → `e44c9d01a` (the pin the in-regime arms run) changes **exactly
+  one file in the entire HRX backend**, and it is the decode-split flash-attention kernel - the change already
+  rate-tested (5.4% vs 4.0%, Fisher p = 1.000) and closed by sections 26/34/36.
+* **The routed-FFN path is byte-identical across that window** - dispatch registration, `small_rows_f32.loom` (the
+  id-producing argsort), `mul_mat_id_swiglu_f32_f32_wmma.loom`. So the site section 50/51 measured cannot have
+  been introduced by the pin move: it is either older than the clean bound (the "clean" label was about rate, not
+  absence) or it is *triggered* by the one thing that did change.
+* That reopens the FA change on the one axis section 38 left open: GLM runs the **row-major MLA** layout, so the
+  race sweeps that cleared this kernel (40/40 masked-V cases, 2250 + 2000 reps) were run at shapes that are not
+  this model's geometry. "The pin is race-free" holds for the shapes tested, not for GLM's.
+
+This is a constraint, not a verdict: the routed-FFN chain stays the site for *where* the row is lost, and the FA
+diff stays the only candidate for *what changed*. The cheap test that separates them is the MLA race harness
+(`docs/315-campaign/tools/glm-mla-race.cpp`, already compiled on the box and never run) - seconds of GPU, no
+regime, no neighbours.

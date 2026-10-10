@@ -1772,3 +1772,32 @@ a constraint on the objective, not a finding about the defect, and it needs a de
 box budget, or accept that the campaign is delivered outside it. The per-arm cost is intrinsic to the registered
 workload (the 8x96-token identical block plus 50 mixed requests at GTT pressure), so shortening it would change
 the measurement rather than make acceptance harder, which the freeze rules forbid.
+
+## 44. Face B is not a second defect: it is the same corruption seen after the parser
+
+The line immediately before all seven Face-B 500s is `common_chat_peg_parse: unparsed Content-only output:`
+followed by the model's own text, and that text is degenerate in two flavours: symbol soup with invalid bytes
+(`a..........* it on ${... and: it itns it that'~><es x case a a~ it`), and a 12-character fragment
+(`We A ( the).`). In `315accept-p1c` the offender is inside the identical block - request 13 of 16 - while
+`identical_distinct` was 1 over the requests that succeeded, so the same prompt produced normal output and then
+this fragment. The event is anomalous, not a property of the prompt, which rules out "the model legitimately
+failed a strict format" for that arm.
+
+**So the two faces are one mechanism with two observables.** The guard that raises Face A is unconditional and
+silent when `nan_count == 0`, and no Face-B arm logged a guard line: those requests' logits contained no NaN.
+Sampling degenerately from NaN-free logits is what a *finite* corruption looks like - soup, or a premature stop -
+and it reaches the sampler, produces text, and fails later, at the parser. The observable therefore depends on
+what the corrupted memory happened to hold: NaNs (Face A, caught at the sampler) or stale finite values (Face B,
+caught at the parser). Section 40's stage - block 41's FFN during a prefill - is the *producer* for both.
+
+**Consequence for the acceptor.** A rule that only counts NaN and server failures cannot see finite corruption
+that still parses, so the fault rule now includes `identical_distinct > 1` (the 8 identical greedy requests
+disagreeing). On the recorded population that never fires without another signal: 135 of 142 arms are
+deterministic, and the 7 exceptions are exactly the Face-A arms. Freeze note of 2026-10-10 in
+`315-preregistration.md` section 8; analyser and its self-test updated (`tools/test-analyse.py`, 13/13).
+
+**What it does not yet settle.** No Face-B arm had the logits fingerprint on, so an offending request's logits
+have never been fingered. `315-faceb.sh` turns it on and can test the strong form: the eight identical greedy
+requests must log the same logits hash, so a corrupted sample has to appear as exactly one hash differing from
+its seven siblings. Until that is read, "Face B is corrupted logits" rests on the degenerate text plus the
+absence of NaN, not on a measurement of the logits themselves.

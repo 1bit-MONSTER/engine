@@ -35,7 +35,12 @@ M=$HOME/models
 O=$HOME/wt/315reg
 LOG=$HOME/wt/315fix-tests-build.log
 PORT=${PORT:-19401}
-PIN=e44c9d01a4d5110cecaf45472a717f46cd1abbf9
+# PIN and FIX_GREP are parameterised because this cell has to run twice: once against the baseline
+# revision (to capture the "unchanged" side of task-6's comparison) and once against the fix. The
+# earlier version hardcoded both the revision and the *coherence* candidate's code pattern, which
+# was withdrawn - it would have aborted on any other fix, and could not run a baseline at all.
+PIN=${PIN:-e44c9d01a4d5110cecaf45472a717f46cd1abbf9}   # override for the fix revision
+FIX_GREP=${FIX_GREP:-}   # optional regex that must match the source; the fix's own signature
 export IREE_HAL_AMDGPU_LIBHSA_PATH=/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1
 mkdir -p "$O"
 
@@ -43,12 +48,17 @@ say() { echo "[$(date +%H:%M:%S)] $*"; }
 
 say "=== regression cell: source $SRC at $(git -C "$SRC" rev-parse --short HEAD) (pin ${PIN:0:9}) ==="
 [ "$(git -C "$SRC" rev-parse HEAD)" = "$PIN" ] || { echo "ABORT: source is not at the pin"; exit 1; }
-G=$SRC/ggml/src/ggml-hrx/ggml-hrx.cpp
-grep -q 'memory_type |= HRX_MEMORY_TYPE_HOST_COHERENT;' "$G" || { echo "ABORT: the fix is not in the source being validated"; exit 1; }
-if grep -A1 'HRX_MEMORY_TYPE_HOST_LOCAL | HRX_MEMORY_TYPE_DEVICE_VISIBLE;' "$G" | grep -q 'if (direct_host_binding)'; then
-  echo "ABORT: coherence still gated - wrong source"; exit 1
+# Revision identity is the assertion that matters: prove we are validating the intended tree. A code-pattern
+# assertion is optional, and only if the caller supplies the fix's own signature, so that this cell does not
+# bake in one candidate's implementation (the coherence candidate it used to hardcode was withdrawn).
+if [ -n "$FIX_GREP" ]; then
+  grep -qE "$FIX_GREP" "$SRC/ggml/src/ggml-hrx/ggml-hrx.cpp" \
+    || { echo "ABORT: FIX_GREP '$FIX_GREP' not found in the source being validated"; exit 1; }
+  say "source assertion: FIX_GREP matched"
+else
+  say "source assertion: revision only (no FIX_GREP given)"
 fi
-say "source assertion: the fix is in effect"
+say "source diff vs the baseline revision: $(git -C "$SRC" diff --stat "$PIN" HEAD | tail -1)"
 
 # The op-test needs the box to itself (it drives the GPU hard); take the same lock the campaign uses.
 exec 9>"$HOME/.cache/lax-decode/box.lock"

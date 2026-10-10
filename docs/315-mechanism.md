@@ -875,6 +875,41 @@ FFN/MoE, the LM head). Those are the surviving loci, and they need an arm-level 
 kernel test needs almost no device memory. So kernel-level and compile-level iteration is available even
 while the box looks full; only arm-level work needs the regime, and it is the only thing still waiting.
 
+## 27. Kernel-level tests are exhausted, and all of them pass
+
+With section 26 the kernel routes are closed, so the whole HRX test suite was run at the pin's kernel on the
+same cheap footing (evidence and command: `315-campaign/evidence/315-hrx-tests-baseline.txt`):
+
+| test | result |
+|---|---|
+| `test-hrx-fa-masked-v` (extended) | 40 cases passed, `differing 0/8, non-finite outputs 0` |
+| `test-hrx-decode-stride` | 72 cases, 0 failures |
+| `test-hrx-moe-split` | all cases OK |
+| `test-hrx-mul-mat-id-k32` | all cases OK |
+| `test-hrx-buffer` | 5 passed, 0 failed |
+| `test-hrx-attention-sink` | disjoint output accepted, aliasing refused |
+| `test-hrx-hadamard` | PASS |
+| `test-hrx-mxfp4` | 7 rows x 256 values bit-exact |
+
+Two do not compile at this revision, both pre-existing and unrelated to the masked-V work:
+`test-hrx-ops.cpp` (`fatal error: dispatch_registration/common/dispatch-activation-publication.h file not
+found`) and `test-hrx-loom-jit.cpp` (API drift against the HRX revision in use). They are recorded here
+because task-6's "engine CI green" claim has to account for them, and because a CI result that silently skips
+two test targets is not a green suite.
+
+**What this settles.** No kernel's standalone behaviour exposes the fault: not the FA kernels (40 cases
+including the regime's own `cells=2048` shapes), not the KV handoff (`decode-stride`), not the routed FFN
+(`moe-split`) and not `MUL_MAT_ID`. The producer therefore lives in model-level state under the regime - the
+allocation/streaming path that only exists when the box is loaded, or the *content* of the mask and K/V at
+fault time - and both of those need arms, not tests.
+
+That also removes an easy trap: a "fix" aimed at a kernel's logic now has nothing to stand on. The earlier
+`cf4dfd801` candidate is withdrawn (section 26), and nothing in the suite suggests a replacement.
+
+**Cheap footing is worth keeping.** Every test above ran at 103 GiB of GTT held by a foreign session, i.e.
+kernel-level and compile-level work needs almost no device memory. Arm-level work is the only thing that
+needs the regime gate, and it is now the only thing outstanding.
+
 ### How to run that test
 
 The patch is written, generated from the live tree and verified to apply:

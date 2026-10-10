@@ -72,3 +72,22 @@ is not a fix for this issue - it has been tried and the fault survived it (secti
 that the coherence and ordering levers failed; section 26 kills the FA masked-row lever outright).
 The eventual change has to be a new fork commit that is a **descendant of `e44c9d01a`** and carries
 whatever the mechanism work ends up naming.
+
+## Closing the recorded gap: the registry pin and the gitlink agree today
+
+The baseline above recorded a gap - "nothing ties `registry/architectures.json`'s hrx pin to the gitlink" -
+which reads as a possible divergence. Checked 2026-10-10:
+
+```
+$ git ls-tree HEAD third_party/llama.cpp
+160000 commit e44c9d01a4d5110cecaf45472a717f46cd1abbf9	third_party/llama.cpp
+$ grep -n 'llama.cpp (hrx)' registry/architectures.json
+4:  "llama.cpp (hrx)": "e44c9d01a4d5110cecaf45472a717f46cd1abbf9"
+```
+
+They are the same commit. So the gap is one of *enforcement* - no check compares the two, and `check_pins.py`
+enforces only the gitlink - not of current divergence. A forward-only fix therefore edits **two** files by hand
+(the gitlink and `registry/architectures.json` line 4) and both must stay equal; a CI check that compares them
+would be a reasonable addition but is not part of this change. `KNOWN-ISSUES.md` lines 81-84 hold the other
+mechanical constraint (why `f2099e9b7` cannot be adopted: it is a strict ancestor of the shipped `26330cc20`,
+so pinning it is a revert).

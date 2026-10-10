@@ -122,6 +122,39 @@ filter was `std::strstr(list, name)`, so `-41` also matched `-4` and only layers
 eight ids, the count outside `[0, n_expert)` and whether the row's ids repeat. Duplicate or out-of-range ids make
 the argsort kernel the site; a clean permutation kills it.
 
+**Correction, evening 2026-10-10 — this supersedes the two paragraphs directly above.** Both the routing-tensor
+candidate and the by-name instrument that produced it are now withdrawn, and the ordering family is closed:
+
+* the fingerprint reads the MoE intermediates out of one **host-visible, non-coherent 44 MB arena**
+  (`size=44048640 memory_type=0x52`) through a plain `memcpy` (`ggml_backend_tensor_get` short-circuits for host
+  buffers), and, worse, a **post-graph read by name returns that arena slot's last writer** - proven inside one
+  arm by arithmetic, since `ffn_out-0` reads `nan=7048 of 1048576` while `l_out-0` reads `nan=4963`, and
+  `l_out = ffn_out + attn_out` forbids `l_out` from having fewer NaNs. So no post-graph by-name instrument can
+  name a producer on this backend, and the `oor`/`dup_pairs` ids diagnostic was mis-specified besides (`oor`
+  against `ne0`, which for the top-k *view* is `k`, not the expert count);
+* **four in-regime toggles, all null, every arm at `gtt_start=98 GiB`**: `GRAPH_SYNC` after each replay
+  (control 1 fault/4, fix 0/2); `ggml_backend_synchronize` before the instrument's reads (2/5 vs 1/5);
+  `HRX_FORCE_BARRIERS=1` forcing an AQL barrier on every packet (2/4 vs 1/2); and `-fa off` (1/2 vs 2/2, the
+  fault persists). `HRX_COMMAND_BUFFER_MODE=pm4` is not a lever at all - every PM4 arm failed the first request
+  with HTTP 500. With the host read path already ordered at source (`hsa_signal_wait_scacquire`, covered
+  timepoint) and a static audit of the whole `loom-libs/ops` corpus finding no unfenced intra-dispatch global
+  handoff, the whole ordering/visibility super-family is **closed for this fault**;
+* **what survives**: the fault is real and common in regime (178 arms on the box, **131 in-regime, 34 faulting
+  in-regime**, both faces, never in the same arm), the guard line is exactly
+  `count=154880 of 154880 ... contiguous=yes`, and the one ordered by-name capture put the corruption at
+  **layer 0 of a T=512 prefill**, whole-batch, cascading to a fully NaN residual stream by layer 1;
+* **the best-matching lead is the engine's own #123/#140 record** (`docs/hrx.md`): a producer/consumer pair whose
+  barrier fenced LDS only, whose own description contains both faces ("the f32 output was right and `next_q8` was
+  wrong, and NaN when the stale bytes decoded as NaN") and the only pressure link anyone has written down ("the
+  window opens on dispatch preemption, which is why the rate followed memory-pressure settings"). That fix is in
+  the pin; what is not closed is the same window opening under memory pressure itself, which no userspace lever in
+  the inventory reaches.
+
+**No mechanism is proven, so no limitation entry is recorded**, and `#315` stays OPEN - a documented limitation is
+this issue's own rule only *after* the mechanism is named. The next instrument has to read a value at the point of
+production (inside the dispatch, or from a non-transient copy at the producer) or correlate a faulting arm with
+the driver's own eviction/preemption events; both are named in the issue comment of 2026-10-10 evening.
+
 ### Levers tested and excluded
 
 - **`GGML_HRX_TRANSIENT_REUSE=legacy`** — no effect. 15-arm matched study, alternating control and legacy

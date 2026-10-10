@@ -1300,3 +1300,57 @@ rows (`%scratch`, `%data`, `%q_shared`/`%s_shared`, `%expert_table`) are "unclas
 the audit covers intra-dispatch handoffs only, by construction; and it is static - it says nothing about whether
 the host-side recorder actually records every producer/consumer pair it should, which is the one ordering
 question still standing after section 32.
+
+## 34. The standalone FA-race harness: the pin is race-free at every recorded shape
+
+Unblocking by REA is what found this: the Oct 5 working set in `~/.cache/kvnan/` contains a purpose-built
+standalone reproducer the earlier investigation left behind.
+
+* `fa-race.cpp` / `fa-race` - builds one `FLASH_ATTN_EXT` (D=DV=128, Hq=16, Hkv=8, F32 precision) on HRX0, runs
+  it `reps` times **with identical inputs**, and reports every run whose output differs from run 0, grouped by
+  `(query tile, head, 16-channel block)`. Usage `fa-race <T> <cells> <visible> <reps> [seed] [device]`; a bad
+  run prints `run 14: 256 differ (112 nonfinite): [qtile 0 head 9 ch 96..111: 256]`, the summary is
+  `T=... cells=... visible=... reps=... bad_runs=N`.
+* the Oct 5 logs (`fa-race1.log`, `fa-race2.log`, `bis1-4.log`, `h336.log`) show it reproducing a real race:
+  `bad_runs` 2-11 per 250 at `T=190 cells=4864 visible=4798`, with 64-144 of the differing values **non-finite**,
+  and 0 at `T=192`, `T=512`, `T=64` and at `cells=4608`. So the trigger was a specific shape, and `T=190` is not
+  a multiple of the 16-token query tile.
+* `h336.log` is an A/B the earlier session read as a fix: four rounds of 250 reps with the h336 libraries gave
+  `bad_runs=0 0 0 0` where the control gave `4 11 4 2`, at an identical checksum (`1.190266`); `e2e.log` adds
+  24/24 clean model-level runs.
+
+**What the pin does at the same shapes, measured today** (harness run against `~/wt/315fp-build`, the
+`e44c9d01a` tree):
+
+| T | cells | visible | reps | checksum | bad_runs |
+|---|---|---|---|---|---|
+| 190 | 4864 | 4798 | 250 | **1.190266** | **0** |
+| 192 | 4864 | 4798 | 250 | -5.256695 | 0 |
+| 1 / 16 | 4864 | 4798 | 250 | -2.715973 / 14.680580 | 0 / 0 |
+| 1 / 2 / 8 / 16 / 190 | 2048 | 810 | 250 | -7.353318 / -7.709488 / 35.336398 / 41.561140 / 146.350555 | 0 |
+
+2250 reps across nine shapes - including the one that raced in October and the regime's own (`cells=2048`,
+`visible=810`) - and **not one bad run**. The checksum at `T=190 cells=4864 visible=4798` is exactly the October
+value (`1.190266`), so the same kernel and the same path are exercised; it is simply deterministic now. The race
+was real, shape-specific, and closed by the time of the pin.
+
+Two cautions this adds to the artifact set:
+
+* **Do not read the Oct 5 `b*/c*/e*/s*` tag matrix as a bisection.** Extracting and disassembling one cache entry
+  per tag (`/tmp/fa_variant_profile.py`, using the validated `llvm19` objdump) shows `b0..b3`, `c0..c3`, `e0..e3`,
+  `s0..s2` and `jit190`/`jit190c`/`jit190d` are the **same compiled kernel** instruction for instruction (12
+  `s_barrier`, 86 `s_waitcnt`, 3 `s_waitcnt_vscnt`, 4 `global_store`, 164 `global_load`), and those logs' own
+  `md5sum jit190*/*.bin` lines agree. Their very different `bad_runs` therefore came from outside the kernel -
+  environment or which libraries happened to be loaded - not from code. Only `jit190w` (292 `s_waitcnt`),
+  `jith336` (76 `s_waitcnt`, 1 `s_waitcnt_vscnt`), `jitmf` and the `T=192` build differ at all.
+* **The harness works and is cheap**: a second or two per 250 reps, no regime, no model, a few MB of GTT. It
+  links only `libggml`/`libggml-base` and loads the HRX backend at runtime, so any build can be pointed at by
+  setting `LD_LIBRARY_PATH` to that build's `bin` plus its `hrx/src/ggml-hrx-deps-build/libhrx/src/libhrx` and
+  `.../loom/binding/c`, with `IREE_HAL_AMDGPU_LIBHSA_PATH` set and a fresh `GGML_HRX_JIT_CACHE_DIR`. Its RUNPATH
+  still names the October build directory, which no longer exists - hence
+  `libhrx.so.0: cannot open shared object file` unless that environment is supplied.
+
+**This closes the FA-race lead for the pin**, as sections 26, 27 and 33 closed the others: what raced in October
+does not race now, and no shape I can construct does. What remains is not a kernel property - it is the regime
+itself (real memory pressure and the preemptions it causes) or the full GLM graph, which is exactly what the
+in-regime arms exercise and what standalone harnesses cannot reproduce by construction.

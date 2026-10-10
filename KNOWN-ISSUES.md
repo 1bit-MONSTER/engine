@@ -61,6 +61,16 @@ depending on what the corrupted memory holds (NaN, or stale finite values):
    135, 140, 172, 306, 342), and the first affected node is an unnamed partial expert sum
    (`build_moe_ffn` names only the final aggregate). Mechanism, evidence and the discriminating experiment:
    docs/315-mechanism.md sections 40, 44, 47.
+
+   **Correction, 2026-10-10.** That "one row" figure is a property of the instrument that measured it, not yet a
+   property of the fault. Those arms used `GGML_HRX_TENSOR_FP=tail:16` (a window over the last sixteen graph
+   nodes). Arm `315row-p1c`, in regime at `gtt_start=98G`, measured by *node name* instead and found the
+   corruption in the routed-FFN **routing** tensors with the whole batch already NaN (`l_out-4`: 20480 of 20480
+   floats, all ten tokens' rows; `ffn_moe_up-4`: 61440 of 61440), the earliest NaN-bearing node being
+   `ffn_moe_weights-4` — the `ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` route-weight gather — while
+   `ffn_moe_probs-4` carried none. Until the same instrument is run over the same arms, the safe statement is
+   that the corruption involves the MoE routing tensors and that the row extent is instrument-dependent.
+   Evidence: docs/315-campaign/evidence/315-row-p1c-inregime-mechanism.md.
 2. **Format-500 (Face B).** The same event with *finite* contents. A faulting request whose 60-name tensor
    fingerprint included `norm`, `result_norm` and `result_output` logged **no NaN at all**, and the server rejected
    its output as `unparsed Content-only output: the}:}:}甚;` — garbage; the paired control arm produced a
@@ -75,6 +85,42 @@ guard, format failures through HTTP status, UTF-8 and JSON parse failures — an
 corruption that still parses: the detector's eight identical greedy requests must agree (`identical_distinct == 1`),
 because no clean arm among the 142 recorded has ever been non-deterministic while all seven non-deterministic arms
 were Face-A faults (`docs/315-preregistration.md` section 8, freeze note 2026-10-10).
+
+### State as of 2026-10-10 (this section supersedes the mechanism text above wherever they differ)
+
+Diagnostic record: `docs/315-mechanism.md` sections 42-51; evidence under `docs/315-campaign/evidence/`.
+
+**Where the fault sits now.** The routed FFN's *routing* tensors, in the MoE path:
+`ffn_moe_argsort` / `ffn_moe_topk` (the top-k ids, `src/llama-graph.cpp:1930-1935`) feed
+`ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` and `ggml_mul_mat_id`. In arm `315row-p1c` the gather was NaN for two
+whole tokens while the ids had never been instrumented at all, which is the measurement gap this entry now
+carries as its most important limitation.
+
+**A candidate with a mechanism, not yet a finding.** `ggml_argsort_rows_f32`
+(`kernel-corpus/kernels/loom-libs/ops/small_rows_f32.loom:111`) computes each element's rank with *ordered*
+comparisons (`cmpf ogt`/`olt`/`oeq`) plus an index tie-break. That is a total order for finite input, so the ranks
+are a bijection and every output slot is written; **for a row holding two or more NaNs it is not** — all three
+comparisons are false, two elements take the same rank, and one slot in `[0, cols)` is never written and keeps
+whatever the buffer held before. A stale `i32` in the top-k view is an arbitrary expert id. The two consumers
+disagree about it: the gather clamps the id (`small_rows_f32.loom:157+`), while the expert-table builders
+consume it with `index.assume` *ranges* (`mul_mat_id_swiglu_f32_f32_wmma.loom:47-53`), not checks. Full reading:
+`evidence/315-id-producing-kernel.md`.
+
+**Falsified in this round** (each with its own evidence path):
+
+| candidate | result | where |
+|---|---|---|
+| memory coherence is the carrier | `HOST_COHERENT` patch live (`hv52=0 hv56=1`), still 9 clean + 1 fault in 10 | `evidence/315-face-landscape.md` |
+| consumer-side ordering is the carrier | `GRAPH_SYNC` after every replay, 4 of 6 arms below the gate, the one in-regime arm faulted | `evidence/315-face-landscape.md` |
+| the expert/partition tables go stale | both are rebuilt by producer dispatches inside the same plan | `evidence/315-moe-routing-routed-ffn-static.md` section 3 |
+| the fused path loses `route_stride` | that defect is already fixed in every tree that faults | the same file, section 7 |
+| the engine's MoE expert-streaming cache | Vulkan-only; the arms never enter it | the same file, section 6 |
+
+**Still untested, and next.** The ids themselves: instrumented as `i32` with the name match anchored (the previous
+filter was `std::strstr(list, name)`, so `-41` also matched `-4` and only layers 4 and 41 were covered).
+`docs/315-campaign/315-idprobe.sh` builds that probe and runs four in-regime arms, reporting per row the first
+eight ids, the count outside `[0, n_expert)` and whether the row's ids repeat. Duplicate or out-of-range ids make
+the argsort kernel the site; a clean permutation kills it.
 
 ### Levers tested and excluded
 
@@ -142,10 +188,11 @@ motivated the change and neither excludes "no change" (and that ~10% comparator 
 arms, 95% CI ~0.2-32%, so the lower rate needs no environmental explanation). No runtime-side ordering gap on the
 device-to-host path could be named, and no forward-pin fix candidate
 survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert). The open candidates are in the
-kernel/binding family: GLM is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760
-dispatches) with 1,399 barriers per token.
+kernel/binding family — narrowed as of 2026-10-10 to the routed-FFN routing tensors and the id-producing kernel,
+with the two 128 KB AQL command blocks GLM's decode splits into (919 + 760 dispatches, 1,399 barriers per token)
+still unexamined as an *ordering* question. See "State as of 2026-10-10" above.
 
-### Instrumentation available for the bisect (implemented, not yet built)
+### SUPERSEDED 2026-10-10: instrumentation for the bisect (implemented, not built — and now known to be unreachable)
 
 On `f2099e9b7`: a probe on the route the logits actually take (`backend_get_tensor_async` →
 `hrx_stream_copy_buffer`) that names the producing graph `value`. It recovers the `ValueId` by searching the

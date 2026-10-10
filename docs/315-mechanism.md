@@ -1801,3 +1801,36 @@ have never been fingered. `315-faceb.sh` turns it on and can test the strong for
 requests must log the same logits hash, so a corrupted sample has to appear as exactly one hash differing from
 its seven siblings. Until that is read, "Face B is corrupted logits" rests on the degenerate text plus the
 absence of NaN, not on a measurement of the logits themselves.
+
+## 45. Correction: the visibility/ordering eliminations lean on an inference that only covers the logits buffer
+
+Sections 21, 22 and 29 dismissed the coherence (§13) and ordering (§15) fixes with the sentence "both address a
+missing or late write, and the write is present". That "write is present" came from the fault line's `sentinel=0`.
+Section 41 then established what the sentinel actually covers: `GGML_HRX_SENTINEL` writes its payload only when
+`size == 619520`, i.e. the logits allocation and nothing else. So `sentinel=0` is evidence about **the LM head's
+output buffer only**. It is not evidence about the tensors where the NaN is born - `ffn_shexp-41` is 1409024 bytes,
+`ffn_swiglu-41` is 1056768, `result_norm` is 8192, and none of them is ever sentinel-filled. The inference does not
+extend to the producer, and sections 21/29 used it as though it did.
+
+What actually survives from those sections:
+
+- **§13's own campaign is untouched by this** and remains the strongest statement available: a cell with the
+  coherence bit forced on (`GGML_HRX_USE_UNIFIED_MEMORY=1`, `memory_type` `0x52` -> `0x56`, verified in the trace)
+  still faulted, so coherence is **not sufficient**. That is direct experimental evidence, independent of any
+  sentinel argument.
+- What §13 does not establish, in its own words, is coherence being "cleared as a *contributing* factor".
+- The same applies to ordering: "not sufficient" was shown; "not contributing" was inferred, and the inference is
+  the part that does not hold.
+
+**Why this matters now, and what it revives.** The producer is block 41's FFN during a prefill (§40), and today's
+Face-B evidence is that the *same* event yields stale **finite** values where Face A yields NaN (§44). A reader
+observing a buffer's *previous* contents - finite stale data - rather than its intended contents is the signature
+of a visibility or ordering failure at that crossing, with the value class decided by whatever the buffer held
+before (NaN from a sentinel/uninitialised state, or stale floats). So the visibility/ordering family is a live
+*contributing* hypothesis for the producer tensors, constrained by §13 to be insufficient on its own.
+
+**Next discriminator, in order.** (1) The chain probe now on the box: whether block 41's *input* tensors
+(`l_out-40`, `ffn_inp-41`, `ffn_norm-41`) already carry NaN or only its FFN outputs do. An input-side NaN puts the
+corruption at a boundary *before* the block, which is where a visibility/ordering defect would sit; an output-side
+NaN puts it inside the FFN's own compute. (2) Only then a coherence/ordering variant scored with the multi-face
+rule including `identical_distinct`, since a NaN-only or 500-only score cannot see the finite half of this defect.

@@ -612,6 +612,14 @@ failure "does not currently reproduce on demand" (section 22 host note; the comm
 branch's pin `e44c9d01a`, i.e. the #314 fix is *in* and these faults remain). A masked-key visibility defect
 in that kernel is exactly a first-decode, data-dependent, intermittent fault.
 
+One fact from that history that matters for task-4: the pin carries **both** #314 candidates, and the merge
+`26330cc20` took the *shared-memory* variant (`f9ff06675`, 102 lines: `all_visible` becomes "all 16 lanes of
+this tile see a visible key", read from the tile's own shared-memory entries) **over** the always-stage
+fallback (`cf4dfd801`, 6 lines: `all_visible = false`, `any_visible = true`, so every key tile takes the
+staging path and never issues a collective). So the conservative path exists, is authored, and is *not* what
+runs. If outcome 1 of the list below holds, that fallback is a forward-only candidate fix already in the tree,
+which would make task-4 a small, reviewable change rather than a new kernel.
+
 ### Pre-predicted outcomes of the next arm
 
 Run on the first decode of a faulting arm, fingerprinting the attention side by name — `attn_inp_kq_mask` is a

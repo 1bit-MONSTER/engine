@@ -50,6 +50,9 @@ limitations under the License.
 | exactly one `n_embd` row of NaN (2048 floats) is the invariant across the 16 faulting in-session arms, at the MoE aggregation, with the traced row count varying 87-342 | 47 | `for d in ~/wt/rt-det/315nan-*/; do grep -m1 -E "hrx-tensor-fp.*nan=[1-9]" $d/server.log; done` on strixhalo |
 | the coherence *patch* does not remove the fault (9 clean, 1 fault in 10 fix-cell arms, `hv52=0 hv56=1` proving it live) | 46 | `~/wt/315accept-console.log` |
 | `GRAPH_SYNC` after every replay does not remove the fault (1 in-regime arm, faulted; 4 of 6 arms below the gate) | 46 | `~/wt/315gsync-console.log`, `evidence/315-face-landscape.md` |
+| the AQL-block-split asymmetry is *not* real: `packet_index_base` is a profiling prefix (0 when profiling is off) and every block is submitted as its own submission | 32 | `host_queue_command_buffer_block.c:879`, `host_queue_command_buffer_replay.c:337/364` |
+| the routed-FFN path's routing tables are rebuilt per plan, so a stale table is not available as a mechanism; the sites that can lose one token's row are intra-plan producer/consumer ordering, the partition kernel's `completion_counters` publication, and the tables' transient allocation | 49 | `evidence/315-moe-routing-routed-ffn-static.md` |
+| the engine's MoE expert-streaming cache (`serve --moe-slots`/`--moe-subst`, `moe/expert_cache.cpp`) is not on the HRX decode path | 49 | the same file, section 6 |
 | the two faces never co-occur (23 Face-A, 7 Face-B, 0 both, 108 clean of 142 arms) | 42 | `evidence/315-face-landscape.md` |
 | Face A travels with finite nondeterminism; Face B does not | 42 | the same file (`identical_distinct` distribution) |
 | neither instrument can fabricate NaN (copy probe only fprintfs; sentinel is size-gated to 619520) | 41 | `ggml-hrx.cpp:181-199, 380-391` in the fp build's tree |

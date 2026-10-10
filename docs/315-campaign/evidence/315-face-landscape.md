@@ -165,3 +165,27 @@ Every session's `control_bin` on disk is `~/wt/315instr3-build`, whose tree carr
 a baseline. `~/wt/315fix-build` is the same family with the coherence gate removed (240 insertions). A true
 stock-pin control does not exist on the box; building one from a clean worktree at the pin is a prerequisite for the
 task-5 control cell and for any "unchanged relative to baseline" claim in task-6.
+
+## The host-read path, read from the pin (for whatever the sync test returns)
+
+`ggml-hrx.cpp:454 backend_get_tensor_async` has two paths, and only one of them is synchronous:
+
+```cpp
+ggml::hrx::HostBufferRef destination = backend_context->device->host_buffers.find(data, size);
+if (destination.valid()) {
+    // Registered host buffers can participate directly in the stream command buffer.
+    HRX_CHECK(hrx_stream_copy_buffer(backend_context->stream, context->buffer, tensor_base + offset,
+                                     destination.buffer(), destination.offset(), size));
+} else {
+    synchronous_download_fallback(backend_context, context->buffer, tensor_base + offset, data, size);
+}
+```
+
+The registered-buffer path enqueues a *stream copy* - it does not complete the transfer, and it does not itself
+order that copy against the submission of the graph that produced the data. `backend_synchronize` (a few lines
+below) does the actual `stream_synchronize_sleeping`, and the executor's replay path already consults a
+`replay_wait_status`, so whether a read can observe pre-write contents depends on how the copy is ordered against
+the producing graph's *submission*, not merely on whether the stream is flushed before the wait. That is the
+concrete thing `315-graphsync.sh` changes - it forces a stream synchronisation after every graph replay - and it is
+where a scoped forward-only fix would go if the sync test comes back clean: order the producing graph's submission
+ahead of the copy that feeds a host read, rather than synchronising every graph.

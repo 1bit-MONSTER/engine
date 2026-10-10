@@ -125,3 +125,25 @@ the tensor type is `i32`.
   a different session, on prefills of T = 87…342, while this arm is a T = 10 prefill measured by name. The two
   observations are in tension, and until the same instrument is run over the same arms, "one row" must not be
   quoted as the fault's shape.
+
+## The complete session tally (added when the run finished)
+
+```sh
+ssh strixhalo 'grep -E "^  pair" ~/wt/315row-console.log'
+#   pair 1 arm c: FAULT nan=1 req=34 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=80G)
+#   pair 1 arm l: OK    nan=0 req=66 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=98G)
+#   pair 2 arm l: FAULT nan=1 req=34 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=80G)
+#   pair 3 arm l: OK    nan=0 req=66 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=99G)
+#   pair 4 arm l: OK    nan=0 req=66 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=99G)
+```
+
+Five arms, **every one at `gtt_start=98G`** (inside the frozen `>= 95 GiB` gate): two faults (`nan=1`, each aborting
+at `req=34` of 66) and three arms completing `66/66`. The by-name instrument therefore reproduces the fault in
+**2 of 5 in-regime arms**, against the shipped pin's recorded 2/37 = 5.4 % - consistent with section 39's finding
+that the instrument is an *inducer*: it raises the rate, which is what makes a few arms informative at all, and
+which is why no arm here is eligible and no rate is quoted from it.
+
+Two of the five were the control cell (both build cells are the same binary in this diagnostic). The two faulting
+arms are `315row-p1c` and `315row-p2l`; their fingerprints are quoted in the body of this file, and their
+disagreements are what exposed the unsynchronised-read defect (section 53), which is the reason those per-node
+lines are not used as attribution.

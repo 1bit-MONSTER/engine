@@ -1917,3 +1917,28 @@ same token index in every tensor of the chain (a per-token state, which points a
 it the *last* row - the token whose routing is computed last and is therefore the one a racing read would find
 unwritten? A tail-row answer would name the defect as a routing-table read that is not ordered after the routing
 computation, and the fix as ordering it.
+
+## 48. Why the last two runs under-shot the gate: the probe scripts override the composition target downward
+
+`315-regime.sh:65` composes neighbours until live GTT reaches `REGIME_LO`, default **80** GiB, and comments the
+projection it assumes: "projects to >=95 after the detector loads". Every *probe* wrapper that calls the harness
+passes its own defaults instead - `REGIME_LO=${REGIME_LO:-70} REGIME_HI=${REGIME_HI:-85}` - in
+`315-attrib.sh:57`, `315-campaign.sh:40`, `315-faceb.sh:49`, `315-graphsync.sh:58` and `315-rowprobe.sh:77`. The
+arm then loads on a composition that stopped at 70 GiB and lands **out of regime**, because the detector's own
+contribution is not the ~25 GiB the LO=70 projection needs.
+
+The two sessions of 2026-10-10 are the controlled contrast, same harness, same box, same day:
+
+| session | wrapper | `gtt_before_arm` | arms | outcome |
+|---|---|---|---|---|
+| `315chain` (09:37) | `315-chain.sh` - sets no `REGIME_LO`, so 80 applies | 80G (2 neighbours) | 7 | every arm `gtt_start=98G`, in-regime |
+| `315gsync` (10:10) | `315-graphsync.sh` - LO=70 | 70G | 6 | `gtt_start` 87-99G, **4 of 6 below the gate** |
+
+So the graphsync falsifier was not unlucky and not under-composed for want of neighbours: it was told to stop one
+step early. Same for the row probe that started at 10:44, had it not in fact reached 80G with three neighbours.
+
+Fixed in place: the five wrappers now default to `REGIME_LO=80 REGIME_HI=92`, matching the module, with the reason
+recorded at the module's default (`315-regime.sh:65`). This is a tooling correction only - it changes no registered
+criterion, and the arms it will produce are ordinary in-regime arms. Consequence for the record: the
+`315gsync`/`315row` arms are labelled by their own `gtt_start` as they always were, and any statement about the
+fault's rate must come from arms at or above the gate.

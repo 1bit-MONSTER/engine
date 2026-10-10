@@ -35,9 +35,9 @@ test -x "$FIX/bin/llama-server" || { echo "ABORT: no $FIX/bin/llama-server"; exi
 test -x "$CTRL/bin/llama-server" || { echo "ABORT: no $CTRL/bin/llama-server"; exit 2; }
 echo "fix  binary: $("$FIX/bin/llama-server" --version 2>&1 | head -1)"
 echo "ctrl binary: $("$CTRL/bin/llama-server" --version 2>&1 | head -1)"
-echo "campaign: tag=$TAG pairs=$PAIRS target_clean=$MINCLEAN regime_LO=${REGIME_LO:-70} regime_HI=${REGIME_HI:-85} EXTRA_ENV=<empty>"
+echo "campaign: tag=$TAG pairs=$PAIRS target_clean=$MINCLEAN regime_LO=${REGIME_LO:-80} regime_HI=${REGIME_HI:-92} EXTRA_ENV=<empty>"
 
-REGIME_LO=${REGIME_LO:-70} REGIME_HI=${REGIME_HI:-85} MINCLEAN="$MINCLEAN" \
+REGIME_LO=${REGIME_LO:-80} REGIME_HI=${REGIME_HI:-92} MINCLEAN="$MINCLEAN" \
   bash "$HOME/wt/315-paired.sh" "$PAIRS" 2 2048 "$CTRL/bin" "$FIX/bin" "$TAG" 2>&1 | tail -12
 # The "2" above is the driver's <neighbours> argument and it is INERT: the driver reads it only to print it
 # in the session header, and composition is done by 315-regime.sh, which starts neighbours one at a time

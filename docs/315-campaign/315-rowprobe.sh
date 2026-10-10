@@ -64,7 +64,7 @@ cmake -S "$SRC" -B "$B" \
   -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=OFF -DBUILD_TESTING=OFF \
   > "$LOG" 2>&1 || { echo "row: cmake failed"; tail -20 "$LOG"; exit 1; }
 echo "row: building -j10 $(date -Is)"
-cmake --build "$B" -j 10 >> "$LOG" 2>&1 || { echo "row: build failed"; tail -30 "$LOG"; exit 1; }
+cmake --build "$B" -j 6 >> "$LOG" 2>&1 || { echo "row: build failed"; tail -30 "$LOG"; exit 1; }
 "$B/bin/llama-server" --version
 
 LIB=$(ls "$B"/bin/libggml-hrx.so* 2>/dev/null | head -1)
@@ -74,7 +74,7 @@ echo "row: index field present in $(basename "$LIB")"
 NAMES="ffn_moe_probs-41,ffn_moe_weights-41,ffn_moe_gate-41,ffn_moe_up-41,ffn_moe_weighted-41,ffn_moe_down-41,ffn_moe_out-41,ffn_swiglu-41,ffn_shexp-41,ffn_out-41,l_out-41,norm,result_norm,result_output"
 echo "row: running $ARMS arms with the index fingerprint $(date -Is)"
 CBIN="$B/bin" FBIN="$B/bin" NOLOCK=1 \
-REGIME_LO=${REGIME_LO:-70} REGIME_HI=${REGIME_HI:-85} \
+REGIME_LO=${REGIME_LO:-80} REGIME_HI=${REGIME_HI:-92} \
   bash "$HOME/wt/315-attrib.sh" "$ARMS" "$TAG" 999 \
   "GGML_HRX_SENTINEL=1 GGML_HRX_TENSOR_FP=$NAMES GGML_HRX_TENSOR_FP_NANONLY=1"
 

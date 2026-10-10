@@ -54,7 +54,7 @@ echo "=== attrib session tag=$TAG pairs=$PAIRS control_every=$CE $(date -Is) ===
 echo "    extra_env='${EV}'"
 echo "    control_bin=$CBIN fix_bin=$FBIN"
 
-REGIME_LO=${REGIME_LO:-70} REGIME_HI=${REGIME_HI:-85} \
+REGIME_LO=${REGIME_LO:-80} REGIME_HI=${REGIME_HI:-92} \
 CONTROL_EVERY="$CE" NOSTOP=1 MINCLEAN=999 NOLOCK=1 \
 EXTRA_ENV="$EV" ARM_TIMEOUT="${ARM_TIMEOUT:-1200}" \
   bash "$D/315-paired.sh" "$PAIRS" "${NB:-2}" "${NCTX:-2048}" "$CBIN" "$FBIN" "$TAG"

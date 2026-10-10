@@ -63,6 +63,10 @@ regime_neighbours() {
     local up_timeout=${REGIME_UP_TIMEOUT:-150}
     REGIME_NB=0; local failures=0
     REGIME_LO=${REGIME_LO:-80}; REGIME_HI=${REGIME_HI:-92}
+    # Callers must not lower these. The pre-registered arm gate is gtt_start >= 95 GiB and the detector
+    # contributes ~19-30 GiB, so a composition that stops at a lower LO lands out of regime: the
+    # 2026-10-10 315gsync and 315row sessions passed LO=70/HI=85 and produced 87-93 GiB arms (4 of 6
+    # below the gate), while 315chain, which inherits these defaults, produced 98 GiB arms.
     while [ "$REGIME_NB" -lt "$max_nb" ]; do
         local now; now=$(regime_gtt)
         if [ "$REGIME_NB" -ge "$min_nb" ] && [ "$now" -ge "$REGIME_LO" ]; then break; fi

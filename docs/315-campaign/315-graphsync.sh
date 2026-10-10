@@ -55,7 +55,7 @@ fi
 # Both slots get the same build and the knob applies to both cells, so a control cell would be a duplicate:
 # run fix-slot arms only and compare against the no-knob arms already recorded by the same harness.
 cd "$HOME/wt" || exit 1
-REGIME_LO=${REGIME_LO:-70} REGIME_HI=${REGIME_HI:-85} \
+REGIME_LO=${REGIME_LO:-80} REGIME_HI=${REGIME_HI:-92} \
 CONTROL_EVERY=999 NOSTOP=1 MINCLEAN=999 NOLOCK=1 ARM_TIMEOUT=${ARM_TIMEOUT:-1800} \
 EXTRA_ENV="GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1" \
   bash "$HOME/wt/315-paired.sh" "$PAIRS" "${NB:-2}" "${NCTX:-2048}" \

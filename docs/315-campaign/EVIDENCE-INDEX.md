@@ -47,6 +47,9 @@ limitations under the License.
 | GLM runs the **row-major MLA** layout, never the transposed-V transient | 38 | `dispatch-flash-attention.cpp` `prepare_flash_attention_value` |
 | GLM never dispatches `q6_k_token1_shortlist`, so section 37's defect is not its mechanism | 37 | `evidence/315-glm-dispatch-inventory.md` |
 | the pin is race-free at the October shape and at the regime's shapes (2250 + 2000 reps) | 34, 36 | `evidence/315-fa-race-pin-sweep.md` |
+| exactly one `n_embd` row of NaN (2048 floats) is the invariant across the 16 faulting in-session arms, at the MoE aggregation, with the traced row count varying 87-342 | 47 | `for d in ~/wt/rt-det/315nan-*/; do grep -m1 -E "hrx-tensor-fp.*nan=[1-9]" $d/server.log; done` on strixhalo |
+| the coherence *patch* does not remove the fault (9 clean, 1 fault in 10 fix-cell arms, `hv52=0 hv56=1` proving it live) | 46 | `~/wt/315accept-console.log` |
+| `GRAPH_SYNC` after every replay does not remove the fault (1 in-regime arm, faulted; 4 of 6 arms below the gate) | 46 | `~/wt/315gsync-console.log`, `evidence/315-face-landscape.md` |
 | the two faces never co-occur (23 Face-A, 7 Face-B, 0 both, 108 clean of 142 arms) | 42 | `evidence/315-face-landscape.md` |
 | Face A travels with finite nondeterminism; Face B does not | 42 | the same file (`identical_distinct` distribution) |
 | neither instrument can fabricate NaN (copy probe only fprintfs; sentinel is size-gated to 619520) | 41 | `ggml-hrx.cpp:181-199, 380-391` in the fp build's tree |
@@ -74,8 +77,8 @@ October FA race, the `exact_output` access defect. Section 29 is the consolidate
 | acceptance tooling | `315-campaign.sh`, `315-paired.sh`, `315-detector.py`, `315-analyse.py` | frozen; four freeze notes in `315-preregistration.md` section 8 |
 | acceptance rule self-test | `tools/test-analyse.py` | 10/10 cases pass (gate edges, Face-B-as-fault, rate over in-regime arms rather than clean arms) |
 | attribution + chain probes | `315-attrib.sh`, `315-chain.sh`, `315-chain2.sh` | diagnostic only, never acceptance-eligible. `315-chain.sh` ran: pair 1 faulted both cells with a 60-name fingerprint and **zero** NaN lines, which is the direct Face-B measurement; `315-chain2.sh` is staged for the input-side case |
-| visibility falsifier | `315-graphsync.sh` | queued: `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1` (a stream sync after every replay), no other instrument |
-| row probe | `315-rowprobe.sh` | queued: builds the extended fingerprint (`ne0=`/`first=`/`row=`) into a new dir and reads the per-token MoE chain (section 47) |
+| visibility falsifier | `315-graphsync.sh` | ran 2026-10-10 (6 pairs, `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1` both cells, no other instrument): **4 of 6 arms below the gate**; the one in-regime arm faulted. Read as *not sufficient*, not as a rate. Record: `evidence/315-face-landscape.md` |
+| row probe | `315-rowprobe.sh` | ran 2026-10-10: builds the extended fingerprint (`ne0=`/`first=`/`row=`) into `~/wt/315row-build` and reads the per-token MoE chain (section 47) |
 | Face-B probe (not run) | `315-faceb.sh` | written then dropped in favour of the visibility falsifier; its question is answered by the chain probe's zero-NaN result |
 
 ## Arms and logs

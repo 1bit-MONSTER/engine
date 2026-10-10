@@ -1411,9 +1411,11 @@ because comparing a rare event across six runs is not evidence either way.
 With the regime blocked, the side quest was to attack the fault's own shapes and kernel family with the cheap
 standalone methods, and to finish the reads left open in sections 32-35.
 
-**1. The FA path is clean at GLM's own geometry.** `fa-race` used Hq=16/Hkv=8; GLM-4.7-Flash is Hq=32/Hkv=4 (the
-same geometry the earlier session put in `~/wt/lt/cfg`). Recompiling the harness with GLM's geometry and
-sweeping shapes on the pin's build:
+**1. The FA path is clean at GLM's own geometry.** `fa-race` used Hq=16/Hkv=8; the recompiled sweep used
+Hq=32/Hkv=4 (taken from `~/wt/lt/cfg`). **That label is wrong and section 38 corrects it** - GLM-4.7-Flash is MLA
+(`deepseek2`): 20 query heads against a single latent, 256-wide MLA key/value, 576-wide cache entries. So this
+sweep is evidence about the Qwen-shaped geometry, not about GLM's; it is still 2000 clean reps, just not at the
+shape it claims. The sweep's numbers:
 
 | T | cells | visible | reps | checksum | bad_runs |
 |---|---|---|---|---|---|
@@ -1547,3 +1549,35 @@ the first right-hand name - mapping `%out_na` to `%weight` instead of `%output` 
 read-only weights. Pairing the lists positionally drops the count to the 2 above, both of which were then
 checked by hand against the kernel body. The lesson is the usual one: a static audit that finds dozens of
 defects in widely exercised code is more likely to be wrong than the code.
+
+## 38. GLM's real attention geometry is MLA - and that invalidates the "GLM geometry" label on my sweeps
+
+While the arms ran I read the model's own metadata instead of trusting a config file, and it matters:
+
+| key | value |
+|---|---|
+| arch | `deepseek2` (**MLA**, multi-head latent attention) |
+| `attention.head_count` / `head_count_kv` | **20** / **1** |
+| `attention.key_length` | 576 (= `kv_lora_rank` 512 + rope 64) |
+| `attention.key_length_mla` / `value_length_mla` | 256 / 256 |
+| `attention.q_lora_rank` / `value_length` | 768 / 512 |
+| `rope.dimension_count` | 64 |
+| `expert_count` / `expert_used_count` / `expert_feed_forward_length` | 64 / 4 / 1536 (1 dense leading block, 47 blocks) |
+| `vocab_size` | 154,880 |
+
+**So sections 34 and 36 are mislabelled.** `fa-race` (Hq=16/Hkv=8) and my GLM-geometry recompilation (Hq=32/Hkv=4,
+taken from `~/wt/lt/cfg`) are both **not** GLM's attention shape: GLM has 20 query heads against a single MLA
+latent, with 256-wide per-head MLA key/value and a 576-wide cache entry. The sweeps' clean results stand as
+results about *those* shapes; they are not evidence about GLM's, and the earlier session's `lt/cfg` was for a
+different model. Section 27's kernel suite is unaffected in the same way: `test-hrx-fa-masked-v` uses Hq=16/Hkv=8
+with head 128, so its 27 cases (and my 40) are not MLA either.
+
+That re-opens a cheap, well-defined probe rather than a vague one: an **MLA-shaped** attention race hunt. The
+shape is now known from the model itself, the harness pattern exists (`fa-race.cpp`: build one `FLASH_ATTN_EXT`,
+run it N times with identical inputs, compare bit-for-bit), and the FA dispatch for this model at the pin is
+`common.flash_attention_f32_f16_wmma` - whose source carries an explicit MLA branch ("MLA (deepseek2/GLM) stores
+V with the QK ... such a V keeps the row-major layout"). Nothing I have run to date exercises that branch, which
+makes it the most obviously untested code on the failing model's path.
+
+It also puts the `test-hrx-fa-masked-v` family's value in perspective: those tests are good evidence about the
+non-MLA kernels, and they say nothing about the branch GLM actually takes.

@@ -81,17 +81,24 @@ def main(argv):
             if g["row"] is not None:
                 row, ne0, first = int(g["row"]), int(g["ne0"]), int(g["first"])
                 tokens = n // ne0 if ne0 else 0
-                rows.add(row)
-                tail = "" if row < 0 else ("  <-- LAST ROW" if row == tokens - 1 else "")
+                # A T=1 tensor (the decode's logits, or a decode graph's activations) has one row by
+                # construction, so its row number carries no per-token information and must not enter the
+                # consistency verdict - doing so would manufacture a false "different rows".
+                if tokens > 1:
+                    rows.add(row)
+                tail = "" if tokens <= 1 or row < 0 else ("  <-- LAST ROW" if row == tokens - 1 else "")
+                note = "  (T=1: single token, row is trivial)" if tokens <= 1 else ""
                 print(f"    {g['name']:<22} {g['op']:<10} nan={nan:>7} of {n:<8} ne0={ne0:<6} "
-                      f"first={first:<9} row={row:<5} of T={tokens}{tail}")
+                      f"first={first:<9} row={row:<5} of T={tokens}{tail}{note}")
             else:
                 print(f"    {g['name']:<22} {g['op']:<10} nan={nan:>7} of {n:<8} (no row fields: "
                       f"this line predates the extension)")
         if rows:
-            verdict = ("SAME ROW throughout the chain -> per-token state" if len(rows) == 1
-                       else f"{len(rows)} DIFFERENT ROWS -> not a single per-token state")
-            print(f"    rows seen: {sorted(rows)}  -> {verdict}")
+            verdict = ("SAME ROW throughout the multi-token chain -> per-token state" if len(rows) == 1
+                       else f"{len(rows)} DIFFERENT ROWS across multi-token tensors -> not one per-token state")
+            print(f"    rows seen (multi-token tensors only): {sorted(rows)}  -> {verdict}")
+        elif seen:
+            print("    no multi-token tensor in this arm carried NaN (all affected tensors were T=1)")
     return 0
 
 

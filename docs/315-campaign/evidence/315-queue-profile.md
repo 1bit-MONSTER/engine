@@ -104,3 +104,29 @@ which invalidates the arms already recorded (each is labelled by its own `gtt_st
 
 This is the same family as the "silent arm loss" trap already recorded in `KNOWN-ISSUES.md` (an abnormal arm death
 leaving an orphan holding the flock), with a second trigger: a *normal* arm whose teardown outlives the 15 s window.
+
+## Appendix 2: `HRX_COMMAND_BUFFER_MODE=pm4` is unusable on this workload (2026-10-10)
+
+The other lever on the packet mechanism is the command-buffer mode: `aql` (the default) versus `pm4`
+(`logical_device.c:244-253`, and PM4/AUTO additionally provision upload queue-control storage for *reusable*
+dispatch command buffers with dynamic binding-table fixups). The paired A/B was run - control = the default AQL
+path, fix cell = the same binary behind a launcher exporting `HRX_COMMAND_BUFFER_MODE=pm4`, both cells carrying
+the same inducer, arms alternating, `REGIME_LO=80`:
+
+```text
+pair 1 arm c: OK   nan=0 req=66 gtt_start=98G      pair 1 arm l: FAULT nan=0 req=1 gtt_start=97G
+pair 2 arm c: OK   nan=0 req=66 gtt_start=98G      pair 2 arm l: FAULT nan=0 req=1 gtt_start=97G
+pair 3 arm c: FAULT nan=1 req=19 gtt_start=98G     pair 3 arm l: FAULT nan=0 req=1 gtt_start=97G
+pair 4 arm c: OK   nan=0 req=66 gtt_start=98G      pair 4 arm l: FAULT nan=0 req=1 gtt_start=97G
+control: OK=3 FAULT=1 OOR=0        fix(pm4): OK=0 FAULT=4 OOR=0
+```
+
+**Every PM4 arm stopped at `req=1` with `nan=0`**, and the detector's own record for one of them is
+`{"requests": 1, "ok": 0, "http_failures": 1, "first_failure": "HTTP 500"}` - i.e. the *first* request failed.
+That is not a fault-rate comparison: the PM4 cell never reached the workload, so the four "FAULT" verdicts are
+the harness's short-request rule, not Face A or Face B. The honest reading is **inconclusive for the mechanism**
+and a separate diagnostic finding: **`HRX_COMMAND_BUFFER_MODE=pm4` fails the first request with HTTP 500 on this
+stack, at the pin**, which is worth its own report and is out of #315's scope.
+
+The consequence for this issue is that the packet-level lever has to be the barrier bit itself (see
+`315-forcebarrier.sh`), not the command-buffer mode.

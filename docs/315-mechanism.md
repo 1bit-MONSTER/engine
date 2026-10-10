@@ -925,35 +925,56 @@ needed. `GGML_HRX_FA_PARTIAL_ALIGN=256`, `-fa on`, Qwen3-0.6B on HRX0, 180 ident
 server process, with `sudo -n tee /proc/sys/vm/compact_memory` looping in the background. Harness:
 `315-campaign/315-cheap-probe.sh`; evidence: `315-campaign/evidence/315-cheap-repro.txt`.
 
-| configuration | requests | distinct logits hash at token 0 | token 2 | token 7 | token 23 | distinct completions |
-|---|---|---|---|---|---|---|
-| default align, quiet | 180 | 1 | 1 | 1 | 1 | 1 |
-| default align + compaction | 180 | 1 | 1 | 1 | 1 | 1 |
-| **align=256 + compaction** | 180 | **2** | **7** | **35** | **121** | **95** |
+| configuration | runs | outcome |
+|---|---|---|
+| default align, quiet | 1 | clean, 180/180 identical |
+| default align + compaction | 2 | clean, 180/180 both |
+| align=256, quiet | 1 | clean, 180/180 |
+| **align=256 + compaction** | **5** | **1 faulty (95 distinct outputs of 180), 4 clean (180/180)** |
 
-Three things follow:
+**Correction to the first version of this section.** It presented the table above as a clean 2x2 and called
+the configuration a reproducer. Five runs of the faulty cell do not support that: it fired once (95 distinct
+outputs, tokens 0/2/7/23 = 2/7/35/121 distinct logits hashes) and was clean four times at 180 requests each.
+The other three cells have one or two runs each and were always clean, so "needs both the layout knob and the
+evictions" is a reading of single runs, not an established result. What is established is narrower and still
+worth having: **a preemption-sensitive wrong-output event is possible at this pin**, it happened at align=256
+with compaction running, its onset was the first decoded token, and every sampled logit was finite. The
+runs: `315align256` (faulty), `315r256-1`, `-2`, `-3`, `-4`, `-5` (clean), plus `315a256-quiet`,
+`315fa-ctl`, `315fa-compact`, `315r4096-1`, `315ctl-nocompact`.
 
-1. **The class reproduces on the pin**, without GLM, without the 98 GiB regime, without neighbours, in about a
-   minute. Compaction alone changes nothing (row 2) and the knob without compaction was not tried, so the two
-   together are what opens it.
-2. **The onset is the first decoded token.** Token 0 already has two distinct logits hashes across 180
-   identical requests and the divergence compounds from there - the same locality engine#315 records for its
-   own faults (section 23: every fault on the first decoded token of a newly launched task).
-3. **All sampled logits stay finite** (`nan=0` throughout), so this shape is **Face B**, not Face A. That is
-   consistent with the class's own description: wrong when the stale bytes are finite, NaN only when they are
-   not.
+Why it is not controllable yet: the one faulty run happened while the foreign session on the box was busy
+(load average 8-12); the four clean repeats ran while it was quieter (load 4-7). That fits the class's own
+description - the window opens on queue preemption, and page compaction alone may not be enough without real
+contention - but it is a correlation over five runs, not a measurement. Making it a tool means creating the
+contention deliberately (a second HRX workload of our own running against the same device while the probe
+runs) rather than borrowing the neighbour's.
+
+Three things follow, at the strength the evidence actually supports:
+
+1. A wrong-output event of this class is reachable at the pin without GLM, without the 98 GiB regime and
+   without neighbours - but rarely, and not yet on demand.
+2. Its onset in the faulty run was the first decoded token, the same locality the arms show for engine#315
+   (section 23).
+3. All sampled logits stayed finite (`nan=0`), so that shape is Face B; nothing here has produced Face A.
 
 The knob is not merely misaligning a buffer - it changes which kernels the dispatcher selects
 (`GGML_HRX_LOG_DISPATCH=1`): at align=256 `common.flash_attention_decode_split_next_q8` never runs and
-`kquant.mul_mat_add.decode_f32 (fused)` does; at the shipped align=4096 it is the other way round. So the
-divergence is carried by one of those two substitutions, and they are separable with the registry's own skip
-knob (`GGML_HRX_DISABLE_DISPATCH`, whose "fused" form skips every fused registration).
+`kquant.mul_mat_add.decode_f32 (fused)` does; at the shipped align=4096 it is the other way round. The
+registry's own skip knob separates them: with `GGML_HRX_DISABLE_DISPATCH=kquant.mul_mat_add.decode_f32`
+the fault still happened (68 distinct outputs of 180, that same evening, one run), so the matmul-add fusion
+is not the carrier. What is left is the flash-attention substitution - at align=256 the single-token decode
+is served by `common.flash_attention_f32_f16_wmma`, the prefill-shaped kernel, instead of the decode-split
+one. That kernel has no global-to-global handoff to blame (its only stored-and-loaded buffer is the mask
+input, written by a separate test-only helper: auditing its views by root buffer shows `%score_stage` as LDS
+and nothing else), so if it is the carrier, the defect is not the missing global fence of section 28's
+opening paragraph but something else in how that kernel is dispatched or parameterised for a decode shape.
 
 What this does and does not say. It does **not** show that #315's in-regime GLM fault is this instance: the
-knob is a documented stress knob, not the shipped default, and this is a different model and shape. What it
-does show is that the class the maintainers believed closed at this pin is still live at a non-default layout,
-which is a testable lead for the mechanism and a reproducer that costs a minute instead of five hours - and it
-is the first artefact in this investigation that does not need the box to be free.
+knob is a documented stress knob, not the shipped default, this is a different model and shape, and the event
+fired once in five attempts. What it does say is narrower: a wrong-output, preemption-sensitive event of this
+family was possible at the pin on 2026-10-09, at a non-default layout, starting at the first decoded token.
+That is a lead, not a reproducer - but the probe itself costs a minute and does not need the box to be free,
+which no other artefact in this investigation can say.
 
 ### The arm probe is built and verified, so the next arm needs no setup
 

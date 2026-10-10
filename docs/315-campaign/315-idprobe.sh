@@ -39,6 +39,12 @@
 # Diagnostic, not acceptance: no registered criterion changes and no arm from it is eligible.
 #
 # Usage: 315-idprobe.sh [arms] [tag]
+#
+# Note on the gate: the composition target defaults to the module's 80 GiB ("State" section of
+# docs/315-mechanism.md: the probe wrappers used to override it *down* to 70 and under-shot the gate). For the
+# strictest reading of the in-regime requirement - task-2's "gtt_start >= 101 GiB" - export REGIME_LO=85
+# REGIME_HI=95: neighbours at 85 GiB put the detector's ~19-21 GiB at ~101-106, inside the 110 GiB upper bound.
+# The arms are labelled by their own gtt_start either way, so nothing is inferred from the setting.
 set -uo pipefail
 ARMS=${1:-4}; TAG=${2:-315id}
 SRC=$HOME/wt/llama-315copy

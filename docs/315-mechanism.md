@@ -2059,3 +2059,48 @@ This is a constraint, not a verdict: the routed-FFN chain stays the site for *wh
 diff stays the only candidate for *what changed*. The cheap test that separates them is the MLA race harness
 (`docs/315-campaign/tools/glm-mla-race.cpp`, already compiled on the box and never run) - seconds of GPU, no
 regime, no neighbours.
+
+## 53. Correction: the by-name fingerprint cannot support per-node attribution, and the arena it reads points at a better candidate
+
+Reading the trace instead of the fingerprint changes the reading of sections 50 and 51, in the direction of
+retracting my own attribution. `GGML_HRX_BUFFER_TRACE` names every allocation of 64 KiB or more
+(`ggml-hrx.cpp:343`), and in a complete arm (`315accept-p1c`) the host-visible allocations are exactly two:
+
+```text
+[hrx-buf] type=HRX0      host_visible=0 direct_host_binding=0 memory_type=0x30 size=17895352832   (the weights)
+[hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=619520       (the logits)
+[hrx-buf] type=HRX0      host_visible=0 direct_host_binding=0 memory_type=0x30 size=443547648
+[hrx-buf] type=HRX0      host_visible=0 direct_host_binding=0 memory_type=0x30 size=81788928
+[hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=44048640      (the arena)
+```
+
+The MoE tensors the fingerprint names - `ffn_moe_weights` (160 B), `ffn_moe_probs` (2560 B),
+`ffn_moe_gate`/`up` (245760 B), `ffn_moe_down`/`weighted` (327680 B), `l_out` (81920 B) - are **not allocated as
+buffers of their own**, so they live inside the 44048640-byte host-visible, non-coherent arena. (That is also the
+"44048640-byte second host-visible buffer" section 12's trace recorded.)
+
+Two consequences:
+
+1. **The fingerprint's reads are unsynchronised.** `ggml_backend_tensor_get` on a host-visible tensor is a plain
+   `memcpy` - no iface call, no sync (the t2 hard negative, and the reason the download probes could never fire).
+   So each of the fingerprint's per-node reads samples that arena at whatever moment the CPU gets there, and the
+   lines from one graph are **not a snapshot of one instant**. That is exactly what the two faulting arms show:
+   `ffn_moe_weighted-4` reads 81880 of 81920 NaN while `ffn_moe_out-4` - its own sum - reads finite, and
+   `ffn_moe_probs-4` reads finite while the gather from it reads NaN. **Sections 50 and 51's per-node ordering
+   ("the corruption enters at the gather, the source is finite") is therefore withdrawn**: it rests on reads that
+   are not ordered, and it is instrument-inference, not measurement. What survives is only what does not depend
+   on read order: the guard's own line (whole-buffer NaN) and the fact that the fault is real and in-regime.
+2. **The same structure is a better candidate than the one I withdrew.** The consumer reads the logits with the
+   same unsynchronised memcpy out of the same class of buffer, and nothing in that path waits for the producing
+   dispatch (section 22/45). A read that precedes the write yields *unwritten* memory: NaN if that is what the
+   mapping held (**Face A**), or the *previous token's* finite logits if that is what it held (**Face B**). Face B's
+   observed text flavours fit that reading better than any other candidate on the record: a repetition loop
+   (`a gaps gaps gaps gaps ...`) is what sampling from the previous token's logits produces, and a truncated
+   fragment is what it produces when the stale row is scaled differently. Regime dependence follows from the
+   mapping's history: under GTT pressure what the arena holds, and when the write lands, both change.
+
+This is a *candidate*, and it is not untested: `GRAPH_SYNC`-style inhibition has been run once
+(`315-graphsync.sh`, one in-regime arm, which faulted) - but that session's composition stopped at 70 GiB and 4 of
+its 6 arms fell below the gate, so it is one arm of evidence, not a falsification. The decisive run for it is the
+same knob with the composition fixed (`REGIME_LO=85`), which is queued: many in-regime arms, no other instrument.
+Zero faults there would make the read-path ordering the mechanism; an unchanged rate kills it.

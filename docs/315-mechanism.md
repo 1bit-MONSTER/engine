@@ -949,6 +949,15 @@ contention - but it is a correlation over five runs, not a measurement. Making i
 contention deliberately (a second HRX workload of our own running against the same device while the probe
 runs) rather than borrowing the neighbour's.
 
+**Follow-up, 2026-10-10:** the contention was never observed. A watcher was left measuring the neighbouring
+session's own `/proc` CPU counters for 1200 s and saw no device work at all - the `repro336` session holds the
+shared box lock (`~/.cache/lax-decode/box.lock`, fd 9, inherited by its three `llama-server` children) while
+sitting idle. So the box is *memory*-occupied, not compute-occupied, which is a refinement of the blocker: the
+regime gate is blocked by their resident GTT, not by contention. The paired probe run did not happen either -
+my watcher invoked `~/wt/cheap-probe.sh` while the harness had been copied to `/tmp/cheap-probe.sh`, so the
+sample was lost to a path bug, recorded here rather than papered over. Given section 34 (2250 clean FA reps on
+the pin) the cheap-probe path is not worth re-running without a specific hypothesis to test with it.
+
 Three things follow, at the strength the evidence actually supports:
 
 1. A wrong-output event of this class is reachable at the pin without GLM, without the 98 GiB regime and

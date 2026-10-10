@@ -1121,4 +1121,51 @@ Three things that matter for the remaining tasks:
   new fork commit that is a descendant of `e44c9d01a`.
 * **The regression half is still untested**: the `gcc-15` build of `onebit` plus the 14 test targets and `ctest`
   have not been run at all, because there is nothing to regress against yet. That is the one piece of task-6 that
-  will cost real time when the fix exists.
+  will cost real time when the fix exists. (`g++-15` is installed on `ryzen` - 15.2.0 - but all nine submodules are
+  uninitialised in this worktree, so the build starts with `git submodule update --init`.)
+
+## 31. Reconciling with KNOWN-ISSUES.md: what was already measured
+
+The issue's own entry is a substantive record, and reading it end to end changes what sections 24-30 are worth.
+Three things in it are load-bearing here, and one of them is a measurement that closes a candidate this session
+had floated.
+
+**The rate study is already done, in-regime, on both revisions.** From `KNOWN-ISSUES.md`:
+
+```
+A  shipped fix  (10604 = 3971f49bf)   40 scheduled, 40 in-regime, 37 complete
+   clean 66/66: 35   NaN faults: 2 (both parse=0, inside the gate)   rate 2/37 = 5.4%  (95% CI 0.7-18.2%)   parse-500: 3
+B  always-stage (10605)               30 scheduled, 30 in-regime, 25 complete
+   clean 66/66: 24   NaN faults: 1                                    rate 1/25 = 4.0%  (95% CI 0.1-20.4%)   parse-500: 5
+Fisher exact two-sided p = 1.000;  P(rate_A < rate_B) = 0.460
+```
+
+So the **always-stage variant that section 26 floated as a fix candidate has already been measured**: 62 arms
+across the two cells, no reduction. The withdrawal is therefore corroborated by measurement and not only by the
+kernel test - and it also fixes the number task-5's power statement is really about: the shipped pin's Face-A rate
+in-regime is **5.4%**, so 60 clean arms bounding the rate below ~5% is a real improvement claim, not a formality.
+
+**The issue text still carries the superseded Face-A story.** It says "the logits buffer is never written" and
+quotes the sampler guard. Section 21 falsified that (the faulting graph wrote all 154,880 logits as NaN, with
+varying payloads) and section 25 showed the sentinel could not have decided it either way. Task-7 has to correct
+that paragraph, not append to it.
+
+**One structural lead in the issue that sections 24-30 never mention:** "GLM is the only model whose decode splits
+into two 128 KB AQL command blocks (919 + 760 dispatches) with 1,399 barriers per token", filed under the
+kernel/binding family. That is a concrete, model-specific structural difference at exactly the layer the fault
+lives in - model-level state, first decode of a task - and it is a better lead than anything left in the kernel
+tests. It should be the first thing the next mechanism attempt checks: where the two blocks split, and what
+ordering the boundary does or does not preserve.
+
+**Also on the record and not to be redone:** the staged host-writeback path is excluded (11 valid arms, 0 `HRX host
+writeback` lines, reporting path proven under `=poison`); the direct device-to-host copy *is* covered by the wait;
+`GGML_HRX_TRANSIENT_REUSE=legacy` has no effect; pinning `f2099e9b7` would be a revert; and the issue lists four
+traps its own history sprang - the last of which, "stale incremental builds", is worth stating against this
+session's own work: `315fp-build` was rebuilt *incrementally* after the nan-dump patch, which is a source change
+plus relink rather than a stale object, but any arm used for acceptance must come from a fresh build directory with
+the engine's own `ExternalProject` arguments (section 27 records the diagnostic rebuild as such).
+
+**The pre-existing probe that names the producing graph `value`** (implemented on `f2099e9b7`, deliberately
+unbuilt because relinking there recompiles every TU that includes `backend-context.h`, and that CPU confounds a
+GTT-bound measurement) is the task-2 instrument. It is complementary to the nan-dump fingerprint built here: the
+fingerprint says which node goes NaN first, that one says which graph value produced the downloaded bytes.

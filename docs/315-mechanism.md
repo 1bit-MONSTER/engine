@@ -910,6 +910,51 @@ That also removes an easy trap: a "fix" aimed at a kernel's logic now has nothin
 kernel-level and compile-level work needs almost no device memory. Arm-level work is the only thing that
 needs the regime gate, and it is now the only thing outstanding.
 
+## 28. A cheap reproducer at the pin, found while the box was otherwise unusable
+
+Sections 26-27 left the producer at model level and the box unable to run GLM arms. The engine's own
+`docs/hrx.md` documents the historical instance of exactly this class - engine#123/#140: a producer wave
+writes global memory, a consumer wave reads it back, and the barrier between them fenced **LDS only**
+(`barrier<workgroup>`, no store wait, no `buffer_gl0_inv`), so the consumer could quantize the previous
+contents of the slot; "the f32 output was right and `next_q8` was wrong, and NaN when the stale bytes decoded
+as NaN". The window opens on dispatch preemption, which is why the rate followed memory-pressure settings.
+That fix is in the pin. Its repro recipe was not tried again until now.
+
+Recipe: the study's own stress knob plus forced queue evictions, on a model small enough that no regime is
+needed. `GGML_HRX_FA_PARTIAL_ALIGN=256`, `-fa on`, Qwen3-0.6B on HRX0, 180 identical greedy requests in one
+server process, with `sudo -n tee /proc/sys/vm/compact_memory` looping in the background. Harness:
+`315-campaign/315-cheap-probe.sh`; evidence: `315-campaign/evidence/315-cheap-repro.txt`.
+
+| configuration | requests | distinct logits hash at token 0 | token 2 | token 7 | token 23 | distinct completions |
+|---|---|---|---|---|---|---|
+| default align, quiet | 180 | 1 | 1 | 1 | 1 | 1 |
+| default align + compaction | 180 | 1 | 1 | 1 | 1 | 1 |
+| **align=256 + compaction** | 180 | **2** | **7** | **35** | **121** | **95** |
+
+Three things follow:
+
+1. **The class reproduces on the pin**, without GLM, without the 98 GiB regime, without neighbours, in about a
+   minute. Compaction alone changes nothing (row 2) and the knob without compaction was not tried, so the two
+   together are what opens it.
+2. **The onset is the first decoded token.** Token 0 already has two distinct logits hashes across 180
+   identical requests and the divergence compounds from there - the same locality engine#315 records for its
+   own faults (section 23: every fault on the first decoded token of a newly launched task).
+3. **All sampled logits stay finite** (`nan=0` throughout), so this shape is **Face B**, not Face A. That is
+   consistent with the class's own description: wrong when the stale bytes are finite, NaN only when they are
+   not.
+
+The knob is not merely misaligning a buffer - it changes which kernels the dispatcher selects
+(`GGML_HRX_LOG_DISPATCH=1`): at align=256 `common.flash_attention_decode_split_next_q8` never runs and
+`kquant.mul_mat_add.decode_f32 (fused)` does; at the shipped align=4096 it is the other way round. So the
+divergence is carried by one of those two substitutions, and they are separable with the registry's own skip
+knob (`GGML_HRX_DISABLE_DISPATCH`, whose "fused" form skips every fused registration).
+
+What this does and does not say. It does **not** show that #315's in-regime GLM fault is this instance: the
+knob is a documented stress knob, not the shipped default, and this is a different model and shape. What it
+does show is that the class the maintainers believed closed at this pin is still live at a non-default layout,
+which is a testable lead for the mechanism and a reproducer that costs a minute instead of five hours - and it
+is the first artefact in this investigation that does not need the box to be free.
+
 ### The arm probe is built and verified, so the next arm needs no setup
 
 Sections 26-27 pushed the surviving locus to model-level state under the regime, which only an arm can see.

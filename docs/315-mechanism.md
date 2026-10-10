@@ -2166,3 +2166,37 @@ What survives, and is what `315gsync2` actually tests:
    (`command-program-executor.cpp:2034`), i.e. it tests (1) and (2) rather than the acquire itself. That is why the
    paired run is the right experiment and why a clean fix cell would not have been explainable by "the acquire was
    missing" - it would point at coverage or at the unbarriered 15 %.
+
+## 56. The timepoint covers the last submission - so the read-path candidate has no mechanism left at the stream level
+
+Section 55 left one bookkeeping question standing: the wait is on `stream->timepoint`, so does that value cover the
+*last* submission? Every submission site answers it the same way, and the answer is yes:
+
+```text
+libhrx/src/libhrx/stream.c:129-155   uint64_t wait_value = stream->timepoint;  uint64_t signal_value = stream->timepoint + 1;
+                                     ... submit with that pair ...
+                                     stream->timepoint = signal_value;      // advanced AFTER the submission
+libhrx/src/libhrx/buffer.c:112       stream->timepoint = signal_value;
+libhrx/src/libhrx/event.c:96, :241   stream->timepoint = signal_value;
+libhrx/src/libhrx/transfer.c:74      stream->timepoint = signal_value;
+libhrx/src/libhrx/graph_exec.c:780   stream->timepoint = stream_signal_value;
+```
+
+Each submission signals `timepoint + 1` and the stream's timepoint is only advanced once that submission has been
+recorded, so an `hrx_stream_wait(stream)` waits on the most recent submission's signal. Combined with section 55's
+`hsa_signal_wait_scacquire`, the chain "submit -> signal -> acquire wait -> host read" is ordered **for work
+carried on that stream**.
+
+So the read-path story now has no mechanism at the level it was proposed. What is left of it is precisely what the
+queued run measures, and both residuals are narrower than "the read is unordered":
+
+* **the unbarriered 15 %** (§54: 92 of 612 dispatches; queue saturated) - ordering between those packets is left
+  to program order in the ring, which a per-replay sync addresses;
+* **a producer not carried on the waited stream** - the profile's `cb 3 execs 23` shows three command buffers, and
+  the amdgpu HAL provisions separate upload queue-control storage in PM4/AUTO modes
+  (`logical_device.c:2018-2027`), so "everything the logits depend on is on `backend_context->stream`" is an
+  assumption of the coverage argument rather than a measured fact.
+
+Both are tested by the paired `GRAPH_SYNC` run. If its fix cell is clean, the mechanism is one of these two and the
+remedy is a scoped sync; if it faults at the control cell's rate, the visibility/ordering family is closed for this
+fault and the fault is *computed* - which is the case the ordered locator (`315-fp2`) is gated to open.

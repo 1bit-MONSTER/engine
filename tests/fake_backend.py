@@ -19,7 +19,7 @@
 # (-m, --port, anything else ignored), answers /health, and replies to the
 # OpenAI routes with a fixed answer, streamed or not. The reply names the
 # backend's own model id ("fake-backend-id") so serve's rename is visible.
-import json, os, select, socket, sys, time
+import json, os, select, socket, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port = int(sys.argv[sys.argv.index("--port") + 1])
@@ -70,6 +70,10 @@ class H(BaseHTTPRequestHandler):
             timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0}
             self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
                              "timings": timings})
+            # "fake_exit": N: the backend exits with status N shortly after this reply, on its own
+            # (a crashed backend; serve must notice and not wait its SIGTERM grace for a dead pid)
+            if "fake_exit" in req:
+                threading.Timer(0.2, os._exit, [int(req["fake_exit"])]).start()
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

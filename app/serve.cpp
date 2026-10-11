@@ -455,6 +455,17 @@ void merge_env(std::vector<std::string>& env_store, const std::vector<std::strin
     }
 }
 
+// ONEBIT_BACKEND_STOP_GRACE_S: how long Child::stop waits after SIGTERM before SIGKILL (default 30 s).
+int stop_grace_s() {
+    if (const char* e = std::getenv("ONEBIT_BACKEND_STOP_GRACE_S"); e && *e) {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end && *end == '\0' && v >= 0 && v <= 86400) return int(v);
+        std::fprintf(stderr, "1bit serve: ONEBIT_BACKEND_STOP_GRACE_S=%s ignored (whole seconds, 0..86400); using 30\n", e);
+    }
+    return 30;
+}
+
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
 // closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
@@ -561,25 +572,38 @@ public:
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
 
-    // SIGTERM, then a generous wait before SIGKILL: a backend that holds an NPU hardware
-    // context (ryzenai-server on the RyzenAI provider) must get to close it itself. Killing
-    // such a process outright, with a live context after an earlier firmware timeout, took the
-    // kernel down on amdxdna 0.17.0 (2026-10-11, list_del corruption in amdxdna_client_cleanup).
-    // ryzenai-server stops within a second; the 30 s covers a backend busy in a long dispatch.
+    // SIGTERM to the child itself (it shares our process group, so no group signal: that would
+    // reach serve and every other backend), then a wait before SIGKILL: a backend that holds an
+    // NPU hardware context (ryzenai-server on the RyzenAI provider) must get to close it itself.
+    // Killing such a process outright, with a live context after an earlier firmware timeout,
+    // took the kernel down on amdxdna 0.17.0 (2026-10-11, list_del corruption in
+    // amdxdna_client_cleanup). The wait is ONEBIT_BACKEND_STOP_GRACE_S (30 s by default: a
+    // backend busy in a long dispatch); the escalation stays, a hung backend for ever is worse.
+    // A child that already exited (reaped by alive()) needs nothing: no signal, no wait.
     void stop() {
-        if (pid_ <= 0) return;
+        if (pid_ <= 0 || reap(WNOHANG)) return;
         ::kill(pid_, SIGTERM);
-        for (int i = 0; i < 300; i++) {
-            if (::waitpid(pid_, nullptr, WNOHANG) == pid_) { pid_ = -1; return; }
+        const int grace = stop_grace_s();
+        for (int i = 0; i < grace * 10; i++) {
+            if (reap(WNOHANG)) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
-        std::fprintf(stderr, "1bit serve: backend pid %d ignored SIGTERM for 30 s; killing it\n", int(pid_));
+        std::fprintf(stderr, "1bit serve: backend pid %d ignored SIGTERM for %d s; sending SIGKILL "
+                             "(on amdxdna, killing a process that holds an NPU context can take the kernel down; "
+                             "ONEBIT_BACKEND_STOP_GRACE_S sets this wait)\n", int(pid_), grace);
         ::kill(pid_, SIGKILL);
-        ::waitpid(pid_, nullptr, 0);
-        pid_ = -1;
+        reap(0);
     }
 
-    bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
+    bool alive() const { return pid_ > 0 && !reap(WNOHANG); }
+
+    // how the child ended ("exit 3", "signal 6"), "" while it runs or before it was reaped
+    std::string exit_text() const {
+        if (!exited_) return "";
+        if (WIFEXITED(status_)) return "exit " + std::to_string(WEXITSTATUS(status_));
+        if (WIFSIGNALED(status_)) return "signal " + std::to_string(WTERMSIG(status_));
+        return "gone";
+    }
 #endif
 
     // Polls the child's ready path (/health; /v1/models for servers without one, which answer
@@ -611,7 +635,22 @@ private:
 #ifdef _WIN32
     HANDLE proc_ = nullptr, job_ = nullptr;
 #else
-    pid_t pid_ = -1;
+    // Every waitpid on the child goes through here, so alive() and stop() agree: once the child
+    // is reaped (options WNOHANG to poll, 0 to wait) its status is kept and pid_ is -1. True once
+    // the child is gone. ECHILD (reaped elsewhere) counts as gone with no status.
+    bool reap(int options) const {
+        if (pid_ <= 0) return true;
+        int status = 0;
+        pid_t r;
+        while ((r = ::waitpid(pid_, &status, options)) < 0 && errno == EINTR) {}
+        if (r == 0) return false;
+        if (r == pid_) { exited_ = true; status_ = status; }
+        pid_ = -1;
+        return true;
+    }
+    mutable pid_t pid_ = -1;      // the running child; -1 once reaped (or never started)
+    mutable bool exited_ = false; // reaped with a status (status_)
+    mutable int status_ = 0;
 #endif
     int port_;
     std::string ready_path_;
@@ -1736,7 +1775,14 @@ int serve_child(const Options& given) {
         for (auto& c : children) c->stop();
         return 0;
     }
-    std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
+    std::string how;
+#ifndef _WIN32
+    {
+        std::lock_guard<std::mutex> lock(start_mu);
+        for (auto& c : children) if (how.empty() && !c->alive()) how = c->exit_text();
+    }
+#endif
+    std::fprintf(stderr, "1bit serve: a %s backend exited%s%s\n", device.c_str(), how.empty() ? "" : ": ", how.c_str());
     return 1;
 }
 

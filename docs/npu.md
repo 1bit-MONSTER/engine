@@ -33,6 +33,10 @@ Step 3 lands in three parts:
 | 3b | The lane runtime: model reader, buffer packing, runlist decode (`npu/lane`, `npu/generate`, `1bit npu-run`) | landed (#9) |
 | 3c | Serving: tokenizer, `1bit unified` (now `1bit serve`'s NPU route) | landed (#9) |
 
+AMD's own NPU runtime is a separate route: `1bit serve --device onnx` runs Ryzen AI Software's
+ONNX Runtime GenAI (the RyzenAI provider) on the NPU, on Linux too, with nothing of AMD's
+shipped by the engine ([ONNX Runtime, Linux NPU](onnx.md#linux-npu)).
+
 ## A model directory
 
 ```

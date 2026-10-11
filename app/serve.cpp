@@ -281,6 +281,56 @@ bool is_onnx_model_dir(const std::string& dir) {
     return fs::is_directory(dir) && fs::exists(fs::path(dir) / "genai_config.json");
 }
 
+// The execution mode an ONNX Runtime GenAI model declares, read as ryzenai-server reads it:
+// "npu" when the RyzenAI provider (or config_entries) has hybrid_opt_token_backend "npu",
+// "hybrid" for the RyzenAI provider without it, "" for a CPU model (no RyzenAI provider).
+std::string onnx_ryzenai_mode(const std::string& dir) {
+    try {
+        std::ifstream f(fs::path(dir) / "genai_config.json");
+        const json cfg = json::parse(f);
+        const json& session = cfg.at("model").at("decoder").at("session_options");
+        if (session.contains("config_entries") && session["config_entries"].value("hybrid_opt_token_backend", "") == "npu")
+            return "npu";
+        if (!session.contains("provider_options")) return "";
+        for (const json& p : session["provider_options"]) {
+            if (!p.is_object() || !p.contains("RyzenAI")) continue;
+            return p["RyzenAI"].is_object() && p["RyzenAI"].value("hybrid_opt_token_backend", "") == "npu" ? "npu" : "hybrid";
+        }
+    } catch (const std::exception&) {
+    }
+    return "";
+}
+
+// Ryzen AI Software for Linux (docs/onnx.md, "Linux NPU"): its installer makes a venv whose
+// deployment/lib holds ONNX Runtime GenAI with the RyzenAI execution provider, and XRT lives
+// in a prefix of its own. ONEBIT_RYZENAI_ROOT names the venv; ONEBIT_XRT_ROOT the XRT prefix
+// (else $XILINX_XRT, else /opt/xilinx/xrt). The child's environment, in the order the
+// libraries must resolve: XRT's lib first (the venv's voe wheel bundles an older
+// libxrt_coreutil that must not shadow it), then ryzenai-server's own directory (the copies
+// scripts/build-onnx.sh made and cleared of executable stacks), then deployment/lib, then what
+// LD_LIBRARY_PATH already held. The provider library is the copy beside the server when the
+// build made one. Nothing in the venv is modified.
+std::vector<std::string> ryzenai_child_env(const std::string& root, const fs::path& server_dir) {
+    const fs::path deployment = fs::path(root) / "deployment" / "lib";
+    if (!fs::is_directory(deployment))
+        throw std::runtime_error("ONEBIT_RYZENAI_ROOT=" + root + ": no deployment/lib there (a Ryzen AI Software venv has one, docs/onnx.md)");
+    std::string xrt;
+    if (const char* e = std::getenv("ONEBIT_XRT_ROOT"); e && *e) xrt = e;
+    else if (const char* e2 = std::getenv("XILINX_XRT"); e2 && *e2) xrt = e2;
+    else xrt = "/opt/xilinx/xrt";
+    if (!fs::is_directory(fs::path(xrt) / "lib"))
+        throw std::runtime_error("no XRT at " + xrt + " (no lib/ there): set ONEBIT_XRT_ROOT to the XRT prefix, docs/onnx.md");
+    std::string ld = (fs::path(xrt) / "lib").string();
+    if (!server_dir.empty()) ld += ":" + server_dir.string();
+    ld += ":" + deployment.string();
+    if (const char* old = std::getenv("LD_LIBRARY_PATH"); old && *old) ld += std::string(":") + old;
+    fs::path ep = server_dir / "libonnxruntime_providers_ryzenai.so";
+    if (server_dir.empty() || !fs::exists(ep)) ep = deployment / "libonnxruntime_providers_ryzenai.so";
+    if (!fs::exists(ep))
+        throw std::runtime_error(ep.string() + " is missing: the RyzenAI execution provider of Ryzen AI Software for Linux");
+    return {"XILINX_XRT=" + xrt, "LD_LIBRARY_PATH=" + ld, "RYZENAI_EP_PATH=" + ep.string()};
+}
+
 // DwarfStar's ds4-server (third_party/ds4, MIT), built by scripts/build-ds4.sh
 std::string default_ds4() {
     if (const char* e = std::getenv("ONEBIT_DS4"); e && *e) return e;
@@ -387,13 +437,31 @@ PortOwner port_owner(pid_t child, int port) {
 #endif
 
 // A child OpenAI-compatible server on a loopback port.
+// The child's environment: ours, plus env_extra where a variable is not set (a value the user
+// set wins), plus env_override in place of whatever was set (the few a route must own: the
+// library order the RyzenAI provider needs, which already folds in the user's LD_LIBRARY_PATH).
+void merge_env(std::vector<std::string>& env_store, const std::vector<std::string>& env_extra,
+               const std::vector<std::string>& env_override) {
+    for (const auto& e : env_extra) {
+        const std::string key = e.substr(0, e.find('=') + 1);
+        bool present = false;
+        for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
+        if (!present) env_store.push_back(e);
+    }
+    for (const auto& e : env_override) {
+        const std::string key = e.substr(0, e.find('=') + 1);
+        std::erase_if(env_store, [&](const std::string& have) { return have.rfind(key, 0) == 0; });
+        env_store.push_back(e);
+    }
+}
+
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
 // closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
 class Child {
 public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health")
+          std::string ready_path = "/health", const std::vector<std::string>& env_override = {})
         : port_(port), ready_path_(std::move(ready_path)) {
         // the command line, each argument quoted the way CommandLineToArgvW reads it back
         std::string cmd;
@@ -417,12 +485,7 @@ public:
             for (char* e = block; *e; e += std::strlen(e) + 1) env_store.emplace_back(e);
             ::FreeEnvironmentStringsA(block);
         }
-        for (const auto& e : env_extra) {
-            const std::string key = e.substr(0, e.find('=') + 1);
-            bool present = false;
-            for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
-            if (!present) env_store.push_back(e);
-        }
+        merge_env(env_store, env_extra, env_override);
         std::string env_block;
         for (const auto& e : env_store) { env_block += e; env_block += '\0'; }
         env_block += '\0';
@@ -464,19 +527,14 @@ public:
 class Child {
 public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health")
+          std::string ready_path = "/health", const std::vector<std::string>& env_override = {})
         : port_(port), ready_path_(std::move(ready_path)) {
         std::vector<char*> args;
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
         args.push_back(nullptr);
         std::vector<std::string> env_store;
         for (char** e = environ; *e; ++e) env_store.emplace_back(*e);
-        for (const auto& e : env_extra) {
-            const std::string key = e.substr(0, e.find('=') + 1);
-            bool present = false;
-            for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
-            if (!present) env_store.push_back(e);  // a value the user set wins
-        }
+        merge_env(env_store, env_extra, env_override);
         std::vector<char*> envp;
         for (auto& e : env_store) envp.push_back(e.data());
         envp.push_back(nullptr);
@@ -503,13 +561,19 @@ public:
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
 
+    // SIGTERM, then a generous wait before SIGKILL: a backend that holds an NPU hardware
+    // context (ryzenai-server on the RyzenAI provider) must get to close it itself. Killing
+    // such a process outright, with a live context after an earlier firmware timeout, took the
+    // kernel down on amdxdna 0.17.0 (2026-10-11, list_del corruption in amdxdna_client_cleanup).
+    // ryzenai-server stops within a second; the 30 s covers a backend busy in a long dispatch.
     void stop() {
         if (pid_ <= 0) return;
         ::kill(pid_, SIGTERM);
-        for (int i = 0; i < 50; i++) {
+        for (int i = 0; i < 300; i++) {
             if (::waitpid(pid_, nullptr, WNOHANG) == pid_) { pid_ = -1; return; }
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        std::fprintf(stderr, "1bit serve: backend pid %d ignored SIGTERM for 30 s; killing it\n", int(pid_));
         ::kill(pid_, SIGKILL);
         ::waitpid(pid_, nullptr, 0);
         pid_ = -1;
@@ -573,6 +637,15 @@ struct InFlight {
 private:
     std::atomic<int>* n_;
 };
+
+// whether a request body asks for a streamed reply
+bool wants_stream(const std::string& body) {
+    try {
+        return json::parse(body).value("stream", false);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
              const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
@@ -661,6 +734,8 @@ struct Launch {
     std::string set_model;
     bool mtp = false;
     std::string ready_path = "/health";
+    std::vector<std::string> env_override;  // set in place of the inherited value (Child)
+    bool npu_retry = false;  // an NPU model on onnx: retry a failed non-streamed request once (serve_child)
 };
 
 // The backend process for one device: its command line and environment.
@@ -748,6 +823,20 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             throw std::runtime_error("--device onnx takes no --parallel, --mtp, --dflash or --mmproj");
         argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
+        if (const std::string mode = onnx_ryzenai_mode(o.model); !mode.empty()) {
+            // Linux: the RyzenAI provider's runtime comes from the Ryzen AI Software venv
+            // ONEBIT_RYZENAI_ROOT names (ryzenai_child_env); unset, the environment is the
+            // user's own (RYZENAI_EP_PATH and LD_LIBRARY_PATH as they exported them)
+            if (const char* root = std::getenv("ONEBIT_RYZENAI_ROOT"); root && *root) {
+                const fs::path server(argv[0]);  // a bare name resolves on PATH: no directory of its own
+                l.env_override = ryzenai_child_env(root, server.has_parent_path() ? fs::absolute(server).parent_path() : fs::path());
+            } else if (!std::getenv("RYZENAI_EP_PATH")) {
+                std::fprintf(stderr, "1bit serve: %s declares the RyzenAI provider (%s); set ONEBIT_RYZENAI_ROOT to the "
+                                     "Ryzen AI Software venv so ryzenai-server finds it (docs/onnx.md, Linux NPU)\n",
+                             o.model.c_str(), mode.c_str());
+            }
+            l.npu_retry = mode == "npu";
+        }
         return l;
     }
     if (device == "mlx") {
@@ -1395,12 +1484,17 @@ int serve_child(const Options& given) {
     // the backend to be ready, up to 600 s)
     std::vector<Child*> started(backends.size(), nullptr);
     std::mutex start_mu;
+    auto all_alive = [&] {
+        std::lock_guard<std::mutex> lock(start_mu);
+        for (auto& c : children) if (!c->alive()) return false;
+        return true;
+    };
     auto ensure = [&](size_t i) -> bool {
         std::lock_guard<std::mutex> lock(start_mu);
         if (started[i]) return true;
         const Launch& b = backends[i];
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path);
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, b.env_override);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
         started[i] = c.get();
         children.push_back(std::move(c));
@@ -1495,6 +1589,17 @@ int serve_child(const Options& given) {
         }
         ++routed[pick];
         forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r);
+        if (backends[pick].npu_retry && r.status >= 500 && !wants_stream(q.body) && all_alive()) {
+            // The NPU's first dispatch after idle can hit a one-off firmware timeout (TDR); the
+            // device recovers and the same request then runs. One retry, said aloud, for a reply
+            // nothing of which reached the client (a stream is not retried: its bytes went out).
+            std::fprintf(stderr, "1bit serve: %s answered %d on %s; retrying once (first NPU dispatch after idle can time out)\n",
+                         backends[pick].device.c_str(), r.status, q.path.c_str());
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            r.status = 200;
+            r.body.clear();
+            forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r);
+        }
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -1596,7 +1701,7 @@ int serve_child(const Options& given) {
 #endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path));
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, b.env_override));
     }
     for (const auto& b : rag) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
@@ -1619,11 +1724,6 @@ int serve_child(const Options& given) {
                      id.c_str(), o.lemonade_url.c_str(), experts.empty() ? "none" : experts.c_str(),
                      o.pm_experts.empty() ? "config/pm-experts.json" : o.pm_experts.c_str(), pm_cfg.max_rounds);
     }
-    auto all_alive = [&] {
-        std::lock_guard<std::mutex> lock(start_mu);
-        for (auto& c : children) if (!c->alive()) return false;
-        return true;
-    };
     while (all_alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
     if (backends.size() > 1) {
         std::fprintf(stderr, "1bit serve: requests routed:");

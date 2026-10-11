@@ -23,8 +23,16 @@
 # By default it builds against Microsoft's ONNX Runtime GenAI 0.11.2 and ONNX Runtime 1.23.2
 # (both MIT), fetched pinned and checked against their sha256: models run on the CPU. For the
 # NPU and hybrid modes, AMD's Ryzen AI Software (its own licence, installed separately) provides
-# ONNX Runtime GenAI with the Vitis AI provider: set RYZENAI_INSTALL_PATH to it, and the build
+# ONNX Runtime GenAI with the RyzenAI provider: set RYZENAI_INSTALL_PATH to it, and the build
 # uses that instead.
+#
+# Linux NPU (docs/onnx.md, "Linux NPU"): RYZENAI_INSTALL_PATH is the venv Ryzen AI Software's
+# install_ryzen_ai.sh made (`-p <venv>`); its deployment/lib holds libonnxruntime-genai.so,
+# libonnxruntime.so and libonnxruntime_providers_ryzenai.so. ryzenai-server's build copies that
+# whole directory beside the binary (DT_RPATH $ORIGIN finds it), and this script then clears the
+# executable-stack request from any copy that carries one: a 7.x kernel refuses to load such a
+# library (`patchelf --clear-execstack`, on the copies only; the venv is never modified). At run
+# time `1bit serve` points the child at the venv and XRT with ONEBIT_RYZENAI_ROOT / ONEBIT_XRT_ROOT.
 
 set -euo pipefail
 prefix=${1:?usage: build-onnx.sh <prefix>}
@@ -76,4 +84,21 @@ cmake -S "$src" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DOGA_ROOT="$oga_roo
 cmake --build "$work/build" -j"$(nproc)" > "$work/build.log" 2>&1 || { tail -20 "$work/build.log"; exit 1; }
 cp -a "$work/build/bin/." "$prefix/"
 [ -n "$ort_lib" ] && cp -a "$ort_lib"/libonnxruntime.so* "$prefix/"
+
+# Executable stacks: a library whose PT_GNU_STACK asks for RWE fails to load on Linux 7.x
+# (and makes the whole process's stack executable before that). Scan the copies beside the
+# binary; clear the request on those that carry it. Only our copies change.
+if [ -n "${RYZENAI_INSTALL_PATH:-}" ]; then
+    rwe=()
+    for so in "$prefix"/*.so "$prefix"/*.so.*; do
+        [ -f "$so" ] && [ ! -L "$so" ] || continue
+        readelf -lW "$so" 2>/dev/null | grep -q 'GNU_STACK.*RWE' && rwe+=("$so")
+    done
+    if [ ${#rwe[@]} -gt 0 ]; then
+        command -v patchelf > /dev/null || { echo "build-onnx.sh: ${#rwe[@]} copied libraries request an executable stack (${rwe[*]##*/}) and patchelf is not installed to clear it: apt install patchelf"; exit 1; }
+        for so in "${rwe[@]}"; do patchelf --clear-execstack "$so"; echo "cleared executable stack: ${so##*/}"; done
+    else
+        echo "executable-stack scan: none of the copied libraries request one"
+    fi
+fi
 echo "built $prefix/ryzenai-server (ryzenai-server $(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown))"

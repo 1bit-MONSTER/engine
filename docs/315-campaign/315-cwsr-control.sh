@@ -22,6 +22,22 @@ DROPIN=/etc/default/grub.d/amd_cwsr.cfg
 TAG=${TAG:-315ctl1}
 PAIRS=${PAIRS:-48}
 
+# Install the PID-capturing driver BEFORE the run, so this control's per-arm data supports the
+# H2 test (faulting-vs-clean eviction counts). Without it, a finished arm cannot be bound to its
+# PID and the comparison is invalid — proved by attempting it on run 7's data and finding the
+# counts contaminated by post-arm lifetime (see 315-pid-capture.md).
+if [ -e "$HOME/wt/315-paired-pidcap.sh" ]; then
+  if [ ! -e "$HOME/wt/315-paired.sh.orig" ]; then
+    cp "$HOME/wt/315-paired.sh" "$HOME/wt/315-paired.sh.orig"
+  fi
+  cp "$HOME/wt/315-paired-pidcap.sh" "$HOME/wt/315-paired.sh"
+  echo "installed the PID-capturing driver (original kept at 315-paired.sh.orig)"
+  bash -n "$HOME/wt/315-paired.sh" || { echo "ABORT: patched driver has a syntax error"; exit 3; }
+else
+  echo "NOTE: 315-paired-pidcap.sh not present; running WITHOUT per-arm PID capture."
+  echo "      The run is still valid, but its data cannot support the H2 comparison."
+fi
+
 echo "=== H1 control: fresh boot with cwsr_enable=1 ==="
 echo "  current cwsr_enable : $(cat /sys/module/amdgpu/parameters/cwsr_enable)"
 echo "  drop-in present     : $([ -e "$DROPIN" ] && echo yes || echo no)"

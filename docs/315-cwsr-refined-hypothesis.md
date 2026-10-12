@@ -82,3 +82,25 @@ actual code asymmetry found in the kernel path.
 3. only if H1 is survived, **H2 instrumentation** to catch the preemption directly.
 
 Doing step 3 before step 2 would risk instrumenting a boot effect.
+
+## Control sizing (so the H1 control is not accidentally over-sized)
+
+The 60-arm bar in the objective applies to the **fix** campaign, not to the control. The
+control only has to distinguish "the 26% baseline rate persists on a fresh boot" from "the
+fresh boot suppressed it".
+
+At the baseline's 26%, with `n` arms the expected fault count and P(0 faults) are:
+
+| n | expected faults | P(0 faults \| 26%) |
+|---|---|---|
+| 11 (what we have at cwsr=0) | 2.9 | 0.030 |
+| **20** | **5.2** | **0.002** |
+| 30 | 7.8 | 0.0001 |
+
+So **20 arms is sufficient for the control**: it either shows ~5 faults (baseline persists,
+H1 dead, the cwsr=0 signal is real) or 0 faults (fresh boot suppressed it, H1 confirmed).
+Running the control to 60 arms would cost ~3 extra hours for no additional discriminating
+power.
+
+Recorded so the control is sized to its question rather than copied from the fix campaign's
+bar.

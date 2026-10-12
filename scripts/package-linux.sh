@@ -14,18 +14,18 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# package-linux.sh <build> <out-dir> <version> [xrt-root]
+# package-linux.sh <build> <out-dir> <version>
 #
 # Packs a build into <out-dir>/1bit-<version>-linux-x86_64.tar.zst (docs/releases.md): 1bit, and
 # every backend the build has, at the same paths relative to 1bit as in the build tree, which
 # is where 1bit looks once the build tree is gone (app/built_path.h). Each program and library
-# finds its libraries beside itself ($ORIGIN). With the NPU lane, XRT's libraries and the XDNA
-# plugin from [xrt-root] go in xrt/lib. HRX still needs TheRock (/opt/rocm-therock) on the
+# finds its libraries beside itself ($ORIGIN). The NPU lane's runtime is compiled into 1bit, so
+# there is no NPU library to ship (no XRT; weekly.sh checks). HRX still needs TheRock (/opt/rocm-therock) on the
 # machine, as it does when built there. There is no Vulkan or ROCm llama.cpp (RFC #213 stage 3).
 set -euo pipefail
 
 [ $# -ge 3 ] || { sed -n '16,25p' "$0"; exit 2; }
-build=$(cd "$1" && pwd) out=$2 ver=$3 xrt=${4:-}
+build=$(cd "$1" && pwd) out=$2 ver=$3
 src=$(cd "$(dirname "$0")/.." && pwd)
 name=1bit-$ver-linux-x86_64
 stage=$(mktemp -d)/$name
@@ -73,17 +73,7 @@ while [ ${#queue[@]} -gt 0 ]; do
     fix "${item%%|*}" "${item#*|}"
 done
 
-if [ -n "$xrt" ] && readelf -d "$stage/1bit" | grep -q libxrt; then
-    mkdir -p "$stage/xrt/lib"
-    cp -a "$xrt"/lib/libxrt_coreutil.so* "$xrt"/lib/libxrt_core.so* "$stage/xrt/lib/" 2>/dev/null || true
-    cp -a "$xrt"/lib/libxrt_driver_xdna.so* "$stage/xrt/lib/" 2>/dev/null || true
-    while IFS= read -r -d '' f; do is_elf "$f" && patchelf --set-rpath '$ORIGIN' "$f"; done \
-        < <(find "$stage/xrt/lib" -type f -print0)
-    patchelf --set-rpath '$ORIGIN/xrt/lib' "$stage/1bit"
-    echo "  xrt/lib: $(ls "$stage/xrt/lib" | wc -l) files"
-else
-    patchelf --remove-rpath "$stage/1bit"
-fi
+patchelf --remove-rpath "$stage/1bit"
 
 # nothing may still point into the build machine's home
 bad=$(find "$stage" -type f -print0 | while IFS= read -r -d '' f; do

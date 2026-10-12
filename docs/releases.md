@@ -28,7 +28,7 @@ release in the same week gets `.1`.
 
 | file | what |
 |---|---|
-| `1bit-<tag>-linux-x86_64.tar.zst` | `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, the NPU lane with XRT. No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `1bit-<tag>-linux-x86_64.tar.zst` | `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, the NPU lane (its runtime compiled into `1bit`; no XRT). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`) from our fork, with the onebit recipe |
 | `1bit-<tag>-windows-x64.zip` | `1bit.exe`, a CPU `llama-server.exe`, `ryzenai-server.exe` ([windows.md](windows.md)) |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, the engine as a bootable USB image ([os/README.md](../os/README.md)) |
@@ -44,8 +44,30 @@ tar --zstd -xf 1bit-v2026.40-linux-x86_64.tar.zst
 ```
 
 The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE` on its Zen 5. HRX needs TheRock in
-`/opt/rocm-therock`; the NPU needs the in-kernel `amdxdna` driver. The closed NPU add-ons
+`/opt/rocm-therock`; the NPU needs the `amdxdna` kernel driver. The closed NPU add-ons
 ([npu.md](npu.md), "Private routes") are never in a release.
+
+### The NPU runtime and XRT
+
+The engine is XRT-free. `1bit`'s NPU lane runs on the 1bit NPU runtime, a proprietary component
+compiled into the release binaries, whose source is not in this repository or in any release
+([NOTICE](../NOTICE), [npu.md](npu.md), "The NPU runtime"). The build stage takes it from the
+commit pinned in `config/npu-runtime.config`: `scripts/fetch-npu-runtime.sh` checks out that path
+at that commit with the release machine's `gh` login (read access to the private repository) and
+the build passes it as `ONEBIT_NPU_RT_DIR`. The run stops if it cannot be fetched or is not at the
+pinned sha.
+
+After packing the Linux tarball, the package stage checks that the release is XRT-free: for the
+build's `1bit` and every ELF file in the tarball, no `NEEDED` `libxrt*` entry, no `libxrt` in
+`ldd`, and no `libxrt` string (`strings -a`); and no `libxrt*` file in the tarball. A failure stops
+the release (`logs/xrt-free.log`). 1bit OS carries no XRT either; its `1bit.check` boot reports
+`CHECK no XRT`.
+
+To exercise only the NPU-runtime build and the packaging without releasing, on Strix Halo:
+
+```sh
+WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-npu scripts/weekly.sh ~/.cache/1bit-weekly build package
+```
 
 ## The Sunday run
 
@@ -72,7 +94,7 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 | `bump-laya/*` | `tests/laya_route_e2e.sh` on the pinned checkpoint |
 | `bump-ds4/*` | DwarfStar's routed-MoE test (`DS4_TEST=1 scripts/build-ds4.sh`) |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
-| `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device) |
+| `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device); the xdna-driver pin is the `amdxdna` kernel driver, which the release does not build: check it on Strix Halo with the module loaded ([npu.md](npu.md), "The XDNA driver") |
 
 Before the build, every bump also checks that each pin it moves is on the branch `.gitmodules`
 names for that submodule (GitHub's compare API: the branch equals or contains the pin). A pin off

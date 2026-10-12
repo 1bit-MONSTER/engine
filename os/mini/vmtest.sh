@@ -28,7 +28,7 @@
 # that chat with its llamacpp CPU backend (its own choice); the onebit entry for the same model
 # needs an AMD GPU or NPU for Lemonade to run it (the recipe's backends are hrx, vulkan, npu and
 # cuda), so the test only reports what Lemonade does with it. Prints VMTEST PASS or FAIL. On a
-# machine without TheRock or XRT, LLAMA_SERVER and NO_XRT (mkimage.sh) make a CPU-only test image.
+# machine without TheRock, LLAMA_SERVER (mkimage.sh) makes a CPU-only test image.
 set -euo pipefail
 out=${1:?usage: vmtest.sh <out> [engine build dir] [model.gguf]}
 build=${2:-$HOME/.cache/1bit-os/src/build}

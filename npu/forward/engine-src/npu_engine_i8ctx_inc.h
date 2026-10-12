@@ -29,7 +29,7 @@
 #include <memory>
 #include <string>
 #include <algorithm>
-#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
+#include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 
 struct I8Ctx {

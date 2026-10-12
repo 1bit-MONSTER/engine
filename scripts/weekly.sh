@@ -43,7 +43,8 @@ DRY=${WEEKLY_DRY_RUN:-0}
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (laya only on its bump)
-SUBMODULES=(hrx-system llama.cpp xdna-driver lemonade ryzenai-server ds4 tokenizers)
+# (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
+SUBMODULES=(hrx-system llama.cpp lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
@@ -98,15 +99,12 @@ pin() { git -C "$SRC" ls-tree HEAD "third_party/$1" | awk '{print $3}'; }
 
 # --- build / test -------------------------------------------------------------------------
 build() {
-    # XRT + the XDNA plugin from the pinned xdna-driver, rebuilt when that pin moves
-    local xdna=$W/xdna
-    if [ "$(cat "$xdna/.pin" 2>/dev/null)" != "$(pin xdna-driver)" ]; then
-        say "XDNA stack $(pin xdna-driver | cut -c1-12)"
-        rm -rf "$xdna"
-        guard "$SRC/scripts/build-xdna.sh" "$xdna" "$JOBS" > "$LOGS/xdna.log" 2>&1
-        pin xdna-driver > "$xdna/.pin"
-    fi
-    say "engine $(git -C "$SRC" rev-parse --short HEAD)"
+    # the NPU runtime compiled into 1bit: the private checkout pinned in config/npu-runtime.config
+    # (stops here when it cannot be fetched at that commit)
+    local npurt
+    npurt=$("$SRC/scripts/fetch-npu-runtime.sh" "$W/npu-runtime" 2> "$LOGS/npu-runtime.log") ||
+        { cat "$LOGS/npu-runtime.log"; return 1; }
+    say "engine $(git -C "$SRC" rev-parse --short HEAD), NPU runtime $(git -C "$W/npu-runtime" rev-parse --short HEAD)"
     local extra=()
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
@@ -114,7 +112,7 @@ build() {
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
-        -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT="$xdna/root/opt/xilinx/xrt" \
+        -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
     guard cmake --build "$BUILD" > "$LOGS/build.log" 2>&1
 }
@@ -160,7 +158,7 @@ bump_check() {  # bump_check <branch>
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
             "$SRC/tests/laya_route_e2e.sh" "$BUILD/1bit" "$W/laya" >> "$LOGS/laya.log" 2>&1 ;;
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" > "$LOGS/ds4.log" 2>&1 ;;
-        *) : ;;  # xdna, tokenizers: covered by build + ctest
+        *) : ;;  # xdna (the kernel driver pin), tokenizers: covered by build + ctest
     esac
 }
 
@@ -235,6 +233,25 @@ PY
 stage_build() { checkout "${WEEKLY_REF:-main}"; build; }
 stage_test() { run_tests; }
 
+# The shipped binaries are XRT-free (docs/releases.md): the NPU runtime is compiled into 1bit, so
+# no program or library in the tarball may need or name AMD's XRT (libxrt*), and the tarball
+# carries no XRT library. Checks every ELF file in it, with the build tree's 1bit first.
+xrt_free() {  # xrt_free <linux tarball>
+    local t bad=0 f
+    t=$(mktemp -d)
+    tar -C "$t" -xf "$1" --use-compress-program=unzstd
+    for f in "$BUILD/1bit" $(find "$t" -type f); do
+        [ "$(head -c 4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ] || continue
+        if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*libxrt'; then echo "FAIL $f needs libxrt"; bad=1; fi
+        if ldd "$f" 2>/dev/null | grep -q libxrt; then echo "FAIL $f: ldd shows libxrt"; bad=1; fi
+        if strings -a "$f" | grep -q libxrt; then echo "FAIL $f names libxrt"; bad=1; fi
+    done
+    if find "$t" -name 'libxrt*' | grep -q .; then echo "FAIL the tarball carries an XRT library"; bad=1; fi
+    rm -rf "$t"
+    [ $bad = 0 ] && echo "ok   XRT-free: $(basename "$1") and $BUILD/1bit"
+    return $bad
+}
+
 TAG_FILE=$W/tag
 stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
@@ -242,7 +259,8 @@ stage_package() {
     echo "$tag" > "$TAG_FILE"
     rm -rf "$OUT" && mkdir -p "$OUT"
     say "package $tag: Linux"
-    "$SRC/scripts/package-linux.sh" "$BUILD" "$OUT" "$tag" "$W/xdna/root/opt/xilinx/xrt" > "$LOGS/package-linux.log" 2>&1
+    "$SRC/scripts/package-linux.sh" "$BUILD" "$OUT" "$tag" > "$LOGS/package-linux.log" 2>&1
+    xrt_free "$OUT/1bit-$tag-linux-x86_64.tar.zst" > "$LOGS/xrt-free.log" 2>&1 || { cat "$LOGS/xrt-free.log"; return 1; }
     say "package $tag: Lemonade + onebit"
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin | zstd -q -T4 -19 \

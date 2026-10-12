@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// npu/rt.h against the selected runtime (-DONEBIT_NPU_RUNTIME=xrt|own): every runtime call the
+// npu/rt.h against the own NPU runtime (ONEBIT_NPU_RT_DIR): every runtime call the
 // engine's NPU code makes (npu/lane.cpp, npu/forward) appears below, so a runtime that lacks one
 // fails to build this test. Nothing here opens the device: `uses` is compiled, never called.
 #include "rt.h"
@@ -55,10 +55,6 @@
 }
 
 int main() {
-#if defined(ONEBIT_NPU_RUNTIME_OWN)
     std::puts("npu/rt.h: own runtime (ONEBIT_NPU_RT_DIR)");
-#else
-    std::puts("npu/rt.h: XRT");
-#endif
     return 0;
 }

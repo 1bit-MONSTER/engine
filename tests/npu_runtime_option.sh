@@ -14,9 +14,10 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# ONEBIT_NPU_RUNTIME (docs/npu.md, "The runtime"): configuring with a value other than xrt|own, or
-# with own and no runtime directory, must stop with a message that says so. Needs neither XRT nor
-# an NPU, so it runs in CI; reuses the parent build's fetched dependencies (offline).
+# The NPU runtime options (docs/npu.md, "The NPU runtime"): ONEBIT_NPU=ON must stop with a message that
+# says why when ONEBIT_NPU_RUNTIME is anything but own (xrt is gone: the engine is XRT-free), or when
+# ONEBIT_NPU_RT_DIR is missing, empty or lacks the runtime's files. Needs no NPU and not the private
+# runtime, so it runs in CI; reuses the parent build's fetched dependencies (offline).
 #
 # usage: tests/npu_runtime_option.sh <source dir> <FetchContent base dir>
 set -uo pipefail
@@ -35,7 +36,11 @@ expect() {  # expect <name> <message fragment> <cmake args...>
     if [ $rc -ne 0 ] && [[ "$out" == *"$msg"* ]]; then echo "ok   $name"; else
         echo "FAIL $name (rc $rc)"; echo "$out" | tail -15; fail=1; fi
 }
-expect bad_value "ONEBIT_NPU_RUNTIME must be xrt or own" -DONEBIT_NPU_RUNTIME=bogus
-expect own_without_dir "ONEBIT_NPU_RUNTIME=own needs ONEBIT_NPU_RT_DIR" -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$tmp/none"
+mkdir -p "$tmp/half" && touch "$tmp/half/npu_rt.h"   # a header but no npu_rt.cpp
+expect xrt_removed "ONEBIT_NPU_RUNTIME must be own" -DONEBIT_NPU_RUNTIME=xrt
+expect bad_value "ONEBIT_NPU_RUNTIME must be own" -DONEBIT_NPU_RUNTIME=bogus
+expect no_dir "ONEBIT_NPU needs the NPU runtime" -DONEBIT_NPU_RT_DIR=
+expect missing_dir "ONEBIT_NPU needs the NPU runtime" -DONEBIT_NPU_RT_DIR="$tmp/none"
+expect half_dir "ONEBIT_NPU needs the NPU runtime" -DONEBIT_NPU_RT_DIR="$tmp/half"
 [ $fail -eq 0 ] && echo PASS
 exit $fail

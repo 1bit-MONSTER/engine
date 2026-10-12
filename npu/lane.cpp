@@ -18,7 +18,7 @@
 #include "full_elf.h"
 #include "pack.h"
 
-#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
+#include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 #include <chrono>
 #include <cstdio>

@@ -201,7 +201,7 @@ endif()
 
 # ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
 # Host side (full-ELF generation, model reader, buffer packing): pure C++, no
-# XRT. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there
+# NPU runtime. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there
 # by default; the Lemonade face (including the mlx backend) does not use it.
 if(APPLE)
     set(_onebit_npu_host_default OFF)
@@ -336,7 +336,7 @@ target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)
 add_test(NAME npu_model_bounds COMMAND npu_model_bounds_test)
-# The forward's Q4NX loader is plain C (no XRT), so its crafted-file checks run in CI too.
+# The forward's Q4NX loader is plain C (no NPU runtime), so its crafted-file checks run in CI too.
 add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forward/src/model.c)
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
 target_link_libraries(npu_forward_loader_test PRIVATE m)
@@ -362,69 +362,50 @@ target_link_libraries(npu_private_route_test PRIVATE onebit_npu)
 add_test(NAME npu_private_route COMMAND npu_private_route_test)
 endif()  # ONEBIT_NPU_HOST
 
-# The lane itself: needs an NPU runtime and an XDNA NPU to run.
-option(ONEBIT_NPU "Build the NPU fast lane (needs an NPU runtime: XRT by default)" OFF)
-set(ONEBIT_XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT install prefix")
-# Which runtime the NPU code compiles against (npu/rt.h, docs/npu.md "The runtime"):
-#   xrt  XRT from ONEBIT_XRT_ROOT (the default; unchanged behaviour)
-#   own  the XRT-compatible runtime of a private add-on: ONEBIT_NPU_RT_DIR holds npu_rt.h and
-#        npu_rt.cpp, built here into onebit_npu_rt. No XRT is needed or linked.
-set(ONEBIT_NPU_RUNTIME "xrt" CACHE STRING "NPU runtime: xrt or own")
-set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS xrt own)
-set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with npu_rt.h and npu_rt.cpp (ONEBIT_NPU_RUNTIME=own)")
-if(NOT ONEBIT_NPU_RUNTIME STREQUAL "xrt" AND NOT ONEBIT_NPU_RUNTIME STREQUAL "own")
-    message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be xrt or own, not '${ONEBIT_NPU_RUNTIME}'")
+# The lane itself: needs the NPU runtime and an XDNA NPU to run.
+option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_DIR)" OFF)
+# The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The NPU runtime"): our own, an
+# XRT-compatible runtime that is not part of this repository. ONEBIT_NPU_RT_DIR holds its npu_rt.h
+# and npu_rt.cpp, built here into the static library onebit_npu_rt and linked into 1bit. AMD's XRT
+# is not supported: the engine links no XRT library. The release build takes the runtime from the
+# pinned private checkout in config/npu-runtime.config (scripts/fetch-npu-runtime.sh).
+set(ONEBIT_NPU_RUNTIME "own" CACHE STRING "NPU runtime: own (the only value)")
+set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS own)
+set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with the NPU runtime's npu_rt.h and npu_rt.cpp (private)")
+if(NOT ONEBIT_NPU_RUNTIME STREQUAL "own")
+    message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be own, not '${ONEBIT_NPU_RUNTIME}': the engine builds "
+                        "no XRT NPU lane (docs/npu.md, \"The NPU runtime\")")
 endif()
 if(ONEBIT_NPU AND NOT ONEBIT_NPU_HOST)
     message(FATAL_ERROR "ONEBIT_NPU needs ONEBIT_NPU_HOST=ON")
 endif()
-# The option's refusals (bad value, own without a runtime directory); needs no XRT, runs in CI.
+# The option's refusals (bad value, no runtime directory); needs no NPU runtime, runs in CI.
 if(ONEBIT_NPU_HOST AND NOT WIN32)
     add_test(NAME npu_runtime_option
              COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_runtime_option.sh ${CMAKE_SOURCE_DIR} ${FETCHCONTENT_BASE_DIR})
     set_tests_properties(npu_runtime_option PROPERTIES TIMEOUT 300)
 endif()
 if(ONEBIT_NPU)
-    if(ONEBIT_NPU_RUNTIME STREQUAL "own")
-        if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.h" OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp")
-            message(FATAL_ERROR "ONEBIT_NPU_RUNTIME=own needs ONEBIT_NPU_RT_DIR with npu_rt.h and npu_rt.cpp; "
-                                "ONEBIT_NPU_RT_DIR='${ONEBIT_NPU_RT_DIR}'")
-        endif()
-        add_library(onebit_npu_rt STATIC ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
-        target_include_directories(onebit_npu_rt SYSTEM PUBLIC ${ONEBIT_NPU_RT_DIR})
-        target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
-        find_package(Threads REQUIRED)
-        target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
-        set(_onebit_npu_rt onebit_npu_rt)
-        set(_onebit_npu_rt_inc "")
-        set(_onebit_npu_rt_extra "")
-    else()
-        if(NOT EXISTS "${ONEBIT_XRT_ROOT}/include/xrt/xrt_device.h")
-            message(FATAL_ERROR "ONEBIT_NPU needs XRT; none at ONEBIT_XRT_ROOT=${ONEBIT_XRT_ROOT}")
-        endif()
-        set(_onebit_npu_rt ${ONEBIT_XRT_ROOT}/lib/libxrt_coreutil.so)
-        set(_onebit_npu_rt_inc ${ONEBIT_XRT_ROOT}/include)
-        set(_onebit_npu_rt_extra aiebu uuid)
+    if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.h" OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp")
+        message(FATAL_ERROR "ONEBIT_NPU needs the NPU runtime: ONEBIT_NPU_RT_DIR must hold npu_rt.h and "
+                            "npu_rt.cpp (ONEBIT_NPU_RT_DIR='${ONEBIT_NPU_RT_DIR}'). The runtime is private; "
+                            "without it, build with ONEBIT_NPU=OFF (docs/npu.md, \"The NPU runtime\")")
     endif()
+    add_library(onebit_npu_rt STATIC ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
+    target_include_directories(onebit_npu_rt SYSTEM PUBLIC ${ONEBIT_NPU_RT_DIR})
+    target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
+    find_package(Threads REQUIRED)
+    target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
     add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp)
-    if(_onebit_npu_rt_inc)
-        target_include_directories(onebit_npu_lane SYSTEM PUBLIC ${_onebit_npu_rt_inc})
-    endif()
-    target_link_libraries(onebit_npu_lane PUBLIC onebit_npu ${_onebit_npu_rt})
+    target_link_libraries(onebit_npu_lane PUBLIC onebit_npu onebit_npu_rt)
     target_sources(onebit PRIVATE app/unified.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_lane)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU)
-    if(ONEBIT_NPU_RUNTIME STREQUAL "xrt")
-        set_target_properties(onebit PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib INSTALL_RPATH ${ONEBIT_XRT_ROOT}/lib)
-    endif()
-    # The shim compiles against the selected runtime (and runs without an NPU: it only builds
-    # objects and checks the API surface the engine uses).
+    # The shim compiles against the runtime (and runs without an NPU: it only builds objects and
+    # checks the API surface the engine uses).
     add_executable(npu_rt_shim_test tests/npu_rt_shim_test.cpp)
     target_link_libraries(npu_rt_shim_test PRIVATE onebit_npu_lane)
     add_test(NAME npu_rt_shim COMMAND npu_rt_shim_test)
-    if(ONEBIT_NPU_RUNTIME STREQUAL "xrt")
-        set_target_properties(npu_rt_shim_test PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib)
-    endif()
 
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
@@ -449,9 +430,8 @@ if(ONEBIT_NPU)
         target_compile_definitions(onebit_npu_forward PRIVATE NPU_INFER_DEBUG_DUMPS)
     endif()
     target_include_directories(onebit_npu_forward SYSTEM PUBLIC
-        npu/forward/include npu/forward/engine-src npu ${_onebit_npu_rt_inc})
-    target_link_libraries(onebit_npu_forward PUBLIC
-        ${_onebit_npu_rt} ${_onebit_npu_rt_extra} dl pthread m)
+        npu/forward/include npu/forward/engine-src npu)
+    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu_rt dl pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
@@ -471,10 +451,6 @@ if(ONEBIT_NPU_PRIVATE)
     endif()
     if(NOT EXISTS "${ONEBIT_NPU_PRIVATE}/addons/CMakeLists.txt")
         message(FATAL_ERROR "ONEBIT_NPU_PRIVATE=${ONEBIT_NPU_PRIVATE} has no addons/CMakeLists.txt")
-    endif()
-    if(ONEBIT_NPU_RUNTIME STREQUAL "own")
-        message(WARNING "ONEBIT_NPU_PRIVATE with ONEBIT_NPU_RUNTIME=own: an add-on that links XRT itself "
-                        "still needs XRT (docs/npu.md, \"XRT or the own runtime\")")
     endif()
     add_subdirectory(${ONEBIT_NPU_PRIVATE}/addons ${CMAKE_BINARY_DIR}/npu_private)
     if(NOT TARGET onebit_npu_private)

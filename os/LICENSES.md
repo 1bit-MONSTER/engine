@@ -81,8 +81,8 @@ says `Ship: yes`.
 | Component | Release | License | Source |
 |---|---|---|---|
 | 1bit engine (`1bit`, its HRX llama-server) | this repository | Apache-2.0; third-party parts in [NOTICE](../NOTICE) | https://github.com/1bit-MONSTER/engine |
+| 1bit NPU runtime (compiled into `1bit`) | `config/npu-runtime.config` pin | proprietary, Copyright 2026 bong-water-water-bong; see [NOTICE](../NOTICE) | not published |
 | Lemonade (lemond, the lemonade CLI, the web app) | third_party/lemonade pin | Apache-2.0, Advanced Micro Devices, Inc.; web app bundle licenses in `renderer.bundle.js.LICENSE.txt` | https://github.com/1bit-MONSTER/lemonade |
-| XRT with the XDNA plugin (`/opt/xilinx/xrt`) | the builder's XRT | Apache-2.0 | https://github.com/Xilinx/XRT, https://github.com/amd/xdna-driver |
 | ROCr HSA runtime (TheRock, for HRX) | the build's ONEBIT_HRX_LIBHSA | University of Illinois/NCSA | https://github.com/ROCm/ROCR-Runtime, https://github.com/ROCm/TheRock |
 
 ## System software from Ubuntu

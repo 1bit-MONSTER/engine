@@ -39,7 +39,7 @@ One model per process:
 
 | Endpoint | |
 |---|---|
-| `GET /health`, `GET /v1/health` | 503 while the model loads, then 200 while every backend is up and answers its own health route; 503 again if one has exited, does not answer within 3 s, or the watchdog found it hung ([below](#when-a-backend-hangs)) |
+| `GET /health`, `GET /v1/health` | 503 while the model loads, then 200 while every backend is up and answers its own health route; 503 again if one has exited, does not answer within 1.5 s, or the watchdog found it hung ([below](#when-a-backend-hangs)) |
 | `GET /v1/models` | the one model (`--alias`, else the file or directory name) |
 | `POST /v1/chat/completions` | streamed (SSE) or not; a thinking model's `<think>` block comes back as `reasoning_content` (`"reasoning_format": "none"` keeps it in `content`) |
 | `POST /v1/completions` | |
@@ -70,7 +70,7 @@ is not covered):
 
 - **`/health` follows the backend.** Once the model is loaded, serve asks each backend's own
   health route (`/health`, or `/v1/models` for DwarfStar) and answers 503 with the reason when
-  one has exited, does not answer within 3 s, or the watchdog below has fired. Lemonade's
+  one has exited, does not answer within 1.5 s (Lemonade's probe gives up at 2 s), or the watchdog below has fired. Lemonade's
   BackendWatchdog probes this route.
 - **A progress watchdog.** Every chat, completion and Responses request serve forwards is
   tracked. Progress is a byte from the backend on that request, or the backend's main loop
@@ -93,6 +93,18 @@ SIGKILL (stuck in the kernel) is reported as such; serve exits anyway.
 1bit serve: watchdog: the backend's last lines:
 1bit serve: watchdog: | ...
 ```
+
+How this meets Lemonade's BackendWatchdog (`wrapped_server.cpp` in our Lemonade fork, which owns
+the restart policy; serve builds none):
+- Every 5 s Lemonade checks that the backend process is running. Exiting is serve's signal: Lemonade
+  marks the backend reset and reloads the model on the next request. That request is answered
+  with `backend_watchdog_reset` ("reloaded automatically on retry").
+- During an active request, after 90 s with no activity, Lemonade also probes `/health` (2 s,
+  status 200 required). After 3 failed probes it stops the backend itself. A wedged llama-server
+  still answers its own `/health`, so this probe alone does not catch a hung GPU. serve's
+  watchdog exit is what does, within `--watchdog` seconds plus Lemonade's 5 s poll.
+- `LEMONADE_BACKEND_WATCHDOG_*` tune Lemonade's side. `onebit_args` in a recipe passes
+  `--watchdog` to serve.
 
 A backend with no `/slots` (DwarfStar, ONNX, MLX, or a llama-server started with `--no-slots`)
 shows progress only by sending bytes, so on those only streamed requests are judged: a long

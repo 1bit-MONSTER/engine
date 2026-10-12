@@ -1454,7 +1454,7 @@ int serve_child(const Options& given) {
     std::vector<std::unique_ptr<Child>> children;
     std::mutex start_mu;
     // /health: 503 while loading; once loaded, 503 too when a backend has exited, does not answer
-    // its own health route within 3 s, or the watchdog found it wedged. Lemonade's BackendWatchdog
+    // its own health route within 1.5 s, or the watchdog found it wedged. Lemonade's BackendWatchdog
     // probes this route and reloads a backend that fails it.
     auto health = [&](const httplib::Request&, httplib::Response& res) {
         auto fail = [&](const std::string& why) {
@@ -1481,9 +1481,11 @@ int serve_child(const Options& given) {
                 }
         }
         for (const auto& [port, path] : probes) {
+            // Lemonade's BackendWatchdog gives the whole probe 2 s and wants a 200 (curl timeout,
+            // HttpClient::is_reachable): ask the backend for 1.5 s at most, so serve answers first
             httplib::Client c("127.0.0.1", port);
-            c.set_connection_timeout(1);
-            c.set_read_timeout(3);
+            c.set_connection_timeout(std::chrono::milliseconds(500));
+            c.set_read_timeout(std::chrono::seconds(1));
             auto r = c.Get(path);
             if (!r) return fail("backend on port " + std::to_string(port) + " does not answer " + path);
             if (r->status != 200)

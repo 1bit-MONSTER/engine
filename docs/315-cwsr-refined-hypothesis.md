@@ -426,3 +426,36 @@ What it still needs before it can be landed as *this* issue's fix:
 statement is that the fix is now *identifiable* (residency) but not yet *earned* (it needs the
 mechanism confirmed and the residency change shown to remove the evictions of the engine's own
 buffers).
+
+### The H1 control does double duty: it is also the only source of H2's faulting arm
+
+A consequence of the PID-capture work that I had not joined up:
+
+**H2's discriminating test needs BOTH a faulting and a clean arm, each with its own captured PID.**
+The campaign of record runs at `cwsr_enable=0`, where the expectation is *zero* faults — so it will
+supply the clean side and, if it behaves, **no faulting side at all**. Its data alone therefore
+cannot run the H2 comparison.
+
+The faulting side has to come from a `cwsr_enable=1` run. Run 7 has faulting arms, but its PIDs are
+unrecoverable (a finished arm's PID cannot be bound, and its post-arm lifetime contaminates the
+total — the 1,461-eviction artefact in `315-pid-capture.md`). So run 7 cannot supply it either.
+
+**Which means the fresh-boot `cwsr=1` control is not optional for H2 — it is the only run that can
+produce a faulting arm with a captured PID.** And the control script already installs the
+PID-capturing driver, so it is set up for exactly this.
+
+Revised roles for the control:
+
+| purpose | what it answers |
+|---|---|
+| H1 | does a fresh boot suppress the fault at `cwsr=1`? (H1's falsification was inferred from `boot_ns`; a purpose-built control would make it direct) |
+| **H2** | **do the faulting arms' own windows show more evictions than the clean arms'?** — the only run that can supply the faulting half |
+
+So the plan's ordering acquires a second justification: the control must run at
+`cwsr_enable=1` **with the PID capture**, and it should be sized for the H2 comparison too — meaning
+enough arms to expect several faults (at ~26%, 20 arms gives ~5, which is ample for a
+faulting-vs-clean eviction comparison, though the 20-arm sizing I chose was for H1's rate question
+and would also serve here).
+
+Recorded so the control is not run at the wrong config or without the capture, either of which
+would waste the only opportunity to obtain the faulting half.

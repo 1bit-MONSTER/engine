@@ -41,7 +41,7 @@ and `llama-perplexity`. It then runs four checks:
 
 | check | what | catches |
 |---|---|---|
-| ops | `test-backend-ops -b HRX0 -o OP` for MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_CONV, GET_ROWS, ROPE, RMS_NORM, SOFT_MAX | a kernel that disagrees with the CPU (#310, #313, #370, the IQ ports) |
+| ops | one `test-backend-ops -b HRX0 -j 4` run over MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_CONV, GET_ROWS, ROPE, RMS_NORM, SOFT_MAX | a kernel that disagrees with the CPU (#310, #313, #370, the IQ ports) |
 | kat | `tools/kat.py check` on Qwen3-0.6B, ZAYA1-8B and Qwen3.8-27B (Q4_K_M / UD-Q4_K_XL), against `tests/golden/hw-gate/kat-<model>.json` | wrong answers, empty replies, NaN logprobs, nondeterminism, cached-prefix and multi-ubatch bugs, drift from the release pin (#308, #309, #315, #318, #319, #369) |
 | kld | `llama-perplexity --kl-divergence` on wiki.test.raw, 512 tokens x 8 chunks, against base logits stored at the release pin | small numeric drift that greedy answers do not show |
 | needle | `tests/hrx_long_prompt.py`: the 4.7K-token vault-code needle on Qwen3-0.6B | #319, #369 |
@@ -62,11 +62,14 @@ A rerun at the recording pin gives 0 on every one.
 
 One `test-backend-ops` case is a known intermittent failure (KNOWN-ISSUES.md, engine#370:
 `MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048)`, about 1 run in 40). When that is the only
-failing case, the op runs once more and passes if the second run is clean; the summary says so.
+failing case, the case runs alone three more times and the check passes if all three are clean;
+the summary says so.
 
 ## Box etiquette
 
-The gate shares the box with other work. Each GPU step (one op, one model's kat, one model's KLD):
+The gate shares the box with other work. It takes the GPU four times: once for all the ops, and
+once per model (the server for kat and the needle, then llama-perplexity for the KLD, in one hold).
+Each of those steps:
 - **Lock.** It holds `~/npu.lock` (flock) only while it runs, so other GPU work keeps its turn between steps.
 - **Heat.** It waits for Tctl to drop to 75 C, then runs under `~/lb/thermal-run.sh`, which freezes it at 78 C and kills it at 93 C.
 - **Memory.** It runs under `scripts/mem-guard.sh` (kills the step below 12 GB MemAvailable). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then releases the lock and retries every minute, up to ten times.
@@ -109,8 +112,40 @@ the box could not run the gate (lock timeout, a model or base file missing, memo
 
 ## Measured
 
-MEASURED_PLACEHOLDER
+Strix Halo, 2026-10-12, at the release pin (main d2a56a4, llama.cpp 0e255d77, hrx-system
+98d05d94), on a box shared with about ten other GPU jobs:
+
+| step | holds the GPU lock |
+|---|---|
+| build, incremental (no pin change) | 6 s, no lock |
+| build, cold (llama.cpp + hrx-system, 4 cores under thermal-run) | about 20 min, no lock |
+| ops: 611/611 cases pass | 269 s |
+| Qwen3-0.6B: kat (3 repeats) + needle | 67 s |
+| ZAYA1-8B: kat (2 repeats) | 172 s |
+| Qwen3.8-27B: kat (2 repeats) | 213 s |
+| KLD: 0.6B / 8B / 27B, 4,096 tokens each | 6 / 24 / 29 s |
+
+That is about 13 minutes of GPU time in all. Waiting for `~/npu.lock` costs more than the gate
+itself: flock is not first-come-first-served, and with about ten jobs queueing, each acquisition
+waited 10 to 60 minutes. The summary reports both numbers (waiting, holding).
+
+What the goldens record at the release pin:
+- Qwen3-0.6B misses one short needle (`varied-720w`: "25"). The check holds that case to the golden's text instead of the answer.
+- On `varied-1620w`, the cached path answers differently from a fresh request at a near-tie: top-2 margin 0.19, a WARN.
+- ZAYA1-8B and Qwen3.8-27B answer every case.
 
 ## Not covered yet
 
-GAPS_PLACEHOLDER
+- **Lock fairness.** `~/npu.lock` is a plain flock, so a job that re-queues quickly can starve the
+  gate for an hour. A first-come-first-served queue, or a reserved window for the gate, would bound
+  the wall time. The gate's own GPU time is about 13 minutes.
+- **Private kernels.** The gate builds the public HRX plumbing only. The private HIP add-on
+  (gpu-kernels, `ONEBIT_GPU_PRIVATE`) is not built or checked, because the runner serves a public
+  repository.
+- **Not exercised:** `1bit serve` itself (the gate talks to llama-server with serve's HRX flags),
+  `--parallel`, `--mtp` / `--dflash`, vision, and contexts past 8K.
+- **One copy of the KLD bases** on the box. A spare copy of the release-pin set is on ryzen
+  `~/backups/hw-gate-kld-0e255d77`.
+- **An intermittent bug** that fires about once in 40 runs (#370's class) can pass a single gate
+  run. kat repeats every case and the ops step re-runs a known flake, but only repeated runs
+  catch such a bug reliably.

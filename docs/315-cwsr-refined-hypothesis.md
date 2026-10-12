@@ -198,3 +198,54 @@ number it predicts should be wrong (the control-stack size) is coherent.
 **Net effect on the hypothesis set:** H4 down-weighted. H1 (fresh-boot confound) remains the
 gate that must be passed before any of H2/H4 can be assessed, and it is still unrun because it
 requires a reboot.
+
+## H2 refined: it is *mid-wave preemption* that matters, not the spill correctness
+
+The kernel's own parameter documentation settles a point I had been treating loosely:
+
+> `cwsr_enable` *(int)* CWSR (compute wave store and resume) **allows the GPU to preempt shader
+> execution in the middle of a compute wave**. Default is 1 to enable this feature. Setting 0
+> disables it. — `docs.kernel.org/gpu/amdgpu/module-parameters.html`
+
+So `amdgpu.cwsr_enable=0` does **not** merely skip saving and restoring a wave. It removes the
+hardware's ability to preempt a wave mid-execution at all. A dispatch either runs to completion
+or waits.
+
+**That reframes the mechanism, and it fits better than "the spill is wrong":**
+
+> Under memory pressure a wave is preempted mid-execution; the buffers that wave is actively
+> reading are then evicted and/or migrated by TTM/amdgpu. When the wave resumes — or as it
+> continues — it reads memory that has moved or been recycled, and the damaged values surface
+> as Face A or Face B depending on what those bytes now hold.
+
+This is the same *window* the engine's own #123/#140 record describes — *"the window opens when
+a dispatch is preempted, and any process's KFD queue eviction (page compaction, KSM, memory
+pressure) does that, which is why the rate followed those memory-pressure settings"* — generalised
+from a barrier bug to preemption itself.
+
+Why it explains everything that was measured:
+
+| observation | explanation |
+|---|---|
+| GTT/pressure dependence | preemption-plus-eviction needs pressure to occur at all |
+| coherence, ordering, AQL barriers, `-fa off`, transient reuse, PM4, MoE routing all returned null | none of them changes **whether a wave is preempted mid-execution**; they all operate *within* execution |
+| corruption already whole-batch at layer 0, cascading by layer 1 | a preempted-and-resumed wave corrupts its own tile, which cascades immediately |
+| run 7 faulted 3× at `gtt_start=97G` while 8 clean arms sat at 98 GiB | the **occurrence** of a mid-wave preemption is the intermittent variable, not the pressure level |
+| both faces, never in the same arm | what the moved bytes now hold decides finite-but-wrong (B) or NaN-bearing (A) |
+
+**And it no longer depends on the size defect** — which is important, because that defect is
+proven fixed here (`315-cwsr-size-excluded-PROOF.md`). A preemption-window mechanism is
+compatible with a fully patched CWSR area: the area can be perfectly sized and the *memory the
+wave reads* can still be moved underneath it.
+
+**How this differs from H1, and why H1 still gates it.** H1 says the signal is a fresh-boot
+effect. H2 says it is preemption. They predict the *same* result for the running campaign
+(0 faults at `cwsr=0`), so the campaign cannot separate them. **Only the fresh-boot `cwsr=1`
+control separates them**: if a fresh boot still faults ~26% with CWSR on, H1 is dead and
+preemption is the difference. If it does not, H1 is confirmed.
+
+**A cheap secondary discriminator worth noting** (no reboot, but needs the box free): count
+**mid-wave preemptions** per arm — via the MES/queue trace, or by comparing per-arm eviction
+counts between faulting and clean arms (the `server.pid` capture in `315-pid-capture.md`
+exists for exactly this and is still unapplied). If faulting arms show preemptions and clean
+arms at the same GTT do not, H2 gains direct support.

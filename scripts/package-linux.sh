@@ -75,6 +75,10 @@ done
 
 patchelf --remove-rpath "$stage/1bit"
 
+# symbol tables and debug info out of every program and library: the release ships compiled code
+# only (docs/releases.md, "Private components"); the dynamic symbols they link by stay
+while IFS= read -r -d '' f; do if is_elf "$f"; then strip --strip-unneeded "$f"; fi; done < <(find "$stage" -type f -print0)
+
 # nothing may still point into the build machine's home
 bad=$(find "$stage" -type f -print0 | while IFS= read -r -d '' f; do
     is_elf "$f" && readelf -d "$f" | grep -E 'R(UN)?PATH' | grep -E "$HOME|$build" | sed "s|^|$f: |"; done || true)

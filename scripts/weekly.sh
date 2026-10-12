@@ -236,22 +236,46 @@ PY
 stage_build() { checkout "${WEEKLY_REF:-main}"; build; }
 stage_test() { run_tests; }
 
-# The shipped binaries are XRT-free (docs/releases.md): the NPU runtime is compiled into 1bit, so
-# no program or library in the tarball may need or name AMD's XRT (libxrt*), and the tarball
-# carries no XRT library. Checks every ELF file in it, with the build tree's 1bit first.
-xrt_free() {  # xrt_free <linux tarball>
-    local t bad=0 f
+# What the Linux tarball must and must not hold (docs/releases.md, "Private components"):
+#   XRT-free  no program or library needs or names AMD's XRT (libxrt*: readelf NEEDED, ldd,
+#             strings), and no libxrt* file is packed; the NPU runtime is compiled into 1bit
+#   kernels   the HRX ggml library carries the private HIP kernels (it exports the add-on's
+#             ggml_hrx_hip_addon_register), compiled in as code objects
+#   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
+#             like one of the private checkouts' files
+# Checks the build's 1bit and every file in the tarball.
+package_checks() {  # package_checks <linux tarball>
+    # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
+    local t bad=0 f n names pin
     t=$(mktemp -d)
     tar -C "$t" -xf "$1" --use-compress-program=unzstd
     for f in "$BUILD/1bit" $(find "$t" -type f); do
         [ "$(head -c 4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ] || continue
-        if readelf -d "$f" 2>/dev/null | grep -q 'NEEDED.*libxrt'; then echo "FAIL $f needs libxrt"; bad=1; fi
-        if ldd "$f" 2>/dev/null | grep -q libxrt; then echo "FAIL $f: ldd shows libxrt"; bad=1; fi
-        if strings -a "$f" | grep -q libxrt; then echo "FAIL $f names libxrt"; bad=1; fi
+        n=$(readelf -d "$f" 2>/dev/null | grep -c 'NEEDED.*libxrt' || true)
+        [ "$n" = 0 ] || { echo "FAIL $f needs libxrt"; bad=1; }
+        n=$(ldd "$f" 2>/dev/null | grep -c libxrt || true)
+        [ "$n" = 0 ] || { echo "FAIL $f: ldd shows libxrt"; bad=1; }
+        n=$(strings -a "$f" | grep -c libxrt || true)
+        [ "$n" = 0 ] || { echo "FAIL $f names libxrt"; bad=1; }
     done
-    if find "$t" -name 'libxrt*' | grep -q .; then echo "FAIL the tarball carries an XRT library"; bad=1; fi
-    rm -rf "$t"
+    n=$(find "$t" -name 'libxrt*' | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL the tarball carries an XRT library"; bad=1; }
     [ $bad = 0 ] && echo "ok   XRT-free: $(basename "$1") and $BUILD/1bit"
+    f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f | head -1)
+    n=0; [ -n "$f" ] && n=$(nm -D --defined-only "$f" | grep -c ggml_hrx_hip_addon_register || true)
+    if [ "$n" != 0 ]; then
+        echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
+    else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
+    n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee /dev/stderr | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
+    names=$(for pin in npu-runtime gpu-kernels; do
+                git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
+            done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
+    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee /dev/stderr | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
+    [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
+    rm -rf "$t"
     return $bad
 }
 
@@ -263,7 +287,8 @@ stage_package() {
     rm -rf "$OUT" && mkdir -p "$OUT"
     say "package $tag: Linux"
     "$SRC/scripts/package-linux.sh" "$BUILD" "$OUT" "$tag" > "$LOGS/package-linux.log" 2>&1
-    xrt_free "$OUT/1bit-$tag-linux-x86_64.tar.zst" > "$LOGS/xrt-free.log" 2>&1 || { cat "$LOGS/xrt-free.log"; return 1; }
+    package_checks "$OUT/1bit-$tag-linux-x86_64.tar.zst" > "$LOGS/package-checks.log" 2>&1 ||
+        { cat "$LOGS/package-checks.log"; return 1; }
     say "package $tag: Lemonade + onebit"
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin | zstd -q -T4 -19 \

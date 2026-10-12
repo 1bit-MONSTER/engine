@@ -202,7 +202,7 @@ endif()
 # ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
 # Host side (full-ELF generation, model reader, buffer packing): pure C++, no
 # XRT. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there
-# by default; the Lemonade face (including the mlx backend) does not use it.
+# by default.
 if(APPLE)
     set(_onebit_npu_host_default OFF)
 else()
@@ -490,10 +490,3 @@ if(ONEBIT_NPU_PRIVATE)
 endif()
 
 
-# MLX on Apple Silicon: `1bit serve --device mlx` (docs/apple.md).
-set(ONEBIT_MLX_SERVER "" CACHE FILEPATH "lemon-mlx-engine's server binary, for serve_e2e_mlx")
-if(APPLE AND ONEBIT_MLX_SERVER)
-    add_test(NAME serve_e2e_mlx
-             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> mlx-community/Qwen3-0.6B-4bit mlx
-                     --mlx-server ${ONEBIT_MLX_SERVER})
-endif()

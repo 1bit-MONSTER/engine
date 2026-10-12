@@ -37,8 +37,7 @@ Each step below is one PR (or a short series) that builds and runs on Strix Halo
 Lemonade (the host users talk to)
   └─ runs, as its onebit backend ─> 1bit serve -m <model> --port <p>   one OpenAI-compatible API
                    ├─ NPU model directory ──> NPU fast lane (full ELFs), in process
-                   ├─ .gguf --device hrx|cpu ──> this build's llama.cpp (ggml-hrx + the CPU; no Vulkan or ROCm)
-                   ├─ HF id --device mlx ──> lemon-mlx-engine (Apple Silicon)
+                   ├─ .gguf --device hrx|cpu ──> this build's llama.cpp (ggml-hrx with HIP kernels + the CPU; no Vulkan, ROCm, Metal or CUDA)
                    ├─ Laya ──> picks the device per request (step 4, opt-in)
                    └─ model registry ──> every HF architecture, refreshed by the daily census (step 5)
 ```

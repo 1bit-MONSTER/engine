@@ -20,9 +20,8 @@ On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prom
 decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
 and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
 
-It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU. The engine builds no Vulkan or
-ROCm llama.cpp (RFC #213 stage 3); what HRX does not run, Lemonade serves with its own
-llamacpp backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
+It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
+backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
 
 ```
 HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)

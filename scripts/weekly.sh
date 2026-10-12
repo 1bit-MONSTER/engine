@@ -22,7 +22,7 @@
 #            pass; the rest stay open and the release lists them
 #   build    main at the merged pins, with every backend this machine builds
 #   test     ctest, including the serve end-to-end tests on a small GGUF
-#   package  the Linux tarball, Lemonade with the onebit recipe, the Windows zip, 1bit OS
+#   package  Lemonade with the onebit recipe and the engine, and 1bit OS (a Lemonade appliance)
 #   release  what moved upstream since the last release (tools/weekly_changes.py), published
 #            as the GitHub release v<ISO year>.<ISO week> with the packages
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
@@ -241,17 +241,16 @@ stage_package() {
     while gh release view "$tag" -R "$REPO" > /dev/null 2>&1; do n=$((n + 1)); tag=v$(date +%G.%V).$n; done
     echo "$tag" > "$TAG_FILE"
     rm -rf "$OUT" && mkdir -p "$OUT"
-    say "package $tag: Linux"
-    "$SRC/scripts/package-linux.sh" "$BUILD" "$OUT" "$tag" "$W/xdna/root/opt/xilinx/xrt" > "$LOGS/package-linux.log" 2>&1
-    say "package $tag: Lemonade + onebit"
+    say "package $tag: Lemonade + onebit, with the engine"
+    # the engine tree (package-linux.sh) is not published on its own: it goes into this package
+    rm -rf "$W/engine-pkg"
+    "$SRC/scripts/package-linux.sh" "$BUILD" "$W/engine-pkg" "$tag" "$W/xdna/root/opt/xilinx/xrt" > "$LOGS/package-linux.log" 2>&1
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
-    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin | zstd -q -T4 -19 \
+    rm -rf "$W/lemonade/1bit" && mkdir -p "$W/lemonade/1bit"
+    zstd -dc "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" | tar -C "$W/lemonade/1bit" --strip-components=1 -xf -
+    install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
+    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \
         -o "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst"
-    say "package $tag: Windows"
-    rm -rf "$W/windows"
-    guard "$SRC/scripts/build-windows.sh" "$W/windows" > "$LOGS/windows.log" 2>&1
-    cp "$SRC/LICENSE" "$SRC/NOTICE" "$W/windows/"
-    (cd "$W/windows" && zip -q "$OUT/1bit-$tag-windows-x64.zip" ./*.exe ./*.dll LICENSE NOTICE)  # not work/
     say "package $tag: 1bit OS"
     rm -rf "$W/os"
     guard "$SRC/os/mini/mkimage.sh" "$W/os" "$BUILD" > "$LOGS/os.log" 2>&1

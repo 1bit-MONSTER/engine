@@ -13,10 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve`'s own Prometheus metrics (docs/serve.md, "Metrics"): requests, time to first
-// token, prompt and generation speed, backend starts and watchdog kills, what the backend's log
-// says (CPU fallbacks, graph splits, HRX graph-program cache flushes), and the box (GTT, RAM,
-// Tctl). GET /metrics renders these, then appends the backend's own /metrics where it has one.
+// `1bit serve`'s own Prometheus metrics (docs/serve.md, "Metrics"): only what the engine sees and
+// Lemonade cannot. Backend starts and watchdog kills; what the backend's log says (CPU fallbacks,
+// graph splits, HRX graph-program cache flushes); the GTT pool and Tctl. GET /metrics renders
+// these, then appends the backend's own /metrics where it has one.
 #pragma once
 
 #include "sysinfo.h"
@@ -132,118 +132,53 @@ private:
     std::mutex mu_;
 };
 
+// The engine's own series. Lemonade's /metrics already reports requests, tokens, TTFT and tok/s per
+// model (lemonade_model_*), CPU and memory use, and GTT + VRAM together as lemonade_vram_used_gb;
+// these are what it cannot see from outside the engine.
 class ServeMetrics {
 public:
-    explicit ServeMetrics(std::string model, std::string device) : model_(std::move(model)), device_(std::move(device)) {}
+    explicit ServeMetrics(std::string device) : device_(std::move(device)) {}
 
-    void request(const std::string& route, int status) {
-        std::lock_guard<std::mutex> l(mu_);
-        ++requests_[{route, status}];
-    }
-    // a streamed request's first byte from the backend, seconds after serve forwarded it
-    void first_byte(double secs) {
-        std::lock_guard<std::mutex> l(mu_);
-        for (size_t i = 0; i < kBuckets.size(); i++)
-            if (secs <= kBuckets[i]) ++ttft_counts_[i];
-        ttft_sum_ += secs;
-        ++ttft_count_;
-    }
-    // llama-server's "timings" object from a reply (the last SSE chunk, or the JSON body)
-    void timings(const nlohmann::json& t) {
-        if (!t.is_object()) return;
-        auto num = [&](const char* k) { return t.contains(k) && t[k].is_number() ? t[k].get<double>() : -1.0; };
-        const double pn = num("prompt_n"), pms = num("prompt_ms"), gn = num("predicted_n"), gms = num("predicted_ms");
-        std::lock_guard<std::mutex> l(mu_);
-        if (pn >= 0 && pms >= 0) {
-            prompt_tokens_ += uint64_t(pn);
-            prompt_secs_ += pms / 1000;
-            if (pms > 0) last_prompt_tps_ = pn * 1000 / pms;
-        }
-        if (gn >= 0 && gms >= 0) {
-            gen_tokens_ += uint64_t(gn);
-            gen_secs_ += gms / 1000;
-            if (gms > 0) last_gen_tps_ = gn * 1000 / gms;
-        }
-    }
     void backend_line(const std::string& line) {
         std::lock_guard<std::mutex> l(mu_);
         log_.feed(line);
     }
 
-    // serve's own metrics, in Prometheus text format 0.0.4
-    std::string render(const Lifecycle& life, int in_flight, const std::string& sys_root = "") const {
+    // Prometheus text format 0.0.4
+    std::string render(const Lifecycle& life, const std::string& sys_root = "") const {
         std::string out;
         auto line = [&](const std::string& s) { out += s; out += '\n'; };
         auto head = [&](const char* name, const char* type, const char* help) {
             line(std::string("# HELP ") + name + " " + help);
             line(std::string("# TYPE ") + name + " " + type);
         };
-        const std::string ml = "model=\"" + esc(model_) + "\"";
         std::lock_guard<std::mutex> l(mu_);
         head("onebit_up", "gauge", "1 while this 1bit serve runs; device names the route");
-        line("onebit_up{" + ml + ",device=\"" + esc(device_) + "\"} 1");
-        head("onebit_requests_total", "counter", "requests forwarded to the backend, by route and HTTP status");
-        for (const auto& [k, n] : requests_)
-            line("onebit_requests_total{" + ml + ",route=\"" + esc(k.first) + "\",code=\"" + std::to_string(k.second) + "\"} " +
-                 std::to_string(n));
-        head("onebit_requests_in_flight", "gauge", "requests waiting on the backend");
-        line("onebit_requests_in_flight{" + ml + "} " + std::to_string(in_flight));
-        head("onebit_ttft_seconds", "histogram", "streamed requests: seconds from forwarding to the backend's first byte");
-        for (size_t i = 0; i < kBuckets.size(); i++)
-            line("onebit_ttft_seconds_bucket{" + ml + ",le=\"" + fmt(kBuckets[i]) + "\"} " + std::to_string(ttft_counts_[i]));
-        line("onebit_ttft_seconds_bucket{" + ml + ",le=\"+Inf\"} " + std::to_string(ttft_count_));
-        line("onebit_ttft_seconds_sum{" + ml + "} " + fmt(ttft_sum_));
-        line("onebit_ttft_seconds_count{" + ml + "} " + std::to_string(ttft_count_));
-        head("onebit_prompt_tokens_total", "counter", "prompt tokens the backend processed (its timings)");
-        line("onebit_prompt_tokens_total{" + ml + "} " + std::to_string(prompt_tokens_));
-        head("onebit_prompt_seconds_total", "counter", "seconds the backend spent on prompts (its timings)");
-        line("onebit_prompt_seconds_total{" + ml + "} " + fmt(prompt_secs_));
-        head("onebit_generated_tokens_total", "counter", "tokens the backend generated (its timings)");
-        line("onebit_generated_tokens_total{" + ml + "} " + std::to_string(gen_tokens_));
-        head("onebit_generation_seconds_total", "counter", "seconds the backend spent generating (its timings)");
-        line("onebit_generation_seconds_total{" + ml + "} " + fmt(gen_secs_));
-        if (last_prompt_tps_ >= 0) {
-            head("onebit_last_prompt_tokens_per_second", "gauge", "prompt speed of the last request");
-            line("onebit_last_prompt_tokens_per_second{" + ml + "} " + fmt(last_prompt_tps_));
-        }
-        if (last_gen_tps_ >= 0) {
-            head("onebit_last_generation_tokens_per_second", "gauge", "generation speed of the last request");
-            line("onebit_last_generation_tokens_per_second{" + ml + "} " + fmt(last_gen_tps_));
-        }
-        head("onebit_serve_starts_total", "counter", "times 1bit serve started for this model (kept across restarts)");
-        line("onebit_serve_starts_total{" + ml + "} " + std::to_string(life.starts));
-        head("onebit_backend_restarts_total", "counter", "starts after the first (Lemonade reloading the backend)");
-        line("onebit_backend_restarts_total{" + ml + "} " + std::to_string(life.starts ? life.starts - 1 : 0));
-        head("onebit_watchdog_kills_total", "counter", "backends the progress watchdog killed (kept across restarts)");
-        line("onebit_watchdog_kills_total{" + ml + "} " + std::to_string(life.watchdog_kills));
+        line("onebit_up{device=\"" + esc(device_) + "\"} 1");
+        head("onebit_serve_starts_total", "counter", "times 1bit serve loaded this model (kept across restarts)");
+        line("onebit_serve_starts_total " + std::to_string(life.starts));
+        head("onebit_watchdog_kills_total", "counter", "backends serve's progress watchdog killed (kept across restarts)");
+        line("onebit_watchdog_kills_total " + std::to_string(life.watchdog_kills));
         head("onebit_backend_exits_total", "counter", "backends that exited on their own (kept across restarts)");
-        line("onebit_backend_exits_total{" + ml + "} " + std::to_string(life.backend_exits));
+        line("onebit_backend_exits_total " + std::to_string(life.backend_exits));
         if (log_.splits_prompt) {
             head("onebit_graph_splits", "gauge", "llama.cpp graph splits at load (backend log), by batch");
-            line("onebit_graph_splits{" + ml + ",batch=\"prompt\"} " + std::to_string(*log_.splits_prompt));
-            line("onebit_graph_splits{" + ml + ",batch=\"1\"} " + std::to_string(*log_.splits_one));
+            line("onebit_graph_splits{batch=\"prompt\"} " + std::to_string(*log_.splits_prompt));
+            line("onebit_graph_splits{batch=\"1\"} " + std::to_string(*log_.splits_one));
         }
         head("onebit_program_cache_flushes_total", "counter", "HRX graph-program cache flushes (backend log WARN)");
-        line("onebit_program_cache_flushes_total{" + ml + "} " + std::to_string(log_.program_cache_flushes));
+        line("onebit_program_cache_flushes_total " + std::to_string(log_.program_cache_flushes));
         if (log_.cpu_fallback_total) {
             head("onebit_cpu_fallback_ops", "gauge", "graph ops placed on the CPU instead of HRX (backend's load report, engine #390)");
-            line("onebit_cpu_fallback_ops{" + ml + ",op=\"all\"} " + std::to_string(*log_.cpu_fallback_total));
+            line("onebit_cpu_fallback_ops{op=\"all\"} " + std::to_string(*log_.cpu_fallback_total));
             for (const auto& [op, n] : log_.cpu_fallback_ops)
-                line("onebit_cpu_fallback_ops{" + ml + ",op=\"" + esc(op) + "\"} " + std::to_string(n));
+                line("onebit_cpu_fallback_ops{op=\"" + esc(op) + "\"} " + std::to_string(n));
         }
         const sysinfo::Memory mem = sysinfo::memory(sys_root);
-        if (mem.has_meminfo || mem.has_gtt) {
-            head("onebit_box_bytes", "gauge", "memory of the box: RAM (/proc/meminfo) and the amdgpu GTT pool");
-            if (mem.has_meminfo) {
-                line("onebit_box_bytes{kind=\"mem_total\"} " + std::to_string(mem.mem_total));
-                line("onebit_box_bytes{kind=\"mem_available\"} " + std::to_string(mem.mem_available));
-            }
-            if (mem.has_gtt) {
-                line("onebit_box_bytes{kind=\"gtt_total\"} " + std::to_string(mem.gtt_total));
-                line("onebit_box_bytes{kind=\"gtt_used\"} " + std::to_string(mem.gtt_used));
-            }
-        }
         if (mem.has_gtt) {
+            head("onebit_gtt_bytes", "gauge", "the amdgpu GTT pool (mem_info_gtt_*), which HRX allocates from");
+            line("onebit_gtt_bytes{kind=\"total\"} " + std::to_string(mem.gtt_total));
+            line("onebit_gtt_bytes{kind=\"used\"} " + std::to_string(mem.gtt_used));
             head("onebit_gtt_fault_zone", "gauge", "1 when GTT use is at or above 95 GiB, where engine #315's faults were seen");
             line(std::string("onebit_gtt_fault_zone ") + (mem.gtt_used >= (95ull << 30) ? "1" : "0"));
         }
@@ -255,7 +190,6 @@ public:
     }
 
 private:
-    static constexpr std::array<double, 11> kBuckets = {0.05, 0.1, 0.25, 0.5, 1, 2.5, 5, 10, 30, 60, 120};
     static std::string esc(const std::string& s) {
         std::string o;
         for (char c : s) {
@@ -271,14 +205,8 @@ private:
         return b;
     }
 
-    std::string model_, device_;
+    std::string device_;
     mutable std::mutex mu_;
-    std::map<std::pair<std::string, int>, uint64_t> requests_;
-    std::array<uint64_t, kBuckets.size()> ttft_counts_{};
-    double ttft_sum_ = 0;
-    uint64_t ttft_count_ = 0;
-    uint64_t prompt_tokens_ = 0, gen_tokens_ = 0;
-    double prompt_secs_ = 0, gen_secs_ = 0, last_prompt_tps_ = -1, last_gen_tps_ = -1;
     BackendLogFacts log_;
 };
 

@@ -49,7 +49,7 @@ One model per process:
 | `POST /v1/responses` | OpenAI Responses API, streamed or not (llama-server devices) |
 | `POST /tokenize`, `/detokenize`, `/apply-template` | llama-server devices |
 | `GET /slots`, `POST /slots/<id>?action=…`, `GET /props` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
-| `GET /metrics` | Prometheus text: serve's own metrics on every child-process device, then the backend's own where it has them ([below](#metrics)) |
+| `GET /metrics` | Prometheus text: the engine's own series (GTT, Tctl, CPU fallbacks, program-cache flushes, starts, watchdog kills) on every child-process device, then the backend's own ([below](#metrics)) |
 
 "llama-server devices" means `hrx` and `cpu`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
@@ -103,40 +103,48 @@ non-streamed answer and a hang look the same from outside. `tests/watchdog_serve
 
 ## Metrics
 
-`GET /metrics` answers Prometheus text (format 0.0.4) on every device serve runs as a child
-process (`hrx`, `cpu`, `ds4`, `onnx`, `mlx`; the in-process NPU route has none yet). serve's own
-series come first, then the backend's `/metrics` when it answers one: llama-server is started
-with `--metrics`, so its `llamacpp:*` series follow.
+Lemonade's own `/metrics` already reports, per model:
+- requests, tokens, time to first token and tok/s (`lemonade_model_*`);
+- CPU and memory use;
+- GTT plus VRAM, as `lemonade_vram_used_gb`.
+
+So `GET /metrics` on serve adds only what the engine sees and Lemonade cannot, in Prometheus
+text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`, `ds4`, `onnx`,
+`mlx`). The in-process NPU route has none yet. serve's own series come first. The backend's own
+`/metrics` follows when it answers one: llama-server is started with `--metrics`, so its
+`llamacpp:*` series follow.
 
 | Series | What |
 |---|---|
-| `onebit_up{model,device}` | 1; `device` names the route |
-| `onebit_requests_total{model,route,code}` | requests forwarded (chat, completions, Responses), by HTTP status |
-| `onebit_requests_in_flight{model}` | requests waiting on the backend |
-| `onebit_ttft_seconds{model}` (histogram) | streamed requests: forward to the backend's first byte |
-| `onebit_prompt_tokens_total`, `onebit_prompt_seconds_total` | from llama-server's `timings` (rate of one over the other is prompt tok/s) |
-| `onebit_generated_tokens_total`, `onebit_generation_seconds_total` | the same for generation |
-| `onebit_last_prompt_tokens_per_second`, `onebit_last_generation_tokens_per_second` | the last request's speeds |
-| `onebit_serve_starts_total`, `onebit_backend_restarts_total` | serve starts for this model, and starts after the first (Lemonade reloading it) |
-| `onebit_watchdog_kills_total`, `onebit_backend_exits_total` | backends the [watchdog](#when-a-backend-hangs) killed, and backends that exited on their own |
-| `onebit_graph_splits{model,batch="prompt"\|"1"}` | llama.cpp's `graph splits = …` line at load |
+| `onebit_up{device}` | 1; `device` names the route |
+| `onebit_serve_starts_total` | loads of this model by serve, kept across restarts |
+| `onebit_watchdog_kills_total` | backends the [progress watchdog](#when-a-backend-hangs) killed, kept across restarts |
+| `onebit_backend_exits_total` | backends that exited on their own, kept across restarts |
+| `onebit_graph_splits{batch="prompt"\|"1"}` | llama.cpp's `graph splits = …` line at load |
 | `onebit_program_cache_flushes_total` | ggml-hrx's "HRX graph program cache over its limit" WARN lines |
-| `onebit_cpu_fallback_ops{model,op}` | engine #390's load report of ops placed off HRX, per op and `op="all"` |
-| `onebit_box_bytes{kind}` | `mem_total`, `mem_available` (/proc/meminfo); `gtt_total`, `gtt_used` (amdgpu `mem_info_gtt_*`) |
+| `onebit_cpu_fallback_ops{op}` | engine #390's load report of ops placed off HRX, per op and `op="all"` |
+| `onebit_gtt_bytes{kind="total"\|"used"}` | the amdgpu GTT pool HRX allocates from (`mem_info_gtt_*`) |
 | `onebit_gtt_fault_zone` | 1 when GTT use is at or above 95 GiB, where engine #315's faults were seen |
 | `onebit_tctl_celsius` | CPU Tctl (k10temp) |
 
 The log-derived series come from the backend's stderr, which serve passes through unchanged and
 reads line by line (Linux). A series whose line never came is left out, not reported as 0. The
-CPU-fallback report (#390) is read from a line that names "CPU fallback" (or "off HRX") followed
-by `OP=count`, `OP xcount` or `OP: count` pairs, or by a total alone.
+#390 report is read from a line that names "CPU fallback" (or "off HRX"), followed by `OP=count`,
+`OP xcount` or `OP: count` pairs, or by a total alone.
 
-Starts, watchdog kills and backend exits outlive one serve process, because Lemonade restarts a
-backend by starting `1bit serve` again. They are kept per model id in
+Starts, watchdog kills and exits outlive one serve process, because Lemonade restarts a backend
+by starting `1bit serve` again. They are kept per model id in
 `$XDG_STATE_HOME/1bit/serve/<id>.json` (default `~/.local/state/1bit/serve/`; `$ONEBIT_STATE_DIR`
-replaces `…/1bit`). Where that is not writable they count from zero in each process. The other
-counters start at zero with each serve process. `tests/metrics_serve.sh` (ctest `metrics_serve`,
-CI included) checks every series against `tests/fake_backend.py`.
+replaces `…/1bit`).
+
+**How Lemonade picks them up.** Lemonade appends a backend's `/metrics` to its own when the
+backend's recipe descriptor sets `exposes_prometheus_metrics`. Each line is renamed
+`lemonade_llamacpp_<name>` and labelled with the model. Our fork's `onebit` descriptor has it
+`false` today, so turning it on is a one-line change in the fork, and it is Lemonade's call.
+Until then, scrape serve's port directly.
+
+`tests/metrics_serve.sh` (ctest `metrics_serve`, CI included) checks every series against
+`tests/fake_backend.py`.
 
 ## Where the model runs
 

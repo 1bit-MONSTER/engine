@@ -17,12 +17,11 @@
 # `1bit serve`'s GET /metrics (docs/serve.md, "Metrics"), without a GPU: tests/fake_backend.py
 # stands in for llama-server, writes the log lines serve reads (graph splits, HRX graph-program
 # cache flushes, a CPU-fallback report) and answers /metrics with one llamacpp:* series.
-#   - requests by route and status, time to first byte, prompt and generation tokens from the
-#     backend's timings (non-streamed body and last SSE chunk),
 #   - what the backend's log said, and nothing for a line that never came,
-#   - the box (RAM; GTT and Tctl where there are),
+#   - GTT and Tctl where the box has them,
 #   - the backend's own /metrics appended,
-#   - starts, restarts and watchdog kills kept across serve processes,
+#   - starts and watchdog kills kept across serve processes,
+#   - no request / TTFT / tok-s series (Lemonade reports those),
 #   - every line is valid Prometheus text.
 #
 # usage: tests/metrics_serve.sh path/to/1bit
@@ -81,28 +80,22 @@ PY
 FAKE_BACKEND_LOG_LINES=1 start "$scratch/a.log"
 curl -s -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"messages": [{"role": "user", "content": "hi"}]}'
-curl -sN -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \
-    -d '{"stream": true, "messages": [{"role": "user", "content": "hi"}]}'
 type=$(curl -s -o "$scratch/m1.txt" -w '%{content_type}' "$api/metrics")
 m=$scratch/m1.txt
 check "text/plain exposition ($type)" '[[ "$type" == text/plain* ]]'
 check "valid Prometheus text" 'valid "$m"'
-check "onebit_up names the device" '[ "$(metric "$m" "onebit_up{model=\"m1\",device=\"cpu\"}")" = 1 ]'
-check "two chat requests, status 200" '[ "$(metric "$m" "onebit_requests_total{model=\"m1\",route=\"/v1/chat/completions\",code=\"200\"}")" = 2 ]'
-check "one time to first byte (the streamed one)" '[ "$(metric "$m" "onebit_ttft_seconds_count{model=\"m1\"}")" = 1 ]'
-check "prompt tokens from both timings" '[ "$(metric "$m" "onebit_prompt_tokens_total{model=\"m1\"}")" = 20 ]'
-check "generated tokens from both timings" '[ "$(metric "$m" "onebit_generated_tokens_total{model=\"m1\"}")" = 14 ]'
-check "last generation speed 20 tok/s" '[ "$(metric "$m" "onebit_last_generation_tokens_per_second{model=\"m1\"}")" = 20 ]'
-check "graph splits from the backend log" '[ "$(metric "$m" "onebit_graph_splits{model=\"m1\",batch=\"prompt\"}")" = 3 ] && [ "$(metric "$m" "onebit_graph_splits{model=\"m1\",batch=\"1\"}")" = 2 ]'
-check "program-cache flushes from the WARN" '[ "$(metric "$m" "onebit_program_cache_flushes_total{model=\"m1\"}")" = 2 ]'
-check "CPU fallbacks from the report line" '[ "$(metric "$m" "onebit_cpu_fallback_ops{model=\"m1\",op=\"all\"}")" = 3 ] && [ "$(metric "$m" "onebit_cpu_fallback_ops{model=\"m1\",op=\"GET_ROWS\"}")" = 2 ]'
+check "onebit_up names the device" '[ "$(metric "$m" "onebit_up{device=\"cpu\"}")" = 1 ]'
+check "graph splits from the backend log" '[ "$(metric "$m" "onebit_graph_splits{batch=\"prompt\"}")" = 3 ] && [ "$(metric "$m" "onebit_graph_splits{batch=\"1\"}")" = 2 ]'
+check "program-cache flushes from the WARN" '[ "$(metric "$m" "onebit_program_cache_flushes_total")" = 2 ]'
+check "CPU fallbacks from the report line" '[ "$(metric "$m" "onebit_cpu_fallback_ops{op=\"all\"}")" = 3 ] && [ "$(metric "$m" "onebit_cpu_fallback_ops{op=\"GET_ROWS\"}")" = 2 ]'
 check "the backend's own /metrics appended" '[ "$(metric "$m" "llamacpp:prompt_tokens_total")" = 12 ]'
-check "first start, no restart yet" '[ "$(metric "$m" "onebit_serve_starts_total{model=\"m1\"}")" = 1 ] && [ "$(metric "$m" "onebit_backend_restarts_total{model=\"m1\"}")" = 0 ]'
-if [ -r /proc/meminfo ]; then
-    check "RAM from /proc/meminfo" '[ "$(metric "$m" "onebit_box_bytes{kind=\"mem_total\"}")" -gt 0 ]'
-fi
+check "first start" '[ "$(metric "$m" "onebit_serve_starts_total")" = 1 ]'
+check "no request, TTFT or tok/s series (Lemonade's)" '! grep -q -E "^onebit_(requests|ttft|prompt_tokens|generated|last_)" "$m"'
 if ls /sys/class/drm/card*/device/mem_info_gtt_total >/dev/null 2>&1; then
-    check "GTT from amdgpu sysfs" '[ "$(metric "$m" "onebit_box_bytes{kind=\"gtt_total\"}")" -gt 0 ]'
+    check "GTT from amdgpu sysfs" '[ "$(metric "$m" "onebit_gtt_bytes{kind=\"total\"}")" -gt 0 ]'
+fi
+if grep -qs k10temp /sys/class/hwmon/*/name; then
+    check "Tctl from k10temp" '[ "$(metric "$m" "onebit_tctl_celsius")" != absent ]'
 fi
 check "backend log lines still reach serve's stderr" 'grep -q "graph splits = 3" "$scratch/a.log"'
 kill "$pid"; wait "$pid" 2>/dev/null
@@ -111,9 +104,9 @@ kill "$pid"; wait "$pid" 2>/dev/null
 start "$scratch/b.log" --watchdog 1
 curl -s -o "$scratch/m2.txt" "$api/metrics"
 m=$scratch/m2.txt
-check "second start counted as a restart" '[ "$(metric "$m" "onebit_serve_starts_total{model=\"m1\"}")" = 2 ] && [ "$(metric "$m" "onebit_backend_restarts_total{model=\"m1\"}")" = 1 ]'
-check "no CPU-fallback line, no CPU-fallback metric" '[ "$(metric "$m" "onebit_cpu_fallback_ops{model=\"m1\",op=\"all\"}")" = absent ]'
-check "no splits line, no splits metric" '[ "$(metric "$m" "onebit_graph_splits{model=\"m1\",batch=\"prompt\"}")" = absent ]'
+check "second start counted" '[ "$(metric "$m" "onebit_serve_starts_total")" = 2 ]'
+check "no CPU-fallback line, no CPU-fallback metric" '[ "$(metric "$m" "onebit_cpu_fallback_ops{op=\"all\"}")" = absent ]'
+check "no splits line, no splits metric" '[ "$(metric "$m" "onebit_graph_splits{batch=\"prompt\"}")" = absent ]'
 curl -sN -m 20 -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"stream": true, "fake_hang": true, "messages": [{"role": "user", "content": "hi"}]}' &
 pids+=($!)
@@ -123,7 +116,7 @@ check "the watchdog took the hung backend down" '! kill -0 "$pid" 2>/dev/null'
 start "$scratch/c.log"
 curl -s -o "$scratch/m3.txt" "$api/metrics"
 m=$scratch/m3.txt
-check "the watchdog kill is counted after the restart" '[ "$(metric "$m" "onebit_watchdog_kills_total{model=\"m1\"}")" = 1 ] && [ "$(metric "$m" "onebit_serve_starts_total{model=\"m1\"}")" = 3 ]'
+check "the watchdog kill is counted after the restart" '[ "$(metric "$m" "onebit_watchdog_kills_total")" = 1 ] && [ "$(metric "$m" "onebit_serve_starts_total")" = 3 ]'
 
 if [ $fail -ne 0 ]; then for l in a b c; do echo "--- serve log $l"; cat "$scratch/$l.log"; done; echo "--- metrics"; cat "$scratch"/m*.txt; echo FAIL; exit 1; fi
 echo PASS

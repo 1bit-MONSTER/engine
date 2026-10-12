@@ -96,18 +96,15 @@ class H(BaseHTTPRequestHandler):
             text = "".join(WORDS)
             msg = {"message": {"role": "assistant", "content": text}} if "chat" in self.path else {"text": text}
             # llama-server's timings, fixed, for tools/bench.py (tests/bench_selftest.sh)
-            timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0,
-                       "prompt_n": 10, "prompt_ms": 20.0, "predicted_n": 7, "predicted_ms": 350.0}
+            timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0}
             self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
                              "timings": timings})
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")
         self.end_headers()
-        for i, w in enumerate(WORDS):
+        for w in WORDS:
             chunk = {"id": "x", "model": "fake-backend-id", "choices": [{"index": 0, "delta": {"content": w}}]}
-            if i == len(WORDS) - 1:  # llama-server's last chunk carries its timings
-                chunk["timings"] = {"prompt_n": 10, "prompt_ms": 20.0, "predicted_n": 7, "predicted_ms": 350.0}
             self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
             self.wfile.flush()
             time.sleep(0.01)

@@ -31,9 +31,23 @@ This is NOT an acceptance run (task-9 owns acceptance).
 ## Arms so far
 
 ```
-pair 1 arm c: OK nan=0 req=66 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=0 hv56=0
-pair 1 arm l: (running) 152 requests served, 0 faults both faces
+pair 1 arm c: OK  nan=0 req=66 parse=0 gtt_start=98G   <- IN regime, clean
+pair 1 arm l: OOR nan=0 req=66 parse=0 gtt_start=93G   <- OUT of regime, NOT COUNTED
 ```
+
+Both arms served 66/66 with `utf8_fail=0 parse_fail=0 http_fail=0 transport_fail=0
+truncated=False` and no NaN. But the driver's own gate ("out-of-regime `gtt_start` < 95 GiB
+(reported, not counted)", `315-paired.sh:12`) excludes arm `l`: it started at 93 GiB, below
+the frozen 95 GiB gate.
+
+**So the tally to date is 1 in-regime arm, 0 faults — not 2 clean arms.** An `OOR` arm is
+neither clean evidence nor a fault and must not be summed with the clean ones. The
+composition does not guarantee every arm lands in band: `gtt_start` is sampled per arm
+(`315-paired.sh:75`) and drifted by 5 GiB between the two arms of this pair.
+
+If the drift persists, a 12-arm run yields roughly half in-regime arms — which is far short
+of task-9's `>=60` but is enough for task-8, whose requirement is a single faulting arm or
+an honest null.
 
 ## What this does and does not establish
 

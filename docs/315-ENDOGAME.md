@@ -195,3 +195,35 @@ Include the reproduction and the arm-campaign evidence paths.
    instead (`315-paired-pidcap.sh` exists for exactly this reason).
 7. **H1's falsification came from `boot_ns`, not a purpose-built control.** The control in §2 makes
    it direct. Until then, treat H1 as strongly weakened but formally open.
+
+---
+
+## Appendix — measured pace and the budget verdict (2026-10-12 17:22 box time)
+
+Measured from the arm `server.pid` mtimes, i.e. from when each arm's server actually started:
+
+```
+16:55:18  p1c      16:59:45  p1l      17:04:11  p2l
+17:08:37  p3l      17:13:02  p4c      17:17:27  p4l
+```
+
+Interval between consecutive arm starts: **4:25, 4:26, 4:26, 4:27, 4:25** — a spread of **2 seconds**
+across five intervals. So the pace is not an estimate; it is **4.43 min/arm** with almost no variance,
+which also means the arm time is set by the fixed request sequence and not by contention.
+
+| | |
+|---|---|
+| arms started | 6 |
+| measured pace | **4.43 min/arm** |
+| projected total (93 arms) | **6.87 h** |
+| elapsed so far | 0.42 h |
+| projected completion | ~**23:45 box time** |
+
+**Budget verdict — both stages fit.** ~2 h used before the campaign + 6.87 h campaign + ~2.2 h for a
+20-pair control (30 arms × 4.43) ≈ **11.1 h of the 12 h ceiling.** So the decisive control in §2 does
+fit after the campaign, which was the open question in Update 4. Margin is ~0.9 h: enough, but not
+enough to also add a stage without re-checking.
+
+Note the `c` arms appear only at pairs 1 and 4 so far, so the pairing is sparse in controls as
+designed — 70 pairs should yield ~70 `l` and ~20 `c`, comfortably clearing the 60 **fix-cell** bar
+with ~10 arms of slack for any that fall out of regime.

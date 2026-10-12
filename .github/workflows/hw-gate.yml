@@ -1,0 +1,125 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# HRX hardware gate (docs/hw-gate.md): ci.yml runs on a GPU-less GitHub runner, and the HRX
+# correctness bugs #308 #309 #310 #313 #318 #319 #369 #370 were all found by hand. This job runs
+# scripts/hw-gate.sh on the Strix Halo box: test-backend-ops on HRX0, tools/kat.py against
+# goldens recorded at the release pin on three models, KLD against stored base logits, and the
+# 4.7K-token needle. It is one check on the PR (hw_gate), or one commit status (hw-gate) when it
+# is started by hand.
+#
+# When it runs:
+#   - a same-repo PR labelled `hw-gate` (adding the label starts it; later pushes re-run it);
+#   - every PR bump-hrx opens (branch bump-hrx/*; that workflow opens it with a PAT, so this fires);
+#   - by hand: Actions -> hw-gate -> Run workflow, with a ref (branch, tag, SHA or pull/N/head).
+# PRs from forks never run here: this is a self-hosted runner on the owner's box.
+#
+# Runner: strixhalo-engine (the only engine runner with the pr-agent label). That is deliberate:
+# the runner runs one job at a time, so no PR-Agent review (Vulkan coder-llm on :8090) generates
+# while the gate's HRX dispatches run (long HRX dispatches starve that model into a ring timeout).
+# The script also waits for coder-llm to be idle before each GPU step and reports any new ring
+# timeout. GPU steps hold ~/npu.lock one at a time (other GPU work on the box keeps priority
+# between steps), run under scripts/mem-guard.sh and ~/lb/thermal-run.sh.
+name: hw-gate
+
+on:
+  pull_request:
+    types: [opened, synchronize, reopened, labeled]
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: "Branch, tag, SHA or pull/N/head to check"
+        required: true
+        default: main
+      phases:
+        description: "Phases to run (build,ops,kat,kld,needle)"
+        required: false
+        default: build,ops,kat,kld,needle
+
+permissions:
+  contents: read
+
+jobs:
+  hw_gate:
+    runs-on: [self-hosted, strixhalo, pr-agent]
+    if: |
+      github.event_name == 'workflow_dispatch' ||
+      (github.event.pull_request.head.repo.full_name == github.repository &&
+       (github.event.action != 'labeled' || github.event.label.name == 'hw-gate') &&
+       (contains(github.event.pull_request.labels.*.name, 'hw-gate') ||
+        startsWith(github.event.pull_request.head.ref, 'bump-hrx/')))
+    permissions:
+      contents: read
+      statuses: write   # by-hand runs post the hw-gate status on the commit they checked
+    concurrency:
+      group: hw-gate-${{ github.event.pull_request.number || inputs.ref }}
+      cancel-in-progress: true
+    # the gate itself takes under 20 minutes; the rest is waiting for ~/npu.lock and a cold build
+    timeout-minutes: 150
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          ref: ${{ github.event_name == 'workflow_dispatch' && (startsWith(inputs.ref, 'pull/') && format('refs/{0}', inputs.ref) || inputs.ref) || '' }}
+          persist-credentials: false
+          submodules: false
+
+      - name: Check out the HRX pair (llama.cpp + hrx-system)
+        run: |
+          set -euo pipefail
+          git submodule sync -- third_party/llama.cpp third_party/hrx-system
+          git -c protocol.version=2 submodule update --init --depth 1 third_party/llama.cpp third_party/hrx-system
+          git submodule status -- third_party/llama.cpp third_party/hrx-system
+
+      - name: Pending status
+        if: github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          gh api -X POST "repos/${{ github.repository }}/statuses/$(git rev-parse HEAD)" \
+            -f state=pending -f context=hw-gate -f description="HRX hardware gate running" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null
+
+      - name: HRX hardware gate
+        id: gate
+        env:
+          HW_GATE_OUT: ${{ runner.temp }}/hw-gate
+          PHASES: ${{ inputs.phases || 'build,ops,kat,kld,needle' }}
+        run: scripts/hw-gate.sh --phases "$PHASES"
+
+      - name: Logs of failed checks
+        if: failure()
+        env:
+          HW_GATE_OUT: ${{ runner.temp }}/hw-gate
+        run: |
+          for f in "$HW_GATE_OUT"/kat-*.txt "$HW_GATE_OUT"/needle.txt "$HW_GATE_OUT"/kld-*.log; do
+            [ -f "$f" ] || continue
+            echo "::group::$(basename "$f")"; tail -n 60 "$f"; echo "::endgroup::"
+          done
+          for f in "$HW_GATE_OUT"/ops-*.log; do
+            [ -f "$f" ] || continue
+            grep -q FAIL "$f" || continue
+            echo "::group::$(basename "$f") (failing cases)"; grep -E "FAIL|passed" "$f" | head -n 40; echo "::endgroup::"
+          done
+
+      - name: Final status
+        if: always() && github.event_name == 'workflow_dispatch'
+        env:
+          GH_TOKEN: ${{ github.token }}
+          OUTCOME: ${{ steps.gate.outcome }}
+        run: |
+          state=failure; [ "$OUTCOME" = success ] && state=success
+          gh api -X POST "repos/${{ github.repository }}/statuses/$(git rev-parse HEAD)" \
+            -f state="$state" -f context=hw-gate -f description="HRX hardware gate: $OUTCOME" \
+            -f target_url="${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}" > /dev/null

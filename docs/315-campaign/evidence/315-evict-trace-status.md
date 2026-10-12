@@ -318,3 +318,31 @@ behaviour, and better than the pre-fix version that would have run unprotected.
 The task-8 contract permits closing on the null, recorded as uninformative with its
 clean-arm count. The reason is box contention — externally caused and now documented — not a
 design choice and not a harness defect.
+
+## Final measured state at the block (2026-10-12 13:26)
+
+`~/npu.lock` queue, oldest first — the head does not drain:
+
+| waited | pid | what |
+|---|---|---|
+| **6,376 s (1 h 46 m)** | 99828 | `flock ~/npu.lock ./batch2.sh` — **the head, and wedged** |
+| 1,583 s | 816808 / 816800 | another goal's `npu-forge2-kvsplit` bisect |
+| 1,479 s | 826939 / 826940 / 826913 / 826914 | another goal's `probe_model.sh` ×2 |
+| 1,345 s | 845081 | `./batch2.sh` itself |
+| 6:31 | 948371 | **our run 5** (`flock -w 900 8`), will abort at 900 s |
+
+`batch2.log`: **7,185 bytes, unchanged over 30 s — wedged.** It has 18 × "failed to load
+model" (`unknown model architecture: 'zamba2'`) and its current job is CPU-only
+(`-dev none -ngl 0 -t 4 --no-mmproj-offload`).
+
+**The queue is growing, not draining:** three unrelated workers are now parked behind a
+batch that is failing and not progressing. That is why retrying is not a strategy — a fresh
+attempt does not move closer to the head, it joins the queue behind a stalled owner.
+
+## Correction to the first blocker note
+
+The blocked summary says "three consecutive goal turns hit the same cause". That is right in
+substance but understated the first two: they were plain contention (`repro336` at
+103–111 GiB). **Today's is a wedged lock owner**, which is a different and worse problem —
+contention eventually clears, a stalled batch does not. Recorded so the decision is not made
+against the weaker description.

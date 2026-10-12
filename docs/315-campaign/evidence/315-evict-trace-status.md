@@ -630,3 +630,42 @@ PID-bindable (§ above). Faulting-vs-clean eviction counts remain the missing me
 **Does not name a mechanism.** Three faults in one run is a reproducibility result, not a
 mechanism. The four falsified lever families and the closed ordering/visibility super-family
 are untouched by it.
+
+---
+
+# The recorded blocker is STALE — both its premises are resolved
+
+The goal's blocker text (written before the reboot) says:
+
+> `~/npu.lock` is WEDGED: the granted holder is pid 826940, which no longer exists ...
+> Needs a user decision: (a) accept task-8 closing on the null ... (b) clear the wedged lock
+> ... (c) authorise running despite the queue.
+
+**Every clause of that is now out of date**, verified 2026-10-12 15:07:
+
+| claim in the blocker | measured now |
+|---|---|
+| `npu.lock` is wedged | **FREE** (`flock -n` succeeds) |
+| holder 826940 still holds it | `/proc/826940` gone, **0** stale `/proc/locks` entries |
+| need to choose (a) accept the null | **superseded** — run 7 produced 3 in-regime faults, both faces |
+| need to choose (b) clear the lock | **done** — the user's clean reboot cleared it |
+| need to choose (c) authorise running | **done** — run 7 ran, in regime, and completed |
+
+The blocker was correct when written and is now resolved by events. It is left in place only
+because goal blockers are not editable from here; this note is the correction of record.
+
+**Where the goal actually stands:**
+
+- task-5, task-6, task-7: complete
+- task-8: **evidence obtained** — run 7, 11 in-regime arms, 3 faults (Face A ×2, Face B ×1),
+  with the eviction stream attached and the Face-B arm's PID correlated exactly. The one
+  remaining measurement (faulting-vs-clean eviction counts) has a verified one-line fix
+  proposed in `315-pid-capture.md`.
+- task-9: still gated on a **named mechanism**, which no instrument has produced. Four lever
+  families are falsified and the ordering/visibility super-family is closed both by run
+  (§59, Fisher p=1.00) and at source. This is unaffected by the box being free.
+
+So the goal's blocker should be cleared, and the open question is not the box — it is whether
+the objective should be re-scoped from "land a fix + ≥60-arm campaign" (unreachable, no named
+mechanism) to "name the mechanism, or record the closed families and the next instrument"
+(what the evidence supports, and largely written).

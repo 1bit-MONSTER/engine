@@ -560,3 +560,73 @@ each arm directory at start, which the frozen driver does not do and I have not 
 **Recorded as the concrete next step, not as done.** Until it exists, the honest statement
 remains: the faulting arm was evicted heavily, the clean arms were in the same regime and were
 presumably also evicted, and nothing here separates them.
+
+---
+
+# RUN 7 FINAL: 11 in-regime arms, 3 faults, BOTH FACES captured
+
+Run 7 (`315evict7`, wrapper with all eight fixes) completed. **11 in-regime arms, 3 faults** —
+and it is the first run in this task to capture **both** failure faces in regime with the
+eviction watcher attached.
+
+```
+pair 1 arm c: OK    nan=0 req=66  gtt_start=97G
+pair 1 arm l: OK    nan=0 req=66  gtt_start=97G
+pair 2 arm l: OK    nan=0 req=66  gtt_start=97G
+pair 3 arm l: FAULT nan=0 req=20  gtt_start=97G   <- FACE B
+pair 4 arm c: OK    nan=0 req=66  gtt_start=98G
+pair 4 arm l: OK    nan=0 req=66  gtt_start=98G
+pair 5 arm l: OK    nan=0 req=66  gtt_start=98G
+pair 6 arm l: OK    nan=0 req=66  gtt_start=98G
+pair 7 arm c: FAULT nan=1 req=16  gtt_start=98G   <- FACE A
+pair 7 arm l: FAULT nan=1 req=1   gtt_start=98G   <- FACE A
+pair 8 arm l: OK    nan=0 req=66  gtt_start=98G
+```
+
+Every arm at `gtt_start` 97–98 GiB, inside the frozen `>= 95 GiB` gate.
+
+## Face A — the canonical guard line
+
+Both `p7c` and `p7l` produced the exact symptom the issue records:
+
+```
+0.57.838.128 E common_sampler_sample: HRX returned NaN logits: count=154880 of 154880,
+              index range [0..154879], contiguous=yes, continuing=no (engine#315)
+```
+
+`count == vocab == 154880` with `contiguous=yes` — the whole LM-head output NaN, exactly as
+`KNOWN-ISSUES.md` describes. Detector: `transport_failures: 1`,
+`first_failure: "RemoteDisconnected: Remote end closed connection without..."` (the server
+aborting on NaN).
+
+## Face B — `p3l`
+
+Detector: `http_failures: 1`, `first_failure: "HTTP 500"`, `truncated: true`, `nan=0`. Server:
+
+```
+1.21.180.831 W common_chat_peg_parse: unparsed Content-only output:  laptop too
+1.21.185.082 W srv operator(): got exception: code 500 - The model produced output that does
+              not match the expected Content...
+```
+
+## Both faces were captured with the eviction stream attached
+
+`8419 Q_EVICT` / `8417 restores not rescheduled` across the run, with `trigger=USERPTR 4866` +
+`trigger=SVM 3553`. The Face-B arm's own PID was bound exactly while live:
+**323 Q_EVICT / 357 Q_RESTORE** for pid 111371 →
+`~/wt/315evict7-evict/correlated-p3l.tsv` (681 rows).
+
+## What this establishes, and what it does not
+
+**Establishes:** the fault is reproducible **on demand in regime** — 3 faults in 11 arms
+(~27%), both faces, from a run where every arm was inside the gate and the driver's eviction
+events were recorded on one clock alongside. That is the input task-8 asked for, and it
+supersedes the earlier null (run 1: 1 in-regime arm, 0 faults).
+
+**Does not establish:** that evictions *cause* it. The clean arms ran in the same regime,
+presumably also evicted, and I could not compare them because finished arms are not
+PID-bindable (§ above). Faulting-vs-clean eviction counts remain the missing measurement.
+
+**Does not name a mechanism.** Three faults in one run is a reproducibility result, not a
+mechanism. The four falsified lever families and the closed ordering/visibility super-family
+are untouched by it.

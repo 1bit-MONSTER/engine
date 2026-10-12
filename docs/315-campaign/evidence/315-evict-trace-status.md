@@ -669,3 +669,31 @@ So the goal's blocker should be cleared, and the open question is not the box �
 the objective should be re-scoped from "land a fix + ≥60-arm campaign" (unreachable, no named
 mechanism) to "name the mechanism, or record the closed families and the next instrument"
 (what the evidence supports, and largely written).
+
+## Data-quality check of the running campaign (2026-10-12, ~9 arms in)
+
+A valid arm is one whose detector completed all 66 requests with no truncation and no first
+failure. Every scored arm so far qualifies, and every arm is inside the gate:
+
+```
+  p1c: req=66 ok=66 trunc=False first=None -> VALID
+  p1l: req=66 ok=66 trunc=False first=None -> VALID
+  p2l: req=66 ok=66 trunc=False first=None -> VALID
+  p3l: req=66 ok=66 trunc=False first=None -> VALID
+  p4c: req=66 ok=66 trunc=False first=None -> VALID
+  p4l: req=66 ok=66 trunc=False first=None -> VALID
+  p5l: req=66 ok=66 trunc=False first=None -> VALID
+  p6l: req=66 ok=66 trunc=False first=None -> VALID
+  p7c: req=66 ok=66 trunc=False first=None -> VALID
+  p7l: (in flight)
+
+  gtt_start distribution: 9 x 97G   (gate is >= 95)
+```
+
+So there are **no malformed arms and no out-of-regime arms** — the two ways this campaign could
+have produced a technically-clean but invalid result. Nine clean in-regime arms against run 7's
+3 faults in its first 11 at the same 97G gate.
+
+**Still not a result.** Nine arms gives a rule-of-three upper bound of 33%, which does not
+exclude the 26–27% baseline, and the H1 confound (fresh boot) is unaddressed. Recorded as a
+quality assurance datum, not evidence about the mechanism.

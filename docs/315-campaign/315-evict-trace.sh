@@ -67,7 +67,16 @@ trap cleanup EXIT INT TERM
 
 # Run the frozen driver unchanged. NOSTOP=1 so the run continues past a fault and gives us
 # more than one faulting arm to correlate; MINCLEAN=0 because this is not an acceptance run.
-FIX="$FIX" CTRL="$CTRL" TAG="$TAG" PAIRS="$PAIRS" MINCLEAN=0 NOSTOP=1 \
+# Run the frozen driver unchanged.
+#
+# MINCLEAN is a goalpost, not a floor: 315-paired.sh:147 stops when the clean count
+# REACHES it. Passing MINCLEAN=0 therefore means "stop at zero clean arms", which ended
+# the first launch of this wrapper after pair 1 (2 arms run, not 12). Set it above anything
+# reachable so the PAIRS cap is what ends the run, and let NOSTOP keep a fault from
+# aborting a diagnostic run.
+UNREACHABLE=$(( PAIRS * 2 + 1 ))
+MINCLEAN="$UNREACHABLE" NOSTOP=1 \
+  FIX="$FIX" CTRL="$CTRL" TAG="$TAG" PAIRS="$PAIRS" \
   bash "$HOME/wt/315-campaign.sh" 2>&1 | tail -20
 
 cleanup
@@ -92,8 +101,13 @@ echo
 echo "=== arm verdicts ==="
 if [ -f "$CONSOLE" ]; then
   grep -E "^  pair" "$CONSOLE" | tail -20
-  IN=$(grep -cE "^  pair.*gtt_start=(9[5-9]|10[0-9]|110)G" "$CONSOLE" 2>/dev/null || echo 0)
-  FA=$(grep -E "^  pair.*gtt_start=(9[5-9]|10[0-9]|110)G" "$CONSOLE" 2>/dev/null | grep -c "FAULT" || echo 0)
+  # grep -c prints 0 AND exits 1 when there are no matches, so `|| echo 0` appends a SECOND
+  # 0 and the value becomes "0\n0" - which made `[ "$FA" -eq 0 ]` fail with
+  # 'integer expected'. Take the count and normalise in one step.
+  IN=$(grep -cE "^  pair.*gtt_start=(9[5-9]|10[0-9]|110)G" "$CONSOLE" 2>/dev/null)
+  IN=${IN:-0}
+  FA=$(grep -E "^  pair.*gtt_start=(9[5-9]|10[0-9]|110)G" "$CONSOLE" 2>/dev/null | grep -c "FAULT")
+  FA=${FA:-0}
   echo "in-regime arms: $IN   faults: $FA"
   if [ "$FA" -eq 0 ]; then
     echo "NO in-regime fault in this run -> the eviction trace has no faulting half to correlate."

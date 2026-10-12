@@ -60,3 +60,48 @@ Q_EVICT 180   Q_RESTORE 246
 So the regime is reached and the eviction stream is populated. Whether this becomes
 **evidence** still depends on an in-regime arm faulting while the watcher is attached —
 a clean trace is recorded as UNINFORMATIVE with its clean-arm count, never as evidence.
+
+## 6. Two bugs that cost the first real launch (both mine, both silent-ish)
+
+### 6a. `MINCLEAN=0` stops immediately
+
+`315-paired.sh:147` stops when the clean count **reaches** the target:
+
+```sh
+[ "$cf" -ge "${MINCLEAN:-60}" ] && { say "STOP: reached $cf clean fix-cell arms"; break; }
+```
+
+It is a goalpost, not a floor. Passing `MINCLEAN=0` — intended as "no minimum" — means
+*stop at zero clean arms*, and `0 >= 0` is true, so the run ended after **pair 1**: 2 arms
+instead of 12. The wrapper now computes `MINCLEAN=$(( PAIRS * 2 + 1 ))` so nothing is
+reachable and the `PAIRS` cap is what ends the run. The console records it exactly:
+
+```
+after pair 1: fix-cell clean=0 fault-or-invalid=0 (target >=0 clean, cap 6 pairs)
+STOP: reached 0 clean fix-cell arms
+```
+
+### 6b. `grep -c ... || echo 0` yields a two-line value
+
+`grep -c` prints `0` **and** exits 1 when there are no matches, so `|| echo 0` appends a
+second `0`. The value becomes `"0\n0"` and the arithmetic test fails:
+
+```
+/home/bcloud/wt/315-evict-trace.sh: line 98: [: 0
+0: integer expected
+```
+
+The wrapper now takes the count and normalises with `${VAR:-0}` instead. Tested: zero
+matches gives `IN=[0] FA=[0]` and the comparison succeeds.
+
+**Why these matter beyond this script:** both failures left the run *looking finished*. 6a
+produced a complete, well-formed verdict summary for a 2-arm run — it would be easy to read
+"cell c: in-regime=1 clean=1 fault=0" as a result rather than as a truncated run. The
+`PAIRS`/`MINCLEAN` line in the console is the tell.
+
+### 6c. Box contention
+
+A campaign must not run while a peer holds the box. Observed on the relaunch attempt: a
+peer's `~/wt/loom-ub389` 27B HRX job under `guard.sh` (1800 s timeout), GTT 46.7 GiB,
+`npu.lock` touched minutes earlier. The composition would have evicted that job's memory.
+Wait for the box rather than disturb a peer — the goal's own constraint.

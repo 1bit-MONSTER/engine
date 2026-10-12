@@ -180,12 +180,42 @@ candidate and the by-name instrument that produced it are now withdrawn, and the
   in-regime**, both faces, never in the same arm), the guard line is exactly
   `count=154880 of 154880 ... contiguous=yes`, and the one ordered by-name capture put the corruption at
   **layer 0 of a T=512 prefill**, whole-batch, cascading to a fully NaN residual stream by layer 1;
-* **the best-matching lead is the engine's own #123/#140 record** (`docs/hrx.md`): a producer/consumer pair whose
-  barrier fenced LDS only, whose own description contains both faces ("the f32 output was right and `next_q8` was
-  wrong, and NaN when the stale bytes decoded as NaN") and the only pressure link anyone has written down ("the
-  window opens on dispatch preemption, which is why the rate followed memory-pressure settings"). That fix is in
-  the pin; what is not closed is the same window opening under memory pressure itself, which no userspace lever in
-  the inventory reaches.
+* **the best-matching lead, stated as a lead and not as a mechanism: the same *window* the engine's own #123/#140
+  record describes, opening somewhere our levers do not reach.** The historical instance is written down in
+  `docs/hrx.md` (section "MoE router expert-id fault fix" and the `00adc2b` section), and it is the only
+  record in the tree whose mechanism explains *both* faces in one sentence and *the GTT dependence at all*:
+  * a producer wave writes **global** memory, a consumer wave reads it back, and the barrier between them was
+    `kernel.barrier<workgroup>` - which fences **LDS only** (no store wait, no `buffer_gl0_inv`). A consumer
+    could therefore quantize the output slot's previous contents: *"The f32 output was right and `next_q8` was
+    wrong, and NaN when the stale bytes decoded as NaN"* - wrong-but-finite (Face B) and NaN (Face A) from one
+    defect, decided by what the stale bytes happened to hold. That is the same two-observables-one-event shape
+    this issue measures;
+  * *"The window opens when a dispatch is preempted, and any process's KFD queue eviction (page compaction,
+    KSM, memory pressure) does that, which is why the rate followed those settings"* - a mechanism that
+    explains the GTT dependence, which no other candidate in this issue does.
+
+  **Both historical fixes are in the pin, verified as ancestors of `0e255d774` (`git merge-base --is-ancestor`):**
+  `895d63f` (#123, the router argmax sentinel) and `00adc2b` (#140, `barrier<global>` then `barrier<workgroup>`
+  in every decode-split `reduce_fused` variant). So the historical defect is fixed, and what is *not* closed is
+  the same window opening somewhere else - most plausibly under memory pressure itself, where the preemption
+  is induced by the driver rather than by an adversarial test. Today's static audit over the whole `loom-libs/ops`
+  corpus and the forced-barrier run close this mechanism's **intra-dispatch** half for this model, but neither
+  reaches a window opened by the driver's own eviction.
+
+**The two instruments that could name it, and neither is built yet.** Named here so the next attempt starts from
+this state rather than re-deriving it:
+
+1. **Read a value at the point of production** - inside the dispatch, or from a non-transient copy taken at the
+   producer. This is the instrument the backend forces: a post-graph, by-name read cannot work on this backend
+   (it returns a transient arena slot's last writer, proven by arithmetic in an arm), so an in-dispatch read or a
+   producer-side copy is the only route left.
+2. **Correlate a faulting arm with the driver's own eviction/preemption events** - KFD SMI eviction records and
+   the amdgpu preemption path, aligned to the arm's own timeline. This is the instrument that tests the lead
+   above directly, and it needs an in-regime **faulting** arm to correlate; the profiled sessions so far produced
+   clean arms only (see the next bullet), so its faulting half is still owed.
+
+Neither instrument is a fix, and no limitation entry is recorded: a mechanism is not named, so `#315` stays OPEN
+by this issue's own rule.
 
 **No mechanism is proven, so no limitation entry is recorded**, and `#315` stays OPEN - a documented limitation is
 this issue's own rule only *after* the mechanism is named. The next instrument has to read a value at the point of

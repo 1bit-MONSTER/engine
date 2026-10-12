@@ -60,6 +60,7 @@
 
 #include "gguf_meta.h"
 #include "hrx_archs.h"
+#include "mem_admit.h"
 #include "pm.h"
 #include "recipes.h"
 
@@ -160,6 +161,8 @@ struct Options {
     bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
     std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
+    bool mem_check = true;               // --no-mem-check (or ONEBIT_MEM_CHECK=0): skip the admission check
+    bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -1374,6 +1377,40 @@ int serve_child(const Options& given) {
     auto stem = [](const std::string& m) { return fs::path(m).stem().string(); };
 
     const std::string id = model_id(o);
+
+    // Memory admission (app/mem_admit.h): before any llama-server starts, refuse a load the box
+    // has no room for, in one line with the numbers, so Lemonade shows why instead of an
+    // allocation failure or an OOM minutes later. laya counts its first device.
+    if (o.mem_check || o.mem_check_only) {
+        admit::Need need;
+        std::vector<const Launch*> launches;
+        if (!backends.empty()) launches.push_back(&backends[0]);
+        for (const auto& b : rag) launches.push_back(&b);
+        for (const Launch* l : launches)
+            if (l->device.rfind("hrx", 0) == 0 || l->device.rfind("cpu", 0) == 0) admit::add_llama_server(need, l->argv);
+        const admit::Verdict v = admit::judge(need, sysinfo::memory());
+        if (!need.parts.empty() && v.checked) {
+            auto gib = [](uint64_t b) { char t[32]; std::snprintf(t, sizeof t, "%.1f", double(b) / double(admit::kGiB)); return std::string(t); };
+            std::string parts;
+            for (const auto& p : need.parts) parts += (parts.empty() ? "" : "; ") + p;
+            const std::string ctx = need.ctx_from_model ? "the model's own ctx " + std::to_string(need.n_ctx) + " (no --ctx-size)"
+                                                        : "ctx " + std::to_string(need.n_ctx);
+            const std::string line = "need " + gib(need.total) + " GiB (" + parts + ") at " + ctx + ", free " + gib(v.free) +
+                                     " GiB (" + v.box + ")";
+            if (o.mem_check_only) {
+                std::printf("%s: %s: %s\n", id.c_str(), v.fits ? "fits" : "does not fit", line.c_str());
+                for (const auto& w : v.warnings) std::printf("%s: warning: %s\n", id.c_str(), w.c_str());
+                return v.fits ? 0 : 3;
+            }
+            if (!v.fits)
+                throw std::runtime_error(id + " does not fit: " + line + "; free memory, lower --ctx-size, or pass --no-mem-check");
+            std::fprintf(stderr, "1bit serve: memory: %s\n", line.c_str());
+            for (const auto& w : v.warnings) std::fprintf(stderr, "1bit serve: memory: warning: %s\n", w.c_str());
+        } else if (o.mem_check_only) {
+            std::printf("%s: no estimate (%s)\n", id.c_str(), need.parts.empty() ? "not a llama-server model" : "the box reports no memory");
+            return 0;
+        }
+    }
     std::atomic<bool> ready{false};
 
     httplib::Server srv;
@@ -1884,6 +1921,9 @@ void usage(FILE* out) {
                  "                  [--pm [--pm-experts FILE] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
+                 "                  [--no-mem-check | --mem-check]   before a .gguf loads, serve estimates its memory and\n"
+                 "                  refuses one that does not fit (--no-mem-check or ONEBIT_MEM_CHECK=0: skip;\n"
+                 "                  --mem-check: print the estimate and exit, 0 fits, 3 does not; docs/serve.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
@@ -1893,6 +1933,7 @@ void usage(FILE* out) {
 
 int run_serve(int argc, char** argv) {
     Options o;
+    if (const char* e = std::getenv("ONEBIT_MEM_CHECK"); e && std::string(e) == "0") o.mem_check = false;
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1942,6 +1983,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--no-recipes") o.no_recipes = true;
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
+        else if (a == "--no-mem-check") o.mem_check = false;
+        else if (a == "--mem-check") o.mem_check_only = true;
         else if (a == "--lemonade-url") o.lemonade_url = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);

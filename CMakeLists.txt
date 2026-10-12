@@ -102,6 +102,7 @@ add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FI
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
@@ -115,6 +116,11 @@ add_test(NAME http_guard COMMAND http_guard_test)
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)
 target_include_directories(gguf_meta_test PRIVATE app)
 add_test(NAME gguf_meta COMMAND gguf_meta_test)
+# serve's memory admission (app/mem_admit.h, docs/serve.md "Will it fit?"): KV/state sizes against
+# HRX0 logs, the box readings on a fake /proc and /sys; header only, runs in CI.
+add_executable(mem_admit_test tests/mem_admit_test.cpp)
+target_include_directories(mem_admit_test PRIVATE app)
+add_test(NAME mem_admit COMMAND mem_admit_test)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.

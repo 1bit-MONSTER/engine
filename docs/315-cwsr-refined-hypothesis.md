@@ -165,3 +165,36 @@ If it instead shows a proportionally larger value, H4 is dead and the firmware i
 layout.
 
 Recorded as a hypothesis with a bounded test, not as a finding.
+
+### H4 first measurement (kernel-side values, previously unknown)
+
+Read from `/sys/class/kfd/kfd/topology/nodes/1/properties`:
+
+```
+cwsr_size       19185664   (18.3 MiB)
+ctl_stack_size     16384   (16 KiB)
+```
+
+Three consequences, and they cut against H4:
+
+1. **`ctl_stack_size = 16384` exactly equals libhsakmt's SGPR return (`0x4000` = 16384).**
+   So the kernel's `!=` check compares 16384 against 16384 and passes. That is consistent
+   with the arms running at all, and it means the control stack is **not** mis-sized today —
+   kernel and userspace agree.
+2. Therefore the control-stack half is *coherent*: whatever the firmware's save/restore list
+   supplied, userspace declares a matching value. **H4's control-stack variant is weakened** —
+   a mismatch would have failed loudly with EINVAL, and it does not.
+3. `cwsr_size = 19185664` is **not a clean multiple** of the per-CU VGPR value:
+   `19185664 / 393216 = 48.79…`. So the node's cwsr_size is not simply
+   `vgpr_per_cu × n_cu`, and the arithmetic behind it is not reconstructible from these two
+   numbers alone. That is a gap in my understanding, not evidence of a bug.
+
+What H4 would still need to survive: a **comparison part**. If a standard-GFX11 GPU (1.0×
+VGPR) reports the same `ctl_stack_size` *and* a `cwsr_size` whose ratio to its VGPR size
+matches gfx1151's, the firmware is layout-aware and H4 is dead. Without a second part on this
+box, H4 stays untested — and it is now the *weakest* of the four hypotheses, because the one
+number it predicts should be wrong (the control-stack size) is coherent.
+
+**Net effect on the hypothesis set:** H4 down-weighted. H1 (fresh-boot confound) remains the
+gate that must be passed before any of H2/H4 can be assessed, and it is still unrun because it
+requires a reboot.

@@ -76,14 +76,34 @@ UNREACHABLE=$(( PAIRS * 2 + 1 ))
 if [ -n "${NOLOCK:-}" ]; then
   echo "inheriting the caller's box lock (NOLOCK=1)"
 else
+  # Take BOTH lock conventions, because this box has two and they do not overlap:
+  #   ~/npu.lock                        - the box-wide convention. Observed holding 12 pids
+  #                                       from three unrelated workers (one peer batch and
+  #                                       two NPU-goal workers), so this is the one that
+  #                                       actually serialises GPU use.
+  #   ~/.cache/lax-decode/box.lock      - narrower, used only by the older 315 harnesses.
+  #                                       Held by nobody but us, so on its own it excludes
+  #                                       nothing (measured 2026-10-12).
+  # Taking only box.lock was the bug: the run looked lock-protected while a peer ran HRX0.
   LOCK=$HOME/.cache/lax-decode/box.lock
   mkdir -p "$(dirname "$LOCK")"
   exec 9>"$LOCK"
   if flock -w "${LOCK_WAIT:-900}" 9; then
-    echo "box lock held $(date -Is)"
+    echo "box lock held $(date -Is)  ($LOCK)"
   else
     echo "ABORT: box lock unobtainable after ${LOCK_WAIT:-900}s - a peer is running arms."
     echo "Nothing was started. Retry when the box is quiet."
+    exit 3
+  fi
+  NPULOCK=$HOME/npu.lock
+  exec 8>"$NPULOCK"
+  if flock -w "${NPU_LOCK_WAIT:-900}" 8; then
+    echo "npu lock held $(date -Is)  ($NPULOCK) - the box-wide convention"
+  else
+    echo "ABORT: ~/npu.lock unobtainable after ${NPU_LOCK_WAIT:-900}s."
+    echo "That lock is held by other workers on this box, and the campaign composes ~5"
+    echo "neighbours in the 95-110 GiB band, which would evict their memory."
+    echo "Nothing was started."
     exit 3
   fi
 fi

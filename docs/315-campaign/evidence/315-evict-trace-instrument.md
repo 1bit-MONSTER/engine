@@ -139,3 +139,35 @@ as the bound. On timeout it aborts and starts nothing, rather than racing.
 survived), because the wrapper was parked in the quiet-poll's `sleep` with a trap installed.
 The watcher stopped but the wrapper did not. `kill -KILL <pid>` was needed. Worth knowing:
 a half-stopped wrapper can leave a watcher running or a lock held.
+
+### 6g. There are TWO lock conventions on this box, and the campaign was holding the wrong one
+
+The most consequential finding of this task's harness work. Measured 2026-10-12 13:18:
+
+| lock file | holders at the time | who |
+|---|---|---|
+| `~/npu.lock` | **12 pids** | the box-wide convention — a peer batch (`flock ~/npu.lock ./batch2.sh`) **plus two unrelated NPU-goal workers** (`npu-forge2-kvsplit` bisect, `probe_model.sh`) |
+| `~/.cache/lax-decode/box.lock` | 2 pids | **ours only** — the narrow convention the older 315 harnesses use |
+
+So `box.lock` was free while `npu.lock` was held by three workers, and my wrapper
+"successfully" took `box.lock` — logging `box lock held` — while a peer ran `-dev HRX0`.
+**The lock line in the log looked like protection and provided none.** The only thing
+actually protecting the box was the separate GPU-quiet poll added in §6e.
+
+The fix: take **both**, `box.lock` first (harmless, cheap, matches the 315 harnesses) then
+`~/npu.lock`, which is the one that serialises real GPU use. The log now distinguishes them:
+
+```
+box lock held <ts>  (/home/bcloud/.cache/lax-decode/box.lock)
+npu lock held <ts>  (/home/bcloud/npu.lock) - the box-wide convention
+```
+
+Peer's usage, for the record (`~/wt/loom-ub389/runs/bench.sh:7`):
+
+```sh
+flock ~/npu.lock systemd-run --user --scope ... llama-bench ... -dev HRX0 ...
+```
+
+**Generalisation worth keeping:** on this box, `npu.lock` is the real mutex. Any harness
+that only takes `box.lock` is unprotected against peers and against other goals' workers,
+and it will report a held lock while the box is busy.

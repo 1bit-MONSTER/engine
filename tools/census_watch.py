@@ -40,7 +40,9 @@ runtime library that is not Transformers, so Transformers itself has no implemen
 it either) and that fewer than REMOTE_CODE_SPREAD uploaders publish is reported but does
 not alert: research one-offs like that arrive every day and are not something a backend
 could map. Once REMOTE_CODE_SPREAD uploaders use it, or it is a reviewed class
-(registry/significant.json), it alerts like any other.
+(registry/significant.json), it alerts like any other. The exception is a reviewed class
+whose entry says `"watch": "report"`: a research architecture reviewed as not an alias that
+nothing upstream implements, so a new upload of it needs no action. It is reported, not alerted.
   *  runtime failure (no network, unreadable registry, ...)
 
 State (the model ids already classified) lives outside the checkout, at
@@ -177,7 +179,9 @@ def classify(models, archs, sig, previously_seen=()):
             native.add(arch)
     out["classes"] = classes
     out["reasons"] = reasons
-    out["significant"] = sorted(c for c in classes if c in sig)
+    # reviewed classes marked report-only (`"watch": "report"`): reported, no alert
+    out["reviewed_report"] = sorted(c for c in classes if c in sig and sig[c].get("watch") == "report")
+    out["significant"] = sorted(c for c in classes if c in sig and c not in out["reviewed_report"])
     # custom-code classes from fewer than REMOTE_CODE_SPREAD uploaders: reported, no alert
     out["remote_code"] = sorted(
         c for c, ids in classes.items()
@@ -254,9 +258,14 @@ def report(models, res, previously_seen):
     if not models:
         print(f"census-watch: nothing new since the last run "
               f"({len(previously_seen)} models already classified)")
-    quiet = set(res.get("remote_code", ()))
+    reviewed_report = set(res.get("reviewed_report", ()))
+    quiet = set(res.get("remote_code", ())) | reviewed_report
     for cls, ids in sorted(res["classes"].items(), key=lambda kv: (-len(kv[1]), kv[0])):
-        if cls in quiet:
+        if cls in reviewed_report:
+            print(f"  . REVIEWED {cls}: {len(ids)} model(s), e.g. {ids[0]}")
+            print(f"     -> reviewed, not an alias, report only (registry/significant.json, "
+                  f"docs/arch-gaps.md)")
+        elif cls in quiet:
             owners = len({i.split("/")[0] for i in ids})
             print(f"  . REMOTE-CODE {cls}: {len(ids)} model(s) from {owners} uploader(s), e.g. {ids[0]}")
             print(f"     -> custom modeling code (auto_map, or a non-Transformers runtime); "

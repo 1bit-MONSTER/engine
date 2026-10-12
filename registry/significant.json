@@ -60,6 +60,11 @@
   "KairoForCausalLM": {
    "model_type": "kairo",
    "family": "Kairo (crypto-model research)"
+  },
+  "GrugMoeForCausalLM": {
+   "model_type": "grug_moe",
+   "family": "Grug MoE (marin-community research MoE)",
+   "watch": "report"
   }
  }
 }

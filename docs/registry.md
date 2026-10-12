@@ -127,7 +127,9 @@ not Transformers, so Transformers has no implementation of it either) and that f
 uploaders publish. Research one-offs like that arrive every day (`Ihatetomatoes/nanoBeard-sloop-14M`
 is a raw `pytorch` nanoGPT checkpoint whose config says `architectures: ["GPT"]` and
 `model_type: nanobeard-gpt`, engine#296). It alerts once 3 uploaders use it, and a reviewed
-class (`registry/significant.json`) always alerts.
+class (`registry/significant.json`) always alerts, unless its entry says `"watch": "report"`:
+a research architecture reviewed as not an alias that nothing upstream implements
+(`GrugMoeForCausalLM`, engine#381). The watcher lists those as `. REVIEWED` without the alert.
 
 The watch runs daily at 04:30 UTC (ahead of the 05:17 sweep) in two places:
 - GitHub Actions (`.github/workflows/census-watch.yml`, [RFC #246](https://github.com/1bit-MONSTER/engine/discussions/246)), which files one deduped

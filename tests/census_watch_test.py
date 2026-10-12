@@ -266,6 +266,25 @@ check("reviewed non-alias classes are documented",
       all(cls in gap_docs for cls in reviewed_gaps)
       and "not an alias" in gap_docs)
 
+# 14. A reviewed class marked `"watch": "report"` is listed but does not alert (engine#381).
+check("GrugMoeForCausalLM is reviewed as report-only",
+      sig.get("GrugMoeForCausalLM", {}).get("watch") == "report"
+      and sig["GrugMoeForCausalLM"].get("model_type") == "grug_moe"
+      and "GrugMoeForCausalLM" not in archs and "GrugMoeForCausalLM" in gap_docs)
+grug = model("open-athena/Grug-67B-A2B-Merge", "GrugMoeForCausalLM")
+rc, res = rc_of([grug], archs, sig)
+check("report-only reviewed class -> exit 0",
+      rc == 0 and res["reviewed_report"] == ["GrugMoeForCausalLM"] and res["significant"] == []
+      and res[cw.UNCOVERED] == ["open-athena/Grug-67B-A2B-Merge"])
+_, out = text_of([grug], archs, sig)
+check("report-only reviewed class is printed as REVIEWED, not UNCOVERED",
+      ". REVIEWED GrugMoeForCausalLM" in out and "UNCOVERED" not in out)
+rc, _ = rc_of([grug, model("x/new", "BrandNewForCausalLM")], archs, sig)
+check("a new class next to a report-only one still alerts", rc == 1)
+sig_alert = dict(sig, GrugMoeForCausalLM={k: v for k, v in sig["GrugMoeForCausalLM"].items() if k != "watch"})
+rc, res = rc_of([grug], archs, sig_alert)
+check("without the watch field the reviewed class alerts", rc == 1 and res["significant"] == ["GrugMoeForCausalLM"])
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

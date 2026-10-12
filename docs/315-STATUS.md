@@ -294,3 +294,60 @@ before anything else.
 3. `tools/315-evict-per-arm.py` — the H2 comparison, now possible because the PIDs are captured;
 4. a fresh-boot `cwsr=1` control if the rate holds, since H1's falsification was inferred from
    `boot_ns` rather than from a purpose-built control.
+
+---
+
+# UPDATE 5 — side quests while the campaign runs (all committed and pushed)
+
+Run while waiting on `315cwsr70`, per "unblock by doing side quests". Five of the six are
+correctness fixes to the **analysis and control** tooling, i.e. to the parts that decide whether the
+campaign's result is believed — not to the frozen experiment itself.
+
+**1. The console line cannot certify zero faults on its own — fixed.** (commit `43caadc`) Criterion 3
+requires zero faults on **both faces**, but the driver's per-arm console line has no `http=` field,
+and `detector.json` carries `http_failures` and `transport_failures` that the console cannot see. A
+Face-B fault surfacing as HTTP 500 would therefore leave **no trace in the console** and a
+console-only count would report that arm **clean** — a false negative on the one criterion the
+campaign exists to certify. `315-rate.py` now reads every arm's `detector.json` and treats the
+**detector as authoritative**: an arm the console passes but the detector fails is counted a **fault**
+(`MISSED BY CONSOLE`), and an arm with no usable detector is **UNVERIFIED**, never silently clean.
+Proven on a fixture where it changes the answer (`0/3 = 0%` without it → `1/2 = 50%` with it, the
+difference being a real HTTP-500 fault). Re-checked on run 7: still 3/11, no missed arms, so it is a
+guard and not a revision.
+
+**2. The endgame runbook.** (`f3ac0a5`) `docs/315-ENDOGAME.md` — exact commands, the decision table
+for the control, and the standing constraints plus seven traps already paid for. Written because the
+session that started the campaign will not outlast it.
+
+**3. The H1 control was hardened and dry-run safe.** (`ad0a494`) Sized 48 → 20 pairs (at ~26%, 20
+gives ~5.2 expected faults and `P(0)=0.002`; 48 would cost ~3 h for no added power). It now
+**verifies** the PID-capturing driver actually landed instead of trusting the copy — a run without the
+capture silently produces H2-unusable data, and that is invisible until the analysis, after the GPU
+hours are spent. Dry-run with `sudo`/`pgrep` neutered: drop-in PRESENT, `cwsr_enable` 0, campaign
+alive, uptime unchanged. Its abort guards fire before any `sudo`.
+
+**4. Pace measured, budget verdict: both stages fit.** (`80032c8`) From arm `server.pid` mtimes:
+intervals **4:25, 4:26, 4:26, 4:27, 4:25** — a 2-second spread, so **4.43 min/arm** is not an estimate.
+93 arms ≈ 6.87 h, finishing ~23:45. With ~2 h used before and ~2.2 h for the 20-pair control, the
+total is **~11.1 h of the 12 h ceiling**. The decisive control does fit; margin is ~0.9 h.
+
+**5. The H2 test was confounded — now it is a causal test.** (`76b7bdb`) I checked my own test and
+found it could not distinguish *more evictions caused the fault* from *the fault caused more
+evictions*: a faulting arm crashes, may be retried, and outlives its arm, so its window can simply be
+longer. But **the fault is timestamped** (`0.07.279.709 E ... HRX returned NaN logits`, in
+minutes.seconds.milliseconds.microseconds — confirmed against that arm's `req=1`, not assumed). So
+the tool now also counts evictions **up to the fault instant**, which the fault cannot have caused.
+Both faces are matched (Face B via `unparsed Content-only`), validated as 3/3 faults timed and **0 of
+8 clean arms falsely flagged** — a parser that found faults in clean arms would fabricate the effect.
+
+**6. Two of run 7's three faults were Face A *followed by a full server crash*** — the same commit.
+p7c and p7l logged the NaN line and died (logs end in a gdb backtrace), which is why their detectors
+recorded `RemoteDisconnected`: **the transport failure is downstream of the NaN, not a separate mode.**
+The console's `FaceA` label is right. Run 7's faults are two NaN crashes (at 7.3 s and 57.8 s into
+their arms) and one Face-B parse failure (81.2 s, `req=20`).
+
+## Where that leaves the criteria
+
+Unchanged: **1 open** (control), **2 open** (no repair landed), **3 in progress**, **4/5 not started**.
+But criterion 3 is now much harder to pass *falsely* — the detector reconciliation and the fix-cell
+count both stand between a clean-looking console and a claimed pass. That is the point.

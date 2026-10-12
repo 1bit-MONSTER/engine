@@ -257,3 +257,22 @@ manufactured a passing campaign.
 
 Re-checked against run 7 (which really faulted): still `3/11 = 27.27%`, 11 detectors read, no missed
 arms. So the change is a guard, not a revision of the known result.
+
+### §6i, live: the running campaign's clean arms are certified, not merely console-clean
+
+First read of the campaign of record through the reconciled tool (5 arms scored, the 6th in flight):
+
+```
+  in-regime  5   clean  5   FAULT  0   INVALID  0
+  detector.json read   6 arm(s)
+  (no MISSED BY CONSOLE line, no UNVERIFIED line)
+```
+
+The absence of those two lines is the point: each of the 5 clean arms has a `detector.json` that the
+tool read and that reports no `http_failures` and no `transport_failures`. So they are clean **by the
+detector**, not clean because the console could not see a failure. Had any of them failed via HTTP
+500, the tool would have named it as a MISSED fault and the rate would have stopped being 0.
+
+Rates as expected for this point in the run: `0/5 = 0.00%`, exact one-sided 95% upper bound 45.07% —
+correctly reported as **BELOW the 60-arm bar**, so these 5 arms certify nothing yet. That is the
+tool refusing to overclaim, and it will keep refusing until the count reaches 60.

@@ -384,3 +384,45 @@ Incidental QA: run 7 had a server living **1,975 s** (the p3l fault arm, which o
 which I killed by hand); the campaign's longest-lived server is **267 s**, i.e. its arm servers are
 being cleaned up properly. That is the harness discipline the PID-capture work was part of, and it
 is why run 7's per-arm eviction counts were unusable (see `315-pid-capture.md`).
+
+## Criterion 2 revisited: H2 suggests an ENGINE-side remedy after all
+
+Earlier I recorded that criterion 2 (a forward-only fix in `1bit-MONSTER/engine`) had "nothing to
+repair", because the documented CWSR *size* defect is proved fixed here and H2's cause would live
+in the driver. That was too quick. If H2 is the mechanism, it points at an engine-side change that
+is a **repair, not a guard**:
+
+> **Do not let the GPU compute on buffers that the driver is free to evict.**
+
+H2's premise is that a wave preempted mid-execution finds its buffers evicted or migrated
+underneath it. That can only happen to memory the driver *may* move — i.e. the evictable classes:
+GTT/TTM allocations and, above all, **userptr/SVM** buffers, which the #315 investigation already
+showed are evicted in the 95–110 GiB band (`315-TOOLS.md`: ~18 queue evictions in 20 s at
+`GTT >= 95 GiB`).
+
+So the engine-side remedy is a **buffer-residency change**, not a configuration guard:
+
+- stop placing the buffers the GPU reads during compute (weights, KV, activations) in
+  evictable/userptr memory;
+- move them to a class the driver will not reclaim under pressure (a VRAM carve-out or a
+  driver-owned allocation, rather than GTT-backed userptr);
+- optionally, keep a residency ledger and refuse to start work whose working set cannot be made
+  resident.
+
+**This is an engine change, forward-only, and it is the same conclusion Engine V2's D5 already
+reached independently** — "weights/KV in DRIVER-OWNED memory (no userptr/SVM/SVA) to kill the #315
+eviction class by construction", with the P1 soak as its gate. Two separate lines of reasoning
+arriving at the same fix is a good sign for both.
+
+What it still needs before it can be landed as *this* issue's fix:
+
+1. the mechanism confirmed by n (≥60 clean arms at `cwsr=0`) — H2 is currently the only surviving
+   candidate but is not yet measured directly;
+2. a demonstration that buffer residency, not merely CWSR-off, removes the fault — i.e. the
+   `Q_EVICT` events for the engine's own buffers go to zero;
+3. the byte-identical-output and no-regression gates the objective already requires.
+
+**So criterion 2 is not hopeless after all** — I was wrong to close it earlier. The correct
+statement is that the fix is now *identifiable* (residency) but not yet *earned* (it needs the
+mechanism confirmed and the residency change shown to remove the evictions of the engine's own
+buffers).

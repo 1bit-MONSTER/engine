@@ -196,3 +196,51 @@ eviction comparison tool (`315-evict-per-arm.py`, the H2 test), PID-capture wiri
 control, the control's guard verified by dry-run, campaign QA (9/9 arms valid and in regime), and
 three failed attempts at a retroactive H1 test — each of which is recorded as a negative with its
 reason.
+
+---
+
+# UPDATE 3 — I under-sized the running campaign against the pre-registration's own target
+
+**This prevents a false claim, so it goes at the top of the record.**
+
+## The discrepancy
+
+| source | says |
+|---|---|
+| the objective (user-provided) | "≥60 arms, every arm inside the declared regime gate, zero faults across both faces" |
+| `docs/315-preregistration.md` §6 | "Target: **≥60 in-regime clean arms in the fix cell**, with paired control arms running in the same session… Hard cap: **80 scheduled pairs** (160 arms)" |
+| `docs/315-preregistration.md` §7 | "The campaign passes only if, **in the fix cell**, ≥60 in-regime arms are clean…" |
+
+The pre-registration counts **fix-cell arms**, not total arms. And the driver emits exactly **one
+fix-cell (`l`) arm per pair** — measured, not assumed: the 8-pair run produced 8 `l` arms and 3
+`c` arms (11 total).
+
+So the running campaign, launched with **48 pairs**, will produce **~48 fix-cell arms** — **twelve
+short of the pre-registered target**, even though its *total* arm count (~64) would satisfy the
+objective's looser wording.
+
+## What this means
+
+1. **The running campaign cannot, by itself, satisfy §7.** It can establish the rate (and 9 clean
+   arms so far is consistent with zero), but it must not be reported as meeting the ≥60 fix-cell
+   bar.
+2. **A follow-on is required.** Either:
+   - a further campaign of **≥60 pairs** (the fix-cell count is what must reach 60), i.e. **~13
+     additional pairs** beyond the 48 already scheduled would *not* suffice unless pooled; the
+     clean route is a fresh run at ≥60 pairs (~6.5 h); or
+   - pooling the `cwsr=0` arms across runs (`315cwsr0` gave 11, the campaign ~48, total ~59) —
+     but pooling is **not provided for** in the pre-registration, which says "no arm pruning, no
+     criterion changes" (§8) and frames the target as a single campaign with its paired controls.
+     Pooling would need to be declared and justified, not assumed.
+3. **The honest reading is that §7 needs a fresh ≥60-pair run**, and the current campaign is a
+   useful but insufficient down-payment on it.
+
+## How the mistake happened, stated plainly
+
+I read the objective's "≥60 arms" and sized the run for ~64 **total** arms, never checking the
+pre-registration's own definition of the target, which counts only the fix cell. I had read §6
+earlier in the session (I quoted the "≥60 in-regime arms" bar in the task-8 work) and still sized
+by total arms. The check takes one `grep` and I did not run it until now.
+
+Recorded so the next run is sized from §6 — **60 fix-cell arms means ≥60 pairs** — rather than from
+the objective's looser phrasing.

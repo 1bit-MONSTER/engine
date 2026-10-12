@@ -35,17 +35,21 @@ pids=()
 cleanup() {
     for p in "${pids[@]}"; do pkill -9 -P "$p" 2>/dev/null; kill -9 "$p" 2>/dev/null; done
     wait 2>/dev/null
+    statefile | xargs -r rm -f
     rm -rf "$scratch"
 }
 trap cleanup EXIT
 fail=0
 check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 newport() { python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])'; }
-export FAKE_BACKEND_EVENTS="$scratch/events" ONEBIT_STATE_DIR="$scratch/state"
+export FAKE_BACKEND_EVENTS="$scratch/events"
+# a model id of its own: the start counts live in ~/.local/state/1bit/serve/, removed at exit
+alias=metrics-test-$$-$RANDOM
+statefile() { grep -l "\"model\":\"$alias\"" "$(getent passwd "$(id -u)" | cut -d: -f6)"/.local/state/1bit/serve/*.json 2>/dev/null; }
 
 start() {  # <log> [serve args]
     port=$(newport)
-    "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias m1 \
+    "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias "$alias" \
         --llama-server "$here/fake_backend.py" "${@:2}" >"$1" 2>&1 &
     pid=$!
     pids+=("$pid")

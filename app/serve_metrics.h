@@ -27,6 +27,10 @@
 #include <array>
 #include <cctype>
 #include <chrono>
+#ifndef _WIN32
+#include <pwd.h>
+#include <unistd.h>
+#endif
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
@@ -86,21 +90,26 @@ struct BackendLogFacts {
 
 // Counts that outlive one serve process: Lemonade restarts a backend by starting `1bit serve`
 // again, so starts, watchdog kills and backend exits are kept per model id in
-// $XDG_STATE_HOME/1bit/serve/<id>.json (~/.local/state/...). Unwritable: counted in memory only.
+// ~/.local/state/1bit/serve/<hash of the id>.json (the file names the model inside). Unwritable:
+// counted in memory only.
 class Lifecycle {
 public:
     uint64_t starts = 0, watchdog_kills = 0, backend_exits = 0;
 
     explicit Lifecycle(const std::string& model_id) {
-        std::string base;
-        if (const char* e = std::getenv("ONEBIT_STATE_DIR"); e && *e) base = e;
-        else if (const char* x = std::getenv("XDG_STATE_HOME"); x && *x) base = std::string(x) + "/1bit";
-        else if (const char* h = std::getenv("HOME"); h && *h) base = std::string(h) + "/.local/state/1bit";
-        if (base.empty()) return;
-        std::string name;
-        for (char c : model_id) name += (std::isalnum(static_cast<unsigned char>(c)) || c == '.' || c == '-' || c == '_') ? c : '_';
-        if (name.empty() || name[0] == '.') name = "_" + name;
-        path_ = base + "/serve/" + name + ".json";
+        // The directory comes from the user database, not the environment, and the file name is a
+        // hash of the model id, so no outside string becomes a path (CodeQL cpp/path-injection).
+        std::string home;
+#ifndef _WIN32
+        if (const passwd* pw = ::getpwuid(::geteuid()); pw && pw->pw_dir && *pw->pw_dir) home = pw->pw_dir;
+#endif
+        if (home.empty()) return;
+        uint64_t h = 1469598103934665603ull;   // FNV-1a
+        for (unsigned char c : model_id) { h ^= c; h *= 1099511628211ull; }
+        char name[32];
+        std::snprintf(name, sizeof name, "%016llx.json", static_cast<unsigned long long>(h));
+        path_ = home + "/.local/state/1bit/serve/" + name;
+        id_ = model_id;
         std::ifstream in(path_);
         const auto j = nlohmann::json::parse(in, nullptr, false);
         if (j.is_object()) {
@@ -123,12 +132,12 @@ private:
         {
             std::ofstream out(tmp, std::ios::trunc);
             if (!out) return;
-            out << nlohmann::json{{"starts", starts}, {"watchdog_kills", watchdog_kills}, {"backend_exits", backend_exits}}.dump() << "\n";
+            out << nlohmann::json{{"model", id_}, {"starts", starts}, {"watchdog_kills", watchdog_kills}, {"backend_exits", backend_exits}}.dump() << "\n";
             if (!out) return;
         }
         std::filesystem::rename(tmp, path_, ec);
     }
-    std::string path_;
+    std::string path_, id_;
     std::mutex mu_;
 };
 

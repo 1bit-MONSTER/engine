@@ -146,8 +146,8 @@ reads line by line (Linux). A series whose line never came is left out, not repo
 
 Starts, watchdog kills and exits outlive one serve process, because Lemonade restarts a backend
 by starting `1bit serve` again. They are kept per model id in
-`$XDG_STATE_HOME/1bit/serve/<id>.json` (default `~/.local/state/1bit/serve/`; `$ONEBIT_STATE_DIR`
-replaces `…/1bit`).
+`~/.local/state/1bit/serve/<hash of the id>.json` (the file names the model inside; the home
+directory comes from the user database, not `$HOME`).
 
 **How Lemonade picks them up.** Lemonade appends a backend's `/metrics` to its own when the
 backend's recipe descriptor sets `exposes_prometheus_metrics`. Each line is renamed

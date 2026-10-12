@@ -412,3 +412,38 @@ cannot work. Waiting (which I have done for three turns) cannot work.
 I have not cleared it: `flock` offers no break mechanism from userspace, and the only ways
 that occur to me are destructive (reboot, or `fuser -k` on the lock, which would kill three
 innocent waiters' work). That is the user's call, not mine.
+
+## The wedge is cleared by a clean reboot, and the campaign is finally running
+
+**2026-10-12 14:03:53 — box rebooted** (user decision, option (b)). State after boot:
+
+| check | value |
+|---|---|
+| `~/npu.lock` | **FREE** (was wedged 36+ min) |
+| `~/.cache/lax-decode/box.lock` | FREE |
+| stale `/proc/locks` entries for it | **0** |
+| HRX0 | 0 processes |
+| GTT | 26.6 GiB (baseline) |
+| `Tctl` | 40.2 °C |
+| `MemAvailable` | 90 GiB |
+
+The dead holder `826940` is gone and the three waiters it had blocked are gone with it. Cost:
+the three queued workers' in-flight work (a #315 arm, `batch3.sh`, a `bisect4.sh` worker),
+accepted by the user.
+
+**Run 6 (`315evict6`) launched 14:05:45 with the full corrected guard sequence — and it is the
+first run to get through all four gates:**
+
+```
+box lock held 2026-10-12T14:05:45-03:00  (/home/bcloud/.cache/lax-decode/box.lock)
+npu lock held 2026-10-12T14:05:45-03:00  (/home/bcloud/npu.lock) - the box-wide convention
+GPU quiet: no foreign HRX job (waited as needed)
+watcher pid 11922 -> /home/bcloud/wt/315evict6-evict/kfd_smi.tsv
+```
+
+`315-campaign.sh` and `315-paired.sh` are composing (8 pairs = 16 arms). This is the first
+attempt in this task that reached composition rather than aborting at a gate, which is what
+the harness work was for.
+
+**Not yet evidence.** task-8 still needs an in-regime arm to *fault* while the watcher is
+attached, or the null recorded with its clean-arm count. Nothing here changes that.

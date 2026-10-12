@@ -84,3 +84,49 @@ the next campaign, whose arms can then carry both verdicts and eviction counts.
 Until it is applied, the honest statement stands: **the faulting arm was evicted heavily, the
 clean arms ran in the same regime and were presumably evicted too, and nothing yet separates
 them.** One faulting data point is not a comparison.
+
+## Attempted the faulting-vs-clean comparison on run 7's existing data — it does not work, and here is exactly why
+
+I tried to get the H2 discriminating test (do faulting arms show more evictions than clean arms?)
+out of data already on disk, without a reboot or a new run. It fails on two independent
+grounds, both now measured rather than assumed.
+
+### 1. An arm server's eviction count is contaminated by its post-arm lifetime
+
+`llama-server` PIDs and their `Q_EVICT` counts across run 7's complete SMI stream:
+
+```
+  1674  pid 38896     235  pid 179876     206  pid 141991      65  pid 88672
+  1594  pid 33195     217  pid 198847     191  pid 122598      15  pid 205541
+  1589  pid 35975     217  pid 160820     212  pid 41825      144  pid 65395
+  1461  pid 111371
+```
+
+`111371` is the **p3l faulting arm** — I bound it live via `arm-pid.py` from the port in its own
+`server.log`. Its count (1,461) is in the same band as the *long-lived neighbours*, not the
+other arm servers (15–599). The reason is in the record: when I went to correlate it I found that
+process **still running ~40 minutes after its arm had been scored**, and killed it by hand.
+
+So an arm server keeps being evicted after its measurement window closes, and its total is a
+function of how long it happened to survive — not of what happened during the arm.
+
+### 2. The five long-lived neighbours cannot be separated from the eleven arm servers
+
+Run 7's stream has **19** `llama-server` `PROC_START` events: five neighbours (which live for the
+whole session and legitimately accumulate the largest counts) plus eleven arm servers, plus
+three more whose role I cannot determine from the stream. Nothing in the SMI stream records which
+port or which arm a PID belongs to — that is the same limitation recorded at the top of this file.
+
+The two effects compound: the top four counts (1,589–1,674) are almost certainly neighbours, the
+faulting arm sits inside that band because it outlived its arm, and there is no clean way to
+assign a window to any of them after the fact.
+
+### Conclusion
+
+**The comparison requires the PID to be captured at arm start, while the arm is live.** That is
+what the one-line change at the top of this file does, and it is why the change exists rather than
+being an optimisation. Running the comparison against historical data is not merely inconvenient —
+it is invalid, and would have produced a confident wrong answer had I not checked which PIDs the
+counts belonged to.
+
+Recorded so the next attempt applies the capture *before* the campaign it wants to analyse.

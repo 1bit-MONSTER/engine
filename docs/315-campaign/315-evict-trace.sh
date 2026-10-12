@@ -153,7 +153,19 @@ echo "watcher pid $WPID -> $OUT/kfd_smi.tsv"
 cleanup() { sudo -n kill "$WPID" 2>/dev/null; }
 trap cleanup EXIT INT TERM
 
-MINCLEAN="$UNREACHABLE" NOSTOP=1 \
+# NOLOCK=1 is REQUIRED, not optional. 315-paired.sh:47-52 re-opens
+# ~/.cache/lax-decode/box.lock on its OWN fd 9 and flocks it, falling back to "proceeding
+# CONCURRENTLY (UNLOCKED)" on timeout. flock is per-open-file-description, so a SECOND open
+# of a file this process tree already holds a lock on will BLOCK.
+#
+# Observed: run 6 (315evict6) passed all four of this wrapper's gates, began composing, then
+# deadlocked here - the driver's child sat in locks_lock_inode_wait on box.lock while this
+# wrapper held box.lock on fd 9 and npu.lock on fd 8. After LOCK_WAIT it would have proceeded
+# UNLOCKED, so the failure is not even protective.
+#
+# The driver documents the convention in its own header: NOLOCK=1 means the caller already
+# holds the lock on an inherited fd 9 - exactly our case.
+MINCLEAN="$UNREACHABLE" NOSTOP=1 NOLOCK=1 \
   FIX="$FIX" CTRL="$CTRL" TAG="$TAG" PAIRS="$PAIRS" \
   bash "$HOME/wt/315-campaign.sh" 2>&1 | tail -20
 

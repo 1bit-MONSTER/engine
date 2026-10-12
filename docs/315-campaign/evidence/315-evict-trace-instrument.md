@@ -171,3 +171,41 @@ flock ~/npu.lock systemd-run --user --scope ... llama-bench ... -dev HRX0 ...
 **Generalisation worth keeping:** on this box, `npu.lock` is the real mutex. Any harness
 that only takes `box.lock` is unprotected against peers and against other goals' workers,
 and it will report a held lock while the box is busy.
+
+### 6h. Self-deadlock: the wrapper held the lock the driver re-opens (NOLOCK=1)
+
+The eighth and last harness defect, and the one that finally mattered. Run 6 (`315evict6`)
+passed all four of this wrapper's gates, started composing, and then **deadlocked against
+itself**:
+
+```
+bash 11865  /home/bcloud/wt/315-evict-trace.sh 8 315evict6
+  └─ bash 12119  315-campaign.sh
+      └─ bash 12143  315-paired.sh 8 2 2048 ...
+          └─ flock 15489  -w 900 9        <- blocked: locks_lock_inode_wait
+                                            /proc/15489/fd/9 -> box.lock
+```
+
+The wrapper held `box.lock` on **fd 9** and `npu.lock` on **fd 8**. `315-paired.sh:47-52` then
+**re-opens `box.lock` on its own fd 9** and flocks it:
+
+```sh
+if [ -z "${NOLOCK:-}" ]; then
+  exec 9>"$HOME/.cache/lax-decode/box.lock"
+  if flock -w "${LOCK_WAIT:-900}" 9; then
+```
+
+`flock` is per-open-file-description. A **second** open of a file this process tree already
+holds blocks — the lock is not re-entrant — and after `LOCK_WAIT` the driver gives up and
+"proceeds CONCURRENTLY (UNLOCKED)", so the wait is not even protective.
+
+The driver documents the convention in its own header: **`NOLOCK=1` means the caller already
+holds the lock on an inherited fd 9** — exactly our case. The wrapper now passes it.
+
+Verified on run 7 (`315evict7`): all four gates passed, driver in `do_wait` (not
+`locks_lock_inode_wait`), and the composition reached the regime — GTT 27 → 80 → 98 → 100 GiB
+with 4 HRX neighbours and 560+ evictions captured.
+
+**Pattern worth generalising:** when a wrapper takes a lock that its child also takes, the
+child needs to be told the lock is already held. Silently double-locking looks like progress
+up to the exact point where it stops.

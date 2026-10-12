@@ -1390,7 +1390,7 @@ int serve_child(const Options& given) {
             if (l->device.rfind("hrx", 0) == 0 || l->device.rfind("cpu", 0) == 0) admit::add_llama_server(need, l->argv);
         const admit::Verdict v = admit::judge(need, sysinfo::memory());
         if (!need.parts.empty() && v.checked) {
-            auto gib = [](uint64_t b) { char t[32]; std::snprintf(t, sizeof t, "%.1f", double(b) / double(admit::kGiB)); return std::string(t); };
+            auto gib = [](uint64_t b) { char t[32]; std::snprintf(t, sizeof t, "%.2f", double(b) / double(admit::kGiB)); return std::string(t); };
             std::string parts;
             for (const auto& p : need.parts) parts += (parts.empty() ? "" : "; ") + p;
             const std::string ctx = need.ctx_from_model ? "the model's own ctx " + std::to_string(need.n_ctx) + " (no --ctx-size)"
@@ -1402,8 +1402,14 @@ int serve_child(const Options& given) {
                 for (const auto& w : v.warnings) std::printf("%s: warning: %s\n", id.c_str(), w.c_str());
                 return v.fits ? 0 : 3;
             }
-            if (!v.fits)
-                throw std::runtime_error(id + " does not fit: " + line + "; free memory, lower --ctx-size, or pass --no-mem-check");
+            if (!v.fits) {
+                // exit 3, the same as --mem-check's "does not fit": Lemonade's loader logs the exit
+                // code and fails the load at once ("1bit serve failed to start"), with this line in
+                // its log
+                std::fprintf(stderr, "1bit serve: %s does not fit: %s; free memory, lower --ctx-size, or pass --no-mem-check\n",
+                             id.c_str(), line.c_str());
+                return 3;
+            }
             std::fprintf(stderr, "1bit serve: memory: %s\n", line.c_str());
             for (const auto& w : v.warnings) std::fprintf(stderr, "1bit serve: memory: warning: %s\n", w.c_str());
         } else if (o.mem_check_only) {

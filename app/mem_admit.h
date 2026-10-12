@@ -201,7 +201,25 @@ inline ModelNeed model_need(const std::string& path, long long n_ctx, int n_seq,
     const long long v_len = h.get("attention.value_length", k_len);
     const long long kv_lora = h.get("attention.kv_lora_rank", 0);
     const long long swa = h.get("attention.sliding_window", 0);
-    const long long tokens = swa > 0 ? std::min(n_ctx, swa + 512) : n_ctx;  // SWA layers keep a window
+    const long long swa_tokens = swa > 0 ? std::min(n_ctx, swa * n_seq + 512) : n_ctx;  // a window per sequence + a ubatch
+    // the share of layers that attend over the full context: llama.cpp sets the sliding-window
+    // pattern per architecture (one full layer in N); a pattern array in the file wins; an
+    // architecture not listed counts every layer as windowed (the estimate stays a lower bound)
+    double full_share = 1;
+    if (swa > 0) {
+        long long every = 0;
+        if (h.arch == "gpt-oss" || h.arch == "gemma2") every = 2;
+        else if (h.arch == "cohere2" || h.arch == "exaone4" || h.arch == "smallthinker" || h.arch == "llama4") every = 4;
+        else if (h.arch == "gemma3n") every = 5;
+        else if (h.arch == "gemma3") every = 6;
+        full_share = every > 0 ? 1.0 / double(every) : 0.0;
+        if (const auto* pat = h.array("attention.sliding_window_pattern"); pat && !pat->empty()) {
+            long long windowed = 0;
+            for (long long x : *pat) windowed += x != 0;
+            full_share = 1.0 - double(windowed) / double(pat->size());
+        }
+    }
+    const double tokens = full_share * double(n_ctx) + (1 - full_share) * double(swa_tokens);
 
     // heads with a KV cache, summed over the layers that have one
     long long head_layers = 0;
@@ -230,9 +248,9 @@ inline ModelNeed model_need(const std::string& path, long long n_ctx, int n_seq,
     if (kv_lora > 0) {
         // MLA caches the compressed latent and the rope part once per token, V is a view of it
         const long long rope = std::max(0LL, h.get("rope.dimension_count", 0));
-        m.kv = uint64_t(double(head_layers) * double(kv_lora + rope) * double(tokens) * k_bytes);
+        m.kv = uint64_t(double(head_layers) * double(kv_lora + rope) * tokens * k_bytes);
     } else {
-        m.kv = uint64_t(double(head_layers) * (double(k_len) * k_bytes + double(v_len) * v_bytes) * double(tokens));
+        m.kv = uint64_t(double(head_layers) * (double(k_len) * k_bytes + double(v_len) * v_bytes) * tokens);
     }
     return m;
 }
@@ -269,7 +287,7 @@ inline void add_llama_server(Need& need, const std::vector<std::string>& argv, u
     if (ctx <= 0 && !gpu) ctx = 4096;
     const ModelNeed m = model_need(model, ctx, n_seq, kb, vb);
     if (need.n_ctx == 0) { need.n_ctx = m.n_ctx; need.ctx_from_model = m.ctx_from_model && n_ctx <= 0; }
-    auto gib = [](uint64_t b) { char s[32]; std::snprintf(s, sizeof s, "%.1f", double(b) / double(kGiB)); return std::string(s); };
+    auto gib = [](uint64_t b) { char s[32]; std::snprintf(s, sizeof s, "%.2f", double(b) / double(kGiB)); return std::string(s); };
     const std::string name = std::filesystem::path(model).filename().string();
     need.parts.push_back(name + ": weights " + gib(m.weights) + " + KV/state " + gib(m.kv + m.state) + " + compute " + gib(compute));
     need.total += m.weights + m.kv + m.state + compute;

@@ -137,6 +137,14 @@ int main() {
     expect_mib("per-layer head_count_kv: only the layers with heads", admit::model_need(mixed, 1024, 1).kv,
                8.0 * 256 * 2 * 1024 / (1 << 20));  // 8 heads, 128 + 128, f16
 
+    // gpt-oss: sliding window 128 on every other layer (llama.cpp's pattern for the architecture)
+    const auto oss = Gguf().s("general.architecture", "gpt-oss").u32("gpt-oss.block_count", 24)
+        .u32("gpt-oss.embedding_length", 2880).u32("gpt-oss.attention.head_count", 64).u32("gpt-oss.attention.head_count_kv", 8)
+        .u32("gpt-oss.attention.key_length", 64).u32("gpt-oss.attention.value_length", 64)
+        .u32("gpt-oss.attention.sliding_window", 128).write(d + "/oss.gguf");
+    expect_mib("gpt-oss: 12 full layers at 131072 + 12 windowed at 128 + 512", admit::model_need(oss, 131072, 1).kv,
+               (12.0 * 131072 + 12.0 * 640) * 8 * 128 * 2 / (1 << 20));
+
     // a split model counts every shard
     Gguf().s("general.architecture", "qwen3").write(d + "/big-00001-of-00002.gguf", 3ull << 30);
     Gguf().write(d + "/big-00002-of-00002.gguf", 2ull << 30);

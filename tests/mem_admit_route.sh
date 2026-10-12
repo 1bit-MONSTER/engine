@@ -63,8 +63,8 @@ t0=$(date +%s%N)
     --llama-server "$here/fake_backend.py" >"$scratch/huge.log" 2>&1
 rc=$?
 ms=$((($(date +%s%N) - t0) / 1000000))
-check "a 4 TiB model is refused (rc $rc) in under 2 s (${ms} ms)" '[ "$rc" = 1 ] && [ "$ms" -lt 2000 ]'
-check "  in one line with the numbers" '[ "$(wc -l < "$scratch/huge.log")" = 1 ] && grep -q "huge does not fit: need 4096.7 GiB (huge.gguf: weights 4096.0 + KV/state 0.2 + compute 0.5) at ctx 4096, free .* GiB (MemAvailable" "$scratch/huge.log"'
+check "a 4 TiB model is refused (rc $rc) in under 2 s (${ms} ms)" '[ "$rc" = 3 ] && [ "$ms" -lt 2000 ]'
+check "  in one line with the numbers" '[ "$(wc -l < "$scratch/huge.log")" = 1 ] && grep -q "huge does not fit: need 4096.72 GiB (huge.gguf: weights 4096.00 + KV/state 0.22 + compute 0.50) at ctx 4096, free .* GiB (MemAvailable" "$scratch/huge.log"'
 check "  before any backend started" '[ ! -e "$scratch/events" ] && ! grep -q "on cpu" "$scratch/huge.log"'
 
 for how in flag env; do
@@ -90,11 +90,11 @@ pid=$!; pids+=("$pid")
 code=000
 for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port/health"); [ "$code" = 200 ] && break; sleep 0.1; done
 check "a small model starts ($code)" '[ "$code" = 200 ]'
-check "  and serve logs its estimate" 'grep -q "1bit serve: memory: need 0.7 GiB (small.gguf: weights 0.0 + KV/state 0.2 + compute 0.5) at ctx 4096, free" "$scratch/small.log"'
+check "  and serve logs its estimate" 'grep -q "1bit serve: memory: need 0.72 GiB (small.gguf: weights 0.00 + KV/state 0.22 + compute 0.50) at ctx 4096, free" "$scratch/small.log"'
 kill "$pid"; wait "$pid" 2>/dev/null
 
 out=$("$bin" serve -m "$scratch/small.gguf" --device cpu -c 4096 --mem-check); rc=$?
-check "--mem-check on a small model: fits, rc 0" '[ "$rc" = 0 ] && [[ "$out" == "small: fits: need 0.7 GiB"* ]]'
+check "--mem-check on a small model: fits, rc 0" '[ "$rc" = 0 ] && [[ "$out" == "small: fits: need 0.72 GiB"* ]]'
 out=$("$bin" serve -m "$scratch/huge.gguf" --device cpu -c 4096 --mem-check); rc=$?
 check "--mem-check on a huge one: does not fit, rc 3" '[ "$rc" = 3 ] && [[ "$out" == "huge: does not fit: need"* ]]'
 

@@ -81,7 +81,8 @@ The estimate (`app/mem_admit.h`) reads only the GGUF header, the way `tools/mem-
   bytes (`-ctk` / `-ctv`, f16 by default). MLA models (`kv_lora_rank`) cache the latent and the
   rope dimensions once. Qwen3.5 / 3.8 / Next attend in one layer of `full_attention_interval`.
   Per-layer `head_count_kv` arrays count only the layers with heads. Sliding-window layers count
-  the window.
+  the window per sequence plus a ubatch, with llama.cpp's per-architecture pattern for which
+  layers are windowed (gpt-oss and Gemma 2: every other layer; Gemma 3: 5 of 6).
 - **state:** the gated delta-net recurrent state, per sequence;
 - **compute:** 512 MiB (HRX measured 20-505 MiB);
 - **extras:** a draft or MTP head (`-md`, with its KV), `--mmproj`.
@@ -98,6 +99,7 @@ more than that. Two things grow after load, so they only warn:
 
 - `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) skips the check.
 - `--mem-check` prints the estimate and exits: 0 when it fits, 3 when it does not.
+- A refused load exits with status 3 too.
 
 ctest `mem_admit` checks the KV and state sizes against HRX0 server logs:
 

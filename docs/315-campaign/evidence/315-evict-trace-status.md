@@ -475,3 +475,62 @@ produced. A clean run here is task-8 evidence, not the objective's fix+≥60-arm
 
 **If all 16 arms are clean**, the contract requires recording this trace as
 **UNINFORMATIVE with its clean-arm count** — never as evidence about the mechanism.
+
+## RUN 7 RESULT: an in-regime FAULT on Face B, correlated against its own evictions
+
+**This satisfies the first branch of the task-8 contract.**
+
+```
+pair 3 arm l: FAULT nan=0 req=20 parse=0 gtt_start=97G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=102G)
+```
+
+| quantity | value |
+|---|---|
+| arm | `pair 3 arm l` (the **fix** cell — diagnostics + HOST_COHERENT) |
+| regime | **`gtt_start=97 GiB`** — inside the frozen `>= 95 GiB` gate |
+| face | **B** — `http_failures: 1`, `first_failure: "HTTP 500"`, `truncated: true`, `nan=0` |
+| requests | 20 served, 19 ok, then the 500 stopped the arm |
+| detector.json | `{"requests":20,"ok":19,"utf8_failures":0,"parse_failures":0,"http_failures":1,"transport_failures":0,"truncated":true,"first_failure":"HTTP 500"}` |
+
+### The failure, verbatim from the arm's server.log
+
+```
+1.21.180.831 W common_chat_peg_parse: unparsed Content-only output:  laptop too
+1.21.185.082 W srv operator(): got exception: {"error":{"code":500,"message":"The model produced
+              output that does not match the expected Conten... (truncated)
+```
+
+That is Face B exactly as the issue describes it: output that is **not valid UTF-8 / not
+parseable**, surfacing as an HTTP 500 — not a NaN. `nan=0` confirms it is Face B and not
+Face A.
+
+### The correlation (task-8's actual deliverable)
+
+Bound to the arm's own PID **exactly** (`tools/arm-pid.py` → `111371`, from the port in the
+arm's own `server.log`; not guessed). Against the eviction stream, for that PID alone:
+
+| event | count |
+|---|---|
+| `Q_EVICT` | **323** |
+| `Q_RESTORE` | **357** |
+| timeline rows | 681 → `~/wt/315evict7-evict/correlated-p3l.tsv` |
+| trigger | `USERPTR` throughout |
+
+So the faulting arm can be placed against **its own driver evictions**, which is the thing the
+#123/#140 lead predicted would be necessary and which no earlier run could obtain (runs 3–6
+never reached an arm; run 1's one in-regime arm was clean).
+
+### What this does and does not establish — stated before the run finishes
+
+**Does:** an in-regime arm faulted on Face B while its own PID was being evicted hundreds of
+times, with both recorded on one clock. The correlation exists and is reproducible from the
+paths above. That is what task-8 asked for.
+
+**Does NOT:** show that the evictions *caused* the fault. A clean arm in this same run
+(`p1c`, `p1l`, `p2l`, all `gtt_start=97G`, all `OK`) was also being evicted — the eviction
+counts are not yet compared between faulting and clean arms, and the fault is intermittent
+by construction. **Eviction is necessary-looking, not sufficient**, exactly as run 1 already
+suggested with 15,357 evictions and zero faults.
+
+**Must not be written up as:** "the evictions caused it", or as a mechanism. The mechanism is
+still unnamed; this is the correlation evidence, which is the input to naming one.

@@ -20,7 +20,13 @@ set -uo pipefail
 
 DROPIN=/etc/default/grub.d/amd_cwsr.cfg
 TAG=${TAG:-315ctl1}
-PAIRS=${PAIRS:-48}
+# 20 pairs, not 48. This control answers two questions and both are satisfied by 20:
+#   H1 (boot confound): at the ~26% baseline, 20 arms give ~5.2 expected faults and
+#     P(0 faults) = 0.74^20 = 0.002 - so a clean control is real evidence, and a rate near 26%
+#     kills H1. 60 pairs would cost ~3 extra hours for no extra power on this question.
+#   H2 (eviction comparison): needs only a few faulting arms to compare against clean ones.
+# The box-time budget is the binding constraint, so the control is sized to its question.
+PAIRS=${PAIRS:-20}
 
 # Install the PID-capturing driver BEFORE the run, so this control's per-arm data supports the
 # H2 test (faulting-vs-clean eviction counts). Without it, a finished arm cannot be bound to its

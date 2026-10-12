@@ -76,3 +76,40 @@ Both are destructive and affect work that is not mine. Left for the user.
 - `docs/315-campaign/evidence/315-evict-trace-instrument.md` §6g — why `npu.lock` is the real
   mutex (the older 315 harnesses take `box.lock`, which excludes nobody)
 - `~/amd-oss/315-TOOLS.md` — the box-tooling inventory
+
+## Correction: the wedge does not make a run impossible — it makes it a policy choice
+
+After writing the above I checked whether a run is physically possible despite the wedge. It
+**is**, and the blocked note overstated this. Measured:
+
+| quantity | value |
+|---|---|
+| HRX0 occupancy | 0 processes, sampled over 60 s |
+| baseline GTT | 26.7 GiB; **only two foreign holders**, both **Vulkan** (24.5 GiB at pid 846805, 3.4 GiB at 1618706) — not HRX |
+| `MemAvailable` | 82 GiB |
+| `Tctl` | 53–54 °C (well under the 72 °C gate) |
+
+And critically, the stalled waiters hold **0 bytes of GTT**:
+
+```
+pid 867745   GTT=0B   flock 7
+pid 99830    GTT=0B   flock ~/npu.lock ./batch3.sh
+pid 1155054  GTT=0B   flock -w 7200 9
+pid 826914   GTT=0B   probe_model.sh ...
+pid 1155052  GTT=0B   bisect4.sh ...
+```
+
+So all six are parked on the lock with no GPU state at all. A campaign could reach the
+95–110 GiB regime without clobbering anyone's resident memory.
+
+**The only reason not to run is the decision itself.** Those three waiters are queued for
+HRX0 work; a composition that takes HRX0 to 98–104 GiB would evict work they are stalled
+waiting to do — using a kernel bug as an advantage over other goals. Two of them are the
+`dx long-context` goal's own probes. That is a call for the user, not for me.
+
+**Why this still blocks the goal as stated:** the campaign harness I built deliberately
+refuses to run when `~/npu.lock` is unobtainable (§6g), because that lock is how this box
+serialises GPU use. Overriding that guard would be me weakening my own safety check to get a
+result — which the goal's constraints explicitly forbid ("do not weaken the existing guards
+or instrumentation in a way that destroys failure evidence"). If the user wants the run, the
+honest form is to say so explicitly, or to clear the wedge first.

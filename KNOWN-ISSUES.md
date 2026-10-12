@@ -19,7 +19,10 @@ limitations under the License.
 
 ## engine#315 — intermittent all-NaN logits and format-500 on GLM-4.7-Flash under GTT pressure
 
-**Status: OPEN, accepted as a documented limitation.** The issue stays open until this criterion is met.
+**Status: OPEN. No limitation entry is recorded.** The earlier status line here read "accepted as a
+documented limitation"; that is superseded. This issue's own rule is that a documented limitation is
+acceptable only *after* the mechanism is named, and no mechanism is proven - so nothing is recorded and
+the issue stays open until the criterion below is met. See the correction at the end of this entry.
 
 Owner acceptance, recorded 2026-10-07: the owner authorised landing this entry in writing — *"you have gh
 authorization and do what needs to be done"* — on the basis that no forward fix is available. The limitation text

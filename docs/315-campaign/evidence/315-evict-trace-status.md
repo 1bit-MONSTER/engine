@@ -226,3 +226,47 @@ So the honest position on task-8 is:
 Per the task-8 contract, the null is recordable as **uninformative with its clean-arm
 count**, and the reason is box contention. That is a legitimate close, not a design choice —
 but it is a weaker close than a faulting arm would be, and it should be reported as such.
+
+## The lock holder is another #315 campaign, thermally stuck while holding the lock
+
+Diagnosed 2026-10-12 13:19–13:22. `~/npu.lock` was not held by a peer agent's batch alone —
+it was held by **another #315 campaign**, `~/wt/315fix-tools/camp5.sh` (started 13:03:31),
+running arms tagged `fx-c5-*` on the same control binary via an `LD_PRELOAD` shim
+(`cwsr_shim2.so`) with modes `lockall`, `pinall`, `pincwsrstaging`.
+
+**It has produced nothing in 16 minutes.** Its arm directory
+`~/wt/rt-det/fx-c5-lockall-r1` is entirely empty — no `run.log`, no `server.log`, no
+`detector.json` — and its only child is `flock 7` (holding `npu.lock`, 13+ minutes).
+
+**Why, exactly.** The arm script gates on temperature *before* it starts work
+(`/tmp/315arm-6xh7.sh:33`):
+
+```sh
+while [ "$(tctl)" -ge ${TSTART:-72} ]; do sleep 10; done
+exec 7>"$HOME/npu.lock"; flock 7
+```
+
+and it takes the lock on the next line. Measured `Tctl` over 60 s:
+
+| t | Tctl | edge |
+|---|---|---|
+| 10 s | 70.8 °C | 37.0 °C |
+| 20 s | 72.5 °C | 37.0 °C |
+| 30 s | 72.1 °C | 37.0 °C |
+| 40 s | 71.8 °C | 37.0 °C |
+| 50 s | 72.1 °C | 36.0 °C |
+| 60 s | 72.1 °C | 36.0 °C |
+
+`Tctl` oscillates **70.8–72.5 °C** around the 72 °C gate, so the wait never reliably
+completes. Note the two sensors disagree wildly: `edge` is 36–37 °C while `Tctl` sits at
+~72 °C. The gate is on the hot one, and the arm holds `npu.lock` for the entire wait.
+
+**Consequence for task-8:** run 5 is starved — it correctly took `box.lock`, then blocked on
+`~/npu.lock`, which the thermally-stuck arm holds. Waiting cannot fix this; the other
+campaign must clear or its lock must be released.
+
+**This is a design flaw in the other harness, not a bug in mine**, and it is worth flagging
+plainly: an arm that holds the box-wide lock **while waiting for a thermal precondition**
+can block the box indefinitely when the precondition sits on the wrong side of its
+oscillation. The safe order is to wait for thermal conditions *before* taking the lock (or to
+bound the wait and release).

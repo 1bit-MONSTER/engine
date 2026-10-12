@@ -112,9 +112,24 @@ unusable for H2 and only the control (and the campaign of record) can supply it.
 
 The tool refuses to invent a number when the PID is absent. Do not "fix" that by estimating.
 
-**Interpretation:** if faulting arms show more evictions in their own windows than clean arms do,
-that is consistent with H2 and with the residency argument in §4. If they do not, H2's stated
-mechanism is wrong as written and must be revised rather than defended.
+**Interpretation:** read the **`pre-fault` column**, not the window total. The tool counts evictions
+up to the instant the fault was logged, because a fault cannot cause evictions that precede it —
+whereas the window total is confounded (a faulting arm crashes, may be retried, and outlives its arm,
+so its window can simply be longer).
+
+The fault time comes from the arm's own `server.log`, in `minutes.seconds.milliseconds.microseconds`:
+`0.07.279.709 E common_sampler_sample: HRX returned NaN logits`. Both faces are matched (Face B via
+`unparsed Content-only`), or a Face-B arm would look like it had no recoverable fault time. Validated
+against run 7: all 3 faulting arms yield a time (81.181 s, 57.838 s, 7.280 s) and **0 of the 8 clean
+arms do** — a parser that found faults in clean arms would fabricate the H2 effect.
+
+Compare the faulting arms' **pre-fault** mean against the **clean arms' full windows** — a clean arm
+has no fault to truncate at, so that comparison is conservative and works against finding an effect.
+
+If faulting arms show more evictions pre-fault, that is consistent with H2 and with the residency
+argument in §4. If they do not, H2's stated mechanism is wrong as written and must be revised rather
+than defended. Note that run 7's faults landed **very early** — 7.3 s and 57.8 s into their arms — so
+a pre-fault window can be short; check the parsed time rather than assuming a fault lands late.
 
 A supporting (not decisive) check already done: eviction **rates** are comparable across
 `cwsr=0` and `cwsr=1` (3.80/s vs 4.19/s), so `cwsr=0` does not reduce pressure — the variable is

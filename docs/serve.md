@@ -70,8 +70,14 @@ into the load. ggml-hrx reports free memory equal to total, so llama.cpp's own `
 this on HRX0.
 
 ```
-1bit serve: Qwen3.8-27B-UD-Q4_K_XL does not fit: need 34.0 GiB (Qwen3.8-27B-UD-Q4_K_XL.gguf: weights 16.6 + KV/state 16.9 + compute 0.5) at the model's own ctx 262144 (no --ctx-size), free 20.3 GiB (GTT 20.3 of 120.0 GiB free, MemAvailable 61.2 GiB); free memory, lower --ctx-size, or pass --no-mem-check
+$ 1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --device hrx --mem-check     # strixhalo, 2026-10-12
+Qwen3.8-27B-UD-Q4_K_XL: fits: need 33.00 GiB (Qwen3.8-27B-UD-Q4_K_XL.gguf: weights 16.35 + KV/state 16.15 + compute 0.50) at the model's own ctx 262144 (no --ctx-size), free 57.71 GiB (GTT 73.3 of 120.0 GiB free, MemAvailable 57.7 GiB)
 ```
+
+A load that does not fit prints the same line as `1bit serve: <model> does not fit: need …;
+free memory, lower --ctx-size, or pass --no-mem-check` and exits 3 before any backend starts.
+Lemonade's loader logs that line with the exit code and fails the load ("1bit serve failed to
+start").
 
 The estimate (`app/mem_admit.h`) reads only the GGUF header, the way `tools/mem-budget`'s
 `mem_budget.py model` does:
@@ -111,7 +117,10 @@ ctest `mem_admit` checks the KV and state sizes against HRX0 server logs:
 | Qwen3.6-35B-A3B | 2048 | 40 + 62.8 MiB |
 
 ctest `mem_admit_route` checks that a sparse 4 TiB GGUF is refused in milliseconds, before any
-backend starts.
+backend starts. On strixhalo (2026-10-12), estimates for 15 model and context pairs agree with
+`mem_budget.py model` (KV from llama-fit-params) within 1.1%. The pairs cover Qwen3 0.6B/8B,
+GLM-4.7-Flash, ZAYA1-8B, Qwen3.6-35B-A3B, Qwen3.8-27B, Qwen3-Coder-30B-A3B, gpt-oss-20b and
+MiniCPM4-8B, at 2K-262K context.
 
 ## Where the model runs
 

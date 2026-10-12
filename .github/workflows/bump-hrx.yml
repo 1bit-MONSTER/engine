@@ -13,24 +13,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Keep third_party/llama.cpp and third_party/hrx-system on the pair AMD's
-# integration repo (ROCm/ggml-staging-automation) builds and tests together
-# (docs/hrx.md, "Staying current"). The engine pins 1bit/hrx-vulkan-patched: AMD's
-# commit plus our own commits on top. When AMD moves its pins, this workflow:
-#   1. syncs 1bit-MONSTER/llama.cpp: master to ggml-org, 1bit/hrx-vulkan to AMD's pin;
-#   2. MERGES AMD's pin into 1bit/hrx-vulkan-patched, tagging the previous tip so the
-#      commit the engine pins stays reachable;
-#   3. opens a PR here moving both submodules.
+# Keep third_party/llama.cpp and third_party/hrx-system current with the pair AMD's
+# integration repo (ROCm/ggml-staging-automation) builds and tests together, while the engine
+# stays on OUR HRX line (docs/hrx.md, "Staying current"). The engine pins
+# 1bit/hrx-vulkan-patched: AMD's commits plus our own. When AMD moves its pins, this workflow
+# (scripts/bump-hrx-sync.sh does the fork side and can be run locally with DRY_RUN=1):
+#   1. moves 1bit/hrx-vulkan, our mirror of AMD's pin, to AMD's pin. If AMD rewrote its history
+#      (2026-10-10: 141 commits squashed into one), the old mirror tip is tagged first, and the
+#      run fails if the mirror held any commit that is on no AMD branch;
+#   2. MERGES AMD's pin into 1bit/hrx-vulkan-patched, tagging the previous tip so the commit the
+#      engine pins stays reachable. While config/hrx-system-hold.config names a commit, only
+#      AMD's changes outside the HRX backend are taken (AMD's ggml-hrx is written against AMD's
+#      hrx-system) and hrx-system is not merged at all;
+#   3. opens a PR here when either submodule has something new.
 #
 # Why a merge and not a rebase (measured 2026-10-06): our patched line carries 159 of our own
 # commits and AMD's pin had moved 70 commits, over the same files. Rebasing replays all 159 and
-# died at commit 1 of 159 (dispatch-mul-mat.cpp), so the job failed on every scheduled run from
-# 2026-10-01 to 2026-10-05 and the HRX pin silently froze while AMD and our fork both moved.
-# Merging the same two lines conflicts in 15 files, all under ggml/src/ggml-hrx/. The llama.cpp
-# merge resolves those toward our patched line (measured: AMD core + our ggml-hrx passes the
-# full HRX0 gate with 0 NaN; AMD's ggml-hrx fails 54 cases and yields NaN, engine#315) and takes
-# AMD's side elsewhere. A conflict outside ggml/src/ggml-hrx, or in hrx-system, still fails the
-# run: resolve those files by hand.
+# died at commit 1 of 159 (dispatch-mul-mat.cpp). Merging the same two lines conflicts only under
+# ggml/src/ggml-hrx/, and the merge resolves those toward our patched line (measured: AMD core +
+# our ggml-hrx passes the full HRX0 gate with 0 NaN; AMD's ggml-hrx fails 54 cases and yields
+# NaN, engine#315). A conflict outside ggml/src/ggml-hrx, or in hrx-system, still fails the run
+# and names the files: resolve those by hand.
+#
+# The hold (engine#388): the owner keeps the engine on our HRX line (2026-10-10). AMD's
+# hrx-system after 98d05d94 miscompiles long-context attention (ROCm/hrx-system#1535), so
+# hrx-system stays at 98d05d94. Before the hold existed, every scheduled run from 2026-10-09
+# failed at the mirror step instead of reporting it.
 # A failed run now files an issue, so it cannot break silently for another five days.
 # GitHub-hosted CI builds that PR without HRX; run tests/serve_e2e.sh on
 # Strix Halo before merging it.
@@ -100,83 +108,13 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           AMD_LLAMA: ${{ steps.pins.outputs.amd_llama }}
-          OURS_BASE: ${{ steps.pins.outputs.ours_base }}
-        run: |
-          set -euo pipefail
-          # Keep the fork's master current when the token permits workflow-file updates. This
-          # mirror refresh is independent of moving the HRX branches to AMD's pin.
-          if ! gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master > /dev/null; then
-            echo "::warning::could not refresh 1bit-MONSTER/llama.cpp master; continuing with the HRX pin sync"
-          fi
-          git init -q fork && cd fork
-          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/llama.cpp.git"
-          git remote add amd https://github.com/AMD-Ecosystem/llama.cpp.git
-          git fetch -q --filter=blob:none amd "$AMD_LLAMA"
-          git fetch -q --filter=blob:none fork 1bit/hrx-vulkan
-          if ! git merge-base --is-ancestor FETCH_HEAD "$AMD_LLAMA"; then
-            echo "::error::1bit/hrx-vulkan has commits that AMD's pin does not contain; rebase them by hand"
-            exit 1
-          fi
-          git push -q fork "$AMD_LLAMA:refs/heads/1bit/hrx-vulkan"
-
-          # Merge (not rebase) AMD's pin into our line, in a clone whose only (partial) remote is
-          # the fork, which now holds AMD's pin too. Rebasing our 159 commits died at commit 1 of
-          # 159; the same two lines merge with 15 conflicting files, all under ggml/src/ggml-hrx/.
-          cd .. && git init -q patched && cd patched
-          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/llama.cpp.git"
-          git fetch -q --filter=blob:none fork 1bit/hrx-vulkan
-          git fetch -q --filter=blob:none fork 1bit/hrx-vulkan-patched
-          patched=$(git rev-parse FETCH_HEAD)
-          rebased=$patched
-          if [ "$OURS_BASE" != "$AMD_LLAMA" ]; then
-            git checkout -q --detach "$patched"
-            if ! git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com merge --no-edit --no-ff "$AMD_LLAMA"; then
-              conflicts=$(git diff --name-only --diff-filter=U || true)
-              outside=$(printf '%s\n' "$conflicts" | grep -v '^ggml/src/ggml-hrx/' | grep -v '^$' || true)
-              if [ -n "$outside" ]; then
-                git merge --abort || true
-                echo "::error::merging AMD's ${AMD_LLAMA:0:12} into 1bit/hrx-vulkan-patched conflicts outside ggml/src/ggml-hrx: $(printf '%s ' $outside); resolve those files by hand"
-                exit 1
-              fi
-              # Every conflict is inside our HRX backend. Take ours (the branch being merged
-              # into, i.e. the patched line) and keep the rest of AMD's pin.
-              #
-              # Measured 2026-10-06, fresh builds with this workflow's own ExternalProject
-              # arguments - AMD's core plus our ggml-hrx: full gate test-backend-ops -b HRX0
-              # 1073/1073 with 0 FAIL, and GLM-4.7-Flash at -ub 512 returns " Paris." with 0
-              # NaN events. AMD's own ggml-hrx on the same core: 1019/1071 with 54 FAIL and 18
-              # NaN events (engine#315). Resolving these 15 files toward AMD's side therefore
-              # imports that NaN into the pinned line, so the merge keeps our files.
-              # Our side may have DELETED a file AMD changed (modify/delete). `git checkout --ours`
-              # cannot apply to a path we do not have, which leaves the merge uncommitted and makes
-              # `git commit` fail. Keep our deletion, which is what this line already ships.
-              printf '%s\n' "$conflicts" | while read -r path; do
-                [ -n "$path" ] || continue
-                if git cat-file -e ":2:$path" 2>/dev/null; then
-                  git checkout --ours -- "$path" && git add -- "$path"
-                else
-                  echo "::notice::kept our deletion of $path (modify/delete conflict)"
-                  git rm -q -f -- "$path"
-                fi
-              done
-              git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com commit -q --no-edit
-              echo "::notice::merged AMD's ${AMD_LLAMA:0:12} keeping our ggml/src/ggml-hrx for: $(printf '%s ' $conflicts)"
-            fi
-            rebased=$(git rev-parse HEAD)
-            # keep the commit the engine pins now reachable before moving the branch
-            git tag -f "patched-${patched:0:12}" "$patched"
-            git push -q fork "refs/tags/patched-${patched:0:12}"
-            git push -q --force-with-lease="refs/heads/1bit/hrx-vulkan-patched:$patched" fork "$rebased:refs/heads/1bit/hrx-vulkan-patched"
-          fi
-          {
-            echo "rebased=$rebased"
-            echo "patches<<EOF"; git log --format='- `%h` %s' "$AMD_LLAMA..$rebased"; echo "EOF"
-          } >> "$GITHUB_OUTPUT"
+          OURS_LLAMA: ${{ steps.pins.outputs.ours_llama }}
+          OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
+        run: scripts/bump-hrx-sync.sh llama
 
       # hrx-system is the OTHER HALF of AMD's tested pair. The engine pins our fork's 1bit/main
-      # (ROCm/hrx-system at AMD's pin plus our commits), and .gitmodules records that it is rebased
-      # by hand — which is why an unextended workflow leaves it behind every time AMD moves. Same
-      # merge-not-rebase treatment as llama.cpp above.
+      # (ROCm/hrx-system at AMD's pin plus our commits). Same merge-not-rebase treatment as
+      # llama.cpp above, unless config/hrx-system-hold.config holds it.
       - name: Merge AMD's hrx-system pin into our line
         id: hrxfork
         if: steps.pins.outputs.changed == 'true'
@@ -184,32 +122,7 @@ jobs:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           AMD_HRX: ${{ steps.pins.outputs.amd_hrx }}
           OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
-        run: |
-          set -euo pipefail
-          git init -q hrxsystem && cd hrxsystem
-          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/hrx-system.git"
-          git remote add amd https://github.com/ROCm/hrx-system.git
-          # AMD's pin first, then our branch into an explicit ref, so FETCH_HEAD ordering cannot bite
-          # (a bare FETCH_HEAD read after two fetches silently compares the wrong pair).
-          git fetch -q --filter=blob:none amd "$AMD_HRX" || git fetch -q --filter=blob:none fork "$AMD_HRX"
-          git fetch -q --filter=blob:none fork 1bit/main:refs/remotes/fork/1bit-main
-          ours=$(git rev-parse refs/remotes/fork/1bit-main)
-          hrx_rebased=$ours
-          if [ "$OURS_HRX" != "$AMD_HRX" ]; then
-            git checkout -q --detach "$ours"
-            if ! git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com merge --no-edit --no-ff "$AMD_HRX"; then
-              conflicts=$(git diff --name-only --diff-filter=U | tr '\n' ' ' || true)
-              git merge --abort || true
-              echo "::error::merging AMD's hrx-system ${AMD_HRX:0:12} into 1bit-MONSTER/hrx-system 1bit/main conflicts in: ${conflicts}; resolve those files by hand"
-              exit 1
-            fi
-            hrx_rebased=$(git rev-parse HEAD)
-            # keep the commit the engine pins now reachable before moving the branch
-            git tag -f "main-${ours:0:12}" "$ours"
-            git push -q fork "refs/tags/main-${ours:0:12}"
-            git push -q --force-with-lease="refs/heads/1bit/main:$ours" fork "$hrx_rebased:refs/heads/1bit/main"
-          fi
-          echo "hrx_rebased=$hrx_rebased" >> "$GITHUB_OUTPUT"
+        run: scripts/bump-hrx-sync.sh hrx
 
       # Our ggml-hrx backend (ggml/src/ggml-hrx in the llama.cpp fork) is compiled against the LoomC
       # headers of hrx-system. AMD removes public LoomC symbols without notice (2026-10-07: loom 32d0c76a
@@ -225,11 +138,12 @@ jobs:
         env:
           REBASED: ${{ steps.fork.outputs.rebased }}
           HRX_REBASED: ${{ steps.hrxfork.outputs.hrx_rebased }}
+          HRX_POLICY_HELD: ${{ steps.hrxfork.outputs.held }}
           OURS_HRX: ${{ steps.pins.outputs.ours_hrx }}
         run: |
           set -euo pipefail
           hrx_pin="$HRX_REBASED"
-          held=""
+          held="$HRX_POLICY_HELD"
           if [ "$HRX_REBASED" != "$OURS_HRX" ]; then
             used=$(cd patched && git ls-tree -r --name-only "$REBASED" -- ggml/src/ggml-hrx \
               | grep -E '\.(c|cc|cpp|h|hpp)$' \
@@ -269,33 +183,33 @@ jobs:
         run: |
           set -euo pipefail
           if [ "$REBASED" = "$OURS_LLAMA" ] && [ "$HRX_REBASED" = "$OURS_HRX" ]; then
-            echo "::notice::nothing to move: llama.cpp stays at ${OURS_LLAMA:0:12} and hrx-system is held at ${OURS_HRX:0:12}"
+            echo "::notice::nothing to move: llama.cpp stays at ${OURS_LLAMA:0:12}, hrx-system at ${OURS_HRX:0:12}"
             exit 0
           fi
-          branch="bump-hrx/${AMD_LLAMA:0:12}-${HRX_REBASED:0:12}"
+          title="Bump HRX: llama.cpp ${REBASED:0:12} + hrx-system ${HRX_REBASED:0:12}"
+          branch="bump-hrx/${REBASED:0:12}-${HRX_REBASED:0:12}"
           if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
-            echo "$branch already exists"; exit 0
+            echo "::notice::$branch already exists"; exit 0
           fi
           git config user.name "hrx-bump"
           git config user.email "hrx-bump@users.noreply.github.com"
           git switch -c "$branch"
           git update-index --cacheinfo "160000,$REBASED,third_party/llama.cpp"
           git update-index --cacheinfo "160000,$HRX_REBASED,third_party/hrx-system"
-          git commit -q -m "Bump HRX: llama.cpp ${AMD_LLAMA:0:12} + hrx-system ${HRX_REBASED:0:12} (AMD's tested pair)"
+          git commit -q -m "$title"
           scripts/registry-regen.sh  # the registry must record the new pin (ctest registry_pins)
           git push -q origin "$branch"
-          gh pr create --base main --head "$branch" \
-            --title "Bump HRX: llama.cpp ${AMD_LLAMA:0:12} + hrx-system ${HRX_REBASED:0:12} (AMD's tested pair)" \
-            --body "Moves BOTH submodules onto the pair ROCm/ggml-staging-automation now pins, each merged with our own commits (the workflow performs the merge; a conflict fails the run and names the files).
+          gh pr create --base main --head "$branch" --title "$title" \
+            --body "Moves the HRX submodules along our line. AMD's tested pair (ROCm/ggml-staging-automation) is llama.cpp \`${AMD_LLAMA:0:12}\` + hrx-system \`${AMD_HRX:0:12}\`; the workflow merges it into our branches (a conflict fails the run and names the files).
 
           | | from | to |
           |---|---|---|
-          | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched) | \`${OURS_LLAMA:0:12}\` | \`${REBASED:0:12}\` (on AMD \`${AMD_LLAMA:0:12}\`) |
-          | third_party/hrx-system (1bit-MONSTER/hrx-system 1bit/main) | \`${OURS_HRX:0:12}\` | \`${HRX_REBASED:0:12}\` (on AMD \`${AMD_HRX:0:12}\`) |
+          | third_party/llama.cpp (1bit-MONSTER/llama.cpp 1bit/hrx-vulkan-patched) | \`${OURS_LLAMA:0:12}\` | \`${REBASED:0:12}\` |
+          | third_party/hrx-system (1bit-MONSTER/hrx-system 1bit/main) | \`${OURS_HRX:0:12}\` | \`${HRX_REBASED:0:12}\` |
 
           ${HRX_HELD}
 
-          Our commits, rebased onto AMD's pin:
+          llama.cpp commits new to the engine:
           ${PATCHES}
 
           CI here builds without HRX. Before merging, on Strix Halo run the long-prompt correctness

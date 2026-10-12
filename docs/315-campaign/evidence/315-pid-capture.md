@@ -158,3 +158,54 @@ captured while the arm runs, so the window is exact and the count is attributabl
 
 The H2 discriminating test — *do faulting arms show more evictions than clean arms in their own
 windows?* — can therefore be run on this campaign's data as soon as it has both kinds of arm.
+
+## Two findings that change the H2 test (2026-10-12)
+
+Investigating a faulting run-7 arm turned up two things that matter more than the check I was doing.
+
+### 1. The fault IS timestamped — so the window total can be replaced by a pre-fault count
+
+`server.log` timestamps the fault line, in `minutes.seconds.milliseconds.microseconds`:
+
+```
+0.07.279.709 E common_sampler_sample: HRX returned NaN logits: count=154880 of 154880 ...
+1.21.180.831 W common_chat_peg_parse: unparsed Content-only output:  laptop too
+```
+
+Decoded against that arm's own request count (`req=1`), 7.28 s is right where a 1-request arm would
+die. So the format is confirmed by an independent quantity, not assumed.
+
+**This removes a confound in my own H2 test.** A whole-window total cannot distinguish *"more
+evictions caused the fault"* from *"the fault caused more evictions"* — a faulting arm's server
+crashes, may be retried, and outlives its arm, so its window can simply be longer. Counting only up
+to the fault instant is a causal test: **a fault cannot cause evictions that precede it.**
+
+`tools/315-evict-per-arm.py` now prints both columns — `pre-fault` (the causal test) and `window`
+(kept for continuity, and because a large gap between them is itself informative) — and refuses to
+draw a causal conclusion when no fault arm has a recoverable time.
+
+### 2. Two of run 7's three faults were Face A **followed by a full server crash**
+
+p7c and p7l each logged the Face-A NaN line and then died — their logs end in a gdb backtrace
+(`#16 _start`, `[Inferior 1 (process 205541) detached]`). That is why their detectors recorded
+`transport_failures=1` / `RemoteDisconnected`: **the transport failure is downstream of the NaN, not a
+separate failure mode.** The console called both `FaceA nan=1`, and on the server side that is right.
+
+So run 7's three faults are: **two Face-A NaN crashes** (at 7.3 s and 57.8 s into their arms) and
+**one Face-B parse failure** (at 81.2 s, req=20). The counts are small but the arm durations are very
+different — a reminder that a fault can happen almost immediately, which is worth knowing when sizing
+the control.
+
+### Validation of the timestamp parser
+
+Both faces are matched, or a Face-B arm looks like it has no recoverable fault time:
+
+| arm | face | parsed | note |
+|---|---|---|---|
+| `315evict7-p3l` | B (HTTP 500 / parse) | **81.181 s** | matched via `unparsed Content-only` |
+| `315evict7-p7c` | A (NaN) | **57.838 s** | |
+| `315evict7-p7l` | A (NaN) | **7.280 s** | consistent with its `req=1` |
+
+False-positive check across **all** run-7 arms: exactly those 3 yield a time, and **0 of the 8 clean
+arms do**. A parser that found faults in clean arms would fabricate the H2 effect, so this check is
+the one that matters.

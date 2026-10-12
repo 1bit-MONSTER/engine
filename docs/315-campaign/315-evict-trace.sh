@@ -52,22 +52,19 @@ echo "This run's PURPOSE is the eviction timeline, not an acceptance rate. A cle
 echo "recorded as UNINFORMATIVE (with its clean-arm count), never as evidence about the fault."
 echo
 
-# Root, or the trace is silently empty. Start BEFORE the driver composes neighbours so the
-# neighbours' own BOs get owners in the stream.
-sudo -n nohup "$WATCH" -e all -t 10800 -o "$OUT/kfd_smi.tsv" -q >"$OUT/watcher.err" 2>&1 &
-sleep 3
-WPID=$(pgrep -f "kfd_smi_watch.*$OUT/kfd_smi.tsv" | head -1)
-if [ -z "$WPID" ]; then
-  echo "ABORT: the watcher did not start; stderr:"; head -5 "$OUT/watcher.err"; exit 3
-fi
-echo "watcher pid $WPID -> $OUT/kfd_smi.tsv"
-
-cleanup() { sudo -n kill "$WPID" 2>/dev/null; }
-trap cleanup EXIT INT TERM
+# The watcher is started LATER, after the box lock and the GPU-quiet check (see below).
+# It was originally started here, which meant it ran its 3h TTL while a peer still held HRX0
+# and recorded events from a window that was not ours.
 
 # Run the frozen driver unchanged. NOSTOP=1 so the run continues past a fault and gives us
 # more than one faulting arm to correlate; MINCLEAN=0 because this is not an acceptance run.
-# Run the frozen driver unchanged.
+# Run the frozen driver unchanged, under the box lock.
+#
+# The 315 harnesses share a convention (315-attrib.sh:41-48): take
+# ~/.cache/lax-decode/box.lock on fd 9 and pass NOLOCK=1 down, so a second arm runner
+# cannot start concurrently. That comment also warns that the driver's fallback is to
+# proceed UNLOCKED - so taking the lock here is what makes concurrent runs impossible,
+# not merely unlikely.
 #
 # MINCLEAN is a goalpost, not a floor: 315-paired.sh:147 stops when the clean count
 # REACHES it. Passing MINCLEAN=0 therefore means "stop at zero clean arms", which ended
@@ -75,6 +72,67 @@ trap cleanup EXIT INT TERM
 # reachable so the PAIRS cap is what ends the run, and let NOSTOP keep a fault from
 # aborting a diagnostic run.
 UNREACHABLE=$(( PAIRS * 2 + 1 ))
+
+if [ -n "${NOLOCK:-}" ]; then
+  echo "inheriting the caller's box lock (NOLOCK=1)"
+else
+  LOCK=$HOME/.cache/lax-decode/box.lock
+  mkdir -p "$(dirname "$LOCK")"
+  exec 9>"$LOCK"
+  if flock -w "${LOCK_WAIT:-900}" 9; then
+    echo "box lock held $(date -Is)"
+  else
+    echo "ABORT: box lock unobtainable after ${LOCK_WAIT:-900}s - a peer is running arms."
+    echo "Nothing was started. Retry when the box is quiet."
+    exit 3
+  fi
+fi
+
+# The lock only excludes harnesses that FOLLOW the convention. Observed 2026-10-12: a peer
+# batch (~/wt/loom-ub389) runs HRX jobs without ever taking box.lock, so the lock was free
+# while a peer held HRX0. The composition would have evicted that peer's memory. So also
+# poll for actual GPU quiescence: any foreign '-dev HRX0' process, other than the two
+# Vulkan servers this box keeps resident.
+wait_for_gpu_quiet() {
+  local deadline=$(( $(date +%s) + ${QUIET_WAIT:-1800} ))
+  while :; do
+    local foreign
+    foreign=$(ps -eo pid,args 2>/dev/null \
+      | grep -- "-dev HRX0" | grep -v grep \
+      | grep -v "$OUT" | grep -v "315-" || true)
+    # Also refuse if a peer's HRX job is mid-flight even without '-dev HRX0' in argv.
+    local peer
+    peer=$(ps -eo pid,args 2>/dev/null | grep -E "loom-ub389|repro336" | grep -v grep || true)
+    if [ -z "$foreign" ] && [ -z "$peer" ]; then
+      echo "GPU quiet: no foreign HRX job (waited as needed)"
+      return 0
+    fi
+    if [ "$(date +%s)" -ge "$deadline" ]; then
+      echo "ABORT: GPU still busy after ${QUIET_WAIT:-1800}s; a foreign HRX job would be evicted."
+      echo "  foreign: ${foreign:-none}"
+      echo "  peer:    ${peer:-none}"
+      echo "Nothing was started."
+      return 3
+    fi
+    sleep 20
+  done
+}
+
+wait_for_gpu_quiet || exit $?
+
+# Now that the box is ours, start the watcher. Root, or the trace is silently empty.
+# Start it BEFORE the driver composes neighbours so the neighbours' own BOs get owners in
+# the stream (the driver's fallback would otherwise miss their registration).
+sudo -n nohup "$WATCH" -e all -t 10800 -o "$OUT/kfd_smi.tsv" -q >"$OUT/watcher.err" 2>&1 &
+sleep 3
+WPID=$(pgrep -f "kfd_smi_watch.*$OUT/kfd_smi.tsv" | head -1)
+if [ -z "$WPID" ]; then
+  echo "ABORT: the watcher did not start; stderr:"; head -5 "$OUT/watcher.err"; exit 3
+fi
+echo "watcher pid $WPID -> $OUT/kfd_smi.tsv"
+cleanup() { sudo -n kill "$WPID" 2>/dev/null; }
+trap cleanup EXIT INT TERM
+
 MINCLEAN="$UNREACHABLE" NOSTOP=1 \
   FIX="$FIX" CTRL="$CTRL" TAG="$TAG" PAIRS="$PAIRS" \
   bash "$HOME/wt/315-campaign.sh" 2>&1 | tail -20

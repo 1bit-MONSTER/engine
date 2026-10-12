@@ -105,3 +105,37 @@ A campaign must not run while a peer holds the box. Observed on the relaunch att
 peer's `~/wt/loom-ub389` 27B HRX job under `guard.sh` (1800 s timeout), GTT 46.7 GiB,
 `npu.lock` touched minutes earlier. The composition would have evicted that job's memory.
 Wait for the box rather than disturb a peer — the goal's own constraint.
+
+### 6d. The watcher started before the box was ours
+
+Third launch (run 3, tag `315evict3`) started the KFD watcher at the **top** of the script,
+~70 lines before the box-lock acquisition and the GPU-quiet check. So the watcher ran its
+3-hour TTL while a peer still held HRX0, recording events from a window that was not the
+campaign's. Its output would have looked identical to a correct run — the tell is only the
+ordering of the lines in the run log.
+
+Run 4 fixes the order, and the log now shows it:
+
+```
+box lock held 2026-10-12T13:13:03-03:00     <- lock first
+GPU quiet: ...                              <- then the box is actually ours
+watcher pid ...                             <- only now start the watcher
+```
+
+### 6e. flock alone does not protect against a peer
+
+The box lock only excludes processes that **follow the convention**. Observed 2026-10-12: a
+peer batch (`~/wt/loom-ub389`) runs `-dev HRX0` jobs and its only shell script is
+`build.sh` with no lock usage. So `flock` reported the lock free while the peer held HRX0,
+and composing neighbours into the 95–110 GiB band would have evicted that peer's memory.
+
+The wrapper therefore takes the lock **and** polls for actual GPU quiescence: no foreign
+`-dev HRX0` process and no `loom-ub389`/`repro336` job, with `QUIET_WAIT` (default 1800 s)
+as the bound. On timeout it aborts and starts nothing, rather than racing.
+
+### 6f. Killing a run needs the wrapper killed directly
+
+`pkill -f "315-evict-trace.sh ..."` did not stop run 3 (it returned 255 and the process
+survived), because the wrapper was parked in the quiet-poll's `sleep` with a trap installed.
+The watcher stopped but the wrapper did not. `kill -KILL <pid>` was needed. Worth knowing:
+a half-stopped wrapper can leave a watcher running or a lock held.

@@ -356,3 +356,31 @@ sessions (no `wtmp`/`last reboot` on this box). So there is no retroactive H1 te
 `cwsr_enable=1`, on the same harness, on the same day — i.e. exactly the control that is scripted
 and waiting. This is now not merely "the honest thing to do" but the *only* remaining route,
 because the alternative data does not exist.
+
+### Control check: does `cwsr_enable=0` reduce the pressure itself? No.
+
+If disabling CWSR merely made the box quieter (fewer evictions), then the fault difference would
+be about pressure, not about preemption. It does not:
+
+| run | config | Q_EVICT | stream span | rate |
+|---|---|---|---|---|
+| `315evict7` | `cwsr_enable=1` | 8,419 | 2,011 s | **4.19 /s** |
+| `315cwsr60` | `cwsr_enable=0` | 9,997 | 2,634 s | **3.80 /s** |
+| | | | | (not-rescheduled: 8,417 vs 9,997 — both ~100%) |
+
+The eviction load is comparable — slightly *lower* per second in the treatment, but the same order,
+and every restore is still not-rescheduled. So the memory pressure and the queue-eviction activity
+are present in both arms of the comparison.
+
+**Why that matters:** it isolates the *variable* to what CWSR actually controls. `Q_EVICT` is a
+queue-level event; `cwsr_enable` governs whether a **wave** can be preempted mid-execution. With
+pressure held roughly constant across the two runs, a difference in fault rate is attributable to
+the preemption capability rather than to how hard the box was being squeezed.
+
+That is the distinction H2 rests on: evictions happen either way; what CWSR-off removes is the
+hardware's ability to preempt a wave *mid-execution* while its buffers are being moved.
+
+Incidental QA: run 7 had a server living **1,975 s** (the p3l fault arm, which outlived its arm and
+which I killed by hand); the campaign's longest-lived server is **267 s**, i.e. its arm servers are
+being cleaned up properly. That is the harness discipline the PID-capture work was part of, and it
+is why run 7's per-arm eviction counts were unusable (see `315-pid-capture.md`).

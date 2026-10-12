@@ -182,3 +182,47 @@ reason task-8 may close on the null already in hand rather than on a new run.
 Note also: GTT stays ~27 GiB during peer jobs, i.e. the peer never approaches the regime.
 A cheaper future option — not taken here because it would change the pre-registered
 composition — would be to interleave arms into gaps rather than requiring an empty box.
+
+## Runs 4 and 5: the lock finding, and where the campaign now stands
+
+**Run 4** (`315evict4`) ran the wrapper *before* the two-lock fix. It "acquired the box
+lock" at 13:13:03 and sat in the GPU-quiet poll for 5m32s while `~/npu.lock` was held by 12
+other processes. Its log line `box lock held` read as protection and provided none — the
+poll was doing all the work. Stopped and discarded rather than left running in a
+semantically unprotected state.
+
+**Run 5** (`315evict5`) runs the corrected wrapper. Its log now distinguishes the two locks
+and, crucially, **stops at the one that matters**:
+
+```
+box lock held 2026-10-12T13:18:52-03:00  (/home/bcloud/.cache/lax-decode/box.lock)
+  ... then waits on ~/npu.lock, held by 14 processes ...
+```
+
+That is the expected behaviour and it is a behaviour change worth stating: before the fix
+the run would have proceeded into the composition while another worker held the box-wide
+lock. Now it waits, and aborts having started nothing if the lock is unobtainable within
+its budget.
+
+### Status: task-8 is blocked on the shared box, not on the harness
+
+The harness has now been hardened against seven distinct silent-failure modes
+(`315-evict-trace-instrument.md` §6a–§6g). What remains is not engineering:
+
+| | |
+|---|---|
+| `~/npu.lock` holders while run 5 waited | 12 → 14 |
+| workers holding it | a peer batch (`loom-ub389`) **and** two other goals' workers (`npu-forge2-kvsplit`, `probe_model.sh`) |
+| HRX0 occupancy | 1–2 processes at every sample over 2 min |
+| regime requirement | ~5 neighbours resident in the 95–110 GiB band, ~5 min per arm |
+
+So the honest position on task-8 is:
+
+- **evidence in hand**: run 1 — 1 in-regime arm, 0 faults, under 15,457 evictions
+  (15,353 of them unrestored). A **null**.
+- **blocked**: a fresh run needs the box-wide lock free for a sustained window, and three
+  unrelated workers are currently holding it.
+
+Per the task-8 contract, the null is recordable as **uninformative with its clean-arm
+count**, and the reason is box contention. That is a legitimate close, not a design choice —
+but it is a weaker close than a faulting arm would be, and it should be reported as such.

@@ -156,3 +156,29 @@ an honest null with its clean-arm count.
 **If the box stays contended, task-8's honest close is the null already in hand**: 1
 in-regime clean arm under 15.4k evictions, recorded as uninformative, with the reason being
 box contention rather than a design choice.
+
+## Box contention, measured 2026-10-12 13:10–13:17
+
+The failure mode here is not a bug in the harness — it is that the box is continuously busy.
+Measured, not assumed:
+
+| observation | value |
+|---|---|
+| peer batch | `~/wt/loom-ub389/runs/` — grew `batch1` → `batch2` → `batch3` while waiting |
+| job types in the batch | `emb_hrx`, `emb_cpu`, `rr_hrx`, `rr_cpu`, `vis_hrx`, `zamba_base/fix/fin_ub`, `txt_fin_ub`, `ms_fin_b`, `fin_` |
+| HRX0 occupancy, sampled every 15 s for 2 min | **1–2 holder processes at every sample, never 0** |
+| GTT while a peer job ran | steady ~27 GiB (a small job, not the 95–110 band) |
+| one peer job's duration | 6 min 21 s elapsed against a 1200 s cap, with more queued behind it |
+
+So the peer's batch takes HRX0 continuously in small jobs. My composition needs ~5
+neighbours resident in the 95–110 GiB band for ~5 minutes per arm; running it would evict
+the peer's live job. The goal's constraint is to not disturb other workloads, so run 4
+polls (30 min budget) and aborts having started nothing rather than racing.
+
+**This is the second long unavailability this task has hit** (the first was `repro336`
+holding 103–111 GiB on 2026-10-09). It is a property of a shared box, and it is the honest
+reason task-8 may close on the null already in hand rather than on a new run.
+
+Note also: GTT stays ~27 GiB during peer jobs, i.e. the peer never approaches the regime.
+A cheaper future option — not taken here because it would change the pre-registered
+composition — would be to interleave arms into gaps rather than requiring an empty box.

@@ -447,3 +447,31 @@ the harness work was for.
 
 **Not yet evidence.** task-8 still needs an in-regime arm to *fault* while the watcher is
 attached, or the null recorded with its clean-arm count. Nothing here changes that.
+
+## Run 7 (`315evict7`) — first campaign to run properly in regime
+
+After the reboot and the NOLOCK fix (§6h), run 7 passed all four gates and reached the regime:
+
+| | |
+|---|---|
+| gates | box lock → npu lock → GPU quiet → watcher (all four passed) |
+| composition | 4 HRX neighbours, GTT 27 → 80 → 98 → **104 GiB** |
+| arm 1 (`p1c`) | `run.log: gtt_start 97GiB` — **in regime** |
+| requests | 140 → 208 in 60 s (68/min) |
+| evictions | 662 → 668 |
+| deadlock | none (`do_wait`) |
+
+This is the first run in the whole task that got past composition and into a scored
+in-regime arm while the eviction watcher was attached. Everything before it aborted at a
+gate or deadlocked: run 1 was truncated by `MINCLEAN=0`, runs 3–5 never cleared the locks,
+run 6 self-deadlocked on the lock the driver re-opens.
+
+**What it is for:** task-8 needs an in-regime arm to **fault** while the watcher runs, so the
+fault can be correlated against the driver's own eviction events. 16 arms (8 pairs) is the
+target; the observed in-regime rate is roughly 1 in 2, so expect ~8 in-regime arms.
+
+**What it cannot do:** satisfy task-9, which is gated on a named mechanism no instrument has
+produced. A clean run here is task-8 evidence, not the objective's fix+≥60-arm deliverable.
+
+**If all 16 arms are clean**, the contract requires recording this trace as
+**UNINFORMATIVE with its clean-arm count** — never as evidence about the mechanism.

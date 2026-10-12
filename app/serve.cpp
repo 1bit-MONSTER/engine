@@ -20,7 +20,8 @@
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
 // onebit backend runs `1bit serve` the way it runs llama-server:
 //
-//   GET  /health, /v1/health     503 while the model loads, then 200
+//   GET  /health, /v1/health     503 while the model loads, then 200 while the backend answers its own
+//                                (503 when it has exited, stopped answering, or the watchdog fired)
 //   GET  /v1/models              the one model
 //   POST /v1/chat/completions    (stream or not)
 //   POST /v1/completions
@@ -62,6 +63,8 @@
 #include "hrx_archs.h"
 #include "pm.h"
 #include "recipes.h"
+#include "serve_watchdog.h"
+#include "sysinfo.h"
 
 #ifdef ONEBIT_MOE
 #include "gguf_index.h"
@@ -92,6 +95,7 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -160,6 +164,7 @@ struct Options {
     bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
     std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
+    WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -393,8 +398,9 @@ PortOwner port_owner(pid_t child, int port) {
 class Child {
 public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health")
+          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr)
         : port_(port), ready_path_(std::move(ready_path)) {
+        (void)on_line;  // the backend's stderr is its own on Windows
         // the command line, each argument quoted the way CommandLineToArgvW reads it back
         std::string cmd;
         for (const auto& a : argv) {
@@ -460,11 +466,21 @@ public:
 
     bool alive() const { return proc_ && ::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT; }
 
+    bool kill_now(std::chrono::seconds wait) {
+        if (!proc_) return true;
+        ::TerminateProcess(proc_, 1);
+        const bool gone = ::WaitForSingleObject(proc_, DWORD(wait.count() * 1000)) == WAIT_OBJECT_0;
+        if (gone) { ::CloseHandle(proc_); proc_ = nullptr; }
+        return gone;
+    }
+    int pid() const { return proc_ ? int(::GetProcessId(proc_)) : -1; }
+
 #else
 class Child {
 public:
+    // on_line, where given, sees every complete line the backend writes to its stderr (Linux)
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health")
+          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr)
         : port_(port), ready_path_(std::move(ready_path)) {
         std::vector<char*> args;
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
@@ -481,6 +497,10 @@ public:
         for (auto& e : env_store) envp.push_back(e.data());
         envp.push_back(nullptr);
 #if defined(__linux__)
+        // The backend's stderr comes through serve (passed on unchanged), so serve keeps its last
+        // lines for a watchdog report and can read what it says (docs/serve.md).
+        int err[2] = {-1, -1};
+        const bool tee = ::pipe2(err, O_CLOEXEC) == 0;
         const pid_t parent = ::getpid();
         pid_ = ::fork();
         if (pid_ < 0) throw std::runtime_error("cannot fork for " + argv[0] + ": " + std::strerror(errno));
@@ -489,8 +509,30 @@ public:
             // SIGKILL included, so a backend is never left running on its own.
             ::prctl(PR_SET_PDEATHSIG, SIGTERM);
             if (::getppid() != parent) ::_exit(127);  // parent already gone
+            if (tee) ::dup2(err[1], 2);
             ::execvpe(args[0], args.data(), envp.data());
             ::_exit(127);
+        }
+        if (tee) {
+            ::close(err[1]);
+            // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
+            std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line)] {
+                char buf[4096];
+                for (;;) {
+                    const ssize_t n = ::read(fd, buf, sizeof buf);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) break;
+                    for (ssize_t done = 0; done < n;) {
+                        const ssize_t w = ::write(2, buf + done, size_t(n - done));
+                        if (w < 0 && errno == EINTR) continue;
+                        if (w <= 0) break;
+                        done += w;
+                    }
+                    for (const std::string& line : tail->feed(buf, size_t(n)))
+                        if (on_line) on_line(line);
+                }
+                ::close(fd);
+            }).detach();
         }
 #else
         // No parent-death signal outside Linux: the SIGTERM/SIGINT handler
@@ -516,7 +558,25 @@ public:
     }
 
     bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
+
+    // The watchdog's stop: SIGKILL at once (a wedged GPU process does not act on SIGTERM), then
+    // up to `wait` for it to go. False when it is still there (stuck in the kernel).
+    bool kill_now(std::chrono::seconds wait) {
+        if (pid_ <= 0) return true;
+        ::kill(pid_, SIGKILL);
+        const auto end = std::chrono::steady_clock::now() + wait;
+        while (std::chrono::steady_clock::now() < end) {
+            const pid_t r = ::waitpid(pid_, nullptr, WNOHANG);
+            if (r == pid_ || (r < 0 && errno == ECHILD)) { pid_ = -1; return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+    int pid() const { return int(pid_); }
 #endif
+    // the backend's last stderr lines (empty where serve does not pass its stderr through)
+    std::vector<std::string> last_lines(size_t n) const { return tail_->last(n); }
+    const std::string& ready_path() const { return ready_path_; }
 
     // Polls the child's ready path (/health; /v1/models for servers without one, which answer
     // only once the model is loaded) until it answers 200, it exits, or time runs out.
@@ -551,6 +611,7 @@ private:
 #endif
     int port_;
     std::string ready_path_;
+    std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();
 };
 
 std::string model_id(const Options& o) {
@@ -574,8 +635,10 @@ private:
     std::atomic<int>* n_;
 };
 
+// watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h).
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
-             const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
+             const std::string& set_model, const httplib::Request& req, httplib::Response& res,
+             ProgressWatch* watch = nullptr) {
     json body;
     try {
         body = json::parse(req.body);
@@ -592,6 +655,8 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     const std::string payload = body.dump();
     const std::string path = req.path;
     if (!stream) {
+        // nothing arrives until the whole answer does: the backend's probe is the only progress
+        const auto tracked = watch ? watch->begin(port, "POST " + path, req.body.size(), true) : nullptr;
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         // The backend learns of a client that hung up only when serve closes its own connection:
@@ -620,11 +685,16 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
         return;
     }
     // Streaming: relay the child's SSE bytes as they arrive.
-    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held](size_t, httplib::DataSink& sink) {
+    const size_t prompt_bytes = req.body.size();
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes](size_t, httplib::DataSink& sink) {
+        const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         c.Post(path, httplib::Headers{}, payload, "application/json",
-               [&sink](const char* data, size_t n) { return sink.write(data, n); });
+               [&sink, &tracked](const char* data, size_t n) {
+                   if (tracked) ProgressWatch::progress(*tracked, n);
+                   return sink.write(data, n);
+               });
         sink.done();
         return true;
     });
@@ -1375,12 +1445,52 @@ int serve_child(const Options& given) {
 
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
+    ProgressWatch watch(o.watchdog);
+    std::mutex wedged_mu;
+    std::string wedged;   // set by the watchdog: why the backend is taken down
 
     httplib::Server srv;
     install_request_guard(srv, o.host);  // Host / Origin (app/http_guard.h)
+    std::vector<std::unique_ptr<Child>> children;
+    std::mutex start_mu;
+    // /health: 503 while loading; once loaded, 503 too when a backend has exited, does not answer
+    // its own health route within 3 s, or the watchdog found it wedged. Lemonade's BackendWatchdog
+    // probes this route and reloads a backend that fails it.
     auto health = [&](const httplib::Request&, httplib::Response& res) {
-        res.status = ready ? 200 : 503;
-        res.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");
+        auto fail = [&](const std::string& why) {
+            res.status = 503;
+            res.set_content(json{{"status", "error"}, {"error", why}}.dump(), "application/json");
+        };
+        if (!ready) {
+            res.status = 503;
+            res.set_content(R"({"status":"loading"})", "application/json");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(wedged_mu);
+            if (!wedged.empty()) return fail("backend wedged: " + wedged);
+        }
+        std::vector<std::pair<int, std::string>> probes;  // port, health route
+        {
+            // a laya backend starting holds start_mu for as long as it loads: do not wait on it
+            std::unique_lock<std::mutex> lock(start_mu, std::try_to_lock);
+            if (lock.owns_lock())
+                for (const auto& c : children) {
+                    if (!c->alive()) return fail("backend on port " + std::to_string(c->port()) + " exited");
+                    probes.emplace_back(c->port(), c->ready_path());
+                }
+        }
+        for (const auto& [port, path] : probes) {
+            httplib::Client c("127.0.0.1", port);
+            c.set_connection_timeout(1);
+            c.set_read_timeout(3);
+            auto r = c.Get(path);
+            if (!r) return fail("backend on port " + std::to_string(port) + " does not answer " + path);
+            if (r->status != 200)
+                return fail("backend on port " + std::to_string(port) + " answers " + path + " with " + std::to_string(r->status));
+        }
+        res.status = 200;
+        res.set_content(R"({"status":"ok"})", "application/json");
     };
     srv.Get("/health", health);
     srv.Get("/v1/health", health);
@@ -1390,11 +1500,9 @@ int serve_child(const Options& given) {
         if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", rag_device()}, {"role", "rerank"}});
         res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
-    std::vector<std::unique_ptr<Child>> children;
     // laya: the backends by index, started on first use (under start_mu; a start waits for
     // the backend to be ready, up to 600 s)
     std::vector<Child*> started(backends.size(), nullptr);
-    std::mutex start_mu;
     auto ensure = [&](size_t i) -> bool {
         std::lock_guard<std::mutex> lock(start_mu);
         if (started[i]) return true;
@@ -1484,7 +1592,7 @@ int serve_child(const Options& given) {
             }
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
-            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r);
+            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r, &watch);
             r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
@@ -1494,7 +1602,7 @@ int serve_child(const Options& given) {
             held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
-        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r);
+        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -1532,7 +1640,7 @@ int serve_child(const Options& given) {
             r.set_content(R"({"error":{"message":"backend did not become ready"}})", "application/json");
             return;
         }
-        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r);
+        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r, &watch);
     };
     for (const char* path : {"/v1/responses", "/tokenize", "/detokenize", "/apply-template"})
         srv.Post(path, llama ? httplib::Server::Handler(first_json) : httplib::Server::Handler(unsupported));
@@ -1624,7 +1732,80 @@ int serve_child(const Options& given) {
         for (auto& c : children) if (!c->alive()) return false;
         return true;
     };
-    while (all_alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // The progress watchdog (app/serve_watchdog.h): while requests are in flight, probe each busy
+    // backend's main loop (GET /slots answers only between llama-server's decode steps) and look
+    // for a request with no progress past its limit.
+    std::atomic<bool> watchdog_quit{false};
+    ProgressWatch::Stall stall;
+    std::thread watchdog_thread;
+    if (watch.enabled()) {
+        watchdog_thread = std::thread([&] {
+            using clock = std::chrono::steady_clock;
+            const double secs = o.watchdog.secs;
+            const auto every = std::chrono::duration<double>(std::clamp(secs / 4, 0.25, 5.0));
+            const auto timeout = std::chrono::milliseconds(int64_t(std::clamp(secs / 2, 0.5, 10.0) * 1000));
+            std::unordered_map<int, int> probe;   // port -> 1 answers /slots, -1 has none, 0 not known yet
+            std::unordered_map<int, clock::time_point> last;
+            while (!watchdog_quit && !g_stop) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                for (const int port : watch.busy_ports()) {
+                    if (probe[port] < 0 || clock::now() - last[port] < every) continue;
+                    last[port] = clock::now();
+                    httplib::Client c("127.0.0.1", port);
+                    c.set_connection_timeout(timeout);
+                    c.set_read_timeout(timeout);
+                    if (auto r = c.Get("/slots")) {
+                        if (r->status == 200) {
+                            probe[port] = 1;
+                            watch.alive(port);
+                        } else if (probe[port] == 0) {
+                            probe[port] = -1;   // DwarfStar, ONNX, MLX, or llama-server --no-slots
+                        }
+                    }
+                }
+                if (auto st = watch.stalled([&](int port) { return probe[port] >= 0; })) {
+                    std::lock_guard<std::mutex> lock(wedged_mu);
+                    stall = *st;
+                    char why[256];
+                    std::snprintf(why, sizeof why, "%s made no progress for %.0f s", st->what.c_str(), st->idle);
+                    wedged = why;
+                    return;
+                }
+            }
+        });
+    }
+    struct JoinWatchdog {
+        std::atomic<bool>& quit;
+        std::thread& t;
+        ~JoinWatchdog() { quit = true; if (t.joinable()) t.join(); }
+    } join_watchdog{watchdog_quit, watchdog_thread};
+    auto is_wedged = [&] {
+        std::lock_guard<std::mutex> lock(wedged_mu);
+        return !wedged.empty();
+    };
+    while (all_alive() && !g_stop && !is_wedged()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (is_wedged() && !g_stop) {
+        // Kill the wedged backend and exit non-zero: Lemonade's BackendWatchdog sees the process go
+        // and loads the model again. Say why, with what the box and the backend said last.
+        std::lock_guard<std::mutex> lock(start_mu);
+        Child* bad = nullptr;
+        for (auto& c : children) if (c->port() == stall.port) bad = c.get();
+        std::fprintf(stderr, "1bit serve: watchdog: %s on the %s backend (port %d, pid %d) made no progress for %.0f s "
+                             "(limit %.0f s; %llu bytes received in %.0f s); killing it and exiting so Lemonade reloads it\n",
+                     stall.what.c_str(), device.c_str(), stall.port, bad ? bad->pid() : -1, stall.idle, stall.limit,
+                     (unsigned long long) stall.bytes, stall.age);
+        if (const auto t = sysinfo::tctl_celsius()) std::fprintf(stderr, "1bit serve: watchdog: Tctl %.1f C\n", *t);
+        if (bad) {
+            const auto lines = bad->last_lines(12);
+            if (!lines.empty()) std::fprintf(stderr, "1bit serve: watchdog: the backend's last lines:\n");
+            for (const auto& l : lines) std::fprintf(stderr, "1bit serve: watchdog: | %s\n", l.c_str());
+            if (!bad->kill_now(std::chrono::seconds(10)))
+                std::fprintf(stderr, "1bit serve: watchdog: pid %d did not exit after SIGKILL (stuck in the kernel; "
+                                     "a GPU reset may be needed)\n", bad->pid());
+        }
+        for (auto& c : children) if (c.get() != bad) c->kill_now(std::chrono::seconds(5));
+        return 1;
+    }
     if (backends.size() > 1) {
         std::fprintf(stderr, "1bit serve: requests routed:");
         for (size_t i = 0; i < backends.size(); i++) std::fprintf(stderr, " %s %ld", backends[i].device.c_str(), routed[i].load());
@@ -1884,6 +2065,10 @@ void usage(FILE* out) {
                  "                  [--pm [--pm-experts FILE] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
+                 "                  [--watchdog SECS] [--watchdog-prompt-tps N]   a request with no progress from its backend\n"
+                 "                  for SECS (default 120, or $ONEBIT_WATCHDOG_SECS; 0 = off), plus prompt tokens / N\n"
+                 "                  (default 50) before its first byte, kills the backend and exits non-zero so Lemonade\n"
+                 "                  reloads it (docs/serve.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
@@ -1893,6 +2078,7 @@ void usage(FILE* out) {
 
 int run_serve(int argc, char** argv) {
     Options o;
+    if (const char* e = std::getenv("ONEBIT_WATCHDOG_SECS"); e && *e) o.watchdog.secs = std::atof(e);
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1942,11 +2128,15 @@ int run_serve(int argc, char** argv) {
         else if (a == "--no-recipes") o.no_recipes = true;
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
+        else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
+        else if (a == "--watchdog-prompt-tps") o.watchdog.prompt_tps = std::stod(next());
         else if (a == "--lemonade-url") o.lemonade_url = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
     if (o.model.empty()) { usage(stderr); return 2; }
+    if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)
+        throw std::runtime_error("--watchdog and --watchdog-prompt-tps take a number >= 0 (0 turns it off)");
     refuse_removed_device(o.device);
 
     if (is_onnx_model_dir(o.model)) {

@@ -130,3 +130,31 @@ it is invalid, and would have produced a confident wrong answer had I not checke
 counts belonged to.
 
 Recorded so the next attempt applies the capture *before* the campaign it wants to analyse.
+
+## VERIFIED LIVE: the PID-capture pipeline works on the campaign of record
+
+Checked while `315cwsr70` was on its first arm:
+
+```
+  p1c: server.pid = 564373
+  tool: 315cwsr70-p1c-GLM-4.7-Flash-Q4_K_M   pid 564373   22 evictions in window
+```
+
+So the whole chain works on real data:
+
+1. the patched driver wrote `$O/server.pid` at arm start, while the server was live;
+2. `315-evict-per-arm.py` resolved that PID to its `PROC_START` in the SMI stream;
+3. it bounded the window (this PID's start → its `PROC_END`, else the next arm's start) and counted
+   **only that PID's** `Q_EVICT` rows inside it — 22 for the arm in progress.
+
+The tool's "no in-regime arms" line at that moment was correct: the arm had not yet been scored, so
+its verdict and `gtt_start` were unknown. It is the same guard that refuses to invent a number when
+the PID is absent — as it did, correctly, on the mis-sized 48-pair run and on run 7.
+
+**This is the difference between the failed retrospective attempt and the live one.** Run 7's counts
+were unusable because a finished arm's PID is unrecoverable and its post-arm lifetime contaminates
+the total (1,461 evictions for a fault arm that outlived its arm by 40 minutes). Here the PID is
+captured while the arm runs, so the window is exact and the count is attributable.
+
+The H2 discriminating test — *do faulting arms show more evictions than clean arms in their own
+windows?* — can therefore be run on this campaign's data as soon as it has both kinds of arm.

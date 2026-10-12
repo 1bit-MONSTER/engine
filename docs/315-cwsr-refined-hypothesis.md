@@ -276,3 +276,50 @@ before the result, so it cannot be read post hoc.
 **Note the control's design is already right for this:** the H1 control is a *fresh* boot with
 `cwsr_enable=1`, i.e. ~1 h uptime, which matches the campaign's condition rather than run 7's.
 That is the correct comparison; run 7 alone is not.
+
+## Side quests while the campaign ran (2026-10-12)
+
+### The H1 control's guard is verified
+
+Dry-ran `315-cwsr-control.sh` with only the destructive step neutered (the final
+`systemctl reboot` replaced by an echo). It correctly refused:
+
+```
+=== H1 control: fresh boot with cwsr_enable=1 ===
+  current cwsr_enable : 0
+  drop-in present     : yes
+  campaign to mirror  : 315-evict-trace.sh 48
+ABORT: a 315 campaign is still running. Wait for it - this would kill its evidence.
+```
+
+So it cannot accidentally destroy a running campaign's evidence — the property that matters most
+for a script that ends in a reboot.
+
+### H2 has NO documented upstream backing (attempted to find one, and failed)
+
+Three targeted searches for a gfx1151 *mid-wave preemption* corruption beyond the VGPR-size
+defect returned **nothing relevant** — only the generic kernel-changelog noise. Specifically
+searched for:
+
+- gfx1151 mid-wave preemption compute corruption beyond the VGPR size fix;
+- gfx1151 CWSR preemption data corruption 2026 kernel fix missing;
+- amdkfd preemption wave-state corruption gfx11.
+
+The gfx1151 CWSR record that *does* exist is the size defect — which this session proved is
+**fully fixed on our box** (`315-cwsr-size-excluded-PROOF.md`). Nothing documents a second,
+execution-level defect.
+
+**That absence is evidence, and it points the same way as everything else in this session:**
+
+- the one documented gfx1151 CWSR corruption is fixed here;
+- no second one is documented anywhere;
+- every prior lever returned null;
+- the only new fact is that `cwsr_enable=0` coincided with a **fresh boot**.
+
+So H2 now rests on a mechanism with no upstream support and no direct measurement, while H1
+(fresh-boot effect) explains the signal with a single, already-quantified confound (~32.5 h
+uptime vs 692 s). The honest ranking after this pass: **H1 is the leading explanation, not H2.**
+
+I am not deleting H2 — it is the only candidate that explains the GTT dependence — but it should
+not be presented as the likely mechanism on current evidence, and the H1 control is the only
+thing that can settle it.

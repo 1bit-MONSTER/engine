@@ -382,7 +382,7 @@ cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<runtime dir with np
   out exactly that path at that commit with the release machine's `gh` credentials and prints the
   directory for `ONEBIT_NPU_RT_DIR`; it fails, and the release stops, when the commit cannot be
   fetched or the checkout is not at the pin. The release then checks that no shipped program or
-  library needs or names `libxrt` ([releases.md](releases.md)). Move the pin by hand after the NPU
+  library needs or names `libxrt` ([releases.md](releases.md), "Private components"). Move the pin by hand after the NPU
   check below.
 - A private route add-on (`ONEBIT_NPU_PRIVATE`) that links XRT itself would put XRT back into
   `1bit`; the release's XRT check catches it, and the release build does not use add-ons.

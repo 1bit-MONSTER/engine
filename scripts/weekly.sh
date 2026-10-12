@@ -28,11 +28,12 @@
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
-# Needs gh (logged in, allowed to merge on the engine), TheRock in /opt/rocm-therock, and
+# Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
+# config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
 # what the build scripts each list.
 set -euo pipefail
 
-[ $# -ge 1 ] || { sed -n '16,32p' "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
 W=$(mkdir -p "$1" && cd "$1" && pwd); shift
 STAGES=${*:-bumps build test package release}
 REPO=1bit-MONSTER/engine

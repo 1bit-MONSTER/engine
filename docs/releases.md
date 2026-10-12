@@ -47,26 +47,38 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 `/opt/rocm-therock`; the NPU needs the `amdxdna` kernel driver. The closed NPU add-ons
 ([npu.md](npu.md), "Private routes") are never in a release.
 
-### The NPU runtime and XRT
+### Private components
 
-The engine is XRT-free. `1bit`'s NPU lane runs on the 1bit NPU runtime, a proprietary component
-compiled into the release binaries, whose source is not in this repository or in any release
-([NOTICE](../NOTICE), [npu.md](npu.md), "The NPU runtime"). The build stage takes it from the
-commit pinned in `config/npu-runtime.config`: `scripts/fetch-npu-runtime.sh` checks out that path
-at that commit with the release machine's `gh` login (read access to the private repository) and
-the build passes it as `ONEBIT_NPU_RT_DIR`. The run stops if it cannot be fetched or is not at the
-pinned sha.
+Two components of the release binaries are proprietary and compiled in; their source is not in
+this repository or in any release ([NOTICE](../NOTICE)):
 
-After packing the Linux tarball, the package stage checks that the release is XRT-free: for the
-build's `1bit` and every ELF file in the tarball, no `NEEDED` `libxrt*` entry, no `libxrt` in
-`ldd`, and no `libxrt` string (`strings -a`); and no `libxrt*` file in the tarball. A failure stops
-the release (`logs/xrt-free.log`). 1bit OS carries no XRT either; its `1bit.check` boot reports
-`CHECK no XRT`.
+| Component | Compiled into | Pin | Build option |
+|---|---|---|---|
+| The 1bit NPU runtime ([npu.md](npu.md), "The NPU runtime") | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` |
+| The private HIP kernels for HRX ([hrx.md](hrx.md), "Private HIP kernels") | `hrx/llama/bin/libggml-hrx.so` (code objects) | `config/gpu-kernels.config` | `ONEBIT_GPU_PRIVATE` |
 
-To exercise only the NPU-runtime build and the packaging without releasing, on Strix Halo:
+The build stage fetches each with `scripts/fetch-private.sh <pin> <dir>`: the pinned path at the
+pinned commit only, with the release machine's `gh` login (read access to the private
+repositories). The run stops if either cannot be fetched or is not at its pinned sha. Move a pin
+by hand, after the NPU check or the HRX checks on Strix Halo.
+
+The engine is XRT-free: the NPU lane runs on the compiled-in runtime, and nothing links AMD's
+XRT. `scripts/package-linux.sh` strips every packed program and library (`strip
+--strip-unneeded`), and after packing the Linux tarball the package stage checks
+(`logs/package-checks.log`; a failure stops the release):
+
+- **XRT-free:** for the build's `1bit` and every ELF file in the tarball, no `NEEDED` `libxrt*`
+  entry, no `libxrt` in `ldd`, no `libxrt` string (`strings -a`); no `libxrt*` file packed.
+- **Kernels in:** the packed `libggml-hrx.so` exports the add-on's `ggml_hrx_hip_addon_register`.
+- **No source:** no source file (`.hip`, `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hpp`, `.inc`, `.cu`,
+  `.py`, `.cmake`) and no file named like one of the private checkouts' files.
+
+1bit OS carries no XRT either; its `1bit.check` boot reports `CHECK no XRT`.
+
+To exercise only the private builds and the packaging without releasing, on Strix Halo:
 
 ```sh
-WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-npu scripts/weekly.sh ~/.cache/1bit-weekly build package
+WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-weekly build package
 ```
 
 ## The Sunday run

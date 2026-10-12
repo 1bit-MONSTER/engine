@@ -4,16 +4,18 @@ Copyright 2026 bong-water-water-bong
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 ===============================================================================
-The NPU runtime (proprietary, compiled into the release binaries)
+Proprietary components compiled into the release binaries
 ===============================================================================
 
-The source code in this repository is licensed under Apache-2.0. The 1bit
-binaries published with the engine's releases (the Linux package and 1bit OS)
-also contain the 1bit NPU runtime, compiled in statically, which runs the NPU
-lane. The NPU runtime is a proprietary component: it is not part of this
-repository, its source is not published, and it is not licensed under
-Apache-2.0. Copyright 2026 bong-water-water-bong. All rights reserved.
-Building this repository without it gives a 1bit with no NPU lane.
+The source code in this repository is licensed under Apache-2.0. The binaries
+published with the engine's releases (the Linux package and 1bit OS) also
+contain two proprietary components, compiled in: the 1bit NPU runtime (in
+1bit) and the 1bit HIP kernels for HRX (code objects in the HRX llama.cpp
+library). They are not part of this repository, their source is not
+published, and they are not licensed under Apache-2.0.
+Copyright 2026 bong-water-water-bong. All rights reserved.
+A build of this repository without them has no NPU lane and runs HRX on the
+public kernels only.
 
 ===============================================================================
 Third-party components
@@ -73,7 +75,7 @@ Xilinx Runtime, XRT (https://github.com/Xilinx/XRT)
   Copyright (C) 2016-2022 Xilinx, Inc.
   Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
   License: Apache-2.0 (userspace). No longer built, linked or shipped: the NPU
-  lane runs on the 1bit NPU runtime above, whose classes keep XRT's API names
+  lane runs on the 1bit NPU runtime (see above), whose classes keep XRT's API names
   (xrt::device, xrt::bo, ...) so the engine's NPU sources read the same.
 
 MLIR-AIE, IRON and aiecc (third_party/mlir-aie)

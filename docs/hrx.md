@@ -583,7 +583,10 @@ Our own HIP kernels for HRX are closed source, like the NPU kernels: they live i
 public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>`
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
-that hook. Without the option the build is unchanged. To drop the add-on from an existing
+that hook. Without the option the build is unchanged. The release builds with it, from the
+commit pinned in `config/gpu-kernels.config`, so the release binaries carry the kernels as
+compiled code objects while their source stays private ([releases.md](releases.md), "Private
+components"). To drop the add-on from an existing
 build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).
 
 ## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)

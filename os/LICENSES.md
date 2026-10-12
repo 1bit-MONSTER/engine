@@ -82,6 +82,7 @@ says `Ship: yes`.
 |---|---|---|---|
 | 1bit engine (`1bit`, its HRX llama-server) | this repository | Apache-2.0; third-party parts in [NOTICE](../NOTICE) | https://github.com/1bit-MONSTER/engine |
 | 1bit NPU runtime (compiled into `1bit`) | `config/npu-runtime.config` pin | proprietary, Copyright 2026 bong-water-water-bong; see [NOTICE](../NOTICE) | not published |
+| 1bit HIP kernels for HRX (code objects in the HRX llama.cpp) | `config/gpu-kernels.config` pin | proprietary, Copyright 2026 bong-water-water-bong; see [NOTICE](../NOTICE) | not published |
 | Lemonade (lemond, the lemonade CLI, the web app) | third_party/lemonade pin | Apache-2.0, Advanced Micro Devices, Inc.; web app bundle licenses in `renderer.bundle.js.LICENSE.txt` | https://github.com/1bit-MONSTER/lemonade |
 | ROCr HSA runtime (TheRock, for HRX) | the build's ONEBIT_HRX_LIBHSA | University of Illinois/NCSA | https://github.com/ROCm/ROCR-Runtime, https://github.com/ROCm/TheRock |
 

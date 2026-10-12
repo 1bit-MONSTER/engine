@@ -85,10 +85,11 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 
 The source code in this repository is Apache-2.0. See [LICENSE](LICENSE).
 
-The release binaries (the Linux package and 1bit OS) also contain the 1bit NPU runtime, compiled
-in, which runs the NPU lane. It is a proprietary component: not in this repository, its source not
-published, not under Apache-2.0. A build from this repository without it has no NPU lane
-([NOTICE](NOTICE), [docs/npu.md](docs/npu.md#the-npu-runtime)).
+The release binaries (the Linux package and 1bit OS) also contain two proprietary components,
+compiled in: the 1bit NPU runtime and the 1bit HIP kernels for HRX. They are not in this
+repository, their source is not published, and they are not under Apache-2.0. A build from this
+repository without them has no NPU lane and runs HRX on the public kernels only
+([NOTICE](NOTICE), [docs/releases.md](docs/releases.md#private-components)).
 
 ## Thank you
 

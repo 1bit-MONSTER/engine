@@ -270,3 +270,51 @@ plainly: an arm that holds the box-wide lock **while waiting for a thermal preco
 can block the box indefinitely when the precondition sits on the wrong side of its
 oscillation. The safe order is to wait for thermal conditions *before* taking the lock (or to
 bound the wait and release).
+
+## Root blocker identified: a peer batch holds `npu.lock` while its jobs fail
+
+Traced the queue depth on 2026-10-12 13:24. `~/npu.lock` had 14 holders, but only one
+matters, because `flock` is first-come: **pid 99828**, `flock ~/npu.lock ./batch2.sh`,
+started 11:39:11 — **held 1 h 44 m**. Every other holder is queued behind it, including:
+
+| holder | waiting | what |
+|---|---|---|
+| 948331 + 948371 | — | **run 5** (this task), correctly blocked |
+| 847551 + 867745 | 16 m 32 s | camp5's `fx-c5-lockall-r1` arm, whose `flock 7` has not yet acquired |
+| 816800 / 826913 / 826914 | — | **two other goals' workers** (`npu-forge2-kvsplit` bisect, `probe_model.sh`) |
+| 816808 / 826939 / 826940 | — | their `flock -w 7200 9` children |
+
+**The lock owner is not healthy.** `batch2.log` stopped growing (7185 bytes, unchanged over
+40 s) and its current job is failing outright:
+
+```
+0.00.126.893 E llama_model_load: error loading model: unknown model architecture: 'zamba2'
+0.00.126.905 E llama_model_load_from_file_impl: failed to load model
+0.00.127.071 E common_fit_params: ... failed to load
+client_rc=1
+urllib.error.URLError: <urlopen error [Errno 111] Connection refused>
+```
+
+18 × "failed to load model" and 5 × fit-params errors in that batch. And its current job is
+**CPU-only** (`-dev none -ngl 0 -t 4 --no-mmproj-offload`), i.e. it is holding the GPU-wide
+lock while running something that does not use the GPU, against a model its binary does not
+support.
+
+**Not touched.** That is a peer's process. The goal's constraints say do not disturb other
+workloads, and killing another agent's batch to win the box is not mine to decide. Recorded
+here precisely so the decision is visible to whoever owns it.
+
+**Consequence for task-8:** the trace cannot start while this holds the lock. Run 5 will time
+out on `NPU_LOCK_WAIT` (900 s) and abort having started nothing — which is the correct
+behaviour, and better than the pre-fix version that would have run unprotected.
+
+## Where this leaves task-8
+
+- harness: hardened against seven silent-failure modes, verified
+- evidence in hand: **run 1** — 1 in-regime arm, 0 faults, under 15,457 evictions (15,353 unrestored). A **null**
+- fresh run: blocked on `~/npu.lock`, held by a peer batch whose jobs are failing, with two
+  other goals' workers also queued
+
+The task-8 contract permits closing on the null, recorded as uninformative with its
+clean-arm count. The reason is box contention — externally caused and now documented — not a
+design choice and not a harness defect.

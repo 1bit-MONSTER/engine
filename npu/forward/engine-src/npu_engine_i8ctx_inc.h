@@ -40,7 +40,7 @@ struct I8Ctx {
     // hw_context is created from the ELF, and kext is the resulting
     // xrt::ext::kernel whose signature is (A, B, C). Requires the design's
     // runtime sequence to load the ELF's PDI (aiex.npu.load_pdi; see
-    // generators/build_zaya_m8.sh), otherwise XRT never configures the array.
+    // generators/build_zaya_m8.sh), otherwise the runtime never configures the array.
     std::unique_ptr<xrt::elf> elf;
     std::unique_ptr<xrt::ext::kernel> kext;
     std::unique_ptr<xrt::bo> bA, bC;

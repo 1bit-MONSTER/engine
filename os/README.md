@@ -162,7 +162,7 @@ Lemonade's `"host": "0.0.0.0"` and a `LEMONADE_API_KEY` on the stick. It checks 
 that Lemonade's web app loads, that Lemonade refuses a request without the key, that
 `/api/v1/models` lists the stick's model, and that Lemonade answers a chat request with it. The VM
 has no Radeon GPU or NPU: Lemonade serves that chat with its own `llamacpp` backend on the CPU, and
-hides the `onebit` entry (its backends need gfx1151, the NPU or CUDA), so the test checks only that
+hides the `onebit` entry (its backends need gfx1151 or the NPU), so the test checks only that
 the entry is in Lemonade's registry on the stick. On a machine without TheRock or XRT,
 `LLAMA_SERVER=<a CPU llama-server> NO_XRT=1` makes a CPU-only test image.
 

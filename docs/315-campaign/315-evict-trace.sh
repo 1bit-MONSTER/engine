@@ -12,8 +12,16 @@ set -uo pipefail
 
 PAIRS=${1:-4}
 TAG=${2:-315evict}
-FIX=${3:-$HOME/wt/315fix-build/bin}
-CTRL=${4:-$HOME/wt/315instr3-build/bin}
+FIX=${3:-$HOME/wt/315fix-build}
+CTRL=${4:-$HOME/wt/315instr3-build}
+
+# 315-campaign.sh takes the BUILD DIR and appends /bin itself. Accept either form so a
+# caller passing .../bin cannot silently double it (the first launch of this wrapper died
+# with 'no .../315fix-build/bin/bin/llama-server' for exactly that reason).
+strip_bin() { local d=${1%/}; [ "$(basename "$d")" = "bin" ] && dirname "$d" || echo "$d"; }
+FIX=$(strip_bin "$FIX")
+CTRL=$(strip_bin "$CTRL")
+
 WATCH=$HOME/amd-oss/tools/315-trace/kfd_smi_watch
 OUT=$HOME/wt/$TAG-evict
 CONSOLE=$HOME/wt/$TAG-console.log
@@ -28,15 +36,15 @@ HSA=${IREE_HAL_AMDGPU_LIBHSA_PATH:-/opt/rocm-therock/lib/python3.14/site-package
 export IREE_HAL_AMDGPU_LIBHSA_PATH="$HSA"
 
 need() { [ -e "$1" ] || { echo "ABORT: missing $1"; exit 2; }; }
-need "$WATCH"; need "$FIX/llama-server"; need "$CTRL/llama-server"; need "$HSA"
+need "$WATCH"; need "$FIX/bin/llama-server"; need "$CTRL/bin/llama-server"; need "$HSA"
 sudo -n true 2>/dev/null || { echo "ABORT: the watcher needs passwordless sudo; sudo -n failed"; exit 2; }
 mkdir -p "$OUT"
 
 echo "=== task-8 eviction/preemption trace ==="
 echo "tag      : $TAG"
 echo "pairs    : $PAIRS  (arms alternate control/fix inside one composition)"
-echo "fix bin  : $($FIX/llama-server --version 2>&1 | head -1)"
-echo "ctrl bin : $($CTRL/llama-server --version 2>&1 | head -1)"
+echo "fix  bin  : $($FIX/bin/llama-server --version 2>&1 | head -1)   ($FIX)"
+echo "ctrl bin  : $($CTRL/bin/llama-server --version 2>&1 | head -1)   ($CTRL)"
 echo "watcher  : $WATCH (as root)"
 echo "hsa      : $HSA"
 echo

@@ -323,3 +323,36 @@ uptime vs 692 s). The honest ranking after this pass: **H1 is the leading explan
 I am not deleting H2 — it is the only candidate that explains the GTT dependence — but it should
 not be presented as the likely mechanism on current evidence, and the H1 control is the only
 thing that can settle it.
+
+### Can H1 be tested retroactively? Attempted — no, and here is why that matters
+
+I tried to settle H1 from existing data instead of a fresh-boot control: each KFD SMI stream
+records `boot_ns` (CLOCK_BOOTTIME at the event), so in principle a session's boot wall-clock is
+recoverable as `stream_start_wall − first_boot_ns`, and every arm's uptime follows from its
+directory mtime.
+
+**The method works only when the stream's START wall time is known.** For a completed stream its
+file mtime is the *last* write, not the first, so `mtime − first_boot_ns` is wrong by the whole
+stream duration. Using the campaign's own start timestamp instead recovers the true boot
+(the `cwsr60` stream's 52.5 min offset against a 16:08:06 campaign start gives 15:15:40, which is
+exactly the boot I measured) — but that requires a per-run start timestamp.
+
+Streams available and what they cover:
+
+| stream | session | usable |
+|---|---|---|
+| `315evict` | 10-11, boot ~05:33 | yes, but it is run 1 (the truncated 2-arm run) |
+| `315evict2` | 10-11 05:44 | yes — run 1's continuation |
+| `315evict6` | 10-12 14:04 | only 2 arms (self-deadlocked) |
+| `315evict7` | 10-12, boot 10-11 05:33 (~32.5 h uptime) | yes — the faulting baseline |
+| `315cwsr0`, `315cwsr60` | 10-12, boot 15:15:40 | yes — the treatment |
+
+**The decisive problem: the historical faulting arms predate the tracer.** The 34 in-regime
+faulting arms of 131 accumulated across 10-09…10-11 — the multi-session baseline H1 would need to
+be tested against — were run before any SMI stream existed, and no boot times survive for those
+sessions (no `wtmp`/`last reboot` on this box). So there is no retroactive H1 test.
+
+**Consequence, stated plainly:** H1 can only be settled by a *new* fresh-boot run at
+`cwsr_enable=1`, on the same harness, on the same day — i.e. exactly the control that is scripted
+and waiting. This is now not merely "the honest thing to do" but the *only* remaining route,
+because the alternative data does not exist.

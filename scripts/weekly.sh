@@ -99,18 +99,21 @@ pin() { git -C "$SRC" ls-tree HEAD "third_party/$1" | awk '{print $3}'; }
 
 # --- build / test -------------------------------------------------------------------------
 build() {
-    # the NPU runtime compiled into 1bit: the private checkout pinned in config/npu-runtime.config
-    # (stops here when it cannot be fetched at that commit)
+    # the private components compiled in (docs/releases.md, "Private components"): the NPU runtime
+    # (into 1bit) and the HIP kernels (into the HRX llama.cpp), each a checkout at the commit its
+    # config/*.config pins; the build stops here when one cannot be fetched at that commit
     local npurt
-    npurt=$("$SRC/scripts/fetch-npu-runtime.sh" "$W/npu-runtime" 2> "$LOGS/npu-runtime.log") ||
-        { cat "$LOGS/npu-runtime.log"; return 1; }
-    say "engine $(git -C "$SRC" rev-parse --short HEAD), NPU runtime $(git -C "$W/npu-runtime" rev-parse --short HEAD)"
+    npurt=$("$SRC/scripts/fetch-private.sh" "$SRC/config/npu-runtime.config" "$W/npu-runtime" 2> "$LOGS/private.log") ||
+        { cat "$LOGS/private.log"; return 1; }
+    "$SRC/scripts/fetch-private.sh" "$SRC/config/gpu-kernels.config" "$W/gpu-kernels" > /dev/null 2>> "$LOGS/private.log" ||
+        { cat "$LOGS/private.log"; return 1; }
+    say "engine $(git -C "$SRC" rev-parse --short HEAD), NPU runtime $(git -C "$W/npu-runtime" rev-parse --short HEAD), HIP kernels $(git -C "$W/gpu-kernels" rev-parse --short HEAD)"
     local extra=()
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DONEBIT_HRX=ON -DONEBIT_ONNX=ON \
+        -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
         -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1

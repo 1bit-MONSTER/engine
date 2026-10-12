@@ -48,8 +48,11 @@ Everything that has to last lives on the stick's `1BIT-DATA` partition:
 On a machine that has built the engine with the NPU lane and HRX (TheRock in `/opt/rocm-therock`):
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=ON -DONEBIT_HRX=ON \
-      -DONEBIT_NPU_RT_DIR=$(scripts/fetch-npu-runtime.sh ~/.cache/npu-runtime)   # the private NPU runtime
+# the private components the release compiles in (docs/releases.md, "Private components")
+npurt=$(scripts/fetch-private.sh config/npu-runtime.config ~/.cache/npu-runtime)
+scripts/fetch-private.sh config/gpu-kernels.config ~/.cache/gpu-kernels
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR="$npurt" \
+      -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$HOME/.cache/gpu-kernels"
 cmake --build build
 os/mini/mkimage.sh out build
 ```

@@ -368,7 +368,7 @@ option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU
 # XRT-compatible runtime that is not part of this repository. ONEBIT_NPU_RT_DIR holds its npu_rt.h
 # and npu_rt.cpp, built here into the static library onebit_npu_rt and linked into 1bit. AMD's XRT
 # is not supported: the engine links no XRT library. The release build takes the runtime from the
-# pinned private checkout in config/npu-runtime.config (scripts/fetch-npu-runtime.sh).
+# pinned private checkout in config/npu-runtime.config (scripts/fetch-private.sh).
 set(ONEBIT_NPU_RUNTIME "own" CACHE STRING "NPU runtime: own (the only value)")
 set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS own)
 set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with the NPU runtime's npu_rt.h and npu_rt.cpp (private)")

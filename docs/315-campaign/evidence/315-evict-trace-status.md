@@ -346,3 +346,69 @@ substance but understated the first two: they were plain contention (`repro336` 
 103–111 GiB). **Today's is a wedged lock owner**, which is a different and worse problem —
 contention eventually clears, a stalled batch does not. Recorded so the decision is not made
 against the weaker description.
+
+## CORRECTION + the real blocker: `~/npu.lock` is wedged by a dead holder
+
+### What I got wrong
+
+I previously recorded the blocker as "a wedged peer batch (pid 99828/99830) holds
+`npu.lock` while its jobs fail". **That was wrong.** `ps` shows `flock` for both holders and
+waiters, and I read elapsed time as evidence of holding. The kernel's own lock table says
+otherwise.
+
+### What the kernel actually says
+
+`/proc/locks` for the inode behind `~/npu.lock` (`103:02:80249278`) — unindented line is the
+**granted** lock, `->` lines are **waiters**:
+
+```
+10: FLOCK ADVISORY WRITE 826940  103:02:80249278 0 EOF      <- HOLDER
+10: -> FLOCK ADVISORY WRITE 867745 103:02:80249278 0 EOF    <- waiting
+10:  -> FLOCK ADVISORY WRITE 99830  103:02:80249278 0 EOF   <- waiting
+10:   -> FLOCK ADVISORY WRITE 1155054 103:02:80249278 0 EOF <- waiting
+```
+
+**The holder `826940` no longer exists.** `/proc/826940` is gone, its whole group
+(826913/826939/826940, `probe_model.sh`) has exited, yet the kernel still grants it the
+lock. The three waiters are alive and parked in `locks_lock_inode_wait`:
+
+| pid | state | wchan |
+|---|---|---|
+| 867745 | S | `locks_lock_inode_wait` |
+| 99830 | Ss | `locks_lock_inode_wait` |
+| 1155054 | S | `locks_lock_inode_wait` |
+
+### It is reproducible, not a transient read
+
+```
+t=10s  HELD
+t=20s  HELD
+t=30s  HELD
+box.lock: FREE      <- same filesystem, same mechanism: flock itself is fine
+```
+
+`flock -n` against `~/npu.lock` fails on every attempt while `box.lock` acquires immediately.
+So this is specific to that lock file, and it is **stuck**, not busy.
+
+### Why this matters beyond my task
+
+`~/npu.lock` is the **box-wide mutex for GPU work** (§6g). Every GPU harness on this box
+queues on it — mine, the peer batch, and two other goals' workers. With a dead holder, **all
+of them are blocked permanently**, and no amount of retrying or waiting helps. This is not
+contention that clears; it is a wedged mutex.
+
+**Possible cause, stated as a hypothesis not a finding:** the holder was a `flock` in a
+`systemd-run --scope` unit. If the scope was torn down while its flock was granted, the
+granted entry can outlive the process in `/proc/locks`. That would make
+`flock ~/npu.lock ...` inside a transient scope an unsafe pattern on this box — an advisory
+lock whose holder can be reaped out from under it.
+
+### What this means for task-8
+
+The blocker is **not** a peer batch I should leave alone; it is a **stuck kernel lock
+holding back every GPU consumer on the box**, including two other goals. Retrying (option c)
+cannot work. Waiting (which I have done for three turns) cannot work.
+
+I have not cleared it: `flock` offers no break mechanism from userspace, and the only ways
+that occur to me are destructive (reboot, or `fuser -k` on the lock, which would kill three
+innocent waiters' work). That is the user's call, not mine.

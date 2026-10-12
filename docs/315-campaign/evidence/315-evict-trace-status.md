@@ -534,3 +534,29 @@ suggested with 15,357 evictions and zero faults.
 
 **Must not be written up as:** "the evictions caused it", or as a mechanism. The mechanism is
 still unnamed; this is the correlation evidence, which is the input to naming one.
+
+## The comparison I cannot make retrospectively — and why
+
+The obvious next step is to compare eviction counts between the **faulting** arm and the
+**clean** arms, all at `gtt_start=97G`. I can produce the faulting arm's count and **not**
+the clean arms', and the reason is a known limit of this instrument:
+
+| arm | port known | PID known | own evictions |
+|---|---|---|---|
+| `p3l` (FAULT) | 19508 | **111371** — captured **while live** | 323 Q_EVICT / 357 Q_RESTORE |
+| `p1c`, `p1l`, `p2l` (OK) | 19498 / 19636 / 19461 | **not recoverable** | — |
+
+The SMI stream's `PROC_START` rows carry no port (`raw=<ctx> llama-server`), so once an arm's
+server exits there is no exact way to bind it to a PID after the fact. `tools/arm-pid.py`
+deliberately **refuses** rather than guessing in that case, because `correlate.py`'s own
+fallback ("most frequent eviction subject") was observed landing on a dead PID.
+
+**Consequence:** this run gives the faulting arm's correlation but **not** the faulting-vs-clean
+eviction comparison. That comparison is what would turn correlation into a start on causation.
+It needs the PIDs captured **live** for every arm — a one-line change to record the PID into
+each arm directory at start, which the frozen driver does not do and I have not edited
+(editing it mid-run would invalidate the run).
+
+**Recorded as the concrete next step, not as done.** Until it exists, the honest statement
+remains: the faulting arm was evicted heavily, the clean arms were in the same regime and were
+presumably also evicted, and nothing here separates them.

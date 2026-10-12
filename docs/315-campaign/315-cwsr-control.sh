@@ -39,6 +39,11 @@ if [ -e "$HOME/wt/315-paired-pidcap.sh" ]; then
   cp "$HOME/wt/315-paired-pidcap.sh" "$HOME/wt/315-paired.sh"
   echo "installed the PID-capturing driver (original kept at 315-paired.sh.orig)"
   bash -n "$HOME/wt/315-paired.sh" || { echo "ABORT: patched driver has a syntax error"; exit 3; }
+  # Verify the capture is actually present rather than trusting the copy: a run without it
+  # silently produces data that cannot support the H2 comparison.
+  grep -q "server.pid" "$HOME/wt/315-paired.sh" \
+    || { echo "ABORT: installed driver does not write server.pid - H2 data would be lost"; exit 3; }
+  echo "  verified: driver writes server.pid (H2 data will be capturable)"
 else
   echo "NOTE: 315-paired-pidcap.sh not present; running WITHOUT per-arm PID capture."
   echo "      The run is still valid, but its data cannot support the H2 comparison."
@@ -47,7 +52,7 @@ fi
 echo "=== H1 control: fresh boot with cwsr_enable=1 ==="
 echo "  current cwsr_enable : $(cat /sys/module/amdgpu/parameters/cwsr_enable)"
 echo "  drop-in present     : $([ -e "$DROPIN" ] && echo yes || echo no)"
-echo "  campaign to mirror  : 315-evict-trace.sh $PAIRS (the cwsr=0 run used 48)"
+echo "  campaign to mirror  : 315-evict-trace.sh $PAIRS (the cwsr=0 campaign of record used 70)"
 echo
 
 if [ -n "$(pgrep -f '315-evict-trace' || true)" ]; then

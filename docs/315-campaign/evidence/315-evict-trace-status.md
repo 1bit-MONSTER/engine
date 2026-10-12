@@ -697,3 +697,45 @@ have produced a technically-clean but invalid result. Nine clean in-regime arms 
 **Still not a result.** Nine arms gives a rule-of-three upper bound of 33%, which does not
 exclude the 26–27% baseline, and the H1 confound (fresh boot) is unaddressed. Recorded as a
 quality assurance datum, not evidence about the mechanism.
+
+## The H1 control script: hardened and dry-run verified safe (2026-10-12)
+
+Sizing changed from 48 to **20 pairs**: at the ~26% baseline that gives ~5.2 expected faults and
+`P(0) = 0.74^20 = 0.002`, so a clean control is real evidence and a ~26% control kills H1. 48 pairs
+would cost ~3 extra hours for no added power on that question, and the box-time budget is the binding
+constraint.
+
+**One real hazard removed.** The script copies the PID-capturing driver into place and previously
+trusted the copy. A run without the capture silently produces data that *cannot* support the H2
+comparison — and the failure is invisible until the analysis, after the GPU hours are spent. It now
+verifies the installed driver actually writes `server.pid` and aborts if not:
+
+```
+  installed the PID-capturing driver (original kept at 315-paired.sh.orig)
+  verified: driver writes server.pid (H2 data will be capturable)
+```
+
+**Dry-run, with `sudo` and `pgrep` neutered so no reboot and no drop-in removal could occur:**
+
+```
+  current cwsr_enable : 0
+  drop-in present     : yes
+  campaign to mirror  : 315-evict-trace.sh 20 (the cwsr=0 campaign of record used 70)
+  ABORT: an HRX job is running (not ours). Do not disturb it.
+```
+
+Checked immediately after:
+
+```
+  drop-in: PRESENT      cwsr_enable: 0      campaign alive: 2      uptime: up 2 hours, 5 minutes
+```
+
+So the destructive steps were not reached and the running campaign was not disturbed. The abort came
+from the script's **second** guard, the HRX check — it fires because the campaign's own arm server
+holds the GPU, and it cannot distinguish our server from a peer's. That is the correct conservative
+behaviour on a shared box: it refuses to reboot while anything holds the GPU, at the cost of a
+slightly misleading "not ours" message. Worth knowing when the control is run for real: it will abort
+if any foreign HRX job is up, so run it when the box is genuinely quiet.
+
+`bash -n` clean, and the two abort guards (`pgrep 315-evict-trace`, foreign HRX job) both fire before
+any `sudo`, which is the ordering that makes the script safe to invoke by mistake.

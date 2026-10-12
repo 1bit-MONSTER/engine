@@ -249,3 +249,30 @@ preemption is the difference. If it does not, H1 is confirmed.
 counts between faulting and clean arms (the `server.pid` capture in `315-pid-capture.md`
 exists for exactly this and is still unapplied). If faulting arms show preemptions and clean
 arms at the same GTT do not, H2 gains direct support.
+
+## H1 quantified: the two compared runs differ by ~32 hours of uptime
+
+Measured 2026-10-12:
+
+| | uptime when the arms ran | faults |
+|---|---|---|
+| run 7 (`cwsr_enable=1`) | **~32.5 h** — box booted 2026-10-11 05:33 | 3 / 11 |
+| campaign `315cwsr60` (`cwsr_enable=0`) | started **692 s (~11.5 min)** after the 15:15:40 boot | 0 / 2 so far |
+
+So the two arms of the comparison are not just "CWSR on vs off" — they are also "32-hour-old
+box vs 11-minute-old box". H1 is not hypothetical; it is quantified, and the gap is large.
+
+**This gives the running campaign a testable prediction.** It runs ~6 h, so it ends at roughly
+**7 h post-boot**:
+
+- if the fault rate rises with uptime, the campaign should show faults **late**, not uniformly
+  — and that would support H1 over H2;
+- if it stays at 0 across all ~66 arms spanning 11 min → 7 h of uptime, that argues the rate
+  does not depend on uptime over that window, which **weakens H1** and leaves H2 standing.
+
+Either outcome is informative, and neither was designed in — I am recording the prediction now,
+before the result, so it cannot be read post hoc.
+
+**Note the control's design is already right for this:** the H1 control is a *fresh* boot with
+`cwsr_enable=1`, i.e. ~1 h uptime, which matches the campaign's condition rather than run 7's.
+That is the correct comparison; run 7 alone is not.

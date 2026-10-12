@@ -209,3 +209,51 @@ with 4 HRX neighbours and 560+ evictions captured.
 **Pattern worth generalising:** when a wrapper takes a lock that its child also takes, the
 child needs to be told the lock is already held. Silently double-locking looks like progress
 up to the exact point where it stops.
+
+## §6i — the console line cannot certify zero faults on its own (fixed in the analysis tool)
+
+Criterion 3 asks for "zero faults across **both faces**". Both faces is the problem: the driver's
+per-arm console line carries `nan= req= ret3= parse= gtt_start= utf8= alloc= hv52= hv56=` — and
+Face B does not only arrive as a `parse=`/`utf8=` count. It also arrives as an **HTTP 500**, and
+there is **no `http=` field in the console line at all**.
+
+Confirmed against a real arm's detector:
+
+```
+315evict7-p1c-.../detector.json:
+  requests 66  ok 66  utf8_failures 0  parse_failures 0  http_failures 0  transport_failures 0
+                             ^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^   ^^^^^^^^^^^^^^^^^^  ^^^^^^^^^^^^^^^^^^^^^
+                             these two are in the console line;  these two are NOT
+```
+
+So a Face-B fault surfacing as HTTP 500 leaves **no trace in the console**, and a console-only count
+would report that arm **clean**. That is a false negative on the single criterion the campaign
+exists to certify — the worst possible failure mode here, because it silently manufactures the
+desired result.
+
+**Fix, in the analysis tool only.** `tools/315-rate.py` now reads every arm's `detector.json` when
+pointed at the arm root (`--det`, `--tag`) and treats the **detector as authoritative for faults**:
+
+* an arm the console calls clean but the detector calls failed is counted as a **fault** and flagged
+  `MISSED BY CONSOLE`, naming which counter caught it (`http=`, `transport=`, `parse=`, `utf8=`);
+* an arm with **no usable `detector.json`** is reported **UNVERIFIED** — clean from the console
+  alone, *not* certified. It is never silently counted as clean;
+* with `--det` disabled the tool prints an explicit WARNING that an HTTP-500 Face-B fault would be
+  counted CLEAN. The dangerous reading is stated, not implied.
+
+The driver stays frozen, as required mid-campaign: this reads artefacts the driver already writes.
+
+**Proven on a fixture where it changes the answer** (3 arms, console says OK for all three):
+
+| arm | detector | console | tool |
+|---|---|---|---|
+| `TT-p1c` | `http_failures=1` | `OK` | **FAULT** — "MISSED BY CONSOLE … http=1" |
+| `TT-p2l` | all zero | `OK` | clean |
+| `TT-p3l` | **absent** | `OK` | **UNVERIFIED** — not certified |
+
+Result: `1/2 = 50.00%`, acceptance FAILS. Without the reconciliation the same fixture reports
+`0/3 = 0.00%` and the arm with a real HTTP-500 fault is counted **clean** — i.e. the tool would have
+manufactured a passing campaign.
+
+Re-checked against run 7 (which really faulted): still `3/11 = 27.27%`, 11 detectors read, no missed
+arms. So the change is a guard, not a revision of the known result.

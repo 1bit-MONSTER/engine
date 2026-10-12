@@ -16,16 +16,64 @@ Counting rules, taken from the frozen pre-registration:
   * BOTH faces count as faults: Face A = nan>0, Face B = parse>0 or utf8>0
   * an arm that faults on either face is a fault; an arm with neither and verdict OK is clean
   * OOR and INVALID are neither clean nor faulted and are excluded from the rate
+
+The console line is NOT sufficient on its own to certify zero faults: it carries nan=, req=,
+parse= and utf8= but NOT the detector's http_failures or transport_failures. A Face-B fault that
+surfaces as HTTP 500 therefore leaves no trace in the console and a console-only count would report
+a FALSE clean arm on the very criterion it must certify. So when --det points at the arm root, every
+arm's detector.json is read and the detector is treated as authoritative for faults: any arm the
+console calls clean but the detector calls failed is counted as a fault and named "MISSED". An arm
+with no detector.json is reported as unverifiable rather than assumed clean.
 """
 import argparse
+import json
+import os
 import re
 import sys
 from math import comb
 
 LINE = re.compile(
-    r"arm\s+([cl]):\s+(OK|FAULT|OOR|INVALID)\s+nan=(\d+)\s+req=(\d+)\s+"
+    r"(?:pair\s+(\d+)\s+)?arm\s+([cl]):\s+(OK|FAULT|OOR|INVALID)\s+nan=(\d+)\s+req=(\d+)\s+"
     r"ret3=\d+\s+parse=(\d+)\s+gtt_start=(\d+)G(?:\s+utf8=(\d+))?"
 )
+
+ARM = re.compile(r"-p(\d+)([cl])-")
+
+# detector fields that mean a failure; http_failures/transport_failures are the ones the
+# console cannot see at all.
+DET_FIELDS = (("parse_failures", "parse"), ("utf8_failures", "utf8"),
+              ("http_failures", "http"), ("transport_failures", "transport"))
+
+
+def detector_verdicts(arm_root, tag):
+    """{(pair, cell): {parse,utf8,http,transport,failed,error}} for every arm dir present.
+
+    Enumerates the whole arm root rather than sampling: a missed arm here is a missed fault.
+    """
+    out = {}
+    if not arm_root or not os.path.isdir(arm_root):
+        return out
+    for name in sorted(os.listdir(arm_root)):
+        if tag and not name.startswith(tag):
+            continue
+        m = ARM.search(name)
+        if not m:
+            continue
+        key = (int(m.group(1)), m.group(2))
+        path = os.path.join(arm_root, name, "detector.json")
+        if not os.path.exists(path):
+            out[key] = dict(error="no detector.json", failed=None)
+            continue
+        try:
+            d = json.load(open(path))
+        except Exception as e:
+            out[key] = dict(error=f"unreadable: {e}", failed=None)
+            continue
+        rec = {short: int(d.get(field) or 0) for field, short in DET_FIELDS}
+        rec["failed"] = any(rec[s] > 0 for _, s in DET_FIELDS) or d.get("first_failure") is not None
+        rec["error"] = None
+        out[key] = rec
+    return out
 
 
 def parse(path, gate):
@@ -34,9 +82,10 @@ def parse(path, gate):
         m = LINE.search(line)
         if not m:
             continue
-        cell, verdict, nan, req, parse, gtt, utf8 = m.groups()
-        rows.append(dict(cell=cell, verdict=verdict, nan=int(nan), req=int(req),
-                         parse=int(parse), gtt=int(gtt), utf8=int(utf8 or 0)))
+        pair, cell, verdict, nan, req, parse, gtt, utf8 = m.groups()
+        rows.append(dict(pair=int(pair) if pair else None, cell=cell, verdict=verdict,
+                         nan=int(nan), req=int(req), parse=int(parse), gtt=int(gtt),
+                         utf8=int(utf8 or 0)))
     in_reg = [r for r in rows if r["gtt"] >= gate]
     oor = [r for r in rows if r["gtt"] < gate]
     def is_fault(r):
@@ -45,6 +94,30 @@ def parse(path, gate):
     fault = [r for r in in_reg if is_fault(r) or r["verdict"] == "FAULT"]
     invalid = [r for r in in_reg if r["verdict"] == "INVALID" and not is_fault(r)]
     return rows, in_reg, oor, clean, fault, invalid
+
+
+def reconcile(clean, fault, dets, tag):
+    """Move arms the detector failed but the console passed from clean to fault.
+
+    Returns (clean, fault, missed, unverified). The detector is authoritative: its http and
+    transport failure counters exist only in detector.json, so the console is blind to them.
+    """
+    if not dets:
+        return clean, fault, [], []
+    missed, unverified, keep = [], [], []
+    by_key = {(r["pair"], r["cell"]): r for r in clean}
+    for key, r in by_key.items():
+        d = dets.get(key)
+        if d is None:
+            unverified.append(r)
+        elif d.get("failed") is True:
+            missed.append((r, d))
+        elif d.get("failed") is None:
+            unverified.append(r)
+        else:
+            keep.append(r)
+    keep = [r for r in clean if (r["pair"], r["cell"]) not in by_key or dets.get((r["pair"], r["cell"]), {}).get("failed") is False]
+    return keep, fault + [r for r, _ in missed], missed, unverified
 
 
 def cp_upper(k, n, alpha=0.05):
@@ -68,8 +141,16 @@ def main():
     ap = argparse.ArgumentParser()
     ap.add_argument("console")
     ap.add_argument("--gate", type=int, default=95)
+    ap.add_argument("--det", default=os.path.expanduser("~/wt/rt-det"),
+                    help="arm root; each arm's detector.json is read and the detector is "
+                         "treated as authoritative for faults. Pass '' to disable.")
+    ap.add_argument("--tag", default="",
+                    help="only reconcile arms whose directory name starts with this")
     a = ap.parse_args()
     rows, in_reg, oor, clean, fault, invalid = parse(a.console, a.gate)
+
+    dets = detector_verdicts(a.det, a.tag) if a.det else {}
+    clean, fault, missed, unverified = reconcile(clean, fault, dets, a.tag)
 
     print(f"console : {a.console}")
     print(f"gate    : gtt_start >= {a.gate} GiB   (the frozen pre-registration's gate)")
@@ -80,6 +161,23 @@ def main():
     print(f"  clean                {len(clean)}")
     print(f"  FAULT                {len(fault)}")
     print(f"  INVALID              {len(invalid)}")
+    if dets:
+        print(f"  detector.json read   {len(dets)} arm(s) under {a.det}"
+              f"{f' (tag {a.tag})' if a.tag else ''}")
+        if missed:
+            print(f"  !! MISSED BY CONSOLE  {len(missed)} arm(s) the console passed but the")
+            print(f"     detector failed -- these are counted as faults (http/transport are not in the")
+            print(f"     console line at all):")
+            for r, d in missed[:10]:
+                print(f"       pair {r['pair']} cell {r['cell']} "
+                      f"http={d.get('http', 0)} transport={d.get('transport', 0)} "
+                      f"parse={d.get('parse', 0)} utf8={d.get('utf8', 0)}")
+        if unverified:
+            print(f"  UNVERIFIED           {len(unverified)} clean arm(s) with no usable")
+            print(f"     detector.json -- reported as clean from the console alone; NOT certified")
+    else:
+        print("  WARNING: no detector.json read (--det disabled or root absent); a Face-B fault")
+        print("  surfacing as HTTP 500 is invisible to the console and would be counted CLEAN.")
     print()
 
     n, k = len(clean) + len(fault), len(fault)

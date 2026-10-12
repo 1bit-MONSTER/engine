@@ -139,3 +139,60 @@ Recorded in advance so it cannot be read post hoc.
 **Next actions after it completes, in order:** (1) read its rate; (2) **H1 control** — fresh
 boot, `cwsr=1`, 20 arms (`docs/315-campaign/315-cwsr-control.sh`); (3) only then H2
 instrumentation.
+
+---
+
+# UPDATE 2 (late same day) — H1 FALSIFIED; the CWSR signal stands on its own
+
+**Read `315-H1-FALSIFIED.md` first.** My recorded "fresh-boot confound" was an arithmetic error
+of mine: I derived run 7's uptime (32.5 h) from a reading taken *before* the clean reboot at
+14:03:53 that preceded run 7. Corrected from the SMI stream's `boot_ns`, two independent anchors
+agree within 4 s that run 7 booted at **14:03:5x**.
+
+| run | config | box age during its arms | result |
+|---|---|---|---|
+| **run 7** | `cwsr_enable=1` | **~6–40 min after a fresh boot** | **3 faults / 11 arms** |
+| `315cwsr60` | `cwsr_enable=0` | ~53 min – 7 h after a fresh boot | 0 faults / 9 arms so far |
+
+Both were fresh boots, same day, same hardware, same harness. **So a fresh boot does not suppress
+the fault — run 7 was freshly booted and faulted anyway.** The strongest alternative explanation
+for the CWSR signal is gone.
+
+## Revised hypothesis ranking
+
+| | | state |
+|---|---|---|
+| ~~H1~~ | fresh-boot effect | **FALSIFIED** — run 7 was fresh-booted and faulted 3/11 |
+| **H2** | **mid-wave preemption under memory pressure** | **the leading and only surviving candidate** |
+| ~~H3~~ | partial kernel-side fix | dead — a sizing variant |
+| ~~H4~~ | firmware save/restore list mis-sized | dead — a sizing variant |
+
+The mechanism as it now stands, and it is falsifiable:
+
+> Under memory pressure a compute wave is preempted mid-execution (CWSR); the buffers that wave
+> is reading are evicted/migrated by TTM/amdgpu; on resume it reads relocated or recycled memory,
+> and the damaged values surface as Face A or Face B depending on what those bytes now hold.
+> Disabling CWSR removes mid-wave preemption and closes the window.
+
+**Discriminating experiment:** `amdgpu.cwsr_enable` 1 vs 0 — same harness, same gate, same day.
+**Alternatives ruled out:** every prior lever (coherence, ordering, AQL barriers, `-fa off`,
+transient reuse, PM4, MoE routing), the area-size explanation (proved fixed by AMD's own patch set
+with exact arithmetic), and now the fresh-boot confound.
+
+## What is still missing for criterion 1
+
+**n.** 9 clean arms gives a rule-of-three upper bound of 33%, which does **not** exclude the
+26–27% baseline. Removing H1 removes an *explanation*; it does not substitute for the ≥60 arms the
+objective requires. At 60 clean arms the bound is 5% and the criterion's power statement holds.
+
+## Unchanged
+
+Criterion 2 (a forward-only fix) still has nothing to repair: the documented gfx1151 CWSR defect is
+**proved fixed here**, and H2's remedy would be a driver/firmware change, not an engine change. The
+best engine-side option remains a configuration guard — a **workaround**, not a repair.
+
+Side quests completed while the campaign ran: a rate/CI/power tool (`315-rate.py`), the per-arm
+eviction comparison tool (`315-evict-per-arm.py`, the H2 test), PID-capture wiring into the H1
+control, the control's guard verified by dry-run, campaign QA (9/9 arms valid and in regime), and
+three failed attempts at a retroactive H1 test — each of which is recorded as a negative with its
+reason.

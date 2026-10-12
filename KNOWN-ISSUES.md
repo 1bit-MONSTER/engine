@@ -109,21 +109,43 @@ disagree about it: the gather clamps the id (`small_rows_f32.loom:157+`), while 
 consume it with `index.assume` *ranges* (`mul_mat_id_swiglu_f32_f32_wmma.loom:47-53`), not checks. Full reading:
 `evidence/315-id-producing-kernel.md`.
 
-**Falsified in this round** (each with its own evidence path):
+**Falsified in this round** (each with its own evidence path). Arm counts below are **re-derived from the
+run consoles** (`docs/315-campaign/tools/lever-census.py`, all arms at `gtt_start` 97-98 GiB, i.e. inside
+the frozen `>= 95 GiB` gate), not from prose:
 
-| candidate | result | where |
-|---|---|---|
-| memory coherence is the carrier | `HOST_COHERENT` patch live (`hv52=0 hv56=1`), still 9 clean + 1 fault in 10 | `evidence/315-face-landscape.md` |
-| consumer-side ordering is the carrier | `GRAPH_SYNC` after every replay, 4 of 6 arms below the gate, the one in-regime arm faulted | `evidence/315-face-landscape.md` |
-| the expert/partition tables go stale | both are rebuilt by producer dispatches inside the same plan | `evidence/315-moe-routing-routed-ffn-static.md` section 3 |
-| the fused path loses `route_stride` | that defect is already fixed in every tree that faults | the same file, section 7 |
-| the engine's MoE expert-streaming cache | Vulkan-only; the arms never enter it | the same file, section 6 |
+| candidate | run | control cell | fix cell | reading | evidence |
+|---|---|---|---|---|---|
+| memory coherence is the carrier (`HOST_COHERENT` on host-visible buffers) | `315accept` / face-landscape | — | **9 clean + 1 fault / 10** | not sufficient | `evidence/315-face-landscape.md` |
+| consumer-side ordering is the carrier (`GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1`, a stream sync after every replay) | `315gsync2` | 1 fault / 4 | 0 / 4 | no change (Fisher p = 1.00) | `evidence/315-face-landscape.md` |
+| ordering the instrument's own reads (`ggml_backend_synchronize` before each read) | `315row` vs `315fp2` | 1 / 1 (`315row` c) | 1 / 4 (`315fp2` l) | no change (p = 1.00) | `evidence/315-fp2-ordered-fingerprint.md` |
+| forced AQL execution barrier on **every** packet (`HRX_FORCE_BARRIERS=1`, env-gated patch in `aql_block_processor.c`) | `315fbar` | 3 faults / 4 | 1 / 4 | no change | `315fbar-console.log` |
+| flash attention is the carrier (`-fa off`) | `315nofa` | 1 / 4 | 2 / 4 | fault persists | `315nofa-console.log` |
+| `HRX_COMMAND_BUFFER_MODE=pm4` | `315pm4` | 3 OK + 1 fault / 4 | 4 / 4 arms failed at `req=1` | **unusable**: every fix arm failed the *first* request with HTTP 500 - not a fault-rate comparison at all | `315pm4-console.log` |
+| the expert/partition tables go stale | static | — | — | both are rebuilt by producer dispatches inside the same plan | `evidence/315-moe-routing-routed-ffn-static.md` section 3 |
+| the fused path loses `route_stride` | static | — | — | that defect is already fixed in every tree that faults | the same file, section 7 |
+| the engine's MoE expert-streaming cache | static | — | — | Vulkan-only; the arms never enter it | the same file, section 6 |
 
-**Still untested, and next.** The ids themselves: instrumented as `i32` with the name match anchored (the previous
-filter was `std::strstr(list, name)`, so `-41` also matched `-4` and only layers 4 and 41 were covered).
-`docs/315-campaign/315-idprobe.sh` builds that probe and runs four in-regime arms, reporting per row the first
-eight ids, the count outside `[0, n_expert)` and whether the row's ids repeat. Duplicate or out-of-range ids make
-the argsort kernel the site; a clean permutation kills it.
+**Two arm counts in the 2026-10-10 issue comment were transcription errors, corrected here against the
+consoles.** That comment gives the forced-barrier control as `2 / 4` and the `GRAPH_SYNC` fix cell as
+`0 / 2`; `315fbar-console.log` records control **3 faults / 4** (pairs 1, 2, 4 fault; pair 3 clean) and
+`315gsync2-console.log` records the fix cell as **0 faults / 4** (not 2). Neither correction changes any
+reading: the barrier still shows no improvement, and the sync cell is still clean against a faulting
+control. The comment's command section cites these same consoles as its source, so the consoles govern.
+
+**Withdrawn (kept for its own record) - was "still untested, and next".** The ids themselves: instrumented
+as `i32` with the name match anchored (the previous filter was `std::strstr(list, name)`, so `-41` also
+matched `-4` and only layers 4 and 41 were covered). `docs/315-campaign/315-idprobe.sh` builds that probe
+and runs four in-regime arms, reporting per row the first eight ids, the count outside `[0, n_expert)` and
+whether the row's ids repeat. Duplicate or out-of-range ids make the argsort kernel the site; a clean
+permutation kills it.
+
+**This is no longer the next step.** The correction directly below supersedes it twice over: the by-name
+instrument that would have produced these ids reads a transient arena slot's last writer (so no post-graph
+by-name read can name a producer on this backend), and the `oor`/`dup_pairs` ids diagnostic was itself
+**mis-specified** - `oor` was compared against `ne0`, which for the top-k *view* is `k`, not the expert
+count, so essentially all of its ~253,000 output lines are flagged and none is usable. The probe exists and
+runs; its output cannot answer the question it was built for. Do not treat this paragraph or
+`315-idprobe.sh` as an untested lead, and do not cite `evidence/315-id-producing-kernel.md` as a live result.
 
 **Correction, evening 2026-10-10 — this supersedes the two paragraphs directly above.** Both the routing-tensor
 candidate and the by-name instrument that produced it are now withdrawn, and the ordering family is closed:
@@ -136,12 +158,24 @@ candidate and the by-name instrument that produced it are now withdrawn, and the
   name a producer on this backend, and the `oor`/`dup_pairs` ids diagnostic was mis-specified besides (`oor`
   against `ne0`, which for the top-k *view* is `k`, not the expert count);
 * **four in-regime toggles, all null, every arm at `gtt_start=98 GiB`**: `GRAPH_SYNC` after each replay
-  (control 1 fault/4, fix 0/2); `ggml_backend_synchronize` before the instrument's reads (2/5 vs 1/5);
-  `HRX_FORCE_BARRIERS=1` forcing an AQL barrier on every packet (2/4 vs 1/2); and `-fa off` (1/2 vs 2/2, the
-  fault persists). `HRX_COMMAND_BUFFER_MODE=pm4` is not a lever at all - every PM4 arm failed the first request
-  with HTTP 500. With the host read path already ordered at source (`hsa_signal_wait_scacquire`, covered
-  timepoint) and a static audit of the whole `loom-libs/ops` corpus finding no unfenced intra-dispatch global
-  handoff, the whole ordering/visibility super-family is **closed for this fault**;
+  (control 1 fault / 4, fix 0 / 4); `ggml_backend_synchronize` before the instrument's reads (1/1 vs 1/4);
+  `HRX_FORCE_BARRIERS=1` forcing an AQL barrier on every packet (3/4 vs 1/4); and `-fa off` (1/4 vs 2/4, the
+  fault persists). `HRX_COMMAND_BUFFER_MODE=pm4` is not a lever at all - every fix arm failed the first
+  request with HTTP 500;
+* **the ordering/visibility super-family is closed at source as well as by run.** Both halves have a
+  citation, not just a symbol name:
+
+| claim | evidence |
+|---|---|
+| the host read of the logits is ordered: the accessor synchronises before returning | `src/llama-context.cpp:3728-3730` - `llama_get_logits_ith` calls `ctx->synchronize()` as its first statement |
+| the wait is an **acquire** wait, not a relaxed poll | `runtime/src/iree/hal/drivers/amdgpu/semaphore.c:329` - `iree_hsa_signal_wait_scacquire(..., HSA_WAIT_STATE_BLOCKED)`, inside the epoch-wait loop that returns via `iree_hal_amdgpu_semaphore_epoch_is_reached` |
+| the waited timepoint covers the **last** submission, so a stream wait cannot miss it | `semaphore.c:219` - `iree_async_semaphore_advance_timeline(base_semaphore, new_value, frontier)` runs in `iree_hal_amdgpu_semaphore_signal` *before* `dispatch_timepoints`; the public advance is `libhrx/src/libhrx/stream.c:240` (`hrx_stream_advance_timeline`) |
+| the barrier bit is decided from **encoded flags only**, and the driver explicitly refuses to infer memory hazards | `runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c:103-116` (`..._packet_has_barrier`: execution-barrier flag, final flag, first-packet wait count, first-packet inline acquire scope) and `:119-126` (`..._packet_control`, containing the comment *"Do not infer memory hazards here by walking command operands."*) |
+
+  Read together: the consumer's own path ends in a blocking acquire wait that is covered by the last
+  submission's timepoint, and the packet barrier is a recorded property the driver will not infer. Forcing
+  that bit on everywhere (`HRX_FORCE_BARRIERS=1`) changed the outcome in neither direction. That is why the
+  family is closed for *this* fault rather than merely untested;
 * **what survives**: the fault is real and common in regime (178 arms on the box, **131 in-regime, 34 faulting
   in-regime**, both faces, never in the same arm), the guard line is exactly
   `count=154880 of 154880 ... contiguous=yes`, and the one ordered by-name capture put the corruption at

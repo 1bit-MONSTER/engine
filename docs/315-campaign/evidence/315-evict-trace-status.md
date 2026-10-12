@@ -77,3 +77,54 @@ result:
 Satisfied by EITHER `>=1` in-regime faulting arm with the correlation attached, OR the
 trace recorded **UNINFORMATIVE with its clean-arm count**. A clean trace is not evidence
 about the mechanism. If the run ends clean, that is what will be recorded.
+
+---
+
+## Run 1 (`315evict2`) — completed, but TRUNCATED, and why
+
+The first real trace run ended after **2 arms, not 12**. Cause: my wrapper passed
+`MINCLEAN=0` intending "no minimum", but `315-paired.sh:147` treats MINCLEAN as a goalpost
+and stops when the clean count REACHES it — so `0 >= 0` stopped the run at pair 1. See
+`315-evict-trace-instrument.md` §6a. Fixed (`MINCLEAN=$((PAIRS*2+1))`), plus §6b (a
+`grep -c || echo 0` producing a two-line integer).
+
+What the truncated run did establish, at full strength, is the **eviction environment**:
+
+| quantity | value |
+|---|---|
+| Q_EVICT | **15,357** (8,936 SVM + 6,421 USERPTR) |
+| Q_RESTORE | 19,649 |
+| — `rescheduled=no` | **15,353** |
+| VMFAULT | 0 |
+| arms scored | 2 — `c` in-regime OK, `l` **OOR** (93 GiB < 95 gate) |
+| in-regime arms | **1** |
+| in-regime faults | **0** |
+
+So: 15.4k evictions, 15.4k of them unrestored, sustained across the window, with one
+in-regime clean arm. **This is a null for task-8, not a result** — and it is explicitly
+*not* recorded as evidence about the mechanism.
+
+## Why run 1 cannot be read as anything stronger
+
+1. one in-regime arm is nothing like the `>=60` task-9 needs, and task-8 itself wants a
+   *faulting* arm to correlate;
+2. an `OOR` arm is neither clean nor faulted, so the fix cell contributed **no** in-regime
+   data at all;
+3. the campaign was truncated by a harness bug, so its length was not the designed length.
+
+The honest statement is: **the eviction/preemption window was open and intense, and the
+one in-regime arm was clean.** That is a datapoint about eviction pressure being present
+without the fault, and nothing more.
+
+## Run 2 — not launched: box contention
+
+A relaunch on 2026-10-12 13:09+ found a peer agent's HRX workload on the box
+(`~/wt/loom-ub389`, `guard.sh`-wrapped, 1800 s timeout each, first a 27B Qwen3.8 run then a
+Zamba2-VL-2.7B run, `npu.lock` freshly touched). The campaign composes ~5 neighbours into
+the 95–110 GiB band, which would have evicted that peer's memory. Per the goal's own
+constraint (take the box lock, do not disturb other workloads) the relaunch **waits** for
+the box rather than competing for it.
+
+This is the second time the box has been unavailable for a long in-regime window (the
+first was `repro336` holding 103–111 GiB). It is a real constraint on task-8, not an
+excuse: the trace needs an uninterrupted composition, and the box is shared.

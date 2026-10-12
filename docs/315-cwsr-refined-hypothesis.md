@@ -104,3 +104,64 @@ power.
 
 Recorded so the control is sized to its question rather than copied from the fix campaign's
 bar.
+
+## H4 (new): the firmware save/restore list sizes the context for standard GFX11, not gfx1151's 1.5x VGPR layout
+
+Found 2026-10-12 while waiting, and it is the first hypothesis that names a *specific
+firmware artifact* rather than a userspace value.
+
+The driver reads a **save/restore list** out of firmware and logs its geometry:
+
+```
+save_restore_list_srm_ucode_ver: %u
+save_restore_list_srm_feature_ver: %u
+save_restore_list_cntl_size_bytes %u          <- the CONTROL stack size
+save_restore_list_cntl_offset_bytes: %u
+save_restore_list_gpm_ucode_ver: %u
+save_restore_list_gpm_feature_ver: %u
+save_restore_list_gpm_offset_bytes: %u
+RLC_SRM_DATA_RAM / RLC_SRM_ADDR_RAM           <- RLC holds the SRM blob in its own RAM
+```
+
+Reading the pieces together:
+
+- `node_props.ctl_stack_size` — the value our kernel's **UNFIXED `!=` check** compares against
+  — is exactly what `save_restore_list_cntl_size_bytes` supplies. So the control-stack size is
+  **firmware-declared**, not computed by the kernel.
+- The patch pair everyone cites (`d15deaf` kernel + `#1807` userspace) aligns the **VGPR /
+  cwsr** area only. Nothing in that pair touches the **control stack**, whose only check in
+  our module is still the exact-equality form.
+- Spill/restore is executed by the **RLC firmware** using that list.
+
+**The hypothesis:** the gfx1151 firmware's save/restore list is built for standard GFX11
+context geometry, not for gfx1151's **1.5× VGPR** memory. The kernel and userspace then agree
+on a control-stack size that *passes* the `!=` check (so nothing is rejected loudly) while the
+RLC firmware's actual spill needs more room than the declared list provides. A wave preempted
+under pressure overruns the declared region and restores truncated state.
+
+That would make the defect **firmware-side**, which explains why:
+
+- every userspace and kernel-side lever returned null — none of them can change what the RLC
+  spills;
+- the size checks all pass — the declared values are mutually consistent, just not
+  sufficient for the hardware;
+- `cwsr_enable=0` helps — it bypasses the RLC SRM path entirely.
+
+**How to falsify it (bounded RE, no GPU needed):**
+
+1. extract `save_restore_list_cntl_size_bytes`, `..._offset_bytes` and the SRM ucode version
+   the driver logs at init for gfx1151 (raise the log level, or read them out of the RLC SRM
+   RAM region);
+2. compare against another GFX11 part's list (e.g. gfx1100) where the fault is not reported —
+   if gfx1151's control-stack size is the same as a 1.0× VGPR part's, the list is wrong for
+   the 1.5× layout;
+3. inspect `gc_11_0_0_rlc.bin` / `gc_11_0_0_mes*.bin` (present at `/lib/firmware/amdgpu/`) for
+   the SRM blob to see whether the geometry is encoded there.
+
+Step 2 alone is decisive and cheap: **same declared control-stack size on a 1.5× VGPR part as
+on a 1.0× part would confirm the list is not gfx1151-aware.**
+
+If it instead shows a proportionally larger value, H4 is dead and the firmware is aware of the
+layout.
+
+Recorded as a hypothesis with a bounded test, not as a finding.

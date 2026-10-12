@@ -341,6 +341,24 @@ classes it as native rather than custom code. Nothing in the pinned llama.cpp tr
 mentions `kairo`, and no pinned backend (`hrx`, `npu`) implements the class. Reviewed
 2026-10-06: **not an alias**.
 
+### `grug_moe` - `open-athena/Grug-67B-A2B-Merge-Campaign2-DARE-TIES-02-2026.10.10`
+
+Architecture class `GrugMoeForCausalLM`, `model_type: grug_moe`, no `auto_map`, so the
+census classes it as native. It is the marin-community research MoE (`marin-community/marin`,
+`experiments/grug/moe`; `lib/levanter/src/levanter/models/snowball.py`): 67B total, about 2B
+active, 26 layers, hidden 2560, 20 heads with 5 KV heads, 256 routed experts (4 per token) plus
+one shared expert, a 2048-token sliding window with a global layer every 4 (`global_every`),
+and its own attention knobs (`qk_mult`, `sconv`, `grugmoe_attention_mode`). Transformers,
+upstream llama.cpp and upstream vLLM have no implementation; it is served through marin's own
+vLLM fork and loaded in training through `marin-community/MarinSkyRL`, which registers the class
+itself. The checkpoint flagged (engine#381) is a DARE-TIES merge-campaign upload with almost no
+downloads; the other uploads are the same group's training snapshots (`open-athena/Snowball-67B-A2B-*`,
+`penfever/grug-67b-a2b-*`). No pinned backend (`hrx`, `npu`) implements the class, and the
+`qk_mult` / `sconv` / local-global layout rules out treating it as a Mixtral- or Qwen-MoE
+alias. Reviewed 2026-10-12: **not an alias**. Its `registry/significant.json` entry carries
+`"watch": "report"`, so the census watcher lists new uploads of it as `. REVIEWED` and does
+not alert; remove that field if an upstream backend gains the architecture.
+
 ## Unverifiable: gated configs
 
 `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on

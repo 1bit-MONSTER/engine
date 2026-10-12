@@ -25,6 +25,7 @@
 //   GET  /v1/models              the one model
 //   POST /v1/chat/completions    (stream or not)
 //   POST /v1/completions
+//   GET  /metrics                serve's own Prometheus metrics, then the backend's (app/serve_metrics.h)
 //
 // Which device runs the model follows from the model and --device:
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
@@ -63,6 +64,7 @@
 #include "hrx_archs.h"
 #include "pm.h"
 #include "recipes.h"
+#include "serve_metrics.h"
 #include "serve_watchdog.h"
 #include "sysinfo.h"
 
@@ -635,10 +637,25 @@ private:
     std::atomic<int>* n_;
 };
 
-// watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h).
+// The "timings" object in the last bytes of a llama-server reply (its final SSE chunk), or null.
+json last_timings(const std::string& tail) {
+    const size_t at = tail.rfind("\"timings\":");
+    if (at == std::string::npos) return nullptr;
+    const size_t open = tail.find('{', at);
+    if (open == std::string::npos) return nullptr;
+    int depth = 0;
+    for (size_t i = open; i < tail.size(); i++) {
+        if (tail[i] == '{') depth++;
+        else if (tail[i] == '}' && --depth == 0) return json::parse(tail.substr(open, i - open + 1), nullptr, false);
+    }
+    return nullptr;
+}
+
+// watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h);
+// metrics, where given, counts it for GET /metrics (app/serve_metrics.h).
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
              const std::string& set_model, const httplib::Request& req, httplib::Response& res,
-             ProgressWatch* watch = nullptr) {
+             ProgressWatch* watch = nullptr, ServeMetrics* metrics = nullptr) {
     json body;
     try {
         body = json::parse(req.body);
@@ -670,13 +687,16 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
             }
         auto r = pending.get();
         if (!r) {
+            if (metrics) metrics->request(path, 502);
             res.status = 502;
             res.set_content(R"({"error":{"message":"backend did not answer"}})", "application/json");
             return;
         }
         res.status = r->status;
+        if (metrics) metrics->request(path, r->status);
         try {
             json out = json::parse(r->body);
+            if (metrics && out.is_object() && out.contains("timings")) metrics->timings(out["timings"]);
             if (out.is_object() && out.contains("model")) out["model"] = our_id;
             res.set_content(out.dump(), "application/json");
         } catch (const std::exception&) {
@@ -686,15 +706,28 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     }
     // Streaming: relay the child's SSE bytes as they arrive.
     const size_t prompt_bytes = req.body.size();
-    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes](size_t, httplib::DataSink& sink) {
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, metrics, prompt_bytes](size_t, httplib::DataSink& sink) {
         const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
+        const auto t0 = std::chrono::steady_clock::now();
+        bool first = true;
+        std::string tail;   // the last bytes, where llama-server's final chunk carries its timings
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
-        c.Post(path, httplib::Headers{}, payload, "application/json",
-               [&sink, &tracked](const char* data, size_t n) {
+        auto r = c.Post(path, httplib::Headers{}, payload, "application/json",
+               [&](const char* data, size_t n) {
                    if (tracked) ProgressWatch::progress(*tracked, n);
+                   if (metrics) {
+                       if (first) metrics->first_byte(std::chrono::duration<double>(std::chrono::steady_clock::now() - t0).count());
+                       tail.append(data, n);
+                       if (tail.size() > 32768) tail.erase(0, tail.size() - 16384);
+                   }
+                   first = false;
                    return sink.write(data, n);
                });
+        if (metrics) {
+            metrics->request(path, r ? r->status : 502);
+            if (const json t = last_timings(tail); t.is_object()) metrics->timings(t);
+        }
         sink.done();
         return true;
     });
@@ -831,6 +864,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         refuse_missing_arch(o.model);
         argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port)};
+        argv.push_back("--metrics");   // its /metrics, appended to serve's own
         if (device == "cpu") argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
         else argv.insert(argv.end(), {"--device", "HRX0", "-ngl", "99", "--jinja"});
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
@@ -1446,6 +1480,9 @@ int serve_child(const Options& given) {
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
     ProgressWatch watch(o.watchdog);
+    ServeMetrics metrics(id, device);   // GET /metrics (app/serve_metrics.h)
+    Lifecycle lifecycle(id);
+    auto backend_line = [&metrics](const std::string& line) { metrics.backend_line(line); };
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
 
@@ -1508,7 +1545,7 @@ int serve_child(const Options& given) {
         if (started[i]) return true;
         const Launch& b = backends[i];
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path);
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
         started[i] = c.get();
         children.push_back(std::move(c));
@@ -1592,7 +1629,7 @@ int serve_child(const Options& given) {
             }
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
-            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r, &watch);
+            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r, &watch, &metrics);
             r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
@@ -1602,7 +1639,7 @@ int serve_child(const Options& given) {
             held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
-        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
+        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch, &metrics);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -1640,12 +1677,31 @@ int serve_child(const Options& given) {
             r.set_content(R"({"error":{"message":"backend did not become ready"}})", "application/json");
             return;
         }
-        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r, &watch);
+        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r, &watch, &metrics);
     };
     for (const char* path : {"/v1/responses", "/tokenize", "/detokenize", "/apply-template"})
         srv.Post(path, llama ? httplib::Server::Handler(first_json) : httplib::Server::Handler(unsupported));
-    for (const char* path : {"/slots", "/props", "/metrics"})
+    for (const char* path : {"/slots", "/props"})
         srv.Get(path, llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
+    // serve's own metrics on every device, then the backend's own where it has them (llama-server
+    // runs with --metrics: its llamacpp:* series)
+    srv.Get("/metrics", [&](const httplib::Request&, httplib::Response& r) {
+        int in_flight = 0;
+        for (const auto& n : inflight) in_flight += n.load();
+        std::string text = metrics.render(lifecycle, in_flight);
+        int port = 0;
+        {
+            std::unique_lock<std::mutex> lock(start_mu, std::try_to_lock);
+            if (ready && lock.owns_lock() && (!laya || started[0])) port = backends[0].port;
+        }
+        if (port) {
+            httplib::Client c("127.0.0.1", port);
+            c.set_connection_timeout(1);
+            c.set_read_timeout(3);
+            if (auto br = c.Get("/metrics"); br && br->status == 200) text += br->body;
+        }
+        r.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
+    });
     srv.Post(R"(/slots/(\d+))", llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
     // RAG: embeddings and rerank go to their own backends, the reply names the model served
     auto rag_route = [&](size_t i, const std::string& model) {
@@ -1704,7 +1760,7 @@ int serve_child(const Options& given) {
 #endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path));
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line));
     }
     for (const auto& b : rag) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
@@ -1718,6 +1774,7 @@ int serve_child(const Options& given) {
         }
     }
     ready = true;
+    lifecycle.count_start();
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), o.port,
                  laya ? " (laya routes each request; a device's backend starts when first picked)" : "");
     if (o.pm) {
@@ -1787,6 +1844,7 @@ int serve_child(const Options& given) {
     if (is_wedged() && !g_stop) {
         // Kill the wedged backend and exit non-zero: Lemonade's BackendWatchdog sees the process go
         // and loads the model again. Say why, with what the box and the backend said last.
+        lifecycle.count_watchdog_kill();
         std::lock_guard<std::mutex> lock(start_mu);
         Child* bad = nullptr;
         for (auto& c : children) if (c->port() == stall.port) bad = c.get();
@@ -1817,6 +1875,7 @@ int serve_child(const Options& given) {
         for (auto& c : children) c->stop();
         return 0;
     }
+    lifecycle.count_backend_exit();
     std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
     return 1;
 }

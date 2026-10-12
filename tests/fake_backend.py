@@ -113,8 +113,7 @@ class H(BaseHTTPRequestHandler):
 
 if os.environ.get("FAKE_BACKEND_LOG_LINES"):
     # what llama.cpp and ggml-hrx write to stderr that serve's /metrics reads (tests/metrics_serve.sh)
-    for line in ("llama_context: graph splits = 3 (with bs=512), 2 (with bs=1)",
-                 "trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 1",
+    for line in ("trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 1",
                  "trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 2",
                  "ggml_hrx: CPU fallback: GET_ROWS x2, SOFTPLUS x1"):
         print(line, file=sys.stderr, flush=True)

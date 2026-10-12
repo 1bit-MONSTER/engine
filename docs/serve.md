@@ -132,7 +132,6 @@ text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`
 | `onebit_serve_starts_total` | loads of this model by serve, kept across restarts |
 | `onebit_watchdog_kills_total` | backends the [progress watchdog](#when-a-backend-hangs) killed, kept across restarts |
 | `onebit_backend_exits_total` | backends that exited on their own, kept across restarts |
-| `onebit_graph_splits{batch="prompt"\|"1"}` | llama.cpp's `graph splits = …` line at load |
 | `onebit_program_cache_flushes_total` | ggml-hrx's "HRX graph program cache over its limit" WARN lines |
 | `onebit_cpu_fallback_ops{op}` | engine #390's load report of ops placed off HRX, per op and `op="all"` |
 | `onebit_gtt_bytes{kind="total"\|"used"}` | the amdgpu GTT pool HRX allocates from (`mem_info_gtt_*`) |
@@ -142,7 +141,9 @@ text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`
 The log-derived series come from the backend's stderr, which serve passes through unchanged and
 reads line by line (Linux). A series whose line never came is left out, not reported as 0. The
 #390 report is read from a line that names "CPU fallback" (or "off HRX"), followed by `OP=count`,
-`OP xcount` or `OP: count` pairs, or by a total alone.
+`OP xcount` or `OP: count` pairs, or by a total alone. llama-server drops the library's INFO lines
+at its default verbosity, because they map to its trace level. So the report reaches serve only
+when it is logged as a WARN or above, as the program-cache flush line is.
 
 Starts, watchdog kills and exits outlive one serve process, because Lemonade restarts a backend
 by starting `1bit serve` again. They are kept per model id in

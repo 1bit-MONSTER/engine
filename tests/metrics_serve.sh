@@ -15,8 +15,8 @@
 # limitations under the License.
 #
 # `1bit serve`'s GET /metrics (docs/serve.md, "Metrics"), without a GPU: tests/fake_backend.py
-# stands in for llama-server, writes the log lines serve reads (graph splits, HRX graph-program
-# cache flushes, a CPU-fallback report) and answers /metrics with one llamacpp:* series.
+# stands in for llama-server, writes the log lines serve reads (HRX graph-program cache flushes, a
+# CPU-fallback report) and answers /metrics with one llamacpp:* series.
 #   - what the backend's log said, and nothing for a line that never came,
 #   - GTT and Tctl where the box has them,
 #   - the backend's own /metrics appended,
@@ -89,7 +89,6 @@ m=$scratch/m1.txt
 check "text/plain exposition ($type)" '[[ "$type" == text/plain* ]]'
 check "valid Prometheus text" 'valid "$m"'
 check "onebit_up names the device" '[ "$(metric "$m" "onebit_up{device=\"cpu\"}")" = 1 ]'
-check "graph splits from the backend log" '[ "$(metric "$m" "onebit_graph_splits{batch=\"prompt\"}")" = 3 ] && [ "$(metric "$m" "onebit_graph_splits{batch=\"1\"}")" = 2 ]'
 check "program-cache flushes from the WARN" '[ "$(metric "$m" "onebit_program_cache_flushes_total")" = 2 ]'
 check "CPU fallbacks from the report line" '[ "$(metric "$m" "onebit_cpu_fallback_ops{op=\"all\"}")" = 3 ] && [ "$(metric "$m" "onebit_cpu_fallback_ops{op=\"GET_ROWS\"}")" = 2 ]'
 check "the backend's own /metrics appended" '[ "$(metric "$m" "llamacpp:prompt_tokens_total")" = 12 ]'
@@ -101,7 +100,7 @@ fi
 if grep -qs k10temp /sys/class/hwmon/*/name; then
     check "Tctl from k10temp" '[ "$(metric "$m" "onebit_tctl_celsius")" != absent ]'
 fi
-check "backend log lines still reach serve's stderr" 'grep -q "graph splits = 3" "$scratch/a.log"'
+check "backend log lines still reach serve's stderr" 'grep -q "HRX graph program cache over its limit" "$scratch/a.log"'
 kill "$pid"; wait "$pid" 2>/dev/null
 
 # Lemonade starts serve again: the start counts carry over; no report line, no fallback metric.
@@ -110,7 +109,6 @@ curl -s -o "$scratch/m2.txt" "$api/metrics"
 m=$scratch/m2.txt
 check "second start counted" '[ "$(metric "$m" "onebit_serve_starts_total")" = 2 ]'
 check "no CPU-fallback line, no CPU-fallback metric" '[ "$(metric "$m" "onebit_cpu_fallback_ops{op=\"all\"}")" = absent ]'
-check "no splits line, no splits metric" '[ "$(metric "$m" "onebit_graph_splits{batch=\"prompt\"}")" = absent ]'
 curl -sN -m 20 -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \
     -d '{"stream": true, "fake_hang": true, "messages": [{"role": "user", "content": "hi"}]}' &
 pids+=($!)

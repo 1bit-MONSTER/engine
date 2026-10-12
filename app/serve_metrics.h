@@ -15,7 +15,7 @@
 
 // `1bit serve`'s own Prometheus metrics (docs/serve.md, "Metrics"): only what the engine sees and
 // Lemonade cannot. Backend starts and watchdog kills; what the backend's log says (CPU fallbacks,
-// graph splits, HRX graph-program cache flushes); the GTT pool and Tctl. GET /metrics renders
+// HRX graph-program cache flushes); the GTT pool and Tctl. GET /metrics renders
 // these, then appends the backend's own /metrics where it has one.
 #pragma once
 
@@ -34,6 +34,7 @@
 #include <cstdint>
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
 #include <filesystem>
 #include <fstream>
 #include <map>
@@ -48,43 +49,52 @@ namespace onebit {
 // What a backend's stderr says that is worth a metric. Lines that match nothing are ignored, and
 // a metric whose line never came is left out rather than reported as zero.
 struct BackendLogFacts {
-    // llama.cpp: "llama_context: graph splits = 3 (with bs=512), 2 (with bs=1)" or "... = 1"
-    std::optional<long> splits_prompt, splits_one;
     // ggml-hrx (fork #63): "HRX graph program cache over its limit (...): kept the current one, flush N"
     uint64_t program_cache_flushes = 0;
     // engine #390's load-time report of ops placed off HRX: a line naming "CPU fallback" (or
-    // "off HRX") with OP=count, OP xcount or OP: count pairs, or only a total
+    // "off HRX") with OP=count, OP xcount or OP: count pairs, or only a total. llama-server drops
+    // library INFO lines at its default verbosity (they map to its trace level), so the report
+    // reaches serve only as a WARN (or above).
     std::optional<long> cpu_fallback_total;
     std::map<std::string, long> cpu_fallback_ops;
 
     void feed(const std::string& line) {
-        static const std::regex splits(R"(graph splits = (\d+)(?: \(with bs=\d+\), (\d+) \(with bs=1\))?)");
-        static const std::regex flush(R"(HRX graph program cache over its limit.*flush (\d+))");
-        static const std::regex fallback(R"((cpu[ -]fallback|off hrx))", std::regex::icase);
-        static const std::regex op_count(R"(\b([A-Z][A-Z0-9_]{2,})\s*(?:=|:|x)\s*(\d+))");
-        static const std::regex number(R"((\d+))");
-        std::smatch m;
-        if (std::regex_search(line, m, splits)) {
-            splits_prompt = std::stol(m[1]);
-            splits_one = m[2].matched ? std::stol(m[2]) : std::stol(m[1]);
-        } else if (line.find("HRX graph program cache over its limit") != std::string::npos) {
+        // every backend line passes here: plain substring tests first, a regex only on a hit
+        if (line.find("HRX graph program cache over its limit") != std::string::npos) {
+            static const std::regex flush(R"(flush (\d+))");
+            std::smatch m;
             const uint64_t n = std::regex_search(line, m, flush) ? std::stoull(m[1]) : 0;
             program_cache_flushes = std::max(program_cache_flushes + 1, n);
-        } else if (std::regex_search(line, m, fallback)) {
-            const std::string rest = m.suffix();
-            std::map<std::string, long> ops;
-            long sum = 0;
-            for (auto it = std::sregex_iterator(rest.begin(), rest.end(), op_count); it != std::sregex_iterator(); ++it) {
-                ops[(*it)[1]] += std::stol((*it)[2]);
-                sum += std::stol((*it)[2]);
-            }
-            if (!ops.empty()) {
-                cpu_fallback_ops = ops;
-                cpu_fallback_total = sum;
-            } else if (std::regex_search(rest, m, number)) {
-                cpu_fallback_total = std::stol(m[1]);
-            }
+            return;
         }
+        const size_t at = fallback_at(line);
+        if (at == std::string::npos) return;
+        static const std::regex op_count(R"(\b([A-Z][A-Z0-9_]{2,})\s*(?:=|:|x)\s*(\d+))");
+        static const std::regex number(R"((\d+))");
+        const std::string rest = line.substr(at);
+        std::map<std::string, long> ops;
+        long sum = 0;
+        for (auto it = std::sregex_iterator(rest.begin(), rest.end(), op_count); it != std::sregex_iterator(); ++it) {
+            ops[(*it)[1]] += std::stol((*it)[2]);
+            sum += std::stol((*it)[2]);
+        }
+        std::smatch m;
+        if (!ops.empty()) {
+            cpu_fallback_ops = ops;
+            cpu_fallback_total = sum;
+        } else if (std::regex_search(rest, m, number)) {
+            cpu_fallback_total = std::stol(m[1]);
+        }
+    }
+
+private:
+    // where the text after "CPU fallback" / "cpu-fallback" / "off HRX" (any case) starts, or npos
+    static size_t fallback_at(const std::string& line) {
+        std::string low = line;
+        for (char& c : low) c = char(std::tolower(static_cast<unsigned char>(c)));
+        for (const char* key : {"cpu fallback", "cpu-fallback", "off hrx"})
+            if (const size_t p = low.find(key); p != std::string::npos) return p + std::strlen(key);
+        return std::string::npos;
     }
 };
 
@@ -170,11 +180,6 @@ public:
         line("onebit_watchdog_kills_total " + std::to_string(life.watchdog_kills));
         head("onebit_backend_exits_total", "counter", "backends that exited on their own (kept across restarts)");
         line("onebit_backend_exits_total " + std::to_string(life.backend_exits));
-        if (log_.splits_prompt) {
-            head("onebit_graph_splits", "gauge", "llama.cpp graph splits at load (backend log), by batch");
-            line("onebit_graph_splits{batch=\"prompt\"} " + std::to_string(*log_.splits_prompt));
-            line("onebit_graph_splits{batch=\"1\"} " + std::to_string(*log_.splits_one));
-        }
         head("onebit_program_cache_flushes_total", "counter", "HRX graph-program cache flushes (backend log WARN)");
         line("onebit_program_cache_flushes_total " + std::to_string(log_.program_cache_flushes));
         if (log_.cpu_fallback_total) {

@@ -128,3 +128,31 @@ the box rather than competing for it.
 This is the second time the box has been unavailable for a long in-regime window (the
 first was `repro336` holding 103–111 GiB). It is a real constraint on task-8, not an
 excuse: the trace needs an uninterrupted composition, and the box is shared.
+
+## Run 2: deferred, with the reason and the resume command
+
+Not launched. The box is held by a peer agent's **batch** (`~/wt/loom-ub389/runs/batch2.log`,
+active 13:10, jobs queued, several `-dev HRX0`) plus a CPU embedding pass. The campaign's
+composition drives ~5 neighbours into the 95–110 GiB band, which would evict that peer's
+memory. The goal's constraint is explicit — take the box lock, do not disturb other
+workloads — so the trace waits.
+
+Resume when the box is quiet, with the two launch bugs fixed:
+
+```sh
+ssh strixhalo
+# confirm free: no "-dev HRX0" jobs of anyone else's, GTT near the ~26 GiB baseline
+ps -eo pid,args | grep -- "-dev HRX0" | grep -v grep
+awk '{printf "%.1f GiB\n", $1/1073741824}' /sys/class/drm/card*/device/mem_info_gtt_used
+
+# then, with the corrected wrapper (MINCLEAN=$((PAIRS*2+1)), PAIRS cap ends the run):
+nohup bash ~/wt/315-evict-trace.sh 8 315evict3 > ~/wt/315evict3-run.log 2>&1 &
+```
+
+8 pairs = 16 arms, which at the observed ~1-in-2 in-regime rate gives ~8 in-regime arms.
+That is still short of task-9's `>=60`; task-8 needs only one **faulting** in-regime arm, or
+an honest null with its clean-arm count.
+
+**If the box stays contended, task-8's honest close is the null already in hand**: 1
+in-regime clean arm under 15.4k evictions, recorded as uninformative, with the reason being
+box contention rather than a design choice.

@@ -244,3 +244,53 @@ by total arms. The check takes one `grep` and I did not run it until now.
 
 Recorded so the next run is sized from §6 — **60 fix-cell arms means ≥60 pairs** — rather than from
 the objective's looser phrasing.
+
+---
+
+# UPDATE 4 — campaign of record relaunched at compliant size (70 pairs)
+
+The 48-pair run was stopped at 10 scored arms (all clean) once I realised it could not reach the
+pre-registration's ≥60 **fix-cell** arms. It is recorded as a **mis-sized pilot, not the campaign
+of record** — no result was discarded and none was inconvenient (10/10 clean); the run simply could
+not meet §6 as sized.
+
+## The campaign of record
+
+```
+tag    : 315cwsr70
+pairs  : 70  ->  ~70 fix-cell ('l') arms   (>=60 required by section 6; within the 80-pair cap)
+config : amdgpu.cwsr_enable=0   (unchanged since the treatment reboot)
+gates  : box lock -> npu lock -> GPU quiet -> watcher   (all four passed 16:54:11)
+driver : with the PID capture installed, so its arms carry $O/server.pid and its data can
+         support the H2 faulting-vs-clean eviction comparison
+```
+
+Expected duration ~7–8 h at the observed ~5 min/arm.
+
+## Why relaunching rather than extending
+
+Running 48 pairs and then another 60+ would cost ~11.9 h to reach one compliant campaign.
+Relaunching once at 70 pairs costs ~7.8 h for the same thing. The stopped run's 10 clean arms are
+not counted toward the target (pooling across runs is not provided for in the pre-registration),
+so nothing of value was gained by letting it continue.
+
+## Box-time budget
+
+| | arms | ~GPU hours |
+|---|---|---|
+| earlier sessions (10-09…10-11) | 260 | — (predate this goal turn) |
+| this goal turn, before the relaunch | ~24 | ~2 h |
+| this campaign of record | ~93 | ~7.8 h |
+| **total for this turn** | | **~10 h of the stated ≤12 h** |
+
+Tight but inside. If the campaign needs a follow-on, the budget will be the binding constraint
+before anything else.
+
+## What to check when it lands
+
+1. `tools/315-rate.py <console>` — the rate, exact CI and the power statement, applying §5/§6's
+   counting rules from the driver's own lines;
+2. **fix-cell count specifically** — must be ≥60 clean, not merely ≥60 total;
+3. `tools/315-evict-per-arm.py` — the H2 comparison, now possible because the PIDs are captured;
+4. a fresh-boot `cwsr=1` control if the rate holds, since H1's falsification was inferred from
+   `boot_ns` rather than from a purpose-built control.

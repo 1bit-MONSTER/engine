@@ -1259,3 +1259,40 @@ and worth keeping for the write-up rather than over-reading now.
    residency levers both target exactly this buffer-ownership boundary).
  - P3 is a cheap refutation test available on the running control's data.
  - H1 remains FALSIFIED (fresh boot does not suppress the fault), so H2' is the sole candidate.
+
+---
+
+## P1 DISCRIMINATOR — pre-registered design (2026-10-13 05:25)
+
+H2' predicts faults need BOTH resumption AND buffer movement. cwsr=0 already removes resumption.
+P1 removes the other factor: keep cwsr=1 (resumption stays) but deny the buffers the chance to
+move. This is the experiment that has NOT been run and it is the clean discriminator.
+
+### Why this is NOT a goalpost move
+The frozen pre-registration fixes the regime gate at gtt_start >= 95 GiB and the fault grammar.
+P1 deliberately changes the REGIME, so it cannot be compared to the 70-arm cwsr=0 campaign and
+must not be scored against criterion 3. It is a criterion-1 mechanism experiment with its own
+declaration, written here BEFORE any P1 arm runs:
+
+    P1 HYPOTHESIS  at cwsr=1, denying buffer movement suppresses the fault
+    P1 PREDICTION  cwsr=1 + buffers pinned/pre-resident -> ~0 faults over n arms
+                   cwsr=1 + buffers free to move       -> ~26% faults (the observed baseline)
+    P1 REFUTATION  faults persist at the same ~26% rate with movement denied
+                   -> H2' is dead; no surviving carrier for criterion 1
+
+### The two arms of P1 (both at cwsr=1, same model, same pressure)
+ A. MOVEMENT ALLOWED (the positive control): identical to the historical 34/131 baseline.
+ B. MOVEMENT DENIED: the arm's buffers made non-evictable / pre-resident.
+
+### Feasibility, checked rather than assumed
+ - The arm launcher already accepts env injection at 315-paired-pidcap.sh:65
+   (`TRACE_ENV=(--setenv=GGML_HRX_BUFFER_TRACE=1)`), so a knob can be threaded the same way.
+ - There is NO `gtt_size` module parameter on this box, so the obvious "shrink GTT" route is
+   unavailable; movement must be denied from the allocation side (a residency/pin flag) or by
+   removing the pressure that causes it.
+ - The lever analysis independently points at exactly this boundary: `HRX_MEMORY_TYPE_HOST_COHERENT`
+   (falsified as a FIX) and the residency-style preference (the one lever-check CLEAR) both target
+   the buffer-ownership boundary H2' names. That is corroboration for the mechanism, not evidence
+   that either is the fix.
+ - NOT YET RUN. It needs (a) a knob or a pinned build, and (b) its own shell-time budget. The
+   current 315ctl1 control owns the box lock and must finish first.

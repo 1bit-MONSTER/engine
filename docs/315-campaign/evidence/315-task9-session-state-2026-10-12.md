@@ -38,6 +38,13 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
     rollback  ~/work/amd_cwsr.cfg.backup  md5 a8b25738...  == the dropped-in file
 
     WAITER    bg task b3deb6f74 -> reports fix-cell fault tally + 315-rate.py output on completion
+              (if the waiter is gone, score it manually with the commands below)
+
+    SCORE THE CONTROL (fix-cell arm l is the scored cell; the tool's 'clean' counts BOTH cells)
+      ssh strixhalo 'C=~/wt/315ctl1-console.log; echo "l OK=$(grep -oE "pair [0-9]+ arm l: OK" $C|wc -l) FAULT=$(grep -oE "pair [0-9]+ arm l: FAULT" $C|wc -l) OOR=$(grep -oE "pair [0-9]+ arm l: OOR" $C|wc -l)"'
+      ssh strixhalo 'cd ~/wt && python3 315-rate.py 315ctl1-console.log --det ~/wt/rt-det --tag 315ctl1'
+      # want: no MISSED BY CONSOLE line; UNVERIFIED 0
+      # baseline to compare against: 34 faulting / 131 in-regime at cwsr=1 historically (~26%)
 
     READING KEY (this decides criterion 1)
       rate ~26% faults -> H1 CONFIRMED: the cwsr=0 signal was a fresh-boot artefact;

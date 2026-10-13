@@ -3740,3 +3740,34 @@ never written should be detectable directly - instrument or infer which rank is 
 and check whether a faulting arm's route ids contain a duplicate or out-of-range id. Section 51 recorded
 that the ids diagnostic in one earlier build was MIS-SPECIFIED (`oor` compared against `ne0`, which for
 the top-k view is `k`, not the expert count), so a correct ids check has not yet been run.
+
+---
+
+## Foreign run 315gord1a on the box (11:55) — read-only, not disturbed
+
+    tag        : 315gord1a  (NOT mine; launched 11:22:08 by 315gord1a-launch.sh, reparented to pid 1)
+    driver     : ~/wt/315-disc.sh 4 315gord1a
+    binary     : ~/wt/315coherent-build/bin   (the PATCHED build I made)
+    extra_env  : no GGML_HRX_COHERENT_READ -> knob OFF -> a replication of ARM A on this build
+    status     : round 1 arm q OK; 3 HRX0 holders; GTT 79G; load 11
+    box.lock   : NOT held (the run proceeds unlocked - noted, not policed)
+
+It is another sample of the control condition on my build, which is genuinely useful, and it is not mine
+to touch. Recorded because it occupies the box and because its result (if it completes) adds to arm A's
+4/4.
+
+## The decisive test for the argsort candidate, and why it has not been run yet
+The candidate predicts a specific, checkable artifact: for a faulting arm, the route ids should contain
+a **duplicate** (the slot that was never written still holds its previous content, which is another
+element's index) or an **out-of-range** id. Section 51 recorded that an earlier ids diagnostic was
+MIS-SPECIFIED - it compared against `ne0`, which for the top-k *view* is `k` (the expert count
+requested), not the model's `n_expert` - so ~all of that build's 253,000 lines were flagged and none of
+its output was used. **A correct ids check has never been run.**
+
+The measurement to make: instrument `ffn_moe_topk` (and the argsort it views) as `i32`, and per row
+report (a) the ids in order, (b) whether any id repeats, (c) whether any id falls outside
+`[0, n_expert)`, and (d) whether any slot equals the pre-arm content. Then compare a faulting arm's row
+against the same row in a clean arm.
+
+This is the test that would confirm or refute the candidate, and it is a kernel-instrumentation change
+on the fork side - in scope. It needs the box, which the foreign run currently holds.

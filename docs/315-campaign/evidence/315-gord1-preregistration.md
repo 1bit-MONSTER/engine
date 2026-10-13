@@ -77,3 +77,41 @@ recorded as invalid, never as passes.
   be argued (program order is a performance regression by construction — it costs the 3 saved barriers
   per layer graph — so the real fix may be to fence only the overlap, which is a different change).
 - **Does not touch criteria 3 or 4**, which need a landed fix first.
+
+---
+
+# ADDENDUM before arm B (2026-10-13 13:17) — the knob is a clean single-variable intervention
+
+Verified while waiting for the GPU (the peer agent's `315ids2` campaign holds it; arm B is queued behind
+it and launches automatically when the box frees).
+
+`level_order_enabled()` is read in **exactly one place** — `graph-record-order.cpp:240`:
+
+    const bool enabled = level_order_enabled();
+    if ((!enabled && !log_enabled()) || commands.size() < 2) {
+        return {};                                   // {} -> caller keeps program order
+    }
+
+and its single consumer is `use_level = enabled && level_barriers < program_barriers && transient_extent
+<= kMaxTransientExtent`. Nothing else in the recorder, the executor, or the commit path reads
+`GGML_HRX_GRAPH_ORDER`.
+
+So `GGML_HRX_GRAPH_ORDER=program` is a **single-variable intervention with no side effects**: it disables
+the reorder and changes nothing else. That is what makes arm A vs arm B a clean comparison.
+
+## The built-in differential
+
+The zero-arm probe measured GLM's decode as a two-graph alternation:
+
+    graph A: 26 commands, barriers 23 -> 20 in lookahead order, transient extent 237568  -> REORDERED
+    graph B:  9 commands, barriers  5 ->  5,                  transient extent 116736  -> program order
+
+Because the knob can only act where `level_barriers < program_barriers`, it **cannot affect graph B at
+all** (5 == 5, so `use_level` is false regardless). So:
+
+- the 9-command attention graph is an internal control *inside arm B* — it is submitted identically in
+  both arms by construction;
+- any effect of the knob must act through the **26-command routed-FFN graph**.
+
+That sharpens the reading: if arm B is clean in cell `e`, the effect is attributable to the routed-FFN
+graph specifically, not to a general change in submission behaviour.

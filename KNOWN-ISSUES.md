@@ -374,10 +374,27 @@ created `HOST_LOCAL | HOST_COHERENT | DEVICE_VISIBLE`
 
 ### Consequence for this entry's acceptance criterion
 
-The criterion used here has been ">=60 in-regime arms, zero faults". The census shows that criterion is
-**satisfiable without testing the defect**: 60 arms at `gtt_start=97G` run in the ~5% population while
-the defect is fully present at 98G. Any claim that #315 is gone must therefore show zero faults **in the
-high band (>=98G)**, or the regime gate must be redefined to the population that actually faults.
+The criterion used here has been ">=60 in-regime arms, zero faults". That criterion is **satisfiable
+without testing the defect**: 60 quiet arms run at the ambient ~5% rate while the fault lives elsewhere
+entirely.
+
+**An earlier version of this paragraph said the gate should move to "the high band (>=98G)". That is also
+wrong, and is corrected here.** The cell-separated tally across every recorded console shows occupancy alone
+does not do it:
+
+    cell q (QUIET, no side load)          cell e (evictonly forcer)
+      gtt_start=44G   0%  (n=4)             gtt_start=44G   0%  (n=4)
+      gtt_start=97G   5%  (n=39)            gtt_start=98G  95%  (n=43)
+      gtt_start=98G   0%  (n=2)
+
+The quiet cell is **0% at 98G** against 5% at 97G — so `gtt_start` does not govern the fault, and a band-based
+gate would still admit arms that cannot fault.
+
+**The gate has to be the intervention cell, not a band.** The fault lives in cell `e`: ~95% under forced KFD
+eviction against ~5% ambient, a 19x contrast on the same workload at the same level. Any claim that #315 is
+gone must therefore show zero faults **in the forced-eviction cell** — and must report the ambient
+(quiet-cell) rate alongside it, so that a clean result cannot be produced by simply not applying the
+trigger. That is what makes the criterion falsifiable rather than satisfiable by omission.
 
 ### Families closed by discriminating experiment (2026-10-13)
 

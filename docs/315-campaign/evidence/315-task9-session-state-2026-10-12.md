@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4959,3 +4943,67 @@ detector issues) and ideally **inside the eviction rig**, so the queue is popula
 
 Recorded because a probe that returns zero for the wrong reason is the most expensive kind of null: it
 would let the lead be abandoned on evidence that never tested it.
+
+---
+
+# THE WRITEBACK LEAD IS REFUTED (16:00) — a VALID probe now shows the queue is never populated
+
+The peer's lead said the logits are *structurally expected* to take the deferred-writeback path, and that
+whether `pending_host_writebacks_` is non-empty is what the probe would report. The probe has now been run
+**correctly** and it reports: **the queue is never populated, across three full-size GLM decodes.**
+
+### Why the first probe was invalid and this one is not
+    probe 1 (the peer's)   /v1/chat/completions, reused prefix: prompt eval 9 then 1 then 1 tokens,
+                           graphs reused 7 / 15 / 23
+    probe 2 (mine)         the ARMS' OWN shape - /completion, cache_prompt=false, n_predict=96:
+                           prompt eval 25 tokens, 120 tokens delivered, graphs reused 95
+                           95 matches a real arm's first request EXACTLY (315text1-r1q: 95)
+
+So probe 2 exercised the identical workload shape the arms use, at the identical dispatch count, and it is
+a valid test where probe 1 was not.
+
+### The result
+    === writeback fingerprint records ===
+    0
+    === rec_eq_sync tally ===
+    (empty)
+
+Zero `hrx-wb-fp` records in three full-size decodes.
+
+### Why zero records means "the queue is never populated" - traced, not assumed
+    populate site : command-program-executor.cpp:1106, `add_host_writeback(...)` inside
+                    `download_prepared_host_staging`
+    push_back     : :176 (the queue's ONLY push site)
+    print site    : :136 `fingerprint_writeback_log(...)`, invoked at :127 INSIDE
+                    `for (PendingHostWriteback & writeback : pending_host_writebacks_)` (:125)
+
+So the fingerprint prints **iff the queue is non-empty**. Zero records therefore means the loop body never
+ran, i.e. **nothing was ever queued** - not that the fingerprint is broken. Verified separately that the
+knob is live: the marker and env name are both in `315coherent-build`, the source has the check
+(`writeback_fingerprint_enabled`, inert-unless-set), and probe 2 set it via `setsid env`.
+
+### And why the queue is empty - the gate, read at source
+    :748   if (binding.host_data == nullptr) { materialized.push_back(binding); continue; }   <- SKIP
+    :764   staging.download = access.write && !binding.graph_input;
+    :1072  has_download = has_download || staging.download;        <- the download path is only taken
+                                                                      if this is true
+So the deferred writeback requires a binding that (a) carries non-null `host_data`, (b) is host-visible,
+(c) is WRITTEN by the graph (`access.write`), and (d) is NOT a graph input. The logits satisfy (a)-(d) in
+the peer's *static* reading - but the empirical result is that on a real decode **no binding reaches the
+download path at all**. The most likely reason, and the one the code makes explicit, is that the bindings
+which would qualify are **resident** (`:739-746` pushes `prepared.resident_host_weights` and continues) or
+carry null `host_data`, so `staging.download` is never set.
+
+### Consequence
+The deferred-writeback gap is **not the mechanism**, on the evidence, because the code path is never
+entered. The peer's static chain was careful and correctly flagged that it was "all static ... static
+expectation is not a result" - and the result is negative. That is the fourth candidate eliminated, and it
+likewise removes the last read-side variant of the non-coherent `0x52` family: the immediate read was
+refuted by its own A/B, and the deferred read never happens.
+
+### What is left
+    the WRITE side    - the device writing into a buffer whose backing the eviction moved
+    an intermediate buffer damaged and propagating to the logits
+Both are consistent with my text constraint (correct prior outputs, then a terminal whole-buffer event),
+and both are in scope on the fork side. Neither has an instrument yet, and the honest position is that
+they are un-tested rather than promising.

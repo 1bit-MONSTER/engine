@@ -375,3 +375,65 @@ Distinguishing these is a bounded read of one more function, not a GPU question.
 - **Corrected**: the earlier section's claim that the logits are "structurally expected" to take the
   staging path is **not supported by measurement**. It rests on reading one comment as decisive when the
   event count says otherwise. That inference is withdrawn pending the bounded read named above.
+
+---
+
+# CLOSED by mechanism: the logits binding carries `host_data == nullptr`, so it is never staged
+
+Completed the bounded read named above. The contradiction resolves, and it resolves **against** this lead —
+not by absence of output but by the binding's own resolution.
+
+## The predicate chain, now complete
+
+`materialize_host_bindings` (`command-program-executor.cpp:686`) is where staging is decided, and its gate is
+`:700`:
+
+    if (binding.length == 0 || (!binding.requires_materialization() && !materialize_weight)) {
+        ... continue;                      // NOT staged
+    }
+
+and the predicate is one line (`dispatch/command-program-bindings.h:31`, identically in
+`graph/value-map.h:67`):
+
+    bool requires_materialization() const { return host_data != nullptr; }
+
+So **staging happens if and only if the binding's `host_data` is non-null** — nothing else. And
+`backend-buffer-binding.cpp:78` sets it:
+
+    binding.host_data = directly_bindable ? nullptr : context->base;
+
+with `directly_bindable = !ggml_backend_buffer_is_host(buffer) || context->direct_host_binding`.
+
+The measurement fixes the answer: the writeback path is **never entered** across two sound probes and the
+trace run, so for GLM's decode the logits binding resolves with **`host_data == nullptr`** — i.e. as
+directly bindable (an HRX buffer handle), *not* as host data. The allocation is host-visible `0x52`; the
+**binding** is nonetheless device-addressable.
+
+## What I got wrong
+
+The earlier section read `backend-buffer-binding.cpp:78`'s comment — "Noncoherent host allocations remain
+host data" — as decisive for the logits, and concluded the staging path was "structurally expected". That
+was an inference from a comment about the *general* case, contradicted by an event count for *this* binding.
+The prediction is withdrawn, and the reason is recorded: the comment describes what happens to non-coherent
+host allocations **that take this branch**, whereas the logits resolve through the directly-bindable branch
+and never present host data to the materializer at all.
+
+## Consequence
+
+The deferred host writeback is **not** on GLM's decode path in this configuration. This family closes the
+same way the other four did — with a mechanism, not a shrug:
+
+    gate      binding.host_data != nullptr
+    actual    the logits binding's host_data IS nullptr (writebacks never queued, measured)
+    therefore the queued-writeback window never opens for this workload
+
+The relevant non-coherent host read on the logits still exists — that much the trace confirms — but it is
+the **immediate** read the A/B already refuted (`buffer_get`), not a deferred one. So this lead does not
+rescue that family; it collapses back into it.
+
+## Honest note on cost
+
+This lead consumed a probe, a corrected probe, a trace run and several source reads, and its yield is a
+closing argument. That is the same disposition as the other four families, and it is recorded rather than
+quietly dropped — but the process lesson is that a comment about the general case is not evidence for a
+specific binding, and the cheap measurement (one trace run) should have preceded the static write-up.

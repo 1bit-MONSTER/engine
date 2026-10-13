@@ -1170,3 +1170,92 @@ Baseline for comparison: 34 faulting / 131 in-regime arms at cwsr=1 historically
  - the SMI watcher surviving the whole run (3h TTL); if it dies early the run's eviction data is
    truncated and H2's comparison loses its faulting half again
  - ENDOGAME §3: read the pre-fault eviction column, not the window total
+
+---
+
+## CANDIDATE MECHANISM (H2′) — 2026-10-13 05:22 — resume-dependent buffer borrowing
+
+Found while reading the section the earlier SAVE/DRAIN quote came from. This is the first
+statement of H2 that survives the DRAIN refutation AND explains why cwsr=1 faults while cwsr=0
+does not. All quotes are file:line from the vendored set,
+`~/amd-oss/hrx-system/docs/reference/amd/gpu/context-save.md`.
+
+### The four statements that compose it
+    L3-5   "Compute wave save/restore (CWSR) lets the native scheduler take a compute queue off
+            hardware while preserving unfinished waves FOR RESUMPTION."
+    L6     "Saved waves still depend on their executable, arguments, payloads and private
+            scratch."                     <- the context save does NOT own those buffers
+    L299   "An inactive-queue snapshot is not an application checkpoint that OWNS COPIES of
+            executable code, arguments, external buffers or private scratch."
+    L330   those payloads stay owned by "every unfinished producer/consumer that CAN RESUME".
+    L304   "The KFD update path FIRST REMOVES THE QUEUE FROM HARDWARE" (both branches) - so the
+            wave really is off hardware either way; the difference is resumption.
+
+### The mechanism
+CWSR preserves the wave's own registers and LDS, and remaps the queue so the wave RESUMES.
+It does NOT take ownership of, or copy, the executable/arguments/payloads/scratch the wave
+will read. Those remain borrowed from application memory. Therefore:
+
+    under memory pressure, between suspension and resumption, a page migration/eviction
+    (TTM/amdgpu) can move or recycle the very buffers the suspended wave will re-read on
+    resume. The resumed wave then reads stale or recycled memory and its results are wrong.
+
+Which face appears is decided by what the moved bytes now hold: NaN/poison or unmapped ->
+Face A (NaN logits, HSA_STATUS_ERROR_MEMORY_FAULT); finite garbage that survives tokenisation
+-> Face B (invalid UTF-8 -> HTTP 500).
+
+### Why this is NOT the refuted claim
+The refuted version said "cwsr=0 removes mid-wave preemption" - contradicted, because queue
+removal happens in both branches. This version does not need that. It says the danger is
+RESUMPTION, not interruption:
+    cwsr=1 -> SAVE   -> wave resumes -> re-reads borrowed buffers -> corruption possible
+    cwsr=0 -> DRAIN  -> wave is drained/abandoned -> never resumes -> re-reads nothing
+The DRAIN finding is what MAKES this work rather than what contradicts it.
+
+### Falsifiable predictions (the discriminating experiment)
+ P1. Faults require BOTH resumption and buffer movement. Removing either must remove faults:
+     - cwsr=0 (no resumption): already observed 0 faults / 70 fix-cell in-regime arms.
+     - no memory pressure / buffers pinned (no movement): predicts 0 faults at cwsr=1.
+     The second is the experiment that has NOT been run. It is the clean discriminator: at
+     cwsr=1, pin or pre-resident the model's buffers (or run with GTT pressure removed) and
+     faults should vanish; restore pressure and they return.
+ P2. Faulting arms should show page-migration/eviction activity for the ARM's own buffers in
+     the window between its last suspension and the fault. This is what 315-evict-per-arm.py
+     reads as its PRE-FAULT column, against the clean-arm baseline of ~228 evictions/arm.
+ P3. Inference-free corollary: the same cwsr=1 arm that faults should have been suspended at
+     least once. If an arm faults with zero Q_EVICT/Q_RESTORE for its pid, this mechanism is
+     refuted.
+
+### P3 IS LIVE ON THIS RUN (verified 05:23) - arms are evicted AND restored under cwsr=1
+Per-arm, from the control's own SMI stream (pid = the arm's server.pid):
+
+    arm pid   Q_EVICT   Q_RESTORE
+    21139         293         411
+    44443         160         173
+    68030         262         288
+    91692         196         257
+    114850        275         307
+
+Every arm shows both, i.e. its buffers are evicted and then RESTORED while the arm is live.
+That is H2's precondition made directly observable for the first time: suspension followed by
+resumption, attributable to the arm rather than to a long-lived neighbour. (Run totals:
+Q_EVICT 3836, Q_RESTORE 4607 behind a still-alive watcher.)
+
+Note Q_RESTORE > Q_EVICT per arm - restores are attempted more often than evictions are
+recorded, consistent with the "remap queues that remain active" language at context-save.md:305
+and worth keeping for the write-up rather than over-reading now.
+
+  P3 refutation test, now runnable: if an arm faults at cwsr=1 with ZERO Q_EVICT for its own
+  pid, H2' is dead. If every faulting arm has evictions and clean arms have ~228, that is the
+  predicted asymmetry. The CURRENT arms are all clean so far, so this is not yet discriminating -
+  it fires when the first fault lands.
+
+### Honest bounds
+ - The doc establishes the BORROWING (L6/L299/L330) and the RESUMES-vs-ABANDONED split
+   (L4/L304). It does not state that resumption re-fetches by address walk - that is a
+   hardware-level consequence I am inferring, though it is the only reading consistent with
+   L6 and L299 together.
+ - It does not name TTM as the mover; that is from the falsified-lever analysis (coherence and
+   residency levers both target exactly this buffer-ownership boundary).
+ - P3 is a cheap refutation test available on the running control's data.
+ - H1 remains FALSIFIED (fresh boot does not suppress the fault), so H2' is the sole candidate.

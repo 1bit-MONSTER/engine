@@ -415,10 +415,12 @@ matters and is recorded in `315-galign-peer-result.md`:
 
 The **cause** — which handoff reads stale data after an eviction — is not located, now after closing six
 families. What IS established is the trigger, quantified on the quiet cell (the one cell with no instrument
-confound): ambient **~5%** against **~95%** under forced KFD eviction, a 19x contrast on the same workload at
-the same GTT level (`315-quiet-vs-forcer-by-level.md`). That file also corrects an earlier band-based gate
-recommendation, showing the quiet cell is 0% at 98G — so the gate must be the **intervention cell**, not a
-band. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch ordering,
+confound): ambient **~5%** against **~95%** under forced KFD eviction, an order-of-magnitude contrast on the
+same workload at the same GTT level (`315-quiet-vs-forcer-by-level.md`). That file also retires an earlier
+band-based gate recommendation — the quiet cell's rate at 98G was first put at 0% on n=2, but a **second**
+quiet-cell fault at 98G overturned that leg (1 in 3 arms pooled; rule-of-three on 0/2 is ~78%, so "zero" was
+never supportable from it). The load-bearing figure is the cross-cell contrast at matched level, not the
+quiet rate. So the gate must be the **intervention cell**, not a band. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch ordering,
 or a different class), and the MoE id-producing-kernel family under active work by another agent.
 
 The **`GGML_HRX_FA_PARTIAL_ALIGN`** discriminator — the #140 FA layout/dispatch class, which §57 of

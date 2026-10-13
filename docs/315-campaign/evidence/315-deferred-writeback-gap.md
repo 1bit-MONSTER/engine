@@ -196,3 +196,56 @@ refuted candidate read, just at a different site.
 - Whether the `:994` guard covers every reachable sequence even when the queue is non-empty.
 - It is not a cause; it is a located, self-documented hazard of the right memory type, deferred across the
   window the trigger opens.
+
+---
+
+# The logits are structurally expected to take this path: `direct_host_binding=0`
+
+Completed the chain from the other end — from GLM's logits binding to the deferred writeback — using the
+recorded allocation trace rather than inference.
+
+## The gating condition
+
+The writeback is queued in `materialize_bindings` (`command-program-executor.cpp:764`) for any binding that
+is host-visible and not a graph input:
+
+    staging.download = access.write && !binding.graph_input;
+
+guarded by `if (binding.host_data == nullptr) { ... continue; }` (`:750`) — i.e. only **host-visible**
+bindings reach it. A host-visible binding that the graph **writes** therefore queues a deferred writeback.
+
+## The logits are exactly that, and not by the direct path
+
+The recorded trace (`docs/315-mechanism.md:34`, and `315-task9-session-state-2026-10-12.md:3304`) shows the
+logits allocation as:
+
+    type=HRX0_HOST  host_visible=1  direct_host_binding=0  memory_type=0x52  size=619520
+
+and `ggml-hrx.cpp:319` defines the flag:
+
+    const bool direct_host_binding = host_visible && type_context->device->use_direct_host_bindings;
+
+with `use_direct_host_bindings = environment_flag_enabled("GGML_HRX_USE_UNIFIED_MEMORY")` (`:1202`), which
+**defaults off**. So on the shipped configuration the logits are `host_visible=1` but
+`direct_host_binding=0` — host-visible *without* the direct binding — which is precisely the condition that
+routes them through host staging rather than binding host memory in place.
+
+## What that means for this lead
+
+- The logits are **host-visible** (so `host_data != nullptr` holds) and are **written by the graph** (so
+  `access.write` holds), and they are **not** a graph input. All three terms of
+  `access.write && !binding.graph_input` are satisfied.
+- They are **not** on the direct-binding fast path (`direct_host_binding=0`), which is the path that would
+  bypass staging entirely.
+- The staging buffer that the deferred read later dereferences is the non-coherent `0x52` mapping traced
+  above.
+
+So the deferred-writeback path is **structurally expected** to carry the logits, not merely reachable in
+principle.
+
+## Still owed, and it is only a measurement
+
+All of the above is static. Whether `pending_host_writebacks_` is non-empty at the right moments during a
+GLM decode, and whether `rec_eq_sync` is ever 0 under the eviction rig, is what the staged probe
+(`~/wt/315wb-probe.sh`, one decode with `GGML_HRX_WRITEBACK_FINGERPRINT=1`) reports. Static expectation is
+not a result, and this section is explicitly not claiming one.

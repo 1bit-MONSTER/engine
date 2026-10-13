@@ -155,3 +155,80 @@ quarantine counters may simply not be on the trigger's path.
 So the lead is **not** "the pool leaks its in-flight count" — that is unsupported — and the live question is
 whether this quarantine machinery is on the trigger's path at all. Answering that is a runtime counter
 question (pool stats in a faulting arm), which is the cheap next step already named.
+
+---
+
+# The pool's DOCUMENTED retirement/reuse contract — a concrete stale-read surface
+
+Checked whether the quarantine counters could simply be read at runtime (the "cheap next step" named above).
+**They cannot**, and finding that out exposed something better.
+
+## The counters are NOT exposed
+
+`hrx_mem_pool_get_attribute` exists and is public, but the attribute enum is closed:
+
+    HRX_MEM_POOL_ATTR_REUSE_FOLLOW_EVENT_DEPENDENCIES = 0
+    HRX_MEM_POOL_ATTR_REUSE_ALLOW_INTERNAL_DEPENDENCIES = 1
+    HRX_MEM_POOL_ATTR_REUSE_ALLOW_OPPORTUNISTIC = 2
+    HRX_MEM_POOL_ATTR_RELEASE_THRESHOLD = 3
+    HRX_MEM_POOL_ATTR_RESERVED_MEM_CURRENT = 4
+    HRX_MEM_POOL_ATTR_RESERVED_MEM_HIGH = 5
+    HRX_MEM_POOL_ATTR_USED_MEM_CURRENT = 6
+    HRX_MEM_POOL_ATTR_USED_MEM_HIGH = 7
+
+No `quarantine_eviction_count`, no `bytes_quarantined`, no `inflight_allocation_count`. The quarantine
+counters the decompiled `trim` reads come from `iree_hal_pool_query_stats` into a **local struct** and never
+leave the library. So the counter test needs an API change to the runtime, which is out of scope.
+
+## What the header documents instead — the retirement/reuse contract
+
+`libhrx/include/hrx_runtime.h`, verbatim:
+
+    // Records a logical allocation backed by |pool|. Logical usage is distinct
+    // from physical TLSF reservations, which can remain retained for later
+    // stream-ordered reuse.
+    hrx_mem_pool_record_logical_allocation(pool, size);
+
+    // Records retirement of a logical allocation backed by |pool|. The physical
+    // reservation remains owned by its buffer until that buffer is released or
+    // reused.
+    hrx_mem_pool_record_logical_free(pool, size);
+
+    // Trims unused backing storage toward the pool's configured release threshold.
+    // This is intended for stream-ordered free completion paths.
+    hrx_mem_pool_release_unused(pool);
+
+and the attribute enum names the reuse policy explicitly — `REUSE_FOLLOW_EVENT_DEPENDENCIES`,
+`REUSE_ALLOW_INTERNAL_DEPENDENCIES`, `REUSE_ALLOW_OPPORTUNISTIC`.
+
+**So the pool deliberately retains and reuses physical memory across stream ordering.** Logical free and
+physical release are separated in time, by design, and `release_unused` is documented as belonging on
+*stream-ordered free completion paths*.
+
+## Why this is the concrete stale-read surface
+
+That separation is exactly the shape a stale read needs:
+
+    a buffer is logically retired  ->  its physical reservation is RETAINED  ->  reused for something else
+                                                                                    |
+    a consumer still holding the old expectation reads the NEW contents  <------------+
+
+and the reuse policy is **event-dependency-based** (`REUSE_FOLLOW_EVENT_DEPENDENCIES`), i.e. correctness
+rests on the pool correctly following event dependencies when it decides a reservation is reusable. If an
+eviction event displaces or delays the dependency bookkeeping — which is the trigger's class — a reservation
+could be treated as reusable earlier than the consumer finished with it.
+
+This is a **premise**, not a finding: nothing here shows the dependency tracking is wrong, and it is a
+different layer from the KFD eviction the forcer actually drives.
+
+## Honest statement of the lead after this read
+
+    quarantine/trim invariant        exists and is correctly maintained (previous sections)
+    counters observable at runtime   NO - needs an API change, out of scope
+    documented reuse contract        separates logical free from physical release, event-dependency based
+    is it on the trigger's path      UNKNOWN, and the forcer drives KFD, not pool trim
+
+So the useful residue is a **named, documented contract** (logical-free vs physical-release, ordered by event
+dependencies) that a stale read could violate — and the question of whether HRX's pool is even involved when
+KFD evicts underneath it. Both need either an API addition or a different instrument; neither is in scope as
+a change.

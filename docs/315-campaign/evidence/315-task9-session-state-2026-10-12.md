@@ -5188,3 +5188,50 @@ from its console columns.
 The honest note for whoever reads that run: `distinct_content=0` on every arm is a defect signature, not a
 finding, and it is the fifth measurement instrument on this issue to produce a zero for the wrong reason
 (after the ids dump, the writeback fingerprint, the first writeback probe and the fresh-arena knob).
+
+---
+
+## THE PEER'S ALIGNMENT RUN CANNOT SPEAK TO #315 — wrong model, and align=256 is a DECLINE (16:40)
+
+I re-derived the peer's alignment run from its raw data (its console metric is dead, `95b6062`). Two
+independent problems make its result uninformative for this issue, and both are checkable facts rather
+than opinions.
+
+### Finding 1: every arm is clean, so nothing was induced
+    arm a4096-e align=4096 cell=e requests=180 nan=0
+    arm a256-e  align=256  cell=e requests=180 nan=0
+    arm a4096-q align=4096 cell=q requests=180 nan=0
+    arm a256-q  align=256  cell=q requests=180 nan=0
+
+and the per-arm server logs agree: `nan=0 other-fault=0` in all four. **Cell `e` - which this run drives
+with `evictonly` AND a `compact_memory` loop - did not fault at all.** Against the frozen rig's 85%
+eviction-cell fault rate, a clean cell `e` means the induction failed, so the run is uninformative about
+alignment rather than evidence against it.
+
+### Finding 2: it ran the WRONG MODEL
+`315align2.sh:10` sets `M=$HOME/models/Qwen3-0.6B-Q4_K_M.gguf`. Issue #315 is about
+**GLM-4.7-Flash-Q4_K_M** specifically - the whole record, every arm, every face, and the eviction trigger's
+85% rate are all GLM. A 0.6B Qwen result cannot bear on a GLM fault, and the fault's model-specificity is
+part of what an explanation has to account for.
+
+### Finding 3: `align=256` is a DECLINE, not a stress layout
+`dispatch-flash-attention.cpp:381-386`:
+
+    // Any other layout is a test rig whose safety is not established, so DECLINE (fall back to
+    // flash_attention_f32_f16_wmma) rather than run an unproven layout and risk a probabilistic fault.
+    if (decode_split_partial_alignment() != 4096u) { return {}; }
+
+So setting `align=256` does **not** reproduce the layout the #123/#140 oracle used to expose the fault -
+it makes the dispatch **refuse the decode-split kernel entirely** and fall back. The test is therefore
+"decode-split kernel bypassed vs present", which is a legitimate experiment but a different one from
+"alignment-sensitive emission", and it must be labelled as such.
+
+### What this means
+The peer's run is the right *kind* of idea (test the emission class under the real trigger) executed with
+three defects that each independently make it unable to answer the question: a dead metric, the wrong model,
+and a knob whose semantics differ from what the experiment needs. Its four arms are clean for those reasons.
+
+Recorded without running my own version: the box is held by that run, and a correct version would need GLM
+(the arms' model), a populated fault metric, and a genuine stress rather than a decline - which the code
+does not currently offer for alignment. That last point is the real finding: **`GGML_HRX_FA_PARTIAL_ALIGN`
+cannot be used as a stress knob in this pin**, because any non-production value is declined rather than run.

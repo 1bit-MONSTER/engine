@@ -3073,3 +3073,57 @@ first clause and criterion 2's fix.
 Recorded rather than silently overwritten: my "43.8% vs 0/30, p=0.0002" figure (commit 8bd0e21) was
 computed from a per-cell grep that counted gate-wait lines. The driver's own summary is the authority
 and gives the larger effect. Both are in the record; the summary-derived numbers supersede.
+
+---
+
+# TURN DISPOSITION 2 (2026-10-13 ~09:00) — the mechanism is named; the fix is not
+
+## What changed this turn, in one line
+The issue went from "no candidate survives its own test" to **"the trigger is named, replicated, and
+pre-registered, with both faces produced by one controlled intervention"** — and the specific code site
+remains unidentified, so no forward fix is landable.
+
+## Criteria, final
+
+    1. named falsifiable mechanism, both faces, discriminating experiment  MET at the TRIGGER level
+       - named:        forced eviction of in-flight KFD work causes the fault
+       - falsifiable:  4 branches pre-registered BEFORE the run (36f360a)
+       - discriminating: 3 cells isolate eviction from thermal/CPU/benchmark-presence
+       - alternatives ruled out: CPU pressure 0/12, quiet 0/10 (two runs)
+       - both faces:   4 Face A + 3 Face B under the same intervention, same run
+       - effect:       70% vs 0/22, Fisher p = 3.6e-5, control bound 13.6%
+       - NOT met at the code-site level: which handoff reads the stale data is unnamed
+    2. forward-only fix landed                                          NOT MET
+       no fix, because the site to repair is unidentified; landing a change now
+       would ship something no evidence supports (and task-9's contract forbids it)
+    3. >=60 in-regime arms, 0 faults, CI + power statement              MET (315cwsr70)
+       interpretation weakened: an ambient 0/70 no longer reads as "cwsr=0 fixes it"
+    4. no regression                                                    NOT STARTED (no fix)
+       runnable gates pass: copyright, check_pins
+    5. KNOWN-ISSUES.md updated with the evidence                        MET (8d690ca, pushed branch)
+
+## The honest summary
+- **Criterion 1's first clause is met, and it is the hardest clause.** The issue now has a mechanism
+  with a pre-registered controlled experiment, a verified instrument, both faces, and p = 3.6e-5 -
+  where this morning it had nothing.
+- **Criterion 2 remains open and is not closeable from here.** A trigger is not a cause. The static leg
+  already cleared the #140-class handoff in GLM's path (`1de679f`), so the corrupted handoff is
+  elsewhere; finding it is a fresh static/dynamic investigation, not a step this turn can take.
+- **Two of my own recorded conclusions were wrong and are corrected**: "H2' is falsified" (eviction
+  DOES cause the fault by intervention; only the per-arm correlation failed), and "Face B has not
+  appeared under forced eviction" (3 of disc2's 5 faults are Face B).
+
+## What a next turn should do
+1. Use the now-affordable intervention as a TEST RIG: at 70% fault rate, an A/B of any candidate fence
+   needs ~5 arms per cell, not 60. That is the difference the rate-raiser makes.
+2. Locate the handoff by differential: the static search over GLM's dispatch path found no unfenced
+   cross-wave handoff, so the corrupted buffer is likely one the eviction invalidates WITHOUT a
+   missing fence - a host-visible/zero-copy surface, given the logits allocation is host-visible and
+   non-coherent (`ggml-hrx.cpp:305-311`). That is where the next static pass should look.
+3. Do NOT re-run the 60-arm ambient campaign for acceptance; at ~5-7% it cannot resolve the question
+   and the objective's criterion 3 is already met on the record.
+
+## Box left clean
+0 HRX0 holders, GTT 26 GiB, VRAM 0, locks free, no watcher, load 0.24, drop-in present with
+cwsr_enable=0 in 3 grub entries (shipped boot state). Live cwsr=1 until a reboot (not taken
+unilaterally).

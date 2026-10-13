@@ -985,3 +985,43 @@ Once `pgrep -x rsync` is empty:
 Then after the reboot: `nohup bash ~/wt/315-evict-trace.sh 20 315ctl1 > ~/wt/315ctl1-run.log 2>&1 &`
 Reading key: rate ~26% -> H1 confirmed (signal was a boot artefact, criterion 1 collapses);
 rate ~0% -> H1 dead, cwsr=0 signal real, H2 the sole survivor.
+
+---
+
+## BLOCKER CLEARED — 2026-10-13 04:50 — control is GO, awaiting /goal-resume
+
+The rsync finished. Full precondition re-check at 04:50:34:
+
+    rsync            0        <- CLEARED (was the blocker)
+    any 315 campaign 0
+    HRX holders      0
+    npu.lock         FREE
+    cwsr_enable      0        (drop-in present)
+    sudo -n          ok
+    control staged   yes      (~/wt/315-cwsr-control.sh)
+    other sessions   0
+    load             0.29 0.37 0.43
+    GTT              26.5 GiB (baseline)
+    1bit-canonical   active, 0 connections   (enabled+linger -> ~2 min self-restart)
+    coder-llm        active, 0 connections   (enabled+linger -> ~2 min self-restart)
+
+Every constraint is satisfied: the only disturbance a reboot now causes is ~2 minutes of
+self-healing restart for two idle managed services. The inbound transfer that made this a
+constraint violation is gone.
+
+**The goal is still in the `blocked` state, however, and the objective's verification contract
+ends with "If blocked: stop and ask the user."** So the control does NOT run until the user
+resumes. This is not a wait-able condition any more - it is a state transition the user owns.
+
+### To proceed, the user runs /goal-resume, then this single command:
+    ssh strixhalo 'cd ~/wt && TAG=315ctl1 PAIRS=20 bash 315-cwsr-control.sh'
+    # reboots; after the box returns:
+    ssh strixhalo 'nohup bash ~/wt/315-evict-trace.sh 20 315ctl1 > ~/wt/315ctl1-run.log 2>&1 &'
+
+Reading key: rate ~26% -> H1 CONFIRMED (cwsr=0 signal was a fresh-boot artefact; criterion 1
+collapses and the issue should be re-scoped honestly). rate ~0% -> H1 DEAD (the cwsr=0 signal is
+real; H2 is the sole surviving candidate to pursue, and this control also supplies H2's only
+faulting arms with captured PIDs).
+
+Rollback if needed: sudo cp ~/work/amd_cwsr.cfg.backup /etc/default/grub.d/amd_cwsr.cfg &&
+sudo update-grub && sudo systemctl reboot

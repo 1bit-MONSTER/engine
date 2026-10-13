@@ -3390,3 +3390,48 @@ this.
 ### What this cost, honestly
 Roughly 45 minutes of box time across several full rebuilds, mostly spent on problems that were NOT
 about the fix: the copied-cache incident, and IREE's `-Werror`. The patch itself is one guarded call.
+
+---
+
+## THE FORWARD-ONLY FIX IS PREPARED ON THE FORK (10:12) — waiting on the A/B
+
+### The change, in its shipped form
+`~/engine/third_party/llama.cpp` on branch `1bit/315-coherent-host-read`, one hunk in `buffer_get`:
+
+    -    if (context->base != reinterpret_cast<uint8_t *>(GGML_HRX_FAKE_PTR_BASE)) {
+    -        std::memcpy(data, context->base + source_offset, size);
+    -        return;
+    -    }
+    +    // (comment: the non-coherent mmap, the missing invalidate, the measured 7/10 vs 0/22)
+         if (!HRX_CHECK(hrx_synchronous_d2h(context->device->device, context->buffer, source_offset, data, size))) {
+             GGML_LOG_ERROR("%s: HRX buffer download failed\n", __func__);
+         }
+
+Net: **11 insertions, 4 deletions**. The bare `memcpy` of a non-coherent mapping is DELETED, and both
+cases (mapped host-visible and otherwise) now take the runtime's queued HAL download. That is the
+smallest correct form - the earlier two-branch version called `hrx_synchronous_d2h` in both branches, so
+the `if` was redundant and was collapsed.
+
+### Forward-only, verified
+    git merge-base --is-ancestor 0e255d774032 HEAD  ->  TRUE
+    HEAD = 0e255d774  (the branch is created AT the pinned rev, so the pin is trivially an ancestor)
+The engine-side move is then the gitlink plus `registry/architectures.json:4` (both currently
+`0e255d774032`), changed together, and `tools/check_pins.py main` re-run.
+
+Infrastructure note: `engine/third_party/llama.cpp` was an EMPTY submodule (0 files) - the gitlink was
+present but never initialized. Now `git submodule update --init` has populated it at the pinned rev, so
+the tree can actually carry a fork-side commit.
+
+### What is still pending, and in what order
+1. **The A/B must pass** (running now as `315ab1a` knob-off / `315ab1b` knob-on, pre-registered at
+   `fc7ffd5`). If the fix does not stop the forced-eviction fault, this whole branch is moot.
+2. Then push the fork branch, move the engine gitlink + registry together, and run the >=60-arm
+   in-regime campaign ON THE FIXED BUILD - criterion 3's bar was met by `315cwsr70` on an UNFIXED build,
+   so it must be re-run for the fixed one.
+3. Then criterion 4's regression controls (dense model + MUL_MAT_ID op-test, engine CI).
+
+### Honest status of the turn
+The mechanism is named and replicated (70% vs 0/22, p = 3.6e-5, both faces). The cause is named at
+file:line. The fix is written, built, smoke-tested (both knob states answer correctly, zero faults) and
+prepared forward-only on the fork. What remains is the A/B result and then the campaign on the fixed
+build - both of which are measured work, not open questions.

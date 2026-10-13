@@ -2025,3 +2025,30 @@ Box time note: at ~4.5 min/arm, a >=60 fix-cell campaign is ~4.5 h, and the goal
 this turn at ~10-11 h of the stated 12 h ceiling. That budget is the binding constraint on task-9's
 campaign, independent of the mechanism, and it is worth stating plainly to the user when the verdict
 lands rather than discovering it mid-campaign.
+
+## The contract's falsified-levers check PASSES for the current mechanism (06:35)
+
+Task-9's verification contract requires: "Re-read the issue's falsified-levers list and confirm the
+claimed mechanism is not one of them; if it is, the fix is rejected." Ran it rather than assuming.
+
+The list, verbatim from `KNOWN-ISSUES.md` §"Levers tested and excluded" (7 entries):
+
+    1. **`GGML_HRX_TRANSIENT_REUSE=legacy`**
+    2. **Placement advice on the transient arena's committed backing**
+    3. **The staged host writeback path**
+    4. **The direct device-to-host copy not being covered by the wait**
+    5. **Pinning `f2099e9b7` (the `1bit/amd-core-our-hrx` cell)**   <- an ancestor, i.e. a revert
+    6. **The `TRANSIENT_REUSE` knob is not a lever for this fault**  (restatement of 1)
+    7. **The sleeping wait returning before completion**
+
+Case-insensitive search of that section for `cwsr|preempt|evict|resum|migrat|stale`: **0 matches.**
+
+So the mechanism as it now stands - H2' (resumption-dependent buffer borrowing) and the #123/#140
+stale-buffer class (an LDS-only-fenced producer->consumer handoff letting a consumer read a slot's
+previous contents, triggered by preemption/eviction) - is **not** on the falsified list. The affected
+levers are a different set: transient-reuse knobs, placement advice, the host writeback path, the
+device-to-host copy wait, an ancestor pin, and the sleeping wait.
+
+Note this check will need RE-RUNNING against whatever the actual landed change turns out to be: the
+list is about the CHANGE, not the mechanism. A fix that merely re-enabled `GGML_HRX_TRANSIENT_REUSE`
+would be rejected regardless of the mechanism it claimed. Recorded so the check is available verbatim.

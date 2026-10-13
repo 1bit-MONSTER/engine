@@ -2653,11 +2653,47 @@ The two faces are now characterised at the level of concrete timestamps rather t
 That is a materially different pair of signatures from "intermittent corruption somewhere in the run",
 and it sharpens what a mechanism must explain: Face A is an *initialisation-adjacent* whole-buffer
 failure, Face B a *late, partial* content failure. It also means a future experiment can target the
-warmup phase specifically, which is both cheaper (seconds, not minutes per arm) and much higher-yield
-than sampling the full 66-request workload - the fault appeared 165 ms into a warmup in one arm of a
-27-arm run.
+warmup phase specifically for SENSITIVITY - the fault appeared 165 ms into a warmup request in one arm
+of a 27-arm run. [CORRECTED 08:55 below: warmup-targeting is NOT cheaper, because the ~14 min model
+load dominates every arm regardless of how many requests follow.]
 
 NOT claimed: that the two faces have different mechanisms (they may still be one defect seen at
 different phases); that the warmup phase is *enriched* for the fault (n=1 at that phase, and the
 historical comparator is another single example); or that Face A is confined to warmup. What IS
 established is the phase, the extent, and the survival-vs-abort difference, each with a timestamp.
+
+---
+
+## CORRECTION to my own claim (08:55): a warmup-targeted design is NOT cheaper — the load dominates
+
+In the characterisation above I wrote that a future experiment "can target the warmup phase
+specifically, which is both cheaper (seconds, not minutes per arm) and much higher-yield". The first
+half is **WRONG** and I checked it rather than leaving it in the record.
+
+The fault at 11.3 s happens *after* the model has loaded, and the load is where the time goes:
+
+    p16c timeline:  0.00 -> 0.10.67  load_model + model loaded    (~10.7 min of the 0.11.3 life)
+                    0.11.11          first request launched
+                    0.11.28          fault                            <- 165 ms of actual compute
+
+So an arm that stops after one request still pays the ~10-15 min load. Costed:
+
+    warmup-only (1 request)   ~14.5 min/arm   -> 20 arms = ~4.8 h
+    full pair (66 requests)   ~17.3 min/arm   -> 20 pairs = ~3.1 h  (and 20 pairs yields 40 arms)
+
+Warmup-only is therefore MORE expensive per informative arm, not less: it saves ~3 min of request
+phase while keeping the ~14 min load, and it yields one arm per load instead of two.
+
+**What survives from the observation is the other half:** the fault is reachable on the FIRST request,
+so a warmup-phase arm is a legitimate *harbour* for the fault and is much faster *once loaded*. The
+yield claim (higher-yield) is untested - it rests on n=1 at that phase plus one historical comparator.
+
+Corrected statement, for the record: **the fault is observed on the first request 165 ms in, which
+tells us the defect is present at load-completion and does not require a long generation phase; it does
+NOT make the experiment cheaper, because the model load dominates every arm regardless.** A future
+design should target the phase for *sensitivity*, not for cost - and any such design must first
+measure the warmup-phase rate, which is exactly the "measure the rate at your configuration" lesson
+from the 26%-vs-7% correction.
+
+Recorded because an over-claim left standing in the evidence file is how a future session ends up
+sizing an experiment from a number that was never true.

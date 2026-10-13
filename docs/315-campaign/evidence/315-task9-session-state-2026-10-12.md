@@ -4100,3 +4100,73 @@ conclusion comes from the DATA, not from the knob.
     read    : [hrx-ids-fp] dup_pairs, and FIRST check that min/max are a plausible index range
               (min>=0, max small). If they are not, the instrument is still not reading the tensor and
               the run is uninformative regardless of what dup_pairs says.
+
+---
+
+# THE IDS INSTRUMENT IS DEFINITIVELY DEAD (13:50) — and the coherence knob did not fix it
+
+`315ids3` ran the ids instrument with `GGML_HRX_USE_UNIFIED_MEMORY=1`, the runtime knob that is supposed
+to make host-visible allocations `HOST_COHERENT` and therefore make the read valid. It did not work, and
+the evidence is unambiguous on three independent points:
+
+### 1. The coherence knob never took effect
+The code prints `ggml_hrx: direct coherent host bindings enabled by GGML_HRX_USE_UNIFIED_MEMORY` when the
+knob is read (`ggml-hrx.cpp:1184`). In the `315ids3` arm log:
+
+    "direct coherent host bindings" occurrences : 0
+    the only 'unified' string in the log         : kv_unified = 'false'   <- an unrelated server flag
+    ggml_hrx log lines                           : 0
+
+So the device-init path that would confirm the knob did not run, and the allocation was not made
+coherent.
+
+### 2. The read is unchanged by the knob, measured directly
+Comparing the faulting arm across the two runs, by read class:
+
+    run       total ids lines   all-zero (min=0 max=0)   float-bits (min=-1e6..)   other
+    ids2          6376               2984                    2925                467
+    ids3          7456               2984                    3971                501
+
+The `all-zero` count is **identical** (2984) - the signature of the invalid class did not move at all -
+while float-bits went *up*. So the knob altered nothing about how the tensors read.
+
+### 3. The instrument is invalid for the WHOLE arm, including at the fault
+    ids lines span log lines 12 .. 7579   (the arm has 7667 lines)
+    completed requests                    60
+    the FAULT is at log line 7580 - immediately after the last ids line
+
+So the routing tensors were sampled across the entire arm and **every sample is invalid**, including the
+one immediately preceding the fault. There is no valid sample to compare.
+
+### Why this closes the ids route rather than merely delaying it
+The instrument has now been through three separate attempts - the by-name fingerprint (section 53), the
+ordered locator (section 59), and the ids dump with a coherence knob (this turn) - and all three fail the
+same way: a host-visible, non-coherent arena read returns either zeros or another tensor's bytes. The
+`GGML_HRX_USE_UNIFIED_MEMORY` enabler was the last no-build option, and it did not apply.
+
+### What remains for the routing hypothesis, and its honest cost
+The only surviving ways to read those indices are:
+  (a) a **device-side** copy into a coherent buffer (a kernel change in the fork - real work, and the
+      kernel corpus is a generated artifact with its own build path);
+  (b) deriving the answer **without reading ids** - recomputing the MoE from the same inputs and comparing
+      outputs, which needs the harness to capture response text (it currently records only counts).
+Both are meaningfully larger than anything left in this turn's budget, and (a) touches the kernel corpus.
+
+### Also: this was the SEVENTH independent replication
+`315ids3` faulted in the eviction cell again (`round 1 arm e: FAULT nan=1 req=16 transport=1`, Face A).
+Pooled across all runs of the frozen rig: **19 faults / 23 eviction-cell arms (83%)** against
+**1 fault / 45 control arms (2.2%)**. The trigger result is now overwhelming and fully independent of the
+cause question.
+
+### Honest statement of where the goal stands
+    criterion 1 (named mechanism): the TRIGGER is named, replicated seven times, controlled, and
+        pre-registered - a real, falsifiable, discriminating result. The CAUSE is NOT named: one candidate
+        eliminated by its own A/B, three live candidates all blocked by a shared instrumentation gap that
+        three instruments have failed to close.
+    criterion 2 (forward-only fix): NOT met, and correctly so - the fix I built was refuted by its own
+        pre-registered A/B, and there is no validated mechanism to repair.
+    criterion 3 (>=60 arms zero faults): NOT met in the sense that matters - the recorded 0/70 campaign
+        has no eviction cell, so it measures ambient pressure rather than the faulting regime.
+    criterion 4: not reached.
+    criterion 5: DONE - KNOWN-ISSUES carries the corrected rate, the closed families, the per-face timing,
+        the eviction result, and the traps.

@@ -50,6 +50,26 @@ def compare(repo, old, new):
         return json.load(r)
 
 
+def registry_llama_cpp():
+    """The llama.cpp revision declared in registry/architectures.json, or None if absent.
+
+    That value is what the engine's registry tells users the tree is pinned to; the gitlink is what the
+    tree actually builds. Nothing else ties them together, so a half-move (one updated, the other not)
+    would pass every other gate while shipping an inconsistent tree.
+    """
+    try:
+        with open("registry/architectures.json") as f:
+            doc = json.load(f)
+    except (OSError, ValueError):
+        return None
+    for key in ("llama.cpp (hrx)", "llama.cpp"):
+        for scope in (doc.get("sources", {}), doc):
+            value = scope.get(key) if isinstance(scope, dict) else None
+            if isinstance(value, str) and value:
+                return value, key
+    return None
+
+
 def main():
     if len(sys.argv) != 2:
         sys.exit(__doc__)
@@ -61,6 +81,20 @@ def main():
         name, field = key[len("submodule."):].rsplit(".", 1)
         subs.setdefault(name, {})[field] = value
     bad = 0
+
+    # The registry declares the llama.cpp revision independently of the gitlink; require them to agree.
+    declared = registry_llama_cpp()
+    if declared:
+        value, key = declared
+        link = gitlink("HEAD", "third_party/llama.cpp")
+        if link and value != link:
+            print(f"FAIL registry/architectures.json: \"{key}\" is {value[:9]} but the gitlink at "
+                  f"third_party/llama.cpp is {link[:9]} - move both together (tools/check_pins.py "
+                  f"compares gitlinks only and will not catch a half-move)")
+            bad += 1
+        elif link:
+            print(f"ok   registry/architectures.json: \"{key}\" agrees with the gitlink ({link[:9]})")
+
     for sub in subs.values():
         path, url = sub.get("path"), sub.get("url", "")
         old, new = gitlink(base, path), gitlink("HEAD", path)

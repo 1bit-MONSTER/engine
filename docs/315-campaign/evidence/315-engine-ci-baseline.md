@@ -47,11 +47,20 @@ rather than through the workflow.
 compare API whether the new commit is ahead of the old one. It is the machine enforcement of the
 objective's "must not be a revert" clause, and it works here (rows 2-3).
 
-What it does **not** cover: the hrx revision declared in `registry/architectures.json`
-(`"llama.cpp (hrx)": "e44c9d01a4d5..."`). `tests/registry_gaps_test.py` reads that file, but it checks
-class coverage, not the pin, and nothing in `tools/` or `tests/` ties the registry value to the
-gitlink. So a change that bumps one and not the other passes CI while leaving the tree inconsistent.
-Task-7 has to move both, by hand, and cannot rely on the gate to catch a half-move.
+**Gap found and CLOSED (2026-10-13).** As originally recorded, `check_pins.py` covered only the
+submodule gitlinks, not the hrx revision declared in `registry/architectures.json`
+(`"sources": { "llama.cpp (hrx)": "e44c9d01a4d5..." }`). `tests/registry_gaps_test.py` reads that file
+but checks class coverage, not the pin, and nothing tied the registry value to the gitlink.
+
+Demonstrated rather than asserted: setting the registry's declared revision to all-zeros passed
+`check_pins.py`, `registry_build.py --check-gaps` **and** `tests/registry_gaps_test.py` — every gate
+green on an inconsistent tree.
+
+`tools/check_pins.py` now reads the registry and requires it to agree with the gitlink at
+`third_party/llama.cpp`, failing with an explicit message when they diverge. Verified both directions:
+exit 0 on the consistent tree (`"llama.cpp (hrx)" agrees with the gitlink (e44c9d01a)`) and exit 1 on
+the half-move, with the message naming both revisions and pointing at the file that must be moved too.
+So a half-move can no longer pass CI, and task-7's "move both by hand" is now enforced by the gate.
 
 ## The pin lineage, and why the fix cannot be "move the pin"
 

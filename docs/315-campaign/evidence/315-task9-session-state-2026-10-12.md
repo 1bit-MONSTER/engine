@@ -5235,3 +5235,72 @@ Recorded without running my own version: the box is held by that run, and a corr
 (the arms' model), a populated fault metric, and a genuine stress rather than a decline - which the code
 does not currently offer for alignment. That last point is the real finding: **`GGML_HRX_FA_PARTIAL_ALIGN`
 cannot be used as a stress knob in this pin**, because any non-production value is declined rather than run.
+
+---
+
+# HONEST ASSESSMENT AT 16:45 — where the goal actually is
+
+## Criteria, against the objective's own wording
+
+**1. "A named, falsifiable mechanism for both faces, with a discriminating experiment that rules out the
+surviving alternatives."**
+ - **TRIGGER: MET.** Forced KFD eviction of in-flight work causes the fault: **28 faults / 33 eviction-cell
+   arms (85%) vs 4 / 60 control arms (6.7%), Fisher p = 7e-13**, across **nine independent runs**, both
+   faces, two binaries, three of the runs not authored by me. The instrument is verified (4,134 Q_EVICT in
+   25 s vs 0 quiet). The comparison controls for thermal, CPU contention and benchmark presence via two
+   different control side-loads.
+ - **CAUSE: NOT MET.** Five candidate classes eliminated this session, each with a recorded reason:
+   the immediate CPU read of the logits (refuted by its own pre-registered A/B); the deferred read (queue
+   never populated - two independent probes); the #140-class unfenced handoff in GLM's FA path (both
+   fences present); the consumer read path, dispatch ordering and the block split; and steady computation
+   corruption (0 of 6 faulting arms differ from the clean answer across 14 recorded-text arms).
+   Two candidates remain live (device write into moved backing; intermediate-buffer propagation) and
+   neither has an instrument.
+ - **The candidate family is not exhausted by argument but by measurement**, and the measurements keep
+   failing for one shared reason: this box's instruments cannot observe memory state coherently.
+
+**2. Forward-only fix landed. NOT MET, and correctly so.** The one candidate built this session (the
+coherent-read fix) was refuted by its own pre-registered A/B. Landing a change now would ship something
+no evidence supports, which the contract forbids while the mechanism is unnamed.
+
+**3. ≥60 in-regime arms, zero faults, CI + power. NOT MET in the sense that matters.** The recorded
+`315cwsr70` campaign passed its bar (70/70 fix-cell, 0 faults, CI 3.14%) - but it has **no eviction cell**,
+so it measures ambient pressure, not the faulting regime. Against the trigger now established (85% under
+forced eviction, ~5-7% ambient), a 0/70 ambient run does not evidence the fixed behaviour.
+
+**4. No regression. NOT REACHED** - no fix.
+
+**5. KNOWN-ISSUES updated. DONE** - the entry carries the corrected rate, the closed families, the
+per-face timing, the eviction result and the traps, on the pushed branch
+`1bit/315-known-issues-rate-and-closures`.
+
+## What this session actually produced
+ - **the trigger, named and replicated nine times at p=7e-13** - the strongest empirical result the issue
+   has ever had, and it replaced a confounded 26%-vs-CWSR comparison;
+ - **five candidate classes eliminated**, four of them this session;
+ - **the first ever clean comparator** for faulting arms' output: 14 arms with recorded text showing the
+   model computes correctly until a terminal whole-buffer event;
+ - **the harness now records response text** (a permanent improvement, verified additive);
+ - **six instruments diagnosed as producing zeros for the wrong reason** - a systemic finding about this
+   box's instrumentation, recorded so the next attempt does not trust a silent zero;
+ - **the correct rate** (~5-7%, not 26%) with the pool decomposition that shows why every earlier
+   instrument was mis-powered.
+
+## Why I am not calling this complete or blocked
+Not complete: criteria 2, 3 and 4 are unmet, and criterion 1's cause half is unmet. The auditor would
+reject it, correctly.
+Not blocked in the objective's sense yet: the blocker has not recurred three times as *the* blocker on
+consecutive turns - each turn I found and eliminated new ground. But the remaining path is instrument-
+bound, and I have now shown that every available instrument fails on this box for the same reason.
+
+## What would actually be needed
+One of:
+ (a) **a coherent or device-side read** of an intermediate buffer - a fork-side instrumentation change
+     (the kernel corpus is a generated artifact with its own build path);
+ (b) **a genuine stress for the alignment class** - the current knob DECLINES any non-production value, so
+     this needs code, not an env flag;
+ (c) **the box's instrumentation to be fixed at source** - the recurring failure is that a host-visible
+     non-coherent arena read returns zeros or another tensor's bytes, which has now defeated five
+     instruments.
+All three are code changes on the fork side, in scope, and each is larger than what remains of this turn's
+budget.

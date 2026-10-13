@@ -1145,3 +1145,72 @@ The peer's driver does **not** take the box lock (verified), so both wait for ac
 | 3 | >=60 in-regime arms, zero faults | **not met**; the recorded 0/70 has no eviction cell |
 | 4 | no regression | **partially**: all seven recorded CI gates now pass (was red); the dense-model and MUL_MAT_ID controls still need a landed fix to compare against |
 | 5 | KNOWN-ISSUES updated | **done**, and refreshed with the four closed families |
+
+---
+
+# UPDATE 15 (2026-10-13 ~15:30) — the deferred-writeback lead is CLOSED by mechanism; six families now
+
+Continues UPDATE 14. The fifth candidate was tested and closed, with its probes run.
+
+## The lead, and why it closed
+
+`add_host_writeback` queues a host `memcpy` and `mark_stream_synchronized` performs it later, reading from a
+`HOST_LOCAL | DEVICE_VISIBLE` = `0x52` non-coherent mapping — structurally the same class as the refuted
+candidate, but **deferred** across the window the trigger opens. The code documents the hazard itself
+("Uploading the same host memory before that has happened would read the previous contents … so nothing
+else guarantees the ordering"), and a purpose-built instrument for it
+(`GGML_HRX_WRITEBACK_FINGERPRINT`) sat unused in the binary.
+
+Three measurements settled it:
+
+1. probe take 1 — **zero records**, but the probe reused the cached graph (3 identical requests), so it
+   never asked the question. Its own tally line was also a false positive from my script grepping a header
+   it had written into the same file. Both recorded.
+2. probe take 2 — **zero records** from a *sound* probe (10 varying prompt lengths, 10 graphs rebuilt),
+   with the instrumentation confirmed compiled in and callable.
+3. the buffer trace — the logits **are** `HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52
+   size=619520`, i.e. non-coherent and host-visible, exactly as predicted — **and still zero writebacks**.
+
+That contradiction resolved at the binding, not the allocation:
+
+    staging is gated on `requires_materialization()` == `host_data != nullptr`   (command-program-bindings.h:31)
+    `binding.host_data = directly_bindable ? nullptr : context->base`            (backend-buffer-binding.cpp:78)
+    measured: writebacks never queued  =>  the logits binding's host_data IS nullptr
+
+So the allocation is host-visible but the **binding** is device-addressable, and the materializer never sees
+host data for it. The deferred window therefore never opens for GLM's decode.
+
+**An earlier inference is withdrawn**: the claim that the logits are "structurally expected" to take the
+staging path rested on reading a comment about the general case as decisive for this binding. The event
+count says otherwise, and the cheap measurement should have preceded the static write-up.
+
+## Six families now closed
+
+| family | disposition |
+|---|---|
+| logits **read path** (`hrx_synchronous_d2h`) | REFUTED by its own pre-registered A/B |
+| **host side** (all four accesses to `0x52`) | CLOSED — none on the decode path |
+| runtime **AQL submission policy** | CLOSED — the runtime does not infer hazards |
+| **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | REFUTED — cell `e` 4/4 FAULT both arms |
+| **deferred host writeback** | CLOSED by mechanism (this update) |
+| **(§57) FA alignment/dispatch** | **still open** — my run was uninformative, not a null |
+
+## Also this stretch
+
+- `315align` ran but is **uninformative**: 4 arms in 38 s at GTT 47 GiB with no neighbours and no
+  compaction, so the eviction window it needs was never opened. Its clean result says nothing.
+- The peer's text thread is **complete at n=14**: the fault is a **terminal whole-buffer event**, never a
+  changed computation.
+- The two threads compose: the (now-closed) writeback chain asked WHERE; the peer's evidence fixes WHEN and
+  WHAT SHAPE. With the writeback family closed, the shape constraint now needs a different carrier — a
+  deferred read that is **not** on the host-staging path.
+
+## Criteria (unchanged in substance)
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named mechanism | trigger named/replicated (pooled p<=1.3e-17, both faces); **cause still not located** after six families |
+| 2 | forward-only fix | **not achievable**: the one prepared candidate is refuted |
+| 3 | >=60 in-regime arms, zero faults | **not met**; the 0/70 has no eviction cell |
+| 4 | no regression | CI gates all green (were red); controls need a landed fix to compare |
+| 5 | KNOWN-ISSUES updated | done |

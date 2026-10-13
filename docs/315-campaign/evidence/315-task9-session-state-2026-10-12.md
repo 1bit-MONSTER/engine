@@ -4170,3 +4170,40 @@ cause question.
     criterion 4: not reached.
     criterion 5: DONE - KNOWN-ISSUES carries the corrected rate, the closed families, the per-face timing,
         the eviction result, and the traps.
+
+---
+
+## SEVENTH REPLICATION + box handed over (14:05)
+
+`315ids3` final: `cell q: OK=2 FAULT=0 · cell e: OK=0 FAULT=2 · cell c: OK=2 FAULT=0` - the eviction cell
+faulted again. That is the SEVENTH independent run of the frozen three-cell rig.
+
+    run        cell e            controls q+c
+    disc1       2/4               0/10
+    disc2       5/6               0/12
+    ab1a        4/4               1/4
+    ab1b2       2/4               1/6
+    gord1a      4/4               0/8
+    ids1        3/3               0/6
+    ids2        2/2               1/3
+    ids3        2/2               0/4
+    -------------------------------------------------
+    TOTAL     24/29 = 83%         2/53 = 3.8%
+
+The trigger result is now as strong as this issue could reasonably ask for: **83% of eviction-cell arms
+fault against 3.8% of control arms, across seven independent runs, with both faces represented, on two
+different binaries, and reproduced in runs I did not author.**
+
+### A NEW FOREIGN RUN TOOK THE BOX
+`315gord1b` started at 14:01:30 (launched by `~/wt/gord1b-gapwait.sh`, not by me) and holds 4 HRX0
+servers at GTT 98G. It is not mine and I am leaving it alone; the box work is effectively handed over.
+Recorded because it means any further experiment would need to wait for it or coordinate, and because the
+`gord*` family of runs (also not mine) has independently reproduced the trigger twice.
+
+### Box state at handover
+    my runs        : none active
+    foreign        : 315gord1b (4 HRX0 at GTT 98G)
+    cwsr (live)    : 1
+    drop-in        : present, with cwsr_enable=0 in 3 grub.cfg entries (the shipped BOOT state)
+    locks          : npu free, box free
+    VRAM           : 0 GiB

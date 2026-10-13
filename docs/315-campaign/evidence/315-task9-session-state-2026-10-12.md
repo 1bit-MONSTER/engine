@@ -3574,3 +3574,51 @@ process itself.
 ## The patch is NOT to be landed
 The fork branch `1bit/315-coherent-host-read` (one hunk, forward-only, built, smoke-tested) is retained
 only as the record of a refuted hypothesis. It must not be proposed as the fix.
+
+---
+
+## ARM B COMPLETE (11:35) — the refutation is confirmed, both faces, and the forcer is NOT required
+
+Two arm-B attempts ran (the first died at composition, the second produced arms). Combined:
+
+    ARM B  GGML_HRX_COHERENT_READ=1  (the fix), patched binary, tag 315ab1b2
+        round 1 arm q: OK     nan=0 req=66              gtt 97G->98G
+        round 1 arm e: FAULT  nan=0 http=1 s500=1 unparsed=2   <- FACE B, eviction cell
+        round 1 arm c: OK     nan=0 req=66              gtt 97G->98G
+        round 2 arm e: FAULT  nan=0 http=1 s500=1 unparsed=2   <- FACE B, eviction cell
+        round 2 arm c: FAULT  nan=1 transport=1                <- FACE A, CPU cell, gtt_now 79G
+        round 2 arm q: OK     nan=0 req=66              gtt 97G->98G
+
+    per-cell:  q 4 arms / 0 faults   e 4 arms / 2 faults   c 3 arms / 1 fault
+
+Against arm A (knob unset, same binary): e 4 arms / 4 faults, c 0/4, q 1/3.
+
+### The verdict the pre-registration already named
+**H-fix REFUTED.** The fix does not reduce the eviction-cell fault rate; if anything arm B's own cells
+(e 2/4, c 1/3) show faults spread across cells rather than concentrated, which is what a
+memory-pressure-driven fault looks like once the read path is no longer the hypothesis.
+
+### The most informative single arm in the whole A/B
+`round 2 arm c: FAULT nan=1 transport=1` with `side=12/12` (CPU-only load, no GPU side load) at
+`gtt_now=79G`, in the same round as an eviction-cell fault. Two things follow:
+
+ 1. **The eviction forcer is not required.** A CPU-pressure arm faulted (Face A) with no `evictonly`
+    running. Combined with arm A's quiet-cell fault (Face B, at gtt 97G->102G drift), the picture is
+    consistent across all three runs: **the operative variable is memory pressure / GTT movement, not
+    the forcer process**. `evictonly` is a convenient WAY to create pressure - and a very effective one,
+    4/4 in arm A - but it is not the mechanism.
+ 2. **Both faces appear in both cells**, which further weakens any cell-specific story and matches the
+    issue's long-standing observation that the two faces are one defect with two observables.
+
+### What stands and what is now open
+    TRIGGER : eviction / memory pressure while work is in flight. Replicated, both faces, controlled.
+              STANDS.
+    CAUSE   : UNKNOWN. The non-coherent host read of the logits is REFUTED by experiment (this A/B).
+              The read path is therefore not where the corruption enters.
+
+### A NEW RUN APPEARED: 315gord1a (launched 11:22:08, not by me)
+A box-locked `315-disc.sh 4 315gord1a` is running against the SAME patched build with the knob **OFF**
+(`EXTRA_ENV` has no GGML_HRX_COHERENT_READ), so it is a replication of arm A on this build. It is NOT
+mine to touch - it holds the box lock - and I am leaving it alone. Its existence is recorded because it
+affects the box state and because its result, if it lands, is another independent sample of the control
+condition.

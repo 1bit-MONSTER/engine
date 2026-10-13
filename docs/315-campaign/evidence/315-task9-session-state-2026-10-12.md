@@ -25,6 +25,38 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
 
 ---
 
+<!-- TASK9-STATUS -->
+## STATUS NOW (updated 2026-10-13 05:08)
+
+    H1 CONTROL RUNNING    tag 315ctl1, cwsr_enable=1, 20 pairs
+    progress  2 fix-cell arms OK, 0 FAULT, 0 OOR, all in-regime gtt_start=97G
+    watcher   pid 8916, TTL 180 min vs run ~135 min -> will survive; NO truncation
+    locks     both held (box.lock + npu.lock)
+    boot      2026-10-13 04:53:19 (control rebooted; drop-in removed, grub clean)
+    launch    04:54:37
+    durable   committed c3f51a9 on 1bit/315-preregistration (clean tree)
+    rollback  ~/work/amd_cwsr.cfg.backup  md5 a8b25738...  == the dropped-in file
+
+    WAITER    bg task b3deb6f74 -> reports fix-cell fault tally + 315-rate.py output on completion
+
+    READING KEY (this decides criterion 1)
+      rate ~26% faults -> H1 CONFIRMED: the cwsr=0 signal was a fresh-boot artefact;
+                          criterion 1 collapses, issue needs honest re-scoping
+      rate ~0%  faults -> H1 DEAD: the cwsr=0 signal is real; H2 is the sole survivor
+
+    GOAL STATE
+      criterion 3  MET    315cwsr70: 70/70 fix-cell arms, 0 faults, CI 3.14%, all in-regime
+      criterion 1  open   no mechanism named; H2's carrier contradicted by the AMD refs
+                          (cwsr=0 -> KFD_PREEMPT_TYPE_WAVEFRONT_DRAIN; GFX11 -> DRAIN_PIPE)
+      criterion 2  open   no landed fix; both cwsr70 cells ran the same rev e44c9d01a
+      criteria 4,5 not started
+
+    IF THE CONTROL IS LOST: re-run `ssh strixhalo 'cd ~/wt && TAG=315ctl1 PAIRS=20 bash 315-cwsr-control.sh'`
+    (it reboots; cwsr is ALREADY 1 so re-running the trace script is enough):
+      ssh strixhalo 'nohup bash ~/wt/315-evict-trace.sh 20 315ctl1 > ~/wt/315ctl1-run.log 2>&1 &'
+    RESTORE cwsr=0 afterwards: sudo cp ~/work/amd_cwsr.cfg.backup /etc/default/grub.d/amd_cwsr.cfg && sudo update-grub && sudo systemctl reboot
+<!-- /TASK9-STATUS -->
+
 # engine#315 — state at 2026-10-12 ~22:20Z (corrected)
 
 ## My earlier framing was wrong on two counts; this supersedes it

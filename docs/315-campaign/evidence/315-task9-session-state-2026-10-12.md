@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5074,3 +5058,39 @@ executed).
 The two live candidates have **no instrument yet**. My text constraint still governs both: correct prior
 outputs, then a terminal whole-buffer event (always 154880 of 154880 NaN), never a gradually wrong
 computation.
+
+---
+
+## THE FRESH-ARENA TEST IS NOT RUNNABLE — the knob grows GTT past the regime gate (16:15)
+
+Pre-registered at `bc85c17`, launched, and **stopped after one arm**, because the instrument cannot satisfy
+the regime gate. Recording it as a tooling limit rather than a result.
+
+### What happened
+    round 1 arm q: INVALID nan=0 req=0 ... gtt_start=117G gtt_now=117G   side=0/0
+
+One arm, `INVALID`, with `req=0` (the server never served a request), at **`gtt_start=117G`** - outside the
+frozen 95-110 GiB gate, and past the point where the detector can allocate.
+
+### Why, and I pre-registered this exact caveat
+`GGML_HRX_DIAGNOSTIC_FRESH_TRANSIENT_ARENA` **retires** each arena buffer rather than releasing it
+(`transient-arena.cpp:83-84`, `diagnostic_retired_buffers_.push_back(buffer_)`). The retired buffers are
+deliberately kept alive, so every grow adds memory instead of reusing it - and GTT climbs with each graph.
+Within one arm it reached 117 GiB, above the gate.
+
+My own pre-registration said: *"the retired buffers are retained, so memory grows across the arm; arms may
+OOR or die for that reason and such arms are INVALID, not clean."* That is exactly what happened, on the
+first arm, and it makes the knob unusable for an in-regime experiment on this box.
+
+### What this does and does not settle
+ - It does NOT test H-fresh: no arm was scored, so there is no evidence either way about whether arena
+   reuse matters.
+ - It DOES establish that this instrument cannot be used as-is for the write-side question at this regime,
+   because the regime gate and the knob's memory behaviour are incompatible.
+ - A usable variant would need the retired buffers released **after** the graph that used them (so memory is
+   bounded) while still never *reusing* them - which is a code change, not an env flag.
+
+### Box note: NOT my orphans
+Four `-dev HRX0` servers remain, but they are **not mine**: they use `315fp-build` and are parented to a
+live `bash 315align2.sh` (a peer run). I verified the parent chain before considering any cleanup and left
+them alone. My own fresh1 neighbours exited with the run.

@@ -3949,3 +3949,62 @@ arms (2.5%)**. Both faces appear repeatedly.
     driver : ~/wt/315-disc.sh 2 315ids2,  BIN=~/wt/315ids-build/bin
     EXTRA_ENV: GGML_HRX_TENSOR_FP=ffn_moe_topk-1..-4,ffn_moe_argsort-1..-4 (EXACT suffixed names)
     purpose: read [hrx-ids-fp] dup_pairs on a faulting arm's routing rows
+
+---
+
+# THE IDS TEST RAN, AND THE INSTRUMENT CANNOT ANSWER IT (13:25)
+
+The instrument emitted (6,376 lines in the faulting arm, 16,848 in the clean arm), so unlike `315ids1`
+this run produced data. But **every line is invalid**, in one of exactly two ways, and this is a property
+of the instrument rather than of the fault.
+
+### Class 1: all-zero
+    [hrx-ids-fp] name=ffn_moe_argsort-1 ne0=64 rows=2 min=0 max=0 oor=0 dup_pairs=4032 first8=[0 0 0 0 0 0 0 0]
+`min=0 max=0` with an all-zero `first8` is not an index list. `dup_pairs=4032` is then just the
+arithmetic consequence of 64 identical zeros (C(64,2) = 2016 per row x 2 rows), not evidence of
+corruption. 2,984 such lines in BOTH arms.
+
+### Class 2: float bits reinterpreted as i32
+    name=ffn_moe_argsort-4 ne0=64 rows=1 min=-1121069644 max=1071412090 oor=64 dup_pairs=0 first8=[1061517...]
+Decoding those values as floats gives **ordinary small floats**:
+
+    i32  -1229665280 -> float -5.39e-06
+    i32   1051938418 -> float  0.350
+    i32  -1121069644 -> float -0.042
+    i32   1071412090 -> float  1.722
+
+The observed range (±1.24e9) is exactly the i32 band that floats in about [-1, 2] occupy
+([0xBF800000, 0x3F800000] = [-1082130432, 1065353216]), so these lines are reading **float data** through
+an `i32` view. That is the unsynchronised-arena read section 53 recorded and section 59 confirmed: a
+by-name read of a transient returns *the last writer's* bytes, which here belong to a different tensor.
+
+### The fatal control: the clean arm has MORE of them
+    faulting arm (r1e): 2,925 float-bit lines
+    clean arm   (r1q): 13,092 float-bit lines
+
+If these were the corruption, the CLEAN arm would be the corrupted one. They are an artifact of *when*
+the reader looked, not of the fault. So `dup_pairs` cannot be read as evidence either: it is 0 exactly
+when the read returned float bits (no duplicates among random floats) and large when it returned all
+zeros - both meaningless.
+
+**No line in either arm ever showed a plausible expert-index range** (`min>=0` and `max` small, with a
+non-zero `first8`). The instrument has never captured this tensor's real contents on this path.
+
+### What this means for the argsort candidate
+**Not tested, not refuted.** The candidate remains *live* but its decisive test - `dup_pairs > 0` on a
+faulting arm's routing row - has not been performed, because the only instrument available for it cannot
+read the tensor. This is the third instrument on this issue defeated by the same root cause
+(unsynchronised host-visible arena reads), after the by-name fingerprint (section 53) and the ordered
+locator (section 59).
+
+### What a WORKING test would require
+It has to read the routing indices at a moment when they are actually valid, which means either:
+ (a) reading them **device-side** (a kernel that copies the ids into a coherent output), or
+ (b) making the transient **coherent** for this specific tensor before reading, or
+ (c) deriving the answer WITHOUT reading the ids at all - e.g. comparing the MoE output of a faulting arm
+     against a recomputation from the same inputs, where a wrong expert would show as a large discrepancy.
+Option (c) is the cheapest and needs no new instrument on the routing path.
+
+Also recorded: this run was the FIFTH independent replication and reproduced the fault in the eviction
+cell (`round 1 arm e: FAULT nan=0 http=1 s500=1 unparsed=2`, Face B). Pooled across five runs:
+**18 faults / 21 eviction-cell arms (86%) vs 1 fault / 40 control arms (2.5%)**.

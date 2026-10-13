@@ -75,3 +75,33 @@ Cell `q` at 98G has n=2, so its 0% is weak on its own; the 97G/98G comparison is
 level (95% vs 0%), which rests on n=43 vs n=2 — the quiet side being the thin one. Both thin spots are
 stated rather than hidden: the honest summary is that the forcer dominates by roughly 19x on the pooled
 data, and a matched-level replication would tighten it.
+
+---
+
+# CORRECTION (2026-10-13): the "quiet is 0% at 98G" leg is overturned — n=2 was too thin
+
+The table above puts the quiet cell at **0% at 98G (n=2)** and leans on it for the statement that
+`gtt_start` does not govern the fault. That leg is now overturned: the peer's replication produced a **second**
+quiet-cell fault at `gtt_start=98G` (`315-galign-peer-result.md`, arm `gb4096-q`), so the quiet cell at 98G is
+**1 fault in 3 arms pooled** (that arm plus the earlier `ga4096-q`, against 2 clean).
+
+The n=2 was the thin spot this file itself flagged, and it has now failed exactly as a thin cell does.
+
+## What survives, and what does not
+
+- **Survives — and is the load-bearing claim**: the **cross-cell contrast at matched level**. Cell `e` at 98G
+  is ~95% (41 of 43 arms); the quiet rate at 98G is now bounded well below it whichever way the three pooled
+  arms are read. The forcer dominates by roughly an order of magnitude, and that does not depend on the quiet
+  figure being zero.
+- **Does not survive**: "the quiet cell is 0% at 98G", and any argument that rests specifically on quiet being
+  *zero* rather than *low*.
+- **Also does not survive as stated**: "`gtt_start` does not govern the fault" is still *probably* right — the
+  within-console control (`315ctl1`, no forcer: 9.1% at 97G vs 6.2% at 98G) is independent evidence for it and
+  is unaffected by these two arms — but the quiet-cell leg of that argument is weaker than this file claimed,
+  and the claim should now rest on the `ctl1` control rather than on the quiet count at 98G.
+
+## Lesson, recorded rather than glossed
+
+A 0-of-2 cell cannot support a "zero" claim; the rule-of-three bound on 0/2 is ~78%, which is wide enough to
+admit almost any rate. The cell was reported with its n, which is what made the failure visible — but the
+*conclusion* drawn from it should have been bounded rather than stated as a rate.

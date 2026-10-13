@@ -2285,3 +2285,31 @@ useful size breaches it - and at a reduced size it has no power anyway.
    a measured rate (after the H1 control's own sizing rationale, which DID work, and the 315-rate.py
    face-tally under-count recorded earlier). Worth stating plainly: the rate moved, and every
    power argument built on 26% moved with it.
+
+---
+
+## Box cleanup after the control (07:30)
+
+Left behind by the campaign and now cleaned up:
+ - the `p8l` arm server (pid 265323, the Face-B faulting arm) had been orphaned to `ppid=1` and was
+   still holding `-dev HRX0` ~1h32m after its arm ended. It is MINE (its pid matches
+   `rt-det/315ctl1-p8l-*/server.pid`), not a foreign workload, so it was terminated.
+ - verified no other orphaned 315 arm servers remain (`ps` for the 315*-build llama-server pattern
+   returns nothing).
+
+Final box state:
+
+    HRX0 holders  0
+    GTT           26 GiB   (baseline)
+    VRAM used     0 GiB
+    load          1.05 1.22 2.38
+    npu.lock      FREE
+    watcher       0 running
+    drop-in       present, cwsr_enable=0 in 3 grub.cfg entries (shipped boot state restored)
+    live cwsr     1        (until the next reboot; the campaign work is finished)
+    1bit-canonical / coder-llm: inactive (self-heal on demand, as designed)
+
+Noted for the record: the orphan existed because a faulting arm's server dies without the harness
+reaping it, which is the same class as the "silent arm loss" trap already in KNOWN-ISSUES. It held
+HRX0 across the tail of the run and into the teardown; it did NOT affect the measurements (the arm's
+own window ended at its fault), but it would have inflated a NEXT run's baseline if left.

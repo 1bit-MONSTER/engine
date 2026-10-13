@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5023,3 +5007,54 @@ refuted by its own A/B, and the deferred read never happens.
 Both are consistent with my text constraint (correct prior outputs, then a terminal whole-buffer event),
 and both are in scope on the fork side. Neither has an instrument yet, and the honest position is that
 they are un-tested rather than promising.
+
+---
+
+## INDEPENDENT CONVERGENCE: THE PEER RAN ITS OWN CORRECTED PROBE AND ALSO GOT ZERO (16:10)
+
+The peer had already diagnosed the same probe defects independently and staged two more probes
+(`315wb-probe2.sh` at 15:18, `315buf.sh` at 15:23). Its `315wb-probe2.sh` header, written before it saw my
+result, says:
+
+> "Fixes take 1's three defects: **identical prompts reused the cached graph (so the download path was
+> never entered)**; the tally grepped a file its own headers were written into; and a silent path read as
+> a zero."
+
+That is exactly my diagnosis, reached separately - including the `cache_prompt`/graph-reuse defect, which
+is the one that mattered.
+
+And its `315buf.sh` (which asks the reachability question directly) reports:
+
+    [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=619520   <- the logits
+    [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=44048640  <- the arena
+    === writeback records ===
+    0
+
+So the logits ARE host-visible `0x52` as the static chain said, AND there are still **zero writeback
+records**. Two independent probes, by two agents with separately-written scripts, both find the deferred
+writeback queue empty.
+
+### Why this is now conclusive rather than merely repeated
+ - the allocation facts are CONFIRMED empirically on the current build (not inferred from an earlier trace):
+   the 619520-byte logits allocation is `type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52`;
+ - my probe and the peer's `315buf.sh` used **different request shapes** and different script structures,
+   and both got zero;
+ - and the gating is traced at source: the fingerprint prints inside the loop over
+   `pending_host_writebacks_`, whose only push site is reached from `download_prepared_host_staging`, so
+   zero records means the download path is never entered.
+
+**So the deferred-writeback lead is refuted by two independent valid probes**: the logits satisfy the
+static conditions, and the code path still never runs. The 0x52 non-coherent family is now closed in both
+its forms - the immediate read (refuted by its own A/B in `f84be10`) and the deferred read (never
+executed).
+
+### Where that leaves the cause search
+    eliminated : the CPU read of the logits, immediate AND deferred (both forms of the 0x52 read)
+    eliminated : the #140-class unfenced handoff in GLM's decode-split FA path
+    eliminated : the consumer read path, dispatch ordering, the block split
+    LIVE       : the WRITE side - the device writing into a buffer whose backing the eviction moved
+    LIVE       : an intermediate buffer damaged and propagating to the logits
+
+The two live candidates have **no instrument yet**. My text constraint still governs both: correct prior
+outputs, then a terminal whole-buffer event (always 154880 of 154880 NaN), never a gradually wrong
+computation.

@@ -126,3 +126,51 @@ dead, and the surviving form (load-time weight writes) does not obviously explai
 eviction-correlated fault. So the write side is **not** currently the leading explanation of arm B's
 result; it is recorded because the access asymmetry is real and because the next hypothesis should not
 have to rediscover it.
+
+---
+
+# CLOSED (2026-10-13) — the host-write path is not exercised during GLM decode either
+
+The logits half was falsified earlier (`output_reserve`'s clear is once-at-allocation). This closes the
+remaining half: are weights or other inputs host-written into the non-coherent mapping **per token**?
+
+Enumerated every `ggml_backend_tensor_set` site in `src/llama-context.cpp` — there are exactly three:
+
+    2617  llama_io_read_host::~llama_io_read_host()   flushes host reads into tensors   <- MODEL LOAD
+    2699  llama_io_read_file::read_tensor()           file read -> temp buffer -> set   <- MODEL LOAD
+    3432  training path (labels)                      sparse label write                <- TRAIN ONLY
+
+The first two are the model-loading IO classes (`llama_io_read_host`, and the file reader); they run once
+when the GGUF is loaded. The third is the training path, which `llama-server` inference never enters.
+
+So **nothing host-writes a tensor on the GLM decode path**, and the non-coherent `context->base` mapping
+is not written from the host between tokens. Combined with the earlier falsification of the logits
+`buffer_clear` and of `buffer_get` as the read site (the A/B:
+
+    cell e, arm A knob OFF 0 OK / 4 FAULT   vs   arm B knob ON 0 OK / 2 FAULT
+
+both faces, knob verified live), the whole host-side access set is now accounted for:
+
+    buffer_memset  (line 210)  WRITE   not called on the decode path
+    buffer_set     (line 231)  WRITE   load-time only (2617, 2699) or train-only (3432)
+    buffer_get     (line 262)  READ    the fix; REFUTED by its own A/B
+    buffer_clear   (line 298)  WRITE   once at allocation, not per decode
+
+## What this closes, and what it leaves
+
+**Closed**: the host-side incoherence family. Neither direction of host access to the non-coherent
+mapping is exercised per token, so no host-side cache-coherence defect can be producing a per-token,
+eviction-correlated fault. This retires the lead this file proposed.
+
+**Left**: the corruption is on the **device** side — something reads stale/inconsistent data from the
+server's own evicted-then-restored device memory, which is where the trigger (forced eviction, 0/22 ->
+7/10) already points. The surviving candidate families are the ones §55/§56 left open: executor-level
+cross-dispatch ordering, or a different class entirely. Note that §55/§56 cleared the *consumer's own*
+host read path via `hsa_signal_wait_scacquire` + timepoint, which is consistent with this: the answer is
+expected to be device-side, not host-side.
+
+## Honest note on the ledger
+
+This file has now proposed a lead and closed it in the same session, after the logits half was falsified
+in between. That is recorded rather than tidied away: the host-write idea was worth checking, the check
+was cheap and decisive, and its result is that the answer is not here.

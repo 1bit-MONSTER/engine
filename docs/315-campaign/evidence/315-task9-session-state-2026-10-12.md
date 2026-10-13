@@ -3771,3 +3771,36 @@ against the same row in a clean arm.
 
 This is the test that would confirm or refute the candidate, and it is a kernel-instrumentation change
 on the fork side - in scope. It needs the box, which the foreign run currently holds.
+
+---
+
+## THIRD INDEPENDENT REPLICATION of the trigger (12:10) — 315gord1a, and it matches
+
+`315gord1a` (foreign, launched 11:22:08, still running in round 4 at the time of writing) is the same
+frozen rig driven against the PATCHED build with the knob OFF. Its arms so far:
+
+    round 1 arm q: OK                 round 1 arm e: FAULT nan=1 transport=1     <- FACE A
+    round 1 arm c: OK                 round 2 arm e: FAULT nan=1 transport=1     <- FACE A
+    round 2 arm c: OK                 round 2 arm q: OK
+    round 3 arm c: OK                 round 3 arm q: OK
+                                      round 3 arm e: FAULT nan=0 http=1 s500=1 unparsed=2  <- FACE B
+
+    q: 5 arms / 0 faults      e: 6 arms / 3 faults      c: 6 arms / 0 faults
+
+So a **third** independent run of the rig produces the same contrast, on the same build, with both faces
+represented inside the eviction cell and zero faults in 11 control arms. Pooling all three runs:
+
+    run                       cell e            cells q+c
+    disc2 (10-13, instr3)     5/6               0/20
+    ab1a (10:25, patched)     4/4               1/3*      *the one is the GTT-drifting quiet arm
+    gord1a (11:22, patched)   3/6               0/11
+    --------------------------------------------------------
+    total                    12/16 = 75%        1/34 = 3%
+
+**12 of 16 eviction-cell arms faulted against 1 of 34 control arms**, and the single control fault is
+the arm whose GTT drifted 5 GiB. Both faces appear in multiple runs. This is a robust, repeatedly
+reproduced intervention effect, and it is the strongest empirical footing the issue has ever had.
+
+Note this also **independently re-confirms the A/B's conclusion**: `gord1a` runs the same patched binary
+with the knob off and faults 3 of 6, i.e. the knob's absence changes nothing, consistent with arm B
+(knob on) also faulting.

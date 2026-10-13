@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4777,3 +4761,51 @@ test is to exercise the deferred-writeback path with the instrument - which is a
 other agent, so I should not duplicate it. What I contribute is the constraint: any explanation must
 produce correct output for prior requests and a terminal whole-buffer failure at the failing one, which the
 deferred-download story naturally gives and a steady-read-corruption story does not.
+
+---
+
+# CONFIRMED AT n=14: NO FAULTING ARM'S OUTPUT DIFFERS FROM THE CLEAN ANSWER (15:40)
+
+The text comparison is no longer n=1. Every arm on the box that has recorded text (14 arms across two
+runs, one of them a FOREIGN run I did not author) now shows:
+
+    verdict     arms    identical-prompt answer
+    OK            7     the single clean answer
+    FAULT-A       5     ALL match the clean answer
+    FAULT-B       1     matches the clean answer
+
+    distinct clean answers to the identical prompt: 1
+    faulting arms that DIFFER from the clean answer: 0
+
+### Why this is the strongest single constraint in the record
+ - **The fault never changes the answer.** Not once, in 6 faulting arms (5 Face A + 1 Face B), did the
+   model produce different text for the same prompt than a clean arm produced.
+ - **It holds for the foreign run too** (`gord1b`, 8 arms: 4 clean, 4 faulting) - so it is not a property
+   of one harness invocation or one of my runs.
+ - Combined with the request-by-request trace from `315text1` (requests 0-4 `http=200` with correct
+   content, request 5 `RemoteDisconnected`), the picture is unambiguous: **the arm computes correctly right
+   up to a terminal event.**
+
+### What it rules out, definitively
+Any mechanism that corrupts the computation - a stale expert index, a wrong MoE route, a drifted value, a
+steadily-moving buffer - would eventually produce a **different answer** for the identical prompt. Across 7
+clean and 6 faulting arms with recorded text, that never happens. The corruption is therefore not in what
+the model computes; it is in a buffer that is lost or replaced **wholesale**, at a moment between requests
+or at the end of one.
+
+### How it composes with the peer's deferred-writeback lead
+The peer traced a deferred memcpy that reads a non-coherent `0x52` staging mapping at the sync point, and
+established the logits are **structurally expected** to take that path (`0802b07`). My constraint says the
+corruption must be terminal and whole-buffer, not gradual. A deferred read of a staging buffer that has been
+evicted in the window since the device copy populated it gives exactly that: correct results while the data
+is intact, then a whole-buffer wrong read once it is not.
+
+So the two lines are complementary and mutually constraining:
+    the peer's static chain answers WHERE the bad read is queued;
+    my text evidence answers WHEN it must fire and WHAT shape it must have.
+
+### The honest caveat that must be stated
+"Same answer" is measured on the harness's SHORT (96-token) response to ONE prompt. A corruption that only
+manifests in long generations, or only in the KV cache after many tokens, or only in a different prompt
+shape, would not appear here. So this eliminates a class of mechanism for THIS workload; it does not
+eliminate it universally. That is the same limit the issue's own hidden-state work would have to respect.

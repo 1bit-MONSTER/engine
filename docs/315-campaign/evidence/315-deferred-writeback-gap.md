@@ -249,3 +249,67 @@ All of the above is static. Whether `pending_host_writebacks_` is non-empty at t
 GLM decode, and whether `rec_eq_sync` is ever 0 under the eviction rig, is what the staged probe
 (`~/wt/315wb-probe.sh`, one decode with `GGML_HRX_WRITEBACK_FINGERPRINT=1`) reports. Static expectation is
 not a result, and this section is explicitly not claiming one.
+
+---
+
+# Completing the mechanism: the writeback is queued at the END of a replay and NOT flushed there
+
+Traced the replay path end to end. The deferral is not incidental — the queue is populated as the last
+act of a replay, and the replay returns without flushing it.
+
+## The three download sites, and what follows each
+
+`download_prepared_host_staging(context, prepared, insert_barrier)` is called from three places:
+
+    :1978   download_prepared_host_staging(context, prepared)              insert_barrier = true (default)
+            -> followed by `result.success = true; return result;`        (the diagnostic-kernel path)
+    :2047   download_prepared_host_staging(context, prepared, false)       insert_barrier = FALSE
+            -> followed by `result.success = true; return result;`        (the main path)
+    :2082   download_prepared_host_staging(context, commands)             (the execute_program path)
+
+Inside, the function queues each download and returns:
+
+    for each host_staging with .download:
+        allocate_mapped_host_staging_buffer(...)        -> non-coherent 0x52 mapped buffer
+        hrx_stream_copy_buffer(staging.buffer -> download_buffer)    device -> mapped copy
+        add_host_writeback(staging.host_data, download_data, ...)    QUEUES the host memcpy
+    return status;
+
+**None of the three call sites calls `mark_stream_synchronized()` afterwards.** The two that return
+directly (`:1978`, `:2047`) return with the writeback still pending; the third hands control back to
+`execute_prepared_command_program`, whose flush point is conditional.
+
+## So the sequence on the main path is
+
+    replay launches the graph
+      -> download_prepared_host_staging(..., insert_barrier=false):
+           device -> mapped (0x52) copy, then QUEUE a host memcpy from that mapped buffer
+      -> replay returns success, writeback still PENDING
+
+and the queued memcpy is executed only when some later caller reaches `mark_stream_synchronized()` —
+which, per the code's own comment, is the host-staging **upload** guard plus the two
+`mark_graph_replay_synchronized` sites, and "nothing else guarantees the ordering."
+
+## Why the asymmetry matters
+
+The `insert_barrier` argument controls whether a **stream execution barrier** is inserted before the
+download — a device-side ordering fence. It does **not** control the host-side flush of the queued
+writeback. So:
+
+- the device-side copy into the staging buffer is ordered by the barrier when `insert_barrier=true`, and
+  by ring program order otherwise;
+- the **host-side** read of that buffer (`download_data`) happens at an unrelated, later moment, and
+  nothing ties it to the device copy that populated it beyond the eventual sync.
+
+That is a genuine window, and it is wider on the main path (`insert_barrier=false`, `:2047`) than on the
+diagnostic one (`:1978`).
+
+## The instrument answers this exactly
+
+`GGML_HRX_WRITEBACK_FINGERPRINT=1`'s `rec_hash` is taken when the writeback is queued and `sync_hash` when
+it is executed. **`rec_eq_sync=0` means the mapped source held different bytes at flush time than when it
+was recorded** — which is what an eviction or the CP writing through during the window would produce. The
+probe staged at `~/wt/315wb-probe.sh` reports exactly that tally.
+
+Explicitly still static: this section shows the window exists and is unflushed at the end of a replay. It
+does not show the source ever actually differs at flush time, which is the measurement.

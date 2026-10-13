@@ -136,3 +136,17 @@ sequenced behind a live run.
   to regress *against* — which is why criterion 4 cannot be *met* until criterion 2 produces something to
   compare. This run establishes that the controls are stable on the current pin, i.e. that the baseline the
   future fix must match is still the baseline.
+
+---
+
+# Update: the control re-run now requires a sustained clear window
+
+The first `315crit4.sh` waited on the **first** 30-second poll showing no other driver, which is unsafe here:
+another agent launches campaigns back-to-back, so a brief gap between two of its runs would let this control
+start and collide with its next launch — corrupting both measurements.
+
+Replaced by `315crit4b.sh`, which requires a **sustained 120-second clear window** (four consecutive 30-second
+polls with no other driver) before starting, and still takes the box lock. Launched 16:46:23 and waiting.
+
+Nothing about the criterion-4 content changed — same baseline, same commands, same `MUL_MAT_ID` extraction —
+only the gate on when it is safe to begin.

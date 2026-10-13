@@ -109,3 +109,50 @@ a shared box" advice is still sound practice, but it was not the thing that happ
 - No further action on the "collision". The `315ab1b2` launch guard is harmless and may stay.
 - The goal was, however, genuinely being driven from two front-ends (this session and the `pi-315` tmux
   pane, both owner `01a1356c`) — that is a real coordination hazard, but it did not cause this.
+
+---
+
+# SECOND CORRECTION (2026-10-13 10:52) — the collision WAS real. Both readings are true.
+
+The correction above over-corrected. Checking the actual session transcripts (not PIDs) settles it: the
+ORIGINAL collision was real, and only the *later* double-`pgrep` was a misreading.
+
+## The evidence
+
+Two Pi sessions exist on this host, both working this goal:
+
+    session 01a1356c-790a-70c4-aa0a-f69a5b05ebb9   (this session; goal owner)
+    session 01a12f94-d804-75df-b710-9bdd6e84958a   (a second, concurrent Pi session; tmux pane pi-315)
+
+session `01a12f94`'s transcript contains the duplicate launch, at the exact collision time:
+
+    2026-10-13T12:24:05.121Z  EXTRA_ENV="... GGML_HRX_COHERENT_READ=1" setsid nohup bash \
+                               315-disc.sh 4 315ab1b > ~/wt/315ab1b-run.log 2>&1 < /dev/null
+
+12:24:05 UTC is **10:24:05 ADT** — the second driver observed at 10:24:45, same tag `315ab1b`, same
+knob. It then polled `pgrep -f "315-disc.sh 4 315ab1b"` at 12:25:20 and 12:26:05/12:26:20, i.e. it was
+tracking *its own* run of the tag this session had already started at 10:22:33.
+
+## So both statements hold
+
+- **The 10:24:45 collision was real**: two different Pi sessions ran tag `315ab1b` concurrently. The
+  discard of `315ab1b` and the guarded re-run as `315ab1b2` were correct actions.
+- **The later "two drivers" reading was wrong**: pid 2181579's ppid was 2033289, the driver's own
+  per-arm child. That specific observation proves nothing about contention.
+
+## The generalizable lesson, corrected
+
+    a pgrep COUNT is not a count of sessions  ->  check ppid
+    a pgrep count is also not proof of ONE session  ->  check WHICH session issued the command
+
+Neither PID inspection nor process counting identifies a competing agent; the session transcripts do.
+The collision was only diagnosable from `~/.pi/agent/sessions/*.jsonl`, which is where the launch
+command's ownership actually lives.
+
+## What this means for the goal
+
+The goal `mv0f7orc-9rf73p` was being pursued by **two concurrent Pi sessions at once** — this session
+and `01a12f94` — which is a real coordination hazard independent of any single incident: they share one
+goal file, one owner id, one box, and one pre-registered tag namespace. `01a12f94`'s pane now shows
+`goal: blocked` (it believes a campaign holds `~/npu.lock`, which is free), and its `/goal-resume`
+keystrokes did not submit. Any further work should assume one driver only.

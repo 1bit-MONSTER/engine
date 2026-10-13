@@ -437,3 +437,41 @@ This lead consumed a probe, a corrected probe, a trace run and several source re
 closing argument. That is the same disposition as the other four families, and it is recorded rather than
 quietly dropped — but the process lesson is that a comment about the general case is not evidence for a
 specific binding, and the cheap measurement (one trace run) should have preceded the static write-up.
+
+---
+
+# Corroborated: the peer agent closed this lead independently, with a stronger probe
+
+While this file was being written, the other agent on the branch reached the same conclusion from a
+different and **better** probe (commit `13deecb`). Recording the agreement and the methodological
+difference, because it is the second time this turn that a peer's method outperformed mine.
+
+## Their probe used the arms' own workload shape
+
+    probe 1 (mine, invalid)  /v1/chat/completions, reused prefix -> prompt eval 9 then 1 then 1 tokens,
+                             graphs reused 7/15/23
+    probe 2 (theirs, valid)  /completion with cache_prompt=false and n_predict=96 -> prompt eval 25 tokens,
+                             120 tokens delivered, graphs reused 95
+
+and `graphs reused 95` matches a real arm's first request exactly — so their probe exercised the **identical
+workload shape at the identical dispatch count**, where mine exercised a shape the faulting arms never use.
+
+## Their queue-tracing argument is also tighter than mine
+
+They established that zero records means the queue was never populated, rather than that the fingerprint is
+broken, by tracing the three sites: the populate site is `add_host_writeback` at
+`command-program-executor.cpp:1106`, the queue's **only** push site is at `:176`, and the print site at
+`:136` is invoked at `:127` **inside the loop over `pending_host_writebacks_` at `:125`** — so the
+fingerprint prints *iff* the queue is non-empty. That is a stronger closure than my binding-level argument
+(`requires_materialization()` → `host_data == nullptr`), and the two are consistent: my chain says the logits
+binding never presents host data to the materializer; theirs says the queue is therefore never populated.
+
+## Net
+
+Two independent methods, two different probe shapes, one conclusion: **the deferred host writeback is not on
+GLM's decode path.** The family is closed.
+
+Worth stating plainly for the record: my probe failed twice (once for a reused graph, once for a tally that
+grepped its own header) before yielding a sound negative, whereas the peer's single well-shaped probe settled
+it. The lesson generalizes past this lead — **probe the workload's own shape**, and a probe that does not
+reproduce the arms' dispatch count has not asked the question.

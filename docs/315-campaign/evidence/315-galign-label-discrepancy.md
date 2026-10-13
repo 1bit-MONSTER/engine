@@ -106,3 +106,25 @@ Two coordination notes:
   EXIT` handler. Any future run on this box should either avoid `setsid` for the neighbours or check for
   ppid-1 `llama-server` processes before waiting on the lock — otherwise a finished run's orphans will block
   the next one for its full `flock` timeout.
+
+---
+
+# SUPERSEDED (2026-10-13): the counts used here were a parse error, and the peer was closer to right
+
+This file argued that the replication misstated its own first result, on the basis of byte-level
+`md5sum` counts showing `ga256-e` at "66 distinct of 66". **Those counts were wrong** — scoring streaming
+responses by hash treats identical text with different chunk framing as distinct (see
+`315-galign-CORRECTION-my-parse-was-wrong.md`).
+
+So:
+
+- the file's factual claim — that `align256-e` "faulted" and was therefore not clean — is **not supported by
+  the evidence it cites**;
+- the peer's replication premise is **not** shown to be a misstatement by anything here;
+- the substantive outcome is the peer's own: their run was **UNINFORMATIVE** because their composition did not
+  reproduce the frozen driver's trigger rate, which is a real finding about the design rather than about
+  alignment.
+
+The one part of this file that stands is its closing recommendation — score against the pre-registered
+branches rather than any header's premise — and that recommendation is exactly what led to the correct
+disposition.

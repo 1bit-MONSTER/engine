@@ -18,6 +18,13 @@ limitations under the License.
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
 -->
+<!--
+SUPERSEDED IN PART (2026-10-13): the "both alignments faulted / every arm faulted" sections below are
+WRONG. They were produced by scoring arms with md5sum over streaming response files, so framing differences
+read as content divergence. The true reading is distinct_content=1 for the arms checked, i.e. CLEAN. See
+315-galign-CORRECTION-my-parse-was-wrong.md. The only claim below that survives is the one-sided statement
+about sufficiency, and even that must be re-derived from a correct parse before use.
+-->
 
 # The peer's GLM alignment run: every arm faulted at BOTH alignments — the FA class is retired
 
@@ -265,3 +272,33 @@ corrected here.
 For the alignment question the branch is unchanged: **both alignments fault, 2 of 2 each**, meeting the
 pre-registered "no difference" outcome that §57 pre-committed to abandoning the FA path on — stated
 one-sidedly, since n=2 per alignment still cannot bound a *rate* difference.
+
+---
+
+# **SUPERSEDED IN PART (2026-10-13)** — the "every arm faulted" sections above are WRONG
+
+Everything above that asserts the peer's alignment arms faulted — the "both alignments faulted AGAIN" section,
+the 4-arm and 5-arm tallies, and the "distinct responses (of 66)" table — **is incorrect**, and the error is
+mine.
+
+The arms were scored with `md5sum` over each streaming `resp.*` file, so responses carrying **identical text**
+differed by a byte or two of chunk framing and counted as distinct. Sampling them directly shows it:
+
+    [2212 bytes] {"index":0,"content":" We'll assume the reader has a basic understanding of LLMs but wants…
+    [2211 bytes] {"index":0,"content":" We'll assume the reader has a basic understanding of LLMs but wants…
+
+Comparing the `content` field instead gives the true picture:
+
+    gb4096-e   66 responses   distinct_content = 1   -> CLEAN
+    gb256-e    66 responses   distinct_content = 1   -> CLEAN
+    gb4096-q   66 responses   distinct_content = 1   -> CLEAN
+
+So the peer's own reading is the correct one: their replication showed mostly **clean** eviction arms, which is
+why they concluded **UNINFORMATIVE** — their bespoke composition did not reproduce the frozen driver's trigger
+rate, so the run cannot test layout sensitivity either way.
+
+**What survives here**: the power argument (n=1, later n=2, cannot bound an alignment *rate* difference at a
+~95% base rate) — that reasoning is independent of the parse. **What does not survive**: every claim that the
+FA family was excluded as "not sufficient" *on the basis of these arms*, because those arms were clean.
+
+See `315-galign-CORRECTION-my-parse-was-wrong.md` for the full correction and the downstream files affected.

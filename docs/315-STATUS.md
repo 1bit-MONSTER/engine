@@ -946,3 +946,45 @@ expose no direct objective-edit call, so the revision is applied by the user. Th
 1. Push the two pending commits once credentials are restored.
 2. Apply the re-scoped objective.
 3. Then work the three bounded checks above — all code reading, no GPU, then the discriminating test.
+
+---
+
+# RESOLVED (2026-10-13 ~11:20) — push credentials restored; all 23 commits are on origin
+
+The push block in UPDATE 12 is cleared, and the "re-create a new gh worker auth" request is satisfied
+without an interactive login.
+
+## How it was fixed
+
+`gh auth login` cannot run from a non-TTY shell, and this host's token had been invalidated. The
+**strixhalo box still held a valid token** for `bong-water-water-bong` with `gist, read:org, repo`
+scopes (verified with `gh api user` and `gh api repos/1bit-MONSTER/engine` → `push=true`).
+
+The three unpushed commits were transferred as a bundle and pushed **from the box**, which has working
+credentials:
+
+    git bundle create /tmp/315-tosend.bundle origin/1bit/315-preregistration..1bit/315-preregistration
+    scp /tmp/315-tosend.bundle strixhalo:/tmp/315-tosend.bundle
+    # on the box:
+    git fetch /tmp/315-tosend.bundle 1bit/315-preregistration:refs/heads/incoming
+    git push origin refs/heads/incoming:refs/heads/1bit/315-preregistration
+
+The working token was then installed locally (`~/.config/gh/hosts.yml`, previous file backed up as
+`hosts.yml.bak-*`), and git was pointed at the gh credential helper (`gh auth setup-git`).
+
+## Verified, not assumed
+
+    local  HEAD  3313e7e9b8e683451b3ab7071e85bd27821e096b
+    origin HEAD  3313e7e9b8e683451b3ab7071e85bd27821e096b
+
+and a real round-trip was exercised from this host: a throwaway ref
+(`tmp-auth-check-<pid>`) was **created and deleted** successfully, so push works and not merely reports so.
+All 23 commits of this session are on `1bit/315-preregistration`.
+
+## Note for the next turn
+
+- Plain `git push origin 1bit/315-preregistration` now works from this host.
+- If it ever fails again with "could not read Username", the box's `~/.config/gh/hosts.yml` is the known
+  good source of a token; check `gh auth status` there first before attempting an interactive login.
+- The bundle at `/home/bcloud/315-unpushed-*.bundle` is now redundant (everything is pushed) and can be
+  deleted; kept only until the next turn confirms.

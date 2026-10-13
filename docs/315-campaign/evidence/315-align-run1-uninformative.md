@@ -78,3 +78,27 @@ be attempted only with the box-time budget to spend, not as a 38-second probe.
 The harness has been improved in place (`~/wt/315align-run.sh` should gain the compaction loop and the
 neighbour composition before any re-run). This file exists so the 38-second run is not later cited as
 evidence that the FA layout class is innocent.
+
+---
+
+# Take 2 is running with the conditions take 1 lacked
+
+Revised harness (`~/wt/315align2.sh`), started 15:28:54, matching the prior recipe's conditions rather than
+simplifying them:
+
+| | take 1 (uninformative) | take 2 (running) |
+|---|---|---|
+| GTT | 47 GiB | **117 GiB** (3 GLM neighbours at `-c 2048` composed first) |
+| requests/arm | 120 short (`messages`, 1 word) | **180 in the arms' own shape** — `/completion`, `cache_prompt=false`, `n_predict=96` |
+| eviction | `evictonly` alone | `evictonly 500` **+** a `compact_memory` loop |
+| arms | 1 per cell | 6 (two repeats of the 4096/256 cell-`e` contrast, since the prior rate was 1 in 5 even under ideal conditions) |
+| duration | 38 s total | ~3 min per arm |
+| box lock | not taken | taken (`flock -w 1800`) |
+
+Verified in flight rather than assumed: neighbours up and GTT at 117 GiB before the first arm; the first
+arm's server processing tasks (148 of 180 at the check) with `evictonly` alive and
+`/proc/sys/vm/compact_memory` present.
+
+The reading is unchanged from the pre-registration: if `align=256` faults materially more than `align=4096`
+in cell `e`, the #140 layout/dispatch class is implicated; if they are equivalent, §57 pre-commits to
+leaving the FA path entirely.

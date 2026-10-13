@@ -19,67 +19,98 @@ Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
 -->
 
-# The id probe's first run: the ids are CLEAN, so the argsort candidate dies
+# The id probe is INVALID, and my first reading of it was wrong
 
-The pre-registered readout (`315-idproducing-kernel.md`, branches fixed in advance), run for the first time
-on 2026-10-13 at ~19:12, 4 pairs, instrument `ffn_moe_topk/argsort/weights/probs` anchored per layer 0..63.
+The probe ran for the first time on 2026-10-13 ~19:12 (4 pairs, `ffn_moe_topk/argsort/weights/probs` anchored
+per layer 0..63). It produced a genuine faulting arm:
 
-## The faulting arm, and the control
+    pair 1 arm c: OK     nan=0  req=66   gtt_start=98G
+    pair 1 arm l: FAULT  nan=1  req=14   gtt_start=98G     <- Face A, in-regime
+    pair 2 arm l: OK     nan=0  req=66   gtt_start=98G
+    pair 3 arm l: OK     nan=0  req=66   gtt_start=98G
 
-    pair 1 arm l: FAULT nan=1 (Face A)  gtt_start=98G  req=14   <- in-regime, genuinely faulted
-    pair 1 arm c: clean
-    pair 2 arm l: clean
+**The readout does not answer the question, and the first version of this file read it backwards.**
 
-so the comparison is between a real faulting arm and clean arms from the same session.
+## What the instrument actually saw
 
-## The readout
+Both arms, over every line of the two I32 tensors the instrument reads:
 
-**`oor` (ids outside `[0, ne0)`) is ZERO in every line of every arm.** No out-of-range id was produced.
+| arm | argsort lines | `oor = 0` | `oor = 64` | `oor > 0` |
+|---|---|---|---|---|
+| p1l (**FAULT**) | 36,708 | 16,614 | 19,728 | 20,094 |
+| p1c (clean) | 126,822 | 16,637 | **106,446** | 110,185 |
 
-`ffn_moe_argsort` — the tensor that *must* be a clean permutation, since an argsort assigns each rank once —
-by `dup_pairs`:
+The clean arm carries **more** all-out-of-range lines than the faulting arm. And the decisive number:
 
-    dup_pairs    p1l (FAULT, nan=2)     p1c (clean, nan=0)
-        0              18,719                 99,802
-     2016              16,257                 16,257
-        1               1,128                  9,786
-        2                 145                    308
-    50400                 156                    156
+    lines with 0 < max < ne0      ->  0        (both arms, every tensor)
 
-**The non-zero values appear identically in both arms** — `2016` exactly 16,257 times in each, `50400`
-exactly 156 times in each. Those are baseline behaviour of the argsort, not a fault signature. The faulting
-arm simply has fewer total lines (36,405 vs 126,309) because it **died early** after 2 NaN events, which is
-what makes its small values look proportionally different.
+**The instrument never once observed a plausible rank value.** Every line is either all-zeros
+(`min=0 max=0`, `first8=[0 0 0 0 0 0 0 0]`, 16,614 and 16,637 lines) or **f32 bit patterns** re-read as i32 —
+`max=1074410205`, `min=-1138111520`, `first8=[1040594397 -1122889188 ...]`, which decode to small floats in
+the ±0.001..0.25 range, i.e. **probability values**.
 
-`ffn_moe_topk` shows the same shape: `dup_pairs=6` at 533 occurrences per layer in **both** arms — topk
-repeats experts normally, so that is not a signal either.
+So `oor` was never measuring route ids. `oor > 0` is baseline behaviour of these reads in **both** arms
+(superficially *more* so in the clean arm, though that is a per-request count effect), and `oor = 0` is the
+all-zeros population, not a clean permutation.
 
-## The pre-registered reading
+## Why — at source
 
-The first branch was *"`oor > 0` or `dup_pairs > 0` in a faulting arm → the id list is not a clean
-permutation: the argsort's rank computation is the site"*. **It does not fire**: `oor = 0` always, and the
-`dup_pairs` profile is the same in faulting and clean arms.
+`src/llama-graph.cpp:1932-1935` (patched tree):
 
-So the second branch applies:
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);
+    cb(selected_experts->src[0], "ffn_moe_argsort", il);   // labels the INPUT to the argsort
+    cb(selected_experts,         "ffn_moe_topk",   il);    // labels its OUTPUT
 
-> **ids clean while the matmuls are NaN → the argsort candidate dies, and the fault is downstream, in the
-> table builders or in the matmul's descriptor use.**
+The name `ffn_moe_argsort` is applied to `selected_experts->src[0]` — the argsort's **input** (`selection_probs`,
+f32 routing probabilities), not to the argsort's output. That is exactly what the instrument found there:
+probability-shaped floats. The name is a misnomer in the graph builder, and the probe had assumed it was the
+i32 rank tensor.
 
-**The id-producing/argsort family is therefore excluded as the site of the stale value.** What the fault
-consumes is not a corrupted route id.
+And the read itself cannot be trusted for either name. The instrument in `ggml-hrx.cpp` (~line 616) reads with
+`ggml_backend_tensor_get`, and its own comment states the case:
 
-## What this leaves in scope
+> Everything the fingerprint names on the MoE path lives in a host-visible, non-coherent arena ... and
+> `ggml_backend_tensor_get` on a host-visible tensor is a plain memcpy - no iface call, no synchronisation -
+> so without this the per-node lines are not a snapshot of one instant and the per-node attribution is invalid.
 
-Downstream of the argsort, on the routed-FFN path: the **table builders** (`ffn_moe_weights` /
-`ffn_moe_probs` construction) and the **matmul's descriptor use**. Both are engine-side and in scope, and
-neither has been instrumented to the same depth as the ids now have.
+A plain memcpy out of a **non-coherent** arena returns the **stale host copy**, not the device's tensor
+contents. Every value observed — zeros (fresh allocation) and f32 patterns (the previous occupant of a reused
+buffer) — is consistent with that, in both arms.
 
-## Caveats, stated rather than glossed
+## The corrected reading
 
-- **n is small**: one faulting arm (`nan=1`, `req=14`) against clean arms from the same session. The
-  conclusion is a **one-sided exclusion** (the argsort did not produce bad ids in a faulting arm), not a
-  measured null.
-- The `dup_pairs` metric counts repeats **within a row**; a row is a token's expert selection. That is the
-  right shape for a route id, but the metric would not catch a *swap* (two ids exchanged, still a valid
-  permutation) — a distinction worth noting for anyone reusing this instrument.
-- The probe is diagnostic: no criterion changes and no arm from it is eligible.
+- **Neither pre-registered branch fires.** The first branch (`oor > 0` or `dup_pairs > 0` in a faulting arm)
+  does not discriminate, because `oor > 0` is the baseline state of these reads in clean arms too; the second
+  branch ("ids clean while the matmuls are NaN") does not fire either, because the instrument never observed
+  ids at all.
+- **The id-producing / argsort family is NOT excluded.** It remains **untested**, because the instrument
+  cannot measure it: it names the argsort's input by mistake and reads a non-coherent arena by memcpy.
+- The probe's earlier framing as a discriminator is withdrawn.
+
+## The error in this file's first version, and its shape
+
+The first version claimed *"`oor` is ZERO in every line of every arm → the ids are clean → the argsort
+candidate dies"*. It was produced with
+
+    grep -oE "oor=[0-9]+ dup_pairs=[0-9]+" ... | sort | uniq -c | head -5
+
+and `head -5` **cut off exactly the dominant `oor=64` lines**, leaving a list that began with `oor=0` entries
+and looked like a full distribution. This is the **third** instance of the session's standing lesson: read the
+distribution, never a truncated sorted head of it. (The first two: the `md5sum`-over-streaming parse that
+briefly produced a false FA exclusion, and the line-counter on newline-free JSON.)
+
+A second, smaller error accompanied it: the file read a *proportional* difference in `dup_pairs` between arms
+as a signal, when the absolute counts of the non-zero values were **identical** in both arms (16,257 × `2016`,
+156 × `50400`) — the faulting arm simply died earlier, so its totals were smaller.
+
+## What would make this testable
+
+The two named obstacles are both fixable and both in scope (engine-side instrumentation, not driver work):
+
+1. **Name the right tensor.** Read the tensor the MoE kernel actually consumes as ids — the `ids` operand of
+   the `MUL_MAT_ID` node — instead of a name that happens to label the argsort's input.
+2. **Read it coherently.** Replace the plain-memcpy `ggml_backend_tensor_get` with a synchronising
+   device→host read for these tensors, so the value reflects device truth rather than the stale host copy.
+
+Until both are done, this family stays open and the probe must not be cited as evidence either way. No
+criterion changes and no arm from it is eligible.

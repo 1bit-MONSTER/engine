@@ -4305,3 +4305,60 @@ with a clean comparator population of 372.
    truncates the block. That is the FIRST thing to check and it may explain the whole effect.
  - This is a correlation on recorded data, not a discriminating experiment. It narrows the candidate
    space; it does not name a cause.
+
+---
+
+# THE FACE A / FACE B DETERMINISM SPLIT SURVIVES ITS CONFOUND (14:45) — and strengthens
+
+I flagged the obvious confound before over-reading the result: the harness's eight identical requests are
+separated by distractors, so an arm that dies early truncates the block, and Face-A arms die by
+definition. If `idn > 1` were merely "the arm died mid-block", the effect would be an artifact.
+
+### The confound is real but does NOT explain the effect
+Face-A arms with `idn > 1` did complete far fewer requests than `idn = 1` ones (median 9, 7, 9 against
+32), so short arms and nondeterminism are correlated. **But the controlled comparison separates them:**
+restricting to arms that completed **≤ 15 requests** - i.e. comparing equally-short arms:
+
+    verdict     idn=1   idn>1   nondeterministic
+    FAULT-B       19       0        0%        <- equally short, NEVER nondeterministic
+    FAULT-A        3      16       84%
+
+and the full population for reference:
+
+    OK          372       0        0%
+    FAULT-B      33       0        0%
+    FAULT-A      39      17       30%
+
+**Among arms of the same (short) length, Face B is nondeterministic in 0 of 19 cases while Face A is
+nondeterministic in 16 of 19 (84%).** Truncation cannot produce that: the two faces die the same way, at
+the same point in the workload, and only one of them disagrees with itself.
+
+### The refined statement
+    Face B (parser rejects output) : deterministic - every one of 52 measurable arms had idn = 1
+    Face A (NaN logits, server dies): nondeterministic in 84% of short arms, 30% overall
+
+So Face B's corruption REPRODUCES for the same input while Face A's VARIES run to run, and the difference
+is not explained by how far the arm got.
+
+### What this does to the candidate space
+ - the **argsort / stale-index** candidate predicts deterministic corruption (a stale slot holds the same
+   stale bytes if nothing rewrote it) -> fits Face B, does NOT fit Face A;
+ - the **eviction during a live write** candidate predicts nondeterministic corruption -> fits Face A,
+   does NOT fit Face B;
+ - therefore, on this evidence, the two faces most likely have DIFFERENT proximate origins while sharing
+   the eviction trigger.
+
+That contradicts the issue's own section 44 ("Face B is not a second defect: it is the same corruption
+seen after the parser"), which rested on seven Face-B arms. This is 52 measurable Face-B arms with a
+372-arm clean comparator population, and the split is now the strongest constraint in the record on what a
+mechanism must explain.
+
+### What is still needed
+This narrows the space; it does not name a cause. Two specific next measurements follow and both are
+cheap at an 83% fault rate:
+ 1. for Face-A arms, is the `idn > 1` disagreement in the LOGITS or in the sampling? (A NaN-logits arm
+    that disagrees with itself across identical requests means the NaN arrives intermittently, which is
+    the eviction-timing signature - already supported by the full-vocabulary-NaN observation.)
+ 2. for Face-B arms, does the rejected text REPRODUCE across arms (same degenerate output for the same
+    prompt)? If yes, it is a stable property of a corrupted buffer, which points at a persistent wrong
+    value rather than a moving one.

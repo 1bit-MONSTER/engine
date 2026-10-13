@@ -1487,3 +1487,52 @@ Also settled while here: the only change to ggml-hrx.cpp between the faulting pi
 pin removes a `return false` for IQ3_S/IQ4_NL GET_ROWS (i.e. PR #100 ENABLES an op the faulting pin
 refused). Unrelated to the reuse boundary, and it means the faulting configuration is otherwise
 carried forward unchanged - consistent with the fault still reproducing on the current pin.
+
+---
+
+## THE STOCK-BUILD GAP IS CONFIRMED CONCRETE (2026-10-13 05:45) — and it blocks P1's and criterion 4's baseline
+
+Section 46 of `docs/315-mechanism.md` flagged in passing that "every `control_bin` on disk is
+`315instr3-build`, whose tree has 233 insertions of its own, so the control cell has always been a
+candidate rather than a baseline. A stock-pin control has never been measured." Checked rather than
+repeated, and it is worse than "one tree": **there is no uninstrumented build at the pin at all.**
+
+Every build on the box reports the same version (`10613`, rev `e44c9d01a`), but each was configured
+against a DIRTY tree, and the footprints are all substantial:
+
+    tree                HEAD        dirty   ggml-hrx diff             total diff
+    llama-315copy       e44c9d01a   5       4 files, +432 -6           5 files, +471 -11
+    llama-315instr      e44c9d01a   4       4 files, +233 -5           4 files, +233 -5   <- 315instr3-build
+    llama-315fix        e44c9d01a   4       4 files, +240 -8           4 files, +240 -8
+
+    build                configured against
+    315instr3-build      ~/wt/llama-315instr/ggml
+    315copy-build        ~/wt/llama-315copy/ggml
+    315fbar-build        ~/wt/llama-315copy/ggml
+    315fp-build          ~/wt/llama-315copy/ggml
+
+So a version string of `e44c9d01a` does NOT mean stock: the rev is the commit the tree was checked
+out at, while the instrumentation is uncommitted working-tree diff. Every arm this campaign has ever
+run - including the 70-arm campaign of record and the running control - measured an instrumented
+binary against an instrumented binary. The 233-insertion delta is the smaller of the three and the
+copy probes are documented read-only (mechanism §41), so this is a *smaller* caveat than it first
+looks, but it is not nothing and it has never been measured.
+
+### Consequences
+ 1. **Criterion 4's "unchanged relative to baseline"** needs a stock build to compare against; the
+    baselines on record (`315-hrx-tests-baseline.md`, `315-engine-ci-baseline.md`) must be checked
+    for whether they were taken from a stock tree before being cited as the baseline.
+ 2. **P1's two arms** should both use the SAME build (that was always the design - the env is the
+    only intended difference), so the gap does not invalidate P1's comparison. Resolved for P1:
+    `<SAMEBIN>` = `~/wt/315instr3-build`, i.e. the exact binary the campaign of record and the
+    running control were run on, so P1 arm A is directly comparable to the historical 34/131.
+    A stock build would be *better* but is not required for P1 to be internally valid, and building
+    one costs box time that the budget may not have.
+ 3. **Any "the fault is gone" claim** must state which build it was measured on, because the
+    instrumented tree is not the shipped configuration.
+
+### What is NOT claimed
+This does not show the instrumentation causes or suppresses the fault. Section 41 established the
+copy probe is read-only and the sentinel touches only the 619520-byte logits allocation, and the
+70-arm campaign faulted 0/70 on an instrumented pair of binaries while run 7 faulted 3/11 - so
+instrumented runs reproduce faults fine. The gap is a record-keeping and baseline-purity issue.

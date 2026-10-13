@@ -66,3 +66,29 @@ carries NaN.
   arm here is an acceptance arm and no rate is quoted from it.
 
 No criterion changes.
+
+---
+
+# Amendment (before the second attempt): the environment must be the one that produces Face A
+
+The first attempt ran the sweep against a configuration that faulted **6 of 6 arms as Face B** — no NaN anywhere,
+so a `NANONLY` NaN-counting sweep could report nothing. That is a mis-targeted run, not a negative.
+
+The environment that has produced **Face A** at scale in this campaign is the one `315nan` used, which recorded
+16 faults in 17 arms, all Face A (`nan=1`, `hsa=0`), at `gtt_start=98G`:
+
+    EXTRA_ENV="GGML_HRX_COPY_PROBE=1 GGML_HRX_SENTINEL=1 GGML_HRX_LOGITS_FP=100000 \
+               GGML_HRX_TENSOR_FP=tail:16 GGML_HRX_TENSOR_FP_NANONLY=1"
+
+The second attempt therefore keeps that environment and changes **only** the tensor selector, from
+`tail:16` to the `l_out-0…l_out-63` name list — which is the whole point of the sweep, since `l_out-<layer>` is
+the last node of its layer's chunk and therefore faithfully readable.
+
+**The readout table above is unchanged**, and one check is added because the first attempt needed it:
+
+- if the arms fault as **Face B** (`nan=0`) again, the sweep is again uninformative and must be reported as a
+  **mis-targeted run**, never as "every layer clean".
+
+Note the pre-registration's own confound applies with more force here: `COPY_PROBE` and `LOGITS_FP` add further
+host-side reads on top of the 64-name list, so this run is more heavily instrumented than any before it, and the
+known inducing effect (§39) is correspondingly larger. No rate is quoted from it and no arm is eligible.

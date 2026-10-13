@@ -100,3 +100,22 @@ trigger.
 
 **Arm B (align 256) staged** as `~/wt/315alignf-b.sh` with the same shape and only the alignment differing,
 to run after arm A releases the box.
+
+## Arm A (align 4096) — COMPLETE
+
+    315alignfa, 3 rounds, frozen rig, GTT 98-99 GiB throughout, all arms in-regime, zero OOR/INVALID
+
+    cell q: OK=2 FAULT=1
+    cell e: OK=0 FAULT=3      <- every eviction arm faulted
+    cell c: OK=3 FAULT=0
+
+Cell `e` at **3/3 FAULT** — the frozen rig behaving exactly as its record says (~95% under the forcer), with
+align at the default 4096. The single cell-`q` fault is the drift-into-band effect already recorded, not a
+forcer result (`side=0/0`).
+
+**Arm B (align 256) launched 18:12:28**, tag `315alignfb`, verified: its session header carries
+`GGML_HRX_FA_PARTIAL_ALIGN=256` and the regime composed to GTT 100 GiB.
+
+So the comparison now has a valid control: if align 256 is **clean** in cell `e` where 4096 faulted 3/3, the
+alignment is required (a large, detectable difference despite the small n). If 256 also faults ~3/3, the
+alignment is **not required** — a one-sided "not sufficient", not a measured null.

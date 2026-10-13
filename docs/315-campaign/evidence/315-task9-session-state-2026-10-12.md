@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5320,3 +5304,70 @@ One of:
      instruments.
 All three are code changes on the fork side, in scope, and each is larger than what remains of this turn's
 budget.
+
+---
+
+# #####################################################################
+# THE DECODE-SPLIT FA KERNEL *IS* REQUIRED — align 256 clean, 4096 faulted
+# #####################################################################
+# 2026-10-13 16:00 — with a correction to my own harness verdict
+
+## The result, on the objective evidence
+`315galign1` ran the alignment discriminator **on GLM** with the frozen trigger. Checking each arm's own
+artifacts rather than my console counter:
+
+    arm        responses  HTTP-500 in responses  'Content-only' rejections  crash  verdict
+    ga4096-e      66              4                      8                   0    FAULT-B  (REAL)
+    ga256-e       66              0                      0                   0    CLEAN
+    ga4096-q      56              0                      0                   0    clean
+
+**With `GGML_HRX_FA_PARTIAL_ALIGN=256` - which makes the dispatch DECLINE the decode-split kernel and fall
+back to `flash_attention_f32_f16_wmma` - the eviction cell did NOT fault. With the production 4096 it did.**
+
+Against the pre-registered branches (`6282f03`):
+
+    "align256-e clean while align4096-e faults -> the kernel IS required; alignment becomes the lead"
+
+That is the branch the evidence landed on.
+
+## Correction to my own harness: one verdict was a false positive
+My console printed `arm ga256-e align=256 cell=e FAULT-A req=66 NaN=0`. **That verdict is wrong** and the
+objective evidence says so:
+
+    ga256-e: 66 responses written (each ~2.2 KB of valid content, last one resp.66),
+             nan-guard=0, Content-only=0, crash=0,
+             and the server log ends "cleaning up before exit" - a CLEAN shutdown, which is my own teardown.
+
+So the arm completed its whole workload correctly and my script's `xport` counter fired on a request issued
+after teardown began. That is a harness race in my own probe (`galign.sh` breaks the request loop on the
+first non-200 and counts it as a transport fault), and it is exactly the "zero for the wrong reason" class I
+have been cataloguing all session - except this time the direction was a FALSE FAULT rather than a false
+clean, which is the more dangerous direction for this issue.
+
+**It does not change the conclusion, and it strengthens it**: the arm that my bug mislabelled as faulting is
+in fact the CLEAN arm, which is precisely the positive result the pre-registration was looking for.
+
+## What this means for the mechanism
+This is the first positive identification of a **necessary component** rather than an eliminated one:
+
+    the fault REQUIRES the decode-split FA kernel path
+      - with it present (align 4096): the eviction cell faulted (4 HTTP 500s, 8 parser rejections)
+      - with it bypassed (align 256 -> fallback to flash_attention_f32_f16_wmma): clean
+
+So the corruption enters through the decode-split FA kernel or something only it does. That is
+**consistent with everything already recorded**:
+ - the static leg found the two handoffs #140 fixed are correctly fenced in that kernel
+   (`1de679f`), so this is NOT the same fence failing again - it is something else in the same kernel;
+ - the `GGML_HRX_USE_UNIFIED_MEMORY` coherence attribute made no difference, and the read path is
+   eliminated, so it is not the host read;
+ - my text constraint says the corruption is terminal and whole-buffer, which fits a kernel whose output
+   is consumed wholesale.
+
+## Bounds, stated plainly
+ - **n=1 per arm.** One clean 256 arm against one faulting 4096 arm, at a ~85% base rate, means
+   P(clean | fault still possible) is ~15% - so this is suggestive, not conclusive, and it needs
+   replication. The 4096 arm faulting while its own control cell was clean is the reassuring part.
+ - `align=256` **bypasses** rather than stresses, so this identifies the KERNEL as necessary; it says
+   nothing about which alignment/layout within it matters.
+ - my harness's false positive means this run's console column must not be trusted - the per-arm
+   artifacts must be read directly, which is how the result above was derived.

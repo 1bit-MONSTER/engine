@@ -832,3 +832,53 @@ is why that tag was discarded.
 The honest close: this turn produced a **refutation**, a retraction, two corrections, a pre-registration,
 and a named-but-confounded lead now properly bounded. It did not produce a fix, and criterion 2 should not
 be claimed.
+
+---
+
+# UPDATE 11 (2026-10-13 ~11:05) — the device-side family is also closed; the remaining surface is OUT OF SCOPE
+
+Continues UPDATE 10. Where UPDATE 10 closed the host side, this closes the device side as far as this
+goal's scope reaches, and records the boundary as the reason criterion 2 cannot be claimed.
+
+## What was closed this turn
+
+1. **The host-side family is fully accounted for** (`315-write-side-unaddressed.md`). Every host access to
+   the non-coherent `0x52` mapping is enumerated and none is on the decode path:
+   `buffer_memset` not called; `buffer_set` load-time only (`llama-context.cpp:2617, 2699`) or train-only
+   (`:3432`); `buffer_get` the fix, **refuted by its own A/B**; `buffer_clear` once at allocation. So no
+   host-side coherence defect can produce a per-token, eviction-correlated fault.
+
+2. **The runtime does not infer memory hazards** (`315-device-hunt-boundary.md`). Following §32/§33's
+   standing question, `aql_block_processor.c` states the policy in a comment: "command recording has
+   already encoded execution-barrier scopes in |packet_flags| … Do not infer memory hazards here by
+   walking command operands." The barrier bit consumes only compiler-set flags plus the
+   `packet_index == 0` submission overlay. **The runtime never derives a producer/consumer pair**, so a
+   missing dependency would be an *emission* gap, not a runtime one.
+
+## Why the remaining surface is out of scope
+
+The evidence now points at the **compiler's emission of execution-barrier scopes** for GLM's stream
+(loom / IREE codegen). The goal's declared boundaries are "the strixhalo GPU box, the `~/wt` repro
+harness, the engine pin and docs, and the 1bit-MONSTER/llama.cpp ggml-hrx side". Codegen is none of
+those. A bounded test would need codegen instrumentation comparing GLM's emitted scopes against a
+non-faulting dense model — outside the scope, and an open-ended internals expedition if attempted here.
+
+## Criteria, final for this turn
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named falsifiable mechanism | trigger **named and replicated** (0/22 -> 7/10, p=3.6e-5, both faces); **cause not located**, and now bounded out of scope |
+| 2 | forward-only fix landed | **not achievable**: the one candidate is refuted by its own pre-registered A/B; the patch must not be landed |
+| 3 | >=60 in-regime arms, zero faults | **not met**: the recorded 0/70 has no eviction cell, so it measures ambient pressure |
+| 4 | no regression | not reached (nothing landed to regress) |
+| 5 | KNOWN-ISSUES updated with evidence | **done**, including the refutation, the corrections, and the criterion-3 defect |
+
+## Honest close
+
+This turn produced a **refutation of the leading fix**, the **closure of both host- and device-side
+runtime families**, **one retracted overclaim**, **two corrections**, **one pre-registration** for the
+level question, and a **named out-of-scope boundary** for what remains. It did not produce a fix, and
+criterion 2 should not be claimed.
+
+20 commits on `1bit/315-preregistration`, pushed. Box left clean: no 315 processes, box lock released,
+`~/npu.lock` free, GTT 26 GiB, only the two pre-existing foreign Vulkan servers on the render node.

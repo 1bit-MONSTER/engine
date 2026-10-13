@@ -104,3 +104,47 @@ that would not disturb the timing.
 - Every other in-scope family (eight) remains as recorded.
 - The only remaining **faithful** statement about a faulting graph: **the residual stream is entirely NaN at the
   head**.
+
+---
+
+# Refinement: the graphs are per-layer, so `tail:N` is much safer than a name — and the campaign's one localization is still exposed
+
+The section above states the reuse rule but treats "intermediate tensor" as one category. The graph structure
+splits it, and the split matters because it decides which of the campaign's existing findings survive.
+
+**The graphs are per-layer (or per-layer-chunk).** From `315-row-p1c-inregime-mechanism.md`'s own fingerprint,
+by `call=` index:
+
+    call=158945   ffn_moe_weights-4, ffn_moe_gate-4, ffn_moe_up-4, ffn_moe_down-4, ffn_moe_weighted-4, l_out-4
+    call=159019   ffn_moe_probs-41, ffn_moe_weights-41, ffn_moe_gate-41, ..., l_out-41
+    call=159029   norm, result_norm, result_output
+
+Each call is **one layer's chunk, or the head** — not one graph holding all 47 layers. The id probe's own log
+agrees: only layer 46's tensors appear at `call=94`.
+
+**Consequences.**
+
+1. **`tail:N` reads a single layer's last N nodes** — near the end of a per-layer graph, so their slots have the
+   fewest later nodes available to displace them. That is why the campaign's `tail:16` NaN localisations produced
+   coherent, discriminating readings while name-based reads of the same kinds of tensor produced floats. **The
+   `tail:N` methodology is sound, and this stretch's reuse finding does not undermine it.**
+2. **Name-based reads of early nodes are the exposed case.** `ffn_moe_argsort`/`ffn_moe_topk` sit early in a
+   layer's graph (the route selection precedes the MoE matmuls), so later nodes reuse their slots — which is
+   exactly what was observed (an i32 rank tensor reading back a later float tensor's data, identically under two
+   independent read paths).
+3. **The campaign's one localization is still exposed, and it is the part that mattered.** The reported first
+   NaN-bearing stage is `ffn_shexp-41` (one `n_embd` row, 2048 of 352256), and the record itself notes the
+   window "begins after `ffn_norm-41`". So `ffn_shexp-41` is among the **earliest** nodes in that 16-node window
+   — the position most exposed to displacement by the window's later nodes. **The observed "first NaN" may be a
+   displaced read rather than a NaN produced there.** The record's own hedge — that the window "cannot say whether
+   the FFN's input row was already NaN or the FFN matmul fabricated NaN from clean input" — is therefore joined by
+   a second reason for doubt: the node's own reading is the weakest in the window.
+
+So the corrected statement of the rule is positional, not categorical:
+
+- **late in the graph** (end-of-graph tensors; a `tail:N` window's tail) — faithful;
+- **early or middle** (name-matched intermediates; the *head* of a `tail:N` window) — exposed to displacement.
+
+Net effect on the campaign's standing evidence: the NaN **totals** and the all-NaN residual at the head remain
+supported (`norm`, `result_norm`, `result_output` are the graph's last nodes). The **per-node attribution** to
+`ffn_shexp-41` — the one named stage — is weaker than the record presents it.

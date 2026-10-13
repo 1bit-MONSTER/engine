@@ -1240,6 +1240,21 @@ The DRAIN finding is what MAKES this work rather than what contradicts it.
      least once. If an arm faults with zero Q_EVICT/Q_RESTORE for its pid, this mechanism is
      refuted.
 
+### P2 PIPELINE VERIFIED END-TO-END (05:30), before any fault lands
+So the comparison is computed, not hand-derived, the moment an arm faults:
+  - `detector.json` schema matches what the tool reads: requests, ok, utf8_failures,
+    parse_failures, http_failures, transport_failures, identical_distinct, first_failure.
+    The clean 315ctl1 arms show identical_distinct=1 (deterministic) with every failure
+    counter 0, which is the control shape P2 needs.
+  - the fault-timestamp parser handles BOTH faces: `315-evict-per-arm.py:47` (TS) matches
+    `m.s.ms.us` and `:52` (FAULT) matches both `HRX returned NaN logits` (Face A) and
+    `unparsed Content-only` (Face B).
+  - checked against a REAL faulting arm rather than assumed: run 7's p3l fault line is
+    `1.21.180.831 W common_chat_peg_parse: unparsed Content-only output`, and TS resolves that
+    to 1 min 21.18 s into the arm - the Face-B case, parsed correctly.
+  - the clean-arm denominator it compares against is now n=7 (min 160, median 262, max 293,
+    mean 234.7), stable as n grew from 4, so the comparator is not a small-sample artefact.
+
 ### P3 IS LIVE ON THIS RUN (verified 05:23) - arms are evicted AND restored under cwsr=1
 Per-arm, from the control's own SMI stream (pid = the arm's server.pid):
 

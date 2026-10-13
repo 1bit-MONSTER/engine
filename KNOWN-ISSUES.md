@@ -40,8 +40,23 @@ authorization and do what needs to be done"* — on the basis that no forward fi
 below was drafted by the assistant; the owner has not edited it and may amend or withdraw it at any time.
 
 **Affected:** `GLM-4.7-Flash-Q4_K_M` on `HRX0`, `llama-server`, at high GTT occupancy (measured from
-`gtt_start` ~83 GB up to ~110 GB). Raises at roughly 10-20 % per run; not deterministic and not reproducible on
-demand, which is why it is recorded as a limitation rather than fixed.
+`gtt_start` ~83 GB up to ~110 GB). Not deterministic and not reproducible on demand, which is why it is
+recorded as a limitation rather than fixed.
+
+**Rate, corrected 2026-10-13.** The earlier "roughly 10-20 % per run" was a pooled figure and it mixed a
+deliberate high-rate reproduction rig with ordinary runs. Decomposed from the arm ledger's own per-tag table,
+the `315nan` session alone contributed 18 of the 33 pooled in-regime faults from 19 arms (94.7 %); excluding
+it the pool is 18.1 %. The two measurements taken under a *stated* regime agree with each other instead:
+
+| measurement | arms | regime | faults | rate |
+|---|---|---|---|---|
+| shipped-pin study (this file, 2026-10-09) | 37 | 102 GiB | 2 | **5.4 %** |
+| `315ctl1` cwsr=1 fresh-boot control (2026-10-13) | 27 | 97-98 GiB | 2 | **7.4 %** |
+
+Fisher exact two-sided p = 1.000, i.e. no difference detectable. **So the working rate for this configuration is
+~5-7 % per in-regime arm**, with both faces represented. Any experiment sized against 10-20 % or against the
+pooled 26 % will be under-powered: at 7 % a clean block of 20 arms occurs by chance ~21 % of the time. Re-measure
+the rate at the configuration under test and size from that number.
 
 ### Reproduction
 
@@ -116,6 +131,25 @@ exposure and is excluded, not counted as clean.
   abnormal arm death leaves an orphan holding the flock and every later arm wedges without running. One-word fix
   at the launch site: `... 2>&1 9>&- &`.
 
+Three more traps found on 2026-10-13, each of which cost time or nearly produced a wrong conclusion:
+
+- **Raw per-pid eviction counts are meaningless for a FAULTING arm.** A faulting arm's server can be orphaned
+  (`ppid=1`) and outlive its own arm, so it accumulates evictions for as long as it survives. The faulting arm
+  `p8l` shows **2,798** raw evictions — the highest in its run — against **203** when correctly bounded to the arm
+  window, while the clean-arm ceiling is 559. A raw `grep` therefore reports the opposite of the truth. Always use
+  the arm-bounded **pre-fault** column (`315-evict-per-arm.py`), never a raw per-pid count.
+- **A Face-B fault can be invisible to `grep`.** The parser's rejected text contains invalid UTF-8, which makes
+  `grep` treat the log as binary and return *nothing* for a line that is present. Use `grep -a`, or trust the
+  detector's `first_failure`/`http_failures`. Related: the scoring tool's own face tally keys on parse/utf8
+  counters, so a Face-B fault recorded as `http_failures` lands in its "unattributed" column — `detector.json` is
+  authoritative, not the console and not the face tally.
+- **A pooled rate is not a rate for a configuration.** Pooling a deliberate high-rate repro rig (`315nan`, 18
+  faults in 19 arms) with ordinary runs produced the "~26 %" that several instruments were powered against, when
+  the two regime-controlled measurements agree at 5-7 %. See the corrected rate table above.
+- **A rollback path is not a rollback.** The `cwsr_enable=0` drop-in was removed for a control run and its verbatim
+  bytes had never been recorded — only a path and an md5, and the file was gone. Capture the CONTENT of any
+  environment change into the repository, not a reference to it.
+
 ### What remains unknown
 
 The fault reproduces on the shipped pin — `pair 2 arm c: FAULT-NaN nan=1 req=34 gtt_start=102G`, build
@@ -137,9 +171,39 @@ live on the shipped pin. The reading is bounded, not directional: both intervals
 motivated the change and neither excludes "no change" (and that ~10% comparator itself rested on 1 fault in 15
 arms, 95% CI ~0.2-32%, so the lower rate needs no environmental explanation). No runtime-side ordering gap on the
 device-to-host path could be named, and no forward-pin fix candidate
-survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert). The open candidates are in the
-kernel/binding family: GLM is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760
-dispatches) with 1,399 barriers per token.
+survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert).
+
+**Candidate families closed by measurement and source reading (2026-10-13).** The block-split candidate
+recorded here previously is WITHDRAWN: the engine's own profiler measures GLM's decode program as **one block with
+zero block-boundary gaps**, at the default and at both alternate `HRX_AQL_BLOCK_SIZE` values, so the
+"919 + 760 dispatches, two 128 KB blocks, 1,399 barriers per token" figure this file carried is not reproduced —
+it is either a different workload or wrong. The following were also closed on 2026-10-13, and
+`docs/315-STATUS.md` UPDATE 7 carries the full evidence paths:
+
+- **The CWSR/preemption framing.** A fresh-booted `cwsr_enable=1` control (20 pairs, 27 in-regime arms) faulted
+  **2/27 = 7.41 % with BOTH faces** (`p8l` Face B via HTTP 500; `p16c` Face A via `nan=1`), on opposite cells.
+  A fresh boot at cwsr=1 therefore faults, so the 70-arm cwsr=0 clean campaign cannot be attributed to CWSR, and
+  "cwsr=0 prevents it" is not the mechanism.
+- **Eviction/buffer-movement as a rate mechanism.** On the arm-bounded pre-fault measure (the causal one — a fault
+  cannot cause evictions that precede it) faulting arms show **no excess**: 203 evictions for the sampled faulting
+  arm against a clean-arm mean of 254.5 (n=25, clean floor 117), and one faulting arm sat at 16. The predicted
+  excess is absent, so the eviction count is not a discriminator for this fault.
+- **The engine's own #123/#140 stale-buffer class, in GLM's path.** Read to conclusion: the two handoffs that
+  class fixed carry **both** the store-wait and the LDS fence in GLM's kernel
+  (`loom-libs/ops/...flash_attention_decode_split_f32_f16_wmma.loom:1170-1178`, plus the completion-counter
+  handshake at `:1158-1180`), and four further hazard hypotheses were rejected by reading the code rather than
+  asserted (`masked_value_stage` is per-subgroup so its subgroup barrier suffices; `probability_stage` is
+  workgroup-wide but workgroup-barriered; `mul_mat_id_swiglu` writes a global it never reads; the q6_k handoff is
+  cross-dispatch). The consumer's own read path was already cleared (`hsa_signal_wait_scacquire`, timepoint
+  advanced after submit) and so was dispatch ordering.
+
+**What that leaves as the honest position:** no candidate on the record survives its own discriminating test,
+while the fault itself is real, reproducible, and now well characterised — at **~5-7 %** per in-regime arm, on
+**both** faces, at **both** cwsr settings, on two different binaries, at 97-102 GiB. The single most useful
+lesson for whoever picks this up: **every instrument on this issue was powered against a rate that turned out to
+be wrong by ~4x**, so size any new experiment from a freshly measured rate, and prefer a design that RAISES the
+event rate before testing a mechanism — which is what the #123/#140 work did with a separate process forcing queue
+evictions, and what none of this issue's instruments did.
 
 **Pin note (2026-10-09).** `engine@main` has since moved twice: first to `third_party/llama.cpp e44c9d01a4d5`
 (#347), then to `0e255d774032` (#373, the fork tip after the NVFP4 / Q2_0 / IQ GET_ROWS merges), both with

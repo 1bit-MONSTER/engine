@@ -927,3 +927,61 @@ comparison needs.
     criteria 4,5 not started
 Commits this session: 12a04f5, 7d74d5c on 1bit/315-preregistration (add-only, pushed).
 Evidence file: docs/315-campaign/evidence/315-task9-session-state-2026-10-12.md
+
+---
+
+## BLOCKED DECLARATION — 2026-10-13 (context 83%, goal 484m / 15.0M tokens)
+
+The same blocker has now recurred across many consecutive goal turns and cannot be cleared by any
+action available to me. Recording it per the goal system's own rule, after having kept trying
+concrete steps.
+
+### The blocker
+`315-cwsr-control.sh` is staged, rollback-verified, and in scope — but it **reboots the box**, and
+the box carries a live workload I must not disturb:
+
+    pid 2692078  rsync --server --sender -logDtprSe.iLsfxCIvu . /home/bcloud/
+    parent       sshd-session: bcloud@notty  <- an INBOUND ssh connection
+    state        STILL TRANSFERRING (read_bytes 6,296,723,456 -> 6,562,484,224 across this session)
+    peers        5 established :22 sessions from 192.168.50.100 and 192.168.50.216
+
+`--sender` means the box is SERVING a transfer to remote hosts - someone else's pull, over an
+inbound SSH session. It is not a service I manage and not mine to kill. A reboot truncates it
+mid-flight.
+
+The objective's own constraint forbids exactly this: "do not disturb other workloads on the shared
+box."
+
+### Why I am NOT calling this an excuse
+Concrete steps actually tried, not assumed:
+ - verified all five control preconditions individually (campaign, HRX holders, drop-in, sudo, cwsr)
+ - verified `npu.lock` FREE and that 315-evict-trace.sh:98-103 takes both locks (so the objective's
+   flock requirement is met by the script)
+ - re-read the objective's boundaries/constraints and confirmed the reboot is in scope
+ - captured and md5-verified the rollback (~/work/amd_cwsr.cfg.backup == live drop-in)
+ - established that two managed services (1bit-canonical, coder-llm) are enabled+linger, so they
+   self-heal in ~2 min - tolerable
+ - traced the rsync's parent chain to an inbound sshd-session, proving it is not mine to stop
+ - checked ~10 times over multiple goal turns whether it finished; it has not
+
+So the blocker is real, external, and outside my authority. Waiting is the only correct action, and
+it has already cost ~15M tokens of holding.
+
+### What IS done (this session)
+    criterion 3  MET      315cwsr70: 70/70 fix-cell arms, 0 faults, 0 OOR, 0 INVALID,
+                          all in-regime at gtt_start=97G; exact 95% CI 3.14%; power statement
+    criterion 1  UNMET    no mechanism named; H2's carrier contradicted by the AMD reference set
+                          (cwsr=0 -> WAVEFRONT_DRAIN; GFX11 -> DRAIN_PIPE)
+    criterion 2  UNMET    no landed fix; both campaign cells ran the same revision e44c9d01a
+    criteria 4,5 not started
+
+    commits    ecf9be3, 7d74d5c, 12a04f5 on 1bit/315-preregistration (add-only, pushed)
+    evidence   docs/315-campaign/evidence/315-task9-session-state-2026-10-12.md
+    rollback   ~/work/amd_cwsr.cfg.backup (md5 a8b25738...)
+
+### The single resume action
+Once `pgrep -x rsync` is empty:
+    ssh strixhalo 'cd ~/wt && TAG=315ctl1 PAIRS=20 bash 315-cwsr-control.sh'
+Then after the reboot: `nohup bash ~/wt/315-evict-trace.sh 20 315ctl1 > ~/wt/315ctl1-run.log 2>&1 &`
+Reading key: rate ~26% -> H1 confirmed (signal was a boot artefact, criterion 1 collapses);
+rate ~0% -> H1 dead, cwsr=0 signal real, H2 the sole survivor.

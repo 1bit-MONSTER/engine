@@ -1472,3 +1472,54 @@ Line-based counter on newline-free NDJSON; `pgrep` pattern matching its own call
 responses; **guessed binary names** for the criterion-4 control; and a `sudo -n tee` that wrote nothing. Each
 was caught before its output was cited. The consistent lesson: **read the baseline, list the directory, and
 compare the payload** rather than reconstructing from memory.
+
+---
+
+# UPDATE 20 (2026-10-13 ~17:40) — the pool lead is CLOSED structurally; five families/leads now
+
+Pursued the new lead from the REA dumps to its end, via three of my own corrections.
+
+## The lead, and where it ended
+
+`hrx_mem_pool_trim`'s decompilation showed `quarantine_eviction_count` and `bytes_quarantined` — plausible
+"retire → reuse" vocabulary that could sit under the eviction trigger. Followed to the end:
+
+1. I concluded the pool was **unreachable** (engine never calls `hrx_mem_pool_*`). **Wrong** — the engine uses
+   a **slab pool** created via `hrx_mem_pool_backing_create_pool`; I had grepped the wrong symbol.
+2. Corrected, the lead re-opened, and the pool the engine does use was read
+   (`hrx_iree_exact_pool_create`, `libhrx/src/libhrx/pool.c`, from `buffer.c:109`).
+3. Its `trim` is a **no-op**; `acquire` marks every reservation `OK_FRESH` (straight to
+   `iree_hal_allocator_allocate_buffer`); `release` frees immediately and retains nothing.
+4. So **there is no reuse window**, and `quarantine` in this runtime is the **AMDGPU HAL ASAN** feature
+   (redzones, shadow publication, release poisoning, a FIFO that deliberately retains freed mappings) —
+   **off in production**.
+
+Net: the lead closes for a **structural** reason — the pool holds nothing, so it cannot hand anything out
+stale — not by absence of evidence.
+
+## What the goals' closed set now is
+
+    logits read path (hrx_synchronous_d2h)     REFUTED   its own pre-registered A/B
+    host side (all four 0x52 accesses)         CLOSED    none on the decode path
+    runtime AQL submission policy              CLOSED    the runtime does not infer hazards
+    graph reorder (GGML_HRX_GRAPH_ORDER)       REFUTED   cell e 4/4 FAULT in BOTH arms
+    deferred host writeback                    CLOSED    binding host_data == nullptr
+    memory-pool quarantine / reuse             CLOSED    no-op trim, fresh-only acquire, immediate release
+    FA alignment/dispatch (#140)               OPEN      untested (my exclusion was a parse error)
+
+and the **trigger** stands, quantified: ambient ~5% vs forced eviction ~95% under the frozen rig.
+
+## Also still true
+
+- **Criterion 4's controls are measured and passing** — 8/8 HRX tests, `MUL_MAT_ID` nmse matching baseline.
+- **Criterion 2 remains not achievable within scope** — the structural argument is unchanged, and this
+  closure removes another candidate rather than opening one.
+- The engine's own allocation path is now **read end to end** for this question: buffer allocate → exact pool
+  → fresh allocator buffer → immediate release. Nothing in it caches.
+
+## Harness/reasoning defects this session
+
+Now six: a line counter on newline-free NDJSON; a `pgrep` matching its own caller; `md5sum` over streaming
+responses; guessed binary names; a `sudo -n tee` writing nothing; and the **symbol-search false negative**
+above. The last is the same lesson as the others in a new guise — **check the symbol you grepped, not just
+that the grep was empty.**

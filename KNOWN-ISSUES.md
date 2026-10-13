@@ -302,3 +302,75 @@ flush-and-wait that publishes the data, with a `=poison` mode so the reporting p
 compiles (single TU). It is deliberately unbuilt and unrun: relinking rebuilds every TU that includes
 `backend-context.h`, and that CPU inside a GTT-bound measurement is the confound that already invalidated one run
 of this experiment.
+
+---
+
+## UPDATE 2026-10-13 — the condition is now named and it is `gtt_start`; the read-path fix is REFUTED
+
+This supersedes the "no mechanism is proven" line at the top of this entry. It does **not** retire the
+entry: the cause site is still not located, so the issue remains OPEN.
+
+### The condition that governs the fault: measured, and it is occupancy, not the instrument
+
+A census of **every recorded arm on the box** (all `315*-console.log` under `~/wt`, 1,675 lines, every
+line matching `arm [qelc]: (OK|FAULT|OOR|INVALID)` parsed for cell, `gtt_start`, `gtt_now`) gives:
+
+```
+    gtt_start=97G:  OK=150  FAULT=8    rate =  5.1%
+    gtt_start=98G:  OK=145  FAULT=64   rate = 30.6%
+```
+
+A six-fold difference between adjacent 1 GiB bands. The split is **not** an artifact of cell
+composition: excluding the forcer cell `e` entirely it survives (5.1% vs 26.2%), and it holds *within*
+each cell — `l` 6.0%->24.8%, `c` 2.2%->29.5%.
+
+This reconciles four observations that previously did not fit together: the 0/70 campaign (run at 97G,
+the 5% band, where ~3.6 faults were expected and 0 observed, P~3%) is a genuine low-band measurement and
+never evidence of absence; cell `e`'s near-total fault rate is because the forcer drives arms straight
+through the high band; the quiet- and CPU-cell faults occur at 98G starts or by drifting there; and the
+falsified per-arm eviction-*count* correlation (faulting mean 109.5 vs clean 254.5) failed because a
+count of evictions is not a measure of band occupancy.
+
+Evidence: `docs/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`,
+`315-faults-track-gtt-drift.md`, `315-ab1-cell-c-fault-drift.md`, `315-0of70-has-no-eviction-cell.md`.
+
+### The forced-eviction intervention, and the fix it motivated
+
+Forcing KFD evict/restore via `~/wt/evictonly` raises the rate from 0/22 to 7/10 arms (Fisher exact
+two-sided p = 3.6e-5), producing **both** faces under one intervention — the trigger-level mechanism.
+
+The candidate repair that intervention motivated — routing `buffer_get`'s bare `memcpy` of the
+non-coherent `0x52` logits mapping through `hrx_synchronous_d2h` — has been **REFUTED by its own
+pre-registered A/B** (`fc7ffd5`, `docs/315-campaign/evidence/315-ab-preregistration.md`):
+
+```
+    cell e (forced eviction, the test cell)    arm A (knob OFF): 0 OK / 4 FAULT
+                                               arm B (knob ON):  FAULT in round 1 (Face B) and round 2 (Face B)
+```
+
+The knob was confirmed live by reading the arm server's own `/proc/<pid>/environ` during the arm. The
+refutation is not dismissible: the one objection that would make it vacuous — that `hrx_synchronous_d2h`
+is itself an incoherent read — was checked at source and disproved, the runtime's staging pool being
+created `HOST_LOCAL | HOST_COHERENT | DEVICE_VISIBLE`
+(`host_queue_staging.c:427`, `315-ab1-fix-path-is-coherent.md`).
+
+**The prepared patch must NOT be landed.** It is preserved at
+`docs/315-campaign/patches/315-coherent-read-fix.patch` for the record only.
+
+### Consequence for this entry's acceptance criterion
+
+The criterion used here has been ">=60 in-regime arms, zero faults". The census shows that criterion is
+**satisfiable without testing the defect**: 60 arms at `gtt_start=97G` run in the ~5% population while
+the defect is fully present at 98G. Any claim that #315 is gone must therefore show zero faults **in the
+high band (>=98G)**, or the regime gate must be redefined to the population that actually faults.
+
+### Still open
+
+The **cause** — which handoff reads stale data after an eviction — is not located. The read path is now
+eliminated. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch
+ordering, or a different class), plus the host-write-side access asymmetry recorded in
+`315-write-side-unaddressed.md`, whose logits form is already falsified
+(`output_reserve`'s clear is once-at-allocation, not per-decode).
+
+The controlled confirmation of the `gtt_start` boundary (cell fixed, start stepped 97/98/99) is
+pre-registered at `docs/315-campaign/evidence/315-gttstep-preregistration.md`, not yet run.

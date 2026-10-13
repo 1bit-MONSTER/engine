@@ -2602,3 +2602,62 @@ clean range rather than above it. The candidate is closed by the same causal log
 predecessors, and this time at zero box cost.
 
 Recorded with the numbers so the tempting metadata pattern is not rediscovered and mis-read as a lead.
+
+---
+
+# THE CLEANEST CHARACTERISATION OF BOTH FACES IN THE RECORD (08:45) — from the control's own logs
+
+Re-reading the two faulting arms' `server.log` line by line (free, no box time) gives the exact
+sequence for each face, and it is the sharpest evidence this issue has produced.
+
+## p16c — FACE A, on the FIRST request, 165 ms in
+
+    0.10.661.057  load_model: initializing, n_slots = 1, n_ctx_slot = 8192
+    0.10.672.905  llama_server: model loaded
+    0.10.672.910  llama_server: listening on http://127.0.0.1:19556
+    0.11.115.575  slot launch_slot_: id 0 | task 0 | processing task, is_child = 0   <- FIRST request
+    (sampling.cpp:620) HRX: NaN logits (engine#123)
+    0.11.280.251  E common_sampler_sample: HRX returned NaN logits: count=154880 of 154880,
+                  index range [0..154879], contiguous=yes, continuing=no
+
+So the sequence is: **model loaded -> server listening -> first request -> 165 ms of work -> the ENTIRE
+vocabulary (154880 of 154880) NaN.** The guard aborts, the process dumps a backtrace (a 105-line log
+against a clean arm's 485), and the detector records `transport_failures 1 / RemoteDisconnected`.
+
+Three things this pins down:
+ 1. **It is the load/warmup phase, not steady-state generation** - 11.3 s into a process whose clean
+    siblings run ~207 s, and the very first `task 0`.
+ 2. **It is the whole LM-head output, contiguous** - `[0..154879] contiguous=yes` - which is the exact
+    signature KNOWN-ISSUES already records (`count=154880 of 154880, contiguous=yes`). The buffer was
+    not partially wrong; it was entirely unwritten or entirely poison.
+ 3. **It is reproducible at this phase** - the same shape as the historical `v315g-c3` control arm in
+    KNOWN-ISSUES. So a fault at the FIRST request, whole-vocabulary, is not a new phenomenon.
+
+## p8l — FACE B, after ~90 s of SUCCESSFUL generation
+
+    0.40.207.097  slot print_timing: id 0 | task 454 | eval time = 5000.24 ms / 96 tokens (19.20 tok/s)
+    ...
+    1.31.428.076  W srv operator(): got exception: {"error":{"code":500,"message":"The model produced
+                  output that does not match the expected Content-only format"}}
+
+The arm ran to `req=22` of 66 with 21 successful completions, printing timing for 96-token evals, and
+then the parser rejected one output at 1 min 31 s. Its server survived (no backtrace; the log ends
+normally) - so Face B is a *content* failure inside an otherwise working server.
+
+## Why this matters - and what it does NOT say
+The two faces are now characterised at the level of concrete timestamps rather than verdicts:
+
+    Face A: FIRST request, ~165 ms of work, whole-vocabulary NaN, process aborts
+    Face B: ~90 s in, after 21 good completions, one degenerate output, process survives
+
+That is a materially different pair of signatures from "intermittent corruption somewhere in the run",
+and it sharpens what a mechanism must explain: Face A is an *initialisation-adjacent* whole-buffer
+failure, Face B a *late, partial* content failure. It also means a future experiment can target the
+warmup phase specifically, which is both cheaper (seconds, not minutes per arm) and much higher-yield
+than sampling the full 66-request workload - the fault appeared 165 ms into a warmup in one arm of a
+27-arm run.
+
+NOT claimed: that the two faces have different mechanisms (they may still be one defect seen at
+different phases); that the warmup phase is *enriched* for the fault (n=1 at that phase, and the
+historical comparator is another single example); or that Face A is confined to warmup. What IS
+established is the phase, the extent, and the survival-vs-abort difference, each with a timestamp.

@@ -613,3 +613,79 @@ not erase) the 0/70 campaign's evidential force.
     HRX0 holders 0 · GTT 26 GiB (baseline) · VRAM 0 GiB · load ~1.1 · npu.lock FREE · watcher 0
     drop-in present with cwsr_enable=0 in 3 grub.cfg entries (shipped BOOT state restored)
     live cwsr = 1 until the next reboot (no reboot taken unilaterally; nothing waits on it)
+
+---
+
+# UPDATE 8 (2026-10-13 ~08:55) — THE MECHANISM IS NAMED AND REPLICATED: forced KFD eviction
+# causes the fault, 70% vs 0/22, p = 3.6e-5, BOTH faces
+
+This supersedes UPDATE 7's "no candidate survives" position. It does not supersede the control result
+in UPDATE 7 — it explains why that control could not see the mechanism.
+
+## The result
+
+A pre-registered three-cell experiment (commit `36f360a`, branches fixed BEFORE the run) plus its
+earlier twin:
+
+    cell e  = ~/wt/evictonly 500   a process that launches NO kernels and only forces KFD evict/restore
+                                   via mprotect churn over hipHostRegister'd memory
+    cell q  = quiet                no side load
+    cell c  = CPU pressure only    pinned to CCD1, no GPU
+
+    315disc1 (2026-10-11)   e: 2 FAULT / 2 OK     q+c: 0 FAULT / 10 OK
+    315disc2 (2026-10-13)   e: 5 FAULT / 1 OK     q+c: 0 FAULT / 12 OK
+    ----------------------------------------------------------------------
+    pooled                  e: 7 FAULT / 10 arms = 70.0%
+                            q+c: 0 FAULT / 22 arms = 0.0%
+                            Fisher exact two-sided p = 3.6e-5
+                            rule-of-three control bound (22 arms, 0 faults) = 13.6%
+
+All seven faults in-regime at `gtt_start=98G`, zero OOR in either run.
+
+**Both faces appear under the same intervention**: 4 Face A (`nan=1`, whole-vocabulary
+`count=154880 of 154880 contiguous=yes`, sampler guard aborts the server) and 3 Face B (`nan=0`,
+`http=1 s500=1 unparsed=2`, parser returns HTTP 500, server survives).
+
+## The mechanism statement
+
+> A process that makes the kernel evict and restore in-flight KFD queue memory — launching no kernels
+> of its own — raises the GLM-4.7-Flash HRX fault rate from **0/22 arms to 7/10 arms**, producing BOTH
+> recorded faces. Neither a quiet box (0/10) nor CPU-only pressure (0/12) does this at all.
+
+## Why the intervention is trustworthy
+
+`evictonly` was verified directly with the issue's own watcher rather than trusted from its comment:
+**4,134 `Q_EVICT` / 4,168 `Q_RESTORE` in 25 s** against **0 / 0 in a 25 s quiet window**. It launches no
+kernels, so the effect cannot be compute, thermal or scheduling — and the `c` cell (CPU pressure, no
+GPU) is clean across 12 arms, ruling those out independently.
+
+## What this fixes about UPDATE 7
+
+UPDATE 7 reported the control's per-arm **correlation** finding: faulting arms showed no eviction excess
+(203 vs clean mean 254.5). That remains true and is not contradicted — a rate-correlation and an
+intervention are different instruments. The intervention shows eviction **causes** the fault; the
+correlation showed that under ambient pressure the per-arm eviction *count* does not predict which arm
+faults. Both stand; only the conclusion I drew from the second ("H2' is falsified") was wrong, and it
+is corrected at `3a2ba07` and definitively here.
+
+This also explains why the earlier H1 control could not surface a mechanism: at ambient ~5-7 % the
+event rate is too low for any correlation to see, which is exactly the rate-raising argument the
+26 %-vs-7 % correction made.
+
+## What is still NOT named, and it is the boundary between criteria 1 and 2
+
+**Named:** the TRIGGER — eviction of in-flight KFD work causes the fault, both faces, replicated.
+
+**Not named:** the CAUSE — which handoff reads stale data. The static leg already showed the #140-class
+handoff in GLM's path is correctly fenced in this pin (`barrier<global>` then `barrier<workgroup>`
+between the reduce's stores and the q8 pack, plus the completion-counter handshake; commit `1de679f`),
+so the corrupted handoff is elsewhere and remains unidentified.
+
+Criterion 1's first clause ("name the mechanism, with a discriminating experiment") is therefore met at
+the trigger level with a controlled, replicated, pre-registered experiment. Criterion 2 (the
+forward-only fix) still requires the code site.
+
+## Box state
+Clean: 0 HRX0 holders, GTT 26 GiB, VRAM 0 GiB, locks free, load 0.2. Drop-in present and the box's
+boot config is the shipped `cwsr=0`; the live kernel remains `cwsr=1` until a reboot (not taken
+unilaterally).

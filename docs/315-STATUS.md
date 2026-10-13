@@ -1619,3 +1619,85 @@ the opposite of the truth).
 
 The consistent lesson, now stated three times on the record: **count occurrences not lines, read the baseline
 rather than reconstructing it, and check the symbol/pattern you actually used.**
+
+---
+
+## Session of 2026-10-13 evening: read fidelity, device-side instrumentation, and the sentinel recovered
+
+Add-only. Nothing above is edited; where this changes a reading, it says so.
+
+### The instrument itself was the subject, and it yielded three results
+
+1. **The read path is refuted, not the cause.** The instrument was patched to read every tensor twice on the
+   same line — plain memcpy and synchronising `hrx_synchronous_d2h` — and over ~138k observations **138,256 were
+   identical**. A plausible and attractive explanation (the host-visible memcpy shortcut in `buffer_get` returning
+   non-coherent memory, which would have implicated *every* host-side read in this campaign) is **dead on
+   evidence**. `315-idprobe-readpath-refuted.md`.
+
+2. **Arena slot reuse is why intermediate reads are unfaithful.** `ggml_argsort` allocates a fresh i32 tensor
+   (`ggml.c:5347`) and `ggml_argsort_top_k` merely views it, so after execution it must hold ranks; it holds a
+   *later* tensor's float data instead — because the fingerprint reads **after the whole graph has run** and the
+   allocator reassigns the slot of any tensor whose lifetime ended. `TransientArena` is one reused buffer, and
+   `GGML_HRX_DIAGNOSTIC_FRESH_TRANSIENT_ARENA` **does not help** (checked: it only allocates fresh on capacity
+   growth), which is worth knowing before anyone relies on it.
+
+3. **Faithfulness is positional.** The graphs are **per-layer**, so `tail:N` reads a layer's *last* nodes — the
+   least displaced — which is why this campaign's `tail:16` work produced coherent readings while name-matched
+   early nodes did not. **The `tail:N` methodology survives.** But its own first node is the exposed one: the one
+   named NaN stage in the record, `ffn_shexp-41`, sits at the **head** of its 16-node window, so that attribution
+   is weaker than the record presents. `315-which-readings-are-faithful.md`.
+
+### Two exclusions added, one of them recovered from a run that was never read out
+
+- **Stale / never-written logits — EXCLUDED for Face A.** The engine already ships the discriminator:
+  `GGML_HRX_SENTINEL=1` fills the 619520-byte logits allocation with payload NaN `0x7FC0DEAD`, and the sampler
+  guard reports the match count as `sentinel=`. The `315nan` session **armed it** (fill line present in **20 of 21
+  arms**) and **all 17 fault lines read `sentinel=0`**: the device wrote the region, with NaNs. The field was
+  never read out at the time, so the campaign spent two days reasoning about a mechanism its own log had already
+  decided. `315-sentinel-preregistration.md`.
+- **Device-side access violations — not detected, qualified.** `HRX_HAL_SANITIZER=asan` (→ `options->asan.enabled`,
+  `logical_device.c:241`) plus the engine's existing sink via `GGML_HRX_LOG_DEVICE_EVENTS=1` (installed before
+  `hrx_gpu_initialize`, `ggml-hrx.cpp:1371`) is a **device-side, kernel-attributed** channel that had never been
+  switched on. Three in-regime arms — two Face A, one Face B, all `gtt_start=100G` — produced **zero reports**.
+  Qualified: **no positive control was run**, and the sanitizer works at buffer/dispatch-binding granularity.
+  `315-asan-wiring-verified.md`.
+
+### A near-deterministic Face-B configuration, offered as a tool and not as evidence
+
+`EXTRA_ENV` with the 64-name `l_out` list on `315fp-build` faulted **6 of 6 arms, all Face B, all in regime, in
+all three cells, at `req=1…11`** — against `req=6…54` for the Face-A arms this campaign has chased. The model's
+own text is **valid UTF-8 and a mid-essay fragment**, i.e. a corrupted opening, consistent with the recorded
+reading of Face B as the sampler drawing a finite but wrong distribution. It is absent in every clean and
+baseline arm, so it is induced by the configuration; the instrument is a known inducer and this run reads 64
+tensors per graph. **A tool whose value depends on an untested hypothesis that it shares its mechanism with the
+production fault.** `315-faceb-amplifier.md`.
+
+### Criterion table, updated
+
+| # | criterion | state after this session |
+|---|---|---|
+| 1 | named, falsifiable mechanism | **trigger: MET.** **Cause: still NOT LOCATED** — now with **9** candidates closed rather than 7 (stale/unwritten logits and sanitizer-visible OOB are new), and with a *named reason* why the remaining surface resists: no host-side read of a mid-graph tensor is trustworthy, and both faces reduce to "a value is wrong at a consumer" |
+| 2 | forward-only fix landed | **still NOT ACHIEVABLE within scope**; the runtime proposal stands |
+| 3 | ≥60 in-regime arms, zero faults | **NOT MET**; the Face-B amplifier may make fix-validation tractable without a 60-arm campaign per attempt — if its mechanism matches |
+| 4 | no regression | **unchanged, measured on both halves** |
+| 5 | KNOWN-ISSUES updated | **DONE** — two more rows, plus a corrected row for the id family |
+
+### The one sentence worth carrying forward
+
+**Both faces are now "a value is wrong when a consumer reads it", and no host-side read can say where it was
+first written** — which needs a read whose fidelity does not depend on the allocator's reuse: per-node at
+production, or device-side validation at the consuming op. The runtime's `USER = 0x8000` device-event range makes
+the second route plausible; it is a new instrument, not a re-run.
+
+### Harness defects recorded this session (numbered as the campaign numbers them)
+
+**#10** an orphaned `315coherent-build` neighbour, parent PID 1, silently **reused as a regime neighbour** so the
+composition baseline was not "box at rest". **#11/#12** `pkill`/`pgrep` on a script name kills wrappers, not the
+run: the `attrib → paired → llama-server` chain kept faulting for ~25 more minutes and blocked a later run's
+thermal gate at 1577 % CPU; and the same self-match trap fired **three more times** during cleanup, twice killing
+my own session — the fix is to put kill patterns in a **script file** so no command line carries them. **#13** the
+rig's default `BIN` build does not implement `GGML_HRX_TENSOR_FP` at all, so an `EXTRA_ENV`-driven sweep was
+silently inert. **#14** a `NANONLY` sweep cannot distinguish "every layer clean" from "no Face-A arm occurred",
+and the first sweep attempt was exactly that — reported as **mis-targeted, not as a negative**. Plus **five parse
+slips** in one family: a truncated sorted head, a line counter on newline-free output, a sum over streaming
+responses, a mis-indexed `awk` field test, and an unread `sentinel=` field.

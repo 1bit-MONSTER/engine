@@ -1896,3 +1896,47 @@ location is NOT an LDS-only intra-kernel fence that grep finds, and any remainin
 class would have to be either cross-dispatch (executor-level ordering, where §55/§56 already cleared
 the consumer's own read path via `hsa_signal_wait_scacquire` + the timepoint covering the last
 submission) or a different mechanism entirely.
+
+## The completion-counter protocol is CORRECT and complete - read end to end (06:05)
+
+The one remaining cross-wave handoff in GLM's FA kernel is the producer->reducer completion counter,
+and I read the whole protocol rather than sampling it. `loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom:1155-1184`:
+
+    // Publish every producer's partial stores before the leader advances one
+    // workgroup arrival. The last arrival then acquires every partial.
+    kernel.barrier<global> scope(workgroup) ordering(release)          :1158
+    scf.if %workitem_is_zero {
+      %old_counter = view.atomic.rmw<addi> ... {ordering = acq_rel, scope = device}   :1160
+      view.store %old_counter, %counter_scratch_view[%c0]              :1161
+    }
+    kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)       :1163
+    %old_counter = view.load %counter_scratch_view[%c0]                :1164
+    ...
+    scf.if %is_last_partition {
+      kernel.barrier<global> scope(workgroup) ordering(acquire)        :1170  <- acquire every partial
+      template.apply<...reduce_completed.direct>(... %output_noalias ...)     :1171  <- reads partials
+      scf.if %publish_q8 {
+        kernel.barrier<global> scope(workgroup) ordering(acq_rel)      :1173
+        kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)   :1174
+        template.apply<...pack_completed_q8>(... %output_noalias ...)  :1175  <- reads the output
+      }
+      // Do not expose the reset until every final F32 and Q8 store completes.
+      kernel.barrier<global> scope(workgroup) ordering(release)        :1178
+      scf.if %workitem_is_zero { view.store %c0_i32, %completion_counter_view[...] }  :1180
+    }
+
+Every cross-wave handoff is fenced in BOTH memory spaces, the counter advance is a device-scope
+`acq_rel` atomic, the reducer acquires after the last arrival, and the reset is explicitly protected
+against being exposed early. This is exactly the shape #140's fix produced, and it is in GLM's path.
+
+**Conclusion of the static leg: GLM's flash-attention decode-split path is clean of the #140 class.**
+That is the fourth hazard hypothesis read to a conclusion and rejected (masked_value_stage,
+probability_stage, mul_mat_id_swiglu, and now the FA completion protocol), and it agrees with the
+grep-based screening over `loom-libs/ops`.
+
+### The one instrument that could still test the class directly
+`GGML_HRX_FA_PARTIAL_ALIGN` IS still in the tree (`dispatch_registration/common/dispatch-flash-attention.cpp:23`),
+i.e. the #123 repro's stress knob survives. It has not been used for #315. If #315 were an instance of
+the #140 class, lowering that alignment should raise the fault rate at cwsr=1 - a cheap, targeted test
+that does not need the campaign's workload. Recorded as the next instrument, not yet run (the control
+owns the box lock).

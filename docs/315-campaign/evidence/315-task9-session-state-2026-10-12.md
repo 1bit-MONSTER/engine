@@ -1025,3 +1025,45 @@ faulting arms with captured PIDs).
 
 Rollback if needed: sudo cp ~/work/amd_cwsr.cfg.backup /etc/default/grub.d/amd_cwsr.cfg &&
 sudo update-grub && sudo systemctl reboot
+
+---
+
+## CONTROL RUNNING — 2026-10-13 04:54 — the H1 discriminator is live
+
+The blocker cleared at ~04:50 (inbound rsync finished). With the goal resumed, the control ran:
+
+    removed /etc/default/grub.d/amd_cwsr.cfg ; update-grub ; rebooted at 04:53:19
+    verified after boot:  cwsr_enable = 1        <- the control condition
+                          drop-in gone          <- yes
+                          grub.cfg cwsr entries = 0
+    then launched:        315-evict-trace.sh 20 315ctl1
+
+Live confirmation from the run log:
+
+    box lock held 2026-10-13T04:54:37-03:00  (/home/bcloud/.cache/lax-decode/box.lock)
+    npu lock held 2026-10-13T04:54:37-03:00  (/home/bcloud/npu.lock) - the box-wide convention
+    GPU quiet: no foreign HRX job (waited as needed)
+    watcher pid 8916 -> /home/bcloud/wt/315ctl1-evict/kfd_smi.tsv
+
+Note: the script DID take both locks, confirming the objective's flock requirement is satisfied by
+design rather than by me.
+
+### Sizing and expected duration
+20 pairs => ~20 fix-cell + ~7 control arms = ~27 arms at 4.7-5.3 min/arm = ~135 min, against the
+SMI watcher's -t 10800 (3h) TTL. Fits, with ~45 min slack - and this control is EXPECTED to fault
+~26%, and faulting arms are slower (1200 s detector timeout + retry). Monitor the watcher.
+
+### The reading key (this is the whole point)
+    rate ~26%, faults present -> H1 CONFIRMED: the cwsr=0 signal was a fresh-boot artefact;
+                                 criterion 1 collapses and the issue should be re-scoped honestly
+    rate ~0%, no faults       -> H1 DEAD: the cwsr=0 signal is real; H2 is the sole surviving
+                                 candidate, and this run supplies H2's only faulting arms with PIDs
+
+Baseline for comparison: 34 faulting / 131 in-regime arms at cwsr=1 historically (~26%).
+
+### Watch for
+ - faults appearing, and WHEN (early vs late) - the refined doc pre-registered that faults rising
+   with uptime would support H1 over H2
+ - the SMI watcher surviving the whole run (3h TTL); if it dies early the run's eviction data is
+   truncated and H2's comparison loses its faulting half again
+ - ENDOGAME §3: read the pre-fault eviction column, not the window total

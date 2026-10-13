@@ -398,9 +398,9 @@ trigger. That is what makes the criterion falsifiable rather than satisfiable by
 
 ### Families closed by discriminating experiment (2026-10-13)
 
-Five candidate families have been closed by a pre-registered or source-level test, and a sixth (the FA
-alignment class) is excluded as *not sufficient* rather than retired on a measured null — the distinction
-matters and is recorded in `315-galign-peer-result.md`:
+Four candidate families are closed by a pre-registered or source-level test; a fifth (the FA
+alignment class) was mistakenly listed as excluded and is **OPEN** — that listing rested on a parse error,
+corrected in `315-galign-CORRECTION-my-parse-was-wrong.md`:
 
 | family | disposition | evidence |
 |---|---|---|
@@ -409,7 +409,7 @@ matters and is recorded in `315-galign-peer-result.md`:
 | the **runtime's AQL submission policy** | **CLOSED**: `aql_block_processor.c` states in code that the runtime does not infer memory hazards, consuming only compiler-set packet flags, so it never derives a producer/consumer pair | `315-device-hunt-boundary.md` |
 | the **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | **REFUTED** by a pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT in BOTH arms (reorder on and off), 100% either way | `315-gord1-final.md` |
 | the **deferred host writeback** (`add_host_writeback` queued, flushed at `mark_stream_synchronized`) | **CLOSED by mechanism**: the queue is never populated, and the gate is `binding.host_data != nullptr` while the logits binding resolves to `nullptr` (allocation host-visible, binding device-addressable) | `315-deferred-writeback-gap.md` |
-| the **FA alignment/dispatch** class (`GGML_HRX_FA_PARTIAL_ALIGN`, the #140 family) | **not sufficient**: on GLM, cell `e` faulted at BOTH alignments (4096 Face B, 256 on the identity check). Stated one-sidedly on purpose - this is **not** a measured null, because n=1 per alignment has essentially no power at the ~95% base rate (distinguishing 95% from 60% needs ~20 arms per condition). What it rules out is the FA family as *sufficient*, joining the coherence and `GRAPH_SYNC` rows at that same strength. | `315-galign-peer-result.md` |
+| the **FA alignment/dispatch** class (`GGML_HRX_FA_PARTIAL_ALIGN`, the #140 family) | **OPEN, and the earlier attempt to exclude it was scored wrongly**. An alignment A/B was run and I first read its arms as all-faulting; that was a parse error (md5sum over streaming responses counted identical text as distinct), and the correct reading is that the arms were mostly **CLEAN**, so the run is **UNINFORMATIVE** — the bespoke composition did not reproduce the frozen driver's trigger, and the alignment question is untested rather than answered. What remains is the power point: n=2 per alignment cannot bound a rate difference at this base rate. | `315-galign-CORRECTION-my-parse-was-wrong.md` |
 
 ### Still open
 

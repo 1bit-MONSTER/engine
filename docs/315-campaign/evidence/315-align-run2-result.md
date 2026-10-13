@@ -106,3 +106,34 @@ Everything else is take 2's design unchanged: `align` 4096 vs 256, cells `q` and
 contrast repeated — six arms, ~13 min.
 
 Result pending; recorded here so the launch conditions are durable rather than reconstructed later.
+
+---
+
+# Take 3 stood down: the peer's GLM-based variant supersedes it
+
+Before take 3 could acquire the box lock it was blocked by `/tmp/galign.sh` (ports 20362-20364), which is
+**the other agent's own alignment experiment on GLM**. Its header names its three corrections, and they are
+corrections to *my* run:
+
+> "Fixes the peer's three defects: **GLM not Qwen**; the rig's classification not a bespoke parser; and it
+> tests what the knob **CAN** do (bypass vs present) rather than a stress it cannot produce."
+
+That is a better instrument than mine on every axis that matters:
+
+| | my take 2/3 | the peer's `galign` |
+|---|---|---|
+| model | Qwen3-0.6B | **GLM-4.7-Flash** — the model that actually faults |
+| classification | my own `distinct_content` parser (which was broken on take 2 and reported 0 for every arm) | **the frozen rig's own classifier** |
+| what the knob is asked to do | produce the fault under stress | **test what it can actually do — bypass vs present** |
+
+My take 3 was stood down rather than queued behind it, because running the same question on a weaker model
+would burn the box to re-derive a weaker answer. Verified afterwards that the runner was killed and the
+peer's process left untouched.
+
+## The lesson this repeats
+
+This is the third time in this stretch that a peer's method outperformed mine on the same question (the
+writeback probe shape, and now the alignment model + classifier). The pattern is consistent: **use the
+faulting workload and the established classifier, not a convenient substitute.** My Qwen runs were cheaper
+and produced two uninformative results and one broken parse; the peer's GLM run costs more and asks the
+question the issue actually poses.

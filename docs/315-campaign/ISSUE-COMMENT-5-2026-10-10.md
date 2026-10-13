@@ -1,3 +1,19 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
 ## The ordering family is closed by four null toggles in regime; no mechanism is named yet, and #315 stays OPEN
 
 This is the consolidation of today's in-regime work on `strixhalo` (pin `e44c9d01a4d5`). It reports a **negative

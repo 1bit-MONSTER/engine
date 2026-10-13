@@ -1,3 +1,19 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
 ## Correction: I withdraw my previous comment's per-node attribution — and the reason points at a better candidate
 
 My previous comment reported that the corruption "enters at the routing gather" because `ffn_moe_weights-4` was NaN while its source `ffn_moe_probs-4` was not. **That inference does not hold, and I am withdrawing it.** The measurement it rests on is not ordered, and I can now show why.

@@ -3622,3 +3622,50 @@ A box-locked `315-disc.sh 4 315gord1a` is running against the SAME patched build
 mine to touch - it holds the box lock - and I am leaving it alone. Its existence is recorded because it
 affects the box state and because its result, if it lands, is another independent sample of the control
 condition.
+
+---
+
+## CORRECTION TO MY OWN OUT-OF-SCOPE CLAIM (11:40) — the A/B narrows the cause INTO scope
+
+Last turn I reported that the cause "points at the compiler" and is outside the objective's boundaries.
+**That was drawn from the read-path elimination alone and was too quick.** Correcting it here.
+
+### What the A/B actually tells us
+The fix routed the logits read through a coherent HAL download and the fault rate did not move. So:
+
+    the logits buffer is NOT read stale. Either it is written correctly and the defect is elsewhere,
+    or the corrupted buffer is not the logits at all.
+
+That is a statement about the READ of the final buffer. It says nothing about what happens upstream of
+it - and the issue's own evidence already localises the corruption upstream:
+
+ - KNOWN-ISSUES records the first NaN-bearing node at the **MoE aggregation**, exactly one token's row
+   (2048 floats), in 15 of 16 faulting arms;
+ - mechanism section 47 narrowed it to "exactly one token's hidden vector is NaN, and it is already NaN
+   by the time the MoE aggregation adds run";
+ - section 50 measured NaN in `ffn_moe_weights` where its source `ffn_moe_probs` was finite;
+ - section 51 found a **rank-sort that stops being a bijection on NaN**, leaving one slot unwritten and
+   therefore holding a stale INDEX - and the routed path CONSUMES those indices.
+
+If the corruption enters at the routing/argsort or the MoE aggregation, then the logits buffer is
+written correctly *from corrupted inputs* - which is exactly what the A/B observed, and which also
+explains why the coherence attribute and the read-side transfer both did nothing.
+
+### So the live candidates are IN SCOPE
+    (a) the DEVICE writing into a buffer whose backing the eviction moved  - live, untested
+    (b) an INTERMEDIATE buffer corrupted, propagating to the logits       - live, and where the
+                                                                            recorded evidence points
+    (c) a kernel reading a buffer eviction invalidated (#140 class)       - checked and closed for the
+                                                                            decode-split FA path
+    (d) the ROUTING/argsort path leaving a stale index on NaN             - live, most specific
+
+All four live in `ggml/src/ggml-hrx` (dispatch, kernels) or the ggml graph - the fork side, which the
+objective explicitly puts in scope ("the 1bit-MONSTER/llama.cpp ggml-hrx side if the mechanism lands
+there").
+
+### What this changes about the plan
+The next step is NOT a codegen expedition. It is to test (d), the most specific live candidate, because
+`small_rows_f32.loom` (the argsort that produces the route ids) was already read in section 51 and has a
+concrete reported defect: ordered comparisons make ranks non-unique when a row contains NaN, so a slot
+is left holding its previous content. That is a *stale read* of exactly the kind the eviction trigger
+would produce - and it is in a kernel I can read and test locally.

@@ -115,3 +115,33 @@ all** (5 == 5, so `use_level` is false regardless). So:
 
 That sharpens the reading: if arm B is clean in cell `e`, the effect is attributable to the routed-FFN
 graph specifically, not to a general change in submission behaviour.
+
+---
+
+# Guard verified correct (not a phantom bug) — the `pgrep` self-match scare
+
+While arm B waited, the launcher's concurrency guard was checked, because a false abort there would waste
+the entire wait:
+
+    n=$(pgrep -fc "315-disc.sh|315coherent-build/bin/llama-server" 2>/dev/null); n=${n:-0}
+    if [ "$n" -gt 0 ]; then echo "gord1b: ABORT ..."; exit 4; fi
+
+Run **inline over ssh**, the count reads 3 while only 2 peer processes exist — because the pattern text
+appears in the shell command line that `pgrep` is inside, so `pgrep` matches itself. That looked like it
+would make a genuinely free box read 1 (not 0) and cause a false abort.
+
+**It does not.** Run from a script file — where the pattern is not in any process's argv — the same
+pattern gives exactly the real count:
+
+    $ bash /tmp/guardtest.sh          # contains the pgrep line, nothing else
+    from script file: n=2
+    2995562 bash 315-disc.sh 2 315ids2
+    3052193 bash 315-disc.sh 2 315ids2
+
+So the launcher, which is a file (`~/wt/315gord1b-launch.sh`), sees 0 when the box is free and will
+proceed. Recorded because the scare was real enough to act on and the resolution is the kind of thing
+that otherwise gets re-investigated: **`pgrep -f` counts its own caller when the pattern is in the
+caller's argv; from a file it does not.**
+
+Related, and also checked: the chainer's cmdline is `bash /home/bcloud/wt/gord1b-chain.sh`, which does not
+contain `315-disc.sh`, so the chainer cannot trip its own child's guard.

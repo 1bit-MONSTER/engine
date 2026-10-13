@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5450,3 +5434,38 @@ signal); the galign1 one produced a false *fault*. For an issue whose acceptance
 the false-fault direction is the more dangerous, because it would block a fix that works - and the
 false-zero direction is the one that would let a broken fix pass. Both were present this session and both
 were caught by artifact-level, not counter-level, reading.
+
+---
+
+## MY REPLICATION HARNESS HAS THE SAME BUG — the console column is unusable (16:20)
+
+`gb4096-e` printed `FAULT-A resp=66 http500=0 content_only=0 nan_guard=0 crash=0` while its artifacts say
+**CLEAN**: 66 responses, zero fault signatures, clean shutdown. So the same false-positive I fixed in
+galign1's *request loop* is still present in galign2's *scoring line*, and I have now found the exact
+mechanism.
+
+### The bug, precisely
+`galign_repl.sh:49-50`:
+
+    local v="CLEAN"; [ "$h" != 0 ] && v="FAULT-B"; [ "$ng" != 0 ] && v="FAULT-A"; [ "$cr" != 0 ] && v="FAULT-A"
+
+Each variable is assigned from `grep -c ... || echo 0`. **`grep -c` prints `0` AND exits non-zero when
+there are no matches**, so the `|| echo 0` appends a SECOND `0` and the value becomes `"0\n0"`. Then
+`[ "0\n0" != 0 ]` is TRUE, so every arm is stamped `FAULT-A` regardless of its data.
+
+This is the identical defect this issue already records as a trap (`KNOWN-ISSUES` §"Traps": *"grep -c prints
+0 AND exits 1 when there are no matches, so `|| echo 0` appends a SECOND 0 ... which made `[ "$FA" -eq 0 ]`
+fail"*), and this issue's own harness had fixed it elsewhere. I reintroduced it in a new script, in the same
+session in which I catalogued five other instruments for exactly this class of error. Recorded plainly
+rather than quietly corrected: it is the seventh such instrument and the second one that is mine.
+
+### Consequence: this run's console column is void
+Every arm in `315galign2` will be stamped `FAULT-A`. The run's **artifacts are unaffected** (responses,
+server logs), so the result is still recoverable by reading them directly - which is how I scored galign1
+and how I will score this.
+
+### And this RE-READS galign1's verdicts too
+galign1's `galign.sh` had the same `|| echo 0` pattern but a different verdict expression, and I already
+corrected its `ga256-e` verdict by artifacts. Its `ga4096-e` FAULT-B stands on artifacts (4 HTTP 500s and 8
+Content-only rejections in the files), not on the console. So galign1's conclusion is unaffected - but it
+was correct by artifact-reading, not by the tool.

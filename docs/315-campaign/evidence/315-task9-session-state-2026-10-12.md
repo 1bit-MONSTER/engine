@@ -3804,3 +3804,34 @@ reproduced intervention effect, and it is the strongest empirical footing the is
 Note this also **independently re-confirms the A/B's conclusion**: `gord1a` runs the same patched binary
 with the knob off and faults 3 of 6, i.e. the knob's absence changes nothing, consistent with arm B
 (knob on) also faulting.
+
+---
+
+# FOUR INDEPENDENT RUNS, POOLED: 15/18 (83%) vs 1/34 (2.9%), p = 2.7e-9
+
+`315gord1a` finished with the cleanest result of the four:
+
+    cell q: OK=4  FAULT=0  OOR=0 INVALID=0
+    cell e: OK=0  FAULT=4  OOR=0 INVALID=0     <- 4 of 4
+    cell c: OK=4  FAULT=0  OOR=0 INVALID=0
+
+Pooled across every run of the frozen three-cell rig, including two I did not launch:
+
+    run        cell e (evictonly)        cells q+c (controls)
+    disc1       2 fault / 4 arms          0 fault / 10
+    disc2       5 fault / 6 arms          0 fault / 12
+    ab1a        4 fault / 4 arms          1 fault /  4   (the one = the GTT-drifting quiet arm)
+    gord1a      4 fault / 4 arms          0 fault /  8
+    ------------------------------------------------------------------
+    TOTAL      15 fault / 18 = 83.3%      1 fault / 34 = 2.9%
+    Fisher exact two-sided p = 2.7e-9
+    rule-of-three upper bound on the control rate (34 arms, 1 fault) = 8.8%
+
+**The eviction intervention reproduces in four independent runs, at 83% of arms, against 2.9% in 34
+control arms, p = 2.7e-9.** Both faces appear repeatedly in the eviction cell. The single control fault
+is the arm whose GTT drifted 5 GiB, which is consistent with the operative variable being memory pressure
+rather than the forcer.
+
+This is the empirical foundation of the whole issue now, and it is far stronger than the 26%-vs-CWSR
+comparison it replaces: it is an INTERVENTION, it is reproducible, it isolates the variable against two
+different control side-loads, and it was reproduced twice by a run I did not author.

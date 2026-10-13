@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5485,3 +5469,55 @@ galign1's `galign.sh` had the same `|| echo 0` pattern but a different verdict e
 corrected its `ga256-e` verdict by artifacts. Its `ga4096-e` FAULT-B stands on artifacts (4 HTTP 500s and 8
 Content-only rejections in the files), not on the console. So galign1's conclusion is unaffected - but it
 was correct by artifact-reading, not by the tool.
+
+---
+
+# ####################################################################
+# CORRECTION: THE ALIGNMENT FINDING IS REFUTED BY ITS OWN REPLICATION
+# ####################################################################
+# 2026-10-13 16:30
+
+I recorded at 16:00 that "the decode-split FA kernel IS required" on the strength of galign1
+(`ga4096-e` FAULT-B, `ga256-e` CLEAN). **The pre-registered replication refutes it**, and the refutation is
+in the opposite direction from the claim.
+
+### The replication's artifact-only verdicts (`315galign2`)
+    arm         align   responses   http500   content_only   nan   crash   VERDICT
+    gb4096-e     4096       66          0           0         0      0     CLEAN
+    gb4096-e2    4096       66          0           0         0      0     CLEAN
+    gb256-e       256       66          0           0         0      0     CLEAN
+    gb256-e2      256       66          1           2         0      0     FAULT-B     <- faulted
+    gb4096-q     4096       (control, in progress)
+
+So **both 4096 eviction arms were clean and one of the two 256 arms faulted** - the opposite of galign1, in
+which 4096 faulted and 256 was clean.
+
+### What that means
+Galign1 was **n=1 per arm**. At the frozen rig's ~85% base rate, a single clean arm occurs ~15% of the time -
+so galign1's pairing (one fault at 4096, one clean at 256) was exactly the coincidence it looked like, and I
+over-read it. The replication shows the alignment knob does **not** determine whether the eviction cell
+faults: 4096 was clean twice and 256 faulted once, which is what "the knob is irrelevant to the fault" looks
+like at this sample size.
+
+**The correct statement is the pre-registration's third branch:** the result is **uninformative about
+alignment**, because cell `e` did not fault reliably enough in either configuration to compare. And the
+substantive conclusion is the one I should have drawn from n=1: **neither alignment is reliably clean or
+reliably faulting in this design**, so this experiment cannot test the layout-sensitivity question - which is
+what I had already written in the pre-registration's own Bounds (*"one model, one prompt shape, 2 rounds:
+enough to see 85% vs 0% but not to resolve small differences"*).
+
+### Why the arms were mostly clean, and it is the real lesson
+The frozen rig's cell `e` faults ~85% **when composed the way the frozen driver composes it**. My
+`galign_repl.sh` composes its own neighbours and drives its own request loop, and it produced **4 clean
+eviction arms out of 4 so far** - so it is not reproducing the trigger at all. The one fault (`gb256-e2`) is
+the exception, not the rule. That makes the whole run uninformative, in exactly the way the peer's
+`315align2` take 1 was uninformative and for the same reason: **a custom composition does not reproduce the
+eviction trigger, and a rig that does not fault cannot test a mechanism.**
+
+### The honest bottom line for the alignment lead
+    NOT "the decode-split FA kernel is required"   - that was an n=1 artefact, now refuted
+    NOT "the kernel is irrelevant"                 - the rig failed to induce, so this cannot say that either
+    UNINFORMATIVE  - a custom-composition rig that produced 4 clean eviction arms cannot compare anything
+
+The alignment question remains **open and untested**, and the way to test it is the frozen driver (which does
+fault at ~85%), not a bespoke one.

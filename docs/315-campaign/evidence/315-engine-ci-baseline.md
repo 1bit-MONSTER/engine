@@ -150,3 +150,34 @@ polls with no other driver) before starting, and still takes the box lock. Launc
 
 Nothing about the criterion-4 content changed — same baseline, same commands, same `MUL_MAT_ID` extraction —
 only the gate on when it is safe to begin.
+
+---
+
+# Update: the control's first attempt matched no tests — my binary names were wrong
+
+The first corrected run (17:05) produced a header and then "done" with **no test output at all**. Diagnosed
+rather than rerun blindly: my script looked for
+
+    test-hrx-backend-buffer  test-hrx-host-buffer  test-hrx-host-transfer
+    test-hrx-host-staging    test-hrx-host-weight-cache
+
+and **none of those binaries exist**. The real contents of `~/wt/v315-build/bin` are:
+
+    test-hrx-attention-sink   test-hrx-buffer           test-hrx-decode-stride    test-hrx-fa-masked-v
+    test-hrx-hadamard         test-hrx-moe-split        test-hrx-mul-mat-id-k32   test-hrx-mxfp4
+
+So the baseline's **"5 HRX buffer test cases"** (`backend_buffer`, `host_buffer`, `host_transfer`,
+`host_staging`, `host_weight_cache`) are **cases inside `test-hrx-buffer`**, not separate binaries — I had
+misread the baseline's output as a list of executables.
+
+Note also that the objective's named control, the **MUL_MAT_ID op-test**, is present as
+`test-hrx-mul-mat-id-k32`, and `test-hrx-mxfp4` carries the `MUL_MAT_ID mxfp4 … nmse=` lines the baseline
+table records.
+
+Corrected as `315crit4c.sh`, which runs the real binaries and greps for the `MUL_MAT_ID`/`mxfp4` lines to
+diff against the baseline table.
+
+This is the fourth harness/parse defect of the session (a line-based counter on newline-free NDJSON; a
+`pgrep` pattern matching its own caller; `md5sum` over streaming responses; now guessed binary names). Each
+was caught before its output was cited, but the pattern is consistent enough to state plainly: **read the
+baseline and list the directory, rather than reconstructing either from memory.**

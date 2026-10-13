@@ -33,15 +33,17 @@ pin once it lands. Treat a single failure of this case as a flake, not a regress
 
 ## engine#315 — intermittent all-NaN logits and format-500 on GLM-4.7-Flash under GTT pressure
 
-**Status: OPEN, accepted as a documented limitation.** The issue stays open until this criterion is met.
+**Status: OPEN — mechanism NAMED and replicated; no forward fix landed yet.** The issue stays open until a fix lands and is verified (criteria 2-5). Its first criterion — a named, falsifiable mechanism for both faces with a discriminating experiment — was met on 2026-10-13 by a pre-registered three-cell intervention: **forced eviction of in-flight KFD work causes the fault on both faces at 70 % vs 0/22 control arms, p = 3.6e-5**. See "What remains unknown" for the experiment, and note what is still missing: the specific handoff that reads stale data.
 
 Owner acceptance, recorded 2026-10-07: the owner authorised landing this entry in writing — *"you have gh
 authorization and do what needs to be done"* — on the basis that no forward fix is available. The limitation text
 below was drafted by the assistant; the owner has not edited it and may amend or withdraw it at any time.
 
 **Affected:** `GLM-4.7-Flash-Q4_K_M` on `HRX0`, `llama-server`, at high GTT occupancy (measured from
-`gtt_start` ~83 GB up to ~110 GB). Not deterministic and not reproducible on demand, which is why it is
-recorded as a limitation rather than fixed.
+`gtt_start` ~83 GB up to ~110 GB). Intermittent under ambient pressure — the regime-controlled rate is
+**~5-7 % per in-regime arm** (see the rate table below) — but **reproducible on demand** when a separate
+process forces KFD eviction/restore: **7 faults in 10 in-regime arms (70 %)** while matched control cells
+stay at 0/22.
 
 **Rate, corrected 2026-10-13.** The earlier "roughly 10-20 % per run" was a pooled figure and it mixed a
 deliberate high-rate reproduction rig with ordinary runs. Decomposed from the arm ledger's own per-tag table,
@@ -171,6 +173,46 @@ Three more traps found on 2026-10-13, each of which cost time or nearly produced
   environment change into the repository, not a reference to it.
 
 ### What remains unknown
+
+**The trigger is NAMED and REPLICATED (2026-10-13): forced eviction of in-flight KFD work causes the
+fault, on BOTH faces.** A pre-registered three-cell experiment (`docs/315-campaign/evidence/`,
+upstream pre-registration commit `36f360a`, branches fixed **before** the run) isolates the variable:
+
+| cell | side load | result |
+|---|---|---|
+| `e` | `~/wt/evictonly 500` — launches **no kernels**, only `mprotect` churn over `hipHostRegister`'d memory, forcing KFD evict/restore | **7 FAULT / 10 arms = 70 %** |
+| `q` | quiet (no side load) | 0 FAULT / 10 arms |
+| `c` | CPU pressure only, pinned to CCD1, no GPU | 0 FAULT / 12 arms |
+
+Fisher exact two-sided **p = 3.6e-5**; rule-of-three upper bound on the control rate (22 arms, 0 faults)
+= 13.6 %. All seven faults in-regime at `gtt_start = 98 GiB`, zero OOR in either run. The intervention
+is verified rather than assumed: `evictonly` produces **4,134 `Q_EVICT` / 4,168 `Q_RESTORE` in 25 s**
+against **0 / 0 in a 25 s quiet window** (the issue's own `kfd_smi_watch`). Because it launches no
+kernels, the effect cannot be compute, thermal or scheduling — and the CPU-pressure cell independently
+rules those out across 12 arms.
+
+**Both faces appear under the same intervention**, in the same cells, same day, same build:
+
+- **Face A** ×4 — `nan=1`, `count=154880 of 154880, contiguous=yes`, the sampler guard aborts the server.
+- **Face B** ×3 — `nan=0`, `http=1 s500=1 unparsed=2`, the parser rejects the output and returns HTTP 500
+  while the server survives.
+
+So a single intervention that isolates eviction from every other factor tested produces **both** faces,
+which is what "one mechanism, two observables" predicts.
+
+**What is still NOT named: which handoff reads the stale data.** The static leg showed that the
+engine#123/#140-class handoff in GLM's path is correctly fenced in the current pin (`barrier<global>`
+then `barrier<workgroup>` between the reduce's stores and the q8 pack, plus the completion-counter
+handshake), so the corrupted handoff is elsewhere and is unidentified. The **trigger** is named; the
+**code site** is not.
+
+**Correction to an earlier reading in this issue.** A per-arm *correlation* on the cwsr=1 control found
+that faulting arms did **not** show more evictions than clean arms (203 against a clean mean of 254.5).
+That is not in conflict: a rate-correlation and an intervention are different instruments. The
+intervention shows eviction **causes** the fault; the correlation shows that under ambient pressure the
+per-arm eviction *count* does not predict which arm faults. This also explains why an ambient-rate
+control could not surface a mechanism at all: at the measured ~5-7 % the event rate is too low for any
+correlation to see, which is why the intervention had to force the rate up first.
 
 The fault reproduces on the shipped pin — `pair 2 arm c: FAULT-NaN nan=1 req=34 gtt_start=102G`, build
 `10604 = 3971f49bf`, `parse=0` ruling out the format-500 mode — so the shared-memory tile-visibility change does

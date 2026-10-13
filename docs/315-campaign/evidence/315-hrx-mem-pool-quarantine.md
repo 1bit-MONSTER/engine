@@ -395,3 +395,65 @@ The lead began as a plausible "retire → reuse window", survived one false nega
 wrong symbol), and ends at a sanitizer feature. Recorded in full, including the false negative, because a
 symbol-search conclusion is only as good as the symbol — which is the same lesson as the session's other
 parse defects, arriving from a different direction.
+
+---
+
+# FINAL CLOSURE: the pool the engine uses does NO reuse at all — no retire→reuse window exists
+
+Read the implementation of the pool GLM actually goes through
+(`hrx_iree_exact_pool_create`, `libhrx/src/libhrx/pool.c`, reached from `buffer.c:109`). All three ops that
+could implement a reuse window are inert:
+
+## trim: a no-op
+
+    static iree_status_t hrx_iree_exact_pool_trim(iree_hal_pool_t* base_pool) {
+      (void)base_pool;
+      return iree_ok_status();
+    }
+
+## acquire: always a FRESH allocation
+
+    status = iree_hal_allocator_allocate_buffer(
+        pool->allocator, pool->params, requests[acquired_count].allocation_size,
+        &buffers[acquired_count]);
+    ...
+    out_infos[i].result = IREE_HAL_POOL_ACQUIRE_OK_FRESH;
+
+Every reservation is marked `OK_FRESH` — nothing is handed out of a cache.
+
+## release: frees immediately, retains nothing
+
+    iree_hal_buffer_release(buffer);
+    iree_async_notification_signal(pool->notification, INT32_MAX);
+
+No quarantine, no retained slab, no reuse list — the buffer is released and a notification is signalled.
+
+## Why this closes the whole lead
+
+A "retire → reuse window" requires the pool to **hold** freed memory for later reissue. This pool:
+
+    trim      -> does nothing
+    acquire   -> always fresh
+    release   -> frees immediately
+
+so **there is no retention and therefore no reuse window** on GLM's path. The residue of the original lead is
+gone, and it is gone for a structural reason rather than by absence of evidence.
+
+## Where the lead went, in full
+
+This file's history is worth stating because it is mostly a record of my own errors:
+
+1. **Opened**: the decompiled `hrx_mem_pool_trim` showed `quarantine_eviction_count` and
+   `bytes_quarantined` — plausible "retire → reuse" vocabulary. **Premise, not a finding.**
+2. **False negative**: I concluded the pool was unreachable because the engine never calls
+   `hrx_mem_pool_*`. Wrong — the engine uses a **slab pool** created via `hrx_mem_pool_backing_create_pool`;
+   I had grepped the wrong symbol.
+3. **Corrected**: the allocation path does create a pool, so the lead re-opened.
+4. **Quarantine identified**: `quarantine` is the **AMDGPU HAL ASAN** feature — redzones, shadow publication,
+   release poisoning, and a FIFO that deliberately retains freed mappings to catch use-after-free. ASAN is off
+   in production.
+5. **Closed**: the pool actually used has a no-op trim, fresh-only allocations, and immediate release. No
+   reuse window exists.
+
+Net: two of my own reasoning errors on the way (a symbol-search false negative, and an initial over-reading of
+sanitizer counters as production bookkeeping), and a clean structural closure at the end.

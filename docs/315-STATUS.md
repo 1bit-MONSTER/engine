@@ -1523,3 +1523,54 @@ Now six: a line counter on newline-free NDJSON; a `pgrep` matching its own calle
 responses; guessed binary names; a `sudo -n tee` writing nothing; and the **symbol-search false negative**
 above. The last is the same lesson as the others in a new guise — **check the symbol you grepped, not just
 that the grep was empty.**
+
+---
+
+# UPDATE 21 (2026-10-13 ~19:00) — the last open family is CLOSED; seven candidates excluded
+
+## The FA alignment test, finally run on a rig that reproduces the fault
+
+The FA family was the one open lead, left open because the earlier attempt used a **bespoke composition that
+stayed mostly clean** (and because I had briefly misread its arms via a parse error). Fixed by using the
+**frozen driver**, which reproduces the trigger at ~95%, and varying only `EXTRA_ENV`.
+
+Pre-registered at `ccf5b14`, run 17:28–18:50, 3 rounds per arm:
+
+                 cell q            cell e            cell c
+    arm A     2 OK / 1 FAULT    0 OK / 3 FAULT    3 OK / 0 FAULT      align 4096 (default)
+    arm B     2 OK / 1 FAULT    0 OK / 3 FAULT    3 OK / 0 FAULT      align 256 (#140 oracle)
+
+**Identical.** Cell `e` faulted **3 of 3 in both** at `gtt_start=98G`, forcer live, zero OOR/INVALID, with
+both session headers recording the value actually applied.
+
+**Reading (one-sided, per the pre-registration's power note)**: the FA layout/dispatch class is **not
+required** for the fault — the layout the #140 oracle used to *expose* the divergence faults at the same 3/3
+as the default. It is **not a measured null**: 3 arms per alignment cannot bound a rate difference
+(distinguishing 95% from 60% needs ~20), so it lands at the same strength as the coherence and `GRAPH_SYNC`
+rows.
+
+## The closed set, now seven
+
+    logits read path                REFUTED       its own pre-registered A/B
+    host side                       CLOSED        none on the decode path
+    runtime AQL submission policy   CLOSED        the runtime does not infer hazards
+    graph reorder                   REFUTED       cell e 4/4 in BOTH arms
+    deferred host writeback         CLOSED        binding host_data == nullptr
+    memory-pool quarantine/reuse    CLOSED        no-op trim, fresh-only acquire, immediate release
+    FA alignment/dispatch (#140)    NOT REQUIRED  3/3 both alignments on the frozen rig
+
+KNOWN-ISSUES updated to match (`58310d1`), replacing the FA row's OPEN status.
+
+## Criterion 4: op-test half done, dense half running
+
+- **op-test half MEASURED**: 8/8 HRX tests pass; `MUL_MAT_ID` nmse matching baseline (1.34–1.61e-05 vs
+  1.23–1.58e-05). See `315-crit4-control-result.md`.
+- **dense half RUNNING**: Qwen3-8B (dense, not MoE) on HRX0 under the same detector shape, as a **negative
+  control** — a clean result shows the apparatus does not fault everything in sight, which is what makes the
+  GLM arms' eviction-cell rate attributable to the model/shape.
+
+## Where the cause stands
+
+Still **not located**, but the exclusion surface is now much firmer than a week of prose: seven candidates
+have been excluded by pre-registered experiment on the frozen rig or by mechanism read at source, and the
+trigger is quantified (ambient ~5% vs forced eviction ~95%). Criterion 2 remains not achievable within scope.

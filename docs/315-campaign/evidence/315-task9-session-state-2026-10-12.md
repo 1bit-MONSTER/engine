@@ -5521,3 +5521,41 @@ eviction trigger, and a rig that does not fault cannot test a mechanism.**
 
 The alignment question remains **open and untested**, and the way to test it is the frozen driver (which does
 fault at ~85%), not a bespoke one.
+
+---
+
+## WHY MY RIG DID NOT INDUCE — two concrete differences from the frozen driver (16:40)
+
+My "the composition doesn't reproduce the trigger" diagnosis was **wrong**: the arms were in-regime
+(`gtt_start=98G`) with the frozen composition (3 neighbours at `-c 2048`). Comparing the two drivers line by
+line, two other differences explain the 4/4 clean eviction arms:
+
+### 1. Context size: the frozen rig's arms use `-c 8192`, mine used `-c 4096`
+    frozen rig, line 106 :  "$BIN/llama-server" ... -c 8192 -np 1 --no-webui
+    my galign_repl, :31  :  "$BIN/llama-server" ... -c 4096 -np 1
+    my galign1, same     :  -c 4096
+The KV allocation is twice as large in the frozen rig, so its arms sit under more memory pressure for the
+same GTT reading - and the fault is pressure-driven. This alone could account for the difference.
+
+### 2. Request pattern: the frozen driver alternates identical requests with DISTRACTORS
+    frozen : 8 identical greedy requests (n_predict=96, cache_prompt=false), each followed by a
+             distractor of 3-900 words, then 50 mixed-length requests (n_predict 4-64)
+    mine   : the SAME prompt 66 times, n_predict=96, cache_prompt=false
+The frozen pattern deliberately varies the workload - long distractor prompts force large prefill graphs
+between the short ones - while my loop hammered one identical request. A prefill-shaped graph is exactly
+where the issue's own record locates the corruption (`ffn_moe_*` at block 41 during a prefill, §40/47), so my
+loop may simply never have built the graph shape that faults.
+
+### Also different, and possibly relevant
+ - the frozen rig runs each arm under `systemd-run --scope -p MemoryMax=60G`; mine did not.
+ - the frozen rig gates on thermals between arms (`TPAUSE`/`TABORT`, gate-wait lines); mine did not, though
+   the boxes were cool.
+
+### What this means for the alignment question
+The alignment hypothesis is **still untested**, and now I know why my two attempts could not test it: both
+used a non-frozen driver that does not reproduce the trigger. The correct experiment is to run
+`GGML_HRX_FA_PARTIAL_ALIGN` **through the frozen `315-disc.sh`** (which faults at ~85% on GLM) via
+`EXTRA_ENV`, exactly as `315fresh1` was launched - not through a bespoke script, however carefully written.
+
+That is a cheap, in-scope test and it is the last thing this session should attempt: `315-disc.sh 2` with
+`EXTRA_ENV` carrying the alignment value, on GLM, at the frozen composition.

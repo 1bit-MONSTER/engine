@@ -65,3 +65,48 @@ CPU workers evidently perturbed allocation enough to walk GTT up across the band
 This is one arm. It does not show cell `c` faults at the eviction cell's rate — cell `c` is 1 fault in
 2 rounds here against cell `e`'s 2 in 2, and arm A had cell `c` clean 4/4. It is recorded because the
 direction is the mechanism's and because the drift is measurable, not because it establishes a rate.
+
+---
+
+# The cell-c drift, measured sample by sample
+
+The claim that cell `c` faulted because it walked into the eviction band is measurable, so here is the
+whole trace rather than a summary. From `315ab1b2-r2c-GLM-4.7-Flash-Q4_K_M/tctl.log`
+(sample = 5 s; GTT in GiB, load1 from `/proc/loadavg`):
+
+    sample   GTT    load1
+      1       79     2.97     <- arm start, pre-load
+      2       96     2.97
+      3       97     3.86     <- in-regime gate value
+      4       98     5.87
+      5-7     98     7.56 .. 10.24
+      8-11    99    11.42 .. 14.64
+     12      100    15.63
+     20      103    19.51
+     21      104    19.39
+     22      106    19.75     <- peak
+     23-26   99..102  19.85 .. 20.27   <- and it stays in the band, oscillating
+     30      99    21.67
+
+The CPU-pressure cell raises system load from ~3 to ~21 and, as it does, GTT climbs from the 97 G gate
+value to a 106 G peak and then **settles into a 99-104 G oscillation** for the rest of the arm.
+
+That is the mechanism's operative variable, made directly observable: the cells differ in *how they
+drive memory pressure into the band*, not in whether the fault is possible. `evictonly` drives it fast
+and deliberately; three GLM neighbours plus 12 duty-cycled CPU workers drive it slowly and incidentally;
+a quiet arm can drift there on its own (arm A round 2). All three reach the same band, and the band is
+where KFD evicts in-flight work.
+
+## Consequence for the pre-registration's regime gate
+
+The gate checks `gtt_start in [95,110]`. The trace shows the arm spends most of its life **above** its
+start value, in a band the gate does not constrain. A cell that starts at 97 G and ends oscillating at
+102 G is not "in-regime" in any sense that keeps its cell identity — and this is why a nominally
+CPU-only control could fault.
+
+This does not invalidate the A/B (the comparison is still cell `e` vs cell `e`, and arm B's cell-`e`
+faults are unambiguous at `gtt_start 98G`), but it does mean:
+
+- **cell membership has to be argued from the trace, not the gate label**; and
+- any future campaign should record `gtt_now` and the drift, and treat "drifted into the band" as the
+  covariate that matters — which is exactly what the console already logs and what these files cite.

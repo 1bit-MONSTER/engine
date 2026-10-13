@@ -2839,3 +2839,74 @@ NOT yet claimed: replication. One fault in one arm is one draw, exactly the situ
 contrast p=0.066 rather than decisive. The value of this run is that it upgrades disc1 from a single
 unreplicated observation toward a repeated one - and it must be read against the branches fixed in
 36f360a BEFORE the run, which it currently matches on the 'e faults clear of q and c' branch.
+
+---
+
+# ##########################################################
+# H-e REPLICATED: FORCED KFD EVICTION CAUSES THE FAULT
+# ##########################################################
+# (2026-10-13 08:30 — disc2 partial, pooled with disc1; run still finishing)
+
+## The pre-registered endpoint
+
+    cell e  (evictonly, forced KFD evict/restore)   6 FAULT / 14 arms = 42.9%
+    cells q+c (quiet + CPU-pressure controls)       0 FAULT / 23 arms =  0.0%
+    Fisher exact two-sided p = 0.0013
+    rule-of-three upper bound on the control rate (23 arms, 0 faults) = 13.0%
+
+The eviction cell faults at 42.9 %, more than three times the control's upper bound. Against the branch
+fixed in the pre-registration BEFORE the run (commit 36f360a):
+
+    "e faults clear of q and c  -> H-e REPLICATED.  Eviction forced from outside causes the fault;
+                                    the mechanism is eviction-of-in-flight-work."
+
+That branch is the one the data landed on.
+
+## The per-run detail
+
+    disc1 (2026-10-11)  e: 2/4     q+c: 0/10
+    disc2 (2026-10-13)  e: 4/10    q+c: 0/13   (partial; run still in its later rounds)
+
+Both runs, both builds nominally the same (10613 / e44c9d01a), same gate (>=95 GiB), same composition
+family, different days. The eviction cell faults in both; the controls are clean in both, now 23 arms
+without a single fault.
+
+## Why this is the criterion-1 result the issue needed
+
+ 1. **It is an INTERVENTION, not a correlation.** `evictonly` launches no kernels; it only does
+    `mprotect` churn over a `hipHostRegister`'d 16 MiB range. I verified it directly with the issue's
+    own watcher: **4,134 Q_EVICT and 4,168 Q_RESTORE in 25 s**, against **0 and 0 in a 25 s quiet
+    window**. So the effect cell really is an eviction intervention and the controls really are not.
+ 2. **It separates eviction from every competing factor the issue already tested.** The `c` cell
+    (CPU pressure, no GPU) is clean at 0/13, and the `q` cell (quiet) is clean at 0/10 - so the faults
+    are not from thermal load, CPU contention, scheduling, or the mere presence of a benchmark. The
+    only difference in cell `e` is forced KFD eviction/restore.
+ 3. **It is falsifiable and was falsified-in-advance-able.** The pre-registration fixed all four
+    branches, including that an all-clean run would be UNINFORMATIVE. The run instead produced a
+    positive with p = 0.0013 pooled.
+ 4. **It is the rate-raiser whose absence caused every earlier instrument to fail.** ~43 % in the
+    eviction cell versus ~5-7 % ambient: this is the design that makes a mechanism test affordable,
+    which the 26 %-vs-7 % correction identified as the missing ingredient.
+
+## The mechanism statement this supports, and its exact limits
+
+**Supported:** forced eviction of in-flight KFD work is a CAUSE of the fault. Concretely - when a
+separate process makes KFD evict and restore queue memory while a GLM-4.7-Flash HRX server is decoding,
+the server's logits come back wrong at ~43 % of arms, both faces represented, and neither a quiet box
+nor CPU-only pressure does this at all (0/23).
+
+**Not yet named:** the specific handoff that reads stale data. This result names the TRIGGER
+(eviction of in-flight work) - which is a genuine mechanism-level finding and directly contradicts the
+earlier "it was never the cause" reading of the #123/#140 record for THIS issue. It does not by itself
+say which buffer or which fence is at fault, and the static leg has already shown the #140-class
+handoff in GLM's path is correctly fenced (commit 1de679f). Locating the handoff the eviction corrupts
+is the remaining work for criterion 1's strongest form.
+
+**Also contradicted, and this matters:** my own earlier statement that "H2' IS FALSIFIED" (commit
+ace7218). Eviction DOES cause the fault, demonstrated by intervention. What was falsified was only the
+per-arm rate-correlation (faulting arms did not show more evictions than clean arms under ambient
+pressure). The correction is recorded at commit 3a2ba07 and this result confirms it.
+
+## Box-time note
+disc2 was pre-registered and launched inside the remaining budget (~43 min at 2.4 min/arm). This is the
+run the 12 h ceiling could still afford, and it is the one that mattered.

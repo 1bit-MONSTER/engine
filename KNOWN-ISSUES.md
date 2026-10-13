@@ -379,13 +379,35 @@ The criterion used here has been ">=60 in-regime arms, zero faults". The census 
 the defect is fully present at 98G. Any claim that #315 is gone must therefore show zero faults **in the
 high band (>=98G)**, or the regime gate must be redefined to the population that actually faults.
 
+### Families closed by discriminating experiment (2026-10-13)
+
+Four candidate families have since been eliminated, each by a pre-registered or source-level test rather
+than by argument:
+
+| family | disposition | evidence |
+|---|---|---|
+| the logits **read path** — routing `buffer_get`'s bare `memcpy` through `hrx_synchronous_d2h` | **REFUTED** by its own pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT with the knob off and 0 OK / 2 FAULT with it on, both Face B, knob verified live in the arm server's `/proc` environ | `315-ab1-arm-B-interim.md`, `315-ab1-fix-path-is-coherent.md` |
+| the **host side** — every host access to the non-coherent `0x52` mapping | **CLOSED**: all four accesses enumerated (`buffer_memset`, `buffer_set`, `buffer_get`, `buffer_clear`) and none is on the decode path | `315-write-side-unaddressed.md` |
+| the **runtime's AQL submission policy** | **CLOSED**: `aql_block_processor.c` states in code that the runtime does not infer memory hazards, consuming only compiler-set packet flags, so it never derives a producer/consumer pair | `315-device-hunt-boundary.md` |
+| the **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | **REFUTED** by a pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT in BOTH arms (reorder on and off), 100% either way | `315-gord1-final.md` |
+
 ### Still open
 
-The **cause** — which handoff reads stale data after an eviction — is not located. The read path is now
-eliminated. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch
-ordering, or a different class), plus the host-write-side access asymmetry recorded in
-`315-write-side-unaddressed.md`, whose logits form is already falsified
-(`output_reserve`'s clear is once-at-allocation, not per-decode).
+The **cause** — which handoff reads stale data after an eviction — is not located, now after closing four
+families. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch ordering,
+or a different class), and the MoE id-producing-kernel family under active work by another agent.
+
+The **`GGML_HRX_FA_PARTIAL_ALIGN`** discriminator — the #140 FA layout/dispatch class, which §57 of
+`315-mechanism.md` names as the cheapest never-applied lever and pre-commits to abandoning the FA path if
+the rate does not move — is pre-registered at `315-align-preregistration.md`, not yet run.
+
+### On the fix
+
+**No forward-only fix is currently landable.** The prepared read-path patch is refuted and must not be
+landed. The one defensive mitigation in the tree (`GGML_HRX_NAN_CONTINUE`, scrubbing NaNs to `-INFINITY`)
+addresses Face A only and is a **workaround, not a repair** — and this entry's own rule is that a
+documented limitation is acceptable only *after* the mechanism is named, so no limitation entry is
+recorded.
 
 The controlled confirmation of the `gtt_start` boundary (cell fixed, start stepped 97/98/99) is
 pre-registered at `docs/315-campaign/evidence/315-gttstep-preregistration.md`, not yet run.

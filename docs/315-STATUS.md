@@ -1403,3 +1403,72 @@ control.
 
 The blocker is unchanged from UPDATE 11: the cause is not locatable within the declared scope, and the
 remaining surface (device/runtime restore fidelity, and the codegen lane) lies outside the boundaries.
+
+---
+
+# UPDATE 19 (2026-10-13 ~17:20) — criterion-4 controls MEASURED (8/8 pass); a new lead from the REA dumps
+
+Box time was authorised past the 12h ceiling, and two things were done with it.
+
+## 1. Criterion-4 controls: all eight HRX tests pass, matching baseline
+
+Ran on the current pin (`e44c9d01a`) at 17:09. Full detail in `315-crit4-control-result.md`:
+
+    test-hrx-buffer  PASS (5 passed, 0 failed)     test-hrx-mul-mat-id-k32  PASS
+    test-hrx-mxfp4   PASS                          test-hrx-moe-split       PASS
+    test-hrx-attention-sink PASS                   test-hrx-decode-stride   PASS
+    test-hrx-hadamard PASS                         test-hrx-fa-masked-v     PASS
+
+with the `MUL_MAT_ID mxfp4` `nmse` figures in the same range as the baseline (1.34–1.61e-05 against
+1.23–1.58e-05) and the same two kernels selected. Since `nmse` is a numeric fingerprint of the reduce and
+id-resolution path, "PASS with an unchanged range" is stronger than PASS alone.
+
+**This makes criterion 4's control half measured rather than assumed.** It still does not make criterion 4
+*met*: the criterion pairs the controls with a fix to compare against, and no fix has landed. The
+"dense-model control" the objective names alongside the op-test was **not** run and should not be claimed.
+
+## 2. A new in-scope lead from the REA decompilation dumps
+
+The large REA effort now on the box (`~/amd-oss/hrx-re/`, 83 MB of decompiled output) yielded a runtime
+mechanism this goal's own reading had not reached — see `315-hrx-mem-pool-quarantine.md`:
+
+- the HRX **memory pool** has a **quarantine** state with an explicit `quarantine_eviction_count` and
+  `bytes_quarantined`, plus an `inflight_allocation_count`;
+- the aggressive `hrx_mem_pool_trim` path is **gated on `inflight_allocation_count == 0`**, i.e. the runtime
+  tries to maintain "do not reclaim memory out from under in-flight work";
+- the allocate side maintains that counter correctly (increment under the mutex, work outside it, decrement
+  after — 2 increments, 2 decrements, and the one `goto` is reached *after* the decrement, so **no leak**);
+- the counters are **not observable** through the public API (`hrx_mem_pool_get_attribute`'s enum stops at
+  `RESERVED_MEM_*`/`USED_MEM_*`), so the counter test would need a runtime API change — out of scope;
+- instead the header documents a **retirement/reuse contract**: logical free is distinct from physical
+  release, reservations "remain retained for later **stream-ordered reuse**", and `release_unused` is
+  "intended for **stream-ordered free completion paths**", with reuse policies named
+  `REUSE_FOLLOW_EVENT_DEPENDENCIES` / `ALLOW_INTERNAL` / `ALLOW_OPPORTUNISTIC`.
+
+That contract is a concrete surface where a stale read could occur (retire → reuse while a consumer still
+holds the old expectation), and the reuse decision is event-dependency based. It is a **premise, not a
+finding**: nothing shows the dependency tracking is wrong, and it is a different layer from the KFD eviction
+the forcer actually drives.
+
+## 3. Also corrected: the preserved peer dossier
+
+Its `_spt` claim ("GOT-indirect thunk patch") is **wrong** — the REA decompilation shows `0x31d8a0` is a
+`.plt` stub, no `hipMalloc_spt` export exists, and the mechanism is name-based `dlsym(symbol + "_spt")`. The
+dossier is annotated in place and the correction recorded (`315-dossier-spt-claim-corrected.md`).
+
+## Criteria
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named mechanism | trigger named/replicated/quantified; **cause not located** — four families closed, FA open, and a new pool-reuse lead opened |
+| 2 | forward-only fix | not achievable within scope (structural argument, both ends) |
+| 3 | ≥60 arms, zero faults | not met; gate mis-specified (intervention cell, not a band) |
+| 4 | no regression | **controls MEASURED and passing (8/8, baseline-matched)**; criterion still not *met* because no fix has landed to compare against, and the dense-model control was not run |
+| 5 | KNOWN-ISSUES | done, corrected for the parse error |
+
+## Harness defects this session (five now)
+
+Line-based counter on newline-free NDJSON; `pgrep` pattern matching its own caller; `md5sum` over streaming
+responses; **guessed binary names** for the criterion-4 control; and a `sudo -n tee` that wrote nothing. Each
+was caught before its output was cited. The consistent lesson: **read the baseline, list the directory, and
+compare the payload** rather than reconstructing from memory.

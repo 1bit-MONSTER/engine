@@ -71,3 +71,50 @@ All three are fixed in the revised probe (`~/wt/315wb-probe2.sh`).
 This is the second time in this goal that a measurement's *reporting* was the defect rather than the
 measurement (the earlier one was the `pgrep` self-match scare). Both were caught before the number was
 cited, and both are recorded in place rather than quietly dropped.
+
+---
+
+# Take 2 also produced zero records — and this time the probe was sound, so the result is real
+
+The corrected probe (`~/wt/315wb-probe2.sh`) fixed take 1's three defects and ran on an idle box. It issued
+**10 varying prompt lengths** so the recorded graph could not be reused:
+
+    10 requests issued, 10 decodes completed, 10 "graphs reused" events
+    hrx-wb-fp records: 0
+    host staging / download language in the server log: 0 occurrences
+
+**Zero writeback records from a sound probe.** Unlike take 1, this is a real measurement: the graph was
+rebuilt on every request, so `download_prepared_host_staging` was re-entered each time, and it still queued
+nothing.
+
+## The instrumentation is genuinely reachable
+
+Checked before drawing any conclusion, because "instrument silent" and "instrument absent" are different
+findings:
+
+    strings libggml-hrx.so | grep hrx-wb-fp          -> 1   (the log format string is compiled in)
+    nm -C libggml-hrx.so | grep fingerprint_writeback_log -> 1   (the function exists)
+    nm -C libggml-hrx.so | grep add_host_writeback        -> 1   (the queue entry point exists)
+
+So the path is compiled in and callable; it simply is not taken.
+
+## What this means, at the strength it supports
+
+On this workload — GLM-4.7-Flash decode via `llama-server`, ~10 varying requests, no regime — the host
+staging **download** path is not entered, so `pending_host_writebacks_` is never populated and the deferred
+window never opens.
+
+That is a **negative for the path under these conditions**, and it is weaker than it sounds:
+
+- The gate is `staging.download = access.write && !binding.graph_input` **with** `binding.host_data != nullptr`.
+  The recorded trace (`host_visible=1 direct_host_binding=0 memory_type=0x52`) says the logits *are*
+  host-visible, but that trace was taken on a **different build and configuration** (`GGML_HRX_BUFFER_TRACE`
+  on `315instr3`/`315fix` trees), and whether the same holds in `315coherent-build` under this exact load
+  has not been confirmed.
+- No regime was involved. Whether the path is entered under GTT pressure, with neighbours, or with the
+  eviction forcer is untested — the same gap that made the `315align` run uninformative.
+
+So the honest state of this lead is: **not reached in the one configuration tested, not yet tested in the
+configuration that matters.** The next step is to run the buffer trace (`GGML_HRX_BUFFER_TRACE=1` alongside
+`GGML_HRX_WRITEBACK_FINGERPRINT=1`) in the *coherent* build to establish whether the logits are host-visible
+there at all — if they are not, this lead closes by construction rather than by absence of output.

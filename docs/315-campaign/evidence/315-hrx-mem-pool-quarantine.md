@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # New in-scope lead from the REA decompilation: the HRX **memory pool quarantine/eviction** path
@@ -80,3 +96,62 @@ whole-buffer event** rather than a changed computation.
 2. Read the remaining pool functions from the preserved queue (`~/amd-oss/hrx-re/pipeline/queue-full-943.tsv`
    is resumable) — specifically anything touching `inflight_allocation_count`, which is the invariant's
    linchpin.
+
+---
+
+# The allocate side: the invariant looks SOUND, which narrows this lead
+
+Followed up by reading `hrx_mem_pool_allocate_buffer` (`~/amd-oss/hrx-re/decomp/libhrx/`), which is the other
+decompiled function that touches `inflight_allocation_count`. Together with `trim`, it defines the pool's
+centrality invariant.
+
+## The shape
+
+    pool->inflight_allocation_count = pool->inflight_allocation_count + 1;   // increment UNDER the mutex
+    iree_slim_mutex_unlock(&pool->mutex);                                    // release it
+    ...
+    status = iree_hal_pool_allocate_buffer(...);                             // work happens OUTSIDE the lock
+    ...
+    iree_slim_mutex_lock(mutex);                                             // re-acquire
+    pool->inflight_allocation_count = pool->inflight_allocation_count - 1;   // decrement
+
+That is the correct pattern: the counter is maintained under the mutex, the blocking allocation is performed
+outside it, and the decrement pairs with the increment. And `trim`'s aggressive path is gated on
+`inflight_allocation_count == 0`, so the two halves are consistent by construction.
+
+## Checked for the obvious defect, and it is not there
+
+The classic failure for this pattern is a **leak on an error path** — an early return between the increment
+and the decrement, which would leave the counter permanently high (blocking trim forever) or, in the other
+direction, allow trim while work is in flight.
+
+Counted and located the sites in that function:
+
+    increments: 2      decrements: 2
+    the one goto (LAB_0017653c) is reached at offset ~2380, AFTER the decrement at ~1021
+
+So on the path I could read, the decrement precedes the jump and the count is balanced. **No leak found at
+this site.**
+
+## What that does to the lead
+
+It **weakens** it as "the counter is buggy" and leaves the more interesting remainder intact: the invariant
+exists and is maintained here, so an eviction-during-flight event would have to arise either from another
+path that touches the counter (only two functions in the decompiled set do, and 51 pool/alloc functions
+remain undecompiled), or from **outside the pool entirely** — i.e. the KFD-level eviction the trigger
+actually uses does not go through `hrx_mem_pool_trim` at all, in which case this quarantine machinery is not
+the affected path and the lead is about a different layer's notion of quarantine.
+
+That second possibility is now the more likely one: the forcer (`evictonly`) drives **KFD** eviction via
+`mprotect` churn on a `hipHostRegister`'d range, which never calls into HRX's pool trim. So the pool's own
+quarantine counters may simply not be on the trigger's path.
+
+## Honest standing after this read
+
+    gate exists and is correct            (this file, previous section)
+    allocate/trim pair is consistent      (this section)
+    whether KFD eviction reaches it       UNKNOWN, and the forcer's mechanism suggests it does NOT
+
+So the lead is **not** "the pool leaks its in-flight count" — that is unsupported — and the live question is
+whether this quarantine machinery is on the trigger's path at all. Answering that is a runtime counter
+question (pool stats in a faulting arm), which is the cheap next step already named.

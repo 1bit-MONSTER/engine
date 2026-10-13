@@ -63,3 +63,58 @@ mapping as the corruption site) is falsified as the *cause*.
 
 A single round is not "B ≈ A". The claim waits on arm B's full cell-`e` tally. If later rounds are
 clean, the reading changes to mixed and must be reported as such rather than resolved post hoc.
+
+---
+
+# FINAL (2026-10-13 ~10:56) — completed at 2 of 4 rounds; the refutation is established
+
+The run was stopped after round 2 rather than continued. Recording why, and what the stopped run does and
+does not support.
+
+## Final scored arms
+
+```
+  round 1 arm q: OK     nan=0 req=66                     gtt 97G->98G   side=0/0
+  round 1 arm e: FAULT  nan=0 http=1 s500=1 unparsed=2   gtt 98G->99G   side=1/1   <- FACE B
+  round 1 arm c: OK     nan=0 req=66                     gtt 97G->98G   side=12/12
+  round 2 arm e: FAULT  nan=0 http=1 s500=1 unparsed=2   gtt 98G->100G  side=1/1   <- FACE B
+  round 2 arm c: FAULT  nan=1 req=34 transport=1         gtt 97G->79G   side=12/12  <- FACE A
+  round 2 arm q: OK     nan=0 req=66                     gtt 97G->98G   side=0/0
+```
+
+    cell e (the test cell):  0 OK / 2 FAULT   both Face B
+    cell q (quiet):          2 OK / 0 FAULT
+    cell c (CPU pressure):   1 OK / 1 FAULT   the fault is Face A
+
+## The pre-registered reading
+
+Unchanged from the interim note: arm B's cell-`e` arms **fault with the fix engaged**, while arm A's
+cell `e` is 4/4 FAULT. That is the refutation branch fixed at `fc7ffd5`:
+
+> **B ~= A -> H-fix REFUTED. The memcpy is not the site; the stale data enters elsewhere.**
+
+The knob was verified live during the arms by reading the arm server's own `/proc/<pid>/environ`. The
+refutation is not dismissible — the vacuity objection (that `hrx_synchronous_d2h` might itself be
+incoherent) was checked at source and disproved (`315-ab1-fix-path-is-coherent.md`).
+
+## Why it was stopped at 2 rounds
+
+- **The verdict was settled.** Cell `e` faulted in every round run, so rounds 3-4 could only narrow a
+  rate that is not in question. The pre-registration's "B ~= A" branch is met on the evidence already in.
+- **Box-time budget.** The record puts this goal turn at ~10-11.1 h of the stated <=12 h ceiling before
+  this run; two more rounds would add ~20 min against a margin that is at best thin.
+
+Stopping a pre-registered run early is a deviation and is recorded as one: the pre-registration specified
+4 rounds unless the result was already clear, and this invokes that clause explicitly rather than
+silently. **The cost is stated**: arm B has 2 cell-`e` arms against arm A's 4, so the comparison is 2-vs-4
+in cell `e`, not round-for-round. The direction is unambiguous (arm B faults in 100% of its cell-`e`
+arms) but the sample is half the planned size, and no rate estimate should be computed from it.
+
+## What is established, and what is not
+
+- **Established**: the read-path fix does not stop the fault; the corruption is not the CPU observing a
+  stale logits page.
+- **Established separately**: the `cell c` Face-A fault, whose GTT trace (97 -> 106G) is recorded in
+  `315-ab1-cell-c-fault-drift.md` as a single-arm observation.
+- **Not established**: the cause site. Still open, with the read path eliminated.
+- **Not usable as a rate**: 2 arms. Nothing in this file should be quoted as a frequency.

@@ -114,3 +114,78 @@ The two named obstacles are both fixable and both in scope (engine-side instrume
 
 Until both are done, this family stays open and the probe must not be cited as evidence either way. No
 criterion changes and no arm from it is eligible.
+
+---
+
+# Addendum: the instrument was reading the CORRECT tensors — and the f32 side never ran
+
+Two things were established after the retraction above, both from source and from the run's own logs. One of
+them corrects a hypothesis I was about to record.
+
+## 1. The two names are the right tensors (so "wrong tensor" is not the defect)
+
+`ggml.c:5365`:
+
+    struct ggml_tensor * ggml_argsort_top_k(ctx, a, k) {
+        GGML_ASSERT(a->ne[0] >= k);
+        struct ggml_tensor * result = ggml_argsort(ctx, a, GGML_SORT_ORDER_DESC);   // i32
+        result = ggml_view_4d(ctx, result, k, ...);                                  // a VIEW of it
+        return result;
+    }
+
+and `ggml.h:2393` documents it as *"similar to `ggml_top_k` but implemented as `argsort` + `view`"*. At
+`src/llama-graph.cpp:1932`:
+
+    ggml_tensor * selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used);
+    cb(selected_experts->src[0], "ffn_moe_argsort", il);   // the argsort result, i32, [64, n_tokens]
+    cb(selected_experts,         "ffn_moe_topk",   il);    // the view of it,  i32, [4,  n_tokens]
+
+So `ffn_moe_argsort` is the argsort **result**, `ffn_moe_topk` is a **view of the same buffer** — which is why
+their bytes agree at the same call (confirmed in the log at call=94, layer 46: `ffn_moe_topk-46`'s four values
+are exactly the first four of `ffn_moe_argsort-46`). The instrument took the i32 path for both, which means it
+observed `node->type == GGML_TYPE_I32` for both — the declared types are right.
+
+**Both were the correct tensors. The defect is what came back, not what was asked for:** an i32 tensor that by
+construction must hold ranks in `[0, 64)` held float-shaped values (e.g. `1040594397` ≈ 0.131, `-1122889188`
+≈ -0.0326 — logit/probability-shaped) or zeros, in a faulting and in clean arms alike, never once a rank.
+
+## 2. The f32 side of the probe never ran at all — and my staleness hypothesis was wrong
+
+I was about to record that the plain-memcpy read of a non-coherent arena (`ggml-hrx.cpp` `buffer_get`: when
+`context->base != GGML_HRX_FAKE_PTR_BASE` it memcpys and **returns**, never reaching
+`hrx_synchronous_d2h`) meant the fingerprint reads stale memory — which would have been a large claim, since it
+would implicate every host-side tensor read in this campaign.
+
+**That claim is not supported.** The run's log contains **only** `[hrx-ids-fp]` lines — 73,416 of them — and
+**no f32 line at all**, in the faulting arm *or* the clean arms. The reason is coverage, not staleness: the
+campaign's earlier NaN localisation used **position-based** selection (`GGML_HRX_TENSOR_FP=tail:16`, which
+bypasses the name filter entirely), so it never depended on the head tensors matching by name. The id probe
+instead supplied names — `norm`, `result_norm`, `result_output`, `ffn_moe_weights-N`, `ffn_moe_probs-N` — and
+**none of them matched a node**, so the f32 path emitted nothing.
+
+That also means the probe's third pre-registered branch (*"`probs` re-read as NaN with a coherent read → NaN
+upstream of argsort"*) has **no data**, and cannot be read either way. Note the anchored name matching added
+earlier in this probe fixes `-41`-vs-`-4` over-matching but introduces the opposite failure: a name that
+carries a suffix no longer matches at all. Exactness cuts both ways.
+
+## Consequence for the logits NaN, and what the arm actually was
+
+The faulting arm's own log is unambiguous about the scale:
+
+    common_sampler_sample: HRX returned NaN logits: count=154880 of 154880, index range [0..154879],
+                           contiguous=yes, continuing=no sentinel=0 (engine#315)
+
+**Every one of the 154,880 logits was NaN** — not a small corruption, the whole tensor. Under the earlier
+recorded reading of the head's behaviour (*"1..4096 NaNs at the head's input means small upstream corruption
+amplified by the head; zero there means the head itself manufactures the NaN"*), this is the *manufactured*
+case — and the probe cannot confirm or refute that, because the head tensors were never read.
+
+## Standing state of the family
+
+**The id-producing / argsort family remains UNTESTED.** It is not excluded, and it is not implicated. Both of
+its instruments failed for different, now-understood, and separately fixable reasons:
+
+1. the i32 read returns float-shaped values where ranks belong — correct tensor, wrong contents, unexplained;
+2. the f32 read matched no node, so the probs/weights half produced nothing.
+
+Neither pre-registered branch fires. No criterion changes and no arm from this probe is eligible.

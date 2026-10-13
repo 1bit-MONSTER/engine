@@ -188,3 +188,40 @@ Its header said it was testing whether the "align4096-e FAULT-B / align256-e CLE
 run shows that asymmetry: galign1 had `align256-e` faulting on the identity check, and galign2 has both arms
 faulting. So the replication answered a question it did not intend to ask, and the answer is the pre-registered
 **"no difference"** branch — which §57 pre-committed to abandoning the FA path on.
+
+---
+
+# Update: the replication extended to 4 arms — all four faulted, both alignments 2/2
+
+The peer's run continued past its first two arms. Full tally from its console:
+
+    gb4096-e   align=4096  cell=e  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+    gb256-e    align=256   cell=e  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+    gb4096-e2  align=4096  cell=e  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+    gb256-e2   align=256   cell=e  FAULT-A  resp=66  http500=1  content_only=2  nan_guard=0
+
+so, pooled with the first run:
+
+    align=4096, cell e:   2 of 2 arms faulted   (galign1 63/66 distinct; galign2 66/66 ×2)
+    align=256,  cell e:   2 of 2 arms faulted   (galign1 66/66; galign2 66/66, one with Face-B content)
+
+**Every arm faulted. No arm was clean.** Notably `gb256-e2` carries a genuine **Face B** signature
+(`http500=1 content_only=2`) — so the forced-eviction cell produced Face B at `align=256` too, i.e. the face
+that appears does not track the alignment either.
+
+## What this settles, and at what strength
+
+- **Settled (one-sided)**: the FA alignment/dispatch class is **not sufficient**. At `align=256` — the layout
+  the #140 oracle used to *expose* the divergence — the forced-eviction cell faulted in **2 of 2 arms**, with
+  a Face-B signature in one of them. Replicated across two independent runs.
+- **Still not settled**: whether the two alignments fault at the *same rate*. n=2 per alignment cannot
+  distinguish "both ~95%" from "95% vs 60%"; that needs roughly 20 per condition. So this remains a
+  one-sided exclusion of sufficiency, not a measured null — the same strength as the coherence and
+  `GRAPH_SYNC` rows.
+
+## Why the extension was the right move
+
+The replication was extended from two arms to four precisely because a single arm per alignment has no power
+at a ~95% base rate (the power point raised in the correction above). Four arms with zero clean results does
+not by itself reach the n a two-sided contrast needs, but it does make "the FA class is not sufficient"
+robust: four independent opportunities for `align=256` to come back clean, and none did.

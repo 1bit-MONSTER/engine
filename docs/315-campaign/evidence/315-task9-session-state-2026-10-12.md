@@ -1859,3 +1859,31 @@ sites #140 fixed are both correctly fenced in this pin. That means either:
 Both remain open. This is the honest state: the mechanism CLASS is named to the project's own
 root-cause text and the trigger/cause distinction is settled, but the specific surviving site is not
 located, and criterion 1 needs a named falsifiable mechanism rather than a class.
+
+## Static search, round 2 (05:57) - q6_k head kernel excluded as cross-dispatch, not intra-kernel
+
+Screened GLM's `loom-libs/ops` path for kernels with subgroup-scoped fences and zero global fences:
+
+    gated_delta_net_f32_wmma.loom               subgroup=13  global=0     (not GLM's path)
+    mul_mat_id_swiglu_f32_f32_wmma.loom         subgroup=7   global=0     (excluded, previous round)
+    mul_mat_q6_k_packed_f16_wmma.loom           subgroup=2   global=0     (this round)
+    mul_mat_swiglu_f32_f32_wmma.loom            subgroup=7   global=0
+    flash_attention_decode_split...wmma.loom    subgroup=2   global=13    (has the #140 fences)
+
+`mul_mat_q6_k_packed_f16_wmma.loom` was the interesting one because it has a global `groups_view`
+written at :635 and read at :703 - the #140 shape. Read the boundaries:
+
+    575  kernel.def export("ggml_select_symmetric_i4_k32_groups")        <- WRITES groups_view (:635)
+    640  kernel.def export("ggml_mul_mat_q6_k_symmetric_i2_scan_token1")  <- READS groups_view (:703)
+
+They are TWO SEPARATE DISPATCHES, so the handoff is cross-dispatch and cannot be expressed as an
+intra-kernel fence - the same conclusion as the previous round, reached from a different kernel. And
+independently, § b854af3 closed this q6_k shortlist path for GLM on dispatch evidence
+(`q6_k_token1_shortlist` never appears in the model's inventory).
+
+So: **two static-search rounds, five kernel candidates read, zero surviving intra-kernel #140-class
+handoffs on GLM's path.** Both sites #140 fixed are correctly fenced in this pin. The surviving-defect
+location is NOT an LDS-only intra-kernel fence that grep finds, and any remaining instance of the
+class would have to be either cross-dispatch (executor-level ordering, where §55/§56 already cleared
+the consumer's own read path via `hsa_signal_wait_scacquire` + the timepoint covering the last
+submission) or a different mechanism entirely.

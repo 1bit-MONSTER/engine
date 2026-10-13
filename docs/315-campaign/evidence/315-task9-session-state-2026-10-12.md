@@ -2128,3 +2128,59 @@ faults. So:
 ## Immediate next step recorded, not yet run
 P1 is the surviving discriminator and is copy-pasteable (see the P1 RECIPE below). It needs the box
 lock, which the just-finished control released.
+
+---
+
+# H2' IS FALSIFIED (06:30) — two faulting arms show LESS eviction activity than every clean arm's floor
+
+The H2 test H2' was built for, now with n=2 faulting arms instead of the single draw that was only
+weakly informative before:
+
+    FAULT n=2   evictions/arm:  min=16   median=203   mean=109.5
+    clean n=25  evictions/arm:  min=117  median=254   max=559   mean=254.5
+
+    pre-fault (causal): 203.0 from 1 of 2 fault arms (the other had no recoverable fault time)
+    tool verdict: "NOT supportive (faulting <= 1.5x clean)"
+
+## Why this is a falsification rather than a weak result
+
+ 1. **The direction is opposite to the prediction.** H2' predicts faulting arms are evicted MORE.
+    Observed: the faulting mean (109.5) is 43% of the clean mean (254.5), and the faulting MEDIAN
+    (203) is below the clean median (254).
+ 2. **One faulting arm is below the clean MINIMUM.** p16c shows **16 evictions** against a clean-arm
+    minimum of 117 across 25 clean arms. That arm faulted (Face A) with essentially NO suspension or
+    eviction activity attributable to it. H2' says the fault needs a buffer moved during the arm's
+    own suspension window; this arm had almost none.
+ 3. **n=2 across opposite cells and opposite faces.** The two faulting arms are `p8l` (fix-cell,
+    Face B) and `p16c` (control-cell, Face A) - so this is not one cell's or one face's artefact.
+ 4. **This is P3's refutation condition.** P3 was pre-registered as: "the same cwsr=1 arm that faults
+    should have been suspended at least once. If an arm faults with zero Q_EVICT/Q_RESTORE for its
+    pid, this mechanism is refuted." 16 is not zero, so the letter of P3 is not met - but the
+    quantitative prediction (P2) fails in the opposite direction, with a faulting arm an order of
+    magnitude below the clean floor.
+
+## What is falsified, precisely
+**H2' as a quantitative mechanism: "faults concentrate on arms whose buffers were evicted/migrated
+during their own suspension window".** That claim predicted an eviction EXCESS on faulting arms. The
+data show an eviction DEFICIT. The mechanism as stated is dead.
+
+What is NOT claimed: that eviction is irrelevant to the fault in every conceivable form. A mechanism
+in which eviction is a NECESSARY but very rare SUFFICIENT condition would need a different test (the
+P1 denial experiment), and one faulting arm having 16 evictions while 117 is the clean floor leaves
+room for a non-quantitative relationship. But the specific falsifiable prediction H2' made - the
+discriminating one that justified calling it a mechanism - is contradicted.
+
+## Consequence for criterion 1
+H2' was the sole surviving candidate after H1 was re-opened by the control's own result. With H2'
+falsified:
+  - the cwsr signal does not survive as a mechanism (H1 explains its evidential collapse),
+  - the buffer-movement/eviction story as a quantitative mechanism does not survive,
+  - and the fault IS real and reproducible at cwsr=1 on a fresh boot, both faces, in-regime.
+So criterion 1 is now further from a named mechanism, not closer - and the honest position is that
+NO candidate on the record survives its own discriminating test. That is a real result and it should
+be reported as such rather than dressed up.
+
+The one experiment that could still rescue a movement-dependent mechanism is P1 (deny movement at
+cwsr=1 via GGML_HRX_USE_UNIFIED_MEMORY): if faults vanish with movement denied, movement is
+necessary even though not rate-correlated; if faults persist, movement is irrelevant. P1 is
+copy-pasteable and ready.

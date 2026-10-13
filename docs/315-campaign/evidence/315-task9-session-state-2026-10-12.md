@@ -3835,3 +3835,43 @@ rather than the forcer.
 This is the empirical foundation of the whole issue now, and it is far stronger than the 26%-vs-CWSR
 comparison it replaces: it is an INTERVENTION, it is reproducible, it isolates the variable against two
 different control side-loads, and it was reproduced twice by a run I did not author.
+
+---
+
+## THE IDS DIAGNOSTIC EXISTS, AND ITS TWO HALVES HAVE DIFFERENT VALIDITY (12:30)
+
+Section 51 called the ids diagnostic "mis-specified". Reading it at source
+(`~/wt/llama-315copy/ggml/src/ggml-hrx/ggml-hrx.cpp:635-670`) says which half and which not - and the
+answer matters, because one half is exactly the test the argsort candidate needs.
+
+    const int64_t ine0 = node->ne[0] > 0 ? node->ne[0] : 1;
+    ...
+    if (v < 0 || v >= static_cast<int32_t>(ine0)) { ++oor; }          // <-- WRONG for a top-k view
+    for a < ine0: for b > a: if (ids[row*ine0+a] == ids[row*ine0+b]) ++dup;   // <-- CORRECT
+
+**`oor` is invalid.** `ffn_moe_topk` is a top-k VIEW over the expert axis, so `node->ne[0] == k ==
+n_expert_used`, which for GLM is a small number (the routed-top count), while the valid range of an
+expert ID is `[0, n_expert)` with `n_expert` far larger. Comparing an expert id against `ne0` therefore
+flags every legitimate id `>= k` as out of range - which is why section 51 saw ~all 253,000 lines
+flagged and discarded the output. The `oor` column can never be read as evidence.
+
+**`dup` is valid and is precisely the right metric.** It compares ids WITHIN a row and counts duplicate
+pairs. That is exactly the signature the candidate predicts: if the argsort's scatter left one slot
+unwritten, that slot still holds its previous content - which is *another element's index from the same
+list* - producing a duplicate inside the row. And the check needs no knowledge of `n_expert`, so it is
+unaffected by the shape confusion that breaks `oor`.
+
+### So the decisive test is runnable with a valid metric
+Enable `GGML_HRX_TENSOR_FP` with the ids node named (`ffn_moe_topk`, and `ffn_moe_argsort` for the
+parent) on the corrected build, and read `dup_pairs` from a faulting arm versus a clean arm:
+    dup_pairs > 0 in a faulting arm, 0 in clean arms  -> the candidate is CONFIRMED
+    dup_pairs = 0 everywhere                          -> the candidate is REFUTED, and the stale-index
+                                                        path is not how the corruption enters
+
+The instrument needs to be carried into a build that has the diagnostic. `315copy-build` already has it
+and already has the (invalid) `oor`; I can build a corrected variant that additionally prints the ids of
+the FIRST DUP pair and the row they are in, which is what will make a hit interpretable.
+
+### What I am NOT doing
+Not re-running the 60-arm campaign for this. The question here is diagnostic (does a stale index appear),
+not acceptance, and the eviction rig at 83% gives a faulting arm in ~2 arms, so a few arms suffice.

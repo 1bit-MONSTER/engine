@@ -48,3 +48,35 @@ ordering. It is recorded as corroboration of the apparatus, not as evidence for 
 The peer is a separate agent working the same box; its consoles live at `strixhalo:~/wt/315ids1-console.log`
 and `315ids2-console.log`. This file cites only the summary lines from its driver output, read directly
 from the box. The peer's own conclusions are not reproduced or relied on here.
+
+---
+
+# Coordination finding (2026-10-13 13:33): the peer's driver does NOT take the box lock
+
+Discovered while waiting for the GPU, and it invalidates the obvious arbitration strategy. While the peer
+agent's campaign `315ids3` was actively running, the box lock was **free**:
+
+    $ flock -n ~/.cache/lax-decode/box.lock -c "echo LOCK-IS-FREE"
+    LOCK-IS-FREE
+
+    $ for p in $(pgrep -f "315-disc.sh 2 315ids3"); do ls -l /proc/$p/fd | grep -c box.lock; done
+    0
+    0
+    0
+
+So the peer's driver runs **without holding `~/.cache/lax-decode/box.lock`**, even though
+`~/wt/315-COORDINATION.md` and the goal's own constraints say to take it. Consequences:
+
+1. **The lock cannot arbitrate between the two agents.** A lock-wait would acquire a lock that the peer
+   is not holding, then run concurrently with the peer's live campaign anyway.
+2. **The only reliable signal is GPU/process idleness** — observing that no other `315-disc.sh` driver is
+   alive. That is what arm A used, and it is what arm B now uses.
+3. **A "60-second clean window" requirement is too strict** against a peer running a tight campaign
+   series (`ids1` -> `ids2` -> `ids3`, each launched as the previous ends). Waiting for genuine driver
+   absence with a short settle, and starting immediately, is the workable approach; the residual race is
+   a few seconds of teardown, not a whole campaign.
+
+Recorded because it is the kind of coordination assumption that silently produces concurrent GPU runs —
+which is precisely the contamination class this issue has already been burned by once (the two-driver
+incident on tag `315ab1b`, `315-ab1-two-drivers-incident.md`). The peer's non-locking behaviour is
+outside this goal's control; what is within it is not relying on the lock for mutual exclusion.

@@ -4362,3 +4362,59 @@ cheap at an 83% fault rate:
  2. for Face-B arms, does the rejected text REPRODUCE across arms (same degenerate output for the same
     prompt)? If yes, it is a stable property of a corrupted buffer, which points at a persistent wrong
     value rather than a moving one.
+
+---
+
+# FACE B REPRODUCES, AND ITS MODAL OUTPUT IS COHERENT ENGLISH (14:55) — this changes the read
+
+Measurement 2 from the previous section, answered from recorded logs.
+
+### The data
+Extracting the parser's rejection text (`unparsed Content-only output: ...`) from **every Face-B arm**
+across the whole record - 33 arms with a captured line - and grouping the strings:
+
+    distinct rejection strings : 25
+    REPEATED x9                : "We'll assume the reader has a basic understanding of LLMs but wants
+                                  to understand the internal mechanics."     (105 characters, COMPLETE)
+
+and the remaining 24 strings occur once each, and are the symbol-soup kind this issue already recorded
+(`'ity (中。)。)))) ( for, size here,, hold ( ( foricic for here f'`, `'the}:}:}甚;'`, ...).
+
+### Why the 9-fold repeat is the important part
+Nine arms, across **four different runs** (`ab1a`, `ab1b2`, `gord1a`, `ids1`, `ids3` - two of which I did
+not author), produced the **same complete, grammatical English sentence** as their failing output:
+
+  - it is 105 characters and ends in a full stop - a *complete* generation, not a truncation;
+  - it is coherent - not the invalid-byte soup that the other 24 strings are;
+  - it is identical character-for-character across nine independent arms and four runs.
+
+So Face B is not "the model emits garbage". Its **modal** failure is a *specific, reproducible, coherent
+sentence* that the chat-template parser rejects because the request expected Content-only output and this
+sentence is not the expected shape. The soup cases are the minority (24 of 33) and each is unique.
+
+### What this does to the mechanism story
+It kills the simplest reading of Face B. If Face B were "a corrupted logits vector sampled degenerate text",
+the output would be either random garbage (as in the 24 unique cases) or prompt-dependent - not the SAME
+105-character sentence nine times across four runs. A stable, coherent, input-independent sentence is what
+you get from a **stable wrong state**, not from a moving corruption:
+
+    deterministic (52 of 52 arms, previous section)
+  + reproducible across runs (9 arms, 4 runs, exact string)
+  + coherent and complete (not soup)
+  = a STABLE wrong computation, not a race
+
+That is a substantially better fit for the **argsort / stale-index** candidate than for eviction-timing:
+a stale index slot holds the same stale bytes whenever the same buffer layout recurs, which would give the
+same wrong expert and hence the same wrong text.
+
+It also fits something the issue had not connected: a specific repeated sentence is what you would see if
+the model were answering a **different prompt** - i.e. if it were reading another request's context. That is
+a hypothesis the argsort candidate does not predict, and it is testable from the recorded text: if the
+9-fold sentence is a plausible answer to one of the harness's OTHER prompts (the distractors or the
+"Continue the story" mix), then Face B is cross-request contamination rather than a wrong expert.
+
+### Immediate, cheap check (recorded, not yet run)
+The harness's prompts are deterministic and known. Check whether that 105-character sentence - or a prefix
+of it - appears as a normal (accepted) output of any OTHER arm or cell. If it does, a clean arm already
+produces that sentence for some prompt, and Face B is a request/context mix-up. If no clean arm ever
+produces it, the sentence is unique to the corrupt state.

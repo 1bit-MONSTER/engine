@@ -312,17 +312,32 @@ entry: the cause site is still not located, so the issue remains OPEN.
 
 ### The condition that governs the fault: measured, and it is occupancy, not the instrument
 
-A census of **every recorded arm on the box** (all `315*-console.log` under `~/wt`, 1,675 lines, every
-line matching `arm [qelc]: (OK|FAULT|OOR|INVALID)` parsed for cell, `gtt_start`, `gtt_now`) gives:
+A census of every recorded arm on the box (all `315*-console.log` under `~/wt`, 1,675 lines, every line
+matching `arm [qelc]: (OK|FAULT|OOR|INVALID)` parsed for cell, `gtt_start`, `gtt_now`) pools to:
 
 ```
     gtt_start=97G:  OK=150  FAULT=8    rate =  5.1%
     gtt_start=98G:  OK=145  FAULT=64   rate = 30.6%
 ```
 
-A six-fold difference between adjacent 1 GiB bands. The split is **not** an artifact of cell
-composition: excluding the forcer cell `e` entirely it survives (5.1% vs 26.2%), and it holds *within*
-each cell — `l` 6.0%->24.8%, `c` 2.2%->29.5%.
+**BUT THIS POOLED SPLIT IS CONFOUNDED AND MUST NOT BE READ AS A PROPERTY OF THE LEVEL.** Compared
+within a single console — one session, one instrumentation — it does not survive:
+
+```
+    315ctl1 (NO forcer)   97G: 10 OK / 1 FAULT = 9.1%    98G: 15 OK / 1 FAULT = 6.2%   <- no level effect
+    315disc2 (WITH forcer) 97G: 12 OK / 0 FAULT = 0.0%    98G:  1 OK / 5 FAULT = 83.3%
+```
+
+The whole pooled effect is carried by the forcer run, i.e. the 98G population is dominated by forcer
+arms and the **forcer**, not the level, produced those faults. Within-cell breakdowns do not rescue it,
+because cells are not independent of instrument (cell `e` is *defined* by having the forcer).
+
+What is supported: the forcer causes faults (0/22 -> 7/10 pooled, arm A 4/4, arm B faulting with the fix
+on); and individual arms have drifted into a high band and faulted while doing so (arm A quiet r2
+97->102G; arm B cell `c` 97->106G). Isolated observations, not rates. The level question is open and is
+what the pre-registered `315gttstep` run exists to test. See
+`docs/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`, whose correction section carries the
+within-console numbers.
 
 This reconciles four observations that previously did not fit together: the 0/70 campaign (run at 97G,
 the 5% band, where ~3.6 faults were expected and 0 observed, P~3%) is a genuine low-band measurement and

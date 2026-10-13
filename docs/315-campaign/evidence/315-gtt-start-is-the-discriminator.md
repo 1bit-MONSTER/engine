@@ -106,3 +106,49 @@ fault-rate populations in every cell measured, and no cell's own label explains 
 confirmation is a single pre-registered run with the cell fixed and the start value stepped (97/98/99),
 which would also give the boundary's sharpness. That run is the obvious next experiment and is cheap —
 it needs no forcer, no watcher and no build change, only a controlled set of in-regime arms.
+
+---
+
+# IMPORTANT CORRECTION (same day) — the pooled 97/98 split does NOT survive within-console. Confounded.
+
+The census above pools heterogeneous runs, so the right control is to compare 97G against 98G **inside a
+single console** (one session, one instrumentation, one condition). Doing that breaks the finding:
+
+    315ctl1-console.log    97G: 10 OK / 1 FAULT =  9.1%     98G: 15 OK / 1 FAULT =  6.2%
+    315disc2-console.log   97G: 12 OK / 0 FAULT =  0.0%     98G:  1 OK / 5 FAULT = 83.3%
+
+`315ctl1` — which ran **without the eviction forcer** — shows **no level effect at all** (9.1% vs 6.2%,
+slightly inverted, on n=11 and n=16). The whole pooled 6x effect is carried by `315disc2`, which ran
+**with** the forcer.
+
+So the pooled table is confounded exactly as it looked dangerous: the 98G population is dominated by
+**forcer runs**, and the forcer — not the level — is what produced those faults. The within-cell
+breakdown I offered as the confound check does not rescue it either, because the cells are not
+independent of the instrument: cell `e` is *defined* by having the forcer, and the `c`-cell 2.2%->29.5%
+split comes from runs where the forcer was also present in the session.
+
+## What is actually supported
+
+- The **forcer** causes faults (7/10 vs 0/22 pooled; arm A 4/4; arm B faulting with the fix on). That
+  stands and is a controlled intervention.
+- A **single arm** drifted into the band and faulted while doing so (arm A quiet r2, 97->102G), and arm
+  B's cell-`c` fault drifted 97->106G. These are individual observations, not rates.
+- `gtt_start=98G` is **associated** with faults in the pooled corpus, but association here is
+  confounded by instrument and does **not** establish the level as the cause.
+
+## What is NOT supported, and must not be cited
+
+- "Fault probability is governed by `gtt_start`" as a rate statement.
+- "5.1% at 97G vs 30.6% at 98G" as a property of the level.
+- "The 0/70 campaign is explained by running in the 5% band" — with the level effect unestablished, the
+  0/70 run may equally be explained by having had no forcer at all, which its own file already said.
+
+## What this changes
+
+The pre-registered `315gttstep` experiment (`315-gttstep-preregistration.md`) becomes **more** necessary,
+not less: it is now the only way to test the level question, because the corpus cannot separate level
+from instrument. Its design is already correct for this (cell fixed to `q`, no forcer), and its branch
+"rates equal -> refuted at this design" now looks like the likelier outcome on `ctl1`'s evidence.
+
+The KNOWN-ISSUES update that cites the census as the governing condition must be corrected to carry this
+caveat, or it will record a confounded rate as a mechanism.

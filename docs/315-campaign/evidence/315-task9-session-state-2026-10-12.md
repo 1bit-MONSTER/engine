@@ -2346,3 +2346,54 @@ forbids: acting while the mechanism is unnamed, and shipping a change no evidenc
 This is recorded as a RESOLVED-CONDITION, not a skip-to-avoid-work: the condition was actively
 evaluated with three instruments and a source audit, and every one of them came back negative for a
 mechanism. The honest state is that the issue's own candidate family is exhausted by measurement.
+
+---
+
+## DECISION: the available mechanism tests were evaluated and NOT run — with the numbers (07:45)
+
+Rather than leave "we could still run something" implied, the one remaining untested instrument was
+checked to a decision. Recording it because the reasoning is the deliverable.
+
+### What `GGML_HRX_FA_PARTIAL_ALIGN` actually is (read at source, not assumed)
+The record called it "the #123 repro's stress knob". Reading the call site corrects that:
+`dispatch-flash-attention.cpp:384-386`
+
+    if (decode_split_partial_alignment() != 4096u) {
+        return {};   // DECLINE -> fall back to flash_attention_f32_f16_wmma
+    }
+
+and the comment at :380-383 says the non-production layout is a "test rig whose safety is not
+established, so DECLINE ... rather than run an unproven layout". So setting it to 256 does not
+reproduce the dangerous layout - it makes the dispatch REFUSE the decode-split kernel and fall back.
+It is a path-elimination switch, not a stress. (The knob IS compiled into the arm build:
+`315instr3-build/.../dispatch-flash-attention.cpp.o` contains the string, and it exists at the arm rev
+`e44c9d01a`.)
+
+### Decision analysis at the measured rate (p = 2/27 = 0.074)
+A pilot is affordable only at <=14 pairs (2.2 h) against ~2.4 h of remaining budget.
+
+    Outcome A: pilot FAULTS. P = 0.884 if the rate is unchanged. Learned: the decode-split FA
+               kernel is not required. That is a NEGATIVE about one kernel, not a mechanism - and we
+               already know faults occur on two cells/binaries at cwsr=1.
+    Outcome B: pilot CLEAN. P(clean | FA irrelevant) = 0.116 - i.e. roughly one time in nine a
+               clean result would be a coincidence. Its suggested follow-up is exactly the static
+               search already run to conclusion (no surviving #140-class handoff in GLM's path), and
+               the only stronger experiment (the movement denial) costs 6.3 h.
+
+    Cost: the entire remaining box-time budget.
+    Neither branch closes criterion 1.
+
+**Not run.** Spending the last 2.2 h of a 12 h ceiling on a test whose clean branch is a 1-in-9
+coincidence and whose faulting branch yields a negative would be the same calibration error that
+sank P1. The honest move is to stop and report.
+
+### The general shape of why every instrument failed here
+Each designed test assumed a rate that could produce a decisive result. The measured rate is ~7%,
+not the 26% the instruments were powered against, so EVERY test built on 26% lost its power when the
+rate moved: P1 (0.21-0.46 chance of a clean arm B), this pilot (0.12 chance of a clean run by
+coincidence at the affordable size), and the campaign-of-record's own >=60-arm bar (which passed at
+0/70 but is now known to describe a configuration that also faults 7% of the time at cwsr=1).
+
+That is the single most useful thing this turn produced: **the rate changed, and it invalidated the
+power analysis behind every instrument in the issue's toolkit.** Any future attempt must first
+re-measure the rate at the configuration of interest, then size its experiment from THAT number.

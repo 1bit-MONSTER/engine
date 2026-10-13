@@ -1860,6 +1860,15 @@ Both remain open. This is the honest state: the mechanism CLASS is named to the 
 root-cause text and the trigger/cause distinction is settled, but the specific surviving site is not
 located, and criterion 1 needs a named falsifiable mechanism rather than a class.
 
+## LIVE POSITION (05:45) - control at 9/20 pairs
+
+    315ctl1   cwsr_enable=1   9/20 pairs   fix-cell: 8 clean, 1 FAULT, 0 OOR
+                                        control-cell: 3 clean, 0 faults
+              watcher alive, ppid=1 (detached), boot 04:53:19, ~11 pairs remain (~50 min)
+
+The one fault is `pair 8 arm l`, Face B, in-regime at 97G. Everything below is preparation for
+reading the final tally, plus the static search that has now been exhausted.
+
 ## Static search, round 2 (05:57) - q6_k head kernel excluded as cross-dispatch, not intra-kernel
 
 Screened GLM's `loom-libs/ops` path for kernels with subgroup-scoped fences and zero global fences:

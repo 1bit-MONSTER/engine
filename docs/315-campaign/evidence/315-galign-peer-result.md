@@ -94,3 +94,53 @@ The sixth family. With it, the closed set is:
     graph reorder (GGML_HRX_GRAPH_ORDER)       REFUTED   (cell e 4/4 both arms)
     deferred host writeback                    CLOSED    (binding host_data == nullptr)
     FA alignment / dispatch (#140 class)       RETIRED   (both alignments fault, on GLM)
+
+---
+
+# Correction: n=1 per alignment cannot TEST the contrast — it can only fail to contradict it
+
+Re-reading the FA retirement's basis before relying on it further, and it is weaker than the section above
+implies. This is recorded as a correction, not a caveat.
+
+## The power problem
+
+At the rate the forced-eviction cell actually runs (~95%: 41 faults in 43 arms), a **single** arm per
+alignment has almost no chance of *not* faulting:
+
+    P(fault | align=4096) = 0.95
+    P(fault | align=256)  = 0.95
+    -> observing 1 fault at each alignment is the EXPECTED outcome under the hypothesis that the
+       alignment makes no difference
+
+So the run's result is consistent with "no difference" — but it is *equally* consistent with "a real
+difference smaller than the noise floor of a single arm". To distinguish "256 faults 95% and 4096 faults 95%"
+from "256 faults 95% and 4096 faults 60%", one arm each is nowhere near enough: the second case also
+frequently produces one fault per arm.
+
+Concretely, with n=1 per cell, the experiment has essentially **no power to detect an alignment effect**
+unless the effect were large enough to make one of the arms *clean* — and at a 95% base rate even a clean arm
+is only ~5% likely, which is exactly the fluke the peer's replication header mistook for a result
+(`315-galign-label-discrepancy.md`).
+
+## What the retirement can and cannot rest on
+
+- **Can rest on**: the FA family is not *sufficient* to explain the fault, because in the same session at
+  `align=256` — the layout the #140 oracle used to *expose* the divergence — cell `e` still faulted. That is
+  a one-sided statement and it is what the data supports.
+- **Cannot rest on**: "the two alignments have the same rate." That requires several arms per alignment, and
+  the pooled 95% base rate makes the required n larger than it first appears: distinguishing 95% from 60% at
+  80% power needs roughly 20 arms per arm-of-the-experiment, not 1.
+
+## What the running replication would establish
+
+The peer's `315galign2` repeats both alignments in one composition, which is the right structure. But if it
+again yields one arm each, it inherits the same power problem and its result should be cited as "again
+consistent with no difference", not as a measured null. A decisive version needs the arm count the power
+calculation above implies.
+
+## Effect on the six-family table
+
+The FA row is downgraded from **RETIRED** to **"not sufficient"** — the same strength as the earlier
+coherence and GRAPH_SYNC rows, which were also one-sided nulls. It is not re-opened as a *candidate* (nothing
+positive supports it), but it is no longer presented as retired on a measured null, because no measured null
+exists.

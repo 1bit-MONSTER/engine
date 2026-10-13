@@ -4526,3 +4526,39 @@ thing an over-eager write-up would smooth over.
  - "outputs already disagree" is measured on the eight identical greedy requests only. Whether the
    DISAGREEMENT is in the logits or in the sampling is not resolved by this data - that needs the
    fingerprint, which is the instrument that the arena-read problem defeated.
+
+---
+
+## CONTRACT CHECK: the falsified-levers list, re-read against the current candidates (15:30)
+
+The objective's verification contract requires: "Re-read the issue's falsified-levers list and confirm the
+claimed mechanism is not one of them; if it is, the fix is rejected." Re-run because the candidates have
+changed since the last check (commit a3012b8).
+
+The list, verbatim from `KNOWN-ISSUES.md` §"Levers tested and excluded":
+
+    1. GGML_HRX_TRANSIENT_REUSE=legacy
+    2. Placement advice on the transient arena's committed backing
+    3. The staged host writeback path
+    4. The direct device-to-host copy not being covered by the wait
+    5. Pinning f2099e9b7 (an ancestor - i.e. a revert)
+    6. The TRANSIENT_REUSE knob (restatement of 1)
+    7. The sleeping wait returning before completion
+
+Case-insensitive search of that section for the current candidate families:
+
+    argsort | route | expert | index | moe   -> 0 matches   NOT on the list
+    coherent | host-read | memcpy            -> 0 matches   NOT on the list
+
+So the LEADING candidate (the argsort/rank scatter leaving a stale expert index, driven by the eviction
+trigger) is **not** one of the falsified levers, and neither is the refuted coherent-read candidate. The
+check passes for both.
+
+Note the check's limitation, unchanged from the earlier run: it is about the CHANGE, not the mechanism. Any
+eventual fix has to be re-checked against this list on its own terms - e.g. a fix that merely made the
+transient arena resident would land on item 2's family and be rejected regardless of the mechanism.
+
+### Also confirmed: the eviction-intervention result is not a falsified lever
+The trigger finding (83% of eviction-cell arms fault vs 3.8% of controls) is an experimental result, not a
+lever, and it is not on the list. The list's items are all "things that were tried as fixes and did
+nothing", which is a different category.

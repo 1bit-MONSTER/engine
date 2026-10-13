@@ -882,3 +882,67 @@ criterion 2 should not be claimed.
 
 20 commits on `1bit/315-preregistration`, pushed. Box left clean: no 315 processes, box lock released,
 `~/npu.lock` free, GTT 26 GiB, only the two pre-existing foreign Vulkan servers on the render node.
+
+---
+
+# UPDATE 12 (2026-10-13 ~11:15) — RE-SCOPE PREPARED; PUSH BLOCKED BY EXPIRED CREDENTIALS
+
+## The re-scope
+
+The user chose to widen the scope to the loom/IREE codegen lane and to redefine criterion 3 to the
+faulting band. Writing the revision turned up a fact that changes what "widening" means:
+
+**The barrier-emission surface is already in scope.** The boundaries include "the
+1bit-MONSTER/llama.cpp ggml-hrx side", and the hazard/ordering machinery §33 left as the one standing
+question lives *inside ggml-hrx* at the pin (`e44c9d01a`):
+
+    ggml/src/ggml-hrx/runtime/graph-record-order.cpp    <- RangeHazards, the byte-range hazard recorder
+    ggml/src/ggml-hrx/runtime/graph-program-cache.cpp
+    ggml/src/ggml-hrx/dispatch/command-plan*.{cpp,h}
+    ggml/src/ggml-hrx/kernel-corpus/kernels/loom-libs/ops/*.loom    (59 files, in-repo)
+
+So no external toolchain is needed to ask §33's question. What stays out of scope is the **loom/IREE
+compiler** itself (`~/amd-oss/hyperloom-toolchain`, TheRock/loom): reading an emitted `.loom` in the
+corpus is in scope; changing the loom compiler is not.
+
+Three specific bounded checks are named, each of which could silently drop a producer/consumer pair
+(`315-rescope-ground-truth.md`):
+
+1. `update()` clears `readers` on a write, so a later reader depends only on the last writer;
+2. `collect()` and `update()` are separate calls, so correctness depends on their ordering relative to
+   barrier insertion;
+3. `kMaxTransientExtent = 16 MiB` (`graph-record-order.cpp:29`) names a transient-extent cap whose
+   hazard behaviour for larger spans is unread.
+
+The full revised objective is written out at
+`docs/315-campaign/evidence/315-PROPOSED-RESCOPED-OBJECTIVE.md`, with the established-facts list, the
+re-scoped criteria, the revised boundaries and the added constraints.
+
+## PUSH IS BLOCKED — credentials expired mid-session
+
+Earlier pushes succeeded (`58e7ba1..b2a706d` are on origin). The final two commits **cannot be pushed**:
+
+    e4699c4  315: proposed re-scoped objective for the user to apply
+    f8656d4  315: re-scope ground truth - the barrier-emission surface is ALREADY in scope
+
+`git push` fails with "could not read Username for 'https://github.com'", and `gh auth status` reports
+"The token in default is invalid" for account `bong-water-water-bong` — a re-authentication
+(`gh auth login -h github.com`) is needed by the user. This is a credential problem, not a repo problem:
+21 of 23 session commits are on `1bit/315-preregistration`.
+
+The two unpushed commits are documentation only (no code) and are preserved three ways:
+
+    local branch 1bit/315-preregistration (HEAD = e4699c4)
+    bundle        /home/bcloud/315-unpushed-20261013-1115.bundle
+    plain files   /home/bcloud/315-PROPOSED-RESCOPED-OBJECTIVE.md, 315-rescope-ground-truth.md
+
+## Goal state
+
+The goal remains **blocked** pending the user's `/goal-resume` with the revised objective: the goal tools
+expose no direct objective-edit call, so the revision is applied by the user. The box is clean and free.
+
+## What the next turn should do
+
+1. Push the two pending commits once credentials are restored.
+2. Apply the re-scoped objective.
+3. Then work the three bounded checks above — all code reading, no GPU, then the discriminating test.

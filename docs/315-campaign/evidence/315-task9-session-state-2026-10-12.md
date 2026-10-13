@@ -3669,3 +3669,74 @@ The next step is NOT a codegen expedition. It is to test (d), the most specific 
 concrete reported defect: ordered comparisons make ranks non-unique when a row contains NaN, so a slot
 is left holding its previous content. That is a *stale read* of exactly the kind the eviction trigger
 would produce - and it is in a kernel I can read and test locally.
+
+---
+
+## THE SPECIFIC CAUSE CANDIDATE IS VERIFIED ON GLM'S PATH (11:50)
+
+Pursued (d) from the narrowing above, and it holds up at every link of the chain. This is the first
+candidate since the read path whose mechanism, site, and consumer are all concrete and in scope.
+
+### 1. The defect, read at source
+`ggml/src/ggml-hrx/kernel-corpus/kernels/loom-libs/ops/small_rows_f32.loom`, the ARGSORT rank loop
+(`:141-156`):
+
+    %rank = scf.for %other = [0, cols)(%count = 0) {
+      %value   = view.load %input_view[%row, %other]
+      %greater = scalar.cmpf ogt, %value, %mine      <- FALSE if either is NaN
+      %less    = scalar.cmpf olt, %value, %mine      <- FALSE if either is NaN
+      %equal   = scalar.cmpf oeq, %value, %mine      <- FALSE if either is NaN
+      %earlier = index.cmp ult, %other, %element
+      %tie_before = scalar.andi %equal, %earlier
+      %strict  = scf.select %want_descending, %greater, %less
+      %before  = scalar.ori %strict, %tie_before
+      %step    = scf.select %before, %c1, %c0
+      %next    = index.add %count, %step
+    }
+    view.store %element_i32, %output_view[%row, %rank]     // SCATTER by rank
+
+When `%mine` is NaN every comparison against it is false, so it contributes nothing to any rank; when
+`%value` is NaN that pair also compares false. The ranks therefore **stop being a permutation**, and
+because the write is a **scatter** (`element -> slot rank(element)`), a rank that is never produced
+leaves its slot **never written**. Verified there is no initialisation of the output before the
+scatter: no memset/fill/clear on that path.
+
+So a row containing NaN yields an output row with a slot still holding **whatever the buffer held
+before** - and the buffer is a reused transient, which is precisely why the eviction trigger matters.
+
+### 2. The stale value is an INDEX, not a float
+`%element_i32` is stored, i.e. the argsort output is `i32`. So the unwritten slot holds a stale *expert
+index*, and indices are consumed structurally (as gather/table bases) rather than numerically. This is
+the class the issue's own section 51 called out: "every other candidate in this issue leaves a *value*
+wrong; this one leaves an *index* stale, which is precisely what the routed path consumes."
+
+### 3. The chain to GLM's MoE, confirmed end to end
+    src/llama-graph.cpp:1932   selected_experts = ggml_argsort_top_k(ctx0, selection_probs, n_expert_used)
+    src/llama-graph.cpp:1934   cb(selected_experts->src[0], "ffn_moe_argsort", il)      <- the label
+    dispatch_registration/qwen/dispatch-moe-router.cpp:218-228
+                               finds the GGML_OP_ARGSORT consumer of the softmax and requires it to be a
+                               DESCENDING argsort                                     <- matches the
+                                                                                        want_descending
+                                                                                        path above
+    src/llama-graph.cpp:1939   cb(selected_experts, "ffn_moe_topk", il)                <- the consumer
+
+GLM uses the deepseek2 builder (`src/models/deepseek.cpp`), whose `build_moe_ffn` is this code, so the
+argsort IS on GLM's prefill and decode path.
+
+### 4. Why this fits the A/B result and the trigger
+ - the corruption is an untouched **index slot in an intermediate routing tensor**, upstream of the
+   MoE aggregation and far upstream of the logits - so a coherent logits read changes nothing, exactly
+   as the A/B measured;
+ - KNOWN-ISSUES already records the first NaN-bearing node at the **MoE aggregation** with exactly one
+   token's row affected, and a stale expert id is precisely a per-token, per-row defect;
+ - section 50 measured NaN in `ffn_moe_weights` where its source `ffn_moe_probs` was finite - a gather
+   producing NaN from a finite source is what a corrupt/stale index does;
+ - and the eviction trigger supplies the "buffer held something else" precondition by moving/recycling
+   the transient between writes.
+
+### What is NOT yet established
+That this is THE cause rather than A defect. It needs a test, and there is a cheap one: the slot that is
+never written should be detectable directly - instrument or infer which rank is missing for a NaN row
+and check whether a faulting arm's route ids contain a duplicate or out-of-range id. Section 51 recorded
+that the ids diagnostic in one earlier build was MIS-SPECIFIED (`oor` compared against `ne0`, which for
+the top-k view is `k`, not the expert count), so a correct ids check has not yet been run.

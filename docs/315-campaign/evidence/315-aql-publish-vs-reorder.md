@@ -102,3 +102,42 @@ commit loop at `:584-590`, the single doorbell at `:661`, the commit contract in
 
 That dossier is a peer agent's work product, not this goal's evidence, and it is cited as a pointer only.
 Its own §11 defects table concerns HIP-layer diagnostics and ABI coverage, not this question.
+
+---
+
+# Kernarg publication checked: the discipline is correct, so the reorder is the only order-changing step
+
+Following the commit contract's explicit claim that it orders "prior writes to the packet's fields **and
+to kernarg memory**", the kernarg path was traced to see whether it introduces its own ordering gap.
+
+`host_queue_submission.h:210`:
+
+    // Publishes host-populated queue-owned kernargs before committing packet
+    // headers that reference them. Callers must have already written all kernarg
+    // bytes for |submission|.
+    static inline void iree_hal_amdgpu_host_queue_publish_submission_kernargs(...) {
+      if (submission->kernargs.blocks) {
+        iree_hal_amdgpu_kernarg_ring_publish_host_writes(&queue->kernarg_ring);
+      }
+    }
+
+and the adjacent comment states the split of responsibility:
+
+    // CPU-side publication and device-side acquisition are independent: coherent host
+    // memory needs no explicit publication step but still crosses from the host agent to
+    // the GPU agent.
+
+The call sites put this **before** the commit loop (`host_queue_command_buffer_block.c:571` publish,
+`:584-590` commit), and the acquire side is raised to `IREE_HSA_FENCE_SCOPE_SYSTEM` via
+`iree_hal_amdgpu_host_queue_kernarg_acquire_scope`. That is the correct order — publish, then commit,
+with the device acquiring at SYSTEM scope.
+
+**So there is no ordering gap in the publication machinery itself.** The only step that changes the order
+the CP observes, relative to the order the graph was recorded in, is the **graph reorder**
+(`order_prepared_commands_for_graph`), because it is the only thing that rewrites the command list before
+emission. Everything downstream — kernarg publication, commit, doorbell — preserves whatever order it is
+handed, and preserves it correctly.
+
+That sharpens the A/B: with the publication discipline cleared, `GGML_HRX_GRAPH_ORDER=program` isolates
+the reorder as the sole order-changing variable, which is exactly the intervention the pre-registration
+describes.

@@ -61,3 +61,51 @@ its own neighbour/regime lines, and was stopped before any `round N arm X:` line
 - Lesson re-recorded (extends the existing "never build from a copied build dir" trap): **one tag, one
   driver, on a shared box.** Publish a tag only after the run it names has started, or use a tag that
   cannot be guessed and re-used by a peer session.
+
+---
+
+# CORRECTION (2026-10-13 10:50) — THIS INCIDENT WAS A MISDIAGNOSIS. There was no second session.
+
+This file is retained rather than deleted, because the false record is itself instructive — but its
+central claim is **wrong** and must not be cited.
+
+## What was actually seen
+
+`pgrep -af "315-disc.sh 4 315ab1b2"` matched **two** pids:
+
+    2033289  bash /home/bcloud/wt/315-disc.sh 4 315ab1b2      # the driver
+    2181579  bash /home/bcloud/wt/315-disc.sh 4 315ab1b2      # <- read as a second session
+
+## What it actually was
+
+`2181579`'s `ppid` is **2033289** — it is the driver's **own child**, the per-arm subshell, which
+carries the same command line by construction. Same for the earlier "duplicate": the shape that looked
+like "a second driver on one tag" is what one driver looks like under `pgrep`, because the parent shell
+and its per-arm child share the command line.
+
+The corroborating evidence that *should* have caught this and did not:
+
+- `pgrep -P 2033289 -a` lists the driver's children, and the arm server (port 19309, outdir
+  `315ab1b2-r2q`) plus its detector sit under a `315-disc.sh` child — the normal arm structure;
+- the "second session" never had its own console, its own lock, or its own outdir — it had none of the
+  things a real second session would need.
+
+## What was also true, and is the real lesson
+
+`/tmp/... box.lock` is held by the *single* driver and its children, and the run was never contended.
+No arm was ever scored by a competing writer, so the arm-A result and the arm-B run were **never**
+endangered, and the "discard tag 315ab1b" decision was unnecessary. `315ab1b` was abandoned for no
+reason; only its own incompleteness (it was superseded by the re-run) matters.
+
+## Which of this file's lessons survive
+
+Only one, and it is a different one than written: **a `pgrep` count of a recursive shell script is not
+a count of sessions — check `ppid` before concluding contention.** The original "one tag, one driver on
+a shared box" advice is still sound practice, but it was not the thing that happened here.
+
+## Disposition
+
+- `315ab1b2` is the arm-B run of record and was never contended; its results stand.
+- No further action on the "collision". The `315ab1b2` launch guard is harmless and may stay.
+- The goal was, however, genuinely being driven from two front-ends (this session and the `pi-315` tmux
+  pane, both owner `01a1356c`) — that is a real coordination hazard, but it did not cause this.

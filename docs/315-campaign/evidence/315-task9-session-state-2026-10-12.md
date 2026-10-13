@@ -2786,3 +2786,26 @@ Method note: the first attempt at this probe returned 0 everywhere because `grep
 newline into a shell arithmetic expansion, which failed silently and printed 0. Re-ran with the count
 normalised and it worked. Recorded because a silent 0 from a broken probe is indistinguishable from a
 true 0, which is exactly the failure mode that would have made this negative.
+
+---
+
+## 315disc2 IS RUNNING (09:28) — the eviction-intervention replication
+
+    driver : ~/wt/315-disc.sh 6 315disc2   (the SAME frozen design as disc1)
+    started: 2026-10-13T07:20:44-03:00, composition 3 neighbours at gtt=79G
+    cells  : q (quiet) / e (evictonly 500) / c (CPU pressure), rotating per round
+    gate   : gtt_start >= 95 GiB; OOR reported, not counted
+    pre-reg: docs/315-campaign/evidence/315-eviction-replication-preregistration.md (commit 36f360a)
+
+First arm observed: `round 1 arm q: OK nan=0 req=66 gtt_start=97G` (in-regime, clean), with the
+eviction cell then entering and `evictonly` confirmed ACTIVE.
+
+    pre-registered prediction : e faults clear of q and c
+    pre-registered branches   : e clear of q,c  -> REPLICATED
+                                all alike       -> NOT replicated
+                                controls fault  -> CONTRADICTED
+                                all clean       -> UNINFORMATIVE (declared so in advance, because at
+                                                   the measured ~5-7% ambient rate ~16 arms is expected
+                                                   clean most of the time)
+
+Waiter task `b4c7ae24f` will report the per-cell tally on completion (~40 min).

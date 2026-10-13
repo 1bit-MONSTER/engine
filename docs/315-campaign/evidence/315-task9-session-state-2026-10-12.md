@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4613,3 +4597,58 @@ correlational claim.
 Note also that the four control faults now include a `c`-cell (CPU-pressure) fault, and several control
 faults sit on arms whose GTT had drifted into the band - consistent with the recording that the operative
 variable is memory pressure rather than the forcer process.
+
+---
+
+# CORRECTION: the "9-fold sentence" is the model's NORMAL ANSWER, not a corruption signature (15:15)
+
+The recording detector (built this turn) settled a claim I had made earlier from grep evidence, and it
+**refutes my own previous section**. Recording it immediately.
+
+### What I claimed
+That the 105-character sentence
+
+    "We'll assume the reader has a basic understanding of LLMs but wants to understand the internal mechanics."
+
+was "unique to the corrupt state", based on a search of every arm's `server.log` that found it only in
+rejected (parser-error) contexts and never in a clean arm.
+
+### What the recorded text shows
+`315text1` ran the frozen rig with the recording detector, and comparing the two arms' recorded responses
+for the harness's identical prompt:
+
+    315text1-r1q   verdict OK      records=66   identical-block=8   starts-with-sentence=8 of 8
+    315text1-r1e   verdict FAULT   records= 6   identical-block=3   starts-with-sentence=3 of 3
+
+**The CLEAN arm produces that sentence on all eight identical requests.** It is simply GLM-4.7-Flash's
+normal answer to the prompt *"Explain in detail how a transformer language model generates text, step by
+step, including attention, the KV cache and sampling."* - a 105-character response that the harness's
+detector then feeds into a `/completion` continuation, and which the chat-template parser rejects in the
+Face-B arms because it is not Content-only shape.
+
+### Why the earlier evidence misled me
+The grep found the sentence only in `unparsed Content-only output:` lines because that string is the
+**only place the content is written to the log at all** - normal responses are not logged verbatim by the
+harness. So "appears only in rejected context" was an artifact of WHERE the harness logs text, not of
+where the sentence occurs. That is the fourth time on this issue that a logging artifact has produced a
+false signal, and it is the same class as the console-vs-detector and grep-invalid-UTF-8 traps.
+
+### What survives, and what does not
+REFUTED: "Face B's modal output is a stable wrong generation" - the output is the correct, expected answer
+for that prompt. Face B is the parser rejecting a NORMAL reply, not a corrupted one.
+
+STANDS (the determinism split, which does not depend on this): Face B arms were `idn=1` in 52 of 52
+measurable arms while Face A arms were nondeterministic in 84% of short arms. That is measured from
+`identical_distinct` and is unaffected by the sentence correction.
+
+IMPLICATION, and it is a real one: if Face B's text is the model's ordinary answer, then Face B is not
+"wrong text" at all - it is *correct text that the harness's own parser path mishandles*. That reframes
+Face B as possibly a HARNESS/format issue rather than a corruption, which the issue's own section 44
+already half-suggested ("that makes Face B a text-level failure") and which the objective explicitly
+counts as first-class ("Face B is a first-class acceptance criterion").
+
+That reframing needs its own check before it is asserted: whether a clean arm EVER produces the same text
+through the same path without the parser rejecting it. In `r1q` the sentence appears in responses that
+were ACCEPTED (the arm is OK, 66 ok requests), so the same text is fine in one arm and rejected in another
+- which would mean the rejection is path/state dependent rather than text dependent. That is the next
+measurement and it is now cheap because the text is recorded.

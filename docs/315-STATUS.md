@@ -1214,3 +1214,76 @@ count says otherwise, and the cheap measurement should have preceded the static 
 | 3 | >=60 in-regime arms, zero faults | **not met**; the 0/70 has no eviction cell |
 | 4 | no regression | CI gates all green (were red); controls need a landed fix to compare |
 | 5 | KNOWN-ISSUES updated | done |
+
+---
+
+# UPDATE 16 (2026-10-13 ~16:05) — six families closed, the trigger quantified, and the fix question answered
+
+Consolidates the stretch since UPDATE 15.
+
+## The trigger, finally stated without the confound
+
+Using the **quiet cell** — the one cell where no forcer can be blamed — across every recorded console:
+
+    cell q (QUIET, no side load)          cell e (evictonly forcer)
+      gtt_start=44G   0%  (n=4)             gtt_start=44G   0%  (n=4)
+      gtt_start=97G   5%  (n=39)            gtt_start=98G  95%  (n=43)
+      gtt_start=98G   0%  (n=2)
+
+So `gtt_start` alone does **not** govern the fault (quiet is 0% at 98G against 5% at 97G — my earlier
+retraction was right), while the forcer at 98G is **95%**. The sharpest statement available:
+
+    ambient (quiet)             ~5%
+    with forced KFD eviction    ~95%      a 19x contrast, same workload, same level
+
+This removes the instrument confound that made the earlier pooled 97/98 census unusable, and it is what
+criterion 1's trigger clause needed.
+
+## Six families closed by discriminating experiment or mechanism
+
+| family | disposition | how |
+|---|---|---|
+| logits **read path** (`hrx_synchronous_d2h`) | REFUTED | its own pre-registered A/B (cell e 4/4 with knob on) |
+| **host side** (all four `0x52` accesses) | CLOSED | none on the decode path |
+| runtime **AQL submission policy** | CLOSED | the runtime does not infer memory hazards |
+| **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | REFUTED | cell e 4/4 FAULT in BOTH arms |
+| **deferred host writeback** | CLOSED | binding `host_data == nullptr` (measured) |
+| **FA alignment/dispatch** (#140 class) | RETIRED | the peer's GLM run: both alignments faulted |
+
+The FA retirement rests on the peer's GLM run (`315galign`), where **every arm faulted** — `align=4096`
+Face B, `align=256` on the identity check, and even the quiet cell. The pre-registered branch
+"`align=256 ~= align=4096`" is met, and §57 pre-committed to leaving the FA path on that outcome.
+
+## Criterion 2 answered structurally (not by absence)
+
+`315-no-fix-available.md`: the engine validates **program structure** (`verify_command_program`,
+`validate_program_constant_access`) and never **memory contents**; the only content check is
+`std::isnan(logits[i])` in the sampler, and it is Face-A only. So nothing on the replay → restore → consume
+path can distinguish "the bytes are what the device wrote" from "the bytes are a pre-eviction stale copy".
+
+A repair would therefore have to (a) make the runtime guarantee restore fidelity — **out of scope** (the
+driver/runtime lane the boundaries exclude), or (b) scrub NaNs — a **workaround**, Face-A only, which the
+issue's own rule forbids recording as a limitation until the mechanism is named. Four ordering/coherence
+changes have already been tried and falsified.
+
+**Criterion 2 is not achievable within scope on present evidence.**
+
+## Process notes worth keeping
+
+- My Qwen-based `align` attempts were **uninformative twice** (38 s at 47 GiB; then a `sudo -n tee` that
+  wrote nothing). The peer's GLM run settled the question in one. **Use the faulting workload and the
+  established classifier**, not a convenient substitute.
+- My writeback probe produced a **false positive** (a grep matching its own header) before yielding a sound
+  negative. Both defects are recorded in place.
+- The peer's replication header misstates its own first result (`align256-e` **was not clean**); flagged in
+  `315-galign-label-discrepancy.md` so a "both fault" outcome is not read as a surprise.
+
+## Criteria
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named, falsifiable mechanism | trigger **named, replicated, and now quantified** (5% vs 95%, 19x, confound removed); **cause not located** — six families closed |
+| 2 | forward-only fix landed | **not achievable within scope** — structural argument, `315-no-fix-available.md` |
+| 3 | >=60 in-regime arms, zero faults | **not met, and the gate is mis-specified**: "in [95,110]" is satisfiable by quiet arms at the 5% ambient rate, which is exactly what the recorded 0/70 did. A claim the defect is gone must run the **forcer** cell |
+| 4 | no regression | all seven recorded CI gates green (they were red: copyright restored, `check_pins` gap closed); controls still need a landed fix to compare |
+| 5 | KNOWN-ISSUES updated | done |

@@ -3127,3 +3127,33 @@ remains unidentified, so no forward fix is landable.
 0 HRX0 holders, GTT 26 GiB, VRAM 0, locks free, no watcher, load 0.24, drop-in present with
 cwsr_enable=0 in 3 grub entries (shipped boot state). Live cwsr=1 until a reboot (not taken
 unilaterally).
+
+---
+
+# THE PERFECT PER-ARM CORRELATION (09:05) — every fault is an evictonly arm, no others
+
+The disc2 console records the side-load state on EVERY arm, which gives a per-arm covariate rather than
+just a per-cell tally. The result is a clean separation:
+
+    arm type                    side= field      count
+    FAULTING                    1/1  (evictonly)     5   <- every single fault
+    clean, quiet cell           0/0  (none)          6
+    clean, CPU-pressure cell    12/12 (CPU workers) 6
+
+    thermal_pauses on the 5 faulting arms : all 0
+    thermal_pauses on the 1 clean e arm   : 0
+
+So **every fault occurred in an arm where the eviction side-load was engaged (`side=1/1`), and no fault
+occurred in any arm with no load (`0/0`) or CPU-only load (`12/12`)**. There is no faulting arm outside
+the intervention and no clean arm inside it. And `thermal_pauses=0` across all six eviction arms rules
+out thermal throttling as the mechanism for the effect.
+
+The driver's own final summary agrees (its per-cell counts are authoritative; the waiter's and my own
+greps had both counted `gate wait` lines as arms):
+
+    cell q: OK=6 FAULT=0 OOR=0 INVALID=0
+    cell e: OK=1 FAULT=5 OOR=0 INVALID=0
+    cell c: OK=6 FAULT=0 OOR=0 INVALID=0
+
+This is about as clean a separation as an intervention study can produce at this size: the covariate
+that predicts the fault is exactly the one the hypothesis names, with no exceptions on either side.

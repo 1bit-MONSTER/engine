@@ -87,6 +87,26 @@ A NaN-only count records the second face as a clean run, which is what makes it 
 must be: an arm is **valid only if it completes `mixed: 50 of 50 ok`**; an arm that aborts early has reduced
 exposure and is excluded, not counted as clean.
 
+**When each face appears, with timestamps (2026-10-13).** Both faces were captured in the same 20-pair control
+run and their logs give the sequence rather than a verdict, which sharpens what a mechanism must explain:
+
+    Face A  (p16c)  0:10.67  model loaded / listening
+                    0:11.11  first request (task 0) launched
+                    0:11.28  HRX returned NaN logits: count=154880 of 154880, [0..154879], contiguous=yes
+                    0:11.28  sampling.cpp:620 aborts -> backtrace, process dies (105-line log vs a clean arm's 485)
+                    -> the FIRST request, 165 ms of compute in, the WHOLE vocabulary, process does not survive
+
+    Face B  (p8l)   0:40.20  printing 96-token eval timings, 21 completions already OK
+                    1:31.42  Content-only parse rejects one output -> HTTP 500
+                    -> ~90 s in, after 21 good completions, ONE degenerate output, process survives
+
+So Face A is an **initialisation-adjacent whole-buffer** failure on the first request, and Face B is a **late,
+partial content** failure inside an otherwise working server. That is a materially different pair of signatures
+from "intermittent corruption somewhere in a run", and it means the defect is already present at
+load-completion - it does not need a long generation phase to appear. It does NOT follow that a warmup-targeted
+experiment is cheaper: the model load is ~10-15 min and dominates every arm regardless of how many requests
+follow, so a warmup-only arm costs about the same as a full one while yielding half the arms.
+
 ### Levers tested and excluded
 
 - **`GGML_HRX_TRANSIENT_REUSE=legacy`** — no effect. 15-arm matched study, alternating control and legacy

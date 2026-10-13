@@ -3157,3 +3157,91 @@ greps had both counted `gate wait` lines as arms):
 
 This is about as clean a separation as an intervention study can produce at this size: the covariate
 that predicts the fault is exactly the one the hypothesis names, with no exceptions on either side.
+
+---
+
+# ####################################################################
+# THE CAUSE IS NAMED: buffer_get's memcpy reads a non-coherent mapping
+# without invalidating, on the very buffer the fault corrupts
+# ####################################################################
+# 2026-10-13 09:15 — the code site criterion 2 needs
+
+## The mechanism, read from the source
+
+`ggml/src/ggml-hrx/ggml-hrx.cpp`, allocation (lines 305-312):
+
+    const bool host_visible = type_context->host_visible;
+    const bool direct_host_binding = host_visible && type_context->device->use_direct_host_bindings;
+    if (host_visible) {
+        memory_type = HRX_MEMORY_TYPE_HOST_LOCAL | HRX_MEMORY_TYPE_DEVICE_VISIBLE;
+        if (direct_host_binding) {                       // OFF by default
+            memory_type |= HRX_MEMORY_TYPE_HOST_COHERENT;
+        }
+    }
+
+and mapping (lines 329-333):
+
+    uint8_t * base = reinterpret_cast<uint8_t *>(GGML_HRX_FAKE_PTR_BASE);
+    if (host_visible && size > 0) {
+        hrx_buffer_map(allocation, HRX_MAP_READ | HRX_MAP_WRITE, 0, size, &mapped);
+        base = static_cast<uint8_t *>(mapped);           // non-FAKE_PTR -> the memcpy path
+    }
+
+and the read (`buffer_get`, lines 238-256):
+
+    if (context->base != reinterpret_cast<uint8_t *>(GGML_HRX_FAKE_PTR_BASE)) {
+        std::memcpy(data, context->base + source_offset, size);   // <-- plain memcpy
+        return;
+    }
+    hrx_synchronous_d2h(...);                                     // <-- NOT taken for host_visible
+
+So for a host-visible buffer - and the logits are host-visible, confirmed by the allocation trace
+(`[hrx-buf] type=HRX0_HOST host_visible=1 ... size=619520`, the 619520-byte logits allocation) - the CPU
+read is a **plain `memcpy` from an `mmap`'d region that is NOT marked coherent**. There is no cache
+invalidate anywhere on this path: `grep -n "invalidate\|flush\|clflush"` over `ggml-hrx.cpp` returns
+nothing except the coherence-attribute assignment itself.
+
+## Why that is sufficient to produce both faces
+
+A `memcpy` from a non-coherent device mapping is only guaranteed to observe the device's writes if the
+CPU's view of that region is invalidated first. `llama_get_logits_ith` does call `ctx->synchronize()`
+(`src/llama-context.cpp:3728-3729`), and §55/§56 traced that to `hsa_signal_wait_scacquire` with a
+timepoint covering the last submission - so **stream ordering** is present. What is absent is
+**cache coherence on the CPU read**.
+
+That distinction is exactly what the fault's shape requires:
+ - if the invalidate is missing and the mapping still holds the CPU's stale line, the reader sees
+   whatever was there before the device wrote: a **previously-evicted page's recycled contents**
+   (finite garbage -> degenerate text -> **Face B**, HTTP 500), or **unwritten/poison bytes**
+   (-> whole-vocabulary NaN -> **Face A**, sampler guard aborts);
+ - eviction of the in-flight work is what makes the physical page differ from what the CPU cached,
+   which is why **forced eviction drives it to 70%** while a quiet box (0/10) and CPU-only pressure
+   (0/12) do not.
+
+## Why the earlier coherence patch failed, in this reading
+
+`~/wt/315-coherence-fix.patch` made `HRX_MEMORY_TYPE_HOST_COHERENT` unconditional on the allocation.
+It was tested and FALSIFIED as a fix (315accept: 9 clean + 1 fault / 10). This mechanism *predicts* that
+outcome: setting the coherence **attribute** on the allocation does not add an invalidate to the CPU
+**read**. If the read path is the problem, the fix has to be at the read, not at the attribute - which
+is why the attribute-only change left the fault rate unchanged. That is a consistency check the earlier
+work could not make because it had no mechanism.
+
+## The candidate forward-only fix, and its exact form
+
+`buffer_get` must not plain-`memcpy` out of a non-coherent mapping. Two forward-only options:
+
+ (a) **invalidate/refresh the mapping before the memcpy** on the host-visible path (the minimal change:
+     one guarded call at `ggml-hrx.cpp:250-255`);
+ (b) **route host-visible reads through `hrx_synchronous_d2h`** (the handle-based copy the non-mapped
+     path already uses), which re-establishes the device as the source of truth.
+
+Either is engine/fork-side, additive, and does not move a pin backwards - so it satisfies criterion 2's
+"forward-only, not a revert" requirement. **NOT YET IMPLEMENTED OR TESTED**, and this is a hypothesis
+with strong structural support (the read path, the allocation flags, the two observed faces, the
+falsified-attribute result) rather than a verified repair.
+
+## What would test it cheaply - and this is the point of the whole turn
+The forced-eviction rig is now a **70% fault rate**, so a candidate fix needs **~5 arms per cell, not
+60**: a q/e/c run of 3-4 rounds with the fix in the binary would settle it in ~20 minutes. That is the
+experiment the rate-raiser makes affordable, and it is the direct path to criterion 2.

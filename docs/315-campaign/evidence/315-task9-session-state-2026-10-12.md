@@ -1362,3 +1362,37 @@ cwsr=1 AND a live watcher. Its test is already pre-registered above (P2/P3):
         baseline currently on the record (~228 evictions/arm at 97G, n=4).
   - P3: a faulting arm with ZERO evictions for its own pid refutes H2' outright.
 Until a fault lands, both remain untested and H2' remains a candidate, not a finding.
+
+## P1 EXECUTION SHAPE — read before running (2026-10-13 05:32)
+
+Read the wrapper end-to-end to get the invocation right rather than guessing. Two facts decide
+P1's shape:
+
+ 1. `315-evict-trace.sh <PAIRS> <TAG> [FIX_BIN] [CTRL_BIN]` ends by calling
+    `FIX=$FIX CTRL=$CTRL TAG=$TAG PAIRS=$PAIRS bash 315-campaign.sh`, and `315-paired-pidcap.sh`
+    alternates cell `c` = CTRL bin and cell `l` = FIX bin within ONE composition.
+ 2. `EXTRA_ENV` is threaded per arm and is NOT cell-selective (315-paired-pidcap.sh:66-67).
+
+CONSEQUENCE: a single paired run cannot express P1. If EXTRA_ENV were set, BOTH cells would get
+it. P1 therefore must be run as TWO SEPARATE RUNS, each with both cells on the same build, with
+the env as the only difference between the runs:
+
+    # run A - movement allowed (baseline): both cells on the same build, no extra env
+    315-evict-trace.sh <PAIRS> 315p1a <SAMEBIN> <SAMEBIN>
+    # run B - direct coherent bindings: identical, plus the env
+    EXTRA_ENV="GGML_HRX_USE_UNIFIED_MEMORY=1" 315-evict-trace.sh <PAIRS> 315p1b <SAMEBIN> <SAMEBIN>
+
+With FIX_BIN == CTRL_BIN the c/l split becomes a same-build A/B repeat, which is what P1 wants.
+<SAMEBIN> should be the build the cwsr0 campaign actually used, so run A doubles as the
+movement-allowed control at cwsr=1 and is directly comparable to the historical 34/131.
+
+Also inherited from the wrapper (do not rediscover these):
+ - the watcher must run as root or the trace is silently header-only (`sudo -n` required);
+ - `NOLOCK=1` is REQUIRED when called through the wrapper (it holds box.lock on fd 9 and npu.lock
+   on fd 8); the driver re-opening box.lock without it deadlocks (observed in run 6);
+ - `MINCLEAN` is a goalpost not a floor - the wrapper sets it unreachable on purpose, and passing
+   a small value ends the run early (which killed the first launch after pair 1);
+ - `NOSTOP=1` keeps a fault from aborting a diagnostic run, which P1 needs since faults are the
+   signal;
+ - the wrapper also polls for foreign `-dev HRX0` holders because box.lock alone does not exclude
+   peers who ignore the convention.

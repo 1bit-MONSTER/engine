@@ -2184,3 +2184,63 @@ The one experiment that could still rescue a movement-dependent mechanism is P1 
 cwsr=1 via GGML_HRX_USE_UNIFIED_MEMORY): if faults vanish with movement denied, movement is
 necessary even though not rate-correlated; if faults persist, movement is irrelevant. P1 is
 copy-pasteable and ready.
+
+---
+
+## EVIDENTIAL GAP FOUND: the cwsr=0 drop-in's verbatim content was never recorded, and the backup is gone (07:12)
+
+The control removed `/etc/default/grub.d/amd_cwsr.cfg` and the box now runs `cwsr_enable=1`. The
+ledger's rollback path (`~/work/amd_cwsr.cfg.backup`, md5 `a8b25738...`) **does not exist** - not at
+`~/work/`, not anywhere under `$HOME` (searched). The repo recorded only the PATH and the md5, never
+the bytes:
+
+    docs/315-campaign/evidence/315-task9-session-state-2026-10-12.md:833
+      "The drop-in was captured verbatim to ~/work/amd_cwsr.cfg.backup before the reboot."
+      ... but the file is absent and no copy of its content appears in the repo.
+
+Also gone as a source: the grub.cfg that the cwsr=0 boot used was regenerated at 04:52, so the old
+entry is not in it either.
+
+**This is a real process failure of mine and it is recorded rather than papered over**: a rollback that
+lives only at a path, with the content nowhere durable, is not a rollback. Had the box needed
+restoring and the file been lost before the campaign, the cwsr=0 configuration would have had to be
+reconstructed from semantics rather than restored from evidence.
+
+### What IS recoverable, and how
+The semantics are fully pinned by the investigation, even though the bytes are not:
+ - the drop-in existed solely to put `amdgpu.cwsr_enable=0` on the kernel cmdline - that is the
+   entire point of the cwsr work, and both campaign consoles record `cwsr_enable` state;
+ - the file's purpose, effect and the reboot it required are documented in the control script's own
+   header (`315-cwsr-control.sh:1-14`) and in the ledger;
+ - the house format is a `grub.d` fragment setting `GRUB_CMDLINE_LINUX_DEFAULT`, which
+   `/etc/default/grub.d/kdump-tools.cfg` demonstrates on this box;
+ - `ttm.pages_limit=31457280 ttm.page_pool_size=31457280` are already in the main `GRUB_CMDLINE_LINUX_DEFAULT`
+   and in the CURRENT `/proc/cmdline`, so a reconstruction must APPEND to those, not replace them.
+
+### The gap's consequence for the record
+ - No result in this issue depends on the missing bytes: every arm's `cwsr_enable` state was observed
+   live from `/sys/module/amdgpu/parameters/cwsr_enable`, not inferred from the drop-in. The campaign
+   consoles and the pre-flight checks all read the live parameter.
+ - The criterion-1 conclusion is unaffected: the control's fault rate (2/27, both faces) was measured
+   with `cwsr_enable` read live as 1.
+ - So this is a durability/process defect in the rollback procedure, not an evidence defect in any
+   finding. Recorded as such.
+
+### Action taken (DONE 07:20)
+ 1. the content is now COMMITTED at docs/315-campaign/evidence/amd_cwsr.cfg (commit 9df9efb), so the
+    rollback is durable in the repo rather than only at an ephemeral path;
+ 2. the drop-in was written back to the box and grub regenerated:
+        /etc/default/grub.d/amd_cwsr.cfg  md5 e20f05bf91d50b645c0fbc8d11998e86
+        sudo update-grub -> "cwsr_enable=0" appears in 3 entries of /boot/grub/grub.cfg
+ 3. so the box's BOOT CONFIGURATION is restored to the shipped cwsr=0 state. The RUNNING kernel is
+    still cwsr=1 until the next reboot (mounting it now would reboot the box; that is a deliberate
+    choice left to the user rather than taken unilaterally, since the campaign work is finished and
+    nothing is waiting on it).
+
+NEW md5 for any future rollback check: e20f05bf91d50b645c0fbc8d11998e86
+(the OLD a8b25738... is unrecoverable and must not be cited again).
+
+### What P1 would need before it can run
+P1's pre-condition is cwsr_enable=1, which the RUNNING kernel already provides. So P1 can run on the
+live boot as-is; it does NOT require the reboot. The drop-in restore above changes only what the NEXT
+boot will do, which is the correct shipped state to leave behind.

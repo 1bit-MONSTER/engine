@@ -4062,3 +4062,41 @@ Build **one** device-side or coherent capture of the routing indices, then the a
 testable in ~2 arms at an 86% fault rate. That is a focused, bounded piece of fork-side work, and it is
 the single highest-value thing remaining: it unblocks candidate 1, and candidates 2 and 3 would use the
 same instrument.
+
+---
+
+## THE INSTRUMENT FIX EXISTS AND NEEDS NO BUILD (13:45) — but read the distinction first
+
+The coherence knob is a **runtime flag**, verified at source:
+
+    ggml-hrx.cpp:1182   device_ctx->use_direct_host_bindings = environment_flag_enabled("GGML_HRX_USE_UNIFIED_MEMORY")
+    ggml-hrx.cpp:313   direct_host_binding = host_visible && type_context->device->use_direct_host_bindings
+    ggml-hrx.cpp:320   if (direct_host_binding) memory_type |= HRX_MEMORY_TYPE_HOST_COHERENT
+
+So `GGML_HRX_USE_UNIFIED_MEMORY=1` makes every host-visible allocation **`HOST_COHERENT`** - which is
+exactly the property whose absence made the ids dump read either zeros or another tensor's float bits.
+
+### The distinction that must be stated, because this knob has history
+`GGML_HRX_USE_UNIFIED_MEMORY` (via the `HOST_COHERENT` attribute) was **tested and FALSIFIED as a FIX** -
+`315accept` gave 9 clean + 1 fault in 10, and this turn's A/B independently showed that routing the READ
+coherently does not stop the fault. So:
+
+    as a FIX       : falsified, twice. Do not propose it.
+    as an INSTRUMENT: different claim. The question here is not "does coherence stop the fault" (no) but
+                      "does coherence let the ids dump READ the tensor correctly" (probably yes, since the
+                      failure mode observed - float bits through an i32 view - is precisely the
+                      unsynchronised/incoherent read).
+
+Using it to complete the instrument is therefore legitimate **provided the result is read as a
+measurement of the tensor, not as evidence about the fault's mechanism.** If the ids come out valid (a
+real permutation with small indices) and a faulting arm shows a duplicate, that is evidence for the
+argsort candidate. If the ids are valid and show no duplicate, the candidate is refuted. Either way the
+conclusion comes from the DATA, not from the knob.
+
+### The run to make
+    driver  : ~/wt/315-disc.sh 2 315ids3    BIN=~/wt/315ids-build/bin
+    EXTRA_ENV: GGML_HRX_TENSOR_FP=ffn_moe_topk-1..-4,ffn_moe_argsort-1..-4 (exact suffixed names)
+               GGML_HRX_USE_UNIFIED_MEMORY=1     <- the instrument enabler
+    read    : [hrx-ids-fp] dup_pairs, and FIRST check that min/max are a plausible index range
+              (min>=0, max small). If they are not, the instrument is still not reading the tensor and
+              the run is uninformative regardless of what dup_pairs says.

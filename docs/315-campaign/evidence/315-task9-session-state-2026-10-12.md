@@ -62,6 +62,23 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
          The only lever-check CLEAR result is a residency-style preference, which the tool itself
          flags as not confirming any mechanism.
 
+    H2 IS TESTABLE FOR THE FIRST TIME ON THIS RUN (verified 05:15)
+      The H2 discriminating test needs a per-arm PID; every previous run failed that:
+        run 7      PID contaminated (no per-arm attribution)
+        315disc1   0 server.pid files
+        315cwsr70  0 faults -> nothing to compare
+      This control satisfies the whole chain:
+        1. server.pid per arm   5 of 5 arms (315-paired-pidcap.sh:78 writes it)
+        2. detector.json per arm 4 of 5
+        3. SMI stream           alive, 841 KB, watcher pid 8916
+        4. PROC_START resolves  for each arm pid (1 row each)
+        5. Q_EVICT rows present 3695 already - evictions are actively occurring
+      => when faults land, read the PRE-FAULT column (the causal test):
+         ~/wt/315-evict-per-arm.py ~/wt/rt-det 315ctl1-console.log --smi ~/wt/315ctl1-evict/kfd_smi.tsv --tag 315ctl1
+      Prediction if H2 holds: faulting arms show MORE pre-fault evictions than clean arms
+      at the same GTT. If faults land with NO eviction excess, H2 dies too and criterion 1
+      has no surviving candidate - that outcome must be reported honestly, not papered over.
+
     GOAL STATE
       criterion 3  MET    315cwsr70: 70/70 fix-cell arms, 0 faults, CI 3.14%, all in-regime
       criterion 1  open   no mechanism named; H2's carrier contradicted by the AMD refs

@@ -81,3 +81,53 @@ So criterion 2 is **not achievable within this goal's scope on present evidence*
 disposition is that the issue closes with the trigger named and replicated, six cause families closed, and
 the fix question assigned to the out-of-scope runtime lane. That is a conclusion about the *fix*, reached
 after the cause search, not a substitute for it.
+
+---
+
+# Face B already has a detector — which closes the last "detect and recover" avenue
+
+The one remaining shape a forward-only change could have taken was *detect the corruption and refuse or
+recover*, on the theory that the engine was serving bad data silently. Read at the pin, that avenue is
+already closed for both faces.
+
+## Face A — detection exists
+
+`common/sampling.cpp:598-620`: the sampler scans the logits, and on NaN logs
+`HRX returned NaN logits: count=… of …, contiguous=…, continuing=no` and **aborts** unless
+`GGML_HRX_NAN_CONTINUE` is set. So Face A is detected and fails loudly, by construction.
+
+## Face B — detection also exists, at the parse site
+
+`common/chat.cpp:3290-3291`:
+
+    LOG_WRN("%s: unparsed %s output: %s\n", __func__, common_chat_format_name(params.format), ...);
+    LOG_DBG("%s: full %s output triggering error:\n=== BEGIN ===\n%s\n=== END ===\n", ...);
+    throw std::runtime_error(std::string("The model produced output that does not match the expected ")
+                             + common_chat_format_name(params.format) + " format");
+
+So the engine **already logs the offending text** and **throws** — the HTTP 500 the issue records *is* the
+detector firing. There is no silent-corruption gap to close: the failure is not being swallowed.
+
+## Why that forecloses the detect-and-recover avenue
+
+A forward-only change of the form "notice the corruption and do something better" has nothing to add:
+
+- Face A already aborts (and the scrub option already exists, and is a workaround);
+- Face B already logs and throws, with the full text in the debug log;
+- neither detector can **distinguish** "the model genuinely emitted malformed text" from "the model emitted
+  correct text into a buffer that a restore left stale". The information is not present at either site —
+  which is the same conclusion as the section above, reached from the detection end rather than the data
+  end.
+
+So the two arguments agree: the engine can see *that* something is wrong (both faces) but cannot see
+*why*, and the "why" is a device/runtime restore-fidelity question that the goal's boundaries place out of
+scope.
+
+## Net
+
+Criterion 2 has no achievable forward-only form within scope:
+
+    repair the stale bytes            -> needs runtime restore fidelity   (out of scope)
+    detect and refuse                 -> ALREADY DONE for both faces      (nothing to add)
+    re-read / re-run after sync       -> performance-destroying, and null on the record (GRAPH_SYNC p=1.00)
+    reorder / re-fence the read       -> tried four times, all falsified

@@ -225,3 +225,43 @@ The replication was extended from two arms to four precisely because a single ar
 at a ~95% base rate (the power point raised in the correction above). Four arms with zero clean results does
 not by itself reach the n a two-sided contrast needs, but it does make "the FA class is not sufficient"
 robust: four independent opportunities for `align=256` to come back clean, and none did.
+
+---
+
+# Final tally (5 arms) — and the quiet cell faulted at 98G, twice now
+
+The peer's run completed with five arms:
+
+    gb4096-e   align=4096  cell=e  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+    gb256-e    align=256   cell=e  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+    gb4096-e2  align=4096  cell=e  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+    gb256-e2   align=256   cell=e  FAULT-A  resp=66  http500=1  content_only=2  nan_guard=0
+    gb4096-q   align=4096  cell=q  FAULT-A  resp=66  http500=0  content_only=0  nan_guard=0
+
+Pooled with the first run, cell `e`:
+
+    align=4096:  2 of 2 arms faulted
+    align=256:   2 of 2 arms faulted
+    -> every eviction-cell arm faulted, both alignments, across two runs
+
+## The quiet-cell fault, and why it now needs a second look
+
+`gb4096-q` faulted **in the quiet cell at `gtt_start=98G`**. My pooled tally
+(`315-quiet-vs-forcer-by-level.md`) has the quiet cell at **0% at 98G (n=2)** and 5% at 97G (n=39), and
+treated the *earlier* peer quiet-cell fault as an outlier on that basis.
+
+With a **second** quiet-cell fault at 98G, that reading needs revising: quiet at 98G is now 1 fault in 3
+arms pooled (this file's arm plus the earlier `ga4096-q`, against 2 clean). That is still consistent with a
+low rate, but it is **no longer zero**, and the n=2 on which the "0% at 98G" rested is now the weaker leg of
+that file's argument.
+
+What is unaffected: the **cross-cell contrast at matched level**. Cell `e` at 98G is ~95% (41/43) against a
+quiet rate that is now bounded well below it regardless of the exact quiet figure. The claim "the forcer
+dominates by roughly an order of magnitude" survives; the specific "quiet is 0% at 98G" does not, and is
+corrected here.
+
+## Reading against the pre-registration
+
+For the alignment question the branch is unchanged: **both alignments fault, 2 of 2 each**, meeting the
+pre-registered "no difference" outcome that §57 pre-committed to abandoning the FA path on — stated
+one-sidedly, since n=2 per alignment still cannot bound a *rate* difference.

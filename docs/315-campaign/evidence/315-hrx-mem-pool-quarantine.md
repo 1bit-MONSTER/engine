@@ -232,3 +232,48 @@ So the useful residue is a **named, documented contract** (logical-free vs physi
 dependencies) that a stale read could violate — and the question of whether HRX's pool is even involved when
 KFD evicts underneath it. Both need either an API addition or a different instrument; neither is in scope as
 a change.
+
+---
+
+# DEAD END: the engine never calls the pool API — the lead is closed
+
+Checked the reachability question the file above left open, and it resolves **against** the lead.
+
+## The engine does not touch the pool
+
+    git grep -c "mem_pool" e44c9d01a -- ggml/src/ggml-hrx/     ->  ZERO hits
+    grep "hrx_mem_pool_create" in libhrx/src/libhrx/*.c (excl. mem_pool.c)  ->  no internal callers
+
+So `hrx_mem_pool_*` is a public surface with **no consumer on GLM's path, and no internal user in the
+runtime**. The quarantine/`inflight_allocation_count`/retirement-reuse machinery is therefore **not
+reachable** during a GLM decode, and its contract cannot be the carrier of the fault.
+
+## What the engine actually uses
+
+Counting the runtime symbols the engine calls:
+
+    hrx_buffer_release              21
+    hrx_allocator_allocate_buffer    5
+    hrx_buffer_retain                4
+    hrx_buffer_map                   2
+    hrx_buffer_export_dmabuf         2
+
+i.e. **`hrx_allocator_allocate_buffer` directly, plus `hrx_buffer_release`** — the raw allocator, bypassing
+the pool layer entirely (consistent with the recorded trace showing the logits as a `HRX0_HOST` allocation
+rather than a pooled one).
+
+## Where the residue of the lead actually is
+
+The pool's documented "retain reservations for later **stream-ordered reuse**" discipline is a pool-layer
+concept. If an equivalent discipline exists on the **allocator/buffer** path — the one the engine really uses
+— that is where any stale-read surface would be, and it is a different function set
+(`hrx_allocator_allocate_buffer`, `hrx_buffer_release`, and whatever they call).
+
+That is the honest redirection: the *shape* of the lead (retire → reuse window) may still be worth checking,
+but it must be checked on the allocator path, not the pool path, because the pool is unreachable.
+
+## Standing
+
+This closes the pool variant. It does **not** close "an allocation is reused before every consumer is done"
+as a class — that now needs to be looked for in `hrx_allocator_allocate_buffer` / `hrx_buffer_release` and
+their callees, which is a fresh, bounded read.

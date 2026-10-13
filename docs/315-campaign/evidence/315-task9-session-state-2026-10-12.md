@@ -4252,3 +4252,56 @@ change, no coherence problem.
 ### Honest caveat
 This is instrumentation, not a result. It makes the test POSSIBLE; it does not answer it. And it cannot be
 run until the box is free, since the arm's text only exists if the arm runs.
+
+---
+
+# NEW POPULATION-LEVEL SIGNAL (14:35): Face A is nondeterministic, Face B is not — across 468 arms
+
+Found by re-reading ALREADY-COLLECTED data (no box time). This is the first new signal about the
+mechanism in several hours, and it comes from a field the issue had only ever read as a boolean.
+
+### The data
+Every arm directory with a `detector.json`, classified by face and tabulated against
+`identical_distinct` (the number of distinct outputs among the harness's EIGHT identical greedy requests,
+so `1` = fully deterministic):
+
+    verdict      n     identical_distinct distribution
+    OK          372    1 in 372        (100% deterministic, no exceptions)
+    FAULT-B      37    1 in 33, None in 4    (never > 1)
+    FAULT-A      59    1 in 39, 2 in 11, 3 in 3, 4 in 3, None in 3
+
+### What it says
+ - **374 clean arms were deterministic without a single exception.** So `idn > 1` is never a property of
+   normal operation on this build.
+ - **Face B is deterministic.** 33 of 37 produced a value and every one was `1`. A parser-500 arm
+   generated the same text for all eight identical requests and *then* failed to parse. So Face B is not
+   a per-request race; the arm's computation was reproducible and the output was reproducibly
+   unacceptable.
+ - **Face A is often nondeterministic**: 17 of 56 with a value (30%) disagree with themselves across
+   eight identical greedy requests. A server that returns NaN for some identical requests and not others
+   is showing genuine run-to-run variation within one arm.
+
+### Why this matters for the mechanism
+It separates the two faces on a dimension nothing else has:
+
+    Face B  deterministic  -> the corruption REPRODUCES for the same input; a stable wrong computation
+    Face A  nondeterministic -> the corruption VARIES run to run; a moving target
+
+The argsort/stale-index candidate predicts **deterministic** corruption for the same input (a stale index
+slot holds the same stale bytes if nothing rewrote it), which fits Face B well and Face A poorly. The
+eviction-during-a-live-write candidate predicts **nondeterministic** corruption (whether the write lands
+before the read depends on timing), which fits Face A and not Face B's determinism.
+
+So the population data suggests the two faces may have DIFFERENT proximate origins even while sharing the
+eviction trigger - which is a real constraint, and it contradicts the issue's own section 44 conclusion
+that they are one mechanism with two observables. That conclusion rested on seven Face-B arms; this is 37,
+with a clean comparator population of 372.
+
+### Bounds, stated before anyone over-reads it
+ - `identical_distinct` is `None` for arms that aborted before the eight-request block completed, so it is
+   a *conditional* statistic: available for 56 of 59 Face-A and 33 of 37 Face-B arms.
+ - Face A's `idn > 1` could be an artifact of the arm dying between requests rather than of
+   nondeterministic logits - the harness's eight requests are separated by distractors, so an early death
+   truncates the block. That is the FIRST thing to check and it may explain the whole effect.
+ - This is a correlation on recorded data, not a discriminating experiment. It narrows the candidate
+   space; it does not name a cause.

@@ -197,6 +197,13 @@ rules those out across 12 arms.
 - **Face B** ×3 — `nan=0`, `http=1 s500=1 unparsed=2`, the parser rejects the output and returns HTTP 500
   while the server survives.
 
+The console records the side-load state on **every** arm, so the separation is per-arm and not merely
+per-cell: **all 5 faulting arms carried `side=1/1` (evictonly engaged)**, while the clean arms carried
+`side=0/0` (quiet) or `side=12/12` (CPU workers only) — with no faulting arm outside the intervention and
+no clean arm inside it. `thermal_pauses=0` on all six eviction arms rules out thermal throttling as the
+route. Note for anyone reading the logs: the driver's own final summary is authoritative; a naive `grep`
+over the console counts `gate wait` lines as arms and understates the effect.
+
 So a single intervention that isolates eviction from every other factor tested produces **both** faces,
 which is what "one mechanism, two observables" predicts.
 

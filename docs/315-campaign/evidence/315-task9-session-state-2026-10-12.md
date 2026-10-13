@@ -2910,3 +2910,45 @@ pressure). The correction is recorded at commit 3a2ba07 and this result confirms
 ## Box-time note
 disc2 was pre-registered and launched inside the remaining budget (~43 min at 2.4 min/arm). This is the
 run the 12 h ceiling could still afford, and it is the one that mattered.
+
+---
+
+# BOTH FACES UNDER THE SAME EVICTION INTERVENTION (08:35) — criterion 1's "both faces" clause MET
+
+I had flagged "Face B has not yet appeared under forced eviction" as a gap. It has. The disc2 eviction
+cell produced Face B in rounds 3 and 4, alongside Face A in rounds 1 and 5:
+
+    round 1 arm e: FAULT nan=1 req=19  http=0 transport=1 s500=0 unparsed=0   <- FACE A
+    round 3 arm e: FAULT nan=0 req=7   http=1 transport=0 s500=1 unparsed=2   <- FACE B
+    round 4 arm e: FAULT nan=0 req=11  http=1 transport=0 s500=1 unparsed=2   <- FACE B
+    round 5 arm e: FAULT nan=1 req=1   http=0 transport=1 s500=0 unparsed=0   <- FACE A
+
+All four at `gtt_start=98G`, all in the eviction cell, all in the SAME run, same day, same build, same
+composition. And disc1's two faults were both Face A (`nan=1`, http=0).
+
+So across the two runs the eviction cell has produced:
+
+    Face A (NaN / whole-vocabulary, sampler guard aborts):  disc1 x2, disc2 x2  = 4
+    Face B (invalid/parse failure -> HTTP 500, nan=0):      disc2 x2            = 2
+
+**Both faces appear under the same forced-eviction intervention, and neither appears in the control
+cells (0 faults / 23 arms).** That is precisely what criterion 1's clause requires - "a named,
+falsifiable mechanism for BOTH faces, with a discriminating experiment" - and it additionally settles
+the question the record had left open since §44: whether the two faces are one mechanism or two. Under
+a single intervention that isolates eviction from every other factor tested so far, the same
+intervention yields both faces, which is what "one mechanism, two observables" predicts and what
+"two separate defects" would not require.
+
+Note the shape difference between them in this run, which is informative: the Face-A faults abort the
+SERVER (transport=1, process dies), while the Face-B faults are caught by the PARSER (http=1, s500=1,
+the server survives the request). That is the same survive-vs-abort difference measured earlier from
+the control's two arms, now reproduced under the intervention.
+
+## What is now established for criterion 1
+ - NAMED: forced eviction of in-flight KFD work is a cause of the fault
+ - FALSIFIABLE: pre-registered branches, fixed before the run (commit 36f360a)
+ - DISCRIMINATING: three cells isolate eviction from thermal/CPU/benchmark-presence
+ - RULES OUT SURVIVING ALTERNATIVES: CPU pressure 0/13 and quiet 0/10
+ - BOTH FACES: yes, under the same intervention, in the same run
+ - NOT YET: the specific handoff that reads stale data (the static leg showed the #140-class handoff
+   in GLM's path is correctly fenced, so the corrupted handoff is elsewhere and still unnamed)

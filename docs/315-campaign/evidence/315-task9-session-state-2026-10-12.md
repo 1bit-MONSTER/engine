@@ -3475,3 +3475,33 @@ The pre-registered branch of interest is still "arm B clean in cell e while arm 
 Arm A currently has cell `e` at 2 faults and cells `q`+`c` at 1 fault, the latter being the drifting
 quiet arm. If arm B's cell `e` is clean while arm A's is not, the fix holds regardless of the quiet-arm
 episode; if arm B also faults in cell `e`, the fix has not addressed the fault.
+
+---
+
+## ARM A COMPLETE (10:25) — the control is emphatic: 4 of 4 eviction arms faulted
+
+    cell q: OK=3  FAULT=1  OOR=0 INVALID=0     (the one fault is the GTT-drifting arm, recorded above)
+    cell e: OK=0  FAULT=4  OOR=0 INVALID=0     <- 100% of in-regime eviction arms
+    cell c: OK=4  FAULT=0  OOR=0 INVALID=0
+
+Arm A = the PATCHED binary with `GGML_HRX_COHERENT_READ` **unset**, i.e. pre-fix behaviour. It faults
+**4 of 4** in the eviction cell and 0 of 4 in the CPU-pressure cell. So:
+
+ - the rig reproduces on the patched binary in its default state, which is what a valid control needs;
+ - the 4 faults cover both faces across the run (Face A `nan=1 transport=1` and Face B
+   `nan=0 http=1 s500=1 unparsed=2`), matching disc1/disc2;
+ - the one control-cell fault is the quiet arm whose GTT drifted 97G -> 102G, consistent with the
+   operative variable being memory pressure rather than the forcer process.
+
+This makes arm A a strong positive control: any clean eviction cell in arm B cannot be explained by
+"the rig failed to induce".
+
+## Arm B (the fix) is running
+Launched 10:24:45, tag `315ab1b`, same binary, `GGML_HRX_COHERENT_READ=1` added to `EXTRA_ENV`.
+Composition forming at gtt=79G after a thermal pause to 44C.
+
+The pre-registered reading key (commit fc7ffd5) applies unchanged:
+    arm B clean in cell e while arm A faults there   -> H-fix SUPPORTED
+    arm B faults in cell e at a similar rate to arm A -> H-fix REFUTED, the memcpy is not the site
+    arm B faults but arm A does not                   -> CONTRADICTED in direction
+    both clean in cell e                              -> UNINFORMATIVE (and now implausible, since A was 4/4)

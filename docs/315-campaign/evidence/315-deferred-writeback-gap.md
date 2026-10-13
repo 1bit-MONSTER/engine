@@ -146,3 +146,53 @@ This also means the four closed families were worked while a purpose-built instr
 candidate sat unused in the same binary — worth recording as a process observation, not a criticism: the
 instrument was built for a different framing (download fingerprints) and its writeback half had no
 consumer until this lead gave it one.
+
+---
+
+# The queued source is a NON-COHERENT `0x52` mapping — the same type the refuted candidate named
+
+Traced the writeback's source buffer to its allocation, which sharpens this lead from "a deferred read"
+to "a deferred read of the same memory type the refuted fix was about".
+
+Chain (`~/wt/llama-315coherent`, the tree `315coherent-build` came from):
+
+    download_prepared_host_staging(...)                      command-program-executor.cpp:1065
+      for each prepared.host_staging with .download:
+        allocate_mapped_host_staging_buffer(...)             -> download_data (a mapped pointer)
+        hrx_stream_copy_buffer(staging.buffer -> download_buffer)   device -> staging copy
+        add_host_writeback(staging.host_data, download_data, ...)   QUeues: dest=host_data, src=download_data
+
+    allocate_mapped_host_staging_buffer(...)                 runtime/host-memory.cpp:1287
+        hrx_buffer_params_t params = {
+            HRX_MEMORY_TYPE_HOST_LOCAL | HRX_MEMORY_TYPE_DEVICE_VISIBLE,     // :1300   == 0x52
+            HRX_MEMORY_ACCESS_ALL,
+            HRX_BUFFER_USAGE_DEFAULT | HRX_BUFFER_USAGE_MAPPING_SCOPED | HRX_BUFFER_USAGE_MAPPING_PERSISTENT,
+        };
+        hrx_allocator_allocate_buffer(...);
+        hrx_buffer_map(buffer, HRX_MAP_READ | HRX_MAP_WRITE, 0, size, &host_data);   // :1310
+
+So `download_data` — the pointer the deferred `memcpy` reads from, at whatever later moment
+`mark_stream_synchronized()` runs — is a **`HOST_LOCAL | DEVICE_VISIBLE` = `0x52` mapping with no
+`HOST_COHERENT`**: exactly the memory type the read-path mechanism chain named, and exactly the type the
+refuted candidate read, just at a different site.
+
+## Why that makes this materially stronger than the refuted candidate
+
+- **The refuted candidate** read the non-coherent logits mapping at a **single, immediate** point, and its
+  fix (route the read through a coherent queued transfer) was shown not to help — cell `e` faulted 4/4
+  with the fix on (`315-ab1-arm-B-interim.md`).
+- **This one is deferred.** The non-coherent source is read at the *sync point*, arbitrarily later than the
+  device copy that populated it, and the code states the ordering is not otherwise guaranteed. A
+  preemption/eviction landing anywhere in that window is precisely the trigger the pooled rig establishes
+  (28 of 29 eviction-cell arms; `315-pooled-rig-verification.md`).
+- The instrument already in the binary measures exactly this: `rec_hash` at record time vs `sync_hash` at
+  sync time, with `rec_eq_sync=0` marking a source that changed while queued.
+
+## Still not established
+
+- Whether GLM's decode produces `host_staging` buffers with `.download` at all, and therefore whether
+  `pending_host_writebacks_` is ever non-empty on this path. That is what the staged probe
+  (`~/wt/315wb-probe.sh`) answers.
+- Whether the `:994` guard covers every reachable sequence even when the queue is non-empty.
+- It is not a cause; it is a located, self-documented hazard of the right memory type, deferred across the
+  window the trigger opens.

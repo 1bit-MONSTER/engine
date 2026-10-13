@@ -144,3 +144,47 @@ The FA row is downgraded from **RETIRED** to **"not sufficient"** — the same s
 coherence and GRAPH_SYNC rows, which were also one-sided nulls. It is not re-opened as a *candidate* (nothing
 positive supports it), but it is no longer presented as retired on a measured null, because no measured null
 exists.
+
+---
+
+# Replication result: both alignments faulted AGAIN — n=2 per alignment, no difference
+
+`315galign2` completed at 16:19. Raw evidence (distinct-response counts, re-derived from the per-response
+files, not the console labels):
+
+    run         align=4096                     align=256
+    galign1     63 distinct of 66  (FAULT)     66 distinct of 66  (FAULT)
+    galign2     66 distinct of 66  (FAULT)     66 distinct of 66  (FAULT)
+
+with both of galign2's arms at `gtt_start=98G` and `nan_guard=0`.
+
+## What this changes
+
+**n is now 2 per alignment, and no arm was clean.** That matters because the replication was framed as
+testing a 4096-faults / 256-clean asymmetry (`315-galign-label-discrepancy.md` showed that premise was
+wrong about galign1). The useful outcome is the opposite of what it was looking for: it **strengthens** the
+one-sided conclusion.
+
+    align=4096, cell e:  2 faults in 2 arms
+    align=256,  cell e:  2 faults in 2 arms
+
+## What it still does not do
+
+The power correction stands (`315-galign-peer-result.md`, earlier section): at the ~95% base rate, n=2 per
+alignment still cannot distinguish "both 95%" from "95% vs 60%" at reasonable power — the required n for that
+contrast is roughly 20 per condition. So the honest statement remains **one-sided**, and is now simply
+better supported by more arms:
+
+> the FA alignment/dispatch class is **not sufficient** to explain the fault: at `align=256` — the layout the
+> #140 oracle used to *expose* the divergence — the forced-eviction cell still faulted, in 2 of 2 arms
+> across two independent runs.
+
+That is the same strength as the coherence and `GRAPH_SYNC` rows, and it is what the entry now claims. It is
+**not** a measured null.
+
+## Note on the replication's framing
+
+Its header said it was testing whether the "align4096-e FAULT-B / align256-e CLEAN" asymmetry held. Neither
+run shows that asymmetry: galign1 had `align256-e` faulting on the identity check, and galign2 has both arms
+faulting. So the replication answered a question it did not intend to ask, and the answer is the pre-registered
+**"no difference"** branch — which §57 pre-committed to abandoning the FA path on.

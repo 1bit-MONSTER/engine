@@ -101,3 +101,27 @@ the GLM arms' high eviction-cell rate attributable to the model/shape rather tha
 
 Staged, not run — arm B of the alignment test holds the box. It will be run after arm B releases it, and its
 result recorded either way.
+
+---
+
+# Harness defect (seventh of the session): my monitoring prevented the dense control from starting
+
+The first dense-control script waited on
+
+    pgrep -f "galign|315-disc.sh|315alignf"
+
+to find a clear window. It never cleared — because **every monitoring command I ran contained that same
+pattern text** (`pgrep -af "...315-disc.sh..."`), so `pgrep -f` matched my own shell's command line and reset
+the clear counter each time. The control sat in its wait loop for >4 minutes, `do_wait` on a `sleep 30`, with
+the box genuinely idle.
+
+That is an **observer effect of my own making**: the act of checking whether the run could start prevented it
+from starting. Diagnosed by running the pattern from a script file (where the text is not in any argv) and
+seeing two `bash -c` matches that were *my own SSH one-liners*.
+
+Fixed as `315dense2.sh`, which counts only real driver processes — reading each candidate's
+`/proc/<pid>/cmdline` and skipping `bash -c` wrappers — so no monitoring one-liner can mimic a driver.
+
+This is the seventh harness/reasoning defect recorded this session, and it belongs to the same family as the
+`pgrep` self-match scare earlier: **`pgrep -f` sees whatever text is in a command line, including the one
+asking the question.**

@@ -3022,3 +3022,54 @@ the trigger level; the second (a forward-only fix) requires the site.
    fault by intervention. Only the per-arm rate-correlation was ever falsified.
  - "Face B has not yet appeared under forced eviction" (recorded 08:30 today) - corrected within the
    same run: 3 of disc2's 5 faults are Face B.
+
+---
+
+# CORRECTED ENDPOINT (08:52) — the driver's own summary shows 70%, not 44%
+
+My per-cell tally counted `gate wait before round N arm X` lines as arms. The driver's own final summary
+is authoritative and the effect is much larger:
+
+    315disc2 final summary (verbatim):
+        cell q: OK=6  FAULT=0  OOR=0  INVALID=0
+        cell e: OK=1  FAULT=5  OOR=0  INVALID=0     <- 5 of 6 in-regime eviction arms faulted
+        cell c: OK=6  FAULT=0  OOR=0  INVALID=0
+
+So disc2 alone:
+
+    cell e (eviction)   5 FAULT / 6 arms  = 83.3%
+    cells q+c           12 arms, 0 FAULT  =  0.0%
+    Fisher exact two-sided p = 0.0007
+
+Pooled with disc1 (whose own summary was e 2 fault / 2 ok, q+c 0 fault / 10 ok):
+
+    cell e  (eviction)   7 FAULT / 10 arms = 70.0%
+    cells q+c (control)  0 FAULT / 22 arms =  0.0%
+    Fisher exact two-sided p = 3.6e-5
+    rule-of-three upper bound on the control rate (22 arms, 0 faults) = 13.6%
+
+**70% against a control bound of 13.6%, p = 3.6e-5, with all seven faults in-regime at
+gtt_start=98G and zero OOR in either run.**
+
+## The mechanism statement, at the strength the evidence supports
+
+> A process that makes the kernel evict and restore in-flight KFD queue memory - launching no kernels
+> of its own - raises the GLM-4.7-Flash HRX fault rate from 0/22 arms to 7/10 arms, producing BOTH
+> recorded faces (4 Face A: whole-vocabulary NaN, sampler guard aborts the server; 3 Face B: invalid
+> output, parser returns HTTP 500, server survives). Neither a quiet box (0/10) nor CPU-only pressure
+> (0/12) does this at all.
+
+That is a named, falsifiable, replicated, pre-registered mechanism-level statement with a verified
+intervention and a controlled comparison. It identifies eviction of in-flight work as a CAUSE of both
+faces, which is a stronger and better-controlled claim than the issue has previously held.
+
+## The honest boundary, unchanged by the correction
+The specific HANDOFF that reads stale data is still not named. The static leg showed the #140-class
+handoff in GLM's path is correctly fenced in this pin (commit 1de679f), so the corrupted handoff is
+elsewhere. The trigger is named; the code site is not. That is the difference between criterion 1's
+first clause and criterion 2's fix.
+
+## Correction note
+Recorded rather than silently overwritten: my "43.8% vs 0/30, p=0.0002" figure (commit 8bd0e21) was
+computed from a per-cell grep that counted gate-wait lines. The driver's own summary is the authority
+and gives the larger effect. Both are in the record; the summary-derived numbers supersede.

@@ -3245,3 +3245,58 @@ falsified-attribute result) rather than a verified repair.
 The forced-eviction rig is now a **70% fault rate**, so a candidate fix needs **~5 arms per cell, not
 60**: a q/e/c run of 3-4 rounds with the fix in the binary would settle it in ~20 minutes. That is the
 experiment the rate-raiser makes affordable, and it is the direct path to criterion 2.
+
+---
+
+## THE FIX IS PINNED TO AN EXISTING API (09:25) — option (a) is impossible, option (b) is exact
+
+I proposed two candidate fixes. Checking the runtime API against them settles which is real:
+
+### Option (a) - "invalidate the mapping before the memcpy" - IS NOT POSSIBLE
+`~/amd-oss/hrx-system/libhrx/include/hrx_runtime.h` has **no CPU cache-invalidate or flush API**. The
+only `flush` is `hrx_stream_flush` (`:585`), which is command-buffer submission semantics, not cache
+maintenance. So there is nothing to call for a cache invalidate, and option (a) cannot be written.
+
+### Option (b) - route the host-visible read through `hrx_synchronous_d2h` - IS EXACT AND ALREADY EXISTS
+`hrx_runtime.h:649`:
+
+    HRX_API hrx_status_t hrx_synchronous_d2h(hrx_device_t device, hrx_buffer_t src,
+                                             size_t src_offset, void* host_dst, size_t size);
+
+and its implementation (`libhrx/src/libhrx/transfer.c:118-148`) ends in a real HAL transfer:
+
+    const iree_hal_transfer_operation_t operation = {
+        .type = IREE_HAL_TRANSFER_OPERATION_TYPE_DOWNLOAD,
+        .download = { .source_buffer = src->hal_buffer, .source_offset = ..., .target = host_dst, ... },
+    };
+    hrx_status_from_iree(hrx_hal_queue_transfer_and_wait(device, 1, &operation));
+
+So it is a **queued DOWNLOAD with a wait** - the engine's own device-to-host path, which is where the
+runtime's coherency handling lives. This is precisely the call the non-host-visible branch of
+`buffer_get` already makes, and it is the call the logits read currently SKIPS:
+
+    if (context->base != GGML_HRX_FAKE_PTR_BASE) {
+        std::memcpy(data, context->base + source_offset, size);   // <- the logits take THIS
+        return;
+    }
+    hrx_synchronous_d2h(...);                                     // <- and skip THIS
+
+### Why the diagnosis matches the memory-type trace exactly
+`hrx_runtime.h:194-202` defines the flags, and `HRX_MEMORY_TYPE_HOST_LOCAL` is **`0x42`** - it already
+carries `0x02` (HOST_VISIBLE) but **not** `0x04` (HOST_COHERENT). The logits allocation is
+`HOST_LOCAL | DEVICE_VISIBLE` = `0x42 | 0x10` = **`0x52`**, which is exactly the value the issue's own
+allocation trace recorded (`[hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0
+memory_type=0x52 size=619520` - the 619520-byte logits allocation). So the buffer the fault corrupts is
+**host-visible and non-coherent, read by a bare memcpy**. The three facts agree: the allocation flags,
+the read path, and the trace.
+
+### The minimal forward-only change, stated exactly
+One guarded call at `ggml/src/ggml-hrx/ggml-hrx.cpp:250-255`: for host-visible buffers whose mapping is
+non-coherent, replace the `memcpy` with `hrx_synchronous_d2h` (or perform it *in addition* as a
+coherency refresh). Engine/fork-side, additive, no pin recession - so it satisfies criterion 2's
+"forward-only, not a revert" form.
+
+**Still a hypothesis, not a verified repair.** What makes it worth testing is that it now has: a named
+site, an existing API, agreement with the allocation trace, an explanation for both faces, an
+explanation for why the earlier coherence-ATTRIBUTE patch failed, and - via the 70% eviction rig - a
+test that needs ~5 arms per cell (~20 min) instead of 60.

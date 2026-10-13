@@ -92,6 +92,29 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
       ~228 evictions/arm for clean in-regime arms at 97G. A faulting arm well above that
       supports H2; at or below it kills H2.
 
+    NEW SOURCE FINDING (05:20) - the SAVE-vs-DRAIN inference is now SUPPORTED, not just inferred
+      context-save.md, "Save, resume and final ownership" (the section the earlier quote came from):
+        * "The KFD update path FIRST REMOVES THE QUEUE FROM HARDWARE, then changes its MQD and
+           remaps queues that remain active." -> queue removal precedes the SAVE/DRAIN choice and
+           happens in BOTH branches; the choice governs only the hardware request the direct
+           loader makes, not whether a wave is unhooked.
+        * "the cited MEC protocol can report the status fence AFTER ABANDONING A PREEMPTION
+           REQUEST" -> a preemption request can be abandoned by the driver.
+        * "A successful configuration change does not imply that saved work completed or that its
+           application-owned storage can be reused."
+      Consequence for H2: the earlier contradiction rested on an INFERRED reading of "drain" as a
+      dequeue semantic (labelled NOT QUOTED, explicitly not promoted). It is now SUPPORTED by a
+      file:line statement that queue removal - not the SAVE/DRAIN type - is what unhooks the wave,
+      and that removal happens in both branches. cwsr_enable=0 therefore cannot be read as
+      removing mid-wave interruption.
+      What this does NOT do: it does not name a mechanism, and it does not by itself explain the
+      cwsr=0 signal (3 faults/11 at cwsr=1 vs 0/55+ at cwsr=0). H2 still lacks a carrier that
+      survives this reading. Criterion 1 remains OPEN.
+      Also confirmed: every "drain" hit elsewhere in the vendored ref set is the SDMA
+      transfer-drain sense (waiting for a copy), a DIFFERENT concept from the CP preempt-type
+      DRAIN_PIPE - so the set still never defines DRAIN_PIPE's effect on an in-flight wave. The
+      honest label from the prior session stands and is now better sourced.
+
     GOAL STATE
       criterion 3  MET    315cwsr70: 70/70 fix-cell arms, 0 faults, CI 3.14%, all in-regime
       criterion 1  open   no mechanism named; H2's carrier contradicted by the AMD refs

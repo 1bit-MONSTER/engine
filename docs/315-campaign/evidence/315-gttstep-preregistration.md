@@ -78,3 +78,34 @@ post-hoc level merging.
 ~2-3 h of box time, taken under the box lock. This must not run concurrently with any other 315 driver
 (see `~/wt/315-COORDINATION.md`): one tag, one driver. The other Pi session (`01a12f94`) is currently
 idle; this run must not start until arm B (`315ab1b2`) has finished and released the lock.
+
+---
+
+# SUPERSEDED (2026-10-13) — do not run this as written; its hypothesis was retracted
+
+This pre-registration was written on the **pooled 97G-vs-98G census** (5.1% vs 30.6%), which was
+subsequently **retracted** after a within-console control broke it (`315-gtt-start-is-the-discriminator.md`,
+correction section: `315ctl1` with no forcer showed 9.1% at 97G against 6.2% at 98G — no level effect).
+
+Later and stronger: the **cell-separated** tally across every recorded console shows the quiet cell is
+**0% at 98G** against 5% at 97G, so `gtt_start` does not govern the fault at all
+(`315-quiet-vs-forcer-by-level.md`). Against that, this file's H-start — "fault probability is governed by
+the arm's `gtt_start`" — is **falsified by the corpus**, and its three-level design would spend GPU time
+re-testing a hypothesis already refuted.
+
+## What replaces it
+
+The corrected gate is not a band and not a start level; it is the **intervention cell**. The fault lives in
+cell `e` (~95% under forced KFD eviction) against ~5% ambient, a 19x contrast on the same workload at the
+same level. Any future campaign claiming the defect is gone must therefore:
+
+1. run the **forced-eviction cell**, and report the ambient (quiet-cell) rate alongside it, so a clean result
+   cannot be produced by simply not applying the trigger;
+2. state its arm count against the **actual** rate it is testing — at ~95% a handful of arms discriminates,
+   whereas the old ">=60 arms" bar was sized for a 5% population and is satisfiable by quiet arms.
+
+## Status of this file
+
+Kept rather than deleted so the retraction is traceable: the design was reasonable given what was believed
+at the time, and the reason it no longer applies is recorded above and in the two files it cites. **Nothing
+in this file should be run or cited as a live pre-registration.**

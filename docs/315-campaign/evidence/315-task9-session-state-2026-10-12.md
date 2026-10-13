@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5387,3 +5371,38 @@ So the corruption enters through the decode-split FA kernel or something only it
    nothing about which alignment/layout within it matters.
  - my harness's false positive means this run's console column must not be trusted - the per-arm
    artifacts must be read directly, which is how the result above was derived.
+
+---
+
+## galign1 FINAL TALLY, on the objective evidence (16:05)
+
+All three arms completed their full 66-request workload, and the verdicts come from the arms' own artifacts
+(HTTP codes inside the response files, and parser/guard lines in the server logs) rather than from my
+console counters:
+
+    arm         align   responses   http500   content_only   nan_guard   crash   VERDICT
+    ga4096-e     4096       66          4           8            0         0     FAULT-B
+    ga256-e       256       66          0           0            0         0     CLEAN
+    ga4096-q     4096       66          0           0            0         0     clean (control)
+
+So on GLM, under the eviction trigger, with the production alignment the eviction cell faulted (Face B,
+4 HTTP 500s and 8 parser rejections) while with the alignment that **declines the decode-split kernel** it
+was **clean**, and the quiet-cell control was clean.
+
+That is the pre-registered branch: **"align256-e clean while align4096-e faults -> the kernel IS required;
+alignment becomes the lead."**
+
+Replication launched as `315galign2` (2 eviction arms per alignment + a control, objective artifact-based
+scoring, and a server-death check in the request loop to prevent the false-positive I found in my own
+galign1 harness).
+
+### Why this matters more than the eliminations before it
+Every previous result this session removed a candidate. This one **adds a positive**: the decode-split FA
+kernel path is **necessary**. That is a different kind of finding - it constrains where the cause must be
+rather than ruling things out - and it is the first such constraint the issue has had.
+
+It does not yet say WHICH part of that kernel, because `align=256` bypasses rather than stresses. But it
+narrows the search decisively: the corruption enters through the decode-split FA kernel or through something
+only that kernel does (its partial-transient layout, its pack handoff, its completion-counter protocol), and
+everything the static leg already cleared inside it (`1de679f`) stays cleared - so it is a different aspect
+of the same kernel.

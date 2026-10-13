@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4900,3 +4884,62 @@ The probe is now loading GLM and will issue 3 decodes, then report `hrx-wb-fp` r
 
 I will read that result rather than re-run it. My contribution to the pair - the constraint that any
 mechanism must give correct prior outputs and a terminal whole-buffer failure - stands either way.
+
+---
+
+## THE WRITEBACK PROBE'S RESULT, READ CORRECTLY (15:30) — a negative on the QUIET box, lead still open
+
+The peer's probe completed. Its report:
+
+    === writeback fingerprint records ===
+    0
+    === rec_eq_sync tally ===
+          1 rec_eq_sync=0
+
+I read this carefully rather than as a verdict, because the first number and the second appear to
+contradict and the invocation is easy to misjudge.
+
+### What actually ran
+    server up        : model loaded at 0:04.6, listening
+    3 decodes issued : all real (http 200), print_timing present
+    graphs reused    : 7, then 15, then 23       (a real GLM arm's first request: 95)
+    prompt tokens    : 9, then 1, then 1         (cache_prompt reused the prefix across the 3)
+    whole probe      : 15:16:24 -> 15:16:36, 12 seconds
+
+The knob IS in the build the probe used (`hrx-wb-fp` marker and `GGML_HRX_WRITEBACK_FINGERPRINT` both
+present in `315coherent-build`), the env was set via `setsid env`, and the writeback source carries the
+fingerprint (2 occurrences in that tree's executor). I checked all three because a zero from a
+mis-invoked instrument is indistinguishable from a true zero - the same trap that produced the earlier
+`315ids1` no-output run.
+
+### What the two numbers mean together
+ - **`hrx-wb-fp` records: 0** - the writeback fingerprint never printed. The queue the peer traced was
+   **never non-empty** during three real decodes.
+ - **`rec_eq_sync=0` count: 1** - that line is the probe's *grep for the pattern across its own log*, and
+   with zero records it is matching the **header text of its own report** (`"sample records (rec_eq_sync=0
+   means the source CHANGED while queued)"`). It is an artefact of the script grepping a string it just
+   wrote. Not a measurement.
+
+So the honest reading is a single fact: **the deferred writeback queue was never populated in three
+decodes on a quiet box.**
+
+### Why this does NOT refute the lead
+The lead requires **eviction** to make the queued source stale. The probe ran on a **quiet box** (gtt=48G,
+no neighbours, no `evictonly`) - it is a reachability test, not the eviction test. Two readings remain,
+and the probe cannot separate them:
+ (a) the writeback path is never taken on this configuration, in which case the lead dies for the logits;
+ (b) the path is taken only under the conditions the lead is about (host staging with `access.write`
+     bindings actually present), and 3 small decodes with a reused prefix did not create them.
+The peer's own commit anticipated exactly this: *"whether `pending_host_writebacks_` is non-empty at the
+right moments ... is what the staged probe reports, and static expectation is not a result."* The probe
+reports the queue was never populated; it does not decide between (a) and (b).
+
+### What would decide it - and this is the gap the probe left
+The writeback queue needs a HOST-STAGING DOWNLOAD to exist: a binding with `staging.download` set, i.e.
+`access.write && !binding.graph_input` on a host-visible tensor. Three decodes with a 9-token then 1-token
+prompt and 8 output tokens may not reach the logits download at all if the harness's route differs. The
+next probe should therefore run **the same request shape the arms use** (the 96-token completion the
+detector issues) and ideally **inside the eviction rig**, so the queue is populated under the trigger.
+
+Recorded because a probe that returns zero for the wrong reason is the most expensive kind of null: it
+would let the lead be abandoned on evidence that never tested it.

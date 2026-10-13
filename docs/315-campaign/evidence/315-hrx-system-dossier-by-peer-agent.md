@@ -1,4 +1,12 @@
 <!--
+ANNOTATION (2026-10-13): this dossier's section 4.5 and its architecture diagram claim the `_spt` dispatch
+works via a GOT-indirect thunk ("JMP qword ptr [0x0032a3e0] ... resolves through a GOT slot that is patched").
+THAT MECHANISM IS WRONG. A larger decompilation effort (~/amd-oss/hrx-re/) shows 0x31d8a0 is a .plt stub, no
+hipMalloc_spt export exists, and the real mechanism is name-based dlsym(symbol + "_spt"). See
+315-dossier-spt-claim-corrected.md in this directory. The dossier is preserved for its other findings; this
+claim is not to be cited.
+-->
+<!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
 

@@ -988,3 +988,65 @@ All 23 commits of this session are on `1bit/315-preregistration`.
   good source of a token; check `gh auth status` there first before attempting an interactive login.
 - The bundle at `/home/bcloud/315-unpushed-*.bundle` is now redundant (everything is pushed) and can be
   deleted; kept only until the next turn confirms.
+
+---
+
+# UPDATE 13 (2026-10-13 ~15:03) — a THIRD mechanism family closed: the graph reorder is NOT the cause
+
+Continues UPDATE 11. Records a new, pre-registered refutation.
+
+## The experiment and its result
+
+A new in-scope lever was found and tested: the **graph reordering** in
+`ggml/src/ggml-hrx/runtime/graph-record-order.cpp`, which decides the order commands are emitted (and
+therefore committed to the AQL ring) for programs whose transient extent is <= 16 MiB — a gate GLM's
+decode satisfies. The zero-arm probe proved the lever is **live on GLM's decode path**: the 26-command
+routed-FFN graph is reordered in every layer (23 -> 20 barriers), while the 9-command attention graph is
+already program-ordered.
+
+Pre-registered A/B (`101ab04`), same binary and rig, only `GGML_HRX_GRAPH_ORDER` differing:
+
+                 cell q            cell e              cell c
+    arm A     4 OK / 0 FAULT    0 OK / 4 FAULT      4 OK / 0 FAULT      reorder ON
+    arm B     4 OK / 0 FAULT    0 OK / 4 FAULT      3 OK / 1 FAULT      reorder OFF
+
+**Cell `e` faulted 4/4 in BOTH arms — 100% with the reorder enabled and disabled.** The pre-registered
+branch is met: **B ~= A -> H-gord REFUTED**.
+
+Validity: the knob was confirmed live in the arm server's `/proc/<pid>/environ`, the intervention
+provably changes the submitted order (zero-arm probe), all arms in-regime with no OOR/INVALID, and both
+faces appeared in both arms.
+
+## Families now closed by discriminating experiment
+
+    read path (hrx_synchronous_d2h)       REFUTED   315-ab1-arm-B-interim.md
+    host-side coherence (all 4 accesses)  CLOSED    315-write-side-unaddressed.md
+    runtime AQL submission policy         CLOSED    315-device-hunt-boundary.md
+    graph reorder (GRAPH_ORDER)           REFUTED   315-gord1-final.md
+
+## Family now closed by a peer agent's independent replication
+
+The **rig itself** is corroborated: the peer's `315ids1` reproduced the eviction cell at 0 OK / 3 FAULT on
+a different build, and my `315gord1a` / `315gord1b` each reproduced it at 4/4. Same shape across three
+independent runs and two builds (`315-peer-rig-replication.md`).
+
+## Coordination, learned the hard way
+
+The peer agent's driver **does not take the box lock** (verified: the lock was free while its campaign
+ran, and its processes held zero fds on it). So the lock cannot arbitrate between agents, and the only
+reliable signal is that no other `315-disc.sh` driver is alive — which is what arm B waited for, after the
+first two waiters were written against the wrong assumption (`315-peer-rig-replication.md`).
+
+## Where the goal stands
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named, falsifiable mechanism | trigger **named and replicated** (0/22 -> 7/10, p=3.6e-5, both faces); **cause still not located**, now after closing four families |
+| 2 | forward-only fix landed | **not achievable** on current evidence; the one candidate is refuted |
+| 3 | >=60 in-regime arms, zero faults | **not met**; the recorded 0/70 has no eviction cell |
+| 4 | no regression | not reached (nothing landed) |
+| 5 | KNOWN-ISSUES updated with evidence | **done** |
+
+Surviving cause candidates: the §55/§56 executor-level cross-dispatch ordering question, and the MoE
+id-producing-kernel family the peer agent is currently working (`315ids*`, `315text1`). Both are outside
+what this turn could test without further GPU time, and the peer is on the second of them right now.

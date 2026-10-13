@@ -78,3 +78,31 @@ Score it against the **pre-registered branches**, not against the header's premi
     both alignments fault  -> FA class not implicated  (consistent with the first run)
     only one faults        -> would be a new asymmetry worth its own test
     both clean             -> uninformative, since n=1 showed faults at both
+
+---
+
+# Unblocking the replication: galign1's orphaned neighbours were holding the box
+
+The replication sat with an empty console for ~4 minutes because **galign1 left three `llama-server`
+processes behind**, all reparented to init:
+
+    pid 3931486  ppid=1  21:18 elapsed
+    pid 3931487  ppid=1  21:18 elapsed
+    pid 3931488  ppid=1  21:18 elapsed
+
+Their parent run had **finished** (`315galign done` was present in its console), so these were genuine
+leftovers, and between them they held both `~/.cache/lax-decode/box.lock` and ~80 GiB of GTT — which is why
+the replication's `flock -w 1800` was waiting rather than running.
+
+Cleared, after checking they were orphaned and their run finished. The replication acquired the lock
+immediately (its own four processes), and started at 16:04:53 with GTT climbing to 98 GiB.
+
+Two coordination notes:
+
+- **I also cleared my own dead `align3` waiter** from the lock queue (pid 3963038), so it was not squatting
+  ahead of the peer's live run.
+- **The teardown gap is systemic, not specific**: both my `315align2` and the peer's `315galign` left
+  neighbours behind when the driving shell exited, because `setsid` + a killed parent skips the `trap ...
+  EXIT` handler. Any future run on this box should either avoid `setsid` for the neighbours or check for
+  ppid-1 `llama-server` processes before waiting on the lock — otherwise a finished run's orphans will block
+  the next one for its full `flock` timeout.

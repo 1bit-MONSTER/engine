@@ -78,3 +78,37 @@ the composition is trusted:
 Patterns must live in a **script file** rather than a command line, because a command line carrying them is
 matched by its own `pgrep`/`pkill` — a trap that cost this session three separate incidents, two of them killing
 my own SSH session mid-cleanup.
+
+---
+
+# Addendum: the rig's gates assume a dedicated box, and the box is now shared
+
+Chasing defect #15 turned up a second operability problem, distinct from the leftovers.
+
+The frozen rig gates every arm on, among other things, **`load1 < 4`** (`315-disc.sh:91`). Held next to the
+current tenancy of this box that threshold is **unreachable**:
+
+    $ cat /proc/loadavg        ->  4.72  ...      (tctl 44.5 C, our own forcers and workers at zero)
+    $ ps -eo pcpu,cmd --sort=-pcpu | head
+      clickhouse-server, redis, dockerd, node ...   <- other agents' workloads, not ours
+
+with our own side-processes verified at **zero** (`evictonly=0`, CPU workers `=0`) and **GTT at 26 GiB** — i.e. the
+box is as quiet as *we* can make it, and the gate still refuses.
+
+Two consequences worth recording:
+
+1. **A run can stall indefinitely without failing.** A swap script of mine sat in exactly this loop for minutes
+   with every one of *our* preconditions satisfied, and only a self-imposed iteration cap let it proceed. The rig's
+   own gate has no such cap. An arm that never starts is indistinguishable, from the outside, from an arm that
+   started and produced nothing — the same ambiguity this campaign has hit twice before (defect #13's inert
+   `EXTRA_ENV`, and #14's `NANONLY` sweep that could not distinguish "clean" from "not run").
+2. **The gate is a property of the original tenancy.** `load1 < 4` and `tctl < 80` were calibrated for a box this
+   campaign had to itself. With other agents running servers and CPU work, the gate measures *their* load, so it
+   silently changes what "in-regime" means for our arms — not the GTT regime itself (arms carry their own
+   `gtt_start`), but the *ambient* condition the campaign has been treating as constant, which is the baseline
+   against which §39's inducing effect and the whole ambient-vs-forced comparison are drawn.
+
+**Not resolved here.** The honest statement is that this campaign's ambient baseline and its arm-starts are now
+conditional on a box it no longer exclusively owns, and no arm in this record was tagged with the foreign load
+that was present when it ran. The rig's newer `resident_inventory (foreign, not ours)` line is a step toward
+recording that, and it should be read as required context for any arm from this session onward.

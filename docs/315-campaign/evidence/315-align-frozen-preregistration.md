@@ -2,6 +2,22 @@
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
 
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
 engine#315 pre-registration. Written BEFORE the run so the reading cannot be chosen post hoc.
 -->
 
@@ -71,3 +87,16 @@ recorded as invalid.
 - **Would settle (one-sided)**: whether the FA alignment is *required* for the fault.
 - **Would not settle**: whether it makes a *rate* difference, at this arm count.
 - **Does not touch criteria 2–4.**
+
+---
+
+# Execution log
+
+**Arm A (align 4096) launched 2026-10-13T17:28:26**, tag `315alignfa`, 3 rounds, frozen rig. Verified in
+flight: the session header carries
+`extra_env='GGML_HRX_TENSOR_FP=tail:16 GGML_HRX_TENSOR_FP_NANONLY=1 GGML_HRX_FA_PARTIAL_ALIGN=4096'` and the
+regime composed to GTT 98 GiB before the first arm — i.e. the faulting band, on the driver that reproduces the
+trigger.
+
+**Arm B (align 256) staged** as `~/wt/315alignf-b.sh` with the same shape and only the alignment differing,
+to run after arm A releases the box.

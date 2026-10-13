@@ -3505,3 +3505,72 @@ The pre-registered reading key (commit fc7ffd5) applies unchanged:
     arm B faults in cell e at a similar rate to arm A -> H-fix REFUTED, the memcpy is not the site
     arm B faults but arm A does not                   -> CONTRADICTED in direction
     both clean in cell e                              -> UNINFORMATIVE (and now implausible, since A was 4/4)
+
+---
+
+# ####################################################################
+# THE FIX FAILED ITS A/B — the non-coherent-memcpy cause is REFUTED
+# ####################################################################
+# 2026-10-13 11:30
+
+## The result the pre-registration called "H-fix REFUTED"
+
+The pre-registered A/B (`fc7ffd5`), same patched binary, knob the only difference:
+
+    ARM A  GGML_HRX_COHERENT_READ unset (pre-fix behaviour)
+        cell e: OK=0  FAULT=4      <- 4 of 4 eviction arms faulted
+        cell c: OK=4  FAULT=0
+        cell q: OK=3  FAULT=1      (the GTT-drifting arm)
+
+    ARM B  GGML_HRX_COHERENT_READ=1 (the fix: read via hrx_synchronous_d2h)
+        round 1 arm e: FAULT nan=0 http=1 s500=1 unparsed=2     <- FACE B
+        round 2 arm e: FAULT nan=0 http=1 s500=1 unparsed=2     <- FACE B
+        (run photographed mid-flight; every eviction arm observed so far faulted)
+
+**The fix does not stop the fault.** The pre-registered reading:
+
+    B ~= A (both fault in cell e at a similar rate)
+        -> H-fix REFUTED. The memcpy is not the site; the stale data enters elsewhere.
+
+That is the branch the data landed on.
+
+## What this kills, precisely
+
+The hypothesis was: `buffer_get` plain-`memcpy`s a host-visible, NON-COHERENT mapping
+(`memory_type=0x52`, no `HOST_COHERENT`), and no invalidate exists on the path, so the CPU can read a
+stale view of the logits buffer. That is now **refuted by its own pre-registered test**. Routing the
+read through the runtime's own device-to-host transfer - a queued HAL DOWNLOAD, the same call the
+non-mapped branch already used - leaves the fault rate unchanged in the eviction cell.
+
+Two consequences follow, and both matter:
+
+ 1. **The stale data is not the CPU's view of the logits allocation.** Whatever the eviction corrupts is
+    either written correctly into that buffer (so a coherent read would not have helped), or it is not
+    that buffer at all.
+ 2. **The coherence-ATTRIBUTE patch's earlier failure now has a second, independent explanation.** I had
+    argued that making `HOST_COHERENT` unconditional failed (9 clean + 1 fault / 10) because "an
+    attribute does not add an invalidate to the READ". That reasoning was sound but the conclusion it
+    supported is wrong: adding the read-side transfer ALSO fails, so the read path was never the problem.
+
+## Honest state of the mechanism
+    TRIGGER   : named and replicated - forced KFD eviction causes the fault, both faces,
+                7/10 vs 0/22, p = 3.6e-5. UNCHANGED by this result.
+    CAUSE     : UNKNOWN. The leading candidate (non-coherent host read of the logits) is refuted.
+The trigger finding stands; the cause search is back to open, with one strong candidate eliminated by
+experiment rather than argument.
+
+## What the failure narrows
+The eviction cell faults on **Face B** in this run (http=1 s500=1 unparsed=2, nan=0) in both observed
+arms, where arm A's faults were a mix. Both are consistent with the same underlying corruption. The
+refutation removes the read path; what remains of the previously-eliminated space is the WRITE side -
+the device writing into a buffer whose mapping/handoff the eviction perturbs - and the possibility that
+the corrupted buffer is not the logits at all but an intermediate whose damage propagates.
+
+Note also the arm-B2 evidence that the fault is not confined to the forcer: `round 2 arm c: FAULT nan=1
+transport=1` with `side=12/12` (CPU-only load) and `round 2 arm e: FAULT` in the same round, and
+`gtt_now` values of 99G/100G on those arms - again pointing at memory pressure rather than the forcer
+process itself.
+
+## The patch is NOT to be landed
+The fork branch `1bit/315-coherent-host-read` (one hunk, forward-only, built, smoke-tested) is retained
+only as the record of a refuted hypothesis. It must not be proposed as the fix.

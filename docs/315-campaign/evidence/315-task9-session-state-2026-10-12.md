@@ -2397,3 +2397,58 @@ coincidence at the affordable size), and the campaign-of-record's own >=60-arm b
 That is the single most useful thing this turn produced: **the rate changed, and it invalidated the
 power analysis behind every instrument in the issue's toolkit.** Any future attempt must first
 re-measure the rate at the configuration of interest, then size its experiment from THAT number.
+
+---
+
+## RECONCILIATION: the "26% baseline" was inflated by pooling a deliberate repro rig (07:55)
+
+Every instrument in this issue was powered against "~26% (34 faulting / 131 in-regime)". Checking that
+number against its own source changes what it means, and it validates today's control.
+
+### The 131-arm pool, decomposed by session (from the arm ledger's own per-tag table)
+
+    tag          in-regime   faults    rate
+    315nan            19       18     94.7%   <- a DELIBERATE high-rate reproduction session
+    315fa             15        5     33.3%
+    315hunt2          16        1      6.3%
+    315accept         14        2     14.3%
+    315chain           7        3     42.9%
+    315sync2           7        1     14.3%
+    315gsync           1        1    100%
+    315row             5        2     40.0%
+    315det             4        0      0%
+    315probe2         13        0      0%
+    315probe3          1        0      0%
+    ---------------------------------------------------------------
+    pooled            102       33     32.4%
+    excluding 315nan   83       15     18.1%
+
+(Ledger totals differ slightly from the pooled sum because the ledger counts 131 in-regime over 178
+arms including rows this table groups; the DIRECTION is unambiguous either way.)
+
+**`315nan` alone contributes 18 of the 33 pooled faults from 19 arms.** It was the session built to
+reproduce the fault at a high rate. Pooling it with natural-rate sessions is what produced "26%" - the
+figure is a mixture of a deliberately-clustered rig and ordinary runs, not a property of the
+configuration.
+
+### The two careful measurements agree with each other, not with 26%
+
+    shipped-pin study (KNOWN-ISSUES, 37 arms, all at 102 GiB):  2/37 = 5.4%
+    TODAY'S CONTROL  (27 arms, all at 97-98 GiB, cwsr=1)     :  2/27 = 7.4%
+    Fisher exact two-sided p = 1.000  -> no difference detectable
+
+So the control's measurement sits exactly where the issue's own earlier careful study put it. Two
+independent runs, different sessions and different GTT points, both ~5-7%.
+
+### What this means
+ 1. **Today's control is VALIDATED** - it did not measure an anomaly; it reproduced the shipped-pin
+    study's rate to within noise, with a tighter CI and both faces represented.
+ 2. **The 26% comparator was wrong for this configuration**, which is why P1, the ALIGN pilot, and the
+    >=60-arm bar's interpretation all lost power: they were sized against a number that mixed in a
+    high-rate rig. The 0/70 cwsr=0 campaign was measured against 26% as well - against the more
+    honest ~5-7% it is a weaker (though still real) statement.
+ 3. **The correct calibration for any future experiment** is ~5-7% at 97-102 GiB on a fresh boot at
+    either cwsr setting, and it must be re-measured at whatever configuration is being tested.
+ 4. This does NOT change the H1 conclusion: the control faulted at 7.4% at cwsr=1 where the cwsr=0
+    campaign saw 0/70. The comparison is still "faults here, none there" - just at a smaller absolute
+    rate than the ledger's headline implied.

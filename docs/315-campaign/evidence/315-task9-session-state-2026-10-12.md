@@ -3435,3 +3435,43 @@ The mechanism is named and replicated (70% vs 0/22, p = 3.6e-5, both faces). The
 file:line. The fix is written, built, smoke-tested (both knob states answer correctly, zero faults) and
 prepared forward-only on the fork. What remains is the A/B result and then the campaign on the fixed
 build - both of which are measured work, not open questions.
+
+---
+
+## THE A/B IS RUNNING, AND ARM A PRODUCED A REFINEMENT (10:00)
+
+### Arm A (patched binary, knob OFF = pre-fix behaviour) — the control that must fault
+    round 1 arm q: OK     nan=0 req=66   gtt 97G->98G   side=0/0
+    round 1 arm e: FAULT  nan=1 req=19   gtt 98G->79G   side=1/1   <- FACE A
+    round 1 arm c: OK     nan=0 req=66   gtt 97G->98G   side=12/12
+    round 2 arm e: FAULT  nan=0 http=1 s500=1 unparsed=2  side=1/1  <- FACE B
+    round 2 arm c: OK     nan=0 req=66                    side=12/12
+    round 2 arm q: FAULT  nan=0 http=1 s500=1 unparsed=2  side=0/0  <- QUIET CELL
+    round 3 arm c: OK     nan=0 req=66                    side=12/12
+
+So the rig reproduces on the patched binary with the knob OFF: the eviction cell faults in both faces,
+exactly as disc1/disc2 did. Arm A is therefore a valid control.
+
+### The refinement: a QUIET-cell fault, and it is the arm whose GTT drifted
+`round 2 arm q` faulted (Face B) with `side=0/0` - no side load at all. That is the first control-cell
+fault across all three runs of this rig, and it is informative rather than anomalous:
+
+    run       quiet arms   their GTT behaviour            quiet-cell faults
+    disc2          6       all 97G->98G (stable)                    0
+    ab1a           2       one 97G->98G, one 97G->102G              1  <- the drifting one
+
+The faulting quiet arm is the one whose GTT **drifted +5 GiB** during the arm (97G -> 102G), while every
+quiet arm at stable GTT has been clean. That is exactly what the mechanism predicts and what
+`evictonly` is a *proxy* for: the operative variable is **memory pressure that makes the kernel evict
+in-flight work**, not the forcer process itself. A quiet arm whose occupancy climbs into the band can
+reach the same condition without any side load.
+
+This does not weaken the A/B - it sharpens what the A/B is testing and it explains a control-cell fault
+that would otherwise look like rig noise. It also means the A/B's cell-`e` comparison should be read
+alongside the cells' GTT traces, not in isolation.
+
+### Consequence for the reading key (fixed before the run, unchanged)
+The pre-registered branch of interest is still "arm B clean in cell e while arm A faults in cell e".
+Arm A currently has cell `e` at 2 faults and cells `q`+`c` at 1 fault, the latter being the drifting
+quiet arm. If arm B's cell `e` is clean while arm A's is not, the fix holds regardless of the quiet-arm
+episode; if arm B also faults in cell `e`, the fix has not addressed the fault.

@@ -1328,3 +1328,37 @@ declaration, written here BEFORE any P1 arm runs:
    that either is the fix.
  - NOT YET RUN. It needs (a) a knob or a pinned build, and (b) its own shell-time budget. The
    current 315ctl1 control owns the box lock and must finish first.
+
+---
+
+## H2' CONSISTENCY CHECK against the hardest existing observation (2026-10-13 05:27)
+
+The single observation any mechanism must explain (line ~312 of this file):
+
+    "run 7 faulted 3x at 97G while 8 clean arms sat at 98 GiB"
+
+The OLD account read this as "the OCCURRENCE of mid-wave preemption is the intermittent
+variable, not the pressure level" - but that account rested on the now-refuted premise that
+cwsr=0 removes mid-wave preemption, and it also asserts what it needs to prove (preemption).
+
+H2' gives a DIFFERENT and checkable account. Under H2' the intermittent variable is not pressure
+and not "preemption happened"; it is:
+
+    did a page migration/eviction move THIS arm's own borrowed buffers during its OWN suspension
+    window, before it resumed?
+
+That is per-arm and per-window, which is exactly why two arms at nearly the same GTT can differ:
+pressure is the enabler, the individual suspension-plus-move is the event. It predicts faults
+cluster on arms that were suspended with movement, not on the arms at the highest GTT.
+
+CAN IT BE TESTED ON THE EXISTING DATA? No - and the reason is the same blocker H2 has always had:
+run 7's arms have no per-arm PID, so their evictions cannot be attributed (that is the documented
+reason H2's test was INVALID on run 7's data, evidence/315-pid-capture.md). The 97G/98G observation
+therefore cannot discriminate H2' from the old account on existing data.
+
+WHAT WOULD: the running 315ctl1 control, which is the first run with per-arm server.pid AND
+cwsr=1 AND a live watcher. Its test is already pre-registered above (P2/P3):
+  - P2: faulting arms show more PRE-FAULT evictions for their own pid than the clean-arm
+        baseline currently on the record (~228 evictions/arm at 97G, n=4).
+  - P3: a faulting arm with ZERO evictions for its own pid refutes H2' outright.
+Until a fault lands, both remain untested and H2' remains a candidate, not a finding.

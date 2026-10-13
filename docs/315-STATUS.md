@@ -773,3 +773,62 @@ One driver only (`315ab1b2`, holds `~/.cache/lax-decode/box.lock`). `~/npu.lock`
 session (`01a12f94`, tmux `pi-315`) is pursuing this same goal; it is currently idle/blocked on a stale
 `~/npu.lock` premise and did not resume. See `~/wt/315-COORDINATION.md`. Do not run two drivers on one
 tag.
+
+---
+
+# UPDATE 10 (2026-10-13 ~10:57) — the A/B is CLOSED (refutation), the box is free, and one claim was retracted
+
+Short, because UPDATE 9 carries the substance. This records the close-out.
+
+## Arm B final
+
+    cell e (test cell):  0 OK / 2 FAULT  (both Face B)     cell q: 2 OK / 0 FAULT
+    cell c:              1 OK / 1 FAULT  (Face A)
+
+Stopped after round 2: the verdict was settled (cell `e` faulted in every round run) and the box-time
+budget is thin. Deviation recorded in `315-ab1-arm-B-interim.md`, including the cost (2 cell-`e` arms
+vs arm A's 4, so no rate may be quoted from it).
+
+**Criterion 2 is not achievable with the prepared change.** The patch stays unlanded.
+
+## A claim I made and RETRACTED in the same session
+
+I extracted a census from every console and found `gtt_start=97G` at 5.1% faults vs `98G` at 30.6%, and
+wrote it up as the governing condition. **It does not survive a within-console control:**
+
+    315ctl1 (NO forcer)     97G: 9.1%   98G: 6.2%    <- no level effect
+    315disc2 (WITH forcer)  97G: 0.0%   98G: 83.3%
+
+The whole pooled effect is carried by the forcer run, and cells are not independent of instrument (cell
+`e` *is* the forcer). `315-gtt-start-is-the-discriminator.md` now leads with the correction and
+KNOWN-ISSUES was fixed in place. What survives: **the forcer causes faults** (controlled intervention),
+and individual arms have drifted into a high band and faulted (two single-arm observations).
+
+This matters for method: the pre-registered `315gttstep` run is now the *only* way to test the level
+question, and `ctl1`'s evidence makes its "rates equal -> refuted" branch the likelier outcome.
+
+## Box state
+
+**Clean and free.** No 315 processes; `~/.cache/lax-decode/box.lock` released; `~/npu.lock` free; GTT
+26 GiB; VRAM idle; only the two pre-existing foreign Vulkan servers hold the render node. Kernel still
+`cwsr=1` (no reboot taken).
+
+## Coordination
+
+The second Pi session (`01a12f94`, tmux `pi-315`) pursuing this same goal is idle and still displays
+`goal: blocked` on a stale `~/npu.lock` premise; it did not resume. `~/wt/315-COORDINATION.md` carries the
+one-tag-one-driver rules. Its earlier duplicate launch on tag `315ab1b` is confirmed in its transcript and
+is why that tag was discarded.
+
+## Where the goal stands
+
+| | |
+|---|---|
+| criterion 1 | trigger **named and replicated**; **cause not located** (read path eliminated) |
+| criterion 2 | **not achieved** — the candidate is refuted; no fix may be landed |
+| criterion 3 | not met in the sense that matters (the recorded 0/70 has no eviction cell) |
+| criterion 4 | not reached |
+
+The honest close: this turn produced a **refutation**, a retraction, two corrections, a pre-registration,
+and a named-but-confounded lead now properly bounded. It did not produce a fix, and criterion 2 should not
+be claimed.

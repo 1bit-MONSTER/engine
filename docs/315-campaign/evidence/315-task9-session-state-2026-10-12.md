@@ -87,6 +87,9 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
         p3l                   91692  97G       OK        --     196
         p4c (not in-regime)  114850   0G        ?        --     225
         clean n=4  evictions/arm: min=160 median=262 max=293 mean=227.8
+      (updated 05:26 as arms accumulated: n=7, min=160 median=262 max=293 mean=234.7 -
+       the spread barely moves as n grows, so the P2 denominator is stable, not a small-sample
+       artefact. p1c/p4c are CONTROL-cell arms and are in-regime too, so they count.)
       The reader resolved every pid, attributed evictions per arm, and correctly reported that
       it still needs a faulting in-regime arm. THE H2 DENOMINATOR IS NOW ON THE RECORD:
       ~228 evictions/arm for clean in-regime arms at 97G. A faulting arm well above that

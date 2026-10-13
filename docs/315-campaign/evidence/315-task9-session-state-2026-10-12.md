@@ -1699,3 +1699,125 @@ It is still confounded by the same thing the control was built to test: run 7 an
 on different boots/states than the cwsr=0 campaign, so "cwsr=1 faults and cwsr=0 does not" and
 "a fresh-booted box at cwsr=1 faults too" are both consistent with the data. The RATE is what
 separates them, and that needs the final tally.
+
+---
+
+# THE MECHANISM IS NAMED IN THE ENGINE'S OWN RECORD (05:50) — engine#123/#140's root cause IS #315's mechanism
+
+Found by following the NaN guard's own comment. `third_party/llama.cpp/common/sampling.cpp:578-580`
+(the guard that logs "HRX returned NaN logits") states the mechanism in one sentence:
+
+    "engine#123: HRX can hand back all-NaN router logits when the driver MIGRATES A PAGE
+     BEHIND IN-FLIGHT WORK (the engine#140-class nondeterminism)."
+
+And `docs/hrx.md` §"Root cause of the NaNs (engine#123, #140)" gives the full, quantified mechanism:
+
+    "In every decode-split `reduce_fused` variant the last workgroup writes the attention output to
+     global memory, and `pack_completed_q8` then reads it back with other waves to build `next_q8`.
+     The barrier between the two was `kernel.barrier<workgroup>`, which FENCES LDS ONLY (no store
+     wait, no `buffer_gl0_inv`), so a pack wave could QUANTIZE THE OUTPUT SLOT'S PREVIOUS CONTENTS.
+     The f32 output was right and `next_q8` was wrong, and NaN when the stale bytes decoded as NaN.
+     THE WINDOW OPENS WHEN A DISPATCH IS PREEMPTED, and any process's KFD queue eviction (page
+     compaction, KSM, memory pressure) does that, which is why the rate followed those settings.
+     IT WAS NEVER THE CAUSE. The fix fences both memory spaces (`barrier<global>` then
+     `barrier<workgroup>`). With a separate process forcing queue evictions: Qwen3-Coder-30B
+     (2113-token prompt, partial alignment 256) went from 1 of 8 correct to 8 of 8 with no NaN."
+
+## Why this IS the named mechanism for #315
+It matches every constraint the issue accumulated, and it does so from the PROJECT'S OWN record
+rather than from my inference:
+
+ 1. **It names the stale-buffer window.** A wave quantizes an output slot's PREVIOUS contents - the
+    same "reads what is there now, not what it wrote" boundary H2' was built around, and the same
+    one §59 hit when the arena's last writer made a by-name read return the wrong tensor's bytes.
+ 2. **It explains the preemption/eviction dependence** - "the window opens when a dispatch is
+    preempted, and any process's KFD queue eviction (page compaction, KSM, memory pressure) does
+    that, which is why the rate followed those settings".
+ 3. **It explicitly distinguishes the trigger from the cause**: "It was never the cause." That is
+    exactly the correction H2' needed - preemption/eviction is the TRIGGER, the insufficient barrier
+    is the CAUSE. H2 and H2' both mistook the trigger for the mechanism.
+ 4. **It spans both faces**, because a stale slot can decode as NaN (Face A) or as finite garbage
+    (Face B) - the value class is decided by what the slot's previous contents happened to be, which
+    is #44's finding stated independently.
+ 5. **§"It is the same WINDOW the engine's own #123/#140 record describes"** was already written in
+    the ledger (line ~327) - the connection had been noticed and then not followed to the root cause.
+
+## But the fix for #140 IS present in the current pin - checked, not assumed
+I first hypothesised that GLM's kernel variant still lacked the fix. **That is WRONG and is recorded
+as a correction:**
+
+    git merge-base --is-ancestor a14199a31 0e255d774032  -> TRUE (present)
+    git merge-base --is-ancestor 1c15f38a9 0e255d774032  -> TRUE (present)
+    a14199a31 "hrx: fence both global and LDS at the decode-split barriers" touched BOTH
+      loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom  (the GLM variant)
+      qwen_moe/.../flash_attention_decode_split_f32_f16_wmma.loom
+    and added to the GLM file: `barrier<workgroup>` in all three `reduce_fused` variants plus
+      `// Wave 0 rewrote partial_max in global memory; every wave reads it below.`
+      `kernel.barrier<global> scope(workgroup) ordering(acq_rel)`
+So the two-space fence is in the shipped GLM path. The remaining defect must therefore be in a
+DIFFERENT handoff of the same class (a producer->consumer boundary fenced for LDS only), not in the
+one #140 fixed.
+
+## The gap that explains why #315 survives #140's fix, from the guard's own code
+`common/sampling.cpp` checks **NaN ONLY**: `if (std::isnan(logits[i]))`. So:
+  - a stale slot that decodes as NaN        -> caught, logged, aborted          (Face A)
+  - a stale slot that decodes as FINITE     -> passes the guard untouched, samples degenerate text,
+                                               and fails later at the chat parser as HTTP 500 (Face B)
+That is precisely the Face-A/Face-B split the issue reports, and it is why a NaN-only detector cannot
+see half the defect - the same structural blindness §46 and §59 recorded from the other direction.
+
+## What this changes for criterion 1
+ - The mechanism is **named, falsifiable, and cited to the project's own root-cause record**: a
+   producer->consumer handoff fenced for LDS only, letting a consumer read a slot's stale contents;
+   triggered by preemption/queue eviction; surfacing as NaN (Face A) or finite garbage (Face B).
+ - It is **not on the falsified-levers list** (which covers transient reuse, placement advice, host
+   writeback, the device-to-host copy wait, pinning f2099e9b7, and the sleeping wait).
+ - The discriminating experiment is the one the #140 work already used: force queue evictions from a
+   separate process and check for staleness at the specific handoff. Plus P1 here (deny buffer
+   movement at cwsr=1), which tests the same trigger.
+ - Open work: locating WHICH handoff still has the LDS-only fence in GLM's path. That is a static
+   search for `barrier<workgroup>` immediately preceding a cross-wave global read, of the same shape
+   as the two #140 fixed.
+
+## The #140 handoff in GLM's kernel is CORRECTLY fenced - verified at line (05:52)
+
+Read the actual site rather than inferring from the commit. GLM's kernel,
+`loom-libs/ops/flash_attention_decode_split_f32_f16_wmma.loom:1170-1176`:
+
+    kernel.barrier<global> scope(workgroup) ordering(acquire)
+    template.apply<...reduce_completed.direct>(... %output_noalias ...)     <- writes the f32 output
+    scf.if %publish_q8 {
+      kernel.barrier<global> scope(workgroup) ordering(acq_rel)             <- store wait / buffer_gl0_inv
+      kernel.barrier<workgroup> scope(workgroup) ordering(acq_rel)          <- LDS fence
+      template.apply<...pack_completed_q8>(%key_value_head, %output_noalias, %q8_output)   <- reads it back
+    }
+
+Both memory spaces are fenced exactly as #140's fix describes, and the surrounding
+completion-counter handshake is also `barrier<global>` (release at :1158, acquire at :1170, release at
+:1178). The kernel has 13 `barrier<global>` and 23 `barrier<workgroup>`.
+
+So the ONE handoff #140 identified and fixed is fixed in GLM's path too. My hypothesis that the fix
+was missing for GLM's variant is **WRONG**, and this is the second correction in a row on this lead -
+both recorded rather than quietly dropped.
+
+### What therefore stands and what does not, on this lead
+STANDS (and is the strongest mechanism statement the record has):
+ - the mechanism CLASS is named by the project itself: a producer->consumer handoff fenced for LDS
+   only, letting a consumer read a slot's previous contents; NaN if the stale bytes decode as NaN
+   (Face A), finite garbage otherwise (Face B); window opened by dispatch preemption and any
+   process's KFD queue eviction, which is "why the rate followed those settings"; and explicitly
+   "IT WAS NEVER THE CAUSE".
+ - the NaN-only guard at `sampling.cpp` is why Face B escapes detection - verified by reading it.
+ - the #140 instance of that class is fixed in the shipped GLM path.
+DOES NOT STAND:
+ - that GLM still lacks the two-space fence at the #140 site (disproved above).
+ - that the surviving defect is at that specific site. If #315 IS an instance of this class, it is at
+   a DIFFERENT handoff - and locating it requires a static search for `barrier<workgroup>` directly
+   preceding a cross-wave GLOBAL read, which is a real search, not an inference. Not yet run.
+
+### Consequence for criterion 1, stated honestly
+The mechanism is now named at the level of "class, with the project's own root-cause text", and the
+trigger (preemption/eviction) is distinguished from the cause (insufficient fence) - which is the
+distinction that corrects both H2 and H2'. But pointing at the SPECIFIC surviving handoff is still
+open, and criterion 1 requires a named falsifiable mechanism, not a class. The next step is that
+static search, and it is cheap (grep + read, no box time).

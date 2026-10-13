@@ -168,6 +168,15 @@ Three more traps found on 2026-10-13, each of which cost time or nearly produced
 - **A pooled rate is not a rate for a configuration.** Pooling a deliberate high-rate repro rig (`315nan`, 18
   faults in 19 arms) with ordinary runs produced the "~26 %" that several instruments were powered against, when
   the two regime-controlled measurements agree at 5-7 %. See the corrected rate table above.
+- **Never build from a COPIED build directory.** CMake retains the original absolute working
+  directories inside a copied cache, so objects and linked outputs can land in the **original** build
+  directory — silently patching the very binary the arm runs use. Observed 2026-10-13: a copied clone of
+  `315instr3-build` left its working directory resolving into the reference tree, and the reference's
+  `libggml-hrx.so.0.18.0` came out carrying the experimental patch. Detected only because the check was
+  "does the NEW artifact contain a NEW string" — which failed on the new build and then showed the
+  *reference* lib carrying it. Build in a fresh directory configured against the target source, or patch
+  and rebuild the same tree in place; and always verify a rebuilt artifact by a string unique to the
+  change.
 - **A rollback path is not a rollback.** The `cwsr_enable=0` drop-in was removed for a control run and its verbatim
   bytes had never been recorded — only a path and an md5, and the file was gone. Capture the CONTENT of any
   environment change into the repository, not a reference to it.

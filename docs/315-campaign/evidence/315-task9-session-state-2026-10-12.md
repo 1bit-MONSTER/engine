@@ -5094,3 +5094,47 @@ first arm, and it makes the knob unusable for an in-regime experiment on this bo
 Four `-dev HRX0` servers remain, but they are **not mine**: they use `315fp-build` and are parented to a
 live `bash 315align2.sh` (a peer run). I verified the parent chain before considering any cleanup and left
 them alone. My own fresh1 neighbours exited with the run.
+
+---
+
+## THE PEER IS RUNNING THE DECISIVE ALIGNMENT TEST (16:20) — and it is the right one
+
+`315align2.sh` (running, holding the box lock) is the peer's second attempt at the **alignment
+discriminator**, and its header states the design and why take 1 failed:
+
+> "Take 1 was uninformative: 38s total, GTT 47GiB, no neighbours, no compaction -> the eviction window the
+> #140 class needs was never opened. This matches the prior recipe's conditions instead of simplifying
+> them: **align 256 vs 4096, cell q vs cell e, evictonly 500 + compact_memory loop + neighbour GTT, >=180
+> requests per arm in the ARMS' OWN shape** (/completion, cache_prompt=false, n_predict=96)."
+
+That is exactly the experiment the #123/#140 record used (the rig that went "1 of 8 correct to 8 of 8"),
+applied to this issue's fault - and it is the test of the alignment-sensitive emission class that the
+static leg could not settle and that `GGML_HRX_FA_PARTIAL_ALIGN` exists to enable.
+
+I am **not duplicating it**. It holds the box lock, it is the peer's, and I have nothing to add to its
+design: their take-2 corrections (real neighbours, compaction loop, the arms' request shape, >=180
+requests) are the same lessons I hit with the writeback probe (request shape matters; a quiet box does not
+open the window).
+
+### Where the cause search stands, with both agents' work pooled
+    ELIMINATED, with the reason recorded
+      the CPU read of the logits, IMMEDIATE   - refuted by its own pre-registered A/B (f84be10)
+      the CPU read of the logits, DEFERRED    - queue never populated, two independent valid probes
+                                                 (13deecb, and the peer's 315buf.sh)
+      the #140-class unfenced handoff in GLM's decode-split FA path
+                                              - read to conclusion; both fences present (1de679f)
+      the consumer read path (acquire+timepoint), dispatch ordering, the block split
+      steady computation corruption           - 0 of 6 faulting arms differ from the clean answer
+                                                 across 14 recorded-text arms (125daf6)
+    LIVE
+      the alignment-sensitive emission class  - THE PEER IS TESTING THIS NOW (315align2)
+      the device writing into a buffer whose backing eviction moved
+      an intermediate buffer damaged and propagating to the logits
+    NOT RUNNABLE AS-IS
+      the never-recycle-arena instrument       - GTT grows past the regime gate (b123145)
+
+### The constraint any surviving candidate must satisfy
+From the recorded text (n=14, including a foreign run): **correct prior outputs, then a TERMINAL
+whole-buffer event** - always `154880 of 154880` NaN, never a gradually wrong computation, and a faulting
+arm's answer to the identical prompt is character-identical to the clean arms' until the request where it
+dies.

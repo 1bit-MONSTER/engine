@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # A self-documented ordering gap: the deferred host writeback (`mark_stream_synchronized`)
@@ -88,3 +104,45 @@ Two things follow:
 
 Recorded because it is the first candidate found by the code documenting its own ordering hazard, and
 because it is the only surviving cause candidate that is both in scope and cheaply testable.
+
+---
+
+# The instrument for this already exists — and has never been run
+
+Checked before building anything, and the writeback queue is **already instrumented** in the tree that
+`315coherent-build` was built from (`~/wt/llama-315coherent`, and also `~/wt/llama-315copy`):
+
+    GGML_HRX_WRITEBACK_FINGERPRINT=1
+      -> fingerprint_writeback_log(...)   command-program-executor.cpp:84
+         "[hrx-wb-fp] value=%d size=%zu barrier=%d rec_hash=%016llx sync_hash=%016llx dst_hash=%016llx
+          rec_class=%s sync_class=%s dst_class=%s rec_eq_sync=%d
+          rec_nf16=%llu sync_nf16=%llu dst_nf16=%llu rec_nf32=%llu sync_nf32=%llu dst_nf32=%llu"
+
+That is purpose-built for exactly the question this lead poses. Per writeback it records:
+
+- **`rec_hash`** — the source fingerprint **when the writeback was recorded** (the download);
+- **`sync_hash`** — the source fingerprint **at the sync point**, when the deferred `memcpy` would run;
+- **`dst_hash`** — the destination after the copy;
+- **`rec_eq_sync`** — **whether the source changed between recording and sync.** `rec_eq_sync=0` is the
+  deferred-window hazard made directly observable: the queued `mapped_source` held different contents at
+  record time than at sync time;
+- **`rec_nf16/32`, `sync_nf16/32`** — non-finite counts on each side, which is the link to Face A.
+
+And there is a driver already written for it: `docs/315-campaign/315-fp-hunt.sh` runs instrumented
+in-regime arms and reports `wb_records=$(grep -c "\[hrx-wb-fp\]" ...)` per arm.
+
+**Neither has ever produced output.** A search of the whole record (`docs/`, `KNOWN-ISSUES.md`) and of the
+box (`~/wt/*console*.log`, `~/wt/rt-det/*/server.log`) finds **zero** `[hrx-wb-fp]` lines anywhere. The
+instrument was built on 2026-10-13 and, as far as the record shows, never switched on.
+
+## Consequence for the plan above
+
+Step 1 as written ("count it with existing instrumentation") needs no new code and no fault — one GLM
+decode with `GGML_HRX_WRITEBACK_FINGERPRINT=1` answers whether the queue is used at all, and if it is,
+whether `rec_eq_sync` is ever 0 under the eviction rig. That probe is staged at
+`~/wt/315wb-probe.sh` and queued behind the peer agent's campaign.
+
+This also means the four closed families were worked while a purpose-built instrument for a *fifth*
+candidate sat unused in the same binary — worth recording as a process observation, not a criticism: the
+instrument was built for a different framing (download fingerprints) and its writeback half had no
+consumer until this lead gave it one.

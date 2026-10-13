@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # `315align` take 2 — six arms, all clean; the compaction ingredient was silently absent
@@ -70,3 +86,23 @@ same six arms (~13 min).
 The harness bug is recorded here rather than silently patched, and the take-1 file's "what a decisive
 version needs" list is now superseded by this one — the remaining gap is the compaction write, not the
 regime, the shape or the arm count.
+
+---
+
+# Take 3 launched with the compaction write verified
+
+The one-line fix from the section above was applied and the run launched at 15:48.
+
+    start_comp(){ ... echo 1 > /proc/sys/vm/compact_memory 2>/dev/null || \
+                      sudo -n sh -c "echo 1 > /proc/sys/vm/compact_memory" >/dev/null 2>&1; ... }
+
+**Verified before launch and again during the run**, rather than assumed:
+`sudo -n sh -c "echo 1 > /proc/sys/vm/compact_memory"` returns **exit 0** — i.e. compaction is actually
+triggered — and the loop process is live (`pgrep -f compact_memory` → the `while :` shell). GTT at the
+launch was 98 GiB with 5 GLM neighbours resident.
+
+Everything else is take 2's design unchanged: `align` 4096 vs 256, cells `q` and `e`, `evictonly 500`,
+180 × `/completion` with `cache_prompt=false` and `n_predict=96` (the arms' own shape), and the cell-`e`
+contrast repeated — six arms, ~13 min.
+
+Result pending; recorded here so the launch conditions are durable rather than reconstructed later.

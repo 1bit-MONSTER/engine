@@ -398,8 +398,8 @@ trigger. That is what makes the criterion falsifiable rather than satisfiable by
 
 ### Families closed by discriminating experiment (2026-10-13)
 
-Four candidate families have since been eliminated, each by a pre-registered or source-level test rather
-than by argument:
+Six candidate families have since been eliminated, each by a pre-registered or source-level test rather than
+by argument:
 
 | family | disposition | evidence |
 |---|---|---|
@@ -407,11 +407,17 @@ than by argument:
 | the **host side** — every host access to the non-coherent `0x52` mapping | **CLOSED**: all four accesses enumerated (`buffer_memset`, `buffer_set`, `buffer_get`, `buffer_clear`) and none is on the decode path | `315-write-side-unaddressed.md` |
 | the **runtime's AQL submission policy** | **CLOSED**: `aql_block_processor.c` states in code that the runtime does not infer memory hazards, consuming only compiler-set packet flags, so it never derives a producer/consumer pair | `315-device-hunt-boundary.md` |
 | the **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | **REFUTED** by a pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT in BOTH arms (reorder on and off), 100% either way | `315-gord1-final.md` |
+| the **deferred host writeback** (`add_host_writeback` queued, flushed at `mark_stream_synchronized`) | **CLOSED by mechanism**: the queue is never populated, and the gate is `binding.host_data != nullptr` while the logits binding resolves to `nullptr` (allocation host-visible, binding device-addressable) | `315-deferred-writeback-gap.md` |
+| the **FA alignment/dispatch** class (`GGML_HRX_FA_PARTIAL_ALIGN`, the #140 family) | **RETIRED**: on GLM, every arm faulted at BOTH alignments (4096 Face B, 256 on the identity check) and even the quiet cell — meeting the pre-registered "no difference" branch that §57 pre-committed to abandoning the FA path on. Note the earlier stated gate recommendation was corrected: see `315-quiet-vs-forcer-by-level.md`. | `315-galign-peer-result.md` |
 
 ### Still open
 
-The **cause** — which handoff reads stale data after an eviction — is not located, now after closing four
-families. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch ordering,
+The **cause** — which handoff reads stale data after an eviction — is not located, now after closing six
+families. What IS established is the trigger, quantified on the quiet cell (the one cell with no instrument
+confound): ambient **~5%** against **~95%** under forced KFD eviction, a 19x contrast on the same workload at
+the same GTT level (`315-quiet-vs-forcer-by-level.md`). That file also corrects an earlier band-based gate
+recommendation, showing the quiet cell is 0% at 98G — so the gate must be the **intervention cell**, not a
+band. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch ordering,
 or a different class), and the MoE id-producing-kernel family under active work by another agent.
 
 The **`GGML_HRX_FA_PARTIAL_ALIGN`** discriminator — the #140 FA layout/dispatch class, which §57 of
@@ -420,7 +426,15 @@ the rate does not move — is pre-registered at `315-align-preregistration.md`, 
 
 ### On the fix
 
-**No forward-only fix is currently landable.** The prepared read-path patch is refuted and must not be
+**No forward-only fix is currently landable**, and the reason is structural rather than an absence of
+ideas: the engine validates **program structure** (`verify_command_program`,
+`validate_program_constant_access`) and never **memory contents**; the only content check is
+`std::isnan(logits[i])` in the sampler, Face-A only. Nothing on the replay → restore → consume path can
+distinguish bytes the device wrote from a pre-eviction stale copy, so a repair would need the runtime to
+guarantee restore fidelity (out of scope: the driver/runtime lane) or would be a Face-A-only workaround the
+entry's own rule forbids recording. Full argument: `315-no-fix-available.md`.
+
+The prepared read-path patch is refuted and must not be
 landed. The one defensive mitigation in the tree (`GGML_HRX_NAN_CONTINUE`, scrubbing NaNs to `-INFINITY`)
 addresses Face A only and is a **workaround, not a repair** — and this entry's own rule is that a
 documented limitation is acceptable only *after* the mechanism is named, so no limitation entry is

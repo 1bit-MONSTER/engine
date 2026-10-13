@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4825,3 +4809,49 @@ So the two lines are complementary and mutually constraining:
 manifests in long generations, or only in the KV cache after many tokens, or only in a different prompt
 shape, would not appear here. So this eliminates a class of mechanism for THIS workload; it does not
 eliminate it universally. That is the same limit the issue's own hidden-state work would have to respect.
+
+---
+
+## STATE OF THE TWO LIVE THREADS (15:50)
+
+Two agents are working this goal on branch `1bit/315-preregistration`. Recording the split so neither
+duplicates the other.
+
+### Thread A (mine): the recorded-text constraint - COMPLETE, n=14
+Result committed (`125daf6`): across 14 arms with recorded text (including the foreign `gord1b` run),
+**every faulting arm's output for the identical prompt matches the clean arms' answer** - 0 of 6 faulting
+arms differ. Combined with the request-by-request trace (requests 0-4 correct, request 5
+`RemoteDisconnected`), the constraint is: **the fault is a terminal, whole-buffer event and never a
+changed computation.** That eliminates the stale-index/wrong-expert class for this workload and it is the
+sharpest "when and what shape" statement the issue has.
+
+I am NOT running further arms for this: n=14 with a foreign replication is enough for the constraint, and
+more arms would only re-confirm it. The limit is recorded (short 96-token answers, one prompt).
+
+### Thread B (the peer): the deferred-writeback lead - RUNNING
+Their chain is static and strong: the logits are host-visible `0x52` (no `HOST_COHERENT`), written by the
+graph, not a graph input - so all three terms of `staging.download = access.write && !binding.graph_input`
+hold and the deferred writeback is **structurally expected** to carry them (`0802b07`). The staging buffer
+the deferred memcpy later dereferences is that same non-coherent mapping.
+
+Their probe (`~/wt/315wb-probe.sh`) is **running now**: it waits for the rig to release the box, then
+launches one server with `GGML_HRX_WRITEBACK_FINGERPRINT=1`, issues 3 decodes, and reports `hrx-wb-fp`
+records - specifically `rec_eq_sync=0`, which means **the queued source changed while queued**. That is the
+direct evidence the lead needs, and it is exactly the right measurement.
+
+Verified for them: `315coherent-build` exists (they rebuilt it) and **every arm build carries the knob**
+(`GGML_HRX_WRITEBACK_FINGERPRINT` present, `hrx-wb-fp` marker present) in `315coherent-build`,
+`315instr3-build`, `315ids-build` and `315fix-build`. So the probe will run.
+
+### How the two compose
+    peer : WHERE the bad read is queued (a deferred memcpy of a non-coherent staging buffer)
+    mine : WHEN it must fire and what shape it must have (terminal, whole-buffer, never gradual)
+A deferred read of a staging buffer that eviction moved in the window since its device copy gives exactly
+the shape my text evidence requires. Neither thread alone is a cause; together they are the tightest
+hypothesis pair in the record.
+
+### What I will do next
+Not duplicate Thread B. If the probe reports `rec_eq_sync=0` records, the deferred-writeback gap is
+CONFIRMED as the mechanism and a forward-only fix becomes well-founded. If it reports none, the lead dies
+and the remaining candidates are the write-side and intermediate-buffer classes. I will watch the probe's
+result rather than re-run it.

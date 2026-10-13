@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # The origin is at or before layer 4 — and layers 0–3 were never instrumented
@@ -61,3 +77,33 @@ attention — would. That is a different shape of candidate from anything the ca
 A **layer sweep of the prefix** — `l_out-0 … l_out-7` — with the same faithful selector, on a Face-A arm. That is
 exactly what `315lout4` (running now, selector `l_out-0, l_out-3, …, l_out-45, 46, 47`) covers at coarse
 resolution: it samples layers 0 and 3, which bracket the region this finding says the origin must be in.
+
+---
+
+# Replicated: the second in-regime Face-A arm reads the same
+
+The `315row` session produced **two** in-regime Face-A arms, and the section above asked that the second be
+checked before the reading was treated as fixed. It has been:
+
+| arm | `l_out-4` | `l_out-41` | guard |
+|---|---|---|---|
+| `315row-p1c` | `nan=20480 of 20480, first=0` | `nan=20480 of 20480, first=0` | `count=154880 of 154880` |
+| `315row-p2l` | `nan=20480 of 20480, first=0` | `nan=20480 of 20480, first=0` | `count=154880 of 154880` |
+
+Both arms, both tensors, byte-identical counts — and both arms were labelled in the session's own tally:
+
+    pair 1 arm l: OK    nan=0 req=66 gtt_start=98G
+    pair 2 arm l: FAULT nan=1 req=34 gtt_start=98G      <- 315row-p2l
+    pair 3 arm l: OK    nan=0 req=66 gtt_start=98G
+
+So this is **two independent in-regime Face-A faults**, not one, and they agree exactly:
+
+> **In both, the residual stream is entirely NaN immediately after layer 4 — every one of 10 tokens' 2048-wide
+> rows, from element 0.**
+
+Both were also limited to **layers 4 and 41** by the same `strstr` defect, so in both the prefix **0–3 is
+unmeasured**.
+
+The finding is therefore no longer single-arm, and the consequence stands with it: the campaign's per-node leads
+have been downstream of a stream that is already fully NaN by layer 4, and the unmeasured prefix 0–3 is where the
+origin must be — with breadth (all tokens, not one row) pointing at something shared across tokens.

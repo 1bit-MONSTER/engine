@@ -367,7 +367,9 @@ what follows supersedes H2's *carrier* only.
     verified after boot: cwsr_enable=1, drop-in gone, 0 cwsr entries in grub.cfg
     launch  : 04:54:37, holding BOTH locks (box.lock + npu.lock)
     watcher : kfd_smi_watch pid 8916, -t 10800 (180 min) vs a ~135 min run -> ~45 min slack
-    progress at 05:24: 4/20 pairs, 0 faults, all fix-cell arms in-regime at gtt_start=97G
+    progress at 05:41: 8/20 pairs, 1 FAULT (pair 8 l, FACE B, cwsr=1, gtt_start=97G)
+                        -- the control HAS now faulted, which is the H1-confirming direction
+                        -- and H2' failed its first quantitative test on that same arm (below)
     detached: ppid=1, so it completes regardless of any agent session
 
     READING KEY  ~26% faults -> H1 CONFIRMED (the cwsr=0 signal was a boot artefact; criterion 1
@@ -422,6 +424,29 @@ and the comment at `:306-307` distinguishes pinned transfer memory from coherent
 **Caveat that must appear in the write-up:** `HOST_COHERENT` is falsified AS A FIX (315accept: 9
 clean + 1 fault / 10). P1 does not re-propose it as a fix - it uses it as a MECHANISM PROBE. A
 clean arm B is evidence about the mechanism, not a landed repair.
+
+## THE FIRST RESULT IS IN (05:42) - read this before the sections below
+
+**The control faulted.** `pair 8 arm l: FAULT nan=0 req=22 parse=0 utf8=0` at `gtt_start=97G`,
+`detector.json` = `http_failures:1, first_failure:HTTP 500, truncated:true`, server log =
+`common_chat_peg_parse: unparsed Content-only output:` + symbol soup with invalid bytes. That is
+**Face B**, zero NaN, `identical_distinct:1`. The control runs `cwsr_enable=1`, so **a fresh-booted
+box at cwsr=1 does fault** - the H1-confirming direction, and it makes the cwsr=0 signal (0/70) look
+more like a boot/state artefact.
+
+**And H2' failed its first quantitative test on that same arm.** The first faulting arm with per-arm
+PID attribution shows **203** evictions (pre-fault, fault at 91.4s) against a clean-arm mean of
+**252.4** (n=10, median 275). The tool's verdict: "NOT supportive (faulting <= 1.5x clean)". The
+pre-fault figure is the causal direction (a fault cannot cause evictions preceding it) and it is
+compared against clean arms' full windows - the conservative comparison. H2' predicted faults
+concentrate on heavily-evicted arms; this one is on the LOW side of the clean distribution.
+
+Bounds, so neither result is over-read: n=1 faulting arm cannot establish a distribution; the clean
+mean is still moving (234.7 at n=7, 252.4 at n=10); and P3's cheap refutation form does NOT fire (the
+arm has 203 evictions, so suspension-plus-eviction did occur - what fails is the concentration
+prediction). 1 fault in 8 pairs is ordinary against a 26% baseline (expected 2.1). So: **not "H2' is
+refuted", not "H1 is confirmed".** The fault occurred at cwsr=1 and shows no eviction excess, which
+shifts weight to H1 and leaves P1 as the surviving discriminator.
 
 ## H2' is testable for the first time on this control
 

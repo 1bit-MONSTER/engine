@@ -1446,3 +1446,26 @@ It converges on the same boundary as H2' (buffer lifetime/reuse vs a reader that
 freshness) but from the kernel side, and it is directly checkable by a build-level experiment:
 nondeterminism for IDENTICAL requests is already what the comment reports. It does NOT yet name
 which of the two faces it produces, and it does NOT explain the cwsr=0/1 split. Both outstanding.
+
+## KERNEL LEAD RESOLVED NEGATIVE — 2026-10-13 05:45
+
+Checked whether the decode-split FA kernel is the LIVE mechanism. It is not.
+
+    bounded_key_value_token_count occurrences in the faulting pin (26330cc20): 24
+    bounded_key_value_token_count occurrences in the current pin (0e255d7):   24
+    -> identical. The token-bound masking that the "rows past the sequence end hold whatever an
+       earlier request left there" comment describes was ALREADY PRESENT when the fault
+       reproduced (the faulting cell ran at gtt_start=102G with parse=0).
+
+So that comment is the RATIONALE for the #314 fix, not evidence of a live defect. The kernel reads
+key/value only up to %bounded_key_value_token_count (loom:165-166, clamped at loom:214) and masks
+scores accordingly, so stale rows past the sequence end are already excluded.
+
+Recorded so this is not re-explored: the FA decode-split kernel is a dead end for the LIVE fault.
+What survives from that trail is only the merge message's phrase "looser arena reuse", which points
+at the allocation/reuse boundary generally, not at this kernel.
+
+Also settled while here: the only change to ggml-hrx.cpp between the faulting pin and the current
+pin removes a `return false` for IQ3_S/IQ4_NL GET_ROWS (i.e. PR #100 ENABLES an op the faulting pin
+refused). Unrelated to the reuse boundary, and it means the faulting configuration is otherwise
+carried forward unchanged - consistent with the fault still reproducing on the current pin.

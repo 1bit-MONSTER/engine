@@ -3355,3 +3355,38 @@ original working directories, so objects and linked outputs can land in the ORIG
 in a fresh directory configured against the target source, or patch and rebuild the same tree in place.
 And verify a rebuilt artifact by checking a NEW string it should contain - that check is what caught
 this.
+
+---
+
+## THE FIX IS BUILT (09:50) — patched binary ready for the A/B, and the build cost a lot of steps
+
+### What was built
+    tree   : ~/wt/llama-315coherent   (a COPY of llama-315instr with the one-hunk patch)
+    build  : ~/wt/315coherent-build
+    patch  : buffer_get(), ggml-hrx.cpp:250-255 - when GGML_HRX_COHERENT_READ is set, the host-visible
+             read goes through hrx_synchronous_d2h (a queued HAL DOWNLOAD) instead of a bare memcpy
+             from a non-coherent mmap
+    verify : libggml-hrx.so.0.18.0 carries the knob (1 occurrence); version 10613; compiler amdclang++
+             (same toolchain as the reference build); launcher loads its OWN libs, confirmed with ldd
+
+### The build problems, recorded because they cost most of this turn's remaining time
+ 1. **A copied build dir writes into the ORIGINAL.** Copying `315instr3-build` and repointing its cache
+    left CMake's recorded working directories resolving into the source build, so my patched object got
+    linked into the REFERENCE library. Detected by checking that the NEW artifact contained the NEW
+    string - it did not, which exposed the reference carrying it. Recovered by reverting the patch and
+    rebuilding the reference library from its own tree, then verified with a functional smoke test.
+    Now in KNOWN-ISSUES as a trap.
+ 2. **`-Werror` in hrx-system's own sources blocks a from-source build.** Two pre-existing diagnostics
+    (`array-bounds` in `runtime/src/iree/async/util/continuation.h`, `format-overflow` in
+    `loom/src/loom/tooling/testbench/expectation.c`) fail the external dependency build. Passing
+    `-Wno-error` via CMAKE_C_FLAGS does NOT work, because IREE appends `-Werror` AFTER it
+    (`build_tools/cmake/iree_copts.cmake:169,220`). The supported switch is
+    **`-DIREE_ENABLE_WERROR_FLAG=OFF`**, plumbed through `GGML_HRX_CMAKE_ARGS`.
+ 3. **The first successful build used the WRONG COMPILER.** It fell back to `/usr/bin/c++` while the
+    reference uses `/opt/rocm-therock/bin/amdclang++` - a real confound for an A/B, and potentially
+    wrong for HIP/HRX. Caught by comparing `LLAMA_COMPILER` in the two `build-info.cpp` files, and
+    rebuilt with the ROCm toolchain plus `-DLLAMA_BUILD_NUMBER=10613` so the logs are comparable.
+
+### What this cost, honestly
+Roughly 45 minutes of box time across several full rebuilds, mostly spent on problems that were NOT
+about the fix: the copied-cache incident, and IREE's `-Werror`. The patch itself is one guarded call.

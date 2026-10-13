@@ -4562,3 +4562,38 @@ transient arena resident would land on item 2's family and be rejected regardles
 The trigger finding (83% of eviction-cell arms fault vs 3.8% of controls) is an experimental result, not a
 lever, and it is not on the list. The list's items are all "things that were tried as fixes and did
 nothing", which is a different category.
+
+---
+
+# NINE RUNS: 28/33 (85%) vs 4/60 (6.7%), p = 7e-13 — and 315gord1b is a fourth FOREIGN replication
+
+`315gord1b` finished (foreign, not mine) with the cleanest result yet:
+
+    cell q: OK=4  FAULT=0
+    cell e: OK=0  FAULT=4
+    cell c: OK=3  FAULT=1
+
+Pooled across all nine runs of the frozen three-cell rig:
+
+    run       cell e        controls
+    disc1      2/4           0/10
+    disc2      5/6           0/12
+    ab1a       4/4           1/4
+    ab1b2      2/4           1/6
+    gord1a     4/4           0/8
+    ids1       3/3           0/6
+    ids2       2/2           1/3
+    ids3       2/2           0/4
+    gord1b     4/4           1/7
+    ------------------------------------
+    TOTAL     28/33 = 85%    4/60 = 6.7%
+    Fisher exact two-sided p = 7.1e-13
+
+**Three of the nine runs were not authored by me** (gord1a, gord1b, and the `ab1b2` relaunch), and two of
+those reproduced the trigger at 4/4. The eviction-vs-control contrast is as solid as this issue could
+reasonably produce, and it is an intervention with two independent control side-loads rather than a
+correlational claim.
+
+Note also that the four control faults now include a `c`-cell (CPU-pressure) fault, and several control
+faults sit on arms whose GTT had drifted into the band - consistent with the recording that the operative
+variable is memory pressure rather than the forcer process.

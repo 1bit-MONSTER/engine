@@ -583,6 +583,31 @@ extensions of this one.
    mine and was terminated; it did not affect the measurements but would have inflated a later run's
    baseline. Same class as the "silent arm loss" trap in KNOWN-ISSUES.
 
+## 6b. The "26% baseline" was inflated — reconciled, and the control is validated against an
+## independent study
+
+Every instrument in this issue was powered against "~26% (34 faulting / 131 in-regime)". Checking that
+figure against the arm ledger's own per-tag table decomposes it: **`315nan` contributes 18 of the 33
+pooled in-regime faults from 19 arms (94.7%)** and was the session built to reproduce the fault at a
+high rate. Pooled the rate is 32.4%; excluding `315nan` it is 18.1%. So "26%" mixed a deliberately
+clustered repro rig with ordinary runs.
+
+The two careful measurements agree with each other instead:
+
+    shipped-pin study (KNOWN-ISSUES, 37 arms, 102 GiB):  2/37 = 5.4%
+    TODAY'S CONTROL (27 arms, 97-98 GiB, cwsr=1)      :  2/27 = 7.4%
+    Fisher exact two-sided p = 1.000 — no difference detectable
+
+So the control is **validated**: it reproduced the issue's own earlier careful study to within noise,
+with a tighter CI and both faces represented. It also explains why P1, the ALIGN pilot and the
+>=60-arm bar's interpretation all lost power — they were sized against a rig-inflated number. The
+correct calibration for any future experiment is **~5-7% at 97-102 GiB on a fresh boot at either cwsr
+setting**, and it must be re-measured at whatever configuration is under test.
+
+This does not change the H1 conclusion: the comparison is still "faults at cwsr=1, none at cwsr=0" —
+just at a smaller absolute rate than the ledger's headline implied, which further weakens (but does
+not erase) the 0/70 campaign's evidential force.
+
 ## 6. Box state left behind
 
     HRX0 holders 0 · GTT 26 GiB (baseline) · VRAM 0 GiB · load ~1.1 · npu.lock FREE · watcher 0

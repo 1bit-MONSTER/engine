@@ -5138,3 +5138,53 @@ From the recorded text (n=14, including a foreign run): **correct prior outputs,
 whole-buffer event** - always `154880 of 154880` NaN, never a gradually wrong computation, and a faulting
 arm's answer to the identical prompt is character-identical to the clean arms' until the request where it
 dies.
+
+---
+
+## THE PEER'S ALIGNMENT RUN HAS A DEAD METRIC — its `distinct_content` is 0 on EVERY arm (16:30)
+
+Reading the peer's console, every arm reports `distinct_content=0` - including clean ones. That is not a
+result, it is a metric defect, and I can show exactly why and what the data actually contains.
+
+### The defect
+`315align2.sh:49-58` curls `/completion` into `$D/$tag.out`, then parses that file with:
+
+    for line in open(...):
+        if line.startswith('data: '): line = line[6:]
+        try: seen.add(json.loads(line).get('content'))
+
+That parser expects **SSE `data:` lines**. But `/completion` with a single request returns **one plain
+JSON object with NO newlines** - measured:
+
+    a4096-e.out: 371963 bytes, 0 lines, 0 data-lines
+    a256-e.out : 380478 bytes, 0 lines, 0 data-lines
+    a4096-q.out: 380609 bytes, 0 lines, 0 data-lines
+
+So the loop iterates once over a 371 KB line, the `startswith('data: ')` branch does not fire, `json.loads`
+succeeds on the whole object, and it adds the SAME single content string each time - a set of size 1. The
+reported `0` is then the `except` fallback or an empty-set artefact; either way the column carries no
+information about any arm. **`distinct_content` must be ignored in this run's results.**
+
+### What the data DOES contain
+The output files are intact and readable, and all three arms produce:
+
+    {"index":0,"content":" The fox is a quick and a brown fox. The dog is a lazy and the field is a field.
+     The fox is a quick and a brown fox. The field i..."
+
+That is a **repetition loop** - the same degenerate pattern on `a4096-e`, `a256-e` AND `a4096-q`. So:
+ - the loop appears on the CLEAN arm too (`a4096-q`), so it is not by itself the fault;
+ - it suggests these arms are in a degenerate regime for this prompt (a 17-word prompt with
+   `n_predict=96` at temperature 0), which is worth knowing before reading any of the alignment arms as
+   evidence about the fault.
+
+### Why I am recording this rather than running my own
+The peer's run is still going and holds the box lock. Its **design** is right - align 256 vs 4096, cell e
+vs q, forcer + compaction + neighbours, 180 requests in the arms' shape - and that is the correct test of
+the alignment-sensitive emission class. But its **reporting** is broken in two ways I can name precisely
+(`distinct_content` never populated; and the fault signal is only the `nan=` count plus whatever the server
+log holds), so its conclusions will need to be re-derived from the raw `.out` and server logs rather than
+from its console columns.
+
+The honest note for whoever reads that run: `distinct_content=0` on every arm is a defect signature, not a
+finding, and it is the fifth measurement instrument on this issue to produce a zero for the wrong reason
+(after the ids dump, the writeback fingerprint, the first writeback probe and the fresh-arena knob).

@@ -4207,3 +4207,48 @@ Recorded because it means any further experiment would need to wait for it or co
     drop-in        : present, with cwsr_enable=0 in 3 grub.cfg entries (the shipped BOOT state)
     locks          : npu free, box free
     VRAM           : 0 GiB
+
+---
+
+## OPTION (b) INSTRUMENTED: the harness now persists response TEXT (14:20)
+
+While the box is held by a foreign run, I did the piece of work that needs no GPU and that unblocks the
+cheapest remaining cause test.
+
+### What was wrong
+`~/wt/315-detector.py` calls `note(rec)` for **every** request with the full record - including
+`content` and `excerpt_hex` - but `note()` only increments counters, and the script writes a SUMMARY to
+`detector.json`. The per-request content is computed and then discarded. So a faulting arm's output text
+has never been recoverable, and with it the possibility of testing whether a WRONG EXPERT produced it.
+
+### The change (additive only)
+ 1. `rec` gains a `prompt` key so a record is self-describing;
+ 2. a `records` list accumulates `{i, prompt, http_status, utf8_ok, json_ok, content, excerpt_hex, error}`
+    for EVERY request, clean or faulting;
+ 3. a second output file `detector-records.json` is written beside the summary.
+
+Verified:
+ - **the summary schema is byte-for-byte the same** (`requests, ok, utf8_failures, parse_failures,
+   http_failures, transport_failures, identical_distinct, first_failure, truncated`), so the scorer,
+   `315-rate.py`, and the frozen classification are unaffected;
+ - the diff is 27 lines, all additions except the one-key `prompt` addition to the record literal;
+ - `python3 -c "ast.parse(...)"` passes;
+ - a dry run against a dead port wrote BOTH files, with `detector-records.json` carrying 8 keys including
+   `content` and `prompt`.
+ - backup at `~/wt/315-detector.py.bak-preserve-records`.
+
+Note the detector checksum in the console changes (9d46ec45... -> 314da4a7...). The console records
+`detector_sha256` but nothing ENFORCES it (`grep` over the drivers shows only the `say` line), so this is
+a recorded provenance change rather than a break. Any run made from here on is a NEW instrument version
+and must be labelled as such - it cannot be pooled with earlier arms as though the detector were identical.
+
+### Why this matters
+It restores the one test that does not need the dead instrument. With response text for a faulting arm, a
+routing error can be detected WITHOUT reading the ids: recompute the MoE output for the same prompt from
+the same weights and compare. A wrong expert produces a large, structured discrepancy; a NaNs-only fault
+produces a different signature. That is a CPU-side comparison against recorded text - no GPU, no kernel
+change, no coherence problem.
+
+### Honest caveat
+This is instrumentation, not a result. It makes the test POSSIBLE; it does not answer it. And it cannot be
+run until the box is free, since the arm's text only exists if the arm runs.

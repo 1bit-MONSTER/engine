@@ -2313,3 +2313,36 @@ Noted for the record: the orphan existed because a faulting arm's server dies wi
 reaping it, which is the same class as the "silent arm loss" trap already in KNOWN-ISSUES. It held
 HRX0 across the tail of the run and into the teardown; it did NOT affect the measurements (the arm's
 own window ended at its fault), but it would have inflated a NEXT run's baseline if left.
+
+---
+
+## task-9's CONDITION was evaluated and is NOT MET (07:35)
+
+task-9's own contract: "Only if task-7's instruments name a mechanism: forward-only branch or pin
+move ... then a pre-registered >=60 in-regime arm campaign ... **Not attempted while the mechanism is
+unnamed.**"
+
+The condition was evaluated this turn by running task-7's instruments to their conclusions:
+
+    instrument                              outcome
+    the cwsr=1 fresh-boot control (H1)      RAN. Faulted 2/27 = 7.41%, both faces.
+                                            -> H1 CONFIRMED; the cwsr signal's evidential
+                                               value collapses; 'cwsr=0 prevents it' is dead.
+    the per-arm eviction correlation (H2')  RAN. Faulting mean 109.5 vs clean 254.5; one faulting
+                                            arm at 16 against a clean floor of 117.
+                                            -> H2' FALSIFIED (predicted excess, observed deficit).
+    the P1 movement-denial discriminator     WITHDRAWN. Power requires a rate it does not have
+                                            (P(clean B | irrelevant) = 0.21-0.46), and cost is
+                                            6.3 h against ~9.4 h spent of a 12 h ceiling.
+    the #123/#140 stale-buffer class         CHECKED at source. The two sites #140 fixed are correctly
+                                            fenced in GLM's path; four hazard hypotheses read to
+                                            conclusion and rejected; consumer read path cleared
+                                            (s56); dispatch ordering cleared (s54).
+
+**No mechanism is named.** So task-9's condition is NOT satisfied and the task must not be attempted -
+attempting it (a >=60-arm campaign and a forward-only fix) would be doing exactly what the contract
+forbids: acting while the mechanism is unnamed, and shipping a change no evidence supports.
+
+This is recorded as a RESOLVED-CONDITION, not a skip-to-avoid-work: the condition was actively
+evaluated with three instruments and a source audit, and every one of them came back negative for a
+mechanism. The honest state is that the issue's own candidate family is exhausted by measurement.

@@ -689,3 +689,87 @@ forward-only fix) still requires the code site.
 Clean: 0 HRX0 holders, GTT 26 GiB, VRAM 0 GiB, locks free, load 0.2. Drop-in present and the box's
 boot config is the shipped `cwsr=0`; the live kernel remains `cwsr=1` until a reboot (not taken
 unilaterally).
+
+---
+
+# UPDATE 9 (2026-10-13 ~10:55) — the A/B REFUTES the read-path fix; the cause is NOT the logits read
+
+This supersedes the "fix is prepared, waiting on the A/B" position in UPDATE 8 and the session-state
+file. Read this before those.
+
+## The result
+
+Same binary, same frozen three-cell rig, one knob (`GGML_HRX_COHERENT_READ`). Arm A = knob OFF,
+arm B = knob ON.
+
+    cell e (forced eviction, the test cell)     arm A: 0 OK / 4 FAULT      arm B: FAULT in r1, r2
+    cell q (quiet)                              arm A: 3 OK / 1 FAULT      arm B: r1 OK
+    cell c (CPU pressure, no GPU)               arm A: 4 OK / 0 FAULT      arm B: r1 OK, r2 FAULT
+
+Arm B's cell-`e` arms faulted with the fix engaged — verified by reading the arm server's own
+`/proc/<pid>/environ` while the arm ran (`GGML_HRX_COHERENT_READ=1`) — producing **Face B** in both
+rounds (`http=1 s500=1 unparsed=2`, the server's "does not match the expected Content-only format").
+
+This is the pre-registration's OWN refutation branch (`fc7ffd5`):
+
+> **B ~= A -> H-fix REFUTED. The memcpy is not the site; the stale data enters elsewhere.**
+
+## The refutation is not dismissible
+
+The one objection that would have made it vacuous — that `hrx_synchronous_d2h` might itself end in an
+incoherent read — was checked at source and **disproved**
+(`docs/315-campaign/evidence/315-ab1-fix-path-is-coherent.md`): the runtime's download routes to the
+amdgpu staging path, whose pool is created
+`HOST_LOCAL | HOST_COHERENT | DEVICE_VISIBLE` (`host_queue_staging.c:427`). The fix genuinely supplies
+a coherent read; it simply is not where the corruption enters.
+
+## The mechanism is now better supported, not worse
+
+The cell-`c` fault (`315-ab1-cell-c-fault-drift.md`) is the strongest mechanism evidence yet: a
+CPU-only control cell, clean 4/4 in arm A, faulted Face A here — and its GTT trace shows why. Sampled
+every 5 s it climbs **97G -> 106G** as the CPU load rises 3 -> 21, then settles oscillating in
+**99-104G**. It walked into the eviction band on its own.
+
+That is the mechanism's operative variable made observable, and it is now reached by **three
+independent routes**: the forcer (`evictonly`, disc1/disc2 7/10), a quiet arm drifting (arm A r2), and
+CPU pressure drifting (this). All three share one variable: **memory pressure that makes KFD evict
+in-flight work**, not the forcer process and not the read path.
+
+## Two consequences that must not be lost
+
+1. **The regime gate is necessary but not sufficient.** `gtt_start in [95,110]` does not hold for the
+   arm's duration; a cell can start at 97G and spend its life at 100-104G. Cell membership has to be
+   argued from the trace, not the gate label.
+2. **The recorded 0/70 campaign does not bear on this.** `315cwsr70` ran cells `l` (70) and `c` (24)
+   with **no cell `e`** — no forcer, so no band. Its 0 faults are an ambient-rate measurement, and its
+   own commit already said "both cells ran the same revision" and "a clean trace is NOT evidence about
+   the fault's mechanism" (`315-0of70-has-no-eviction-cell.md`). It is not contradicted by, and does
+   not contradict, the eviction faults.
+
+## Criteria after this update
+
+| criterion | state |
+|---|---|
+| 1 — named mechanism + discriminating experiment | **trigger MET** (forced eviction, replicated, both faces); cause **NOT** located |
+| 2 — forward-only fix landed | **NOT ACHIEVED.** The prepared read-path fix is refuted by this A/B. Patch preserved at `docs/315-campaign/patches/315-coherent-read-fix.patch`, NOT to be landed. |
+| 3 — >=60 in-regime arms, zero faults | not met in the sense that matters: the 0/70 run has no eviction cell, and on a fixed build the bar needs arms that reach the band |
+| 4 — no regression | not reached (nothing landed to regress) |
+
+## What a next turn should do
+
+- **Do not land the read-path fix.** It is refuted; landing it would ship a change the evidence
+  contradicts.
+- Read **all four** new evidence files: `315-ab1-arm-B-interim.md`, `315-ab1-fix-path-is-coherent.md`,
+  `315-ab1-cell-c-fault-drift.md`, `315-0of70-has-no-eviction-cell.md`, plus the two corrections in
+  `315-ab1-two-drivers-incident.md`.
+- The cause is still open. The read path is now **eliminated**; the surviving candidate families are
+  the ones §55/§56 left open (executor-level cross-dispatch ordering, or a different class), plus the
+  write-side access asymmetry recorded in `315-write-side-unaddressed.md` (whose logits form is
+  already falsified).
+
+## Box state / coordination
+
+One driver only (`315ab1b2`, holds `~/.cache/lax-decode/box.lock`). `~/npu.lock` is FREE. A SECOND Pi
+session (`01a12f94`, tmux `pi-315`) is pursuing this same goal; it is currently idle/blocked on a stale
+`~/npu.lock` premise and did not resume. See `~/wt/315-COORDINATION.md`. Do not run two drivers on one
+tag.

@@ -1531,8 +1531,136 @@ looks, but it is not nothing and it has never been measured.
  3. **Any "the fault is gone" claim** must state which build it was measured on, because the
     instrumented tree is not the shipped configuration.
 
+### The criterion-4 baseline is CLEAN - checked, so the gap does not taint it (05:48)
+Chased the baseline's own build rather than assuming the gap applies to it:
+
+    docs/315-campaign/evidence/315-hrx-tests-baseline.md header:
+      "run 2026-10-09T22:55-03:00 on strixhalo, build dir ~/wt/v315-build
+       (fork at 26330cc20; ggml/src/ggml-hrx identical to the pin e44c9d01a)"
+    ~/wt/v315-build/CMakeCache.txt -> ggml_SOURCE_DIR = ~/wt/llama-hybrid/ggml
+    ~/wt/llama-hybrid: HEAD=ec0175971, dirty files=0, `git diff HEAD -- ggml/src/ggml-hrx/` EMPTY
+
+So the tree behind the criterion-4 baseline is genuinely STOCK: clean worktree, no HRX diff. The
+9-runnable-tests-all-green baseline is therefore citable as a baseline, and criterion 4's
+"unchanged relative to baseline" has a real stock comparison point. The stock-build gap above applies
+to the ARM binaries (all instrumented), not to this baseline.
+
+Caveat carried: the baseline was taken at fork rev 26330cc20 while its header says the hrx tree is
+"identical to the pin e44c9d01a" - consistent with the 2026-10-13 finding that the only ggml-hrx.cpp
+change between those revs is the IQ3_S/IQ4_NL GET_ROWS guard removal. If the eventual fix moves the
+pin, re-running this baseline on the new pin is the clean way to make the "unchanged" claim.
+
 ### What is NOT claimed
 This does not show the instrumentation causes or suppresses the fault. Section 41 established the
 copy probe is read-only and the sentinel touches only the 619520-byte logits allocation, and the
 70-arm campaign faulted 0/70 on an instrumented pair of binaries while run 7 faulted 3/11 - so
 instrumented runs reproduce faults fine. The gap is a record-keeping and baseline-purity issue.
+
+---
+
+# !!! THE CONTROL HAS FAULTED — pair 8 arm l, FACE B, at cwsr=1 (05:40:47) !!!
+
+This is the discriminator firing, and it points at **H1 being CONFIRMED** (the cwsr=0 signal was a
+boot effect), NOT at H2' being the sole survivor. Recorded verbatim before any interpretation.
+
+## The fault, from the console and the arm's own detector
+
+    pair 8 arm l: FAULT nan=0 req=22 ret3=0 parse=0 gtt_start=97G utf8=0 alloc=0 hv52=0 hv56=0 (gtt_now=104G)
+
+    detector.json:
+      requests: 22   ok: 21   utf8_failures: 0   parse_failures: 0
+      http_failures: 1   transport_failures: 0   identical_distinct: 1
+      first_failure: HTTP 500     truncated: True
+
+    server.log tail:
+      1.31.423.659 W common_chat_peg_parse: unparsed Content-only output:  gaps = =,.. condition，) for for for):): (.., (�..,-R,, 的(I (。 (...(R.,(A,,
+      1.31.428.076 W srv operator(): got exception: {"error":{"code":500,"message":"The model produced output
+                     that does not match the expected Content-only format","type":"server_error"}}
+
+## What this arm IS
+ - **Face B**, unambiguously: the parser rejected degenerate output containing invalid bytes (`�`), and
+   the server returned HTTP 500. `first_failure: HTTP 500` is the detector's own record.
+ - **Zero NaN** (`nan=0`), so this is the FINITE-corruption face - exactly the shape mechanism §44
+   described ("the observable depends on what the corrupted memory happened to hold").
+ - `identical_distinct: 1`, consistent with §42's landscape finding that Face-B arms are not divergent.
+ - The garbage is the symbol-soup flavour §44 recorded for Face B, not the repetition-loop flavour.
+ - In-regime: `gtt_start=97G`, at the frozen gate.
+
+## Why this matters so much
+**The control is `cwsr_enable=1`, and it faulted.** So a fresh-booted box at cwsr=1 DOES fault. That is
+the H1-confirming direction:
+
+    H1 (fresh-boot confound) -> CONFIRMING EVIDENCE
+    the cwsr=0 signal (0/70) may indeed have been a boot/state artefact rather than an effect of CWSR
+
+Combined with 315-H1-FALSIFIED.md this is now genuinely contested: that doc argued run 7 was
+fresh-booted (~6-40 min) and faulted 3/11, so a fresh boot does not suppress the fault; but run 7's
+faults were 2 Face A + 1 Face B at ~97-98G with an INSTRUMENTED pair, and this control's first fault
+is Face B at 97G on the same instrumented pair. What differs is only the run and its timing.
+
+## What must NOT be concluded yet
+ - ONE fault in 8 pairs is not a rate. The 26% baseline over 8 in-regime fix-cell arms predicts ~2.1
+   faults; observing 1 is entirely ordinary. The reading key needs the FINAL tally, not the first fault.
+ - This does not by itself falsify H2'. H2' predicts faults require resumption + movement, and this
+   arm at cwsr=1 is a resumption arm - so the fault is *consistent with* H2' too. H2' and "H1 was a
+   boot artefact" are not mutually exclusive; both predict faults at cwsr=1.
+ - The clean way to separate them is exactly what was pre-registered: P2/P3 on this faulting arm
+   (does it show pre-fault evictions for its own pid?) and P1 (does denying movement suppress faults).
+
+## Immediate next step (the H2 test this run exists to enable)
+This arm has `server.pid`, so it is the FIRST faulting arm in the issue's history with per-arm PID
+attribution available. Run the pre-registered comparison now:
+
+    315-evict-per-arm.py ~/wt/rt-det 315ctl1-console.log --smi ~/wt/315ctl1-evict/kfd_smi.tsv --tag 315ctl1
+
+  P2: does p8l exceed the ~228-235 clean-arm baseline in PRE-FAULT evictions?
+  P3: does p8l have ZERO own-pid evictions (which would refute H2' outright)?
+
+---
+
+# H2' PREDICTION FAILS ON ITS FIRST REAL TEST (05:42) — the eviction-load asymmetry is not there
+
+The first faulting arm with per-arm PID attribution is the test H2' was built to face. It fails it.
+
+    315ctl1-p8l   pid 265323   97G   FAULT   pre-fault 203   window 203   fault at 91.4s
+    clean arms    n=10   min 160  median 275  max 342  mean 252.4
+
+    tool verdict: "NOT supportive (faulting <= 1.5x clean)"
+    window total, mean: faulting 203.0 vs clean 252.4
+
+## What H2' predicted vs what happened
+H2' predicts the fault needs a buffer moved during the arm's own suspension window, so faulting arms
+should show MORE evictions - the pre-registered form was "faulting arms exceed the ~228-235 clean
+baseline" (P2). Observed: **203, i.e. 81% of the clean mean of 252.4, and below the clean median 275.**
+The faulting arm is on the LOW side of the clean distribution, not the high side.
+
+This is the causal direction done properly: the pre-fault figure counts only evictions BEFORE the
+fault instant (91.4 s), which the fault cannot have caused, and it is compared against clean arms'
+FULL windows - the conservative comparison the tool itself flags as favouring not finding an effect.
+The faulting arm still loses under that generous comparison.
+
+## Honest bounds on this falsification
+ - **n=1 faulting arm.** A single fault cannot establish a distribution. This is one draw, and the
+   pre-registered bar needed faulting-vs-clean asymmetry across several faults, not one.
+ - The clean mean rose from 234.7 (n=7) to 252.4 (n=10) as arms accumulated, so the comparator is
+   still moving. The direction is stable though: 203 is below both the old and the new clean mean.
+ - P3 explicitly offered the cheap refutation form - "an arm faults with ZERO Q_EVICT for its pid" -
+   and that does NOT fire: p8l has 203, so the arm *was* suspended and evicted, consistent with the
+   mechanism being possible. What fails is the QUANTITATIVE prediction that faults concentrate on
+   heavily-evicted arms.
+
+## What this does to the mechanism picture
+ - H2' is not yet dead (n=1, and the qualitative precondition - suspension plus eviction occurred -
+   holds), but its discriminating quantitative prediction has failed its first opportunity.
+ - Read together with the fault itself being at **cwsr=1**, the weight now shifts to **H1**: the
+   cwsr=0 signal (0/70) may have been a boot/state artefact, and faults may be roughly as common at
+   cwsr=1 as the historical ~26% suggests - which is exactly what this control was built to detect.
+ - Both readings agree the fault is NOT explained by "faulting arms are the heavily-evicted ones".
+ - The surviving discriminator is P1 (deny buffer movement at cwsr=1): if faults persist unchanged
+   with movement denied, the whole eviction-buffer story - H2 and H2' alike - is done.
+
+## What must not be claimed
+Not "H2' is refuted" (n=1). Not "H1 is confirmed" (needs the final tally, and 1 fault in 8 pairs is
+ordinary at a 26% baseline - expected 2.1). The honest statement is: **the first faulting arm with
+attribution does not show the eviction excess the mechanism predicted, and the fault occurred at
+cwsr=1.**

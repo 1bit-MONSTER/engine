@@ -1574,3 +1574,48 @@ KNOWN-ISSUES updated to match (`58310d1`), replacing the FA row's OPEN status.
 Still **not located**, but the exclusion surface is now much firmer than a week of prose: seven candidates
 have been excluded by pre-registered experiment on the frozen rig or by mechanism read at source, and the
 trigger is quantified (ambient ~5% vs forced eviction ~95%). Criterion 2 remains not achievable within scope.
+
+---
+
+# UPDATE 22 (2026-10-13 ~19:10) — criterion 4 measured on BOTH halves; no fix branch exists anywhere
+
+## Criterion 4 is now fully measured
+
+| half | result | evidence |
+|---|---|---|
+| MUL_MAT_ID op-test + HRX suite | **8/8 pass**, nmse matching baseline (1.34–1.61e-05 vs 1.23–1.58e-05) | `315-crit4-control-result.md` |
+| dense-model control (Qwen3-8B) | **clean**: 50/50 responses, 1 distinct content, 0 NaN, 0 Content-only, 0 HSA errors | same file |
+
+The dense half is the **negative control**: it shows the detector, build, HRX0 path and request shape do not
+fault everything in sight, which is what makes the GLM arms' ~95% eviction-cell rate attributable to the
+model/shape rather than the apparatus.
+
+Criterion 4 is still not *met* in its own terms — it pairs these controls with a fix to compare against, and
+no fix has landed — but the baseline a future fix must match is now **measured and intact**.
+
+## No fix branch exists anywhere
+
+Checked every 315 branch on the remote: `1bit/315-known-issues-rate-and-closures` and
+`docs/known-issues-315-pin-note` are documentation, and `engine-315/coherence-fix` is a **pin record, not a
+repair**. So the two other agents sharing this goal are on documentation/rate evidence, not on a fix.
+
+## Where the goal stands, plainly
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named, falsifiable mechanism | **trigger: MET** — named, replicated, quantified (ambient ~5% vs forced eviction ~95%; pooled p≈1.3e-17 on 29 eviction arms vs 57 controls); **cause: NOT LOCATED**, with the in-scope surface **enumerated and excluded** (7 candidates) |
+| 2 | forward-only fix landed | **NOT ACHIEVABLE within scope** — a repair needs a distinction the engine cannot make (real bytes vs a pre-eviction copy); the runtime proposal recording this is written (`315-runtime-restore-fidelity-proposal.md`) |
+| 3 | ≥60 in-regime arms, zero faults | **NOT MET, and the gate is mis-specified** — it must be the intervention cell with the ambient rate reported alongside, not a band on `gtt_start`; and a fixed-build campaign cannot run because there is no fix |
+| 4 | no regression | **MEASURED on both halves** (above); not *met* pending a fix to compare against |
+| 5 | KNOWN-ISSUES updated | **DONE**, re-corrected for this session's parse error |
+
+## This session's defects, all recorded rather than hidden
+
+Eight harness/parse defects: a line counter on newline-free NDJSON; a `pgrep` matching its own caller;
+`md5sum` over streaming responses (which briefly reproduced a *false* family exclusion); guessed binary names;
+a `sudo -n tee` writing nothing; a symbol-search false negative; my own monitoring preventing a run from
+starting; and again a line counter on concatenated JSON (the dense control, where the script's own verdict was
+the opposite of the truth).
+
+The consistent lesson, now stated three times on the record: **count occurrences not lines, read the baseline
+rather than reconstructing it, and check the symbol/pattern you actually used.**

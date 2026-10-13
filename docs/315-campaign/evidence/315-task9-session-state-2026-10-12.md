@@ -3909,3 +3909,43 @@ Run the frozen three-cell rig with the ids instrument pointed at the routing ten
 
 This is diagnostic work, not acceptance: the eviction cell faults at 83% pooled, so a faulting arm
 should appear within ~2 arms and a few arms suffice to read the metric.
+
+---
+
+## PROBE DEFECT FOUND AND FIXED (13:05) — and a FIFTH independent replication
+
+### The probe defect: the instrument's name match is EXACT, not substring
+`~/wt/llama-315copy/ggml/src/ggml-hrx/ggml-hrx.cpp:570-588`, `hrx_fp_name_listed`:
+
+    if (len == name_len && std::strncmp(p, name, name_len) == 0) { return true; }
+
+It compares each comma-separated list entry against a node name with **equal length**. The comment above
+it explains why: the previous filter was `std::strstr(list, name)`, which matched a list entry
+`ffn_moe_weights-41` against a node named `ffn_moe_weights-4` - a probe defect that section 50/51 had to
+work around.
+
+The fix over-corrected for the case that matters here: GLM's node names carry a layer suffix, so the real
+names are `ffn_moe_topk-1`, `ffn_moe_topk-2`, ..., `ffn_moe_argsort-41`. My list said `ffn_moe_topk` and
+`ffn_moe_argsort`, which match **nothing**, so the instrument emitted zero lines in `315ids1` despite the
+env reaching the server correctly (verified in the console's `extra_env=`).
+
+**Both defects are the same class**: a name filter that is wrong in one direction or the other. The
+correct form is anchored-prefix matching (`strncmp(p, name, name_len) == 0 && (p[name_len] == ',' ||
+p[name_len] == '\0')` when matching a full entry, or an explicit `-` boundary when the list entry is meant
+as a prefix). Recorded because it has now cost two probe runs: `315ids1` produced no data at all.
+
+### Fifth independent replication of the trigger
+`315ids1` ran the frozen rig with the same instrumented binary and reproduced the effect cleanly, even
+though its instrument was mis-configured:
+
+    cell q: OK=3  FAULT=0  OOR=0 INVALID=0
+    cell e: OK=0  FAULT=3  OOR=0 INVALID=0     <- 3 of 3
+    cell c: OK=3  FAULT=0  OOR=0 INVALID=0
+
+Pooled across all five runs: **18 faults / 21 eviction-cell arms (86%)** against **1 fault / 40 control
+arms (2.5%)**. Both faces appear repeatedly.
+
+### `315ids2` launched with the exact names
+    driver : ~/wt/315-disc.sh 2 315ids2,  BIN=~/wt/315ids-build/bin
+    EXTRA_ENV: GGML_HRX_TENSOR_FP=ffn_moe_topk-1..-4,ffn_moe_argsort-1..-4 (EXACT suffixed names)
+    purpose: read [hrx-ids-fp] dup_pairs on a faulting arm's routing rows

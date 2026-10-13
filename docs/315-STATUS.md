@@ -351,3 +351,125 @@ their arms) and one Face-B parse failure (81.2 s, `req=20`).
 Unchanged: **1 open** (control), **2 open** (no repair landed), **3 in progress**, **4/5 not started**.
 But criterion 3 is now much harder to pass *falsely* — the detector reconciliation and the fix-cell
 count both stand between a clean-looking console and a claimed pass. That is the point.
+
+---
+
+# UPDATE 6 (2026-10-13 ~05:20) — H2 is re-carried as H2' (resumption, not interruption), and the
+# control that tests H1 is now running
+
+Read this with `315-mechanism.md` §59, which is the previous frontier. Nothing above is retracted;
+what follows supersedes H2's *carrier* only.
+
+## The control is RUNNING (this is criterion 1's decisive test)
+
+    tag     : 315ctl1     config: amdgpu.cwsr_enable=1     pairs: 20
+    boot    : 2026-10-13 04:53:19  (the control rebooted; the cwsr drop-in was removed first)
+    verified after boot: cwsr_enable=1, drop-in gone, 0 cwsr entries in grub.cfg
+    launch  : 04:54:37, holding BOTH locks (box.lock + npu.lock)
+    watcher : kfd_smi_watch pid 8916, -t 10800 (180 min) vs a ~135 min run -> ~45 min slack
+    progress at 05:24: 4/20 pairs, 0 faults, all fix-cell arms in-regime at gtt_start=97G
+    detached: ppid=1, so it completes regardless of any agent session
+
+    READING KEY  ~26% faults -> H1 CONFIRMED (the cwsr=0 signal was a boot artefact; criterion 1
+                              collapses and the issue must be re-scoped honestly)
+                 ~0%  faults -> H1 DEAD (the signal is real; H2' is the sole survivor)
+    score with: ~/wt/315-rate.py 315ctl1-console.log --det ~/wt/rt-det --tag 315ctl1
+    ROLLBACK  : sudo cp ~/work/amd_cwsr.cfg.backup /etc/default/grub.d/amd_cwsr.cfg &&
+                sudo update-grub && sudo systemctl reboot   (md5 a8b25738...)
+
+Note on the H1 falsification above: it was inferred from `boot_ns`, and this control is the
+purpose-built confirmation that UPDATE 5 item 6 and UPDATE 3's final line both asked for. If the
+control faults at ~26%, that inference was wrong and the cwsr signal was a boot effect after all.
+
+## H2' — the carrier that survives the DRAIN refutation
+
+H2 as written said cwsr=0 "removes mid-wave preemption". That is refuted:
+`reference/amd/gpu/context-save.md:304` says the KFD update path **first removes the queue from
+hardware** in BOTH branches, so the SAVE-vs-DRAIN choice (which cwsr_enable selects, GFX11 mapping
+SAVE to DRAIN_PIPE) governs only the hardware request, not whether a wave is unhooked.
+
+H2' keeps the empirical signal and moves the danger from interruption to **resumption**:
+
+> CWSR preserves a wave's registers and LDS and remaps the queue so the wave resumes. It does NOT
+> own or copy the executable, arguments, payloads or private scratch the wave will re-read -
+> `context-save.md:6` ("Saved waves still depend on their executable, arguments, payloads and
+> private scratch") and `:299` ("not an application checkpoint that OWNS COPIES of ... external
+> buffers or private scratch"), with `:330` assigning those to "every unfinished producer/consumer
+> that CAN RESUME". So under pressure a migration/eviction between suspension and resumption leaves
+> the resumed wave reading stale or recycled buffers, and what those bytes now hold decides Face A
+> (NaN/poison) vs Face B (finite garbage tokenised as invalid UTF-8).
+
+Why the refutation ENABLES rather than kills it: cwsr=1 -> SAVE -> resumes -> re-reads; cwsr=0 ->
+DRAIN -> abandoned -> never re-reads. The window is resumption, not interruption.
+
+## The discriminating experiment is pre-registered and needs NO rebuild
+
+    P1 HYPOTHESIS  at cwsr=1, denying buffer movement suppresses the fault
+    P1 PREDICTION  cwsr=1 + direct coherent bindings -> ~0 faults;  cwsr=1 default -> ~26%
+    P1 REFUTATION  ~26% faults persist with movement denied -> H2' is dead
+
+    arm A (movement allowed): 315-evict-trace.sh <pairs> 315p1a <SAMEBIN> <SAMEBIN>
+    arm B (movement denied) : EXTRA_ENV="GGML_HRX_USE_UNIFIED_MEMORY=1" \
+                              315-evict-trace.sh <pairs> 315p1b <SAMEBIN> <SAMEBIN>
+
+Both arms must be SEPARATE runs: `EXTRA_ENV` is threaded per arm and is NOT cell-selective
+(`315-paired-pidcap.sh:66-67`), so a single paired run cannot express P1. With FIX_BIN == CTRL_BIN
+the c/l split becomes a same-build A/B repeat, and run A doubles as the movement-allowed control.
+The knob is real and per-arm: `ggml-hrx.cpp:1173` reads `GGML_HRX_USE_UNIFIED_MEMORY` at runtime
+into `use_direct_host_bindings`, `:304` gates on it, `:310` adds `HRX_MEMORY_TYPE_HOST_COHERENT`,
+and the comment at `:306-307` distinguishes pinned transfer memory from coherent direct bindings.
+
+**Caveat that must appear in the write-up:** `HOST_COHERENT` is falsified AS A FIX (315accept: 9
+clean + 1 fault / 10). P1 does not re-propose it as a fix - it uses it as a MECHANISM PROBE. A
+clean arm B is evidence about the mechanism, not a landed repair.
+
+## H2' is testable for the first time on this control
+
+Every previous run failed H2's prerequisite (a per-arm PID): run 7's PID was contaminated,
+`315disc1` had 0 `server.pid`, `315cwsr70` had 0 faults. This control satisfies the whole chain:
+5/5 arms on `server.pid`, 4/5 `detector.json`, SMI stream alive, `PROC_START` resolving per arm pid,
+and 3695 `Q_EVICT` rows already present. All five arms show BOTH `Q_EVICT` and `Q_RESTORE`
+attributable to their own pid, so suspension-plus-resumption is directly observable.
+
+    H2 DENOMINATOR ON RECORD (clean in-regime arms, n=4, at 97G):
+        min=160  median=262  max=293  mean=227.8 pre-fault evictions
+    P2  faulting arms should exceed that
+    P3  a faulting arm with ZERO own-pid evictions refutes H2' outright
+    read with: ~/wt/315-evict-per-arm.py ~/wt/rt-det 315ctl1-console.log \
+                 --smi ~/wt/315ctl1-evict/kfd_smi.tsv --tag 315ctl1
+
+## Also settled on 2026-10-13 (negatives, so they are not re-explored)
+
+- **Arena-knob / coherence dead end re-confirmed.** `~/wt/315-coherence-fix.patch` has criterion 2's
+  exact forward-only shape but is falsified: lever row 1 of 10 in KNOWN-ISSUES §"Levers tested and
+  excluded", and `tools/315-lever-check.py` rejects a diff adding `HOST_COHERENT` with exit 1.
+- **The decode-split FA kernel is NOT the live mechanism.** `bounded_key_value_token_count` appears
+  24 times in the faulting pin (26330cc20) and 24 times in the current pin (0e255d7) - identical - so
+  the token-bound masking the "rows past the sequence end hold whatever an earlier request left there"
+  comment describes was already in place when the fault reproduced. That comment is the rationale for
+  the #314 fix, not evidence of a live defect. (Hypotheses disproved by reading rather than asserted:
+  `masked_value_stage` is per-subgroup offset so its subgroup barrier is sufficient; `probability_stage`
+  is workgroup-wide but a workgroup barrier at loom:316 orders it; workgroup 256 / subgroup 64 = 4.)
+- **The access-mode defect does not apply to this model** (`b854af3`): GLM-4.7-Flash never dispatches
+  `q6_k_token1_shortlist`, so the one-word manifest fix is correct on its own merits but is not this
+  issue's mechanism.
+- **Ancestry chain confirmed** (the fork clone was SHALLOW; it has been unshallowed, so the
+  forward-only proof and the bisect are now checkable locally):
+  `f2099e9b7` -> `26330cc20` -> `0e255d7`, all true ancestor links. The fix must move forward from
+  `0e255d7` itself; adopting `f2099e9b7` would be a revert the contract excludes.
+- **The only change to `ggml-hrx.cpp` between the faulting pin and the current pin** removes a
+  `return false` for IQ3_S/IQ4_NL GET_ROWS (PR #100 enables an op the faulting pin refused) -
+  unrelated to the reuse boundary, and evidence the faulting configuration is otherwise carried
+  forward unchanged.
+
+## Criteria after this update
+
+**1 open** (the control is running and H2' is a candidate, not yet a finding - it needs a faulting
+arm). **2 open** (no unfalsified forward-only candidate; `task-9` stays CONDITIONAL on a named
+mechanism). **3 MET** (315cwsr70: 70/70 fix-cell arms, 0 faults, CI 3.14%, all in-regime). **4, 5 not
+started.**
+
+Honest bounds on H2': the doc establishes the BORROWING (`:6`, `:299`, `:330`) and the
+resumes-vs-abandoned split (`:4`, `:304`); that a resumed wave re-fetches by address walk is an
+inference consistent with those lines, not a quotation. TTM is named from the lever analysis, not
+from the doc.

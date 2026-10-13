@@ -2244,3 +2244,44 @@ NEW md5 for any future rollback check: e20f05bf91d50b645c0fbc8d11998e86
 P1's pre-condition is cwsr_enable=1, which the RUNNING kernel already provides. So P1 can run on the
 live boot as-is; it does NOT require the reboot. The drop-in restore above changes only what the NEXT
 boot will do, which is the correct shipped state to leave behind.
+
+---
+
+# P1 IS DEAD AS AN EXPERIMENT (07:25) — its discriminating power was calibrated against the old 26% rate
+
+P1 was pre-registered on the reasoning: "at 26%, 20 pairs gives ~5.2 expected faults and P(0) = 0.002,
+the same power argument the H1 control used." **That rate is wrong for this configuration.** The
+control measured the actual cwsr=1 rate as **2/27 = 7.4%**, not 26%.
+
+Recomputed at the observed rate, a clean arm B is unremarkable:
+
+    arms in arm B    P(0 faults | movement irrelevant) at p=7.4%
+        8                     0.540
+       10                     0.463
+       12                     0.397
+       16                     0.292
+       20                     0.207
+
+So if buffer movement is COMPLETELY IRRELEVANT, arm B would still come back clean 21-54% of the time
+across any affordable size. A clean arm B would therefore be weak evidence at best, and P1's
+pre-registered reading key ("A ~26% and B clean -> movement is necessary") does not hold, because A
+will not be ~26% either - at 7.4% the positive control itself has a ~21% chance of coming back clean
+at 20 arms, which would make the whole run uninformative by P1's own third branch.
+
+### Cost, which rules it out independently
+    P1 as designed: 2 runs x 20 pairs x 2 arms x 4.7 min = 6.3 h
+    a smaller pair : 2 runs x 10 pairs x 2 arms x 4.7 min = 3.1 h   (and P(0)=0.46 in B)
+This turn has already spent ~9.4 h of box time against the objective's <=12 h ceiling, so P1 at any
+useful size breaches it - and at a reduced size it has no power anyway.
+
+### What this means
+ - **P1 is withdrawn as the discriminating experiment.** It is recorded rather than run, because
+   running it would spend hours to produce a result its own statistics cannot interpret.
+ - The correct replacement, if a movement experiment is ever wanted, is a DESIGN that raises the
+   event rate first (e.g. the #123 repro's `GGML_HRX_FA_PARTIAL_ALIGN` stress, or a separate process
+   forcing queue evictions as the #140 work did) so that the arm count needed falls. That is a new
+   pre-registration, not a tweak to P1.
+ - This is the third designed instrument on this issue whose calibration did not survive contact with
+   a measured rate (after the H1 control's own sizing rationale, which DID work, and the 315-rate.py
+   face-tally under-count recorded earlier). Worth stating plainly: the rate moved, and every
+   power argument built on 26% moved with it.

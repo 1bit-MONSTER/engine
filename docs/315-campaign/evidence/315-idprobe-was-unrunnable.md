@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # The last in-scope probe was UNRUNNABLE — its build predated its patch
@@ -42,3 +58,43 @@ matmuls are NaN, that candidate dies. Either outcome closes the family, and the 
 pointing at the table builders or the matmul descriptor — still in scope.
 
 The probe is diagnostic, not acceptance: no criterion changes and no arm from it is eligible.
+
+---
+
+# The guard I added misfired (ninth defect) — and the probe builds its own tree anyway
+
+Two corrections to the section above.
+
+## 1. The guard was a false abort
+
+My chain's instrumentation guard printed the marker count (**1**) and then aborted anyway:
+
+    --- instrumentation check: does the binary now carry the ids markers? ---
+    1
+    ABORT: rebuild did not add the ids instrumentation - not running the probe into a blind build
+
+But the marker **is** present — verified by hand afterwards:
+
+    strings ~/wt/315copy-build/bin/libggml-hrx.so | grep -cE "dup_pairs|oor="   ->  1   (exit 0)
+    the marker text:  oor=%zu dup_pairs=%zu fi
+    the .so is fresh:  19:09 today
+
+So the abort was a bug in my own guard logic, not a missing instrument. The irony is worth stating: a guard
+written to *prevent a silent false negative* produced a **loud false negative** instead. The lesson is the
+same shape as the rest of the session — the check has to be verified as well as the thing it checks.
+
+## 2. The rebuild was probably unnecessary: the probe builds its own tree
+
+Running the probe directly shows it takes the box lock and then **configures and builds its own tree**:
+
+    id: box lock held 2026-10-13T19:10:36-03:00
+    id: configuring /home/bcloud/wt/315id-build 2026-10-13T19:10:36-03:00
+    id: building -j 6 2026-10-13T19:10:38-03:00
+
+So `315-idprobe.sh` builds from the patched source itself (`~/wt/llama-315copy`) rather than consuming
+`315copy-build`. My incremental rebuild of `315copy-build` was therefore beside the point for the probe — the
+genuine blocker was only that **nobody had ever run it**.
+
+What the stale-build observation still established: the `315copy-build` artifact was stale relative to its
+source, which is worth knowing independently (it is the artifact an ad-hoc probe would have used) — but it was
+not the probe's blocker, and the section above overstates it as one.

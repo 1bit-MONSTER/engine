@@ -2952,3 +2952,73 @@ the control's two arms, now reproduced under the intervention.
  - BOTH FACES: yes, under the same intervention, in the same run
  - NOT YET: the specific handoff that reads stale data (the static leg showed the #140-class handoff
    in GLM's path is correctly fenced, so the corrupted handoff is elsewhere and still unnamed)
+
+---
+
+# ################################################################
+# 315disc2 COMPLETE: H-e REPLICATED, p = 0.0002, BOTH FACES
+# ################################################################
+# 2026-10-13 08:40
+
+## The final, pre-registered endpoint (disc1 + disc2 pooled)
+
+    cell e  (evictonly, forced KFD evict/restore)   7 FAULT / 16 arms = 43.8%
+    cells q+c (quiet + CPU-pressure controls)       0 FAULT / 30 arms =  0.0%
+    Fisher exact two-sided p = 0.00021
+    rule-of-three upper bound on the control rate (30 arms, 0 faults) = 10.0%
+
+    315disc2 standalone: e 5/12 = 41.7% vs q+c 0/20 = 0%, Fisher p = 0.0039
+
+The pre-registration (commit 36f360a, written before the run) fixed four branches; the data landed on:
+
+    "e faults clear of q and c -> H-e REPLICATED. Eviction forced from outside causes the fault;
+     the mechanism is eviction-of-in-flight-work."
+
+## Both faces, under the same intervention
+
+    Face A (nan=1, transport=1, server aborts):  disc1 x2, disc2 x2  = 4
+    Face B (nan=0, http=1, s500=1, unparsed=2):  disc2 x3            = 3
+    controls                                  :  0 faults / 30 arms, EITHER face
+
+All seven faults at gtt_start=98G, all in cell `e`, all in-regime, zero OOR in either run.
+
+## Why this is the result criterion 1 asked for
+
+The contract: "A named, falsifiable mechanism for both faces, with a discriminating experiment that
+rules out the surviving alternatives (arena knobs and transient reuse are already falsified)."
+
+    NAMED                    forced eviction of in-flight KFD work is a cause of the fault
+    FALSIFIABLE              four branches fixed before the run; one was 'controls fault -> CONTRADICTED'
+    DISCRIMINATING           three cells isolate eviction from thermal load, CPU contention and
+                             benchmark presence
+    RULES OUT ALTERNATIVES   CPU-pressure cell 0/20, quiet cell 0/10, across two runs
+    BOTH FACES               4 Face A + 3 Face B, same intervention, same cell, same run
+    EFFECT SIZE              43.8% vs 0/30 (bound 10%), p = 0.0002
+
+The intervention is verified, not assumed: `evictonly` launches NO kernels and only does `mprotect`
+churn on `hipHostRegister`'d memory, and I measured it at **4,134 Q_EVICT / 4,168 Q_RESTORE in 25 s
+against 0 / 0 in a quiet window**.
+
+This also settles a question the record had left open since mechanism §44: whether the two faces are
+one mechanism or two. A single intervention that isolates eviction from every other factor tested
+produces BOTH faces, which is what "one mechanism, two observables" predicts.
+
+## The one thing still NOT named, and it is the difference between a trigger and a cause
+
+**Named: the TRIGGER.** Forced eviction of in-flight KFD work causes the fault.
+
+**Not named: the CAUSE.** Which handoff reads stale data. The static leg already showed that the
+#140-class handoff in GLM's path is correctly fenced in this pin (commit 1de679f: `barrier<global>`
+then `barrier<workgroup>` between the reduce's stores and the q8 pack, plus the completion-counter
+handshake), so the corrupted handoff is somewhere else and is still unidentified.
+
+That distinction matters for how this is reported: the issue now has a **named, falsifiable,
+replicated mechanism-level trigger with a verified intervention**, and does not yet have the specific
+code site to repair. Under the objective's own wording the first clause ("name the mechanism") is met at
+the trigger level; the second (a forward-only fix) requires the site.
+
+## And it corrects my own record twice
+ - "H2' IS FALSIFIED" (ace7218) - corrected at 3a2ba07 and now definitively: eviction DOES cause the
+   fault by intervention. Only the per-arm rate-correlation was ever falsified.
+ - "Face B has not yet appeared under forced eviction" (recorded 08:30 today) - corrected within the
+   same run: 3 of disc2's 5 faults are Face B.

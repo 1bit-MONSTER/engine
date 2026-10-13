@@ -1284,9 +1284,30 @@ declaration, written here BEFORE any P1 arm runs:
  A. MOVEMENT ALLOWED (the positive control): identical to the historical 34/131 baseline.
  B. MOVEMENT DENIED: the arm's buffers made non-evictable / pre-resident.
 
-### Feasibility, checked rather than assumed
- - The arm launcher already accepts env injection at 315-paired-pidcap.sh:65
-   (`TRACE_ENV=(--setenv=GGML_HRX_BUFFER_TRACE=1)`), so a knob can be threaded the same way.
+### Feasibility, checked rather than assumed - P1 IS RUNNABLE WITH NO REBUILD
+ - The arm launcher threads arbitrary per-arm environment at 315-paired-pidcap.sh:66-67:
+       EXTRA_ENV="K=V K2=V2" adds environment to each arm
+   So the injection point exists (`systemd-run --setenv=`), verified in the source, not assumed.
+ - The knob exists and is a RUNTIME flag over a REAL memory-class difference.
+   ggml-hrx.cpp:1173  use_direct_host_bindings = environment_flag_enabled("GGML_HRX_USE_UNIFIED_MEMORY")
+   ggml-hrx.cpp:304   direct_host_binding = host_visible && use_direct_host_bindings
+   ggml-hrx.cpp:310   if (direct_host_binding) memory_type |= HRX_MEMORY_TYPE_HOST_COHERENT
+   The two classes the comment distinguishes (ggml-hrx.cpp:306-307):
+       default (unset) : HOST_LOCAL | DEVICE_VISIBLE  = "pinned TRANSFER memory: DEVICE_VISIBLE
+                         permits handle-based stream copies without implying direct device access"
+       =1              : adds HOST_COHERENT           = direct command-program bindings, coherent
+                         CPU/GPU visibility
+   This is exactly H2''s buffer-movement factor, and it is per-arm togglable.
+
+### P1 RECIPE (both arms cwsr=1, same model/pressure - only the env differs)
+    arm A (movement allowed, positive control):
+        315-evict-trace.sh <pairs> 315p1a          # no EXTRA_ENV -> the historical default
+    arm B (movement denied / direct bindings):
+        EXTRA_ENV="GGML_HRX_USE_UNIFIED_MEMORY=1" 315-evict-trace.sh <pairs> 315p1b
+    Prediction: B shows ~0 faults, A shows ~26%. Faults in B at ~26% refutes H2'.
+    Caveat to state in the write-up: HOST_COHERENT was FALSIFIED AS A FIX (315accept 9 clean +
+    1 fault / 10). P1 does not re-propose it as a fix - it uses it as a MECHANISM PROBE, a
+    different claim. If B is clean that is evidence about the mechanism, not a landed repair.
  - There is NO `gtt_size` module parameter on this box, so the obvious "shrink GTT" route is
    unavailable; movement must be denied from the allocation side (a residency/pin flag) or by
    removing the pressure that causes it.

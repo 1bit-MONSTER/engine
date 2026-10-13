@@ -51,6 +51,17 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
                           criterion 1 collapses, issue needs honest re-scoping
       rate ~0%  faults -> H1 DEAD: the cwsr=0 signal is real; H2 is the sole survivor
 
+    CRITERION-2 FIX CANDIDATE: DEAD END (verified 05:15, do not re-explore)
+      ~/wt/315-coherence-fix.patch adds an unconditional HRX_MEMORY_TYPE_HOST_COHERENT bit in
+      ggml-hrx.cpp buffer_alloc - exactly the forward-only shape criterion 2 wants. BUT it is
+      already FALSIFIED on the record: 315accept ran 9 clean + 1 fault / 10, it is lever row 1 of
+      the 10-row falsified-lever table (KNOWN-ISSUES.md section 13), and 315-lever-check.py
+      REJECTS a diff adding HOST_COHERENT with exit 1. Do not propose it as the fix.
+      => criterion 2 has no candidate that is both forward-only and unfalsified. It is BLOCKED on
+         criterion 1 naming a mechanism, exactly as the task list says (`task-9` is CONDITIONAL).
+         The only lever-check CLEAR result is a residency-style preference, which the tool itself
+         flags as not confirming any mechanism.
+
     GOAL STATE
       criterion 3  MET    315cwsr70: 70/70 fix-cell arms, 0 faults, CI 3.14%, all in-regime
       criterion 1  open   no mechanism named; H2's carrier contradicted by the AMD refs

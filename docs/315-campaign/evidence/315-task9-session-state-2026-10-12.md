@@ -79,6 +79,19 @@ Note: `docs/315-campaign/evidence/NPU-LOCK-WEDGED-2026-10-12.md` (an earlier ses
       at the same GTT. If faults land with NO eviction excess, H2 dies too and criterion 1
       has no surviving candidate - that outcome must be reported honestly, not papered over.
 
+      PIPELINE VERIFIED LIVE at 05:16 (dry run on the first clean arms):
+        arm                     pid  gtt  verdict  pre-fault  window
+        p1c                   21139  97G       OK        --     293
+        p1l                   44443  97G       OK        --     160
+        p2l                   68030  97G       OK        --     262
+        p3l                   91692  97G       OK        --     196
+        p4c (not in-regime)  114850   0G        ?        --     225
+        clean n=4  evictions/arm: min=160 median=262 max=293 mean=227.8
+      The reader resolved every pid, attributed evictions per arm, and correctly reported that
+      it still needs a faulting in-regime arm. THE H2 DENOMINATOR IS NOW ON THE RECORD:
+      ~228 evictions/arm for clean in-regime arms at 97G. A faulting arm well above that
+      supports H2; at or below it kills H2.
+
     GOAL STATE
       criterion 3  MET    315cwsr70: 70/70 fix-cell arms, 0 faults, CI 3.14%, all in-regime
       criterion 1  open   no mechanism named; H2's carrier contradicted by the AMD refs

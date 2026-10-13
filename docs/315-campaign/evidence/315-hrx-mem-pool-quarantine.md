@@ -277,3 +277,65 @@ but it must be checked on the allocator path, not the pool path, because the poo
 This closes the pool variant. It does **not** close "an allocation is reused before every consumer is done"
 as a class — that now needs to be looked for in `hrx_allocator_allocate_buffer` / `hrx_buffer_release` and
 their callees, which is a fresh, bounded read.
+
+---
+
+# CORRECTION: the pool IS on GLM's path — I grepped the wrong symbol
+
+The "DEAD END" section above concluded the pool machinery is unreachable because the engine never calls
+`hrx_mem_pool_*` and the runtime has no internal `hrx_mem_pool_create` caller. **That conclusion was wrong**,
+and the decompiled `hrx_buffer_allocate` shows why.
+
+## What the allocation path actually does
+
+`~/amd-oss/hrx-re/decomp/libhrx/hrx_buffer_allocate.json` (REA record, `authority: shipped-artifact`,
+`confidence: observed`) uses **454 `pool` mentions** and these symbols:
+
+    iree_hal_slab_pool_create
+    iree_hal_slab_pool_options_initialize / _options_t
+    iree_hal_pool_family_access_t / _host_access_t / _import_class_t / _scope_t
+    iree_hal_pool_placement   (PREFERRED / node ordinal)
+    hrx_mem_pool_backing_create_pool
+    hrx_mem_pool_backing_create_source
+    hrx_mem_pool_backing_retain_allocation_source
+    hrx_mem_pool_backing_retain_import_source
+
+with a visible call:
+
+    piVar6 = iree_hal_slab_pool_create(device->hal_device_group, scope, &options,
+                                       allocator, local_68);
+
+So the engine's allocation path **does** create and use a pool — a **slab pool** built through the
+allocator/backing layer, with a `scope` carrying family and host-access modes.
+
+## Why my test missed it
+
+I grepped for `mem_pool` in the engine and `hrx_mem_pool_create` in the runtime. Both are the **public
+`hrx_mem_pool_*` API**, which is indeed unused. But the pool the engine actually uses is created internally
+via `hrx_mem_pool_backing_create_pool` → `iree_hal_slab_pool_create`, under names that do not contain
+`mem_pool_create`. **Absence of the public symbol was not absence of the mechanism** — the same class of
+error as the session's other parse defects, applied to a symbol search.
+
+## What that re-opens, on a corrected basis
+
+The quarantine/`inflight_allocation_count`/retirement-reuse machinery is in `mem_pool.c` — the **public pool
+implementation**. Whether the **slab pool** the engine actually creates has an equivalent discipline is now
+the real question, and it is a *different* implementation:
+
+    public hrx_mem_pool_*      -> mem_pool.c, quarantine + inflight counting  (NOT used by the engine)
+    slab pool (in use)         -> iree_hal_slab_pool_*, reached via
+                                  hrx_mem_pool_backing_create_pool
+
+So the lead is **open again**, pointed at the slab pool rather than the public pool, and the counters to look
+for are whatever the slab-pool implementation keeps (the decompiled `trim` read its stats through
+`iree_hal_pool_query_stats`, which is generic across pool implementations — so the slab pool may expose the
+same counters).
+
+## Standing
+
+    public pool reachable from GLM          NO   (previous section, still true)
+    ANY pool reachable from GLM             YES  (this section - slab pool, via the backing layer)
+    quarantine/inflight discipline present  UNKNOWN for the slab pool
+
+The retraction above is kept rather than deleted so the reasoning error is visible: a symbol-search negative
+is only as good as the symbol chosen.

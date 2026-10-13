@@ -339,11 +339,17 @@ Face A or Face B depending on what those bytes now hold.
 | run 7 faulted 3x at 97G while 8 clean arms sat at 98 GiB | the OCCURRENCE of mid-wave preemption is the intermittent variable, not the pressure level |
 | both faces, never the same arm | what the moved bytes hold decides finite-but-wrong (B) or NaN (A) |
 
-**Key refinement that makes it compatible with the size fix:** `amdgpu.cwsr_enable=0` does not
-merely skip save/restore — per the kernel's own module-parameter doc it removes the hardware's
-ability to preempt a wave MID-EXECUTION at all. So the mechanism does not depend on the
-(proven-fixed) size defect: the CWSR area can be perfectly sized and the memory the wave reads
-can still be moved underneath it.
+**Key refinement that makes it compatible with the size fix** [SUPERSEDED 2026-10-13 05:22 -
+the preempt-removal premise below is REFUTED; see H2' in this file and 315-H1-FALSIFIED.md]:
+`amdgpu.cwsr_enable=0` does not merely skip save/restore — per the kernel's own module-parameter
+doc it removes the hardware's ability to preempt a wave MID-EXECUTION at all. So the mechanism
+does not depend on the (proven-fixed) size defect: the CWSR area can be perfectly sized and the
+memory the wave reads can still be moved underneath it.
+READ THE CORRECTION: context-save.md:304 says the KFD update path FIRST REMOVES THE QUEUE FROM
+HARDWARE in BOTH branches, so cwsr=0 does not prevent mid-wave interruption. H2' replaces the
+carrier: the danger is RESUMPTION (cwsr=1 -> SAVE -> resumes -> re-reads borrowed buffers),
+not interruption. The size-fix compatibility point above still holds and is why H2' does not
+depend on the size defect either.
 
 **It is the same WINDOW the engine's own #123/#140 record describes**, generalised from a
 barrier bug to preemption itself.
@@ -571,6 +577,11 @@ mid-execution with CWSR off; what changes is that the wave is *drained/abandoned
 *context-saved and resumed*.
 
 That inverts H2's explanatory story. H2 assumes cwsr=0 prevents the dangerous window entirely.
+
+[FOLLOW-UP 2026-10-13 05:22: this section's own last clause - "drained/abandoned rather than
+context-saved and RESUMED" - is the seed of H2'. H2' keeps this refutation and rebuilds the
+carrier on resumption instead of interruption. See the H2' section later in this file; it is the
+current best statement of the mechanism.]
 On this reading, cwsr=0 changes what happens to the *wave's own registers*, while the
 memory-eviction concern H2 rests on is a property of the *buffers*, which are unaffected by the
 save/drain distinction.

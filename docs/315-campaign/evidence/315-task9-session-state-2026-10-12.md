@@ -2697,3 +2697,66 @@ from the 26%-vs-7% correction.
 
 Recorded because an over-claim left standing in the evidence file is how a future session ends up
 sizing an experiment from a number that was never true.
+
+---
+
+# ###### MAJOR: THE EVICTION INTERVENTION ALREADY EXISTS AND IT WORKS — I mis-stated H2' as falsified
+# (2026-10-13 09:10, found by following the rate-raiser the record kept naming)
+
+## The result, sitting in `~/wt/315disc1-console.log` since 2026-10-11
+
+`315-disc.sh` is a three-cell discriminating design: `q` quiet (control), `e` = `~/wt/evictonly 500`
+(a process that launches NO kernels and only forces KFD evict/restore via `hipHostRegister` +
+`mprotect` churn), `c` = CPU pressure only, cells rotating per round so session drift cannot align
+with one cell. All arms at the same composition, gate `gtt_start=98G`, build `10613 (e44c9d01a)`.
+
+    round 1 arm q: OK     nan=0 req=66                gtt_start=98G
+    round 1 arm e: FAULT  nan=1 req=6  transport=1    gtt_start=98G     <- EVICTION CELL
+    round 1 arm c: OK     nan=0 req=66                gtt_start=98G
+    round 2 arm e: FAULT  nan=1 req=4  transport=1    gtt_start=98G     <- EVICTION CELL
+    round 2 arm c: OK     nan=0 req=66                gtt_start=98G
+    round 2 arm q: OOR    (out of regime, not counted)
+    round 3 arm c: OOR    (out of regime, not counted)
+    ...
+
+    cell q (quiet)        5 arms   0 FAULT
+    cell e (EVICTION)     4 arms   2 FAULT   = 50% of in-regime arms
+    cell c (CPU pressure) 5 arms   0 FAULT
+
+    Fisher exact, cell e (2/4) vs cells q+c pooled (0/10): p = 0.066
+
+## Why this matters more than the p-value
+This is an **INTERVENTION**, not a correlation: an external process that only makes KFD evict and
+restore queues raises the fault rate to 50% while the quiet and CPU-pressure cells stay at 0/10. That
+is precisely the method KNOWN-ISSUES records for engine#123/#140 ("a separate process forcing queue
+evictions") and precisely the rate-raising design the 26%-vs-7% correction said was missing.
+
+It also **directly contradicts the way I stated the H2' result earlier today.** I wrote "H2' IS
+FALSIFIED". That is too strong and is now corrected:
+
+    disc1  (intervention: force eviction)          -> faults 2/4 = 50%    <- eviction CAUSES faults
+    ctl1   (ambient pressure, per-arm correlation) -> faulting arms show no eviction excess
+                                                      (203 vs clean mean 254.5)
+
+These are not in conflict. An external forcer raises the EVENT RATE; within a run under ambient
+pressure, the per-arm eviction COUNT does not predict which arm faults. The first is an intervention
+(the right instrument for causation); the second is a correlation (the wrong instrument, and now
+shown to be uninformative at this sample size). **H2-as-eviction-trigger is SUPPORTED by the
+intervention and was only ever falsified as a rate-correlation.**
+
+## What the record already knew, and what it missed
+The ledger HAD recorded "`315disc1` (Oct 11): 2 (arm e, both rounds)" - but it recorded it in a table
+of runs "usable for H2?", where it was correctly marked NO because 0 of its 7 arm dirs have
+`server.pid` (so no per-arm eviction correlation was possible). What was missed is that the run answers
+a DIFFERENT question from the one the table was asking: not "which arm was evicted more" but "does
+forcing eviction from outside cause the fault". It does.
+
+This is the single strongest causal contrast in the issue's history and it had been filed as unusable
+for the wrong test.
+
+## Also: my "H2' is falsified" commit stays, with this correction attached
+I am not rewriting the earlier commit; the per-arm correlation result is real and correctly computed.
+What changes is the CONCLUSION drawn from it. A mechanism can be causally real (intervention) while not
+being rate-correlated per arm (observation) - and the earlier write-up collapsed those two into one
+claim. Recorded as a correction with the original left intact, per the issue's own rule about not
+quietly reinterpreting recorded studies.

@@ -3875,3 +3875,37 @@ the FIRST DUP pair and the row they are in, which is what will make a hit interp
 ### What I am NOT doing
 Not re-running the 60-arm campaign for this. The question here is diagnostic (does a stale index appear),
 not acceptance, and the eviction rig at 83% gives a faulting arm in ~2 arms, so a few arms suffice.
+
+---
+
+## THE IDS-INSTRUMENTED BUILD IS READY (12:50)
+
+Built `~/wt/315ids-build` from the instrumented tree `~/wt/llama-315copy`, using the recipe proven on
+`315coherent-build` (same ROCm toolchain, plus the `IREE_ENABLE_WERROR_FLAG=OFF` plumbing that tree
+needed):
+
+    version       : 10613 (e44c9d01a)
+    libggml-hrx   : exists
+    TENSOR_FP     : present (3 occurrences)
+    hrx-ids-fp    : present (1 occurrence)
+
+So the build carries BOTH instruments: the tensor fingerprint (`GGML_HRX_TENSOR_FP=<name list>`, which
+reports NaN counts with `first`/`row` for f32 tensors) and the ids fingerprint (`[hrx-ids-fp]`, which
+reports `min max oor dup_pairs first8` for `i32` tensors). Only the `dup_pairs` column is valid evidence,
+for the reason recorded above; `oor` compares against `ne0` which for a top-k view is `k`, not `n_expert`.
+
+### The test, stated before running it
+Run the frozen three-cell rig with the ids instrument pointed at the routing tensors, and read
+`dup_pairs` per arm:
+
+    driver : ~/wt/315-disc.sh <rounds> 315ids1   with BIN=~/wt/315ids-build/bin
+    EXTRA_ENV must include GGML_HRX_TENSOR_FP naming the ids tensors (ffn_moe_topk, ffn_moe_argsort)
+    cell e is the test cell; q and c are controls
+
+    PREDICTION (argsort candidate): a FAULTING arm shows dup_pairs > 0 on a routing row, and clean arms
+    show 0. The duplicate is the never-written slot still holding another element's index.
+    REFUTATION: dup_pairs = 0 in faulting arms as well. Then a stale index is not the corruption and the
+    candidate dies, leaving the write-side and intermediate-buffer classes.
+
+This is diagnostic work, not acceptance: the eviction cell faults at 83% pooled, so a faulting arm
+should appear within ~2 arms and a few arms suffice to read the metric.

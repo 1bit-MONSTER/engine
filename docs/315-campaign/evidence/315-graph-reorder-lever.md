@@ -173,3 +173,48 @@ Prediction to fix before the run, so the reading is not chosen afterwards: if re
 the **26-command routed-FFN graph** is where the overlap that races the eviction window lives, so the
 fault should disappear (or drop sharply) in cell `e` with the knob set — and if it does not, the lever is
 falsified and the graph-order family joins the closed list.
+
+---
+
+# IMPORTANT TEMPERING (2026-10-13) — the reorder preserves hazard order BY CONSTRUCTION
+
+Before the A/B result lands, the reorder's guarantee was re-read, because a hypothesis should be weakened
+as soon as the evidence weakens it. `lookahead_order`'s own comment states:
+
+> "Every hazard pair keeps its program order because a command is only taken once all of its dependencies
+> are recorded."
+
+and the code enforces it — a command is pickable only when `ready(c)` holds, i.e. every entry in
+`deps[c]` is already scheduled. `deps` is built from the byte-range hazard tracker, which covers
+write-after-read, read-after-write and write-after-write on the same bytes.
+
+**So the reorder cannot invert a producer/consumer pair.** It reorders only work that is *independent*
+under the recorded hazards, to move barrier-free commands ahead and save barriers (GLM: 23 -> 20 in the
+26-command graph).
+
+## What this does to the hypothesis
+
+It narrows the mechanism sharply, and honestly, to one of two shapes:
+
+    (i)  the reorder increases the AMOUNT of independent work in flight across a preemption window,
+         which raises the chance that an eviction interrupts a multi-command sequence and leaves a
+         consumer reading a partially-produced state that the recorder deemed independent; or
+    (ii) the recorded hazard set is itself incomplete, in which case the reorder is not the defect but
+         the EXPOSER of it — it would turn a latent missing dependency into an observable fault by
+         changing which independent commands are in flight together.
+
+Either way the A/B remains the right experiment: `GGML_HRX_GRAPH_ORDER=program` removes the reorder, and
+if the fault rate changes materially then the reorder is on the causal path (in either shape). But the
+pre-registration's implicit framing — that the reorder might simply *break* an ordering — is now
+falsified as a mechanism, and that is recorded before the result rather than after.
+
+## Why this is still worth the run
+
+Shape (ii) is genuinely interesting and is exactly the class §33 left open: if `deps` misses a pair, then
+`GGML_HRX_GRAPH_ORDER=program` would mask the fault by removing the overlap, and the *real* finding would
+be the missing dependency — with the reorder merely being how it became visible. A clean cell `e` under
+the knob would then point at the recorder's hazard coverage rather than at the ordering it computes, which
+redirects the cause hunt to a bounded, already-identified surface (`RangeHazards`).
+
+The negative outcome is also informative: if `B ~= A`, then neither the reorder nor any missing pair it
+exposes is on the causal path, and the lever joins the closed list with a measured reason.

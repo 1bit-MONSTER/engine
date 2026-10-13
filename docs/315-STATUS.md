@@ -498,3 +498,93 @@ Honest bounds on H2': the doc establishes the BORROWING (`:6`, `:299`, `:330`) a
 resumes-vs-abandoned split (`:4`, `:304`); that a resumed wave re-fetches by address walk is an
 inference consistent with those lines, not a quotation. TTM is named from the lever analysis, not
 from the doc.
+
+---
+
+# UPDATE 7 (2026-10-13 ~07:30) — the H1 control RAN AND FAULTED, H2' IS FALSIFIED, and P1 is withdrawn
+
+This supersedes UPDATE 6's "control running" state. Read this first; the sections above are the
+history that produced it.
+
+## 1. The H1 control faulted. H1 is CONFIRMED.
+
+`315ctl1`, `cwsr_enable=1`, 20 pairs, fresh boot 04:53:19 with the cwsr drop-in removed (verified
+gone, 0 cwsr entries in grub.cfg), finished 06:32.
+
+    27 arms parsed    all in-regime   0 OOR   0 INVALID   25 clean   2 FAULT
+    rate 2/27 = 7.41%     BOTH FACES represented
+
+    pair  8 arm l: FACE B  - detector http_failures=1, first_failure HTTP 500; server log shows
+                             the parser rejecting symbol soup with invalid bytes
+    pair 16 arm c: FACE A  - nan=1 req=1; detector transport_failures=1 RemoteDisconnected
+
+The two faults are on OPPOSITE CELLS and OPPOSITE FACES, so this is not one binary's property.
+
+The reading key was fixed before the run: ~26% -> H1 CONFIRMED; ~0% -> H1 DEAD. Observed 7.41% with
+both faces. **A fresh-booted box at cwsr=1 faults**, so the cwsr=0 result (0/70) cannot be attributed
+to CWSR alone, and the "cwsr=0 prevents it" framing is dead.
+
+## 2. H2' IS FALSIFIED.
+
+    FAULT n=2   evictions/arm: min=16   median=203   mean=109.5
+    clean n=25  evictions/arm: min=117  median=254   max=559   mean=254.5
+
+H2' predicted faults concentrate on heavily-evicted arms. The faulting mean is 43% of the clean mean,
+the faulting median is below the clean median, and one faulting arm (p16c) shows **16** evictions
+against a clean FLOOR of 117 - it faulted with almost no suspension activity attributable to it. The
+direction is opposite to the prediction. Bounds recorded: n=2 is small, and a mechanism where
+eviction is necessary-but-rarely-sufficient would need the P1-style denial test rather than a rate
+comparison - but the specific quantitative prediction that justified calling H2' a mechanism is
+contradicted.
+
+## 3. P1 IS WITHDRAWN — it could not have discriminated, and it was over budget.
+
+P1 was pre-registered assuming a 26% rate ("20 pairs gives ~5.2 faults, P(0)=0.002"). The control
+measured the actual rate as **7.4%**. Recomputed there, P(arm B clean | movement irrelevant) is
+**0.46 at 10 arms, 0.29 at 16, 0.21 at 20** - so a clean arm B is unremarkable at any affordable
+size, and the positive control itself has a ~21% chance of coming back clean. Cost independently
+rules it out: 6.3 h as designed, 3.1 h reduced, against a ~9.4 h spend and the <=12 h ceiling.
+Recorded rather than run, because running it would spend hours on a result its own statistics cannot
+interpret.
+
+## 4. What this leaves
+
+**No candidate on the record survives its own discriminating test.** H1 explains the cwsr signal's
+evidential collapse; H2' fails its own prediction in the opposite direction; P1 cannot discriminate
+at the measured rate; and the engine's own #123/#140 stale-buffer class is correctly fenced in GLM's
+path (four hazard hypotheses read to conclusion and rejected, plus the consumer read path cleared by
+sections 55/56 and dispatch ordering by section 54).
+
+Meanwhile the fault is REAL and reproducible: at cwsr=1, on a fresh boot, in-regime at 97-98G, on
+both faces, on two different binaries (the two faulting arms are in different cells), at a measured
+rate of ~7%. That is a solid, honest characterisation even though it is not a mechanism.
+
+**Criterion 1 is therefore OPEN and further from a mechanism than when the control was launched, not
+closer** - and the honest report is the negative one: the issue's own candidate family is exhausted
+by measurement. The remaining ways forward are a design that raises the event rate before testing a
+mechanism (the #123 repro's `GGML_HRX_FA_PARTIAL_ALIGN` stress, or a separate process forcing queue
+evictions as #140 did), or a fresh mechanism hypothesis; both are new pre-registrations rather than
+extensions of this one.
+
+## 5. Process failures found and fixed (recorded rather than hidden)
+
+ - **The cwsr=0 drop-in's bytes were never preserved.** The ledger cited
+   `~/work/amd_cwsr.cfg.backup` md5 `a8b25738...`, but the file does not exist anywhere under
+   `$HOME`, and the repo had recorded only the path and md5. A rollback that lives only at a path is
+   not a rollback. The content is now committed at `docs/315-campaign/evidence/amd_cwsr.cfg`, labelled
+   as a reconstruction from documented semantics, and the box's boot config is restored
+   (`cwsr_enable=0` in 3 grub entries, new md5 **e20f05bf91d50b645c0fbc8d11998e86**; the old md5 is
+   uncitable). No finding depends on the missing bytes - every arm's cwsr state was read live.
+ - **`315-rate.py` under-counts Face B in its face tally.** For p8l it prints `FaceB=0
+   unattributed=1`, because its regex keys on parse/utf8 counters while the detector recorded
+   `http_failures`. The arm's own `detector.json` is authoritative. Same class as the
+   console-vs-detector trap in UPDATE 5.
+ - **An orphaned faulting-arm server held HRX0** (`p8l`, ppid=1, ~1h32m after its arm ended). It is
+   mine and was terminated; it did not affect the measurements but would have inflated a later run's
+   baseline. Same class as the "silent arm loss" trap in KNOWN-ISSUES.
+
+## 6. Box state left behind
+
+    HRX0 holders 0 · GTT 26 GiB (baseline) · VRAM 0 GiB · load ~1.1 · npu.lock FREE · watcher 0
+    drop-in present with cwsr_enable=0 in 3 grub.cfg entries (shipped BOOT state restored)
+    live cwsr = 1 until the next reboot (no reboot taken unilaterally; nothing waits on it)

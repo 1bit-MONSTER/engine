@@ -81,3 +81,24 @@ That was wrong: the campaign's operational definition of Face B **is** the `Cont
 (`315-both-faces-one-trigger.md:40`), not a UTF-8 check. Corrected there; recorded here because the distinction
 between the objective's summary phrase and the campaign's operational definition is exactly the kind of thing
 that silently changes a tally.
+
+---
+
+# QUALIFICATION (defect #15): the "all three cells" claim is withdrawn
+
+A forcer audit run while this session was still going found **4 live `evictonly` processes**, the oldest of which
+**started before this run did** — left over from the previous session. Each arm spawns a forcer for its cell and
+teardown does not always reap it, so the count had grown rather than reset.
+
+**Therefore the arms labelled `q` (quiet) and `c` (CPU) in this session ran under leftover forced KFD eviction.**
+The statement "Face B appears in **all three cells**" — made in the section above and in `KNOWN-ISSUES`-adjacent
+notes — **is withdrawn**: what is established is that Face B appeared in arms *labelled* quiet, not that it
+appeared without eviction. Given the campaign's recorded eviction trigger, the distinction is the whole point.
+
+**What survives:** the configuration faults as Face B repeatedly, in regime (`gtt_start=98G`), at `req=1…11` —
+which is what makes it cheap to test a candidate fix against. **What does not:** that it does so in the absence
+of eviction.
+
+Also worth stating plainly: this is the same defect family as #10 (an orphaned neighbour silently reused as a
+regime neighbour), and it was caught only because the process list was inspected for an unrelated reason. Neither
+the rig's thermal gate nor its load gate can see it.

@@ -1,0 +1,64 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Defect #15: orphaned `evictonly` forcers accumulate, and the "quiet" cell is not quiet
+
+## What was observed
+
+While the `315lout2` session was still running, its side-processes were counted on the box:
+
+    $ pgrep -fc evictonly        ->  4      (it had been 2 twenty minutes earlier)
+    $ pgrep -fc "busy=70"        ->  2      (the rig's CPU-pressure workers)
+    $ awk '{print $1}' /proc/loadavg; sensors | awk '/Tctl/'   ->  5.04 , 75.9 C
+
+and the oldest forcer's elapsed time (28 min at that point) places its start **before `315lout2` began** — i.e. it
+was left over from the previous session (`315lout`).
+
+So during `315lout2`'s arms there was at least one foreign `evictonly` applying **forced KFD eviction to every
+cell**. The count then grew, because each arm spawns a forcer for its cell and the teardown does not always
+reap it.
+
+## Why this matters: it changes what a cell *means*
+
+The campaign's cells are defined by their pressure — `q` quiet, `e` eviction, `c` CPU — and the arm line's cell
+letter is used as the label for which condition the arm ran under. **With an orphaned forcer alive, an arm
+labelled `q` is not a quiet arm**: it ran under eviction pressure that the label does not record. The rig's own
+gating does not catch this, because it measures thermal and load state, not *what the side-processes are doing*.
+
+This is the second instance of one family, and it is worth naming it as such:
+
+- **defect #10** — an orphaned neighbour (parent PID 1) that the composition step **found already running and
+  counted toward the target GTT**, so the composition baseline was not "box at rest";
+- **defect #15** — orphaned forcers that the arms' cell semantics do not record, so a "quiet" arm is not quiet.
+
+Both are the same failure: **a leftover from a previous run changes the meaning of a later run's label, silently.**
+
+## What it does to the Face-B amplifier claim
+
+`315-faceb-amplifier.md` reports **6 of 6 arms as Face B "in all three cells"**, and offers that as a
+near-deterministic reproducer. **That claim is now qualified**: the `q` and `c` arms were not cell-isolated, so
+"Face B appears in the quiet cell too" is **not** established — it may be eviction pressure leaking into a cell
+labelled quiet, which would be a much less interesting statement (and one already consistent with the campaign's
+recorded eviction trigger).
+
+The part that survives: **the configuration faults as Face B at `req=1…11`, repeatedly, in regime.** The part that
+does not: **that it does so without eviction.**
+
+Corrected in place in that file's own terms — the amplifier's value as a tool is unchanged (a fault on the first
+request is still cheap to test against), but the claim about which cells it spans is withdrawn until a session is
+run whose forcer count is verified zero at every arm boundary.
+
+## The operational fix
+
+Kill by **process family, in a script file, before and after every session**, and assert the count is zero before
+the composition is trusted:
+
+    for P in $(pgrep -f evictonly);    do kill -9 $P; done
+    for P in $(pgrep -f "busy=70/1000.0"); do kill -9 $P; done
+    # then assert:  [ "$(pgrep -fc evictonly)" = 0 ] || abort
+
+Patterns must live in a **script file** rather than a command line, because a command line carrying them is
+matched by its own `pgrep`/`pkill` — a trap that cost this session three separate incidents, two of them killing
+my own SSH session mid-cleanup.

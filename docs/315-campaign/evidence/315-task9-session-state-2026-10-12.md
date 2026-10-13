@@ -1396,3 +1396,53 @@ Also inherited from the wrapper (do not rediscover these):
    signal;
  - the wrapper also polls for foreign `-dev HRX0` holders because box.lock alone does not exclude
    peers who ignore the convention.
+
+---
+
+## KERNEL-SIDE LEAD — 2026-10-13 05:40 — the FA decode-split kernel names the same boundary
+
+Fetched the full fork history (the clone was SHALLOW; the KNOWN-ISSUES revs were absent, so the
+forward-only ancestry proof was not even checkable before this). All revs now present.
+
+### The ancestry chain is CONFIRMED (this is criterion 2's anchor)
+    f2099e9b7  "hrx: keep our ggml-hrx backend on AMD's core"          <- clean lower bound
+       -> 26330cc20 "merge: take shared-memory tile visibility over always-stage for decode-split FA (engine#314)"
+          -> 0e255d7  (current pin, "Merge PR #100 ... hrx-getrows-iq-rb")
+    merge-base --is-ancestor TRUE for both links.
+So the rev the fix must move FORWARD from is 0e255d7 itself; f2099e9b7 is behind it and adopting
+it would be a revert, which the contract excludes. (Matches KNOWN-ISSUES' own note.)
+
+### The merge message fingers the configuration
+26330cc20's message states: "the unconditional staging plus LOOSER ARENA REUSE is the configuration
+under which the pressure-dependent all-NaN logits concentrate." That is the buffer-reuse boundary
+H2' names, arriving from the issue's own history rather than from my reading of the CWSR docs.
+
+### The kernel comment names the observed defect in the same terms
+flash_attention_decode_split_f32_f16_wmma.loom:307-310 (present in BOTH 26330cc20 and 0e255d7 -
+`git diff 26330cc20 0e255d7 -- <file>` is EMPTY, so this code is still shipped):
+
+    "Rows past the sequence end hold whatever an earlier request left there, so identical
+     requests gave different logits."
+
+That is stale-reuse nondeterminism: a buffer holding a previous request's bytes, producing
+different results for identical requests. Exactly H2''s "the wave reads what is there now, not
+what it wrote".
+
+### What I checked and did NOT find (so this is not overclaimed)
+ - Hazards I hypothesised and then DISPROVED by reading the code, rather than asserting:
+   * masked_value_stage (loom:180-181) is PER-SUBGROUP offset, and its barrier (loom:481) is
+     scope(subgroup) - so a subgroup barrier is SUFFICIENT for it. Not a bug.
+   * probability_stage (loom:185, no subgroup offset, workgroup-wide) IS written by lanes
+     (loom:299-302) and read as MMA fragments (loom:360), but a workgroup barrier at loom:316
+     orders the two. Not a missing-barrier bug.
+   * workgroup_size 256 with subgroup_size 64 = 4 subgroups (loom:1293, loom:23) - checked because
+     the cross-subgroup question depends on it.
+ - So the kernel's ordering is, as far as I can read it, correct. What the comment documents is a
+   CONTENT hazard (stale bytes in rows the current request does not write), not an ordering hazard.
+   That distinction matters for where a fix belongs and is the honest state of this lead.
+
+### Why this is a lead and not yet the answer
+It converges on the same boundary as H2' (buffer lifetime/reuse vs a reader that assumes
+freshness) but from the kernel side, and it is directly checkable by a build-level experiment:
+nondeterminism for IDENTICAL requests is already what the comment reports. It does NOT yet name
+which of the two faces it produces, and it does NOT explain the cwsr=0/1 split. Both outstanding.

@@ -3300,3 +3300,58 @@ coherency refresh). Engine/fork-side, additive, no pin recession - so it satisfi
 site, an existing API, agreement with the allocation trace, an explanation for both faces, an
 explanation for why the earlier coherence-ATTRIBUTE patch failed, and - via the 70% eviction rig - a
 test that needs ~5 arms per cell (~20 min) instead of 60.
+
+---
+
+## INCIDENT + RECOVERY: I contaminated the reference arm build, detected it, and restored it (09:35)
+
+Recorded in full because it is the most dangerous thing that happened this turn, and because the
+detection is what stopped it from invalidating future work.
+
+### What went wrong
+Attempting to build the candidate fix (route `buffer_get`'s host-visible read through
+`hrx_synchronous_d2h` instead of a bare `memcpy`), I copied the working build dir `315instr3-build`
+and rewrote its cached `ggml_SOURCE_DIR` to `~/wt/llama-315instr` to point at the patched tree. That
+left the cloned cache's compile working directory still resolving INTO the reference tree, so the
+build wrote into **the reference build's own `bin/`**:
+
+    315instr3-build/bin/libggml-hrx.so.0.18.0   knob=1  (PATCHED)  mtime 09:13:02
+
+`315instr3-build` is the binary every arm run of this issue has used (`control_bin` and `fix_bin` in
+both the cwsr70 campaign and the cwsr=1 control). Leaving it patched would have silently changed the
+apparatus for every subsequent measurement - the exact "stale/instrumented build" trap KNOWN-ISSUES
+already records, but caused by me rather than found.
+
+### How it was detected
+The verification step I ran for the *new* build, not the old one: checking that the built library
+actually carried the new knob. It did not - so I enumerated every `libggml-hrx` and printed its knob
+state, which showed the REFERENCE library carrying `knob=1` while the other three arm builds
+(`315fix-build`, `315copy-build`, `315fp-build`) were all `knob=0`. A one-line census caught it.
+
+### What it did NOT affect
+**No recorded result is affected.** The reference library's patched mtime is **09:13:02**, while:
+
+    315disc1 ran 2026-10-11
+    315disc2 ran 2026-10-13 07:20:44 -> 08:51:19
+    the cwsr=1 control (315ctl1) ran 04:54 -> 06:32
+    the campaign of record (315cwsr70) ran 2026-10-12
+
+All of them finished before 09:13. The contamination window is entirely after the last arm run, so
+the eviction result (70% vs 0/22, p=3.6e-5), the control (2/27), the campaign (0/70) and every H2
+measurement stand on clean binaries.
+
+### The recovery, and its verification
+ 1. the source patch was reverted in full (`GGML_HRX_COHERENT_READ` occurrences back to 0);
+ 2. the reference library was rebuilt from ITS OWN tree - not byte-copied from another build, because
+    the sizes differ across builds (5,397,656 / 5,397,704 / 5,398,920) since each tree carries
+    different instrumentation, so a cross-build copy would have been a different contamination;
+ 3. verification: `knob=0`, correct version string `10613 (e44c9d01a)`, backend loads;
+ 4. **functional smoke test** - the restored server loaded GLM on HRX0 in 5 s, answered a real
+    `/v1/chat/completions` request with a coherent response, and logged zero fault lines.
+
+### The lesson, recorded as a trap
+Never build from a *copied* build directory whose cache points at another tree: CMake retains the
+original working directories, so objects and linked outputs can land in the ORIGINAL build dir. Build
+in a fresh directory configured against the target source, or patch and rebuild the same tree in place.
+And verify a rebuilt artifact by checking a NEW string it should contain - that check is what caught
+this.

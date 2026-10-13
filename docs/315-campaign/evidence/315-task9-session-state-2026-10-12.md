@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -5422,3 +5406,31 @@ narrows the search decisively: the corruption enters through the decode-split FA
 only that kernel does (its partial-transient layout, its pack handoff, its completion-counter protocol), and
 everything the static leg already cleared inside it (`1de679f`) stays cleared - so it is a different aspect
 of the same kernel.
+
+---
+
+## LEDGER: EVERY INSTRUMENT THAT PRODUCED A ZERO FOR THE WRONG REASON (16:15)
+
+This session diagnosed **six** instruments that silently reported nothing - or the wrong thing - and each
+one could have been read as a result. Collected because the pattern is itself the most transferable finding
+from this work, and because a future attempt on this issue will reach for the same tools.
+
+| instrument | what it reported | why it was wrong | how it was caught |
+|---|---|---|---|
+| `315-rate.py` face tally | `FaceB=0 unattributed=1` for a Face-B arm | its regex keys on parse/utf8 counters, but the detector recorded `http_failures` | comparing against the arm's own `detector.json` |
+| 315 ids dump, run 1 | 0 instrument lines | the name filter is EXACT-match, so `ffn_moe_topk` missed `ffn_moe_topk-1` | checking the instrument emitted anything at all |
+| 315 ids dump, run 2 | `dup_pairs` values | read either zeros or another tensor's FLOAT bits as i32; the CLEAN arm had MORE "garbage" lines than the faulting one | decoding the i32 values as floats |
+| writeback probe, take 1 (peer) | 0 records | `/v1/chat/completions` reused the cached graph, so the download path was never entered (prompt eval 1 token) | comparing `graphs reused` (7/15/23) against a real arm (95) |
+| fresh-transient-arena knob | 1 arm, all INVALID | retiring every arena buffer grows GTT past the regime gate (117 GiB) | reading the arm's `gtt_start` |
+| my own galign1 harness | `ga256-e FAULT-A` | the request loop broke on the first non-200 and counted a post-teardown request as a transport fault | reading the arm's own artifacts: 66 valid responses, zero fault lines, clean shutdown |
+
+**The shared lesson, stated once:** on this box an instrument's silence or a counter's zero is *usually* a
+tooling defect rather than a measurement, and the defence is always the same - check that the instrument
+fired AT ALL, and verify its output against an independent artifact (the arm's own files, the values
+decoded, a real arm's dispatch count). Four of the six were caught by that single habit.
+
+**And one direction matters more than the other.** Five of the six produced a false *zero* (missing a
+signal); the galign1 one produced a false *fault*. For an issue whose acceptance criterion is "zero faults",
+the false-fault direction is the more dangerous, because it would block a fix that works - and the
+false-zero direction is the one that would let a broken fix pass. Both were present this session and both
+were caught by artifact-level, not counter-level, reading.

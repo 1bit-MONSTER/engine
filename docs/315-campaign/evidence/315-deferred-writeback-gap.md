@@ -313,3 +313,65 @@ probe staged at `~/wt/315wb-probe.sh` reports exactly that tally.
 
 Explicitly still static: this section shows the window exists and is unflushed at the end of a replay. It
 does not show the source ever actually differs at flush time, which is the measurement.
+
+---
+
+# MEASURED: the logits ARE host-visible `0x52`, and the writeback path is still NOT entered
+
+The buffer trace was run in the build the earlier probes used, with both knobs on, to settle whether this
+lead is reachable at all. It produced the sharpest result of the whole lead — and it **contradicts the
+static reading** above.
+
+## The trace
+
+    [hrx-buf] type=HRX0      host_visible=0 direct_host_binding=0 memory_type=0x30 size=17895352832
+    [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=619520     <- the logits
+    [hrx-buf] type=HRX0      host_visible=0 direct_host_binding=0 memory_type=0x30 size=443547648
+    [hrx-buf] type=HRX0      host_visible=0 direct_host_binding=0 memory_type=0x30 size=81788928
+    [hrx-buf] type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=44048640
+
+and, from the same run:
+
+    writeback records: 0
+
+So the static prediction **held**: the logits are `HRX0_HOST`, `host_visible=1`, `direct_host_binding=0`,
+`memory_type=0x52` (not `HOST_COHERENT`) — exactly the allocation the chain above says should flow through
+host staging. **And no writeback was queued anyway.**
+
+## Where the static reading and the measurement disagree
+
+`backend-buffer-binding.cpp:76-80` appears to support the static reading outright, in its own comment:
+
+    const bool directly_bindable = !ggml_backend_buffer_is_host(buffer) || context->direct_host_binding;
+    // Coherent HRX host allocations are directly device-addressable. ... Noncoherent host allocations
+    // remain host data.
+    binding.buffer    = directly_bindable ? context->buffer : nullptr;
+    binding.host_data = directly_bindable ? nullptr : context->base;
+
+with `direct_host_binding = 0` in the trace, `directly_bindable` should be `!is_host(buffer)`. For the logits
+that is the open question — and the honest statement is that **this file's comment predicts staging for a
+non-coherent host allocation, while the measurement shows staging is not entered.** One of the two is not
+being read correctly, and the measurement is the one that cannot be wrong about the event count.
+
+The likely resolutions, none verified:
+
+- the logits' binding reaches the **first** early-return branch (`backend-buffer-binding.cpp:45-68`), which
+  sets `binding.host_data = base` and returns immediately — host data, but **never passed through
+  `materialize_bindings`**, so `staging.download` is never evaluated;
+- or `ggml_backend_buffer_is_host(buffer)` is true for the logits, making `directly_bindable` false and
+  sending them down a different route than assumed;
+- or the host-staging entries are materialized elsewhere for this binding shape.
+
+Distinguishing these is a bounded read of one more function, not a GPU question.
+
+## What is now established, and what is not
+
+- **Established**: the logits are a non-coherent `0x52` host-visible allocation in this build (measured,
+  not inferred).
+- **Established**: the `GGML_HRX_WRITEBACK_FINGERPRINT` instrumentation is compiled in and callable, and
+  it recorded nothing across two sound probes (10 varying graphs) plus this trace run.
+- **NOT established**: that the deferred writeback is unreachable in general. It is unreached on the paths
+  exercised here.
+- **Corrected**: the earlier section's claim that the logits are "structurally expected" to take the
+  staging path is **not supported by measurement**. It rests on reading one comment as decisive when the
+  event count says otherwise. That inference is withdrawn pending the bounded read named above.

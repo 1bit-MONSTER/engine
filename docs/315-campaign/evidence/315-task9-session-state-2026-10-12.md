@@ -594,3 +594,101 @@ Checked whether pooling the three cwsr=0 runs risks mixing out-of-regime arms:
 
 So the pooled 2x2 (cwsr=1 3/11 vs cwsr=0 0/72) contains no OOR contamination and the Fisher
 p=0.001863 figure stands as computed. (n moved 71 -> 72 as pair 57 landed.)
+
+---
+
+## !! CAMPAIGN OF RECORD CLEARED THE >=60 BAR — 2026-10-12 22:50
+
+`315cwsr70` reached the criterion-3 arm bar. All of ENDOGAME §1's required conditions verified:
+
+    fix-cell arms (arm l)            60      <- the number that must reach 60
+    arm l FAULT                       0
+    arm l OOR                         0
+    arm l INVALID                     0
+    all 60 arms at gtt_start=97G      YES (60/60; gate is >=95G, so all in-regime)
+    control-cell arms                21      (do NOT count toward the 60)
+
+`315-rate.py` output (with the trap noted):
+    arms parsed 81 | in-regime 81 | OOR 0 | clean 81 | FAULT 0 | INVALID 0
+    rate 0/81 = 0.00%
+    exact 95% upper CI 3.63% (Clopper-Pearson, one-sided)
+    rule of three 3.70%
+    face tally FaceA(nan)=0 FaceB(parse/utf8)=0 unattributed=0
+    no MISSED BY CONSOLE line; no UNVERIFIED line
+
+**The 81-vs-60 point is confirmed, not assumed:** 60 fix + 21 control = 81. So the tool's "81
+clean" over-counts; the honest fix-cell figure is exactly **60, which meets the bar.** My earlier
+warning about this trap was correct and is now demonstrated rather than predicted.
+
+### What this DOES establish
+ - criterion 3's arm bar: **MET** on the fix-cell count, with zero faults on BOTH faces and an
+   explicit power statement (95% confidence the true rate is < 3.63%).
+ - the campaign ran at `cwsr_enable=0` in-regime throughout.
+ - no arm was invalid for harness reasons (INVALID 0), and no fault was missed by the console.
+
+### What this does NOT establish (and the goal must not be declared met on this alone)
+ 1. **criterion 1 is still unmet.** No mechanism is named. A 60-arm clean run at cwsr=0 is a
+    strong result for ONE setting, with its best explanation (H2) contradicted by the vendored
+    reference set. Criterion 1 wants a named falsifiable mechanism with a discriminating
+    experiment - not a clean run.
+ 2. **The control has NOT run.** ENDOGAME §2: the H1 control (fresh boot, cwsr_enable=1, 20 pairs)
+    is criterion 1's decisive test and the only run that can produce a faulting arm with a bound
+    PID. It requires a reboot, which kills any running campaign. Until it runs, a clean cwsr=0
+    campaign cannot be attributed to CWSR rather than to this boot.
+ 3. **criterion 2 has no fix.** The campaign ran the SAME revision in both cells
+    (`version: 10613 (e44c9d01a)` for control_bin and fix_bin) - it is a diagnostic pair, not a
+    fix-vs-baseline comparison. No forward-only change is landed.
+ 4. **criterion 4 baselines not compared**, and **criterion 5** (KNOWN-ISSUES) is last by the
+    issue's own rule.
+
+### Population caveat if anyone pools this with the earlier runs
+The pooled 0/72 figure (three cwsr=0 runs) overlaps this one: `315cwsr70` supplied 60 of those 72.
+Do not double-count. The campaign of record stands on its own 60; the pool is a separate,
+post-hoc aggregate and is not the pre-registered n.
+
+---
+
+## !! CAMPAIGN OF RECORD COMPLETE — 2026-10-12 23:50, 70/70 fix-cell arms, 0 faults
+
+`315cwsr70` hit its cap of 70 pairs. FINAL figures:
+
+    fix-cell (arm l)  OK=70   FAULT=0   OOR=0   INVALID=0     <- all 70 at gtt_start=97G
+    control-cell (c)  OK=24
+    scorer total      94 = 70 + 24  (its "clean 94" again counts BOTH cells)
+
+    315-rate.py: rate 0/94 = 0.00%
+                 exact 95% upper CI 3.14% (Clopper-Pearson, one-sided)
+                 rule of three 3.19%
+                 face tally FaceA(nan)=0  FaceB(parse/utf8)=0  unattributed=0
+                 no MISSED BY CONSOLE, no UNVERIFIED
+
+    fix-cell only (authoritative): n=70, bound 3/70 = 4.29%, P(0|26%) = 7.5e-10,
+                                   expected faults at 26% = 18.2
+
+### Criterion 3's arm bar: MET, and now comfortably
+70 >= 60, every arm in-regime, zero faults on BOTH faces, explicit power statement, no invalid
+arms, no console-missed faults. The 81/60/70 progression across this session was real progress,
+not a rounding artifact - and the fix-cell-vs-total trap stayed confirmed throughout (94 total vs
+70 fix-cell).
+
+### The run's own closing line, quoted verbatim
+    70 clean fix-cell arms, 0 faulted-or-invalid in the fix cell, out of 94 arms run
+    Record it as UNINFORMATIVE (clean-arm count 94), per the task-8 contract. A clean
+    trace is NOT evidence about the fault's mechanism.
+
+That is the campaign's own verdict on its H2 relevance, and it agrees with every finding this
+session: **task-8's trace is UNINFORMATIVE for the mechanism** (no faulting arm to correlate),
+even though criterion 3's arm bar is met.
+
+### Where the goal stands now, precisely
+| criterion | state |
+|---|---|
+| 1 — named mechanism | **UNMET.** No mechanism named; H2's carrier contradicted; the trace that would test it is uninformative |
+| 2 — forward-only fix | **UNMET.** No landed repair; both cells are the same revision `e44c9d01a` |
+| 3 — >=60 in-regime, 0 faults, CI, power | **MET** on fix-cell: 70 arms, 0 faults, CI 4.29% fix-cell / 3.14% total, power statement given |
+| 4 — no regression | not run (no fix to regress-test) |
+| 5 — KNOWN-ISSUES | not started; last by the issue's own rule |
+
+**The goal is NOT complete.** Criterion 3 is met; criteria 1, 2, 4, 5 are not. The campaign
+established the RATE for one setting - exactly what ENDOGAME §1 said it would ("establishes the
+RATE, not the cause") - and nothing more.

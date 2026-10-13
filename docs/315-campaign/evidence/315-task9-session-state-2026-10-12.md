@@ -2809,3 +2809,33 @@ eviction cell then entering and `evictonly` confirmed ACTIVE.
                                                    clean most of the time)
 
 Waiter task `b4c7ae24f` will report the per-cell tally on completion (~40 min).
+
+---
+
+## DISС2 FIRST RESULT (09:29) — the eviction cell faulted, replicating disc1's signature
+
+    round 1 arm q: OK     nan=0 req=66                              gtt_start=97G
+    round 1 arm e: FAULT  nan=1 req=19 transport=1 side=1/1         gtt_start=98G
+    round 1 arm c: OK     nan=0 req=66                              (cell c, first arm)
+
+The faulting arm's own log and detector:
+
+    315disc2-r1e: requests=19, ok=18, transport_failures=1,
+                  first_failure="RemoteDisconnected: Remote end closed connection without response"
+    server.log:145: 1.18.529.363 E common_sampler_sample: HRX returned NaN logits:
+                    count=154880 of 154880, index range [0..154879], contiguous=yes, continuing=no
+    server.log:218: #5 ggml_abort() from libggml-base.so.0
+
+So: **the whole vocabulary (154880 of 154880), contiguous, the sampler guard aborts, the process dies** -
+the identical signature to the control's p16c (`count=154880 of 154880, contiguous=yes`) and to disc1's
+two faulting arms (nan=1, transport=1, early abort). The console records `side=1/1`, i.e. the eviction
+side-load WAS engaged for this arm.
+
+That is the first arm of the replication and it lands exactly on the pre-registered prediction branch:
+**cell e faults while cells q and c are clean** - so far 1 fault in 2 e-arms against 0 in 2 controls.
+The run continues; the final per-cell tally is what the pre-registered reading key is applied to.
+
+NOT yet claimed: replication. One fault in one arm is one draw, exactly the situation that made disc1's
+contrast p=0.066 rather than decisive. The value of this run is that it upgrades disc1 from a single
+unreplicated observation toward a repeated one - and it must be read against the branches fixed in
+36f360a BEFORE the run, which it currently matches on the 'e faults clear of q and c' branch.

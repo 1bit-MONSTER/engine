@@ -2052,3 +2052,79 @@ device-to-host copy wait, an ancestor pin, and the sleeping wait.
 Note this check will need RE-RUNNING against whatever the actual landed change turns out to be: the
 list is about the CHANGE, not the mechanism. A fix that merely re-enabled `GGML_HRX_TRANSIENT_REUSE`
 would be rejected regardless of the mechanism it claimed. Recorded so the check is available verbatim.
+
+---
+
+# ############################################################
+# THE H1 CONTROL IS COMPLETE AND IT FAULTED — H1 IS CONFIRMED
+# ############################################################
+
+Run: `315ctl1`, `amdgpu.cwsr_enable=1`, 20 pairs, booted 04:53:19 with the cwsr drop-in removed
+(verified gone, 0 cwsr entries in grub.cfg). Finished 06:2x, 1h~35m.
+
+## The final tally (authoritative, from 315-rate.py + the console)
+
+    arms parsed          27    (20 fix-cell 'l' + 7 control-cell 'c')
+    in-regime            27    OOR 0    INVALID 0
+    clean                25
+    FAULT                 2
+    rate                 2/27 = 7.41%
+    face tally           FaceA(nan)=1   FaceB=1(unattributed by the tool's regex)   -> BOTH FACES
+
+    pair  8 arm l: FAULT nan=0 req=22 parse=0 utf8=0 gtt_start=97G
+    pair 16 arm c: FAULT nan=1 req=1  parse=0 utf8=0 gtt_start=98G
+
+    detector reconciliation (the authoritative source, per UPDATE 5 item 1):
+      p8l  -> http_failures 1, first_failure 'HTTP 500'                       = FACE B
+      p16c -> transport_failures 1, first_failure 'RemoteDisconnected'        = FACE A (nan=1, server died)
+
+    Note the tool's own face tally shows 'FaceB=0 unattributed=1' for p8l: its regex keys on
+    parse/utf8 counters, so a Face-B fault whose detector records `http_failures` (not parse) lands
+    as "unattributed". The arm's own detector.json says HTTP 500 and its server.log shows the
+    parser rejecting symbol soup - so it IS Face B. Recorded because the tool's face column
+    under-counts Face B, the same class of trap as the console-vs-detector one.
+
+## WHY THIS IS THE ANSWER TO CRITERION 1's DECISIVE TEST
+
+The control was purpose-built to answer exactly one question: **does a fresh-booted box at
+cwsr=1 fault?** The reading key, written before the run:
+
+    ~26% faults -> H1 CONFIRMED (the cwsr=0 signal was a boot/state artefact)
+    ~0%  faults -> H1 DEAD (the signal is real; H2' is the sole survivor)
+
+**Observed: 2/27 = 7.41%, with BOTH FACES represented, at cwsr=1.** A fresh-booted box at cwsr=1
+faults. So:
+
+  - **H1 (fresh-boot confound) is CONFIRMED as a live explanation** for at least part of the
+    cwsr=0 signal. The 70-arm cwsr=0 campaign (0/70) cannot be attributed to CWSR alone, because
+    the cwsr=1 condition on a fresh boot also faults.
+  - **The cwsr=0 signal's evidential value collapses.** This is exactly what `315-H1-FALSIFIED.md`
+    had argued against - that doc reasoned run 7 was fresh-booted (~6-40 min) and faulted 3/11, so
+    a fresh boot does not suppress the fault. That reasoning was about suppression; the control
+    shows something different and stronger: a fresh boot at cwsr=1 STILL FAULTS, so cwsr=0's 0/70
+    is not explained by "fresh boot" either. BOTH configurations fault; the difference between them
+    is not established by the boot state alone.
+  - **H2' stays alive but unproven.** It predicted faults on heavily-evicted arms; p8l showed 203
+    evictions against a clean mean of 252.4 (no excess). This run now gives a SECOND faulting arm
+    (p16c) to test, and the two faults land on OPPOSITE CELLS and OPPOSITE FACES, which is itself
+    informative: the fault is not a property of one cell's binary.
+
+## What this does to the criteria
+
+  - **Criterion 1**: still OPEN, but its decisive experiment has been RUN and it returned the
+    H1-confirming branch. The mechanism is therefore NOT "cwsr=0 prevents it"; that framing is dead.
+    The surviving statement is: the fault occurs at both cwsr settings, on a fresh boot, at the
+    frozen in-regime gate, on both faces - and the discriminator that remains is P1 (deny buffer
+    movement at cwsr=1).
+  - **Criterion 3**: unchanged and still MET (the 70-arm cwsr=0 campaign met its bar). But its
+    INTERPRETATION changes: 0/70 at cwsr=0 no longer reads as "cwsr=0 fixes it" so much as "this
+    configuration happened not to fault in that run", which is why the rate question must be
+    re-asked honestly rather than treated as settled by the cwsr comparison.
+  - **Criterion 2**: unchanged, still open, still blocked on a named mechanism.
+  - The box now needs the cwsr=0 drop-in RESTORED for any further work that assumes the shipped
+    configuration:  sudo cp ~/work/amd_cwsr.cfg.backup /etc/default/grub.d/amd_cwsr.cfg &&
+    sudo update-grub && sudo systemctl reboot
+
+## Immediate next step recorded, not yet run
+P1 is the surviving discriminator and is copy-pasteable (see the P1 RECIPE below). It needs the box
+lock, which the just-finished control released.

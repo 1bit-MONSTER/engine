@@ -339,3 +339,59 @@ same counters).
 
 The retraction above is kept rather than deleted so the reasoning error is visible: a symbol-search negative
 is only as good as the symbol chosen.
+
+---
+
+# CLOSED: the quarantine is the AMDGPU HAL **ASAN** feature, inactive in production
+
+Followed the corrected lead to the slab pool and found where "quarantine" actually lives — and it is not a
+production eviction mechanism at all.
+
+## The quarantine is a sanitizer
+
+`runtime/src/iree/hal/drivers/amdgpu/asan_state.h`:
+
+    typedef void (IREE_API_PTR* iree_hal_amdgpu_asan_quarantine_release_fn_t)(...);
+    typedef struct iree_hal_amdgpu_asan_quarantine_entry_t {
+      // Next entry in the ASAN state quarantine FIFO while retained.
+      struct iree_hal_amdgpu_asan_quarantine_entry_t* next;
+      // Mapping byte length counted against the quarantine budget.
+      ...
+      iree_hal_amdgpu_asan_quarantine_release_fn_t release_fn;
+    } iree_hal_amdgpu_asan_quarantine_entry_t;
+    ...
+      // Current total bytes retained by the quarantine FIFO.
+
+and `driver_options_test.cc:68` exercises `options.asan.quarantine_size`. The allocator header confirms the
+intent:
+
+> "device-local persistent allocations route through the device default pool set so redzones, shadow
+> publication, **release poisoning, and quarantine** follow the same policy as queue allocations."
+
+So this is **AddressSanitizer for the GPU HAL**: redzones, shadow publication, release poisoning, and a
+quarantine **FIFO that deliberately retains freed mappings** so a use-after-free can be caught rather than
+silently succeed. `quarantine_eviction_count` and `bytes_quarantined` are its bookkeeping — counters *about*
+the sanitizer's retention, not about memory pressure reclaiming anything.
+
+## Why this closes the lead
+
+- The counters I found in the decompiled `hrx_mem_pool_trim` (`quarantine_eviction_count`,
+  `bytes_quarantined`) are **ASAN statistics**, surfaced through the generic `iree_hal_pool_query_stats`.
+- ASAN is **not enabled** in the production configuration the arms run (it is an option with a
+  `quarantine_size`, and the recorded traces show no sanitizer behaviour).
+- The `inflight_allocation_count` gate is a genuine pool invariant — but it protects against trimming during
+  allocation, and I verified its accounting is correct on both decompiled paths. It is not the fault's
+  carrier.
+
+## Final standing of this whole lead
+
+    quarantine semantics found       ASAN-only (redzones/poisoning/quarantine FIFO), inactive in production
+    public pool API                  unused by the engine (verified)
+    pool actually used by GLM        slab pool via hrx_mem_pool_backing_create_pool (verified in the decompile)
+    inflight/trim invariant          correct on the two decompiled paths, no leak found
+    stale-read surface here          NOT ESTABLISHED, and on the evidence now closed
+
+The lead began as a plausible "retire → reuse window", survived one false negative of mine (grepping the
+wrong symbol), and ends at a sanitizer feature. Recorded in full, including the false negative, because a
+symbol-search conclusion is only as good as the symbol — which is the same lesson as the session's other
+parse defects, arriving from a different direction.

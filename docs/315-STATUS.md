@@ -1287,3 +1287,59 @@ changes have already been tried and falsified.
 | 3 | >=60 in-regime arms, zero faults | **not met, and the gate is mis-specified**: "in [95,110]" is satisfiable by quiet arms at the 5% ambient rate, which is exactly what the recorded 0/70 did. A claim the defect is gone must run the **forcer** cell |
 | 4 | no regression | all seven recorded CI gates green (they were red: copyright restored, `check_pins` gap closed); controls still need a landed fix to compare |
 | 5 | KNOWN-ISSUES updated | done |
+
+---
+
+# UPDATE 17 (2026-10-13 ~16:45) — a parse error of MINE invalidated a family exclusion; the record is corrected
+
+This supersedes UPDATE 16's "six families closed" line, which is no longer true.
+
+## What happened
+
+I scored the peer's alignment runs by running `md5sum` over each streaming `resp.*` file and counting distinct
+hashes, and read **every arm as faulting**. That was wrong: `/completion` streams its answer, so two responses
+with **identical text** differ by a byte or two of chunk framing. Sampling the files shows it directly
+(`[2212 bytes]` and `[2211 bytes]` with the same content). Comparing the `content` field instead:
+
+    gb4096-e   66 responses   distinct_content = 1   -> CLEAN
+    gb256-e    66 responses   distinct_content = 1   -> CLEAN
+    gb4096-q   66 responses   distinct_content = 1   -> CLEAN
+
+## What it invalidated
+
+- my claims that the peer's alignment arms "all faulted" (several files);
+- my **downgrade of the FA row in KNOWN-ISSUES**, which I had justified as "not sufficient" on the strength of
+  those faults. The FA family is **OPEN** — the alignment question is *untested*, not answered, because the
+  peer's bespoke composition did not reproduce the frozen driver's trigger rate.
+
+Their own conclusion was right and mine was not: their `f3cf774` reached the pre-registration's **UNINFORMATIVE**
+branch and diagnosed why (a custom composition does not reproduce ~85% triggering).
+
+Corrected in place, with marks on every affected file (`315-galign-peer-result.md`,
+`315-galign-label-discrepancy.md`, `KNOWN-ISSUES.md`), plus a standalone correction file.
+
+## Corrected criteria table
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named, falsifiable mechanism | trigger **named, replicated, quantified** (ambient ~5% vs forced eviction ~95%, order-of-magnitude contrast); **cause not located** — **four** families closed (not six) |
+| 2 | forward-only fix landed | **not achievable within scope**: structural argument plus the detection observation — the engine validates program structure and never memory contents, and both faces already fail loudly, so there is nothing to add at the detection end either |
+| 3 | >=60 in-regime arms, zero faults | **not met, and mis-specified**: the gate must be the **intervention cell** and the ambient rate reported alongside, not a band on `gtt_start` |
+| 4 | no regression | all seven recorded CI gates green (were red); the control re-run is **queued** behind another agent's campaign series |
+| 5 | KNOWN-ISSUES updated | done, and re-corrected for the parse error |
+
+## The families that ARE closed (four)
+
+    logits read path (hrx_synchronous_d2h)      REFUTED   its own pre-registered A/B
+    host side (all four 0x52 accesses)          CLOSED    none on the decode path
+    runtime AQL submission policy               CLOSED    the runtime does not infer hazards
+    graph reorder (GGML_HRX_GRAPH_ORDER)        REFUTED   cell e 4/4 FAULT in BOTH arms
+    deferred host writeback                     CLOSED    binding host_data == nullptr (measured)
+    FA alignment/dispatch                       OPEN      my exclusion was a parse error
+
+## Lesson, since this is the third parsing failure in this issue
+
+In this issue the **measurement has repeatedly been sound and the parsing of it has repeatedly failed** (a
+line-based counter reading zero on newline-free NDJSON; a `pgrep` pattern matching its own caller; now hashes
+over streaming responses). The frozen rig ships its own classifier precisely to avoid hand-rolled parsing, and
+the rule from here is: **use the rig's classifier, or compare the payload rather than the file.**

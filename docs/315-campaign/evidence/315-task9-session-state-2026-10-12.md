@@ -4476,3 +4476,53 @@ which is a one-line check once records exist.
 This is still characterisation, not a named cause. But it is now the most constrained characterisation in
 the record: a specific, reproducible, on-topic, clean-arm-absent sentence, from a face that never varies
 within an arm. Any candidate mechanism now has to explain THAT.
+
+---
+
+# FACE A IS ALWAYS FULL-VOCABULARY NaN, AND ITS NONDETERMINISM IS IN THE EARLIER OUTPUTS (15:15)
+
+Measurement 1 from the previous section, answered from recorded logs.
+
+### The data
+Face-A arms split by determinism, with the NaN extent read from each arm's own guard line:
+
+    group      n    with a NaN line    NaN extent seen
+    idn=1     39         29            (154880, 154880)  x29
+    idn>1     17         17            (154880, 154880)  x17
+
+    ok-requests:  idn=1  min=4  median=32  max=64
+                  idn>1  min=3  median=9   max=16
+
+### Two things this establishes
+ 1. **Every Face-A arm that logged the guard reported the ENTIRE vocabulary NaN** - 154880 of 154880, in
+    all 46 arms with a line, deterministic or not. There is no partial-NaN Face A in this population. That
+    matches the issue's oldest observation (`count=154880 of 154880, contiguous=yes`) and it means the
+    extent is not a discriminator: whatever produces Face A produces total corruption of that buffer.
+ 2. **The nondeterminism is in the arm's EARLIER outputs, not in the NaN event.** The `idn > 1` arms differ
+    among themselves in the first eight identical requests - i.e. _before_ the arm faulted. So for those
+    arms the corruption was already varying during normal generation, and the eventual NaN is the terminal
+    event of an arm that was already unstable.
+
+### What that means for the mechanism
+It splits Face A into two sub-populations, which the issue has never separated:
+
+    Face A, deterministic (39):  normal outputs agree; then the whole vocabulary goes NaN once.
+    Face A, nondeterministic (17): outputs ALREADY disagree among identical requests; then NaN.
+
+The second is a stronger finding than "the arm is intermittent": outputs that differ for identical greedy
+requests mean the computation itself was varying mid-arm, which is the signature of a read that depends on
+timing (or of state that a concurrent process is mutating) - and it is exactly what the *eviction*
+candidate predicts. The first sub-population is a single abrupt total corruption with stable behaviour
+before it, which is what a *one-shot wrong value* (a stale index, a moved buffer read once) predicts.
+
+So the population contains evidence for BOTH candidate classes, on different arms, rather than favouring
+one. Recorded plainly because it cuts against a clean single-cause story - and because it is the kind of
+thing an over-eager write-up would smooth over.
+
+### Bounds
+ - `identical_distinct` is `None` for 3 Face-A arms that died before the eight-request block, and there are
+   10 Face-A arms with no NaN line in the log (their guard line may have been lost with the abort); the
+   table uses what is present.
+ - "outputs already disagree" is measured on the eight identical greedy requests only. Whether the
+   DISAGREEMENT is in the logits or in the sampling is not resolved by this data - that needs the
+   fingerprint, which is the instrument that the arena-read problem defeated.

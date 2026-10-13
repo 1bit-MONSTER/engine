@@ -1328,11 +1328,35 @@ declaration, written here BEFORE any P1 arm runs:
                          CPU/GPU visibility
    This is exactly H2''s buffer-movement factor, and it is per-arm togglable.
 
-### P1 RECIPE (both arms cwsr=1, same model/pressure - only the env differs)
-    arm A (movement allowed, positive control):
-        315-evict-trace.sh <pairs> 315p1a          # no EXTRA_ENV -> the historical default
-    arm B (movement denied / direct bindings):
-        EXTRA_ENV="GGML_HRX_USE_UNIFIED_MEMORY=1" 315-evict-trace.sh <pairs> 315p1b
+### P1 RECIPE - RESOLVED AND EXECUTABLE (SAMEBIN pinned 06:20)
+SAMEBIN = $HOME/wt/315instr3-build   # the exact binary both the 70-arm campaign of record and the
+                                     # running control used, so P1 arm A is directly comparable to
+                                     # the historical 34/131 baseline. Both cells get the SAME build
+                                     # so the env is the only difference between the runs.
+
+Sizing: the discriminator needs enough arms to separate ~26% from ~0. At 26%, 20 pairs gives ~5.2
+expected faults and P(0 faults) = 0.002 - the same power argument the H1 control used, and ~2.5 h.
+So PAIRS=20 for each arm unless the box budget forbids it.
+
+    # arm A - movement ALLOWED (positive control; must fault if the fault is still live)
+    ssh strixhalo 'cd ~/wt && setsid nohup env TAG=315p1a bash 315-evict-trace.sh 20 315p1a \
+        ~/wt/315instr3-build ~/wt/315instr3-build > ~/wt/315p1a-run.log 2>&1 < /dev/null &'
+
+    # arm B - movement DENIED (direct coherent bindings via the runtime knob, no rebuild)
+    ssh strixhalo 'cd ~/wt && setsid nohup env EXTRA_ENV="GGML_HRX_USE_UNIFIED_MEMORY=1" \
+        bash 315-evict-trace.sh 20 315p1b ~/wt/315instr3-build ~/wt/315instr3-build \
+        > ~/wt/315p1b-run.log 2>&1 < /dev/null &'
+
+PRE-CONDITION for both: cwsr_enable must be 1 (it is, after the control reboot, and the drop-in is
+already removed). If the control's restore-to-cwsr=0 has been run, re-apply and reboot FIRST.
+
+READING KEY (pre-registered):
+    A faults ~26% and B is clean        -> movement is necessary; H2' survives with a real carrier
+    A faults ~26% and B faults ~26%     -> denying movement changes nothing; the whole
+                                           eviction/buffer story (H2 and H2') is dead
+    A clean (0/20)                      -> the fault is not live in this state at all; P1 is
+                                           uninformative and the rate question reopens
+    A and B both clean                  -> uninformative; do NOT read as evidence for B fixing it
     Prediction: B shows ~0 faults, A shows ~26%. Faults in B at ~26% refutes H2'.
     Caveat to state in the write-up: HOST_COHERENT was FALSIFIED AS A FIX (315accept 9 clean +
     1 fault / 10). P1 does not re-propose it as a fix - it uses it as a MECHANISM PROBE, a

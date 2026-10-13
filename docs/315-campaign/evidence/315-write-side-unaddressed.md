@@ -79,3 +79,50 @@ Read in the working tree `~/wt/llama-315coherent` and `~/wt/validate-329/third_p
 strixhalo. The engine's pinned `llama.cpp` revision must be re-checked before these line numbers are
 used in KNOWN-ISSUES; the load-bearing facts (four host accesses, one fixed; `hrx_synchronous_h2d`
 exists) are structural and should be re-read at the pin.
+
+---
+
+# UPDATE (same turn) — the logits half of the write-side lead is FALSIFIED
+
+Checked the "output buffer reallocated mid-run" form promised above, and it does not hold for this
+campaign's shapes.
+
+## The code
+
+    uint32_t llama_context::output_reserve(int32_t n_outputs)   # llama-context.cpp:2096
+        ...
+        const size_t prev_size = buf_output ? ggml_backend_buffer_get_size(buf_output.get()) : 0;
+        const size_t new_size  = (...) * sizeof(float) + (...) * sizeof(llama_token);
+        // alloc only when more than the current capacity is required
+        if (!buf_output || prev_size < new_size) {          # the branch holding the clear
+            ...
+            buf_output.reset(ggml_backend_buft_alloc_buffer(buft, new_size));
+            ...
+            ggml_backend_buffer_clear(buf_output.get(), 0);  # line 2186
+        }
+
+`output_reserve` **is** on the decode path — it is called from `llama_decode` (`:1848`) and
+`llama_encode` (`:1446`) on every call — but the allocation-and-clear branch is guarded by
+`prev_size < new_size`. With the campaign's fixed shapes (`-c 8192`, `--no-webui`, identical request
+size, `n_outputs_max` fixed at init) `new_size` does not grow, so the branch is taken on the first call
+and never again.
+
+**Therefore the logits/output buffer is not host-written per token**, and the "stale host write to the
+logits mapping" story is falsified for this defect in this campaign.
+
+## What survives
+
+Only the `buffer_set` load-path form (below), which is a different claim: a host write of **weights or
+other inputs** through `ggml_backend_tensor_set` (`llama-context.cpp:2617, 2699`) into a non-coherent
+mapping. That is not falsified here and is not tested here. It is also a poor fit for the observed
+behaviour on its own — a stale weight write would not be *intermittent* and eviction-driven the way the
+fault is, since it happens once per load.
+
+## Net position of this file
+
+The write side remains architecturally relevant — three of the four host accesses are writes, against
+one read that the fix addressed — but the specific "host write per decode to the logits buffer" form is
+dead, and the surviving form (load-time weight writes) does not obviously explain an intermittent,
+eviction-correlated fault. So the write side is **not** currently the leading explanation of arm B's
+result; it is recorded because the access asymmetry is real and because the next hypothesis should not
+have to rediscover it.

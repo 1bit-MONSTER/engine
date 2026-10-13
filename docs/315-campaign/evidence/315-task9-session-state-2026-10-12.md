@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4730,3 +4714,50 @@ text the recording detector made available.
    reply), and the Face-B reframing from the previous section still needs its own check.
  - "indistinguishable up to the terminal event" is for THIS prompt. A corruption that only affects long
    generations, or only the KV cache after many tokens, would not show in a 96-token answer.
+
+---
+
+## CONVERGENCE WITH THE PEER'S LEAD (15:30) — two independent lines, same memory type, different sites
+
+A **second agent is working this same goal on this same branch** (commits `59b3442`, `abbf539`, `d8ee52b`,
+plus tooling fixes `c56f93a`, `94efd08` - none of them mine). Its lead is independent and it composes with
+my text finding rather than competing with it.
+
+### Their claim, in their words
+`download_prepared_host_staging` (`command-program-executor.cpp:1065`) allocates a mapped staging buffer,
+copies the device buffer into it with `hrx_stream_copy_buffer`, then queues
+`add_host_writeback(dest=host_data, src=download_data)`. That staging buffer comes from
+`allocate_mapped_host_staging_buffer` (`runtime/host-memory.cpp:1287`), which allocates with
+**`HRX_MEMORY_TYPE_HOST_LOCAL | HRX_MEMORY_TYPE_DEVICE_VISIBLE` = `0x52`, NO `HOST_COHERENT`**, then
+`hrx_buffer_map`s it. So the pointer the deferred memcpy reads is a non-coherent 0x52 mapping - **the same
+memory class my refuted candidate read, at a different site** - and crucially the read is **DEFERRED** to
+the sync point rather than immediate.
+
+### Why their version is stronger than mine was
+My candidate read the mapping at a single immediate point, right after the device write, and its fix was
+shown not to help. Theirs reads it at `mark_stream_synchronized` - **arbitrarily later** than the device
+copy that populated it - and the code states the ordering is not otherwise guaranteed. A preemption or
+eviction landing in that wider window is exactly the trigger, which explains why the deferred version could
+work where the immediate version did not.
+
+### Why my text evidence SUPPORTS it rather than contradicting it
+My `315text1` finding is that a faulting arm's first five requests were **correct and character-identical
+to the clean controls'**, and the arm then died at request 5 with whole-vocabulary NaN. That is exactly
+what a deferred download-path corruption predicts:
+
+ - the deferred read is not on every token's path; it fires on the host-staging/download route,
+ - so earlier REQUESTS complete correctly (observed),
+ - and the request whose download reads a corrupted staging buffer fails **whole-buffer and terminally** -
+   which is the `count=154880 of 154880, contiguous=yes` signature every Face-A arm shows.
+
+So my evidence constrains WHEN the corruption must fire (at a download, not during generation) and their
+trace names WHERE it is queued. The two are complementary, and they independently converge on the 0x52
+non-coherent memory class.
+
+### The honest state
+This is a sharper lead than anything before it, but it is still a lead: it has **never been run**, and the
+peer's own commit says the instrument "already exists and has NEVER been run" (`abbf539`). The remaining
+test is to exercise the deferred-writeback path with the instrument - which is a task in progress by the
+other agent, so I should not duplicate it. What I contribute is the constraint: any explanation must
+produce correct output for prior requests and a terminal whole-buffer failure at the failing one, which the
+deferred-download story naturally gives and a steady-read-corruption story does not.

@@ -4418,3 +4418,61 @@ The harness's prompts are deterministic and known. Check whether that 105-charac
 of it - appears as a normal (accepted) output of any OTHER arm or cell. If it does, a clean arm already
 produces that sentence for some prompt, and Face B is a request/context mix-up. If no clean arm ever
 produces it, the sentence is unique to the corrupt state.
+
+---
+
+# THE 9-FOLD SENTENCE IS A STABLE WRONG GENERATION, AND IT IS ON-TOPIC (15:05)
+
+Two checks, both from recorded data, and together they sharpen Face B considerably.
+
+### Check 1: the sentence appears ONLY as rejected output
+Searching every arm's `server.log` for the 105-character sentence:
+
+    total occurrences : 12
+    by context        : {'REJECTED': 12}
+    non-rejection contexts: NONE
+
+So **no clean arm has ever produced that sentence.** It is unique to the corrupt state - not a prompt
+template, not a common continuation, not a cross-request mix-up. That eliminates the contamination
+reading I floated, which is worth recording as eliminated rather than left open.
+
+### Check 2: it is nevertheless ON-TOPIC for the harness's own prompt
+    harness prompt : "Explain in detail how a transformer language model generates text, step by step,
+                      including attention, the KV cache and sampling."
+    rejected output: "We'll assume the reader has a basic understanding of LLMs but wants to understand
+                      the internal mechanics."
+
+That sentence is a **plausible opening for that exact prompt** - it is about LLMs and about understanding
+their internal mechanics, which is what the prompt asks for. So Face B's modal output is:
+
+    coherent, complete, on-topic for the requested subject, identical across 9 arms / 4 runs,
+    never produced by any clean arm, and rejected by the parser for shape (Content-only) rather than content.
+
+### What that combination means for the mechanism
+It is the signature of a model **computing the right kind of answer but committing to the wrong text** in a
+stable way, which is:
+
+ - NOT a random corruption (the text is on-topic and grammatical);
+ - NOT a race (it reproduces exactly across runs);
+ - NOT cross-contamination (no clean arm emits it);
+ - consistent with a **stable wrong value entering the computation** - e.g. a wrong expert or a wrong
+   intermediate that persistently changes the trajectory for this prompt, giving the same wrong but
+   plausible continuation every time.
+
+That is a better fit for the argsort/stale-index candidate than for any timing-based one, and it explains
+why the sentence is *plausible*: a stale index selects a real expert, so the model still produces a
+sensible continuation - just not the one it would have produced with the correct expert.
+
+### The decisive follow-up, now well-posed
+Have a **clean arm and a faulting arm answer the same prompt with the text recorded** (needs a run on the
+patched detector, which is ready). Then:
+  - if the faulting arm's accepted (pre-fault) outputs match clean arms' and only the failing one differs,
+    the corruption is a late, localised wrong step -> consistent with a wrong expert at one layer;
+  - if the faulting arm diverges from the very first token, the wrong value entered at the start.
+And the 9-fold sentence gives a target: a clean arm should NOT produce it, and a faulting arm should -
+which is a one-line check once records exist.
+
+### Honest note
+This is still characterisation, not a named cause. But it is now the most constrained characterisation in
+the record: a specific, reproducible, on-topic, clean-arm-absent sentence, from a face that never varies
+within an arm. Any candidate mechanism now has to explain THAT.

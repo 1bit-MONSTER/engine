@@ -125,3 +125,46 @@ Fixed as `315dense2.sh`, which counts only real driver processes — reading eac
 This is the seventh harness/reasoning defect recorded this session, and it belongs to the same family as the
 `pgrep` self-match scare earlier: **`pgrep -f` sees whatever text is in a command line, including the one
 asking the question.**
+
+---
+
+# The dense-model half: VALID and CLEAN — criterion 4 is now measured on both halves
+
+Ran 19:02–19:05, Qwen3-8B-Q4_K_M (a **dense** model, not MoE) on HRX0 at GTT 44→55 GiB, the same detector
+shape the arms use (50 mixed-length requests, `max_tokens=32`, `temperature=0`).
+
+    responses         50 of 50
+    distinct content   1        (every response identical — deterministic and coherent)
+    NaN guard          0
+    Content-only       0
+    HSA_STATUS_ERROR   0
+    server tasks    1617        (0 errors; "graphs reused = 1539")
+
+**Clean.** That is the expected negative control: a dense model does not exhibit the fault, so it
+demonstrates the apparatus — detector, build, HRX0 path, request shape — does not fault everything in sight.
+That is what makes the GLM arms' high eviction-cell rate attributable to the model/shape rather than to the
+harness.
+
+## Criterion 4, both halves now MEASURED
+
+| half | result |
+|---|---|
+| MUL_MAT_ID op-test + HRX suite | **8/8 pass**; `MUL_MAT_ID` nmse matching baseline (1.34–1.61e-05 vs 1.23–1.58e-05) |
+| dense-model control | **clean**: 50/50 responses, 1 distinct content, no fault signatures |
+
+Criterion 4 is still not *met* in the criterion's own terms, because it pairs these controls with a **fix to
+compare against** ("baseline-vs-fix on the same harness") and no fix has landed. What is established is that
+the baseline the future fix must match is measured and currently intact.
+
+## Eighth harness/parse defect of the session
+
+My own script reported `responses=1` and printed `RESULT: FAULT or incomplete`. **That was wrong.** The
+script counted with `grep -c '"content"'`, which counts *lines* — and `/v1/chat/completions` responses are
+concatenated without newlines, so fifty responses sit on one "line" and the count is 1.
+
+Counted correctly (`grep -o … | wc -l`) it is **50**. Anyone reading only the script's verdict would have
+concluded the dense control faulted, which is the opposite of the truth.
+
+This is the **same class** as an earlier defect this session (a line-based counter reading zero on
+newline-free NDJSON). Twice on the same mistake is worth stating plainly: **for any concatenated-JSON
+endpoint, count occurrences, never lines.**

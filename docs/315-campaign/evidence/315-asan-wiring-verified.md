@@ -91,3 +91,50 @@ kept running for another ~25 minutes, because the diagnostic mode sets `NOSTOP=1
 pinned the box at 1577 % CPU, holding tctl at 91 °C and blocking the ASAN run's gate. Two lessons, both the shape
 of this campaign's earlier harness defects: **kill the process group, not the script name**, and **a leftover can
 block a later run's gate rather than merely slowing it**.
+
+---
+
+# The outcome: no device-level access violation in either face
+
+Both ASAN runs are complete. Tallies, verbatim from the session logs:
+
+**`315asan2`** — `EXTRA_ENV="GGML_HRX_LOG_DEVICE_EVENTS=1 HRX_HAL_SANITIZER=asan"`, rig otherwise untouched:
+
+    round 1 arm q: FAULT  nan=1  req=6   transport=1            gtt_start=100G   <- Face A
+    round 1 arm e: FAULT  nan=1  req=10  transport=1            gtt_start=100G   <- Face A
+    round 1 arm c: FAULT  nan=0  req=17  http=1 s500=1 unparsed=2  gtt_start=100G   <- Face B
+
+    $ grep -h "HRX ASAN" ~/wt/rt-det/315asan2-*/server.log | wc -l      ->  0
+    $ grep -h "HRX ASAN" ~/wt/rt-det/315asan-*/server.log  | wc -l      ->  0   (the discarded OOR run)
+
+**Three arms, both faces represented, every arm in regime, and not one sanitizer report.** The channel was live
+(proved section by section above: the knob reached the process, set `asan.enabled`, and the device was created
+with feedback, which requires a valid sink). So the readout is the pre-registered **branch 2**: the fault is not
+an access violation of the class the AMDGPU HAL sanitizer detects — a buffer/dispatch-binding access leaving its
+allocation, caught by pool redzones and shadow.
+
+## What this does and does not exclude, stated at the strength the evidence supports
+
+**Does:** no sanitizer-visible out-of-bounds buffer access accompanied either face in these arms.
+
+**Does not**, and this is the whole of the caveat:
+
+1. **No positive control.** The sanitizer's own detection was never demonstrated on this device — the argument
+   that it *would* fire rests on its configuration and delivery path, both verified, not on an induced violation
+   being caught. A null result with no positive control bounds the family only as far as the sanitizer's own
+   functioning goes.
+2. **Granularity.** It validates at buffer/dispatch-binding granularity. An access that leaves its *row* but stays
+   inside the allocation is not an ASAN event — and a gather reading a wrong-but-in-bounds row would produce
+   exactly the finite-but-wrong distribution this campaign calls Face B.
+3. **n = 3.** Two Face-A arms and one Face-B arm.
+
+## Where this leaves the two faces
+
+| face | excluded | still open |
+|---|---|---|
+| **A** (NaN logits) | stale/never-written logits region (the engine's own sentinel: `sentinel=0`, fill present in 20 of 21 arms); sanitizer-visible OOB | a NaN **computed** upstream of the final norm — the residual stream is all-NaN at the head, and *which* node produced it is unattributable with the host-side instrument (arena slot reuse) |
+| **B** (format failure) | same two | a finite but **wrong** distribution at the sampler; the arm's own text is valid UTF-8 and begins mid-essay, i.e. a corrupted opening |
+
+Both faces therefore point at the same unresolved question: **a value is wrong at a consumer, and no
+host-side read can be trusted to say where it was first written.** Settling it needs a read whose fidelity does
+not depend on the allocator's reuse — per-node at production, or device-side validation of the consuming op.

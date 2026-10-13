@@ -1940,3 +1940,36 @@ i.e. the #123 repro's stress knob survives. It has not been used for #315. If #3
 the #140 class, lowering that alignment should raise the fault rate at cwsr=1 - a cheap, targeted test
 that does not need the campaign's workload. Recorded as the next instrument, not yet run (the control
 owns the box lock).
+
+## Dispatch-ordering leg examined (06:15) - consistent with §54/§55/§56, no new lead
+
+Read the executor's ordering contract rather than assuming it, to complete the static picture:
+
+    runtime/command-program-executor.cpp
+      :922  enqueue_stream_execution_barrier(...)  - the only per-operation fence emitter
+      :964  called with the label "insert HRX host download barrier", i.e. the HOST DOWNLOAD path only
+      :1916 the opt-in GGML_HRX_DIAGNOSTIC_GRAPH_SYNC knob is the only other synchronize
+      :1901 flush_stream_commands("flush HRX graph replay commands")
+      :1908 wait_stream_commands("wait for HRX graph replay commands", recorded.exec)
+
+So dispatches are RECORDED into one command program and submitted together; ordering between them is
+program order inside that program, which is the HRX runtime's responsibility, and the executor adds a
+per-replay synchronize only when the diagnostic knob asks. That is exactly what §54 established from
+the profile side (92 of 612 dispatches carry no barrier; queue saturated; ordering left to ring
+program order) and it is why `GGML_HRX_DIAGNOSTIC_GRAPH_SYNC` is the knob §55-§57 tested.
+
+No new lead, and it closes the third leg of the static picture. The three legs now agree:
+  - intra-kernel fences: clean for the #140 class in GLM's path (four hypotheses read and rejected)
+  - consumer's own read path: cleared by §55/§56 (hsa_signal_wait_scacquire + timepoint covers last)
+  - dispatch ordering: program order inside one recorded command program; per-replay sync is opt-in
+    and §59 showed ordering it changes nothing (1 fault in 5 with sync vs 2 in 5 without, p=1.000)
+
+### What that leaves, stated without overclaiming
+Every ordering mechanism I can find is either present or was tested and did not change the rate. So
+either the surviving defect is not an ordering/visibility problem at all, or it is in a mechanism
+none of these three legs covers. The cheapest remaining discriminator is still the one the project's
+own #123 work used and #315 has never applied: `GGML_HRX_FA_PARTIAL_ALIGN` (still present at
+dispatch_registration/common/dispatch-flash-attention.cpp:23). If the fault rate rises when the
+partial alignment is lowered, the fault IS the #140 layout-sensitive class and its surviving instance
+is at a boundary the fences do not cover; if the rate is unchanged, the #140 class is not #315's
+mechanism and the search should leave the FA path entirely.

@@ -92,3 +92,35 @@ the last node of its layer's chunk and therefore faithfully readable.
 Note the pre-registration's own confound applies with more force here: `COPY_PROBE` and `LOGITS_FP` add further
 host-side reads on top of the 64-name list, so this run is more heavily instrumented than any before it, and the
 known inducing effect (§39) is correspondingly larger. No rate is quoted from it and no arm is eligible.
+
+---
+
+# Amendment 2 (before the third attempt): shrink the selector to the perturbation level that produces Face A
+
+Two attempts have now produced **only Face B**, and the second is informative about why:
+
+    attempt 1 (315lout,  BIN=instr3, 64-name list)   -> no fingerprint lines at all (defect #13, wrong build)
+    attempt 2 (315lout2, BIN=fp,     64-name list)   -> 6/6 arms Face B, at req=1..11
+    attempt 3 (315lout3, BIN=fp,     64-name list + COPY_PROBE/SENTINEL/LOGITS_FP)
+                                                     -> r1q reached req=59/66 with 58 OK and ONE Face B fault
+
+Attempt 3 matters: adding the rest of the `315nan` environment moved the fault from *every* arm at `req=1..11` to
+**one arm in 59 requests** — i.e. back toward the intermittency the objective describes, and still Face B.
+
+**The remaining difference between the configuration that produced Face A at scale and these is the selector's
+size.** `315nan` read `tail:16` — 16 tensors per graph — and recorded 16 Face-A faults in 17 arms. These attempts
+read **64** named tensors per graph. So the working hypothesis is a **dose-response in instrumentation**: more
+host-side reads per graph shifts the fault from Face A toward Face B.
+
+**Third attempt, therefore: the same environment, same build, same readout — with the selector reduced to ~16
+`l_out` layers sampled across the model** (`l_out-0`, `l_out-3`, …, `l_out-45`, plus `46` and `47`). This keeps the
+property the sweep depends on (`l_out-<layer>` is the last node of its layer's chunk, hence faithfully readable)
+while matching the perturbation level that produced Face A.
+
+**Readout unchanged**, with the added check from amendment 1: arms faulting as Face B again make the sweep
+**mis-targeted**, never "every layer clean". A 16-layer sample brackets the origin layer rather than pinpointing
+it — that is the intended resolution of this attempt, and a follow-up would refine within the bracket.
+
+This is deliberately the **last** selector attempt. If it also yields Face B, the honest conclusion is that the
+`l_out` selector and the Face-A fault are not co-observable at any perturbation level tried, which is itself a
+finding about the instrument and is how it will be recorded — not as a negative result about layers.

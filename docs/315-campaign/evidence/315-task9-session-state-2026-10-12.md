@@ -2516,3 +2516,42 @@ restored). Live cwsr=1 until the next reboot, which was NOT taken unilaterally.
 ~1.6 h this turn (the control), against a turn total of ~9.4 h and the objective's <=12 h ceiling.
 That remaining ~2.6 h is why the two candidate experiments were evaluated arithmetically instead of
 run: neither could be afforded at a size that would have been interpretable.
+
+---
+
+## CORRECTION/CLARIFICATION on the H2' numbers (08:10) — two counts, and only one is causal
+
+While checking the H2' falsification I computed the RAW per-pid eviction totals and got a very
+different picture, which must be recorded rather than left to confuse a future reader:
+
+    raw per-pid counts over the whole process life (what a naive grep gives):
+      p8l   (FAULT, Face B)  evict=2798  restore=2997   <- the HIGHEST in the run (clean max 559)
+      p16c  (FAULT, Face A)  evict=  16  restore=  16   <- the LOWEST in the run (clean min 117)
+
+    arm-bounded counts from 315-evict-per-arm.py:
+      p8l   pre-fault 203  window 203   (fault at 91.4s)
+      p16c              -  window  16
+      FAULT n=2 mean 109.5   vs   clean n=25 mean 254.5    -> NOT supportive
+
+**Why they differ, and why the tool's number is the right one:** `p8l`'s server was ORPHANED (the one
+I found holding HRX0 at 07:30, ppid=1) and had NO `PROC_END` row, so its raw count spans ~1.5 h of
+life after its arm ended - it is a function of post-arm survival, not of the arm. The tool bounds each
+arm `PROC_START -> PROC_END or the next arm's PROC_START`, which is exactly the confound its own
+docstring warns about ("a faulting arm ... lives on after the failure, so its window can simply be
+longer"), and it prints the PRE-FAULT column as the causal test precisely because the fault cannot
+cause evictions that precede it.
+
+**So the falsification stands on the correct figure** - but the raw numbers show something worth
+naming: the two faulting arms are the run's extreme of BOTH directions (highest raw, lowest raw). That
+is what a fault-time-independent variable looks like when the sample is n=2, and it is further reason
+not to read a rate-correlation into these counts.
+
+**The honest statement, restated:** on the arm-bounded, causal (pre-fault) measure, faulting arms show
+no eviction excess - 203 pre-fault vs a clean mean of 254.5 - and one faulting arm sits below the
+entire clean range. H2' predicted an excess. It is not there. Combined with the raw counts landing at
+both extremes, the eviction COUNT is not a discriminator for this fault at this sample size, and the
+mechanism as stated is falsified.
+
+**Lesson recorded:** any future eviction analysis on this issue must use the arm-bounded pre-fault
+column, never a raw per-pid grep. The orphaned-server trap makes the raw number meaningless for
+faulting arms specifically - which is the worst possible bias for a fault test.

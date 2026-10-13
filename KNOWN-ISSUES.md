@@ -398,9 +398,10 @@ trigger. That is what makes the criterion falsifiable rather than satisfiable by
 
 ### Families closed by discriminating experiment (2026-10-13)
 
-Four candidate families are closed by a pre-registered or source-level test; a fifth (the FA
-alignment class) was mistakenly listed as excluded and is **OPEN** — that listing rested on a parse error,
-corrected in `315-galign-CORRECTION-my-parse-was-wrong.md`:
+Six candidate families are closed by a pre-registered or source-level test; a seventh (the FA
+alignment class) is now **excluded as sufficient** on the frozen rig — an earlier attempt to exclude it
+rested on a parse error and was retracted (`315-galign-CORRECTION-my-parse-was-wrong.md`), and this run
+replaces it:
 
 | family | disposition | evidence |
 |---|---|---|
@@ -409,7 +410,7 @@ corrected in `315-galign-CORRECTION-my-parse-was-wrong.md`:
 | the **runtime's AQL submission policy** | **CLOSED**: `aql_block_processor.c` states in code that the runtime does not infer memory hazards, consuming only compiler-set packet flags, so it never derives a producer/consumer pair | `315-device-hunt-boundary.md` |
 | the **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | **REFUTED** by a pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT in BOTH arms (reorder on and off), 100% either way | `315-gord1-final.md` |
 | the **deferred host writeback** (`add_host_writeback` queued, flushed at `mark_stream_synchronized`) | **CLOSED by mechanism**: the queue is never populated, and the gate is `binding.host_data != nullptr` while the logits binding resolves to `nullptr` (allocation host-visible, binding device-addressable) | `315-deferred-writeback-gap.md` |
-| the **FA alignment/dispatch** class (`GGML_HRX_FA_PARTIAL_ALIGN`, the #140 family) | **OPEN, and the earlier attempt to exclude it was scored wrongly**. An alignment A/B was run and I first read its arms as all-faulting; that was a parse error (md5sum over streaming responses counted identical text as distinct), and the correct reading is that the arms were mostly **CLEAN**, so the run is **UNINFORMATIVE** — the bespoke composition did not reproduce the frozen driver's trigger, and the alignment question is untested rather than answered. What remains is the power point: n=2 per alignment cannot bound a rate difference at this base rate. | `315-galign-CORRECTION-my-parse-was-wrong.md` |
+| the **FA alignment/dispatch** class (`GGML_HRX_FA_PARTIAL_ALIGN`, the #140 family) | **not required**: on the FROZEN rig (the driver that reproduces the trigger), arm A (align 4096) and arm B (align 256) gave IDENTICAL tallies — cell `e` faulted **3 of 3 arms in both**, at `gtt_start=98G` with the forcer live. So the layout the #140 oracle used to expose the divergence is not required for the fault. One-sided (3 arms per alignment cannot bound a rate difference), the same strength as the coherence and `GRAPH_SYNC` rows — not a measured null. | `315-align-frozen-result.md` |
 
 ### Still open
 

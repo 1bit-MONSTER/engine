@@ -2555,3 +2555,50 @@ mechanism as stated is falsified.
 **Lesson recorded:** any future eviction analysis on this issue must use the arm-bounded pre-fault
 column, never a raw per-pid grep. The orphaned-server trap makes the raw number meaningless for
 faulting arms specifically - which is the worst possible bias for a fault test.
+
+---
+
+## FREE ANALYSIS ON THE CONTROL'S DATA (08:30) — two candidate signals found, one killed by the causal test
+
+No box time: pure re-analysis of already-collected data. Recorded because one of the two looked
+striking and the causal test is what settled it.
+
+### What the arm metadata showed (the tempting signal)
+Per-arm console lines give `gtt_start` and `gtt_now`, and the two faulting arms stood out:
+
+    arm      verdict   gtt_start   gtt_now   delta     pair position
+    p8l      FAULT      97G         104G      +7G       FIRST arm of pair 8
+    p16c     FAULT      98G          80G     -18G       FIRST arm of pair 16
+    clean    OK         97-98G      97-99G   0G (15 arms) / +1G (10 arms)    -
+
+Every clean arm stayed within 0..+1G while both faulting arms moved +7G and -18G, and both faulting
+arms are the FIRST arm of their pair. Tempting readings: "the fault needs a GTT excursion" and "the
+first arm of a pair is at risk".
+
+### Why neither survives
+ 1. **The pair-position pattern is a 1-in-4 coincidence.** Two faulting arms, both first-of-pair,
+    under a ~50/50 ordering is p = 0.25. n=2 establishes nothing.
+ 2. **The GTT delta is measured at arm END, and a faulting arm ABORTS mid-workload** (p8l stopped at
+    req=22 of 66; p16c at req=1 of 66). A shorter, failed run is expected to move GTT differently. The
+    delta is plausibly an EFFECT of the abort - the same arrow-of-time trap the eviction analysis had
+    to avoid, and the reason that tool prints a pre-fault column.
+ 3. **The causal test is available and it kills it.** The SMI stream carries per-pid Q_EVICT rows with
+    timestamps, and each arm's PROC_START is recorded, so activity can be counted in the window BEFORE
+    the fault instead of over the whole arm. Counting evictions in the FIRST 60 SECONDS after each
+    arm's PROC_START (before either fault at 91.4s and earlier):
+
+         p8l   (FAULT)   evictions in first 60s = 103     <- mid-pack
+         p16c  (FAULT)   evictions in first 60s =  16     <- at the low end
+         clean arms (25) evictions in first 60s = 34..249
+
+    So on the pre-fault measure the faulting arms are NOT elevated - one is mid-range and one is low.
+    The end-of-arm GTT excursion is an effect of the abort, not a cause of the fault.
+
+### What this adds
+A third independent negative on the same question (is the fault tied to memory-activity magnitude in
+the arm?): the arm-bounded count said no (203 vs clean 254.5), the raw count was shown meaningless
+(orphaned server), and now the pre-fault 60s window says no as well, with the faulting arms inside the
+clean range rather than above it. The candidate is closed by the same causal logic that closed its two
+predecessors, and this time at zero box cost.
+
+Recorded with the numbers so the tempting metadata pattern is not rediscovered and mis-read as a lead.

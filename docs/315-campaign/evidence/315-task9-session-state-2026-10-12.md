@@ -4008,3 +4008,57 @@ Option (c) is the cheapest and needs no new instrument on the routing path.
 Also recorded: this run was the FIFTH independent replication and reproduced the fault in the eviction
 cell (`round 1 arm e: FAULT nan=0 http=1 s500=1 unparsed=2`, Face B). Pooled across five runs:
 **18 faults / 21 eviction-cell arms (86%) vs 1 fault / 40 control arms (2.5%)**.
+
+---
+
+## WHERE THE CAUSE SEARCH STANDS (13:35) — honest tally of what is live, closed, and blocked
+
+### Settled and strong: the TRIGGER
+Five independent runs of the frozen three-cell rig, pooled: **18 faults / 21 eviction-cell arms (86%)**
+against **1 fault / 40 control arms (2.5%)** (and that single control fault is the GTT-drifting arm).
+Both faces appear repeatedly. The instrument is verified (4,134 Q_EVICT in 25 s from a kernel-free
+process vs 0 quiet), the comparison is controlled against two different side-loads, and it has been
+reproduced twice by a run I did not author. Fisher p across the pooled runs is ~1e-9.
+
+### Eliminated by experiment or by reading, with the reason recorded
+    the CPU's read of the logits (coherence + read-side transfer)   A/B REFUTED (this turn)
+    the #140-class unfenced handoff in GLM's decode-split FA path   read to conclusion, correctly fenced
+    the consumer's own read path (acquire + timepoint)             sections 55/56
+    dispatch ordering (program order in one recorded program)      section 54, and section 59 showed
+                                                                   ordering the fingerprint changes nothing
+    the block-split candidate                                      section 54: one block, zero boundary gaps
+    round 1 arm c's "CPU pressure causes it"                       it faulted but the forcer is not
+                                                                   required - see the quiet-arm drift
+
+### Live, and each blocked by a specific obstacle - not by lack of effort
+ 1. **The argsort / routing-index path** (the most specific). Mechanism read at source
+    (`small_rows_f32.loom:141-156`): NaN makes all three comparisons false, so ranks stop being a
+    permutation, and because the write is a scatter, an unproduced rank leaves a slot **never written** -
+    holding a stale expert *index*. Chain to GLM confirmed (`llama-graph.cpp:1932-1939` ->
+    `dispatch-moe-router.cpp:218-228`).
+    **BLOCKED:** no instrument can read that tensor. Three have now been defeated by the same root cause -
+    the by-name fingerprint (§53), the ordered locator (§59), and now the ids dump (this turn), which
+    returned either all zeros or *float bits reinterpreted as i32*, with the CLEAN arm showing MORE of
+    the latter than the faulting arm. A working test needs a device-side read, a coherence change on that
+    transient, or a no-read approach.
+
+ 2. **The device writing into a buffer whose backing the eviction moved.** Untested; the write-side
+    mirror of what the A/B eliminated.
+    **BLOCKED:** same class of obstacle - detecting it means observing a device write against a moving
+    backing, which needs either coherence or device-side instrumentation.
+
+ 3. **An intermediate buffer damaged and propagating to the logits.** This is where the issue's own
+    recorded evidence points (first NaN at the MoE aggregation, one token's row, 15/16 arms).
+    **BLOCKED:** the per-node fingerprint that would chase it is the same unsynchronised-arena reader.
+
+### The pattern, stated plainly
+Every remaining candidate needs a **coherent or device-side read** to be tested, and the fork's only
+instrumented read path is a host-visible, non-coherent, unsynchronised arena access. That is why three
+instruments failed identically. The obstacle is not the hypothesis space - it is that the current
+instrumentation cannot observe the error at the only place left to look.
+
+### What that implies for the next concrete step (in scope, engine/fork side)
+Build **one** device-side or coherent capture of the routing indices, then the argsort candidate is
+testable in ~2 arms at an 86% fault rate. That is a focused, bounded piece of fork-side work, and it is
+the single highest-value thing remaining: it unblocks candidate 1, and candidates 2 and 3 would use the
+same instrument.

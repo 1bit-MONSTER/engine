@@ -2452,3 +2452,67 @@ independent runs, different sessions and different GTT points, both ~5-7%.
  4. This does NOT change the H1 conclusion: the control faulted at 7.4% at cwsr=1 where the cwsr=0
     campaign saw 0/70. The comparison is still "faults here, none there" - just at a smaller absolute
     rate than the ledger's headline implied.
+
+---
+
+# TURN DISPOSITION (2026-10-13 ~08:00) — what was achieved, what could not be
+
+## Criteria, against the objective's five
+
+    1. named falsifiable mechanism, discriminating experiment     OPEN, and FURTHER away than at turn start
+    2. forward-only change landed on a branch/PR                 OPEN; task-9's condition evaluated, NOT met
+    3. >=60 in-regime arms, zero faults both faces, CI+power     MET  (315cwsr70: 70/70 fix-cell, 0
+                                                                      faults, exact 95% CI 3.14%)
+    4. no regression (engine CI + dense control + MUL_MAT_ID)    NOT STARTED (no fix to regress)
+    5. KNOWN-ISSUES.md updated with evidence and met criterion    PARTIAL - findings recorded; there
+                                                                      is no met criterion 1 to record
+
+## What this turn DELIVERED (real, measured, pushed)
+
+ 1. **The H1 control RAN and FAULTED**: 2/27 = 7.41% at cwsr=1 on a fresh boot, BOTH faces, on
+    opposite cells. H1 is CONFIRMED and the "cwsr=0 prevents it" framing is dead.
+ 2. **H2' FALSIFIED**: faulting arms show 109.5 evictions vs clean 254.5, with one faulting arm at 16
+    against a clean floor of 117 - the opposite of the predicted excess.
+ 3. **The control VALIDATED against an independent study**: my 7.4% (97-98G) matches KNOWN-ISSUES'
+    shipped-pin 5.4% (102G), Fisher p = 1.000.
+ 4. **The 26% comparator explained**: it pooled the 315nan repro rig (18 faults / 19 arms). Excluding
+    it the pool is 18.1%; the careful measurements agree at ~5-7%. This is why every instrument lost
+    its power.
+ 5. **Three designed instruments evaluated to a decision, with numbers**: P1 withdrawn (P(clean B |
+    irrelevant) = 0.21-0.46, cost 6.3h vs ~2.4h left); the ALIGN pilot declined (clean branch is a
+    1-in-9 coincidence at the affordable size); the #123/#140 class audited at source (both fixed
+    sites correctly fenced in GLM's path; four hazard hypotheses rejected by reading code).
+ 6. **Three process failures found and fixed**: the cwsr=0 drop-in's bytes were never preserved (now
+    reconstructed, committed, box boot-state restored, new md5 e20f05bf...); 315-rate.py under-counts
+    Face B in its face tally; an orphaned faulting-arm server held HRX0 and was terminated.
+
+## What this turn did NOT achieve, and why
+
+**Criterion 1 is not met.** No mechanism survived its own discriminating test. That is not a failure
+to look - it is the result of looking with the instruments the issue built, all of which were
+powered against a rate that turned out to be wrong by a factor of ~4.
+
+**Criterion 2 is not met**, and it must not be. task-9's own contract says "Not attempted while the
+mechanism is unnamed"; landing a forward-only change now would ship a change no evidence supports,
+and the contract's first check - that the mechanism is not on the falsified-levers list - cannot even
+be meaningfully applied to a mechanism that does not exist.
+
+## The single most useful product of this turn
+
+**The rate moved, and it invalidated the power analysis behind every instrument in the issue's
+toolkit.** Any future attempt must (a) re-measure the rate at the configuration of interest, (b) size
+its experiment from that number rather than from the ledger's pooled "26%", and (c) prefer designs
+that RAISE the event rate before testing a mechanism - which is what the #123/#140 work did with a
+separate process forcing queue evictions, and what none of this issue's instruments did.
+
+## Box left in the shipped state
+
+HRX0 holders 0 · GTT 26 GiB (baseline) · VRAM 0 GiB · npu.lock FREE · no watcher · both managed
+services inactive · drop-in present with cwsr_enable=0 in 3 grub.cfg entries (shipped BOOT state
+restored). Live cwsr=1 until the next reboot, which was NOT taken unilaterally.
+
+## Box time
+
+~1.6 h this turn (the control), against a turn total of ~9.4 h and the objective's <=12 h ceiling.
+That remaining ~2.6 h is why the two candidate experiments were evaluated arithmetically instead of
+run: neither could be afforded at a size that would have been interpretable.

@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4668,3 +4652,65 @@ through the same path without the parser rejecting it. In `r1q` the sentence app
 were ACCEPTED (the arm is OK, 66 ok requests), so the same text is fine in one arm and rejected in another
 - which would mean the rejection is path/state dependent rather than text dependent. That is the next
 measurement and it is now cheap because the text is recorded.
+
+---
+
+# THE RECORDED TEXT SETTLES IT: a faulting arm's PRIOR OUTPUTS ARE INDISTINGUISHABLE FROM CLEAN (15:20)
+
+`315text1` round 1 gave all three cells records, so the comparison the recording detector was built for can
+finally be made. The result is clean and it rules out a whole class of mechanism.
+
+### The three arms, same composition, same prompt
+    315text1-r1q   OK        records=66
+    315text1-r1c   OK        records=66
+    315text1-r1e   FAULT-A   records=6     <- transport_failures=1, the server died
+
+and the identical prompt's answer, per arm:
+
+    r1c : " We'll assume the reader has a basic understanding of LLMs but wants t..."
+    r1e : " We'll assume the reader has a basic understanding of LLMs but wants t..."
+    r1q : " We'll assume the reader has a basic understanding of LLMs but wants t..."
+
+**All three agree.** The faulting arm's answer to the identical prompt is character-identical to both
+clean arms' answers. So the corruption had NOT changed what the model computed for that request.
+
+### And its request-by-request trace
+    [0] http=200  content=" We'll assume the reader has a basic und..."
+    [1] http=200  content=" fox jumps over the lazy dog. The..."       <- a distractor
+    [2] http=200  content=" We'll assume the reader has a basic und..."
+    [3] http=200  content=" over a a a a a a a a a a a a"                 <- distractor, degenerate
+    [4] http=200  content=" We'll assume the reader has a basic und..."
+    [5] http=None  err=RemoteDisconnected                               <- the server died HERE
+
+So requests 0-4 all succeeded with **normal, matching content**, and the arm died at request 5. The fault
+is a **sudden terminal event after correct work**, not a gradual degradation and not a wrong computation
+that had already been producing wrong output.
+
+### What this rules out
+ - **Any mechanism that corrupts the running computation steadily** - a stale index, a wrong expert, a
+   moved buffer that is read repeatedly - would have shown a divergent answer BEFORE the terminal event.
+   The first five requests were correct and identical to the controls'.
+ - **Any "wrong text" account of Face A.** Its text was right.
+ - It also explains why the `identical_distinct` signal behaves as it does: the arm is deterministic up to
+   the moment it dies, so `idn=1` unless it happens to die inside the eight-request block (which is what
+   the truncation confound was measuring, and which the short-arm control already separated).
+
+### What it points at instead
+A terminal, instantaneous, whole-buffer event - the guard reports the ENTIRE vocabulary NaN
+(154880 of 154880 in every Face-A arm with a line). That is consistent with a buffer whose contents are
+lost or replaced in one step, not with a value that drifts wrong. Combined with:
+ - the eviction trigger (85% vs 6.7%, p=7e-13), and
+ - the fact that the read path is already eliminated (the refuted A/B),
+the picture is now "eviction invalidates or moves a buffer that the NEXT dispatch reads or writes whole",
+rather than "a computation reads a slightly wrong value".
+
+That is a narrower and better-supported statement than anything the issue has had, and it came from the
+text the recording detector made available.
+
+### Honest limits
+ - n=1 faulting arm with recorded text. The comparison needs repeating (the run continues; more arms are
+   coming).
+ - the faulting arm here is Face A. Face B's text path is different in kind (the parser rejects a normal
+   reply), and the Face-B reframing from the previous section still needs its own check.
+ - "indistinguishable up to the terminal event" is for THIS prompt. A corruption that only affects long
+   generations, or only the KV cache after many tokens, would not show in a 96-token answer.

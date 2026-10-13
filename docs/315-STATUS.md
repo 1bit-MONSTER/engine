@@ -1066,3 +1066,82 @@ first two waiters were written against the wrong assumption (`315-peer-rig-repli
 Surviving cause candidates: the §55/§56 executor-level cross-dispatch ordering question, and the MoE
 id-producing-kernel family the peer agent is currently working (`315ids*`, `315text1`). Both are outside
 what this turn could test without further GPU time, and the peer is on the second of them right now.
+
+---
+
+# UPDATE 14 (2026-10-13 ~15:15) — a fifth cause candidate located, with its own instrument; two CI defects fixed
+
+Continues UPDATE 13. Records a new lead and two gate repairs.
+
+## New cause candidate: the deferred host writeback
+
+Working the §55/§56 leg turned up a candidate the code **documents about itself**
+(`315-deferred-writeback-gap.md`):
+
+    add_host_writeback(...)            command-program-executor.cpp:152   merely QUEUES a memcpy
+    mark_stream_synchronized()         command-program-executor.cpp:38    performs it, later
+
+and the upload path's own comment (`:874-880`) states the hazard in words:
+
+> "A host download staged by an earlier replay is only published to host memory by
+> `mark_stream_synchronized()`; `add_host_writeback` merely queues the memcpy. **Uploading the same host
+> memory before that has happened would read the previous contents.** … **so nothing else guarantees the
+> ordering.**"
+
+Three things make this the strongest surviving candidate:
+
+1. **The queued source is a non-coherent `0x52` mapping.** `allocate_mapped_host_staging_buffer`
+   (`runtime/host-memory.cpp:1287`) allocates with `HOST_LOCAL | DEVICE_VISIBLE` (`:1300`) and maps it
+   (`:1310`) — the same memory type the read-path chain named, then read by a **deferred** `memcpy`.
+2. **It is deferred, unlike the refuted candidate.** `buffer_get` read the mapping at one immediate
+   instant; this reads it at a sync point arbitrarily later, so a preemption/eviction inside the window
+   is exactly the trigger the pooled rig establishes (28 of 29 eviction-cell arms).
+3. **The logits are structurally expected to take it.** `staging.download = access.write &&
+   !binding.graph_input` (`:764`) holds for the logits, which the trace records as
+   `host_visible=1 direct_host_binding=0 memory_type=0x52` — host-visible, not on the direct-binding fast
+   path, and written by the graph.
+
+**An instrument for this already exists and has NEVER been run.** `GGML_HRX_WRITEBACK_FINGERPRINT=1`
+drives `fingerprint_writeback_log` (`:84`), which logs `rec_hash` (at record time), `sync_hash` (at sync
+time), `dst_hash`, and **`rec_eq_sync`** — 0 meaning the queued source *changed while it was queued*. A
+driver (`315-fp-hunt.sh`) also exists. Neither has produced a single `[hrx-wb-fp]` line anywhere in the
+record or on the box.
+
+Static expectation is not a result: whether the queue is non-empty during GLM decode, and whether
+`rec_eq_sync` is ever 0, needs the staged probe.
+
+## Two CI defects found and fixed
+
+1. **Copyright gate was RED** — 61 files (all this goal's own docs) lacked the notice the repo's CI
+   requires, against a baseline that recorded it green. Fixed via the tool's `--fix` (55 files, verified
+   as pure insertions with zero deletions) plus 6 genuinely non-commentable artefacts added to `EXEMPT`
+   (`*.patch` — a header would break byte-applicability — `*.csv`, `*.cfg`). Gate green again.
+2. **`check_pins.py` had a real gap**: nothing tied `registry/architectures.json`'s declared llama.cpp
+   revision to the gitlink. Demonstrated by setting the registry to all-zeros and watching
+   `check_pins`, `registry_gaps` **and** `registry_gaps_test` all pass on an inconsistent tree. The tool
+   now reads the registry (under `sources`) and fails on a half-move — verified both directions, exit 0
+   consistent and exit 1 half-moved. This enforces the objective's own forward-only clause.
+
+## Also recorded
+
+- The peer agent's **pooled 9-run tally** (28/33 vs 4/60, p=7.1e-13) was independently recounted here:
+  numerators agree exactly (28 and 4) but denominators differ (29 and 57), the peer likely counting
+  OOR/INVALID arms. On the strict parse p = 1.33e-17, so the conclusion is unchanged and stronger
+  (`315-pooled-rig-verification.md`).
+
+## Queued behind the peer's campaign (both holding)
+
+    ~/wt/315wb-probe.sh      one GLM decode with GGML_HRX_WRITEBACK_FINGERPRINT=1  -> the writeback lead
+    ~/wt/315align-run.sh     the FA alignment/dispatch discriminator (315align, pre-registered)
+
+The peer's driver does **not** take the box lock (verified), so both wait for actual driver absence.
+
+## Criteria
+
+| # | criterion | state |
+|---|---|---|
+| 1 | named, falsifiable mechanism | trigger **named, replicated, pooled at p<=1.3e-17**; **cause still not located** — five families closed, a fifth candidate now located with its instrument built but unrun |
+| 2 | forward-only fix landed | **not achievable**: the one prepared candidate is refuted; the only defensive mitigation (`GGML_HRX_NAN_CONTINUE`) is Face-A-only, a workaround, and the issue's own rule forbids recording it until the mechanism is named |
+| 3 | >=60 in-regime arms, zero faults | **not met**; the recorded 0/70 has no eviction cell |
+| 4 | no regression | **partially**: all seven recorded CI gates now pass (was red); the dense-model and MUL_MAT_ID controls still need a landed fix to compare against |
+| 5 | KNOWN-ISSUES updated | **done**, and refreshed with the four closed families |

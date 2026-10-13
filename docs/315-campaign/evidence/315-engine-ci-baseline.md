@@ -100,3 +100,39 @@ enforces only the gitlink - not of current divergence. A forward-only fix theref
 would be a reasonable addition but is not part of this change. `KNOWN-ISSUES.md` lines 81-84 hold the other
 mechanical constraint (why `f2099e9b7` cannot be adopted: it is a strict ancestor of the shipped `26330cc20`,
 so pinning it is a revert).
+
+---
+
+# Criterion-4 control re-run: queued (2026-10-13 ~16:07)
+
+The objective's fourth criterion needs the **dense-model control and the MUL_MAT_ID op-test unchanged
+relative to baseline**. The baseline for both is the file above (2026-10-09, pin `e44c9d01a`), and the two
+things it records that a re-run must match are:
+
+- the 5 HRX buffer tests, all `[PASS]`, and the 9 runnable tests overall;
+- the **MUL_MAT_ID `nmse` values**, e.g. `mxfp4 k=2880 tokens=1 rows=1 … nmse=1.56e-05 OK` — a numeric
+  fingerprint, not just a pass/fail, so a drift in the reduce or the id resolution would show.
+
+## Status
+
+A re-run is **queued** (`~/wt/315crit4.sh`, tag `315crit4`), waiting for the peer agent's replication to
+release the GPU. It re-runs the buffer tests and the op-test from `~/wt/v315-build` (present, with 8
+`test-hrx*` binaries) under `systemd-run --user --scope -p MemoryMax=4G`, exactly as the baseline did, and
+extracts the `MUL_MAT_ID` lines into `~/wt/315crit4/mul_mat_id.txt` for a direct diff against the table
+above.
+
+## Why it is queued rather than run now
+
+The tests need HRX0, and the box is currently held by the peer's alignment replication (with the box lock
+taken). Running them concurrently would perturb that measurement and risk its GTT headroom — the same
+reasoning that deferred my earlier probes. Nothing about criterion 4 is blocked in principle; it is
+sequenced behind a live run.
+
+## What a result would and would not establish
+
+- **Would**: whether the shipped pin's own regression controls are unchanged *today*, which is criterion 4's
+  claim, and it would do so with the baseline's own numbers rather than a pass/fail.
+- **Would not**: anything about the #315 defect. No fix has landed, so there is nothing for these controls
+  to regress *against* — which is why criterion 4 cannot be *met* until criterion 2 produces something to
+  compare. This run establishes that the controls are stable on the current pin, i.e. that the baseline the
+  future fix must match is still the baseline.

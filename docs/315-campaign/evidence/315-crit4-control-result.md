@@ -69,3 +69,35 @@ Two attempts were needed and both failures are recorded rather than hidden: the 
 clear-window rule, and the second **matched no tests at all** because I used guessed binary names
 (`test-hrx-backend-buffer` etc.) for cases that actually live inside `test-hrx-buffer`
 (`315-engine-ci-baseline.md`). The corrected run is `315crit4c.sh`.
+
+---
+
+# The dense-model half of criterion 4: staged
+
+The objective's criterion 4 names **"the dense-model control plus the MUL_MAT_ID op-test unchanged relative
+to baseline"**. The op-test half is done (8/8 HRX tests pass, `MUL_MAT_ID` nmse baseline-matched, above). The
+dense half is now staged.
+
+## What is staged
+
+`~/wt/315dense.sh` — runs a **dense** model on HRX0 under the same detector shape the arms use and records
+whether it faults:
+
+    model  : Qwen3-8B-Q4_K_M (4795 MB) - a DENSE model, not MoE, so it lacks the routed-FFN/id-producing
+             structure the fault's leading family involves
+    device : HRX0, -ngl 99, -fa on, c 4096, --no-webui
+    load   : 50 mixed-length requests (the detector's shape), max_tokens 32, temperature 0
+    detects: nan_guard lines, HSA_STATUS_ERROR/Queue error, Content-only parse failures, and a response count
+    gate   : waits for a sustained 120 s clear window (another agent launches campaigns back-to-back)
+
+## Why it is a meaningful control
+
+The recorded finding is that dense models **do not** exhibit this fault while GLM (MoE, routed FFN) does. So a
+**clean** dense run is the expected baseline, and its value is as a *negative control* for the harness: it
+shows the detector, the regime composition and the build do not fault everything in sight, which is what makes
+the GLM arms' high eviction-cell rate attributable to the model/shape rather than to the apparatus.
+
+## Status
+
+Staged, not run — arm B of the alignment test holds the box. It will be run after arm B releases it, and its
+result recorded either way.

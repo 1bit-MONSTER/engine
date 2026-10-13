@@ -119,3 +119,57 @@ The one thing to avoid is a **second driver on the box**: the arm campaign must 
 only one 315 driver may run at a time (see `~/wt/315-COORDINATION.md`). Decompilation is CPU-only and
 does not take the GPU, so the two can proceed in parallel; the campaign just must not run alongside
 another *campaign*.
+
+---
+
+# MEASURED (2026-10-13 ~11:30) — GLM's decode IS reordered, on every layer graph
+
+The cheapest step promised above was run: one GLM server, one greedy decode, the **existing** binary (no
+rebuild — `libggml-hrx.so` already carries both the knob and the diagnostic string, verified with
+`strings`), `GGML_HRX_LOG_GRAPH_ORDER=1`. Zero arms, no regime, ~2 minutes of GPU.
+
+Re-runnable as: `bash ~/wt/315-graphorder-probe.sh` (takes the box lock; log at
+`strixhalo:~/wt/315graphorder-probe.log`).
+
+## The result
+
+GLM's decode is a two-graph alternation, repeated once per layer:
+
+    graph A: 26 commands, 21 levels, barriers 23 in program order, 20 in lookahead order,
+             transient extent 237568  ->  LOOKAHEAD ORDER USED     (reordered)
+    graph B:  9 commands,  6 levels, barriers  5 in program order,  5 in lookahead order,
+             transient extent 116736  ->  program order used
+
+The two alternate A,B,A,B,… for the whole decode (~40 repetitions capture the layer stack), and the same
+9-command graph also appears standalone at the start.
+
+## What this establishes
+
+1. **The reordering is live on GLM's decode path**, not merely reachable. The 26-command graph — the
+   routed-FFN/MoE block, judging by the alternation with an attention-shaped 9-command graph — **is
+   reordered in every layer**, saving 3 of its 23 barriers (23 -> 20).
+2. **GLM's decode is far inside the `kMaxTransientExtent` gate**: transient extents of 237,568 B and
+   116,736 B against a 16 MiB (16,777,216 B) cap — roughly 1.4% and 0.7% of it. So the extent gate is not
+   marginal for this model; the reordering decision here is governed by the `level_barriers <
+   program_barriers` clause, which is satisfied.
+3. **The ordering the runtime submits is therefore NOT the order the graph was recorded in**, for ~half
+   of GLM's per-layer graphs, on the live path
+   (`command-program-executor.cpp:1479` → `record_prepared_command_list(..., ordered, ...)`).
+
+## What it does not establish
+
+It does **not** show that reordering causes a fault. It converts the lever from "untested and possibly
+inert" to "untested and **demonstrably active on the faulting model's decode path**", which is the
+precondition for the A/B being informative at all — an A/B on a knob that never engages would be
+uninformative by construction (the pre-registration discipline's branch 3).
+
+## Consequence for the proposed experiment
+
+The A/B is now worth running rather than reflective: the knob provably changes what is submitted, so
+`GGML_HRX_GRAPH_ORDER=program` is a real intervention on GLM's decode, not a no-op. It stays cheap — the
+eviction cell faults at ~70%, so ~5 arms per cell (~20 min) discriminates.
+
+Prediction to fix before the run, so the reading is not chosen afterwards: if reordering is implicated,
+the **26-command routed-FFN graph** is where the overlap that races the eviction window lives, so the
+fault should disappear (or drop sharply) in cell `e` with the knob set — and if it does not, the lever is
+falsified and the graph-order family joins the closed list.

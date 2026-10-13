@@ -1664,3 +1664,38 @@ Not "H2' is refuted" (n=1). Not "H1 is confirmed" (needs the final tally, and 1 
 ordinary at a 26% baseline - expected 2.1). The honest statement is: **the first faulting arm with
 attribution does not show the eviction excess the mechanism predicted, and the fault occurred at
 cwsr=1.**
+
+## The cwsr=1 Face-B faults agree in shape across two independent runs (05:43)
+
+    run 7, p3l   (cwsr=1, 2026-10-11):  unparsed Content-only output:  laptop too
+    315ctl1, p8l (cwsr=1, 2026-10-13):  unparsed Content-only output:  gaps = =,.. condition，) for for
+                                                                       for):): (.., (�..,-R,, 的(I (。 (..(R.,(A,,
+
+Both are the Face-B observable: the parser rejects degenerate text containing invalid bytes, and the
+server returns HTTP 500. The 315ctl1 sample is the symbol-soup flavour; run 7's is the truncated
+flavour. §44 recorded exactly those two flavours from the earlier Face-B population, so this new
+fault is consistent with the recorded Face-B shape rather than a new phenomenon.
+
+Recorded with a tooling note: the fault line contains invalid UTF-8 (`\ufffd`), which makes a plain
+`grep -E "unparsed Content-only" file` on that log return NOTHING even though the line is present
+(it is line 173, found with `grep -n "unparsed"`). Any analysis of Face-B logs must not treat an
+empty grep as "no Face-B fault" - the same trap class as the console-vs-detector one in UPDATE 5.
+The detector's `first_failure: HTTP 500` is the reliable signal; the log text may be un-greppable.
+
+Also confirmed, and now DOUBLE-verified against the UTF-8 grep trap (05:44):
+    315cwsr70 (cwsr=0), detector scan of ALL 94 arms:  arms with any face-B counter = 0
+    315cwsr70 (cwsr=0), binary-safe `grep -a` for 'unparsed Content-only':  0 files
+The earlier "empty = none" reading therefore holds and was not a grep artefact.
+
+So the Face-B comparison across conditions is:
+
+    condition                    arms    Face-B faults
+    cwsr=1 (run 7 + 315ctl1)      ~19     2   (evict7-p3l 'laptop too'; 315ctl1-p8l symbol soup)
+    cwsr=0 (315cwsr70 of record)   94     0
+
+This is the sharpest form of the cwsr signal available so far, and it is a FACE-B comparison
+specifically - independent of the Face-A/NaN counting that the earlier 3/11-vs-0/70 numbers used.
+It is still confounded by the same thing the control was built to test: run 7 and this control ran
+on different boots/states than the cwsr=0 campaign, so "cwsr=1 faults and cwsr=0 does not" and
+"a fresh-booted box at cwsr=1 faults too" are both consistent with the data. The RATE is what
+separates them, and that needs the final tally.

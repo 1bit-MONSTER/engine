@@ -1,19 +1,3 @@
-<!--
-Copyright 2026 bong-water-water-bong
-SPDX-License-Identifier: Apache-2.0
-
-Licensed under the Apache License, Version 2.0 (the "License");
-you may not use this file except in compliance with the License.
-You may obtain a copy of the License at
-
-    http://www.apache.org/licenses/LICENSE-2.0
-
-Unless required by applicable law or agreed to in writing, software
-distributed under the License is distributed on an "AS IS" BASIS,
-WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
-See the License for the specific language governing permissions and
-limitations under the License.
--->
 # task-9 session state — 2026-10-12 late session
 
 Written by an agent session that worked #315 while the `315cwsr70` campaign of record ran.
@@ -4871,3 +4855,32 @@ Not duplicate Thread B. If the probe reports `rec_eq_sync=0` records, the deferr
 CONFIRMED as the mechanism and a forward-only fix becomes well-founded. If it reports none, the lead dies
 and the remaining candidates are the write-side and intermediate-buffer classes. I will watch the probe's
 result rather than re-run it.
+
+---
+
+## HANDOFF: I RELEASED THE BOX TO THE PEER'S PROBE (15:17)
+
+My `315text1` run was in a gate wait (tctl 87C) before round 2 with 3 arms done - which had already
+delivered what it was for (the n=14 text constraint). It was also the reason the peer's `315wb-probe.sh`
+was still in its wait loop, since that script blocks until no `315-disc.sh` is running.
+
+So I stopped it. It is mine (tag `315text1`, launched by me), it had served its purpose, and the peer's
+probe is the live lead for the CAUSE while my thread was complete. Stopping my own run to unblock a
+peer's is the right call on a shared box and it is recorded rather than done silently.
+
+Immediately after:
+
+    my text1 procs : 0
+    any 315-disc   : 0
+    HRX0 holders   : 1        (the peer's probe server, loading)
+    GTT            : 47 GiB
+    probe started  : 2026-10-13T15:16:24  "=== 315wb-probe start ... gtt=48GiB ==="
+
+The probe is now loading GLM and will issue 3 decodes, then report `hrx-wb-fp` records with the
+`rec_eq_sync` tally. Its result decides the deferred-writeback lead:
+
+    rec_eq_sync=0 present  -> the queued source CHANGED while queued: the gap is REAL and is the mechanism
+    none                   -> the writeback queue never carries a stale source on this path; lead dies
+
+I will read that result rather than re-run it. My contribution to the pair - the constraint that any
+mechanism must give correct prior outputs and a terminal whole-buffer failure - stands either way.

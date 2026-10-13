@@ -1821,3 +1821,41 @@ trigger (preemption/eviction) is distinguished from the cause (insufficient fenc
 distinction that corrects both H2 and H2'. But pointing at the SPECIFIC surviving handoff is still
 open, and criterion 1 requires a named falsifiable mechanism, not a class. The next step is that
 static search, and it is cheap (grep + read, no box time).
+
+## Static search for the surviving #140-class handoff (05:55) - one candidate found, then excluded
+
+Searched `loom-libs/ops` (the path GLM actually dispatches, per §49) for kernels with `barrier<workgroup>`
+and zero `barrier<global>`:
+
+    mul_mat_id_swiglu_f32_f32_wmma.loom      wg=11  global=0    <- §49's GLM prefill consumer
+    (all other mul_mat_id variants: wg=0 global=0; the qwen_moe variants are a different path)
+
+Read `mul_mat_id_swiglu_f32_f32_wmma.loom` in full for the #140 shape (a global write followed by a
+cross-wave global read fenced only for LDS). **It is not that shape:**
+
+ - `%output_view` (line 127, a global view) is WRITTEN at lines 325/336/347/358 and **never read**
+   anywhere in the kernel - `grep -n output_view` returns the declaration and the four stores only.
+   So there is no intra-kernel consumer needing a fence.
+ - the four stores are `vector.store.mask` into DISTINCT rows (`%bounded_assignment0`/`_assignment1`,
+   each guarded by its own `%writesNN` predicate), so no two waves write the same element.
+ - the eleven `barrier<workgroup> scope(subgroup)` fences guard the LDS fragment reads
+   (`gate_result_physical_view`, `up_result_physical_view`) before publishing, which is what
+   subgroup-scoped fencing is for.
+ - the only cross-wave data flow is the LDS result fragments, and those are subgroup-local.
+
+So the consumer of `%output` is a SEPARATE dispatch, and ordering there is the executor's
+responsibility - not something a kernel fence would express. **Excluded**, and recorded so it is not
+re-explored (this is now the third hazard hypothesis on this issue that reading the code rejected:
+masked_value_stage, probability_stage, and now this one).
+
+### Where the search stands
+The #140-shape search over GLM's dispatch path has produced no surviving instance so far, and the two
+sites #140 fixed are both correctly fenced in this pin. That means either:
+  (a) the surviving defect is at a handoff between DISPATCHES (executor-level ordering, not a kernel
+      fence), which is the same place §55/§56 examined and cleared for the *consumer's own* read path
+      via `hsa_signal_wait_scacquire` + the timepoint covering the last submission; or
+  (b) it is a different class entirely, and the #123/#140 text is a record of the SAME WINDOW the
+      issue describes (as the ledger already says) rather than a surviving instance of it.
+Both remain open. This is the honest state: the mechanism CLASS is named to the project's own
+root-cause text and the trigger/cause distinction is settled, but the specific surviving site is not
+located, and criterion 1 needs a named falsifiable mechanism rather than a class.

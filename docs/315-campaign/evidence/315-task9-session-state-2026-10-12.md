@@ -1997,3 +1997,31 @@ dispatch_registration/common/dispatch-flash-attention.cpp:23). If the fault rate
 partial alignment is lowered, the fault IS the #140 layout-sensitive class and its surviving instance
 is at a boundary the fences do not cover; if the rate is unchanged, the #140 class is not #315's
 mechanism and the search should leave the FA path entirely.
+
+## Forward-only landing mechanics - verified so a fix is landable the moment a mechanism is named (06:25)
+
+Task-9's contract needs a forward-only branch or pin move with `git merge-base --is-ancestor <prev> <new>`
+true. Verified what that actually requires on this repo rather than assuming:
+
+    tools/check_pins.py <base-commit>
+      "Fail a pull request that moves a submodule pin backwards or sideways."
+      -> for every submodule whose gitlink differs between <base> and HEAD, it asks GitHub's compare
+         API whether the new commit is AHEAD of the old one; behind or diverged fails.
+    third_party/llama.cpp gitlink = 0e255d774032dc6b4b06a157d2feb6be2175d3ab
+    registry/architectures.json:4  "llama.cpp (hrx)": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+      -> the SAME rev in two places, and nothing ties them together (an earlier session recorded that
+         gap), so a pin move must change BOTH by hand and keep them consistent.
+
+Consequences for the eventual fix:
+ - the fork-side commit must DESCEND from 0e255d774032, not be rebased onto another base. A change
+   prepared on top of 26330cc20 or f2099e9b7 would be rejected as sideways/behind (both are ANCESTORS
+   of 0e255d774032, confirmed 2026-10-13).
+ - the engine-side change is the gitlink plus registry/architectures.json, both moved together.
+ - the contract's check is `git merge-base --is-ancestor <previous pinned rev> <new rev>`, which the
+   unshallowed clone can now evaluate locally (it could NOT before 2026-10-13 - the fork clone was
+   shallow and the revs were absent).
+
+Box time note: at ~4.5 min/arm, a >=60 fix-cell campaign is ~4.5 h, and the goal's earlier ledger put
+this turn at ~10-11 h of the stated 12 h ceiling. That budget is the binding constraint on task-9's
+campaign, independent of the mechanism, and it is worth stating plainly to the user when the verdict
+lands rather than discovering it mid-campaign.

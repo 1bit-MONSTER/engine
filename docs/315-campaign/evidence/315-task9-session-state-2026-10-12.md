@@ -2760,3 +2760,29 @@ What changes is the CONCLUSION drawn from it. A mechanism can be causally real (
 being rate-correlated per arm (observation) - and the earlier write-up collapsed those two into one
 claim. Recorded as a correction with the original left intact, per the issue's own rule about not
 quietly reinterpreting recorded studies.
+
+---
+
+## The eviction instrument is VERIFIED, not assumed (2026-10-13 09:35)
+
+The whole disc1/disc2 interpretation rests on `evictonly` really forcing KFD eviction. Measured it
+directly with the issue's own watcher rather than trusting the source comment:
+
+    window                  Q_EVICT   Q_RESTORE
+    25 s, quiet box             0          0
+    25 s, evictonly 500      4134       4168
+
+So a kernel-free process doing only `mprotect` churn over a `hipHostRegister`'d 16 MiB range provokes
+**~4,134 KFD evictions in 25 s (~165/s)** where the quiet box produces **zero**. The instrument is
+real: no kernels are launched (so this is not a compute or thermal effect), and the evictions are
+attributable by pid in the SMI stream.
+
+Why that matters for the argument: the disc1 contrast (cell e 2/4 FAULT vs cells q+c 0/10) is only
+interpretable as a causal statement about eviction if the 'effect' cell really is an eviction
+intervention and the control cells really are not. The probe establishes both halves - the quiet
+window is 0, not merely "small".
+
+Method note: the first attempt at this probe returned 0 everywhere because `grep -c` output carried a
+newline into a shell arithmetic expansion, which failed silently and printed 0. Re-ran with the count
+normalised and it worked. Recorded because a silent 0 from a broken probe is indistinguishable from a
+true 0, which is exactly the failure mode that would have made this negative.

@@ -99,3 +99,49 @@ faithful class. So a `tail:16` run with `NANONLY=1` (the configuration that prod
 in `315nan`) would print **which of layer 0's final 16 nodes first carries NaN**, localizing within layer 0
 without any new instrument. Everything before that window — the embedding and layer 0's attention — is
 displacement-exposed by name, and would need the read-at-production instrument.
+
+---
+
+# Replicated three times — and `l_out-0`'s NaN count is a constant, not a proportion
+
+The reduced-selector session produced **four arms with fingerprints**: one clean and **three Face A**. All three
+faulting arms show the layer-0 signature:
+
+| arm | cell | tokens | total values | **`l_out-0`** | `l_out-1` | `l_out-2` | `l_out-3` | `l_out-4` |
+|---|---|---|---|---|---|---|---|---|
+| `r1e` | eviction | 98 | 200,704 | **1,984** | 69,568 | 73,664 | 174,752 | 200,608 |
+| `r2e` | eviction | 135 | 276,480 | **1,984** | 14,272 | 16,320 | 254,472 | 276,448 |
+| `r1c` | CPU | 10 | 20,480 | 46 | 245 | 20,448 | 20,448 | 20,448 |
+| `r1q` | quiet | — | — | — (clean, 66/66) | | | | |
+
+**The two eviction arms report `nan=1984` at `l_out-0` — the same number, to the digit, at 98 tokens and at 135
+tokens, with different tensor sizes (200,704 and 276,480 values) and different hashes** (`8275da278cc381c6` vs
+`ec5cc25ebe3aa882`). A proportion would have scaled with the token count; a per-token row would be 2048. **1984 is
+a fixed count, and `1984 = 2048 − 64 = 31 × 64`.**
+
+That is a structured number twice over — an exact 64-element deficit against one token's width, in arms whose
+token counts differ by 37 — and it is the strongest clue this campaign has about the *shape* of the corruption
+rather than just its location:
+
+- **It is not "one token's row"**, which is 2048: it is that row **minus exactly one 64-wide block**.
+- **It is not dilution**: the count is not the token count, and not proportional to it.
+- The CPU-pressure arm does **not** share it (46 at `l_out-0`, growing to saturation by layer 2), so **the eviction
+  path and the CPU path reach different layer-0 signatures** — the objective's trigger is eviction, and 1984 is the
+  eviction signature.
+
+## What the instrument cannot yet say
+
+This build's fingerprint line prints `bytes / nan / of / hash` — **not** `ne0`, `first`, or `row`, which the
+`315row` build did print. So **where** inside `l_out-0` the 1984 NaN sit is not recoverable from these arms: a
+contiguous prefix of 1984, a suffix of 1984, and 31 scattered 64-blocks are all consistent with the count alone.
+
+`315row-build` has the fields (`first=`, `row=`) and implements the fingerprint, so **a targeted `l_out-0` read on
+that build would give the position directly** — and `first=` alone would distinguish "NaN starts at element 64 of a
+row" from "NaN starts at 0", which is the difference between "one block survived" and "the first block is the
+casualty".
+
+## Status of the finding
+
+Four arms now, three of them Face A, all in regime (`gtt_start=98G`), one clean quiet arm in the same session.
+The layer-0 origin is no longer n = 1 — and the constant 1984 says the corruption has a **fixed shape** at layer 0,
+not a diffuse one.

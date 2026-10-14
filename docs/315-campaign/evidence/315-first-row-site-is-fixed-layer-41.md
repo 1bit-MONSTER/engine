@@ -111,3 +111,25 @@ Raw logs: `~/wt/rt-det/315nan-p*l/server.log` on strixhalo (17 faulting arms; 16
 
 prints the full per-node chain for one arm (`node_2948` first, then `ffn_moe_out-41` … `result_output` at
 `nan=154880 of 154880`), which is the propagation path from one row to the whole vocabulary.
+
+### Why only the three `315fbar` arms are used, and not the other four
+
+Every faulting arm in the archive that carries the extended fields was read out, and the first NaN-bearing
+node differs between them:
+
+| arm | first NaN node | size | `row` | config |
+|---|---|---|---|---|
+| `315fbar-p2c` | `node_2948` ADD (layer 41) | 2,048 = one row | 0 | `tail:16` |
+| `315fbar-p2l` | `node_2948` ADD (layer 41) | 2,048 = one row | 1 | `tail:16` |
+| `315fbar-p4c` | `node_2948` ADD (layer 41) | 2,048 = one row | 0 | `tail:16` |
+| `315fp2-p2l` | `ffn_out-0` MUL_MAT | 7,048 | 0 | `tail:16` |
+| `315idp-p4l` | `ffn_moe_probs-1` UNARY | 640 of 640 | 0 | id probe |
+| `315row-p1c` | `ffn_moe_weights-4` GET_ROWS | 8 of 40 | 32 | name list |
+| `315row-p2l` | `ffn_moe_weights-4` GET_ROWS | 8 of 40 | 32 | name list |
+
+Only the `315fbar` triple is used, because **the fingerprint only reports the nodes the arm was asked to
+watch**: a run driven by a name list (`l_out-…`, `ffn_moe_weights-…`) cannot see `node_2948` at all, so its
+"first NaN node" is an artifact of its name list, not of the corruption. The four other rows are therefore
+**not evidence against the fixed site** and are **not pooled** with it — they are recorded here so the
+comparison is not silently dropped, and so nobody later reads their differing node names as a contradiction.
+`315rowidx` (pre-registered) removes this confound by using one config across all its arms.

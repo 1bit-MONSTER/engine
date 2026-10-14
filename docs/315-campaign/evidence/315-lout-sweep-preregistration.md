@@ -124,3 +124,31 @@ it — that is the intended resolution of this attempt, and a follow-up would re
 This is deliberately the **last** selector attempt. If it also yields Face B, the honest conclusion is that the
 `l_out` selector and the Face-A fault are not co-observable at any perturbation level tried, which is itself a
 finding about the instrument and is how it will be recorded — not as a negative result about layers.
+
+---
+
+# Amendment 2 confirmed: the instrumentation dose selects which face, and whether the quiet cell is quiet
+
+The reduced selector did what the dose-response hypothesis predicted, and the comparison is worth having on the
+record because it bears directly on the acceptance criterion:
+
+| configuration | selector | quiet cell | eviction cell |
+|---|---|---|---|
+| `315lout2` | 64 named tensors | **Face B at `req=1`** | Face B at `req=1…3` |
+| `315lout4` | **16 named tensors** | **OK, 66/66** | **Face A, `nan=1`, `req=6`** |
+
+**Same build, same environment, same rig, same regime (`gtt_start=98G` in every arm) — only the number of
+tensors read per graph changed.** At 64 names, every cell faulted and the fault was Face B; at 16 names, the
+**quiet cell is clean for a full 66-request arm** and the eviction cell faults as **Face A**, which is the
+production profile the objective describes.
+
+Two consequences:
+
+1. **The dose-response hypothesis is supported**: host-side reads per graph select the fault's face, not just its
+   rate. That is a stronger statement than the record's existing "the instrument is an inducer" (§39) — it is not
+   only that instrumenting changes the odds, but that *how much* changes *which* face.
+2. **It matters for criterion 3.** A ≥60-arm acceptance campaign is required to show zero faults across both
+   faces. This table says a campaign run at a high instrumentation dose would fault on *every* arm for reasons
+   having nothing to do with the regime — and a campaign run with no instrumentation cannot observe either face.
+   **Any acceptance campaign therefore has to state its instrumentation dose and justify it**, which the objective
+   as written does not require. That is a gap in the criterion as specified, not in the arms.

@@ -135,3 +135,53 @@ Because the probe hooks **only graphs containing a host-visible tensor**, and `h
 records that HRX executes the llama graph as ~9-node chunks, the probe will report on the logits chunk and not
 on the layer chunks. So a positive result localises the *logits region*, and says nothing directly about
 `node_2948`'s buffer — stated here so the result is not over-read.
+
+---
+
+## Second amendment, still BEFORE any result: the table misread the source's counters
+
+Implementing the table as code (so the verdict is computed rather than chosen) caught an error **in the table
+itself**. The source loop is:
+
+    if (bits == kProbeSentinel) { ++sentinel; }
+    else if (std::isnan(fp[w])) { ++nan; if (first_nan == 0) first_nan = bits; }
+    else { ++finite; }
+
+**The probe's own payload is counted in `sentinel` ALONE** — it is the first branch, so a surviving payload
+word never increments `nan` and **never sets `first_nan`**. `first_nan` is therefore always the first
+*genuine* (non-sentinel) NaN. The table above asserts `sentinel>0` **and** `first_nan = 0x7FC0DEAD` as its
+"never written" test, which the source makes **impossible to satisfy**: a surviving sentinel yields
+`sentinel>0, nan=0`, and `first_nan` is then unset and prints as `0x00000000`.
+
+Corrected readout, with the source's exact partition `sentinel + nan + finite == words` asserted:
+
+| observation | verdict |
+|---|---|
+| `sentinel > 0` **and** `nan == 0` | **NEVER_WRITTEN** — payload words survive and there is no genuine NaN: the device did not write this region. Consumer reads pre-fill content ⇒ visibility/staleness defect |
+| `sentinel > 0` **and** `nan > 0` | **PARTIAL_UNWRITTEN** — the region was partly written; size the gap against `words` before concluding anything |
+| `sentinel == 0`, `nan > 0`, `first_nan = 0x7FC00000` | **WRITTEN_QUIET_NAN** — written, ordinary arithmetic NaN ⇒ the never-written/restored-copy family is excluded |
+| `sentinel == 0`, `nan > 0`, `first_nan` any other value | **WRITTEN_OTHER_PAYLOAD** — written; the payload identifies the producer |
+| no `anomaly` line, `armed` present | **WRITTEN_CLEAN** |
+| no `armed` line | **SELECTOR_ARMED_NOTHING** — INVALID for the question; widen the band, do not read as clean |
+
+`PARTIAL_UNWRITTEN` is a new branch and it is the one the earlier table wrongly collapsed into "never
+written": a handful of leftover payload words in an otherwise-written region is **not** evidence that the
+region went unwritten, and reading it as such would have manufactured the exact conclusion the experiment is
+supposed to test.
+
+**Ordering note, kept from before:** the payload test is no longer a special case at all — the payload never
+appears in `first_nan`, so the decisive distinction is simply `nan > 0` versus `nan == 0` given `sentinel > 0`.
+
+The classifier is `docs/315-campaign/tools/producer-probe-readout.py`, self-tested 7/7 including the partition
+identity, so the table is exercised rather than asserted.
+
+### Two more readout facts worth having before the arms land
+
+- **`anomaly` requires `sentinel > 0 || nan > 0`.** A hook that fired, wrote the region correctly and produced
+  no NaN prints **no anomaly line at all** — so "armed but no anomaly" is a *clean* reading, not a missing
+  measurement, and `SELECTOR_ARMED_NOTHING` is the only genuine no-measurement case.
+- **`armed` prints once per process** (`armed_logged` is a `static bool`), so its absence across an arm is
+  meaningful only if the process never armed a target; several arms may share one `armed` line's absence.
+
+Nothing else changes: the run config, its declared confound (the name list is the fault-yield enabler), the
+hooked-graph limitation (logits chunk only), and every INVALID clause stand as written.

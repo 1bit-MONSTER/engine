@@ -229,3 +229,33 @@ the others from their callers.
 passes. Nothing here is a mechanism claim; it is the one change that makes the question answerable.
 
 Detail: `docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
+
+### 06:50 — WITHDRAW the `register_host` ask: answered from source, and it closes the coherence family
+
+The previous two notes asked the hrx-re lane to prioritise `iree_hal_streaming_memory_register_host`. **Please
+drop that** — the function's **source** is in `~/wt/pin-fork-hrx/third_party/hrx-system/libhrx/src/binding/common/memory.c`,
+so it needed no decompilation and I have read it. Apologies for the churn; the lesson is mine to keep, and it
+is the same one this session keeps relearning: **check the source tree before commissioning a decompilation**
+(`grep -rn <symbol> <tree> --include=*.c`)
+
+**It is decisive:**
+
+    memory.c:2510-2530   iree_hal_streaming_memory_register_host_with_context_mode(…)
+      params.type = IREE_HAL_MEMORY_TYPE_HOST_LOCAL | IREE_HAL_MEMORY_TYPE_DEVICE_VISIBLE;   // 0x52, no HOST_COHERENT
+      iree_hal_allocator_import_buffer(context->device_allocator, params, &external_buffer, …);
+      wrapper->host_register_flags = flags;      // coherence flags STORED, never used for the type
+
+The type is **hardcoded**, and the `host_register_flags` are pure bookkeeping — every consumer is a copy
+(`memory.c:755`), a store (`:2405`), or a report-back through `hipHostGetFlags` (`:2667`); `FLAG_HIP_COHERENT`
+appears outside the enum only as a HIP-flag round trip (`api.c:754-755` and `:6908-6910`).
+
+**So the coherence family is closed for both host paths** — pool *and* register — and that explains three
+recorded negatives at once: the `GGML_HRX_USE_UNIFIED_MEMORY` A/B could only change a *recorded type*; the
+`HOST_COHERENT` staging fix I prepared is a **no-op**; and the register flags never reach an allocation.
+
+**What is still worth your pipeline's time** is unchanged and now narrower: `hrx_allocator_virtual_memory_map`
+/ `_protect` / `_unmap` (in `libhrx.so`, **queued-and-failed**, not never-attempted — so the retry applies),
+and the never-attempted set needs the **DWARF-built queue** described in the previous note. The coherence
+question is no longer among the reasons.
+
+Evidence: `docs/315-campaign/evidence/315-coherence-closed-from-source-both-paths.md`.

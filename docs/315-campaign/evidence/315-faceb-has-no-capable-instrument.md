@@ -129,3 +129,22 @@ a Face-B arm's divergence shows up as a `hash_finite` that differs from several 
       fp=$(grep -ac hrx-tensor-fp "$d/server.log"); fb=$(grep -aciE 'invalid utf|Content-only' "$d/server.log")
       [ "${fp:-0}" -gt 0 ] && [ "${fb:-0}" -gt 0 ] && echo "$d"
     done
+
+### Design check: dropping `NANONLY` costs no extra perturbation, only log volume
+
+A reasonable objection to the plan above is that reading *every* watched tensor would perturb the run more than
+the NaN-only mode, and the record already holds that the fingerprint is itself an inducer — so the instrument
+that can see Face B might prevent it. Read at source, the objection does not apply:
+
+    ggml-hrx.cpp:701   ggml_backend_tensor_get(node, host.data(), 0, bytes);   <- the read, always
+    ggml-hrx.cpp:722-727  ... isnan(f[j]) ... nan++ ...                       <- classified after
+    ggml-hrx.cpp:728   if (fp_nan_only && nan == 0) { continue; }             <- only the PRINTING is gated
+
+The device→host read and the NaN/hash classification happen **before** the `NANONLY` test, so `NANONLY` selects
+what is *printed*, not what is *read*. Turning it off adds output lines and nothing else.
+
+The dose variable the record actually identifies is therefore the **number of watched tensors** (16 for
+`tail:16`, 64 for the amplifier, 15 for the name list) — and `315faceb` holds that at the same 15 as the
+baseline config, which is what makes it a controlled comparison rather than a new induced regime. Bind the
+output volume with `GGML_HRX_TENSOR_FP_CALLS` rather than by narrowing the watched set, so the read pattern
+stays matched to the baseline.

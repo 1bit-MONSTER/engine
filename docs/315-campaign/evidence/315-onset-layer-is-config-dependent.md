@@ -39,7 +39,33 @@ were **clean** in that arm. Layer 0 is watchable: `norm-0` printed in `315nan-p1
 So both statements are true of their own data: **with the probe-heavy instrumentation the first corruption is
 at layer 41; with the name-list instrumentation it is at layer 0.**
 
-## What this means, stated plainly
+## This comparison is CONFOUNDED, and that is the main caveat
+
+The two configurations differ in **two** ways, not one:
+
+| config | selector | probes |
+|---|---|---|
+| `315nan`, `315fbar` | `tail:16` (positional window) | yes |
+| `315size` | 15-name `l_out` list | no |
+
+So the onset difference **cannot be attributed to the probes**. Either variable could produce it, and the
+selector is the more worrying one: if a `tail:16` window does not in fact reach layer 0 in those arms, then
+"the first NaN-bearing tensor is in layer 41" is a statement about **what the window covered**, not about the
+fault. My earlier argument that layers 0–40 were watched and clean rests entirely on
+`GGML_HRX_TENSOR_FP_CALLS` being effectively unlimited and `NANONLY` suppressing only NaN-free lines — which
+is true of the *printing* — but it says nothing about whether a **layer-0 node was inside the 16-node window of
+any call**. Those are different questions and I ran them together.
+
+The evidence does not settle it either way. In favour of early layers being covered: `node_74`,
+`node_108` (layer 1's ADD), `node_145`, `node_179`, `node_250`, `node_287` and `norm-0` **do** print, in
+`315nan-p12l`, so early-layer nodes are reachable by the window in at least one arm. Against: they print in
+**exactly one** of 19 arms, and that one is the arm whose onset is already early — which is also what you would
+see if the window normally misses them.
+
+**Consequently the honest statement is weaker than this document's title.** What is established is: *under
+the probe-heavy `tail:16` config the first NaN-bearing tensor seen is in layer 41; under the name-list config
+it is layer 0.* What is **not** established is that the probe set is the reason, or that layer 41 is anything
+other than the window's reach.
 
 - **"Layer 41" is not a stable site.** It is where this defect surfaces *under the probe-heavy configuration*.
   A claim that the site is layer 41 is a claim about the instrument as much as about the fault.
@@ -62,6 +88,28 @@ State them, because they weaken the comparison:
 - `315size` **also faulted in the quiet cell** (round 2 arm q, `nan=1`, `side=0/0`), so its control cell is not
   clean and its cells are not a clean contrast.
 - Its arms were **not** run by me; they are the peer session's, read here.
+
+## The controlled experiment this requires (and which `315cfg` is)
+
+Both conditions must share the **selector** so that the same tensors are observed:
+
+| condition | `EXTRA_ENV` | what it isolates |
+|---|---|---|
+| A | 15-name `l_out` list, `NANONLY` | baseline — known to fault today (`315size`, `315lout4`) |
+| B | the same list, `NANONLY`, **plus** `COPY_PROBE` `SENTINEL` `LOGITS_FP` | the probes' effect on the onset layer, selector held fixed |
+
+**Readout, fixed in advance:** for each Face-A arm in each condition, the **smallest `N` with `nan(l_out-N)>0`**.
+
+| observation | verdict |
+|---|---|
+| A's onset is layer 0 and B's is layer 41 | the **probes** move the onset — the layer-41 site is an instrument artifact |
+| both onsets are layer 0 | the layer-41 reading was a **window artifact** of `tail:16`; this document's title is wrong and is withdrawn |
+| both onsets are layer 41 | the name-list config's layer-0 reading was an artifact (e.g. an aliased `l_out-0` read) |
+| either condition yields no Face-A arm | **INVALID** for the comparison; reported as such |
+
+The third condition's caveat matters and is checked the same way as before: an `l_out-0` reading is only
+evidence if its **hash is unique** in that arm. In `315size-r2e`, `l_out-0`'s hash (`3fb58e998569ad4d`) is
+unique among the printed lines, so that arm's reading is not an obvious alias.
 
 ## What must change in the record
 

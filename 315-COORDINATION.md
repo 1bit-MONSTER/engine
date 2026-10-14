@@ -33,3 +33,48 @@ Consistent with `0ed67c2`'s finding that the `tail:16` + probes yield did not re
 
 Evidence: `docs/315-campaign/evidence/315-row-size-scored-from-archive.md`,
 `315-layer41-site-by-graph-arithmetic.md`.
+
+---
+
+## 2026-10-14 03:55 — the onset layer is set by the READ PATTERN; and `315lout4` did have probes
+
+**1. A correction to `0ed67c2`'s table, because it drove the config switch.** That commit describes
+`315lout4` as *"disc rig, 16 `l_out` names, **no probes**"* and infers the configs that yield Face A are the
+name list *without* the probes. The console says otherwise:
+
+    extra_env='GGML_HRX_COPY_PROBE=1 GGML_HRX_SENTINEL=1 GGML_HRX_LOGITS_FP=100000
+               GGML_HRX_TENSOR_FP=l_out-0,l_out-3,...,l_out-47 GGML_HRX_TENSOR_FP_NANONLY=1'
+
+All three probes were present. The amended selector (15 `l_out` names, probes retained) is therefore very
+close to `315lout4` — the config that already worked — so the switch is probably right in outcome, but its
+stated reason is not what the logs show, and the inference that the probes suppress the yield is unsupported.
+
+**2. The onset layer is a property of the read pattern, not of the probes.** Three conditions already exist in
+the archive, and they separate the two variables:
+
+| condition | selector | probes | onset |
+|---|---|---|---|
+| A — `315size` | 15-name `l_out` list | none | **layer 0** (`l_out-0 nan=1984`, `1790`) |
+| B — `315lout4`, `315inp2` | `l_out` name list | **yes** | **layer 0** (`l_out-0 nan=1984`, `nan=46`) |
+| C — `315nan`, `315fbar` | **`tail:16`** (all ~9 nodes/chunk) | yes | **layer 41** (`node_2948 nan=2048`, 18/19) |
+
+A vs B holds the selector fixed and changes the probes: onset does not move. B vs C holds the probes fixed and
+changes the selector: onset moves 0 → 41. **So the read pattern is the cause**, which also explains why
+`tail:16`'s yield would not reproduce: the instrument that reads every node is a different regime from one that
+reads three.
+
+`hrx-producer` in the three `315dump-*` arms shows `graph n_nodes=9`, so `tail:16` covers **every** node of a
+subgraph — ~9 reads per chunk, against ~1–3 for a name list.
+
+**3. What this implies for the goal.** Neither layer 0 nor layer 41 is *the* site; both are where one
+instrument first sees NaN. Any "the corruption is at layer N" claim is instrument-relative unless the read
+pattern is fixed. The instrument-independent quantity appears to be the **size** — one `n_embd` row, 2048
+floats, `finite + nan = extent` exactly — and that should be re-measured under condition A before being called
+universal.
+
+**4. `315cfg` (mine, running).** It tests A′ vs B, which the table above already answers; it is left to finish
+only as a formal pre-registered check. Its interesting half is `A vs C`, which the archive has supplied. If it
+is still thermally blocked when you read this, stopping it loses little — and note it holds `box.lock`, so it
+is the one thing blocking the box right now.
+
+Full evidence: `docs/315-campaign/evidence/315-onset-is-set-by-read-pattern-not-probes.md`.

@@ -1784,3 +1784,35 @@ recorded 16/17 did not reproduce here.
 `315-row-size-scored-from-archive.md`, `315-node-2948-is-an-unnamed-moe-accumulation.md` (with its withdrawal
 note), and the coordination note in `315-COORDINATION.md`. Every number above is reproduced by a command in
 one of those files; none required GPU time, all were read from the archived arm logs at pin `e44c9d01a`.
+
+### Correction to the section above: the onset layer is configuration-dependent
+
+The section above reports the layer-41 site from the probe-heavy config (`tail:16` + `COPY_PROBE` +
+`SENTINEL` + `LOGITS_FP`). A second working configuration says otherwise, and the same day's peer run supplies
+it: **`315size`** (15-name `l_out` list, `NANONLY`, **no probes**) puts the onset at **layer 0** in all three
+of its Face-A arms — `l_out-0 nan=1984 of 276480` (r2e, call 40377), `1984 of 503808` (r1e), `1790 of 20480`
+(r2q) — each in its own per-layer call, growing to saturation by layer 4.
+
+The layer-41 reading is not wrong for its own data: in `315nan-p2l` the first printed line is `call=152939`,
+and with `NANONLY=1` and all calls fingerprinted, that means ~152,938 earlier graphs produced no NaN line, so
+layers 0–40 were watched and clean. Both are true. What is **not** true is that the site is layer 41
+unqualified: **the observable onset moves with the instrument set**, which is the recorded
+"instrumentation is an inducer" note showing up as a change of *layer*, not merely of face.
+
+Two things therefore narrow:
+
+- **criterion 1's "site is named"**: it is named *under the probe-heavy configuration*. The claim to be *the*
+  site is withdrawn pending the config-only test below.
+- **the row-size invariant** (`nan=2048` exactly, 18 of 19 arms) is an invariant **of that configuration**.
+  `315size`'s onset counts are not one row (`1984`, `1790`), though `1984 = 2048 − 64` recurs in both.
+
+**The discriminating experiment this implies, and it is config-only:** run the same fingerprint window on both
+configurations in the same session at the same regime, and see whether the onset layer moves with the probe
+set. That decides whether "layer 41" is the defect or the instrument.
+
+**Caveat on the `315size` comparison:** that run was thermally saturated (`thermal_pauses` to 29, `tctl` to
+95 °C, `stopped_frac` to 0.82, gate waits of 10–50 min) and it **faulted in the quiet cell** (round 2 arm q,
+`nan=1`, `side=0/0`), so its cells are not a clean contrast. Its arms were run by the peer session, read here
+only.
+
+Evidence: `docs/315-campaign/evidence/315-onset-layer-is-config-dependent.md`.

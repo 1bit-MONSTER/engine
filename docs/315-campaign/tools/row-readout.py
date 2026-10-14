@@ -37,6 +37,10 @@ LINE = re.compile(
     r"(?: ne0=(?P<ne0>-?\d+) first=(?P<first>-?\d+) row=(?P<row>-?\d+))?"
     r" hash=(?P<hash>[0-9a-f]+)")
 
+# GGML_HRX_SENTINEL=1 fills the logits allocation with payload NaN and the guard reports the match
+# count as `sentinel=`. Read it (docs/315-STATUS.md records that it went unread for two days).
+SENT = re.compile(r"sentinel=(?P<sent>\d+)")
+
 
 def arms(paths):
     out = []
@@ -65,9 +69,25 @@ def main(argv):
                 if m:
                     lines.append(m.groupdict())
         guard = 0
+        sent_armed = 0
+        sent_matched = 0
         with open(log, errors="replace") as fh:
-            guard = sum(1 for r in fh if "HRX returned NaN logits" in r)
-        print(f"=== {tag[:44]}  guard_lines={guard}  fingerprint_lines={len(lines)}")
+            for r in fh:
+                if "HRX returned NaN logits" in r:
+                    guard += 1
+                if "[hrx-sentinel] filled" in r:
+                    sent_armed += 1
+                m = SENT.search(r)
+                if m:
+                    sent_matched += int(m.group(1))
+        # The sentinel field was armed for days and never read out (docs/315-STATUS.md), so it is
+        # printed here beside every arm's verdict rather than left in the raw log. sentinel>0 means
+        # the logits region still held the payload the fill wrote: the device never wrote it.
+        sent_note = ("not armed" if sent_armed == 0 else
+                     ("0 matches -> device wrote the region" if sent_matched == 0 else
+                      f"{sent_matched} MATCHES -> reads are stale, never-written"))
+        print(f"=== {tag[:44]}  guard_lines={guard}  fingerprint_lines={len(lines)}  "
+              f"sentinel_armed={sent_armed}  sentinel={sent_note}")
         if not lines:
             print("    (no NaN-bearing fingerprint line: with NANONLY=1 that means no NaN in any named node)")
             continue

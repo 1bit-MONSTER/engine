@@ -176,3 +176,37 @@ distinction. Any run that wants to settle whether the corruption is a region or 
 That also means: **not one of the 266 readings on the record can distinguish a region from a lane pattern**, and
 no amount of further counting will. The instrument to add is a per-wave (32-bit mask across the row's 32 waves)
 or per-element dump — small, diagnostic-only, and in scope.
+
+---
+
+# PRE-REGISTRATION: what the wave mask must read for each shape, fixed before the run
+
+The mask instrument is built and rides in both arms of the corrected `315ab` campaign. Its output is a 32-bit
+hex word; these are the values the two candidate shapes must produce, fixed **before** any mask line exists, so
+the result is scored rather than read.
+
+Bit *w* is set iff wave *w* — elements `[64w, 64w+64)` — contains at least one NaN, for the first 32 waves
+(elements 0…2047 = one `n_embd` row). `0x7FFFFFFF` = `0b0111…1111`; `0xFFFFFFFF` = all 32 set.
+
+| shape | predicted mask | why |
+|---|---|---|
+| **one corrupted region at the front of the row** | a **contiguous run of set bits from bit 0**, e.g. `0x7FFFFFFF` for a 31-wave region | a region is contiguous by definition |
+| **one clean wave inside an otherwise-wrong row** (the `1984` = 31-of-32 case) | `0x7FFFFFFF` if the *last* wave is clean; `0xFFFFFFFE` if the *first* is | it pins which wave the hole is in, which the count alone cannot |
+| **whole-row corruption** | `0xFFFFFFFF` | every wave poisoned |
+| **a lane/wave-interleaved pattern** | bits set with **gaps**, e.g. `0x55555555`, `0xAAAAAAAA`, or any non-contiguous run | this is the one shape a *count* can never show |
+| **no mask line printed, though a fault occurred** | the instrument did not arm in that arm | INVALID for the mask question, and it must not be read as "no waves" |
+
+**The decisive comparison, stated in advance:** if every faulting arm's mask is a contiguous run, the corruption
+is a **region**, and the wave64-lane reading loses; if any arm shows a **non-contiguous** mask, it is a
+**lane/wave pattern**, and the region reading loses. A count of 1984 is consistent with both, which is exactly
+why this instrument exists.
+
+**Also pre-committed, because it is easy to get wrong after the fact:** the mask covers only the **first 32
+waves (2048 elements)**. For a tensor whose `ne0 != 2048` the bit indices no longer correspond to one row's
+waves, and such a reading must be **excluded** rather than reinterpreted. Every hidden-state tensor on this
+record has `ne0 = 2048`, so this excludes nothing observed so far — but it is stated now, not after a
+surprising mask appears.
+
+**What a mask result does not do:** it does not name the writer, and it does not by itself establish a
+mechanism. It decides one binary question — region or lane pattern — that every previous instrument was blind
+to.

@@ -75,6 +75,29 @@ half that document left open.
 - **Not a replacement for the running test.** `315row` remains the pre-registered replication and its
   verdicts stand; this document is an **additional branch** that its own third row already anticipated.
 
+## Addendum: the ROW index, from the arms that DO carry the extended fields
+
+The `315nan` lines above lack `ne0=`/`first=`/`row=`, so they fix the row *size* and the *site* but not
+*which* row. Four archived arms in the same campaign **do** carry the fields — `315fbar-p2c`, `315fbar-p2l`,
+`315fbar-p4c` (build `315fbar-build`) — and at the same node they read:
+
+| arm | extent `of` | T = of/2048 | `nan` | `ne0` | `first` | `row` |
+|---|---|---|---|---|---|---|
+| `315fbar-p2c` | 352,256 | 172 | 2,048 | 2048 | **0** | **0** |
+| `315fbar-p2l` | 712,704 | 348 | 2,048 | 2048 | **2048** | **1** |
+| `315fbar-p4c` | 79,872 | 39 | 2,048 | 2048 | **0** | **0** |
+
+So at the fixed site the row **size** is one row (`nan=2048`) and the row **index is 0 or 1 — never higher**,
+while T is 39, 172 and 348. A per-last-token reading would sit at T−1 (tens to hundreds); a fixed-offset
+reading would sit at one constant. `row ∈ {0,1}` is neither: it is a **front-of-buffer** corruption whose
+extent is constant and whose index is small.
+
+This is the second branch of `315-row-index-preregistration.md` read from existing data — **fixed site,
+moving (small) row** — and it is the strongest pointer yet at the residual-stream buffer's first row(s) at
+layer 41. It does **not** name the buffer (front-of-buffer is shared by the residual stream's first token
+rows and by any row-oriented staging buffer), does not explain why layer 41, and rests on **three** arms in
+one build; the pre-registered `315rowidx` run is what replicates it.
+
 ## Evidence
 
     for d in ~/wt/rt-det/315nan-*; do

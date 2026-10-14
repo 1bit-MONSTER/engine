@@ -328,3 +328,46 @@ run; the primary readout, the arm counts, and the stopping rule are unchanged.
 
 That second row is the important one: it makes the run **self-falsifying**, so a null cannot be mistaken for a
 refutation and cannot be mistaken for support either.
+
+### Amendment 2, still BEFORE any arm: the two instrument trees are DISJOINT, and the run was aimed at the wrong one
+
+Caught while preparing the run, and it would have made the campaign **uninterpretable** rather than wrong — the
+worst kind of failure, because it looks like a null.
+
+**The defect.** The instrumentation is split across two source trees, and they do not overlap:
+
+| tree | what it carries | built by |
+|---|---|---|
+| `~/wt/llama-315copy` | the **fingerprint** (`hrx-tensor-fp`, `hrx-finite-fp`) | `315fp-build`, `315fp2-build`, `315fbar-build`, … |
+| `~/wt/llama-315probe` | the **producer probe** (`hrx-producer`, `GGML_HRX_PRODUCER_PROBE`, `GGML_HRX_PRODUCER_DEVICE`) | `315probe-build` |
+
+Checked in the artefacts, not inferred: `315probe-build/bin/libggml-hrx.so.0.18.0` contains **7**
+`hrx-producer` strings and **0** `hrx-tensor-fp` strings; `llama-315copy`'s `graph-executor.cpp` contains
+**0** occurrences of `kProbeSentinel|producer_probe_target|hrx-producer`.
+
+**What that would have done.** The campaign was written to run on `315probe-build` while setting
+`GGML_HRX_TENSOR_FP=<15-name list>`. In that binary the variable is **inert** — so the **15-name list, which is
+the fault-yield enabler**, would not have been active. The conditions would have degenerated to *"probe, with
+and without a coherence bit"*, at an unknown (probably ambient ~5 %) fault rate, with 4 eviction arms per
+condition. That lands in the pre-registration's own **INVALID / under-powered** row — and a reader would have
+seen two arms with no faults and no fingerprint lines.
+
+**Why the amendment is a target change, not a redesign.** A′/B′ needs exactly three things from its binary: the
+**fingerprint** (yield enabler + onset readout), the **coherence toggle** (the intervention), and the
+**writeback instrument** (the warmth check). Two of the three live in `llama-315copy`, so the fix is to patch
+*that* tree — the coherence toggle applies there with its anchor **unique** (the only other
+`hrx_buffer_params_t params = {` block is `DEVICE_LOCAL`, so the two are not confusable) — and to build
+`315fp-build`. Verified present in `llama-315copy` after patching: the fingerprint, `GGML_HRX_STAGING_COHERENT`,
+and `GGML_HRX_WRITEBACK_FINGERPRINT` (2 occurrences, in `command-program-executor.cpp`).
+
+**The producer probe is dropped from this campaign, deliberately.** It is not needed for A′/B′, it is not in
+this tree, and leaving `GGML_HRX_PRODUCER_PROBE=1` in the environment of a binary without it would have been a
+second inert variable — so those two variables are **removed from the run** rather than left in and ignored. The
+device-probe question keeps its own pre-registration and its own tree.
+
+**The generalisable trap, recorded because it will recur:** *an environment variable whose instrument is not
+compiled into the binary is silently inert, and nothing in the run's output says so.* The only defence is to
+check the artefact (`strings <lib> | grep <env name>`) rather than the source tree you believe you built. This
+is the same class as the record's defect **#13** ("the rig's default BIN build does not implement
+`GGML_HRX_TENSOR_FP` at all, so an `EXTRA_ENV`-driven sweep was silently inert") — the same trap, a second
+time, which is why it is written down rather than just fixed.

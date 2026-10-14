@@ -212,3 +212,45 @@ observed* under the probe-heavy configuration.
 
 `315cfg` (running) tests the probes as a cause with the selector held fixed, and its readout table already
 includes the branch that withdraws this document's framing.
+
+---
+
+## Third refinement: the selector, not the probes, is the prime suspect for the dose difference
+
+`hrx-producer` shows subgraphs of **`n_nodes=9`** (`315-subgraphs-are-9-nodes-so-tail-covers-all.md`), and
+`tail:16` covers all of them. That makes the read **volume** of the two configurations very different, and it
+is the *selector* that sets it — not the probes:
+
+| config | tensors read per chunk | why |
+|---|---|---|
+| `tail:16` + probes | **~9** (every node) | 16-node window over a 9-node graph covers all of it |
+| 15-name `l_out` list | **1–3** (only matching nodes) | the list is matched against each node's name |
+
+Both configurations also pay the probe reads, but that is a constant added to both sides of *this* comparison
+and cannot by itself explain a 9-vs-1 difference. So of the two variables that differ between the original
+observations, **the read dose difference is dominated by the selector**, and the probe set is the secondary
+candidate.
+
+This matters for what `315cfg` can and cannot settle. Its two conditions vary the **probes** with the selector
+held fixed, so it isolates the secondary candidate. The primary one — read dose via the selector — needs a
+third condition:
+
+| condition | selector | probes | reads/chunk |
+|---|---|---|---|
+| A (running) | 15-name `l_out` list | no | ~1–3 |
+| B (running) | 15-name `l_out` list | yes | ~1–3 + probe reads |
+| **C (not yet run)** | `tail:16` | no | **~9** |
+
+**A vs C is the dose test**: same absence of probes, ~1–3 reads versus ~9. If the onset moves from layer 0 (A)
+to layer 41 (C), the read dose is the variable, not the probes — and that is consistent with everything the
+record says about the fingerprint being an inducer, with the "dose" now measured in tensors-read-per-chunk
+rather than in name-list length.
+
+**Stated as a hypothesis with its falsifier:** the observable onset layer is a monotone function of read dose,
+so A (low) → layer 0, B (mid) → intermediate, C (high) → layer 41. Falsified if C's onset is layer 0 like A's,
+or if A's is layer 41 like the probe-heavy config's. **Not yet run**; recorded here so the run is a
+pre-registered test rather than a response to whatever A and B return.
+
+**Caveat carried forward:** `n_nodes=9` is measured on **one** graph (a q-path chunk at layer 0) in three arms.
+MoE chunks, where the layer-41 node lives, are not measured and may be larger — so "~9 reads/chunk" is an
+estimate for that chunk type, and if MoE chunks have ≥17 nodes then even condition C's window is partial there.

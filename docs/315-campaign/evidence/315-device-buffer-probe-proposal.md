@@ -148,3 +148,29 @@ occurs exactly once, so a silent no-op is impossible) can apply it when a build 
 deliberately **not** attempted here: compiling raises `load1` and the `foreign` count, which are two of the
 three conditions the queued `315prod` run is waiting on, and would contend with the foreign decompilation the
 box is already carrying.
+
+### The patch is now written and its anchors verified — but it is NOT compile-tested
+
+`docs/315-campaign/tools/patch-device-producer-probe.py` applies the change in the record's own patch style
+(every anchor asserted to occur exactly once, a pre-check over all anchors before any write, an idempotency
+marker, and a brace-balance check). Verified against a **real copy** of the source, not from memory:
+
+    patched ggml/src/ggml-hrx/runtime/graph-executor.cpp
+      device-enable branch: 1 occurrence(s)
+    second run: already patched
+    braces: 52 / 52
+
+Two defects were caught by that testing rather than shipped:
+
+1. **Use-before-declaration in the scan replacement.** `const float * fp = ...` is declared *before*
+   `const size_t n = ...` in the original, so a staging buffer sized from `n` would not have compiled. The
+   replacement now sizes from a locally computed `dfloats` and does not reference `n`.
+2. **A stranded comment.** The sentinel anchor matched only the declaration, so the original line's trailing
+   comment was left attached to the end of the new `kProbeFinite` line — legal C++ but a mangled double
+   comment. The anchor now includes the trailing comment.
+
+**What is still NOT established, and must not be claimed:** that it **compiles**. The script's own output says
+so on every run. Confirming that needs a build, which is deliberately deferred because compiling raises
+`load1` and the `foreign` count — two of the three conditions the queued `315prod` run is waiting on — and
+would contend with the foreign decompilation already on the box. So the instrument is *ready to build*, not
+*working*.

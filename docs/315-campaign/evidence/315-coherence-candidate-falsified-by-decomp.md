@@ -87,3 +87,69 @@ the disjoint-instrument-trees defect: **the intervention never reached the thing
 - **The wave mask**, built and pre-committed, which decides region-vs-lane in one run.
 - **The coherence/staging family is now closed** as the explanation, on decompiled evidence, unless a
   map-path effect is found — and that is a specific, cheap next read, not an open-ended search.
+
+---
+
+# SCOPE CORRECTION: the falsification covers the POOL path only — the REGISTER path has explicit coherence, and its decider is missing from the dump
+
+The section above concludes "the coherence/staging family is closed". Reading further into the same dump
+narrows that: it is closed for **one** of the two host-memory paths and **open for the other**, and the
+function that would close the second is one of the dump's gaps.
+
+## There are two host-memory paths, and they treat coherence differently
+
+| path | how memory is obtained | is coherence consulted? |
+|---|---|---|
+| **pool** (what the ggml-hrx staging buffer uses) | `hrx_allocator_allocate_buffer` → `hrx_mem_pool_backing_retain_allocation_source` → pool chosen by `HOST_LOCAL` (**0x42**); `create_source(device, kind, usage)` never sees the type | **no** — this is the falsification, and it stands |
+| **register / import** (what `hipHostRegister` and managed buffers use) | `iree_hal_streaming_memory_register_host(context, ptr, size, flags, &buffer)` | **yes** — there are explicit flags |
+
+## The register path's coherence flags, read from the headers
+
+    libhrx/src/binding/common/internal.h:1089-1107
+      IREE_HAL_STREAMING_HOST_REGISTER_FLAG_DEFAULT          = 0
+      IREE_HAL_STREAMING_HOST_REGISTER_FLAG_READ_ONLY        = 1ull << 3   (0x8)
+      IREE_HAL_STREAMING_HOST_REGISTER_FLAG_HIP_UNCACHED     = 1ull << 28
+      IREE_HAL_STREAMING_HOST_REGISTER_FLAG_HIP_COHERENT     = 1ull << 30
+      IREE_HAL_STREAMING_HOST_REGISTER_FLAG_HIP_NON_COHERENT = 1ull << 31
+
+and the decompiled `hipHostRegister` (which decompiled **OK**):
+
+    hipHostRegister(ptr, size, flags)
+      flags_00 = flags | FLAG_READ_ONLY;
+      if ((flags & 8) == 0) {                       // 8 == hipHostRegisterReadOnly
+        flags_00 = flags & (HIP_NON_COHERENT | HIP_COHERENT | HIP_NUMA_USER | HIP_UNCACHED |
+                            WRITE_COMBINED | MAPPED | PORTABLE);        // <- overwrites the READ_ONLY default
+      }
+      status = iree_hal_streaming_memory_register_host(context, ptr, size, flags_00, &buffer);
+
+## What that means for the #315 trigger specifically
+
+The forcer `~/wt/evictonly.hip` registers with **`hipHostRegisterDefault`, i.e. `flags = 0`**:
+
+    flags_00 = 0 | READ_ONLY = 0x8   ->  then (flags & 8) == 0 is TRUE, so overwritten by  0 & (...) = 0
+
+so it passes **`FLAG_DEFAULT` = 0 — neither `HIP_COHERENT` (1<<30) nor `HIP_NON_COHERENT` (1<<31) set.**
+**The registration is coherence-unspecified**, and `iree_hal_streaming_memory_host_flags` (decompiled OK)
+likewise *initialises* `*out_flags = FLAG_DEFAULT` before overwriting it from the buffer.
+
+**So the behaviour of registered host memory under the #315 trigger is decided by what
+`iree_hal_streaming_memory_register_host` does with an unspecified coherence flag — and that function is
+ABSENT from the dump** (no JSON, not among the failures either, so it was never captured).
+
+That is now the single most valuable missing function in the dump, ahead of
+`hrx_allocator_virtual_memory_map`: the trigger registers with flags = 0, so *its own memory's coherence is
+whatever that function's default is*. If it defaults to **non-coherent**, the eviction churn in the trigger is
+operating on non-coherent registered memory — which is exactly the scenario the record's coherence hypotheses
+were reaching for — and the earlier "coherence does not matter" reading would be wrong for a second,
+independent reason.
+
+## Corrected standing of the coherence family
+
+- **Closed:** the **pool** path cannot be influenced by a coherence bit (the falsification; the fix I had
+  prepared is a no-op).
+- **Open:** the **register/import** path distinguishes coherence explicitly, the trigger registers with the
+  flag *unset*, and the deciding function is not in the dump. So the family is **not** closed — it is closed
+  *for the buffer I had proposed to patch* and open *for the path the trigger actually uses*.
+
+**Nothing here is a mechanism claim.** It is a precise statement of which path is decided, which is not, and
+which one function would decide the rest.

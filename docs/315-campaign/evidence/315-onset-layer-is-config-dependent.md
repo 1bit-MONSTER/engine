@@ -148,3 +148,67 @@ uniquely-hashed, partial reading:
 
 What remains unresolved is only **which** of the two differing variables (selector, probes) produces it —
 which is what `315cfg` is running now.
+
+---
+
+## Second correction: it is an onset *distribution* that differs, not a fixed config property
+
+Two further results, one of which withdraws the title's framing.
+
+### 1. The `tail:16` window DOES reach layer 0 — so the layer-41 onset is not a coverage artifact
+
+In `315nan-p12l`, **one call** (`158937`) prints:
+
+    call=158937 name=norm-0       op=RMS_NORM nan=55  of 20480
+    call=158937 name=ffn_norm-0   op=MUL      nan=57  of 20480
+    call=158937 name=ffn_gate-0   op=MUL_MAT  nan=1312 of 102400
+    call=158937 name=ffn_up-0     op=MUL_MAT  nan=166 of 102400
+    call=158937 name=ffn_swiglu-0 op=GLU      nan=204 of 102400
+    call=158937 name=q_nope-1     op=VIEW     nan=66  of 51136
+
+A single window spanning layer 0's **MoE block and** layer 1's attention proves the window covers the
+layer-0→1 boundary. `node_30 op=FLASH_ATTN_EXT` also prints in this arm, so early attention nodes are watched
+too. **The window reaches layer 0.** Therefore the absence of layer-0 NaN in the other 18 arms means layer 0
+was genuinely clean there, and the layer-41 onset in that configuration is **not** a window artifact. That
+part of the earlier concern is resolved.
+
+### 2. But the same configuration produces BOTH onsets, so "layer 41" is not a config property either
+
+`315nan-p12l` is a **`tail:16` + probes** arm — the same configuration as the 18 late-onset arms — and its
+onset is layer 0/1 with *tiny* counts (`norm-0 nan=55`, `ffn_norm-0 nan=57`). So within one configuration:
+
+| onset | arms |
+|---|---|
+| layer 41, `nan=2048` exactly | 18 of 19 |
+| layer 0/1, `nan=55`–`204` | 1 of 19 (`p12l`) |
+
+and in the name-list config:
+
+| onset | arms |
+|---|---|
+| layer 0, `nan=1790`–`1984` | 3 of 3 |
+
+**The correct statement is therefore a difference of onset *distribution*, not a fixed property of either
+configuration**: the probe-heavy config put 18 of 19 onsets at layer 41 and 1 at layer 0/1; the name-list
+config put 3 of 3 at layer 0. Both configs can produce an early onset; they differ in how often.
+
+This is the third time this document has been revised, and the sequence is worth stating plainly because it is
+the honest record: first "the site is layer 41", then "the onset is config-dependent", now "the onset is a
+distribution that differs between configs". Each step was forced by data the previous one had not used
+(the `l_out-0` uniqueness check, then the single-call coverage proof, then `p12l`'s counts).
+
+**What survives all three revisions, and is the solid result:**
+
+- The size invariant `nan=2048` exactly, in 18 of 19 arms, across nine sequence lengths, at a uniquely-hashed
+  node whose two counts partition the extent — i.e. a complete read of exactly one row.
+- `node_2948` = layer 41's unnamed post-attention residual ADD (`71×41+37`; 71 nodes/layer, one unnamed ADD
+  at +37 and one unnamed `FLASH_ATTN_EXT` at +3 per layer, 47 each).
+- `1984 = 2048 − 64` recurs in **both** configurations (`l_out-41` in the probe arms, `l_out-0` in the
+  name-list arms) — a shared constant across an otherwise different presentation, and the most promising
+  thread left.
+
+**What does not survive:** any claim that the site is layer 41 *for the defect*. It is the site *most often
+observed* under the probe-heavy configuration.
+
+`315cfg` (running) tests the probes as a cause with the selector held fixed, and its readout table already
+includes the branch that withdraws this document's framing.

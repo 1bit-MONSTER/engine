@@ -81,3 +81,35 @@ existing `[hrx-buf]`/`build` traces plus `hrx_buffer_get_device_ptr` can supply 
 **Nothing here names the mechanism.** It establishes where correctness comes from, why the trigger is a
 pressure generator rather than a data path, and which single measurement separates the remaining three
 readings — and it retires "missing invalidate" as a *variable*, since there is no invalidate to be missing.
+
+### The separating measurement needs a NEW instrument — the archive cannot supply it
+
+Checked, rather than assumed, and the answer is negative:
+
+| trace | fields recorded | address? |
+|---|---|---|
+| `[hrx-buf]` | `type host_visible direct_host_binding memory_type size` | **no** |
+| `[hrx-tensor-fp]` | `call name op bytes nan of ne0 first row hash` | **no** |
+| `host_ptr=` (329,104 occurrences) | the **copy probe's** download destination | not a buffer base |
+
+So **no arm on the record records a buffer base address or a tensor's offset within its buffer**, and the
+"corruption start versus the allocation base" comparison cannot be performed retrospectively. It needs a small
+new instrument, and the requirement is specific:
+
+> print, once per allocation, the **buffer base address** (or the `hrx_buffer_get_device_ptr` result), and for
+> each fingerprinted tensor its **offset within that buffer** — then the corruption's start can be expressed
+> relative to the base rather than to the tensor, which is the only form in which the three readings differ.
+
+That is diagnostic-only, and it is the smallest addition that would separate a platform cache/coherency granule
+(aligns to the physical base, moves when the base moves) from a wave64 (aligns to the tensor's row/wave index,
+invariant to the base).
+
+**Consequence for sequencing:** the two cheap separators I have left both need hardware. The **wave mask**
+(already built, in `315fp-build`) decides region-vs-lane in one run; the **base-offset instrument** decides
+cache-granule-vs-wave64 in one run after that. Neither can be replaced by more archive mining — the record has
+been mined to the point where the *absence* of an address in it is now the finding.
+
+**And there is no third reading to add.** The three candidates are pinned by measurement: wave64 (granularity
+matches, no mechanism support), MoE-table block (contradicted by the family split), and platform cache granule
+(implied by the structure, untested). A fourth would need a fourth discriminator, and none is available
+without a run.

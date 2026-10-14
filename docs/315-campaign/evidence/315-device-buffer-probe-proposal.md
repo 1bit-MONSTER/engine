@@ -97,3 +97,54 @@ nothing, the run is INVALID and the selector — not the conclusion — is revis
 It separates the two families the goal names and the engine cannot distinguish — *"the device wrote these
 bytes"* versus *"a restore left a pre-eviction copy" / "nothing wrote them"* — **at the tensor the positional
 evidence points at**, rather than at the logits region the host-only probe is confined to.
+
+---
+
+## Correction to this proposal's own size estimate: the change is NOT "drop one clause"
+
+Written after reading `producer_probe_fill` and `producer_probe_scan` in full, and it invalidates the estimate
+above. Both functions touch the tensor **through a raw pointer**:
+
+    producer_probe_fill:   uint32_t * words = static_cast<uint32_t *>(node->data);
+                           for (size_t w = 0; w < n; ++w) words[w] = kProbeSentinel;
+    producer_probe_scan:   const float * fp = static_cast<const float *>(node->data);
+                           ... std::memcpy(&bits, &fp[w], sizeof(bits)); ...
+
+`node->data` is a **host** address for a host buffer and is **not CPU-addressable** for a device (HRX0)
+buffer. So on a device tensor the existing fill would dereference a device pointer from the CPU, and the
+existing scan would read unmapped memory. Dropping the `is_host` clause alone would therefore not produce a
+device probe — it would produce a crash or garbage, which is worse than an INVALID result because it can look
+like a hit.
+
+The real change is:
+
+1. `producer_probe_target` — accept non-host tensors when `GGML_HRX_PRODUCER_DEVICE` is set, and use an exact
+   row-multiple selector `bytes % 8192u == 0 && bytes >= 8192u` (an integer number of `n_embd`-wide rows,
+   which needs no knowledge of `T` — cleaner than the ±1 % band proposed above and equivalent to it for
+   integer `T`);
+2. `producer_probe_fill` — for a device target, fill a **host staging buffer** once with the finite pattern and
+   upload it with `ggml_backend_tensor_set(node, staging, 0, bytes)`; keep the raw-pointer path only for host
+   targets;
+3. `producer_probe_scan` — for a device target, download via `ggml_backend_tensor_get(node, staging, 0, bytes)`
+   after the drained stream and classify the staging buffer; keep the raw path for host targets;
+4. one `kProbeFinite = 0xDEADBEEFu` constant and a branch choosing it over `kProbeSentinel` in device mode.
+
+That is ~40 lines through three functions, not a clause. The estimate above is withdrawn; the design,
+selector, five verdict branches, and confounds all stand.
+
+**This also sharpens why the proposal is a proposal.** The host-only probe's raw-pointer access is not an
+oversight to be patched lightly — it is the reason the instrument is cheap and safe, and a device variant
+trades that for a staging copy per hooked graph, i.e. exactly the kind of perturbation the record already
+flags as an inducer.
+
+### Patch anchors, verified against the file (not from memory)
+
+    runtime/graph-executor.cpp:46-54   bool producer_probe_target(...)  with the is_host clause at :48
+    runtime/graph-executor.cpp:80-96   size_t producer_probe_fill(...)  raw write at :86-87
+    runtime/graph-executor.cpp:99-132  void producer_probe_scan(...)    raw read at :113-114
+
+Each anchor is an exact string, so a patch script in the style of `tools/patch-*.py` (assert each anchor
+occurs exactly once, so a silent no-op is impossible) can apply it when a build is next possible. The build is
+deliberately **not** attempted here: compiling raises `load1` and the `foreign` count, which are two of the
+three conditions the queued `315prod` run is waiting on, and would contend with the foreign decompilation the
+box is already carrying.

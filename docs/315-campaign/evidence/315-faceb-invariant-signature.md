@@ -47,14 +47,38 @@ Read from `315-disc.sh:139-148`:
   correct for the rig's purposes but means a `FAULT` verdict alone is not evidence of a *content* failure. The
   content evidence is `http=1 s500=1 unparsed=2`.
 
-## A discrepancy with the objective's wording, recorded not resolved
+## The `utf8=0` question, RESOLVED: the two detectors measure the same event differently
 
-The objective describes Face B as *"invalid-UTF-8 output surfacing as HTTP 500 parse failures"*. In every
-Face-B arm the detector's own field is **`utf8=0`** and `parse=0`: the recorded failure is the **HTTP-500 /
-unparsed** path, and neither the UTF-8 check nor the parse-failure counter fired. Either the invalid bytes are
-caught downstream as an unparsed response before the UTF-8 check sees them, or the field names do not mean what
-the objective assumes. **This is stated as an observation about the detector's semantics, not as a refutation of
-the objective** — resolving it needs the detector's source, which is `~/wt/315-detector.py` on the box.
+The objective describes Face B as *"invalid-UTF-8 output surfacing as HTTP 500 parse failures"*, while every
+Face-B arm in the disc rig shows `utf8=0 parse=0`. Read both detectors and the two are consistent — the fields
+differ because the **measurement path** differs, not the event.
+
+**`315-detector.py`** (the disc rig) separates the two:
+
+    line 59-60   text = raw.decode("utf-8");  rec["utf8_ok"] = True
+    line 95-97   if not rec["utf8_ok"]:  # Face B: body is not valid UTF-8
+                     summary["utf8_failures"] += 1
+    line 99-100  if not rec["json_ok"]:  # body decoded but is not the API JSON
+                     summary["parse_failures"] += 1
+
+so its `utf8_failures` counts bodies that reached the client but failed to decode, and `parse_failures`
+counts bodies that decoded but were not the API's JSON. **Both are 0 in every Face-B arm because the response
+never arrived as a 200 body at all** — the server answered `HTTP 500`, which the detector records as
+`http_failures` instead. `utf8=0` therefore does **not** mean the output was valid UTF-8; it means the invalid
+body was never handed to the decode step.
+
+**`rt-det.sh`** (the original rig) has no such split — it does `json.loads(r.read())` directly, so a non-UTF-8
+body and a non-JSON body both raise out of the same call and are recorded as one failure. That single failure
+is what the objective's phrase describes.
+
+**Reconciled:** the recorded Face-B event is *the server producing Content-only (non-JSON) output and answering
+HTTP 500* — which matches the record's own description of the text as *"valid UTF-8 and a mid-essay fragment"*
+and matches `unparsed=2` counting the server's own `unparsed Content-only output` log lines. Whether the bytes
+are also invalid UTF-8 is **not determined by these arms**, because the status code short-circuits the client's
+decode; `rt-det.sh`'s `identical.json` outputs are where that would show up.
+
+This supersedes an earlier draft of this section, which reported the `utf8=0` field as a discrepancy with the
+objective. It is not one: it is a difference in where the failure is caught.
 
 ## Why this matters for the goal
 

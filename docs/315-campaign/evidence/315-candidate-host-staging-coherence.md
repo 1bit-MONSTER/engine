@@ -167,3 +167,62 @@ to discover that.
 way.** That is a strictly better position than the record had — it is a named mechanism with a discriminating
 experiment and an in-scope, forward-only, one-bit fix — but it is **not** yet the named mechanism, and it must
 not be reported as the cause.
+
+---
+
+# PRE-REGISTRATION: the A′/B′ staging-coherence campaign (`315abA` / `315abB`)
+
+Written **before** the run. The design above is a sketch; this fixes the shape, the readout, the stopping
+rule and the confounds, so the result is a test rather than a search.
+
+## Shape
+
+Two conditions, **one binary**, differing in exactly one environment variable:
+
+| condition | `EXTRA_ENV` | tag | rounds |
+|---|---|---|---|
+| **A′** (as shipped) | `GGML_HRX_PRODUCER_PROBE=1 GGML_HRX_PRODUCER_DEVICE=1 GGML_HRX_TENSOR_FP=<15-name l_out list> GGML_HRX_TENSOR_FP_NANONLY=1` | `315abA` | 4 |
+| **B′** (bit added) | the same **plus** `GGML_HRX_STAGING_COHERENT=1` | `315abB` | 4 |
+
+Run **back to back under one lock**, A′ first, so session drift and the box's thermal state are shared rather
+than split across conditions. 4 rounds × 3 cells = **12 arms per condition**, of which **4 are eviction-cell
+arms** — the cell the recorded rate lives in.
+
+The two instruments ride along in both arms: the **producer probe** (device mode, finite sentinel) reports
+whether the device wrote the residual-family tensors, and the **fingerprint** provides the fault-yield
+enabler and the onset readout. Neither is a difference between the conditions.
+
+## Readout, fixed in advance
+
+Primary: **fault count per condition over the eviction-cell arms** (`e`), both faces counted.
+
+| observation | verdict |
+|---|---|
+| B′'s eviction-cell fault rate is materially **lower** than A′'s | the mechanism is **live** — coherence on this allocation matters, and the fix direction is confirmed |
+| B′ and A′ fault at **similar** rates, with ≥3 eviction-cell faults total | the candidate is **dead**; the achieved mapping was already coherent, and this line is closed |
+| ≤1 eviction-cell fault in **both** conditions | **INVALID / under-powered** — reported as such, never as "no difference" |
+| a condition produces **no Face-A arm at all** | that condition contributes nothing to the rate; reported, not read as clean |
+
+Secondary (free, from the same arms): the producer probe's `armed` / `anomaly` lines — `sentinel == n` means the
+device never wrote that tensor, `0 < sentinel < n` partial, `sentinel == 0` fully written.
+
+## Stopping rule
+
+Fixed: run both conditions to completion at 4 rounds each. **No early stopping on a trend**, and no extra
+rounds added after seeing the counts — if the result lands in the under-powered row, the correct response is a
+**new** pre-registration with more rounds, not an extension of this one.
+
+## Confounds, declared before the run
+
+- **Not a rate estimate for acceptance.** 4 eviction arms per condition cannot bound a rate; this is a
+  directional diagnostic, and no criterion-3 claim may be read from it.
+- **The probe perturbs the regime.** Filling live tensors changes downstream values and adds a host⇄device
+  copy per hooked graph; the record already holds that this instrumentation is itself an inducer. So this
+  characterises *the probe's regime*, and a difference between A′ and B′ is a difference **within** that regime.
+- **The box was thermally saturated earlier today** (`thermal_pauses` to 29, `tctl` to 95 °C, `stopped_frac`
+  to 0.82) and ran under foreign decompilation load. Both conditions share that, which is why they are run back
+  to back — but a thermally noisy box widens the interval on any rate, and that is stated rather than adjusted
+  for.
+- **A face may be under-represented.** Face A and Face B have not been observed at equal rates, and Face B has
+  never been measured with a capable instrument; a fault-count comparison that is all-Face-A is reported as
+  such.

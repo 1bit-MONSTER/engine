@@ -303,3 +303,28 @@ coherence knob (wrong buffer).
 
 **The A′/B′ campaign now tests exactly this bit**: adding `HOST_COHERENT` to the staging allocation makes the
 published bytes visible before they are re-uploaded. If B′ reduces the fault rate, the chain holds.
+
+### Amendment, still BEFORE any arm: `GGML_HRX_WRITEBACK_FINGERPRINT=1` added to BOTH conditions
+
+A design risk found while re-reading the publish path, and it would have made the run uninterpretable.
+
+**The risk.** The chain above needs the staging path to be **warm**. The record already measured the deferred
+writeback route as **cold** — *"0 `[hrx-wb-fp]` records with the flag on over a complete 66/66 arm"*. If it is
+cold in the disc-rig configuration too, then `add_host_writeback` is never called, no graph input is ever
+published by this path, and **A′ and B′ cannot differ** — a null result that would say nothing about the
+mechanism while looking like evidence against it.
+
+**The amendment.** Both conditions now also carry `GGML_HRX_WRITEBACK_FINGERPRINT=1` (the instrument the record
+used; inert unless set). It is added to **both** arms, so it remains a non-difference between the conditions,
+and it converts the risk from an assumption into a measurement. This is a diagnostic added to the *existing*
+run; the primary readout, the arm counts, and the stopping rule are unchanged.
+
+**The extra readout, fixed in advance:**
+
+| observation | verdict |
+|---|---|
+| `[hrx-wb-fp]` lines present in the arms | the staging writeback path **was exercised** ⇒ the A′/B′ contrast is meaningful |
+| **no** `[hrx-wb-fp]` line in either condition | the path is **cold in this configuration** ⇒ the chain has no first step here, the A′/B′ null is **structurally expected and uninformative**, and this candidate is dead **for the disc rig** (it would then need a configuration that actually exercises host-staging downloads — the multi-ubatch/split path that #90's message implicates — as a new pre-registration) |
+
+That second row is the important one: it makes the run **self-falsifying**, so a null cannot be mistaken for a
+refutation and cannot be mistaken for support either.

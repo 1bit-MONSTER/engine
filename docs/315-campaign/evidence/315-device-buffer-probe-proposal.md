@@ -232,3 +232,31 @@ the engine pin `e44c9d01a`. The local clone is **shallow** — `522dab4789ce` ha
 #315's remaining faults are a *different* path; if it is a **descendant**, #90 is a **forward-only fix
 candidate** for #315. Settling it needs either a full fetch of the fork or the ancestry via the engine repo's
 submodule, and it is worth doing before any other run.
+
+### SETTLED: PR #90 is already shipped, and NOTHING relevant is ahead of the pin
+
+Both questions are now answered from the fork itself, with a fetch for the pin commit:
+
+    git fetch origin e44c9d01a4d5110cecaf45472a717f46cd1abbf9          # exit 0
+    git merge-base --is-ancestor 522dab4789ce e44c9d01a
+    -> ANCESTOR: PR#90 already in the engine pin
+
+**So the KV-NaN root-cause fix ("graph inputs are never written back to host; non-replay programs wait for
+their input upload") is already in `e44c9d01a`. It is not a fix candidate, and it does not explain a remaining
+fault — #315's residual faults are a different path.** What it does establish, independently of anything this
+session measured, is that the family is real and reachable: a NaN was once root-caused in the host write-back
+path and fixed.
+
+And the reverse question — is any fix available *ahead* of the pin, i.e. is a forward-only pin move possible?
+
+| branch | commits ahead of `e44c9d01a` |
+|---|---|
+| `origin/1bit/hrx-vulkan-patched` | **none** |
+| `origin/main` | **none** |
+| `origin/HEAD` | one, `fee39dd92 opencl: add A8 Q6_K non-MoE dp4a binary kernel (#29057)` — unrelated |
+
+The pin is dated **2026-10-07** and the fork's newest branch is **2026-09-23**, so the engine pin is at the
+tip of the 1-bit line. **Consequence for criterion 2: there is no forward-only pin move that fixes #315, so
+any fix has to be *authored* rather than bumped to.** That also means the objective's forward-only clause is
+satisfiable in principle (a new commit on top of the pin is trivially forward-only) but not by moving to
+something that already exists.

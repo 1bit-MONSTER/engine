@@ -429,3 +429,34 @@ produced. `bash -n` clean.
 This is the third defect caught in the campaign's own scaffolding before it ran (the disjoint instrument trees,
 the wrong-target binary, and now the unguarded launcher), which is the argument for reading a rig before
 trusting it — the record has the same lesson three times over in its defect list.
+
+### Amendment 4: the fault-yield assumption in the pre-registration was wrong, and in the campaign's favour
+
+The pre-registration justifies 4 eviction arms per condition from "the 15-name list faulted in **4 of its 9
+arms**" (`315size`). That was the **pooled** arm yield. The **eviction-cell** yield is what matters, and it is
+much higher:
+
+| config | eviction-cell arms | result |
+|---|---|---|
+| `315lout4` (name list + probes) | round 1 `e`, round 2 `e` | **FAULT `nan=1`**, **FAULT `nan=1`** |
+| `315size` (name list, no probes) | round 1 `e`, round 2 `e` | **FAULT `nan=1`**, **FAULT `nan=1`** |
+| `315inp2` (name list + probes) | round 1 `e`, round 2 `e` | **FAULT `nan=0`**, **FAULT `nan=0`** |
+
+**6 of 6 eviction-cell arms faulted — essentially 100 %**, against the 44 % I had assumed. Quiet-cell arms in
+the same runs were `OK` (5 of 5), so the cell contrast holds.
+
+Two consequences, and one of them is a caution:
+
+- **The campaign is better powered than stated.** At ~100 % yield, 4 eviction arms per condition is ample to
+  show a large difference; the "≤1 fault in both → INVALID" clause is very unlikely to trigger, and the
+  under-powered risk I worried about does not apply.
+- **But a *fix* now has to move ~100 % to ~0 %** to be visible, and any acceptance criterion demanding zero
+  faults has a high bar given this base rate. That is a fact about the defect, not about the campaign, and it
+  is worth stating before the arms land rather than after.
+- **Face B appears in eviction-cell arms too** (`315inp2`'s two are `nan=0`), which is consistent with the
+  earlier finding that Face B is not eviction-specific. So an all-Face-A outcome in this campaign would be a
+  result about the configuration, not proof that Face B is absent.
+
+**Not changed:** the arm counts (4 rounds per condition each), the stopping rule, and the readout, because the
+correction makes the existing shape adequate rather than inadequate. Recorded because a pre-registration whose
+stated justification is wrong should say so, even when the shape it justified still holds.

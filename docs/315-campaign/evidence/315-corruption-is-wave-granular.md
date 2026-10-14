@@ -210,3 +210,40 @@ surprising mask appears.
 **What a mask result does not do:** it does not name the writer, and it does not by itself establish a
 mechanism. It decides one binary question — region or lane pattern — that every previous instrument was blind
 to.
+
+---
+
+# LIMITATION: the front/tail split is dominated by TENSOR FAMILY, so "85% front" must not be pooled
+
+Checked because a position result that aggregates across tensor families can hide a family effect, and it does.
+
+| region shape | tensors it is made of |
+|---|---|
+| **FRONT** (`first = 0`), 227 readings | `ffn_moe_down` **89**, `ffn_moe_weighted` **63**, `ffn_shexp` 21, `norm` 19, `ffn_out` 7, `node_3019` 4 |
+| **TAIL** (covers the end), 30 readings | **`l_out` 13**, `ffn_out` 10, `ffn_moe_weighted` 4, `result_norm` 2, `node_3305` 1 |
+| **INTERIOR**, 9 readings | scattered, no family above 2 |
+
+So the two shapes are **not** the same phenomenon seen at different places — they are **largely different tensors**.
+FRONT is overwhelmingly the **MoE path** (`ffn_moe_down`, `ffn_moe_weighted`); TAIL is the **residual output**
+(`l_out`, `ffn_out`). Per arm the mix varies (e.g. `315fp2-p2l` is 156 front / 0 tail, while `315row-p1c` is
+1 front / 3 tail), so the pooled 85.4% is a weighted average over families that behave differently.
+
+**Consequences, all of which narrow the earlier result:**
+
+- **"The corruption starts at the front" is a statement about the MoE-path tensors** that dominate the pool, not
+  a law about the corruption. The `l_out` family — the one the size invariant was measured on — is
+  **over-represented in the TAIL** group.
+- **The family split is a live alternative to any positional reading**: the two shapes could be one mechanism
+  seen through two different tensors, or two different mechanisms, and **this data cannot tell which**.
+- **A pooled percentage is not the right statistic here.** Any future statement of the position result must be
+  **per tensor family**, with the family's own denominator — which this table now supplies.
+
+**A read-faithfulness caveat that applies to the FRONT group specifically.** `ffn_moe_down` and
+`ffn_moe_weighted` are *intermediate* MoE tensors, and the record already establishes that intermediate reads
+can be unfaithful (arena slot reuse; the aliased `l_out-42 ≡ l_out-44` case). So the FRONT group leans on
+exactly the reads the record distrusts most, while the TAIL group leans on `l_out`, the family with the
+best-validated readings. That is an argument for trusting the TAIL observations more, not less — the reverse of
+what the pooled count suggests.
+
+**Unchanged by this:** the 96.6% 256-byte alignment of `first`, which is computed over the same partial readings
+and is not obviously family-specific — but it should be re-cut per family before being quoted as a headline.

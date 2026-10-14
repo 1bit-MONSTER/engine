@@ -226,3 +226,25 @@ rounds added after seeing the counts — if the result lands in the under-powere
 - **A face may be under-represented.** Face A and Face B have not been observed at equal rates, and Face B has
   never been measured with a capable instrument; a fault-count comparison that is all-Face-A is reported as
   such.
+
+## BUILT and RUNNING (2026-10-14 06:00) — both instruments compile and coexist in one binary
+
+    [ 26%] Building CXX object .../runtime/host-memory.cpp.o
+    [ 26%] Linking CXX shared library ../../../bin/libggml-hrx.so
+    [100%] Built target ggml-hrx
+    === EXIT=0 ===
+    strings bin/libggml-hrx.so.0.18.0 | grep -cE 'GGML_HRX_STAGING_COHERENT|GGML_HRX_PRODUCER_DEVICE'  ->  2
+
+So the A′/B′ toggle **compiles** and the device probe is still in the same artifact, which is what makes a
+single run answer both questions. `host-memory.cpp` backed up at `/tmp/host-memory.cpp.orig`
+(sha256 `cc7efbc4b873fe8d…`) before patching.
+
+**Campaign launched**: `315ab` — A′ (`315abA`) then B′ (`315abB`), 4 rounds each, back to back under one lock,
+behind the gate-aware wrapper that holds no lock and no GTT while waiting. **Still NOT claimed: that either
+condition will fault, or that B′ differs from A′.** The arm verdicts and the producer-probe lines are that
+evidence, and they do not exist yet.
+
+**Running with the probe in both arms is a declared confound, not an oversight**: the probe fills live tensors
+and adds a host⇄device copy per hooked graph, and the record holds that this instrumentation is itself an
+inducer. Both conditions carry it identically, so the A′/B′ contrast is within the probe's regime — but it is
+not the ambient regime, and the pre-registration says so.

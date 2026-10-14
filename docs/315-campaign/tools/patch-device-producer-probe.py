@@ -30,7 +30,9 @@ WHAT IT CHANGES (3 functions, ~40 lines) and why each is needed:
                           row-multiple (bytes % 8192 == 0) so the residual family is chosen without needing T.
   producer_probe_fill     for a device target, upload a finite pattern from a host staging buffer with
                           ggml_backend_tensor_set. The existing raw node->data write is a HOST pointer; on a
-                          device tensor it would write through a device address from the CPU.
+                          device tensor it would write through a device address from the CPU. Also ARMS AT MOST
+                          ONE TENSOR PER GRAPH, because that selector matches essentially every 2048-wide
+                          activation and arming all of them would perturb far beyond the declared confound.
   producer_probe_scan     for a device target, download with ggml_backend_tensor_get after the drained
                           stream and classify the staging buffer. Same reason, on the read side.
 
@@ -83,10 +85,28 @@ A_FILL_NEW = """        const size_t n = ggml_nbytes(node) / sizeof(uint32_t);
             static std::vector<uint32_t> staging;
             staging.assign(n, kProbeFinite);
             ggml_backend_tensor_set(const_cast<ggml_tensor *>(node), staging.data(), 0, ggml_nbytes(node));
-        } else {
+            // ENGINE#315: ARM AT MOST ONE TENSOR PER GRAPH, and log it HERE rather than falling through to
+            // the shared logging block below -- breaking before that block would suppress the `armed` line,
+            // which the pre-registration's INVALID clause depends on. The device selector is "an exact number
+            // of n_embd(2048)-wide rows", i.e. bytes % 8192 == 0, and since bytes = 8192 * T for every
+            // 2048-wide activation it matches essentially ALL of them - several per 9-node chunk, every graph,
+            // thousands of graphs per arm. Filling and re-downloading all of them each time is a far larger
+            // cost and perturbation than the pre-registration declared, and it would make the run characterise
+            // the probe rather than the fault. One tensor per graph keeps it bounded and deterministic
+            // (the first match in node order), which is all the sentinel question needs.
+            if (!armed_logged) {
+                GGML_LOG_WARN("[hrx-producer] armed(device) op=%s name=%s bytes=%zu words=%zu\\n",
+                              ggml_op_name(node->op), node->name, ggml_nbytes(node), n);
+                armed_logged = true;
+            }
+            ++armed;
+            break;
+        }
+        {
             uint32_t * words = static_cast<uint32_t *>(node->data);
             for (size_t w = 0; w < n; ++w) words[w] = kProbeSentinel;
         }
+        // the host path falls through to the shared `armed` logging block below, unchanged
 """
 
 A_SCAN_OLD = """        const float *  fp = static_cast<const float *>(node->data);

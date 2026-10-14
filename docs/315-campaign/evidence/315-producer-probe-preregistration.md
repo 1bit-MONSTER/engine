@@ -92,3 +92,46 @@ wrote" from "the device wrote a wrong value", which is precisely the distinction
     grep -naE "hrx-producer" ~/wt/llama-315probe/ggml/src/ggml-hrx/runtime/graph-executor.cpp
     strings ~/wt/315probe-build/bin/libggml-hrx.so.0.18.0 | grep -E "hrx-producer|PRODUCER_PROBE"
     grep -ah "hrx-producer] anomaly\|hrx-producer] armed" ~/wt/rt-det/*/server.log | wc -l   # = 0
+
+---
+
+## Amendment, written BEFORE the run: the probe alone would probably yield no fault
+
+The run above specifies `GGML_HRX_PRODUCER_PROBE=1` alone, on the reasoning that the probe should not be
+compounded with other instrumentation. Checking the yields before launching shows that would likely waste the
+run:
+
+| config | recorded fault yield |
+|---|---|
+| ambient (no instrumentation) | ~5 %/arm (`docs/315-mechanism.md`; 2/37 in `315-instrumented-arm-hunt.md`) |
+| 15-name `l_out` list (`315size`) | **faulted in 4 of its 9 arms**, all three cells |
+| `tail:16` + probes (`315nan`) | 16/17 — but did **not** reproduce in `315row` |
+
+At 8 rounds there are **8 eviction-cell arms**, so at the ambient rate the expected fault count is ~0.4 and the
+likely outcome is *no faulting arm* → INVALID. The instrument cannot manufacture the fault it is meant to
+classify.
+
+**Amended run**, decided before launching and recorded here rather than after seeing any result:
+
+    BIN=~/wt/315probe-build/bin
+    EXTRA_ENV="GGML_HRX_PRODUCER_PROBE=1 \
+               GGML_HRX_TENSOR_FP=l_out-0,l_out-1,l_out-2,l_out-3,l_out-4,l_out-10,l_out-15,l_out-20,\
+    l_out-25,l_out-30,l_out-35,l_out-40,l_out-45,l_out-46,l_out-47 \
+               GGML_HRX_TENSOR_FP_NANONLY=1"
+    ~/wt/315-disc.sh 8 315prod
+
+The 15-name list is the **fault-yield enabler**, not part of the measurement: the probe's target is chosen by
+size and host-visibility, so it does not depend on the fingerprint at all. Declared plainly because it is a
+confound — the run is therefore *"the name-list regime plus the producer probe"*, not the ambient regime — and
+a positive sentinel result from it is a statement about **that** configuration. If a follow-up at the ambient
+rate is wanted, it needs far more than 8 arms and is a separate pre-registration.
+
+**Nothing else changes**: the six verdict branches, the decisive sentinel/`first_nan` pair, the declared
+confounds, and the INVALID clauses all stand as written above.
+
+### One more thing to check at readout, present in the design
+
+Because the probe hooks **only graphs containing a host-visible tensor**, and `hrx-producer`'s own comment
+records that HRX executes the llama graph as ~9-node chunks, the probe will report on the logits chunk and not
+on the layer chunks. So a positive result localises the *logits region*, and says nothing directly about
+`node_2948`'s buffer — stated here so the result is not over-read.

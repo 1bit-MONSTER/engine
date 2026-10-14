@@ -134,3 +134,45 @@ them — which is exactly why the count-based reading went as far as it did and 
 establish a cause, and no instrument on the record observes the write. Sampling remains 266 partial readings
 from a handful of arms in one (`tail:16`) configuration, whose onset site this session showed to be
 instrument-relative — though the *shape* result does not depend on where the onset lands.
+
+---
+
+# SECOND CORRECTION: contiguity was never measured — `nan` is a count and `first` is an index
+
+The section above states that "the NaN is a single contiguous run from `first`" on the evidence that
+`first + nan ≤ extent` in 266 of 266 readings. **That evidence does not support that claim and the claim is
+withdrawn.**
+
+`first + nan ≤ extent` is an arithmetic identity that any reading satisfies whenever the NaNs fit in the space
+after the first one — contiguous or scattered. It is satisfied by a single run, by two runs, by every other
+element, and by a run at the end plus one at the start. **The fingerprint reports exactly two numbers, `first`
+(the index of the first NaN) and `nan` (how many there are); it never measures whether they are adjacent.** So
+"one contiguous run" was an assumption dressed as a measurement, in a document whose whole point was to avoid
+that — and it is the same failure mode as the raw row-index census earlier in this session (a count used to
+support a positional claim).
+
+## What is actually measured
+
+| property | status |
+|---|---|
+| the **first** NaN is at element 0 (`first = 0`) | **measured**: 227 of 266 = 85.4% ⇒ the corruption *includes* the front of the buffer |
+| the NaN **count** is 256-byte aligned | **measured**: 157 of 266 = 59.0% |
+| the first NaN is at a 256-byte boundary | **measured**: 257 of 266 = 96.6% |
+| the NaNs form one contiguous run | **NOT measured — withdrawn** |
+| a "clean tail" or a "clean wave beside a wrong one" | **NOT measured** — both presuppose contiguity |
+
+So the two shapes the last section offered as alternatives — *prefix of whole waves with a clean tail* versus
+*waves interleaved with clean waves* — **cannot be separated from this data at all**, and neither can be
+asserted. What survives is narrower and still useful: **the corruption always reaches down to the front of the
+buffer (85%), and its boundaries/counts fall on 256-byte lines far more often than chance.**
+
+## The consequence for the next instrument
+
+The per-element dump was named as the discriminator between the two readings. It is now not merely *a* way to
+choose between them — it is **the only way**, because the count-based instrument is structurally blind to the
+distinction. Any run that wants to settle whether the corruption is a region or a lane pattern must dump a row
+**element by element** (or report per-wave NaN presence), not a total.
+
+That also means: **not one of the 266 readings on the record can distinguish a region from a lane pattern**, and
+no amount of further counting will. The instrument to add is a per-wave (32-bit mask across the row's 32 waves)
+or per-element dump — small, diagnostic-only, and in scope.

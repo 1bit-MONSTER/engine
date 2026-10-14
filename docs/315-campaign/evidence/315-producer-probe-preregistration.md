@@ -203,3 +203,38 @@ not still the fill", and says nothing about what the NaNs are.
 
 That is why the queued run is worth its box time: it is not a re-measurement of anything already on the
 record, it is the first measurement of a quantity the record has never had.
+
+### Sharpened: the probe can only ever arm the LOGITS region, so it cannot answer the layer-residual question
+
+Written while the run waits, because a positional finding landed in the meantime and the two must not be
+conflated. `producer_probe_target` requires **both** `ggml_backend_buffer_is_host(t->buffer)` **and** a size in
+**256 KiB … 8 MiB**. Checking that against the recorded buffer inventory:
+
+| buffer | size | host-visible | in the band? |
+|---|---|---|---|
+| logits region (`HRX0_HOST`, `memory_type=0x52`) | **619,520 B** | yes | **yes** — the only such tensor |
+| the host-visible arena itself | 44,048,640 B | yes | no (above 8 MiB) |
+| device weights / activations (`HRX0`) | — | **no** (`hrx-producer` prints `host=0` for the layer nodes: `q-0`, `norm-0`, `q_nope-0`, …) | no, never host-visible |
+
+So the probe's selectivity makes it **the logits region, always** — not a choice, a consequence of the
+predicate. The two measurements say different things and neither substitutes for the other:
+
+- **`315prod`** will answer: *was the **logits** region written by the device, and if it holds NaNs, what is
+  their payload?* A surviving payload ⇒ the sampler reads memory the device never wrote; a quiet NaN ⇒ the
+  head computed NaN from an upstream NaN.
+- **`315-one-row-at-the-front-of-the-buffer.md`** is about a **layer 41 residual row** — a device-side tensor
+  that this probe can never arm. Answering *that* question would need the probe extended to non-host buffers,
+  which means filling and reading device memory, i.e. a different instrument and a new pre-registration.
+
+Consequently this run **cannot** confirm or refute the front-of-buffer finding, and a null or positive result
+from it must not be reported as if it did. What it can do is separate "the last stage reads unwritten memory"
+from "the last stage computed a NaN", which is precisely the dichotomy the record's original coherence
+hypothesis lives in.
+
+### Also new, and the reason the sentinel half is not merely a re-measurement
+
+`GGML_HRX_SENTINEL` (already on record: 20 of 21 arms armed, all 17 fault lines `sentinel=0`) fills **once** and
+reports a **match count** at the sampler's guard. This probe fills **before every hooked graph** and classifies
+**after a drained stream**, and reports **the NaN's bits**. So it adds per-graph granularity and the payload —
+the two things the existing result cannot supply — and a disagreement between the two instruments would itself
+be informative rather than an error.

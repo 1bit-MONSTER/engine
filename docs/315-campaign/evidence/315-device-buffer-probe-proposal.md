@@ -174,3 +174,61 @@ so on every run. Confirming that needs a build, which is deliberately deferred b
 `load1` and the `foreign` count — two of the three conditions the queued `315prod` run is waiting on — and
 would contend with the foreign decompilation already on the box. So the instrument is *ready to build*, not
 *working*.
+
+---
+
+## BUILT and RUNNING (2026-10-14 05:52) — the compile caveat is now resolved
+
+The patch was applied to the real tree and **the build succeeded**:
+
+    patched ggml/src/ggml-hrx/runtime/graph-executor.cpp      (anchor-verified, braces 52/52)
+    [ 26%] Building CXX object .../runtime/graph-executor.cpp.o
+    [ 26%] Linking CXX shared library ../../../bin/libggml-hrx.so
+    [100%] Built target ggml-hrx
+    === EXIT=0 ===
+
+so the earlier "**compile NOT claimed**" caveat is now discharged for *compilation*. Verified in the artefact
+rather than inferred from the build's exit code: `bin/libggml-hrx.so.0.18.0` (05:52) contains **both**
+`GGML_HRX_PRODUCER_PROBE` and `GGML_HRX_PRODUCER_DEVICE`, and `graph-executor.cpp.o` carries the same
+timestamp. Source backed up before patching (`/tmp/graph-executor.cpp.orig`, sha256
+`cba0419f55e748ed…`).
+
+**Run launched**: `315dev` — `GGML_HRX_PRODUCER_PROBE=1 GGML_HRX_PRODUCER_DEVICE=1` plus the 15-name
+`l_out` fault-yield enabler, 8 rounds, behind the same gate-aware wrapper (`315dev-wait.sh`) that holds no
+lock and no GTT while waiting. **Still NOT claimed: that it arms anything at run time.** The runtime
+`armed`/`anomaly` lines are the evidence for that, and they do not exist yet.
+
+## The sibling fix another agent landed, which is the closest thing on the record to this family
+
+While checking the build, a pin-bump commit on the fork (`fb24c1f`, Oct 5) turned out to describe a
+**root-caused NaN fix in exactly the family this proposal is about**:
+
+    Bump HRX: llama.cpp 522dab4789ce (long-prompt fix), hrx-system to our fork 98d05d94a9f9
+      third_party/llama.cpp e57beb9721af -> 522dab4789ce (fork #89 runtime overhead,
+      #90: graph inputs never written back to host - every multi-ubatch prompt was wrong since #82 -
+      and the non-replay upload race).
+      third_party/hrx-system -> our fork ... plus the GFX11 wave64 lane-mask drain backport (#313 NaN)
+
+and the fork's merge itself reads:
+
+    522dab478 Merge pull request #90 from 1bit-MONSTER/1bit/kv-nan-rootcause
+    ggml-hrx: graph inputs are never written back to host; non-replay programs wait for their input upload
+
+**That is "the consumer reads memory the device never wrote", already root-caused and fixed once.** Two
+consequences for #315:
+
+- **It is evidence the family is real and reachable**, independent of anything this session measured: a KV-NaN
+  root cause was found in the host write-back path and fixed at `522dab4789ce`.
+- **The engine pin's tree already contains a `PendingHostWriteback` path** whose final step is
+  `std::memcpy(writeback.host_destination, writeback.mapped_source, writeback.size)` — a **device mapping**
+  copied into a **host destination** (`runtime/command-program-executor.cpp`). That is the exact line where
+  "the device wrote these bytes" and "the mapping still holds something else" are decided, and it is in the pin
+  this #315 work runs on.
+
+**What I have NOT established, and it decides whether #90 is a fix or already-shipped:** `522dab4789ce` versus
+the engine pin `e44c9d01a`. The local clone is **shallow** — `522dab4789ce` has no parents in it
+(`git rev-list --parents -n1` returns the commit alone) and `e44c9d01a` is absent — so `git merge-base
+--is-ancestor` cannot run. If `522dab4789ce` is an **ancestor** of the engine pin, #90 is already shipped and
+#315's remaining faults are a *different* path; if it is a **descendant**, #90 is a **forward-only fix
+candidate** for #315. Settling it needs either a full fetch of the fork or the ancestry via the engine repo's
+submodule, and it is worth doing before any other run.

@@ -191,3 +191,41 @@ So: `register_host` first, then `virtual_memory_map` / `_protect` / `_unmap`, th
 **Also useful if it is cheap:** `flags` values for `hipHostRegister` as the HIP headers define them
 (`Portable = 0x1`, `Mapped = 0x2`, `IoMemory = 0x4`, `ReadOnly = 0x8`), so the `(flags & 8)` branch in the
 decompiled function can be confirmed against the header rather than inferred from the constants above.
+
+### 06:40 — ROOT CAUSE of your dump's gaps, and the fix: build the queue from DWARF, not from `.dynsym`
+
+Followed the missing `register_host` to the end, and the cause is not the decompiler.
+
+**Your queue holds exported symbols only.** `pipeline/queue-hip.tsv` is **481** `<so> <address> <name> <weight>`
+rows, which is what an exported-symbol enumeration produces. The functions #315 needs are **internal**:
+
+    nm -D --defined-only libamdhip64.so.7.9999.0 | grep -E 'register_host|owned_host_import|allocate_host_staging'
+    -> empty
+
+and: `iree_hal_streaming_memory_register_host`, `..._allocate_owned_host_import_with_context_mode`,
+`..._allocate_host_staging` each appear **twice** as strings in `libamdhip64.so.7.9999.0` and are **not** in
+your queue; `hrx_allocator_virtual_memory_map` appears **3×** in `libhrx.so.0.1.0` and is likewise not queued.
+
+So **the hard functions were never attempted**, which is different from the 103 that were queued and failed
+with `rc=1` — two defects, two fixes. Retry-with-different-settings for the queued-and-failed;
+**add-to-the-queue for the never-attempted.**
+
+**The fix is available: the binaries carry DWARF.**
+
+    readelf -S libhrx.so.0.1.0          -> no .symtab, but .debug_info .debug_str .debug_abbrev
+                                           .debug_loclists .debug_rnglists
+    readelf -S libamdhip64.so.7.9999.0  -> DWARF likewise
+    strings libhrx.so.0.1.0 | grep -cE '^(iree|hrx)_[a-z_]+$'   -> 11078 plausible C symbol names
+
+So build the queue from `.debug_info` (`readelf --debug-dump=info`, `objdump --dwarf=info`, or pyelftools)
+instead of `.dynsym`, and every internal function becomes name+address addressable — all 44 libhrx priority
+targets plus these three. **Fallback if DWARF-derived addresses are not usable directly:** the call-site route
+— the in-tree `hipHostRegister` (which you decompiled successfully) calls
+`iree_hal_streaming_memory_register_host`, so its address falls out of that call instruction, and likewise for
+the others from their callers.
+
+**What it buys #315:** `iree_hal_streaming_memory_register_host` alone decides whether a default
+`hipHostRegister` yields coherent or non-coherent memory — and `flags = 0` is exactly what the #315 trigger
+passes. Nothing here is a mechanism claim; it is the one change that makes the question answerable.
+
+Detail: `docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.

@@ -449,3 +449,106 @@ recorded.
 
 The controlled confirmation of the `gtt_start` boundary (cell fixed, start stepped 97/98/99) is
 pre-registered at `docs/315-campaign/evidence/315-gttstep-preregistration.md`, not yet run.
+
+---
+
+## UPDATE 2026-10-14 — the site is instrument-relative, the size is not, and Face B was never measurable
+
+Session evidence: `docs/315-campaign/evidence/315-instrument-independent-summary.md` and the nine documents it
+cites; all read from the archived arm logs at pin `e44c9d01a`, no new arms. Nothing above is edited.
+
+### The condition is named (as UPDATE 2026-10-13 says) but the SITE is not a property of the defect
+
+Three configurations already on the record separate the two candidate variables:
+
+| condition | selector | probes | first NaN at |
+|---|---|---|---|
+| A — `315size` | 15-name `l_out` list | none | **layer 0** |
+| B — `315lout4`, `315inp2` | `l_out` name list | `COPY_PROBE`+`SENTINEL`+`LOGITS_FP` | **layer 0** |
+| C — `315nan`, `315fbar` | **`tail:16`** | same probes | **layer 41** |
+
+A vs B varies the probes and the onset does **not** move; B vs C varies the selector and it **does**
+(0 → 41). So the **read pattern** sets the onset, and `hrx-producer` shows `graph n_nodes=9`, making
+`tail:16` read **every** node of a subgraph (~9 per chunk) against ~1–3 for a name list. That also explains
+why `tail:16`'s recorded 16/17 yield did not reproduce: reading every node is a different regime, not a
+failed replication. **Consequence for this entry: a fix aimed at a layer is unsound, because the layer moves
+with the instrument.** Any "the corruption is at layer N" statement in this entry or its evidence is
+instrument-relative unless the read pattern is fixed.
+
+### What survives across the instruments: one hidden-state row, at the front of the buffer
+
+- **Size.** At the first corrupted tensor the count is one `n_embd`-wide row: `2048` floats = **8,192 bytes**,
+  or `1984` = **7,936 bytes** = one row minus one 256-byte alignment block. Five of seven non-saturated onset
+  readings fall in 7,936–8,192 B across three configurations. `nan = 2048` *exactly* in 18 of 19 arms is a
+  property of condition C, not of the defect.
+- **The count is a complete read, not a truncation.** In all four arms where the `hrx-finite-fp` channel
+  printed, `finite + nan` equalled the tensor extent **exactly** (77,824+2,048=79,872; 350,208+2,048=352,256;
+  710,656+2,048=712,704).
+- **Position: row 0 or 1.** In the unbiased subset — readings where `nan` is *exactly* one row, so the
+  reported row is the true position and not the first of several — **12 readings across 4 arms are all at
+  row 0 or 1** (`row/T` ≤ 0.003), at `T = 39, 172, 348`, and **never the last token (0 of 12)**. Across all
+  1,525 multi-token readings the corrupted extent is **median 348 rows**, so one row is the onset and the
+  rest is causally-masked propagation to the full head.
+- **The `l_out-N` per-layer read is not a per-layer measurement.** `l_out-42 ≡ l_out-44` and
+  `l_out-43 ≡ l_out-45` return byte-identical, 25 %-NaN content in the `315fbar` cold cell — aliased reads
+  from arena slot reuse. Scope: sound only for **unsaturated** reads; the stride-3 family in `315lout4` is
+  fully saturated and is **not** evidence. The unnamed `node_NNNN` reads do not alias (only
+  `node_3304 ≡ node_3305`), so **two readings with the same hash are one reading**.
+
+### Face B has never been recorded with an instrument that can see it
+
+- **No arm on the record carries both a fingerprint and Face-B evidence.** The fingerprint's only gate is
+  `if (fp_nan_only && nan == 0) continue;`, so an arm with fingerprint lines has NaN and an arm with Face B
+  has none — the two faces are **mutually exclusive in the instrument's output** under `NANONLY`. Every
+  Face-B statement in this entry therefore rests on arm-level verdicts, with no tensor-level measurement
+  behind it.
+- **Its signature is otherwise invariant**: `nan=0 http=1 s500=1 unparsed=2` in all 15 Face-B arms, in **all
+  three cells including the quiet cell** (`side=0/0`, three runs) and even one out-of-regime arm — so Face B
+  is not eviction-specific either. Counting subtleties: `unparsed=2` is a *log-line* count for one event,
+  `http=1 s500=1` is the same failure counted twice, and `req < 66` alone forces `FAULT`, so a `FAULT` verdict
+  is not by itself content evidence.
+- **Invalid UTF-8 has never been observed.** Of 3,200 request records and 267 greedy-output files, **zero**
+  bodies are invalid UTF-8. The three apparent cases are 32-byte *excerpt* truncations (`utf8_ok = True` and
+  `json_ok = True` on the full bodies); the 34 `utf8_ok = False` records are transport failures with no body.
+  The recorded Face B is **Content-only / non-JSON output answered with HTTP 500**. A "third manifestation"
+  hypothesis (wrong but well-formed output at HTTP 200) was tested and **withdrawn** — clean quiet-cell arms
+  reach the same maximum repetition ratio.
+
+### Two harness defects found and one fixed
+
+- **The acceptance harness could not attribute Face B** — and it failed twice over: its condition was
+  `parse > 0 or utf8 > 0`, which are **0 in every Face-B arm**, and `315-paired.sh` computed
+  `http`/`transport`/`s500`/`unparsed` and used them in its **verdict** but never **printed** them. Both fixed
+  in `docs/315-campaign/315-campaign.sh` and `315-paired.sh`, verified end-to-end on both branches (a real
+  Face-B signature now attributes; an all-zero fault still does not). **Any future campaign must detect
+  Content-only/HTTP 500 — a UTF-8-validity check would never fire and would pass a faulting arm as clean.**
+- **The "rule of three" bound prints probabilities above 100 %** for `n < 3` (`300 %` at n=1). Correct at the
+  criterion's n=60 (5 %), so the intended reading is unaffected; not changed, because deciding what an
+  under-powered campaign should say is a criterion question.
+
+### An instrument that has never been enabled, and one that cannot reach the site
+
+- **`GGML_HRX_PRODUCER_PROBE`** fills a host-visible region with its own payload `0x7FC0DEAD` **before** each
+  hooked graph and classifies **after a drained stream**, reporting `sentinel`/`nan`/`finite` and the NaN's
+  **bit pattern**. The archive contains **zero** `[hrx-producer] armed` and **zero** `[hrx-producer] anomaly`
+  lines — it has never once been enabled — and **no arm has ever logged a NaN payload** (the only 8-hex
+  patterns in the logs are copy-probe `host_ptr=` addresses). Pre-registered as `315prod`; queued.
+- **It cannot reach the site this entry now points at.** Its predicate (`is_host` **and** 256 KiB–8 MiB)
+  admits exactly one tensor, the **logits** region; layer residuals print `host=0` and can never be armed. A
+  **device-buffer** variant is proposed, pre-registered, and its patch written and anchor-verified against a
+  real source copy (two defects caught in review; **compile NOT claimed**) at
+  `docs/315-campaign/evidence/315-device-buffer-probe-proposal.md` and
+  `docs/315-campaign/tools/patch-device-producer-probe.py`.
+
+### On the fix — unchanged conclusion, one new reason
+
+**No forward-only fix is landable**, as above, and now for an additional reason independent of the
+content-validity gap: the site is instrument-relative, so a change aimed at "layer 41" would be aimed at a
+read artifact. The instrument-independent fact available to a fix is the **size** (approximately one
+hidden-state row, 7,936–8,192 B) and the position (front of the buffer) — both of which describe *what* is
+corrupted without saying *what writes it*, since no instrument on the record observes the writing.
+
+**Nothing here retires this entry.** The defect is not gone: Face A's one-row front-of-buffer corruption is
+measured in 18 of 19 arms, and Face B's Content-only/HTTP-500 signature appears in 15 arms including control
+cells. What has changed is that the mechanism cannot be named with the instruments that exist, and the site
+in every earlier reading was an artifact of the instrument that produced it.

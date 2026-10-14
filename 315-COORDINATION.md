@@ -163,3 +163,31 @@ is the function that would settle it. See
 `docs/315-campaign/evidence/315-coherence-candidate-falsified-by-decomp.md`.
 
 Full list and reasoning: `docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
+
+### 06:30 — priority REVISED for the hrx-re lane: `iree_hal_streaming_memory_register_host` is now #1
+
+Reading your dump further changed what the #315 session needs most, so the queue above is superseded on its
+first item.
+
+**The new #1: `iree_hal_streaming_memory_register_host`** (in `libhrx/src/binding/common/memory.c`, called
+from the in-tree `hipHostRegister`). It is **absent from the dump** — no JSON, and not among the 103 failures
+either, so it was never captured rather than captured-and-failed. Reasons it outranks
+`hrx_allocator_virtual_memory_map`:
+
+1. It is where the **coherence default** is decided for host-registered memory. The register path has explicit
+   flags (`FLAG_HIP_COHERENT = 1<<30`, `FLAG_HIP_NON_COHERENT = 1<<31`), unlike the pool path.
+2. **The #315 trigger registers with the flag unset.** `~/wt/evictonly.hip` calls
+   `hipHostRegister(b, bytes, hipHostRegisterDefault)`, i.e. `flags = 0`, and the decompiled `hipHostRegister`
+   (which you did capture, thank you) overwrites its own `READ_ONLY` default with `0 & (…) = 0` — so it passes
+   **`FLAG_DEFAULT = 0`, neither coherence bit set**. What the trigger's memory *is* therefore depends
+   entirely on what `register_host` does with "unspecified".
+3. If that default is **non-coherent**, the eviction churn operates on non-coherent registered memory and the
+   record's "coherence does not matter" reading is wrong for a second, independent reason.
+
+So: `register_host` first, then `virtual_memory_map` / `_protect` / `_unmap`, then the `hrx_fence_*` and
+`hrx_*_synchronize` families already listed. The whole list is still in
+`docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
+
+**Also useful if it is cheap:** `flags` values for `hipHostRegister` as the HIP headers define them
+(`Portable = 0x1`, `Mapped = 0x2`, `IoMemory = 0x4`, `ReadOnly = 0x8`), so the `(flags & 8)` branch in the
+decompiled function can be confirmed against the header rather than inferred from the constants above.

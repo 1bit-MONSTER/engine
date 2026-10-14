@@ -95,3 +95,37 @@ to the layer-41 site — it gives Face B the *instrument* that the layer-41 work
 
     grep -ahE "hrx-finite-fp.*name=node_2948 " ~/wt/rt-det/315fbar-*/server.log
     for d in ~/wt/rt-det/315inp2-r1e* ~/wt/rt-det/315inp2-r2e*; do grep -ac "hrx-tensor-fp" "$d/server.log"; done
+
+---
+
+## Confirmed across the whole archive: no arm has BOTH a fingerprint and Face-B evidence
+
+The claim above was established from the Face-B arms having zero fingerprint lines. Swept over **every arm on
+the record**:
+
+| search | result |
+|---|---|
+| arms with `hrx-tensor-fp` lines **and** Face-B markers | **none** — zero arms |
+| arms with Face-B markers at all | `315ab1a-r2e/r2q/r3e/r4e`, `315ab1b2-r1e/r2e`, `315accept-p10l/p1c`, … |
+
+**Not one arm anywhere carries both.** The reason is structural and now demonstrated rather than argued: the
+fingerprint's only gate is `if (fp_nan_only && nan == 0) continue;`, so an arm with fingerprint lines has NaN,
+and an arm with Face B has no NaN. The two faces are therefore **mutually exclusive in the instrument's
+output** — the campaign's own logging cannot show both, ever, under any configuration that sets `NANONLY`.
+
+This is stronger than "Face B was never observed in this session": it is **"Face B has never been recorded
+alongside any fingerprint, in any arm on this record"**, so the goal's requirement of one mechanism covering
+both faces is **not addressable from existing data at all** — not merely under-supported. Every statement about
+Face B in the campaign has been made from arm-level verdicts (`http=1`, `s500=1`, `unparsed=2`, `utf8=1`) with
+no tensor-level measurement behind it.
+
+The path is unchanged and is the `315faceb` run pre-registered above: the same selector with **`NANONLY`
+absent**, so the `hrx-finite-fp` channel prints `finite=` / `hash_finite=` / `nan=` for every watched node, and
+a Face-B arm's divergence shows up as a `hash_finite` that differs from several agreeing clean arms.
+
+**Reproducing the sweep:**
+
+    for d in ~/wt/rt-det/*/; do
+      fp=$(grep -ac hrx-tensor-fp "$d/server.log"); fb=$(grep -aciE 'invalid utf|Content-only' "$d/server.log")
+      [ "${fp:-0}" -gt 0 ] && [ "${fb:-0}" -gt 0 ] && echo "$d"
+    done

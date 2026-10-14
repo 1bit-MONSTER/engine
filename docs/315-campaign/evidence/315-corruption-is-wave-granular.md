@@ -290,3 +290,27 @@ So the alignment is **family-independent**. That matters in both directions:
 **What remains open, unchanged:** *what* applies 256-byte-aligned damage (a copy/region boundary versus wave64
 lane masking), whether the NaNs are contiguous at all, and the writer. The mask instrument decides the second
 of those and rides in the running campaign.
+
+---
+
+# Narrowing the interpretations of the 256-byte granularity: the copy/region reading is weakened
+
+Three readings were left open for *what* applies 256-byte-aligned damage. One is now weakened by checking the
+runtime rather than by argument:
+
+| reading | status after checking |
+|---|---|
+| **copy / region granularity** — the runtime copies in 256-byte blocks, so a short or sub-range copy lands on those boundaries | **weakened.** No 256-**byte** alignment or granularity constant exists in the copy path: `libhrx/src/binding/common/memory.c` has `staging_threshold = 256 * 1024` (256 **KiB**, a size threshold, nothing to do with 256 bytes), and the HIP copy path adds copy nodes without size rounding. The allocator's own alignment machinery is page-granular (`virtual_memory_protect` etc.), i.e. 4096, not 256 |
+| **one wave64** — 64 lanes × 4 bytes = **256 bytes exactly** | **unaffected**, and relatively favoured by the above: 256 bytes is intrinsic to the hardware's wave width rather than a policy constant someone chose |
+| **a 256-byte data-layout block** — the record's own figure, *"256 the alignment the record gives for the MoE tables"* | **unaffected**, and it has independent support: the FRONT group is dominated by MoE tensors (`ffn_moe_down` 91, `ffn_moe_weighted` 67), i.e. exactly the path that indexes those tables |
+
+**What this does not do:** establish the wave64 reading. Absence of a 256-byte copy constant is weak evidence —
+a granularity can exist without a named constant — and the MoE-table reading is not excluded at all. It narrows
+three candidates to two, which is what a source check can honestly do here.
+
+**It also means the alignments may have more than one cause.** The residual-stream families (`l_out`,
+`node_2948`) and the MoE families (`ffn_moe_down`, `ffn_moe_weighted`) both align at ≥89.5%, and they could
+align for different reasons — a wave-wide write in one case and a table-block boundary in the other. Nothing in
+this data separates those two, and the mask instrument (which reports per-wave NaN presence for one row) is
+**not** a test of the MoE-table reading, because it looks at a tensor, not at a table index. Stated so the mask
+result is not over-read as settling everything.

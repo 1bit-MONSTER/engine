@@ -371,3 +371,33 @@ check the artefact (`strings <lib> | grep <env name>`) rather than the source tr
 is the same class as the record's defect **#13** ("the rig's default BIN build does not implement
 `GGML_HRX_TENSOR_FP` at all, so an `EXTRA_ENV`-driven sweep was silently inert") — the same trap, a second
 time, which is why it is written down rather than just fixed.
+
+### Correction applied and rebuilt: `315fp-build` now carries all FOUR instruments
+
+    [ 26%] Building CXX object .../ggml/src/ggml-hrx/CMakeFiles/ggml-hrx.dir/ggml-hrx.cpp.o
+    [ 26%] Linking CXX shared library ../../../bin/libggml-hrx.so
+    [100%] Built target ggml-hrx            === EXIT=0 ===
+
+    artefact check:  hrx-tensor-fp 1 | GGML_HRX_STAGING_COHERENT 1 |
+                     GGML_HRX_WRITEBACK_FINGERPRINT 1 | GGML_HRX_TENSOR_FP_WAVEMASK 1
+
+So the campaign now runs on a binary holding the **fingerprint** (yield enabler + onset readout), the
+**coherence toggle** (the intervention), the **writeback instrument** (the warmth check) and the **wave mask**
+(region vs lane) — all four verified in the artefact rather than assumed from the build. Rebuilt twice: once
+for the toggle, once to add the wave mask.
+
+**Corrected campaign relaunched** (`315ab`, task `b9b1ee268`): A′ then B′ back to back under one lock, 4 rounds
+each, behind the gate-aware wrapper holding no lock and no GTT. Both arms carry the mask and the writeback
+instrument; **exactly one variable differs** — `GGML_HRX_STAGING_COHERENT`.
+
+It now answers three things in one run:
+
+| question | readout |
+|---|---|
+| does coherence on the staging allocation change the fault rate? | eviction-cell fault counts, A′ vs B′ |
+| was the staging path even exercised? | `[hrx-wb-fp]` line counts per condition |
+| is the corruption a region or a lane pattern? | `[hrx-wavemask]` 32-bit masks |
+
+**Still NOT claimed:** that it compiles *and runs* as intended — the artefact check establishes compilation and
+the presence of the env strings, not that any of the four instruments arms at run time. The verdicts and the
+`hrx-*` lines are that evidence, and they do not exist yet.

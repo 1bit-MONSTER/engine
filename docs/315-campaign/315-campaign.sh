@@ -61,8 +61,26 @@ for line in open(path, errors="replace"):
     tail = m.group(8)
     utf8 = int((re.search(r"utf8=(\d+)", tail) or [0, 0])[1])
     alloc = int((re.search(r"alloc=(\d+)", tail) or [0, 0])[1])
+    # engine#315: the disc rig's arm line carries the fields Face B actually sets; the paired rig's line does
+    # not. Parsed here when present so a disc-rig console summarises correctly, and recorded as absent (None)
+    # otherwise so an unattributed fault is never silently read as "not Face B".
+    def tail_int(name):
+        m2 = re.search(name + r"=(\d+)", tail)
+        return int(m2.group(1)) if m2 else None
+    http  = tail_int("http")
+    s500  = tail_int("s500")
+    unparsed = tail_int("unparsed")
     rows.append(dict(pair=int(m.group(1)), cell=m.group(2), verdict=m.group(3), nan=int(m.group(4)),
-                     req=int(m.group(5)), parse=int(m.group(6)), gtt=int(m.group(7)), utf8=utf8, alloc=alloc))
+                     req=int(m.group(5)), parse=int(m.group(6)), gtt=int(m.group(7)), utf8=utf8, alloc=alloc,
+                     http=http, s500=s500, unparsed=unparsed))
+
+# engine#315: Face B is Content-only / non-JSON output answered with HTTP 500 (the recorded form), or a body
+# that fails the full-body UTF-8 check (the objective's form). Both are tested, per the user's ruling that
+# either manifestation counts. A field must be PRESENT to contribute, so a paired-rig line without these
+# fields cannot manufacture a false Face B.
+def is_face_b(r):
+    return (r["parse"] > 0 or r["utf8"] > 0
+            or (r["http"] or 0) > 0 or (r["s500"] or 0) > 0 or (r["unparsed"] or 0) > 0)
 
 def summarise(cell):
     sel = [r for r in rows if r["cell"] == cell]
@@ -77,15 +95,19 @@ def summarise(cell):
         faces = []
         if r["nan"] > 0:
             faces.append("FaceA(nan=%d)" % r["nan"])
-        if r["parse"] > 0 or r["utf8"] > 0:
-            faces.append("FaceB(parse=%d,utf8=%d)" % (r["parse"], r["utf8"]))
+        if is_face_b(r):
+            faces.append("FaceB(parse=%d,utf8=%d,http=%s,s500=%s,unparsed=%s)"
+                         % (r["parse"], r["utf8"], r["http"], r["s500"], r["unparsed"]))
         if not faces:
+            print("   NOTE: this line carries no http/s500/unparsed field, so Face B's recorded form cannot"
+                  " be tested from it - the paired rig does not emit them. Take the face attribution from a"
+                  " disc-rig console, or add the fields to the paired rig's verdict printer.")
             faces.append("unattributed - FAULT with nan=0 and no parse/utf8 counter; read the server log"
                           " (an HSA_STATUS_ERROR_MEMORY_FAULT is Face A and is not on this line)")
         print(f"   FAULT pair={r['pair']} {' '.join(faces)} req={r['req']} gtt={r['gtt']}G")
     face_a = sum(1 for r in faults if r["nan"] > 0)
-    face_b = sum(1 for r in faults if r["parse"] > 0 or r["utf8"] > 0)
-    unattr = sum(1 for r in faults if r["nan"] == 0 and r["parse"] == 0 and r["utf8"] == 0)
+    face_b = sum(1 for r in faults if is_face_b(r))
+    unattr = sum(1 for r in faults if r["nan"] == 0 and not is_face_b(r))
     if faults:
         print(f"   face tally: FaceA={face_a} FaceB={face_b} unattributed={unattr}"
               f"  (the criterion is zero on BOTH faces; HSA faults are unattributed here by construction)")

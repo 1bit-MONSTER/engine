@@ -248,3 +248,58 @@ evidence, and they do not exist yet.
 and adds a host⇄device copy per hooked graph, and the record holds that this instrumentation is itself an
 inducer. Both conditions carry it identically, so the A′/B′ contrast is within the probe's regime — but it is
 not the ambient regime, and the pre-registration says so.
+
+---
+
+# The chain, completed: device reads are clean, so the corruption is real and the staleness must enter host-side
+
+Reading `HostTransferManager::download_synchronous` settles which reads are trustworthy and where staleness can
+enter. Both matter, and one of them refutes a competing hypothesis I was about to record.
+
+## Two download paths, only one of them clean
+
+| tensor class | path | trustworthy? |
+|---|---|---|
+| **device** tensors (layer residuals — everything the fingerprint read for the size/position findings) | `backend_get_tensor_async` → unregistered pointer → `synchronous_download_fallback` → `download_synchronous` → **`hrx_stream_synchronize` then `hrx_synchronous_d2h`** | **yes: a real runtime D2H** |
+| **host-visible** tensors (the logits region) | generic ggml layer short-circuits for host buffers → **plain memcpy, no backend call, no invalidate** | **no** |
+| graph inputs published by the **staging download** | `add_host_writeback` → **deferred plain memcpy** from a mapped staging buffer | **no** |
+
+    runtime/host-memory.cpp:1421-1425   (download_synchronous)
+      hrx_stream_synchronize(stream);
+      hrx_synchronous_d2h(device, source, offset, host_destination, size);
+
+So the "the fingerprint's own reads are stale" hypothesis is **refuted**: my instrument reads device tensors
+through a synchronised D2H, not through the deferred mapped copy. **That is a validation of this session's
+measurements** — the one-row size invariant, the front-of-buffer position, and `finite + nan == extent` are
+readings of **real device state**, not of instrument memory. It also agrees with the record's independent
+result that the read path was refuted (138,256 of 138,256 identical when every tensor was read twice).
+
+## What that forces
+
+The corruption was measured on the **device**, through a clean read. So the wrong bytes were on the device, and
+the question becomes how they got there — and the answer is available in the same file: the **host→device**
+direction.
+
+    command-program-executor.cpp:994-996   (comment, on the upload path)
+      "A host download staged by an earlier replay is only published to host memory by
+       mark_stream_synchronized(); add_host_writeback merely queues the memcpy. Uploading the same
+       host memory before that has happened would read the previous contents."
+
+The code guards *that* ordering explicitly. **The chain that survives is therefore:**
+
+1. a graph input is published to host memory by the **deferred, non-coherent** staging writeback (or read
+   before its invalidate);
+2. that host buffer is then **uploaded to the device** for a later graph (`staging.upload`);
+3. the device computes from a **stale input**, so a real device tensor — the onset residual row — becomes NaN
+   or wrong;
+4. the fingerprint reads that residual through a **synchronised D2H** and reports it **accurately**.
+
+This is more parsimonious than a device-side defect: every measurement stays valid, the corruption is real and
+device-resident, and the mechanism is stale host data being re-uploaded. It also keeps every observation that
+had to be explained — intermittency (cache state), the eviction correlation (cache pressure), the front of the
+buffer (first cache lines of a reused staging buffer), arena/staging reuse (which makes the stale bytes
+plausible, i.e. Face B), the quiet-cell faults (host cache state is box-wide), and the refutation of the
+coherence knob (wrong buffer).
+
+**The A′/B′ campaign now tests exactly this bit**: adding `HOST_COHERENT` to the staging allocation makes the
+published bytes visible before they are re-uploaded. If B′ reduces the fault rate, the chain holds.

@@ -16,15 +16,20 @@ it changes what a fix can be aimed at.
             ggml_format_name(node, "node_%d", cgraph->n_nodes);
         }
 
-`node_2948` is therefore **the 2,948th node in graph-visit order**, assigned to a node that llama.cpp never
-gave a name. It is a **positional index**, not a semantic identifier. Two consequences follow immediately:
+`node_2948` is therefore **the 2,948th node of the forward graph**, assigned to a node that llama.cpp
+never gave a name. It is a **positional index**, not a semantic identifier — but see the correction below: it
+is **stable across sequence length**, and the reason is that a graph's *node count* is per-operation, not
+per-token (`T` is a tensor dimension, not a node).
 
-- It **shifts with graph size**, i.e. with `n_tokens`, batch shape and model depth. The same physical tensor
-  is `node_2948` at one sequence length and something else at another. **A fix cannot be aimed at it by
-  name.**
-- It tells us the node is *unnamed*, which is itself informative: every named stage in the layer-41 chain
-  (`ffn_moe_out-41`, `ffn_swiglu-41`, `ffn_shexp-41`, `ffn_out-41`, `l_out-41`) has an explicit name, so the
-  first corrupted tensor is an **intermediate that llama.cpp does not name**.
+**Correction (this document originally overstated this).** The first version of this file claimed the index
+"shifts with `n_tokens`, batch shape and model depth". The first half of that is **wrong**, and the gathered
+evidence says so: the same name `node_2948` is the first corrupted node at `T = 39, 172 and 348`
+(`315fbar-p4c`, `315nan-p10l`, `315fbar-p2l` — all with `ne0=2048`, so `T = of/2048`). A name that moved
+with `T` could not appear at three different `T`. What the index *does* depend on is the **graph shape**:
+prefill vs decode build different graphs, and so would `-fa` changes or a different ubatch split. So the
+correct statement is: **stable for a fixed graph shape, not name-stable across graph shapes.**
+What remains true and matters for a fix is that it is **not a semantic name** — nothing in the source says
+"this is the layer-41 MoE accumulation"; the index has to be re-derived if the graph shape changes.
 
 ## Which unnamed ADD it is
 
@@ -63,14 +68,33 @@ inputs that the instrument does not cover**.
 ## What this buys a fix
 
 - The site is now bounded to *a region of `build_moe_ffn`*, not "somewhere in layer 41".
-- It is **not name-addressable**, so any fix must key on **op + shape + layer** (or on the buffer/allocator),
-  not on `node_…`. A patch that matched the string `node_2948` would silently stop matching when the
-  sequence length changed.
-- The natural next discriminator is cheap and named: **add the per-expert views to the watched set** so the
-  `ADD`'s inputs are fingerprint-printed. If a view already carries NaN, the adds are downstream and the
-  origin is earlier; if every view is clean and the `ADD` result is NaN, the add/its output buffer is
-  implicated. That is a **watch-list change, not a new build** — the same instrument with a different
-  `GGML_HRX_TENSOR_FP` value.
+- The node is **unnamed**, and every named stage in the layer-41 chain (`ffn_moe_out-41`, `ffn_swiglu-41`,
+  `ffn_shexp-41`, `ffn_out-41`, `l_out-41`) *does* have an explicit name — so the first corrupted tensor is an
+  intermediate llama.cpp never names.
+- `node_2948` is stable across `T` for a fixed graph shape (see the correction above), so it is usable as a
+  handle **within** a run series that shares a graph shape — but it is not semantic, so a fix must still key
+  on **op + shape + layer** (or the buffer/allocator) rather than on the string.
+
+## The selector, read at source (why `tail:16` shows this node)
+
+The instrument walks the **subgraph** it is computing, not the full model graph:
+
+    ggml-hrx.cpp:661-667
+        const int fp_first = tail_n > 0 && graph->n_nodes > tail_n ? graph->n_nodes - tail_n : 0;
+        for (int i = fp_first; i < graph->n_nodes; ++i) {
+            ggml_tensor * node = graph->nodes[i];
+            ...
+            if (tail_n == 0 && !hrx_fp_name_listed(want, node->name)) { continue; }
+
+The `node_%d` name, however, was **baked at full-graph build time** (`ggml.c:7202-7203`, `cgraph->n_nodes`),
+so a name minted in the full graph rides into whichever HRX subgraph computes that tensor. That is how a
+`tail:16` window over a *per-layer* subgraph can print a name whose index (2,948) is far larger than the
+subgraph's own node count — and it means the index is a handle into the **full** graph, not into the window.
+
+Note also `hrx_fp_name_listed` uses an **anchored, length-checked** compare (`ggml-hrx.cpp:604`, compare at
+`:613`), not
+`strstr` — the comment states the earlier `strstr` filter was itself a probe defect that matched
+`ffn_moe_weights-41` against `ffn_moe_weights-4`.
 
 ## Reproducing
 

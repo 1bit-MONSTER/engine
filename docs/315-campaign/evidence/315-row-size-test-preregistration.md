@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # Pre-registration: test the fixed-size / moving-position prediction
@@ -64,3 +80,44 @@ separately.
   one-chunk read would give a *later* layer's count, which for these arms is larger, so lag would inflate rather
   than manufacture the 8 KiB cluster.
 - **Four eviction arms is not a rate.** The prediction is about size, not frequency.
+
+---
+
+# Amendment (before the second attempt): the `tail:16` yield did not reproduce, so switch to the config that has
+
+The first attempt is heading for the outcome the readout table already calls **INVALID**: after 4 of 8 arms,
+
+    round 1 arm q: OK nan=0 req=66
+    round 1 arm e: OK nan=0 req=66     <- the EVICTION cell, clean
+    round 1 arm c: OK nan=0 req=66
+    round 2 arm q: OK nan=0 req=66
+
+**The eviction cell produced no fault at all**, where `315nan`'s recorded 16/17 came from the same `EXTRA_ENV`. So
+the highest-yield configuration on record did not reproduce its own yield under this rig, and a run that cannot
+produce Face-A arms cannot test a prediction about them. **This is reported as a failed attempt, not as a negative.**
+
+**Second attempt: the configuration that has actually produced Face-A arms in this session.**
+
+| configuration | rig | eviction-cell outcome |
+|---|---|---|
+| `315nan` (recorded) | `315-paired.sh`, two builds | 16/17 Face A |
+| `315row2` (this attempt) | `315-disc.sh`, `tail:16` + probes | **0/1 — clean** |
+| `315lout4` | `315-disc.sh`, 16 `l_out` names, no probes | **Face A ×2** (`r1e`, `r2e`), plus `r1c` Face A |
+| `315inp2` | `315-disc.sh`, 10 `l_out`/`ffn_inp` names | Face B ×2, Face A ×1 |
+
+The distinguishing feature of the configs that yield Face A is **the name list without the extra probes**, not
+`tail:16`. Note also the dose observation already recorded: 64 names → Face B everywhere, 16 names → clean quiet
+cell and Face A under eviction.
+
+**The selector** (15 names, `l_out` only, no `ffn_inp`, no `COPY_PROBE`/`SENTINEL`/`LOGITS_FP`):
+
+    l_out-0,l_out-1,l_out-2,l_out-3,l_out-4,l_out-10,l_out-15,l_out-20,l_out-25,l_out-30,\
+    l_out-35,l_out-40,l_out-45,l_out-46,l_out-47
+
+**Consecutive early layers 0–4**, which is what the size measurement needs — the first attempt could not have
+distinguished a layer-1 origin from a layer-0 one even had it faulted — plus a spread to the tail at roughly the
+`lout4` dose. **The readout table is unchanged**, including its INVALID clause.
+
+**One thing this attempt cannot do that the first could:** `tail:16` covered *every* node in each chunk's last 16,
+so it could have named a node the name list misses. The name list can only report the layers it names. Stated so the
+substitution is not silently a narrowing.

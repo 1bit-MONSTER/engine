@@ -130,8 +130,12 @@ arm() {   # arm <pair> <cell c|l> <bin dir>
     || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] \
     || [ "${idn:-1}" -gt 1 ] || [ "${req:-0}" -lt 66 ]; then verdict=FAULT
   else verdict=OK; fi
-  printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d hv52=%d hv56=%d idn=%d (gtt_now=%dG)\n' \
-    "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "${hv52:-0}" "${hv56:-0}" "${idn:-1}" "$g1" \
+  # engine#315: the Face-B counters are already computed above and already drive `verdict`, but they were not
+  # PRINTED, so the acceptance summariser could not attribute Face B from this line at all - a real Face-B
+  # fault (nan=0, http/s500/unparsed set) came out as "unattributed". Emitted now, AFTER gtt_start so the
+  # existing `(.*)$` tail capture in 315-campaign.sh picks them up without a format change there.
+  printf '  pair %d arm %s: %s nan=%d req=%d ret3=0 parse=%d gtt_start=%dG utf8=%d alloc=%d hv52=%d hv56=%d idn=%d http=%d s500=%d unparsed=%d hsa=%d transport=%d (gtt_now=%dG)\n' \
+    "$pair" "$cell" "$verdict" "${nan:-0}" "${req:-0}" "${parse:-0}" "$g0" "${utf8:-0}" "${alloc:-0}" "${hv52:-0}" "${hv56:-0}" "${idn:-1}" "${http:-0}" "${s500:-0}" "${unr:-0}" "${hsa:-0}" "${tr:-0}" "$g1" \
     | tee -a "$CONSOLE"
   systemctl --user stop $TAG-arm-$pair$cell 2>/dev/null
   for _t in 15 14 13 12 11 10 9 8 7 6 5 4 3 2 1 0; do

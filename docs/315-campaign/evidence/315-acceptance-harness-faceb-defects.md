@@ -23,15 +23,17 @@ form is `http=1 s500=1 unparsed=2` (`315-faceb-invariant-signature.md`). A real 
 **never** be counted as Face B; it landed in the `unattributed` bucket, whose own text says "read the server
 log", i.e. the harness told its reader to go and find by hand what it was supposed to count.
 
-**1b. The rig does not emit the fields at all.** Worse, the acceptance rig's arm line carries no
-`http`/`s500`/`unparsed`:
+**1b. The rig computed the fields but did not print them.** The acceptance rig (`315-paired.sh`) already
+computes `http`, `transport`, `s500` and `unparsed` — it uses all four in its **verdict** condition
+(`... || [ "${http:-0}" -gt 0 ] || [ "${tr:-0}" -gt 0 ] || [ "${s500:-0}" -gt 0 ] || [ "${unr:-0}" -gt 0 ] ...`)
+— but its `printf` omitted them, so they never reached the console the summariser reads:
 
-    acceptance rig (paired):  pair 1 arm c: FAULT nan=0 req=13 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=1 hv56=0
-    disc rig:                 round 1 arm q: OK nan=0 req=66 parse=0 utf8=0 http=0 transport=0 s500=0 unparsed=0 hsa=0 ...
+    BEFORE:  pair 1 arm c: FAULT nan=0 req=13 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=1 hv56=0 (gtt_now=100G)
+    AFTER:   pair 1 arm c: FAULT nan=0 req=13 ret3=0 parse=0 gtt_start=98G utf8=0 alloc=0 hv52=1 hv56=0 idn=1 http=1 s500=1 unparsed=2 hsa=0 transport=0 (gtt_now=100G)
 
-So even a corrected condition cannot attribute Face B from a paired-rig console. **This is empirical, not
-hypothetical**: `315accept`'s own recorded fault — `pair 1 arm c: FAULT nan=0 req=13` with every counter 0 —
-is exactly a Face-B-shaped arm, and the harness labelled it `unattributed`.
+**This is empirical, not hypothetical**: `315accept`'s recorded fault — `pair 1 arm c: FAULT nan=0 req=13` with
+every counter 0 — is exactly a Face-B-shaped arm, and the harness labelled it `unattributed` because the line
+it was given carried no Face-B evidence at all.
 
 **Impact on the criteria.** Criterion 3 asks for *zero faults on both faces*. The **rate** accounting is
 sound — it runs over all in-regime arms, so a fault fails acceptance regardless of face, and the test above
@@ -63,10 +65,21 @@ pass while Face B was never once attributed.
 
 So the corrected test attributes a real Face-B signature and does **not** over-attribute an all-zero fault.
 
-**Still to do, and it is not in this repository's hands:** the *paired* rig's verdict printer
-(`315-paired.sh`, per `docs/preregistration.md`) must emit `http=`, `s500=`, `unparsed=` for the fix to bite
-in an acceptance run. Until then the harness is correct but the rig is silent, and the note says so rather
-than implying Face B was tested.
+**Also fixed, in the rig** (`315-paired.sh`): its `printf` now emits
+`... idn=%d http=%d s500=%d unparsed=%d hsa=%d transport=%d (gtt_now=%dG)`. The new fields are placed **after**
+`gtt_start`, so the summariser's existing `(.*)$` tail capture picks them up with no format change there.
+
+**Verified end-to-end on the patched rig line format:**
+
+    pair=1  (nan=0, http=1 s500=1 unparsed=2)              -> FaceB(parse=0,utf8=0,http=1,s500=1,unparsed=2)
+    pair=2  (nan=2048, http=1 s500=0 unparsed=2)           -> FaceA(nan=2048) FaceB(http=1,s500=0,unparsed=2)
+    pair=1  arm l (all counters 0)                         -> OK
+    face tally: FaceA=1 FaceB=2 unattributed=0
+
+The second row is the case the criterion actually cares about — **both faces attributed on the same arm** —
+and the third confirms an all-zero arm is still not over-attributed. With the fields present the summariser no
+longer prints the "cannot be tested from this line" note, so that note now fires only on a console produced by
+the old printer.
 
 ## Defect 2 — the "rule of three" bound prints probabilities above 100%
 

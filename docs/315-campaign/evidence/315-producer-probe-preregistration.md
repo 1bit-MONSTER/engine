@@ -185,3 +185,21 @@ identity, so the table is exercised rather than asserted.
 
 Nothing else changes: the run config, its declared confound (the name list is the fault-yield enabler), the
 hooked-graph limitation (logits chunk only), and every INVALID clause stand as written.
+
+### Confirmed: no arm on this record has ever logged a NaN payload
+
+The instrument's `first_nan=0x%08x` is the record's **only** payload reporter, checked rather than assumed:
+
+    grep -ahoE "0x[0-9a-fA-F]{8}" ~/wt/rt-det/*/server.log | sort | uniq -c | sort -rn | head
+    # => 0x7ff985d0, 0x7ff0f810, ... each exactly 5,468 times: these are the copy probe's `host_ptr=` addresses
+    grep -ahE "nan.*0x[0-9a-f]{8}|0x[0-9a-f]{8}.*nan" ~/wt/rt-det/*/server.log
+    # => empty
+
+So the payload family — which is what distinguishes "the probe's own fill survived" from "an ordinary
+arithmetic NaN" from "some other writer's pattern" — **has never been recorded in any arm**, and the
+`GGML_HRX_SENTINEL` work could not have supplied it either: that instrument reports a **match count** against
+`0x7FC0DEAD`, not the bits actually found. Its `sentinel=0` on all 17 fault lines therefore says "the region is
+not still the fill", and says nothing about what the NaNs are.
+
+That is why the queued run is worth its box time: it is not a re-measurement of anything already on the
+record, it is the first measurement of a quantity the record has never had.

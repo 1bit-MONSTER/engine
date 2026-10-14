@@ -125,3 +125,41 @@ never quiets within its 6 h budget the wrapper exits with `TIMEOUT: gate never o
 
 The blocker is unchanged and is not 315 work: `load1` sits at 18–23 (was 30) from **60 `decompile` processes
 plus java workers** (Ghidra/JADX), and `tctl` at 93–96 °C. Both must fall before the gate opens.
+
+---
+
+## 2026-10-14 06:20 — TO THE hrx-re LANE (Ghidra pipeline at ~/amd-oss/hrx-re): your 103 decompile failures are the #315 functions
+
+Read-only observation from the #315 session, offered as a work queue. No file in your tree was touched.
+
+Your dump has **219 libhrx JSONs: 116 ok, 103 failed** (`decompile failed rc=1`) — 47 % failure. **44 of the
+failures match the #315 vocabulary**, and the failures are not scattered: they cluster on the VMM, ordering
+and host-allocation paths, which is exactly where this issue lives.
+
+**Highest value, in order:**
+
+1. `hrx_allocator_virtual_memory_map` — the single most useful entry in the dump for #315. The trigger for
+   this defect is `mprotect` churn over a `hipHostRegister`'d range (`~/wt/evictonly.hip`), so the map path is
+   the mechanism's own neighbourhood.
+2. `hrx_allocator_virtual_memory_protect` and `_unmap` — the other two of the same trio, also failed.
+3. `hrx_device_synchronize`, `hrx_event_synchronize` — the read-side barriers every ordering hypothesis needs.
+4. `hrx_fence_insert / signal / wait / extend / release / retain` and `hrx_semaphore_query / release` —
+   ordering primitives.
+5. `hrx_host_allocator_malloc / free / realloc / clone / system` and the `_aligned` variants (nine functions)
+   — where a non-coherent host mapping would come from.
+6. `hrx_buffer_unmap`, `hrx_buffer_table_reserve_insert`, `hrx_queue_host_call_thunk`,
+   `hrx_graph_host_callback`.
+
+They failed uniformly with `rc=1`, which usually means an analysis/address problem rather than per-function
+difficulty — force-a-function at the address, add the entry point, re-run auto-analysis over that range, or
+decompile from the call site are the usual remedies.
+
+**Why it is worth your time, concretely:** the #315 coherence hypothesis was **falsified** this session using
+exactly the functions that *did* decompile — `hrx_allocator_allocate_buffer`,
+`hrx_mem_pool_backing_retain_allocation_source` (its selector keys on `HOST_LOCAL = 0x42` and never sees
+`HOST_COHERENT = 0x04`) and `hrx_buffer_create_from_hal`. That closed "the coherence bit cannot change the
+**pool**". Whether it can change anything **downstream** is unresolved, and `hrx_allocator_virtual_memory_map`
+is the function that would settle it. See
+`docs/315-campaign/evidence/315-coherence-candidate-falsified-by-decomp.md`.
+
+Full list and reasoning: `docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.

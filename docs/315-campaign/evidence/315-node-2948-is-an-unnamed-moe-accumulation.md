@@ -107,3 +107,18 @@ Note also `hrx_fp_name_listed` uses an **anchored, length-checked** compare (`gg
 Pin: `third_party/llama.cpp = e44c9d01a4d5110cecaf45472a717f46cd1abbf9` (matches the arms' `version: 10613
 (e44c9d01a)`). Read on strixhalo at `~/wt/pin-fork-hrx/third_party/llama.cpp/` during the `315row` run; it
 uses no GPU and disturbs no measurement.
+
+---
+
+## WITHDRAWN (same day): the MoE-accumulation identification is wrong
+
+The op-count query settles it against this document. Across the whole archive the unnamed `node_N` nodes
+comprise **exactly two ops, 47 of each**: `ADD` (residue 37 mod 71) and `FLASH_ATTN_EXT` (residue 3 mod 71) —
+one of each per layer for 47 layers. `build_moe_ffn`'s accumulation adds cannot be the residue-37 family, and
+if they were unnamed at all there would be more than one per layer.
+
+So `node_2948` is **layer 41's post-attention residual add**, not a MoE accumulation add. The `op=ADD` shape
+argument in this file was necessary but not sufficient, and the "consistent with, not proven" hedge was the
+right place to leave it — but the identification itself is now superseded. See
+`315-layer41-site-by-graph-arithmetic.md`, which also adds the one-row invariant (18 of 19 arms, `nan=2048`
+exactly) and the clean-attention-op evidence.

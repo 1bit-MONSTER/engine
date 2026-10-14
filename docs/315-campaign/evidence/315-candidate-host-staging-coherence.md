@@ -401,3 +401,31 @@ It now answers three things in one run:
 **Still NOT claimed:** that it compiles *and runs* as intended — the artefact check establishes compilation and
 the presence of the env strings, not that any of the four instruments arms at run time. The verdicts and the
 `hrx-*` lines are that evidence, and they do not exist yet.
+
+### Amendment 3, still BEFORE any arm: the launcher would have run B′ with no control
+
+A defect in my own launcher, found by reading its exit paths rather than by trusting it.
+
+`315-disc.sh` has three abort exits — **3** (`HRX0 not visible`), **4** (`regime composition failed`) and
+**6** (`box not quiet for 2 h before round … arm`, the thermal gate) — and `315ab.sh` ran the two conditions as
+two bare commands:
+
+    bash 315-disc.sh 4 315abA          # A'
+    bash 315-disc.sh 4 315abB          # B'   <- ran even if A' had aborted
+
+So an A′ that died at composition or on the thermal gate would have left the script **proceeding into B′ with no
+control**, producing a set of B′ arms that could not be compared with anything. That is worse than the INVALID
+outcome the pre-registration already names, because INVALID is a verdict a reader can see, while this would
+have looked like a completed run with a suspiciously one-sided result.
+
+**Fixed**: each condition is now guarded —
+
+    … bash 315-disc.sh 4 315abA || { echo "ABORT: A-prime exited $? - refusing to run B-prime without its control"; exit 8; }
+    … bash 315-disc.sh 4 315abB || { echo "ABORT: B-prime exited $?"; exit 9; }
+
+so an abort in either condition **stops the run and says which one failed**, and a partial comparison cannot be
+produced. `bash -n` clean.
+
+This is the third defect caught in the campaign's own scaffolding before it ran (the disjoint instrument trees,
+the wrong-target binary, and now the unguarded launcher), which is the argument for reading a rig before
+trusting it — the record has the same lesson three times over in its defect list.

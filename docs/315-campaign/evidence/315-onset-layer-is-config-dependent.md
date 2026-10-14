@@ -120,3 +120,31 @@ unique among the printed lines, so that arm's reading is not an obvious alias.
 - **The discriminating experiment this implies:** run the *same* fingerprint window on both configurations in
   the *same* session, at the same regime, and find whether the onset layer moves with the probe set. That is
   a config-only test and it settles whether "layer 41" is instrument or defect.
+
+### The `l_out-0` reading is not an alias (checked on all three Face-A arms)
+
+The remaining way the comparison could fail is if `l_out-0`'s layer-0 reading were itself an aliased read.
+It is not. Grouping each `315size` Face-A arm's `l_out` readings by content hash:
+
+| arm | coincident readings |
+|---|---|
+| `315size-r1e` | `l_out-10 ≡ 15 ≡ 20 ≡ 25 ≡ 30 ≡ 35 ≡ 40 ≡ 45` |
+| `315size-r2e` | `l_out-10 ≡ 15 ≡ 20 ≡ 25 ≡ 40 ≡ 45`, `l_out-4 ≡ 30 ≡ 35` |
+| `315size-r2q` | `l_out-1 ≡ 2 ≡ 3 ≡ 4 ≡ 10 ≡ … ≡ 45` |
+
+**`l_out-0` is in none of them.** Every coincident group on this record consists of layers that are
+**saturated** (`nan` equal to the extent), where identical hashes are expected because all-NaN content hashes
+the same — the scope rule established earlier. `l_out-0` reads a *partial* count (`1984`, `1984`, `1790`)
+with a **unique** hash in every arm, so it is a genuine distinct-buffer measurement.
+
+That also means the layer-0 onset is not a saturation artifact: a partially-NaN reading cannot be produced by
+everything being NaN. And it makes the contrast sharper — both sides of the comparison now rest on a
+uniquely-hashed, partial reading:
+
+| config | first NaN-bearing tensor | reading | hash |
+|---|---|---|---|
+| `315nan` / `315fbar` | `node_2948` (layer 41) | `nan=2048` exactly, 18 of 19 arms | unique |
+| `315size` | `l_out-0` (layer 0) | `nan=1984`, `1984`, `1790` | unique |
+
+What remains unresolved is only **which** of the two differing variables (selector, probes) produces it —
+which is what `315cfg` is running now.

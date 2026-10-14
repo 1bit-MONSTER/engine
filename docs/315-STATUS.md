@@ -1701,3 +1701,86 @@ silently inert. **#14** a `NANONLY` sweep cannot distinguish "every layer clean"
 and the first sweep attempt was exactly that — reported as **mis-targeted, not as a negative**. Plus **five parse
 slips** in one family: a truncated sorted head, a line counter on newline-free output, a sum over streaming
 responses, a mis-indexed `awk` field test, and an unread `sentinel=` field.
+
+---
+
+## Session of 2026-10-13 late: the site is named, the size is an invariant, and the read path that was being trusted is not
+
+Add-only. Nothing above is edited.
+
+### The unnamed node is source-addressable, and it is a post-attention residual ADD
+
+`ggml.c:7202-7203` names any node with an empty name `node_%d` using `cgraph->n_nodes`, so `node_2948` is the
+node's position in the **full** forward graph. Because a graph's node count is per-**operation** and not
+per-token, that index is **stable across sequence length** — demonstrated, not assumed: `node_2948` is the
+first corrupted node at `T = 39, 87, 98, 135, 140, 172, 306, 342, 348`.
+
+Every `node_N` in the archive reduces to one of two residues mod 71:
+
+| residue | op | count | meaning |
+|---|---|---|---|
+| 37 | `ADD` | 47 | one unnamed residual add per layer |
+| 3 | `FLASH_ATTN_EXT` | 47 | one unnamed attention op per layer |
+
+So the graph is **71 nodes per layer**, 47 layers, with exactly two unnamed nodes each — and
+
+    node_2948 = 71×41 + 37  -> LAYER 41's unnamed post-attention residual ADD
+    node_2914 = 71×41 +  3  -> LAYER 41's unnamed attention op
+
+This fixes the layer-41 site by a second, independent method (graph arithmetic) alongside the layer-`N` names
+in the same window. It also **withdraws** an intermediate guess filed during this session that the node was a
+MoE expert-accumulation add — the per-layer op pair is attention + residual add, and 47+47 accounts for the
+model exactly.
+
+### The size is an invariant: one row, `nan = 2048`, in 18 of 19 arms
+
+`node_2948` reads **exactly `2048` NaN floats — one `n_embd`-wide row, `2048 × 4 = 8192` bytes** — in **18 of
+19** archived arms, against extents from 79,872 to 712,704 floats and **nine different sequence lengths**. The
+19th arm is `315nan-p12l`, the one arm whose NaN is already present at layer 1 (`node_74`, `node_108`, …; first
+line `norm-0 nan=55 of 20480`), where the tensor is wholly NaN because the corruption predates layer 41.
+
+So the two populations are separable **by the first-corrupted layer**, and only one of them is a layer-41
+onset. This also corrects the wording of the row-size prediction: "position" ran together two different
+things. Size — fixed. Layer — fixed at 41. Row within the tensor — **varies** (the same `T=87` count in five
+arms, five different content hashes; and the ext-fp arms read `row = 0, 1, 0`). The claim the data supports is
+**"one row, always at layer 41, in a row that moves"**.
+
+### The `l_out-N` read is not a per-layer measurement
+
+Grouping each arm's `l_out-N` reads by content hash shows two **different layers returning byte-identical,
+largely-finite content**: `l_out-42 ≡ l_out-44` and `l_out-43 ≡ l_out-45`, both at `nan=19968 of 79872` (25 %
+NaN) in the `315fbar` cold-cell arms. Two layers cannot genuinely produce identical 319 KB outputs, so these
+are **aliased reads** — the same arena slot reached under two names. Scope is stated because it matters: the
+inference is sound **only for unsaturated reads**. In `315lout4-r1e` a stride-3 family
+(`l_out-15 18 21 24 27 30 33 36 39 42 45`) shares one hash, but every member reads `nan=200704 of 200704` —
+fully saturated — so saturation explains it and it is **not** evidence of aliasing. The stride is not
+established to be universal.
+
+The unnamed `node_NNNN` reads do not share the defect: the only coincident pair anywhere is
+`node_3304 ≡ node_3305`, and `node_2948` never coincides. **Practical rule: two readings with the same hash
+are one reading.**
+
+### The `tail:16` yield did not reproduce, and `315row` ended at two clean arms
+
+`315row` (4 rounds, `tail:16` + probes) recorded **round 1 arm q OK (gtt_start 97G) and round 1 arm e OK
+(98G)** — the eviction cell in regime with `side=1/1` — then was superseded. `0ed67c2` amends the test to the
+config that has actually produced Face-A arms (`l_out` name lists without the extra probes) and reports the
+`tail:16` attempt as a **failed attempt, not a negative**. Both readings agree: the same `EXTRA_ENV` that
+recorded 16/17 did not reproduce here.
+
+### Criterion table, updated
+
+| # | criterion | state after this session |
+|---|---|---|
+| 1 | named, falsifiable mechanism | **site named and independently derived**: layer 41's unnamed post-attention residual ADD, one 2048-wide row, 18/19 arms. **Cause still not named** — the add's two inputs (layer-41 residual, attention output) and the buffer behind them are not distinguished, and layer 41's attention op reads clean in the 18 one-row arms without the window-coverage being proven |
+| 2 | forward-only fix landed | unchanged: not achievable within scope until the buffer question is settled |
+| 3 | ≥60 in-regime arms, zero faults | unchanged; `315size` in flight is the amendment's attempt |
+| 4 | no regression | unchanged, measured on both halves |
+| 5 | KNOWN-ISSUES updated | this section is the status record; the KNOWN-ISSUES edit remains with the session that owns it |
+
+### Evidence
+
+`docs/315-campaign/evidence/315-layer41-site-by-graph-arithmetic.md`,
+`315-row-size-scored-from-archive.md`, `315-node-2948-is-an-unnamed-moe-accumulation.md` (with its withdrawal
+note), and the coordination note in `315-COORDINATION.md`. Every number above is reproduced by a command in
+one of those files; none required GPU time, all were read from the archived arm logs at pin `e44c9d01a`.

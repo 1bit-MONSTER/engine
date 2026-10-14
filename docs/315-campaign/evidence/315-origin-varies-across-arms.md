@@ -1,6 +1,22 @@
 <!--
 Copyright 2026 bong-water-water-bong
 SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
 -->
 
 # The origin is not in the same place in different arms — and that is itself the finding
@@ -73,3 +89,46 @@ reading is the right one; if it moves, the region-following account is supported
 **That is a cheap experiment** — the selector already exists and the dose is already known to give Face A with a
 clean quiet cell — and unlike every previous framing it makes a prediction that distinguishes the two accounts
 without needing a new instrument.
+
+---
+
+# Correction: the variation I cited is between CELLS, not between episodes — and the prediction is not testable as written
+
+Reviewing the section above against its own evidence, the case for "the origin moves" is weaker than it states, in
+three specific ways.
+
+**1. The arms I cite do not differ in the way the hypothesis needs.** `r1e` and `r2e` are both **eviction** arms and
+both give `l_out-0 = 1984` — *identical*. The one arm that differs (`r1c`, `l_out-0 = 46`) is the **CPU-pressure**
+cell. So the variation on the table separates *cells*, not episodes of the same trigger. The objective's trigger is
+eviction, and under it the layer-0 signature was **constant across two arms of 98 and 135 tokens**. That is evidence
+for a *fixed* region, not a position-independent one.
+
+**2. Layer 0 is already NaN in every arm I measured, so "which layer carries the first NaN" cannot vary below what
+I can see.** All three Face-A arms put NaN at `l_out-0`; the earliest selector this session read **is** layer 0. A
+hypothesis predicting movement in the first affected layer is therefore **not testable with this selector** — the
+movement would have to be in the embedding or layer 0's internals, which are outside the window. I stated a
+falsification ("run ≥10 arms and show the first NaN layer is the same") that could come out "same" purely because
+the instrument cannot see earlier. **That is the defect #14 ambiguity again, written into a pre-registered-looking
+prediction.**
+
+**3. §40's contrary reading rests on an absence, which I have already argued is ambiguous.** I used that to weaken
+§40 — correctly — but the same standard applies to my own comparison against it. A "clean layer 0" inferred from a
+missing `NANONLY` line is not the same as a measured clean layer 0.
+
+## What actually survives from the section above
+
+- **`ffn_inp-41`, `ffn_norm-41`, `ffn_inp-42`, `ffn_norm-42` have never appeared in any recorded fingerprint**, while
+  `ffn_shexp-41` has 30 times. §40's chain probe has genuinely never been run, and §40's conclusion rests on
+  windows, not on those nodes. **That stands, and it is why the combined probe is worth running.**
+- **Layer 0 carries NaN in all three Face-A arms measured** (1984, 1984, 46) — new, replicated within-session, and
+  in direct tension with §40's generalisation.
+- **Under the eviction trigger the layer-0 count was constant (1984) across two arms of different size.**
+
+**What does not survive:** the claim that the origin moves across arms, and the prediction that tests it. The
+region-following mechanism remains a *hypothesis* — it is not yet supported by any variation between episodes of the
+same trigger, because every eviction arm measured gives the same number.
+
+**What would test it:** arms that read **earlier than layer 0** (the embedding and layer 0's own internals), where
+movement could actually be seen — and that is a displacement-exposed read, i.e. the read-at-production instrument
+again. The honest position is the one this campaign keeps arriving at: the measurement that would separate the
+remaining hypotheses is the one the host-side instrument cannot make.

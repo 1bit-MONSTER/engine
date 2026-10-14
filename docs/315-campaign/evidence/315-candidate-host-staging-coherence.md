@@ -126,3 +126,44 @@ coherence explicitly, calling it a requirement because the read path never inval
 
 **NOT proven:** that the *achieved* mapping is non-coherent — the HIP VMM path may add it
 (`vmm.c:468-473`). **That single fact decides the mechanism, and it is the first thing to measure.**
+
+### The discriminating experiment, made runnable: toggle the bit on *this* allocation
+
+The readback version above is not runnable as written — there is **no getter for a buffer's achieved memory
+type** (`hrx_buffer_get_size`, `hrx_buffer_get_device_ptr`, `hrx_buffer_lookup`, `hrx_buffer_map` exist; no
+`get_memory_type`), and the `[hrx-buf]` trace prints `memory_type` only inside `buffer_alloc`
+(`ggml-hrx.cpp:322`), not for buffers allocated directly through `hrx_allocator_allocate_buffer`. So the
+achieved type cannot be read out without new API.
+
+The runnable form is therefore a **direct A/B on this one allocation**, which is also the stronger test because
+it measures the fault rather than the flag:
+
+| arm | change | prediction if the mechanism is live |
+|---|---|---|
+| A′ | `allocate_mapped_host_staging_buffer` unchanged | faults at the recorded rate |
+| B′ | add `HRX_MEMORY_TYPE_HOST_COHERENT` to the params at `host-memory.cpp:1300` | **fault rate falls** |
+
+**This is the experiment the earlier coherence A/B should have been.** That one toggled
+`GGML_HRX_USE_UNIFIED_MEMORY`, which reaches only `buffer_alloc`'s ggml buffer types and provably cannot touch
+this allocation; both its arms faulted, which refuted the knob and not the property. A′ vs B′ moves the bit on
+the buffer that is actually device-written and host-read with no invalidate.
+
+**Falsifier, unchanged and still first in this document:** if the backend already grants coherence to
+host-located memory (`vmm.c:468-473` is the reverse mapping and suggests it might), then B′ changes nothing
+and the fault rate is unmoved — in which case this candidate is dead and A′ vs B′ is the cheapest possible way
+to discover that.
+
+### Honest status after reading the provider paths
+
+- **Not our provider:** `vmm_slab_provider.c:401-409` **rejects** any request carrying `HOST_LOCAL |
+  HOST_VISIBLE | HOST_COHERENT | HOST_CACHED` ("VMM slab provider requires device-local memory without host
+  access"), so the staging buffer cannot be served there.
+- **Unresolved:** the hip path handles `hipMemLocationTypeHost` (`vmm.c:797` is access-location validation, not
+  the type conversion), and I could not locate the forward conversion from a requested hrx memory type to the
+  `hipMemAllocationProp` actually used. **So the achieved coherence remains unresolved from source**, and this
+  document does not claim otherwise.
+
+**Bottom line: a well-founded candidate with one unresolved premise and a cheap A′/B′ that settles it either
+way.** That is a strictly better position than the record had — it is a named mechanism with a discriminating
+experiment and an in-scope, forward-only, one-bit fix — but it is **not** yet the named mechanism, and it must
+not be reported as the cause.

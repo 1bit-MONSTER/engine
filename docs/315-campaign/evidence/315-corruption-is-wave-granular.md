@@ -77,3 +77,60 @@ same class of defect surviving it.
   site this session showed to be instrument-relative). The *granularity* result does not depend on where the
   onset lands, but it should be re-measured under a name-list configuration before being treated as universal.
 - **No rate:** arms were selected for having faulted.
+
+---
+
+# CORRECTION to the interpretation above: the measured shape is a contiguous 256-byte-aligned PREFIX
+
+The granularity result above (96.6% of corruptions begin on a 64-element boundary) is sound and stands. But I
+took it further than it goes by reading it as "whole waves with a clean neighbour", and the fuller shape
+measurement corrects that. Both are now recorded, the measurement first.
+
+## What the extents actually show (266 partial readings)
+
+| property | measurement |
+|---|---|
+| NaN is a **single contiguous run** from `first` | **266 of 266** — `first + nan ≤ extent` in every reading |
+| the run **starts at element 0** (`first = 0`) | **227 of 266 = 85.4%** |
+| the run **covers the end of the buffer** | 30 of 266 |
+| the run is **interior** (neither) | **9 of 266** |
+| `first` is 256-byte (64-element) aligned | 257 of 266 = 96.6% |
+| the run length is 256-byte aligned | 157 of 266 = 59.0% |
+
+Representative shapes:
+
+    first=      0 nan=  2048 extent= 79872   rows [0.00:  1.00] of  39.00   <- exactly one row, the first
+    first=      0 nan= 55296 extent= 79872   rows [0.00: 27.00] of  39.00   <- first 27 rows
+    first=      0 nan=  1856 extent=  2048   waves[0:29] of 32              <- 29 of one row's 32 waves
+    first=      0 nan=1572928 extent=2441216 rows [0.00:768.03] of 1192.00   <- large prefix
+    first=  59904 nan= 19968 extent= 79872   rows [29.25: 39.00] of 39.00   <- the 30 tail cases
+    first= 264192 nan= 88064 extent=352256   rows[129.00:172.00] of 172.00   <- tail from row 129
+
+So the picture is **a contiguous run of wrong data starting at the front of the buffer in 85% of cases**, not a
+scattered set of waves. The `1984` case is "the first 31 waves of a 32-wave row are wrong and the **last** wave
+is clean" — i.e. a prefix of the row, not a hole in the middle of it.
+
+## What this does and does not settle
+
+**Settled by measurement:** the corruption is contiguous, and its boundaries fall on **256-byte** (64-element)
+lines far more often than chance — 96.6% versus 1.6% for the start. That is a real granularity result and it is
+much coarser than a 64-byte cache line (16 elements), which is what the staging/coherence candidate's mechanism
+would act on.
+
+**NOT settled — and I over-read it before:** *what* applies 256-byte-aligned contiguous prefixes. Two readings
+remain live, and the data does not separate them:
+
+| reading | what it would mean | what would separate it |
+|---|---|---|
+| **a copy/region boundary** | a `copy_buffer`/region operation whose extent is short, or is applied to a sub-range, and whose source held NaN — the runtime's own 256-byte alignment unit (the record's "256 the alignment the record gives for the MoE tables", and `7936 = 8192 − 256`) would then be the natural boundary | whether the *unwritten tail* keeps its previous content or the *prefix* is actively wrong: a short copy leaves the tail stale; a wrong prefix means the copy's source is bad |
+| **wave64 lane masking** | a kernel writing whole waves, with the first waves' lanes wrong and the last wave's drain correct | a lane-mask drain visible with the wave64 drain path instrumented, and a per-element dump showing whole waves wrong with a clean neighbour inside a row |
+
+**The discriminating observation is therefore the same for both, and it is cheap:** dump one corrupted row
+element by element and see whether the wrong elements are (a) a prefix of whole waves with the tail clean
+(region/copy), or (b) whole waves interleaved with clean waves (lane masking). Counting NaN cannot distinguish
+them — which is exactly why the count-based reading went as far as it did and no further.
+
+**Also unchanged:** this is not #313 (whose wave64 lane-mask drain backport is already in the pin), it does not
+establish a cause, and no instrument on the record observes the write. Sampling remains 266 partial readings
+from a handful of arms in one (`tail:16`) configuration, whose onset site this session showed to be
+instrument-relative — though the *shape* result does not depend on where the onset lands.

@@ -103,3 +103,25 @@ disturb other workloads". Consequences:
 write the bytes the consumer reads* — it fills the host-visible region with its own payload `0x7FC0DEAD`
 **before** each hooked graph and classifies **after a drained stream**, and the archive contains **zero**
 `[hrx-producer] armed` and **zero** `[hrx-producer] anomaly` lines, i.e. it has never once been enabled.
+
+### 05:41 — the note above is superseded: `315prod` no longer holds anything while it waits
+
+The run described above (launched 05:37:34) was **stopped at 05:40** precisely because it held `box.lock`
+**and** three composed GLM neighbours at `gtt = 79G` while doing nothing but waiting for a gate that a
+*foreign* CPU workload controls. Holding ~79 GB of GTT for a run that cannot start is a cost to the shared
+box with no benefit, so it was replaced.
+
+**What runs now** (`315prod-wait.sh`, started 05:41:18, verified):
+
+| property | value |
+|---|---|
+| `box.lock` | **FREE** — the wrapper does not take it until the gate is open |
+| GTT | **26 GiB** — no neighbours composed while waiting |
+| gate conditions checked | `tctl < 80`, `load1 < 4`, `foreign = 0` — the same ones the disc rig's own gate uses |
+| then | `exec 315prod.sh`, which takes the lock and composes neighbours only at that point |
+
+So the box is **free for anyone else** until `315prod` actually starts. Nothing needs to be killed; if the box
+never quiets within its 6 h budget the wrapper exits with `TIMEOUT: gate never opened` and takes nothing.
+
+The blocker is unchanged and is not 315 work: `load1` sits at 18–23 (was 30) from **60 `decompile` processes
+plus java workers** (Ghidra/JADX), and `tctl` at 93–96 °C. Both must fall before the gate opens.

@@ -133,3 +133,17 @@ watch**: a run driven by a name list (`l_out-…`, `ffn_moe_weights-…`) cannot
 **not evidence against the fixed site** and are **not pooled** with it — they are recorded here so the
 comparison is not silently dropped, and so nobody later reads their differing node names as a contradiction.
 `315rowidx` (pre-registered) removes this confound by using one config across all its arms.
+
+## Open item: `node_2948` is not yet source-addressable
+
+The engine tree here has **uninitialized submodules** (`git submodule status` shows a leading `-` on every
+entry), so the `ggml-hrx` source that emits the `node_NNNN` names is not present locally and `node_2948`
+could not be resolved to a graph-construction site from this worktree. The pin is
+`third_party/llama.cpp = e44c9d01a4d5110cecaf45472a717f46cd1abbf9`, which matches the `version: 10613
+(e44c9d01a)` the arms report, so the revision is fixed and the lookup is reproducible — it just needs the
+box (or a `git submodule update --init`) rather than a guess.
+
+Resolving it would say whether `node_2948` is a stable graph node (in which case a fix can be aimed at it
+directly) or a per-compilation index (in which case the site must be re-derived each build). That
+distinction is the next step after `315rowidx` confirms the site replicates, and it is recorded here rather
+than guessed.

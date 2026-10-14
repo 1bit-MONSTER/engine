@@ -1,0 +1,97 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Face B has never been measured with an instrument that can see it — and the instrument already exists
+
+Read from the archived arm logs while `315size` runs. No GPU time.
+
+## The one-row count is a complete read, not a truncation
+
+`node_2948` also appears in the **`hrx-finite-fp`** channel, which reports `finite=<count>` (the non-NaN
+values) alongside `hash_finite=` and `nan=`. In all four arms that carry it:
+
+| arm | `finite` | `nan` | `finite + nan` | extent |
+|---|---|---|---|---|
+| `315fbar-p1c` | 77,824 | 2,048 | **79,872** | 79,872 |
+| `315fbar-p2c` | 350,208 | 2,048 | **352,256** | 352,256 |
+| `315fbar-p2l` | 710,656 | 2,048 | **712,704** | 712,704 |
+| `315fbar-p4c` | 77,824 | 2,048 | **79,872** | 79,872 |
+
+**The two counts partition the tensor extent exactly, in every arm.** So `nan = 2048` is a count over a
+**complete read of the whole tensor** — the strongest available refutation of the reading being a truncated,
+partial, or aliased sample. Combined with the 18-of-19 arms result, the one-row finding is now supported by
+both cross-arm invariance and an internal accounting identity.
+
+## `hash_finite` differs between arms of identical shape — the Face-B signal
+
+`315fbar-p1c` and `315fbar-p4c` have the **same** extent (79,872, T=39) and the **same** finite count
+(77,824), and **different** hashes:
+
+    p1c  hash_finite=f5a462171c873f22
+    p4c  hash_finite=6966825d04b7208b
+
+Two arms of identical shape whose *finite* values differ is exactly the observable a `finite but wrong`
+corruption produces. **This is a working detector for Face B's class of value**, already recorded, with no new
+code.
+
+## Why Face B has no evidence: the instrument is blind to it by construction
+
+Every Face-B arm on this record carries **zero** fingerprint lines:
+
+| arm | Face-B markers | `hrx-tensor-fp` lines | `hrx-finite-fp` lines |
+|---|---|---|---|
+| `315inp2-r1e` | 2 | **0** | **0** |
+| `315inp2-r2e` | 2 | **0** | **0** |
+| `315inp2-r3e` | 0 | 7 | 0 |
+| `315lout4-r1e` | 0 | 20 | 0 |
+
+The reason is structural, not accidental: the campaign's fingerprint is driven with
+`GGML_HRX_TENSOR_FP_NANONLY=1`, which prints a line **only if the tensor contains NaN**. Face B is defined as
+**finite but wrong**, so a Face-B arm provably produces no lines. Face A got a mechanism story and Face B did
+not, because **the instrument can only see Face A** — and the earlier sessions' notes that "Face B was never
+observed in this session" were reading a detector that could not have observed it.
+
+`hrx-finite-fp` is not NaN-gated **at source**: it is emitted immediately after the `hrx-tensor-fp` line, under
+the same `GGML_HRX_TENSOR_FP` selector, and the **only** thing that suppresses it is the same
+
+    ggml-hrx.cpp:728-730
+        if (fp_nan_only && nan == 0) { continue; }
+
+`fp_nan_only` comes from `GGML_HRX_TENSOR_FP_NANONLY`. So there is **no separate `GGML_HRX_FINITE_FP`
+variable** — an earlier draft of this file invented one; the correct enabling condition is the opposite of
+what the campaign has been doing. To see finite hashes in a Face-B arm, `NANONLY` must be **absent**, which
+means every watched node prints two lines per call, so `GGML_HRX_TENSOR_FP_CALLS` is what bounds the volume.
+The channel was live in 6 arms (`315fbar-p1c p2c p2l p4c`, `315fp2-p2l`, `315idp-p4l`) — all of them Face-A or
+clean, because every one of them ran with `NANONLY` **and** still had NaN to print.
+
+## The missing run, stated as a pre-registration
+
+    BIN=~/wt/315fp-build/bin
+    EXTRA_ENV="GGML_HRX_TENSOR_FP=<the 15-name l_out list from 0ed67c2> GGML_HRX_TENSOR_FP_CALLS=6"
+    # NANONLY deliberately ABSENT - it is precisely what suppresses the finite line (ggml-hrx.cpp:728)
+    ~/wt/315-disc.sh 8 315faceb
+
+**Readout, fixed in advance:**
+
+| observation | verdict |
+|---|---|
+| a Face-B arm whose `hash_finite` for a given node differs from the clean arms', with `nan=0` | **Face B localised to that node** — the finite-but-wrong value, and the first such node names its site |
+| every Face-B arm's `hash_finite` matches the clean arms' at every watched node | the corruption is **outside** the watched set (head, sampler, tokenizer) or the run produced no Face-B arm — reported as **not-shown**, never as a negative |
+| no Face-B arm results | **INVALID for this question**, reported as such |
+| `EXTRA_ENV` produces no `hrx-finite-fp` lines at all | `NANONLY` is still set, or the selector matched nothing — check both against the source before reading the empty output as absence |
+
+**Confounds.** `hash_finite` is content-sensitive, so **two clean arms may already differ** wherever sampling
+or nondeterminism enters — the clean baseline must therefore be several arms, not one, and a divergence is
+only a finding if the clean arms agree with each other. This is stated because the whole test collapses if it
+is skipped.
+
+**What this does not do:** it does not show the finite-value channel is wired to the same tensors as the NaN
+channel (verify by reading the source, not by assuming), it gives no rate, and it does not itself link Face B
+to the layer-41 site — it gives Face B the *instrument* that the layer-41 work already had.
+
+## Evidence
+
+    grep -ahE "hrx-finite-fp.*name=node_2948 " ~/wt/rt-det/315fbar-*/server.log
+    for d in ~/wt/rt-det/315inp2-r1e* ~/wt/rt-det/315inp2-r2e*; do grep -ac "hrx-tensor-fp" "$d/server.log"; done

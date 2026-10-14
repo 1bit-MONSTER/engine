@@ -145,3 +145,77 @@ casualty".
 Four arms now, three of them Face A, all in regime (`gtt_start=98G`), one clean quiet arm in the same session.
 The layer-0 origin is no longer n = 1 — and the constant 1984 says the corruption has a **fixed shape** at layer 0,
 not a diffuse one.
+
+---
+
+# This contradicts a recorded conclusion, and resolves a tension the record had already flagged
+
+The finding above does not sit quietly beside the record. It contradicts one conclusion and settles another.
+
+## The contradiction: §40 says the corruption is born at block 41
+
+`docs/315-mechanism.md` §40, on the `tail:16` window:
+
+> its window covers **block 41's FFN and block 42's attention** ... **Every earlier call's window was clean, so the
+> corruption is *born* at block 41, not inherited from block 0.**
+
+That is a direct conflict with the gradient measured here: `l_out-0` carries NaN (1,984), `l_out-1` carries 34.7 %
+of a 98-token tensor, and the stream is saturated by layer 15. **If the corruption were born at block 41, layers
+0–40 would be clean.** They are not.
+
+## The tension the record had already flagged, and how this resolves it
+
+The same record is not of one mind, and it says so. `315-row-p1c-inregime-mechanism.md`:
+
+> It does **not** reproduce section 47's "exactly one token's row" invariant, and does not refute it either ...
+> The two observations are in tension, and until the same instrument is run over the same arms, "one row" must
+> not be quoted as the fault's shape.
+
+That arm had `l_out-4` at **20480 of 20480 — the whole tensor** — while §40's window, over an apparently different
+episode, was clean before block 41. Two arms, two conclusions, explicitly left unresolved.
+
+**The gradient here resolves it, and in the direction the `l_out-4` reading pointed**: the stream is already
+essentially saturated at layer 4 (99.95 %), so an arm whose earliest instrumented layer is 4 can only report
+"everything is NaN from layer 4 on" — which reads as *born nearby* if one does not look earlier. The `strstr`
+defect meant no arm ever looked earlier than layer 4. **This is the first arm that reads layer 0.**
+
+## Why the reading is probably not a displaced read — the check that matters
+
+The obvious way to explain a too-early NaN is arena displacement: read `l_out-0`'s slot after later chunks have
+reused it, and report a later layer's NaN as layer 0's. **The readings argue against it:**
+
+| arm | `l_out-0` | `l_out-1` | `l_out-2` |
+|---|---|---|---|
+| `r1e` | **1984** | 69,568 | 73,664 |
+| `r2e` | **1984** | 14,272 | 16,320 |
+
+If `l_out-0`'s slot had been overwritten by `l_out-1`'s value, `l_out-0` would read whatever `l_out-1` reads —
+and `l_out-1` differs between the two arms (69,568 vs 14,272) while `l_out-0` is **identical** (1984). Displacement
+would have to have reproduced exactly 1984 twice in two arms of different sizes. The gradient is also monotone and
+smooth, and the **clean quiet arm in the same session shows zero NaN at every layer** — so these counts are
+tracking the fault, not noise.
+
+## The arbiter the record already specified
+
+§40 writes down, and explicitly does not run, the probe that settles causality for block 41:
+
+    GGML_HRX_TENSOR_FP=l_out-40,ffn_inp-41,ffn_norm-41,ffn_shexp-41,ffn_swiglu-41,ffn_moe_out-41,ffn_out-41,l_out-41,
+                       attn_norm-42,ffn_inp-42,ffn_norm-42
+
+> the chain probe above is written down but not yet run
+
+**That probe is now more valuable than when it was written**: it should be run *together with* `l_out-0…l_out-4`, so
+that one arm can show both the early-layer counts and block 41's chain. If `ffn_inp-41` and `ffn_norm-41` are clean
+while `l_out-0` is not, §40's conclusion is refuted and the early origin stands; if the early layers are clean in
+that arm, then this gradient and §40 describe two different episodes and only the arm-in-common comparison can
+separate them.
+
+## What must not be claimed yet
+
+- **One session, four arms, three Face A.** The gradient is consistent across the three and the constant 1984 is
+  striking, but this is not yet a rate and not yet an independent replication outside this configuration.
+- **This is the heavily instrumented configuration** (name list + `COPY_PROBE` + `SENTINEL` + `LOGITS_FP`). The
+  face an arm takes is dose-dependent (see the selector comparison), so "which layer the NaN is born in" may also
+  be dose-dependent. **That has not been tested**, and it is the strongest reason to hold the conclusion loosely.
+- **§40 was not wrong about what it saw.** Its window really was clean before block 41 *in that arm*. The claim
+  being contested is the generalisation from one window to "born at block 41".

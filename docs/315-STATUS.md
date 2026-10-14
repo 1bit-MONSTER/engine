@@ -1816,3 +1816,75 @@ set. That decides whether "layer 41" is the defect or the instrument.
 only.
 
 Evidence: `docs/315-campaign/evidence/315-onset-layer-is-config-dependent.md`.
+
+---
+
+## Session of 2026-10-14 early: the site is instrument-relative, the size is not, and Face B was never measured
+
+Add-only. Nothing above is edited.
+
+### The site is instrument-relative — and the read pattern, not the probes, decides it
+
+Three configurations already on the record separate the two candidate variables:
+
+| condition | arms | selector | probes | first NaN at |
+|---|---|---|---|---|
+| A | `315size` | 15-name `l_out` list | none | **layer 0** |
+| B | `315lout4`, `315inp2` | `l_out` name list | `COPY_PROBE`+`SENTINEL`+`LOGITS_FP` | **layer 0** |
+| C | `315nan`, `315fbar` | **`tail:16`** | same three probes | **layer 41** |
+
+A vs B holds the selector and varies the probes: onset does not move. B vs C holds the probes and varies the
+selector: onset moves 0 → 41. So **the read pattern sets the onset**, and `hrx-producer` shows `graph n_nodes=9`,
+making `tail:16` cover **every** node of a subgraph (~9 reads/chunk) against ~1–3 for a name list. That also
+explains why `tail:16`'s recorded yield did not reproduce: reading every node is a different regime.
+
+`315cfg` (the controlled A′-vs-B run) was **stopped with no arm run** — condition B already existed as
+`315lout4`, and the gate stayed shut on `load1 ≈ 9` against a required <4. Recorded as a stop, not a pruning.
+
+### What survives: the size, not the site
+
+| condition | onset count | bytes | rows |
+|---|---|---|---|
+| C | 2048 | 8,192 | 1.000 |
+| B | 1984, 1984, 2048 | 7,936 / 8,192 | 0.969, 1.000 |
+| A | 1984, 1984, 1790 | 7,936 / 7,160 | 0.969, 0.874 |
+
+**Five of the seven non-saturated onset readings lie in 7,936–8,192 bytes — one row ± one 256-byte block** —
+across three configurations, two rigs, `T = 39…348`. `nan = 2048` *exactly* is a property of condition C, not
+of the defect. And in all four arms where `hrx-finite-fp` printed, **`finite + nan` equalled the extent
+exactly**, so the count comes from a complete read. Any "the corruption is at layer N" claim is
+instrument-relative; "the corruption is about one row" is not.
+
+### Face B: never measured with a capable instrument, and never invalid UTF-8
+
+- **No arm on the record carries both a fingerprint and Face-B evidence.** The fingerprint's only gate is
+  `if (fp_nan_only && nan == 0) continue;`, so an arm with fingerprint lines has NaN and an arm with Face B has
+  none — the two faces are **mutually exclusive in the instrument's output**. Face B's requirement is therefore
+  not addressable from existing data.
+- **Face B has an invariant signature** across 15 arms: `nan=0 http=1 s500=1 unparsed=2`, in **all three cells
+  including the quiet cell** (`side=0/0`, three runs) and even one `OOR` arm — so it is not eviction-specific
+  either. Counting subtleties: `unparsed=2` is a *log-line* count for one event, `http=1 s500=1` is the same
+  failure counted twice, and `req < 66` alone forces `FAULT`.
+- **Invalid UTF-8 has never been observed.** Of 3,200 request records and 267 greedy-output files, zero bodies
+  are invalid UTF-8; the three apparent cases are 32-byte *excerpt* truncations (`utf8_ok=True json_ok=True` on
+  the full bodies), and the 34 `utf8_ok=False` records are transport failures with no body. Face B as recorded
+  is **Content-only / non-JSON output answered with HTTP 500**.
+- A third-manifestation hypothesis ("wrong but well-formed output at HTTP 200") was **tested and withdrawn**:
+  the maximum repetition ratio is reached by clean quiet-cell arms, so degeneracy is a property of the prompts.
+
+### Criterion table, updated
+
+| # | criterion | state after this session |
+|---|---|---|
+| 1 | named, falsifiable mechanism | **site is NOT nameable** — it moves with the read pattern; the instrument-independent fact is the **size** (~one row, 7,936–8,192 B). Both faces still lack a cause |
+| 2 | forward-only fix landed | unchanged: not achievable until the buffer question is settled; the instrument-relative site makes a layer-targeted fix unsound |
+| 3 | ≥60 in-regime arms, zero faults | unchanged; and the acceptance detector must catch **Content-only/HTTP 500**, since a UTF-8 check would never fire |
+| 4 | no regression | unchanged, measured on both halves |
+| 5 | KNOWN-ISSUES updated | status recorded here; the `KNOWN-ISSUES.md` edit remains with the session that owns that file |
+
+### Evidence
+
+`315-instrument-independent-summary.md`, `315-onset-is-set-by-read-pattern-not-probes.md`,
+`315-subgraphs-are-9-nodes-so-tail-covers-all.md`, `315-faceb-invariant-signature.md`,
+`315-faceb-has-no-capable-instrument.md`, `315-invalid-utf8-never-observed.md`,
+`315-1984-reconciles-the-two-populations.md`, plus the coordination notes in `315-COORDINATION.md`.

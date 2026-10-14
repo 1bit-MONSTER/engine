@@ -100,3 +100,32 @@ measured section are facts, the mechanism paragraph is inference, and it rests o
 from this same line of work were over-claimed and retracted (the layer-41 onset, and the fixed 32-entry
 boundary); this document states its inferential step explicitly so that it can be the third thing checked rather
 than the third thing retracted.
+
+## Verification against the buffer trace: the arena is real, and it is the one the code comment named
+
+The architectural premise was checked rather than assumed. Every `[hrx-buf]` line in the record:
+
+    type=HRX0        host_visible=0  memory_type=0x30  size=17895352832    71x   <- device-local
+    type=HRX0        host_visible=0  memory_type=0x30  size=81788928       70x
+    type=HRX0        host_visible=0  memory_type=0x30  size=443547648      70x
+    type=HRX0_HOST   host_visible=1  direct_host_binding=1  memory_type=0x56  size=44048640   37x
+    type=HRX0_HOST   host_visible=1  direct_host_binding=0  memory_type=0x52  size=44048640   22x
+    type=HRX0_HOST   host_visible=1  direct_host_binding=0  memory_type=0x56  size=44048640   11x
+    type=HRX0_HOST   host_visible=1  memory_type=0x52/0x56   size=619520    22x / 48x       <- the logits tensor
+
+Three things follow:
+
+1. **`44048640` is exactly the arena the backend's own comment named** — *"a host-visible, non-coherent arena
+   (44048640 bytes; see the buffer trace)"*. The trace shows it as `type=HRX0_HOST host_visible=1`, so the device
+   does read it and the CPU does too.
+2. **`44048640` is the KV working set.** With K = 576 and V = 512 per layer over 42 layers at f32, one position
+   costs `42 x (576+512) x 4 = 182,784` bytes, and `44048640 / 182784 = 240.9` — i.e. **~241 positions of K/V for
+   the whole stack.** So this is precisely the buffer the prefill writes and the decode reads.
+3. **The coherence declaration varies by arm** (`0x52` in 22 arms, `0x56` in 48, `direct_host_binding` 1 vs 0),
+   which is a *config* difference, not a fault difference — and per
+   `315-coherence-closed-from-source-both-paths.md` the imported buffer's type is hardcoded `0x52` on every
+   allocation path regardless, so the label is not the memory.
+
+**So the premise stands on trace evidence, not on inference:** a 42 MB host-visible buffer holding the K/V for the
+whole stack, read by the device and by the host, with **no invalidate and no flush anywhere in the runtime**, and
+with the coherence flags that would have made it safe never reaching the allocation.

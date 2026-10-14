@@ -78,3 +78,27 @@ mid-graph read can name the site.
 ## Reproducing
 
     grep -ahE "hrx-tensor-fp" ~/wt/rt-det/*/server.log | grep -aE "nan=(1984|1790) of"
+
+### Self-test of the hypothesis, done immediately: it does not hold as stated
+
+The hypothesis says the count is a function of the tensor's **byte offset mod 256** relative to a fixed region.
+If that were the whole story, the *same tensor* would give the *same* count. It does not: `l_out-0` reads
+**1984** in three arms (extents 200,704 / 276,480 / 503,808) and **1790** in a fourth (20,480).
+
+Two readings survive that, and they are worth separating because only one of them is testable without more
+data:
+
+- **The offsets may differ between arms.** The four `l_out-0` readings come from arms with different sequence
+  lengths, so their buffers are different sizes and the allocator may place them at different alignments. Then
+  the hypothesis is not falsified — but it is also **not tested**, because no offset was recorded. Testing it
+  needs the arena's allocation offsets per arm, which the logs do not carry.
+- **Or the count is not an alignment function at all**, and `1984` and `1790` are two genuine sizes,
+  `1984 − 1790 = 194`, which is not a multiple of 64.
+
+So the honest status of the hypothesis is **untested, not supported**. What the 1984/7936 arithmetic does
+establish is narrower and still useful: the earlier session's `7936` and this session's `8192` are **one row
+differing by exactly one 256-byte block** — a fact about the two reported figures, independent of whatever
+produces them. The mechanism reading of it is a conjecture that this note has just failed to confirm.
+
+The test that would settle it is concrete and cheap: the same tensor read in the same arm at two known arena
+offsets, or the arena offsets printed alongside the counts. Until then the claim stays at the arithmetic.

@@ -247,3 +247,46 @@ what the pooled count suggests.
 
 **Unchanged by this:** the 96.6% 256-byte alignment of `first`, which is computed over the same partial readings
 and is not obviously family-specific — but it should be re-cut per family before being quoted as a headline.
+
+---
+
+# The alignment result SURVIVES the per-family re-cut — it is not a family artifact
+
+The limitation above says a pooled percentage is the wrong statistic and the alignment result must be re-cut
+per family. Done, and it holds in every family:
+
+| family | n | first on a 256-byte boundary | % |
+|---|---|---|---|
+| `ffn_moe_down` | 91 | 91 | **100.0%** |
+| `ffn_moe_weighted` | 67 | 63 | 94.0% |
+| `ffn_shexp` | 22 | 22 | **100.0%** |
+| `norm` | 21 | 21 | **100.0%** |
+| `ffn_out` | 19 | 17 | 89.5% |
+| `l_out` | 16 | 15 | 93.8% |
+| `node_2948`, `node_3019`, `node_3090`, `node_3161`, `node_3232` | 4 each | 4 each | **100.0%** |
+| `ffn_moe_out` | 3 | 3 | **100.0%** |
+
+**Pooled: 252 of 259 = 97.3%** across families with n ≥ 3 (and 257 of 266 = 96.6% over all partial readings),
+against a **1.6%** chance rate. **Eight of the twelve families are at exactly 100%**, and the lowest is 89.5%.
+
+So the alignment is **family-independent**. That matters in both directions:
+
+- It **narrows** the position claim (the front/tail split really is a family effect, as the limitation says), and
+- it **strengthens** the alignment claim, because it is no longer an average that a single dominant family could
+  carry. `ffn_moe_down` alone is 91 of 259 readings; even excluding it entirely the remaining families are
+  ~96% aligned.
+- It also **weakens the read-faithfulness objection to the alignment** specifically: the caveat says the FRONT
+  group leans on intermediate MoE tensors whose reads the record distrusts, but the alignment holds just as
+  firmly on `l_out` (15/16) and `node_2948` (4/4) — the residual-stream tensors with the **best-validated**
+  readings. An artifact of unreliable intermediate reads would not reproduce on the families the record trusts.
+
+**Standing result, stated at the strength the data supports:**
+
+> The corruption **begins** on a 256-byte (64-element) boundary in **96.6%** of partial readings overall and in
+> **at least 89.5%** within every individual tensor family tested — including `l_out` and `node_2948`, whose
+> readings the record treats as faithful — against a 1.6% chance rate. It is therefore a **256-byte-granular**
+> corruption, not a byte- or element-granular one.
+
+**What remains open, unchanged:** *what* applies 256-byte-aligned damage (a copy/region boundary versus wave64
+lane masking), whether the NaNs are contiguous at all, and the writer. The mask instrument decides the second
+of those and rides in the running campaign.

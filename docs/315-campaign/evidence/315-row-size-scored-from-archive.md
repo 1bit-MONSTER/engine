@@ -63,12 +63,27 @@ measurable rather than asserted. Grouping each arm's `l_out-N` lines by content 
 
 **Layers two apart return identical content, in every arm that shows it.** That is the arena slot reuse the
 record already identified (`315-idprobe-readpath-refuted.md`: the fingerprint reads after the whole graph has
-run, so a slot whose tensor's lifetime ended is reassigned) — now measured with a **2-layer stride**. A
-per-layer NaN count taken from `l_out-N` is therefore **not** a per-layer measurement.
+run, so a slot whose tensor's lifetime ended is reassigned) — now measured with a **2-layer stride**.
+
+**Scope correction (this document first stated the stride too broadly).** The coincidence is only evidence of
+aliasing when the reads are **not saturated**. Fully-NaN tensors hash identically whatever layer they are from,
+so an all-NaN `l_out-42` and an all-NaN `l_out-45` matching proves nothing. The *sound* instances are the
+`315fbar` cold-cell arms at **25 % NaN** (`nan=19968 of 79872`), where two different layers returning
+byte-identical largely-finite 319 KB outputs cannot be genuine. In `315lout4-r1e` a stride-**3** family
+(`l_out-15 l_out-18 l_out-21 l_out-24 l_out-27 l_out-30 l_out-33 l_out-36 l_out-39 l_out-42 l_out-45`) shares
+one hash — but every member of it reads `nan=200704 of 200704`, i.e. **fully saturated**, so that family is
+**explained by saturation and is not evidence of aliasing**. The safe statement is therefore narrower than the
+first version of this file made it: **coincident hashes are aliasing only when the reads are unsaturated, and
+the only sound instances found are the stride-2 pairs in the `315fbar` cold cell.** The stride may differ by
+configuration; nothing here establishes one universal value.
 
 The `node_NNNN` reads do **not** share this defect: across the same arms, the only coincident pair is
-`node_3304 ≡ node_3305` (a distinct, adjacent family), and **`node_2948` never coincides with anything**.
-That is why the finding above is stated on the node read.
+`node_3304 ≡ node_3305` (a distinct, adjacent family), and **`node_2948` never coincides with anything**. That
+is why the finding above is stated on the node read. Note the asymmetry is partly structural rather than
+lucky: an unnamed node is read at one position in its chunk's window, so it appears once per call, whereas the
+`l_out` names in a `tail:16` window are the *same* arena region reached from different layers — which is
+exactly the condition under which aliasing shows up. The practical rule either way: **two readings with the
+same hash are one reading.**
 
 ## What this does and does not do
 

@@ -219,3 +219,53 @@ separate them.
   be dose-dependent. **That has not been tested**, and it is the strongest reason to hold the conclusion loosely.
 - **§40 was not wrong about what it saw.** Its window really was clean before block 41 *in that arm*. The claim
   being contested is the generalisation from one window to "born at block 41".
+
+---
+
+# Pre-registration: where inside `l_out-0` do the 1,984 NaN sit?
+
+Written before the run. Answers the one thing `315fp-build` cannot: this build prints `bytes / nan / of / hash` and
+**omits `ne0`, `first` and `row`** — `315row-build` prints them (`[hrx-tensor-fp] ... ne0=%lld first=...`). Without
+them, "contiguous prefix of 1984", "suffix of 1984", and "31 scattered 64-blocks" are indistinguishable.
+
+## The run
+
+    BIN=~/wt/315row-build/bin
+    EXTRA_ENV="GGML_HRX_COPY_PROBE=1 GGML_HRX_SENTINEL=1 \
+               GGML_HRX_TENSOR_FP=l_out-0,l_out-1,l_out-2,l_out-3,l_out-4 \
+               GGML_HRX_TENSOR_FP_NANONLY=1"
+
+Narrow selector (5 names — a *lower* dose than the 16-name runs, which is the direction that favours Face A), the
+configuration `315row` itself used for that build, plus `SENTINEL`. `LOGITS_FP` is absent from this build and is
+therefore omitted rather than silently ignored.
+
+## Readout, fixed in advance
+
+`first` is a **byte** offset (established earlier in this campaign: `ffn_moe_weights-4` printed `first=32` for a
+tensor whose first NaN is at element 8). So, for `l_out-0` with `nan=1984`:
+
+| `first` | meaning |
+|---|---|
+| **0** | the NaN are a **prefix**: elements 0…1983, i.e. **the last 64 elements of the row survive** |
+| **256** | elements 64…2047, i.e. **the first 64 elements — exactly one 256-byte block — survive** |
+| other | report the offset; a value that is a multiple of 256 (the alignment unit the record gives for the MoE tables) is noteworthy, one that is not, more so |
+| `nan` ≠ 1984 | the constant does not reproduce under this build; recorded, and no shape claim is made from it |
+
+`row=` is read alongside: which row the first NaN falls in distinguishes "the corruption is one row's tail" from
+"the corruption is a fixed byte range spanning rows".
+
+## Why this is worth a run rather than an inference
+
+`1984 = 2048 − 64` and `64 f32 = 256 bytes`, and **256 is the alignment the record gives for the MoE tables**
+(`dispatch-mul-mat-id-common.h:311-317`, `alignment 256`). If `first=256`, the shape is "one 256-byte-aligned block
+at the head of a row survived, the remaining 1,984 elements did not" — a partial-write-shaped corruption, and a far
+more specific thing to look for than "layer 0". If `first=0`, it is a tail loss and that reading dies.
+
+## Confounds
+
+- **Different build and pin.** `315row-build` is from the `315row` session's pin, not the current one, so the shape
+  measured is that build's. A shape that reproduces across builds is stronger; a shape seen in only one is a lead,
+  not a fact.
+- **Lower dose than the runs whose count it is checking** (5 names vs 16). If the count differs, that is itself a
+  dose-dependence datum, and no shape claim follows.
+- **Instrument induces**; no rate, no acceptance arm.

@@ -78,3 +78,28 @@ is still thermally blocked when you read this, stopping it loses little — and 
 is the one thing blocking the box right now.
 
 Full evidence: `docs/315-campaign/evidence/315-onset-is-set-by-read-pattern-not-probes.md`.
+
+---
+
+## 2026-10-14 05:39 — `315prod` is QUEUED and holds `box.lock`; the box is load-blocked by foreign work
+
+`315prod` (the producer-side sentinel/payload test, pre-registered in
+`docs/315-campaign/evidence/315-producer-probe-preregistration.md` with its two amendments) took `box.lock`
+at 05:37:34 and is in its **gate wait**: `tctl = 96 °C` against a required < 80, and `load1 = 30` against a
+required < 4.
+
+The load is **not** 315 work and is **not** junk — it is `60 decompile` processes plus java workers (Ghidra /
+JADX), i.e. someone's reverse-engineering lane. **I am not touching them**, per the objective's "do not
+disturb other workloads". Consequences:
+
+- The gate requires `load1 < 4`, which that CPU work controls, so `315prod` cannot start until it finishes.
+  Its own cap is 2 h (aborts with exit 6 at ~07:38), and it will report either way.
+- While waiting it holds the lock **and** three composed GLM neighbours at `gtt = 79G`. That is ~79 GB of
+  GTT held by a run that is doing nothing. If you need the box or the GTT for the 315 lane, the run is
+  yours to stop — kill `~/wt/315prod.sh` and the `315-disc.sh 8 315prod` child; the lock fd is inherited by
+  the script's `sleep`, so check `/proc/*/fd` for a leftover holder rather than assuming `flock` cleared.
+
+**Why this run matters, in one line:** it is the only instrument on this record that asks *did the device
+write the bytes the consumer reads* — it fills the host-visible region with its own payload `0x7FC0DEAD`
+**before** each hooked graph and classifies **after a drained stream**, and the archive contains **zero**
+`[hrx-producer] armed` and **zero** `[hrx-producer] anomaly` lines, i.e. it has never once been enabled.

@@ -552,3 +552,52 @@ corrupted without saying *what writes it*, since no instrument on the record obs
 measured in 18 of 19 arms, and Face B's Content-only/HTTP-500 signature appears in 15 arms including control
 cells. What has changed is that the mechanism cannot be named with the instruments that exist, and the site
 in every earlier reading was an artifact of the instrument that produced it.
+
+### 2026-10-15 — the mechanism is named and a forward-only fix is landed; the acceptance campaign is running
+
+**Status line unchanged: OPEN**, because the acceptance criterion is met by the campaign below and its
+result is not in yet. What has changed is that the mechanism is now named, which is the precondition this
+entry's own rule sets for anything to be recorded.
+
+**The mechanism.** `llama_context::decode` obtains the logits through an **asynchronous** read that this
+backend never completes, and the decode's own completion wait is commented out on a premise that is false
+here. Four links, each at file:line:
+
+1. `src/llama-context.cpp:1483-1489` extracts the logits with `ggml_backend_tensor_get_async(...)`.
+2. `ggml/src/ggml-backend.cpp:268-280` **skips its own `ggml_backend_synchronize`** when the backend
+   implements `get_tensor_async` — and HRX does.
+3. `ggml-hrx.cpp:454-473` (`backend_get_tensor_async`) enqueues `hrx_stream_copy_buffer` on the stream and
+   **returns without waiting**. Measured, not assumed: the engine's read is
+   `name=result_output bytes=619520 host_dst=0x7fed46100000 registered=1` — the registered-host-buffer
+   branch, which has no wait at all.
+4. `src/llama-context.cpp:2087`, at the end of `decode`:
+   `// wait for the computation to finish (automatically done when obtaining the model output)` followed by
+   `//synchronize();`. The premise is false for a backend that implements the async read, because obtaining
+   the output *is* links 1-3. The two other `synchronize()` calls in `decode` do not cover this path
+   (one is guarded by `if (!embd_seq.empty())` — embeddings; the other is in `encode`, not `decode`).
+
+So `llama_decode` returns with the copy — and possibly the graph — still in flight, and the sampler reads
+the destination: the **previous** token's logits (finite, plausible, wrong → the format-500 body) or a
+region **not yet written** (→ all-NaN logits). Intermittency is whether the copy has completed.
+
+This explains the levers already falsified on this record without contradicting any of them: coherence is
+irrelevant (§13 — a missing wait is not a memory-visibility property), the earlier sync cell missed it
+because it synchronized at the end of `graph_compute`, *before* the copy is issued, and the read-ordering
+work ordered the instrument's reads rather than the engine's.
+
+**The fix, forward-only.** Fork commit `47a8fe929` on `1bit-MONSTER/llama.cpp` branch
+`1bit/315-logits-read-wait` — wait for the async logits read where it is issued — and the engine pin on
+`1bit/315-preregistration` moves `e44c9d01a → 47a8fe929` (`95238dc`), with
+`git merge-base --is-ancestor e44c9d01a 47a8fe929` true. It is not a revert.
+
+**The campaign.** Pre-registered before it ran
+(`docs/315-campaign/evidence/315-campaign-preregistration.md`): 60 in-regime **fix** arms plus 20
+interleaved **control** arms on the unfixed build, same harness, same regime gate `[95,110] GiB`, one
+window, instruments off, stopping at the first fix-cell fault. Zero faults in 60 arms gives a one-sided
+95 % upper bound of `1 − 0.05^(1/60) ≈ 4.9 %`. A clean fix cell with a control cell that never faults is
+reported as **under-powered, not passed**.
+
+**Evidence paths:** `docs/315-campaign/evidence/315-MECHANISM-unwaited-async-logits-read.md` (the mechanism
+and its falsifier), `…-campaign-preregistration.md`, `…-which-binary-is-which.md` (cell F =
+`~/wt/315logwait-build` at `47a8fe929`; cell C = `~/wt/315fixlog-build` at `e44c9d01a`; both with
+`hrx-f32-sync` and `hrx-wb-read` = 0).

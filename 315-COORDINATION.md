@@ -394,3 +394,70 @@ plus §51's rank-sort precondition, which is **unmeasured and not measurable by 
 **Handed forward:** `result_norm` changes between two consecutive identical plain reads in a faulting arm, at
 two different addresses, with no pending host writeback at the engine's logits read and a fresh synchronise
 failing to stop it. `KNOWN-ISSUES.md` stays **OPEN**.
+
+---
+
+## 2026-10-15 — TO ALL SESSIONS AND LANES: the shipped Lemonade SDK, reversed (report + five traps)
+
+**Lane:** standalone REA work, no engine code touched. **Deliverable:** `~/rea-lemonade-analysis`
+(git HEAD `2a4ed3e`, `REPORT.md` 696 lines) with a self-checking verifier, `tools/verify-lemonade-report.py`
+(**317 checks, 0 failed**; exits non-zero on failure). Auditor-approved after two rejections — both rejections
+were correct, and what they caught is in §6(a)–(f) of the report.
+
+**Why the engine lane should care:** `1bit.cpp` pins lemonade because **lemonade's `hrx-b*` pin is the actual
+product HRX carrier**, not our llama.cpp fork. This is the shipped product, read from the binary, not the repo.
+
+**Artifact (content-pinned, do not substitute):**
+`~/Downloads/lemonade-embeddable-11.7.0-ubuntu-x64.tar.gz`
+sha256 `6253558fbdd4b1b6ee058af4c099f2aea5eda9df0f415ceea5e7bfe166d74b12` (7,113,355 B); extracted to
+`~/rea-lemonade-11.7.0`. `lemond` `f70a54c4…` (the server), `lemonade` `cf8e6727…` (the client). Both ELF PIE,
+**not stripped**, no DWARF.
+
+**What the product is.** `lemond` is the server and owns the entire serving/backend stack — `lemon::Server::`
+(1003), `WebSocketServer` (82), `HttpServer` (6), `BackendUtils` (88), `LlamaCppServer` (68), `FastFlowLMServer`
+(51), `make_spec` (39, **13 distinct instantiations**) — **all exactly zero in the client**. `lemonade` is its
+HTTP client (`--help`: "Lemonade CLI - HTTP client for Lemonade Server"), default `127.0.0.1:13305`, env
+`LEMONADE_HOST`/`PORT`/`API_KEY`, plus UDP-beacon discovery. **But the registry and utility layers are SHARED**
+(`LinuxProcessPlatform` 41/41, `ProcessManager` 23/23, `RegistrySearchResult` 28/28) — do not repeat my mistake of
+calling the client bare. It has a process platform because `handle_launch_command` is an **agent launcher**.
+
+**Launch path.** locate (`get_backend_binary_path`, keyed `stable` / `rocm-`) → `choose_port` →
+`LinuxProcessPlatform::spawn_process` (**fork + execvp**) → `ProcessHandle` → `wait_for_ready` →
+`forward_streaming_request` → watchdog reset → reap. The children are named by the client's own `--help-all`:
+**`llama-server`, `vllm-server`, `flm serve`, `sd-server`, `whisper-server`, `moonshine-server`**, each with a
+passthrough-args flag. Device = backend-name+ordinal (e.g. `Vulkan0`).
+
+**Pins and asset naming.** `resources/backend_versions.json`: llamacpp `{vulkan b10375, rocm-stable b10470,
+rocm-nightly b1311, cuda b10397, metal b10375, cpu b10375}`, whispercpp v1.8.4, sd-cpp master-820-de298c2. These
+are **release tags, not commit hashes**. `lookup_expected_asset_hash` accepts two shapes — the shipped
+`checksums.github.<owner/repo>.<tag>.<asset> = "sha256:<hex>"` and an unused `artifact_hashes` object shape.
+`rocm_asset_families`: **`gfx1201` (this box) → `gfx120X`**, `gfx1100-1103 → gfx110X`, `gfx1030-1035 → gfx103X`;
+`gfx908`/`gfx90a` verbatim. That is why `is_concrete_gfx_arch` is only a `gfx` prefix test.
+
+**FIVE TRAPS — each cost real time and produced at least one false claim.**
+1. **A filtered view is not a fact.** Reading an absence off `nm -C | grep X` produced a false headline. Check
+   unfiltered, and check **both** binaries.
+2. **A checker that validates a chosen subset certifies a subset.** A green 250-check run passed
+   `lemond links libm, client does not` while the prose asserted libm was *not* a difference. Have the checker
+   parse the report's own tables and re-derive them, **in both directions**.
+3. **String-pool fragments look like source typos.** `resources/backennd_versions.json` is not a typo: the
+   disassembly stores 16 bytes at +0 and the next 16 at **+15**, rebuilding the correct 31-char path. Look for a
+   correct copy elsewhere before reporting a bug.
+4. **`strings -n` is a MINIMUM length.** `-n 8` returns *none* of the six/seven-char `gfx` names.
+5. **Lowest-address symbol wins is wrong** — `.text.cold` clones and generated lambdas sort low, so you analyse
+   an error path or a lambda destructor. Also, a **name-keyed** symbol dict collapses weak aliases and yields
+   bogus function sizes; collect addresses.
+
+**REA specifically: the MCP path cancels its own work.** `rea_batch_decompile`/`rea_procedure_pseudo_code`/
+`rea_binary_overview` appear to hang, and the retained evidence says
+`code: cancelled — "Analysis was cancelled. Start it again when ready."` **The client timeout cancels the
+analysis it started, so retrying through MCP is actively counterproductive.** REA's declared profile is
+`{cpu_seconds: 30}` plus a ~10 MB MCP response budget. Use the CLI instead —
+`rea decompile <path> <addr> --snapshot <dir> --format json` — and reach retained evidence with
+`rea_get_evidence_bundle` → `export_evidence_bundle` (a "timed out" call may have left a complete or failed
+record). `rea_inspect_binary_layout` works through MCP but its result may have to be exported to disk.
+
+**Open, not settled:** control flow of any function; what the client's agent launcher spawns and with what
+environment; why `ProcessManager::find_free_port` is needed client-side; who assembles the child's argv
+daemon-side; the second string-pool fragment. No daemon was started and no network request made — the client ran
+only with `--help`/`--help-all` under a scratch `HOME`.

@@ -91,3 +91,22 @@ measurement does not support.
 
 No instrumentation was weakened: the script is left as it ran so the verdict it produced stays reproducible,
 and the correction is the direct measurement recorded above.
+
+## The artifact reproduces in the observer's own output
+
+The background watcher that waited for this run evaluated the same three expressions and printed the same
+corruption into its own record, which is a second, independent reproduction available in the preserved task
+output:
+
+```
+dense control: responses=50 distinct_content=1 nan_guard=0
+0 hsa=0
+0 content_only=0
+0
+RESULT: FAULT or incomplete - inspect /home/bcloud/wt/315dense-newpin/server.log
+```
+
+Note `nan_guard=0` followed by a bare `0` on the next line: that is the second `0` from the `|| echo 0`
+fallback, sitting inside the variable. Two independent readers of the same log — the script and the watcher —
+agree on `responses=50 distinct_content=1 nan_guard=0 hsa=0 content_only=0`, and both were driven to the same
+false verdict by the same mechanism. The measurement is the four counts plus `responses`, not the verdict.

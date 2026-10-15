@@ -93,3 +93,36 @@ would expect the clamping kernel. That expectation is an inference, not a measur
 **Falsifier:** if `ffn_moe_weights` is served by `ggml_get_rows_small_f32`, then section 50's "bad id"
 alternative is eliminated for the tensor it was raised about, and what remains of this note is the
 general observation that the weight gather enforces its id bound by assumption rather than by check.
+
+## Resolved: which kernel serves which, read from the two matchers
+
+Both matchers are in `dispatch_registration/common/`, and the selection is **shape-dependent**, not
+fixed. `match_get_rows_small` (`dispatch-small-rows.cpp:182`) states its own place in the order in its
+header comment — *"Only rows the regular get_rows kernel does not take (narrower than 4 floats, or not a
+multiple of 4)"* — and enforces it:
+
+```cpp
+if ((w >= 4 && w % 4 == 0) || w > 65536 || s > 65536 || b > 65536 || r > 65536 || ...) {
+    return false;                       // the CLAMPING kernel refuses this shape
+}
+```
+
+with the registration priorities `common.get_rows_small_f32` = 0 against `common.get_rows.f32` = 100 and
+`common.get_rows.f32_next` = 150 (`dispatch-get-rows.cpp:298-320`). So the **clamping** kernel is the
+exception — it takes only what the regular kernel refuses — and the **assuming** kernel is the rule.
+
+Is a plain f32 source allowed to reach the assuming kernel? Yes. `match_get_rows_f32` requires only
+`get_rows_format_for_type(weight->type, ...)`, and the supported list in
+`dispatch-mul-mat-weight-format.h` **includes `case GGML_TYPE_F32`** (alongside F16, BF16 and the
+quantised formats).
+
+**That resolves this note's falsifier against the elimination.** `ffn_moe_weights =
+ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` has an f32 source, and for any row width the regular kernel
+accepts it is served by `ggml_get_rows_f32` — the one whose bound is `index.assume [lt(token_id,
+row_count)]` and which does **not** clamp an out-of-range id. Section 50's "reading out of range (a bad
+id)" therefore survives for this tensor, and it chains to section 51's verified producer defect: a stale
+or duplicated id out of the rank sort would be unbounded here, not clamped.
+
+The converse also has to be stated, because it bounds the claim: for shapes the regular kernel refuses
+(`w < 4`, or `w % 4 != 0`) the clamping kernel runs and the id **is** bounded. The protection is real but
+shape-conditional, so a claim about this tensor must name the shape it was measured at.

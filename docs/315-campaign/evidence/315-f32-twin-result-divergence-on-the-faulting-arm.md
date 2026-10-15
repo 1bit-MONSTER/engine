@@ -144,6 +144,40 @@ pre-registration would not be mixed with a changed instrument.
   that it occurs on the logits tensor (Limit 1), or that it is causal rather than co-symptomatic. Two
   arms is two arms; the clean/faulting split is clean but n = 2.
 
+## The buffer the twin reads has a memory type that varies between arms
+
+Taken from the 71 arm logs that carry a buffer trace (`GGML_HRX_BUFFER_TRACE`), every distinct
+host-visible allocation:
+
+```
+type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=44048640
+type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x52 size=619520
+type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x56 size=44048640
+type=HRX0_HOST host_visible=1 direct_host_binding=0 memory_type=0x56 size=619520
+type=HRX0_HOST host_visible=1 direct_host_binding=1 memory_type=0x56 size=44048640
+type=HRX0_HOST host_visible=1 direct_host_binding=1 memory_type=0x56 size=619520
+```
+
+counts: **44 allocations at `0x52`** (non-coherent: `HOST_LOCAL|DEVICE_VISIBLE`) against **96 at `0x56`**
+(coherent: the same plus `HOST_COHERENT`). The two sizes are the logits buffer (619520 B = 154880 f32)
+and the arena the probe's comment names (44048640 B).
+
+Two consequences, both tightening the next run:
+
+1. **`result_norm` is not its own host-visible allocation.** No traced host-visible buffer is 8192 bytes
+   (its `ggml_nbytes`), so it is a view or slice inside one of these two buffers rather than a buffer of
+   its own. What the twin compares is therefore two reads of a region whose **memory type is not fixed
+   across arms** — and neither of my two arms had the trace enabled, so which type `result_norm`'s region
+   carried is **unknown**, not assumed.
+2. **The next run must enable `GGML_HRX_BUFFER_TRACE`**, so a divergence is tied to a measured memory
+   type rather than to the probe's comment. That also makes a clean two-cell comparison available that
+   has not been run: the same f32 twin against a `0x52` region and against a `0x56` region.
+
+This does not revive lever 1. Section 13's falsification stands where it was made — the **output** region
+was measured coherent (`hv56=1`) in the arm that faulted, so coherence there is not a sufficient cause of
+the *fault*. What is newly visible is narrower and different: the tensor the twin diverges on is not the
+output region, and its memory type was never recorded in these two arms.
+
 **Next run, in order:** (1) apply the read-twice control and re-run in-regime until the same fault, to
 settle Limit 2; (2) fix the `result_output` gap (use `tail:<N>` rather than the name list, so the logits
 node is covered even when the arm aborts) so the logits read is observed in the faulting arm.

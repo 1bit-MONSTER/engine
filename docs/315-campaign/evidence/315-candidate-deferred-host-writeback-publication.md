@@ -75,6 +75,53 @@ So the codebase (a) knows the destination holds the **previous** contents until 
 written a guard for **exactly one direction** — an *upload* must not read the destination before a pending
 download is published. There is no equivalent guard recorded on the **read** side.
 
+## The read side, which has no such guard
+
+`ggml-hrx.cpp:238` — the function the engine's host read actually goes through:
+
+```cpp
+static void buffer_get(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
+                       size_t offset, size_t size) {
+    auto *       context       = buffer_context(buffer);
+    const size_t source_offset = tensor_offset(context, tensor) + offset;
+    if (context->base != reinterpret_cast<uint8_t *>(GGML_HRX_FAKE_PTR_BASE)) {
+        std::memcpy(data, context->base + source_offset, size);   // <-- no publication check
+        return;
+    }
+    if (!HRX_CHECK(hrx_synchronous_d2h(context->device->device, context->buffer, source_offset, data, size))) { ... }
+}
+```
+
+When `context->base` is a real host mapping (`!= GGML_HRX_FAKE_PTR_BASE`) the read is a plain CPU `memcpy`
+out of the host-visible region, and it consults **neither** `has_pending_host_writebacks()` **nor** any
+publication point. So a read that arrives before the queued memcpy has run returns the destination's
+**previous** contents — the exact consequence the upload-side comment names, on the direction that has no
+check.
+
+And the two endpoints are the same memory. The only `add_host_writeback` call site is
+`command-program-executor.cpp:988`:
+
+```cpp
+if (ErrorResult error = take_status(hrx_stream_copy_buffer(context.stream, staging.buffer, 0,
+                                                           download_buffer, 0, staging.length))) { ... }
+context.graph_replay_state->add_host_writeback(staging.host_data, download_data, staging.length, download_buffer);
+```
+
+so the device writes `download_buffer`, and `staging.host_data` — passed as `host_destination` — is the
+host-side destination that a later read of that buffer returns. *That the host destination `buffer_get`
+computes as `context->base + source_offset` is the same region as `staging.host_data` is the one link not
+yet read from source; the discriminating experiment below confirms or kills it directly, which is why it is
+the experiment.*
+
+## The mechanism, complete
+
+> A device→host download is two steps. The device writes `download_buffer`; the step that puts the bytes in
+> the host-visible destination is a **queued CPU `memcpy`** (`add_host_writeback`), executed only when the
+> stream is next marked synchronised (`mark_stream_synchronized`). The reader (`buffer_get`, `ggml-hrx.cpp:238`)
+> reads that destination with a plain `memcpy` and checks nothing. **A read that beats publication returns the
+> previous contents.** The upload direction carries exactly this guard (`command-program-executor.cpp:881`);
+> the read direction does not.
+
 ## Why this fits every hard fact
 
 | fact on the record | how this explains it |

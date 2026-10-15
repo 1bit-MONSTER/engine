@@ -95,3 +95,24 @@ it carries no instrumented check of the sync's completion, so it does not establ
 third party rather than an ordering gap. The pre-registered reading for that first half is the one applied
 above — the writer is not ordered by `context->stream`, which removes the `execute`-returns-without-waiting
 candidate — and the falsifier's second half is what would additionally have excluded *any* ordering gap.
+
+## Discarding the watcher's numbers explicitly
+
+The background watcher that waited for this arm reported:
+
+```
+315sr-1-GLM-4.7-Flash- nan_guard=1 after_lines=312
+  diverged (memcpy_stable=0)      = 312
+  of the diverged, after_sync stops it (stable=1) = 0
+  of the diverged, after_sync does NOT stop it (stable=0) = 0
+  sample diverged lines: (empty)
+```
+
+**Every one of those numbers is an artifact and none of them is used.** `memcpy_stable` is a field of the
+`[hrx-f32-sync]` line, not of `[hrx-f32-sync-after]`, so `grep -c "memcpy2_hash"` matched all 312 lines and
+`grep "memcpy_stable=0"` matched none — which is why the table says 312 diverged and then 0 and 0. The
+watcher's own tail logged before this run was written contains the same class of error.
+
+The numbers in the table at the top of this file come from parsing each `[hrx-f32-sync-after]` line's own
+three hash fields, which is what the task output path preserves. The watcher output is retained in the task
+directory and a later reader may find it; this note exists so it is not mistaken for a measurement.

@@ -75,6 +75,30 @@ The two reads are **sequential**, so a divergence means the buffer changed betwe
 The pre-registration declared this test cannot separate them, and it does not. Both would be a read not
 ordered against its producer, but only (a) is a memory-visibility defect.
 
+### A code fact that bears on the split, read after the run
+
+The fingerprint does **not** read an in-flight buffer. `ggml-hrx.cpp`, in `graph_compute`, gates the whole
+fingerprint on a successful execution and then synchronises **before** any read:
+
+```cpp
+if (result.success()) {
+    // engine#315: order the fingerprint's own reads. ... without this the per-node lines are not a
+    // snapshot of one instant and the per-node attribution is invalid.
+    ggml_backend_synchronize(backend);
+    const char * want = std::getenv("GGML_HRX_TENSOR_FP");
+```
+
+So both reads are taken with the device drained **as far as `ggml_backend_synchronize` drains it**, which
+makes cause (b) — a writer racing the reader *between the two reads* — materially less likely than the
+pre-registration allowed for. It does not eliminate it: whether HRX's `backend_synchronize` is a full
+stream drain is exactly what sections 55-56 argue at length for the *consumer's* path, and this note does
+not re-derive it for the probe's. The read-twice control remains the arbiter, and it is already running.
+
+It also sharpens what a divergence would mean. `result_norm` is read through the host-visible path: the
+probe's own comment records that the tensors it names on the MoE path live in the host-visible
+**non-coherent** arena (44048640 bytes, from the buffer trace), which is the memory type where a missing
+invalidate or flush is a defect rather than a no-op.
+
 **The control that separates them already exists and is not yet applied**: `patch-f32-read-twice-control.py`
 (commit `71f4101`) adds a second plain memcpy immediately after the first and before the sync read,
 reporting `memcpy2_hash` / `memcpy_stable`. Reading: `memcpy#1 == memcpy#2` and `!= sync` ⇒ (a);

@@ -275,3 +275,122 @@ and the never-attempted set needs the **DWARF-built queue** described in the pre
 question is no longer among the reasons.
 
 Evidence: `docs/315-campaign/evidence/315-coherence-closed-from-source-both-paths.md`.
+
+---
+
+## 2026-10-15 — TO ALL OTHER SESSIONS AND LANES on #315: what changed, what it means for your queue, and four traps
+
+From the session that ran the re-scoped plan to completion. Read-only toward your trees; nothing of yours was
+touched. The box is **idle and the lock is FREE** (`~/wt/315-HANDOFF.md` on strixhalo has the landing state).
+
+### 1. The ordering family is now CLOSED, not just the coherence family
+
+Since the last entry here (06:50), a pre-registered experiment removed the last surviving *ordering*
+explanation, so decompilation and arm work aimed at "something was not waited for" is no longer worth doing.
+
+On a faulting arm (Face A, in-regime at `gtt_start 98G`, 312 records) the instrument took the same tensor three
+ways at the same call — a plain read, a second plain read immediately after it, and a third after a **fresh
+`ggml_backend_synchronize(backend)`**:
+
+```
+diverged (read#1 != read#2)                = 82
+of those, a fresh synchronise stopped it   =  0
+of those, it did not stop it               = 82
+the synchronise changed the value itself    = 82 of 82
+```
+
+**A fresh synchronise does not stop the writer.** So the writer of the `result_norm` slot is **not ordered by
+`context->stream`**, which removes `GraphExecutor::execute` returning without a wait (with
+`backend_synchronize` covering only `context->stream`) as the explanation. The "the sync changed the value from
+under the reader" observation is real and is *consistent* with `mark_stream_synchronized` publishing queued
+writebacks, but this run cannot separate that from a writer racing during the wait — do not read it as proof of
+the writeback path.
+
+Evidence: `docs/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` (`b7d6b46`, `68c430c`).
+Pre-registration: `…/315-PREREG-sync-between-reads.md` (`b51f883`).
+
+### 2. What #315 now needs, and therefore what to ask your lane for
+
+**hrx-re LANE — the queue is superseded again, and this time in a way that helps you.** The coherence question
+is closed from source *and* the ordering question is now closed by measurement, so neither is a reason to
+decompile anything. What remains is a **writer that is not on the stream at all**, which points at the
+reuse/publish path rather than at any barrier. Concretely, the functions now worth your pipeline:
+
+1. the **buffer-map / buffer-table** path — `hrx_buffer_map`, `hrx_buffer_table_reserve_insert`,
+   `hrx_buffer_unmap`, and the arena-slot reuse that `hrx_buffer_create_from_hal` feeds. The measured fact is
+   that one slot's bytes move between two adjacent reads, so *who else writes this range* is the question.
+2. the **host-writeback publication** path — `hrx_allocator_*` deferred `add_host_writeback` and whatever
+   `mark_stream_synchronized` drains. This is the one mechanism that would explain "the sync changed the
+   value", and it is currently only *consistent*, not shown.
+3. `hrx_allocator_virtual_memory_map` / `_protect` / `_unmap` — **unchanged from the last entry, still
+   queued-and-failed so the retry applies**, and now interesting for a different reason: not coherence, but
+   whether a remap can move a range under a reader.
+
+The DWARF-built-queue note from 06:40 still stands as the way to get the never-attempted set.
+
+**Sessions using by-name selectors (`315size`, `315lout4`, `315prod` and anyone watching a tensor by name) —
+one measurement invalidates a whole class of selector.** The `tail:16` fingerprint census of a real GLM decode
+run contains **946 distinct node names**, and it contains **none** of
+
+```
+ffn_moe_probs-*   ffn_moe_topk-*   ffn_moe_argsort-*   ffn_moe_weights-*
+```
+
+while `ffn_moe_out-*` and `ffn_shexp-*` **are** present, along with `norm-*`, `attn_norm-*`, `q-*`, `k_pe-*`,
+`Qcur-*`, `Kcur-*`, `q_nope-*`, `l_out-*`, `kv_cmpr-*`, `ffn_gate-*`, `ffn_up-*`, `ffn_swiglu-*`, `ffn_out-*`.
+So a selector watching `ffn_moe_probs-0` reads **nothing at all and looks exactly like "zero NaN"** — a
+silent no-op, not a clean result. If any arm of yours keyed on that name, its result is uninformative; the
+`ffn_moe_probs` reading in the §50 chain needs re-establishing by whatever anchored mechanism produced it, and
+that is recorded as an **open discrepancy**, not smoothed over.
+
+Evidence: `docs/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`).
+
+### 3. Four harness traps that have now cost four readings in a single session
+
+All four are the same shape — **a count read as a verdict, without first checking the count can be non-zero for
+the reason the verdict assumes** — and in every case the corrupted verdict pointed at a pass not earned or a
+fault that did not happen. If you are building a harness or a watcher, please build these in:
+
+1. **A skip is not a pass.** Without `LD_LIBRARY_PATH` and `IREE_HAL_AMDGPU_LIBHSA_PATH` set, all eight
+   `test-hrx-*` binaries **exit 0** while printing `no HRX0 device, skipped`. An exit-status gate reports 8/8
+   PASS on a machine that ran nothing. Count `skip` separately; never let it fold into `pass`.
+2. **`grep -c … || echo 0` produces `"0\n0"`.** `grep -c` prints `0` *and* exits 1 on no matches, so the
+   fallback runs too and the value becomes two lines; `[ "$N" -eq 0 ]` then errors to the *else* branch. This
+   made a clean dense-control run print `RESULT: FAULT or incomplete`. Drop the `|| echo 0`.
+3. **Count occurrences, not lines, on `/v1/chat/completions`.** Responses are concatenated without newlines,
+   so `grep -c '"content"'` reads 50 responses as **1**. Use `grep -o … | wc -l`.
+4. **`pgrep -f "<pattern>"` matches your own monitoring one-liner.** A watcher that waits for "no drivers
+   running" never fires while the command doing the asking contains the pattern. Read `/proc/<pid>/cmdline` and
+   skip `bash -c` wrappers. The same flaw in a CI watcher made it print **GREEN on a branch whose checks had
+   not started** — `no checks reported on the … branch` contains no `pending`, so "nothing is pending" was
+   satisfied. Require that the checks **exist** before concluding anything.
+
+### 4. Also useful to know, so you do not discover it the hard way
+
+* **`EXTRA_ENV` splits on commas.** `315-instr-capture.sh` does `IFS=',' read -r -a` over it, so only the
+  **first** fingerprint name survives. Several names need a position selector (`tail:<N>` / `head:<N>`), and
+  `tail:16` covers `attn_norm-*` but **not** the `ffn_moe_*` family. Recorded as `f08a168`.
+* **The pin moved, and forward-only is now stronger than recorded.** `third_party/llama.cpp` is at
+  `47a8fe929`, whose **parent is `0e255d774`** — engine `main`'s current pin — so the change sits exactly one
+  commit ahead of today's main. `git merge-base --is-ancestor e44c9d01a 47a8fe929` is true; `check_pins.py`
+  reports "ahead". **If you move that pin, move `registry/architectures.json` with it** — `95238dc` did not,
+  and the resulting half-move failed CI until it was fixed. `check_pins.py` now reads the registry and refuses
+  a half-move explicitly.
+* **Full copyright notice, not the two-line SPDX form.** `tools/copyright.py --check` requires
+  `Licensed under the Apache License, Version 2.0` within the first 20 lines; 46 files on this branch failed on
+  that. `python3 tools/copyright.py --fix` is the right remedy, and `*.hip` was a genuine gap in the tool
+  (added to the `//` line style).
+* **Criterion 4 is measured at the moved pin, not the old one.** Engine CI **7 of 7 green** on PR **#414**
+  (`mergeable=MERGEABLE`, `state=CLEAN`); the HRX suite and `MUL_MAT_ID` op-test **unchanged**
+  (`8 pass, 0 skip, 0 fail`; mxfp4 nmse `1.34e-05 … 1.61e-05`, exact match; same two kernels); the dense
+  control **clean and unchanged**. If you re-measure, measure at `47a8fe929`; a result at `e44c9d01a` no longer
+  describes what ships.
+
+### 5. The standing state of #315, in three lines
+
+No named mechanism — **bounded negative**, and not reported as a mechanism. **Surviving family:** an open
+writer of the `result_norm` slot that is *not* ordered by `context->stream` (the reused-arena-slot family),
+plus §51's rank-sort precondition, which is **unmeasured and not measurable by the by-name fingerprint**.
+**Handed forward:** `result_norm` changes between two consecutive identical plain reads in a faulting arm, at
+two different addresses, with no pending host writeback at the engine's logits read and a fresh synchronise
+failing to stop it. `KNOWN-ISSUES.md` stays **OPEN**.

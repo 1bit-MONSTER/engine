@@ -28,11 +28,11 @@ limitations under the License.
 
 | criterion | status | evidence |
 |---|---|---|
-| named, falsifiable mechanism for **both** faces, with a discriminating experiment | **not met** | the search and everything it eliminated is sections 24-38; what survives is listed below |
-| forward-only change landed on a branch/PR | **not met** | no change is justified yet; the one candidate found statically was closed as not-applicable (section 37 + `evidence/315-glm-dispatch-inventory.md`) |
-| pre-registered in-regime campaign, >=60 arms, zero faults both faces, with CI and power statement | **not run** | tooling frozen and audited (`315-campaign.sh`, `315-paired.sh`, `315-detector.py`); invocation in section 27; acceptance statistic and its four freeze notes in `315-preregistration.md` section 8 |
-| no regression: engine CI green, dense control and MUL_MAT_ID op-test unchanged | **partially baselined** | `evidence/315-engine-ci-baseline.md` (copyright check, pin gate, ci.yml python tests, ctest registry tests all run locally at the pin); the gcc-15 build + ctest were *not* run |
-| `KNOWN-ISSUES.md` updated or retired with evidence paths | **not updated** | it still carries the superseded "the logits buffer is never written" story that section 21 falsifies; section 31 records what the update has to correct |
+| named, falsifiable mechanism for **both** faces, with a discriminating experiment — **or a bounded negative** | **BOUNDED NEGATIVE, accepted** | every surviving candidate family eliminated by its own pre-registered experiment, each with its command and observed output; the surviving families and the hand-forward fact are stated below and in `../315-STATUS.md`. **No mechanism is claimed** |
+| forward-only change landed on a branch/PR | **MET** | PR **#414**. Fork commit `47a8fe929` (5 lines ending in `ggml_backend_synchronize(backend_res)` in `src/llama-context.cpp`); engine pin `e44c9d01a -> 47a8fe929`. `47a8fe929`'s **parent is `0e255d774`** = current `main` pin, and `git merge-base --is-ancestor e44c9d01a 47a8fe929` is true. `check_pins.py` reports "ahead" |
+| pre-registered in-regime campaign, with the regime gate, arm count, both-face detectors and stopping rule fixed before it ran, **reported with its result whether met or not** | **RUN, acceptance FAILED — reported as such** | `evidence/315-campaign-preregistration.md` (60 fix + 20 control arms, gate `[95,110] GiB`, stop at the first fix-cell fault). The fix cell **faulted on its first arm** (Face B, `http_failures:1`, `first_failure:"HTTP 500"`, in gate at 98G) — a fault, never an unrun arm. Power statement `1 - 0.05^(1/60) ~= 4.9 %`. `evidence/315-logits-wait-FALSIFIED.md` |
+| no regression: engine CI green, dense control and MUL_MAT_ID op-test unchanged | **MET, at the moved pin `47a8fe929`** | engine CI **7 of 7 green** on PR #414 (`mergeable=MERGEABLE`, `state=CLEAN`); `evidence/315-task3-op-test-unchanged-at-moved-pin.md` (`8 pass, 0 skip, 0 fail`; mxfp4 nmse `1.34e-05 … 1.61e-05`, exact match to baseline; same two kernels) and `evidence/315-task3-dense-control-clean-at-moved-pin.md` (50 responses, 1 distinct content, zero fault signatures) |
+| `KNOWN-ISSUES.md` updated with the evidence, the met criterion, the reproduction and the campaign paths; status stays OPEN | **MET** | `KNOWN-ISSUES.md` #315 carries the forward-only change, the reproduction, the campaign paths and the falsification; status line **OPEN** |
 
 ## What was established
 
@@ -64,6 +64,18 @@ limitations under the License.
 Sections 26, 27, 32, 33, 34, 36, 37, 38 - coherence and ordering (their own campaign), FA masked rows, all
 kernel standalone logic, the AQL block-boundary asymmetry, intra-dispatch unfenced global handoffs, the
 October FA race, the `exact_output` access defect. Section 29 is the consolidated table.
+
+## Session of 2026-10-15 — the ordering family removed, one site shown unmeasurable
+
+| claim | evidence |
+|---|---|
+| **the writer of the `result_norm` slot is NOT ordered by `context->stream`** — on a faulting arm, of 82 records where the tensor differed between two consecutive plain reads, a fresh `ggml_backend_synchronize` stopped it in **0** and did not in **82**, and changed the value itself in **82 of 82** | `evidence/315-task1-writer-not-stream-ordered.md` (`b7d6b46`); pre-registered at `evidence/315-PREREG-sync-between-reads.md` (`b51f883`) |
+| this **removes** `GraphExecutor::execute` returning without a wait (with `backend_synchronize` covering only `context->stream`) as the explanation | the same file; the falsifier is restated there and **not triggered** |
+| **§51's rank-sort precondition is not measurable by the by-name fingerprint** — the faulting arm produced 0 records; the `tail:16` census has **946 distinct node names** and contains `ffn_moe_out-*`/`ffn_shexp-*` but **none** of `ffn_moe_probs-*`, `ffn_moe_topk-*`, `ffn_moe_argsort-*`, `ffn_moe_weights-*` | `evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`) |
+| consequently **how §50 read `ffn_moe_probs` is itself unexplained** — recorded as an open discrepancy, not smoothed over | the same file |
+| `95238dc` was a **half-move**: it moved the `llama.cpp` gitlink without `registry/architectures.json`; CI failed until fixed | `evidence/315-what-the-merge-and-the-gates-found.md` |
+| **46 files** failed the copyright gate on the two-line SPDX form; `*.hip` was a genuine gap in the tool | the same file |
+| four harness defects of one class this session (skip-as-pass; `"0\n0"` from `grep -c … \|\| echo 0`; line-based response count; a vacuous CI green) | `evidence/315-task3-dense-control-clean-at-moved-pin.md`, and for other sessions in `../315-COORDINATION.md` |
 
 ## Instruments and tools
 

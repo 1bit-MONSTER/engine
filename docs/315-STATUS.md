@@ -16,7 +16,9 @@ limitations under the License.
 -->
 # engine#315 — STATUS / resume-here
 
-**Updated** 2026-10-12. Single entry point. Everything else is referenced from here.
+**Updated** 2026-10-15. Single entry point. Everything else is referenced from here.
+**Latest:** the issue is closed out as a **bounded negative** — §"Session of 2026-10-15: closed as a bounded
+negative" below is the resume-here state, and it supersedes the criterion tables above it.
 
 ## Task state
 
@@ -1888,3 +1890,95 @@ instrument-relative; "the corruption is about one row" is not.
 `315-subgraphs-are-9-nodes-so-tail-covers-all.md`, `315-faceb-invariant-signature.md`,
 `315-faceb-has-no-capable-instrument.md`, `315-invalid-utf8-never-observed.md`,
 `315-1984-reconciles-the-two-populations.md`, plus the coordination notes in `315-COORDINATION.md`.
+
+## Session of 2026-10-15: closed as a bounded negative — the ordering family removed, one site shown unmeasurable, criterion 4 measured at the moved pin
+
+**Resume here.** This supersedes every criterion table above it. The objective was re-scoped to accept a
+bounded negative (a named mechanism OR every surviving candidate eliminated by its own pre-registered
+experiment), and this session finished on that branch: **no mechanism is claimed.**
+
+### Task state, this session's numbering
+
+| task | state | result |
+|---|---|---|
+| task-1 — sync-between-reads | **complete** | the stream-ordering candidate is **REMOVED** (below) |
+| task-2 — §51 argsort precondition | **complete, bounded negative** | **not measurable** by the by-name fingerprint |
+| task-3 — no regression | **complete** | CI **7 of 7 green**; both controls **unchanged**, at the moved pin |
+| task-4 — report + KNOWN-ISSUES | **complete** | `KNOWN-ISSUES.md` updated, status stays **OPEN** |
+
+### The measurement that removed the last ordering candidate
+
+On a faulting arm (Face A, in-regime `gtt_start 98G`, 312 records) the same tensor was read three ways at the
+same call — plain, plain again, and after a **fresh `ggml_backend_synchronize(backend)`**:
+
+| quantity | value |
+|---|---:|
+| diverged (`read#1 != read#2`) | **82** |
+| of those, a fresh sync **stopped** it | **0** |
+| of those, it did **not** stop it | **82** |
+| the sync **changed the value itself** | **82 of 82** |
+
+So the writer of the `result_norm` slot is **not ordered by `context->stream`**, which removes
+`GraphExecutor::execute` returning without a wait while `backend_synchronize` covers only `context->stream`.
+`315-task1-writer-not-stream-ordered.md`. Pre-registered at `315-PREREG-sync-between-reads.md` before the run.
+
+### §51's precondition is not measurable by this instrument
+
+The faulting arm produced **zero** records for `ffn_moe_probs-0`. The `tail:16` census of a real decode run has
+**946 distinct node names** and contains `ffn_moe_out-*` and `ffn_shexp-*` but **none** of `ffn_moe_probs-*`,
+`ffn_moe_topk-*`, `ffn_moe_argsort-*`, `ffn_moe_weights-*`. A selector watching that name reads nothing and
+looks exactly like "zero NaN". This is a negative about the **instrument**, not about the site, and it also
+means **how §50 read that tensor is itself unexplained** — recorded as an open discrepancy.
+`315-task2-bounded-negative-precondition-unmeasurable.md`.
+
+### The elimination list, and what survives
+
+Eliminated, each by its own pre-registered experiment with its command and observed output on the record:
+deferred host writeback (626 reads, 0 pending) · persistent-mapping / coherence (A/B at two measured addresses,
+13.7 % / 14.8 %; and closed from source for both host paths) · the unwaited async logits read (its campaign's
+first fix arm faulted, Face B) · **the stream-ordering explanation** (this session).
+
+**Surviving family, stated as surviving:** an open writer of the `result_norm` slot that is *not* ordered by
+`context->stream` — the reused-arena-slot family in `315-what-the-synchronise-drains.md` — plus §51's rank-sort
+precondition, unmeasured.
+
+**Handed forward, one measured unexplained fact:** `result_norm` changes between two consecutive identical
+plain reads in a faulting arm, at two different addresses, with no pending host writeback at the engine's
+logits read, and a fresh synchronise failing to stop it.
+
+### Criterion 4, measured at the moved pin and not the old one
+
+| half | result |
+|---|---|
+| engine CI | **green, 7 of 7** — PR **#414**, `mergeable=MERGEABLE`, `state=CLEAN` |
+| HRX suite + `MUL_MAT_ID` op-test | **unchanged** — `8 pass, 0 skip, 0 fail`; mxfp4 nmse `1.34e-05 … 1.61e-05`, exact match; same two kernels |
+| dense-model control | **clean, unchanged** — 50 responses, 1 distinct content, zero fault signatures |
+
+`315-task3-op-test-unchanged-at-moved-pin.md`, `315-task3-dense-control-clean-at-moved-pin.md`.
+
+**CI did not pass on arrival.** It required fixing two pre-existing defects: `95238dc` was a **half-move** (it
+moved the `llama.cpp` gitlink without `registry/architectures.json`) and 46 files lacked the full copyright
+notice. No gate was loosened. `315-what-the-merge-and-the-gates-found.md`.
+
+### Forward-only, now stronger than recorded
+
+`third_party/llama.cpp` = `47a8fe929`, whose **parent is `0e255d774`** — engine `main`'s current pin — so the
+change sits exactly one commit ahead of today's main. `git merge-base --is-ancestor e44c9d01a 47a8fe929` is
+true, and `check_pins.py` reports "ahead". The fork change is 5 added lines in `src/llama-context.cpp` ending
+in `ggml_backend_synchronize(backend_res)`. It stays landed: a correct change for the reason its comment gives,
+even though its own campaign showed it is **not sufficient** to stop the fault.
+
+### Harness defects, four of one class this session
+
+All are "a count read as a verdict without checking the count can be non-zero for the reason assumed", and each
+corrupted verdict pointed at a pass not earned or a fault that did not happen: eight silently `skipped` tests
+all exiting 0 and reading as 8/8 PASS; `grep -c … || echo 0` producing `"0\n0"` and making a clean dense run
+print `FAULT or incomplete`; a line-based response counter reading 50 as 1; and a CI watcher printing **GREEN**
+on a branch whose checks had not started. All four are reproduced with their fixes in
+`315-task3-dense-control-clean-at-moved-pin.md` and are also written up for other sessions in
+`315-COORDINATION.md`.
+
+### Box
+
+The strixhalo box is **released and idle**: lock FREE, no owned servers, no forcer, GTT back to its 27 GiB
+baseline. A landing note for any peer arriving on the box is at `~/wt/315-HANDOFF.md`.

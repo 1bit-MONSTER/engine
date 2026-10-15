@@ -72,7 +72,13 @@ shipped `llama.cpp` numbers above are *release tags* in this config, not commit 
    so a wrong pick is visible.
 6. **A name-keyed symbol dict collapses weak aliases**, so "the next symbol" skips too far and yields a bogus
    function size. Collect addresses, not name→address.
-7. **Function "size" has two answers.** Next-symbol-minus-start includes alignment padding; `nm -S` gives the
+7. **A decompile that "succeeded" can return the wrong function.** The rea CLI returned exit 0 with 20 KB of
+   pseudo-code for `run_with_output`, and it was `Version::parse`. Grep the returned body for a call the real
+   function must make (`fork`/`execvp` here); if it is absent, you have someone else's function. Exit status
+   proved nothing.
+8. **A stale `--snapshot` is worse than none**, because it makes point 7 more likely rather than less. A snapshot
+   that is not a real analysis database (here a 22 KB file) yields confident wrong answers instead of errors.
+9. **Function "size" has two answers.** Next-symbol-minus-start includes alignment padding; `nm -S` gives the
    symbol's own size. Say which you mean (112 vs 108 for `is_concrete_gfx_arch`).
 
 ## REA specifically — the MCP path cancels, the CLI works
@@ -90,10 +96,17 @@ is why `inspect_binary_layout` succeeded (as `observed` / `shipped-artifact`, vi
 provider — 19,064 symbols, 6,957 relocations, entry `0x1a4850`) but exceeded the stdio budget and had to be read
 from an exported bundle.
 
-Use the CLI, which has neither constraint:
+**The CLI removes those two constraints but NOT the 30-CPU-second one, so it also fails — and one of its failures
+is shaped like success.** `rea decompile lemond 0x<addr> --snapshot ~/rea-lemonade-snap --format json` over five
+launch-path functions gave four exits 1 (`invalid_request`, `"No procedure exists at the requested address"`) and
+**one exit 0 that returned a different function**: the body for `run_with_output` (0x654bf0) contains `Version` x8
+and `parse` x4 and `fork`/`execvp`/`waitpid` **zero** times — it is `Version::parse`. The snapshot explains it:
+`~/rea-lemonade-snap` is a single **22,467-byte file** against the tens of megabytes a Ghidra database needs for a
+binary with 15,286 FUNC symbols. **Check the body, never the exit status**: assert the calls the function must
+contain are present. If that check cannot be satisfied, report control flow as undetermined.
 
     export PATH="$HOME/.nvm/versions/node/v24.21.0/bin:$PATH"
-    rea decompile <path> <address> --snapshot ~/rea-lemonade-snap --format json
+    rea decompile <path> <address> --snapshot <dir> --format json
 
 Two further REA notes: retained evidence is reachable with `rea_get_evidence_bundle` → `export_evidence_bundle`
 (a "timed out" call may have left a complete or failed record), and unresolved control flow is a legitimate

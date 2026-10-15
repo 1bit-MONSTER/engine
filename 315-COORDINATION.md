@@ -461,3 +461,29 @@ record). `rea_inspect_binary_layout` works through MCP but its result may have t
 environment; why `ProcessManager::find_free_port` is needed client-side; who assembles the child's argv
 daemon-side; the second string-pool fragment. No daemon was started and no network request made — the client ran
 only with `--help`/`--help-all` under a scratch `HOME`.
+
+**UPDATE to the five traps above — three more, from the decompile attempt finally landing.**
+
+The REA CLI decompile of five launch-path functions finished. It did **not** work, and the way it failed is the
+single most transferable lesson here. Four addresses returned exit 1
+(`invalid_request`, `"No procedure exists at the requested address"`). The fifth, `run_with_output` at
+`0x654bf0`, returned **exit 0** with 20,772 bytes of pseudo-code — and its body contains `Version` eight times and
+`parse` four times, and `fork`/`execvp`/`waitpid` **zero** times. **It returned `Version::parse`.** The snapshot
+explains it: `~/rea-lemonade-snap` is a single **22,467-byte file**, against the tens of megabytes a Ghidra
+database needs for a binary with 15,286 `FUNC` symbols. REA declares `{address_space_bytes: 3 GB,
+cpu_seconds: 30, file_size_bytes: 64 MB}` and 30 CPU-seconds cannot auto-analyse 12.8 MB of C++; each call burned
+~5 minutes wall at ~200% CPU and produced nothing usable.
+
+So the earlier note "use the rea CLI instead" was necessary but **not sufficient** — the CLI removes the stdio
+budget and the client-side cancellation, not the CPU cap.
+
+6. **A decompile that "succeeded" can return the wrong function.** Grep the returned body for a call the real
+   function must make; if it is absent you have someone else's function. **Exit status proves nothing.**
+7. **A stale or absent `--snapshot` is worse than no snapshot**, because it makes 6 more likely: you get confident
+   wrong answers instead of errors. Confirm the snapshot is a real analysis database, not a 22 KB stub.
+8. **Four loud errors cost four retries; one quiet lie would have been believed.** The body assertion — "does this
+   contain a process-spawn call?" — is the entire defence, and it is the project's own rule (verify by content,
+   never exit status) applied to its own tooling.
+
+Consequence for the reports: control flow stays **undetermined**. It is a bounded negative about the instrument,
+not about the artifact, and it is recorded as correction (g) in `~/rea-lemonade-analysis/REPORT.md`.

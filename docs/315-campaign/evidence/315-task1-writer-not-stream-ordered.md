@@ -81,3 +81,17 @@ as the next isolating question, not as a claim.
   the earlier arms' rates differ).
 * The instrument's own validity: the converged records read identical hashes on all three reads, so the
   instrument is not manufacturing divergence.
+
+## The falsifier, restated as the task contract requires
+
+From `315-PREREG-sync-between-reads.md`:
+
+> Any faulting arm in which `hash_after_sync` differs from read#2 **and** a subsequent instrumented check
+> shows the sync completing normally — i.e. where the writer can be shown to be a *third* party rather than
+> an ordering gap.
+
+**Not triggered.** This run has the first half (`hash_after_sync != read#2`, 82 of 82) but **not** the second:
+it carries no instrumented check of the sync's completion, so it does not establish that the writer is a
+third party rather than an ordering gap. The pre-registered reading for that first half is the one applied
+above — the writer is not ordered by `context->stream`, which removes the `execute`-returns-without-waiting
+candidate — and the falsifier's second half is what would additionally have excluded *any* ordering gap.

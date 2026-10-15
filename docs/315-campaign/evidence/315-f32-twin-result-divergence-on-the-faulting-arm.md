@@ -65,6 +65,33 @@ guard reports as wholly NaN. **It produced zero fingerprint records in the fault
 bytes=619520` records — so its absence here is an arm-specific fact (the guard logs `continuing=no`, the
 server aborts at the fault) and is recorded as an **instrument gap in this arm**, not as agreement.
 
+### The gap, diagnosed from the record afterwards — and the fix
+
+`result_output` is reachable by the instrument, and the record already contains a whole-tensor-NaN
+reading of it. In a run that selected nodes by **position** rather than by name (`tail:<N>`, which
+bypasses the name filter — the probe's own note says position is "the only way to walk the head-end
+pipeline without guessing tensor names"):
+
+```
+[hrx-tensor-fp]  call=103644 name=result_output op=MUL_MAT bytes=619520 nan=154880 of 154880 ne0=154880 first=0 row=0
+[hrx-finite-fp]  call=103644 name=result_output finite=0 nan=154880
+```
+
+So the logits tensor is **wholly NaN, `finite=0`**, which is what the guard reports — and the probe *can*
+see it. Two consequences for the next run:
+
+1. **Use `tail:<N>` (or `head:<N>`), not the name list, for the logits.** The name filter is an exact
+   match per comma-separated item (`hrx_fp_name_listed`, `ggml-hrx.cpp:604-621`), while the graph's
+   layer tensors carry a `-<layer>` suffix — the record's own fingers show `ffn_moe_topk-9`,
+   `l_out-0`, `ffn_moe_weighted-46`. That fully explains why `l_out` and `ffn_out` produced nothing here;
+   for `result_output` the exact name does match in other runs, so its absence in these two arms is not
+   explained by the filter and is stated as unresolved rather than guessed at.
+2. **The logits reading must be taken in a faulting arm.** The record's `result_output` line above is
+   from an arm whose `nan=154880 of 154880` matches the guard, but it is a *post-graph by-name* read and
+   therefore carries §53/§59's aliasing caveat. The f32 twin's own comparison is immune to that caveat
+   (both reads target the same buffer at the same call), which is why extending the twin to the logits
+   node by position — rather than adding another by-name read — is what the next instrument change should do.
+
 ## Limit 2 — the two candidate causes are still not separated
 
 The two reads are **sequential**, so a divergence means the buffer changed between them:

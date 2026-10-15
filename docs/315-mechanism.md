@@ -2326,3 +2326,33 @@ Two independent corroborations:
 *what changed*, which leaves the fault as a latent defect present in both configurations whose rate the
 regime and the trigger modulate — consistent with the trigger being named and replicated (eviction,
 7/10 vs 0/22) while no code delta has ever separated clean from faulting.
+
+## 61. The deferred-host-writeback candidate is falsified, and the f32 read-path divergence loses its explanation
+
+Two measurements this session, and they interact.
+
+**1. The f32 read-path twin diverges on the faulting arm and only there.** §59 left the by-name instrument
+unable to name a producer, but the twin is immune to that objection: it compares two reads of the *same
+buffer at the same call*. First measurement of its kind on any f32 tensor — the i32 family had 1.16M paired
+reads, the f32 family had zero. Arm 1 clean: 0 divergences in 554 records. Arm 2 **faulting**: 42
+divergences, every one on `result_norm`, all `nan=0` on both sides. The read-twice control then settled the
+nature of it: **75 of 75 divergences in a faulting arm were `memcpy_stable=0`** — two *consecutive identical*
+plain reads returned different bytes, so this is not a stale cache line. Full record:
+`315-read-twice-result-buffer-moves-under-the-reader.md`.
+
+**2. That divergence is not the deferred writeback.** The `buffer_get`/`add_host_writeback` path queues a CPU
+`memcpy` that publishes a download only when the stream is next marked synchronised, and the code's own
+comment names the hazard ("would read the previous contents") while guarding only the upload direction. It
+was the natural explanation for a buffer that moves under the reader. It is dead:
+`315-candidate-deferred-writeback-FALSIFIED.md` measured `has_pending_host_writebacks()` at the engine's own
+async logits read in an **eviction-forced, in-regime, faulting** arm (`gtt_start 98`, `nan=1`) — **626 reads,
+0 with a pending writeback**, which is exactly the falsifier that candidate pre-declared.
+
+**So one measured fact is now unexplained and one candidate is removed.** The divergence is real
+(`memcpy_stable=0`), it is a read not ordered against a writer, and the writer is *not* the deferred
+writeback. What remains, in the order `315-what-the-synchronise-drains.md` lists it: `GraphExecutor::execute`
+returns without waiting (§14) while `backend_synchronize` covers only `context->stream`; a second writer of
+the reused arena slot (§53/§59); the replay path (least likely, §4047348 traces it to a full wait). And
+§51's rank-sort precondition — NaN at the argsort's input — is still unmeasured.
+
+Reported as the standing position, not as progress toward a mechanism: **no named mechanism yet.**

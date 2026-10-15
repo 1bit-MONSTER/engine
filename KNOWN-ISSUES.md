@@ -601,3 +601,34 @@ reported as **under-powered, not passed**.
 and its falsifier), `…-campaign-preregistration.md`, `…-which-binary-is-which.md` (cell F =
 `~/wt/315logwait-build` at `47a8fe929`; cell C = `~/wt/315fixlog-build` at `e44c9d01a`; both with
 `hrx-f32-sync` and `hrx-wb-read` = 0).
+
+### 2026-10-15 (later) — the logits-wait mechanism is FALSIFIED by its own campaign; the fix stays landed
+
+The mechanism recorded above was tested by the pre-registered campaign it named, and it failed on the first
+fix arm. The full record is `docs/315-campaign/evidence/315-logits-wait-FALSIFIED.md`.
+
+```
+pair 1 arm c (control, e44c9d01a): OK    req=66  gtt_start=98G
+pair 1 arm l (fix,     47a8fe929): FAULT req=9   gtt_start=98G
+STOP: a fix-cell arm faulted or was invalid — acceptance requires zero faults
+```
+
+The fix arm's `detector.json` reads `http_failures: 1`, `first_failure: "HTTP 500"`, `transport_failures: 0`,
+and its `server.log` carries the **Face B** signature verbatim — *"the model produced output that does not
+match the expected Content-only…"* — with invalid UTF-8 immediately before it and `HRX returned NaN`
+appearing zero times. In gate at `gtt_start 98GiB`. It is counted as a fault, not an invalid arm, because
+the truncation is a *consequence* of the defect rather than an independent harness death.
+
+**So: the acceptance criterion is NOT MET, and the unwaited-async-logits-read mechanism is removed as the
+cause.** The prediction was universal — *the faults stop* — and one in-regime fault refutes it, as one
+counter-example refuted the deferred-writeback candidate. It is not evidence that the wait is wrong; it is
+evidence that the wait is **not sufficient**, so the unwaited read is not the mechanism. No earlier
+candidate is revived: coherence (§13), the deferred writeback, and the read-path families all stay closed.
+
+The fix commit `47a8fe929` and the pin move `e44c9d01a → 47a8fe929` **remain landed** — a correct
+forward-only change for the reason its comment gives, and the objective's criterion for a forward-only
+change is satisfied by it. What is not satisfied is the mechanism and the campaign.
+
+**Standing after this:** no named mechanism. The candidates that survive are the open writers of the
+`result_norm` slot listed in `docs/315-campaign/evidence/315-what-the-synchronise-drains.md`, and §51's
+rank-sort precondition, still unmeasured.

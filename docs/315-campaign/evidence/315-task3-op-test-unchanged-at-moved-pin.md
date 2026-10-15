@@ -98,3 +98,34 @@ for t in test-hrx-buffer test-hrx-mul-mat-id-k32 test-hrx-mxfp4 test-hrx-moe-spl
 * `test-hrx-ops` and `test-hrx-loom-jit` remain absent from the build, consistently with the recorded note that
   they do not compile at this revision.
 * The dense-model half is run separately and reported in its own file.
+
+---
+
+## Criterion 4 closed: engine CI green, and both controls unchanged
+
+Recorded at `ae9da10f9`, when `gh pr checks 414` had settled with **7 of 7 checks passing**:
+
+```
+CodeQL             pass
+build              pass
+pr_agent           pass
+Analyze (actions)  pass
+Analyze (c-cpp)    pass
+Analyze (python)   pass
+Analyze (rust)     pass
+```
+
+CI did not pass on arrival. It passed only after the two defects in
+`315-what-the-merge-and-the-gates-found.md` were fixed — the half-move (registry vs gitlink) and the 46 files
+missing the full copyright notice. No gate was loosened to obtain this: the pin check still refuses
+half-moves and the copyright check still requires the full notice.
+
+| criterion-4 half | claim | where measured |
+|---|---|---|
+| engine CI | **green**, 7 of 7 | PR #414 (`gh pr checks 414`) |
+| `MUL_MAT_ID` op-test + HRX suite | **unchanged** at `47a8fe929` | `315-task3-op-test-unchanged-at-moved-pin.md` |
+| dense-model control | **clean**, unchanged at `47a8fe929` | `315-task3-dense-control-clean-at-moved-pin.md` |
+
+The dense half was **not run** when the record last reported this criterion (`315-crit4-control-result.md`
+said the objective "names it alongside the op-test" and that it "should be named explicitly before it is
+claimed either way"); it is named, run and measured here, at the moved pin rather than the old one.

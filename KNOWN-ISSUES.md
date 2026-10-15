@@ -17,6 +17,20 @@ limitations under the License.
 
 # Known issues
 
+## engine#370 — intermittent MUL_MAT f32 m=1 n=1 k=2048 error on `common.mul_mat.f32_f32_decode`
+
+**Status: OPEN, root cause not fixed in this repository.** The kernel lives in the llama.cpp fork
+(`motifs/dequant.loom`, fork tip e44c9d01a4d5), which is not vendored here, so no engine-side change can fix it.
+
+**Affected:** `test-backend-ops -b HRX0 -o MUL_MAT`, case `MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048)`,
+kernel `common.mul_mat.f32_f32_decode`. Observed on strixhalo 2026-10-09 (hrx-system 98d05d94, performance mode):
+1 failure in 40 runs on the unmodified fork tip (ERR 0.0037); 1 failure in 28 full-suite runs at the quant stack
+tip (ERR 0.0102); 0 failures in 40 further MUL_MAT runs and 10/10 running the case alone.
+
+**Assessment:** pre-existing, not introduced by the quant PRs. The error magnitude and ~1-in-40 rate point to a
+race or an uninitialised read in the shared decode path rather than rounding. Fix belongs in the fork; bump the
+pin once it lands. Treat a single failure of this case as a flake, not a regression.
+
 ## engine#315 — intermittent all-NaN logits and format-500 on GLM-4.7-Flash under GTT pressure
 
 **Status: OPEN. No limitation entry is recorded.** The earlier status line here read "accepted as a
@@ -291,6 +305,17 @@ survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert
 kernel/binding family — narrowed as of 2026-10-10 to the routed-FFN routing tensors and the id-producing kernel,
 with the two 128 KB AQL command blocks GLM's decode splits into (919 + 760 dispatches, 1,399 barriers per token)
 still unexamined as an *ordering* question. See "State as of 2026-10-10" above.
+
+**Pin note (2026-10-09).** `engine@main` has since moved twice: first to `third_party/llama.cpp e44c9d01a4d5`
+(#347), then to `0e255d774032` (#373, the fork tip after the NVFP4 / Q2_0 / IQ GET_ROWS merges), both with
+`third_party/hrx-system 98d05d94`. That is the same runtime the study above ran against, and `26330cc20490` is an
+ancestor of both, so the measurements above still describe what ships. Two things learned on the way:
+a bump that moved `hrx-system` alone to `4ba76c18eafe` (2026-10-08) left `main` unbuildable with
+`ONEBIT_HRX=ON` (the pinned `ggml/src/ggml-hrx/loom-jit.cpp` still used the LoomC API that revision removed; reverted
+in #363, and #365 now holds `hrx-system` when LoomC symbols go missing); and with the port of `loom-jit.cpp`
+(fork #97) that revision compiles but returns an immediate end-of-text on a 4.7K-token prompt where `98d05d94`
+answers (#369), so `hrx-system` stays at `98d05d94` and moving it needs a multi-ubatch prompt check, not a symbol
+check. The #373 pin passed that check: needle 20/20 on Qwen3-0.6B.
 
 ### SUPERSEDED 2026-10-10: instrumentation for the bisect (implemented, not built — and now known to be unreachable)
 

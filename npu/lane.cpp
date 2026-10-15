@@ -18,13 +18,7 @@
 #include "full_elf.h"
 #include "pack.h"
 
-#include <xrt/experimental/xrt_elf.h>
-#include <xrt/experimental/xrt_ext.h>
-#include <xrt/experimental/xrt_kernel.h>
-#include <xrt/xrt_bo.h>
-#include <xrt/xrt_device.h>
-#include <xrt/xrt_hw_context.h>
-#include <xrt/xrt_kernel.h>
+#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
 
 #include <chrono>
 #include <cstdio>

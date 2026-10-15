@@ -45,7 +45,7 @@
 
 struct I8Ctx;
 
-namespace xrt { class device; class bo; }
+#include "rt.h"  // xrt::device, xrt::bo: XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
 
 struct Q4nxForwardConfig {
     int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;

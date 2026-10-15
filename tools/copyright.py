@@ -30,10 +30,10 @@ limitations under the License.""".split("\n")
 
 # Comment style by file name pattern.
 LINE_STYLES = [
-    (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs"), "//"),
+    (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment",
-      "*.service", "*.timer"), "#"),
+      "*.service", "*.timer", "Dockerfile", "*.Dockerfile"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 

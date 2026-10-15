@@ -42,6 +42,8 @@ jobs:
           python3 tests/gguf_to_q4nx_test.py
           python3 tests/ternary_to_q4_0_test.py
           python3 tests/mtp_draft_vocab_test.py
+          python3 tests/check_pins_test.py
+          python3 tests/hrx_long_prompt_test.py
       - name: Install build dependencies
         # GCC 15, as on the Strix Halo development machine: the engine is C++26, which the
         # runner's own GCC 13 cannot build

@@ -29,12 +29,7 @@
 #include <memory>
 #include <string>
 #include <algorithm>
-#include <xrt/xrt_device.h>
-#include <xrt/xrt_bo.h>
-#include <xrt/xrt_kernel.h>
-#include <xrt/experimental/xrt_elf.h>
-#include <xrt/experimental/xrt_ext.h>
-#include <xrt/experimental/xrt_module.h>
+#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
 
 
 struct I8Ctx {

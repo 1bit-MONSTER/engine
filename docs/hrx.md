@@ -52,17 +52,49 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.
 - **How it stays current.** `.github/workflows/bump-hrx.yml` runs daily. When AMD
-  moves its pair, it:
-  - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin);
-  - rebases our commits onto AMD's pin and moves `1bit/hrx-vulkan-patched` there,
-    after tagging the previous tip `patched-<sha>` so every commit the engine has
-    pinned stays reachable (a rebase conflict fails the run: rebase by hand);
-  - opens a PR here moving both submodules, listing the rebased commits.
+  moves its pair, it (through `scripts/bump-hrx-sync.sh`, which also runs locally with
+  `DRY_RUN=1` and pushes nothing):
+  - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin). When AMD
+    rewrites its history, the old `1bit/hrx-vulkan` tip is tagged `hrx-vulkan-<sha>` first,
+    and the run fails if that branch held a commit that is on no AMD branch;
+  - merges AMD's pin into `1bit/hrx-vulkan-patched`, after tagging the previous tip
+    `patched-<sha>` so every commit the engine has pinned stays reachable. Conflicts under
+    `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
+  - merges AMD's hrx-system pin into our `1bit/main` the same way;
+  - opens a PR here moving the submodules, listing the llama.cpp commits new to the engine.
+- **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
+  names a commit, the run does not merge AMD's hrx-system, keeps `third_party/hrx-system`
+  where it is, and takes only AMD's llama.cpp changes outside the HRX backend paths
+  (`ggml/src/ggml-hrx`, `ggml/include/ggml-hrx.h`, `tests/*hrx*`), because AMD's ggml-hrx is
+  written against AMD's hrx-system. Those changes land as an ordinary commit, not a merge, so
+  AMD's HRX changes still arrive in full once the hold is lifted. It reports the hold in the run
+  summary and succeeds. Since 2026-10-10 hrx-system is held at `98d05d94`: the engine stays on
+  our HRX line while AMD's newer hrx-system miscompiles long-context attention
+  ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)).
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
 - **Validation.** CI builds that PR without HRX, so run the checks below on Strix
-  Halo before merging.
+  Halo before merging. The long-prompt result is pin-specific: run the probe against
+  the proposed `hrx-system` pin, and update
+  [`config/hrx-long-prompt-validated-pin.config`](../config/hrx-long-prompt-validated-pin.config)
+  to that full commit only after it passes. CI rejects a changed HRX pin that does not
+  match this record.
+
+### Long-prompt HRX pin check
+
+Before recording a new `hrx-system` pin, build and run `llama-server` for the
+proposed llama.cpp/hrx-system pair on Strix Halo (with context size 8,192 and HRX0
+selected), then run:
+
+```sh
+python3 tests/hrx_long_prompt.py
+```
+
+The probe tokenizes a 320-record prompt and requires at least 4,700 tokens before
+asking for the code buried in record 203. It passes only when Qwen3-0.6B returns
+`7341` exactly. The test endpoint defaults to `http://127.0.0.1:8080`; use
+`--url` or `--model` if the server uses different settings.
 
 ### Fixed: `--device hrx` answered wrongly on mid-length prompts
 

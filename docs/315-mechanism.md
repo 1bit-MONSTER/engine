@@ -2286,3 +2286,43 @@ completely NaN residual stream by layer 1 (`l_out-1 nan=1048576 of 1048576`), wh
 
 Also recorded: this build's ids diagnostic is **mis-specified** (`oor` against `ne0`, which for the top-k *view* is
 `k`, not the expert count), so ~all of its 253 000 lines are flagged and none of its output is used anywhere.
+
+## 60. The pin move is off GLM's path: the only changed kernel is never dispatched
+
+Full record: `evidence/315-glm-never-dispatches-the-changed-kernel.md`.
+
+Section 52 left a dilemma: the whole HRX backend differs by exactly one file between the clean lower
+bound `f2099e9b7` and the pin (`flash_attention_decode_split_f32_f16_wmma.loom`, +102/-2), so either
+the fault is older than the clean bound, or it is triggered by that one change. A dispatch census over
+every arm log on the box settles it for the first branch.
+
+```sh
+$ grep -rh "ggml_hrx dispatch" ~/wt/rt-det/*/server.log | sort | uniq -c | sort -rn | grep flash
+     60 ggml_hrx dispatch: common.flash_attention_f32_f16_wmma (single)
+
+$ grep -rl "next_q8\|decode_split\|split_f32" ~/wt/rt-det/*/server.log | wc -l
+0
+```
+
+**60 of 60 flash-attention dispatches are the non-split kernel; no arm log mentions the split kernel
+under any of its spellings.** The only file that changed between clean and faulting configurations is
+therefore not on GLM's execution path: the pin move cannot have introduced this fault, so the defect is
+**older than the clean bound** and the recorded "clean" label was about *rate, not absence* — exactly
+the first branch section 52 flagged as possible and now has direct evidence for.
+
+Two independent corroborations:
+
+* the MLA race harness section 52 named as the cheap separating test (`tools/glm-mla-race.cpp`) was
+  built and run for the first time this session; at GLM's real geometry it cannot reach a race because
+  Loom rejects the kernel outright — `TARGET/059 ... predicate 'range' on 'query_heads_per_key_value_head0'
+  requires range [1, 16] but known facts prove range [20, 20]` (GLM is 20 query heads over 1 latent KV
+  head). The split kernel is uninstantiable at this model's geometry;
+* this is what section 38 warned about when it said the sweeps clearing this kernel were run at shapes
+  that are not GLM's.
+
+**The falsifier is one line:** any arm log naming `decode_split` as a dispatched kernel.
+
+**What this does not do.** It does not name the producer. It removes the pin move as a candidate for
+*what changed*, which leaves the fault as a latent defect present in both configurations whose rate the
+regime and the trigger modulate — consistent with the trigger being named and replicated (eviction,
+7/10 vs 0/22) while no code delta has ever separated clean from faulting.

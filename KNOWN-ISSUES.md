@@ -654,6 +654,37 @@ The fix commit `47a8fe929` and the pin move `e44c9d01a → 47a8fe929` **remain l
 forward-only change for the reason its comment gives, and the objective's criterion for a forward-only
 change is satisfied by it. What is not satisfied is the mechanism and the campaign.
 
-**Standing after this:** no named mechanism. The candidates that survive are the open writers of the
-`result_norm` slot listed in `docs/315-campaign/evidence/315-what-the-synchronise-drains.md`, and §51's
-rank-sort precondition, still unmeasured.
+**Standing after this:** no named mechanism. Of the candidates that survived the campaign, one has since been
+removed by its own pre-registered experiment and one has been shown unmeasurable by the current instrument.
+
+* **The stream-ordering explanation for the `result_norm` divergence is REMOVED.**
+  `docs/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` ran the pre-registered
+  `315-PREREG-sync-between-reads.md` on a faulting arm (Face A, 312 records) and landed on its **second**
+  pre-declared row: of 82 records where `result_norm` differed between two consecutive plain reads, a fresh
+  `ggml_backend_synchronize` stopped the difference in **0** and did not stop it in **82** — and changed the
+  value itself in all 82. So the writer is **not ordered by `context->stream`**, which removes
+  `GraphExecutor::execute` returning without a wait (with `backend_synchronize` covering only
+  `context->stream`) as the explanation. Recorded at `b7d6b46`.
+* **§51's rank-sort precondition is UNMEASURED and not measurable by the by-name fingerprint.**
+  `docs/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`) — the
+  faulting arm produced zero records because `ffn_moe_probs-*` is not among the 946 node names this build's
+  fingerprint walks. This is a negative about the instrument, not about the site.
+
+**Surviving family, stated as surviving:** an open writer of the `result_norm` slot that is *not* ordered by
+`context->stream` — the reused-arena-slot family in
+`docs/315-campaign/evidence/315-what-the-synchronise-drains.md` — plus the unmeasured §51 site. The measured,
+unexplained fact handed forward is that `result_norm` changes between two consecutive identical plain reads in
+a faulting arm, at two different addresses, with no pending host writeback at the engine's logits read, and
+with a fresh synchronise failing to stop it.
+
+**No regression (criterion 4), measured at the moved pin `47a8fe929` and not the old one:** engine CI is
+**green, 7 of 7** on `1bit-MONSTER/engine` PR #414 (`mergeable=MERGEABLE`, `state=CLEAN`); the HRX suite and
+the `MUL_MAT_ID` op-test are **unchanged** (`8 pass, 0 skip, 0 fail`, `mxfp4` nmse **1.34e-05 … 1.61e-05**, an
+exact match to the recorded baseline, same two kernels); and the dense-model control (Qwen3-8B, dense, not MoE)
+is **clean and unchanged** (50 responses, 1 distinct content, zero fault signatures). Evidence:
+`docs/315-campaign/evidence/315-task3-op-test-unchanged-at-moved-pin.md` and
+`315-task3-dense-control-clean-at-moved-pin.md`.
+
+**CI did not pass on arrival.** It required fixing two pre-existing defects — a half-move (`95238dc` moved the
+`llama.cpp` gitlink without `registry/architectures.json`) and 46 files missing the full copyright notice —
+recorded in `docs/315-campaign/evidence/315-what-the-merge-and-the-gates-found.md`, with no gate loosened.

@@ -122,6 +122,61 @@ the experiment.*
 > previous contents.** The upload direction carries exactly this guard (`command-program-executor.cpp:881`);
 > the read direction does not.
 
+## The read path cannot see the publication machinery — and where the probe belongs
+
+A first attempt to instrument this put the probe in `buffer_get`, and the compiler rejected it: *"no member
+named `graph_replay_state` in `ggml_backend_hrx_device_context`"*. That is a structural fact, not a typo.
+The two contexts are (`backend-context.h:39-67`):
+
+```cpp
+struct ggml_backend_hrx_device_context {          // what a BUFFER context points at
+    hrx_device_t device; ... std::mutex buffer_stream_mutex; hrx_stream_t buffer_stream;
+};
+
+struct ggml_backend_hrx_context {                 // the BACKEND context
+    ggml_backend_hrx_device_context *      device;
+    hrx_stream_t                           stream;                 // <- here
+    ...
+    ggml::hrx::GraphReplayStreamState      graph_replay_state;    // <- and here
+};
+```
+
+`buffer_get` holds only `ggml_backend_hrx_buffer_context`, whose `device` is the **device** context — so the
+synchronous read path has **no route to `stream` and no route to `graph_replay_state`**. It cannot publish a
+pending writeback even if it wanted to, which is a sharper statement of the defect than "it does not check".
+
+`backend_get_tensor_async` (`ggml-hrx.cpp:454`) is where the engine's sampling read actually goes, and it is
+the right probe site for two reasons: it holds the **backend** context, so both fields are in scope; and **it
+does not synchronise** — it enqueues `hrx_stream_copy_buffer` on `backend_context->stream` and returns:
+
+```cpp
+static void backend_get_tensor_async(ggml_backend_t backend, const ggml_tensor * tensor, void * data,
+                                     size_t offset, size_t size) {
+    auto * backend_context = static_cast<ggml_backend_hrx_context *>(backend->context);
+    ...
+    ggml::hrx::HostBufferRef destination = backend_context->device->host_buffers.find(data, size);
+    if (destination.valid()) {
+        HRX_CHECK(hrx_stream_copy_buffer(backend_context->stream, context->buffer, tensor_base + offset,
+                                         destination.buffer(), destination.offset(), size));
+    } else {
+        synchronous_download_fallback(backend_context, context->buffer, tensor_base + offset, data, size);
+    }
+}
+```
+
+So the engine's read of the logits is **issued, not completed**, and the copy it queues is on the same
+`stream` that `backend_synchronize` drains — which is consistent with §14's finding that the sampling path
+does not perform the wait.
+
+## Instrument status
+
+`patch-writeback-read-probe.py` reports `graph_replay_state.has_pending_host_writebacks()` and the
+destination at that call, gated on `GGML_HRX_WRITEBACK_READ_PROBE`. **Validated as far as it can be without
+running it:** the anchors match the live source, and the patched translation unit passes `-fsyntax-only`
+under the build's own `compile_commands.json` flags (`rc=0`) — after the first version failed that same
+check on the device-context mistake above. It is not yet applied, because an arm is running against that
+build.
+
 ## Why this fits every hard fact
 
 | fact on the record | how this explains it |

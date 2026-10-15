@@ -129,3 +129,37 @@ half-moves and the copyright check still requires the full notice.
 The dense half was **not run** when the record last reported this criterion (`315-crit4-control-result.md`
 said the objective "names it alongside the op-test" and that it "should be named explicitly before it is
 claimed either way"); it is named, run and measured here, at the moved pin rather than the old one.
+
+### A note on how the green below was checked — a fourth instance of the same class
+
+The first watcher written to confirm this green reported:
+
+```
+===== CI on PR #414 — final revision =====
+no checks reported on the '1bit/315-preregistration' branch |
+--- counts ---
+      1
+GREEN: no failing check
+```
+
+**That is a vacuous pass and it was not used.** The loop broke out of its wait as soon as
+`gh pr checks 414` printed no `pending` line — and the string `no checks reported on the … branch` contains no
+`pending`, so a branch whose checks had not started yet satisfied "nothing is pending" and the watcher declared
+green before a single check existed. The API confirmed CI was in fact in progress at that moment:
+
+```
+pr_agent: in_progress -        build: in_progress -
+Analyze (python): in_progress -         Analyze (c-cpp): in_progress -
+Analyze (actions): in_progress -        Analyze (rust): in_progress -
+```
+
+It is the **fourth instance this turn** of the one class — the op-test suite's eight silent `skipped` exits
+worth 8/8 PASS, the dense-control script's `"0\n0"` worth a false FAULT, and a response counter read as a
+verdict. Here the count of pending checks was read as a verdict on CI. The corrected watcher requires that at
+least six checks **exist** and that none are pending before it will say anything, and reports `INCONCLUSIVE`
+rather than green otherwise.
+
+The pattern is worth stating once, plainly, because it has now cost this investigation four readings in a
+single turn: **a count read as a verdict, without first checking that the count can be non-zero for the reason
+the verdict assumes.** In all four cases the corrupted verdict pointed the same way — at a pass that was not
+earned, or a fault that did not happen.

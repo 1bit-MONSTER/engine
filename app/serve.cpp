@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|onnx] [--mtp HEAD]`
 //                        [--npu-opt KEY=VALUE ...]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
@@ -33,7 +33,6 @@
 //                                                  -DONEBIT_NPU_PRIVATE (docs/npu.md)
 //   a .gguf, --device hrx                       -> the HRX build's llama-server on HRX0
 //   a .gguf, --device cpu                       -> the same llama-server with no GPU layers
-//                                                  (the Windows package's route, docs/windows.md)
 //   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
 //   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
 //                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
@@ -50,12 +49,12 @@
 //                                                  drafts a block per step (docs/serve.md)
 //   --mmproj <mmproj.gguf> on hrx or cpu        -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
-//   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
 // HRX for a .gguf where the build has it, else the CPU (auto_gguf_device). The engine has
-// no Vulkan or ROCm build (RFC #213 stage 3): what HRX does not run, serve declines with a
-// clear message, and Lemonade serves it with its own llamacpp backends.
+// no Vulkan, ROCm, Metal/MLX, ZINC or CUDA route: on the GPU it is HRX with HIP kernels.
+// What HRX does not run, serve declines with a clear message, and Lemonade serves it with
+// its own backends.
 #include "serve.h"
 
 #include "built_path.h"
@@ -145,7 +144,7 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string flash_attn;  // -fa on/off forwarded to the child llama-server
-    std::string llama_server, hrx_libhsa, mlx, ds4;
+    std::string llama_server, hrx_libhsa, ds4;
     bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
     std::string mtp;
     std::string dflash;  // DFlash block-diffusion draft model for the target
@@ -190,7 +189,7 @@ std::string hrx_libhsa(const std::string& option) {
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
-// else one on PATH (the Windows package puts a CPU llama-server beside 1bit.exe).
+// else one on PATH.
 std::string default_llama_server() {
     if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
 #ifdef ONEBIT_HRX_SERVER
@@ -211,6 +210,9 @@ void refuse_removed_device(const std::string& device) {
     if (device == "zinc")
         throw std::runtime_error("--device zinc was removed: the engine no longer builds ZINC (its GPU route is HRX, "
                                  "--device hrx, or auto). Lemonade's own llamacpp backends serve other GPUs (docs/lemonade.md)");
+    if (device == "mlx")
+        throw std::runtime_error("--device mlx was removed: the engine has no MLX or Metal route (its GPU route is HRX). "
+                                 "Lemonade's own MLX backend serves Apple Silicon (docs/lemonade.md)");
 }
 
 // An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
@@ -304,11 +306,6 @@ std::string default_ds4() {
 // SIGTERM / SIGINT: stop serving and take the backend down with us.
 std::atomic<bool> g_stop{false};
 extern "C" void on_stop_signal(int) { g_stop = true; }
-
-std::string default_mlx() {
-    if (const char* e = std::getenv("LEMONADE_MLX_SERVER"); e && *e) return e;
-    return "lemon-mlx-server";
-}
 
 int free_port() {
 #ifdef _WIN32
@@ -825,14 +822,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
         return l;
     }
-    if (device == "mlx") {
-        // lemon-mlx-engine: `<server> <hf id> --port <p>`; it picks the model by
-        // Hugging Face id, so requests carry that id (docs/apple.md).
-        argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
-        set_model = o.model;
-    } else if (device == "hrx" || device == "cpu") {
-        // --device cpu: llama-server with no GPU layers (the Windows package's route until HRX runs
-        // there, and what --device auto falls back to where HRX has no route for a request)
+    if (device == "hrx" || device == "cpu") {
+        // --device cpu: llama-server with no GPU layers (what --device auto falls back to where
+        // HRX has no route for a request, and in a build without HRX)
         refuse_missing_arch(o.model);
         argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port)};
@@ -919,7 +911,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
-        if (device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
+        if (device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
         if (device == "hrx") {
             // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
@@ -944,7 +936,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
         // on the same device; the model checks them in one batch
         const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
-        if (device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
+        if (device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
         l.mtp = true;
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
@@ -962,7 +954,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
     if (!o.mmproj.empty()) {
-        if (device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
+        if (device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
         // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
         argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
@@ -1050,7 +1042,7 @@ std::vector<std::string> gguf_devices() {
 std::string auto_gguf_device(const Options& o) {
 #if defined(_WIN32) || !defined(ONEBIT_HRX_SERVER)
     (void)o;
-    return "cpu";  // no GPU route on Windows yet (docs/windows.md), nor in a build without HRX
+    return "cpu";  // no GPU route in a build without HRX (or on Windows)
 #else
     (void)o;
     return "hrx";
@@ -1659,7 +1651,7 @@ int serve_child(const Options& given) {
     srv.Post("/v1/completions", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
-    // the first backend; the NPU, DwarfStar and MLX answer 501.
+    // the first backend; the NPU and DwarfStar answer 501.
     const bool llama = device == "hrx" || device == "cpu" ||
                        (laya && (backends[0].device == "hrx" || backends[0].device == "cpu"));
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
@@ -1829,7 +1821,7 @@ int serve_child(const Options& given) {
                             probe[port] = 1;
                             watch.alive(port);
                         } else if (probe[port] == 0) {
-                            probe[port] = -1;   // DwarfStar, ONNX, MLX, or llama-server --no-slots
+                            probe[port] = -1;   // DwarfStar, ONNX, or llama-server --no-slots
                         }
                     }
                 }
@@ -2115,8 +2107,8 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
-                 "                  [--llama-server PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "                  [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--llama-server PATH] [--hrx-libhsa PATH]\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
@@ -2146,7 +2138,7 @@ void usage(FILE* out) {
                  "                  reloads it (docs/serve.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
-                 "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
+                 "           or a .gguf file\n");
 }
 
 }  // namespace
@@ -2174,7 +2166,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--ds4") o.ds4 = next();
         else if (a == "--ssd-streaming") o.ssd_streaming = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
-        else if (a == "--mlx-server") o.mlx = next();
+        else if (a == "--mlx-server")
+            throw std::runtime_error("--mlx-server was removed with the engine's MLX route; Lemonade's own MLX backend serves Apple Silicon (docs/lemonade.md)");
         else if (a == "--prefill-device" || a == "--prefill-min-tokens" || a == "--lean" || a == "--adaptive" ||
                  a == "--adaptive-at" || a == "--long-model" || a == "--long-from")
             // RFC #213 stage 3: these ran on the Vulkan and ROCm builds the engine no longer ships
@@ -2253,7 +2246,6 @@ int run_serve(int argc, char** argv) {
         throw std::runtime_error("this build has no NPU lane (configure with -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<NPU runtime>)");
 #endif
     }
-    if (o.device == "mlx") return serve_child(o);
 #ifdef ONEBIT_NPU
     if (fs::path(o.model).extension() == ".gguf" && o.device == "npu") {
         // Fused-lane first (opt-in via ONEBIT_NPU_LANE_DIR): pack the GGUF in the

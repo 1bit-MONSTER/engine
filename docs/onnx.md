@@ -44,7 +44,7 @@ The engine does not ship Ryzen AI Software. With it installed, the same build se
 
 `ONEBIT_ONNX_SERVER` or `--device onnx` with another `ryzenai-server` on `PATH` overrides the build's.
 
-On Windows the engine builds no ONNX server: `1bit.exe` uses the `ryzenai-server.exe` Lemonade installs for its `ryzenai-server` backend (under `$LEMONADE_CACHE_DIR`, else `%USERPROFILE%\.cache\lemonade`, in `bin\ryzenai-server\npu`). Lemonade publishes that server for Windows only, so Linux keeps building it from `third_party/ryzenai-server`.
+The engine ships no Windows package (Lemonade has its own Windows build, with its own `ryzenai-server` backend). On Linux the engine builds ryzenai-server from `third_party/ryzenai-server`, because Lemonade publishes that server for Windows only.
 
 ## The GPU
 
@@ -65,5 +65,4 @@ llama-server's extra routes (`/tokenize`, `/slots`, …) answer 501 on `--device
 
 ## Next
 
-- **Windows.** `--device onnx` runs Lemonade's `ryzenai-server.exe` ([Windows](windows.md)); the engine no longer builds one. Not yet run against a Lemonade install on Windows.
 - **The Ryzen AI NPU.** On a machine with Ryzen AI Software installed.

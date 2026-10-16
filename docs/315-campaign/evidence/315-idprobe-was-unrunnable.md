@@ -1,0 +1,100 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# The last in-scope probe was UNRUNNABLE — its build predated its patch
+
+`315-idprobe.sh` is the one in-scope lead with a pre-registered probe that had never been run: it answers
+*"are the route ids a clean permutation, and is the NaN in `ffn_moe_weights` an aliased read?"*, with three
+branches fixed in advance (`315-id-producing-kernel.md`). The record explicitly flags it as **untested** and
+says not to cite its evidence file as a live result.
+
+Attempting to run it exposed why it never produced data:
+
+    build  ~/wt/315copy-build/bin/libggml-hrx.so     10-09 17:38
+    source ~/wt/llama-315copy/.../command-program-executor.cpp   10-10 11:04
+
+**The build predates the patch by ~18 hours.** Checked by looking for the instrumentation's own markers
+(`dup_pairs`, `oor=`) in the built library: **0 hits**. So running the probe as staged would have produced a
+server that emits no id data at all — the probe's own readout would have been empty, and an empty readout
+looks like "ids clean", which the pre-registration would have read as *"the argsort candidate dies and the
+fault is downstream"*.
+
+That is a **silent false negative waiting to happen**, and it is the same class as the other harness defects
+this session: the instrument is not actually loaded, and the failure is indistinguishable from a result.
+
+## What was done
+
+- Verified the build cache is configured against the patched tree (`CMAKE_HOME_DIRECTORY=~/wt/llama-315copy`,
+  `ggml_SOURCE_DIR=.../llama-315copy/ggml`), so an **incremental** rebuild is safe and picks up the patch —
+  this is *not* the copied-build-dir trap, where the cache points at a different tree than intended.
+- Started `cmake --build ~/wt/315copy-build -j 8` in the background.
+- Chained the probe behind it, **with a guard**: the chain refuses to run the probe unless the rebuilt library
+  actually contains the ids markers (`dup_pairs`/`oor=`), so a blind run cannot occur and a silent false
+  negative cannot be reported as a clean-ids result.
+
+## Why this was worth fixing rather than abandoning
+
+It is the last in-scope family with a **falsifiable discriminator already designed**: if a faulting arm shows
+`oor > 0` or `dup_pairs > 0`, the argsort's rank computation is the site; if the ids are clean while the
+matmuls are NaN, that candidate dies. Either outcome closes the family, and the second would leave the cause
+pointing at the table builders or the matmul descriptor — still in scope.
+
+The probe is diagnostic, not acceptance: no criterion changes and no arm from it is eligible.
+
+---
+
+# The guard I added misfired (ninth defect) — and the probe builds its own tree anyway
+
+Two corrections to the section above.
+
+## 1. The guard was a false abort
+
+My chain's instrumentation guard printed the marker count (**1**) and then aborted anyway:
+
+    --- instrumentation check: does the binary now carry the ids markers? ---
+    1
+    ABORT: rebuild did not add the ids instrumentation - not running the probe into a blind build
+
+But the marker **is** present — verified by hand afterwards:
+
+    strings ~/wt/315copy-build/bin/libggml-hrx.so | grep -cE "dup_pairs|oor="   ->  1   (exit 0)
+    the marker text:  oor=%zu dup_pairs=%zu fi
+    the .so is fresh:  19:09 today
+
+So the abort was a bug in my own guard logic, not a missing instrument. The irony is worth stating: a guard
+written to *prevent a silent false negative* produced a **loud false negative** instead. The lesson is the
+same shape as the rest of the session — the check has to be verified as well as the thing it checks.
+
+## 2. The rebuild was probably unnecessary: the probe builds its own tree
+
+Running the probe directly shows it takes the box lock and then **configures and builds its own tree**:
+
+    id: box lock held 2026-10-13T19:10:36-03:00
+    id: configuring /home/bcloud/wt/315id-build 2026-10-13T19:10:36-03:00
+    id: building -j 6 2026-10-13T19:10:38-03:00
+
+So `315-idprobe.sh` builds from the patched source itself (`~/wt/llama-315copy`) rather than consuming
+`315copy-build`. My incremental rebuild of `315copy-build` was therefore beside the point for the probe — the
+genuine blocker was only that **nobody had ever run it**.
+
+What the stale-build observation still established: the `315copy-build` artifact was stale relative to its
+source, which is worth knowing independently (it is the artifact an ad-hoc probe would have used) — but it was
+not the probe's blocker, and the section above overstates it as one.

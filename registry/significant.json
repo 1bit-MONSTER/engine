@@ -65,6 +65,11 @@
    "model_type": "grug_moe",
    "family": "Grug MoE (marin-community research MoE)",
    "watch": "report"
+  },
+  "HrmTextForCausalLM": {
+   "model_type": "hrm_text",
+   "family": "HRM-Text hierarchical-reasoning LM (Sapient)",
+   "watch": "report"
   }
  }
 }

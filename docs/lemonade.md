@@ -22,6 +22,11 @@ serves with 1bit, it runs the engine as a backend, the same way it runs `llama-s
 `1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards OpenAI requests to it. The
 engine exposes nothing but that OpenAI-compatible API.
 
+Recovery stays Lemonade's: when a backend hangs, `1bit serve` answers `/health` with 503 and, once
+a request has had no progress for `--watchdog` seconds, kills its backend and exits non-zero
+([serve.md, "When a backend hangs"](serve.md#when-a-backend-hangs)). Lemonade's BackendWatchdog
+then loads the model again.
+
 ## How it got here
 
 Step 1 first went the other way. `1bit lemonade` ran Lemonade v11.9.0's server

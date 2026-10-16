@@ -82,6 +82,7 @@ def main():
             "max_tokens": 16,
             "cache_prompt": False,
             "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
     )
     result = post_json(
@@ -93,6 +94,7 @@ def main():
             "max_tokens": 16,
             "cache_prompt": False,
             "enable_thinking": False,
+            "chat_template_kwargs": {"enable_thinking": False},
         },
     )
     answer = result["choices"][0]["message"].get("content", "").strip()

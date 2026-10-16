@@ -112,34 +112,32 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    - ~~`reasoning_content`~~: done (#73), the NPU route splits the thinking out as llama-server does;
    - ~~models in our own Hugging Face repos~~: the 35B is `1bit-MONSTER/Qwen3.6-35B-A3B-NPU` (fork #8). (engine + fork)
 7. **Beyond the LLM suite:**
-   - the Laya router;
-   - MLX.
+   - the Laya router.
 
 `echo` and generation parameters are skipped, because Lemonade's own llamacpp recipe
 declares neither.
 
-## Vulkan, ROCm and CUDA are Lemonade's
+## Vulkan, ROCm, Metal and CUDA are Lemonade's
 
-The engine builds no Vulkan or ROCm llama.cpp (RFC #213 stage 3; owner direction
-2026-10-01: HRX + NPU only), and since the core strip (2026-10-04) no ZINC, so no CUDA either.
-Lemonade ships its own `llamacpp` backends for Vulkan, ROCm and the
-CPU from upstream llama.cpp, so a model or feature the engine does not run on HRX or the NPU is
-Lemonade's to serve:
+On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU only; the
+core strip, 2026-10-04: no ZINC, so no CUDA; 2026-10-12: no MLX/Metal route and no Windows
+package). Lemonade ships its own backends for Vulkan, ROCm, CUDA, the CPU, MLX on Apple Silicon and
+Windows, so a model, feature or platform the engine does not run on HRX or the NPU is Lemonade's to
+serve:
 
-- `1bit serve --device vulkan`, `--device rocm` and `--device zinc` exit at once with that reason, as
-  do `--lean`, `--adaptive`, `--long-model`, `--prefill-device` and `--zinc`
+- `1bit serve --device vulkan`, `--device rocm`, `--device zinc` and `--device mlx` exit at once
+  with that reason, as do `--lean`, `--adaptive`, `--long-model`, `--prefill-device`, `--zinc` and
+  `--mlx-server`
   ([serve.md](serve.md#removed-devices-and-flags)).
 - An architecture only the removed Vulkan build ran (Zyphra Zamba, Zamba2 and BlackMamba, and a
   few upstream-only ones) is refused with a pointer to Lemonade's `llamacpp` recipe.
   Qwen3.8-Flash-Next (`qwen4exp`) runs on HRX since llama.cpp pin `e57beb97`.
 
-In the fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)), branch
-`1bit/onebit-no-vulkan` drops `vulkan` from the `onebit` backend (`onebit.h`,
-`backend_versions.json`, the test suite's `capabilities.py`, the generated docs); until it is in the
-pinned fork, picking `vulkan` gets the refusal above. With it, the recipe's backends are `hrx`
-(gfx1151), `npu` and `cuda`. The `cuda` entry ran ZINC's CUDA build, which the engine no longer
-builds: it has to leave the fork's `onebit` backend too (a fork follow-up), after which Lemonade
-offers `onebit` models only on machines with `hrx` or `npu`.
+In the pinned fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade),
+`third_party/lemonade` at `4812a683`), the `onebit` backend has two entries, `hrx` and `npu`
+(`backend_versions.json`); its `vulkan` and `cuda` entries are gone. Lemonade offers `onebit`
+models only on machines with `hrx` or `npu`. Lemonade's other recipes (its `llamacpp` Vulkan, ROCm
+and CUDA backends, MLX and the rest) are Lemonade's own and unchanged.
 
 ## On its own
 

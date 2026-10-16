@@ -17,7 +17,7 @@
 # Which device `1bit serve` starts a plain .gguf on, without a GPU (RFC #213 stage 3: HRX only,
 # no Vulkan, no ROCm):
 #   - --device cpu: llama-server with no GPU layers and no --device,
-#   - --device auto: HRX0 in a build with HRX, the CPU in one without (CI, Windows),
+#   - --device auto: HRX0 in a build with HRX, the CPU in one without (CI),
 #   - --device auto with --mtp: the same route (HRX drafts on HRX0 now; it used to keep Vulkan),
 #   - --device auto with --mmproj: the same route as a plain file (HRX0 is unverified for vision,
 #     an open RFC #213 gate to check on ZAYA1-VL),
@@ -30,8 +30,8 @@
 #   - --parallel 4 on a gated delta-net model: in a build with HRX, auto serves it on HRX0 with one
 #     slot and says why; --device cpu keeps -np 4,
 #   - an H32 file (onebit.hadamard_q4_0, a dropped format) is refused by name,
-#   - --device vulkan / rocm / zinc and the removed flags (--lean, --adaptive, --long-model,
-#     --prefill-device, --zinc) are refused with the reason.
+#   - --device vulkan / rocm / zinc / mlx and the removed flags (--lean, --adaptive, --long-model,
+#     --prefill-device, --zinc, --mlx-server) are refused with the reason.
 #
 # usage: tests/device_route.sh path/to/1bit
 set -uo pipefail
@@ -122,10 +122,10 @@ if [ $hrx = 1 ]; then
 fi
 run "$scratch/deltacpu.json" delta --parallel 4 --device cpu
 check "--device cpu keeps --parallel 4 on a gated delta-net model" '[ "$(after "$scratch/deltacpu.json" -np)" = 4 ]'
-for dev in vulkan rocm zinc; do
+for dev in vulkan rocm zinc mlx; do
     check "--device $dev is refused as removed" 'refused "--device $dev was removed" plain --device $dev'
 done
-for flag in --lean --adaptive "--long-model x.gguf" "--prefill-device hrx" "--zinc x"; do
+for flag in --lean --adaptive "--long-model x.gguf" "--prefill-device hrx" "--zinc x" "--mlx-server x"; do
     # shellcheck disable=SC2086
     check "$flag is refused as removed" 'refused "${flag%% *} was removed" plain $flag'
 done

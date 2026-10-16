@@ -283,10 +283,8 @@ def main() -> None:
         md += ["## Engine", ""] + [f"- {e['title']}" + (f" (#{e['pr']})" if e["pr"] else "") for e in own] + [""]
     md += ["## Packages", "",
            "| file | what |", "|---|---|",
-           f"| `1bit-{a.tag}-linux-x86_64.tar.zst` | 1bit and its backends (HRX, ONNX, DwarfStar, NPU on the compiled-in NPU runtime, no XRT) |",
-           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe |",
-           f"| `1bit-{a.tag}-windows-x64.zip` | 1bit.exe with CPU and ONNX backends |",
-           f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: boot the engine from a USB stick |",
+           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe and the engine in `1bit/`: 1bit and its backends (HRX, ONNX, DwarfStar, the NPU lane; no XRT); start it with `lemond-onebit` |",
+           f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: Lemonade with the engine, booted from a USB stick |",
            "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", "",
            "Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); each backend keeps its own "
            "license. 1bit OS also carries GPL programs (the Linux kernel, BusyBox) as built on the release "

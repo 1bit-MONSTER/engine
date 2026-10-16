@@ -29,7 +29,6 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 - HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the engine's one GPU route ([docs/hrx.md](docs/hrx.md)), and the CPU from the same llama.cpp build
 - MoE experts streamed from the drive (`1bit serve --moe-slots N`), for MoE models larger than memory: kept, but not in this build until it moves to HRX with Qwen3.8-Flash-Next ([docs/moe-streaming.md](docs/moe-streaming.md))
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming
-- MLX on Apple Silicon, through lemon-mlx-engine
 - ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs
 - every Hugging Face model architecture, kept current by a daily census
@@ -41,9 +40,14 @@ Every tuned setting `1bit serve` gives a backend is a recipe with its measuremen
 Strix Halo GPU before merge by the hardware gate: kernel tests, known answers on three models,
 KLD against the release pin and a 4.7K-token needle ([docs/hw-gate.md](docs/hw-gate.md)).
 
-Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonade with the engine,
-Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release ships on Sunday,
-4 October 2026.
+On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA.
+Every other backend and platform (Vulkan, ROCm, CUDA, Apple's MLX and Metal, Windows) is Lemonade's,
+through its own backends and builds.
+
+**Install:** through Lemonade. Packages ship every Sunday, rebuilt at that week's upstream pins:
+Lemonade with the onebit recipe and the engine (unpack it and run `lemond-onebit`), and 1bit OS, a
+Lemonade appliance with the engine on a bootable USB stick ([docs/releases.md](docs/releases.md)).
+The engine has no standalone package of its own.
 
 > **Direction:** the engine is HRX (AMD's ggml-hrx, kernels in Loom or HIP) plus the NPU.[^geramyl] HRX met the decode gates in
 > [RFC #213](https://github.com/1bit-MONSTER/engine/discussions/213), and its stage 3 removed the
@@ -59,8 +63,8 @@ Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release sh
 > ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), the NPU engine on full ELFs and on our own
 > NPU runtime, XRT-free ([docs/npu.md](docs/npu.md); its layer kernel and lm-head now decode from
 > source, ELF to ELF, with no xclbin at any point, verified on Qwen3-0.6B/1.7B/4B against an fp64
-> reference — the kernel sources stay private and are not yet merged here, docs/npu.md Step 3d) and
-> MLX ([docs/apple.md](docs/apple.md)). ZAYA1-8B (Zyphra)
+> reference — the kernel sources stay private and are not yet merged here, docs/npu.md Step 3d).
+> The MLX route on Apple Silicon is removed (Lemonade serves MLX). ZAYA1-8B (Zyphra)
 > runs from our llama.cpp on HRX, matching transformers, at about 90 tok/s decode in Q4_K_M
 > ([docs/hrx.md](docs/hrx.md)). The rest of Zyphra's family (Zamba, Zamba2, BlackMamba) and
 > Qwen3.8-Flash-Next ran only on the removed Vulkan build; they are to be ported to HRX. Experimental,

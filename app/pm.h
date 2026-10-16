@@ -28,6 +28,8 @@
 #include <httplib.h>
 #include <nlohmann/json.hpp>
 
+#include <functional>
+#include <map>
 #include <string>
 #include <vector>
 
@@ -41,6 +43,13 @@ struct Expert {
     int max_tokens = 0;    // the expert's max_tokens (0: Lemonade's default)
 };
 
+// What a --pm-router laya decision says about one request (docs/pm.md, "Routing with Laya").
+struct RouteHint {
+    std::string label;        // the router's request class (Laya: code, prose, short, long_doc)
+    float confidence = 0.0f;  // the router's calibrated confidence in that class
+    long ms = 0;              // the router's decision time
+};
+
 struct Config {
     std::vector<Expert> experts;
     int max_rounds = 4;                 // PM rounds per request, tool rounds included
@@ -50,6 +59,14 @@ struct Config {
     std::string system_prompt;          // "" : the built-in prompt (pm.cpp)
     std::string lemonade_url;           // http://host:port of the Lemonade that runs the experts
     std::string chat_path = "/api/v1/chat/completions";
+    // --pm-router laya (docs/pm.md): the router's class -> the expert for it, "" leaving the
+    // answer to the PM. "model" (the default) is the PM's own choice, as before.
+    std::string router = "model";
+    std::map<std::string, std::string> routes;
+    float routes_min_confidence = 0.16f;  // a class below this leaves the answer to the PM
+    // The router, set by serve when --pm-router laya: state -> (label, confidence, ms), false when
+    // it could not classify (the PM answers). Empty with the default router.
+    std::function<bool(const std::string& state, RouteHint& out)> classify;
 
     const Expert* find(const std::string& key) const;
 };
@@ -60,6 +77,15 @@ const char* default_experts_json();
 // Parses an experts file (the built-in one when `file` is empty); throws std::runtime_error
 // with the reason on a bad file.
 Config load_config(const std::string& file, const std::string& lemonade_url);
+
+// The --pm-router values: "model" (the default: the PM decides) and "laya" (the engine asks the
+// Laya router first). An empty value is "model"; anything else throws std::runtime_error.
+std::string parse_router(const std::string& value);
+
+// The expert a routed class selects at `confidence`, or nullptr when the PM answers itself: no
+// route for the class, an empty expert name, an expert the config does not list, or a confidence
+// below routes_min_confidence.
+const Expert* route_expert(const Config& cfg, const std::string& label, float confidence);
 
 // One tool call the PM made, from llama-server's tool_calls array or from the text of its
 // answer (ZAYA's <zyphra_tool_call><function=NAME><parameter=K>V</parameter></function> form,

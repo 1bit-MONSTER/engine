@@ -139,5 +139,18 @@ echo '{"experts": [{"expert": "code"}]}' >"$scratch/bad.json"
 out=$("$bin" serve -m "$scratch/zaya.gguf" --device cpu --pm --pm-experts "$scratch/bad.json" --llama-server "$here/fake_pm_backend.py" 2>&1); rc=$?
 check "an experts file without ids is refused" '[ "$rc" != 0 ] && [[ "$out" == *"needs \"expert\" and \"id\""* ]]'
 
+# 9. --pm-router (docs/pm.md, "Routing with Laya"): model (the default) or laya, needs --pm, and
+# the laya router needs its checkpoint.
+serve router_model --lemonade-url "$lemonade" --pm-router model || fail=1
+before=$(lem_records)
+reply=$(ask)
+check "--pm-router model behaves as --pm: the PM decides" '[ "$(lem_records)" = $((before + 1)) ] && [ "$(echo "$reply" | jq "d[\"pm\"].get(\"routing\")")" = None ]'
+out=$("$bin" serve -m "$scratch/zaya.gguf" --device cpu --pm-router laya --llama-server "$here/fake_pm_backend.py" 2>&1); rc=$?
+check "--pm-router without --pm is refused" '[ "$rc" != 0 ] && [[ "$out" == *"--pm-router needs --pm"* ]]'
+out=$("$bin" serve -m "$scratch/zaya.gguf" --device cpu --pm --pm-router bogus --llama-server "$here/fake_pm_backend.py" 2>&1); rc=$?
+check "--pm-router takes model or laya and nothing else" '[ "$rc" != 0 ] && [[ "$out" == *"--pm-router takes model or laya"* ]]'
+out=$(ONEBIT_LAYA_MODEL="$scratch/no-such-laya" "$bin" serve -m "$scratch/zaya.gguf" --device cpu --pm --pm-router laya --llama-server "$here/fake_pm_backend.py" 2>&1); rc=$?
+check "--pm-router laya needs the Laya checkpoint" '[ "$rc" != 0 ] && [[ "$out" == *"laya: no checkpoint at"* ]]'
+
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

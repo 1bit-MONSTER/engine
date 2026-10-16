@@ -65,6 +65,14 @@ std::string content_text(const json& c) {
     return out;
 }
 
+// The last user message's text: what the router classifies, and the brief the engine hands the
+// expert when it delegates by itself (--pm-router laya).
+std::string last_user_text(const json& messages) {
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it)
+        if (it->is_object() && it->value("role", "") == "user") return content_text(it->value("content", json()));
+    return "";
+}
+
 // Cuts `s` to at most `n` bytes without splitting a UTF-8 sequence.
 std::string cut_utf8(std::string s, size_t n, bool* cut) {
     *cut = false;
@@ -304,6 +312,19 @@ const Expert* Config::find(const std::string& key) const {
     return nullptr;
 }
 
+std::string parse_router(const std::string& value) {
+    if (value.empty() || value == "model") return "model";
+    if (value == "laya") return "laya";
+    throw std::runtime_error("--pm-router takes model or laya, not \"" + value + "\"");
+}
+
+const Expert* route_expert(const Config& cfg, const std::string& label, float confidence) {
+    if (confidence < cfg.routes_min_confidence) return nullptr;
+    const auto it = cfg.routes.find(label);
+    if (it == cfg.routes.end() || it->second.empty()) return nullptr;
+    return cfg.find(it->second);
+}
+
 const char* default_experts_json() { return kDefaultPmExpertsJson; }
 
 Config load_config(const std::string& file, const std::string& lemonade_url) {
@@ -335,6 +356,17 @@ Config load_config(const std::string& file, const std::string& lemonade_url) {
         c.thinking = p.value("thinking", c.thinking);
         c.system_prompt = p.value("system_prompt", std::string());
         c.chat_path = p.value("chat_path", c.chat_path);
+        c.routes_min_confidence = p.value("routes_min_confidence", c.routes_min_confidence);
+        if (c.routes_min_confidence < 0.0f || c.routes_min_confidence > 1.0f)
+            throw std::runtime_error("--pm-experts: pm.routes_min_confidence must be between 0 and 1");
+        if (p.contains("routes")) {
+            if (!p["routes"].is_object()) throw std::runtime_error("--pm-experts: pm.routes must be an object of class -> expert");
+            for (const auto& [label, value] : p["routes"].items()) {
+                if (!value.is_string())
+                    throw std::runtime_error("--pm-experts: pm.routes." + label + " must be an expert name or an empty string");
+                c.routes[label] = value.get<std::string>();
+            }
+        }
     }
     if (c.max_rounds < 1) throw std::runtime_error("--pm-experts: pm.max_rounds must be at least 1");
     for (const auto& x : j["experts"]) {
@@ -348,6 +380,10 @@ Config load_config(const std::string& file, const std::string& lemonade_url) {
         if (c.find(e.key)) throw std::runtime_error("--pm-experts: expert \"" + e.key + "\" is listed twice");
         c.experts.push_back(std::move(e));
     }
+    for (const auto& [label, key] : c.routes)
+        if (!key.empty() && !c.find(key))
+            throw std::runtime_error("--pm-experts: pm.routes.\"" + label + "\" names expert \"" + key +
+                                     "\", which the file does not list");
     return c;
 }
 
@@ -430,8 +466,32 @@ void handle_chat(const Config& cfg, int backend_port, const std::string& our_id,
     httplib::Client backend("127.0.0.1", backend_port);
     backend.set_read_timeout(3600);
     json final_message, final_reply;
+    json routing;  // --pm-router laya only: what the router said (the reply's `pm.routing`)
     std::string finish = "stop";
     int rounds = 0;
+
+    // --pm-router laya (docs/pm.md, "Routing with Laya"): ask the router before the PM's first
+    // round. A class the router is confident about becomes a delegate call of its own, so the PM
+    // composes the final answer from a real tool result instead of from its own choice. A class
+    // with no expert, or one below the confidence floor, is left to the PM as before.
+    if (cfg.router == "laya" && cfg.classify) {
+        const std::string state = last_user_text(messages);
+        RouteHint hint;
+        if (!state.empty() && cfg.classify(state, hint)) {
+            routing = {{"class", hint.label}, {"score", hint.confidence}, {"ms", hint.ms}};
+            const Expert* e = route_expert(cfg, hint.label, hint.confidence);
+            if (e) {
+                routing["expert"] = e->key;
+                const std::string cid = now_id("call_router-");
+                const json args = {{"expert", e->key}, {"task", state}};
+                messages.push_back({{"role", "assistant"}, {"content", ""},
+                                    {"tool_calls", json::array({{{"id", cid}, {"type", "function"},
+                                                                 {"function", {{"name", "delegate"}, {"arguments", args.dump()}}}}})}});
+                messages.push_back({{"role", "tool"}, {"tool_call_id", cid}, {"name", "delegate"},
+                                    {"content", run_delegate(cfg, args, log)}});
+            }
+        }
+    }
     for (int round = 0; round < cfg.max_rounds; round++) {
         rounds = round + 1;
         const bool last = round + 1 == cfg.max_rounds;  // the cap: no tools, the PM must answer
@@ -506,6 +566,7 @@ void handle_chat(const Config& cfg, int backend_port, const std::string& our_id,
 
     json pm = {{"rounds", rounds}, {"delegations", json::array()}};
     for (const auto& d : log) pm["delegations"].push_back({{"expert", d.expert}, {"id", d.id}, {"ms", d.ms}, {"ok", d.ok}});
+    if (!routing.is_null()) pm["routing"] = routing;
     res.set_header("X-1bit-PM", std::to_string(rounds) + " rounds, " + std::to_string(log.size()) + " delegations");
     if (stream) return stream_final(res, id, our_id, final_message, finish);
     json reply = final_reply;

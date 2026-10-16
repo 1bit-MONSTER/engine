@@ -125,6 +125,12 @@ add_test(NAME gguf_meta COMMAND gguf_meta_test)
 add_executable(mem_admit_test tests/mem_admit_test.cpp)
 target_include_directories(mem_admit_test PRIVATE app)
 add_test(NAME mem_admit COMMAND mem_admit_test)
+# --pm-router's class -> expert table and its flag values (app/pm.cpp, docs/pm.md "Routing with
+# Laya"); no GPU, no checkpoint, no Lemonade: config in, mapping out.
+add_executable(pm_routes_test tests/pm_routes_test.cpp app/pm.cpp)
+target_include_directories(pm_routes_test PRIVATE app ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(pm_routes_test PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+add_test(NAME pm_routes COMMAND pm_routes_test)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
@@ -298,6 +304,9 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
+    # `--pm-router laya` end to end without a GPU: the same classifier decides the class of two
+    # labelled requests and the engine's table decides whether the PM delegates (docs/pm.md).
+    add_test(NAME pm_laya_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_laya_route.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 endif()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:

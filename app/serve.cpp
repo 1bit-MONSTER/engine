@@ -25,6 +25,7 @@
 //   GET  /v1/models              the one model
 //   POST /v1/chat/completions    (stream or not)
 //   POST /v1/completions
+//   GET  /metrics                serve's own Prometheus metrics, then the backend's (app/serve_metrics.h)
 //
 // Which device runs the model follows from the model and --device:
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
@@ -63,6 +64,7 @@
 #include "hrx_archs.h"
 #include "pm.h"
 #include "recipes.h"
+#include "serve_metrics.h"
 #include "serve_watchdog.h"
 #include "sysinfo.h"
 
@@ -831,6 +833,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         refuse_missing_arch(o.model);
         argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port)};
+        argv.push_back("--metrics");   // its /metrics, appended to serve's own
         if (device == "cpu") argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
         else argv.insert(argv.end(), {"--device", "HRX0", "-ngl", "99", "--jinja"});
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
@@ -1446,6 +1449,9 @@ int serve_child(const Options& given) {
     const std::string id = model_id(o);
     std::atomic<bool> ready{false};
     ProgressWatch watch(o.watchdog);
+    ServeMetrics metrics(device);   // GET /metrics (app/serve_metrics.h)
+    Lifecycle lifecycle(id);
+    auto backend_line = [&metrics](const std::string& line) { metrics.backend_line(line); };
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
 
@@ -1510,7 +1516,7 @@ int serve_child(const Options& given) {
         if (started[i]) return true;
         const Launch& b = backends[i];
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path);
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
         started[i] = c.get();
         children.push_back(std::move(c));
@@ -1646,8 +1652,26 @@ int serve_child(const Options& given) {
     };
     for (const char* path : {"/v1/responses", "/tokenize", "/detokenize", "/apply-template"})
         srv.Post(path, llama ? httplib::Server::Handler(first_json) : httplib::Server::Handler(unsupported));
-    for (const char* path : {"/slots", "/props", "/metrics"})
+    for (const char* path : {"/slots", "/props"})
         srv.Get(path, llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
+    // what only the engine sees (app/serve_metrics.h: GTT, Tctl, CPU fallbacks, program-cache
+    // flushes, backend starts and watchdog kills; Lemonade already reports requests, TTFT and
+    // tok/s), then the backend's own where it has them (llama-server runs with --metrics)
+    srv.Get("/metrics", [&](const httplib::Request&, httplib::Response& r) {
+        std::string text = metrics.render(lifecycle);
+        int port = 0;
+        {
+            std::unique_lock<std::mutex> lock(start_mu, std::try_to_lock);
+            if (ready && lock.owns_lock() && (!laya || started[0])) port = backends[0].port;
+        }
+        if (port) {
+            httplib::Client c("127.0.0.1", port);
+            c.set_connection_timeout(1);
+            c.set_read_timeout(3);
+            if (auto br = c.Get("/metrics"); br && br->status == 200) text += br->body;
+        }
+        r.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
+    });
     srv.Post(R"(/slots/(\d+))", llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
     // RAG: embeddings and rerank go to their own backends, the reply names the model served
     auto rag_route = [&](size_t i, const std::string& model) {
@@ -1706,7 +1730,7 @@ int serve_child(const Options& given) {
 #endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path));
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line));
     }
     for (const auto& b : rag) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
@@ -1720,6 +1744,7 @@ int serve_child(const Options& given) {
         }
     }
     ready = true;
+    lifecycle.count_start();
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), o.port,
                  laya ? " (laya routes each request; a device's backend starts when first picked)" : "");
     if (o.pm) {
@@ -1789,6 +1814,7 @@ int serve_child(const Options& given) {
     if (is_wedged() && !g_stop) {
         // Kill the wedged backend and exit non-zero: Lemonade's BackendWatchdog sees the process go
         // and loads the model again. Say why, with what the box and the backend said last.
+        lifecycle.count_watchdog_kill();
         std::lock_guard<std::mutex> lock(start_mu);
         Child* bad = nullptr;
         for (auto& c : children) if (c->port() == stall.port) bad = c.get();
@@ -1819,6 +1845,7 @@ int serve_child(const Options& given) {
         for (auto& c : children) c->stop();
         return 0;
     }
+    lifecycle.count_backend_exit();
     std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
     return 1;
 }

@@ -46,6 +46,13 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._json(200, {"status": "ok"})
+        elif self.path == "/metrics" and "--metrics" in sys.argv:
+            body = b"# TYPE llamacpp:prompt_tokens_total counter\nllamacpp:prompt_tokens_total 12\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
         elif self.path == "/slots":
             while WEDGED.is_set():
                 time.sleep(1)
@@ -104,6 +111,12 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
 
 
+if os.environ.get("FAKE_BACKEND_LOG_LINES"):
+    # what llama.cpp and ggml-hrx write to stderr that serve's /metrics reads (tests/metrics_serve.sh)
+    for line in ("trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 1",
+                 "trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 2",
+                 "ggml_hrx: CPU fallback: GET_ROWS x2, SOFTPLUS x1"):
+        print(line, file=sys.stderr, flush=True)
 time.sleep(0.5)  # a real backend takes a moment to load; serve must answer 503 meanwhile
 if os.environ.get("FAKE_BACKEND_IMPOSTOR"):
     # A process serve did not start answers on the port instead: this one detaches a server

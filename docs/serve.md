@@ -48,7 +48,8 @@ One model per process:
 | `POST /v1/embeddings` or `/v1/rerank` | with `--embedding` or `--reranking`: the model itself is an embedding or reranking model |
 | `POST /v1/responses` | OpenAI Responses API, streamed or not (llama-server devices) |
 | `POST /tokenize`, `/detokenize`, `/apply-template` | llama-server devices |
-| `GET /slots`, `POST /slots/<id>?action=…`, `GET /props`, `GET /metrics` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
+| `GET /slots`, `POST /slots/<id>?action=…`, `GET /props` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
+| `GET /metrics` | Prometheus text: the engine's own series (GTT, Tctl, CPU fallbacks, program-cache flushes, starts, watchdog kills) on every child-process device, then the backend's own ([below](#metrics)) |
 
 "llama-server devices" means `hrx` and `cpu`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
@@ -111,6 +112,52 @@ shows progress only by sending bytes, so on those only streamed requests are jud
 non-streamed answer and a hang look the same from outside. `tests/watchdog_serve.sh` (ctest
 `watchdog_serve`, CI included) checks all of this against `tests/fake_backend.py`, whose
 `"fake_hang"` request stops its stream and its `/slots` while `/health` stays 200.
+
+## Metrics
+
+Lemonade's own `/metrics` already reports, per model:
+- requests, tokens, time to first token and tok/s (`lemonade_model_*`);
+- CPU and memory use;
+- GTT plus VRAM, as `lemonade_vram_used_gb`.
+
+So `GET /metrics` on serve adds only what the engine sees and Lemonade cannot, in Prometheus
+text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`, `ds4`, `onnx`,
+`mlx`). The in-process NPU route has none yet. serve's own series come first. The backend's own
+`/metrics` follows when it answers one: llama-server is started with `--metrics`, so its
+`llamacpp:*` series follow.
+
+| Series | What |
+|---|---|
+| `onebit_up{device}` | 1; `device` names the route |
+| `onebit_serve_starts_total` | loads of this model by serve, kept across restarts |
+| `onebit_watchdog_kills_total` | backends the [progress watchdog](#when-a-backend-hangs) killed, kept across restarts |
+| `onebit_backend_exits_total` | backends that exited on their own, kept across restarts |
+| `onebit_program_cache_flushes_total` | ggml-hrx's "HRX graph program cache over its limit" WARN lines |
+| `onebit_cpu_fallback_ops{op}` | engine #390's load report of ops placed off HRX, per op and `op="all"` |
+| `onebit_gtt_bytes{kind="total"\|"used"}` | the amdgpu GTT pool HRX allocates from (`mem_info_gtt_*`) |
+| `onebit_gtt_fault_zone` | 1 when GTT use is at or above 95 GiB, where engine #315's faults were seen |
+| `onebit_tctl_celsius` | CPU Tctl (k10temp) |
+
+The log-derived series come from the backend's stderr, which serve passes through unchanged and
+reads line by line (Linux). A series whose line never came is left out, not reported as 0. The
+#390 report is read from a line that names "CPU fallback" (or "off HRX"), followed by `OP=count`,
+`OP xcount` or `OP: count` pairs, or by a total alone. llama-server drops the library's INFO lines
+at its default verbosity, because they map to its trace level. So the report reaches serve only
+when it is logged as a WARN or above, as the program-cache flush line is.
+
+Starts, watchdog kills and exits outlive one serve process, because Lemonade restarts a backend
+by starting `1bit serve` again. They are kept per model id in
+`~/.local/state/1bit/serve/<hash of the id>.json` (the file names the model inside; the home
+directory comes from the user database, not `$HOME`).
+
+**How Lemonade picks them up.** Lemonade appends a backend's `/metrics` to its own when the
+backend's recipe descriptor sets `exposes_prometheus_metrics`. Each line is renamed
+`lemonade_llamacpp_<name>` and labelled with the model. Our fork's `onebit` descriptor has it
+`false` today, so turning it on is a one-line change in the fork, and it is Lemonade's call.
+Until then, scrape serve's port directly.
+
+`tests/metrics_serve.sh` (ctest `metrics_serve`, CI included) checks every series against
+`tests/fake_backend.py`.
 
 ## Where the model runs
 

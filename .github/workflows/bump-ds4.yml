@@ -15,11 +15,18 @@
 #
 # Keep third_party/ds4 on upstream antirez/ds4 main (docs/dwarfstar.md). The submodule is
 # our fork 1bit-MONSTER/ds4, branch 1bit/main: upstream main plus the commits we carry (1BP
-# packages, docs/1BP.md in the fork). When upstream main moves, this workflow rebases those
-# commits onto it (one upstream has since taken becomes empty and drops out), tags the old tip
-# ds4-main-<sha12> so pinned commits stay reachable, and opens a PR here moving the submodule.
-# A commit that no longer applies stops the bump for a hand rebase. GitHub-hosted CI has no
-# GPU; run the checks in the PR body on Strix Halo before merging.
+# packages, docs/1BP.md in the fork). When upstream main moves, this workflow merges it into
+# 1bit/main, the way sync-lemonade-fork.yml merges upstream's release into the Lemonade fork,
+# and pushes the merge commit: the old tip stays an ancestor of the new one, so the engine's
+# tools/check_pins.py ("pins only move forward") is satisfied and no pin is ever rewritten.
+# It tags the old tip ds4-main-<sha12> so pinned commits stay reachable, and opens a PR here
+# moving the submodule. A merge conflict, or a merge that drops the files we carry, stops the
+# bump for a hand merge and pushes nothing.
+#
+# Until 2026-10-16 this workflow rebased our commits onto upstream and force-pushed, so every
+# bump PR pinned a rewritten commit, which check_pins.py reads as "diverged" and refuses;
+# #429 is such a pin and needed the "pin rollback" label. GitHub-hosted CI has no GPU; run the
+# checks in the PR body on Strix Halo before merging.
 #
 # Uses the secret HRX_BUMP_TOKEN (Contents read/write on 1bit-MONSTER/ds4 and
 # 1bit-MONSTER/engine, Pull requests read/write on 1bit-MONSTER/engine): a PR opened with the
@@ -71,43 +78,54 @@ jobs:
             if [ "$upstream" = "$ours_base" ]; then echo "changed=false"; else echo "changed=true"; fi
           } >> "$GITHUB_OUTPUT"
 
-      - name: Rebase our commits onto upstream
+      - name: Merge upstream into our 1bit/main
         id: fork
         if: steps.pins.outputs.changed == 'true'
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
+          TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
           OURS: ${{ steps.pins.outputs.ours }}
-          OURS_BASE: ${{ steps.pins.outputs.ours_base }}
         run: |
           set -euo pipefail
           # the fork's main mirrors antirez/ds4 main
           gh api -X POST repos/1bit-MONSTER/ds4/merge-upstream -f branch=main > /dev/null
-          git init -q fork && cd fork
-          git remote add fork "https://x-access-token:${GH_TOKEN}@github.com/1bit-MONSTER/ds4.git"
+          git clone -q --filter=blob:none "https://x-access-token:${TOKEN}@github.com/1bit-MONSTER/ds4.git" fork
+          cd fork
+          git config user.name "ds4-bump"
+          git config user.email "ds4-bump@users.noreply.github.com"
           git remote add upstream https://github.com/antirez/ds4.git
-          git fetch -q --filter=blob:none upstream "$UPSTREAM"
-          git fetch -q --filter=blob:none fork 1bit/main
-          carried=$(git rev-parse FETCH_HEAD)
+          git fetch -q upstream "$UPSTREAM"
+          git switch -q -C 1bit/main origin/1bit/main
+          carried=$(git rev-parse HEAD)
           if [ "$carried" != "$OURS" ]; then
             echo "::error::1bit/main (${carried:0:12}) is not the engine's pin (${OURS:0:12}); reconcile them by hand"
             exit 1
           fi
-          git fetch -q --filter=blob:none upstream "$OURS_BASE"
-          git checkout -q --detach "$carried"
-          if ! git -c user.name=ds4-bump -c user.email=ds4-bump@users.noreply.github.com \
-               rebase -q --onto "$UPSTREAM" "$OURS_BASE"; then
-            git rebase --abort || true
-            echo "::error::our commits on 1bit/main do not rebase onto antirez/ds4 ${UPSTREAM:0:12}; rebase them by hand"
+          # A conflict is for a person: no auto-resolution, and nothing is pushed.
+          if ! git merge -q --no-commit --no-ff "$UPSTREAM"; then
+            conflicts=$(git diff --name-only --diff-filter=U | paste -sd, -)
+            git merge --abort
+            echo "::error::antirez/ds4 ${UPSTREAM:0:12} does not merge cleanly into 1bit/main (${conflicts}); merge it by hand"
             exit 1
           fi
-          rebased=$(git rev-parse HEAD)
-          git tag "ds4-main-${carried:0:12}" "$carried"
-          git push -q fork "refs/tags/ds4-main-${carried:0:12}"
-          git push -q --force-with-lease="refs/heads/1bit/main:$carried" fork "$rebased:refs/heads/1bit/main"
+          # The fork exists for the 1BP packages: never push a merge that lost them.
+          for f in ds4_onebp.inc docs/1BP.md; do
+            [ -f "$f" ] || { echo "::error::$f is gone after the merge"; git merge --abort; exit 1; }
+          done
+          compgen -G 'gguf-tools/*1bp*' > /dev/null || { echo "::error::the 1BP tools are gone after the merge"; git merge --abort; exit 1; }
+          grep -q 'ds4_onebp.inc' ds4.c || { echo "::error::ds4.c no longer includes ds4_onebp.inc"; git merge --abort; exit 1; }
+          git commit -q -m "Merge upstream antirez/ds4 ${UPSTREAM:0:12} into 1bit/main"
+          merged=$(git rev-parse HEAD)
+          # the property tools/check_pins.py checks on the engine side, asserted before the push
+          git merge-base --is-ancestor "$OURS" "$merged" || { echo "::error::the merge does not contain the old pin ${OURS:0:12}"; exit 1; }
+          tag="ds4-main-${carried:0:12}"
+          git rev-parse -q --verify "refs/tags/$tag" > /dev/null || git tag "$tag" "$carried"
+          git push -q origin "refs/tags/$tag"
+          git push -q origin "refs/heads/1bit/main"
           {
-            echo "rebased=$rebased"
-            echo "patches<<EOF"; git log --format='- `%h` %s' "$UPSTREAM..$rebased"; echo "EOF"
+            echo "merged=$merged"
+            echo "patches<<EOF"; git log --no-merges --format='- `%h` %s' "$UPSTREAM..$merged"; echo "EOF"
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the bump PR
@@ -117,7 +135,7 @@ jobs:
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
           OURS: ${{ steps.pins.outputs.ours }}
           OURS_BASE: ${{ steps.pins.outputs.ours_base }}
-          REBASED: ${{ steps.fork.outputs.rebased }}
+          MERGED: ${{ steps.fork.outputs.merged }}
           PATCHES: ${{ steps.fork.outputs.patches }}
         run: |
           set -euo pipefail
@@ -130,17 +148,17 @@ jobs:
           git config user.name "ds4-bump"
           git config user.email "ds4-bump@users.noreply.github.com"
           git switch -c "$branch"
-          git update-index --cacheinfo "160000,$REBASED,third_party/ds4"
+          git update-index --cacheinfo "160000,$MERGED,third_party/ds4"
           git commit -q -m "Bump DwarfStar: antirez/ds4 ${UPSTREAM:0:12}"
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
             --title "Bump DwarfStar: antirez/ds4 ${UPSTREAM:0:12}" \
-            --body "Moves third_party/ds4 (1bit-MONSTER/ds4 1bit/main) from \`${OURS:0:12}\` to \`${REBASED:0:12}\`: upstream main \`${UPSTREAM:0:12}\` plus the commits we carry.
+            --body "Moves third_party/ds4 (1bit-MONSTER/ds4 1bit/main) from \`${OURS:0:12}\` to \`${MERGED:0:12}\`: upstream main \`${UPSTREAM:0:12}\` merged into 1bit/main, so the new pin contains the old one and the pin check passes without a \"pin rollback\" label.
 
           Upstream commits (last 30):
           ${log}
 
-          Our commits, rebased onto upstream (none left means upstream has them all):
+          Our commits still on 1bit/main (none left means upstream has them all):
           ${PATCHES:-none}
 
           CI here has no GPU. Before merging, on Strix Halo:

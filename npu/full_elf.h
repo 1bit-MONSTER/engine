@@ -57,6 +57,14 @@ struct ContextMap {
     std::vector<Word> words;
     static constexpr int kBlock = 16;
 
+    // Where the run at context n writes its KV row: each linear word with a step above 1 is a byte
+    // offset base + (n - 1) * step into the KV buffer (a row offset in the control code, or its
+    // relocation addend); the words equal to n step by 1. Distinct (base, step) pairs, in order.
+    struct RowOffset {
+        uint32_t base, step;
+    };
+    std::vector<RowOffset> row_offsets() const;
+
     // Throws if a differing word follows neither rule.
     static ContextMap derive(const Bytes& ctx1, const Bytes& ctx2, const Bytes& ctx17);
 };

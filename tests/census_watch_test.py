@@ -285,6 +285,21 @@ sig_alert = dict(sig, GrugMoeForCausalLM={k: v for k, v in sig["GrugMoeForCausal
 rc, res = rc_of([grug], archs, sig_alert)
 check("without the watch field the reviewed class alerts", rc == 1 and res["significant"] == ["GrugMoeForCausalLM"])
 
+# 15. The classes the 2026-10-14..16 streak flagged (issue #427 and the two un-filed runs
+#     before it) are reviewed, documented and non-alerting.
+for cls, mid in (
+    ("DFlash2DraftModel", "nchapman/Qwen3.5-4B-DFlash2"),
+    ("DiacritizerModel", "ahmadsy/tashkeel-nano-1p1m"),
+    ("MBartForConditionalGeneration", "nhatho1999/orthomni-codeco"),
+    ("BlindForCausalLM", "Vi-LAB/KenT_0.5B_Base"),
+    ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
+):
+    check(f"{cls} is reviewed report-only and documented",
+          sig.get(cls, {}).get("watch") == "report" and cls not in archs and cls in gap_docs)
+    rc, res = rc_of([model(mid, cls)], archs, sig)
+    check(f"{cls} report-only -> exit 0, no alert",
+          rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == [])
+
 if failures:
     print(f"\n{len(failures)} check(s) failed")
     sys.exit(1)

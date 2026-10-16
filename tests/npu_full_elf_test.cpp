@@ -98,6 +98,16 @@ int main(int argc, char** argv) {
         check(refused([&] { elf_section(tiny_elf(".ctrltext", 40, 16, 1u << 20), ".ctrltext"); }),
               "a section name past the end is refused");
     }
+    {
+        // row_offsets keeps the linear words that step by a row (not the words equal to N, step 1,
+        // nor the block words, step 0) and drops the duplicates the relocation addends bring.
+        ContextMap m;
+        m.words = {{0, 1, 1}, {4, 0, 0x400}, {8, 0x800000, 0x400}, {12, 0x1000, 0}, {16, 0, 0x400}, {20, 0x800000, 0x400}};
+        const auto rows = m.row_offsets();
+        check(rows.size() == 2 && rows[0].base == 0 && rows[0].step == 0x400 && rows[1].base == 0x800000 &&
+                  rows[1].step == 0x400,
+              "row_offsets: two distinct KV row offsets");
+    }
     if (argc == 1) {
         std::printf("md5: %s\n", failures ? "FAILED" : "ok (pass <captured-dir> <pdi> <golden-dir> for the model checks)");
         return failures ? 1 : 0;

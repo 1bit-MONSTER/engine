@@ -33,7 +33,10 @@ pin once it lands. Treat a single failure of this case as a flake, not a regress
 
 ## engine#315 — intermittent all-NaN logits and format-500 on GLM-4.7-Flash under GTT pressure
 
-**Status: OPEN, accepted as a documented limitation.** The issue stays open until this criterion is met.
+**Status: OPEN. No limitation entry is recorded.** The earlier status line here read "accepted as a
+documented limitation"; that is superseded. This issue's own rule is that a documented limitation is
+acceptable only *after* the mechanism is named, and no mechanism is proven - so nothing is recorded and
+the issue stays open until the criterion below is met. See the correction at the end of this entry.
 
 Owner acceptance, recorded 2026-10-07: the owner authorised landing this entry in writing — *"you have gh
 authorization and do what needs to be done"* — on the basis that no forward fix is available. The limitation text
@@ -47,30 +50,191 @@ demand, which is why it is recorded as a limitation rather than fixed.
 
 3 detached neighbour `llama-server` processes at default context drive GTT into the ~100 GB band, then one
 detector server is exercised with 8 identical greedy requests separated by different-length distractors,
-followed by 50 mixed-length requests. Under pressure the logits buffer is never written, and the sampler guard
-reports:
+followed by 50 mixed-length requests. Under pressure the decoder produces corrupted logits, and the sampler
+guard reports:
 
 ```
-count=154880 of 154880, contiguous=yes
+count=154880 of 154880, contiguous=yes, sentinel=0
 ```
 
-`154880` is the model's vocabulary width — the whole LM-head output. The guard fires on the consumer side,
-which is why it reports the shape and not the producer.
+`154880` is the model's vocabulary width — the whole LM-head output — and `sentinel=0` says every one of those
+NaNs was **written by the compute**: not one is the sentinel payload the instrumentation pre-fills the logits
+allocation with. The earlier reading here, that "the logits buffer is never written", is therefore falsified, and
+it was unsafe from the start: the sentinel only ever fills the 619520-byte logits allocation (`ggml-hrx.cpp`,
+`size == 619520`), so it says nothing about the tensors where the corruption is born. The guard fires on the
+consumer side and reports the shape, not the producer — the producer is upstream of the final norm, which the
+nan-dump fingerprint (docs/315-campaign/evidence/315-instrumented-arm-hunt.md) established by finding the first
+NaN-bearing tensors in the FFN path.
 
 ### Both failure faces
 
-The same underlying defect — output data that is wrong or unwritten under memory pressure — surfaces in two
-places depending on where it lands:
+The same underlying defect — one token's hidden row corrupted during a prefill — surfaces in two places
+depending on what the corrupted memory holds (NaN, or stale finite values):
 
-1. **All-NaN logits.** The logits buffer is never written; the sampler guard fires with
-   `count=154880 of 154880, contiguous=yes`. Example: `v315g-c3` (control arm).
-2. **Format-500.** The model emits text the server rejects:
-   `{"error":{"code":500,"message":"The model produced output that does not match the expected Content-only
-   format"}}`. Example: `v315k-l1` (legacy arm), `identical: 1 distinct of 8` then mixed `10 of 50`, `nan=0`.
+1. **All-NaN logits (Face A).** One token's hidden row is already NaN by the time the MoE aggregation adds run, so
+   that token's KV slot is poisoned and the next decode attending to it hands the output norm an all-NaN hidden
+   state: `count=154880 of 154880`. Across sixteen faulting arms the NaN count at the first affected tensor is
+   **2048 in fifteen of them** — exactly one `n_embd` row — while the batch size varies four-fold (T of 87, 98,
+   135, 140, 172, 306, 342), and the first affected node is an unnamed partial expert sum
+   (`build_moe_ffn` names only the final aggregate). Mechanism, evidence and the discriminating experiment:
+   docs/315-mechanism.md sections 40, 44, 47.
+
+   **Correction, 2026-10-10.** That "one row" figure is a property of the instrument that measured it, not yet a
+   property of the fault. Those arms used `GGML_HRX_TENSOR_FP=tail:16` (a window over the last sixteen graph
+   nodes). Arm `315row-p1c`, in regime at `gtt_start=98G`, measured by *node name* instead and found the
+   corruption in the routed-FFN **routing** tensors with the whole batch already NaN (`l_out-4`: 20480 of 20480
+   floats, all ten tokens' rows; `ffn_moe_up-4`: 61440 of 61440), the earliest NaN-bearing node being
+   `ffn_moe_weights-4` — the `ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` route-weight gather — while
+   `ffn_moe_probs-4` carried none. Until the same instrument is run over the same arms, the safe statement is
+   that the corruption involves the MoE routing tensors and that the row extent is instrument-dependent.
+   Evidence: docs/315-campaign/evidence/315-row-p1c-inregime-mechanism.md.
+2. **Format-500 (Face B).** The same event with *finite* contents. A faulting request whose 60-name tensor
+   fingerprint included `norm`, `result_norm` and `result_output` logged **no NaN at all**, and the server rejected
+   its output as `unparsed Content-only output: the}:}:}甚;` — garbage; the paired control arm produced a
+   repetition loop, `a gaps gaps gaps ...`. The sampler is drawing from a corrupted distribution, the text is
+   degenerate, and the failure surfaces at the server's chat-template parser instead of at the sampler guard.
+   Evidence: docs/315-campaign/evidence/315-face-landscape.md.
 
 A NaN-only count records the second face as a clean run, which is what makes it dangerous as a metric. Scoring
-must be: an arm is **valid only if it completes `mixed: 50 of 50 ok`**; an arm that aborts early has reduced
-exposure and is excluded, not counted as clean.
+must be: an arm is valid only if it completes the request phase in full (66 of 66 requests); an arm that aborts
+early has reduced exposure and is excluded, not counted as clean. Both faces must count — NaN logits through the
+guard, format failures through HTTP status, UTF-8 and JSON parse failures — and a third signal is needed for finite
+corruption that still parses: the detector's eight identical greedy requests must agree (`identical_distinct == 1`),
+because no clean arm among the 142 recorded has ever been non-deterministic while all seven non-deterministic arms
+were Face-A faults (`docs/315-preregistration.md` section 8, freeze note 2026-10-10).
+
+### State as of 2026-10-10 (this section supersedes the mechanism text above wherever they differ)
+
+Diagnostic record: `docs/315-mechanism.md` sections 42-51; evidence under `docs/315-campaign/evidence/`.
+
+**Where the fault sits now.** The routed FFN's *routing* tensors, in the MoE path:
+`ffn_moe_argsort` / `ffn_moe_topk` (the top-k ids, `src/llama-graph.cpp:1930-1935`) feed
+`ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` and `ggml_mul_mat_id`. In arm `315row-p1c` the gather was NaN for two
+whole tokens while the ids had never been instrumented at all, which is the measurement gap this entry now
+carries as its most important limitation.
+
+**A candidate with a mechanism, not yet a finding.** `ggml_argsort_rows_f32`
+(`kernel-corpus/kernels/loom-libs/ops/small_rows_f32.loom:111`) computes each element's rank with *ordered*
+comparisons (`cmpf ogt`/`olt`/`oeq`) plus an index tie-break. That is a total order for finite input, so the ranks
+are a bijection and every output slot is written; **for a row holding two or more NaNs it is not** — all three
+comparisons are false, two elements take the same rank, and one slot in `[0, cols)` is never written and keeps
+whatever the buffer held before. A stale `i32` in the top-k view is an arbitrary expert id. The two consumers
+disagree about it: the gather clamps the id (`small_rows_f32.loom:157+`), while the expert-table builders
+consume it with `index.assume` *ranges* (`mul_mat_id_swiglu_f32_f32_wmma.loom:47-53`), not checks. Full reading:
+`evidence/315-id-producing-kernel.md`.
+
+**Falsified in this round** (each with its own evidence path). Arm counts below are **re-derived from the
+run consoles** (`docs/315-campaign/tools/lever-census.py`, all arms at `gtt_start` 97-98 GiB, i.e. inside
+the frozen `>= 95 GiB` gate), not from prose:
+
+| candidate | run | control cell | fix cell | reading | evidence |
+|---|---|---|---|---|---|
+| memory coherence is the carrier (`HOST_COHERENT` on host-visible buffers) | `315accept` / face-landscape | — | **9 clean + 1 fault / 10** | not sufficient | `evidence/315-face-landscape.md` |
+| consumer-side ordering is the carrier (`GGML_HRX_DIAGNOSTIC_GRAPH_SYNC=1`, a stream sync after every replay) | `315gsync2` | 1 fault / 4 | 0 / 4 | no change (Fisher p = 1.00) | `evidence/315-face-landscape.md` |
+| ordering the instrument's own reads (`ggml_backend_synchronize` before each read) | `315row` vs `315fp2` | 1 / 1 (`315row` c) | 1 / 4 (`315fp2` l) | no change (p = 1.00) | `evidence/315-fp2-ordered-fingerprint.md` |
+| forced AQL execution barrier on **every** packet (`HRX_FORCE_BARRIERS=1`, env-gated patch in `aql_block_processor.c`) | `315fbar` | 3 faults / 4 | 1 / 4 | no change | `315fbar-console.log` |
+| flash attention is the carrier (`-fa off`) | `315nofa` | 1 / 4 | 2 / 4 | fault persists | `315nofa-console.log` |
+| `HRX_COMMAND_BUFFER_MODE=pm4` | `315pm4` | 3 OK + 1 fault / 4 | 4 / 4 arms failed at `req=1` | **unusable**: every fix arm failed the *first* request with HTTP 500 - not a fault-rate comparison at all | `315pm4-console.log` |
+| the expert/partition tables go stale | static | — | — | both are rebuilt by producer dispatches inside the same plan | `evidence/315-moe-routing-routed-ffn-static.md` section 3 |
+| the fused path loses `route_stride` | static | — | — | that defect is already fixed in every tree that faults | the same file, section 7 |
+| the engine's MoE expert-streaming cache | static | — | — | Vulkan-only; the arms never enter it | the same file, section 6 |
+
+**Two arm counts in the 2026-10-10 issue comment were transcription errors, corrected here against the
+consoles.** That comment gives the forced-barrier control as `2 / 4` and the `GRAPH_SYNC` fix cell as
+`0 / 2`; `315fbar-console.log` records control **3 faults / 4** (pairs 1, 2, 4 fault; pair 3 clean) and
+`315gsync2-console.log` records the fix cell as **0 faults / 4** (not 2). Neither correction changes any
+reading: the barrier still shows no improvement, and the sync cell is still clean against a faulting
+control. The comment's command section cites these same consoles as its source, so the consoles govern.
+
+**Withdrawn (kept for its own record) - was "still untested, and next".** The ids themselves: instrumented
+as `i32` with the name match anchored (the previous filter was `std::strstr(list, name)`, so `-41` also
+matched `-4` and only layers 4 and 41 were covered). `docs/315-campaign/315-idprobe.sh` builds that probe
+and runs four in-regime arms, reporting per row the first eight ids, the count outside `[0, n_expert)` and
+whether the row's ids repeat. Duplicate or out-of-range ids make the argsort kernel the site; a clean
+permutation kills it.
+
+**This is no longer the next step.** The correction directly below supersedes it twice over: the by-name
+instrument that would have produced these ids reads a transient arena slot's last writer (so no post-graph
+by-name read can name a producer on this backend), and the `oor`/`dup_pairs` ids diagnostic was itself
+**mis-specified** - `oor` was compared against `ne0`, which for the top-k *view* is `k`, not the expert
+count, so essentially all of its ~253,000 output lines are flagged and none is usable. The probe exists and
+runs; its output cannot answer the question it was built for. Do not treat this paragraph or
+`315-idprobe.sh` as an untested lead, and do not cite `evidence/315-id-producing-kernel.md` as a live result.
+
+**Correction, evening 2026-10-10 — this supersedes the two paragraphs directly above.** Both the routing-tensor
+candidate and the by-name instrument that produced it are now withdrawn, and the ordering family is closed:
+
+* the fingerprint reads the MoE intermediates out of one **host-visible, non-coherent 44 MB arena**
+  (`size=44048640 memory_type=0x52`) through a plain `memcpy` (`ggml_backend_tensor_get` short-circuits for host
+  buffers), and, worse, a **post-graph read by name returns that arena slot's last writer** - proven inside one
+  arm by arithmetic, since `ffn_out-0` reads `nan=7048 of 1048576` while `l_out-0` reads `nan=4963`, and
+  `l_out = ffn_out + attn_out` forbids `l_out` from having fewer NaNs. So no post-graph by-name instrument can
+  name a producer on this backend, and the `oor`/`dup_pairs` ids diagnostic was mis-specified besides (`oor`
+  against `ne0`, which for the top-k *view* is `k`, not the expert count);
+* **four in-regime toggles, all null, every arm at `gtt_start=98 GiB`**: `GRAPH_SYNC` after each replay
+  (control 1 fault / 4, fix 0 / 4); `ggml_backend_synchronize` before the instrument's reads (1/1 vs 1/4);
+  `HRX_FORCE_BARRIERS=1` forcing an AQL barrier on every packet (3/4 vs 1/4); and `-fa off` (1/4 vs 2/4, the
+  fault persists). `HRX_COMMAND_BUFFER_MODE=pm4` is not a lever at all - every fix arm failed the first
+  request with HTTP 500;
+* **the ordering/visibility super-family is closed at source as well as by run.** Both halves have a
+  citation, not just a symbol name:
+
+| claim | evidence |
+|---|---|
+| the host read of the logits is ordered: the accessor synchronises before returning | `src/llama-context.cpp:3728-3730` - `llama_get_logits_ith` calls `ctx->synchronize()` as its first statement |
+| the wait is an **acquire** wait, not a relaxed poll | `runtime/src/iree/hal/drivers/amdgpu/semaphore.c:329` - `iree_hsa_signal_wait_scacquire(..., HSA_WAIT_STATE_BLOCKED)`, inside the epoch-wait loop that returns via `iree_hal_amdgpu_semaphore_epoch_is_reached` |
+| the waited timepoint covers the **last** submission, so a stream wait cannot miss it | `semaphore.c:219` - `iree_async_semaphore_advance_timeline(base_semaphore, new_value, frontier)` runs in `iree_hal_amdgpu_semaphore_signal` *before* `dispatch_timepoints`; the public advance is `libhrx/src/libhrx/stream.c:240` (`hrx_stream_advance_timeline`) |
+| the barrier bit is decided from **encoded flags only**, and the driver explicitly refuses to infer memory hazards | `runtime/src/iree/hal/drivers/amdgpu/aql_block_processor.c:103-116` (`..._packet_has_barrier`: execution-barrier flag, final flag, first-packet wait count, first-packet inline acquire scope) and `:119-126` (`..._packet_control`, containing the comment *"Do not infer memory hazards here by walking command operands."*) |
+
+  Read together: the consumer's own path ends in a blocking acquire wait that is covered by the last
+  submission's timepoint, and the packet barrier is a recorded property the driver will not infer. Forcing
+  that bit on everywhere (`HRX_FORCE_BARRIERS=1`) changed the outcome in neither direction. That is why the
+  family is closed for *this* fault rather than merely untested;
+* **what survives**: the fault is real and common in regime (178 arms on the box, **131 in-regime, 34 faulting
+  in-regime**, both faces, never in the same arm), the guard line is exactly
+  `count=154880 of 154880 ... contiguous=yes`, and the one ordered by-name capture put the corruption at
+  **layer 0 of a T=512 prefill**, whole-batch, cascading to a fully NaN residual stream by layer 1;
+* **the best-matching lead, stated as a lead and not as a mechanism: the same *window* the engine's own #123/#140
+  record describes, opening somewhere our levers do not reach.** The historical instance is written down in
+  `docs/hrx.md` (section "MoE router expert-id fault fix" and the `00adc2b` section), and it is the only
+  record in the tree whose mechanism explains *both* faces in one sentence and *the GTT dependence at all*:
+  * a producer wave writes **global** memory, a consumer wave reads it back, and the barrier between them was
+    `kernel.barrier<workgroup>` - which fences **LDS only** (no store wait, no `buffer_gl0_inv`). A consumer
+    could therefore quantize the output slot's previous contents: *"The f32 output was right and `next_q8` was
+    wrong, and NaN when the stale bytes decoded as NaN"* - wrong-but-finite (Face B) and NaN (Face A) from one
+    defect, decided by what the stale bytes happened to hold. That is the same two-observables-one-event shape
+    this issue measures;
+  * *"The window opens when a dispatch is preempted, and any process's KFD queue eviction (page compaction,
+    KSM, memory pressure) does that, which is why the rate followed those settings"* - a mechanism that
+    explains the GTT dependence, which no other candidate in this issue does.
+
+  **Both historical fixes are in the pin, verified as ancestors of `0e255d774` (`git merge-base --is-ancestor`):**
+  `895d63f` (#123, the router argmax sentinel) and `00adc2b` (#140, `barrier<global>` then `barrier<workgroup>`
+  in every decode-split `reduce_fused` variant). So the historical defect is fixed, and what is *not* closed is
+  the same window opening somewhere else - most plausibly under memory pressure itself, where the preemption
+  is induced by the driver rather than by an adversarial test. Today's static audit over the whole `loom-libs/ops`
+  corpus and the forced-barrier run close this mechanism's **intra-dispatch** half for this model, but neither
+  reaches a window opened by the driver's own eviction.
+
+**The two instruments that could name it, and neither is built yet.** Named here so the next attempt starts from
+this state rather than re-deriving it:
+
+1. **Read a value at the point of production** - inside the dispatch, or from a non-transient copy taken at the
+   producer. This is the instrument the backend forces: a post-graph, by-name read cannot work on this backend
+   (it returns a transient arena slot's last writer, proven by arithmetic in an arm), so an in-dispatch read or a
+   producer-side copy is the only route left.
+2. **Correlate a faulting arm with the driver's own eviction/preemption events** - KFD SMI eviction records and
+   the amdgpu preemption path, aligned to the arm's own timeline. This is the instrument that tests the lead
+   above directly, and it needs an in-regime **faulting** arm to correlate; the profiled sessions so far produced
+   clean arms only (see the next bullet), so its faulting half is still owed.
+
+Neither instrument is a fix, and no limitation entry is recorded: a mechanism is not named, so `#315` stays OPEN
+by this issue's own rule.
+
+**No mechanism is proven, so no limitation entry is recorded**, and `#315` stays OPEN - a documented limitation is
+this issue's own rule only *after* the mechanism is named. The next instrument has to read a value at the point of
+production (inside the dispatch, or from a non-transient copy at the producer) or correlate a faulting arm with
+the driver's own eviction/preemption events; both are named in the issue comment of 2026-10-10 evening.
 
 ### Levers tested and excluded
 
@@ -138,8 +302,9 @@ motivated the change and neither excludes "no change" (and that ~10% comparator 
 arms, 95% CI ~0.2-32%, so the lower rate needs no environmental explanation). No runtime-side ordering gap on the
 device-to-host path could be named, and no forward-pin fix candidate
 survives (the only one proposed is an ancestor of the shipped pin, i.e. a revert). The open candidates are in the
-kernel/binding family: GLM is the only model whose decode splits into two 128 KB AQL command blocks (919 + 760
-dispatches) with 1,399 barriers per token.
+kernel/binding family — narrowed as of 2026-10-10 to the routed-FFN routing tensors and the id-producing kernel,
+with the two 128 KB AQL command blocks GLM's decode splits into (919 + 760 dispatches, 1,399 barriers per token)
+still unexamined as an *ordering* question. See "State as of 2026-10-10" above.
 
 **Pin note (2026-10-09).** `engine@main` has since moved twice: first to `third_party/llama.cpp e44c9d01a4d5`
 (#347), then to `0e255d774032` (#373, the fork tip after the NVFP4 / Q2_0 / IQ GET_ROWS merges), both with
@@ -152,7 +317,7 @@ in #363, and #365 now holds `hrx-system` when LoomC symbols go missing); and wit
 answers (#369), so `hrx-system` stays at `98d05d94` and moving it needs a multi-ubatch prompt check, not a symbol
 check. The #373 pin passed that check: needle 20/20 on Qwen3-0.6B.
 
-### Instrumentation available for the bisect (implemented, not yet built)
+### SUPERSEDED 2026-10-10: instrumentation for the bisect (implemented, not built — and now known to be unreachable)
 
 On `f2099e9b7`: a probe on the route the logits actually take (`backend_get_tensor_async` →
 `hrx_stream_copy_buffer`) that names the producing graph `value`. It recovers the `ValueId` by searching the
@@ -162,3 +327,364 @@ flush-and-wait that publishes the data, with a `=poison` mode so the reporting p
 compiles (single TU). It is deliberately unbuilt and unrun: relinking rebuilds every TU that includes
 `backend-context.h`, and that CPU inside a GTT-bound measurement is the confound that already invalidated one run
 of this experiment.
+
+---
+
+## UPDATE 2026-10-13 — the condition is now named and it is `gtt_start`; the read-path fix is REFUTED
+
+This supersedes the "no mechanism is proven" line at the top of this entry. It does **not** retire the
+entry: the cause site is still not located, so the issue remains OPEN.
+
+### The condition that governs the fault: measured, and it is occupancy, not the instrument
+
+A census of every recorded arm on the box (all `315*-console.log` under `~/wt`, 1,675 lines, every line
+matching `arm [qelc]: (OK|FAULT|OOR|INVALID)` parsed for cell, `gtt_start`, `gtt_now`) pools to:
+
+```
+    gtt_start=97G:  OK=150  FAULT=8    rate =  5.1%
+    gtt_start=98G:  OK=145  FAULT=64   rate = 30.6%
+```
+
+**BUT THIS POOLED SPLIT IS CONFOUNDED AND MUST NOT BE READ AS A PROPERTY OF THE LEVEL.** Compared
+within a single console — one session, one instrumentation — it does not survive:
+
+```
+    315ctl1 (NO forcer)   97G: 10 OK / 1 FAULT = 9.1%    98G: 15 OK / 1 FAULT = 6.2%   <- no level effect
+    315disc2 (WITH forcer) 97G: 12 OK / 0 FAULT = 0.0%    98G:  1 OK / 5 FAULT = 83.3%
+```
+
+The whole pooled effect is carried by the forcer run, i.e. the 98G population is dominated by forcer
+arms and the **forcer**, not the level, produced those faults. Within-cell breakdowns do not rescue it,
+because cells are not independent of instrument (cell `e` is *defined* by having the forcer).
+
+What is supported: the forcer causes faults (0/22 -> 7/10 pooled, arm A 4/4, arm B faulting with the fix
+on); and individual arms have drifted into a high band and faulted while doing so (arm A quiet r2
+97->102G; arm B cell `c` 97->106G). Isolated observations, not rates. The level question is open and is
+what the pre-registered `315gttstep` run exists to test. See
+`docs/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`, whose correction section carries the
+within-console numbers.
+
+This reconciles four observations that previously did not fit together: the 0/70 campaign (run at 97G,
+the 5% band, where ~3.6 faults were expected and 0 observed, P~3%) is a genuine low-band measurement and
+never evidence of absence; cell `e`'s near-total fault rate is because the forcer drives arms straight
+through the high band; the quiet- and CPU-cell faults occur at 98G starts or by drifting there; and the
+falsified per-arm eviction-*count* correlation (faulting mean 109.5 vs clean 254.5) failed because a
+count of evictions is not a measure of band occupancy.
+
+Evidence: `docs/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`,
+`315-faults-track-gtt-drift.md`, `315-ab1-cell-c-fault-drift.md`, `315-0of70-has-no-eviction-cell.md`.
+
+### The forced-eviction intervention, and the fix it motivated
+
+Forcing KFD evict/restore via `~/wt/evictonly` raises the rate from 0/22 to 7/10 arms (Fisher exact
+two-sided p = 3.6e-5), producing **both** faces under one intervention — the trigger-level mechanism.
+
+The candidate repair that intervention motivated — routing `buffer_get`'s bare `memcpy` of the
+non-coherent `0x52` logits mapping through `hrx_synchronous_d2h` — has been **REFUTED by its own
+pre-registered A/B** (`fc7ffd5`, `docs/315-campaign/evidence/315-ab-preregistration.md`):
+
+```
+    cell e (forced eviction, the test cell)    arm A (knob OFF): 0 OK / 4 FAULT
+                                               arm B (knob ON):  FAULT in round 1 (Face B) and round 2 (Face B)
+```
+
+The knob was confirmed live by reading the arm server's own `/proc/<pid>/environ` during the arm. The
+refutation is not dismissible: the one objection that would make it vacuous — that `hrx_synchronous_d2h`
+is itself an incoherent read — was checked at source and disproved, the runtime's staging pool being
+created `HOST_LOCAL | HOST_COHERENT | DEVICE_VISIBLE`
+(`host_queue_staging.c:427`, `315-ab1-fix-path-is-coherent.md`).
+
+**The prepared patch must NOT be landed.** It is preserved at
+`docs/315-campaign/patches/315-coherent-read-fix.patch` for the record only.
+
+### Consequence for this entry's acceptance criterion
+
+The criterion used here has been ">=60 in-regime arms, zero faults". That criterion is **satisfiable
+without testing the defect**: 60 quiet arms run at the ambient ~5% rate while the fault lives elsewhere
+entirely.
+
+**An earlier version of this paragraph said the gate should move to "the high band (>=98G)". That is also
+wrong, and is corrected here.** The cell-separated tally across every recorded console shows occupancy alone
+does not do it:
+
+    cell q (QUIET, no side load)          cell e (evictonly forcer)
+      gtt_start=44G   0%  (n=4)             gtt_start=44G   0%  (n=4)
+      gtt_start=97G   5%  (n=39)            gtt_start=98G  95%  (n=43)
+      gtt_start=98G   0%  (n=2)
+
+The quiet cell is **0% at 98G** against 5% at 97G — so `gtt_start` does not govern the fault, and a band-based
+gate would still admit arms that cannot fault.
+
+**The gate has to be the intervention cell, not a band.** The fault lives in cell `e`: ~95% under forced KFD
+eviction against ~5% ambient, a 19x contrast on the same workload at the same level. Any claim that #315 is
+gone must therefore show zero faults **in the forced-eviction cell** — and must report the ambient
+(quiet-cell) rate alongside it, so that a clean result cannot be produced by simply not applying the
+trigger. That is what makes the criterion falsifiable rather than satisfiable by omission.
+
+### Families closed by discriminating experiment (2026-10-13)
+
+Six candidate families are closed by a pre-registered or source-level test; a seventh (the FA
+alignment class) is now **excluded as sufficient** on the frozen rig — an earlier attempt to exclude it
+rested on a parse error and was retracted (`315-galign-CORRECTION-my-parse-was-wrong.md`), and this run
+replaces it:
+
+| family | disposition | evidence |
+|---|---|---|
+| the logits **read path** — routing `buffer_get`'s bare `memcpy` through `hrx_synchronous_d2h` | **REFUTED** by its own pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT with the knob off and 0 OK / 2 FAULT with it on, both Face B, knob verified live in the arm server's `/proc` environ | `315-ab1-arm-B-interim.md`, `315-ab1-fix-path-is-coherent.md` |
+| the **host side** — every host access to the non-coherent `0x52` mapping | **CLOSED**: all four accesses enumerated (`buffer_memset`, `buffer_set`, `buffer_get`, `buffer_clear`) and none is on the decode path | `315-write-side-unaddressed.md` |
+| the **runtime's AQL submission policy** | **CLOSED**: `aql_block_processor.c` states in code that the runtime does not infer memory hazards, consuming only compiler-set packet flags, so it never derives a producer/consumer pair | `315-device-hunt-boundary.md` |
+| the **graph reorder** (`GGML_HRX_GRAPH_ORDER`) | **REFUTED** by a pre-registered A/B: cell `e` faulted 0 OK / 4 FAULT in BOTH arms (reorder on and off), 100% either way | `315-gord1-final.md` |
+| the **deferred host writeback** (`add_host_writeback` queued, flushed at `mark_stream_synchronized`) | **CLOSED by mechanism**: the queue is never populated, and the gate is `binding.host_data != nullptr` while the logits binding resolves to `nullptr` (allocation host-visible, binding device-addressable) | `315-deferred-writeback-gap.md` |
+| the **FA alignment/dispatch** class (`GGML_HRX_FA_PARTIAL_ALIGN`, the #140 family) | **not required**: on the FROZEN rig (the driver that reproduces the trigger), arm A (align 4096) and arm B (align 256) gave IDENTICAL tallies — cell `e` faulted **3 of 3 arms in both**, at `gtt_start=98G` with the forcer live. So the layout the #140 oracle used to expose the divergence is not required for the fault. One-sided (3 arms per alignment cannot bound a rate difference), the same strength as the coherence and `GRAPH_SYNC` rows — not a measured null. | `315-align-frozen-result.md` |
+| the **id-producing / argsort** family (route ids corrupted → tables consume a stale id) | **NOT excluded — unmeasurable with the current instrument, for a now-named reason.** The instrument read the **correct** tensors (`ffn_moe_argsort` = the argsort result, i32, `ggml.c:5347`; `ffn_moe_topk` = a `view_4d` of it) and two independent read paths (plain memcpy and synchronising `hrx_synchronous_d2h`) returned **identical** values — so neither the naming nor the read path was the defect. The cause is **arena slot reuse**: the MoE path lives in a single reused `TransientArena`, the fingerprint reads after the whole graph has run, and the allocator reassigns the slot of any tensor whose lifetime has ended — so an i32 rank tensor reads back as a later float tensor's data. This also downgrades the strongest recorded id lead (`ffn_moe_weights-4`: gather output NaN with finite source) to **indistinguishable from a read artifact**. Only end-of-graph tensors are faithful; the trustworthy statement is that the residual stream is **entirely NaN at the head**. | `315-idprobe-readpath-refuted.md`, `315-which-readings-are-faithful.md` |
+
+| **where the corruption is born** (the search's location, not its cause) | **NARROWED to layer 0 or earlier — the first faithful localization on the record.** `l_out-<layer>` is the last node of its per-layer graph chunk, so it is the least displacement-exposed reading available, and in the reduced-selector session **all three Face-A arms carry NaN at `l_out-0`**: 1,984 of 200,704 (98 tokens) and **1,984 of 276,480 (135 tokens) — the same absolute count at different sizes** — growing monotonically to saturation by layer 15, after which `l_out-15…45` are all the **identical hash** `ba52bebcb7a7d383`. A clean quiet arm in the same session shows zero NaN at every layer. `1984 = 2048 − 64 = 7936 bytes = one 8192-byte row less its first 256 bytes`, and 256 is the alignment the record gives for the MoE tables. This **contradicts** `315-mechanism.md` §40's *"born at block 41, not inherited from block 0"* — a tension the `315row` file had already flagged and left unresolved — and it means the per-node leads at layer 41 and the head have been downstream of an already-saturated stream. **Not a named mechanism:** `ffn_inp-0` (layer 0's post-attention residual, faithfully readable by lifetime) and the embedding are still to be separated. | `315-nan-origin-is-layer-0.md`, `315-lifetime-is-the-faithfulness-rule.md` |
+| **device-side access violations** (an out-of-bounds read/write by a specific kernel) | **not detected, but qualified.** Device ASAN was enabled via `HRX_HAL_SANITIZER=asan` (`runtime.c:576` → `options->asan.enabled`) with the engine's existing device-event sink installed by `GGML_HRX_LOG_DEVICE_EVENTS=1` (`ggml-hrx.cpp:1371`, before `hrx_gpu_initialize`). In-regime Face-A arms (`gtt_start=100G`, `nan=2`) produced **no ASAN report**. Wiring verified at every step, but **no positive control was run**, so this bounds the family only as far as the sanitizer's own detection goes. | `315-asan-wiring-verified.md`, `315-asan-preregistration.md` |
+| **the logits region holding stale / never-written memory** (Face A read of an unfilled buffer) | **EXCLUDED by the engine's own sentinel, recovered from an existing run.** `GGML_HRX_SENTINEL=1` fills the 619520-byte logits allocation with payload NaN `0x7FC0DEAD`, and the sampler guard reports the match count as `sentinel=`. The `315nan` session armed it (fill line present in **20 of 21 arms**) and **all 17 fault lines read `sentinel=0`** — the device wrote the region, with NaNs. The fill was never read out at the time. | `315-sentinel-preregistration.md` |### Still open
+
+The **cause** — which handoff reads stale data after an eviction — is not located, now after closing six
+families. What IS established is the trigger, quantified on the quiet cell (the one cell with no instrument
+confound): ambient **~5%** against **~95%** under forced KFD eviction, an order-of-magnitude contrast on the
+same workload at the same GTT level (`315-quiet-vs-forcer-by-level.md`). That file also retires an earlier
+band-based gate recommendation — the quiet cell's rate at 98G was first put at 0% on n=2, but a **second**
+quiet-cell fault at 98G overturned that leg (1 in 3 arms pooled; rule-of-three on 0/2 is ~78%, so "zero" was
+never supportable from it). The load-bearing figure is the cross-cell contrast at matched level, not the
+quiet rate. So the gate must be the **intervention cell**, not a band. The surviving candidates are the ones §55/§56 left open (executor-level cross-dispatch ordering,
+or a different class), and the MoE id-producing-kernel family under active work by another agent.
+
+The **`GGML_HRX_FA_PARTIAL_ALIGN`** discriminator — the #140 FA layout/dispatch class, which §57 of
+`315-mechanism.md` names as the cheapest never-applied lever and pre-commits to abandoning the FA path if
+the rate does not move — is pre-registered at `315-align-preregistration.md`, not yet run.
+
+### On the fix
+
+**No forward-only fix is currently landable**, and the reason is structural rather than an absence of
+ideas: the engine validates **program structure** (`verify_command_program`,
+`validate_program_constant_access`) and never **memory contents**; the only content check is
+`std::isnan(logits[i])` in the sampler, Face-A only. Nothing on the replay → restore → consume path can
+distinguish bytes the device wrote from a pre-eviction stale copy, so a repair would need the runtime to
+guarantee restore fidelity (out of scope: the driver/runtime lane) or would be a Face-A-only workaround the
+entry's own rule forbids recording. Full argument: `315-no-fix-available.md`.
+
+The prepared read-path patch is refuted and must not be
+landed. The one defensive mitigation in the tree (`GGML_HRX_NAN_CONTINUE`, scrubbing NaNs to `-INFINITY`)
+addresses Face A only and is a **workaround, not a repair** — and this entry's own rule is that a
+documented limitation is acceptable only *after* the mechanism is named, so no limitation entry is
+recorded.
+
+The controlled confirmation of the `gtt_start` boundary (cell fixed, start stepped 97/98/99) is
+pre-registered at `docs/315-campaign/evidence/315-gttstep-preregistration.md`, not yet run.
+
+---
+
+## UPDATE 2026-10-14 — the site is instrument-relative, the size is not, and Face B was never measurable
+
+Session evidence: `docs/315-campaign/evidence/315-instrument-independent-summary.md` and the nine documents it
+cites; all read from the archived arm logs at pin `e44c9d01a`, no new arms. Nothing above is edited.
+
+### The condition is named (as UPDATE 2026-10-13 says) but the SITE is not a property of the defect
+
+Three configurations already on the record separate the two candidate variables:
+
+| condition | selector | probes | first NaN at |
+|---|---|---|---|
+| A — `315size` | 15-name `l_out` list | none | **layer 0** |
+| B — `315lout4`, `315inp2` | `l_out` name list | `COPY_PROBE`+`SENTINEL`+`LOGITS_FP` | **layer 0** |
+| C — `315nan`, `315fbar` | **`tail:16`** | same probes | **layer 41** |
+
+A vs B varies the probes and the onset does **not** move; B vs C varies the selector and it **does**
+(0 → 41). So the **read pattern** sets the onset, and `hrx-producer` shows `graph n_nodes=9`, making
+`tail:16` read **every** node of a subgraph (~9 per chunk) against ~1–3 for a name list. That also explains
+why `tail:16`'s recorded 16/17 yield did not reproduce: reading every node is a different regime, not a
+failed replication. **Consequence for this entry: a fix aimed at a layer is unsound, because the layer moves
+with the instrument.** Any "the corruption is at layer N" statement in this entry or its evidence is
+instrument-relative unless the read pattern is fixed.
+
+### What survives across the instruments: one hidden-state row, at the front of the buffer
+
+- **Size.** At the first corrupted tensor the count is one `n_embd`-wide row: `2048` floats = **8,192 bytes**,
+  or `1984` = **7,936 bytes** = one row minus one 256-byte alignment block. Five of seven non-saturated onset
+  readings fall in 7,936–8,192 B across three configurations. `nan = 2048` *exactly* in 18 of 19 arms is a
+  property of condition C, not of the defect.
+- **The count is a complete read, not a truncation.** In all four arms where the `hrx-finite-fp` channel
+  printed, `finite + nan` equalled the tensor extent **exactly** (77,824+2,048=79,872; 350,208+2,048=352,256;
+  710,656+2,048=712,704).
+- **Position: row 0 or 1.** In the unbiased subset — readings where `nan` is *exactly* one row, so the
+  reported row is the true position and not the first of several — **12 readings across 4 arms are all at
+  row 0 or 1** (`row/T` ≤ 0.003), at `T = 39, 172, 348`, and **never the last token (0 of 12)**. Across all
+  1,525 multi-token readings the corrupted extent is **median 348 rows**, so one row is the onset and the
+  rest is causally-masked propagation to the full head.
+- **The `l_out-N` per-layer read is not a per-layer measurement.** `l_out-42 ≡ l_out-44` and
+  `l_out-43 ≡ l_out-45` return byte-identical, 25 %-NaN content in the `315fbar` cold cell — aliased reads
+  from arena slot reuse. Scope: sound only for **unsaturated** reads; the stride-3 family in `315lout4` is
+  fully saturated and is **not** evidence. The unnamed `node_NNNN` reads do not alias (only
+  `node_3304 ≡ node_3305`), so **two readings with the same hash are one reading**.
+
+### Face B has never been recorded with an instrument that can see it
+
+- **No arm on the record carries both a fingerprint and Face-B evidence.** The fingerprint's only gate is
+  `if (fp_nan_only && nan == 0) continue;`, so an arm with fingerprint lines has NaN and an arm with Face B
+  has none — the two faces are **mutually exclusive in the instrument's output** under `NANONLY`. Every
+  Face-B statement in this entry therefore rests on arm-level verdicts, with no tensor-level measurement
+  behind it.
+- **Its signature is otherwise invariant**: `nan=0 http=1 s500=1 unparsed=2` in all 15 Face-B arms, in **all
+  three cells including the quiet cell** (`side=0/0`, three runs) and even one out-of-regime arm — so Face B
+  is not eviction-specific either. Counting subtleties: `unparsed=2` is a *log-line* count for one event,
+  `http=1 s500=1` is the same failure counted twice, and `req < 66` alone forces `FAULT`, so a `FAULT` verdict
+  is not by itself content evidence.
+- **Invalid UTF-8 has never been observed.** Of 3,200 request records and 267 greedy-output files, **zero**
+  bodies are invalid UTF-8. The three apparent cases are 32-byte *excerpt* truncations (`utf8_ok = True` and
+  `json_ok = True` on the full bodies); the 34 `utf8_ok = False` records are transport failures with no body.
+  The recorded Face B is **Content-only / non-JSON output answered with HTTP 500**. A "third manifestation"
+  hypothesis (wrong but well-formed output at HTTP 200) was tested and **withdrawn** — clean quiet-cell arms
+  reach the same maximum repetition ratio.
+
+### Two harness defects found and one fixed
+
+- **The acceptance harness could not attribute Face B** — and it failed twice over: its condition was
+  `parse > 0 or utf8 > 0`, which are **0 in every Face-B arm**, and `315-paired.sh` computed
+  `http`/`transport`/`s500`/`unparsed` and used them in its **verdict** but never **printed** them. Both fixed
+  in `docs/315-campaign/315-campaign.sh` and `315-paired.sh`, verified end-to-end on both branches (a real
+  Face-B signature now attributes; an all-zero fault still does not). **Any future campaign must detect
+  Content-only/HTTP 500 — a UTF-8-validity check would never fire and would pass a faulting arm as clean.**
+- **The "rule of three" bound prints probabilities above 100 %** for `n < 3` (`300 %` at n=1). Correct at the
+  criterion's n=60 (5 %), so the intended reading is unaffected; not changed, because deciding what an
+  under-powered campaign should say is a criterion question.
+
+### An instrument that has never been enabled, and one that cannot reach the site
+
+- **`GGML_HRX_PRODUCER_PROBE`** fills a host-visible region with its own payload `0x7FC0DEAD` **before** each
+  hooked graph and classifies **after a drained stream**, reporting `sentinel`/`nan`/`finite` and the NaN's
+  **bit pattern**. The archive contains **zero** `[hrx-producer] armed` and **zero** `[hrx-producer] anomaly`
+  lines — it has never once been enabled — and **no arm has ever logged a NaN payload** (the only 8-hex
+  patterns in the logs are copy-probe `host_ptr=` addresses). Pre-registered as `315prod`; queued.
+- **It cannot reach the site this entry now points at.** Its predicate (`is_host` **and** 256 KiB–8 MiB)
+  admits exactly one tensor, the **logits** region; layer residuals print `host=0` and can never be armed. A
+  **device-buffer** variant is proposed, pre-registered, and its patch written and anchor-verified against a
+  real source copy (two defects caught in review; **compile NOT claimed**) at
+  `docs/315-campaign/evidence/315-device-buffer-probe-proposal.md` and
+  `docs/315-campaign/tools/patch-device-producer-probe.py`.
+
+### On the fix — unchanged conclusion, one new reason
+
+**No forward-only fix is landable**, as above, and now for an additional reason independent of the
+content-validity gap: the site is instrument-relative, so a change aimed at "layer 41" would be aimed at a
+read artifact. The instrument-independent fact available to a fix is the **size** (approximately one
+hidden-state row, 7,936–8,192 B) and the position (front of the buffer) — both of which describe *what* is
+corrupted without saying *what writes it*, since no instrument on the record observes the writing.
+
+**Nothing here retires this entry.** The defect is not gone: Face A's one-row front-of-buffer corruption is
+measured in 18 of 19 arms, and Face B's Content-only/HTTP-500 signature appears in 15 arms including control
+cells. What has changed is that the mechanism cannot be named with the instruments that exist, and the site
+in every earlier reading was an artifact of the instrument that produced it.
+
+### 2026-10-15 — the mechanism is named and a forward-only fix is landed; the acceptance campaign is running
+
+**Status line unchanged: OPEN**, because the acceptance criterion is met by the campaign below and its
+result is not in yet. What has changed is that the mechanism is now named, which is the precondition this
+entry's own rule sets for anything to be recorded.
+
+**The mechanism.** `llama_context::decode` obtains the logits through an **asynchronous** read that this
+backend never completes, and the decode's own completion wait is commented out on a premise that is false
+here. Four links, each at file:line:
+
+1. `src/llama-context.cpp:1483-1489` extracts the logits with `ggml_backend_tensor_get_async(...)`.
+2. `ggml/src/ggml-backend.cpp:268-280` **skips its own `ggml_backend_synchronize`** when the backend
+   implements `get_tensor_async` — and HRX does.
+3. `ggml-hrx.cpp:454-473` (`backend_get_tensor_async`) enqueues `hrx_stream_copy_buffer` on the stream and
+   **returns without waiting**. Measured, not assumed: the engine's read is
+   `name=result_output bytes=619520 host_dst=0x7fed46100000 registered=1` — the registered-host-buffer
+   branch, which has no wait at all.
+4. `src/llama-context.cpp:2087`, at the end of `decode`:
+   `// wait for the computation to finish (automatically done when obtaining the model output)` followed by
+   `//synchronize();`. The premise is false for a backend that implements the async read, because obtaining
+   the output *is* links 1-3. The two other `synchronize()` calls in `decode` do not cover this path
+   (one is guarded by `if (!embd_seq.empty())` — embeddings; the other is in `encode`, not `decode`).
+
+So `llama_decode` returns with the copy — and possibly the graph — still in flight, and the sampler reads
+the destination: the **previous** token's logits (finite, plausible, wrong → the format-500 body) or a
+region **not yet written** (→ all-NaN logits). Intermittency is whether the copy has completed.
+
+This explains the levers already falsified on this record without contradicting any of them: coherence is
+irrelevant (§13 — a missing wait is not a memory-visibility property), the earlier sync cell missed it
+because it synchronized at the end of `graph_compute`, *before* the copy is issued, and the read-ordering
+work ordered the instrument's reads rather than the engine's.
+
+**The fix, forward-only.** Fork commit `47a8fe929` on `1bit-MONSTER/llama.cpp` branch
+`1bit/315-logits-read-wait` — wait for the async logits read where it is issued — and the engine pin on
+`1bit/315-preregistration` moves `e44c9d01a → 47a8fe929` (`95238dc`), with
+`git merge-base --is-ancestor e44c9d01a 47a8fe929` true. It is not a revert.
+
+**The campaign.** Pre-registered before it ran
+(`docs/315-campaign/evidence/315-campaign-preregistration.md`): 60 in-regime **fix** arms plus 20
+interleaved **control** arms on the unfixed build, same harness, same regime gate `[95,110] GiB`, one
+window, instruments off, stopping at the first fix-cell fault. Zero faults in 60 arms gives a one-sided
+95 % upper bound of `1 − 0.05^(1/60) ≈ 4.9 %`. A clean fix cell with a control cell that never faults is
+reported as **under-powered, not passed**.
+
+**Evidence paths:** `docs/315-campaign/evidence/315-MECHANISM-unwaited-async-logits-read.md` (the mechanism
+and its falsifier), `…-campaign-preregistration.md`, `…-which-binary-is-which.md` (cell F =
+`~/wt/315logwait-build` at `47a8fe929`; cell C = `~/wt/315fixlog-build` at `e44c9d01a`; both with
+`hrx-f32-sync` and `hrx-wb-read` = 0).
+
+### 2026-10-15 (later) — the logits-wait mechanism is FALSIFIED by its own campaign; the fix stays landed
+
+The mechanism recorded above was tested by the pre-registered campaign it named, and it failed on the first
+fix arm. The full record is `docs/315-campaign/evidence/315-logits-wait-FALSIFIED.md`.
+
+```
+pair 1 arm c (control, e44c9d01a): OK    req=66  gtt_start=98G
+pair 1 arm l (fix,     47a8fe929): FAULT req=9   gtt_start=98G
+STOP: a fix-cell arm faulted or was invalid — acceptance requires zero faults
+```
+
+The fix arm's `detector.json` reads `http_failures: 1`, `first_failure: "HTTP 500"`, `transport_failures: 0`,
+and its `server.log` carries the **Face B** signature verbatim — *"the model produced output that does not
+match the expected Content-only…"* — with invalid UTF-8 immediately before it and `HRX returned NaN`
+appearing zero times. In gate at `gtt_start 98GiB`. It is counted as a fault, not an invalid arm, because
+the truncation is a *consequence* of the defect rather than an independent harness death.
+
+**So: the acceptance criterion is NOT MET, and the unwaited-async-logits-read mechanism is removed as the
+cause.** The prediction was universal — *the faults stop* — and one in-regime fault refutes it, as one
+counter-example refuted the deferred-writeback candidate. It is not evidence that the wait is wrong; it is
+evidence that the wait is **not sufficient**, so the unwaited read is not the mechanism. No earlier
+candidate is revived: coherence (§13), the deferred writeback, and the read-path families all stay closed.
+
+The fix commit `47a8fe929` and the pin move `e44c9d01a → 47a8fe929` **remain landed** — a correct
+forward-only change for the reason its comment gives, and the objective's criterion for a forward-only
+change is satisfied by it. What is not satisfied is the mechanism and the campaign.
+
+**Standing after this:** no named mechanism. Of the candidates that survived the campaign, one has since been
+removed by its own pre-registered experiment and one has been shown unmeasurable by the current instrument.
+
+* **The stream-ordering explanation for the `result_norm` divergence is REMOVED.**
+  `docs/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` ran the pre-registered
+  `315-PREREG-sync-between-reads.md` on a faulting arm (Face A, 312 records) and landed on its **second**
+  pre-declared row: of 82 records where `result_norm` differed between two consecutive plain reads, a fresh
+  `ggml_backend_synchronize` stopped the difference in **0** and did not stop it in **82** — and changed the
+  value itself in all 82. So the writer is **not ordered by `context->stream`**, which removes
+  `GraphExecutor::execute` returning without a wait (with `backend_synchronize` covering only
+  `context->stream`) as the explanation. Recorded at `b7d6b46`.
+* **§51's rank-sort precondition is UNMEASURED and not measurable by the by-name fingerprint.**
+  `docs/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`) — the
+  faulting arm produced zero records because `ffn_moe_probs-*` is not among the 946 node names this build's
+  fingerprint walks. This is a negative about the instrument, not about the site.
+
+**Surviving family, stated as surviving:** an open writer of the `result_norm` slot that is *not* ordered by
+`context->stream` — the reused-arena-slot family in
+`docs/315-campaign/evidence/315-what-the-synchronise-drains.md` — plus the unmeasured §51 site. The measured,
+unexplained fact handed forward is that `result_norm` changes between two consecutive identical plain reads in
+a faulting arm, at two different addresses, with no pending host writeback at the engine's logits read, and
+with a fresh synchronise failing to stop it.
+
+**No regression (criterion 4), measured at the moved pin `47a8fe929` and not the old one:** engine CI is
+**green, 7 of 7** on `1bit-MONSTER/engine` PR #414 (`mergeable=MERGEABLE`, `state=CLEAN`); the HRX suite and
+the `MUL_MAT_ID` op-test are **unchanged** (`8 pass, 0 skip, 0 fail`, `mxfp4` nmse **1.34e-05 … 1.61e-05**, an
+exact match to the recorded baseline, same two kernels); and the dense-model control (Qwen3-8B, dense, not MoE)
+is **clean and unchanged** (50 responses, 1 distinct content, zero fault signatures). Evidence:
+`docs/315-campaign/evidence/315-task3-op-test-unchanged-at-moved-pin.md` and
+`315-task3-dense-control-clean-at-moved-pin.md`.
+
+**CI did not pass on arrival.** It required fixing two pre-existing defects — a half-move (`95238dc` moved the
+`llama.cpp` gitlink without `registry/architectures.json`) and 46 files missing the full copyright notice —
+recorded in `docs/315-campaign/evidence/315-what-the-merge-and-the-gates-found.md`, with no gate loosened.

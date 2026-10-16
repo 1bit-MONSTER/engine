@@ -32,13 +32,15 @@ OpenAI client.
            [--parallel N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
+           [--no-mem-check | --mem-check]
+           [--watchdog SECS] [--watchdog-prompt-tps N]
 ```
 
 One model per process:
 
 | Endpoint | |
 |---|---|
-| `GET /health`, `GET /v1/health` | 503 while the model loads, then 200 |
+| `GET /health`, `GET /v1/health` | 503 while the model loads, then 200 while every backend is up and answers its own health route; 503 again if one has exited, does not answer within 1.5 s, or the watchdog found it hung ([below](#when-a-backend-hangs)) |
 | `GET /v1/models` | the one model (`--alias`, else the file or directory name) |
 | `POST /v1/chat/completions` | streamed (SSE) or not; a thinking model's `<think>` block comes back as `reasoning_content` (`"reasoning_format": "none"` keeps it in `content`) |
 | `POST /v1/completions` | |
@@ -47,7 +49,8 @@ One model per process:
 | `POST /v1/embeddings` or `/v1/rerank` | with `--embedding` or `--reranking`: the model itself is an embedding or reranking model |
 | `POST /v1/responses` | OpenAI Responses API, streamed or not (llama-server devices) |
 | `POST /tokenize`, `/detokenize`, `/apply-template` | llama-server devices |
-| `GET /slots`, `POST /slots/<id>?action=…`, `GET /props`, `GET /metrics` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
+| `GET /slots`, `POST /slots/<id>?action=…`, `GET /props` | llama-server devices; slot save and restore answer 501 (llama-server runs without `--slot-save-path`) |
+| `GET /metrics` | Prometheus text: the engine's own series (GTT, Tctl, CPU fallbacks, program-cache flushes, starts, watchdog kills) on every child-process device, then the backend's own ([below](#metrics)) |
 
 "llama-server devices" means `hrx` and `cpu`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
@@ -59,6 +62,163 @@ name (`localhost`, `127.x.x.x`, `[::1]`), and on any host, a POST whose `Origin`
 loopback origin nor the server's own. API clients send no `Origin`. A reverse proxy in front
 of a loopback serve must pass the upstream host (nginx's default `proxy_set_header Host
 $proxy_host`), not the public one.
+
+## Will it fit?
+
+Before any llama-server starts (`hrx`, `cpu`, and the `--embed` / `--rerank` servers), serve
+estimates what the model will hold and refuses a load the box has no room for, in one line and
+in milliseconds, so Lemonade shows the reason instead of an allocation failure or an OOM minutes
+into the load. ggml-hrx reports free memory equal to total, so llama.cpp's own `--fit` cannot do
+this on HRX0.
+
+```
+$ 1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --device hrx --mem-check     # strixhalo, 2026-10-12
+Qwen3.8-27B-UD-Q4_K_XL: fits: need 33.00 GiB (Qwen3.8-27B-UD-Q4_K_XL.gguf: weights 16.35 + KV/state 16.15 + compute 0.50) at the model's own ctx 262144 (no --ctx-size), free 57.71 GiB (GTT 73.3 of 120.0 GiB free, MemAvailable 57.7 GiB)
+```
+
+A load that does not fit prints the same line as `1bit serve: <model> does not fit: need …;
+free memory, lower --ctx-size, or pass --no-mem-check` and exits 3 before any backend starts.
+Lemonade's loader logs that line with the exit code and fails the load ("1bit serve failed to
+start").
+
+The estimate (`app/mem_admit.h`) reads only the GGUF header, the way `tools/mem-budget`'s
+`mem_budget.py model` does:
+
+- **weights:** the GGUF's size, every shard;
+- **KV:** per attention layer, KV heads x (key + value length) x context x the cache type's
+  bytes (`-ctk` / `-ctv`, f16 by default). MLA models (`kv_lora_rank`) cache the latent and the
+  rope dimensions once. Qwen3.5 / 3.8 / Next attend in one layer of `full_attention_interval`.
+  Per-layer `head_count_kv` arrays count only the layers with heads. Sliding-window layers count
+  the window per sequence plus a ubatch, with llama.cpp's per-architecture pattern for which
+  layers are windowed (gpt-oss and Gemma 2: every other layer; Gemma 3: 5 of 6).
+- **state:** the gated delta-net recurrent state, per sequence;
+- **compute:** 512 MiB (HRX measured 20-505 MiB);
+- **extras:** a draft or MTP head (`-md`, with its KV), `--mmproj`.
+
+The context is `--ctx-size` (or a recipe's `-c`). Without one, llama-server takes the model's own
+on HRX0 (HRX reports its whole pool free, so `--fit` shrinks nothing), and serve judges that. On the
+CPU `--fit` shrinks an unset context, so serve judges llama.cpp's 4096 floor.
+
+Free is `min(GTT total - GTT used, MemAvailable)` when a backend runs on HRX0, since the GTT pool
+is the same DRAM, and MemAvailable on the CPU. A load is refused only when the need plus 1 GiB is
+more than that. Two things grow after load, so they only warn:
+- the HRX graph-program cache (2-9 GiB as prompt shapes vary);
+- landing at or above 95 GiB of GTT, where engine #315's faults were seen.
+
+- `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) skips the check.
+- `--mem-check` prints the estimate and exits: 0 when it fits, 3 when it does not.
+- A refused load exits with status 3 too.
+
+ctest `mem_admit` checks the KV and state sizes against HRX0 server logs:
+
+| model | ctx | KV/state |
+|---|---|---|
+| Qwen3-0.6B | 4096 | 448 MiB |
+| GLM-4.7-Flash (MLA) | 2048 | 105.75 MiB |
+| ZAYA1-8B | 2048 | 80 MiB |
+| Qwen3.6-35B-A3B | 2048 | 40 + 62.8 MiB |
+
+ctest `mem_admit_route` checks that a sparse 4 TiB GGUF is refused in milliseconds, before any
+backend starts. On strixhalo (2026-10-12), estimates for 15 model and context pairs agree with
+`mem_budget.py model` (KV from llama-fit-params) within 1.1%. The pairs cover Qwen3 0.6B/8B,
+GLM-4.7-Flash, ZAYA1-8B, Qwen3.6-35B-A3B, Qwen3.8-27B, Qwen3-Coder-30B-A3B, gpt-oss-20b and
+MiniCPM4-8B, at 2K-262K context.
+## When a backend hangs
+
+A hung GPU dispatch (a wedged HRX queue, a #315 fault) stops llama-server's main loop, while its
+HTTP thread keeps answering `/health` with 200. So `1bit serve` checks two things itself, for the
+backends it runs as child processes (`hrx`, `cpu`, `ds4`, `onnx`, `mlx`; the in-process NPU route
+is not covered):
+
+- **`/health` follows the backend.** Once the model is loaded, serve asks each backend's own
+  health route (`/health`, or `/v1/models` for DwarfStar) and answers 503 with the reason when
+  one has exited, does not answer within 1.5 s (Lemonade's probe gives up at 2 s), or the watchdog below has fired. Lemonade's
+  BackendWatchdog probes this route.
+- **A progress watchdog.** Every chat, completion and Responses request serve forwards is
+  tracked. Progress is a byte from the backend on that request, or the backend's main loop
+  answering `GET /slots`, which serve asks every few seconds while requests are in flight
+  (llama-server answers it only between decode steps). A request with no progress for
+  `--watchdog` seconds (default 120; `$ONEBIT_WATCHDOG_SECS` sets the default; 0 turns it off)
+  means the backend is hung. Before a request's first byte it gets prompt tokens /
+  `--watchdog-prompt-tps` seconds more (default 50 tok/s; tokens are estimated as request bytes
+  / 4), so a long prompt is not taken for a hang.
+
+When the watchdog fires, serve logs the request, how long it waited, the CPU's Tctl and the
+backend's last stderr lines (serve passes the backend's stderr through and keeps its tail, which
+is where an HSA status shows up), SIGKILLs the backend and exits with status 1. Lemonade then
+sees the backend process gone and loads the model again. A process that does not die after
+SIGKILL (stuck in the kernel) is reported as such; serve exits anyway.
+
+```
+1bit serve: watchdog: POST /v1/chat/completions (streamed) on the hrx backend (port 34901, pid 3672241) made no progress for 121 s (limit 120 s; 211 bytes received in 125 s); killing it and exiting so Lemonade reloads it
+1bit serve: watchdog: Tctl 71.5 C
+1bit serve: watchdog: the backend's last lines:
+1bit serve: watchdog: | ...
+```
+
+How this meets Lemonade's BackendWatchdog (`wrapped_server.cpp` in our Lemonade fork, which owns
+the restart policy; serve builds none):
+- Every 5 s Lemonade checks that the backend process is running. Exiting is serve's signal: Lemonade
+  marks the backend reset and reloads the model on the next request. That request is answered
+  with `backend_watchdog_reset` ("reloaded automatically on retry").
+- During an active request, after 90 s with no activity, Lemonade also probes `/health` (2 s,
+  status 200 required). After 3 failed probes it stops the backend itself. A wedged llama-server
+  still answers its own `/health`, so this probe alone does not catch a hung GPU. serve's
+  watchdog exit is what does, within `--watchdog` seconds plus Lemonade's 5 s poll.
+- `LEMONADE_BACKEND_WATCHDOG_*` tune Lemonade's side. `onebit_args` in a recipe passes
+  `--watchdog` to serve.
+
+A backend with no `/slots` (DwarfStar, ONNX, MLX, or a llama-server started with `--no-slots`)
+shows progress only by sending bytes, so on those only streamed requests are judged: a long
+non-streamed answer and a hang look the same from outside. `tests/watchdog_serve.sh` (ctest
+`watchdog_serve`, CI included) checks all of this against `tests/fake_backend.py`, whose
+`"fake_hang"` request stops its stream and its `/slots` while `/health` stays 200.
+
+## Metrics
+
+Lemonade's own `/metrics` already reports, per model:
+- requests, tokens, time to first token and tok/s (`lemonade_model_*`);
+- CPU and memory use;
+- GTT plus VRAM, as `lemonade_vram_used_gb`.
+
+So `GET /metrics` on serve adds only what the engine sees and Lemonade cannot, in Prometheus
+text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`, `ds4`, `onnx`,
+`mlx`). The in-process NPU route has none yet. serve's own series come first. The backend's own
+`/metrics` follows when it answers one: llama-server is started with `--metrics`, so its
+`llamacpp:*` series follow.
+
+| Series | What |
+|---|---|
+| `onebit_up{device}` | 1; `device` names the route |
+| `onebit_serve_starts_total` | loads of this model by serve, kept across restarts |
+| `onebit_watchdog_kills_total` | backends the [progress watchdog](#when-a-backend-hangs) killed, kept across restarts |
+| `onebit_backend_exits_total` | backends that exited on their own, kept across restarts |
+| `onebit_program_cache_flushes_total` | ggml-hrx's "HRX graph program cache over its limit" WARN lines |
+| `onebit_cpu_fallback_ops{op}` | engine #390's load report of ops placed off HRX, per op and `op="all"` |
+| `onebit_gtt_bytes{kind="total"\|"used"}` | the amdgpu GTT pool HRX allocates from (`mem_info_gtt_*`) |
+| `onebit_gtt_fault_zone` | 1 when GTT use is at or above 95 GiB, where engine #315's faults were seen |
+| `onebit_tctl_celsius` | CPU Tctl (k10temp) |
+
+The log-derived series come from the backend's stderr, which serve passes through unchanged and
+reads line by line (Linux). A series whose line never came is left out, not reported as 0. The
+#390 report is read from a line that names "CPU fallback" (or "off HRX"), followed by `OP=count`,
+`OP xcount` or `OP: count` pairs, or by a total alone. llama-server drops the library's INFO lines
+at its default verbosity, because they map to its trace level. So the report reaches serve only
+when it is logged as a WARN or above, as the program-cache flush line is.
+
+Starts, watchdog kills and exits outlive one serve process, because Lemonade restarts a backend
+by starting `1bit serve` again. They are kept per model id in
+`~/.local/state/1bit/serve/<hash of the id>.json` (the file names the model inside; the home
+directory comes from the user database, not `$HOME`).
+
+**How Lemonade picks them up.** Lemonade appends a backend's `/metrics` to its own when the
+backend's recipe descriptor sets `exposes_prometheus_metrics`. Each line is renamed
+`lemonade_llamacpp_<name>` and labelled with the model. Our fork's `onebit` descriptor has it
+`false` today, so turning it on is a one-line change in the fork, and it is Lemonade's call.
+Until then, scrape serve's port directly.
+
+`tests/metrics_serve.sh` (ctest `metrics_serve`, CI included) checks every series against
+`tests/fake_backend.py`.
 
 ## Where the model runs
 
@@ -398,4 +558,4 @@ ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`, and in general `serve_e2e_<devic
 `-DONEBIT_MLX_SERVER`). `smoke_serve` runs everywhere, CI included:
 `tests/fake_backend.py` stands in for llama-server. It checks the proxy (`/health`,
 `/v1/models`, the reply rename, SSE relay) and that no backend outlives a
-SIGKILLed `serve`.
+SIGKILLed `serve`. `watchdog_serve` runs everywhere too (see "When a backend hangs").

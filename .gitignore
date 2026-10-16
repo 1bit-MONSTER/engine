@@ -20,3 +20,6 @@ build-*/
 compile_commands.json
 .cache/
 __pycache__/
+
+# Mesh runtime state (runs, leases, sessions, artifacts) - never commit
+.pi/mesh/

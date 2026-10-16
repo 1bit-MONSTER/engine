@@ -19,11 +19,16 @@
 # (-m, --port, anything else ignored), answers /health, and replies to the
 # OpenAI routes with a fixed answer, streamed or not. The reply names the
 # backend's own model id ("fake-backend-id") so serve's rename is visible.
-import json, os, select, socket, sys, time
+#
+# GET /slots answers 200 like llama-server's, from "the main loop": once a request has asked for
+# "fake_hang", the loop is wedged, so /slots never answers and the request gets no more bytes,
+# while /health still answers 200 (what a hung GPU dispatch looks like; tests/watchdog_serve.sh).
+import json, os, select, socket, sys, threading, time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 
 port = int(sys.argv[sys.argv.index("--port") + 1])
 WORDS = ["The", " capital", " of", " France", " is", " Paris", "."]
+WEDGED = threading.Event()
 
 
 class H(BaseHTTPRequestHandler):
@@ -41,6 +46,17 @@ class H(BaseHTTPRequestHandler):
     def do_GET(self):
         if self.path == "/health":
             self._json(200, {"status": "ok"})
+        elif self.path == "/metrics" and "--metrics" in sys.argv:
+            body = b"# TYPE llamacpp:prompt_tokens_total counter\nllamacpp:prompt_tokens_total 12\n"
+            self.send_response(200)
+            self.send_header("Content-Type", "text/plain; version=0.0.4")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+        elif self.path == "/slots":
+            while WEDGED.is_set():
+                time.sleep(1)
+            self._json(200, [{"id": 0, "is_processing": False}])
         else:
             self._json(404, {"error": "not found"})
 
@@ -50,6 +66,19 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if req.get("fake_hang"):
+            # streamed: two chunks, then nothing; not streamed: nothing at all
+            if req.get("stream"):
+                self.send_response(200)
+                self.send_header("Content-Type", "text/event-stream")
+                self.end_headers()
+                for w in WORDS[:2]:
+                    chunk = {"id": "x", "model": "fake-backend-id", "choices": [{"index": 0, "delta": {"content": w}}]}
+                    self.wfile.write(f"data: {json.dumps(chunk)}\n\n".encode())
+                    self.wfile.flush()
+            WEDGED.set()
+            while True:
+                time.sleep(1)
         # "fake_delay": N holds a non-streamed reply N seconds, noting in $FAKE_BACKEND_EVENTS
         # whether serve hung up first (it should once its own client has gone)
         delay = float(req.get("fake_delay", 0))
@@ -82,6 +111,12 @@ class H(BaseHTTPRequestHandler):
         self.wfile.write(b"data: [DONE]\n\n")
 
 
+if os.environ.get("FAKE_BACKEND_LOG_LINES"):
+    # what llama.cpp and ggml-hrx write to stderr that serve's /metrics reads (tests/metrics_serve.sh)
+    for line in ("trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 1",
+                 "trim_graph_programs: HRX graph program cache over its limit (65 programs, limit 64): kept the current one, flush 2",
+                 "ggml_hrx: CPU fallback: GET_ROWS x2, SOFTPLUS x1"):
+        print(line, file=sys.stderr, flush=True)
 time.sleep(0.5)  # a real backend takes a moment to load; serve must answer 503 meanwhile
 if os.environ.get("FAKE_BACKEND_IMPOSTOR"):
     # A process serve did not start answers on the port instead: this one detaches a server

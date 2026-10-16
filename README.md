@@ -37,7 +37,9 @@ serves each model behind an OpenAI-compatible API (`1bit serve`), whatever devic
 Every tuned setting `1bit serve` gives a backend is a recipe with its measurement attached
 ([docs/recipes.md](docs/recipes.md)), and the serve numbers in these docs come from
 `tools/bench.py`, which A/B-measures configurations against a baseline in the same run
-([docs/bench.md](docs/bench.md)).
+([docs/bench.md](docs/bench.md)). HRX pin bumps and PRs labelled `hw-gate` are checked on the
+Strix Halo GPU before merge by the hardware gate: kernel tests, known answers on three models,
+KLD against the release pin and a 4.7K-token needle ([docs/hw-gate.md](docs/hw-gate.md)).
 
 Packages ship every Sunday, rebuilt at that week's upstream pins: Linux, Lemonade with the engine,
 Windows and 1bit OS ([docs/releases.md](docs/releases.md)). The first release ships on Sunday,

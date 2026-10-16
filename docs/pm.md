@@ -68,7 +68,7 @@ the PM asks for it, so pull the experts you want ahead of time.
 
 ```sh
 1bit serve -m zaya1-8b-Q4_K_M.gguf --alias ZAYA1-8B-PM --pm --lemonade-url http://127.0.0.1:8000
-# optional: --pm-experts my-experts.json
+# optional: --pm-experts my-experts.json, --pm-spawn-url http://127.0.0.1:8791 (agent workers, below)
 # optional: --pm-router laya   (the engine asks the Laya router which expert first; below)
 ```
 
@@ -80,7 +80,8 @@ combine with `--laya` or with `--embedding`/`--reranking`.
 1. The PM's system prompt (who it is, when to answer and when to delegate, the experts with their
    `use_when` text) goes first; a system message of the client's follows it.
 2. The PM gets two tools: `experts()` lists the experts; `delegate(expert, task, context)` hands
-   a self-contained brief to one of them. The round runs greedy (temperature 0 unless the request
+   a self-contained brief to one of them. With `--pm-spawn-url` it gets a third, `spawn_worker`
+   (below). The round runs greedy (temperature 0 unless the request
    sets one) with `chat_template_kwargs.enable_thinking` false (`pm.thinking` or the request's own
    value changes that), and stops at the end of a tool call.
 3. A `delegate` call becomes one non-streaming chat request to
@@ -94,7 +95,8 @@ combine with `--laya` or with `--embedding`/`--reranking`.
    ZAYA's own form (`<zyphra_tool_call><function=delegate><parameter=expert>code</parameter>…`)
    or Qwen's `<tool_call>{"name": …, "arguments": {…}}</tool_call>`.
 6. The reply is a normal chat completion under the served model's name, plus a `pm` object
-   (`rounds`, `delegations` with `expert`, `id`, `ms`, `ok`) and an `X-1bit-PM` header. With
+   (`rounds`, `delegations` with `expert`, `id`, `ms`, `ok`, and `spawns` with `worker`, `box`,
+   `class`, `model`, `ms`, `ok`, `reason`) and an `X-1bit-PM` header. With
    `"stream": true` the final answer arrives as SSE chunks (a role chunk, `reasoning_content` and
    `content` pieces, a finish chunk, `[DONE]`).
 
@@ -172,6 +174,32 @@ than route by guess.
   --laya-model ~/.local/share/1bit/laya --lemonade-url http://127.0.0.1:8000
 ```
 
+## Starting an agent worker (`--pm-spawn-url`)
+
+Some work is not one expert answer: it edits files, builds, measures, or runs for hours. For that
+the PM gets a third tool, `spawn_worker(worker, box, class, task)`, but only when `--pm-spawn-url
+URL` names an executor. The option is off by default; without it the tool is not offered at all.
+
+ZAYA only *proposes*. The engine POSTs a versioned proposal to the executor's `/propose` path:
+
+```json
+{"schema_version": 1, "worker": "build-1", "box": "ryzen", "class": "code", "task": "..."}
+```
+
+The executor either accepts it or refuses it with a reason, and either answer comes back as the
+tool result: on a refusal the PM says the worker was not started and answers the request anyway.
+The engine starts nothing itself — no shell, no tmux, no model choice of its own.
+
+The executor owns the guards, so they cannot drift with the model: the worker name must match
+`[a-z0-9-]{1,24}`, the class picks a model from a local table (a remote or public provider is
+refused), the endpoint is health-checked before launch, a name that already exists or a box at its
+worker cap is refused, `class: hardware` is pinned to the machine that has the hardware, and the
+project's local safety rules are appended to every brief before the worker starts. The task text is
+written to a brief file, never interpolated into a command line.
+
+`--pm-spawn-url` is plain `http://` (the engine's client has no TLS). The executor binds loopback on
+its own machine, so a PM on another machine reaches it over an ssh tunnel and no port is exposed.
+`pm.spawn_timeout_s` in the experts file (default 180) is the read timeout for one proposal.
 ## Limits
 
 - One expert at a time: Lemonade keeps two LLMs loaded (the PM and one expert), so a second
@@ -196,4 +224,7 @@ parsed and ZAYA's text form) and a mock Lemonade records the expert id it is ask
 the delegation hits the default code expert's id with its `max_tokens`, the expert's answer
 reaches the client under the served name, a general question is answered without a delegation,
 streaming, a Lemonade that is down (the PM still answers, HTTP 200, the reply says so), an expert
-that errors, the round cap, `/v1/completions` untouched, and the refusals.
+that errors, the round cap, `/v1/completions` untouched, and the refusals. With a mock executor
+(tests/fake_spawn_exec.py) it checks that `spawn_worker` posts the proposal and records it in
+`pm.spawns`, that a refusal and an unreachable executor are relayed with the PM still answering, and
+that the tool is not offered without `--pm-spawn-url`.

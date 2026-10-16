@@ -71,6 +71,15 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   summary and succeeds. Since 2026-10-10 hrx-system is held at `98d05d94`: the engine stays on
   our HRX line while AMD's newer hrx-system miscompiles long-context attention
   ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)).
+- **The backport line (2026-10-16).** The hold now names `1bit/held-98d05d94-3fixes`, a branch off
+  that same held commit carrying three fixes that have nothing to do with the AMD-core move:
+  engine#409 (libhrx bounds-checks a length-less ELF extent instead of skipping the check),
+  engine#410 (`libhip_intercept` covers every HIP symbol the backend exports; the documented
+  interceptor variable works and init is idempotent) and engine#401 (libhsa no longer opens
+  `/dev/accel` in GPU-only processes), plus the +61/−0 `api.h` forward-port the regenerated
+  passthrough stubs need. Nothing under the held AMD core changes, so the #1535 question is
+  untouched. When those fixes are rebased onto `1bit/main` — or the hold is lifted — this line
+  is dropped; until then it is what lets three small fixes ship without a 1688-commit core jump.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.

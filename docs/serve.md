@@ -32,6 +32,7 @@ OpenAI client.
            [--parallel N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
+           [--no-mem-check | --mem-check]
            [--watchdog SECS] [--watchdog-prompt-tps N]
 ```
 
@@ -62,6 +63,66 @@ loopback origin nor the server's own. API clients send no `Origin`. A reverse pr
 of a loopback serve must pass the upstream host (nginx's default `proxy_set_header Host
 $proxy_host`), not the public one.
 
+## Will it fit?
+
+Before any llama-server starts (`hrx`, `cpu`, and the `--embed` / `--rerank` servers), serve
+estimates what the model will hold and refuses a load the box has no room for, in one line and
+in milliseconds, so Lemonade shows the reason instead of an allocation failure or an OOM minutes
+into the load. ggml-hrx reports free memory equal to total, so llama.cpp's own `--fit` cannot do
+this on HRX0.
+
+```
+$ 1bit serve -m Qwen3.8-27B-UD-Q4_K_XL.gguf --device hrx --mem-check     # strixhalo, 2026-10-12
+Qwen3.8-27B-UD-Q4_K_XL: fits: need 33.00 GiB (Qwen3.8-27B-UD-Q4_K_XL.gguf: weights 16.35 + KV/state 16.15 + compute 0.50) at the model's own ctx 262144 (no --ctx-size), free 57.71 GiB (GTT 73.3 of 120.0 GiB free, MemAvailable 57.7 GiB)
+```
+
+A load that does not fit prints the same line as `1bit serve: <model> does not fit: need …;
+free memory, lower --ctx-size, or pass --no-mem-check` and exits 3 before any backend starts.
+Lemonade's loader logs that line with the exit code and fails the load ("1bit serve failed to
+start").
+
+The estimate (`app/mem_admit.h`) reads only the GGUF header, the way `tools/mem-budget`'s
+`mem_budget.py model` does:
+
+- **weights:** the GGUF's size, every shard;
+- **KV:** per attention layer, KV heads x (key + value length) x context x the cache type's
+  bytes (`-ctk` / `-ctv`, f16 by default). MLA models (`kv_lora_rank`) cache the latent and the
+  rope dimensions once. Qwen3.5 / 3.8 / Next attend in one layer of `full_attention_interval`.
+  Per-layer `head_count_kv` arrays count only the layers with heads. Sliding-window layers count
+  the window per sequence plus a ubatch, with llama.cpp's per-architecture pattern for which
+  layers are windowed (gpt-oss and Gemma 2: every other layer; Gemma 3: 5 of 6).
+- **state:** the gated delta-net recurrent state, per sequence;
+- **compute:** 512 MiB (HRX measured 20-505 MiB);
+- **extras:** a draft or MTP head (`-md`, with its KV), `--mmproj`.
+
+The context is `--ctx-size` (or a recipe's `-c`). Without one, llama-server takes the model's own
+on HRX0 (HRX reports its whole pool free, so `--fit` shrinks nothing), and serve judges that. On the
+CPU `--fit` shrinks an unset context, so serve judges llama.cpp's 4096 floor.
+
+Free is `min(GTT total - GTT used, MemAvailable)` when a backend runs on HRX0, since the GTT pool
+is the same DRAM, and MemAvailable on the CPU. A load is refused only when the need plus 1 GiB is
+more than that. Two things grow after load, so they only warn:
+- the HRX graph-program cache (2-9 GiB as prompt shapes vary);
+- landing at or above 95 GiB of GTT, where engine #315's faults were seen.
+
+- `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) skips the check.
+- `--mem-check` prints the estimate and exits: 0 when it fits, 3 when it does not.
+- A refused load exits with status 3 too.
+
+ctest `mem_admit` checks the KV and state sizes against HRX0 server logs:
+
+| model | ctx | KV/state |
+|---|---|---|
+| Qwen3-0.6B | 4096 | 448 MiB |
+| GLM-4.7-Flash (MLA) | 2048 | 105.75 MiB |
+| ZAYA1-8B | 2048 | 80 MiB |
+| Qwen3.6-35B-A3B | 2048 | 40 + 62.8 MiB |
+
+ctest `mem_admit_route` checks that a sparse 4 TiB GGUF is refused in milliseconds, before any
+backend starts. On strixhalo (2026-10-12), estimates for 15 model and context pairs agree with
+`mem_budget.py model` (KV from llama-fit-params) within 1.1%. The pairs cover Qwen3 0.6B/8B,
+GLM-4.7-Flash, ZAYA1-8B, Qwen3.6-35B-A3B, Qwen3.8-27B, Qwen3-Coder-30B-A3B, gpt-oss-20b and
+MiniCPM4-8B, at 2K-262K context.
 ## When a backend hangs
 
 A hung GPU dispatch (a wedged HRX queue, a #315 fault) stops llama-server's main loop, while its

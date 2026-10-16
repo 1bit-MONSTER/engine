@@ -21,6 +21,9 @@
 
 namespace onebit {
 
+// Skipped bytes are read through (ignore), not seeked over: a seek drops the stream's buffer, and
+// a tokenizer's 150K strings then cost a read and an lseek each.
+
 // general.architecture from a GGUF's header, or "" when the file is not a GGUF or has none.
 // Reads only the key/value section (GGUF v2/v3, little endian); the tensors are never touched.
 inline std::string gguf_architecture(const std::string& path) {
@@ -34,7 +37,7 @@ inline std::string gguf_architecture(const std::string& path) {
     auto str = [&](std::string* out) {
         uint64_t n = 0;
         if (!rd(&n, 8) || n > (1u << 20)) return false;
-        if (!out) return static_cast<bool>(f.seekg(static_cast<std::streamoff>(n), std::ios::cur));
+        if (!out) return static_cast<bool>(f.ignore(static_cast<std::streamsize>(n)));
         out->resize(n);
         return rd(out->data(), n);
     };
@@ -59,12 +62,12 @@ inline std::string gguf_architecture(const std::string& path) {
                 for (uint64_t j = 0; j < n; ++j)
                     if (!str(nullptr)) return "";
             } else if (scalar(et) > 0) {
-                f.seekg(static_cast<std::streamoff>(n * scalar(et)), std::ios::cur);
+                f.ignore(static_cast<std::streamsize>(n * scalar(et)));
             } else {
                 return "";  // nested arrays do not occur in GGUF metadata
             }
         } else if (scalar(type) > 0) {
-            f.seekg(scalar(type), std::ios::cur);
+            f.ignore(static_cast<std::streamsize>(scalar(type)));
         } else {
             return "";
         }
@@ -85,7 +88,7 @@ inline long long gguf_int(const std::string& path, const std::string& key) {
     auto str = [&](std::string* out) {
         uint64_t n = 0;
         if (!rd(&n, 8) || n > (1u << 20)) return false;
-        if (!out) return static_cast<bool>(f.seekg(static_cast<std::streamoff>(n), std::ios::cur));
+        if (!out) return static_cast<bool>(f.ignore(static_cast<std::streamsize>(n)));
         out->resize(n);
         return rd(out->data(), n);
     };
@@ -115,12 +118,12 @@ inline long long gguf_int(const std::string& path, const std::string& key) {
                 for (uint64_t j = 0; j < n; ++j)
                     if (!str(nullptr)) return -1;
             } else if (scalar(et) > 0) {
-                f.seekg(static_cast<std::streamoff>(n * scalar(et)), std::ios::cur);
+                f.ignore(static_cast<std::streamsize>(n * scalar(et)));
             } else {
                 return -1;
             }
         } else if (scalar(type) > 0) {
-            f.seekg(scalar(type), std::ios::cur);
+            f.ignore(static_cast<std::streamsize>(scalar(type)));
         } else {
             return -1;
         }

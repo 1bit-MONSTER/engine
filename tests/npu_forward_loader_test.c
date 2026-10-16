@@ -22,7 +22,7 @@
 // data_offsets that are reversed, wrap around, or end past the file are all
 // refused or parsed without reading outside the mapping; a well-formed file
 // loads and its tensor data stays inside the file.  The loader is plain C, so
-// this runs without XRT.
+// this runs without the NPU runtime.
 #define _POSIX_C_SOURCE 200809L  /* mkdtemp */
 #include "model.h"
 

@@ -117,6 +117,16 @@ ContextMap ContextMap::derive(const Bytes& ctx1, const Bytes& ctx2, const Bytes&
     return map;
 }
 
+std::vector<ContextMap::RowOffset> ContextMap::row_offsets() const {
+    std::vector<RowOffset> out;
+    for (const auto& w : words) {
+        if (w.step <= 1) continue;
+        if (std::none_of(out.begin(), out.end(), [&](const RowOffset& r) { return r.base == w.base && r.step == w.step; }))
+            out.push_back({w.base, w.step});
+    }
+    return out;
+}
+
 Bytes derive_context(const Bytes& ctx1, const ContextMap& map, int n) {
     if (n < 1) fail("context length must be at least 1");
     Bytes e = ctx1;

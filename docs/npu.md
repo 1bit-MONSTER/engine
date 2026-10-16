@@ -245,6 +245,34 @@ generations pass with 15 s gaps and with 120 s gaps, at 97–101 tok/s. Afterwar
 left on the device. Code that drives the lane directly with `step()` must call `begin()` first
 and `end()` when done.
 
+### The KV cache between generations
+
+The lane allocates each layer's KV cache once, for `kMaxContext` rows, and reuses it for every
+generation. The layer kernel reads the cache in whole 16-row blocks, so each run also reads rows
+past its own position. The control code gives the attention cores the context length N (one word
+per core, written per context like the KV offsets above), and the cores mask the scores of rows N
+and later. Written into those rows, 2.0 or 1000.0 in K changed nothing. In V, any value in the
+position's group of 8 rows changed the logits; rows of the next group changed nothing. The
+attention cores convert to a block-float format in which 8 values share an exponent.
+
+Before #400 those rows still held the previous request's keys and values. That moved the logits
+of identical requests by up to 3.3, and greedy requests gave different text. A fresh process
+reads zeros there. `Lane::begin()` now zeroes, in every layer, the rows earlier generations
+wrote, so every generation starts from that zeroed cache. `ContextMap::row_offsets` says where
+the kernel writes its rows.
+
+Measured on Qwen3-0.6B (own runtime):
+
+- 12 identical greedy requests in one process, each after a request of 1 to 2000 tokens: all
+  bit-identical to the first (all 12 differed before).
+- Decode speed is unchanged: 82.2 / 82.7 / 84.1 tok/s against 81.8 / 82.5 / 84.0 before.
+- `begin()` costs 8 to 20 ms more after a request of 64 to 2000 tokens (median 41-50 ms before),
+  and nothing extra on the first request.
+- Against an f64 reference on the same weights (31 positions of a chat prompt), the top token
+  agrees at 90% of positions with exact causal attention and at 10% with a softmax that also
+  counts the block's zero rows, so zero rows past the position stay out of the softmax. The
+  remaining disagreement is the same in a fresh process, whose logits are bit-identical.
+
 ## Checking the generator
 
 ```sh

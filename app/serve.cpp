@@ -39,10 +39,13 @@
 //                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
 //   --laya with --device auto                   -> Laya classifies each conversation and the route
 //                                                  policy picks the device (RFC #186, docs/laya.md)
-//   --pm [--pm-experts FILE] [--lemonade-url U] -> the model is the Project Manager: each chat
+//   --pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url U]
+//                                              -> the model is the Project Manager: each chat
 //                                                  completion runs a tool loop in which it answers
 //                                                  or delegates to an expert model Lemonade runs
-//                                                  (app/pm.cpp, docs/pm.md)
+//                                                  (app/pm.cpp, docs/pm.md). --pm-router laya asks
+//                                                  the Laya router which expert the request fits,
+//                                                  before the PM's first round
 //   --mtp <head.gguf> on hrx or cpu             -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
 //   --dflash <draft.gguf> on hrx or cpu         -> a DFlash block-diffusion draft model
@@ -165,6 +168,7 @@ struct Options {
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
     bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
     std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
+    std::string pm_router;               // --pm-router model|laya: who picks the expert (default: model)
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
     bool mem_check = true;               // --no-mem-check (or ONEBIT_MEM_CHECK=0): skip the admission check
     bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
@@ -1335,11 +1339,18 @@ int serve_child(const Options& given) {
     // --pm (docs/pm.md): the model is the Project Manager. Its chat completions run the tool loop
     // in app/pm.cpp against the one backend; the experts are Lemonade's models, reached by URL.
     pm::Config pm_cfg;
+    // --pm-router (docs/pm.md, "Routing with Laya"): "laya" asks the engine's Laya router which
+    // expert a request fits, before the PM's first round. The default, and any unset value, stays
+    // the PM's own choice, so --pm alone behaves exactly as before.
+    const bool pm_laya = o.pm && o.pm_router == "laya";
     if (o.pm) {
-        if (o.laya_auto || !o.laya_model.empty())
+        if (o.laya_auto || (!o.laya_model.empty() && !pm_laya))
             throw std::runtime_error("--pm does not combine with --laya: the Project Manager routes among models, Laya among devices");
         if (!o.role.empty()) throw std::runtime_error("--pm does not combine with --embedding/--reranking");
         pm_cfg = pm::load_config(o.pm_experts, o.lemonade_url);
+        pm_cfg.router = pm::parse_router(o.pm_router);
+    } else if (!o.pm_router.empty()) {
+        throw std::runtime_error("--pm-router needs --pm");
     }
     std::vector<Launch> backends;
     // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
@@ -1348,7 +1359,7 @@ int serve_child(const Options& given) {
     // A device's backend starts when it is first picked (one model is not loaded on every
     // device at once). Opt-in: the built-in policy sends every class to HRX (the engine's one GPU
     // route); a row changes only with a measured net gain.
-    const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto";
+    const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto" && !o.pm;
 #ifdef ONEBIT_LAYA
     std::unique_ptr<onebit::laya::Scorer> scorer;
 #if defined(__linux__)
@@ -1356,14 +1367,18 @@ int serve_child(const Options& given) {
 #endif
     std::vector<std::string> laya_devices;
     onebit::laya::RoutePolicy policy;
-    if (laya) {
-        if (!o.role.empty())
+    // --pm-router laya shares the scorer with the device router: same checkpoint, same
+    // classify_request (laya/route.cpp), one instance.
+    if (laya || pm_laya) {
+        if (laya && !o.role.empty())
             throw std::runtime_error("--laya does not combine with --embedding/--reranking");
-        policy = onebit::laya::load_route_policy(o.route_policy);
+        if (laya) policy = onebit::laya::load_route_policy(o.route_policy);
         // ONEBIT_LAYA_DEVICE=npu: the C++ scorer with its encoder on the NPU, from a private add-on
         // (laya/encoder.h, docs/laya.md); else the GGUF scorer, on HRX0 unless it names another
         const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
         const bool laya_npu = dev && std::string(dev) == "npu";
+        // the route policy is the device router's; --pm-router laya only uses the classifier
+        const std::string policy_note = laya ? (o.route_policy.empty() ? ", policy built in" : ", policy " + o.route_policy) : "";
         const std::string gguf = laya_npu ? "" : laya_gguf(o.laya_model), bin = laya_npu ? "" : laya_ggml_bin();
 #if defined(__linux__)
         if (!gguf.empty() && !bin.empty()) {
@@ -1372,8 +1387,7 @@ int serve_child(const Options& given) {
             if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
                 bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
-            std::fprintf(stderr, "1bit serve: laya: %s through %s, policy %s\n", gguf.c_str(), bin.c_str(),
-                         o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+            std::fprintf(stderr, "1bit serve: laya: %s through %s%s\n", gguf.c_str(), bin.c_str(), policy_note.c_str());
         }
 #endif
         if (!gguf.empty() && gguf == o.laya_model && bin.empty())
@@ -1395,20 +1409,52 @@ int serve_child(const Options& given) {
                 if (!fn) throw std::runtime_error("laya: the NPU encoder: " + err);
                 scorer->set_encoder(std::move(fn));
             }
-            std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s, policy %s\n", ckpt.c_str(),
-                         laya_npu ? " (encoder on the NPU)" : "", o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+            std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s%s\n", ckpt.c_str(),
+                         laya_npu ? " (encoder on the NPU)" : "", policy_note.c_str());
         }
-        for (const std::string& dev : gguf_devices()) {
-            try {
-                backends.push_back(launch_for(o, dev, free_port()));
-                laya_devices.push_back(dev);
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());
+        if (laya) {
+            for (const std::string& dev : gguf_devices()) {
+                try {
+                    backends.push_back(launch_for(o, dev, free_port()));
+                    laya_devices.push_back(dev);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());
+                }
+            }
+            if (backends.empty()) throw std::runtime_error("laya: no device in this build can run " + o.model);
+        }
+        if (pm_laya) {
+            // The PM's router: one Laya decision per request, timed for the reply's `pm.routing`.
+            // The GGUF scorer when serve has one (25 ms a decision), else the C++ scorer on the
+            // safetensors (a few hundred); both answered by the same classify_request.
+#if defined(__linux__)
+            if (laya_daemon) {
+                LayaDaemon* d = laya_daemon.get();
+                pm_cfg.classify = [d](const std::string& state, pm::RouteHint& out) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const onebit::laya::RequestClass c = classify_request_gguf(*d, state);
+                    out.ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+                    out.label = c.label;
+                    out.confidence = c.confidence;
+                    return !c.label.empty();
+                };
+            }
+#endif
+            if (!pm_cfg.classify) {
+                onebit::laya::Scorer* s = scorer.get();
+                pm_cfg.classify = [s](const std::string& state, pm::RouteHint& out) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const onebit::laya::RequestClass c = onebit::laya::classify_request(*s, state);
+                    out.ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+                    out.label = c.label;
+                    out.confidence = c.confidence;
+                    return !c.label.empty();
+                };
             }
         }
-        if (backends.empty()) throw std::runtime_error("laya: no device in this build can run " + o.model);
     }
 #else
+    if (pm_laya) throw std::runtime_error("--pm-router laya is not part of this build (-DONEBIT_LAYA=ON, docs/laya.md)");
     if (laya) throw std::runtime_error("--laya-model is not part of this build (-DONEBIT_LAYA=ON, docs/laya.md)");
 #endif
     if (laya) {
@@ -1788,6 +1834,13 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: pm: %s is the project manager; experts through %s: %s (%s, %d rounds max)\n",
                      id.c_str(), o.lemonade_url.c_str(), experts.empty() ? "none" : experts.c_str(),
                      o.pm_experts.empty() ? "config/pm-experts.json" : o.pm_experts.c_str(), pm_cfg.max_rounds);
+        if (pm_cfg.router == "laya") {
+            std::string routes;
+            for (const auto& [label, key] : pm_cfg.routes)
+                routes += (routes.empty() ? "" : ", ") + label + "=" + (key.empty() ? std::string("pm") : key);
+            std::fprintf(stderr, "1bit serve: pm: router laya: %s (min confidence %.2f)\n",
+                         routes.empty() ? "no class routed" : routes.c_str(), pm_cfg.routes_min_confidence);
+        }
     }
     auto all_alive = [&] {
         std::lock_guard<std::mutex> lock(start_mu);
@@ -2126,7 +2179,7 @@ void usage(FILE* out) {
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
-                 "                  [--pm [--pm-experts FILE] [--lemonade-url URL]]   Project Manager: the model answers or\n"
+                 "                  [--pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
                  "                  [--no-mem-check | --mem-check]   before a .gguf loads, serve estimates its memory and\n"
@@ -2197,6 +2250,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--no-recipes") o.no_recipes = true;
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
+        else if (a == "--pm-router") o.pm_router = next();
         else if (a == "--no-mem-check") o.mem_check = false;
         else if (a == "--mem-check") o.mem_check_only = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());

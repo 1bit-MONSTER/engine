@@ -69,6 +69,7 @@ the PM asks for it, so pull the experts you want ahead of time.
 ```sh
 1bit serve -m zaya1-8b-Q4_K_M.gguf --alias ZAYA1-8B-PM --pm --lemonade-url http://127.0.0.1:8000
 # optional: --pm-experts my-experts.json
+# optional: --pm-router laya   (the engine asks the Laya router which expert first; below)
 ```
 
 The other `1bit serve` options apply unchanged (device, `--ctx-size`, recipes). `--pm` does not
@@ -134,6 +135,42 @@ to load, the default for code), `code-heavy` → Qwen3-Coder-30B-A3B-Instruct (l
 long repositories; an 18 GB load), `reasoning` → Qwen3.8-27B (long reasoning, mathematics,
 analysis), `agentic` → gpt-oss-20b (tool-heavy agentic tasks). General conversation is the PM's
 own; there is no expert for it.
+
+## Routing with Laya (`--pm-router laya`)
+
+`--pm` alone leaves the choice of expert to the model: it reads the experts' `domain` and
+`use_when` text and decides for each request. `--pm-router laya` moves that decision into the
+engine first. Before the PM's first round, the engine asks its Laya router (the same scorer and
+the same `classify_request` as `--laya`, [laya.md](laya.md)) which class the request is — Laya
+answers `code`, `prose`, `short` or `long_doc`, with a calibrated confidence — and looks the
+class up in the `pm.routes` table of the experts file:
+
+| class | expert by default | the class means |
+|---|---|---|
+| `code` | `code` | source code, a script, a fix to a program, or an explanation of code |
+| `prose` | `reasoning` | an explanation, plan or advice that needs a longer written answer |
+| `long_doc` | `code-heavy` | work over a long pasted document, log, table, transcript or file |
+| `short` | *(none)* | a greeting, a quick fact, a calculation, a one-line answer |
+
+A class with no expert (an empty name in the table), an expert the file does not list, or a class
+the router is less sure of than `pm.routes_min_confidence` (default 0.16, the route policy's
+floor) leaves the request to the PM, which answers it itself exactly as with the default router.
+Otherwise the engine makes the `delegate` call itself, as one normal tool round, and the PM
+composes the final answer from the expert's answer, as it does for its own delegation. The reply's
+`pm.routing` object carries what the router said: `class`, `score`, `ms`, and `expert` when one
+was chosen.
+
+Laya has no class for a *heavy* code task, so `code-heavy` is reached through `long_doc`: a long
+pasted document goes to the larger coder. A decision costs about 0.4-0.6 s with the C++ scorer on
+the CPU and about 25 ms with ggmlc's `laya` on HRX (`-DONEBIT_LAYA_GGML=ON`, [laya.md](laya.md)).
+The checkpoint is the one `--laya` uses: `--laya-model DIR`, else `$ONEBIT_LAYA_MODEL`, else
+`~/.local/share/1bit/laya` (`scripts/fetch-laya.sh`); without one, serve refuses to start rather
+than route by guess.
+
+```sh
+1bit serve -m zaya1-8b-Q4_K_M.gguf --alias ZAYA1-8B-PM --pm --pm-router laya \
+  --laya-model ~/.local/share/1bit/laya --lemonade-url http://127.0.0.1:8000
+```
 
 ## Limits
 

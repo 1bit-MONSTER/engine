@@ -313,6 +313,9 @@ if(Python3_Interpreter_FOUND)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry), so a regression cannot leave the daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
+    # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
+    add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
 endif()
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)

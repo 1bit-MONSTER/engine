@@ -83,8 +83,11 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
-- **Validation.** CI builds that PR without HRX, so run the checks below on Strix
-  Halo before merging. The long-prompt result is pin-specific: run the probe against
+- **Validation.** CI builds that PR without HRX. The HRX hardware gate
+  ([hw-gate.md](hw-gate.md)) runs on every bump-hrx PR on Strix Halo: test-backend-ops on
+  HRX0, known-answer and drift checks on three models, KLD against the release pin and the
+  4.7K-token needle. Its check (`hw_gate`) must pass before merging. Before merging, also run the
+  checks below on Strix Halo. The long-prompt result is pin-specific: run the probe against
   the proposed `hrx-system` pin, and update
   [`config/hrx-long-prompt-validated-pin.config`](../config/hrx-long-prompt-validated-pin.config)
   to that full commit only after it passes. CI rejects a changed HRX pin that does not

@@ -2250,7 +2250,7 @@ int run_serve(int argc, char** argv) {
         for (auto& s : args) av.push_back(s.data());
         return run_unified(int(av.size()), av.data());
 #else
-        throw std::runtime_error("this build has no NPU lane (configure with -DONEBIT_NPU=ON)");
+        throw std::runtime_error("this build has no NPU lane (configure with -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<NPU runtime>)");
 #endif
     }
     if (o.device == "mlx") return serve_child(o);

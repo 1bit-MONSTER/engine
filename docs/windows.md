@@ -62,4 +62,4 @@ It has not run on a real Windows machine yet.
 ## Next
 
 - **ONNX on the Windows GPU (DirectML)**, once the `DirectML.dll` licence question is settled. The Ryzen AI NPU through Ryzen AI Software (its own licence, installed by the user).
-- **The NPU lane on Windows XRT.**
+- **The NPU lane on Windows**, on the own NPU runtime (Linux only today; the engine no longer uses XRT).

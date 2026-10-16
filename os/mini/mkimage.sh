@@ -27,7 +27,8 @@
 # 1bit OS is a Lemonade appliance: it boots Lemonade's server (lemond), with Lemonade's defaults,
 # and the engine is one of Lemonade's backends (the onebit recipe). The initramfs holds BusyBox,
 # the kernel modules for the GPU (amdgpu, which also provides /dev/kfd) and the NPU (amdxdna),
-# Ethernet, Wi-Fi and USB storage, the firmware those load, XRT with the XDNA plugin, Mesa's Radeon
+# Ethernet, Wi-Fi and USB storage, the firmware those load (the NPU runtime is compiled into 1bit:
+# no XRT), Mesa's Radeon
 # Vulkan driver (for Lemonade's Vulkan backends), Lemonade (lemond, the lemonade CLI and the web
 # app, built from the engine's pin third_party/lemonade), and the engine: 1bit and its HRX
 # llama-server, with TheRock's HSA runtime that HRX loads (ONEBIT_HRX_LIBHSA from the build's
@@ -56,8 +57,8 @@
 #                         downloads on /data; everything else Lemonade's defaults)
 #   LEMONADE_ENV=<f>      Lemonade's environment file for the stick (LEMONADE_API_KEY, ...)
 #
-# Test images only (vmtest.sh on a machine without TheRock or XRT): LLAMA_SERVER=<a CPU
-# llama-server> stands in for the HRX build, and NO_XRT=1 leaves XRT out.
+# Test images only (vmtest.sh on a machine without TheRock): LLAMA_SERVER=<a CPU llama-server>
+# stands in for the HRX build.
 #
 # Needs no root: the EFI stub and mtools come from their Debian packages, unpacked locally.
 set -euo pipefail
@@ -127,16 +128,6 @@ fw() {   # a pattern that matches nothing on this machine is skipped
 fw "amdgpu/gc_11_5_1_*" "amdgpu/sdma_6_1_1*" "amdgpu/psp_14_0_1*" "amdgpu/smu_14_0_1*" \
    "amdgpu/vpe_6_1_1*" "amdgpu/dcn_3_5_1*" "amdgpu/vcn_4_0_6*" "amdnpu/17f0_11" \
    "rtl_nic/rtl8125*" "mediatek/mt7925" "mediatek/WIFI_*7925*" "mediatek/BT_*7925*" "regulatory.db*"
-
-echo "== XRT"
-if [ -n "${NO_XRT:-}" ]; then
-    echo "   left out (NO_XRT=1: a test image, no NPU)"
-    mkdir -p "$root/etc/1bit"; touch "$root/etc/1bit/no_xrt"
-else
-    copy_elf /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 /opt/xilinx/xrt/lib/libxrt_core.so.2 \
-             /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2
-    (cd "$root/opt/xilinx/xrt/lib" && for l in libxrt_coreutil libxrt_core libxrt_driver_xdna; do ln -sf $l.so.2 $l.so; done)
-fi
 
 echo "== the engine"
 bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit

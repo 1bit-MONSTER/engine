@@ -359,6 +359,43 @@ alias. Reviewed 2026-10-12: **not an alias**. Its `registry/significant.json` en
 `"watch": "report"`, so the census watcher lists new uploads of it as `. REVIEWED` and does
 not alert; remove that field if an upstream backend gains the architecture.
 
+### `hrm_text` - `zyr-AGENT/ZY-S1`
+
+Architecture class `HrmTextForCausalLM`, `model_type: hrm_text`, no `auto_map` and
+`library_name: transformers`, so the census classes it as native, not custom code. It is
+Sapient's HRM-Text hierarchical-reasoning LM, in-tree in upstream Transformers
+(`src/transformers/models/hrm_text/{configuration,modeling,modular}_hrm_text.py`, "The Sapient
+AI Authors and the HuggingFace Inc. team"). The base `sapientinc/HRM-Text-1B` config (read
+2026-10-15) is 128 layers of hidden 1536, 12 heads / 12 kv, head_dim 128, intermediate 4096,
+vocab 65536, rope 10000, `num_layers_per_stack: 16`, `H_cycles: 2`, `L_cycles: 3`,
+`L_bp_cycles: [0, 3]`, `embedding_scale` 39.19, `prefix_lm: true`; the flagged upload
+`zyr-AGENT/ZY-S1` (created 2026-10-12, last modified 2026-10-14) is a 16-layer finetune of it
+with the same `H_cycles` / `L_cycles` / `L_bp_cycles`.
+
+**Why an alias is wrong**: `H_cycles` / `L_cycles` run a stack of layers
+(`num_layers_per_stack`) several times per token and `L_bp_cycles` feeds the low-level stack
+back through the high-level one, on a prefix-LM (`prefix_lm`, `embedding_scale`) schedule. No
+supported family does that: the closest decoder stack would read the same tensor names and
+silently compute a different function (each stack run once, no cycle), the silent-substitution
+failure this page exists to prevent.
+
+**Why it is not mapped**: no pinned backend accepts `hrm_text`. Checked 2026-10-15 on the
+pinned submodule `third_party/llama.cpp` 0e255d77: no `hrm` in `src/llama-arch.cpp`,
+`gguf-py/gguf/constants.py` or `convert_hf_to_gguf.py`, and no `conversion/hrm_text.py`, so
+`tools/registry_build.py` finds neither a converter class nor a runnable GGUF architecture.
+The HRX fork's patched tip `ad18320a` is also free of `hrm`. Upstream `ggml-org/llama.cpp`
+master does have `LLM_ARCH_HRM_TEXT` ("hrm_text") and `conversion/hrm_text.py`, so a later pin
+bump that reaches it maps the class automatically - at that point
+`tools/registry_build.py --check-gaps` fails until this entry records why (`mapped_ok`).
+
+**Not a one-off.** The HF `hrm_text` tag lists 60 models from 34 uploaders and the 2026-10-11
+census snapshot counts 41 `HrmTextForCausalLM` models, including `sapientinc/HRM-Text-1B`
+(14,437 downloads, 834 likes) and `danish-foundation-models/DFM-Mimir{,-v1.5}` (2,175 / 2,824
+downloads). Reviewed 2026-10-15: **not an alias**. Its `registry/significant.json` entry
+carries `"watch": "report"`, so the census watcher lists new uploads of it as `. REVIEWED` and
+does not alert while no pinned backend can serve the class; remove that field (and record
+`mapped_ok`) when the llama.cpp pin gains `hrm_text`.
+
 ## Unverifiable: gated configs
 
 `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on

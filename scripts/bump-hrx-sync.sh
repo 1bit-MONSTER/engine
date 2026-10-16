@@ -63,6 +63,13 @@ remote_url() {
   else echo "https://github.com/$1.git"; fi
 }
 ident() { git -c user.name=hrx-bump -c user.email=hrx-bump@users.noreply.github.com "$@"; }
+# Every command that writes a commit object must carry an identity: GitHub runners (and
+# `env HOME=<empty>` locally) have no user.name/user.email, so a bare `git commit-tree`,
+# `git commit`, `git merge` or `git replace --graft` dies with "empty ident name"/"Author
+# identity unknown" (engine#406). ident() wraps the call sites; these exports cover any
+# command added later.
+export GIT_AUTHOR_NAME=hrx-bump GIT_AUTHOR_EMAIL=hrx-bump@users.noreply.github.com
+export GIT_COMMITTER_NAME=hrx-bump GIT_COMMITTER_EMAIL=hrx-bump@users.noreply.github.com
 
 # The commit hrx-system is held at, or empty. Lines starting with # are comments.
 hold_sha() {
@@ -115,7 +122,7 @@ sync_llama() {
       die "AMD's pin ${pin:0:12} does not contain 1bit/hrx-vulkan ${mirror:0:12} and no AMD commit after it has the same tree as any commit of the new pin; AMD rewrote its history in a way this job cannot map. Merge AMD's pin into 1bit/hrx-vulkan-patched by hand."
     fi
     git fetch -q --filter=blob:none amd "$equiv" 2>/dev/null || git fetch -q --filter=blob:none fork "$equiv"
-    git replace --graft "$squash" "$equiv"
+    ident replace --graft "$squash" "$equiv"
     note "AMD rewrote its history: ${squash:0:12} (in the new pin) has the same tree as ${equiv:0:12}, which follows our mirror ${mirror:0:12}; merging as if ${squash:0:12} followed ${equiv:0:12}"
     summary "- AMD rewrote its llama.cpp history: \`${squash:0:12}\` = tree of \`${equiv:0:12}\`; old mirror tip \`${mirror:0:12}\` tagged \`hrx-vulkan-${mirror:0:12}\`."
   fi
@@ -167,7 +174,7 @@ sync_llama() {
       note "hrx-system is held ($HOLD_FILE): AMD's ${pin:0:12} changes only HRX backend files ($hrx_changed since ${base:0:12}), which are written against AMD's hrx-system; 1bit/hrx-vulkan-patched stays at ${patched:0:12}"
       summary "- llama.cpp: AMD's \`${pin:0:12}\` changes only HRX backend files ($hrx_changed); our line stays at \`${patched:0:12}\` while hrx-system is held."
     else
-      t=$(git commit-tree "$theirs_tree" -p "$base" -m "AMD ${pin:0:12} outside the HRX backend")
+      t=$(ident commit-tree "$theirs_tree" -p "$base" -m "AMD ${pin:0:12} outside the HRX backend")
       if ! res=$(git merge-tree --write-tree --name-only --merge-base="$base" "$patched" "$t"); then
         die "taking AMD's ${pin:0:12} changes outside the HRX backend conflicts in: $(printf '%s\n' "$res" | sed -n '2,/^$/p' | tr '\n' ' '); resolve those files by hand on 1bit/hrx-vulkan-patched"
       fi

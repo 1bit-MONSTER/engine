@@ -1,0 +1,128 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+-->
+
+# Arm B round 2 cell `c` FAULTED — a control-cell fault that the mechanism predicts
+
+Recorded immediately, because a fault in a *control* cell is the kind of result that gets quietly
+explained away. Here it is informative, and it is the strongest single piece of evidence the A/B
+produced about the mechanism itself.
+
+## The result
+
+    round 2 arm c: FAULT nan=1 req=34 transport=1 s500=0 unparsed=0
+                   gtt_start=97G gtt_now=79G tctl_start=49C tctl_max=92C
+                   side=12/12 stopped_frac=0.16 thermal_pauses=0
+
+Cell `c` is CPU-pressure-only by design (12 busy-loop workers pinned to CCD1, **no GPU side load**).
+It was clean 4/4 in arm A and clean in the original disc runs. Here it produced **Face A**:
+
+    common_sampler_sample: HRX returned NaN logits: count=154880 of 154880,
+      index range [0..154879], contiguous=yes, continuing=no (engine#315)
+    common/sampling.cpp:620: HRX: NaN logits (engine#123)
+
+whole-vocabulary NaN, 2.31 s into the arm, with the sampler guard aborting — the exact Face-A signature.
+
+## Why it is not a harness artifact
+
+- **in-regime**: `gtt_start 97GiB`, inside the declared [95,110] gate;
+- **the side load ran the whole arm**: `side=12/12`, and the driver marks `INVALID(side-died)` if not;
+- **not thermal**: `thermal_pauses=0`, `tctl_max=92C` (below the 93C abort);
+- **not the CPU load itself**: cell `c`'s CPU load is the same in every clean round, including arm A's
+  4 clean cell-`c` arms;
+- the failure is the recorded Face-A string, not a parse or transport oddity — the `transport_failures=1`
+  is the sampler guard aborting the connection *after* the NaN, which is the documented order.
+
+## What the GTT trace shows — and this is the point
+
+Per-sample GTT across the arm (`tctl.log`, GiB):
+
+    79 96 97 98(4) 99(9) 100(4) 101(2) 102(4) 103(2) 104(2) ... 106
+
+The cell **drifted upward** 97G -> 106G during the arm, then collapsed to 79G when the server's
+allocation was torn down after the fault. It did not sit still at 97G and get unlucky.
+
+That is precisely the mechanism's prediction, and precisely the pattern arm A's quiet-cell fault showed:
+**the operative variable is memory pressure that drives the kernel to evict in-flight work, not the
+forcer process.** `evictonly` is a *proxy* — it drives pressure to the band deliberately and fast.
+A cell that reaches the band on its own, whatever its nominal load, hits the same condition. Cell `c`'s
+CPU workers evidently perturbed allocation enough to walk GTT up across the band.
+
+## What it changes about the reading
+
+- **It does not weaken the A/B.** The pre-registered comparison is cell `e`; this is a control cell.
+- **It strengthens the mechanism statement** by supplying a *third* independent way to reach the fault
+  (quiet-drift in arm A, forcer in disc1/disc2, CPU-drift here), all of which share one variable:
+  GTT/memory pressure walking into the eviction band.
+- **It means the regime gate is necessary but not sufficient for cell purity.** `gtt_start` inside
+  [95,110] does not keep a cell in one regime for its whole duration — `gtt_now` and the drift between
+  them matter, and the console records both. Any future campaign should treat drift into the band as a
+  covariate, not assume the start value holds.
+
+## Honest scoping
+
+This is one arm. It does not show cell `c` faults at the eviction cell's rate — cell `c` is 1 fault in
+2 rounds here against cell `e`'s 2 in 2, and arm A had cell `c` clean 4/4. It is recorded because the
+direction is the mechanism's and because the drift is measurable, not because it establishes a rate.
+
+---
+
+# The cell-c drift, measured sample by sample
+
+The claim that cell `c` faulted because it walked into the eviction band is measurable, so here is the
+whole trace rather than a summary. From `315ab1b2-r2c-GLM-4.7-Flash-Q4_K_M/tctl.log`
+(sample = 5 s; GTT in GiB, load1 from `/proc/loadavg`):
+
+    sample   GTT    load1
+      1       79     2.97     <- arm start, pre-load
+      2       96     2.97
+      3       97     3.86     <- in-regime gate value
+      4       98     5.87
+      5-7     98     7.56 .. 10.24
+      8-11    99    11.42 .. 14.64
+     12      100    15.63
+     20      103    19.51
+     21      104    19.39
+     22      106    19.75     <- peak
+     23-26   99..102  19.85 .. 20.27   <- and it stays in the band, oscillating
+     30      99    21.67
+
+The CPU-pressure cell raises system load from ~3 to ~21 and, as it does, GTT climbs from the 97 G gate
+value to a 106 G peak and then **settles into a 99-104 G oscillation** for the rest of the arm.
+
+That is the mechanism's operative variable, made directly observable: the cells differ in *how they
+drive memory pressure into the band*, not in whether the fault is possible. `evictonly` drives it fast
+and deliberately; three GLM neighbours plus 12 duty-cycled CPU workers drive it slowly and incidentally;
+a quiet arm can drift there on its own (arm A round 2). All three reach the same band, and the band is
+where KFD evicts in-flight work.
+
+## Consequence for the pre-registration's regime gate
+
+The gate checks `gtt_start in [95,110]`. The trace shows the arm spends most of its life **above** its
+start value, in a band the gate does not constrain. A cell that starts at 97 G and ends oscillating at
+102 G is not "in-regime" in any sense that keeps its cell identity — and this is why a nominally
+CPU-only control could fault.
+
+This does not invalidate the A/B (the comparison is still cell `e` vs cell `e`, and arm B's cell-`e`
+faults are unambiguous at `gtt_start 98G`), but it does mean:
+
+- **cell membership has to be argued from the trace, not the gate label**; and
+- any future campaign should record `gtt_now` and the drift, and treat "drifted into the band" as the
+  covariate that matters — which is exactly what the console already logs and what these files cite.

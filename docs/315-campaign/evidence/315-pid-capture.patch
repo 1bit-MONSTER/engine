@@ -1,0 +1,10 @@
+--- a/315-paired.sh
++++ b/315-paired.sh
+@@ -74,6 +74,10 @@
+   local up=0
+   for t in $(seq 1 300); do curl -sf -m 5 localhost:$port/health >/dev/null 2>&1 && { up=1; break; }; sleep 1; done   # -m 5: a blocked accept must not hang the runner
++  # engine#315: record the arm server's PID while it is live. The KFD SMI stream's PROC_START
++  # rows carry no port, so once an arm exits its PID is unrecoverable and arm->eviction
++  # correlation (faulting vs clean) becomes impossible. One line, read-only, no behaviour change.
++  pgrep -f "port $port" 2>/dev/null | head -1 > "$O/server.pid"
+   local g0; g0=$(gtt); echo "gtt_start ${g0}GiB mode $(cat /sys/class/ec_su_axb35/apu/power_mode 2>/dev/null)" > "$O/run.log"

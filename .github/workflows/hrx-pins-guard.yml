@@ -1,0 +1,104 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Guard the third_party pair: the two submodules are one build unit (docs/hrx.md), and
+# nothing in CI looked at them together. engine#361 was titled as a two-submodule bump and
+# changed one gitlink; #363 then had to revert hrx-system because the pinned
+# ggml/src/ggml-hrx/loom-jit.cpp no longer compiled against the newer LoomC headers (10
+# errors, all in that file: loomc_amdgpu_runtime_global_flags_t and
+# loomc_amdgpu_emit_options_t were removed). CI could not see either failure: ONEBIT_HRX
+# defaults OFF, the hosted build compiles no HRX code, and ctest registry_pins only checks
+# that the registry matches the gitlinks, not that the two pins compile together.
+#
+# This job takes PR #363's own method -- `-fsyntax-only` of the pinned loom-jit.cpp against
+# the pinned hrx-system headers -- because it is decisive on exactly that defect and costs
+# seconds: two shallow submodule fetches plus one translation unit, no GPU, no self-hosted
+# runner. It runs only when one of the pins (or the hold file) changes, so a normal PR pays
+# nothing.
+#
+# What it does NOT cover: it syntax-checks one file (loom-jit.cpp, the known breakage
+# point), not a full -DONEBIT_HRX=ON build, not the other ggml-hrx sources (several need
+# ROCm/HIP headers a hosted runner does not have), not link-time/ABI or runtime/GPU
+# behaviour, and not the correctness of the pair itself -- only that the two pins still
+# agree on the LoomC API that our code uses. ctest registry_pins (ci.yml) still guards the
+# regenerated registry, and tests/check_pins_test.py the recorded pins.
+name: HRX pins guard
+
+on:
+  pull_request:
+    paths:
+      - third_party/llama.cpp
+      - third_party/hrx-system
+      - config/hrx-system-hold.config
+      - .github/workflows/hrx-pins-guard.yml
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: hrx-pins-guard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  # The half-applied bump: a tree that moves hrx-system away from the commit
+  # config/hrx-system-hold.config names has not lifted the hold, so the engine would build
+  # against a revision the hold exists to keep out.
+  hold:
+    name: hrx-system gitlink agrees with the hold file
+    runs-on: ubuntu-latest
+    timeout-minutes: 5
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Check the hold file against the pinned hrx-system commit
+        run: |
+          set -euo pipefail
+          ours_hrx=$(git ls-tree HEAD third_party/hrx-system | awk '{print $3}')
+          hold=$(grep -v '^[[:space:]]*#' config/hrx-system-hold.config \
+                 | grep -oE '^[0-9a-f]{40}' | head -n1 || true)
+          echo "third_party/hrx-system gitlink: ${ours_hrx}"
+          echo "config/hrx-system-hold.config:  ${hold:-<no commit named>}"
+          if [ -n "${hold}" ] && [ "${hold}" != "${ours_hrx}" ]; then
+            echo "::error::the hold names ${hold:0:12} but the tree pins third_party/hrx-system at ${ours_hrx:0:12}. A pin bump that leaves hrx-system where it is keeps the hold; one that moves it must lift or update config/hrx-system-hold.config in the same PR (docs/hrx.md, engine#363)."
+            exit 1
+          fi
+
+  # The ABI/API break: the llama.cpp pin's own loom-jit.cpp against the hrx-system pin's
+  # LoomC headers. Header-only, so a hosted runner can run it.
+  loom-jit:
+    name: pinned loom-jit.cpp compiles against the pinned hrx-system
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
+      - name: Fetch the two pinned submodules (shallow)
+        run: |
+          set -euo pipefail
+          # .gitmodules marks both shallow; --depth 1 keeps the fetch to the pinned trees.
+          git submodule update --init --depth 1 -- third_party/llama.cpp third_party/hrx-system
+          echo "llama.cpp  $(git -C third_party/llama.cpp rev-parse HEAD)"
+          echo "hrx-system $(git -C third_party/hrx-system rev-parse HEAD)"
+      - name: Syntax-check ggml/src/ggml-hrx/loom-jit.cpp against the pinned LoomC headers
+        run: |
+          set -euo pipefail
+          src=third_party/llama.cpp/ggml/src/ggml-hrx/loom-jit.cpp
+          [ -f "$src" ] || { echo "::error::$src is missing at the pinned llama.cpp commit"; exit 1; }
+          cxx=clang++ ; command -v "$cxx" >/dev/null || cxx=g++
+          echo "$cxx -fsyntax-only -std=c++17 -I third_party/hrx-system/loom/binding/c/include -I third_party/hrx-system/libhrx/include $src"
+          "$cxx" -fsyntax-only -std=c++17 \
+            -I third_party/hrx-system/loom/binding/c/include \
+            -I third_party/hrx-system/libhrx/include \
+            "$src"
+          echo "::notice::the pinned loom-jit.cpp compiles against the pinned hrx-system headers"

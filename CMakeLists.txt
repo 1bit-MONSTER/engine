@@ -430,6 +430,17 @@ if(ONEBIT_NPU)
         set_target_properties(npu_rt_shim_test PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib)
     endif()
 
+    # The fast lane's known-answer check (docs/npu.md, "Checking the NPU"). It needs an NPU and
+    # the lane's kernels, a private component, so it is added only where both are configured:
+    # the kernels come from ONEBIT_NPU_LANE_KERNELS_DIR (or the model's own npu/ at run time).
+    set(ONEBIT_NPU_LANE_KERNELS_DIR "" CACHE PATH "The fast lane's kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
+    set(ONEBIT_NPU_LANE_GOLDEN "" CACHE FILEPATH "Golden ids for tests/npu_lane_known_answer.sh")
+    if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_LANE_KERNELS_DIR AND ONEBIT_NPU_LANE_GOLDEN)
+        add_test(NAME npu_lane_known_answer
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_lane_known_answer.sh $<TARGET_FILE:onebit>
+                         ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_LANE_KERNELS_DIR} ${ONEBIT_NPU_LANE_GOLDEN})
+    endif()
+
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
     # + model loader, against the engine tree's I8Ctx header.

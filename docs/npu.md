@@ -47,6 +47,12 @@ Step 3 lands in three parts:
   npu/layer.pdi          the design both kernels run on
 ```
 
+The `npu/` kernels are a private component, not committed here (rule 4 below). The lane finds them,
+in order: `--npu-opt kernels=DIR` (or `1bit unified --kernels DIR`), `ONEBIT_NPU_LANE_KERNELS`,
+`<model dir>/npu`, then a directory a private add-on registered for the model type
+(`register_private_lane_kernels`, `npu/private_route.h`). A model directory without `npu/` is
+served by the add-on's set; without any of them, `1bit serve` refuses the directory.
+
 ### Q4NX chunks
 
 A Q4NX weight is a grid of 32-row x 256-column tiles, one chunk each, row-major over
@@ -452,6 +458,13 @@ FastFlowLM, and the reference logits it compared against are lost. The NPU check
 pin bump that touches the NPU (xdna-driver, XRT, the Linux kernel) is checked with it on Strix
 Halo before merging; the public tests that need no kernels (`npu_full_elf_md5`, `npu_q4nx`,
 `npu_pack_test`, `tokenizer_test`) still run in CI.
+
+The fast lane's own known-answer check is `npu_lane_known_answer` (`tests/npu_lane_known_answer.sh`):
+one fixed prompt through `1bit npu-run`, greedy with `--no-eos`, against a golden id list. The lane
+is deterministic, so the golden is exact. It is added to ctest only where an NPU, a Q4NX model and
+the kernels are configured (`-DONEBIT_NPU_MODEL`, `-DONEBIT_NPU_LANE_KERNELS_DIR`,
+`-DONEBIT_NPU_LANE_GOLDEN`); the offline half of the check (the add-on's kernel directory,
+`private_lane_kernel_dir`) is in `npu_private_route` and runs in CI.
 
 ## Step 3d: the layer kernel and lm-head, built from source
 

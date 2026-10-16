@@ -97,6 +97,16 @@ int main() {
     check("a registered command is found and runs", c && c->run(3, nullptr) == 3 && private_commands().size() == 1);
     check("an unknown command is not", !find_private_command("y"));
 
+    // the fast lane's kernels (docs/npu.md): the add-on supplies the directory the lane loads
+    // when the model carries no npu/ of its own.
+    check("no add-on lane kernels", private_lane_kernel_dir(dense.string(), {}).empty());
+    register_private_lane_kernels("qwen3", [](const std::string& d, const PrivateOptions& o) {
+        return o.count("kernels") ? o.at("kernels") : d + "/npu";
+    });
+    check("add-on lane kernels: the model's own first", private_lane_kernel_dir(dense.string(), {}) == dense.string() + "/npu");
+    check("add-on lane kernels: sees the options", private_lane_kernel_dir(dense.string(), {{"kernels", "/p"}}) == "/p");
+    check("add-on lane kernels: not for another type", private_lane_kernel_dir(dir.string(), {}).empty());
+
     PrivateOptions o;
     parse_private_option("dir=/a=b", o);
     parse_private_option("n=", o);

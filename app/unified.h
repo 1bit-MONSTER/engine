@@ -26,13 +26,15 @@ namespace onebit {
 int run_unified(int argc, char** argv);
 
 // What runs an NPU model directory (model.q4nx, config.json, tokenizer.json):
-//   Lane     a Qwen2/Qwen3 dense model with npu/ holding the fast lane's kernels (docs/npu.md)
+//   Lane     a Qwen2/Qwen3 dense model, its kernels from --npu-opt kernels=DIR, the model's
+//            npu/, or a private add-on's registered set (docs/npu.md)
 //   Private  a model_type a private route registered (npu/private_route.h) and can serve with opts
 enum class NpuModel { None, Lane, Private };
 NpuModel npu_model_kind(const std::string& dir, const npu::PrivateOptions& opts = {});
 bool is_npu_model_dir(const std::string& dir, const npu::PrivateOptions& opts = {});
 // Why dir is not an NPU model directory here, for an error message; empty if it is one.
 std::string npu_model_problem(const std::string& dir, const npu::PrivateOptions& opts = {});
-std::string npu_kernel_dir(const std::string& model_dir);
+// The fast lane's kernel directory for dir (npu/private_route.h); empty when nothing has it.
+std::string npu_kernel_dir(const std::string& model_dir, const npu::PrivateOptions& opts = {});
 
 }  // namespace onebit

@@ -86,6 +86,15 @@ struct PrivateCommand {
 // A later registration for the same model_type (or command name) replaces the earlier one.
 void register_private_route(PrivateRoute route);
 void register_private_command(PrivateCommand command);
+
+// The fast lane's kernel directory for a model of this model_type: layer_ctx{1,2,17}.elf,
+// lmhead.elf and layer.pdi. A private add-on registers this, so the lane's ELFs are the
+// add-on's and not the model's (docs/npu.md, "The fast lane's kernels"). The returned
+// directory is used when the model directory carries no npu/ of its own; empty means the
+// add-on has none for this type.
+using PrivateLaneKernels = std::function<std::string(const std::string& dir, const PrivateOptions& opts)>;
+void register_private_lane_kernels(const std::string& model_type, PrivateLaneKernels kernels);
+std::string private_lane_kernel_dir(const std::string& dir, const PrivateOptions& opts);
 const PrivateRoute* find_private_route(const std::string& model_type);
 const PrivateCommand* find_private_command(const std::string& name);
 const std::vector<PrivateCommand>& private_commands();

@@ -34,6 +34,11 @@ std::vector<PrivateCommand>& commands() {
     return c;
 }
 
+std::map<std::string, PrivateLaneKernels>& lane_kernels() {
+    static std::map<std::string, PrivateLaneKernels> k;
+    return k;
+}
+
 // The private routes that exist, by model_type, so a build without them can say so.
 const std::map<std::string, std::string>& known() {
     static const std::map<std::string, std::string> k = {{"qwen3_5_moe", "Qwen3.6-35B-A3B"}};
@@ -83,6 +88,15 @@ const PrivateCommand* find_private_command(const std::string& name) {
 }
 
 const std::vector<PrivateCommand>& private_commands() { return commands(); }
+
+void register_private_lane_kernels(const std::string& model_type, PrivateLaneKernels kernels) {
+    lane_kernels()[model_type] = std::move(kernels);
+}
+
+std::string private_lane_kernel_dir(const std::string& dir, const PrivateOptions& opts) {
+    const auto it = lane_kernels().find(model_type_of(dir));
+    return it == lane_kernels().end() || !it->second ? std::string() : it->second(dir, opts);
+}
 
 std::string model_type_of(const std::string& dir) {
     std::ifstream f(dir + "/config.json");

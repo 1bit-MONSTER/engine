@@ -215,8 +215,9 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                     {"total_tokens", n_prompt + completion},
                     {"prompt_tokens_details", {{"cached_tokens", n_cached}}}};
     };
-    auto timings = [](const npu::GenerateResult& r, const std::string& cache) {
+    auto timings = [](const npu::GenerateResult& r, const std::string& cache, size_t n_prompt) {
         json t{{"prompt_ms", r.prefill_ms},
+               {"prompt_per_second", r.prefill_ms > 0 ? 1000.0 * double(n_prompt) / r.prefill_ms : 0.0},
                {"predicted_ms", r.decode_ms},
                {"predicted_per_second", r.tokens.empty() ? 0.0 : 1000.0 * double(r.tokens.size()) / r.decode_ms}};
         if (!cache.empty()) t["cache"] = cache;
@@ -245,7 +246,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
                     const json u{{"id", id},       {"object", object},
                                  {"created", created}, {"model", model},
                                  {"choices", json::array()}, {"usage", usage(r, n_prompt, n_cached)},
-                                 {"timings", timings(r, cache)}};
+                                 {"timings", timings(r, cache, n_prompt)}};
                     end += "data: " + u.dump() + "\n\n";
                 }
                 end += "data: [DONE]\n\n";
@@ -276,7 +277,7 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
         out["choices"] = json::array({chat ? json{{"index", 0}, {"message", message}, {"finish_reason", finish}}
                                            : json{{"index", 0}, {"text", text}, {"finish_reason", finish}}});
         out["usage"] = usage(r, n_prompt, n_cached);
-        out["timings"] = timings(r, cache);
+        out["timings"] = timings(r, cache, n_prompt);
         res.set_content(out.dump(), "application/json");
     } catch (const std::exception& ex) {
         res.status = 500;
@@ -286,14 +287,13 @@ void handle_generate(Engine& e, const httplib::Request& req, httplib::Response& 
 
 }  // namespace
 
-std::string npu_kernel_dir(const std::string& model_dir) { return model_dir + "/npu"; }
-
 namespace {
 
-bool has_lane_kernels(const std::string& dir) {
+// The five artifacts a fast-lane kernel directory holds (npu/lane.h).
+bool has_kernels(const std::string& kdir) {
     namespace fs = std::filesystem;
-    for (const char* f : {"npu/layer_ctx1.elf", "npu/layer_ctx2.elf", "npu/layer_ctx17.elf", "npu/lmhead.elf", "npu/layer.pdi"})
-        if (!fs::exists(fs::path(dir) / f)) return false;
+    for (const char* f : {"layer_ctx1.elf", "layer_ctx2.elf", "layer_ctx17.elf", "lmhead.elf", "layer.pdi"})
+        if (!fs::exists(fs::path(kdir) / f)) return false;
     return true;
 }
 
@@ -306,6 +306,18 @@ bool has_model_files(const std::string& dir) {
 
 }  // namespace
 
+// Where the fast lane's kernels come from: an explicit directory first (--npu-opt kernels=DIR, or
+// ONEBIT_NPU_LANE_KERNELS), then the model's own npu/, then a private add-on's registered set
+// (npu/private_route.h). The lane's ELFs are a private component: nothing here is committed
+// (docs/npu.md, "The fast lane's kernels"). Empty when none of those has them.
+std::string npu_kernel_dir(const std::string& model_dir, const npu::PrivateOptions& opts) {
+    const auto it = opts.find("kernels");
+    if (it != opts.end() && !it->second.empty()) return it->second;
+    if (const char* env = std::getenv("ONEBIT_NPU_LANE_KERNELS"); env && *env) return env;
+    if (const std::string own = model_dir + "/npu"; has_kernels(own)) return own;
+    return npu::private_lane_kernel_dir(model_dir, opts);
+}
+
 std::string npu_model_problem(const std::string& dir, const npu::PrivateOptions& opts) {
     if (!has_model_files(dir)) return dir + " is not an NPU model directory (model.q4nx, config.json, tokenizer.json)";
     std::string why;
@@ -314,7 +326,10 @@ std::string npu_model_problem(const std::string& dir, const npu::PrivateOptions&
     // no route, or an optional one declined: the fast lane's directory
     if (const std::string missing = npu::private_route_missing(npu::model_type_of(dir)); !missing.empty())
         return dir + ": " + missing;
-    if (!has_lane_kernels(dir)) return dir + " is not an NPU model directory (the fast lane needs npu/)";
+    if (npu_kernel_dir(dir, opts).empty()) {
+        return dir + " is not an NPU model directory (the fast lane needs its kernels: " + dir +
+               "/npu, --npu-opt kernels=DIR, or a private add-on's set)";
+    }
     return "";
 }
 
@@ -343,11 +358,14 @@ int run_unified(int argc, char** argv) {
         else if (a == "--host") host = next();
         else if (a == "--alias") alias = next();
         else if (a == "--opt") npu::parse_private_option(next(), opts);
+        else if (a == "--kernels") opts["kernels"] = next();
         else if (a == "--help" || a == "-h") {
             std::printf("usage: 1bit unified -m <model dir> [-p 8000] [--host 127.0.0.1] [--alias NAME]\n"
-                        "                    [--opt KEY=VALUE ...]\n"
+                        "                    [--kernels DIR] [--opt KEY=VALUE ...]\n"
                         "  <model dir> holds model.q4nx, config.json, tokenizer.json, and for the fast lane\n"
                         "              npu/ (its kernels); a model a private route serves needs no npu/\n"
+                        "  --kernels   the fast lane's kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf,\n"
+                        "              layer.pdi) when it is not <model dir>/npu (docs/npu.md)\n"
                         "  --opt       an option for a private route (docs/npu.md, \"Private routes\")\n");
             return 0;
         } else throw std::runtime_error("unknown option " + a);
@@ -418,7 +436,7 @@ int run_unified(int argc, char** argv) {
         const std::string type = e.model->dims().model_type;
         if (type != "qwen3" && type != "qwen2")
             throw std::runtime_error("model_type '" + type + "': the fast lane serves the Qwen2/Qwen3 layer kernel only");
-        e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir));
+        e.lane = std::make_unique<npu::Lane>(*e.model, npu_kernel_dir(model_dir, opts));
     }
     ready = true;
     std::fprintf(stderr, "1bit unified: %s ready in %.0f ms on %s:%d\n", e.id.c_str(),

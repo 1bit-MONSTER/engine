@@ -95,6 +95,10 @@ target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}"
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
+# serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
+add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
+# serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
+add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
@@ -102,6 +106,7 @@ add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FI
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
@@ -115,6 +120,11 @@ add_test(NAME http_guard COMMAND http_guard_test)
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)
 target_include_directories(gguf_meta_test PRIVATE app)
 add_test(NAME gguf_meta COMMAND gguf_meta_test)
+# serve's memory admission (app/mem_admit.h, docs/serve.md "Will it fit?"): KV/state sizes against
+# HRX0 logs, the box readings on a fake /proc and /sys; header only, runs in CI.
+add_executable(mem_admit_test tests/mem_admit_test.cpp)
+target_include_directories(mem_admit_test PRIVATE app)
+add_test(NAME mem_admit COMMAND mem_admit_test)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.

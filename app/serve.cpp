@@ -39,10 +39,11 @@
 //                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
 //   --laya with --device auto                   -> Laya classifies each conversation and the route
 //                                                  policy picks the device (RFC #186, docs/laya.md)
-//   --pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url U]
+//   --pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url U] [--pm-spawn-url URL]
 //                                              -> the model is the Project Manager: each chat
-//                                                  completion runs a tool loop in which it answers
-//                                                  or delegates to an expert model Lemonade runs
+//                                                  completion runs a tool loop in which it answers,
+//                                                  delegates to an expert model Lemonade runs, or
+//                                                  asks --pm-spawn-url for an agent worker
 //                                                  (app/pm.cpp, docs/pm.md). --pm-router laya asks
 //                                                  the Laya router which expert the request fits,
 //                                                  before the PM's first round
@@ -169,6 +170,7 @@ struct Options {
     bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
     std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
     std::string pm_router;               // --pm-router model|laya: who picks the expert (default: model)
+    std::string pm_spawn_url;            // --pm-spawn-url URL: the executor that starts agent workers (off by default)
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
     bool mem_check = true;               // --no-mem-check (or ONEBIT_MEM_CHECK=0): skip the admission check
     bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
@@ -1349,6 +1351,7 @@ int serve_child(const Options& given) {
         if (!o.role.empty()) throw std::runtime_error("--pm does not combine with --embedding/--reranking");
         pm_cfg = pm::load_config(o.pm_experts, o.lemonade_url);
         pm_cfg.router = pm::parse_router(o.pm_router);
+        pm_cfg.spawn_url = o.pm_spawn_url;
     } else if (!o.pm_router.empty()) {
         throw std::runtime_error("--pm-router needs --pm");
     }
@@ -1841,6 +1844,8 @@ int serve_child(const Options& given) {
             std::fprintf(stderr, "1bit serve: pm: router laya: %s (min confidence %.2f)\n",
                          routes.empty() ? "no class routed" : routes.c_str(), pm_cfg.routes_min_confidence);
         }
+        if (!o.pm_spawn_url.empty())
+            std::fprintf(stderr, "1bit serve: pm: agent workers (spawn_worker) through %s\n", o.pm_spawn_url.c_str());
     }
     auto all_alive = [&] {
         std::lock_guard<std::mutex> lock(start_mu);
@@ -2182,6 +2187,8 @@ void usage(FILE* out) {
                  "                  [--pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
+                 "                  [--pm-spawn-url URL]   with --pm: the tool spawn_worker asks this executor, a local\n"
+                 "                  http:// URL (off by default), to start a long-running agent worker (docs/pm.md)\n"
                  "                  [--no-mem-check | --mem-check]   before a .gguf loads, serve estimates its memory and\n"
                  "                  refuses one that does not fit (--no-mem-check or ONEBIT_MEM_CHECK=0: skip;\n"
                  "                  --mem-check: print the estimate and exit, 0 fits, 3 does not; docs/serve.md)\n"
@@ -2251,6 +2258,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
         else if (a == "--pm-router") o.pm_router = next();
+        else if (a == "--pm-spawn-url") o.pm_spawn_url = next();
         else if (a == "--no-mem-check") o.mem_check = false;
         else if (a == "--mem-check") o.mem_check_only = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());

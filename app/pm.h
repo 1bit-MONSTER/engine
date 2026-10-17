@@ -17,7 +17,9 @@
 //
 // The resident model (ZAYA1-8B) keeps every conversation. On POST /v1/chat/completions
 // the engine runs a tool loop instead of a plain forward: the PM gets a system prompt
-// and two tools, experts() and delegate(expert, task, context). A delegate call becomes an
+// and two tools, experts() and delegate(expert, task, context); with --pm-spawn-url it also gets
+// spawn_worker(worker, box, class, task), which asks a guarded executor to start a long-running
+// agent worker on its own local model (docs/pm.md). A delegate call becomes an
 // OpenAI chat request to Lemonade for the expert's catalog id (Lemonade loads the expert;
 // it allows two LLMs at once, so one expert runs beside the PM); the expert's answer comes
 // back as the tool result, and the PM composes the final answer, which is streamed when the
@@ -58,6 +60,8 @@ struct Config {
     bool thinking = false;              // chat_template_kwargs.enable_thinking for PM rounds (the client's wins)
     std::string system_prompt;          // "" : the built-in prompt (pm.cpp)
     std::string lemonade_url;           // http://host:port of the Lemonade that runs the experts
+    std::string spawn_url;              // --pm-spawn-url: the executor that starts agent workers ("" : no spawn_worker tool)
+    int spawn_timeout_s = 180;          // read timeout for one spawn_worker request
     std::string chat_path = "/api/v1/chat/completions";
     // --pm-router laya (docs/pm.md): the router's class -> the expert for it, "" leaving the
     // answer to the PM. "model" (the default) is the PM's own choice, as before.

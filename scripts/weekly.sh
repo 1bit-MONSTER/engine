@@ -22,17 +22,18 @@
 #            pass; the rest stay open and the release lists them
 #   build    main at the merged pins, with every backend this machine builds
 #   test     ctest, including the serve end-to-end tests on a small GGUF
-#   package  the Linux tarball, Lemonade with the onebit recipe, the Windows zip, 1bit OS
+#   package  the engine, folded into the Lemonade + onebit package, and 1bit OS
 #   release  what moved upstream since the last release (tools/weekly_changes.py), published
 #            as the GitHub release v<ISO year>.<ISO week> with the packages
 # No stage: all of them, in that order. WEEKLY_DRY_RUN=1 merges and publishes nothing.
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
-# Needs gh (logged in, allowed to merge on the engine), TheRock in /opt/rocm-therock, and
+# Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
+# config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
 # what the build scripts each list.
 set -euo pipefail
 
-[ $# -ge 1 ] || { sed -n '16,32p' "$0"; exit 2; }
+[ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
 W=$(mkdir -p "$1" && cd "$1" && pwd); shift
 STAGES=${*:-bumps build test package release}
 REPO=1bit-MONSTER/engine
@@ -43,7 +44,8 @@ DRY=${WEEKLY_DRY_RUN:-0}
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (laya only on its bump)
-SUBMODULES=(hrx-system llama.cpp xdna-driver lemonade ryzenai-server ds4 tokenizers)
+# (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
+SUBMODULES=(hrx-system llama.cpp lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
@@ -98,23 +100,23 @@ pin() { git -C "$SRC" ls-tree HEAD "third_party/$1" | awk '{print $3}'; }
 
 # --- build / test -------------------------------------------------------------------------
 build() {
-    # XRT + the XDNA plugin from the pinned xdna-driver, rebuilt when that pin moves
-    local xdna=$W/xdna
-    if [ "$(cat "$xdna/.pin" 2>/dev/null)" != "$(pin xdna-driver)" ]; then
-        say "XDNA stack $(pin xdna-driver | cut -c1-12)"
-        rm -rf "$xdna"
-        guard "$SRC/scripts/build-xdna.sh" "$xdna" "$JOBS" > "$LOGS/xdna.log" 2>&1
-        pin xdna-driver > "$xdna/.pin"
-    fi
-    say "engine $(git -C "$SRC" rev-parse --short HEAD)"
+    # the private components compiled in (docs/releases.md, "Private components"): the NPU runtime
+    # (into 1bit) and the HIP kernels (into the HRX llama.cpp), each a checkout at the commit its
+    # config/*.config pins; the build stops here when one cannot be fetched at that commit
+    local npurt
+    npurt=$("$SRC/scripts/fetch-private.sh" "$SRC/config/npu-runtime.config" "$W/npu-runtime" 2> "$LOGS/private.log") ||
+        { cat "$LOGS/private.log"; return 1; }
+    "$SRC/scripts/fetch-private.sh" "$SRC/config/gpu-kernels.config" "$W/gpu-kernels" > /dev/null 2>> "$LOGS/private.log" ||
+        { cat "$LOGS/private.log"; return 1; }
+    say "engine $(git -C "$SRC" rev-parse --short HEAD), NPU runtime $(git -C "$W/npu-runtime" rev-parse --short HEAD), HIP kernels $(git -C "$W/gpu-kernels" rev-parse --short HEAD)"
     local extra=()
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DONEBIT_HRX=ON -DONEBIT_ONNX=ON \
+        -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
-        -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT="$xdna/root/opt/xilinx/xrt" \
+        -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
     guard cmake --build "$BUILD" > "$LOGS/build.log" 2>&1
 }
@@ -160,7 +162,7 @@ bump_check() {  # bump_check <branch>
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
             "$SRC/tests/laya_route_e2e.sh" "$BUILD/1bit" "$W/laya" >> "$LOGS/laya.log" 2>&1 ;;
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" > "$LOGS/ds4.log" 2>&1 ;;
-        *) : ;;  # xdna, tokenizers: covered by build + ctest
+        *) : ;;  # xdna (the kernel driver pin), tokenizers: covered by build + ctest
     esac
 }
 
@@ -235,23 +237,70 @@ PY
 stage_build() { checkout "${WEEKLY_REF:-main}"; build; }
 stage_test() { run_tests; }
 
+# What the engine tarball must and must not hold (docs/releases.md, "Private components"):
+# It is packed by scripts/package-linux.sh and folded into the Lemonade + onebit package as 1bit/;
+#   XRT-free  no program or library needs or names AMD's XRT (libxrt*: readelf NEEDED, ldd,
+#             strings), and no libxrt* file is packed; the NPU runtime is compiled into 1bit
+#   kernels   the HRX ggml library carries the private HIP kernels (it exports the add-on's
+#             ggml_hrx_hip_addon_register), compiled in as code objects
+#   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
+#             like one of the private checkouts' files
+# Checks the build's 1bit and every file in the tarball.
+package_checks() {  # package_checks <linux tarball>
+    # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
+    local t bad=0 f n names pin
+    t=$(mktemp -d)
+    tar -C "$t" -xf "$1" --use-compress-program=unzstd
+    for f in "$BUILD/1bit" $(find "$t" -type f); do
+        [ "$(head -c 4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ] || continue
+        n=$(readelf -d "$f" 2>/dev/null | grep -c 'NEEDED.*libxrt' || true)
+        [ "$n" = 0 ] || { echo "FAIL $f needs libxrt"; bad=1; }
+        n=$(ldd "$f" 2>/dev/null | grep -c libxrt || true)
+        [ "$n" = 0 ] || { echo "FAIL $f: ldd shows libxrt"; bad=1; }
+        n=$(strings -a "$f" | grep -c libxrt || true)
+        [ "$n" = 0 ] || { echo "FAIL $f names libxrt"; bad=1; }
+    done
+    n=$(find "$t" -name 'libxrt*' | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL the tarball carries an XRT library"; bad=1; }
+    [ $bad = 0 ] && echo "ok   XRT-free: $(basename "$1") and $BUILD/1bit"
+    f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f | head -1)
+    n=0; [ -n "$f" ] && n=$(nm -D --defined-only "$f" | grep -c ggml_hrx_hip_addon_register || true)
+    if [ "$n" != 0 ]; then
+        echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
+    else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
+    n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee /dev/stderr | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
+    names=$(for pin in npu-runtime gpu-kernels; do
+                git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
+            done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
+    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee /dev/stderr | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
+    [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
+    rm -rf "$t"
+    return $bad
+}
+
 TAG_FILE=$W/tag
 stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
     while gh release view "$tag" -R "$REPO" > /dev/null 2>&1; do n=$((n + 1)); tag=v$(date +%G.%V).$n; done
     echo "$tag" > "$TAG_FILE"
     rm -rf "$OUT" && mkdir -p "$OUT"
-    say "package $tag: Linux"
-    "$SRC/scripts/package-linux.sh" "$BUILD" "$OUT" "$tag" "$W/xdna/root/opt/xilinx/xrt" > "$LOGS/package-linux.log" 2>&1
-    say "package $tag: Lemonade + onebit"
+    say "package $tag: the engine (into the Lemonade + onebit package)"
+    # the engine tree (package-linux.sh) is not published on its own: it goes into the Lemonade
+    # package below as 1bit/ (docs/releases.md), next to the lemond-onebit launcher
+    rm -rf "$W/engine-pkg"
+    "$SRC/scripts/package-linux.sh" "$BUILD" "$W/engine-pkg" "$tag" > "$LOGS/package-linux.log" 2>&1
+    package_checks "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" > "$LOGS/package-checks.log" 2>&1 ||
+        { cat "$LOGS/package-checks.log"; return 1; }
+    say "package $tag: Lemonade + onebit, with the engine"
     guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
-    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin | zstd -q -T4 -19 \
+    rm -rf "$W/lemonade/1bit" && mkdir -p "$W/lemonade/1bit"
+    zstd -dc "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" | tar -C "$W/lemonade/1bit" --strip-components=1 -xf -
+    install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
+    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \
         -o "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst"
-    say "package $tag: Windows"
-    rm -rf "$W/windows"
-    guard "$SRC/scripts/build-windows.sh" "$W/windows" > "$LOGS/windows.log" 2>&1
-    cp "$SRC/LICENSE" "$SRC/NOTICE" "$W/windows/"
-    (cd "$W/windows" && zip -q "$OUT/1bit-$tag-windows-x64.zip" ./*.exe ./*.dll LICENSE NOTICE)  # not work/
     say "package $tag: 1bit OS"
     rm -rf "$W/os"
     guard "$SRC/os/mini/mkimage.sh" "$W/os" "$BUILD" > "$LOGS/os.log" 2>&1

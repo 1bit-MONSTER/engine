@@ -13,17 +13,19 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|onnx] [--mtp HEAD]`
 //                        [--npu-opt KEY=VALUE ...]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
 // onebit backend runs `1bit serve` the way it runs llama-server:
 //
-//   GET  /health, /v1/health     503 while the model loads, then 200
+//   GET  /health, /v1/health     503 while the model loads, then 200 while the backend answers its own
+//                                (503 when it has exited, stopped answering, or the watchdog fired)
 //   GET  /v1/models              the one model
 //   POST /v1/chat/completions    (stream or not)
 //   POST /v1/completions
+//   GET  /metrics                serve's own Prometheus metrics, then the backend's (app/serve_metrics.h)
 //
 // Which device runs the model follows from the model and --device:
 //   an NPU model directory (model.q4nx + npu/)  -> the NPU fast lane, in process
@@ -31,37 +33,44 @@
 //                                                  -DONEBIT_NPU_PRIVATE (docs/npu.md)
 //   a .gguf, --device hrx                       -> the HRX build's llama-server on HRX0
 //   a .gguf, --device cpu                       -> the same llama-server with no GPU layers
-//                                                  (the Windows package's route, docs/windows.md)
 //   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
 //   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
 //                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
 //                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
 //   --laya with --device auto                   -> Laya classifies each conversation and the route
 //                                                  policy picks the device (RFC #186, docs/laya.md)
-//   --pm [--pm-experts FILE] [--lemonade-url U] -> the model is the Project Manager: each chat
-//                                                  completion runs a tool loop in which it answers
-//                                                  or delegates to an expert model Lemonade runs
-//                                                  (app/pm.cpp, docs/pm.md)
+//   --pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url U] [--pm-spawn-url URL]
+//                                              -> the model is the Project Manager: each chat
+//                                                  completion runs a tool loop in which it answers,
+//                                                  delegates to an expert model Lemonade runs, or
+//                                                  asks --pm-spawn-url for an agent worker
+//                                                  (app/pm.cpp, docs/pm.md). --pm-router laya asks
+//                                                  the Laya router which expert the request fits,
+//                                                  before the PM's first round
 //   --mtp <head.gguf> on hrx or cpu             -> multi-token prediction: the model's MTP
 //                                                  head drafts, the model verifies (docs/serve.md)
 //   --dflash <draft.gguf> on hrx or cpu         -> a DFlash block-diffusion draft model
 //                                                  drafts a block per step (docs/serve.md)
 //   --mmproj <mmproj.gguf> on hrx or cpu        -> images: the vision encoder runs beside the
 //                                                  model, and chat messages may carry image parts
-//   a Hugging Face id, --device mlx (macOS)     -> lemon-mlx-engine's server
 // For a .gguf, the engine starts that server as a private child on a loopback
 // port and forwards the OpenAI routes to it, streaming included. `auto` picks
 // HRX for a .gguf where the build has it, else the CPU (auto_gguf_device). The engine has
-// no Vulkan or ROCm build (RFC #213 stage 3): what HRX does not run, serve declines with a
-// clear message, and Lemonade serves it with its own llamacpp backends.
+// no Vulkan, ROCm, Metal/MLX, ZINC or CUDA route: on the GPU it is HRX with HIP kernels.
+// What HRX does not run, serve declines with a clear message, and Lemonade serves it with
+// its own backends.
 #include "serve.h"
 
 #include "built_path.h"
 
 #include "gguf_meta.h"
 #include "hrx_archs.h"
+#include "mem_admit.h"
 #include "pm.h"
 #include "recipes.h"
+#include "serve_metrics.h"
+#include "serve_watchdog.h"
+#include "sysinfo.h"
 
 #ifdef ONEBIT_MOE
 #include "gguf_index.h"
@@ -92,6 +101,7 @@
 #include <cstring>
 #include <fstream>
 #include <filesystem>
+#include <functional>
 #include <future>
 #include <memory>
 #include <mutex>
@@ -138,7 +148,7 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string flash_attn;  // -fa on/off forwarded to the child llama-server
-    std::string llama_server, hrx_libhsa, mlx, ds4;
+    std::string llama_server, hrx_libhsa, ds4;
     bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
     std::string mtp;
     std::string dflash;  // DFlash block-diffusion draft model for the target
@@ -159,7 +169,12 @@ struct Options {
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
     bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
     std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
+    std::string pm_router;               // --pm-router model|laya: who picks the expert (default: model)
+    std::string pm_spawn_url;            // --pm-spawn-url URL: the executor that starts agent workers (off by default)
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
+    bool mem_check = true;               // --no-mem-check (or ONEBIT_MEM_CHECK=0): skip the admission check
+    bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
+    WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -180,7 +195,7 @@ std::string hrx_libhsa(const std::string& option) {
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
-// else one on PATH (the Windows package puts a CPU llama-server beside 1bit.exe).
+// else one on PATH.
 std::string default_llama_server() {
     if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
 #ifdef ONEBIT_HRX_SERVER
@@ -201,6 +216,9 @@ void refuse_removed_device(const std::string& device) {
     if (device == "zinc")
         throw std::runtime_error("--device zinc was removed: the engine no longer builds ZINC (its GPU route is HRX, "
                                  "--device hrx, or auto). Lemonade's own llamacpp backends serve other GPUs (docs/lemonade.md)");
+    if (device == "mlx")
+        throw std::runtime_error("--device mlx was removed: the engine has no MLX or Metal route (its GPU route is HRX). "
+                                 "Lemonade's own MLX backend serves Apple Silicon (docs/lemonade.md)");
 }
 
 // An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
@@ -295,11 +313,6 @@ std::string default_ds4() {
 std::atomic<bool> g_stop{false};
 extern "C" void on_stop_signal(int) { g_stop = true; }
 
-std::string default_mlx() {
-    if (const char* e = std::getenv("LEMONADE_MLX_SERVER"); e && *e) return e;
-    return "lemon-mlx-server";
-}
-
 int free_port() {
 #ifdef _WIN32
     // Winsock is started by httplib.h (its WSInit)
@@ -393,8 +406,9 @@ PortOwner port_owner(pid_t child, int port) {
 class Child {
 public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health")
+          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr)
         : port_(port), ready_path_(std::move(ready_path)) {
+        (void)on_line;  // the backend's stderr is its own on Windows
         // the command line, each argument quoted the way CommandLineToArgvW reads it back
         std::string cmd;
         for (const auto& a : argv) {
@@ -460,11 +474,21 @@ public:
 
     bool alive() const { return proc_ && ::WaitForSingleObject(proc_, 0) == WAIT_TIMEOUT; }
 
+    bool kill_now(std::chrono::seconds wait) {
+        if (!proc_) return true;
+        ::TerminateProcess(proc_, 1);
+        const bool gone = ::WaitForSingleObject(proc_, DWORD(wait.count() * 1000)) == WAIT_OBJECT_0;
+        if (gone) { ::CloseHandle(proc_); proc_ = nullptr; }
+        return gone;
+    }
+    int pid() const { return proc_ ? int(::GetProcessId(proc_)) : -1; }
+
 #else
 class Child {
 public:
+    // on_line, where given, sees every complete line the backend writes to its stderr (Linux)
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health")
+          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr)
         : port_(port), ready_path_(std::move(ready_path)) {
         std::vector<char*> args;
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
@@ -481,6 +505,10 @@ public:
         for (auto& e : env_store) envp.push_back(e.data());
         envp.push_back(nullptr);
 #if defined(__linux__)
+        // The backend's stderr comes through serve (passed on unchanged), so serve keeps its last
+        // lines for a watchdog report and can read what it says (docs/serve.md).
+        int err[2] = {-1, -1};
+        const bool tee = ::pipe2(err, O_CLOEXEC) == 0;
         const pid_t parent = ::getpid();
         pid_ = ::fork();
         if (pid_ < 0) throw std::runtime_error("cannot fork for " + argv[0] + ": " + std::strerror(errno));
@@ -489,8 +517,30 @@ public:
             // SIGKILL included, so a backend is never left running on its own.
             ::prctl(PR_SET_PDEATHSIG, SIGTERM);
             if (::getppid() != parent) ::_exit(127);  // parent already gone
+            if (tee) ::dup2(err[1], 2);
             ::execvpe(args[0], args.data(), envp.data());
             ::_exit(127);
+        }
+        if (tee) {
+            ::close(err[1]);
+            // detached: a backend stuck in the kernel keeps the pipe open, and serve must still exit
+            std::thread([fd = err[0], tail = tail_, on_line = std::move(on_line)] {
+                char buf[4096];
+                for (;;) {
+                    const ssize_t n = ::read(fd, buf, sizeof buf);
+                    if (n < 0 && errno == EINTR) continue;
+                    if (n <= 0) break;
+                    for (ssize_t done = 0; done < n;) {
+                        const ssize_t w = ::write(2, buf + done, size_t(n - done));
+                        if (w < 0 && errno == EINTR) continue;
+                        if (w <= 0) break;
+                        done += w;
+                    }
+                    for (const std::string& line : tail->feed(buf, size_t(n)))
+                        if (on_line) on_line(line);
+                }
+                ::close(fd);
+            }).detach();
         }
 #else
         // No parent-death signal outside Linux: the SIGTERM/SIGINT handler
@@ -516,7 +566,25 @@ public:
     }
 
     bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
+
+    // The watchdog's stop: SIGKILL at once (a wedged GPU process does not act on SIGTERM), then
+    // up to `wait` for it to go. False when it is still there (stuck in the kernel).
+    bool kill_now(std::chrono::seconds wait) {
+        if (pid_ <= 0) return true;
+        ::kill(pid_, SIGKILL);
+        const auto end = std::chrono::steady_clock::now() + wait;
+        while (std::chrono::steady_clock::now() < end) {
+            const pid_t r = ::waitpid(pid_, nullptr, WNOHANG);
+            if (r == pid_ || (r < 0 && errno == ECHILD)) { pid_ = -1; return true; }
+            std::this_thread::sleep_for(std::chrono::milliseconds(100));
+        }
+        return false;
+    }
+    int pid() const { return int(pid_); }
 #endif
+    // the backend's last stderr lines (empty where serve does not pass its stderr through)
+    std::vector<std::string> last_lines(size_t n) const { return tail_->last(n); }
+    const std::string& ready_path() const { return ready_path_; }
 
     // Polls the child's ready path (/health; /v1/models for servers without one, which answer
     // only once the model is loaded) until it answers 200, it exits, or time runs out.
@@ -551,6 +619,7 @@ private:
 #endif
     int port_;
     std::string ready_path_;
+    std::shared_ptr<LineTail> tail_ = std::make_shared<LineTail>();
 };
 
 std::string model_id(const Options& o) {
@@ -574,8 +643,10 @@ private:
     std::atomic<int>* n_;
 };
 
+// watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h).
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
-             const std::string& set_model, const httplib::Request& req, httplib::Response& res) {
+             const std::string& set_model, const httplib::Request& req, httplib::Response& res,
+             ProgressWatch* watch = nullptr) {
     json body;
     try {
         body = json::parse(req.body);
@@ -592,6 +663,8 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     const std::string payload = body.dump();
     const std::string path = req.path;
     if (!stream) {
+        // nothing arrives until the whole answer does: the backend's probe is the only progress
+        const auto tracked = watch ? watch->begin(port, "POST " + path, req.body.size(), true) : nullptr;
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         // The backend learns of a client that hung up only when serve closes its own connection:
@@ -620,11 +693,16 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
         return;
     }
     // Streaming: relay the child's SSE bytes as they arrive.
-    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held](size_t, httplib::DataSink& sink) {
+    const size_t prompt_bytes = req.body.size();
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes](size_t, httplib::DataSink& sink) {
+        const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
         c.Post(path, httplib::Headers{}, payload, "application/json",
-               [&sink](const char* data, size_t n) { return sink.write(data, n); });
+               [&sink, &tracked](const char* data, size_t n) {
+                   if (tracked) ProgressWatch::progress(*tracked, n);
+                   return sink.write(data, n);
+               });
         sink.done();
         return true;
     });
@@ -750,17 +828,13 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
         return l;
     }
-    if (device == "mlx") {
-        // lemon-mlx-engine: `<server> <hf id> --port <p>`; it picks the model by
-        // Hugging Face id, so requests carry that id (docs/apple.md).
-        argv = {o.mlx.empty() ? default_mlx() : o.mlx, o.model, "--port", std::to_string(child_port)};
-        set_model = o.model;
-    } else if (device == "hrx" || device == "cpu") {
-        // --device cpu: llama-server with no GPU layers (the Windows package's route until HRX runs
-        // there, and what --device auto falls back to where HRX has no route for a request)
+    if (device == "hrx" || device == "cpu") {
+        // --device cpu: llama-server with no GPU layers (what --device auto falls back to where
+        // HRX has no route for a request, and in a build without HRX)
         refuse_missing_arch(o.model);
         argv = {o.llama_server.empty() ? default_llama_server() : o.llama_server,
                 "-m", o.model, "--host", "127.0.0.1", "--port", std::to_string(child_port)};
+        argv.push_back("--metrics");   // its /metrics, appended to serve's own
         if (device == "cpu") argv.insert(argv.end(), {"-ngl", "0", "--jinja"});
         else argv.insert(argv.end(), {"--device", "HRX0", "-ngl", "99", "--jinja"});
         if (o.ctx_size > 0) { argv.push_back("-c"); argv.push_back(std::to_string(o.ctx_size)); }
@@ -843,7 +917,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
-        if (device == "mlx" || device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
+        if (device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
         if (device == "hrx") {
             // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
@@ -868,7 +942,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
         // on the same device; the model checks them in one batch
         const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
-        if (device == "mlx" || device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
+        if (device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
         l.mtp = true;
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
@@ -886,7 +960,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
     if (!o.mmproj.empty()) {
-        if (device == "mlx" || device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
+        if (device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
         // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
         argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
@@ -974,7 +1048,7 @@ std::vector<std::string> gguf_devices() {
 std::string auto_gguf_device(const Options& o) {
 #if defined(_WIN32) || !defined(ONEBIT_HRX_SERVER)
     (void)o;
-    return "cpu";  // no GPU route on Windows yet (docs/windows.md), nor in a build without HRX
+    return "cpu";  // no GPU route in a build without HRX (or on Windows)
 #else
     (void)o;
     return "hrx";
@@ -1267,11 +1341,19 @@ int serve_child(const Options& given) {
     // --pm (docs/pm.md): the model is the Project Manager. Its chat completions run the tool loop
     // in app/pm.cpp against the one backend; the experts are Lemonade's models, reached by URL.
     pm::Config pm_cfg;
+    // --pm-router (docs/pm.md, "Routing with Laya"): "laya" asks the engine's Laya router which
+    // expert a request fits, before the PM's first round. The default, and any unset value, stays
+    // the PM's own choice, so --pm alone behaves exactly as before.
+    const bool pm_laya = o.pm && o.pm_router == "laya";
     if (o.pm) {
-        if (o.laya_auto || !o.laya_model.empty())
+        if (o.laya_auto || (!o.laya_model.empty() && !pm_laya))
             throw std::runtime_error("--pm does not combine with --laya: the Project Manager routes among models, Laya among devices");
         if (!o.role.empty()) throw std::runtime_error("--pm does not combine with --embedding/--reranking");
         pm_cfg = pm::load_config(o.pm_experts, o.lemonade_url);
+        pm_cfg.router = pm::parse_router(o.pm_router);
+        pm_cfg.spawn_url = o.pm_spawn_url;
+    } else if (!o.pm_router.empty()) {
+        throw std::runtime_error("--pm-router needs --pm");
     }
     std::vector<Launch> backends;
     // --laya / --laya-model with --device auto (RFC #186): Laya classifies each conversation
@@ -1280,7 +1362,7 @@ int serve_child(const Options& given) {
     // A device's backend starts when it is first picked (one model is not loaded on every
     // device at once). Opt-in: the built-in policy sends every class to HRX (the engine's one GPU
     // route); a row changes only with a measured net gain.
-    const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto";
+    const bool laya = (!o.laya_model.empty() || o.laya_auto) && o.device == "auto" && !o.pm;
 #ifdef ONEBIT_LAYA
     std::unique_ptr<onebit::laya::Scorer> scorer;
 #if defined(__linux__)
@@ -1288,14 +1370,18 @@ int serve_child(const Options& given) {
 #endif
     std::vector<std::string> laya_devices;
     onebit::laya::RoutePolicy policy;
-    if (laya) {
-        if (!o.role.empty())
+    // --pm-router laya shares the scorer with the device router: same checkpoint, same
+    // classify_request (laya/route.cpp), one instance.
+    if (laya || pm_laya) {
+        if (laya && !o.role.empty())
             throw std::runtime_error("--laya does not combine with --embedding/--reranking");
-        policy = onebit::laya::load_route_policy(o.route_policy);
+        if (laya) policy = onebit::laya::load_route_policy(o.route_policy);
         // ONEBIT_LAYA_DEVICE=npu: the C++ scorer with its encoder on the NPU, from a private add-on
         // (laya/encoder.h, docs/laya.md); else the GGUF scorer, on HRX0 unless it names another
         const char* dev = std::getenv("ONEBIT_LAYA_DEVICE");
         const bool laya_npu = dev && std::string(dev) == "npu";
+        // the route policy is the device router's; --pm-router laya only uses the classifier
+        const std::string policy_note = laya ? (o.route_policy.empty() ? ", policy built in" : ", policy " + o.route_policy) : "";
         const std::string gguf = laya_npu ? "" : laya_gguf(o.laya_model), bin = laya_npu ? "" : laya_ggml_bin();
 #if defined(__linux__)
         if (!gguf.empty() && !bin.empty()) {
@@ -1304,8 +1390,7 @@ int serve_child(const Options& given) {
             if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
                 bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
-            std::fprintf(stderr, "1bit serve: laya: %s through %s, policy %s\n", gguf.c_str(), bin.c_str(),
-                         o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+            std::fprintf(stderr, "1bit serve: laya: %s through %s%s\n", gguf.c_str(), bin.c_str(), policy_note.c_str());
         }
 #endif
         if (!gguf.empty() && gguf == o.laya_model && bin.empty())
@@ -1327,20 +1412,52 @@ int serve_child(const Options& given) {
                 if (!fn) throw std::runtime_error("laya: the NPU encoder: " + err);
                 scorer->set_encoder(std::move(fn));
             }
-            std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s, policy %s\n", ckpt.c_str(),
-                         laya_npu ? " (encoder on the NPU)" : "", o.route_policy.empty() ? "built in" : o.route_policy.c_str());
+            std::fprintf(stderr, "1bit serve: laya: checkpoint %s%s%s\n", ckpt.c_str(),
+                         laya_npu ? " (encoder on the NPU)" : "", policy_note.c_str());
         }
-        for (const std::string& dev : gguf_devices()) {
-            try {
-                backends.push_back(launch_for(o, dev, free_port()));
-                laya_devices.push_back(dev);
-            } catch (const std::exception& e) {
-                std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());
+        if (laya) {
+            for (const std::string& dev : gguf_devices()) {
+                try {
+                    backends.push_back(launch_for(o, dev, free_port()));
+                    laya_devices.push_back(dev);
+                } catch (const std::exception& e) {
+                    std::fprintf(stderr, "1bit serve: laya: %s is not a candidate: %s\n", dev.c_str(), e.what());
+                }
+            }
+            if (backends.empty()) throw std::runtime_error("laya: no device in this build can run " + o.model);
+        }
+        if (pm_laya) {
+            // The PM's router: one Laya decision per request, timed for the reply's `pm.routing`.
+            // The GGUF scorer when serve has one (25 ms a decision), else the C++ scorer on the
+            // safetensors (a few hundred); both answered by the same classify_request.
+#if defined(__linux__)
+            if (laya_daemon) {
+                LayaDaemon* d = laya_daemon.get();
+                pm_cfg.classify = [d](const std::string& state, pm::RouteHint& out) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const onebit::laya::RequestClass c = classify_request_gguf(*d, state);
+                    out.ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+                    out.label = c.label;
+                    out.confidence = c.confidence;
+                    return !c.label.empty();
+                };
+            }
+#endif
+            if (!pm_cfg.classify) {
+                onebit::laya::Scorer* s = scorer.get();
+                pm_cfg.classify = [s](const std::string& state, pm::RouteHint& out) {
+                    const auto t0 = std::chrono::steady_clock::now();
+                    const onebit::laya::RequestClass c = onebit::laya::classify_request(*s, state);
+                    out.ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+                    out.label = c.label;
+                    out.confidence = c.confidence;
+                    return !c.label.empty();
+                };
             }
         }
-        if (backends.empty()) throw std::runtime_error("laya: no device in this build can run " + o.model);
     }
 #else
+    if (pm_laya) throw std::runtime_error("--pm-router laya is not part of this build (-DONEBIT_LAYA=ON, docs/laya.md)");
     if (laya) throw std::runtime_error("--laya-model is not part of this build (-DONEBIT_LAYA=ON, docs/laya.md)");
 #endif
     if (laya) {
@@ -1374,13 +1491,98 @@ int serve_child(const Options& given) {
     auto stem = [](const std::string& m) { return fs::path(m).stem().string(); };
 
     const std::string id = model_id(o);
+
+    // Memory admission (app/mem_admit.h): before any llama-server starts, refuse a load the box
+    // has no room for, in one line with the numbers, so Lemonade shows why instead of an
+    // allocation failure or an OOM minutes later. laya counts its first device.
+    if (o.mem_check || o.mem_check_only) {
+        admit::Need need;
+        std::vector<const Launch*> launches;
+        if (!backends.empty()) launches.push_back(&backends[0]);
+        for (const auto& b : rag) launches.push_back(&b);
+        for (const Launch* l : launches)
+            if (l->device.rfind("hrx", 0) == 0 || l->device.rfind("cpu", 0) == 0) admit::add_llama_server(need, l->argv);
+        const admit::Verdict v = admit::judge(need, sysinfo::memory());
+        if (!need.parts.empty() && v.checked) {
+            auto gib = [](uint64_t b) { char t[32]; std::snprintf(t, sizeof t, "%.2f", double(b) / double(admit::kGiB)); return std::string(t); };
+            std::string parts;
+            for (const auto& p : need.parts) parts += (parts.empty() ? "" : "; ") + p;
+            const std::string ctx = need.ctx_from_model ? "the model's own ctx " + std::to_string(need.n_ctx) + " (no --ctx-size)"
+                                                        : "ctx " + std::to_string(need.n_ctx);
+            const std::string line = "need " + gib(need.total) + " GiB (" + parts + ") at " + ctx + ", free " + gib(v.free) +
+                                     " GiB (" + v.box + ")";
+            if (o.mem_check_only) {
+                std::printf("%s: %s: %s\n", id.c_str(), v.fits ? "fits" : "does not fit", line.c_str());
+                for (const auto& w : v.warnings) std::printf("%s: warning: %s\n", id.c_str(), w.c_str());
+                return v.fits ? 0 : 3;
+            }
+            if (!v.fits) {
+                // exit 3, the same as --mem-check's "does not fit": Lemonade's loader logs the exit
+                // code and fails the load at once ("1bit serve failed to start"), with this line in
+                // its log
+                std::fprintf(stderr, "1bit serve: %s does not fit: %s; free memory, lower --ctx-size, or pass --no-mem-check\n",
+                             id.c_str(), line.c_str());
+                return 3;
+            }
+            std::fprintf(stderr, "1bit serve: memory: %s\n", line.c_str());
+            for (const auto& w : v.warnings) std::fprintf(stderr, "1bit serve: memory: warning: %s\n", w.c_str());
+        } else if (o.mem_check_only) {
+            std::printf("%s: no estimate (%s)\n", id.c_str(), need.parts.empty() ? "not a llama-server model" : "the box reports no memory");
+            return 0;
+        }
+    }
     std::atomic<bool> ready{false};
+    ProgressWatch watch(o.watchdog);
+    ServeMetrics metrics(device);   // GET /metrics (app/serve_metrics.h)
+    Lifecycle lifecycle(id);
+    auto backend_line = [&metrics](const std::string& line) { metrics.backend_line(line); };
+    std::mutex wedged_mu;
+    std::string wedged;   // set by the watchdog: why the backend is taken down
 
     httplib::Server srv;
     install_request_guard(srv, o.host);  // Host / Origin (app/http_guard.h)
+    std::vector<std::unique_ptr<Child>> children;
+    std::mutex start_mu;
+    // /health: 503 while loading; once loaded, 503 too when a backend has exited, does not answer
+    // its own health route within 1.5 s, or the watchdog found it wedged. Lemonade's BackendWatchdog
+    // probes this route and reloads a backend that fails it.
     auto health = [&](const httplib::Request&, httplib::Response& res) {
-        res.status = ready ? 200 : 503;
-        res.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");
+        auto fail = [&](const std::string& why) {
+            res.status = 503;
+            res.set_content(json{{"status", "error"}, {"error", why}}.dump(), "application/json");
+        };
+        if (!ready) {
+            res.status = 503;
+            res.set_content(R"({"status":"loading"})", "application/json");
+            return;
+        }
+        {
+            std::lock_guard<std::mutex> lock(wedged_mu);
+            if (!wedged.empty()) return fail("backend wedged: " + wedged);
+        }
+        std::vector<std::pair<int, std::string>> probes;  // port, health route
+        {
+            // a laya backend starting holds start_mu for as long as it loads: do not wait on it
+            std::unique_lock<std::mutex> lock(start_mu, std::try_to_lock);
+            if (lock.owns_lock())
+                for (const auto& c : children) {
+                    if (!c->alive()) return fail("backend on port " + std::to_string(c->port()) + " exited");
+                    probes.emplace_back(c->port(), c->ready_path());
+                }
+        }
+        for (const auto& [port, path] : probes) {
+            // Lemonade's BackendWatchdog gives the whole probe 2 s and wants a 200 (curl timeout,
+            // HttpClient::is_reachable): ask the backend for 1.5 s at most, so serve answers first
+            httplib::Client c("127.0.0.1", port);
+            c.set_connection_timeout(std::chrono::milliseconds(500));
+            c.set_read_timeout(std::chrono::seconds(1));
+            auto r = c.Get(path);
+            if (!r) return fail("backend on port " + std::to_string(port) + " does not answer " + path);
+            if (r->status != 200)
+                return fail("backend on port " + std::to_string(port) + " answers " + path + " with " + std::to_string(r->status));
+        }
+        res.status = 200;
+        res.set_content(R"({"status":"ok"})", "application/json");
     };
     srv.Get("/health", health);
     srv.Get("/v1/health", health);
@@ -1390,17 +1592,15 @@ int serve_child(const Options& given) {
         if (!o.rerank.empty()) data.push_back({{"id", stem(o.rerank)}, {"object", "model"}, {"owned_by", "1bit"}, {"device", rag_device()}, {"role", "rerank"}});
         res.set_content(json{{"object", "list"}, {"data", data}}.dump(), "application/json");
     });
-    std::vector<std::unique_ptr<Child>> children;
     // laya: the backends by index, started on first use (under start_mu; a start waits for
     // the backend to be ready, up to 600 s)
     std::vector<Child*> started(backends.size(), nullptr);
-    std::mutex start_mu;
     auto ensure = [&](size_t i) -> bool {
         std::lock_guard<std::mutex> lock(start_mu);
         if (started[i]) return true;
         const Launch& b = backends[i];
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path);
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
         started[i] = c.get();
         children.push_back(std::move(c));
@@ -1484,7 +1684,7 @@ int serve_child(const Options& given) {
             }
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
-            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r);
+            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r, &watch);
             r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
@@ -1494,13 +1694,13 @@ int serve_child(const Options& given) {
             held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
-        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r);
+        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
-    // the first backend; the NPU, DwarfStar and MLX answer 501.
+    // the first backend; the NPU and DwarfStar answer 501.
     const bool llama = device == "hrx" || device == "cpu" ||
                        (laya && (backends[0].device == "hrx" || backends[0].device == "cpu"));
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
@@ -1532,12 +1732,30 @@ int serve_child(const Options& given) {
             r.set_content(R"({"error":{"message":"backend did not become ready"}})", "application/json");
             return;
         }
-        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r);
+        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r, &watch);
     };
     for (const char* path : {"/v1/responses", "/tokenize", "/detokenize", "/apply-template"})
         srv.Post(path, llama ? httplib::Server::Handler(first_json) : httplib::Server::Handler(unsupported));
-    for (const char* path : {"/slots", "/props", "/metrics"})
+    for (const char* path : {"/slots", "/props"})
         srv.Get(path, llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
+    // what only the engine sees (app/serve_metrics.h: GTT, Tctl, CPU fallbacks, program-cache
+    // flushes, backend starts and watchdog kills; Lemonade already reports requests, TTFT and
+    // tok/s), then the backend's own where it has them (llama-server runs with --metrics)
+    srv.Get("/metrics", [&](const httplib::Request&, httplib::Response& r) {
+        std::string text = metrics.render(lifecycle);
+        int port = 0;
+        {
+            std::unique_lock<std::mutex> lock(start_mu, std::try_to_lock);
+            if (ready && lock.owns_lock() && (!laya || started[0])) port = backends[0].port;
+        }
+        if (port) {
+            httplib::Client c("127.0.0.1", port);
+            c.set_connection_timeout(1);
+            c.set_read_timeout(3);
+            if (auto br = c.Get("/metrics"); br && br->status == 200) text += br->body;
+        }
+        r.set_content(text, "text/plain; version=0.0.4; charset=utf-8");
+    });
     srv.Post(R"(/slots/(\d+))", llama ? httplib::Server::Handler(first) : httplib::Server::Handler(unsupported));
     // RAG: embeddings and rerank go to their own backends, the reply names the model served
     auto rag_route = [&](size_t i, const std::string& model) {
@@ -1596,7 +1814,7 @@ int serve_child(const Options& given) {
 #endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path));
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line));
     }
     for (const auto& b : rag) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
@@ -1610,6 +1828,7 @@ int serve_child(const Options& given) {
         }
     }
     ready = true;
+    lifecycle.count_start();
     std::fprintf(stderr, "1bit serve: ready on http://%s:%d%s\n", o.host.c_str(), o.port,
                  laya ? " (laya routes each request; a device's backend starts when first picked)" : "");
     if (o.pm) {
@@ -1618,13 +1837,96 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: pm: %s is the project manager; experts through %s: %s (%s, %d rounds max)\n",
                      id.c_str(), o.lemonade_url.c_str(), experts.empty() ? "none" : experts.c_str(),
                      o.pm_experts.empty() ? "config/pm-experts.json" : o.pm_experts.c_str(), pm_cfg.max_rounds);
+        if (pm_cfg.router == "laya") {
+            std::string routes;
+            for (const auto& [label, key] : pm_cfg.routes)
+                routes += (routes.empty() ? "" : ", ") + label + "=" + (key.empty() ? std::string("pm") : key);
+            std::fprintf(stderr, "1bit serve: pm: router laya: %s (min confidence %.2f)\n",
+                         routes.empty() ? "no class routed" : routes.c_str(), pm_cfg.routes_min_confidence);
+        }
+        if (!o.pm_spawn_url.empty())
+            std::fprintf(stderr, "1bit serve: pm: agent workers (spawn_worker) through %s\n", o.pm_spawn_url.c_str());
     }
     auto all_alive = [&] {
         std::lock_guard<std::mutex> lock(start_mu);
         for (auto& c : children) if (!c->alive()) return false;
         return true;
     };
-    while (all_alive() && !g_stop) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    // The progress watchdog (app/serve_watchdog.h): while requests are in flight, probe each busy
+    // backend's main loop (GET /slots answers only between llama-server's decode steps) and look
+    // for a request with no progress past its limit.
+    std::atomic<bool> watchdog_quit{false};
+    ProgressWatch::Stall stall;
+    std::thread watchdog_thread;
+    if (watch.enabled()) {
+        watchdog_thread = std::thread([&] {
+            using clock = std::chrono::steady_clock;
+            const double secs = o.watchdog.secs;
+            const auto every = std::chrono::duration<double>(std::clamp(secs / 4, 0.25, 5.0));
+            const auto timeout = std::chrono::milliseconds(int64_t(std::clamp(secs / 2, 0.5, 10.0) * 1000));
+            std::unordered_map<int, int> probe;   // port -> 1 answers /slots, -1 has none, 0 not known yet
+            std::unordered_map<int, clock::time_point> last;
+            while (!watchdog_quit && !g_stop) {
+                std::this_thread::sleep_for(std::chrono::milliseconds(100));
+                for (const int port : watch.busy_ports()) {
+                    if (probe[port] < 0 || clock::now() - last[port] < every) continue;
+                    last[port] = clock::now();
+                    httplib::Client c("127.0.0.1", port);
+                    c.set_connection_timeout(timeout);
+                    c.set_read_timeout(timeout);
+                    if (auto r = c.Get("/slots")) {
+                        if (r->status == 200) {
+                            probe[port] = 1;
+                            watch.alive(port);
+                        } else if (probe[port] == 0) {
+                            probe[port] = -1;   // DwarfStar, ONNX, or llama-server --no-slots
+                        }
+                    }
+                }
+                if (auto st = watch.stalled([&](int port) { return probe[port] >= 0; })) {
+                    std::lock_guard<std::mutex> lock(wedged_mu);
+                    stall = *st;
+                    char why[256];
+                    std::snprintf(why, sizeof why, "%s made no progress for %.0f s", st->what.c_str(), st->idle);
+                    wedged = why;
+                    return;
+                }
+            }
+        });
+    }
+    struct JoinWatchdog {
+        std::atomic<bool>& quit;
+        std::thread& t;
+        ~JoinWatchdog() { quit = true; if (t.joinable()) t.join(); }
+    } join_watchdog{watchdog_quit, watchdog_thread};
+    auto is_wedged = [&] {
+        std::lock_guard<std::mutex> lock(wedged_mu);
+        return !wedged.empty();
+    };
+    while (all_alive() && !g_stop && !is_wedged()) std::this_thread::sleep_for(std::chrono::milliseconds(200));
+    if (is_wedged() && !g_stop) {
+        // Kill the wedged backend and exit non-zero: Lemonade's BackendWatchdog sees the process go
+        // and loads the model again. Say why, with what the box and the backend said last.
+        lifecycle.count_watchdog_kill();
+        std::lock_guard<std::mutex> lock(start_mu);
+        Child* bad = nullptr;
+        for (auto& c : children) if (c->port() == stall.port) bad = c.get();
+        std::fprintf(stderr, "1bit serve: watchdog: %s on the %s backend (port %d, pid %d) made no progress for %.0f s "
+                             "(limit %.0f s; %llu bytes received in %.0f s); killing it and exiting so Lemonade reloads it\n",
+                     stall.what.c_str(), device.c_str(), stall.port, bad ? bad->pid() : -1, stall.idle, stall.limit,
+                     (unsigned long long) stall.bytes, stall.age);
+        if (const auto t = sysinfo::tctl_celsius()) std::fprintf(stderr, "1bit serve: watchdog: Tctl %.1f C\n", *t);
+        if (bad) {
+            const auto lines = bad->last_lines(12);
+            if (!lines.empty()) std::fprintf(stderr, "1bit serve: watchdog: the backend's last lines:\n");
+            for (const auto& l : lines) std::fprintf(stderr, "1bit serve: watchdog: | %s\n", l.c_str());
+            if (!bad->kill_now(std::chrono::seconds(10)))
+                std::fprintf(stderr, "1bit serve: watchdog: pid %d did not exit after SIGKILL (stuck in the kernel; "
+                                     "a GPU reset may be needed)\n", bad->pid());
+        }
+        for (auto& c : children) if (c.get() != bad) c->kill_now(std::chrono::seconds(5));
+        return 1;
+    }
     if (backends.size() > 1) {
         std::fprintf(stderr, "1bit serve: requests routed:");
         for (size_t i = 0; i < backends.size(); i++) std::fprintf(stderr, " %s %ld", backends[i].device.c_str(), routed[i].load());
@@ -1636,6 +1938,7 @@ int serve_child(const Options& given) {
         for (auto& c : children) c->stop();
         return 0;
     }
+    lifecycle.count_backend_exit();
     std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
     return 1;
 }
@@ -1862,8 +2165,8 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|cpu|ds4|mlx|onnx] [--ctx-size N] [--alias NAME]\n"
-                 "                  [--llama-server PATH] [--hrx-libhsa PATH] [--mlx-server PATH]\n"
+                 "                  [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--llama-server PATH] [--hrx-libhsa PATH]\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
@@ -1881,18 +2184,29 @@ void usage(FILE* out) {
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
                  "                  (default: config/recipes.json, built in; docs/recipes.md)\n"
-                 "                  [--pm [--pm-experts FILE] [--lemonade-url URL]]   Project Manager: the model answers or\n"
+                 "                  [--pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url URL]]   Project Manager: the model answers or\n"
                  "                  delegates each chat to an expert model Lemonade runs (default experts:\n"
                  "                  config/pm-experts.json, built in; URL default http://127.0.0.1:8000; docs/pm.md)\n"
+                 "                  [--pm-spawn-url URL]   with --pm: the tool spawn_worker asks this executor, a local\n"
+                 "                  http:// URL (off by default), to start a long-running agent worker (docs/pm.md)\n"
+                 "                  [--no-mem-check | --mem-check]   before a .gguf loads, serve estimates its memory and\n"
+                 "                  refuses one that does not fit (--no-mem-check or ONEBIT_MEM_CHECK=0: skip;\n"
+                 "                  --mem-check: print the estimate and exit, 0 fits, 3 does not; docs/serve.md)\n"
+                 "                  [--watchdog SECS] [--watchdog-prompt-tps N]   a request with no progress from its backend\n"
+                 "                  for SECS (default 120, or $ONEBIT_WATCHDOG_SECS; 0 = off), plus prompt tokens / N\n"
+                 "                  (default 50) before its first byte, kills the backend and exits non-zero so Lemonade\n"
+                 "                  reloads it (docs/serve.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
-                 "           a .gguf file, or with --device mlx a Hugging Face id (mlx-community/...)\n");
+                 "           or a .gguf file\n");
 }
 
 }  // namespace
 
 int run_serve(int argc, char** argv) {
     Options o;
+    if (const char* e = std::getenv("ONEBIT_MEM_CHECK"); e && std::string(e) == "0") o.mem_check = false;
+    if (const char* e = std::getenv("ONEBIT_WATCHDOG_SECS"); e && *e) o.watchdog.secs = std::atof(e);
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -1912,7 +2226,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--ds4") o.ds4 = next();
         else if (a == "--ssd-streaming") o.ssd_streaming = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
-        else if (a == "--mlx-server") o.mlx = next();
+        else if (a == "--mlx-server")
+            throw std::runtime_error("--mlx-server was removed with the engine's MLX route; Lemonade's own MLX backend serves Apple Silicon (docs/lemonade.md)");
         else if (a == "--prefill-device" || a == "--prefill-min-tokens" || a == "--lean" || a == "--adaptive" ||
                  a == "--adaptive-at" || a == "--long-model" || a == "--long-from")
             // RFC #213 stage 3: these ran on the Vulkan and ROCm builds the engine no longer ships
@@ -1942,11 +2257,19 @@ int run_serve(int argc, char** argv) {
         else if (a == "--no-recipes") o.no_recipes = true;
         else if (a == "--pm") o.pm = true;
         else if (a == "--pm-experts") o.pm_experts = next();
+        else if (a == "--pm-router") o.pm_router = next();
+        else if (a == "--pm-spawn-url") o.pm_spawn_url = next();
+        else if (a == "--no-mem-check") o.mem_check = false;
+        else if (a == "--mem-check") o.mem_check_only = true;
+        else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
+        else if (a == "--watchdog-prompt-tps") o.watchdog.prompt_tps = std::stod(next());
         else if (a == "--lemonade-url") o.lemonade_url = next();
         else if (a == "-h" || a == "--help") { usage(stdout); return 0; }
         else throw std::runtime_error("unknown option " + a);
     }
     if (o.model.empty()) { usage(stderr); return 2; }
+    if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)
+        throw std::runtime_error("--watchdog and --watchdog-prompt-tps take a number >= 0 (0 turns it off)");
     refuse_removed_device(o.device);
 
     if (is_onnx_model_dir(o.model)) {
@@ -1982,10 +2305,9 @@ int run_serve(int argc, char** argv) {
         for (auto& s : args) av.push_back(s.data());
         return run_unified(int(av.size()), av.data());
 #else
-        throw std::runtime_error("this build has no NPU lane (configure with -DONEBIT_NPU=ON)");
+        throw std::runtime_error("this build has no NPU lane (configure with -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<NPU runtime>)");
 #endif
     }
-    if (o.device == "mlx") return serve_child(o);
 #ifdef ONEBIT_NPU
     if (fs::path(o.model).extension() == ".gguf" && o.device == "npu") {
         // Fused-lane first (opt-in via ONEBIT_NPU_LANE_DIR): pack the GGUF in the

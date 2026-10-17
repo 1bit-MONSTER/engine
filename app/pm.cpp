@@ -65,6 +65,14 @@ std::string content_text(const json& c) {
     return out;
 }
 
+// The last user message's text: what the router classifies, and the brief the engine hands the
+// expert when it delegates by itself (--pm-router laya).
+std::string last_user_text(const json& messages) {
+    for (auto it = messages.rbegin(); it != messages.rend(); ++it)
+        if (it->is_object() && it->value("role", "") == "user") return content_text(it->value("content", json()));
+    return "";
+}
+
 // Cuts `s` to at most `n` bytes without splitting a UTF-8 sequence.
 std::string cut_utf8(std::string s, size_t n, bool* cut) {
     *cut = false;
@@ -146,7 +154,7 @@ std::string experts_text(const Config& cfg) {
 json tools_schema(const Config& cfg) {
     std::string keys;
     for (const auto& e : cfg.experts) keys += (keys.empty() ? "" : ", ") + e.key;
-    return json::array({
+    json tools = json::array({
         {{"type", "function"},
          {"function", {{"name", "experts"},
                        {"description", "List the experts you can delegate to, with when to use each."},
@@ -160,6 +168,22 @@ json tools_schema(const Config& cfg) {
                                                        {"task", {{"type", "string"}, {"description", "a complete, self-contained brief of what to do"}}},
                                                        {"context", {{"type", "string"}, {"description", "code, data or constraints the expert needs (optional)"}}}}},
                                        {"required", json::array({"expert", "task"})}}}}}}});
+    if (!cfg.spawn_url.empty())
+        tools.push_back(
+            {{"type", "function"},
+             {"function", {{"name", "spawn_worker"},
+                           {"description", "Ask the executor to start a long-running agent worker: a pi agent in "
+                                           "tmux on its own local model, for work that takes many steps, edits files, "
+                                           "builds, or runs on hardware. The executor starts it and returns at once; "
+                                           "the worker then works on its own. Local models only: the executor "
+                                           "refuses a remote or unknown model."},
+                           {"parameters", {{"type", "object"},
+                                           {"properties", {{"worker", {{"type", "string"}, {"description", "the worker's name: [a-z0-9-], at most 24 characters"}}},
+                                                           {"box", {{"type", "string"}, {"enum", json::array({"ryzen", "strixhalo"})}, {"description", "which machine runs it (hardware work must use strixhalo)"}}},
+                                                           {"class", {{"type", "string"}, {"enum", json::array({"code", "code-heavy", "reasoning", "mechanical", "hardware"})}, {"description", "what kind of work it is; this picks the worker's local model"}}},
+                                                           {"task", {{"type", "string"}, {"description", "a complete, self-contained brief: the worker sees only this"}}}}},
+                                           {"required", json::array({"worker", "box", "class", "task"})}}}}}});
+    return tools;
 }
 
 struct Delegation {
@@ -167,6 +191,90 @@ struct Delegation {
     long ms = 0;
     bool ok = false;
 };
+
+struct Spawn {
+    std::string worker, box, klass, model;
+    long ms = 0;
+    bool ok = false;
+    std::string reason;
+};
+
+// "http://host:port/path" -> base "http://host:port" and path "/path" (default /propose).
+void split_url(const std::string& url, std::string& base, std::string& path) {
+    const size_t scheme = url.find("://");
+    const size_t slash = scheme == std::string::npos ? std::string::npos : url.find('/', scheme + 3);
+    if (slash == std::string::npos) {
+        base = url;
+        path = "/propose";
+    } else {
+        base = url.substr(0, slash);
+        path = url.substr(slash);
+    }
+}
+
+// Runs spawn_worker(): one POST of a proposal to the executor (--pm-spawn-url), which validates it
+// and, if it holds, starts the worker. The reply (accepted, or the reason it was refused) is the
+// tool result. ZAYA proposes; the executor decides.
+std::string run_spawn_worker(const Config& cfg, const json& args, std::vector<Spawn>& log) {
+    Spawn s;
+    s.worker = json_string(args.value("worker", json()));
+    s.box = json_string(args.value("box", json()));
+    s.klass = json_string(args.value("class", json()));
+    const std::string task = json_string(args.value("task", json()));
+    const std::string model = json_string(args.value("model", json()));
+    const auto t0 = std::chrono::steady_clock::now();
+    auto failed = [&](const std::string& why) {
+        s.ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+        s.ok = false;
+        s.reason = why;
+        log.push_back(s);
+        std::fprintf(stderr, "1bit serve: pm: spawn %s on %s (%s) %ld ms failed: %s\n", s.worker.c_str(),
+                     s.box.c_str(), s.klass.c_str(), s.ms, why.c_str());
+        return "spawn_worker failed: " + why + ". Tell the user the worker was not started.";
+    };
+    if (s.worker.empty() || s.box.empty() || s.klass.empty() || task.empty())
+        return failed("spawn_worker needs worker, box, class and task");
+
+    json proposal = {{"schema_version", 1}, {"worker", s.worker}, {"box", s.box}, {"class", s.klass},
+                     {"task", task}};
+    if (!model.empty()) proposal["model"] = model;
+
+    std::string base, path;
+    split_url(cfg.spawn_url, base, path);
+    httplib::Client cli(base);
+    if (!cli.is_valid()) return failed("--pm-spawn-url " + cfg.spawn_url + " is not a usable http:// URL");
+    cli.set_connection_timeout(5);
+    cli.set_read_timeout(cfg.spawn_timeout_s);
+    cli.set_write_timeout(60);
+    auto r = cli.Post(path, proposal.dump(), "application/json");
+    if (!r) return failed("the executor at " + cfg.spawn_url + " did not answer (" + httplib::to_string(r.error()) + ")");
+    json out;
+    try {
+        out = json::parse(r->body);
+    } catch (const std::exception&) {
+        return failed("the executor answered HTTP " + std::to_string(r->status) + " with a body that is not JSON");
+    }
+    const bool accepted = out.is_object() && out.value("accepted", false);
+    if (r->status < 200 || r->status >= 300 || !accepted) {
+        std::string why = out.is_object() ? out.value("reason", std::string()) : std::string();
+        if (why.empty()) why = "HTTP " + std::to_string(r->status);
+        const std::string detail = out.is_object() ? json_string(out.value("detail", json())) : "";
+        return failed(why + (detail.empty() ? "" : " (" + detail + ")"));
+    }
+    s.ms = long(std::chrono::duration_cast<std::chrono::milliseconds>(std::chrono::steady_clock::now() - t0).count());
+    s.ok = true;
+    s.box = out.value("box", s.box);
+    s.klass = out.value("class", s.klass);
+    s.model = out.value("model", std::string());
+    log.push_back(s);
+    const std::string brief = out.value("brief_path", std::string());
+    std::fprintf(stderr, "1bit serve: pm: spawn %s on %s (%s) -> %s, session pi-%s, brief %s, %ld ms ok\n",
+                 s.worker.c_str(), s.box.c_str(), s.klass.c_str(), s.model.c_str(), s.worker.c_str(),
+                 brief.c_str(), s.ms);
+    return "worker \"" + s.worker + "\" is running on " + s.box + " as the tmux session pi-" + s.worker +
+           " on the local model " + s.model + (brief.empty() ? "" : " (brief " + brief + ")") +
+           ". The executor tracks it; it works on its own from here, so tell the user it started and what to watch.";
+}
 
 // Runs delegate(): one OpenAI chat request to Lemonade for the expert's catalog id. Returns the
 // tool result text; a failure is described in it (the PM must say so and answer alone).
@@ -304,6 +412,19 @@ const Expert* Config::find(const std::string& key) const {
     return nullptr;
 }
 
+std::string parse_router(const std::string& value) {
+    if (value.empty() || value == "model") return "model";
+    if (value == "laya") return "laya";
+    throw std::runtime_error("--pm-router takes model or laya, not \"" + value + "\"");
+}
+
+const Expert* route_expert(const Config& cfg, const std::string& label, float confidence) {
+    if (confidence < cfg.routes_min_confidence) return nullptr;
+    const auto it = cfg.routes.find(label);
+    if (it == cfg.routes.end() || it->second.empty()) return nullptr;
+    return cfg.find(it->second);
+}
+
 const char* default_experts_json() { return kDefaultPmExpertsJson; }
 
 Config load_config(const std::string& file, const std::string& lemonade_url) {
@@ -332,9 +453,21 @@ Config load_config(const std::string& file, const std::string& lemonade_url) {
         c.max_rounds = p.value("max_rounds", c.max_rounds);
         c.max_result_bytes = p.value("max_result_bytes", c.max_result_bytes);
         c.delegate_timeout_s = p.value("delegate_timeout_s", c.delegate_timeout_s);
+        c.spawn_timeout_s = p.value("spawn_timeout_s", c.spawn_timeout_s);
         c.thinking = p.value("thinking", c.thinking);
         c.system_prompt = p.value("system_prompt", std::string());
         c.chat_path = p.value("chat_path", c.chat_path);
+        c.routes_min_confidence = p.value("routes_min_confidence", c.routes_min_confidence);
+        if (c.routes_min_confidence < 0.0f || c.routes_min_confidence > 1.0f)
+            throw std::runtime_error("--pm-experts: pm.routes_min_confidence must be between 0 and 1");
+        if (p.contains("routes")) {
+            if (!p["routes"].is_object()) throw std::runtime_error("--pm-experts: pm.routes must be an object of class -> expert");
+            for (const auto& [label, value] : p["routes"].items()) {
+                if (!value.is_string())
+                    throw std::runtime_error("--pm-experts: pm.routes." + label + " must be an expert name or an empty string");
+                c.routes[label] = value.get<std::string>();
+            }
+        }
     }
     if (c.max_rounds < 1) throw std::runtime_error("--pm-experts: pm.max_rounds must be at least 1");
     for (const auto& x : j["experts"]) {
@@ -348,6 +481,10 @@ Config load_config(const std::string& file, const std::string& lemonade_url) {
         if (c.find(e.key)) throw std::runtime_error("--pm-experts: expert \"" + e.key + "\" is listed twice");
         c.experts.push_back(std::move(e));
     }
+    for (const auto& [label, key] : c.routes)
+        if (!key.empty() && !c.find(key))
+            throw std::runtime_error("--pm-experts: pm.routes.\"" + label + "\" names expert \"" + key +
+                                     "\", which the file does not list");
     return c;
 }
 
@@ -426,12 +563,38 @@ void handle_chat(const Config& cfg, int backend_port, const std::string& our_id,
 
     const json tools = tools_schema(cfg);
     std::vector<std::string> names = {"experts", "delegate"};
+    if (!cfg.spawn_url.empty()) names.push_back("spawn_worker");
     std::vector<Delegation> log;
+    std::vector<Spawn> spawns;
     httplib::Client backend("127.0.0.1", backend_port);
     backend.set_read_timeout(3600);
     json final_message, final_reply;
+    json routing;  // --pm-router laya only: what the router said (the reply's `pm.routing`)
     std::string finish = "stop";
     int rounds = 0;
+
+    // --pm-router laya (docs/pm.md, "Routing with Laya"): ask the router before the PM's first
+    // round. A class the router is confident about becomes a delegate call of its own, so the PM
+    // composes the final answer from a real tool result instead of from its own choice. A class
+    // with no expert, or one below the confidence floor, is left to the PM as before.
+    if (cfg.router == "laya" && cfg.classify) {
+        const std::string state = last_user_text(messages);
+        RouteHint hint;
+        if (!state.empty() && cfg.classify(state, hint)) {
+            routing = {{"class", hint.label}, {"score", hint.confidence}, {"ms", hint.ms}};
+            const Expert* e = route_expert(cfg, hint.label, hint.confidence);
+            if (e) {
+                routing["expert"] = e->key;
+                const std::string cid = now_id("call_router-");
+                const json args = {{"expert", e->key}, {"task", state}};
+                messages.push_back({{"role", "assistant"}, {"content", ""},
+                                    {"tool_calls", json::array({{{"id", cid}, {"type", "function"},
+                                                                 {"function", {{"name", "delegate"}, {"arguments", args.dump()}}}}})}});
+                messages.push_back({{"role", "tool"}, {"tool_call_id", cid}, {"name", "delegate"},
+                                    {"content", run_delegate(cfg, args, log)}});
+            }
+        }
+    }
     for (int round = 0; round < cfg.max_rounds; round++) {
         rounds = round + 1;
         const bool last = round + 1 == cfg.max_rounds;  // the cap: no tools, the PM must answer
@@ -491,6 +654,7 @@ void handle_chat(const Config& cfg, int backend_port, const std::string& our_id,
         for (size_t i = 0; i < calls.size(); i++) {
             std::string result;
             if (calls[i].name == "experts") result = experts_text(cfg);
+            else if (calls[i].name == "spawn_worker") result = run_spawn_worker(cfg, calls[i].arguments, spawns);
             else result = run_delegate(cfg, calls[i].arguments, log);
             messages.push_back({{"role", "tool"}, {"tool_call_id", tcs[i]["id"]}, {"name", calls[i].name}, {"content", result}});
         }
@@ -506,7 +670,14 @@ void handle_chat(const Config& cfg, int backend_port, const std::string& our_id,
 
     json pm = {{"rounds", rounds}, {"delegations", json::array()}};
     for (const auto& d : log) pm["delegations"].push_back({{"expert", d.expert}, {"id", d.id}, {"ms", d.ms}, {"ok", d.ok}});
-    res.set_header("X-1bit-PM", std::to_string(rounds) + " rounds, " + std::to_string(log.size()) + " delegations");
+    if (!routing.is_null()) pm["routing"] = routing;
+    json spawn_json = json::array();
+    for (const auto& s : spawns)
+        spawn_json.push_back({{"worker", s.worker}, {"box", s.box}, {"class", s.klass}, {"model", s.model},
+                              {"ms", s.ms}, {"ok", s.ok}, {"reason", s.reason}});
+    pm["spawns"] = spawn_json;
+    res.set_header("X-1bit-PM", std::to_string(rounds) + " rounds, " + std::to_string(log.size()) +
+                                    " delegations, " + std::to_string(spawns.size()) + " spawns");
     if (stream) return stream_final(res, id, our_id, final_message, finish);
     json reply = final_reply;
     reply["id"] = id;

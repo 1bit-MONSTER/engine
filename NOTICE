@@ -4,6 +4,20 @@ Copyright 2026 bong-water-water-bong
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
 ===============================================================================
+Proprietary components compiled into the release binaries
+===============================================================================
+
+The source code in this repository is licensed under Apache-2.0. The binaries
+published with the engine's releases (the Linux package and 1bit OS) also
+contain two proprietary components, compiled in: the 1bit NPU runtime (in
+1bit) and the 1bit HIP kernels for HRX (code objects in the HRX llama.cpp
+library). They are not part of this repository, their source is not
+published, and they are not licensed under Apache-2.0.
+Copyright 2026 bong-water-water-bong. All rights reserved.
+A build of this repository without them has no NPU lane and runs HRX on the
+public kernels only.
+
+===============================================================================
 Third-party components
 ===============================================================================
 
@@ -49,17 +63,20 @@ Qwen3.8 Flash DGX UltraFast (https://github.com/dime-online/qwen3.8-Flash-DGX-Ul
 Pinned at exact commits (git submodules) and built from source
 -------------------------------------------------------------------------------
 
-AMD XDNA driver and XRT shim (third_party/xdna-driver)
+AMD XDNA driver (third_party/xdna-driver)
   https://github.com/amd/xdna-driver
   Copyright (C) 2023-2024 Advanced Micro Devices, Inc.
-  License: Apache-2.0 (the userspace shim built here). The NPU firmware under
+  License: GPL-2.0 (the amdxdna kernel driver), Apache-2.0 (userspace). Pinned as
+  the amdxdna kernel driver the NPU lane is checked against; nothing from it is
+  built into or shipped with the release binaries. The NPU firmware under
   LICENSE.amdnpu is not redistributed by this product.
 
-Xilinx Runtime, XRT (fetched by third_party/xdna-driver)
-  https://github.com/Xilinx/XRT
+Xilinx Runtime, XRT (https://github.com/Xilinx/XRT)
   Copyright (C) 2016-2022 Xilinx, Inc.
   Copyright (C) 2022-2023 Advanced Micro Devices, Inc.
-  License: Apache-2.0 (userspace)
+  License: Apache-2.0 (userspace). No longer built, linked or shipped: the NPU
+  lane runs on the 1bit NPU runtime (see above), whose classes keep XRT's API names
+  (xrt::device, xrt::bo, ...) so the engine's NPU sources read the same.
 
 MLIR-AIE, IRON and aiecc (third_party/mlir-aie)
   https://github.com/Xilinx/mlir-aie

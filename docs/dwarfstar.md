@@ -34,9 +34,10 @@ backend, behind the same OpenAI API as every other device. The engine builds our
 
 `third_party/ds4` pins our fork's `1bit/main`: upstream `antirez/ds4` main plus the
 commits we carry (1BP packages). When upstream main moves, `.github/workflows/bump-ds4.yml`
-rebases our commits onto it, tags the old tip `ds4-main-<sha12>` so the old pin stays
-reachable, and opens a PR moving the submodule. A commit that no longer applies stops the bump
-for a hand rebase.
+merges it into `1bit/main`, the way the Lemonade fork's sync merges an upstream release, tags
+the old tip `ds4-main-<sha12>` so the old pin stays reachable, and opens a PR moving the
+submodule. The merge keeps the old pin an ancestor of the new one, which is what the engine's
+pin check requires. A conflict stops the bump for a hand merge.
 
 ```
 git submodule update --init --depth 1 third_party/ds4

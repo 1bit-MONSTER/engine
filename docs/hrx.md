@@ -20,9 +20,8 @@ On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prom
 decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
 and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
 
-It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU. The engine builds no Vulkan or
-ROCm llama.cpp (RFC #213 stage 3); what HRX does not run, Lemonade serves with its own
-llamacpp backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
+It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
+backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
 
 ```
 HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
@@ -83,8 +82,11 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
-- **Validation.** CI builds that PR without HRX, so run the checks below on Strix
-  Halo before merging. The long-prompt result is pin-specific: run the probe against
+- **Validation.** CI builds that PR without HRX. The HRX hardware gate
+  ([hw-gate.md](hw-gate.md)) runs on every bump-hrx PR on Strix Halo: test-backend-ops on
+  HRX0, known-answer and drift checks on three models, KLD against the release pin and the
+  4.7K-token needle. Its check (`hw_gate`) must pass before merging. Before merging, also run the
+  checks below on Strix Halo. The long-prompt result is pin-specific: run the probe against
   the proposed `hrx-system` pin, and update
   [`config/hrx-long-prompt-validated-pin.config`](../config/hrx-long-prompt-validated-pin.config)
   to that full commit only after it passes. CI rejects a changed HRX pin that does not
@@ -592,7 +594,10 @@ Our own HIP kernels for HRX are closed source, like the NPU kernels: they live i
 public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>`
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
-that hook. Without the option the build is unchanged. To drop the add-on from an existing
+that hook. Without the option the build is unchanged. The release builds with it, from the
+commit pinned in `config/gpu-kernels.config`, so the release binaries carry the kernels as
+compiled code objects while their source stays private ([releases.md](releases.md), "Private
+components"). To drop the add-on from an existing
 build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).
 
 ## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)

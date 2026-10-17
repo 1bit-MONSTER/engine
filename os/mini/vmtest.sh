@@ -26,9 +26,9 @@
 # Lemonade's web app loads, Lemonade refuses a request without the key, lists the stick's model in
 # /api/v1/models, and answers a chat request with it. The VM has no Radeon GPU, so Lemonade serves
 # that chat with its llamacpp CPU backend (its own choice); the onebit entry for the same model
-# needs an AMD GPU or NPU for Lemonade to run it (the recipe's backends are hrx, vulkan, npu and
-# cuda), so the test only reports what Lemonade does with it. Prints VMTEST PASS or FAIL. On a
-# machine without TheRock or XRT, LLAMA_SERVER and NO_XRT (mkimage.sh) make a CPU-only test image.
+# needs an AMD GPU or NPU for Lemonade to run it (the recipe's backends are hrx and npu), so the
+# test only reports what Lemonade does with it. Prints VMTEST PASS or FAIL. On a
+# machine without TheRock, LLAMA_SERVER (mkimage.sh) makes a CPU-only test image.
 set -euo pipefail
 out=${1:?usage: vmtest.sh <out> [engine build dir] [model.gguf]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
@@ -86,7 +86,7 @@ for i in $(seq 10); do reply=$(chat "$name"); case $reply in ""|error*) sleep 10
 case $reply in ""|error*) echo "Lemonade chat with $name: ${reply:-no answer}"; ok=0 ;;
                *) echo "Lemonade chat with $name answered: $reply ($(ssh_vm 'grep -o "llamacpp[^ ]* backend[^,]*\|Using backend: [a-z]*" /tmp/lemond.log | tail -1' 2>/dev/null))" ;; esac
 # the onebit entry init.sh registered in Lemonade's registry on the stick. Lemonade hides a model
-# whose recipe has no backend for this machine (onebit: hrx, vulkan, npu, cuda), even with show_all
+# whose recipe has no backend for this machine (onebit: hrx, npu), even with show_all
 if ssh_vm "grep -q '\"$name-1bit\": {\"checkpoint\": \"/data/models/$name.gguf\", \"source\": \"local_path\", \"recipe\": \"onebit\"}' /data/lemonade/config/user_models.json" 2>/dev/null; then
     echo "Lemonade registry on the stick: user.$name-1bit (onebit) -> /data/models/$name.gguf"
 else echo "Lemonade registry on the stick: user.$name-1bit (onebit) is missing"; ok=0; fi

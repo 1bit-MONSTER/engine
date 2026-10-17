@@ -70,6 +70,31 @@
    "model_type": "hrm_text",
    "family": "HRM-Text hierarchical-reasoning LM (Sapient)",
    "watch": "report"
+  },
+  "DFlash2DraftModel": {
+   "model_type": "dflash2",
+   "family": "DFlash2 speculative drafter (speculators; selector + conv heads the pinned dflash does not run)",
+   "watch": "report"
+  },
+  "DiacritizerModel": {
+   "model_type": "tashkeel_nano",
+   "family": "tashkeel_nano Arabic diacritizer (bidirectional tagger, not a decoder)",
+   "watch": "report"
+  },
+  "MBartForConditionalGeneration": {
+   "model_type": "mbart",
+   "family": "mBART encoder-decoder seq2seq (no decoder-only route)",
+   "watch": "report"
+  },
+  "BlindForCausalLM": {
+   "model_type": "blind_decoder",
+   "family": "KenT Compressed-QK attention + gated key refinement (Vi-LAB)",
+   "watch": "report"
+  },
+  "NanochronoForCausalLM": {
+   "model_type": "sn38-nanochrono",
+   "family": "sn38-nanochrono (ChronoLLM tap/aux-gate stack)",
+   "watch": "report"
   }
  }
 }

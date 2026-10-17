@@ -30,7 +30,7 @@ unless they ask us not to.
 ## Scope
 
 - **The engine:** `1bit` and `1bit serve`, and the scripts and workflows in this repository.
-- **Our packages:** the weekly release packages (the Linux tarball, the Windows zip, 1bit OS).
+- **Our packages:** the weekly release packages (Lemonade with the onebit recipe and the engine, and 1bit OS).
 - **Out of scope here:** the pinned upstreams (llama.cpp, HRX, Lemonade, the XDNA driver and
   the others in `third_party/`). Report those to their own projects, though we want to know if a
   pin we ship is affected.

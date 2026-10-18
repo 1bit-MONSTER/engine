@@ -20,6 +20,8 @@
 
 #include <cstdio>
 #include <cstdlib>
+#include <cstring>
+#include <fcntl.h>
 #include <map>
 #include <string>
 #include <unistd.h>
@@ -37,9 +39,9 @@ static void expect(bool ok, const std::string& what) {
 
 static std::string fake_sysfs(const std::string& dir, const char* name, const char* content) {
     const std::string path = dir + "/" + name;
-    FILE* f = std::fopen(path.c_str(), "w");
-    std::fputs(content, f);
-    std::fclose(f);
+    const int fd = ::open(path.c_str(), O_WRONLY | O_CREAT | O_TRUNC, 0600);
+    if (fd < 0 || ::write(fd, content, std::strlen(content)) < 0) std::printf("FAIL writing %s\n", path.c_str());
+    if (fd >= 0) ::close(fd);
     return path;
 }
 

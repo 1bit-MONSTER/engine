@@ -39,9 +39,9 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 | Submodule | Source | Pinned to |
 |---|---|---|
 | `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
-| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), pinned on branch `1bit/e3e6a976-pin` (the commit `config/hrx-system-hold.config` names; `1bit/main` is where the unheld bump merges AMD) | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
+| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), pinned on branch `1bit/e3e6a976-pin-6` (the commit `config/hrx-system-hold.config` names; `1bit/main` is where the unheld bump merges AMD) | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
 
-- **Our hrx-system commits** (since 2026-10-18 on branch `1bit/e3e6a976-pin` of our fork, on
+- **Our hrx-system commits** (since 2026-10-18 on branch `1bit/e3e6a976-pin-6` of our fork, on
   AMD's `e3e6a9766ccb`): two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and
   `HRX_COMMAND_BUFFER_MODE` (defaults unchanged); engine#409 (libhrx bounds-checks a length-less ELF
   extent instead of skipping the check); engine#410 (`libhip_intercept` covers every HIP symbol the

@@ -107,6 +107,8 @@ add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
+# engine#315: what --hrx-cwsr-placement puts in an HRX backend's environment (app/hrx_cwsr.h); fake backend, no GPU.
+add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
@@ -132,6 +134,12 @@ add_executable(hrx_placement_test tests/hrx_placement_test.cpp)
 target_include_directories(hrx_placement_test PRIVATE app)
 target_link_libraries(hrx_placement_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME hrx_placement COMMAND hrx_placement_test)
+# engine#315 candidate 1's --hrx-cwsr-placement decision (app/hrx_cwsr.h, docs/hrx.md "CWSR
+# save-area placement"): a fake cwsr_enable file and environment in, the variables out; header
+# only, no GPU.
+add_executable(hrx_cwsr_test tests/hrx_cwsr_test.cpp)
+target_include_directories(hrx_cwsr_test PRIVATE app)
+add_test(NAME hrx_cwsr COMMAND hrx_cwsr_test)
 # --pm-router's class -> expert table and its flag values (app/pm.cpp, docs/pm.md "Routing with
 # Laya"); no GPU, no checkpoint, no Lemonade: config in, mapping out.
 add_executable(pm_routes_test tests/pm_routes_test.cpp app/pm.cpp)
@@ -156,7 +164,8 @@ endif()
 if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
     add_dependencies(onebit llama_hrx)
-    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}")
+    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
+                               ONEBIT_HRX_ALLOW_NO_SVM=${ONEBIT_HRX_ALLOW_NO_SVM})
     if(ONEBIT_SERVE_TEST_GGUF)
         foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}

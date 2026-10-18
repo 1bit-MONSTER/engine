@@ -449,6 +449,48 @@ program is rebuilt.
   change includes a regression test that varies stale masked rows and requires bit-identical
   outputs.
 
+### CWSR save-area placement (engine#315)
+
+The shipped configuration for engine#315 is amdgpu with CWSR **off** (`amdgpu.cwsr_enable=0` on the
+kernel command line and in `/etc/modprobe.d`). Nothing below changes that, and it stays the
+recommended setting until a soak on a CWSR-on boot passes.
+
+On a box that runs CWSR **on**, `1bit serve` moves each HRX queue's CWSR context save area out of
+pageable memory. By default libhsakmt allocates the save area as an SVM range. With
+`HSA_USE_SVM=0` and `HSA_USERPTR_FOR_PAGED_MEM=0` it allocates a KFD GTT buffer object instead.
+ROCr then reports no SVM, which HRX refuses unless `HRX_ALLOW_NO_SVM=1` is set; that gate is our
+hrx-system commit (`util/no_svm_gate.c`). serve adds the three variables to the environment of
+every HRX backend it starts (the chat server, the RAG servers, the Laya scorer), so they are in
+place before ROCr initialises in that process, and prints one line:
+
+```
+1bit serve: HRX: CWSR is on; CWSR save area placed in GTT (engine#315)
+```
+
+`--hrx-cwsr-placement` picks the mode:
+
+| value | what serve does |
+|---|---|
+| `auto` (default) | adds the three variables only when `/sys/module/amdgpu/parameters/cwsr_enable` reads `1` and you set none of them. With CWSR off it adds nothing and logs `HRX: CWSR is off; CWSR save-area placement unchanged (engine#315)` |
+| `on` | adds them whatever `cwsr_enable` says. A value you set yourself still wins |
+| `off` | never adds them |
+
+A build whose hrx-system has no `HRX_ALLOW_NO_SVM` gate (CMake prints
+`HRX_ALLOW_NO_SVM gate in hrx-system: 0`) adds nothing in `auto` and refuses `on`, because
+`HSA_USE_SVM=0` would leave HRX with no device. `llama-server`, `llama-bench` or other HRX tools
+you start yourself get the variables only if you set them.
+
+Measured on strixhalo (performance mode, 120 W cap), engine `fce3a68` build with the gate:
+
+- CWSR-on boot, GLM-4.7-Flash Q4_K_M at the #315 composition (4 neighbour servers, 16 GiB ballast,
+  `gtt_start` 104 GiB), one binary: 46 runs with the variables, 0 faults (42 clean in band);
+  16 runs without them, 4 faults (Fisher exact two-sided p = 0.0043). Every save area of every
+  run with the variables was a 19226624-byte GTT BO (kprobes on `kfd_queue_buffer_get`).
+  0 of 42 bounds the fault rate at 6.9 % or less (one-sided 95 %), not at zero.
+- CWSR-off boot, Qwen3-0.6B Q4_K_M, the variables against none: needle at 4732 tokens 5/5 both,
+  same output; KLD top-20 0.000000 nats; `llama-bench -p 512 -n 128`, medians of 2 rounds:
+  pp512 21373 vs 21047, tg128 336.6 vs 337.6 tok/s.
+
 ### Prefill on HRX, decode on Vulkan (removed)
 
 `--prefill-device hrx` left with the Vulkan build (RFC #213 stage 3): `1bit serve` refuses it.

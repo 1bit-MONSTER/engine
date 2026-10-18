@@ -688,3 +688,22 @@ is **clean and unchanged** (50 responses, 1 distinct content, zero fault signatu
 **CI did not pass on arrival.** It required fixing two pre-existing defects — a half-move (`95238dc` moved the
 `llama.cpp` gitlink without `registry/architectures.json`) and 46 files missing the full copyright notice —
 recorded in `docs/315-campaign/evidence/315-what-the-merge-and-the-gates-found.md`, with no gate loosened.
+
+### 2026-10-18 — candidate 1: the CWSR save area in GTT (CWSR off stays the shipped default)
+
+On a CWSR-on boot, the same binary ran the #315 composition (GLM-4.7-Flash Q4_K_M, 4 neighbour
+servers, 16 GiB ballast, `gtt_start` 104 GiB) with and without
+`HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1`. With them, every queue's CWSR save
+area is a KFD GTT BO instead of an SVM range (checked per run with kprobes): **46 runs, 0 faults**
+(42 clean in band; 4 excluded for heat or another agent's NPU job, all four OK). Without them:
+**16 runs, 4 faults**. Fisher exact two-sided p = 0.0043. 0 of 42 bounds the fault rate at 6.9 % or
+less (one-sided 95 %); it does not show zero.
+
+`1bit serve` now sets the three variables for its HRX backends when amdgpu runs with CWSR on
+(`--hrx-cwsr-placement`, default `auto`; docs/hrx.md "CWSR save-area placement"). With CWSR off it
+changes nothing.
+
+**CWSR off (`amdgpu.cwsr_enable=0`) stays the shipped default** until a soak on a CWSR-on boot with
+the engine build (not a hand-set environment) passes: at least 6 hours of GLM-4.7-Flash at the #315
+composition plus ZAYA1-8B served alongside, with 0 NaN aborts, 0 HSA faults, 0 TDRs and 0 GPU resets,
+and every save area traced as a GTT BO. This issue stays open until then.

@@ -47,7 +47,9 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   extent instead of skipping the check); engine#410 (`libhip_intercept` covers every HIP symbol the
   backend exports, init is idempotent); engine#401 (libhsa no longer opens `/dev/accel` in GPU-only
   processes); #6 (`generate_stubs.py` takes signatures from `api.h`, so `--check` is trustworthy;
-  regenerated `stubs_generated.c`); and our fix for the long-context attention miscompile
+  regenerated `stubs_generated.c`); #8 (engine#315: `HRX_ALLOW_NO_SVM=1` lets the amdgpu HAL open a ROCr
+  that reports no SVM, which `1bit serve` uses to put the CWSR save area in GTT on a CWSR-on box;
+  unset, nothing changes); and our fix for the long-context attention miscompile
   ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)): AMD's newer Loom no longer
   reaches the defect on our prompts, but its multi-unit live-out guard is still in
   `unit_liveness_builder.c`, so we keep removing it. The GFX11 wave64 lane-mask backport (#313) is

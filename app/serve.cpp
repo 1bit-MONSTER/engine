@@ -65,6 +65,7 @@
 
 #include "gguf_meta.h"
 #include "hrx_archs.h"
+#include "hrx_cwsr.h"
 #include "mem_admit.h"
 #include "pm.h"
 #include "recipes.h"
@@ -177,6 +178,7 @@ struct Options {
     bool strict_device = false;          // --strict-device: refuse to start unless every node is on HRX (engine #390)
     bool placement_report = false;       // --placement-report: ask the backend for its off-HRX op counts
     WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
+    CwsrPlacement cwsr_placement = CwsrPlacement::Auto;  // --hrx-cwsr-placement (app/hrx_cwsr.h, engine#315)
 };
 
 // HRX dlopens the HSA runtime, and a distro libhsa rejects gfx1151's
@@ -194,6 +196,23 @@ std::string hrx_libhsa(const std::string& option) {
         if (it->path().filename() == "libhsa-runtime64.so.1") return it->path().string();
     }
     return "";
+}
+
+// engine#315 candidate 1 (app/hrx_cwsr.h): the variables that put the CWSR save area in GTT, for
+// every HRX backend's environment. Decided once per serve, on the first HRX backend, with one log line.
+const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
+#if defined(ONEBIT_HRX_ALLOW_NO_SVM) && ONEBIT_HRX_ALLOW_NO_SVM
+    constexpr bool gate = true;
+#else
+    constexpr bool gate = false;
+#endif
+    static const CwsrDecision d = [&] {
+        CwsrDecision r = decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
+                                               [](const char* k) { return std::getenv(k); });
+        std::fprintf(stderr, "1bit serve: %s\n", r.log.c_str());
+        return r;
+    }();
+    return d.env;
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
@@ -876,6 +895,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (device == "hrx") {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             // engine #390 (docs/serve.md, "Off-HRX placement"): the backend's placement observer
             // prints one line per graph when GGML_HRX_REPORT is set, and refuses the graph with
             // GGML_HRX_STRICT. Both are off in the backend by default, and a value the user sets in
@@ -1026,6 +1046,7 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
         // the same ROCr the chat server gets, or the RAG server cannot open HRX0 ("invalid device: HRX0")
         if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty())
             l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+        for (const auto& e : hrx_cwsr_env(o)) l.env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
     } else
         l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
                   "-ngl", "0", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
@@ -1399,6 +1420,8 @@ int serve_child(const Options& given) {
             // the GGUF scorer, with the HSA runtime HRX needs (docs/hrx.md)
             std::vector<std::string> env;
             if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            if (!dev || !*dev || std::string(dev) == "hrx")
+                for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
                 bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
             std::fprintf(stderr, "1bit serve: laya: %s through %s%s\n", gguf.c_str(), bin.c_str(), policy_note.c_str());
@@ -2211,6 +2234,9 @@ void usage(FILE* out) {
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
                  "                  [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--hrx-libhsa PATH]\n"
+                 "                  [--hrx-cwsr-placement=auto|on|off]   engine#315: on a CWSR-on amdgpu (auto, the default)\n"
+                 "                  or always (on), HRX backends get HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0\n"
+                 "                  HRX_ALLOW_NO_SVM=1, which put the CWSR save area in GTT (docs/hrx.md)\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
@@ -2274,6 +2300,9 @@ int run_serve(int argc, char** argv) {
         else if (a == "--ds4") o.ds4 = next();
         else if (a == "--ssd-streaming") o.ssd_streaming = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
+        else if (a == "--hrx-cwsr-placement") o.cwsr_placement = parse_cwsr_placement(next());
+        else if (a.rfind("--hrx-cwsr-placement=", 0) == 0)
+            o.cwsr_placement = parse_cwsr_placement(a.substr(std::string("--hrx-cwsr-placement=").size()));
         else if (a == "--mlx-server")
             throw std::runtime_error("--mlx-server was removed with the engine's MLX route; Lemonade's own MLX backend serves Apple Silicon (docs/lemonade.md)");
         else if (a == "--prefill-device" || a == "--prefill-min-tokens" || a == "--lean" || a == "--adaptive" ||
@@ -2323,6 +2352,8 @@ int run_serve(int argc, char** argv) {
     if (o.strict_device && (o.device == "cpu" || o.device == "ds4" || o.device == "onnx" || o.device == "npu"))
         throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
+    // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
+    if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
 
     if (is_onnx_model_dir(o.model)) {
         if (o.device != "auto" && o.device != "onnx")

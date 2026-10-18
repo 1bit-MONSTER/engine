@@ -72,6 +72,19 @@ if(ONEBIT_GPU_PRIVATE)
     message(STATUS "ONEBIT_HRX: private HIP kernels from ${ONEBIT_GPU_PRIVATE}/addons/hip-hrx")
 endif()
 
+# engine#315 candidate 1 (docs/hrx.md, "CWSR save-area placement"): serve moves the CWSR save area
+# into GTT only when the hrx-system it builds has the HRX_ALLOW_NO_SVM gate; without it, ROCr's
+# HSA_USE_SVM=0 leaves HRX no device.
+set(_hrx_no_svm_gate "${CMAKE_SOURCE_DIR}/third_party/hrx-system/runtime/src/iree/hal/drivers/amdgpu/util/no_svm_gate.c")
+set(ONEBIT_HRX_ALLOW_NO_SVM 0)
+if(EXISTS "${_hrx_no_svm_gate}")
+    file(STRINGS "${_hrx_no_svm_gate}" _hrx_no_svm_hook REGEX "HRX_ALLOW_NO_SVM")
+    if(_hrx_no_svm_hook)
+        set(ONEBIT_HRX_ALLOW_NO_SVM 1)
+    endif()
+endif()
+message(STATUS "ONEBIT_HRX: HRX_ALLOW_NO_SVM gate in hrx-system: ${ONEBIT_HRX_ALLOW_NO_SVM}")
+
 set(ONEBIT_HRX_SERVER "${CMAKE_BINARY_DIR}/hrx/llama/bin/llama-server")
 ExternalProject_Add(llama_hrx
     SOURCE_DIR ${CMAKE_SOURCE_DIR}/third_party/llama.cpp

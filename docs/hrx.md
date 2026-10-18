@@ -46,13 +46,14 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   `HRX_COMMAND_BUFFER_MODE` (defaults unchanged); engine#409 (libhrx bounds-checks a length-less ELF
   extent instead of skipping the check); engine#410 (`libhip_intercept` covers every HIP symbol the
   backend exports, init is idempotent); engine#401 (libhsa no longer opens `/dev/accel` in GPU-only
-  processes); and our fix for the long-context attention miscompile
+  processes); #6 (`generate_stubs.py` takes signatures from `api.h`, so `--check` is trustworthy;
+  regenerated `stubs_generated.c`); and our fix for the long-context attention miscompile
   ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)): AMD's newer Loom no longer
   reaches the defect on our prompts, but its multi-unit live-out guard is still in
   `unit_liveness_builder.c`, so we keep removing it. The GFX11 wave64 lane-mask backport (#313) is
   no longer ours: AMD carries its own (`planning/mask_write_wait`). The pin itself is a `-s ours`
-  merge of the previous pin `3319e536`, so every commit the engine shipped stays reachable; its tree
-  is the tested commit `fc2213a1c`. Rebase these by hand when AMD's pair moves.
+  merge of the previous pin `3319e536` (so every commit the engine shipped stays reachable, with the
+  tree of the tested commit `fc2213a1c`) followed by #6. Rebase these by hand when AMD's pair moves.
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.

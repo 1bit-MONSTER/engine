@@ -37,7 +37,9 @@
 #
 # The hold (engine#388): the owner keeps the engine on our HRX line (2026-10-10). AMD's
 # hrx-system after 98d05d94 miscompiles long-context attention (ROCm/hrx-system#1535), so
-# hrx-system stays at 98d05d94. Before the hold existed, every scheduled run from 2026-10-09
+# hrx-system stayed at 98d05d94 until 2026-10-18, when the engine moved by hand to e3e6a9766ccb
+# plus our commits and our #1535 fix (config/hrx-system-hold.config names that pin now; moves
+# stay manual). Before the hold existed, every scheduled run from 2026-10-09
 # failed at the mirror step instead of reporting it.
 # A failed run now files an issue, so it cannot break silently for another five days.
 # GitHub-hosted CI builds that PR without HRX; run tests/serve_e2e.sh on

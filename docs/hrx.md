@@ -39,14 +39,21 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 | Submodule | Source | Pinned to |
 |---|---|---|
 | `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
-| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), branch `1bit/main` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
+| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), pinned on branch `1bit/e3e6a976-pin-6` (the commit `config/hrx-system-hold.config` names; `1bit/main` is where the unheld bump merges AMD) | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
 
-- **Our hrx-system commits** (branch `1bit/main` of our fork, on AMD's pin `51b1739`): a Loom
-  backport that drains ALU dependencies after a lane-mask SGPR pair is overwritten on GFX11 wave64
-  (the #313 NaN: the prompt FA kernel compiled for a 190-row ubatch read V from a wrong address in
-  about 1% of runs; upstream fixed the class in `ee77c8f7f`/`336037562`, which cannot be pinned yet),
-  and two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and `HRX_COMMAND_BUFFER_MODE`
-  (defaults unchanged). Rebase them by hand when AMD's pair moves.
+- **Our hrx-system commits** (since 2026-10-18 on branch `1bit/e3e6a976-pin-6` of our fork, on
+  AMD's `e3e6a9766ccb`): two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and
+  `HRX_COMMAND_BUFFER_MODE` (defaults unchanged); engine#409 (libhrx bounds-checks a length-less ELF
+  extent instead of skipping the check); engine#410 (`libhip_intercept` covers every HIP symbol the
+  backend exports, init is idempotent); engine#401 (libhsa no longer opens `/dev/accel` in GPU-only
+  processes); #6 (`generate_stubs.py` takes signatures from `api.h`, so `--check` is trustworthy;
+  regenerated `stubs_generated.c`); and our fix for the long-context attention miscompile
+  ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)): AMD's newer Loom no longer
+  reaches the defect on our prompts, but its multi-unit live-out guard is still in
+  `unit_liveness_builder.c`, so we keep removing it. The GFX11 wave64 lane-mask backport (#313) is
+  no longer ours: AMD carries its own (`planning/mask_write_wait`). The pin itself is a `-s ours`
+  merge of the previous pin `3319e536` (so every commit the engine shipped stays reachable, with the
+  tree of the tested commit `fc2213a1c`) followed by #6. Rebase these by hand when AMD's pair moves.
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.
@@ -67,18 +74,20 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   (`ggml/src/ggml-hrx`, `ggml/include/ggml-hrx.h`, `tests/*hrx*`), because AMD's ggml-hrx is
   written against AMD's hrx-system. Those changes land as an ordinary commit, not a merge, so
   AMD's HRX changes still arrive in full once the hold is lifted. It reports the hold in the run
-  summary and succeeds. Since 2026-10-10 hrx-system is held at `98d05d94`: the engine stays on
-  our HRX line while AMD's newer hrx-system miscompiles long-context attention
-  ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)).
-- **The backport line (2026-10-16).** The hold now names `1bit/held-98d05d94-3fixes`, a branch off
+  summary and succeeds. From 2026-10-10 hrx-system was held at `98d05d94` while AMD's newer
+  hrx-system miscompiled long-context attention
+  ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)). On 2026-10-18 the
+  engine moved by hand to AMD's `e3e6a9766ccb` with our commits and our #1535 fix (above), after
+  test-backend-ops 1141/1141, the long-prompt needles, KLD 0 against the old pin on two models and
+  the hardware gate; the hold now names that pin, so later AMD hrx-system moves stay manual too.
+- **The backport line (2026-10-16, superseded 2026-10-18).** The hold named `1bit/held-98d05d94-3fixes`, a branch off
   that same held commit carrying three fixes that have nothing to do with the AMD-core move:
   engine#409 (libhrx bounds-checks a length-less ELF extent instead of skipping the check),
   engine#410 (`libhip_intercept` covers every HIP symbol the backend exports; the documented
   interceptor variable works and init is idempotent) and engine#401 (libhsa no longer opens
   `/dev/accel` in GPU-only processes), plus the +61/−0 `api.h` forward-port the regenerated
   passthrough stubs need. Nothing under the held AMD core changes, so the #1535 question is
-  untouched. When those fixes are rebased onto `1bit/main` — or the hold is lifted — this line
-  is dropped; until then it is what lets three small fixes ship without a 1688-commit core jump.
+  untouched. Those fixes are now replayed on the e3e6a976 line above, and this branch is history.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.

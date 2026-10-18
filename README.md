@@ -59,7 +59,11 @@ The engine has no standalone package of its own.
 > Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
 > suite on HRX. Following a review,[^geramyl] the engine no longer
-> vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx
+> vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx,
+> pinned since 2026-10-18 to AMD's `e3e6a976` hrx-system line with llama.cpp `8d9ce2c1a` (our four fixes
+> replayed plus our long-context live-out fix for ROCm/hrx-system#1535; against the old pins on Strix Halo:
+> test-backend-ops 1141/1141, long-prompt needles 20/20 + 5/5 + 5/5, KLD 0 and identical output on two
+> models, pp512 +4.4% / +7.8%, tg128 +2.5% / +2.8%)
 > ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), the NPU engine on full ELFs and on our own
 > NPU runtime, XRT-free ([docs/npu.md](docs/npu.md); its layer kernel and lm-head now decode from
 > source, ELF to ELF, with no xclbin at any point, verified on Qwen3-0.6B/1.7B/4B against an fp64
@@ -72,17 +76,22 @@ The engine has no standalone package of its own.
 > 16.3-16.5 tok/s decode ([docs/npu.md](docs/npu.md#private-routes)). GGUFs of six architectures
 > (Qwen2.5, Qwen3 MoE, Qwen3.6-35B-A3B, MiniCPM4/5, GLM-4.7-Flash) also answer on the NPU through
 > `1bit serve --device npu`: correct, not yet fast (0.006-0.17 tok/s;
-> [docs/npu.md](docs/npu.md#from-a-gguf)). DwarfStar reads 1BP packages from our fork
+> [docs/npu.md](docs/npu.md#from-a-gguf)). DwarfStar reads 1BP packages from our fork, pinned since
+> 2026-10-17 to `5b013dc1bb75` (1BP v5: reader, converter, checker); checked on hardware at that pin,
+> DeepSeek V4 Flash Q2 gives identical answers and token counts from its GGUF and from its 1BP package,
+> and `1bit serve -m <model>.1bp` routes a package to ds4 by itself
 > ([docs/dwarfstar.md](docs/dwarfstar.md)). Step 4, the Laya router, has landed as an opt-in:
 > `1bit serve --laya` classifies each conversation (code, prose, short, long document; 95.5% on
 > 200 labelled requests) and a measured policy picks the device; the scorer runs on HRX at
 > 15-16 ms a decision ([docs/laya.md](docs/laya.md)). ZAYA1-8B is the engine's Project Manager:
 > `1bit serve --pm` (Lemonade entry `ZAYA1-8B-PM-1bit`) answers general chat itself and delegates
-> code, long reasoning and agentic tasks to expert models Lemonade loads beside it
-> ([docs/pm.md](docs/pm.md)). Step 5, the model registry, has landed: of 334,413
-> HF text-generation models with an architecture, 94.71% are mapped to a backend and 64.2%
-> have an architecture checked end to end on Strix Halo; a daily census keeps the counts
-> current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,
+> code, long reasoning and agentic tasks to expert models Lemonade loads beside it; `--pm-router laya`
+> has the engine's Laya router pick the expert before the PM's first round, and `--pm-spawn-url` adds a
+> `spawn_worker` tool that asks a local executor for a long-running agent worker instead of a single
+> expert answer ([docs/pm.md](docs/pm.md)). Step 5, the model registry, has landed: of 338,650
+> HF text-generation models with an architecture (the 2026-10-17 census), 94.62% are mapped to a
+> backend and 63.9% have an architecture checked end to end on Strix Halo; a daily census keeps the
+> counts current ([docs/registry.md](docs/registry.md)). The working engine is being ported from 1bit-MONSTER,
 > our private development repository; see [docs/PORTING.md](docs/PORTING.md).
 > Measured results are on the [wiki](https://github.com/1bit-MONSTER/engine/wiki). This repository
 > holds the verified code without the development history.

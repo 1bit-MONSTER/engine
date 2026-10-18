@@ -88,6 +88,17 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   `/dev/accel` in GPU-only processes), plus the +61/−0 `api.h` forward-port the regenerated
   passthrough stubs need. Nothing under the held AMD core changes, so the #1535 question is
   untouched. Those fixes are now replayed on the e3e6a976 line above, and this branch is history.
+- **What guards a pair that no longer compiles.** AMD removes public LoomC symbols without notice
+  (2026-10-07: Loom `32d0c76a` dropped `loomc_amdgpu_runtime_global_flags_t` and
+  `loomc_amdgpu_emit_options_t`, which our `ggml/src/ggml-hrx/loom-jit.cpp` used), and CI builds
+  without HRX, so #353, #357 and #361 once merged a pair that did not compile with `ONEBIT_HRX=ON`
+  and #359 / #363 had to pin hrx-system back by hand. `bump-hrx.yml` now holds hrx-system itself when
+  any `loomc_*` / `LOOMC_*` identifier our backend uses is missing from the new revision's
+  `loom/binding/c/include`, and moves llama.cpp only. The hand move of 2026-10-18 (#441) was validated
+  the same way at the pinned pair: `onebit`, `llama_hrx`, `test-backend-ops`, `llama-server`,
+  `llama-bench`, `llama-perplexity`, `libamdhip64` and `libhip_intercept` all build and
+  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` still
+  fails to build on either pin (#422), so that check is not covered yet.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
@@ -394,6 +405,17 @@ program is rebuilt.
 
   (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
   `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
+- **The ZAYA1-8B NaN abort does not reproduce (engine#433).** Three aborts were reported on 2026-10-16
+  on the then-current pin (`06cc0ef` with llama.cpp `dd74f6bb0`) with a second HRX process on the GPU:
+  the sampler guard logged "HRX returned NaN logits" and the server stopped. Re-running that condition
+  on the current line gave **no abort in 60 fresh loads** — 20 loads alone, 20 with a resident
+  Qwen3-0.6B process on the GPU, and 20 with that second process on the older pin `1a5dcba2` — with
+  four slots, unified KV, `--ctx-size 16384` and the game's tool-templated request asserted on every
+  load, and 0 NaN lines. The report's 458-token prompt also cannot have carried a tool block: this
+  model's own chat template gives 257 tokens with no tools, 629 with one, 726 with two and 851 with
+  the four tools the game sends, so a 458-token request either had no tools or came from a different
+  template. The guard itself is unchanged: NaN still aborts unless `GGML_HRX_NAN_CONTINUE` is set, and
+  the current line logs `count`, `index range` and `contiguous` with it.
 - **GLM-4.7-Flash MLA decode accuracy (engine#310).** The reported 11.79-vs-10.60
   perplexity gap is not reproducible on the current pin (`f2099e9b7`), which includes the MLA
   strided-V fix ([llama.cpp #70](https://github.com/1bit-MONSTER/llama.cpp/pull/70)) and the

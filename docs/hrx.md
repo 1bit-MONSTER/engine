@@ -88,6 +88,17 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   `/dev/accel` in GPU-only processes), plus the +61/−0 `api.h` forward-port the regenerated
   passthrough stubs need. Nothing under the held AMD core changes, so the #1535 question is
   untouched. Those fixes are now replayed on the e3e6a976 line above, and this branch is history.
+- **What guards a pair that no longer compiles.** AMD removes public LoomC symbols without notice
+  (2026-10-07: Loom `32d0c76a` dropped `loomc_amdgpu_runtime_global_flags_t` and
+  `loomc_amdgpu_emit_options_t`, which our `ggml/src/ggml-hrx/loom-jit.cpp` used), and CI builds
+  without HRX, so #353, #357 and #361 once merged a pair that did not compile with `ONEBIT_HRX=ON`
+  and #359 / #363 had to pin hrx-system back by hand. `bump-hrx.yml` now holds hrx-system itself when
+  any `loomc_*` / `LOOMC_*` identifier our backend uses is missing from the new revision's
+  `loom/binding/c/include`, and moves llama.cpp only. The hand move of 2026-10-18 (#441) was validated
+  the same way at the pinned pair: `onebit`, `llama_hrx`, `test-backend-ops`, `llama-server`,
+  `llama-bench`, `llama-perplexity`, `libamdhip64` and `libhip_intercept` all build and
+  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` still
+  fails to build on either pin (#422), so that check is not covered yet.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.

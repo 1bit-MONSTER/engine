@@ -130,14 +130,10 @@ jobs:
       # headers of hrx-system. AMD removes public LoomC symbols without notice (2026-10-07: loom 32d0c76a
       # dropped loomc_amdgpu_runtime_global_flags_t and loomc_amdgpu_emit_options_t, used by our
       # loom-jit.cpp). CI here builds without HRX, so #353, #357 and #361 merged a pair that did not
-      # compile with ONEBIT_HRX=ON, and #359 / #363 had to pin hrx-system back by hand. This step is
-      # the guard for that trap: every loomc_* / LOOMC_* identifier our backend uses must still be
+      # compile with ONEBIT_HRX=ON, and #359 / #363 had to pin hrx-system back by hand (KNOWN-ISSUES.md).
+      # Cheap header-level check: every loomc_* / LOOMC_* identifier our backend uses must still be
       # declared under loom/binding/c/include at the new hrx-system revision. If one is missing, the PR
-      # moves llama.cpp only and keeps hrx-system where it is, and says so. The hand move in #441
-      # (2026-10-18) was validated the same way at the pinned pair: onebit, llama_hrx, test-backend-ops,
-      # llama-server, llama-bench, llama-perplexity, libamdhip64 and libhip_intercept all build, and
-      # `generate_stubs.py --check` passes against the built libamdhip64.so. `hrx-backend-test` still
-      # fails to build on either pin (#422), so that check does not cover it yet.
+      # moves llama.cpp only and keeps hrx-system where it is, and says so.
       - name: Hold hrx-system if our ggml-hrx uses LoomC symbols the new revision dropped
         id: compat
         if: steps.pins.outputs.changed == 'true'

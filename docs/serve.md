@@ -242,6 +242,36 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 | `--mtp` | HRX0 (it drafts slower there than Vulkan did: its verify batches of 2-4 tokens are the open item, docs/hrx.md) |
 | an H32 file (a Hadamard-rotated Q4_0 stamped `onebit.hadamard_q4_0`) | refused on every device: the format is dropped; use the model's UD-Q4_K_XL or another standard GGUF. PrismML's own rotation (`prism.hadamard`, Ternary Bonsai) is a different thing and still runs on HRX ([hrx.md](hrx.md#ternary-bonsai-prismmls-hadamard-folded-ggufs)) |
 
+### Off-HRX placement: `--placement-report`, `--strict-device`
+
+Engine #390. HRX can leave part of a graph on the CPU - an op its kernels do not serve, a
+`GET_ROWS` outside the supported range - and the model still answers, slower, with nothing said
+so. The scheduler is the one place that knows the backend of every node, so ggml-hrx reports it
+there (`GGML_HRX_REPORT`, llama.cpp fork #102). serve reads that line and prints its own at load:
+
+```
+placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4), 7 graph splits
+1bit serve: HRX placement: 34 of 512 nodes off HRX (GET_ROWS x 4, MUL_MAT x 30), 7 graph splits
+```
+
+A graph that is all on HRX prints `1bit serve: HRX placement: all 512 nodes on HRX, 1 graph
+splits`. The same numbers are `onebit_cpu_fallback_ops{op}` in [Metrics](#metrics) (`op="all"` is
+the total).
+
+llama-server drops the library's INFO lines below `-lv 4` (an INFO line is a trace line there,
+`common/log.cpp`), so at its default verbosity the report never reaches serve. `--placement-report`
+passes `-lv 4` to the backend for that load, which prints the report along with the rest of
+llama.cpp's INFO lines.
+
+`--strict-device` refuses to start instead of running part of the graph on the CPU: serve sets
+`GGML_HRX_STRICT=1`, the backend aborts at load on the first node off HRX with its name, op, type
+and shape, and serve exits non-zero. It needs `--device hrx` or `auto`. If a report does arrive
+anyway and names off-HRX nodes, serve refuses with the same numbers.
+
+Both flags only set what the backend already reads, and a `GGML_HRX_REPORT` or `GGML_HRX_STRICT`
+in the environment wins over what serve passes (0 turns either off). `tests/hrx_placement_test.cpp`
+(ctest `hrx_placement`, CI included) covers the line, the summary and the refusal with no GPU.
+
 ### Removed devices and flags
 
 On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU, zero Vulkan, zero ROCm; the core strip,

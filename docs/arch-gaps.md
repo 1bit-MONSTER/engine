@@ -493,6 +493,38 @@ computation, so a plain decoder stack would be silent substitution. Reviewed 202
 **not an alias**. Its `registry/significant.json` entry carries `"watch": "report"`; remove
 that field (and record `mapped_ok`) if a backend implements the class.
 
+### `muse_spark` - `Interchained/Muse-Spark-Open-816B-A42B-GGUF`
+
+Architecture class `MuseSparkForConditionalGeneration`, `model_type: muse_spark`: Meta's
+Muse Spark Open (`meta-models/Muse-Spark-Open-816B-A42B`, created 2026-09-15, gated by
+manual approval), a 62-layer text model with vision and audio towers. The flagged upload is
+a GGUF conversion (F16, Q4_0, Q4_K_M, Q5_K_M) whose header (read 2026-10-17 by range request)
+declares `general.architecture = muse-spark`: 256 experts, 8 used, `moe_latent_size: 4096`
+(experts run in a 4096-wide latent, like Nemotron 3 Super's `ffn_latent_down`/`ffn_latent_up`),
+`expert_gating_func: 2`, hidden 8192, 128 heads / 16 kv, head_dim 64, sliding window 2048 with
+one full-attention layer in four (`sliding_window_pattern`), `final_logit_softcapping: 20.0`,
+`logit_scale` 0.177, context 1,048,576, `gpt-4o` pre-tokenizer.
+
+**Why an alias is wrong**: the latent-space experts, the per-layer rope schedule
+(`layer_rope_theta` 0 on the full-attention layers) and the softcapped logits change the
+computation; no supported family has that combination, so mapping it to a Llama 4 or
+Nemotron-H shape would be silent substitution.
+
+**Why it is not mapped**: the pinned `third_party/llama.cpp` 1a5dcba2 has no `muse-spark`
+architecture (it has the `moe_latent_size` key and the latent tensors only for Nemotron 3
+Super). Upstream `ggml-org/llama.cpp` added it on 2026-10-15 in ba3c05f71 ("model: add Muse
+Spark Open (text, vision and audio)", #30616: `LLM_ARCH_MUSE_SPARK`, `src/models/muse-spark.cpp`,
+`conversion/muse_spark.py`), after the fork's last upstream sync, so a later fork sync that
+reaches it maps the class automatically - at that point `tools/registry_build.py --check-gaps`
+fails until this entry records why (`mapped_ok`).
+
+**Not a one-off, but not servable here.** The HF `muse_spark` tag lists 23 models (Meta's
+base and NVFP4, unsloth, mlx-community, intel-ai INT4, amd Quark-MXFP4). Even its smallest
+GGUF (Q4_K_M, ~500 GB) is about four times the 128 GB Strix Halo, so the gap costs nothing on
+the target box today. Reviewed 2026-10-17: **not an alias**. Its `registry/significant.json`
+entry carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and
+does not alert; remove that field (and record `mapped_ok`) when the pin gains `muse-spark`.
+
 ## Unverifiable: gated configs
 
 `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on

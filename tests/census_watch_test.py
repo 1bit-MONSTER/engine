@@ -293,6 +293,8 @@ for cls, mid in (
     ("MBartForConditionalGeneration", "nhatho1999/orthomni-codeco"),
     ("BlindForCausalLM", "Vi-LAB/KenT_0.5B_Base"),
     ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
+    # issue #437 (2026-10-17): upstream-only architecture, after the pin.
+    ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
 ):
     check(f"{cls} is reviewed report-only and documented",
           sig.get(cls, {}).get("watch") == "report" and cls not in archs and cls in gap_docs)

@@ -95,6 +95,11 @@
    "model_type": "sn38-nanochrono",
    "family": "sn38-nanochrono (ChronoLLM tap/aux-gate stack)",
    "watch": "report"
+  },
+  "MuseSparkForConditionalGeneration": {
+   "model_type": "muse_spark",
+   "family": "Meta Muse Spark Open (816B-A42B latent-MoE, vision + audio; upstream llama.cpp ba3c05f71, after the pin)",
+   "watch": "report"
   }
  }
 }

@@ -57,6 +57,11 @@ struct BackendLogFacts {
     // reaches serve only as a WARN (or above).
     std::optional<long> cpu_fallback_total;
     std::map<std::string, long> cpu_fallback_ops;
+    // The same report names the graph's node count and split count (engine #390):
+    // "placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30), 7 graph splits".
+    std::optional<long> placement_nodes;
+    std::optional<long> placement_splits;
+    size_t              placement_lines = 0;   // placement reports seen; serve prints the first
 
     void feed(const std::string& line) {
         // every backend line passes here: plain substring tests first, a regex only on a hit
@@ -79,12 +84,27 @@ struct BackendLogFacts {
             sum += std::stol((*it)[2]);
         }
         std::smatch m;
+        // "34 off HRX": the placement report states its own count, so the first number after the
+        // phrase (which may be the split count) is not it.
+        static const std::regex off_count(R"((\d+) off HRX\b)");
+        const bool stated = std::regex_search(line, m, off_count);
+        const long stated_off = stated ? std::stol(m[1]) : 0;
         if (!ops.empty()) {
             cpu_fallback_ops = ops;
             cpu_fallback_total = sum;
-        } else if (std::regex_search(rest, m, number)) {
-            cpu_fallback_total = std::stol(m[1]);
+        } else if (!stated && std::regex_search(rest, m, number)) {
+            cpu_fallback_total = std::stol(m[1]);   // a total alone, with no per-op counts
         }
+        if (stated) {
+            cpu_fallback_total = stated_off;
+            cpu_fallback_ops = ops;   // empty for a clean graph ("none")
+            ++placement_lines;
+        }
+        // the graph's size and its split count, when the line names them (engine #390)
+        static const std::regex nodes_count(R"((\d+) nodes\b)");
+        static const std::regex splits_count(R"((\d+) graph splits\b)");
+        if (std::regex_search(line, m, nodes_count)) placement_nodes = std::stol(m[1]);
+        if (std::regex_search(line, m, splits_count)) placement_splits = std::stol(m[1]);
     }
 
 private:
@@ -97,6 +117,30 @@ private:
         return std::string::npos;
     }
 };
+
+// engine #390's line for `1bit serve` at load, and what --strict-device prints instead. Both read
+// what the backend's placement report said; an unstated count shows as "?".
+inline std::string off_ops_detail(const BackendLogFacts& f) {
+    std::string ops;
+    for (const auto& [op, n] : f.cpu_fallback_ops) ops += (ops.empty() ? "" : ", ") + op + " x " + std::to_string(n);
+    return ops.empty() ? "none" : ops;
+}
+
+inline std::string placement_summary(const BackendLogFacts& f) {
+    const std::string nodes  = f.placement_nodes ? std::to_string(*f.placement_nodes) : "?";
+    const std::string splits = f.placement_splits ? std::to_string(*f.placement_splits) : "?";
+    const long        off    = f.cpu_fallback_total.value_or(0);
+    if (off == 0) return "all " + nodes + " nodes on HRX, " + splits + " graph splits";
+    return std::to_string(off) + " of " + nodes + " nodes off HRX (" + off_ops_detail(f) + "), " + splits +
+           " graph splits";
+}
+
+inline std::string placement_refusal(const BackendLogFacts& f) {
+    const std::string nodes  = f.placement_nodes ? std::to_string(*f.placement_nodes) : "?";
+    const std::string splits = f.placement_splits ? std::to_string(*f.placement_splits) : "?";
+    return "--strict-device: " + std::to_string(f.cpu_fallback_total.value_or(0)) + " of " + nodes +
+           " nodes would run off HRX (" + off_ops_detail(f) + "), " + splits + " graph splits: refusing to start";
+}
 
 // Counts that outlive one serve process: Lemonade restarts a backend by starting `1bit serve`
 // again, so starts, watchdog kills and backend exits are kept per model id in
@@ -161,6 +205,13 @@ public:
     void backend_line(const std::string& line) {
         std::lock_guard<std::mutex> l(mu_);
         log_.feed(line);
+    }
+
+    // engine #390: the backend's load-time placement report, once a line named it
+    std::optional<BackendLogFacts> placement() const {
+        std::lock_guard<std::mutex> l(mu_);
+        if (log_.placement_lines == 0) return std::nullopt;
+        return log_;
     }
 
     // Prometheus text format 0.0.4

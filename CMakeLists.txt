@@ -125,6 +125,13 @@ add_test(NAME gguf_meta COMMAND gguf_meta_test)
 add_executable(mem_admit_test tests/mem_admit_test.cpp)
 target_include_directories(mem_admit_test PRIVATE app)
 add_test(NAME mem_admit COMMAND mem_admit_test)
+# engine #390's load-time placement report and --strict-device (app/serve_metrics.h, docs/serve.md
+# "Off-HRX placement"): the backend's placement line in, serve's line and the refusal out; header
+# only, no GPU, no backend.
+add_executable(hrx_placement_test tests/hrx_placement_test.cpp)
+target_include_directories(hrx_placement_test PRIVATE app)
+target_link_libraries(hrx_placement_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME hrx_placement COMMAND hrx_placement_test)
 # --pm-router's class -> expert table and its flag values (app/pm.cpp, docs/pm.md "Routing with
 # Laya"); no GPU, no checkpoint, no Lemonade: config in, mapping out.
 add_executable(pm_routes_test tests/pm_routes_test.cpp app/pm.cpp)

@@ -174,6 +174,8 @@ struct Options {
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
     bool mem_check = true;               // --no-mem-check (or ONEBIT_MEM_CHECK=0): skip the admission check
     bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
+    bool strict_device = false;          // --strict-device: refuse to start unless every node is on HRX (engine #390)
+    bool placement_report = false;       // --placement-report: ask the backend for its off-HRX op counts
     WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
 };
 
@@ -874,6 +876,15 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (device == "hrx") {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            // engine #390 (docs/serve.md, "Off-HRX placement"): the backend's placement observer
+            // prints one line per graph when GGML_HRX_REPORT is set, and refuses the graph with
+            // GGML_HRX_STRICT. Both are off in the backend by default, and a value the user sets in
+            // the environment wins (Child keeps it).
+            env.push_back("GGML_HRX_REPORT=1");
+            if (o.strict_device) env.push_back("GGML_HRX_STRICT=1");
+            // llama-server drops the library's INFO lines below verbosity 4 (common/log.cpp maps
+            // GGML_LOG_LEVEL_INFO to its trace level), so the report reaches serve only when asked.
+            if (o.placement_report) argv.insert(argv.end(), {"-lv", "4"});
         }
         // tools/ternary_to_q4_0.py stamped it: HRX0 reads its decode projections at 2.125 bits per weight
         // instead of 4.5 (llama.cpp #54; the upload checks every block and refuses a non-ternary one).
@@ -1532,10 +1543,18 @@ int serve_child(const Options& given) {
         }
     }
     std::atomic<bool> ready{false};
+    std::atomic<bool> placement_printed{false};
     ProgressWatch watch(o.watchdog);
     ServeMetrics metrics(device);   // GET /metrics (app/serve_metrics.h)
     Lifecycle lifecycle(id);
-    auto backend_line = [&metrics](const std::string& line) { metrics.backend_line(line); };
+    auto backend_line = [&metrics, &placement_printed](const std::string& line) {
+        metrics.backend_line(line);
+        if (placement_printed.load()) return;
+        const auto report = metrics.placement();
+        // engine #390: the backend's placement report becomes serve's own line at load.
+        if (report && !placement_printed.exchange(true))
+            std::fprintf(stderr, "1bit serve: HRX placement: %s\n", placement_summary(*report).c_str());
+    };
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
 
@@ -1823,9 +1842,34 @@ int serve_child(const Options& given) {
     for (size_t i = 0; i < children.size(); i++) {
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
-            std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
+            if (o.strict_device)
+                std::fprintf(stderr, "1bit serve: --strict-device: a backend refused the graph "
+                                     "(GGML_HRX_STRICT=1); its own line above names the node\n");
+            else
+                std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
         }
+    }
+    // engine #390: --strict-device. GGML_HRX_STRICT=1 makes the backend abort at load on the first
+    // node off HRX, so a backend that reached ready while its report names off-HRX nodes ignored it.
+    if (o.strict_device || o.placement_report) {
+        const bool hrx_run = std::any_of(backends.begin(), backends.end(),
+                                         [](const Launch& b) { return b.device == "hrx"; });
+        const auto report = metrics.placement();
+        if (o.strict_device && report && report->cpu_fallback_total.value_or(0) > 0) {
+            std::fprintf(stderr, "1bit serve: %s\n", placement_refusal(*report).c_str());
+            return 1;
+        }
+        if (!hrx_run)
+            // --device auto that landed on the CPU, an NPU directory, ds4: no HRX backend, so no
+            // placement report and nothing for either flag to check.
+            std::fprintf(stderr, "1bit serve: %s: no HRX backend in this run, nothing to check\n",
+                         o.strict_device ? "--strict-device" : "--placement-report");
+        else if (!report)
+            std::fprintf(stderr, "1bit serve: HRX placement: the backend printed no placement line "
+                                 "(GGML_HRX_REPORT=1 was passed to it%s)\n",
+                         o.placement_report ? " with -lv 4" : "; llama-server needs -lv 4 for it, which "
+                                                                  "--placement-report passes");
     }
     ready = true;
     lifecycle.count_start();
@@ -2196,6 +2240,10 @@ void usage(FILE* out) {
                  "                  for SECS (default 120, or $ONEBIT_WATCHDOG_SECS; 0 = off), plus prompt tokens / N\n"
                  "                  (default 50) before its first byte, kills the backend and exits non-zero so Lemonade\n"
                  "                  reloads it (docs/serve.md)\n"
+                 "                  [--placement-report]   one line at load: the op types HRX placed on the CPU, their\n"
+                 "                  counts and the graph split count (passes -lv 4 to llama-server; engine #390)\n"
+                 "                  [--strict-device]   refuse to start unless the whole graph is on HRX (needs\n"
+                 "                  --device hrx or auto; engine #390)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           or a .gguf file\n");
@@ -2261,6 +2309,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--pm-spawn-url") o.pm_spawn_url = next();
         else if (a == "--no-mem-check") o.mem_check = false;
         else if (a == "--mem-check") o.mem_check_only = true;
+        else if (a == "--strict-device") o.strict_device = true;
+        else if (a == "--placement-report") o.placement_report = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
         else if (a == "--watchdog-prompt-tps") o.watchdog.prompt_tps = std::stod(next());
         else if (a == "--lemonade-url") o.lemonade_url = next();
@@ -2270,6 +2320,8 @@ int run_serve(int argc, char** argv) {
     if (o.model.empty()) { usage(stderr); return 2; }
     if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)
         throw std::runtime_error("--watchdog and --watchdog-prompt-tps take a number >= 0 (0 turns it off)");
+    if (o.strict_device && (o.device == "cpu" || o.device == "ds4" || o.device == "onnx" || o.device == "npu"))
+        throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
 
     if (is_onnx_model_dir(o.model)) {

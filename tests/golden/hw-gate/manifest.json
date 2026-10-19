@@ -16,8 +16,8 @@
     "size": 396705472
    },
    "recorded_at": {
-    "hrx-system": "98d05d94a9f9e405683f8aeafc037f5ace0abe4a",
-    "llama.cpp": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8d9ce2c1aa60ed6b2334df3576e203e40c533a9c"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -39,8 +39,8 @@
     "size": 17559178144
    },
    "recorded_at": {
-    "hrx-system": "98d05d94a9f9e405683f8aeafc037f5ace0abe4a",
-    "llama.cpp": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8d9ce2c1aa60ed6b2334df3576e203e40c533a9c"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -62,8 +62,8 @@
     "size": 5567582048
    },
    "recorded_at": {
-    "hrx-system": "98d05d94a9f9e405683f8aeafc037f5ace0abe4a",
-    "llama.cpp": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8d9ce2c1aa60ed6b2334df3576e203e40c533a9c"
    },
    "text": {
     "file": "wiki.test.raw",

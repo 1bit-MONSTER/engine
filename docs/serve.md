@@ -276,6 +276,38 @@ What serve did on the request path is the backend's own on this route:
   recipe option when `auto_evict` is on. A reload starts a new llama-server, whose program cache
   starts cold.
 
+Measured on Strix Halo, 2026-10-20 (performance mode), with `tools/onehop_bench.py`: Lemonade fork
+`23972095` (lemond), engine `1e9de48` (`1bit`), the llama-server of package `1bit-hrx-3092596`
+(llama.cpp `00f2a68de`, sha256 `5c3669cdf3c4104e...`) for both arms,
+Qwen3-4B-Instruct-2507 Q4_K_M (`unsloth/Qwen3-4B-Instruct-2507-GGUF`, sha256 `3605803b982cb64a...`)
+on `hrx`, ctx 8192, with `HSA_USERPTR_FOR_PAGED_MEM=0` as the services run. Six rounds per arm
+(three for `/tokenize`, 200 requests each), alternating arms; each cell is the range of the rounds'
+medians. Every request opens a new connection, as Lemonade's client does.
+
+```sh
+tools/onehop_bench.py --arm two --out out --lemond lemond --onebit build/1bit --llama-server <llama-server>
+tools/onehop_bench.py --arm one --out out --lemond lemond --onebit build/1bit --llama-server <llama-server>
+```
+
+| | two hops (`LEMONADE_ONEBIT_ONE_HOP=0`) | one hop | llama-server direct |
+|---|---|---|---|
+| processes for the model | 1bit serve + llama-server | llama-server | |
+| load, `/api/v1/load` to ready | 1.62 s (2.33 s on the first, cold page cache) | 1.35-1.56 s | |
+| `/tokenize` (no GPU work: the hops alone) | 0.53-0.64 ms | 0.36-0.39 ms | 0.11-0.15 ms |
+| 1-token chat | 19.9-21.5 ms | 19.3-21.0 ms | 17.5-19.4 ms |
+| time to first token, repeated prompt (prompt cache hit) | 19.9-21.1 ms | 19.3-21.4 ms | |
+| time to first token, fresh 333-word prompt, seen length | 116.7-125.3 ms | 115.1-119.8 ms | |
+
+The serve hop cost about 0.2 ms a request, under the run-to-run noise of a GPU request: one hop
+removes a process and a quarter second of load, not latency anyone sees. The time to first token
+is the GPU's.
+
+Reload, one hop (three rounds): a prompt length the server had seen answered its first token in
+105.6-118.5 ms after Lemonade was asked to load the model again (pinned) and loaded a second model
+(Qwen3-0.6B Q4_0) beside it: the same llama-server, its program cache warm. After an unload and a
+load, a new llama-server answered the same length in 227.5-235.7 ms, then about 150 ms and 120 ms
+as its program cache filled.
+
 `tests/print_backend.sh` (ctest `print_backend`, CI included) checks the plan and the exit codes
 without a GPU.
 

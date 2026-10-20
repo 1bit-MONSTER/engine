@@ -46,7 +46,7 @@ bind address, port and auth):
   exactly as from the built-in catalog:
 
   ```sh
-  curl -X POST http://127.0.0.1:8000/api/v1/pull -H 'Content-Type: application/json' -d '{
+  curl -X POST http://127.0.0.1:13305/api/v1/pull -H 'Content-Type: application/json' -d '{
     "model_name": "user.ZAYA1-8B-PM-1bit",
     "recipe": "onebit",
     "checkpoint": "1bit-MONSTER/ZAYA1-8B-GGUF:zaya1-8b-Q4_K_M.gguf",
@@ -67,7 +67,7 @@ the PM asks for it, so pull the experts you want ahead of time.
 **Standalone**, against a running Lemonade:
 
 ```sh
-1bit serve -m zaya1-8b-Q4_K_M.gguf --alias ZAYA1-8B-PM --pm --lemonade-url http://127.0.0.1:8000
+1bit serve -m zaya1-8b-Q4_K_M.gguf --alias ZAYA1-8B-PM --pm --lemonade-url http://127.0.0.1:13305
 # optional: --pm-experts my-experts.json, --pm-spawn-url http://127.0.0.1:8791 (agent workers, below)
 # optional: --pm-router laya   (the engine asks the Laya router which expert first; below)
 ```
@@ -171,7 +171,7 @@ than route by guess.
 
 ```sh
 1bit serve -m zaya1-8b-Q4_K_M.gguf --alias ZAYA1-8B-PM --pm --pm-router laya \
-  --laya-model ~/.local/share/1bit/laya --lemonade-url http://127.0.0.1:8000
+  --laya-model ~/.local/share/1bit/laya --lemonade-url http://127.0.0.1:13305
 ```
 
 ## Starting an agent worker (`--pm-spawn-url`)

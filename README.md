@@ -18,23 +18,22 @@ limitations under the License.
 
 **Documentation:** [1bit.gg](https://1bit.gg/) · **Measured results:** [wiki](https://github.com/1bit-MONSTER/engine/wiki) · **Community:** [Discord](https://discord.gg/fa5m4Vawpa)
 
-**Site:** [github.com/1bit-MONSTER/site](https://github.com/1bit-MONSTER/site) (builds 1bit.gg from this repository's README.md and docs/) · **Kernel build:** [github.com/1bit-MONSTER/kernel](https://github.com/1bit-MONSTER/kernel)
+**Site:** [github.com/1bit-MONSTER/site](https://github.com/1bit-MONSTER/site) (builds 1bit.gg from this repository's README.md and docs/)
 
 **The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade stays
 the server you talk to (its catalog, downloads, router and UI), and for the models it hands to 1bit,
 Lemonade runs the engine as one of its backends, the same way it runs `llama-server`. The engine
 serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
-- the XDNA 2 NPU engine, on our own NPU runtime (no XRT; [docs/npu.md](docs/npu.md#the-npu-runtime))
+- the XDNA 2 NPU engine, on our own NPU runtime (no XRT; [docs/npu.md](docs/npu.md#the-npu-runtime)); in progress: the release carries the runtime, and the NPU kernels built from source are not merged yet
 - HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the engine's one GPU route ([docs/hrx.md](docs/hrx.md)), and the CPU from the same llama.cpp build
-- MoE experts streamed from the drive (`1bit serve --moe-slots N`), for MoE models larger than memory: kept, but not in this build until it moves to HRX with Qwen3.8-Flash-Next ([docs/moe-streaming.md](docs/moe-streaming.md))
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming
 - ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs
 - every Hugging Face model architecture, kept current by a daily census
 
-Every tuned setting `1bit serve` gives a backend is a recipe with its measurement attached
-([docs/recipes.md](docs/recipes.md)), and the serve numbers in these docs come from
+A tuned setting `1bit serve` gives a backend is a recipe with its measurement attached
+([docs/recipes.md](docs/recipes.md); the built-in set is empty until there are HRX measurements), and the serve numbers in these docs come from
 `tools/bench.py`, which A/B-measures configurations against a baseline in the same run
 ([docs/bench.md](docs/bench.md)). HRX pin bumps and PRs labelled `hw-gate` are checked on the
 Strix Halo GPU before merge by the hardware gate: kernel tests, known answers on three models,
@@ -44,7 +43,9 @@ On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Met
 Every other backend and platform (Vulkan, ROCm, CUDA, Apple's MLX and Metal, Windows) is Lemonade's,
 through its own backends and builds.
 
-**Install:** through Lemonade. Packages ship every Sunday, rebuilt at that week's upstream pins:
+**Install:** through Lemonade. The release is HRX with our HIP kernels and the NPU engine, all inside
+Lemonade. The weekly release run (`scripts/weekly.sh`, on Sunday) rebuilds the packages at that week's
+upstream pins; the first release is not published yet. The packages:
 Lemonade with the onebit recipe and the engine (unpack it and run `lemond-onebit`), and 1bit OS, a
 Lemonade appliance with the engine on a bootable USB stick ([docs/releases.md](docs/releases.md)).
 The engine has no standalone package of its own.
@@ -56,12 +57,13 @@ The engine has no standalone package of its own.
 >
 > **Status:** the engine runs inside Lemonade through `1bit serve` ([docs/lemonade.md](docs/lemonade.md),
 > [docs/serve.md](docs/serve.md)); the NPU and HRX each pass its end-to-end test on
-> Strix Halo, and the Lemonade recipe that runs it (`onebit`, in our fork
+> Strix Halo (the NPU route is still in progress for the release, above), and the Lemonade recipe that runs it (`onebit`, in our fork
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
 > suite on HRX. Following a review,[^geramyl] the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx,
-> pinned since 2026-10-18 to AMD's `e3e6a976` hrx-system line with llama.cpp `8d9ce2c1a` (our four fixes
-> replayed plus our long-context live-out fix for ROCm/hrx-system#1535; against the old pins on Strix Halo:
+> on AMD's `e3e6a976` hrx-system line since 2026-10-18, now hrx-system `82804197` with llama.cpp `00f2a68de`
+> (2026-10-19, #458, #461; our four fixes replayed plus our long-context live-out fix for ROCm/hrx-system#1535;
+> measured when the line moved on 2026-10-18 with llama.cpp `8d9ce2c1a`, #441, against the old pins on Strix Halo:
 > test-backend-ops 1141/1141, long-prompt needles 20/20 + 5/5 + 5/5, KLD 0 and identical output on two
 > models, pp512 +4.4% / +7.8%, tg128 +2.5% / +2.8%)
 > ([docs/hrx.md](docs/hrx.md); its decode-split race, #123/#140, is fixed and the kernel is on by default; Q2_K, IQ2 and IQ3_XXS GGUFs run on HRX instead of the CPU, and `--mtp` on Qwen3.8-27B runs NaN-free since #257), the NPU engine on full ELFs and on our own

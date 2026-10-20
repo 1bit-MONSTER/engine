@@ -72,8 +72,8 @@ LEMONADE_ONEBIT_BIN=$PWD/build/1bit ~/.cache/lemonade-pin/bin/lemond
 the upstream release sync below). Before merging, rebuild and rerun the LLM suite on Strix Halo.
 
 On Strix Halo the recipe passes Lemonade's own LLM test suite
-(`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX: 31 tests, 9 run,
-22 skipped as unsupported. It is not proposed upstream yet: the plan is to embed the engine fully
+(`test/server_llm.py --wrapped-server onebit`) on HRX (the checklist below has the counts;
+Vulkan passed too before RFC #213 stage 3 removed it). It is not proposed upstream yet: the plan is to embed the engine fully
 in the fork first, then propose it upstream. The fork follows upstream's releases:
 `.github/workflows/sync-lemonade-fork.yml` checks daily and merges upstream's latest
 release tag (never a pre-release or `main`), so each weekly engine release carries the
@@ -134,7 +134,7 @@ serve:
   Qwen3.8-Flash-Next (`qwen4exp`) runs on HRX since llama.cpp pin `e57beb97`.
 
 In the pinned fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade),
-`third_party/lemonade` at `4812a683`), the `onebit` backend has two entries, `hrx` and `npu`
+`third_party/lemonade` at `c5ba797132a4`), the `onebit` backend has two entries, `hrx` and `npu`
 (`backend_versions.json`); its `vulkan` and `cuda` entries are gone. Lemonade offers `onebit`
 models only on machines with `hrx` or `npu`. Lemonade's other recipes (its `llamacpp` Vulkan, ROCm
 and CUDA backends, MLX and the rest) are Lemonade's own and unchanged.

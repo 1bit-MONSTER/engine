@@ -15,15 +15,22 @@
 
 // The NPU runtime the engine's NPU code compiles against (docs/npu.md, "The NPU runtime").
 //
-// Our own XRT-compatible runtime, from the private directory ONEBIT_NPU_RT_DIR (npu_rt.h and
-// npu_rt.cpp), compiled into 1bit. Its classes mirror XRT's names, so the alias below lets the
-// engine's sources keep the xrt:: spelling. AMD's XRT itself is not supported. This repository
-// holds no runtime code: only this header and the CMake option.
+// Our own runtime, private and XRT-compatible, behind our own public interface npu_rt_api.h: the
+// engine sees only that header. The runtime comes either as a prebuilt static library
+// (ONEBIT_NPU_RT_LIB) or as its private sources (ONEBIT_NPU_RT_DIR), compiled into 1bit. Its classes
+// carry XRT's names, so the alias below lets the engine's sources keep the xrt:: spelling. AMD's XRT
+// itself is not supported. This repository holds no runtime code: only these headers and the CMake
+// options.
 #pragma once
 
 #if !defined(ONEBIT_NPU_RUNTIME_OWN)
-#error "the NPU lane builds only against the own NPU runtime (-DONEBIT_NPU_RT_DIR, docs/npu.md)"
+#error "the NPU lane builds only against the own NPU runtime (ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR, docs/npu.md)"
 #endif
-#define NPU_RT_XRT_COMPAT 1
-#include <npu_rt.h>
-namespace xrt = npu_rt;
+#include "npu_rt_api.h"
+namespace xrt = npu_rt_api;
+// XRT's global names the engine's code uses unqualified.
+using npu_rt_api::ert_cmd_state;
+using npu_rt_api::ERT_CMD_STATE_COMPLETED;
+using npu_rt_api::ERT_CMD_STATE_TIMEOUT;
+using npu_rt_api::XCL_BO_SYNC_BO_TO_DEVICE;
+using npu_rt_api::XCL_BO_SYNC_BO_FROM_DEVICE;

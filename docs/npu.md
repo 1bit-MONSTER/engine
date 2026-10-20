@@ -385,26 +385,36 @@ and that message; the add-on brings its own tests.
 The engine is XRT-free: the NPU lane runs on our own NPU runtime, compiled into `1bit`. The runtime
 opens `/dev/accel/accel0` and issues the `amdxdna` ioctls itself, parses the full ELFs itself,
 and keeps XRT's class names (`device`, `bo`, `hw_context`, `elf`, `ext::kernel`, `run`,
-`runlist`), so `npu/rt.h` (`namespace xrt = npu_rt;`) lets the engine's NPU sources read as they
-did on XRT. The NPU sources include `npu/rt.h`, never a runtime header directly.
+`runlist`). The engine reaches it only through our own public header `npu/npu_rt_api.h`: the
+calls the engine's NPU code makes, each class an opaque handle, nothing about how the runtime
+works. `npu/rt.h` includes it and aliases its namespace (`namespace xrt = npu_rt_api;`), so the
+engine's NPU sources read as they did on XRT. The NPU sources include `npu/rt.h`, never a runtime
+header directly.
 
 The runtime is a proprietary component and is not in this repository (see [NOTICE](../NOTICE)):
-the source here holds only `npu/rt.h`, the CMake option and the tests. The release binaries
-carry it compiled in; a build from this repository alone has no NPU lane.
+the source here holds only `npu/npu_rt_api.h`, `npu/rt.h`, the CMake options and the tests. The
+release binaries carry it compiled in; a build from this repository alone has no NPU lane. It
+comes one of two ways, and `ONEBIT_NPU=ON` takes exactly one:
 
 ```
-cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<runtime dir with npu_rt.h, npu_rt.cpp>
+# a prebuilt runtime library that implements npu/npu_rt_api.h (no private source or header)
+cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RT_LIB=<path>/libnpu_rt_api.a
+# the runtime's private sources
+cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<dir with npu_rt.h, npu_rt.cpp, npu_rt_api.cpp>
 ```
 
 - `ONEBIT_NPU_RUNTIME` is `own`, its only value (the default). `xrt` was removed on 2026-10-12;
   configuring with it stops with a message.
-- `ONEBIT_NPU=ON` without a `ONEBIT_NPU_RT_DIR` that holds `npu_rt.h` and `npu_rt.cpp` stops the
-  configure with a message. `npu_rt.cpp` is built into the static library `onebit_npu_rt`.
+- `ONEBIT_NPU=ON` with both `ONEBIT_NPU_RT_LIB` and `ONEBIT_NPU_RT_DIR`, with a
+  `ONEBIT_NPU_RT_LIB` that is not a file, or (without `ONEBIT_NPU_RT_LIB`) with no
+  `ONEBIT_NPU_RT_DIR` holding `npu_rt.h`, `npu_rt.cpp` and `npu_rt_api.cpp` stops the configure
+  with a message. From `ONEBIT_NPU_RT_DIR` the sources are built into the static library
+  `onebit_npu_rt`, with that directory on its own include path only, never the engine's.
 - `ONEBIT_NPU_HOST` (full-ELF generation, the model reader, packing, the tokenizer) needs no
   runtime and builds everywhere, including public CI.
-- Tests: `npu_runtime_option` (CI: `xrt`, a bad value, and a missing, empty or incomplete
-  runtime directory each stop the configure) and `npu_rt_shim` (NPU builds: every runtime call the
-  engine makes compiles against the runtime).
+- Tests: `npu_runtime_option` (CI: `xrt`, a bad value, a missing, empty or incomplete runtime
+  directory, a missing runtime library, and both options at once each stop the configure) and
+  `npu_rt_shim` (NPU builds: every call in `npu/npu_rt_api.h` links against the runtime).
 - **The release** builds the runtime from a pinned commit of the private repository, named in
   `config/npu-runtime.config` (`repo`, `sha`, `path`, `require`). `scripts/fetch-private.sh config/npu-runtime.config <dir>` checks
   out exactly that path at that commit with the release machine's `gh` credentials and prints the

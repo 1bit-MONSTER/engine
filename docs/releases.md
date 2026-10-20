@@ -64,7 +64,7 @@ carry both files beside the engine's `LICENSE` and `NOTICE`:
 
 | Component | Compiled into | Pin | Build option |
 |---|---|---|---|
-| The 1bit NPU runtime ([npu.md](npu.md), "The NPU runtime") | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` |
+| The 1bit NPU runtime ([npu.md](npu.md), "The NPU runtime") | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` (or a prebuilt `ONEBIT_NPU_RT_LIB`) |
 | The private HIP kernels for HRX ([hrx.md](hrx.md), "Private HIP kernels") | `hrx/llama/bin/libggml-hrx.so` (code objects) | `config/gpu-kernels.config` | `ONEBIT_GPU_PRIVATE` |
 
 The build stage fetches each with `scripts/fetch-private.sh <pin> <dir>`: the pinned path at the

@@ -13,9 +13,10 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// npu/rt.h against the own NPU runtime (ONEBIT_NPU_RT_DIR): every runtime call the
-// engine's NPU code makes (npu/lane.cpp, npu/forward) appears below, so a runtime that lacks one
-// fails to build this test. Nothing here opens the device: `uses` is compiled, never called.
+// npu/rt.h against the own NPU runtime (ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR): every call of the
+// public interface npu/npu_rt_api.h appears below (the engine's NPU code, npu/lane.cpp and
+// npu/forward, and the private routes' add-ons use these), so a runtime library that lacks one fails
+// to link this test. Nothing here opens the device: `uses` is linked, never called.
 #include "rt.h"
 
 #include <chrono>
@@ -24,7 +25,7 @@
 #include <string>
 #include <vector>
 
-[[maybe_unused]] static void uses(const std::vector<char>& image) {
+static void uses(const std::vector<char>& image) {
     xrt::device dev{0};
     auto ctx = std::make_unique<xrt::hw_context>(dev, xrt::elf(image.data(), image.size()));
     ctx->add_config(xrt::elf(image.data(), image.size()));
@@ -50,11 +51,24 @@
     rl->add(r2);
     rl->execute();
     rl->wait();
+    rl->reset();
     xrt::run r3 = k(*act, *plain, e);
     r3.wait();
+    if (r3.state() != ERT_CMD_STATE_COMPLETED) std::puts("not completed");
+    xrt::bo row(e, size_t(256), size_t(512));  // a sub-buffer
+    row.map<char*>()[0] = 0;
+    xrt::elf none;
+    xrt::hw_context no_ctx;
+    xrt::ext::kernel no_kernel;
+    xrt::run no_run;
+    if (!none && !no_run && row) no_ctx = *ctx;
+    no_kernel = k;
 }
 
 int main() {
-    std::puts("npu/rt.h: own runtime (ONEBIT_NPU_RT_DIR)");
+    // Taking its address keeps `uses` in the binary, so every call in it must link.
+    void (*volatile keep)(const std::vector<char>&) = uses;
+    (void)keep;
+    std::puts("npu/rt.h: own runtime behind npu/npu_rt_api.h");
     return 0;
 }

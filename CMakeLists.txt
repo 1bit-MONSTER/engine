@@ -416,15 +416,21 @@ add_test(NAME npu_private_route COMMAND npu_private_route_test)
 endif()  # ONEBIT_NPU_HOST
 
 # The lane itself: needs the NPU runtime and an XDNA NPU to run.
-option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_DIR)" OFF)
+option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR)" OFF)
 # The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The NPU runtime"): our own, an
-# XRT-compatible runtime that is not part of this repository. ONEBIT_NPU_RT_DIR holds its npu_rt.h
-# and npu_rt.cpp, built here into the static library onebit_npu_rt and linked into 1bit. AMD's XRT
-# is not supported: the engine links no XRT library. The release build takes the runtime from the
-# pinned private checkout in config/npu-runtime.config (scripts/fetch-private.sh).
+# XRT-compatible runtime that is not part of this repository, behind our public header
+# npu/npu_rt_api.h. It comes one of two ways, exactly one of which must be set:
+#   ONEBIT_NPU_RT_LIB  a prebuilt static library (libnpu_rt_api.a) that implements npu_rt_api.h;
+#                      no runtime source or private header is needed.
+#   ONEBIT_NPU_RT_DIR  the runtime's private sources (npu_rt.h, npu_rt.cpp, npu_rt_api.cpp), built
+#                      here into the static library onebit_npu_rt. npu_rt.h stays on that library's
+#                      own include path only; the engine's sources see npu_rt_api.h.
+# AMD's XRT is not supported: the engine links no XRT library. The release build takes the runtime
+# from the pinned private checkout in config/npu-runtime.config (scripts/fetch-private.sh).
 set(ONEBIT_NPU_RUNTIME "own" CACHE STRING "NPU runtime: own (the only value)")
 set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS own)
-set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with the NPU runtime's npu_rt.h and npu_rt.cpp (private)")
+set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with the NPU runtime's private sources: npu_rt.h, npu_rt.cpp, npu_rt_api.cpp")
+set(ONEBIT_NPU_RT_LIB "" CACHE FILEPATH "Prebuilt NPU runtime static library implementing npu/npu_rt_api.h (libnpu_rt_api.a)")
 if(NOT ONEBIT_NPU_RUNTIME STREQUAL "own")
     message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be own, not '${ONEBIT_NPU_RUNTIME}': the engine builds "
                         "no XRT NPU lane (docs/npu.md, \"The NPU runtime\")")
@@ -439,16 +445,37 @@ if(ONEBIT_NPU_HOST AND NOT WIN32)
     set_tests_properties(npu_runtime_option PROPERTIES TIMEOUT 300)
 endif()
 if(ONEBIT_NPU)
-    if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.h" OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp")
-        message(FATAL_ERROR "ONEBIT_NPU needs the NPU runtime: ONEBIT_NPU_RT_DIR must hold npu_rt.h and "
-                            "npu_rt.cpp (ONEBIT_NPU_RT_DIR='${ONEBIT_NPU_RT_DIR}'). The runtime is private; "
-                            "without it, build with ONEBIT_NPU=OFF (docs/npu.md, \"The NPU runtime\")")
+    if(ONEBIT_NPU_RT_LIB AND ONEBIT_NPU_RT_DIR)
+        message(FATAL_ERROR "ONEBIT_NPU takes one NPU runtime: set ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR, "
+                            "not both (docs/npu.md, \"The NPU runtime\")")
     endif()
-    add_library(onebit_npu_rt STATIC ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
-    target_include_directories(onebit_npu_rt SYSTEM PUBLIC ${ONEBIT_NPU_RT_DIR})
-    target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
     find_package(Threads REQUIRED)
-    target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
+    if(ONEBIT_NPU_RT_LIB)
+        if(NOT EXISTS "${ONEBIT_NPU_RT_LIB}" OR IS_DIRECTORY "${ONEBIT_NPU_RT_LIB}")
+            message(FATAL_ERROR "ONEBIT_NPU_RT_LIB='${ONEBIT_NPU_RT_LIB}' is not a library file "
+                                "(docs/npu.md, \"The NPU runtime\")")
+        endif()
+        add_library(onebit_npu_rt_prebuilt STATIC IMPORTED)
+        set_target_properties(onebit_npu_rt_prebuilt PROPERTIES IMPORTED_LOCATION "${ONEBIT_NPU_RT_LIB}")
+        add_library(onebit_npu_rt INTERFACE)
+        target_link_libraries(onebit_npu_rt INTERFACE onebit_npu_rt_prebuilt Threads::Threads)
+        target_include_directories(onebit_npu_rt INTERFACE ${CMAKE_SOURCE_DIR}/npu)
+        target_compile_definitions(onebit_npu_rt INTERFACE ONEBIT_NPU_RUNTIME_OWN)
+    else()
+        if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.h" OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp"
+           OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt_api.cpp")
+            message(FATAL_ERROR "ONEBIT_NPU needs the NPU runtime: ONEBIT_NPU_RT_LIB must name its prebuilt "
+                                "library, or ONEBIT_NPU_RT_DIR must hold npu_rt.h, npu_rt.cpp and npu_rt_api.cpp "
+                                "(ONEBIT_NPU_RT_DIR='${ONEBIT_NPU_RT_DIR}'). The runtime is private; "
+                                "without it, build with ONEBIT_NPU=OFF (docs/npu.md, \"The NPU runtime\")")
+        endif()
+        add_library(onebit_npu_rt STATIC ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp ${ONEBIT_NPU_RT_DIR}/npu_rt_api.cpp)
+        # npu_rt.h: this library's own include path only (PRIVATE), never the engine's.
+        target_include_directories(onebit_npu_rt SYSTEM PRIVATE ${ONEBIT_NPU_RT_DIR})
+        target_include_directories(onebit_npu_rt PUBLIC ${CMAKE_SOURCE_DIR}/npu)
+        target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
+        target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
+    endif()
     add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp)
     target_link_libraries(onebit_npu_lane PUBLIC onebit_npu onebit_npu_rt)
     target_sources(onebit PRIVATE app/unified.cpp)

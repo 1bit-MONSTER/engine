@@ -35,6 +35,7 @@ OpenAI client.
            [--npu-opt KEY=VALUE ...]
            [--no-mem-check | --mem-check]
            [--watchdog SECS] [--watchdog-prompt-tps N]
+           [--print-backend]
 ```
 
 One model per process:
@@ -227,6 +228,56 @@ Until then, scrape serve's port directly.
 
 `tests/metrics_serve.sh` (ctest `metrics_serve`, CI included) checks every series against
 `tests/fake_backend.py`.
+
+## One hop from Lemonade (`--print-backend`)
+
+For a `.gguf` on HRX, Lemonade does not need serve in the request path. Lemonade's `onebit`
+recipe (our fork, branch `1bit/one-hop`) runs serve's command with `--print-backend` added:
+
+```
+$ 1bit serve -m Qwen3-4B-Q4_K_M.gguf --port 8001 --device hrx --alias Qwen3-4B-1bit --print-backend
+{"argv":[".../llama-server","-m","Qwen3-4B-Q4_K_M.gguf","--host","127.0.0.1","--port","8001","--metrics","--device","HRX0","-ngl","99","--jinja","--alias","Qwen3-4B-1bit","--cache-reuse","256"],"device":"hrx","env":{"GGML_HRX_REPORT":"1",...},"port":8001}
+```
+
+serve makes every check it makes before a load (the architecture, [memory](#will-it-fit), the
+placement flags, [recipes](#recipes---recipes---no-recipes)) and prints the llama-server it would
+start, on the port Lemonade chose, as one JSON line on stdout, then exits. Lemonade starts that
+llama-server itself and forwards to it as it does for its own `llamacpp` recipe: one HTTP hop and
+two processes (lemond, llama-server) instead of two hops and three.
+
+| Exit | Meaning | Lemonade |
+|---|---|---|
+| 0 | the plan is on stdout | starts it |
+| 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `onnx` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+
+Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
+`LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
+the caller's environment does not set already, so a value the user set still wins, as under serve.
+
+What serve did on the request path is the backend's own on this route:
+
+- **Health.** llama-server's `/health` answers 503 while its main loop has work queued and has
+  made no progress for `LLAMA_SERVER_HEALTH_STALL_SECS` (30 s; llama.cpp fork #111), so Lemonade's
+  BackendWatchdog probe (above, [When a backend hangs](#when-a-backend-hangs)) now catches a hung
+  GPU: three failed probes, and Lemonade stops the backend and reloads the model on the next request.
+- **A lost GPU.** llama-server exits with status 1 when ggml-hrx logs `AMDGPU hardware exception`
+  (llama.cpp fork, `tools/server/server-device-lost.cpp`; `LLAMA_SERVER_EXIT_ON_DEVICE_LOST=0` keeps
+  it up), the same signal serve's #466 exit gave Lemonade.
+- **Placement.** `--strict-device` is `GGML_HRX_STRICT=1` in the backend, which aborts on the first
+  node off HRX. serve's own summary line and `onebit_*` [metrics](#metrics) are not printed on this
+  route; llama-server's `--metrics` still are.
+- **Names.** `--alias` gives replies Lemonade's model name; `reasoning_content` is llama-server's
+  own (`--jinja`).
+- **Prefix reuse.** `--cache-reuse 256` lets llama-server shift a cached prefix into place when the
+  middle of a conversation changes. A recipe's own `--cache-reuse` wins.
+- **Residency.** Keeping the model loaded, and so its HRX graph-program cache warm, is Lemonade's:
+  `lemonade load --pinned` (or `"pinned": true`), `max_loaded_models`, and the `evict_idle_timeout`
+  recipe option when `auto_evict` is on. A reload starts a new llama-server, whose program cache
+  starts cold.
+
+`tests/print_backend.sh` (ctest `print_backend`, CI included) checks the plan and the exit codes
+without a GPU.
 
 ## Where the model runs
 

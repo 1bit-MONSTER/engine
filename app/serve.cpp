@@ -351,8 +351,10 @@ std::string onnx_ryzenai_mode(const std::string& dir) {
 // build made one. A server with no provider beside it was built against Microsoft's ONNX Runtime
 // (the release package's onnx/, which ships no part of Ryzen AI Software): then deployment/lib
 // comes before the server's directory, so the venv's ONNX Runtime GenAI, the one that knows the
-// RyzenAI provider, loads instead of the CPU-only copy beside the binary (its RUNPATH $ORIGIN
-// yields to LD_LIBRARY_PATH). Nothing in the venv is modified.
+// RyzenAI provider, loads instead of the CPU-only copy beside the binary. That works because
+// scripts/build-onnx.sh gives that build DT_RUNPATH $ORIGIN, which yields to LD_LIBRARY_PATH (a
+// DT_RPATH would not: the CPU-only copy would load and the provider be unknown), and the
+// release package keeps it (weekly.sh checks). Nothing in the venv is modified.
 std::vector<std::string> ryzenai_child_env(const std::string& root, const fs::path& server_dir) {
     const fs::path deployment = fs::path(root) / "deployment" / "lib";
     if (!fs::is_directory(deployment))

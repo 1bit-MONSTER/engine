@@ -298,7 +298,17 @@ package_checks() {  # package_checks <linux tarball>
                  onnxruntime-genai-LICENSE.txt onnxruntime-genai-ThirdPartyNotices.txt; do
             [ -f "$(echo "$t"/*/onnx)/$f" ] || { echo "FAIL onnx/$f is not in $(basename "$1")"; bad=1; }
         done
-        [ $bad = 0 ] && echo "ok   onnx/: ryzenai-server and ONNX Runtime with their licences, no Ryzen AI Software"
+        # DT_RUNPATH $ORIGIN only: LD_LIBRARY_PATH must win so `1bit serve` can put a Ryzen AI
+        # venv's ONNX Runtime GenAI first (app/serve.cpp ryzenai_child_env), and no path may
+        # point into the build machine
+        f=$(echo "$t"/*/onnx/ryzenai-server)
+        n=$(readelf -d "$f" 2>/dev/null | grep -c '(RPATH)' || true)
+        [ "$n" = 0 ] || { echo "FAIL onnx/ryzenai-server has a DT_RPATH (LD_LIBRARY_PATH cannot override it)"; bad=1; }
+        n=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')
+        [ "$n" = '$ORIGIN' ] || { echo "FAIL onnx/ryzenai-server RUNPATH is '$n', not \$ORIGIN"; bad=1; }
+        n=$(strings -a "$f" | grep -c '^1bit-onnx-signal-shim' || true)
+        [ "$n" != 0 ] || { echo "FAIL onnx/ryzenai-server lacks the SIGTERM shim (scripts/onnx/signal_shim.c)"; bad=1; }
+        [ $bad = 0 ] && echo "ok   onnx/: ryzenai-server (RUNPATH \$ORIGIN, SIGTERM shim) and ONNX Runtime with their licences, no Ryzen AI Software"
     else
         echo "FAIL no onnx/ in $(basename "$1") (weekly builds -DONEBIT_ONNX=ON)"; bad=1
     fi

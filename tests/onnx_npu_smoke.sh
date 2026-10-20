@@ -86,12 +86,16 @@ for i in $(seq 1 240); do
     if ! kill -0 "$child" 2>/dev/null; then gone=$i; break; fi
     sleep 0.25
 done
-check "child exited after SIGTERM to serve (${gone:+$((gone / 4)).$((gone % 4 * 25)) s}${gone:-still alive after 60 s})" '[ -n "$gone" ]'
+if [ -n "$gone" ]; then took="$(awk -v n="$gone" 'BEGIN { printf "%.2f s", n / 4 }')"; else took="still alive after 60 s"; fi
+check "child exited after SIGTERM to serve ($took)" '[ -n "$gone" ]'
 if [ -z "$gone" ]; then
     echo "--- the child is still running (pid $child); left alone; holders of /dev/accel/accel0:"
     lsof /dev/accel/accel0 2>/dev/null || ls -l "/proc/$child/fd" 2>/dev/null | grep accel
 fi
 wait "$pid" 2>/dev/null
+# serve escalates to SIGKILL after ONEBIT_BACKEND_STOP_GRACE_S; on an NPU holder that is the
+# amdxdna risk, so an exit that needed it is a failure even though the child is gone
+check "serve did not SIGKILL the child" '! grep -q "ignored SIGTERM" "$log"'
 
 if [ $fail -ne 0 ]; then echo "--- serve log (tail)"; tail -30 "$log"; echo FAIL; exit 1; fi
 echo PASS

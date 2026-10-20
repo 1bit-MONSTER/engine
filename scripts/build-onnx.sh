@@ -29,7 +29,7 @@
 # Linux NPU (docs/onnx.md, "Linux NPU"): RYZENAI_INSTALL_PATH is the venv Ryzen AI Software's
 # install_ryzen_ai.sh made (`-p <venv>`); its deployment/lib holds libonnxruntime-genai.so,
 # libonnxruntime.so and libonnxruntime_providers_ryzenai.so. ryzenai-server's build copies that
-# whole directory beside the binary (DT_RPATH $ORIGIN finds it), and this script then clears the
+# whole directory beside the binary (DT_RPATH $ORIGIN finds it; the Microsoft build gets DT_RUNPATH, below), and this script then clears the
 # executable-stack request from any copy that carries one: a 7.x kernel refuses to load such a
 # library (`patchelf --clear-execstack`, on the copies only; the venv is never modified). At run
 # time `1bit serve` points the child at the venv and XRT with ONEBIT_RYZENAI_ROOT / ONEBIT_XRT_ROOT.
@@ -77,12 +77,36 @@ else
     ort_lib=$work/ort/lib
 fi
 
-# DT_RPATH $ORIGIN: the binary finds its libraries beside it, and so does ONNX Runtime GenAI when
-# it loads libonnxruntime.so (a RUNPATH would not cover that dlopen)
+# The SIGTERM shim (scripts/onnx/signal_shim.c, its comment has the why): ryzenai-server's
+# handler calls std::exit() from signal context on any thread, which with the NPU provider hangs
+# or double-frees; the shim, linked with --wrap=signal, stops the server from a thread of its own
+# so main() returns and exits once. ryzenai-server's sources stay as pinned.
+cc -O2 -fPIC -Wall -Werror -c "$root/scripts/onnx/signal_shim.c" -o "$work/signal_shim.o"
 cmake -S "$src" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DOGA_ROOT="$oga_root" \
-    "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--disable-new-dtags -Wl,-rpath,\$ORIGIN" > "$work/cmake.log"
+    "-DCMAKE_EXE_LINKER_FLAGS=-Wl,--wrap=signal $work/signal_shim.o -pthread" > "$work/cmake.log"
 cmake --build "$work/build" -j"$(nproc)" > "$work/build.log" 2>&1 || { tail -20 "$work/build.log"; exit 1; }
 cp -a "$work/build/bin/." "$prefix/"
+syms=$(nm "$prefix/ryzenai-server")
+for sym in ' T __wrap_signal$' ' [BD] g_server$' ' T _ZN7ryzenai13RyzenAIServer4stopEv$' ' T _ZN7ryzenai13RyzenAIServerD1Ev$'; do
+    grep -q "$sym" <<< "$syms" || { echo "build-onnx.sh: the SIGTERM shim does not resolve in ryzenai-server (${sym}); see scripts/onnx/signal_shim.c"; exit 1; }
+done
+
+# The search path, $ORIGIN only (no path into this build tree):
+# - against Ryzen AI Software (RYZENAI_INSTALL_PATH): DT_RPATH, as ryzenai-server's own build sets
+#   it, so the AMD libraries copied beside the binary resolve each other through it (their own
+#   RUNPATHs point at AMD's CI paths);
+# - against Microsoft's releases (the release package): DT_RUNPATH, so LD_LIBRARY_PATH comes
+#   first. `1bit serve` with ONEBIT_RYZENAI_ROOT puts the venv's deployment/lib there, and the
+#   venv's ONNX Runtime GenAI (which knows the RyzenAI provider) loads instead of the CPU-only one
+#   beside the binary; a DT_RPATH would win over LD_LIBRARY_PATH and keep the CPU-only one.
+#   Microsoft's libonnxruntime-genai.so carries RUNPATH $ORIGIN itself, so its dlopen of
+#   libonnxruntime.so still finds the copy beside it.
+command -v patchelf > /dev/null || { echo "build-onnx.sh: patchelf is needed to set ryzenai-server's search path: apt install patchelf"; exit 1; }
+if [ -n "${RYZENAI_INSTALL_PATH:-}" ]; then
+    patchelf --force-rpath --set-rpath '$ORIGIN' "$prefix/ryzenai-server"
+else
+    patchelf --set-rpath '$ORIGIN' "$prefix/ryzenai-server"
+fi
 [ -n "$ort_lib" ] && cp -a "$ort_lib"/libonnxruntime.so* "$prefix/"
 # the licence texts of what sits beside the binary, under names that say whose they are (the
 # release packs them in onnx/ with the binaries; NOTICE points here)

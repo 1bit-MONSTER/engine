@@ -48,6 +48,8 @@ usage() {
     exit 2
 }
 die() { echo "$me: $*" >&2; exit 1; }
+# shellcheck source=scripts/pack-elf.sh
+. "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
 
 src=${1:-}; out=${2:-}
 [ -n "$src" ] && [ -n "$out" ] || usage; shift 2
@@ -103,6 +105,14 @@ for f in llama-server; do [ -f "$hrx_src/$f" ] || die "$hrx_src has no $f"; done
 cp -a "$hrx_src/llama-server" "$stage/hrx/llama/bin/"
 for f in "$hrx_src"/*.so "$hrx_src"/*.so.*; do [ -e "$f" ] && cp -a "$f" "$stage/hrx/llama/bin/"; done
 [ -f "$hrx_src/llama-bench" ] && cp -a "$hrx_src/llama-bench" "$stage/hrx/llama/bin/"
+# A packed release is already self-contained. A build tree is not: run package-linux.sh's own
+# steps on it (scripts/pack-elf.sh): the libraries it loads from elsewhere in the build tree and
+# LLVM's OpenMP runtime go beside it, RUNPATH becomes $ORIGIN, and the symbol tables come out.
+if [ -n "$build" ]; then
+    build=$(cd "$build" && pwd)
+    pack_localize "$stage" "$build"
+    pack_strip "$stage/hrx"
+fi
 echo "  hrx/llama/bin: $(ls "$stage/hrx/llama/bin" | wc -l) files from $hrx_from"
 
 # ── the NPU runtime library and its public header ────────────────────────────────────────────────
@@ -123,7 +133,7 @@ cp -a "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$
 
 # ── checks: the same class the weekly package runs, against this layout ──────────────────────────
 bad=0
-is_elf() { [ -f "$1" ] && [ "$(head -c 4 "$1" | od -An -c | tr -d ' ')" = '177ELF' ]; }
+is_elf() { pack_is_elf "$1"; }
 fail() { echo "FAIL $*"; bad=1; }
 
 # every ELF is a compiled binary with no source-name leakage
@@ -136,6 +146,10 @@ while IFS= read -r -d '' f; do
     [ "$n" = 0 ] || fail "$f has an RPATH into a build machine home"
 done < <(find "$stage" -type f -print0)
 [ "$(find "$stage" -name 'libxrt*' | wc -l)" = 0 ] || fail "the drop carries an XRT library"
+
+# every library the programs load is in the drop (or is the TheRock runtime HRX documents)
+missing=$(pack_missing_libs "$stage")
+[ -z "$missing" ] || fail "libraries ldd cannot find: $(echo "$missing" | tr '\n' ';')"
 
 # the private HIP kernels really are compiled into the HRX ggml library
 n=$(nm -D --defined-only "$stage/hrx/llama/bin/libggml-hrx.so" | grep -c ggml_hrx_hip_addon_register || true)

@@ -20,12 +20,21 @@
 # the served name, and a streamed chat arrives as SSE chunks.
 #
 # usage: tests/serve_e2e.sh path/to/1bit <model> <device> [extra serve args]
+# Device hrx skips (exit 77) on a machine without a GPU HRX has kernels for: ONEBIT_HRX_E2E_TARGETS
+# (default gfx1151, Strix Halo), looked up in sysfs by scripts/gpu-targets.sh, which opens no GPU.
 set -uo pipefail
 
 bin=${1:?usage: serve_e2e.sh path/to/1bit <model> <device> [args]}
 model=${2:?}
 device=${3:?}
 shift 3
+if [ "$device" = hrx ]; then
+    have=$("$(cd "$(dirname "$0")/.." && pwd)/scripts/gpu-targets.sh" 2>/dev/null | tr '\n' ' ')
+    want=${ONEBIT_HRX_E2E_TARGETS:-gfx1151}
+    found=0
+    for t in $want; do case " $have" in *" $t "*) found=1 ;; esac; done
+    [ $found = 1 ] || { echo "skip: no $want GPU for HRX on this machine (GPUs: ${have:-none})"; exit 77; }
+fi
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 log=$(mktemp)
 "$bin" serve -m "$model" --device "$device" --port "$port" --alias e2e-model "$@" >"$log" 2>&1 &

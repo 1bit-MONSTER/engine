@@ -65,6 +65,10 @@ if ssh_vm true 2>/dev/null; then
             echo "HRX JIT cache: $(ls -d /data/cache/hrx-jit 2>/dev/null || echo none)"
             echo "Lemonade backends on the stick: $(cd /data/lemonade/cache/bin 2>/dev/null && ls -d */* | tr "\n" " ")"
             echo "1bit (for the shell): $(1bit version 2>&1 | head -1)"'
+    # the Lemonade CLI must be on an SSH command's PATH, as on the console (os/mini/init.sh)
+    if lv=$(ssh_vm 'lemonade --version 2>&1 | head -1' 2>/dev/null) && [ -n "$lv" ] && ! echo "$lv" | grep -q 'not found'; then
+        echo "lemonade CLI over SSH: $lv"
+    else echo "lemonade CLI over SSH: not on PATH (${lv:-no output})"; ok=0; fi
 else
     echo "VM: no SSH"; ok=0
 fi

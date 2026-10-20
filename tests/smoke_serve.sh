@@ -17,7 +17,8 @@
 # Smoke test for `1bit serve`, runnable anywhere (CI included): the proxy in
 # front of a child backend, with tests/fake_backend.py standing in for
 # llama-server. Checks /health, /v1/models, a chat reply renamed to the served
-# model, SSE relay, and that no backend outlives serve.
+# model, SSE relay, that no backend outlives serve, and that a backend that exits on
+# its own ends serve without a wait.
 #
 # usage: tests/smoke_serve.sh path/to/1bit
 set -uo pipefail
@@ -31,8 +32,10 @@ export FAKE_BACKEND_EVENTS="$scratch/events"
 "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port" --alias smoke-model \
     --llama-server "$here/fake_backend.py" >"$scratch/serve.log" 2>&1 &
 pid=$!
+epid=
 cleanup() {
     kill -9 "$pid" 2>/dev/null; wait "$pid" 2>/dev/null
+    [ -n "$epid" ] && kill -9 "$epid" 2>/dev/null
     [ -s "$scratch/impostor" ] && kill -9 "$(cat "$scratch/impostor")" 2>/dev/null
     rm -rf "$scratch"
 }
@@ -80,6 +83,26 @@ kill -9 "$pid"; wait "$pid" 2>/dev/null
 sleep 1
 if [ "$(uname)" = Linux ]; then
     check "no backend outlives serve (SIGKILL)" '! kill -0 "$child" 2>/dev/null'
+fi
+
+if [ "$(uname)" = Linux ]; then
+    # A backend that exits on its own (a crash): serve reaps it where it noticed, says how it
+    # ended, and its stop path neither waits the SIGTERM grace for the dead pid nor signals it
+    # (the grace is set to 20 s here so a regression shows as a slow exit, not a hang).
+    port3=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+    start=$(date +%s)
+    ONEBIT_BACKEND_STOP_GRACE_S=20 timeout 60 "$bin" serve -m "$scratch/tiny.gguf" --device cpu --port "$port3" \
+        --alias smoke-model --llama-server "$here/fake_backend.py" >"$scratch/exit.log" 2>&1 &
+    epid=$!
+    for _ in $(seq 1 100); do [ "$(curl -s -o /dev/null -w '%{http_code}' "http://127.0.0.1:$port3/health")" = 200 ] && break; sleep 0.1; done
+    curl -s -o /dev/null "http://127.0.0.1:$port3/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"model": "smoke-model", "fake_exit": 3, "messages": [{"role": "user", "content": "hi"}]}'
+    wait "$epid"; exit_rc=$?
+    epid=
+    took=$(( $(date +%s) - start ))
+    check "a backend that exits on its own ends serve at once (rc $exit_rc, ${took}s)" \
+        '[ "$exit_rc" = 1 ] && [ "$took" -lt 10 ] && grep -q "backend exited: exit 3" "$scratch/exit.log" && ! grep -q "ignored SIGTERM" "$scratch/exit.log"'
+    [ $fail -ne 0 ] && { echo "--- exit log"; cat "$scratch/exit.log"; }
 fi
 
 both=$("$bin" serve -m "$scratch/tiny.gguf" --device cpu --mtp a.gguf --dflash b.gguf 2>&1); both_rc=$?

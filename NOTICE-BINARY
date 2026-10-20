@@ -27,6 +27,30 @@ NPU add-on npu-lax (from the private npu-kernels repository, addons/npu-lax)
   (http://www.apache.org/licenses/LICENSE-2.0).
 
 -------------------------------------------------------------------------------------
+LLVM OpenMP runtime (libomp.so, packed beside the HRX llama.cpp libraries in hrx/llama/bin)
+
+- libomp.so from TheRock's LLVM (ROCm's llvm-project, https://github.com/ROCm/llvm-project,
+  openmp/runtime; upstream https://github.com/llvm/llvm-project). ggml's CPU code links it
+  when TheRock's amdclang builds llama.cpp. Shipped unmodified, as built by TheRock.
+  Copyright the LLVM Project contributors.
+  Apache License, Version 2.0 with LLVM Exceptions (Apache-2.0 WITH LLVM-exception):
+  http://www.apache.org/licenses/LICENSE-2.0 and the exceptions below.
+
+  ---- LLVM Exceptions to the Apache 2.0 License ----
+
+  As an exception, if, as a result of your compiling your source code, portions
+  of this Software are embedded into an Object form of such source code, you
+  may redistribute such embedded portions in such Object form without complying
+  with the conditions of Sections 4(a), 4(b) and 4(d) of the License.
+
+  In addition, if you combine or link compiled forms of this Software with
+  software that is licensed under the GPLv2 ("Combined Software") and if a
+  court of competent jurisdiction determines that the patent provision (Section
+  3), the indemnity provision (Section 9) or other Section of the License
+  conflicts with the conditions of the GPLv2, you may retain the Apache License
+  terms with respect to the Combined Software notwithstanding such conflict.
+
+-------------------------------------------------------------------------------------
 MIT License
 
 Permission is hereby granted, free of charge, to any person obtaining a copy of this

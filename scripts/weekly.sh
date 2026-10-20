@@ -30,7 +30,7 @@
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
 # config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
-# what the build scripts each list.
+# what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
 [ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
@@ -47,6 +47,9 @@ export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
 SUBMODULES=(hrx-system llama.cpp lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
+# pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
+# shellcheck source=scripts/pack-elf.sh
+. "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
 # Heavy steps wait for room, and stop before the box runs out of memory (unified memory: GPU
@@ -98,6 +101,13 @@ checkout() {  # checkout <ref> [pr number to merge on top]
 
 pin() { git -C "$SRC" ls-tree HEAD "third_party/$1" | awk '{print $3}'; }
 
+# the machine a held bump failed on, for the release notes: its name and its AMD GPU(s), from
+# sysfs (scripts/gpu-targets.sh), e.g. "strixhalo (gfx1151)" or "ryzen (gfx1036, gfx1201)"
+host_desc() {
+    local g; g=$("$(cd "$(dirname "$0")" && pwd)/gpu-targets.sh" 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+    echo "$(hostname -s) (${g:-no AMD GPU})"
+}
+
 # --- build / test -------------------------------------------------------------------------
 build() {
     # the private components compiled in (docs/releases.md, "Private components"): the NPU runtime
@@ -113,6 +123,11 @@ build() {
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
+    # The ONNX backend ships with Microsoft's ONNX Runtime (GenAI) only: with RYZENAI_INSTALL_PATH
+    # set, build-onnx.sh would copy AMD's Ryzen AI Software libraries beside ryzenai-server and
+    # they would land in the package (package_checks refuses them too). The NPU through ONNX uses
+    # the user's own install at run time (docs/onnx.md, "Linux NPU").
+    unset RYZENAI_INSTALL_PATH
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
@@ -210,7 +225,7 @@ stage_bumps() {
         if [ $rc -ne 0 ]; then
             # the step that failed, and the last lines of the log it wrote (the newest besides ours)
             local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-" | head -1)
-            result=held why="failed at $(cat "$W/.step") on Strix Halo ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
+            result=held why="failed at $(cat "$W/.step") on $(host_desc) ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
         elif [ "$DRY" = 1 ]; then
             result=passed why="dry run: not merged"
         else
@@ -246,9 +261,14 @@ stage_test() { run_tests; }
 #   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
 #             like one of the private checkouts' files
 #   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
+#   onnx      onnx/ holds ryzenai-server, Microsoft's libonnxruntime-genai / libonnxruntime and their
+#             licence texts, nothing else: no part of AMD's Ryzen AI Software (the RyzenAI / VitisAI
+#             providers, AMD_LICENSE, the AIE compiler libraries), which users install themselves
 # Checks the build's 1bit and every file in the tarball.
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
+    # (lists go to stderr through `tee >(cat >&2)`, not `tee /dev/stderr`: reopening the log by
+    # that name truncates it, and the earlier lines of package-checks.log were lost, 2026-10-20)
     local t bad=0 f n names pin
     t=$(mktemp -d)
     tar -C "$t" -xf "$1" --use-compress-program=unzstd
@@ -270,18 +290,46 @@ package_checks() {  # package_checks <linux tarball>
         echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
     else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
     n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
-            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee /dev/stderr | wc -l)
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
     names=$(for pin in npu-runtime gpu-kernels; do
                 git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
             done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
-    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee /dev/stderr | wc -l)
+    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
         [ "$n" != 0 ] || { echo "FAIL $f is not in $(basename "$1")"; bad=1; }
     done
+    # every library each program loads is packed beside it (scripts/pack-elf.sh), except the TheRock
+    # runtime the package documents (HIP, hipBLAS(Lt), rocBLAS, HSA); ldd runs with
+    # ROCR_VISIBLE_DEVICES=-1, so nothing touches a GPU
+    local missing; missing=$(pack_missing_libs "$t")
+    if [ -z "$missing" ]; then echo "ok   every library is packed (ldd: nothing missing beyond TheRock's runtime)"
+    else echo "FAIL libraries ldd cannot find in $(basename "$1"):"; echo "$missing"; bad=1; fi
+    if [ -d "$t"/*/onnx ]; then
+        n=$(find "$t"/*/onnx -mindepth 1 \! \( -name ryzenai-server -o -name 'libonnxruntime-genai.so*' \
+                -o -name 'libonnxruntime.so*' -o -name '*.txt' \) -printf '%f\n' | tee >(cat >&2) | wc -l)
+        [ "$n" = 0 ] || { echo "FAIL onnx/ carries files beyond ryzenai-server and Microsoft's ONNX Runtime (Ryzen AI Software?)"; bad=1; }
+        for f in ryzenai-server-LICENSE.txt onnxruntime-LICENSE.txt onnxruntime-ThirdPartyNotices.txt \
+                 onnxruntime-genai-LICENSE.txt onnxruntime-genai-ThirdPartyNotices.txt; do
+            [ -f "$(echo "$t"/*/onnx)/$f" ] || { echo "FAIL onnx/$f is not in $(basename "$1")"; bad=1; }
+        done
+        # DT_RUNPATH $ORIGIN only: LD_LIBRARY_PATH must win so `1bit serve` can put a Ryzen AI
+        # venv's ONNX Runtime GenAI first (app/serve.cpp ryzenai_child_env), and no path may
+        # point into the build machine
+        f=$(echo "$t"/*/onnx/ryzenai-server)
+        n=$(readelf -d "$f" 2>/dev/null | grep -c '(RPATH)' || true)
+        [ "$n" = 0 ] || { echo "FAIL onnx/ryzenai-server has a DT_RPATH (LD_LIBRARY_PATH cannot override it)"; bad=1; }
+        n=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')
+        [ "$n" = '$ORIGIN' ] || { echo "FAIL onnx/ryzenai-server RUNPATH is '$n', not \$ORIGIN"; bad=1; }
+        n=$(strings -a "$f" | grep -c '^1bit-onnx-signal-shim' || true)
+        [ "$n" != 0 ] || { echo "FAIL onnx/ryzenai-server lacks the SIGTERM shim (scripts/onnx/signal_shim.c)"; bad=1; }
+        [ $bad = 0 ] && echo "ok   onnx/: ryzenai-server (RUNPATH \$ORIGIN, SIGTERM shim) and ONNX Runtime with their licences, no Ryzen AI Software"
+    else
+        echo "FAIL no onnx/ in $(basename "$1") (weekly builds -DONEBIT_ONNX=ON)"; bad=1
+    fi
     rm -rf "$t"
     return $bad
 }
@@ -291,6 +339,10 @@ stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
     while gh release view "$tag" -R "$REPO" > /dev/null 2>&1; do n=$((n + 1)); tag=v$(date +%G.%V).$n; done
     echo "$tag" > "$TAG_FILE"
+    # the image's licences step copies from the submodules of $SRC (checked out by build), not
+    # from the tree this script runs from
+    [ -f "$SRC/third_party/lemonade/LICENSE" ] ||
+        { say "no $SRC/third_party/lemonade/LICENSE: run the build stage first (it checks out the submodules)"; return 1; }
     rm -rf "$OUT" && mkdir -p "$OUT"
     say "package $tag: the engine (into the Lemonade + onebit package)"
     # the engine tree (package-linux.sh) is not published on its own: it goes into the Lemonade
@@ -323,13 +375,55 @@ stage_release() {
     if [ -n "$prev" ]; then from=$(git -C "$SRC" rev-list -1 "$prev");
     else from=$(git -C "$SRC" rev-list -1 --before="7 days ago" origin/main); fi
     [ -n "$from" ] || from=$(git -C "$SRC" rev-list --max-parents=0 origin/main | tail -1)
+    # stages run one at a time (docs/releases.md): without the bumps stage there is no bumps.json
+    [ -f "$W/bumps.json" ] || echo "[]" > "$W/bumps.json"
     say "release $tag: changes ${from:0:12}..$(git -C "$SRC" rev-parse --short HEAD) (previous: ${prev:-none})"
     python3 "$SRC/tools/weekly_changes.py" --src "$SRC" --from "$from" --to HEAD --tag "$tag" \
         --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md"
+    # the checksums cover changes.json too (package wrote them before it existed)
+    (cd "$OUT" && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS)
     if [ "$DRY" = 1 ]; then say "dry run: not publishing"; return; fi
     gh release create "$tag" -R "$REPO" --target "$(git -C "$SRC" rev-parse HEAD)" \
         --title "1bit engine $tag" -F "$W/notes.md" "$OUT"/*
     say "released $tag"
 }
+
+# --- preflight ----------------------------------------------------------------------------
+# What the stages need from the machine, checked before the first one runs, so that a missing
+# tool stops the run at the start rather than after an hour of build (2026-10-19 rehearsal).
+preflight() {
+    local bad=0 s rocm d kver vmlinuz
+    for s in $STAGES; do
+        case "$s" in
+            bumps|build)
+                # the HRX build's toolchain (cmake/hrx.cmake), unless WEEKLY_CMAKE_ARGS names another
+                case " ${WEEKLY_CMAKE_ARGS:-} " in
+                    *ONEBIT_HRX_TOOLCHAIN=*) ;;
+                    *) [ -d /opt/rocm-therock ] ||
+                        { echo "preflight: no /opt/rocm-therock (the HRX toolchain): install TheRock there, or pass -DONEBIT_HRX_TOOLCHAIN=<dir> in WEEKLY_CMAKE_ARGS"; bad=1; } ;;
+                esac
+                # DwarfStar (-DONEBIT_DS4=ON) builds with hipcc, found the way scripts/build-ds4.sh finds it
+                rocm=${ROCM_PATH:-}
+                if [ -z "$rocm" ]; then
+                    for d in /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
+                        [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
+                    done
+                fi
+                [ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||
+                    { echo "preflight: no ROCm with bin/hipcc for the DwarfStar build (scripts/build-ds4.sh): set ROCM_PATH"; bad=1; } ;;
+            package)
+                # scripts/package-linux.sh rewrites RPATHs with patchelf
+                command -v patchelf > /dev/null ||
+                    { echo "preflight: patchelf is not installed (scripts/package-linux.sh needs it): apt install patchelf"; bad=1; }
+                # os/mini/mkimage.sh reads the kernel image; on Ubuntu /boot/vmlinuz-* is root-only
+                kver=${KVER:-$(uname -r)}
+                vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
+                [ -r "$vmlinuz" ] ||
+                    { echo "preflight: cannot read the kernel image $vmlinuz (os/mini/mkimage.sh): set VMLINUZ to a readable copy"; bad=1; } ;;
+        esac
+    done
+    return $bad
+}
+preflight || { say "preflight failed: nothing was run"; exit 1; }
 
 for s in $STAGES; do "stage_$s"; done

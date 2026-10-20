@@ -177,6 +177,7 @@ struct Options {
     bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
     bool strict_device = false;          // --strict-device: refuse to start unless every node is on HRX (engine #390)
     bool placement_report = false;       // --placement-report: ask the backend for its off-HRX op counts
+    bool print_backend = false;          // --print-backend: print the llama-server command and exit (Lemonade one hop)
     WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
     CwsrPlacement cwsr_placement = CwsrPlacement::Auto;  // --hrx-cwsr-placement (app/hrx_cwsr.h, engine#315)
 };
@@ -320,6 +321,63 @@ bool is_onnx_model_dir(const std::string& dir) {
     return fs::is_directory(dir) && fs::exists(fs::path(dir) / "genai_config.json");
 }
 
+// The execution mode an ONNX Runtime GenAI model declares, read as ryzenai-server reads it:
+// "npu" when the RyzenAI provider (or config_entries) has hybrid_opt_token_backend "npu",
+// "hybrid" for the RyzenAI provider without it, "" for a CPU model (no RyzenAI provider).
+std::string onnx_ryzenai_mode(const std::string& dir) {
+    try {
+        std::ifstream f(fs::path(dir) / "genai_config.json");
+        const json cfg = json::parse(f);
+        const json& session = cfg.at("model").at("decoder").at("session_options");
+        if (session.contains("config_entries") && session["config_entries"].value("hybrid_opt_token_backend", "") == "npu")
+            return "npu";
+        if (!session.contains("provider_options")) return "";
+        for (const json& p : session["provider_options"]) {
+            if (!p.is_object() || !p.contains("RyzenAI")) continue;
+            return p["RyzenAI"].is_object() && p["RyzenAI"].value("hybrid_opt_token_backend", "") == "npu" ? "npu" : "hybrid";
+        }
+    } catch (const std::exception&) {
+    }
+    return "";
+}
+
+// Ryzen AI Software for Linux (docs/onnx.md, "Linux NPU"): its installer makes a venv whose
+// deployment/lib holds ONNX Runtime GenAI with the RyzenAI execution provider, and XRT lives
+// in a prefix of its own. ONEBIT_RYZENAI_ROOT names the venv; ONEBIT_XRT_ROOT the XRT prefix
+// (else $XILINX_XRT, else /opt/xilinx/xrt). The child's environment, in the order the
+// libraries must resolve: XRT's lib first (the venv's voe wheel bundles an older
+// libxrt_coreutil that must not shadow it), then ryzenai-server's own directory (the copies
+// scripts/build-onnx.sh made and cleared of executable stacks), then deployment/lib, then what
+// LD_LIBRARY_PATH already held. The provider library is the copy beside the server when the
+// build made one. A server with no provider beside it was built against Microsoft's ONNX Runtime
+// (the release package's onnx/, which ships no part of Ryzen AI Software): then deployment/lib
+// comes before the server's directory, so the venv's ONNX Runtime GenAI, the one that knows the
+// RyzenAI provider, loads instead of the CPU-only copy beside the binary. That works because
+// scripts/build-onnx.sh gives that build DT_RUNPATH $ORIGIN, which yields to LD_LIBRARY_PATH (a
+// DT_RPATH would not: the CPU-only copy would load and the provider be unknown), and the
+// release package keeps it (weekly.sh checks). Nothing in the venv is modified.
+std::vector<std::string> ryzenai_child_env(const std::string& root, const fs::path& server_dir) {
+    const fs::path deployment = fs::path(root) / "deployment" / "lib";
+    if (!fs::is_directory(deployment))
+        throw std::runtime_error("ONEBIT_RYZENAI_ROOT=" + root + ": no deployment/lib there (a Ryzen AI Software venv has one, docs/onnx.md)");
+    std::string xrt;
+    if (const char* e = std::getenv("ONEBIT_XRT_ROOT"); e && *e) xrt = e;
+    else if (const char* e2 = std::getenv("XILINX_XRT"); e2 && *e2) xrt = e2;
+    else xrt = "/opt/xilinx/xrt";
+    if (!fs::is_directory(fs::path(xrt) / "lib"))
+        throw std::runtime_error("no XRT at " + xrt + " (no lib/ there): set ONEBIT_XRT_ROOT to the XRT prefix, docs/onnx.md");
+    fs::path ep = server_dir / "libonnxruntime_providers_ryzenai.so";
+    const bool own_copies = !server_dir.empty() && fs::exists(ep);
+    if (!own_copies) ep = deployment / "libonnxruntime_providers_ryzenai.so";
+    std::string ld = (fs::path(xrt) / "lib").string();
+    if (own_copies) ld += ":" + server_dir.string() + ":" + deployment.string();
+    else ld += ":" + deployment.string() + (server_dir.empty() ? "" : ":" + server_dir.string());
+    if (const char* old = std::getenv("LD_LIBRARY_PATH"); old && *old) ld += std::string(":") + old;
+    if (!fs::exists(ep))
+        throw std::runtime_error(ep.string() + " is missing: the RyzenAI execution provider of Ryzen AI Software for Linux");
+    return {"XILINX_XRT=" + xrt, "LD_LIBRARY_PATH=" + ld, "RYZENAI_EP_PATH=" + ep.string()};
+}
+
 // DwarfStar's ds4-server (third_party/ds4, MIT), built by scripts/build-ds4.sh
 std::string default_ds4() {
     if (const char* e = std::getenv("ONEBIT_DS4"); e && *e) return e;
@@ -421,13 +479,43 @@ PortOwner port_owner(pid_t child, int port) {
 #endif
 
 // A child OpenAI-compatible server on a loopback port.
+// The child's environment: ours, plus env_extra where a variable is not set (a value the user
+// set wins), plus env_override in place of whatever was set (the few a route must own: the
+// library order the RyzenAI provider needs, which already folds in the user's LD_LIBRARY_PATH).
+void merge_env(std::vector<std::string>& env_store, const std::vector<std::string>& env_extra,
+               const std::vector<std::string>& env_override) {
+    for (const auto& e : env_extra) {
+        const std::string key = e.substr(0, e.find('=') + 1);
+        bool present = false;
+        for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
+        if (!present) env_store.push_back(e);
+    }
+    for (const auto& e : env_override) {
+        const std::string key = e.substr(0, e.find('=') + 1);
+        std::erase_if(env_store, [&](const std::string& have) { return have.rfind(key, 0) == 0; });
+        env_store.push_back(e);
+    }
+}
+
+// ONEBIT_BACKEND_STOP_GRACE_S: how long Child::stop waits after SIGTERM before SIGKILL (default 30 s).
+int stop_grace_s() {
+    if (const char* e = std::getenv("ONEBIT_BACKEND_STOP_GRACE_S"); e && *e) {
+        char* end = nullptr;
+        const long v = std::strtol(e, &end, 10);
+        if (end && *end == '\0' && v >= 0 && v <= 86400) return int(v);
+        std::fprintf(stderr, "1bit serve: ONEBIT_BACKEND_STOP_GRACE_S=%s ignored (whole seconds, 0..86400); using 30\n", e);
+    }
+    return 30;
+}
+
 #ifdef _WIN32
 // Windows: CreateProcess into a job object that kills its processes when its last handle
 // closes, so the backend dies with `1bit serve` for any reason (Linux: PR_SET_PDEATHSIG).
 class Child {
 public:
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr)
+          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr,
+          const std::vector<std::string>& env_override = {})
         : port_(port), ready_path_(std::move(ready_path)) {
         (void)on_line;  // the backend's stderr is its own on Windows
         // the command line, each argument quoted the way CommandLineToArgvW reads it back
@@ -452,12 +540,7 @@ public:
             for (char* e = block; *e; e += std::strlen(e) + 1) env_store.emplace_back(e);
             ::FreeEnvironmentStringsA(block);
         }
-        for (const auto& e : env_extra) {
-            const std::string key = e.substr(0, e.find('=') + 1);
-            bool present = false;
-            for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
-            if (!present) env_store.push_back(e);
-        }
+        merge_env(env_store, env_extra, env_override);
         std::string env_block;
         for (const auto& e : env_store) { env_block += e; env_block += '\0'; }
         env_block += '\0';
@@ -509,19 +592,15 @@ class Child {
 public:
     // on_line, where given, sees every complete line the backend writes to its stderr (Linux)
     Child(const std::vector<std::string>& argv, const std::vector<std::string>& env_extra, int port,
-          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr)
+          std::string ready_path = "/health", std::function<void(const std::string&)> on_line = nullptr,
+          const std::vector<std::string>& env_override = {})
         : port_(port), ready_path_(std::move(ready_path)) {
         std::vector<char*> args;
         for (const auto& a : argv) args.push_back(const_cast<char*>(a.c_str()));
         args.push_back(nullptr);
         std::vector<std::string> env_store;
         for (char** e = environ; *e; ++e) env_store.emplace_back(*e);
-        for (const auto& e : env_extra) {
-            const std::string key = e.substr(0, e.find('=') + 1);
-            bool present = false;
-            for (const auto& have : env_store) present = present || have.rfind(key, 0) == 0;
-            if (!present) env_store.push_back(e);  // a value the user set wins
-        }
+        merge_env(env_store, env_extra, env_override);
         std::vector<char*> envp;
         for (auto& e : env_store) envp.push_back(e.data());
         envp.push_back(nullptr);
@@ -574,29 +653,47 @@ public:
     Child(const Child&) = delete;
     Child& operator=(const Child&) = delete;
 
+    // SIGTERM to the child itself (it shares our process group, so no group signal: that would
+    // reach serve and every other backend), then a wait before SIGKILL: a backend that holds an
+    // NPU hardware context (ryzenai-server on the RyzenAI provider) must get to close it itself.
+    // Killing such a process outright, with a live context after an earlier firmware timeout,
+    // took the kernel down on amdxdna 0.17.0 (2026-10-11, list_del corruption in
+    // amdxdna_client_cleanup). The wait is ONEBIT_BACKEND_STOP_GRACE_S (30 s by default: a
+    // backend busy in a long dispatch); the escalation stays, a hung backend for ever is worse.
+    // A child that already exited (reaped by alive()) needs nothing: no signal, no wait.
     void stop() {
-        if (pid_ <= 0) return;
+        if (pid_ <= 0 || reap(WNOHANG)) return;
         ::kill(pid_, SIGTERM);
-        for (int i = 0; i < 50; i++) {
-            if (::waitpid(pid_, nullptr, WNOHANG) == pid_) { pid_ = -1; return; }
+        const int grace = stop_grace_s();
+        for (int i = 0; i < grace * 10; i++) {
+            if (reap(WNOHANG)) return;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
+        std::fprintf(stderr, "1bit serve: backend pid %d ignored SIGTERM for %d s; sending SIGKILL "
+                             "(on amdxdna, killing a process that holds an NPU context can take the kernel down; "
+                             "ONEBIT_BACKEND_STOP_GRACE_S sets this wait)\n", int(pid_), grace);
         ::kill(pid_, SIGKILL);
-        ::waitpid(pid_, nullptr, 0);
-        pid_ = -1;
+        reap(0);
     }
 
-    bool alive() const { return pid_ > 0 && ::waitpid(pid_, nullptr, WNOHANG) == 0; }
+    bool alive() const { return pid_ > 0 && !reap(WNOHANG); }
+
+    // how the child ended ("exit 3", "signal 6"), "" while it runs or before it was reaped
+    std::string exit_text() const {
+        if (!exited_) return "";
+        if (WIFEXITED(status_)) return "exit " + std::to_string(WEXITSTATUS(status_));
+        if (WIFSIGNALED(status_)) return "signal " + std::to_string(WTERMSIG(status_));
+        return "gone";
+    }
 
     // The watchdog's stop: SIGKILL at once (a wedged GPU process does not act on SIGTERM), then
     // up to `wait` for it to go. False when it is still there (stuck in the kernel).
     bool kill_now(std::chrono::seconds wait) {
-        if (pid_ <= 0) return true;
+        if (reap(WNOHANG)) return true;
         ::kill(pid_, SIGKILL);
         const auto end = std::chrono::steady_clock::now() + wait;
         while (std::chrono::steady_clock::now() < end) {
-            const pid_t r = ::waitpid(pid_, nullptr, WNOHANG);
-            if (r == pid_ || (r < 0 && errno == ECHILD)) { pid_ = -1; return true; }
+            if (reap(WNOHANG)) return true;
             std::this_thread::sleep_for(std::chrono::milliseconds(100));
         }
         return false;
@@ -636,7 +733,22 @@ private:
 #ifdef _WIN32
     HANDLE proc_ = nullptr, job_ = nullptr;
 #else
-    pid_t pid_ = -1;
+    // Every waitpid on the child goes through here, so alive() and stop() agree: once the child
+    // is reaped (options WNOHANG to poll, 0 to wait) its status is kept and pid_ is -1. True once
+    // the child is gone. ECHILD (reaped elsewhere) counts as gone with no status.
+    bool reap(int options) const {
+        if (pid_ <= 0) return true;
+        int status = 0;
+        pid_t r;
+        while ((r = ::waitpid(pid_, &status, options)) < 0 && errno == EINTR) {}
+        if (r == 0) return false;
+        if (r == pid_) { exited_ = true; status_ = status; }
+        pid_ = -1;
+        return true;
+    }
+    mutable pid_t pid_ = -1;      // the running child; -1 once reaped (or never started)
+    mutable bool exited_ = false; // reaped with a status (status_)
+    mutable int status_ = 0;
 #endif
     int port_;
     std::string ready_path_;
@@ -663,6 +775,15 @@ struct InFlight {
 private:
     std::atomic<int>* n_;
 };
+
+// whether a request body asks for a streamed reply
+bool wants_stream(const std::string& body) {
+    try {
+        return json::parse(body).value("stream", false);
+    } catch (const std::exception&) {
+        return false;
+    }
+}
 
 // watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h).
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
@@ -760,6 +881,8 @@ struct Launch {
     std::string set_model;
     bool mtp = false;
     std::string ready_path = "/health";
+    std::vector<std::string> env_override;  // set in place of the inherited value (Child)
+    bool npu_retry = false;  // an NPU model on onnx: retry a failed non-streamed request once (serve_child)
 };
 
 // The backend process for one device: its command line and environment.
@@ -847,6 +970,20 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             throw std::runtime_error("--device onnx takes no --parallel, --mtp, --dflash or --mmproj");
         argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
+        if (const std::string mode = onnx_ryzenai_mode(o.model); !mode.empty()) {
+            // Linux: the RyzenAI provider's runtime comes from the Ryzen AI Software venv
+            // ONEBIT_RYZENAI_ROOT names (ryzenai_child_env); unset, the environment is the
+            // user's own (RYZENAI_EP_PATH and LD_LIBRARY_PATH as they exported them)
+            if (const char* root = std::getenv("ONEBIT_RYZENAI_ROOT"); root && *root) {
+                const fs::path server(argv[0]);  // a bare name resolves on PATH: no directory of its own
+                l.env_override = ryzenai_child_env(root, server.has_parent_path() ? fs::absolute(server).parent_path() : fs::path());
+            } else if (!std::getenv("RYZENAI_EP_PATH")) {
+                std::fprintf(stderr, "1bit serve: %s declares the RyzenAI provider (%s); set ONEBIT_RYZENAI_ROOT to the "
+                                     "Ryzen AI Software venv so ryzenai-server finds it (docs/onnx.md, Linux NPU)\n",
+                             o.model.c_str(), mode.c_str());
+            }
+            l.npu_retry = mode == "npu";
+        }
         return l;
     }
     if (device == "hrx" || device == "cpu") {
@@ -1330,6 +1467,48 @@ std::string request_state(const httplib::Request& req, bool head_only = false) {
     return out;
 }
 
+// --print-backend (docs/serve.md, "One hop from Lemonade"): a route that needs serve in the
+// request path. Exit 5 tells Lemonade's onebit recipe to run `1bit serve` as before.
+constexpr int kServeOnly = 5;
+int serve_only(const std::string& why) {
+    std::fprintf(stderr, "1bit serve: --print-backend: %s; run 1bit serve itself\n", why.c_str());
+    return kServeOnly;
+}
+
+// --print-backend: the llama-server serve would start for this model, as one JSON line on stdout,
+// after every check serve makes before a load (architecture, memory, recipes). Lemonade starts it
+// on the port it chose (--port) and talks to it directly: one HTTP hop and two processes instead of
+// two and three. What serve added on the request path is the backend's own there: /health answers
+// 503 while the main loop is stalled with work queued (llama.cpp fork #111), so Lemonade's
+// BackendWatchdog resets a hung GPU; --strict-device is GGML_HRX_STRICT in the backend; replies carry
+// Lemonade's name through --alias. env holds only what the caller's environment does not set
+// already, so a value the user set still wins, as it does under serve.
+int print_backend(const Options& o, const Launch& l) {
+    const bool llama = l.device.rfind("hrx", 0) == 0 || l.device.rfind("cpu", 0) == 0;
+    if (!llama) return serve_only("--device " + l.device + " is not a llama-server");
+    std::vector<std::string> argv = l.argv;
+    auto has = [&argv](const char* flag) { return std::find(argv.begin(), argv.end(), flag) != argv.end(); };
+    if (!o.alias.empty() && !has("--alias")) argv.insert(argv.end(), {"--alias", o.alias});
+    // serve's proxy reused nothing between requests; the backend can shift a cached prefix into
+    // place when a conversation's history changes in the middle (chunks of at least 256 tokens).
+    // A recipe's own --cache-reuse wins; recurrent models ignore it (llama.cpp checks can_shift).
+    if (o.role.empty() && !has("--cache-reuse")) argv.insert(argv.end(), {"--cache-reuse", "256"});
+    json env = json::object();
+    for (const std::string& e : l.env) {
+        const auto eq = e.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = e.substr(0, eq);
+        if (!std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
+    }
+    json out = json::object();
+    out["device"] = l.device;
+    out["port"] = l.port;
+    out["argv"] = argv;
+    out["env"] = env;
+    std::printf("%s\n", out.dump().c_str());
+    return 0;
+}
+
 int serve_child(const Options& given) {
     Options o = given;
     if (hadamard_q4_0(o.model))
@@ -1372,6 +1551,14 @@ int serve_child(const Options& given) {
             throw std::runtime_error(o.model + " is a 1BP package: it runs on --device ds4 (docs/dwarfstar.md)");
         if (o.laya_auto || !o.laya_model.empty())
             throw std::runtime_error("--laya routes among devices; a 1BP package runs on ds4 only");
+    }
+    if (o.print_backend) {
+        // --print-backend (docs/serve.md, "One hop from Lemonade"): only a lone llama-server can be
+        // started by Lemonade itself; these need serve in the request path
+        if (o.device == "ds4" || o.device == "onnx") return serve_only("--device " + o.device + " is not a llama-server");
+        if (o.pm) return serve_only("--pm runs its tool loop in serve");
+        if (o.laya_auto || !o.laya_model.empty()) return serve_only("--laya routes each request in serve");
+        if (!o.embed.empty() || !o.rerank.empty()) return serve_only("--embed and --rerank run more servers behind serve");
     }
     // --pm (docs/pm.md): the model is the Project Manager. Its chat completions run the tool loop
     // in app/pm.cpp against the one backend; the experts are Lemonade's models, reached by URL.
@@ -1509,14 +1696,15 @@ int serve_child(const Options& given) {
             throw std::runtime_error("--" + o.role + " runs on llama-server devices (hrx, cpu), not " + dev);
         if (!o.mtp.empty() || !o.dflash.empty())
             throw std::runtime_error("--" + o.role + " does not combine with --mtp or --dflash");
-        Launch l = launch_for(o, dev, free_port());
+        Launch l = launch_for(o, dev, o.print_backend ? o.port : free_port());
         const std::string batch = std::to_string(o.ctx_size > 0 ? o.ctx_size : 8192);
         for (const std::string& a : {std::string("--") + o.role, std::string("-b"), batch, std::string("-ub"), batch})
             l.argv.push_back(a);
         l.device = dev + " " + o.role;
         backends.push_back(std::move(l));
     } else {
-        backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device, free_port()));
+        backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device,
+                                      o.print_backend ? o.port : free_port()));
     }
     const std::string device = laya ? "laya" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
@@ -1568,6 +1756,7 @@ int serve_child(const Options& given) {
             return 0;
         }
     }
+    if (o.print_backend) return print_backend(o, backends[0]);
     std::atomic<bool> ready{false};
     // the placement line is reprinted whenever a graph reports more nodes off HRX than every graph
     // before it: the worst graph is the one worth acting on, and it is not always the first (the
@@ -1596,6 +1785,11 @@ int serve_child(const Options& given) {
     install_request_guard(srv, o.host);  // Host / Origin (app/http_guard.h)
     std::vector<std::unique_ptr<Child>> children;
     std::mutex start_mu;
+    auto all_alive = [&] {
+        std::lock_guard<std::mutex> lock(start_mu);
+        for (auto& c : children) if (!c->alive()) return false;
+        return true;
+    };
     // /health: 503 while loading; once loaded, 503 too when a backend has exited, does not answer
     // its own health route within 1.5 s, or the watchdog found it wedged. Lemonade's BackendWatchdog
     // probes this route and reloads a backend that fails it.
@@ -1653,7 +1847,7 @@ int serve_child(const Options& given) {
         if (started[i]) return true;
         const Launch& b = backends[i];
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line);
+        auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
         started[i] = c.get();
         children.push_back(std::move(c));
@@ -1748,6 +1942,17 @@ int serve_child(const Options& given) {
         }
         ++routed[pick];
         forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
+        if (backends[pick].npu_retry && r.status >= 500 && !wants_stream(q.body) && all_alive()) {
+            // The NPU's first dispatch after idle can hit a one-off firmware timeout (TDR); the
+            // device recovers and the same request then runs. One retry, said aloud, for a reply
+            // nothing of which reached the client (a stream is not retried: its bytes went out).
+            std::fprintf(stderr, "1bit serve: %s answered %d on %s; retrying once (first NPU dispatch after idle can time out)\n",
+                         backends[pick].device.c_str(), r.status, q.path.c_str());
+            std::this_thread::sleep_for(std::chrono::seconds(1));
+            r.status = 200;
+            r.body.clear();
+            forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
+        }
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -1867,7 +2072,7 @@ int serve_child(const Options& given) {
 #endif
     for (const auto& b : laya ? std::vector<Launch>{} : backends) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
-        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line));
+        children.push_back(std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override));
     }
     for (const auto& b : rag) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
@@ -1925,11 +2130,6 @@ int serve_child(const Options& given) {
         if (!o.pm_spawn_url.empty())
             std::fprintf(stderr, "1bit serve: pm: agent workers (spawn_worker) through %s\n", o.pm_spawn_url.c_str());
     }
-    auto all_alive = [&] {
-        std::lock_guard<std::mutex> lock(start_mu);
-        for (auto& c : children) if (!c->alive()) return false;
-        return true;
-    };
     // The progress watchdog (app/serve_watchdog.h): while requests are in flight, probe each busy
     // backend's main loop (GET /slots answers only between llama-server's decode steps) and look
     // for a request with no progress past its limit.
@@ -2029,7 +2229,14 @@ int serve_child(const Options& given) {
         return 0;
     }
     lifecycle.count_backend_exit();
-    std::fprintf(stderr, "1bit serve: a %s backend exited\n", device.c_str());
+    std::string how;
+#ifndef _WIN32
+    {
+        std::lock_guard<std::mutex> lock(start_mu);
+        for (auto& c : children) if (how.empty() && !c->alive()) how = c->exit_text();
+    }
+#endif
+    std::fprintf(stderr, "1bit serve: a %s backend exited%s%s\n", device.c_str(), how.empty() ? "" : ": ", how.c_str());
     return 1;
 }
 
@@ -2294,6 +2501,10 @@ void usage(FILE* out) {
                  "                  one has more off HRX (passes -lv 4 to llama-server; engine #390)\n"
                  "                  [--strict-device]   refuse to start unless the whole graph is on HRX (needs\n"
                  "                  --device hrx or auto; engine #390)\n"
+                 "                  [--print-backend]   print the llama-server serve would start (argv and env, one\n"
+                 "                  JSON line) and exit: 0 printed, 3 does not fit, 5 the route needs serve itself\n"
+                 "                  (NPU, ONNX, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
+                 "                  it directly, one hop (docs/serve.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           or a .gguf file\n");
@@ -2364,6 +2575,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mem-check") o.mem_check_only = true;
         else if (a == "--strict-device") o.strict_device = true;
         else if (a == "--placement-report") o.placement_report = true;
+        else if (a == "--print-backend") o.print_backend = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
         else if (a == "--watchdog-prompt-tps") o.watchdog.prompt_tps = std::stod(next());
         else if (a == "--lemonade-url") o.lemonade_url = next();
@@ -2378,6 +2590,11 @@ int run_serve(int argc, char** argv) {
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
+    if (o.print_backend) {
+        if (is_onnx_model_dir(o.model)) return serve_only("an ONNX Runtime GenAI directory runs on ryzenai-server behind serve");
+        if (fs::is_directory(o.model)) return serve_only("an NPU model directory runs in serve's own process");
+        if (o.device == "npu") return serve_only("--device npu runs in serve's own process");
+    }
 
     if (is_onnx_model_dir(o.model)) {
         if (o.device != "auto" && o.device != "onnx")

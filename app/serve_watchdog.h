@@ -37,6 +37,17 @@
 
 namespace onebit {
 
+// A line a backend writes to stderr when it has lost its GPU (a GPU reset, an MES hang), after which
+// it keeps running and answers every request with an error (engine TSVCHRX, 2026-10-19: after a
+// MODE2 reset ggml-hrx logs "DATA_LOSS; AMDGPU hardware exception" and llama-server returns HTTP 500
+// "Compute error" for good). Serve treats such a line like a wedged backend: kill it, exit non-zero,
+// and let systemd or Lemonade start it again on a working device.
+inline bool device_lost_line(const std::string& line) {
+    for (const char* mark : {"AMDGPU hardware exception", "ErrorDeviceLost", "VK_ERROR_DEVICE_LOST"})
+        if (line.find(mark) != std::string::npos) return true;
+    return false;
+}
+
 struct WatchdogConfig {
     double secs = 120;        // no progress for this long: the backend is wedged (0: watchdog off)
     double prompt_tps = 50;   // before the first byte, allow prompt_tokens / prompt_tps more

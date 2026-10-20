@@ -20,9 +20,8 @@ On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prom
 decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
 and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
 
-It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU. The engine builds no Vulkan or
-ROCm llama.cpp (RFC #213 stage 3); what HRX does not run, Lemonade serves with its own
-llamacpp backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
+It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
+backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
 
 ```
 HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
@@ -40,29 +39,76 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 | Submodule | Source | Pinned to |
 |---|---|---|
 | `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
-| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), branch `1bit/main` | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
+| `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), pinned on branch `1bit/e3e6a976-pin-6` (the commit `config/hrx-system-hold.config` names; `1bit/main` is where the unheld bump merges AMD) | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
 
-- **Our hrx-system commits** (branch `1bit/main` of our fork, on AMD's pin `51b1739`): a Loom
-  backport that drains ALU dependencies after a lane-mask SGPR pair is overwritten on GFX11 wave64
-  (the #313 NaN: the prompt FA kernel compiled for a 190-row ubatch read V from a wrong address in
-  about 1% of runs; upstream fixed the class in `ee77c8f7f`/`336037562`, which cannot be pinned yet),
-  and two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and `HRX_COMMAND_BUFFER_MODE`
-  (defaults unchanged). Rebase them by hand when AMD's pair moves.
+- **Our hrx-system commits** (since 2026-10-18 on branch `1bit/e3e6a976-pin-6` of our fork, on
+  AMD's `e3e6a9766ccb`): two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and
+  `HRX_COMMAND_BUFFER_MODE` (defaults unchanged); engine#409 (libhrx bounds-checks a length-less ELF
+  extent instead of skipping the check); engine#410 (`libhip_intercept` covers every HIP symbol the
+  backend exports, init is idempotent); engine#401 (libhsa no longer opens `/dev/accel` in GPU-only
+  processes); #6 (`generate_stubs.py` takes signatures from `api.h`, so `--check` is trustworthy;
+  regenerated `stubs_generated.c`); #8 (engine#315: `HRX_ALLOW_NO_SVM=1` lets the amdgpu HAL open a ROCr
+  that reports no SVM, which `1bit serve` uses to put the CWSR save area in GTT on a CWSR-on box;
+  unset, nothing changes); and our fix for the long-context attention miscompile
+  ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)): AMD's newer Loom no longer
+  reaches the defect on our prompts, but its multi-unit live-out guard is still in
+  `unit_liveness_builder.c`, so we keep removing it. The GFX11 wave64 lane-mask backport (#313) is
+  no longer ours: AMD carries its own (`planning/mask_write_wait`). The pin itself is a `-s ours`
+  merge of the previous pin `3319e536` (so every commit the engine shipped stays reachable, with the
+  tree of the tested commit `fc2213a1c`) followed by #6. Rebase these by hand when AMD's pair moves.
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.
 - **How it stays current.** `.github/workflows/bump-hrx.yml` runs daily. When AMD
-  moves its pair, it:
-  - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin);
-  - rebases our commits onto AMD's pin and moves `1bit/hrx-vulkan-patched` there,
-    after tagging the previous tip `patched-<sha>` so every commit the engine has
-    pinned stays reachable (a rebase conflict fails the run: rebase by hand);
-  - opens a PR here moving both submodules, listing the rebased commits.
+  moves its pair, it (through `scripts/bump-hrx-sync.sh`, which also runs locally with
+  `DRY_RUN=1` and pushes nothing):
+  - syncs the fork (`master` to ggml-org, `1bit/hrx-vulkan` to AMD's pin). When AMD
+    rewrites its history, the old `1bit/hrx-vulkan` tip is tagged `hrx-vulkan-<sha>` first,
+    and the run fails if that branch held a commit that is on no AMD branch;
+  - merges AMD's pin into `1bit/hrx-vulkan-patched`, after tagging the previous tip
+    `patched-<sha>` so every commit the engine has pinned stays reachable. Conflicts under
+    `ggml/src/ggml-hrx` keep our side; a conflict anywhere else fails the run and names the files;
+  - merges AMD's hrx-system pin into our `1bit/main` the same way;
+  - opens a PR here moving the submodules, listing the llama.cpp commits new to the engine.
+- **The hold.** While [`config/hrx-system-hold.config`](../config/hrx-system-hold.config)
+  names a commit, the run does not merge AMD's hrx-system, keeps `third_party/hrx-system`
+  where it is, and takes only AMD's llama.cpp changes outside the HRX backend paths
+  (`ggml/src/ggml-hrx`, `ggml/include/ggml-hrx.h`, `tests/*hrx*`), because AMD's ggml-hrx is
+  written against AMD's hrx-system. Those changes land as an ordinary commit, not a merge, so
+  AMD's HRX changes still arrive in full once the hold is lifted. It reports the hold in the run
+  summary and succeeds. From 2026-10-10 hrx-system was held at `98d05d94` while AMD's newer
+  hrx-system miscompiled long-context attention
+  ([ROCm/hrx-system#1535](https://github.com/ROCm/hrx-system/issues/1535)). On 2026-10-18 the
+  engine moved by hand to AMD's `e3e6a9766ccb` with our commits and our #1535 fix (above), after
+  test-backend-ops 1141/1141, the long-prompt needles, KLD 0 against the old pin on two models and
+  the hardware gate; the hold now names that pin, so later AMD hrx-system moves stay manual too.
+- **The backport line (2026-10-16, superseded 2026-10-18).** The hold named `1bit/held-98d05d94-3fixes`, a branch off
+  that same held commit carrying three fixes that have nothing to do with the AMD-core move:
+  engine#409 (libhrx bounds-checks a length-less ELF extent instead of skipping the check),
+  engine#410 (`libhip_intercept` covers every HIP symbol the backend exports; the documented
+  interceptor variable works and init is idempotent) and engine#401 (libhsa no longer opens
+  `/dev/accel` in GPU-only processes), plus the +61/−0 `api.h` forward-port the regenerated
+  passthrough stubs need. Nothing under the held AMD core changes, so the #1535 question is
+  untouched. Those fixes are now replayed on the e3e6a976 line above, and this branch is history.
+- **What guards a pair that no longer compiles.** AMD removes public LoomC symbols without notice
+  (2026-10-07: Loom `32d0c76a` dropped `loomc_amdgpu_runtime_global_flags_t` and
+  `loomc_amdgpu_emit_options_t`, which our `ggml/src/ggml-hrx/loom-jit.cpp` used), and CI builds
+  without HRX, so #353, #357 and #361 once merged a pair that did not compile with `ONEBIT_HRX=ON`
+  and #359 / #363 had to pin hrx-system back by hand. `bump-hrx.yml` now holds hrx-system itself when
+  any `loomc_*` / `LOOMC_*` identifier our backend uses is missing from the new revision's
+  `loom/binding/c/include`, and moves llama.cpp only. The hand move of 2026-10-18 (#441) was validated
+  the same way at the pinned pair: `onebit`, `llama_hrx`, `test-backend-ops`, `llama-server`,
+  `llama-bench`, `llama-perplexity`, `libamdhip64` and `libhip_intercept` all build and
+  `generate_stubs.py --check` passes against the built `libamdhip64.so`. `hrx-backend-test` still
+  fails to build on either pin (#422), so that check is not covered yet.
 - **The token it needs.** The secret `HRX_BUMP_TOKEN` is a fine-grained token with
   Contents read/write on `1bit-MONSTER/llama.cpp` and `1bit-MONSTER/engine`, and
   Pull requests read/write on `1bit-MONSTER/engine`.
-- **Validation.** CI builds that PR without HRX, so run the checks below on Strix
-  Halo before merging. The long-prompt result is pin-specific: run the probe against
+- **Validation.** CI builds that PR without HRX. The HRX hardware gate
+  ([hw-gate.md](hw-gate.md)) runs on every bump-hrx PR on Strix Halo: test-backend-ops on
+  HRX0, known-answer and drift checks on three models, KLD against the release pin and the
+  4.7K-token needle. Its check (`hw_gate`) must pass before merging. Before merging, also run the
+  checks below on Strix Halo. The long-prompt result is pin-specific: run the probe against
   the proposed `hrx-system` pin, and update
   [`config/hrx-long-prompt-validated-pin.config`](../config/hrx-long-prompt-validated-pin.config)
   to that full commit only after it passes. CI rejects a changed HRX pin that does not
@@ -361,6 +407,17 @@ program is rebuilt.
 
   (llama-bench `-p 0 -n 32/64`, runs interleaved on a shared strixhalo, 2026-09-27.)
   `ONEBIT_HRX_DECODE_SPLIT=0` turns it off; a `GGML_HRX_DISABLE_DISPATCH` you set yourself wins.
+- **The ZAYA1-8B NaN abort does not reproduce (engine#433).** Three aborts were reported on 2026-10-16
+  on the then-current pin (`06cc0ef` with llama.cpp `dd74f6bb0`) with a second HRX process on the GPU:
+  the sampler guard logged "HRX returned NaN logits" and the server stopped. Re-running that condition
+  on the current line gave **no abort in 60 fresh loads** — 20 loads alone, 20 with a resident
+  Qwen3-0.6B process on the GPU, and 20 with that second process on the older pin `1a5dcba2` — with
+  four slots, unified KV, `--ctx-size 16384` and the game's tool-templated request asserted on every
+  load, and 0 NaN lines. The report's 458-token prompt also cannot have carried a tool block: this
+  model's own chat template gives 257 tokens with no tools, 629 with one, 726 with two and 851 with
+  the four tools the game sends, so a 458-token request either had no tools or came from a different
+  template. The guard itself is unchanged: NaN still aborts unless `GGML_HRX_NAN_CONTINUE` is set, and
+  the current line logs `count`, `index range` and `contiguous` with it.
 - **GLM-4.7-Flash MLA decode accuracy (engine#310).** The reported 11.79-vs-10.60
   perplexity gap is not reproducible on the current pin (`f2099e9b7`), which includes the MLA
   strided-V fix ([llama.cpp #70](https://github.com/1bit-MONSTER/llama.cpp/pull/70)) and the
@@ -391,6 +448,48 @@ program is rebuilt.
   old-path A/B build, so the op-level drift bisect remains unverified. The masked-V kernel
   change includes a regression test that varies stale masked rows and requires bit-identical
   outputs.
+
+### CWSR save-area placement (engine#315)
+
+The shipped configuration for engine#315 is amdgpu with CWSR **off** (`amdgpu.cwsr_enable=0` on the
+kernel command line and in `/etc/modprobe.d`). Nothing below changes that, and it stays the
+recommended setting until a soak on a CWSR-on boot passes.
+
+On a box that runs CWSR **on**, `1bit serve` moves each HRX queue's CWSR context save area out of
+pageable memory. By default libhsakmt allocates the save area as an SVM range. With
+`HSA_USE_SVM=0` and `HSA_USERPTR_FOR_PAGED_MEM=0` it allocates a KFD GTT buffer object instead.
+ROCr then reports no SVM, which HRX refuses unless `HRX_ALLOW_NO_SVM=1` is set; that gate is our
+hrx-system commit (`util/no_svm_gate.c`). serve adds the three variables to the environment of
+every HRX backend it starts (the chat server, the RAG servers, the Laya scorer), so they are in
+place before ROCr initialises in that process, and prints one line:
+
+```
+1bit serve: HRX: CWSR is on; CWSR save area placed in GTT (engine#315)
+```
+
+`--hrx-cwsr-placement` picks the mode:
+
+| value | what serve does |
+|---|---|
+| `auto` (default) | adds the three variables only when `/sys/module/amdgpu/parameters/cwsr_enable` reads `1` and you set none of them. With CWSR off it adds nothing and logs `HRX: CWSR is off; CWSR save-area placement unchanged (engine#315)` |
+| `on` | adds them whatever `cwsr_enable` says. A value you set yourself still wins |
+| `off` | never adds them |
+
+A build whose hrx-system has no `HRX_ALLOW_NO_SVM` gate (CMake prints
+`HRX_ALLOW_NO_SVM gate in hrx-system: 0`) adds nothing in `auto` and refuses `on`, because
+`HSA_USE_SVM=0` would leave HRX with no device. `llama-server`, `llama-bench` or other HRX tools
+you start yourself get the variables only if you set them.
+
+Measured on strixhalo (performance mode, 120 W cap), engine `fce3a68` build with the gate:
+
+- CWSR-on boot, GLM-4.7-Flash Q4_K_M at the #315 composition (4 neighbour servers, 16 GiB ballast,
+  `gtt_start` 104 GiB), one binary: 46 runs with the variables, 0 faults (42 clean in band);
+  16 runs without them, 4 faults (Fisher exact two-sided p = 0.0043). Every save area of every
+  run with the variables was a 19226624-byte GTT BO (kprobes on `kfd_queue_buffer_get`).
+  0 of 42 bounds the fault rate at 6.9 % or less (one-sided 95 %), not at zero.
+- CWSR-off boot, Qwen3-0.6B Q4_K_M, the variables against none: needle at 4732 tokens 5/5 both,
+  same output; KLD top-20 0.000000 nats; `llama-bench -p 512 -n 128`, medians of 2 rounds:
+  pp512 21373 vs 21047, tg128 336.6 vs 337.6 tok/s.
 
 ### Prefill on HRX, decode on Vulkan (removed)
 
@@ -570,7 +669,10 @@ Our own HIP kernels for HRX are closed source, like the NPU kernels: they live i
 public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>`
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
-that hook. Without the option the build is unchanged. To drop the add-on from an existing
+that hook. Without the option the build is unchanged. The release builds with it, from the
+commit pinned in `config/gpu-kernels.config`, so the release binaries carry the kernels as
+compiled code objects while their source stays private ([releases.md](releases.md), "Private
+components"). To drop the add-on from an existing
 build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).
 
 ## Verified (2026-09-23, llama.cpp `f1a0aca`, hrx-system `51b1739`)

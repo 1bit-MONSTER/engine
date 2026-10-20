@@ -341,6 +341,190 @@ classes it as native rather than custom code. Nothing in the pinned llama.cpp tr
 mentions `kairo`, and no pinned backend (`hrx`, `npu`) implements the class. Reviewed
 2026-10-06: **not an alias**.
 
+### `grug_moe` - `open-athena/Grug-67B-A2B-Merge-Campaign2-DARE-TIES-02-2026.10.10`
+
+Architecture class `GrugMoeForCausalLM`, `model_type: grug_moe`, no `auto_map`, so the
+census classes it as native. It is the marin-community research MoE (`marin-community/marin`,
+`experiments/grug/moe`; `lib/levanter/src/levanter/models/snowball.py`): 67B total, about 2B
+active, 26 layers, hidden 2560, 20 heads with 5 KV heads, 256 routed experts (4 per token) plus
+one shared expert, a 2048-token sliding window with a global layer every 4 (`global_every`),
+and its own attention knobs (`qk_mult`, `sconv`, `grugmoe_attention_mode`). Transformers,
+upstream llama.cpp and upstream vLLM have no implementation; it is served through marin's own
+vLLM fork and loaded in training through `marin-community/MarinSkyRL`, which registers the class
+itself. The checkpoint flagged (engine#381) is a DARE-TIES merge-campaign upload with almost no
+downloads; the other uploads are the same group's training snapshots (`open-athena/Snowball-67B-A2B-*`,
+`penfever/grug-67b-a2b-*`). No pinned backend (`hrx`, `npu`) implements the class, and the
+`qk_mult` / `sconv` / local-global layout rules out treating it as a Mixtral- or Qwen-MoE
+alias. Reviewed 2026-10-12: **not an alias**. Its `registry/significant.json` entry carries
+`"watch": "report"`, so the census watcher lists new uploads of it as `. REVIEWED` and does
+not alert; remove that field if an upstream backend gains the architecture.
+
+### `hrm_text` - `zyr-AGENT/ZY-S1`
+
+Architecture class `HrmTextForCausalLM`, `model_type: hrm_text`, no `auto_map` and
+`library_name: transformers`, so the census classes it as native, not custom code. It is
+Sapient's HRM-Text hierarchical-reasoning LM, in-tree in upstream Transformers
+(`src/transformers/models/hrm_text/{configuration,modeling,modular}_hrm_text.py`, "The Sapient
+AI Authors and the HuggingFace Inc. team"). The base `sapientinc/HRM-Text-1B` config (read
+2026-10-15) is 128 layers of hidden 1536, 12 heads / 12 kv, head_dim 128, intermediate 4096,
+vocab 65536, rope 10000, `num_layers_per_stack: 16`, `H_cycles: 2`, `L_cycles: 3`,
+`L_bp_cycles: [0, 3]`, `embedding_scale` 39.19, `prefix_lm: true`; the flagged upload
+`zyr-AGENT/ZY-S1` (created 2026-10-12, last modified 2026-10-14) is a 16-layer finetune of it
+with the same `H_cycles` / `L_cycles` / `L_bp_cycles`.
+
+**Why an alias is wrong**: `H_cycles` / `L_cycles` run a stack of layers
+(`num_layers_per_stack`) several times per token and `L_bp_cycles` feeds the low-level stack
+back through the high-level one, on a prefix-LM (`prefix_lm`, `embedding_scale`) schedule. No
+supported family does that: the closest decoder stack would read the same tensor names and
+silently compute a different function (each stack run once, no cycle), the silent-substitution
+failure this page exists to prevent.
+
+**Why it is not mapped**: no pinned backend accepts `hrm_text`. Checked 2026-10-15 on the
+pinned submodule `third_party/llama.cpp` 0e255d77: no `hrm` in `src/llama-arch.cpp`,
+`gguf-py/gguf/constants.py` or `convert_hf_to_gguf.py`, and no `conversion/hrm_text.py`, so
+`tools/registry_build.py` finds neither a converter class nor a runnable GGUF architecture.
+The HRX fork's patched tip `ad18320a` is also free of `hrm`. Upstream `ggml-org/llama.cpp`
+master does have `LLM_ARCH_HRM_TEXT` ("hrm_text") and `conversion/hrm_text.py`, so a later pin
+bump that reaches it maps the class automatically - at that point
+`tools/registry_build.py --check-gaps` fails until this entry records why (`mapped_ok`).
+
+**Not a one-off.** The HF `hrm_text` tag lists 60 models from 34 uploaders and the 2026-10-11
+census snapshot counts 41 `HrmTextForCausalLM` models, including `sapientinc/HRM-Text-1B`
+(14,437 downloads, 834 likes) and `danish-foundation-models/DFM-Mimir{,-v1.5}` (2,175 / 2,824
+downloads). Reviewed 2026-10-15: **not an alias**. Its `registry/significant.json` entry
+carries `"watch": "report"`, so the census watcher lists new uploads of it as `. REVIEWED` and
+does not alert while no pinned backend can serve the class; remove that field (and record
+`mapped_ok`) when the llama.cpp pin gains `hrm_text`.
+
+### `dflash2` - `nchapman/Qwen3.5-4B-DFlash2` (also `arc-kumbhar/incoai-Qwen3.8-27B-DFlash2`)
+
+Architecture class `DFlash2DraftModel`, no `auto_map` and `library_name: speculators` on the
+nchapman upload, so the census classes it as native and it alerts. Both flagged checkpoints are
+**speculative-decoding drafters, not standalone LMs** (nchapman's card: "DFlash2 speculative
+drafter for Qwen/Qwen3.5-4B"). The 2026-10-16 tensor headers (81 tensors each, read by range
+request) carry machinery no pinned backend runs:
+
+* `candidate_selector.hidden_projection.weight`, `candidate_selector.predecessor_codebook`,
+  `candidate_selector.successor_codebook` - the candidate selector (`selector_rank: 256`,
+  `selector_top_k: 16`);
+* `layers.N.attention_conv.{base_kernel,kernel_projection.weight}` and
+  `layers.N.mlp_conv.{base_kernel,kernel_projection.weight}` - the short convolutions
+  (`conv_group_size: 16`, `conv_kernel_size: 2`);
+* `fc.weight`, `hidden_norm.weight`, `norm.weight` and the per-layer attention/MLP tensors.
+
+The pinned `third_party/llama.cpp` 1a5dcba2 **does** have a DFlash draft architecture
+(`@ModelBase.register("DFlashDraftModel")` in `conversion/qwen.py`, `model_arch =
+MODEL_ARCH.DFLASH`, runtime `src/models/dflash.cpp`), but that is DFlash-1. Its converter reads
+`dflash_config.{target_layer_ids,mask_token_id}` and the runtime requires `target_layers`
+metadata; it has no `candidate_selector` or `*_conv` tensors and no handling for
+`selector_rank`, `selector_top_k`, `conv_group_size`, `conv_kernel_size`,
+`aux_hidden_state_layer_ids`, `sliding_window_non_causal` or the `speculators_config` block.
+Registering DFlash2 under `DFlashDraftModel` therefore loads a draft that silently drops the
+selector and convolution heads - the silent-substitution failure this page exists to prevent -
+and the `nchapman` config does not even carry `target_layer_ids` under `dflash_config`, so the
+pinned converter could not build a GGUF for it at all. Reviewed 2026-10-16: **not an alias**.
+Its `registry/significant.json` entry carries `"watch": "report"`, so the census watcher lists
+new uploads of it as `. REVIEWED` and does not alert; remove that field (and record `mapped_ok`)
+when a pin bump reaches DFlash2 support (selector + conv heads, per-layer window) and its
+converter class registers `DFlash2DraftModel`.
+
+### `tashkeel_nano` - `ahmadsy/tashkeel-nano-1p1m`
+
+Architecture class `DiacritizerModel`, `model_type: tashkeel_nano`, no `library_name` and no
+`auto_map`, so the census classes it as native. It is **not a causal LM**: its `config.json`
+carries `causal: false`, `num_classes: 15` (the diacritic labels), `vocab_size: 171`,
+`hidden_size: 64`, 18 layers, 2 KV heads, and a windows/decoding block (`window: 256`,
+`stride: 128`, `arm: centered`). The repo ships its own `tashkeel_nano/` package
+(`model.py`, `inference.py`, `labels.py`), so the class is served by that code, not by any
+backend. No pinned backend registers `tashkeel_nano` and no supported family is a
+fixed-window, 15-class tagger. Reviewed 2026-10-16: **not an alias**. Its
+`registry/significant.json` entry carries `"watch": "report"`.
+
+### `mbart` - `nhatho1999/orthomni-codeco`
+
+Architecture class `MBartForConditionalGeneration`, `model_type: mbart`, `library_name:
+ctranslate2`. It is an **encoder-decoder seq2seq** model - `is_encoder_decoder: true`, 12
+encoder + 12 decoder layers, `d_model: 1024`, 16 heads per side, `BartphoTokenizer` - and the
+upload is a CTranslate2/ONNX export with no PyTorch weights (`ct2/model.bin`,
+`onnx/encoder_model.onnx`, `onnx/decoder_model_merged.onnx`). The engine's backends are
+decoder-only text decoders (the HRX llama.cpp route and the NPU lanes), and the pinned
+`third_party/llama.cpp` 1a5dcba2 registers no `mbart`/`bart` converter class or GGUF
+architecture, so no pinned backend accepts the class. It is not an alias of any supported
+family either - nothing the engine runs is an encoder-decoder. Serving it would need a
+translation/seq2seq route the engine does not have, not a mapping. Reviewed 2026-10-16:
+**not an alias**. Its `registry/significant.json` entry carries `"watch": "report"`, so the
+census watcher lists new uploads as `. REVIEWED` and does not alert; remove that field (and
+record `mapped_ok`) if a pinned backend ever grows an encoder-decoder route that accepts
+`mbart`.
+
+### `blind_decoder` - `Vi-LAB/KenT_0.5B_Base`
+
+Architecture class `BlindForCausalLM`, `model_type: blind_decoder`, no `auto_map`,
+`library_name: transformers`, so the census classes it as native. It is the only upload (0
+downloads, 0 likes, created 2026-10-16) and the repo is internally inconsistent: `config.json`
+declares `architectures: ["BlindForCausalLM"]` and `model_type: "blind_decoder"`, but the
+shipped `configuration_kent.py` sets `model_type = "kent"` and `modeling_kent.py` defines
+`KenTForCausalLM`; `BlindForCausalLM` is defined nowhere in the repo and there is no
+`auto_map`, so stock Transformers sees an unknown model type with no remote code and cannot
+load it (upstream Transformers has no `blind_decoder` module). The architecture itself is
+bespoke, not a rename: 31 layers, `embed_dim: 1024`, 8 heads, vocab 50257, with
+**Compressed-QK attention** (q/k head_dim 64 against a 128-dim value head) and **gated key
+refinement** - `k = softmax(G G^T / sqrt(d)) K_raw` over a separate gate projection, before
+RoPE - plus RMSNorm and a SwiGLU MLP (intermediate 2816). No supported family computes that
+refinement; the closest decoder stack would read the same tensor names and silently compute a
+different function. Reviewed 2026-10-16: **not an alias**. Its `registry/significant.json`
+entry carries `"watch": "report"`; remove that field (and record `mapped_ok`) if a backend
+implements the class.
+
+### `sn38-nanochrono` - `tensin320/round14_5_114_fitleech_sn38-2023-01`
+
+Architecture class `NanochronoForCausalLM`, `model_type: sn38-nanochrono`, no `auto_map` and
+`library_name: transformers`, so the census classes it as native. The repo carries **no modeling
+code at all** (only `config.json`, `generation_config.json`, `model.safetensors`, the tokenizer
+and a README), and upstream Transformers has no `nanochrono`/`chrono` module, so nothing can
+load it as published. Its config (read 2026-10-16) is 28 layers, hidden 1792, 14 heads / 14 kv,
+vocab 32768, `layer_types` of 3 sliding + 1 full attention per group, `sliding_window: 512`,
+`max_position_embeddings: 2048`, `final_logit_softcapping: 15.0`, `attention_multiplier: 1.2`,
+`use_cache: false`, `tie_word_embeddings: false` - plus machinery no supported family has:
+`tap_layer: 14`, `aux_layers` (every other layer), `aux_gate_dim: 12` and `mix_gate_dim: 24`,
+the ChronoLLM/year-cutoff tap-and-gate stack the tags (`chronollm`, `year-cutoff`) name. There
+is no pinned-backend mapping and no alias to claim: the tap/aux-gate path changes the
+computation, so a plain decoder stack would be silent substitution. Reviewed 2026-10-16:
+**not an alias**. Its `registry/significant.json` entry carries `"watch": "report"`; remove
+that field (and record `mapped_ok`) if a backend implements the class.
+
+### `muse_spark` - `Interchained/Muse-Spark-Open-816B-A42B-GGUF`
+
+Architecture class `MuseSparkForConditionalGeneration`, `model_type: muse_spark`: Meta's
+Muse Spark Open (`meta-models/Muse-Spark-Open-816B-A42B`, created 2026-09-15, gated by
+manual approval), a 62-layer text model with vision and audio towers. The flagged upload is
+a GGUF conversion (F16, Q4_0, Q4_K_M, Q5_K_M) whose header (read 2026-10-17 by range request)
+declares `general.architecture = muse-spark`: 256 experts, 8 used, `moe_latent_size: 4096`
+(experts run in a 4096-wide latent, like Nemotron 3 Super's `ffn_latent_down`/`ffn_latent_up`),
+`expert_gating_func: 2`, hidden 8192, 128 heads / 16 kv, head_dim 64, sliding window 2048 with
+one full-attention layer in four (`sliding_window_pattern`), `final_logit_softcapping: 20.0`,
+`logit_scale` 0.177, context 1,048,576, `gpt-4o` pre-tokenizer.
+
+**Why an alias is wrong**: the latent-space experts, the per-layer rope schedule
+(`layer_rope_theta` 0 on the full-attention layers) and the softcapped logits change the
+computation; no supported family has that combination, so mapping it to a Llama 4 or
+Nemotron-H shape would be silent substitution.
+
+**Why it is not mapped**: the pinned `third_party/llama.cpp` 1a5dcba2 has no `muse-spark`
+architecture (it has the `moe_latent_size` key and the latent tensors only for Nemotron 3
+Super). Upstream `ggml-org/llama.cpp` added it on 2026-10-15 in ba3c05f71 ("model: add Muse
+Spark Open (text, vision and audio)", #30616: `LLM_ARCH_MUSE_SPARK`, `src/models/muse-spark.cpp`,
+`conversion/muse_spark.py`), after the fork's last upstream sync, so a later fork sync that
+reaches it maps the class automatically - at that point `tools/registry_build.py --check-gaps`
+fails until this entry records why (`mapped_ok`).
+
+**Not a one-off, but not servable here.** The HF `muse_spark` tag lists 23 models (Meta's
+base and NVFP4, unsloth, mlx-community, intel-ai INT4, amd Quark-MXFP4). Even its smallest
+GGUF (Q4_K_M, ~500 GB) is about four times the 128 GB Strix Halo, so the gap costs nothing on
+the target box today. Reviewed 2026-10-17: **not an alias**. Its `registry/significant.json`
+entry carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and
+does not alert; remove that field (and record `mapped_ok`) when the pin gains `muse-spark`.
+
 ## Unverifiable: gated configs
 
 `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on
@@ -353,3 +537,23 @@ them forever.
 ## If a family *is* a variant
 
 An unmapped class that is a renamed or same-shape sibling is fixed where the backend is: upstream llama.cpp's converter and `llama-arch.cpp`, or our HRX fork. The registry picks the mapping up at the next pin bump. Verify shape equality before proposing such a mapping: layers, hidden size, heads, experts, and any added config keys. That check is exactly what moved the families above into this file.
+
+Two classes flagged on 2026-10-14/15 are **variants**, not significant gaps, so they are
+deliberately *not* in `registry/significant.json` and keep alerting until a backend registers
+them:
+
+* `GLMForCausalLM` (`JUROCLINIC/seguridad`) is the all-caps spelling of the Transformers class
+  `GlmForCausalLM` (`model_type: glm`), which the pinned fork already maps to `chatglm`
+  (`conversion/chatglm.py`: `@ModelBase.register("GlmForCausalLM", "ChatGLMModel",
+  "ChatGLMForConditionalGeneration")`). The registry lookup is exact, so only the CamelCase
+  string is mapped; the flagged upload is a config-only repo (no weights) that also mis-cases
+  the `model_type`. The fix is registering the alias in the fork's converter, not an
+  architecture review - and it is only reachable via a pin bump, so it is not silenced here.
+* `MinistralForCausalLM` (`saidutta69/Ministral-8B-Instruct-heretic`) is a Mistral-shaped
+  sibling: `model_type: ministral`, `sliding_window` 32768 == `max_position_embeddings`, and
+  the same `layer_types` and 36-layer / H=4096 / 32-head / 8-kv shape as its base
+  `mistralai/Ministral-8B-Instruct-2410`, which publishes `MistralForCausalLM`/`mistral`. The
+  pinned fork maps `MistralForCausalLM` -> `llama` and `Ministral3ForCausalLM` -> `mistral3`
+  but does not register this name (upstream llama.cpp does not either). Same treatment: a
+  converter registration picked up at the next pin bump, so it also keeps alerting rather than
+  being recorded as significant.

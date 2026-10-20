@@ -21,6 +21,8 @@
 #     delegate(expert="code", task=...) call. PM_CALL_FORM picks how the call is written:
 #     "openai" (a tool_calls array, llama-server's parsed form) or "zyphra" (ZAYA's own
 #     <zyphra_tool_call><function=delegate><parameter=..> text, which serve must parse itself);
+#     "spawn" and "spawn-rejected" call spawn_worker(worker="build-1"/"rejected-1", box, class,
+#     task) instead, for the --pm-spawn-url tests;
 #   - a tool result present: the final answer, which quotes the tool result so the test can see
 #     the expert's answer (or the failure text) reach the client;
 #   - anything else: a plain answer, no tool call.
@@ -69,6 +71,15 @@ class H(BaseHTTPRequestHandler):
             text = "The expert answered:\n" + tool_results[-1]["content"]
             message = {"role": "assistant", "content": text}
             finish = "stop"
+        elif req.get("tools") and FORM.startswith("spawn"):
+            worker = "rejected-1" if FORM == "spawn-rejected" else "build-1"
+            message = {"role": "assistant", "content": None,
+                       "tool_calls": [{"id": "call_s1", "type": "function",
+                                       "function": {"name": "spawn_worker",
+                                                    "arguments": json.dumps({"worker": worker, "box": "ryzen",
+                                                                             "class": "code",
+                                                                             "task": "Write " + last_user})}}]}
+            finish = "tool_calls"
         elif req.get("tools") and ("code" in last_user.lower() or "function" in last_user.lower()):
             task = "Write " + last_user
             if FORM == "zyphra":

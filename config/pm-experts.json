@@ -1,10 +1,17 @@
 {
-  "about": "Experts for `1bit serve --pm` (docs/pm.md). The served model (ZAYA1-8B) is the Project Manager: it answers general conversation itself and delegates a task to one of these experts with its delegate(expert, task, context) tool. `id` is the model's Lemonade catalog id; the PM asks Lemonade to run it, so an expert must be an entry Lemonade can load. Lemonade keeps at most two LLMs loaded, so one expert runs beside the PM at a time. Replace with --pm-experts FILE.",
+  "about": "Experts for `1bit serve --pm` (docs/pm.md). The served model (ZAYA1-8B) is the Project Manager: it answers general conversation itself and delegates a task to one of these experts with its delegate(expert, task, context) tool. `id` is the model's Lemonade catalog id; the PM asks Lemonade to run it, so an expert must be an entry Lemonade can load. Lemonade keeps at most two LLMs loaded, so one expert runs beside the PM at a time. Replace with --pm-experts FILE. `pm.routes` is the table `--pm-router laya` uses: the router's request class (Laya: code, prose, short, long_doc; docs/laya.md) to the expert for it, an empty name leaving the answer to the PM; a class the router is not confident about also leaves it to the PM.",
   "pm": {
     "max_rounds": 4,
     "max_result_bytes": 32768,
     "delegate_timeout_s": 1800,
-    "thinking": false
+    "thinking": false,
+    "routes": {
+      "code": "code",
+      "long_doc": "code-heavy",
+      "prose": "reasoning",
+      "short": ""
+    },
+    "routes_min_confidence": 0.16
   },
   "experts": [
     {

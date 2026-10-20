@@ -13,28 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# Keep third_party/xdna-driver on upstream amd/xdna-driver main (docs/npu.md,
-# "The XDNA stack"): when upstream moves, open a PR here moving the submodule.
-# It pins XRT too (xdna-driver's own xrt submodule). GitHub-hosted CI has no
-# NPU; build with scripts/build-xdna.sh and run the NPU check (docs/npu.md,
-# "Checking the NPU") on Strix Halo before merging.
+# Move third_party/xdna-driver, the amdxdna kernel driver pin (docs/npu.md, "The
+# XDNA driver"), to upstream amd/xdna-driver main: opens a PR moving the
+# submodule. Only the kernel driver is pinned here: the engine is XRT-free (its
+# NPU runtime is compiled into 1bit), so nothing from the pin is built into the
+# release, and XRT (xdna-driver's own xrt submodule) is not tracked.
+#
+# Run by hand only (workflow_dispatch): a driver move means rebuilding and
+# re-signing the out-of-tree module on Strix Halo and running the NPU check
+# (docs/npu.md, "Checking the NPU") before merging. GitHub-hosted CI has no NPU.
 #
 # Uses the secret HRX_BUMP_TOKEN (Contents and Pull requests read/write on
 # 1bit-MONSTER/engine): a PR opened with the default GITHUB_TOKEN would not
 # start CI.
-#
-# Behind the runtime switch (docs/npu.md, "XRT or the own runtime"): the engine
-# only needs XRT when it builds with ONEBIT_NPU_RUNTIME=xrt. The repository
-# variable ONEBIT_NPU_RUNTIME mirrors the build we ship; while it is "own" the
-# scheduled bump is skipped and the xdna-driver pin stays where it is (the
-# kernel module still comes from the pinned kernel build, docs/npu.md, "The XDNA
-# stack"). Set it back to "xrt" (or unset it) to resume the daily bump; a manual
-# workflow_dispatch always runs.
 name: bump-xdna
 
 on:
-  schedule:
-    - cron: "41 6 * * *"
   workflow_dispatch:
 
 permissions:
@@ -46,7 +40,6 @@ concurrency:
 
 jobs:
   bump:
-    if: ${{ github.event_name == 'workflow_dispatch' || vars.ONEBIT_NPU_RUNTIME != 'own' }}
     runs-on: ubuntu-latest
     steps:
       - name: Require the token
@@ -69,11 +62,10 @@ jobs:
         run: |
           set -euo pipefail
           upstream=$(gh api repos/amd/xdna-driver/commits/main --jq .sha)
-          upstream_xrt=$(gh api "repos/amd/xdna-driver/contents/xrt?ref=$upstream" --jq .sha)
           ours=$(git ls-tree HEAD third_party/xdna-driver | awk '{print $3}')
-          echo "upstream $upstream (xrt $upstream_xrt), ours $ours"
+          echo "upstream $upstream, ours $ours"
           {
-            echo "upstream=$upstream"; echo "upstream_xrt=$upstream_xrt"; echo "ours=$ours"
+            echo "upstream=$upstream"; echo "ours=$ours"
             if [ "$upstream" = "$ours" ]; then echo "changed=false"; else echo "changed=true"; fi
           } >> "$GITHUB_OUTPUT"
 
@@ -82,7 +74,6 @@ jobs:
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
-          UPSTREAM_XRT: ${{ steps.pins.outputs.upstream_xrt }}
           OURS: ${{ steps.pins.outputs.ours }}
         run: |
           set -euo pipefail
@@ -96,14 +87,13 @@ jobs:
           git config user.email "xdna-bump@users.noreply.github.com"
           git switch -c "$branch"
           git update-index --cacheinfo "160000,$UPSTREAM,third_party/xdna-driver"
-          git commit -q -m "Bump XDNA: amd/xdna-driver ${UPSTREAM:0:12} (XRT ${UPSTREAM_XRT:0:12})"
+          git commit -q -m "Bump XDNA driver: amd/xdna-driver ${UPSTREAM:0:12}"
           git push -q origin "$branch"
           gh pr create --base main --head "$branch" \
-            --title "Bump XDNA: amd/xdna-driver ${UPSTREAM:0:12}" \
-            --body "Moves third_party/xdna-driver from \`${OURS:0:12}\` to upstream main \`${UPSTREAM:0:12}\` (its XRT submodule: \`${UPSTREAM_XRT:0:12}\`).
+            --title "Bump XDNA driver: amd/xdna-driver ${UPSTREAM:0:12}" \
+            --body "Moves third_party/xdna-driver (the amdxdna kernel driver pin) from \`${OURS:0:12}\` to upstream main \`${UPSTREAM:0:12}\`.
 
           Upstream commits (last 30):
           ${log}
 
-          CI here has no NPU. Before merging, on Strix Halo:
-          \`scripts/build-xdna.sh ~/.cache/xdna-pin/prefix && cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=\$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt && cmake --build build --target onebit\`, then the NPU check (docs/npu.md, \"Checking the NPU\")"
+          CI here has no NPU. Before merging, on Strix Halo: build the out-of-tree amdxdna module from this commit, sign and load it, and run the NPU check (docs/npu.md, \"Checking the NPU\")."

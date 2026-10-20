@@ -14,7 +14,7 @@
 // limitations under the License.
 
 // The NPU fast lane (docs/npu.md): one whole-layer kernel run per decoder layer
-// plus the lm head, submitted as one XRT runlist per token, from full ELFs
+// plus the lm head, submitted as one runlist per token, from full ELFs
 // generated at load time. No xclbin.
 //
 // A kernel directory holds the layer kernel's instruction ELFs for context

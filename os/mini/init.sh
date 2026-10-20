@@ -120,9 +120,9 @@ if grep -q "1bit.check" /proc/cmdline; then
     else
         echo "CHECK HSA runtime: none (a CPU-only test image)"
     fi
-    if [ -e /opt/xilinx/xrt/lib/libxrt_driver_xdna.so ]; then echo "CHECK XRT XDNA plugin: present"
-    elif [ -e /etc/1bit/no_xrt ]; then echo "CHECK XRT XDNA plugin: left out (test image)"
-    else echo "CHECK XRT: FAILED"; ok=0; fi
+    # the NPU runtime is compiled into 1bit: the image carries no XRT
+    if find / -xdev -name 'libxrt*' 2>/dev/null | grep -q .; then echo "CHECK no XRT: FAILED"; ok=0
+    else echo "CHECK no XRT: none in the image"; fi
     [ -e /lib/firmware/amdnpu/17f0_11 ] && echo "CHECK NPU firmware: present" || { echo "CHECK NPU firmware: FAILED"; ok=0; }
     dropbear -V 2>&1 | grep -q Dropbear && echo "CHECK dropbear: runs" || { echo "CHECK dropbear: FAILED"; ok=0; }
     echo "CHECK modules: $(find /lib/modules -name '*.ko*' | wc -l) kernel modules, amdgpu $(modinfo -F version amdgpu >/dev/null 2>&1 && echo found || echo MISSING)"

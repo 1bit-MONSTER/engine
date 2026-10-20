@@ -25,7 +25,7 @@ settings. The engine is one of Lemonade's backends, the `onebit` recipe (HRX0 an
 stable-diffusion.cpp, Kokoro and the rest).
 
 What is in it: the kernel with the GPU (`amdgpu`, which also gives HSA its `/dev/kfd`) and NPU
-(`amdxdna`) drivers, the firmware those chips load, BusyBox, XRT with the XDNA plugin, Mesa's Radeon
+(`amdxdna`) drivers, the firmware those chips load, BusyBox (no XRT: the NPU runtime is compiled into `1bit`), Mesa's Radeon
 Vulkan driver (for Lemonade's Vulkan backends), Lemonade (`lemond`, the `lemonade` CLI and the web
 app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit`, the HRX
 `llama-server` it runs, and TheRock's HSA runtime that HRX loads.
@@ -48,7 +48,11 @@ Everything that has to last lives on the stick's `1BIT-DATA` partition:
 On a machine that has built the engine with the NPU lane and HRX (TheRock in `/opt/rocm-therock`):
 
 ```sh
-cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=ON -DONEBIT_HRX=ON
+# the private components the release compiles in (docs/releases.md, "Private components")
+npurt=$(scripts/fetch-private.sh config/npu-runtime.config ~/.cache/npu-runtime)
+scripts/fetch-private.sh config/gpu-kernels.config ~/.cache/gpu-kernels
+cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR="$npurt" \
+      -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$HOME/.cache/gpu-kernels"
 cmake --build build
 os/mini/mkimage.sh out build
 ```
@@ -152,8 +156,8 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 4G -kernel /boot/vmlinuz-$(uname -r)
   -initrd out/initramfs.img -append "console=ttyS0 rdinit=/init 1bit.check" -nographic -no-reboot
 ```
 
-`1bit.check` makes init check that the engine, `llama-server`, Lemonade, the HSA runtime, the XRT
-plugin and the NPU firmware are in place and start, print `1BIT-OS CHECK PASS` or `FAIL`, and power
+`1bit.check` makes init check that the engine, `llama-server`, Lemonade, the HSA runtime and the
+NPU firmware are in place and start, that the image carries no XRT library, print `1BIT-OS CHECK PASS` or `FAIL`, and power
 off.
 
 `os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI, on QEMU's
@@ -162,9 +166,9 @@ Lemonade's `"host": "0.0.0.0"` and a `LEMONADE_API_KEY` on the stick. It checks 
 that Lemonade's web app loads, that Lemonade refuses a request without the key, that
 `/api/v1/models` lists the stick's model, and that Lemonade answers a chat request with it. The VM
 has no Radeon GPU or NPU: Lemonade serves that chat with its own `llamacpp` backend on the CPU, and
-hides the `onebit` entry (its backends need gfx1151, the NPU or CUDA), so the test checks only that
-the entry is in Lemonade's registry on the stick. On a machine without TheRock or XRT,
-`LLAMA_SERVER=<a CPU llama-server> NO_XRT=1` makes a CPU-only test image.
+hides the `onebit` entry (its backends need gfx1151 or the NPU), so the test checks only that
+the entry is in Lemonade's registry on the stick. On a machine without TheRock,
+`LLAMA_SERVER=<a CPU llama-server>` makes a CPU-only test image.
 
 What only the hardware can check: `amdgpu` bringing up `/dev/kfd` and HRX0 from the image (TheRock's
 HSA runtime and its libraries complete, the PM4-emulation probe answered), Lemonade offering and

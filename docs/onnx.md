@@ -46,7 +46,7 @@ The engine does not ship Ryzen AI Software, and copies none of it into the repos
 
 With `RYZENAI_INSTALL_PATH`, ryzenai-server's build copies the whole `deployment/lib` beside the binary, and the script then scans those copies for a `PT_GNU_STACK` that asks for an executable stack and clears it with `patchelf --clear-execstack` (a 7.x kernel refuses to load such a library). It stops with a clear message when a copy needs it and `patchelf` is missing. Only the copies change; nothing in the user's install does.
 
-On Windows the engine builds no ONNX server: `1bit.exe` uses the `ryzenai-server.exe` Lemonade installs for its `ryzenai-server` backend (under `$LEMONADE_CACHE_DIR`, else `%USERPROFILE%\.cache\lemonade`, in `bin\ryzenai-server\npu`). Lemonade publishes that server for Windows only, so Linux keeps building it from `third_party/ryzenai-server`.
+The engine ships no Windows package (Lemonade has its own Windows build, with its own `ryzenai-server` backend). On Linux the engine builds ryzenai-server from `third_party/ryzenai-server`, because Lemonade publishes that server for Windows only.
 
 ## The GPU
 
@@ -100,12 +100,24 @@ The SIGKILL escalation stays in serve: a backend hung for ever, with the port an
 
 ### Measured on Linux
 
-Strix Halo, 2026-10-11, AMD's NPU-only 1.8.0 models (`*_rai_1.8.0_npu_4K`):
+Strix Halo, 2026-10-11, AMD's NPU-only 1.8.0 models. AMD's own `model_benchmark` (raw, no HTTP), 128 prompt / 128 generated tokens:
 
-| model | AMD's `model_benchmark` (raw) | `1bit serve --device onnx` |
+| model | prompt | decode |
 | --- | --- | --- |
-| Qwen2.5-0.5B-Instruct | 2,571 tok/s prompt, **72.0** tok/s decode | **~60** tok/s decode over HTTP (TTFT 0.20 s; 128 tokens in 2.06 s wall) |
-| Llama-3.2-1B-Instruct | 2,326 tok/s prompt, **50.2** tok/s decode | (first run hit the first-dispatch timeout above; the retry ran clean) |
+| Qwen2.5-0.5B-Instruct `_npu_4K` | 2,571 tok/s | 72.0 tok/s |
+| Llama-3.2-1B-Instruct `_npu_4K` | 2,326 tok/s | 50.2 tok/s |
+
+Through `1bit serve --device onnx` (one server per model kept up for all its runs; n=3; 128 tokens generated; prompt rate = prompt tokens over time to first token, which includes about 0.25-0.3 s of HTTP and setup):
+
+| model | decode at 128 / 512 / 2048 prompt tokens | prompt at 128 / 512 / 2048 |
+| --- | --- | --- |
+| Qwen2.5-0.5B-Instruct `_npu_4K` | 70.1 / 66.7 / 64.9 tok/s | 403 / 1,037 / 2,111 tok/s |
+| Qwen2.5-0.5B-Instruct `_npu_16K` | 75.8 / 72.4 / 63.6 tok/s | 508 / 1,650 / 2,487 tok/s |
+| Llama-3.2-1B-Instruct `_npu_4K` | 48.9 / 47.6 / 45.8 tok/s | 318 / 1,088 / 1,944 tok/s |
+| Llama-3.2-3B-Instruct `_npu_4K` | 21.1 / 20.4 / 18.8 tok/s | 231 / 455 / 900 tok/s |
+| Phi-3.5-mini-instruct `_npu_4K` | 13.5 / 12.7 / 10.7 tok/s | 107 / 360 / 723 tok/s |
+
+Package power rose 11-15 W over idle on every model (there is no NPU power sensor).
 
 The child held `/dev/accel/accel0` open throughout generation. Hybrid (NPU + iGPU) and model generation are Windows-only in Ryzen AI 1.8, so Linux serves the NPU-only models AMD publishes (no Qwen3 among them yet).
 
@@ -121,6 +133,4 @@ llama-server's extra routes (`/tokenize`, `/slots`, …) answer 501 on `--device
 
 ## Next
 
-- **Windows.** `--device onnx` runs Lemonade's `ryzenai-server.exe` ([Windows](windows.md)); the engine no longer builds one. Not yet run against a Lemonade install on Windows.
-- **The Ryzen AI NPU on Windows.** Through Lemonade's `ryzenai-server.exe` with Ryzen AI Software installed; not yet run. Linux: [above](#linux-npu).
 - **Routing by provider.** `--device auto` sends every `genai_config.json` directory to onnx; the registry has no notion of an OGA directory's provider (NPU vs CPU) yet.

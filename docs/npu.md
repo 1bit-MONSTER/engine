@@ -17,10 +17,10 @@ limitations under the License.
 # NPU engine: full ELFs, no xclbin
 
 The fast lane runs one whole-layer kernel per decoder layer, plus an lm-head kernel.
-For each token, the host submits the 28 layer runs and the lm head as one XRT runlist.
+For each token, the host submits the 28 layer runs and the lm head as one runlist.
 This step removes the xclbin from that path. Every kernel is a full ELF (the design's
-PDI plus control code), which XRT opens directly. `npu/full_elf.{h,cpp}` builds these
-ELFs in memory when the model loads. The code is pure C++, with no Python and no XRT.
+PDI plus control code), which the NPU runtime opens directly. `npu/full_elf.{h,cpp}` builds these
+ELFs in memory when the model loads. The code is pure C++, with no Python and no runtime library.
 The engine has no xclbin path at all (the last one, a comparison backend in the
 GGUF-on-NPU forward, was removed on 2026-10-03); xclbin numbers below are history,
 from the reference lane the full ELFs were first checked against.
@@ -249,6 +249,34 @@ generations pass with 15 s gaps and with 120 s gaps, at 97–101 tok/s. Afterwar
 left on the device. Code that drives the lane directly with `step()` must call `begin()` first
 and `end()` when done.
 
+### The KV cache between generations
+
+The lane allocates each layer's KV cache once, for `kMaxContext` rows, and reuses it for every
+generation. The layer kernel reads the cache in whole 16-row blocks, so each run also reads rows
+past its own position. The control code gives the attention cores the context length N (one word
+per core, written per context like the KV offsets above), and the cores mask the scores of rows N
+and later. Written into those rows, 2.0 or 1000.0 in K changed nothing. In V, any value in the
+position's group of 8 rows changed the logits; rows of the next group changed nothing. The
+attention cores convert to a block-float format in which 8 values share an exponent.
+
+Before #400 those rows still held the previous request's keys and values. That moved the logits
+of identical requests by up to 3.3, and greedy requests gave different text. A fresh process
+reads zeros there. `Lane::begin()` now zeroes, in every layer, the rows earlier generations
+wrote, so every generation starts from that zeroed cache. `ContextMap::row_offsets` says where
+the kernel writes its rows.
+
+Measured on Qwen3-0.6B (own runtime):
+
+- 12 identical greedy requests in one process, each after a request of 1 to 2000 tokens: all
+  bit-identical to the first (all 12 differed before).
+- Decode speed is unchanged: 82.2 / 82.7 / 84.1 tok/s against 81.8 / 82.5 / 84.0 before.
+- `begin()` costs 8 to 20 ms more after a request of 64 to 2000 tokens (median 41-50 ms before),
+  and nothing extra on the first request.
+- Against an f64 reference on the same weights (31 positions of a chat prompt), the top token
+  agrees at 90% of positions with exact causal attention and at 10% with a softmax that also
+  counts the block's zero rows, so zero rows past the position stay out of the softmax. The
+  remaining disagreement is the same in a fresh process, whose logits are bit-identical.
+
 ## Checking the generator
 
 ```sh
@@ -304,8 +332,8 @@ Every packed buffer is checked against the reference lane's own dump (`npu_pack_
 | decode speed, same run | 11.0 ms/token (91 tok/s); the reference lane binary: 15.1 |
 | load (weights packed, kernels built) | 380 ms |
 
-The `1bit` binary links only `libxrt_coreutil` (none with `-DONEBIT_NPU_RUNTIME=own`, below): no
-xclbin, no FastFlowLM library, no Python.
+The `1bit` binary links no NPU library: the runtime is compiled in ("The NPU runtime", below). No
+xclbin, no XRT, no FastFlowLM library, no Python.
 
 ## Serving (3c)
 
@@ -356,83 +384,77 @@ The add-on may also register an encoder for the Laya router (`laya/encoder.h`, d
 `tests/npu_private_route_test.cpp` (ctest `npu_private_route`, in CI) checks the registry
 and that message; the add-on brings its own tests.
 
-## The XDNA stack
+## The NPU runtime
 
-The lane runs on XRT and the XDNA shim plugin (`libxrt_driver_xdna`), which XRT loads at run
-time. Both are pinned: `third_party/xdna-driver` is upstream
-[amd/xdna-driver](https://github.com/amd/xdna-driver), and its own `xrt` submodule pins XRT.
+The engine is XRT-free: the NPU lane runs on our own NPU runtime, compiled into `1bit`. The runtime
+opens `/dev/accel/accel0` and issues the `amdxdna` ioctls itself, parses the full ELFs itself,
+and keeps XRT's class names (`device`, `bo`, `hw_context`, `elf`, `ext::kernel`, `run`,
+`runlist`), so `npu/rt.h` (`namespace xrt = npu_rt;`) lets the engine's NPU sources read as they
+did on XRT. The NPU sources include `npu/rt.h`, never a runtime header directly.
 
-- **The kernel driver is not built from this pin.** `amdxdna` ships in the kernel
-  (`drivers/accel/amdxdna`), and Strix Halo runs the kernel's copy.
-- **Building the pinned stack:** `scripts/build-xdna.sh <prefix>` builds XRT (the NPU package)
-  and then the shim, staged under `<prefix>/root`. Nothing is installed system-wide: XRT hard-codes
-  `/etc/OpenCL/vendors`, so both installs use `DESTDIR`. The engine then builds against it:
-
-  ```
-  scripts/build-xdna.sh ~/.cache/xdna-pin/prefix
-  cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_XRT_ROOT=$HOME/.cache/xdna-pin/prefix/root/opt/xilinx/xrt
-  ```
-- **XRT's OpenCL layer (`xocl`) is excluded** (`XRT_EXCLUDE_SUB_DIRECTORY`). The NPU does not use
-  it, and it fails to compile where the distro's `ocl_icd.h` is newer than XRT's bundled OpenCL
-  1.2 headers.
-- **Keeping current:** `.github/workflows/bump-xdna.yml` runs daily and opens a PR whenever
-  upstream `main` moves (secret `HRX_BUMP_TOKEN`). CI has no NPU, so run the check below on
-  Strix Halo before merging.
-
-Verified on 2026-09-23 with xdna-driver `5d302c9` and XRT `d8ececf`, in place of the system's
-XRT 2.21.75. Both `libxrt_core` and `libxrt_driver_xdna` were loaded from the pinned prefix
-(strace). The fast-lane test of that time (`tests/npu_lane_e2e.sh`, since retired) gave logits
-bit-identical to the reference lane on 24/24 steps, at 10.8 ms/token (92.6 tok/s), with a 327 ms
-warm load.
-
-### XRT or the own runtime (`ONEBIT_NPU_RUNTIME`)
-
-The NPU sources include `npu/rt.h`, never XRT headers directly. With
-`-DONEBIT_NPU_RUNTIME=xrt` (the default) that header includes XRT, and nothing else changes. With
-`-DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR=<dir>` it includes `<dir>/npu_rt.h` instead: a
-private add-on runtime that opens `/dev/accel/accel0` and issues the amdxdna ioctls itself, with
-XRT's class names, so `namespace xrt = npu_rt;` lets the same sources build unchanged.
-`<dir>/npu_rt.cpp` is built into `onebit_npu_rt`, and `1bit` links no XRT library. This repository
-holds no runtime code, only the option, the shim header and two tests: `npu_runtime_option`
-(CI: a bad value, or `own` without a runtime directory, stops the configure with a message) and
-`npu_rt_shim` (NPU builds: every runtime call the engine makes compiles against the selected
-runtime).
+The runtime is a proprietary component and is not in this repository (see [NOTICE](../NOTICE)):
+the source here holds only `npu/rt.h`, the CMake option and the tests. The release binaries
+carry it compiled in; a build from this repository alone has no NPU lane.
 
 ```
-cmake -B build-own -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own \
-      -DONEBIT_NPU_RT_DIR=<1bit-MONSTER checkout>/engine/npu/npu_rt
+cmake -B build -G Ninja -DONEBIT_NPU=ON -DONEBIT_NPU_RT_DIR=<runtime dir with npu_rt.h, npu_rt.cpp>
 ```
 
-Measured on Strix Halo on 2026-10-09 (fast lane, Qwen3-0.6B, power mode `performance`, both builds
-in the same session, NPU runs alternating):
+- `ONEBIT_NPU_RUNTIME` is `own`, its only value (the default). `xrt` was removed on 2026-10-12;
+  configuring with it stops with a message.
+- `ONEBIT_NPU=ON` without a `ONEBIT_NPU_RT_DIR` that holds `npu_rt.h` and `npu_rt.cpp` stops the
+  configure with a message. `npu_rt.cpp` is built into the static library `onebit_npu_rt`.
+- `ONEBIT_NPU_HOST` (full-ELF generation, the model reader, packing, the tokenizer) needs no
+  runtime and builds everywhere, including public CI.
+- Tests: `npu_runtime_option` (CI: `xrt`, a bad value, and a missing, empty or incomplete
+  runtime directory each stop the configure) and `npu_rt_shim` (NPU builds: every runtime call the
+  engine makes compiles against the runtime).
+- **The release** builds the runtime from a pinned commit of the private repository, named in
+  `config/npu-runtime.config` (`repo`, `sha`, `path`, `require`). `scripts/fetch-private.sh config/npu-runtime.config <dir>` checks
+  out exactly that path at that commit with the release machine's `gh` credentials and prints the
+  directory for `ONEBIT_NPU_RT_DIR`; it fails, and the release stops, when the commit cannot be
+  fetched or the checkout is not at the pin. The release then checks that no shipped program or
+  library needs or names `libxrt` ([releases.md](releases.md), "Private components"). Move the pin by hand after the NPU
+  check below.
+- A private route add-on (`ONEBIT_NPU_PRIVATE`) that links XRT itself would put XRT back into
+  `1bit`; the release's XRT check catches it, and the release build does not use add-ons.
 
-| Check | `xrt` | `own` |
+Measured on Strix Halo on 2026-10-09, before XRT was removed (fast lane, Qwen3-0.6B, power mode
+`performance`, both builds in the same session, NPU runs alternating):
+
+| Check | XRT build | own runtime |
 |---|---|---|
 | `ldd 1bit` | `libxrt_coreutil.so.2` | no `libxrt*` |
-| `1bit npu-run`, anchor prompt, 32 greedy steps: logits against the `xrt` build | (reference) | bit-identical, 32/32 steps, 3 of 3 runs |
+| `1bit npu-run`, anchor prompt, 32 greedy steps: logits against the XRT build | (reference) | bit-identical, 32/32 steps, 3 of 3 runs |
 | `1bit npu-run` decode, median of 3 | 86.2 tok/s | 83.7 tok/s |
 | `1bit serve --device npu`, 3 prompts, 32 greedy tokens each | (reference) | 32/32 tokens identical for each prompt |
 | `1bit serve` decode (`timings`), median of the 3 prompts | 80.3 tok/s | 82.7 tok/s |
 | `tests/serve_e2e.sh` | PASS | PASS |
 
-With `own` as the shipped build, the daily XDNA bump is skipped (repository variable `ONEBIT_NPU_RUNTIME=own`, see "Keeping current" above); the xdna-driver pin is then a kernel-module pin only.
+## The XDNA driver
 
-Scope: `own` is checked on the fast lane's full-ELF path (`npu/lane.cpp`). The per-op forward
-(`npu/forward`) builds against it but has not been run on it. A private route add-on
-(`ONEBIT_NPU_PRIVATE`) that links XRT itself still needs XRT.
+The runtime talks to the `amdxdna` kernel driver. `third_party/xdna-driver` pins upstream
+[amd/xdna-driver](https://github.com/amd/xdna-driver) as the driver version the NPU lane is
+checked against: Strix Halo runs an out-of-tree `amdxdna` built from it (the kernel's own copy
+also works). Nothing from the pin is built into or shipped with the release, and the release does
+not fetch it. `scripts/build-xdna.sh` and XRT's userspace stack are gone.
+
+`.github/workflows/bump-xdna.yml` moves the pin when run by hand (workflow_dispatch); it has no
+schedule, because a driver move means rebuilding and re-signing the module on Strix Halo and
+running the NPU check below first.
 
 ### Checking the NPU
 
 `tests/npu_lane_e2e.sh` is retired (2026-10-03): the fast-lane kernels it ran were derived from
 FastFlowLM, and the reference logits it compared against are lost. The NPU check is now the private dx add-on's from-source check, which is not in this repository. A
-pin bump that touches the NPU (xdna-driver, XRT, the Linux kernel) is checked with it on Strix
+pin bump that touches the NPU (the xdna-driver pin, `config/npu-runtime.config`, the Linux kernel) is checked with it on Strix
 Halo before merging; the public tests that need no kernels (`npu_full_elf_md5`, `npu_q4nx`,
 `npu_pack_test`, `tokenizer_test`) still run in CI.
 
 ## Step 3d: the layer kernel and lm-head, built from source
 
 CONTRIBUTING rule 4 requires NPU kernels to be built from source. The layer kernel and
-lm-head artifacts did not meet that rule for a while: The bump sits behind the runtime switch: with the repository variable `ONEBIT_NPU_RUNTIME` set to `own` (the build we ship), the scheduled run is skipped and the pin stays put, because only an `xrt` build needs XRT; a manual run of the workflow still bumps. Set the variable to `xrt` to resume the daily bump.
+lm-head artifacts did not meet that rule for a while:
 - The instruction ELFs came from the old per-context generator.
 - The PDI came from the rounding-fixed `layer.xclbin` (1bit-MONSTER #2651).
 

@@ -34,9 +34,10 @@ backend, behind the same OpenAI API as every other device. The engine builds our
 
 `third_party/ds4` pins our fork's `1bit/main`: upstream `antirez/ds4` main plus the
 commits we carry (1BP packages). When upstream main moves, `.github/workflows/bump-ds4.yml`
-rebases our commits onto it, tags the old tip `ds4-main-<sha12>` so the old pin stays
-reachable, and opens a PR moving the submodule. A commit that no longer applies stops the bump
-for a hand rebase.
+merges it into `1bit/main`, the way the Lemonade fork's sync merges an upstream release, tags
+the old tip `ds4-main-<sha12>` so the old pin stays reachable, and opens a PR moving the
+submodule. The merge keeps the old pin an ancestor of the new one, which is what the engine's
+pin check requires. A conflict stops the bump for a hand merge.
 
 ```
 git submodule update --init --depth 1 third_party/ds4
@@ -69,6 +70,11 @@ and the build fails (`use of undeclared identifier '__ocml_exp10_f32'`).
 | `--ssd-streaming` | `--ssd-streaming`: routed experts from the SSD instead of full residency (GLM 5.x needs it on 128 GB) |
 | `--ds4 PATH` | a different `ds4-server` (else `$ONEBIT_DS4`, else this build's, else `ds4-server` on PATH) |
 
+`serve` has no flag for ds4's expert-cache size (`--ssd-streaming-cache-experts N|NGB`): it passes only
+`--ssd-streaming`, so `ds4-server` sizes the cache itself from the GPU's recommended working set (69 GiB,
+76 GiB planned with the resident weights, on a 128 GB Strix Halo). To run under a set memory budget, start
+`ds4-server` with the flag yourself and point `serve` at it with `--ds4`.
+
 `ds4-server` opens its port only after the model has loaded, so `1bit serve` waits
 for its `/v1/models` (it has no `/health`). `--parallel` and `--mtp` are llama.cpp
 options and are refused on `ds4`; DwarfStar has its own batching
@@ -79,6 +85,14 @@ and the GPU must see that much (`amdgpu.gttsize` / `ttm.pages_limit`, DwarfStar'
 [STRIX_HALO.md](https://github.com/antirez/ds4/blob/main/docs/STRIX_HALO.md)).
 
 ## 1BP packages
+
+At the pin of 2026-10-17 (`5b013dc1bb75`, upstream `fc80bd695da7` plus our 1BP v5 work: reader,
+converter and checker), DeepSeek V4 Flash Q2 was run on Strix Halo from its GGUF and from its 1BP
+package, against the previous pin (`a7f2e1eaf36c`): three fixed prompts at temperature 0, two reps
+each, gave **identical answers and token counts in every pairing** (new vs old and GGUF vs package),
+and `1bit serve -m <model>.1bp` still routes a package to `ds4` by itself. Both pins ran it with
+`--ssd-streaming` and a 32 GB expert cache, because the model does not fit resident beside the box's
+other services.
 
 Our fork reads 1BP v5, 1bit-MONSTER's model package: one memory-mappable file with the 1BP
 header and tensor index, the model's metadata (encoded as GGUF's key/value section) and

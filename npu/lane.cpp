@@ -18,8 +18,9 @@
 #include "full_elf.h"
 #include "pack.h"
 
-#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
+#include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
+#include <algorithm>
 #include <chrono>
 #include <cstdio>
 #include <cstring>
@@ -55,6 +56,10 @@ struct Lane::Impl {
     std::vector<std::unique_ptr<xrt::ext::bo>> i6[2];  // per runlist slot: RoPE rows differ
     std::unique_ptr<xrt::ext::bo> act, logits, fnorm, lmhead_w;
 
+    // KV rows: the run at context n writes row n - 1 of each region, at byte base + (n - 1) * step.
+    std::vector<ContextMap::RowOffset> kv_rows_at;
+    int kv_used = 0;  // rows [0, kv_used) of each region hold data written since the last clear
+
     struct Slot {
         std::vector<xrt::run> runs;
         std::unique_ptr<xrt::runlist> rl;
@@ -84,6 +89,11 @@ struct Lane::Impl {
             }
             kv.push_back(make_bo(dev, kv_bytes));
         }
+        kv_rows_at = map.row_offsets();
+        if (kv_rows_at.empty()) throw std::runtime_error("layer kernel: no KV row offsets in its control code");
+        for (const auto& r : kv_rows_at)
+            if (size_t(r.base) + size_t(kMaxContext) * r.step > kv_bytes)
+                throw std::runtime_error("layer kernel: a KV region runs past the KV buffer");
         act = make_bo(dev, kSmallBo);
         logits = make_bo(dev, kSmallBo);
         fnorm = make_bo(dev, kSmallBo);
@@ -112,6 +122,7 @@ struct Lane::Impl {
     }
 
     void prepare(int slot, int n) {
+        kv_used = std::max(kv_used, n);
         auto& rope = i6[slot];
         for (auto& bo : rope) {
             fill_rope(static_cast<uint16_t*>(bo->map()), n - 1, d.rope_theta);
@@ -160,6 +171,7 @@ struct Lane::Impl {
     // long-idle context stale and its next runlist execute() fails with
     // ERT_CMD_STATE_TIMEOUT).
     void begin() {
+        clear_kv();
         const Bytes init = assemble_full_elf(ctx1, pdi, "flinit", PdiMode::kInitOnly);
         ctx = std::make_unique<xrt::hw_context>(dev, xrt::elf(reinterpret_cast<const char*>(init.data()), init.size()));
         {
@@ -176,6 +188,24 @@ struct Lane::Impl {
         layer_kernels.clear();
         slots[0].rl.reset(); slots[0].runs.clear();
         slots[1].rl.reset(); slots[1].runs.clear();
+    }
+
+    // Zero the KV rows earlier generations wrote, so that every generation starts from the zeroed
+    // cache a fresh process has (#400). The layer kernel reads the cache in whole 16-row blocks, so
+    // each run also reads rows past its position. Their K rows are masked out of the softmax: no
+    // value written there changed the logits, so zero rows add nothing to it. Their V rows are
+    // not inert: any value in a V row past the position but in the position's group of 8 rows
+    // changed the logits (the attention cores convert to a block-float format in which 8 values
+    // share an exponent), while rows of the next group did not. An earlier request's rows there
+    // moved the logits by up to 3.3, and identical requests gave different text.
+    void clear_kv() {
+        if (kv_used == 0) return;
+        for (auto& bo : kv) {
+            auto* base = static_cast<uint8_t*>(bo->map());
+            for (const auto& r : kv_rows_at) std::memset(base + r.base, 0, size_t(kv_used) * r.step);
+            bo->sync(XCL_BO_SYNC_BO_TO_DEVICE);  // whole buffer: the regions sit at nonzero offsets
+        }
+        kv_used = 0;
     }
 
     // Destroy the hw_context while it is warm (every run completed), so its

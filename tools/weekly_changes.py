@@ -35,7 +35,7 @@ UPSTREAMS = {
     "lemonade": ("Lemonade", "lemonade-sdk/lemonade", "lemonade-sdk/lemonade"),
     "llama.cpp": ("llama.cpp for HRX (AMD's tested pair)", None, "ggml-org/llama.cpp"),
     "hrx-system": ("HRX", None, None),
-    "xdna-driver": ("XDNA driver + XRT", "amd/xdna-driver", None),
+    "xdna-driver": ("XDNA driver (amdxdna)", "amd/xdna-driver", None),
     "laya": ("Laya router", None, None),
     "tokenizers": ("Hugging Face tokenizers", "huggingface/tokenizers", None),
     "ryzenai-server": ("ryzenai-server (ONNX)", "lemonade-sdk/ryzenai-server", None),
@@ -47,7 +47,7 @@ PINS = {  # path -> (name, what it is to the engine, repo whose latest release i
     "lemonade": ("Lemonade", "the server the engine runs inside", "lemonade-sdk/lemonade", "https://github.com/lemonade-sdk/lemonade/releases"),
     "llama.cpp": ("HRX llama.cpp", "our patches on AMD's ggml-hrx", None, "https://github.com/1bit-MONSTER/llama.cpp/commits/1bit/hrx-vulkan-patched"),
     "hrx-system": ("hrx-system", "ROCm/hrx-system plus our Loom/libhrx commits", None, "https://github.com/1bit-MONSTER/hrx-system/commits/1bit/main"),
-    "xdna-driver": ("xdna-driver", "AMD NPU driver + XRT", "amd/xdna-driver", "https://github.com/amd/xdna-driver/commits/main"),
+    "xdna-driver": ("xdna-driver", "AMD NPU kernel driver (amdxdna)", "amd/xdna-driver", "https://github.com/amd/xdna-driver/commits/main"),
     "laya": ("Laya", "router scorer", "NandhaKishorM/laya", "https://github.com/NandhaKishorM/laya/releases"),
     "tokenizers": ("tokenizers", "Hugging Face", "huggingface/tokenizers", "https://github.com/huggingface/tokenizers/releases"),
     "ryzenai-server": ("ryzenai-server", "ONNX Runtime GenAI", "lemonade-sdk/ryzenai-server", "https://github.com/lemonade-sdk/ryzenai-server/releases"),
@@ -283,10 +283,8 @@ def main() -> None:
         md += ["## Engine", ""] + [f"- {e['title']}" + (f" (#{e['pr']})" if e["pr"] else "") for e in own] + [""]
     md += ["## Packages", "",
            "| file | what |", "|---|---|",
-           f"| `1bit-{a.tag}-linux-x86_64.tar.zst` | 1bit and its backends (HRX, ONNX, DwarfStar, NPU with XRT) |",
-           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe |",
-           f"| `1bit-{a.tag}-windows-x64.zip` | 1bit.exe with CPU and ONNX backends |",
-           f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: boot the engine from a USB stick |",
+           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe and the engine in `1bit/`: 1bit and its backends (HRX, ONNX, DwarfStar, the NPU lane; no XRT); start it with `lemond-onebit` |",
+           f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: Lemonade with the engine, booted from a USB stick |",
            "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", "",
            "Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); each backend keeps its own "
            "license. 1bit OS also carries GPL programs (the Linux kernel, BusyBox) as built on the release "

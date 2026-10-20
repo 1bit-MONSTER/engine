@@ -18,7 +18,7 @@
 // Inputs are the model's kernel artifacts: the layer kernel's instruction ELF for
 // context length 1 (plus the ones for lengths 2 and 17, which pin down how the
 // control code depends on the length), the lm-head instruction ELF and the design
-// PDI. Outputs are ELFs XRT opens directly: xrt::hw_context(dev, xrt::elf) and
+// PDI. Outputs are ELFs the NPU runtime opens directly: xrt::hw_context(dev, xrt::elf) and
 // hw_context::add_config, with no xclbin anywhere.
 #pragma once
 
@@ -57,6 +57,14 @@ struct ContextMap {
     std::vector<Word> words;
     static constexpr int kBlock = 16;
 
+    // Where the run at context n writes its KV row: each linear word with a step above 1 is a byte
+    // offset base + (n - 1) * step into the KV buffer (a row offset in the control code, or its
+    // relocation addend); the words equal to n step by 1. Distinct (base, step) pairs, in order.
+    struct RowOffset {
+        uint32_t base, step;
+    };
+    std::vector<RowOffset> row_offsets() const;
+
     // Throws if a differing word follows neither rule.
     static ContextMap derive(const Bytes& ctx1, const Bytes& ctx2, const Bytes& ctx17);
 };
@@ -78,7 +86,7 @@ enum class PdiMode {
 // Assemble a full ELF (PDI + control code) from an instruction ELF, following the
 // layout aiecc --get-full-elf produces. Argument symbols move from the instruction
 // ELF's convention (first buffer is argument 3) to the full-ELF one (argument 0).
-// kernel_name is the name XRT looks the kernel up by; config is the column count.
+// kernel_name is the name the runtime looks the kernel up by; config is the column count.
 Bytes assemble_full_elf(const Bytes& instruction_elf, const Bytes& pdi, const std::string& kernel_name,
                         PdiMode mode, uint32_t config = 8);
 

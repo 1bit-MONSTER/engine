@@ -27,7 +27,8 @@
 # 1bit OS is a Lemonade appliance: it boots Lemonade's server (lemond), with Lemonade's defaults,
 # and the engine is one of Lemonade's backends (the onebit recipe). The initramfs holds BusyBox,
 # the kernel modules for the GPU (amdgpu, which also provides /dev/kfd) and the NPU (amdxdna),
-# Ethernet, Wi-Fi and USB storage, the firmware those load, XRT with the XDNA plugin, Mesa's Radeon
+# Ethernet, Wi-Fi and USB storage, the firmware those load (the NPU runtime is compiled into 1bit:
+# no XRT), Mesa's Radeon
 # Vulkan driver (for Lemonade's Vulkan backends), Lemonade (lemond, the lemonade CLI and the web
 # app, built from the engine's pin third_party/lemonade), and the engine: 1bit and its HRX
 # llama-server, with TheRock's HSA runtime that HRX loads (ONEBIT_HRX_LIBHSA from the build's
@@ -46,7 +47,8 @@
 #
 # Licences (os/LICENSES.md): a backend ships only when os/licenses/<recipe>/SOURCE says
 # "Ship: yes"; that directory goes onto the stick as /data/lemonade/licenses/<recipe>. The
-# initramfs carries /usr/share/licenses/1bit-os (LICENSES.md, the engine's LICENSE and NOTICE,
+# initramfs carries /usr/share/licenses/1bit-os (LICENSES.md, the engine's LICENSE and NOTICE, the
+# closed binaries' LICENSE-BINARY and NOTICE-BINARY,
 # Lemonade's LICENSE, packages.txt) and the Ubuntu copyright file of every package it takes files
 # from, in /usr/share/doc/<package>/copyright, with /usr/share/common-licenses.
 #
@@ -56,8 +58,8 @@
 #                         downloads on /data; everything else Lemonade's defaults)
 #   LEMONADE_ENV=<f>      Lemonade's environment file for the stick (LEMONADE_API_KEY, ...)
 #
-# Test images only (vmtest.sh on a machine without TheRock or XRT): LLAMA_SERVER=<a CPU
-# llama-server> stands in for the HRX build, and NO_XRT=1 leaves XRT out.
+# Test images only (vmtest.sh on a machine without TheRock): LLAMA_SERVER=<a CPU llama-server>
+# stands in for the HRX build.
 #
 # Needs no root: the EFI stub and mtools come from their Debian packages, unpacked locally.
 set -euo pipefail
@@ -127,16 +129,6 @@ fw() {   # a pattern that matches nothing on this machine is skipped
 fw "amdgpu/gc_11_5_1_*" "amdgpu/sdma_6_1_1*" "amdgpu/psp_14_0_1*" "amdgpu/smu_14_0_1*" \
    "amdgpu/vpe_6_1_1*" "amdgpu/dcn_3_5_1*" "amdgpu/vcn_4_0_6*" "amdnpu/17f0_11" \
    "rtl_nic/rtl8125*" "mediatek/mt7925" "mediatek/WIFI_*7925*" "mediatek/BT_*7925*" "regulatory.db*"
-
-echo "== XRT"
-if [ -n "${NO_XRT:-}" ]; then
-    echo "   left out (NO_XRT=1: a test image, no NPU)"
-    mkdir -p "$root/etc/1bit"; touch "$root/etc/1bit/no_xrt"
-else
-    copy_elf /opt/xilinx/xrt/lib/libxrt_coreutil.so.2 /opt/xilinx/xrt/lib/libxrt_core.so.2 \
-             /opt/xilinx/xrt/lib/libxrt_driver_xdna.so.2
-    (cd "$root/opt/xilinx/xrt/lib" && for l in libxrt_coreutil libxrt_core libxrt_driver_xdna; do ln -sf $l.so.2 $l.so; done)
-fi
 
 echo "== the engine"
 bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
@@ -251,7 +243,7 @@ printf '127.0.0.1 localhost\n::1 localhost\n' > "$root/etc/hosts"
 echo "== licences (os/LICENSES.md)"
 doc=$root/usr/share/licenses/1bit-os
 mkdir -p "$doc"
-cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$doc/"
+cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$doc/"
 cp "$src/third_party/lemonade/LICENSE" "$doc/lemonade-LICENSE" ||
     { echo "no third_party/lemonade/LICENSE (git submodule update --init third_party/lemonade)"; exit 1; }
 cp "$licenses/llamacpp-hrx/ROCR-Runtime-LICENSE" "$doc/ROCR-Runtime-LICENSE"   # TheRock's libhsa for HRX

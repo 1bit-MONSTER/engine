@@ -29,7 +29,7 @@
 
 #include "../npu/forward/include/q4nx_forward.h"
 #include "tokenizer.h"
-#include "rt.h"  // XRT, or the own runtime (-DONEBIT_NPU_RUNTIME=own)
+#include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 #include <httplib.h>
 #include "http_guard.h"

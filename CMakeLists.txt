@@ -13,7 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 cmake_minimum_required(VERSION 3.24)
+# The engine needs GCC 16: C++26 std::simd (<simd>) is in libstdc++ from GCC 16.
+# Pick gcc-16 / g++-16 when no compiler was chosen and they are installed.
+if(NOT CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+  find_program(ONEBIT_GXX16 g++-16)
+  find_program(ONEBIT_GCC16 gcc-16)
+  if(ONEBIT_GXX16 AND ONEBIT_GCC16)
+    set(CMAKE_C_COMPILER "${ONEBIT_GCC16}")
+    set(CMAKE_CXX_COMPILER "${ONEBIT_GXX16}")
+  endif()
+endif()
 project(onebit_engine VERSION 0.0.1 LANGUAGES C CXX)
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+  message(FATAL_ERROR "The engine needs GCC 16 or newer for C++26 std::simd; found "
+                      "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}. Install g++-16 or pass "
+                      "-DCMAKE_CXX_COMPILER=g++-16 -DCMAKE_C_COMPILER=gcc-16.")
+endif()
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
@@ -95,6 +110,10 @@ target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}"
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
+# serve takes a hung backend down (docs/serve.md, "When a backend hangs"): a fake backend, no GPU.
+add_test(NAME watchdog_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/watchdog_serve.sh $<TARGET_FILE:onebit>)
+# serve's GET /metrics (docs/serve.md, "Metrics"): a fake backend, no GPU.
+add_test(NAME metrics_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/metrics_serve.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
@@ -102,6 +121,9 @@ add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FI
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
+# engine#315: what --hrx-cwsr-placement puts in an HRX backend's environment (app/hrx_cwsr.h); fake backend, no GPU.
+add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh $<TARGET_FILE:onebit>)
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)
@@ -115,6 +137,30 @@ add_test(NAME http_guard COMMAND http_guard_test)
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)
 target_include_directories(gguf_meta_test PRIVATE app)
 add_test(NAME gguf_meta COMMAND gguf_meta_test)
+# serve's memory admission (app/mem_admit.h, docs/serve.md "Will it fit?"): KV/state sizes against
+# HRX0 logs, the box readings on a fake /proc and /sys; header only, runs in CI.
+add_executable(mem_admit_test tests/mem_admit_test.cpp)
+target_include_directories(mem_admit_test PRIVATE app)
+add_test(NAME mem_admit COMMAND mem_admit_test)
+# engine #390's load-time placement report and --strict-device (app/serve_metrics.h, docs/serve.md
+# "Off-HRX placement"): the backend's placement line in, serve's line and the refusal out; header
+# only, no GPU, no backend.
+add_executable(hrx_placement_test tests/hrx_placement_test.cpp)
+target_include_directories(hrx_placement_test PRIVATE app)
+target_link_libraries(hrx_placement_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME hrx_placement COMMAND hrx_placement_test)
+# engine#315 candidate 1's --hrx-cwsr-placement decision (app/hrx_cwsr.h, docs/hrx.md "CWSR
+# save-area placement"): a fake cwsr_enable file and environment in, the variables out; header
+# only, no GPU.
+add_executable(hrx_cwsr_test tests/hrx_cwsr_test.cpp)
+target_include_directories(hrx_cwsr_test PRIVATE app)
+add_test(NAME hrx_cwsr COMMAND hrx_cwsr_test)
+# --pm-router's class -> expert table and its flag values (app/pm.cpp, docs/pm.md "Routing with
+# Laya"); no GPU, no checkpoint, no Lemonade: config in, mapping out.
+add_executable(pm_routes_test tests/pm_routes_test.cpp app/pm.cpp)
+target_include_directories(pm_routes_test PRIVATE app ${CMAKE_BINARY_DIR}/generated)
+target_link_libraries(pm_routes_test PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+add_test(NAME pm_routes COMMAND pm_routes_test)
 
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
@@ -133,7 +179,8 @@ endif()
 if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
     add_dependencies(onebit llama_hrx)
-    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}")
+    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
+                               ONEBIT_HRX_ALLOW_NO_SVM=${ONEBIT_HRX_ALLOW_NO_SVM})
     if(ONEBIT_SERVE_TEST_GGUF)
         foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}
@@ -205,8 +252,8 @@ endif()
 
 # ── Step 3: NPU engine, full ELFs only (docs/npu.md) ──────────────────────
 # Host side (full-ELF generation, model reader, buffer packing): pure C++, no
-# XRT. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there
-# by default; the Lemonade face (including the mlx backend) does not use it.
+# NPU runtime. It needs PCRE2 (the tokenizer), and macOS has no NPU, so it is off there
+# by default.
 if(APPLE)
     set(_onebit_npu_host_default OFF)
 else()
@@ -292,6 +339,9 @@ if(ONEBIT_LAYA_ROUTE_MODEL)
     # the request classifier on the 200 labelled requests (RFC #186): 95.5% measured, floor 90%
     add_test(NAME laya_classify COMMAND laya_classify_eval ${ONEBIT_LAYA_ROUTE_MODEL}/typed-decisions
              ${CMAKE_SOURCE_DIR}/tests/laya_route_cases.json --min-accuracy 90)
+    # `--pm-router laya` end to end without a GPU: the same classifier decides the class of two
+    # labelled requests and the engine's table decides whether the PM delegates (docs/pm.md).
+    add_test(NAME pm_laya_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_laya_route.sh $<TARGET_FILE:onebit> ${ONEBIT_LAYA_ROUTE_MODEL})
 endif()
 
 # The registry against the reviewed not-an-alias list (docs/arch-gaps.md) and the committed pins:
@@ -307,6 +357,9 @@ if(Python3_Interpreter_FOUND)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry), so a regression cannot leave the daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
+    # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
+    add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
 endif()
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
@@ -340,7 +393,7 @@ target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)
 add_test(NAME npu_model_bounds COMMAND npu_model_bounds_test)
-# The forward's Q4NX loader is plain C (no XRT), so its crafted-file checks run in CI too.
+# The forward's Q4NX loader is plain C (no NPU runtime), so its crafted-file checks run in CI too.
 add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forward/src/model.c)
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
 target_link_libraries(npu_forward_loader_test PRIVATE m)
@@ -366,69 +419,50 @@ target_link_libraries(npu_private_route_test PRIVATE onebit_npu)
 add_test(NAME npu_private_route COMMAND npu_private_route_test)
 endif()  # ONEBIT_NPU_HOST
 
-# The lane itself: needs an NPU runtime and an XDNA NPU to run.
-option(ONEBIT_NPU "Build the NPU fast lane (needs an NPU runtime: XRT by default)" OFF)
-set(ONEBIT_XRT_ROOT "/opt/xilinx/xrt" CACHE PATH "XRT install prefix")
-# Which runtime the NPU code compiles against (npu/rt.h, docs/npu.md "The runtime"):
-#   xrt  XRT from ONEBIT_XRT_ROOT (the default; unchanged behaviour)
-#   own  the XRT-compatible runtime of a private add-on: ONEBIT_NPU_RT_DIR holds npu_rt.h and
-#        npu_rt.cpp, built here into onebit_npu_rt. No XRT is needed or linked.
-set(ONEBIT_NPU_RUNTIME "xrt" CACHE STRING "NPU runtime: xrt or own")
-set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS xrt own)
-set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with npu_rt.h and npu_rt.cpp (ONEBIT_NPU_RUNTIME=own)")
-if(NOT ONEBIT_NPU_RUNTIME STREQUAL "xrt" AND NOT ONEBIT_NPU_RUNTIME STREQUAL "own")
-    message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be xrt or own, not '${ONEBIT_NPU_RUNTIME}'")
+# The lane itself: needs the NPU runtime and an XDNA NPU to run.
+option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_DIR)" OFF)
+# The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The NPU runtime"): our own, an
+# XRT-compatible runtime that is not part of this repository. ONEBIT_NPU_RT_DIR holds its npu_rt.h
+# and npu_rt.cpp, built here into the static library onebit_npu_rt and linked into 1bit. AMD's XRT
+# is not supported: the engine links no XRT library. The release build takes the runtime from the
+# pinned private checkout in config/npu-runtime.config (scripts/fetch-private.sh).
+set(ONEBIT_NPU_RUNTIME "own" CACHE STRING "NPU runtime: own (the only value)")
+set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS own)
+set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with the NPU runtime's npu_rt.h and npu_rt.cpp (private)")
+if(NOT ONEBIT_NPU_RUNTIME STREQUAL "own")
+    message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be own, not '${ONEBIT_NPU_RUNTIME}': the engine builds "
+                        "no XRT NPU lane (docs/npu.md, \"The NPU runtime\")")
 endif()
 if(ONEBIT_NPU AND NOT ONEBIT_NPU_HOST)
     message(FATAL_ERROR "ONEBIT_NPU needs ONEBIT_NPU_HOST=ON")
 endif()
-# The option's refusals (bad value, own without a runtime directory); needs no XRT, runs in CI.
+# The option's refusals (bad value, no runtime directory); needs no NPU runtime, runs in CI.
 if(ONEBIT_NPU_HOST AND NOT WIN32)
     add_test(NAME npu_runtime_option
              COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_runtime_option.sh ${CMAKE_SOURCE_DIR} ${FETCHCONTENT_BASE_DIR})
     set_tests_properties(npu_runtime_option PROPERTIES TIMEOUT 300)
 endif()
 if(ONEBIT_NPU)
-    if(ONEBIT_NPU_RUNTIME STREQUAL "own")
-        if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.h" OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp")
-            message(FATAL_ERROR "ONEBIT_NPU_RUNTIME=own needs ONEBIT_NPU_RT_DIR with npu_rt.h and npu_rt.cpp; "
-                                "ONEBIT_NPU_RT_DIR='${ONEBIT_NPU_RT_DIR}'")
-        endif()
-        add_library(onebit_npu_rt STATIC ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
-        target_include_directories(onebit_npu_rt SYSTEM PUBLIC ${ONEBIT_NPU_RT_DIR})
-        target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
-        find_package(Threads REQUIRED)
-        target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
-        set(_onebit_npu_rt onebit_npu_rt)
-        set(_onebit_npu_rt_inc "")
-        set(_onebit_npu_rt_extra "")
-    else()
-        if(NOT EXISTS "${ONEBIT_XRT_ROOT}/include/xrt/xrt_device.h")
-            message(FATAL_ERROR "ONEBIT_NPU needs XRT; none at ONEBIT_XRT_ROOT=${ONEBIT_XRT_ROOT}")
-        endif()
-        set(_onebit_npu_rt ${ONEBIT_XRT_ROOT}/lib/libxrt_coreutil.so)
-        set(_onebit_npu_rt_inc ${ONEBIT_XRT_ROOT}/include)
-        set(_onebit_npu_rt_extra aiebu uuid)
+    if(NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.h" OR NOT EXISTS "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp")
+        message(FATAL_ERROR "ONEBIT_NPU needs the NPU runtime: ONEBIT_NPU_RT_DIR must hold npu_rt.h and "
+                            "npu_rt.cpp (ONEBIT_NPU_RT_DIR='${ONEBIT_NPU_RT_DIR}'). The runtime is private; "
+                            "without it, build with ONEBIT_NPU=OFF (docs/npu.md, \"The NPU runtime\")")
     endif()
+    add_library(onebit_npu_rt STATIC ${ONEBIT_NPU_RT_DIR}/npu_rt.cpp)
+    target_include_directories(onebit_npu_rt SYSTEM PUBLIC ${ONEBIT_NPU_RT_DIR})
+    target_compile_definitions(onebit_npu_rt PUBLIC ONEBIT_NPU_RUNTIME_OWN)
+    find_package(Threads REQUIRED)
+    target_link_libraries(onebit_npu_rt PUBLIC Threads::Threads)
     add_library(onebit_npu_lane STATIC npu/lane.cpp npu/generate.cpp)
-    if(_onebit_npu_rt_inc)
-        target_include_directories(onebit_npu_lane SYSTEM PUBLIC ${_onebit_npu_rt_inc})
-    endif()
-    target_link_libraries(onebit_npu_lane PUBLIC onebit_npu ${_onebit_npu_rt})
+    target_link_libraries(onebit_npu_lane PUBLIC onebit_npu onebit_npu_rt)
     target_sources(onebit PRIVATE app/unified.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_lane)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU)
-    if(ONEBIT_NPU_RUNTIME STREQUAL "xrt")
-        set_target_properties(onebit PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib INSTALL_RPATH ${ONEBIT_XRT_ROOT}/lib)
-    endif()
-    # The shim compiles against the selected runtime (and runs without an NPU: it only builds
-    # objects and checks the API surface the engine uses).
+    # The shim compiles against the runtime (and runs without an NPU: it only builds objects and
+    # checks the API surface the engine uses).
     add_executable(npu_rt_shim_test tests/npu_rt_shim_test.cpp)
     target_link_libraries(npu_rt_shim_test PRIVATE onebit_npu_lane)
     add_test(NAME npu_rt_shim COMMAND npu_rt_shim_test)
-    if(ONEBIT_NPU_RUNTIME STREQUAL "xrt")
-        set_target_properties(npu_rt_shim_test PROPERTIES BUILD_RPATH ${ONEBIT_XRT_ROOT}/lib)
-    endif()
 
     # The model-generic forward (npu/forward): the GGUF-on-NPU serve route
     # (docs/npu.md, "Open"). q4nx_forward.cpp + its Q4NX dequant/pack/semantics
@@ -453,9 +487,8 @@ if(ONEBIT_NPU)
         target_compile_definitions(onebit_npu_forward PRIVATE NPU_INFER_DEBUG_DUMPS)
     endif()
     target_include_directories(onebit_npu_forward SYSTEM PUBLIC
-        npu/forward/include npu/forward/engine-src npu ${_onebit_npu_rt_inc})
-    target_link_libraries(onebit_npu_forward PUBLIC
-        ${_onebit_npu_rt} ${_onebit_npu_rt_extra} dl pthread m)
+        npu/forward/include npu/forward/engine-src npu)
+    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu_rt dl pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
@@ -476,10 +509,6 @@ if(ONEBIT_NPU_PRIVATE)
     if(NOT EXISTS "${ONEBIT_NPU_PRIVATE}/addons/CMakeLists.txt")
         message(FATAL_ERROR "ONEBIT_NPU_PRIVATE=${ONEBIT_NPU_PRIVATE} has no addons/CMakeLists.txt")
     endif()
-    if(ONEBIT_NPU_RUNTIME STREQUAL "own")
-        message(WARNING "ONEBIT_NPU_PRIVATE with ONEBIT_NPU_RUNTIME=own: an add-on that links XRT itself "
-                        "still needs XRT (docs/npu.md, \"XRT or the own runtime\")")
-    endif()
     add_subdirectory(${ONEBIT_NPU_PRIVATE}/addons ${CMAKE_BINARY_DIR}/npu_private)
     if(NOT TARGET onebit_npu_private)
         message(FATAL_ERROR "${ONEBIT_NPU_PRIVATE}/addons defines no onebit_npu_private target")
@@ -491,13 +520,4 @@ if(ONEBIT_NPU_PRIVATE)
     if(ONEBIT_NPU_DX_KERNELS)
         target_compile_definitions(onebit PRIVATE ONEBIT_NPU_DX_KERNELS_DEFAULT="${ONEBIT_NPU_DX_KERNELS}")
     endif()
-endif()
-
-
-# MLX on Apple Silicon: `1bit serve --device mlx` (docs/apple.md).
-set(ONEBIT_MLX_SERVER "" CACHE FILEPATH "lemon-mlx-engine's server binary, for serve_e2e_mlx")
-if(APPLE AND ONEBIT_MLX_SERVER)
-    add_test(NAME serve_e2e_mlx
-             COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> mlx-community/Qwen3-0.6B-4bit mlx
-                     --mlx-server ${ONEBIT_MLX_SERVER})
 endif()

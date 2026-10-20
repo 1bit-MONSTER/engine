@@ -1,0 +1,36 @@
+engine#315 — the REFUTED candidate fix, preserved as evidence (do NOT land)
+
+HYPOTHESIS (refuted 2026-10-13 by its own pre-registered A/B, commit fc7ffd5):
+  buffer_get() read a host-visible, NON-COHERENT mmap with a bare memcpy, and no cache-invalidate
+  exists on that path, so the CPU could observe a stale view of the logits allocation.
+
+TEST RESULT (commit f84be10):
+  ARM A  GGML_HRX_COHERENT_READ unset : cell e OK=0 FAULT=4   <- 4 of 4 eviction arms faulted
+  ARM B  GGML_HRX_COHERENT_READ=1     : cell e faults too (Face B, http=1 s500=1 unparsed=2)
+  => the fix does NOT reduce the eviction-cell fault rate. The read path is not where the
+     corruption enters.
+
+WHY IT IS PRESERVED: it is the record of a mechanism hypothesis that was killed by experiment rather
+than argument, and its failure is a real constraint on the remaining candidate space (it removes the
+entire read side, leaving the write side and intermediate-buffer propagation).
+
+--- The change, as built and tested (patched tree ~/wt/llama-315coherent, build ~/wt/315coherent-build) ---
+diff --git a/ggml/src/ggml-hrx/ggml-hrx.cpp b/ggml/src/ggml-hrx/ggml-hrx.cpp
+@@ buffer_get(ggml_backend_buffer_t buffer, const ggml_tensor * tensor, void * data,
+@@            size_t offset, size_t size)
+     GGML_ASSERT(source_offset <= buffer->size && size <= buffer->size - source_offset);
++    // engine#315 (REFUTED CANDIDATE): a host-visible buffer is mmap'd non-coherently
++    // (HRX_MEMORY_TYPE_HOST_LOCAL | DEVICE_VISIBLE = 0x52, no HOST_COHERENT) and the runtime exposes no
++    // cache-invalidate call, so a bare memcpy can hand back the CPU's stale view of the mapping rather
++    // than what the device wrote. Route the read through the runtime's own device-to-host transfer.
++    // Gated so an A/B stays one binary; off by default.
++    if (environment_flag_enabled("GGML_HRX_COHERENT_READ")) {
++        if (!HRX_CHECK(hrx_synchronous_d2h(context->device->device, context->buffer, source_offset, data, size))) {
++            GGML_LOG_ERROR("%s: HRX buffer download failed\n", __func__);
++        }
++        return;
++    }
+     if (context->base != reinterpret_cast<uint8_t *>(GGML_HRX_FAKE_PTR_BASE)) {
+         std::memcpy(data, context->base + source_offset, size);
+         return;
+     }

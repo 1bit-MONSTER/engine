@@ -1,0 +1,74 @@
+{
+ "about": "HRX hardware gate KLD bases (docs/hw-gate.md). The .kld files live on the gate box, not in git; this file pins what they are.",
+ "kld": {
+  "qwen3-0.6b": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 619931604,
+   "base_sha256": "a97ecd1a998e9af72a178e88515c9c71aeabd063013c783ec9ecb64796a702e3",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3-0.6B-Q4_K_M.gguf",
+    "sha256_first_64MiB": "9532c863f5486907eb74f04adceea2d3e027c76b05c3a5d0715789547f3b2279",
+    "size": 396705472
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8d9ce2c1aa60ed6b2334df3576e203e40c533a9c"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
+  "qwen3.8-27b": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 1013178324,
+   "base_sha256": "7fc1cf24b5eb07bc15e9b6b28af9e15baddf960d85152e3d56eede265dd981ca",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3.8-27B-UD-Q4_K_XL.gguf",
+    "sha256_first_64MiB": "0bc73cb2357258a977f33f910a7d2b02c3c3ac7db98e4dcac6b58a8618b43827",
+    "size": 17559178144
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8d9ce2c1aa60ed6b2334df3576e203e40c533a9c"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
+  "zaya1-8b": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 1069596564,
+   "base_sha256": "13f3d4c1ad1b6b0da5994aee165df6edd2228dccc72d9ebeb49a9b6c33e6cd4d",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "zaya1-8b-Q4_K_M.gguf",
+    "sha256_first_64MiB": "436ece6be1f34061e6b3e3da4463dabf9f069129e911ba02e5582caa9dab265f",
+    "size": 5567582048
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8d9ce2c1aa60ed6b2334df3576e203e40c533a9c"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  }
+ }
+}

@@ -91,24 +91,26 @@ counts and the coverage read against the registry and the checked results. The
 `census.yml` workflow runs daily at 05:17 UTC. It rebuilds the registry from the pins,
 sweeps HF, and opens a PR when anything changed.
 
-The census of 2026-09-27 (the first full sweep ran 2026-09-25), with `registry/census.json` holding the latest:
+The census of 2026-10-17 (the first full sweep ran 2026-09-25), with `registry/census.json` holding the latest:
 
 | | models | share of those with an architecture |
 |---|---|---|
-| Text-generation models on HF | 415,695 | |
-| With an architecture in their config | 332,726 (2,616 architectures) | |
-| Mapped | 315,701 | 94.88% |
-| Checked | 214,033 | 64.33% |
+| Text-generation models on HF | 425,483 | |
+| With an architecture in their config | 338,650 (2,822 architectures) | |
+| Mapped | 320,418 | 94.62% |
+| Checked | 216,406 | 63.9% |
 
 | Backend | Mapped | Checked |
 |---|---|---|
-| hrx | 94.78% | 64.32% |
-| npu | 9.29% | 9.29% |
+| hrx | 94.62% | 63.9% |
+| npu | 53.77% | 9.37% |
 
 "Checked" counts every model whose architecture has a passing model. It does not mean each
 of those models was run. The unmapped architectures with the most models are
-`Step1MoEForCausalLM` (2,882), `OPTForCausalLM` (2,097), `ParlerTTSForConditionalGeneration`
-(1,586) and `GPTNeoForCausalLM` (1,565). `tools/census.py --pr-body` lists the top ten.
+`Step1MoEForCausalLM` (2,882), `ParlerTTSForConditionalGeneration` (1,585),
+`ChessForCausalLM` (970) and `LlavaLlamaForCausalLM` (453); `OPTForCausalLM` and
+`GPTNeoForCausalLM`, which led this list in September, are mapped now.
+`tools/census.py --pr-body` lists the top ten.
 
 ## The watch
 
@@ -127,7 +129,9 @@ not Transformers, so Transformers has no implementation of it either) and that f
 uploaders publish. Research one-offs like that arrive every day (`Ihatetomatoes/nanoBeard-sloop-14M`
 is a raw `pytorch` nanoGPT checkpoint whose config says `architectures: ["GPT"]` and
 `model_type: nanobeard-gpt`, engine#296). It alerts once 3 uploaders use it, and a reviewed
-class (`registry/significant.json`) always alerts.
+class (`registry/significant.json`) always alerts, unless its entry says `"watch": "report"`:
+a research architecture reviewed as not an alias that nothing upstream implements
+(`GrugMoeForCausalLM`, engine#381). The watcher lists those as `. REVIEWED` without the alert.
 
 The watch runs daily at 04:30 UTC (ahead of the 05:17 sweep) in two places:
 - GitHub Actions (`.github/workflows/census-watch.yml`, [RFC #246](https://github.com/1bit-MONSTER/engine/discussions/246)), which files one deduped

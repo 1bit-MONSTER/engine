@@ -82,6 +82,9 @@ def main():
             "max_tokens": 16,
             "cache_prompt": False,
             "enable_thinking": False,
+            # current llama-server ignores the top-level flag: Qwen3 then thinks for all 16 tokens
+            # and the content is empty (hw-gate, 2026-10-12); the template kwarg turns it off
+            "chat_template_kwargs": {"enable_thinking": False},
         },
     )
     result = post_json(
@@ -93,6 +96,9 @@ def main():
             "max_tokens": 16,
             "cache_prompt": False,
             "enable_thinking": False,
+            # current llama-server ignores the top-level flag: Qwen3 then thinks for all 16 tokens
+            # and the content is empty (hw-gate, 2026-10-12); the template kwarg turns it off
+            "chat_template_kwargs": {"enable_thinking": False},
         },
     )
     answer = result["choices"][0]["message"].get("content", "").strip()

@@ -13,7 +13,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 cmake_minimum_required(VERSION 3.24)
+# The engine needs GCC 16: C++26 std::simd (<simd>) is in libstdc++ from GCC 16.
+# Pick gcc-16 / g++-16 when no compiler was chosen and they are installed.
+if(NOT CMAKE_CXX_COMPILER AND NOT DEFINED ENV{CXX})
+  find_program(ONEBIT_GXX16 g++-16)
+  find_program(ONEBIT_GCC16 gcc-16)
+  if(ONEBIT_GXX16 AND ONEBIT_GCC16)
+    set(CMAKE_C_COMPILER "${ONEBIT_GCC16}")
+    set(CMAKE_CXX_COMPILER "${ONEBIT_GXX16}")
+  endif()
+endif()
 project(onebit_engine VERSION 0.0.1 LANGUAGES C CXX)
+if(NOT CMAKE_CXX_COMPILER_ID STREQUAL "GNU" OR CMAKE_CXX_COMPILER_VERSION VERSION_LESS 16)
+  message(FATAL_ERROR "The engine needs GCC 16 or newer for C++26 std::simd; found "
+                      "${CMAKE_CXX_COMPILER_ID} ${CMAKE_CXX_COMPILER_VERSION}. Install g++-16 or pass "
+                      "-DCMAKE_CXX_COMPILER=g++-16 -DCMAKE_C_COMPILER=gcc-16.")
+endif()
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)

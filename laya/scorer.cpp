@@ -28,13 +28,14 @@
 #include <nlohmann/json.hpp>
 
 #include <algorithm>
-#include <thread>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
 #include <fstream>
 #include <memory>
+#include <simd>
 #include <string>
+#include <thread>
 #include <vector>
 
 namespace onebit::laya {
@@ -88,11 +89,22 @@ void parallel_ranges(int n, int t, F fn) {
 
 // out[m, j0..j1) of in[m,n] @ W^T[k,n] + bias[k]. Every sum has one fixed order (sixteen lanes over
 // the input, then the lanes in turn, then the tail), so the result does not depend on how the
-// columns are split across threads, and the lanes vectorize.
+// columns are split across threads. The lanes are a C++26 std::simd vector of 16 floats: each
+// clone lowers it to its own registers (one zmm, two ymm, or four xmm) with the same lane order.
 ONEBIT_LAYA_SIMD_CLONES
 void linear_cols(const float* in, const float* W, const float* bias, int m, int n, int k, float* out, int j0, int j1) {
-    constexpr int V = 16;
-    const int nv = n / V * V;
+    using V = std::simd::vec<float, 16>;
+    constexpr int VL = 16;
+    const int nv = n / VL * VL;
+    auto load = [](const float* p) { return std::simd::unchecked_load<V>(p, VL); };
+    // Sum the lanes in order 0..15 onto s, as the scalar loop did: one store, then scalar adds
+    // (reading a[l] lane by lane makes AVX2 and SSE shuffle each lane out of the register).
+    auto add_lanes = [](float s, const V& a) {
+        alignas(64) float t[VL];
+        std::simd::unchecked_store(a, t, VL);
+        for (int l = 0; l < VL; ++l) s += t[l];
+        return s;
+    };
     // Each weight row is read once per four input rows; the four rows' sums are independent.
     for (int j = j0; j < j1; ++j) {
         const float* wr = W + (size_t)j * n;
@@ -100,14 +112,12 @@ void linear_cols(const float* in, const float* W, const float* bias, int m, int 
         int i = 0;
         for (; i + 4 <= m; i += 4) {
             const float *x0 = in + (size_t)i * n, *x1 = x0 + n, *x2 = x1 + n, *x3 = x2 + n;
-            float a0[V] = {}, a1[V] = {}, a2[V] = {}, a3[V] = {};
-            for (int c = 0; c < nv; c += V)
-                for (int l = 0; l < V; ++l) {
-                    const float w = wr[c + l];
-                    a0[l] += x0[c + l] * w; a1[l] += x1[c + l] * w; a2[l] += x2[c + l] * w; a3[l] += x3[c + l] * w;
-                }
-            float s0 = b, s1 = b, s2 = b, s3 = b;
-            for (int l = 0; l < V; ++l) { s0 += a0[l]; s1 += a1[l]; s2 += a2[l]; s3 += a3[l]; }
+            V a0 = 0.0f, a1 = 0.0f, a2 = 0.0f, a3 = 0.0f;
+            for (int c = 0; c < nv; c += VL) {
+                const V w = load(wr + c);
+                a0 += load(x0 + c) * w; a1 += load(x1 + c) * w; a2 += load(x2 + c) * w; a3 += load(x3 + c) * w;
+            }
+            float s0 = add_lanes(b, a0), s1 = add_lanes(b, a1), s2 = add_lanes(b, a2), s3 = add_lanes(b, a3);
             for (int c = nv; c < n; ++c) {
                 const float w = wr[c];
                 s0 += x0[c] * w; s1 += x1[c] * w; s2 += x2[c] * w; s3 += x3[c] * w;
@@ -117,11 +127,9 @@ void linear_cols(const float* in, const float* W, const float* bias, int m, int 
         }
         for (; i < m; ++i) {
             const float* x = in + (size_t)i * n;
-            float a[V] = {};
-            for (int c = 0; c < nv; c += V)
-                for (int l = 0; l < V; ++l) a[l] += x[c + l] * wr[c + l];
-            float acc = b;
-            for (int l = 0; l < V; ++l) acc += a[l];
+            V a = 0.0f;
+            for (int c = 0; c < nv; c += VL) a += load(x + c) * load(wr + c);
+            float acc = add_lanes(b, a);
             for (int c = nv; c < n; ++c) acc += x[c] * wr[c];
             out[(size_t)i * k + j] = acc;
         }

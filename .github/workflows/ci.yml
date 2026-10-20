@@ -45,13 +45,13 @@ jobs:
           python3 tests/check_pins_test.py
           python3 tests/hrx_long_prompt_test.py
       - name: Install build dependencies
-        # GCC 15, as on the Strix Halo development machine: the engine is C++26, which the
+        # GCC 16: the engine is C++26 and uses std::simd (<simd>, libstdc++ 16), which the
         # runner's own GCC 13 cannot build
         run: |
           sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update && sudo apt-get install -y g++-15 ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev
+          sudo apt-get update && sudo apt-get install -y g++-16 ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-16 -DCMAKE_CXX_COMPILER=g++-16
       - name: Build
         # Every target a ctest test invokes must be listed here: `ctest` runs whatever
         # binaries exist, so a test whose target is missing reports "Not Run" and never

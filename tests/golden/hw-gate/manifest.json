@@ -24,6 +24,52 @@
     "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
    }
   },
+  "qwen3-4b-iq4xs": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 619931604,
+   "base_sha256": "f5d43376b320183d4b5ad35ef5ce586f92d0266aec6ddf3d06f503acf40d9d2e",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3-4B-IQ4_XS.gguf",
+    "sha256_first_64MiB": "4cdb9218462fd54c5775362281bbdb42dea3cd354a41422ffbd0711eda669b4e",
+    "size": 2270752032
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "00f2a68de2e3275c75f1687222367cda817f2918"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
+  "qwen3-coder-30b-a3b": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 619931604,
+   "base_sha256": "2f0f020994fd19c14416792943fd6cc5f526b96480c445dd02b8cb745c708554",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+    "sha256_first_64MiB": "4352bc33979addc23e174e8d10292ed898f41115ce840686c4d654ea6c720470",
+    "size": 18556689568
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "00f2a68de2e3275c75f1687222367cda817f2918"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
   "qwen3.8-27b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 1013178324,

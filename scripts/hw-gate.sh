@@ -20,9 +20,11 @@
 #
 #   ops     test-backend-ops -b HRX0 on the ops the HRX correctness bugs touched
 #   kat     tools/kat.py check: known answers, determinism, cached prefix, varied lengths and drift
-#           vs tests/golden/hw-gate/kat-<model>.json, on Qwen3-0.6B, ZAYA1-8B and Qwen3.8-27B
+#           vs tests/golden/hw-gate/kat-<model>.json, on Qwen3-0.6B, ZAYA1-8B, Qwen3.8-27B
+#           (K-quants), Qwen3-Coder-30B-A3B (MoE, Q4_K_M) and Qwen3-4B (IQ4_XS)
 #   kld     llama-perplexity --kl-divergence vs stored base logits (512 tokens x 8 chunks)
-#   needle  tests/hrx_long_prompt.py: the 4.7K-token needle (#319, #369) on Qwen3-0.6B
+#   needle  tests/hrx_long_prompt.py: the 320-record needle (7.1K tokens on Qwen3, 7.4K on ZAYA1;
+#           #319, #369) on Qwen3-0.6B and ZAYA1-8B
 #
 #   scripts/hw-gate.sh [--bin DIR] [--phases build,ops,kat,kld,needle] [--models a,b] [--record]
 #
@@ -74,10 +76,15 @@ OPS=${HW_GATE_OPS:-MUL_MAT,MUL_MAT_ID,FLASH_ATTN_EXT,GATED_DELTA_NET,SSM_CONV,GE
 # Cases KNOWN-ISSUES.md lists as intermittent: a failure of only these is re-run once.
 FLAKY_CASES=${HW_GATE_FLAKY:-"MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048"}
 
-# name | file under $MODELS | kat --repeat
-MODEL_TABLE="qwen3-0.6b|Qwen3-0.6B-Q4_K_M.gguf|3
-zaya1-8b|zaya1-8b-Q4_K_M.gguf|2
-qwen3.8-27b|qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf|2"
+# name | file under $MODELS | kat --repeat | needle (1 = run tests/hrx_long_prompt.py on it)
+# The first three are K-quants (ZAYA1-8B routes 1 of 16 experts). The Qwen3-Coder row covers
+# MUL_MAT_ID with top-8 of 128 experts, the IQ row the IQ4_XS matmul and GET_ROWS paths. The
+# needle runs on a small and a mid-size model.
+MODEL_TABLE="qwen3-0.6b|Qwen3-0.6B-Q4_K_M.gguf|3|1
+zaya1-8b|zaya1-8b-Q4_K_M.gguf|2|1
+qwen3.8-27b|qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf|2|0
+qwen3-coder-30b-a3b|Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf|2|0
+qwen3-4b-iq4xs|Qwen3-4B-IQ4_XS.gguf|2|0"
 
 # tools/mem_budget.py (through hw_gate_manifest.py): never start a GPU step that would push the box into
 # the engine#315 regime (faults seen only at GTT >= 95 GiB) or past MemAvailable. "-" = no model.
@@ -98,7 +105,7 @@ while [ $# -gt 0 ]; do
       if [ "${1:-}" = --mem ]; then memcheck "$2" || exit 76; shift 2; fi
       exec "$@" ;;
     --serve-step) SERVE_STEP=1; shift; break ;;   # internal: one model's kat (+ needle) inside the lock
-    -h|--help) sed -n '16,38p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '16,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "hw-gate: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -137,7 +144,7 @@ if [ "$SERVE_STEP" = 1 ]; then
       fi
     fi
     if [ "$needle" = 1 ]; then
-      python3 "$ROOT/tests/hrx_long_prompt.py" --url "http://127.0.0.1:$PORT" > "$out/needle.txt" 2>&1 || rc=$((rc | 4))
+      python3 "$ROOT/tests/hrx_long_prompt.py" --url "http://127.0.0.1:$PORT" > "$out/needle-$name.txt" 2>&1 || rc=$((rc | 4))
     fi
     date +%s > "$out/t-$name-kat"
     kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
@@ -301,12 +308,12 @@ fi
 # ---- kat + needle + KLD: one lock hold per model -------------------------------------------
 if has kat || has needle || has kld; then
   [ -f "$TEXT" ] || { has kld && { result kld FAIL 0 "text missing: $TEXT"; infra=1; }; }
-  while IFS='|' read -r name file repeat; do
+  while IFS='|' read -r name file repeat donee; do
     want_model "$name" || continue
     model=$MODELS/$file base=$STORE/kld/$name.kld
     if [ ! -f "$model" ]; then result "model $name" FAIL 0 "model missing: $model"; infra=1; continue; fi
     dokat=0; has kat && dokat=1
-    needle=0; [ "$name" = qwen3-0.6b ] && has needle && needle=1
+    needle=0; [ "$donee" = 1 ] && has needle && needle=1
     dokld=0; has kld && [ -f "$TEXT" ] && dokld=1
     if [ $dokld = 1 ] && [ "$MODE" = check ] &&
        ! python3 "$ROOT/tools/hw_gate_manifest.py" verify "$GOLDEN/manifest.json" "$name" "$base" "$model" "$TEXT" > "$OUT/kld-$name.verify" 2>&1; then
@@ -331,7 +338,7 @@ if has kat || has needle || has kld; then
     fi
     if [ $needle = 1 ]; then
       st=PASS; [ $((rc & 4)) = 4 ] && st=FAIL
-      result "needle 4.7K $name" $st - "$(tail -n 1 "$OUT/needle.txt")"
+      result "needle $name" $st - "$(tail -n 1 "$OUT/needle-$name.txt")"
     fi
     if [ $dokld = 1 ]; then
       if [ "$MODE" = record ]; then

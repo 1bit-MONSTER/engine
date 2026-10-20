@@ -86,6 +86,8 @@ public:
     void sync(int direction);
     void sync(int direction, size_t size, size_t offset);
     size_t size() const;
+    // The buffer's device address, for add-ons that write it into config buffers.
+    uint64_t address() const;
     explicit operator bool() const { return static_cast<bool>(m); }
 
 protected:

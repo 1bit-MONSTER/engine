@@ -39,6 +39,7 @@ static void uses(const std::vector<char>& image) {
     act->sync(XCL_BO_SYNC_BO_TO_DEVICE);
     act->sync(XCL_BO_SYNC_BO_FROM_DEVICE, size_t(256), size_t(0));
     std::printf("%zu\n", plain->size());
+    std::printf("%llu\n", static_cast<unsigned long long>(act->address()));
     xrt::run r(k);
     r.set_arg(0, *act);
     r.start();

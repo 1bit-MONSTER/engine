@@ -255,7 +255,7 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 Engine #390. HRX can leave part of a graph on the CPU - an op its kernels do not serve, a
 `GET_ROWS` outside the supported range - and the model still answers, slower, with nothing said
 so. The scheduler is the one place that knows the backend of every node, so ggml-hrx reports it
-there (`GGML_HRX_REPORT`, llama.cpp fork #102). serve reads that line and prints its own at load:
+there (`GGML_HRX_REPORT`, llama.cpp fork #102). serve reads those lines and prints its own:
 
 ```
 placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4), 7 graph splits
@@ -266,15 +266,25 @@ A graph that is all on HRX prints `1bit serve: HRX placement: all 512 nodes on H
 splits`. The same numbers are `onebit_cpu_fallback_ops{op}` in [Metrics](#metrics) (`op="all"` is
 the total).
 
+`--placement-report` passes `GGML_HRX_REPORT=2`, so the backend reports **every** graph, and serve
+prints its line again whenever a graph has more nodes off HRX than every graph before it: the line
+is the worst graph so far, with `, worst of N graphs` when more than one reported. This matters
+because the warmup graph is scheduled before any request and is not the model: the 20 Oct census
+found LFM2 `--parallel 4` (20 nodes, 5 splits) and ZAYA1-8B (1-3 nodes) clean in the warmup report
+and split in prompt and multi-sequence graphs. Without `--placement-report` serve keeps
+`GGML_HRX_REPORT=1` (the first graph only), which costs no log volume.
+
 llama-server drops the library's INFO lines below `-lv 4` (an INFO line is a trace line there,
 `common/log.cpp`), so at its default verbosity the report never reaches serve. `--placement-report`
 passes `-lv 4` to the backend for that load, which prints the report along with the rest of
 llama.cpp's INFO lines.
 
 `--strict-device` refuses to start instead of running part of the graph on the CPU: serve sets
-`GGML_HRX_STRICT=1`, the backend aborts at load on the first node off HRX with its name, op, type
-and shape, and serve exits non-zero. It needs `--device hrx` or `auto`. If a report does arrive
-anyway and names off-HRX nodes, serve refuses with the same numbers.
+`GGML_HRX_STRICT=1`, and the backend checks every graph it schedules, aborting on the first node off
+HRX with its name, op, type and shape. A graph that is only scheduled by a request (a
+`--parallel N` multi-sequence batch, a long prompt) therefore aborts at that request rather than at
+load. If a report does arrive and names off-HRX nodes, serve refuses with the same numbers. It needs
+`--device hrx` or `auto`.
 
 Both flags only set what the backend already reads, and a `GGML_HRX_REPORT` or `GGML_HRX_STRICT`
 in the environment wins over what serve passes (0 turns either off). `tests/hrx_placement_test.cpp`

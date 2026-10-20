@@ -375,6 +375,8 @@ stage_release() {
     if [ -n "$prev" ]; then from=$(git -C "$SRC" rev-list -1 "$prev");
     else from=$(git -C "$SRC" rev-list -1 --before="7 days ago" origin/main); fi
     [ -n "$from" ] || from=$(git -C "$SRC" rev-list --max-parents=0 origin/main | tail -1)
+    # stages run one at a time (docs/releases.md): without the bumps stage there is no bumps.json
+    [ -f "$W/bumps.json" ] || echo "[]" > "$W/bumps.json"
     say "release $tag: changes ${from:0:12}..$(git -C "$SRC" rev-parse --short HEAD) (previous: ${prev:-none})"
     python3 "$SRC/tools/weekly_changes.py" --src "$SRC" --from "$from" --to HEAD --tag "$tag" \
         --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md"

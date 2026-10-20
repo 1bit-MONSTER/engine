@@ -817,9 +817,9 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   Qwen attention path (`qwen.attention`), which derives its mask from positions and let the slots'
   answers bleed into each other under `-kvu`. Qwen3-4B 4 slots: 153 tok/s aggregate (single stream
   76; Vulkan 216); Qwen3-Coder-30B-A3B 34 -> 74; ZAYA1-8B 47 -> 71. Hybrid gated delta-net models
-  (qwen35, qwen35moe, qwen3next: Qwen3.5/3.8) are refused with `--parallel` on HRX: there is no
-  multi-sequence GATED_DELTA_NET kernel yet ([llama.cpp #48](https://github.com/1bit-MONSTER/llama.cpp/pull/48)
-  fixed the two failures before it).
+  (qwen35, qwen35moe, qwen3next: Qwen3.5/3.8) take `--parallel` too since 2026-10-20: the gated delta-net
+  matchers hold up to 8 sequences ([llama.cpp #117](https://github.com/1bit-MONSTER/llama.cpp/pull/117);
+  [#48](https://github.com/1bit-MONSTER/llama.cpp/pull/48) fixed the two failures before it).
 - **Fast sub-4-bit kernels on HRX.** IQ3_S has a decode kernel (#43) but not a fast prefill one. Q2_K
   ([llama.cpp #49](https://github.com/1bit-MONSTER/llama.cpp/pull/49)), IQ2_XXS/IQ2_XS
   ([llama.cpp #50](https://github.com/1bit-MONSTER/llama.cpp/pull/50)) and IQ3_XXS/IQ2_S

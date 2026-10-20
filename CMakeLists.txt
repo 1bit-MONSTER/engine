@@ -192,6 +192,8 @@ if(ONEBIT_HRX)
         foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
+            # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS), as onnx_npu_smoke does without an NPU
+            set_tests_properties(serve_e2e_${_dev} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
     endif()
 endif()

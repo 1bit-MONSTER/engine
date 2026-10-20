@@ -34,7 +34,8 @@ stage=$(mktemp -d)/$name
 trap 'rm -rf "$(dirname "$stage")"' EXIT
 mkdir -p "$stage" "$out"
 
-is_elf() { [ -f "$1" ] && [ "$(head -c 4 "$1" | od -An -c | tr -d ' ')" = '177ELF' ]; }
+# shellcheck source=scripts/pack-elf.sh
+. "$src/scripts/pack-elf.sh"
 
 # <rel dir> <program ...>: the programs, and every shared library in that directory
 put() {
@@ -58,38 +59,19 @@ if [ -d "$stage/onnx" ]; then
     done
 fi
 
-# Every program and library finds its libraries beside itself. A library it loads from elsewhere
-# in the build tree (HRX's libhrx, libloomc) is copied beside it; RUNPATH entries outside the
-# build tree (TheRock) stay, since the package needs what the build machine had there.
-fix() {  # fix <staged file> <file in the build>
-    local f=$1 orig=$2 keep="" e dep
-    while read -r dep; do
-        case "$dep" in "$build"/*) [ -e "$(dirname "$f")/$(basename "$dep")" ] || {
-            cp -L "$dep" "$(dirname "$f")/"; queue+=("$(dirname "$f")/$(basename "$dep")|$dep"); } ;; esac
-    done < <(ldd "$orig" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $3}')
-    for e in $(readelf -d "$orig" | sed -n 's/.*R\(UN\)\{0,1\}PATH.*\[\(.*\)\]/\2/p' | tr ':' ' '); do
-        case "$e" in '$ORIGIN'*|"$build"*|"$HOME"*|'') ;; *) keep="$keep:$e" ;; esac
-    done
-    patchelf --set-rpath "\$ORIGIN$keep" "$f"
-}
-queue=()
-while IFS= read -r -d '' f; do
-    is_elf "$f" && queue+=("$f|$build/${f#"$stage"/}")
-done < <(find "$stage" -mindepth 2 -type f -print0)
-while [ ${#queue[@]} -gt 0 ]; do
-    item=${queue[0]}; queue=("${queue[@]:1}")
-    fix "${item%%|*}" "${item#*|}"
-done
-
+# Every program and library finds its libraries beside itself (scripts/pack-elf.sh): a library it
+# loads from elsewhere in the build tree (HRX's libhrx, libloomc) or LLVM's OpenMP runtime
+# (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
+# it; RUNPATH entries outside the build tree (TheRock in /opt) stay, since HRX needs TheRock anyway.
+pack_localize "$stage" "$build"
 patchelf --remove-rpath "$stage/1bit"
 
 # symbol tables and debug info out of every program and library: the release ships compiled code
 # only (docs/releases.md, "Private components"); the dynamic symbols they link by stay
-while IFS= read -r -d '' f; do if is_elf "$f"; then strip --strip-unneeded "$f"; fi; done < <(find "$stage" -type f -print0)
+pack_strip "$stage"
 
 # nothing may still point into the build machine's home
-bad=$(find "$stage" -type f -print0 | while IFS= read -r -d '' f; do
-    is_elf "$f" && readelf -d "$f" | grep -E 'R(UN)?PATH' | grep -E "$HOME|$build" | sed "s|^|$f: |"; done || true)
+bad=$(pack_build_rpaths "$stage" "$build")
 [ -z "$bad" ] || { echo "RPATH into the build machine left:"; echo "$bad"; exit 1; }
 
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"

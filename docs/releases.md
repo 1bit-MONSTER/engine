@@ -96,11 +96,12 @@ binary-drop-<version>/
   MANIFEST              the pins below, the build host, the compilers, sha256 of every file
 ```
 
-It takes the HRX tree from a release build (`--build <dir>`) or from an already packed release
-(`--from-package <tar.zst>`), and the NPU library either prebuilt (`--npu-lib`) or built from the
+It takes the HRX tree from a release build (`--build <dir>`, packed the way `package-linux.sh`
+packs it: the same `scripts/pack-elf.sh` steps copy the libraries it loads beside it, set RUNPATH
+to `$ORIGIN` and strip it) or from an already packed release (`--from-package <tar.zst>`), and the NPU library either prebuilt (`--npu-lib`) or built from the
 pinned private sources (`--npu-rt <dir>`, its `build-api-lib.sh`). It then runs the same class of
 checks the weekly package runs: XRT-free, the kernels really are compiled in, no source files,
-nothing named like the private sources, both binary licenses present. It publishes nothing; the
+nothing named like the private sources, both binary licenses present, every library found. It publishes nothing; the
 orchestrator publishes the tarball and adds its line to `config/binary-drop.config`.
 
 To build against a drop, point CMake at it — a directory or the tarball's URL:
@@ -121,7 +122,9 @@ HSA runtime on the machine that runs it.
 
 The engine is XRT-free: the NPU engine's runtime is compiled in, and nothing links AMD's
 XRT. `scripts/package-linux.sh` strips every packed program and library (`strip
---strip-unneeded`), and after packing the engine tarball the package stage checks
+--strip-unneeded`) and makes each find its libraries beside itself (`$ORIGIN`, `scripts/pack-elf.sh`),
+with LLVM's OpenMP runtime (`libomp.so`, which the HRX llama.cpp libraries link when TheRock's
+amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. After packing the engine tarball the package stage checks
 (`logs/package-checks.log`; a failure stops the release):
 
 - **XRT-free:** for the build's `1bit` and every ELF file in the tarball, no `NEEDED` `libxrt*`
@@ -130,6 +133,11 @@ XRT. `scripts/package-linux.sh` strips every packed program and library (`strip
 - **No source:** no source file (`.hip`, `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hpp`, `.inc`, `.cu`,
   `.py`, `.cmake`) and no file named like one of the private checkouts' files.
 - **Licensed:** `LICENSE`, `NOTICE`, `LICENSE-BINARY` and `NOTICE-BINARY` are in the tarball.
+- **Libraries found:** `ldd` (with `ROCR_VISIBLE_DEVICES=-1`) finds every library each packed
+  program and library needs, except the TheRock runtime the package documents (HIP, hipBLAS(Lt),
+  rocBLAS, HSA, which DwarfStar links).
+
+`SHA256SUMS` is written again by the release stage, after `changes.json`, so it covers every file.
 
 1bit OS carries no XRT either; its `1bit.check` boot reports `CHECK no XRT`.
 

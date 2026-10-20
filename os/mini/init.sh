@@ -57,6 +57,14 @@ else
     export GGML_HRX_JIT_CACHE_DIR=/tmp/hrx-jit
 fi
 
+# SSH sessions get the console's environment: Dropbear starts them with its own PATH
+# (/usr/bin:/bin), so a login shell reads it from /etc/profile, and the Lemonade CLI and lemond are
+# also linked into /usr/bin for `ssh root@<IP> lemonade ...` (no profile is read for a command)
+{ echo "export PATH=$PATH HOME=/root GGML_HRX_JIT_CACHE_DIR=$GGML_HRX_JIT_CACHE_DIR"
+  [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && echo "export IREE_HAL_AMDGPU_LIBHSA_PATH=$IREE_HAL_AMDGPU_LIBHSA_PATH"
+} > /etc/profile
+for b in lemonade lemond; do [ -x "/opt/lemonade/bin/$b" ] && ln -sf "/opt/lemonade/bin/$b" "/usr/bin/$b"; done
+
 # SSH: key logins only, keys from the stick; the host key is made once and kept there
 if [ -s /data/ssh/authorized_keys ]; then
     mkdir -p /root/.ssh && cp /data/ssh/authorized_keys /root/.ssh/ && chmod 700 /root/.ssh && chmod 600 /root/.ssh/authorized_keys

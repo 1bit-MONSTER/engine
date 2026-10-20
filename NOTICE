@@ -94,6 +94,12 @@ ggml-org/llama.cpp carrying AMD's HRX integration)
   Copyright (c) 2023-2026 The ggml authors
   License: MIT
 
+LLVM OpenMP runtime (libomp.so, from TheRock's LLVM; shipped beside the HRX
+llama.cpp libraries, which link it when TheRock's amdclang builds them)
+  https://github.com/ROCm/llvm-project (openmp/runtime; upstream llvm/llvm-project)
+  Copyright the LLVM Project contributors
+  License: Apache-2.0 WITH LLVM-exception (the text is in NOTICE-BINARY)
+
 HRX, HIP Runtime Extended (third_party/hrx-system)
   https://github.com/ROCm/hrx-system
   Copyright the HRX authors (Advanced Micro Devices, Inc.)

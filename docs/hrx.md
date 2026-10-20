@@ -663,6 +663,8 @@ cmake --build build --target onebit
 - **HRX0 and the CPU only.** `GGML_VULKAN`, `GGML_HIP` and `GGML_CUDA` are off. The targets are
   `llama-server` and `llama-bench`. With
   `-DONEBIT_SERVE_TEST_GGUF=<gguf>`, ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`.
+  `serve_e2e_hrx` skips on a machine without a gfx1151 (`ONEBIT_HRX_E2E_TARGETS` names others),
+  found in sysfs by `scripts/gpu-targets.sh` without opening the GPU.
 - **`IREE_ROCM_PATH` is not passed.** It would switch hrx-system to "package"
   mode, which needs TheRock's aqlprofile-sdk headers, and our `/opt/rocm-therock`
   does not ship them. Left unset, hrx-system fetches its pinned HSA/AQL headers.

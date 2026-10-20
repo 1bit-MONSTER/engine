@@ -47,6 +47,9 @@ export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
 SUBMODULES=(hrx-system llama.cpp lemonade ryzenai-server ds4 tokenizers)
 mkdir -p "$LOGS"
+# pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
+# shellcheck source=scripts/pack-elf.sh
+. "$(cd "$(dirname "$0")" && pwd)/pack-elf.sh"
 say() { echo "[$(date +%H:%M:%S)] $*"; }
 trap 'say "FAILED at line $LINENO: $BASH_COMMAND (logs: $LOGS)"' ERR
 # Heavy steps wait for room, and stop before the box runs out of memory (unified memory: GPU
@@ -97,6 +100,13 @@ checkout() {  # checkout <ref> [pr number to merge on top]
 }
 
 pin() { git -C "$SRC" ls-tree HEAD "third_party/$1" | awk '{print $3}'; }
+
+# the machine a held bump failed on, for the release notes: its name and its AMD GPU(s), from
+# sysfs (scripts/gpu-targets.sh), e.g. "strixhalo (gfx1151)" or "ryzen (gfx1036, gfx1201)"
+host_desc() {
+    local g; g=$("$(cd "$(dirname "$0")" && pwd)/gpu-targets.sh" 2>/dev/null | paste -sd, - | sed 's/,/, /g')
+    echo "$(hostname -s) (${g:-no AMD GPU})"
+}
 
 # --- build / test -------------------------------------------------------------------------
 build() {
@@ -215,7 +225,7 @@ stage_bumps() {
         if [ $rc -ne 0 ]; then
             # the step that failed, and the last lines of the log it wrote (the newest besides ours)
             local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-" | head -1)
-            result=held why="failed at $(cat "$W/.step") on Strix Halo ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
+            result=held why="failed at $(cat "$W/.step") on $(host_desc) ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
         elif [ "$DRY" = 1 ]; then
             result=passed why="dry run: not merged"
         else
@@ -257,6 +267,8 @@ stage_test() { run_tests; }
 # Checks the build's 1bit and every file in the tarball.
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
+    # (lists go to stderr through `tee >(cat >&2)`, not `tee /dev/stderr`: reopening the log by
+    # that name truncates it, and the earlier lines of package-checks.log were lost, 2026-10-20)
     local t bad=0 f n names pin
     t=$(mktemp -d)
     tar -C "$t" -xf "$1" --use-compress-program=unzstd
@@ -278,21 +290,27 @@ package_checks() {  # package_checks <linux tarball>
         echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
     else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
     n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
-            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee /dev/stderr | wc -l)
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
     names=$(for pin in npu-runtime gpu-kernels; do
                 git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
             done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
-    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee /dev/stderr | wc -l)
+    n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
         [ "$n" != 0 ] || { echo "FAIL $f is not in $(basename "$1")"; bad=1; }
     done
+    # every library each program loads is packed beside it (scripts/pack-elf.sh), except the TheRock
+    # runtime the package documents (HIP, hipBLAS(Lt), rocBLAS, HSA); ldd runs with
+    # ROCR_VISIBLE_DEVICES=-1, so nothing touches a GPU
+    local missing; missing=$(pack_missing_libs "$t")
+    if [ -z "$missing" ]; then echo "ok   every library is packed (ldd: nothing missing beyond TheRock's runtime)"
+    else echo "FAIL libraries ldd cannot find in $(basename "$1"):"; echo "$missing"; bad=1; fi
     if [ -d "$t"/*/onnx ]; then
         n=$(find "$t"/*/onnx -mindepth 1 \! \( -name ryzenai-server -o -name 'libonnxruntime-genai.so*' \
-                -o -name 'libonnxruntime.so*' -o -name '*.txt' \) -printf '%f\n' | tee /dev/stderr | wc -l)
+                -o -name 'libonnxruntime.so*' -o -name '*.txt' \) -printf '%f\n' | tee >(cat >&2) | wc -l)
         [ "$n" = 0 ] || { echo "FAIL onnx/ carries files beyond ryzenai-server and Microsoft's ONNX Runtime (Ryzen AI Software?)"; bad=1; }
         for f in ryzenai-server-LICENSE.txt onnxruntime-LICENSE.txt onnxruntime-ThirdPartyNotices.txt \
                  onnxruntime-genai-LICENSE.txt onnxruntime-genai-ThirdPartyNotices.txt; do
@@ -360,6 +378,8 @@ stage_release() {
     say "release $tag: changes ${from:0:12}..$(git -C "$SRC" rev-parse --short HEAD) (previous: ${prev:-none})"
     python3 "$SRC/tools/weekly_changes.py" --src "$SRC" --from "$from" --to HEAD --tag "$tag" \
         --previous "$prev" --bumps "$W/bumps.json" --json "$OUT/changes.json" --md "$W/notes.md"
+    # the checksums cover changes.json too (package wrote them before it existed)
+    (cd "$OUT" && rm -f SHA256SUMS && sha256sum -- * > SHA256SUMS)
     if [ "$DRY" = 1 ]; then say "dry run: not publishing"; return; fi
     gh release create "$tag" -R "$REPO" --target "$(git -C "$SRC" rev-parse HEAD)" \
         --title "1bit engine $tag" -F "$W/notes.md" "$OUT"/*

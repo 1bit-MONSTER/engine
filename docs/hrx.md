@@ -56,6 +56,18 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   no longer ours: AMD carries its own (`planning/mask_write_wait`). The pin itself is a `-s ours`
   merge of the previous pin `3319e536` (so every commit the engine shipped stays reachable, with the
   tree of the tested commit `fc2213a1c`) followed by #6. Rebase these by hand when AMD's pair moves.
+- **The pin is off `1bit/main`.** `.gitmodules` names `1bit/main` for hrx-system, but the pin
+  (`82804197`) is on `1bit/e3e6a976-pin-6` (and `1bit/315-allow-no-svm`, the same commit), not on
+  `1bit/main`. The two have diverged (checked 2026-10-20 with GitHub's compare API): `1bit/main`
+  (`c9656af5`) has 6 commits the pin does not, the merges of AMD's `40a1a36c` and `c0b135a7`
+  (the newer hrx-system the hold keeps out) and the engine#409, #410, #401 and #6 fixes, which the
+  pin line carries as its own replayed commits. So `1bit/main` cannot be fast-forwarded to the pin;
+  moving it there means resetting the branch (a force push), which drops those two AMD merges from
+  it. Until that is decided, the pin stays off-branch on purpose. What it costs: a bump PR that moves
+  hrx-system fails the release's on-branch check (`pins_on_branch` in `scripts/weekly.sh`), and a
+  shallow submodule clone that follows `1bit/main` cannot fetch the pin, so the release clones it
+  in full (`weekly.sh` retries the submodule update without `--depth 1`). The pin stays reachable
+  through the `1bit/e3e6a976-pin-6` branch, which must not be deleted.
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.
@@ -368,8 +380,8 @@ The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on 
 and less accurate than the UD-Q4_K_XL file of the same model (Qwen3.8-27B pp512 63.5 against 335
 tok/s; KLD 0.029 against 0.007 vs BF16), and the lean ROCm W4A4 route it was made for left with the
 ROCm build. `tools/hadamard_q4_0.py` is removed, and `1bit serve` refuses a file stamped
-`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`, llama.cpp
-#58) stays in the fork; it is the same code that rotates PrismML's files
+`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`,
+llama.cpp #58) stays in the fork; it is the same code that rotates PrismML's files
 ([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)), which keep running.
 
 ### Server memory: the graph program cache cap (llama.cpp #63)

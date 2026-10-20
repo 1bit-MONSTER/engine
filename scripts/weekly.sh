@@ -30,7 +30,7 @@
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
 # config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
-# what the build scripts each list.
+# what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
 [ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
@@ -113,6 +113,11 @@ build() {
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
+    # The ONNX backend ships with Microsoft's ONNX Runtime (GenAI) only: with RYZENAI_INSTALL_PATH
+    # set, build-onnx.sh would copy AMD's Ryzen AI Software libraries beside ryzenai-server and
+    # they would land in the package (package_checks refuses them too). The NPU through ONNX uses
+    # the user's own install at run time (docs/onnx.md, "Linux NPU").
+    unset RYZENAI_INSTALL_PATH
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
@@ -246,6 +251,9 @@ stage_test() { run_tests; }
 #   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
 #             like one of the private checkouts' files
 #   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
+#   onnx      onnx/ holds ryzenai-server, Microsoft's libonnxruntime-genai / libonnxruntime and their
+#             licence texts, nothing else: no part of AMD's Ryzen AI Software (the RyzenAI / VitisAI
+#             providers, AMD_LICENSE, the AIE compiler libraries), which users install themselves
 # Checks the build's 1bit and every file in the tarball.
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
@@ -282,6 +290,28 @@ package_checks() {  # package_checks <linux tarball>
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
         [ "$n" != 0 ] || { echo "FAIL $f is not in $(basename "$1")"; bad=1; }
     done
+    if [ -d "$t"/*/onnx ]; then
+        n=$(find "$t"/*/onnx -mindepth 1 \! \( -name ryzenai-server -o -name 'libonnxruntime-genai.so*' \
+                -o -name 'libonnxruntime.so*' -o -name '*.txt' \) -printf '%f\n' | tee /dev/stderr | wc -l)
+        [ "$n" = 0 ] || { echo "FAIL onnx/ carries files beyond ryzenai-server and Microsoft's ONNX Runtime (Ryzen AI Software?)"; bad=1; }
+        for f in ryzenai-server-LICENSE.txt onnxruntime-LICENSE.txt onnxruntime-ThirdPartyNotices.txt \
+                 onnxruntime-genai-LICENSE.txt onnxruntime-genai-ThirdPartyNotices.txt; do
+            [ -f "$(echo "$t"/*/onnx)/$f" ] || { echo "FAIL onnx/$f is not in $(basename "$1")"; bad=1; }
+        done
+        # DT_RUNPATH $ORIGIN only: LD_LIBRARY_PATH must win so `1bit serve` can put a Ryzen AI
+        # venv's ONNX Runtime GenAI first (app/serve.cpp ryzenai_child_env), and no path may
+        # point into the build machine
+        f=$(echo "$t"/*/onnx/ryzenai-server)
+        n=$(readelf -d "$f" 2>/dev/null | grep -c '(RPATH)' || true)
+        [ "$n" = 0 ] || { echo "FAIL onnx/ryzenai-server has a DT_RPATH (LD_LIBRARY_PATH cannot override it)"; bad=1; }
+        n=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')
+        [ "$n" = '$ORIGIN' ] || { echo "FAIL onnx/ryzenai-server RUNPATH is '$n', not \$ORIGIN"; bad=1; }
+        n=$(strings -a "$f" | grep -c '^1bit-onnx-signal-shim' || true)
+        [ "$n" != 0 ] || { echo "FAIL onnx/ryzenai-server lacks the SIGTERM shim (scripts/onnx/signal_shim.c)"; bad=1; }
+        [ $bad = 0 ] && echo "ok   onnx/: ryzenai-server (RUNPATH \$ORIGIN, SIGTERM shim) and ONNX Runtime with their licences, no Ryzen AI Software"
+    else
+        echo "FAIL no onnx/ in $(basename "$1") (weekly builds -DONEBIT_ONNX=ON)"; bad=1
+    fi
     rm -rf "$t"
     return $bad
 }
@@ -291,6 +321,10 @@ stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
     while gh release view "$tag" -R "$REPO" > /dev/null 2>&1; do n=$((n + 1)); tag=v$(date +%G.%V).$n; done
     echo "$tag" > "$TAG_FILE"
+    # the image's licences step copies from the submodules of $SRC (checked out by build), not
+    # from the tree this script runs from
+    [ -f "$SRC/third_party/lemonade/LICENSE" ] ||
+        { say "no $SRC/third_party/lemonade/LICENSE: run the build stage first (it checks out the submodules)"; return 1; }
     rm -rf "$OUT" && mkdir -p "$OUT"
     say "package $tag: the engine (into the Lemonade + onebit package)"
     # the engine tree (package-linux.sh) is not published on its own: it goes into the Lemonade
@@ -331,5 +365,43 @@ stage_release() {
         --title "1bit engine $tag" -F "$W/notes.md" "$OUT"/*
     say "released $tag"
 }
+
+# --- preflight ----------------------------------------------------------------------------
+# What the stages need from the machine, checked before the first one runs, so that a missing
+# tool stops the run at the start rather than after an hour of build (2026-10-19 rehearsal).
+preflight() {
+    local bad=0 s rocm d kver vmlinuz
+    for s in $STAGES; do
+        case "$s" in
+            bumps|build)
+                # the HRX build's toolchain (cmake/hrx.cmake), unless WEEKLY_CMAKE_ARGS names another
+                case " ${WEEKLY_CMAKE_ARGS:-} " in
+                    *ONEBIT_HRX_TOOLCHAIN=*) ;;
+                    *) [ -d /opt/rocm-therock ] ||
+                        { echo "preflight: no /opt/rocm-therock (the HRX toolchain): install TheRock there, or pass -DONEBIT_HRX_TOOLCHAIN=<dir> in WEEKLY_CMAKE_ARGS"; bad=1; } ;;
+                esac
+                # DwarfStar (-DONEBIT_DS4=ON) builds with hipcc, found the way scripts/build-ds4.sh finds it
+                rocm=${ROCM_PATH:-}
+                if [ -z "$rocm" ]; then
+                    for d in /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
+                        [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
+                    done
+                fi
+                [ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||
+                    { echo "preflight: no ROCm with bin/hipcc for the DwarfStar build (scripts/build-ds4.sh): set ROCM_PATH"; bad=1; } ;;
+            package)
+                # scripts/package-linux.sh rewrites RPATHs with patchelf
+                command -v patchelf > /dev/null ||
+                    { echo "preflight: patchelf is not installed (scripts/package-linux.sh needs it): apt install patchelf"; bad=1; }
+                # os/mini/mkimage.sh reads the kernel image; on Ubuntu /boot/vmlinuz-* is root-only
+                kver=${KVER:-$(uname -r)}
+                vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
+                [ -r "$vmlinuz" ] ||
+                    { echo "preflight: cannot read the kernel image $vmlinuz (os/mini/mkimage.sh): set VMLINUZ to a readable copy"; bad=1; } ;;
+        esac
+    done
+    return $bad
+}
+preflight || { say "preflight failed: nothing was run"; exit 1; }
 
 for s in $STAGES; do "stage_$s"; done

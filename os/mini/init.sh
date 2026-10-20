@@ -97,7 +97,10 @@ for d in /data/models/*/model.q4nx; do [ -f "$d" ] && d=${d%/model.q4nx} && oneb
   if [ -f lemond.conf ]; then set -a; . ./lemond.conf; set +a; fi
   exec lemond "$lem/cache" "$lem/config" ) > /tmp/lemond.log 2>&1 &
 cfg() { sed -n "s/.*\"$1\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\).*/\1/p" "$lem/config/config.json" 2>/dev/null | head -1; }
-key=off; grep -q '^[[:space:]]*\(export[[:space:]]*\)\{0,1\}LEMONADE_\(ADMIN_\)\{0,1\}API_KEY=..*' "$lem/lemond.conf" 2>/dev/null && key=on
+# Only LEMONADE_API_KEY guards /api and /v1; the admin key alone guards /internal and leaves them open
+setkey() { grep -q "^[[:space:]]*\\(export[[:space:]]*\\)\\{0,1\\}$1=..*" "$lem/lemond.conf" 2>/dev/null; }
+key=off; setkey LEMONADE_API_KEY && key=on
+[ "$key" = off ] && setkey LEMONADE_ADMIN_API_KEY && key="off, admin key only: /api and /v1 are open"
 lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-13305}
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"

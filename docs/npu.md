@@ -33,6 +33,10 @@ Step 3 lands in three parts:
 | 3b | The lane runtime: model reader, buffer packing, runlist decode (`npu/lane`, `npu/generate`, `1bit npu-run`) | landed (#9) |
 | 3c | Serving: tokenizer, `1bit unified` (now `1bit serve`'s NPU route) | landed (#9) |
 
+AMD's own NPU runtime is a separate route: `1bit serve --device onnx` runs Ryzen AI Software's
+ONNX Runtime GenAI (the RyzenAI provider) on the NPU, on Linux too, with nothing of AMD's
+shipped by the engine ([ONNX Runtime, Linux NPU](onnx.md#linux-npu)).
+
 ## A model directory
 
 ```
@@ -383,8 +387,7 @@ and that message; the add-on brings its own tests.
 ## The NPU runtime
 
 The engine is XRT-free: the NPU lane runs on our own NPU runtime, compiled into `1bit`. The runtime
-opens `/dev/accel/accel0` and issues the `amdxdna` ioctls itself, parses the full ELFs itself,
-and keeps XRT's class names (`device`, `bo`, `hw_context`, `elf`, `ext::kernel`, `run`,
+keeps XRT's class names (`device`, `bo`, `hw_context`, `elf`, `ext::kernel`, `run`,
 `runlist`). The engine reaches it only through our own public header `npu/npu_rt_api.h`: the
 calls the engine's NPU code makes, each class an opaque handle, nothing about how the runtime
 works. `npu/rt.h` includes it and aliases its namespace (`namespace xrt = npu_rt_api;`), so the

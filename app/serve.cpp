@@ -1099,8 +1099,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // bleed into each other; it is turned off for these servers.
             // G9: multi-sequence gated delta net - the HRX matchers hold kMaximumSequences 8 now, so these
             // architectures take --parallel like every other llama.cpp model
-            const std::string arch = gguf_architecture(o.model);
-            (void) arch;
             argv.push_back("-kvu");
             bool merged = false;
             for (std::string& e : env)

@@ -61,7 +61,7 @@ The engine has no standalone package of its own.
 > [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade)) passes Lemonade's own LLM test
 > suite on HRX. Following a review,[^geramyl] the engine no longer
 > vendors Lemonade: Lemonade is the host, 1bit is the engine inside it. Ported so far: HRX on AMD's live ggml-hrx,
-> on AMD's `e3e6a976` hrx-system line since 2026-10-18, now hrx-system `82804197` with llama.cpp `00f2a68de` (`b14a28362` since 2026-10-20: a stall-aware `/health` and an exit on a lost GPU for [one hop from Lemonade](docs/serve.md#one-hop-from-lemonade---print-backend), plus the census-gap fixes G4-G6; `8792923f8` since 2026-10-20: the SET_ROWS hook the private kernels' q8_0 KV cache needs, census G1)
+> on AMD's `e3e6a976` hrx-system line since 2026-10-18, now hrx-system `82804197` with llama.cpp `00f2a68de` (`cefbfc073` since 2026-10-20: a stall-aware `/health` and an exit on a lost GPU for [one hop from Lemonade](docs/serve.md#one-hop-from-lemonade---print-backend), plus the census-gap fixes G4-G6; `8792923f8` since 2026-10-20: the SET_ROWS hook the private kernels' q8_0 KV cache needs, census G1; `cefbfc073`: gated delta net with up to 8 sequences, census G9)
 > (2026-10-19, #458, #461; our four fixes replayed plus our long-context live-out fix for ROCm/hrx-system#1535;
 > measured when the line moved on 2026-10-18 with llama.cpp `8d9ce2c1a`, #441, against the old pins on Strix Halo:
 > test-backend-ops 1141/1141, long-prompt needles 20/20 + 5/5 + 5/5, KLD 0 and identical output on two

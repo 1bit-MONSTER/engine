@@ -72,13 +72,52 @@ carry both files beside the engine's `LICENSE` and `NOTICE`:
 
 | Component | Compiled into | Pin | Build option |
 |---|---|---|---|
-| The 1bit NPU runtime ([npu.md](npu.md), "The NPU runtime") | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` |
+| The 1bit NPU runtime ([npu.md](npu.md), "The NPU runtime") | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` (or a prebuilt `ONEBIT_NPU_RT_LIB`) |
 | The private HIP kernels for HRX ([hrx.md](hrx.md), "Private HIP kernels") | `hrx/llama/bin/libggml-hrx.so` (code objects) | `config/gpu-kernels.config` | `ONEBIT_GPU_PRIVATE` |
 
 The build stage fetches each with `scripts/fetch-private.sh <pin> <dir>`: the pinned path at the
 pinned commit only, with the release machine's `gh` login (read access to the private
 repositories). The run stops if either cannot be fetched or is not at its pinned sha. Move a pin
 by hand, after the NPU check or the HRX checks on Strix Halo.
+
+### The public binary drop
+
+A source build outside the org has no private HIP kernels and no private NPU runtime, so it cannot
+compile those parts itself. `scripts/make-binary-drop.sh <engine checkout> <out dir>` packs them
+already compiled, for one engine pin, as `binary-drop-<version>.tar.zst` + `SHA256SUMS`:
+
+```
+binary-drop-<version>/
+  hrx/llama/bin/        llama-server, llama-bench and the libraries beside them, libggml-hrx.so
+                        with the private HIP kernels compiled in
+  npu/libnpu_rt_api.a   the NPU runtime behind the engine's public npu/npu_rt_api.h
+  npu/include/          npu_rt_api.h (the engine's own public header)
+  LICENSE-BINARY NOTICE-BINARY LICENSE NOTICE
+  MANIFEST              the pins below, the build host, the compilers, sha256 of every file
+```
+
+It takes the HRX tree from a release build (`--build <dir>`) or from an already packed release
+(`--from-package <tar.zst>`), and the NPU library either prebuilt (`--npu-lib`) or built from the
+pinned private sources (`--npu-rt <dir>`, its `build-api-lib.sh`). It then runs the same class of
+checks the weekly package runs: XRT-free, the kernels really are compiled in, no source files,
+nothing named like the private sources, both binary licenses present. It publishes nothing; the
+orchestrator publishes the tarball and adds its line to `config/binary-drop.config`.
+
+To build against a drop, point CMake at it — a directory or the tarball's URL:
+
+```
+cmake -B build -DONEBIT_HRX=ON -DONEBIT_NPU=ON -DONEBIT_BINARY_DROP=/path/to/binary-drop-<version>
+# or -DONEBIT_BINARY_DROP=https://…/binary-drop-<version>.tar.zst
+```
+
+A URL is only accepted when `config/binary-drop.config` pins its sha256 for the engine commit being
+built (`drop=<engine sha> <version> <sha256>`); `file(DOWNLOAD)` refuses a body that does not match.
+A directory is verified against its `MANIFEST` — every file's sha256, and the engine commit it was
+built from — and a mismatch, or a drop built for another commit, stops the configure. With a drop in
+place, `ONEBIT_GPU_PRIVATE` and `ONEBIT_NPU_RT_DIR` are not needed and not used: the build links
+`hrx/llama/bin/llama-server` and `npu/libnpu_rt_api.a` from the drop, and does not build llama.cpp,
+so the `llama.cpp` and `hrx-system` submodules are not required either. HRX still needs TheRock's
+HSA runtime on the machine that runs it.
 
 The engine is XRT-free: the NPU engine's runtime is compiled in, and nothing links AMD's
 XRT. `scripts/package-linux.sh` strips every packed program and library (`strip

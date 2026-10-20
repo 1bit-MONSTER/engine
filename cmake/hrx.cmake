@@ -34,6 +34,41 @@ include(ExternalProject)
 
 set(ONEBIT_HRX_TOOLCHAIN "/opt/rocm-therock" CACHE PATH "ROCm/TheRock root: its amdclang builds llama.cpp and HRX")
 
+# A source build outside the org has no private HIP kernels to compile, so it links the prebuilt
+# HRX tree from the public binary drop instead (docs/releases.md, "The public binary drop"): the
+# pinned llama-server and its libraries, libggml-hrx.so with those kernels compiled in. Nothing is
+# built here in that case, so neither TheRock nor the llama.cpp/hrx-system submodules are needed;
+# HRX still dlopens TheRock's HSA runtime on the machine that runs it.
+if(ONEBIT_BINARY_DROP_HRX_BIN AND EXISTS "${ONEBIT_BINARY_DROP_HRX_BIN}/llama-server")
+    if(ONEBIT_GPU_PRIVATE)
+        message(FATAL_ERROR "ONEBIT_HRX: set either ONEBIT_GPU_PRIVATE (compile the private kernels here) "
+                            "or ONEBIT_BINARY_DROP (use them prebuilt), not both (docs/releases.md)")
+    endif()
+    if(NOT ONEBIT_HRX_LIBHSA)
+        file(GLOB_RECURSE _drop_libhsa "${ONEBIT_HRX_TOOLCHAIN}/*/libhsa-runtime64.so.1")
+        set(_drop_libhsa_first "")
+        if(_drop_libhsa)
+            list(SORT _drop_libhsa)
+            list(GET _drop_libhsa 0 _drop_libhsa_first)
+        endif()
+        if(_drop_libhsa_first)
+            set(ONEBIT_HRX_LIBHSA "${_drop_libhsa_first}" CACHE FILEPATH
+                "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)" FORCE)
+        else()
+            set(ONEBIT_HRX_LIBHSA "" CACHE FILEPATH
+                "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)" FORCE)
+            message(STATUS "ONEBIT_HRX: no libhsa-runtime64.so.1 under ${ONEBIT_HRX_TOOLCHAIN}; the build "
+                           "proceeds, but HRX needs TheRock's on the machine that runs it (pass "
+                           "-DONEBIT_HRX_LIBHSA=<path> to bake it in)")
+        endif()
+    endif()
+    set(ONEBIT_HRX_SERVER "${ONEBIT_BINARY_DROP_HRX_BIN}/llama-server" CACHE FILEPATH
+        "HRX llama-server 1bit runs" FORCE)
+    set(ONEBIT_HRX_ALLOW_NO_SVM 1)
+    message(STATUS "ONEBIT_HRX: prebuilt from the binary drop: ${ONEBIT_HRX_SERVER} (HSA runtime: ${ONEBIT_HRX_LIBHSA})")
+    return()
+endif()
+
 foreach(_sub hrx-system llama.cpp)
     if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/${_sub}/CMakeLists.txt")
         message(FATAL_ERROR "ONEBIT_HRX needs third_party/${_sub}: git submodule update --init third_party/${_sub}")

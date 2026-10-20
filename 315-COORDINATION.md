@@ -47,7 +47,7 @@ arms**, across nine sequence lengths — one `n_embd`-wide row = 8192 bytes. If 
 arm e OK (98G)**, in-regime with `side=1/1`, then was superseded by the amendment. Two clean arms, no Face-A.
 Consistent with `0ed67c2`'s finding that the `tail:16` + probes yield did not reproduce.
 
-Evidence: `docs/315-campaign/evidence/315-row-size-scored-from-archive.md`,
+Evidence: `dev/315/315-campaign/evidence/315-row-size-scored-from-archive.md`,
 `315-layer41-site-by-graph-arithmetic.md`.
 
 ---
@@ -93,14 +93,14 @@ only as a formal pre-registered check. Its interesting half is `A vs C`, which t
 is still thermally blocked when you read this, stopping it loses little — and note it holds `box.lock`, so it
 is the one thing blocking the box right now.
 
-Full evidence: `docs/315-campaign/evidence/315-onset-is-set-by-read-pattern-not-probes.md`.
+Full evidence: `dev/315/315-campaign/evidence/315-onset-is-set-by-read-pattern-not-probes.md`.
 
 ---
 
 ## 2026-10-14 05:39 — `315prod` is QUEUED and holds `box.lock`; the box is load-blocked by foreign work
 
 `315prod` (the producer-side sentinel/payload test, pre-registered in
-`docs/315-campaign/evidence/315-producer-probe-preregistration.md` with its two amendments) took `box.lock`
+`dev/315/315-campaign/evidence/315-producer-probe-preregistration.md` with its two amendments) took `box.lock`
 at 05:37:34 and is in its **gate wait**: `tctl = 96 °C` against a required < 80, and `load1 = 30` against a
 required < 4.
 
@@ -176,9 +176,9 @@ exactly the functions that *did* decompile — `hrx_allocator_allocate_buffer`,
 `HOST_COHERENT = 0x04`) and `hrx_buffer_create_from_hal`. That closed "the coherence bit cannot change the
 **pool**". Whether it can change anything **downstream** is unresolved, and `hrx_allocator_virtual_memory_map`
 is the function that would settle it. See
-`docs/315-campaign/evidence/315-coherence-candidate-falsified-by-decomp.md`.
+`dev/315/315-campaign/evidence/315-coherence-candidate-falsified-by-decomp.md`.
 
-Full list and reasoning: `docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
+Full list and reasoning: `dev/315/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
 
 ### 06:30 — priority REVISED for the hrx-re lane: `iree_hal_streaming_memory_register_host` is now #1
 
@@ -202,7 +202,7 @@ either, so it was never captured rather than captured-and-failed. Reasons it out
 
 So: `register_host` first, then `virtual_memory_map` / `_protect` / `_unmap`, then the `hrx_fence_*` and
 `hrx_*_synchronize` families already listed. The whole list is still in
-`docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
+`dev/315/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
 
 **Also useful if it is cheap:** `flags` values for `hipHostRegister` as the HIP headers define them
 (`Portable = 0x1`, `Mapped = 0x2`, `IoMemory = 0x4`, `ReadOnly = 0x8`), so the `(flags & 8)` branch in the
@@ -244,7 +244,7 @@ the others from their callers.
 `hipHostRegister` yields coherent or non-coherent memory — and `flags = 0` is exactly what the #315 trigger
 passes. Nothing here is a mechanism claim; it is the one change that makes the question answerable.
 
-Detail: `docs/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
+Detail: `dev/315/315-campaign/evidence/315-hrx-re-decomp-gaps-are-the-315-functions.md`.
 
 ### 06:50 — WITHDRAW the `register_host` ask: answered from source, and it closes the coherence family
 
@@ -274,7 +274,7 @@ recorded negatives at once: the `GGML_HRX_USE_UNIFIED_MEMORY` A/B could only cha
 and the never-attempted set needs the **DWARF-built queue** described in the previous note. The coherence
 question is no longer among the reasons.
 
-Evidence: `docs/315-campaign/evidence/315-coherence-closed-from-source-both-paths.md`.
+Evidence: `dev/315/315-campaign/evidence/315-coherence-closed-from-source-both-paths.md`.
 
 ---
 
@@ -306,7 +306,7 @@ under the reader" observation is real and is *consistent* with `mark_stream_sync
 writebacks, but this run cannot separate that from a writer racing during the wait — do not read it as proof of
 the writeback path.
 
-Evidence: `docs/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` (`b7d6b46`, `68c430c`).
+Evidence: `dev/315/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` (`b7d6b46`, `68c430c`).
 Pre-registration: `…/315-PREREG-sync-between-reads.md` (`b51f883`).
 
 ### 2. What #315 now needs, and therefore what to ask your lane for
@@ -343,7 +343,7 @@ silent no-op, not a clean result. If any arm of yours keyed on that name, its re
 `ffn_moe_probs` reading in the §50 chain needs re-establishing by whatever anchored mechanism produced it, and
 that is recorded as an **open discrepancy**, not smoothed over.
 
-Evidence: `docs/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`).
+Evidence: `dev/315/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`).
 
 ### 3. Four harness traps that have now cost four readings in a single session
 

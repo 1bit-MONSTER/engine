@@ -13,7 +13,7 @@
 # WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 # See the License for the specific language governing permissions and
 # limitations under the License.
-"""Check Qwen3-0.6B HRX retrieval across a multi-ubatch prompt.
+"""Check HRX retrieval across a multi-ubatch prompt (Qwen3-0.6B, ZAYA1-8B in scripts/hw-gate.sh).
 
 Run against a llama-server built with HRX on Strix Halo:
     python3 tests/hrx_long_prompt.py [--url http://127.0.0.1:8080]

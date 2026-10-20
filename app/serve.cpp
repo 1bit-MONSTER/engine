@@ -177,6 +177,7 @@ struct Options {
     bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
     bool strict_device = false;          // --strict-device: refuse to start unless every node is on HRX (engine #390)
     bool placement_report = false;       // --placement-report: ask the backend for its off-HRX op counts
+    bool print_backend = false;          // --print-backend: print the llama-server command and exit (Lemonade one hop)
     WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
     CwsrPlacement cwsr_placement = CwsrPlacement::Auto;  // --hrx-cwsr-placement (app/hrx_cwsr.h, engine#315)
 };
@@ -1036,11 +1037,15 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // prints one line per graph when GGML_HRX_REPORT is set, and refuses the graph with
             // GGML_HRX_STRICT. Both are off in the backend by default, and a value the user sets in
             // the environment wins (Child keeps it).
-            env.push_back("GGML_HRX_REPORT=1");
+            // 2 = every graph: the warmup graph alone is not the model (census 2026-10-20, finding 1:
+            // LFM2 --parallel 4 and ZAYA1-8B keep 20 and 3 nodes on the CPU in prompt and
+            // multi-sequence graphs while the warmup report says all on HRX).
+            env.push_back(o.placement_report || o.strict_device ? "GGML_HRX_REPORT=2" : "GGML_HRX_REPORT=1");
             if (o.strict_device) env.push_back("GGML_HRX_STRICT=1");
             // llama-server drops the library's INFO lines below verbosity 4 (common/log.cpp maps
             // GGML_LOG_LEVEL_INFO to its trace level), so the report reaches serve only when asked.
-            if (o.placement_report) argv.insert(argv.end(), {"-lv", "4"});
+            // both flags read the report, so both need the verbosity that lets it through
+            if (o.placement_report || o.strict_device) argv.insert(argv.end(), {"-lv", "4"});
         }
         // tools/ternary_to_q4_0.py stamped it: HRX0 reads its decode projections at 2.125 bits per weight
         // instead of 4.5 (llama.cpp #54; the upload checks every block and refuses a non-ternary one).
@@ -1463,6 +1468,48 @@ std::string request_state(const httplib::Request& req, bool head_only = false) {
     return out;
 }
 
+// --print-backend (docs/serve.md, "One hop from Lemonade"): a route that needs serve in the
+// request path. Exit 5 tells Lemonade's onebit recipe to run `1bit serve` as before.
+constexpr int kServeOnly = 5;
+int serve_only(const std::string& why) {
+    std::fprintf(stderr, "1bit serve: --print-backend: %s; run 1bit serve itself\n", why.c_str());
+    return kServeOnly;
+}
+
+// --print-backend: the llama-server serve would start for this model, as one JSON line on stdout,
+// after every check serve makes before a load (architecture, memory, recipes). Lemonade starts it
+// on the port it chose (--port) and talks to it directly: one HTTP hop and two processes instead of
+// two and three. What serve added on the request path is the backend's own there: /health answers
+// 503 while the main loop is stalled with work queued (llama.cpp fork #111), so Lemonade's
+// BackendWatchdog resets a hung GPU; --strict-device is GGML_HRX_STRICT in the backend; replies carry
+// Lemonade's name through --alias. env holds only what the caller's environment does not set
+// already, so a value the user set still wins, as it does under serve.
+int print_backend(const Options& o, const Launch& l) {
+    const bool llama = l.device.rfind("hrx", 0) == 0 || l.device.rfind("cpu", 0) == 0;
+    if (!llama) return serve_only("--device " + l.device + " is not a llama-server");
+    std::vector<std::string> argv = l.argv;
+    auto has = [&argv](const char* flag) { return std::find(argv.begin(), argv.end(), flag) != argv.end(); };
+    if (!o.alias.empty() && !has("--alias")) argv.insert(argv.end(), {"--alias", o.alias});
+    // serve's proxy reused nothing between requests; the backend can shift a cached prefix into
+    // place when a conversation's history changes in the middle (chunks of at least 256 tokens).
+    // A recipe's own --cache-reuse wins; recurrent models ignore it (llama.cpp checks can_shift).
+    if (o.role.empty() && !has("--cache-reuse")) argv.insert(argv.end(), {"--cache-reuse", "256"});
+    json env = json::object();
+    for (const std::string& e : l.env) {
+        const auto eq = e.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string key = e.substr(0, eq);
+        if (!std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
+    }
+    json out = json::object();
+    out["device"] = l.device;
+    out["port"] = l.port;
+    out["argv"] = argv;
+    out["env"] = env;
+    std::printf("%s\n", out.dump().c_str());
+    return 0;
+}
+
 int serve_child(const Options& given) {
     Options o = given;
     if (hadamard_q4_0(o.model))
@@ -1505,6 +1552,14 @@ int serve_child(const Options& given) {
             throw std::runtime_error(o.model + " is a 1BP package: it runs on --device ds4 (docs/dwarfstar.md)");
         if (o.laya_auto || !o.laya_model.empty())
             throw std::runtime_error("--laya routes among devices; a 1BP package runs on ds4 only");
+    }
+    if (o.print_backend) {
+        // --print-backend (docs/serve.md, "One hop from Lemonade"): only a lone llama-server can be
+        // started by Lemonade itself; these need serve in the request path
+        if (o.device == "ds4" || o.device == "onnx") return serve_only("--device " + o.device + " is not a llama-server");
+        if (o.pm) return serve_only("--pm runs its tool loop in serve");
+        if (o.laya_auto || !o.laya_model.empty()) return serve_only("--laya routes each request in serve");
+        if (!o.embed.empty() || !o.rerank.empty()) return serve_only("--embed and --rerank run more servers behind serve");
     }
     // --pm (docs/pm.md): the model is the Project Manager. Its chat completions run the tool loop
     // in app/pm.cpp against the one backend; the experts are Lemonade's models, reached by URL.
@@ -1642,14 +1697,15 @@ int serve_child(const Options& given) {
             throw std::runtime_error("--" + o.role + " runs on llama-server devices (hrx, cpu), not " + dev);
         if (!o.mtp.empty() || !o.dflash.empty())
             throw std::runtime_error("--" + o.role + " does not combine with --mtp or --dflash");
-        Launch l = launch_for(o, dev, free_port());
+        Launch l = launch_for(o, dev, o.print_backend ? o.port : free_port());
         const std::string batch = std::to_string(o.ctx_size > 0 ? o.ctx_size : 8192);
         for (const std::string& a : {std::string("--") + o.role, std::string("-b"), batch, std::string("-ub"), batch})
             l.argv.push_back(a);
         l.device = dev + " " + o.role;
         backends.push_back(std::move(l));
     } else {
-        backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device, free_port()));
+        backends.push_back(launch_for(o, o.device == "auto" ? auto_gguf_device(o) : o.device,
+                                      o.print_backend ? o.port : free_port()));
     }
     const std::string device = laya ? "laya" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
@@ -1701,23 +1757,28 @@ int serve_child(const Options& given) {
             return 0;
         }
     }
+    if (o.print_backend) return print_backend(o, backends[0]);
     std::atomic<bool> ready{false};
-    std::atomic<bool> placement_printed{false};
+    // the placement line is reprinted whenever a graph reports more nodes off HRX than every graph
+    // before it: the worst graph is the one worth acting on, and it is not always the first (the
+    // warmup graph is scheduled before any request).
+    std::atomic<long> placement_worst{-1};
     ProgressWatch watch(o.watchdog);
     ServeMetrics metrics(device);   // GET /metrics (app/serve_metrics.h)
     Lifecycle lifecycle(id);
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
-    auto backend_line = [&metrics, &placement_printed, &wedged_mu, &wedged](const std::string& line) {
+    auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged](const std::string& line) {
         metrics.backend_line(line);
         if (device_lost_line(line)) {
             std::lock_guard<std::mutex> lock(wedged_mu);
             if (wedged.empty()) wedged = "the backend lost its GPU: " + line.substr(0, 200);
         }
-        if (placement_printed.load()) return;
         const auto report = metrics.placement();
         // engine #390: the backend's placement report becomes serve's own line at load.
-        if (report && !placement_printed.exchange(true))
+        if (!report) return;
+        const long off = report->cpu_fallback_total.value_or(0);
+        if (off > placement_worst.load() && placement_worst.exchange(off) < off)
             std::fprintf(stderr, "1bit serve: HRX placement: %s\n", placement_summary(*report).c_str());
     };
 
@@ -2045,10 +2106,10 @@ int serve_child(const Options& given) {
             std::fprintf(stderr, "1bit serve: %s: no HRX backend in this run, nothing to check\n",
                          o.strict_device ? "--strict-device" : "--placement-report");
         else if (!report)
+            // both --placement-report and --strict-device pass GGML_HRX_REPORT=2 and -lv 4, so a missing
+            // line means the backend never spoke, not that the verbosity was wrong
             std::fprintf(stderr, "1bit serve: HRX placement: the backend printed no placement line "
-                                 "(GGML_HRX_REPORT=1 was passed to it%s)\n",
-                         o.placement_report ? " with -lv 4" : "; llama-server needs -lv 4 for it, which "
-                                                                  "--placement-report passes");
+                                 "(GGML_HRX_REPORT=2 and -lv 4 were passed to it)\n");
     }
     ready = true;
     lifecycle.count_start();
@@ -2436,10 +2497,15 @@ void usage(FILE* out) {
                  "                  for SECS (default 120, or $ONEBIT_WATCHDOG_SECS; 0 = off), plus prompt tokens / N\n"
                  "                  (default 50) before its first byte, kills the backend and exits non-zero so Lemonade\n"
                  "                  reloads it (docs/serve.md)\n"
-                 "                  [--placement-report]   one line at load: the op types HRX placed on the CPU, their\n"
-                 "                  counts and the graph split count (passes -lv 4 to llama-server; engine #390)\n"
+                 "                  [--placement-report]   every graph: the op types HRX placed on the CPU, their\n"
+                 "                  counts and the graph split count; prints the worst graph again when a later\n"
+                 "                  one has more off HRX (passes -lv 4 to llama-server; engine #390)\n"
                  "                  [--strict-device]   refuse to start unless the whole graph is on HRX (needs\n"
                  "                  --device hrx or auto; engine #390)\n"
+                 "                  [--print-backend]   print the llama-server serve would start (argv and env, one\n"
+                 "                  JSON line) and exit: 0 printed, 3 does not fit, 5 the route needs serve itself\n"
+                 "                  (NPU, ONNX, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
+                 "                  it directly, one hop (docs/serve.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           or a .gguf file\n");
@@ -2510,6 +2576,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--mem-check") o.mem_check_only = true;
         else if (a == "--strict-device") o.strict_device = true;
         else if (a == "--placement-report") o.placement_report = true;
+        else if (a == "--print-backend") o.print_backend = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
         else if (a == "--watchdog-prompt-tps") o.watchdog.prompt_tps = std::stod(next());
         else if (a == "--lemonade-url") o.lemonade_url = next();
@@ -2524,6 +2591,11 @@ int run_serve(int argc, char** argv) {
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
+    if (o.print_backend) {
+        if (is_onnx_model_dir(o.model)) return serve_only("an ONNX Runtime GenAI directory runs on ryzenai-server behind serve");
+        if (fs::is_directory(o.model)) return serve_only("an NPU model directory runs in serve's own process");
+        if (o.device == "npu") return serve_only("--device npu runs in serve's own process");
+    }
 
     if (is_onnx_model_dir(o.model)) {
         if (o.device != "auto" && o.device != "onnx")

@@ -41,11 +41,21 @@ and `llama-perplexity`. It then runs four checks:
 | check | what | catches |
 |---|---|---|
 | ops | one `test-backend-ops -b HRX0 -j 4` run over MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_CONV, GET_ROWS, ROPE, RMS_NORM, SOFT_MAX | a kernel that disagrees with the CPU (#310, #313, #370, the IQ ports) |
-| kat | `tools/kat.py check` on Qwen3-0.6B, ZAYA1-8B and Qwen3.8-27B (Q4_K_M / UD-Q4_K_XL), against `tests/golden/hw-gate/kat-<model>.json` | wrong answers, empty replies, NaN logprobs, nondeterminism, cached-prefix and multi-ubatch bugs, drift from the release pin (#308, #309, #315, #318, #319, #369) |
+| kat | `tools/kat.py check` on five models (below), against `tests/golden/hw-gate/kat-<model>.json` | wrong answers, empty replies, NaN logprobs, nondeterminism, cached-prefix and multi-ubatch bugs, drift from the release pin (#308, #309, #315, #318, #319, #369) |
 | kld | `llama-perplexity --kl-divergence` on wiki.test.raw, 512 tokens x 8 chunks, against base logits stored at the release pin | small numeric drift that greedy answers do not show |
-| needle | `tests/hrx_long_prompt.py`: the 4.7K-token vault-code needle on Qwen3-0.6B | #319, #369 |
+| needle | `tests/hrx_long_prompt.py`: the 320-record vault-code needle (7.1K tokens on Qwen3, 7.4K on ZAYA1) on Qwen3-0.6B and ZAYA1-8B | #319, #369 |
 
-kat repeats every case (three times on Qwen3-0.6B, twice on the others) and fails on any of:
+The models (`MODEL_TABLE` in the script, files under `~/models`):
+
+| name | file | covers | kat repeats | needle |
+|---|---|---|---|---|
+| qwen3-0.6b | Qwen3-0.6B-Q4_K_M.gguf | small dense K-quant | 3 | yes |
+| zaya1-8b | zaya1-8b-Q4_K_M.gguf | ZAYA1 (16 experts, 1 active per token), K-quant | 2 | yes |
+| qwen3.8-27b | qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf | gated delta net + attention hybrid, Unsloth dynamic mix | 2 | no |
+| qwen3-coder-30b-a3b | Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf | qwen3moe: 128 experts, 8 active per token (MUL_MAT_ID with top-8 routing) | 2 | no |
+| qwen3-4b-iq4xs | Qwen3-4B-IQ4_XS.gguf | an IQ quant (IQ4_XS matmul and GET_ROWS) | 2 | no |
+
+kat repeats every case and fails on any of:
 - a missing expected answer;
 - an empty reply or a NaN logprob;
 - two different texts for the same request;
@@ -66,7 +76,7 @@ the summary says so.
 
 ## Box etiquette
 
-The gate shares the box with other work. It takes the GPU four times: once for all the ops, and
+The gate shares the box with other work. It takes the GPU six times: once for all the ops, and
 once per model (the server for kat and the needle, then llama-perplexity for the KLD, in one hold).
 Each of those steps:
 - **Lock.** It holds `~/npu.lock` (flock) only while it runs, so other GPU work keeps its turn between steps.
@@ -124,7 +134,22 @@ Strix Halo, 2026-10-12, at the release pin (main d2a56a4, llama.cpp 0e255d77, hr
 | Qwen3.8-27B: kat (2 repeats) | 213 s |
 | KLD: 0.6B / 8B / 27B, 4,096 tokens each | 6 / 24 / 29 s |
 
-That is about 13 minutes of GPU time in all. Waiting for `~/npu.lock` costs more than the gate
+That is about 13 minutes of GPU time in all.
+
+Strix Halo, 2026-10-20, performance power mode, main 55929b5 (llama.cpp 00f2a68d, hrx-system
+82804197) plus this coverage change, a quiet box (3 s waiting in all):
+
+| step | holds the GPU lock |
+|---|---|
+| ops: 611/611 cases pass | 20 s |
+| Qwen3-0.6B: kat + needle + KLD | 20 s |
+| ZAYA1-8B: kat + needle + KLD (the needle: 7,421-token prompt at 1,207 tok/s, about 8 s) | 70 s |
+| Qwen3.8-27B: kat + KLD | 184 s |
+| Qwen3-Coder-30B-A3B (MoE): kat + KLD | 38 s |
+| Qwen3-4B IQ4_XS: kat + KLD | 31 s |
+
+363 s of GPU time in all; the MoE model, the IQ model and the ZAYA1 needle add about 77 s of it.
+Waiting for `~/npu.lock` costs more than the gate
 itself: flock is not first-come-first-served, and with about ten jobs queueing, each acquisition
 waited 10 to 60 minutes. The summary reports both numbers (waiting, holding).
 
@@ -133,18 +158,30 @@ What the goldens record at the release pin:
 - On `varied-1620w`, the cached path answers differently from a fresh request at a near-tie: top-2 margin 0.19, a WARN.
 - ZAYA1-8B and Qwen3.8-27B answer every case.
 
+The MoE and IQ rows (`qwen3-coder-30b-a3b`, `qwen3-4b-iq4xs`) were recorded on 2026-10-20 at
+llama.cpp 00f2a68d / hrx-system 82804197 (`manifest.json` `recorded_at`). Both answer every kat case.
+Their HRX base logits against a CPU run of the same file (`--device none`) give:
+
+| model | mean KLD | KLD p99 | same top token |
+|---|---|---|---|
+| Qwen3-Coder-30B-A3B Q4_K_M | 0.0054 | 0.043 | 96.7% |
+| Qwen3-4B IQ4_XS | 0.0054 | 0.057 | 96.4% |
+| Qwen3-0.6B Q4_K_M (the release-pin base, for comparison) | 0.0080 | 0.039 | 95.8% |
+
+That is the usual GPU-vs-CPU rounding gap of a 4-bit file, not a wrong kernel.
+
 ## Not covered yet
 
 - **Lock fairness.** `~/npu.lock` is a plain flock, so a job that re-queues quickly can starve the
   gate for an hour. A first-come-first-served queue, or a reserved window for the gate, would bound
-  the wall time. The gate's own GPU time is about 13 minutes.
+  the wall time. The gate's own GPU time is 6 to 13 minutes.
 - **Private kernels.** The gate builds the public HRX plumbing only. The private HIP add-on
   (gpu-kernels, `ONEBIT_GPU_PRIVATE`) is not built or checked, because the runner serves a public
   repository.
 - **Not exercised:** `1bit serve` itself (the gate talks to llama-server with serve's HRX flags),
   `--parallel`, `--mtp` / `--dflash`, vision, and contexts past 8K.
 - **One copy of the KLD bases** on the box. A spare copy of the release-pin set is on ryzen
-  `~/backups/hw-gate-kld-0e255d77`.
+  `~/backups/hw-gate-kld-0e255d77`; the MoE and IQ bases are in `~/backups/hw-gate-kld-00f2a68d`.
 - **An intermittent bug** that fires about once in 40 runs (#370's class) can pass a single gate
   run. kat repeats every case and the ops step re-runs a known flake, but only repeated runs
   catch such a bug reliably.

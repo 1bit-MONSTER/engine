@@ -16,9 +16,9 @@
 # HRX hardware gate (docs/hw-gate.md): ci.yml runs on a GPU-less GitHub runner, and the HRX
 # correctness bugs #308 #309 #310 #313 #318 #319 #369 #370 were all found by hand. This job runs
 # scripts/hw-gate.sh on the Strix Halo box: test-backend-ops on HRX0, tools/kat.py against
-# goldens recorded at the release pin on three models, KLD against stored base logits, and the
-# 4.7K-token needle. It is one check on the PR (hw_gate), or one commit status (hw-gate) when it
-# is started by hand.
+# goldens on five models (K-quants incl. the Qwen3-Coder-30B-A3B MoE, and one IQ4_XS), KLD against
+# stored base logits, and the 7K-token needle on two models. It is one check on the PR (hw_gate), or
+# one commit status (hw-gate) when it is started by hand.
 #
 # When it runs:
 #   - a same-repo PR labelled `hw-gate` (adding the label starts it; later pushes re-run it);
@@ -103,7 +103,7 @@ jobs:
         env:
           HW_GATE_OUT: ${{ runner.temp }}/hw-gate
         run: |
-          for f in "$HW_GATE_OUT"/kat-*.txt "$HW_GATE_OUT"/needle.txt "$HW_GATE_OUT"/kld-*.log; do
+          for f in "$HW_GATE_OUT"/kat-*.txt "$HW_GATE_OUT"/needle-*.txt "$HW_GATE_OUT"/kld-*.log; do
             [ -f "$f" ] || continue
             echo "::group::$(basename "$f")"; tail -n 60 "$f"; echo "::endgroup::"
           done

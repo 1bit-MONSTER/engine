@@ -28,7 +28,7 @@ On the image:
 
 | Where | What |
 |---|---|
-| `/usr/share/licenses/1bit-os/` | this file, the engine's `LICENSE` and `NOTICE`, Lemonade's license (`lemonade-LICENSE`), the ROCr HSA runtime license, and `packages.txt`: every Ubuntu package the image takes files from, with its exact version |
+| `/usr/share/licenses/1bit-os/` | this file, the engine's `LICENSE` and `NOTICE`, the closed binaries' `LICENSE-BINARY` and `NOTICE-BINARY`, Lemonade's license (`lemonade-LICENSE`), the ROCr HSA runtime license, and `packages.txt`: every Ubuntu package the image takes files from, with its exact version |
 | `/usr/share/doc/<package>/copyright` | the Ubuntu copyright file of each of those packages |
 | `/usr/share/common-licenses/` | the GPL, LGPL, Apache, MPL and other texts those copyright files refer to |
 | `/data/lemonade/licenses/<recipe>/` | per Lemonade backend: `SOURCE` (project, release, licenses, source) and the license texts its release archive leaves out (from `os/licenses/<recipe>/`) |

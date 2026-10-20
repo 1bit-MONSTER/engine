@@ -86,7 +86,7 @@ bad=$(find "$stage" -type f -print0 | while IFS= read -r -d '' f; do
     is_elf "$f" && readelf -d "$f" | grep -E 'R(UN)?PATH' | grep -E "$HOME|$build" | sed "s|^|$f: |"; done || true)
 [ -z "$bad" ] || { echo "RPATH into the build machine left:"; echo "$bad"; exit 1; }
 
-cp "$src/LICENSE" "$src/NOTICE" "$stage/"
+cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"
 cat > "$stage/README.txt" <<EOF
 1bit engine $ver for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/
 

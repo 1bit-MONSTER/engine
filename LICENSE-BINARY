@@ -1,0 +1,45 @@
+1bit Binary License
+
+Copyright 2026 bong-water-water-bong. All rights reserved.
+
+This license covers the closed-source binaries of the 1bit engine (the "Binaries"):
+the compiled HIP GPU kernels (code objects) and the libraries built from them, the
+NPU runtime (npu_rt), the NPU kernel files (full ELFs and their program images), the
+NPU add-ons, and any other file that ships with this license or is listed in
+docs/binaries.md. It does not cover the 1bit engine's source code, which is licensed
+under the Apache License, Version 2.0 (LICENSE), or the third-party components listed
+in NOTICE-BINARY, which keep their own licenses.
+
+1. Grant. The copyright holder grants you a worldwide, royalty-free, non-exclusive
+   license to use, copy and run the Binaries for any purpose, including commercial use.
+
+2. Redistribution. You may redistribute exact, unmodified copies of the Binaries, on
+   their own or as part of another product, provided that every copy is accompanied
+   by this license and NOTICE-BINARY, and that no copyright, license or attribution
+   notice in or with the Binaries is removed or altered.
+
+3. Restrictions. You may not:
+   a. modify the Binaries or distribute modified copies;
+   b. decompile, disassemble or otherwise reverse engineer the Binaries, except to the
+      extent that applicable law expressly permits it notwithstanding this limitation;
+   c. remove or alter any copyright, license or attribution notice.
+
+4. Ownership. The Binaries are licensed, not sold. The copyright holder keeps all
+   rights not expressly granted here. This license grants no right to the source code
+   of the Binaries.
+
+5. Third-party components. Parts of the Binaries are derived from or include
+   third-party code. Those parts are listed in NOTICE-BINARY with their licenses, and
+   their licenses apply to them.
+
+6. Termination. This license ends automatically if you break its terms. On termination
+   you must stop using and distributing the Binaries. Sections 4, 7 and 8 survive.
+
+7. No warranty. THE BINARIES ARE PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS
+   OR IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY, FITNESS
+   FOR A PARTICULAR PURPOSE AND NON-INFRINGEMENT.
+
+8. Limitation of liability. IN NO EVENT SHALL THE COPYRIGHT HOLDER BE LIABLE FOR ANY
+   CLAIM, DAMAGES OR OTHER LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR
+   OTHERWISE, ARISING FROM, OUT OF OR IN CONNECTION WITH THE BINARIES OR THE USE OR
+   OTHER DEALINGS IN THE BINARIES.

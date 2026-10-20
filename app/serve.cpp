@@ -960,11 +960,10 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // Qwen3-4B, 4 slots, 39 -> 153 tok/s). AMD's Qwen attention path (qwen.attention) builds
             // its mask from positions and ignores the other sequences, so under -kvu the answers
             // bleed into each other; it is turned off for these servers.
+            // G9: multi-sequence gated delta net - the HRX matchers hold kMaximumSequences 8 now, so these
+            // architectures take --parallel like every other llama.cpp model
             const std::string arch = gguf_architecture(o.model);
-            if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next")
-                throw std::runtime_error("--parallel on --device hrx does not run " + arch +
-                                         " yet (no multi-sequence gated delta-net on HRX): leave --parallel off "
-                                         "(one sequence on HRX0), or use --device cpu");
+            (void) arch;
             argv.push_back("-kvu");
             bool merged = false;
             for (std::string& e : env)

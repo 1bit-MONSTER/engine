@@ -903,11 +903,12 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // 2 = every graph: the warmup graph alone is not the model (census 2026-10-20, finding 1:
             // LFM2 --parallel 4 and ZAYA1-8B keep 20 and 3 nodes on the CPU in prompt and
             // multi-sequence graphs while the warmup report says all on HRX).
-            env.push_back(o.placement_report ? "GGML_HRX_REPORT=2" : "GGML_HRX_REPORT=1");
+            env.push_back(o.placement_report || o.strict_device ? "GGML_HRX_REPORT=2" : "GGML_HRX_REPORT=1");
             if (o.strict_device) env.push_back("GGML_HRX_STRICT=1");
             // llama-server drops the library's INFO lines below verbosity 4 (common/log.cpp maps
             // GGML_LOG_LEVEL_INFO to its trace level), so the report reaches serve only when asked.
-            if (o.placement_report) argv.insert(argv.end(), {"-lv", "4"});
+            // both flags read the report, so both need the verbosity that lets it through
+            if (o.placement_report || o.strict_device) argv.insert(argv.end(), {"-lv", "4"});
         }
         // tools/ternary_to_q4_0.py stamped it: HRX0 reads its decode projections at 2.125 bits per weight
         // instead of 4.5 (llama.cpp #54; the upload checks every block and refuses a non-ternary one).
@@ -1900,10 +1901,10 @@ int serve_child(const Options& given) {
             std::fprintf(stderr, "1bit serve: %s: no HRX backend in this run, nothing to check\n",
                          o.strict_device ? "--strict-device" : "--placement-report");
         else if (!report)
+            // both --placement-report and --strict-device pass GGML_HRX_REPORT=2 and -lv 4, so a missing
+            // line means the backend never spoke, not that the verbosity was wrong
             std::fprintf(stderr, "1bit serve: HRX placement: the backend printed no placement line "
-                                 "(GGML_HRX_REPORT was passed to it%s)\n",
-                         o.placement_report ? " with -lv 4" : "; llama-server needs -lv 4 for it, which "
-                                                                  "--placement-report passes");
+                                 "(GGML_HRX_REPORT=2 and -lv 4 were passed to it)\n");
     }
     ready = true;
     lifecycle.count_start();

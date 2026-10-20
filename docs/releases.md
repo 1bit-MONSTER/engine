@@ -55,7 +55,12 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 ### Private components
 
 Two components of the release binaries are proprietary and compiled in; their source is not in
-this repository or in any release ([NOTICE](../NOTICE)):
+this repository or in any release. They ship under the [1bit Binary License](../LICENSE-BINARY):
+anyone may use them for any purpose, including commercial use, and pass on exact unmodified
+copies with the license and notices; modifying them, reverse engineering them (except where the law
+expressly allows it) and removing notices are not allowed. The third-party code inside them is listed
+with its licenses in [NOTICE-BINARY](../NOTICE-BINARY). Every release package and the 1bit OS image
+carry both files beside the engine's `LICENSE` and `NOTICE`:
 
 | Component | Compiled into | Pin | Build option |
 |---|---|---|---|
@@ -77,6 +82,7 @@ XRT. `scripts/package-linux.sh` strips every packed program and library (`strip
 - **Kernels in:** the packed `libggml-hrx.so` exports the add-on's `ggml_hrx_hip_addon_register`.
 - **No source:** no source file (`.hip`, `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hpp`, `.inc`, `.cu`,
   `.py`, `.cmake`) and no file named like one of the private checkouts' files.
+- **Licensed:** `LICENSE`, `NOTICE`, `LICENSE-BINARY` and `NOTICE-BINARY` are in the tarball.
 
 1bit OS carries no XRT either; its `1bit.check` boot reports `CHECK no XRT`.
 

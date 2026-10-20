@@ -17,9 +17,8 @@ limitations under the License.
 # HRX hardware gate
 
 `ci.yml` runs on a GitHub runner with no GPU, so it cannot see an HRX kernel or pin that computes
-the wrong thing. Eight HRX correctness bugs were found by hand within ten days: #308, #309, #310,
-#313, #318, #319, #369 and #370. The hardware gate checks every HRX pin bump, and every PR that asks
-for it, on the Strix Halo box before merge.
+the wrong thing. Eight HRX correctness bugs were found by hand within ten days: #308, #309, #310, #313, #318, #319, #369
+and #370. The hardware gate checks every HRX pin bump, and every PR that asks for it, on the Strix Halo box before merge.
 
 ## When it runs
 

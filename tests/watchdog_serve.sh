@@ -21,7 +21,9 @@
 #   - a slow answer from a backend whose main loop still answers /slots is not a hang,
 #   - a request that gets no bytes for --watchdog seconds kills the backend, and serve exits
 #     non-zero with the reason in its log (Lemonade's BackendWatchdog then reloads it),
-#   - before its first byte, a request gets prompt tokens / --watchdog-prompt-tps more.
+#   - before its first byte, a request gets prompt tokens / --watchdog-prompt-tps more,
+#   - a backend that writes a lost-GPU line (a GPU reset) takes serve down at once, even with
+#     --watchdog 0: it would otherwise answer every request with an error for good.
 #
 # usage: tests/watchdog_serve.sh path/to/1bit
 set -uo pipefail
@@ -98,5 +100,14 @@ pids+=($!)
 sleep 4
 check "--watchdog 0: no watchdog" 'kill -0 "$pid" 2>/dev/null && ! grep -q "watchdog:" "$scratch/c.log"'
 
-if [ $fail -ne 0 ]; then for l in a b c; do echo "--- serve log $l"; cat "$scratch/$l.log"; done; echo FAIL; exit 1; fi
+# 4. A backend that reports a lost GPU (and keeps running) takes serve down, whatever --watchdog says.
+start "$scratch/d.log" --watchdog 0
+curl -s -m 10 -o /dev/null "$api/v1/chat/completions" -H 'Content-Type: application/json' \
+    -d '{"fake_device_lost": true, "messages": [{"role": "user", "content": "hi"}]}'
+gone_within "$pid" 10; wait "$pid"; rc=$?
+check "a lost GPU takes serve down (rc $rc)" '[ "$rc" != 0 ]'
+check "  saying why" 'grep -q "the backend lost its GPU" "$scratch/d.log" && grep -q "AMDGPU hardware exception" "$scratch/d.log"'
+check "  and the backend is gone" '! kill -0 "$child" 2>/dev/null'
+
+if [ $fail -ne 0 ]; then for l in a b c d; do echo "--- serve log $l"; cat "$scratch/$l.log"; done; echo FAIL; exit 1; fi
 echo PASS

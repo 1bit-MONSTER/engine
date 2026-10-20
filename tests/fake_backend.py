@@ -66,6 +66,12 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if req.get("fake_device_lost"):
+            # what ggml-hrx logs after a GPU reset; the backend keeps running and fails every request
+            print("graph_compute: launch HRX graph replay: hrx-system/runtime/src/iree/hal/drivers/amdgpu/system_event.c:129: "
+                  "DATA_LOSS; AMDGPU hardware exception (reset type 0x00000001)", file=sys.stderr, flush=True)
+            self._json(500, {"error": {"code": 500, "message": "Compute error.", "type": "server_error"}})
+            return
         if req.get("fake_hang"):
             # streamed: two chunks, then nothing; not streamed: nothing at all
             if req.get("stream"):

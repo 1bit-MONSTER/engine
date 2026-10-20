@@ -150,6 +150,13 @@ is where an HSA status shows up), SIGKILLs the backend and exits with status 1. 
 sees the backend process gone and loads the model again. A process that does not die after
 SIGKILL (stuck in the kernel) is reported as such; serve exits anyway.
 
+**A lost GPU.** After a GPU reset (an MES hang, a MODE2 reset), a backend keeps running but
+cannot use the device again: ggml-hrx logs `AMDGPU hardware exception` and llama-server answers
+every request with HTTP 500 "Compute error". Serve watches the backend's stderr for that line
+(and Vulkan's device-lost error) and treats it like the watchdog firing, whatever `--watchdog`
+is set to: it logs the line, kills the backend and exits with status 1, so systemd
+(`Restart=always`) or Lemonade starts it again on the reset device.
+
 ```
 1bit serve: watchdog: POST /v1/chat/completions (streamed) on the hrx backend (port 34901, pid 3672241) made no progress for 121 s (limit 120 s; 211 bytes received in 125 s); killing it and exiting so Lemonade reloads it
 1bit serve: watchdog: Tctl 71.5 C

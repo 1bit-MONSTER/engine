@@ -1570,16 +1570,20 @@ int serve_child(const Options& given) {
     ProgressWatch watch(o.watchdog);
     ServeMetrics metrics(device);   // GET /metrics (app/serve_metrics.h)
     Lifecycle lifecycle(id);
-    auto backend_line = [&metrics, &placement_printed](const std::string& line) {
+    std::mutex wedged_mu;
+    std::string wedged;   // set by the watchdog: why the backend is taken down
+    auto backend_line = [&metrics, &placement_printed, &wedged_mu, &wedged](const std::string& line) {
         metrics.backend_line(line);
+        if (device_lost_line(line)) {
+            std::lock_guard<std::mutex> lock(wedged_mu);
+            if (wedged.empty()) wedged = "the backend lost its GPU: " + line.substr(0, 200);
+        }
         if (placement_printed.load()) return;
         const auto report = metrics.placement();
         // engine #390: the backend's placement report becomes serve's own line at load.
         if (report && !placement_printed.exchange(true))
             std::fprintf(stderr, "1bit serve: HRX placement: %s\n", placement_summary(*report).c_str());
     };
-    std::mutex wedged_mu;
-    std::string wedged;   // set by the watchdog: why the backend is taken down
 
     httplib::Server srv;
     install_request_guard(srv, o.host);  // Host / Origin (app/http_guard.h)
@@ -1978,10 +1982,22 @@ int serve_child(const Options& given) {
         std::lock_guard<std::mutex> lock(start_mu);
         Child* bad = nullptr;
         for (auto& c : children) if (c->port() == stall.port) bad = c.get();
-        std::fprintf(stderr, "1bit serve: watchdog: %s on the %s backend (port %d, pid %d) made no progress for %.0f s "
-                             "(limit %.0f s; %llu bytes received in %.0f s); killing it and exiting so Lemonade reloads it\n",
-                     stall.what.c_str(), device.c_str(), stall.port, bad ? bad->pid() : -1, stall.idle, stall.limit,
-                     (unsigned long long) stall.bytes, stall.age);
+        if (stall.what.empty()) {
+            // not a stall: the backend said it lost its GPU (backend_line)
+            std::string why;
+            {
+                std::lock_guard<std::mutex> wl(wedged_mu);
+                why = wedged;
+            }
+            if (!bad && !children.empty()) bad = children.front().get();
+            std::fprintf(stderr, "1bit serve: watchdog: %s (%s backend, pid %d); killing it and exiting so it is "
+                                 "started again\n", why.c_str(), device.c_str(), bad ? bad->pid() : -1);
+        } else {
+            std::fprintf(stderr, "1bit serve: watchdog: %s on the %s backend (port %d, pid %d) made no progress for %.0f s "
+                                 "(limit %.0f s; %llu bytes received in %.0f s); killing it and exiting so Lemonade reloads it\n",
+                         stall.what.c_str(), device.c_str(), stall.port, bad ? bad->pid() : -1, stall.idle, stall.limit,
+                         (unsigned long long) stall.bytes, stall.age);
+        }
         if (const auto t = sysinfo::tctl_celsius()) std::fprintf(stderr, "1bit serve: watchdog: Tctl %.1f C\n", *t);
         if (bad) {
             const auto lines = bad->last_lines(12);

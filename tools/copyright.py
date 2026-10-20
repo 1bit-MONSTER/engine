@@ -37,7 +37,7 @@ LINE_STYLES = [
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 
-EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "tests/golden/*.bin", "tests/golden/*/*.bin", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico",
+EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*", "LICENSE", "NOTICE", "LICENSE-BINARY", "NOTICE-BINARY", "*.gguf", "tests/golden/*.bin", "tests/golden/*/*.bin", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico",
           # engine#315 evidence artefacts that cannot carry a comment: diffs must stay byte-applicable
           # and data files have no comment syntax. Matches the existing "patches/*" exemption.
           "*.patch", "*.csv", "*.cfg"]

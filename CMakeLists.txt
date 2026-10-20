@@ -32,6 +32,10 @@ endif()
 
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
+
+# The public binary drop (docs/releases.md): prebuilt proprietary parts for a source build outside
+# the org. Sets ONEBIT_BINARY_DROP_* and verifies the drop; a no-op when ONEBIT_BINARY_DROP is unset.
+include(cmake/binary_drop.cmake)
 set(CMAKE_CXX_EXTENSIONS OFF)
 set(CMAKE_EXPORT_COMPILE_COMMANDS ON)
 
@@ -178,7 +182,10 @@ if(ONEBIT_GPU_PRIVATE AND NOT ONEBIT_HRX)
 endif()
 if(ONEBIT_HRX)
     include(cmake/hrx.cmake)
-    add_dependencies(onebit llama_hrx)
+    # A drop build has no llama_hrx target: the prebuilt server and its libraries come from the drop.
+    if(TARGET llama_hrx)
+        add_dependencies(onebit llama_hrx)
+    endif()
     target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
                                ONEBIT_HRX_ALLOW_NO_SVM=${ONEBIT_HRX_ALLOW_NO_SVM})
     if(ONEBIT_SERVE_TEST_GGUF)
@@ -445,6 +452,13 @@ if(ONEBIT_NPU_HOST AND NOT WIN32)
     set_tests_properties(npu_runtime_option PROPERTIES TIMEOUT 300)
 endif()
 if(ONEBIT_NPU)
+    # The public binary drop carries the runtime already compiled (libnpu_rt_api.a behind
+    # npu/npu_rt_api.h), for a source build that has no private runtime sources
+    # (docs/releases.md, "The public binary drop").
+    if(NOT ONEBIT_NPU_RT_LIB AND NOT ONEBIT_NPU_RT_DIR AND ONEBIT_BINARY_DROP_NPU_LIB)
+        set(ONEBIT_NPU_RT_LIB "${ONEBIT_BINARY_DROP_NPU_LIB}")
+        message(STATUS "ONEBIT_NPU: runtime from the binary drop: ${ONEBIT_NPU_RT_LIB}")
+    endif()
     if(ONEBIT_NPU_RT_LIB AND ONEBIT_NPU_RT_DIR)
         message(FATAL_ERROR "ONEBIT_NPU takes one NPU runtime: set ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR, "
                             "not both (docs/npu.md, \"The NPU runtime\")")

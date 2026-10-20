@@ -113,6 +113,11 @@ build() {
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
+    # The ONNX backend ships with Microsoft's ONNX Runtime (GenAI) only: with RYZENAI_INSTALL_PATH
+    # set, build-onnx.sh would copy AMD's Ryzen AI Software libraries beside ryzenai-server and
+    # they would land in the package (package_checks refuses them too). The NPU through ONNX uses
+    # the user's own install at run time (docs/onnx.md, "Linux NPU").
+    unset RYZENAI_INSTALL_PATH
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" -DONEBIT_ONNX=ON \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
@@ -246,6 +251,9 @@ stage_test() { run_tests; }
 #   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
 #             like one of the private checkouts' files
 #   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
+#   onnx      onnx/ holds ryzenai-server, Microsoft's libonnxruntime-genai / libonnxruntime and their
+#             licence texts, nothing else: no part of AMD's Ryzen AI Software (the RyzenAI / VitisAI
+#             providers, AMD_LICENSE, the AIE compiler libraries), which users install themselves
 # Checks the build's 1bit and every file in the tarball.
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
@@ -282,6 +290,18 @@ package_checks() {  # package_checks <linux tarball>
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
         [ "$n" != 0 ] || { echo "FAIL $f is not in $(basename "$1")"; bad=1; }
     done
+    if [ -d "$t"/*/onnx ]; then
+        n=$(find "$t"/*/onnx -mindepth 1 \! \( -name ryzenai-server -o -name 'libonnxruntime-genai.so*' \
+                -o -name 'libonnxruntime.so*' -o -name '*.txt' \) -printf '%f\n' | tee /dev/stderr | wc -l)
+        [ "$n" = 0 ] || { echo "FAIL onnx/ carries files beyond ryzenai-server and Microsoft's ONNX Runtime (Ryzen AI Software?)"; bad=1; }
+        for f in ryzenai-server-LICENSE.txt onnxruntime-LICENSE.txt onnxruntime-ThirdPartyNotices.txt \
+                 onnxruntime-genai-LICENSE.txt onnxruntime-genai-ThirdPartyNotices.txt; do
+            [ -f "$(echo "$t"/*/onnx)/$f" ] || { echo "FAIL onnx/$f is not in $(basename "$1")"; bad=1; }
+        done
+        [ $bad = 0 ] && echo "ok   onnx/: ryzenai-server and ONNX Runtime with their licences, no Ryzen AI Software"
+    else
+        echo "FAIL no onnx/ in $(basename "$1") (weekly builds -DONEBIT_ONNX=ON)"; bad=1
+    fi
     rm -rf "$t"
     return $bad
 }

@@ -84,6 +84,15 @@ cmake -S "$src" -B "$work/build" -DCMAKE_BUILD_TYPE=Release -DOGA_ROOT="$oga_roo
 cmake --build "$work/build" -j"$(nproc)" > "$work/build.log" 2>&1 || { tail -20 "$work/build.log"; exit 1; }
 cp -a "$work/build/bin/." "$prefix/"
 [ -n "$ort_lib" ] && cp -a "$ort_lib"/libonnxruntime.so* "$prefix/"
+# the licence texts of what sits beside the binary, under names that say whose they are (the
+# release packs them in onnx/ with the binaries; NOTICE points here)
+cp "$src/LICENSE" "$prefix/ryzenai-server-LICENSE.txt"
+if [ -z "${RYZENAI_INSTALL_PATH:-}" ]; then
+    for t in LICENSE ThirdPartyNotices.txt; do
+        cp "$work/oga/$t" "$prefix/onnxruntime-genai-${t%.txt}.txt"
+        cp "$work/ort/$t" "$prefix/onnxruntime-${t%.txt}.txt"
+    done
+fi
 
 # Executable stacks: a library whose PT_GNU_STACK asks for RWE fails to load on Linux 7.x
 # (and makes the whole process's stack executable before that). Scan the copies beside the

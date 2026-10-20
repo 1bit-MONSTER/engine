@@ -348,7 +348,11 @@ std::string onnx_ryzenai_mode(const std::string& dir) {
 // libxrt_coreutil that must not shadow it), then ryzenai-server's own directory (the copies
 // scripts/build-onnx.sh made and cleared of executable stacks), then deployment/lib, then what
 // LD_LIBRARY_PATH already held. The provider library is the copy beside the server when the
-// build made one. Nothing in the venv is modified.
+// build made one. A server with no provider beside it was built against Microsoft's ONNX Runtime
+// (the release package's onnx/, which ships no part of Ryzen AI Software): then deployment/lib
+// comes before the server's directory, so the venv's ONNX Runtime GenAI, the one that knows the
+// RyzenAI provider, loads instead of the CPU-only copy beside the binary (its RUNPATH $ORIGIN
+// yields to LD_LIBRARY_PATH). Nothing in the venv is modified.
 std::vector<std::string> ryzenai_child_env(const std::string& root, const fs::path& server_dir) {
     const fs::path deployment = fs::path(root) / "deployment" / "lib";
     if (!fs::is_directory(deployment))
@@ -359,12 +363,13 @@ std::vector<std::string> ryzenai_child_env(const std::string& root, const fs::pa
     else xrt = "/opt/xilinx/xrt";
     if (!fs::is_directory(fs::path(xrt) / "lib"))
         throw std::runtime_error("no XRT at " + xrt + " (no lib/ there): set ONEBIT_XRT_ROOT to the XRT prefix, docs/onnx.md");
-    std::string ld = (fs::path(xrt) / "lib").string();
-    if (!server_dir.empty()) ld += ":" + server_dir.string();
-    ld += ":" + deployment.string();
-    if (const char* old = std::getenv("LD_LIBRARY_PATH"); old && *old) ld += std::string(":") + old;
     fs::path ep = server_dir / "libonnxruntime_providers_ryzenai.so";
-    if (server_dir.empty() || !fs::exists(ep)) ep = deployment / "libonnxruntime_providers_ryzenai.so";
+    const bool own_copies = !server_dir.empty() && fs::exists(ep);
+    if (!own_copies) ep = deployment / "libonnxruntime_providers_ryzenai.so";
+    std::string ld = (fs::path(xrt) / "lib").string();
+    if (own_copies) ld += ":" + server_dir.string() + ":" + deployment.string();
+    else ld += ":" + deployment.string() + (server_dir.empty() ? "" : ":" + server_dir.string());
+    if (const char* old = std::getenv("LD_LIBRARY_PATH"); old && *old) ld += std::string(":") + old;
     if (!fs::exists(ep))
         throw std::runtime_error(ep.string() + " is missing: the RyzenAI execution provider of Ryzen AI Software for Linux");
     return {"XILINX_XRT=" + xrt, "LD_LIBRARY_PATH=" + ld, "RYZENAI_EP_PATH=" + ep.string()};

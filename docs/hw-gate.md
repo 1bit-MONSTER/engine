@@ -36,7 +36,15 @@ PRs from forks never run there: the runner is the owner's box.
 
 `scripts/hw-gate.sh` builds this checkout's HRX pair (`third_party/llama.cpp` and
 `third_party/hrx-system`) with the configuration of `cmake/hrx.cmake`, plus `test-backend-ops`
-and `llama-perplexity`. It then runs four checks:
+and `llama-perplexity`, with the private HIP kernels compiled in as the release builds them: the
+gpu-kernels add-on at the commit `config/gpu-kernels.config` pins, fetched by
+`scripts/fetch-private.sh` with the runner box's `gh` login and passed as
+`GGML_HRX_HIP_ADDON_DIR`. A llama.cpp pin and a gpu-kernels pin that do not compile together fail
+the build step (2026-10-20: gpu-kernels be68256d used `HipSetRowsArgs`, which the pinned
+llama.cpp did not have yet), and so does a build whose `libggml-hrx.so` lacks the add-on. A box
+that cannot read gpu-kernels stops with exit 2; `HW_GATE_PRIVATE=0` gates the public plumbing
+only. On a failed build the job log shows the compiler's error lines without their source
+excerpts, since the log is public and the add-on's sources are not. It then runs four checks:
 
 | check | what | catches |
 |---|---|---|
@@ -175,9 +183,6 @@ That is the usual GPU-vs-CPU rounding gap of a 4-bit file, not a wrong kernel.
 - **Lock fairness.** `~/npu.lock` is a plain flock, so a job that re-queues quickly can starve the
   gate for an hour. A first-come-first-served queue, or a reserved window for the gate, would bound
   the wall time. The gate's own GPU time is 6 to 13 minutes.
-- **Private kernels.** The gate builds the public HRX plumbing only. The private HIP add-on
-  (gpu-kernels, `ONEBIT_GPU_PRIVATE`) is not built or checked, because the runner serves a public
-  repository.
 - **Not exercised:** `1bit serve` itself (the gate talks to llama-server with serve's HRX flags),
   `--parallel`, `--mtp` / `--dflash`, vision, and contexts past 8K.
 - **One copy of the KLD bases** on the box. A spare copy of the release-pin set is on ryzen

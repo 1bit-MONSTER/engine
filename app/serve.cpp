@@ -1036,11 +1036,15 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             // prints one line per graph when GGML_HRX_REPORT is set, and refuses the graph with
             // GGML_HRX_STRICT. Both are off in the backend by default, and a value the user sets in
             // the environment wins (Child keeps it).
-            env.push_back("GGML_HRX_REPORT=1");
+            // 2 = every graph: the warmup graph alone is not the model (census 2026-10-20, finding 1:
+            // LFM2 --parallel 4 and ZAYA1-8B keep 20 and 3 nodes on the CPU in prompt and
+            // multi-sequence graphs while the warmup report says all on HRX).
+            env.push_back(o.placement_report || o.strict_device ? "GGML_HRX_REPORT=2" : "GGML_HRX_REPORT=1");
             if (o.strict_device) env.push_back("GGML_HRX_STRICT=1");
             // llama-server drops the library's INFO lines below verbosity 4 (common/log.cpp maps
             // GGML_LOG_LEVEL_INFO to its trace level), so the report reaches serve only when asked.
-            if (o.placement_report) argv.insert(argv.end(), {"-lv", "4"});
+            // both flags read the report, so both need the verbosity that lets it through
+            if (o.placement_report || o.strict_device) argv.insert(argv.end(), {"-lv", "4"});
         }
         // tools/ternary_to_q4_0.py stamped it: HRX0 reads its decode projections at 2.125 bits per weight
         // instead of 4.5 (llama.cpp #54; the upload checks every block and refuses a non-ternary one).
@@ -1702,22 +1706,26 @@ int serve_child(const Options& given) {
         }
     }
     std::atomic<bool> ready{false};
-    std::atomic<bool> placement_printed{false};
+    // the placement line is reprinted whenever a graph reports more nodes off HRX than every graph
+    // before it: the worst graph is the one worth acting on, and it is not always the first (the
+    // warmup graph is scheduled before any request).
+    std::atomic<long> placement_worst{-1};
     ProgressWatch watch(o.watchdog);
     ServeMetrics metrics(device);   // GET /metrics (app/serve_metrics.h)
     Lifecycle lifecycle(id);
     std::mutex wedged_mu;
     std::string wedged;   // set by the watchdog: why the backend is taken down
-    auto backend_line = [&metrics, &placement_printed, &wedged_mu, &wedged](const std::string& line) {
+    auto backend_line = [&metrics, &placement_worst, &wedged_mu, &wedged](const std::string& line) {
         metrics.backend_line(line);
         if (device_lost_line(line)) {
             std::lock_guard<std::mutex> lock(wedged_mu);
             if (wedged.empty()) wedged = "the backend lost its GPU: " + line.substr(0, 200);
         }
-        if (placement_printed.load()) return;
         const auto report = metrics.placement();
         // engine #390: the backend's placement report becomes serve's own line at load.
-        if (report && !placement_printed.exchange(true))
+        if (!report) return;
+        const long off = report->cpu_fallback_total.value_or(0);
+        if (off > placement_worst.load() && placement_worst.exchange(off) < off)
             std::fprintf(stderr, "1bit serve: HRX placement: %s\n", placement_summary(*report).c_str());
     };
 
@@ -2045,10 +2053,10 @@ int serve_child(const Options& given) {
             std::fprintf(stderr, "1bit serve: %s: no HRX backend in this run, nothing to check\n",
                          o.strict_device ? "--strict-device" : "--placement-report");
         else if (!report)
+            // both --placement-report and --strict-device pass GGML_HRX_REPORT=2 and -lv 4, so a missing
+            // line means the backend never spoke, not that the verbosity was wrong
             std::fprintf(stderr, "1bit serve: HRX placement: the backend printed no placement line "
-                                 "(GGML_HRX_REPORT=1 was passed to it%s)\n",
-                         o.placement_report ? " with -lv 4" : "; llama-server needs -lv 4 for it, which "
-                                                                  "--placement-report passes");
+                                 "(GGML_HRX_REPORT=2 and -lv 4 were passed to it)\n");
     }
     ready = true;
     lifecycle.count_start();
@@ -2436,8 +2444,9 @@ void usage(FILE* out) {
                  "                  for SECS (default 120, or $ONEBIT_WATCHDOG_SECS; 0 = off), plus prompt tokens / N\n"
                  "                  (default 50) before its first byte, kills the backend and exits non-zero so Lemonade\n"
                  "                  reloads it (docs/serve.md)\n"
-                 "                  [--placement-report]   one line at load: the op types HRX placed on the CPU, their\n"
-                 "                  counts and the graph split count (passes -lv 4 to llama-server; engine #390)\n"
+                 "                  [--placement-report]   every graph: the op types HRX placed on the CPU, their\n"
+                 "                  counts and the graph split count; prints the worst graph again when a later\n"
+                 "                  one has more off HRX (passes -lv 4 to llama-server; engine #390)\n"
                  "                  [--strict-device]   refuse to start unless the whole graph is on HRX (needs\n"
                  "                  --device hrx or auto; engine #390)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"

@@ -81,7 +81,7 @@ int main() {
         expect(f.cpu_fallback_total && *f.cpu_fallback_total == 12, "total-only line: 12");
     }
     {
-        // serve prints the report once, and the accessor is what --strict-device reads
+        // serve prints the report once per worse graph, and the accessor is what --strict-device reads
         onebit::ServeMetrics metrics("hrx");
         expect(!metrics.placement(), "serve: no report before the backend speaks");
         metrics.backend_line("srv  load_model: loading model");
@@ -104,6 +104,28 @@ int main() {
         const std::string text = metrics.render(life);
         expect(text.find("onebit_cpu_fallback_ops{op=\"all\"} 0") != std::string::npos,
                "metrics: onebit_cpu_fallback_ops{op=\"all\"} 0");
+    }
+
+    {
+        // --placement-report now sees every graph (GGML_HRX_REPORT=2): the warmup graph is clean, the
+        // multi-sequence graph is not, and the worst graph is what serve prints and --strict-device
+        // refuses on (census 2026-10-20, finding 1: LFM2 --parallel 4, ZAYA1-8B).
+        onebit::BackendLogFacts f;
+        f.feed(kAllOnHrx);   // warmup
+        expect(onebit::placement_summary(f) == "all 512 nodes on HRX, 1 graph splits", "warmup is clean");
+        f.feed("placement_observer: placement: 354 nodes, 20 off HRX (MUL_MAT x 20), 5 graph splits");
+        expect(f.cpu_fallback_total && *f.cpu_fallback_total == 20, "par4: 20 off HRX");
+        expect(f.placement_nodes && *f.placement_nodes == 354, "par4: 354 nodes, not the warmup's 512");
+        expect(f.placement_splits && *f.placement_splits == 5, "par4: 5 graph splits");
+        const std::string worst = onebit::placement_summary(f);
+        expect(worst == "20 of 354 nodes off HRX (MUL_MAT x 20), 5 graph splits, worst of 2 graphs",
+               "par4: " + worst);
+        expect(onebit::placement_refusal(f).find("20 of 354") != std::string::npos,
+               "par4: --strict-device refuses on the worst graph");
+        // a later clean graph does not hide the one that is not
+        f.feed(kAllOnHrx);
+        expect(f.cpu_fallback_total && *f.cpu_fallback_total == 20, "a later clean graph keeps the worst");
+        expect(f.placement_lines == 3, "three reports seen");
     }
 
     if (failures == 0) std::printf("hrx_placement: OK\n");

@@ -51,6 +51,12 @@ cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench
 put ds4/hip ds4-server ds4 ds4-bench
 put onnx ryzenai-server
+# the licence texts build-onnx.sh puts beside it (ryzenai-server, ONNX Runtime GenAI, ONNX Runtime)
+if [ -d "$stage/onnx" ]; then
+    for f in "$build"/onnx/*-LICENSE.txt "$build"/onnx/*-ThirdPartyNotices.txt; do
+        if [ -f "$f" ]; then cp "$f" "$stage/onnx/"; fi
+    done
+fi
 
 # Every program and library finds its libraries beside itself. A library it loads from elsewhere
 # in the build tree (HRX's libhrx, libloomc) is copied beside it; RUNPATH entries outside the

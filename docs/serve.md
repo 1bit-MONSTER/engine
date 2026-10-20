@@ -334,6 +334,13 @@ else the build's copy, else the first one under `/opt/rocm-therock`.
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH.
 
+Stopping `serve` (SIGTERM, SIGINT) sends each backend SIGTERM and waits
+`ONEBIT_BACKEND_STOP_GRACE_S` seconds (default 30) before SIGKILL, with a warning line
+first; a backend that already exited is reaped where `serve` noticed, so its stop
+is free. A backend that exits on its own ends `serve` with exit code 1 and the way it
+ended on stderr (`a cpu backend exited: signal 6`). The grace matters for the NPU
+([onnx.md](onnx.md), "Linux NPU").
+
 ## The Project Manager (`--pm`)
 
 `--pm` makes the served model the Project Manager ([pm.md](pm.md)): on `/v1/chat/completions`
@@ -594,5 +601,6 @@ with 6, with ZINC.) With `-DONEBIT_HRX=ON`,
 ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`, and in general `serve_e2e_<device>`, when configured with
 `-DONEBIT_SERVE_TEST_GGUF=<gguf>`. `smoke_serve` runs everywhere, CI included:
 `tests/fake_backend.py` stands in for llama-server. It checks the proxy (`/health`,
-`/v1/models`, the reply rename, SSE relay) and that no backend outlives a
-SIGKILLed `serve`. `watchdog_serve` runs everywhere too (see "When a backend hangs").
+`/v1/models`, the reply rename, SSE relay), that no backend outlives a
+SIGKILLed `serve`, and that a backend that exits on its own ends `serve` at once.
+`watchdog_serve` runs everywhere too (see "When a backend hangs").

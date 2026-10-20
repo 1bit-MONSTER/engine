@@ -387,10 +387,8 @@ and that message; the add-on brings its own tests.
 ## The NPU runtime
 
 The engine is XRT-free: the NPU lane runs on our own NPU runtime, compiled into `1bit`. The runtime
-opens `/dev/accel/accel0` and issues the `amdxdna` ioctls itself, parses the full ELFs itself,
-and keeps XRT's class names (`device`, `bo`, `hw_context`, `elf`, `ext::kernel`, `run`,
-`runlist`), so `npu/rt.h` (`namespace xrt = npu_rt;`) lets the engine's NPU sources read as they
-did on XRT. The NPU sources include `npu/rt.h`, never a runtime header directly.
+keeps XRT's class names, so `npu/rt.h` (`namespace xrt = npu_rt;`) lets the engine's NPU sources
+read as they did on XRT. The NPU sources include `npu/rt.h`, never a runtime header directly.
 
 The runtime is a proprietary component and is not in this repository (see [NOTICE](../NOTICE)):
 the source here holds only `npu/rt.h`, the CMake option and the tests. The release binaries

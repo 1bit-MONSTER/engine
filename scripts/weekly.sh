@@ -30,7 +30,7 @@
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
 # config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
-# what the build scripts each list.
+# what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
 [ $# -ge 1 ] || { sed -n '16,33p' "$0"; exit 2; }
@@ -321,6 +321,10 @@ stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
     while gh release view "$tag" -R "$REPO" > /dev/null 2>&1; do n=$((n + 1)); tag=v$(date +%G.%V).$n; done
     echo "$tag" > "$TAG_FILE"
+    # the image's licences step copies from the submodules of $SRC (checked out by build), not
+    # from the tree this script runs from
+    [ -f "$SRC/third_party/lemonade/LICENSE" ] ||
+        { say "no $SRC/third_party/lemonade/LICENSE: run the build stage first (it checks out the submodules)"; return 1; }
     rm -rf "$OUT" && mkdir -p "$OUT"
     say "package $tag: the engine (into the Lemonade + onebit package)"
     # the engine tree (package-linux.sh) is not published on its own: it goes into the Lemonade
@@ -361,5 +365,43 @@ stage_release() {
         --title "1bit engine $tag" -F "$W/notes.md" "$OUT"/*
     say "released $tag"
 }
+
+# --- preflight ----------------------------------------------------------------------------
+# What the stages need from the machine, checked before the first one runs, so that a missing
+# tool stops the run at the start rather than after an hour of build (2026-10-19 rehearsal).
+preflight() {
+    local bad=0 s rocm d kver vmlinuz
+    for s in $STAGES; do
+        case "$s" in
+            bumps|build)
+                # the HRX build's toolchain (cmake/hrx.cmake), unless WEEKLY_CMAKE_ARGS names another
+                case " ${WEEKLY_CMAKE_ARGS:-} " in
+                    *ONEBIT_HRX_TOOLCHAIN=*) ;;
+                    *) [ -d /opt/rocm-therock ] ||
+                        { echo "preflight: no /opt/rocm-therock (the HRX toolchain): install TheRock there, or pass -DONEBIT_HRX_TOOLCHAIN=<dir> in WEEKLY_CMAKE_ARGS"; bad=1; } ;;
+                esac
+                # DwarfStar (-DONEBIT_DS4=ON) builds with hipcc, found the way scripts/build-ds4.sh finds it
+                rocm=${ROCM_PATH:-}
+                if [ -z "$rocm" ]; then
+                    for d in /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
+                        [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
+                    done
+                fi
+                [ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||
+                    { echo "preflight: no ROCm with bin/hipcc for the DwarfStar build (scripts/build-ds4.sh): set ROCM_PATH"; bad=1; } ;;
+            package)
+                # scripts/package-linux.sh rewrites RPATHs with patchelf
+                command -v patchelf > /dev/null ||
+                    { echo "preflight: patchelf is not installed (scripts/package-linux.sh needs it): apt install patchelf"; bad=1; }
+                # os/mini/mkimage.sh reads the kernel image; on Ubuntu /boot/vmlinuz-* is root-only
+                kver=${KVER:-$(uname -r)}
+                vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
+                [ -r "$vmlinuz" ] ||
+                    { echo "preflight: cannot read the kernel image $vmlinuz (os/mini/mkimage.sh): set VMLINUZ to a readable copy"; bad=1; } ;;
+        esac
+    done
+    return $bad
+}
+preflight || { say "preflight failed: nothing was run"; exit 1; }
 
 for s in $STAGES; do "stage_$s"; done

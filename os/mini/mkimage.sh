@@ -70,7 +70,7 @@ build=${2:-$HOME/.cache/1bit-os/src/build}
 build=$(cd "$build" && pwd)   # absolute: binaries keep their build paths inside the image
 kver=${KVER:-$(uname -r)}
 # the kernel image: /boot/vmlinuz-<kver>, or VMLINUZ= (e.g. unpacked from its .deb where /boot is root-only);
-# the engine builds no kernel: the Strix Halo kernel packages come from github.com/1bit-MONSTER/kernel
+# the engine builds no kernel: the Strix Halo kernel packages come from our separate kernel build
 vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x

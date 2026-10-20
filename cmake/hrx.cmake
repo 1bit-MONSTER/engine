@@ -46,8 +46,11 @@ if(ONEBIT_BINARY_DROP_HRX_BIN AND EXISTS "${ONEBIT_BINARY_DROP_HRX_BIN}/llama-se
     endif()
     if(NOT ONEBIT_HRX_LIBHSA)
         file(GLOB_RECURSE _drop_libhsa "${ONEBIT_HRX_TOOLCHAIN}/*/libhsa-runtime64.so.1")
-        list(SORT _drop_libhsa)
-        list(GET _drop_libhsa 0 _drop_libhsa_first)
+        set(_drop_libhsa_first "")
+        if(_drop_libhsa)
+            list(SORT _drop_libhsa)
+            list(GET _drop_libhsa 0 _drop_libhsa_first)
+        endif()
         if(_drop_libhsa_first)
             set(ONEBIT_HRX_LIBHSA "${_drop_libhsa_first}" CACHE FILEPATH
                 "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)" FORCE)

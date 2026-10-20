@@ -28,6 +28,10 @@ jobs:
     # toolchain PPA's GCC 16 for 24.04 is an older snapshot without it.
     container:
       image: ubuntu:26.04
+      # A real init as PID 1 reaps orphans, as systemd does on a host: smoke_serve SIGKILLs
+      # serve and checks that its backend is gone, and without a reaper the exited backend
+      # stays a zombie that kill -0 still finds.
+      options: --init
     steps:
       - name: Tools for checkout and the build
         run: |

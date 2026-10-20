@@ -15,8 +15,10 @@
 # limitations under the License.
 #
 # hw-gate.sh: the HRX correctness gate on real hardware (docs/hw-gate.md). It builds this
-# checkout's HRX llama.cpp pair (third_party/llama.cpp + third_party/hrx-system) and checks it on
-# the Radeon iGPU against goldens recorded at the release pin:
+# checkout's HRX llama.cpp pair (third_party/llama.cpp + third_party/hrx-system) with the private
+# HIP kernels compiled in, as the release does (the gpu-kernels add-on at the commit
+# config/gpu-kernels.config pins, fetched by scripts/fetch-private.sh), and checks it on the Radeon
+# iGPU against goldens recorded at the release pin:
 #
 #   ops     test-backend-ops -b HRX0 on the ops the HRX correctness bugs touched
 #   kat     tools/kat.py check: known answers, determinism, cached prefix, varied lengths and drift
@@ -34,6 +36,9 @@
 #               tests/golden/hw-gate and the base logits under $HW_GATE_STORE/kld (manifest.json
 #               keeps their sha256). Only at a release pin.
 #
+#   HW_GATE_PRIVATE=0  build the public HRX plumbing only, without the private kernels (a box with
+#               no read access to gpu-kernels). The default builds them: a fetch failure is exit 2.
+#
 # Every GPU step holds ~/npu.lock (flock) only while it runs, inside scripts/mem-guard.sh and
 # ~/lb/thermal-run.sh. Before each one it waits for the PR-Agent model (coder-llm, :8090) to be
 # idle, and afterwards it reports any new amdgpu ring timeout (HRX dispatches starve that
@@ -50,6 +55,7 @@ MEM_FLOOR=${HW_GATE_MEM_FLOOR:-12}
 CODER_URL=${HW_GATE_CODER_URL:-http://127.0.0.1:8090}
 CODER_WAIT=${HW_GATE_CODER_WAIT:-900}
 TOOLCHAIN=${ONEBIT_HRX_TOOLCHAIN:-/opt/rocm-therock}
+PRIVATE=${HW_GATE_PRIVATE:-1}
 TEXT=${HW_GATE_TEXT:-$MODELS/qwen38/wikitext-2-raw/wiki.test.raw}
 PORT=${HW_GATE_PORT:-18471}
 JOBS=${HW_GATE_JOBS:-4}
@@ -226,8 +232,9 @@ note "hw-gate $MODE at $(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null): lla
 # ---- build ---------------------------------------------------------------------------------
 if [ -z "$BIN" ]; then
   src=$ROOT/third_party/llama.cpp
-  # one persistent build tree per source path, so the runner's checkout rebuilds incrementally
-  key=$(printf '%s' "$src" | sha1sum | cut -c1-10)
+  # one persistent build tree per source path (and per add-on choice), so the runner's checkout
+  # rebuilds incrementally
+  key=$(printf '%s|private=%s' "$src" "$PRIVATE" | sha1sum | cut -c1-10)
   build=$STORE/build-$key
   BIN=$build/bin
   if has build; then
@@ -237,28 +244,56 @@ if [ -z "$BIN" ]; then
       [ -f "$ROOT/third_party/$s/CMakeLists.txt" ] || { note "::error::third_party/$s is not checked out"; exit 2; }
     done
     t0=$(date +%s)
+    # the private HIP kernels, as cmake/hrx.cmake (ONEBIT_GPU_PRIVATE) and scripts/weekly.sh build
+    # them: the gpu-kernels add-on at the pinned commit, through llama.cpp's GGML_HRX_HIP_ADDON_DIR.
+    # A llama.cpp pin and a gpu-kernels pin that do not compile together fail the gate here (the
+    # 2026-10-20 break: the add-on used HipSetRowsArgs, which the pinned llama.cpp did not have).
+    addon_args=() addon_pin=none
+    if [ "$PRIVATE" = 1 ]; then
+      addon_pin=$(sed -n 's/^sha=//p' "$ROOT/config/gpu-kernels.config" | tail -n 1)
+      if ! addon=$("$ROOT/scripts/fetch-private.sh" "$ROOT/config/gpu-kernels.config" "$STORE/gpu-kernels" 2> "$OUT/private.log"); then
+        note "::error::cannot fetch the private gpu-kernels add-on at ${addon_pin:0:12} (gh login with read access on this box?): $(tail -n 1 "$OUT/private.log")"
+        note "  (HW_GATE_PRIVATE=0 gates the public plumbing only)"
+        exit 2
+      fi
+      grep -q GGML_HRX_HIP_ADDON_DIR "$src/ggml/src/ggml-hrx/hip/ggml-hrx-hip.cmake" 2>/dev/null ||
+        { note "::error::third_party/llama.cpp has no GGML_HRX_HIP_ADDON_DIR hook (needs the HIP plumbing)"; exit 2; }
+      addon_args=(-DGGML_HRX_HIP_ADDON_DIR="$addon")
+      note "private HIP kernels: gpu-kernels ${addon_pin:0:12} (addons/hip-hrx)"
+    fi
+    # configure once per add-on pin (a new pin can add kernel files the old configure never saw);
+    # otherwise ninja re-runs cmake itself when a CMakeLists.txt changes
+    [ "$(cat "$build/.gpu-kernels-pin" 2>/dev/null)" = "$addon_pin" ] || rm -f "$build/CMakeCache.txt"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
     built=1
     # thermal-run kills a build at 93 C (the box is shared); ninja resumes where it stopped
     for attempt in 1 2 3 4 5 6; do
       cool
-      # configure once; afterwards ninja re-runs cmake itself when a CMakeLists.txt changes
-      { [ -f "$build/CMakeCache.txt" ] || "$THERMAL" cmake -S "$src" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
+      { [ -f "$build/CMakeCache.txt" ] || { "$THERMAL" cmake -S "$src" -B "$build" -G Ninja -DCMAKE_BUILD_TYPE=Release \
           -DCMAKE_C_COMPILER="$TOOLCHAIN/bin/amdclang" -DCMAKE_CXX_COMPILER="$TOOLCHAIN/bin/amdclang++" \
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
-          -DHRX_SOURCE_DIR="$ROOT/third_party/hrx-system" \
+          -DHRX_SOURCE_DIR="$ROOT/third_party/hrx-system" "${addon_args[@]}" \
           -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON \
-          -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1; } &&
+          -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1 &&
+          echo "$addon_pin" > "$build/.gpu-kernels-pin"; }; } &&
       "$THERMAL" cmake --build "$build" -j "$JOBS" --target llama-server test-backend-ops llama-perplexity >> "$OUT/build.log" 2>&1 && { built=0; break; }
       grep -q "error:" <(tail -n 40 "$OUT/build.log") && break   # a compile error, not heat
       note "build stopped (attempt $attempt, Tctl $(tctl) C); resuming"
     done
+    # (grep -c, not grep -q: under pipefail grep's early exit would fail nm's side of the pipe)
+    if [ $built = 0 ] && [ "$PRIVATE" = 1 ] &&
+       [ "$(nm -D --defined-only "$BIN/libggml-hrx.so" 2>/dev/null | grep -c ggml_hrx_hip_addon_register)" = 0 ]; then
+      note "::error::the build passed but libggml-hrx.so does not export ggml_hrx_hip_addon_register: the private kernels are not in it"
+      built=1
+    fi
     if [ $built = 0 ]; then
       result build PASS $(( $(date +%s) - t0 )) "$build"
     else
       result build FAIL $(( $(date +%s) - t0 )) "see $OUT/build.log"
-      tail -n 30 "$OUT/build.log"
+      # the compiler's error lines only, not its source excerpts: the job log is public and the
+      # add-on's sources are not
+      grep -E '(error|Error)[: ]' "$OUT/build.log" | grep -v -E '^ *[0-9]+ \|' | head -n 20
       exit 2
     fi
   fi

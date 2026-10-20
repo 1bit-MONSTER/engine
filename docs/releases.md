@@ -18,8 +18,8 @@ limitations under the License.
 
 1bit engine is pinned upstream: every backend it builds is a submodule at a fixed commit
 (`third_party/`), and the `bump-*` workflows open a PR whenever an upstream moves. The engine
-runs inside Lemonade, which releases on Fridays. So the engine releases once a week, on Sunday,
-rebuilt from scratch at that week's pins.
+runs inside Lemonade, which releases on Fridays. So the release run is weekly, on Sunday,
+rebuilt from scratch at that week's pins. The first release is not published yet.
 
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
@@ -28,7 +28,7 @@ release in the same week gets `.1`.
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, the NPU lane (no XRT). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, and the NPU engine's runtime (no XRT; the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
@@ -52,6 +52,14 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 `/opt/rocm-therock`; the NPU needs the `amdxdna` kernel driver. The closed NPU add-ons
 ([npu.md](npu.md), "Private routes") are never in a release.
 
+### The NPU engine
+
+The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
+NPU engine is in progress: the release carries its runtime, compiled into `1bit`, and the `onebit`
+recipe's `npu` backend, but the NPU layer and lm-head kernels built from source are not merged yet
+([npu.md](npu.md#step-3d-the-layer-kernel-and-lm-head-built-from-source)). Until they are, NPU models
+are not served from a release package; HRX serves the GGUF models.
+
 ### Private components
 
 Two components of the release binaries are proprietary and compiled in; their source is not in
@@ -72,7 +80,7 @@ pinned commit only, with the release machine's `gh` login (read access to the pr
 repositories). The run stops if either cannot be fetched or is not at its pinned sha. Move a pin
 by hand, after the NPU check or the HRX checks on Strix Halo.
 
-The engine is XRT-free: the NPU lane runs on the compiled-in runtime, and nothing links AMD's
+The engine is XRT-free: the NPU engine's runtime is compiled in, and nothing links AMD's
 XRT. `scripts/package-linux.sh` strips every packed program and library (`strip
 --strip-unneeded`), and after packing the engine tarball the package stage checks
 (`logs/package-checks.log`; a failure stops the release):
@@ -109,6 +117,17 @@ WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-we
 
 `WEEKLY_DRY_RUN=1` merges and publishes nothing; stages can be run one at a time
 (`scripts/weekly.sh ~/.cache/1bit-weekly build test`).
+
+Before the first stage runs, `weekly.sh` checks what the machine must have (the 2026-10-19
+rehearsal found these only after the build) and stops with a message naming what is missing:
+
+- **bumps, build:** TheRock in `/opt/rocm-therock`, or `-DONEBIT_HRX_TOOLCHAIN=<dir>` in
+  `WEEKLY_CMAKE_ARGS`; `hipcc` for DwarfStar, in TheRock or `/opt/rocm`, or `ROCM_PATH`.
+- **package:** `patchelf` (`scripts/package-linux.sh`); a readable kernel image for 1bit OS,
+  `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
+  The image's licences step copies from the submodules of the run's own checkout (`<workdir>/src`,
+  checked out by the build stage), so run `os/mini/mkimage.sh` from there, not from a plain
+  worktree without submodules.
 
 ### Bumps
 

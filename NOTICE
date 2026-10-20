@@ -162,8 +162,8 @@ Linux kernel
   https://github.com/torvalds/linux
   Copyright Linus Torvalds and the Linux kernel contributors
   License: GPL-2.0 WITH Linux-syscall-note. Built as a separate program by
-  https://github.com/1bit-MONSTER/kernel; os/mini/mkimage.sh copies a built kernel
-  into the image. No kernel code is linked into this product.
+  our kernel build; os/mini/mkimage.sh copies a built kernel into the image.
+  The corresponding source is available on request (see the release notes). No kernel code is linked into this product.
 
 -------------------------------------------------------------------------------
 Fetched by the build at pinned commits (CMakeLists.txt)

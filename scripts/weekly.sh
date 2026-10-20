@@ -245,6 +245,7 @@ stage_test() { run_tests; }
 #             ggml_hrx_hip_addon_register), compiled in as code objects
 #   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
 #             like one of the private checkouts' files
+#   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
 # Checks the build's 1bit and every file in the tarball.
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
@@ -277,6 +278,10 @@ package_checks() {  # package_checks <linux tarball>
     n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee /dev/stderr | wc -l)
     [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
+    for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
+        n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
+        [ "$n" != 0 ] || { echo "FAIL $f is not in $(basename "$1")"; bad=1; }
+    done
     rm -rf "$t"
     return $bad
 }

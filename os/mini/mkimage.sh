@@ -47,7 +47,8 @@
 #
 # Licences (os/LICENSES.md): a backend ships only when os/licenses/<recipe>/SOURCE says
 # "Ship: yes"; that directory goes onto the stick as /data/lemonade/licenses/<recipe>. The
-# initramfs carries /usr/share/licenses/1bit-os (LICENSES.md, the engine's LICENSE and NOTICE,
+# initramfs carries /usr/share/licenses/1bit-os (LICENSES.md, the engine's LICENSE and NOTICE, the
+# closed binaries' LICENSE-BINARY and NOTICE-BINARY,
 # Lemonade's LICENSE, packages.txt) and the Ubuntu copyright file of every package it takes files
 # from, in /usr/share/doc/<package>/copyright, with /usr/share/common-licenses.
 #
@@ -242,7 +243,7 @@ printf '127.0.0.1 localhost\n::1 localhost\n' > "$root/etc/hosts"
 echo "== licences (os/LICENSES.md)"
 doc=$root/usr/share/licenses/1bit-os
 mkdir -p "$doc"
-cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$doc/"
+cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$doc/"
 cp "$src/third_party/lemonade/LICENSE" "$doc/lemonade-LICENSE" ||
     { echo "no third_party/lemonade/LICENSE (git submodule update --init third_party/lemonade)"; exit 1; }
 cp "$licenses/llamacpp-hrx/ROCR-Runtime-LICENSE" "$doc/ROCR-Runtime-LICENSE"   # TheRock's libhsa for HRX

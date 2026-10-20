@@ -33,6 +33,8 @@ pin once it lands. Treat a single failure of this case as a flake, not a regress
 
 ## engine#315 — intermittent all-NaN logits and format-500 on GLM-4.7-Flash under GTT pressure
 
+The investigation notes and evidence cited below as `notes/315/...` are kept in a private repository.
+
 **Status: OPEN. No limitation entry is recorded.** The earlier status line here read "accepted as a
 documented limitation"; that is superseded. This issue's own rule is that a documented limitation is
 acceptable only *after* the mechanism is named, and no mechanism is proven - so nothing is recorded and
@@ -63,7 +65,7 @@ allocation with. The earlier reading here, that "the logits buffer is never writ
 it was unsafe from the start: the sentinel only ever fills the 619520-byte logits allocation (`ggml-hrx.cpp`,
 `size == 619520`), so it says nothing about the tensors where the corruption is born. The guard fires on the
 consumer side and reports the shape, not the producer — the producer is upstream of the final norm, which the
-nan-dump fingerprint (dev/315/315-campaign/evidence/315-instrumented-arm-hunt.md) established by finding the first
+nan-dump fingerprint (notes/315/315-campaign/evidence/315-instrumented-arm-hunt.md) established by finding the first
 NaN-bearing tensors in the FFN path.
 
 ### Both failure faces
@@ -77,7 +79,7 @@ depending on what the corrupted memory holds (NaN, or stale finite values):
    **2048 in fifteen of them** — exactly one `n_embd` row — while the batch size varies four-fold (T of 87, 98,
    135, 140, 172, 306, 342), and the first affected node is an unnamed partial expert sum
    (`build_moe_ffn` names only the final aggregate). Mechanism, evidence and the discriminating experiment:
-   dev/315/315-mechanism.md sections 40, 44, 47.
+   notes/315/315-mechanism.md sections 40, 44, 47.
 
    **Correction, 2026-10-10.** That "one row" figure is a property of the instrument that measured it, not yet a
    property of the fault. Those arms used `GGML_HRX_TENSOR_FP=tail:16` (a window over the last sixteen graph
@@ -87,13 +89,13 @@ depending on what the corrupted memory holds (NaN, or stale finite values):
    `ffn_moe_weights-4` — the `ggml_get_rows(ffn_moe_probs, ffn_moe_topk)` route-weight gather — while
    `ffn_moe_probs-4` carried none. Until the same instrument is run over the same arms, the safe statement is
    that the corruption involves the MoE routing tensors and that the row extent is instrument-dependent.
-   Evidence: dev/315/315-campaign/evidence/315-row-p1c-inregime-mechanism.md.
+   Evidence: notes/315/315-campaign/evidence/315-row-p1c-inregime-mechanism.md.
 2. **Format-500 (Face B).** The same event with *finite* contents. A faulting request whose 60-name tensor
    fingerprint included `norm`, `result_norm` and `result_output` logged **no NaN at all**, and the server rejected
    its output as `unparsed Content-only output: the}:}:}甚;` — garbage; the paired control arm produced a
    repetition loop, `a gaps gaps gaps ...`. The sampler is drawing from a corrupted distribution, the text is
    degenerate, and the failure surfaces at the server's chat-template parser instead of at the sampler guard.
-   Evidence: dev/315/315-campaign/evidence/315-face-landscape.md.
+   Evidence: notes/315/315-campaign/evidence/315-face-landscape.md.
 
 A NaN-only count records the second face as a clean run, which is what makes it dangerous as a metric. Scoring
 must be: an arm is valid only if it completes the request phase in full (66 of 66 requests); an arm that aborts
@@ -101,11 +103,11 @@ early has reduced exposure and is excluded, not counted as clean. Both faces mus
 guard, format failures through HTTP status, UTF-8 and JSON parse failures — and a third signal is needed for finite
 corruption that still parses: the detector's eight identical greedy requests must agree (`identical_distinct == 1`),
 because no clean arm among the 142 recorded has ever been non-deterministic while all seven non-deterministic arms
-were Face-A faults (`dev/315/315-preregistration.md` section 8, freeze note 2026-10-10).
+were Face-A faults (`notes/315/315-preregistration.md` section 8, freeze note 2026-10-10).
 
 ### State as of 2026-10-10 (this section supersedes the mechanism text above wherever they differ)
 
-Diagnostic record: `dev/315/315-mechanism.md` sections 42-51; evidence under `dev/315/315-campaign/evidence/`.
+Diagnostic record: `notes/315/315-mechanism.md` sections 42-51; evidence under `notes/315/315-campaign/evidence/`.
 
 **Where the fault sits now.** The routed FFN's *routing* tensors, in the MoE path:
 `ffn_moe_argsort` / `ffn_moe_topk` (the top-k ids, `src/llama-graph.cpp:1930-1935`) feed
@@ -124,7 +126,7 @@ consume it with `index.assume` *ranges* (`mul_mat_id_swiglu_f32_f32_wmma.loom:47
 `evidence/315-id-producing-kernel.md`.
 
 **Falsified in this round** (each with its own evidence path). Arm counts below are **re-derived from the
-run consoles** (`dev/315/315-campaign/tools/lever-census.py`, all arms at `gtt_start` 97-98 GiB, i.e. inside
+run consoles** (`notes/315/315-campaign/tools/lever-census.py`, all arms at `gtt_start` 97-98 GiB, i.e. inside
 the frozen `>= 95 GiB` gate), not from prose:
 
 | candidate | run | control cell | fix cell | reading | evidence |
@@ -148,7 +150,7 @@ control. The comment's command section cites these same consoles as its source, 
 
 **Withdrawn (kept for its own record) - was "still untested, and next".** The ids themselves: instrumented
 as `i32` with the name match anchored (the previous filter was `std::strstr(list, name)`, so `-41` also
-matched `-4` and only layers 4 and 41 were covered). `dev/315/315-campaign/315-idprobe.sh` builds that probe
+matched `-4` and only layers 4 and 41 were covered). `notes/315/315-campaign/315-idprobe.sh` builds that probe
 and runs four in-regime arms, reporting per row the first eight ids, the count outside `[0, n_expert)` and
 whether the row's ids repeat. Duplicate or out-of-range ids make the argsort kernel the site; a clean
 permutation kills it.
@@ -361,7 +363,7 @@ What is supported: the forcer causes faults (0/22 -> 7/10 pooled, arm A 4/4, arm
 on); and individual arms have drifted into a high band and faulted while doing so (arm A quiet r2
 97->102G; arm B cell `c` 97->106G). Isolated observations, not rates. The level question is open and is
 what the pre-registered `315gttstep` run exists to test. See
-`dev/315/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`, whose correction section carries the
+`notes/315/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`, whose correction section carries the
 within-console numbers.
 
 This reconciles four observations that previously did not fit together: the 0/70 campaign (run at 97G,
@@ -371,7 +373,7 @@ through the high band; the quiet- and CPU-cell faults occur at 98G starts or by 
 falsified per-arm eviction-*count* correlation (faulting mean 109.5 vs clean 254.5) failed because a
 count of evictions is not a measure of band occupancy.
 
-Evidence: `dev/315/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`,
+Evidence: `notes/315/315-campaign/evidence/315-gtt-start-is-the-discriminator.md`,
 `315-faults-track-gtt-drift.md`, `315-ab1-cell-c-fault-drift.md`, `315-0of70-has-no-eviction-cell.md`.
 
 ### The forced-eviction intervention, and the fix it motivated
@@ -381,7 +383,7 @@ two-sided p = 3.6e-5), producing **both** faces under one intervention — the t
 
 The candidate repair that intervention motivated — routing `buffer_get`'s bare `memcpy` of the
 non-coherent `0x52` logits mapping through `hrx_synchronous_d2h` — has been **REFUTED by its own
-pre-registered A/B** (`fc7ffd5`, `dev/315/315-campaign/evidence/315-ab-preregistration.md`):
+pre-registered A/B** (`fc7ffd5`, `notes/315/315-campaign/evidence/315-ab-preregistration.md`):
 
 ```
     cell e (forced eviction, the test cell)    arm A (knob OFF): 0 OK / 4 FAULT
@@ -395,7 +397,7 @@ created `HOST_LOCAL | HOST_COHERENT | DEVICE_VISIBLE`
 (`host_queue_staging.c:427`, `315-ab1-fix-path-is-coherent.md`).
 
 **The prepared patch must NOT be landed.** It is preserved at
-`dev/315/315-campaign/patches/315-coherent-read-fix.patch` for the record only.
+`notes/315/315-campaign/patches/315-coherent-read-fix.patch` for the record only.
 
 ### Consequence for this entry's acceptance criterion
 
@@ -473,13 +475,13 @@ documented limitation is acceptable only *after* the mechanism is named, so no l
 recorded.
 
 The controlled confirmation of the `gtt_start` boundary (cell fixed, start stepped 97/98/99) is
-pre-registered at `dev/315/315-campaign/evidence/315-gttstep-preregistration.md`, not yet run.
+pre-registered at `notes/315/315-campaign/evidence/315-gttstep-preregistration.md`, not yet run.
 
 ---
 
 ## UPDATE 2026-10-14 — the site is instrument-relative, the size is not, and Face B was never measurable
 
-Session evidence: `dev/315/315-campaign/evidence/315-instrument-independent-summary.md` and the nine documents it
+Session evidence: `notes/315/315-campaign/evidence/315-instrument-independent-summary.md` and the nine documents it
 cites; all read from the archived arm logs at pin `e44c9d01a`, no new arms. Nothing above is edited.
 
 ### The condition is named (as UPDATE 2026-10-13 says) but the SITE is not a property of the defect
@@ -544,7 +546,7 @@ instrument-relative unless the read pattern is fixed.
 - **The acceptance harness could not attribute Face B** — and it failed twice over: its condition was
   `parse > 0 or utf8 > 0`, which are **0 in every Face-B arm**, and `315-paired.sh` computed
   `http`/`transport`/`s500`/`unparsed` and used them in its **verdict** but never **printed** them. Both fixed
-  in `dev/315/315-campaign/315-campaign.sh` and `315-paired.sh`, verified end-to-end on both branches (a real
+  in `notes/315/315-campaign/315-campaign.sh` and `315-paired.sh`, verified end-to-end on both branches (a real
   Face-B signature now attributes; an all-zero fault still does not). **Any future campaign must detect
   Content-only/HTTP 500 — a UTF-8-validity check would never fire and would pass a faulting arm as clean.**
 - **The "rule of three" bound prints probabilities above 100 %** for `n < 3` (`300 %` at n=1). Correct at the
@@ -562,8 +564,8 @@ instrument-relative unless the read pattern is fixed.
   admits exactly one tensor, the **logits** region; layer residuals print `host=0` and can never be armed. A
   **device-buffer** variant is proposed, pre-registered, and its patch written and anchor-verified against a
   real source copy (two defects caught in review; **compile NOT claimed**) at
-  `dev/315/315-campaign/evidence/315-device-buffer-probe-proposal.md` and
-  `dev/315/315-campaign/tools/patch-device-producer-probe.py`.
+  `notes/315/315-campaign/evidence/315-device-buffer-probe-proposal.md` and
+  `notes/315/315-campaign/tools/patch-device-producer-probe.py`.
 
 ### On the fix — unchanged conclusion, one new reason
 
@@ -616,13 +618,13 @@ work ordered the instrument's reads rather than the engine's.
 `git merge-base --is-ancestor e44c9d01a 47a8fe929` true. It is not a revert.
 
 **The campaign.** Pre-registered before it ran
-(`dev/315/315-campaign/evidence/315-campaign-preregistration.md`): 60 in-regime **fix** arms plus 20
+(`notes/315/315-campaign/evidence/315-campaign-preregistration.md`): 60 in-regime **fix** arms plus 20
 interleaved **control** arms on the unfixed build, same harness, same regime gate `[95,110] GiB`, one
 window, instruments off, stopping at the first fix-cell fault. Zero faults in 60 arms gives a one-sided
 95 % upper bound of `1 − 0.05^(1/60) ≈ 4.9 %`. A clean fix cell with a control cell that never faults is
 reported as **under-powered, not passed**.
 
-**Evidence paths:** `dev/315/315-campaign/evidence/315-MECHANISM-unwaited-async-logits-read.md` (the mechanism
+**Evidence paths:** `notes/315/315-campaign/evidence/315-MECHANISM-unwaited-async-logits-read.md` (the mechanism
 and its falsifier), `…-campaign-preregistration.md`, `…-which-binary-is-which.md` (cell F =
 `~/wt/315logwait-build` at `47a8fe929`; cell C = `~/wt/315fixlog-build` at `e44c9d01a`; both with
 `hrx-f32-sync` and `hrx-wb-read` = 0).
@@ -630,7 +632,7 @@ and its falsifier), `…-campaign-preregistration.md`, `…-which-binary-is-whic
 ### 2026-10-15 (later) — the logits-wait mechanism is FALSIFIED by its own campaign; the fix stays landed
 
 The mechanism recorded above was tested by the pre-registered campaign it named, and it failed on the first
-fix arm. The full record is `dev/315/315-campaign/evidence/315-logits-wait-FALSIFIED.md`.
+fix arm. The full record is `notes/315/315-campaign/evidence/315-logits-wait-FALSIFIED.md`.
 
 ```
 pair 1 arm c (control, e44c9d01a): OK    req=66  gtt_start=98G
@@ -658,7 +660,7 @@ change is satisfied by it. What is not satisfied is the mechanism and the campai
 removed by its own pre-registered experiment and one has been shown unmeasurable by the current instrument.
 
 * **The stream-ordering explanation for the `result_norm` divergence is REMOVED.**
-  `dev/315/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` ran the pre-registered
+  `notes/315/315-campaign/evidence/315-task1-writer-not-stream-ordered.md` ran the pre-registered
   `315-PREREG-sync-between-reads.md` on a faulting arm (Face A, 312 records) and landed on its **second**
   pre-declared row: of 82 records where `result_norm` differed between two consecutive plain reads, a fresh
   `ggml_backend_synchronize` stopped the difference in **0** and did not stop it in **82** — and changed the
@@ -666,13 +668,13 @@ removed by its own pre-registered experiment and one has been shown unmeasurable
   `GraphExecutor::execute` returning without a wait (with `backend_synchronize` covering only
   `context->stream`) as the explanation. Recorded at `b7d6b46`.
 * **§51's rank-sort precondition is UNMEASURED and not measurable by the by-name fingerprint.**
-  `dev/315/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`) — the
+  `notes/315/315-campaign/evidence/315-task2-bounded-negative-precondition-unmeasurable.md` (`ba6753a`) — the
   faulting arm produced zero records because `ffn_moe_probs-*` is not among the 946 node names this build's
   fingerprint walks. This is a negative about the instrument, not about the site.
 
 **Surviving family, stated as surviving:** an open writer of the `result_norm` slot that is *not* ordered by
 `context->stream` — the reused-arena-slot family in
-`dev/315/315-campaign/evidence/315-what-the-synchronise-drains.md` — plus the unmeasured §51 site. The measured,
+`notes/315/315-campaign/evidence/315-what-the-synchronise-drains.md` — plus the unmeasured §51 site. The measured,
 unexplained fact handed forward is that `result_norm` changes between two consecutive identical plain reads in
 a faulting arm, at two different addresses, with no pending host writeback at the engine's logits read, and
 with a fresh synchronise failing to stop it.
@@ -682,12 +684,12 @@ with a fresh synchronise failing to stop it.
 the `MUL_MAT_ID` op-test are **unchanged** (`8 pass, 0 skip, 0 fail`, `mxfp4` nmse **1.34e-05 … 1.61e-05**, an
 exact match to the recorded baseline, same two kernels); and the dense-model control (Qwen3-8B, dense, not MoE)
 is **clean and unchanged** (50 responses, 1 distinct content, zero fault signatures). Evidence:
-`dev/315/315-campaign/evidence/315-task3-op-test-unchanged-at-moved-pin.md` and
+`notes/315/315-campaign/evidence/315-task3-op-test-unchanged-at-moved-pin.md` and
 `315-task3-dense-control-clean-at-moved-pin.md`.
 
 **CI did not pass on arrival.** It required fixing two pre-existing defects — a half-move (`95238dc` moved the
 `llama.cpp` gitlink without `registry/architectures.json`) and 46 files missing the full copyright notice —
-recorded in `dev/315/315-campaign/evidence/315-what-the-merge-and-the-gates-found.md`, with no gate loosened.
+recorded in `notes/315/315-campaign/evidence/315-what-the-merge-and-the-gates-found.md`, with no gate loosened.
 
 ### 2026-10-18 — candidate 1: the CWSR save area in GTT (CWSR off stays the shipped default)
 

@@ -219,6 +219,10 @@ if(ONEBIT_ONNX)
         USES_TERMINAL)
     add_dependencies(onebit onnx_server)
     target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${ONEBIT_ONNX_SERVER}")
+    # Linux NPU through Ryzen AI Software (docs/onnx.md): skips without ONEBIT_RYZENAI_ROOT,
+    # an NPU and a model (ONEBIT_ONNX_NPU_MODEL)
+    add_test(NAME onnx_npu_smoke COMMAND ${CMAKE_SOURCE_DIR}/tests/onnx_npu_smoke.sh $<TARGET_FILE:onebit>)
+    set_tests_properties(onnx_npu_smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────

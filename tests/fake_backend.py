@@ -105,6 +105,10 @@ class H(BaseHTTPRequestHandler):
             timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0}
             self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
                              "timings": timings})
+            # "fake_exit": N: the backend exits with status N shortly after this reply, on its own
+            # (a crashed backend; serve must notice and not wait its SIGTERM grace for a dead pid)
+            if "fake_exit" in req:
+                threading.Timer(0.2, os._exit, [int(req["fake_exit"])]).start()
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

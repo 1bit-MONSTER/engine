@@ -33,7 +33,7 @@ jobs:
         run: |
           apt-get update
           DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
-            python3 python3-venv gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev libzstd-dev \
+            python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev libzstd-dev \
             libssl-dev libdrm-dev libpcre2-dev
           git config --global --add safe.directory "$GITHUB_WORKSPACE"
           python3 -m venv /opt/ci-venv && echo /opt/ci-venv/bin >> "$GITHUB_PATH"

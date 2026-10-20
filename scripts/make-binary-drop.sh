@@ -198,6 +198,8 @@ echo "  MANIFEST: $(grep -cE '^[0-9a-f]{64}  ' "$stage/MANIFEST") files, pins en
 
 # ── the tarball and its SHA256SUMS ──────────────────────────────────────────────────────────────
 name=binary-drop-$version
+# Rebuild cleanly: the target is this script's own output, and zstd refuses an existing one.
+rm -f "$out/$name.tar.zst" "$out/SHA256SUMS"
 tar -C "$work" -cf - "$name" | zstd -q -T4 -19 -o "$out/$name.tar.zst"
 ( cd "$out" && sha256sum "$name.tar.zst" > SHA256SUMS )
 echo "  $out/$name.tar.zst ($(stat -c%s "$out/$name.tar.zst") B)"

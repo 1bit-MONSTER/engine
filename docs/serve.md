@@ -28,7 +28,7 @@ so it also works on its own with any OpenAI client.
            [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH]
            [--hrx-cwsr-placement=auto|on|off]
-           [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
            [--pm [--pm-experts FILE] [--lemonade-url URL]]
            [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   # refused in this build, below
@@ -281,6 +281,17 @@ What serve did on the request path is the backend's own on this route:
   own (`--jinja`).
 - **Prefix reuse.** `--cache-reuse 256` lets llama-server shift a cached prefix into place when the
   middle of a conversation changes. A recipe's own `--cache-reuse` wins.
+- **Warm-up.** serve sends a backend one synthetic request once it is ready (a 360-token prompt,
+  8 tokens, temperature 0, `cache_prompt` off; HRX only), so the first client request does not pay
+  HRX's one-time per-shape program build (#492). On this route the plan carries that request as
+  `"warmup": {"path", "body"}` (on `hrx` chat plans only), and Lemonade's onebit recipe sends it after
+  `/health` answers and before it marks the model loaded. `ONEBIT_NO_WARMUP=1` in lemond's
+  environment leaves it out of the plan, as it turns serve's own warm-up off.
+  It lifts the first request's decode (Lemonade bench, Qwen3.8-27B: 11.1 -> 12.8 tok/s chat-short;
+  Qwen3.5-4B: 56.6 -> 61.5), not a short prompt's TTFT: the per-shape cost is per prompt length, and
+  some lengths cost far more than others the first time (Qwen3.8-27B, one server without MTP:
+  67 tokens 2,350 ms, then 531 ms; 74 tokens 559 ms, then 528 ms), so the warm-up's 360-token
+  prompt leaves chat-short's 67-token prompt at 2.3-2.4 s after every reload.
 - **Residency.** Keeping the model loaded, and so its HRX graph-program cache warm, is Lemonade's:
   `lemonade load --pinned` (or `"pinned": true`), `max_loaded_models`, and the `evict_idle_timeout`
   recipe option when `auto_evict` is on. A reload starts a new llama-server, whose program cache
@@ -500,6 +511,31 @@ device, and the model checks them in one batch. `--mtp-max N` caps the draft len
 `--mtp-p-min P` drafts a token only when the head is at least that sure of it.
 It works on the llama.cpp devices (`hrx`, `cpu`), and `--device auto` keeps it on HRX0.
 A drafted token is kept only when the model agrees, so the output is the model's own.
+
+**A GGUF's own MTP head is on by default on `hrx`.** When the `-m` file carries its MTP layer
+(`<architecture>.nextn_predict_layers` > 0, e.g. Unsloth's Qwen3.8-27B UD-Q4_K_XL, `blk.64.nextn.*`)
+and no other drafter is asked for, serve adds `--spec-type draft-mtp` with no `-md`: llama-server
+loads the head from the model file. That is what Lemonade's own llamacpp recipe does for a model
+with the `mtp` label, which Lemonade sets from the same key; both `1bit serve` and the
+[one-hop plan](#one-hop-from-lemonade---print-backend) do it. `--mtp-max` and `--mtp-p-min` apply.
+Not on `cpu`, not with `--parallel` > 1, not for `--embedding` / `--reranking`, and `--no-mtp` (or
+`ONEBIT_NO_MTP=1`; Lemonade: `onebit.args=--no-mtp`) turns it off. A file without the key is
+unchanged.
+
+Lemonade's standard benchmark (`lemonade bench --scenarios chat-short code-short --runs 5
+--warmup 1`, the pinned CI's protocol, a reload before every run), onebit recipe on the one-hop
+route, Qwen3.8-27B UD-Q4_K_XL, Strix Halo, 2026-10-21 (decode tok/s, chat-short / code-short):
+
+| | tok/s | TTFT ms |
+|---|---|---|
+| no drafter (before) | 11.1 / 11.9 | 2298 / 724 |
+| own MTP head (now) | **24.9 / 29.1** | 2424 / 807 |
+| own MTP head + one-hop warm-up | **26.2 / 29.5** | 2446 / 824 |
+| Lemonade's llamacpp Vulkan, same file, `--spec-type draft-mtp` (README of the 2026-10-21 run) | 24.2 / 28.0 | 1882 / 1882 |
+
+Greedy outputs with and without the head (three 128-token chats): two identical, one diverges at a
+near-tie (" Earth" -0.684 against " the" -0.705 without MTP), where the verify batch's numerics
+pick the other token; a drafted token is still only kept when the model's verify pass agrees.
 
 On HRX, Qwen3.8-27B UD-Q4_K_XL with its MTP head (default draft length 3, greedy 256-token chats,
 medians of 3 fresh servers) decodes at **36.0 / 26.8 / 29.9 tok/s** on code / prose / short, up

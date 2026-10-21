@@ -136,6 +136,11 @@ amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. Af
 - **Libraries found:** `ldd` (with `ROCR_VISIBLE_DEVICES=-1`) finds every library each packed
   program and library needs, except the TheRock runtime the package documents (HIP, hipBLAS(Lt),
   rocBLAS, HSA, which DwarfStar links).
+- **Links inside:** every symlink in the engine tarball and in the Lemonade + onebit tarball is
+  relative and resolves inside the package (`pack_outside_links`); the `libggml*.so` ->
+  `.so.0` links stay links. Lemonade's build links its web app's KaTeX fonts to the build
+  machine's `/usr/share/fonts/truetype/katex`; the package stage and `os/mini/mkimage.sh` copy
+  every link that points out of the tree as a file (`pack_localize_links`, `scripts/pack-elf.sh`).
 
 `SHA256SUMS` is written again by the release stage, after `changes.json`, so it covers every file.
 

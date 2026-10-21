@@ -305,6 +305,7 @@ package_checks() {  # package_checks <linux tarball>
     # every library each program loads is packed beside it (scripts/pack-elf.sh), except the TheRock
     # runtime the package documents (HIP, hipBLAS(Lt), rocBLAS, HSA); ldd runs with
     # ROCR_VISIBLE_DEVICES=-1, so nothing touches a GPU
+    links_ok "$t" "$(basename "$1")" || bad=1
     local missing; missing=$(pack_missing_libs "$t")
     if [ -z "$missing" ]; then echo "ok   every library is packed (ldd: nothing missing beyond TheRock's runtime)"
     else echo "FAIL libraries ldd cannot find in $(basename "$1"):"; echo "$missing"; bad=1; fi
@@ -334,6 +335,24 @@ package_checks() {  # package_checks <linux tarball>
     return $bad
 }
 
+# every symlink in a package stays inside it (scripts/pack-elf.sh pack_outside_links): no absolute
+# link and none that resolves outside the tree or dangles; the .so -> .so.0 links in
+# hrx/llama/bin are relative and stay. Lemonade's web app linked its KaTeX fonts to the build
+# machine's /usr/share/fonts/truetype/katex (2026-10-21 rehearsal)
+links_ok() {  # links_ok <unpacked dir> <name>
+    local out; out=$(pack_outside_links "$1")
+    if [ -z "$out" ]; then echo "ok   every symlink in $2 resolves inside it"; return 0; fi
+    echo "FAIL symlinks in $2 that are absolute, point outside it or dangle:"; echo "$out"; return 1
+}
+package_link_checks() {  # package_link_checks <tarball>
+    local t rc=0
+    t=$(mktemp -d)
+    tar -C "$t" -xf "$1" --use-compress-program=unzstd
+    links_ok "$t" "$(basename "$1")" || rc=1
+    rm -rf "$t"
+    return $rc
+}
+
 TAG_FILE=$W/tag
 stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
@@ -356,10 +375,15 @@ stage_package() {
     rm -rf "$W/lemonade/1bit" && mkdir -p "$W/lemonade/1bit"
     zstd -dc "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" | tar -C "$W/lemonade/1bit" --strip-components=1 -xf -
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
+    # links out of the tree (the web app's KaTeX fonts -> the build machine's fonts-katex) become
+    # copies of their targets; the links inside it stay links
+    pack_localize_links "$W/lemonade/bin"
     # the S flag: member names only; GNU tar otherwise rewrites symlink targets too, and every
     # libggml*.so.0 -> libggml*.so.0.18.0 link in 1bit/hrx/llama/bin pointed into a directory that is not there
     tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/,S" -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \
         -o "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst"
+    package_link_checks "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst" >> "$LOGS/package-checks.log" 2>&1 ||
+        { cat "$LOGS/package-checks.log"; return 1; }
     say "package $tag: 1bit OS"
     rm -rf "$W/os"
     guard "$SRC/os/mini/mkimage.sh" "$W/os" "$BUILD" > "$LOGS/os.log" 2>&1

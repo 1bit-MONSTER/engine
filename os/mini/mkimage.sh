@@ -174,6 +174,14 @@ lem=$(cd "$lem" && pwd)
 [ -d "$lem/bin/resources/web-app" ] || echo "   warning: no web app in $lem (build it with LEMONADE_WEB_APP=1 scripts/build-lemonade.sh)"
 # lemond reads resources/ beside itself
 mkdir -p "$root/opt/lemonade"; cp -a "$lem/bin" "$root/opt/lemonade/bin"
+# Lemonade's build links the web app's KaTeX fonts to the build machine's fonts-katex
+# (/usr/share/fonts/truetype/katex), which the image does not have: every link out of the tree
+# becomes a copy of its target (scripts/pack-elf.sh), the links inside it stay
+# shellcheck source=scripts/pack-elf.sh
+. "$src/scripts/pack-elf.sh"
+pack_localize_links "$root/opt/lemonade/bin"
+n=$(pack_outside_links "$root/opt/lemonade/bin" | wc -l)
+[ "$n" = 0 ] || { echo "symlinks out of /opt/lemonade/bin in the image:"; pack_outside_links "$root/opt/lemonade/bin"; exit 1; }
 copy_libs "$lem/bin/lemond" "$lem/bin/lemonade"
 # HTTPS for Lemonade's downloads (models, backends) when the stick has a network
 mkdir -p "$root/etc/ssl/certs"; cp -L /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/"

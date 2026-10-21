@@ -23,12 +23,12 @@
 # Lemonade's own settings for a network-facing server: "host": "0.0.0.0" in its config.json (QEMU's
 # port forward reaches the guest's network address, not its loopback) and LEMONADE_API_KEY in its
 # environment file. Then over SSH and HTTP: the system is up, the stick's data partition is mounted,
-# Lemonade's web app loads, Lemonade refuses a request without the key, lists the stick's model in
-# /api/v1/models, and answers a chat request with it. The VM has no Radeon GPU, so Lemonade serves
-# that chat with its llamacpp CPU backend (its own choice); the onebit entry for the same model
-# needs an AMD GPU or NPU for Lemonade to run it (the recipe's backends are hrx and npu), so the
-# test only reports what Lemonade does with it. Prints VMTEST PASS or FAIL. On a
-# machine without TheRock, LLAMA_SERVER (mkimage.sh) makes a CPU-only test image.
+# Lemonade's web app loads and serves its KaTeX font as a file, Lemonade refuses a request without
+# the key, lists the stick's model in /api/v1/models, and answers a chat request with it. The VM
+# has no Radeon GPU, so Lemonade serves that chat with its llamacpp CPU backend (its own choice);
+# the onebit entry for the same model needs an AMD GPU or NPU for Lemonade to run it (the recipe's
+# backends are hrx and npu), so the test only reports what Lemonade does with it. Prints VMTEST
+# PASS or FAIL. On a machine without TheRock, LLAMA_SERVER (mkimage.sh) makes a CPU-only test image.
 set -euo pipefail
 out=${1:?usage: vmtest.sh <out> [engine build dir] [model.gguf]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
@@ -75,6 +75,12 @@ fi
 for i in $(seq 60); do curl -sf "${auth[@]}" "$api/api/v1/health" >/dev/null && break; sleep 2; done
 code=$(curl -s -o "$out/ui.html" -w '%{http_code} %{content_type}' "$api/")
 if [ "${code%% *}" = 200 ] && grep -qi '<html' "$out/ui.html"; then echo "Lemonade web app: HTTP $code"; else echo "Lemonade web app: HTTP $code"; ok=0; fi
+# the web app's math fonts are files on the stick, not links to the build machine's fonts-katex
+# (os/mini/mkimage.sh, pack_localize_links)
+code=$(curl -s -o "$out/katex.woff2" -w '%{http_code}' "$api/KaTeX_Main-Regular.woff2")
+if [ "$code" = 200 ] && [ "$(head -c 4 "$out/katex.woff2")" = wOF2 ]; then
+    echo "Lemonade web app font KaTeX_Main-Regular.woff2: HTTP 200, $(stat -c %s "$out/katex.woff2") bytes (woff2)"
+else echo "Lemonade web app font KaTeX_Main-Regular.woff2: HTTP $code, not a woff2 font"; ok=0; fi
 code=$(curl -s -o /dev/null -w '%{http_code}' "$api/api/v1/models")
 if [ "$code" = 401 ]; then echo "Lemonade without the API key: HTTP 401"; else echo "Lemonade without the API key: HTTP $code (expected 401)"; ok=0; fi
 models=$(curl -s "${auth[@]}" "$api/api/v1/models" | python3 -c 'import json,sys; print(" ".join(m["id"] + "(" + m.get("recipe", "?") + ")" for m in json.load(sys.stdin)["data"]))' 2>/dev/null || true)

@@ -14,12 +14,15 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# Weekly releases
+# Releases
+
+The first release goes out when every item on the release checklist is done; it is not published
+yet.
 
 1bit engine is pinned upstream: every backend it builds is a submodule at a fixed commit
 (`third_party/`), and the `bump-*` workflows open a PR whenever an upstream moves. The engine
-runs inside Lemonade, which releases on Fridays. So the release run is weekly, on Sunday,
-rebuilt from scratch at that week's pins. The first release is not published yet.
+runs inside Lemonade, which releases on Fridays. The release run (`scripts/weekly.sh`) rebuilds
+everything from scratch at the current pins, so each release carries that week's upstreams.
 
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
@@ -28,7 +31,7 @@ release in the same week gets `.1`.
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, and the NPU engine's runtime (no XRT; the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, and the NPU engine's runtime (the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
@@ -50,14 +53,14 @@ lemonade-onebit-v2026.40/lemond-onebit           # lemond with the onebit recipe
 
 The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE` on its Zen 5. HRX needs TheRock in
 `/opt/rocm-therock`; the NPU needs the `amdxdna` kernel driver. The closed NPU add-ons
-([npu.md](npu.md), "Private routes") are never in a release.
+([npu.md](npu.md#add-on-routes)) are never in a release.
 
 ### The NPU engine
 
 The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
 NPU engine is in progress: the release carries its runtime, compiled into `1bit`, and the `onebit`
 recipe's `npu` backend, but the NPU layer and lm-head kernels built from source are not merged yet
-([npu.md](npu.md#step-3d-the-layer-kernel-and-lm-head-built-from-source)). Until they are, NPU models
+([npu.md](npu.md)). Until they are, NPU models
 are not served from a release package; HRX serves the GGUF models.
 
 ### Private components
@@ -72,7 +75,7 @@ carry both files beside the engine's `LICENSE` and `NOTICE`:
 
 | Component | Compiled into | Pin | Build option |
 |---|---|---|---|
-| The 1bit NPU runtime ([npu.md](npu.md), "The NPU runtime") | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` (or a prebuilt `ONEBIT_NPU_RT_LIB`) |
+| The 1bit NPU runtime ([npu.md](npu.md#the-runtime)) | `1bit` (static) | `config/npu-runtime.config` | `ONEBIT_NPU_RT_DIR` (or a prebuilt `ONEBIT_NPU_RT_LIB`) |
 | The private HIP kernels for HRX ([hrx.md](hrx.md), "Private HIP kernels") | `hrx/llama/bin/libggml-hrx.so` (code objects) | `config/gpu-kernels.config` | `ONEBIT_GPU_PRIVATE` |
 
 The build stage fetches each with `scripts/fetch-private.sh <pin> <dir>`: the pinned path at the
@@ -100,7 +103,7 @@ It takes the HRX tree from a release build (`--build <dir>`, packed the way `pac
 packs it: the same `scripts/pack-elf.sh` steps copy the libraries it loads beside it, set RUNPATH
 to `$ORIGIN` and strip it) or from an already packed release (`--from-package <tar.zst>`), and the NPU library either prebuilt (`--npu-lib`) or built from the
 pinned private sources (`--npu-rt <dir>`, its `build-api-lib.sh`). It then runs the same class of
-checks the weekly package runs: XRT-free, the kernels really are compiled in, no source files,
+checks the release package runs: the NPU runtime compiled in, the kernels really are compiled in, no source files,
 nothing named like the private sources, both binary licenses present, every library found. It publishes nothing; the
 orchestrator publishes the tarball and adds its line to `config/binary-drop.config`.
 
@@ -120,15 +123,15 @@ place, `ONEBIT_GPU_PRIVATE` and `ONEBIT_NPU_RT_DIR` are not needed and not used:
 so the `llama.cpp` and `hrx-system` submodules are not required either. HRX still needs TheRock's
 HSA runtime on the machine that runs it.
 
-The engine is XRT-free: the NPU engine's runtime is compiled in, and nothing links AMD's
-XRT. `scripts/package-linux.sh` strips every packed program and library (`strip
+The NPU engine's runtime is compiled into `1bit`; no packed program needs a separate NPU runtime
+library. `scripts/package-linux.sh` strips every packed program and library (`strip
 --strip-unneeded`) and makes each find its libraries beside itself (`$ORIGIN`, `scripts/pack-elf.sh`),
 with LLVM's OpenMP runtime (`libomp.so`, which the HRX llama.cpp libraries link when TheRock's
 amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. After packing the engine tarball the package stage checks
 (`logs/package-checks.log`; a failure stops the release):
 
-- **XRT-free:** for the build's `1bit` and every ELF file in the tarball, no `NEEDED` `libxrt*`
-  entry, no `libxrt` in `ldd`, no `libxrt` string (`strings -a`); no `libxrt*` file packed.
+- **Self-contained NPU runtime:** for the build's `1bit` and every program and library in the
+  tarball, no separate NPU runtime library is needed or packed.
 - **Kernels in:** the packed `libggml-hrx.so` exports the add-on's `ggml_hrx_hip_addon_register`.
 - **No source:** no source file (`.hip`, `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hpp`, `.inc`, `.cu`,
   `.py`, `.cmake`) and no file named like one of the private checkouts' files.
@@ -146,15 +149,13 @@ amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. Af
 
 `SHA256SUMS` is written again by the release stage, after `changes.json`, so it covers every file.
 
-1bit OS carries no XRT either; its `1bit.check` boot reports `CHECK no XRT`.
-
 To exercise only the private builds and the packaging without releasing, on Strix Halo:
 
 ```sh
 WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-weekly build package
 ```
 
-## The Sunday run
+## The release run
 
 `scripts/weekly.sh <workdir>` on Strix Halo, in stages:
 
@@ -207,5 +208,4 @@ changes with credit to their authors, the rest as a list, and the downloads (the
 above). Then two lists written
 straight from the data: **New models** (repos published under our Hugging Face org, models added to
 Lemonade's catalog, architectures the registry gained or that gained a backend) and **Updates** (every
-upstream as pinned in the release, with its latest release and changelog). It is the one weekly
-digest; each week's post is new and earlier ones stay.
+upstream as pinned in the release, with its latest release and changelog). Each release gets its own post, and earlier ones stay.

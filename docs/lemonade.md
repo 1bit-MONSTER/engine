@@ -16,11 +16,14 @@ limitations under the License.
 -->
 # Lemonade
 
-**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade is
-the server users talk to, with its own catalog, downloads, router and UI. For the models it
-serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`: it starts
-`1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards OpenAI requests to it. The
-engine exposes nothing but that OpenAI-compatible API.
+**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade)**, and its
+`onebit` recipe passes Lemonade's own LLM test suite on HRX: 29 of 29 tests run, all pass. Lemonade
+is the server users talk to, with its own catalog, downloads, router and UI. For the models it
+serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`. For a GGUF
+it starts the engine's HRX `llama-server` directly, one HTTP hop
+([#475](https://github.com/1bit-MONSTER/engine/pull/475), [below](#the-recipe-that-runs-it)); for
+the other routes it starts `1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards
+OpenAI requests to it. The engine exposes nothing but that OpenAI-compatible API.
 
 Recovery stays Lemonade's: when a backend hangs, `1bit serve` answers `/health` with 503 and, once
 a request has had no progress for `--watchdog` seconds, kills its backend and exits non-zero
@@ -84,8 +87,8 @@ On Strix Halo the recipe passes Lemonade's own LLM test suite
 Vulkan passed too before RFC #213 stage 3 removed it). It is not proposed upstream yet: the plan is to embed the engine fully
 in the fork first, then propose it upstream. The fork follows upstream's releases:
 `.github/workflows/sync-lemonade-fork.yml` checks daily and merges upstream's latest
-release tag (never a pre-release or `main`), so each weekly engine release carries the
-Lemonade release of that week. It
+release tag (never a pre-release or `main`), so each engine release carries the Lemonade
+release current when it was built. It
 pushes only a clean merge that still registers `onebit`; otherwise it opens a PR
 in the fork that lists the conflicts. It also keeps the fork's own copies of
 upstream's workflows disabled. Lemonade asks for an RFC
@@ -99,9 +102,9 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 | device | 2026-09-25, start | now |
 |---|---|---|
-| Vulkan | 19 / 31 | **29 / 29 run, all pass** (2 skipped, as for llamacpp) |
 | HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; release pre-check 2026-10-02, from the packaged tarballs) |
-| NPU | 3 / 31 | Qwen3.6-35B-A3B loads and answers through Lemonade; the suite's small test models are GGUF |
+| NPU | 3 / 31 | in progress ([npu.md](npu.md)); the suite's small test models are GGUF |
+| Vulkan (removed in RFC #213 stage 3) | 19 / 31 | 29 / 29 run, all pass, before its removal |
 
 1. ~~**Declare what already works.**~~ Done (fork #6). The recipe now declares tool calls,
    `stop`, async, the Responses API, slots, tokenize, embeddings and reranking.
@@ -113,10 +116,11 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    `--reranking`, and the recipe serves those modes.
 5. ~~**Reranking on HRX.**~~ Done. jina-reranker-v1-tiny reranks on HRX (the suite's three
    rerank tests return the same top 3 as on Vulkan), and `1bit serve --rerank` runs on HRX (#281).
-6. **The NPU from Lemonade.** Qwen3.6-35B-A3B now runs: Lemonade downloads the Q4NX checkpoint
-   repo, the recipe hands `1bit serve` the directory, and the engine runs it on the NPU
-   (16.0 tok/s; builds with the private add-on only, docs/npu.md, "Private routes"). Still open:
-   - the smaller NPU models: their lane kernels are captured, not built from source;
+6. **The NPU from Lemonade.** The path works end to end: Lemonade downloads the Q4NX checkpoint
+   repo, the recipe hands `1bit serve` the directory, and the engine runs it on the NPU (the
+   experimental Qwen3.6-35B-A3B route builds with a closed add-on only,
+   [npu.md](npu.md#add-on-routes)). Still open:
+   - the NPU engine's kernels built from source, verified but not merged ([npu.md](npu.md));
    - ~~`reasoning_content`~~: done (#73), the NPU route splits the thinking out as llama-server does;
    - ~~models in our own Hugging Face repos~~: the 35B is `1bit-MONSTER/Qwen3.6-35B-A3B-NPU` (fork #8). (engine + fork)
 7. **Beyond the LLM suite:**

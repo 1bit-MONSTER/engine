@@ -44,11 +44,12 @@ the build step (2026-10-20: gpu-kernels be68256d used `HipSetRowsArgs`, which th
 llama.cpp did not have yet), and so does a build whose `libggml-hrx.so` lacks the add-on. A box
 that cannot read gpu-kernels stops with exit 2; `HW_GATE_PRIVATE=0` gates the public plumbing
 only. On a failed build the job log shows the compiler's error lines without their source
-excerpts, since the log is public and the add-on's sources are not. It then runs five checks:
+excerpts, since the log is public and the add-on's sources are not. It then runs six checks:
 
 | check | what | catches |
 |---|---|---|
 | ops | one `test-backend-ops -b HRX0 -j 4` run over MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_CONV, GET_ROWS, ROPE, RMS_NORM, SOFT_MAX | a kernel that disagrees with the CPU (#310, #313, #370, the IQ ports) |
+| fa-decode-q8 | the add-on's `ggml-hrx-fa-decode-bench` on its q8_0 KV decode kernel against a double-precision reference: K q8_0 with V f16 (`-ctk q8_0` alone) and with V q8_0, Hq/Hkv 16/8 and 32/8, n_kv 1031, 2048 and 4103, six runs in one hold | a mixed K/V type bug test-backend-ops cannot see: it has no FLASH_ATTN_EXT case with K and V of different types (gpu-kernels #11 read f16 V dims 0..31 only) |
 | kat | `tools/kat.py check` on five models (below), against `tests/golden/hw-gate/kat-<model>.json` | wrong answers, empty replies, NaN logprobs, nondeterminism, cached-prefix and multi-ubatch bugs, drift from the release pin (#308, #309, #315, #318, #319, #369) |
 | kld | `llama-perplexity --kl-divergence` on wiki.test.raw, 512 tokens x 8 chunks, against base logits stored at the release pin | small numeric drift that greedy answers do not show |
 | needle | `tests/hrx_long_prompt.py`: the 320-record vault-code needle (7.1K tokens on Qwen3, 7.4K on ZAYA1) on Qwen3-0.6B and ZAYA1-8B | #319, #369 |
@@ -63,6 +64,17 @@ The models (`MODEL_TABLE` in the script, files under `~/models`):
 | qwen3.8-27b | qwen38/UD-Q4_K_XL/Qwen3.8-27B-UD-Q4_K_XL.gguf | gated delta net + attention hybrid, Unsloth dynamic mix | 2 | no |
 | qwen3-coder-30b-a3b | Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf | qwen3moe: 128 experts, 8 active per token (MUL_MAT_ID with top-8 routing) | 2 | no |
 | qwen3-4b-iq4xs | Qwen3-4B-IQ4_XS.gguf | an IQ quant (IQ4_XS matmul and GET_ROWS) | 2 | no |
+| qwen3-0.6b-kq8 | Qwen3-0.6B-Q4_K_M.gguf, served with `-fa on -ctk q8_0` | a q8_0 K cache with an f16 V cache | 2 | yes |
+| qwen3-0.6b-kvq8 | Qwen3-0.6B-Q4_K_M.gguf, served with `-fa on -ctk q8_0 -ctv q8_0` | q8_0 K and V caches | 2 | yes |
+
+The last two rows give `llama-server` extra arguments (the fifth column of `MODEL_TABLE`). Their kat
+needle (about 4.7K tokens) and the 7.1K-token needle decode past 1,024 KV cells, where the add-on's
+split decode kernel (`fa_decode_q8_d128`) takes over from its prompt kernel; the short kat cases
+decode through the prompt kernel with one query. Both bugs of gpu-kernels #11 showed only on that
+path: a launch parameter registered on the wrong kernel (every long decode failed with "compiled
+ABI does not match manifest", HTTP 500) and an f16 V read that covered dims 0..31 only. The rows
+run kat, the needle and placement but not kld, since a KLD base is stored per model file and
+recorded with the default f16 cache.
 
 kat repeats every case and fails on any of:
 - a missing expected answer;
@@ -100,8 +112,19 @@ the summary says so.
 
 ## Box etiquette
 
-The gate shares the box with other work. It takes the GPU six times: once for all the ops, and
-once per model (the server for kat and the needle, then llama-perplexity for the KLD, in one hold).
+The gate shares the box with other work. It takes the GPU nine times: once for all the ops, once
+for the fa-decode-q8 runs, and once per `MODEL_TABLE` row (the server for kat and the needle, then
+llama-perplexity for the KLD, in one hold).
+Before the first of them it takes the fleet's GPU token, `~/GPU-TOKEN`: the file long GPU jobs
+(Hyperloom, agents' benchmark holds) write their name into while they own the GPU. The gate waits
+while another job holds it, up to `HW_GATE_TOKEN_WAIT` seconds (default 3600), logging the holder;
+then it writes `hw-gate <run> pid <pid> <time>` into it and removes it on exit, only if the content
+is still its own. A wait that times out fails the run with exit 2 and names the holder. Two gate
+runs on 2026-10-20 (#481) died with "server failed (rc 137)" while Hyperloom held the token and
+loaded models of its own. Hyperloom's own token_take waits while a `scripts/hw-gate.sh` process
+exists, so the two take turns. `HW_GATE_TOKEN=none` skips the token for a caller that already
+holds it.
+
 Each of those steps:
 - **Lock.** It holds `~/npu.lock` (flock) only while it runs, so other GPU work keeps its turn between steps.
 - **Heat.** It waits for Tctl to drop to 75 C, then runs under `~/lb/thermal-run.sh`, which freezes it at 78 C and kills it at 93 C.

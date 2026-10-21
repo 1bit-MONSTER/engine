@@ -20,7 +20,9 @@
 #   - an embedding model keeps its role and gets no --cache-reuse,
 #   - routes that need serve in the request path exit 5 (NPU directory, --pm, --laya, --embed),
 #   - a model that does not fit exits 3, as serve does,
-#   - nothing is started: the fake backend never runs.
+#   - nothing is started: the fake backend never runs,
+#   - --device hrx: strict placement by default (GGML_HRX_STRICT=1 in env); --no-strict-device,
+#     ONEBIT_STRICT_DEVICE=0 and a GGML_HRX_STRICT the caller set leave it out.
 #
 # usage: tests/print_backend.sh path/to/1bit
 set -uo pipefail
@@ -73,6 +75,31 @@ plan --port 43119 --pm >"$scratch/out"; rc=$?
 check "--pm needs serve (exit $rc)" '[ "$rc" = 5 ] && [ ! -s "$scratch/out" ]'
 plan --port 43120 --embed "$scratch/small.gguf" >"$scratch/out"; rc=$?
 check "--embed needs serve (exit $rc)" '[ "$rc" = 5 ] && [ ! -s "$scratch/out" ]'
+
+# strict placement on HRX (docs/serve.md, "Off-HRX placement: strict by default")
+env_of() { printf '%s' "$out" | python3 -c "import json,sys; print(json.load(sys.stdin)['env'].get('$1', '-'))"; }
+out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43122 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: strict by default (exit $rc, GGML_HRX_STRICT=$(env_of GGML_HRX_STRICT))" \
+    '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = 1 ] && [ "$(env_of GGML_HRX_REPORT)" = 1 ] && [ "$(get "\"-lv\" in d[\"argv\"]")" = False ]'
+out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43123 --no-strict-device --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: --no-strict-device leaves GGML_HRX_STRICT out (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = - ]'
+out=$(env -u GGML_HRX_STRICT ONEBIT_STRICT_DEVICE=0 "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43124 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: ONEBIT_STRICT_DEVICE=0 leaves it out (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = - ]'
+out=$(GGML_HRX_STRICT=0 "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43125 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: a GGML_HRX_STRICT the caller set wins (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = - ]'
+out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43126 --strict-device --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: --strict-device adds the every-graph report and -lv 4 (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = 1 ] && [ "$(env_of GGML_HRX_REPORT)" = 2 ] && [ "$(get "d[\"argv\"][d[\"argv\"].index(\"-lv\")+1]")" = 4 ]'
+out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device cpu \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43127 --print-backend 2>"$scratch/err"); rc=$?
+check "cpu plan: no strict placement (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = - ]'
+"$bin" serve -m "$scratch/small.gguf" --device hrx --strict-device --no-strict-device --print-backend >"$scratch/out" 2>"$scratch/err"; rc=$?
+check "--strict-device with --no-strict-device is refused (exit $rc)" '[ "$rc" != 0 ] && grep -q "pick one" "$scratch/err"'
 
 if [ -r /proc/meminfo ]; then
     "$bin" serve -m "$scratch/huge.gguf" --device cpu --port 43121 --llama-server "$here/fake_backend.py" \

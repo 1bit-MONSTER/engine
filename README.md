@@ -26,7 +26,7 @@ Lemonade runs the engine as one of its backends, the same way it runs `llama-ser
 serves each model behind an OpenAI-compatible API (`1bit serve`), whatever device runs it:
 
 - the XDNA 2 NPU engine, on our own NPU runtime (no XRT; [docs/npu.md](docs/npu.md#the-npu-runtime)); in progress: the release carries the runtime, and the NPU kernels built from source are not merged yet
-- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the engine's one GPU route ([docs/hrx.md](docs/hrx.md)), and the CPU from the same llama.cpp build
+- HRX on the Radeon iGPU (AMD's ggml-hrx with our Loom kernels), the engine's one GPU route ([docs/hrx.md](docs/hrx.md)): the whole graph runs on HRX, or the model is refused with the op that would not (strict by default, [docs/serve.md](docs/serve.md#off-hrx-placement-strict-by-default)); `--device cpu` runs the same llama.cpp build on the CPU
 - DwarfStar, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD expert streaming
 - ONNX Runtime GenAI models (Lemonade's ONNX format) on the CPU ([docs/onnx.md](docs/onnx.md))
 - Laya, which decides where each request runs

@@ -34,6 +34,14 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 | `hrx` (and `auto` for GGUF) | `HRX0` | AMD's ggml-hrx: the engine's GPU route |
 | `cpu` | the CPU | the same llama-server with no GPU layers |
 
+On `hrx` the whole graph runs on HRX0 or the model does not load. Since the HRX census closed on
+2026-10-20 (43 of 43 runnable cells, 0 nodes off HRX in every graph), serve runs every HRX backend
+with `GGML_HRX_STRICT=1`: a node HRX would leave on the CPU stops the load (or the request whose
+graph has it) with the node's name, op, type and shape, instead of running slower in silence.
+`--no-strict-device` (or `ONEBIT_STRICT_DEVICE=0`) restores the CPU fallback
+([serve.md](serve.md#off-hrx-placement-strict-by-default)), and the [hardware gate](hw-gate.md)
+fails a pin that leaves a gate model's node off HRX.
+
 ## Pinned sources, kept current
 
 | Submodule | Source | Pinned to |
@@ -812,7 +820,7 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   recurrence already did. Q8_0 `--mtp` now runs clean on prose and code (15.7 / 20.2 tok/s, balanced power
   mode, 85 W); UD-Q4_K_XL `--mtp` speed and output are unchanged (also measured in balanced mode).
 - **`1bit serve --device hrx --parallel N`.** With one KV stream per slot, the K/V tensors are
-  4-D and HRX's flash attention falls back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
+  4-D and HRX's flash attention fell back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
   aggregate, below one stream). serve now passes `-kvu` (one shared KV cache) and turns off AMD's
   Qwen attention path (`qwen.attention`), which derives its mask from positions and let the slots'
   answers bleed into each other under `-kvu`. Qwen3-4B 4 slots: 153 tok/s aggregate (single stream
@@ -838,7 +846,8 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   - IQ1_S: pp512 70.8 -> 81.7 tok/s, tg128 14.1 -> 18.6 (balanced; the first decode run in a process
     includes about 18 s of kernel JIT for the IQ1 grid). IQ1_M: pp512 70.8 -> 80.4, tg128 14.1 -> 18.1.
 
-  Some batched IQ2_XXS matmul shapes are still declined and run on the CPU. Mixed files decode
+  Some batched IQ2_XXS matmul shapes are still declined (not in the 2026-10-20 census); under strict
+  placement, the default, such a shape refuses the load, and `--no-strict-device` runs it on the CPU. Mixed files decode
   slower than pure ones: a SwiGLU gate/up pair whose two formats need different grids shares one
   grid buffer, so it is declined and takes the generic path.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.

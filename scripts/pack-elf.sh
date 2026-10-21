@@ -34,6 +34,14 @@
 #                                   touches a GPU), except PACK_EXTERNAL_LIBS, the TheRock runtime
 #                                   the package documents as a requirement (HIP, hipBLAS(Lt),
 #                                   rocBLAS, HSA: DwarfStar's ds4 links them)
+#   pack_localize_links <dir>       every symlink under <dir> that is absolute or resolves outside
+#                                   <dir> becomes a copy of what it points to; links inside the tree
+#                                   (libggml.so -> libggml.so.0) stay links. Lemonade's build links
+#                                   its web app's KaTeX fonts to the build machine's fonts-katex
+#                                   (/usr/share/fonts/truetype/katex), which a package or 1bit OS
+#                                   does not have (2026-10-21 rehearsal). Fails on a dangling one
+#   pack_outside_links <dir>        prints "<link> -> <target>" for each symlink under <dir> that is
+#                                   absolute, resolves outside <dir>, or dangles
 
 PACK_BUNDLE_LIBS=${PACK_BUNDLE_LIBS:-'libomp.so libomp.so.*'}
 PACK_EXTERNAL_LIBS=${PACK_EXTERNAL_LIBS:-'libamdhip64.so* libhipblas.so* libhipblaslt.so* librocblas.so* libhsa-runtime64.so* librocm_smi64.so* librocsolver.so* libroctx64.so*'}
@@ -99,4 +107,33 @@ pack_missing_libs() {
         done
         [ -z "$miss" ] || echo "${f#"$1"/}:$miss"
     done < <(find "$1" -type f -print0)
+}
+
+# a symlink is "inside" when its target is relative and resolves to an existing path under the
+# tree's top (followed through any chain of links)
+_pack_link_inside() {  # <top (physical)> <link>
+    local t
+    case "$(readlink -- "$2")" in /*) return 1 ;; esac
+    t=$(readlink -e -- "$2") || return 1
+    case "$t" in "$1"/*) return 0 ;; *) return 1 ;; esac
+}
+
+pack_localize_links() {
+    local top l tmp bad=0
+    top=$(cd "$1" && pwd -P)
+    while IFS= read -r -d '' l; do
+        _pack_link_inside "$top" "$l" && continue
+        if [ ! -e "$l" ]; then echo "pack_localize_links: dangling ${l#"$1"/} -> $(readlink -- "$l")" >&2; bad=1; continue; fi
+        tmp="$l.pack-tmp"
+        cp -rL --preserve=mode,timestamps -- "$l" "$tmp" && rm -f -- "$l" && mv -- "$tmp" "$l" || bad=1
+    done < <(find "$1" -type l -print0)
+    return $bad
+}
+
+pack_outside_links() {
+    local top l
+    top=$(cd "$1" && pwd -P)
+    while IFS= read -r -d '' l; do
+        _pack_link_inside "$top" "$l" || echo "${l#"$1"/} -> $(readlink -- "$l")"
+    done < <(find "$1" -type l -print0)
 }

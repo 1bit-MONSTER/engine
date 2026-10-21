@@ -28,7 +28,7 @@ release in the same week gets `.1`.
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, and the NPU engine's runtime (no XRT; the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, and the NPU engine's runtime (no XRT; the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
@@ -136,6 +136,13 @@ amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. Af
 - **Libraries found:** `ldd` (with `ROCR_VISIBLE_DEVICES=-1`) finds every library each packed
   program and library needs, except the TheRock runtime the package documents (HIP, hipBLAS(Lt),
   rocBLAS, HSA, which DwarfStar links).
+- **Links inside:** every symlink in the engine tarball and in the Lemonade + onebit tarball is
+  relative and resolves inside the package (`pack_outside_links`); the `libggml*.so` ->
+  `.so.0` links stay links. Lemonade's build links its web app's KaTeX fonts to the build
+  machine's `/usr/share/fonts/truetype/katex`; the package stage and `os/mini/mkimage.sh` copy
+  every link that points out of the tree as a file (`pack_localize_links`, `scripts/pack-elf.sh`).
+- **Web app:** the Lemonade + onebit tarball carries Lemonade's web app
+  (`bin/resources/web-app/index.html`), the UI `lemond` serves at `/`, as 1bit OS does.
 
 `SHA256SUMS` is written again by the release stage, after `changes.json`, so it covers every file.
 
@@ -170,7 +177,8 @@ rehearsal found these only after the build) and stops with a message naming what
 
 - **bumps, build:** TheRock in `/opt/rocm-therock`, or `-DONEBIT_HRX_TOOLCHAIN=<dir>` in
   `WEEKLY_CMAKE_ARGS`; `hipcc` for DwarfStar, in TheRock or `/opt/rocm`, or `ROCM_PATH`.
-- **package:** `patchelf` (`scripts/package-linux.sh`); a readable kernel image for 1bit OS,
+- **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
+  (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for 1bit OS,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
   The image's licences step copies from the submodules of the run's own checkout (`<workdir>/src`,
   checked out by the build stage), so run `os/mini/mkimage.sh` from there, not from a plain

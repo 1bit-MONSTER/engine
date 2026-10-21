@@ -36,7 +36,7 @@ OpenAI client.
            [--no-mem-check | --mem-check]
            [--watchdog SECS] [--watchdog-prompt-tps N]
            [--strict-device | --no-strict-device] [--placement-report]
-           [--print-backend]
+           [--print-backend | --print-backend-env]
 ```
 
 One model per process:
@@ -255,6 +255,10 @@ two processes (lemond, llama-server) instead of two hops and three.
 Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
 `LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
 the caller's environment does not set already, so a value the user set still wins, as under serve.
+
+`--print-backend-env` prints only `env`, one `NAME=VALUE` line each, for a caller that builds the
+argv itself: `lemonade-hrx`, the stock Lemonade PPA's HRX recipe on Ubuntu 26.04
+([lemonade.md, "Ubuntu 26.04: the PPA's lemond"](lemonade.md#ubuntu-2604-the-ppas-lemond)).
 
 What serve did on the request path is the backend's own on this route:
 

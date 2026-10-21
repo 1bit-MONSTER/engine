@@ -1,0 +1,68 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# lemonade-hrx [llama-server args]: the llama-server stock Lemonade's HRX recipe (llamacpp-hrx)
+# starts, when hrx.hrx_bin (or LEMONADE_HRX_HRX_BIN) names this file (docs/lemonade.md, "Ubuntu
+# 26.04: the PPA's lemond"). It runs the engine's HRX llama-server, with our HIP kernels, on
+# Lemonade's argv, in the environment `1bit serve` gives an HRX backend (strict placement, the
+# TheRock HSA runtime, CWSR placement, ternary decode): `1bit serve --print-backend-env` makes
+# serve's load-time checks (architecture, memory) and prints it. What Lemonade's argv leaves to
+# llama-server's defaults gets serve's values: -ngl 99, --cache-reuse 256, and -kvu with
+# --parallel above 1. A variable already set in the environment wins, as it does under serve.
+#
+# ONEBIT_BIN and ONEBIT_HRX_LLAMA_SERVER override the 1bit and llama-server beside this file.
+set -euo pipefail
+
+here=$(dirname "$(readlink -f "$0")")
+onebit=${ONEBIT_BIN:-$here/1bit}
+server=${ONEBIT_HRX_LLAMA_SERVER:-$here/hrx/llama/bin/llama-server}
+
+args=("$@")
+model='' port='' ctx='' parallel=''
+has() { local a f; for a in "${args[@]}"; do for f in "$@"; do [ "$a" = "$f" ] && return 0; done; done; return 1; }
+for ((i = 0; i < ${#args[@]}; i++)); do
+    v=${args[i + 1]:-}
+    case ${args[i]} in
+        -m | --model) model=$v ;;
+        --port) port=$v ;;
+        -c | --ctx-size) ctx=$v ;;
+        -np | --parallel) parallel=$v ;;
+    esac
+done
+
+# no model (--version, --help): nothing to plan
+[ -n "$model" ] || exec "$server" "$@"
+
+plan=(serve -m "$model" --device hrx --llama-server "$server" --print-backend-env)
+[ -n "$port" ] && plan+=(--port "$port")
+[ -n "$ctx" ] && [ "$ctx" -gt 0 ] 2>/dev/null && plan+=(--ctx-size "$ctx")
+[ -n "$parallel" ] && plan+=(--parallel "$parallel")
+rc=0
+env_lines=$("$onebit" "${plan[@]}") || rc=$?
+if [ "$rc" != 0 ]; then
+    echo "lemonade-hrx: \`1bit ${plan[*]}\` exited $rc (3: the model does not fit; 5: not a llama-server model); not starting llama-server" >&2
+    exit "$rc"
+fi
+while IFS= read -r kv; do
+    case $kv in [A-Za-z_]*=*) export "${kv?}" ;; esac
+done <<<"$env_lines"
+
+extra=()
+has -ngl --gpu-layers --n-gpu-layers || extra+=(-ngl 99)
+has --cache-reuse || extra+=(--cache-reuse 256)
+if [ -n "$parallel" ] && [ "$parallel" -gt 1 ] 2>/dev/null && ! has -kvu --kv-unified; then extra+=(-kvu); fi
+
+exec "$server" "$@" "${extra[@]}"

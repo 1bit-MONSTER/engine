@@ -75,10 +75,20 @@ bad=$(pack_build_rpaths "$stage" "$build")
 [ -z "$bad" ] || { echo "RPATH into the build machine left:"; echo "$bad"; exit 1; }
 
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"
+# the stock Lemonade PPA's lemond (Ubuntu 26.04) runs our HRX llama-server through lemonade-hrx
+# (docs/lemonade.md, "Ubuntu 26.04: the PPA's lemond"); install-lemonade-ppa.sh wires its drop-in
+if [ -x "$stage/hrx/llama/bin/llama-server" ]; then
+    cp "$src/scripts/lemonade-hrx" "$src/scripts/install-lemonade-ppa.sh" "$stage/"
+    mkdir -p "$stage/lemonade"
+    cp "$src/config/lemonade/1bit-hrx.conf" "$stage/lemonade/"
+fi
 cat > "$stage/README.txt" <<EOF
 1bit engine $ver for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/
 
   ./1bit serve -m model.gguf --port 8000      (--device auto: HRX0, else the CPU)
+
+Ubuntu 26.04 with the Lemonade PPA's lemond: sudo ./install-lemonade-ppa.sh
+  (installs to /opt/1bit; lemond's HRX recipe then runs this llama-server)
 
 Keep the directory layout: 1bit finds its backends beside itself.
 HRX needs TheRock in /opt/rocm-therock; the NPU needs the amdxdna

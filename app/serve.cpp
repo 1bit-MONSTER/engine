@@ -2081,17 +2081,14 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
     }
-    // a backend on HRX that runs strict (app/hrx_strict.h): if it dies, say whether ggml-hrx refused a node
-    const bool strict_run = std::any_of(backends.begin(), backends.end(),
-                                        [&](const Launch& b) { return strict_for(o.strict, b.device); }) ||
-                            std::any_of(rag.begin(), rag.end(), [&](const Launch& b) {
-                                return strict_for(o.strict, b.device.substr(0, b.device.find(' ')));
-                            });
+    // Launch::device is "hrx", or "hrx reranking" for a role or RAG server: the device is the first word
+    auto on_device = [](const Launch& b) { return b.device.substr(0, b.device.find(' ')); };
     for (size_t i = 0; i < children.size(); i++) {
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
-            if (strict_run)
-                std::fprintf(stderr, "1bit serve: %s\n", strict_refusal_message(metrics.strict_refusal()).c_str());
+            // a strict HRX backend (app/hrx_strict.h) that refused a node said which; serve says it again
+            if (const std::string why = metrics.strict_refusal(); !why.empty())
+                std::fprintf(stderr, "1bit serve: %s\n", strict_refusal_message(why).c_str());
             else
                 std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
@@ -2101,7 +2098,7 @@ int serve_child(const Options& given) {
     // node off HRX, so a backend that reached ready while its report names off-HRX nodes ignored it.
     if (o.strict == StrictDevice::On || o.placement_report) {
         const bool hrx_run = std::any_of(backends.begin(), backends.end(),
-                                         [](const Launch& b) { return b.device == "hrx"; });
+                                         [&](const Launch& b) { return on_device(b) == "hrx"; });
         const auto report = metrics.placement();
         if (o.strict == StrictDevice::On && report && report->cpu_fallback_total.value_or(0) > 0) {
             std::fprintf(stderr, "1bit serve: %s\n", placement_refusal(*report).c_str());

@@ -73,7 +73,7 @@
   "qwen3.8-27b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 1013178324,
-   "base_sha256": "d2f9a8af3f9d7d13f94b252dce0579c1b53411799578b4bedd5b1f5c64c427a3",
+   "base_sha256": "a31cb56ca9a9f3361cdb9601af2bf219b8d1581761fbab47e91653558e9f32dd",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -86,7 +86,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+    "llama.cpp": "96f81977fc07a75824a7f2108b7a4154154fdb54"
    },
    "text": {
     "file": "wiki.test.raw",

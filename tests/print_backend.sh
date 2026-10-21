@@ -23,7 +23,12 @@
 #   - nothing is started: the fake backend never runs,
 #   - --device hrx: strict placement by default (GGML_HRX_STRICT=1 in env); --no-strict-device,
 #     ONEBIT_STRICT_DEVICE=0 and a GGML_HRX_STRICT the caller set leave it out,
-#   - --print-backend-env prints the same env as NAME=VALUE lines (scripts/lemonade-hrx).
+#   - --print-backend-env prints the same env as NAME=VALUE lines (scripts/lemonade-hrx),
+#   - a GGUF with its own MTP head (<arch>.nextn_predict_layers > 0) drafts with it on hrx
+#     (--spec-type draft-mtp, no -md), as Lemonade's llamacpp recipe does; --no-mtp, ONEBIT_NO_MTP=1,
+#     --device cpu, --parallel 2, --embedding and a file without the key leave it out,
+#   - an hrx chat plan carries "warmup" (serve's warm-up request, for Lemonade to send before the
+#     model counts as loaded); ONEBIT_NO_WARMUP=1, cpu and role servers have none.
 #
 # usage: tests/print_backend.sh path/to/1bit
 set -uo pipefail
@@ -43,10 +48,10 @@ def u32(k, v): return s(k) + struct.pack("<I", 4) + struct.pack("<I", v)
 kv = [s("general.architecture") + struct.pack("<I", 8) + s("qwen3"), u32("qwen3.block_count", 28),
       u32("qwen3.context_length", 40960), u32("qwen3.embedding_length", 1024), u32("qwen3.attention.head_count", 16),
       u32("qwen3.attention.head_count_kv", 8)]
-for name, size in (("huge", 4 << 40), ("small", 0)):
+for name, size, extra in (("huge", 4 << 40, []), ("small", 0, []), ("mtp", 0, [u32("qwen3.nextn_predict_layers", 1)])):
     p = f"{sys.argv[1]}/{name}.gguf"
     with open(p, "wb") as f:
-        f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
+        f.write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv) + len(extra)) + b"".join(kv + extra))
     if size:
         os.truncate(p, size)
 PY
@@ -108,6 +113,38 @@ check "--print-backend-env: NAME=VALUE lines, strict on HRX (exit $rc)" \
 out=$(GGML_HRX_STRICT=0 "$bin" serve -m "$scratch/small.gguf" --device hrx \
       --llama-server "$here/fake_backend.py" --no-mem-check --port 43129 --print-backend-env 2>"$scratch/err"); rc=$?
 check "--print-backend-env: a value the caller set is left out (exit $rc)" '[ "$rc" = 0 ] && ! printf "%s" "$out" | grep -q GGML_HRX_STRICT'
+
+# MTP by default from the model's own head, on hrx (docs/serve.md, "Multi-token prediction")
+mplan() { env -u ONEBIT_NO_MTP -u ONEBIT_NO_WARMUP "$bin" serve -m "$scratch/$1.gguf" --device "$2" \
+          --llama-server "$here/fake_backend.py" --no-mem-check --port 43130 "${@:3}" --print-backend 2>"$scratch/err"; }
+spec() { get '" ".join(d["argv"][i+1] for i, a in enumerate(d["argv"]) if a == "--spec-type") or "-"'; }
+out=$(mplan mtp hrx); rc=$?
+check "hrx plan: own MTP head drafts (exit $rc, --spec-type $(spec))" \
+    '[ "$rc" = 0 ] && [ "$(spec)" = draft-mtp ] && [ "$(get "\"-md\" in d[\"argv\"]")" = False ] && grep -q "own MTP head" "$scratch/err"'
+out=$(mplan mtp hrx --mtp-max 6); rc=$?
+check "hrx plan: --mtp-max applies to the own head" '[ "$rc" = 0 ] && [ "$(get "d[\"argv\"][d[\"argv\"].index(\"--spec-draft-n-max\")+1]")" = 6 ]'
+out=$(mplan mtp hrx --no-mtp); rc=$?
+check "hrx plan: --no-mtp leaves it out (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
+out=$(ONEBIT_NO_MTP=1 "$bin" serve -m "$scratch/mtp.gguf" --device hrx --llama-server "$here/fake_backend.py" \
+      --no-mem-check --port 43131 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: ONEBIT_NO_MTP=1 leaves it out (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
+out=$(mplan small hrx); rc=$?
+check "hrx plan: no MTP head, no drafter (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
+out=$(mplan mtp cpu); rc=$?
+check "cpu plan: no default drafter (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
+out=$(mplan mtp hrx --parallel 2); rc=$?
+check "hrx plan: --parallel 2, no default drafter (exit $rc)" '[ "$rc" = 0 ] && [ "$(spec)" = - ]'
+out=$(mplan mtp hrx --embedding); rc=$?
+check "hrx plan: an embedding server, no drafter and no warmup (exit $rc)" \
+    '[ "$rc" = 0 ] && [ "$(spec)" = - ] && [ "$(get "\"warmup\" in d")" = False ]'
+out=$(mplan small hrx); rc=$?
+check "hrx plan: warmup is serve's request" \
+    '[ "$(get "d[\"warmup\"][\"path\"]")" = /v1/chat/completions ] && [ "$(get "(d[\"warmup\"][\"body\"][\"max_tokens\"], d[\"warmup\"][\"body\"][\"temperature\"], d[\"warmup\"][\"body\"][\"cache_prompt\"])")" = "(8, 0, False)" ]'
+out=$(ONEBIT_NO_WARMUP=1 "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
+      --no-mem-check --port 43132 --print-backend 2>"$scratch/err"); rc=$?
+check "hrx plan: ONEBIT_NO_WARMUP=1, no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d")" = False ]'
+out=$(mplan small cpu); rc=$?
+check "cpu plan: no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d")" = False ]'
 
 if [ -r /proc/meminfo ]; then
     "$bin" serve -m "$scratch/huge.gguf" --device cpu --port 43121 --llama-server "$here/fake_backend.py" \

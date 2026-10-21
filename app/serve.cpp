@@ -153,6 +153,7 @@ struct Options {
     std::string llama_server, hrx_libhsa, ds4;
     bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
     std::string mtp;
+    bool no_mtp = false;  // --no-mtp (or ONEBIT_NO_MTP=1): no drafting from the GGUF's own MTP head (own_mtp_head)
     std::string dflash;  // DFlash block-diffusion draft model for the target
     int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM (-1: auto)
     int moe_prefetch = 0;   // --moe-prefetch N: gate-ahead prefetch N MoE layers ahead (0: off)
@@ -889,6 +890,22 @@ struct Launch {
     bool npu_retry = false;  // an NPU model on onnx: retry a failed non-streamed request once (serve_child)
 };
 
+// A GGUF that carries its own MTP head (<architecture>.nextn_predict_layers > 0: Unsloth's Qwen3.8-27B
+// UD-Q4_K_XL holds it as blk.64.nextn.*) drafts with it by default on HRX. That is what Lemonade's own
+// llamacpp recipe does for a model with the "mtp" label (Lemonade reads the same key): `--spec-type
+// draft-mtp` and no -md, so llama-server loads the head from the model file. Lemonade's standard benchmark
+// (P1, 2026-10-21) had Lemonade's Qwen3.8-27B entry drafting at 24-28 tok/s while the onebit recipe ran it
+// without a drafter at 11-12. Not when another drafter is asked for (--mtp, --dflash), for a role server
+// (--embedding, --reranking), with --parallel > 1 (llama-server drafts per slot; not measured on HRX), or
+// with --no-mtp / ONEBIT_NO_MTP=1.
+bool own_mtp_head(const Options& o, const std::string& device) {
+    if (device != "hrx" || o.no_mtp || !o.mtp.empty() || !o.dflash.empty() || !o.role.empty() || o.parallel > 1)
+        return false;
+    if (const char* e = std::getenv("ONEBIT_NO_MTP"); e && *e && std::string(e) != "0") return false;
+    if (fs::path(o.model).extension() != ".gguf") return false;
+    return gguf_int(o.model, gguf_architecture(o.model) + ".nextn_predict_layers") > 0;
+}
+
 // The backend process for one device: its command line and environment.
 #ifdef ONEBIT_MOE
 uint64_t mem_available() {
@@ -1111,13 +1128,18 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         }
     }
     if (!o.mtp.empty() && !o.dflash.empty()) throw std::runtime_error("--mtp and --dflash are two drafters; pick one");
-    if (!o.mtp.empty() || !o.dflash.empty()) {
+    const bool own_mtp = own_mtp_head(o, device);
+    if (own_mtp)
+        std::fprintf(stderr, "1bit serve: %s carries its own MTP head: drafting with it (--spec-type draft-mtp; "
+                             "--no-mtp or ONEBIT_NO_MTP=1 turns it off)\n", o.model.c_str());
+    if (!o.mtp.empty() || !o.dflash.empty() || own_mtp) {
         // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
         // on the same device; the model checks them in one batch
         const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
         if (device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
         l.mtp = true;
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
+        else if (own_mtp) argv.insert(argv.end(), {"--spec-type", "draft-mtp"});  // the head is in -m (own_mtp_head)
         else argv.insert(argv.end(), {"--spec-type", "draft-dflash", "-md", o.dflash, "-ngld", "99"});
         if (o.mtp_max > 0) { argv.push_back("--spec-draft-n-max"); argv.push_back(std::to_string(o.mtp_max)); }
         // DFlash drafts a whole block per step and only pays with full blocks; llama-server's
@@ -1155,7 +1177,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         facts.device = device;
         facts.architecture = gguf_architecture(o.model);
         facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
-        facts.drafter = !o.dflash.empty() ? "dflash" : !o.mtp.empty() ? "mtp" : "none";
+        facts.drafter = !o.dflash.empty() ? "dflash" : (!o.mtp.empty() || own_mtp) ? "mtp" : "none";
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }
@@ -1479,6 +1501,22 @@ int serve_only(const std::string& why) {
     return kServeOnly;
 }
 
+// The warm-up request (warm_backend, below): HRX only, and ONEBIT_NO_WARMUP=1 turns it off. serve sends it
+// itself; --print-backend hands the same request to Lemonade as the plan's "warmup" ({path, body}), and
+// Lemonade's onebit recipe sends it once the backend is ready, before it marks the model loaded.
+static bool warmup_wanted(const std::string& device) {
+    return getenv("ONEBIT_NO_WARMUP") == nullptr && device.substr(0, device.find(' ')) == "hrx";
+}
+
+static const char* const kWarmupPath = "/v1/chat/completions";
+
+static json warmup_body() {
+    std::string text = "warm up the decode and prefill shapes";
+    for (int i = 0; i < 60; ++i) text += " lorem ipsum dolor sit amet";
+    return json{ { "messages", json::array({ { { "role", "user" }, { "content", text } } }) },
+                 { "temperature", 0 }, { "max_tokens", 8 }, { "cache_prompt", false } };
+}
+
 // --print-backend: the llama-server serve would start for this model, as one JSON line on stdout,
 // after every check serve makes before a load (architecture, memory, recipes). Lemonade starts it
 // on the port it chose (--port) and talks to it directly: one HTTP hop and two processes instead of
@@ -1515,8 +1553,40 @@ int print_backend(const Options& o, const Launch& l) {
     out["port"] = l.port;
     out["argv"] = argv;
     out["env"] = env;
+    // a chat backend on HRX: the request Lemonade sends before it marks the model loaded (warmup_wanted)
+    if (o.role.empty() && warmup_wanted(l.device)) out["warmup"] = json{ { "path", kWarmupPath }, { "body", warmup_body() } };
     std::printf("%s\n", out.dump().c_str());
     return 0;
+}
+
+// The backend's first request after a load pays a one-time cost that is not its steady state. Measured on
+// Qwen3.8-27B (engine main, three fresh loads): request 1 decoded 5 % slower than requests 2-3 (11.72-11.75
+// against 12.41-12.46 tok/s) and prefilled 20 % slower (869-945 against 714-733 ms); on Qwen3-4B with a cold
+// model file request 1 decoded 23 % slower (54.67 against 71-72 tok/s). It is not llama.cpp's warmup
+// (--no-warmup changes nothing), not the GPU ramping (9 s of GPU load before the first request changes
+// nothing) and not prompt caching (measured with cache_prompt off): it is HRX's per-shape command-program
+// build and the first touch of that shape's buffers, paid by whichever request uses the shape first.
+// One synthetic request here moves that cost to load time: with it, the first measured request on the 27B
+// decoded 12.47 tok/s, the same as the later ones. Only the decode shape and this prompt length are covered;
+// a client prompt of another length still builds its own prefill program once (~130-200 ms on the 27B).
+// HRX only, and ONEBIT_NO_WARMUP=1 turns it off.
+static void warm_backend(int port, const std::string& device) {
+    if (!warmup_wanted(device)) {
+        return;
+    }
+    httplib::Client c("127.0.0.1", port);
+    c.set_connection_timeout(5);
+    c.set_read_timeout(600);
+    const auto body = warmup_body().dump();
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r  = c.Post(kWarmupPath, body, "application/json");
+    const long ms = (long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    if (!r || r->status != 200) {
+        std::fprintf(stderr, "1bit serve: warm-up request on port %d failed (%d)\n", port, r ? r->status : -1);
+    } else {
+        std::fprintf(stderr, "1bit serve: warm-up request on port %d took %ld ms\n", port, ms);
+    }
 }
 
 int serve_child(const Options& given) {
@@ -1851,6 +1921,7 @@ int serve_child(const Options& given) {
     });
     // laya: the backends by index, started on first use (under start_mu; a start waits for
     // the backend to be ready, up to 600 s)
+
     std::vector<Child*> started(backends.size(), nullptr);
     auto ensure = [&](size_t i) -> bool {
         std::lock_guard<std::mutex> lock(start_mu);
@@ -1859,6 +1930,7 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
         auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
+        warm_backend(b.port, b.device);
         started[i] = c.get();
         children.push_back(std::move(c));
         return true;
@@ -2099,6 +2171,13 @@ int serve_child(const Options& given) {
             else
                 std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
+        }
+    }
+    // one synthetic request per backend, now that it is ready: the first client request would otherwise pay
+    // the one-time per-shape cost (see warm_backend)
+    if (!laya) {
+        for (size_t i = 0; i < children.size() && i < backends.size(); i++) {
+            warm_backend(children[i]->port(), on_device(backends[i]));
         }
     }
     // engine #390: --strict-device. GGML_HRX_STRICT=1 makes the backend abort at load on the first
@@ -2484,6 +2563,8 @@ void usage(FILE* out) {
                  "                  HRX_ALLOW_NO_SVM=1, which put the CWSR save area in GTT (docs/hrx.md)\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
+                 "                  [--no-mtp]   a GGUF with its own MTP head drafts with it on hrx by default;\n"
+                 "                  this (or ONEBIT_NO_MTP=1) turns that off\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
                  "                  [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   stream MoE experts from the file,\n"
                  "                                    N held in RAM (auto: what fits); R: resident experts stand in for missing\n"
@@ -2568,6 +2649,7 @@ int run_serve(int argc, char** argv) {
             throw std::runtime_error(a + " was removed with the engine's Vulkan and ROCm builds (RFC #213); "
                                      "Lemonade's own llamacpp backend serves Vulkan and ROCm (docs/serve.md)");
         else if (a == "--mtp") o.mtp = next();
+        else if (a == "--no-mtp") o.no_mtp = true;
         else if (a == "--dflash") o.dflash = next();
         else if (a == "--moe-slots") {
             const std::string v = next();

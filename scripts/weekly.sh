@@ -344,11 +344,16 @@ links_ok() {  # links_ok <unpacked dir> <name>
     if [ -z "$out" ]; then echo "ok   every symlink in $2 resolves inside it"; return 0; fi
     echo "FAIL symlinks in $2 that are absolute, point outside it or dangle:"; echo "$out"; return 1
 }
-package_link_checks() {  # package_link_checks <tarball>
-    local t rc=0
+# the Lemonade + onebit tarball: its links stay inside it, and it carries Lemonade's web app (the UI
+# lemond serves at /, built with LEMONADE_WEB_APP=1), as 1bit OS does
+lemonade_package_checks() {  # lemonade_package_checks <tarball>
+    local t rc=0 n
     t=$(mktemp -d)
     tar -C "$t" -xf "$1" --use-compress-program=unzstd
     links_ok "$t" "$(basename "$1")" || rc=1
+    n=$(find "$t" -path '*/bin/resources/web-app/index.html' -type f | wc -l)
+    if [ "$n" != 0 ]; then echo "ok   Lemonade's web app: bin/resources/web-app/index.html and $(find "$t" -path '*/bin/resources/web-app/*' -type f | wc -l) files in $(basename "$1")"
+    else echo "FAIL no Lemonade web app (bin/resources/web-app/index.html) in $(basename "$1")"; rc=1; fi
     rm -rf "$t"
     return $rc
 }
@@ -371,7 +376,8 @@ stage_package() {
     package_checks "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" > "$LOGS/package-checks.log" 2>&1 ||
         { cat "$LOGS/package-checks.log"; return 1; }
     say "package $tag: Lemonade + onebit, with the engine"
-    guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
+    # with Lemonade's web app (node and npm, preflight), the UI lemond serves at /
+    LEMONADE_WEB_APP=1 guard "$SRC/scripts/build-lemonade.sh" "$W/lemonade" > "$LOGS/lemonade-build.log" 2>&1
     rm -rf "$W/lemonade/1bit" && mkdir -p "$W/lemonade/1bit"
     zstd -dc "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" | tar -C "$W/lemonade/1bit" --strip-components=1 -xf -
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
@@ -382,7 +388,7 @@ stage_package() {
     # libggml*.so.0 -> libggml*.so.0.18.0 link in 1bit/hrx/llama/bin pointed into a directory that is not there
     tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/,S" -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \
         -o "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst"
-    package_link_checks "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst" >> "$LOGS/package-checks.log" 2>&1 ||
+    lemonade_package_checks "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst" >> "$LOGS/package-checks.log" 2>&1 ||
         { cat "$LOGS/package-checks.log"; return 1; }
     say "package $tag: 1bit OS"
     rm -rf "$W/os"
@@ -441,6 +447,12 @@ preflight() {
                 # scripts/package-linux.sh rewrites RPATHs with patchelf
                 command -v patchelf > /dev/null ||
                     { echo "preflight: patchelf is not installed (scripts/package-linux.sh needs it): apt install patchelf"; bad=1; }
+                # Lemonade's web app (LEMONADE_WEB_APP=1 scripts/build-lemonade.sh): node and npm, and
+                # the network for its `npm ci`
+                for d in node npm; do
+                    command -v "$d" > /dev/null ||
+                        { echo "preflight: no $d on PATH (Lemonade's web app in the Lemonade + onebit package): install Node.js with npm"; bad=1; }
+                done
                 # os/mini/mkimage.sh reads the kernel image; on Ubuntu /boot/vmlinuz-* is root-only
                 kver=${KVER:-$(uname -r)}
                 vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}

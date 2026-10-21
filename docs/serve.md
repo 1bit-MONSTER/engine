@@ -350,9 +350,13 @@ ggml-hrx checks each graph the scheduler places and aborts on the first node off
 and serve exits non-zero with its own line:
 
 ```
-placement_observer: GGML_HRX_STRICT=1: "attn_out-0" is MUL_MAT f32 ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits
-1bit serve: HRX strict placement refused the model: "attn_out-0" is MUL_MAT f32 ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits. Pass --no-strict-device (or set ONEBIT_STRICT_DEVICE=0) to run those nodes on the CPU instead
+.../ggml-hrx.cpp:447: placement_observer: GGML_HRX_STRICT=1: "kq-0" is MUL_MAT f32 ne=[2,2,12,1] and is not placed on HRX; 12 of 152 nodes off HRX (MUL_MAT x 8, SOFT_MAX x 4), 9 splits
+1bit serve: HRX strict placement refused the model: "kq-0" is MUL_MAT f32 ne=[2,2,12,1] and is not placed on HRX; 12 of 152 nodes off HRX (MUL_MAT x 8, SOFT_MAX x 4), 9 splits. Pass --no-strict-device (or set ONEBIT_STRICT_DEVICE=0) to run those nodes on the CPU instead
 ```
+
+(jina-reranker-v1-tiny-en Q8_0 with `--reranking`, on a llama-server built before the jina-bert
+attention kernels, census gap G10; Strix Halo, 2026-10-20. With `--no-strict-device` the same
+load serves `/v1/rerank`.)
 
 The load, the warmup graph and every later graph are checked. A graph that only a request
 schedules (a `--parallel N` multi-sequence batch, a long prompt) therefore aborts at that request,

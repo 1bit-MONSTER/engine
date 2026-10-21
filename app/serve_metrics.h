@@ -19,6 +19,7 @@
 // these, then appends the backend's own /metrics where it has one.
 #pragma once
 
+#include "hrx_strict.h"
 #include "sysinfo.h"
 
 #include <nlohmann/json.hpp>
@@ -62,8 +63,13 @@ struct BackendLogFacts {
     std::optional<long> placement_nodes;
     std::optional<long> placement_splits;
     size_t              placement_lines = 0;   // placement reports seen; the worst one is kept
+    // ggml-hrx's GGML_HRX_STRICT=1 abort: the refused node, its op, type and shape (app/hrx_strict.h)
+    std::string strict_refusal;
 
     void feed(const std::string& line) {
+        if (strict_refusal.empty()) {
+            if (std::string d = strict_abort_detail(line); !d.empty()) strict_refusal = std::move(d);
+        }
         // every backend line passes here: plain substring tests first, a regex only on a hit
         if (line.find("HRX graph program cache over its limit") != std::string::npos) {
             static const std::regex flush(R"(flush (\d+))");
@@ -220,6 +226,12 @@ public:
         std::lock_guard<std::mutex> l(mu_);
         if (log_.placement_lines == 0) return std::nullopt;
         return log_;
+    }
+
+    // the first GGML_HRX_STRICT=1 abort a backend printed, or ""
+    std::string strict_refusal() const {
+        std::lock_guard<std::mutex> l(mu_);
+        return log_.strict_refusal;
     }
 
     // Prometheus text format 0.0.4

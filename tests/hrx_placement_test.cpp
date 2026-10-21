@@ -16,10 +16,14 @@
 // engine #390's load-time placement report (app/serve_metrics.h): the line ggml-hrx's placement
 // observer prints goes in, serve's own line and the --strict-device refusal come out. No GPU, no
 // backend, no model: the input is the observer's text, which the fork's ggml-hrx.cpp writes.
+#include "hrx_strict.h"
 #include "serve_metrics.h"
 
+#include <algorithm>
 #include <cstdio>
+#include <stdexcept>
 #include <string>
+#include <vector>
 
 static int failures = 0;
 
@@ -126,6 +130,60 @@ int main() {
         f.feed(kAllOnHrx);
         expect(f.cpu_fallback_total && *f.cpu_fallback_total == 20, "a later clean graph keeps the worst");
         expect(f.placement_lines == 3, "three reports seen");
+    }
+
+    {
+        // strict placement is the default on HRX (app/hrx_strict.h); the opt-out restores the fallback
+        using onebit::StrictDevice;
+        auto has = [](const std::vector<std::string>& env, const std::string& kv) {
+            return std::find(env.begin(), env.end(), kv) != env.end();
+        };
+        expect(onebit::strict_for(StrictDevice::Default, "hrx"), "default: strict on hrx");
+        expect(!onebit::strict_for(StrictDevice::Default, "cpu"), "default: not strict on cpu");
+        expect(!onebit::strict_for(StrictDevice::Off, "hrx"), "--no-strict-device: not strict on hrx");
+        expect(onebit::strict_for(StrictDevice::On, "hrx"), "--strict-device: strict on hrx");
+
+        const auto def = onebit::hrx_placement_env(StrictDevice::Default, false);
+        expect(has(def, "GGML_HRX_STRICT=1") && has(def, "GGML_HRX_REPORT=1"),
+               "default env: GGML_HRX_STRICT=1, first-graph report");
+        expect(!onebit::hrx_placement_verbose(StrictDevice::Default, false), "default: no -lv 4");
+        const auto off = onebit::hrx_placement_env(StrictDevice::Off, false);
+        expect(!has(off, "GGML_HRX_STRICT=1") && has(off, "GGML_HRX_REPORT=1"), "opt-out env: no GGML_HRX_STRICT");
+        const auto on = onebit::hrx_placement_env(StrictDevice::On, false);
+        expect(has(on, "GGML_HRX_STRICT=1") && has(on, "GGML_HRX_REPORT=2"), "--strict-device env: strict, every graph");
+        expect(onebit::hrx_placement_verbose(StrictDevice::On, false), "--strict-device: -lv 4");
+        const auto off_report = onebit::hrx_placement_env(StrictDevice::Off, true);
+        expect(!has(off_report, "GGML_HRX_STRICT=1") && has(off_report, "GGML_HRX_REPORT=2") &&
+                   onebit::hrx_placement_verbose(StrictDevice::Off, true),
+               "--no-strict-device --placement-report: counts, no abort");
+
+        expect(onebit::strict_from_env(nullptr) == StrictDevice::Default, "ONEBIT_STRICT_DEVICE unset: default");
+        expect(onebit::strict_from_env("") == StrictDevice::Default, "ONEBIT_STRICT_DEVICE empty: default");
+        expect(onebit::strict_from_env("0") == StrictDevice::Off, "ONEBIT_STRICT_DEVICE=0: off");
+        expect(onebit::strict_from_env("1") == StrictDevice::On, "ONEBIT_STRICT_DEVICE=1: on");
+        bool threw = false;
+        try { (void) onebit::strict_from_env("maybe"); } catch (const std::runtime_error&) { threw = true; }
+        expect(threw, "ONEBIT_STRICT_DEVICE=maybe: refused");
+
+        // ggml-hrx's abort line (GGML_ABORT: file:line: func: message) becomes serve's refusal
+        const std::string abort_line =
+            "/src/ggml/src/ggml-hrx/ggml-hrx.cpp:444: placement_observer: GGML_HRX_STRICT=1: \"attn_out-0\" is "
+            "MUL_MAT f32 ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits";
+        const std::string detail = onebit::strict_abort_detail(abort_line + "\n");
+        expect(detail.rfind("\"attn_out-0\" is MUL_MAT f32 ne=[1024,7,1,1]", 0) == 0 && detail.back() == 's',
+               "abort: detail " + detail);
+        expect(onebit::strict_abort_detail(kOffHrx).empty(), "a report line is not an abort");
+        const std::string msg = onebit::strict_refusal_message(detail);
+        expect(msg.find("MUL_MAT f32 ne=[1024,7,1,1]") != std::string::npos &&
+                   msg.find("--no-strict-device") != std::string::npos &&
+                   msg.find("ONEBIT_STRICT_DEVICE=0") != std::string::npos,
+               "refusal names the op, the shape and the opt-out: " + msg);
+
+        onebit::ServeMetrics metrics("hrx");
+        metrics.backend_line(kAllOnHrx);
+        expect(metrics.strict_refusal().empty(), "serve: no refusal from a clean report");
+        metrics.backend_line(abort_line);
+        expect(metrics.strict_refusal() == detail, "serve: the abort is kept for the exit line");
     }
 
     if (failures == 0) std::printf("hrx_placement: OK\n");

@@ -35,6 +35,7 @@ OpenAI client.
            [--npu-opt KEY=VALUE ...]
            [--no-mem-check | --mem-check]
            [--watchdog SECS] [--watchdog-prompt-tps N]
+           [--strict-device | --no-strict-device] [--placement-report]
            [--print-backend]
 ```
 
@@ -236,7 +237,7 @@ recipe (our fork, branch `1bit/one-hop`) runs serve's command with `--print-back
 
 ```
 $ 1bit serve -m Qwen3-4B-Q4_K_M.gguf --port 8001 --device hrx --alias Qwen3-4B-1bit --print-backend
-{"argv":[".../llama-server","-m","Qwen3-4B-Q4_K_M.gguf","--host","127.0.0.1","--port","8001","--metrics","--device","HRX0","-ngl","99","--jinja","--alias","Qwen3-4B-1bit","--cache-reuse","256"],"device":"hrx","env":{"GGML_HRX_REPORT":"1",...},"port":8001}
+{"argv":[".../llama-server","-m","Qwen3-4B-Q4_K_M.gguf","--host","127.0.0.1","--port","8001","--metrics","--device","HRX0","-ngl","99","--jinja","--alias","Qwen3-4B-1bit","--cache-reuse","256"],"device":"hrx","env":{"GGML_HRX_REPORT":"1","GGML_HRX_STRICT":"1",...},"port":8001}
 ```
 
 serve makes every check it makes before a load (the architecture, [memory](#will-it-fit), the
@@ -264,9 +265,12 @@ What serve did on the request path is the backend's own on this route:
 - **A lost GPU.** llama-server exits with status 1 when ggml-hrx logs `AMDGPU hardware exception`
   (llama.cpp fork, `tools/server/server-device-lost.cpp`; `LLAMA_SERVER_EXIT_ON_DEVICE_LOST=0` keeps
   it up), the same signal serve's #466 exit gave Lemonade.
-- **Placement.** `--strict-device` is `GGML_HRX_STRICT=1` in the backend, which aborts on the first
-  node off HRX. serve's own summary line and `onebit_*` [metrics](#metrics) are not printed on this
-  route; llama-server's `--metrics` still are.
+- **Placement.** Strict placement, the default on `hrx` ([below](#off-hrx-placement-strict-by-default)),
+  is `GGML_HRX_STRICT=1` in the plan's `env`, so the llama-server Lemonade starts aborts on the
+  first node off HRX, naming it, and Lemonade fails the load with that line in its log.
+  `--no-strict-device` (or `ONEBIT_STRICT_DEVICE=0`, or `GGML_HRX_STRICT=0` in lemond's
+  environment) leaves it out. serve's own summary line and `onebit_*` [metrics](#metrics) are not
+  printed on this route; llama-server's `--metrics` still are.
 - **Names.** `--alias` gives replies Lemonade's model name; `reasoning_content` is llama-server's
   own (`--jinja`).
 - **Prefix reuse.** `--cache-reuse 256` lets llama-server shift a cached prefix into place when the
@@ -333,12 +337,37 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 | `--mtp` | HRX0 (it drafts slower there than Vulkan did: its verify batches of 2-4 tokens are the open item, docs/hrx.md) |
 | an H32 file (a Hadamard-rotated Q4_0 stamped `onebit.hadamard_q4_0`) | refused on every device: the format is dropped; use the model's UD-Q4_K_XL or another standard GGUF. PrismML's own rotation (`prism.hadamard`, Ternary Bonsai) is a different thing and still runs on HRX ([hrx.md](hrx.md#ternary-bonsai-prismmls-hadamard-folded-ggufs)) |
 
-### Off-HRX placement: `--placement-report`, `--strict-device`
+### Off-HRX placement: strict by default
 
-Engine #390. HRX can leave part of a graph on the CPU - an op its kernels do not serve, a
-`GET_ROWS` outside the supported range - and the model still answers, slower, with nothing said
-so. The scheduler is the one place that knows the backend of every node, so ggml-hrx reports it
-there (`GGML_HRX_REPORT`, llama.cpp fork #102). serve reads those lines and prints its own:
+Engine #390. HRX could leave part of a graph on the CPU - an op its kernels did not serve, a
+`GET_ROWS` outside the supported range - and the model still answered, slower, with nothing said
+so. The HRX census of 2026-10-20 closed with every runnable cell (43 of 43) all on HRX in every
+graph, so a node off HRX is now a bug to report, not a fallback to take: on `hrx` serve refuses it.
+
+**The default.** Every `hrx` backend serve starts (the model's own, an `--embedding` or
+`--reranking` model, and the `--embed` / `--rerank` servers beside it) gets `GGML_HRX_STRICT=1`.
+ggml-hrx checks each graph the scheduler places and aborts on the first node off HRX, naming it,
+and serve exits non-zero with its own line:
+
+```
+placement_observer: GGML_HRX_STRICT=1: "attn_out-0" is MUL_MAT f32 ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits
+1bit serve: HRX strict placement refused the model: "attn_out-0" is MUL_MAT f32 ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits. Pass --no-strict-device (or set ONEBIT_STRICT_DEVICE=0) to run those nodes on the CPU instead
+```
+
+The load, the warmup graph and every later graph are checked. A graph that only a request
+schedules (a `--parallel N` multi-sequence batch, a long prompt) therefore aborts at that request,
+and serve exits with the same line, so Lemonade sees the backend go. The same holds on the
+[one-hop route](#one-hop-from-lemonade---print-backend): the plan's `env` carries
+`GGML_HRX_STRICT=1`. The default needs no extra log volume: the abort is an error line, and the
+backend keeps its default verbosity. `--device cpu` and the other devices are not affected.
+
+**The opt-out.** `--no-strict-device`, or `ONEBIT_STRICT_DEVICE=0` in serve's environment, leaves
+`GGML_HRX_STRICT` unset, and HRX runs any node it declines on the CPU, as before. A
+`GGML_HRX_STRICT` you set yourself wins over either (`0` off, `1` on), under serve and in the
+one-hop plan.
+
+**`--placement-report`** passes `GGML_HRX_REPORT=2`, so the backend reports **every** graph, and
+serve prints its own line whenever a graph has more nodes off HRX than every graph before it:
 
 ```
 placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4), 7 graph splits
@@ -346,32 +375,30 @@ placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4
 ```
 
 A graph that is all on HRX prints `1bit serve: HRX placement: all 512 nodes on HRX, 1 graph
-splits`. The same numbers are `onebit_cpu_fallback_ops{op}` in [Metrics](#metrics) (`op="all"` is
-the total).
-
-`--placement-report` passes `GGML_HRX_REPORT=2`, so the backend reports **every** graph, and serve
-prints its line again whenever a graph has more nodes off HRX than every graph before it: the line
-is the worst graph so far, with `, worst of N graphs` when more than one reported. This matters
-because the warmup graph is scheduled before any request and is not the model: the 20 Oct census
-found LFM2 `--parallel 4` (20 nodes, 5 splits) and ZAYA1-8B (1-3 nodes) clean in the warmup report
-and split in prompt and multi-sequence graphs. Without `--placement-report` serve keeps
-`GGML_HRX_REPORT=1` (the first graph only), which costs no log volume.
+splits`; with `, worst of N graphs` when more than one reported. The same numbers are
+`onebit_cpu_fallback_ops{op}` in [Metrics](#metrics) (`op="all"` is the total). The warmup graph
+alone is not the model: the census found LFM2 `--parallel 4` (20 nodes, 5 splits) and ZAYA1-8B
+(1-3 nodes) clean in the warmup report and split in prompt and multi-sequence graphs. To see the
+counts for a model that strict mode refuses, pass `--no-strict-device --placement-report`.
+Without `--placement-report` serve keeps `GGML_HRX_REPORT=1` (the first graph only), which costs
+no log volume.
 
 llama-server drops the library's INFO lines below `-lv 4` (an INFO line is a trace line there,
 `common/log.cpp`), so at its default verbosity the report never reaches serve. `--placement-report`
 passes `-lv 4` to the backend for that load, which prints the report along with the rest of
 llama.cpp's INFO lines.
 
-`--strict-device` refuses to start instead of running part of the graph on the CPU: serve sets
-`GGML_HRX_STRICT=1`, and the backend checks every graph it schedules, aborting on the first node off
-HRX with its name, op, type and shape. A graph that is only scheduled by a request (a
-`--parallel N` multi-sequence batch, a long prompt) therefore aborts at that request rather than at
-load. If a report does arrive and names off-HRX nodes, serve refuses with the same numbers. It needs
-`--device hrx` or `auto`.
+**`--strict-device`** is the default plus the report: `GGML_HRX_REPORT=2` and `-lv 4`, and if a
+report arrives and names off-HRX nodes, serve refuses with the same numbers (a backend that
+reached ready despite `GGML_HRX_STRICT`). It needs `--device hrx` or `auto`; `ONEBIT_STRICT_DEVICE=1`
+is the same. It and `--no-strict-device` do not combine.
 
-Both flags only set what the backend already reads, and a `GGML_HRX_REPORT` or `GGML_HRX_STRICT`
-in the environment wins over what serve passes (0 turns either off). `tests/hrx_placement_test.cpp`
-(ctest `hrx_placement`, CI included) covers the line, the summary and the refusal with no GPU.
+Every flag only sets what the backend already reads (llama.cpp fork #102), and a `GGML_HRX_REPORT`
+or `GGML_HRX_STRICT` in the environment wins over what serve passes. `tests/hrx_placement_test.cpp`
+(ctest `hrx_placement`, CI included) covers the report line, the summary, the strict abort line and
+the default and opt-out environments with no GPU, and `tests/print_backend.sh` (ctest
+`print_backend`) the plan's `env`. The [hardware gate](hw-gate.md) fails any gate model with a node
+off HRX.
 
 ### Removed devices and flags
 

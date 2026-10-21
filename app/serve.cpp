@@ -66,6 +66,7 @@
 #include "gguf_meta.h"
 #include "hrx_archs.h"
 #include "hrx_cwsr.h"
+#include "hrx_strict.h"
 #include "mem_admit.h"
 #include "pm.h"
 #include "recipes.h"
@@ -175,7 +176,9 @@ struct Options {
     std::string lemonade_url = "http://127.0.0.1:8000";  // --lemonade-url: the Lemonade that runs the experts
     bool mem_check = true;               // --no-mem-check (or ONEBIT_MEM_CHECK=0): skip the admission check
     bool mem_check_only = false;         // --mem-check: print the estimate and exit (0 fits, 3 does not)
-    bool strict_device = false;          // --strict-device: refuse to start unless every node is on HRX (engine #390)
+    // strict placement on HRX (app/hrx_strict.h): the default refuses a graph with a node off HRX;
+    // --strict-device adds the every-graph report, --no-strict-device / ONEBIT_STRICT_DEVICE=0 lets HRX fall back
+    StrictDevice strict = StrictDevice::Default;
     bool placement_report = false;       // --placement-report: ask the backend for its off-HRX op counts
     bool print_backend = false;          // --print-backend: print the llama-server command and exit (Lemonade one hop)
     WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
@@ -1035,17 +1038,17 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             // engine #390 (docs/serve.md, "Off-HRX placement"): the backend's placement observer
             // prints one line per graph when GGML_HRX_REPORT is set, and refuses the graph with
-            // GGML_HRX_STRICT. Both are off in the backend by default, and a value the user sets in
-            // the environment wins (Child keeps it).
-            // 2 = every graph: the warmup graph alone is not the model (census 2026-10-20, finding 1:
-            // LFM2 --parallel 4 and ZAYA1-8B keep 20 and 3 nodes on the CPU in prompt and
-            // multi-sequence graphs while the warmup report says all on HRX).
-            env.push_back(o.placement_report || o.strict_device ? "GGML_HRX_REPORT=2" : "GGML_HRX_REPORT=1");
-            if (o.strict_device) env.push_back("GGML_HRX_STRICT=1");
+            // GGML_HRX_STRICT. Both are off in the backend by default; serve turns strict on for
+            // every HRX load unless --no-strict-device (app/hrx_strict.h), and a value the user sets
+            // in the environment wins (Child keeps it; --print-backend leaves it out of env).
+            // GGML_HRX_REPORT=2 = every graph: the warmup graph alone is not the model (census
+            // 2026-10-20, finding 1: LFM2 --parallel 4 and ZAYA1-8B kept 20 and 3 nodes on the CPU in
+            // prompt and multi-sequence graphs while the warmup report said all on HRX).
+            for (const auto& e : hrx_placement_env(o.strict, o.placement_report)) env.push_back(e);
             // llama-server drops the library's INFO lines below verbosity 4 (common/log.cpp maps
-            // GGML_LOG_LEVEL_INFO to its trace level), so the report reaches serve only when asked.
-            // both flags read the report, so both need the verbosity that lets it through
-            if (o.placement_report || o.strict_device) argv.insert(argv.end(), {"-lv", "4"});
+            // GGML_LOG_LEVEL_INFO to its trace level), so the report reaches serve only when a flag
+            // reads it; the default strict abort is an error line and needs no verbosity
+            if (hrx_placement_verbose(o.strict, o.placement_report)) argv.insert(argv.end(), {"-lv", "4"});
         }
         // tools/ternary_to_q4_0.py stamped it: HRX0 reads its decode projections at 2.125 bits per weight
         // instead of 4.5 (llama.cpp #54; the upload checks every block and refuses a non-ternary one).
@@ -1185,6 +1188,8 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
         if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty())
             l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
         for (const auto& e : hrx_cwsr_env(o)) l.env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
+        // strict placement, as the model's own backend (app/hrx_strict.h); no report, no -lv 4
+        if (strict_for(o.strict, "hrx")) l.env.push_back("GGML_HRX_STRICT=1");
     } else
         l.argv = {server, "-m", model, "--host", "127.0.0.1", "--port", std::to_string(port),
                   "-ngl", "0", "-c", "8192", "-b", "8192", "-ub", "8192", "-np", "4",
@@ -1478,7 +1483,7 @@ int serve_only(const std::string& why) {
 // on the port it chose (--port) and talks to it directly: one HTTP hop and two processes instead of
 // two and three. What serve added on the request path is the backend's own there: /health answers
 // 503 while the main loop is stalled with work queued (llama.cpp fork #111), so Lemonade's
-// BackendWatchdog resets a hung GPU; --strict-device is GGML_HRX_STRICT in the backend; replies carry
+// BackendWatchdog resets a hung GPU; strict placement (the HRX default) is GGML_HRX_STRICT in the backend; replies carry
 // Lemonade's name through --alias. env holds only what the caller's environment does not set
 // already, so a value the user set still wins, as it does under serve.
 int print_backend(const Options& o, const Launch& l) {
@@ -2076,12 +2081,17 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s)\n", b.argv[2].c_str(), b.device.c_str(), b.argv[0].c_str());
         children.push_back(std::make_unique<Child>(b.argv, b.env, b.port));
     }
+    // a backend on HRX that runs strict (app/hrx_strict.h): if it dies, say whether ggml-hrx refused a node
+    const bool strict_run = std::any_of(backends.begin(), backends.end(),
+                                        [&](const Launch& b) { return strict_for(o.strict, b.device); }) ||
+                            std::any_of(rag.begin(), rag.end(), [&](const Launch& b) {
+                                return strict_for(o.strict, b.device.substr(0, b.device.find(' ')));
+                            });
     for (size_t i = 0; i < children.size(); i++) {
         if (!children[i]->wait_ready(std::chrono::seconds(600), g_stop)) {
             if (g_stop) return 0;
-            if (o.strict_device)
-                std::fprintf(stderr, "1bit serve: --strict-device: a backend refused the graph "
-                                     "(GGML_HRX_STRICT=1); its own line above names the node\n");
+            if (strict_run)
+                std::fprintf(stderr, "1bit serve: %s\n", strict_refusal_message(metrics.strict_refusal()).c_str());
             else
                 std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
@@ -2089,11 +2099,11 @@ int serve_child(const Options& given) {
     }
     // engine #390: --strict-device. GGML_HRX_STRICT=1 makes the backend abort at load on the first
     // node off HRX, so a backend that reached ready while its report names off-HRX nodes ignored it.
-    if (o.strict_device || o.placement_report) {
+    if (o.strict == StrictDevice::On || o.placement_report) {
         const bool hrx_run = std::any_of(backends.begin(), backends.end(),
                                          [](const Launch& b) { return b.device == "hrx"; });
         const auto report = metrics.placement();
-        if (o.strict_device && report && report->cpu_fallback_total.value_or(0) > 0) {
+        if (o.strict == StrictDevice::On && report && report->cpu_fallback_total.value_or(0) > 0) {
             std::fprintf(stderr, "1bit serve: %s\n", placement_refusal(*report).c_str());
             return 1;
         }
@@ -2101,7 +2111,7 @@ int serve_child(const Options& given) {
             // --device auto that landed on the CPU, an NPU directory, ds4: no HRX backend, so no
             // placement report and nothing for either flag to check.
             std::fprintf(stderr, "1bit serve: %s: no HRX backend in this run, nothing to check\n",
-                         o.strict_device ? "--strict-device" : "--placement-report");
+                         o.strict == StrictDevice::On ? "--strict-device" : "--placement-report");
         else if (!report)
             // both --placement-report and --strict-device pass GGML_HRX_REPORT=2 and -lv 4, so a missing
             // line means the backend never spoke, not that the verbosity was wrong
@@ -2235,6 +2245,9 @@ int serve_child(const Options& given) {
     }
 #endif
     std::fprintf(stderr, "1bit serve: a %s backend exited%s%s\n", device.c_str(), how.empty() ? "" : ": ", how.c_str());
+    // a graph only a request schedules (a long prompt, a multi-sequence batch) is checked then
+    if (const std::string why = metrics.strict_refusal(); !why.empty())
+        std::fprintf(stderr, "1bit serve: %s\n", strict_refusal_message(why).c_str());
     return 1;
 }
 
@@ -2497,8 +2510,10 @@ void usage(FILE* out) {
                  "                  [--placement-report]   every graph: the op types HRX placed on the CPU, their\n"
                  "                  counts and the graph split count; prints the worst graph again when a later\n"
                  "                  one has more off HRX (passes -lv 4 to llama-server; engine #390)\n"
-                 "                  [--strict-device]   refuse to start unless the whole graph is on HRX (needs\n"
-                 "                  --device hrx or auto; engine #390)\n"
+                 "                  [--strict-device | --no-strict-device]   on HRX a node that would run on the CPU\n"
+                 "                  refuses the load by default, naming its op and shape; --strict-device adds the\n"
+                 "                  every-graph report (as --placement-report) and checks it; --no-strict-device\n"
+                 "                  (or ONEBIT_STRICT_DEVICE=0) lets HRX leave such nodes on the CPU (engine #390)\n"
                  "                  [--print-backend]   print the llama-server serve would start (argv and env, one\n"
                  "                  JSON line) and exit: 0 printed, 3 does not fit, 5 the route needs serve itself\n"
                  "                  (NPU, ONNX, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
@@ -2514,6 +2529,9 @@ int run_serve(int argc, char** argv) {
     Options o;
     if (const char* e = std::getenv("ONEBIT_MEM_CHECK"); e && std::string(e) == "0") o.mem_check = false;
     if (const char* e = std::getenv("ONEBIT_WATCHDOG_SECS"); e && *e) o.watchdog.secs = std::atof(e);
+    // ONEBIT_STRICT_DEVICE=0 / 1 (app/hrx_strict.h); a flag on the command line wins
+    o.strict = strict_from_env(std::getenv("ONEBIT_STRICT_DEVICE"));
+    bool strict_flag = false, no_strict = false;
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -2571,7 +2589,16 @@ int run_serve(int argc, char** argv) {
         else if (a == "--pm-spawn-url") o.pm_spawn_url = next();
         else if (a == "--no-mem-check") o.mem_check = false;
         else if (a == "--mem-check") o.mem_check_only = true;
-        else if (a == "--strict-device") o.strict_device = true;
+        else if (a == "--strict-device") {
+            if (no_strict) throw std::runtime_error("--strict-device and --no-strict-device: pick one");
+            o.strict = StrictDevice::On;
+            strict_flag = true;
+        }
+        else if (a == "--no-strict-device") {
+            if (strict_flag) throw std::runtime_error("--strict-device and --no-strict-device: pick one");
+            o.strict = StrictDevice::Off;
+            no_strict = true;
+        }
         else if (a == "--placement-report") o.placement_report = true;
         else if (a == "--print-backend") o.print_backend = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
@@ -2583,7 +2610,7 @@ int run_serve(int argc, char** argv) {
     if (o.model.empty()) { usage(stderr); return 2; }
     if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)
         throw std::runtime_error("--watchdog and --watchdog-prompt-tps take a number >= 0 (0 turns it off)");
-    if (o.strict_device && (o.device == "cpu" || o.device == "ds4" || o.device == "onnx" || o.device == "npu"))
+    if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "ds4" || o.device == "onnx" || o.device == "npu"))
         throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend

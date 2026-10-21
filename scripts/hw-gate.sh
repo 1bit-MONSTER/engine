@@ -27,8 +27,11 @@
 #   kld     llama-perplexity --kl-divergence vs stored base logits (512 tokens x 8 chunks)
 #   needle  tests/hrx_long_prompt.py: the 320-record needle (7.1K tokens on Qwen3, 7.4K on ZAYA1;
 #           #319, #369) on Qwen3-0.6B and ZAYA1-8B
+#   placement  every graph the server scheduled for a gate model (load, warmup, the kat prompts,
+#           the needle) is all on HRX: ggml-hrx's placement report (GGML_HRX_REPORT=2, engine #390)
+#           names no node off HRX, as `1bit serve` now requires by default (docs/serve.md)
 #
-#   scripts/hw-gate.sh [--bin DIR] [--phases build,ops,kat,kld,needle] [--models a,b] [--record]
+#   scripts/hw-gate.sh [--bin DIR] [--phases build,ops,kat,kld,needle,placement] [--models a,b] [--record]
 #
 #   --bin DIR   test the llama.cpp binaries in DIR (llama-server, test-backend-ops, llama-perplexity)
 #               instead of building this checkout (the revert test uses it)
@@ -98,7 +101,7 @@ memcheck() {
   python3 "$ROOT/tools/hw_gate_manifest.py" memcheck "$1" "$ROOT/third_party/llama.cpp"
 }
 
-BIN="" PHASES="build,ops,kat,kld,needle" ONLY_MODELS="" MODE=check SERVE_STEP=0
+BIN="" PHASES="build,ops,kat,kld,needle,placement" ONLY_MODELS="" MODE=check SERVE_STEP=0
 while [ $# -gt 0 ]; do
   case "$1" in
     --bin) BIN=$(cd "$2" && pwd); shift 2 ;;
@@ -111,7 +114,7 @@ while [ $# -gt 0 ]; do
       if [ "${1:-}" = --mem ]; then memcheck "$2" || exit 76; shift 2; fi
       exec "$@" ;;
     --serve-step) SERVE_STEP=1; shift; break ;;   # internal: one model's kat (+ needle) inside the lock
-    -h|--help) sed -n '16,40p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+    -h|--help) sed -n '16,43p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "hw-gate: unknown argument $1" >&2; exit 2 ;;
   esac
 done
@@ -123,14 +126,19 @@ export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-$LIBHSA}
 
 # ---- internal: one model in one lock hold: serve it, run kat (and the needle), stop the server,
 # then llama-perplexity for the KLD. Exit bits: 1 kat failed, 4 needle failed, 8 perplexity failed;
-# 3 = the server did not come up.
+# 3 = the server did not come up. The placement verdict is read from the server log afterwards.
 if [ "$SERVE_STEP" = 1 ]; then
-  name=$1 model=$2 repeat=$3 out=$4 needle=$5 dokat=$6 dokld=$7 base=$8
+  name=$1 model=$2 repeat=$3 out=$4 needle=$5 dokat=$6 dokld=$7 base=$8 doplace=${9:-0}
   log=$out/server-$name.log
   rc=0
-  if [ "$dokat" = 1 ] || [ "$needle" = 1 ]; then
-    "$BIN/llama-server" -m "$model" --device HRX0 -ngl 99 --jinja -c 8192 -np 1 \
-      --host 127.0.0.1 --port "$PORT" --no-webui > "$log" 2>&1 &
+  if [ "$dokat" = 1 ] || [ "$needle" = 1 ] || [ "$doplace" = 1 ]; then
+    # placement: the report for every graph (GGML_HRX_REPORT=2) at the verbosity that lets the
+    # library's INFO lines through (-lv 4), and no strict abort, so the gate reports the nodes
+    # instead of losing the kat to a dead server
+    place_env=() place_args=()
+    [ "$doplace" = 1 ] && place_env=(GGML_HRX_REPORT=2 GGML_HRX_STRICT=0) place_args=(-lv 4)
+    env "${place_env[@]}" "$BIN/llama-server" -m "$model" --device HRX0 -ngl 99 --jinja -c 8192 -np 1 \
+      --host 127.0.0.1 --port "$PORT" --no-webui "${place_args[@]}" > "$log" 2>&1 &
     srv=$!
     trap 'kill $srv 2>/dev/null; wait $srv 2>/dev/null' EXIT
     for _ in $(seq 600); do
@@ -151,6 +159,11 @@ if [ "$SERVE_STEP" = 1 ]; then
     fi
     if [ "$needle" = 1 ]; then
       python3 "$ROOT/tests/hrx_long_prompt.py" --url "http://127.0.0.1:$PORT" > "$out/needle-$name.txt" 2>&1 || rc=$((rc | 4))
+    fi
+    if [ "$doplace" = 1 ] && [ "$dokat" = 0 ] && [ "$needle" = 0 ]; then
+      # placement alone: one chat request, so a prompt graph and decode graphs are scheduled too
+      curl -sf "http://127.0.0.1:$PORT/v1/chat/completions" -H 'Content-Type: application/json' \
+        -d '{"messages":[{"role":"user","content":"Name three primary colors."}],"max_tokens":16}' > /dev/null 2>&1 || true
     fi
     date +%s > "$out/t-$name-kat"
     kill $srv 2>/dev/null; wait $srv 2>/dev/null; trap - EXIT
@@ -350,14 +363,15 @@ if has kat || has needle || has kld; then
     dokat=0; has kat && dokat=1
     needle=0; [ "$donee" = 1 ] && has needle && needle=1
     dokld=0; has kld && [ -f "$TEXT" ] && dokld=1
+    doplace=0; has placement && doplace=1
     if [ $dokld = 1 ] && [ "$MODE" = check ] &&
        ! python3 "$ROOT/tools/hw_gate_manifest.py" verify "$GOLDEN/manifest.json" "$name" "$base" "$model" "$TEXT" > "$OUT/kld-$name.verify" 2>&1; then
       result "kld $name" FAIL 0 "$(tail -n 1 "$OUT/kld-$name.verify")"; infra=1; dokld=0
     fi
-    [ $dokat = 0 ] && [ $needle = 0 ] && [ $dokld = 0 ] && continue
+    [ $dokat = 0 ] && [ $needle = 0 ] && [ $dokld = 0 ] && [ $doplace = 0 ] && continue
     t0=$(date +%s)
     rec=(); [ "$MODE" = record ] && rec=(--record)
-    GPU_MODEL=$model gpu "$0" --bin "$BIN" "${rec[@]}" --serve-step "$name" "$model" "$repeat" "$OUT" "$needle" "$dokat" "$dokld" "$base"
+    GPU_MODEL=$model gpu "$0" --bin "$BIN" "${rec[@]}" --serve-step "$name" "$model" "$repeat" "$OUT" "$needle" "$dokat" "$dokld" "$base" "$doplace"
     rc=$?
     secs=$(( $(date +%s) - t0 )) held=$LAST_HOLD
     if [ $rc = 75 ] || [ $rc = 76 ]; then result "model $name" FAIL "$secs" "could not run: lock or memory (rc $rc)"; continue; fi
@@ -374,6 +388,13 @@ if has kat || has needle || has kld; then
     if [ $needle = 1 ]; then
       st=PASS; [ $((rc & 4)) = 4 ] && st=FAIL
       result "needle $name" $st - "$(tail -n 1 "$OUT/needle-$name.txt")"
+    fi
+    if [ $doplace = 1 ]; then
+      # engine #390's report, read the way serve reads it: any graph with a node off HRX fails
+      verdict=$(python3 "$ROOT/tools/hw_gate_manifest.py" placement "$OUT/server-$name.log")
+      prc=$?
+      st=PASS; [ $prc != 0 ] && st=FAIL
+      result "placement $name" $st - "$verdict"
     fi
     if [ $dokld = 1 ]; then
       if [ "$MODE" = record ]; then

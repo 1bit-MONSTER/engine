@@ -44,7 +44,7 @@ the build step (2026-10-20: gpu-kernels be68256d used `HipSetRowsArgs`, which th
 llama.cpp did not have yet), and so does a build whose `libggml-hrx.so` lacks the add-on. A box
 that cannot read gpu-kernels stops with exit 2; `HW_GATE_PRIVATE=0` gates the public plumbing
 only. On a failed build the job log shows the compiler's error lines without their source
-excerpts, since the log is public and the add-on's sources are not. It then runs four checks:
+excerpts, since the log is public and the add-on's sources are not. It then runs five checks:
 
 | check | what | catches |
 |---|---|---|
@@ -52,6 +52,7 @@ excerpts, since the log is public and the add-on's sources are not. It then runs
 | kat | `tools/kat.py check` on five models (below), against `tests/golden/hw-gate/kat-<model>.json` | wrong answers, empty replies, NaN logprobs, nondeterminism, cached-prefix and multi-ubatch bugs, drift from the release pin (#308, #309, #315, #318, #319, #369) |
 | kld | `llama-perplexity --kl-divergence` on wiki.test.raw, 512 tokens x 8 chunks, against base logits stored at the release pin | small numeric drift that greedy answers do not show |
 | needle | `tests/hrx_long_prompt.py`: the 320-record vault-code needle (7.1K tokens on Qwen3, 7.4K on ZAYA1) on Qwen3-0.6B and ZAYA1-8B | #319, #369 |
+| placement | every graph the server scheduled for each model (load, warmup, the kat prompts, the needle) is all on HRX, read from ggml-hrx's placement report | a pin that leaves a node on the CPU, which `1bit serve` now refuses to load by default ([serve.md](serve.md#off-hrx-placement-strict-by-default)) |
 
 The models (`MODEL_TABLE` in the script, files under `~/models`):
 
@@ -76,6 +77,21 @@ KLD thresholds live per model in `tests/golden/hw-gate/manifest.json` (`limits`)
 - the same top token at least 95% of the time.
 
 A rerun at the recording pin gives 0 on every one.
+
+The placement check reuses engine #390's report. The kat server runs with `GGML_HRX_REPORT=2`
+(one line per graph) and `-lv 4` (llama-server drops the library's INFO lines below it), and with
+`GGML_HRX_STRICT=0`, so a node off HRX is counted rather than aborting the server and losing the
+kat. `tools/hw_gate_manifest.py placement` then reads the server log the way serve does:
+
+```
+placement_observer: placement: 512 nodes, 0 off HRX (none), 1 graph splits
+```
+
+Any graph with a node off HRX fails the check, with the worst graph's counts and op types
+(`20 of 354 nodes off HRX (MUL_MAT x 20), 5 graph splits; 1 of 41 graphs had nodes off HRX`). A
+log with no report at all fails too: the check saw nothing. With `--phases placement` alone the
+server answers one short chat request instead of the kat, so a prompt graph and decode graphs are
+scheduled. The judge's verdicts are in `tests/hw_gate_test.py` (ctest `hw_gate_judges`).
 
 One `test-backend-ops` case is a known intermittent failure (KNOWN-ISSUES.md, engine#370:
 `MUL_MAT(type_a=f32,type_b=f32,m=1,n=1,k=2048)`, about 1 run in 40). When that is the only

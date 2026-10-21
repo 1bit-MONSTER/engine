@@ -1519,6 +1519,39 @@ int print_backend(const Options& o, const Launch& l) {
     return 0;
 }
 
+// The backend's first request after a load pays a one-time cost that is not its steady state. Measured on
+// Qwen3.8-27B (engine main, three fresh loads): request 1 decoded 5 % slower than requests 2-3 (11.72-11.75
+// against 12.41-12.46 tok/s) and prefilled 20 % slower (869-945 against 714-733 ms); on Qwen3-4B with a cold
+// model file request 1 decoded 23 % slower (54.67 against 71-72 tok/s). It is not llama.cpp's warmup
+// (--no-warmup changes nothing), not the GPU ramping (9 s of GPU load before the first request changes
+// nothing) and not prompt caching (measured with cache_prompt off): it is HRX's per-shape command-program
+// build and the first touch of that shape's buffers, paid by whichever request uses the shape first.
+// One synthetic request here moves that cost to load time: with it, the first measured request on the 27B
+// decoded 12.47 tok/s, the same as the later ones. Only the decode shape and this prompt length are covered;
+// a client prompt of another length still builds its own prefill program once (~130-200 ms on the 27B).
+// HRX only, and ONEBIT_NO_WARMUP=1 turns it off.
+static void warm_backend(int port, const std::string& device) {
+    if (getenv("ONEBIT_NO_WARMUP") != nullptr || device.substr(0, device.find(' ')) != "hrx") {
+        return;
+    }
+    httplib::Client c("127.0.0.1", port);
+    c.set_connection_timeout(5);
+    c.set_read_timeout(600);
+    std::string text = "warm up the decode and prefill shapes";
+    for (int i = 0; i < 60; ++i) text += " lorem ipsum dolor sit amet";
+    const auto body = json{ { "messages", json::array({ { { "role", "user" }, { "content", text } } }) },
+                            { "temperature", 0 }, { "max_tokens", 8 }, { "cache_prompt", false } }.dump();
+    const auto t0 = std::chrono::steady_clock::now();
+    const auto r  = c.Post("/v1/chat/completions", body, "application/json");
+    const long ms = (long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                        std::chrono::steady_clock::now() - t0).count();
+    if (!r || r->status != 200) {
+        std::fprintf(stderr, "1bit serve: warm-up request on port %d failed (%d)\n", port, r ? r->status : -1);
+    } else {
+        std::fprintf(stderr, "1bit serve: warm-up request on port %d took %ld ms\n", port, ms);
+    }
+}
+
 int serve_child(const Options& given) {
     Options o = given;
     if (hadamard_q4_0(o.model))
@@ -1851,6 +1884,7 @@ int serve_child(const Options& given) {
     });
     // laya: the backends by index, started on first use (under start_mu; a start waits for
     // the backend to be ready, up to 600 s)
+
     std::vector<Child*> started(backends.size(), nullptr);
     auto ensure = [&](size_t i) -> bool {
         std::lock_guard<std::mutex> lock(start_mu);
@@ -1859,6 +1893,7 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s on %s (%s), picked by laya\n", id.c_str(), b.device.c_str(), b.argv[0].c_str());
         auto c = std::make_unique<Child>(b.argv, b.env, b.port, b.ready_path, backend_line, b.env_override);
         if (!c->wait_ready(std::chrono::seconds(600), g_stop)) return false;
+        warm_backend(b.port, b.device);
         started[i] = c.get();
         children.push_back(std::move(c));
         return true;
@@ -2099,6 +2134,13 @@ int serve_child(const Options& given) {
             else
                 std::fprintf(stderr, "1bit serve: backend %zu did not become ready\n", i);
             return 1;
+        }
+    }
+    // one synthetic request per backend, now that it is ready: the first client request would otherwise pay
+    // the one-time per-shape cost (see warm_backend)
+    if (!laya) {
+        for (size_t i = 0; i < children.size() && i < backends.size(); i++) {
+            warm_backend(children[i]->port(), on_device(backends[i]));
         }
     }
     // engine #390: --strict-device. GGML_HRX_STRICT=1 makes the backend abort at load on the first

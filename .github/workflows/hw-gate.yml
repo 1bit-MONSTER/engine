@@ -44,9 +44,9 @@ on:
         required: true
         default: main
       phases:
-        description: "Phases to run (build,ops,kat,kld,needle)"
+        description: "Phases to run (build,ops,kat,kld,needle,placement)"
         required: false
-        default: build,ops,kat,kld,needle
+        default: build,ops,kat,kld,needle,placement
 
 permissions:
   contents: read
@@ -95,7 +95,7 @@ jobs:
         id: gate
         env:
           HW_GATE_OUT: ${{ runner.temp }}/hw-gate
-          PHASES: ${{ inputs.phases || 'build,ops,kat,kld,needle' }}
+          PHASES: ${{ inputs.phases || 'build,ops,kat,kld,needle,placement' }}
         run: scripts/hw-gate.sh --phases "$PHASES"
 
       - name: Logs of failed checks

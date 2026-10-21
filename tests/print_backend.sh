@@ -22,7 +22,8 @@
 #   - a model that does not fit exits 3, as serve does,
 #   - nothing is started: the fake backend never runs,
 #   - --device hrx: strict placement by default (GGML_HRX_STRICT=1 in env); --no-strict-device,
-#     ONEBIT_STRICT_DEVICE=0 and a GGML_HRX_STRICT the caller set leave it out.
+#     ONEBIT_STRICT_DEVICE=0 and a GGML_HRX_STRICT the caller set leave it out,
+#   - --print-backend-env prints the same env as NAME=VALUE lines (scripts/lemonade-hrx).
 #
 # usage: tests/print_backend.sh path/to/1bit
 set -uo pipefail
@@ -100,6 +101,13 @@ out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/s
 check "cpu plan: no strict placement (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of GGML_HRX_STRICT)" = - ]'
 "$bin" serve -m "$scratch/small.gguf" --device hrx --strict-device --no-strict-device --print-backend >"$scratch/out" 2>"$scratch/err"; rc=$?
 check "--strict-device with --no-strict-device is refused (exit $rc)" '[ "$rc" != 0 ] && grep -q "pick one" "$scratch/err"'
+out=$(env -u GGML_HRX_STRICT -u ONEBIT_STRICT_DEVICE "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43128 --print-backend-env 2>"$scratch/err"); rc=$?
+check "--print-backend-env: NAME=VALUE lines, strict on HRX (exit $rc)" \
+    '[ "$rc" = 0 ] && printf "%s\n" "$out" | grep -qx GGML_HRX_STRICT=1 && ! printf "%s" "$out" | grep -q "[{}]"'
+out=$(GGML_HRX_STRICT=0 "$bin" serve -m "$scratch/small.gguf" --device hrx \
+      --llama-server "$here/fake_backend.py" --no-mem-check --port 43129 --print-backend-env 2>"$scratch/err"); rc=$?
+check "--print-backend-env: a value the caller set is left out (exit $rc)" '[ "$rc" = 0 ] && ! printf "%s" "$out" | grep -q GGML_HRX_STRICT'
 
 if [ -r /proc/meminfo ]; then
     "$bin" serve -m "$scratch/huge.gguf" --device cpu --port 43121 --llama-server "$here/fake_backend.py" \

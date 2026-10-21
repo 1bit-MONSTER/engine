@@ -125,6 +125,65 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 `echo` and generation parameters are skipped, because Lemonade's own llamacpp recipe
 declares neither.
 
+## Ubuntu 26.04: the PPA's lemond
+
+On Ubuntu 26.04 Lemonade installs from its PPA, and that `lemond` (2026.42.1~26.04) is upstream's,
+with no `onebit` recipe. The fork's Debian 13 `.deb` does not install there either: it depends
+on `libcpp-httplib0.41`, which 26.04 does not have. So on 26.04 the engine plugs into the stock
+`lemond` through the HRX recipe it already has, `llamacpp-hrx`, with no patch to Lemonade:
+
+- `lemond` looks for that recipe's `llama-server` in `LEMONADE_HRX_HRX_BIN`, then in `hrx.hrx_bin`
+  in its `config.json`. A path there skips its download of its own HRX build.
+- The engine package's systemd drop-in, `lemonade/1bit-hrx.conf`
+  ([config/lemonade/1bit-hrx.conf](../config/lemonade/1bit-hrx.conf)), sets
+  `LEMONADE_HRX_HRX_BIN` to `lemonade-hrx` in the package.
+- `lemonade-hrx` ([scripts/lemonade-hrx](../scripts/lemonade-hrx)) runs the package's HRX
+  `llama-server`, with our HIP kernels, on Lemonade's arguments. First it runs
+  `1bit serve --print-backend-env`, which makes serve's load-time checks (architecture, memory)
+  and prints the environment serve gives an HRX backend: strict placement (`GGML_HRX_STRICT=1`),
+  TheRock's HSA runtime, CWSR placement (engine#315) and the ternary decode. It also fills in
+  what Lemonade's arguments leave to llama-server's defaults with serve's values: `-ngl 99`,
+  `--cache-reuse 256`, and `-kvu` above `--parallel 1`. A variable already set in `lemond`'s
+  environment wins, as it does under serve.
+
+To install:
+
+```sh
+sudo add-apt-repository ppa:lemonade-team/stable
+sudo apt install lemonade-server
+tar -I zstd -xf 1bit-<version>-linux-x86_64.tar.zst
+sudo 1bit-<version>-linux-x86_64/install-lemonade-ppa.sh      # to /opt/1bit; restarts lemond
+```
+
+`install-lemonade-ppa.sh` ([scripts/install-lemonade-ppa.sh](../scripts/install-lemonade-ppa.sh))
+copies the package to `/opt/1bit` (or the directory it is given, outside `/home`, since the
+service runs with `ProtectHome=yes`). It writes the drop-in to
+`/etc/systemd/system/lemond.service.d/1bit-hrx.conf` and reloads systemd. If the PPA's postinst
+did not already add the `lemonade` user to `render`, the script does. HRX also needs TheRock in
+`/opt/rocm-therock` ([hrx.md](hrx.md)).
+
+To run `lemond` as yourself instead of as the service, set the same variable for it
+(`LEMONADE_HRX_HRX_BIN=/opt/1bit/lemonade-hrx lemond`) or put the path in `hrx.hrx_bin` in its
+`config.json`.
+
+Lemonade's HRX catalog (the `*-HRX` models) then runs on the engine, and so does a GGUF you
+register with `recipe: "llamacpp-hrx"`. Per-model arguments go in Lemonade's `hrx_args`, except
+the ones Lemonade sets itself (`-m`, `--ctx-size`, `--device`, `--port`, `--jinja`,
+`--metrics`). NPU model directories, ONNX, DwarfStar, `--pm` and `--laya` are not
+llama-server, so they stay with `/opt/1bit/1bit serve` ([serve.md](serve.md)), outside the stock
+`lemond`.
+
+[scripts/check-ubuntu-2604-lemond.sh](../scripts/check-ubuntu-2604-lemond.sh) runs this whole path
+in a clean `ubuntu:26.04` container: PPA, package, a model registered with `llamacpp-hrx`, a load
+and a chat completion. It passes when `lemond` started `lemonade-hrx` rather than installing its
+own HRX build, and when the `llama-server` it ran has `GGML_HRX_STRICT=1`. Without `--gpu` it
+needs no GPU: a stand-in records the `llama-server` command and environment, then runs Ubuntu's
+CPU llama.cpp. On Strix Halo, `--gpu` runs the real one on HRX0:
+
+```sh
+scripts/check-ubuntu-2604-lemond.sh out/1bit-<version>-linux-x86_64.tar.zst ~/models/Qwen3-0.6B-Q4_K_M.gguf --gpu
+```
+
 ## Vulkan, ROCm, Metal and CUDA are Lemonade's
 
 On the GPU the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, 2026-10-01: HRX + NPU only; the

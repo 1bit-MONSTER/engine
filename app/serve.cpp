@@ -181,6 +181,7 @@ struct Options {
     StrictDevice strict = StrictDevice::Default;
     bool placement_report = false;       // --placement-report: ask the backend for its off-HRX op counts
     bool print_backend = false;          // --print-backend: print the llama-server command and exit (Lemonade one hop)
+    bool print_backend_env = false;      // --print-backend-env: only its environment, NAME=VALUE lines (lemonade-hrx)
     WatchdogConfig watchdog;             // --watchdog SECS, --watchdog-prompt-tps N (app/serve_watchdog.h)
     CwsrPlacement cwsr_placement = CwsrPlacement::Auto;  // --hrx-cwsr-placement (app/hrx_cwsr.h, engine#315)
 };
@@ -1503,6 +1504,12 @@ int print_backend(const Options& o, const Launch& l) {
         const std::string key = e.substr(0, eq);
         if (!std::getenv(key.c_str())) env[key] = e.substr(eq + 1);
     }
+    if (o.print_backend_env) {
+        // --print-backend-env: the same environment as NAME=VALUE lines, for a caller that starts the
+        // backend with an argv of its own (lemonade-hrx: stock Lemonade's HRX recipe, docs/lemonade.md)
+        for (const auto& [key, value] : env.items()) std::printf("%s=%s\n", key.c_str(), value.get<std::string>().c_str());
+        return 0;
+    }
     json out = json::object();
     out["device"] = l.device;
     out["port"] = l.port;
@@ -2515,6 +2522,8 @@ void usage(FILE* out) {
                  "                  JSON line) and exit: 0 printed, 3 does not fit, 5 the route needs serve itself\n"
                  "                  (NPU, ONNX, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
                  "                  it directly, one hop (docs/serve.md)\n"
+                 "                  [--print-backend-env]   as --print-backend, but only the environment, one\n"
+                 "                  NAME=VALUE line each (lemonade-hrx, stock Lemonade's HRX recipe: docs/lemonade.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
                  "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           or a .gguf file\n");
@@ -2598,6 +2607,7 @@ int run_serve(int argc, char** argv) {
         }
         else if (a == "--placement-report") o.placement_report = true;
         else if (a == "--print-backend") o.print_backend = true;
+        else if (a == "--print-backend-env") o.print_backend = o.print_backend_env = true;
         else if (a == "--watchdog") o.watchdog.secs = std::stod(next());
         else if (a == "--watchdog-prompt-tps") o.watchdog.prompt_tps = std::stod(next());
         else if (a == "--lemonade-url") o.lemonade_url = next();

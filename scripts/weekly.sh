@@ -356,7 +356,9 @@ stage_package() {
     rm -rf "$W/lemonade/1bit" && mkdir -p "$W/lemonade/1bit"
     zstd -dc "$W/engine-pkg/1bit-$tag-linux-x86_64.tar.zst" | tar -C "$W/lemonade/1bit" --strip-components=1 -xf -
     install -m 755 "$SRC/scripts/lemond-onebit.sh" "$W/lemonade/lemond-onebit"
-    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/," -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \
+    # the S flag: member names only; GNU tar otherwise rewrites symlink targets too, and every
+    # libggml*.so.0 -> libggml*.so.0.18.0 link in 1bit/hrx/llama/bin pointed into a directory that is not there
+    tar -C "$W/lemonade" --transform "s,^,lemonade-onebit-$tag/,S" -cf - bin 1bit lemond-onebit | zstd -q -T4 -19 \
         -o "$OUT/lemonade-onebit-$tag-linux-x86_64.tar.zst"
     say "package $tag: 1bit OS"
     rm -rf "$W/os"

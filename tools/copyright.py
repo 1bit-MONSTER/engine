@@ -33,7 +33,7 @@ LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment",
-      "*.service", "*.timer", "Dockerfile", "*.Dockerfile"), "#"),
+      "*.service", "*.timer", "*.conf", "lemonade-hrx", "Dockerfile", "*.Dockerfile"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 

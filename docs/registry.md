@@ -34,7 +34,7 @@ hand:
 |---|---|
 | HF -> GGUF | a `@ModelBase.register(...)` class in our HRX fork's llama.cpp converter names it |
 | `hrx` | the GGUF architecture is in our HRX fork's `src/llama-arch.cpp`; the same llama-server runs it on the CPU (`--device cpu`), so `hrx` also means the CPU route |
-| `npu` | the fast lane's model type: `qwen3` (the lane kernels are built for Qwen3-0.6B's shapes) |
+| `npu` | the NPU engine's model type: `qwen3` (its kernels are built for Qwen3-0.6B's shapes) |
 
 The `vulkan` column (the upstream llama.cpp release the engine built for Vulkan) left with that
 build in RFC #213 stage 3. With it went the HF class names only the upstream

@@ -16,9 +16,10 @@ limitations under the License.
 -->
 # HRX on the Radeon iGPU
 
-On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prompts at 335 tok/s and
-decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
-and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
+HRX runs every graph node of every model and mode we test on the Strix Halo GPU: 43 of 43
+configurations, with 0 nodes on the CPU. That is the 2026-10-20 census (#476, #480, #481). HRX is
+AMD's ggml-hrx with its Loom kernels, plus our HIP kernels. Qwen3.8-27B with MTP decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose /
+short chats (#487), and ZAYA1-8B at about 90 tok/s. HRX is the engine's one GPU route.
 
 It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
 backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
@@ -686,9 +687,9 @@ cmake --build build --target onebit
 
 ### Private HIP kernels
 
-Our own HIP kernels for HRX are closed source, like the NPU kernels: they live in the private
-`1bit-MONSTER/gpu-kernels` repository (`addons/hip-hrx`). The llama.cpp fork keeps only the
-public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>`
+Our own HIP kernels for HRX are closed source, like the NPU kernels: they live in a private
+repository, as an add-on (`addons/hip-hrx`). The llama.cpp fork keeps only the
+public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<add-on checkout>`
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
 that hook. Without the option the build is unchanged. The release builds with it, from the
@@ -807,8 +808,11 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   KLD against CPU logits 0.00167 (AMD kernels 0.00318). #46 adds 2-8 token variants for speculative
   verify batches: Qwen3.8-27B with its MTP head (`1bit serve --mtp`, draft 3, p-min 0.75) decodes
   22.5 / 17.7 / 19.0 tok/s on code / prose / translation prompts (was 20.1 / 16.4 / 17.6; Vulkan
-  34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still costs ~1.7x a 1-token
-  step (f32 multiply-adds per token); int8 activations, as Vulkan does, are the next step.
+  34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still cost ~1.7x a 1-token
+  step (f32 multiply-adds per token). Since #487 our HIP kernels run 2 to 8 drafted tokens on q8_1
+  activations, reading each weight block once for every token: the 4-token verify step went from
+  121.5 to 88.0 ms, and the 27B decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose / short
+  (from 25.9 / 20.5 / 21.9).
 - **NaN after an MTP rollback on Qwen3.5/3.8
   ([llama.cpp #52](https://github.com/1bit-MONSTER/llama.cpp/pull/52)).** With `--mtp`, the gated
   delta-net kernel publishes one recurrent-state snapshot per verify token so a rejected draft can

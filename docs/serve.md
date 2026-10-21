@@ -16,10 +16,12 @@ limitations under the License.
 -->
 # `1bit serve`: the engine behind one OpenAI-compatible API
 
-The engine runs inside Lemonade ([lemonade.md](lemonade.md)): Lemonade runs
-`1bit serve` as a backend, the way it runs `llama-server`. `1bit serve` exposes
-nothing but an OpenAI-compatible API, so it also works on its own with any
-OpenAI client.
+The engine runs inside Lemonade ([lemonade.md](lemonade.md)) as a backend, the way Lemonade runs
+`llama-server`. Lemonade runs `1bit serve`, and for a GGUF it starts the `llama-server` that serve
+names, one HTTP hop ([below](#one-hop-from-lemonade---print-backend)).
+On HRX the whole graph runs on the GPU or the model does not load: 43 of 43 configurations in the
+2026-10-20 census had 0 nodes off HRX. `1bit serve` exposes nothing but an OpenAI-compatible API,
+so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
@@ -323,9 +325,9 @@ without a GPU.
 
 | Model | `--device` | Runs on |
 |---|---|---|
-| NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
-| Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | the private NPU route, in process, in builds with `-DONEBIT_NPU_PRIVATE` (docs/npu.md, "Private routes") |
-| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md), `--mtp` included. Since the HRX prompt-matmul routing (llama.cpp fork #55), prompts on HRX run at pp512 335 tok/s on Qwen3.8-27B UD-Q4_K_XL (was 97-99), and a 14K-token prompt through `serve` at 265 tok/s (was 91). `auto` exceptions: below |
+| NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU engine, in process (in progress) |
+| Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | a closed NPU add-on route, in process, in builds with `-DONEBIT_NPU_PRIVATE` ([npu.md](npu.md#add-on-routes)) |
+| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
 | DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 
@@ -338,7 +340,7 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 | `--moe-slots` | refused: not in this build ([below](#moe-models-larger-than-memory-not-in-this-build)) |
 | `--parallel N` > 1 on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) | HRX0 with one slot, and a warning on stderr: HRX runs one such sequence at a time (no multi-sequence delta-net yet). `--device cpu` keeps `--parallel N` |
 | `--mmproj` | HRX0. **Unverified:** vision on HRX is an open RFC #213 gate, to be checked on ZAYA1-VL; if it fails there, `auto` goes back to the CPU for `--mmproj` |
-| `--mtp` | HRX0 (it drafts slower there than Vulkan did: its verify batches of 2-4 tokens are the open item, docs/hrx.md) |
+| `--mtp` | HRX0: Qwen3.8-27B decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose / short with the default draft length (#487; [below](#multi-token-prediction---mtp)) |
 | an H32 file (a Hadamard-rotated Q4_0 stamped `onebit.hadamard_q4_0`) | refused on every device: the format is dropped; use the model's UD-Q4_K_XL or another standard GGUF. PrismML's own rotation (`prism.hadamard`, Ternary Bonsai) is a different thing and still runs on HRX ([hrx.md](hrx.md#ternary-bonsai-prismmls-hadamard-folded-ggufs)) |
 
 ### Off-HRX placement: strict by default
@@ -431,10 +433,8 @@ went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min
 the H32 format it served (`tools/hadamard_q4_0.py` is removed; serve refuses those files). `--dflash`
 itself stays, on HRX and the CPU.
 
-A build without the private add-on answers a Qwen3.6-35B-A3B directory with "the
-Qwen3.6-35B-A3B NPU route is not part of this build; build with
--DONEBIT_NPU_PRIVATE=<npu-kernels checkout>". `--npu-opt KEY=VALUE` passes an option
-through to a private route. On a route that keeps its cache between requests,
+A build without the add-on answers a Qwen3.6-35B-A3B directory saying that its NPU route is not
+part of this build. `--npu-opt KEY=VALUE` passes an option through to an add-on route. On a route that keeps its cache between requests,
 `usage.prompt_tokens_details.cached_tokens` counts the reused prompt tokens and
 `timings.cache` says where they came from. On the NPU a streamed request with
 `stream_options.include_usage` gets a last chunk with `usage` and `timings`, as OpenAI's
@@ -499,11 +499,16 @@ own MTP head (Unsloth ships it as `MTP/mtp-<model>-*.gguf`) drafts tokens on the
 device, and the model checks them in one batch. `--mtp-max N` caps the draft length;
 `--mtp-p-min P` drafts a token only when the head is at least that sure of it.
 It works on the llama.cpp devices (`hrx`, `cpu`), and `--device auto` keeps it on HRX0.
-A drafted token is kept only when the model agrees, so the output is the model's own. HRX's MTP
-numbers are in [hrx.md](hrx.md) ("Not yet": Qwen3.8-27B with its Q4_0 MTP head).
+A drafted token is kept only when the model agrees, so the output is the model's own.
 
-The measurements below were taken on the removed Vulkan build (2026-09-24) and are kept for the
-settings they found; re-measure on HRX before relying on the speeds. The sweep (draft length x
+On HRX, Qwen3.8-27B UD-Q4_K_XL with its MTP head (default draft length 3, greedy 256-token chats,
+medians of 3 fresh servers) decodes at **36.0 / 26.8 / 29.9 tok/s** on code / prose / short, up
+from 25.9 / 20.5 / 21.9, since our HIP kernels check 2 to 8 drafted tokens in one pass: the 4-token
+verify step went from 121.5 to 88.0 ms ([#487](https://github.com/1bit-MONSTER/engine/pull/487)).
+Without MTP it decodes at 12.15 tok/s (tg128, [hrx.md](hrx.md#not-yet)).
+
+The sweep below was taken on the removed Vulkan build (2026-09-24) and is kept for the settings it
+found; it has not been repeated on HRX. The sweep (draft length x
 `--mtp-p-min`, code / prose / short; 12.2 / 12.3 / 12.3 without MTP):
 
 | Setting | tok/s | Drafts accepted |
@@ -718,10 +723,10 @@ streaming:
 
 | Device | Result |
 |---|---|
-| `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory on the fast lane |
+| `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory |
 | `hrx` | PASS (32 SSE chunks), with no environment set up |
 
-Qwen3.6-35B-A3B on the NPU is tested by the private add-on (docs/npu.md, "Private routes").
+Qwen3.6-35B-A3B on the NPU is tested by its add-on ([npu.md](npu.md#add-on-routes)).
 Without it, `serve` on that directory exits with the message above.
 
 (The `vulkan` row, PASS with 32 SSE chunks, went with the Vulkan build, and the `zinc` row, PASS

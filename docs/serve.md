@@ -794,3 +794,21 @@ ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`, and in general `serve_e2e_<devic
 `/v1/models`, the reply rename, SSE relay), that no backend outlives a
 SIGKILLed `serve`, and that a backend that exits on its own ends `serve` at once.
 `watchdog_serve` runs everywhere too (see "When a backend hangs").
+
+## `--precise`: a follow-up turn is bitwise identical to a cold run
+
+A follow-up turn in the same conversation is not bit-identical to a cold run of that conversation. The
+follow-up continues from the KV cache and prefills only its new user message (28 tokens in the test below),
+where a cold run prefills the conversation in 512-token ubatches - and HRX picks a different kernel family for a
+different token count (generic post-ops for 16 < T < 128, the WMMA prefill tiles for T >= 128), with a different
+activation quantisation, split-K and combine tree, so the last bits differ and a near-tie flips. Measured on
+2026-10-22, 10 greedy two-turn chats per model, follow-up against a cold run of the same conversation.
+
+`--precise` (or `ONEBIT_PRECISE=1`) makes every request re-prefill its whole conversation, which is exactly the
+path a cold run takes: with it, 10/10 chats came out identical on Qwen3.8-27B and 9/10 on Qwen3-4B (the
+remaining 4B difference is at a 0.0385-nat tie with both arms prefilling the same tokens, i.e. a question about
+that path's determinism rather than about batch size). The cost is the full time-to-first-token of the
+conversation on every turn instead of only the new tokens: on the 27B a follow-up goes from 672 ms to 4785 ms
+after a ~1.6k-token conversation and from 676 ms to 12348 ms after ~5.4k tokens. It is off by default, and the
+token stream of a single turn is unchanged either way.
+

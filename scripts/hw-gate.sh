@@ -397,9 +397,12 @@ if [ -z "$BIN" ]; then
     fi
   fi
 fi
-for b in llama-server test-backend-ops llama-perplexity; do
-  [ -x "$BIN/$b" ] || { note "::error::$BIN/$b missing"; exit 2; }
-done
+# the llama.cpp binaries, for the HRX phases (an npu-only run needs none of them)
+if has build || has ops || has kat || has kld || has needle || has placement; then
+  for b in llama-server test-backend-ops llama-perplexity; do
+    [ -x "$BIN/$b" ] || { note "::error::$BIN/$b missing"; exit 2; }
+  done
+fi
 
 # ---- the GPU token, before the first GPU step (gpu() would take it too, but its output is a step log)
 if has ops || has kat || has needle || has kld || has placement; then

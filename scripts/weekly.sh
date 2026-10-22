@@ -462,7 +462,9 @@ stage_package() {
     guard "$SRC/os/mini/mkimage.sh" "$W/os" "$BUILD" > "$LOGS/os.log" 2>&1
     zstd -q -T4 -19 "$W/os/1bit-os.img" -o "$OUT/1bit-os-$tag.img.zst"
     cp "$W/os/1bit-os.efi" "$OUT/1bit-os-$tag.efi"
-    (cd "$OUT" && sha256sum -- * > SHA256SUMS)
+    # SHA256SUMS must not list itself: it is written after the hashes are taken, so its own line can
+    # never match and "sha256sum -c SHA256SUMS" would always report one failure.
+    (cd "$OUT" && sha256sum $(ls | grep -vx SHA256SUMS) > SHA256SUMS)
     ls -la "$OUT"
 }
 

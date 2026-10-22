@@ -58,10 +58,12 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 ### The NPU engine
 
 The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
-NPU engine is in progress: the release carries its runtime, compiled into `1bit`, and the `onebit`
-recipe's `npu` backend, but the NPU layer and lm-head kernels built from source are not merged yet
-([npu.md](npu.md)). Until they are, NPU models
-are not served from a release package; HRX serves the GGUF models.
+release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's `npu` backend.
+The NPU kernels are closed too: they ship as compiled, encrypted artifacts (`config/npu-kernels.config`,
+`ONEBIT_NPU_PRIVATE`) that `1bit` verifies and decrypts in memory at load, failing cleanly on a
+wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
+([npu.md](npu.md)). Wiring the kernels into the weekly release package is the last step; until a
+package carries them, HRX serves the GGUF models.
 
 ### Private components
 

@@ -25,8 +25,11 @@ They are not merged into this repository yet. The release carries the NPU runtim
 package serves GGUF models on HRX, not NPU models ([releases.md](releases.md#the-npu-engine)).
 
 The NPU runtime and the NPU kernels are proprietary and closed source
-([releases.md](releases.md#private-components)). This page covers the public parts: the model
-format, how `1bit serve` runs an NPU model, and how to build.
+([releases.md](releases.md#private-components)). They ship only as compiled binaries: the runtime
+is compiled into `1bit`, and the kernels ship as compiled, encrypted artifacts that `1bit` verifies
+and decrypts in memory at load (a wrong key fails cleanly, and nothing phones home). Their source,
+build and method are not in this repository or in any release. This page covers the public parts:
+the model format, how `1bit serve` runs an NPU model, and how to build.
 
 AMD's own NPU stack is a separate route that ships today: `1bit serve --device onnx` runs Ryzen AI
 Software's ONNX Runtime GenAI (the RyzenAI provider) on the NPU, on Linux too, from the user's own

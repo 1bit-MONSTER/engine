@@ -94,6 +94,7 @@ cat > "$stage/README.txt" <<EOF
 1bit engine $ver for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/
 
   ./1bit serve -m model.gguf --port 8000      (--device auto: HRX0, else the CPU)
+$( [ -d "$stage/npu/kernels" ] && printf '  ./1bit serve -m <Qwen3 NPU model dir> --port 8000   (the 1bit NPU engine, XDNA 2 NPU)\n' )
 
 Ubuntu 26.04 with the Lemonade PPA's lemond: sudo ./install-lemonade-ppa.sh
   (installs to /opt/1bit; lemond's HRX recipe then runs this llama-server)

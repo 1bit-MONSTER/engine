@@ -124,6 +124,16 @@ published FastFlowLM model, is trusted as published.
 
 ## Serving
 
+The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
+kernels (dense Qwen3: 0.6B, 1.7B and 4B):
+
+```
+./1bit serve -m <Qwen3 NPU model dir> --port 8000
+```
+
+In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
+The model directory holds the weights only; the kernels ship inside the package.
+
 - **Tokenizer:** `npu/tokenizer.cpp` reads `tokenizer.json` directly (PCRE2 for the
   pre-tokenizer regex). Added tokens with `special: false`, such as Qwen3's `<think>` and
   `</think>`, stay whole, as Hugging Face `tokenizers` does.

@@ -571,7 +571,9 @@ if has npu; then
     for v in "$oracle" "$greedy" "$prefill" "$repro"; do [ "$v" = PASS ] || st=FAIL; done
     [ "$rc" = 75 ] && { st=FAIL; infra=1; }
     slow=""
-    if [ -n "$tps" ] && awk -v t="$tps" -v f="$floor" 'BEGIN{exit !(t+0 < f+0)}'; then st=FAIL; slow=" (below the ${floor} tok/s floor)"; fi
+    # no number is a failure, not a skipped floor (the first on-device run printed an empty tok_s)
+    if ! [[ "$tps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then st=FAIL; slow=" (no tok/s reported: the speed floor cannot be checked)"
+    elif awk -v t="$tps" -v f="$floor" 'BEGIN{exit !(t+0 < f+0)}'; then st=FAIL; slow=" (below the ${floor} tok/s floor)"; fi
     result npu $st $(( $(date +%s) - t0 )) "oracle=${oracle:-?} greedy64=${greedy:-?} prefill=${prefill:-?} reproducible=${repro:-?}${tps:+ tok/s=$tps}$slow"
   fi
 fi

@@ -124,11 +124,11 @@ build() {
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
     # The NPU kernels (docs/releases.md, "The NPU engine"): sealed, packed beside 1bit in
-    # npu/kernels. Off until the hardware gate's npu phase passes on Strix Halo; then
-    # WEEKLY_NPU_KERNELS defaults to 1. The private checkout does the work through its one entry
+    # npu/kernels. On by default (the npu gate phase passed on Strix Halo; WEEKLY_NPU_KERNELS=0
+    # builds a package without them). The private checkout does the work through its one entry
     # point (key install, sealing, the per-commit kernel cache); this script names nothing in it.
     # ONEBIT_NPU_RELEASE makes the built 1bit load sealed kernels only.
-    if [ "${WEEKLY_NPU_KERNELS:-0}" = 1 ]; then
+    if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
         "$SRC/scripts/fetch-private.sh" "$SRC/config/npu-kernels.config" "$W/npu-kernels" > /dev/null 2>> "$LOGS/private.log" ||
             { cat "$LOGS/private.log"; return 1; }
         guard "$W/npu-kernels/addons/release-kernels.sh" "$BUILD/npu/kernels" "${ONEBIT_NPU_KEY_DIR:-$HOME/.config/1bit-npu-key}" \
@@ -321,6 +321,10 @@ package_checks() {  # package_checks <linux tarball>
     # kernel would be), the shipped 1bit has no symbol table, and its strings name no private
     # source file and no build-machine home.
     local nk=0 m privsrc
+    if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
+        n=$(find "$t" -path '*/npu/kernels/*/layout.json' -type f | wc -l)
+        [ "$n" -ge 3 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries $n NPU kernel sets (want the 0.6B, 1.7B and 4B sets)"; bad=1; }
+    fi
     # The shipped npu tree is an exact allowlist: <set>/layout.json and <set>/layer1_*/layer1.elf.
     # Anything else is the kernel method in the clear - layer1.work/ carries plaintext MLIR, object
     # files and intermediate ELFs - so a stray file is a leak, not just a wrong shape.
@@ -414,6 +418,9 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
     n=$(find "$t" -path '*/bin/resources/web-app/index.html' -type f | wc -l)
     if [ "$n" != 0 ]; then echo "ok   Lemonade's web app: bin/resources/web-app/index.html and $(find "$t" -path '*/bin/resources/web-app/*' -type f | wc -l) files in $(basename "$1")"
     else echo "FAIL no Lemonade web app (bin/resources/web-app/index.html) in $(basename "$1")"; rc=1; fi
+    n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null | head -1)
+    if [ "${n:-0}" != 0 ]; then echo "ok   lemond-onebit loads sealed NPU kernels only (ONEBIT_KCRYPT_REQUIRE_SEALED=1)"
+    else echo "FAIL lemond-onebit does not export ONEBIT_KCRYPT_REQUIRE_SEALED=1"; rc=1; fi
     rm -rf "$t"
     return $rc
 }

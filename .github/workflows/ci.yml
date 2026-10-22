@@ -24,7 +24,23 @@ permissions:
 jobs:
   build:
     runs-on: ubuntu-24.04
+    # Ubuntu 26.04's own GCC 16 (16-20260322 and later) ships <simd> (C++26 std::simd); the
+    # toolchain PPA's GCC 16 for 24.04 is an older snapshot without it.
+    container:
+      image: ubuntu:26.04
+      # A real init as PID 1 reaps orphans, as systemd does on a host: smoke_serve SIGKILLs
+      # serve and checks that its backend is gone, and without a reaper the exited backend
+      # stays a zombie that kill -0 still finds.
+      options: --init
     steps:
+      - name: Tools for checkout and the build
+        run: |
+          apt-get update
+          DEBIAN_FRONTEND=noninteractive apt-get install -y --no-install-recommends ca-certificates git \
+            python3 python3-venv curl jq file procps make gcc-16 g++-16 cmake ninja-build libcurl4-openssl-dev libzstd-dev \
+            libssl-dev libdrm-dev libpcre2-dev
+          git config --global --add safe.directory "$GITHUB_WORKSPACE"
+          python3 -m venv /opt/ci-venv && echo /opt/ci-venv/bin >> "$GITHUB_PATH"
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
       - name: Copyright notice on every file
         run: python3 tools/copyright.py --check
@@ -38,20 +54,14 @@ jobs:
           python3 tools/check_pins.py "$BASE"
       - name: GGUF -> Q4NX repack, ternary -> Q4_0, MTP draft vocabulary
         run: |
-          python3 -m pip install --user numpy gguf
+          python3 -m pip install numpy gguf
           python3 tests/gguf_to_q4nx_test.py
           python3 tests/ternary_to_q4_0_test.py
           python3 tests/mtp_draft_vocab_test.py
           python3 tests/check_pins_test.py
           python3 tests/hrx_long_prompt_test.py
-      - name: Install build dependencies
-        # GCC 15, as on the Strix Halo development machine: the engine is C++26, which the
-        # runner's own GCC 13 cannot build
-        run: |
-          sudo add-apt-repository -y ppa:ubuntu-toolchain-r/test
-          sudo apt-get update && sudo apt-get install -y g++-15 ninja-build libcurl4-openssl-dev libzstd-dev libssl-dev libdrm-dev libpcre2-dev
       - name: Configure
-        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-15 -DCMAKE_CXX_COMPILER=g++-15
+        run: cmake -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_C_COMPILER=gcc-16 -DCMAKE_CXX_COMPILER=g++-16
       - name: Build
         # Every target a ctest test invokes must be listed here: `ctest` runs whatever
         # binaries exist, so a test whose target is missing reports "Not Run" and never
@@ -63,4 +73,5 @@ jobs:
             laya_encoder_test http_guard_test moe_gguf_index_test laya_bounds_test \
             npu_model_bounds_test npu_forward_loader_test tokenizer_linear_test hrx_placement_test hrx_cwsr_test -j
       - name: Test
-        run: ctest --test-dir build --output-on-failure
+        # One hung test must not hold the job for hours: each test gets 10 minutes.
+        run: ctest --test-dir build --output-on-failure --timeout 600

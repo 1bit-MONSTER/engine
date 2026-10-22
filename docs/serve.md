@@ -16,25 +16,29 @@ limitations under the License.
 -->
 # `1bit serve`: the engine behind one OpenAI-compatible API
 
-The engine runs inside Lemonade ([lemonade.md](lemonade.md)): Lemonade runs
-`1bit serve` as a backend, the way it runs `llama-server`. `1bit serve` exposes
-nothing but an OpenAI-compatible API, so it also works on its own with any
-OpenAI client.
+The engine runs inside Lemonade ([lemonade.md](lemonade.md)) as a backend, the way Lemonade runs
+`llama-server`. Lemonade runs `1bit serve`, and for a GGUF it starts the `llama-server` that serve
+names, one HTTP hop ([below](#one-hop-from-lemonade---print-backend)).
+On HRX the whole graph runs on the GPU or the model does not load: 43 of 43 configurations in the
+2026-10-20 census had 0 nodes off HRX. `1bit serve` exposes nothing but an OpenAI-compatible API,
+so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
            [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH]
            [--hrx-cwsr-placement=auto|on|off]
-           [--mtp HEAD.gguf | --dflash DRAFT.gguf] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
+           [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
            [--pm [--pm-experts FILE] [--lemonade-url URL]]
-           [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]
+           [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   # refused in this build, below
            [--parallel N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
            [--no-mem-check | --mem-check]
            [--watchdog SECS] [--watchdog-prompt-tps N]
+           [--strict-device | --no-strict-device] [--placement-report]
+           [--print-backend | --print-backend-env]
 ```
 
 One model per process:
@@ -150,6 +154,13 @@ is where an HSA status shows up), SIGKILLs the backend and exits with status 1. 
 sees the backend process gone and loads the model again. A process that does not die after
 SIGKILL (stuck in the kernel) is reported as such; serve exits anyway.
 
+**A lost GPU.** After a GPU reset (an MES hang, a MODE2 reset), a backend keeps running but
+cannot use the device again: ggml-hrx logs `AMDGPU hardware exception` and llama-server answers
+every request with HTTP 500 "Compute error". Serve watches the backend's stderr for that line
+(and Vulkan's device-lost error) and treats it like the watchdog firing, whatever `--watchdog`
+is set to: it logs the line, kills the backend and exits with status 1, so systemd
+(`Restart=always`) or Lemonade starts it again on the reset device.
+
 ```
 1bit serve: watchdog: POST /v1/chat/completions (streamed) on the hrx backend (port 34901, pid 3672241) made no progress for 121 s (limit 120 s; 211 bytes received in 125 s); killing it and exiting so Lemonade reloads it
 1bit serve: watchdog: Tctl 71.5 C
@@ -201,8 +212,8 @@ The in-process NPU route has none yet. serve's own series come first. The backen
 | `onebit_tctl_celsius` | CPU Tctl (k10temp) |
 
 The log-derived series come from the backend's stderr, which serve passes through unchanged and
-reads line by line (Linux). A series whose line never came is left out, not reported as 0. The
-#390 report is read from a line that names "CPU fallback" (or "off HRX"), followed by `OP=count`,
+reads line by line (Linux). A series whose line never came is left out, not reported as 0.
+The #390 report is read from a line that names "CPU fallback" (or "off HRX"), followed by `OP=count`,
 `OP xcount` or `OP: count` pairs, or by a total alone. llama-server drops the library's INFO lines
 at its default verbosity, because they map to its trace level. So the report reaches serve only
 when it is logged as a WARN or above, as the program-cache flush line is.
@@ -221,13 +232,113 @@ Until then, scrape serve's port directly.
 `tests/metrics_serve.sh` (ctest `metrics_serve`, CI included) checks every series against
 `tests/fake_backend.py`.
 
+## One hop from Lemonade (`--print-backend`)
+
+For a `.gguf` on HRX, Lemonade does not need serve in the request path. Lemonade's `onebit`
+recipe (our fork, branch `1bit/one-hop`) runs serve's command with `--print-backend` added:
+
+```
+$ 1bit serve -m Qwen3-4B-Q4_K_M.gguf --port 8001 --device hrx --alias Qwen3-4B-1bit --print-backend
+{"argv":[".../llama-server","-m","Qwen3-4B-Q4_K_M.gguf","--host","127.0.0.1","--port","8001","--metrics","--device","HRX0","-ngl","99","--jinja","--alias","Qwen3-4B-1bit","--cache-reuse","256"],"device":"hrx","env":{"GGML_HRX_REPORT":"1","GGML_HRX_STRICT":"1",...},"port":8001}
+```
+
+serve makes every check it makes before a load (the architecture, [memory](#will-it-fit), the
+placement flags, [recipes](#recipes---recipes---no-recipes)) and prints the llama-server it would
+start, on the port Lemonade chose, as one JSON line on stdout, then exits. Lemonade starts that
+llama-server itself and forwards to it as it does for its own `llamacpp` recipe: one HTTP hop and
+two processes (lemond, llama-server) instead of two hops and three.
+
+| Exit | Meaning | Lemonade |
+|---|---|---|
+| 0 | the plan is on stdout | starts it |
+| 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `onnx` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+
+Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
+`LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
+the caller's environment does not set already, so a value the user set still wins, as under serve.
+
+`--print-backend-env` prints only `env`, one `NAME=VALUE` line each, for a caller that builds the
+argv itself: `lemonade-hrx`, the stock Lemonade PPA's HRX recipe on Ubuntu 26.04
+([lemonade.md, "Ubuntu 26.04: the PPA's lemond"](lemonade.md#ubuntu-2604-the-ppas-lemond)).
+
+What serve did on the request path is the backend's own on this route:
+
+- **Health.** llama-server's `/health` answers 503 while its main loop has work queued and has
+  made no progress for `LLAMA_SERVER_HEALTH_STALL_SECS` (30 s; llama.cpp fork #111), so Lemonade's
+  BackendWatchdog probe (above, [When a backend hangs](#when-a-backend-hangs)) now catches a hung
+  GPU: three failed probes, and Lemonade stops the backend and reloads the model on the next request.
+- **A lost GPU.** llama-server exits with status 1 when ggml-hrx logs `AMDGPU hardware exception`
+  (llama.cpp fork, `tools/server/server-device-lost.cpp`; `LLAMA_SERVER_EXIT_ON_DEVICE_LOST=0` keeps
+  it up), the same signal serve's #466 exit gave Lemonade.
+- **Placement.** Strict placement, the default on `hrx` ([below](#off-hrx-placement-strict-by-default)),
+  is `GGML_HRX_STRICT=1` in the plan's `env`, so the llama-server Lemonade starts aborts on the
+  first node off HRX, naming it, and Lemonade fails the load with that line in its log.
+  `--no-strict-device` (or `ONEBIT_STRICT_DEVICE=0`, or `GGML_HRX_STRICT=0` in lemond's
+  environment) leaves it out. serve's own summary line and `onebit_*` [metrics](#metrics) are not
+  printed on this route; llama-server's `--metrics` still are.
+- **Names.** `--alias` gives replies Lemonade's model name; `reasoning_content` is llama-server's
+  own (`--jinja`).
+- **Prefix reuse.** `--cache-reuse 256` lets llama-server shift a cached prefix into place when the
+  middle of a conversation changes. A recipe's own `--cache-reuse` wins.
+- **Warm-up.** serve sends a backend one synthetic request once it is ready (a 360-token prompt,
+  8 tokens, temperature 0, `cache_prompt` off; HRX only), so the first client request does not pay
+  HRX's one-time per-shape program build (#492). On this route the plan carries that request as
+  `"warmup": {"path", "body"}` (on `hrx` chat plans only), and Lemonade's onebit recipe sends it after
+  `/health` answers and before it marks the model loaded. `ONEBIT_NO_WARMUP=1` in lemond's
+  environment leaves it out of the plan, as it turns serve's own warm-up off.
+  It lifts the first request's decode (Lemonade bench, Qwen3.8-27B: 11.1 -> 12.8 tok/s chat-short;
+  Qwen3.5-4B: 56.6 -> 61.5), not a short prompt's TTFT: the per-shape cost is per prompt length, and
+  some lengths cost far more than others the first time (Qwen3.8-27B, one server without MTP:
+  67 tokens 2,350 ms, then 531 ms; 74 tokens 559 ms, then 528 ms), so the warm-up's 360-token
+  prompt leaves chat-short's 67-token prompt at 2.3-2.4 s after every reload.
+- **Residency.** Keeping the model loaded, and so its HRX graph-program cache warm, is Lemonade's:
+  `lemonade load --pinned` (or `"pinned": true`), `max_loaded_models`, and the `evict_idle_timeout`
+  recipe option when `auto_evict` is on. A reload starts a new llama-server, whose program cache
+  starts cold.
+
+Measured on Strix Halo, 2026-10-20 (performance mode), with `tools/onehop_bench.py`: Lemonade fork
+`23972095` (lemond), engine `1e9de48` (`1bit`), the llama-server of package `1bit-hrx-3092596`
+(llama.cpp `00f2a68de`, sha256 `5c3669cdf3c4104e...`) for both arms,
+Qwen3-4B-Instruct-2507 Q4_K_M (`unsloth/Qwen3-4B-Instruct-2507-GGUF`, sha256 `3605803b982cb64a...`)
+on `hrx`, ctx 8192, with `HSA_USERPTR_FOR_PAGED_MEM=0` as the services run. Six rounds per arm
+(three for `/tokenize`, 200 requests each), alternating arms; each cell is the range of the rounds'
+medians. Every request opens a new connection, as Lemonade's client does.
+
+```sh
+tools/onehop_bench.py --arm two --out out --lemond lemond --onebit build/1bit --llama-server <llama-server>
+tools/onehop_bench.py --arm one --out out --lemond lemond --onebit build/1bit --llama-server <llama-server>
+```
+
+| | two hops (`LEMONADE_ONEBIT_ONE_HOP=0`) | one hop | llama-server direct |
+|---|---|---|---|
+| processes for the model | 1bit serve + llama-server | llama-server | |
+| load, `/api/v1/load` to ready | 1.62 s (2.33 s on the first, cold page cache) | 1.35-1.56 s | |
+| `/tokenize` (no GPU work: the hops alone) | 0.53-0.64 ms | 0.36-0.39 ms | 0.11-0.15 ms |
+| 1-token chat | 19.9-21.5 ms | 19.3-21.0 ms | 17.5-19.4 ms |
+| time to first token, repeated prompt (prompt cache hit) | 19.9-21.1 ms | 19.3-21.4 ms | |
+| time to first token, fresh 333-word prompt, seen length | 116.7-125.3 ms | 115.1-119.8 ms | |
+
+The serve hop cost about 0.2 ms a request, under the run-to-run noise of a GPU request: one hop
+removes a process and a quarter second of load, not latency anyone sees. The time to first token
+is the GPU's.
+
+Reload, one hop (three rounds): a prompt length the server had seen answered its first token in
+105.6-118.5 ms after Lemonade was asked to load the model again (pinned) and loaded a second model
+(Qwen3-0.6B Q4_0) beside it: the same llama-server, its program cache warm. After an unload and a
+load, a new llama-server answered the same length in 227.5-235.7 ms, then about 150 ms and 120 ms
+as its program cache filled.
+
+`tests/print_backend.sh` (ctest `print_backend`, CI included) checks the plan and the exit codes
+without a GPU.
+
 ## Where the model runs
 
 | Model | `--device` | Runs on |
 |---|---|---|
-| NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU fast lane, in process |
-| Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | the private NPU route, in process, in builds with `-DONEBIT_NPU_PRIVATE` (docs/npu.md, "Private routes") |
-| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` (docs/hrx.md), `--mtp` included. Since the HRX prompt-matmul routing (llama.cpp fork #55), prompts on HRX run at pp512 335 tok/s on Qwen3.8-27B UD-Q4_K_XL (was 97-99), and a 14K-token prompt through `serve` at 265 tok/s (was 91). `auto` exceptions: below |
+| NPU model directory (`model.q4nx` + `npu/`, docs/npu.md) | `auto`, `npu` | the NPU engine, in process (in progress) |
+| Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | a closed NPU add-on route, in process, in builds with `-DONEBIT_NPU_PRIVATE` ([npu.md](npu.md#add-on-routes)) |
+| `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
 | DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 
@@ -237,18 +348,47 @@ fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
 | Case | `auto` |
 |---|---|
 | an architecture our llama.cpp does not build: anything outside `gguf_architectures.hrx` in registry/architectures.json, which `tools/registry_build.py` reads from the pinned fork and the build compiles in (among them Zyphra Zamba, Zamba2, BlackMamba; Spark2.5, BailingMoeV3, HRM text, MuseGlimmer, Kimi K3, Maple, GraniteSwitch, Granite SWA, HY v4, MiniMax, Dots3 Note, PocketTTS, Qwen3-TTS) | refused on hrx and cpu, pointing at Lemonade's llamacpp backend; Zyphra is to be ported to HRX (Flash-Next's `qwen4exp` was, at pin `e57beb97`) |
-| `--moe-slots` | refused: not in this build ([below](#moe-models-larger-than-memory---moe-slots)) |
+| `--moe-slots` | refused: not in this build ([below](#moe-models-larger-than-memory-not-in-this-build)) |
 | `--parallel N` > 1 on a gated delta-net model (Qwen3.5, Qwen3.8, Qwen3-Next) | HRX0 with one slot, and a warning on stderr: HRX runs one such sequence at a time (no multi-sequence delta-net yet). `--device cpu` keeps `--parallel N` |
 | `--mmproj` | HRX0. **Unverified:** vision on HRX is an open RFC #213 gate, to be checked on ZAYA1-VL; if it fails there, `auto` goes back to the CPU for `--mmproj` |
-| `--mtp` | HRX0 (it drafts slower there than Vulkan did: its verify batches of 2-4 tokens are the open item, docs/hrx.md) |
+| `--mtp` | HRX0: Qwen3.8-27B decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose / short with the default draft length (#487; [below](#multi-token-prediction---mtp)) |
 | an H32 file (a Hadamard-rotated Q4_0 stamped `onebit.hadamard_q4_0`) | refused on every device: the format is dropped; use the model's UD-Q4_K_XL or another standard GGUF. PrismML's own rotation (`prism.hadamard`, Ternary Bonsai) is a different thing and still runs on HRX ([hrx.md](hrx.md#ternary-bonsai-prismmls-hadamard-folded-ggufs)) |
 
-### Off-HRX placement: `--placement-report`, `--strict-device`
+### Off-HRX placement: strict by default
 
-Engine #390. HRX can leave part of a graph on the CPU - an op its kernels do not serve, a
-`GET_ROWS` outside the supported range - and the model still answers, slower, with nothing said
-so. The scheduler is the one place that knows the backend of every node, so ggml-hrx reports it
-there (`GGML_HRX_REPORT`, llama.cpp fork #102). serve reads that line and prints its own at load:
+Engine #390. HRX could leave part of a graph on the CPU - an op its kernels did not serve, a
+`GET_ROWS` outside the supported range - and the model still answered, slower, with nothing said
+so. The HRX census of 2026-10-20 closed with every runnable cell (43 of 43) all on HRX in every
+graph, so a node off HRX is now a bug to report, not a fallback to take: on `hrx` serve refuses it.
+
+**The default.** Every `hrx` backend serve starts (the model's own, an `--embedding` or
+`--reranking` model, and the `--embed` / `--rerank` servers beside it) gets `GGML_HRX_STRICT=1`.
+ggml-hrx checks each graph the scheduler places and aborts on the first node off HRX, naming it,
+and serve exits non-zero with its own line:
+
+```
+.../ggml-hrx.cpp:447: placement_observer: GGML_HRX_STRICT=1: "kq-0" is MUL_MAT f32 ne=[2,2,12,1] and is not placed on HRX; 12 of 152 nodes off HRX (MUL_MAT x 8, SOFT_MAX x 4), 9 splits
+1bit serve: HRX strict placement refused the model: "kq-0" is MUL_MAT f32 ne=[2,2,12,1] and is not placed on HRX; 12 of 152 nodes off HRX (MUL_MAT x 8, SOFT_MAX x 4), 9 splits. Pass --no-strict-device (or set ONEBIT_STRICT_DEVICE=0) to run those nodes on the CPU instead
+```
+
+(jina-reranker-v1-tiny-en Q8_0 with `--reranking`, on a llama-server built before the jina-bert
+attention kernels, census gap G10; Strix Halo, 2026-10-20. With `--no-strict-device` the same
+load serves `/v1/rerank`.)
+
+The load, the warmup graph and every later graph are checked. A graph that only a request
+schedules (a `--parallel N` multi-sequence batch, a long prompt) therefore aborts at that request,
+and serve exits with the same line, so Lemonade sees the backend go. The same holds on the
+[one-hop route](#one-hop-from-lemonade---print-backend): the plan's `env` carries
+`GGML_HRX_STRICT=1`. The default needs no extra log volume: the abort is an error line, and the
+backend keeps its default verbosity. `--device cpu` and the other devices are not affected.
+
+**The opt-out.** `--no-strict-device`, or `ONEBIT_STRICT_DEVICE=0` in serve's environment, leaves
+`GGML_HRX_STRICT` unset, and HRX runs any node it declines on the CPU, as before. A
+`GGML_HRX_STRICT` you set yourself wins over either (`0` off, `1` on), under serve and in the
+one-hop plan.
+
+**`--placement-report`** passes `GGML_HRX_REPORT=2`, so the backend reports **every** graph, and
+serve prints its own line whenever a graph has more nodes off HRX than every graph before it:
 
 ```
 placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4), 7 graph splits
@@ -256,22 +396,30 @@ placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4
 ```
 
 A graph that is all on HRX prints `1bit serve: HRX placement: all 512 nodes on HRX, 1 graph
-splits`. The same numbers are `onebit_cpu_fallback_ops{op}` in [Metrics](#metrics) (`op="all"` is
-the total).
+splits`; with `, worst of N graphs` when more than one reported. The same numbers are
+`onebit_cpu_fallback_ops{op}` in [Metrics](#metrics) (`op="all"` is the total). The warmup graph
+alone is not the model: the census found LFM2 `--parallel 4` (20 nodes, 5 splits) and ZAYA1-8B
+(1-3 nodes) clean in the warmup report and split in prompt and multi-sequence graphs. To see the
+counts for a model that strict mode refuses, pass `--no-strict-device --placement-report`.
+Without `--placement-report` serve keeps `GGML_HRX_REPORT=1` (the first graph only), which costs
+no log volume.
 
 llama-server drops the library's INFO lines below `-lv 4` (an INFO line is a trace line there,
 `common/log.cpp`), so at its default verbosity the report never reaches serve. `--placement-report`
 passes `-lv 4` to the backend for that load, which prints the report along with the rest of
 llama.cpp's INFO lines.
 
-`--strict-device` refuses to start instead of running part of the graph on the CPU: serve sets
-`GGML_HRX_STRICT=1`, the backend aborts at load on the first node off HRX with its name, op, type
-and shape, and serve exits non-zero. It needs `--device hrx` or `auto`. If a report does arrive
-anyway and names off-HRX nodes, serve refuses with the same numbers.
+**`--strict-device`** is the default plus the report: `GGML_HRX_REPORT=2` and `-lv 4`, and if a
+report arrives and names off-HRX nodes, serve refuses with the same numbers (a backend that
+reached ready despite `GGML_HRX_STRICT`). It needs `--device hrx` or `auto`; `ONEBIT_STRICT_DEVICE=1`
+is the same. It and `--no-strict-device` do not combine.
 
-Both flags only set what the backend already reads, and a `GGML_HRX_REPORT` or `GGML_HRX_STRICT`
-in the environment wins over what serve passes (0 turns either off). `tests/hrx_placement_test.cpp`
-(ctest `hrx_placement`, CI included) covers the line, the summary and the refusal with no GPU.
+Every flag only sets what the backend already reads (llama.cpp fork #102), and a `GGML_HRX_REPORT`
+or `GGML_HRX_STRICT` in the environment wins over what serve passes. `tests/hrx_placement_test.cpp`
+(ctest `hrx_placement`, CI included) covers the report line, the summary, the strict abort line and
+the default and opt-out environments with no GPU, and `tests/print_backend.sh` (ctest
+`print_backend`) the plan's `env`. The [hardware gate](hw-gate.md) fails any gate model with a node
+off HRX.
 
 ### Removed devices and flags
 
@@ -296,10 +444,8 @@ went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min
 the H32 format it served (`tools/hadamard_q4_0.py` is removed; serve refuses those files). `--dflash`
 itself stays, on HRX and the CPU.
 
-A build without the private add-on answers a Qwen3.6-35B-A3B directory with "the
-Qwen3.6-35B-A3B NPU route is not part of this build; build with
--DONEBIT_NPU_PRIVATE=<npu-kernels checkout>". `--npu-opt KEY=VALUE` passes an option
-through to a private route. On a route that keeps its cache between requests,
+A build without the add-on answers a Qwen3.6-35B-A3B directory saying that its NPU route is not
+part of this build. `--npu-opt KEY=VALUE` passes an option through to an add-on route. On a route that keeps its cache between requests,
 `usage.prompt_tokens_details.cached_tokens` counts the reused prompt tokens and
 `timings.cache` says where they came from. On the NPU a streamed request with
 `stream_options.include_usage` gets a last chunk with `usage` and `timings`, as OpenAI's
@@ -327,12 +473,20 @@ else the build's copy, else the first one under `/opt/rocm-therock`.
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
 then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH.
 
+Stopping `serve` (SIGTERM, SIGINT) sends each backend SIGTERM and waits
+`ONEBIT_BACKEND_STOP_GRACE_S` seconds (default 30) before SIGKILL, with a warning line
+first; a backend that already exited is reaped where `serve` noticed, so its stop
+is free. A backend that exits on its own ends `serve` with exit code 1 and the way it
+ended on stderr (`a cpu backend exited: signal 6`). The grace matters for the NPU
+([onnx.md](onnx.md), "Linux NPU").
+
 ## The Project Manager (`--pm`)
 
 `--pm` makes the served model the Project Manager ([pm.md](pm.md)): on `/v1/chat/completions`
 it runs a tool loop instead of a plain forward. The model answers general conversation itself and
 delegates a task that fits an expert's domain with `delegate(expert, task, context)`; the engine
-turns that into one chat request to Lemonade (`--lemonade-url`, default `http://127.0.0.1:8000`)
+turns that into one chat request to Lemonade (`--lemonade-url`; the `onebit` recipe passes Lemonade's own
+address, and by hand the default is `http://127.0.0.1:8000`, not Lemonade's default port 13305, so pass it)
 for the expert's catalog id, Lemonade loads the expert beside the PM, and the expert's answer
 comes back as the tool result. The experts are listed in `config/pm-experts.json` (built in;
 `--pm-experts FILE` replaces it). At most `pm.max_rounds` (4) rounds; a Lemonade that is down
@@ -356,11 +510,41 @@ own MTP head (Unsloth ships it as `MTP/mtp-<model>-*.gguf`) drafts tokens on the
 device, and the model checks them in one batch. `--mtp-max N` caps the draft length;
 `--mtp-p-min P` drafts a token only when the head is at least that sure of it.
 It works on the llama.cpp devices (`hrx`, `cpu`), and `--device auto` keeps it on HRX0.
-A drafted token is kept only when the model agrees, so the output is the model's own. HRX's MTP
-numbers are in [hrx.md](hrx.md) ("Not yet": Qwen3.8-27B with its Q4_0 MTP head).
+A drafted token is kept only when the model agrees, so the output is the model's own.
 
-The measurements below were taken on the removed Vulkan build (2026-09-24) and are kept for the
-settings they found; re-measure on HRX before relying on the speeds. The sweep (draft length x
+**A GGUF's own MTP head is on by default on `hrx`.** When the `-m` file carries its MTP layer
+(`<architecture>.nextn_predict_layers` > 0, e.g. Unsloth's Qwen3.8-27B UD-Q4_K_XL, `blk.64.nextn.*`)
+and no other drafter is asked for, serve adds `--spec-type draft-mtp` with no `-md`: llama-server
+loads the head from the model file. That is what Lemonade's own llamacpp recipe does for a model
+with the `mtp` label, which Lemonade sets from the same key; both `1bit serve` and the
+[one-hop plan](#one-hop-from-lemonade---print-backend) do it. `--mtp-max` and `--mtp-p-min` apply.
+Not on `cpu`, not with `--parallel` > 1, not for `--embedding` / `--reranking`, and `--no-mtp` (or
+`ONEBIT_NO_MTP=1`; Lemonade: `onebit.args=--no-mtp`) turns it off. A file without the key is
+unchanged.
+
+Lemonade's standard benchmark (`lemonade bench --scenarios chat-short code-short --runs 5
+--warmup 1`, the pinned CI's protocol, a reload before every run), onebit recipe on the one-hop
+route, Qwen3.8-27B UD-Q4_K_XL, Strix Halo, 2026-10-21 (decode tok/s, chat-short / code-short):
+
+| | tok/s | TTFT ms |
+|---|---|---|
+| no drafter (before) | 11.1 / 11.9 | 2298 / 724 |
+| own MTP head (now) | **24.9 / 29.1** | 2424 / 807 |
+| own MTP head + one-hop warm-up | **26.2 / 29.5** | 2446 / 824 |
+| Lemonade's llamacpp Vulkan, same file, `--spec-type draft-mtp` (README of the 2026-10-21 run) | 24.2 / 28.0 | 1882 / 1882 |
+
+Greedy outputs with and without the head (three 128-token chats): two identical, one diverges at a
+near-tie (" Earth" -0.684 against " the" -0.705 without MTP), where the verify batch's numerics
+pick the other token; a drafted token is still only kept when the model's verify pass agrees.
+
+On HRX, Qwen3.8-27B UD-Q4_K_XL with its MTP head (default draft length 3, greedy 256-token chats,
+medians of 3 fresh servers) decodes at **36.0 / 26.8 / 29.9 tok/s** on code / prose / short, up
+from 25.9 / 20.5 / 21.9, since our HIP kernels check 2 to 8 drafted tokens in one pass: the 4-token
+verify step went from 121.5 to 88.0 ms ([#487](https://github.com/1bit-MONSTER/engine/pull/487)).
+Without MTP it decodes at 12.15 tok/s (tg128, [hrx.md](hrx.md#not-yet)).
+
+The sweep below was taken on the removed Vulkan build (2026-09-24) and is kept for the settings it
+found; it has not been repeated on HRX. The sweep (draft length x
 `--mtp-p-min`, code / prose / short; 12.2 / 12.3 / 12.3 without MTP):
 
 | Setting | tok/s | Drafts accepted |
@@ -459,16 +643,16 @@ build is gone, above.)
 
 ## Recipes (`--recipes`, `--no-recipes`)
 
-Tuned llama-server settings that depend on the model and route, such as a DFlash drafter's
-p-min, are recipes in `config/recipes.json`. Each one
-carries the measurement behind it. Serve prints each recipe it applies. Anything serve sets
+Tuned llama-server settings that depend on the model and route go in `config/recipes.json` as
+recipes, each with the measurement behind it. The built-in set is empty for now: the recipes the
+engine had were measured on builds RFC #213 stage 3 removed ([recipes.md](recipes.md#the-built-in-recipes)). Serve prints each recipe it applies. Anything serve sets
 itself wins over a recipe. `--recipes FILE` replaces the built-in set and `--no-recipes` turns
 recipes off ([recipes.md](recipes.md)). To measure a setting before making it a recipe, use
 [`tools/bench.py`](bench.md).
 
-## MoE models larger than memory (`--moe-slots`)
+## MoE models larger than memory: not in this build
 
-**Not in this build.** `--moe-slots` is kept (the option, `--moe-subst`, `--moe-prefetch` and
+`--moe-slots` is kept (the option, `--moe-subst`, `--moe-prefetch` and
 serve's code for them), but the expert streamer lives in the removed Vulkan llama.cpp pin. Until it
 moves to HRX together with Qwen3.8-Flash-Next, `serve` refuses `--moe-slots` with "not available in
 this build". What follows describes it as it ran on Vulkan0 (docs/moe-streaming.md).
@@ -575,10 +759,10 @@ streaming:
 
 | Device | Result |
 |---|---|
-| `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory on the fast lane |
+| `npu` | PASS (33 SSE chunks): Qwen3-0.6B NPU model directory |
 | `hrx` | PASS (32 SSE chunks), with no environment set up |
 
-Qwen3.6-35B-A3B on the NPU is tested by the private add-on (docs/npu.md, "Private routes").
+Qwen3.6-35B-A3B on the NPU is tested by its add-on ([npu.md](npu.md#add-on-routes)).
 Without it, `serve` on that directory exits with the message above.
 
 (The `vulkan` row, PASS with 32 SSE chunks, went with the Vulkan build, and the `zinc` row, PASS
@@ -586,5 +770,6 @@ with 6, with ZINC.) With `-DONEBIT_HRX=ON`,
 ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`, and in general `serve_e2e_<device>`, when configured with
 `-DONEBIT_SERVE_TEST_GGUF=<gguf>`. `smoke_serve` runs everywhere, CI included:
 `tests/fake_backend.py` stands in for llama-server. It checks the proxy (`/health`,
-`/v1/models`, the reply rename, SSE relay) and that no backend outlives a
-SIGKILLed `serve`. `watchdog_serve` runs everywhere too (see "When a backend hangs").
+`/v1/models`, the reply rename, SSE relay), that no backend outlives a
+SIGKILLed `serve`, and that a backend that exits on its own ends `serve` at once.
+`watchdog_serve` runs everywhere too (see "When a backend hangs").

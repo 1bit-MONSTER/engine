@@ -16,7 +16,7 @@
 """Host-side checks of the HRX hardware gate's judges (docs/hw-gate.md), no GPU needed:
 tools/kat.py against a fake OpenAI server (pass, cache-path near-tie = WARN, cache-path wrong
 answer = FAIL, nondeterminism = FAIL, golden drift = FAIL, a case the golden also missed = not a
-FAIL) and tools/hw_gate_manifest.py (KLD verdicts, manifest verification)."""
+FAIL) and tools/hw_gate_manifest.py (KLD verdicts, placement verdicts, manifest verification)."""
 import http.server
 import json
 import os
@@ -142,6 +142,22 @@ def main():
         if subprocess.run([sys.executable, MAN, "judge", man, "m", os.path.join(d, "ppl.log")],
                           capture_output=True).returncode != 1:
             bad.append("a log without KLD statistics must fail")
+
+        # placement verdicts (engine #390's report; the gate fails on any node off HRX)
+        clean = "placement_observer: placement: 512 nodes, 0 off HRX (none), 1 graph splits\n"
+        off = "placement_observer: placement: 354 nodes, 20 off HRX (MUL_MAT x 20), 5 graph splits\n"
+        abort = ('ggml-hrx.cpp:444: placement_observer: GGML_HRX_STRICT=1: "attn_out-0" is MUL_MAT f32 '
+                 'ne=[1024,7,1,1] and is not placed on HRX; 1 of 512 nodes off HRX (MUL_MAT x 1), 3 splits\n')
+        for name, text, want, says in (("clean", clean * 3, 0, "all on HRX in 3 graphs"),
+                                       ("worst graph", clean + off + clean, 1, "20 of 354 nodes off HRX"),
+                                       ("no report", "srv  load_model: loaded\n", 1, "no placement report"),
+                                       ("strict abort", clean + abort, 1, "attn_out-0")):
+            log = os.path.join(d, "server.log")
+            with open(log, "w") as f:
+                f.write(text)
+            p = subprocess.run([sys.executable, MAN, "placement", log], capture_output=True, text=True)
+            if p.returncode != want or says not in p.stdout:
+                bad.append(f"placement {name}: rc {p.returncode}, want {want}; said {p.stdout.strip()!r}")
 
         # manifest set / verify
         base, model, text = (os.path.join(d, n) for n in ("b.kld", "m.gguf", "t.txt"))

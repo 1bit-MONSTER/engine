@@ -47,7 +47,8 @@
 #
 # Licences (os/LICENSES.md): a backend ships only when os/licenses/<recipe>/SOURCE says
 # "Ship: yes"; that directory goes onto the stick as /data/lemonade/licenses/<recipe>. The
-# initramfs carries /usr/share/licenses/1bit-os (LICENSES.md, the engine's LICENSE and NOTICE,
+# initramfs carries /usr/share/licenses/1bit-os (LICENSES.md, the engine's LICENSE and NOTICE, the
+# closed binaries' LICENSE-BINARY and NOTICE-BINARY,
 # Lemonade's LICENSE, packages.txt) and the Ubuntu copyright file of every package it takes files
 # from, in /usr/share/doc/<package>/copyright, with /usr/share/common-licenses.
 #
@@ -69,7 +70,7 @@ build=${2:-$HOME/.cache/1bit-os/src/build}
 build=$(cd "$build" && pwd)   # absolute: binaries keep their build paths inside the image
 kver=${KVER:-$(uname -r)}
 # the kernel image: /boot/vmlinuz-<kver>, or VMLINUZ= (e.g. unpacked from its .deb where /boot is root-only);
-# the engine builds no kernel: the Strix Halo kernel packages come from github.com/1bit-MONSTER/kernel
+# the engine builds no kernel: the Strix Halo kernel packages come from our separate kernel build
 vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x
@@ -173,6 +174,14 @@ lem=$(cd "$lem" && pwd)
 [ -d "$lem/bin/resources/web-app" ] || echo "   warning: no web app in $lem (build it with LEMONADE_WEB_APP=1 scripts/build-lemonade.sh)"
 # lemond reads resources/ beside itself
 mkdir -p "$root/opt/lemonade"; cp -a "$lem/bin" "$root/opt/lemonade/bin"
+# Lemonade's build links the web app's KaTeX fonts to the build machine's fonts-katex
+# (/usr/share/fonts/truetype/katex), which the image does not have: every link out of the tree
+# becomes a copy of its target (scripts/pack-elf.sh), the links inside it stay
+# shellcheck source=scripts/pack-elf.sh
+. "$src/scripts/pack-elf.sh"
+pack_localize_links "$root/opt/lemonade/bin"
+n=$(pack_outside_links "$root/opt/lemonade/bin" | wc -l)
+[ "$n" = 0 ] || { echo "symlinks out of /opt/lemonade/bin in the image:"; pack_outside_links "$root/opt/lemonade/bin"; exit 1; }
 copy_libs "$lem/bin/lemond" "$lem/bin/lemonade"
 # HTTPS for Lemonade's downloads (models, backends) when the stick has a network
 mkdir -p "$root/etc/ssl/certs"; cp -L /etc/ssl/certs/ca-certificates.crt "$root/etc/ssl/certs/"
@@ -242,7 +251,7 @@ printf '127.0.0.1 localhost\n::1 localhost\n' > "$root/etc/hosts"
 echo "== licences (os/LICENSES.md)"
 doc=$root/usr/share/licenses/1bit-os
 mkdir -p "$doc"
-cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$doc/"
+cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$doc/"
 cp "$src/third_party/lemonade/LICENSE" "$doc/lemonade-LICENSE" ||
     { echo "no third_party/lemonade/LICENSE (git submodule update --init third_party/lemonade)"; exit 1; }
 cp "$licenses/llamacpp-hrx/ROCR-Runtime-LICENSE" "$doc/ROCR-Runtime-LICENSE"   # TheRock's libhsa for HRX

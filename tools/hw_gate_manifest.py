@@ -24,6 +24,7 @@ the thresholds a run is judged by.
   hw_gate_manifest.py verify MANIFEST NAME BASE MODEL TEXT   exit 1 if any of the three changed
   hw_gate_manifest.py judge  MANIFEST NAME LOG               parse llama-perplexity, exit 1 over a threshold
   hw_gate_manifest.py memcheck MODEL|- LLAMA_CPP_DIR         tools/mem_budget.py pre-check before a GPU step
+  hw_gate_manifest.py placement LOG                          ggml-hrx's placement report, exit 1 on a node off HRX
 """
 import hashlib
 import json
@@ -143,6 +144,37 @@ def cmd_judge(manifest, name, logpath):
     return 1 if bad else 0
 
 
+# ggml-hrx's placement observer (GGML_HRX_REPORT=2, engine #390), one line per graph:
+# "placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30, GET_ROWS x 4), 7 graph splits"
+PLACEMENT = re.compile(r"placement: (\d+) nodes, (\d+) off HRX \(([^)]*)\), (\d+) graph splits")
+STRICT_ABORT = re.compile(r"GGML_HRX_STRICT=1: (.*)")
+
+
+def cmd_placement(logpath):
+    """The gate's placement check: every graph the backend scheduled while the gate ran (load,
+    warmup, the kat prompts and the needle) must be all on HRX. No report at all is a failure too:
+    the server was started with GGML_HRX_REPORT=2 and -lv 4, so silence means the check saw nothing."""
+    with open(logpath, errors="replace") as f:
+        log = f.read()
+    graphs = [(int(n), int(off), ops, int(splits)) for n, off, ops, splits in PLACEMENT.findall(log)]
+    abort = STRICT_ABORT.search(log)
+    if abort:
+        print("GGML_HRX_STRICT refused: " + abort.group(1).strip()[:300])
+        return 1
+    if not graphs:
+        print("no placement report in the server log (GGML_HRX_REPORT=2, -lv 4 were passed)")
+        return 1
+    worst = max(graphs, key=lambda g: g[1])
+    largest = max(g[0] for g in graphs)
+    if worst[1] > 0:
+        bad = sum(1 for g in graphs if g[1] > 0)
+        print(f"{worst[1]} of {worst[0]} nodes off HRX ({worst[2]}), {worst[3]} graph splits; "
+              f"{bad} of {len(graphs)} graphs had nodes off HRX")
+        return 1
+    print(f"all on HRX in {len(graphs)} graphs (largest {largest} nodes)")
+    return 0
+
+
 FAULT_ZONE_GIB = 95.0   # engine#315: faults only seen at GTT >= 95 GiB
 OPS_HEADROOM_GIB = 6.0  # test-backend-ops allocates a few GiB at most
 
@@ -194,6 +226,8 @@ def main(argv):
         return cmd_memcheck(*args)
     if cmd == "judge" and len(args) == 3:
         return cmd_judge(*args)
+    if cmd == "placement" and len(args) == 1:
+        return cmd_placement(*args)
     print(__doc__)
     return 2
 

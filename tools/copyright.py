@@ -33,11 +33,11 @@ LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment",
-      "*.service", "*.timer", "Dockerfile", "*.Dockerfile"), "#"),
+      "*.service", "*.timer", "*.conf", "lemonade-hrx", "Dockerfile", "*.Dockerfile"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 
-EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*", "LICENSE", "NOTICE", "*.gguf", "tests/golden/*.bin", "tests/golden/*/*.bin", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico",
+EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*", "LICENSE", "NOTICE", "LICENSE-BINARY", "NOTICE-BINARY", "*.gguf", "tests/golden/*.bin", "tests/golden/*/*.bin", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico",
           # engine#315 evidence artefacts that cannot carry a comment: diffs must stay byte-applicable
           # and data files have no comment syntax. Matches the existing "patches/*" exemption.
           "*.patch", "*.csv", "*.cfg"]

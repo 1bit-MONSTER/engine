@@ -16,11 +16,14 @@ limitations under the License.
 -->
 # Lemonade
 
-**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** Lemonade is
-the server users talk to, with its own catalog, downloads, router and UI. For the models it
-serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`: it starts
-`1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards OpenAI requests to it. The
-engine exposes nothing but that OpenAI-compatible API.
+**The 1bit engine runs inside [Lemonade](https://github.com/lemonade-sdk/lemonade)**, and its
+`onebit` recipe passes Lemonade's own LLM test suite on HRX: 29 of 29 tests run, all pass. Lemonade
+is the server users talk to, with its own catalog, downloads, router and UI. For the models it
+serves with 1bit, it runs the engine as a backend, the same way it runs `llama-server`. For a GGUF
+it starts the engine's HRX `llama-server` directly, one HTTP hop
+([#475](https://github.com/1bit-MONSTER/engine/pull/475), [below](#the-recipe-that-runs-it)); for
+the other routes it starts `1bit serve` ([serve.md](serve.md)), waits for `/health`, and forwards
+OpenAI requests to it. The engine exposes nothing but that OpenAI-compatible API.
 
 Recovery stays Lemonade's: when a backend hangs, `1bit serve` answers `/health` with 503 and, once
 a request has had no progress for `--watchdog` seconds, kills its backend and exits non-zero
@@ -54,6 +57,14 @@ backend selector picks the device (`hrx` or `npu`; unset,
 the recipe sends `--device auto`). Replies already carry Lemonade's model name (`--alias`),
 so requests pass through unchanged.
 
+**One hop for GGUF models** (fork branch `1bit/one-hop`). For a `.gguf`, the recipe first runs that
+command with `--print-backend`: serve makes its load-time checks (architecture, memory, recipes)
+and prints the llama-server it would start, and Lemonade starts that llama-server itself and
+talks to it directly, as it does for `llamacpp`. A request then crosses one HTTP hop instead of
+two. NPU model directories, ONNX, DwarfStar, `--pm` and `--laya` still run through `1bit serve`
+(serve exits 5 for them), and `LEMONADE_ONEBIT_ONE_HOP=0` keeps serve in the path for every model
+([serve.md, "One hop from Lemonade"](serve.md#one-hop-from-lemonade---print-backend)).
+
 The recipe lives in our Lemonade fork,
 [1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade): upstream
 Lemonade plus the `onebit` backend (fork PR #1). Build `lemond` from the fork and
@@ -72,12 +83,12 @@ LEMONADE_ONEBIT_BIN=$PWD/build/1bit ~/.cache/lemonade-pin/bin/lemond
 the upstream release sync below). Before merging, rebuild and rerun the LLM suite on Strix Halo.
 
 On Strix Halo the recipe passes Lemonade's own LLM test suite
-(`test/server_llm.py --wrapped-server onebit`) on Vulkan and HRX: 31 tests, 9 run,
-22 skipped as unsupported. It is not proposed upstream yet: the plan is to embed the engine fully
+(`test/server_llm.py --wrapped-server onebit`) on HRX (the checklist below has the counts;
+Vulkan passed too before RFC #213 stage 3 removed it). It is not proposed upstream yet: the plan is to embed the engine fully
 in the fork first, then propose it upstream. The fork follows upstream's releases:
 `.github/workflows/sync-lemonade-fork.yml` checks daily and merges upstream's latest
-release tag (never a pre-release or `main`), so each weekly engine release carries the
-Lemonade release of that week. It
+release tag (never a pre-release or `main`), so each engine release carries the Lemonade
+release current when it was built. It
 pushes only a clean merge that still registers `onebit`; otherwise it opens a PR
 in the fork that lists the conflicts. It also keeps the fork's own copies of
 upstream's workflows disabled. Lemonade asks for an RFC
@@ -91,9 +102,9 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 | device | 2026-09-25, start | now |
 |---|---|---|
-| Vulkan | 19 / 31 | **29 / 29 run, all pass** (2 skipped, as for llamacpp) |
 | HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; release pre-check 2026-10-02, from the packaged tarballs) |
-| NPU | 3 / 31 | Qwen3.6-35B-A3B loads and answers through Lemonade; the suite's small test models are GGUF |
+| NPU | 3 / 31 | in progress ([npu.md](npu.md)); the suite's small test models are GGUF |
+| Vulkan (removed in RFC #213 stage 3) | 19 / 31 | 29 / 29 run, all pass, before its removal |
 
 1. ~~**Declare what already works.**~~ Done (fork #6). The recipe now declares tool calls,
    `stop`, async, the Responses API, slots, tokenize, embeddings and reranking.
@@ -105,10 +116,11 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
    `--reranking`, and the recipe serves those modes.
 5. ~~**Reranking on HRX.**~~ Done. jina-reranker-v1-tiny reranks on HRX (the suite's three
    rerank tests return the same top 3 as on Vulkan), and `1bit serve --rerank` runs on HRX (#281).
-6. **The NPU from Lemonade.** Qwen3.6-35B-A3B now runs: Lemonade downloads the Q4NX checkpoint
-   repo, the recipe hands `1bit serve` the directory, and the engine runs it on the NPU
-   (16.0 tok/s; builds with the private add-on only, docs/npu.md, "Private routes"). Still open:
-   - the smaller NPU models: their lane kernels are captured, not built from source;
+6. **The NPU from Lemonade.** The path works end to end: Lemonade downloads the Q4NX checkpoint
+   repo, the recipe hands `1bit serve` the directory, and the engine runs it on the NPU (the
+   experimental Qwen3.6-35B-A3B route builds with a closed add-on only,
+   [npu.md](npu.md#add-on-routes)). Still open:
+   - the NPU engine's kernels built from source, verified but not merged ([npu.md](npu.md));
    - ~~`reasoning_content`~~: done (#73), the NPU route splits the thinking out as llama-server does;
    - ~~models in our own Hugging Face repos~~: the 35B is `1bit-MONSTER/Qwen3.6-35B-A3B-NPU` (fork #8). (engine + fork)
 7. **Beyond the LLM suite:**
@@ -116,6 +128,65 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 `echo` and generation parameters are skipped, because Lemonade's own llamacpp recipe
 declares neither.
+
+## Ubuntu 26.04: the PPA's lemond
+
+On Ubuntu 26.04 Lemonade installs from its PPA, and that `lemond` (2026.42.1~26.04) is upstream's,
+with no `onebit` recipe. The fork's Debian 13 `.deb` does not install there either: it depends
+on `libcpp-httplib0.41`, which 26.04 does not have. So on 26.04 the engine plugs into the stock
+`lemond` through the HRX recipe it already has, `llamacpp-hrx`, with no patch to Lemonade:
+
+- `lemond` looks for that recipe's `llama-server` in `LEMONADE_HRX_HRX_BIN`, then in `hrx.hrx_bin`
+  in its `config.json`. A path there skips its download of its own HRX build.
+- The engine package's systemd drop-in, `lemonade/1bit-hrx.conf`
+  ([config/lemonade/1bit-hrx.conf](../config/lemonade/1bit-hrx.conf)), sets
+  `LEMONADE_HRX_HRX_BIN` to `lemonade-hrx` in the package.
+- `lemonade-hrx` ([scripts/lemonade-hrx](../scripts/lemonade-hrx)) runs the package's HRX
+  `llama-server`, with our HIP kernels, on Lemonade's arguments. First it runs
+  `1bit serve --print-backend-env`, which makes serve's load-time checks (architecture, memory)
+  and prints the environment serve gives an HRX backend: strict placement (`GGML_HRX_STRICT=1`),
+  TheRock's HSA runtime, CWSR placement (engine#315) and the ternary decode. It also fills in
+  what Lemonade's arguments leave to llama-server's defaults with serve's values: `-ngl 99`,
+  `--cache-reuse 256`, and `-kvu` above `--parallel 1`. A variable already set in `lemond`'s
+  environment wins, as it does under serve.
+
+To install:
+
+```sh
+sudo add-apt-repository ppa:lemonade-team/stable
+sudo apt install lemonade-server
+tar -I zstd -xf 1bit-<version>-linux-x86_64.tar.zst
+sudo 1bit-<version>-linux-x86_64/install-lemonade-ppa.sh      # to /opt/1bit; restarts lemond
+```
+
+`install-lemonade-ppa.sh` ([scripts/install-lemonade-ppa.sh](../scripts/install-lemonade-ppa.sh))
+copies the package to `/opt/1bit` (or the directory it is given, outside `/home`, since the
+service runs with `ProtectHome=yes`). It writes the drop-in to
+`/etc/systemd/system/lemond.service.d/1bit-hrx.conf` and reloads systemd. If the PPA's postinst
+did not already add the `lemonade` user to `render`, the script does. HRX also needs TheRock in
+`/opt/rocm-therock` ([hrx.md](hrx.md)).
+
+To run `lemond` as yourself instead of as the service, set the same variable for it
+(`LEMONADE_HRX_HRX_BIN=/opt/1bit/lemonade-hrx lemond`) or put the path in `hrx.hrx_bin` in its
+`config.json`.
+
+Lemonade's HRX catalog (the `*-HRX` models) then runs on the engine, and so does a GGUF you
+register with `recipe: "llamacpp-hrx"`. Per-model arguments go in Lemonade's `hrx_args`, except
+the ones Lemonade sets itself (`-m`, `--ctx-size`, `--device`, `--port`, `--jinja`,
+`--metrics`). NPU model directories, ONNX, DwarfStar, `--pm` and `--laya` are not
+llama-server, so they stay with `/opt/1bit/1bit serve` ([serve.md](serve.md)), outside the stock
+`lemond`.
+
+[scripts/check-ubuntu-2604-lemond.sh](../scripts/check-ubuntu-2604-lemond.sh) runs this whole path
+in a clean `ubuntu:26.04` container: PPA, package, a model registered with `llamacpp-hrx`, a load
+and a chat completion. It passes when `lemond` started `lemonade-hrx` rather than installing its
+own HRX build, and when the `llama-server` it ran has `GGML_HRX_STRICT=1`. Without `--gpu` it
+needs no GPU: a stand-in records the `llama-server` command and environment, then runs Ubuntu's
+CPU llama.cpp. On Strix Halo, `--gpu` runs the real one on HRX0:
+
+```sh
+scripts/check-ubuntu-2604-lemond.sh out/1bit-<version>-linux-x86_64.tar.zst ~/models/Qwen3-0.6B-Q4_K_M.gguf --gpu
+```
 
 ## Vulkan, ROCm, Metal and CUDA are Lemonade's
 
@@ -134,7 +205,7 @@ serve:
   Qwen3.8-Flash-Next (`qwen4exp`) runs on HRX since llama.cpp pin `e57beb97`.
 
 In the pinned fork ([1bit-MONSTER/lemonade](https://github.com/1bit-MONSTER/lemonade),
-`third_party/lemonade` at `4812a683`), the `onebit` backend has two entries, `hrx` and `npu`
+`third_party/lemonade` at `80064ba72a98`, fork #15 on `main`), the `onebit` backend has two entries, `hrx` and `npu`
 (`backend_versions.json`); its `vulkan` and `cuda` entries are gone. Lemonade offers `onebit`
 models only on machines with `hrx` or `npu`. Lemonade's other recipes (its `llamacpp` Vulkan, ROCm
 and CUDA backends, MLX and the rest) are Lemonade's own and unchanged.

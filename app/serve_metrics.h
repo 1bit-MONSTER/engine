@@ -19,6 +19,7 @@
 // these, then appends the backend's own /metrics where it has one.
 #pragma once
 
+#include "hrx_strict.h"
 #include "sysinfo.h"
 
 #include <nlohmann/json.hpp>
@@ -61,9 +62,14 @@ struct BackendLogFacts {
     // "placement_observer: placement: 512 nodes, 34 off HRX (MUL_MAT x 30), 7 graph splits".
     std::optional<long> placement_nodes;
     std::optional<long> placement_splits;
-    size_t              placement_lines = 0;   // placement reports seen; serve prints the first
+    size_t              placement_lines = 0;   // placement reports seen; the worst one is kept
+    // ggml-hrx's GGML_HRX_STRICT=1 abort: the refused node, its op, type and shape (app/hrx_strict.h)
+    std::string strict_refusal;
 
     void feed(const std::string& line) {
+        if (strict_refusal.empty()) {
+            if (std::string d = strict_abort_detail(line); !d.empty()) strict_refusal = std::move(d);
+        }
         // every backend line passes here: plain substring tests first, a regex only on a hit
         if (line.find("HRX graph program cache over its limit") != std::string::npos) {
             static const std::regex flush(R"(flush (\d+))");
@@ -88,23 +94,29 @@ struct BackendLogFacts {
         // phrase (which may be the split count) is not it.
         static const std::regex off_count(R"((\d+) off HRX\b)");
         const bool stated = std::regex_search(line, m, off_count);
-        const long stated_off = stated ? std::stol(m[1]) : 0;
+        if (stated) {
+            const long stated_off = std::stol(m[1]);
+            ++placement_lines;
+            // the WORST graph is what serve reports: with GGML_HRX_REPORT=2 the backend reports every graph,
+            // and the warmup graph that reports first is the one that looks clean while a --parallel
+            // multi-sequence graph leaves 20 nodes on the CPU (census 2026-10-20, finding 1).
+            if (!cpu_fallback_total || stated_off > *cpu_fallback_total) {
+                cpu_fallback_total = stated_off;
+                cpu_fallback_ops = ops;   // empty for a clean graph ("none")
+                static const std::regex nodes_count(R"((\d+) nodes\b)");
+                static const std::regex splits_count(R"((\d+) graph splits\b)");
+                std::smatch sized;
+                if (std::regex_search(line, sized, nodes_count)) placement_nodes = std::stol(sized[1]);
+                if (std::regex_search(line, sized, splits_count)) placement_splits = std::stol(sized[1]);
+            }
+            return;
+        }
         if (!ops.empty()) {
             cpu_fallback_ops = ops;
             cpu_fallback_total = sum;
-        } else if (!stated && std::regex_search(rest, m, number)) {
+        } else if (std::regex_search(rest, m, number)) {
             cpu_fallback_total = std::stol(m[1]);   // a total alone, with no per-op counts
         }
-        if (stated) {
-            cpu_fallback_total = stated_off;
-            cpu_fallback_ops = ops;   // empty for a clean graph ("none")
-            ++placement_lines;
-        }
-        // the graph's size and its split count, when the line names them (engine #390)
-        static const std::regex nodes_count(R"((\d+) nodes\b)");
-        static const std::regex splits_count(R"((\d+) graph splits\b)");
-        if (std::regex_search(line, m, nodes_count)) placement_nodes = std::stol(m[1]);
-        if (std::regex_search(line, m, splits_count)) placement_splits = std::stol(m[1]);
     }
 
 private:
@@ -130,9 +142,11 @@ inline std::string placement_summary(const BackendLogFacts& f) {
     const std::string nodes  = f.placement_nodes ? std::to_string(*f.placement_nodes) : "?";
     const std::string splits = f.placement_splits ? std::to_string(*f.placement_splits) : "?";
     const long        off    = f.cpu_fallback_total.value_or(0);
-    if (off == 0) return "all " + nodes + " nodes on HRX, " + splits + " graph splits";
+    // more than one graph reported: the numbers are the worst of them (GGML_HRX_REPORT=2)
+    const std::string which = f.placement_lines > 1 ? ", worst of " + std::to_string(f.placement_lines) + " graphs" : "";
+    if (off == 0) return "all " + nodes + " nodes on HRX, " + splits + " graph splits" + which;
     return std::to_string(off) + " of " + nodes + " nodes off HRX (" + off_ops_detail(f) + "), " + splits +
-           " graph splits";
+           " graph splits" + which;
 }
 
 inline std::string placement_refusal(const BackendLogFacts& f) {
@@ -212,6 +226,12 @@ public:
         std::lock_guard<std::mutex> l(mu_);
         if (log_.placement_lines == 0) return std::nullopt;
         return log_;
+    }
+
+    // the first GGML_HRX_STRICT=1 abort a backend printed, or ""
+    std::string strict_refusal() const {
+        std::lock_guard<std::mutex> l(mu_);
+        return log_.strict_refusal;
     }
 
     // Prometheus text format 0.0.4

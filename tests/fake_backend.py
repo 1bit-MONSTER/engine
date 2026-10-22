@@ -66,6 +66,12 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        if req.get("fake_device_lost"):
+            # what ggml-hrx logs after a GPU reset; the backend keeps running and fails every request
+            print("graph_compute: launch HRX graph replay: hrx-system/runtime/src/iree/hal/drivers/amdgpu/system_event.c:129: "
+                  "DATA_LOSS; AMDGPU hardware exception (reset type 0x00000001)", file=sys.stderr, flush=True)
+            self._json(500, {"error": {"code": 500, "message": "Compute error.", "type": "server_error"}})
+            return
         if req.get("fake_hang"):
             # streamed: two chunks, then nothing; not streamed: nothing at all
             if req.get("stream"):
@@ -99,6 +105,10 @@ class H(BaseHTTPRequestHandler):
             timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0}
             self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
                              "timings": timings})
+            # "fake_exit": N: the backend exits with status N shortly after this reply, on its own
+            # (a crashed backend; serve must notice and not wait its SIGTERM grace for a dead pid)
+            if "fake_exit" in req:
+                threading.Timer(0.2, os._exit, [int(req["fake_exit"])]).start()
             return
         self.send_response(200)
         self.send_header("Content-Type", "text/event-stream")

@@ -16,9 +16,10 @@ limitations under the License.
 -->
 # HRX on the Radeon iGPU
 
-On Strix Halo, HRX (AMD's ggml-hrx with our Loom kernels) reads Qwen3.8-27B prompts at 335 tok/s and
-decodes ZAYA1-8B at about 90 tok/s. It is the engine's GPU route: a 14,435-token prompt runs at 265 tok/s,
-and Qwen3.8-27B decodes at 97% of the previous Vulkan figure.
+HRX runs every graph node of every model and mode we test on the Strix Halo GPU: 43 of 43
+configurations, with 0 nodes on the CPU. That is the 2026-10-20 census (#476, #480, #481). HRX is
+AMD's ggml-hrx with its Loom kernels, plus our HIP kernels. Qwen3.8-27B with MTP decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose /
+short chats (#487), and ZAYA1-8B at about 90 tok/s. HRX is the engine's one GPU route.
 
 It is one llama.cpp build with one GPU backend, ggml-hrx, and the CPU: the engine is pure HRX with HIP kernels; no Vulkan, ROCm backend, Metal, ZINC or CUDA (RFC #213 stage 3, the core strip). What HRX does not run, Lemonade serves with its own
 backends ([lemonade.md](lemonade.md)). Its `llama-server` exposes on Strix Halo:
@@ -33,6 +34,14 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
 |---|---|---|
 | `hrx` (and `auto` for GGUF) | `HRX0` | AMD's ggml-hrx: the engine's GPU route |
 | `cpu` | the CPU | the same llama-server with no GPU layers |
+
+On `hrx` the whole graph runs on HRX0 or the model does not load. Since the HRX census closed on
+2026-10-20 (43 of 43 runnable cells, 0 nodes off HRX in every graph), serve runs every HRX backend
+with `GGML_HRX_STRICT=1`: a node HRX would leave on the CPU stops the load (or the request whose
+graph has it) with the node's name, op, type and shape, instead of running slower in silence.
+`--no-strict-device` (or `ONEBIT_STRICT_DEVICE=0`) restores the CPU fallback
+([serve.md](serve.md#off-hrx-placement-strict-by-default)), and the [hardware gate](hw-gate.md)
+fails a pin that leaves a gate model's node off HRX.
 
 ## Pinned sources, kept current
 
@@ -56,6 +65,18 @@ HRX0:    AMD Radeon 8060S Graphics (Node 1) (gfx1151)
   no longer ours: AMD carries its own (`planning/mask_write_wait`). The pin itself is a `-s ours`
   merge of the previous pin `3319e536` (so every commit the engine shipped stays reachable, with the
   tree of the tested commit `fc2213a1c`) followed by #6. Rebase these by hand when AMD's pair moves.
+- **The pin is off `1bit/main`.** `.gitmodules` names `1bit/main` for hrx-system, but the pin
+  (`82804197`) is on `1bit/e3e6a976-pin-6` (and `1bit/315-allow-no-svm`, the same commit), not on
+  `1bit/main`. The two have diverged (checked 2026-10-20 with GitHub's compare API): `1bit/main`
+  (`c9656af5`) has 6 commits the pin does not, the merges of AMD's `40a1a36c` and `c0b135a7`
+  (the newer hrx-system the hold keeps out) and the engine#409, #410, #401 and #6 fixes, which the
+  pin line carries as its own replayed commits. So `1bit/main` cannot be fast-forwarded to the pin;
+  moving it there means resetting the branch (a force push), which drops those two AMD merges from
+  it. Until that is decided, the pin stays off-branch on purpose. What it costs: a bump PR that moves
+  hrx-system fails the release's on-branch check (`pins_on_branch` in `scripts/weekly.sh`), and a
+  shallow submodule clone that follows `1bit/main` cannot fetch the pin, so the release clones it
+  in full (`weekly.sh` retries the submodule update without `--depth 1`). The pin stays reachable
+  through the `1bit/e3e6a976-pin-6` branch, which must not be deleted.
 - **Where the pair comes from.** The two pins are the pair AMD's integration repo,
   [ROCm/ggml-staging-automation](https://github.com/ROCm/ggml-staging-automation),
   builds and tests together.
@@ -368,8 +389,8 @@ The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on 
 and less accurate than the UD-Q4_K_XL file of the same model (Qwen3.8-27B pp512 63.5 against 335
 tok/s; KLD 0.029 against 0.007 vs BF16), and the lean ROCm W4A4 route it was made for left with the
 ROCm build. `tools/hadamard_q4_0.py` is removed, and `1bit serve` refuses a file stamped
-`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`, llama.cpp
-#58) stays in the fork; it is the same code that rotates PrismML's files
+`onebit.hadamard_q4_0` by name. The loader support in our llama.cpp (`llama-hadamard`,
+llama.cpp #58) stays in the fork; it is the same code that rotates PrismML's files
 ([Ternary Bonsai](#ternary-bonsai-prismmls-hadamard-folded-ggufs)), which keep running.
 
 ### Server memory: the graph program cache cap (llama.cpp #63)
@@ -651,6 +672,8 @@ cmake --build build --target onebit
 - **HRX0 and the CPU only.** `GGML_VULKAN`, `GGML_HIP` and `GGML_CUDA` are off. The targets are
   `llama-server` and `llama-bench`. With
   `-DONEBIT_SERVE_TEST_GGUF=<gguf>`, ctest runs `serve_e2e_hrx` and `serve_e2e_cpu`.
+  `serve_e2e_hrx` skips on a machine without a gfx1151 (`ONEBIT_HRX_E2E_TARGETS` names others),
+  found in sysfs by `scripts/gpu-targets.sh` without opening the GPU.
 - **`IREE_ROCM_PATH` is not passed.** It would switch hrx-system to "package"
   mode, which needs TheRock's aqlprofile-sdk headers, and our `/opt/rocm-therock`
   does not ship them. Left unset, hrx-system fetches its pinned HSA/AQL headers.
@@ -664,9 +687,9 @@ cmake --build build --target onebit
 
 ### Private HIP kernels
 
-Our own HIP kernels for HRX are closed source, like the NPU kernels: they live in the private
-`1bit-MONSTER/gpu-kernels` repository (`addons/hip-hrx`). The llama.cpp fork keeps only the
-public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<gpu-kernels checkout>`
+Our own HIP kernels for HRX are closed source, like the NPU kernels: they live in a private
+repository, as an add-on (`addons/hip-hrx`). The llama.cpp fork keeps only the
+public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVATE=<add-on checkout>`
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
 that hook. Without the option the build is unchanged. The release builds with it, from the
@@ -785,8 +808,11 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   KLD against CPU logits 0.00167 (AMD kernels 0.00318). #46 adds 2-8 token variants for speculative
   verify batches: Qwen3.8-27B with its MTP head (`1bit serve --mtp`, draft 3, p-min 0.75) decodes
   22.5 / 17.7 / 19.0 tok/s on code / prose / translation prompts (was 20.1 / 16.4 / 17.6; Vulkan
-  34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still costs ~1.7x a 1-token
-  step (f32 multiply-adds per token); int8 activations, as Vulkan does, are the next step.
+  34.6 / 24.3 / 24.5) with the same draft acceptance. A 4-token step still cost ~1.7x a 1-token
+  step (f32 multiply-adds per token). Since #487 our HIP kernels run 2 to 8 drafted tokens on q8_1
+  activations, reading each weight block once for every token: the 4-token verify step went from
+  121.5 to 88.0 ms, and the 27B decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose / short
+  (from 25.9 / 20.5 / 21.9).
 - **NaN after an MTP rollback on Qwen3.5/3.8
   ([llama.cpp #52](https://github.com/1bit-MONSTER/llama.cpp/pull/52)).** With `--mtp`, the gated
   delta-net kernel publishes one recurrent-state snapshot per verify token so a rejected draft can
@@ -798,14 +824,14 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   recurrence already did. Q8_0 `--mtp` now runs clean on prose and code (15.7 / 20.2 tok/s, balanced power
   mode, 85 W); UD-Q4_K_XL `--mtp` speed and output are unchanged (also measured in balanced mode).
 - **`1bit serve --device hrx --parallel N`.** With one KV stream per slot, the K/V tensors are
-  4-D and HRX's flash attention falls back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
+  4-D and HRX's flash attention fell back to the CPU in every layer (Qwen3-4B, 4 slots: 39 tok/s
   aggregate, below one stream). serve now passes `-kvu` (one shared KV cache) and turns off AMD's
   Qwen attention path (`qwen.attention`), which derives its mask from positions and let the slots'
   answers bleed into each other under `-kvu`. Qwen3-4B 4 slots: 153 tok/s aggregate (single stream
   76; Vulkan 216); Qwen3-Coder-30B-A3B 34 -> 74; ZAYA1-8B 47 -> 71. Hybrid gated delta-net models
-  (qwen35, qwen35moe, qwen3next: Qwen3.5/3.8) are refused with `--parallel` on HRX: there is no
-  multi-sequence GATED_DELTA_NET kernel yet ([llama.cpp #48](https://github.com/1bit-MONSTER/llama.cpp/pull/48)
-  fixed the two failures before it).
+  (qwen35, qwen35moe, qwen3next: Qwen3.5/3.8) take `--parallel` too since 2026-10-20: the gated delta-net
+  matchers hold up to 8 sequences ([llama.cpp #117](https://github.com/1bit-MONSTER/llama.cpp/pull/117);
+  [#48](https://github.com/1bit-MONSTER/llama.cpp/pull/48) fixed the two failures before it).
 - **Fast sub-4-bit kernels on HRX.** IQ3_S has a decode kernel (#43) but not a fast prefill one. Q2_K
   ([llama.cpp #49](https://github.com/1bit-MONSTER/llama.cpp/pull/49)), IQ2_XXS/IQ2_XS
   ([llama.cpp #50](https://github.com/1bit-MONSTER/llama.cpp/pull/50)) and IQ3_XXS/IQ2_S
@@ -824,7 +850,8 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
   - IQ1_S: pp512 70.8 -> 81.7 tok/s, tg128 14.1 -> 18.6 (balanced; the first decode run in a process
     includes about 18 s of kernel JIT for the IQ1 grid). IQ1_M: pp512 70.8 -> 80.4, tg128 14.1 -> 18.1.
 
-  Some batched IQ2_XXS matmul shapes are still declined and run on the CPU. Mixed files decode
+  Some batched IQ2_XXS matmul shapes are still declined (not in the 2026-10-20 census); under strict
+  placement, the default, such a shape refuses the load, and `--no-strict-device` runs it on the CPU. Mixed files decode
   slower than pure ones: a SwiGLU gate/up pair whose two formats need different grids shares one
   grid buffer, so it is declined and takes the generic path.
 - **Q4NX on HRX.** Our Q4NX kernels lived in ggml-hrx2 and are not in ggml-hrx.

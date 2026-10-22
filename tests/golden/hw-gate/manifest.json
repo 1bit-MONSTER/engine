@@ -16,8 +16,54 @@
     "size": 396705472
    },
    "recorded_at": {
-    "hrx-system": "98d05d94a9f9e405683f8aeafc037f5ace0abe4a",
-    "llama.cpp": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
+  "qwen3-4b-iq4xs": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 619931604,
+   "base_sha256": "2afc23b39ebc7534cdb06f8b47d5258347f3389b7e8738eb8a85b0109a73ceea",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3-4B-IQ4_XS.gguf",
+    "sha256_first_64MiB": "4cdb9218462fd54c5775362281bbdb42dea3cd354a41422ffbd0711eda669b4e",
+    "size": 2270752032
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+   },
+   "text": {
+    "file": "wiki.test.raw",
+    "sha256": "173c87a53759e0201f33e0ccf978e510c2042d7f2cb78229d9a50d79b9e7dd08"
+   }
+  },
+  "qwen3-coder-30b-a3b": {
+   "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
+   "base_bytes": 619931604,
+   "base_sha256": "2f0f020994fd19c14416792943fd6cc5f526b96480c445dd02b8cb745c708554",
+   "limits": {
+    "max_kld_p99": 0.2,
+    "max_mean_kld": 0.01,
+    "min_same_top_p": 95.0
+   },
+   "model": {
+    "file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf",
+    "sha256_first_64MiB": "4352bc33979addc23e174e8d10292ed898f41115ce840686c4d654ea6c720470",
+    "size": 18556689568
+   },
+   "recorded_at": {
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -27,7 +73,7 @@
   "qwen3.8-27b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 1013178324,
-   "base_sha256": "7fc1cf24b5eb07bc15e9b6b28af9e15baddf960d85152e3d56eede265dd981ca",
+   "base_sha256": "a31cb56ca9a9f3361cdb9601af2bf219b8d1581761fbab47e91653558e9f32dd",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -39,8 +85,8 @@
     "size": 17559178144
    },
    "recorded_at": {
-    "hrx-system": "98d05d94a9f9e405683f8aeafc037f5ace0abe4a",
-    "llama.cpp": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "96f81977fc07a75824a7f2108b7a4154154fdb54"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -50,7 +96,7 @@
   "zaya1-8b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 1069596564,
-   "base_sha256": "13f3d4c1ad1b6b0da5994aee165df6edd2228dccc72d9ebeb49a9b6c33e6cd4d",
+   "base_sha256": "47174ec31a2537ed2d21d8a2c8fbd7e271c5effed9f1d9a918ce59591759adf4",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -62,8 +108,8 @@
     "size": 5567582048
    },
    "recorded_at": {
-    "hrx-system": "98d05d94a9f9e405683f8aeafc037f5ace0abe4a",
-    "llama.cpp": "0e255d774032dc6b4b06a157d2feb6be2175d3ab"
+    "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
+    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
    },
    "text": {
     "file": "wiki.test.raw",

@@ -306,7 +306,8 @@ package_checks() {  # package_checks <linux tarball>
         echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
     else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
     n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
-            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee >(cat >&2) | wc -l)
+            -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \
+            -o -name '*.mlir' -o -name '*.mlirbc' \) | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
     names=$(for pin in npu-runtime gpu-kernels npu-kernels; do
                 [ -d "$W/$pin" ] || continue
@@ -320,9 +321,17 @@ package_checks() {  # package_checks <linux tarball>
     # kernel would be), the shipped 1bit has no symbol table, and its strings name no private
     # source file and no build-machine home.
     local nk=0 m privsrc
+    # The shipped npu tree is an exact allowlist: <set>/layout.json and <set>/layer1_*/layer1.elf.
+    # Anything else is the kernel method in the clear - layer1.work/ carries plaintext MLIR, object
+    # files and intermediate ELFs - so a stray file is a leak, not just a wrong shape.
     while IFS= read -r -d '' f; do
-        [ "$(basename "$f")" = layout.json ] && continue
-        [ "$(head -c 8 "$f")" = 1BPKCRYP ] || { echo "FAIL $f is not a sealed kernel artifact"; nk=$((nk + 1)); }
+        rel=${f#"$t"/}
+        if [ "$(basename "$f")" = layout.json ]; then continue; fi
+        if [ "$(head -c 8 "$f")" != 1BPKCRYP ]; then
+            echo "FAIL leaked build artifact in the package (not a sealed kernel): $rel"; nk=$((nk + 1))
+        elif [[ ! "$rel" =~ ^[^/]+/npu/kernels/[^/]+/layer1_[^/]+/layer1\.elf$ ]]; then
+            echo "FAIL unexpected file under npu/kernels (a set ships layout.json + layer1_*/layer1.elf only): $rel"; nk=$((nk + 1))
+        fi
     done < <(find "$t" -path '*/npu/kernels/*' -type f -print0)
     [ "$nk" = 0 ] || bad=1
     n=$(find "$t" -path '*/npu/kernels/*' -type f | wc -l)

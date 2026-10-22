@@ -30,6 +30,11 @@
 #           rows without server arguments
 #   needle  tests/hrx_long_prompt.py: the 320-record needle (7.1K tokens on Qwen3, 7.4K on ZAYA1;
 #           #319, #369) on Qwen3-0.6B (f16 and both q8_0 KV caches) and ZAYA1-8B
+#   npu     the NPU engine's own correctness + speed check on Strix Halo, run through a private
+#           checker ($HW_GATE_NPU_CHECK): dense Qwen3-0.6B decode vs an fp64 reference (oracle),
+#           a 64-position greedy build, the prompt prefill, run-to-run reproducibility and a
+#           tok/s floor (HW_GATE_NPU_FLOOR). Auto-skips with no NPU or no checker configured; not
+#           in the default phases (add it with --phases npu).
 #   placement  every graph the server scheduled for a gate model (load, warmup, the kat prompts,
 #           the needle) is all on HRX: ggml-hrx's placement report (GGML_HRX_REPORT=2, engine #390)
 #           names no node off HRX, as `1bit serve` now requires by default (docs/serve.md)
@@ -392,9 +397,12 @@ if [ -z "$BIN" ]; then
     fi
   fi
 fi
-for b in llama-server test-backend-ops llama-perplexity; do
-  [ -x "$BIN/$b" ] || { note "::error::$BIN/$b missing"; exit 2; }
-done
+# the llama.cpp binaries, for the HRX phases (an npu-only run needs none of them)
+if has build || has ops || has kat || has kld || has needle || has placement; then
+  for b in llama-server test-backend-ops llama-perplexity; do
+    [ -x "$BIN/$b" ] || { note "::error::$BIN/$b missing"; exit 2; }
+  done
+fi
 
 # ---- the GPU token, before the first GPU step (gpu() would take it too, but its output is a step log)
 if has ops || has kat || has needle || has kld || has placement; then
@@ -532,6 +540,42 @@ if has kat || has needle || has kld; then
       fi
     fi
   done <<< "$MODEL_TABLE"
+fi
+
+# ---- npu (the NPU engine on Strix Halo; neutral, auto-skips without an NPU) ----------------
+# The checks themselves live in a private checker ($HW_GATE_NPU_CHECK): the NPU runtime and
+# kernels are closed source, so this phase only runs it, reads its neutral result lines and
+# applies the speed floor. It prints: oracle/greedy64/prefill/reproducible <PASS|FAIL> and
+# tok_s <float>. oracle is dense Qwen3-0.6B decode vs an fp64 reference (token for token over a
+# prompt + teacher-forced steps), greedy64 the 64-position build, prefill the prompt prefill,
+# reproducible that repeated runs match byte for byte. Set HW_GATE_NPU_CHECK to the private
+# checker (it reads its own settings from the environment) and
+# HW_GATE_NPU_FLOOR to the tok/s floor (default 30). The NPU shares the box: this runs inside
+# the gate's GPU claim and holds ~/npu.lock, and is NOT wrapped in thermal-run (its freeze can
+# abort an NPU dispatch); cool() gates the start instead.
+if has npu; then
+  t0=$(date +%s)
+  if [ ! -e /dev/accel/accel0 ]; then
+    result npu SKIP 0 "no NPU (/dev/accel/accel0) on this host"
+  elif [ -z "${HW_GATE_NPU_CHECK:-}" ]; then
+    result npu SKIP 0 "no NPU check configured (HW_GATE_NPU_CHECK); the checker and kernels are private"
+  else
+    cool
+    log=$OUT/npu.log
+    flock -w "$LOCK_WAIT" -E 75 "$LOCK" sh -c "$HW_GATE_NPU_CHECK" > "$log" 2>&1
+    rc=$?
+    floor=${HW_GATE_NPU_FLOOR:-30}
+    get() { sed -n "s/^$1 //p" "$log" | tail -n 1; }
+    oracle=$(get oracle); greedy=$(get greedy64); prefill=$(get prefill); repro=$(get reproducible); tps=$(get tok_s)
+    st=PASS
+    for v in "$oracle" "$greedy" "$prefill" "$repro"; do [ "$v" = PASS ] || st=FAIL; done
+    [ "$rc" = 75 ] && { st=FAIL; infra=1; }
+    slow=""
+    # no number is a failure, not a skipped floor (the first on-device run printed an empty tok_s)
+    if ! [[ "$tps" =~ ^[0-9]+(\.[0-9]+)?$ ]]; then st=FAIL; slow=" (no tok/s reported: the speed floor cannot be checked)"
+    elif awk -v t="$tps" -v f="$floor" 'BEGIN{exit !(t+0 < f+0)}'; then st=FAIL; slow=" (below the ${floor} tok/s floor)"; fi
+    result npu $st $(( $(date +%s) - t0 )) "oracle=${oracle:-?} greedy64=${greedy:-?} prefill=${prefill:-?} reproducible=${repro:-?}${tps:+ tok/s=$tps}$slow"
+  fi
 fi
 
 # ---- summary ---------------------------------------------------------------------------------

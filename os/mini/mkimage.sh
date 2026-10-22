@@ -135,6 +135,23 @@ bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
 [ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_HRX=ON)"; exit 1; }
 copy_elf "$bin"
 ln -s "$bin" "$root/bin/1bit"
+# The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"):
+# in a package that is <pkg>/npu/kernels next to <pkg>/1bit, and here the binary keeps its build
+# path, so the sets go to the same place relative to it. Without them the image ships the NPU
+# route and nothing it can load - the route then refuses rather than falling back.
+if [ -d "$build/npu/kernels" ]; then
+    mkdir -p "$root$build/npu"
+    cp -a "$build/npu/kernels" "$root$build/npu/"
+    sealed=$(find "$root$build/npu/kernels" -name layer1.elf -exec \
+        sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
+    total=$(find "$root$build/npu/kernels" -name layer1.elf | wc -l)
+    stray=$(find "$root$build/npu/kernels" -mindepth 3 \( -name '*.mlir' -o -name '*.o' -o -name 'layer1.work' \
+        -o -name '*.pdi' \) | head -3)
+    [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
+    [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
+    [ -z "$stray" ] || { echo "npu/kernels carries build artifacts, not just layout.json + layer1.elf:"; echo "$stray"; exit 1; }
+    echo "   npu/kernels: $(ls "$root$build/npu/kernels" | wc -l) sealed sets, $sealed kernels"
+fi
 mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"
 hrx=$build/hrx/llama/bin
 cache_get() { sed -n "s/^$1:[A-Z]*=//p" "$build/CMakeCache.txt" 2>/dev/null; }

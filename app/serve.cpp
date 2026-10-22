@@ -170,6 +170,9 @@ struct Options {
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
     std::string recipes;                 // --recipes FILE: tuned backend settings (default: built in, docs/recipes.md)
     bool no_recipes = false;             // --no-recipes: the backend gets serve's own flags only
+    // --precise (or ONEBIT_PRECISE=1): every request re-prefills its whole conversation, so a follow-up turn
+    // takes the same path a cold run of that conversation takes and comes out bitwise identical to it
+    bool precise = false;
     bool pm = false;                     // --pm: the model is the Project Manager, delegating to experts (docs/pm.md)
     std::string pm_experts;              // --pm-experts FILE (default: config/pm-experts.json, built in)
     std::string pm_router;               // --pm-router model|laya: who picks the expert (default: model)
@@ -792,7 +795,7 @@ bool wants_stream(const std::string& body) {
 
 // watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h).
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
-             const std::string& set_model, const httplib::Request& req, httplib::Response& res,
+             const std::string& set_model, bool precise, const httplib::Request& req, httplib::Response& res,
              ProgressWatch* watch = nullptr) {
     json body;
     try {
@@ -803,6 +806,12 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
         return;
     }
     if (drop_model) body.erase("model");
+    // --precise: a follow-up turn differs from a cold run of the same conversation because its new tokens form a
+    // different batch than the cold prefill does (different kernels, different reduction order), and a near-tie
+    // then flips. The only way to make the two bitwise identical is to take the cold path: re-prefill the whole
+    // conversation instead of continuing from the KV cache. That is what this costs - the TTFT of the whole
+    // conversation on every turn - which is why it is off by default.
+    if (precise) body["cache_prompt"] = false;
     // MTP by load: a request's own draft length wins; otherwise the router's (see post)
     if (draft_max >= 0 && !body.contains("speculative.n_max")) body["speculative.n_max"] = draft_max;
     if (!set_model.empty()) body["model"] = set_model;
@@ -2046,7 +2055,7 @@ int serve_child(const Options& given) {
             }
             held = std::make_shared<InFlight>(&inflight[pick]);
             ++routed[pick];
-            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, q, r, &watch);
+            forward(backends[pick].port, held, -1, id, backends[pick].drop_model, backends[pick].set_model, o.precise, q, r, &watch);
             r.set_header("X-1bit-Route", route_hdr);  // class, Laya confidence, device
             return;
         }
@@ -2056,7 +2065,7 @@ int serve_child(const Options& given) {
             held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
-        forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
+        forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
         if (backends[pick].npu_retry && r.status >= 500 && !wants_stream(q.body) && all_alive()) {
             // The NPU's first dispatch after idle can hit a one-off firmware timeout (TDR); the
             // device recovers and the same request then runs. One retry, said aloud, for a reply
@@ -2066,7 +2075,7 @@ int serve_child(const Options& given) {
             std::this_thread::sleep_for(std::chrono::seconds(1));
             r.status = 200;
             r.body.clear();
-            forward(backends[pick].port, held, -1, id, drop_model, set_model, q, r, &watch);
+            forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
         }
     };
     srv.Post("/v1/chat/completions", post);
@@ -2105,7 +2114,7 @@ int serve_child(const Options& given) {
             r.set_content(R"({"error":{"message":"backend did not become ready"}})", "application/json");
             return;
         }
-        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, q, r, &watch);
+        forward(backends[0].port, nullptr, -1, id, drop_model, set_model, o.precise, q, r, &watch);
     };
     for (const char* path : {"/v1/responses", "/tokenize", "/detokenize", "/apply-template"})
         srv.Post(path, llama ? httplib::Server::Handler(first_json) : httplib::Server::Handler(unsupported));
@@ -2138,7 +2147,7 @@ int serve_child(const Options& given) {
                 r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
                 return;
             }
-            forward(rag[i].port, nullptr, -1, stem(model), true, "", q, r);
+            forward(rag[i].port, nullptr, -1, stem(model), true, "", false, q, r);
         };
     };
     if (!o.role.empty()) {
@@ -2148,7 +2157,7 @@ int serve_child(const Options& given) {
                 r.set_content(R"({"error":{"message":"model is loading"}})", "application/json");
                 return;
             }
-            forward(backends[0].port, nullptr, -1, id, true, "", q, r);
+            forward(backends[0].port, nullptr, -1, id, true, "", false, q, r);
         };
         if (o.role == "embedding")
             for (const char* path : {"/v1/embeddings", "/embeddings"}) srv.Post(path, h);
@@ -2596,6 +2605,8 @@ void usage(FILE* out) {
                  "                  HRX_ALLOW_NO_SVM=1, which put the CWSR save area in GTT (docs/hrx.md)\n"
                  "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
+                 "                  [--precise]             re-prefill each request in full: follow-up turns come out\n"
+                 "                                          identical to a cold run, at the cost of the TTFT (ONEBIT_PRECISE=1)\n"
                  "                  [--no-mtp]   a GGUF with its own MTP head drafts with it on hrx by default;\n"
                  "                  this (or ONEBIT_NO_MTP=1) turns that off\n"
                  "                  [--dflash DRAFT.gguf]   DFlash draft model instead of --mtp; --mtp-max/--mtp-p-min apply\n"
@@ -2648,6 +2659,8 @@ void usage(FILE* out) {
 int run_serve(int argc, char** argv) {
     Options o;
     if (const char* e = std::getenv("ONEBIT_MEM_CHECK"); e && std::string(e) == "0") o.mem_check = false;
+    // ONEBIT_PRECISE=1 is the same as --precise (every request re-prefills its conversation in full)
+    if (const char* e = std::getenv("ONEBIT_PRECISE"); e && *e && std::string(e) != "0") o.precise = true;
     if (const char* e = std::getenv("ONEBIT_WATCHDOG_SECS"); e && *e) o.watchdog.secs = std::atof(e);
     // ONEBIT_STRICT_DEVICE=0 / 1 (app/hrx_strict.h); a flag on the command line wins
     o.strict = strict_from_env(std::getenv("ONEBIT_STRICT_DEVICE"));
@@ -2683,6 +2696,7 @@ int run_serve(int argc, char** argv) {
                                      "Lemonade's own llamacpp backend serves Vulkan and ROCm (docs/serve.md)");
         else if (a == "--mtp") o.mtp = next();
         else if (a == "--no-mtp") o.no_mtp = true;
+        else if (a == "--precise") o.precise = true;
         else if (a == "--dflash") o.dflash = next();
         else if (a == "--moe-slots") {
             const std::string v = next();

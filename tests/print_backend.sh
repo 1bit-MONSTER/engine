@@ -27,6 +27,8 @@
 #   - a GGUF with its own MTP head (<arch>.nextn_predict_layers > 0) drafts with it on hrx
 #     (--spec-type draft-mtp, no -md), as Lemonade's llamacpp recipe does; --no-mtp, ONEBIT_NO_MTP=1,
 #     --device cpu, --parallel 2, --embedding and a file without the key leave it out,
+#   - an hrx chat plan carries "warmups" (serve's warm-up requests, in order: the chat request, then a
+#     16-token /completion prompt (" a" x 16, n_predict 0)) and "warmup" (the first one, for an older lemond),
 #   - an hrx chat plan carries "warmup" (serve's warm-up request, for Lemonade to send before the
 #     model counts as loaded); ONEBIT_NO_WARMUP=1, cpu and role servers have none.
 #
@@ -140,9 +142,11 @@ check "hrx plan: an embedding server, no drafter and no warmup (exit $rc)" \
 out=$(mplan small hrx); rc=$?
 check "hrx plan: warmup is serve's request" \
     '[ "$(get "d[\"warmup\"][\"path\"]")" = /v1/chat/completions ] && [ "$(get "(d[\"warmup\"][\"body\"][\"max_tokens\"], d[\"warmup\"][\"body\"][\"temperature\"], d[\"warmup\"][\"body\"][\"cache_prompt\"])")" = "(8, 0, False)" ]'
+check "hrx plan: warmups = [the chat request, a 16-token /completion], warmup = the first" \
+    '[ "$(get "[w[\"path\"] for w in d[\"warmups\"]]")" = "['"'"'/v1/chat/completions'"'"', '"'"'/completion'"'"']" ] && [ "$(get "d[\"warmups\"][0] == d[\"warmup\"]")" = True ] && [ "$(get "(d[\"warmups\"][1][\"body\"][\"prompt\"].count(\"a\"), d[\"warmups\"][1][\"body\"][\"n_predict\"], d[\"warmups\"][1][\"body\"][\"cache_prompt\"])")" = "(16, 0, False)" ]'
 out=$(ONEBIT_NO_WARMUP=1 "$bin" serve -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" \
       --no-mem-check --port 43132 --print-backend 2>"$scratch/err"); rc=$?
-check "hrx plan: ONEBIT_NO_WARMUP=1, no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d")" = False ]'
+check "hrx plan: ONEBIT_NO_WARMUP=1, no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d or \"warmups\" in d")" = False ]'
 out=$(mplan small cpu); rc=$?
 check "cpu plan: no warmup (exit $rc)" '[ "$rc" = 0 ] && [ "$(get "\"warmup\" in d")" = False ]'
 

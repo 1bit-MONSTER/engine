@@ -1501,9 +1501,10 @@ int serve_only(const std::string& why) {
     return kServeOnly;
 }
 
-// The warm-up request (warm_backend, below): HRX only, and ONEBIT_NO_WARMUP=1 turns it off. serve sends it
-// itself; --print-backend hands the same request to Lemonade as the plan's "warmup" ({path, body}), and
-// Lemonade's onebit recipe sends it once the backend is ready, before it marks the model loaded.
+// The warm-up requests (warm_backend, below): HRX only, and ONEBIT_NO_WARMUP=1 turns them off. serve sends
+// them itself; --print-backend hands the same requests to Lemonade as the plan's "warmups" ([{path, body}],
+// in order; "warmup" is the first one, for a lemond that reads only that), and Lemonade's onebit recipe
+// sends them once the backend is ready, before it marks the model loaded.
 static bool warmup_wanted(const std::string& device) {
     return getenv("ONEBIT_NO_WARMUP") == nullptr && device.substr(0, device.find(' ')) == "hrx";
 }
@@ -1515,6 +1516,32 @@ static json warmup_body() {
     for (int i = 0; i < 60; ++i) text += " lorem ipsum dolor sit amet";
     return json{ { "messages", json::array({ { { "role", "user" }, { "content", text } } }) },
                  { "temperature", 0 }, { "max_tokens", 8 }, { "cache_prompt", false } };
+}
+
+// The second warm-up request: one 16-token prompt, " a" 16 times (one token each in the byte-level BPE
+// vocabularies of the models we serve; a BOS makes it 17, still inside the range below). n_predict 0: the
+// prompt is the work. (Token ids instead of text ended in a 500 on Qwen3.5-4B: id 100 is a lone UTF-8
+// byte there, which llama-server's output parser rejects.)
+// The first request whose batch holds 13 to 20 tokens takes HRX's small-batch matmul kernels, and they
+// read the weights in a layout ggml-hrx builds on the host the first time it needs it (re-quantizing the
+// affected tensors: 6.1 s of CPU, +1.0 GiB of GTT on Qwen3.8-27B UD-Q4_K_XL). A chat request splits its
+// prompt at the last user message and before its last 4 tokens, so short chats land there: Lemonade's
+// chat-short prompt (67 tokens) runs as 50 + 13 + 4, and its first time after a load cost 2.43 s against
+// 0.53 s later, with lemond on 4 cores. This request moves that build to load time (2.1 s on 4 cores).
+// On a fresh server, 13-20 tokens cost 2.03-2.07 s the first time; 1-12 cost 0.1-0.5 s and 21-512 cost
+// 0.45-1.23 s (docs/serve.md, "Warm-up").
+static constexpr int kWarmupShortTokens = 16;
+
+static json warmup_short_body() {
+    std::string prompt;
+    for (int i = 0; i < kWarmupShortTokens; ++i) prompt += " a";
+    return json{ { "prompt", prompt }, { "n_predict", 0 },
+                 { "temperature", 0 }, { "cache_prompt", false } };
+}
+
+static json warmup_requests() {
+    return json::array({ json{ { "path", kWarmupPath }, { "body", warmup_body() } },
+                         json{ { "path", "/completion" }, { "body", warmup_short_body() } } });
 }
 
 // --print-backend: the llama-server serve would start for this model, as one JSON line on stdout,
@@ -1554,7 +1581,10 @@ int print_backend(const Options& o, const Launch& l) {
     out["argv"] = argv;
     out["env"] = env;
     // a chat backend on HRX: the request Lemonade sends before it marks the model loaded (warmup_wanted)
-    if (o.role.empty() && warmup_wanted(l.device)) out["warmup"] = json{ { "path", kWarmupPath }, { "body", warmup_body() } };
+    if (o.role.empty() && warmup_wanted(l.device)) {
+        out["warmups"] = warmup_requests();
+        out["warmup"]  = out["warmups"][0];
+    }
     std::printf("%s\n", out.dump().c_str());
     return 0;
 }
@@ -1577,15 +1607,18 @@ static void warm_backend(int port, const std::string& device) {
     httplib::Client c("127.0.0.1", port);
     c.set_connection_timeout(5);
     c.set_read_timeout(600);
-    const auto body = warmup_body().dump();
-    const auto t0 = std::chrono::steady_clock::now();
-    const auto r  = c.Post(kWarmupPath, body, "application/json");
-    const long ms = (long) std::chrono::duration_cast<std::chrono::milliseconds>(
-                        std::chrono::steady_clock::now() - t0).count();
-    if (!r || r->status != 200) {
-        std::fprintf(stderr, "1bit serve: warm-up request on port %d failed (%d)\n", port, r ? r->status : -1);
-    } else {
-        std::fprintf(stderr, "1bit serve: warm-up request on port %d took %ld ms\n", port, ms);
+    for (const auto & w : warmup_requests()) {
+        const std::string path = w["path"].get<std::string>();
+        const auto t0 = std::chrono::steady_clock::now();
+        const auto r  = c.Post(path, w["body"].dump(), "application/json");
+        const long ms = (long) std::chrono::duration_cast<std::chrono::milliseconds>(
+                            std::chrono::steady_clock::now() - t0).count();
+        if (!r || r->status != 200) {
+            std::fprintf(stderr, "1bit serve: warm-up request %s on port %d failed (%d)\n", path.c_str(), port,
+                         r ? r->status : -1);
+        } else {
+            std::fprintf(stderr, "1bit serve: warm-up request %s on port %d took %ld ms\n", path.c_str(), port, ms);
+        }
     }
 }
 

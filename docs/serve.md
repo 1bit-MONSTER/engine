@@ -281,17 +281,38 @@ What serve did on the request path is the backend's own on this route:
   own (`--jinja`).
 - **Prefix reuse.** `--cache-reuse 256` lets llama-server shift a cached prefix into place when the
   middle of a conversation changes. A recipe's own `--cache-reuse` wins.
-- **Warm-up.** serve sends a backend one synthetic request once it is ready (a 360-token prompt,
-  8 tokens, temperature 0, `cache_prompt` off; HRX only), so the first client request does not pay
-  HRX's one-time per-shape program build (#492). On this route the plan carries that request as
-  `"warmup": {"path", "body"}` (on `hrx` chat plans only), and Lemonade's onebit recipe sends it after
-  `/health` answers and before it marks the model loaded. `ONEBIT_NO_WARMUP=1` in lemond's
-  environment leaves it out of the plan, as it turns serve's own warm-up off.
-  It lifts the first request's decode (Lemonade bench, Qwen3.8-27B: 11.1 -> 12.8 tok/s chat-short;
-  Qwen3.5-4B: 56.6 -> 61.5), not a short prompt's TTFT: the per-shape cost is per prompt length, and
-  some lengths cost far more than others the first time (Qwen3.8-27B, one server without MTP:
-  67 tokens 2,350 ms, then 531 ms; 74 tokens 559 ms, then 528 ms), so the warm-up's 360-token
-  prompt leaves chat-short's 67-token prompt at 2.3-2.4 s after every reload.
+- **Warm-up.** serve sends a backend two synthetic requests once it is ready (HRX only): a chat
+  request (a 360-token prompt, 8 tokens, temperature 0, `cache_prompt` off), so the first client
+  request does not pay HRX's one-time per-shape program build (#492), and a 16-token `/completion`
+  prompt (`" a"` x 16, `n_predict` 0), below. On this route the plan carries them as
+  `"warmups": [{"path", "body"}, ...]` (and `"warmup"`, the first one, for an older lemond), on `hrx`
+  chat plans only; Lemonade's onebit recipe sends them in order after `/health` answers and before it
+  marks the model loaded. `ONEBIT_NO_WARMUP=1` in lemond's environment leaves them out of the plan, as
+  it turns serve's own warm-up off.
+
+  **Why the 16-token request.** The first batch of 13 to 20 tokens after a load takes ggml-hrx's
+  small-batch matmul kernels, which read the weights in a layout ggml-hrx builds on the host the first
+  time it is needed: it re-quantizes the affected tensors (Qwen3.8-27B UD-Q4_K_XL: 6.1 s of CPU time,
+  +1.0 GiB of GTT, held for the life of the server). A chat request is split into batches at the last
+  user message and before its last 4 tokens, so short chats land in that range: Lemonade's chat-short
+  prompt (67 tokens) runs as 50 + 13 + 4. First-request prompt time per length on a fresh server
+  (Qwen3.8-27B, JIT cache warm, 4 cores): 1-12 tokens 0.1-0.5 s, **13-20 tokens 2.03-2.07 s**, 21-512
+  tokens 0.45-1.23 s, rising with the length. The extra request moves
+  that build to load time: +2.1 s per load on the 27B, +0.2 s on Qwen3.5-4B. Outputs are unchanged
+  (greedy chats with and without it are identical; it changes when the layout is built, not which
+  kernels run).
+
+  Lemonade's standard benchmark (`lemonade bench --scenarios chat-short code-short --runs 5
+  --warmup 1`, a reload before every run, one hop, lemond on cores 0-3), 2026-10-21, TTFT ms:
+
+  | model | chat-short before -> after | code-short before -> after |
+  |---|---|---|
+  | Qwen3.8-27B UD-Q4_K_XL (MTP on) | 2,643 -> **796** | 824 -> 818 |
+  | Qwen3.5-4B UD-Q4_K_XL | 263 -> **138** | 268 -> 142 |
+
+  Decode is unchanged (27B 25.6 / 29.3 -> 26.2 / 29.6 tok/s, 4B 61.3 / 61.0 -> 61.5 / 60.9).
+  The host build runs one thread per hardware thread, limited by the cores the backend may run on;
+  these numbers are with 4 (not measured unpinned).
 - **Residency.** Keeping the model loaded, and so its HRX graph-program cache warm, is Lemonade's:
   `lemonade load --pinned` (or `"pinned": true`), `max_loaded_models`, and the `evict_idle_timeout`
   recipe option when `auto_evict` is on. A reload starts a new llama-server, whose program cache

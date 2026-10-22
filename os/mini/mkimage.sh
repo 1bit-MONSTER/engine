@@ -112,7 +112,10 @@ for a in $("$root/bin/busybox" --list); do [ -e "$root/bin/$a" ] || ln -s busybo
 
 echo "== kernel modules ($kver)"
 # plus virtio, so 1bit OS also runs (and is tested) in a VM; together a few hundred KB
-mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk"
+# USB4 v2 / Thunderbolt on Strix Halo: the USB4 host router (1022:158d) is driven by thunderbolt.ko and
+# its Type-C side by typec + ucsi_acpi (alt modes, display); without them the USB4 ports and any dock
+# behind them do nothing, and with them a stick on a USB4 port tunnels like any other.
+mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done

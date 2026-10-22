@@ -47,12 +47,28 @@ def _match(name, patterns):
     return any(fnmatch.fnmatch(name, p) for p in patterns)
 
 
+def _line_block(prefix):
+    return "".join((prefix + " " + line).rstrip() + "\n" for line in NOTICE)
+
+
+def _shebang(path):
+    try:
+        with open(path, encoding="utf-8", errors="replace") as f:
+            return f.readline().startswith("#!")
+    except OSError:
+        return False
+
+
 def notice_block(path):
     """The notice formatted as comments for `path`, or None if no style is known."""
     name = path.rsplit("/", 1)[-1]
     for patterns, prefix in LINE_STYLES:
         if _match(name, patterns):
-            return "".join((prefix + " " + line).rstrip() + "\n" for line in NOTICE)
+            return _line_block(prefix)
+    # A file with no extension has no pattern to match (scripts/gpu-hold): the shebang decides, and a script
+    # that starts with #! takes the '#' line style.
+    if "." not in name and _shebang(path):
+        return _line_block("#")
     for patterns, (open_, close) in BLOCK_STYLES:
         if _match(name, patterns):
             return open_ + "\n" + "\n".join(NOTICE) + "\n" + close + "\n"

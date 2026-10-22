@@ -318,6 +318,27 @@ objcopy --add-section .cmdline="$out/cmdline.txt" --change-section-vma .cmdline=
         --add-section .initrd="$out/initramfs.img" --change-section-vma .initrd=$o_initrd \
         "$stub" "$out/1bit-os.efi"
 
+# Secure Boot: sign the unified kernel image with the machine's own enrolled MOK when its key is
+# named (MOK_KEY + MOK_CERT), so a signed 1bit OS stick boots with Secure Boot left on rather than
+# asking the owner to switch it off. sbsign appends a signature over the whole PE, which is what
+# firmware verifies for a UKI; sbverify then proves the result against the same certificate.
+if [ -n "${MOK_KEY:-}${MOK_CERT:-}" ]; then
+    [ -n "${MOK_KEY:-}" ] && [ -n "${MOK_CERT:-}" ] ||
+        { echo "MOK_KEY and MOK_CERT must be given together: sbsign --key <priv> --cert <pem>"; exit 1; }
+    command -v sbsign > /dev/null ||
+        { echo "sbsign is needed to sign the image: apt install sbsigntool"; exit 1; }
+    sbsign --key "$MOK_KEY" --cert "$MOK_CERT" --output "$out/1bit-os.efi.signed" "$out/1bit-os.efi" > /dev/null ||
+        { echo "sbsign failed"; exit 1; }
+    mv -f "$out/1bit-os.efi.signed" "$out/1bit-os.efi"
+    if command -v sbverify > /dev/null; then
+        sbverify --cert "$MOK_CERT" "$out/1bit-os.efi" > /dev/null 2>&1 ||
+            { echo "the signature does not verify against $MOK_CERT"; exit 1; }
+    fi
+    echo "   signed with $(basename "$MOK_CERT")"
+else
+    echo "   unsigned (set MOK_KEY and MOK_CERT to sign it for Secure Boot)"
+fi
+
 echo "== 1bit-os.img (USB: EFI partition + 1BIT-DATA)"
 efi_mb=$(( $(stat -c %s "$out/1bit-os.efi") / 1048576 + 64 ))
 mk() { "$tools/usr/bin/$1" "${@:2}"; }

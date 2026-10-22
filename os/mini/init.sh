@@ -113,9 +113,13 @@ lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
+echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
+echo "      Reboot to discard everything; only /data on the stick persists."
+touch /etc/1bit/live 2>/dev/null
 echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
 echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"
+echo "Prove the engine answers from this boot:  1bit-selftest   (console or SSH; logs to /data/selftest.log)"
 echo "The engine alone, for debugging:  1bit serve -m /data/models/<file.gguf>   (auto: HRX0, on 127.0.0.1:8000)"; echo
 
 # 1bit.check on the kernel command line: check the userspace starts, report, power off (for CI

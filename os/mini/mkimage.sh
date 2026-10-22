@@ -115,7 +115,7 @@ echo "== kernel modules ($kver)"
 # USB4 v2 / Thunderbolt on Strix Halo: the USB4 host router (1022:158d) is driven by thunderbolt.ko and
 # its Type-C side by typec + ucsi_acpi (alt modes, display); without them the USB4 ports and any dock
 # behind them do nothing, and with them a stick on a USB4 port tunnels like any other.
-mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
+mods="amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -142,45 +142,7 @@ ln -s "$bin" "$root/bin/1bit"
 # in a package that is <pkg>/npu/kernels next to <pkg>/1bit, and here the binary keeps its build
 # path, so the sets go to the same place relative to it. Without them the image ships the NPU
 # route and nothing it can load - the route then refuses rather than falling back.
-if [ -d "$build/npu/kernels" ]; then
-    mkdir -p "$root$build/npu"
-    cp -a "$build/npu/kernels" "$root$build/npu/"
-    sealed=$(find "$root$build/npu/kernels" -name layer1.elf -exec \
-        sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
-    total=$(find "$root$build/npu/kernels" -name layer1.elf | wc -l)
-    stray=$(find "$root$build/npu/kernels" -mindepth 3 \( -name '*.mlir' -o -name '*.o' -o -name 'layer1.work' \
-        -o -name '*.pdi' \) | head -3)
-    [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
-    [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
-    [ -z "$stray" ] || { echo "npu/kernels carries build artifacts, not just layout.json + layer1.elf:"; echo "$stray"; exit 1; }
-    echo "   npu/kernels: $(ls "$root$build/npu/kernels" | wc -l) sealed sets, $sealed kernels"
-fi
-mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"
-hrx=$build/hrx/llama/bin
-cache_get() { sed -n "s/^$1:[A-Z]*=//p" "$build/CMakeCache.txt" 2>/dev/null; }
-if [ -x "$hrx/llama-server" ]; then
-    # at its build path: 1bit serve runs it from there (ONEBIT_HRX_SERVER), for HRX0 and the CPU
-    copy_elf "$hrx/llama-server" $(ls "$hrx"/lib*.so* 2>/dev/null)
-    ln -s "$hrx/llama-server" "$root/opt/1bit-llama/llama-server"
-    # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md)
-    hsa=$(cache_get ONEBIT_HRX_LIBHSA)
-    [ -n "$hsa" ] && [ -e "$hsa" ] || { echo "no ONEBIT_HRX_LIBHSA in $build/CMakeCache.txt"; exit 1; }
-    copy_elf "$hsa"
-    echo "$hsa" > "$root/etc/1bit/libhsa"
-    # libdrm's GPU name table, where TheRock has one (names only; HSA works without it)
-    for ids in "$(dirname "$hsa")"/../share/libdrm/amdgpu.ids "$(cache_get ONEBIT_HRX_TOOLCHAIN)"/share/libdrm/amdgpu.ids; do
-        if [ -e "$ids" ]; then ids=$(realpath "$ids"); mkdir -p "$root$(dirname "$ids")"; cp "$ids" "$root$ids"; break; fi
-    done
-    echo "   HRX llama-server ($hrx), HSA runtime $hsa"
-elif [ -n "${LLAMA_SERVER:-}" ]; then
-    # test images only: a CPU llama-server, found on PATH by a 1bit built without HRX
-    ls=$(realpath "$LLAMA_SERVER")
-    copy_elf "$ls" $(ls "$(dirname "$ls")"/lib*.so* 2>/dev/null)
-    ln -s "$ls" "$root/opt/1bit-llama/llama-server"
-    echo "   CPU llama-server ($ls): a test image, no HRX"
-else
-    echo "no HRX llama-server in $build (build with -DONEBIT_HRX=ON; LLAMA_SERVER=<path> for a CPU-only test image)"; exit 1
-fi
+
 
 echo "== Lemonade (lemond, the lemonade CLI, the web app)"
 src=$(cd "$here/../.." && pwd)
@@ -259,7 +221,12 @@ LD_LIBRARY_PATH=$lib ldd "$tools/usr/sbin/dropbear" | grep -o '/[^ ]*' | while r
 done
 
 echo "== init"
-cp "$here/init.sh" "$root/init"; chmod +x "$root/init"
+if [ -n "${BOOT_STUB:-}" ]; then
+    cp "$here/stub-init.sh" "$root/init"; chmod +x "$root/init"
+    echo "   init: STUB (diagnostic: proves userspace and dumps dmesg to the stick)"
+else
+    cp "$here/init.sh" "$root/init"; chmod +x "$root/init"
+fi
 # one command that proves the engine answers from this boot (console or SSH)
 cp "$here/selftest.sh" "$root/bin/1bit-selftest"; chmod +x "$root/bin/1bit-selftest"
 cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
@@ -306,12 +273,12 @@ echo "== initramfs"
 # (Dropbear, like sshd, refuses keys when the home directory is group-writable)
 chmod -R go-w "$root"; chmod 1777 "$root/tmp"; chmod 700 "$root/root"
 # every file owned by root (Dropbear, like sshd, refuses keys in files the user does not own)
-(cd "$root" && find . -print0 | cpio --null -o -H newc -R 0:0 --quiet) | zstd -q -19 -T4 > "$out/initramfs.img"
+(cd "$root" && find . -print0 | cpio --null -o -H newc -R 0:0 --quiet) | gzip -9 -c > "$out/initramfs.img"   # gzip, not zstd: the machine booted its own 37M gzip initrd through grub and never our 106M zstd one
 
 echo "== 1bit-os.efi (unified kernel image)"
 stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 # the GPU may use up to 120 GiB of RAM (the same limits as the development machine)
-cmdline="console=tty0 console=ttyS0,115200 quiet rdinit=/init ttm.pages_limit=31457280 ttm.page_pool_size=31457280"
+cmdline="console=tty0 console=ttyS0,115200 ignore_loglevel loglevel=7 panic=600 oops=panic fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
 printf '%s' "$cmdline" > "$out/cmdline.txt"
 # section layout after the stub's own sections, each aligned to 64 KiB
 align() { echo $(( ($1 + 65535) / 65536 * 65536 )); }
@@ -349,7 +316,75 @@ efi_mb=$(( $(stat -c %s "$out/1bit-os.efi") / 1048576 + 64 ))
 mk() { "$tools/usr/bin/$1" "${@:2}"; }
 rm -f "$out/efi.part"; mkfs.fat -F 32 -n 1BIT-OS -C "$out/efi.part" $((efi_mb * 1024)) >/dev/null
 MTOOLS_SKIP_CHECK=1 mk mmd -i "$out/efi.part" ::/EFI ::/EFI/BOOT
-MTOOLS_SKIP_CHECK=1 mk mcopy -i "$out/efi.part" "$out/1bit-os.efi" ::/EFI/BOOT/BOOTX64.EFI
+# Secure Boot again: firmware verifies EFI/BOOT/BOOTX64.EFI against db, and a MOK-signed image is not
+# in db - only shim consults MokList. So a signed image is booted the way every Secure Boot machine
+# boots: a shim signed by a db key (Canonical's, Microsoft UEFI CA) as BOOTX64.EFI, which then
+# verifies our MOK-signed image as its second stage, grubx64.efi. Without signing, the image is
+# BOOTX64.EFI itself and only boots with Secure Boot off.
+# Two boot layouts. "grub" is the one this machine is proven to boot: the shim (Microsoft-signed,
+# in db) hands over to Canonical's own signed grub, which reads grub.cfg and loads a separate kernel
+# and initrd. "uki" is the one-EFI-file layout we used before; it boots under QEMU but dies on this
+# hardware before userspace, so it stays available behind BOOT_LAYOUT=uki.
+BOOT_LAYOUT=${BOOT_LAYOUT:-grub}
+if [ "$BOOT_LAYOUT" = grub ]; then
+    shim=${SHIM:-/usr/lib/shim/shimx64.efi.signed}
+    [ -f "$shim" ] || shim=/boot/efi/EFI/ubuntu/shimx64.efi
+    [ -f "$shim" ] || { echo "grub layout needs a Microsoft-signed shim: set SHIM=<shimx64.efi.signed>"; exit 1; }
+    grub=${GRUB:-/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed}
+    [ -f "$grub" ] || grub=/boot/efi/EFI/ubuntu/grubx64.efi
+    [ -f "$grub" ] || { echo "grub layout needs a signed grub: set GRUB=<grubx64.efi.signed>"; exit 1; }
+    mkdir -p "$out/esp/EFI/BOOT" "$out/esp/1bit"
+    cp -L "$shim" "$out/esp/EFI/BOOT/BOOTX64.EFI"
+    cp -L "$grub" "$out/esp/EFI/BOOT/grubx64.efi"
+    [ -f "${MOK_MANAGER:-/usr/lib/shim/mmx64.efi}" ] && cp -L "${MOK_MANAGER:-/usr/lib/shim/mmx64.efi}" "$out/esp/EFI/BOOT/mmx64.efi"
+    # grub under Secure Boot only loads a signed kernel, so the kernel is signed with the same enrolled
+    # MOK (it already is on this box, but sign our copy rather than trusting that).
+    cp -L "$vmlinuz" "$out/esp/1bit/vmlinuz"
+    if [ -n "${MOK_KEY:-}${MOK_CERT:-}" ] && command -v sbsign > /dev/null; then
+        sbsign --key "$MOK_KEY" --cert "$MOK_CERT" --output "$out/esp/1bit/vmlinuz.signed" "$out/esp/1bit/vmlinuz" > /dev/null &&
+            mv -f "$out/esp/1bit/vmlinuz.signed" "$out/esp/1bit/vmlinuz"
+    fi
+    cp -L "$out/initramfs.img" "$out/esp/1bit/initramfs.img"
+    cat > "$out/esp/EFI/BOOT/grub.cfg" <<GRUBCFG
+set timeout=12
+set default=0
+menuentry "1bit OS v2026.43 - LIVE (runs from RAM, nothing installed)" {
+    linux /1bit/vmlinuz $cmdline
+    initrd /1bit/initramfs.img
+}
+menuentry "1bit OS - LIVE, verbose, no GPU driver" {
+    linux /1bit/vmlinuz ${cmdline} 1bit.nogpu=1
+    initrd /1bit/initramfs.img
+}
+menuentry "1bit OS - root shell only" {
+    linux /1bit/vmlinuz $cmdline 1bit.shell=1
+    initrd /1bit/initramfs.img
+}
+GRUBCFG
+    # Bisect entry: the machine's own signed kernel + initrd, on the same stick, through the same
+    # shim->grub chain. If this reaches userspace and ours does not, the boot path is proven and the
+    # fault is in our kernel/initramfs payload.
+    if [ -n "${BOOT_TEST_KERNEL:-}" ] && [ -f "${BOOT_TEST_KERNEL}" ]; then
+        mkdir -p "$out/esp/test"
+        cp -L "${BOOT_TEST_KERNEL}" "$out/esp/test/vmlinuz"
+        [ -n "${BOOT_TEST_INITRD:-}" ] && [ -f "${BOOT_TEST_INITRD}" ] && cp -L "${BOOT_TEST_INITRD}" "$out/esp/test/initrd.img"
+        cat >> "$out/esp/EFI/BOOT/grub.cfg" <<TESTCFG
+menuentry "TEST: this machine's own kernel + initrd (bisect)" {
+    linux /test/vmlinuz root=/dev/ram0 rw console=tty0 console=ttyS0,115200
+    initrd /test/initrd.img
+}
+TESTCFG
+        echo "   ESP: bisect entry added ($(basename "${BOOT_TEST_KERNEL}"))"
+    fi
+    echo "   ESP: shim + signed grub + separate vmlinuz/initramfs + grub.cfg (layout=grub)"
+else
+    MTOOLS_SKIP_CHECK=1 mk mcopy -i "$out/efi.part" "$out/1bit-os.efi" ::/EFI/BOOT/BOOTX64.EFI
+    echo "   ESP: unified kernel image as BOOTX64.EFI (layout=uki)"
+fi
+if [ "$BOOT_LAYOUT" = grub ]; then
+    MTOOLS_SKIP_CHECK=1 mk mcopy -s -i "$out/efi.part" "$out/esp"/* ::/ ||
+        { echo "copying the ESP tree into the FAT failed"; exit 1; }
+fi
 rm -rf "$out/data.dir"; mkdir -p "$out/data.dir/models" "$out/data.dir/ssh" "$out/data.dir/lemonade/cache" "$out/data.dir/lemonade/config"
 cat > "$out/data.dir/models/README" <<'TXT'
 Put GGUF files and NPU model directories here. Lemonade lists every GGUF in this folder
@@ -395,7 +430,49 @@ echo "Put your SSH public key(s) in authorized_keys here; 1bit OS takes key logi
 [ -n "${AUTHORIZED_KEYS:-}" ] && cp "$AUTHORIZED_KEYS" "$out/data.dir/ssh/authorized_keys"
 for m in ${MODELS:-}; do cp -L "$m" "$out/data.dir/models/"; done
 data_mb=${DATA_MB:-$(( $(du -sm "$out/data.dir" | cut -f1) + 1024 ))}   # the contents plus 1 GiB
-rm -f "$out/data.part"; mkfs.ext4 -q -L 1BIT-DATA -d "$out/data.dir" "$out/data.part" $((data_mb))M
+rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
+    # The sealed sets go on the STICK'S DATA PARTITION, not inside the RAM image. They are ~124 MB and
+    # were making the initramfs 103 MB compressed, which is what grub was failing to load on real
+    # hardware (the machine's own 37 MB initrd loads fine). init.sh links them to the engine's
+    # expected path at boot, so the engine still finds npu/kernels beside itself.
+    mkdir -p "$out/data.dir/npu"
+    cp -a "$build/npu/kernels" "$out/data.dir/npu/"
+    sealed=$(find "$out/data.dir/npu/kernels" -name layer1.elf -exec \
+        sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
+    total=$(find "$out/data.dir/npu/kernels" -name layer1.elf | wc -l)
+    stray=$(find "$out/data.dir/npu/kernels" -mindepth 3 \( -name '*.mlir' -o -name '*.o' -o -name 'layer1.work' -o -name '*.pdi' \) | head -3)
+    [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
+    [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
+    [ -z "$stray" ] || { echo "npu/kernels carries build artifacts, not just layout.json + layer1.elf:"; echo "$stray"; exit 1; }
+    echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) sealed sets on the data partition ($sealed kernels)"
+fi
+mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"
+hrx=$build/hrx/llama/bin
+cache_get() { sed -n "s/^$1:[A-Z]*=//p" "$build/CMakeCache.txt" 2>/dev/null; }
+if [ -x "$hrx/llama-server" ]; then
+    # at its build path: 1bit serve runs it from there (ONEBIT_HRX_SERVER), for HRX0 and the CPU
+    copy_elf "$hrx/llama-server" $(ls "$hrx"/lib*.so* 2>/dev/null)
+    ln -s "$hrx/llama-server" "$root/opt/1bit-llama/llama-server"
+    # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md)
+    hsa=$(cache_get ONEBIT_HRX_LIBHSA)
+    [ -n "$hsa" ] && [ -e "$hsa" ] || { echo "no ONEBIT_HRX_LIBHSA in $build/CMakeCache.txt"; exit 1; }
+    copy_elf "$hsa"
+    echo "$hsa" > "$root/etc/1bit/libhsa"
+    # libdrm's GPU name table, where TheRock has one (names only; HSA works without it)
+    for ids in "$(dirname "$hsa")"/../share/libdrm/amdgpu.ids "$(cache_get ONEBIT_HRX_TOOLCHAIN)"/share/libdrm/amdgpu.ids; do
+        if [ -e "$ids" ]; then ids=$(realpath "$ids"); mkdir -p "$root$(dirname "$ids")"; cp "$ids" "$root$ids"; break; fi
+    done
+    echo "   HRX llama-server ($hrx), HSA runtime $hsa"
+elif [ -n "${LLAMA_SERVER:-}" ]; then
+    # test images only: a CPU llama-server, found on PATH by a 1bit built without HRX
+    ls=$(realpath "$LLAMA_SERVER")
+    copy_elf "$ls" $(ls "$(dirname "$ls")"/lib*.so* 2>/dev/null)
+    ln -s "$ls" "$root/opt/1bit-llama/llama-server"
+    echo "   CPU llama-server ($ls): a test image, no HRX"
+else
+    echo "no HRX llama-server in $build (build with -DONEBIT_HRX=ON; LLAMA_SERVER=<path> for a CPU-only test image)"; exit 1
+fi
+mkfs.ext4 -q -L 1BIT-DATA -d "$out/data.dir" "$out/data.part" $((data_mb))M
 img=$out/1bit-os.img; rm -f "$img"
 truncate -s $(( (efi_mb + data_mb + 2) * 1048576 )) "$img"
 printf 'label: gpt\nstart=2048, size=%s, type=U, name="EFI"\ntype=L, name="1BIT-DATA"\n' $((efi_mb * 2048)) | sfdisk -q "$img"

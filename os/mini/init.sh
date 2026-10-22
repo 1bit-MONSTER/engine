@@ -26,9 +26,13 @@ hostname -F /etc/hostname
 
 echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"; echo
 
-# drivers: GPU, NPU, network, USB storage
-# sd_mod makes a USB stick a disk (usb-storage only presents it as a SCSI device)
-for m in amdgpu amdxdna r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod vfat ext4; do modprobe -q "$m"; done
+# drivers, in the order the boot needs them: network, USB storage and the USB4/Type-C stack first, so
+# the machine is reachable and the stick readable even if a GPU probe is slow. sd_mod makes a USB
+# stick a disk (usb-storage only presents it as a SCSI device); the TYPEC/Thunderbolt modules are what
+# bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
+# PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
+# comes up with no network at all, which looks exactly like a hang.
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod vfat ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
 # network: DHCP on every wired interface
@@ -42,11 +46,86 @@ done
 # models: the stick's 1BIT-DATA partition, if present (the internal disk is left alone)
 # USB storage can take several seconds to appear: wait for the partition, up to 20 s
 data=
-for i in $(seq 20); do
+# A USB 2.0 stick can take 45 s or more to appear on this machine (sd 1:0:0:0: [sda] at t=46.4 s in the
+# box's own log), and the old 20 s window expired before it did - so /data never mounted, the keys
+# never arrived and nothing was logged. Wait much longer, and say so as we go.
+i=0
+while [ $i -lt 90 ]; do
     data=$(findfs LABEL=1BIT-DATA 2>/dev/null) && break
-    sleep 1
+    [ $i = 30 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
+    [ $i = 60 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
+    sleep 1; i=$((i+1))
 done
 if [ -n "$data" ]; then mount "$data" /data && echo "models: /data/models (from $data)"; fi
+
+# Evidence that outlives a live boot: stage markers on the stick, so a machine that hangs later can be
+# diagnosed by reading /data/boot.log from another system instead of squinting at the console.
+stage() { echo "$(date -u +%H:%M:%S) $*" >> /data/boot.log 2>/dev/null; echo "$*"; }
+# If the data partition did not turn up, log to the EFI partition instead - it is the one pieces of the
+# stick the firmware could read, so it is the best chance of keeping evidence across a panic.
+if ! grep -q " /data " /proc/mounts; then
+    os=$(findfs LABEL=1BIT-OS 2>/dev/null)
+    if [ -n "$os" ] && mount -t vfat -o rw "$os" /data 2>/dev/null; then
+        echo "log fallback: EFI partition mounted at /data"
+    fi
+fi
+stage "stick mounted at ${data:-nothing}"
+
+# The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
+# to load): link them to the path the engine looks for, beside itself.
+if [ -d /data/npu/kernels ] && [ -d /home ]; then
+    mkdir -p /home/bcloud/wt/npupkg-build/npu 2>/dev/null
+    ln -sfn /data/npu/kernels /home/bcloud/wt/npupkg-build/npu/kernels 2>/dev/null
+    say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
+fi
+
+# Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
+# screen you have to guess about.
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null; [ -w /dev/console ] && echo "$*" > /dev/console 2>/dev/null; }
+n=0
+step() { n=$((n+1)); say "[$n] $*"; }
+
+MODE=live
+if [ -c /dev/console ]; then
+    {
+      echo
+      echo "  1bit OS  v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  ------------------------------------------------------------------------------"
+      echo "   1) Lemonade appliance            (default, starts in 12s)"
+      echo "   2) Lemonade, verbose, no GPU driver"
+      echo "   3) Root shell (no services)"
+      echo "   4) Power off"
+      echo
+    } > /dev/console 2>/dev/null
+    printf "  choice: " > /dev/console 2>/dev/null
+    i=0
+    while [ $i -lt 12 ]; do
+        if read -r -t 1 -n 1 c < /dev/console 2>/dev/null; then
+            case "$c" in
+                2) MODE=nogpu;  break ;;
+                3) MODE=shell;  break ;;
+                4) MODE=off;    break ;;
+                1|"") break ;;
+            esac
+        fi
+        i=$((i+1))
+    done
+    echo > /dev/console 2>/dev/null
+fi
+case "$MODE" in
+    off)  say "powering off (choice 4)"; sync; poweroff -f ;;
+    shell) say "root shell - the appliance will not start (choice 3)"; exec setsid cttyhack sh < /dev/console > /dev/console 2>&1 ;;
+    nogpu) say "verbose mode: GPU/NPU drivers are skipped (choice 2)" ;;
+esac
+
+# GPU and NPU last: on real hardware these probes are the slow part of the boot (and the usual suspect
+# when a boot appears to stop), and by now the network is up and the stick is mounted.
+# GPU/NPU drivers are NOT loaded here. The live image ships the machine's own /lib/modules, and its
+# stock amdxdna disagrees with the private 1bit build - loading it at boot panics before the appliance
+# is even reachable. The engine loads what it needs when it starts a model, so a live boot does not
+# need them: leave them out and the appliance comes up, stays visible and stays reachable.
+say "[gpu] drivers left to the engine (not loaded at boot)"
+if [ "$MODE" = nogpu ]; then say "[gpu] (menu: no-GPU mode was already selected)"; fi
 
 # HRX: TheRock's HSA runtime (1bit serve also finds it at its compiled-in path), and the Loom
 # kernel cache on the stick, so kernels compiled on the first boot are reused after a reboot
@@ -147,4 +226,8 @@ fi
 
 # a shell on the console and the serial port
 [ -e /dev/ttyS0 ] && setsid sh -c 'exec sh </dev/ttyS0 >/dev/ttyS0 2>&1' &
-exec setsid cttyhack sh
+# PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
+# what happened on real hardware - the script finished, the final exec returned, and the machine
+# rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
+setsid cttyhack sh < /dev/console > /dev/console 2>&1 &
+while :; do sleep 3600; done

@@ -1,0 +1,236 @@
+#!/usr/bin/env bash
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# gpu-hold [-t MINUTES] [-l LABEL] [-w WAIT_SECONDS] [-q QUEUE_DIR] [--] CMD [ARGS...]
+#
+# Runs one GPU job under a fair FIFO claim on the box's ~/GPU-TOKEN, so agents stop racing for it. The token
+# file stays compatible with everything that predates this script: it is still one file whose content names
+# its holder, and a holder that knows nothing about the queue simply makes everyone wait.
+#
+# What one invocation does:
+#   1. writes a ticket ~/GPU-QUEUE/<epoch-ns>.<label> (pid and command go inside the ticket), so queue order is
+#      file-name order: the oldest ticket runs first, whoever arrived first;
+#   2. creates ~/GPU-TOKEN only when its ticket is the oldest live ticket AND the token is absent AND the die is
+#      at or below the start gate, writing its label into the token;
+#   3. runs CMD under that hold, with a max-hold timeout (default 14 minutes) and a watchdog that aborts it at
+#      the critical temperature;
+#   4. always releases the token and removes its ticket, however it exits (trap on EXIT/INT/TERM/HUP);
+#   5. drops tickets, and tokens, whose owner process is gone, so a killed agent cannot block the queue;
+#   6. makes a label that has just released wait RELEASE_WAIT seconds (default 180) before it holds again.
+#
+# Options and environment (all optional):
+#   -t MINUTES     max hold, default $GPU_HOLD_MINUTES or 14        (0.05 = 3 seconds)
+#   -l LABEL       label written into the token, default "<command name>-$$"
+#   -w SECONDS     how long to queue before giving up, default $GPU_HOLD_WAIT or 5400; exit 75 on timeout
+#   -q DIR         queue directory, default $GPU_QUEUE_DIR or ~/GPU-QUEUE
+#   GPU_TOKEN_FILE         the token file, default ~/GPU-TOKEN
+#   GPU_HOLD_RELEASE_WAIT  seconds a label must wait after releasing, default 180
+#   GPU_HOLD_TCTL_START    start gate in C, default 75 - a hot box is not taken
+#   GPU_HOLD_TCTL_ABORT    abort in C, default 93
+#   GPU_HOLD_TCTL_FILE     temperature file in millidegrees, default the k10temp hwmon
+#   GPU_HOLD_POLL          queue poll interval in seconds, default 2
+#   GPU_HOLD_LOG           also append the protocol log to this file
+#
+# Exit status is the command's, or 124 when the max hold cut it short, 75 when the queue never came round.
+set -u
+
+MINUTES=${GPU_HOLD_MINUTES:-14}
+LABEL=""
+WAIT=${GPU_HOLD_WAIT:-5400}
+QUEUE=${GPU_QUEUE_DIR:-$HOME/GPU-QUEUE}
+TOKEN=${GPU_TOKEN_FILE:-$HOME/GPU-TOKEN}
+RELEASE_WAIT=${GPU_HOLD_RELEASE_WAIT:-180}
+TCTL_START=${GPU_HOLD_TCTL_START:-75}
+TCTL_ABORT=${GPU_HOLD_TCTL_ABORT:-93}
+POLL=${GPU_HOLD_POLL:-2}
+LOG=${GPU_HOLD_LOG:-}
+
+while getopts ":t:l:w:q:h" opt; do
+    case $opt in
+        t) MINUTES=$OPTARG ;;
+        l) LABEL=$OPTARG ;;
+        w) WAIT=$OPTARG ;;
+        q) QUEUE=$OPTARG ;;
+        h) sed -n '18,58p' "$0"; exit 0 ;;
+        *) echo "gpu-hold: unknown option -$OPTARG (try -h)" >&2; exit 2 ;;
+    esac
+done
+shift $((OPTIND - 1))
+[ $# -gt 0 ] || { echo "gpu-hold: no command given (try -h)" >&2; exit 2; }
+
+tctl_file() {
+    if [ -n "${GPU_HOLD_TCTL_FILE:-}" ]; then printf '%s' "$GPU_HOLD_TCTL_FILE"; return; fi
+    local f
+    f=$(grep -l k10temp /sys/class/hwmon/*/name 2> /dev/null | head -n 1)
+    if [ -n "$f" ]; then printf '%s' "$(dirname "$f")/temp1_input"; else printf '%s' /dev/null; fi
+}
+TCTL_FILE=$(tctl_file)
+tctl() {
+    local v
+    v=$(cat "$TCTL_FILE" 2> /dev/null) || v=""
+    if [ -n "$v" ]; then echo $((v / 1000)); else echo 0; fi
+}
+
+log() {
+    local line
+    line="gpu-hold[$$] $* $(date -Is)"
+    printf '%s\n' "$line" >&2
+    if [ -n "$LOG" ]; then printf '%s\n' "$line" >> "$LOG"; fi
+}
+
+mkdir -p "$QUEUE" || { echo "gpu-hold: cannot create $QUEUE" >&2; exit 2; }
+[ -n "$LABEL" ] || LABEL="$(basename -- "$1")-$$"
+SAFE=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9_.-' '_')
+TICKET="$QUEUE/$(printf '%020d' "$(date +%s%N)").$SAFE"
+RELEASED_AT="$QUEUE/.released-at.$SAFE"
+TICKET_NAME=$(basename "$TICKET")
+
+state=queued
+mine=""
+child=""
+watchdog=""
+
+release() {
+    if [ "$state" = holding ] && [ -n "$mine" ] && [ "$(cat "$TOKEN" 2> /dev/null)" = "$mine" ]; then
+        rm -f "$TOKEN"
+        date +%s > "$RELEASED_AT"
+        log "released $TOKEN"
+    fi
+    if [ "$state" != done ]; then rm -f "$TICKET"; fi
+    state=done
+}
+trap release EXIT
+trap 'exit 143' TERM INT HUP
+
+pid_of() { sed -n 's/^pid=\([0-9][0-9]*\).*/\1/p' "$1" 2> /dev/null | head -n 1; }
+
+stale() {
+    local pid
+    pid=$(pid_of "$1")
+    if [ -z "$pid" ]; then return 0; fi          # unreadable or half-written: stale
+    kill -0 "$pid" 2> /dev/null && return 1
+    return 0
+}
+
+oldest_ticket() {
+    local f pid
+    for f in $(ls -1 "$QUEUE" 2> /dev/null | grep -v '^\.' | sort); do
+        [ -f "$QUEUE/$f" ] || continue
+        if stale "$QUEUE/$f"; then
+            rm -f "$QUEUE/$f"
+            log "dropped stale ticket $f (owner pid gone)"
+            continue
+        fi
+        printf '%s' "$f"
+        return
+    done
+}
+
+# A token left behind by a killed holder blocks everyone, so reap it too - but only when it is clearly ours to
+# read (a "gpu-hold ..." line with a pid). Anything else is left alone: it belongs to a wrapper this script
+# does not know.
+reap_token() {
+    [ -e "$TOKEN" ] || return 0
+    local content pid
+    content=$(cat "$TOKEN" 2> /dev/null) || return 0
+    case $content in gpu-hold*) ;; *) return 0 ;; esac
+    pid=$(printf '%s' "$content" | sed -n 's/.* pid \([0-9][0-9]*\) .*/\1/p' | head -n 1)
+    if [ -n "$pid" ] && ! kill -0 "$pid" 2> /dev/null; then
+        rm -f "$TOKEN"
+        log "dropped stale token (holder pid $pid gone): $content"
+    fi
+}
+
+printf 'pid=%s\nlabel=%s\ncmd=%s\nenqueued=%s\n' "$$" "$LABEL" "$*" "$(date -Is)" > "$TICKET" ||
+    { echo "gpu-hold: cannot write $TICKET" >&2; exit 2; }
+log "queued '$LABEL' as $TICKET_NAME"
+
+waited=0
+while [ "$state" = queued ]; do
+    reap_token
+    head_ticket=$(oldest_ticket)
+    if [ "$head_ticket" = "$TICKET_NAME" ]; then
+        if [ -e "$TOKEN" ]; then
+            if [ "$waited" = 0 ]; then
+                log "first in the queue, waiting for $TOKEN (held by: $(cat "$TOKEN" 2> /dev/null || echo '?'))"
+            fi
+        elif [ "$(tctl)" -ge "$TCTL_START" ]; then
+            if [ "$waited" = 0 ]; then
+                log "first in the queue, holding off: die at $(tctl)C, start gate ${TCTL_START}C"
+            fi
+        elif [ -f "$RELEASED_AT" ] &&
+             [ $(( $(date +%s) - $(cat "$RELEASED_AT" 2> /dev/null || echo 0) )) -lt "$RELEASE_WAIT" ]; then
+            if [ "$waited" = 0 ]; then
+                log "first in the queue, releasing label waits ${RELEASE_WAIT}s after its last hold"
+            fi
+        else
+            mine="gpu-hold $LABEL pid $$ $(date -Is)"
+            if ( set -o noclobber; printf '%s\n' "$mine" > "$TOKEN" ) 2> /dev/null; then
+                state=holding
+                log "took $TOKEN after ${waited}s (die $(tctl)C)"
+                break
+            fi
+        fi
+    fi
+    if [ "$waited" -ge "$WAIT" ]; then
+        log "::error::queue never came round after ${WAIT}s (head: ${head_ticket:-none}, token: $(cat "$TOKEN" 2> /dev/null || echo free))"
+        rm -f "$TICKET"
+        state=done
+        exit 75
+    fi
+    sleep "$POLL"
+    waited=$((waited + POLL))
+done
+
+deadline=$(( $(date +%s) + $(awk -v m="$MINUTES" 'BEGIN { printf "%d", m * 60 }') ))
+started=$(date +%s)
+"$@" &
+child=$!
+# The watchdog is a function so it can be given the command's pid: a subshell inherits a copy of the shell's
+# variables, so a watchdog started before the command (the first version did) holds an empty pid and neither
+# the abort nor the max hold stops anything.
+watch() {
+    local target=$1
+    while sleep 2; do
+        t=$(tctl)
+        if [ "$t" -ge "$TCTL_ABORT" ]; then
+            log "ABORT die at ${t}C (limit ${TCTL_ABORT}C)"
+            pkill -TERM -P "$target" 2> /dev/null
+            kill -TERM "$target" 2> /dev/null
+            return
+        fi
+        if [ "$(date +%s)" -ge "$deadline" ]; then
+            log "max hold of ${MINUTES} min reached"
+            pkill -TERM -P "$target" 2> /dev/null
+            kill -TERM "$target" 2> /dev/null
+            return
+        fi
+    done
+}
+watch "$child" &
+watchdog=$!
+
+wait "$child"
+rc=$?
+# wait reports 143 for SIGTERM; say 124 for a max hold, as timeout does
+if [ "$rc" = 143 ] && [ "$(date +%s)" -ge "$deadline" ]; then rc=124; fi
+held=$(( $(date +%s) - started ))
+
+kill "$watchdog" 2> /dev/null
+wait "$watchdog" 2> /dev/null
+log "command exited $rc after ${held}s"
+release
+exit "$rc"

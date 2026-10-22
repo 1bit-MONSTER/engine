@@ -45,18 +45,36 @@
 #   HW_GATE_PRIVATE=0  build the public HRX plumbing only, without the private kernels (a box with
 #               no read access to gpu-kernels). The default builds them: a fetch failure is exit 2.
 #
-# The gate takes the fleet's GPU token (~/GPU-TOKEN, the file other long GPU jobs such as Hyperloom
-# write their name into) before its first GPU step: it waits up to HW_GATE_TOKEN_WAIT s (default
-# 3600) while another job holds it, logging the holder, then writes "hw-gate <run> <time>" into it
-# and removes it on exit if the content is still its own. A wait that times out is exit 2. Two
-# gate runs (#481) died "server failed (rc 137)" loading models while Hyperloom held the token.
-# HW_GATE_TOKEN=none skips this (a caller that already holds the token).
+# The gate takes the fleet's GPU token (~/GPU-TOKEN) before its first GPU step. With the gpu-hold helper
+# installed (scripts/gpu-hold; ~/.local/bin/gpu-hold on the box; the protocol is in ~/amd-oss/GPU-TOKEN.md)
+# the whole run sits inside one fair claim: tickets are served in arrival order, the die temperature gates the
+# start and aborts the run, the hold has a deadline (HW_GATE_HOLD_MINUTES, default 45), and a killed run
+# cannot leave the token behind. HW_GATE_GPU_HOLD=0 turns that off. Without the helper the gate waits up to
+# HW_GATE_TOKEN_WAIT s (default 3600) for the file to be free, logging the holder, then writes
+# "hw-gate <run> <time>" into it and removes it on exit if the content is still its own; a wait that times out
+# is exit 2. Two gate runs (#481) died "server failed (rc 137)" loading models while Hyperloom held the token.
+# HW_GATE_TOKEN=none skips all of it (a caller that already holds the token).
 #
 # Every GPU step holds ~/npu.lock (flock) only while it runs, inside scripts/mem-guard.sh and
 # ~/lb/thermal-run.sh. Before each one it waits for the PR-Agent model (coder-llm, :8090) to be
 # idle, and afterwards it reports any new amdgpu ring timeout (HRX dispatches starve that
 # Vulkan service). Exit 0 = pass, 1 = a check failed, 2 = the box could not run the gate.
 set -uo pipefail
+
+# Fair GPU queue (the protocol is written down in ~/amd-oss/GPU-TOKEN.md on the box): when the gpu-hold helper
+# is installed, the whole gate runs inside one claim on ~/GPU-TOKEN instead of racing for it with a noclobber
+# open. Claims are served in arrival order, a killed run cannot leave the token behind, the die temperature
+# gates the start and aborts the run, and the hold has a deadline. Without the helper this script behaves
+# exactly as before. HW_GATE_GPU_HOLD=0 skips the queue; the inner run (GPU_HOLD=1) uses the outer claim.
+if [ "${GPU_HOLD:-}" != 1 ] && [ "${HW_GATE_GPU_HOLD:-1}" != 0 ] && [ -z "${HW_GATE_TOKEN:-}" ]; then
+    hold=$(command -v gpu-hold 2> /dev/null || true)
+    if [ -z "$hold" ] && [ -x "$(dirname "$0")/gpu-hold" ]; then hold="$(dirname "$0")/gpu-hold"; fi
+    if [ -n "$hold" ]; then
+        GPU_HOLD=1 HW_GATE_TOKEN=none exec "$hold" \
+            -l "hw-gate${GITHUB_RUN_ID:+ run $GITHUB_RUN_ID} pid $$" \
+            -t "${HW_GATE_HOLD_MINUTES:-45}" -w "${HW_GATE_TOKEN_WAIT:-5400}" -- "$0" "$@"
+    fi
+fi
 
 ROOT=$(cd "$(dirname "$0")/.." && pwd)
 STORE=${HW_GATE_STORE:-$HOME/.cache/hw-gate}

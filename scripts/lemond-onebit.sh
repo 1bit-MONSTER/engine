@@ -24,5 +24,8 @@
 set -euo pipefail
 here=$(cd "$(dirname "$(readlink -f "$0")")" && pwd)
 export LEMONADE_ONEBIT_BIN=${LEMONADE_ONEBIT_BIN:-$here/1bit/1bit}
+# the NPU engine loads sealed kernels only, always: no opt-out (the release 1bit refuses plain
+# kernel sets on its own too)
+export ONEBIT_KCRYPT_REQUIRE_SEALED=1
 export PATH=$here/bin:$PATH
 exec "$here/bin/lemond" "$@"

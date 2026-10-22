@@ -43,6 +43,10 @@
 #   GPU_HOLD_TCTL_FILE     temperature file in millidegrees, default the k10temp hwmon
 #   GPU_HOLD_POLL          queue poll interval in seconds, default 2
 #   GPU_HOLD_LOG           also append the protocol log to this file
+#   GPU_HOLD_IGNORE_THERMAL_HOLD=1  start even while strixhalo-thermal-guard's ~/THERMAL-HOLD is up
+#   GPU_HOLD_COOLDOWN      seconds the WHOLE queue waits after a hold that ended at or above
+#                          GPU_HOLD_COOLDOWN_TCTL, whatever its label; default 180, 0 disables the cool-down
+#   GPU_HOLD_COOLDOWN_TCTL die temperature at release that counts as "ended hot", default 85
 #
 # Exit status is the command's, or 124 when the max hold cut it short, 75 when the queue never came round.
 set -u
@@ -57,6 +61,9 @@ TCTL_START=${GPU_HOLD_TCTL_START:-75}
 TCTL_ABORT=${GPU_HOLD_TCTL_ABORT:-93}
 POLL=${GPU_HOLD_POLL:-2}
 LOG=${GPU_HOLD_LOG:-}
+THERMAL_FLAG=${GPU_HOLD_THERMAL_FLAG:-$HOME/THERMAL-HOLD}
+COOLDOWN=${GPU_HOLD_COOLDOWN:-180}
+COOLDOWN_TCTL=${GPU_HOLD_COOLDOWN_TCTL:-85}
 
 while getopts ":t:l:w:q:h" opt; do
     case $opt in
@@ -92,6 +99,7 @@ log() {
 }
 
 mkdir -p "$QUEUE" || { echo "gpu-hold: cannot create $QUEUE" >&2; exit 2; }
+COOLDOWN_STAMP="$QUEUE/.cooldown"      # "<epoch> <C>" of the last hold that ended hot; shared by every label
 [ -n "$LABEL" ] || LABEL="$(basename -- "$1")-$$"
 SAFE=$(printf '%s' "$LABEL" | tr -c 'A-Za-z0-9_.-' '_')
 TICKET="$QUEUE/$(printf '%020d' "$(date +%s%N)").$SAFE"
@@ -103,8 +111,28 @@ mine=""
 child=""
 watchdog=""
 
+# A hold that ends hot leaves the box soaked: the next claim, whatever its label, would start on hot air and climb
+# straight back. cool_end stamps the queue at release; cool_left is what the next ticket waits.
+cool_end() {
+    local t
+    [ "$COOLDOWN" -gt 0 ] || return 0
+    t=$(tctl)
+    [ "$t" -ge "$COOLDOWN_TCTL" ] || return 0
+    printf '%s %s\n' "$(date +%s)" "$t" > "$COOLDOWN_STAMP"
+    log "ended at ${t}C: no new claim starts for ${COOLDOWN}s (any label)"
+}
+cool_left() {
+    local stamp now
+    [ "$COOLDOWN" -gt 0 ] && [ -f "$COOLDOWN_STAMP" ] || { echo 0; return; }
+    stamp=$(sed -n '1s/ .*//p' "$COOLDOWN_STAMP" 2> /dev/null)
+    case $stamp in '' | *[!0-9]*) echo 0; return ;; esac
+    now=$(date +%s)
+    if [ $((now - stamp)) -lt "$COOLDOWN" ]; then echo $((COOLDOWN - now + stamp)); else echo 0; fi
+}
+
 release() {
     if [ "$state" = holding ] && [ -n "$mine" ] && [ "$(cat "$TOKEN" 2> /dev/null)" = "$mine" ]; then
+        cool_end
         rm -f "$TOKEN"
         date +%s > "$RELEASED_AT"
         log "released $TOKEN"
@@ -161,6 +189,7 @@ log "queued '$LABEL' as $TICKET_NAME"
 waited=0
 while [ "$state" = queued ]; do
     reap_token
+    cool=$(cool_left)
     head_ticket=$(oldest_ticket)
     if [ "$head_ticket" = "$TICKET_NAME" ]; then
         if [ -e "$TOKEN" ]; then
@@ -171,10 +200,20 @@ while [ "$state" = queued ]; do
             if [ "$waited" = 0 ]; then
                 log "first in the queue, holding off: die at $(tctl)C, start gate ${TCTL_START}C"
             fi
+        elif [ -e "$THERMAL_FLAG" ] && [ "${GPU_HOLD_IGNORE_THERMAL_HOLD:-0}" != 1 ] &&
+             kill -0 "$(head -n 1 "$THERMAL_FLAG" 2> /dev/null)" 2> /dev/null; then
+            # strixhalo-thermal-guard has the box hot and the compilers paused: a new claim would only add heat.
+            if [ "$waited" = 0 ]; then
+                log "first in the queue, holding off: $(head -n 2 "$THERMAL_FLAG" | paste -sd' ') is up"
+            fi
         elif [ -f "$RELEASED_AT" ] &&
              [ $(( $(date +%s) - $(cat "$RELEASED_AT" 2> /dev/null || echo 0) )) -lt "$RELEASE_WAIT" ]; then
             if [ "$waited" = 0 ]; then
                 log "first in the queue, releasing label waits ${RELEASE_WAIT}s after its last hold"
+            fi
+        elif [ "$cool" -gt 0 ]; then
+            if [ "$waited" = 0 ] || [ $((waited % 60)) = 0 ]; then
+                log "first in the queue, cooling down after a hot hold (${cool}s to go, then any label may start)"
             fi
         else
             mine="gpu-hold $LABEL pid $$ $(date -Is)"

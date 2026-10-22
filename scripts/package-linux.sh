@@ -59,6 +59,14 @@ if [ -d "$stage/onnx" ]; then
     done
 fi
 
+# the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
+# beside 1bit in npu/kernels, where it looks for them
+if [ -d "$build/npu/kernels" ]; then
+    mkdir -p "$stage/npu"
+    cp -a "$build/npu/kernels" "$stage/npu/"
+    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets"
+fi
+
 # Every program and library finds its libraries beside itself (scripts/pack-elf.sh): a library it
 # loads from elsewhere in the build tree (HRX's libhrx, libloomc) or LLVM's OpenMP runtime
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside

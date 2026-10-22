@@ -123,6 +123,19 @@ build() {
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
+    # The NPU kernels (docs/releases.md, "The NPU engine"): sealed, packed beside 1bit in
+    # npu/kernels. Off until the hardware gate's npu phase passes on Strix Halo; then
+    # WEEKLY_NPU_KERNELS defaults to 1. The private checkout does the work through its one entry
+    # point (key install, sealing, the per-commit kernel cache); this script names nothing in it.
+    # ONEBIT_NPU_RELEASE makes the built 1bit load sealed kernels only.
+    if [ "${WEEKLY_NPU_KERNELS:-0}" = 1 ]; then
+        "$SRC/scripts/fetch-private.sh" "$SRC/config/npu-kernels.config" "$W/npu-kernels" > /dev/null 2>> "$LOGS/private.log" ||
+            { cat "$LOGS/private.log"; return 1; }
+        guard "$W/npu-kernels/addons/release-kernels.sh" "$BUILD/npu/kernels" "${ONEBIT_NPU_KEY_DIR:-$HOME/.config/1bit-npu-key}" \
+            > "$LOGS/npu-kernels.log" 2>&1 || { tail -n 5 "$LOGS/npu-kernels.log"; return 1; }
+        extra+=(-DONEBIT_NPU_PRIVATE="$W/npu-kernels" -DONEBIT_NPU_RELEASE=ON)
+        say "NPU kernels $(git -C "$W/npu-kernels" rev-parse --short HEAD): $(ls "$BUILD/npu/kernels" | wc -l) sealed sets"
+    fi
     # The ONNX backend ships with Microsoft's ONNX Runtime (GenAI) only: with RYZENAI_INSTALL_PATH
     # set, build-onnx.sh would copy AMD's Ryzen AI Software libraries beside ryzenai-server and
     # they would land in the package (package_checks refuses them too). The NPU through ONNX uses
@@ -261,6 +274,9 @@ stage_test() { run_tests; }
 #   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
 #             like one of the private checkouts' files
 #   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
+#   npu       (with WEEKLY_NPU_KERNELS) every file under npu/kernels but layout.json is sealed, never a
+#             plaintext ELF; every ELF in the tarball is for the host (x86-64); the packed 1bit has no
+#             symbol table and its strings name no private source file and no build-machine home
 #   onnx      onnx/ holds ryzenai-server, Microsoft's libonnxruntime-genai / libonnxruntime and their
 #             licence texts, nothing else: no part of AMD's Ryzen AI Software (the RyzenAI / VitisAI
 #             providers, AMD_LICENSE, the AIE compiler libraries), which users install themselves
@@ -292,12 +308,47 @@ package_checks() {  # package_checks <linux tarball>
     n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
             -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \) | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
-    names=$(for pin in npu-runtime gpu-kernels; do
+    names=$(for pin in npu-runtime gpu-kernels npu-kernels; do
+                [ -d "$W/$pin" ] || continue
                 git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
             done | xargs -r -n1 basename | grep -v -x -E 'README.md|NOTICE|LICENSE' | LC_ALL=C sort -u)
     n=$(find "$t" -type f -printf '%f\n' | LC_ALL=C sort -u | LC_ALL=C comm -12 - <(echo "$names") | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
+    # The NPU kernels, when the package carries them (WEEKLY_NPU_KERNELS): every kernel file is
+    # sealed (never a plaintext ELF), no ELF in the tarball is for anything but the host (an NPU
+    # kernel would be), the shipped 1bit has no symbol table, and its strings name no private
+    # source file and no build-machine home.
+    local nk=0 m privsrc
+    while IFS= read -r -d '' f; do
+        [ "$(basename "$f")" = layout.json ] && continue
+        [ "$(head -c 8 "$f")" = 1BPKCRYP ] || { echo "FAIL $f is not a sealed kernel artifact"; nk=$((nk + 1)); }
+    done < <(find "$t" -path '*/npu/kernels/*' -type f -print0)
+    [ "$nk" = 0 ] || bad=1
+    n=$(find "$t" -path '*/npu/kernels/*' -type f | wc -l)
+    [ "$n" = 0 ] || [ "$nk" != 0 ] || echo "ok   NPU kernels: $n files under npu/kernels, all sealed"
+    nk=0
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        m=$(od -An -t u2 -j 18 -N 2 "$f" | tr -d ' ')
+        [ "$m" = 62 ] || { echo "FAIL $f is an ELF for machine $m, not the host (x86-64)"; nk=$((nk + 1)); }
+    done < <(find "$t" -type f -print0)
+    [ "$nk" = 0 ] && echo "ok   every ELF in $(basename "$1") is a host (x86-64) program or library" || bad=1
+    f=$(find "$t" -maxdepth 2 -type f -name 1bit | head -1)
+    if [ -n "$f" ]; then
+        local b1=0
+        n=$(nm --defined-only "$f" 2>/dev/null | wc -l)
+        [ "$n" = 0 ] || { echo "FAIL the packed 1bit still has a symbol table ($n symbols)"; b1=1; }
+        privsrc=$(for pin in npu-runtime npu-kernels; do
+                      [ -d "$W/$pin" ] || continue
+                      git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null
+                  done | grep -E '\.(c|cc|cpp|cxx|h|hpp|py)$' | xargs -r -n1 basename | LC_ALL=C sort -u)
+        n=0; [ -z "$privsrc" ] || n=$(strings -a "$f" | grep -c -F -f <(printf '%s\n' "$privsrc") || true)
+        [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a private source file ($n strings)"; b1=1; }
+        n=$(strings -a "$f" | grep -c '/home/' || true)
+        [ "$n" = 0 ] || { echo "FAIL the packed 1bit names a build-machine home ($n strings)"; b1=1; }
+        if [ $b1 = 0 ]; then echo "ok   the packed 1bit: no symbol table, no private source names, no build-machine paths"; else bad=1; fi
+    fi
     for f in LICENSE NOTICE LICENSE-BINARY NOTICE-BINARY; do
         n=$(find "$t" -maxdepth 2 -type f -name "$f" | wc -l)
         [ "$n" != 0 ] || { echo "FAIL $f is not in $(basename "$1")"; bad=1; }

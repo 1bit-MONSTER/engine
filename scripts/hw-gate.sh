@@ -546,7 +546,7 @@ fi
 # tok_s <float>. oracle is dense Qwen3-0.6B decode vs an fp64 reference (token for token over a
 # prompt + teacher-forced steps), greedy64 the 64-position build, prefill the prompt prefill,
 # reproducible that repeated runs match byte for byte. Set HW_GATE_NPU_CHECK to the private
-# checker (it reads its own DXTEST/KERNELS/MODEL/REF/... from the environment) and
+# checker (it reads its own settings from the environment) and
 # HW_GATE_NPU_FLOOR to the tok/s floor (default 30). The NPU shares the box: this runs inside
 # the gate's GPU claim and holds ~/npu.lock, and is NOT wrapped in thermal-run (its freeze can
 # abort an NPU dispatch); cool() gates the start instead.

@@ -65,6 +65,12 @@ wrong key with no network callback of any kind; a lifted kernel file is cipherte
 ([npu.md](npu.md)). Wiring the kernels into the weekly release package is the last step; until a
 package carries them, HRX serves the GGUF models.
 
+`scripts/weekly.sh` packs them with `WEEKLY_NPU_KERNELS=1` (off until the hardware gate's `npu`
+phase passes on Strix Halo): the sealed kernel sets go beside `1bit` in `npu/kernels`, the build
+loads sealed kernels only (`ONEBIT_NPU_RELEASE`), and the package checks refuse a plaintext kernel,
+an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The
+release machine holds the kernel key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
+
 ### Private components
 
 Two components of the release binaries are proprietary and compiled in; their source is not in

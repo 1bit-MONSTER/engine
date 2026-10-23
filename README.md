@@ -68,6 +68,10 @@ and exits cleanly, so Lemonade can restart the model
 ([#486](https://github.com/1bit-MONSTER/engine/pull/486)). Serve numbers in these docs come from
 `tools/bench.py`, which A/B-measures configurations in the same run ([docs/bench.md](docs/bench.md)).
 
+The box's kernel is ours too: Linux `v7.3-rc4` plus the IOMMU PerfOpt backports, built from our
+config, MOK-signed for Secure Boot, and gated like a pin bump. Moving it to the next upstream tag is
+a written step list ([docs/kernel.md](docs/kernel.md)).
+
 **Install:** through Lemonade. The packages are Lemonade with the `onebit` recipe and the engine
 (unpack it and run `lemond-onebit`), and 1bit OS, a Lemonade appliance on a bootable USB image.
 On Ubuntu 26.04 the stock `lemond` from the Lemonade PPA runs the engine through a systemd drop-in,

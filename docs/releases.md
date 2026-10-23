@@ -29,21 +29,21 @@ release in the same week gets `.1`.
 
 ## v2026.43 (candidate, 23 Oct)
 
-Built from `main` by the release run; **nothing is tagged or published yet** — the owner publishes
-(TRELEASE.md on the release box). Artifacts, checksums and every check's log live in
-`RELEASE-CANDIDATE.md` beside the candidate build; the package rows below are filled from it and are
-marked *pending* until that file exists.
+Built from `main` by the release run; **nothing is tagged or published yet** — the owner publishes.
+The run records the artifacts, their checksums and every check's log beside the candidate build, and
+the package rows below are filled from that record and are marked *pending* until it exists.
 
 Release sha and pins (the submodules this candidate is built from):
 
 | component | pin |
 |---|---|
-| engine | release sha recorded when the last release-blocking PR merged — see `RELEASE-CANDIDATE.md` |
+| engine | `7871c71d` (main when the last release-blocking PR merged; a later merge today re-runs only the stages it touches, and the run's record carries the final sha) |
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
 | Lemonade (fork) | `27abcc24da99` |
-| gpu-kernels (private, HIP) | `abaa6bc484d5` (`config/gpu-kernels.config`) |
+| gpu-kernels (private, HIP) | `744bd713d968` (`config/gpu-kernels.config`) |
 | npu-kernels (private, sealed) | `17ed5be7a28a` (`config/npu-kernels.config`) |
+| npu-runtime (private) | `ce9fa59adf95` (`config/npu-runtime.config`) |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
 | DwarfStar / tokenizers / ryzenai-server | `5b013dc1bb` / `3012770722` / `69765cc591` |
@@ -78,7 +78,7 @@ K-quant verify took the step from 121 ms to 88 ms (`#487`). Decode without MTP s
 | change | PR | measured |
 |---|---|---|
 | 2..8-token K-quant verify kernels | `#487` | 27B `--mtp` **+31–39 %** |
-| batched MoE decode on our kernels | `#521` | see the batched row below (90 W cap, PCM pad (23 Oct)) |
+| batched MoE decode on our kernels | `#521`, `#526` | pin `744bd713d968`: the top-1 batched window from 5 tokens; the batched cells below were measured one pin earlier (90 W cap, PCM pad (23 Oct)) |
 | split-K decode attention for gated head-256 | `#500` | Qwen3.5-4B 32K decode **23.7 → 47.1 tok/s**; 27B **7.5 → 11.0** |
 | MoE formats for Qwen3.8-Flash-Next | `#494` | **5.1 → 26 tok/s**, 50 with MTP |
 | HIP prompt flash attention, causal block skipping | `#491` | Qwen3-4B pp4096 **+45 %** |

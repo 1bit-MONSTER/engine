@@ -189,6 +189,8 @@ rehearsal found these only after the build) and stops with a message naming what
 - **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
   (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for 1bit OS,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
+  Which kernel that image should carry, and how a new one is built, signed and gated before it is
+  allowed on the box, is [kernel.md](kernel.md).
   The image's licences step copies from the submodules of the run's own checkout (`<workdir>/src`,
   checked out by the build stage), so run `os/mini/mkimage.sh` from there, not from a plain
   worktree without submodules.

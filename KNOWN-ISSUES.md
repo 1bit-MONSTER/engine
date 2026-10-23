@@ -35,10 +35,14 @@ pin once it lands. Treat a single failure of this case as a flake, not a regress
 
 The investigation notes and evidence cited below as `notes/315/...` are kept in a private repository.
 
-**Status: OPEN. No limitation entry is recorded.** The earlier status line here read "accepted as a
-documented limitation"; that is superseded. This issue's own rule is that a documented limitation is
-acceptable only *after* the mechanism is named, and no mechanism is proven - so nothing is recorded and
-the issue stays open until the criterion below is met. See the correction at the end of this entry.
+**Status: RESOLVED 2026-10-22, closed.** The trigger is named (the CWSR context save area living in a
+pageable SVM range on a CWSR-on box, which KFD eviction can migrate out from under a preempted queue), the
+repair is shipped (`1bit serve` places the save area in GTT when `amdgpu.cwsr_enable=1`; engine PR #454,
+pins in #455), and the acceptance soak this entry required **passed on 2026-10-18/19**: 37 in-band arms,
+9 h 03 min in band, **0 graded faults**, every graded arm's save area traced as two GTT BOs with zero SVM
+lookups. See "UPDATE 2026-10-19 - the CWSR-on soak passed" at the end of this entry for the numbers, the
+bound, and what the result does not show. The earlier "no limitation is recorded" status is kept below for
+the record; it is superseded, not deleted.
 
 Owner acceptance, recorded 2026-10-07: the owner authorised landing this entry in writing — *"you have gh
 authorization and do what needs to be done"* — on the basis that no forward fix is available. The limitation text
@@ -705,7 +709,114 @@ less (one-sided 95 %); it does not show zero.
 (`--hrx-cwsr-placement`, default `auto`; docs/hrx.md "CWSR save-area placement"). With CWSR off it
 changes nothing.
 
-**CWSR off (`amdgpu.cwsr_enable=0`) stays the shipped default** until a soak on a CWSR-on boot with
-the engine build (not a hand-set environment) passes: at least 6 hours of GLM-4.7-Flash at the #315
-composition plus ZAYA1-8B served alongside, with 0 NaN aborts, 0 HSA faults, 0 TDRs and 0 GPU resets,
-and every save area traced as a GTT BO. This issue stays open until then.
+**CWSR off (`amdgpu.cwsr_enable=0`) stays the shipped default** (the soak below does not change it; the
+default is the owner's decision). The soak this paragraph required ran on 2026-10-18/19 and passed -
+see the closing section.
+
+---
+
+## UPDATE 2026-10-22 — the CWSR-on soak passed, the condition is confirmed, #315 is closed
+
+Acceptance soak run 2026-10-18 15:56 (boot) to 2026-10-19 04:52 (box time) on strixhalo, on a **CWSR-on**
+boot (`amdgpu.cwsr_enable=1`, stock amdgpu, kernel `7.3.0-rc4-1bit`), with the engine build deciding the
+placement itself (no hand-set environment), then restored to CWSR-off. Build: engine `9228e5a`
+(llama.cpp `8d9ce2c1a`, hrx-system `82804197b` with the `HRX_ALLOW_NO_SVM` gate), `1bit` sha256
+`ccbf5991f6c4…`. Composition: 4 `1bit serve` neighbours of GLM-4.7-Flash (`-c 2048`) + a sized GTT ballast
+(no kernels, no queues) + one graded `1bit serve` GLM-4.7-Flash (`-c 8192 -fa on`) reloaded per arm; every
+GPU process is a `1bit serve` of that build, so every HRX queue got its placement through the engine.
+
+| item | value |
+|---|---|
+| in-band time | **32,575 s = 9 h 03 min** (band = graded arm `gtt_start` in [100,108] GiB) |
+| in-band arms | **37**, every one `verdict=OK`, `in_band=1` (0 out of band, 0 INVALID) |
+| `gtt_start` per arm | 101-102 GiB; `gtt_peak` 110-111 GiB; `avail_min` 7-8 GiB |
+| graded detector | 66 requests per arm (`~/wt/315-detector.py`), **37 arms, 0 failures** (`det_http_failures=0 det_utf8_failures=0 det_parse_failures=0 transport_failures=0`, `identical_distinct=1` every arm) |
+| graded chat | 20 greedy `/v1/chat/completions` per arm, **740 requests, 0 bad, 0 mismatch** |
+| background load | 4,791 neighbour requests, **2 bad** (both HTTP 502, isolated; the next request to the same server answered 200; no NaN, no 500, no backend exit, no watchdog kill - recorded, not graded) |
+| NaN aborts | **0** (`HRX returned NaN` absent from every server log) |
+| HSA faults / backend exits / watchdog kills / arm hangs | **0 / 0 / 0 / 0** |
+| dmesg | page faults **0**, ring timeouts **0**, GPU resets **0**, OOM **0**; Tctl peak 83 C, 6 gate pauses, 0 freezes |
+| **placement, graded arms** | **37 of 37**: `csa_gtt=2 csa_svm=0 kbg_fail=0`, engine line `HRX: CWSR is on; CWSR save area placed in GTT (engine#315)` in every serve log, llama-server child's environ exactly `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` |
+| neighbours | `csa_gtt=2 csa_svm=0 gtt_line=1` for all four; their rows carry `env_ok=-1` because the environment snapshot raced the exec, and a stale `zaya.pids` file from an earlier attempt raised `DRIFT` in `counters.txt` (the run's own stop flag never fired; a fresh counter pass prints `placement_drift=0`) |
+
+**Against the control, same boot, same composition.** Phase B (the hand-set environment, `PHASE-B-GO.md`)
+faulted **4 of 16** runs without the placement; this soak faulted **0 of 37** arms with it (engine-decided).
+Fisher exact, two-sided: **p = 0.0062**. The pre-registered criterion was >= 6 h in band and >= 42 arms
+with zero faults; the run reached 9 h 03 min and stopped at its 9 h wall cap with 37 arms, so per the
+orchestrator ruling of 2026-10-19 01:30 it is graded **PASS (cap-limited)**, with the arm count reported.
+
+**What this does not show.** 0 of 37 bounds the per-arm fault rate at **7.8 %** (one-sided 95 %), it does
+not make the fault impossible; the optional positive control (`--hrx-cwsr-placement=off` on the same boot)
+was not run, so the rate contrast rests on Phase B rather than on a same-session control; and the soak ran
+with the ballast rather than ZAYA1-8B alongside (ZAYA was dropped on 2026-10-18 19:19 for memory headroom -
+GTT 112 GiB left 4 GiB MemAvailable and tripped the guard on otherwise-clean arms).
+
+**CWSR-off remains the shipped default.** The repair makes a CWSR-on box safe; whether to ship CWSR on is a
+separate owner decision and nothing here recommends it. CWSR-off evidence on the record: 11 and 10 in-regime
+arms in two campaigns, 0 faults (`~/wt/315cwsr0-console.log`, `~/wt/315cwsr60-console.log`).
+
+Evidence on the box: `~/wt/315soak/{SUMMARY,STATE.md,PROVENANCE,counters.txt,arms/}`,
+`~/wt/315soak/gate/PASS` (placement gate), `~/wt/315-PATCH-STATUS.md` §11; the plan it followed is
+`~/wt/315c1/SOAK-GO.md`.
+
+### Addendum 2026-10-23 — hw-gate on real hardware, the thermal threshold, and what is still unmeasured
+
+Three things the closing section above leaves implicit, recorded here so the entry can be read without
+the issue thread.
+
+**1. hw-gate (the six-check correctness gate) was run on this fix's PR, on strixhalo.** `hw_gate` is
+`skipped` for ordinary PR events by design (it runs on the `hw-gate` label, on `bump-hrx/*`, or by hand),
+so it was dispatched by hand on PR #518's head. Run
+<https://github.com/1bit-MONSTER/engine/actions/runs/39892647547>: the logits-pin under test was
+`cc65151` with llama.cpp `af04c9f22b97` and hrx-system `82804197bcbe`, 338 s, 0 amdgpu ring timeouts,
+Tctl 60 °C at the end. **The run was cancelled when the box went down** (it is unreachable as this is
+written) part-way through the sixth model, so its verdict is "not completed", not "failed on a check".
+Everything that did run passed:
+
+| check | result |
+|---|---|
+| build | PASS |
+| ops | PASS — **695/695** tests (MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_CONV, GET_ROWS, ROPE, RMS_NORM, SOFT_MAX) |
+| fa-decode-q8 | PASS — 6/6 (K q8_0 × V f16 and q8_0; Hq/Hkv 16/8 and 32/8; n_kv 1031, 2048, 4103) |
+| kat | PASS — qwen3-0.6b, zaya1-8b, qwen3.8-27b, qwen3-coder-30b-a3b, qwen3-4b-iq4xs, qwen3-0.6b-kq8 (9 cases each) |
+| needle | PASS — qwen3-0.6b 7,082-token, zaya1-8b 7,403-token, qwen3-0.6b-kq8 7,082-token (all answered 7341) |
+| placement | PASS — all on HRX in every graph: 170 / 193 / 152 / 99 / 99 / 122 graphs (largest 986 / 6,449 / 3,655 / 3,030 / 1,266 / 1,154 nodes) |
+| kld qwen3-0.6b | PASS — mean KLD 0.000003, p99 0.00004, **same top 99.90 %** |
+| kld zaya1-8b | PASS — mean KLD 0.007729, p99 0.11945, **same top 98.33 %** |
+| kld qwen3.8-27b | PASS — mean KLD −0.000000, p99 0.00004, **same top 100.00 %** |
+| kld qwen3-coder-30b-a3b | PASS — mean KLD 0.000912, p99 0.01119, **same top 98.97 %** |
+| kld qwen3-4b-iq4xs | PASS — mean KLD 0.000002, p99 0.00005, **same top 99.85 %** |
+| model qwen3-0.6b-kvq8 | **cut off** — rc 143 (SIGTERM) from the cancellation, not a check failure; its placement line reads 1322 nodes, 0 off HRX |
+
+A re-dispatch on the same branch (run 39894128364) got further and died the same way: it was killed at
+03:18:52 while running `kld qwen3-coder-30b-a3b`, and that check is recorded as
+`FAIL — FileNotFoundError: …/kld-qwen3-coder-30b-a3b.log`, i.e. the log the judge opens was never written
+because the process died with the box. The same check **passed** in the first run on the identical pin
+(mean KLD 0.000912, same top 98.97 %), so that `FAIL` is the machine, not a regression on this branch.
+
+**2. The thermal threshold in the soak was 96 °C, not 93 °C.** The #315 soak followed phase B's rules:
+detector/chat drivers pause at 92 °C, resume at ≤ 84 °C, and only ≥ 96 °C aborts (`~/wt/315soak/STATE.md`,
+2026-10-18 17:19, an orchestrator ruling after an arm was lost to 92-93 °C). The measured peak across the
+whole run was **83 °C**, with 6 gate pauses, 0 freezes and 0 aborts, so no event came near either
+threshold — but the stated 93 °C rule was not the one in force and that is recorded rather than smoothed
+over.
+
+**3. What is still unmeasured, and what it would take.** None of these are hidden behind the PASS above:
+
+| gap | why | what would close it |
+|---|---|---|
+| GLM-4.7-Flash's own **KLD / same-top** | no stored base logits exist for this model on the box (the gate has bases only for qwen3-0.6b, qwen3-4b-iq4xs, qwen3-coder-30b-a3b, qwen3.8-27b, zaya1-8b), and producing one costs 1-2.5 GB on a disk that was at 14 GB free with other agents' work resident | add `glm-4.7-flash` to `MODEL_TABLE` with a stored base at the pin, then `hw-gate.sh --phases kld --models glm-4.7-flash` |
+| GLM **throughput** at this composition | the box went down before the `llama-bench` run | `llama-bench -m GLM-4.7-Flash-Q4_K_M.gguf -dev HRX0 -ngl 99 -fa on -p 512,2048 -n 128 -r 3` on the same build |
+| the **intervention cell** (forced KFD eviction, `~/wt/evictonly`) re-run **with** the fix | the #315 regime needs ~100 GiB of GTT with 4 GLM-4.7-Flash neighbours, which needs the services-off window the owner gates (`~/soff.sh`, BOX-CONTROL.md queue item), and the box is down | one services-off window: composition as in `~/wt/315soak/soak.sh` plus the forcer, ≥ 8 fresh arms, 0 faults expected under CWSR off |
+| a **trace of KFD migrating the save area** during a faulting run | the record traces the save area's **allocation class** (`kfd_queue_buffer_get` → GTT vs `kfd_queue_buffer_svm_get` → SVM, `~/wt/315c1/{csa.bt,alloc.bt}`), not the eviction event itself | a kprobe on the KFD eviction/restore path keyed by the CSA range, on a CWSR-on boot with the forcer |
+
+On the regression test, precisely: the fix's own commit (#454) added `tests/hrx_cwsr_test.cpp`, whose
+`auto + CWSR on` case asserts the three variables and the GTT line on **any** box (it feeds
+`decide_cwsr_placement` directly), and `tests/hrx_cwsr_route.sh`, whose CWSR-on block is skipped when
+`amdgpu.cwsr_enable` reads 0 — i.e. on the shipped configuration the unit test covers the decision and the
+end-to-end route test does not. A `ONEBIT_CWSR_ENABLE_FILE` seam that would have let the route test cover
+it on a CWSR-off box was written and **withdrawn**: CodeQL flags an environment-derived path reaching
+`fopen` (`cpp/path-injection`, alert 29), and this repo does not loosen a gate to land a test.
+
+Status of the documentation itself: this entry and the docs change ship in **PR #518, open and awaiting
+the orchestrator's merge** (auto-merge is off by rule); #315 is closed on the strength of the soak above.

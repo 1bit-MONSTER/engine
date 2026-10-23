@@ -34,7 +34,12 @@ out=${1:?usage: vmtest.sh <out> [engine build dir] [model.gguf]}
 build=${2:-$HOME/.cache/1bit-os/src/build}
 model=${3:-$HOME/models/Qwen3-0.6B-Q4_K_M.gguf}
 here=$(cd "$(dirname "$0")" && pwd)
+# a rerun into the same directory starts clean: the previous image and target disk are regenerated,
+# and keeping them costs gigabytes on a box that has to stay above 40 GB free
 mkdir -p "$out"; out=$(cd "$out" && pwd)
+rm -f "$out/vdisk.img"
+rm -rf "$out/image"
+echo "VM test in $out (free: $(df -h "$out" | awk 'NR==2 {print $4}'))"
 name=$(basename "$model" .gguf)
 
 rm -f "$out/key" "$out/key.pub"; ssh-keygen -q -t ed25519 -N "" -f "$out/key"
@@ -44,11 +49,16 @@ printf 'LEMONADE_API_KEY=%s\n' "$apikey" > "$out/lemond.conf"
 AUTHORIZED_KEYS="$out/key.pub" MODELS="$model" LEMONADE_CONFIG="$out/config.json" LEMONADE_ENV="$out/lemond.conf" \
     "$here/mkimage.sh" "$out/image" "$build" > "$out/mkimage.log" 2>&1 || { tail -5 "$out/mkimage.log"; echo "VMTEST FAIL (mkimage)"; exit 1; }
 
+# The install target: an empty disk, so 1bit-install has somewhere real to write. qcow2, not a raw
+# file: the guest only ever writes about a gigabyte, and a raw 24 GB image costs that much on the host
+# wherever it is not sparse (disk pressure is real on the build box).
+[ -f "$out/vdisk.img" ] || qemu-img create -q -f qcow2 "$out/vdisk.img" 24G
 cp /usr/share/OVMF/OVMF_VARS_4M.fd "$out/vars.fd"
 qemu-system-x86_64 -enable-kvm -cpu host -m 16G -smp 8 -machine q35 \
     -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
     -drive if=pflash,format=raw,file="$out/vars.fd" \
     -device qemu-xhci -drive id=stick,if=none,format=raw,file="$out/image/1bit-os.img" -device usb-storage,drive=stick \
+    -drive id=vdisk,if=none,format=qcow2,file="$out/vdisk.img" -device nvme,serial=1bit0test,drive=vdisk \
     -nic user,restrict=on,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:18000-:13305 \
     -display none -serial file:"$out/serial.log" -no-reboot &
 vm=$!
@@ -118,6 +128,20 @@ else echo "Live banner on the console: missing from $out/serial.log"; ok=0; fi
 # The self-test has to run from the image. It cannot PASS in a VM - there is no Radeon GPU and no XDNA
 # NPU - so what is asserted is that it runs, reports the live mode, and says plainly that the NPU is
 # what is missing. The NPU PASS belongs to the real boot (owner's step).
+# The engine's own llama-server and the HSA runtime it loads live on the data partition, not in the RAM
+# image (mkimage.sh). Nothing checked that until a release candidate's 1bit.check reported
+# "CHECK llama-server: FAILED" on a shipped image, so check it here, on the boot that has /data.
+eng=$(ssh_vm '/opt/1bit-llama/llama-server --version 2>&1 | head -1; echo "----"; cat /etc/1bit/libhsa 2>/dev/null' 2>/dev/null || true)
+lls=$(printf '%s' "$eng" | sed -n '1,/^----$/p' | head -1)
+hsa=$(printf '%s' "$eng" | sed -n '/^----$/,$p' | tail -1)
+case "$lls" in
+    *version*|*build*) echo "engine llama-server on the stick (/opt/1bit-llama): ${lls}";;
+    *) echo "engine llama-server (/opt/1bit-llama/llama-server) does not run: ${lls:-no output}"; ok=0;;
+esac
+if [ -n "$hsa" ] && ssh_vm "test -e '$hsa'" 2>/dev/null; then
+    echo "HSA runtime named by /etc/1bit/libhsa: $hsa (present)"
+else echo "HSA runtime: /etc/1bit/libhsa is ${hsa:-empty} and/or names no file"; ok=0; fi
+
 st=$(ssh_vm '1bit-selftest 2>&1 | tail -25' 2>/dev/null || true)
 case "$st" in
     *"mode      : LIVE"*) echo "1bit-selftest: runs, and reports the LIVE mode";;
@@ -165,7 +189,98 @@ if [ -n "$engine" ]; then
 else echo "Guest tier: could not resolve /bin/1bit in the VM"; ok=0; fi
 
 [ $ok = 1 ] || ssh_vm 'grep -i -E "error|fail" /tmp/lemond.log | tail -12' 2>/dev/null || true
+# --- the install step: 1bit OS onto the machine's own disk (os/mini/install.sh, /bin/1bit-install) -----
+# The live system must refuse every wrong way of asking BEFORE it writes, then install onto the empty
+# virtual NVMe, and the machine must then boot from that disk with no stick attached at all.
+nvme=$(ssh_vm 'ls /dev/nvme?n1 2>/dev/null | head -1' 2>/dev/null || true)
+if [ -n "$nvme" ]; then
+    ndata="${nvme}p2"
+    refused() {   # <label> <expected> <output>
+        case "$3" in
+            *REFUSED*"rc=$2"*) echo "install refuses $1: $(printf '%s' "$3" | grep REFUSED | head -1 | cut -c1-88)";;
+            *) echo "install does NOT refuse $1 (got: $(printf '%s' "$3" | tr '\n' ' ' | cut -c1-120))"; ok=0;;
+        esac
+    }
+    refused "without --yes" 2 "$(ssh_vm "1bit-install $nvme 2>&1; echo rc=\$?" 2>/dev/null)"
+    helptext=$(ssh_vm '1bit-install --help 2>&1; echo rc=$?' 2>/dev/null)
+    case "$helptext" in
+        *"Exit: 0 installed"*"rc=0"*) echo "install --help: prints its own usage, rc=0";;
+        *) echo "install --help does not print its usage: $(printf '%s' "$helptext" | head -1 | cut -c1-80)"; ok=0;;
+    esac
+    refused "a partition instead of a whole disk" 2 "$(ssh_vm "1bit-install /dev/sda1 --yes 2>&1; echo rc=\$?" 2>/dev/null)"
+    refused "the live stick itself" 2 "$(ssh_vm "1bit-install /dev/sda --yes 2>&1; echo rc=\$?" 2>/dev/null)"
+    refused "a device that does not exist" 2 "$(ssh_vm "1bit-install /dev/does-not-exist --yes 2>&1; echo rc=\$?" 2>/dev/null)"
+
+    inst=$(ssh_vm "1bit-install $nvme --yes 2>&1; echo rc=\$?" 2>/dev/null)
+    case "$inst" in
+        *"1bit OS is installed on $nvme"*"rc=0"*)
+            echo "install onto $nvme: $(printf '%s' "$inst" | grep -E "partition [12]" | tr '\n' ' ' | cut -c1-150)";;
+        *) echo "install onto $nvme did not complete: $(printf '%s' "$inst" | tail -6 | tr '\n' ' ' | cut -c1-400)"; ok=0;;
+    esac
+    # a device with something mounted on it must be refused too - now that the disk has filesystems
+    refused "a disk with a mounted partition" 2 "$(ssh_vm "mkdir -p /mnt/x && mount -t ext4 $ndata /mnt/x && \
+        1bit-install $nvme --yes 2>&1; echo rc=\$?; umount /mnt/x" 2>/dev/null)"
+else
+    echo "install: no NVMe device in the VM, nothing to install onto"; ok=0
+fi
+
 ssh_vm 'poweroff -f' 2>/dev/null || true
 wait $vm 2>/dev/null || true
 trap - EXIT
-[ $ok = 1 ] && echo "VMTEST PASS" || { echo "VMTEST FAIL (serial console: $out/serial.log)"; exit 1; }
+# --- boot the INSTALLED disk, with no USB stick anywhere --------------------------------------------
+if [ $ok = 1 ] && [ -f "$out/vdisk.img" ]; then
+    echo "--- second boot: from the installed disk only ---"
+    cp /usr/share/OVMF/OVMF_VARS_4M.fd "$out/vars2.fd"     # clean NVRAM: the firmware must find the disk itself
+    qemu-system-x86_64 -enable-kvm -cpu host -m 16G -smp 8 -machine q35 \
+        -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd \
+        -drive if=pflash,format=raw,file="$out/vars2.fd" \
+        -drive id=vdisk,if=none,format=qcow2,file="$out/vdisk.img" -device nvme,serial=1bit0test,drive=vdisk \
+        -nic user,restrict=on,model=virtio-net-pci,hostfwd=tcp:127.0.0.1:2222-:22,hostfwd=tcp:127.0.0.1:18000-:13305 \
+        -display none -serial file:"$out/serial2.log" -no-reboot &
+    vm2=$!
+    for i in $(seq 60); do ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+        -o ConnectTimeout=5 root@127.0.0.1 true 2>/dev/null && break; sleep 3; done
+    if ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=5 \
+            root@127.0.0.1 true 2>/dev/null; then
+        echo "VM: the installed disk booted on its own (no USB attached)"
+        if grep -q "INSTALLED" "$out/serial2.log" 2>/dev/null; then
+            echo "INSTALLED banner on the console: $(grep -m1 "INSTALLED" "$out/serial2.log" | cut -c1-72)"
+        else echo "INSTALLED banner on the console: missing"; ok=0; fi
+        st2=$(ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 \
+            'test -e /etc/1bit/installed && echo marker-installed; test -e /etc/1bit/live && echo marker-live; \
+             grep " /data " /proc/mounts | cut -d" " -f1-3; 1bit-selftest 2>&1 | grep -E "mode|RESULT" | head -4' 2>/dev/null)
+        case "$st2" in *marker-installed*) echo "installed boot: /etc/1bit/installed present";; *) echo "installed boot: no /etc/1bit/installed"; ok=0;; esac
+        case "$st2" in *marker-live*) echo "installed boot: /etc/1bit/live present (should not be)"; ok=0;; *) ;; esac
+        case "$st2" in */dev/nvme*) echo "installed boot: /data is on the disk ($(printf '%s' "$st2" | grep /data | head -1))";;
+            *) echo "installed boot: /data is not on the installed disk"; ok=0;; esac
+        case "$st2" in *"mode      : INSTALLED"*) echo "1bit-selftest on the installed disk: reports the INSTALLED mode";;
+            *) echo "1bit-selftest on the installed disk: $(printf '%s' "$st2" | grep mode | head -1 | cut -c1-70)"; ok=0;; esac
+        eng2=$(ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 \
+            '/opt/1bit-llama/llama-server --version 2>&1 | head -1; echo "----"; cat /etc/1bit/libhsa 2>/dev/null' 2>/dev/null || true)
+        lls2=$(printf '%s' "$eng2" | sed -n '1,/^----$/p' | head -1)
+        hsa2=$(printf '%s' "$eng2" | sed -n '/^----$/,$p' | tail -1)
+        case "$lls2" in
+            *version*|*build*) echo "installed boot: engine llama-server runs from the disk (${lls2})";;
+            *) echo "installed boot: engine llama-server does not run: ${lls2:-no output}"; ok=0;;
+        esac
+        if [ -n "$hsa2" ] && ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                root@127.0.0.1 "test -e '$hsa2'" 2>/dev/null; then
+            echo "installed boot: HSA runtime named by /etc/1bit/libhsa is present ($hsa2)"
+        else echo "installed boot: /etc/1bit/libhsa is ${hsa2:-empty} and/or names no file"; ok=0; fi
+        for i in $(seq 40); do curl -sf "${auth[@]}" "$api/api/v1/health" >/dev/null && break; sleep 2; done
+        code=$(curl -s -o /dev/null -w '%{http_code}' "$api/api/v1/models")
+        [ "$code" = 401 ] && echo "installed Lemonade: 401 without the key" || { echo "installed Lemonade: HTTP $code without the key"; ok=0; }
+        if curl -s "${auth[@]}" "$api/api/v1/models" | grep -q "\"$name\""; then
+            echo "installed Lemonade lists the GGUF carried over to the disk: $name"
+        else echo "installed Lemonade does not list $name"; ok=0; fi
+        reply2=$(chat "$name")
+        case "$reply2" in ""|error*) echo "installed Lemonade chat: ${reply2:-no answer}"; ok=0 ;;
+                       *) echo "installed Lemonade chat with $name answered: $reply2" ;; esac
+        ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 'poweroff -f' 2>/dev/null || true
+    else
+        echo "VM: the installed disk did not boot"; ok=0
+    fi
+    wait $vm2 2>/dev/null || true
+fi
+
+[ $ok = 1 ] && echo "VMTEST PASS" || { echo "VMTEST FAIL (serial consoles: $out/serial.log $out/serial2.log)"; exit 1; }

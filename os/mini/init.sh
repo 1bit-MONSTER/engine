@@ -32,7 +32,7 @@ echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"
 # bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
 # PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
 # comes up with no network at all, which looks exactly like a hang.
-for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod vfat ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
 # network: DHCP on every wired interface
@@ -71,6 +71,29 @@ if ! grep -q " /data " /proc/mounts; then
 fi
 stage "stick mounted at ${data:-nothing}"
 
+# Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
+# screen you have to guess about. Defined before its first use: it used to sit below the kernel link
+# line, so the console lost that line to "say: not found" (seen in the VM's serial log).
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
+    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
+
+# The engine's own llama-server and the HSA runtime it loads are on the DATA PARTITION, not in the RAM
+# image (mkimage.sh: grub will not load an initrd over ~103 MB and this one is at 89.5 MB, so anything
+# added to the image after it is packed never reaches the stick - which is why 1bit.check said
+# "CHECK llama-server: FAILED" on a released image). Put them where the engine and 1bit.check look:
+# /opt/1bit-llama is on PATH, and /etc/1bit/libhsa names the on-stick runtime for the engine.
+if [ -d /data/1bit-llama ]; then
+    mkdir -p /opt /etc/1bit
+    ln -sfn /data/1bit-llama /opt/1bit-llama
+    # same on /data, from the Lemonade package that is already there (the build machine's
+    # /opt/rocm-therock path does not exist on a stick)
+    hsa=$(ls /data/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    [ -n "$hsa" ] && echo "$hsa" > /etc/1bit/libhsa
+    say "[engine] llama-server from /data/1bit-llama, HSA runtime ${hsa:-not found}"
+else
+    say "[engine] no /data/1bit-llama: '1bit serve' has no HRX llama-server on this boot"
+fi
+
 # The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
 # to load): link them to the path the engine looks for, beside itself.
 if [ -d /data/npu/kernels ] && [ -d /home ]; then
@@ -79,10 +102,6 @@ if [ -d /data/npu/kernels ] && [ -d /home ]; then
     say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
 fi
 
-# Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
-# screen you have to guess about.
-say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
-    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
 n=0
 step() { n=$((n+1)); say "[$n] $*"; }
 
@@ -96,7 +115,11 @@ screen_login() {
     chvt 1 2>/dev/null || true
     {
       echo
-      echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+      if [ "$INSTALLED" = 1 ]; then
+        echo "  1bit OS  v2026.43  -  INSTALLED on this machine. /data is on its disk; the engine and Lemonade start from here."
+      else
+        echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+      fi
       echo "  ----------------------------------------------------------------------------------------"
       echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
       echo "   lemonade list                 the models;  lemonade chat Qwen3-0.6B-1bit"
@@ -116,8 +139,17 @@ screen_login() {
 # Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
 # framebuffer /dev/console is no longer what is painted, and the screen must never be the part that lies.
 mc() { while IFS= read -r l; do for c in /dev/console /dev/tty1; do [ -w "$c" ] && printf '%s\n' "$l" > "$c" 2>/dev/null; done; done; }
+# An installed disk carries /data/.installed (1bit-install writes it). The same init then boots the
+# appliance from the disk: no stick menu to offer, and INSTALLED instead of LIVE on the screen and in
+# /etc/1bit. Nothing else about the boot changes - same initramfs, same signed chain.
+INSTALLED=0
+grep -q " /data " /proc/mounts && [ -e /data/.installed ] && INSTALLED=1
+# this boot's state lives here, and init makes it rather than trusting the image to carry it: mkimage.sh
+# creates /etc/1bit after it packs the initramfs, so the directory was never in any image and the marker
+# below was silently lost (the installed boot reported INSTALLED on screen and no marker in /etc/1bit)
+mkdir -p /etc/1bit 2>/dev/null
 MODE=live
-if [ -c /dev/console ]; then
+if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
       echo "  1bit OS  v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
@@ -253,9 +285,15 @@ lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
-echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
-echo "      Reboot to discard everything; only /data on the stick persists."
-touch /etc/1bit/live 2>/dev/null
+if [ "$INSTALLED" = 1 ]; then
+    echo "MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is $(findfs LABEL=1BIT-DATA 2>/dev/null)."
+    echo "      Reboot to restart it; the install is permanent (1bit-install, os/README.md)."
+    touch /etc/1bit/installed 2>/dev/null
+else
+    echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
+    echo "      Reboot to discard everything; only /data on the stick persists."
+    touch /etc/1bit/live 2>/dev/null
+fi
 echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
 echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"
@@ -267,13 +305,23 @@ echo "The engine alone, for debugging:  1bit serve -m /data/models/<file.gguf>  
 if grep -q "1bit.check" /proc/cmdline; then
     ok=1
     1bit --help >/dev/null 2>&1 && echo "CHECK 1bit: runs" || { echo "CHECK 1bit: FAILED"; ok=0; }
-    /opt/1bit-llama/llama-server --version >/dev/null 2>&1 && echo "CHECK llama-server: runs" || { echo "CHECK llama-server: FAILED"; ok=0; }
+    # The engine's own llama-server lives on the data partition (mkimage.sh), so a boot assembled from
+    # the bare -kernel/-initrd pair has nothing to check: say SKIPPED with the reason instead of FAILED,
+    # which is what a release gate that boots without the stick's data partition would otherwise report.
+    if [ -d /data/1bit-llama ]; then
+        /opt/1bit-llama/llama-server --version >/dev/null 2>&1 && echo "CHECK llama-server: runs" ||
+            { echo "CHECK llama-server: FAILED (it is on /data but does not run)"; ok=0; }
+    else
+        echo "CHECK llama-server: SKIPPED - no data partition on this boot; the engine's llama-server is on /data/1bit-llama"
+    fi
     lemonade --version >/dev/null 2>&1 && [ -f /opt/lemonade/bin/resources/defaults.json ] && echo "CHECK Lemonade: runs" || { echo "CHECK Lemonade: FAILED"; ok=0; }
     [ -d /opt/lemonade/bin/resources/web-app ] && echo "CHECK Lemonade web app: present" || echo "CHECK Lemonade web app: left out"
     if [ -s /etc/1bit/libhsa ]; then
         [ -e "$(cat /etc/1bit/libhsa)" ] && echo "CHECK HSA runtime (HRX): present" || { echo "CHECK HSA runtime: FAILED"; ok=0; }
+    elif [ -d /data/1bit-llama ]; then
+        echo "CHECK HSA runtime: FAILED - /data/1bit-llama is here but no libhsa was found in the data partition's Lemonade package"; ok=0
     else
-        echo "CHECK HSA runtime: none (a CPU-only test image)"
+        echo "CHECK HSA runtime: none (no data partition on this boot; the runtime comes from the Lemonade package on /data)"
     fi
     # the NPU runtime is compiled into 1bit: the image carries no XRT
     if find / -xdev -name 'libxrt*' 2>/dev/null | grep -q .; then echo "CHECK no XRT: FAILED"; ok=0

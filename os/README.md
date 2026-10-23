@@ -27,8 +27,9 @@ stable-diffusion.cpp, Kokoro and the rest).
 What is in it: the kernel with the GPU (`amdgpu`, which also gives HSA its `/dev/kfd`) and NPU
 (`amdxdna`) drivers, the firmware those chips load, BusyBox (no XRT: the NPU runtime is compiled into `1bit`), Mesa's Radeon
 Vulkan driver (for Lemonade's Vulkan backends), Lemonade (`lemond`, the `lemonade` CLI and the web
-app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit`, the HRX
-`llama-server` it runs, and TheRock's HSA runtime that HRX loads.
+app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit` with its HRX backend
+(the `llama-server` it runs and the HSA runtime that `llama-server` loads are on the data partition -
+`1bit-llama/` below - because the initramfs has to stay under the size grub will load).
 
 Everything that has to last lives on the stick's `1BIT-DATA` partition:
 
@@ -40,6 +41,7 @@ Everything that has to last lives on the stick's `1BIT-DATA` partition:
 | `lemonade/cache/` | Lemonade's cache directory, with its backends in `bin/`, installed when the image was built |
 | `lemonade/licenses/` | the backends' licenses, one directory per recipe ([LICENSES.md](LICENSES.md)) |
 | `lemonade/huggingface/` | models Lemonade downloads (`models_dir`) |
+| `1bit-llama/` | the engine's own HRX `llama-server` and the libraries it links, put on the stick instead of in the RAM image; `init` links `/opt/1bit-llama` to it at boot, so `1bit serve` finds it on `PATH` whether the boot is LIVE or INSTALLED |
 | `cache/hrx-jit/` | HRX's Loom kernel cache (`GGML_HRX_JIT_CACHE_DIR`): the first use of a kernel compiles it, later boots reuse it |
 | `ssh/` | `authorized_keys` and the SSH host key |
 
@@ -57,9 +59,11 @@ cmake --build build
 os/mini/mkimage.sh out build
 ```
 
-`mkimage.sh` copies the HRX `llama-server` and the HSA runtime the build was configured with
-(`ONEBIT_HRX_LIBHSA` in `build/CMakeCache.txt`) at their build paths, with every library they
-link; `1bit` has both paths compiled in. It takes `lemond` from `build/lemonade` (or `LEMONADE=`, a
+`mkimage.sh` puts the HRX `llama-server` and every library it links on the data partition under
+`1bit-llama/`, with each ELF's `RUNPATH` rewritten to `$ORIGIN` (`patchelf`) so the set runs from there -
+the build tree's paths do not exist on a stick. The HSA runtime HRX loads is taken from the Lemonade
+`llamacpp-hrx` package that is already on the stick, and `init` writes its on-stick path into
+`/etc/1bit/libhsa`, which is where the engine reads `IREE_HAL_AMDGPU_LIBHSA_PATH` from. It takes `lemond` from `build/lemonade` (or `LEMONADE=`, a
 `scripts/build-lemonade.sh` prefix), and when there is none it builds it there from
 `third_party/lemonade` with the web app (`LEMONADE_WEB_APP=1`, which needs `node` and `npm`).
 
@@ -172,6 +176,53 @@ sealed artifact, that `LICENSE-BINARY`/`NOTICE-BINARY` are present, and the imag
 The rows that need the hardware - `gpu`, `npu`, `models`, `chat-hrx`, `chat-npu` - report
 `SKIP(reason)` in a VM.
 
+## Install it on the machine's own disk
+
+The stick is the installer. Boot it as above, then from its shell (console or SSH):
+
+```sh
+1bit-selftest                       # the live boot works: RESULT: PASS, and the NPU where there is one
+1bit-install /dev/nvme0n1 --yes     # ONE internal disk, named explicitly; this destroys it
+```
+
+`1bit-install` lays the disk out exactly as the stick is laid out, with the same tool the image is
+built with: a 512 MB EFI system partition carrying the signed chain this boot came from (shim, grub,
+`vmlinuz`, `initramfs`, `grub.cfg` - byte for byte, so the machine's MOK enrolment needs no change),
+and a `1BIT-DATA` ext4 partition filling the rest, carrying `models/`, `lemonade/` (its backends,
+config, cache and the API key), the NPU kernel sets and `ssh/` from the stick's `/data`.
+
+It refuses, before writing anything: to run without `--yes`; to be given a partition instead of a
+whole disk; to point at a removable device; to point at the disk this live boot is running from; to
+point at a disk with anything mounted on it. Then it prints the disk's model, size and current
+partition table - what it is about to destroy - and waits 10 seconds before the first write.
+
+Power off, remove the stick, boot the machine from the disk. It boots the same init, which finds
+`/data/.installed` and says so:
+
+```
+1bit OS  v2026.43  -  INSTALLED on this machine. /data is on its disk; ...
+MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is /dev/nvme0n1p2.
+```
+
+and `/etc/1bit/installed` exists instead of `/etc/1bit/live` (the menu a stick shows is skipped -
+there is nothing to choose). Then `1bit-release-check` again: the same PASS/FAIL list as on the stick,
+now reporting the INSTALLED mode. `1bit-selftest` works too and must report `mode : INSTALLED`,
+`RESULT: PASS` and, on hardware with an NPU, `RESULT-NPU: PASS` with the placement line in
+`/data/selftest.log`.
+
+**Secure Boot.** The install copies the ESP as it is, so the kernel and initramfs on the disk are the
+same MOK-signed files the stick booted; the machine's MOK enrolment (`mokutil --list-enrolled`) is
+not touched by an install. If the firmware does not offer the disk on its own, add an entry pointing
+at `\EFI\BOOT\BOOTX64.EFI` on its partition 1 (on a Linux box: `efibootmgr -c -d /dev/nvme0n1
+-p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI'`). Booting the stick again is unchanged and does not
+touch the installed disk: that is how you get back to a live system (or to reinstall).
+
+What the VM proves (`os/mini/vmtest.sh`, which now also installs onto a virtual NVMe and boots from
+it with no stick attached): the installer's refusals, the install itself, the INSTALLED banner and
+`/etc/1bit/installed`, `/data` coming from the installed disk, Lemonade up with its key and answering
+a chat, and `1bit-selftest` reporting INSTALLED. What only the real machine can prove: that this
+firmware boots the disk on its own, and the NPU on it.
+
 ## Check it without the hardware
 
 ```sh
@@ -183,8 +234,10 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 4G -kernel /boot/vmlinuz-$(uname -r)
 NPU firmware are in place and start, that the image carries no XRT library, print `1BIT-OS CHECK PASS` or `FAIL`, and power
 off.
 
-`os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI, on QEMU's
-restricted network (nothing outside the VM is reachable, so the stick has to work offline), with
+`os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI, installs it
+onto an empty virtual NVMe with `1bit-install` (checking every refusal first), boots from that
+disk with no stick attached, and checks all of it; the network is QEMU's restricted one (nothing
+outside the VM is reachable, so the stick has to work offline), with
 Lemonade's `"host": "0.0.0.0"` and a `LEMONADE_API_KEY` on the stick. It checks over SSH and HTTP
 that Lemonade's web app loads, that Lemonade refuses a request without the key, that
 `/api/v1/models` lists the stick's model, and that Lemonade answers a chat request with it. The VM
@@ -203,4 +256,6 @@ being reused after a reboot, Lemonade's Vulkan backends on RADV, `llamacpp-hrx`,
 - A Loom kernel cache built ahead of time, so the first boot needs no compile.
 - The image split: a base (the EFI file and an empty data partition) and Lemonade's backends as a
   separate bundle for the data partition.
+- An install that can also grow `1BIT-DATA` over a disk whose firmware needs a partition table it did
+  not write, and an upgrade path that keeps `/data` while replacing the ESP.
 - Every piece pinned upstream and bumped by a workflow, like the rest of the engine.

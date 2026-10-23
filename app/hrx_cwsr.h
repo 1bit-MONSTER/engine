@@ -34,6 +34,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -44,6 +45,17 @@ namespace onebit {
 enum class CwsrPlacement { Auto, On, Off };
 
 inline constexpr const char* kCwsrEnablePath = "/sys/module/amdgpu/parameters/cwsr_enable";
+
+// Points read_cwsr_enable() at another file. serve never sets it: it exists so a test can drive the
+// CWSR-on branch on a box whose amdgpu runs with CWSR off, which is the shipped default - otherwise
+// that branch is only ever exercised on a CWSR-on boot (tests/hrx_cwsr_test.cpp, tests/hrx_cwsr_route.sh).
+inline constexpr const char* kCwsrEnablePathEnv = "ONEBIT_CWSR_ENABLE_FILE";
+
+// The file serve reads the CWSR state from: $ONEBIT_CWSR_ENABLE_FILE, else amdgpu's own parameter.
+inline std::string cwsr_enable_path() {
+    if (const char* p = std::getenv(kCwsrEnablePathEnv); p && *p) return p;
+    return kCwsrEnablePath;
+}
 inline constexpr const char* kCwsrPlacementVars[] = {"HSA_USE_SVM", "HSA_USERPTR_FOR_PAGED_MEM", "HRX_ALLOW_NO_SVM"};
 inline constexpr const char* kCwsrPlacementValues[] = {"0", "0", "1"};
 

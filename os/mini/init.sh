@@ -207,7 +207,10 @@ onebit_register() {   # <name> <path>: add the entry unless the registry has tha
     case "$1$2" in *'"'*|*'\'*) return ;; esac
     [ -s "$f" ] || echo '{}' > "$f"
     grep -q "\"$1\"[[:space:]]*:" "$f" && return
-    e="\"$1\": {\"checkpoint\": \"$2\", \"source\": \"local_path\", \"recipe\": \"onebit\"${3:+, \"onebit_backend\": \"$3\"}}"
+    # A recipe option belongs in recipe_options. A top-level "onebit_backend" is not read by the
+    # Lemonade server as of the #3771 refactor (measured: lemond passed --device auto and the engine
+    # only found the NPU by luck), so an NPU model directory says it the way the catalog does.
+    e="\"$1\": {\"checkpoint\": \"$2\", \"source\": \"local_path\", \"recipe\": \"onebit\"${3:+, \"recipe_options\": {\"onebit_backend\": \"$3\"}}}"
     tr '\n' ' ' < "$f" | awk -v e="$e" '{ i = length($0); while (i > 0 && substr($0, i, 1) != "}") i--
         head = substr($0, 1, i - 1); inner = head; sub(/^[ \t]*\{/, "", inner); gsub(/[ \t]/, "", inner)
         print head (inner == "" ? "" : ", ") e "}" }' > "$f.new" && mv "$f.new" "$f" && echo "Lemonade: user.$1 (onebit) -> $2"
@@ -219,7 +222,10 @@ for m in /data/models/*.gguf; do
     onebit_register "$n-1bit" "$m"
 done
 # A .q4nx directory is the engine's own model format, so it runs on the NPU: say so, or Lemonade
-# sends it down the CPU path, which wants a llama-server this image does not carry.
+# sends it down the CPU path, which wants a llama-server this image does not carry. Lemonade's own
+# catalog also carries the three NPU entries by name (Qwen3-{0.6B,1.7B,4B}-NPU-1bit): they list in
+# /api/v1/models from the image, and this registers the copy on the stick so the same model loads
+# without the Hub.
 for d in /data/models/*/model.q4nx; do
     [ -f "$d" ] || continue
     d=${d%/model.q4nx}

@@ -27,6 +27,110 @@ everything from scratch at the current pins, so each release carries that week's
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
 
+## v2026.43 (candidate, 23 Oct)
+
+Built from `main` by the release run; **nothing is tagged or published yet** — the owner publishes.
+The run records the artifacts, their checksums and every check's log beside the candidate build, and
+the package rows below are filled from that record and are marked *pending* until it exists.
+
+Release sha and pins (the submodules this candidate is built from):
+
+| component | pin |
+|---|---|
+| engine | `7871c71d` (main when the last release-blocking PR merged; a later merge today re-runs only the stages it touches, and the run's record carries the final sha) |
+| llama.cpp (HRX fork) | `851fa6c8d8f2` |
+| hrx-system | `82804197bcbe` |
+| Lemonade (fork) | `27abcc24da99` |
+| gpu-kernels (private, HIP) | `744bd713d968` (`config/gpu-kernels.config`) |
+| npu-kernels (private, sealed) | `17ed5be7a28a` (`config/npu-kernels.config`) |
+| npu-runtime (private) | `ce9fa59adf95` (`config/npu-runtime.config`) |
+| Laya | source `6f0496f797dc`, model `7b928d828b7b` |
+| amdxdna (out-of-tree NPU driver) | `526c608197` |
+| DwarfStar / tokenizers / ryzenai-server | `5b013dc1bb` / `3012770722` / `69765cc591` |
+
+| artifact | status |
+|---|---|
+| `lemonade-onebit-v2026.43-linux-x86_64.tar.zst` | pending |
+| `1bit-os-v2026.43.img.zst`, `1bit-os-v2026.43.efi` | pending |
+| `binary-drop-v2026.43.tar.zst` | pending |
+| `changes.json`, `SHA256SUMS` | pending |
+
+| check | status |
+|---|---|
+| `weekly.sh build test package` at the pins above | pending |
+| `package_checks` (the packaging's own leak scan: no plaintext NPU artifacts, no private symbols) | pending |
+| `1bit check` from the packed tarball on a clean prefix | pending |
+| hardware gate, all phases (ops, fa-decode-q8, kat, kld, needle, placement, **npu**) | pending |
+| OS image VMTEST (`os/mini/vmtest.sh`) | pending |
+| binary drop built from a clean tree with no private parts | pending |
+
+### What moved since the last rehearsal (18 Oct)
+
+Every line is a merged PR; the numbers are measured, and the ones measured on Strix Halo carry the
+power state they were taken in. **lemonade bench standard** = Lemonade's own CI benchmark (reload
+before every run); **ours** = our sampler/batched standard (see the table legend in
+the auto-opt database).
+
+**HRX speed (ours).** Qwen3.8-27B UD-Q4_K_XL with MTP, greedy 256-token chats: **36.0 / 26.8 / 29.9
+tok/s** on code / prose / short, from 25.9 / 20.5 / 21.9 before the verify kernels — 2–8-token
+K-quant verify took the step from 121 ms to 88 ms (`#487`). Decode without MTP stays 12.2 tok/s.
+
+| change | PR | measured |
+|---|---|---|
+| 2..8-token K-quant verify kernels | `#487` | 27B `--mtp` **+31–39 %** |
+| batched MoE decode on our kernels | `#521`, `#526` | pin `744bd713d968`: the top-1 batched window from 5 tokens; the batched cells below were measured one pin earlier (90 W cap, PCM pad (23 Oct)) |
+| split-K decode attention for gated head-256 | `#500` | Qwen3.5-4B 32K decode **23.7 → 47.1 tok/s**; 27B **7.5 → 11.0** |
+| MoE formats for Qwen3.8-Flash-Next | `#494` | **5.1 → 26 tok/s**, 50 with MTP |
+| HIP prompt flash attention, causal block skipping | `#491` | Qwen3-4B pp4096 **+45 %** |
+| m128 prefill tiles + raster groups | `#490` | 27B prefill **+1.6…2.5 %** |
+| query-chunk prompt FA, ROPE token chunks, int4 SwiGLU opt-in | `#493` | 27B KLD base re-recorded; 27B runs `-ub 4096` |
+| a second warm-up at load builds the small-batch weight layout | `#498` | 27B chat-short TTFT **2.64 → 0.80 s** |
+| warm the backend before the first client request | `#492` | removes the 5–23 % slower first request |
+| MTP drafts with the model's own head on HRX by default | `#495` | `--print-backend` carries the warm-up |
+| `--precise`: a follow-up turn bitwise identical to a cold run | `#504` | identity, not speed |
+
+**Batched, ours standard** (N concurrent 256-token chat requests, `-c 8192` per slot, median of 3,
+**90 W cap, PCM pad (23 Oct)**), aggregate tok/s at N=8: Qwen3.8-27B **50.7** (2.08x N=1, with the
+model's own MTP draft), Qwen3-Coder-30B-A3B **138.1** (1.64x), Qwen3.5-4B **194.3** (3.39x). Single
+stream in the same cells: Coder-30B 84.2, 27B 24.3 (MTP on; 12.2 without), Qwen3.5-4B 57.3. Lemonade's
+Vulkan build reaches 245.7 on Coder-30B at N=8 in the same run — that gap is batching headroom, not a
+model result, and it is the next speed row.
+
+**Correctness and placement.** Strict device placement is the default: a graph with any node off HRX
+refuses to load, and the hardware gate fails the same condition (`#482`, `#473`, `#442`). The census
+closes **43 of 43** configurations with 0 nodes off the GPU and one graph split (`#476`, `#480`,
+`#481`), the gate now covers q8_0 KV rows, a mixed K/V flash-attention case, an MoE model, an IQ
+quant and a second needle (`#474`, `#477`, `#484`), and the KLD bases were re-recorded at the release
+pin (`#456`). `#315` is **resolved**: the CWSR-on soak passed 37 arms over 9 h 03 min with 0 faults
+(`#518`), after the CWSR save area moved into GTT (`#454`) and `hrx-system` gained its
+`HRX_ALLOW_NO_SVM` gate (`#455`). A lost GPU now exits the server instead of serving from a broken
+context (`#466`), allocation safety bounds the program cache and poisons a device after a fault
+(`#486`), and the ZAYA1-8B NaN re-check closed on **120 fresh loads, 0 NaN** at the current pins
+(`#433`).
+
+**NPU (sealed).** The gate gained an NPU phase and the packages carry **only the sealed kernel
+sets** — a plaintext artifact fails the packaging check, and the launcher refuses an unsealed one
+(`#503`, `#505`, `#509`, `#512`). The 0.6B gate phase measures **90.33 tok/s**; the OS image proves
+`amd_pmf` sensors and the NPU from the booted image (`#517`, `#523`). The runtime's public header and
+prebuilt-library build are in the tree (`#467`, `#479`, `#469`).
+
+**Lemonade.** One hop for GGUFs: Lemonade starts the engine's `llama-server` directly, no shim
+(`#475`, fork `#15`), the engine's own warm-ups are sent in order (`#492`, fork `#16`, `#17`), and
+the Ubuntu 26.04 PPA's `lemond` runs our HRX server unchanged (`#483`). Synced to upstream `#3771`
+(fork `#21`, `#520`). The catalog has **22 HRX entries, each proven on the box** — strict placement,
+one request in role, `lemonade bench ... chat-short` — and 3 NPU entries (fork `#19`, `#20`, `#23`);
+chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16 holds.
+
+**1bit OS.** The image carries the sealed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
+signed with the enrolled MOK so a stick boots with Secure Boot on (`#513`), the USB4 v2 / Thunderbolt
+stack is loaded (`#514`), and `amd_pmf` sensors come up from the booted image (`#517`). The install
+step is not in this candidate (branch `1bit/os-install`).
+
+**Tooling.** `scripts/gpu-hold`: a fair FIFO GPU queue, used by the hardware gate and the release
+runs, which honours the box's thermal brake and cools down after a hot hold (`#501`, `#502`). Census
+and pins kept current daily (`#506`, `#524`), and the kernel is now a written runbook with a
+rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
+
 ## What a release carries
 
 | file | what |

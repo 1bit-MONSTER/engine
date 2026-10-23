@@ -20,7 +20,9 @@
 # build has, at the same paths relative to 1bit as in the build tree, which is where 1bit looks
 # once the build tree is gone (app/built_path.h). Each program and library finds its libraries
 # beside itself ($ORIGIN). The NPU lane has no separate runtime library to ship (no XRT;
-# weekly.sh checks). HRX still needs TheRock (/opt/rocm-therock) on the
+# weekly.sh checks), and it carries the GGUF-on-NPU helper scripts (scripts/, tools/): public
+# Apache-2.0 source, the one exception package_checks makes to the tarball's no-source rule.
+# HRX still needs TheRock (/opt/rocm-therock) on the
 # machine, as it does when built there. The engine is pure HRX with HIP kernels on the GPU: no
 # Vulkan, ROCm backend, Metal, ZINC or CUDA. This tarball is not published on its own: weekly.sh
 # unpacks it into the Lemonade + onebit package as 1bit/ (docs/releases.md).
@@ -74,6 +76,17 @@ if [ -d "$build/npu/kernels" ]; then
     echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels"
 fi
 
+# The NPU lane's GGUF path runs public helper scripts (the repack, its declared-scale guard and the
+# lane packer). 1bit looks for them beside itself (app/built_path.h, packaged_path), so they ship at
+# the same relative path a build tree has them. They are Apache-2.0 and already published in this
+# repository -- the tarball still carries no source of a private component.
+if [ -d "$build/npu" ]; then
+    mkdir -p "$stage/scripts" "$stage/tools"
+    cp "$src/scripts/repack_gguf.py" "$src/scripts/check_repack_config.py" "$stage/scripts/"
+    cp "$src/tools/gguf_to_q4nx.py" "$stage/tools/"
+    echo "  scripts, tools: the GGUF-on-NPU helpers ($(ls "$stage/scripts" "$stage/tools" | wc -l) files)"
+fi
+
 # Every program and library finds its libraries beside itself (scripts/pack-elf.sh): a library it
 # loads from elsewhere in the build tree (HRX's libhrx, libloomc) or LLVM's OpenMP runtime
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
@@ -101,7 +114,7 @@ cat > "$stage/README.txt" <<EOF
 1bit engine $ver for Linux x86_64 (Strix Halo / Ryzen AI): https://1bit.gg/
 
   ./1bit serve -m model.gguf --port 8000      (--device auto: HRX0, else the CPU)
-$( [ -d "$stage/npu/kernels" ] && printf '  ./1bit serve -m <Qwen3 NPU model dir> --port 8000   (the 1bit NPU engine, XDNA 2 NPU)\n' )
+$( [ -d "$stage/npu/kernels" ] && printf '  ./1bit serve -m <Qwen3 NPU model dir> --port 8000   (the 1bit NPU engine, XDNA 2 NPU)\n  ./1bit serve -m model.gguf --device npu --port 8000  (a GGUF repacked for the NPU: needs python3\n                                                       with numpy and gguf, and the Q4NX converter\n                                                       in ONEBIT_Q4NX_CONVERTER or ~/np-model-generic)\n' )
 
 Ubuntu 26.04 with the Lemonade PPA's lemond: sudo ./install-lemonade-ppa.sh
   (installs to /opt/1bit; lemond's HRX recipe then runs this llama-server)

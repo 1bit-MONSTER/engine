@@ -130,6 +130,11 @@ add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<T
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
+# where --device npu finds the GGUF repack script: beside 1bit in a package (scripts/package-linux.sh),
+# else ONEBIT_Q4NX_REPACK; no NPU needed (the repack runs before the device)
+add_test(NAME npu_repack_path COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_repack_path.sh $<TARGET_FILE:onebit>)
+# a build without the NPU lane has no repack path: the test says skip (77) there, not fail
+set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
@@ -137,6 +142,15 @@ add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.
 add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
 # engine#315: what --hrx-cwsr-placement puts in an HRX backend's environment (app/hrx_cwsr.h); fake backend, no GPU.
 add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh $<TARGET_FILE:onebit>)
+# --device hybrid (docs/hybrid.md): the handoff with a fake backend and a fake provider; and, with a model,
+# end to end on the CPU llama-server (ONEBIT_SERVE_TEST_LLAMA_SERVER, else the build's own; skips without one)
+add_test(NAME hybrid_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_route.sh $<TARGET_FILE:onebit>)
+set(ONEBIT_SERVE_TEST_LLAMA_SERVER "" CACHE FILEPATH "llama-server for hybrid_e2e (default: the build's own)")
+if(ONEBIT_SERVE_TEST_GGUF)
+    add_test(NAME hybrid_e2e
+             COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${ONEBIT_SERVE_TEST_LLAMA_SERVER})
+    set_tests_properties(hybrid_e2e PROPERTIES SKIP_RETURN_CODE 77)
+endif()
 # The NPU route's <think> split into reasoning_content (app/think_split.h); header only, runs in CI.
 add_executable(think_split_test tests/think_split_test.cpp)
 target_include_directories(think_split_test PRIVATE app)

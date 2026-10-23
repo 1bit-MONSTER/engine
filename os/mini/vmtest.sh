@@ -128,6 +128,20 @@ else echo "Live banner on the console: missing from $out/serial.log"; ok=0; fi
 # The self-test has to run from the image. It cannot PASS in a VM - there is no Radeon GPU and no XDNA
 # NPU - so what is asserted is that it runs, reports the live mode, and says plainly that the NPU is
 # what is missing. The NPU PASS belongs to the real boot (owner's step).
+# The engine's own llama-server and the HSA runtime it loads live on the data partition, not in the RAM
+# image (mkimage.sh). Nothing checked that until a release candidate's 1bit.check reported
+# "CHECK llama-server: FAILED" on a shipped image, so check it here, on the boot that has /data.
+eng=$(ssh_vm '/opt/1bit-llama/llama-server --version 2>&1 | head -1; echo "----"; cat /etc/1bit/libhsa 2>/dev/null' 2>/dev/null || true)
+lls=$(printf '%s' "$eng" | sed -n '1,/^----$/p' | head -1)
+hsa=$(printf '%s' "$eng" | sed -n '/^----$/,$p' | tail -1)
+case "$lls" in
+    *version*|*build*) echo "engine llama-server on the stick (/opt/1bit-llama): ${lls}";;
+    *) echo "engine llama-server (/opt/1bit-llama/llama-server) does not run: ${lls:-no output}"; ok=0;;
+esac
+if [ -n "$hsa" ] && ssh_vm "test -e '$hsa'" 2>/dev/null; then
+    echo "HSA runtime named by /etc/1bit/libhsa: $hsa (present)"
+else echo "HSA runtime: /etc/1bit/libhsa is ${hsa:-empty} and/or names no file"; ok=0; fi
+
 st=$(ssh_vm '1bit-selftest 2>&1 | tail -25' 2>/dev/null || true)
 case "$st" in
     *"mode      : LIVE"*) echo "1bit-selftest: runs, and reports the LIVE mode";;
@@ -241,6 +255,18 @@ if [ $ok = 1 ] && [ -f "$out/vdisk.img" ]; then
             *) echo "installed boot: /data is not on the installed disk"; ok=0;; esac
         case "$st2" in *"mode      : INSTALLED"*) echo "1bit-selftest on the installed disk: reports the INSTALLED mode";;
             *) echo "1bit-selftest on the installed disk: $(printf '%s' "$st2" | grep mode | head -1 | cut -c1-70)"; ok=0;; esac
+        eng2=$(ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 \
+            '/opt/1bit-llama/llama-server --version 2>&1 | head -1; echo "----"; cat /etc/1bit/libhsa 2>/dev/null' 2>/dev/null || true)
+        lls2=$(printf '%s' "$eng2" | sed -n '1,/^----$/p' | head -1)
+        hsa2=$(printf '%s' "$eng2" | sed -n '/^----$/,$p' | tail -1)
+        case "$lls2" in
+            *version*|*build*) echo "installed boot: engine llama-server runs from the disk (${lls2})";;
+            *) echo "installed boot: engine llama-server does not run: ${lls2:-no output}"; ok=0;;
+        esac
+        if [ -n "$hsa2" ] && ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null \
+                root@127.0.0.1 "test -e '$hsa2'" 2>/dev/null; then
+            echo "installed boot: HSA runtime named by /etc/1bit/libhsa is present ($hsa2)"
+        else echo "installed boot: /etc/1bit/libhsa is ${hsa2:-empty} and/or names no file"; ok=0; fi
         for i in $(seq 40); do curl -sf "${auth[@]}" "$api/api/v1/health" >/dev/null && break; sleep 2; done
         code=$(curl -s -o /dev/null -w '%{http_code}' "$api/api/v1/models")
         [ "$code" = 401 ] && echo "installed Lemonade: 401 without the key" || { echo "installed Lemonade: HTTP $code without the key"; ok=0; }

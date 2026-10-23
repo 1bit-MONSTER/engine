@@ -474,8 +474,11 @@ program is rebuilt.
 ### CWSR save-area placement (engine#315)
 
 The shipped configuration for engine#315 is amdgpu with CWSR **off** (`amdgpu.cwsr_enable=0` on the
-kernel command line and in `/etc/modprobe.d`). Nothing below changes that, and it stays the
-recommended setting until a soak on a CWSR-on boot passes.
+kernel command line and in `/etc/modprobe.d`). Nothing below changes that, and it stays the default.
+The replacement below was accepted by a soak on a CWSR-on boot (2026-10-18/19: 37 in-band arms, 9 h 03 min,
+0 faults, every graded arm's save area two GTT BOs and no SVM lookup; KNOWN-ISSUES.md, engine#315), so
+a box that runs CWSR on - for another workload, or by its owner's choice - gets the safe placement
+automatically.
 
 On a box that runs CWSR **on**, `1bit serve` moves each HRX queue's CWSR context save area out of
 pageable memory. By default libhsakmt allocates the save area as an SVM range. With

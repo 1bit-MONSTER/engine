@@ -35,10 +35,14 @@ pin once it lands. Treat a single failure of this case as a flake, not a regress
 
 The investigation notes and evidence cited below as `notes/315/...` are kept in a private repository.
 
-**Status: OPEN. No limitation entry is recorded.** The earlier status line here read "accepted as a
-documented limitation"; that is superseded. This issue's own rule is that a documented limitation is
-acceptable only *after* the mechanism is named, and no mechanism is proven - so nothing is recorded and
-the issue stays open until the criterion below is met. See the correction at the end of this entry.
+**Status: RESOLVED 2026-10-22, closed.** The trigger is named (the CWSR context save area living in a
+pageable SVM range on a CWSR-on box, which KFD eviction can migrate out from under a preempted queue), the
+repair is shipped (`1bit serve` places the save area in GTT when `amdgpu.cwsr_enable=1`; engine PR #454,
+pins in #455), and the acceptance soak this entry required **passed on 2026-10-18/19**: 37 in-band arms,
+9 h 03 min in band, **0 graded faults**, every graded arm's save area traced as two GTT BOs with zero SVM
+lookups. See "UPDATE 2026-10-19 - the CWSR-on soak passed" at the end of this entry for the numbers, the
+bound, and what the result does not show. The earlier "no limitation is recorded" status is kept below for
+the record; it is superseded, not deleted.
 
 Owner acceptance, recorded 2026-10-07: the owner authorised landing this entry in writing — *"you have gh
 authorization and do what needs to be done"* — on the basis that no forward fix is available. The limitation text
@@ -705,7 +709,52 @@ less (one-sided 95 %); it does not show zero.
 (`--hrx-cwsr-placement`, default `auto`; docs/hrx.md "CWSR save-area placement"). With CWSR off it
 changes nothing.
 
-**CWSR off (`amdgpu.cwsr_enable=0`) stays the shipped default** until a soak on a CWSR-on boot with
-the engine build (not a hand-set environment) passes: at least 6 hours of GLM-4.7-Flash at the #315
-composition plus ZAYA1-8B served alongside, with 0 NaN aborts, 0 HSA faults, 0 TDRs and 0 GPU resets,
-and every save area traced as a GTT BO. This issue stays open until then.
+**CWSR off (`amdgpu.cwsr_enable=0`) stays the shipped default** (the soak below does not change it; the
+default is the owner's decision). The soak this paragraph required ran on 2026-10-18/19 and passed -
+see the closing section.
+
+---
+
+## UPDATE 2026-10-22 — the CWSR-on soak passed, the condition is confirmed, #315 is closed
+
+Acceptance soak run 2026-10-18 15:56 (boot) to 2026-10-19 04:52 (box time) on strixhalo, on a **CWSR-on**
+boot (`amdgpu.cwsr_enable=1`, stock amdgpu, kernel `7.3.0-rc4-1bit`), with the engine build deciding the
+placement itself (no hand-set environment), then restored to CWSR-off. Build: engine `9228e5a`
+(llama.cpp `8d9ce2c1a`, hrx-system `82804197b` with the `HRX_ALLOW_NO_SVM` gate), `1bit` sha256
+`ccbf5991f6c4…`. Composition: 4 `1bit serve` neighbours of GLM-4.7-Flash (`-c 2048`) + a sized GTT ballast
+(no kernels, no queues) + one graded `1bit serve` GLM-4.7-Flash (`-c 8192 -fa on`) reloaded per arm; every
+GPU process is a `1bit serve` of that build, so every HRX queue got its placement through the engine.
+
+| item | value |
+|---|---|
+| in-band time | **32,575 s = 9 h 03 min** (band = graded arm `gtt_start` in [100,108] GiB) |
+| in-band arms | **37**, every one `verdict=OK`, `in_band=1` (0 out of band, 0 INVALID) |
+| `gtt_start` per arm | 101-102 GiB; `gtt_peak` 110-111 GiB; `avail_min` 7-8 GiB |
+| graded detector | 66 requests per arm (`~/wt/315-detector.py`), **37 arms, 0 failures** (`det_http_failures=0 det_utf8_failures=0 det_parse_failures=0 transport_failures=0`, `identical_distinct=1` every arm) |
+| graded chat | 20 greedy `/v1/chat/completions` per arm, **740 requests, 0 bad, 0 mismatch** |
+| background load | 4,791 neighbour requests, **2 bad** (both HTTP 502, isolated; the next request to the same server answered 200; no NaN, no 500, no backend exit, no watchdog kill - recorded, not graded) |
+| NaN aborts | **0** (`HRX returned NaN` absent from every server log) |
+| HSA faults / backend exits / watchdog kills / arm hangs | **0 / 0 / 0 / 0** |
+| dmesg | page faults **0**, ring timeouts **0**, GPU resets **0**, OOM **0**; Tctl peak 83 C, 6 gate pauses, 0 freezes |
+| **placement, graded arms** | **37 of 37**: `csa_gtt=2 csa_svm=0 kbg_fail=0`, engine line `HRX: CWSR is on; CWSR save area placed in GTT (engine#315)` in every serve log, llama-server child's environ exactly `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` |
+| neighbours | `csa_gtt=2 csa_svm=0 gtt_line=1` for all four; their rows carry `env_ok=-1` because the environment snapshot raced the exec, and a stale `zaya.pids` file from an earlier attempt raised `DRIFT` in `counters.txt` (the run's own stop flag never fired; a fresh counter pass prints `placement_drift=0`) |
+
+**Against the control, same boot, same composition.** Phase B (the hand-set environment, `PHASE-B-GO.md`)
+faulted **4 of 16** runs without the placement; this soak faulted **0 of 37** arms with it (engine-decided).
+Fisher exact, two-sided: **p = 0.0062**. The pre-registered criterion was >= 6 h in band and >= 42 arms
+with zero faults; the run reached 9 h 03 min and stopped at its 9 h wall cap with 37 arms, so per the
+orchestrator ruling of 2026-10-19 01:30 it is graded **PASS (cap-limited)**, with the arm count reported.
+
+**What this does not show.** 0 of 37 bounds the per-arm fault rate at **7.8 %** (one-sided 95 %), it does
+not make the fault impossible; the optional positive control (`--hrx-cwsr-placement=off` on the same boot)
+was not run, so the rate contrast rests on Phase B rather than on a same-session control; and the soak ran
+with the ballast rather than ZAYA1-8B alongside (ZAYA was dropped on 2026-10-18 19:19 for memory headroom -
+GTT 112 GiB left 4 GiB MemAvailable and tripped the guard on otherwise-clean arms).
+
+**CWSR-off remains the shipped default.** The repair makes a CWSR-on box safe; whether to ship CWSR on is a
+separate owner decision and nothing here recommends it. CWSR-off evidence on the record: 11 and 10 in-regime
+arms in two campaigns, 0 faults (`~/wt/315cwsr0-console.log`, `~/wt/315cwsr60-console.log`).
+
+Evidence on the box: `~/wt/315soak/{SUMMARY,STATE.md,PROVENANCE,counters.txt,arms/}`,
+`~/wt/315soak/gate/PASS` (placement gate), `~/wt/315-PATCH-STATUS.md` §11; the plan it followed is
+`~/wt/315c1/SOAK-GO.md`.

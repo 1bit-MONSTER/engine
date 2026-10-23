@@ -15,9 +15,10 @@
 # limitations under the License.
 # 1bit-selftest: one command that proves the engine answers from THIS boot.
 #
-# 1bit OS is live: everything runs from RAM, no internal disk is mounted and nothing is installed,
-# so whatever this proves is gone at the next reboot (only /data on the stick persists). Run it from
-# the console, or over SSH from another machine.
+# On a live boot everything runs from RAM: no internal disk is mounted and nothing is installed, so
+# whatever this proves is gone at the next reboot (only /data on the stick persists). On an installed
+# machine the same program runs from the disk (os/README.md, 1bit-install) and says INSTALLED. Run it
+# from the console, or over SSH from another machine.
 set -u
 PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
 PORT=${PORT:-13305}
@@ -29,7 +30,21 @@ LOG=/data/selftest.log
 say() { echo "$@"; [ -w /data ] && echo "$@" >> "$LOG" 2>/dev/null; }
 
 say "1bit OS self-test  $(date -u +%FT%TZ)"
-say "  mode      : LIVE - RAM only, nothing installed, internal disks never mounted"
+# The mode is what this boot IS, not what the script assumes: init marks a live boot with /etc/1bit/live
+# and an installed disk's boot with /etc/1bit/installed (os/mini/init.sh). This line used to say LIVE
+# unconditionally, so on an installed machine the self-test contradicted the banner - and the installer's
+# own check, which asserts "mode: INSTALLED", could never pass.
+if [ -e /etc/1bit/installed ]; then
+    MODE=INSTALLED
+    MODEWHAT="runs from this machine's disk, /data is $(findfs LABEL=1BIT-DATA 2>/dev/null)"
+elif [ -e /etc/1bit/live ]; then
+    MODE=LIVE
+    MODEWHAT="RAM only, nothing installed, internal disks never mounted"
+else
+    MODE=UNKNOWN
+    MODEWHAT="no marker in /etc/1bit, so this boot cannot say where it came from"
+fi
+say "  mode      : $MODE - $MODEWHAT"
 say "  kernel    : $(uname -r)"
 say "  GPU / NPU : $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')$(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 say "  NPU fw    : $([ -e /lib/firmware/amdnpu/17f0_11 ] && echo present || echo MISSING)"
@@ -62,7 +77,7 @@ case "$RESP" in
     *'"content"'*)
         say "  answer    : $(printf '%s' "$RESP" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)"
         say "  timings   : $(printf '%s' "$RESP" | sed -n 's/.*"predicted_per_second":\([0-9.]*\).*/\1/p' | head -1 | awk '{printf "decode %.1f tok/s", $1}')"
-        say "RESULT: PASS - the engine answered from this live boot"
+        say "RESULT: PASS - the engine answered from this $MODE boot"
         ;;
     *)  say "  answer    : none (${RESP:-empty response})"
         say "RESULT-LM  : FAIL - Lemonade is up but the chat did not answer (the NPU route is tested below anyway)" ;;

@@ -115,7 +115,11 @@ echo "== kernel modules ($kver)"
 # USB4 v2 / Thunderbolt on Strix Halo: the USB4 host router (1022:158d) is driven by thunderbolt.ko and
 # its Type-C side by typec + ucsi_acpi (alt modes, display); without them the USB4 ports and any dock
 # behind them do nothing, and with them a stick on a USB4 port tunnels like any other.
-mods="amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
+# nvme and ahci are for the install target, not for the live stick: 1bit-install writes an internal
+# disk, and without these modules the live system cannot even see one (os/mini/install.sh). nls_cp437 and
+# nls_ascii are for mounting its ESP: the image mounts no vfat until the installer does, and this kernel's
+# CONFIG_NLS_DEFAULT is ascii ("codepage cp437 not found" / "IO charset ascii not found" in the VM).
+mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -241,6 +245,20 @@ else
 fi
 # one command that proves the engine answers from this boot (console or SSH)
 cp "$here/selftest.sh" "$root/bin/1bit-selftest"; chmod +x "$root/bin/1bit-selftest"
+# the installer (os/README.md): from a live boot onto one internal disk. It lays the target out with
+# the same sfdisk script this build uses for the stick, so an installed disk and a stick are the same
+# layout - so the image carries sfdisk (busybox fdisk is MBR-only and cannot make the GPT the stick has)
+cp "$here/install.sh" "$root/bin/1bit-install"; chmod +x "$root/bin/1bit-install"
+cp /usr/sbin/sfdisk "$root/bin/sfdisk"; chmod +x "$root/bin/sfdisk"
+copy_libs /usr/sbin/sfdisk
+# and the real mke2fs, for the same reason: busybox's is ext2-only and takes no -t, so the installer's
+# data partition was never made ("1bit-install: mke2fs failed", with busybox's usage text above it, in
+# the VM). /etc/mke2fs.conf comes along or mke2fs silently falls back to its built-in defaults.
+# rm first: bin/mke2fs is a symlink to busybox, and cp would write the new binary THROUGH it, into busybox
+rm -f "$root/bin/mke2fs"
+cp /usr/sbin/mke2fs "$root/bin/mke2fs"; chmod +x "$root/bin/mke2fs"
+copy_libs /usr/sbin/mke2fs
+cp /etc/mke2fs.conf "$root/etc/mke2fs.conf"
 cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/1bit-release-check"
 cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"

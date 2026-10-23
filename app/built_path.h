@@ -18,20 +18,21 @@
 #include <string>
 #include <system_error>
 
-// A backend the build compiled in by its absolute path in the build tree
-// (ONEBIT_BUILD_DIR/<rel>). A packaged 1bit (scripts/package-linux.sh) keeps that relative
-// layout beside the executable. That copy wins whenever it exists, so a package run on the box
-// that built it tests its own backends rather than the build tree's; the compiled path is the
-// fallback (a 1bit run from the build tree).
+// A backend the build compiled in, named RELATIVE to the build dir (CMake writes
+// file(RELATIVE_PATH ...) for every such define). scripts/package-linux.sh keeps that layout
+// beside the executable, and a 1bit run from the build tree finds it the same way, because the
+// binary lives in the build dir: either way the path resolves from the executable's own
+// directory. Nothing machine-specific is compiled in, so a shipped binary that has no build tree
+// on disk names no build-machine path (scripts/weekly.sh package_checks asserts this).
 inline std::string built_path(const char* compiled) {
     namespace fs = std::filesystem;
     std::error_code ec;
-#if defined(ONEBIT_BUILD_DIR) && defined(__linux__)
-    const fs::path rel = fs::path(compiled).lexically_relative(ONEBIT_BUILD_DIR);
-    if (!rel.empty() && *rel.begin() != "..") {
+    const fs::path p = compiled;
+#if defined(__linux__)
+    if (!p.is_absolute()) {
         const fs::path here = fs::read_symlink("/proc/self/exe", ec).parent_path();
-        if (!ec && fs::exists(here / rel, ec)) return (here / rel).string();
+        if (!ec && fs::exists(here / p, ec)) return (here / p).string();
     }
 #endif
-    return compiled;
+    return std::string(compiled);   // an absolute (older build) or a path with no file beside us
 }

@@ -25,8 +25,11 @@ They are not merged into this repository yet. The release carries the NPU runtim
 package serves GGUF models on HRX, not NPU models ([releases.md](releases.md#the-npu-engine)).
 
 The NPU runtime and the NPU kernels are proprietary and closed source
-([releases.md](releases.md#private-components)). This page covers the public parts: the model
-format, how `1bit serve` runs an NPU model, and how to build.
+([releases.md](releases.md#private-components)). They ship only as compiled binaries: the runtime
+is compiled into `1bit`, and the kernels ship as compiled, encrypted artifacts that `1bit` verifies
+and decrypts in memory at load (a wrong key fails cleanly, and nothing phones home). Their source,
+build and method are not in this repository or in any release. This page covers the public parts:
+the model format, how `1bit serve` runs an NPU model, and how to build.
 
 AMD's own NPU stack is a separate route that ships today: `1bit serve --device onnx` runs Ryzen AI
 Software's ONNX Runtime GenAI (the RyzenAI provider) on the NPU, on Linux too, from the user's own
@@ -120,6 +123,16 @@ cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>
 published FastFlowLM model, is trusted as published.
 
 ## Serving
+
+The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU
+kernels (dense Qwen3: 0.6B, 1.7B and 4B):
+
+```
+./1bit serve -m <Qwen3 NPU model dir> --port 8000
+```
+
+In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
+The model directory holds the weights only; the kernels ship inside the package.
 
 - **Tokenizer:** `npu/tokenizer.cpp` reads `tokenizer.json` directly (PCRE2 for the
   pre-tokenizer regex). Added tokens with `special: false`, such as Qwen3's `<think>` and

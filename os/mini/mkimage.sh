@@ -112,7 +112,10 @@ for a in $("$root/bin/busybox" --list); do [ -e "$root/bin/$a" ] || ln -s busybo
 
 echo "== kernel modules ($kver)"
 # plus virtio, so 1bit OS also runs (and is tested) in a VM; together a few hundred KB
-mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk"
+# USB4 v2 / Thunderbolt on Strix Halo: the USB4 host router (1022:158d) is driven by thunderbolt.ko and
+# its Type-C side by typec + ucsi_acpi (alt modes, display); without them the USB4 ports and any dock
+# behind them do nothing, and with them a stick on a USB4 port tunnels like any other.
+mods="amdgpu amdxdna r8169 mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -135,6 +138,23 @@ bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
 [ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_HRX=ON)"; exit 1; }
 copy_elf "$bin"
 ln -s "$bin" "$root/bin/1bit"
+# The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"):
+# in a package that is <pkg>/npu/kernels next to <pkg>/1bit, and here the binary keeps its build
+# path, so the sets go to the same place relative to it. Without them the image ships the NPU
+# route and nothing it can load - the route then refuses rather than falling back.
+if [ -d "$build/npu/kernels" ]; then
+    mkdir -p "$root$build/npu"
+    cp -a "$build/npu/kernels" "$root$build/npu/"
+    sealed=$(find "$root$build/npu/kernels" -name layer1.elf -exec \
+        sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
+    total=$(find "$root$build/npu/kernels" -name layer1.elf | wc -l)
+    stray=$(find "$root$build/npu/kernels" -mindepth 3 \( -name '*.mlir' -o -name '*.o' -o -name 'layer1.work' \
+        -o -name '*.pdi' \) | head -3)
+    [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
+    [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
+    [ -z "$stray" ] || { echo "npu/kernels carries build artifacts, not just layout.json + layer1.elf:"; echo "$stray"; exit 1; }
+    echo "   npu/kernels: $(ls "$root$build/npu/kernels" | wc -l) sealed sets, $sealed kernels"
+fi
 mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"
 hrx=$build/hrx/llama/bin
 cache_get() { sed -n "s/^$1:[A-Z]*=//p" "$build/CMakeCache.txt" 2>/dev/null; }
@@ -300,6 +320,27 @@ objcopy --add-section .cmdline="$out/cmdline.txt" --change-section-vma .cmdline=
         --add-section .linux="$vmlinuz" --change-section-vma .linux=$o_linux \
         --add-section .initrd="$out/initramfs.img" --change-section-vma .initrd=$o_initrd \
         "$stub" "$out/1bit-os.efi"
+
+# Secure Boot: sign the unified kernel image with the machine's own enrolled MOK when its key is
+# named (MOK_KEY + MOK_CERT), so a signed 1bit OS stick boots with Secure Boot left on rather than
+# asking the owner to switch it off. sbsign appends a signature over the whole PE, which is what
+# firmware verifies for a UKI; sbverify then proves the result against the same certificate.
+if [ -n "${MOK_KEY:-}${MOK_CERT:-}" ]; then
+    [ -n "${MOK_KEY:-}" ] && [ -n "${MOK_CERT:-}" ] ||
+        { echo "MOK_KEY and MOK_CERT must be given together: sbsign --key <priv> --cert <pem>"; exit 1; }
+    command -v sbsign > /dev/null ||
+        { echo "sbsign is needed to sign the image: apt install sbsigntool"; exit 1; }
+    sbsign --key "$MOK_KEY" --cert "$MOK_CERT" --output "$out/1bit-os.efi.signed" "$out/1bit-os.efi" > /dev/null ||
+        { echo "sbsign failed"; exit 1; }
+    mv -f "$out/1bit-os.efi.signed" "$out/1bit-os.efi"
+    if command -v sbverify > /dev/null; then
+        sbverify --cert "$MOK_CERT" "$out/1bit-os.efi" > /dev/null 2>&1 ||
+            { echo "the signature does not verify against $MOK_CERT"; exit 1; }
+    fi
+    echo "   signed with $(basename "$MOK_CERT")"
+else
+    echo "   unsigned (set MOK_KEY and MOK_CERT to sign it for Secure Boot)"
+fi
 
 echo "== 1bit-os.img (USB: EFI partition + 1BIT-DATA)"
 efi_mb=$(( $(stat -c %s "$out/1bit-os.efi") / 1048576 + 64 ))

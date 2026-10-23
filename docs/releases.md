@@ -58,10 +58,18 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 ### The NPU engine
 
 The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
-NPU engine is in progress: the release carries its runtime, compiled into `1bit`, and the `onebit`
-recipe's `npu` backend, but the NPU layer and lm-head kernels built from source are not merged yet
-([npu.md](npu.md)). Until they are, NPU models
-are not served from a release package; HRX serves the GGUF models.
+release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's `npu` backend.
+The NPU kernels are closed too: they ship as compiled, encrypted artifacts (`config/npu-kernels.config`,
+`ONEBIT_NPU_PRIVATE`) that `1bit` verifies and decrypts in memory at load, failing cleanly on a
+wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
+([npu.md](npu.md)). The release package carries them, and serves dense Qwen3 (0.6B, 1.7B, 4B)
+on the NPU.
+
+`scripts/weekly.sh` packs them by default (`WEEKLY_NPU_KERNELS=0` builds without): the sealed
+kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels only
+(`ONEBIT_NPU_RELEASE`), the `lemond-onebit` launcher sets `ONEBIT_KCRYPT_REQUIRE_SEALED=1`, and the package checks refuse a plaintext kernel,
+an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The
+release machine holds the kernel key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
 
 ### Private components
 

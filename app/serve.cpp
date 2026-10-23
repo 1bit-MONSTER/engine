@@ -2414,7 +2414,9 @@ std::string repack_gguf(const std::string& gguf) {
     const std::string python = py ? py : "python3";
     const char* rp = std::getenv("ONEBIT_Q4NX_REPACK");
 #ifdef ONEBIT_NPU_REPACK_SCRIPT
-    const std::string script = rp ? rp : ONEBIT_NPU_REPACK_SCRIPT;
+    // the package keeps it beside 1bit (scripts/package-linux.sh); a build tree has it at the
+    // path CMake wrote, ../src/scripts/repack_gguf.py, which no install layout can mirror
+    const std::string script = rp ? rp : packaged_path("scripts/repack_gguf.py", ONEBIT_NPU_REPACK_SCRIPT);
 #else
     const std::string script = rp ? rp : "";
 #endif
@@ -2521,7 +2523,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
     const std::string python = py ? py : "python3";
     const char* lp = std::getenv("ONEBIT_Q4NX_LANE_PACK");
 #ifdef ONEBIT_NPU_LANE_PACK_SCRIPT
-    const std::string script = lp ? lp : ONEBIT_NPU_LANE_PACK_SCRIPT;
+    const std::string script = lp ? lp : packaged_path("tools/gguf_to_q4nx.py", ONEBIT_NPU_LANE_PACK_SCRIPT);
 #else
     const std::string script = lp ? lp : "";
 #endif

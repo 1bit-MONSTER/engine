@@ -85,8 +85,10 @@ class H(BaseHTTPRequestHandler):
             name = str(req.get("filename", ""))
             slot_dir = sys.argv[sys.argv.index("--slot-save-path") + 1]
             # the path comes from the directory listing, never from the request string itself
-            files = {entry: os.path.join(slot_dir, entry) for entry in os.listdir(slot_dir)}
-            path = files.get(name) if name == os.path.basename(name) else None
+            path = None
+            for entry in sorted(os.listdir(slot_dir)):
+                if entry == name:
+                    path = os.path.join(slot_dir, entry)
             if path is None:
                 self._json(400, {"error": {"message": "Invalid filename"}})
                 return

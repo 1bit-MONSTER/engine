@@ -47,6 +47,9 @@ PACK_BUNDLE_LIBS=${PACK_BUNDLE_LIBS:-'libomp.so libomp.so.*'}
 PACK_EXTERNAL_LIBS=${PACK_EXTERNAL_LIBS:-'libamdhip64.so* libhipblas.so* libhipblaslt.so* librocblas.so* libhsa-runtime64.so* librocm_smi64.so* librocsolver.so* libroctx64.so*'}
 
 pack_is_elf() { [ -f "$1" ] && [ "$(head -c 4 "$1" | od -An -c | tr -d ' ')" = '177ELF' ]; }
+# only an ELF with a .dynamic section can carry an RPATH/RUNPATH; a static ELF (an AIE kernel
+# object, an intermediate link) must be left alone rather than fed to patchelf
+pack_is_dynelf() { pack_is_elf "$1" && readelf -S "$1" 2>/dev/null | grep -c '\.dynamic' | grep -qv '^0$'; }
 
 _pack_matches() {  # <name> <patterns>
     local p
@@ -61,7 +64,7 @@ pack_localize() {
     local stage=$1 build=$2 item f orig keep e dep dest
     local queue=()
     while IFS= read -r -d '' f; do
-        pack_is_elf "$f" && queue+=("$f|$build/${f#"$stage"/}")
+        pack_is_dynelf "$f" && queue+=("$f|$build/${f#"$stage"/}")
     done < <(find "$stage" -mindepth 2 -type f -print0)
     while [ ${#queue[@]} -gt 0 ]; do
         item=${queue[0]}; queue=("${queue[@]:1}")

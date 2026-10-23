@@ -110,7 +110,12 @@ set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DI
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
 # backends are compiled in by build-tree path; a package keeps that layout (app/built_path.h)
-target_compile_definitions(onebit PRIVATE ONEBIT_BUILD_DIR="${CMAKE_BINARY_DIR}")
+# Backend paths are embedded RELATIVE to the build dir (see app/built_path.h): a shipped binary
+# must not name a build-machine path. Each define below is turned into its relative form first.
+function(onebit_build_relative var out)
+    file(RELATIVE_PATH _rel "${CMAKE_BINARY_DIR}" "${${var}}")
+    set(${out} "${_rel}" PARENT_SCOPE)
+endfunction()
 
 # Runs everywhere, CI included: serve's proxy against a fake backend.
 add_test(NAME smoke_serve COMMAND ${CMAKE_SOURCE_DIR}/tests/smoke_serve.sh $<TARGET_FILE:onebit>)
@@ -190,7 +195,8 @@ if(ONEBIT_HRX)
     if(TARGET llama_hrx)
         add_dependencies(onebit llama_hrx)
     endif()
-    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${ONEBIT_HRX_SERVER}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
+    onebit_build_relative(ONEBIT_HRX_SERVER _onebit_hrx_server)
+    target_compile_definitions(onebit PRIVATE ONEBIT_HRX_SERVER="${_onebit_hrx_server}" ONEBIT_HRX_LIBHSA="${ONEBIT_HRX_LIBHSA}"
                                ONEBIT_HRX_ALLOW_NO_SVM=${ONEBIT_HRX_ALLOW_NO_SVM})
     if(ONEBIT_SERVE_TEST_GGUF)
         foreach(_dev hrx cpu)
@@ -217,7 +223,8 @@ if(ONEBIT_DS4)
         BYPRODUCTS ${ONEBIT_DS4_SERVER}
         USES_TERMINAL)
     add_dependencies(onebit ds4)
-    target_compile_definitions(onebit PRIVATE ONEBIT_DS4_SERVER="${ONEBIT_DS4_SERVER}")
+    onebit_build_relative(ONEBIT_DS4_SERVER _onebit_ds4_server)
+    target_compile_definitions(onebit PRIVATE ONEBIT_DS4_SERVER="${_onebit_ds4_server}")
 endif()
 
 # ── ONNX Runtime GenAI (docs/onnx.md) ──────────────────────────────────────
@@ -231,7 +238,8 @@ if(ONEBIT_ONNX)
         BYPRODUCTS ${ONEBIT_ONNX_SERVER}
         USES_TERMINAL)
     add_dependencies(onebit onnx_server)
-    target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${ONEBIT_ONNX_SERVER}")
+    onebit_build_relative(ONEBIT_ONNX_SERVER _onebit_onnx_server)
+    target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${_onebit_onnx_server}")
     # Linux NPU through Ryzen AI Software (docs/onnx.md): skips without ONEBIT_RYZENAI_ROOT,
     # an NPU and a model (ONEBIT_ONNX_NPU_MODEL)
     add_test(NAME onnx_npu_smoke COMMAND ${CMAKE_SOURCE_DIR}/tests/onnx_npu_smoke.sh $<TARGET_FILE:onebit>)
@@ -321,7 +329,8 @@ option(ONEBIT_LAYA_GGML "Build ggmlc's laya (HRX) as the router's scorer" OFF)
 if(ONEBIT_LAYA_GGML)
     include(cmake/laya-ggml.cmake)
     add_dependencies(onebit laya_ggml)
-    target_compile_definitions(onebit PRIVATE ONEBIT_LAYA_GGML_BIN="${ONEBIT_LAYA_GGML_BIN}")
+    onebit_build_relative(ONEBIT_LAYA_GGML_BIN _onebit_laya_ggml)
+    target_compile_definitions(onebit PRIVATE ONEBIT_LAYA_GGML_BIN="${_onebit_laya_ggml}")
 endif()
 
 add_executable(laya_gate tests/laya_gate.cpp)
@@ -383,11 +392,15 @@ set(ONEBIT_NPU_CAPTURED "" CACHE PATH "Directory of captured layer_ctx<N>.elf in
 set(ONEBIT_NPU_PDI "" CACHE FILEPATH "The layer kernel's design PDI")
 set(ONEBIT_NPU_GOLDEN "" CACHE PATH "Directory of full ELFs the fast lane ran")
 set(ONEBIT_NPU_KERNELS_DIR "" CACHE PATH "Full-ELF directory the GGUF-on-NPU forward loads (docs/npu.md)")
-target_compile_definitions(onebit PRIVATE ONEBIT_NPU_REPACK_SCRIPT="${CMAKE_SOURCE_DIR}/scripts/repack_gguf.py")
+set(_onebit_npu_repack "${CMAKE_SOURCE_DIR}/scripts/repack_gguf.py")
+onebit_build_relative(_onebit_npu_repack _onebit_npu_repack_rel)
+target_compile_definitions(onebit PRIVATE ONEBIT_NPU_REPACK_SCRIPT="${_onebit_npu_repack_rel}")
 # The GGUF -> fused-lane Q4NX layout packer (docs/npu.md, "From a GGUF").  A
 # different layout from repack_gguf.py; used only when ONEBIT_NPU_LANE_DIR routes
 # a GGUF to the fast lane, and never on the per-op forward's path.
-target_compile_definitions(onebit PRIVATE ONEBIT_NPU_LANE_PACK_SCRIPT="${CMAKE_SOURCE_DIR}/tools/gguf_to_q4nx.py")
+set(_onebit_npu_lane_pack "${CMAKE_SOURCE_DIR}/tools/gguf_to_q4nx.py")
+onebit_build_relative(_onebit_npu_lane_pack _onebit_npu_lane_pack_rel)
+target_compile_definitions(onebit PRIVATE ONEBIT_NPU_LANE_PACK_SCRIPT="${_onebit_npu_lane_pack_rel}")
 if(ONEBIT_NPU_KERNELS_DIR)
     target_compile_definitions(onebit PRIVATE ONEBIT_NPU_KERNELS_DIR="${ONEBIT_NPU_KERNELS_DIR}")
 endif()

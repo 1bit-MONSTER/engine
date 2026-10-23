@@ -59,6 +59,9 @@ hands to 1bit, it runs the engine as one of its backends, behind an OpenAI-compa
   same build on the CPU.
 - **The NPU engine** on the XDNA 2 NPU, in progress: correctness first, speed next
   ([docs/npu.md](docs/npu.md)).
+- **Hybrid**: the prompt on the NPU engine, the tokens on HRX. `1bit serve --device hybrid` hands
+  the prompt's KV cache from a prefill provider to the HRX llama-server
+  ([docs/hybrid.md](docs/hybrid.md)).
 - **DwarfStar**, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD
   expert streaming ([docs/dwarfstar.md](docs/dwarfstar.md)).
 - **Laya**, opt-in, which picks where each request runs ([docs/laya.md](docs/laya.md)), and

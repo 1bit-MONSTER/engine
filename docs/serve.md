@@ -25,8 +25,9 @@ so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|hrx|cpu|ds4] [--ctx-size N] [--alias NAME]
+           [--device auto|npu|hrx|hybrid|cpu|ds4] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH]
+           [--prefill-provider PATH]      --device hybrid: NPU prefill, HRX decode (docs/hybrid.md)
            [--hrx-cwsr-placement=auto|on|off]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
@@ -252,7 +253,7 @@ two processes (lemond, llama-server) instead of two hops and three.
 |---|---|---|
 | 0 | the plan is on stdout | starts it |
 | 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
-| 5 | the route needs serve in the request path: an NPU model directory, `--device npu` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `hybrid` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
 
 Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
 `LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
@@ -361,6 +362,7 @@ without a GPU.
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | a closed NPU add-on route, in process, in builds with `-DONEBIT_NPU_PRIVATE` ([npu.md](npu.md#add-on-routes)) |
 | `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
+| `.gguf` | `hybrid` | the HRX llama-server decodes, one slot, from a KV cache a prefill provider computed for the prompt (the NPU engine, named by `--prefill-provider` / `ONEBIT_HYBRID_PREFILL`) and serve restored into the slot; without a provider, HRX prefills too ([hybrid.md](hybrid.md)) |
 | DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 
 What `--device auto` does with a `.gguf` that HRX has no route for. Until RFC #213 stage 3 these

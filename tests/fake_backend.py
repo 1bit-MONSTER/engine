@@ -66,6 +66,26 @@ class H(BaseHTTPRequestHandler):
 
     def do_POST(self):
         req = json.loads(self.rfile.read(int(self.headers["Content-Length"])))
+        # what `--device hybrid` asks of its backend (app/serve_hybrid.h, tests/hybrid_route.sh): the
+        # templated prompt, its ids (one per character here), and a slot restore that counts the
+        # ids in the provider's state file (which the fake provider writes as one id per line)
+        if self.path == "/apply-template":
+            self._json(200, {"prompt": "".join(m.get("content", "") for m in req.get("messages", []))})
+            return
+        if self.path == "/tokenize":
+            self._json(200, {"tokens": [ord(c) for c in req.get("content", "")]})
+            return
+        if self.path.startswith("/slots/"):
+            slot, _, action = self.path[len("/slots/"):].partition("?action=")
+            if action != "restore":
+                self._json(400, {"error": {"message": "Invalid action"}})
+                return
+            path = os.path.join(sys.argv[sys.argv.index("--slot-save-path") + 1], req["filename"])
+            with open(path) as f:
+                n = sum(1 for line in f if line.strip())
+            self._json(200, {"id_slot": int(slot), "filename": req["filename"], "n_restored": n, "n_read": 0,
+                             "timings": {"restore_ms": 1.5}})
+            return
         if req.get("fake_device_lost"):
             # what ggml-hrx logs after a GPU reset; the backend keeps running and fails every request
             print("graph_compute: launch HRX graph replay: hrx-system/runtime/src/iree/hal/drivers/amdgpu/system_event.c:129: "
@@ -103,8 +123,11 @@ class H(BaseHTTPRequestHandler):
             msg = {"message": {"role": "assistant", "content": text}} if "chat" in self.path else {"text": text}
             # llama-server's timings, fixed, for tools/bench.py (tests/bench_selftest.sh)
             timings = {"prompt_per_second": 500.0, "predicted_per_second": 20.0}
+            # the slot the request was pinned to and whether it may reuse the slot's prompt
+            # (what the hybrid handoff sets; tests/hybrid_route.sh reads them back)
             self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
-                             "timings": timings})
+                             "timings": timings, "fake_id_slot": req.get("id_slot", -1),
+                             "fake_cache_prompt": req.get("cache_prompt", None)})
             # "fake_exit": N: the backend exits with status N shortly after this reply, on its own
             # (a crashed backend; serve must notice and not wait its SIGTERM grace for a dead pid)
             if "fake_exit" in req:

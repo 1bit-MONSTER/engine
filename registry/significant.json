@@ -100,6 +100,11 @@
    "model_type": "muse_spark",
    "family": "Meta Muse Spark Open (816B-A42B latent-MoE, vision + audio; upstream llama.cpp ba3c05f71, after the pin)",
    "watch": "report"
+  },
+  "Glm5NextForConditionalGeneration": {
+   "model_type": "glm5_next",
+   "family": "GLM-5.3-Flash (KDA linear-attention + DeepSeek sparse attention hybrid, hyper-connections; upstream llama.cpp 649dcb10, after the pin)",
+   "watch": "report"
   }
  }
 }

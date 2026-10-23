@@ -51,6 +51,13 @@ This page is the reviewed evidence for the second kind: what each family is, wha
   through the V4 path and produce tokens while **silently ignoring the engram
   and candidate-block machinery** — the silent-substitution failure this repo
   bans, not a crash.
+* **Why it is not mapped** (rechecked 2026-10-23 on the pin `main` carries,
+  `third_party/llama.cpp` af04c9f2): the fork registers no
+  `DeepseekV41ForCausalLM` converter class (`conversion/deepseek.py`) and
+  `src/llama-arch.cpp` has no `deepseek_v41`/`deepseek41` architecture, so
+  `tools/registry_build.py` finds nothing to read the class from. The census
+  watcher's `!! UNCOVERED` line for it is therefore correct and stays, which is
+  what `registry/significant.json` (no `watch` field) encodes.
 * **Real support needs**: shape-agnostic config + the engram embedding path +
   candidate-block sparse attention (and a scope decision for the vision tower),
   validated against reference logits from the HF implementation.
@@ -525,14 +532,86 @@ the target box today. Reviewed 2026-10-17: **not an alias**. Its `registry/signi
 entry carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and
 does not alert; remove that field (and record `mapped_ok`) when the pin gains `muse-spark`.
 
+### `glm5_next` - `azampatti/GLM-5.3-Flash-AZ` (also `zai-org/GLM-5.3-Flash`)
+
+Architecture class `Glm5NextForConditionalGeneration`, `model_type: glm5_next`, no `auto_map` and
+`library_name: transformers`, so the census classes it as native and it alerts. The flagged upload
+is a 4-bit auto-round derivative of `Intel/GLM-5.3-Flash-W4A16-AutoRound`; the release itself is
+zai-org's GLM-5.3-Flash.
+
+**Shape** (configs read 2026-10-23, `text_config`): 45 layers, hidden 4096, 64 heads, vocab
+154880, 288 routed experts with 4 used plus 1 shared (`moe_intermediate_size` 2048,
+`first_k_dense_replace` 3), DeepSeek-style MLA (`kv_lora_rank` 512, `qk_nope_head_dim` /
+`qk_rope_head_dim`, `mla_use_nope`), `index_topk` 2048 with 32 index heads, and
+`num_nextn_predict_layers: 1` (MTP). The top level wraps a `text_config` plus a `vision_config`
+and image/video token ids, so the class is a VLM wrapper, not a bare decoder.
+
+**Machinery no pinned family runs**:
+
+* `layer_types` is a **34 + 11 hybrid** - 34 `linear_attention` layers (KDA:
+  `linear_attn_config.kda_layers`, `gate_lower_bound` -5.0, `short_conv_kernel_size` 4, head_dim
+  128) and 11 `deepseek_sparse_attention` layers (`full_attn_layers` 3/7/11/.../43, all with
+  `indexer_types: full`).
+* `hc_mult` 4, `hc_sinkhorn_iters` 20, `hc_eps` 1e-6 - hyper-connections, i.e. the residual stream
+  is a 4-wide Sinkhorn-normalised expansion rather than one residual per layer.
+* `index_kpool` 4 with `index_kpool_compress` and `index_kpool_always_select_tail` - the sparse
+  attention's key pool is compressed and a tail is always selected, which the fork's GLM-5.2
+  indexer does not implement.
+
+**Why an alias is wrong**: the pinned fork's GLM-5.2 path (`GlmMoeDsaForCausalLM` ->
+`LLM_ARCH_GLM_DSA`, `src/models/glm-dsa.cpp`) is an MLA + DeepSeek-sparse-attention stack on
+**every** layer: it reads the MLA, `indexer_top_k` and `indexer_types` keys and assumes each layer
+runs that attention. The fork's KDA support is Kimi's (`LLM_ARCH_KIMI_LINEAR`, `LLM_KV_KDA_HEAD_DIM`,
+the Kimi converter), and nothing in the tree reads `hc_mult` / `hc_sinkhorn_iters` for a GLM model
+(only `dsv4_hc_mult` on DeepSeek V4 / qwen4exp). Mapping `glm5_next` onto `glm-dsa` would run 34
+KDA layers as full sparse attention, drop the hyper-connection expansion and ignore the compressed
+k-pool - tokens out, a different function in: the silent-substitution failure this page exists to
+prevent. Mapping it onto `kimi-linear` would drop the DSA layers and the indexer instead.
+
+**Why it is not mapped**: the pinned `third_party/llama.cpp` af04c9f2 has no `glm5-next` at all -
+no `@ModelBase.register("Glm5NextForConditionalGeneration")` in `conversion/glm.py` (it registers
+`Glm4ForCausalLM`, `Glm4vForConditionalGeneration`, `GlmOcrForConditionalGeneration`,
+`Glm4MoeForCausalLM`, `Glm4vMoeForConditionalGeneration`, `Glm4MoeLiteForCausalLM`,
+`GlmMoeDsaForCausalLM`, `SolarOpenForCausalLM`), no `glm5-next` in `src/llama-arch.cpp`'s
+`LLM_ARCH_NAMES` (`glm4`, `glm4moe`, `glm-dsa` only) and no `src/models/glm5-next.cpp`. Upstream
+`ggml-org/llama.cpp` added it in #27773 (`649dcb10`, 2026-09-30, `LLM_ARCH_GLM5_NEXT`,
+`src/models/glm5-next.cpp`, `MODEL_ARCH.GLM5_NEXT` in the GLM converter) and the MTP follow-up
+#29928 (`b9acf138`, 2026-10-07) - both after the fork's last upstream sync, so a later fork sync
+that reaches them maps the class automatically. At that point `tools/registry_build.py
+--check-gaps` fails until this entry records why (`mapped_ok`), which is the intended prompt for a
+person to confirm the sync really brought the KDA + DSA + hyper-connection layers before the class
+counts as supported. Reviewed 2026-10-23: **not an alias**. Its `registry/significant.json` entry
+carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and does not
+alert; remove that field (and record `mapped_ok`) when the pin gains `glm5-next`.
+
 ## Unverifiable: gated configs
 
-`WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is counted as **unverifiable** on
-every run: its `config.json` cannot be fetched anonymously, so the census
-cannot classify it. `census/hf_new_models.py` sends no `Authorization` header.
-Supplying a token (`HF_TOKEN` in the environment, or the standard
-`~/.cache/huggingface/token`) would resolve gated repos instead of retrying
-them forever.
+A gated repository cannot be classified at all: the watcher's listing carries no config for it, so
+the class is unknown and the census counts it as **unverifiable** rather than guessing it. The
+watcher sends no `Authorization` header on purpose. Supplying a token (`HF_TOKEN` in the
+environment, or the standard `~/.cache/huggingface/token`) would resolve gated repos instead of
+retrying them forever - **needs HF token in the watcher**, and none was added here.
+
+Long-standing: `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is unverifiable on every run.
+
+The 2026-10-22/23 watcher run behind engine#447 listed twelve, all unverifiable for the same
+reason - needs HF token in the watcher:
+
+`Chandangepala/spendai-gemma3-1b`,
+`DrJohnCode/NebulaText`,
+`Elevatormusic/DeepSeek-V4.1-Flash-1017-2x-DGX-Spark-TensorFold-2x-Faster`,
+`ModaLeap/qwen3-4b-instruct-2507-onnx`,
+`ReadyArt/Wicked-Tutu-31B`,
+`dimitarpg13/semsimula-ladder-live-owt-d384-l2-attention-potential-rfqk-norc`,
+`executorch-community/Gemma-3-1B-IT-ExecuTorch-WebGPU`,
+`gostar77/qwen3.8-flash-next-radiance-q5-w5dn64-bf16ple`,
+`japanese-data-analyze/JMicro-10M-chat-research-20261018`,
+`seoan1024/Hanok-LLM`,
+`tasmaikeni13/algebraic-transformer`,
+`zendevvv/odoko-gemma3-1b`.
+
+None of them is evidence of an unmapped class: until a token is available they stay in the
+unverifiable count, which `docs/registry.md` reports separately from mapped and checked.
 
 ## If a family *is* a variant
 

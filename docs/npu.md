@@ -130,6 +130,26 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
 
+### Dense Qwen3, checked on the NPU
+
+All three dense Qwen3 models run on the NPU from a sealed kernel set, and each one passes the
+hardware gate's `npu` phase ([hw-gate.md](hw-gate.md)): greedy decoding token for token against an
+independent fp64 reference over a short prompt and teacher-forced steps, the 64-position build,
+the prompt prefill, and byte-identical output when the run is repeated, with the phase's speed
+floor met. Each is a catalogue entry in Lemonade, and each answers there:
+
+| Model | `npu` phase | Decode tok/s | Lemonade entry | `chat-short` tok/s |
+|---|---|---|---|---|
+| Qwen3-0.6B | PASS | 90.7 | `Qwen3-0.6B-NPU-1bit` | 93.7 |
+| Qwen3-1.7B | PASS | 39.5 | `Qwen3-1.7B-NPU-1bit` | 41.3 |
+| Qwen3-4B | PASS | 16.8 | `Qwen3-4B-NPU-1bit` | 17.7 |
+
+Measured on Strix Halo, 90 W cap, PCM pad (23 Oct). Decode tok/s is the gate phase's own
+64-position run; the phase's speed floor is set per model, 60 tok/s at 0.6B and scaled down by the
+model's size for the two larger ones. `chat-short` is `lemonade bench --scenarios chat-short --runs
+3` (mean of three runs, 0 failed) on a private server with one model loaded at a time. The checker
+that runs the phase is private, like the kernels it runs.
+
 - **Tokenizer:** `npu/tokenizer.cpp` reads `tokenizer.json` directly (PCRE2 for the
   pre-tokenizer regex). Added tokens with `special: false`, such as Qwen3's `<think>` and
   `</think>`, stay whole, as Hugging Face `tokenizers` does.

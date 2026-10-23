@@ -104,6 +104,53 @@ echo "Lemonade chat with $name-1bit (onebit; the VM has no AMD GPU or NPU, repor
 echo "Lemonade's llama-server in the VM:"; ssh_vm 'grep -i -E "vulkan|offload|device" /tmp/lemond.log | grep -v -i "nvidia\|download" | head -6' 2>/dev/null || true
 dl=$(ssh_vm 'grep -i -c "downloading" /tmp/lemond.log' 2>/dev/null || true)
 echo "Lemonade downloads during the test: ${dl:-?} (QEMU's network is restricted: the backends came from the stick)"
+# --- what this image is FOR: 1bit OS = Lemonade with the 1bit engine embedded (os/README.md) ---
+# The LIVE banner has to reach the console: the serial line is the VM's screen, and a blank screen is
+# what made a working appliance look dead on real hardware (os/mini/init.sh writes to tty1 as well).
+if grep -qi "1bit OS" "$out/serial.log" 2>/dev/null; then
+    echo "Live banner on the console: $(grep -i "1bit OS" "$out/serial.log" | head -1 | cut -c1-78)"
+else echo "Live banner on the console: missing from $out/serial.log"; ok=0; fi
+
+# The self-test has to run from the image. It cannot PASS in a VM - there is no Radeon GPU and no XDNA
+# NPU - so what is asserted is that it runs, reports the live mode, and says plainly that the NPU is
+# what is missing. The NPU PASS belongs to the real boot (owner's step).
+st=$(ssh_vm '1bit-selftest 2>&1 | tail -25' 2>/dev/null || true)
+case "$st" in
+    *"mode      : LIVE"*) echo "1bit-selftest: runs, and reports the LIVE mode";;
+    *) echo "1bit-selftest: did not report the LIVE mode"; ok=0;;
+esac
+case "$st" in
+    *"RESULT-NPU"*) echo "1bit-selftest NPU line in the VM: $(printf '%s' "$st" | grep "RESULT-NPU" | head -1 | cut -c1-90)";;
+    *) echo "1bit-selftest: no RESULT-NPU line"; ok=0;;
+esac
+
+# Lemonade's own catalog carries the three NPU entries by name (catalog: onebit, recipe_options
+# onebit_backend npu). They must LIST in the image - loading is impossible here because the NPU cannot
+# run in QEMU, and saying so is the point of this check.
+for want in Qwen3-0.6B-NPU-1bit Qwen3-1.7B-NPU-1bit Qwen3-4B-NPU-1bit; do
+    case " $models " in
+        *" $want("*) echo "Lemonade lists the catalog NPU entry by name: $want";;
+        *) echo "Lemonade does not list the catalog NPU entry: $want"; ok=0;;
+    esac
+done
+
+# Guest tier intact: take the engine binary away and Lemonade must stop offering the onebit entries;
+# put it back and they return. The NPU entries above are exactly the guest-tier ones.
+engine=$(ssh_vm 'readlink -f /bin/1bit 2>/dev/null' 2>/dev/null || true)
+if [ -n "$engine" ]; then
+    gt=$(ssh_vm "mv '$engine' /tmp/1bit.hidden && mkdir -p /tmp/gt-cfg /tmp/gt-cache && \
+        cp /data/lemonade/config/user_models.json /tmp/gt-cfg/ && \
+        (env -u LEMONADE_ONEBIT_BIN /opt/lemonade/bin/lemond --host 127.0.0.1 --port 13399 --no-broadcast \
+            /tmp/gt-cache /tmp/gt-cfg >/tmp/gt.log 2>&1 &) && sleep 14 && \
+        curl -s http://127.0.0.1:13399/api/v1/models | grep -o onebit | wc -l; \
+        pkill -f 'port 13399' >/dev/null 2>&1; mv /tmp/1bit.hidden '$engine'; sleep 1" 2>/dev/null || true)
+    case "${gt:-x}" in
+        0) echo "Guest tier: with the engine hidden, 0 onebit entries (as upstream v2026.43.3 defines it)";;
+        x) echo "Guest tier: could not run the hidden-engine check";;
+        *) echo "Guest tier: $gt onebit entries with the engine hidden (expected 0)"; ok=0;;
+    esac
+else echo "Guest tier: could not resolve /bin/1bit in the VM"; ok=0; fi
+
 [ $ok = 1 ] || ssh_vm 'grep -i -E "error|fail" /tmp/lemond.log | tail -12' 2>/dev/null || true
 ssh_vm 'poweroff -f' 2>/dev/null || true
 wait $vm 2>/dev/null || true

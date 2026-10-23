@@ -115,8 +115,8 @@ if [ -z "${MODELS:-}" ]; then
     fail models "Lemonade did not answer, so the model list cannot be checked"
 elif [ ! -f "$MAN" ] && ! ( [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1 ) && ! ls /dev/accel/accel* >/dev/null 2>&1; then
     CAT=/opt/lemonade/bin/resources/server_models.json
-    WANT_HRX=$(grep -o '"recipe":"onebit"' "$CAT" 2>/dev/null | wc -l)
-    WANT_NPU=$(grep -o '"onebit_backend":"npu"' "$CAT" 2>/dev/null | wc -l)
+    WANT_HRX=$(grep -oE '"recipe"[[:space:]]*:[[:space:]]*"onebit"' "$CAT" 2>/dev/null | wc -l)
+    WANT_NPU=$(grep -oE '"onebit_backend"[[:space:]]*:[[:space:]]*"npu"' "$CAT" 2>/dev/null | wc -l)
     skip models "no GPU or NPU here, so Lemonade hides the onebit entries ($WANT_HRX HRX + $WANT_NPU NPU in the catalog; $MAN records the shipped subset when the build writes it)"
 elif [ ! -f "$MAN" ]; then
     fail models "$MAN is missing from the image (the build writes it from server_models.json)"
@@ -195,11 +195,17 @@ elif [ -z "$VMODEL" ]; then
     skip bench "no model to bench"
 else
     BLF=/tmp/bench.json
-    BL=$(LEMONADE_API_KEY="$KEY" timeout 900 "$BENCH" bench "$VMODEL" --scenarios chat-short --runs 1 --warmup 0 --json 2>/tmp/bench.err) || BL=
-    printf '%s' "$BL" > "$BLF"
-    BTG=$(printf '%s' "$BL" | tr ',' '\n' | sed -n 's/.*"tg_tps":[[:space:]]*\([0-9.]*\).*/\1/p' | head -1)
-    BPP=$(printf '%s' "$BL" | tr ',' '\n' | sed -n 's/.*"pp_tps":[[:space:]]*\([0-9.]*\).*/\1/p' | head -1)
-    if [ -n "$BTG" ]; then pass bench "lemonade bench chat-short on $VMODEL: ${BPP:-?} tok/s prefill, ${BTG} tok/s decode"
+    # `lemonade bench` prints one human row per run: "Run 1/1... TTFT=30.6ms PP=881.6t/s TPS=120.2".
+    # That line is the evidence; --json/--output is only a fallback because its shape moves between
+    # Lemonade versions (and it wrote nothing to stdout in the 2026-10-23 candidate image).
+    BL=$(LEMONADE_API_KEY="$KEY" timeout 900 "$BENCH" bench "$VMODEL" --scenarios chat-short --runs 1 --warmup 0 \
+            --json --output "$BLF" 2>/tmp/bench.err) || BL=
+    BTT=$(printf '%s\n' "$BL" | sed -n 's/.*TTFT=\([0-9.]*\)ms.*/\1/p' | head -1)
+    BPP=$(printf '%s\n' "$BL" | sed -n 's/.*PP=\([0-9.]*\)t\/s.*/\1/p' | head -1)
+    BTG=$(printf '%s\n' "$BL" | sed -n 's/.* TPS=\([0-9.]*\).*/\1/p' | head -1)
+    [ -n "$BTG" ] || BTG=$(sed -n 's/.*"tg_tps":[[:space:]]*\([0-9.]*\).*/\1/p' "$BLF" 2>/dev/null | head -1)
+    [ -n "$BPP" ] || BPP=$(sed -n 's/.*"pp_tps":[[:space:]]*\([0-9.]*\).*/\1/p' "$BLF" 2>/dev/null | head -1)
+    if [ -n "$BTG" ]; then pass bench "lemonade bench chat-short on $VMODEL: TTFT ${BTT:-?} ms, prefill ${BPP:-?} tok/s, decode ${BTG} tok/s"
     else
         # Say what bench actually printed, so the row diagnoses itself instead of needing a second run.
         say "      bench stderr: $(head -c 200 /tmp/bench.err 2>/dev/null | tr '\n' ' ')"

@@ -493,29 +493,72 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
     echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) sealed sets on the data partition ($sealed kernels)"
 fi
-mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"
+# The engine's own llama-server goes on the DATA PARTITION, not into the RAM image. This point in the
+# script is AFTER the initramfs was packed (above), so what used to happen here - copying llama-server,
+# its libraries and the HSA runtime into $root and writing /etc/1bit/libhsa - never reached the stick:
+# the release candidate's 1bit.check reported "CHECK llama-server: FAILED" and "CHECK HSA runtime: none"
+# on an image that otherwise looked complete. It cannot move into the initramfs either: grub will not
+# load an initrd over ~103 MB and this one is at 89.5. So the engine's llama-server, its libraries and a
+# libhsa pointer live on /data, init.sh links /opt/1bit-llama to them and records the on-stick libhsa
+# path in /etc/1bit/libhsa at boot, and the installer's wholesale copy of /data carries it to the disk.
 hrx=$build/hrx/llama/bin
-cache_get() { sed -n "s/^$1:[A-Z]*=//p" "$build/CMakeCache.txt" 2>/dev/null; }
+# the llama-server this build produced names its own build tree in RUNPATH, which dangles on a stick;
+# $ORIGIN is the directory the binary is in, which is where its libraries are put
+relocate() {   # <file>: make an ELF look for its libraries beside itself
+    [ -f "$1" ] && [ ! -L "$1" ] || return 0
+    case "$(head -c 4 "$1" 2>/dev/null)" in
+        *ELF*) patchelf --set-rpath '$ORIGIN' "$1" 2>/dev/null ||
+                   { echo "patchelf --set-rpath failed on $1"; exit 1; } ;;
+    esac
+}
+llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
+    local srv=$1 libs=$2 f want path pkg_lib
+    # the Lemonade package's own hrx libraries, already on the stick: preferred source for anything the
+    # image does not carry (its license set covers those files, a build-machine path is not shippable)
+    pkg_lib=$(ls -d "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib 2>/dev/null | head -1)
+    mkdir -p "$out/data.dir/1bit-llama"
+    cp -a "$srv" "$out/data.dir/1bit-llama/llama-server"
+    # -a, not -L: the .so -> .so.0 -> .so.0.18.0 chain is how the loader finds the versioned file
+    for f in "$libs"/lib*.so*; do if [ -e "$f" ]; then cp -a "$f" "$out/data.dir/1bit-llama/"; fi; done
+    # What the loader resolves from outside the image goes on the stick too - TheRock's libomp.so is the
+    # one that caught this out - and libraries the image already carries at their own path are left to it.
+    ldd "$srv" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' > "$out/1bit-llama-needs.txt"
+    while read -r want path; do
+        if [ -e "$out/data.dir/1bit-llama/$want" ]; then continue; fi
+        case "$path" in "$libs"/*) continue ;; esac
+        if [ -e "$root$path" ]; then continue; fi
+        if [ -n "$pkg_lib" ] && [ -e "$pkg_lib/$want" ]; then
+            cp -L "$pkg_lib/$want" "$out/data.dir/1bit-llama/$want"
+            echo "   + $want (from the Lemonade package)"
+        else
+            cp -L "$path" "$out/data.dir/1bit-llama/$want"
+            echo "   + $want (from this build machine: $path)"
+        fi
+    done < "$out/1bit-llama-needs.txt"
+    rm -f "$out/1bit-llama-needs.txt"
+    for f in "$out/data.dir/1bit-llama"/*; do relocate "$f"; done
+    # a build that cannot resolve its own llama-server is not worth shipping: say which library is missing
+    if ldd "$out/data.dir/1bit-llama/llama-server" 2>/dev/null | grep -q "not found"; then
+        echo "llama-server on the data partition still misses libraries:"
+        ldd "$out/data.dir/1bit-llama/llama-server" | grep "not found"
+        exit 1
+    fi
+}
 if [ -x "$hrx/llama-server" ]; then
-    # at its build path: 1bit serve runs it from there (ONEBIT_HRX_SERVER), for HRX0 and the CPU
-    copy_elf "$hrx/llama-server" $(ls "$hrx"/lib*.so* 2>/dev/null)
-    ln -s "$hrx/llama-server" "$root/opt/1bit-llama/llama-server"
-    # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md)
-    hsa=$(cache_get ONEBIT_HRX_LIBHSA)
-    [ -n "$hsa" ] && [ -e "$hsa" ] || { echo "no ONEBIT_HRX_LIBHSA in $build/CMakeCache.txt"; exit 1; }
-    copy_elf "$hsa"
-    echo "$hsa" > "$root/etc/1bit/libhsa"
-    # libdrm's GPU name table, where TheRock has one (names only; HSA works without it)
-    for ids in "$(dirname "$hsa")"/../share/libdrm/amdgpu.ids "$(cache_get ONEBIT_HRX_TOOLCHAIN)"/share/libdrm/amdgpu.ids; do
-        if [ -e "$ids" ]; then ids=$(realpath "$ids"); mkdir -p "$root$(dirname "$ids")"; cp "$ids" "$root$ids"; break; fi
-    done
-    echo "   HRX llama-server ($hrx), HSA runtime $hsa"
+    llama_to_data "$hrx/llama-server" "$hrx"
+    # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md). Taken from
+    # the Lemonade package that is already on the stick - the build machine's /opt/rocm-therock path does
+    # not exist there - and left where that package keeps it, beside the sibling libraries it needs.
+    hsa_pkg=$(ls "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    [ -n "$hsa_pkg" ] ||
+        { echo "no libhsa-runtime64 in Lemonade's llamacpp-hrx package on the data partition"; exit 1; }
+    echo "   HRX llama-server -> data partition /1bit-llama ($(du -sh "$out/data.dir/1bit-llama" | cut -f1), $(ls "$out/data.dir/1bit-llama" | wc -l) files)"
+    echo "   HSA runtime (on the stick): ${hsa_pkg#"$out/data.dir"}"
 elif [ -n "${LLAMA_SERVER:-}" ]; then
     # test images only: a CPU llama-server, found on PATH by a 1bit built without HRX
     ls=$(realpath "$LLAMA_SERVER")
-    copy_elf "$ls" $(ls "$(dirname "$ls")"/lib*.so* 2>/dev/null)
-    ln -s "$ls" "$root/opt/1bit-llama/llama-server"
-    echo "   CPU llama-server ($ls): a test image, no HRX"
+    llama_to_data "$ls" "$(dirname "$ls")"
+    echo "   CPU llama-server -> data partition /1bit-llama ($ls): a test image, no HRX"
 else
     echo "no HRX llama-server in $build (build with -DONEBIT_HRX=ON; LLAMA_SERVER=<path> for a CPU-only test image)"; exit 1
 fi

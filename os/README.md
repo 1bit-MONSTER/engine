@@ -27,8 +27,9 @@ stable-diffusion.cpp, Kokoro and the rest).
 What is in it: the kernel with the GPU (`amdgpu`, which also gives HSA its `/dev/kfd`) and NPU
 (`amdxdna`) drivers, the firmware those chips load, BusyBox (no XRT: the NPU runtime is compiled into `1bit`), Mesa's Radeon
 Vulkan driver (for Lemonade's Vulkan backends), Lemonade (`lemond`, the `lemonade` CLI and the web
-app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit`, the HRX
-`llama-server` it runs, and TheRock's HSA runtime that HRX loads.
+app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit` with its HRX backend
+(the `llama-server` it runs and the HSA runtime that `llama-server` loads are on the data partition -
+`1bit-llama/` below - because the initramfs has to stay under the size grub will load).
 
 Everything that has to last lives on the stick's `1BIT-DATA` partition:
 
@@ -40,6 +41,7 @@ Everything that has to last lives on the stick's `1BIT-DATA` partition:
 | `lemonade/cache/` | Lemonade's cache directory, with its backends in `bin/`, installed when the image was built |
 | `lemonade/licenses/` | the backends' licenses, one directory per recipe ([LICENSES.md](LICENSES.md)) |
 | `lemonade/huggingface/` | models Lemonade downloads (`models_dir`) |
+| `1bit-llama/` | the engine's own HRX `llama-server` and the libraries it links, put on the stick instead of in the RAM image; `init` links `/opt/1bit-llama` to it at boot, so `1bit serve` finds it on `PATH` whether the boot is LIVE or INSTALLED |
 | `cache/hrx-jit/` | HRX's Loom kernel cache (`GGML_HRX_JIT_CACHE_DIR`): the first use of a kernel compiles it, later boots reuse it |
 | `ssh/` | `authorized_keys` and the SSH host key |
 
@@ -57,9 +59,11 @@ cmake --build build
 os/mini/mkimage.sh out build
 ```
 
-`mkimage.sh` copies the HRX `llama-server` and the HSA runtime the build was configured with
-(`ONEBIT_HRX_LIBHSA` in `build/CMakeCache.txt`) at their build paths, with every library they
-link; `1bit` has both paths compiled in. It takes `lemond` from `build/lemonade` (or `LEMONADE=`, a
+`mkimage.sh` puts the HRX `llama-server` and every library it links on the data partition under
+`1bit-llama/`, with each ELF's `RUNPATH` rewritten to `$ORIGIN` (`patchelf`) so the set runs from there -
+the build tree's paths do not exist on a stick. The HSA runtime HRX loads is taken from the Lemonade
+`llamacpp-hrx` package that is already on the stick, and `init` writes its on-stick path into
+`/etc/1bit/libhsa`, which is where the engine reads `IREE_HAL_AMDGPU_LIBHSA_PATH` from. It takes `lemond` from `build/lemonade` (or `LEMONADE=`, a
 `scripts/build-lemonade.sh` prefix), and when there is none it builds it there from
 `third_party/lemonade` with the web app (`LEMONADE_WEB_APP=1`, which needs `node` and `npm`).
 

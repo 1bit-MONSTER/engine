@@ -77,6 +77,23 @@ stage "stick mounted at ${data:-nothing}"
 say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
     for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
 
+# The engine's own llama-server and the HSA runtime it loads are on the DATA PARTITION, not in the RAM
+# image (mkimage.sh: grub will not load an initrd over ~103 MB and this one is at 89.5 MB, so anything
+# added to the image after it is packed never reaches the stick - which is why 1bit.check said
+# "CHECK llama-server: FAILED" on a released image). Put them where the engine and 1bit.check look:
+# /opt/1bit-llama is on PATH, and /etc/1bit/libhsa names the on-stick runtime for the engine.
+if [ -d /data/1bit-llama ]; then
+    mkdir -p /opt /etc/1bit
+    ln -sfn /data/1bit-llama /opt/1bit-llama
+    # same on /data, from the Lemonade package that is already there (the build machine's
+    # /opt/rocm-therock path does not exist on a stick)
+    hsa=$(ls /data/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    [ -n "$hsa" ] && echo "$hsa" > /etc/1bit/libhsa
+    say "[engine] llama-server from /data/1bit-llama, HSA runtime ${hsa:-not found}"
+else
+    say "[engine] no /data/1bit-llama: '1bit serve' has no HRX llama-server on this boot"
+fi
+
 # The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
 # to load): link them to the path the engine looks for, beside itself.
 if [ -d /data/npu/kernels ] && [ -d /home ]; then
@@ -288,13 +305,23 @@ echo "The engine alone, for debugging:  1bit serve -m /data/models/<file.gguf>  
 if grep -q "1bit.check" /proc/cmdline; then
     ok=1
     1bit --help >/dev/null 2>&1 && echo "CHECK 1bit: runs" || { echo "CHECK 1bit: FAILED"; ok=0; }
-    /opt/1bit-llama/llama-server --version >/dev/null 2>&1 && echo "CHECK llama-server: runs" || { echo "CHECK llama-server: FAILED"; ok=0; }
+    # The engine's own llama-server lives on the data partition (mkimage.sh), so a boot assembled from
+    # the bare -kernel/-initrd pair has nothing to check: say SKIPPED with the reason instead of FAILED,
+    # which is what a release gate that boots without the stick's data partition would otherwise report.
+    if [ -d /data/1bit-llama ]; then
+        /opt/1bit-llama/llama-server --version >/dev/null 2>&1 && echo "CHECK llama-server: runs" ||
+            { echo "CHECK llama-server: FAILED (it is on /data but does not run)"; ok=0; }
+    else
+        echo "CHECK llama-server: SKIPPED - no data partition on this boot; the engine's llama-server is on /data/1bit-llama"
+    fi
     lemonade --version >/dev/null 2>&1 && [ -f /opt/lemonade/bin/resources/defaults.json ] && echo "CHECK Lemonade: runs" || { echo "CHECK Lemonade: FAILED"; ok=0; }
     [ -d /opt/lemonade/bin/resources/web-app ] && echo "CHECK Lemonade web app: present" || echo "CHECK Lemonade web app: left out"
     if [ -s /etc/1bit/libhsa ]; then
         [ -e "$(cat /etc/1bit/libhsa)" ] && echo "CHECK HSA runtime (HRX): present" || { echo "CHECK HSA runtime: FAILED"; ok=0; }
+    elif [ -d /data/1bit-llama ]; then
+        echo "CHECK HSA runtime: FAILED - /data/1bit-llama is here but no libhsa was found in the data partition's Lemonade package"; ok=0
     else
-        echo "CHECK HSA runtime: none (a CPU-only test image)"
+        echo "CHECK HSA runtime: none (no data partition on this boot; the runtime comes from the Lemonade package on /data)"
     fi
     # the NPU runtime is compiled into 1bit: the image carries no XRT
     if find / -xdev -name 'libxrt*' 2>/dev/null | grep -q .; then echo "CHECK no XRT: FAILED"; ok=0

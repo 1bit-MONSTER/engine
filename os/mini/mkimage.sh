@@ -425,7 +425,7 @@ if [ -d "$out/data.dir/lemonade/licenses" ]; then cp "$here/../LICENSES.md" "$ou
 # Lemonade's own config file: where the models are, and downloads kept on the stick; host, port
 # and everything else are Lemonade's defaults (localhost:13305)
 if [ -n "${LEMONADE_CONFIG:-}" ]; then cp "$LEMONADE_CONFIG" "$out/data.dir/lemonade/config/config.json"
-else printf '{\n    "extra_models_dir": "/data/models",\n    "models_dir": "/data/lemonade/huggingface"\n}\n' > "$out/data.dir/lemonade/config/config.json"; fi
+else printf '{\n    "extra_models_dir": "/data/models",\n    "models_dir": "/data/lemonade/huggingface",\n    "host": "0.0.0.0",\n    "port": 13305\n}\n' > "$out/data.dir/lemonade/config/config.json"; fi
 # Lemonade's environment file (its systemd unit's EnvironmentFile, /etc/default/lemond)
 if [ -n "${LEMONADE_ENV:-}" ]; then cp "$LEMONADE_ENV" "$out/data.dir/lemonade/lemond.conf"
 else

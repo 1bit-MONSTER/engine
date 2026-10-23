@@ -22,6 +22,9 @@ set -u
 PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
 PORT=${PORT:-13305}
 KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | head -1)
+# Lemonade listens on the LAN (config.json "host"), so it wants the key - and it must be set HERE,
+# before the first request: the models call below used to go out unauthenticated and get 401.
+AUTH=""; [ -n "$KEY" ] && AUTH="Authorization: Bearer $KEY"
 LOG=/data/selftest.log
 say() { echo "$@"; [ -w /data ] && echo "$@" >> "$LOG" 2>/dev/null; }
 
@@ -33,10 +36,11 @@ say "  NPU fw    : $([ -e /lib/firmware/amdnpu/17f0_11 ] && echo present || echo
 say "  USB4/TB   : $(find /lib/modules -name 'thunderbolt.ko*' | head -1 | sed 's|.*/||')$([ -n "$(find /lib/modules -name 'thunderbolt.ko*' | head -1)" ] && echo '' || echo ' MISSING')"
 say "  IP        : $(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | tr '\n' ' ')"
 
-MODELS=$(wget -q -O - "http://127.0.0.1:$PORT/api/v1/models" 2>/dev/null)
+MODELS=$(wget -q -O - ${AUTH:+--header="$AUTH"} "http://127.0.0.1:$PORT/api/v1/models" 2>/dev/null)
 if [ -z "$MODELS" ]; then
     say "  Lemonade  : no answer on 127.0.0.1:$PORT (see /tmp/lemond.log)"
-    say "  hint      : run 'lemonade list' once lemond is up; models go in /data/models"
+    say "  hint      : if lemond is up this is usually the API key (401): grep LEMONADE_API_KEY /data/lemonade/lemond.conf"
+    say "              otherwise run 'lemonade list'; models go in /data/models"
     exit 1
 fi
 pick() { printf '%s' "$MODELS" | tr ',' '\n' | sed -n "s/.*\"$1\":\"\($2\)\".*/\1/p" | head -1; }
@@ -51,7 +55,6 @@ ANY=$(pick id '[^"]*')
 say "  Lemonade  : answers; testing model '$NAME'"
 
 BODY="{\"model\":\"$NAME\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: NPU OK\"}],\"max_tokens\":48,\"temperature\":0}"
-AUTH=""; [ -n "$KEY" ] && AUTH="Authorization: Bearer $KEY"
 RESP=$(wget -q -O - \
         --header='Content-Type: application/json' ${AUTH:+--header="$AUTH"} \
         --post-data="$BODY" "http://127.0.0.1:$PORT/api/v1/chat/completions" 2>/dev/null)
@@ -88,6 +91,7 @@ else
         --post-data='{"model":"x","messages":[{"role":"user","content":"/no_think Reply with exactly: NPU OK"}],"max_tokens":32,"temperature":0}' \
         http://127.0.0.1:18001/v1/chat/completions 2>/dev/null)
     kill $npupid 2>/dev/null
+    j=0; while kill -0 $npupid 2>/dev/null && [ $j -lt 15 ]; do j=$((j+1)); sleep 1; done
     if [ -n "$PLACE" ]; then
         say "  placement  : $(echo "$PLACE" | sed 's/.*1bit unified: //' | cut -c1-100)"
     else
@@ -102,4 +106,22 @@ else
     fi
 fi
 
+# The NPU takes ONE engine context at a time and does not hand it back by itself: once the test's engine
+# is gone the device refuses the next call - "npu runtime: invalid call (code 614): state 8" - which is
+# what left Lemonade's own engine unable to load a model until a reboot. Stop what Lemonade holds, reload
+# the driver, and then PROVE the handoff by asking Lemonade the same question on the same NPU.
+wget -q -O - ${AUTH:+--header="$AUTH"} --header='Content-Type: application/json' \
+    --post-data='{}' "http://127.0.0.1:$PORT/api/v1/unload" >/dev/null 2>&1
+if [ -c /dev/accel/accel0 ]; then
+    modprobe -r amdxdna 2>/dev/null; sleep 2; modprobe amdxdna 2>/dev/null
+    j=0; while [ ! -c /dev/accel/accel0 ] && [ $j -lt 20 ]; do j=$((j+1)); sleep 1; done
+fi
+HAND=$(wget -q -O - ${AUTH:+--header="$AUTH"} --header='Content-Type: application/json' \
+    --post-data="{\"model\":\"${NAME:-x}\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: NPU OK\"}],\"max_tokens\":24,\"temperature\":0}" \
+    "http://127.0.0.1:$PORT/api/v1/chat/completions" 2>/dev/null)
+case "$HAND" in
+    *'"content"'*)
+        say "  device    : NPU handed back - Lemonade answered '$(printf '%s' "$HAND" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)' on it after the test" ;;
+    *)  say "  device    : WARN - Lemonade did not answer after the NPU test; it comes back on the next boot" ;;
+esac
 say "  evidence  : appended to $LOG"

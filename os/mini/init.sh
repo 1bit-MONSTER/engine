@@ -81,9 +81,37 @@ fi
 
 # Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
 # screen you have to guess about.
-say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null; [ -w /dev/console ] && echo "$*" > /dev/console 2>/dev/null; }
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
+    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
 n=0
 step() { n=$((n+1)); say "[$n] $*"; }
+
+# The screen gets a real interactive login on tty1, never a shell on /dev/console: /dev/console stops
+# being what is painted once fbcon takes the DRM framebuffer, and a non-interactive shell has no
+# prompt - so the machine sat there looking dead while it was serving. tty1 is the VT we are on.
+screen_login() {
+    [ -c /dev/tty1 ] || return 0
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [ -n "$ip" ] || ip="<this address>"
+    chvt 1 2>/dev/null || true
+    {
+      echo
+      echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+      echo "  ----------------------------------------------------------------------------------------"
+      echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
+      echo "   lemonade list                 the models;  lemonade chat Qwen3-0.6B-1bit"
+      echo "   cat /data/boot.log            what this boot did"
+      echo "   ssh root@<this address>       also works, with the key in /data/ssh/authorized_keys"
+      echo
+      echo "  Lemonade is on the network:  http://${ip}:13305   (Lemonade Mobile finds it via the UDP beacon)"
+      echo "  its API key:                 grep LEMONADE_API_KEY /data/lemonade/lemond.conf"
+      echo
+    } > /dev/tty1 2>/dev/null
+    # cttyhack is what a classic initramfs uses, but here it exits at once (it cannot claim a tty that
+    # setsid has already detached from) - measured on the box. setsid -c makes tty1 the controlling
+    # terminal instead, which is what gives a prompt AND job control; the loop puts it back if you exit.
+    ( while :; do setsid -c /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
+}
 
 MODE=live
 if [ -c /dev/console ]; then
@@ -114,7 +142,7 @@ if [ -c /dev/console ]; then
 fi
 case "$MODE" in
     off)  say "powering off (choice 4)"; sync; poweroff -f ;;
-    shell) say "root shell - the appliance will not start (choice 3)"; exec setsid cttyhack sh < /dev/console > /dev/console 2>&1 ;;
+    shell) say "root shell - the appliance will not start (choice 3)"; screen_login; while :; do sleep 3600; done ;;
     nogpu) say "verbose mode: GPU/NPU drivers are skipped (choice 2)" ;;
 esac
 
@@ -194,6 +222,15 @@ for d in /data/models/*/model.q4nx; do
     d=${d%/model.q4nx}
     onebit_register "${d##*/}-1bit" "$d" npu
 done
+# Lemonade listens on the LAN (config/config.json "host": 0.0.0.0) so Lemonade Mobile and any other
+# client can reach it, which means it must not be open: mint an API key once, keep it on the stick, and
+# every request presents it as "Authorization: Bearer <key>".
+kf=/data/lemonade/lemond.conf
+if [ -f "$kf" ] && ! grep -q '^LEMONADE_API_KEY=..*' "$kf" 2>/dev/null; then
+    { echo "LEMONADE_API_KEY=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+      echo "# minted at boot: send it as  Authorization: Bearer <key>  (Lemonade Mobile asks for it once)"
+    } >> "$kf" && chmod 600 "$kf"
+fi
 # Lemonade's environment file (LEMONADE_API_KEY, LEMONADE_ADMIN_API_KEY, HF_TOKEN), for lemond only
 ( cd "$lem" || exit 1
   if [ -f lemond.conf ]; then set -a; . ./lemond.conf; set +a; fi
@@ -244,5 +281,5 @@ fi
 # PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
 # what happened on real hardware - the script finished, the final exec returned, and the machine
 # rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
-setsid cttyhack sh < /dev/console > /dev/console 2>&1 &
+screen_login
 while :; do sleep 3600; done

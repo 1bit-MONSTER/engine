@@ -109,8 +109,8 @@ echo "Lemonade downloads during the test: ${dl:-?} (QEMU's network is restricted
 # what made a working appliance look dead on real hardware (os/mini/init.sh writes to tty1 as well).
 # grub's own menu says "1bit OS" too, so match init's live-mode banner, which say() writes to
 # /dev/console (= this serial line in the VM) and to tty1.
-if grep -q "LIVE. You are root, on RAM" "$out/serial.log" 2>/dev/null; then
-    echo "Live banner on the console: $(grep "LIVE. You are root, on RAM" "$out/serial.log" | head -1 | cut -c1-72)"
+if grep -q "LIVE: runs from RAM" "$out/serial.log" 2>/dev/null; then
+    echo "Live banner on the console: $(grep "LIVE: runs from RAM" "$out/serial.log" | head -1 | cut -c1-72)"
 elif ssh_vm 'test -e /etc/1bit/live' 2>/dev/null; then
     echo "Live banner on the console: not on the serial line, but the live marker exists (tty1 only)"; ok=0
 else echo "Live banner on the console: missing from $out/serial.log"; ok=0; fi
@@ -139,10 +139,9 @@ if [ -n "$catalog" ]; then
             *) echo "The image's catalog is missing the NPU entry: $want"; ok=0;;
         esac
     done
-    case "$catalog" in
-        *'\"onebit_backend\": \"npu\"'*) echo "The catalog's NPU entries carry recipe_options.onebit_backend: npu";;
-        *) echo "The catalog's NPU entries do not carry recipe_options.onebit_backend"; ok=0;;
-    esac
+    if printf '%s' "$catalog" | grep -q '\"onebit_backend\": \"npu\"'; then
+        echo "The catalog's NPU entries carry recipe_options.onebit_backend: npu"
+    else echo "The catalog's NPU entries do not carry recipe_options.onebit_backend"; ok=0; fi
 else echo "could not read the image's server_models.json"; ok=0; fi
 # and say plainly why they are not in the listing here
 echo "Note: /api/v1/models cannot list them under QEMU - this Lemonade hides every onebit model when the" \

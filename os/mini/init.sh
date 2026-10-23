@@ -124,8 +124,17 @@ esac
 # stock amdxdna disagrees with the private 1bit build - loading it at boot panics before the appliance
 # is even reachable. The engine loads what it needs when it starts a model, so a live boot does not
 # need them: leave them out and the appliance comes up, stays visible and stays reachable.
-say "[gpu] drivers left to the engine (not loaded at boot)"
-if [ "$MODE" = nogpu ]; then say "[gpu] (menu: no-GPU mode was already selected)"; fi
+if [ "$MODE" = nogpu ]; then
+    say "[gpu] skipped by menu choice"
+else
+    say "[gpu] loading the private NPU driver (amdxdna) and amdgpu"
+    # amd_pmf first: it owns the platform sensors (hwmon) and the profile interface; without it the
+    # appliance has no temperatures or fan readings at all ("no HWMON support due to missing pmf sensor")
+    for m in amd_pmf amdgpu amdxdna; do modprobe -q "$m"; done
+    mdev -s 2>/dev/null
+    say "[gpu] devices: $(ls /dev/dri/renderD* /dev/kfd /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
+    say "[gpu] hwmon: $(for h in /sys/class/hwmon/hwmon*; do cat $h/name 2>/dev/null; done | tr '\n' ' ')"
+fi
 
 # HRX: TheRock's HSA runtime (1bit serve also finds it at its compiled-in path), and the Loom
 # kernel cache on the stick, so kernels compiled on the first boot are reused after a reboot

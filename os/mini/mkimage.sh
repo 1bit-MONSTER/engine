@@ -115,11 +115,23 @@ echo "== kernel modules ($kver)"
 # USB4 v2 / Thunderbolt on Strix Halo: the USB4 host router (1022:158d) is driven by thunderbolt.ko and
 # its Type-C side by typec + ucsi_acpi (alt modes, display); without them the USB4 ports and any dock
 # behind them do nothing, and with them a stick on a USB4 port tunnels like any other.
-mods="amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
+mods="amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
 cp /lib/modules/"$kver"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kver/" 2>/dev/null || true
+# The NPU needs the PRIVATE XDNA driver build, not the stock module in /lib/modules: with the stock one
+# the engine's NPU route resets the machine. Same vermagic, so it is a straight drop-in.
+xdna=${AMDXDNA_KO:-$HOME/wt/perfopt-7.3-obj/drivers/accel/amdxdna/amdxdna.ko}
+if [ -f "$xdna" ]; then
+    dst=$(find "$root/lib/modules" -name 'amdxdna.ko*' | head -1)
+    if [ -n "$dst" ]; then
+        rm -f "$dst"; mkdir -p "$(dirname "$dst")"; cp "$xdna" "$dst"
+        echo "   amdxdna: private build installed over the stock module ($(stat -c %s "$dst") bytes)"
+    fi
+else
+    echo "   amdxdna: private build not found at $xdna - the stock module ships"
+fi
 depmod -b "$root" "$kver"
 
 echo "== firmware (only what these chips load)"

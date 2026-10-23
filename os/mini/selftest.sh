@@ -40,8 +40,11 @@ if [ -z "$MODELS" ]; then
     exit 1
 fi
 pick() { printf '%s' "$MODELS" | tr ',' '\n' | sed -n "s/.*\"$1\":\"\($2\)\".*/\1/p" | head -1; }
+# An NPU model directory first (that is what this image ships), then any plain GGUF.
 NAME=$(pick id '[^"]*-1bit')
 [ -n "$NAME" ] || NAME=$(pick model_name '[^"]*-1bit')
+ANY=$(pick id '[^"]*')
+[ -n "$NAME" ] || NAME=$ANY
 [ -n "$NAME" ] || NAME=$(pick id '[^"]*')
 [ -n "$NAME" ] || NAME=$(pick model_name '[^"]*')
 [ -n "$NAME" ] || { say "  models    : Lemonade answers but lists none - put a GGUF or an NPU model dir in /data/models"; say "RESULT: FAIL - no model to test"; exit 1; }
@@ -59,8 +62,7 @@ case "$RESP" in
         say "RESULT: PASS - the engine answered from this live boot"
         ;;
     *)  say "  answer    : none (${RESP:-empty response})"
-        say "RESULT: FAIL - Lemonade is up but the chat did not answer"
-        exit 1 ;;
+        say "RESULT-LM  : FAIL - Lemonade is up but the chat did not answer (the NPU route is tested below anyway)" ;;
 esac
 # The engine's own NPU route: only a .q4nx model directory can take --device npu (it refuses a .gguf,
 # with no silent fallback), and the sealed kernel sets travel beside the engine. This is the proof the

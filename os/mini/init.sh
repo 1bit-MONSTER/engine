@@ -176,7 +176,7 @@ onebit_register() {   # <name> <path>: add the entry unless the registry has tha
     case "$1$2" in *'"'*|*'\'*) return ;; esac
     [ -s "$f" ] || echo '{}' > "$f"
     grep -q "\"$1\"[[:space:]]*:" "$f" && return
-    e="\"$1\": {\"checkpoint\": \"$2\", \"source\": \"local_path\", \"recipe\": \"onebit\"}"
+    e="\"$1\": {\"checkpoint\": \"$2\", \"source\": \"local_path\", \"recipe\": \"onebit\"${3:+, \"onebit_backend\": \"$3\"}}"
     tr '\n' ' ' < "$f" | awk -v e="$e" '{ i = length($0); while (i > 0 && substr($0, i, 1) != "}") i--
         head = substr($0, 1, i - 1); inner = head; sub(/^[ \t]*\{/, "", inner); gsub(/[ \t]/, "", inner)
         print head (inner == "" ? "" : ", ") e "}" }' > "$f.new" && mv "$f.new" "$f" && echo "Lemonade: user.$1 (onebit) -> $2"
@@ -187,7 +187,13 @@ for m in /data/models/*.gguf; do
     case $n in mmproj*|*-0000[2-9]-of-*|*-000[1-9][0-9]-of-*) continue ;; esac
     onebit_register "$n-1bit" "$m"
 done
-for d in /data/models/*/model.q4nx; do [ -f "$d" ] && d=${d%/model.q4nx} && onebit_register "${d##*/}-1bit" "$d"; done
+# A .q4nx directory is the engine's own model format, so it runs on the NPU: say so, or Lemonade
+# sends it down the CPU path, which wants a llama-server this image does not carry.
+for d in /data/models/*/model.q4nx; do
+    [ -f "$d" ] || continue
+    d=${d%/model.q4nx}
+    onebit_register "${d##*/}-1bit" "$d" npu
+done
 # Lemonade's environment file (LEMONADE_API_KEY, LEMONADE_ADMIN_API_KEY, HF_TOKEN), for lemond only
 ( cd "$lem" || exit 1
   if [ -f lemond.conf ]; then set -a; . ./lemond.conf; set +a; fi

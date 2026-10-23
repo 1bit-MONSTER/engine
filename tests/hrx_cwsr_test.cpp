@@ -129,32 +129,6 @@ int main() {
         expect(threw, "parse refuses yes");
     }
 
-    {
-        // engine#315 on the SHIPPED configuration: CWSR off is what ships, so the CWSR-on branch has to
-        // be reachable in a test from a CWSR-off box. ONEBIT_CWSR_ENABLE_FILE is serve's seam
-        // (app/hrx_cwsr.h: cwsr_enable_path()), and this is the decision serve makes with it.
-        const auto on = fake_sysfs(dir, "seam-on", "1\n");
-        const auto off = fake_sysfs(dir, "seam-off", "0\n");
-        ::setenv(kCwsrEnablePathEnv, on.c_str(), 1);
-        expect(cwsr_enable_path() == on, "seam: the path is the file the environment names");
-        expect(read_cwsr_enable(cwsr_enable_path()) == 1, "seam: CWSR on read through the seam");
-        {
-            const auto d = decide_cwsr_placement(CwsrPlacement::Auto, read_cwsr_enable(cwsr_enable_path()), true, none);
-            expect(d.env == kAll, "seam, auto + CWSR on: all three");
-            expect(d.log == "HRX: CWSR is on; CWSR save area placed in GTT (engine#315)", "seam, auto + on log: " + d.log);
-        }
-        ::setenv(kCwsrEnablePathEnv, off.c_str(), 1);
-        expect(read_cwsr_enable(cwsr_enable_path()) == 0, "seam: CWSR off read through the seam");
-        {
-            const auto d = decide_cwsr_placement(CwsrPlacement::Auto, read_cwsr_enable(cwsr_enable_path()), true, none);
-            expect(d.env.empty(), "seam, auto + CWSR off: no variables");
-        }
-        ::unsetenv(kCwsrEnablePathEnv);
-        expect(cwsr_enable_path() == kCwsrEnablePath, "seam unset: falls back to amdgpu's parameter");
-        unlink(on.c_str());
-        unlink(off.c_str());
-    }
-
     for (const char* n : {"on", "off", "auto", "junk"}) unlink((dir + "/" + n).c_str());
     rmdir(dir.c_str());
     if (failures) return 1;

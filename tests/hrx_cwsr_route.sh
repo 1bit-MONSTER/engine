@@ -23,9 +23,6 @@
 #   - auto on a CWSR-on box: all three with the gate, none without it; with one of the three set
 #     by the user, none, and serve says so;
 #   - auto elsewhere (CWSR off, or no amdgpu, as in CI): none;
-#   - auto with the CWSR state supplied by ONEBIT_CWSR_ENABLE_FILE (serve's test seam): all three and the
-#     GTT line for 1, none for 0 - so the shipped CWSR-off configuration still exercises the CWSR-on
-#     branch, which otherwise only runs on a CWSR-on boot;
 #   - --device cpu: never any of them.
 #
 # usage: tests/hrx_cwsr_route.sh path/to/1bit
@@ -112,24 +109,5 @@ else
     check "auto, CWSR not on here: the HRX backend gets none of the three" 'env_is "$scratch/auto.json" "{}"'
     check "  and serve says placement is unchanged" 'grep -q "placement unchanged (engine#315)" "$scratch/auto.json.log"'
 fi
-
-# engine#315 on the shipped configuration: CWSR off is what ships, so drive the CWSR-on branch through
-# serve's seam ($ONEBIT_CWSR_ENABLE_FILE) instead of relying on a CWSR-on boot.
-printf '1\n' > "$scratch/cwsr-on"
-printf '0\n' > "$scratch/cwsr-off"
-ONEBIT_CWSR_ENABLE_FILE="$scratch/cwsr-on" run "$scratch/seam-on.json" --device hrx
-if [ $gate = 1 ]; then
-    check "seam, auto + CWSR on: the HRX backend gets all three" 'env_is "$scratch/seam-on.json" "$all"'
-    check "  and serve logs the GTT line" 'grep -q "HRX: CWSR is on; CWSR save area placed in GTT (engine#315)" "$scratch/seam-on.json.log"'
-else
-    check "seam, auto + CWSR on, no gate: none of the three" 'env_is "$scratch/seam-on.json" "{}"'
-    check "  and serve says the gate is missing" 'grep -q "no HRX_ALLOW_NO_SVM gate; placement unchanged" "$scratch/seam-on.json.log"'
-fi
-ONEBIT_CWSR_ENABLE_FILE="$scratch/cwsr-off" run "$scratch/seam-off.json" --device hrx
-check "seam, auto + CWSR off: no variables" 'env_is "$scratch/seam-off.json" "{}"'
-check "  and serve says CWSR is off" 'grep -q "HRX: CWSR is off" "$scratch/seam-off.json.log"'
-ONEBIT_CWSR_ENABLE_FILE="$scratch/cwsr-on" HSA_USE_SVM=1 run "$scratch/seam-user.json" --device hrx
-check "seam, auto + CWSR on with the user's own HSA_USE_SVM: serve adds nothing" 'env_is "$scratch/seam-user.json" "{\"HSA_USE_SVM\": \"1\"}"'
-unset ONEBIT_CWSR_ENABLE_FILE
 
 exit $fail

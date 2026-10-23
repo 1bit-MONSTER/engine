@@ -216,7 +216,7 @@ const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
     constexpr bool gate = false;
 #endif
     static const CwsrDecision d = [&] {
-        CwsrDecision r = decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(cwsr_enable_path()), gate,
+        CwsrDecision r = decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
                                                [](const char* k) { return std::getenv(k); });
         std::fprintf(stderr, "1bit serve: %s\n", r.log.c_str());
         return r;

@@ -266,8 +266,11 @@ stage_test() { run_tests; }
 #             strings), and no libxrt* file is packed; the NPU runtime is compiled into 1bit
 #   kernels   the HRX ggml library carries the private HIP kernels (it exports the add-on's
 #             ggml_hrx_hip_addon_register), compiled in as code objects
-#   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .py .cmake) and no file named
-#             like one of the private checkouts' files
+#   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .cmake) and no file named
+#             like one of the private checkouts' files -- except the three GGUF-on-NPU helper scripts
+#             (scripts/repack_gguf.py, scripts/check_repack_config.py, tools/gguf_to_q4nx.py), which
+#             are the engine's own Apache-2.0 source, published in this repository, and without
+#             which a packed install cannot serve a GGUF on the NPU
 #   licensed  the closed binaries' LICENSE-BINARY and NOTICE-BINARY are packed beside LICENSE and NOTICE
 #   npu       (with WEEKLY_NPU_KERNELS) every file under npu/kernels but layout.json is sealed, never a
 #             plaintext ELF; every ELF in the tarball is for the host (x86-64); the packed 1bit has no
@@ -297,10 +300,24 @@ package_checks() {  # package_checks <linux tarball>
     if [ "$n" != 0 ]; then
         echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
     else echo "FAIL no private HIP kernels in the HRX ggml library (${f:-missing})"; bad=1; fi
+    # The packed install runs the GGUF-on-NPU path with the engine's own public helper scripts
+    # (scripts/package-linux.sh). They are Apache-2.0 source that is already public, so they are the
+    # three exceptions to the ban below; what must never ship is a private component's source.
+    local helpers='scripts/repack_gguf.py scripts/check_repack_config.py tools/gguf_to_q4nx.py' h
     n=$(find "$t" -type f \( -name '*.hip' -o -name '*.c' -o -name '*.cc' -o -name '*.cpp' -o -name '*.cxx' \
             -o -name '*.h' -o -name '*.hpp' -o -name '*.inc' -o -name '*.cu' -o -name '*.py' -o -name '*.cmake' \
-            -o -name '*.mlir' -o -name '*.mlirbc' \) | tee >(cat >&2) | wc -l)
+            -o -name '*.mlir' -o -name '*.mlirbc' \) -not -path '*/scripts/repack_gguf.py' \
+            -not -path '*/scripts/check_repack_config.py' -not -path '*/tools/gguf_to_q4nx.py' \
+            | tee >(cat >&2) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
+    # ... and a tarball that carries the NPU kernels must carry all three, or its GGUF-on-NPU path
+    # dies at the first GGUF with "repack script not found" (the bug this list exists to prevent)
+    if [ -n "$(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print -quit)" ]; then
+        for h in $helpers; do
+            [ "$(find "$t" -path "*/$h" -type f | wc -l)" = 1 ] || { echo "FAIL the NPU package is missing $h"; bad=1; }
+        done
+        if [ $bad = 0 ]; then echo "ok   GGUF-on-NPU helpers packed (3 files): the three public scripts"; fi
+    fi
     names=$(for pin in npu-runtime gpu-kernels npu-kernels; do
                 [ -d "$W/$pin" ] || continue
                 git -C "$W/$pin" ls-files -- "$(sed -n 's/^path=//p' "$SRC/config/$pin.config")" 2>/dev/null

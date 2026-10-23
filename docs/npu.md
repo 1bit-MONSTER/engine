@@ -97,7 +97,12 @@ weights over the bound. The Q6_K tensors (half of `v_proj` and `down_proj`, and
 reference of the repacked weights, with every step's logits at cosine 0.99995 or better.
 
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
-`~/.cache/1bit/q4nx/`, and serves it. GGUFs of six architectures (Qwen2.5, Qwen3 MoE,
+`~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,
+which the package ships beside `1bit` (`scripts/`, with its declared-scale guard;
+`ONEBIT_Q4NX_REPACK` overrides the path), so a packed install repacks too. It needs `python3` with
+`numpy` and `gguf`, and FastFlowLM's Q4NX converter, which is not vendored: point
+`ONEBIT_Q4NX_CONVERTER` at a converter checkout (a `~/np-model-generic` beside the engine or in the
+home directory is found without it). GGUFs of six architectures (Qwen2.5, Qwen3 MoE,
 Qwen3.6-35B-A3B, MiniCPM4/5, GLM-4.7-Flash) answer correctly this way, on a generic per-op path
 that is not yet fast (#179, #181, #209). On a release, GGUFs belong on HRX.
 

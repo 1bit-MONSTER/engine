@@ -59,9 +59,6 @@ hands to 1bit, it runs the engine as one of its backends, behind an OpenAI-compa
   same build on the CPU.
 - **The NPU engine** on the XDNA 2 NPU, in progress: correctness first, speed next
   ([docs/npu.md](docs/npu.md)).
-- **ONNX Runtime GenAI** (Lemonade's ONNX format) on the CPU, and on the NPU through the user's
-  own install of AMD's Ryzen AI Software, on Linux
-  ([#386](https://github.com/1bit-MONSTER/engine/pull/386), [docs/onnx.md](docs/onnx.md)).
 - **DwarfStar**, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD
   expert streaming ([docs/dwarfstar.md](docs/dwarfstar.md)).
 - **Laya**, opt-in, which picks where each request runs ([docs/laya.md](docs/laya.md)), and

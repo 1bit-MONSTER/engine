@@ -202,7 +202,7 @@ if(ONEBIT_HRX)
         foreach(_dev hrx cpu)
             add_test(NAME serve_e2e_${_dev}
                      COMMAND ${CMAKE_SOURCE_DIR}/tests/serve_e2e.sh $<TARGET_FILE:onebit> ${ONEBIT_SERVE_TEST_GGUF} ${_dev})
-            # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS), as onnx_npu_smoke does without an NPU
+            # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS)
             set_tests_properties(serve_e2e_${_dev} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
     endif()
@@ -225,25 +225,6 @@ if(ONEBIT_DS4)
     add_dependencies(onebit ds4)
     onebit_build_relative(ONEBIT_DS4_SERVER _onebit_ds4_server)
     target_compile_definitions(onebit PRIVATE ONEBIT_DS4_SERVER="${_onebit_ds4_server}")
-endif()
-
-# ── ONNX Runtime GenAI (docs/onnx.md) ──────────────────────────────────────
-# Off by default: builds ryzenai-server (MIT) with scripts/build-onnx.sh as its own program;
-# `1bit serve --device onnx` runs it as a child process.
-option(ONEBIT_ONNX "Build ryzenai-server (third_party/ryzenai-server) for --device onnx" OFF)
-if(ONEBIT_ONNX)
-    set(ONEBIT_ONNX_SERVER "${CMAKE_BINARY_DIR}/onnx/ryzenai-server")
-    add_custom_target(onnx_server
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-onnx.sh ${CMAKE_BINARY_DIR}/onnx
-        BYPRODUCTS ${ONEBIT_ONNX_SERVER}
-        USES_TERMINAL)
-    add_dependencies(onebit onnx_server)
-    onebit_build_relative(ONEBIT_ONNX_SERVER _onebit_onnx_server)
-    target_compile_definitions(onebit PRIVATE ONEBIT_ONNX_SERVER="${_onebit_onnx_server}")
-    # Linux NPU through Ryzen AI Software (docs/onnx.md): skips without ONEBIT_RYZENAI_ROOT,
-    # an NPU and a model (ONEBIT_ONNX_NPU_MODEL)
-    add_test(NAME onnx_npu_smoke COMMAND ${CMAKE_SOURCE_DIR}/tests/onnx_npu_smoke.sh $<TARGET_FILE:onebit>)
-    set_tests_properties(onnx_npu_smoke PROPERTIES SKIP_RETURN_CODE 77)
 endif()
 
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────

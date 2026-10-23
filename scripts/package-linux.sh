@@ -51,11 +51,6 @@ put() {
 cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench
 put ds4/hip ds4-server ds4 ds4-bench
-put onnx ryzenai-server
-# the licence texts build-onnx.sh puts beside it (ryzenai-server, ONNX Runtime GenAI, ONNX Runtime)
-if [ -d "$stage/onnx" ]; then
-    for f in "$build"/onnx/*-LICENSE.txt "$build"/onnx/*-ThirdPartyNotices.txt; do
-        if [ -f "$f" ]; then cp "$f" "$stage/onnx/"; fi
     done
 fi
 

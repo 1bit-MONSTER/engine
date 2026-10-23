@@ -61,7 +61,7 @@ so requests pass through unchanged.
 command with `--print-backend`: serve makes its load-time checks (architecture, memory, recipes)
 and prints the llama-server it would start, and Lemonade starts that llama-server itself and
 talks to it directly, as it does for `llamacpp`. A request then crosses one HTTP hop instead of
-two. NPU model directories, ONNX, DwarfStar, `--pm` and `--laya` still run through `1bit serve`
+two. NPU model directories, DwarfStar, `--pm` and `--laya` still run through `1bit serve`
 (serve exits 5 for them), and `LEMONADE_ONEBIT_ONE_HOP=0` keeps serve in the path for every model
 ([serve.md, "One hop from Lemonade"](serve.md#one-hop-from-lemonade---print-backend)).
 
@@ -173,7 +173,7 @@ To run `lemond` as yourself instead of as the service, set the same variable for
 Lemonade's HRX catalog (the `*-HRX` models) then runs on the engine, and so does a GGUF you
 register with `recipe: "llamacpp-hrx"`. Per-model arguments go in Lemonade's `hrx_args`, except
 the ones Lemonade sets itself (`-m`, `--ctx-size`, `--device`, `--port`, `--jinja`,
-`--metrics`). NPU model directories, ONNX, DwarfStar, `--pm` and `--laya` are not
+`--metrics`). NPU model directories, DwarfStar, `--pm` and `--laya` are not
 llama-server, so they stay with `/opt/1bit/1bit serve` ([serve.md](serve.md)), outside the stock
 `lemond`.
 

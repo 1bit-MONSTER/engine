@@ -41,7 +41,7 @@ body:
     attributes:
       label: Device you want it on
       multiple: true
-      options: [npu, hrx, cpu, ds4, onnx, any]
+      options: [npu, hrx, cpu, ds4, any]
     validations:
       required: true
   - type: textarea

@@ -15,7 +15,7 @@
 // 1bit: the engine binary. Subcommands:
 //
 //   1bit serve -m <model>            one model on any device (NPU, HRX, CPU,
-//                                    DwarfStar, ONNX) behind an OpenAI-compatible API;
+//                                    DwarfStar) behind an OpenAI-compatible API;
 //                                    how the engine runs inside Lemonade (docs/serve.md).
 //   1bit unified -m <model dir>      one native model on the NPU fast lane behind
 //                                    OpenAI endpoints; serve's NPU route.

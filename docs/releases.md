@@ -46,7 +46,7 @@ Release sha and pins (the submodules this candidate is built from):
 | npu-runtime (private) | `ce9fa59adf95` (`config/npu-runtime.config`) |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
-| DwarfStar / tokenizers / ryzenai-server | `5b013dc1bb` / `3012770722` / `69765cc591` |
+| DwarfStar / tokenizers | `5b013dc1bb` / `3012770722` |
 
 | artifact | status |
 |---|---|
@@ -135,7 +135,7 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), ONNX (ryzenai-server), DwarfStar, and the NPU engine's runtime (the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), DwarfStar, and the NPU engine's runtime (the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 

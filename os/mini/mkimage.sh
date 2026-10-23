@@ -450,15 +450,28 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     # were making the initramfs 103 MB compressed, which is what grub was failing to load on real
     # hardware (the machine's own 37 MB initrd loads fine). init.sh links them to the engine's
     # expected path at boot, so the engine still finds npu/kernels beside itself.
-    mkdir -p "$out/data.dir/npu"
-    cp -a "$build/npu/kernels" "$out/data.dir/npu/"
+    # Only the artifact surface goes on the stick: <set>/layout.json and <set>/layer1_*/layer1.elf, the
+    # allowlist scripts/package-linux.sh packs. A set directory also holds layer1.work/ (plaintext
+    # MLIR, object files, intermediate ELFs) because that is where it was built, so copying the tree
+    # would put the kernel method on the stick; the guard that caught that used `find ... | head -3`,
+    # which exits 141 (SIGPIPE) under `set -o pipefail` and aborted the whole image instead.
+    mkdir -p "$out/data.dir/npu/kernels"
+    for set in "$build"/npu/kernels/*/; do
+        setname=$(basename "$set")
+        [ -f "$set/layout.json" ] || continue
+        mkdir -p "$out/data.dir/npu/kernels/$setname"
+        cp -a "$set/layout.json" "$out/data.dir/npu/kernels/$setname/"
+        for layer in "$set"/layer1_*/; do
+            [ -f "$layer/layer1.elf" ] || continue
+            mkdir -p "$out/data.dir/npu/kernels/$setname/$(basename "$layer")"
+            cp -a "$layer/layer1.elf" "$out/data.dir/npu/kernels/$setname/$(basename "$layer")/"
+        done
+    done
     sealed=$(find "$out/data.dir/npu/kernels" -name layer1.elf -exec \
         sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
     total=$(find "$out/data.dir/npu/kernels" -name layer1.elf | wc -l)
-    stray=$(find "$out/data.dir/npu/kernels" -mindepth 3 \( -name '*.mlir' -o -name '*.o' -o -name 'layer1.work' -o -name '*.pdi' \) | head -3)
     [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
     [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
-    [ -z "$stray" ] || { echo "npu/kernels carries build artifacts, not just layout.json + layer1.elf:"; echo "$stray"; exit 1; }
     echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) sealed sets on the data partition ($sealed kernels)"
 fi
 mkdir -p "$root/opt/1bit-llama" "$root/etc/1bit"

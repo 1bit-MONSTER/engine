@@ -428,7 +428,10 @@ chmod 600 "$out/data.dir/lemonade/lemond.conf"
 echo "Put your SSH public key(s) in authorized_keys here; 1bit OS takes key logins only." > "$out/data.dir/ssh/README"
 # optional contents of the data partition (tests, or a ready-to-go stick)
 [ -n "${AUTHORIZED_KEYS:-}" ] && cp "$AUTHORIZED_KEYS" "$out/data.dir/ssh/authorized_keys"
-for m in ${MODELS:-}; do cp -L "$m" "$out/data.dir/models/"; done
+for m in ${MODELS:-}; do
+    if [ -d "$m" ]; then cp -aL "$m" "$out/data.dir/models/"      # an NPU model set (.q4nx); -L: FLM ships symlinks
+    else cp -L "$m" "$out/data.dir/models/"; fi
+done
 data_mb=${DATA_MB:-$(( $(du -sm "$out/data.dir" | cut -f1) + 1024 ))}   # the contents plus 1 GiB
 rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     # The sealed sets go on the STICK'S DATA PARTITION, not inside the RAM image. They are ~124 MB and

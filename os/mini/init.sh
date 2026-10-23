@@ -26,9 +26,13 @@ hostname -F /etc/hostname
 
 echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"; echo
 
-# drivers: GPU, NPU, network, USB storage
-# sd_mod makes a USB stick a disk (usb-storage only presents it as a SCSI device)
-for m in amdgpu amdxdna r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod vfat ext4; do modprobe -q "$m"; done
+# drivers, in the order the boot needs them: network, USB storage and the USB4/Type-C stack first, so
+# the machine is reachable and the stick readable even if a GPU probe is slow. sd_mod makes a USB
+# stick a disk (usb-storage only presents it as a SCSI device); the TYPEC/Thunderbolt modules are what
+# bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
+# PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
+# comes up with no network at all, which looks exactly like a hang.
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod vfat ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
 # network: DHCP on every wired interface
@@ -42,11 +46,126 @@ done
 # models: the stick's 1BIT-DATA partition, if present (the internal disk is left alone)
 # USB storage can take several seconds to appear: wait for the partition, up to 20 s
 data=
-for i in $(seq 20); do
+# A USB 2.0 stick can take 45 s or more to appear on this machine (sd 1:0:0:0: [sda] at t=46.4 s in the
+# box's own log), and the old 20 s window expired before it did - so /data never mounted, the keys
+# never arrived and nothing was logged. Wait much longer, and say so as we go.
+i=0
+while [ $i -lt 90 ]; do
     data=$(findfs LABEL=1BIT-DATA 2>/dev/null) && break
-    sleep 1
+    [ $i = 30 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
+    [ $i = 60 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
+    sleep 1; i=$((i+1))
 done
 if [ -n "$data" ]; then mount "$data" /data && echo "models: /data/models (from $data)"; fi
+
+# Evidence that outlives a live boot: stage markers on the stick, so a machine that hangs later can be
+# diagnosed by reading /data/boot.log from another system instead of squinting at the console.
+stage() { echo "$(date -u +%H:%M:%S) $*" >> /data/boot.log 2>/dev/null; echo "$*"; }
+# If the data partition did not turn up, log to the EFI partition instead - it is the one pieces of the
+# stick the firmware could read, so it is the best chance of keeping evidence across a panic.
+if ! grep -q " /data " /proc/mounts; then
+    os=$(findfs LABEL=1BIT-OS 2>/dev/null)
+    if [ -n "$os" ] && mount -t vfat -o rw "$os" /data 2>/dev/null; then
+        echo "log fallback: EFI partition mounted at /data"
+    fi
+fi
+stage "stick mounted at ${data:-nothing}"
+
+# The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
+# to load): link them to the path the engine looks for, beside itself.
+if [ -d /data/npu/kernels ] && [ -d /home ]; then
+    mkdir -p /home/bcloud/wt/npupkg-build/npu 2>/dev/null
+    ln -sfn /data/npu/kernels /home/bcloud/wt/npupkg-build/npu/kernels 2>/dev/null
+    say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
+fi
+
+# Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
+# screen you have to guess about.
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
+    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
+n=0
+step() { n=$((n+1)); say "[$n] $*"; }
+
+# The screen gets a real interactive login on tty1, never a shell on /dev/console: /dev/console stops
+# being what is painted once fbcon takes the DRM framebuffer, and a non-interactive shell has no
+# prompt - so the machine sat there looking dead while it was serving. tty1 is the VT we are on.
+screen_login() {
+    [ -c /dev/tty1 ] || return 0
+    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [ -n "$ip" ] || ip="<this address>"
+    chvt 1 2>/dev/null || true
+    {
+      echo
+      echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+      echo "  ----------------------------------------------------------------------------------------"
+      echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
+      echo "   lemonade list                 the models;  lemonade chat Qwen3-0.6B-1bit"
+      echo "   cat /data/boot.log            what this boot did"
+      echo "   ssh root@<this address>       also works, with the key in /data/ssh/authorized_keys"
+      echo
+      echo "  Lemonade is on the network:  http://${ip}:13305   (Lemonade Mobile finds it via the UDP beacon)"
+      echo "  its API key:                 grep LEMONADE_API_KEY /data/lemonade/lemond.conf"
+      echo
+    } > /dev/tty1 2>/dev/null
+    # cttyhack is what a classic initramfs uses, but here it exits at once (it cannot claim a tty that
+    # setsid has already detached from) - measured on the box. setsid -c makes tty1 the controlling
+    # terminal instead, which is what gives a prompt AND job control; the loop puts it back if you exit.
+    ( while :; do setsid -c /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
+}
+
+# Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
+# framebuffer /dev/console is no longer what is painted, and the screen must never be the part that lies.
+mc() { while IFS= read -r l; do for c in /dev/console /dev/tty1; do [ -w "$c" ] && printf '%s\n' "$l" > "$c" 2>/dev/null; done; done; }
+MODE=live
+if [ -c /dev/console ]; then
+    {
+      echo
+      echo "  1bit OS  v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  ------------------------------------------------------------------------------"
+      echo "   1) Lemonade appliance            (default, starts in 12s)"
+      echo "   2) Lemonade, verbose, no GPU driver"
+      echo "   3) Root shell (no services)"
+      echo "   4) Power off"
+      echo
+    } | mc
+    printf "  choice: " | mc
+    i=0
+    while [ $i -lt 12 ]; do
+        if read -r -t 1 -n 1 c < /dev/console 2>/dev/null; then
+            case "$c" in
+                2) MODE=nogpu;  break ;;
+                3) MODE=shell;  break ;;
+                4) MODE=off;    break ;;
+                1|"") break ;;
+            esac
+        fi
+        i=$((i+1))
+    done
+    printf "\n" | mc
+fi
+case "$MODE" in
+    off)  say "powering off (choice 4)"; sync; poweroff -f ;;
+    shell) say "root shell - the appliance will not start (choice 3)"; screen_login; while :; do sleep 3600; done ;;
+    nogpu) say "verbose mode: GPU/NPU drivers are skipped (choice 2)" ;;
+esac
+
+# GPU and NPU last: on real hardware these probes are the slow part of the boot (and the usual suspect
+# when a boot appears to stop), and by now the network is up and the stick is mounted.
+# GPU/NPU drivers are NOT loaded here. The live image ships the machine's own /lib/modules, and its
+# stock amdxdna disagrees with the private 1bit build - loading it at boot panics before the appliance
+# is even reachable. The engine loads what it needs when it starts a model, so a live boot does not
+# need them: leave them out and the appliance comes up, stays visible and stays reachable.
+if [ "$MODE" = nogpu ]; then
+    say "[gpu] skipped by menu choice"
+else
+    say "[gpu] loading the private NPU driver (amdxdna) and amdgpu"
+    # amd_pmf first: it owns the platform sensors (hwmon) and the profile interface; without it the
+    # appliance has no temperatures or fan readings at all ("no HWMON support due to missing pmf sensor")
+    for m in amd_pmf amdgpu amdxdna; do modprobe -q "$m"; done
+    mdev -s 2>/dev/null
+    say "[gpu] devices: $(ls /dev/dri/renderD* /dev/kfd /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
+    say "[gpu] hwmon: $(for h in /sys/class/hwmon/hwmon*; do cat $h/name 2>/dev/null; done | tr '\n' ' ')"
+fi
 
 # HRX: TheRock's HSA runtime (1bit serve also finds it at its compiled-in path), and the Loom
 # kernel cache on the stick, so kernels compiled on the first boot are reused after a reboot
@@ -88,7 +207,7 @@ onebit_register() {   # <name> <path>: add the entry unless the registry has tha
     case "$1$2" in *'"'*|*'\'*) return ;; esac
     [ -s "$f" ] || echo '{}' > "$f"
     grep -q "\"$1\"[[:space:]]*:" "$f" && return
-    e="\"$1\": {\"checkpoint\": \"$2\", \"source\": \"local_path\", \"recipe\": \"onebit\"}"
+    e="\"$1\": {\"checkpoint\": \"$2\", \"source\": \"local_path\", \"recipe\": \"onebit\"${3:+, \"onebit_backend\": \"$3\"}}"
     tr '\n' ' ' < "$f" | awk -v e="$e" '{ i = length($0); while (i > 0 && substr($0, i, 1) != "}") i--
         head = substr($0, 1, i - 1); inner = head; sub(/^[ \t]*\{/, "", inner); gsub(/[ \t]/, "", inner)
         print head (inner == "" ? "" : ", ") e "}" }' > "$f.new" && mv "$f.new" "$f" && echo "Lemonade: user.$1 (onebit) -> $2"
@@ -99,7 +218,22 @@ for m in /data/models/*.gguf; do
     case $n in mmproj*|*-0000[2-9]-of-*|*-000[1-9][0-9]-of-*) continue ;; esac
     onebit_register "$n-1bit" "$m"
 done
-for d in /data/models/*/model.q4nx; do [ -f "$d" ] && d=${d%/model.q4nx} && onebit_register "${d##*/}-1bit" "$d"; done
+# A .q4nx directory is the engine's own model format, so it runs on the NPU: say so, or Lemonade
+# sends it down the CPU path, which wants a llama-server this image does not carry.
+for d in /data/models/*/model.q4nx; do
+    [ -f "$d" ] || continue
+    d=${d%/model.q4nx}
+    onebit_register "${d##*/}-1bit" "$d" npu
+done
+# Lemonade listens on the LAN (config/config.json "host": 0.0.0.0) so Lemonade Mobile and any other
+# client can reach it, which means it must not be open: mint an API key once, keep it on the stick, and
+# every request presents it as "Authorization: Bearer <key>".
+kf=/data/lemonade/lemond.conf
+if [ -f "$kf" ] && ! grep -q '^LEMONADE_API_KEY=..*' "$kf" 2>/dev/null; then
+    { echo "LEMONADE_API_KEY=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')"
+      echo "# minted at boot: send it as  Authorization: Bearer <key>  (Lemonade Mobile asks for it once)"
+    } >> "$kf" && chmod 600 "$kf"
+fi
 # Lemonade's environment file (LEMONADE_API_KEY, LEMONADE_ADMIN_API_KEY, HF_TOKEN), for lemond only
 ( cd "$lem" || exit 1
   if [ -f lemond.conf ]; then set -a; . ./lemond.conf; set +a; fi
@@ -113,9 +247,13 @@ lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
+echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
+echo "      Reboot to discard everything; only /data on the stick persists."
+touch /etc/1bit/live 2>/dev/null
 echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
 echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"
+echo "Prove the engine answers from this boot:  1bit-selftest   (console or SSH; logs to /data/selftest.log)"
 echo "The engine alone, for debugging:  1bit serve -m /data/models/<file.gguf>   (auto: HRX0, on 127.0.0.1:8000)"; echo
 
 # 1bit.check on the kernel command line: check the userspace starts, report, power off (for CI
@@ -143,4 +281,8 @@ fi
 
 # a shell on the console and the serial port
 [ -e /dev/ttyS0 ] && setsid sh -c 'exec sh </dev/ttyS0 >/dev/ttyS0 2>&1' &
-exec setsid cttyhack sh
+# PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
+# what happened on real hardware - the script finished, the final exec returned, and the machine
+# rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
+screen_login
+while :; do sleep 3600; done

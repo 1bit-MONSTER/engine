@@ -246,7 +246,12 @@ amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. Af
   tarball, no separate NPU runtime library is needed or packed.
 - **Kernels in:** the packed `libggml-hrx.so` exports the add-on's `ggml_hrx_hip_addon_register`.
 - **No source:** no source file (`.hip`, `.c`, `.cc`, `.cpp`, `.cxx`, `.h`, `.hpp`, `.inc`, `.cu`,
-  `.py`, `.cmake`) and no file named like one of the private checkouts' files.
+  `.cmake`) and no file named like one of the private checkouts' files. The three public GGUF-on-NPU
+  helper scripts are the stated exception: `scripts/repack_gguf.py`, its declared-scale guard
+  `scripts/check_repack_config.py` and the lane packer `tools/gguf_to_q4nx.py` are the engine's own
+  Apache-2.0 source, published in this repository, and a packed install cannot serve a GGUF on the
+  NPU without them ([npu.md](npu.md#from-a-gguf)). The check fails if a tarball carrying the NPU
+  kernels is missing any of the three.
 - **Licensed:** `LICENSE`, `NOTICE`, `LICENSE-BINARY` and `NOTICE-BINARY` are in the tarball.
 - **Libraries found:** `ldd` (with `ROCR_VISIBLE_DEVICES=-1`) finds every library each packed
   program and library needs, except the TheRock runtime the package documents (HIP, hipBLAS(Lt),

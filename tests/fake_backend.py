@@ -80,7 +80,14 @@ class H(BaseHTTPRequestHandler):
             if action != "restore":
                 self._json(400, {"error": {"message": "Invalid action"}})
                 return
-            path = os.path.join(sys.argv[sys.argv.index("--slot-save-path") + 1], req["filename"])
+            # the file name is a bare name inside --slot-save-path, as llama-server requires
+            # (fs_validate_filename): no directory part, no "..", nothing outside that directory
+            name = str(req.get("filename", ""))
+            slot_dir = os.path.realpath(sys.argv[sys.argv.index("--slot-save-path") + 1])
+            path = os.path.realpath(os.path.join(slot_dir, name))
+            if not name or name != os.path.basename(name) or name in (".", "..") or os.path.dirname(path) != slot_dir:
+                self._json(400, {"error": {"message": "Invalid filename"}})
+                return
             with open(path) as f:
                 n = sum(1 for line in f if line.strip())
             self._json(200, {"id_slot": int(slot), "filename": req["filename"], "n_restored": n, "n_read": 0,

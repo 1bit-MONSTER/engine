@@ -51,8 +51,6 @@ put() {
 cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench
 put ds4/hip ds4-server ds4 ds4-bench
-    done
-fi
 
 # the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
 # beside 1bit in npu/kernels, where it looks for them

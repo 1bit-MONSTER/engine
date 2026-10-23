@@ -241,6 +241,7 @@ else
 fi
 # one command that proves the engine answers from this boot (console or SSH)
 cp "$here/selftest.sh" "$root/bin/1bit-selftest"; chmod +x "$root/bin/1bit-selftest"
+cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/1bit-release-check"
 cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"

@@ -149,6 +149,29 @@ no longer read.
 
 It has no authentication of its own (SECURITY.md); keep it on 127.0.0.1.
 
+## Check the release
+
+One command says PASS or FAIL for the image that is booted, on the live stick and again after the
+install to disk. Every check prints its own PASS/FAIL/SKIP line, a transcript lands in
+`/data/release-check.log`, and the exit status is non-zero on any failure:
+
+```sh
+# on the live stick (console, or over SSH from another machine)
+1bit-release-check
+
+# after installing to the disk and booting from it
+1bit-release-check
+```
+
+It checks the boot mode (LIVE or INSTALLED), the kernel and the Secure Boot state, the GPU and NPU
+devices, that Lemonade answers with its API key and refuses without it, that `/api/v1/models` lists
+the onebit entries the build shipped (22 on HRX, plus the NPU entries whose sealed kernel set is on
+the data partition) and the stick's own GGUF, one chat per backend the machine can run, one
+`lemonade bench` chat-short row on the default model, that every file under `/data/npu/kernels` is a
+sealed artifact, that `LICENSE-BINARY`/`NOTICE-BINARY` are present, and the image's tag + sha256.
+The rows that need the hardware - `gpu`, `npu`, `models`, `chat-hrx`, `chat-npu` - report
+`SKIP(reason)` in a VM.
+
 ## Check it without the hardware
 
 ```sh

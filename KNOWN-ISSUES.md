@@ -788,6 +788,12 @@ Everything that did run passed:
 | kld qwen3-4b-iq4xs | PASS — mean KLD 0.000002, p99 0.00005, **same top 99.85 %** |
 | model qwen3-0.6b-kvq8 | **cut off** — rc 143 (SIGTERM) from the cancellation, not a check failure; its placement line reads 1322 nodes, 0 off HRX |
 
+A re-dispatch on the same branch (run 39894128364) got further and died the same way: it was killed at
+03:18:52 while running `kld qwen3-coder-30b-a3b`, and that check is recorded as
+`FAIL — FileNotFoundError: …/kld-qwen3-coder-30b-a3b.log`, i.e. the log the judge opens was never written
+because the process died with the box. The same check **passed** in the first run on the identical pin
+(mean KLD 0.000912, same top 98.97 %), so that `FAIL` is the machine, not a regression on this branch.
+
 **2. The thermal threshold in the soak was 96 °C, not 93 °C.** The #315 soak followed phase B's rules:
 detector/chat drivers pause at 92 °C, resume at ≤ 84 °C, and only ≥ 96 °C aborts (`~/wt/315soak/STATE.md`,
 2026-10-18 17:19, an orchestrator ruling after an arm was lost to 92-93 °C). The measured peak across the

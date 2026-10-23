@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4|onnx] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4] [--mtp HEAD]`
 //                        [--npu-opt KEY=VALUE ...]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
@@ -249,6 +249,10 @@ void refuse_removed_device(const std::string& device) {
     if (device == "mlx")
         throw std::runtime_error("--device mlx was removed: the engine has no MLX or Metal route (its GPU route is HRX). "
                                  "Lemonade's own MLX backend serves Apple Silicon (docs/lemonade.md)");
+    if (device == "onnx")
+        throw std::runtime_error("--device onnx was removed: the engine ships no ONNX Runtime (its NPU route is its own "
+                                 "engine, --device npu). Lemonade's own backends serve ONNX models where they exist "
+                                 "(ryzenai-llm on Windows, onnxruntime on the CPU; docs/lemonade.md)");
 }
 
 // An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
@@ -289,101 +293,6 @@ bool onebp_file(const std::string& model) {
     std::ifstream f(model, std::ios::binary);
     char magic[4] = {};
     return f.read(magic, 4) && std::memcmp(magic, "1BP\0", 4) == 0;
-}
-
-#ifdef _WIN32
-// The ryzenai-server.exe Lemonade installs for its ryzenai-server backend:
-// <cache>\bin\ryzenai-server\npu\...\ryzenai-server.exe, where <cache> is $LEMONADE_CACHE_DIR, else
-// %USERPROFILE%\.cache\lemonade (Lemonade's own defaults). Empty when Lemonade has not installed it.
-std::string lemonade_ryzenai_server() {
-    fs::path cache;
-    if (const char* e = std::getenv("LEMONADE_CACHE_DIR"); e && *e) cache = e;
-    else if (const char* h = std::getenv("USERPROFILE"); h && *h) cache = fs::path(h) / ".cache" / "lemonade";
-    else return "";
-    std::error_code ec;
-    const fs::path dir = cache / "bin" / "ryzenai-server" / "npu";
-    if (!fs::is_directory(dir, ec)) return "";
-    for (fs::recursive_directory_iterator it(dir, ec), end; !ec && it != end; it.increment(ec))
-        if (it->path().filename() == "ryzenai-server.exe") return it->path().string();
-    return "";
-}
-#endif
-
-// ryzenai-server (lemonade-sdk/ryzenai-server, MIT): ONNX Runtime GenAI models. Linux builds it
-// from third_party/ryzenai-server (CPU with Microsoft's ONNX Runtime, or the NPU / hybrid where
-// AMD's Ryzen AI Software provides it); Windows uses the one Lemonade installs.
-std::string default_onnx() {
-    if (const char* e = std::getenv("ONEBIT_ONNX_SERVER"); e && *e) return e;
-#ifdef ONEBIT_ONNX_SERVER
-    return built_path(ONEBIT_ONNX_SERVER);
-#elif defined(_WIN32)
-    if (std::string p = lemonade_ryzenai_server(); !p.empty()) return p;
-    return "ryzenai-server.exe";
-#else
-    return "ryzenai-server";
-#endif
-}
-
-// an ONNX Runtime GenAI model directory (genai_config.json beside the graph)
-bool is_onnx_model_dir(const std::string& dir) {
-    return fs::is_directory(dir) && fs::exists(fs::path(dir) / "genai_config.json");
-}
-
-// The execution mode an ONNX Runtime GenAI model declares, read as ryzenai-server reads it:
-// "npu" when the RyzenAI provider (or config_entries) has hybrid_opt_token_backend "npu",
-// "hybrid" for the RyzenAI provider without it, "" for a CPU model (no RyzenAI provider).
-std::string onnx_ryzenai_mode(const std::string& dir) {
-    try {
-        std::ifstream f(fs::path(dir) / "genai_config.json");
-        const json cfg = json::parse(f);
-        const json& session = cfg.at("model").at("decoder").at("session_options");
-        if (session.contains("config_entries") && session["config_entries"].value("hybrid_opt_token_backend", "") == "npu")
-            return "npu";
-        if (!session.contains("provider_options")) return "";
-        for (const json& p : session["provider_options"]) {
-            if (!p.is_object() || !p.contains("RyzenAI")) continue;
-            return p["RyzenAI"].is_object() && p["RyzenAI"].value("hybrid_opt_token_backend", "") == "npu" ? "npu" : "hybrid";
-        }
-    } catch (const std::exception&) {
-    }
-    return "";
-}
-
-// Ryzen AI Software for Linux (docs/onnx.md, "Linux NPU"): its installer makes a venv whose
-// deployment/lib holds ONNX Runtime GenAI with the RyzenAI execution provider, and XRT lives
-// in a prefix of its own. ONEBIT_RYZENAI_ROOT names the venv; ONEBIT_XRT_ROOT the XRT prefix
-// (else $XILINX_XRT, else /opt/xilinx/xrt). The child's environment, in the order the
-// libraries must resolve: XRT's lib first (the venv's voe wheel bundles an older
-// libxrt_coreutil that must not shadow it), then ryzenai-server's own directory (the copies
-// scripts/build-onnx.sh made and cleared of executable stacks), then deployment/lib, then what
-// LD_LIBRARY_PATH already held. The provider library is the copy beside the server when the
-// build made one. A server with no provider beside it was built against Microsoft's ONNX Runtime
-// (the release package's onnx/, which ships no part of Ryzen AI Software): then deployment/lib
-// comes before the server's directory, so the venv's ONNX Runtime GenAI, the one that knows the
-// RyzenAI provider, loads instead of the CPU-only copy beside the binary. That works because
-// scripts/build-onnx.sh gives that build DT_RUNPATH $ORIGIN, which yields to LD_LIBRARY_PATH (a
-// DT_RPATH would not: the CPU-only copy would load and the provider be unknown), and the
-// release package keeps it (weekly.sh checks). Nothing in the venv is modified.
-std::vector<std::string> ryzenai_child_env(const std::string& root, const fs::path& server_dir) {
-    const fs::path deployment = fs::path(root) / "deployment" / "lib";
-    if (!fs::is_directory(deployment))
-        throw std::runtime_error("ONEBIT_RYZENAI_ROOT=" + root + ": no deployment/lib there (a Ryzen AI Software venv has one, docs/onnx.md)");
-    std::string xrt;
-    if (const char* e = std::getenv("ONEBIT_XRT_ROOT"); e && *e) xrt = e;
-    else if (const char* e2 = std::getenv("XILINX_XRT"); e2 && *e2) xrt = e2;
-    else xrt = "/opt/xilinx/xrt";
-    if (!fs::is_directory(fs::path(xrt) / "lib"))
-        throw std::runtime_error("no XRT at " + xrt + " (no lib/ there): set ONEBIT_XRT_ROOT to the XRT prefix, docs/onnx.md");
-    fs::path ep = server_dir / "libonnxruntime_providers_ryzenai.so";
-    const bool own_copies = !server_dir.empty() && fs::exists(ep);
-    if (!own_copies) ep = deployment / "libonnxruntime_providers_ryzenai.so";
-    std::string ld = (fs::path(xrt) / "lib").string();
-    if (own_copies) ld += ":" + server_dir.string() + ":" + deployment.string();
-    else ld += ":" + deployment.string() + (server_dir.empty() ? "" : ":" + server_dir.string());
-    if (const char* old = std::getenv("LD_LIBRARY_PATH"); old && *old) ld += std::string(":") + old;
-    if (!fs::exists(ep))
-        throw std::runtime_error(ep.string() + " is missing: the RyzenAI execution provider of Ryzen AI Software for Linux");
-    return {"XILINX_XRT=" + xrt, "LD_LIBRARY_PATH=" + ld, "RYZENAI_EP_PATH=" + ep.string()};
 }
 
 // DwarfStar's ds4-server (third_party/ds4, MIT), built by scripts/build-ds4.sh
@@ -488,8 +397,7 @@ PortOwner port_owner(pid_t child, int port) {
 
 // A child OpenAI-compatible server on a loopback port.
 // The child's environment: ours, plus env_extra where a variable is not set (a value the user
-// set wins), plus env_override in place of whatever was set (the few a route must own: the
-// library order the RyzenAI provider needs, which already folds in the user's LD_LIBRARY_PATH).
+// set wins), plus env_override in place of whatever was set (the few a route must own).
 void merge_env(std::vector<std::string>& env_store, const std::vector<std::string>& env_extra,
                const std::vector<std::string>& env_override) {
     for (const auto& e : env_extra) {
@@ -663,7 +571,7 @@ public:
 
     // SIGTERM to the child itself (it shares our process group, so no group signal: that would
     // reach serve and every other backend), then a wait before SIGKILL: a backend that holds an
-    // NPU hardware context (ryzenai-server on the RyzenAI provider) must get to close it itself.
+    // NPU hardware context must get to close it itself.
     // Killing such a process outright, with a live context after an earlier firmware timeout,
     // took the kernel down on amdxdna 0.17.0 (2026-10-11, list_del corruption in
     // amdxdna_client_cleanup). The wait is ONEBIT_BACKEND_STOP_GRACE_S (30 s by default: a
@@ -896,7 +804,6 @@ struct Launch {
     bool mtp = false;
     std::string ready_path = "/health";
     std::vector<std::string> env_override;  // set in place of the inherited value (Child)
-    bool npu_retry = false;  // an NPU model on onnx: retry a failed non-streamed request once (serve_child)
 };
 
 // A GGUF that carries its own MTP head (<architecture>.nextn_predict_layers > 0: Unsloth's Qwen3.8-27B
@@ -993,29 +900,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     std::vector<std::string>& env = l.env;
     std::string& set_model = l.set_model;
     if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
-    if (device == "onnx") {
-        // ryzenai-server: `-m <dir> --port <p>`; the execution mode (CPU, NPU, hybrid) comes from
-        // the model's genai_config.json
-        if (o.parallel > 1 || !o.mtp.empty() || !o.dflash.empty() || !o.mmproj.empty())
-            throw std::runtime_error("--device onnx takes no --parallel, --mtp, --dflash or --mmproj");
-        argv = {default_onnx(), "-m", o.model, "--port", std::to_string(child_port)};
-        if (o.ctx_size > 0) { argv.push_back("--ctx-size"); argv.push_back(std::to_string(o.ctx_size)); }
-        if (const std::string mode = onnx_ryzenai_mode(o.model); !mode.empty()) {
-            // Linux: the RyzenAI provider's runtime comes from the Ryzen AI Software venv
-            // ONEBIT_RYZENAI_ROOT names (ryzenai_child_env); unset, the environment is the
-            // user's own (RYZENAI_EP_PATH and LD_LIBRARY_PATH as they exported them)
-            if (const char* root = std::getenv("ONEBIT_RYZENAI_ROOT"); root && *root) {
-                const fs::path server(argv[0]);  // a bare name resolves on PATH: no directory of its own
-                l.env_override = ryzenai_child_env(root, server.has_parent_path() ? fs::absolute(server).parent_path() : fs::path());
-            } else if (!std::getenv("RYZENAI_EP_PATH")) {
-                std::fprintf(stderr, "1bit serve: %s declares the RyzenAI provider (%s); set ONEBIT_RYZENAI_ROOT to the "
-                                     "Ryzen AI Software venv so ryzenai-server finds it (docs/onnx.md, Linux NPU)\n",
-                             o.model.c_str(), mode.c_str());
-            }
-            l.npu_retry = mode == "npu";
-        }
-        return l;
-    }
     if (device == "hrx" || device == "cpu") {
         // --device cpu: llama-server with no GPU layers (what --device auto falls back to where
         // HRX has no route for a request, and in a build without HRX)
@@ -1677,7 +1561,7 @@ int serve_child(const Options& given) {
     if (o.print_backend) {
         // --print-backend (docs/serve.md, "One hop from Lemonade"): only a lone llama-server can be
         // started by Lemonade itself; these need serve in the request path
-        if (o.device == "ds4" || o.device == "onnx") return serve_only("--device " + o.device + " is not a llama-server");
+        if (o.device == "ds4") return serve_only("--device ds4 is not a llama-server");
         if (o.pm) return serve_only("--pm runs its tool loop in serve");
         if (o.laya_auto || !o.laya_model.empty()) return serve_only("--laya routes each request in serve");
         if (!o.embed.empty() || !o.rerank.empty()) return serve_only("--embed and --rerank run more servers behind serve");
@@ -2066,17 +1950,6 @@ int serve_child(const Options& given) {
         }
         ++routed[pick];
         forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
-        if (backends[pick].npu_retry && r.status >= 500 && !wants_stream(q.body) && all_alive()) {
-            // The NPU's first dispatch after idle can hit a one-off firmware timeout (TDR); the
-            // device recovers and the same request then runs. One retry, said aloud, for a reply
-            // nothing of which reached the client (a stream is not retried: its bytes went out).
-            std::fprintf(stderr, "1bit serve: %s answered %d on %s; retrying once (first NPU dispatch after idle can time out)\n",
-                         backends[pick].device.c_str(), r.status, q.path.c_str());
-            std::this_thread::sleep_for(std::chrono::seconds(1));
-            r.status = 200;
-            r.body.clear();
-            forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
-        }
     };
     srv.Post("/v1/chat/completions", post);
     srv.Post("/v1/completions", post);
@@ -2290,7 +2163,7 @@ int serve_child(const Options& given) {
                             probe[port] = 1;
                             watch.alive(port);
                         } else if (probe[port] == 0) {
-                            probe[port] = -1;   // DwarfStar, ONNX, or llama-server --no-slots
+                            probe[port] = -1;   // DwarfStar, or llama-server --no-slots
                         }
                     }
                 }
@@ -2598,7 +2471,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|hrx|cpu|ds4] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--hrx-libhsa PATH]\n"
                  "                  [--hrx-cwsr-placement=auto|on|off]   engine#315: on a CWSR-on amdgpu (auto, the default)\n"
                  "                  or always (on), HRX backends get HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0\n"
@@ -2645,12 +2518,11 @@ void usage(FILE* out) {
                  "                  (or ONEBIT_STRICT_DEVICE=0) lets HRX leave such nodes on the CPU (engine #390)\n"
                  "                  [--print-backend]   print the llama-server serve would start (argv and env, one\n"
                  "                  JSON line) and exit: 0 printed, 3 does not fit, 5 the route needs serve itself\n"
-                 "                  (NPU, ONNX, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
+                 "                  (NPU, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
                  "                  it directly, one hop (docs/serve.md)\n"
                  "                  [--print-backend-env]   as --print-backend, but only the environment, one\n"
                  "                  NAME=VALUE line each (lemonade-hrx, stock Lemonade's HRX recipe: docs/lemonade.md)\n"
                  "  <model>: an NPU model directory (model.q4nx + npu/, or one a private NPU route serves),\n"
-                 "           an ONNX Runtime GenAI directory (genai_config.json: --device onnx),\n"
                  "           or a .gguf file\n");
 }
 
@@ -2746,24 +2618,16 @@ int run_serve(int argc, char** argv) {
     if (o.model.empty()) { usage(stderr); return 2; }
     if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)
         throw std::runtime_error("--watchdog and --watchdog-prompt-tps take a number >= 0 (0 turns it off)");
-    if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "ds4" || o.device == "onnx" || o.device == "npu"))
+    if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "ds4" || o.device == "npu"))
         throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
     if (o.print_backend) {
-        if (is_onnx_model_dir(o.model)) return serve_only("an ONNX Runtime GenAI directory runs on ryzenai-server behind serve");
         if (fs::is_directory(o.model)) return serve_only("an NPU model directory runs in serve's own process");
         if (o.device == "npu") return serve_only("--device npu runs in serve's own process");
     }
 
-    if (is_onnx_model_dir(o.model)) {
-        if (o.device != "auto" && o.device != "onnx")
-            throw std::runtime_error("an ONNX Runtime GenAI model directory (genai_config.json) runs on --device onnx");
-        Options onnx = o;
-        onnx.device = "onnx";
-        return serve_child(onnx);
-    }
     if (fs::is_directory(o.model)) {
         if (!o.mmproj.empty()) throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         if (o.device != "auto" && o.device != "npu")

@@ -31,10 +31,6 @@ and decrypts in memory at load (a wrong key fails cleanly, and nothing phones ho
 build and method are not in this repository or in any release. This page covers the public parts:
 the model format, how `1bit serve` runs an NPU model, and how to build.
 
-AMD's own NPU stack is a separate route that ships today: `1bit serve --device onnx` runs Ryzen AI
-Software's ONNX Runtime GenAI (the RyzenAI provider) on the NPU, on Linux too, from the user's own
-install of it ([ONNX Runtime, Linux NPU](onnx.md#linux-npu)).
-
 ## A model directory
 
 ```

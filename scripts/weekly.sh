@@ -45,7 +45,7 @@ JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (laya only on its bump)
 # (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
-SUBMODULES=(hrx-system llama.cpp lemonade ryzenai-server ds4 tokenizers)
+SUBMODULES=(hrx-system llama.cpp lemonade ds4 tokenizers)
 mkdir -p "$LOGS"
 # pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
 # shellcheck source=scripts/pack-elf.sh
@@ -136,13 +136,8 @@ build() {
         extra+=(-DONEBIT_NPU_PRIVATE="$W/npu-kernels" -DONEBIT_NPU_RELEASE=ON)
         say "NPU kernels $(git -C "$W/npu-kernels" rev-parse --short HEAD): $(ls "$BUILD/npu/kernels" | wc -l) sealed sets"
     fi
-    # The ONNX backend ships with Microsoft's ONNX Runtime (GenAI) only: with RYZENAI_INSTALL_PATH
-    # set, build-onnx.sh would copy AMD's Ryzen AI Software libraries beside ryzenai-server and
-    # they would land in the package (package_checks refuses them too). The NPU through ONNX uses
-    # the user's own install at run time (docs/onnx.md, "Linux NPU").
-    unset RYZENAI_INSTALL_PATH
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
-        -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" -DONEBIT_ONNX=ON \
+        -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" \
         -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
         -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
@@ -277,9 +272,6 @@ stage_test() { run_tests; }
 #   npu       (with WEEKLY_NPU_KERNELS) every file under npu/kernels but layout.json is sealed, never a
 #             plaintext ELF; every ELF in the tarball is for the host (x86-64); the packed 1bit has no
 #             symbol table and its strings name no private source file and no build-machine home
-#   onnx      onnx/ holds ryzenai-server, Microsoft's libonnxruntime-genai / libonnxruntime and their
-#             licence texts, nothing else: no part of AMD's Ryzen AI Software (the RyzenAI / VitisAI
-#             providers, AMD_LICENSE, the AIE compiler libraries), which users install themselves
 # Checks the build's 1bit and every file in the tarball.
 package_checks() {  # package_checks <linux tarball>
     # (no `cmd | grep -q` here: under pipefail grep's early exit fails the pipeline on a match)
@@ -373,28 +365,6 @@ package_checks() {  # package_checks <linux tarball>
     local missing; missing=$(pack_missing_libs "$t")
     if [ -z "$missing" ]; then echo "ok   every library is packed (ldd: nothing missing beyond TheRock's runtime)"
     else echo "FAIL libraries ldd cannot find in $(basename "$1"):"; echo "$missing"; bad=1; fi
-    if [ -d "$t"/*/onnx ]; then
-        n=$(find "$t"/*/onnx -mindepth 1 \! \( -name ryzenai-server -o -name 'libonnxruntime-genai.so*' \
-                -o -name 'libonnxruntime.so*' -o -name '*.txt' \) -printf '%f\n' | tee >(cat >&2) | wc -l)
-        [ "$n" = 0 ] || { echo "FAIL onnx/ carries files beyond ryzenai-server and Microsoft's ONNX Runtime (Ryzen AI Software?)"; bad=1; }
-        for f in ryzenai-server-LICENSE.txt onnxruntime-LICENSE.txt onnxruntime-ThirdPartyNotices.txt \
-                 onnxruntime-genai-LICENSE.txt onnxruntime-genai-ThirdPartyNotices.txt; do
-            [ -f "$(echo "$t"/*/onnx)/$f" ] || { echo "FAIL onnx/$f is not in $(basename "$1")"; bad=1; }
-        done
-        # DT_RUNPATH $ORIGIN only: LD_LIBRARY_PATH must win so `1bit serve` can put a Ryzen AI
-        # venv's ONNX Runtime GenAI first (app/serve.cpp ryzenai_child_env), and no path may
-        # point into the build machine
-        f=$(echo "$t"/*/onnx/ryzenai-server)
-        n=$(readelf -d "$f" 2>/dev/null | grep -c '(RPATH)' || true)
-        [ "$n" = 0 ] || { echo "FAIL onnx/ryzenai-server has a DT_RPATH (LD_LIBRARY_PATH cannot override it)"; bad=1; }
-        n=$(readelf -d "$f" 2>/dev/null | sed -n 's/.*(RUNPATH).*\[\(.*\)\]/\1/p')
-        [ "$n" = '$ORIGIN' ] || { echo "FAIL onnx/ryzenai-server RUNPATH is '$n', not \$ORIGIN"; bad=1; }
-        n=$(strings -a "$f" | grep -c '^1bit-onnx-signal-shim' || true)
-        [ "$n" != 0 ] || { echo "FAIL onnx/ryzenai-server lacks the SIGTERM shim (scripts/onnx/signal_shim.c)"; bad=1; }
-        [ $bad = 0 ] && echo "ok   onnx/: ryzenai-server (RUNPATH \$ORIGIN, SIGTERM shim) and ONNX Runtime with their licences, no Ryzen AI Software"
-    else
-        echo "FAIL no onnx/ in $(basename "$1") (weekly builds -DONEBIT_ONNX=ON)"; bad=1
-    fi
     rm -rf "$t"
     return $bad
 }

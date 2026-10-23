@@ -25,7 +25,7 @@ so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|hrx|cpu|ds4|onnx] [--ctx-size N] [--alias NAME]
+           [--device auto|npu|hrx|cpu|ds4] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH]
            [--hrx-cwsr-placement=auto|on|off]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
@@ -132,7 +132,7 @@ MiniCPM4-8B, at 2K-262K context.
 
 A hung GPU dispatch (a wedged HRX queue, a #315 fault) stops llama-server's main loop, while its
 HTTP thread keeps answering `/health` with 200. So `1bit serve` checks two things itself, for the
-backends it runs as child processes (`hrx`, `cpu`, `ds4`, `onnx`; the in-process NPU route
+backends it runs as child processes (`hrx`, `cpu`, `ds4`; the in-process NPU route
 is not covered):
 
 - **`/health` follows the backend.** Once the model is loaded, serve asks each backend's own
@@ -180,7 +180,7 @@ the restart policy; serve builds none):
 - `LEMONADE_BACKEND_WATCHDOG_*` tune Lemonade's side. `onebit_args` in a recipe passes
   `--watchdog` to serve.
 
-A backend with no `/slots` (DwarfStar, ONNX, or a llama-server started with `--no-slots`)
+A backend with no `/slots` (DwarfStar, or a llama-server started with `--no-slots`)
 shows progress only by sending bytes, so on those only streamed requests are judged: a long
 non-streamed answer and a hang look the same from outside. `tests/watchdog_serve.sh` (ctest
 `watchdog_serve`, CI included) checks all of this against `tests/fake_backend.py`, whose
@@ -194,7 +194,7 @@ Lemonade's own `/metrics` already reports, per model:
 - GTT plus VRAM, as `lemonade_vram_used_gb`.
 
 So `GET /metrics` on serve adds only what the engine sees and Lemonade cannot, in Prometheus
-text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`, `ds4`, `onnx`).
+text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`, `ds4`).
 The in-process NPU route has none yet. serve's own series come first. The backend's own
 `/metrics` follows when it answers one: llama-server is started with `--metrics`, so its
 `llamacpp:*` series follow.
@@ -252,7 +252,7 @@ two processes (lemond, llama-server) instead of two hops and three.
 |---|---|---|
 | 0 | the plan is on stdout | starts it |
 | 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
-| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `onnx` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
 
 Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
 `LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
@@ -498,8 +498,8 @@ Stopping `serve` (SIGTERM, SIGINT) sends each backend SIGTERM and waits
 `ONEBIT_BACKEND_STOP_GRACE_S` seconds (default 30) before SIGKILL, with a warning line
 first; a backend that already exited is reaped where `serve` noticed, so its stop
 is free. A backend that exits on its own ends `serve` with exit code 1 and the way it
-ended on stderr (`a cpu backend exited: signal 6`). The grace matters for the NPU
-([onnx.md](onnx.md), "Linux NPU").
+ended on stderr (`a cpu backend exited: signal 6`). The grace matters for a backend that
+holds an NPU hardware context: it must get to close it itself.
 
 ## The Project Manager (`--pm`)
 
@@ -522,7 +522,7 @@ URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes 
 `convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. With it, llama-server runs
 with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that attend to an image
 bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B were checked on the
-removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU, DwarfStar and ONNX routes take no `--mmproj`.
+removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU and DwarfStar routes take no `--mmproj`.
 
 ## Multi-token prediction (`--mtp`)
 

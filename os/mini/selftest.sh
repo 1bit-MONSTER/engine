@@ -67,61 +67,19 @@ case "$RESP" in
     *)  say "  answer    : none (${RESP:-empty response})"
         say "RESULT-LM  : FAIL - Lemonade is up but the chat did not answer (the NPU route is tested below anyway)" ;;
 esac
-# The engine's own NPU route: only a .q4nx model directory can take --device npu (it refuses a .gguf,
-# with no silent fallback), and the sealed kernel sets travel beside the engine. This is the proof the
-# appliance exists for, so run it here and put the placement line in the log.
-NPUDIR=""
-for d in /data/models/*/ /tmp/npu2/; do
-    [ -f "$d/model.q4nx" ] && { NPUDIR=$d; break; }
-done
-if [ -z "$NPUDIR" ]; then
-    say "  NPU route  : skipped - no .q4nx model directory under /data/models or /tmp/npu2"
+# THE NPU PROOF, THROUGH THE PRODUCT PATH. Lemonade runs the 1bit engine as its onebit backend, and the
+# engine says where it put the model: "1bit unified: loading <model> on the NPU" then "on the private route
+# dx: ...". The chat above already triggered that load, so read the engine's own words rather than starting
+# a SECOND engine: the NPU takes one engine context at a time, and a second one poisons it - "npu runtime:
+# invalid call (code 614): state 8" - which left Lemonade unable to load a model until a reboot. Proving it
+# through Lemonade is also the thing the owner actually uses.
+ONNPU=$(grep -a "1bit unified: loading .* on the NPU" /tmp/lemond.log 2>/dev/null | tail -1)
+PLACE=$(grep -a "1bit unified: on the private route" /tmp/lemond.log 2>/dev/null | tail -1)
+if [ -n "$ONNPU" ] && [ -n "$PLACE" ]; then
+    say "  NPU model  : $(printf '%s' "$ONNPU" | sed 's/.*1bit unified: loading //')"
+    say "  placement  : $(printf '%s' "$PLACE" | sed 's/.*1bit unified: //' | cut -c1-100)"
+    say "  RESULT-NPU : PASS - Lemonade ran the engine on the NPU (the engine's own log lines)"
 else
-    say "  NPU model  : $NPUDIR"
-    1bit serve -m "$NPUDIR" --device npu --port 18001 > /tmp/selftest-npu.log 2>&1 &
-    npupid=$!
-    i=0
-    while [ $i -lt 40 ]; do
-        grep -q "ready" /tmp/selftest-npu.log 2>/dev/null && break
-        grep -qiE "failed|error|refus" /tmp/selftest-npu.log 2>/dev/null && break
-        sleep 3; i=$((i+1))
-    done
-    PLACE=$(grep -a "private route" /tmp/selftest-npu.log 2>/dev/null | tail -1)
-    RESP=$(wget -q -O - --header='Content-Type: application/json' \
-        --post-data='{"model":"x","messages":[{"role":"user","content":"/no_think Reply with exactly: NPU OK"}],"max_tokens":32,"temperature":0}' \
-        http://127.0.0.1:18001/v1/chat/completions 2>/dev/null)
-    kill $npupid 2>/dev/null
-    j=0; while kill -0 $npupid 2>/dev/null && [ $j -lt 15 ]; do j=$((j+1)); sleep 1; done
-    if [ -n "$PLACE" ]; then
-        say "  placement  : $(echo "$PLACE" | sed 's/.*1bit unified: //' | cut -c1-100)"
-    else
-        say "  placement  : none (engine did not reach the NPU route)"
-    fi
-    if [ -n "$RESP" ]; then
-        say "  NPU answer : $(printf '%s' "$RESP" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)"
-        say "  NPU rate   : $(printf '%s' "$RESP" | sed -n 's/.*"predicted_per_second":\([0-9.]*\).*/\1/p' | head -1 | awk '{printf "%.1f tok/s", $1}')"
-        say "  RESULT-NPU : PASS - the engine answered on the NPU route"
-    else
-        say "  RESULT-NPU : FAIL - no answer from the NPU route (see /tmp/selftest-npu.log)"
-    fi
+    say "  RESULT-NPU : FAIL - the engine never reported loading on the NPU (see /tmp/lemond.log)"
 fi
-
-# The NPU takes ONE engine context at a time and does not hand it back by itself: once the test's engine
-# is gone the device refuses the next call - "npu runtime: invalid call (code 614): state 8" - which is
-# what left Lemonade's own engine unable to load a model until a reboot. Stop what Lemonade holds, reload
-# the driver, and then PROVE the handoff by asking Lemonade the same question on the same NPU.
-wget -q -O - ${AUTH:+--header="$AUTH"} --header='Content-Type: application/json' \
-    --post-data='{}' "http://127.0.0.1:$PORT/api/v1/unload" >/dev/null 2>&1
-if [ -c /dev/accel/accel0 ]; then
-    modprobe -r amdxdna 2>/dev/null; sleep 2; modprobe amdxdna 2>/dev/null
-    j=0; while [ ! -c /dev/accel/accel0 ] && [ $j -lt 20 ]; do j=$((j+1)); sleep 1; done
-fi
-HAND=$(wget -q -O - ${AUTH:+--header="$AUTH"} --header='Content-Type: application/json' \
-    --post-data="{\"model\":\"${NAME:-x}\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: NPU OK\"}],\"max_tokens\":24,\"temperature\":0}" \
-    "http://127.0.0.1:$PORT/api/v1/chat/completions" 2>/dev/null)
-case "$HAND" in
-    *'"content"'*)
-        say "  device    : NPU handed back - Lemonade answered '$(printf '%s' "$HAND" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)' on it after the test" ;;
-    *)  say "  device    : WARN - Lemonade did not answer after the NPU test; it comes back on the next boot" ;;
-esac
 say "  evidence  : appended to $LOG"

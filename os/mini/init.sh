@@ -113,6 +113,9 @@ screen_login() {
     ( while :; do setsid -c /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
 }
 
+# Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
+# framebuffer /dev/console is no longer what is painted, and the screen must never be the part that lies.
+mc() { while IFS= read -r l; do for c in /dev/console /dev/tty1; do [ -w "$c" ] && printf '%s\n' "$l" > "$c" 2>/dev/null; done; done; }
 MODE=live
 if [ -c /dev/console ]; then
     {
@@ -124,8 +127,8 @@ if [ -c /dev/console ]; then
       echo "   3) Root shell (no services)"
       echo "   4) Power off"
       echo
-    } > /dev/console 2>/dev/null
-    printf "  choice: " > /dev/console 2>/dev/null
+    } | mc
+    printf "  choice: " | mc
     i=0
     while [ $i -lt 12 ]; do
         if read -r -t 1 -n 1 c < /dev/console 2>/dev/null; then
@@ -138,7 +141,7 @@ if [ -c /dev/console ]; then
         fi
         i=$((i+1))
     done
-    echo > /dev/console 2>/dev/null
+    printf "\n" | mc
 fi
 case "$MODE" in
     off)  say "powering off (choice 4)"; sync; poweroff -f ;;

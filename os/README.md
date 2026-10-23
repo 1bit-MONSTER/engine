@@ -172,6 +172,53 @@ sealed artifact, that `LICENSE-BINARY`/`NOTICE-BINARY` are present, and the imag
 The rows that need the hardware - `gpu`, `npu`, `models`, `chat-hrx`, `chat-npu` - report
 `SKIP(reason)` in a VM.
 
+## Install it on the machine's own disk
+
+The stick is the installer. Boot it as above, then from its shell (console or SSH):
+
+```sh
+1bit-selftest                       # the live boot works: RESULT: PASS, and the NPU where there is one
+1bit-install /dev/nvme0n1 --yes     # ONE internal disk, named explicitly; this destroys it
+```
+
+`1bit-install` lays the disk out exactly as the stick is laid out, with the same tool the image is
+built with: a 512 MB EFI system partition carrying the signed chain this boot came from (shim, grub,
+`vmlinuz`, `initramfs`, `grub.cfg` - byte for byte, so the machine's MOK enrolment needs no change),
+and a `1BIT-DATA` ext4 partition filling the rest, carrying `models/`, `lemonade/` (its backends,
+config, cache and the API key), the NPU kernel sets and `ssh/` from the stick's `/data`.
+
+It refuses, before writing anything: to run without `--yes`; to be given a partition instead of a
+whole disk; to point at a removable device; to point at the disk this live boot is running from; to
+point at a disk with anything mounted on it. Then it prints the disk's model, size and current
+partition table - what it is about to destroy - and waits 10 seconds before the first write.
+
+Power off, remove the stick, boot the machine from the disk. It boots the same init, which finds
+`/data/.installed` and says so:
+
+```
+1bit OS  v2026.43  -  INSTALLED on this machine. /data is on its disk; ...
+MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is /dev/nvme0n1p2.
+```
+
+and `/etc/1bit/installed` exists instead of `/etc/1bit/live` (the menu a stick shows is skipped -
+there is nothing to choose). Then `1bit-release-check` again: the same PASS/FAIL list as on the stick,
+now reporting the INSTALLED mode. `1bit-selftest` works too and must report `mode : INSTALLED`,
+`RESULT: PASS` and, on hardware with an NPU, `RESULT-NPU: PASS` with the placement line in
+`/data/selftest.log`.
+
+**Secure Boot.** The install copies the ESP as it is, so the kernel and initramfs on the disk are the
+same MOK-signed files the stick booted; the machine's MOK enrolment (`mokutil --list-enrolled`) is
+not touched by an install. If the firmware does not offer the disk on its own, add an entry pointing
+at `\EFI\BOOT\BOOTX64.EFI` on its partition 1 (on a Linux box: `efibootmgr -c -d /dev/nvme0n1
+-p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI'`). Booting the stick again is unchanged and does not
+touch the installed disk: that is how you get back to a live system (or to reinstall).
+
+What the VM proves (`os/mini/vmtest.sh`, which now also installs onto a virtual NVMe and boots from
+it with no stick attached): the installer's refusals, the install itself, the INSTALLED banner and
+`/etc/1bit/installed`, `/data` coming from the installed disk, Lemonade up with its key and answering
+a chat, and `1bit-selftest` reporting INSTALLED. What only the real machine can prove: that this
+firmware boots the disk on its own, and the NPU on it.
+
 ## Check it without the hardware
 
 ```sh
@@ -183,8 +230,10 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 4G -kernel /boot/vmlinuz-$(uname -r)
 NPU firmware are in place and start, that the image carries no XRT library, print `1BIT-OS CHECK PASS` or `FAIL`, and power
 off.
 
-`os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI, on QEMU's
-restricted network (nothing outside the VM is reachable, so the stick has to work offline), with
+`os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI, installs it
+onto an empty virtual NVMe with `1bit-install` (checking every refusal first), boots from that
+disk with no stick attached, and checks all of it; the network is QEMU's restricted one (nothing
+outside the VM is reachable, so the stick has to work offline), with
 Lemonade's `"host": "0.0.0.0"` and a `LEMONADE_API_KEY` on the stick. It checks over SSH and HTTP
 that Lemonade's web app loads, that Lemonade refuses a request without the key, that
 `/api/v1/models` lists the stick's model, and that Lemonade answers a chat request with it. The VM
@@ -203,4 +252,6 @@ being reused after a reboot, Lemonade's Vulkan backends on RADV, `llamacpp-hrx`,
 - A Loom kernel cache built ahead of time, so the first boot needs no compile.
 - The image split: a base (the EFI file and an empty data partition) and Lemonade's backends as a
   separate bundle for the data partition.
+- An install that can also grow `1BIT-DATA` over a disk whose firmware needs a partition table it did
+  not write, and an upgrade path that keeps `/data` while replacing the ESP.
 - Every piece pinned upstream and bumped by a workflow, like the rest of the engine.

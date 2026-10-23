@@ -32,7 +32,7 @@ echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"
 # bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
 # PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
 # comes up with no network at all, which looks exactly like a hang.
-for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod vfat ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
 # network: DHCP on every wired interface
@@ -71,6 +71,12 @@ if ! grep -q " /data " /proc/mounts; then
 fi
 stage "stick mounted at ${data:-nothing}"
 
+# Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
+# screen you have to guess about. Defined before its first use: it used to sit below the kernel link
+# line, so the console lost that line to "say: not found" (seen in the VM's serial log).
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
+    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
+
 # The sealed NPU kernels live on the stick (they used to be inside the RAM image, which made it too big
 # to load): link them to the path the engine looks for, beside itself.
 if [ -d /data/npu/kernels ] && [ -d /home ]; then
@@ -79,10 +85,6 @@ if [ -d /data/npu/kernels ] && [ -d /home ]; then
     say "[kernels] $(ls /data/npu/kernels | wc -l) sealed NPU sets linked beside the engine"
 fi
 
-# Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
-# screen you have to guess about.
-say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
-    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
 n=0
 step() { n=$((n+1)); say "[$n] $*"; }
 
@@ -96,7 +98,11 @@ screen_login() {
     chvt 1 2>/dev/null || true
     {
       echo
-      echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+      if [ "$INSTALLED" = 1 ]; then
+        echo "  1bit OS  v2026.43  -  INSTALLED on this machine. /data is on its disk; the engine and Lemonade start from here."
+      else
+        echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+      fi
       echo "  ----------------------------------------------------------------------------------------"
       echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
       echo "   lemonade list                 the models;  lemonade chat Qwen3-0.6B-1bit"
@@ -116,8 +122,17 @@ screen_login() {
 # Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
 # framebuffer /dev/console is no longer what is painted, and the screen must never be the part that lies.
 mc() { while IFS= read -r l; do for c in /dev/console /dev/tty1; do [ -w "$c" ] && printf '%s\n' "$l" > "$c" 2>/dev/null; done; done; }
+# An installed disk carries /data/.installed (1bit-install writes it). The same init then boots the
+# appliance from the disk: no stick menu to offer, and INSTALLED instead of LIVE on the screen and in
+# /etc/1bit. Nothing else about the boot changes - same initramfs, same signed chain.
+INSTALLED=0
+grep -q " /data " /proc/mounts && [ -e /data/.installed ] && INSTALLED=1
+# this boot's state lives here, and init makes it rather than trusting the image to carry it: mkimage.sh
+# creates /etc/1bit after it packs the initramfs, so the directory was never in any image and the marker
+# below was silently lost (the installed boot reported INSTALLED on screen and no marker in /etc/1bit)
+mkdir -p /etc/1bit 2>/dev/null
 MODE=live
-if [ -c /dev/console ]; then
+if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
       echo "  1bit OS  v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
@@ -253,9 +268,15 @@ lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
-echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
-echo "      Reboot to discard everything; only /data on the stick persists."
-touch /etc/1bit/live 2>/dev/null
+if [ "$INSTALLED" = 1 ]; then
+    echo "MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is $(findfs LABEL=1BIT-DATA 2>/dev/null)."
+    echo "      Reboot to restart it; the install is permanent (1bit-install, os/README.md)."
+    touch /etc/1bit/installed 2>/dev/null
+else
+    echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
+    echo "      Reboot to discard everything; only /data on the stick persists."
+    touch /etc/1bit/live 2>/dev/null
+fi
 echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
 echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"

@@ -107,8 +107,12 @@ echo "Lemonade downloads during the test: ${dl:-?} (QEMU's network is restricted
 # --- what this image is FOR: 1bit OS = Lemonade with the 1bit engine embedded (os/README.md) ---
 # The LIVE banner has to reach the console: the serial line is the VM's screen, and a blank screen is
 # what made a working appliance look dead on real hardware (os/mini/init.sh writes to tty1 as well).
-if grep -qi "1bit OS" "$out/serial.log" 2>/dev/null; then
-    echo "Live banner on the console: $(grep -i "1bit OS" "$out/serial.log" | head -1 | cut -c1-78)"
+# grub's own menu says "1bit OS" too, so match init's live-mode banner, which say() writes to
+# /dev/console (= this serial line in the VM) and to tty1.
+if grep -q "LIVE. You are root, on RAM" "$out/serial.log" 2>/dev/null; then
+    echo "Live banner on the console: $(grep "LIVE. You are root, on RAM" "$out/serial.log" | head -1 | cut -c1-72)"
+elif ssh_vm 'test -e /etc/1bit/live' 2>/dev/null; then
+    echo "Live banner on the console: not on the serial line, but the live marker exists (tty1 only)"; ok=0
 else echo "Live banner on the console: missing from $out/serial.log"; ok=0; fi
 
 # The self-test has to run from the image. It cannot PASS in a VM - there is no Radeon GPU and no XDNA
@@ -127,12 +131,22 @@ esac
 # Lemonade's own catalog carries the three NPU entries by name (catalog: onebit, recipe_options
 # onebit_backend npu). They must LIST in the image - loading is impossible here because the NPU cannot
 # run in QEMU, and saying so is the point of this check.
-for want in Qwen3-0.6B-NPU-1bit Qwen3-1.7B-NPU-1bit Qwen3-4B-NPU-1bit; do
-    case " $models " in
-        *" $want("*) echo "Lemonade lists the catalog NPU entry by name: $want";;
-        *) echo "Lemonade does not list the catalog NPU entry: $want"; ok=0;;
+catalog=$(ssh_vm 'cat /opt/lemonade/bin/resources/server_models.json 2>/dev/null' 2>/dev/null || true)
+if [ -n "$catalog" ]; then
+    for want in Qwen3-0.6B-NPU-1bit Qwen3-1.7B-NPU-1bit Qwen3-4B-NPU-1bit; do
+        case "$catalog" in
+            *"\"$want\""*) echo "The image's catalog carries the NPU entry by name: $want";;
+            *) echo "The image's catalog is missing the NPU entry: $want"; ok=0;;
+        esac
+    done
+    case "$catalog" in
+        *'\"onebit_backend\": \"npu\"'*) echo "The catalog's NPU entries carry recipe_options.onebit_backend: npu";;
+        *) echo "The catalog's NPU entries do not carry recipe_options.onebit_backend"; ok=0;;
     esac
-done
+else echo "could not read the image's server_models.json"; ok=0; fi
+# and say plainly why they are not in the listing here
+echo "Note: /api/v1/models cannot list them under QEMU - this Lemonade hides every onebit model when the" \
+     "machine has no AMD GPU and no NPU (the stick's own onebit register answers model_not_found too)."
 
 # Guest tier intact: take the engine binary away and Lemonade must stop offering the onebit entries;
 # put it back and they return. The NPU entries above are exactly the guest-tier ones.

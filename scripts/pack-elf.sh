@@ -108,8 +108,13 @@ $f: .comment names the compiler"
         strings -a "$f" 2>/dev/null | grep -qE "^/(home|Users|root)/[A-Za-z0-9_./-]+" &&
             out="$out
 $f: embedded build-machine path"
-        readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' | grep -qE "Library (runpath|rpath): \[/" &&
-            out="$out\n$f: absolute RUNPATH"
+        # An absolute RUNPATH is only acceptable under the toolchain root: some shipped programs link the
+        # SDK's own libraries (whose closure is far larger than the package), and the release needs that
+        # toolchain to run anyway.
+        readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' |
+            sed -n 's/.*Library \(runpath\|rpath\): \[\(.*\)\]/\2/p' | tr ':' '\n' |
+            grep -E "^/" | grep -vE "^(/opt/rocm-therock|$ONEBIT_TOOLCHAIN_ROOT)/" | grep -q . &&
+            out="$out\n$f: absolute RUNPATH outside the toolchain root"
     done < <(find "$1" -type f -print0)
     [ -z "$out" ] || printf "%b\n" "$out"
 }

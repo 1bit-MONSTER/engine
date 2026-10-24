@@ -93,12 +93,9 @@ fi
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
 # it; RUNPATH entries outside the build tree (TheRock in /opt) stay, since HRX needs TheRock anyway.
 pack_localize "$stage" "$build"
-# Every shipped program and library finds its libraries beside itself and nowhere else: replace whatever
-# RUNPATH the build left (the build tree, an SDK under /opt) with $ORIGIN.
-while IFS= read -r -d '' f; do
-    pack_is_elf "$f" || continue
-    patchelf --set-rpath '\$ORIGIN' "$f" 2>/dev/null || patchelf --remove-rpath "$f" 2>/dev/null || true
-done < <(find "$stage" -type f -print0)
+# pack_localize gives every program and library $ORIGIN plus whatever SDK entries its link needed; the
+# engine binary at the top of the tree is the one it does not visit (depth 1), so drop its rpath here.
+patchelf --remove-rpath "$stage/1bit"
 
 # symbol tables and debug info out of every program and library: the release ships compiled code
 # only (docs/releases.md, "Private components"); the dynamic symbols they link by stay

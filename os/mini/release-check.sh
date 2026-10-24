@@ -218,17 +218,17 @@ fi
 # The signature is checked by the engine at load (it holds only the release public key and refuses
 # a file its set's manifest does not cover), so this row proves the bytes on the stick are the ones
 # that were signed and that nothing unlisted rides along.
-SETS=$(find /data/npu/kernels -name layout.json 2>/dev/null | wc -l)
+SETS=$(find /data/npu/kernels -name manifest 2>/dev/null | wc -l)
 if [ "$SETS" = 0 ]; then
-    fail npu-kernels "no NPU kernel set on the data partition (find /data/npu/kernels -name layout.json)"
+    fail npu-kernels "no NPU kernel set on the data partition (find /data/npu/kernels -name manifest)"
 else
     BAD=0
     for set in $(find /data/npu/kernels -mindepth 1 -maxdepth 1 -type d 2>/dev/null); do
-        [ -f "$set/layout.json" ] || continue
+        [ -f "$set/manifest" ] || continue
         if [ ! -s "$set/manifest" ] || [ "$(stat -c%s "$set/manifest.sig" 2>/dev/null || echo 0)" != 64 ]; then
             BAD=$((BAD + 1)); say "      no signed manifest in $set"; continue
         fi
-        for f in "$set"/layout.json "$set"/layer1_*/layer1.elf; do
+        for f in "$set"/*/layer1.elf; do
             [ -f "$f" ] || continue
             rel=${f#"$set"/}
             want=$(awk -v p="$rel" '$1=="file" && $4==p {print $2}' "$set/manifest" 2>/dev/null)
@@ -238,7 +238,7 @@ else
         done
         for f in $(find "$set" -type f 2>/dev/null); do
             rel=${f#"$set"/}
-            case "$rel" in layout.json|manifest|manifest.sig) continue ;; esac
+            case "$rel" in manifest|manifest.sig) continue ;; esac
             [ -n "$(awk -v p="$rel" '$1=="file" && $4==p {print $2}' "$set/manifest" 2>/dev/null)" ] ||
                 { BAD=$((BAD + 1)); say "      unlisted file: $f"; }
         done

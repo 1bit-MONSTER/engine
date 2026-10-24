@@ -470,8 +470,8 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     # were making the initramfs 103 MB compressed, which is what grub was failing to load on real
     # hardware (the machine's own 37 MB initrd loads fine). init.sh links them to the engine's
     # expected path at boot, so the engine still finds npu/kernels beside itself.
-    # Only the artifact surface goes on the stick: <set>/layout.json, <set>/layer1_*/layer1.elf,
-    # manifest and manifest.sig - the allowlist scripts/package-linux.sh packs. A set directory also
+    # Only the artifact surface goes on the stick: <set>/manifest, <set>/manifest.sig and
+    # <set>/<id>/layer1.elf - the allowlist scripts/package-linux.sh packs. A set directory also
     # holds layer1.work/ (plaintext
     # MLIR, object files, intermediate ELFs) because that is where it was built, so copying the tree
     # would put the kernel method on the stick; the guard that caught that used `find ... | head -3`,
@@ -479,10 +479,10 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     mkdir -p "$out/data.dir/npu/kernels"
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")
-        [ -f "$set/layout.json" ] || continue
+        [ -f "$set/manifest" ] || continue
         mkdir -p "$out/data.dir/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$set/manifest" "$set/manifest.sig" "$out/data.dir/npu/kernels/$setname/"
-        for layer in "$set"/layer1_*/; do
+        cp -a "$set/manifest" "$set/manifest.sig" "$out/data.dir/npu/kernels/$setname/"
+        for layer in "$set"/*/; do
             [ -f "$layer/layer1.elf" ] || continue
             mkdir -p "$out/data.dir/npu/kernels/$setname/$(basename "$layer")"
             cp -a "$layer/layer1.elf" "$out/data.dir/npu/kernels/$setname/$(basename "$layer")/"
@@ -494,10 +494,10 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     # listed in it with the same sha256: a set that does not verify never reaches a stick.
     bad=0
     for set in "$out/data.dir/npu/kernels"/*/; do
-        [ -f "$set/layout.json" ] || continue
+        [ -f "$set/manifest" ] || continue
         [ -s "$set/manifest" ] && [ "$(stat -c%s "$set/manifest.sig" 2>/dev/null || echo 0)" = 64 ] ||
             { echo "npu/kernels: $(basename "$set") has no signed manifest"; bad=1; continue; }
-        for elf in "$set"/layer1_*/layer1.elf; do
+        for elf in "$set"/*/layer1.elf; do
             [ -f "$elf" ] || continue
             rel=${elf#"$set"}
             want=$(awk -v p="$rel" '$1=="file" && $4==p {print $2}' "$set/manifest")

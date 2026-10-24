@@ -49,7 +49,7 @@ fails a pin that leaves a gate model's node off HRX.
 |---|---|---|
 | `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
 | `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), pinned on branch `1bit/e3e6a976-pin-6` (the commit `config/hrx-system-hold.config` names; `1bit/main` is where the unheld bump merges AMD) | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
-| private HIP kernels | [1bit-MONSTER/gpu-kernels](https://github.com/1bit-MONSTER/gpu-kernels) (not a submodule: a build points at a checkout with `-DONEBIT_GPU_PRIVATE`) | `4f586cac` — the commit the release builds and the hardware gate were run at |
+| private HIP kernels | a private kernel add-on (not a submodule: a build points at a checkout with `-DONEBIT_GPU_PRIVATE`) | `4f586cac` — the commit the release builds and the hardware gate were run at |
 
 - **Our hrx-system commits** (since 2026-10-18 on branch `1bit/e3e6a976-pin-6` of our fork, on
   AMD's `e3e6a9766ccb`): two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and
@@ -697,7 +697,7 @@ public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVAT
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
 that hook. Without the option the build is unchanged. The release builds with it, from the
-commit pinned in `config/gpu-kernels.config`, so the release binaries carry the kernels as
+commit pinned in the release config, so the release binaries carry the kernels as
 compiled code objects while their source stays private ([releases.md](releases.md), "Private
 components"). To drop the add-on from an existing
 build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).

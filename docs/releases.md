@@ -41,9 +41,9 @@ Release sha and pins (the submodules this candidate is built from):
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
 | Lemonade (fork) | `27abcc24da99` |
-| gpu-kernels (private, HIP) | `744bd713d968` (`config/gpu-kernels.config`) |
-| npu-kernels (private, sealed) | `17ed5be7a28a` (`config/npu-kernels.config`) |
-| npu-runtime (private) | `ce9fa59adf95` (`config/npu-runtime.config`) |
+| private kernel add-on (HIP) | `744bd713d968` |
+| private NPU kernel set | `17ed5be7a28a` |
+| private NPU runtime | `ce9fa59adf95` |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
 | DwarfStar / tokenizers | `5b013dc1bb` / `3012770722` |
@@ -163,8 +163,8 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 
 The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
 release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's `npu` backend.
-The NPU kernels are closed too: they ship as compiled, encrypted artifacts (`config/npu-kernels.config`,
-`ONEBIT_NPU_PRIVATE`) that `1bit` verifies and decrypts in memory at load, failing cleanly on a
+The NPU kernels are closed too: they ship as sealed artifacts that `1bit` verifies and opens in
+memory at load, failing cleanly on a
 wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
 ([npu.md](npu.md)). The release package carries them, and serves dense Qwen3 (0.6B, 1.7B, 4B)
 on the NPU.

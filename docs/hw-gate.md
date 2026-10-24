@@ -37,12 +37,12 @@ PRs from forks never run there: the runner is the owner's box.
 `scripts/hw-gate.sh` builds this checkout's HRX pair (`third_party/llama.cpp` and
 `third_party/hrx-system`) with the configuration of `cmake/hrx.cmake`, plus `test-backend-ops`
 and `llama-perplexity`, with the private HIP kernels compiled in as the release builds them: the
-gpu-kernels add-on at the commit `config/gpu-kernels.config` pins, fetched by
-`scripts/fetch-private.sh` with the runner box's `gh` login and passed as
-`GGML_HRX_HIP_ADDON_DIR`. A llama.cpp pin and a gpu-kernels pin that do not compile together fail
-the build step (2026-10-20: gpu-kernels be68256d used `HipSetRowsArgs`, which the pinned
+private add-on at the commit the release config pins, fetched by
+the private-fetch helper with the runner box's `gh` login and passed as
+`GGML_HRX_HIP_ADDON_DIR`. A llama.cpp pin and an add-on pin that do not compile together fail
+the build step (2026-10-20: an add-on pin used a kernel-side type the pinned
 llama.cpp did not have yet), and so does a build whose `libggml-hrx.so` lacks the add-on. A box
-that cannot read gpu-kernels stops with exit 2; `HW_GATE_PRIVATE=0` gates the public plumbing
+that cannot read the add-on stops with exit 2; `HW_GATE_PRIVATE=0` gates the public plumbing
 only. On a failed build the job log shows the compiler's error lines without their source
 excerpts, since the log is public and the add-on's sources are not. It then runs six checks:
 

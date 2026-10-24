@@ -465,7 +465,8 @@ when asked for any of these:
 The DFlash2 one-server route (a Hadamard-rotated file with W4A4 prompts and DFlash2 decode on ROCm)
 went with them, and so did its recipes (`rotated-moe-ub1024`, `rocm-dflash-p-min-0.4`), and so did
 the H32 format it served (`tools/hadamard_q4_0.py` is removed; serve refuses those files). `--dflash`
-itself stays, on HRX and the CPU.
+itself stays, on HRX and the CPU, but a DFlash2 drafter does not load on the llama.cpp this release pins
+(see [DFlash draft models](#dflash-draft-models---dflash)); use `--mtp` there too.
 
 A build without the add-on answers a Qwen3.6-35B-A3B directory saying that its NPU route is not
 part of this build. `--npu-opt KEY=VALUE` passes an option through to an add-on route. On a route that keeps its cache between requests,
@@ -621,6 +622,12 @@ Measured with the fork's Vulkan `llama-server` on Strix Halo, 2026-10-01. Settin
 - **`-lm mmap`:** Flash-Next needs it on this llama.cpp. Without it, the 27.5 GiB per-layer embedding table is copied into RAM next to the ~82 GB the GPU holds, which does not fit in 128 GB.
 
 ## DFlash draft models (`--dflash`)
+
+> **Not in this release's pin.** The llama.cpp this release pins (`851fa6c8`) cannot load a DFlash2 drafter:
+> `1bit serve --dflash <draft.gguf>` stops at model load with
+> `done_getting_tensors: wrong number of tensors; expected 81, got 58`, because DFlash2 support (the candidate
+> selector and the conv heads) is not on the fork branch that pin tracks. The port is queued for the next pin.
+> Use `--mtp` - the in-file MTP head - as the drafter here: it is supported.
 
 `--dflash <draft.gguf>` uses a DFlash block-diffusion draft model instead of the MTP head: the
 draft emits a whole block of tokens in one pass, reading the model's hidden states, and the

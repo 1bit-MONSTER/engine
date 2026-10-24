@@ -88,7 +88,7 @@ endif()
 set(ONEBIT_HRX_LIBHSA "${_hrx_libhsa_first}" CACHE FILEPATH "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)")
 message(STATUS "ONEBIT_HRX: HSA runtime ${ONEBIT_HRX_LIBHSA}")
 
-# Private GPU kernels (docs/hrx.md, "Private HIP kernels"): a checkout of the private gpu-kernels
+# Private GPU kernels (docs/hrx.md, "Private HIP kernels"): a checkout of the private add-on
 # repository whose addons/hip-hrx is built into the HRX llama.cpp (its GGML_HRX_HIP_ADDON_DIR hook).
 set(_hrx_gpu_private_args)
 if(ONEBIT_GPU_PRIVATE)

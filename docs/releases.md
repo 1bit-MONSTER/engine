@@ -42,7 +42,7 @@ Release sha and pins (the submodules this candidate is built from):
 | hrx-system | `82804197bcbe` |
 | Lemonade (fork) | `27abcc24da99` |
 | private kernel add-on (HIP) | `744bd713d968` |
-| private NPU kernel set | `17ed5be7a28a` |
+| private NPU kernel set (signed) | `17ed5be7a28a` |
 | private NPU runtime | `ce9fa59adf95` |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
@@ -108,9 +108,9 @@ context (`#466`), allocation safety bounds the program cache and poisons a devic
 (`#486`), and the ZAYA1-8B NaN re-check closed on **120 fresh loads, 0 NaN** at the current pins
 (`#433`).
 
-**NPU (sealed).** The gate gained an NPU phase and the packages carry **only the sealed kernel
-sets** — a plaintext artifact fails the packaging check, and the launcher refuses an unsealed one
-(`#503`, `#505`, `#509`, `#512`). The 0.6B gate phase measures **90.33 tok/s**; the OS image proves
+**NPU (signed).** The gate gained an NPU phase and the packages carry **only signed kernel sets** —
+every shipped file is listed in the set's signed manifest, a set that does not verify fails the
+packaging check, and the engine refuses an unlisted kernel file (`#503`, `#505`, `#509`, `#512`). The 0.6B gate phase measures **90.33 tok/s**; the OS image proves
 `amd_pmf` sensors and the NPU from the booted image (`#517`, `#523`). The runtime's public header and
 prebuilt-library build are in the tree (`#467`, `#479`, `#469`).
 
@@ -121,7 +121,7 @@ the Ubuntu 26.04 PPA's `lemond` runs our HRX server unchanged (`#483`). Synced t
 one request in role, `lemonade bench ... chat-short` — and 3 NPU entries (fork `#19`, `#20`, `#23`);
 chat-short spans 43.4 (Qwen3-8B) to 330.7 tok/s (Qwen3-0.6B), 0 faults in 16 holds.
 
-**1bit OS.** The image carries the sealed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
+**1bit OS.** The image carries the signed NPU sets and the new Lemonade (`#512`, `#523`), the UKI is
 signed with the enrolled MOK so a stick boots with Secure Boot on (`#513`), the USB4 v2 / Thunderbolt
 stack is loaded (`#514`), and `amd_pmf` sensors come up from the booted image (`#517`). The install
 step is not in this candidate (branch `1bit/os-install`).
@@ -163,17 +163,18 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 
 The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
 release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's `npu` backend.
-The NPU kernels are closed too: they ship as sealed artifacts that `1bit` verifies and opens in
-memory at load, failing cleanly on a
-wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
-([npu.md](npu.md)). The release package carries them, and serves dense Qwen3 (0.6B, 1.7B, 4B)
+The NPU kernels are closed too: they ship as compiled artifacts with a signed manifest per set
+(`ONEBIT_NPU_PRIVATE`), and `1bit` verifies each kernel against that manifest at load, failing
+cleanly on a modified or unlisted file with no network callback of any kind ([npu.md](npu.md)). The
+release package carries them, and serves dense Qwen3 (0.6B, 1.7B, 4B)
 on the NPU.
 
-`scripts/weekly.sh` packs them by default (`WEEKLY_NPU_KERNELS=0` builds without): the sealed
-kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels only
-(`ONEBIT_NPU_RELEASE`), the `lemond-onebit` launcher sets `ONEBIT_KCRYPT_REQUIRE_SEALED=1`, and the package checks refuse a plaintext kernel,
-an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The
-release machine holds the kernel key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
+`scripts/weekly.sh` packs them by default (`WEEKLY_NPU_KERNELS=0` builds without): each signed
+kernel set goes beside `1bit` in `npu/kernels`, the build loads signed sets only
+(`ONEBIT_NPU_RELEASE`), the `lemond-onebit` launcher sets `ONEBIT_KMANIFEST_REQUIRED=1`, and the
+package checks refuse a kernel the manifest does not list, a set without its manifest, an ELF for
+anything but the host, a symbol table in `1bit`, or a private source name in it. The release machine
+holds the signing key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
 
 ### Private components
 

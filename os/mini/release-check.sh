@@ -24,8 +24,8 @@
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
 # gpu, npu, models, chat-hrx, chat-npu. Everything else - mode, kernel, Secure Boot, Lemonade up
-# with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU sets, the
-# licences and the image identity - is checked in the VM as well.
+# with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the signed NPU kernel sets,
+# the licences and the image identity - is checked in the VM as well.
 set -u
 
 LOG=/data/release-check.log
@@ -304,20 +304,38 @@ else
     fi
 fi
 
-# ── sealed NPU sets: the method never ships in the clear ────────────────────────────────────────
+# ── NPU kernel sets: every file verifies against the set's signed manifest ─────────────────────
+# The signature is checked by the engine at load (it holds only the release public key and refuses
+# a file its set's manifest does not cover), so this row proves the bytes on the stick are the ones
+# that were signed and that nothing unlisted rides along.
 SETS=$(find /data/npu/kernels -name layout.json 2>/dev/null | wc -l)
 if [ "$SETS" = 0 ]; then
-    fail sealed "no NPU kernel set on the data partition (find /data/npu/kernels -name layout.json)"
+    fail npu-kernels "no NPU kernel set on the data partition (find /data/npu/kernels -name layout.json)"
 else
     BAD=0
-    for f in $(find /data/npu/kernels -type f 2>/dev/null); do
-        [ "$(basename "$f")" = layout.json ] && continue
-        [ "$(head -c 8 "$f" 2>/dev/null)" = 1BPKCRYP ] && continue
-        BAD=$((BAD + 1)); say "      not sealed: $f"
+    for set in $(find /data/npu/kernels -mindepth 1 -maxdepth 1 -type d 2>/dev/null); do
+        [ -f "$set/layout.json" ] || continue
+        if [ ! -s "$set/manifest" ] || [ "$(stat -c%s "$set/manifest.sig" 2>/dev/null || echo 0)" != 64 ]; then
+            BAD=$((BAD + 1)); say "      no signed manifest in $set"; continue
+        fi
+        for f in "$set"/layout.json "$set"/layer1_*/layer1.elf; do
+            [ -f "$f" ] || continue
+            rel=${f#"$set"/}
+            want=$(awk -v p="$rel" '$1=="file" && $4==p {print $2}' "$set/manifest" 2>/dev/null)
+            if [ -z "$want" ]; then BAD=$((BAD + 1)); say "      not in the manifest: $f"
+            elif [ "$want" != "$(sha256sum "$f" 2>/dev/null | cut -d' ' -f1)" ]; then
+                BAD=$((BAD + 1)); say "      does not match the manifest: $f"; fi
+        done
+        for f in $(find "$set" -type f 2>/dev/null); do
+            rel=${f#"$set"/}
+            case "$rel" in layout.json|manifest|manifest.sig) continue ;; esac
+            [ -n "$(awk -v p="$rel" '$1=="file" && $4==p {print $2}' "$set/manifest" 2>/dev/null)" ] ||
+                { BAD=$((BAD + 1)); say "      unlisted file: $f"; }
+        done
     done
     [ "$(find /data/npu/kernels -name '*.mlir' -o -name 'layer1.work' 2>/dev/null | wc -l)" = 0 ] || { BAD=$((BAD + 1)); say "      plaintext build tree on the data partition"; }
-    if [ "$BAD" = 0 ]; then pass sealed "$SETS sealed sets, $PLAIN_TOTAL kernels, none in the clear"
-    else fail sealed "$BAD file(s) under /data/npu/kernels are not sealed artifacts"; fi
+    if [ "$BAD" = 0 ]; then pass npu-kernels "$SETS signed sets, $PLAIN_TOTAL kernels, every file matches its manifest"
+    else fail npu-kernels "$BAD problem(s) under /data/npu/kernels"; fi
 fi
 
 # ── licences and image identity ────────────────────────────────────────────────────────────────

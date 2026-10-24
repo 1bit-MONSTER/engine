@@ -97,7 +97,18 @@ pack_localize "$stage" "$build"
 # engine binary at the top of the tree is the one it does not visit (depth 1), so drop its rpath here.
 patchelf --remove-rpath "$stage/1bit"
 
-# a program whose implementation library was not built leaves the package instead of shipping broken
+# every program the release promises has to load from the package; one that does not is a build problem, not
+# something to drop silently (the 2026-10-23 rc shipped llama-perplexity without its implementation library)
+tools_bad=""
+tools_bad+=$(pack_require_tools "$stage" hrx/llama/bin llama-server llama-bench llama-perplexity || true)
+tools_bad+=$(pack_require_tools "$stage" ds4/hip ds4-server ds4 ds4-bench || true)
+[ -z "$tools_bad" ] || { echo "shipped tools that cannot load:"; echo "$tools_bad"; exit 1; }
+
+# everything shipped has to come from the build being packaged
+provenance_bad=$(pack_require_provenance "$stage" "$build" || true)
+[ -z "$provenance_bad" ] || { echo "files that did not come from this build:"; echo "$provenance_bad"; exit 1; }
+
+# anything else that cannot load leaves the package rather than shipping broken
 pack_prune_unloadable "$stage"
 
 # symbol tables and debug info out of every program and library: the release ships compiled code

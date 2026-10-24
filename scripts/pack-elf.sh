@@ -99,6 +99,70 @@ pack_unresolved_needed() {
     done < <(find "$stage" -type f -print0)
 }
 
+# Everything in the package has to come from the build being packaged. A binary copied in from another tree
+# (a hardware-gate cache, a drop) carries that tree's RUNPATH and its build's missing parts: in the 2026-10-23
+# rc, `llama-perplexity` came from a hardware-gate build and pointed at that build's directory. Compares each
+# staged file with the same relative path under the build and reports what has no counterpart there.
+pack_require_provenance() {  # <stage> <build>
+    local stage=$1 build=$2 f rel bad=0
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        rel=${f#"$stage"/}
+        if [ ! -f "$build/$rel" ]; then
+            echo "  $rel is not in the build being packaged"
+            bad=1
+        elif ! cmp -s "$f" "$build/$rel"; then
+            echo "  $rel differs from the build being packaged"
+            bad=1
+        fi
+    done < <(find "$stage" -type f -print0)
+    return $bad
+}
+
+# The programs `put` was asked for are the ones the release promises: if one of them cannot resolve, that is a
+# build problem (the tool came from another tree, or its implementation library was not built) and the package
+# has to fail rather than quietly lose the tool. Call once per directory group: pack_require_tools <stage>
+# <rel dir> <program ...>.
+pack_require_tools() {
+    local stage=$1 rel=$2 f bad=0
+    shift 2
+    for f in "$@"; do
+        if [ ! -f "$stage/$rel/$f" ]; then
+            echo "  missing from the package: $rel/$f"
+            bad=1
+            continue
+        fi
+        while IFS= read -r line; do
+            echo "  $rel/$f cannot load: ${line##*: }"
+            bad=1
+        done < <(pack_unresolved_needed "$stage" | grep -F "$stage/$rel/$f:")
+    done
+    return $bad
+}
+
+# Everything in the package has to come from the build being packaged. A binary copied in from another tree
+# (a hardware-gate cache, a drop) carries that tree's RUNPATH and its build's missing parts: in the 2026-10-23
+# rc, `llama-perplexity` came from a hardware-gate build and pointed at that build's directory. Compares each
+# staged file with the same relative path under the build and reports what has no counterpart there.
+pack_require_provenance() {  # <stage> <build>
+    local stage=$1 build=$2 f rel bad=0
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        rel=${f#"$stage"/}
+        if [ ! -f "$build/$rel" ]; then
+            echo "  $rel is not in the build being packaged"
+            bad=1
+        elif ! cmp -s "$f" "$build/$rel"; then
+            echo "  $rel differs from the build being packaged"
+            bad=1
+        fi
+    done < <(find "$stage" -type f -print0)
+    return $bad
+}
+
+# The programs `put` was asked for are the ones the release promises: if one of them cannot resolve, that is a
+# build problem (the tool came from another tree, or its implementation library was not built) and the package
+# has to fail rather than quietly lose the tool. Prints the offending programs.
 # A thin binary whose implementation library was not built has to leave the package rather than ship broken
 # (the 2026-10-23 rc shipped llama-perplexity without libllama-perplexity-impl.so). Removing the binary is
 # the safe direction: the tool is then absent instead of failing at first use.

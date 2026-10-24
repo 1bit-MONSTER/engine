@@ -315,7 +315,7 @@ package_checks() {  # package_checks <linux tarball>
     [ "$n" = 0 ] || { echo "FAIL source files in the tarball"; bad=1; }
     # ... and a tarball that carries the NPU kernels must carry all three, or its GGUF-on-NPU path
     # dies at the first GGUF with "repack script not found" (the bug this list exists to prevent)
-    if [ -n "$(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print -quit)" ]; then
+    if [ -n "$(find "$t" -path '*/npu/kernels/*/manifest' -type f -print -quit)" ]; then
         for h in $helpers; do
             [ "$(find "$t" -path "*/$h" -type f | wc -l)" = 1 ] || { echo "FAIL the NPU package is missing $h"; bad=1; }
         done
@@ -329,23 +329,23 @@ package_checks() {  # package_checks <linux tarball>
     [ "$n" = 0 ] || { echo "FAIL files named like the private sources in the tarball"; bad=1; }
     [ $bad = 0 ] && echo "ok   no private source in $(basename "$1")"
     # The NPU kernels, when the package carries them (WEEKLY_NPU_KERNELS): each set ships
-    # layout.json, layer1_*/layer1.elf and a signed manifest; every shipped file is listed in that
+    # a signed manifest and its layers/<id>/layer1.elf files; every shipped file is listed in that
     # manifest and matches its sha256, so nothing unlisted (a build tree: plaintext MLIR, objects,
-    # intermediate ELFs) and nothing modified can ride along. The manifest signature itself is
+    # intermediate ELFs, a readable layout.json) and nothing modified can ride along. The manifest signature itself is
     # checked by the engine at load (it holds only the release public key and refuses a file the
     # manifest does not cover), so this row verifies the package, not the signature.
     local nk=0 m privsrc
     if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
-        n=$(find "$t" -path '*/npu/kernels/*/layout.json' -type f | wc -l)
+        n=$(find "$t" -path '*/npu/kernels/*/manifest' -type f | wc -l)
         [ "$n" -ge 3 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries $n NPU kernel sets (want the 0.6B, 1.7B and 4B sets)"; bad=1; }
     fi
     while IFS= read -r -d '' f; do
         rel=${f#"$t"/}
         setdir=${f%/npu/kernels/*}/npu/kernels/$(echo "${rel#*/npu/kernels/}" | cut -d/ -f1)
         case "$(basename "$f")" in
-            layout.json|manifest|manifest.sig) continue ;;
+            manifest|manifest.sig) continue ;;
         esac
-        if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/(layer1_[^/]+/layer1\.elf)$ ]]; then
+        if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/([0-9a-f]+/layer1\.elf)$ ]]; then
             inner=${BASH_REMATCH[1]}
             want=$(awk -v p="$inner" '$1=="file" && $4==p {print $2}' "$t/$setdir/manifest" 2>/dev/null)
             if [ -z "$want" ]; then
@@ -354,11 +354,11 @@ package_checks() {  # package_checks <linux tarball>
                 echo "FAIL $rel does not match the sha256 in its set's manifest"; nk=$((nk + 1))
             fi
         else
-            echo "FAIL unexpected file under npu/kernels (a set ships layout.json + layer1_*/layer1.elf + manifest + manifest.sig): $rel"; nk=$((nk + 1))
+            echo "FAIL unexpected file under npu/kernels (a set ships manifest + manifest.sig + <id>/layer1.elf only): $rel"; nk=$((nk + 1))
         fi
     done < <(find "$t" -path '*/npu/kernels/*' -type f -print0)
-    for lj in $(find "$t" -path '*/npu/kernels/*/layout.json' -type f 2>/dev/null); do
-        set=$(dirname "$lj")
+    for mf in $(find "$t" -path '*/npu/kernels/*/manifest' -type f 2>/dev/null); do
+        set=$(dirname "$mf")
         [ -s "$set/manifest" ] || { echo "FAIL $set has no signed manifest"; nk=$((nk + 1)); }
         [ "$(stat -c%s "$set/manifest.sig" 2>/dev/null || echo 0)" = 64 ] ||
             { echo "FAIL $set/manifest.sig is not a 64-byte Ed25519 signature"; nk=$((nk + 1)); }

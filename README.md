@@ -120,6 +120,19 @@ third-party parts in [NOTICE-BINARY](NOTICE-BINARY)). A build from this
 repository without them has no NPU engine and runs HRX on the public kernels only
 ([NOTICE](NOTICE), [docs/releases.md](docs/releases.md#private-components)).
 
+## How to credit
+
+Credit is welcome and, for the code, required: the Apache-2.0 license keeps the copyright
+notices and the [NOTICE](NOTICE) file with every copy. Three lines are enough:
+
+```
+1bit engine - https://github.com/1bit-MONSTER/engine - Copyright 2026 bong-water-water-bong - Apache-2.0
+```
+
+[CITATION.cff](CITATION.cff) carries the same in citation form (GitHub shows it under
+"Cite this repository"). If you build on a specific piece, name the file or the pull request it
+came from; the history is public.
+
 ## Thank you
 
 **[Osmantic / ODS](https://github.com/Osmantic/ODS) comes first.** ODS introduced me to

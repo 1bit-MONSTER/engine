@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=EC Fan Control
+Comment=Fan and APU control for ec_su_axb35
+Exec=/usr/local/bin/ec-su_axb35-linux-gui
+Icon=fan
+Terminal=false
+Categories=System;Settings;

@@ -32,7 +32,7 @@ limitations under the License.""".split("\n")
 LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cff", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
-      ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment",
+      ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment", "*.example",
       "*.service", "*.timer", "*.conf", "lemonade-hrx", "Dockerfile", "*.Dockerfile"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]

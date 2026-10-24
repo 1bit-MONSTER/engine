@@ -1,0 +1,17 @@
+cff-version: 1.2.0
+message: "If you use the 1bit engine or code from it, please cite it as below and keep the copyright notices and the NOTICE file, as the Apache-2.0 license requires."
+title: "1bit engine"
+type: software
+authors:
+  - name: "1bit-MONSTER (bong-water-water-bong)"
+    website: "https://1bit.gg/"
+repository-code: "https://github.com/1bit-MONSTER/engine"
+url: "https://1bit.gg/"
+license: Apache-2.0
+keywords:
+  - llama.cpp
+  - AMD Strix Halo
+  - HRX
+  - Ryzen AI NPU
+  - local inference
+abstract: "A local LLM engine for AMD Strix Halo (Ryzen AI MAX+ 395): HRX with our own HIP kernels on the GPU and our own kernel sets on the XDNA2 NPU, served through Lemonade."

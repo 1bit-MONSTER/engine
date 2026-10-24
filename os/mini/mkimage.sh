@@ -140,6 +140,21 @@ else
         mkdir -p "$root/lib/modules/$kver/updates"
         cp "$ecbuild/ec_su_axb35.ko" "$root/lib/modules/$kver/updates/"
         echo "   ec_su_axb35.ko for $kver: $(stat -c %s "$root/lib/modules/$kver/updates/ec_su_axb35.ko") bytes"
+        # Secure Boot: an out-of-tree module has to be signed by a key the kernel trusts, i.e. a MOK that is
+        # enrolled. It must be the MOK - the "Secure Boot Kernel" cert carries no module-signing OID, so it
+        # can sign an EFI binary but not a module (verified on the development box: amdxdna.ko and our own
+        # ec_su_axb35.ko are both signed by "strixhalo Secure Boot MOK").
+        kdir=/lib/modules/"$kver"/build
+        modkey=${MODULE_SIGN_KEY:-/var/lib/shim-signed/mok/MOK.priv}
+        modcrt=${MODULE_SIGN_CERT:-/var/lib/shim-signed/mok/MOK.der}
+        if [ -x "$kdir/scripts/sign-file" ] && [ -r "$modkey" ] && [ -r "$modcrt" ]; then
+            "$kdir/scripts/sign-file" sha256 "$modkey" "$modcrt" "$root/lib/modules/$kver/updates/ec_su_axb35.ko" \
+                && echo "   signed with $(basename "$modcrt") (the module-signing MOK)"
+        else
+            echo "   WARNING: ec_su_axb35.ko left UNSIGNED (need $modkey, $modcrt and $kdir/scripts/sign-file)"
+            echo "            it loads where module signature checking is off, which is the case for our kernel:"
+            echo "            CONFIG_LOCK_DOWN_IN_EFI_SECURE_BOOT is not set, so lockdown stays 'none' even with SB on"
+        fi
     else
         echo "   build FAILED (see $out/logs/ec_su_axb35-build.log); set EC_MODULE=skip to ship without it"; exit 1
     fi
@@ -286,19 +301,25 @@ mkdir -p "$root/etc/1bit"
 install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
 # The SMU limits (the 90 W sustained cap) are set through ryzenadj, which is LGPL-3.0: ship the tool and
 # its licence. A builder without it still works - the EC power mode alone applies and the image says so.
-RJ=${RYZENADJ:-$(command -v ryzenadj 2>/dev/null || echo /usr/local/bin/ryzenadj)}
-if [ -x "$RJ" ]; then
+echo "== SMU tool (ryzenadj v0.19.0, LGPL-3.0, source pinned in os/licenses/ryzenadj)"
+# Deterministic: built from the source this repository ships, never from whatever the build machine has.
+rjsrc=$licenses/ryzenadj/src
+if [ ! -d "$rjsrc" ]; then echo "   os/licenses/ryzenadj/src is missing: the SMU cap could not be applied"; exit 1; fi
+rjbuild=$(mktemp -d)
+if cp -a "$rjsrc"/. "$rjbuild"/ && ( cd "$rjbuild" \
+        && cmake -B build -DCMAKE_BUILD_TYPE=Release . > "$out/logs/ryzenadj-build.log" 2>&1 \
+        && cmake --build build -j4 >> "$out/logs/ryzenadj-build.log" 2>&1 ); then
     mkdir -p "$root/opt/1bit"
-    cp -L "$RJ" "$root/opt/1bit/ryzenadj"; chmod 0755 "$root/opt/1bit/ryzenadj"
-    for lib in $(ldd "$RJ" 2>/dev/null | awk '/=> \//{print $3}'); do
+    cp "$rjbuild/build/ryzenadj" "$root/opt/1bit/ryzenadj"; chmod 0755 "$root/opt/1bit/ryzenadj"
+    for lib in $(ldd "$root/opt/1bit/ryzenadj" 2>/dev/null | awk '/=> \//{print $3}'); do
         case "$lib" in */libc.so*|*/libm.so*|*/ld-linux*) continue ;; esac
         if [ ! -e "$root$lib" ]; then mkdir -p "$root$(dirname "$lib")"; cp -L "$lib" "$root$lib"; fi
     done
-    cp /usr/share/common-licenses/LGPL-3 "$doc/ryzenadj-LGPL-3" 2>/dev/null || true
-    echo "   ryzenadj shipped as /opt/1bit/ryzenadj (LGPL-3.0, licence in /usr/share/licenses/1bit-os)"
+    echo "   /opt/1bit/ryzenadj $(stat -c %s "$root/opt/1bit/ryzenadj") bytes ($(ldd "$root/opt/1bit/ryzenadj" 2>/dev/null | wc -l) libs linked)"
 else
-    echo "   no ryzenadj on the builder: the image applies the EC power mode only (90 W cap not applied)"
+    echo "   build FAILED (see $out/logs/ryzenadj-build.log); needs cmake, a C compiler and libpci-dev"; exit 1
 fi
+rm -rf "$rjbuild"
 cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
@@ -318,6 +339,9 @@ cp "$licenses/llamacpp-hrx/ROCR-Runtime-LICENSE" "$doc/ROCR-Runtime-LICENSE"   #
 mkdir -p "$doc/ec_su_axb35"
 cp -a "$licenses/ec_su_axb35/LICENSE" "$licenses/ec_su_axb35/SOURCE" "$doc/ec_su_axb35/" 2>/dev/null || true
 if [ -d "$licenses/ec_su_axb35/src" ]; then cp -a "$licenses/ec_su_axb35/src" "$doc/ec_su_axb35/src"; fi
+mkdir -p "$doc/ryzenadj"
+cp -a "$licenses/ryzenadj/LICENSE" "$licenses/ryzenadj/SOURCE" "$doc/ryzenadj/" 2>/dev/null || true
+if [ -d "$licenses/ryzenadj/src" ]; then cp -a "$licenses/ryzenadj/src" "$doc/ryzenadj/src"; fi
 cp -rL /usr/share/common-licenses "$root/usr/share/"
 # the Ubuntu package behind each file in the image, found at its path or its merged-/usr alias
 (cd "$root" && find . -type f | cut -c2-) > "$out/image-files.txt"

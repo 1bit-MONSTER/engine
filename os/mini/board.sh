@@ -50,6 +50,7 @@ TCTL_C=${TCTL_C:-95}
 FCLK=${FCLK:-7}                       # amdgpu pp_dpm_fclk index, "auto" to leave it alone
 SOCCLK=${SOCCLK:-6}                   # amdgpu pp_dpm_socclk index
 SKIP_POWER=${SKIP_POWER:-0}
+FALLBACK_MODE=${FALLBACK_MODE:-balanced}  # EC mode when the SMU limits cannot be written
 RYZENADJ=${RYZENADJ:-}
 
 say() { printf '%s\n' "$*"; }
@@ -168,9 +169,10 @@ power_conf() {   # read KEY=value overrides from $POWER_CONF without executing i
                 eval "CONF_$key=\$val" ;;
         esac
     done < "$POWER_CONF"
-    for k in POWER_MODE STAPM_W SLOW_W FAST_W TCTL_C FCLK SOCCLK SKIP_POWER RYZENADJ; do
+    for k in POWER_MODE STAPM_W SLOW_W FAST_W TCTL_C FCLK SOCCLK SKIP_POWER RYZENADJ FALLBACK_MODE; do
         eval "v=\${CONF_$k:-}"; [ -n "$v" ] && eval "$k=\$v"
     done
+    v=${CONF_FAN_HOT5_C:-}; [ -n "$v" ] && BOOST_HOT5_C=$v
     return 0
 }
 
@@ -186,17 +188,28 @@ power() {
     else
         notes="$notes mode=no-ec"
     fi
+    cap_ok=0
     if [ -n "$RYZENADJ" ] && [ ! -x "$RYZENADJ" ]; then
         notes="$notes cap=failed(RYZENADJ=$RYZENADJ is not executable)"
     elif RJ=$(ryzenadj_bin); then
         if "$RJ" --stapm-limit=$(( STAPM_W * 1000 )) --slow-limit=$(( SLOW_W * 1000 )) \
                  --fast-limit=$(( FAST_W * 1000 )) --tctl-temp="$TCTL_C" >/dev/null 2>&1; then
-            notes="$notes cap=${STAPM_W}/${SLOW_W}/${FAST_W}W tctl=$TCTL_C"
+            notes="$notes cap=${STAPM_W}/${SLOW_W}/${FAST_W}W tctl=$TCTL_C"; cap_ok=1
         else
             notes="$notes cap=failed($RJ)"
         fi
     else
-        notes="$notes cap=not-applied(no ryzenadj; the EC profile alone is in force)"
+        notes="$notes cap=not-applied(no ryzenadj)"
+    fi
+    if [ "$cap_ok" = 0 ]; then
+        # Secure Boot lockdown, no /dev/mem access or no tool: the SMU limits cannot be written, so fall back
+        # to the EC's own balanced profile (85 W sustained, 120 W burst). Never leave the board in performance
+        # mode (its ~120 W profile) with no cap at all.
+        if printf '%s\n' "$FALLBACK_MODE" > "$EC/apu/power_mode" 2>/dev/null; then
+            notes="$notes fallback=$FALLBACK_MODE (the EC profile alone is in force)"
+        else
+            notes="$notes fallback=unavailable"
+        fi
     fi
     G=$(ls -d /sys/class/drm/card*/device 2>/dev/null | head -n 1)
     if [ -n "$G" ] && [ -w "$G/power_dpm_force_performance_level" ]; then
@@ -215,10 +228,10 @@ power() {
 power_status() {
     mode=$(cat "$EC/apu/power_mode" 2>/dev/null || echo none)
     if RJ=$(ryzenadj_bin) && info=$("$RJ" --info 2>/dev/null); then
-        lim=$(printf '%s\n' "$info" | sed -n 's/^STAPM LIMIT *| *\([0-9.]*\).*/\1/p' | head -n 1)
-        say "power: $mode mode, STAPM ${lim:-?} W"
+        lim=$(printf '%s\n' "$info" | sed -n 's/^STAPM LIMIT *| *\([0-9.]*\)\..*/\1/p' | head -n 1)
+        say "power: $mode mode, SMU cap ${lim:-?} W sustained"
     else
-        say "power: $mode mode, no SMU limits readable (ryzenadj absent or not permitted: the EC profile alone is in force)"
+        say "power: $mode mode, EC profile only (no SMU cap: ryzenadj absent or /dev/mem not writable)"
     fi
 }
 

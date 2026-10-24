@@ -95,7 +95,7 @@ limits. Both are shipped with their licences, and the driver also with its sourc
 | Component | Release | License | Source |
 |---|---|---|---|
 | `ec_su_axb35` (fan curve, EC temperature, EC power mode on the AXB35-02 board) | commit `f62c2c228959a08683273a26ef3afd8991e69f6d`, built for the image kernel by `os/mini/mkimage.sh` | GPL-2.0-only | `os/licenses/ec_su_axb35/` in this repository; the same source is installed in the image at `/usr/share/licenses/1bit-os/ec_su_axb35/src`; upstream https://github.com/cmetz/ec-su_axb35-linux |
-| `ryzenadj` (sets the SMU power limits; `/opt/1bit/ryzenadj` in the image) | built on the build machine, copied unmodified | LGPL-3.0, Copyright Jiaxun Yang and the RyzenAdj contributors | https://github.com/FlyGoat/RyzenAdj; the LGPL-3.0 text ships as `/usr/share/licenses/1bit-os/ryzenadj-LGPL-3` |
+| `ryzenadj` (sets the SMU power limits; `/opt/1bit/ryzenadj` in the image) | **pinned v0.19.0**, commit `ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182`, built by `os/mini/mkimage.sh` from the source in `os/licenses/ryzenadj` | LGPL-3.0, Copyright Jiaxun Yang and the RyzenAdj contributors | `os/licenses/ryzenadj/` in this repository (LICENSE, SOURCE, and the tag's source verbatim); the same source is installed in the image at `/usr/share/licenses/1bit-os/ryzenadj/src`; upstream https://github.com/FlyGoat/RyzenAdj |
 
 ## System software from Ubuntu
 
@@ -135,5 +135,5 @@ source available; the MPL requires the same for its covered files. For each:
 | TheRock sysdeps in llamacpp-hrx (elfutils, libnl, numactl, libmnl) | the upstream tarballs TheRock builds, https://github.com/ROCm/TheRock/tree/main/third-party/sysdeps/linux (elfutils 0.195, libnl 3.12.0, numactl 2.0.19, libmnl 1.0.5 at the time of this review) |
 | libquadmath, libgfortran in moonshine | GCC, https://gcc.gnu.org |
 | `ec_su_axb35` (the board driver in the image) | the source as shipped in `os/licenses/ec_su_axb35/src`, upstream https://github.com/cmetz/ec-su_axb35-linux at commit `f62c2c228959a08683273a26ef3afd8991e69f6d` |
-| `ryzenadj` | https://github.com/FlyGoat/RyzenAdj at the release the build machine carries (LGPL-3.0) |
+| `ryzenadj` | the source as shipped in `os/licenses/ryzenadj/src`, upstream https://github.com/FlyGoat/RyzenAdj at tag v0.19.0 (commit `ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182`), built by `os/mini/mkimage.sh` |
 | certifi, tqdm in moonshine (MPL-2.0) | the covered files are on the image as shipped (Python source and cacert.pem); https://pypi.org/project/certifi/, https://pypi.org/project/tqdm/ |

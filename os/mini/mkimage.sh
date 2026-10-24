@@ -123,6 +123,28 @@ for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
 cp /lib/modules/"$kver"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kver/" 2>/dev/null || true
+
+echo "== board driver (ec_su_axb35, GPL-2.0, source shipped in os/licenses/ec_su_axb35)"
+# The fans and the EC power mode are driven by the board's embedded controller and the kernel has no
+# driver for it, so it is built here, out of tree, against the image kernel - from the source this
+# repository ships next to it (GPL-2.0: the binary in the image always travels with its source).
+ecsrc=$licenses/ec_su_axb35/src
+if [ "${EC_MODULE:-build}" = skip ]; then
+    echo "   skipped (EC_MODULE=skip): this image will leave the fans on the firmware curve"
+elif [ ! -d "$ecsrc" ]; then
+    echo "   os/licenses/ec_su_axb35/src is missing: the fans would stay on the firmware curve"; exit 1
+else
+    ecbuild=$(mktemp -d)
+    cp -a "$ecsrc"/. "$ecbuild"/
+    if make -s -C "$ecbuild" KERNEL_BUILD=/lib/modules/"$kver"/build modules > "$out/logs/ec_su_axb35-build.log" 2>&1; then
+        mkdir -p "$root/lib/modules/$kver/updates"
+        cp "$ecbuild/ec_su_axb35.ko" "$root/lib/modules/$kver/updates/"
+        echo "   ec_su_axb35.ko for $kver: $(stat -c %s "$root/lib/modules/$kver/updates/ec_su_axb35.ko") bytes"
+    else
+        echo "   build FAILED (see $out/logs/ec_su_axb35-build.log); set EC_MODULE=skip to ship without it"; exit 1
+    fi
+    rm -rf "$ecbuild"
+fi
 # The NPU needs the PRIVATE XDNA driver build, not the stock module in /lib/modules: with the stock one
 # the engine's NPU route resets the machine. Same vermagic, so it is a straight drop-in.
 xdna=${AMDXDNA_KO:-$HOME/wt/perfopt-7.3-obj/drivers/accel/amdxdna/amdxdna.ko}
@@ -259,6 +281,24 @@ cp /usr/sbin/mke2fs "$root/bin/mke2fs"; chmod +x "$root/bin/mke2fs"
 copy_libs /usr/sbin/mke2fs
 cp /etc/mke2fs.conf "$root/etc/mke2fs.conf"
 cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/1bit-release-check"
+install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
+mkdir -p "$root/etc/1bit"
+install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
+# The SMU limits (the 90 W sustained cap) are set through ryzenadj, which is LGPL-3.0: ship the tool and
+# its licence. A builder without it still works - the EC power mode alone applies and the image says so.
+RJ=${RYZENADJ:-$(command -v ryzenadj 2>/dev/null || echo /usr/local/bin/ryzenadj)}
+if [ -x "$RJ" ]; then
+    mkdir -p "$root/opt/1bit"
+    cp -L "$RJ" "$root/opt/1bit/ryzenadj"; chmod 0755 "$root/opt/1bit/ryzenadj"
+    for lib in $(ldd "$RJ" 2>/dev/null | awk '/=> \//{print $3}'); do
+        case "$lib" in */libc.so*|*/libm.so*|*/ld-linux*) continue ;; esac
+        if [ ! -e "$root$lib" ]; then mkdir -p "$root$(dirname "$lib")"; cp -L "$lib" "$root$lib"; fi
+    done
+    cp /usr/share/common-licenses/LGPL-3 "$doc/ryzenadj-LGPL-3" 2>/dev/null || true
+    echo "   ryzenadj shipped as /opt/1bit/ryzenadj (LGPL-3.0, licence in /usr/share/licenses/1bit-os)"
+else
+    echo "   no ryzenadj on the builder: the image applies the EC power mode only (90 W cap not applied)"
+fi
 cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
@@ -274,6 +314,10 @@ cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$s
 cp "$src/third_party/lemonade/LICENSE" "$doc/lemonade-LICENSE" ||
     { echo "no third_party/lemonade/LICENSE (git submodule update --init third_party/lemonade)"; exit 1; }
 cp "$licenses/llamacpp-hrx/ROCR-Runtime-LICENSE" "$doc/ROCR-Runtime-LICENSE"   # TheRock's libhsa for HRX
+# the board driver is GPL-2.0: its source and licence travel in the image, next to the binary
+mkdir -p "$doc/ec_su_axb35"
+cp -a "$licenses/ec_su_axb35/LICENSE" "$licenses/ec_su_axb35/SOURCE" "$doc/ec_su_axb35/" 2>/dev/null || true
+if [ -d "$licenses/ec_su_axb35/src" ]; then cp -a "$licenses/ec_su_axb35/src" "$doc/ec_su_axb35/src"; fi
 cp -rL /usr/share/common-licenses "$root/usr/share/"
 # the Ubuntu package behind each file in the image, found at its path or its merged-/usr alias
 (cd "$root" && find . -type f | cut -c2-) > "$out/image-files.txt"

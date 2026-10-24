@@ -86,6 +86,17 @@ says `Ship: yes`.
 | Lemonade (lemond, the lemonade CLI, the web app) | third_party/lemonade pin | Apache-2.0, Advanced Micro Devices, Inc.; web app bundle licenses in `renderer.bundle.js.LICENSE.txt` | https://github.com/1bit-MONSTER/lemonade |
 | ROCr HSA runtime (TheRock, for HRX) | the build's ONEBIT_HRX_LIBHSA | University of Illinois/NCSA | https://github.com/ROCm/ROCR-Runtime, https://github.com/ROCm/TheRock |
 
+## The board driver and the SMU tool
+
+The appliance controls its fans and its power profile on the boards it knows: an out-of-tree driver for
+the board's embedded controller, and (when the build machine has it) the tool that sets the SMU power
+limits. Both are shipped with their licences, and the driver also with its source.
+
+| Component | Release | License | Source |
+|---|---|---|---|
+| `ec_su_axb35` (fan curve, EC temperature, EC power mode on the AXB35-02 board) | commit `f62c2c228959a08683273a26ef3afd8991e69f6d`, built for the image kernel by `os/mini/mkimage.sh` | GPL-2.0-only | `os/licenses/ec_su_axb35/` in this repository; the same source is installed in the image at `/usr/share/licenses/1bit-os/ec_su_axb35/src`; upstream https://github.com/cmetz/ec-su_axb35-linux |
+| `ryzenadj` (sets the SMU power limits; `/opt/1bit/ryzenadj` in the image) | built on the build machine, copied unmodified | LGPL-3.0, Copyright Jiaxun Yang and the RyzenAdj contributors | https://github.com/FlyGoat/RyzenAdj; the LGPL-3.0 text ships as `/usr/share/licenses/1bit-os/ryzenadj-LGPL-3` |
+
 ## System software from Ubuntu
 
 mkimage.sh copies these from the build machine (Ubuntu 26.04), unmodified, and records the exact
@@ -123,4 +134,6 @@ source available; the MPL requires the same for its covered files. For each:
 | eSpeak NG in kokoro's `koko`, and Kokoros | https://crates.io/api/v1/crates/espeak-rs-sys/0.1.9/download (eSpeak NG as built into koko); https://github.com/lemonade-sdk/Kokoros/tree/b17 |
 | TheRock sysdeps in llamacpp-hrx (elfutils, libnl, numactl, libmnl) | the upstream tarballs TheRock builds, https://github.com/ROCm/TheRock/tree/main/third-party/sysdeps/linux (elfutils 0.195, libnl 3.12.0, numactl 2.0.19, libmnl 1.0.5 at the time of this review) |
 | libquadmath, libgfortran in moonshine | GCC, https://gcc.gnu.org |
+| `ec_su_axb35` (the board driver in the image) | the source as shipped in `os/licenses/ec_su_axb35/src`, upstream https://github.com/cmetz/ec-su_axb35-linux at commit `f62c2c228959a08683273a26ef3afd8991e69f6d` |
+| `ryzenadj` | https://github.com/FlyGoat/RyzenAdj at the release the build machine carries (LGPL-3.0) |
 | certifi, tqdm in moonshine (MPL-2.0) | the covered files are on the image as shipped (Python source and cacert.pem); https://pypi.org/project/certifi/, https://pypi.org/project/tqdm/ |

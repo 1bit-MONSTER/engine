@@ -1,0 +1,22 @@
+# /etc/1bit/power — power profile overrides for 1bit OS.
+#
+# At boot the image applies: the EC power mode, then the SMU limits (STAPM / slow / fast, plus the
+# die temperature limit) through ryzenadj when the image carries it, then the fabric/SoC clock pins.
+# Order matters: an EC power-mode write resets the SMU limits, so the mode goes first.
+#
+# Uncomment and edit any line; the file is read as KEY=value, nothing in it is executed.
+# Defaults are the profile the 1bit development box runs (performance mode, 90 W sustained).
+#
+#POWER_MODE=performance     # quiet | balanced | performance (the EC's own power mode)
+#STAPM_W=90                 # sustained package power limit, watts
+#SLOW_W=90                  # slow (average) limit, watts
+#FAST_W=105                 # fast (burst) limit, watts
+#TCTL_C=95                  # die temperature limit, degrees C
+#FCLK=7                     # amdgpu pp_dpm_fclk index, or auto to let the driver decide
+#SOCCLK=6                   # amdgpu pp_dpm_socclk index
+#RYZENADJ=/opt/1bit/ryzenadj  # the SMU tool; empty = search /opt/1bit, /usr/local/bin, /usr/bin
+#SKIP_POWER=1               # do not touch power at all (the firmware profile stays)
+#
+# Fans (the curve the EC applies on its own sensor; levels 1..5 = 20/40/60/80/100 %):
+#FAN_UP=45,54,62,70,76
+#FAN_DOWN=41,50,58,66,72

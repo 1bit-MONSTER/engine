@@ -323,9 +323,10 @@ if grep -q "1bit.check" /proc/cmdline; then
     else
         echo "CHECK HSA runtime: none (no data partition on this boot; the runtime comes from the Lemonade package on /data)"
     fi
-    # the NPU runtime is compiled into 1bit: the image carries no XRT
-    if find / -xdev -name 'libxrt*' 2>/dev/null | grep -q .; then echo "CHECK no XRT: FAILED"; ok=0
-    else echo "CHECK no XRT: none in the image"; fi
+    # the NPU runtime is compiled into 1bit: the image's runtime dependencies are self-contained
+    if find / -xdev \( -name 'libxrt*' -o -name 'libopenvino*' -o -name 'libonnxruntime*' \) 2>/dev/null | grep -q .; then
+        echo "CHECK runtime deps: FAILED (an external accelerator runtime is in the image)"; ok=0
+    else echo "CHECK runtime deps: self-contained"; fi
     [ -e /lib/firmware/amdnpu/17f0_11 ] && echo "CHECK NPU firmware: present" || { echo "CHECK NPU firmware: FAILED"; ok=0; }
     dropbear -V 2>&1 | grep -q Dropbear && echo "CHECK dropbear: runs" || { echo "CHECK dropbear: FAILED"; ok=0; }
     echo "CHECK modules: $(find /lib/modules -name '*.ko*' | wc -l) kernel modules, amdgpu $(modinfo -F version amdgpu >/dev/null 2>&1 && echo found || echo MISSING)"

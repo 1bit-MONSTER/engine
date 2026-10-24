@@ -19,8 +19,9 @@
 # Packs a build into <out-dir>/1bit-<version>-linux-x86_64.tar.zst: 1bit, and every backend the
 # build has, at the same paths relative to 1bit as in the build tree, which is where 1bit looks
 # once the build tree is gone (app/built_path.h). Each program and library finds its libraries
-# beside itself ($ORIGIN). The NPU lane has no separate runtime library to ship (no XRT;
-# weekly.sh checks), and it carries the GGUF-on-NPU helper scripts (scripts/, tools/): public
+# beside itself ($ORIGIN). The NPU lane has no separate runtime library to ship: its runtime is
+# compiled into 1bit (scripts/weekly.sh checks the package's runtime dependencies), and it carries
+# the GGUF-on-NPU helper scripts (scripts/, tools/): public
 # Apache-2.0 source, the one exception package_checks makes to the tarball's no-source rule.
 # HRX still needs TheRock (/opt/rocm-therock) on the
 # machine, as it does when built there. The engine is pure HRX with HIP kernels on the GPU: no

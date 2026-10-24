@@ -262,8 +262,9 @@ stage_test() { run_tests; }
 
 # What the engine tarball must and must not hold (docs/releases.md, "Private components"):
 # It is packed by scripts/package-linux.sh and folded into the Lemonade + onebit package as 1bit/;
-#   XRT-free  no program or library needs or names AMD's XRT (libxrt*: readelf NEEDED, ldd,
-#             strings), and no libxrt* file is packed; the NPU runtime is compiled into 1bit
+#   runtime-deps  no program or library needs or names an external accelerator-runtime library
+#             (EXT_RUNTIME_LIBS below: readelf NEEDED, ldd, strings), and no such library is packed;
+#             the NPU runtime is compiled into 1bit
 #   kernels   the HRX ggml library carries the private HIP kernels (it exports the add-on's
 #             ggml_hrx_hip_addon_register), compiled in as code objects
 #   no source no source file (.hip .c .cc .cpp .cxx .h .hpp .inc .cu .cmake) and no file named
@@ -281,20 +282,21 @@ package_checks() {  # package_checks <linux tarball>
     # (lists go to stderr through `tee >(cat >&2)`, not `tee /dev/stderr`: reopening the log by
     # that name truncates it, and the earlier lines of package-checks.log were lost, 2026-10-20)
     local t bad=0 f n names pin
+    local ext_runtime='libxrt|libopenvino|libonnxruntime'
     t=$(mktemp -d)
     tar -C "$t" -xf "$1" --use-compress-program=unzstd
     for f in "$BUILD/1bit" $(find "$t" -type f); do
         [ "$(head -c 4 "$f" | od -An -c | tr -d ' ')" = '177ELF' ] || continue
-        n=$(readelf -d "$f" 2>/dev/null | grep -c 'NEEDED.*libxrt' || true)
-        [ "$n" = 0 ] || { echo "FAIL $f needs libxrt"; bad=1; }
-        n=$(ldd "$f" 2>/dev/null | grep -c libxrt || true)
-        [ "$n" = 0 ] || { echo "FAIL $f: ldd shows libxrt"; bad=1; }
-        n=$(strings -a "$f" | grep -c libxrt || true)
-        [ "$n" = 0 ] || { echo "FAIL $f names libxrt"; bad=1; }
+        n=$(readelf -d "$f" 2>/dev/null | grep -Ec "NEEDED.*($ext_runtime)" || true)
+        [ "$n" = 0 ] || { echo "FAIL $f needs an external accelerator runtime"; bad=1; }
+        n=$(ldd "$f" 2>/dev/null | grep -Ec "$ext_runtime" || true)
+        [ "$n" = 0 ] || { echo "FAIL $f: ldd resolves an external accelerator runtime"; bad=1; }
+        n=$(strings -a "$f" | grep -Ec "$ext_runtime" || true)
+        [ "$n" = 0 ] || { echo "FAIL $f names an external accelerator runtime"; bad=1; }
     done
-    n=$(find "$t" -name 'libxrt*' | wc -l)
-    [ "$n" = 0 ] || { echo "FAIL the tarball carries an XRT library"; bad=1; }
-    [ $bad = 0 ] && echo "ok   XRT-free: $(basename "$1") and $BUILD/1bit"
+    n=$(find "$t" \( -name 'libxrt*' -o -name 'libopenvino*' -o -name 'libonnxruntime*' \) | wc -l)
+    [ "$n" = 0 ] || { echo "FAIL the tarball carries an external accelerator runtime"; bad=1; }
+    [ $bad = 0 ] && echo "ok   runtime-deps: $(basename "$1") and $BUILD/1bit are self-contained"
     f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f | head -1)
     n=0; [ -n "$f" ] && n=$(nm -D --defined-only "$f" | grep -c ggml_hrx_hip_addon_register || true)
     if [ "$n" != 0 ]; then

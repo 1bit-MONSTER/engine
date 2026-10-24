@@ -34,9 +34,9 @@
 #   npu   --npu-lib <file>       a prebuilt libnpu_rt_api.a
 #         --npu-rt <dir>         the private runtime's sources, built here with its build-api-lib.sh
 #
-# Then it runs the same checks the weekly package runs (scripts/weekly.sh package_checks): XRT-free,
-# the HIP kernels really are compiled in, no source files, nothing named like the private sources,
-# and the two binary licenses are present. The drop is written as
+# Then it runs the same checks the weekly package runs (scripts/weekly.sh package_checks): runtime deps
+# self-contained, the HIP kernels really are compiled in, no source files, nothing named like the private
+# sources, and the two binary licenses are present. The drop is written as
 # <out>/binary-drop-<version>.tar.zst plus <out>/SHA256SUMS, and the script prints the tarball path.
 # It publishes nothing.
 set -euo pipefail
@@ -139,13 +139,13 @@ fail() { echo "FAIL $*"; bad=1; }
 # every ELF is a compiled binary with no source-name leakage
 while IFS= read -r -d '' f; do
     is_elf "$f" || continue
-    n=$(readelf -d "$f" 2>/dev/null | grep -c 'NEEDED.*libxrt' || true); [ "$n" = 0 ] || fail "$f needs libxrt"
-    n=$(ldd "$f" 2>/dev/null | grep -c libxrt || true);           [ "$n" = 0 ] || fail "$f: ldd shows libxrt"
-    n=$(strings -a "$f" | grep -c libxrt || true);                [ "$n" = 0 ] || fail "$f names libxrt"
+    n=$(readelf -d "$f" 2>/dev/null | grep -Ec 'NEEDED.*(libxrt|libopenvino|libonnxruntime)' || true); [ "$n" = 0 ] || fail "$f needs an external accelerator runtime"
+    n=$(ldd "$f" 2>/dev/null | grep -Ec 'libxrt|libopenvino|libonnxruntime' || true);           [ "$n" = 0 ] || fail "$f: ldd resolves an external accelerator runtime"
+    n=$(strings -a "$f" | grep -Ec 'libxrt|libopenvino|libonnxruntime' || true);                [ "$n" = 0 ] || fail "$f names an external accelerator runtime"
     n=$(readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' | grep -cE "$HOME|/home/|$work" || true)
     [ "$n" = 0 ] || fail "$f has an RPATH into a build machine home"
 done < <(find "$stage" -type f -print0)
-[ "$(find "$stage" -name 'libxrt*' | wc -l)" = 0 ] || fail "the drop carries an XRT library"
+[ "$(find "$stage" \( -name 'libxrt*' -o -name 'libopenvino*' -o -name 'libonnxruntime*' \) | wc -l)" = 0 ] || fail "the drop carries an external accelerator runtime"
 
 # every library the programs load is in the drop (or is the TheRock runtime HRX documents)
 missing=$(pack_missing_libs "$stage")

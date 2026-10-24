@@ -113,7 +113,7 @@ $f: embedded build-machine path"
         # toolchain to run anyway.
         readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' |
             sed -n 's/.*Library \(runpath\|rpath\): \[\(.*\)\]/\2/p' | tr ':' '\n' |
-            grep -E "^/" | grep -vE "^(/opt/rocm-therock|$ONEBIT_TOOLCHAIN_ROOT)/" | grep -q . &&
+            grep -E "^/" | grep -vE "^(${ONEBIT_TOOLCHAIN_ROOT:-/opt/rocm-therock})/" | grep -q . &&
             out="$out\n$f: absolute RUNPATH outside the toolchain root"
     done < <(find "$1" -type f -print0)
     [ -z "$out" ] || printf "%b\n" "$out"

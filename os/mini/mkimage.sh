@@ -153,7 +153,8 @@ bin=$build/onebit; [ -x "$bin" ] || bin=$build/1bit
 [ -x "$bin" ] || { echo "no engine binary in $build (build with -DONEBIT_NPU=ON -DONEBIT_HRX=ON)"; exit 1; }
 copy_elf "$bin"
 ln -s "$bin" "$root/bin/1bit"
-# The sealed NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"):
+# The NPU kernel sets travel BESIDE the engine binary (docs/releases.md, "The NPU engine"), each
+# with the signed manifest the engine verifies it against at load:
 # in a package that is <pkg>/npu/kernels next to <pkg>/1bit, and here the binary keeps its build
 # path, so the sets go to the same place relative to it. Without them the image ships the NPU
 # route and nothing it can load - the route then refuses rather than falling back.
@@ -464,33 +465,47 @@ for m in ${MODELS:-}; do
 done
 data_mb=${DATA_MB:-$(( $(du -sm "$out/data.dir" | cut -f1) + 1024 ))}   # the contents plus 1 GiB
 rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
-    # The sealed sets go on the STICK'S DATA PARTITION, not inside the RAM image. They are ~124 MB and
+    # The signed sets go on the STICK'S DATA PARTITION, not inside the RAM image. They are ~124 MB and
     # were making the initramfs 103 MB compressed, which is what grub was failing to load on real
     # hardware (the machine's own 37 MB initrd loads fine). init.sh links them to the engine's
     # expected path at boot, so the engine still finds npu/kernels beside itself.
-    # Only the artifact surface goes on the stick: <set>/layout.json and <set>/layer1_*/layer1.elf, the
-    # allowlist scripts/package-linux.sh packs. A set directory also holds layer1.work/ (plaintext
+    # Only the artifact surface goes on the stick: <set>/manifest, <set>/manifest.sig and
+    # <set>/<id>/layer1.elf - the allowlist scripts/package-linux.sh packs. A set directory also
+    # holds layer1.work/ (plaintext
     # MLIR, object files, intermediate ELFs) because that is where it was built, so copying the tree
     # would put the kernel method on the stick; the guard that caught that used `find ... | head -3`,
     # which exits 141 (SIGPIPE) under `set -o pipefail` and aborted the whole image instead.
     mkdir -p "$out/data.dir/npu/kernels"
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")
-        [ -f "$set/layout.json" ] || continue
+        [ -f "$set/manifest" ] || continue
         mkdir -p "$out/data.dir/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$out/data.dir/npu/kernels/$setname/"
-        for layer in "$set"/layer1_*/; do
+        cp -a "$set/manifest" "$set/manifest.sig" "$out/data.dir/npu/kernels/$setname/"
+        for layer in "$set"/*/; do
             [ -f "$layer/layer1.elf" ] || continue
             mkdir -p "$out/data.dir/npu/kernels/$setname/$(basename "$layer")"
             cp -a "$layer/layer1.elf" "$out/data.dir/npu/kernels/$setname/$(basename "$layer")/"
         done
     done
-    sealed=$(find "$out/data.dir/npu/kernels" -name layer1.elf -exec \
-        sh -c 'head -c 8 "$1" | grep -q 1BPKCRYP' _ {} \; -print | wc -l)
     total=$(find "$out/data.dir/npu/kernels" -name layer1.elf | wc -l)
     [ "$total" -gt 0 ] || { echo "npu/kernels in $build carries no layer1.elf"; exit 1; }
-    [ "$sealed" = "$total" ] || { echo "npu/kernels: $sealed of $total kernels are sealed (plaintext would leak the method)"; exit 1; }
-    echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) sealed sets on the data partition ($sealed kernels)"
+    # Each set must carry the manifest it is verified against, and every kernel it ships must be
+    # listed in it with the same sha256: a set that does not verify never reaches a stick.
+    bad=0
+    for set in "$out/data.dir/npu/kernels"/*/; do
+        [ -f "$set/manifest" ] || continue
+        [ -s "$set/manifest" ] && [ "$(stat -c%s "$set/manifest.sig" 2>/dev/null || echo 0)" = 64 ] ||
+            { echo "npu/kernels: $(basename "$set") has no signed manifest"; bad=1; continue; }
+        for elf in "$set"/*/layer1.elf; do
+            [ -f "$elf" ] || continue
+            rel=${elf#"$set"}
+            want=$(awk -v p="$rel" '$1=="file" && $4==p {print $2}' "$set/manifest")
+            [ -n "$want" ] && [ "$want" = "$(sha256sum "$elf" | cut -d' ' -f1)" ] ||
+                { echo "npu/kernels: $(basename "$set")/$rel does not match its manifest"; bad=1; }
+        done
+    done
+    [ "$bad" = 0 ] || exit 1
+    echo "   npu/kernels: $(ls "$out/data.dir/npu/kernels" | wc -l) signed sets on the data partition ($total kernels)"
 fi
 # The engine's own llama-server goes on the DATA PARTITION, not into the RAM image. This point in the
 # script is AFTER the initramfs was packed (above), so what used to happen here - copying llama-server,

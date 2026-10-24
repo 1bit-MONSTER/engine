@@ -143,7 +143,7 @@ ExternalProject_Add(llama_hrx
         "-DCMAKE_C_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}"
         "-DCMAKE_CXX_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}"
         ${_hrx_gpu_private_args}
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench llama-perplexity
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
     USES_TERMINAL_BUILD ON)

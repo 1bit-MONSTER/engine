@@ -97,6 +97,9 @@ pack_localize "$stage" "$build"
 # engine binary at the top of the tree is the one it does not visit (depth 1), so drop its rpath here.
 patchelf --remove-rpath "$stage/1bit"
 
+# a program whose implementation library was not built leaves the package instead of shipping broken
+pack_prune_unloadable "$stage"
+
 # symbol tables and debug info out of every program and library: the release ships compiled code
 # only (docs/releases.md, "Private components"); the dynamic symbols they link by stay
 pack_strip "$stage"

@@ -86,6 +86,34 @@ pack_localize() {
     done
 }
 
+# A program or library ships only if every library it NEEDs resolves the way it will on a user's machine:
+# plain ldd, with **no** LD_LIBRARY_PATH, so only the ELF's own RUNPATH and the system are consulted. A
+# library path inherited from the build shell resolves against the build tree and hides exactly the defect
+# this check exists for. Prints "<file>: <lib>" for each NEEDED that cannot be found.
+pack_unresolved_needed() {
+    local stage=$1 f
+    while IFS= read -r -d '' f; do
+        pack_is_dynelf "$f" || continue
+        env -u LD_LIBRARY_PATH ROCR_VISIBLE_DEVICES=-1 ldd "$f" 2>/dev/null |
+            awk -v f="$f" '$2 == "=>" && $3 == "not" {print f": "$1}'
+    done < <(find "$stage" -type f -print0)
+}
+
+# A thin binary whose implementation library was not built has to leave the package rather than ship broken
+# (the 2026-10-23 rc shipped llama-perplexity without libllama-perplexity-impl.so). Removing the binary is
+# the safe direction: the tool is then absent instead of failing at first use.
+pack_prune_unloadable() {
+    local stage=$1 bad dropped=0
+    while IFS= read -r line; do
+        bad=${line%%:*}
+        [ -f "$bad" ] || continue
+        echo "  drop $(echo "$bad" | sed "s|^$stage/||"): needs a library the package does not carry"
+        rm -f "$bad"
+        dropped=$((dropped+1))
+    done < <(pack_unresolved_needed "$stage")
+    [ "$dropped" = 0 ] || echo "  $dropped program(s) dropped as unloadable"
+}
+
 pack_strip() {
     local f
     while IFS= read -r -d '' f; do
@@ -116,6 +144,9 @@ $f: embedded build-machine path"
             grep -E "^/" | grep -vE "^(${ONEBIT_TOOLCHAIN_ROOT:-/opt/rocm-therock})/" | grep -q . &&
             out="$out\n$f: absolute RUNPATH outside the toolchain root"
     done < <(find "$1" -type f -print0)
+    # every shipped program and library must resolve what it links against
+    while IFS= read -r line; do out="$out\n$line: a NEEDED library is not in the package or on the machine"; done \
+        < <(pack_unresolved_needed "$1")
     [ -z "$out" ] || printf "%b\n" "$out"
 }
 

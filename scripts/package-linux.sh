@@ -54,26 +54,26 @@ cp -a "$build/1bit" "$stage/"
 put hrx/llama/bin llama-server llama-bench
 put ds4/hip ds4-server ds4 ds4-bench
 
-# the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
-# beside 1bit in npu/kernels, where it looks for them
-# Only the artifact surface is shipped: <set>/layout.json and <set>/layer1_*/layer1.elf. The set
-# directory also holds layer1.work/ (plaintext MLIR, object files, intermediate ELFs) because that is
-# where it was built; copying the tree would ship the kernel method and feed those static ELFs to
-# patchelf. package_checks asserts this allowlist on the tarball.
+# the NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): packed beside 1bit in npu/kernels,
+# where it looks for them, each with the signed manifest it is verified against at load.
+# Only the artifact surface is shipped: <set>/layout.json, <set>/layer1_*/layer1.elf, manifest and
+# manifest.sig. The set directory also holds layer1.work/ (plaintext MLIR, object files,
+# intermediate ELFs) because that is where it was built; copying the tree would ship the kernel
+# method and feed those static ELFs to patchelf. package_checks asserts this allowlist on the tarball.
 if [ -d "$build/npu/kernels" ]; then
     mkdir -p "$stage/npu/kernels"
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")   # not $name: that is the package name tar uses below
         [ -f "$set/layout.json" ] || continue
         mkdir -p "$stage/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$stage/npu/kernels/$setname/"
+        cp -a "$set/layout.json" "$set/manifest" "$set/manifest.sig" "$stage/npu/kernels/$setname/"
         for layer in "$set"/layer1_*/; do
             [ -f "$layer/layer1.elf" ] || continue
             mkdir -p "$stage/npu/kernels/$setname/$(basename "$layer")"
             cp -a "$layer/layer1.elf" "$stage/npu/kernels/$setname/$(basename "$layer")/"
         done
     done
-    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels"
+    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) kernels, each with its signed manifest"
 fi
 
 # The NPU lane's GGUF path runs public helper scripts (the repack, its declared-scale guard and the

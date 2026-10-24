@@ -26,10 +26,12 @@ package serves GGUF models on HRX, not NPU models ([releases.md](releases.md#the
 
 The NPU runtime and the NPU kernels are proprietary and closed source
 ([releases.md](releases.md#private-components)). They ship only as compiled binaries: the runtime
-is compiled into `1bit`, and the kernels ship as compiled, encrypted artifacts that `1bit` verifies
-and decrypts in memory at load (a wrong key fails cleanly, and nothing phones home). Their source,
-build and method are not in this repository or in any release. This page covers the public parts:
-the model format, how `1bit serve` runs an NPU model, and how to build.
+is compiled into `1bit`, and each kernel set ships with a signed manifest that lists every file it
+contains. `1bit` holds only the release public key and verifies a kernel against its manifest at
+load; a modified file, a file the manifest does not list, or a set signed by another key is refused
+before anything reaches the device, and nothing phones home. Their source, build and method are not
+in this repository or in any release. This page covers the public parts: the model format, how
+`1bit serve` runs an NPU model, and how to build.
 
 ## A model directory
 
@@ -137,7 +139,7 @@ The model directory holds the weights only; the kernels ship inside the package.
 
 ### Dense Qwen3, checked on the NPU
 
-All three dense Qwen3 models run on the NPU from a sealed kernel set, and each one passes the
+All three dense Qwen3 models run on the NPU from a signed kernel set, and each one passes the
 hardware gate's `npu` phase ([hw-gate.md](hw-gate.md)): greedy decoding token for token against an
 independent fp64 reference over a short prompt and teacher-forced steps, the 64-position build,
 the prompt prefill, and byte-identical output when the run is repeated, with the phase's speed

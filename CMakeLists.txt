@@ -33,6 +33,16 @@ endif()
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Every string the build bakes in (asserts, log prefixes, __FILE__) has to name a path that exists in
+# the package, not on the machine that built it: the shipped binaries are gated on it
+# (scripts/pack-elf.sh, pack_artifact_hygiene). -ffile-prefix-map covers -fmacro-prefix-map and
+# -fdebug-prefix-map on GCC and clang alike; ONEBIT_PATH_MAPS is also handed to the externals below.
+set(ONEBIT_PATH_MAP_FLAGS
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+    "-ffile-prefix-map=${CMAKE_BINARY_DIR}=build"
+    CACHE STRING "Compiler flags that rewrite build-machine paths out of embedded strings")
+add_compile_options(${ONEBIT_PATH_MAP_FLAGS})
+
 # The public binary drop (docs/releases.md): prebuilt proprietary parts for a source build outside
 # the org. Sets ONEBIT_BINARY_DROP_* and verifies the drop; a no-op when ONEBIT_BINARY_DROP is unset.
 include(cmake/binary_drop.cmake)

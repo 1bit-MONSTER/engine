@@ -89,8 +89,34 @@ pack_localize() {
 pack_strip() {
     local f
     while IFS= read -r -d '' f; do
-        if pack_is_elf "$f"; then strip --strip-unneeded "$f"; fi
+        if pack_is_elf "$f"; then
+            strip --strip-unneeded "$f"
+            # .comment names the compiler and its version; it is not needed to load or link
+            objcopy --remove-section=.comment --remove-section=.note.gnu.gold-version "$f" 2>/dev/null || true
+        fi
     done < <(find "$1" -type f -print0)
+}
+
+# Everything a shipped program and library may not carry: a compiler identification section, a path
+# into a build machine, or an absolute RUNPATH. Prints one line per violation, empty when clean.
+pack_artifact_hygiene() {
+    local f out=""
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        readelf -p .comment "$f" 2>/dev/null | grep -qE "clang version|GCC:" && out="$out
+$f: .comment names the compiler"
+        strings -a "$f" 2>/dev/null | grep -qE "^/(home|Users|root)/[A-Za-z0-9_./-]+" &&
+            out="$out
+$f: embedded build-machine path"
+        # An absolute RUNPATH is only acceptable under the toolchain root: some shipped programs link the
+        # SDK's own libraries (whose closure is far larger than the package), and the release needs that
+        # toolchain to run anyway.
+        readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' |
+            sed -n 's/.*Library \(runpath\|rpath\): \[\(.*\)\]/\2/p' | tr ':' '\n' |
+            grep -E "^/" | grep -vE "^(${ONEBIT_TOOLCHAIN_ROOT:-/opt/rocm-therock})/" | grep -q . &&
+            out="$out\n$f: absolute RUNPATH outside the toolchain root"
+    done < <(find "$1" -type f -print0)
+    [ -z "$out" ] || printf "%b\n" "$out"
 }
 
 pack_build_rpaths() {

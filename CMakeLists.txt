@@ -442,23 +442,23 @@ endif()  # ONEBIT_NPU_HOST
 
 # The lane itself: needs the NPU runtime and an XDNA NPU to run.
 option(ONEBIT_NPU "Build the NPU lane (needs the private NPU runtime: ONEBIT_NPU_RT_LIB or ONEBIT_NPU_RT_DIR)" OFF)
-# The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The NPU runtime"): our own, an
-# XRT-compatible runtime that is not part of this repository, behind our public header
-# npu/npu_rt_api.h. It comes one of two ways, exactly one of which must be set:
+# The NPU code compiles against one runtime (npu/rt.h, docs/npu.md "The runtime"): our own runtime,
+# which is not part of this repository, behind our public header npu/npu_rt_api.h. It comes one of
+# two ways, exactly one of which must be set:
 #   ONEBIT_NPU_RT_LIB  a prebuilt static library (libnpu_rt_api.a) that implements npu_rt_api.h;
 #                      no runtime source or private header is needed.
 #   ONEBIT_NPU_RT_DIR  the runtime's private sources (npu_rt.h, npu_rt.cpp, npu_rt_api.cpp), built
 #                      here into the static library onebit_npu_rt. npu_rt.h stays on that library's
 #                      own include path only; the engine's sources see npu_rt_api.h.
-# AMD's XRT is not supported: the engine links no XRT library. The release build takes the runtime
-# from the pinned private checkout in config/npu-runtime.config (scripts/fetch-private.sh).
+# The release build takes the runtime from the pinned private checkout in config/npu-runtime.config
+# (scripts/fetch-private.sh); the engine has that one NPU runtime and no other.
 set(ONEBIT_NPU_RUNTIME "own" CACHE STRING "NPU runtime: own (the only value)")
 set_property(CACHE ONEBIT_NPU_RUNTIME PROPERTY STRINGS own)
 set(ONEBIT_NPU_RT_DIR "" CACHE PATH "Directory with the NPU runtime's private sources: npu_rt.h, npu_rt.cpp, npu_rt_api.cpp")
 set(ONEBIT_NPU_RT_LIB "" CACHE FILEPATH "Prebuilt NPU runtime static library implementing npu/npu_rt_api.h (libnpu_rt_api.a)")
 if(NOT ONEBIT_NPU_RUNTIME STREQUAL "own")
-    message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be own, not '${ONEBIT_NPU_RUNTIME}': the engine builds "
-                        "no XRT NPU lane (docs/npu.md, \"The NPU runtime\")")
+    message(FATAL_ERROR "ONEBIT_NPU_RUNTIME must be own, not '${ONEBIT_NPU_RUNTIME}': the engine has one "
+                        "NPU runtime, its own (docs/npu.md, \"The runtime\")")
 endif()
 if(ONEBIT_NPU AND NOT ONEBIT_NPU_HOST)
     message(FATAL_ERROR "ONEBIT_NPU needs ONEBIT_NPU_HOST=ON")

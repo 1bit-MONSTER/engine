@@ -281,7 +281,7 @@ def main() -> None:
         md += ["## Engine", ""] + [f"- {e['title']}" + (f" (#{e['pr']})" if e["pr"] else "") for e in own] + [""]
     md += ["## Packages", "",
            "| file | what |", "|---|---|",
-           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe and the engine in `1bit/`: 1bit and its backends (HRX, DwarfStar, the NPU lane; no XRT); start it with `lemond-onebit` |",
+           f"| `lemonade-onebit-{a.tag}-linux-x86_64.tar.zst` | Lemonade (lemond + CLI) with the onebit recipe and the engine in `1bit/`: 1bit and its backends (HRX, DwarfStar, the NPU lane); start it with `lemond-onebit` |",
            f"| `1bit-os-{a.tag}.img.zst`, `.efi` | 1bit OS: Lemonade with the engine, booted from a USB stick |",
            "| `SHA256SUMS`, `changes.json` | checksums; this list as data |", "",
            "Licenses: the engine is Apache-2.0 (LICENSE, NOTICE in each package); each backend keeps its own "

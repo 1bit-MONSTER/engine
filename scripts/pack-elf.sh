@@ -89,8 +89,29 @@ pack_localize() {
 pack_strip() {
     local f
     while IFS= read -r -d '' f; do
-        if pack_is_elf "$f"; then strip --strip-unneeded "$f"; fi
+        if pack_is_elf "$f"; then
+            strip --strip-unneeded "$f"
+            # .comment names the compiler and its version; it is not needed to load or link
+            objcopy --remove-section=.comment --remove-section=.note.gnu.gold-version "$f" 2>/dev/null || true
+        fi
     done < <(find "$1" -type f -print0)
+}
+
+# Everything a shipped program and library may not carry: a compiler identification section, a path
+# into a build machine, or an absolute RUNPATH. Prints one line per violation, empty when clean.
+pack_artifact_hygiene() {
+    local f out=""
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        readelf -p .comment "$f" 2>/dev/null | grep -qE "clang version|GCC:" && out="$out
+$f: .comment names the compiler"
+        strings -a "$f" 2>/dev/null | grep -qE "^/(home|Users|root)/[A-Za-z0-9_./-]+" &&
+            out="$out
+$f: embedded build-machine path"
+        readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' | grep -qE "Library (runpath|rpath): \[/" &&
+            out="$out\n$f: absolute RUNPATH"
+    done < <(find "$1" -type f -print0)
+    [ -z "$out" ] || printf "%b\n" "$out"
 }
 
 pack_build_rpaths() {

@@ -93,15 +93,23 @@ fi
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
 # it; RUNPATH entries outside the build tree (TheRock in /opt) stay, since HRX needs TheRock anyway.
 pack_localize "$stage" "$build"
-patchelf --remove-rpath "$stage/1bit"
+# Every shipped program and library finds its libraries beside itself and nowhere else: replace whatever
+# RUNPATH the build left (the build tree, an SDK under /opt) with $ORIGIN.
+while IFS= read -r -d '' f; do
+    pack_is_elf "$f" || continue
+    patchelf --set-rpath '\$ORIGIN' "$f" 2>/dev/null || patchelf --remove-rpath "$f" 2>/dev/null || true
+done < <(find "$stage" -type f -print0)
 
 # symbol tables and debug info out of every program and library: the release ships compiled code
 # only (docs/releases.md, "Private components"); the dynamic symbols they link by stay
 pack_strip "$stage"
 
-# nothing may still point into the build machine's home
+# nothing may still point into the build machine's home, carry the compiler's identification, or load
+# through an absolute RUNPATH
 bad=$(pack_build_rpaths "$stage" "$build")
 [ -z "$bad" ] || { echo "RPATH into the build machine left:"; echo "$bad"; exit 1; }
+hygiene=$(pack_artifact_hygiene "$stage")
+[ -z "$hygiene" ] || { echo "artifact hygiene:"; echo "$hygiene"; exit 1; }
 
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"
 # the stock Lemonade PPA's lemond (Ubuntu 26.04) runs our HRX llama-server through lemonade-hrx

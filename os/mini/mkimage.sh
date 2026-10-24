@@ -27,10 +27,9 @@
 # 1bit OS is a Lemonade appliance: it boots Lemonade's server (lemond), with Lemonade's defaults,
 # and the engine is one of Lemonade's backends (the onebit recipe). The initramfs holds BusyBox,
 # the kernel modules for the GPU (amdgpu, which also provides /dev/kfd) and the NPU (amdxdna),
-# Ethernet, Wi-Fi and USB storage, the firmware those load (the NPU runtime is compiled into 1bit:
-# no XRT), Mesa's Radeon
-# Vulkan driver (for Lemonade's Vulkan backends), Lemonade (lemond, the lemonade CLI and the web
-# app, built from the engine's pin third_party/lemonade), and the engine: 1bit and its HRX
+# Ethernet, Wi-Fi and USB storage, the firmware those load, the NPU runtime compiled into 1bit,
+# Mesa's Radeon Vulkan driver (for Lemonade's Vulkan backends), Lemonade (lemond, the lemonade CLI
+# and the web app, built from the engine's pin third_party/lemonade), and the engine: 1bit and its HRX
 # llama-server, with TheRock's HSA runtime that HRX loads (ONEBIT_HRX_LIBHSA from the build's
 # CMake cache, kept at its path, which 1bit has compiled in), each with exactly the shared
 # libraries it links. HRX compiles its Loom kernels on first use and caches them

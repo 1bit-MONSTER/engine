@@ -14,8 +14,8 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# The NPU runtime options (docs/npu.md, "The NPU runtime"): ONEBIT_NPU=ON must stop with a message that
-# says why when ONEBIT_NPU_RUNTIME is anything but own (xrt is gone: the engine is XRT-free), when
+# The NPU runtime options (docs/npu.md, "The runtime"): ONEBIT_NPU=ON must stop with a message that
+# says why when ONEBIT_NPU_RUNTIME is anything but own (the engine has one NPU runtime, its own), when
 # neither or both of ONEBIT_NPU_RT_LIB and ONEBIT_NPU_RT_DIR are set, when ONEBIT_NPU_RT_LIB names no
 # file, or when ONEBIT_NPU_RT_DIR is missing, empty or lacks the runtime's files. Needs no NPU and not the private
 # runtime, so it runs in CI; reuses the parent build's fetched dependencies (offline).
@@ -40,7 +40,7 @@ expect() {  # expect <name> <message fragment> <cmake args...>
 mkdir -p "$tmp/half" && touch "$tmp/half/npu_rt.h"   # a header but no npu_rt.cpp
 mkdir -p "$tmp/noapi" && touch "$tmp/noapi/npu_rt.h" "$tmp/noapi/npu_rt.cpp"   # no npu_rt_api.cpp
 touch "$tmp/libnpu_rt_api.a"
-expect xrt_removed "ONEBIT_NPU_RUNTIME must be own" -DONEBIT_NPU_RUNTIME=xrt
+expect not_own "ONEBIT_NPU_RUNTIME must be own" -DONEBIT_NPU_RUNTIME=external
 expect bad_value "ONEBIT_NPU_RUNTIME must be own" -DONEBIT_NPU_RUNTIME=bogus
 expect no_dir "ONEBIT_NPU needs the NPU runtime" -DONEBIT_NPU_RT_DIR=
 expect missing_dir "ONEBIT_NPU needs the NPU runtime" -DONEBIT_NPU_RT_DIR="$tmp/none"

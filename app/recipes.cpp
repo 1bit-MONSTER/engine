@@ -53,6 +53,8 @@ bool Recipe::matches(const RecipeFacts& f) const {
     if (!any_of(device, f.device) || !any_of(architecture, f.architecture) || !any_of(drafter, f.drafter))
         return false;
     if (moe >= 0 && (moe == 1) != f.moe) return false;
+    for (const auto& k : gguf_keys)  // every listed metadata key must be in the model file
+        if (std::find(f.gguf_keys.begin(), f.gguf_keys.end(), k) == f.gguf_keys.end()) return false;
     return true;
 }
 
@@ -88,6 +90,7 @@ bool Recipes::parse(const std::string& json_text, std::string& err) {
                         if (mk == "device") rec.device = strings(mv, "match.device", rec.id);
                         else if (mk == "architecture") rec.architecture = strings(mv, "match.architecture", rec.id);
                         else if (mk == "drafter") rec.drafter = strings(mv, "match.drafter", rec.id);
+                        else if (mk == "gguf_keys") rec.gguf_keys = strings(mv, "match.gguf_keys", rec.id);
                         else if (mk == "moe") {
                             if (!mv.is_boolean()) throw std::runtime_error("recipe " + rec.id + ": match." + mk + " is not true/false");
                             rec.moe = mv.get<bool>() ? 1 : 0;
@@ -111,6 +114,12 @@ bool Recipes::parse(const std::string& json_text, std::string& err) {
         return false;
     }
     return true;
+}
+
+bool Recipes::needs_gguf_keys() const {
+    for (const auto& r : list)
+        if (!r.gguf_keys.empty()) return true;
+    return false;
 }
 
 std::vector<std::string> Recipes::apply(const RecipeFacts& f, std::vector<std::string>& argv,

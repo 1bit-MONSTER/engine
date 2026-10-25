@@ -58,6 +58,28 @@ status() {
     printf '%s' "${c:-000}"
 }
 
+# Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
+# app, engine spawn). The capped fetches above then see "status 000" and the row fails although the
+# server is fine - candidate 4 (25 Oct) failed exactly so, where candidate 3's uncapped wget had simply
+# waited. So the port is polled with 2 s probes until anything answers, up to READY_WAIT seconds; only
+# then do the capped assertions run. A server that never answers gets its own row (lemonade_ready
+# false), distinct from a wrong key. The caps on the assertions stay: they are what keep the
+# 20-minute hang from coming back.
+READY_WAIT=${READY_WAIT:-120}
+lemonade_ready() {
+    i=0
+    while [ "$i" -lt "$READY_WAIT" ]; do
+        if command -v curl >/dev/null 2>&1; then
+            c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$API/api/v1/models" 2>/dev/null)
+        else
+            c=$(wget -S -O /dev/null --timeout=2 -t 1 "$API/api/v1/models" 2>&1 | sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | head -1)
+        fi
+        case "${c:-000}" in 000) ;; *) say "      lemond answered $API after ${i}s (status $c)"; return 0 ;; esac
+        sleep 2; i=$((i + 2))
+    done
+    return 1
+}
+
 # The lemonade row, decided from what the two probes returned. Pure, so tests/release_check_row.sh can
 # drive it (os/mini/release-check.sh --self-test): <keyed status> <keyed body> <keyless status>.
 lemonade_verdict() {
@@ -188,6 +210,9 @@ fi
 # ── Lemonade, with and without the key ──────────────────────────────────────────────────────────
 if [ -z "$KEY" ]; then
     fail lemonade "no LEMONADE_API_KEY in /data/lemonade/lemond.conf: a network-facing server without a key"
+elif ! lemonade_ready; then
+    # Not the same row as a wrong key: nothing answered on the port at all within the wait.
+    fail lemonade "lemond did not answer $API within ${READY_WAIT}s (see /tmp/lemond.log)"
 else
     MODELS=$(got --header="Authorization: Bearer $KEY" "$API/api/v1/models")
     WITH=$(status --header="Authorization: Bearer $KEY" "$API/api/v1/models")

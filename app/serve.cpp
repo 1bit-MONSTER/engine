@@ -722,6 +722,13 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
         return;
     }
     if (drop_model) body.erase("model");
+    // Greedy short-circuit (issue #560): a request that asks for temperature 0 gets argmax by way of
+    // top_k 1 unless it names its own top_k. That skips the full-vocabulary top-p / min-p chain, which
+    // on a 262147-entry vocab costs about 2.1 ms per token (ZAYA1-8B: 118 -> 153 tok/s). A request that
+    // states any other temperature is untouched.
+    if (body.contains("temperature") && body["temperature"].is_number() &&
+        body["temperature"].get<double>() <= 0.0 && !body.contains("top_k"))
+        body["top_k"] = 1;
     // --precise: a follow-up turn differs from a cold run of the same conversation because its new tokens form a
     // different batch than the cold prefill does (different kernels, different reduction order), and a near-tie
     // then flips. The only way to make the two bitwise identical is to take the cold path: re-prefill the whole

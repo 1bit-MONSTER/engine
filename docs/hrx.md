@@ -589,6 +589,9 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
 - **PrismML tile bytes** ([llama.cpp #74](https://github.com/1bit-MONSTER/llama.cpp/pull/74)): the low-token
   SwiGLU sized PQ2_0 / PTQ1_0 weight rows from a tile size of 0, so every row read row 0. Ternary-Bonsai-1.7B
   PQ2_0 decode perplexity 1,225,624 -> 20.65 (CPU 20.70); the 27B files took another kernel and were unaffected.
+  **PQ2_0 on the dense prefill kernels and ternary weights on the 2..16-token verify kernels** (private
+  add-on, 2026-10-25): Ternary-Bonsai-2-27B PQ2_0 pp512 188 -> 553 tok/s, and its ternary verify batch
+  decodes at 43.3 / 37.3 / 27.1 tok/s on code / prose / short with the Qwen3.8-27B MTP head (39/40 GSM8K).
 - **NVFP4 (ggml type 40) and Q2_0 (type 42)**: prompt and decode on HRX through our HIP kernels
   (private add-on, 2026-10-24), no extra flag or environment: a Qwen3.8-27B file of either type loads
   and runs with **one graph split**. Measured on the 27B, performance mode: NVFP4 pp512 613 / tg128

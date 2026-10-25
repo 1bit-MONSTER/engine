@@ -41,9 +41,9 @@ Release sha and pins (the submodules this candidate is built from):
 | llama.cpp (HRX fork) | `851fa6c8d8f2` |
 | hrx-system | `82804197bcbe` |
 | Lemonade (fork) | `27abcc24da99` |
-| gpu-kernels (private, HIP) | `744bd713d968` (`config/gpu-kernels.config`) |
-| npu-kernels (private, sealed) | `17ed5be7a28a` (`config/npu-kernels.config`) |
-| npu-runtime (private) | `ce9fa59adf95` (`config/npu-runtime.config`) |
+| private kernel add-on (HIP) | `744bd713d968` |
+| private NPU kernel set | `17ed5be7a28a` |
+| private NPU runtime | `ce9fa59adf95` |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
 | DwarfStar / tokenizers | `5b013dc1bb` / `3012770722` |
@@ -72,14 +72,14 @@ before every run); **ours** = our sampler/batched standard (see the table legend
 the auto-opt database).
 
 **HRX speed (ours).** Qwen3.8-27B UD-Q4_K_XL with MTP, greedy 256-token chats: **36.0 / 26.8 / 29.9
-tok/s** on code / prose / short, from 25.9 / 20.5 / 21.9 before the verify kernels — 2–8-token
-K-quant verify took the step from 121 ms to 88 ms (`#487`). Decode without MTP stays 12.2 tok/s.
+tok/s** on code / prose / short, from 25.9 / 20.5 / 21.9 before the speculative verify pass was
+reworked — the step it took is 121 ms to 88 ms per step (`#487`). Decode without MTP stays 12.2 tok/s.
 
 | change | PR | measured |
 |---|---|---|
-| 2..8-token K-quant verify kernels | `#487` | 27B `--mtp` **+31–39 %** |
-| batched MoE decode on our kernels | `#521`, `#526` | pin `744bd713d968`: the top-1 batched window from 5 tokens; the batched cells below were measured one pin earlier (90 W cap, PCM pad (23 Oct)) |
-| split-K decode attention for gated head-256 | `#500` | Qwen3.5-4B 32K decode **23.7 → 47.1 tok/s**; 27B **7.5 → 11.0** |
+| speculative verify pass rework | `#487` | 27B `--mtp` **+31–39 %** |
+| batched MoE decode | `#521`, `#526` | pin `744bd713d968`: batching pays from five tokens per window; the batched cells below were measured one pin earlier (90 W cap, PCM pad (23 Oct)) |
+| decode attention for gated attention at long context | `#500` | Qwen3.5-4B 32K decode **23.7 → 47.1 tok/s**; 27B **7.5 → 11.0** |
 | MoE formats for Qwen3.8-Flash-Next | `#494` | **5.1 → 26 tok/s**, 50 with MTP |
 | HIP prompt flash attention, causal block skipping | `#491` | Qwen3-4B pp4096 **+45 %** |
 | m128 prefill tiles + raster groups | `#490` | 27B prefill **+1.6…2.5 %** |
@@ -163,8 +163,8 @@ The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE
 
 The release is the HRX runtime with our HIP kernels and the NPU engine, all inside Lemonade. The
 release carries the NPU runtime, compiled into `1bit`, and the `onebit` recipe's `npu` backend.
-The NPU kernels are closed too: they ship as compiled, encrypted artifacts (`config/npu-kernels.config`,
-`ONEBIT_NPU_PRIVATE`) that `1bit` verifies and decrypts in memory at load, failing cleanly on a
+The NPU kernels are closed too: they ship as sealed artifacts that `1bit` verifies and opens in
+memory at load, failing cleanly on a
 wrong key with no network callback of any kind; a lifted kernel file is ciphertext and does not run
 ([npu.md](npu.md)). The release package carries them, and serves dense Qwen3 (0.6B, 1.7B, 4B)
 on the NPU.

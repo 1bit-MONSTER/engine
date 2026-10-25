@@ -49,7 +49,7 @@ fails a pin that leaves a gate model's node off HRX.
 |---|---|---|
 | `third_party/llama.cpp` | [1bit-MONSTER/llama.cpp](https://github.com/1bit-MONSTER/llama.cpp), branch `1bit/hrx-vulkan-patched` | AMD's `hrx-graph-develop-v2` (ggml-hrx on ggml-org llama.cpp) plus our commits ("Our patches") |
 | `third_party/hrx-system` | [1bit-MONSTER/hrx-system](https://github.com/1bit-MONSTER/hrx-system), pinned on branch `1bit/e3e6a976-pin-6` (the commit `config/hrx-system-hold.config` names; `1bit/main` is where the unheld bump merges AMD) | [ROCm/hrx-system](https://github.com/ROCm/hrx-system) (libhrx, loomc and the Loom tools) at AMD's pin plus our commits ("Our hrx-system commits") |
-| private HIP kernels | [1bit-MONSTER/gpu-kernels](https://github.com/1bit-MONSTER/gpu-kernels) (not a submodule: a build points at a checkout with `-DONEBIT_GPU_PRIVATE`) | `4f586cac` — the commit the release builds and the hardware gate were run at |
+| private HIP kernels | a private kernel add-on (not a submodule: a build points at a checkout with `-DONEBIT_GPU_PRIVATE`) | `4f586cac` — the commit the release builds and the hardware gate were run at |
 
 - **Our hrx-system commits** (since 2026-10-18 on branch `1bit/e3e6a976-pin-6` of our fork, on
   AMD's `e3e6a9766ccb`): two libhrx device knobs for diagnosis, `HRX_AQL_BLOCK_SIZE` and
@@ -589,6 +589,13 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
 - **PrismML tile bytes** ([llama.cpp #74](https://github.com/1bit-MONSTER/llama.cpp/pull/74)): the low-token
   SwiGLU sized PQ2_0 / PTQ1_0 weight rows from a tile size of 0, so every row read row 0. Ternary-Bonsai-1.7B
   PQ2_0 decode perplexity 1,225,624 -> 20.65 (CPU 20.70); the 27B files took another kernel and were unaffected.
+  **PQ2_0 on the dense prefill kernels and ternary weights on the 2..16-token verify kernels** (private
+  add-on, 2026-10-25): Ternary-Bonsai-2-27B PQ2_0 pp512 188 -> 553 tok/s, and its ternary verify batch
+  decodes at 43.3 / 37.3 / 27.1 tok/s on code / prose / short with the Qwen3.8-27B MTP head (39/40 GSM8K).
+- **NVFP4 (ggml type 40) and Q2_0 (type 42)**: prompt and decode on HRX through our HIP kernels
+  (private add-on, 2026-10-24), no extra flag or environment: a Qwen3.8-27B file of either type loads
+  and runs with **one graph split**. Measured on the 27B, performance mode: NVFP4 pp512 613 / tg128
+  12.7 tok/s, KLD vs the CPU 0.00144; Q2_0 pp512 632 / tg128 23.1 tok/s, KLD vs the CPU 0.00055.
 - **TQ1_0 / TQ2_0** ([llama.cpp #69](https://github.com/1bit-MONSTER/llama.cpp/pull/69)): ggml's ternary types
   in the shared dequantizer and on the K-quant decode kernels. Ternary-Bonsai-1.7B, HRX0 vs CPU: KLD 0.000523,
   same top token 98.67%; pp512 / tg128 TQ1_0 3542 / 113, TQ2_0 4100 / 156 tok/s.
@@ -697,7 +704,7 @@ public HIP-through-HRX plumbing (`ggml/src/ggml-hrx/hip/`). `-DONEBIT_GPU_PRIVAT
 (with `-DONEBIT_HRX=ON`) passes `GGML_HRX_HIP_ADDON_DIR=<checkout>/addons/hip-hrx` to the HRX
 llama.cpp build, which compiles those kernels and matchers in; it needs a llama.cpp pin with
 that hook. Without the option the build is unchanged. The release builds with it, from the
-commit pinned in `config/gpu-kernels.config`, so the release binaries carry the kernels as
+commit pinned in the release config, so the release binaries carry the kernels as
 compiled code objects while their source stays private ([releases.md](releases.md), "Private
 components"). To drop the add-on from an existing
 build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).

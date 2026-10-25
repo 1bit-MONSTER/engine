@@ -1,0 +1,44 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/1bit/power — power profile and fan overrides for 1bit OS.
+#
+# The defaults below are the values in force with this file untouched: they are the profile the 1bit
+# development box runs on the same board (performance mode, 90 W sustained), so a shipped appliance and the
+# numbers on the leaderboard describe the same machine. Change a line to override it; the file is read as
+# KEY=value and nothing in it is executed.
+#
+# Order at boot: the EC power mode first (a mode write resets the SMU limits), then the SMU limits, then the
+# fabric/SoC clock pins. If the SMU limits cannot be written (no tool, or /dev/mem refused - see the Secure
+# Boot note in TOSFANS-STATE), the EC falls back to FALLBACK_MODE and the boot banner says which cap is in force.
+#
+#POWER_MODE=performance     # quiet | balanced | performance (the EC's own power mode)
+#STAPM_W=90                 # sustained package power limit, watts
+#SLOW_W=90                  # slow (average) limit, watts
+#FAST_W=105                 # fast (burst) limit, watts
+#TCTL_C=95                  # die temperature limit, degrees C
+#FALLBACK_MODE=balanced     # EC mode used when the SMU limits cannot be written (85 W sustained, 120 W burst)
+#FCLK=7                     # amdgpu pp_dpm_fclk index, or auto to let the driver choose
+#SOCCLK=6                   # amdgpu pp_dpm_socclk index
+#RYZENADJ=/opt/1bit/ryzenadj  # the SMU tool; empty = search /opt/1bit, /usr/local/bin, /usr/bin
+#SKIP_POWER=1               # do not touch power at all (the firmware profile stays)
+#
+# Fans: the EC applies this curve on its own sensor (levels 1..5 = 20/40/60/80/100 %).
+# The boost raises the CPU fans to level 4 on load and back to the curve after 20 s quiet.
+#FAN_UP=45,54,62,70,76
+#FAN_DOWN=41,50,58,66,72
+#FAN_HOT5_C=82              # Tctl that sends the boost to level 5 (100 %) and holds it down to 76 C.
+                            # FIRST THING TO REVISIT on a hotter unit: this trip, and the curve points above,
+                            # were tuned on the development box's board with a phase-change pad.

@@ -18,6 +18,7 @@
 #include <cstring>
 #include <fstream>
 #include <string>
+#include <vector>
 
 namespace onebit {
 
@@ -74,6 +75,63 @@ inline std::string gguf_architecture(const std::string& path) {
         if (!f) return "";
     }
     return "";
+}
+
+// True when every key in `wanted` appears in the file's metadata section (GGUF v2/v3, little
+// endian, same format assumptions as gguf_architecture). An empty list is true. Only the key/value
+// header is read; the tensors are never touched, and the walk stops as soon as every key was seen.
+inline bool gguf_has_keys(const std::string& path, const std::vector<std::string>& wanted) {
+    if (wanted.empty()) return true;
+    std::ifstream f(path, std::ios::binary);
+    auto rd = [&](void* p, size_t n) { return static_cast<bool>(f.read(static_cast<char*>(p), n)); };
+    uint32_t magic = 0, version = 0;
+    uint64_t n_tensors = 0, n_kv = 0;
+    if (!rd(&magic, 4) || magic != 0x46554747u /* "GGUF" */ || !rd(&version, 4) || version < 2 ||
+        !rd(&n_tensors, 8) || !rd(&n_kv, 8))
+        return false;
+    auto str = [&](std::string* out) {
+        uint64_t n = 0;
+        if (!rd(&n, 8) || n > (1u << 20)) return false;
+        if (!out) return static_cast<bool>(f.ignore(static_cast<std::streamsize>(n)));
+        out->resize(n);
+        return rd(out->data(), n);
+    };
+    static const int size[] = {1, 1, 2, 2, 4, 4, 4, 1, 0, 0, 8, 8, 8};
+    auto scalar = [](uint32_t t) -> int { return t < 13 ? size[t] : -1; };
+    std::vector<bool> seen(wanted.size(), false);
+    size_t left = wanted.size();
+    for (uint64_t i = 0; i < n_kv && i < 4096 && left > 0; ++i) {
+        std::string key;
+        uint32_t type = 0;
+        if (!str(&key) || !rd(&type, 4)) return false;
+        for (size_t w = 0; w < wanted.size(); ++w) {
+            if (!seen[w] && wanted[w] == key) {
+                seen[w] = true;
+                --left;
+            }
+        }
+        if (type == 8) {
+            if (!str(nullptr)) return false;
+        } else if (type == 9) {
+            uint32_t et = 0;
+            uint64_t n = 0;
+            if (!rd(&et, 4) || !rd(&n, 8)) return false;
+            if (et == 8) {
+                for (uint64_t j = 0; j < n; ++j)
+                    if (!str(nullptr)) return false;
+            } else if (scalar(et) > 0) {
+                f.ignore(static_cast<std::streamsize>(n * scalar(et)));
+            } else {
+                return false;
+            }
+        } else if (scalar(type) > 0) {
+            f.ignore(static_cast<std::streamsize>(scalar(type)));
+        } else {
+            return false;
+        }
+        if (!f) return false;
+    }
+    return left == 0;
 }
 
 // The integer value of metadata key `key` (any GGUF integer type), or -1 when the file is not a

@@ -13,8 +13,8 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|cpu|ds4] [--mtp HEAD]`
-//                        [--npu-opt KEY=VALUE ...]
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|hybrid|cpu|ds4] [--mtp HEAD]`
+//                        [--npu-opt KEY=VALUE ...] [--prefill-provider PATH]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -33,6 +33,9 @@
 //                                                  -DONEBIT_NPU_PRIVATE (docs/npu.md)
 //   a .gguf, --device hrx                       -> the HRX build's llama-server on HRX0
 //   a .gguf, --device cpu                       -> the same llama-server with no GPU layers
+//   a .gguf, --device hybrid                    -> the HRX llama-server decodes; the prompt's KV comes
+//                                                  from an external prefill provider (the NPU engine,
+//                                                  ONEBIT_HYBRID_PREFILL; app/serve_hybrid.h, docs/hybrid.md)
 //   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
 //   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
 //                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
@@ -72,6 +75,7 @@
 #include "recipes.h"
 #include "serve_metrics.h"
 #include "serve_watchdog.h"
+#include "serve_hybrid.h"
 #include "sysinfo.h"
 
 #ifdef ONEBIT_MOE
@@ -165,6 +169,7 @@ struct Options {
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
+    std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
     std::string route_policy;            // --route-policy FILE: request class -> device (default: built in)
@@ -702,12 +707,15 @@ bool wants_stream(const std::string& body) {
 }
 
 // watch, where given, tracks the request for the progress watchdog (app/serve_watchdog.h).
+// body_override, where given, is the JSON body to send in place of the request's (hybrid: id_slot and
+// cache_prompt added); on_first_byte, where given, runs when the first byte of the reply arrives.
 void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std::string& our_id, bool drop_model,
              const std::string& set_model, bool precise, const httplib::Request& req, httplib::Response& res,
-             ProgressWatch* watch = nullptr) {
+             ProgressWatch* watch = nullptr, const json* body_override = nullptr,
+             std::function<void()> on_first_byte = nullptr) {
     json body;
     try {
-        body = json::parse(req.body);
+        body = body_override ? *body_override : json::parse(req.body);
     } catch (const std::exception&) {
         res.status = 400;
         res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
@@ -741,6 +749,7 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
                 c.stop();
             }
         auto r = pending.get();
+        if (on_first_byte) on_first_byte();
         if (!r) {
             res.status = 502;
             res.set_content(R"({"error":{"message":"backend did not answer"}})", "application/json");
@@ -758,12 +767,15 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
     }
     // Streaming: relay the child's SSE bytes as they arrive.
     const size_t prompt_bytes = req.body.size();
-    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes](size_t, httplib::DataSink& sink) {
+    res.set_chunked_content_provider("text/event-stream", [port, path, payload, held, watch, prompt_bytes, on_first_byte](size_t, httplib::DataSink& sink) {
         const auto tracked = watch ? watch->begin(port, "POST " + path + " (streamed)", prompt_bytes, false) : nullptr;
         httplib::Client c("127.0.0.1", port);
         c.set_read_timeout(3600);
+        bool first = true;
         c.Post(path, httplib::Headers{}, payload, "application/json",
-               [&sink, &tracked](const char* data, size_t n) {
+               [&sink, &tracked, &first, &on_first_byte](const char* data, size_t n) {
+                   if (first && on_first_byte) on_first_byte();
+                   first = false;
                    if (tracked) ProgressWatch::progress(*tracked, n);
                    return sink.write(data, n);
                });
@@ -804,6 +816,8 @@ struct Launch {
     bool mtp = false;
     std::string ready_path = "/health";
     std::vector<std::string> env_override;  // set in place of the inherited value (Child)
+    bool hybrid = false;     // --device hybrid: the prompt's KV comes from the prefill provider (app/serve_hybrid.h)
+    std::string slot_dir;    // hybrid: the backend's --slot-save-path, where the handoff files go
 };
 
 // A GGUF that carries its own MTP head (<architecture>.nextn_predict_layers > 0: Unsloth's Qwen3.8-27B
@@ -892,6 +906,8 @@ bool delta_net_arch(const std::string& arch) {
     return arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next";
 }
 
+std::string auto_gguf_device(const Options& o);
+
 Launch launch_for(const Options& o, const std::string& device, int child_port) {
     Launch l;
     l.device = device;
@@ -900,6 +916,30 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     std::vector<std::string>& env = l.env;
     std::string& set_model = l.set_model;
     if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
+    if (device == "hybrid") {
+        // Hybrid (docs/hybrid.md, app/serve_hybrid.h): llama-server decodes on HRX (the CPU in a build
+        // without HRX, so the path runs anywhere), from a KV cache an external prefill provider computed
+        // and serve restored into its one slot. The handoff is a sequence-state file in --slot-save-path.
+        // Nothing else is handed over: no drafter, no images, no second slot.
+        if (!o.mtp.empty() || !o.dflash.empty() || !o.mmproj.empty() || o.parallel > 1 || !o.role.empty() || o.moe_slots != 0)
+            throw std::runtime_error("--device hybrid takes no --mtp, --dflash, --mmproj, --moe-slots, --parallel > 1 or a role: "
+                                     "one slot, decoding from the provider's KV (docs/hybrid.md)");
+#if defined(_WIN32)
+        throw std::runtime_error("--device hybrid is a Linux route");
+#else
+        Options one = o;
+        one.parallel = 1;
+        one.no_mtp = true;   // the slot's KV comes from the provider; the GGUF's own MTP head would draft over it unverified
+        Launch l = launch_for(one, auto_gguf_device(o), child_port);
+        char dir[] = "/tmp/1bit-hybrid-XXXXXX";
+        if (!::mkdtemp(dir)) throw std::runtime_error(std::string("--device hybrid: cannot make a slot directory: ") + std::strerror(errno));
+        l.slot_dir = dir;
+        l.argv.insert(l.argv.end(), {"--slot-save-path", l.slot_dir});
+        l.device = "hybrid";
+        l.hybrid = true;
+        return l;
+#endif
+    }
     if (device == "hrx" || device == "cpu") {
         // --device cpu: llama-server with no GPU layers (what --device auto falls back to where
         // HRX has no route for a request, and in a build without HRX)
@@ -1071,6 +1111,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         facts.architecture = gguf_architecture(o.model);
         facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
         facts.drafter = !o.dflash.empty() ? "dflash" : (!o.mtp.empty() || own_mtp) ? "mtp" : "none";
+        if (recipes.needs_gguf_keys()) {
+            // only recipes that match on the file's metadata keys pay for this read (the header alone)
+            for (const auto& rec : recipes.list)
+                for (const auto& key : rec.gguf_keys)
+                    if (std::find(facts.gguf_keys.begin(), facts.gguf_keys.end(), key) == facts.gguf_keys.end() &&
+                        gguf_has_keys(o.model, {key}))
+                        facts.gguf_keys.push_back(key);
+        }
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }
@@ -1399,7 +1447,8 @@ int serve_only(const std::string& why) {
 // in order; "warmup" is the first one, for a lemond that reads only that), and Lemonade's onebit recipe
 // sends them once the backend is ready, before it marks the model loaded.
 static bool warmup_wanted(const std::string& device) {
-    return getenv("ONEBIT_NO_WARMUP") == nullptr && device.substr(0, device.find(' ')) == "hrx";
+    const std::string dev = device.substr(0, device.find(' '));
+    return getenv("ONEBIT_NO_WARMUP") == nullptr && (dev == "hrx" || dev == "hybrid");
 }
 
 static const char* const kWarmupPath = "/v1/chat/completions";
@@ -1562,6 +1611,7 @@ int serve_child(const Options& given) {
         // --print-backend (docs/serve.md, "One hop from Lemonade"): only a lone llama-server can be
         // started by Lemonade itself; these need serve in the request path
         if (o.device == "ds4") return serve_only("--device ds4 is not a llama-server");
+        if (o.device == "hybrid") return serve_only("--device hybrid hands each prompt's KV to llama-server in serve");
         if (o.pm) return serve_only("--pm runs its tool loop in serve");
         if (o.laya_auto || !o.laya_model.empty()) return serve_only("--laya routes each request in serve");
         if (!o.embed.empty() || !o.rerank.empty()) return serve_only("--embed and --rerank run more servers behind serve");
@@ -1715,6 +1765,30 @@ int serve_child(const Options& given) {
     const std::string device = laya ? "laya" : backends[0].device;
     const bool drop_model = backends[0].drop_model;
     const std::string set_model = backends[0].set_model;
+
+    // --device hybrid (app/serve_hybrid.h, docs/hybrid.md): the prefill provider, when named; without one
+    // the backend prefills every prompt itself (said once), so the device still serves.
+    std::unique_ptr<hybrid::Prefill> hybrid_prefill;
+    struct SlotDirGuard {
+        std::string dir;
+        ~SlotDirGuard() { if (!dir.empty()) { std::error_code ec; fs::remove_all(dir, ec); } }
+    } slot_dir_guard{backends[0].hybrid ? backends[0].slot_dir : ""};
+    if (backends[0].hybrid) {
+        if (o.pm) throw std::runtime_error("--device hybrid does not combine with --pm (the tool loop forwards its own requests)");
+        std::string provider = o.prefill_provider;
+        if (provider.empty())
+            if (const char* e = std::getenv("ONEBIT_HYBRID_PREFILL"); e && *e) provider = e;
+        std::string elfs;
+        if (const char* e = std::getenv("ONEBIT_HYBRID_ELFS"); e && *e) elfs = e;
+        if (provider.empty()) {
+            std::fprintf(stderr, "1bit serve: hybrid: no prefill provider (--prefill-provider or ONEBIT_HYBRID_PREFILL): "
+                                 "the %s backend prefills every prompt itself (docs/hybrid.md)\n", auto_gguf_device(o).c_str());
+        } else {
+            hybrid_prefill = std::make_unique<hybrid::Prefill>(provider, elfs, backends[0].slot_dir, o.model);
+            std::fprintf(stderr, "1bit serve: hybrid: prefill by %s%s%s, decode on %s\n", provider.c_str(),
+                         elfs.empty() ? "" : " --elfs ", elfs.c_str(), auto_gguf_device(o).c_str());
+        }
+    }
 
     std::vector<Launch> rag;   // [0] embedding, then rerank, if given
     if (!o.embed.empty()) rag.push_back(rag_launch(o, o.embed, "embedding", free_port()));
@@ -1949,6 +2023,41 @@ int serve_child(const Options& given) {
             held = std::make_shared<InFlight>(&inflight[pick]);
         }
         ++routed[pick];
+        if (backends[pick].hybrid && hybrid_prefill) {
+            // the handoff (app/serve_hybrid.h): template + tokenize on the backend, the provider's prefill,
+            // restore into slot 0, then the request pinned to that slot. One slot: one request at a time,
+            // held through its decode so the next handoff cannot replace a KV still in use.
+            json body;
+            try {
+                body = json::parse(q.body);
+            } catch (const std::exception&) {
+                r.status = 400;
+                r.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
+                return;
+            }
+            // The lock is held until the backend has started on the slot (its first byte): from then
+            // on llama-server itself defers a restore into a busy slot. httplib runs the handler and
+            // the streamed reply on one thread, so the unlock is on the locking thread.
+            auto slot = std::make_shared<std::unique_lock<std::mutex>>(hybrid_prefill->slot_mutex());
+            const auto t0 = std::chrono::steady_clock::now();
+            const hybrid::Outcome h = hybrid_prefill->prepare(backends[pick].port, q.path, body);
+            if (!h.handed_over) {
+                std::fprintf(stderr, "1bit serve: hybrid: %s; the backend prefills this request itself\n", h.why.c_str());
+                slot->unlock();
+                forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
+                return;
+            }
+            const size_t n = h.n_tokens;
+            const double prefill_ms = h.prefill_ms, restore_ms = h.restore_ms;
+            forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch, &body,
+                    [t0, n, prefill_ms, restore_ms, slot] {
+                        const double ttft = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+                        std::fprintf(stderr, "1bit serve: hybrid: %zu prompt tokens: prefill %.0f ms, restore %.0f ms, first byte %.0f ms\n",
+                                     n, prefill_ms, restore_ms, ttft);
+                        if (slot->owns_lock()) slot->unlock();
+                    });
+            return;
+        }
         forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch);
     };
     srv.Post("/v1/chat/completions", post);
@@ -1956,7 +2065,7 @@ int serve_child(const Options& given) {
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
     // the first backend; the NPU and DwarfStar answer 501.
-    const bool llama = device == "hrx" || device == "cpu" ||
+    const bool llama = device == "hrx" || device == "cpu" || device == "hybrid" ||
                        (laya && (backends[0].device == "hrx" || backends[0].device == "cpu"));
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
         r.status = 501;
@@ -2473,8 +2582,11 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|cpu|ds4] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|hrx|hybrid|cpu|ds4] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--hrx-libhsa PATH]\n"
+                 "                  [--prefill-provider PATH]   --device hybrid: the program that prefills each prompt\n"
+                 "                  (the NPU engine) and writes its KV for llama-server, which decodes it on HRX\n"
+                 "                  (or ONEBIT_HYBRID_PREFILL; ONEBIT_HYBRID_ELFS passes --elfs; docs/hybrid.md)\n"
                  "                  [--hrx-cwsr-placement=auto|on|off]   engine#315: on a CWSR-on amdgpu (auto, the default)\n"
                  "                  or always (on), HRX backends get HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0\n"
                  "                  HRX_ALLOW_NO_SVM=1, which put the CWSR save area in GTT (docs/hrx.md)\n"
@@ -2587,6 +2699,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--reranking") o.role = "reranking";
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
+        else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
         else if (a == "--laya") o.laya_auto = true;
         else if (a == "--route-policy") o.route_policy = next();

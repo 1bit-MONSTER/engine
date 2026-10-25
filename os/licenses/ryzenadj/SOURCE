@@ -1,0 +1,12 @@
+SMU power-limit tool: ryzenadj (sets STAPM / slow / fast PPT and the die temperature limit)
+Ship: yes
+Project: RyzenAdj, https://github.com/FlyGoat/RyzenAdj
+Release: v0.19.0, commit ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182 (2026-05-13, "Bump version to 0.19.0")
+License: LGPL-3.0 (LICENSE, shipped here); the source in src/ is that tag, verbatim, and it is installed
+into the image under /usr/share/licenses/1bit-os/ryzenadj/src.
+Build: from the source in this directory, by os/mini/mkimage.sh (deterministic - the image never depends on
+       what the build machine happens to have):
+         cmake -B build -DCMAKE_BUILD_TYPE=Release && cmake --build build -j4
+       needs cmake, gcc, pkg-config and libpci-dev on the build machine; links libpci, libudev, libz, libc.
+Why it ships: the EC power mode alone gives the firmware's own profile; the 90 W sustained cap this image
+ships needs the SMU limits written with this tool (through /dev/mem; see os/LICENSES.md and TOSFANS-STATE).

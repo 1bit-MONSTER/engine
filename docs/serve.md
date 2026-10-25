@@ -526,6 +526,19 @@ with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that at
 bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B were checked on the
 removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU and DwarfStar routes take no `--mmproj`.
 
+## Greedy requests (`temperature 0`)
+
+A request with `temperature: 0` (or any negative temperature) leaves nothing to sample: serve forwards
+it with `top_k: 1`, so llama-server takes the argmax and skips the top-p / min-p passes over the whole
+vocabulary. On a 262147-entry vocabulary those passes cost about **2.1 ms per token**, which is most of
+the decode step on a small model: ZAYA1-8B Q4_K_M goes from 118 to 153 tok/s at temperature 0, and
+Qwen3.8-27B gains in proportion to its own vocabulary (248320 entries).
+
+A request that names its own `top_k` keeps it — only the absent case is filled in — and a request with
+any other temperature is forwarded untouched, so sampling behaviour is unchanged everywhere it matters.
+`tests/greedy_shortcut.sh` (ctest `greedy_shortcut`) pins all four cases against `tests/fake_backend.py`
+without a GPU.
+
 ## Multi-token prediction (`--mtp`)
 
 `--mtp <head.gguf>` turns on llama-server's `draft-mtp` speculative decoding: the model's

@@ -32,12 +32,14 @@ struct RecipeFacts {
     std::string architecture;       // general.architecture of the -m file
     bool moe = false;               // <architecture>.expert_count > 0
     std::string drafter = "none";   // none, mtp, dflash
+    std::vector<std::string> gguf_keys;  // metadata keys present in the -m file (app/gguf_meta.h)
 };
 
 struct Recipe {
     std::string id, why, measured, source;
     std::vector<std::string> device, architecture, drafter;  // empty: any
     int moe = -1;                                             // -1: any, else 0 / 1
+    std::vector<std::string> gguf_keys;                       // empty: any; else every key must be present
     std::vector<std::string> args;                            // llama-server flags and values
     std::vector<std::pair<std::string, std::string>> env;     // backend environment
 
@@ -55,6 +57,10 @@ struct Recipes {
     // them. Returns "id: what it added" for every recipe that added something.
     std::vector<std::string> apply(const RecipeFacts& f, std::vector<std::string>& argv,
                                    std::vector<std::string>& env) const;
+
+    // True when any recipe matches on the model file's metadata keys, so serve reads that section
+    // of the file only when a recipe needs it.
+    bool needs_gguf_keys() const;
 };
 
 // config/recipes.json as built into this binary.

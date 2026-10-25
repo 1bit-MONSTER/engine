@@ -36,3 +36,24 @@ inline std::string built_path(const char* compiled) {
 #endif
     return std::string(compiled);   // an absolute (older build) or a path with no file beside us
 }
+
+// A helper script the package keeps beside the executable, REL being its path from the executable's
+// directory (scripts/package-linux.sh packs scripts/ and tools/ there). scripts/ lives outside the
+// build dir, so its CMake path escapes it (../src/scripts/...) and no package layout could mirror
+// that; a build tree still has the script at BAKED, so that stays the fallback.
+inline std::string packaged_path(const char* rel, const char* baked) {
+    namespace fs = std::filesystem;
+    std::error_code ec;
+#if defined(__linux__)
+    const fs::path here = fs::read_symlink("/proc/self/exe", ec).parent_path();
+    if (!ec) {
+        if (fs::exists(here / rel, ec)) return (here / rel).string();
+        // the build-tree fallback resolves against the executable's own directory too: a relative
+        // baked path left as-is would be tested against the caller's working directory, so the
+        // same binary would find its tools from one directory and not from another
+        const fs::path p = baked;
+        if (!p.is_absolute() && fs::exists(here / p, ec)) return (here / p).string();
+    }
+#endif
+    return std::string(baked);
+}

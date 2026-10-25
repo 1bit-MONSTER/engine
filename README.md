@@ -59,6 +59,9 @@ hands to 1bit, it runs the engine as one of its backends, behind an OpenAI-compa
   same build on the CPU.
 - **The NPU engine** on the XDNA 2 NPU, in progress: correctness first, speed next
   ([docs/npu.md](docs/npu.md)).
+- **Hybrid**: the prompt on the NPU engine, the tokens on HRX. `1bit serve --device hybrid` hands
+  the prompt's KV cache from a prefill provider to the HRX llama-server
+  ([docs/hybrid.md](docs/hybrid.md)).
 - **DwarfStar**, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD
   expert streaming ([docs/dwarfstar.md](docs/dwarfstar.md)).
 - **Laya**, opt-in, which picks where each request runs ([docs/laya.md](docs/laya.md)), and
@@ -116,6 +119,19 @@ repository, their source is not published, and they are not under Apache-2.0: th
 third-party parts in [NOTICE-BINARY](NOTICE-BINARY)). A build from this
 repository without them has no NPU engine and runs HRX on the public kernels only
 ([NOTICE](NOTICE), [docs/releases.md](docs/releases.md#private-components)).
+
+## How to credit
+
+Credit is welcome and, for the code, required: the Apache-2.0 license keeps the copyright
+notices and the [NOTICE](NOTICE) file with every copy. Three lines are enough:
+
+```
+1bit engine - https://github.com/1bit-MONSTER/engine - Copyright 2026 bong-water-water-bong - Apache-2.0
+```
+
+[CITATION.cff](CITATION.cff) carries the same in citation form (GitHub shows it under
+"Cite this repository"). If you build on a specific piece, name the file or the pull request it
+came from; the history is public.
 
 ## Thank you
 

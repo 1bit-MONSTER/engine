@@ -15,9 +15,9 @@
 #
 # Move third_party/xdna-driver, the amdxdna kernel driver pin (docs/npu.md, "The
 # XDNA driver"), to upstream amd/xdna-driver main: opens a PR moving the
-# submodule. Only the kernel driver is pinned here: the engine is XRT-free (its
-# NPU runtime is compiled into 1bit), so nothing from the pin is built into the
-# release, and XRT (xdna-driver's own xrt submodule) is not tracked.
+# submodule. Only the kernel driver is pinned here: the NPU runtime is compiled
+# into 1bit, so nothing from the pin is built into the release, and the driver's
+# own userspace submodules are not tracked.
 #
 # Run by hand only (workflow_dispatch): a driver move means rebuilding and
 # re-signing the out-of-tree module on Strix Halo and running the NPU check

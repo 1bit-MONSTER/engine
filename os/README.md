@@ -25,11 +25,11 @@ settings. The engine is one of Lemonade's backends, the `onebit` recipe (HRX0 an
 stable-diffusion.cpp, Kokoro and the rest).
 
 What is in it: the kernel with the GPU (`amdgpu`, which also gives HSA its `/dev/kfd`) and NPU
-(`amdxdna`) drivers, the firmware those chips load, BusyBox (no XRT: the NPU runtime is compiled into `1bit`), Mesa's Radeon
-Vulkan driver (for Lemonade's Vulkan backends), Lemonade (`lemond`, the `lemonade` CLI and the web
-app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit` with its HRX backend
-(the `llama-server` it runs and the HSA runtime that `llama-server` loads are on the data partition -
-`1bit-llama/` below - because the initramfs has to stay under the size grub will load).
+(`amdxdna`) drivers, the firmware those chips load, BusyBox, the NPU runtime compiled into `1bit`,
+Mesa's Radeon Vulkan driver (for Lemonade's Vulkan backends), Lemonade (`lemond`, the `lemonade` CLI
+and the web app, built from the engine's pin `third_party/lemonade`), and the engine: `1bit` with its
+HRX backend (the `llama-server` it runs and the HSA runtime that `llama-server` loads are on the data
+partition - `1bit-llama/` below - because the initramfs has to stay under the size grub will load).
 
 Everything that has to last lives on the stick's `1BIT-DATA` partition:
 
@@ -231,8 +231,8 @@ qemu-system-x86_64 -enable-kvm -cpu host -m 4G -kernel /boot/vmlinuz-$(uname -r)
 ```
 
 `1bit.check` makes init check that the engine, `llama-server`, Lemonade, the HSA runtime and the
-NPU firmware are in place and start, that the image carries no XRT library, print `1BIT-OS CHECK PASS` or `FAIL`, and power
-off.
+NPU firmware are in place and start, that the image's runtime dependencies are self-contained, print
+`1BIT-OS CHECK PASS` or `FAIL`, and power off.
 
 `os/mini/vmtest.sh out build [model.gguf]` boots the USB image in QEMU/KVM with UEFI, installs it
 onto an empty virtual NVMe with `1bit-install` (checking every refusal first), boots from that

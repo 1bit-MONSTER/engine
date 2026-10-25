@@ -90,6 +90,34 @@ else
     skip npu "no NPU in this VM: /dev/accel and /lib/firmware/amdnpu only appear on the machine"
 fi
 
+# ── fans (EC fan curve; only a board we know has one we drive) ──────────────────────────────────
+if [ ! -x /usr/sbin/1bit-board ]; then
+    skip fans "no /usr/sbin/1bit-board in this image: the fans stay on the firmware curve"
+elif ! /usr/sbin/1bit-board known; then
+    skip fans "this board has no EC we drive: the firmware fan curve stays"
+elif [ ! -d /sys/class/ec_su_axb35 ]; then
+    skip fans "ec_su_axb35 did not load: the firmware fan curve stays"
+else
+    # level 4 (the boost level) for 5 s, then every CPU fan must report rpm > 0. A fan that reads 0 rpm
+    # at 80 % is exactly the fault this row exists for - it is how the system fan failed on 2026-10-04.
+    for f in fan1 fan2; do
+        printf 'fixed\n' > "/sys/class/ec_su_axb35/$f/mode" 2>/dev/null
+        printf '4\n' > "/sys/class/ec_su_axb35/$f/level" 2>/dev/null
+    done
+    sleep 5
+    RPMS=; BAD=0
+    for f in fan1 fan2; do
+        r=$(cat "/sys/class/ec_su_axb35/$f/rpm" 2>/dev/null || echo 0)
+        RPMS="$RPMS$f $r rpm, "
+        [ "$r" -gt 0 ] 2>/dev/null || BAD=1
+    done
+    for f in fan1 fan2; do printf 'curve\n' > "/sys/class/ec_su_axb35/$f/mode" 2>/dev/null; done
+    RPMS=$(printf '%s' "$RPMS" | sed 's/, $//')
+    if [ "$BAD" = 0 ]; then pass fans "controlled ($RPMS at level 4)"
+    else fail fans "the driver loaded but a fan reads 0 rpm at level 4 ($RPMS): the curve and the boost cannot cool this board"
+    fi
+fi
+
 # ── Lemonade, with and without the key ──────────────────────────────────────────────────────────
 if [ -z "$KEY" ]; then
     fail lemonade "no LEMONADE_API_KEY in /data/lemonade/lemond.conf: a network-facing server without a key"

@@ -34,6 +34,14 @@ include(ExternalProject)
 
 set(ONEBIT_HRX_TOOLCHAIN "/opt/rocm-therock" CACHE PATH "ROCm/TheRock root: its amdclang builds llama.cpp and HRX")
 
+# The HRX binaries carry strings from this tree and, with -DONEBIT_GPU_PRIVATE, from the add-on
+# checkout; both are rewritten so the shipped libraries name no build-machine path.
+set(ONEBIT_HRX_PATH_MAP_FLAGS "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+    CACHE STRING "Path mapping for the HRX llama.cpp build")
+if(ONEBIT_GPU_PRIVATE)
+    string(APPEND ONEBIT_HRX_PATH_MAP_FLAGS " -ffile-prefix-map=${ONEBIT_GPU_PRIVATE}=addon")
+endif()
+
 # A source build outside the org has no private HIP kernels to compile, so it links the prebuilt
 # HRX tree from the public binary drop instead (docs/releases.md, "The public binary drop"): the
 # pinned llama-server and its libraries, libggml-hrx.so with those kernels compiled in. Nothing is
@@ -88,7 +96,7 @@ endif()
 set(ONEBIT_HRX_LIBHSA "${_hrx_libhsa_first}" CACHE FILEPATH "TheRock HSA runtime HRX loads (IREE_HAL_AMDGPU_LIBHSA_PATH)")
 message(STATUS "ONEBIT_HRX: HSA runtime ${ONEBIT_HRX_LIBHSA}")
 
-# Private GPU kernels (docs/hrx.md, "Private HIP kernels"): a checkout of the private gpu-kernels
+# Private GPU kernels (docs/hrx.md, "Private HIP kernels"): a checkout of the private add-on
 # repository whose addons/hip-hrx is built into the HRX llama.cpp (its GGML_HRX_HIP_ADDON_DIR hook).
 set(_hrx_gpu_private_args)
 if(ONEBIT_GPU_PRIVATE)
@@ -132,8 +140,10 @@ ExternalProject_Add(llama_hrx
         -DHRX_SOURCE_DIR=${CMAKE_SOURCE_DIR}/third_party/hrx-system
         -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
+        "-DCMAKE_C_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}"
+        "-DCMAKE_CXX_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}"
         ${_hrx_gpu_private_args}
-    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench
+    BUILD_COMMAND ${CMAKE_COMMAND} --build <BINARY_DIR> --target llama-server llama-bench llama-perplexity
     INSTALL_COMMAND ""
     BUILD_ALWAYS ON
     USES_TERMINAL_BUILD ON)

@@ -355,7 +355,7 @@ if [ -z "$BIN" ]; then
       grep -q GGML_HRX_HIP_ADDON_DIR "$src/ggml/src/ggml-hrx/hip/ggml-hrx-hip.cmake" 2>/dev/null ||
         { note "::error::third_party/llama.cpp has no GGML_HRX_HIP_ADDON_DIR hook (needs the HIP plumbing)"; exit 2; }
       addon_args=(-DGGML_HRX_HIP_ADDON_DIR="$addon")
-      # the add-on's own check of its q8_0 KV decode kernel (the ops phase runs it)
+      # the add-on's own check (the ops phase runs it)
       targets+=(ggml-hrx-fa-decode-bench)
       note "private HIP kernels: gpu-kernels ${addon_pin:0:12} (addons/hip-hrx)"
     fi
@@ -544,7 +544,7 @@ fi
 
 # ---- npu (the NPU engine on Strix Halo; neutral, auto-skips without an NPU) ----------------
 # The checks themselves live in a private checker ($HW_GATE_NPU_CHECK): the NPU runtime and
-# kernels are closed source, so this phase only runs it, reads its neutral result lines and
+# the add-on is closed source, so this phase only runs it, reads its neutral result lines and
 # applies the speed floor. It prints: oracle/greedy64/prefill/reproducible <PASS|FAIL> and
 # tok_s <float>. oracle is dense Qwen3-0.6B decode vs an fp64 reference (token for token over a
 # prompt + teacher-forced steps), greedy64 the 64-position build, prefill the prompt prefill,

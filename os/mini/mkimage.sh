@@ -27,10 +27,9 @@
 # 1bit OS is a Lemonade appliance: it boots Lemonade's server (lemond), with Lemonade's defaults,
 # and the engine is one of Lemonade's backends (the onebit recipe). The initramfs holds BusyBox,
 # the kernel modules for the GPU (amdgpu, which also provides /dev/kfd) and the NPU (amdxdna),
-# Ethernet, Wi-Fi and USB storage, the firmware those load (the NPU runtime is compiled into 1bit:
-# no XRT), Mesa's Radeon
-# Vulkan driver (for Lemonade's Vulkan backends), Lemonade (lemond, the lemonade CLI and the web
-# app, built from the engine's pin third_party/lemonade), and the engine: 1bit and its HRX
+# Ethernet, Wi-Fi and USB storage, the firmware those load, the NPU runtime compiled into 1bit,
+# Mesa's Radeon Vulkan driver (for Lemonade's Vulkan backends), Lemonade (lemond, the lemonade CLI
+# and the web app, built from the engine's pin third_party/lemonade), and the engine: 1bit and its HRX
 # llama-server, with TheRock's HSA runtime that HRX loads (ONEBIT_HRX_LIBHSA from the build's
 # CMake cache, kept at its path, which 1bit has compiled in), each with exactly the shared
 # libraries it links. HRX compiles its Loom kernels on first use and caches them
@@ -124,6 +123,73 @@ for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
 cp /lib/modules/"$kver"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kver/" 2>/dev/null || true
+
+echo "== board driver (ec_su_axb35, GPL-2.0, source shipped in os/licenses/ec_su_axb35)"
+# The fans and the EC power mode are driven by the board's embedded controller and the kernel has no
+# driver for it, so it is built here, out of tree, against the image kernel - from the source this
+# repository ships next to it (GPL-2.0: the binary in the image always travels with its source).
+lic=$(cd "$here/.." && pwd)/licenses          # self-contained: $licenses is defined further down
+ecsrc=$lic/ec_su_axb35/src
+if [ "${EC_MODULE:-build}" = skip ]; then
+    echo "   skipped (EC_MODULE=skip): this image will leave the fans on the firmware curve"
+elif [ ! -d "$ecsrc" ]; then
+    echo "   os/licenses/ec_su_axb35/src is missing: the fans would stay on the firmware curve"; exit 1
+else
+    mkdir -p "$out/logs"
+    ecbuild=$(mktemp -d)
+    cp -a "$ecsrc"/. "$ecbuild"/
+    # the image kernel is clang-built (CONFIG_CC_IS_CLANG): an out-of-tree module has to use the same
+    # toolchain, or the compiler rejects the kernel's own flags (e.g. -mretpoline-external-thunk)
+    kmake=""
+    if grep -q "^CONFIG_CC_IS_CLANG=y" /boot/config-"$kver" 2>/dev/null; then
+        # LLVM=1 wants the whole LLVM toolchain (ld.lld, llvm-ar, llvm-nm, ...), so the matching
+        # /usr/lib/llvm-<major>/bin goes on PATH - a bare `clang` is not enough
+        kv=$(sed -n 's/^CONFIG_CLANG_VERSION=\([0-9]*\)/\1/p' /boot/config-"$kver" | head -n 1)
+        major=$(( ${kv:-99} / 10000 ))
+        for d in "/usr/lib/llvm-$major/bin" "$HOME/.cache/xdna-km/llvm$major/bin" /usr/lib/llvm-18/bin; do
+            [ -x "$d/ld.lld" ] && [ -x "$d/clang" ] && { PATH="$d:$PATH"; export PATH; kmake="LLVM=1"; break; }
+        done
+        [ -n "$kmake" ] || echo "   no LLVM toolchain (ld.lld) on this builder: the kernel is clang-built, the module will not build"
+    fi
+    if make -s -C "$ecbuild" KERNEL_BUILD=/lib/modules/"$kver"/build $kmake modules > "$out/logs/ec_su_axb35-build.log" 2>&1; then
+        mkdir -p "$root/lib/modules/$kver/updates"
+        # Secure Boot: an out-of-tree module has to be signed by a key the kernel trusts, i.e. a MOK that is
+        # enrolled. It must be the MOK - the "Secure Boot Kernel" cert carries no module-signing OID, so it
+        # can sign an EFI binary but not a module (verified on the development box: amdxdna.ko and our own
+        # ec_su_axb35.ko are both signed by "strixhalo Secure Boot MOK").
+        # note: MODULE_SIGN_KEY/MODULE_SIGN_CERT sign the module, and they are not MOK_KEY/MOK_CERT, which sign
+        # the EFI image further down: a module needs the MOK with the module-signing OID, the image needs the
+        # kernel-signing key. Both certificates are enrolled on the development box.
+        kdir=/lib/modules/"$kver"/build
+        modkey=${MODULE_SIGN_KEY:-/var/lib/shim-signed/mok/MOK.priv}
+        modcrt=${MODULE_SIGN_CERT:-/var/lib/shim-signed/mok/MOK.der}
+        # sign the scratch copy, never the file inside the image: sign-file needs the root-only MOK key, so it
+        # may run through sudo, and a root-written file inside the image tree breaks the later cpio/chmod
+        ko=$ecbuild/ec_su_axb35.ko; kosign=$ecbuild/ec_su_axb35.signed.ko
+        signed=0
+        if [ -x "$kdir/scripts/sign-file" ] && [ -r "$modcrt" ]; then
+            if [ -r "$modkey" ]; then
+                "$kdir/scripts/sign-file" sha256 "$modkey" "$modcrt" "$ko" "$kosign" && signed=1
+            elif sudo -n true 2> /dev/null; then
+                sudo -n "$kdir/scripts/sign-file" sha256 "$modkey" "$modcrt" "$ko" "$kosign" && signed=1
+            fi
+        fi
+        [ "$signed" = 1 ] && cp "$kosign" "$root/lib/modules/$kver/updates/ec_su_axb35.ko" \
+                         || cp "$ko" "$root/lib/modules/$kver/updates/ec_su_axb35.ko"
+        chmod 0644 "$root/lib/modules/$kver/updates/ec_su_axb35.ko"
+        echo "   ec_su_axb35.ko for $kver: $(stat -c %s "$root/lib/modules/$kver/updates/ec_su_axb35.ko") bytes"
+        if [ "$signed" = 1 ]; then
+            echo "   signed with $(basename "$modcrt") (the module-signing MOK)"
+        else
+            echo "   WARNING: ec_su_axb35.ko left UNSIGNED (need $modkey, $modcrt and $kdir/scripts/sign-file)"
+            echo "            it loads where module signature checking is off, which is the case for our kernel:"
+            echo "            CONFIG_LOCK_DOWN_IN_EFI_SECURE_BOOT is not set, so lockdown stays 'none' even with SB on"
+        fi
+    else
+        echo "   build FAILED (see $out/logs/ec_su_axb35-build.log); set EC_MODULE=skip to ship without it"; exit 1
+    fi
+    rm -rf "$ecbuild"
+fi
 # The NPU needs the PRIVATE XDNA driver build, not the stock module in /lib/modules: with the stock one
 # the engine's NPU route resets the machine. Same vermagic, so it is a straight drop-in.
 xdna=${AMDXDNA_KO:-$HOME/wt/perfopt-7.3-obj/drivers/accel/amdxdna/amdxdna.ko}
@@ -260,6 +326,31 @@ cp /usr/sbin/mke2fs "$root/bin/mke2fs"; chmod +x "$root/bin/mke2fs"
 copy_libs /usr/sbin/mke2fs
 cp /etc/mke2fs.conf "$root/etc/mke2fs.conf"
 cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/1bit-release-check"
+install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
+mkdir -p "$root/etc/1bit"
+install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
+# The SMU limits (the 90 W sustained cap) are set through ryzenadj, which is LGPL-3.0: ship the tool and
+# its licence. A builder without it still works - the EC power mode alone applies and the image says so.
+echo "== SMU tool (ryzenadj v0.19.0, LGPL-3.0, source pinned in os/licenses/ryzenadj, userspace build)"
+# Deterministic: built from the source this repository ships, never from whatever the build machine has.
+rjsrc=$lic/ryzenadj/src
+if [ ! -d "$rjsrc" ]; then echo "   os/licenses/ryzenadj/src is missing: the SMU cap could not be applied"; exit 1; fi
+mkdir -p "$out/logs"
+rjbuild=$(mktemp -d)
+if cp -a "$rjsrc"/. "$rjbuild"/ && ( cd "$rjbuild" \
+        && cmake -B build -DCMAKE_BUILD_TYPE=Release . > "$out/logs/ryzenadj-build.log" 2>&1 \
+        && cmake --build build -j4 >> "$out/logs/ryzenadj-build.log" 2>&1 ); then
+    mkdir -p "$root/opt/1bit"
+    cp "$rjbuild/build/ryzenadj" "$root/opt/1bit/ryzenadj"; chmod 0755 "$root/opt/1bit/ryzenadj"
+    for lib in $(ldd "$root/opt/1bit/ryzenadj" 2>/dev/null | awk '/=> \//{print $3}'); do
+        case "$lib" in */libc.so*|*/libm.so*|*/ld-linux*) continue ;; esac
+        if [ ! -e "$root$lib" ]; then mkdir -p "$root$(dirname "$lib")"; cp -L "$lib" "$root$lib"; fi
+    done
+    echo "   /opt/1bit/ryzenadj $(stat -c %s "$root/opt/1bit/ryzenadj") bytes ($(ldd "$root/opt/1bit/ryzenadj" 2>/dev/null | wc -l) libs linked)"
+else
+    echo "   build FAILED (see $out/logs/ryzenadj-build.log); needs cmake, a C compiler and libpci-dev"; exit 1
+fi
+rm -rf "$rjbuild"
 cp "$here/udhcpc.sh" "$root/etc/udhcpc.script"; chmod +x "$root/etc/udhcpc.script"
 echo "1bit-os" > "$root/etc/hostname"
 printf 'root:x:0:0:root:/root:/bin/sh\n' > "$root/etc/passwd"
@@ -275,6 +366,12 @@ cp "$here/../LICENSES.md" "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$s
 cp "$src/third_party/lemonade/LICENSE" "$doc/lemonade-LICENSE" ||
     { echo "no third_party/lemonade/LICENSE (git submodule update --init third_party/lemonade)"; exit 1; }
 cp "$licenses/llamacpp-hrx/ROCR-Runtime-LICENSE" "$doc/ROCR-Runtime-LICENSE"   # TheRock's libhsa for HRX
+# the board driver is GPL-2.0 and the SMU tool LGPL-3.0: source and licence travel in the image with them
+mkdir -p "$doc/ec_su_axb35" "$doc/ryzenadj"
+cp -a "$lic/ec_su_axb35/LICENSE" "$lic/ec_su_axb35/SOURCE" "$doc/ec_su_axb35/" 2>/dev/null || true
+if [ -d "$lic/ec_su_axb35/src" ]; then cp -a "$lic/ec_su_axb35/src" "$doc/ec_su_axb35/src"; fi
+cp -a "$lic/ryzenadj/LICENSE" "$lic/ryzenadj/SOURCE" "$doc/ryzenadj/" 2>/dev/null || true
+if [ -d "$lic/ryzenadj/src" ]; then cp -a "$lic/ryzenadj/src" "$doc/ryzenadj/src"; fi
 cp -rL /usr/share/common-licenses "$root/usr/share/"
 # the Ubuntu package behind each file in the image, found at its path or its merged-/usr alias
 (cd "$root" && find . -type f | cut -c2-) > "$out/image-files.txt"

@@ -25,8 +25,9 @@ so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|hrx|cpu|ds4] [--ctx-size N] [--alias NAME]
+           [--device auto|npu|hrx|hybrid|cpu|ds4] [--ctx-size N] [--alias NAME]
            [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH]
+           [--prefill-provider PATH]      --device hybrid: NPU prefill, HRX decode (docs/hybrid.md)
            [--hrx-cwsr-placement=auto|on|off]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
@@ -252,7 +253,7 @@ two processes (lemond, llama-server) instead of two hops and three.
 |---|---|---|
 | 0 | the plan is on stdout | starts it |
 | 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
-| 5 | the route needs serve in the request path: an NPU model directory, `--device npu` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `hybrid` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
 
 Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
 `LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
@@ -361,6 +362,7 @@ without a GPU.
 | Qwen3.6-35B-A3B Q4NX directory (`model_type` `qwen3_5_moe`) | `auto`, `npu` | a closed NPU add-on route, in process, in builds with `-DONEBIT_NPU_PRIVATE` ([npu.md](npu.md#add-on-routes)) |
 | `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
+| `.gguf` | `hybrid` | the HRX llama-server decodes, one slot, from a KV cache a prefill provider computed for the prompt (the NPU engine, named by `--prefill-provider` / `ONEBIT_HYBRID_PREFILL`) and serve restored into the slot; without a provider, HRX prefills too ([hybrid.md](hybrid.md)) |
 | DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
 
 What `--device auto` does with a `.gguf` that HRX has no route for. Until RFC #213 stage 3 these
@@ -577,9 +579,40 @@ found; it has not been repeated on HRX. The sweep (draft length x
 
 Use the default for chat and `--mtp-max 6 --mtp-p-min 0.5` for code (3.4x): code is
 predictable enough to keep long drafts, prose is not. Draft length 8 collapses on every
-prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
+prompt. Adding n-gram drafting to MTP gains nothing.
+
+**Cap the draft on HRX**: `config/recipes.json` pins `--mtp-max 3` for `qwen35` on `hrx`, which is
+also llama-server's default — 32.6 / 26.9 / 28.0 tok/s on the 27B on 2026-10-24. Do not raise it
+past 7: from 8 drafts on, acceptance falls to 0.17-0.60 and the longer verify batch costs more than
+the drafts return (`--mtp-max 7 --mtp-p-min 0`: 37.9 / 22.4 / 22.4; `--mtp-max 15`: 33.6 / 14.9 /
+13.5, even with 16-token verify kernels). Code is the one case where a longer draft still pays, and
+only up to 7. Small-active MoE models are the
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s then) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
+
+### Ternary-Bonsai-2-27B: the Qwen3.8 head, and two drafts by default
+
+PrismML's Ternary-Bonsai-2-27B is a `qwen35` model with ternary weights, and its three published files
+(PTQ1_0, PQ2_0, the packed Q4_0) hold **the same weights**: the 4096 blocks we compared decode
+identically, so picking a file is picking a size, not a model. **PQ2_0 is the pick** — 9.8 GiB against
+17.2 for the packed Q4_0, and the fastest of the three at both ends (pp512 553, tg128 21.4 tok/s,
+against 237/19.0 and 176/16.1).
+
+Because the geometry is Qwen3.8's, **Qwen3.8-27B's own MTP head attaches** to it: `--mtp
+MTP/mtp-Qwen3.8-27B-Q4_0.gguf` drafts and the ternary model verifies. That head is the recommendation —
+PQ2_0 with MTP decodes at **43 / 37 / 27 tok/s** on code / prose / short (39/40 on GSM8K, against 20-21
+tok/s without drafting), and a DFlash2 drafter works on it too since llama.cpp fork #143 but trails the
+MTP head (0.37 against 0.67 acceptance), so it is not the pick here.
+
+The ternary files accept 0.76 of **two**-token drafts against 0.67 at three, so the draft length is 2 for
+prose, short answers and translation and 4 when the traffic is code (40.4 / 38.3 / 30.4 / 34.7 tok/s at
+two drafts over code / prose / short / translation, 43.7 / 36.0 / 24.6 / 30.1 at four).
+`config/recipes.json` pins the 2-draft default for these files only: the recipe matches on the
+PrismML metadata key the Hadamard-folded files carry (`prism.hadamard.version`), so it cannot catch a
+plain Qwen3.8-27B, which has the same architecture. Raising the draft length is `--mtp-max 4`.
+
+Both the PQ2_0 dense prefill kernels and the ternary verify kernels come with the next private-add-on
+pin; on the current one, PQ2_0 prefill runs at 188 tok/s instead of 553.
 
 ### Qwen3.8-Flash-Next: drafting from part of the vocabulary
 
@@ -620,6 +653,8 @@ Measured with the fork's Vulkan `llama-server` on Strix Halo, 2026-10-01. Settin
 
 ## DFlash draft models (`--dflash`)
 
+> **Not on this pin.** On llama.cpp pins before fork `e91b608cd` (this one, and the release candidate built on it) a DFlash2 drafter fails to load with `done_getting_tensors: wrong number of tensors; expected 81, got 58`; fixed by fork #139 + #140, lands with the next pin bump.
+
 `--dflash <draft.gguf>` uses a DFlash block-diffusion draft model instead of the MTP head: the
 draft emits a whole block of tokens in one pass, reading the model's hidden states, and the
 model checks the block in one batch. It turns on llama-server's `draft-dflash` (DFlash2's
@@ -641,32 +676,41 @@ llama-quantize dflash2-bf16.gguf dflash2-q8_0.gguf Q8_0
 1bit serve -m Qwen3.8-27B-Q4_0.gguf --dflash dflash2-q8_0.gguf
 ```
 
-Measured through `1bit serve` on the removed Vulkan build on Strix Halo (not yet re-measured on
-HRX), Qwen3.8-27B Q4_0 (Unsloth), the
-same three chat prompts as above (code / prose / short, decode tok/s), runs back to back on a
-shared box, 2026-09-28:
+Measured through `1bit serve` on Strix Halo on 2026-10-24: Qwen3.8-27B UD-Q4_K_XL, the same three
+chat prompts as above (code / prose / short, decode tok/s), greedy 256-token answers, medians of
+three fresh servers, performance mode, **strict placement on** — the drafter's candidate selector
+(its top-k, fill and row-gather nodes) runs on HRX, so the whole drafter graph is on the GPU in one
+graph split:
 
-| Drafter | tok/s | Prompt t/s (1,838 tokens) |
-|---|---|---|
-| none | 11.1 / 11.8 / 12.4 | 330 |
-| `--mtp` (Q4_0 MTP head, draft length 3) | 31.7 / 25.8 / **28.2** | 267 |
-| `--dflash` (DFlash2, Q8_0, full blocks) | **45.7** / **28.3** / 17.8 | 255 |
+| Drafter | code | prose | short |
+|---|---|---|---|
+| none | 12.1 | 12.1 | 12.5 |
+| `--mtp` (the file's own head, draft length 3) | 32.6 | 26.9 | 28.0 |
+| `--dflash` (DFlash2 Q8_0, whole blocks) | **56.6** | **30.8** | 20.6 |
+| `--dflash` (DFlash2 Q4_K, whole blocks) | **58.8** | — | — |
 
-DFlash2 is the pick for code (4.1x, +44% over MTP) and ties or beats MTP on prose. MTP wins
-short answers (the translation prompt stops after ~16 tokens, too few to fill blocks). The Q8_0
-drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A drafted token is
-kept only when the model agrees, so the output is the model's own.
+DFlash2 is the pick for code (+73% over MTP, 4.7x without drafting) and about level on prose, but a
+short answer stops before a block is worth filling, so it loses a third there. **The default stays
+MTP for chat; `--dflash` is for code-heavy serving.** Acceptance on the three prompts is 0.88 / 0.42
+/ 0.23, and a drafted token is kept only when the model's verify pass agrees, so the output is the
+model's own. The Q8_0 drafter is what the numbers above use; a Q8_0 file is also what the drafter's
+own README recommends over BF16.
 
 Without `--mtp-max`, `--dflash` drafts the drafter's block minus one (its `dflash.block_size`; 16
-when the file does not say). Our HRX llama.cpp's default draft p-min is already 0, which keeps
-DFlash blocks whole; `--mtp-p-min` sets another. (The DFlash2 one-server route on the lean ROCm
-build is gone, above.)
+when the file does not say). **DFlash2's block is 8 tokens**, not 16: the seven drafts per verify
+step are what `1bit serve --dflash` asks for, and they fit the 2-8-token verify kernels.
+
+A non-zero draft threshold throws whole blocks away: on the 27B, `--spec-draft-p-min` 0.2 / 0.4 /
+0.6 cut prose from 30.8 to 22.5-23.3 tok/s, so `config/recipes.json` pins `--spec-draft-p-min 0`
+for `qwen35` on `hrx` (docs/recipes.md). `--mtp-p-min` sets the same threshold. (The DFlash2
+one-server route on the lean ROCm build is gone, above.)
 
 ## Recipes (`--recipes`, `--no-recipes`)
 
 Tuned llama-server settings that depend on the model and route go in `config/recipes.json` as
-recipes, each with the measurement behind it. The built-in set is empty for now: the recipes the
-engine had were measured on builds RFC #213 stage 3 removed ([recipes.md](recipes.md#the-built-in-recipes)). Serve prints each recipe it applies. Anything serve sets
+recipes, each with the measurement behind it. The built-in set has two entries today, both for
+Qwen3.8-27B on `hrx`: `--spec-draft-p-min 0` with a DFlash2 drafter and `--mtp-max 3` with the file's
+own MTP head ([recipes.md](recipes.md#the-built-in-recipes)). Serve prints each recipe it applies. Anything serve sets
 itself wins over a recipe. `--recipes FILE` replaces the built-in set and `--no-recipes` turns
 recipes off ([recipes.md](recipes.md)). To measure a setting before making it a recipe, use
 [`tools/bench.py`](bench.md).
@@ -799,9 +843,8 @@ SIGKILLed `serve`, and that a backend that exits on its own ends `serve` at once
 
 A follow-up turn in the same conversation is not bit-identical to a cold run of that conversation. The
 follow-up continues from the KV cache and prefills only its new user message (28 tokens in the test below),
-where a cold run prefills the conversation in 512-token ubatches - and HRX picks a different kernel family for a
-different token count (generic post-ops for 16 < T < 128, the WMMA prefill tiles for T >= 128), with a different
-activation quantisation, split-K and combine tree, so the last bits differ and a near-tie flips. Measured on
+where a cold run prefills the conversation in 512-token ubatches - and HRX serves a different token count with a
+different plan, so the last bits of the logits differ and a near-tie can flip. Measured on
 2026-10-22, 10 greedy two-turn chats per model, follow-up against a cold run of the same conversation.
 
 `--precise` (or `ONEBIT_PRECISE=1`) makes every request re-prefill its whole conversation, which is exactly the

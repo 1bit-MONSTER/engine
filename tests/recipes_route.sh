@@ -20,6 +20,8 @@
 #   - a recipe file's flag is added and named on stderr, and a flag serve already set wins
 #     (--mtp-p-min 0.5 stays the only p-min),
 #   - --no-recipes adds nothing, --recipes FILE replaces the built-in set (flags and environment),
+#   - a recipe can match on the model file's metadata keys (match.gguf_keys): a file that carries
+#     every listed key matches, the same architecture without it does not, and a non-list is refused,
 #   - a malformed recipe file stops serve with the reason.
 #
 # usage: tests/recipes_route.sh path/to/1bit
@@ -34,17 +36,29 @@ check() { if eval "$2"; then echo "ok   $1"; else echo "FAIL $1"; fail=1; fi; }
 
 python3 - "$scratch" <<'PY'
 import struct, sys
-def gguf(path, arch="llama", ints={}):
+def gguf(path, arch="llama", ints=None, strs=None):
     kv = []
     def s(x): b = x.encode(); return struct.pack("<Q", len(b)) + b
     kv.append(s("general.architecture") + struct.pack("<I", 8) + s(arch))
-    for k, v in ints.items():
+    for k, v in (ints or {}).items():
         kv.append(s(k) + struct.pack("<I", 4) + struct.pack("<I", v))
+    for k, v in (strs or {}).items():
+        kv.append(s(k) + struct.pack("<I", 8) + s(v))
     open(path, "wb").write(b"GGUF" + struct.pack("<IQQ", 3, 0, len(kv)) + b"".join(kv))
 d = sys.argv[1]
 gguf(d + "/moe.gguf", "qwen3moe", {"qwen3moe.expert_count": 128})
 gguf(d + "/plain.gguf")
 gguf(d + "/draft.gguf", "dflash", {"dflash.block_size": 8})
+gguf(d + "/prism.gguf", "qwen35", strs={"prism.hadamard.version": "1"})   # PrismML ternary, Hadamard-folded
+gguf(d + "/plainq35.gguf", "qwen35")                                      # same architecture, no PrismML key
+open(d + "/gk.json", "w").write("""{"recipes": [{"id": "gk", "match": {"architecture": ["qwen35"],
+  "gguf_keys": ["prism.hadamard.version"]}, "args": ["--spec-draft-n-max", "2"], "measured": "test"}]}""")
+open(d + "/gkbad.json", "w").write("""{"recipes": [{"id": "gkbad", "match": {"gguf_keys": "prism.hadamard.version"},
+  "args": ["--spec-draft-n-max", "2"], "measured": "test"}]}""")
+open(d + "/gkorder.json", "w").write("""{"recipes": [
+  {"id": "gkb", "match": {"architecture": ["qwen35"], "gguf_keys": ["prism.hadamard.version"]},
+   "args": ["--spec-draft-n-max", "2"], "measured": "test"},
+  {"id": "gkg", "match": {"architecture": ["qwen35"]}, "args": ["--spec-draft-n-max", "3"], "measured": "test"}]}""")
 open(d + "/pmin.json", "w").write("""{"recipes": [{"id": "pmin", "match": {"drafter": ["dflash"]},
   "args": ["--spec-draft-p-min", "0"], "measured": "test"}]}""")
 open(d + "/mine.json", "w").write("""{"recipes": [{"id": "mine", "match": {"architecture": ["llama"]},
@@ -107,10 +121,24 @@ check "  and its environment" '[ "$(field "$scratch/mine-run.json" "r[\"env\"].g
 run "$scratch/moe.gguf" "$scratch/repl.json" --recipes "$scratch/mine.json"
 check "  and replaces the built-in set" '[ "$(after "$scratch/repl.json" -ub)" = None ]'
 
+run "$scratch/prism.gguf" "$scratch/gk-on.json" --recipes "$scratch/gk.json"
+check "a gguf_keys recipe matches the file that carries the key" '[ "$(after "$scratch/gk-on.json" --spec-draft-n-max)" = 2 ]'
+run "$scratch/plainq35.gguf" "$scratch/gk-off.json" --recipes "$scratch/gk.json"
+check "  and not the same architecture without it" '[ "$(after "$scratch/gk-off.json" --spec-draft-n-max)" = None ] && ! grep -q recipe "$scratch/gk-off.json.log"'
+run "$scratch/prism.gguf" "$scratch/gk-order-prism.json" --recipes "$scratch/gkorder.json"
+check "file order: the narrower gguf_keys recipe wins (2, once) on a file that carries the key" '[ "$(after "$scratch/gk-order-prism.json" --spec-draft-n-max)" = 2 ] && [ "$(count "$scratch/gk-order-prism.json" --spec-draft-n-max)" = 1 ] && grep -q "recipe gkb" "$scratch/gk-order-prism.json.log" && ! grep -q "recipe gkg" "$scratch/gk-order-prism.json.log"'
+run "$scratch/plainq35.gguf" "$scratch/gk-order-plain.json" --recipes "$scratch/gkorder.json"
+check "  and the broader one still applies without the key" '[ "$(after "$scratch/gk-order-plain.json" --spec-draft-n-max)" = 3 ] && grep -q "recipe gkg" "$scratch/gk-order-plain.json.log"'
+
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 bad=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \
       --recipes "$scratch/bad.json" 2>&1)
 check "a malformed recipe file stops serve with the reason" '[[ "$bad" == *"unknown match key \"archtecture\""* ]]'
+
+port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
+badk=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \
+       --recipes "$scratch/gkbad.json" 2>&1)
+check "a non-list gguf_keys stops serve with the reason" '[[ "$badk" == *"match.gguf_keys is not a list"* ]]'
 
 if [ $fail -ne 0 ]; then for f in "$scratch"/*.log; do echo "--- $f"; cat "$f"; done; echo FAIL; exit 1; fi
 echo PASS

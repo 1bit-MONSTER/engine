@@ -2,18 +2,68 @@
  "about": "Tuned llama-server settings per model and route, applied by `1bit serve` (docs/recipes.md). A recipe never overrides a flag already on the backend's command line or a variable already set. Every recipe carries the measurement behind it; re-measure with tools/bench.py before changing one.",
  "recipes": [
   {
+   "id": "bonsai-ternary-mtp-n2",
+   "match": {
+    "device": [
+     "hrx"
+    ],
+    "architecture": [
+     "qwen35"
+    ],
+    "drafter": [
+     "mtp"
+    ],
+    "gguf_keys": [
+     "prism.hadamard.version"
+    ]
+   },
+   "args": [
+    "--spec-draft-n-max",
+    "2"
+   ],
+   "why": "Ternary-Bonsai-2-27B (PrismML, Hadamard-folded qwen35) accepts 0.76 of 2-token MTP drafts vs 0.67 at 3: n2 wins prose / short / translation, n3-n4 win code by 4-8%.",
+   "measured": "Ternary-Bonsai-2-27B-PQ2_0 + mtp-Qwen3.8-27B-Q4_0, HRX, performance mode, 2 servers, medians, code / prose / short / translation tok/s: n2 40.36 / 38.25 / 30.40 / 34.66, n3 41.65 / 36.81 / 27.18 / 33.18, n4 43.67 / 36.00 / 24.56 / 30.13 (2026-10-25).",
+   "source": "TBONSAI-SWEET 2026-10-25"
+  },
+  {
    "id": "qwen35-dflash-p-min-0",
-   "match": {"device": ["hrx"], "architecture": ["qwen35"], "drafter": ["dflash"]},
-   "args": ["--spec-draft-p-min", "0"],
+   "match": {
+    "device": [
+     "hrx"
+    ],
+    "architecture": [
+     "qwen35"
+    ],
+    "drafter": [
+     "dflash"
+    ]
+   },
+   "args": [
+    "--spec-draft-p-min",
+    "0"
+   ],
    "why": "DFlash2 proposes and verifies whole 8-token blocks, so a non-zero draft p-min discards blocks whose first tokens look unlikely and the loss lands on prose; 0 keeps every block whole. The flag is pinned here rather than left to llama-server's default, because the measurement below is what the recipe is for.",
    "measured": "Qwen3.8-27B UD-Q4_K_XL, 1bit serve --dflash with the Q8_0 drafter, greedy 256-token chats, medians of 3, performance mode, 2026-10-24: p-min 0 gives 56.6 / 30.8 / 20.6 tok/s on code / prose / short (acceptance 0.88 / 0.42 / 0.23); p-min 0.2, 0.4 and 0.6 cut prose to 22.5-23.3. The Q4_K drafter reaches 58.8 on code at p-min 0. Strict placement on: the drafter's graphs run on HRX in one graph split.",
    "source": "TDFLASH-HRX / TDFLASH-STRICT"
   },
   {
    "id": "qwen35-mtp-max-3",
-   "match": {"device": ["hrx"], "architecture": ["qwen35"], "drafter": ["mtp"]},
-   "args": ["--mtp-max", "3"],
-   "why": "The model's own MTP head accepts about two thirds of its three drafts, and acceptance collapses past seven, so a longer verify batch costs more than the extra drafts return. Capping at 3 is what the measurement below is for; do not raise it past 7.",
+   "match": {
+    "device": [
+     "hrx"
+    ],
+    "architecture": [
+     "qwen35"
+    ],
+    "drafter": [
+     "mtp"
+    ]
+   },
+   "args": [
+    "--spec-draft-n-max",
+    "3"
+   ],
+   "why": "The model's own MTP head accepts about two thirds of its three drafts, and acceptance collapses past seven, so a longer verify batch costs more than the extra drafts return. The flag is llama-server's own (--spec-draft-n-max is what serve's --mtp-max 3 passes); capping there is what the measurement below is for. Do not raise it past 7.",
    "measured": "Qwen3.8-27B UD-Q4_K_XL with its in-file MTP head, greedy 256-token chats, medians of 3, performance mode, 2026-10-24: --mtp-max 3 gives 32.6 / 26.9 / 28.0 tok/s on code / prose / short (12.1 / 12.1 / 12.5 without drafting). --mtp-max 7 --mtp-p-min 0 gives 37.9 / 22.4 / 22.4 and --mtp-max 15 33.6 / 14.9 / 13.5, with 0.17-0.60 acceptance past 8 drafts.",
    "source": "TDFLASH-HRX / TDFLASH-STRICT"
   }

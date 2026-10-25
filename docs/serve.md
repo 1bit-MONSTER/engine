@@ -603,6 +603,30 @@ only up to 7. Small-active MoE models are the
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s then) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
 
+### Ternary-Bonsai-2-27B: the Qwen3.8 head, and two drafts by default
+
+PrismML's Ternary-Bonsai-2-27B is a `qwen35` model with ternary weights, and its three published files
+(PTQ1_0, PQ2_0, the packed Q4_0) hold **the same weights**: the 4096 blocks we compared decode
+identically, so picking a file is picking a size, not a model. **PQ2_0 is the pick** — 9.8 GiB against
+17.2 for the packed Q4_0, and the fastest of the three at both ends (pp512 553, tg128 21.4 tok/s,
+against 237/19.0 and 176/16.1).
+
+Because the geometry is Qwen3.8's, **Qwen3.8-27B's own MTP head attaches** to it: `--mtp
+MTP/mtp-Qwen3.8-27B-Q4_0.gguf` drafts and the ternary model verifies. That head is the recommendation —
+PQ2_0 with MTP decodes at **43 / 37 / 27 tok/s** on code / prose / short (39/40 on GSM8K, against 20-21
+tok/s without drafting), and a DFlash2 drafter works on it too since llama.cpp fork #143 but trails the
+MTP head (0.37 against 0.67 acceptance), so it is not the pick here.
+
+The ternary files accept 0.76 of **two**-token drafts against 0.67 at three, so the draft length is 2 for
+prose, short answers and translation and 4 when the traffic is code (40.4 / 38.3 / 30.4 / 34.7 tok/s at
+two drafts over code / prose / short / translation, 43.7 / 36.0 / 24.6 / 30.1 at four).
+`config/recipes.json` pins the 2-draft default for these files only: the recipe matches on the
+PrismML metadata key the Hadamard-folded files carry (`prism.hadamard.version`), so it cannot catch a
+plain Qwen3.8-27B, which has the same architecture. Raising the draft length is `--mtp-max 4`.
+
+Both the PQ2_0 dense prefill kernels and the ternary verify kernels come with the next private-add-on
+pin; on the current one, PQ2_0 prefill runs at 188 tok/s instead of 553.
+
 ### Qwen3.8-Flash-Next: drafting from part of the vocabulary
 
 Flash-Next's MTP head computes logits over all 248,320 tokens for every drafted token. That
@@ -641,6 +665,8 @@ Measured with the fork's Vulkan `llama-server` on Strix Halo, 2026-10-01. Settin
 - **`-lm mmap`:** Flash-Next needs it on this llama.cpp. Without it, the 27.5 GiB per-layer embedding table is copied into RAM next to the ~82 GB the GPU holds, which does not fit in 128 GB.
 
 ## DFlash draft models (`--dflash`)
+
+> **Not on this pin.** On llama.cpp pins before fork `e91b608cd` (this one, and the release candidate built on it) a DFlash2 drafter fails to load with `done_getting_tensors: wrong number of tensors; expected 81, got 58`; fixed by fork #139 + #140, lands with the next pin bump.
 
 `--dflash <draft.gguf>` uses a DFlash block-diffusion draft model instead of the MTP head: the
 draft emits a whole block of tokens in one pass, reading the model's hidden states, and the

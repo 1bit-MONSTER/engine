@@ -1118,6 +1118,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         facts.architecture = gguf_architecture(o.model);
         facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
         facts.drafter = !o.dflash.empty() ? "dflash" : (!o.mtp.empty() || own_mtp) ? "mtp" : "none";
+        if (recipes.needs_gguf_keys()) {
+            // only recipes that match on the file's metadata keys pay for this read (the header alone)
+            for (const auto& rec : recipes.list)
+                for (const auto& key : rec.gguf_keys)
+                    if (std::find(facts.gguf_keys.begin(), facts.gguf_keys.end(), key) == facts.gguf_keys.end() &&
+                        gguf_has_keys(o.model, {key}))
+                        facts.gguf_keys.push_back(key);
+        }
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }

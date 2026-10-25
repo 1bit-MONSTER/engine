@@ -63,9 +63,16 @@ It adds each variable in `env` unless it is already set. Serve prints what it ad
 
 ## The built-in recipes
 
-None, for now. Every recipe the engine had was measured on a build RFC #213 stage 3 removed:
-`rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build) and `dflash-p-min-0` (a no-op
-on our HRX llama.cpp, whose default draft p-min is already 0). New ones come with HRX measurements.
+Two, both for Qwen3.8-27B (`qwen35`) on `hrx`, from the 2026-10-24 HRX drafter measurements:
+
+| id | matches | adds | measured |
+|---|---|---|---|
+| `qwen35-dflash-p-min-0` | `hrx`, `qwen35`, drafter `dflash` | `--spec-draft-p-min 0` | 56.6 / 30.8 / 20.6 tok/s code / prose / short with the Q8_0 drafter; a non-zero threshold cut prose to 22.5-23.3 |
+| `qwen35-mtp-max-3` | `hrx`, `qwen35`, drafter `mtp` | `--mtp-max 3` | 32.6 / 26.9 / 28.0 tok/s; acceptance falls to 0.17-0.60 past 7 drafts, so do not raise it |
+
+Both carry their full `measured` line in `config/recipes.json`. Older recipes were measured on build
+RFC #213 stage 3 removed: `rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build). New
+ones come with HRX measurements.
 
 Recipes apply in file order. The first recipe to add a flag wins, so a narrower recipe goes before
 a broader one for the same flag.

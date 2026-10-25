@@ -15,8 +15,8 @@
 # limitations under the License.
 #
 # How `1bit serve` applies recipes (config/recipes.json, docs/recipes.md), without a GPU:
-#   - the built-in set is empty (RFC #213 stage 3 dropped the ROCm-measured recipes): serve adds
-#     nothing, with or without a drafter,
+#   - the built-in set is scoped to Qwen3.8-27B (`qwen35`) on `hrx` (config/recipes.json), so a plain
+#     or MoE test file gets nothing, with or without a drafter,
 #   - a recipe file's flag is added and named on stderr, and a flag serve already set wins
 #     (--mtp-p-min 0.5 stays the only p-min),
 #   - --no-recipes adds nothing, --recipes FILE replaces the built-in set (flags and environment),

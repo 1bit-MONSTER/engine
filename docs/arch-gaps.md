@@ -52,12 +52,22 @@ This page is the reviewed evidence for the second kind: what each family is, wha
   and candidate-block machinery** — the silent-substitution failure this repo
   bans, not a crash.
 * **Why it is not mapped** (rechecked 2026-10-23 on the pin `main` carries,
-  `third_party/llama.cpp` af04c9f2): the fork registers no
-  `DeepseekV41ForCausalLM` converter class (`conversion/deepseek.py`) and
-  `src/llama-arch.cpp` has no `deepseek_v41`/`deepseek41` architecture, so
-  `tools/registry_build.py` finds nothing to read the class from. The census
-  watcher's `!! UNCOVERED` line for it is therefore correct and stays, which is
-  what `registry/significant.json` (no `watch` field) encodes.
+  `third_party/llama.cpp` af04c9f2, and again 2026-10-25 at `6b397ee9`): the fork
+  registers no `DeepseekV41ForCausalLM` converter class — `conversion/deepseek.py`
+  has `DeepseekV4ForCausalLM` only — and `src/llama-arch.cpp` has
+  `LLM_ARCH_DEEPSEEK4` with the `hc_*` tensors but no `deepseek_v41`/`deepseek41`
+  architecture and no `engram_*` / `candidate_block_*` parameter. `conversion/`
+  reads neither key family at all. So `tools/registry_build.py` finds nothing to
+  read the class from, and a mapping would load a V4.1 checkpoint through the V4
+  path and silently ignore the machinery above.
+* **Watcher** (engine #522): `registry/significant.json` carries
+  `"watch": "report"` for this class, so the census prints it as
+  `REVIEWED` and does not alert on every new upload of the family. That is a
+  statement about the *review*, not about support: the class stays out of
+  `registry/architectures.json`, `tools/registry_build.py --check-gaps` still
+  fails if anyone maps it without a `mapped_ok` reason, and real support (engram
+  embedding path + candidate-block sparse attention, plus a scope decision for
+  the vision tower) needs the logits validation listed above.
 * **Real support needs**: shape-agnostic config + the engram embedding path +
   candidate-block sparse attention (and a scope decision for the vision tower),
   validated against reference logits from the HF implementation.

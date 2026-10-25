@@ -341,13 +341,15 @@ package_checks() {  # package_checks <linux tarball>
     fi
     while IFS= read -r -d '' f; do
         rel=${f#"$t"/}
-        setdir=${f%/npu/kernels/*}/npu/kernels/$(echo "${rel#*/npu/kernels/}" | cut -d/ -f1)
         case "$(basename "$f")" in
             manifest|manifest.sig) continue ;;
         esac
+        # <pkg>/npu/kernels/<set>/<id>/layer1.elf -> the set's manifest, without rebuilding the path by hand
+        manifest=$t/${rel%/npu/kernels/*}/npu/kernels/${rel#*/npu/kernels/}
+        manifest=${manifest%/*/*}/manifest
         if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/([0-9a-f]+/layer1\.elf)$ ]]; then
             inner=${BASH_REMATCH[1]}
-            want=$(awk -v p="$inner" '$1=="file" && $4==p {print $2}' "$t/$setdir/manifest" 2>/dev/null)
+            want=$(awk -v p="$inner" '$1=="file" && $4==p {print $2}' "$manifest" 2>/dev/null)
             if [ -z "$want" ]; then
                 echo "FAIL $rel is not listed in its set's signed manifest"; nk=$((nk + 1))
             elif [ "$want" != "$(sha256sum "$f" | cut -d' ' -f1)" ]; then

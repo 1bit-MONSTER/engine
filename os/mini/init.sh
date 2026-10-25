@@ -94,8 +94,8 @@ else
     say "[engine] no /data/1bit-llama: '1bit serve' has no HRX llama-server on this boot"
 fi
 
-# The NPU kernels (each with its signed manifest) live on the stick (they used to be inside the RAM image, which made it too big
-# to load): link them to the path the engine looks for, beside itself.
+# The NPU kernels (each with its signed manifest) live on the stick - inside the RAM image they made it too
+# big to load - and are linked to the path the engine looks for, beside itself.
 if [ -d /data/npu/kernels ] && [ -d /home ]; then
     mkdir -p /home/bcloud/wt/npupkg-build/npu 2>/dev/null
     ln -sfn /data/npu/kernels /home/bcloud/wt/npupkg-build/npu/kernels 2>/dev/null

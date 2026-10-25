@@ -132,6 +132,19 @@ lic=$(cd "$here/.." && pwd)/licenses          # self-contained: $licenses is def
 ecsrc=$lic/ec_su_axb35/src
 if [ "${EC_MODULE:-build}" = skip ]; then
     echo "   skipped (EC_MODULE=skip): this image will leave the fans on the firmware curve"
+elif [ "${EC_MODULE:-build}" != build ]; then
+    # EC_MODULE=<file>: stage a module that was already built (and signed) for this exact kernel instead of
+    # building one here - the builder may have no kernel object tree (the out-of-tree build needs
+    # /lib/modules/$kver/build) while the module it runs right now is the one the image should carry.
+    # The vermagic has to match the image kernel exactly, or the module would not load on the stick.
+    [ -f "$EC_MODULE" ] || { echo "   EC_MODULE=$EC_MODULE is not a file"; exit 1; }
+    ecmagic=$(modinfo -F vermagic "$EC_MODULE" 2>/dev/null | awk '{print $1}')
+    [ "$ecmagic" = "$kver" ] || { echo "   EC_MODULE vermagic '$ecmagic' is not the image kernel '$kver'"; exit 1; }
+    mkdir -p "$root/lib/modules/$kver/updates"
+    cp "$EC_MODULE" "$root/lib/modules/$kver/updates/ec_su_axb35.ko"
+    chmod 0644 "$root/lib/modules/$kver/updates/ec_su_axb35.ko"
+    ecsigner=$(modinfo -F signer "$EC_MODULE" 2>/dev/null)
+    echo "   ec_su_axb35.ko for $kver staged from $EC_MODULE: $(stat -c %s "$EC_MODULE") bytes, signer: ${ecsigner:-none (unsigned)}"
 elif [ ! -d "$ecsrc" ]; then
     echo "   os/licenses/ec_su_axb35/src is missing: the fans would stay on the firmware curve"; exit 1
 else

@@ -4,7 +4,7 @@
   "qwen3-0.6b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 619931604,
-   "base_sha256": "a97ecd1a998e9af72a178e88515c9c71aeabd063013c783ec9ecb64796a702e3",
+   "base_sha256": "af6eb4309794905f9535be33cddc779e6ad1a749e03ee59fe2b0509fd971bada",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -17,7 +17,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -27,7 +27,7 @@
   "qwen3-4b-iq4xs": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 619931604,
-   "base_sha256": "2afc23b39ebc7534cdb06f8b47d5258347f3389b7e8738eb8a85b0109a73ceea",
+   "base_sha256": "63062b57e90d482347b72b7c4c9756a6dfd2272c51c074b5b237e47978b7d88e",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -40,7 +40,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -50,7 +50,7 @@
   "qwen3-coder-30b-a3b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 619931604,
-   "base_sha256": "2f0f020994fd19c14416792943fd6cc5f526b96480c445dd02b8cb745c708554",
+   "base_sha256": "0d90e13f5fe99e22f64ddc50653596597b0860f4aab3d2f010735676d5a05c72",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -63,7 +63,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -86,7 +86,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "96f81977fc07a75824a7f2108b7a4154154fdb54"
+    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -96,7 +96,7 @@
   "zaya1-8b": {
    "args": "-c 512 --chunks 8 -b 512 -ub 512 --device HRX0 -ngl 99",
    "base_bytes": 1069596564,
-   "base_sha256": "47174ec31a2537ed2d21d8a2c8fbd7e271c5effed9f1d9a918ce59591759adf4",
+   "base_sha256": "017898e89e8dd15cf66fb4ad91fd05c47026ab80dcdc7f288554b76fdde7bab1",
    "limits": {
     "max_kld_p99": 0.2,
     "max_mean_kld": 0.01,
@@ -109,7 +109,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "8792923f8ba99637c562a52523a9fb831f57edfe"
+    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
    },
    "text": {
     "file": "wiki.test.raw",

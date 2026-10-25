@@ -116,9 +116,11 @@ screen_login() {
     {
       echo
       if [ "$INSTALLED" = 1 ]; then
-        echo "  1bit OS  v2026.43  -  INSTALLED on this machine. /data is on its disk; the engine and Lemonade start from here."
+        echo "  1bit OS, Lemonade Server appliance   v2026.43  -  INSTALLED on this machine. /data is on its disk; the engine and Lemonade start from here."
+        echo "  Lemonade Server by AMD, running on the 1bit engine"
       else
-        echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+        echo "  1bit OS, Lemonade Server appliance   v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
+        echo "  Lemonade Server by AMD, running on the 1bit engine"
       fi
       echo "  ----------------------------------------------------------------------------------------"
       echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
@@ -152,7 +154,8 @@ MODE=live
 if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
-      echo "  1bit OS  v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  1bit OS, Lemonade Server appliance   v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  Lemonade Server by AMD, running on the 1bit engine"
       echo "  ------------------------------------------------------------------------------"
       echo "   1) Lemonade appliance            (default, starts in 12s)"
       echo "   2) Lemonade, verbose, no GPU driver"

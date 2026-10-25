@@ -35,7 +35,12 @@ say() { printf '%s\n' "$*"; [ -w /data ] 2>/dev/null && printf '%s\n' "$*" >> "$
 pass() { ROWS=$((ROWS + 1)); say "PASS  $1 : $2"; }
 fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 skip() { ROWS=$((ROWS + 1)); say "SKIP  $1 : $2"; }
-got() { wget -q -O - "$@" 2>/dev/null || curl -sf "$@" 2>/dev/null; }
+# Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
+# the whole check with no output - measured on the release candidate: 1bit-release-check sat in the
+# lemonade row until an external 20-minute limit killed the run, which on the owner's console would
+# look like a hung machine rather than a failed check.
+got() { wget -q -T 15 -t 1 -O - "$@" 2>/dev/null ||
+        curl -sf --connect-timeout 5 --max-time 20 "$@" 2>/dev/null; }
 
 # HTTP status of a request: 000 when nothing answered at all. A refusal has to be *proved* by its
 # status, not inferred from an empty body: the unprepared stick returns an empty body to the keyless

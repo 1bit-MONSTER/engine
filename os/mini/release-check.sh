@@ -27,6 +27,7 @@
 # with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU sets, the
 # licences and the image identity - is checked in the VM as well.
 set -u
+
 LOG=/data/release-check.log
 FAILS=0
 ROWS=0
@@ -35,6 +36,67 @@ pass() { ROWS=$((ROWS + 1)); say "PASS  $1 : $2"; }
 fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 skip() { ROWS=$((ROWS + 1)); say "SKIP  $1 : $2"; }
 got() { wget -q -O - "$@" 2>/dev/null || curl -sf "$@" 2>/dev/null; }
+
+# HTTP status of a request: 000 when nothing answered at all. A refusal has to be *proved* by its
+# status, not inferred from an empty body: the unprepared stick returns an empty body to the keyless
+# probe and the old row counted that as a refusal (it false-PASSED).
+status() {
+    c=
+    if command -v curl >/dev/null 2>&1; then
+        c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 10 "$@" 2>/dev/null)
+    fi
+    if [ -z "$c" ] || [ "$c" = 000 ]; then
+        if command -v wget >/dev/null 2>&1; then
+            c=$(wget -S -O /dev/null --timeout=10 "$@" 2>&1 | sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | head -1)
+        fi
+    fi
+    printf '%s' "${c:-000}"
+}
+
+# The lemonade row, decided from what the two probes returned. Pure, so tests/release_check_row.sh can
+# drive it (os/mini/release-check.sh --self-test): <keyed status> <keyed body> <keyless status>.
+lemonade_verdict() {
+    ws=$1; body=$2; ns=$3
+    case "$ws" in
+        200) ;;
+        000) printf 'FAIL no answer with the key from /data/lemonade/lemond.conf (status 000; see /tmp/lemond.log)'; return 0 ;;
+        *) printf 'FAIL the server answered %s with the key (wanted 200)' "$ws"; return 0 ;;
+    esac
+    case "$body" in
+        *'"data"'*|*'"models"'*) ;;
+        *) printf 'FAIL the keyed request answered 200 but not a model list: %.60s' "$body"; return 0 ;;
+    esac
+    case "$ns" in
+        401|403) printf 'PASS answers on %s with the API key, and refuses it without (status %s)' "$API" "$ns" ;;
+        200) printf 'FAIL answers on %s, but also answers WITHOUT the key (status 200)' "$API" ;;
+        *) printf 'FAIL the keyless probe answered %s, not a refusal: the key is not proved to be enforced' "$ns" ;;
+    esac
+}
+
+# --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
+# this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
+# body and no status without it.
+if [ "${1:-}" = --self-test ]; then
+    API=http://127.0.0.1:13305
+    rc=0
+    check() {  # <want> <got>
+        want=$1; g=${2:-}
+        case "$g" in
+            "$want"*) printf 'ok   %s\n' "$(printf '%s' "$g" | cut -c1-78)" ;;
+            *) printf 'FAIL want %s, got: %s\n' "$want" "$g"; rc=1 ;;
+        esac
+    }
+    check PASS "$(lemonade_verdict 200 '{"data":[{"id":"m"}]}' 401)"
+    check PASS "$(lemonade_verdict 200 '{"models":[]}' 403)"
+    check FAIL "$(lemonade_verdict 200 '{"data":[{"id":"m"}]}' 200)"      # answers without the key
+    check FAIL "$(lemonade_verdict 200 '{"data":[{"id":"m"}]}' 000)"      # empty body / no answer
+    check FAIL "$(lemonade_verdict 000 '' 000)"                           # no server at all
+    check FAIL "$(lemonade_verdict 200 '' 401)"                           # 200 with no model list
+    check FAIL "$(lemonade_verdict 500 'error' 401)"                      # not a 200
+    [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
+    exit $rc
+fi
+
 
 PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
 PORT=${PORT:-13305}
@@ -123,14 +185,14 @@ if [ -z "$KEY" ]; then
     fail lemonade "no LEMONADE_API_KEY in /data/lemonade/lemond.conf: a network-facing server without a key"
 else
     MODELS=$(got --header="Authorization: Bearer $KEY" "$API/api/v1/models")
-    BODY=; [ -z "$MODELS" ] && BODY=$(got "$API/api/v1/models")
-    if [ -n "$MODELS" ] && [ -z "$BODY" ]; then
-        pass lemonade "answers on $API with the API key, and without it ($(printf '%s' "$BODY" | head -c 60))"
-    elif [ -n "$MODELS" ]; then
-        fail lemonade "answers on $API, but also answers WITHOUT the key"
-    else
-        fail lemonade "no answer on $API with the key from /data/lemonade/lemond.conf (see /tmp/lemond.log)"
-    fi
+    WITH=$(status --header="Authorization: Bearer $KEY" "$API/api/v1/models")
+    BODY=$(got "$API/api/v1/models")
+    WITHOUT=$(status "$API/api/v1/models")
+    case "$(lemonade_verdict "$WITH" "$MODELS" "$WITHOUT")" in
+        PASS*) pass lemonade "$(printf '%s' "$(lemonade_verdict "$WITH" "$MODELS" "$WITHOUT")" | sed 's/^PASS //')";;
+        *) fail lemonade "$(printf '%s' "$(lemonade_verdict "$WITH" "$MODELS" "$WITHOUT")" | sed 's/^FAIL //')";;
+    esac
+    : "$BODY"
 fi
 
 have_model() { printf '%s' "${MODELS:-}" | grep -q "\"$1\""; }

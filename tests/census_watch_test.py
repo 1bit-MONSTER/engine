@@ -295,6 +295,8 @@ for cls, mid in (
     ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
     # issue #437 (2026-10-17): upstream-only architecture, after the pin.
     ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
+    # issue #522 (2026-10-25): reviewed, documented, needs real support (engram + candidate blocks).
+    ("DeepseekV41ForCausalLM", "overhand/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored"),
 ):
     check(f"{cls} is reviewed report-only and documented",
           sig.get(cls, {}).get("watch") == "report" and cls not in archs and cls in gap_docs)

@@ -780,12 +780,24 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
 
 ## Not yet
 
-- **IQ4_NL / IQ4_XS on HRX ([llama.cpp #41](https://github.com/1bit-MONSTER/llama.cpp/pull/41)).**
+- **IQ4_NL / IQ4_XS on HRX ([llama.cpp #41](https://github.com/1bit-MONSTER/llama.cpp/pull/41), done).**
   AMD's IQ4 nibble packers remapped every table index (XOR 12) for a lowering that does not apply on
   gfx1151, in `motifs/dequant.loom` and again in the Q5_K/IQ4_XS prefill kernel, so IQ4 was declined
-  and ran on the CPU. #41 fixes both copies and the q8-plane SwiGLU path they exposed. Qwen3.8-27B
-  UD-Q4_K_XL: 91 graph splits -> 1, wikitext PPL 5.8294 (CPU 5.8288), decode 7.25 -> 9.0 tok/s
-  (Vulkan 12.5); `test-backend-ops -b HRX0` passes the IQ4 MUL_MAT and GET_ROWS cases.
+  and ran on the CPU. #41 fixes both copies and the q8-plane SwiGLU path they exposed: the shared
+  dequant now reads the real `kvalues_iq4nl` table through a table lookup, and the corpus contains no
+  XOR-12 on that path at all. Qwen3.8-27B UD-Q4_K_XL: 91 graph splits -> 1, wikitext PPL 5.8294 (CPU
+  5.8288), decode 7.25 -> 9.0 tok/s (Vulkan 12.5).
+
+  Re-verified on the **Loom-only** path on 2026-10-25 (a build with no HIP add-on at all, so every case
+  below runs through the Loom corpus). `test-backend-ops -b HRX0`: `MUL_MAT` iq4_nl **OK** for n=1..9 at
+  k=256, iq4_xs the same, `GET_ROWS` iq4_nl **OK** at `be1=1`; **0 FAIL, 2/2 backends passed**. Two
+  groups stay *declined* rather than wrong, and both are shape coverage, not the codebook: `k=32`
+  projections and `GET_ROWS` on a view or with a batched gather (`v=1`, `be1=7` — the same gap
+  [390](https://github.com/1bit-MONSTER/engine/issues/390) found, where `q8_0` fails identically, so the
+  quant is not the variable); and **`MUL_MAT_ID` for iq4_nl / iq4_xs**, which the Loom corpus does not
+  claim at all, so routed experts of those types take the CPU on a Loom-only build instead of decoding
+  garbage. The build the engine ships carries the HIP add-on, whose routed-expert kernels handle those
+  types on HRX.
 - **K-quant decode kernels ([llama.cpp #42](https://github.com/1bit-MONSTER/llama.cpp/pull/42)).**
   One-token projections on Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and Q8_0 now read the GGUF blocks
   directly with f32 activations: the FFN gate/up pair fused with SwiGLU, and plain projections

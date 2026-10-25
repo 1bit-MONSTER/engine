@@ -45,6 +45,7 @@ recipe against the launch:
 | `architecture` | the file's `general.architecture` is in the list |
 | `moe` | the file has (`true`) or lacks (`false`) an `<architecture>.expert_count` above 0 |
 | `drafter` | the drafter is in the list: `none`, `mtp` (`--mtp`) or `dflash` (`--dflash`) |
+| `gguf_keys` | every listed GGUF metadata key is present in the `-m` file (for example `prism.hadamard.version`, which PrismML's Hadamard-folded files carry and Qwen3.8 files do not) |
 
 A key that is left out matches anything. A matching recipe adds each flag in `args`, with the
 values after it, unless the backend's command line already has that flag. So whatever serve
@@ -63,12 +64,14 @@ It adds each variable in `env` unless it is already set. Serve prints what it ad
 
 ## The built-in recipes
 
-Two, both for Qwen3.8-27B (`qwen35`) on `hrx`, from the 2026-10-24 HRX drafter measurements:
+Three, all on `hrx` for the `qwen35` architecture, from the 2026-10-24/25 HRX drafter measurements
+(the Bonsai one is narrowed to PrismML's ternary files by a metadata key, below):
 
 | id | matches | adds | measured |
 |---|---|---|---|
 | `qwen35-dflash-p-min-0` | `hrx`, `qwen35`, drafter `dflash` | `--spec-draft-p-min 0` | 56.6 / 30.8 / 20.6 tok/s code / prose / short with the Q8_0 drafter; a non-zero threshold cut prose to 22.5-23.3 |
-| `qwen35-mtp-max-3` | `hrx`, `qwen35`, drafter `mtp` | `--mtp-max 3` | 32.6 / 26.9 / 28.0 tok/s; acceptance falls to 0.17-0.60 past 7 drafts, so do not raise it |
+| `bonsai-ternary-mtp-n2` | `hrx`, `qwen35`, drafter `mtp`, `prism.hadamard.version` present | `--spec-draft-n-max 2` | 40.4 / 38.3 / 30.4 / 34.7 tok/s (code / prose / short / translation) against 41.7 / 36.8 / 27.2 / 33.2 at 3 drafts: the ternary files accept 0.76 of 2-token drafts, so short answers and translation win at 2 and only code wants 3-4 |
+| `qwen35-mtp-max-3` | `hrx`, `qwen35`, drafter `mtp` | `--spec-draft-n-max 3` (what serve's `--mtp-max 3` passes) | 32.6 / 26.9 / 28.0 tok/s; acceptance falls to 0.17-0.60 past 7 drafts, so do not raise it |
 
 Both carry their full `measured` line in `config/recipes.json`. Older recipes were measured on build
 RFC #213 stage 3 removed: `rotated-moe-ub1024` and `rocm-dflash-p-min-0.4` (the lean ROCm build). New

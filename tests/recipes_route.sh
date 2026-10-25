@@ -55,6 +55,10 @@ open(d + "/gk.json", "w").write("""{"recipes": [{"id": "gk", "match": {"architec
   "gguf_keys": ["prism.hadamard.version"]}, "args": ["--spec-draft-n-max", "2"], "measured": "test"}]}""")
 open(d + "/gkbad.json", "w").write("""{"recipes": [{"id": "gkbad", "match": {"gguf_keys": "prism.hadamard.version"},
   "args": ["--spec-draft-n-max", "2"], "measured": "test"}]}""")
+open(d + "/gkorder.json", "w").write("""{"recipes": [
+  {"id": "gkb", "match": {"architecture": ["qwen35"], "gguf_keys": ["prism.hadamard.version"]},
+   "args": ["--spec-draft-n-max", "2"], "measured": "test"},
+  {"id": "gkg", "match": {"architecture": ["qwen35"]}, "args": ["--spec-draft-n-max", "3"], "measured": "test"}]}""")
 open(d + "/pmin.json", "w").write("""{"recipes": [{"id": "pmin", "match": {"drafter": ["dflash"]},
   "args": ["--spec-draft-p-min", "0"], "measured": "test"}]}""")
 open(d + "/mine.json", "w").write("""{"recipes": [{"id": "mine", "match": {"architecture": ["llama"]},
@@ -121,6 +125,10 @@ run "$scratch/prism.gguf" "$scratch/gk-on.json" --recipes "$scratch/gk.json"
 check "a gguf_keys recipe matches the file that carries the key" '[ "$(after "$scratch/gk-on.json" --spec-draft-n-max)" = 2 ]'
 run "$scratch/plainq35.gguf" "$scratch/gk-off.json" --recipes "$scratch/gk.json"
 check "  and not the same architecture without it" '[ "$(after "$scratch/gk-off.json" --spec-draft-n-max)" = None ] && ! grep -q recipe "$scratch/gk-off.json.log"'
+run "$scratch/prism.gguf" "$scratch/gk-order-prism.json" --recipes "$scratch/gkorder.json"
+check "file order: the narrower gguf_keys recipe wins (2, once) on a file that carries the key" '[ "$(after "$scratch/gk-order-prism.json" --spec-draft-n-max)" = 2 ] && [ "$(count "$scratch/gk-order-prism.json" --spec-draft-n-max)" = 1 ] && grep -q "recipe gkb" "$scratch/gk-order-prism.json.log" && ! grep -q "recipe gkg" "$scratch/gk-order-prism.json.log"'
+run "$scratch/plainq35.gguf" "$scratch/gk-order-plain.json" --recipes "$scratch/gkorder.json"
+check "  and the broader one still applies without the key" '[ "$(after "$scratch/gk-order-plain.json" --spec-draft-n-max)" = 3 ] && grep -q "recipe gkg" "$scratch/gk-order-plain.json.log"'
 
 port=$(python3 -c 'import socket; s=socket.socket(); s.bind(("127.0.0.1", 0)); print(s.getsockname()[1])')
 bad=$(timeout 20 "$bin" serve -m "$scratch/plain.gguf" --device auto --port "$port" --llama-server "$scratch/backend.py" \

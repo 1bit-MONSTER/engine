@@ -579,7 +579,14 @@ found; it has not been repeated on HRX. The sweep (draft length x
 
 Use the default for chat and `--mtp-max 6 --mtp-p-min 0.5` for code (3.4x): code is
 predictable enough to keep long drafts, prose is not. Draft length 8 collapses on every
-prompt. Adding n-gram drafting to MTP gains nothing. Small-active MoE models are the
+prompt. Adding n-gram drafting to MTP gains nothing.
+
+**Cap the draft on HRX**: `config/recipes.json` pins `--mtp-max 3` for `qwen35` on `hrx`, which is
+also llama-server's default — 32.6 / 26.9 / 28.0 tok/s on the 27B on 2026-10-24. Do not raise it
+past 7: from 8 drafts on, acceptance falls to 0.17-0.60 and the longer verify batch costs more than
+the drafts return (`--mtp-max 7 --mtp-p-min 0`: 37.9 / 22.4 / 22.4; `--mtp-max 15`: 33.6 / 14.9 /
+13.5, even with 16-token verify kernels). Code is the one case where a longer draft still pays, and
+only up to 7. Small-active MoE models are the
 opposite case: on Qwen3-Coder-30B-A3B (3B active, 88 tok/s then) every draft model
 tried (Qwen3 0.6B / 1.7B / 4B) was slower than no drafting, even at 82-87% acceptance.
 
@@ -643,32 +650,41 @@ llama-quantize dflash2-bf16.gguf dflash2-q8_0.gguf Q8_0
 1bit serve -m Qwen3.8-27B-Q4_0.gguf --dflash dflash2-q8_0.gguf
 ```
 
-Measured through `1bit serve` on the removed Vulkan build on Strix Halo (not yet re-measured on
-HRX), Qwen3.8-27B Q4_0 (Unsloth), the
-same three chat prompts as above (code / prose / short, decode tok/s), runs back to back on a
-shared box, 2026-09-28:
+Measured through `1bit serve` on Strix Halo on 2026-10-24: Qwen3.8-27B UD-Q4_K_XL, the same three
+chat prompts as above (code / prose / short, decode tok/s), greedy 256-token answers, medians of
+three fresh servers, performance mode, **strict placement on** — the drafter's candidate selector
+(its top-k, fill and row-gather nodes) runs on HRX, so the whole drafter graph is on the GPU in one
+graph split:
 
-| Drafter | tok/s | Prompt t/s (1,838 tokens) |
-|---|---|---|
-| none | 11.1 / 11.8 / 12.4 | 330 |
-| `--mtp` (Q4_0 MTP head, draft length 3) | 31.7 / 25.8 / **28.2** | 267 |
-| `--dflash` (DFlash2, Q8_0, full blocks) | **45.7** / **28.3** / 17.8 | 255 |
+| Drafter | code | prose | short |
+|---|---|---|---|
+| none | 12.1 | 12.1 | 12.5 |
+| `--mtp` (the file's own head, draft length 3) | 32.6 | 26.9 | 28.0 |
+| `--dflash` (DFlash2 Q8_0, whole blocks) | **56.6** | **30.8** | 20.6 |
+| `--dflash` (DFlash2 Q4_K, whole blocks) | **58.8** | — | — |
 
-DFlash2 is the pick for code (4.1x, +44% over MTP) and ties or beats MTP on prose. MTP wins
-short answers (the translation prompt stops after ~16 tokens, too few to fill blocks). The Q8_0
-drafter is faster than BF16 (42.5 vs 38.9 on code, direct llama-server). A drafted token is
-kept only when the model agrees, so the output is the model's own.
+DFlash2 is the pick for code (+73% over MTP, 4.7x without drafting) and about level on prose, but a
+short answer stops before a block is worth filling, so it loses a third there. **The default stays
+MTP for chat; `--dflash` is for code-heavy serving.** Acceptance on the three prompts is 0.88 / 0.42
+/ 0.23, and a drafted token is kept only when the model's verify pass agrees, so the output is the
+model's own. The Q8_0 drafter is what the numbers above use; a Q8_0 file is also what the drafter's
+own README recommends over BF16.
 
 Without `--mtp-max`, `--dflash` drafts the drafter's block minus one (its `dflash.block_size`; 16
-when the file does not say). Our HRX llama.cpp's default draft p-min is already 0, which keeps
-DFlash blocks whole; `--mtp-p-min` sets another. (The DFlash2 one-server route on the lean ROCm
-build is gone, above.)
+when the file does not say). **DFlash2's block is 8 tokens**, not 16: the seven drafts per verify
+step are what `1bit serve --dflash` asks for, and they fit the 2-8-token verify kernels.
+
+A non-zero draft threshold throws whole blocks away: on the 27B, `--spec-draft-p-min` 0.2 / 0.4 /
+0.6 cut prose from 30.8 to 22.5-23.3 tok/s, so `config/recipes.json` pins `--spec-draft-p-min 0`
+for `qwen35` on `hrx` (docs/recipes.md). `--mtp-p-min` sets the same threshold. (The DFlash2
+one-server route on the lean ROCm build is gone, above.)
 
 ## Recipes (`--recipes`, `--no-recipes`)
 
 Tuned llama-server settings that depend on the model and route go in `config/recipes.json` as
-recipes, each with the measurement behind it. The built-in set is empty for now: the recipes the
-engine had were measured on builds RFC #213 stage 3 removed ([recipes.md](recipes.md#the-built-in-recipes)). Serve prints each recipe it applies. Anything serve sets
+recipes, each with the measurement behind it. The built-in set has two entries today, both for
+Qwen3.8-27B on `hrx`: `--spec-draft-p-min 0` with a DFlash2 drafter and `--mtp-max 3` with the file's
+own MTP head ([recipes.md](recipes.md#the-built-in-recipes)). Serve prints each recipe it applies. Anything serve sets
 itself wins over a recipe. `--recipes FILE` replaces the built-in set and `--no-recipes` turns
 recipes off ([recipes.md](recipes.md)). To measure a setting before making it a recipe, use
 [`tools/bench.py`](bench.md).

@@ -589,6 +589,10 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
 - **PrismML tile bytes** ([llama.cpp #74](https://github.com/1bit-MONSTER/llama.cpp/pull/74)): the low-token
   SwiGLU sized PQ2_0 / PTQ1_0 weight rows from a tile size of 0, so every row read row 0. Ternary-Bonsai-1.7B
   PQ2_0 decode perplexity 1,225,624 -> 20.65 (CPU 20.70); the 27B files took another kernel and were unaffected.
+- **NVFP4 (ggml type 40) and Q2_0 (type 42)**: prompt and decode on HRX through our HIP kernels
+  (private add-on, 2026-10-24), no extra flag or environment: a Qwen3.8-27B file of either type loads
+  and runs with **one graph split**. Measured on the 27B, performance mode: NVFP4 pp512 613 / tg128
+  12.7 tok/s, KLD vs the CPU 0.00144; Q2_0 pp512 632 / tg128 23.1 tok/s, KLD vs the CPU 0.00055.
 - **TQ1_0 / TQ2_0** ([llama.cpp #69](https://github.com/1bit-MONSTER/llama.cpp/pull/69)): ggml's ternary types
   in the shared dequantizer and on the K-quant decode kernels. Ternary-Bonsai-1.7B, HRX0 vs CPU: KLD 0.000523,
   same top token 98.67%; pp512 / tg128 TQ1_0 3542 / 113, TQ2_0 4100 / 156 tok/s.

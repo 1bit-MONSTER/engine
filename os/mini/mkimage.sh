@@ -476,7 +476,7 @@ if [ "$BOOT_LAYOUT" = grub ]; then
     cat > "$out/esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=12
 set default=0
-menuentry "1bit OS v2026.43 - LIVE (runs from RAM, nothing installed)" {
+menuentry "1bit OS, Lemonade Server appliance v2026.43 - LIVE (runs from RAM, nothing installed)" {
     linux /1bit/vmlinuz $cmdline
     initrd /1bit/initramfs.img
 }

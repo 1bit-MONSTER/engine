@@ -52,7 +52,7 @@ put() {
 }
 
 cp -a "$build/1bit" "$stage/"
-put hrx/llama/bin llama-server llama-bench
+put hrx/llama/bin llama-server llama-bench llama-perplexity
 put ds4/hip ds4-server ds4 ds4-bench
 
 # the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
@@ -88,6 +88,12 @@ if [ -d "$build/npu" ]; then
     echo "  scripts, tools: the GGUF-on-NPU helpers ($(ls "$stage/scripts" "$stage/tools" | wc -l) files)"
 fi
 
+# Everything staged has to come from the build being packaged. This compares bytes with the same path under the
+# build, so it runs before pack_localize: localization rewrites every RUNPATH (and adds libomp.so, which the build
+# does not have), after which nothing would match.
+provenance_bad=$(pack_require_provenance "$stage" "$build" || true)
+[ -z "$provenance_bad" ] || { echo "files that did not come from this build:"; echo "$provenance_bad"; exit 1; }
+
 # Every program and library finds its libraries beside itself (scripts/pack-elf.sh): a library it
 # loads from elsewhere in the build tree (HRX's libhrx, libloomc) or LLVM's OpenMP runtime
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
@@ -103,10 +109,6 @@ tools_bad=""
 tools_bad+=$(pack_require_tools "$stage" hrx/llama/bin llama-server llama-bench llama-perplexity || true)
 tools_bad+=$(pack_require_tools "$stage" ds4/hip ds4-server ds4 ds4-bench || true)
 [ -z "$tools_bad" ] || { echo "shipped tools that cannot load:"; echo "$tools_bad"; exit 1; }
-
-# everything shipped has to come from the build being packaged
-provenance_bad=$(pack_require_provenance "$stage" "$build" || true)
-[ -z "$provenance_bad" ] || { echo "files that did not come from this build:"; echo "$provenance_bad"; exit 1; }
 
 # anything else that cannot load leaves the package rather than shipping broken
 pack_prune_unloadable "$stage"

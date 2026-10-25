@@ -653,6 +653,8 @@ Measured with the fork's Vulkan `llama-server` on Strix Halo, 2026-10-01. Settin
 
 ## DFlash draft models (`--dflash`)
 
+> **Not on this pin.** On llama.cpp pins before fork `e91b608cd` (this one, and the release candidate built on it) a DFlash2 drafter fails to load with `done_getting_tensors: wrong number of tensors; expected 81, got 58`; fixed by fork #139 + #140, lands with the next pin bump.
+
 `--dflash <draft.gguf>` uses a DFlash block-diffusion draft model instead of the MTP head: the
 draft emits a whole block of tokens in one pass, reading the model's hidden states, and the
 model checks the block in one batch. It turns on llama-server's `draft-dflash` (DFlash2's

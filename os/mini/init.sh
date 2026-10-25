@@ -199,6 +199,17 @@ else
     say "[gpu] hwmon: $(for h in /sys/class/hwmon/hwmon*; do cat $h/name 2>/dev/null; done | tr '\n' ' ')"
 fi
 
+
+# fans and power: the EC driver exists only for the boards we know (os/mini/board.sh). On any other
+# board nothing is written at all and the firmware's own fan curve stays.
+if [ -x /usr/sbin/1bit-board ] && /usr/sbin/1bit-board known 2>/dev/null; then
+    modprobe -q ec_su_axb35
+    say "[fans] curve: $(/usr/sbin/1bit-board curve 2>&1 | head -n 1)"
+    say "[power] $(/usr/sbin/1bit-board power 2>&1 | head -n 1)"
+    setsid /usr/sbin/1bit-board boost > /tmp/fans.log 2>&1 &
+else
+    say "[fans] not controlled: this board is not one we know, the firmware curve stays"
+fi
 # HRX: TheRock's HSA runtime (1bit serve also finds it at its compiled-in path), and the Loom
 # kernel cache on the stick, so kernels compiled on the first boot are reused after a reboot
 [ -s /etc/1bit/libhsa ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$(cat /etc/1bit/libhsa)"
@@ -295,6 +306,16 @@ else
     touch /etc/1bit/live 2>/dev/null
 fi
 echo "GPU: $(ls /dev/dri/renderD* /dev/kfd 2>/dev/null | tr '\n' ' ')  NPU: $(ls /dev/accel/accel* 2>/dev/null | tr '\n' ' ')"
+
+# health: fans, power profile and the two temperatures this board reports
+if [ -x /usr/sbin/1bit-board ]; then
+    say "[fans] $(/usr/sbin/1bit-board status 2>/dev/null)"
+    say "[power] $(/usr/sbin/1bit-board power-status 2>/dev/null)"
+fi
+TJ=$(for h in /sys/class/hwmon/hwmon*; do [ "$(cat "$h/name" 2>/dev/null)" = k10temp ] && echo "$h"; done | head -n 1)
+if [ -n "$TJ" ]; then
+    say "temps: Tctl $(( $(cat "$TJ/temp1_input" 2>/dev/null || echo 0) / 1000 ))C  EC $(cat /sys/class/ec_su_axb35/temp1/temp 2>/dev/null || echo n/a)C"
+fi
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
 echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"
 echo "Prove the engine answers from this boot:  1bit-selftest   (console or SSH; logs to /data/selftest.log)"
@@ -327,6 +348,12 @@ if grep -q "1bit.check" /proc/cmdline; then
     if find / -xdev \( -name 'libxrt*' -o -name 'libopenvino*' -o -name 'libonnxruntime*' \) 2>/dev/null | grep -q .; then
         echo "CHECK runtime deps: FAILED (an external accelerator runtime is in the image)"; ok=0
     else echo "CHECK runtime deps: self-contained"; fi
+    if [ -x /usr/sbin/1bit-board ] && /usr/sbin/1bit-board known 2>/dev/null; then
+        if /usr/sbin/1bit-board status > /dev/null 2>&1; then echo "CHECK fans: controlled"
+        else echo "CHECK fans: FAILED"; ok=0; fi
+    else
+        echo "CHECK fans: not controlled (no EC driver on this board)"
+    fi
     [ -e /lib/firmware/amdnpu/17f0_11 ] && echo "CHECK NPU firmware: present" || { echo "CHECK NPU firmware: FAILED"; ok=0; }
     dropbear -V 2>&1 | grep -q Dropbear && echo "CHECK dropbear: runs" || { echo "CHECK dropbear: FAILED"; ok=0; }
     echo "CHECK modules: $(find /lib/modules -name '*.ko*' | wc -l) kernel modules, amdgpu $(modinfo -F version amdgpu >/dev/null 2>&1 && echo found || echo MISSING)"

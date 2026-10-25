@@ -1,0 +1,571 @@
+#!/usr/bin/env bash
+
+# mandatory bash version check
+if [[ "${BASH_VERSION%%.*}" -lt 4 ]]; then
+    echo "Error: This script requires Bash version 4 or higher"
+    echo "Current version: $BASH_VERSION"
+    exit 1
+fi
+
+axb35_name=ec_su_axb35
+axb35_path=/sys/class/$axb35_name
+axb35_delay=1
+raw_mode=0
+dev_mode=0
+declare -a axb35_vars
+
+# usage info
+usage() {
+    cat << EOF
+Usage: $(basename "$0") [OPTIONS]
+
+OPTIONS:
+  -i SECONDS   Update interval (0.3-10 seconds, default: 1)
+  -j           Output current values in JSON and exit
+  -r           Display raw values without additional processing
+  -h, --help   Display this usage information
+
+
+EOF
+    exit 0
+}
+
+# colors and formatting
+RESET="\033[0m"
+BOLD="\033[1m"
+GREEN="\033[32m"
+YELLOW="\033[33m"
+BLUE="\033[34m"
+CYAN="\033[36m"
+RED="\033[31m"
+MAGENTA="\033[35m"
+
+# magic numbers to navigate the array
+fan1rpm=0    fan2rpm=1   fan3rpm=2
+fan1mode=3   fan2mode=4  fan3mode=5
+fan1level=6  fan2level=7 fan3level=8
+fan1ru=9     fan2ru=10   fan3ru=11
+fan1rd=12    fan2rd=13   fan3rd=14
+temp=15      tempmin=16  tempmax=17
+powermode=18
+
+# function to get all needed values from the module
+get_current_state() {
+    mapfile -t axb35_vars < <(
+    cat \
+        $axb35_path/fan{1..3}/rpm \
+        $axb35_path/fan{1..3}/mode \
+        $axb35_path/fan{1..3}/level \
+        $axb35_path/fan{1..3}/rampup_curve \
+        $axb35_path/fan{1..3}/rampdown_curve \
+        $axb35_path/temp1/{temp,min,max} \
+        $axb35_path/apu/power_mode
+    )
+}
+
+# function to process received values
+process_current_state() {
+    local modes=($fan1mode $fan2mode $fan3mode)
+    local rus=($fan1ru $fan2ru $fan3ru)
+    local rds=($fan1rd $fan2rd $fan3rd)
+    local levels=($fan1level $fan2level $fan3level)
+
+    # for fans in auto or fixed mode, ramp-up and ramp-down curves are not applicable
+    # for fans in auto mode, fan level is not applicable
+    for i in {0..2}; do
+        if [[ "${axb35_vars[${modes[$i]}]}" == "auto" || "${axb35_vars[${modes[$i]}]}" == "fixed" ]]; then
+            axb35_vars[${rus[$i]}]=''
+            axb35_vars[${rds[$i]}]=''
+        fi
+        [[ "${axb35_vars[${modes[$i]}]}" == "auto" ]] && axb35_vars[${levels[$i]}]=''
+    done
+
+    # check if any conditional field changed to/from empty compared to previous state
+    needs_redraw=0
+    local conditional_indices=($fan1level $fan1ru $fan1rd $fan2level $fan2ru $fan2rd $fan3level $fan3ru $fan3rd)
+    for idx in "${conditional_indices[@]}"; do
+        local cur_empty=0 prev_empty=0
+        [[ -z "${axb35_vars[$idx]}" ]] && cur_empty=1
+        [[ -z "${axb35_vars_old[$idx]}" ]] && prev_empty=1
+        if [[ $cur_empty -ne $prev_empty ]]; then
+            needs_redraw=1
+            break
+        fi
+    done
+    axb35_vars_old=("${axb35_vars[@]}")
+}
+
+# check if module is loaded and path exists (skipped in dev mode)
+check_module() {
+    if ! lsmod | grep -q "$axb35_name" || [ ! -d "$axb35_path" ]; then
+        echo "Error: Module '$axb35_name' is not loaded or not accessible"
+        exit 2
+    fi
+}
+
+# dev mode state generator - cycles through various states to exercise the UI
+_dev_tick=0
+get_dev_state() {
+    local tick=$(( _dev_tick % 40 ))
+    (( _dev_tick++ ))
+
+    # cycle through phases:
+    #   0-9:   all fans auto, low temp, quiet power
+    #  10-19:  fan1 fixed, fan2 curve, fan3 auto, mid temp, balanced power
+    #  20-29:  all fans curve, high temp, performance power
+    #  30-39:  fan1 curve, fan2 auto, fan3 fixed, cooling down, balanced power
+
+    local f1rpm f2rpm f3rpm
+    local f1mode f2mode f3mode
+    local f1level f2level f3level
+    local f1ru f2ru f3ru
+    local f1rd f2rd f3rd
+    local cur_temp pwr_mode
+
+    if (( tick < 10 )); then
+        # phase 0: all fans auto, cool, quiet
+        f1rpm=$(( 800  + tick * 20 ))
+        f2rpm=$(( 750  + tick * 15 ))
+        f3rpm=$(( 600  + tick * 10 ))
+        f1mode=auto;  f2mode=auto;  f3mode=auto
+        f1level='';   f2level='';   f3level=''
+        f1ru='';      f2ru='';      f3ru=''
+        f1rd='';      f2rd='';      f3rd=''
+        cur_temp=$(( 38 + tick ))
+        pwr_mode=quiet
+    elif (( tick < 20 )); then
+        # phase 1: fan1 fixed, fan2 curve, fan3 auto, warming, balanced
+        local t=$(( tick - 10 ))
+        f1rpm=$(( 1800 + t * 80 ))
+        f2rpm=$(( 1200 + t * 60 ))
+        f3rpm=$(( 900  + t * 40 ))
+        f1mode=fixed; f2mode=curve; f3mode=auto
+        f1level=$(( 1 + t / 3 )); f2level=''; f3level=''
+        f1ru='';           f2ru="60,70,83,95,97"; f3ru=''
+        f1rd='';           f2rd="40,50,80,94,96"; f3rd=''
+        cur_temp=$(( 50 + t * 2 ))
+        pwr_mode=balanced
+    elif (( tick < 30 )); then
+        # phase 2: all fans curve, hot, performance
+        local t=$(( tick - 20 ))
+        f1rpm=$(( 3000 + t * 100 ))
+        f2rpm=$(( 2800 + t * 90  ))
+        f3rpm=$(( 2200 + t * 70  ))
+        f1mode=curve; f2mode=curve; f3mode=curve
+        f1level='';   f2level='';   f3level=''
+        f1ru="60,70,83,95,97"; f2ru="60,70,83,95,97"; f3ru="20,60,83,95,97"
+        f1rd="40,50,80,94,96"; f2rd="40,50,80,94,96"; f3rd="0,50,80,94,96"
+        cur_temp=$(( 72 + t ))
+        pwr_mode=performance
+    else
+        # phase 3: fan1 curve, fan2 auto, fan3 fixed, cooling, balanced
+        local t=$(( tick - 30 ))
+        f1rpm=$(( 3900 - t * 120 ))
+        f2rpm=$(( 3600 - t * 100 ))
+        f3rpm=$(( 2900 - t * 80  ))
+        f1mode=curve; f2mode=auto; f3mode=fixed
+        f1level='';   f2level='';  f3level=$(( 5 - t / 2 ))
+        f1ru="60,70,83,95,97"; f2ru=''; f3ru=''
+        f1rd="40,50,80,94,96"; f2rd=''; f3rd=''
+        cur_temp=$(( 80 - t * 2 ))
+        pwr_mode=balanced
+    fi
+
+    axb35_vars=(
+        "$f1rpm" "$f2rpm" "$f3rpm"
+        "$f1mode" "$f2mode" "$f3mode"
+        "$f1level" "$f2level" "$f3level"
+        "$f1ru" "$f2ru" "$f3ru"
+        "$f1rd" "$f2rd" "$f3rd"
+        "$cur_temp" "35" "82"
+        "$pwr_mode"
+    )
+}
+
+# command line arguments processing
+while getopts ":i:jrdh-:" opt; do
+    case $opt in
+        i)
+            if [[ $(echo "$OPTARG > 0.2 && $OPTARG <= 10" | bc) -eq 1 ]]; then
+                axb35_delay=$OPTARG
+            else
+                echo "Error: Interval must be between 0.3 and 10 seconds"
+                exit 1
+            fi
+            ;;
+        j)
+            get_current_state
+            cat << EOF
+{
+  "fan1": {
+    "rpm": ${axb35_vars[$fan1rpm]},
+    "mode": "${axb35_vars[$fan1mode]}",
+    "level": ${axb35_vars[$fan1level]},
+    "rampup_curve": "${axb35_vars[$fan1ru]}",
+    "rampdown_curve": "${axb35_vars[$fan1rd]}"
+  },
+  "fan2": {
+    "rpm": ${axb35_vars[$fan2rpm]},
+    "mode": "${axb35_vars[$fan2mode]}",
+    "level": ${axb35_vars[$fan2level]},
+    "rampup_curve": "${axb35_vars[$fan2ru]}",
+    "rampdown_curve": "${axb35_vars[$fan2rd]}"
+  },
+  "fan3": {
+    "rpm": ${axb35_vars[$fan3rpm]},
+    "mode": "${axb35_vars[$fan3mode]}",
+    "level": ${axb35_vars[$fan3level]},
+    "rampup_curve": "${axb35_vars[$fan3ru]}",
+    "rampdown_curve": "${axb35_vars[$fan3rd]}"
+  },
+  "temperature": {
+    "current": ${axb35_vars[$temp]},
+    "min": ${axb35_vars[$tempmin]},
+    "max": ${axb35_vars[$tempmax]}
+  },
+  "power_mode": "${axb35_vars[$powermode]}"
+}
+EOF
+            exit 0
+            ;;
+        r)
+            raw_mode=1
+            ;;
+        d)
+            dev_mode=1
+            ;;
+        h)
+            usage
+            ;;
+        -)
+            case "${OPTARG}" in
+                help)
+                    usage
+                    ;;
+                *)
+                    echo "Invalid option: --${OPTARG}" >&2
+                    usage
+                    ;;
+            esac
+            ;;
+        \?)
+            echo "Invalid option: -$OPTARG" >&2
+            usage
+            ;;
+        :)
+            echo "Option -$OPTARG requires an argument." >&2
+            usage
+            ;;
+    esac
+done
+
+# module check runs after argument parsing so -d can suppress it
+[[ $dev_mode -eq 0 ]] && check_module
+
+# function to format the RPM value with color
+format_rpm() {
+    local rpm=$1
+    if (( rpm < 1200 )); then
+        echo -e "${GREEN}${rpm}${RESET} RPM"
+    elif (( rpm < 3000 )); then
+        echo -e "${YELLOW}${rpm}${RESET} RPM"
+    else
+        echo -e "${RED}${rpm}${RESET} RPM"
+    fi
+}
+
+# function to format the temperature with color
+format_temp() {
+    local temp=$1
+    if (( temp < 50 )); then
+        echo -e "${GREEN}${temp}${RESET} °C"
+    elif (( temp < 70 )); then
+        echo -e "${YELLOW}${temp}${RESET} °C"
+    else
+        echo -e "${RED}${temp}${RESET} °C"
+    fi
+}
+
+# function to format the mode with color
+format_mode() {
+    local mode=$1
+    case "$mode" in
+        "auto")  echo -e "[${GREEN}${mode}${RESET}]" ;;
+        "fixed") echo -e "[${YELLOW}${mode}${RESET}]" ;;
+        "curve") echo -e "[${CYAN}${mode}${RESET}]" ;;
+        *) echo -e "[${mode}]" ;;
+    esac
+}
+
+# function to format the power mode with color
+format_power_mode() {
+    local mode=$1
+    case "$mode" in
+        "quiet")       echo -e "${GREEN}${mode}${RESET}" ;;
+        "balanced")    echo -e "${YELLOW}${mode}${RESET}" ;;
+        "performance") echo -e "${RED}${mode}${RESET}" ;;
+        *) echo -e "${mode}" ;;
+    esac
+}
+
+# function to draw the interface
+draw_interface() {
+    local value_offset=20
+    local term_rows=$(tput lines)
+    local term_cols=$(tput cols)
+    
+    tput cup 0 0
+    tput ed
+
+    # terminal dimensions and update interval in top right corner
+    local interval_ms=$( printf "%.0f" $(echo "${axb35_delay} * 1000" | bc -l) )
+    local dim_text="[i:${interval_ms}ms | t:${term_cols}x${term_rows}]"
+    local dim_pos=$((term_cols - ${#dim_text}))
+    tput cup 0 $dim_pos
+    echo -n -e "${CYAN}${dim_text}${RESET}"
+    
+    # title
+    tput cup 0 0
+    echo -e "${BOLD}${MAGENTA}=== AXB35 System Monitor ===${RESET}"
+    echo ""
+    
+    # calculate layout based on terminal size
+    # each block is 6 rows high (1 title + 4 data + 1 empty)
+    # each column is 40 chars wide (static)
+    local block_height=6
+    local column_width=40
+    local max_columns=$((term_cols / column_width))
+    [[ $max_columns -lt 1 ]] && max_columns=1
+    
+    local usable_rows=$((term_rows - 4))
+    local blocks_per_column=$((usable_rows / block_height))
+    [[ $blocks_per_column -lt 1 ]] && blocks_per_column=1
+    
+    # store the positions of each value for later updates
+    declare -gA positions
+    
+    # Block 1: APU Fan 1
+    local col=0
+    local row=2
+    
+    if [[ $((row + block_height)) -gt $((usable_rows + 2)) ]]; then
+        col=$((col + 1))
+        row=2
+    fi
+    
+    if [[ $col -lt $max_columns ]]; then
+        local col_offset=$((col * column_width))
+        tput cup $row $col_offset
+        echo -e "${BOLD}APU Fan 1${RESET}"
+        positions[fan1mode_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Speed: "
+        positions[fan1rpm_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan1level]}" ]] && echo -n "  Level: "
+        positions[fan1level_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan1ru]}" ]] && echo -n "  Ramp Up Curve: "
+        positions[fan1ru_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan1rd]}" ]] && echo -n "  Ramp Down Curve: "
+        positions[fan1rd_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 2)) # skip one line
+    fi
+    
+    # Block 2: APU Fan 2
+    if [[ $((row + block_height)) -gt $((usable_rows + 2)) ]]; then
+        col=$((col + 1))
+        row=2
+    fi
+    
+    if [[ $col -lt $max_columns ]]; then
+        local col_offset=$((col * column_width))
+        tput cup $row $col_offset
+        echo -e "${BOLD}APU Fan 2${RESET}"
+        positions[fan2mode_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Speed: "
+        positions[fan2rpm_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan2level]}" ]] && echo -n "  Level: "
+        positions[fan2level_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan2ru]}" ]] && echo -n "  Ramp Up Curve: "
+        positions[fan2ru_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan2rd]}" ]] && echo -n "  Ramp Down Curve: "
+        positions[fan2rd_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 2)) # skip one line
+    fi
+    
+    # Block 3: System Fan
+    if [[ $((row + block_height)) -gt $((usable_rows + 2)) ]]; then
+        col=$((col + 1))
+        row=2
+    fi
+    
+    if [[ $col -lt $max_columns ]]; then
+        local col_offset=$((col * column_width))
+        tput cup $row $col_offset
+        echo -e "${BOLD}System Fan${RESET}"
+        positions[fan3mode_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Speed: "
+        positions[fan3rpm_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan3level]}" ]] && echo -n "  Level: "
+        positions[fan3level_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan3ru]}" ]] && echo -n "  Ramp Up Curve: "
+        positions[fan3ru_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        [[ -n "${axb35_vars[$fan3rd]}" ]] && echo -n "  Ramp Down Curve: "
+        positions[fan3rd_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 2)) # skip one line
+    fi
+    
+    # Block 4: Temperature & Power
+    if [[ $((row + block_height)) -gt $((usable_rows + 2)) ]]; then
+        col=$((col + 1))
+        row=2
+    fi
+    
+    if [[ $col -lt $max_columns ]]; then
+        local col_offset=$((col * column_width))
+        tput cup $row $col_offset
+        echo -e "${BOLD}Temperature & Power${RESET}"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Current: "
+        positions[temp_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Min: "
+        positions[tempmin_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Max: "
+        positions[tempmax_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 1))
+        tput cup $row $col_offset
+        echo -n "  Power Mode: "
+        positions[powermode_pos]="$row $((col_offset + value_offset))"
+        
+        row=$((row + 2)) # skip one line
+    fi
+    
+    # prompt
+    local prompt_row=$((term_rows - 2))
+    tput cup $prompt_row 0
+    echo -e "${BOLD}${BLUE}Press Ctrl+C to exit${RESET}"
+}
+
+# function to draw the values in their positions
+draw_values() {
+    for pos in "${!positions[@]}"; do
+        read -r row col <<< "${positions[$pos]}"
+        tput cup "$row" "$col"
+
+        local value_str=''
+        
+        # extract the variable name without _pos suffix
+        var_name=${pos%_pos}
+        
+        # special formatting for different types of values
+        case "$var_name" in
+            fan1rpm|fan2rpm|fan3rpm)
+                value_str=$(format_rpm "${axb35_vars[${!var_name}]}")
+                ;;
+            temp|tempmin|tempmax)
+                value_str=$(format_temp "${axb35_vars[${!var_name}]}")
+                ;;
+            fan1mode|fan2mode|fan3mode)
+                value_str=$(format_mode "${axb35_vars[${!var_name}]}")
+                ;;
+            powermode)
+                value_str=$(format_power_mode "${axb35_vars[${!var_name}]}")
+                ;;
+            *)
+                value_str="${axb35_vars[${!var_name}]}"
+                ;;
+        esac
+
+        # calculate required padding
+        local clean_str=${value_str//$'\e'[\[0-9;]*m/}
+        local visible_length=${#clean_str}
+        local padding=$((15 - visible_length))
+        printf "%s%${padding}s" "$value_str" ""
+    done
+}
+
+# function to handle terminal resize
+handle_resize() {
+    draw_interface
+    draw_values
+}
+
+# function to handle cleanup on exit
+cleanup() {
+    tput cnorm
+    tput sgr0
+    clear
+    echo "Monitor terminated."
+    exit 0
+}
+
+# set up signal handlers
+trap cleanup SIGINT SIGTERM
+trap handle_resize SIGWINCH
+
+# hide cursor
+tput civis
+
+# previous state array for change detection in process_current_state
+declare -a axb35_vars_old
+
+# main loop
+handle_resize
+while true; do
+    if [[ $dev_mode -eq 1 ]]; then
+        get_dev_state
+    else
+        get_current_state
+    fi
+    [[ $raw_mode -eq 0 ]] && process_current_state
+    [[ $needs_redraw -eq 1 ]] && draw_interface
+
+    draw_values
+    sleep $axb35_delay
+done

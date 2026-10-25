@@ -49,7 +49,7 @@ excerpts, since the log is public and the add-on's sources are not. It then runs
 | check | what | catches |
 |---|---|---|
 | ops | one `test-backend-ops -b HRX0 -j 4` run over MUL_MAT, MUL_MAT_ID, FLASH_ATTN_EXT, GATED_DELTA_NET, SSM_CONV, GET_ROWS, ROPE, RMS_NORM, SOFT_MAX | a kernel that disagrees with the CPU (#310, #313, #370, the IQ ports) |
-| fa-decode-q8 | the add-on's `ggml-hrx-fa-decode-bench` on its q8_0 KV decode kernel against a double-precision reference: K q8_0 with V f16 (`-ctk q8_0` alone) and with V q8_0, Hq/Hkv 16/8 and 32/8, n_kv 1031, 2048 and 4103, six runs in one hold | a mixed K/V type bug test-backend-ops cannot see: it has no FLASH_ATTN_EXT case with K and V of different types (gpu-kernels #11 read f16 V dims 0..31 only) |
+| fa-decode-q8 | the add-on's own long-context decode-attention check against a double-precision reference, quantised K with both cache value types and two head groupings, six runs in one hold | a mixed cache-type bug `test-backend-ops` cannot see: it has no `FLASH_ATTN_EXT` case with K and V of different types |
 | kat | `tools/kat.py check` on five models (below), against `tests/golden/hw-gate/kat-<model>.json` | wrong answers, empty replies, NaN logprobs, nondeterminism, cached-prefix and multi-ubatch bugs, drift from the release pin (#308, #309, #315, #318, #319, #369) |
 | kld | `llama-perplexity --kl-divergence` on wiki.test.raw, 512 tokens x 8 chunks, against base logits stored at the release pin | small numeric drift that greedy answers do not show |
 | needle | `tests/hrx_long_prompt.py`: the 320-record vault-code needle (7.1K tokens on Qwen3, 7.4K on ZAYA1) on Qwen3-0.6B and ZAYA1-8B | #319, #369 |

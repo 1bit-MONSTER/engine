@@ -817,9 +817,8 @@ SIGKILLed `serve`, and that a backend that exits on its own ends `serve` at once
 
 A follow-up turn in the same conversation is not bit-identical to a cold run of that conversation. The
 follow-up continues from the KV cache and prefills only its new user message (28 tokens in the test below),
-where a cold run prefills the conversation in 512-token ubatches - and HRX picks a different kernel family for a
-different token count (generic post-ops for 16 < T < 128, the WMMA prefill tiles for T >= 128), with a different
-activation quantisation, split-K and combine tree, so the last bits differ and a near-tie flips. Measured on
+where a cold run prefills the conversation in 512-token ubatches - and HRX serves a different token count with a
+different plan, so the last bits of the logits differ and a near-tie can flip. Measured on
 2026-10-22, 10 greedy two-turn chats per model, follow-up against a cold run of the same conversation.
 
 `--precise` (or `ONEBIT_PRECISE=1`) makes every request re-prefill its whole conversation, which is exactly the

@@ -1,0 +1,15 @@
+Package: 1bit-ryzenadj
+Version: @VERSION@
+Architecture: amd64
+Maintainer: 1bit <packages@1bit.gg>
+Section: admin
+Priority: optional
+Depends: libc6 (>= 2.39), libpci3, libudev1, zlib1g
+Description: SMU power limits for this board (RyzenAdj v0.19.0)
+ The tool 1bit-board writes the power profile with: sustained, slow
+ and fast PPT limits and the die temperature limit through the SMU.
+ The EC power mode on its own gives the firmware's profile; the 90 W
+ sustained cap this appliance ships needs these limits written.
+ Built from the pinned source shipped in /usr/share/doc/1bit-ryzenadj
+ (v0.19.0, LGPL-3.0, Copyright Jiaxun Yang and the RyzenAdj
+ contributors), which is what LGPL-3.0 asks a binary to travel with.

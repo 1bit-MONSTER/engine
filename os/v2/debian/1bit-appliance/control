@@ -1,0 +1,14 @@
+Package: 1bit-appliance
+Version: @VERSION@
+Architecture: amd64
+Maintainer: 1bit <packages@1bit.gg>
+Section: metapackages
+Priority: optional
+Depends: 1bit-engine (= @VERSION@), 1bit-lemonade (= @VERSION@), 1bit-archive-keyring, systemd, openssh-server, systemd-resolved, initramfs-tools
+Replaces: base-files
+Description: 1bit OS, Lemonade Server appliance - meta and configuration package
+ Turns a minimal Ubuntu into the appliance: the units that start
+ Lemonade and the engine, the console banner, autologin, the network
+ and /data mount, the fans and power profile, the first-boot setup
+ and the signed apt repository this box updates from. Lemonade
+ Server by AMD, running on the 1bit engine.

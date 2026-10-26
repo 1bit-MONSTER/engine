@@ -251,6 +251,24 @@ HSA runtime and its libraries complete, the PM4-emulation probe answered), Lemon
 running `onebit` models on HRX0 and the NPU, HRX kernels compiling into `/data/cache/hrx-jit` and
 being reused after a reboot, Lemonade's Vulkan backends on RADV, `llamacpp-hrx`, Lemonade's ROCm downloads for gfx1151, the Wi-Fi chip, and the speed of all of it.
 
+## The v2 base (Ubuntu + apt)
+
+Everything above describes `os/mini`: one BusyBox image that runs from RAM, updated by reflashing the
+stick. `os/v2/` is the same appliance on a minimal Ubuntu 26.04 root filesystem with systemd, where what
+we ship are `.deb` packages from the signed repository on `1bit.gg/apt` and the update path is
+`apt update && apt upgrade` - with the previous kernel and the cached debs as the rollback. The kernel,
+the EC board driver and ryzenadj are packages too; the live medium is the root filesystem as a squashfs
+with a tmpfs overlay, and `1bit-install` writes three partitions (ESP, `1BIT-ROOT`, `1BIT-DATA`) instead
+of unpacking everything into a RAM image.
+
+```sh
+os/v2/proto.sh <work-dir> <engine-stage> <lemonade-prefix>   # everything, in one command
+os/v2/README.md                                             # what each piece is, and what is proven
+```
+
+`os/mini` keeps shipping until v2 passes the same checks on hardware. Both images keep the same `/data`
+layout and the same installer behaviour, so an owner's runbook does not change.
+
 ## Next
 
 - A Loom kernel cache built ahead of time, so the first boot needs no compile.

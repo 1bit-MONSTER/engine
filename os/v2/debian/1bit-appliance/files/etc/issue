@@ -1,0 +1,8 @@
+1bit OS, Lemonade Server appliance
+Lemonade Server by AMD, running on the 1bit engine
+
+  Lemonade ................ http://<this-box>:13305   (API key: /etc/1bit/lemonade.env)
+  1bit-release-check ...... PASS/FAIL for this boot, one line per check
+  1bit-selftest ........... prove the engine answers
+  1bit-board status ....... fans and power, on the boards we know
+  apt update && apt upgrade  the box updates from 1bit.gg/apt

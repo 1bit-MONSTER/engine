@@ -1,0 +1,14 @@
+1bit OS, Lemonade Server appliance
+Lemonade Server by AMD, running on the 1bit engine
+
+The console is root, on this machine. What is here, and what to run:
+
+  1bit-release-check              PASS/FAIL for this boot (mode, kernel, Secure Boot, GPU, NPU,
+                                  Lemonade with its key, the catalog entries, a chat, the licences)
+  1bit-selftest                   the engine answers, and where it ran
+  lemonade list                   the models; models go in /data/models
+  journalctl -u 1bit-lemonade -f  Lemonade's log
+  apt update && apt upgrade       update from 1bit.gg/apt (signed repository)
+
+The models, Lemonade's backends and configuration, and the SSH keys live on the 1BIT-DATA
+partition, mounted at /data: they survive an update, a reinstall of the system does not touch them.

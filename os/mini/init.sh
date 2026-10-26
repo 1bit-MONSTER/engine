@@ -336,7 +336,8 @@ if [ -n "$TJ" ]; then
     say "temps: Tctl $(( $(cat "$TJ/temp1_input" 2>/dev/null || echo 0) / 1000 ))C  EC $(cat /sys/class/ec_su_axb35/temp1/temp 2>/dev/null || echo n/a)C"
 fi
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
-echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"
+ipaddr=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+echo; echo "Web app (chat in a browser): http://${ipaddr:-<this address>}:$lport/     API (OpenAI-compatible): http://${ipaddr:-<this address>}:$lport/api/v1"
 echo "Prove the engine answers from this boot:  1bit-selftest   (console or SSH; logs to /data/selftest.log)"
 echo "The engine alone, for debugging:  1bit serve -m /data/models/<file.gguf>   (auto: HRX0, on 127.0.0.1:8000)"; echo
 

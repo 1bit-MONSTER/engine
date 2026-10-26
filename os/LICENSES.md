@@ -110,6 +110,7 @@ the machine this list was made on.
 | Vulkan loader | libvulkan1 | 1.4.341.0-1 | Apache-2.0 |
 | BusyBox | busybox-static | 1.37.0-7ubuntu1 | GPL-2.0-only |
 | Dropbear SSH, libtomcrypt, libtommath | dropbear-bin, libtomcrypt1, libtommath1 | the Ubuntu archive's | MIT; public domain / WTFPL; Unlicense |
+| QR code generator, for the console menu's "Open on your phone" (`/bin/qrencode`) | qrencode, libqrencode4 | 4.1.1-2build1 | LGPL-2.1-or-later (LICENSE and SOURCE in `os/licenses/qrencode/`; the Debian packaging is public domain) |
 | GNU C library | libc6 | 2.43-2ubuntu2.4 | LGPL-2.1-or-later |
 | GCC runtime (libstdc++, libgcc_s, libgomp) | libstdc++6, libgcc-s1, libgomp1 | 16-20260322-1ubuntu1 | GPL-3.0-or-later WITH GCC-exception-3.1 |
 | libquadmath | libquadmath0 | 16-20260322-1ubuntu1 | LGPL-2.1-or-later |

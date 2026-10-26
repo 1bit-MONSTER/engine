@@ -27,8 +27,9 @@
 #   1bit-menu           the menu (init.sh, tty1)
 #   1bit-menu --shell   no menu, straight to the plain shell
 #
-# Keys: up/down or j/k move, 1-9 jump, Enter chooses, q quits to the shell. Holding q while the menu
-# starts skips it too, which is the escape hatch if the screen ever misbehaves. The terminal is
+# Keys: up/down or j/k move, 1-9 jump, Enter chooses, q quits to the shell, u shows the web app URL as
+# a QR code (the console cannot be clicked; a phone can scan it). Holding q while the menu starts
+# skips the menu too, which is the escape hatch if the screen ever misbehaves. The terminal is
 # restored on every way out (EXIT, INT, TERM, HUP), and init.sh runs `stty sane` before restarting a
 # menu that died, so a crash can never leave the console in raw mode.
 #
@@ -117,10 +118,24 @@ readkey_t() {
     [ "$KEY" = "$ESC" ] && KEY=esc
 }
 
+# a clickable link where the terminal can make one, the bare text where it cannot. OSC 8 is what
+# modern terminals (ssh, a serial console in a terminal app) turn into a link; the VT has no idea what
+# it is, and TERM=linux is exactly the VT, so there it is never sent - the owner would otherwise see
+# the escape as stray characters around the URL.
+link() {
+    if [ -n "${TERM:-}" ] && [ "$TERM" != linux ]; then
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
 # ---- facts about this boot ----------------------------------------------------------------------
 MODE=LIVE
 IP=none
 PORT=13305
+URL=http://localhost:13305/
+APURL=http://localhost:13305/api/v1
 installed() { [ -e /data/.installed ] || [ -e /etc/1bit/installed ]; }
 
 facts() {
@@ -129,6 +144,8 @@ facts() {
     if installed; then MODE=INSTALLED; else MODE=LIVE; fi
     PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
     PORT=${PORT:-13305}
+    URL="http://$IP:$PORT/"
+    APURL="http://$IP:$PORT/api/v1"
 }
 
 # the top of every screen: the banner facts. Edition, mode, address, where the key is.
@@ -144,10 +161,17 @@ header() {
         printf 'runs from RAM, nothing installed, disks untouched\n'
     fi
     # the two things a person wants first: where to click, and where to point a client. The web app is
-    # Lemonade's own (served at /, chat right away); the API is OpenAI-compatible under /api/v1.
+    # Lemonade's own (served at /, chat right away); the API is OpenAI-compatible under /api/v1. Both
+    # are OSC 8 links where the terminal can make them clickable; on the VT (TERM=linux) they are the
+    # bare text, because the console would show the escape instead.
     if wget -q -O /dev/null -T 2 "http://127.0.0.1:$PORT/" 2>/dev/null; then web=up; else web=starting; fi
-    printf '  Web app      %shttp://%s:%s/%s   open it in a browser and chat (%s)\033[K\n' "$BOLD" "$IP" "$PORT" "$RESET" "$web"
-    printf '  API          http://%s:%s/api/v1   OpenAI-compatible; key: grep LEMONADE_API_KEY /data/lemonade/lemond.conf\033[K\n' "$IP" "$PORT"
+    printf '  Web app      %s' "$BOLD"
+    link "$URL"
+    printf '%s   open it in a browser and chat (%s)\033[K\n' "$RESET" "$web"
+    printf '  On a phone   press %su%s: that URL as a QR code (the console cannot be clicked)\033[K\n' "$BOLD" "$RESET"
+    printf '  API          '
+    link "$APURL"
+    printf '   OpenAI-compatible; key: grep LEMONADE_API_KEY /data/lemonade/lemond.conf\033[K\n'
     printf '%s  %s%s\033[K\n' "$GREY" "$RULE" "$RESET"
 }
 
@@ -212,6 +236,7 @@ pick() {
             down|j) p_i=$((p_i + 1)); [ "$p_i" -gt "$p_n" ] && p_i=1 ;;
             [1-9]) if [ "$KEY" -le "$p_n" ] 2>/dev/null; then p_i=$KEY; fi ;;
             q|Q) SEL=0; return 0 ;;
+            u|U) SEL=-1; return 0 ;;
             '') SEL=$p_i; SEL_ITEM=; p_k=1
                 for p_it in "$@"; do
                     [ "$p_k" = "$p_i" ] && SEL_ITEM=$p_it
@@ -272,7 +297,7 @@ EOF_IDS
         return
     fi
     pick "Chat - choose a model" "$@"
-    [ "$SEL" = 0 ] && return
+    [ "$SEL" -le 0 ] && return
     c_id=${SEL_ITEM%%|*}
     cooked
     cls
@@ -504,6 +529,53 @@ act_power() {
     esac
 }
 
+# ---- the QR code --------------------------------------------------------------------------------
+# The console cannot be clicked (JetKVM video, a monitor), so the web app URL is drawn as a QR code a
+# phone opens. ANSIUTF8 is half blocks: two QR rows per text row in an 8x16 console font, so this URL's
+# 29x29 modules with their margin come to 17 text rows and fit an 80x25 screen; `a` switches to ASCII
+# blocks for a font without the block glyphs (2 characters per module, so it needs a taller screen).
+act_qr() {
+    facts                       # the URL, even if this screen is ever reached without a frame first
+    q_mode=utf8
+    while :; do
+        cls
+        printf '  %sOpen on your phone%s: point the camera at this code\033[K\n\n' "$BOLD" "$RESET"
+        if command -v qrencode >/dev/null 2>&1; then
+            if [ "$q_mode" = ascii ]; then
+                qrencode -t ASCII -m 2 "$URL" 2>/dev/null | while IFS= read -r q_line; do
+                    printf '%s\033[K\n' "$q_line"
+                done
+            else
+                # ANSIUTF8 draws the light modules as white blocks and the dark ones as the black
+                # background, which is a printed QR's polarity (paper light, ink dark) - the strict
+                # scanner in the proof reads it, so nothing is inverted here on purpose.
+                qrencode -t ANSIUTF8 -m 2 "$URL" 2>/dev/null | while IFS= read -r q_line; do
+                    printf '%s\033[K\n' "$q_line"
+                done
+            fi
+            printf '%s' "$RESET"
+        else
+            printf '  %sno qrencode in this image, so no code to scan here%s\033[K\n' "$GREY" "$RESET"
+        fi
+        printf '\n  '
+        link "$URL"
+        printf '%s\033[K\n' "$RESET"
+        printf '\n%s  any key goes back   a = %s\033[K%s\n' "$GREY" \
+            "$( [ "$q_mode" = utf8 ] && echo 'ASCII blocks instead' || echo 'half blocks instead' )" "$RESET"
+        # the ASCII form is 2 characters per module: 29 rows for this URL, where the half-block form
+        # needs 17. A 25-row text console cannot show all of it, so say that instead of letting it scroll.
+        if [ "$q_mode" = ascii ] && [ "$ROWS" -lt 32 ]; then
+            printf '%s  (ASCII needs a taller screen: %s rows, this console has %s)%s\033[K\n' \
+                "$GREY" "$(qrencode -t ASCII -m 2 "$URL" 2>/dev/null | wc -l)" "$ROWS" "$RESET"
+        fi
+        readkey
+        case "$KEY" in
+            a|A) [ "$q_mode" = utf8 ] && q_mode=ascii || q_mode=utf8 ;;
+            *) return ;;
+        esac
+    done
+}
+
 # ---- the menu -----------------------------------------------------------------------------------
 menu_main() {
     while :; do
@@ -519,8 +591,10 @@ menu_main() {
             "Logs|Lemonade, boot and fans" \
             "Install|$i_hint" \
             "Shell|a plain root shell (exit comes back here)" \
-            "Power|reboot, or switch the machine off"
+            "Power|reboot, or switch the machine off" \
+            "Phone|the web app URL as a QR code, to open on a phone"
         case "$SEL" in
+            -1|8) act_qr ;;
             0) return 0 ;;
             1) act_chat ;;
             2) act_models ;;

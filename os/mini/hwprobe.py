@@ -61,6 +61,12 @@ for bl in (f"/lib/modules/{kver}/modules.builtin", f"{img_root}/lib/modules/{kve
             builtin.add(os.path.basename(line.strip()).split(".ko")[0].replace("-","_"))
     except OSError:
         pass
+# a driver the host has no .ko for at all is built in as well (sysfs still names it as a module);
+# only a .ko that exists on the host and not in the image is a real gap
+host_ko = set()
+for ko in glob.glob(f"/lib/modules/{kver}/**/*.ko*", recursive=True):
+    host_ko.add(os.path.basename(ko).split(".ko")[0].replace("-","_"))
+builtin |= {m for m in needed if m not in host_ko}
 missing = {m:v for m,v in needed.items() if m not in have and m not in builtin}
 print(f"image modules found in build root: {len(have)}; distinct driver modules bound on this box: {len(needed)}; built into the kernel: {len([m for m in needed if m in builtin])}; MISSING from image: {len(missing)}")
 print("\n== MISSING (module: devices)")

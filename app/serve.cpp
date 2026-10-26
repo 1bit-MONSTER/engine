@@ -230,14 +230,24 @@ const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
-// else one on PATH.
+// else one on PATH. Resolution, first hit wins (engine #581, measured on the 1bit OS stick where
+// Lemonade spawns `1bit serve` itself and the build tree does not exist, so the compiled-in
+// relative path failed with "Failed to execute: hrx/llama/bin/llama-server"):
+//   ONEBIT_LLAMA_SERVER, ONEBIT_HRX_LLAMA_SERVER (scripts/lemonade-hrx's name for the same thing),
+//   the build's own server beside the executable when it exists, /opt/1bit-llama/llama-server
+//   (where the OS image keeps it), then plain "llama-server" on PATH.
 std::string default_llama_server() {
-    if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
+    namespace fs = std::filesystem;
+    for (const char* name : {"ONEBIT_LLAMA_SERVER", "ONEBIT_HRX_LLAMA_SERVER"}) {
+        if (const char* e = std::getenv(name); e && *e) return e;
+    }
+    std::error_code ec;
 #ifdef ONEBIT_HRX_SERVER
-    return built_path(ONEBIT_HRX_SERVER);
-#else
-    return "llama-server";
+    const std::string built = built_path(ONEBIT_HRX_SERVER);
+    if (fs::exists(built, ec)) return built;
 #endif
+    if (fs::exists("/opt/1bit-llama/llama-server", ec)) return "/opt/1bit-llama/llama-server";
+    return "llama-server";
 }
 
 // The devices this engine no longer has (RFC #213 stage 3, 2026-10-01: HRX + NPU only, zero

@@ -143,8 +143,11 @@ header() {
     else
         printf 'runs from RAM, nothing installed, disks untouched\n'
     fi
-    printf '  Address      http://%s:%s\033[K\n' "$IP" "$PORT"
-    printf '  API key      grep LEMONADE_API_KEY /data/lemonade/lemond.conf\033[K\n'
+    # the two things a person wants first: where to click, and where to point a client. The web app is
+    # Lemonade's own (served at /, chat right away); the API is OpenAI-compatible under /api/v1.
+    if wget -q -O /dev/null -T 2 "http://127.0.0.1:$PORT/" 2>/dev/null; then web=up; else web=starting; fi
+    printf '  Web app      %shttp://%s:%s/%s   open it in a browser and chat (%s)\033[K\n' "$BOLD" "$IP" "$PORT" "$RESET" "$web"
+    printf '  API          http://%s:%s/api/v1   OpenAI-compatible; key: grep LEMONADE_API_KEY /data/lemonade/lemond.conf\033[K\n' "$IP" "$PORT"
     printf '%s  %s%s\033[K\n' "$GREY" "$RULE" "$RESET"
 }
 

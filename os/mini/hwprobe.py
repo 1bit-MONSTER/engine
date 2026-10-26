@@ -53,8 +53,22 @@ for bus,dev,drv,mod,desc in rows:
     if mod == "(built-in)": continue
     m = mod.replace("-","_")
     needed.setdefault(m, []).append((bus,dev,drv,desc))
-missing = {m:v for m,v in needed.items() if m not in have}
-print(f"image modules found in build root: {len(have)}; distinct driver modules bound on this box: {len(needed)}; MISSING from image: {len(missing)}")
+# modules compiled into this kernel are never "missing": modules.builtin lists them
+builtin = set()
+for bl in (f"/lib/modules/{kver}/modules.builtin", f"{img_root}/lib/modules/{kver}/modules.builtin"):
+    try:
+        for line in open(bl):
+            builtin.add(os.path.basename(line.strip()).split(".ko")[0].replace("-","_"))
+    except OSError:
+        pass
+# a driver the host has no .ko for at all is built in as well (sysfs still names it as a module);
+# only a .ko that exists on the host and not in the image is a real gap
+host_ko = set()
+for ko in glob.glob(f"/lib/modules/{kver}/**/*.ko*", recursive=True):
+    host_ko.add(os.path.basename(ko).split(".ko")[0].replace("-","_"))
+builtin |= {m for m in needed if m not in host_ko}
+missing = {m:v for m,v in needed.items() if m not in have and m not in builtin}
+print(f"image modules found in build root: {len(have)}; distinct driver modules bound on this box: {len(needed)}; built into the kernel: {len([m for m in needed if m in builtin])}; MISSING from image: {len(missing)}")
 print("\n== MISSING (module: devices)")
 for m,v in missing.items():
     print(f"  {m:24s} " + "; ".join(f"{b}:{d} [{drv}] {desc}" for b,d,drv,desc in v[:3])[:150])
@@ -64,3 +78,4 @@ for m,v in needed.items():
 print("\n== loaded-but-unbound modules on this box (helpers: hwmon, crypto, input handlers)")
 extra = sorted(x for x in loaded if x not in needed and x not in have and not x.startswith(("nf_","nft","x_tables","ip_tables","iptable","bridge","br_","veth","overlay","xt_","ip6","zram","binfmt","snd","soundcore","nls_","cuse","fuse","vhost","tun","tap","kvm","ccp","aes","crypto","cryptd","dm_","raid","md_","loop","squashfs","qrtr","cfg80211","mac80211","rfkill","bluetooth","bt","ecdh","libarc4","mt76","mt792","drm","ttm","video","wmi","i2c_","intel","sunrpc","nfs","lockd","grace","autofs","parport","ppdev","lp","msr","cmac","ecc","input_leds","joydev","mac_hid","sch_","ipmi","efi_pstore","pstore","x86_pkg","edac","ucsi","typec","roles","nvme_fabrics","nvme_tcp","xor","asix","ax88","cdc_","r8152","usbnet","mii","apple","hid_","uinput","uhid","udp_tunnel","ip6_udp","geneve","vxlan","macvlan","ipvlan","libcrc","crc"))) 
 print("  " + " ".join(extra)[:600])
+raise SystemExit(1 if missing else 0)

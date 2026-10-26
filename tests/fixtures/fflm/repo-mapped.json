@@ -1,0 +1,43 @@
+{
+ "id": "FastFlowLM/D3-Mini-NPU2",
+ "modelId": "FastFlowLM/D3-Mini-NPU2",
+ "lastModified": "2026-10-25T08:56:01.000Z",
+ "createdAt": "2026-10-24T16:29:09.000Z",
+ "tags": [
+  "qwen3_5_text",
+  "decision-model",
+  "system-one",
+  "fastflowlm",
+  "amd-npu",
+  "q4nx",
+  "zero-shot-classification",
+  "base_model:vllm-sr/d3-mini",
+  "base_model:finetune:vllm-sr/d3-mini",
+  "license:apache-2.0",
+  "region:us"
+ ],
+ "pipeline_tag": "zero-shot-classification",
+ "config": {
+  "model_type": "qwen3_5_text"
+ },
+ "siblings": [
+  {
+   "rfilename": "model.q4nx",
+   "size": 2750560152,
+   "lfs": {
+    "size": 2750560152
+   }
+  },
+  {
+   "rfilename": "vision_weight.q4nx",
+   "size": 667061544,
+   "lfs": {
+    "size": 667061544
+   }
+  },
+  {
+   "rfilename": "config.json",
+   "size": 3000
+  }
+ ]
+}

@@ -95,7 +95,11 @@ if [ -d /data/1bit-llama ]; then
     # Lemonade's HRX recipe starts the engine through scripts/lemonade-hrx, whose default llama-server is
     # "beside the script" (hrx/llama/bin/llama-server) - a path that does not exist in this layout, so on
     # candidate 5 lemond logged "Failed to execute: hrx/llama/bin/llama-server". Name the shipped one.
+    # both names: scripts/lemonade-hrx reads ONEBIT_HRX_LLAMA_SERVER, `1bit serve` itself reads
+    # ONEBIT_LLAMA_SERVER (candidate 8 on the box: lemond spawns `1bit serve` directly, and its env
+    # carried only the first name, so the exec still failed)
     export ONEBIT_HRX_LLAMA_SERVER=/opt/1bit-llama/llama-server
+    export ONEBIT_LLAMA_SERVER=/opt/1bit-llama/llama-server
     say "[engine] llama-server from /data/1bit-llama, HSA runtime ${hsa:-not found}"
 else
     say "[engine] no /data/1bit-llama: '1bit serve' has no HRX llama-server on this boot"
@@ -237,6 +241,7 @@ fi
 { echo "export PATH=$PATH HOME=/root GGML_HRX_JIT_CACHE_DIR=$GGML_HRX_JIT_CACHE_DIR"
   [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && echo "export IREE_HAL_AMDGPU_LIBHSA_PATH=$IREE_HAL_AMDGPU_LIBHSA_PATH"
   [ -n "${ONEBIT_HRX_LLAMA_SERVER:-}" ] && echo "export ONEBIT_HRX_LLAMA_SERVER=$ONEBIT_HRX_LLAMA_SERVER"
+  [ -n "${ONEBIT_LLAMA_SERVER:-}" ] && echo "export ONEBIT_LLAMA_SERVER=$ONEBIT_LLAMA_SERVER"
   echo "export PS1='1bit-os:\\w # '"
 } > /etc/profile
 for b in lemonade lemond; do [ -x "/opt/lemonade/bin/$b" ] && ln -sf "/opt/lemonade/bin/$b" "/usr/bin/$b"; done

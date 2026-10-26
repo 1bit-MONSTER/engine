@@ -304,6 +304,43 @@ if [ -n "$VMODEL" ]; then
 else
     skip chat "Lemonade lists no model this machine can run"
 fi
+# ── the HRX runtime itself, before any chat row that depends on it ─────────────────────────────
+# A chat-hrx failure is useless on its own: it says an entry did not answer, not whether the runtime
+# below it registered a device at all. Candidate 5 shipped an HRX runtime from before the pin that
+# carries HRX_ALLOW_NO_SVM, so it registered no HRX0 while every other row stayed green - the engine
+# sets HSA_USE_SVM=0 on a CWSR-on kernel and needs that gate to still see the device. This row asks
+# llama-server directly, which is the smallest question with a yes/no answer.
+if [ -e /dev/kfd ]; then
+    LSRV=${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
+    if [ ! -x "$LSRV" ]; then
+        fail hrx-device "no llama-server at $LSRV"
+    else
+        # the same libhsa the engine resolves, so this row tests the runtime the image actually uses
+        HRXLIB=${HSA_RUNTIME_LIBRARY_PATH:-}
+        if [ -z "$HRXLIB" ] && [ -r /etc/1bit/libhsa ]; then
+            HRXLIB=$(dirname "$(cat /etc/1bit/libhsa 2>/dev/null)")
+        fi
+        [ -n "$HRXLIB" ] && export HSA_RUNTIME_LIBRARY_PATH="$HRXLIB"
+        # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
+        # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
+        # on stderr and that text is the diagnostic.
+        LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
+        # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
+        # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
+        # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
+        HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
+        if [ -n "$HRXDEV" ]; then
+            pass hrx-device "$HRXDEV"
+        elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
+            fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+        else
+            fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+        fi
+    fi
+else
+    skip hrx-device "no /dev/kfd: this machine has no AMD GPU, so no HRX device can register"
+fi
+
 HRX=$(pick '[^"]*-1bit')
 if [ -e /dev/kfd ] && [ -n "$HRX" ]; then
     chat "$HRX"

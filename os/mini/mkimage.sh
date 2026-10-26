@@ -75,9 +75,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x
 # Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A
 # cleaned ~/.cache used to stop the weekly release at "SSH (Dropbear)" (2026-10-01 rehearsal).
-tool_debs="dropbear-bin libtomcrypt1 libtommath1 mtools systemd-boot-efi"
+tool_debs="dropbear-bin libtomcrypt1 libtommath1 mtools systemd-boot-efi qrencode libqrencode4"
 if [ ! -x "$tools/usr/sbin/dropbear" ] || [ ! -x "$tools/usr/bin/mtools" ] ||
-   [ ! -e "$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub" ]; then
+   [ ! -e "$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub" ] ||
+   [ ! -x "$tools/usr/bin/qrencode" ]; then
     echo "== unpacking $tool_debs into $tools"
     mkdir -p "$tools"
     (cd "$(dirname "$tools")" && apt-get download $tool_debs)
@@ -322,6 +323,19 @@ LD_LIBRARY_PATH=$lib ldd "$tools/usr/sbin/dropbear" | grep -o '/[^ ]*' | while r
     d=${l#"$tools"}; [ -e "$root$d" ] || { mkdir -p "$root$(dirname "$d")"; cp -L "$l" "$root$d"; }
 done
 
+# qrencode (os/mini/1bit-menu, "Open on your phone"): the console cannot be clicked, so the menu draws
+# the web app URL as a QR code. Taken from the same unpacked .debs as Dropbear (LGPL-2.1, source and
+# licence in os/licenses/qrencode), and its NEEDED entries are resolved the same way: ldd under the
+# unpacked tree, then the file at the same path in the image.
+echo "== QR code (qrencode, LGPL-2.1, from the Ubuntu packages unpacked in $tools)"
+qren=$tools/usr/bin/qrencode
+[ -x "$qren" ] || { echo "   $qren is missing from the unpacked tools"; exit 1; }
+cp "$qren" "$root/bin/qrencode"; chmod 0755 "$root/bin/qrencode"
+LD_LIBRARY_PATH=$tools/usr/lib/x86_64-linux-gnu ldd "$qren" | grep -o '/[^ ]*' | while read -r l; do
+    d=${l#"$tools"}; [ -e "$root$d" ] || { mkdir -p "$root$(dirname "$d")"; cp -L "$l" "$root$d"; }
+done
+echo "   /bin/qrencode $(stat -c %s "$root/bin/qrencode") bytes, $(LD_LIBRARY_PATH=$tools/usr/lib/x86_64-linux-gnu ldd "$qren" | grep -c '=>') libs resolved"
+
 echo "== init"
 if [ -n "${BOOT_STUB:-}" ]; then
     cp "$here/stub-init.sh" "$root/init"; chmod +x "$root/init"
@@ -469,6 +483,8 @@ mkdir -p "$doc/ec_su_axb35" "$doc/ryzenadj"
 cp -a "$lic/ec_su_axb35/LICENSE" "$lic/ec_su_axb35/SOURCE" "$doc/ec_su_axb35/" 2>/dev/null || true
 if [ -d "$lic/ec_su_axb35/src" ]; then cp -a "$lic/ec_su_axb35/src" "$doc/ec_su_axb35/src"; fi
 cp -a "$lic/ryzenadj/LICENSE" "$lic/ryzenadj/SOURCE" "$doc/ryzenadj/" 2>/dev/null || true
+mkdir -p "$doc/qrencode"
+cp -a "$lic/qrencode/LICENSE" "$lic/qrencode/SOURCE" "$doc/qrencode/" 2>/dev/null || true
 if [ -d "$lic/ryzenadj/src" ]; then cp -a "$lic/ryzenadj/src" "$doc/ryzenadj/src"; fi
 cp -rL /usr/share/common-licenses "$root/usr/share/"
 # the Ubuntu package behind each file in the image, found at its path or its merged-/usr alias
@@ -488,7 +504,7 @@ while read -r p; do
 done < "$out/image-debs.txt"
 { xargs -r dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' < "$out/image-debs.txt" 2>/dev/null || true; } | awk '$3 == "amd64" || $3 == "all" {print $1, $2}' > "$doc/packages.txt"
 # Dropbear and its libraries come from .debs unpacked into $tools, not installed
-for p in dropbear-bin libtomcrypt1 libtommath1; do
+for p in dropbear-bin libtomcrypt1 libtommath1 qrencode libqrencode4; do
     [ -e "$tools/usr/share/doc/$p/copyright" ] || continue
     mkdir -p "$root/usr/share/doc/$p"; cp -L "$tools/usr/share/doc/$p/copyright" "$root/usr/share/doc/$p/"
 done

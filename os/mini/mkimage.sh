@@ -370,6 +370,10 @@ except Exception as e:
 # The catalogue has been both a list of model dicts and a dict of {section: [model dicts]}; walk
 # whichever it is so a layout change does not silently produce an empty manifest.
 def models(node):
+    # The vendored catalogue is a dict KEYED BY MODEL ID ({"Qwen2.5-0.5B-Instruct-CPU": {...}}); earlier
+    # shapes were a list of dicts with an "id" field. Handle both, and take the key as the id when the
+    # record has none - the first version only looked for an "id" field, so it matched nothing in the
+    # keyed catalogue and wrote a manifest with zero entries, which made the models row pass vacuously.
     if isinstance(node, list):
         for x in node:
             yield from models(x)
@@ -377,8 +381,14 @@ def models(node):
         if "id" in node and isinstance(node.get("id"), str):
             yield node
         else:
-            for v in node.values():
-                yield from models(v)
+            for k, v in node.items():
+                if isinstance(v, dict) and ("recipe" in v or "onebit_backend" in v):
+                    rec = dict(v)
+                    rec.setdefault("id", k)
+                    if isinstance(rec.get("id"), str):
+                        yield rec
+                else:
+                    yield from models(v)
 rows, seen = [], set()
 for m in models(data):
     recipe = m.get("recipe")

@@ -731,6 +731,25 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     cp -a "$srv" "$out/data.dir/1bit-llama/llama-server"
     # -a, not -L: the .so -> .so.0 -> .so.0.18.0 chain is how the loader finds the versioned file
     for f in "$libs"/lib*.so*; do if [ -e "$f" ]; then cp -a "$f" "$out/data.dir/1bit-llama/"; fi; done
+    # The HRX runtime of THIS build - libhrx and libloomc from the pinned hrx-system that ggml-hrx built -
+    # before anything is resolved from the Lemonade package: those two are not in $libs (ggml-hrx builds
+    # them deeper in the tree), so the NEEDED loop below used to take Lemonade's bundle copies, an HRX
+    # release without the HRX_ALLOW_NO_SVM gate. On the board (candidates 6-10, 26 Oct) the engine then
+    # set HSA_USE_SVM=0 for the CWSR-on kernel and that runtime refused the GPU ("only systems with SVM
+    # are supported"), so no onebit HRX model could ever load, while --list-devices without that env passed.
+    local hrx_lib
+    for hrx_lib in libhrx.so libloomc.so; do
+        f=$(find "$build" -path '*ggml-hrx-deps-build*' -name "$hrx_lib.*" -type f 2>/dev/null | head -n 1)
+        if [ -n "$f" ]; then
+            cp -L "$f" "$out/data.dir/1bit-llama/${hrx_lib}.0"
+            echo "   + ${hrx_lib}.0 (this build's hrx-system: ${f#"$build/"})"
+        else
+            echo "   this build has no $hrx_lib under ggml-hrx-deps-build: refusing to ship Lemonade's copy in its place"; exit 1
+        fi
+    done
+    if ! strings "$out/data.dir/1bit-llama/libhrx.so.0" 2>/dev/null | grep -q HRX_ALLOW_NO_SVM; then
+        echo "   libhrx.so.0 has no HRX_ALLOW_NO_SVM gate: the engine's CWSR placement needs it (engine #315, pin #565)"; exit 1
+    fi
     # What the loader resolves from outside the image goes on the stick too - TheRock's libomp.so is the
     # one that caught this out - and libraries the image already carries at their own path are left to it.
     # The backends are dlopened by ggml at run time, so their own NEEDED entries count as much as the

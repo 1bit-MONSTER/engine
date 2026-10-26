@@ -112,37 +112,39 @@ fi
 n=0
 step() { n=$((n+1)); say "[$n] $*"; }
 
-# The screen gets a real interactive login on tty1, never a shell on /dev/console: /dev/console stops
-# being what is painted once fbcon takes the DRM framebuffer, and a non-interactive shell has no
-# prompt - so the machine sat there looking dead while it was serving. tty1 is the VT we are on.
+# The screen gets the menu on tty1, never a shell on /dev/console: /dev/console stops being what is
+# painted once fbcon takes the DRM framebuffer, and a non-interactive shell has no prompt - so the
+# machine sat there looking dead while it was serving. tty1 is the VT we are on.
+#
+# tty1 ONLY: ttyS0 (the serial line a QEMU gate drives) and ssh keep the plain shell that this file
+# and /etc/profile set up, so nothing a gate matches on changes. 1bit-menu draws the banner facts
+# itself and starts nothing: lemond is already up.
+#
+# This runs in the foreground, not as `prog &`: POSIX has an asynchronous list ignore SIGINT and
+# SIGQUIT, and a child inherits that, so a menu started with & could not be interrupted - and neither
+# could the lemonade chat or the shell it runs. init has nothing left to do once the appliance is up,
+# and the loops below never return. The menu restores the terminal on every way out (EXIT, INT, TERM,
+# HUP); `stty sane` here covers the one case it cannot: a menu killed hard enough to leave raw mode
+# behind. Any exit other than 0 (q means "give me the plain shell") starts the menu again, so a crash
+# never swallows the console; boot choice 3 asks for a root shell and gets no menu.
 screen_login() {
     [ -c /dev/tty1 ] || return 0
-    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    [ -n "$ip" ] || ip="<this address>"
     chvt 1 2>/dev/null || true
-    {
-      echo
-      if [ "$INSTALLED" = 1 ]; then
-        echo "  1bit OS, Lemonade Server appliance   v2026.43  -  INSTALLED on this machine. /data is on its disk; the engine and Lemonade start from here."
-        echo "  Lemonade Server by AMD, running on the 1bit engine"
-      else
-        echo "  1bit OS, Lemonade Server appliance   v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
-        echo "  Lemonade Server by AMD, running on the 1bit engine"
-      fi
-      echo "  ----------------------------------------------------------------------------------------"
-      echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
-      echo "   lemonade list                 the models;  lemonade chat Qwen3-0.6B-1bit"
-      echo "   cat /data/boot.log            what this boot did"
-      echo "   ssh root@<this address>       also works, with the key in /data/ssh/authorized_keys"
-      echo
-      echo "  Lemonade is on the network:  http://${ip}:13305   (Lemonade Mobile finds it via the UDP beacon)"
-      echo "  its API key:                 grep LEMONADE_API_KEY /data/lemonade/lemond.conf"
-      echo
-    } > /dev/tty1 2>/dev/null
+    menu=1
+    [ "${1:-}" = shell ] && menu=0
+    while [ "$menu" = 1 ] && [ -x /bin/1bit-menu ]; do
+        stty sane < /dev/tty1 2>/dev/null
+        setsid -c /bin/1bit-menu < /dev/tty1 > /dev/tty1 2>&1 && break
+        sleep 1
+    done
+    printf '\n  1bit OS shell. 1bit-menu returns to the menu; 1bit-selftest proves the engine.\n\n' > /dev/tty1 2>/dev/null
     # cttyhack is what a classic initramfs uses, but here it exits at once (it cannot claim a tty that
     # setsid has already detached from) - measured on the box. setsid -c makes tty1 the controlling
     # terminal instead, which is what gives a prompt AND job control; the loop puts it back if you exit.
-    ( while :; do setsid -c env PS1='1bit-os:\w # ' /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
+    # the plain shell keeps the prompt #582 gave the console (#582 is why the console is readable at
+    # all: kernel messages stopped, and the prompt says 1bit-os:<dir>); the menu's Shell entry sets the
+    # same PS1 for the shell it starts
+    while :; do setsid -c env PS1='1bit-os:\w # ' /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done
 }
 
 # Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
@@ -187,7 +189,7 @@ if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
 fi
 case "$MODE" in
     off)  say "powering off (choice 4)"; sync; poweroff -f ;;
-    shell) say "root shell - the appliance will not start (choice 3)"; screen_login; while :; do sleep 3600; done ;;
+    shell) say "root shell - the appliance will not start (choice 3)"; screen_login shell; while :; do sleep 3600; done ;;
     nogpu) say "verbose mode: GPU/NPU drivers are skipped (choice 2)" ;;
 esac
 
@@ -382,7 +384,10 @@ fi
 # ignore_loglevel so every boot line is on the console and the serial log; the first hardware boot
 # (26 Oct) then kept printing USB connect/disconnect lines over the shell and the owner could not
 # use the prompt at all. Both knobs are runtime-writable; emergencies (level 0) still reach the console.
+# They matter for the menu too: a boot line painted over the frame is a mess the menu cannot clean up
+# (it only redraws on a keypress or, on Status, once a second).
 echo N > /sys/module/printk/parameters/ignore_loglevel 2>/dev/null
 echo "1 4 1 7" > /proc/sys/kernel/printk 2>/dev/null
+# with a tty1 this never returns (screen_login loops); the while keeps PID 1 alive if there is none
 screen_login
 while :; do sleep 3600; done

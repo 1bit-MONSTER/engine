@@ -1,0 +1,67 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# 1bit OS appliance: turn the units on. A minimal Ubuntu boots with almost nothing enabled, and the
+# appliance is defined by what is enabled here.
+#
+# Two paths, because both happen: `deb-systemd-helper` (the Debian tool, honours each unit's [Install]
+# section and works inside a chroot, which is how the image is built), and `systemctl` on a live
+# system, so an already-running box picks the change up.
+set -e
+
+# ssh: enable the *socket* when it exists. ssh.socket binds 22 and starts ssh.service per connection;
+# enabling ssh.service as well makes it hold the port itself, and a connection then arrives at a socket
+# nobody is accepting - a hang at banner exchange, measured in the VM.
+set -- 1bit-lemonade.service 1bit-first-boot.service 1bit-board.service 1bit-boost.service \
+       data.mount systemd-networkd.service systemd-networkd.socket systemd-resolved.service
+# sshd on Ubuntu 26.04: ssh.socket is what listens on 22 and systemd hands each connection to
+# ssh.service (the socket unit carries RequiredBy=ssh.service). So the socket is enabled and the service
+# is not started by anything: enabling both makes a connection arrive at a service that is not accepting
+# it (a client hangs at banner exchange, measured on the os/mini image), and masking the socket while
+# enabling the service starts nothing at all - "Failed to start ssh.service: Unit ssh.socket is masked",
+# measured in the v2 VM. One path, the distro's own.
+set -- "$@" ssh.socket
+
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper enable "$@" >/dev/null 2>&1 || true
+fi
+# In an image build nothing runs systemd, and deb-systemd-helper leaves some units behind (measured:
+# systemd-networkd.service), which is how the appliance first came up with no network at all. The
+# links are therefore written explicitly too - the same thing systemctl enable would do.
+L=/etc/systemd/system
+mkdir -p "$L/multi-user.target.wants" "$L/sockets.target.wants" "$L/local-fs.target.wants"
+# ssh is in this list on purpose: in the image build deb-systemd-helper did not enable it (measured in
+# the VM: "ssh.service ... disabled", so the appliance came up with nothing listening on 22). It is the
+# *socket* that gets enabled, which is how Ubuntu 26.04 runs sshd.
+for u in 1bit-lemonade 1bit-first-boot 1bit-board 1bit-boost systemd-networkd systemd-resolved; do
+    [ -e "/usr/lib/systemd/system/$u.service" ] || continue
+    ln -sf "/usr/lib/systemd/system/$u.service" "$L/multi-user.target.wants/$u.service"
+done
+for u in systemd-networkd systemd-networkd-resolve ssh; do
+    [ -e "/usr/lib/systemd/system/$u.socket" ] || continue
+    ln -sf "/usr/lib/systemd/system/$u.socket" "$L/sockets.target.wants/$u.socket"
+done
+[ -e /usr/lib/systemd/system/data.mount ] &&
+    ln -sf /usr/lib/systemd/system/data.mount "$L/local-fs.target.wants/data.mount"
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    for u in "$@"; do systemctl enable "$u" >/dev/null 2>&1 || true; done
+    systemctl try-restart systemd-networkd.service >/dev/null 2>&1 || true
+    systemctl try-restart 1bit-lemonade.service >/dev/null 2>&1 || true
+fi
+
+# the data partition's directories, so a fresh stick works before Lemonade's first start
+command -v systemd-tmpfiles >/dev/null 2>&1 && systemd-tmpfiles --create /usr/lib/tmpfiles.d/1bit.conf 2>/dev/null || true
+exit 0

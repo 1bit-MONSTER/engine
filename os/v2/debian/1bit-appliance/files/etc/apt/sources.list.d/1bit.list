@@ -1,0 +1,4 @@
+# Our own signed repository: the engine, Lemonade, the kernel and modules, the board tools and the
+# appliance meta package. Trust comes from the keyring file alone (signed-by), never from apt-key or
+# [trusted=yes].
+deb [signed-by=/usr/share/keyrings/1bit-archive-keyring.gpg] https://1bit.gg/apt stable main

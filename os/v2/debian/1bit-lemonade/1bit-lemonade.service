@@ -1,0 +1,41 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Lemonade, our build: the appliance's server. Started by systemd, not by a custom init (os/v2).
+[Unit]
+Description=1bit OS: Lemonade Server (lemond)
+Documentation=https://1bit.gg
+After=network-online.target data.mount
+Wants=network-online.target
+RequiresMountsFor=/data
+
+[Service]
+Type=simple
+# lemond resolves its cache directory from HOME, and a systemd unit has none by default: without this
+# it exits at once with "HOME is not set; cannot resolve Lemonade cache directory" (measured in the VM)
+Environment=HOME=/data/lemonade
+# the API key must exist before lemond reads its environment: a network-facing server without one is
+# exactly what release-check's lemonade row fails on
+ExecStartPre=/usr/lib/1bit/ensure-env.sh
+# lemond takes its cache and config directories as positionals; /data is the 1BIT-DATA partition, so
+# models, backends and the key survive an update
+ExecStart=/opt/lemonade/bin/lemond --host 0.0.0.0 --port 13305 /data/lemonade/cache /data/lemonade/config
+EnvironmentFile=-/etc/1bit/lemonade.env
+EnvironmentFile=-/etc/1bit/libhsa.env
+Restart=always
+RestartSec=2
+LimitNOFILE=1048576
+
+[Install]
+WantedBy=multi-user.target

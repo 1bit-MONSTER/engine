@@ -1,0 +1,15 @@
+Package: 1bit-kernel-modules-@KVER@
+Version: @VERSION@
+Architecture: amd64
+Maintainer: 1bit <packages@1bit.gg>
+Section: kernel
+Priority: optional
+Depends: kmod
+Description: 1bit OS: kernel modules for @KVER@
+ Every module built for @KVER@ - amdgpu, amdxdna and the rest - plus
+ the out-of-tree board driver for this machine's embedded controller
+ (ec_su_axb35: fans, EC temperature, EC power mode), signed with the
+ enrolled MOK so Secure Boot loads it. The driver's source travels
+ with it under /usr/src/1bit-ec- (GPL-2.0). No DKMS: the kernel
+ version is fixed per release, so these are rebuilt with the kernel,
+ not on the box.

@@ -232,7 +232,9 @@ stage_bumps() {
         rc=$?; set -e
         if [ $rc -ne 0 ]; then
             # the step that failed, and the last lines of the log it wrote (the newest besides ours)
-            local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-" | head -1)
+            # `| head -1` would kill the pipeline under pipefail once there are two logs; take the
+            # first line of what ls printed instead
+            local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-"); last=${last%%$'\n'*}
             result=held why="failed at $(cat "$W/.step") on $(host_desc) ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
         elif [ "$DRY" = 1 ]; then
             result=passed why="dry run: not merged"
@@ -297,7 +299,8 @@ package_checks() {  # package_checks <linux tarball>
     n=$(find "$t" \( -name 'libxrt*' -o -name 'libopenvino*' -o -name 'libonnxruntime*' \) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL the tarball carries an external accelerator runtime"; bad=1; }
     [ $bad = 0 ] && echo "ok   runtime-deps: $(basename "$1") and $BUILD/1bit are self-contained"
-    f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f | head -1)
+    f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f)   # no `| head -1`: see mkimage
+    f=${f%%$'\n'*}
     n=0; [ -n "$f" ] && n=$(nm -D --defined-only "$f" | grep -c ggml_hrx_hip_addon_register || true)
     if [ "$n" != 0 ]; then
         echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
@@ -358,7 +361,8 @@ package_checks() {  # package_checks <linux tarball>
         [ "$m" = 62 ] || { echo "FAIL $f is an ELF for machine $m, not the host (x86-64)"; nk=$((nk + 1)); }
     done < <(find "$t" -type f -print0)
     [ "$nk" = 0 ] && echo "ok   every ELF in $(basename "$1") is a host (x86-64) program or library" || bad=1
-    f=$(find "$t" -maxdepth 2 -type f -name 1bit | head -1)
+    f=$(find "$t" -maxdepth 2 -type f -name 1bit)
+    f=${f%%$'\n'*}
     if [ -n "$f" ]; then
         local b1=0
         n=$(nm --defined-only "$f" 2>/dev/null | wc -l)
@@ -407,7 +411,8 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
     n=$(find "$t" -path '*/bin/resources/web-app/index.html' -type f | wc -l)
     if [ "$n" != 0 ]; then echo "ok   Lemonade's web app: bin/resources/web-app/index.html and $(find "$t" -path '*/bin/resources/web-app/*' -type f | wc -l) files in $(basename "$1")"
     else echo "FAIL no Lemonade web app (bin/resources/web-app/index.html) in $(basename "$1")"; rc=1; fi
-    n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null | head -1)
+    n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null)
+    n=${n%%$'\n'*}
     if [ "${n:-0}" != 0 ]; then echo "ok   lemond-onebit loads sealed NPU kernels only (ONEBIT_KCRYPT_REQUIRE_SEALED=1)"
     else echo "FAIL lemond-onebit does not export ONEBIT_KCRYPT_REQUIRE_SEALED=1"; rc=1; fi
     rm -rf "$t"

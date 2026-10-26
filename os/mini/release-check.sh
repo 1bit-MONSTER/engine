@@ -315,12 +315,15 @@ if [ -e /dev/kfd ]; then
     if [ ! -x "$LSRV" ]; then
         fail hrx-device "no llama-server at $LSRV"
     else
-        # the same libhsa the engine resolves, so this row tests the runtime the image actually uses
-        HRXLIB=${HSA_RUNTIME_LIBRARY_PATH:-}
-        if [ -z "$HRXLIB" ] && [ -r /etc/1bit/libhsa ]; then
-            HRXLIB=$(dirname "$(cat /etc/1bit/libhsa 2>/dev/null)")
+        # The runtime resolves libhsa through IREE_HAL_AMDGPU_LIBHSA_PATH (iree/.../util/libhsa.c) -
+        # that is the only libhsa knob in libggml-hrx/libhrx, and init.sh exports it from
+        # /etc/1bit/libhsa. Set the same variable here so this row tests the runtime the engine
+        # actually loads, not whatever the loader would find first. It accepts a directory or an exact
+        # library path; /etc/1bit/libhsa holds the exact path, which is passed through unchanged.
+        if [ -z "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && [ -r /etc/1bit/libhsa ]; then
+            HRXLIB=$(cat /etc/1bit/libhsa 2>/dev/null)
+            [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
         fi
-        [ -n "$HRXLIB" ] && export HSA_RUNTIME_LIBRARY_PATH="$HRXLIB"
         # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
         # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
         # on stderr and that text is the diagnostic.

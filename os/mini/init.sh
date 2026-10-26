@@ -32,7 +32,7 @@ echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"
 # bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
 # PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
 # comes up with no network at all, which looks exactly like a hang.
-for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt usbhid hid_generic evdev; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
 # network: DHCP on every wired interface

@@ -691,7 +691,16 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     for f in "$libs"/lib*.so*; do if [ -e "$f" ]; then cp -a "$f" "$out/data.dir/1bit-llama/"; fi; done
     # What the loader resolves from outside the image goes on the stick too - TheRock's libomp.so is the
     # one that caught this out - and libraries the image already carries at their own path are left to it.
-    ldd "$srv" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' > "$out/1bit-llama-needs.txt"
+    # The backends are dlopened by ggml at run time, so their own NEEDED entries count as much as the
+    # program's: libggml-hrx needs libhsa-runtime64.so.1, and on the first hardware boot (candidate 5,
+    # 26 Oct) that one was nowhere beside it - the HRX backend never loaded, llama-server listed no HRX0,
+    # and the only way to make it load mixed Lemonade's bundle into the engine's process (symbol
+    # mismatch in libloomc). So every lib*.so in the directory is resolved too, and the HSA runtime's
+    # own ROCm sysdeps (its RUNPATH expects them beside it) come along flat, since relocate() makes every
+    # file look in $ORIGIN only.
+    { ldd "$srv" 2>/dev/null
+      for f in "$out/data.dir/1bit-llama"/lib*.so; do ldd "$f" 2>/dev/null; done
+    } | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' | sort -u > "$out/1bit-llama-needs.txt"
     while read -r want path; do
         if [ -e "$out/data.dir/1bit-llama/$want" ]; then continue; fi
         case "$path" in "$libs"/*) continue ;; esac
@@ -703,24 +712,38 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
             cp -L "$path" "$out/data.dir/1bit-llama/$want"
             echo "   + $want (from this build machine: $path)"
         fi
+        case "$want" in libhsa-runtime64.so*)
+            for d in "$(dirname "$path")/rocm_sysdeps/lib" "$pkg_lib/rocm_sysdeps/lib"; do
+                if [ -d "$d" ]; then
+                    for f in "$d"/lib*.so*; do
+                        [ -e "$f" ] && [ ! -e "$out/data.dir/1bit-llama/$(basename "$f")" ] && cp -a "$f" "$out/data.dir/1bit-llama/"
+                    done
+                    echo "   + ROCm sysdeps of $want (from $d)"
+                    break
+                fi
+            done ;;
+        esac
     done < "$out/1bit-llama-needs.txt"
     rm -f "$out/1bit-llama-needs.txt"
     for f in "$out/data.dir/1bit-llama"/*; do relocate "$f"; done
-    # a build that cannot resolve its own llama-server is not worth shipping: say which library is missing
-    if ldd "$out/data.dir/1bit-llama/llama-server" 2>/dev/null | grep -q "not found"; then
-        echo "llama-server on the data partition still misses libraries:"
-        ldd "$out/data.dir/1bit-llama/llama-server" | grep "not found"
-        exit 1
-    fi
+    # a build that cannot resolve its own llama-server or a backend is not worth shipping: say what is missing
+    for f in "$out/data.dir/1bit-llama/llama-server" "$out/data.dir/1bit-llama"/lib*.so; do
+        if ldd "$f" 2>/dev/null | grep -q "not found"; then
+            echo "$(basename "$f") on the data partition still misses libraries:"
+            ldd "$f" | grep "not found"
+            exit 1
+        fi
+    done
 }
 if [ -x "$hrx/llama-server" ]; then
     llama_to_data "$hrx/llama-server" "$hrx"
     # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md). Taken from
     # the Lemonade package that is already on the stick - the build machine's /opt/rocm-therock path does
     # not exist there - and left where that package keeps it, beside the sibling libraries it needs.
-    hsa_pkg=$(ls "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    hsa_pkg=$(ls "$out/data.dir"/1bit-llama/libhsa-runtime64.so* 2>/dev/null | head -1)
+    [ -n "$hsa_pkg" ] || hsa_pkg=$(ls "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
     [ -n "$hsa_pkg" ] ||
-        { echo "no libhsa-runtime64 in Lemonade's llamacpp-hrx package on the data partition"; exit 1; }
+        { echo "no libhsa-runtime64 beside the engine's llama-server nor in Lemonade's llamacpp-hrx package"; exit 1; }
     echo "   HRX llama-server -> data partition /1bit-llama ($(du -sh "$out/data.dir/1bit-llama" | cut -f1), $(ls "$out/data.dir/1bit-llama" | wc -l) files)"
     echo "   HSA runtime (on the stick): ${hsa_pkg#"$out/data.dir"}"
 elif [ -n "${LLAMA_SERVER:-}" ]; then

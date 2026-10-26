@@ -388,6 +388,9 @@ if(Python3_Interpreter_FOUND)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry), so a regression cannot leave the daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # FastFlowLM's drops are files, not architecture classes (engine #588): the org listing and the runtime
+    # releases. Offline too - recorded API payloads under tests/fixtures/fflm/.
+    add_test(NAME fflm_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fflm_watch_test.py)
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)

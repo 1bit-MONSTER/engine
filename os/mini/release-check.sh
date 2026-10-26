@@ -315,11 +315,19 @@ else
         fail models "$HRX_GOT/$HRX_WANT HRX and $NPU_GOT/$NPU_WANT NPU entries listed; missing:$MISSING"
     fi
 fi
-if [ -n "${MODELS:-}" ] && [ "$GGUF_NAME" != none ]; then
-    if have_model "$GGUF_NAME"; then pass gguf "the stick's own model '$GGUF_NAME' is listed"
-    else fail gguf "/data/models/$GGUF_NAME.gguf is on the data partition but Lemonade does not list it"; fi
-else
+# Three different situations used to share one message. On candidate 10's first hardware run the gguf row
+# said "no /data/models/*.gguf on the data partition" while `ls /data/models/*.gguf` plainly found the
+# file: the row never looked at the partition at all. It took this else branch because $MODELS was empty -
+# Lemonade's list had come back 401 with a stale key - so a missing model list was reported as a missing
+# file, and the person reading it went looking at the data partition instead of the key.
+if [ "$GGUF_NAME" = none ]; then
     skip gguf "no /data/models/*.gguf on the data partition"
+elif [ -z "${MODELS:-}" ]; then
+    skip gguf "'$GGUF_NAME.gguf' is on the data partition, but Lemonade listed no models, so it cannot be checked (see the lemonade row)"
+elif have_model "$GGUF_NAME"; then
+    pass gguf "the stick's own model '$GGUF_NAME' is listed"
+else
+    fail gguf "/data/models/$GGUF_NAME.gguf is on the data partition but Lemonade does not list it"
 fi
 
 # ── one chat per backend that this machine can actually run ─────────────────────────────────────

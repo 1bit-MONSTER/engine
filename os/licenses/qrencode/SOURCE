@@ -1,0 +1,20 @@
+QR code generator: qrencode (the console menu's "Open on your phone" shows the web app URL as a QR)
+Ship: yes
+Project: libqrencode / qrencode, https://fukuchi.org/works/qrencode/
+Release: 4.1.1-2build1, the Ubuntu 26.04 (resolute) packages qrencode and libqrencode4
+License: LGPL-2.1-or-later (LICENSE, shipped here); the Debian packaging is public domain
+Packaged: not built here - mkimage.sh unpacks the two .debs into ~/.cache/1bit-os/tools/x on first use
+          (the same route as Dropbear and mtools), copies /usr/bin/qrencode to /bin/qrencode and
+          resolves what it links with ldd under that tree (libqrencode.so.4 from this package, plus
+          libpng16, libz, libm and libc, which the image already carries or takes from Ubuntu).
+          Each package's own /usr/share/doc/<pkg>/copyright is installed in the image beside the
+          others. They are unpacked, not dpkg-installed, so `dpkg -S` cannot attribute their files and
+          /usr/share/licenses/1bit-os/packages.txt does not name them - the same as Dropbear and
+          mtools, whose copyright files travel the same way.
+Why it ships: the physical console cannot be clicked (JetKVM video, a monitor), so the owner asked for
+          a code a phone can scan; qrencode is the smallest tool that renders one in the terminal
+          without a graphics stack. It is run only when the menu's QR screen is opened.
+Source: the .debs are the upstream 4.1.1 source as packaged by Debian/Ubuntu; upstream tarball
+          https://fukuchi.org/works/qrencode/qrencode-4.1.1.tar.gz, Debian packaging
+          https://salsa.debian.org/debian/qrencode . Nothing is patched: the image carries the
+          packaged binaries unmodified.

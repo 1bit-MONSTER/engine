@@ -1,0 +1,68 @@
+[
+ {
+  "tag_name": "v1.0.10",
+  "name": "\ud83d\ude80 FastFlowLM v1.0.10 \u2014 Constrained Decoding & More Accurate Whisper",
+  "published_at": "2026-10-22T22:59:58Z",
+  "prerelease": false,
+  "body": "This release does three things:\r\n\r\n- **Reasoning, tool calls and structured output** are handled one way for every model on `/v1/chat/completions`.\r\n- **`tool_choice` and `response_format` are enforced** while the model generates, not just requested.\r\n- **Whisper transcription** is more accurate, and `/v1/audio/transcriptions` now supports `language`, `prompt` and `response_format`.\r\n\r\nIt also fixes several `flm serve` bugs, including Lemonade failing to launch FLM on Linux.\r\n\r\n---\r\n\r\n## \u2728 New Features\r\n\r\n### \ud83e\udde9 OpenAI API: Shared Chat Parsing and Constrained Decoding\r\n\r\n**[PR #790](https://github.com/ROCm/FastFlowLM/pull/790)**\r\n\r\nEvery model writes its answer in its own markup. Qwen3 uses `<think>` and `<tool_call>`, Gemma 4 uses a thought channel and `call:f{\u2026}`, GPT-OSS uses Harmony channels, and LFM2 writes Python calls. Until now each model had its own parser for this. In v1.0.10, one shared parser handles all of them, so `/v1/chat/completions` returns the same OpenAI-shaped message whatever the model:\r\n\r\n- `reasoning_content`, `content` and `tool_calls` are split the same way for every model, streamed or not.\r\n- The streamed deltas add up to exactly the non-streamed reply.\r\n- Tool-call markup counts as a call only when the request includes `tools`. A reply that is only tool calls has `content: null`, as in the OpenAI API.\r\n\r\n**Constrained decoding.** Before each token is sampled, FLM works out which tokens can still lead to valid output and rules out the rest. This uses",
+  "assets": [
+   {
+    "name": "fastflowlm_1.0.10_debian13_amd64.deb",
+    "size": 64467988
+   },
+   {
+    "name": "fastflowlm_1.0.10_linux.tar.gz",
+    "size": 37927581
+   },
+   {
+    "name": "fastflowlm_1.0.10_ubuntu24.04_amd64.deb",
+    "size": 45951392
+   },
+   {
+    "name": "fastflowlm_1.0.10_ubuntu25.10_amd64.deb",
+    "size": 48375952
+   },
+   {
+    "name": "fastflowlm_1.0.10_ubuntu26.04_amd64.deb",
+    "size": 48282030
+   },
+   {
+    "name": "fastflowlm_1.0.10_windows_amd64.zip",
+    "size": 30484687
+   }
+  ]
+ },
+ {
+  "tag_name": "v1.0.9",
+  "name": "\ud83d\ude80 FastFlowLM v1.0.9 \u2014 `flm validate` Fix",
+  "published_at": "2026-10-15T21:35:13Z",
+  "prerelease": false,
+  "body": "Runtime update: the q4nx container chunk layout changed; re-export models with flm 1.0.9.",
+  "assets": [
+   {
+    "name": "fastflowlm_1.0.9_debian13_amd64.deb",
+    "size": 47964076
+   },
+   {
+    "name": "fastflowlm_1.0.9_linux.tar.gz",
+    "size": 48082541
+   },
+   {
+    "name": "fastflowlm_1.0.9_ubuntu24.04_amd64.deb",
+    "size": 33776380
+   },
+   {
+    "name": "fastflowlm_1.0.9_ubuntu25.10_amd64.deb",
+    "size": 35221626
+   },
+   {
+    "name": "fastflowlm_1.0.9_ubuntu26.04_amd64.deb",
+    "size": 35167690
+   },
+   {
+    "name": "fastflowlm_1.0.9_windows_amd64.zip",
+    "size": 40992743
+   }
+  ]
+ }
+]

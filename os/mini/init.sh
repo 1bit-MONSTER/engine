@@ -142,7 +142,7 @@ screen_login() {
     # cttyhack is what a classic initramfs uses, but here it exits at once (it cannot claim a tty that
     # setsid has already detached from) - measured on the box. setsid -c makes tty1 the controlling
     # terminal instead, which is what gives a prompt AND job control; the loop puts it back if you exit.
-    ( while :; do setsid -c /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
+    ( while :; do setsid -c env PS1='1bit-os:\w # ' /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
 }
 
 # Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
@@ -235,6 +235,7 @@ fi
 { echo "export PATH=$PATH HOME=/root GGML_HRX_JIT_CACHE_DIR=$GGML_HRX_JIT_CACHE_DIR"
   [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && echo "export IREE_HAL_AMDGPU_LIBHSA_PATH=$IREE_HAL_AMDGPU_LIBHSA_PATH"
   [ -n "${ONEBIT_HRX_LLAMA_SERVER:-}" ] && echo "export ONEBIT_HRX_LLAMA_SERVER=$ONEBIT_HRX_LLAMA_SERVER"
+  echo "export PS1='1bit-os:\\w # '"
 } > /etc/profile
 for b in lemonade lemond; do [ -x "/opt/lemonade/bin/$b" ] && ln -sf "/opt/lemonade/bin/$b" "/usr/bin/$b"; done
 
@@ -373,9 +374,15 @@ if grep -q "1bit.check" /proc/cmdline; then
 fi
 
 # a shell on the console and the serial port
-[ -e /dev/ttyS0 ] && setsid sh -c 'exec sh </dev/ttyS0 >/dev/ttyS0 2>&1' &
+[ -e /dev/ttyS0 ] && setsid sh -c 'PS1="1bit-os:\\w # " exec sh </dev/ttyS0 >/dev/ttyS0 2>&1' &
 # PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
 # what happened on real hardware - the script finished, the final exec returned, and the machine
 # rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
+# Kernel messages stay in dmesg from here on, not over the console shell. The cmdline boots with
+# ignore_loglevel so every boot line is on the console and the serial log; the first hardware boot
+# (26 Oct) then kept printing USB connect/disconnect lines over the shell and the owner could not
+# use the prompt at all. Both knobs are runtime-writable; emergencies (level 0) still reach the console.
+echo N > /sys/module/printk/parameters/ignore_loglevel 2>/dev/null
+echo "1 4 1 7" > /proc/sys/kernel/printk 2>/dev/null
 screen_login
 while :; do sleep 3600; done

@@ -121,7 +121,11 @@ echo "== kernel modules ($kver)"
 # usbhid + hid_generic + evdev: the console keyboard. The first hardware boots (candidates 5 and 8, 26 Oct)
 # had a running menu and shell but no USB keyboard driver in the initramfs (/dev/input held only "mice"),
 # so the owner could not type at all: the KVM and every USB keyboard are HID devices.
-mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev"
+# Every module the board binds on the build machine (os/mini/hwprobe.py, 26 Oct 2026): CPU temperature
+# (k10temp, what the fan logic and the checks read), SMBus and the DIMM sensors, the power controller,
+# the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), audio (HDA and the
+# KVM's USB audio), the SD reader, RAPL power readings. BusyBox init has no udev: init.sh loads them.
+mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done

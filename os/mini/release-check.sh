@@ -137,7 +137,25 @@ fi
 
 PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
 PORT=${PORT:-13305}
-KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | head -1)
+# The key the running lemond actually holds, read from the environment of the process that listens on
+# the Lemonade port (via the socket inode in /proc/net/tcp). Candidate 10 on the board (26 Oct): the conf
+# held two active key lines for a while (a staged one glued to the previous line, and the one init then
+# minted); lemond, which SOURCES the file, ran on the last one, and this check, taking the first, sent the
+# other and read 401 as "the key is wrong". The file is only the fallback, and then the last assignment
+# wins, as it does for the shell that started lemond.
+lemond_key() {
+    ino=$(awk -v p="$(printf ':%04X' "$PORT")" '$2 ~ p"$" && $4 == "0A" { print $10; exit }' /proc/net/tcp 2>/dev/null)
+    [ -n "$ino" ] || return 1
+    for d in /proc/[0-9]*; do
+        if ls -l "$d/fd" 2>/dev/null | grep -q "socket:\[$ino\]"; then
+            tr '\0' '\n' < "$d/environ" 2>/dev/null | sed -n 's/^LEMONADE_API_KEY=//p' | head -n 1
+            return 0
+        fi
+    done
+    return 1
+}
+KEY=$(lemond_key)
+[ -n "$KEY" ] || KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | tail -n 1)
 API="http://127.0.0.1:$PORT"
 CATALOG=/opt/lemonade/bin/resources/server_models.json
 PLAIN_TOTAL=$(find /data/npu/kernels -name 'layer1.elf' 2>/dev/null | wc -l)

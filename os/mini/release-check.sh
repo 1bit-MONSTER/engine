@@ -43,12 +43,14 @@ got() { wget -q -T 15 -t 1 -O - "$@" 2>/dev/null ||
         curl -sf --connect-timeout 5 --max-time 20 "$@" 2>/dev/null; }
 
 # The FIRST HRX request on a fresh stick is not a 20-second operation: the one-hop backend JIT-compiles
-# its Loom kernels before it can answer, which took minutes on candidate 10's first hardware boot, so
-# chat-hrx reported "no answer" while the exec chain was working perfectly (lemond: "one hop:
-# /opt/1bit-llama/llama-server on port 8002"). Only the HRX chat row uses this; every other fetch keeps
-# the short caps that exist to stop a hung server stalling the whole check.
-got_slow() { wget -q -T 900 -t 1 -O - "$@" 2>/dev/null ||
-             curl -sf --connect-timeout 5 --max-time 900 "$@" 2>/dev/null; }
+# its Loom kernels before it can answer, so chat-hrx reported "no answer" on candidate 10 while the exec
+# chain was working perfectly (lemond: "one hop: /opt/1bit-llama/llama-server on port 8002").
+# MEASURED on the board once the runtime was right: cold 2 s (66 cache files), warm 80 ms, then 120 tokens
+# in 383 ms. So this is not a minutes-long operation and the cap need not be minutes either: 120 s is 60x
+# the measured cold start - enough that a first-run JIT cannot fail the row, short enough that a genuinely
+# hung backend still fails this row instead of stalling the whole check. Only the HRX chat row uses it.
+got_slow() { wget -q -T 120 -t 1 -O - "$@" 2>/dev/null ||
+             curl -sf --connect-timeout 5 --max-time 120 "$@" 2>/dev/null; }
 
 # HTTP status of a request: 000 when nothing answered at all. A refusal has to be *proved* by its
 # status, not inferred from an empty body: the unprepared stick returns an empty body to the keyless

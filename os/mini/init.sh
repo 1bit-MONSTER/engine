@@ -87,8 +87,15 @@ if [ -d /data/1bit-llama ]; then
     ln -sfn /data/1bit-llama /opt/1bit-llama
     # same on /data, from the Lemonade package that is already there (the build machine's
     # /opt/rocm-therock path does not exist on a stick)
-    hsa=$(ls /data/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    # the engine's own copy first (shipped beside llama-server since candidate 6, with its ROCm sysdeps);
+    # Lemonade's bundle only as a fallback for older data partitions
+    hsa=$(ls /data/1bit-llama/libhsa-runtime64.so* 2>/dev/null | head -1)
+    [ -n "$hsa" ] || hsa=$(ls /data/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
     [ -n "$hsa" ] && echo "$hsa" > /etc/1bit/libhsa
+    # Lemonade's HRX recipe starts the engine through scripts/lemonade-hrx, whose default llama-server is
+    # "beside the script" (hrx/llama/bin/llama-server) - a path that does not exist in this layout, so on
+    # candidate 5 lemond logged "Failed to execute: hrx/llama/bin/llama-server". Name the shipped one.
+    export ONEBIT_HRX_LLAMA_SERVER=/opt/1bit-llama/llama-server
     say "[engine] llama-server from /data/1bit-llama, HSA runtime ${hsa:-not found}"
 else
     say "[engine] no /data/1bit-llama: '1bit serve' has no HRX llama-server on this boot"
@@ -227,6 +234,7 @@ fi
 # also linked into /usr/bin for `ssh root@<IP> lemonade ...` (no profile is read for a command)
 { echo "export PATH=$PATH HOME=/root GGML_HRX_JIT_CACHE_DIR=$GGML_HRX_JIT_CACHE_DIR"
   [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && echo "export IREE_HAL_AMDGPU_LIBHSA_PATH=$IREE_HAL_AMDGPU_LIBHSA_PATH"
+  [ -n "${ONEBIT_HRX_LLAMA_SERVER:-}" ] && echo "export ONEBIT_HRX_LLAMA_SERVER=$ONEBIT_HRX_LLAMA_SERVER"
 } > /etc/profile
 for b in lemonade lemond; do [ -x "/opt/lemonade/bin/$b" ] && ln -sf "/opt/lemonade/bin/$b" "/usr/bin/$b"; done
 

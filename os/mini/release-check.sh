@@ -42,6 +42,16 @@ skip() { ROWS=$((ROWS + 1)); say "SKIP  $1 : $2"; }
 got() { wget -q -T 15 -t 1 -O - "$@" 2>/dev/null ||
         curl -sf --connect-timeout 5 --max-time 20 "$@" 2>/dev/null; }
 
+# The FIRST HRX request on a fresh stick is not a 20-second operation: the one-hop backend JIT-compiles
+# its Loom kernels before it can answer, so chat-hrx reported "no answer" on candidate 10 while the exec
+# chain was working perfectly (lemond: "one hop: /opt/1bit-llama/llama-server on port 8002").
+# MEASURED on the board once the runtime was right: cold 2 s (66 cache files), warm 80 ms, then 120 tokens
+# in 383 ms. So this is not a minutes-long operation and the cap need not be minutes either: 120 s is 60x
+# the measured cold start - enough that a first-run JIT cannot fail the row, short enough that a genuinely
+# hung backend still fails this row instead of stalling the whole check. Only the HRX chat row uses it.
+got_slow() { wget -q -T 120 -t 1 -O - "$@" 2>/dev/null ||
+             curl -sf --connect-timeout 5 --max-time 120 "$@" 2>/dev/null; }
+
 # HTTP status of a request: 000 when nothing answered at all. A refusal has to be *proved* by its
 # status, not inferred from an empty body: the unprepared stick returns an empty body to the keyless
 # probe and the old row counted that as a refusal (it false-PASSED).
@@ -305,14 +315,32 @@ else
     [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1 && have_gpu=1
     have_npu=0
     ls /dev/accel/accel* >/dev/null 2>&1 && have_npu=1
-    if [ "$HRX_GOT" = "$HRX_WANT" ] && [ "$NPU_GOT" = "$NPU_WANT" ]; then
-        pass models "$HRX_WANT onebit HRX entries and $NPU_WANT NPU entries listed"
+    # "listed by Lemonade" means LISTED AND DOWNLOADED, not "known". On candidate 10's stick this row
+    # reported "0/22 HRX and 0/4 NPU listed" and looked like a build defect, while every id was in the
+    # catalogue the image ships: the stick simply carries one model, so Lemonade offered only that one.
+    # The question this row can actually answer on any machine is whether the manifest and the shipped
+    # catalogue agree; how many are downloaded is context, and chat-hrx is the row that proves serving.
+    CAT=/opt/lemonade/bin/resources/server_models.json
+    HRX_REG=0; NPU_REG=0; NOTCAT=
+    while read -r kind id; do
+        [ -n "${id:-}" ] || continue
+        if grep -qF "\"$id\"" "$CAT" 2>/dev/null; then
+            [ "$kind" = hrx ] && HRX_REG=$((HRX_REG + 1)) || NPU_REG=$((NPU_REG + 1))
+        else
+            NOTCAT="$NOTCAT $id"
+        fi
+    done < "$MAN"
+    SERVED="$HRX_GOT HRX + $NPU_GOT NPU downloaded"
+    if [ -n "$NOTCAT" ]; then
+        fail models "the manifest names ids the shipped catalogue ($CAT) does not contain:$NOTCAT"
+    elif [ "$HRX_REG" = "$HRX_WANT" ] && [ "$NPU_REG" = "$NPU_WANT" ]; then
+        pass models "$HRX_REG HRX and $NPU_REG NPU onebit entries are in the shipped catalogue ($SERVED here)"
     elif [ "$have_gpu" = 0 ] && [ "$have_npu" = 0 ]; then
         skip models "this machine has no AMD GPU or NPU, so Lemonade hides the onebit entries ($HRX_WANT HRX + $NPU_WANT NPU are registered in $MAN)"
-    elif [ "${man_mode:-}" != "$MODE" ] && [ "$HRX_GOT" = 0 ]; then
+    elif [ "${man_mode:-}" != "$MODE" ] && [ "$HRX_REG" = 0 ]; then
         skip models "a $MODE boot lists no onebit entries; the manifest records the ${man_mode:-<unknown>} set ($HRX_WANT HRX + $NPU_WANT NPU): checked in the registry by vmtest.sh"
     else
-        fail models "$HRX_GOT/$HRX_WANT HRX and $NPU_GOT/$NPU_WANT NPU entries listed; missing:$MISSING"
+        fail models "$HRX_REG/$HRX_WANT HRX and $NPU_REG/$NPU_WANT NPU entries found in the shipped catalogue; not in it:$NOTCAT"
     fi
 fi
 # Three different situations used to share one message. On candidate 10's first hardware run the gguf row
@@ -331,9 +359,10 @@ else
 fi
 
 # ── one chat per backend that this machine can actually run ─────────────────────────────────────
-chat() {   # chat <model id> -> sets ANSWER and TPS
+chat() {   # chat <model id> [slow] -> sets ANSWER and TPS
     ANSWER=; TPS=
-    R=$(got --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+    _get=got; [ "${2:-}" = slow ] && _get=got_slow
+    R=$($_get --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
         --post-data="{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0}" \
         "$API/api/v1/chat/completions")
     case "$R" in
@@ -399,7 +428,8 @@ fi
 
 HRX=$(pick '[^"]*-1bit')
 if [ -e /dev/kfd ] && [ -n "$HRX" ]; then
-    chat "$HRX"
+    # slow: the first HRX call compiles Loom kernels (see got_slow)
+    chat "$HRX" slow
     if [ -n "$TPS" ]; then pass chat-hrx "$HRX (onebit, HRX) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-hrx "$HRX (onebit, HRX) did not answer ($ANSWER)"; fi
 elif [ ! -e /dev/kfd ]; then

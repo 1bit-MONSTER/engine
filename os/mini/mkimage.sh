@@ -756,7 +756,10 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
             echo "   this build has no $hrx_lib under ggml-hrx-deps-build: refusing to ship Lemonade's copy in its place"; exit 1
         fi
     done
-    if ! strings "$out/data.dir/1bit-llama/libhrx.so.0" 2>/dev/null | grep -q HRX_ALLOW_NO_SVM; then
+    # no `strings | grep -q` here: under set -o pipefail, grep -q closing the pipe on the first match kills
+    # strings with SIGPIPE (a 2 MB file) and the pipeline reports failure for a file that HAS the string -
+    # candidate 11's two package runs refused a correct libhrx exactly so. grep -a reads the binary itself.
+    if ! grep -qa HRX_ALLOW_NO_SVM "$out/data.dir/1bit-llama/libhrx.so.0" 2>/dev/null; then
         echo "   libhrx.so.0 has no HRX_ALLOW_NO_SVM gate: the engine's CWSR placement needs it (engine #315, pin #565)"
         ls -l "$out/data.dir/1bit-llama/libhrx.so.0" 2>&1 | sed 's/^/   /'
         file "$out/data.dir/1bit-llama/libhrx.so.0" 2>&1 | sed 's/^/   /'
@@ -837,11 +840,14 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     fi
     for f in "$out/data.dir/1bit-llama"/*; do relocate "$f"; done
     # a build that cannot resolve its own llama-server or a backend is not worth shipping: say what is missing
+    # the same pipefail trap the other way round: `ldd | grep -q` can report success-of-ldd-killed-by-SIGPIPE
+    # as "nothing missing"; the ldd output is captured first and grep reads it from a variable
     for f in "$out/data.dir/1bit-llama/llama-server" "$out/data.dir/1bit-llama"/lib*.so*; do
         [ -L "$f" ] && continue
-        if ldd "$f" 2>/dev/null | grep -q "not found"; then
+        lddout=$(ldd "$f" 2>/dev/null || true)
+        if printf '%s\n' "$lddout" | grep -c "not found" | grep -qv '^0$'; then
             echo "$(basename "$f") on the data partition still misses libraries:"
-            ldd "$f" | grep "not found"
+            printf '%s\n' "$lddout" | grep "not found"
             exit 1
         fi
     done

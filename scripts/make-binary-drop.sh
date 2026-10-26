@@ -93,7 +93,8 @@ elif [ -n "$package" ]; then
     [ -f "$package" ] || die "no such engine package: $package"
     mkdir -p "$work/pkg"
     tar -C "$work/pkg" -xf "$package" --use-compress-program=unzstd
-    hrx_src=$(find "$work/pkg" -path '*/hrx/llama/bin' -type d | head -1)
+    hrx_src=$(find "$work/pkg" -path '*/hrx/llama/bin' -type d)
+    hrx_src=${hrx_src%%$'\n'*}
     [ -n "$hrx_src" ] || die "$package carries no hrx/llama/bin"
     hrx_from="package $(basename "$package")"
 else

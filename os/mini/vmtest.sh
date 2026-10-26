@@ -120,7 +120,10 @@ echo "Lemonade downloads during the test: ${dl:-?} (QEMU's network is restricted
 # grub's own menu says "1bit OS" too, so match init's live-mode banner, which say() writes to
 # /dev/console (= this serial line in the VM) and to tty1.
 if grep -q "LIVE: runs from RAM" "$out/serial.log" 2>/dev/null; then
-    echo "Live banner on the console: $(grep "LIVE: runs from RAM" "$out/serial.log" | head -1 | cut -c1-72)"
+    # capture the matches whole and take the first: `grep ... | head -1` would kill grep under pipefail
+    # and print an empty banner
+    banner=$(grep "LIVE: runs from RAM" "$out/serial.log" | cut -c1-72)
+    echo "Live banner on the console: ${banner%%$'\n'*}"
 elif ssh_vm 'test -e /etc/1bit/live' 2>/dev/null; then
     echo "Live banner on the console: not on the serial line, but the live marker exists (tty1 only)"; ok=0
 else echo "Live banner on the console: missing from $out/serial.log"; ok=0; fi
@@ -163,7 +166,9 @@ if [ -n "$catalog" ]; then
             *) echo "The image's catalog is missing the NPU entry: $want"; ok=0;;
         esac
     done
-    if printf '%s' "$catalog" | grep -q '\"onebit_backend\": \"npu\"'; then
+    # the catalogue is ~80 KB, larger than a pipe buffer: `printf | grep -q` here would kill printf and
+    # take the false branch on a catalogue that does carry NPU entries. A here-string has no pipe.
+    if grep -q '\"onebit_backend\": \"npu\"' <<<"$catalog"; then
         echo "The catalog's NPU entries carry recipe_options.onebit_backend: npu"
     else echo "The catalog's NPU entries do not carry recipe_options.onebit_backend"; ok=0; fi
 else echo "could not read the image's server_models.json"; ok=0; fi
@@ -270,7 +275,10 @@ if [ $ok = 1 ] && [ -f "$out/vdisk.img" ]; then
         for i in $(seq 40); do curl -sf "${auth[@]}" "$api/api/v1/health" >/dev/null && break; sleep 2; done
         code=$(curl -s -o /dev/null -w '%{http_code}' "$api/api/v1/models")
         [ "$code" = 401 ] && echo "installed Lemonade: 401 without the key" || { echo "installed Lemonade: HTTP $code without the key"; ok=0; }
-        if curl -s "${auth[@]}" "$api/api/v1/models" | grep -q "\"$name\""; then
+        # not `curl ... | grep -q`: grep exits on the match and kills curl (141), and under pipefail
+        # the check then reports a model that IS listed as missing
+        listed=$(curl -s "${auth[@]}" "$api/api/v1/models")
+        if grep -q "\"$name\"" <<<"$listed"; then
             echo "installed Lemonade lists the GGUF carried over to the disk: $name"
         else echo "installed Lemonade does not list $name"; ok=0; fi
         reply2=$(chat "$name")

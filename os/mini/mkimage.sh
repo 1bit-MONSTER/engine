@@ -342,6 +342,65 @@ cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/
 install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
 mkdir -p "$root/etc/1bit"
 install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
+# The onebit entries this image ships, so 1bit-release-check can prove Lemonade registers them. The
+# catalogue Lemonade reads at runtime is server_models.json; the check needs the *shipped* subset on
+# paper, because on a machine without a GPU or NPU Lemonade hides those entries and their absence there
+# says nothing about the image. Format, one record per line, exactly as release-check.sh parses it:
+#     mode=<live|installed>
+#     hrx <model id>
+#     npu <model id>
+# release-check.sh used to read this file without anything ever writing it, so every hardware run
+# reported "models : /etc/1bit/onebit-models.txt is missing from the image" - a check that could never
+# pass. Derived from the catalog rather than a hand-kept list, so it cannot drift from what Lemonade
+# actually ships; a catalogue without onebit entries writes a manifest with none, which the check
+# reports as such instead of failing.
+cat=$root/opt/lemonade/bin/resources/server_models.json
+if [ -f "$cat" ]; then
+    python3 - "$cat" "$root/etc/1bit/onebit-models.txt" <<'ONEBIT_MODELS'
+import json, sys
+cat, out = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(cat))
+except Exception as e:
+    sys.stderr.write("onebit-models: %s is not readable JSON (%s)\n" % (cat, e))
+    raise SystemExit(1)
+# The catalogue has been both a list of model dicts and a dict of {section: [model dicts]}; walk
+# whichever it is so a layout change does not silently produce an empty manifest.
+def models(node):
+    if isinstance(node, list):
+        for x in node:
+            yield from models(x)
+    elif isinstance(node, dict):
+        if "id" in node and isinstance(node.get("id"), str):
+            yield node
+        else:
+            for v in node.values():
+                yield from models(v)
+rows, seen = [], set()
+for m in models(data):
+    recipe = m.get("recipe")
+    backend = m.get("onebit_backend")
+    if recipe == "onebit":
+        kind = "npu" if backend == "npu" else "hrx"
+    elif backend == "npu":
+        kind = "npu"
+    else:
+        continue
+    if m["id"] in seen:
+        continue
+    seen.add(m["id"])
+    rows.append("%s %s" % (kind, m["id"]))
+rows.sort(key=lambda r: (r.split()[0] != "hrx", r))
+with open(out, "w") as f:
+    f.write("mode=live\n")
+    for r in rows:
+        f.write(r + "\n")
+sys.stderr.write("   onebit-models: %d hrx + %d npu\n"
+                 % (sum(r.startswith("hrx ") for r in rows), sum(r.startswith("npu ") for r in rows)))
+ONEBIT_MODELS
+else
+    echo "   warning: no $cat; /etc/1bit/onebit-models.txt is not written and the models row cannot pass"
+fi
 # The SMU limits (the 90 W sustained cap) are set through ryzenadj, which is LGPL-3.0: ship the tool and
 # its licence. A builder without it still works - the EC power mode alone applies and the image says so.
 echo "== SMU tool (ryzenadj v0.19.0, LGPL-3.0, source pinned in os/licenses/ryzenadj, userspace build)"

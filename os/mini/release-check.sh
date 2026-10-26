@@ -162,7 +162,21 @@ if command -v mokutil >/dev/null 2>&1; then
         *) skip secureboot "mokutil answered: $SB";;
     esac
 elif [ -e /sys/firmware/efi ]; then
-    skip secureboot "no mokutil in the image; firmware reports EFI but not the Secure Boot state"
+    # mokutil is not shipped, but the firmware's own variable says it plainly: SecureBoot-<vendor guid>,
+    # 5 bytes - attributes(4) then the value. Reading it needs no new binary, and the previous wording
+    # ("no mokutil in the image") reported a SKIP on a machine that had Secure Boot ON and had just
+    # booted our MOK-signed kernel, which is the pass the owner actually cares about.
+    SBVAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+    if [ -r "$SBVAR" ]; then
+        sbv=$(od -An -tu1 -j4 -N1 "$SBVAR" 2>/dev/null | tr -d ' \n')
+        case "${sbv:-}" in
+            1) pass secureboot "Secure Boot enabled; the MOK-signed kernel booted";;
+            0) pass secureboot "Secure Boot disabled (the firmware reports it off)";;
+            *) skip secureboot "Secure Boot state unreadable from $SBVAR";;
+        esac
+    else
+        skip secureboot "no mokutil and no readable $SBVAR; firmware reports EFI but not the Secure Boot state"
+    fi
 else
     fail secureboot "no /sys/firmware/efi: booted in legacy mode, not the signed UEFI chain"
 fi
@@ -290,21 +304,65 @@ if [ -n "$VMODEL" ]; then
 else
     skip chat "Lemonade lists no model this machine can run"
 fi
+# ── the HRX runtime itself, before any chat row that depends on it ─────────────────────────────
+# A chat-hrx failure is useless on its own: it says an entry did not answer, not whether the runtime
+# below it registered a device at all. Candidate 5 shipped an HRX runtime from before the pin that
+# carries HRX_ALLOW_NO_SVM, so it registered no HRX0 while every other row stayed green - the engine
+# sets HSA_USE_SVM=0 on a CWSR-on kernel and needs that gate to still see the device. This row asks
+# llama-server directly, which is the smallest question with a yes/no answer.
+if [ -e /dev/kfd ]; then
+    LSRV=${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
+    if [ ! -x "$LSRV" ]; then
+        fail hrx-device "no llama-server at $LSRV"
+    else
+        # The runtime resolves libhsa through IREE_HAL_AMDGPU_LIBHSA_PATH (iree/.../util/libhsa.c) -
+        # that is the only libhsa knob in libggml-hrx/libhrx, and init.sh exports it from
+        # /etc/1bit/libhsa. Set the same variable here so this row tests the runtime the engine
+        # actually loads, not whatever the loader would find first. It accepts a directory or an exact
+        # library path; /etc/1bit/libhsa holds the exact path, which is passed through unchanged.
+        if [ -z "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && [ -r /etc/1bit/libhsa ]; then
+            HRXLIB=$(cat /etc/1bit/libhsa 2>/dev/null)
+            [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
+        fi
+        # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
+        # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
+        # on stderr and that text is the diagnostic.
+        LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
+        # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
+        # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
+        # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
+        HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
+        if [ -n "$HRXDEV" ]; then
+            pass hrx-device "$HRXDEV"
+        elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
+            fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+        else
+            fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+        fi
+    fi
+else
+    skip hrx-device "no /dev/kfd: this machine has no AMD GPU, so no HRX device can register"
+fi
+
 HRX=$(pick '[^"]*-1bit')
 if [ -e /dev/kfd ] && [ -n "$HRX" ]; then
     chat "$HRX"
     if [ -n "$TPS" ]; then pass chat-hrx "$HRX (onebit, HRX) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-hrx "$HRX (onebit, HRX) did not answer ($ANSWER)"; fi
+elif [ ! -e /dev/kfd ]; then
+    skip chat-hrx "no /dev/kfd: this machine has no AMD GPU, so no HRX entry can run"
 else
-    skip chat-hrx "no AMD GPU in this VM: the onebit HRX entries only run on the machine"
+    skip chat-hrx "no onebit HRX entry is listed by Lemonade, so there is nothing to ask"
 fi
 NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     chat "$NPU"
     if [ -n "$TPS" ]; then pass chat-npu "$NPU (onebit, NPU) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-npu "$NPU (onebit, NPU) did not answer ($ANSWER)"; fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
-    skip chat-npu "no NPU in this VM: the onebit NPU entries only run on the machine"
+    skip chat-npu "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

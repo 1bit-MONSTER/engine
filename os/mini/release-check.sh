@@ -35,7 +35,22 @@ say() { printf '%s\n' "$*"; [ -w /data ] 2>/dev/null && printf '%s\n' "$*" >> "$
 pass() { ROWS=$((ROWS + 1)); say "PASS  $1 : $2"; }
 fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 skip() { ROWS=$((ROWS + 1)); say "SKIP  $1 : $2"; }
-got() { wget -q -O - "$@" 2>/dev/null || curl -sf "$@" 2>/dev/null; }
+# Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
+# the whole check with no output - measured on the release candidate: 1bit-release-check sat in the
+# lemonade row until an external 20-minute limit killed the run, which on the owner's console would
+# look like a hung machine rather than a failed check.
+got() { wget -q -T 15 -t 1 -O - "$@" 2>/dev/null ||
+        curl -sf --connect-timeout 5 --max-time 20 "$@" 2>/dev/null; }
+
+# The FIRST HRX request on a fresh stick is not a 20-second operation: the one-hop backend JIT-compiles
+# its Loom kernels before it can answer, so chat-hrx reported "no answer" on candidate 10 while the exec
+# chain was working perfectly (lemond: "one hop: /opt/1bit-llama/llama-server on port 8002").
+# MEASURED on the board once the runtime was right: cold 2 s (66 cache files), warm 80 ms, then 120 tokens
+# in 383 ms. So this is not a minutes-long operation and the cap need not be minutes either: 120 s is 60x
+# the measured cold start - enough that a first-run JIT cannot fail the row, short enough that a genuinely
+# hung backend still fails this row instead of stalling the whole check. Only the HRX chat row uses it.
+got_slow() { wget -q -T 120 -t 1 -O - "$@" 2>/dev/null ||
+             curl -sf --connect-timeout 5 --max-time 120 "$@" 2>/dev/null; }
 
 # HTTP status of a request: 000 when nothing answered at all. A refusal has to be *proved* by its
 # status, not inferred from an empty body: the unprepared stick returns an empty body to the keyless
@@ -51,6 +66,28 @@ status() {
         fi
     fi
     printf '%s' "${c:-000}"
+}
+
+# Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
+# app, engine spawn). The capped fetches above then see "status 000" and the row fails although the
+# server is fine - candidate 4 (25 Oct) failed exactly so, where candidate 3's uncapped wget had simply
+# waited. So the port is polled with 2 s probes until anything answers, up to READY_WAIT seconds; only
+# then do the capped assertions run. A server that never answers gets its own row (lemonade_ready
+# false), distinct from a wrong key. The caps on the assertions stay: they are what keep the
+# 20-minute hang from coming back.
+READY_WAIT=${READY_WAIT:-120}
+lemonade_ready() {
+    i=0
+    while [ "$i" -lt "$READY_WAIT" ]; do
+        if command -v curl >/dev/null 2>&1; then
+            c=$(curl -s -o /dev/null -w '%{http_code}' --max-time 2 "$API/api/v1/models" 2>/dev/null)
+        else
+            c=$(wget -S -O /dev/null --timeout=2 -t 1 "$API/api/v1/models" 2>&1 | sed -n 's/.*HTTP\/1\.[01] \([0-9][0-9][0-9]\).*/\1/p' | head -1)
+        fi
+        case "${c:-000}" in 000) ;; *) say "      lemond answered $API after ${i}s (status $c)"; return 0 ;; esac
+        sleep 2; i=$((i + 2))
+    done
+    return 1
 }
 
 # The lemonade row, decided from what the two probes returned. Pure, so tests/release_check_row.sh can
@@ -100,7 +137,25 @@ fi
 
 PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
 PORT=${PORT:-13305}
-KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | head -1)
+# The key the running lemond actually holds, read from the environment of the process that listens on
+# the Lemonade port (via the socket inode in /proc/net/tcp). Candidate 10 on the board (26 Oct): the conf
+# held two active key lines for a while (a staged one glued to the previous line, and the one init then
+# minted); lemond, which SOURCES the file, ran on the last one, and this check, taking the first, sent the
+# other and read 401 as "the key is wrong". The file is only the fallback, and then the last assignment
+# wins, as it does for the shell that started lemond.
+lemond_key() {
+    ino=$(awk -v p="$(printf ':%04X' "$PORT")" '$2 ~ p"$" && $4 == "0A" { print $10; exit }' /proc/net/tcp 2>/dev/null)
+    [ -n "$ino" ] || return 1
+    for d in /proc/[0-9]*; do
+        if ls -l "$d/fd" 2>/dev/null | grep -q "socket:\[$ino\]"; then
+            tr '\0' '\n' < "$d/environ" 2>/dev/null | sed -n 's/^LEMONADE_API_KEY=//p' | head -n 1
+            return 0
+        fi
+    done
+    return 1
+}
+KEY=$(lemond_key)
+[ -n "$KEY" ] || KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | tail -n 1)
 API="http://127.0.0.1:$PORT"
 CATALOG=/opt/lemonade/bin/resources/server_models.json
 PLAIN_TOTAL=$(find /data/npu/kernels -name 'layer1.elf' 2>/dev/null | wc -l)
@@ -135,7 +190,21 @@ if command -v mokutil >/dev/null 2>&1; then
         *) skip secureboot "mokutil answered: $SB";;
     esac
 elif [ -e /sys/firmware/efi ]; then
-    skip secureboot "no mokutil in the image; firmware reports EFI but not the Secure Boot state"
+    # mokutil is not shipped, but the firmware's own variable says it plainly: SecureBoot-<vendor guid>,
+    # 5 bytes - attributes(4) then the value. Reading it needs no new binary, and the previous wording
+    # ("no mokutil in the image") reported a SKIP on a machine that had Secure Boot ON and had just
+    # booted our MOK-signed kernel, which is the pass the owner actually cares about.
+    SBVAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+    if [ -r "$SBVAR" ]; then
+        sbv=$(od -An -tu1 -j4 -N1 "$SBVAR" 2>/dev/null | tr -d ' \n')
+        case "${sbv:-}" in
+            1) pass secureboot "Secure Boot enabled; the MOK-signed kernel booted";;
+            0) pass secureboot "Secure Boot disabled (the firmware reports it off)";;
+            *) skip secureboot "Secure Boot state unreadable from $SBVAR";;
+        esac
+    else
+        skip secureboot "no mokutil and no readable $SBVAR; firmware reports EFI but not the Secure Boot state"
+    fi
 else
     fail secureboot "no /sys/firmware/efi: booted in legacy mode, not the signed UEFI chain"
 fi
@@ -183,6 +252,9 @@ fi
 # ── Lemonade, with and without the key ──────────────────────────────────────────────────────────
 if [ -z "$KEY" ]; then
     fail lemonade "no LEMONADE_API_KEY in /data/lemonade/lemond.conf: a network-facing server without a key"
+elif ! lemonade_ready; then
+    # Not the same row as a wrong key: nothing answered on the port at all within the wait.
+    fail lemonade "lemond did not answer $API within ${READY_WAIT}s (see /tmp/lemond.log)"
 else
     MODELS=$(got --header="Authorization: Bearer $KEY" "$API/api/v1/models")
     WITH=$(status --header="Authorization: Bearer $KEY" "$API/api/v1/models")
@@ -195,7 +267,16 @@ else
     : "$BODY"
 fi
 
-have_model() { printf '%s' "${MODELS:-}" | grep -q "\"$1\""; }
+# Lemonade registers the onebit entries under a "user." prefix: candidate 8's hardware boot logged
+# "lemond DID register user.Qwen3-0.6B-Q4_K_M-1bit". The manifest holds the bare catalogue id, so a
+# plain ""$1"" match found nothing and every entry counted as missing - which is how the row ended up
+# claiming the machine had no GPU. Match either form. -F, because ids contain dots that would otherwise
+# be regex wildcards.
+have_model() {
+    printf '%s' "${MODELS:-}" | grep -qF "\"$1\"" && return 0
+    printf '%s' "${MODELS:-}" | grep -qF "\"user.$1\"" && return 0
+    return 1
+}
 GGUF=$(ls /data/models/*.gguf 2>/dev/null | head -1)
 GGUF_NAME=$(basename "${GGUF:-none}" .gguf)
 
@@ -222,25 +303,66 @@ else
             MISSING="$MISSING $id"
         fi
     done < "$MAN"
-    if [ "$MODE" != "$(sed -n 's/^mode=//p' "$MAN" 2>/dev/null | head -1)" ] && [ "$HRX_GOT" = 0 ]; then
-        skip models "the machine has no AMD GPU or NPU ($HRX_WANT HRX + $NPU_WANT NPU entries are registered, Lemonade hides them here): checked in the registry by vmtest.sh"
-    elif [ "$HRX_GOT" = "$HRX_WANT" ] && [ "$NPU_GOT" = "$NPU_WANT" ]; then
-        pass models "$HRX_WANT onebit HRX entries and $NPU_WANT NPU entries listed"
+    # Decide from the HARDWARE, not from whether the count happened to be zero. On candidate 8's hardware
+    # boot this row said "the machine has no AMD GPU or NPU ... Lemonade hides them here" on a box with a
+    # Radeon 8060S: two bugs made that happen. First, $MODE is LIVE/INSTALLED while the manifest this build
+    # writes says "mode=live" / "mode=installed", so the mismatch test was always true - a case difference,
+    # invisible and permanent. Second, the skip was gated on HRX_GOT = 0, so any failure to match a single
+    # id was reported as "this machine has no GPU" instead of as a count. Now: a machine with a device never
+    # gets the no-hardware skip (it gets a PASS or a count), and the mode comparison is case-folded.
+    man_mode=$(sed -n 's/^mode=//p' "$MAN" 2>/dev/null | head -1 | tr '[:lower:]' '[:upper:]')
+    have_gpu=0
+    [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1 && have_gpu=1
+    have_npu=0
+    ls /dev/accel/accel* >/dev/null 2>&1 && have_npu=1
+    # "listed by Lemonade" means LISTED AND DOWNLOADED, not "known". On candidate 10's stick this row
+    # reported "0/22 HRX and 0/4 NPU listed" and looked like a build defect, while every id was in the
+    # catalogue the image ships: the stick simply carries one model, so Lemonade offered only that one.
+    # The question this row can actually answer on any machine is whether the manifest and the shipped
+    # catalogue agree; how many are downloaded is context, and chat-hrx is the row that proves serving.
+    CAT=/opt/lemonade/bin/resources/server_models.json
+    HRX_REG=0; NPU_REG=0; NOTCAT=
+    while read -r kind id; do
+        [ -n "${id:-}" ] || continue
+        if grep -qF "\"$id\"" "$CAT" 2>/dev/null; then
+            [ "$kind" = hrx ] && HRX_REG=$((HRX_REG + 1)) || NPU_REG=$((NPU_REG + 1))
+        else
+            NOTCAT="$NOTCAT $id"
+        fi
+    done < "$MAN"
+    SERVED="$HRX_GOT HRX + $NPU_GOT NPU downloaded"
+    if [ -n "$NOTCAT" ]; then
+        fail models "the manifest names ids the shipped catalogue ($CAT) does not contain:$NOTCAT"
+    elif [ "$HRX_REG" = "$HRX_WANT" ] && [ "$NPU_REG" = "$NPU_WANT" ]; then
+        pass models "$HRX_REG HRX and $NPU_REG NPU onebit entries are in the shipped catalogue ($SERVED here)"
+    elif [ "$have_gpu" = 0 ] && [ "$have_npu" = 0 ]; then
+        skip models "this machine has no AMD GPU or NPU, so Lemonade hides the onebit entries ($HRX_WANT HRX + $NPU_WANT NPU are registered in $MAN)"
+    elif [ "${man_mode:-}" != "$MODE" ] && [ "$HRX_REG" = 0 ]; then
+        skip models "a $MODE boot lists no onebit entries; the manifest records the ${man_mode:-<unknown>} set ($HRX_WANT HRX + $NPU_WANT NPU): checked in the registry by vmtest.sh"
     else
-        fail models "$HRX_GOT/$HRX_WANT HRX and $NPU_GOT/$NPU_WANT NPU entries listed; missing:$MISSING"
+        fail models "$HRX_REG/$HRX_WANT HRX and $NPU_REG/$NPU_WANT NPU entries found in the shipped catalogue; not in it:$NOTCAT"
     fi
 fi
-if [ -n "${MODELS:-}" ] && [ "$GGUF_NAME" != none ]; then
-    if have_model "$GGUF_NAME"; then pass gguf "the stick's own model '$GGUF_NAME' is listed"
-    else fail gguf "/data/models/$GGUF_NAME.gguf is on the data partition but Lemonade does not list it"; fi
-else
+# Three different situations used to share one message. On candidate 10's first hardware run the gguf row
+# said "no /data/models/*.gguf on the data partition" while `ls /data/models/*.gguf` plainly found the
+# file: the row never looked at the partition at all. It took this else branch because $MODELS was empty -
+# Lemonade's list had come back 401 with a stale key - so a missing model list was reported as a missing
+# file, and the person reading it went looking at the data partition instead of the key.
+if [ "$GGUF_NAME" = none ]; then
     skip gguf "no /data/models/*.gguf on the data partition"
+elif [ -z "${MODELS:-}" ]; then
+    skip gguf "'$GGUF_NAME.gguf' is on the data partition, but Lemonade listed no models, so it cannot be checked (see the lemonade row)"
+elif have_model "$GGUF_NAME"; then
+    pass gguf "the stick's own model '$GGUF_NAME' is listed"
+else
+    fail gguf "/data/models/$GGUF_NAME.gguf is on the data partition but Lemonade does not list it"
 fi
 
 # ── one chat per backend that this machine can actually run ─────────────────────────────────────
-chat() {   # chat <model id> -> sets ANSWER and TPS
+chat() {   # chat <model id> [slow] -> sets ANSWER and TPS
     ANSWER=; TPS=
-    R=$(got --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+    _get=got; [ "${2:-}" = slow ] && _get=got_slow
+    R=$($_get --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
         --post-data="{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0}" \
         "$API/api/v1/chat/completions")
     case "$R" in
@@ -260,21 +382,70 @@ if [ -n "$VMODEL" ]; then
 else
     skip chat "Lemonade lists no model this machine can run"
 fi
+# ── the HRX runtime itself, before any chat row that depends on it ─────────────────────────────
+# A chat-hrx failure is useless on its own: it says an entry did not answer, not whether the runtime
+# below it registered a device at all. Candidate 5 shipped an HRX runtime from before the pin that
+# carries HRX_ALLOW_NO_SVM, so it registered no HRX0 while every other row stayed green - the engine
+# sets HSA_USE_SVM=0 on a CWSR-on kernel and needs that gate to still see the device. This row asks
+# llama-server directly, which is the smallest question with a yes/no answer.
+# The same device test the gpu row uses: /dev/kfd alone is not enough. In the QEMU gate /dev/kfd is
+# present but /dev/dri/renderD* is not, so a guard on /dev/kfd alone runs this row on a machine with no
+# usable GPU, gets an honest "no device", and FAILS a candidate that is fine - a false FAIL in the row
+# written to prevent false results. Require both, exactly as `gpu` does.
+if [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1; then
+    LSRV=${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
+    if [ ! -x "$LSRV" ]; then
+        fail hrx-device "no llama-server at $LSRV"
+    else
+        # The runtime resolves libhsa through IREE_HAL_AMDGPU_LIBHSA_PATH (iree/.../util/libhsa.c) -
+        # that is the only libhsa knob in libggml-hrx/libhrx, and init.sh exports it from
+        # /etc/1bit/libhsa. Set the same variable here so this row tests the runtime the engine
+        # actually loads, not whatever the loader would find first. It accepts a directory or an exact
+        # library path; /etc/1bit/libhsa holds the exact path, which is passed through unchanged.
+        if [ -z "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && [ -r /etc/1bit/libhsa ]; then
+            HRXLIB=$(cat /etc/1bit/libhsa 2>/dev/null)
+            [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
+        fi
+        # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
+        # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
+        # on stderr and that text is the diagnostic.
+        LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
+        # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
+        # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
+        # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
+        HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
+        if [ -n "$HRXDEV" ]; then
+            pass hrx-device "$HRXDEV"
+        elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
+            fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+        else
+            fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+        fi
+    fi
+else
+    skip hrx-device "no /dev/kfd or no /dev/dri/renderD*: this machine has no AMD GPU, so no HRX device can register"
+fi
+
 HRX=$(pick '[^"]*-1bit')
 if [ -e /dev/kfd ] && [ -n "$HRX" ]; then
-    chat "$HRX"
+    # slow: the first HRX call compiles Loom kernels (see got_slow)
+    chat "$HRX" slow
     if [ -n "$TPS" ]; then pass chat-hrx "$HRX (onebit, HRX) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-hrx "$HRX (onebit, HRX) did not answer ($ANSWER)"; fi
+elif [ ! -e /dev/kfd ]; then
+    skip chat-hrx "no /dev/kfd: this machine has no AMD GPU, so no HRX entry can run"
 else
-    skip chat-hrx "no AMD GPU in this VM: the onebit HRX entries only run on the machine"
+    skip chat-hrx "no onebit HRX entry is listed by Lemonade, so there is nothing to ask"
 fi
 NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     chat "$NPU"
     if [ -n "$TPS" ]; then pass chat-npu "$NPU (onebit, NPU) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-npu "$NPU (onebit, NPU) did not answer ($ANSWER)"; fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
-    skip chat-npu "no NPU in this VM: the onebit NPU entries only run on the machine"
+    skip chat-npu "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

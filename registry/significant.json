@@ -3,7 +3,8 @@
  "classes": {
   "DeepseekV41ForCausalLM": {
    "model_type": "deepseek_v41",
-   "family": "DeepSeek V4.1"
+   "family": "DeepSeek V4.1 (engram embeddings + candidate-block sparse attention; the pinned deepseek4 path runs neither)",
+   "watch": "report"
   },
   "Qwen3Mamba3ForCausalLM": {
    "model_type": "qwen3_mamba3",

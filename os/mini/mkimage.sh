@@ -75,9 +75,10 @@ here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x
 # Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A
 # cleaned ~/.cache used to stop the weekly release at "SSH (Dropbear)" (2026-10-01 rehearsal).
-tool_debs="dropbear-bin libtomcrypt1 libtommath1 mtools systemd-boot-efi"
+tool_debs="dropbear-bin libtomcrypt1 libtommath1 mtools systemd-boot-efi qrencode libqrencode4"
 if [ ! -x "$tools/usr/sbin/dropbear" ] || [ ! -x "$tools/usr/bin/mtools" ] ||
-   [ ! -e "$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub" ]; then
+   [ ! -e "$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub" ] ||
+   [ ! -x "$tools/usr/bin/qrencode" ]; then
     echo "== unpacking $tool_debs into $tools"
     mkdir -p "$tools"
     (cd "$(dirname "$tools")" && apt-get download $tool_debs)
@@ -118,7 +119,17 @@ echo "== kernel modules ($kver)"
 # disk, and without these modules the live system cannot even see one (os/mini/install.sh). nls_cp437 and
 # nls_ascii are for mounting its ESP: the image mounts no vfat until the installer does, and this kernel's
 # CONFIG_NLS_DEFAULT is ascii ("codepage cp437 not found" / "IO charset ascii not found" in the VM).
-mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
+# usbhid + hid_generic + evdev: the console keyboard. The first hardware boots (candidates 5 and 8, 26 Oct)
+# had a running menu and shell but no USB keyboard driver in the initramfs (/dev/input held only "mice"),
+# so the owner could not type at all: the KVM and every USB keyboard are HID devices.
+# USB4 v2 / Thunderbolt docks and what they expose (owner, 26 Oct): the Type-C stack (typec, typec_ucsi,
+# ucsi_acpi, typec_displayport, roles) for the port itself, thunderbolt_net, and the USB NIC drivers a dock
+# carries (r8152, ax88179_178a, cdc_ether, cdc_ncm, usbnet). Wi-Fi: mt7925e pulls mt76/mac80211/cfg80211.
+# Every module the board binds on the build machine (os/mini/hwprobe.py, 26 Oct 2026): CPU temperature
+# (k10temp, what the fan logic and the checks read), SMBus and the DIMM sensors, the power controller,
+# the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), audio (HDA and the
+# KVM's USB audio), the SD reader, RAPL power readings. BusyBox init has no udev: init.sh loads them.
+mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118 typec_ucsi roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -132,6 +143,19 @@ lic=$(cd "$here/.." && pwd)/licenses          # self-contained: $licenses is def
 ecsrc=$lic/ec_su_axb35/src
 if [ "${EC_MODULE:-build}" = skip ]; then
     echo "   skipped (EC_MODULE=skip): this image will leave the fans on the firmware curve"
+elif [ "${EC_MODULE:-build}" != build ]; then
+    # EC_MODULE=<file>: stage a module that was already built (and signed) for this exact kernel instead of
+    # building one here - the builder may have no kernel object tree (the out-of-tree build needs
+    # /lib/modules/$kver/build) while the module it runs right now is the one the image should carry.
+    # The vermagic has to match the image kernel exactly, or the module would not load on the stick.
+    [ -f "$EC_MODULE" ] || { echo "   EC_MODULE=$EC_MODULE is not a file"; exit 1; }
+    ecmagic=$(modinfo -F vermagic "$EC_MODULE" 2>/dev/null | awk '{print $1}')
+    [ "$ecmagic" = "$kver" ] || { echo "   EC_MODULE vermagic '$ecmagic' is not the image kernel '$kver'"; exit 1; }
+    mkdir -p "$root/lib/modules/$kver/updates"
+    cp "$EC_MODULE" "$root/lib/modules/$kver/updates/ec_su_axb35.ko"
+    chmod 0644 "$root/lib/modules/$kver/updates/ec_su_axb35.ko"
+    ecsigner=$(modinfo -F signer "$EC_MODULE" 2>/dev/null)
+    echo "   ec_su_axb35.ko for $kver staged from $EC_MODULE: $(stat -c %s "$EC_MODULE") bytes, signer: ${ecsigner:-none (unsigned)}"
 elif [ ! -d "$ecsrc" ]; then
     echo "   os/licenses/ec_su_axb35/src is missing: the fans would stay on the firmware curve"; exit 1
 else
@@ -144,7 +168,8 @@ else
     if grep -q "^CONFIG_CC_IS_CLANG=y" /boot/config-"$kver" 2>/dev/null; then
         # LLVM=1 wants the whole LLVM toolchain (ld.lld, llvm-ar, llvm-nm, ...), so the matching
         # /usr/lib/llvm-<major>/bin goes on PATH - a bare `clang` is not enough
-        kv=$(sed -n 's/^CONFIG_CLANG_VERSION=\([0-9]*\)/\1/p' /boot/config-"$kver" | head -n 1)
+        # grep -m1 stops on its own; a `| head -n 1` here would kill the writer under pipefail
+        kv=$(grep -m1 '^CONFIG_CLANG_VERSION=' /boot/config-"$kver" 2>/dev/null | cut -d= -f2)
         major=$(( ${kv:-99} / 10000 ))
         for d in "/usr/lib/llvm-$major/bin" "$HOME/.cache/xdna-km/llvm$major/bin" /usr/lib/llvm-18/bin; do
             [ -x "$d/ld.lld" ] && [ -x "$d/clang" ] && { PATH="$d:$PATH"; export PATH; kmake="LLVM=1"; break; }
@@ -194,7 +219,10 @@ fi
 # the engine's NPU route resets the machine. Same vermagic, so it is a straight drop-in.
 xdna=${AMDXDNA_KO:-$HOME/wt/perfopt-7.3-obj/drivers/accel/amdxdna/amdxdna.ko}
 if [ -f "$xdna" ]; then
-    dst=$(find "$root/lib/modules" -name 'amdxdna.ko*' | head -1)
+    # not `find | head -1`: under set -o pipefail head closing the pipe kills find (141) and the
+    # assignment aborts the build; capture, then take the first line
+    dst=$(find "$root/lib/modules" -name 'amdxdna.ko*')
+    dst=${dst%%$'\n'*}
     if [ -n "$dst" ]; then
         rm -f "$dst"; mkdir -p "$(dirname "$dst")"; cp "$xdna" "$dst"
         echo "   amdxdna: private build installed over the stock module ($(stat -c %s "$dst") bytes)"
@@ -302,6 +330,19 @@ LD_LIBRARY_PATH=$lib ldd "$tools/usr/sbin/dropbear" | grep -o '/[^ ]*' | while r
     d=${l#"$tools"}; [ -e "$root$d" ] || { mkdir -p "$root$(dirname "$d")"; cp -L "$l" "$root$d"; }
 done
 
+# qrencode (os/mini/1bit-menu, "Open on your phone"): the console cannot be clicked, so the menu draws
+# the web app URL as a QR code. Taken from the same unpacked .debs as Dropbear (LGPL-2.1, source and
+# licence in os/licenses/qrencode), and its NEEDED entries are resolved the same way: ldd under the
+# unpacked tree, then the file at the same path in the image.
+echo "== QR code (qrencode, LGPL-2.1, from the Ubuntu packages unpacked in $tools)"
+qren=$tools/usr/bin/qrencode
+[ -x "$qren" ] || { echo "   $qren is missing from the unpacked tools"; exit 1; }
+cp "$qren" "$root/bin/qrencode"; chmod 0755 "$root/bin/qrencode"
+LD_LIBRARY_PATH=$tools/usr/lib/x86_64-linux-gnu ldd "$qren" | grep -o '/[^ ]*' | while read -r l; do
+    d=${l#"$tools"}; [ -e "$root$d" ] || { mkdir -p "$root$(dirname "$d")"; cp -L "$l" "$root$d"; }
+done
+echo "   /bin/qrencode $(stat -c %s "$root/bin/qrencode") bytes, $(LD_LIBRARY_PATH=$tools/usr/lib/x86_64-linux-gnu ldd "$qren" | grep -c '=>') libs resolved"
+
 echo "== init"
 if [ -n "${BOOT_STUB:-}" ]; then
     cp "$here/stub-init.sh" "$root/init"; chmod +x "$root/init"
@@ -311,6 +352,9 @@ else
 fi
 # one command that proves the engine answers from this boot (console or SSH)
 cp "$here/selftest.sh" "$root/bin/1bit-selftest"; chmod +x "$root/bin/1bit-selftest"
+# the console menu init.sh puts on tty1 (os/mini/1bit-menu): a plain shell script, because the image
+# carries no dialog, whiptail or ncurses, and terminfo is not guaranteed on a text console
+cp "$here/1bit-menu" "$root/bin/1bit-menu"; chmod +x "$root/bin/1bit-menu"
 # the installer (os/README.md): from a live boot onto one internal disk. It lays the target out with
 # the same sfdisk script this build uses for the stick, so an installed disk and a stick are the same
 # layout - so the image carries sfdisk (busybox fdisk is MBR-only and cannot make the GPT the stick has)
@@ -329,6 +373,81 @@ cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/
 install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
 mkdir -p "$root/etc/1bit"
 install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
+# The onebit entries this image ships, so 1bit-release-check can prove Lemonade registers them. The
+# catalogue Lemonade reads at runtime is server_models.json; the check needs the *shipped* subset on
+# paper, because on a machine without a GPU or NPU Lemonade hides those entries and their absence there
+# says nothing about the image. Format, one record per line, exactly as release-check.sh parses it:
+#     mode=<live|installed>
+#     hrx <model id>
+#     npu <model id>
+# release-check.sh used to read this file without anything ever writing it, so every hardware run
+# reported "models : /etc/1bit/onebit-models.txt is missing from the image" - a check that could never
+# pass. Derived from the catalog rather than a hand-kept list, so it cannot drift from what Lemonade
+# actually ships; a catalogue without onebit entries writes a manifest with none, which the check
+# reports as such instead of failing.
+cat=$root/opt/lemonade/bin/resources/server_models.json
+if [ -f "$cat" ]; then
+    python3 - "$cat" "$root/etc/1bit/onebit-models.txt" <<'ONEBIT_MODELS'
+import json, sys
+cat, out = sys.argv[1], sys.argv[2]
+try:
+    data = json.load(open(cat))
+except Exception as e:
+    sys.stderr.write("onebit-models: %s is not readable JSON (%s)\n" % (cat, e))
+    raise SystemExit(1)
+# The catalogue has been both a list of model dicts and a dict of {section: [model dicts]}; walk
+# whichever it is so a layout change does not silently produce an empty manifest.
+def models(node):
+    # The vendored catalogue is a dict KEYED BY MODEL ID ({"Qwen2.5-0.5B-Instruct-CPU": {...}}); earlier
+    # shapes were a list of dicts with an "id" field. Handle both, and take the key as the id when the
+    # record has none - the first version only looked for an "id" field, so it matched nothing in the
+    # keyed catalogue and wrote a manifest with zero entries, which made the models row pass vacuously.
+    if isinstance(node, list):
+        for x in node:
+            yield from models(x)
+    elif isinstance(node, dict):
+        if "id" in node and isinstance(node.get("id"), str):
+            yield node
+        else:
+            for k, v in node.items():
+                if isinstance(v, dict) and ("recipe" in v or "onebit_backend" in v):
+                    rec = dict(v)
+                    rec.setdefault("id", k)
+                    if isinstance(rec.get("id"), str):
+                        yield rec
+                else:
+                    yield from models(v)
+rows, seen = [], set()
+for m in models(data):
+    recipe = m.get("recipe")
+    # The NPU marker lives INSIDE recipe_options (recipe_options: {"onebit_backend": "npu"}), not at the
+    # record's top level - reading it from the top missed all four NPU entries and would have labelled
+    # them "hrx". Check both places so either shape works.
+    opts = m.get("recipe_options")
+    backend = m.get("onebit_backend")
+    if isinstance(opts, dict) and opts.get("onebit_backend"):
+        backend = opts.get("onebit_backend")
+    if recipe == "onebit":
+        kind = "npu" if backend == "npu" else "hrx"
+    elif backend == "npu":
+        kind = "npu"
+    else:
+        continue
+    if m["id"] in seen:
+        continue
+    seen.add(m["id"])
+    rows.append("%s %s" % (kind, m["id"]))
+rows.sort(key=lambda r: (r.split()[0] != "hrx", r))
+with open(out, "w") as f:
+    f.write("mode=live\n")
+    for r in rows:
+        f.write(r + "\n")
+sys.stderr.write("   onebit-models: %d hrx + %d npu\n"
+                 % (sum(r.startswith("hrx ") for r in rows), sum(r.startswith("npu ") for r in rows)))
+ONEBIT_MODELS
+else
+    echo "   warning: no $cat; /etc/1bit/onebit-models.txt is not written and the models row cannot pass"
+fi
 # The SMU limits (the 90 W sustained cap) are set through ryzenadj, which is LGPL-3.0: ship the tool and
 # its licence. A builder without it still works - the EC power mode alone applies and the image says so.
 echo "== SMU tool (ryzenadj v0.19.0, LGPL-3.0, source pinned in os/licenses/ryzenadj, userspace build)"
@@ -371,6 +490,8 @@ mkdir -p "$doc/ec_su_axb35" "$doc/ryzenadj"
 cp -a "$lic/ec_su_axb35/LICENSE" "$lic/ec_su_axb35/SOURCE" "$doc/ec_su_axb35/" 2>/dev/null || true
 if [ -d "$lic/ec_su_axb35/src" ]; then cp -a "$lic/ec_su_axb35/src" "$doc/ec_su_axb35/src"; fi
 cp -a "$lic/ryzenadj/LICENSE" "$lic/ryzenadj/SOURCE" "$doc/ryzenadj/" 2>/dev/null || true
+mkdir -p "$doc/qrencode"
+cp -a "$lic/qrencode/LICENSE" "$lic/qrencode/SOURCE" "$doc/qrencode/" 2>/dev/null || true
 if [ -d "$lic/ryzenadj/src" ]; then cp -a "$lic/ryzenadj/src" "$doc/ryzenadj/src"; fi
 cp -rL /usr/share/common-licenses "$root/usr/share/"
 # the Ubuntu package behind each file in the image, found at its path or its merged-/usr alias
@@ -390,7 +511,7 @@ while read -r p; do
 done < "$out/image-debs.txt"
 { xargs -r dpkg-query -W -f='${Package} ${Version} ${Architecture}\n' < "$out/image-debs.txt" 2>/dev/null || true; } | awk '$3 == "amd64" || $3 == "all" {print $1, $2}' > "$doc/packages.txt"
 # Dropbear and its libraries come from .debs unpacked into $tools, not installed
-for p in dropbear-bin libtomcrypt1 libtommath1; do
+for p in dropbear-bin libtomcrypt1 libtommath1 qrencode libqrencode4; do
     [ -e "$tools/usr/share/doc/$p/copyright" ] || continue
     mkdir -p "$root/usr/share/doc/$p"; cp -L "$tools/usr/share/doc/$p/copyright" "$root/usr/share/doc/$p/"
 done
@@ -476,7 +597,7 @@ if [ "$BOOT_LAYOUT" = grub ]; then
     cat > "$out/esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=12
 set default=0
-menuentry "1bit OS v2026.43 - LIVE (runs from RAM, nothing installed)" {
+menuentry "1bit OS, Lemonade Server appliance v2026.43 - LIVE (runs from RAM, nothing installed)" {
     linux /1bit/vmlinuz $cmdline
     initrd /1bit/initramfs.img
 }
@@ -612,14 +733,60 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     local srv=$1 libs=$2 f want path pkg_lib
     # the Lemonade package's own hrx libraries, already on the stick: preferred source for anything the
     # image does not carry (its license set covers those files, a build-machine path is not shippable)
-    pkg_lib=$(ls -d "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib 2>/dev/null | head -1)
+    # the same shape as the `ls glob | head -1` that ended the candidate 6 build with no message
+    # (#583): a loop takes the first match without giving `head` a producer to kill
+    pkg_lib=
+    for d in "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib; do
+        [ -d "$d" ] && { pkg_lib=$d; break; }
+    done
     mkdir -p "$out/data.dir/1bit-llama"
     cp -a "$srv" "$out/data.dir/1bit-llama/llama-server"
     # -a, not -L: the .so -> .so.0 -> .so.0.18.0 chain is how the loader finds the versioned file
     for f in "$libs"/lib*.so*; do if [ -e "$f" ]; then cp -a "$f" "$out/data.dir/1bit-llama/"; fi; done
+    # a symlink whose target is not in this directory (the build dir keeps some chains pointing at ../lib)
+    # dangles after -a and would be written THROUGH by the copies below, leaving the name a symlink
+    find "$out/data.dir/1bit-llama" -xtype l -delete 2>/dev/null || true
+    # The HRX runtime of THIS build - libhrx and libloomc from the pinned hrx-system that ggml-hrx built -
+    # before anything is resolved from the Lemonade package: those two are not in $libs (ggml-hrx builds
+    # them deeper in the tree), so the NEEDED loop below used to take Lemonade's bundle copies, an HRX
+    # release without the HRX_ALLOW_NO_SVM gate. On the board (candidates 6-10, 26 Oct) the engine then
+    # set HSA_USE_SVM=0 for the CWSR-on kernel and that runtime refused the GPU ("only systems with SVM
+    # are supported"), so no onebit HRX model could ever load, while --list-devices without that env passed.
+    local hrx_lib
+    for hrx_lib in libhrx.so libloomc.so; do
+        f=$(find "$build" -path '*ggml-hrx-deps-build*' -name "$hrx_lib.*" -type f 2>/dev/null)
+        f=${f%%$'\n'*}
+        if [ -n "$f" ]; then
+            # never through an existing entry: candidate 11's first package run wrote this copy through a
+            # dangling libhrx.so.0 symlink and the gate below then refused a correct build
+            rm -f "$out/data.dir/1bit-llama/${hrx_lib}.0"
+            cp -L "$f" "$out/data.dir/1bit-llama/${hrx_lib}.0"
+            echo "   + ${hrx_lib}.0 (this build's hrx-system: ${f#"$build/"}, $(stat -c %s "$out/data.dir/1bit-llama/${hrx_lib}.0") bytes)"
+        else
+            echo "   this build has no $hrx_lib under ggml-hrx-deps-build: refusing to ship Lemonade's copy in its place"; exit 1
+        fi
+    done
+    # no `strings | grep -q` here: under set -o pipefail, grep -q closing the pipe on the first match kills
+    # strings with SIGPIPE (a 2 MB file) and the pipeline reports failure for a file that HAS the string -
+    # candidate 11's two package runs refused a correct libhrx exactly so. grep -a reads the binary itself.
+    if ! grep -qa HRX_ALLOW_NO_SVM "$out/data.dir/1bit-llama/libhrx.so.0" 2>/dev/null; then
+        echo "   libhrx.so.0 has no HRX_ALLOW_NO_SVM gate: the engine's CWSR placement needs it (engine #315, pin #565)"
+        ls -l "$out/data.dir/1bit-llama/libhrx.so.0" 2>&1 | sed 's/^/   /'
+        file "$out/data.dir/1bit-llama/libhrx.so.0" 2>&1 | sed 's/^/   /'
+        exit 1
+    fi
     # What the loader resolves from outside the image goes on the stick too - TheRock's libomp.so is the
     # one that caught this out - and libraries the image already carries at their own path are left to it.
-    ldd "$srv" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' > "$out/1bit-llama-needs.txt"
+    # The backends are dlopened by ggml at run time, so their own NEEDED entries count as much as the
+    # program's: libggml-hrx needs libhsa-runtime64.so.1, and on the first hardware boot (candidate 5,
+    # 26 Oct) that one was nowhere beside it - the HRX backend never loaded, llama-server listed no HRX0,
+    # and the only way to make it load mixed Lemonade's bundle into the engine's process (symbol
+    # mismatch in libloomc). So every lib*.so in the directory is resolved too, and the HSA runtime's
+    # own ROCm sysdeps (its RUNPATH expects them beside it) come along flat, since relocate() makes every
+    # file look in $ORIGIN only.
+    { ldd "$srv" 2>/dev/null
+      for f in "$out/data.dir/1bit-llama"/lib*.so; do ldd "$f" 2>/dev/null; done
+    } | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' | sort -u > "$out/1bit-llama-needs.txt"
     while read -r want path; do
         if [ -e "$out/data.dir/1bit-llama/$want" ]; then continue; fi
         case "$path" in "$libs"/*) continue ;; esac
@@ -631,24 +798,88 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
             cp -L "$path" "$out/data.dir/1bit-llama/$want"
             echo "   + $want (from this build machine: $path)"
         fi
+        case "$want" in libhsa-runtime64.so*)
+            for d in "$(dirname "$path")/rocm_sysdeps/lib" "$pkg_lib/rocm_sysdeps/lib"; do
+                if [ -d "$d" ]; then
+                    for f in "$d"/lib*.so*; do
+                        [ -e "$f" ] && [ ! -e "$out/data.dir/1bit-llama/$(basename "$f")" ] && cp -a "$f" "$out/data.dir/1bit-llama/"
+                    done
+                    echo "   + ROCm sysdeps of $want (from $d)"
+                    break
+                fi
+            done ;;
+        esac
     done < "$out/1bit-llama-needs.txt"
     rm -f "$out/1bit-llama-needs.txt"
-    for f in "$out/data.dir/1bit-llama"/*; do relocate "$f"; done
-    # a build that cannot resolve its own llama-server is not worth shipping: say which library is missing
-    if ldd "$out/data.dir/1bit-llama/llama-server" 2>/dev/null | grep -q "not found"; then
-        echo "llama-server on the data partition still misses libraries:"
-        ldd "$out/data.dir/1bit-llama/llama-server" | grep "not found"
+    # The HSA runtime is not a NEEDED entry of anything: libggml-hrx dlopens it through
+    # IREE_HAL_AMDGPU_LIBHSA_PATH (which init.sh points at /etc/1bit/libhsa). So it is staged explicitly:
+    # the runtime this build was configured with (ONEBIT_HRX_LIBHSA in the CMake cache) when the build
+    # machine still has it, else the Lemonade package's copy already on the stick; its ROCm sysdeps come
+    # along flat (relocate() makes every file look in $ORIGIN only). The candidate 6 image stage died here
+    # with no message because an `ls | head` of a glob that matched nothing tripped set -e -o pipefail.
+    local hsa_src="" hsa_dir
+    # a `| head -n 1 || true` here hides a killed sed: the value comes back empty and the fallback
+    # below silently ships the Lemonade package's runtime instead of the configured one
+    hsa_src=$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$build/CMakeCache.txt" 2>/dev/null)
+    hsa_src=${hsa_src%%$'\n'*}
+    if [ -z "$hsa_src" ] || [ ! -e "$hsa_src" ]; then
+        hsa_src=""
+        if [ -n "$pkg_lib" ] && [ -e "$pkg_lib/libhsa-runtime64.so.1" ]; then hsa_src=$pkg_lib/libhsa-runtime64.so.1; fi
+    fi
+    if [ -n "$hsa_src" ]; then
+        cp -L "$hsa_src" "$out/data.dir/1bit-llama/libhsa-runtime64.so.1"
+        # only what the runtime resolves (its RPATH names the sysdeps and sibling directories): the ROCm
+        # sysdeps it names plus its own siblings such as librocprofiler-register, about 3 MB, not the
+        # whole sysdeps directory (33 files, 70 MB, including a video driver and ncurses)
+        local n=0
+        ldd "$hsa_src" 2>/dev/null | awk '$2 == "=>" && $3 ~ /^\// {print $1, $3}' > "$out/1bit-llama-hsa-needs.txt"
+        while read -r want path; do
+            if [ -e "$out/data.dir/1bit-llama/$want" ]; then continue; fi
+            if [ -e "$root$path" ]; then continue; fi
+            case "$path" in
+                */rocm_sysdeps/*|*/_rocm_sdk_core/*|"$(dirname "$hsa_src")"/*)
+                    cp -L "$path" "$out/data.dir/1bit-llama/$want"; n=$((n + 1)) ;;
+                *)  # a build-machine library outside the ROCm tree: the same rule as for llama-server above
+                    if [ -n "$pkg_lib" ] && [ -e "$pkg_lib/$want" ]; then cp -L "$pkg_lib/$want" "$out/data.dir/1bit-llama/$want"
+                    else cp -L "$path" "$out/data.dir/1bit-llama/$want"; fi
+                    n=$((n + 1)) ;;
+            esac
+        done < "$out/1bit-llama-hsa-needs.txt"
+        rm -f "$out/1bit-llama-hsa-needs.txt"
+        echo "   + libhsa-runtime64.so.1 (from $hsa_src) with $n libraries it resolves"
+    else
+        echo "no HSA runtime to ship: neither ONEBIT_HRX_LIBHSA of this build nor Lemonade's llamacpp-hrx package has libhsa-runtime64.so.1"
         exit 1
     fi
+    for f in "$out/data.dir/1bit-llama"/*; do relocate "$f"; done
+    # a build that cannot resolve its own llama-server or a backend is not worth shipping: say what is missing
+    # the same pipefail trap the other way round: `ldd | grep -q` can report success-of-ldd-killed-by-SIGPIPE
+    # as "nothing missing"; the ldd output is captured first and grep reads it from a variable
+    for f in "$out/data.dir/1bit-llama/llama-server" "$out/data.dir/1bit-llama"/lib*.so*; do
+        [ -L "$f" ] && continue
+        # ldd -r: data AND function relocations, so an UNRESOLVED SYMBOL fails here too. A shared library
+        # links fine with one (the Hyperloom harness on 26 Oct: a stale object kept an old mangled name,
+        # the .so exported the new one and carried the old as undefined, every binary died at dlopen).
+        lddout=$(ldd -r "$f" 2>&1 || true)
+        if printf '%s\n' "$lddout" | grep -ciE "not found|undefined symbol|symbol .* not defined" | grep -qv '^0$'; then
+            echo "$(basename "$f") on the data partition does not load (missing library or unresolved symbol):"
+            printf '%s\n' "$lddout" | grep -iE "not found|undefined symbol|symbol .* not defined" | head -n 10
+            exit 1
+        fi
+    done
 }
 if [ -x "$hrx/llama-server" ]; then
     llama_to_data "$hrx/llama-server" "$hrx"
     # TheRock's HSA runtime: the distro's rejects gfx1151's PM4-emulation probe (docs/hrx.md). Taken from
     # the Lemonade package that is already on the stick - the build machine's /opt/rocm-therock path does
     # not exist there - and left where that package keeps it, beside the sibling libraries it needs.
-    hsa_pkg=$(ls "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    # (globs, not `ls | head`: under set -e -o pipefail an unmatched glob piped through head exits 2 silently)
+    hsa_pkg=""
+    for f in "$out/data.dir"/1bit-llama/libhsa-runtime64.so.1 "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so.1; do
+        if [ -e "$f" ]; then hsa_pkg=$f; break; fi
+    done
     [ -n "$hsa_pkg" ] ||
-        { echo "no libhsa-runtime64 in Lemonade's llamacpp-hrx package on the data partition"; exit 1; }
+        { echo "no libhsa-runtime64 beside the engine's llama-server nor in Lemonade's llamacpp-hrx package"; exit 1; }
     echo "   HRX llama-server -> data partition /1bit-llama ($(du -sh "$out/data.dir/1bit-llama" | cut -f1), $(ls "$out/data.dir/1bit-llama" | wc -l) files)"
     echo "   HSA runtime (on the stick): ${hsa_pkg#"$out/data.dir"}"
 elif [ -n "${LLAMA_SERVER:-}" ]; then

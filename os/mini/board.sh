@@ -195,6 +195,11 @@ power() {
         if "$RJ" --stapm-limit=$(( STAPM_W * 1000 )) --slow-limit=$(( SLOW_W * 1000 )) \
                  --fast-limit=$(( FAST_W * 1000 )) --tctl-temp="$TCTL_C" >/dev/null 2>&1; then
             notes="$notes cap=${STAPM_W}/${SLOW_W}/${FAST_W}W tctl=$TCTL_C"; cap_ok=1
+            # what power_status reports: the write is the fact, `ryzenadj --info` is not a test of it
+            # (on the image's kernel, STRICT_DEVMEM lets ryzenadj write the SMU limits and refuses the
+            # pm-table read that --info needs, so --info fails after a successful cap - measured on the
+            # candidate 8 stick with Secure Boot on)
+            printf '%s/%s/%s\n' "$STAPM_W" "$SLOW_W" "$FAST_W" > /run/1bit-smu-cap 2>/dev/null || true
         else
             notes="$notes cap=failed($RJ)"
         fi
@@ -227,11 +232,15 @@ power() {
 
 power_status() {
     mode=$(cat "$EC/apu/power_mode" 2>/dev/null || echo none)
-    if RJ=$(ryzenadj_bin) && info=$("$RJ" --info 2>/dev/null); then
+    if [ -s /run/1bit-smu-cap ]; then
+        say "power: $mode mode, SMU cap $(cat /run/1bit-smu-cap) W (sustained/slow/fast) applied this boot"
+    elif RJ=$(ryzenadj_bin) && info=$("$RJ" --info 2>/dev/null); then
         lim=$(printf '%s\n' "$info" | sed -n 's/^STAPM LIMIT *| *\([0-9.]*\)\..*/\1/p' | head -n 1)
-        say "power: $mode mode, SMU cap ${lim:-?} W sustained"
+        say "power: $mode mode, SMU cap ${lim:-?} W sustained (read back)"
+    elif RJ=$(ryzenadj_bin); then
+        say "power: $mode mode, EC profile only: $RJ is present but the SMU cap was not applied this boot (see the [power] apply line)"
     else
-        say "power: $mode mode, EC profile only (no SMU cap: ryzenadj absent or /dev/mem not writable)"
+        say "power: $mode mode, EC profile only: no ryzenadj in this image"
     fi
 }
 

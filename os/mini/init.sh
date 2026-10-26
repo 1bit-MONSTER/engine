@@ -32,7 +32,7 @@ echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"
 # bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
 # PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
 # comes up with no network at all, which looks exactly like a hang.
-for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt; do modprobe -q "$m"; done
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118 thunderbolt_net roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
 # network: DHCP on every wired interface
@@ -87,8 +87,19 @@ if [ -d /data/1bit-llama ]; then
     ln -sfn /data/1bit-llama /opt/1bit-llama
     # same on /data, from the Lemonade package that is already there (the build machine's
     # /opt/rocm-therock path does not exist on a stick)
-    hsa=$(ls /data/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
+    # the engine's own copy first (shipped beside llama-server since candidate 6, with its ROCm sysdeps);
+    # Lemonade's bundle only as a fallback for older data partitions
+    hsa=$(ls /data/1bit-llama/libhsa-runtime64.so* 2>/dev/null | head -1)
+    [ -n "$hsa" ] || hsa=$(ls /data/lemonade/cache/bin/llamacpp-hrx/*/lib/libhsa-runtime64.so* 2>/dev/null | head -1)
     [ -n "$hsa" ] && echo "$hsa" > /etc/1bit/libhsa
+    # Lemonade's HRX recipe starts the engine through scripts/lemonade-hrx, whose default llama-server is
+    # "beside the script" (hrx/llama/bin/llama-server) - a path that does not exist in this layout, so on
+    # candidate 5 lemond logged "Failed to execute: hrx/llama/bin/llama-server". Name the shipped one.
+    # both names: scripts/lemonade-hrx reads ONEBIT_HRX_LLAMA_SERVER, `1bit serve` itself reads
+    # ONEBIT_LLAMA_SERVER (candidate 8 on the box: lemond spawns `1bit serve` directly, and its env
+    # carried only the first name, so the exec still failed)
+    export ONEBIT_HRX_LLAMA_SERVER=/opt/1bit-llama/llama-server
+    export ONEBIT_LLAMA_SERVER=/opt/1bit-llama/llama-server
     say "[engine] llama-server from /data/1bit-llama, HSA runtime ${hsa:-not found}"
 else
     say "[engine] no /data/1bit-llama: '1bit serve' has no HRX llama-server on this boot"
@@ -105,35 +116,39 @@ fi
 n=0
 step() { n=$((n+1)); say "[$n] $*"; }
 
-# The screen gets a real interactive login on tty1, never a shell on /dev/console: /dev/console stops
-# being what is painted once fbcon takes the DRM framebuffer, and a non-interactive shell has no
-# prompt - so the machine sat there looking dead while it was serving. tty1 is the VT we are on.
+# The screen gets the menu on tty1, never a shell on /dev/console: /dev/console stops being what is
+# painted once fbcon takes the DRM framebuffer, and a non-interactive shell has no prompt - so the
+# machine sat there looking dead while it was serving. tty1 is the VT we are on.
+#
+# tty1 ONLY: ttyS0 (the serial line a QEMU gate drives) and ssh keep the plain shell that this file
+# and /etc/profile set up, so nothing a gate matches on changes. 1bit-menu draws the banner facts
+# itself and starts nothing: lemond is already up.
+#
+# This runs in the foreground, not as `prog &`: POSIX has an asynchronous list ignore SIGINT and
+# SIGQUIT, and a child inherits that, so a menu started with & could not be interrupted - and neither
+# could the lemonade chat or the shell it runs. init has nothing left to do once the appliance is up,
+# and the loops below never return. The menu restores the terminal on every way out (EXIT, INT, TERM,
+# HUP); `stty sane` here covers the one case it cannot: a menu killed hard enough to leave raw mode
+# behind. Any exit other than 0 (q means "give me the plain shell") starts the menu again, so a crash
+# never swallows the console; boot choice 3 asks for a root shell and gets no menu.
 screen_login() {
     [ -c /dev/tty1 ] || return 0
-    ip=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
-    [ -n "$ip" ] || ip="<this address>"
     chvt 1 2>/dev/null || true
-    {
-      echo
-      if [ "$INSTALLED" = 1 ]; then
-        echo "  1bit OS  v2026.43  -  INSTALLED on this machine. /data is on its disk; the engine and Lemonade start from here."
-      else
-        echo "  1bit OS  v2026.43  -  LIVE. You are root, on RAM: nothing is installed and no disk is touched."
-      fi
-      echo "  ----------------------------------------------------------------------------------------"
-      echo "   1bit-selftest                 prove the engine and the NPU (writes /data/selftest.log)"
-      echo "   lemonade list                 the models;  lemonade chat Qwen3-0.6B-1bit"
-      echo "   cat /data/boot.log            what this boot did"
-      echo "   ssh root@<this address>       also works, with the key in /data/ssh/authorized_keys"
-      echo
-      echo "  Lemonade is on the network:  http://${ip}:13305   (Lemonade Mobile finds it via the UDP beacon)"
-      echo "  its API key:                 grep LEMONADE_API_KEY /data/lemonade/lemond.conf"
-      echo
-    } > /dev/tty1 2>/dev/null
+    menu=1
+    [ "${1:-}" = shell ] && menu=0
+    while [ "$menu" = 1 ] && [ -x /bin/1bit-menu ]; do
+        stty sane < /dev/tty1 2>/dev/null
+        setsid -c /bin/1bit-menu < /dev/tty1 > /dev/tty1 2>&1 && break
+        sleep 1
+    done
+    printf '\n  1bit OS shell. 1bit-menu returns to the menu; 1bit-selftest proves the engine.\n\n' > /dev/tty1 2>/dev/null
     # cttyhack is what a classic initramfs uses, but here it exits at once (it cannot claim a tty that
     # setsid has already detached from) - measured on the box. setsid -c makes tty1 the controlling
     # terminal instead, which is what gives a prompt AND job control; the loop puts it back if you exit.
-    ( while :; do setsid -c /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done ) &
+    # the plain shell keeps the prompt #582 gave the console (#582 is why the console is readable at
+    # all: kernel messages stopped, and the prompt says 1bit-os:<dir>); the menu's Shell entry sets the
+    # same PS1 for the shell it starts
+    while :; do setsid -c env PS1='1bit-os:\w # ' /bin/sh -i < /dev/tty1 > /dev/tty1 2>&1; sleep 2; done
 }
 
 # Everything init prints goes to the visible VT as well as /dev/console: once fbcon takes the DRM
@@ -152,7 +167,8 @@ MODE=live
 if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
-      echo "  1bit OS  v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  1bit OS, Lemonade Server appliance   v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  Lemonade Server by AMD, running on the 1bit engine"
       echo "  ------------------------------------------------------------------------------"
       echo "   1) Lemonade appliance            (default, starts in 12s)"
       echo "   2) Lemonade, verbose, no GPU driver"
@@ -177,7 +193,7 @@ if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
 fi
 case "$MODE" in
     off)  say "powering off (choice 4)"; sync; poweroff -f ;;
-    shell) say "root shell - the appliance will not start (choice 3)"; screen_login; while :; do sleep 3600; done ;;
+    shell) say "root shell - the appliance will not start (choice 3)"; screen_login shell; while :; do sleep 3600; done ;;
     nogpu) say "verbose mode: GPU/NPU drivers are skipped (choice 2)" ;;
 esac
 
@@ -224,6 +240,9 @@ fi
 # also linked into /usr/bin for `ssh root@<IP> lemonade ...` (no profile is read for a command)
 { echo "export PATH=$PATH HOME=/root GGML_HRX_JIT_CACHE_DIR=$GGML_HRX_JIT_CACHE_DIR"
   [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && echo "export IREE_HAL_AMDGPU_LIBHSA_PATH=$IREE_HAL_AMDGPU_LIBHSA_PATH"
+  [ -n "${ONEBIT_HRX_LLAMA_SERVER:-}" ] && echo "export ONEBIT_HRX_LLAMA_SERVER=$ONEBIT_HRX_LLAMA_SERVER"
+  [ -n "${ONEBIT_LLAMA_SERVER:-}" ] && echo "export ONEBIT_LLAMA_SERVER=$ONEBIT_LLAMA_SERVER"
+  echo "export PS1='1bit-os:\\w # '"
 } > /etc/profile
 for b in lemonade lemond; do [ -x "/opt/lemonade/bin/$b" ] && ln -sf "/opt/lemonade/bin/$b" "/usr/bin/$b"; done
 
@@ -317,7 +336,8 @@ if [ -n "$TJ" ]; then
     say "temps: Tctl $(( $(cat "$TJ/temp1_input" 2>/dev/null || echo 0) / 1000 ))C  EC $(cat /sys/class/ec_su_axb35/temp1/temp 2>/dev/null || echo n/a)C"
 fi
 echo "IP:  $(ip -4 -o addr show scope global | awk '{print $2, $4}' | tr '\n' ' ')"
-echo; echo "Lemonade's web app and API: http://$lhost:$lport   (from another machine: ssh -L $lport:localhost:$lport root@<IP>)"
+ipaddr=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+echo; echo "Web app (chat in a browser): http://${ipaddr:-<this address>}:$lport/     API (OpenAI-compatible): http://${ipaddr:-<this address>}:$lport/api/v1"
 echo "Prove the engine answers from this boot:  1bit-selftest   (console or SSH; logs to /data/selftest.log)"
 echo "The engine alone, for debugging:  1bit serve -m /data/models/<file.gguf>   (auto: HRX0, on 127.0.0.1:8000)"; echo
 
@@ -362,9 +382,18 @@ if grep -q "1bit.check" /proc/cmdline; then
 fi
 
 # a shell on the console and the serial port
-[ -e /dev/ttyS0 ] && setsid sh -c 'exec sh </dev/ttyS0 >/dev/ttyS0 2>&1' &
+[ -e /dev/ttyS0 ] && setsid sh -c 'PS1="1bit-os:\\w # " exec sh </dev/ttyS0 >/dev/ttyS0 2>&1' &
 # PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
 # what happened on real hardware - the script finished, the final exec returned, and the machine
 # rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
+# Kernel messages stay in dmesg from here on, not over the console shell. The cmdline boots with
+# ignore_loglevel so every boot line is on the console and the serial log; the first hardware boot
+# (26 Oct) then kept printing USB connect/disconnect lines over the shell and the owner could not
+# use the prompt at all. Both knobs are runtime-writable; emergencies (level 0) still reach the console.
+# They matter for the menu too: a boot line painted over the frame is a mess the menu cannot clean up
+# (it only redraws on a keypress or, on Status, once a second).
+echo N > /sys/module/printk/parameters/ignore_loglevel 2>/dev/null
+echo "1 4 1 7" > /proc/sys/kernel/printk 2>/dev/null
+# with a tty1 this never returns (screen_login loops); the while keeps PID 1 alive if there is none
 screen_login
 while :; do sleep 3600; done

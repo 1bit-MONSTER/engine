@@ -93,12 +93,19 @@ curl -sf -m 600 localhost:13305/api/v1/chat/completions -H "Content-Type: applic
     python3 -c "import json,sys; print(\"reply:\", json.load(sys.stdin)[\"choices\"][0][\"message\"][\"content\"].strip())"
 
 step "what lemond started"
-pid=$(pgrep -x llama-server | head -1)
+# several llama-servers can be up (Lemonade plus a backend): take the first pid. Not `| head -1`,
+# which under pipefail would kill pgrep and abort the container script. (This block is a single-quoted
+# string, so no apostrophes and no $'...' in here: sed -n 1p reads to the end, head does not.)
+pid=$(pgrep -x llama-server | sed -n 1p)
 tr "\0" " " </proc/$pid/cmdline; echo
 runuser -u lemonade -- cat /proc/$pid/environ | tr "\0" "\n" | grep -E "^(GGML_HRX|HSA_|HRX_|IREE_)" | sort
 grep -E "1bit serve|HRX|hrx" /tmp/lemond.log | tail -n 20
 fail=0
-runuser -u lemonade -- cat /proc/$pid/environ | tr "\0" "\n" | grep -qx GGML_HRX_STRICT=1 || { echo "FAIL: no GGML_HRX_STRICT=1"; fail=1; }
+# NOT `... | grep -qx`: grep leaving on the match kills tr (141) and pipefail then turns a variable
+# that IS set into "FAIL: no GGML_HRX_STRICT=1". Capture the environment, then match it in the shell
+# (a here-string is a temp file, so there is no pipe left for grep to kill).
+env2=$(runuser -u lemonade -- cat /proc/$pid/environ | tr "\0" "\n")
+grep -qx GGML_HRX_STRICT=1 <<<"$env2" || { echo "FAIL: no GGML_HRX_STRICT=1"; fail=1; }
 # hrx.hrx_bin set to a path skips Lemonade'"'"'s install of its own HRX build (cache/bin/llamacpp-hrx)
 [ ! -e /var/lib/lemonade/.cache/lemonade/bin/llamacpp-hrx ] || { echo "FAIL: lemond installed its own HRX build"; fail=1; }
 [ "$GPU" != --gpu ] || grep -q "HRX0" /tmp/lemond.log || { echo "FAIL: no HRX0 in the backend log"; fail=1; }

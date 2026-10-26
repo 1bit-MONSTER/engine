@@ -324,6 +324,9 @@ else
 fi
 # one command that proves the engine answers from this boot (console or SSH)
 cp "$here/selftest.sh" "$root/bin/1bit-selftest"; chmod +x "$root/bin/1bit-selftest"
+# the console menu init.sh puts on tty1 (os/mini/1bit-menu): a plain shell script, because the image
+# carries no dialog, whiptail or ncurses, and terminfo is not guaranteed on a text console
+cp "$here/1bit-menu" "$root/bin/1bit-menu"; chmod +x "$root/bin/1bit-menu"
 # the installer (os/README.md): from a live boot onto one internal disk. It lays the target out with
 # the same sfdisk script this build uses for the stick, so an installed disk and a stick are the same
 # layout - so the image carries sfdisk (busybox fdisk is MBR-only and cannot make the GPT the stick has)

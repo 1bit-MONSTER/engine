@@ -162,7 +162,21 @@ if command -v mokutil >/dev/null 2>&1; then
         *) skip secureboot "mokutil answered: $SB";;
     esac
 elif [ -e /sys/firmware/efi ]; then
-    skip secureboot "no mokutil in the image; firmware reports EFI but not the Secure Boot state"
+    # mokutil is not shipped, but the firmware's own variable says it plainly: SecureBoot-<vendor guid>,
+    # 5 bytes - attributes(4) then the value. Reading it needs no new binary, and the previous wording
+    # ("no mokutil in the image") reported a SKIP on a machine that had Secure Boot ON and had just
+    # booted our MOK-signed kernel, which is the pass the owner actually cares about.
+    SBVAR=/sys/firmware/efi/efivars/SecureBoot-8be4df61-93ca-11d2-aa0d-00e098032b8c
+    if [ -r "$SBVAR" ]; then
+        sbv=$(od -An -tu1 -j4 -N1 "$SBVAR" 2>/dev/null | tr -d ' \n')
+        case "${sbv:-}" in
+            1) pass secureboot "Secure Boot enabled; the MOK-signed kernel booted";;
+            0) pass secureboot "Secure Boot disabled (the firmware reports it off)";;
+            *) skip secureboot "Secure Boot state unreadable from $SBVAR";;
+        esac
+    else
+        skip secureboot "no mokutil and no readable $SBVAR; firmware reports EFI but not the Secure Boot state"
+    fi
 else
     fail secureboot "no /sys/firmware/efi: booted in legacy mode, not the signed UEFI chain"
 fi
@@ -295,16 +309,20 @@ if [ -e /dev/kfd ] && [ -n "$HRX" ]; then
     chat "$HRX"
     if [ -n "$TPS" ]; then pass chat-hrx "$HRX (onebit, HRX) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-hrx "$HRX (onebit, HRX) did not answer ($ANSWER)"; fi
+elif [ ! -e /dev/kfd ]; then
+    skip chat-hrx "no /dev/kfd: this machine has no AMD GPU, so no HRX entry can run"
 else
-    skip chat-hrx "no AMD GPU in this VM: the onebit HRX entries only run on the machine"
+    skip chat-hrx "no onebit HRX entry is listed by Lemonade, so there is nothing to ask"
 fi
 NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     chat "$NPU"
     if [ -n "$TPS" ]; then pass chat-npu "$NPU (onebit, NPU) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-npu "$NPU (onebit, NPU) did not answer ($ANSWER)"; fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
-    skip chat-npu "no NPU in this VM: the onebit NPU entries only run on the machine"
+    skip chat-npu "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

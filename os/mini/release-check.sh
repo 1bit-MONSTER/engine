@@ -239,7 +239,16 @@ else
     : "$BODY"
 fi
 
-have_model() { printf '%s' "${MODELS:-}" | grep -q "\"$1\""; }
+# Lemonade registers the onebit entries under a "user." prefix: candidate 8's hardware boot logged
+# "lemond DID register user.Qwen3-0.6B-Q4_K_M-1bit". The manifest holds the bare catalogue id, so a
+# plain ""$1"" match found nothing and every entry counted as missing - which is how the row ended up
+# claiming the machine had no GPU. Match either form. -F, because ids contain dots that would otherwise
+# be regex wildcards.
+have_model() {
+    printf '%s' "${MODELS:-}" | grep -qF "\"$1\"" && return 0
+    printf '%s' "${MODELS:-}" | grep -qF "\"user.$1\"" && return 0
+    return 1
+}
 GGUF=$(ls /data/models/*.gguf 2>/dev/null | head -1)
 GGUF_NAME=$(basename "${GGUF:-none}" .gguf)
 
@@ -266,10 +275,24 @@ else
             MISSING="$MISSING $id"
         fi
     done < "$MAN"
-    if [ "$MODE" != "$(sed -n 's/^mode=//p' "$MAN" 2>/dev/null | head -1)" ] && [ "$HRX_GOT" = 0 ]; then
-        skip models "the machine has no AMD GPU or NPU ($HRX_WANT HRX + $NPU_WANT NPU entries are registered, Lemonade hides them here): checked in the registry by vmtest.sh"
-    elif [ "$HRX_GOT" = "$HRX_WANT" ] && [ "$NPU_GOT" = "$NPU_WANT" ]; then
+    # Decide from the HARDWARE, not from whether the count happened to be zero. On candidate 8's hardware
+    # boot this row said "the machine has no AMD GPU or NPU ... Lemonade hides them here" on a box with a
+    # Radeon 8060S: two bugs made that happen. First, $MODE is LIVE/INSTALLED while the manifest this build
+    # writes says "mode=live" / "mode=installed", so the mismatch test was always true - a case difference,
+    # invisible and permanent. Second, the skip was gated on HRX_GOT = 0, so any failure to match a single
+    # id was reported as "this machine has no GPU" instead of as a count. Now: a machine with a device never
+    # gets the no-hardware skip (it gets a PASS or a count), and the mode comparison is case-folded.
+    man_mode=$(sed -n 's/^mode=//p' "$MAN" 2>/dev/null | head -1 | tr '[:lower:]' '[:upper:]')
+    have_gpu=0
+    [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1 && have_gpu=1
+    have_npu=0
+    ls /dev/accel/accel* >/dev/null 2>&1 && have_npu=1
+    if [ "$HRX_GOT" = "$HRX_WANT" ] && [ "$NPU_GOT" = "$NPU_WANT" ]; then
         pass models "$HRX_WANT onebit HRX entries and $NPU_WANT NPU entries listed"
+    elif [ "$have_gpu" = 0 ] && [ "$have_npu" = 0 ]; then
+        skip models "this machine has no AMD GPU or NPU, so Lemonade hides the onebit entries ($HRX_WANT HRX + $NPU_WANT NPU are registered in $MAN)"
+    elif [ "${man_mode:-}" != "$MODE" ] && [ "$HRX_GOT" = 0 ]; then
+        skip models "a $MODE boot lists no onebit entries; the manifest records the ${man_mode:-<unknown>} set ($HRX_WANT HRX + $NPU_WANT NPU): checked in the registry by vmtest.sh"
     else
         fail models "$HRX_GOT/$HRX_WANT HRX and $NPU_GOT/$NPU_WANT NPU entries listed; missing:$MISSING"
     fi

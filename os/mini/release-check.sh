@@ -310,7 +310,11 @@ fi
 # carries HRX_ALLOW_NO_SVM, so it registered no HRX0 while every other row stayed green - the engine
 # sets HSA_USE_SVM=0 on a CWSR-on kernel and needs that gate to still see the device. This row asks
 # llama-server directly, which is the smallest question with a yes/no answer.
-if [ -e /dev/kfd ]; then
+# The same device test the gpu row uses: /dev/kfd alone is not enough. In the QEMU gate /dev/kfd is
+# present but /dev/dri/renderD* is not, so a guard on /dev/kfd alone runs this row on a machine with no
+# usable GPU, gets an honest "no device", and FAILS a candidate that is fine - a false FAIL in the row
+# written to prevent false results. Require both, exactly as `gpu` does.
+if [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1; then
     LSRV=${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
     if [ ! -x "$LSRV" ]; then
         fail hrx-device "no llama-server at $LSRV"
@@ -341,7 +345,7 @@ if [ -e /dev/kfd ]; then
         fi
     fi
 else
-    skip hrx-device "no /dev/kfd: this machine has no AMD GPU, so no HRX device can register"
+    skip hrx-device "no /dev/kfd or no /dev/dri/renderD*: this machine has no AMD GPU, so no HRX device can register"
 fi
 
 HRX=$(pick '[^"]*-1bit')

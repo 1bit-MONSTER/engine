@@ -118,7 +118,10 @@ echo "== kernel modules ($kver)"
 # disk, and without these modules the live system cannot even see one (os/mini/install.sh). nls_cp437 and
 # nls_ascii are for mounting its ESP: the image mounts no vfat until the installer does, and this kernel's
 # CONFIG_NLS_DEFAULT is ascii ("codepage cp437 not found" / "IO charset ascii not found" in the VM).
-mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport"
+# usbhid + hid_generic + evdev: the console keyboard. The first hardware boots (candidates 5 and 8, 26 Oct)
+# had a running menu and shell but no USB keyboard driver in the initramfs (/dev/input held only "mice"),
+# so the owner could not type at all: the KVM and every USB keyboard are HID devices.
+mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done

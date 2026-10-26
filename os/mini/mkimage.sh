@@ -168,7 +168,8 @@ else
     if grep -q "^CONFIG_CC_IS_CLANG=y" /boot/config-"$kver" 2>/dev/null; then
         # LLVM=1 wants the whole LLVM toolchain (ld.lld, llvm-ar, llvm-nm, ...), so the matching
         # /usr/lib/llvm-<major>/bin goes on PATH - a bare `clang` is not enough
-        kv=$(sed -n 's/^CONFIG_CLANG_VERSION=\([0-9]*\)/\1/p' /boot/config-"$kver" | head -n 1)
+        # grep -m1 stops on its own; a `| head -n 1` here would kill the writer under pipefail
+        kv=$(grep -m1 '^CONFIG_CLANG_VERSION=' /boot/config-"$kver" 2>/dev/null | cut -d= -f2)
         major=$(( ${kv:-99} / 10000 ))
         for d in "/usr/lib/llvm-$major/bin" "$HOME/.cache/xdna-km/llvm$major/bin" /usr/lib/llvm-18/bin; do
             [ -x "$d/ld.lld" ] && [ -x "$d/clang" ] && { PATH="$d:$PATH"; export PATH; kmake="LLVM=1"; break; }
@@ -218,7 +219,10 @@ fi
 # the engine's NPU route resets the machine. Same vermagic, so it is a straight drop-in.
 xdna=${AMDXDNA_KO:-$HOME/wt/perfopt-7.3-obj/drivers/accel/amdxdna/amdxdna.ko}
 if [ -f "$xdna" ]; then
-    dst=$(find "$root/lib/modules" -name 'amdxdna.ko*' | head -1)
+    # not `find | head -1`: under set -o pipefail head closing the pipe kills find (141) and the
+    # assignment aborts the build; capture, then take the first line
+    dst=$(find "$root/lib/modules" -name 'amdxdna.ko*')
+    dst=${dst%%$'\n'*}
     if [ -n "$dst" ]; then
         rm -f "$dst"; mkdir -p "$(dirname "$dst")"; cp "$xdna" "$dst"
         echo "   amdxdna: private build installed over the stock module ($(stat -c %s "$dst") bytes)"
@@ -729,7 +733,12 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     local srv=$1 libs=$2 f want path pkg_lib
     # the Lemonade package's own hrx libraries, already on the stick: preferred source for anything the
     # image does not carry (its license set covers those files, a build-machine path is not shippable)
-    pkg_lib=$(ls -d "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib 2>/dev/null | head -1)
+    # the same shape as the `ls glob | head -1` that ended the candidate 6 build with no message
+    # (#583): a loop takes the first match without giving `head` a producer to kill
+    pkg_lib=
+    for d in "$out/data.dir"/lemonade/cache/bin/llamacpp-hrx/*/lib; do
+        [ -d "$d" ] && { pkg_lib=$d; break; }
+    done
     mkdir -p "$out/data.dir/1bit-llama"
     cp -a "$srv" "$out/data.dir/1bit-llama/llama-server"
     # -a, not -L: the .so -> .so.0 -> .so.0.18.0 chain is how the loader finds the versioned file
@@ -745,7 +754,8 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     # are supported"), so no onebit HRX model could ever load, while --list-devices without that env passed.
     local hrx_lib
     for hrx_lib in libhrx.so libloomc.so; do
-        f=$(find "$build" -path '*ggml-hrx-deps-build*' -name "$hrx_lib.*" -type f 2>/dev/null | head -n 1)
+        f=$(find "$build" -path '*ggml-hrx-deps-build*' -name "$hrx_lib.*" -type f 2>/dev/null)
+        f=${f%%$'\n'*}
         if [ -n "$f" ]; then
             # never through an existing entry: candidate 11's first package run wrote this copy through a
             # dangling libhrx.so.0 symlink and the gate below then refused a correct build
@@ -808,7 +818,10 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     # along flat (relocate() makes every file look in $ORIGIN only). The candidate 6 image stage died here
     # with no message because an `ls | head` of a glob that matched nothing tripped set -e -o pipefail.
     local hsa_src="" hsa_dir
-    hsa_src=$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$build/CMakeCache.txt" 2>/dev/null | head -n 1 || true)
+    # a `| head -n 1 || true` here hides a killed sed: the value comes back empty and the fallback
+    # below silently ships the Lemonade package's runtime instead of the configured one
+    hsa_src=$(sed -n 's/^ONEBIT_HRX_LIBHSA:FILEPATH=//p' "$build/CMakeCache.txt" 2>/dev/null)
+    hsa_src=${hsa_src%%$'\n'*}
     if [ -z "$hsa_src" ] || [ ! -e "$hsa_src" ]; then
         hsa_src=""
         if [ -n "$pkg_lib" ] && [ -e "$pkg_lib/libhsa-runtime64.so.1" ]; then hsa_src=$pkg_lib/libhsa-runtime64.so.1; fi

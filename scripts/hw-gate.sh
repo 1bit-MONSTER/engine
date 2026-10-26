@@ -66,6 +66,13 @@
 # Vulkan service). Exit 0 = pass, 1 = a check failed, 2 = the box could not run the gate.
 set -uo pipefail
 
+# -h/--help is answered before anything else, in particular before the GPU queue below: printing the
+# usage takes no hardware and must not claim the fleet's GPU token (measured: `hw-gate --help` queued on
+# ~/GPU-TOKEN and held it for a moment while another pass was running).
+case " $* " in
+  *" -h "*|*" --help "*) sed -n '16,66p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
 # Fair GPU queue (the protocol is written down in ~/amd-oss/GPU-TOKEN.md on the box): when the gpu-hold helper
 # is installed, the whole gate runs inside one claim on ~/GPU-TOKEN instead of racing for it with a noclobber
 # open. Claims are served in arrival order, a killed run cannot leave the token behind, the die temperature
@@ -99,7 +106,12 @@ PORT=${HW_GATE_PORT:-18471}
 JOBS=${HW_GATE_JOBS:-4}
 GOLDEN=$ROOT/tests/golden/hw-gate
 
-TCTL=$(grep -l k10temp /sys/class/hwmon/*/name 2>/dev/null | head -n 1 | xargs -r dirname)/temp1_input
+# the first hwmon chip that calls itself k10temp. A loop, not `grep -l ... | head -1 | xargs dirname`:
+# under pipefail head kills grep (141) and the assignment aborts the gate
+TCTL=
+for hw in /sys/class/hwmon/*/name; do
+  if grep -q k10temp "$hw" 2>/dev/null; then TCTL=$(dirname "$hw")/temp1_input; break; fi
+done
 tctl() { echo $(( $(cat "$TCTL" 2>/dev/null || echo 0) / 1000 )); }
 # thermal-run.sh kills its job at 93 C, so never start one on a box another job has heated: wait
 # (up to HW_GATE_COOL_WAIT s) for Tctl <= HW_GATE_COOL_C first
@@ -161,14 +173,15 @@ while [ $# -gt 0 ]; do
       if [ "${1:-}" = --mem ]; then memcheck "$2" || exit 76; shift 2; fi
       exec "$@" ;;
     --serve-step) SERVE_STEP=1; shift; break ;;   # internal: one model's kat (+ needle) inside the lock
-    -h|--help) sed -n '16,53p' "$0" | sed 's/^# \{0,1\}//'; exit 0 ;;
     *) echo "hw-gate: unknown argument $1" >&2; exit 2 ;;
   esac
 done
 
 # tools/mem_budget.py: never start a GPU step that would push the box into the engine#315 regime
 # (faults seen only at GTT >= 95 GiB) or past MemAvailable. "-" = no model (test-backend-ops).
-LIBHSA=$(find "$TOOLCHAIN" -path '*/libhsa-runtime64.so.1' 2>/dev/null | sort | head -n 1)
+# sort reads all of find's output, so it is sort that a `head` would kill; take the first line instead
+LIBHSA=$(find "$TOOLCHAIN" -path '*/libhsa-runtime64.so.1' 2>/dev/null | sort)
+LIBHSA=${LIBHSA%%$'\n'*}
 export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-$LIBHSA}
 
 # ---- internal: one model in one lock hold: serve it, run kat (and the needle), stop the server,
@@ -392,7 +405,9 @@ if [ -z "$BIN" ]; then
       result build FAIL $(( $(date +%s) - t0 )) "see $OUT/build.log"
       # the compiler's error lines only, not its source excerpts: the job log is public and the
       # add-on's sources are not
-      grep -E '(error|Error)[: ]' "$OUT/build.log" | grep -v -E '^ *[0-9]+ \|' | head -n 20
+      # a truncated diagnostic must not decide the exit code: under pipefail the killed grep would make
+      # this 141 instead of the exit 2 below
+      grep -E '(error|Error)[: ]' "$OUT/build.log" | grep -v -E '^ *[0-9]+ \|' | head -n 20 || true
       exit 2
     fi
   fi
@@ -585,7 +600,7 @@ rings=$(ring_timeouts)
 {
   echo "## HRX hardware gate: $([ "$nfail" = 0 ] && echo PASS || echo "FAIL ($nfail)")"
   echo
-  echo "Commit \`$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)\`, llama.cpp \`$(git -C "$ROOT" ls-tree HEAD third_party/llama.cpp | awk '{print substr($3,1,12)}')\`, hrx-system \`$(git -C "$ROOT" ls-tree HEAD third_party/hrx-system | awk '{print substr($3,1,12)}')\`, binaries \`$BIN\`, ${total}s, Tctl at end $(( $(cat "$(grep -l k10temp /sys/class/hwmon/*/name | head -n 1 | xargs dirname)/temp1_input") / 1000 )) C, amdgpu ring timeouts during the run: $rings."
+  echo "Commit \`$(git -C "$ROOT" rev-parse --short HEAD 2>/dev/null)\`, llama.cpp \`$(git -C "$ROOT" ls-tree HEAD third_party/llama.cpp | awk '{print substr($3,1,12)}')\`, hrx-system \`$(git -C "$ROOT" ls-tree HEAD third_party/hrx-system | awk '{print substr($3,1,12)}')\`, binaries \`$BIN\`, ${total}s, Tctl at end $(tctl) C, amdgpu ring timeouts during the run: $rings."
   echo
   echo "| check | result | secs | detail |"
   echo "|---|---|---|---|"

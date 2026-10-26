@@ -734,6 +734,9 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     cp -a "$srv" "$out/data.dir/1bit-llama/llama-server"
     # -a, not -L: the .so -> .so.0 -> .so.0.18.0 chain is how the loader finds the versioned file
     for f in "$libs"/lib*.so*; do if [ -e "$f" ]; then cp -a "$f" "$out/data.dir/1bit-llama/"; fi; done
+    # a symlink whose target is not in this directory (the build dir keeps some chains pointing at ../lib)
+    # dangles after -a and would be written THROUGH by the copies below, leaving the name a symlink
+    find "$out/data.dir/1bit-llama" -xtype l -delete 2>/dev/null || true
     # The HRX runtime of THIS build - libhrx and libloomc from the pinned hrx-system that ggml-hrx built -
     # before anything is resolved from the Lemonade package: those two are not in $libs (ggml-hrx builds
     # them deeper in the tree), so the NEEDED loop below used to take Lemonade's bundle copies, an HRX
@@ -744,14 +747,20 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     for hrx_lib in libhrx.so libloomc.so; do
         f=$(find "$build" -path '*ggml-hrx-deps-build*' -name "$hrx_lib.*" -type f 2>/dev/null | head -n 1)
         if [ -n "$f" ]; then
+            # never through an existing entry: candidate 11's first package run wrote this copy through a
+            # dangling libhrx.so.0 symlink and the gate below then refused a correct build
+            rm -f "$out/data.dir/1bit-llama/${hrx_lib}.0"
             cp -L "$f" "$out/data.dir/1bit-llama/${hrx_lib}.0"
-            echo "   + ${hrx_lib}.0 (this build's hrx-system: ${f#"$build/"})"
+            echo "   + ${hrx_lib}.0 (this build's hrx-system: ${f#"$build/"}, $(stat -c %s "$out/data.dir/1bit-llama/${hrx_lib}.0") bytes)"
         else
             echo "   this build has no $hrx_lib under ggml-hrx-deps-build: refusing to ship Lemonade's copy in its place"; exit 1
         fi
     done
     if ! strings "$out/data.dir/1bit-llama/libhrx.so.0" 2>/dev/null | grep -q HRX_ALLOW_NO_SVM; then
-        echo "   libhrx.so.0 has no HRX_ALLOW_NO_SVM gate: the engine's CWSR placement needs it (engine #315, pin #565)"; exit 1
+        echo "   libhrx.so.0 has no HRX_ALLOW_NO_SVM gate: the engine's CWSR placement needs it (engine #315, pin #565)"
+        ls -l "$out/data.dir/1bit-llama/libhrx.so.0" 2>&1 | sed 's/^/   /'
+        file "$out/data.dir/1bit-llama/libhrx.so.0" 2>&1 | sed 's/^/   /'
+        exit 1
     fi
     # What the loader resolves from outside the image goes on the stick too - TheRock's libomp.so is the
     # one that caught this out - and libraries the image already carries at their own path are left to it.

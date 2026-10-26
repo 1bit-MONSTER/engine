@@ -392,7 +392,13 @@ def models(node):
 rows, seen = [], set()
 for m in models(data):
     recipe = m.get("recipe")
+    # The NPU marker lives INSIDE recipe_options (recipe_options: {"onebit_backend": "npu"}), not at the
+    # record's top level - reading it from the top missed all four NPU entries and would have labelled
+    # them "hrx". Check both places so either shape works.
+    opts = m.get("recipe_options")
     backend = m.get("onebit_backend")
+    if isinstance(opts, dict) and opts.get("onebit_backend"):
+        backend = opts.get("onebit_backend")
     if recipe == "onebit":
         kind = "npu" if backend == "npu" else "hrx"
     elif backend == "npu":

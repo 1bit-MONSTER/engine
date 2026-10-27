@@ -65,6 +65,7 @@ debugging tool, it judges nothing.
 | `1bit-kernel-modules-<kver>` | every module for `<kver>`, including the out-of-tree EC board driver (MOK-signed) and its source under `/usr/src/1bit-ec-<ver>` |
 | `1bit-ryzenadj` | `/usr/bin/ryzenadj`, built from the pinned v0.19.0 source, which ships beside it (LGPL-3.0) |
 | `1bit-appliance` | the meta/config package: units, banner, autologin, network, `/data`, first boot, apt source, `/usr/share/licenses/1bit-os`. `Depends:` the six above |
+| `1bit-openwebui` | **optional — published, installed by nobody**: the unit that runs the upstream OpenWebUI container, its console line and its preset (engine#594). Nothing depends on it |
 | `1bit-archive-keyring` | the public half of the key that signs `1bit.gg/apt` |
 
 Two things the packages must get right, both learned the hard way and both checked by `mkdebs.sh`:
@@ -74,6 +75,54 @@ Two things the packages must get right, both learned the hard way and both check
   and `RUNPATH` is `$ORIGIN`. A build-machine path in a package is a package that does not load (#549).
 - **Signed, or Secure Boot refuses it.** `mkdebs.sh` fails if the EC module is unsigned or built for another
   kernel, and if the kernel image carries no signature (`sbverify --list` → `signature 1`).
+
+## The optional chat front end (OpenWebUI)
+
+Lemonade serves its own web app at `http://<box>:13305/` — chat works with nothing else installed. The
+`1bit-openwebui` package adds the other front end (users, accounts, chat history, documents) as the
+upstream OpenWebUI container pointed at the Lemonade API. It is **optional on purpose**: it is in the
+repository, no package `Depends:`/`Recommends:` it and no target wants its unit, so an absent package, an
+absent runtime or a failed image pull cannot hold a boot. Nothing of it is in the RAM live image
+(`os/mini`): it is several hundred MB and wants a disk.
+
+Install it on a box that is already running (`sudo` or root):
+
+```
+sudo apt install podman          # or docker.io; podman is preferred (no daemon to be up first)
+sudo apt install 1bit-openwebui  # enables the unit and the console line, starts nothing
+sudo systemctl start 1bit-openwebui
+```
+
+The first start pulls `ghcr.io/open-webui/open-webui:main` (a multi-GB download, so it is the operator's
+step and not dpkg's; a box with no network yet simply retries — `Restart=always`, `RestartSec=15`). Then
+`http://<box>:8080/` is the chat UI, the console banner gains a `Chat UI` line beside the Lemonade one, and
+the admin account is created on the first page load. Without the package, or before it answers, the line
+reads `(starting)`; without the package at all the line is not printed and nothing is probed.
+
+```
+systemctl status 1bit-openwebui           # active (running) once the container is up
+journalctl -u 1bit-openwebui -n 50        # the pull, and the runtime error if there is one
+journalctl -u 1bit-openwebui-console      # the line writer (timer: 20 s after boot, then every 60 s)
+```
+
+What it reads and writes: the API key from `/etc/1bit/lemonade.env` (`LEMONADE_API_KEY`, or from
+`/data/lemonade/lemond.conf` on a box prepared from a stick), a generated environment at
+`/etc/1bit/openwebui.env` (`0600`, rewritten at every start with the persistent `WEBUI_SECRET_KEY` kept),
+and the container's `/app/backend/data` — accounts and chats — at `/data/openwebui`, so an image update,
+a `systemctl restart` or a package upgrade keeps them. To pin the image instead of following `:main`,
+write the operator's override file the unit reads (root, `0644`):
+
+```
+# /etc/1bit/openwebui.conf
+ONEBIT_OPENWEBUI_IMAGE=ghcr.io/open-webui/open-webui:v0.6.5
+```
+
+then `sudo systemctl restart 1bit-openwebui`. `1bit-openwebui.env` is generated at every start (do not
+edit it: it is rewritten); `openwebui.conf` is never written by the package.
+
+Remove it and keep the chats: `sudo apt remove 1bit-openwebui` stops the console line with the package and
+leaves `/data/openwebui` alone; `apt purge` also drops `/etc/1bit/openwebui.env` and `openwebui.conf`. `rm -rf /data/openwebui`
+is the only thing that deletes accounts or chats, and nothing does it for you.
 
 ## Trust and the boot chain
 
@@ -110,7 +159,7 @@ verdict. `vmtest-install-v2.sh` does the same for the live medium and then boots
 
 | What | How |
 |---|---|
-| all seven packages install and are the release's | `dpkg-query -W '1bit-*'` in the guest |
+| all seven installed packages are the release's (**eight** are built: `1bit-openwebui` is the optional one) | `dpkg-query -W '1bit-*'` in the guest |
 | the banner, `/data` on its own disk, `1bit-selftest` | guest transcript |
 | the engine runs; `llama-server`'s own libraries resolve | `1bit --help`, `ldd` on the packaged `llama-server` |
 | our kernel package produced `vmlinuz` **and** `initrd.img` | `/boot` in the guest |
@@ -133,7 +182,12 @@ the `secureboot` row answers; enrolling the MOK is the machine's step, not a VM'
   `vmtest-v2` asserts.
 - **A development stage has no sealed NPU sets**, so `1bit-release-check`'s `sealed` row fails by
   construction in these runs (the VM has no NPU either). A release stage always carries them.
-- The v2 rootfs in these runs came from the archive mirror, not the pinned snapshot, because
+- **The optional `1bit-openwebui` package is not exercised by the vmtest runs.** Installing it needs a
+  container runtime from the Ubuntu archive and its first start pulls a multi-GB image, so the VM would
+  spend the run on a download and prove nothing about 1bit OS. What is checked instead is `mkdebs.sh`
+  building the `.deb` and the unit/console scripts being syntax-clean; a box check of the whole thing is
+  in `vmtest-install-v2.sh`'s style but is not run here — see engine#594.
+- **The v2 rootfs in these runs came from the archive mirror**, not the pinned snapshot, because
   `snapshot.ubuntu.com` was 503. `pin.txt` is unchanged and is what a release build uses.
 
 ## Licence

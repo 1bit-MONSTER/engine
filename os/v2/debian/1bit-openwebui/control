@@ -1,0 +1,19 @@
+Package: 1bit-openwebui
+Version: @VERSION@
+Architecture: amd64
+Maintainer: 1bit <packages@1bit.gg>
+Section: admin
+Priority: optional
+Depends: 1bit-lemonade
+Suggests: podman | docker.io
+Description: OpenWebUI chat front end for 1bit OS (optional)
+ The other chat front end (engine#594): the upstream OpenWebUI container,
+ run against this box's Lemonade API on 127.0.0.1:13305 with the key
+ Lemonade already has, listening on 8080. The console and the menu name
+ the URL while it answers.
+ .
+ It is optional and nothing depends on it: it is not in the image, apt
+ installs it, and the unit it ships is enabled by this package's own
+ preset. The container runtime is only Suggests, so the package installs
+ on a box with no Ubuntu archive and no network; the unit then fails
+ loudly without holding the boot.

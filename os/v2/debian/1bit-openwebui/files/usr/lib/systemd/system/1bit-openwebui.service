@@ -1,0 +1,48 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# OpenWebUI, the optional second front end (engine#594), on this box's Lemonade API. Its own package,
+# its own preset (90-1bit-openwebui.preset): the appliance is not this, and nothing in the image
+# depends on it.
+#
+# No unit Wants= or Requires= this one, so it can never hold the boot. It talks to a localhost API, so
+# the network only matters for the image pull: with no image and no network it fails, the box carries
+# on, and `systemctl start 1bit-openwebui` is the retry after the network is there.
+[Unit]
+Description=1bit OS: OpenWebUI (the other chat front end, on Lemonade's API)
+Documentation=https://1bit.gg
+# ordering only: Lemonade serves the API this talks to, but a stopped Lemonade is not this unit's
+# failure to start (it answers 401/connection-refused until Lemonade is back)
+After=network-online.target data.mount 1bit-lemonade.service
+Wants=network-online.target
+RequiresMountsFor=/data
+# five tries, then the unit stays failed instead of a boot-long retry loop against a registry that is
+# not reachable; systemctl start is the retry
+StartLimitIntervalSec=300
+StartLimitBurst=5
+
+[Service]
+Type=simple
+# the upstream OpenWebUI container's data: chats, users, settings. /data is the partition an install
+# keeps, so an update does not take them; the image itself stays under /var/lib/containers
+Environment=HOME=/data/openwebui
+EnvironmentFile=-/etc/1bit/openwebui.conf
+ExecStart=/usr/lib/1bit/openwebui-run.sh
+Restart=always
+RestartSec=15
+# the pull is minutes of work with no output on a first start: it must not be cut off at 90 s
+TimeoutStartSec=0
+
+[Install]
+WantedBy=multi-user.target

@@ -3,66 +3,99 @@
   "tag_name": "v1.0.10",
   "name": "\ud83d\ude80 FastFlowLM v1.0.10 \u2014 Constrained Decoding & More Accurate Whisper",
   "published_at": "2026-10-22T22:59:58Z",
-  "prerelease": false,
-  "body": "This release does three things:\r\n\r\n- **Reasoning, tool calls and structured output** are handled one way for every model on `/v1/chat/completions`.\r\n- **`tool_choice` and `response_format` are enforced** while the model generates, not just requested.\r\n- **Whisper transcription** is more accurate, and `/v1/audio/transcriptions` now supports `language`, `prompt` and `response_format`.\r\n\r\nIt also fixes several `flm serve` bugs, including Lemonade failing to launch FLM on Linux.\r\n\r\n---\r\n\r\n## \u2728 New Features\r\n\r\n### \ud83e\udde9 OpenAI API: Shared Chat Parsing and Constrained Decoding\r\n\r\n**[PR #790](https://github.com/ROCm/FastFlowLM/pull/790)**\r\n\r\nEvery model writes its answer in its own markup. Qwen3 uses `<think>` and `<tool_call>`, Gemma 4 uses a thought channel and `call:f{\u2026}`, GPT-OSS uses Harmony channels, and LFM2 writes Python calls. Until now each model had its own parser for this. In v1.0.10, one shared parser handles all of them, so `/v1/chat/completions` returns the same OpenAI-shaped message whatever the model:\r\n\r\n- `reasoning_content`, `content` and `tool_calls` are split the same way for every model, streamed or not.\r\n- The streamed deltas add up to exactly the non-streamed reply.\r\n- Tool-call markup counts as a call only when the request includes `tools`. A reply that is only tool calls has `content: null`, as in the OpenAI API.\r\n\r\n**Constrained decoding.** Before each token is sampled, FLM works out which tokens can still lead to valid output and rules out the rest. This uses",
+  "html_url": "https://github.com/ROCm/FastFlowLM/releases/tag/v1.0.10",
   "assets": [
    {
-    "name": "fastflowlm_1.0.10_debian13_amd64.deb",
-    "size": 64467988
+    "name": "fastflowlm_1.0.10_debian13_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.10_linux.tar.gz",
-    "size": 37927581
+    "name": "fastflowlm_1.0.10_linux.tar.gz"
    },
    {
-    "name": "fastflowlm_1.0.10_ubuntu24.04_amd64.deb",
-    "size": 45951392
+    "name": "fastflowlm_1.0.10_ubuntu24.04_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.10_ubuntu25.10_amd64.deb",
-    "size": 48375952
+    "name": "fastflowlm_1.0.10_ubuntu25.10_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.10_ubuntu26.04_amd64.deb",
-    "size": 48282030
+    "name": "fastflowlm_1.0.10_ubuntu26.04_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.10_windows_amd64.zip",
-    "size": 30484687
+    "name": "fastflowlm_1.0.10_windows_amd64.zip"
+   },
+   {
+    "name": "flm-setup.msi"
+   },
+   {
+    "name": "HRX_fastflowlm_1.0.10_linux.tar.gz"
+   },
+   {
+    "name": "HRX_fastflowlm_1.0.10_windows_amd64.zip"
    }
-  ]
+  ],
+  "body": "This release does three things:\r\n\r\n- **Reasoning, tool calls and structured output** are handled one way for every model on `/v1/chat/completions`.\r\n- **`tool_choice` and `response_format` are enforced** while the model generates, not just requested.\r\n- **Whisper transcription** is more accurate, and `/v1/audio/transcriptions` now supports `language`, `prompt` and `response_format`.\r\n\r\nIt also fixes several `flm serve` bugs, including Lemonade failing to launch FLM on Linux.\r\n\r\n---\r\n\r\n## \u2728 New Features\r\n\r\n### \ud83e\udde9 OpenAI API: Shared Chat Parsing and Constrained Decoding\r\n\r\n**[PR #790](https://github.com/ROCm/FastFlowLM/pull/790)**\r\n\r\nEvery model writes its answer in its own markup. Qwen3 uses `<think>` and `<tool_call>`, Gemma 4 uses a thought channel and `call:f{\u2026}`, GPT-OSS uses Harmony channels, and LFM2 writes Python calls. Until now each model had its own parser for this. In v1.0.10, one shared parser handles all of them, so `/v1/chat/completions` returns the same OpenAI-shaped message whatever the model:\r\n\r\n- `reasoning_content`, `content` and `tool_calls` are split the same way for every model, streamed or not.\r\n- The streamed deltas add up to exactly the non-streamed reply.\r\n- Tool-call markup counts as a call only when the request includes `tools`. A reply that is only tool calls has `content: null`, as in the OpenAI API.\r\n\r\n**Constrained decoding.** Before each token is sampled, FLM works out which tokens can still lead to valid output and rules out the rest. This uses [xgrammar](https://github.com/mlc-ai/xgrammar). The model can't misspell a tool name, give an argument the wrong type, leave out a required field, or wrap your JSON in a Markdown fence. You control it with the standard OpenAI request fields:\r\n\r\n| Field | What FLM enforces |\r\n|-------|-------------------|\r\n| `tool_choice: \"none\"` | No tool call |\r\n| `tool_choice: \"auto\"` | Any tool call is well-formed and names a real tool |\r\n| `tool_choice: \"required\"` | At least one tool call |\r\n| `tool_choice: {\"type\": \"function\", ...}` | A call to that function |\r\n| `parallel_tool_calls` | One call or several |\r\n| `response_format: {\"type\": \"json_object\"}` | Valid JSON |\r\n| `response_format: {\"type\": \"json_schema\", ...}` | JSON that matches your schema |\r\n\r\nBad values return a clear **400** error instead of being ignored. This covers a malformed `tool_choice`, an unknown function name, `\"required\"` w"
  },
  {
   "tag_name": "v1.0.9",
   "name": "\ud83d\ude80 FastFlowLM v1.0.9 \u2014 `flm validate` Fix",
   "published_at": "2026-10-15T21:35:13Z",
-  "prerelease": false,
-  "body": "Runtime update: the q4nx container chunk layout changed; re-export models with flm 1.0.9.",
+  "html_url": "https://github.com/ROCm/FastFlowLM/releases/tag/v1.0.9",
   "assets": [
    {
-    "name": "fastflowlm_1.0.9_debian13_amd64.deb",
-    "size": 47964076
+    "name": "fastflowlm_1.0.9_debian13_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.9_linux.tar.gz",
-    "size": 48082541
+    "name": "fastflowlm_1.0.9_linux.tar.gz"
    },
    {
-    "name": "fastflowlm_1.0.9_ubuntu24.04_amd64.deb",
-    "size": 33776380
+    "name": "fastflowlm_1.0.9_ubuntu24.04_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.9_ubuntu25.10_amd64.deb",
-    "size": 35221626
+    "name": "fastflowlm_1.0.9_ubuntu25.10_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.9_ubuntu26.04_amd64.deb",
-    "size": 35167690
+    "name": "fastflowlm_1.0.9_ubuntu26.04_amd64.deb"
    },
    {
-    "name": "fastflowlm_1.0.9_windows_amd64.zip",
-    "size": 40992743
+    "name": "fastflowlm_1.0.9_windows_amd64.zip"
+   },
+   {
+    "name": "flm-setup.msi"
+   },
+   {
+    "name": "HRX_fastflowlm_1.0.9_linux.tar.gz"
+   },
+   {
+    "name": "HRX_fastflowlm_1.0.9_windows_amd64.zip"
    }
-  ]
+  ],
+  "body": "This is a maintenance release. It fixes **`flm validate` on Linux**, which wrongly reported \"No NPU device found.\" in v1.0.8.\r\n\r\n---\r\n\r\n## \ud83d\udc1b Bug Fixes\r\n\r\n### \u2705 `flm validate` Finds the NPU Again on Linux\r\n\r\n**[PR #796](https://github.com/ROCm/FastFlowLM/pull/796)**\r\n\r\nIn v1.0.8, `flm validate` on Linux printed **\"No NPU device found.\"** and exited with status 1, even on systems where the NPU worked fine and `flm run` and `flm serve` had no problems.\r\n\r\nThe cause: since v1.0.8, `flm` opens the NPU device at startup, before it runs any command. `flm validate` then tried to open the same `/dev/accel/accel*` device a second time to check it. The amdxdna driver allows only one open of a device per process, so the second open failed with `EBUSY`. The check skipped busy devices without saying anything, so it found no device at all.\r\n\r\nWhat changed:\r\n\r\n- `flm validate` now runs **before** `flm` opens the NPU, so its check gets the device.\r\n- If a device node is busy, `flm validate` now **reports it** (`device busy`) instead of skipping it silently. The `--json` output marks it with `\"busy\": true`.\r\n\r\nIf you run `flm validate` in a setup script or CI job, upgrade to get the right result back.\r\n\r\n---\r\n\r\n## \ud83d\udce6 MSI Installer: Uninstall v1.0.8 First\r\n\r\nThe v1.0.8 MSI (`flm-setup.msi`) was published with the wrong version number. Windows registered it as version **8** instead of **1.0.8**, so it shows up as \"8\" in *Installed apps*. Because 8 is higher than 1.0.9, the v1.0.9 MSI treats v1.0.8 as a newer install and stops with **\"A newer version of flm is already installed.\"**\r\n\r\nIf you installed v1.0.8 with the MSI, **uninstall FLM from Settings \u2192 Apps \u2192 Installed apps first**, then run the v1.0.9 MSI. Your downloaded models are kept. The v1.0.9 MSI has the right version number, so later upgrades will work normally again.\r\n\r\nThis only affects the MSI. The portable `.zip` packages and the Linux packages are not affected.\r\n\r\n---\r\n\r\n## \ud83c\udf1f Summary\r\n\r\n|       | Highlight |\r\n|-------|-----------|\r\n| \u2705 | `flm validate` on Linux finds the NPU again, instead of reporting \"No NPU device found.\" (broken in v1.0.8) |\r\n| \ud83d\udce6 | If you installed v1.0.8 with the MSI, uninstall it before running the v1.0.9 MSI |\r\n\r\nThanks for your support \u2014 see you in the next one! \ud83d\ude80"
+ },
+ {
+  "tag_name": "v0.9.40",
+  "name": "\ud83d\ude80 FastFlowLM v0.9.40 - Gemma4 E4B + Reliability Updates",
+  "published_at": "2026-04-28T20:24:29Z",
+  "html_url": "https://github.com/ROCm/FastFlowLM/releases/tag/v0.9.40",
+  "assets": [
+   {
+    "name": "fastflowlm_0.9.40_debian13_amd64.deb"
+   },
+   {
+    "name": "fastflowlm_0.9.40_ubuntu24.04_amd64.deb"
+   },
+   {
+    "name": "fastflowlm_0.9.40_ubuntu25.10_amd64.deb"
+   },
+   {
+    "name": "fastflowlm_0.9.40_ubuntu26.04_amd64.deb"
+   },
+   {
+    "name": "fastflowlm_0.9.40_windows_amd64.zip"
+   },
+   {
+    "name": "flm-setup.exe"
+   }
+  ],
+  "body": "## \ud83d\udce6 New Model Support\r\n\r\n### \ud83c\udf0e Gemma4-IT-E4B\r\n\r\nFastFlowLM now supports `gemma4-it:e4b` for language, vision, audio workloads, including concurrent multimodal input for omni-model use cases.\r\n\r\n- **Tag:** `gemma4-it:e4b`\r\n\r\nRun in CLI mode:\r\n\r\n```bash\r\nflm run gemma4-it:e4b\r\n```\r\n\r\nRun in server mode:\r\n\r\n```bash\r\nflm serve gemma4-it:e4b\r\n```\r\n\r\nFor more details, see the [model card](https://fastflowlm.com/docs/models/gemma/#-model-card-gemma-4-e4b-it) and [benchmark results](https://fastflowlm.com/docs/benchmarks/gemma4_results/).\r\n\r\n---\r\n\r\n## \u2728 Improvements\r\n\r\n### \ud83d\udd25 Performance Boosts for `gemma4-it:e2b`\r\n\r\nThis release brings meaningful speed improvements to the `gemma4-it:e2b` model:\r\n\r\n- **Prefill:** up to 11.4% faster\r\n- **Decoding:** up to 10.2% faster\r\n\r\n### \u26a1 Chunk Prefill\r\n\r\nThis release adds chunk prefill support, significantly reducing memory usage for long prompts and larger workloads.\r\n\r\nYou can configure the prefill chunk length with `--prefill-chunk-len` in both `CLI` and `server` modes. The default value is `4096`.\r\n\r\nRun in CLI mode:\r\n\r\n```bash\r\nflm run gemma4-it:e4b --prefill-chunk-len 8192\r\n```\r\n\r\nRun in server mode:\r\n\r\n```bash\r\nflm serve gemma4-it:e4b --prefill-chunk-len 8192\r\n```\r\n\r\nIn server mode, you can now cancel a request even while it is still in the prefill stage. No more waiting around for a huge prompt to finish prefill: just hit the stop button in higher-level apps such as Open WebUI and move on.\r\n\r\n### \ud83d\udd10 Hash Checking\r\n\r\nA new hash checking command is now available to help verify downloaded model files.\r\n\r\nIf you have trouble running a model and suspect a corrupted download, run:\r\n\r\n```bash\r\nflm check gemma4-it:e4b\r\n```\r\n\r\nIf corrupted files are detected, you will see output like this:\r\n\r\n```txt\r\n[FLM]  Checking model: llama3.2:1b...\r\n\r\n[FLM]  Checking file: config.json...\r\n[FLM]  Fail!\r\n[FLM]  Removing corrupted file: config.json...\r\n[FLM]  Successfully removed config.json!\r\n[FLM]  Checking file: model.q4nx...\r\n[FLM]  Success!\r\n[FLM]  Checking file: tokenizer.json...\r\n[FLM]  Success!\r\n[FLM]  Checking file: tokenizer_config.json...\r\n[FLM]  Success!\r\n[FLM]  Model check completed with errors. Please use `flm pull llama3.2:1b` to re-download corrupted files.\r\n```\r\n\r\n---\r\n\r\n## \ud83d\udc1b Bug Fixes\r\n\r\n### \ud83d\udee0\ufe0f Tool Calling\r\n\r\nFixed an issue where tool calls could return an incorrect finish reason.\r\n\r\nThanks to @antrv for reporting this issue"
  }
 ]

@@ -24,8 +24,8 @@
 # Rows that cannot PASS without the hardware are marked SKIP in a VM (Lemonade hides its onebit
 # entries on a machine with no AMD GPU or NPU, and there is no HRX or NPU device to run them on):
 # gpu, npu, models, chat-hrx, chat-npu. Everything else - mode, kernel, Secure Boot, Lemonade up
-# with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU sets, the
-# licences and the image identity - is checked in the VM as well.
+# with its key, the stick's GGUF answering on vulkan, `lemonade bench`, the sealed NPU sets and
+# the signed manifests over them, the licences and the image identity - is checked in the VM as well.
 set -u
 
 LOG=/data/release-check.log
@@ -110,6 +110,39 @@ lemonade_verdict() {
     esac
 }
 
+# The sealed-set manifest rule (engine #574). Sealing is confidentiality: the kernel files are
+# 1BPKCRYP ciphertext and the loader opens them with the kernel key. A set re-sealed by another key,
+# or swapped for a different set that also decrypts, is indistinguishable from ours by that alone.
+# So every set ships manifest.json - every file it carries, with the sha256 of its ciphertext - and
+# manifest.sig, an Ed25519 signature over those bytes by the release signing key (tools/seal_manifest.py
+# write). This function is the half that needs no key: the set's files and its manifest must be the
+# same set of files. Pure, so --self-test drives it and the row below uses the same code.
+seal_manifest_problems() {  # <set dir>: one line per problem, nothing and status 0 when sound
+    _sd=$1 _bad=0 _rel= _f= _sz= _h= _m=0 _n=
+    if [ ! -f "$_sd/manifest.json" ]; then
+        printf 'no manifest.json: the set was never signed\n'
+        return 1
+    fi
+    [ -f "$_sd/manifest.sig" ] || { printf 'no manifest.sig: the manifest is not signed\n'; _bad=1; }
+    for _f in $(find "$_sd" -type f 2>/dev/null); do
+        case "${_f##*/}" in manifest.json|manifest.sig) continue ;; esac
+        _m=$((_m + 1)); _rel=${_f#"$_sd"/}
+        _sz=$(wc -c <"$_f" | tr -d ' ')
+        _h=$(sha256sum "$_f" 2>/dev/null | cut -c1-64)
+        # the manifest is one file per line, keys in this order, so a plain grep can read it
+        if ! grep -qF "{\"path\": \"$_rel\", \"size\": $_sz, \"sha256\": \"$_h\"}" "$_sd/manifest.json"; then
+            printf '%s is not in the set manifest with the sha256 of its bytes\n' "$_rel"
+            _bad=1
+        fi
+    done
+    _n=$(grep -c '"sha256":' "$_sd/manifest.json" 2>/dev/null || true)
+    [ "${_n:-0}" = "$_m" ] || {
+        printf 'the manifest lists %s file(s), the set carries %s\n' "${_n:-0}" "$_m"
+        _bad=1
+    }
+    return $_bad
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -130,6 +163,31 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(lemonade_verdict 000 '' 000)"                           # no server at all
     check FAIL "$(lemonade_verdict 200 '' 401)"                           # 200 with no model list
     check FAIL "$(lemonade_verdict 500 'error' 401)"                      # not a 200
+    # engine #574: the sealed set's manifest, on sets built here (a manifest whose file list and
+    # the set's files are not the same set of files is exactly what the packaging and this check
+    # have to refuse)
+    ST=$(mktemp -d)
+    mkdir -p "$ST/set/layer1_1"
+    printf 'ciphertext' > "$ST/set/layer1_1/layer1.elf"
+    hs=$(sha256sum "$ST/set/layer1_1/layer1.elf" | cut -c1-64)
+    printf '{\n  "format": 1,\n  "set": "set",\n  "files": [\n    {"path": "layer1_1/layer1.elf", "size": 10, "sha256": "%s"}\n  ]\n}\n' \
+        "$hs" > "$ST/set/manifest.json"
+    printf 'abababab\n' > "$ST/set/manifest.sig"
+    st() {  # <want> <label> <set dir>
+        _got=FAIL; seal_manifest_problems "$3" >/dev/null 2>&1 && _got=PASS
+        if [ "$_got" = "$1" ]; then printf 'ok   %s -> %s\n' "$2" "$_got"
+        else printf 'FAIL want %s, got %s: %s\n' "$1" "$_got" "$2"; rc=1; fi
+    }
+    st PASS "a sealed set whose manifest lists exactly its files" "$ST/set"
+    printf 'more' > "$ST/set/layer1_1/extra.elf"
+    st FAIL "a file the manifest does not list" "$ST/set"
+    rm -f "$ST/set/layer1_1/extra.elf" "$ST/set/manifest.sig"
+    st FAIL "a manifest with no signature" "$ST/set"
+    printf 'abababab\n' > "$ST/set/manifest.sig"; printf 'tampered' > "$ST/set/layer1_1/layer1.elf"
+    st FAIL "a ciphertext byte that changed after it was hashed" "$ST/set"
+    rm -f "$ST/set/manifest.json"
+    st FAIL "a sealed set with no manifest at all" "$ST/set"
+    rm -rf "$ST"
     [ $rc = 0 ] && echo "release-check self-test PASS" || echo "release-check self-test FAIL"
     exit $rc
 fi
@@ -475,20 +533,58 @@ else
     fi
 fi
 
-# ── sealed NPU sets: the method never ships in the clear ────────────────────────────────────────
+# ── sealed NPU sets: the method never ships in the clear, and every file is in its set's manifest ────────
 SETS=$(find /data/npu/kernels -name layout.json 2>/dev/null | wc -l)
 if [ "$SETS" = 0 ]; then
     fail sealed "no NPU kernel set on the data partition (find /data/npu/kernels -name layout.json)"
 else
     BAD=0
     for f in $(find /data/npu/kernels -type f 2>/dev/null); do
-        [ "$(basename "$f")" = layout.json ] && continue
+        case "${f##*/}" in layout.json|manifest.json|manifest.sig) continue ;; esac
         [ "$(head -c 8 "$f" 2>/dev/null)" = 1BPKCRYP ] && continue
         BAD=$((BAD + 1)); say "      not sealed: $f"
     done
     [ "$(find /data/npu/kernels -name '*.mlir' -o -name 'layer1.work' 2>/dev/null | wc -l)" = 0 ] || { BAD=$((BAD + 1)); say "      plaintext build tree on the data partition"; }
-    if [ "$BAD" = 0 ]; then pass sealed "$SETS sealed sets, $PLAIN_TOTAL kernels, none in the clear"
-    else fail sealed "$BAD file(s) under /data/npu/kernels are not sealed artifacts"; fi
+    # engine #574: sealing is confidentiality, the manifest is authenticity. Every set has to carry a
+    # manifest listing every file it ships with the sha256 of its ciphertext, and a signature over it.
+    for d in $(find /data/npu/kernels -name layout.json 2>/dev/null | sed 's|/layout.json$||'); do
+        P=$(seal_manifest_problems "$d") && continue
+        BAD=$((BAD + 1))
+        printf '%s\n' "$P" | sed "s|^|      ${d#/data/npu/kernels/}: |" | while IFS= read -r l; do say "$l"; done
+    done
+    if [ "$BAD" = 0 ]; then pass sealed "$SETS sealed sets, $PLAIN_TOTAL kernels, none in the clear, every file in its set's manifest"
+    else fail sealed "$BAD problem(s) under /data/npu/kernels: not sealed, or not in the set's manifest"; fi
+fi
+
+# ── the signatures over those manifests (engine #574): the release public key is the only thing needed ──
+# The loader - the private NPU runtime - holds the same key and verifies the signature before it opens
+# a kernel. This row is the same judgement on the stick, where it can be made at all: it needs an
+# interpreter (the image carries busybox, not python) and the release public key. Where either is
+# missing it says so, rather than passing a row it did not check.
+SEALPUB=${ONEBIT_SEAL_PUB:-/etc/1bit/seal-pub.txt}
+SEALTOOL=
+for t in "$(dirname "$0")/../../tools/seal_manifest.py" "$(dirname "$0")/../lib/1bit/seal_manifest.py" \
+         /usr/lib/1bit/seal_manifest.py /opt/1bit/tools/seal_manifest.py; do
+    [ -f "$t" ] && { SEALTOOL=$t; break; }
+done
+if [ "$SETS" = 0 ]; then
+    skip sealed-sig "no NPU kernel set on the data partition, so there is no manifest to verify"
+elif ! command -v python3 >/dev/null 2>&1; then
+    skip sealed-sig "no python3 in this image, so the signatures can only be verified by the loader (the private NPU runtime holds the release public key)"
+elif [ -z "$SEALTOOL" ]; then
+    skip sealed-sig "no verifier (tools/seal_manifest.py) in this image; the loader verifies the signatures here"
+elif [ ! -f "$SEALPUB" ]; then
+    skip sealed-sig "no release public key at $SEALPUB: install the key the loader was built with to check the signatures here"
+else
+    SIGBAD=0; SIGS=0
+    for d in $(find /data/npu/kernels -name layout.json 2>/dev/null | sed 's|/layout.json$||'); do
+        SIGS=$((SIGS + 1))
+        _o=$(python3 "$SEALTOOL" verify "$d" --pub "$SEALPUB" 2>&1) || {
+            SIGBAD=$((SIGBAD + 1)); say "      ${d#/data/npu/kernels/}: $(printf '%s\n' "$_o" | head -1)"
+        }
+    done
+    if [ "$SIGBAD" = 0 ]; then pass sealed-sig "$SIGS manifest.sig verified with the release public key ($SEALPUB)"
+    else fail sealed-sig "$SIGBAD of $SIGS set manifests are not signed by the release public key"; fi
 fi
 
 # ── licences and image identity ────────────────────────────────────────────────────────────────

@@ -388,6 +388,9 @@ if(Python3_Interpreter_FOUND)
     # the new-model watcher's alert contract (offline: synthetic batches against the
     # committed registry), so a regression cannot leave the daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
+    # published FastFlowLM model goes through is proved to fire without the model at hand.
+    add_test(NAME q4nx_dir_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_q4nx_dir.py --self-test)
     # FastFlowLM's drops are files, not architecture classes (engine #588): the org listing and the runtime
     # releases. Offline too - recorded API payloads under tests/fixtures/fflm/.
     add_test(NAME fflm_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fflm_watch_test.py)

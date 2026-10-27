@@ -121,7 +121,11 @@ repack script) names a different converter than this build would use (`repack_gg
 --check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). If the checker or the converter
 cannot be found, serve warns once per process and reuses the directory, so a missing script
 cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a
-published FastFlowLM model, is trusted as published.
+published FastFlowLM model, is trusted as published. Its chunk layout can be checked first, without
+dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container header only, names each
+quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
+needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
+not record which one it holds.
 
 ## Serving
 

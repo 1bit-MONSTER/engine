@@ -135,6 +135,26 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
 
+### Sealed kernel sets: the manifest is what says a set is ours
+
+A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened
+in memory by the loader with the kernel key) and two more files: `manifest.json`, which lists every
+file the set carries with the sha256 of its **ciphertext**, and `manifest.sig`, an Ed25519 signature
+over the manifest's exact bytes made with the release signing key. Sealing on its own is
+confidentiality only: a set re-sealed by another key, or swapped for a different set that also
+decrypts, would be indistinguishable from ours. The signature covers the manifest, the manifest's
+digests cover the ciphertext files, and the release public key never leaves the loader.
+
+`tools/seal_manifest.py` is the public half: `write <set> --key <release key>` emits both files,
+`check <set>` proves the manifest lists exactly the set's files with their sha256 (no key needed),
+and `verify <set> --pub <release public key>` proves the signature too. `scripts/package-linux.sh`
+refuses to pack a set without them, `scripts/weekly.sh`'s `package_checks` refuses a tarball whose
+sets do not match their manifests (`ONEBIT_SEAL_PUB=<release public key>` also verifies the
+signatures there), and `1bit-release-check`'s `sealed`/`sealed-sig` rows prove the same on the stick
+(the signature where the image has an interpreter and the key). The loader-side requirement,
+`ONEBIT_KCRYPT_REQUIRE_MANIFEST=1` beside `ONEBIT_KCRYPT_REQUIRE_SEALED`, is read by the private NPU
+runtime and lands with the pin that makes it honour one - engine #574.
+
 ### Dense Qwen3, checked on the NPU
 
 All three dense Qwen3 models run on the NPU from a sealed kernel set, and each one passes the

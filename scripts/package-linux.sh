@@ -57,24 +57,43 @@ put ds4/hip ds4-server ds4 ds4-bench
 
 # the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
 # beside 1bit in npu/kernels, where it looks for them
-# Only the artifact surface is shipped: <set>/layout.json and <set>/layer1_*/layer1.elf. The set
-# directory also holds layer1.work/ (plaintext MLIR, object files, intermediate ELFs) because that is
-# where it was built; copying the tree would ship the kernel method and feed those static ELFs to
-# patchelf. package_checks asserts this allowlist on the tarball.
+# Only the artifact surface is shipped: <set>/layout.json, <set>/layer1_*/layer1.elf and the set's
+# signed manifest. The set directory also holds layer1.work/ (plaintext MLIR, object files,
+# intermediate ELFs) because that is where it was built; copying the tree would ship the kernel
+# method and feed those static ELFs to patchelf. package_checks asserts this allowlist on the
+# tarball.
+# The manifest (engine #574) is what makes a set provably ours: manifest.json lists every file the
+# set ships with the sha256 of its ciphertext, manifest.sig is Ed25519 over those bytes by the
+# release signing key (tools/seal_manifest.py write, on the release machine). A set without one is
+# not packed at all - shipping it would put kernels in the tarball that nothing can tell from a set
+# somebody else re-sealed.
 if [ -d "$build/npu/kernels" ]; then
     mkdir -p "$stage/npu/kernels"
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")   # not $name: that is the package name tar uses below
         [ -f "$set/layout.json" ] || continue
+        [ -f "$set/manifest.json" ] || { echo "sealed set $setname has no manifest.json: it was never signed (tools/seal_manifest.py write $set --key <release key>)"; exit 1; }
+        [ -f "$set/manifest.sig" ] || { echo "sealed set $setname has no manifest.sig: its manifest is not signed (tools/seal_manifest.py write)"; exit 1; }
         mkdir -p "$stage/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$stage/npu/kernels/$setname/"
+        cp -a "$set/layout.json" "$set/manifest.json" "$set/manifest.sig" "$stage/npu/kernels/$setname/"
         for layer in "$set"/layer1_*/; do
             [ -f "$layer/layer1.elf" ] || continue
             mkdir -p "$stage/npu/kernels/$setname/$(basename "$layer")"
             cp -a "$layer/layer1.elf" "$stage/npu/kernels/$setname/$(basename "$layer")/"
         done
     done
-    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels"
+    # the manifest has to describe the bytes that were just staged, not the ones in the build tree:
+    # check the staged copy, which is what the tarball carries. With the release public key in
+    # ONEBIT_SEAL_PUB the signature is verified too; without it the digests are all a package can say.
+    command -v python3 >/dev/null 2>&1 || { echo "no python3: the sealed sets' manifests cannot be verified (tools/seal_manifest.py)"; exit 1; }
+    for set in "$stage"/npu/kernels/*/; do
+        if [ -n "${ONEBIT_SEAL_PUB:-}" ]; then
+            python3 "$src/tools/seal_manifest.py" verify "$set" --pub "$ONEBIT_SEAL_PUB" || exit 1
+        else
+            python3 "$src/tools/seal_manifest.py" check "$set" || exit 1
+        fi
+    done
+    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels, $(find "$stage/npu/kernels" -name manifest.json | wc -l) signed manifests$([ -n "${ONEBIT_SEAL_PUB:-}" ] || echo ' (digests only: no ONEBIT_SEAL_PUB, so no release public key to verify the signature with)')"
 fi
 
 # The NPU lane's GGUF path runs public helper scripts (the repack, its declared-scale guard and the

@@ -24,6 +24,8 @@
 #   1bit-lemonade    our build of Lemonade Server (lemond, CLI, web app)  -> /opt/lemonade
 #   1bit-appliance   the meta/config package: units, banner, first boot, apt source
 #   1bit-archive-keyring  the public half of the key that signs 1bit.gg/apt
+#   1bit-openwebui  the optional chat front end (units, console line, no container runtime:
+#                    engine#594) - in the repository, installed by nobody, apt-installed on request
 #
 # With KERNEL_STAGE=<dir> set it also builds the three packages that only a box needs, from the
 # release kernel build as it sits on the build machine (<dir>/boot/vmlinuz-<kver>, System.map-<kver>,
@@ -283,6 +285,29 @@ if [ -n "$kver" ]; then
         "$p/DEBIAN/control"
 fi
 dpkg-deb --build --root-owner-group "$p" "$out/1bit-appliance_${debver}_amd64.deb" >/dev/null
+
+# --- the optional one: no target wants it, nothing depends on it, so an absent or failing OpenWebUI
+# can never hold a boot (engine#594). It publishes like the rest, is installed by nobody, and the
+# operator's `apt install 1bit-openwebui` is what a box runs it with (os/v2/README.md).
+echo "== 1bit-openwebui"
+newpkg 1bit-openwebui
+withscripts 1bit-openwebui
+cp -a "$here/debian/1bit-openwebui/files"/. "$p/"
+# cp -a keeps what git has, but the modes are what systemd and dpkg will honour: say them here
+chmod 755 "$p/usr/lib/1bit/openwebui-run.sh" "$p/usr/lib/1bit/openwebui-console.sh"
+mkdir -p "$p/usr/share/doc/1bit-openwebui"
+# the software itself is the upstream image, pulled on the box at first start: the licence travels with
+# the image, so what this package carries is who it came from and where its settings are
+doc "$p" 1bit-openwebui
+cat > "$p/usr/share/doc/1bit-openwebui/UPSTREAM" <<'UPSTREAM'
+1bit OS, the optional OpenWebUI chat front end
+
+OpenWebUI is not distributed in this package: it is the upstream container image
+(ghcr.io/open-webui/open-webui), pulled by the unit on the box at its first start, and its own licence
+travels with that image. What this package carries is the unit, the console line, the environment it is
+run with, and 1bit OS's Apache-2.0 licence beside this file.
+UPSTREAM
+builddeb
 
 echo "== 1bit-archive-keyring"
 newpkg 1bit-archive-keyring

@@ -36,6 +36,16 @@
 # Gated/no-config models do NOT fail the run — they are unverifiable without an HF token
 # and expected; only genuinely uncovered classes alert.
 #
+# The same run also watches FastFlowLM's HF org and runtime releases (engine #588, inside
+# tools/census_watch.py). A repo whose architecture the registry does not map prints
+# `!! NEW FLM` and is the alert too: exit 1 either way, so neither source can turn the
+# other's alert green. A release whose notes name the q4nx/chunk/layout container is
+# printed as `kernel-format` for the issue body but does not alert on its own.
+#
+# Only exit 1 files an issue. Exit 2 means a watch did not run (no network, an unreadable
+# listing) — that stays a red check, not a coverage-breach issue, so a network hiccup
+# cannot file a bogus "class uncovered" report.
+#
 # Permissions (RFC #246): the workflow token is read-only by default. Only the `alert` job holds
 # `issues: write`. It never checks out or runs repository code; it only reads the watch job's
 # filtered output, which carries Hugging Face model ids and class names (untrusted text). Those
@@ -93,9 +103,9 @@ jobs:
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
           fi
-          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
+          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|kernel-format" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
-          if [ $rc -ne 0 ]; then echo "alert=true" >> "$GITHUB_OUTPUT"; fi
+          if [ $rc -eq 1 ]; then echo "alert=true" >> "$GITHUB_OUTPUT"; fi
           exit $rc
 
   alert:
@@ -125,7 +135,8 @@ jobs:
             echo "## Census coverage breach"
             echo ""
             echo "The daily new-model watcher found Hugging Face models whose architecture class is not"
-            echo "mapped by the engine registry (\`registry/architectures.json\`):"
+            echo "mapped by the engine registry (\`registry/architectures.json\`), or a FastFlowLM"
+            echo "repo publishing a model family this engine does not map (engine #588):"
             echo ""
             echo '```'
             printf '%s' "$LINES" | base64 -d

@@ -1,37 +1,20 @@
 {
- "id": "FastFlowLM/Ornith-1.5-35B-NPU2",
- "modelId": "FastFlowLM/Ornith-1.5-35B-NPU2",
- "lastModified": "2026-10-25T11:02:00.000Z",
- "createdAt": "2026-10-24T16:29:09.000Z",
- "tags": [
-  "ornith_text",
-  "q4nx",
-  "amd-npu",
-  "license:mit",
-  "base_model:acme/ornith-1.5-35b"
- ],
- "pipeline_tag": "zero-shot-classification",
- "config": {
-  "model_type": "ornith_text"
- },
+ "id": "FastFlowLM/MiniCPM-V-4.7-1B-NPU2",
+ "lastModified": "2026-10-12T17:24:58.000Z",
  "siblings": [
   {
    "rfilename": "model.q4nx",
-   "size": 2750560152,
+   "size": 1068839584,
    "lfs": {
-    "size": 2750560152
+    "size": 1068839584
    }
   },
   {
    "rfilename": "vision_weight.q4nx",
-   "size": 667061544,
+   "size": 1135147712,
    "lfs": {
-    "size": 667061544
+    "size": 1135147712
    }
-  },
-  {
-   "rfilename": "config.json",
-   "size": 3000
   }
  ]
 }

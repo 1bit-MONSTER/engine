@@ -154,6 +154,26 @@ Gated repos (no config without a token) are reported as unverifiable and never f
 run; derivatives (a quantized GGUF, a LoRA adapter) have no config by design and are
 skipped, because the release they derive from carries the config and is what gets checked.
 
+The same run also watches FastFlowLM (engine#588), because that is where a family arrives
+that the engine may have to serve itself: their HF org
+(`api/models?author=FastFlowLM&sort=lastModified`, one listing request whose `expand[]`
+brings `lastModified`, the tags and the config back inline — no per-model fetch) and their
+runtime releases (`FastFlowLM/FastFlowLM`). A repo prints one line with its `*.q4nx` files
+and sizes (`?blobs=true`, fetched only for a repo that is new or changed), its license and
+base model, its architecture, whether `architectures.json` maps that architecture, and
+whether the npu route already serves the family. A family the registry does not map prints
+`!! NEW FLM` and is the alert, exactly like an uncovered class: exit 1 either way, so
+neither watch can turn the other's alert green. A repo with no config is one of the org's
+quantized `.gguf` drops — a derivative, reported but not an alert. A release whose notes or
+asset names mention `q4nx`, `chunk` or `layout` is marked `kernel-format` for a human to
+read before the pinned Q4NX decoder moves; that line alone does not alert ("chunk" also
+matches streamed-SSE prose, so the flag means "read the notes").
+
+The repo ids and their `lastModified`, plus the release tags, are kept in the same state
+file, so a daily run prints only what is new or changed; `--full` lists every repo and
+release on demand. A FastFlowLM fetch that fails is a runtime failure (exit 2) — never a
+quiet day — but an alert from the other watch still wins the exit code.
+
 ## Commands
 
 ```
@@ -162,6 +182,8 @@ tools/registry_build.py --check    # exit 1 if it is stale
 tools/registry_check.py build/1bit --models ~/models   # run the checks on Strix Halo
 tools/census.py                    # full HF sweep (about 420 pages)
 tools/census.py --report           # recompute coverage from the saved counts
-tools/census_watch.py              # newest models vs the registry; exit 1 on an uncovered class
+tools/census_watch.py              # newest models vs the registry, plus FastFlowLM's org and
+                                   # releases (--full to list all); exit 1 on an uncovered class
+                                   # or an unmapped FastFlowLM family
 scripts/census-watch.sh            # the same, with the log file and the origin/main refresh
 ```

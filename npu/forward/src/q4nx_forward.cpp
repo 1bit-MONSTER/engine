@@ -1005,6 +1005,17 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         }
         return true;
     };
+    // alpha/beta are stored row-padded to the 32-row tile (48 heads -> 64 rows,
+    // Q8: 40 tiles x 8704 B = 348160 B), so dequantise at the stored height and
+    // keep the first `rows`.  Short-circuits when rows already tile-align.
+    auto deq_pad = [&](const char* suffix, float* out, int rows, int cols) -> bool {
+        if (rows % Q4NX_TILE_ROWS == 0) return deq(suffix, out, rows, cols);
+        const int prows = ((rows + Q4NX_TILE_ROWS - 1) / Q4NX_TILE_ROWS) * Q4NX_TILE_ROWS;
+        std::vector<float> tmp((size_t)prows * (size_t)cols);
+        if (!deq(suffix, tmp.data(), prows, cols)) return false;
+        memcpy(out, tmp.data(), (size_t)rows * (size_t)cols * sizeof(float));
+        return true;
+    };
     auto bf16v = [&](const char* suffix, float* out, int n) -> bool {
         TensorDesc* d = tensor(suffix);
         if (!d) { err_ = std::string("GDN: no tensor ") + nm; return false; }
@@ -1016,11 +1027,20 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         for (int i = 0; i < n; i++) out[i] = bf16_to_f32(((const uint16_t*)raw)[i]);
         return true;
     };
-    if (!deq("linear_attn.qkv_proj.weight", wqkvlin_.data(), CD, H)) return false;
-    if (!deq("self_attn.gate_proj.weight", wz_.data(), lin_vd_, H)) return false;
-    if (!deq("linear_attn.ssm_out_proj.weight", woutlin_.data(), H, lin_vd_)) return false;
-    if (!deq("linear_attn.ssm_alpha_proj.weight", wa_.data(), lin_nvh_, H)) return false;
-    if (!deq("linear_attn.ssm_beta_proj.weight", wb_.data(), lin_nvh_, H)) return false;
+    // The three big GDN projections are only ever read through q4nx_assemble_B()
+    // when their packed BO is not cached yet, so re-dequantising them on every
+    // token is pure waste (~1.5 GB per layer per token).  The small members below
+    // (alpha/beta, conv, norm, ssm_a/dt) are used on the host every token and are
+    // still refreshed.
+    const bool proj_cached = weight_cache_ && weight_cached(0) && weight_cached(1) &&
+                             weight_cached(6);
+    if (!proj_cached) {
+        if (!deq("linear_attn.qkv_proj.weight", wqkvlin_.data(), CD, H)) return false;
+        if (!deq("self_attn.gate_proj.weight", wz_.data(), lin_vd_, H)) return false;
+        if (!deq("linear_attn.ssm_out_proj.weight", woutlin_.data(), H, lin_vd_)) return false;
+    }
+    if (!deq_pad("linear_attn.ssm_alpha_proj.weight", wa_.data(), lin_nvh_, H)) return false;
+    if (!deq_pad("linear_attn.ssm_beta_proj.weight", wb_.data(), lin_nvh_, H)) return false;
     if (!bf16v("linear_attn.ssm_conv1d.weight", lin_conv_w_.data(), lin_ck_ * CD)) return false;
     if (!bf16v("linear_attn.ssm_norm.weight", lin_norm_w_.data(), lin_vhd_)) return false;
     {
@@ -1225,8 +1245,10 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         const Q4nxDesignGeom* g = &designs_[i_o];
         Q4nxProjections p{};
         p.o = woutlin_.data();
-        if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
-        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out, 2);
+        // Key 6, not 2: key 2 is the FFN gate_proj of this same layer (N = IM),
+        // so reusing it handed this N = H GEMM a BO packed for the other width.
+        if (!weight_cached(6) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
+        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out, 6);
     }
     return true;
 }
@@ -1779,8 +1801,8 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     {   // kv_a: [H] -> [kv_real] (+ zero pad to the kernel's n-tile)
         const Q4nxDesignGeom* g = &designs_[i_kva];
         Q4nxProjections p{}; p.v = w_kva_.data();
-        if (!weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble kv_a"; return false; }
-        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva, 2);
+        if (!weight_cached(6) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble kv_a"; return false; }
+        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva, 6);
     }
     if ((int)kva.size() < kv_real) { err_ = "kv_a short"; return false; }
     std::vector<float> kl(kv_lora_);
@@ -1858,8 +1880,8 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
     {   // o_proj: [NH*v_head] -> [H]
         const Q4nxDesignGeom* g = &designs_[i_o];
         Q4nxProjections p{}; p.o = w_o_.data();
-        if (!weight_cached(3) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
-        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o, 3);
+        if (!weight_cached(7) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
+        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o, 7);
     }
     return true;
 }

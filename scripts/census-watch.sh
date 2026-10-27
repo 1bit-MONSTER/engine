@@ -26,16 +26,16 @@
 # makes. Any new class the registry does not map is the alert: that is the one thing that
 # silently moves the mapped share the census reports.
 #
-# It then runs tools/fflm_watch.py, which watches what the architecture census cannot see
-# (engine #588): FastFlowLM's `*-NPU2` repos, whose drops are q4nx files rather than
-# architecture classes, and FastFlowLM's own runtime releases, flagging the ones whose notes
-# move the q4nx container. It is reported in the same log and never changes this script's
-# exit code: the FLM watch being unreachable must not silence an unmapped-architecture alert.
+# The same run also watches FastFlowLM (engine #588): their HF org, whose `*-NPU2` drops
+# are q4nx files rather than architecture classes, and their runtime releases, flagging the
+# ones whose notes move the q4nx container. tools/census_watch.py does both in one process,
+# so a failure there is printed and never loses the architecture alert, and an unmapped FLM
+# family cannot turn a quiet architecture walk green.
 #
 # Exit codes (same contract as tools/census_watch.py):
-#   0  no uncovered classes among the newest models
-#   1  an uncovered class arrived (the alert)
-#   2  the refresh step refused to touch the checkout
+#   0  no uncovered classes among the newest models, and no unmapped FastFlowLM family
+#   1  an uncovered class arrived, or an unmapped FastFlowLM family did (the alert)
+#   2  the refresh step refused to touch the checkout, or a watch did not run
 #   *  runtime failure (no network, unreadable registry, ...)
 #
 # Usage:
@@ -82,20 +82,8 @@ RC=${PIPESTATUS[0]}
 set -e
 
 if [ "${RC}" -ne 0 ]; then
-    echo "census-watch: EXIT ${RC} (an uncovered class needs a registry mapping;" \
-         "full log: ${LOG})" | tee -a "${LOG}"
-fi
-
-# FastFlowLM watch: same log, reported only. Its own exit code is printed, never propagated - a new
-# `*-NPU2` family the registry does not map is worth a look, but it must not turn the architecture
-# alert green or red.
-set +e
-python3 "${ROOT}/tools/fflm_watch.py" 2>&1 | tee -a "${LOG}"
-FLM_RC=${PIPESTATUS[0]}
-set -e
-if [ "${FLM_RC}" -ne 0 ]; then
-    echo "census-watch: fflm-watch EXIT ${FLM_RC} (a FastFlowLM drop or release needs a look;" \
-         "full log: ${LOG})" | tee -a "${LOG}"
+    echo "census-watch: EXIT ${RC} (an uncovered class or an unmapped FastFlowLM family needs a" \
+         "registry mapping; full log: ${LOG})" | tee -a "${LOG}"
 fi
 
 exit "${RC}"

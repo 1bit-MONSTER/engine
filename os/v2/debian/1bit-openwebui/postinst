@@ -1,0 +1,50 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# 1bit-openwebui: the optional chat front end (engine#594). apt installing this package IS the decision
+# to run it, so it enables its own two units - and starts nothing, because the first start pulls a
+# multi-gigabyte image and apt holds the dpkg lock: `systemctl start 1bit-openwebui` is the operator's
+# step (os/v2/README.md), and the next boot does it otherwise.
+#
+# Both enable paths are the appliance's (debian/1bit-appliance/postinst): deb-systemd-helper for an
+# image build, systemctl on a box, and the links written explicitly too - in a chroot deb-systemd-helper
+# left units behind there, which is how the appliance once came up with no network at all.
+set -e
+units="1bit-openwebui.service 1bit-openwebui-console.timer"
+if command -v deb-systemd-helper >/dev/null 2>&1; then
+    deb-systemd-helper enable $units >/dev/null 2>&1 || true
+fi
+L=/etc/systemd/system
+mkdir -p "$L/multi-user.target.wants" "$L/timers.target.wants"
+for u in $units; do
+    [ -e "/usr/lib/systemd/system/$u" ] || continue
+    case $u in
+        *.timer) t=timers.target ;;
+        *) t=multi-user.target ;;
+    esac
+    ln -sf "/usr/lib/systemd/system/$u" "$L/$t.wants/$u"
+done
+command -v systemd-tmpfiles >/dev/null 2>&1 &&
+    systemd-tmpfiles --create /usr/lib/tmpfiles.d/1bit-openwebui.conf 2>/dev/null || true
+if [ -d /run/systemd/system ] && command -v systemctl >/dev/null 2>&1; then
+    systemctl daemon-reload || true
+    systemctl enable $units >/dev/null 2>&1 || true
+fi
+# the runtime is only Suggests: this install has to work on a box with no Ubuntu archive (the VM, a
+# stick made elsewhere), so a missing runtime is said here rather than left as a failed unit
+if ! command -v podman >/dev/null 2>&1 && ! command -v docker >/dev/null 2>&1; then
+    echo "1bit-openwebui: no container runtime yet: apt install podman, then systemctl start 1bit-openwebui"
+fi
+exit 0

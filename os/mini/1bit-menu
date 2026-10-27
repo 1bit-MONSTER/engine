@@ -134,6 +134,7 @@ link() {
 MODE=LIVE
 IP=none
 PORT=13305
+CHATPORT=8080
 URL=http://localhost:13305/
 APURL=http://localhost:13305/api/v1
 installed() { [ -e /data/.installed ] || [ -e /etc/1bit/installed ]; }
@@ -160,7 +161,8 @@ header() {
     else
         printf 'runs from RAM, nothing installed, disks untouched\n'
     fi
-    # the two things a person wants first: where to click, and where to point a client. The web app is
+    # the things a person wants first: where to click, and where to point a client (and, where the
+    # optional OpenWebUI package is installed, the second front end below). The web app is
     # Lemonade's own (served at /, chat right away); the API is OpenAI-compatible under /api/v1. Both
     # are OSC 8 links where the terminal can make them clickable; on the VT (TERM=linux) they are the
     # bare text, because the console would show the escape instead.
@@ -168,6 +170,16 @@ header() {
     printf '  Web app      %s' "$BOLD"
     link "$URL"
     printf '%s   open it in a browser and chat (%s)\033[K\n' "$RESET" "$web"
+    # the optional second front end (1bit-openwebui, engine#594): the same line, the same probe, but
+    # only where that package is installed - and nothing is probed where it is not, so a live boot and
+    # an installed box without OpenWebUI pay nothing for it. 8080 answers -> (up), else (starting),
+    # exactly like the line above; the URL is the one the package's own console line prints.
+    if [ -e /usr/lib/systemd/system/1bit-openwebui.service ]; then
+        if wget -q -O /dev/null -T 2 "http://127.0.0.1:$CHATPORT/" 2>/dev/null; then chat=up; else chat=starting; fi
+        printf '  Chat UI      %s' "$BOLD"
+        link "http://$IP:$CHATPORT/"
+        printf '%s   OpenWebUI, the other front end (%s)\033[K\n' "$RESET" "$chat"
+    fi
     printf '  On a phone   press %su%s: that URL as a QR code (the console cannot be clicked)\033[K\n' "$BOLD" "$RESET"
     printf '  API          '
     link "$APURL"

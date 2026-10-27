@@ -1,0 +1,27 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# The console line for the optional front end (engine#594), one probe per run: it writes
+# /etc/issue.d/50-1bit-openwebui.issue saying (up) or (starting), the same two words the menu's probe
+# of 13305 uses. Started by 1bit-openwebui-console.timer, never enabled directly and wanted by no
+# target: the probe (up to 2 s) is never on the boot's critical path.
+[Unit]
+Description=1bit OS: the console's Chat UI line (OpenWebUI)
+Documentation=https://1bit.gg
+After=1bit-openwebui.service
+
+[Service]
+Type=oneshot
+ExecStart=/usr/lib/1bit/openwebui-console.sh
+TimeoutStartSec=30

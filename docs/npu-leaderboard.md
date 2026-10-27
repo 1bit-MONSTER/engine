@@ -28,6 +28,7 @@ One row is one measured run of this engine. A record is only ranked if it names 
 | Flash-Next (IQ4_XS 4.25 bpw) | hrx | IQ4_XS | prefill p1024 ub576 | 269.34 tok/s | ngl=99, fa=1, ub=576, engine=0d0c846 | 1 | llama-bench -p 1024, 1 repeat |
 | Flash-Next (IQ4_XS 4.25 bpw) | hrx | IQ4_XS | prefill pp4096 | 260.59 tok/s | ngl=99, fa=1, ub=512, engine=0d0c846 | 3 | llama-bench -p 4096, 3 repeats, s.d. 4.51 tok/s |
 | Qwen3-4B | hrx | as shipped (1bit-hrx-3092596) | decode (eval) | 41.48 tok/s | parallel=4, kv_unified=true, requests=60 | 1 | llama-server timings in the response body |
+| Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | prefill | 58.14 s | device=accel0, addon=npu-dx 1e89468d4, engine=fix/587-gdn-batch on 800cf6f, batch=5 tokens in one step_batch chunk, submits=350, threads=4, pin=0-3, tokens=1 | 1 | wall clock for one request + /proc/<pid>/stat cpu_s + npu-trace submit count; same prompt/params as the 145.7 s sequential record |
 | Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | decode | 63.1 s/token | device=accel0, addon=npu-dx 1e89468d4, threads=4, pin=0-3, tokens=8 | 1 | wall clock / tokens, 505 s for 8 greedy tokens |
 | Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | decode | 67.5 s/token | device=accel0, addon=local xrt-free patch, threads=4, tokens=8 | 1 | wall clock / tokens, 540 s for 8 greedy tokens |
 
@@ -35,5 +36,6 @@ One row is one measured run of this engine. A record is only ranked if it names 
 - `flashnext-p1024-ub576-20261027` — 2026-10-27T02:50:00Z; source: ~/lb/572/run-20261027T015408Z/a4-ub576.out (strixhalo); shows the ubatch bound above 512 no longer refuses the run; single repeat, do not read as a tuned number
 - `flashnext-pp4096-20261027` — 2026-10-27T02:41:00Z; source: ~/lb/572/run-20261027T015408Z/a1-timing.out (strixhalo)
 - `qwen3-4b-hrx-parallel4-20261027` — 2026-10-27T12:36:00Z; source: ~/lb/528/run-20261027T123606Z-none (strixhalo); #528 repro arm: only one slot was used, so this is a single-slot decode rate and the NaN report stayed unreproduced
+- `27b-prefill-batched-20261027` — 2026-10-27T21:33:22Z; source: ~/lb/587-gbnos.sh run log 587-gbnos-server-20261027T213012Z.log; prompt 'The capital of France is' -> ' Paris'; sequential baseline for the same request was 2298 submits / 145.7 s; device wait is 26 ms per submit, so cost tracks submit count
 - `27b-npudx-20261027` — 2026-10-27T14:40:00Z; source: ~/lb/587-npudx-smoke.sh run log on strixhalo; prompt 'The capital of France is' -> ' Paris.\nThe capital of Germany is'; upstream add-on, no local patch
 - `27b-localaddon-20261027` — 2026-10-27T14:20:00Z; source: ~/lb/587-noxrt-smoke-20261027T101012Z.log; same text as the npu-dx row; kept because it is the pair that established the add-on does not move decode

@@ -1,0 +1,23 @@
+{
+  "id": "flashnext-pp512-20261027",
+  "host": "strixhalo",
+  "model": "Flash-Next (IQ4_XS 4.25 bpw)",
+  "route": "hrx",
+  "quant": "IQ4_XS",
+  "metric": {
+    "name": "prefill pp512",
+    "value": 286.63,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "ngl": 99,
+    "fa": 1,
+    "ub": 512,
+    "engine": "0d0c846"
+  },
+  "instrument": "llama-bench -p 512, 3 repeats, s.d. 0.94 tok/s",
+  "repeats": 3,
+  "timestamp": "2026-10-27T02:38:52Z",
+  "source": "~/lb/572/run-20261027T015408Z/a1-timing.out (strixhalo)",
+  "notes": "gufo reference on the same box is 1679 tok/s; the analysis is in docs/hrx.md"
+}

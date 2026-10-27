@@ -30,6 +30,8 @@ One row is one measured run of this engine. A record is only ranked if it names 
 | Qwen3-4B | hrx | as shipped (1bit-hrx-3092596) | decode (eval) | 41.48 tok/s | parallel=4, kv_unified=true, requests=60 | 1 | llama-server timings in the response body |
 | Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | decode | 63.1 s/token | device=accel0, addon=npu-dx 1e89468d4, threads=4, pin=0-3, tokens=8 | 1 | wall clock / tokens, 505 s for 8 greedy tokens |
 | Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | decode | 67.5 s/token | device=accel0, addon=local xrt-free patch, threads=4, tokens=8 | 1 | wall clock / tokens, 540 s for 8 greedy tokens |
+| Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | first token (weight pack included) | 145.7 s | device=accel0, commits=800cf6f, threads=32 | 1 | request wall and driver trace span |
+| Qwen3.8-27B-NPU2 | npu | Q4NX (int8 GEMM) | first token (weight pack included) | 435.9 s | device=accel0, commits=pre-#622, threads=32 | 1 | driver trace span, gated on ~/npu.lock |
 
 - `flashnext-pp512-20261027` — 2026-10-27T02:38:52Z; source: ~/lb/572/run-20261027T015408Z/a1-timing.out (strixhalo); gufo reference on the same box is 1679 tok/s; the analysis is in docs/hrx.md
 - `flashnext-p1024-ub576-20261027` — 2026-10-27T02:50:00Z; source: ~/lb/572/run-20261027T015408Z/a4-ub576.out (strixhalo); shows the ubatch bound above 512 no longer refuses the run; single repeat, do not read as a tuned number
@@ -37,3 +39,5 @@ One row is one measured run of this engine. A record is only ranked if it names 
 - `qwen3-4b-hrx-parallel4-20261027` — 2026-10-27T12:36:00Z; source: ~/lb/528/run-20261027T123606Z-none (strixhalo); #528 repro arm: only one slot was used, so this is a single-slot decode rate and the NaN report stayed unreproduced
 - `27b-npudx-20261027` — 2026-10-27T14:40:00Z; source: ~/lb/587-npudx-smoke.sh run log on strixhalo; prompt 'The capital of France is' -> ' Paris.\nThe capital of Germany is'; upstream add-on, no local patch
 - `27b-localaddon-20261027` — 2026-10-27T14:20:00Z; source: ~/lb/587-noxrt-smoke-20261027T101012Z.log; same text as the npu-dx row; kept because it is the pair that established the add-on does not move decode
+- `27b-first-token-after-transpose-20261027` — 2026-10-27T20:15:00Z; source: ~/lb/587-trace-20261027T201250Z/bpf.log (37 507 driver events); same trace, binary built from main 800cf6f (#622): device wait 59.8 s (2 298 x 26 ms), host 83.7 s, one gap above a second
+- `27b-first-token-before-transpose-20261027` — 2026-10-27T17:56:00Z; source: ~/lb/587-trace-20261027T175645Z/bpf.log (37 504 driver events); 362.9 s of this is host time with no ioctl in flight; 220.9 s of it in 120 gaps of more than a second, all before a single 89.13/73.40/52.43 MB weight BO was created

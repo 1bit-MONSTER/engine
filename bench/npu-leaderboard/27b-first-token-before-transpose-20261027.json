@@ -1,0 +1,22 @@
+{
+  "id": "27b-first-token-before-transpose-20261027",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX (int8 GEMM)",
+  "metric": {
+    "name": "first token (weight pack included)",
+    "value": 435.9,
+    "unit": "s"
+  },
+  "settings": {
+    "device": "accel0",
+    "commits": "pre-#622",
+    "threads": 32
+  },
+  "instrument": "driver trace span, gated on ~/npu.lock",
+  "repeats": 1,
+  "timestamp": "2026-10-27T17:56:00Z",
+  "source": "~/lb/587-trace-20261027T175645Z/bpf.log (37 504 driver events)",
+  "notes": "362.9 s of this is host time with no ioctl in flight; 220.9 s of it in 120 gaps of more than a second, all before a single 89.13/73.40/52.43 MB weight BO was created"
+}

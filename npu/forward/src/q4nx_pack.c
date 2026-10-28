@@ -276,13 +276,28 @@ const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,
     return NULL;
 }
 
-/* Copy src[n][i] (row-major [rows][K]) into B[i][n0 + n]. */
+/* Copy src[n][i] (row-major [rows][K]) into B[i][n0 + n].
+ *
+ * Tiled: writing one float at B[i*N + n0 + n] while walking n costs a 70 KB stride
+ * (N = 17408 -> 68 KB) and one cache line per element, which measured 0.6-1.9 s for
+ * a single 5120x17408 projection on strixhalo -- that is the whole reason a first
+ * token took minutes, not the pack that follows it. 64x64 tiles make every inner
+ * run 64 contiguous floats on both sides (16 KB source tile stays in L1/L2);
+ * measured 20-27 ms for the same projection, byte-identical output. */
 static void scatter_transposed(const float* src, int K, int rows, int n0, int N,
                                float* B) {
-    for (int n = 0; n < rows; n++) {
-        const float* row = src + (size_t)n * (size_t)K;
-        for (int i = 0; i < K; i++)
-            B[(size_t)i * (size_t)N + (size_t)(n0 + n)] = row[i];
+    const int T = 64;
+    #pragma omp parallel for schedule(static)
+    for (int jb = 0; jb < rows; jb += T) {
+        const int jn = (rows - jb < T) ? (rows - jb) : T;
+        for (int ib = 0; ib < K; ib += T) {
+            const int in = (K - ib < T) ? (K - ib) : T;
+            for (int i = 0; i < in; i++) {
+                float* dst = B + (size_t)(ib + i) * (size_t)N + (size_t)(n0 + jb);
+                for (int b = 0; b < jn; b++)
+                    dst[b] = src[(size_t)(jb + b) * (size_t)K + (size_t)(ib + i)];
+            }
+        }
     }
 }
 

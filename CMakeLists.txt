@@ -149,6 +149,11 @@ set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
 # the OS image's own release check: its lemonade row must prove the API key is enforced, not infer it
 # from an empty body (os/mini/release-check.sh --self-test; no device and no build needed)
 add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
+# engine #574: the signed manifest of a sealed NPU kernel set. tools/seal_manifest.py writes it (sha256
+# of the ciphertext, Ed25519 over the manifest) and checks it; the test is a throwaway set in a temp
+# dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
+# manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
+add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
 add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
@@ -386,11 +391,14 @@ if(Python3_Interpreter_FOUND)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
     # the new-model watcher's alert contract (offline: synthetic batches against the
-    # committed registry), so a regression cannot leave the daily alert permanently green.
+    # committed registry, plus FastFlowLM's org listing and releases from the recorded
+    # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
+    # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
-    # FastFlowLM's drops are files, not architecture classes (engine #588): the org listing and the runtime
-    # releases. Offline too - recorded API payloads under tests/fixtures/fflm/.
-    add_test(NAME fflm_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/fflm_watch_test.py)
+
+    # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
+    # published FastFlowLM model goes through is proved to fire without the model at hand.
+    add_test(NAME q4nx_dir_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_q4nx_dir.py --self-test)
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)

@@ -1,0 +1,22 @@
+{
+  "id": "qwen3-4b-hrx-parallel4-20261027",
+  "host": "strixhalo",
+  "model": "Qwen3-4B",
+  "route": "hrx",
+  "quant": "as shipped (1bit-hrx-3092596)",
+  "metric": {
+    "name": "decode (eval)",
+    "value": 41.48,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "parallel": 4,
+    "kv_unified": "true",
+    "requests": 60
+  },
+  "instrument": "llama-server timings in the response body",
+  "repeats": 1,
+  "timestamp": "2026-10-27T12:36:00Z",
+  "source": "~/lb/528/run-20261027T123606Z-none (strixhalo)",
+  "notes": "#528 repro arm: only one slot was used, so this is a single-slot decode rate and the NaN report stayed unreproduced"
+}

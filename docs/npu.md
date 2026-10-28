@@ -121,7 +121,11 @@ repack script) names a different converter than this build would use (`repack_gg
 --check-stamp <dir>`: exit 0 current, 1 stale, 2 cannot tell). If the checker or the converter
 cannot be found, serve warns once per process and reuses the directory, so a missing script
 cannot stop serving. A Q4NX directory served as it is (`1bit serve -m <Q4NX dir>`), such as a
-published FastFlowLM model, is trusted as published.
+published FastFlowLM model, is trusted as published. Its chunk layout can be checked first, without
+dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container header only, names each
+quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
+needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
+not record which one it holds.
 
 ## Serving
 
@@ -134,6 +138,26 @@ kernels (dense Qwen3: 0.6B, 1.7B and 4B):
 
 In Lemonade, the `onebit` recipe's `npu` backend serves the same directories (`--onebit npu`).
 The model directory holds the weights only; the kernels ship inside the package.
+
+### Sealed kernel sets: the manifest is what says a set is ours
+
+A set ships as `<set>/layout.json`, `<set>/layer1_*/layer1.elf` (each `1BPKCRYP` ciphertext, opened
+in memory by the loader with the kernel key) and two more files: `manifest.json`, which lists every
+file the set carries with the sha256 of its **ciphertext**, and `manifest.sig`, an Ed25519 signature
+over the manifest's exact bytes made with the release signing key. Sealing on its own is
+confidentiality only: a set re-sealed by another key, or swapped for a different set that also
+decrypts, would be indistinguishable from ours. The signature covers the manifest, the manifest's
+digests cover the ciphertext files, and the release public key never leaves the loader.
+
+`tools/seal_manifest.py` is the public half: `write <set> --key <release key>` emits both files,
+`check <set>` proves the manifest lists exactly the set's files with their sha256 (no key needed),
+and `verify <set> --pub <release public key>` proves the signature too. `scripts/package-linux.sh`
+refuses to pack a set without them, `scripts/weekly.sh`'s `package_checks` refuses a tarball whose
+sets do not match their manifests (`ONEBIT_SEAL_PUB=<release public key>` also verifies the
+signatures there), and `1bit-release-check`'s `sealed`/`sealed-sig` rows prove the same on the stick
+(the signature where the image has an interpreter and the key). The loader-side requirement,
+`ONEBIT_KCRYPT_REQUIRE_MANIFEST=1` beside `ONEBIT_KCRYPT_REQUIRE_SEALED`, is read by the private NPU
+runtime and lands with the pin that makes it honour one - engine #574.
 
 ### Dense Qwen3, checked on the NPU
 

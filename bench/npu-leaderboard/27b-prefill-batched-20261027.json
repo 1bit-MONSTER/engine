@@ -1,0 +1,27 @@
+{
+  "id": "27b-prefill-batched-20261027",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX (int8 GEMM)",
+  "metric": {
+    "name": "prefill",
+    "value": 58.14,
+    "unit": "s"
+  },
+  "settings": {
+    "device": "accel0",
+    "addon": "npu-dx 1e89468d4",
+    "engine": "fix/587-gdn-batch on 800cf6f",
+    "batch": "5 tokens in one step_batch chunk",
+    "submits": 350,
+    "threads": 4,
+    "pin": "0-3",
+    "tokens": 1
+  },
+  "instrument": "wall clock for one request + /proc/<pid>/stat cpu_s + npu-trace submit count; same prompt/params as the 145.7 s sequential record",
+  "repeats": 1,
+  "timestamp": "2026-10-27T21:33:22Z",
+  "source": "~/lb/587-gbnos.sh run log 587-gbnos-server-20261027T213012Z.log",
+  "notes": "prompt 'The capital of France is' -> ' Paris'; sequential baseline for the same request was 2298 submits / 145.7 s; device wait is 26 ms per submit, so cost tracks submit count"
+}

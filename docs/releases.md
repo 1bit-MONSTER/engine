@@ -175,6 +175,15 @@ kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels on
 an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The
 release machine holds the kernel key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
 
+Sealing is confidentiality; each set is signed too (#574). Before a set is packed it gets
+`manifest.json` - every file the set ships, with the sha256 of its ciphertext - and `manifest.sig`,
+Ed25519 over that manifest by the release signing key (`tools/seal_manifest.py write <set> --key
+<release key>`, `ONEBIT_SEAL_KEY`). Packaging requires both: `scripts/package-linux.sh` and the
+weekly `package_checks` refuse a set without them or a manifest that does not match the files
+packed, and verify the signatures when `ONEBIT_SEAL_PUB` names the release public key.
+`1bit-release-check` proves the same on a written stick, so a set that was re-sealed or swapped
+fails the checks even though it still opens.
+
 ### Private components
 
 Two components of the release binaries are proprietary and compiled in; their source is not in

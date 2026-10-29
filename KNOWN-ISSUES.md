@@ -801,13 +801,14 @@ whole run was **83 °C**, with 6 gate pauses, 0 freezes and 0 aborts, so no even
 threshold — but the stated 93 °C rule was not the one in force and that is recorded rather than smoothed
 over.
 
-**3. What is still unmeasured, and what it would take.** None of these are hidden behind the PASS above:
+**3. What is still unmeasured, and what it would take.** None of these are hidden behind the PASS above, and the two
+cells this release was asked about are marked **not measured** in the table rather than left to read as done:
 
 | gap | why | what would close it |
 |---|---|---|
 | GLM-4.7-Flash's own **KLD / same-top** | no stored base logits exist for this model on the box (the gate has bases only for qwen3-0.6b, qwen3-4b-iq4xs, qwen3-coder-30b-a3b, qwen3.8-27b, zaya1-8b), and producing one costs 1-2.5 GB on a disk that was at 14 GB free with other agents' work resident | add `glm-4.7-flash` to `MODEL_TABLE` with a stored base at the pin, then `hw-gate.sh --phases kld --models glm-4.7-flash` |
-| GLM **throughput** at this composition | the box went down before the `llama-bench` run | `llama-bench -m GLM-4.7-Flash-Q4_K_M.gguf -dev HRX0 -ngl 99 -fa on -p 512,2048 -n 128 -r 3` on the same build |
-| the **intervention cell** (forced KFD eviction, `~/wt/evictonly`) re-run **with** the fix | the #315 regime needs ~100 GiB of GTT with 4 GLM-4.7-Flash neighbours, which needs the services-off window the owner gates (`~/soff.sh`, BOX-CONTROL.md queue item), and the box is down | one services-off window: composition as in `~/wt/315soak/soak.sh` plus the forcer, ≥ 8 fresh arms, 0 faults expected under CWSR off |
+| GLM **throughput** at this composition | **not measured:** the run never happened (the box went down before it, and a GPU hold is not ours to take while the leaderboard and kernel lanes hold the device) | **not yet measured - needs one `llama-bench` hold:** `llama-bench -m GLM-4.7-Flash-Q4_K_M.gguf -dev HRX0 -ngl 99 -fa on -p 512,2048 -n 128 -r 3` on the same build |
+| the **intervention cell** (forced KFD eviction, `~/wt/evictonly`) re-run **with** the fix | **not measured:** the #315 regime needs ~100 GiB of GTT with 4 GLM-4.7-Flash neighbours, i.e. the services-off window the owner gates (`~/soff.sh`, BOX-CONTROL.md queue item); no such window has opened, so this cell has no result and none is implied | **not yet measured - needs the owner's services-off window:** one window, composition as in `~/wt/315soak/soak.sh` plus the forcer, ≥ 8 fresh arms, 0 faults expected under CWSR off |
 | a **trace of KFD migrating the save area** during a faulting run | the record traces the save area's **allocation class** (`kfd_queue_buffer_get` → GTT vs `kfd_queue_buffer_svm_get` → SVM, `~/wt/315c1/{csa.bt,alloc.bt}`), not the eviction event itself | a kprobe on the KFD eviction/restore path keyed by the CSA range, on a CWSR-on boot with the forcer |
 
 On the regression test, precisely: the fix's own commit (#454) added `tests/hrx_cwsr_test.cpp`, whose
@@ -818,5 +819,5 @@ end-to-end route test does not. A `ONEBIT_CWSR_ENABLE_FILE` seam that would have
 it on a CWSR-off box was written and **withdrawn**: CodeQL flags an environment-derived path reaching
 `fopen` (`cpp/path-injection`, alert 29), and this repo does not loosen a gate to land a test.
 
-Status of the documentation itself: this entry and the docs change ship in **PR #518, open and awaiting
-the orchestrator's merge** (auto-merge is off by rule); #315 is closed on the strength of the soak above.
+Status of the documentation itself: this entry and the docs change are in `KNOWN-ISSUES.md` on main (they landed in
+#518); #315 is closed on the strength of the soak above.

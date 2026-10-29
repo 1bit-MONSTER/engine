@@ -1,0 +1,23 @@
+{
+  "id": "27b-localaddon-20261027",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX (int8 GEMM)",
+  "metric": {
+    "name": "decode",
+    "value": 67.5,
+    "unit": "s/token"
+  },
+  "settings": {
+    "device": "accel0",
+    "addon": "local xrt-free patch",
+    "threads": 4,
+    "tokens": 8
+  },
+  "instrument": "wall clock / tokens, 540 s for 8 greedy tokens",
+  "repeats": 1,
+  "timestamp": "2026-10-27T14:20:00Z",
+  "source": "~/lb/587-noxrt-smoke-20261027T101012Z.log",
+  "notes": "same text as the npu-dx row; kept because it is the pair that established the add-on does not move decode"
+}

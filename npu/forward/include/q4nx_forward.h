@@ -270,6 +270,8 @@ private:
     std::vector<std::vector<float>> conv_state_, rec_state_;  // [CD][CK-1], [nvh][khd][vhd]
     // One GDN token step: xn is the normed input; out gets the out_proj result.
     bool gdn_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
+    bool gdn_layer_batch(int l, const std::vector<float>& xn, int M,
+                         std::vector<float>& out);
     bool load_gdn_layer(int l);
     std::string err_;
     std::string backend_ = "uninitialised";

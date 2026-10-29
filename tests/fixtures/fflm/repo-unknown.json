@@ -1,0 +1,20 @@
+{
+ "id": "FastFlowLM/MiniCPM-V-4.7-1B-NPU2",
+ "lastModified": "2026-10-12T17:24:58.000Z",
+ "siblings": [
+  {
+   "rfilename": "model.q4nx",
+   "size": 1068839584,
+   "lfs": {
+    "size": 1068839584
+   }
+  },
+  {
+   "rfilename": "vision_weight.q4nx",
+   "size": 1135147712,
+   "lfs": {
+    "size": 1135147712
+   }
+  }
+ ]
+}

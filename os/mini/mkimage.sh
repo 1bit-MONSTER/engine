@@ -901,10 +901,13 @@ llama_to_data() {   # <llama-server> <directory holding its lib*.so*>
     # as "nothing missing"; the ldd output is captured first and grep reads it from a variable
     for f in "$out/data.dir/1bit-llama/llama-server" "$out/data.dir/1bit-llama"/lib*.so*; do
         [ -L "$f" ] && continue
-        lddout=$(ldd "$f" 2>/dev/null || true)
-        if printf '%s\n' "$lddout" | grep -c "not found" | grep -qv '^0$'; then
-            echo "$(basename "$f") on the data partition still misses libraries:"
-            printf '%s\n' "$lddout" | grep "not found"
+        # ldd -r: data AND function relocations, so an UNRESOLVED SYMBOL fails here too. A shared library
+        # links fine with one (the Hyperloom harness on 26 Oct: a stale object kept an old mangled name,
+        # the .so exported the new one and carried the old as undefined, every binary died at dlopen).
+        lddout=$(ldd -r "$f" 2>&1 || true)
+        if printf '%s\n' "$lddout" | grep -ciE "not found|undefined symbol|symbol .* not defined" | grep -qv '^0$'; then
+            echo "$(basename "$f") on the data partition does not load (missing library or unresolved symbol):"
+            printf '%s\n' "$lddout" | grep -iE "not found|undefined symbol|symbol .* not defined" | head -n 10
             exit 1
         fi
     done

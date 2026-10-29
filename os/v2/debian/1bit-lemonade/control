@@ -1,0 +1,18 @@
+Package: 1bit-lemonade
+Version: @VERSION@
+Architecture: amd64
+Maintainer: 1bit <packages@1bit.gg>
+Section: admin
+Priority: optional
+Depends: libc6 (>= 2.39), libstdc++6, libgcc-s1, libssl3t64 | libssl3, zlib1g, libzstd1,
+ libcurl4t64 | libcurl4, libwebsockets19t64 | libwebsockets19, libcap2, libsystemd0,
+ libdrm-amdgpu1, libbrotli1
+Conflicts: lemonade-server
+Replaces: lemonade-server
+Provides: lemonade-server
+Description: our build of Lemonade Server
+ 1bit OS, Lemonade Server appliance: lemond, the lemonade CLI and
+ the web app, built from the 1bit fork (the onebit recipe, the three
+ Qwen3 NPU catalog entries, the drop-in that points onebit at
+ /opt/1bit). This is our fork, not the upstream lemonade-server
+ package, and it conflicts with it.

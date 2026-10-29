@@ -384,6 +384,57 @@ also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -u
 
 `test-backend-ops -o MUL_MAT -b HRX0`: 287/287. `GGML_HRX_Q8_PREFILL_RELAX=0` turns this off too.
 
+### Flash-Next prefill: where the 287 tok/s goes ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
+
+Qwen3.8-Flash-Next (`qwen4exp A3B`, 512 experts, 176.9 B parameters, UD-IQ4_XS 93.7 GB) prefills at
+287 tok/s on Strix Halo where another stack reports 1,679 for the same class of model. Two candidate
+causes are ruled out before the profile below: the ubatch cap, and the expert GEMM's tile width.
+
+The ubatch cap is gone. An ubatch above 512 tokens used to fail the whole graph with
+`GGML_STATUS_FAILED` (engine#389); the token bounds in
+`ggml/src/ggml-hrx/ubatch-token-limits.h` are what removed it — `kSsmConvRollbackMaxTokens` 512
+chained by `dispatch-ssm-conv-chunked.cpp`, `kSetRowsKernelMaxTokens` 2048 by
+`dispatch-row-chunks.cpp`, `kUbatchMaxTokens` 65536. A bigger ubatch buys nothing on this model
+anyway, so it is not the limiter either.
+
+Measured on Strix Halo, engine `0d0c846` + llama.cpp `8ee20a0`, `-ngl 99 -fa 1`, 2026-10-27T02:38Z,
+3 runs (`samples_ts` 287.384 / 286.933 / 285.578):
+
+| metric | tok/s |
+|---|---|
+| pp512 | 286.63 ± 0.94 |
+| pp4096 | 260.59 ± 4.51 |
+| p1024, `-ub 576` | 269.34 |
+
+`HRX_PROFILE_MODE=dispatch`, bundles parsed with `iree-profile dispatch` (32 MB at pp512, 46 MB at
+pp4096). Device time accounts for 1,355 ms of the 1,786 ms pp512 pass (76%) and 12.84 s of 15.72 s
+at pp4096 (82%), so 18–24% is host-side and the table below is the rest. Top rows, share of device
+time:
+
+| kernel | pp512 | pp4096 | dispatches | workgroups per dispatch |
+|---|---|---|---|---|
+| `hrx_prefill_mmid_swiglu_iq3_s_m64_w4` | 27.1% | 25.1% | 92 / 736 | m64 tiles |
+| `hrx_dp_mm_q8_0_m128_w8_f2` | 15.9% | 14.7% | 552 / 4416 | 4x10x1 and 4x40x1 |
+| `hrx_prefill_mmid_iq4_nl_m64_w4` | 11.6% | 10.6% | 86 / 688 | m64 tiles |
+| `ggml_mul_mat_f32_f32_wmma` | 8.6% | 8.0% | 522 / 4272 | f32 fallback |
+| `ggml_flash_attention_f32_f16_wmma` | | 8.0% | 192 | |
+| `hrx_dp_mm_q8_0_m64_w8_f2_sb` | 3.5% | 3.2% | 190 / 1520 | |
+| `llm_gated_delta_net_f32_wmma_head128` | 3.0% | 2.7% | 72 / 576 | |
+
+The expert GEMMs are a third of the pass and already the fastest thing per token: the m64 tile is
+in play, so a wider MMQ tile is not the lever, and those kernels belong to the private add-on
+(`third_party/ds4`'s `ROCM_MMQ_Y` is a different route and does not appear in this bundle). The two
+levers that do appear are both decode-shaped code running on a prefill. `hrx_dp_mm_q8_0_*` is ~16%
+of it while its grid stays 4x10x1 and 4x40x1 workgroups — 40 and 160 workgroups on a 40-CU part —
+however many tokens the chunk carries. `ggml_mul_mat_f32_f32_wmma` is 8% of a 4.25 bpw model's
+prefill, which means some projection is falling back to an unquantized matmul.
+
+Not claimed here: the 1,679 tok/s is another stack's number on another harness, and no MTP head
+exists for this model in this tree, so there is no speculative-decode row. The profiled pass also
+carries two multi-second gaps after `ggml_get_rows_f32` that the timed pass does not (1,786 ms ≈
+1,355 ms device + ~0.4 s host), so those are bundle-write or cold-start cost, not the steady-state
+host gap.
+
 ### Hadamard-rotated Q4_0 files ("H32", dropped)
 
 The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on HRX it was slower

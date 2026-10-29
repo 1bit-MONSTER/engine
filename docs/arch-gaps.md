@@ -594,6 +594,50 @@ counts as supported. Reviewed 2026-10-23: **not an alias**. Its `registry/signif
 carries `"watch": "report"`, so the census watcher lists new uploads as `. REVIEWED` and does not
 alert; remove that field (and record `mapped_ok`) when the pin gains `glm5-next`.
 
+### 2026-10-27 batch (engine#619)
+
+Three of the four classes in that census run are reviewed below; the fourth,
+`GraniteSwitchForCausalLM` (`cestaristudio/granite-switch-4.1-3b-preview`), is gated and is
+listed under *Unverifiable: gated configs* instead. None of the three is registered by the pin:
+`git grep` over `third_party/llama.cpp` `e7e5cd08` for `LiveMemForCausalLM`/`livemem`,
+`CDMMoELMPoincare`/`cdm_moe_poincare` and `Senryu2ForCausalLM`/`senryu2` returns nothing, so no
+pinned backend reads them and a mapping would be a claim the engine cannot honour.
+
+### `livemem` - `Popbones/LiveMem-RL-mlx-q4-backbone`
+
+Architecture class `LiveMemForCausalLM`, `model_type: livemem`, `library_name: livemem-mlx`, no
+`auto_map` (the censused upload is MLX-format weights: `model.safetensors` + `manifest.json`,
+vendored `livemem-mlx` runtime). The config is a plain dense decoder - `hidden_size` 2560,
+`intermediate_size` 9728, `head_dim` 128, every entry of `layer_types` is `full_attention`, Qwen2.5
+vocab ids (151643/151645) - so the machinery is unremarkable; what is missing is the format and
+the registration, not the layers. Serving it needs an MLX dequant and a converter, and the pin has
+neither. Reviewed 2026-10-27: **not an alias**. Its `registry/significant.json` entry carries
+`"watch": "report"`.
+
+### `cdm_moe_poincare` - `DuoNeural/Lattice-7-Hermes-CDM-Poincare-Instruct`
+
+Architecture class `CDMMoELMPoincare`, `model_type: cdm_moe_poincare`, no `auto_map`,
+`library_name: transformers`. Not an alias for a structural reason: attention runs in a Poincare
+ball (`geometry: poincare`, learnable `curvature: 1.4427`) and a `telepathy` gate
+(`beta_tele: 0.5`) mixes it, neither of which any pinned family implements; the rest is small
+(`d_model` 768, 8 layers, 12 heads, 4 experts, `teacher: Qwen/Qwen3.5-4B`, 629M params). The repo
+ships `lattice7_hermes-q8-attn-q6-rest-text.gguf`, but a GGUF of an architecture no converter
+knows is not loadable by the pinned runtime - the metadata would name an arch
+`src/llama-arch.cpp`'s `LLM_ARCH_NAMES` does not have. Reviewed 2026-10-27: **not an alias**. Its
+`registry/significant.json` entry carries `"watch": "report"`.
+
+### `senryu2` - `KerzgrAI/Senryu-2.2-1B`
+
+Architecture class `Senryu2ForCausalLM`, `model_type: senryu2`, `library_name: tiny_gdn`, no
+`auto_map`, and the weights come with the repo's own `inference.py` plus
+`ngram_tables.safetensors` - the class is served by that code, not by any backend. Its
+`layer_types` are a 3+1 hybrid of `gdn2` and `parallax` (`full_attention_interval` 4,
+`attention_layer_type: parallax`, `kda_lower_bound` -5.0, `linear_conv_kernel_dim` 4,
+`allow_negative_eigenvalues: false`): the GDN2 half is the class this page reviews elsewhere, but
+`parallax` attention and the n-gram tables are not in the pin, so `gdn2` would be a partial
+substitution, not an alias. Reviewed 2026-10-27: **not an alias**. Its `registry/significant.json`
+entry carries `"watch": "report"`.
+
 ## Unverifiable: gated configs
 
 A gated repository cannot be classified at all: the watcher's listing carries no config for it, so
@@ -603,6 +647,10 @@ environment, or the standard `~/.cache/huggingface/token`) would resolve gated r
 retrying them forever - **needs HF token in the watcher**, and none was added here.
 
 Long-standing: `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is unverifiable on every run.
+
+From the 2026-10-27 census (engine#619): `cestaristudio/granite-switch-4.1-3b-preview`, class
+`GraniteSwitchForCausalLM` - the repo listing is gated (`Access to model ... is restricted`), so
+the class stays `!! UNCOVERED` and the watcher keeps exiting non-zero until a token is available.
 
 The 2026-10-22/23 watcher run behind engine#447 listed twelve, all unverifiable for the same
 reason - needs HF token in the watcher:

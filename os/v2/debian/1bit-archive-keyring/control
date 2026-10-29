@@ -1,0 +1,11 @@
+Package: 1bit-archive-keyring
+Version: @VERSION@
+Architecture: all
+Maintainer: 1bit <packages@1bit.gg>
+Section: admin
+Priority: optional
+Description: signing key for the 1bit apt repository
+ The public half of the archive key that signs 1bit.gg/apt's
+ Release file. Every 1bit OS box trusts the repository through
+ this keyring and nothing else (apt's signed-by), so a package
+ this key did not sign is not installable.

@@ -33,14 +33,21 @@ LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cff", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment", "*.example",
-      "*.service", "*.timer", "*.conf", "lemonade-hrx", "Dockerfile", "*.Dockerfile"), "#"),
+      "*.service", "*.timer", "*.conf", "lemonade-hrx", "Dockerfile", "*.Dockerfile",
+      # os/v2's packaged files: systemd units of kinds the list did not name yet, and the two '#'-comment
+      # files a v2 build reads (the snapshot pin, and the board's power profile at /etc/1bit/power)
+      "*.mount", "*.preset", "*.network", "power", "pin.txt"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 
 EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*", "LICENSE", "NOTICE", "LICENSE-BINARY", "NOTICE-BINARY", "*.gguf", "tests/golden/*.bin", "tests/golden/*/*.bin", "*.json", "*.tsv", "tests/golden/*/tokens.txt", "*/Cargo.lock", "*.png", "*.ico",
           # engine#315 evidence artefacts that cannot carry a comment: diffs must stay byte-applicable
           # and data files have no comment syntax. Matches the existing "patches/*" exemption.
-          "*.patch", "*.csv", "*.cfg"]
+          "*.patch", "*.csv", "*.cfg",
+          # os/v2 packages: dpkg control files, apt/dpkg list files and the console banner are data
+          # with no comment syntax - the same exemption patches/* and *.cfg get
+          "os/v2/debian/*/control", "os/v2/debian/*/conffiles", "*.list",
+          "os/v2/debian/*/files/etc/issue", "os/v2/debian/*/files/etc/motd"]
 
 
 def _match(name, patterns):

@@ -1,0 +1,19 @@
+Package: 1bit-engine
+Version: @VERSION@
+Architecture: amd64
+Maintainer: 1bit <packages@1bit.gg>
+Section: admin
+Priority: optional
+Depends: libc6 (>= 2.39), libstdc++6, libgcc-s1, libgomp1, libpcre2-8-0
+Description: the 1bit engine and the server it runs models with
+ 1bit OS, Lemonade Server appliance: the engine binary, the HRX
+ llama-server and its libraries, the ds4 programs, the sealed NPU
+ kernel sets and the two commands that prove a boot (1bit-selftest,
+ 1bit-release-check). Installed under /opt/1bit, which is where the
+ engine looks once its build tree is gone.
+ .
+ The engine's own libraries are found beside it ($ORIGIN). The ROCm
+ userspace (HIP, rocBLAS, hipBLASLt, the HSA runtime) is the
+ machine's, not this package's: upstream ours came from the SDK the
+ build machine had, and on a box it has to come from packages
+ (see os/v2/README.md, "The ROCm userspace").

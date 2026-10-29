@@ -642,15 +642,33 @@ entry carries `"watch": "report"`.
 
 A gated repository cannot be classified at all: the watcher's listing carries no config for it, so
 the class is unknown and the census counts it as **unverifiable** rather than guessing it. The
-watcher sends no `Authorization` header on purpose. Supplying a token (`HF_TOKEN` in the
-environment, or the standard `~/.cache/huggingface/token`) would resolve gated repos instead of
-retrying them forever - **needs HF token in the watcher**, and none was added here.
+watcher sends a token when one is in the environment. `tools/census_watch.py`'s `hf_token()` reads
+`HF_TOKEN`, then `HUGGING_FACE_HUB_TOKEN` (the name `huggingface_hub` writes), and
+`request_headers()` adds `Authorization: Bearer <token>` when either is set and non-empty. No token
+*file* is read: the standard `~/.cache/huggingface/token` is never consulted, so a token that only
+lives in that file changes nothing - export one of the two variables for the process that runs the
+watch (`scripts/census-watch.sh` passes its environment through to `tools/census_watch.py`). With
+neither set, the request is the user agent alone (`1bit-census-watch`), byte-identical to what the
+watcher always sent, and a gated row stays unverifiable: reported the first time it is seen,
+remembered in the state file, and never an alert, so it does not move the exit code. The header
+goes on the architecture walk's listing pages (`hf_get_page`) only; the FastFlowLM org listing,
+repo details and release pages (`get_json`) still send the user agent alone. A rejected token is not
+fatal: a `401` in `hf_get_page` sets `_AUTH_REJECTED`, warns `the token was rejected (401);
+continuing without it` on stderr, and retries that page anonymously, and the rest of the run stays
+unauthenticated rather than dying - a stale token costs a line of stderr, not the sweep. HF answers
+the listing `200` even with an invalid Bearer (measured 2026-10-29: `GET /api/models` returns `200`
+with a bad token, only `GET /api/whoami-v2` returns `401`), so that fallback is defensive: the
+watcher calls no endpoint that distinguishes a valid token from a bad one.
 
 Long-standing: `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is unverifiable on every run.
 
 From the 2026-10-27 census (engine#619): `cestaristudio/granite-switch-4.1-3b-preview`, class
 `GraniteSwitchForCausalLM` - the repo listing is gated (`Access to model ... is restricted`), so
-the class stays `!! UNCOVERED` and the watcher keeps exiting non-zero until a token is available.
+with no token in the environment the listing carries no config and the row stays **unverifiable**
+(reported once, remembered, no alert), not counted as an uncovered class. A token the repo has been
+granted access to puts the config in the listing and the class is then classified like any other
+row: `!! UNCOVERED` only if the pin does not map it. Whether HF returns the config to a granted
+token is not recorded here - it has not been observed with a working token.
 
 The 2026-10-22/23 watcher run behind engine#447 listed twelve, all unverifiable for the same
 reason - needs HF token in the watcher:

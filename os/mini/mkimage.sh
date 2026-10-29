@@ -739,8 +739,9 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     # were making the initramfs 103 MB compressed, which is what grub was failing to load on real
     # hardware (the machine's own 37 MB initrd loads fine). init.sh links them to the engine's
     # expected path at boot, so the engine still finds npu/kernels beside itself.
-    # Only the artifact surface goes on the stick: <set>/layout.json and <set>/layer1_*/layer1.elf, the
-    # allowlist scripts/package-linux.sh packs. A set directory also holds layer1.work/ (plaintext
+    # Only the artifact surface goes on the stick: <set>/layout.json, the set's signed manifest
+    # (manifest.json + manifest.sig) and <set>/layer1_*/layer1.elf, the same allowlist
+    # scripts/package-linux.sh packs. A set directory also holds layer1.work/ (plaintext
     # MLIR, object files, intermediate ELFs) because that is where it was built, so copying the tree
     # would put the kernel method on the stick; the guard that caught that used `find ... | head -3`,
     # which exits 141 (SIGPIPE) under `set -o pipefail` and aborted the whole image instead.
@@ -748,8 +749,16 @@ rm -f "$out/data.part"; if [ -d "$build/npu/kernels" ]; then
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")
         [ -f "$set/layout.json" ] || continue
+        # engine #574: sealing is confidentiality, the manifest is authenticity. package-linux.sh already
+        # refuses to pack a set without a manifest; this copy has to carry the same files, or the stick
+        # ships kernel sets that nothing can tell from a set somebody else re-sealed.
+        for meta in manifest.json manifest.sig; do
+            [ -f "$set/$meta" ] || {
+                echo "npu/kernels/$setname has no $meta: it was never signed (tools/seal_manifest.py write $set --key <release key>)"
+                exit 1; }
+        done
         mkdir -p "$out/data.dir/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$out/data.dir/npu/kernels/$setname/"
+        cp -a "$set/layout.json" "$set/manifest.json" "$set/manifest.sig" "$out/data.dir/npu/kernels/$setname/"
         for layer in "$set"/layer1_*/; do
             [ -f "$layer/layer1.elf" ] || continue
             mkdir -p "$out/data.dir/npu/kernels/$setname/$(basename "$layer")"

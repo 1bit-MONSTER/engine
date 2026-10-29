@@ -48,7 +48,13 @@ DRY_RUN=${DRY_RUN:-0}
 HOLD_FILE=${HOLD_FILE:-config/hrx-system-hold.config}
 ENGINE_DIR=$(pwd)
 # The HRX backend paths of the llama.cpp tree (what AMD's hrx-graph line adds on top of ggml).
-HRX_PATHS=(ggml/src/ggml-hrx ggml/include/ggml-hrx.h 'tests/*hrx*')
+# tests/CMakeLists.txt belongs here: it is where the HRX test targets are registered, so it moves
+# with them. AMD renamed the four HRX tests (test-hrx-buffer -> hrx-buffer-test, ...) in its
+# 2026-10-28 pin c1e1bcbf6839; the .cpp files are already covered by 'tests/*hrx*', but the
+# registration block is in this one shared file, so leaving it out merges AMD's rename into our
+# line and conflicts there (engine#628). While hrx-system is held we keep our registration with
+# our tests; a full merge after the hold lifts brings AMD's block back in.
+HRX_PATHS=(ggml/src/ggml-hrx ggml/include/ggml-hrx.h 'tests/*hrx*' tests/CMakeLists.txt)
 
 note()    { echo "::notice::$*"; }
 warn()    { echo "::warning::$*"; }
@@ -79,9 +85,13 @@ hold_sha() {
 
 sync_llama() {
   : "${AMD_LLAMA:?}" "${OURS_HRX:?}"
-  local hold; hold=$(hold_sha)
-  if [ "$DRY_RUN" != 1 ] && ! gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master > /dev/null; then
-    warn "could not refresh 1bit-MONSTER/llama.cpp master; continuing with the HRX pin sync"
+  local hold refresh; hold=$(hold_sha)
+  # Name the reason, not just the fact: every run since the token was scoped down logs
+  # "refusing to allow a Personal Access Token to create or update workflow ... without
+  # `workflow` scope (HTTP 422)" (engine#628), and "could not refresh" alone hid that the
+  # fix is a token permission and not a fork problem. The message carries no secret.
+  if [ "$DRY_RUN" != 1 ] && ! refresh=$(gh api -X POST repos/1bit-MONSTER/llama.cpp/merge-upstream -f branch=master 2>&1); then
+    warn "could not refresh 1bit-MONSTER/llama.cpp master: $(printf '%s' "$refresh" | head -n1); continuing with the HRX pin sync"
   fi
 
   rm -rf patched && git init -q patched && cd patched

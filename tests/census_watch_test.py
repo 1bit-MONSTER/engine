@@ -33,6 +33,8 @@ import os
 import sys
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 import contextlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -511,6 +513,60 @@ check("family: an unmapped family stays unmapped", cw.resolve_family("minicpmv4_
 check("family: an empty name maps to nothing", cw.resolve_family("", FLM_ARCHS) is None)
 
 shutil.rmtree(STATE_DIR, ignore_errors=True)
+# 16. Gated repos (engine#619): the request carries a token when one is in the environment, and
+#     the run says so instead of repeating "gated repos need a token" at a run that sent one.
+#     No network here; this pins the header construction and the report text, not HF's answer.
+for var in cw.TOKEN_VARS:
+    os.environ.pop(var, None)
+check("no token in the environment -> UA only",
+      cw.request_headers() == {"User-Agent": "1bit-census-watch"} and cw.hf_token() == "")
+os.environ[cw.TOKEN_VARS[0]] = "hf_example"
+check("HF_TOKEN -> Bearer header",
+      cw.request_headers().get("Authorization") == "Bearer hf_example")
+os.environ.pop(cw.TOKEN_VARS[0])
+os.environ[cw.TOKEN_VARS[1]] = "hf_second"
+check("HUGGING_FACE_HUB_TOKEN is the fallback",
+      cw.request_headers().get("Authorization") == "Bearer hf_second")
+check("the unverifiable line names the token it already sent",
+      "(HF_TOKEN sent, still no config)" in text_of([model("gated/one")])[1])
+os.environ.pop(cw.TOKEN_VARS[1], None)
+check("with no token the line stays the plain advice",
+      "HF_TOKEN sent" not in text_of([model("gated/one")])[1])
+
+# 17. A rejected token (401) must not cost the whole run: the page comes back anonymously.
+#     Pins the fallback that keeps engine#619's watcher useful on a stale HF_TOKEN.
+seen_auth = []
+
+
+class _Stub(io.BytesIO):
+    headers = {"Link": ""}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_urlopen(req, timeout=0):
+    seen_auth.append(req.headers.get("Authorization"))
+    if req.headers.get("Authorization"):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+    return _Stub(b'[{"id": "x/y"}]')
+
+
+os.environ[cw.TOKEN_VARS[0]] = "hf_stale"
+cw._AUTH_REJECTED = False
+_real = urllib.request.urlopen
+urllib.request.urlopen = _fake_urlopen
+try:
+    page, _ = cw.hf_get_page("https://example.invalid/api/models")
+finally:
+    urllib.request.urlopen = _real
+    os.environ.pop(cw.TOKEN_VARS[0], None)
+    cw._AUTH_REJECTED = False
+check("a 401 falls back to anonymous instead of failing the run",
+      page == [{"id": "x/y"}] and seen_auth[0] == "Bearer hf_stale" and seen_auth[1] is None)
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

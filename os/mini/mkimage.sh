@@ -517,6 +517,58 @@ for p in dropbear-bin libtomcrypt1 libtommath1 qrencode libqrencode4; do
 done
 echo "   $(wc -l < "$out/image-debs.txt") packages, $(du -sh "$root/usr/share/doc" "$doc" "$root/usr/share/common-licenses" | cut -f1 | tr '\n' ' ')"
 
+# --- every ELF the image ships must be able to load -----------------------------------------------
+# Candidate 12's lesson (2026-10-26): a build can exit 0 and still ship a binary that dies at dlopen.
+# Shared libraries are ALLOWED to carry unresolved symbols, so plain `ldd` - which only reports the
+# libraries it found - says nothing about this; `ldd -r` relocates, and is the one cheap command that
+# says `undefined symbol`. The tree that exposed it had a stale object predating a header change that
+# ninja never recorded (deps=gcc keeps its dependencies in .ninja_deps, so an incremental build
+# reported "no work to do" and produced a load-broken lib). Nothing in the build noticed, because the
+# only ldd in it checked presence, on the data partition.
+# Resolved against the image's own library directories, not the build host's: the question is what the
+# stick's loader will see at boot. (The host's default search paths still participate - isolating them
+# would mean a private ld.so.cache - so a symbol that only the HOST happens to export can mask a miss;
+# the failure direction this guards against, an unresolved symbol, cannot be masked.)
+root_elfs_load() {   # <root>: name every ELF in the image root that cannot resolve, and fail the build
+    local root=$1 f res ldlibs= d bad=0 n=0
+    for d in lib lib64 usr/lib usr/lib64 usr/local/lib; do
+        [ -d "$root/$d" ] && ldlibs="${ldlibs:+$ldlibs:}$root/$d"
+    done
+    # The multiarch directories are where Debian/Ubuntu actually put the libraries, and they are not
+    # on the list above: without them every consumer of libtomcrypt, libzstd, libcurl and libz reports
+    # its symbols as undefined and a GOOD image fails the build. Measured on the 2026-10-28 rehearsal
+    # root (120 ELFs): 3 flagged without this loop (dropbear, dropbearkey, libtomcrypt.so.1 itself),
+    # 0 with it. Two further built roots (120 and 39 ELFs) go 0 as well.
+    for d in "$root"/lib/*-linux-gnu* "$root"/usr/lib/*-linux-gnu*; do
+        [ -d "$d" ] && ldlibs="${ldlibs:+$ldlibs:}$d"
+    done
+    while IFS= read -r -d '' f; do
+        [ -L "$f" ] && continue
+        [ "$(head -c 4 "$f" 2>/dev/null)" = "$(printf '\177ELF')" ] || continue
+        n=$((n + 1))
+        # captured first, then grepped: `ldd | grep -q` would report a grep-killed ldd as "nothing wrong"
+        # (the pipefail trap this file documents twice already)
+        res=$(LD_LIBRARY_PATH=$ldlibs ldd -r "$f" 2>&1 || true)
+        # no "skip statically linked binaries" shortcut here: ldd labels a .so with no NEEDED entries
+        # "statically linked" AND still prints its undefined symbols, so keying on that label would
+        # swallow exactly the case this gate exists for. A genuinely static binary simply produces no
+        # matching line below.
+        if printf '%s\n' "$res" | grep -qE "undefined symbol|not found"; then
+            bad=$((bad + 1))
+            echo "   ELF does not load: ${f#"$root"}"
+            printf '%s\n' "$res" | grep -E "undefined symbol|not found" | sed 's/^/      /'
+        fi
+    done < <(find "$root" -type f -print0 2>/dev/null)
+    echo "   load check: $n ELF files in the image root, $bad that cannot resolve their symbols"
+    if [ "$bad" != 0 ]; then
+        echo "this image would ship $bad ELF file(s) that cannot load (named above); stopping before packaging"
+        exit 1
+    fi
+}
+
+echo "== load check: every ELF in the image root, against the image's own libraries"
+root_elfs_load "$root"
+
 echo "== initramfs"
 # the builder's umask must not reach the image: nothing group- or world-writable, /root private
 # (Dropbear, like sshd, refuses keys when the home directory is group-writable)

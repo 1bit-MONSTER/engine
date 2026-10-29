@@ -596,12 +596,22 @@ alert; remove that field (and record `mapped_ok`) when the pin gains `glm5-next`
 
 ### 2026-10-27 batch (engine#619)
 
-Three of the four classes in that census run are reviewed below; the fourth,
-`GraniteSwitchForCausalLM` (`cestaristudio/granite-switch-4.1-3b-preview`), is gated and is
-listed under *Unverifiable: gated configs* instead. None of the three is registered by the pin:
-`git grep` over `third_party/llama.cpp` `e7e5cd08` for `LiveMemForCausalLM`/`livemem`,
-`CDMMoELMPoincare`/`cdm_moe_poincare` and `Senryu2ForCausalLM`/`senryu2` returns nothing, so no
-pinned backend reads them and a mapping would be a claim the engine cannot honour.
+All four classes in that census run are reviewed below. The mirror the run named for
+`GraniteSwitchForCausalLM` (`cestaristudio/granite-switch-4.1-3b-preview`) is gated, so that one
+listing stays unclassifiable and is listed under *Unverifiable: gated configs*; the class itself
+is IBM's own and its configs are public, so it is reviewed here from
+`ibm-granite/granite-switch-4.1-*`. None of the four is registered by the pin: `git grep` over
+`third_party/llama.cpp` `e7e5cd08` for `LiveMemForCausalLM`/`livemem`,
+`CDMMoELMPoincare`/`cdm_moe_poincare` and `Senryu2ForCausalLM`/`senryu2` returns nothing, and the
+same grep over the pin `main` carries now (`40c4ccb7`, re-checked 2026-10-29) returns nothing for
+those three or for `GraniteSwitchForCausalLM`/`granite_switch` either, so no pinned backend reads
+them and a mapping would be a claim the engine cannot honour.
+
+The same run also printed the REMOTE-CODE families `KeuralMoECausalLM`,
+`LNewqForConditionalGeneration`, `Newq1ForConditionalGeneration` and
+`NewqForConditionalGeneration`. Those are not significant gaps and are not in
+`registry/significant.json`: they are recorded under *If a family is a variant* instead, because
+what they need is a converter registration (a renamed class), not a review of a new architecture.
 
 ### `livemem` - `Popbones/LiveMem-RL-mlx-q4-backbone`
 
@@ -638,6 +648,54 @@ Architecture class `Senryu2ForCausalLM`, `model_type: senryu2`, `library_name: t
 substitution, not an alias. Reviewed 2026-10-27: **not an alias**. Its `registry/significant.json`
 entry carries `"watch": "report"`.
 
+### `granite_switch` - `ibm-granite/granite-switch-4.1-3b-preview` (also -8b, -30b)
+
+Architecture class `GraniteSwitchForCausalLM`, `model_type: granite_switch`, no `auto_map`,
+`library_name: transformers`. `registry/census.json` (2026-10-29) counts **17** models of this
+class, so it is not a one-off: `ibm-granite/granite-switch-4.1-{3b,8b,30b}` are public and the
+family already ships GGUFs (`ibm-granite/granite-switch-4.1-8b-GGUF`, whose
+`general.architecture` is `graniteswitch`).
+
+* **Shape**: 42 layers (30b: 66), hidden 2560 (8b/30b: 4096), 40 heads / 8 kv (8b/30b: 32/8),
+  vocab 100365 (8b/30b: 100355), every entry of `layer_types` `full_attention`,
+  `num_local_experts: 0` with a leftover `num_experts_per_tok: 2` - i.e. dense, all-attention
+  Granite.
+* **What it adds**: the model is a *stack of LoRA adapters switched per token*, not one set of
+  weights. The config carries `num_adapters`, `adapter_names`, `adapter_ranks`,
+  `max_lora_rank`, `lora_target_modules`, `switch_head_dim`, `control_token_gain`,
+  `dual_stream`, `cross_stream_rank`, `ms_code_*`/`ms_memory_gain`, `asr_*` and
+  `adapter_token_ids`/`adapter_substitute_token_ids`. Upstream's converter puts that in one
+  sentence (`conversion/granite.py`: "Dense, all-attention Granite with N per-token embedded
+  LoRA adapters, stacked over the adapter dim with a zero adapter at slot 0 (N = num_adapters +
+  1)") and additionally writes `adapter_count`, `adapter_lora_rank`, `adapter_token_ids_*`,
+  `adapter_router_gain` and, for `ibm-granite`'s `decision` adapter, a `granite_switch` decision
+  type; `num_hidden_layers` also counts *weightless switch layers* that carry no tensors, and
+  the converter has to derive the real block count from the tensor names.
+* **Why an alias is wrong**: the nearest supported families are `granitehybrid`
+  (`GraniteMoeHybridForCausalLM`), `granitemoe` and `granite`, and none of their loaders has an
+  adapter stack, a router gain or a switch layer: loading a checkpoint through them would keep
+  one adapter's weights and silently drop the rest, which is the silent-substitution failure
+  this page exists to prevent. Renaming it to `granitehybrid` would also lose the ASR path.
+* **Why it is not mapped**: the pinned backend has nothing to map to. At `40c4ccb7`
+  `conversion/granite.py:17-379` makes six `@ModelBase.register` calls covering eight class
+  names (`GraniteForCausalLM`, `GraniteMoeForCausalLM`, `GraniteMoeSharedForCausalLM`,
+  `GraniteMoeHybridForCausalLM`/`BambaForCausalLM`,
+  `GraniteSpeechForConditionalGeneration`, `GraniteSpeechPlusForConditionalGeneration`,
+  `Granite4VisionForConditionalGeneration`), `src/llama-arch.cpp` has `granite`, `granitemoe`
+  and `granitehybrid` but no `graniteswitch` (nor `granite_swa`), `src/models/` has
+  `granite.cpp`, `granite-moe.cpp` and `granite-hybrid.cpp` and no `granite-switch.cpp`, and
+  `gguf-py` has no `GRANITE_SWITCH` at all - as expected, since `registry/architectures.json`
+  is generated from that tree.
+* **Where the support is**: upstream `ggml-org/llama.cpp` `157b81fe` ("model : Granite-Switch
+  Architecture", #25107, 2026-08-10) registers the class, adds `LLM_ARCH_GRANITE_SWITCH` /
+  `"graniteswitch"` and the mapping case. That is *older* than the pin's tip (2026-10-25), so a
+  fork sync is what brings it, and `tools/registry_build.py --check-gaps` then fails until this
+  entry records why (`mapped_ok`) and someone confirms the loaded adapters really switch before
+  the class counts as supported. Reviewed 2026-10-29: **not an alias**. Its
+  `registry/significant.json` entry carries `"watch": "report"`, so the census watcher lists new
+  uploads as `. REVIEWED` instead of filing an issue; remove that field (and record `mapped_ok`)
+  when the pin gains `graniteswitch`.
+
 ## Unverifiable: gated configs
 
 A gated repository cannot be classified at all: the watcher's listing carries no config for it, so
@@ -662,13 +720,14 @@ watcher calls no endpoint that distinguishes a valid token from a bad one.
 
 Long-standing: `WaveMatrix/Qwen3-VL-8B-Instruct-GPTQ-Int4` is unverifiable on every run.
 
-From the 2026-10-27 census (engine#619): `cestaristudio/granite-switch-4.1-3b-preview`, class
-`GraniteSwitchForCausalLM` - the repo listing is gated (`Access to model ... is restricted`), so
-with no token in the environment the listing carries no config and the row stays **unverifiable**
-(reported once, remembered, no alert), not counted as an uncovered class. A token the repo has been
-granted access to puts the config in the listing and the class is then classified like any other
-row: `!! UNCOVERED` only if the pin does not map it. Whether HF returns the config to a granted
-token is not recorded here - it has not been observed with a working token.
+From the 2026-10-27 census (engine#619): `cestaristudio/granite-switch-4.1-3b-preview` - the
+repo listing is gated (`Access to model ... is restricted`), so with no token in the environment
+the listing carries no config and the row stays **unverifiable** (reported once, remembered, no
+alert), not counted as an uncovered class. The *class* it would have named is no longer unknown: it
+is IBM's `GraniteSwitchForCausalLM`, reviewed from `ibm-granite`'s public repos under
+`granite_switch` above, which is what the census now reports for that family. A token the repo has
+been granted access to puts the config in the listing and the row is classified like any other -
+`!! UNCOVERED` only if the pin does not map it; that has not been observed with a working token.
 
 The 2026-10-22/23 watcher run behind engine#447 listed twelve, all unverifiable for the same
 reason - the watcher sent no token on that run:
@@ -712,3 +771,36 @@ them:
   but does not register this name (upstream llama.cpp does not either). Same treatment: a
   converter registration picked up at the next pin bump, so it also keeps alerting rather than
   being recorded as significant.
+
+From the 2026-10-27 census (engine#619), plus its 2026-10-29 rerun, four REMOTE-CODE families are
+recorded the same way - read and dispositioned here, deliberately *not* in
+`registry/significant.json`, and still what the census will alert on if a native (no `auto_map`)
+upload of the class appears:
+
+* `LNewqForConditionalGeneration` (`crussella0129/LNewq`) and `Newq1ForConditionalGeneration`
+  (`crussella0129/Newq1`) are **one rename each of the same Qwen3.5-VL wrapper**: `model_type:
+  qwen3_5`, `text_config.model_type` `qwen3_5_text` (32 layers, H 2560, `head_dim` 256,
+  `full_attention_interval` 4, vocab 248320) over a `vision_config` with
+  `deepstack_visual_indexes`, `image_token_id` 248056 - the shape the pin already converts under
+  the name `Qwen3_5ForConditionalGeneration` (`conversion/qwen3vl.py:16` registers that class and
+  its MoE sibling; `registry/architectures.json` maps it to `qwen35`). The only unusual keys are
+  `lnewq_steer` /
+  `newq1_steer`, and both repos carry `auto_map` (`AutoModelForImageTextToText` and
+  `AutoModelForCausalLM` -> `modeling_lnewq.LNewqForConditionalGeneration` /
+  `modeling_newq1.Newq1ForConditionalGeneration`), i.e. they run their own modelling code. The
+  pinned fork registers neither name, so the class - not the architecture - is what is
+  unmapped, and the fix is one converter registration in the fork (a pin bump), exactly like the
+  two classes above. The census counts one model each. The third name in that batch,
+  `NewqForConditionalGeneration` (1 model, `crussella0129/Newq`), is now a gated repo, so its
+  config could not be read on 2026-10-29; it is recorded as the same family name pattern,
+  unverified.
+* `KeuralMoECausalLM` (`hossain0909/keural-dpo2-final`, 24 models from one uploader in
+  `registry/census.json`) is **not** a rename of anything mapped: `model_type: keural`,
+  `auto_map` to `configuration_keural.KeuralConfig` /
+  `modeling_keural.KeuralMoECausalLM`, and the config is an MoE decoder the pin has no arch for
+  (24 layers, H 4096, 32 heads / 8 kv, `head_dim` 128, 8 experts, top-2, `sliding_window` 512,
+  vocab 131074, plus a `keural_step` key). No pinned converter or runtime reads that name, so
+  mapping it would be a claim the engine cannot honour. It is left out of significant.json on
+  purpose: it is a remote-code one-off until a second uploader uses it, which is why the census
+  reports it as `. REMOTE-CODE` and starts alerting at `REMOTE_CODE_SPREAD` (3) uploaders - that
+  alert is the prompt to review it for a variant shape, not to silence it now.

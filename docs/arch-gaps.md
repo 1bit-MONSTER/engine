@@ -671,7 +671,7 @@ row: `!! UNCOVERED` only if the pin does not map it. Whether HF returns the conf
 token is not recorded here - it has not been observed with a working token.
 
 The 2026-10-22/23 watcher run behind engine#447 listed twelve, all unverifiable for the same
-reason - needs HF token in the watcher:
+reason - the watcher sent no token on that run:
 
 `Chandangepala/spendai-gemma3-1b`,
 `DrJohnCode/NebulaText`,

@@ -1,0 +1,22 @@
+{
+  "id": "27b-first-token-after-transpose-20261027",
+  "host": "strixhalo",
+  "model": "Qwen3.8-27B-NPU2",
+  "route": "npu",
+  "quant": "Q4NX (int8 GEMM)",
+  "metric": {
+    "name": "first token (weight pack included)",
+    "value": 145.7,
+    "unit": "s"
+  },
+  "settings": {
+    "device": "accel0",
+    "commits": "800cf6f",
+    "threads": 32
+  },
+  "instrument": "request wall and driver trace span",
+  "repeats": 1,
+  "timestamp": "2026-10-27T20:15:00Z",
+  "source": "~/lb/587-trace-20261027T201250Z/bpf.log (37 507 driver events)",
+  "notes": "same trace, binary built from main 800cf6f (#622): device wait 59.8 s (2 298 x 26 ms), host 83.7 s, one gap above a second"
+}

@@ -231,14 +231,24 @@ const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
-// else one on PATH.
+// else one on PATH. Resolution, first hit wins (engine #581, measured on the 1bit OS stick where
+// Lemonade spawns `1bit serve` itself and the build tree does not exist, so the compiled-in
+// relative path failed with "Failed to execute: hrx/llama/bin/llama-server"):
+//   ONEBIT_LLAMA_SERVER, ONEBIT_HRX_LLAMA_SERVER (scripts/lemonade-hrx's name for the same thing),
+//   the build's own server beside the executable when it exists, /opt/1bit-llama/llama-server
+//   (where the OS image keeps it), then plain "llama-server" on PATH.
 std::string default_llama_server() {
-    if (const char* e = std::getenv("ONEBIT_LLAMA_SERVER"); e && *e) return e;
+    namespace fs = std::filesystem;
+    for (const char* name : {"ONEBIT_LLAMA_SERVER", "ONEBIT_HRX_LLAMA_SERVER"}) {
+        if (const char* e = std::getenv(name); e && *e) return e;
+    }
+    std::error_code ec;
 #ifdef ONEBIT_HRX_SERVER
-    return built_path(ONEBIT_HRX_SERVER);
-#else
-    return "llama-server";
+    const std::string built = built_path(ONEBIT_HRX_SERVER);
+    if (fs::exists(built, ec)) return built;
 #endif
+    if (fs::exists("/opt/1bit-llama/llama-server", ec)) return "/opt/1bit-llama/llama-server";
+    return "llama-server";
 }
 
 // The devices this engine no longer has (RFC #213 stage 3, 2026-10-01: HRX + NPU only, zero
@@ -723,6 +733,13 @@ void forward(int port, std::shared_ptr<InFlight> held, int draft_max, const std:
         return;
     }
     if (drop_model) body.erase("model");
+    // Greedy short-circuit (issue #560): a request that asks for temperature 0 gets argmax by way of
+    // top_k 1 unless it names its own top_k. That skips the full-vocabulary top-p / min-p chain, which
+    // on a 262147-entry vocab costs about 2.1 ms per token (ZAYA1-8B: 118 -> 153 tok/s). A request that
+    // states any other temperature is untouched.
+    if (body.contains("temperature") && body["temperature"].is_number() &&
+        body["temperature"].get<double>() <= 0.0 && !body.contains("top_k"))
+        body["top_k"] = 1;
     // --precise: a follow-up turn differs from a cold run of the same conversation because its new tokens form a
     // different batch than the cold prefill does (different kernels, different reduction order), and a near-tie
     // then flips. The only way to make the two bitwise identical is to take the cold path: re-prefill the whole
@@ -1116,6 +1133,14 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         facts.architecture = gguf_architecture(o.model);
         facts.moe = gguf_int(o.model, facts.architecture + ".expert_count") > 0;
         facts.drafter = !o.dflash.empty() ? "dflash" : (!o.mtp.empty() || own_mtp) ? "mtp" : "none";
+        if (recipes.needs_gguf_keys()) {
+            // only recipes that match on the file's metadata keys pay for this read (the header alone)
+            for (const auto& rec : recipes.list)
+                for (const auto& key : rec.gguf_keys)
+                    if (std::find(facts.gguf_keys.begin(), facts.gguf_keys.end(), key) == facts.gguf_keys.end() &&
+                        gguf_has_keys(o.model, {key}))
+                        facts.gguf_keys.push_back(key);
+        }
         for (const auto& line : recipes.apply(facts, argv, env))
             std::fprintf(stderr, "1bit serve: recipe %s\n", line.c_str());
     }

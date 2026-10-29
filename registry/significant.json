@@ -3,7 +3,8 @@
  "classes": {
   "DeepseekV41ForCausalLM": {
    "model_type": "deepseek_v41",
-   "family": "DeepSeek V4.1"
+   "family": "DeepSeek V4.1 (engram embeddings + candidate-block sparse attention; the pinned deepseek4 path runs neither)",
+   "watch": "report"
   },
   "Qwen3Mamba3ForCausalLM": {
    "model_type": "qwen3_mamba3",
@@ -104,6 +105,21 @@
   "Glm5NextForConditionalGeneration": {
    "model_type": "glm5_next",
    "family": "GLM-5.3-Flash (KDA linear-attention + DeepSeek sparse attention hybrid, hyper-connections; upstream llama.cpp 649dcb10, after the pin)",
+   "watch": "report"
+  },
+  "LiveMemForCausalLM": {
+   "model_type": "livemem",
+   "family": "LiveMem RL backbone (Qwen2.5-shaped dense decoder, MLX q4 uploads)",
+   "watch": "report"
+  },
+  "CDMMoELMPoincare": {
+   "model_type": "cdm_moe_poincare",
+   "family": "CDM Poincare-geometry MoE (hyperbolic attention + telepathy gate, 629M, one uploader)",
+   "watch": "report"
+  },
+  "Senryu2ForCausalLM": {
+   "model_type": "senryu2",
+   "family": "Senryu-2.2 GDN2 + parallax-attention hybrid with repo-local n-gram tables",
    "watch": "report"
   }
  }

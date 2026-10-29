@@ -1,0 +1,641 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-menu: the console menu of a booted 1bit OS.
+#
+# init.sh starts it on tty1 (the screen the owner looks at) in place of the bare `sh -i` loop. The
+# serial line (ttyS0, which the QEMU gate drives) and ssh keep the plain shell, so nothing here can
+# change what a gate sees. It draws with ANSI escapes only: the image has no dialog, whiptail or
+# ncurses, and terminfo is not guaranteed on a text console.
+#
+# It drives the commands the appliance already has (lemonade, 1bit-selftest, 1bit-release-check,
+# 1bit-install) and starts nothing itself: lemond is already up when init gets this far.
+#
+#   1bit-menu           the menu (init.sh, tty1)
+#   1bit-menu --shell   no menu, straight to the plain shell
+#
+# Keys: up/down or j/k move, 1-9 jump, Enter chooses, q quits to the shell, u shows the web app URL as
+# a QR code (the console cannot be clicked; a phone can scan it). Holding q while the menu starts
+# skips the menu too, which is the escape hatch if the screen ever misbehaves. The terminal is
+# restored on every way out (EXIT, INT, TERM, HUP), and init.sh runs `stty sane` before restarting a
+# menu that died, so a crash can never leave the console in raw mode.
+#
+# PATH is not set here: init.sh exports the appliance PATH (which is what puts lemonade and the 1bit-*
+# commands in reach), and a shell that runs the menu already has the same one.
+
+ESC=$(printf '\033')
+RESET=$ESC'[0m'
+BOLD=$ESC'[1m'
+REV=$ESC'[7m'
+HIDECUR=$ESC'[?25l'
+SHOWCUR=$ESC'[?25h'
+CYAN=$ESC'[1;36m'
+GREEN=$ESC'[1;32m'
+YELLOW=$ESC'[1;33m'
+RED=$ESC'[1;31m'
+GREY=$ESC'[0;37m'
+RULE=------------------------------------------------------------------------
+
+# ---- the terminal -------------------------------------------------------------------------------
+# keys are read from the terminal itself, not from stdin: `page` prints a command's output through a
+# pipeline, so its stdin is that command, and reading a key from stdin would eat a line of it
+KTTY=/dev/tty
+( : < /dev/tty ) 2>/dev/null || KTTY=/dev/stdin
+# stty on this console. The { } 2>/dev/null hides the shell's own "cannot open /dev/tty" when the menu
+# is read or started without a terminal (a test, or --help), which is otherwise all the user would see.
+ttystat() { { stty "$@" < "$KTTY"; } 2>/dev/null; }
+# the size of this console, so the frame fits an 80x25 text console and a wide JetKVM/fbcon screen
+# alike: 25x80 is the fallback when `stty size` cannot answer
+ROWS=25
+COLS=80
+k_sz=$(ttystat size)
+if [ -n "$k_sz" ]; then ROWS=${k_sz% *}; COLS=${k_sz#* }; fi
+case "$ROWS" in ''|*[!0-9]*) ROWS=25 ;; esac
+case "$COLS" in ''|*[!0-9]*) COLS=80 ;; esac
+[ "$ROWS" -lt 16 ] && ROWS=16
+[ "$COLS" -lt 60 ] && COLS=60
+raw() { ttystat -echo -icanon min 1 time 0; [ "$KTTY" = /dev/tty ] && printf '%s' "$HIDECUR"; }
+cooked() { ttystat sane; [ "$KTTY" = /dev/tty ] && printf '%s%s' "$RESET" "$SHOWCUR"; }
+trap 'cooked' EXIT
+trap 'cooked; exit 130' INT
+trap 'cooked; exit 130' TERM
+trap 'cooked; exit 130' HUP
+
+# one key into KEY: up/down/left/right/esc get names, Enter arrives as the empty string (icanon is
+# off, so the line discipline hands us the CR as a newline and $(...) strips it - hence the file, which
+# is what tells "Enter" from "nothing yet").
+#
+# The read waits in 0.5 s slices rather than blocking (stty min 1): a menu that is killed in the middle
+# of a read then leaves at most half a second of dd behind. A dd blocked in a read holds this tty's
+# session, and while anything holds it init.sh cannot give tty1 a new menu at all.
+KEY=
+KEYF=/tmp/.1bit-menu.key
+readkey() {
+    while :; do
+        ttystat min 0 time 5
+        dd bs=1 count=1 < "$KTTY" > "$KEYF" 2>/dev/null || { cooked; exit 130; }
+        [ -s "$KEYF" ] && break
+    done
+    KEY=$(cat "$KEYF" 2>/dev/null)
+    rm -f "$KEYF"
+    if [ "$KEY" = "$ESC" ]; then
+        # an arrow key arrives as ESC [ A..D in one write; min 0 time 1 is the 0.1 s wait that tells a
+        # bare ESC from a sequence without ever blocking on the next keypress
+        ttystat min 0 time 1
+        k_tail=$(dd bs=1 count=2 < "$KTTY" 2>/dev/null)
+        case "$k_tail" in
+            '[A') KEY=up ;;
+            '[B') KEY=down ;;
+            '[C') KEY=right ;;
+            '[D') KEY=left ;;
+            *) KEY=esc ;;
+        esac
+    fi
+}
+
+# one key, but give up after ~1 s: KEY empty and TIMED=1 means nothing was pressed (Status and Logs
+# redraw on that tick)
+TIMED=0
+readkey_t() {
+    TIMED=0
+    ttystat min 0 time 10
+    dd bs=1 count=1 < "$KTTY" > "$KEYF" 2>/dev/null || { cooked; exit 130; }
+    if [ -s "$KEYF" ]; then KEY=$(cat "$KEYF" 2>/dev/null); else KEY=; TIMED=1; fi
+    rm -f "$KEYF"
+    [ "$KEY" = "$ESC" ] && KEY=esc
+}
+
+# a clickable link where the terminal can make one, the bare text where it cannot. OSC 8 is what
+# modern terminals (ssh, a serial console in a terminal app) turn into a link; the VT has no idea what
+# it is, and TERM=linux is exactly the VT, so there it is never sent - the owner would otherwise see
+# the escape as stray characters around the URL.
+link() {
+    if [ -n "${TERM:-}" ] && [ "$TERM" != linux ]; then
+        printf '\033]8;;%s\033\\%s\033]8;;\033\\' "$1" "$1"
+    else
+        printf '%s' "$1"
+    fi
+}
+
+# ---- facts about this boot ----------------------------------------------------------------------
+MODE=LIVE
+IP=none
+PORT=13305
+CHATPORT=8080
+URL=http://localhost:13305/
+APURL=http://localhost:13305/api/v1
+installed() { [ -e /data/.installed ] || [ -e /etc/1bit/installed ]; }
+
+facts() {
+    IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    [ -n "$IP" ] || IP="no address"
+    if installed; then MODE=INSTALLED; else MODE=LIVE; fi
+    PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
+    PORT=${PORT:-13305}
+    URL="http://$IP:$PORT/"
+    APURL="http://$IP:$PORT/api/v1"
+}
+
+# the top of every screen: the banner facts. Edition, mode, address, where the key is.
+header() {
+    facts
+    if [ "$MODE" = INSTALLED ]; then mcol=$GREEN
+    else mcol=$YELLOW; fi
+    printf '%s  1bit OS - Lemonade Server appliance%s\n' "$CYAN" "$RESET"
+    printf '  %s%s%s  ' "$mcol" "$MODE" "$RESET"
+    if [ "$MODE" = INSTALLED ]; then
+        printf 'runs from this machine'"'"'s disk\n'
+    else
+        printf 'runs from RAM, nothing installed, disks untouched\n'
+    fi
+    # the things a person wants first: where to click, and where to point a client (and, where the
+    # optional OpenWebUI package is installed, the second front end below). The web app is
+    # Lemonade's own (served at /, chat right away); the API is OpenAI-compatible under /api/v1. Both
+    # are OSC 8 links where the terminal can make them clickable; on the VT (TERM=linux) they are the
+    # bare text, because the console would show the escape instead.
+    if wget -q -O /dev/null -T 2 "http://127.0.0.1:$PORT/" 2>/dev/null; then web=up; else web=starting; fi
+    printf '  Web app      %s' "$BOLD"
+    link "$URL"
+    printf '%s   open it in a browser and chat (%s)\033[K\n' "$RESET" "$web"
+    # the optional second front end (1bit-openwebui, engine#594): the same line, the same probe, but
+    # only where that package is installed - and nothing is probed where it is not, so a live boot and
+    # an installed box without OpenWebUI pay nothing for it. 8080 answers -> (up), else (starting),
+    # exactly like the line above; the URL is the one the package's own console line prints.
+    if [ -e /usr/lib/systemd/system/1bit-openwebui.service ]; then
+        if wget -q -O /dev/null -T 2 "http://127.0.0.1:$CHATPORT/" 2>/dev/null; then chat=up; else chat=starting; fi
+        printf '  Chat UI      %s' "$BOLD"
+        link "http://$IP:$CHATPORT/"
+        printf '%s   OpenWebUI, the other front end (%s)\033[K\n' "$RESET" "$chat"
+    fi
+    printf '  On a phone   press %su%s: that URL as a QR code (the console cannot be clicked)\033[K\n' "$BOLD" "$RESET"
+    printf '  API          '
+    link "$APURL"
+    printf '   OpenAI-compatible; key: grep LEMONADE_API_KEY /data/lemonade/lemond.conf\033[K\n'
+    printf '%s  %s%s\033[K\n' "$GREY" "$RULE" "$RESET"
+}
+
+# every screen starts here: home the cursor and clear below it, so a redraw does not flash a blank
+# screen the way a full clear does on JetKVM
+cls() { printf '%s[H%s[J%s' "$ESC" "$ESC" "$HIDECUR"; }
+
+pause() { printf '\n%s  any key goes back%s' "$GREY" "$RESET"; readkey; printf '\n'; }
+
+# a message the user has to read, then any key
+note() {
+    cls
+    header
+    printf '\n'
+    for line in "$@"; do printf '  %s\n' "$line"; done
+    pause
+}
+
+# ---- choosing -----------------------------------------------------------------------------------
+# pick "<title>" "<label>|<hint>" ... : a vertical list. Sets SEL to the index, 0 for q, and SEL_ITEM
+# to the chosen entry. Items beyond one window scroll; the labels never wrap at 80 columns.
+SEL=0
+SEL_ITEM=
+pick() {
+    p_title=$1
+    shift
+    p_n=$#
+    p_i=1
+    p_top=1
+    p_win=$((ROWS - 13))
+    [ "$p_win" -lt 4 ] && p_win=4
+    while :; do
+        cls
+        header
+        printf '\n  %s%s%s\n\n' "$BOLD" "$p_title" "$RESET"
+        p_k=1
+        p_row=0
+        for p_it in "$@"; do
+            if [ "$p_k" -ge "$p_top" ] && [ "$p_row" -lt "$p_win" ]; then
+                p_lab=${p_it%%|*}
+                p_hint=${p_it#*|}
+                [ "$p_hint" = "$p_it" ] && p_hint=
+                if [ "$p_k" = "$p_i" ]; then
+                    printf '  %s> %s  %-10s%s' "$REV" "$p_k" "$p_lab" "$RESET"
+                    printf '  %s%s\033[K\n' "$BOLD" "$p_hint"
+                else
+                    printf '     %s  %-10s' "$p_k" "$p_lab"
+                    printf '  %s%s%s\033[K\n' "$GREY" "$p_hint" "$RESET"
+                fi
+                p_row=$((p_row + 1))
+            fi
+            p_k=$((p_k + 1))
+        done
+        [ "$p_n" -gt "$p_win" ] &&
+            printf '%s  ... %s of %s%s\033[K\n' "$GREY" "$p_top" "$p_n" "$RESET"
+        [ "$p_row" -lt "$p_win" ] && printf '\033[K\n'
+        printf '\n%s  up/down or j/k move   1-%s jump   Enter choose   q back%s\033[K\n' \
+            "$GREY" "$p_n" "$RESET"
+        readkey
+        case "$KEY" in
+            up|k) p_i=$((p_i - 1)); [ "$p_i" -lt 1 ] && p_i=$p_n ;;
+            down|j) p_i=$((p_i + 1)); [ "$p_i" -gt "$p_n" ] && p_i=1 ;;
+            [1-9]) if [ "$KEY" -le "$p_n" ] 2>/dev/null; then p_i=$KEY; fi ;;
+            q|Q) SEL=0; return 0 ;;
+            u|U) SEL=-1; return 0 ;;
+            '') SEL=$p_i; SEL_ITEM=; p_k=1
+                for p_it in "$@"; do
+                    [ "$p_k" = "$p_i" ] && SEL_ITEM=$p_it
+                    p_k=$((p_k + 1))
+                done
+                return 0 ;;
+        esac
+        [ "$p_i" -lt "$p_top" ] && p_top=$p_i
+        [ "$p_i" -ge $((p_top + p_win)) ] && p_top=$((p_i - p_win + 1))
+    done
+}
+
+# ---- a pager, because busybox `more` may not be in the image ------------------------------------
+# stdin to the screen, one screenful at a time, a key between pages, q stops.
+page() {
+    p_lines=0
+    p_page=$((ROWS - 9))
+    [ "$p_page" -lt 4 ] && p_page=4
+    while IFS= read -r p_line; do
+        printf '%s\033[K\n' "$p_line"
+        p_lines=$((p_lines + 1))
+        if [ $((p_lines % p_page)) = 0 ]; then
+            printf '%s  -- more: any key, q stops --%s' "$GREY" "$RESET"
+            readkey
+            printf '\r\033[K'
+            case "$KEY" in q|Q) return 0 ;; esac
+        fi
+    done
+    printf '\n%s  -- end: any key --%s' "$GREY" "$RESET"
+    readkey
+    printf '\n'
+}
+
+# ---- Chat ---------------------------------------------------------------------------------------
+# the ids `lemonade list` reports for THIS machine: the Local section (what can actually be chatted),
+# one per line, with "|onebit" appended when the line names a 1bit model. Model ids have no spaces.
+model_ids() {
+    lemonade list 2>/dev/null | awk '
+        /^Available for Download/ { done = 1 }
+        done { next }
+        $1 == "Local" || $1 == "Model" { next }
+        /^-+$/ { next }
+        /^[ \t]*$/ { next }
+        { mark = ""; if (tolower($0) ~ /onebit|1bit/) mark = "onebit"; print $1 "|" mark }'
+}
+
+act_chat() {
+    set --
+    while IFS= read -r id_line; do
+        set -- "$@" "${id_line%%|*}|$( [ "${id_line#*|}" = onebit ] && printf '[1bit]' )"
+    done <<EOF_IDS
+$(model_ids)
+EOF_IDS
+    if [ "$#" = 0 ]; then
+        note "lemonade list reported no local models." \
+            "" \
+            "A GGUF in /data/models becomes <name>-1bit at the next boot (see Models)."
+        return
+    fi
+    pick "Chat - choose a model" "$@"
+    [ "$SEL" -le 0 ] && return
+    c_id=${SEL_ITEM%%|*}
+    cooked
+    cls
+    printf '%s  lemonade chat %s%s  (exit, or Ctrl-C, returns here)\n\n' "$BOLD" "$c_id" "$RESET"
+    lemonade chat "$c_id"
+    printf '\n%s  [chat ended]%s' "$GREY" "$RESET"
+    raw
+    readkey
+    printf '\n'
+}
+
+# ---- Models -------------------------------------------------------------------------------------
+act_models() {
+    cls
+    header
+    printf '\n  %sModels%s   lemonade list, then the GGUFs on /data/models\n\n' "$BOLD" "$RESET"
+    {
+        lemonade list 2>&1
+        printf '\n%s  GGUFs on /data/models%s\n' "$BOLD" "$RESET"
+        if ls /data/models/*.gguf >/dev/null 2>&1; then
+            ls -l /data/models/*.gguf 2>/dev/null | awk '{ printf "  %8.1f MB  %s\n", $5 / 1000000, $9 }'
+        else
+            printf '  none: put a .gguf in /data/models on the stick, or ask Lemonade to pull one\n'
+        fi
+        printf '\n%s  Local is what chat can use; the [1bit] ones run on this engine%s\n' "$GREY" "$RESET"
+    } | cut -c1-$((COLS - 2)) | page
+}
+
+# ---- Status -------------------------------------------------------------------------------------
+# the PASS/FAIL/SKIP rows of the LATEST run: the log is appended to, and each run starts with a header
+latest_check_rows() {
+    [ -f /data/release-check.log ] || return 0
+    rc_line=$(grep -n '^1bit OS release check' /data/release-check.log 2>/dev/null | tail -1 | cut -d: -f1)
+    rc_line=${rc_line:-1}
+    tail -n +"$rc_line" /data/release-check.log 2>/dev/null |
+        grep -E '^(PASS|FAIL|SKIP|RESULT)' | tail -n 9 | cut -c1-$((COLS - 4)) |
+        sed -e "s/^PASS/${GREEN}PASS${RESET}/" \
+            -e "s/^FAIL/${RED}FAIL${RESET}/" \
+            -e "s/^SKIP/${YELLOW}SKIP${RESET}/" \
+            -e "s/^RESULT/${BOLD}RESULT${RESET}/" \
+            -e 's/^/  /'
+}
+
+run_check() {
+    cooked
+    cls
+    printf '%s  running 1bit-release-check%s  (about a minute with a model)\n\n' "$BOLD" "$RESET"
+    if command -v 1bit-release-check >/dev/null 2>&1; then
+        1bit-release-check
+    else
+        printf '  1bit-release-check is not in this image\n'
+    fi
+    printf '\n%s  [done]%s' "$GREY" "$RESET"
+    raw
+    readkey
+    printf '\n'
+}
+
+act_status() {
+    while :; do
+        cls
+        header
+        printf '\n  %sself-test%s  /data/selftest.log\n' "$BOLD" "$RESET"
+        if [ -f /data/selftest.log ]; then
+            tail -n 5 /data/selftest.log | cut -c1-$((COLS - 4)) | sed 's/^/  /'
+        else
+            printf '%s  no self-test on this boot yet: choose Shell and run 1bit-selftest%s\n' "$GREY" "$RESET"
+        fi
+        printf '\n  %srelease check%s  /data/release-check.log, the latest run\n' "$BOLD" "$RESET"
+        s_rows=$(latest_check_rows)
+        if [ -n "$s_rows" ]; then
+            printf '%s\n' "$s_rows"
+        else
+            printf '%s  no release check on this boot yet%s\n' "$GREY" "$RESET"
+        fi
+        printf '\n%s  r re-runs the release check   any other key goes back%s\033[K\n' "$GREY" "$RESET"
+        readkey_t
+        case "$KEY" in
+            r|R) run_check ;;
+            '') : ;;
+            *) return ;;
+        esac
+    done
+}
+
+# ---- Logs ---------------------------------------------------------------------------------------
+act_logs() {
+    while :; do
+        cls
+        header
+        for lg in /tmp/lemond.log /data/boot.log /tmp/fans.log; do
+            printf '\n  %s%s%s  (last 40 lines)\n' "$BOLD" "$lg" "$RESET"
+            if [ -f "$lg" ]; then
+                tail -n 40 "$lg" 2>/dev/null | sed 's/^/  /'
+            else
+                printf '%s  not there%s\n' "$GREY" "$RESET"
+            fi
+        done
+        printf '\n%s  any key refreshes, q goes back%s\033[K\n' "$GREY" "$RESET"
+        readkey
+        case "$KEY" in q|Q) return ;; esac
+    done
+}
+
+# ---- Install ------------------------------------------------------------------------------------
+DISK=/dev/nvme0n1
+disk_facts() {   # <disk> -> "model, N GB" on stdout
+    d_name=${1#/dev/}
+    d_model=$(cat "/sys/class/block/$d_name/device/model" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')
+    [ -n "$d_model" ] || d_model="(no model reported)"
+    d_sect=$(cat "/sys/class/block/$d_name/size" 2>/dev/null || echo 0)
+    printf '%s, %s GB' "$d_model" "$((d_sect * 512 / 1000000000))"
+}
+
+act_install() {
+    if installed; then
+        cls
+        header
+        printf '\n  %sInstall%s  this machine is installed: 1bit OS runs from its own disk\n\n' "$BOLD" "$RESET"
+        i_data=$(findfs LABEL=1BIT-DATA 2>/dev/null)
+        printf '  data partition  %s  (LABEL=1BIT-DATA, mounted on /data)\n' "${i_data:-not found}"
+        if [ -n "$i_data" ]; then
+            i_name=${i_data#/dev/}
+            i_disk=$(basename "$(readlink -f "/sys/class/block/$i_name/.." 2>/dev/null)" 2>/dev/null)
+            [ -n "$i_disk" ] && printf '  disk            /dev/%s  (%s)\n' "$i_disk" "$(disk_facts "/dev/$i_disk")"
+        fi
+        printf '  mode marker     %s\n' "$( [ -e /data/.installed ] && echo /data/.installed || echo /etc/1bit/installed )"
+        printf '\n  The install is permanent: a live stick never touches this disk.\n'
+        printf '  To reinstall, boot the stick and use this screen there.\n'
+        pause
+        return
+    fi
+    cls
+    header
+    printf '\n  %sInstall 1bit OS onto this machine%s\n\n' "$BOLD" "$RESET"
+    if [ ! -b "$DISK" ]; then
+        note "There is no $DISK on this boot, so there is no internal disk to install onto." \
+            "" \
+            "1bit OS installs onto one internal NVMe disk. Nothing has been written."
+        return
+    fi
+    printf '  target      %s  (%s)\n' "$DISK" "$(disk_facts "$DISK")"
+    printf '  layout      GPT: 512 MB ESP (1BIT-OS) + ext4 (1BIT-DATA) for the rest\n'
+    printf '  source      this live boot (its signed ESP, and /data)\n\n'
+    printf '  %swhat is on %s now, and about to be destroyed:%s\n' "$RED" "$DISK" "$RESET"
+    i_tab=
+    command -v sfdisk >/dev/null 2>&1 && i_tab=$(sfdisk -l "$DISK" 2>/dev/null)
+    if [ -n "$i_tab" ]; then
+        printf '%s\n' "$i_tab" | sed 's/^/    /'
+    else
+        printf '    (the partition table could not be read: no sfdisk, or not root)\n'
+    fi
+    # 1bit-install's own refusal, run exactly as the menu calls it but without --yes: it exits 2
+    # before it touches anything, so the warning here is the tool's text and cannot drift from it
+    printf '\n'
+    if command -v 1bit-install >/dev/null 2>&1; then
+        1bit-install "$DISK" 2>&1 | sed 's/^/  /'
+    else
+        printf '  %s1bit-install is not in this image%s\n' "$RED" "$RESET"
+    fi
+    printf '\n  This destroys everything on %s. It cannot be undone.\n' "$DISK"
+    printf '  If you mean it, type %sINSTALL%s and press Enter (anything else goes back): ' "$BOLD" "$RESET"
+    cooked
+    i_ans=
+    read -r i_ans < "$KTTY"
+    if [ "$i_ans" != INSTALL ]; then
+        printf '\n  Nothing was written.\n'
+        raw
+        readkey
+        printf '\n'
+        return
+    fi
+    cls
+    printf '%s  installing onto %s%s\n\n' "$BOLD" "$DISK" "$RESET"
+    if command -v 1bit-install >/dev/null 2>&1; then
+        1bit-install "$DISK" --yes
+        i_rc=$?
+    else
+        i_rc=1
+    fi
+    printf '\n'
+    if [ "$i_rc" = 0 ]; then
+        printf '%s  1bit OS is installed on %s.%s\n\n' "$GREEN" "$DISK" "$RESET"
+        printf '  Power the machine off, remove the stick, and boot it from this disk.\n'
+    else
+        printf '%s  The install did not finish (1bit-install exit %s).%s\n' "$RED" "$i_rc" "$RESET"
+        printf '  Nothing on the stick changed; the output above says why.\n'
+    fi
+    printf '\n  %sr%s reboot now, any other key goes back to the menu: ' "$GREY" "$RESET"
+    raw
+    readkey
+    printf '\n'
+    case "$KEY" in
+        r|R) cooked; sync; printf '  rebooting...\n'; reboot -f ;;
+    esac
+}
+
+# ---- Shell --------------------------------------------------------------------------------------
+act_shell() {
+    cooked
+    cls
+    PS1='1bit-os:\w # '
+    export PS1
+    printf '1bit OS shell as root. exit (or Ctrl-D) comes back to the menu.\n\n'
+    sh -i
+    printf '\n%s  [shell ended]%s' "$GREY" "$RESET"
+    raw
+    readkey
+    printf '\n'
+}
+
+# ---- Power --------------------------------------------------------------------------------------
+act_power() {
+    pick "Power" "Reboot|restart the machine" "Power off|switch it off"
+    case "$SEL" in
+        1) p_what="restart"; p_why="Reboot" ;;
+        2) p_what="switch off"; p_why="Power off" ;;
+        *) return ;;
+    esac
+    cls
+    header
+    printf '\n  %s%s this machine?%s  y confirms, any other key cancels: ' "$BOLD" "$p_why" "$RESET"
+    readkey
+    printf '\n'
+    case "$KEY" in
+        y|Y) cooked; sync; printf '  %s...\n' "$p_what"
+             [ "$p_why" = Reboot ] && reboot -f
+             poweroff -f ;;
+    esac
+}
+
+# ---- the QR code --------------------------------------------------------------------------------
+# The console cannot be clicked (JetKVM video, a monitor), so the web app URL is drawn as a QR code a
+# phone opens. ANSIUTF8 is half blocks: two QR rows per text row in an 8x16 console font, so this URL's
+# 29x29 modules with their margin come to 17 text rows and fit an 80x25 screen; `a` switches to ASCII
+# blocks for a font without the block glyphs (2 characters per module, so it needs a taller screen).
+act_qr() {
+    facts                       # the URL, even if this screen is ever reached without a frame first
+    q_mode=utf8
+    while :; do
+        cls
+        printf '  %sOpen on your phone%s: point the camera at this code\033[K\n\n' "$BOLD" "$RESET"
+        if command -v qrencode >/dev/null 2>&1; then
+            if [ "$q_mode" = ascii ]; then
+                qrencode -t ASCII -m 2 "$URL" 2>/dev/null | while IFS= read -r q_line; do
+                    printf '%s\033[K\n' "$q_line"
+                done
+            else
+                # ANSIUTF8 draws the light modules as white blocks and the dark ones as the black
+                # background, which is a printed QR's polarity (paper light, ink dark) - the strict
+                # scanner in the proof reads it, so nothing is inverted here on purpose.
+                qrencode -t ANSIUTF8 -m 2 "$URL" 2>/dev/null | while IFS= read -r q_line; do
+                    printf '%s\033[K\n' "$q_line"
+                done
+            fi
+            printf '%s' "$RESET"
+        else
+            printf '  %sno qrencode in this image, so no code to scan here%s\033[K\n' "$GREY" "$RESET"
+        fi
+        printf '\n  '
+        link "$URL"
+        printf '%s\033[K\n' "$RESET"
+        printf '\n%s  any key goes back   a = %s\033[K%s\n' "$GREY" \
+            "$( [ "$q_mode" = utf8 ] && echo 'ASCII blocks instead' || echo 'half blocks instead' )" "$RESET"
+        # the ASCII form is 2 characters per module: 29 rows for this URL, where the half-block form
+        # needs 17. A 25-row text console cannot show all of it, so say that instead of letting it scroll.
+        if [ "$q_mode" = ascii ] && [ "$ROWS" -lt 32 ]; then
+            printf '%s  (ASCII needs a taller screen: %s rows, this console has %s)%s\033[K\n' \
+                "$GREY" "$(qrencode -t ASCII -m 2 "$URL" 2>/dev/null | wc -l)" "$ROWS" "$RESET"
+        fi
+        readkey
+        case "$KEY" in
+            a|A) [ "$q_mode" = utf8 ] && q_mode=ascii || q_mode=utf8 ;;
+            *) return ;;
+        esac
+    done
+}
+
+# ---- the menu -----------------------------------------------------------------------------------
+menu_main() {
+    while :; do
+        if installed; then
+            i_hint="this machine is installed: what it runs from"
+        else
+            i_hint="write 1bit OS onto this machine's internal disk"
+        fi
+        pick "Menu" \
+            "Chat|talk to a model in this terminal" \
+            "Models|lemonade list, and the GGUFs on /data/models" \
+            "Status|the self-test and the latest release check" \
+            "Logs|Lemonade, boot and fans" \
+            "Install|$i_hint" \
+            "Shell|a plain root shell (exit comes back here)" \
+            "Power|reboot, or switch the machine off" \
+            "Phone|the web app URL as a QR code, to open on a phone"
+        case "$SEL" in
+            -1|8) act_qr ;;
+            0) return 0 ;;
+            1) act_chat ;;
+            2) act_models ;;
+            3) act_status ;;
+            4) act_logs ;;
+            5) act_install ;;
+            6) act_shell ;;
+            7) act_power ;;
+        esac
+    done
+}
+
+case "${1:-}" in
+    --shell) cooked; PS1='1bit-os:\w # '; export PS1; exec sh -i ;;
+    --help|-h) sed -n '/^# 1bit-menu: /,/^$/p' "$0" 2>/dev/null | sed 's/^# \{0,1\}//'; exit 0 ;;
+esac
+
+raw
+# holding q while the menu comes up drops to the plain shell, so a console that will not draw the
+# menu right is never a dead end
+k_hold=
+ttystat min 0 time 4
+dd bs=1 count=1 < "$KTTY" > "$KEYF" 2>/dev/null
+k_hold=$(cat "$KEYF" 2>/dev/null)
+rm -f "$KEYF"
+case "$k_hold" in
+    q|Q) cooked; printf '  q held: plain shell. Run 1bit-menu to come back.\n'; exit 0 ;;
+esac
+menu_main
+cooked
+printf '  1bit OS shell. Run 1bit-menu to come back to the menu; 1bit-selftest proves the engine.\n'
+exit 0

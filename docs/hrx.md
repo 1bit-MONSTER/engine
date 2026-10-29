@@ -384,6 +384,57 @@ also be resident raw. Measured against `6e42b51` (3 interleaved runs, `-b 512 -u
 
 `test-backend-ops -o MUL_MAT -b HRX0`: 287/287. `GGML_HRX_Q8_PREFILL_RELAX=0` turns this off too.
 
+### Flash-Next prefill: where the 287 tok/s goes ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
+
+Qwen3.8-Flash-Next (`qwen4exp A3B`, 512 experts, 176.9 B parameters, UD-IQ4_XS 93.7 GB) prefills at
+287 tok/s on Strix Halo where another stack reports 1,679 for the same class of model. Two candidate
+causes are ruled out before the profile below: the ubatch cap, and the expert GEMM's tile width.
+
+The ubatch cap is gone. An ubatch above 512 tokens used to fail the whole graph with
+`GGML_STATUS_FAILED` (engine#389); the token bounds in
+`ggml/src/ggml-hrx/ubatch-token-limits.h` are what removed it — `kSsmConvRollbackMaxTokens` 512
+chained by `dispatch-ssm-conv-chunked.cpp`, `kSetRowsKernelMaxTokens` 2048 by
+`dispatch-row-chunks.cpp`, `kUbatchMaxTokens` 65536. A bigger ubatch buys nothing on this model
+anyway, so it is not the limiter either.
+
+Measured on Strix Halo, engine `0d0c846` + llama.cpp `8ee20a0`, `-ngl 99 -fa 1`, 2026-10-27T02:38Z,
+3 runs (`samples_ts` 287.384 / 286.933 / 285.578):
+
+| metric | tok/s |
+|---|---|
+| pp512 | 286.63 ± 0.94 |
+| pp4096 | 260.59 ± 4.51 |
+| p1024, `-ub 576` | 269.34 |
+
+`HRX_PROFILE_MODE=dispatch`, bundles parsed with `iree-profile dispatch` (32 MB at pp512, 46 MB at
+pp4096). Device time accounts for 1,355 ms of the 1,786 ms pp512 pass (76%) and 12.84 s of 15.72 s
+at pp4096 (82%), so 18–24% is host-side and the table below is the rest. Top rows, share of device
+time:
+
+| kernel | pp512 | pp4096 | dispatches | workgroups per dispatch |
+|---|---|---|---|---|
+| `hrx_prefill_mmid_swiglu_iq3_s_m64_w4` | 27.1% | 25.1% | 92 / 736 | m64 tiles |
+| `hrx_dp_mm_q8_0_m128_w8_f2` | 15.9% | 14.7% | 552 / 4416 | 4x10x1 and 4x40x1 |
+| `hrx_prefill_mmid_iq4_nl_m64_w4` | 11.6% | 10.6% | 86 / 688 | m64 tiles |
+| `ggml_mul_mat_f32_f32_wmma` | 8.6% | 8.0% | 522 / 4272 | f32 fallback |
+| `ggml_flash_attention_f32_f16_wmma` | | 8.0% | 192 | |
+| `hrx_dp_mm_q8_0_m64_w8_f2_sb` | 3.5% | 3.2% | 190 / 1520 | |
+| `llm_gated_delta_net_f32_wmma_head128` | 3.0% | 2.7% | 72 / 576 | |
+
+The expert GEMMs are a third of the pass and already the fastest thing per token: the m64 tile is
+in play, so a wider MMQ tile is not the lever, and those kernels belong to the private add-on
+(`third_party/ds4`'s `ROCM_MMQ_Y` is a different route and does not appear in this bundle). The two
+levers that do appear are both decode-shaped code running on a prefill. `hrx_dp_mm_q8_0_*` is ~16%
+of it while its grid stays 4x10x1 and 4x40x1 workgroups — 40 and 160 workgroups on a 40-CU part —
+however many tokens the chunk carries. `ggml_mul_mat_f32_f32_wmma` is 8% of a 4.25 bpw model's
+prefill, which means some projection is falling back to an unquantized matmul.
+
+Not claimed here: the 1,679 tok/s is another stack's number on another harness, and no MTP head
+exists for this model in this tree, so there is no speculative-decode row. The profiled pass also
+carries two multi-second gaps after `ggml_get_rows_f32` that the timed pass does not (1,786 ms ≈
+1,355 ms device + ~0.4 s host), so those are bundle-write or cold-start cost, not the steady-state
+host gap.
+
 ### Hadamard-rotated Q4_0 files ("H32", dropped)
 
 The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on HRX it was slower
@@ -589,6 +640,13 @@ in [hrx.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/
 - **PrismML tile bytes** ([llama.cpp #74](https://github.com/1bit-MONSTER/llama.cpp/pull/74)): the low-token
   SwiGLU sized PQ2_0 / PTQ1_0 weight rows from a tile size of 0, so every row read row 0. Ternary-Bonsai-1.7B
   PQ2_0 decode perplexity 1,225,624 -> 20.65 (CPU 20.70); the 27B files took another kernel and were unaffected.
+  **PQ2_0 on the dense prefill kernels and ternary weights on the 2..16-token verify kernels** (private
+  add-on, 2026-10-25): Ternary-Bonsai-2-27B PQ2_0 pp512 188 -> 553 tok/s, and its ternary verify batch
+  decodes at 43.3 / 37.3 / 27.1 tok/s on code / prose / short with the Qwen3.8-27B MTP head (39/40 GSM8K).
+- **NVFP4 (ggml type 40) and Q2_0 (type 42)**: prompt and decode on HRX through our HIP kernels
+  (private add-on, 2026-10-24), no extra flag or environment: a Qwen3.8-27B file of either type loads
+  and runs with **one graph split**. Measured on the 27B, performance mode: NVFP4 pp512 613 / tg128
+  12.7 tok/s, KLD vs the CPU 0.00144; Q2_0 pp512 632 / tg128 23.1 tok/s, KLD vs the CPU 0.00055.
 - **TQ1_0 / TQ2_0** ([llama.cpp #69](https://github.com/1bit-MONSTER/llama.cpp/pull/69)): ggml's ternary types
   in the shared dequantizer and on the K-quant decode kernels. Ternary-Bonsai-1.7B, HRX0 vs CPU: KLD 0.000523,
   same top token 98.67%; pp512 / tg128 TQ1_0 3542 / 113, TQ2_0 4100 / 156 tok/s.
@@ -773,12 +831,24 @@ evictions: Qwen3-Coder-30B (2113-token prompt, partial alignment 256) went from 
 
 ## Not yet
 
-- **IQ4_NL / IQ4_XS on HRX ([llama.cpp #41](https://github.com/1bit-MONSTER/llama.cpp/pull/41)).**
+- **IQ4_NL / IQ4_XS on HRX ([llama.cpp #41](https://github.com/1bit-MONSTER/llama.cpp/pull/41), done).**
   AMD's IQ4 nibble packers remapped every table index (XOR 12) for a lowering that does not apply on
   gfx1151, in `motifs/dequant.loom` and again in the Q5_K/IQ4_XS prefill kernel, so IQ4 was declined
-  and ran on the CPU. #41 fixes both copies and the q8-plane SwiGLU path they exposed. Qwen3.8-27B
-  UD-Q4_K_XL: 91 graph splits -> 1, wikitext PPL 5.8294 (CPU 5.8288), decode 7.25 -> 9.0 tok/s
-  (Vulkan 12.5); `test-backend-ops -b HRX0` passes the IQ4 MUL_MAT and GET_ROWS cases.
+  and ran on the CPU. #41 fixes both copies and the q8-plane SwiGLU path they exposed: the shared
+  dequant now reads the real `kvalues_iq4nl` table through a table lookup, and the corpus contains no
+  XOR-12 on that path at all. Qwen3.8-27B UD-Q4_K_XL: 91 graph splits -> 1, wikitext PPL 5.8294 (CPU
+  5.8288), decode 7.25 -> 9.0 tok/s (Vulkan 12.5).
+
+  Re-verified on the **Loom-only** path on 2026-10-25 (a build with no HIP add-on at all, so every case
+  below runs through the Loom corpus). `test-backend-ops -b HRX0`: `MUL_MAT` iq4_nl **OK** for n=1..9 at
+  k=256, iq4_xs the same, `GET_ROWS` iq4_nl **OK** at `be1=1`; **0 FAIL, 2/2 backends passed**. Two
+  groups stay *declined* rather than wrong, and both are shape coverage, not the codebook: `k=32`
+  projections and `GET_ROWS` on a view or with a batched gather (`v=1`, `be1=7` — the same gap
+  [390](https://github.com/1bit-MONSTER/engine/issues/390) found, where `q8_0` fails identically, so the
+  quant is not the variable); and **`MUL_MAT_ID` for iq4_nl / iq4_xs**, which the Loom corpus does not
+  claim at all, so routed experts of those types take the CPU on a Loom-only build instead of decoding
+  garbage. The build the engine ships carries the HIP add-on, whose routed-expert kernels handle those
+  types on HRX.
 - **K-quant decode kernels ([llama.cpp #42](https://github.com/1bit-MONSTER/llama.cpp/pull/42)).**
   One-token projections on Q4_K, Q5_K, Q6_K, IQ4_NL, IQ4_XS and Q8_0 now read the GGUF blocks
   directly with f32 activations: the FFN gate/up pair fused with SwiGLU, and plain projections

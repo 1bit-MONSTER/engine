@@ -232,7 +232,9 @@ stage_bumps() {
         rc=$?; set -e
         if [ $rc -ne 0 ]; then
             # the step that failed, and the last lines of the log it wrote (the newest besides ours)
-            local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-" | head -1)
+            # `| head -1` would kill the pipeline under pipefail once there are two logs; take the
+            # first line of what ls printed instead
+            local last; last=$(ls -t "$LOGS"/*.log | grep -v "/bump-"); last=${last%%$'\n'*}
             result=held why="failed at $(cat "$W/.step") on $(host_desc) ($(basename "$last")): $(tail -n 2 "$last" | tr '\n' ' ' | cut -c1-240)"
         elif [ "$DRY" = 1 ]; then
             result=passed why="dry run: not merged"
@@ -297,7 +299,8 @@ package_checks() {  # package_checks <linux tarball>
     n=$(find "$t" \( -name 'libxrt*' -o -name 'libopenvino*' -o -name 'libonnxruntime*' \) | wc -l)
     [ "$n" = 0 ] || { echo "FAIL the tarball carries an external accelerator runtime"; bad=1; }
     [ $bad = 0 ] && echo "ok   runtime-deps: $(basename "$1") and $BUILD/1bit are self-contained"
-    f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f | head -1)
+    f=$(find "$t" -path '*/hrx/llama/bin/libggml-hrx.so*' -type f)   # no `| head -1`: see mkimage
+    f=${f%%$'\n'*}
     n=0; [ -n "$f" ] && n=$(nm -D --defined-only "$f" | grep -c ggml_hrx_hip_addon_register || true)
     if [ "$n" != 0 ]; then
         echo "ok   private HIP kernels compiled into $(basename "$f") ($(strings -a "$f" | grep -c amdgcn-amd-amdhsa || true) code object targets)"
@@ -336,21 +339,55 @@ package_checks() {  # package_checks <linux tarball>
         n=$(find "$t" -path '*/npu/kernels/*/layout.json' -type f | wc -l)
         [ "$n" -ge 3 ] || { echo "FAIL WEEKLY_NPU_KERNELS=1 but $(basename "$1") carries $n NPU kernel sets (want the 0.6B, 1.7B and 4B sets)"; bad=1; }
     fi
-    # The shipped npu tree is an exact allowlist: <set>/layout.json and <set>/layer1_*/layer1.elf.
-    # Anything else is the kernel method in the clear - layer1.work/ carries plaintext MLIR, object
-    # files and intermediate ELFs - so a stray file is a leak, not just a wrong shape.
+    # The shipped npu tree is an exact allowlist: <set>/layout.json, <set>/layer1_*/layer1.elf, and
+    # the set's signed manifest. Anything else is the kernel method in the clear - layer1.work/
+    # carries plaintext MLIR, object files and intermediate ELFs - so a stray file is a leak, not
+    # just a wrong shape.
     while IFS= read -r -d '' f; do
         rel=${f#"$t"/}
         if [ "$(basename "$f")" = layout.json ]; then continue; fi
+        # engine #574: the set's manifest and its Ed25519 signature, in the set's own directory
+        if [[ "$rel" =~ ^[^/]+/npu/kernels/[^/]+/manifest\.(json|sig)$ ]]; then continue; fi
         if [ "$(head -c 8 "$f")" != 1BPKCRYP ]; then
             echo "FAIL leaked build artifact in the package (not a sealed kernel): $rel"; nk=$((nk + 1))
         elif [[ ! "$rel" =~ ^[^/]+/npu/kernels/[^/]+/layer1_[^/]+/layer1\.elf$ ]]; then
-            echo "FAIL unexpected file under npu/kernels (a set ships layout.json + layer1_*/layer1.elf only): $rel"; nk=$((nk + 1))
+            echo "FAIL unexpected file under npu/kernels (a set ships layout.json + layer1_*/layer1.elf + manifest.json + manifest.sig only): $rel"; nk=$((nk + 1))
         fi
     done < <(find "$t" -path '*/npu/kernels/*' -type f -print0)
     [ "$nk" = 0 ] || bad=1
     n=$(find "$t" -path '*/npu/kernels/*' -type f | wc -l)
     [ "$n" = 0 ] || [ "$nk" != 0 ] || echo "ok   NPU kernels: $n files under npu/kernels, all sealed"
+    # engine #574: sealing is confidentiality, the manifest is authenticity. Every sealed set in the
+    # tarball carries manifest.json - listing every file it ships, with the sha256 of its ciphertext -
+    # and manifest.sig, and the manifest lists exactly the files that were packed. A set without one
+    # is refused, because nothing in the package, or in the loader, could tell it from a set somebody
+    # else re-sealed. Checked on the tarball's own copy: that is the surface being shipped.
+    local seal=0 sd spub=${ONEBIT_SEAL_PUB:-}
+    if [ -n "$spub" ] && [ ! -f "$spub" ]; then
+        echo "FAIL ONEBIT_SEAL_PUB=$spub is not a file: the release public key is needed to verify the set signatures"; seal=$((seal + 1))
+    fi
+    if [ "${WEEKLY_NPU_KERNELS:-1}" = 1 ]; then
+        while IFS= read -r -d '' sd; do
+            sd=$(dirname "$sd")
+            rel=${sd#"$t"/}
+            [ -f "$sd/manifest.json" ] || { echo "FAIL sealed set $rel has no manifest.json (it was never signed: tools/seal_manifest.py write)"; seal=$((seal + 1)); }
+            [ -f "$sd/manifest.sig" ] || { echo "FAIL sealed set $rel has no manifest.sig (its manifest is not signed)"; seal=$((seal + 1)); }
+            [ -f "$sd/manifest.json" ] || continue
+            if ! command -v python3 >/dev/null 2>&1; then
+                echo "FAIL no python3: the manifest of $rel cannot be checked (tools/seal_manifest.py)"; seal=$((seal + 1))
+            elif [ -n "$spub" ]; then
+                python3 "$SRC/tools/seal_manifest.py" verify "$sd" --pub "$spub" || seal=$((seal + 1))
+            else
+                python3 "$SRC/tools/seal_manifest.py" check "$sd" || seal=$((seal + 1))
+            fi
+        done < <(find "$t" -path '*/npu/kernels/*/layout.json' -type f -print0)
+    fi
+    if [ "$seal" = 0 ]; then
+        n=$(find "$t" -path '*/npu/kernels/*/manifest.json' -type f | wc -l)
+        if [ "$n" = 0 ]; then echo "ok   no sealed NPU set in $(basename "$1"): nothing to sign"
+        elif [ -n "$spub" ]; then echo "ok   signed manifests: $n set(s), each listing exactly the files packed, signatures verified with $spub"
+        else echo "ok   signed manifests: $n set(s), each listing exactly the files packed (digests only: ONEBIT_SEAL_PUB is unset, so there is no release public key here to verify the signatures with)"; fi
+    else bad=1; fi
     nk=0
     while IFS= read -r -d '' f; do
         pack_is_elf "$f" || continue
@@ -358,7 +395,8 @@ package_checks() {  # package_checks <linux tarball>
         [ "$m" = 62 ] || { echo "FAIL $f is an ELF for machine $m, not the host (x86-64)"; nk=$((nk + 1)); }
     done < <(find "$t" -type f -print0)
     [ "$nk" = 0 ] && echo "ok   every ELF in $(basename "$1") is a host (x86-64) program or library" || bad=1
-    f=$(find "$t" -maxdepth 2 -type f -name 1bit | head -1)
+    f=$(find "$t" -maxdepth 2 -type f -name 1bit)
+    f=${f%%$'\n'*}
     if [ -n "$f" ]; then
         local b1=0
         n=$(nm --defined-only "$f" 2>/dev/null | wc -l)
@@ -407,7 +445,8 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
     n=$(find "$t" -path '*/bin/resources/web-app/index.html' -type f | wc -l)
     if [ "$n" != 0 ]; then echo "ok   Lemonade's web app: bin/resources/web-app/index.html and $(find "$t" -path '*/bin/resources/web-app/*' -type f | wc -l) files in $(basename "$1")"
     else echo "FAIL no Lemonade web app (bin/resources/web-app/index.html) in $(basename "$1")"; rc=1; fi
-    n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null | head -1)
+    n=$(find "$t" -maxdepth 2 -name lemond-onebit -type f -exec grep -c '^export ONEBIT_KCRYPT_REQUIRE_SEALED=1$' {} + 2>/dev/null)
+    n=${n%%$'\n'*}
     if [ "${n:-0}" != 0 ]; then echo "ok   lemond-onebit loads sealed NPU kernels only (ONEBIT_KCRYPT_REQUIRE_SEALED=1)"
     else echo "FAIL lemond-onebit does not export ONEBIT_KCRYPT_REQUIRE_SEALED=1"; rc=1; fi
     rm -rf "$t"

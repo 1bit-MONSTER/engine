@@ -23,12 +23,16 @@ test drives classify() and report() against synthetic batches and a synthetic re
 committed registry still parses and still maps a known class.
 
 No network: the listing walk (sweep_newest) is exercised by the daily
-timer, not here.
+timer, not here; the FastFlowLM org and release sweeps (engine#588) are driven from the
+recorded payloads in tests/fixtures/fflm/, captured from the live listing on 2026-10-26
+with only the fields this watcher reads kept.
 """
 import io
 import json
 import os
 import sys
+import shutil
+import tempfile
 import contextlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -295,12 +299,218 @@ for cls, mid in (
     ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
     # issue #437 (2026-10-17): upstream-only architecture, after the pin.
     ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
+    # issue #522 (2026-10-25): reviewed, documented, needs real support (engram + candidate blocks).
+    ("DeepseekV41ForCausalLM", "overhand/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored"),
 ):
     check(f"{cls} is reviewed report-only and documented",
           sig.get(cls, {}).get("watch") == "report" and cls not in archs and cls in gap_docs)
     rc, res = rc_of([model(mid, cls)], archs, sig)
     check(f"{cls} report-only -> exit 0, no alert",
           rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == [])
+
+# --- FastFlowLM org + releases watch (engine#588) ----------------------------------
+#
+# The recorded payloads are what huggingface.co/api/models?author=FastFlowLM and
+# api.github.com/repos/FastFlowLM/FastFlowLM/releases returned on 2026-10-26, trimmed to
+# the fields the watcher reads. A fetch factory keyed on the URL keeps the test offline;
+# the repo detail (`?blobs=true`, the only route that carries file sizes) is served from
+# two recorded details so `fill_sizes` is exercised without the network.
+FLM_FIX = os.path.join(ROOT, "tests", "fixtures", "fflm")
+
+
+def fixture(name):
+    with open(os.path.join(FLM_FIX, name)) as f:
+        return json.load(f)
+
+
+def flm_fetch(url):
+    """Serve the recorded org listing or releases page for the URL the watcher asks for."""
+    if url == cw.FLM_ORG_URL:
+        return fixture("org.json")
+    if url.startswith(cw.GH_RELEASES.split("?")[0]):
+        return fixture("releases.json")
+    raise AssertionError(f"unexpected URL: {url}")
+
+
+def flm_detail(url):
+    """Serve a recorded repo detail (file sizes live only on that route), else no files."""
+    if "D3-Mini-NPU2" in url:
+        return fixture("repo-mapped.json")
+    if "MiniCPM-V-4.7-1B-NPU2" in url:
+        return fixture("repo-unknown.json")
+    return {"id": url, "siblings": []}
+
+
+STATE_DIR = tempfile.mkdtemp(prefix="census-watch-test-")
+
+
+def flm_state():
+    """A state file that does not exist yet: the first run's defaults."""
+    return cw.load_state(os.path.join(STATE_DIR, "state.json"))
+
+
+# 16. The org listing is classified inline: tags, architecture, registry mapping and the
+#     npu route all come from the one listing response, no per-model fetch.
+live_archs = cw.load_registry()[0]
+repos = cw.sweep_org(live_archs, fetch=flm_fetch)
+by_id = {r["id"]: r for r in repos}
+check("flm org: every recorded repo is read", len(repos) == 5)
+d3 = by_id["FastFlowLM/D3-Mini-NPU2"]
+check("flm org: a model_type-only repo still resolves (qwen3_5_text -> qwen35)",
+      d3["registry_class"] == "Qwen35ForCausalLM" and d3["mapped"])
+check("flm org: license tag read", d3["license"] == "apache-2.0")
+check("flm org: base model tag read, relation prefix dropped",
+      d3["base_models"] == ["vllm-sr/d3-mini"])
+check("flm org: q4nx file names come from the listing",
+      [f["name"] for f in d3["q4nx"]] == ["model.q4nx", "vision_weight.q4nx"])
+check("flm org: the listing carries no sizes", all(f["size"] == 0 for f in d3["q4nx"]))
+qp = by_id["FastFlowLM/Qwen3-8B-NPU2"]
+check("flm org: the npu route is reported for a family it serves",
+      qp["npu"] and qp["npu_model_type"] == "qwen3")
+llama = by_id["FastFlowLM/Llama-3.2-1B-NPU2"]
+check("flm org: a second npu family is reported", llama["npu_model_type"] == "llama")
+mini = by_id["FastFlowLM/MiniCPM-V-4.7-1B-NPU2"]
+check("flm org: an unmapped architecture is unmapped, not a guess",
+      mini["architecture"] == "MiniCPMV4_7ForConditionalGeneration"
+      and not mini["mapped"] and cw.unmapped(mini) and not mini["npu"])
+gguf = by_id["FastFlowLM/Qwen3.5-0.8B-gguf"]
+check("flm org: a config-less gguf drop is a derivative, not a new family",
+      gguf["derivative"] and not cw.unmapped(gguf) and not gguf["mapped"])
+
+# 17. File sizes come from the repo detail, and only where they are still unknown.
+calls = []
+
+def counting_detail(url):
+    calls.append(url)
+    return flm_detail(url)
+
+cw.fill_sizes(d3, fetch=counting_detail)
+check("flm sizes: model.q4nx size read from the detail",
+      [f["size"] for f in d3["q4nx"]] == [2750560152, 667061544])
+cw.fill_sizes(d3, fetch=counting_detail)
+check("flm sizes: a filled row is not refetched", len(calls) == 1)
+broken = [{"name": "model.q4nx", "size": 0}]
+with contextlib.redirect_stderr(io.StringIO()):
+    kept = cw.fill_sizes({"id": "x/y", "q4nx": broken},
+                          fetch=lambda url: (_ for _ in ()).throw(RuntimeError("x")))
+check("flm sizes: a failed detail fetch keeps the repo (size 0, no crash)",
+      [f["size"] for f in kept["q4nx"]] == [0])
+
+# 18. One line per repo, `!! NEW FLM` only for a family we cannot serve, and the exit code
+#     is the OR of both watches (an unmapped class is not turned green by a quiet day).
+state = flm_state()
+buf, err = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+    flm_rc, flm_ok = cw.watch_flm(live_archs, state, fetch=flm_fetch, detail=flm_detail)
+first = buf.getvalue()
+check("flm first run: both watches ran", flm_ok)
+check("flm first run: an unmapped family alerts (exit 1)", flm_rc == 1)
+check("flm report: one line per repo",
+      len([ln for ln in first.splitlines()
+           if ln.startswith(("  + FLM FastFlowLM/", "  !! NEW FLM "))]) == 5)
+check("flm report: the unknown family is marked !! NEW FLM",
+      "  !! NEW FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in first)
+check("flm report: a mapped family is not marked",
+      "  + FLM FastFlowLM/Qwen3-8B-NPU2" in first and "!! NEW FLM FastFlowLM/Qwen3-8B-NPU2" not in first)
+check("flm report: the derivative drop does not alert",
+      "!! NEW FLM FastFlowLM/Qwen3.5-0.8B-gguf" not in first)
+check("flm report: sizes are named in GiB, one line each",
+      "GiB" in first and "npu route: qwen3" in first and "registry: none" in first)
+check("flm report: releases are listed with their tags",
+      "  + FLM RELEASE v1.0.10" in first and len(first.splitlines()) < 40)
+check("flm report: the container-format release is flagged",
+      "kernel-format: chunk" in first and "q4nx" in first.split("  -> release(s) ")[-1])
+
+# 19. The delta: the second run prints nothing, a moved repo prints one line.
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    quiet_rc, quiet_ok = cw.watch_flm(live_archs, state, fetch=flm_fetch, detail=flm_detail)
+second = buf.getvalue()
+check("flm delta: a second run is quiet and green",
+      quiet_ok and quiet_rc == 0 and "nothing new since the last run" in second)
+check("flm delta: no repo line on a quiet day",
+      "  + FLM FastFlowLM/" not in second and "  !! NEW FLM" not in second)
+moved = [dict(r) for r in fixture("org.json")]
+moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"
+moved_repos = cw.sweep_org(live_archs, fetch=lambda url: moved)
+fresh, fresh_rel = cw.flm_deltas(state, moved_repos, cw.sweep_releases(fetch=flm_fetch))
+check("flm delta: only the moved repo is new", [r["id"] for r in fresh] == [moved[0]["id"]])
+check("flm delta: known releases are not new", fresh_rel == [])
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    moved_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel)
+check("flm delta: one relocated line, still green (mapped family)",
+      moved_rc == 0 and buf.getvalue().count("  + FLM ") == 1)
+
+# 20. `--full` prints every repo and release on demand.
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    full_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), [], [], full=True)
+full = buf.getvalue()
+check("flm --full: every repo listed", full.count("  + FLM FastFlowLM/") + full.count("  !! NEW FLM ") == 5)
+check("flm --full: every release listed", full.count("  + FLM RELEASE ") == 3)
+check("flm --full: an unmapped repo in the listing still alerts", full_rc == 1)
+state_path = os.path.join(STATE_DIR, "round-trip.json")
+cw.save_state(state_path, state)
+reloaded = cw.load_state(state_path)
+check("flm state: ids and lastModified round-trip through the state file",
+      reloaded["flm_models"] == state["flm_models"] and len(reloaded["flm_models"]) == 5)
+check("flm state: release tags round-trip through the state file",
+      reloaded["flm_tags"] == state["flm_tags"] and len(reloaded["flm_tags"]) == 3)
+
+# 21. Releases: flags come from the notes and the asset names.
+releases = cw.sweep_releases(fetch=flm_fetch)
+by_tag = {r["tag"]: r for r in releases}
+check("flm releases: tag, date and asset names read",
+      by_tag["v1.0.10"]["date"].startswith("2026-10-22") and len(by_tag["v1.0.10"]["assets"]) == 9
+      and "HRX_fastflowlm_1.0.10_linux.tar.gz" in by_tag["v1.0.10"]["assets"])
+check("flm releases: a q4nx mention in the notes is flagged",
+      "q4nx" in by_tag["v0.9.40"]["kernel_format"])
+check("flm releases: a clean release is not flagged", by_tag["v1.0.9"]["kernel_format"] == [])
+check("flm releases: an asset name alone flags the format",
+      cw.kernel_format_flags({"tag_name": "v9", "assets": [{"name": "flm.q4nx"}]}) == ["q4nx"])
+check("flm releases: layout/chunk markers are what the flag reports",
+      cw.kernel_format_flags({"tag_name": "v9", "body": "new chunk table layout"})
+      == ["chunk", "layout"])
+
+# 22. The alert contract: neither watch can silence the other, and a failed FLM fetch is a
+#     runtime failure (2), never a quiet day.
+check("exit code: an uncovered class alone -> 1", cw.exit_code(1, 0, True) == 1)
+check("exit code: an unmapped FLM family alone -> 1", cw.exit_code(0, 1, True) == 1)
+check("exit code: both -> 1", cw.exit_code(1, 1, True) == 1)
+check("exit code: an alert beats a failed FLM fetch", cw.exit_code(1, 0, False) == 1)
+check("exit code: nothing new and both watches ran -> 0", cw.exit_code(0, 0, True) == 0)
+check("exit code: a failed FLM fetch alone -> 2 (runtime failure)", cw.exit_code(0, 0, False) == 2)
+
+
+def fail_fetch(url):
+    raise RuntimeError(f"no network: {url}")
+
+
+buf, err = io.StringIO(), io.StringIO()
+with contextlib.redirect_stdout(buf), contextlib.redirect_stderr(err):
+    dead_rc, dead_ok = cw.watch_flm(live_archs, flm_state(), fetch=fail_fetch)
+check("flm failure: reported as a failure, not as nothing new",
+      dead_ok is False and dead_rc == 0 and "FLM WATCH FAILED" in err.getvalue())
+check("flm failure: combined exit code is 2, so the daily job notices",
+      cw.exit_code(0, dead_rc, dead_ok) == 2)
+
+# 23. The family resolver's contract, on a synthetic registry shaped like architectures.json.
+FLM_ARCHS = {
+    "Qwen3_5ForCausalLM": {"gguf": "qwen35", "backends": ["hrx", "npu"], "npu_model_type": "qwen3_5"},
+    "MiniCPMV4_6ForConditionalGeneration": {"gguf": "qwen35", "backends": ["hrx"]},
+    "GptOssForCausalLM": {"gguf": "gpt-oss", "backends": ["hrx"]},
+}
+check("family: the modality suffix is stripped before comparing",
+      cw.resolve_family("qwen3_5_text", FLM_ARCHS) == "Qwen3_5ForCausalLM")
+check("family: the gguf string is matched with punctuation dropped",
+      cw.resolve_family("gpt_oss", FLM_ARCHS) == "GptOssForCausalLM")
+check("family: an exact class wins", cw.resolve_family("GptOssForCausalLM", FLM_ARCHS) == "GptOssForCausalLM")
+check("family: a version bump is not a prefix match", cw.resolve_family("qwen3_6_text", FLM_ARCHS) is None)
+check("family: an unmapped family stays unmapped", cw.resolve_family("minicpmv4_7", FLM_ARCHS) is None)
+check("family: an empty name maps to nothing", cw.resolve_family("", FLM_ARCHS) is None)
+
+shutil.rmtree(STATE_DIR, ignore_errors=True)
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

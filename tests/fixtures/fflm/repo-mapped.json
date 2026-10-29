@@ -1,0 +1,20 @@
+{
+ "id": "FastFlowLM/D3-Mini-NPU2",
+ "lastModified": "2026-10-25T08:56:01.000Z",
+ "siblings": [
+  {
+   "rfilename": "model.q4nx",
+   "size": 2750560152,
+   "lfs": {
+    "size": 2750560152
+   }
+  },
+  {
+   "rfilename": "vision_weight.q4nx",
+   "size": 667061544,
+   "lfs": {
+    "size": 667061544
+   }
+  }
+ ]
+}

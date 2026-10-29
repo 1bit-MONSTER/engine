@@ -86,6 +86,17 @@ says `Ship: yes`.
 | Lemonade (lemond, the lemonade CLI, the web app) | third_party/lemonade pin | Apache-2.0, Advanced Micro Devices, Inc.; web app bundle licenses in `renderer.bundle.js.LICENSE.txt` | https://github.com/1bit-MONSTER/lemonade |
 | ROCr HSA runtime (TheRock, for HRX) | the build's ONEBIT_HRX_LIBHSA | University of Illinois/NCSA | https://github.com/ROCm/ROCR-Runtime, https://github.com/ROCm/TheRock |
 
+## The board driver and the SMU tool
+
+The appliance controls its fans and its power profile on the boards it knows: an out-of-tree driver for
+the board's embedded controller, and (when the build machine has it) the tool that sets the SMU power
+limits. Both are shipped with their licences, and the driver also with its source.
+
+| Component | Release | License | Source |
+|---|---|---|---|
+| `ec_su_axb35` (fan curve, EC temperature, EC power mode on the AXB35-02 board) | commit `f62c2c228959a08683273a26ef3afd8991e69f6d`, built for the image kernel by `os/mini/mkimage.sh` | GPL-2.0-only | `os/licenses/ec_su_axb35/` in this repository; the same source is installed in the image at `/usr/share/licenses/1bit-os/ec_su_axb35/src`; upstream https://github.com/cmetz/ec-su_axb35-linux |
+| `ryzenadj` (sets the SMU power limits; `/opt/1bit/ryzenadj` in the image) | **pinned v0.19.0**, commit `ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182`, built by `os/mini/mkimage.sh` from the source in `os/licenses/ryzenadj` | LGPL-3.0, Copyright Jiaxun Yang and the RyzenAdj contributors | `os/licenses/ryzenadj/` in this repository (LICENSE, SOURCE, and the tag's source verbatim); the same source is installed in the image at `/usr/share/licenses/1bit-os/ryzenadj/src`; upstream https://github.com/FlyGoat/RyzenAdj |
+
 ## System software from Ubuntu
 
 mkimage.sh copies these from the build machine (Ubuntu 26.04), unmodified, and records the exact
@@ -99,6 +110,7 @@ the machine this list was made on.
 | Vulkan loader | libvulkan1 | 1.4.341.0-1 | Apache-2.0 |
 | BusyBox | busybox-static | 1.37.0-7ubuntu1 | GPL-2.0-only |
 | Dropbear SSH, libtomcrypt, libtommath | dropbear-bin, libtomcrypt1, libtommath1 | the Ubuntu archive's | MIT; public domain / WTFPL; Unlicense |
+| QR code generator, for the console menu's "Open on your phone" (`/bin/qrencode`) | qrencode, libqrencode4 | 4.1.1-2build1 | LGPL-2.1-or-later (LICENSE and SOURCE in `os/licenses/qrencode/`; the Debian packaging is public domain) |
 | GNU C library | libc6 | 2.43-2ubuntu2.4 | LGPL-2.1-or-later |
 | GCC runtime (libstdc++, libgcc_s, libgomp) | libstdc++6, libgcc-s1, libgomp1 | 16-20260322-1ubuntu1 | GPL-3.0-or-later WITH GCC-exception-3.1 |
 | libquadmath | libquadmath0 | 16-20260322-1ubuntu1 | LGPL-2.1-or-later |
@@ -123,4 +135,6 @@ source available; the MPL requires the same for its covered files. For each:
 | eSpeak NG in kokoro's `koko`, and Kokoros | https://crates.io/api/v1/crates/espeak-rs-sys/0.1.9/download (eSpeak NG as built into koko); https://github.com/lemonade-sdk/Kokoros/tree/b17 |
 | TheRock sysdeps in llamacpp-hrx (elfutils, libnl, numactl, libmnl) | the upstream tarballs TheRock builds, https://github.com/ROCm/TheRock/tree/main/third-party/sysdeps/linux (elfutils 0.195, libnl 3.12.0, numactl 2.0.19, libmnl 1.0.5 at the time of this review) |
 | libquadmath, libgfortran in moonshine | GCC, https://gcc.gnu.org |
+| `ec_su_axb35` (the board driver in the image) | the source as shipped in `os/licenses/ec_su_axb35/src`, upstream https://github.com/cmetz/ec-su_axb35-linux at commit `f62c2c228959a08683273a26ef3afd8991e69f6d` |
+| `ryzenadj` | the source as shipped in `os/licenses/ryzenadj/src`, upstream https://github.com/FlyGoat/RyzenAdj at tag v0.19.0 (commit `ea71739b4a3e1a0a624dfd1c9c268a31cb2a4182`), built by `os/mini/mkimage.sh` |
 | certifi, tqdm in moonshine (MPL-2.0) | the covered files are on the image as shipped (Python source and cacert.pem); https://pypi.org/project/certifi/, https://pypi.org/project/tqdm/ |

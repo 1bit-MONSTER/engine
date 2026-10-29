@@ -33,6 +33,16 @@ endif()
 set(CMAKE_CXX_STANDARD 26)
 set(CMAKE_CXX_STANDARD_REQUIRED ON)
 
+# Every string the build bakes in (asserts, log prefixes, __FILE__) has to name a path that exists in
+# the package, not on the machine that built it: the shipped binaries are gated on it
+# (scripts/pack-elf.sh, pack_artifact_hygiene). -ffile-prefix-map covers -fmacro-prefix-map and
+# -fdebug-prefix-map on GCC and clang alike; ONEBIT_PATH_MAPS is also handed to the externals below.
+set(ONEBIT_PATH_MAP_FLAGS
+    "-ffile-prefix-map=${CMAKE_SOURCE_DIR}=."
+    "-ffile-prefix-map=${CMAKE_BINARY_DIR}=build"
+    CACHE STRING "Compiler flags that rewrite build-machine paths out of embedded strings")
+add_compile_options(${ONEBIT_PATH_MAP_FLAGS})
+
 # The public binary drop (docs/releases.md): prebuilt proprietary parts for a source build outside
 # the org. Sets ONEBIT_BINARY_DROP_* and verifies the drop; a no-op when ONEBIT_BINARY_DROP is unset.
 include(cmake/binary_drop.cmake)
@@ -129,12 +139,21 @@ add_test(NAME print_backend COMMAND ${CMAKE_SOURCE_DIR}/tests/print_backend.sh $
 add_test(NAME lemonade_hrx COMMAND ${CMAKE_SOURCE_DIR}/tests/lemonade_hrx.sh $<TARGET_FILE:onebit>)
 add_test(NAME parallel_args COMMAND ${CMAKE_SOURCE_DIR}/tests/parallel_args.sh $<TARGET_FILE:onebit>)
 add_test(NAME recipes_route COMMAND ${CMAKE_SOURCE_DIR}/tests/recipes_route.sh $<TARGET_FILE:onebit>)
+add_test(NAME greedy_shortcut COMMAND ${CMAKE_SOURCE_DIR}/tests/greedy_shortcut.sh $<TARGET_FILE:onebit>)
 add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<TARGET_FILE:onebit>)
 # where --device npu finds the GGUF repack script: beside 1bit in a package (scripts/package-linux.sh),
 # else ONEBIT_Q4NX_REPACK; no NPU needed (the repack runs before the device)
 add_test(NAME npu_repack_path COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_repack_path.sh $<TARGET_FILE:onebit>)
 # a build without the NPU lane has no repack path: the test says skip (77) there, not fail
 set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
+# the OS image's own release check: its lemonade row must prove the API key is enforced, not infer it
+# from an empty body (os/mini/release-check.sh --self-test; no device and no build needed)
+add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)
+# engine #574: the signed manifest of a sealed NPU kernel set. tools/seal_manifest.py writes it (sha256
+# of the ciphertext, Ed25519 over the manifest) and checks it; the test is a throwaway set in a temp
+# dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
+# manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
+add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
 add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)
@@ -372,8 +391,14 @@ if(Python3_Interpreter_FOUND)
     # a pin bump that did not regenerate the registry (only the gitlinks: no checkouts)
     add_test(NAME registry_pins COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/registry_build.py --check-pins)
     # the new-model watcher's alert contract (offline: synthetic batches against the
-    # committed registry), so a regression cannot leave the daily alert permanently green.
+    # committed registry, plus FastFlowLM's org listing and releases from the recorded
+    # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
+    # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+
+    # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
+    # published FastFlowLM model goes through is proved to fire without the model at hand.
+    add_test(NAME q4nx_dir_check COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tools/check_q4nx_dir.py --self-test)
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)

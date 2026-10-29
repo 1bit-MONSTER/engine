@@ -52,29 +52,48 @@ put() {
 }
 
 cp -a "$build/1bit" "$stage/"
-put hrx/llama/bin llama-server llama-bench
+put hrx/llama/bin llama-server llama-bench llama-perplexity
 put ds4/hip ds4-server ds4 ds4-bench
 
 # the sealed NPU kernel sets (scripts/weekly.sh, WEEKLY_NPU_KERNELS): encrypted artifacts, packed
 # beside 1bit in npu/kernels, where it looks for them
-# Only the artifact surface is shipped: <set>/layout.json and <set>/layer1_*/layer1.elf. The set
-# directory also holds layer1.work/ (plaintext MLIR, object files, intermediate ELFs) because that is
-# where it was built; copying the tree would ship the kernel method and feed those static ELFs to
-# patchelf. package_checks asserts this allowlist on the tarball.
+# Only the artifact surface is shipped: <set>/layout.json, <set>/layer1_*/layer1.elf and the set's
+# signed manifest. The set directory also holds layer1.work/ (plaintext MLIR, object files,
+# intermediate ELFs) because that is where it was built; copying the tree would ship the kernel
+# method and feed those static ELFs to patchelf. package_checks asserts this allowlist on the
+# tarball.
+# The manifest (engine #574) is what makes a set provably ours: manifest.json lists every file the
+# set ships with the sha256 of its ciphertext, manifest.sig is Ed25519 over those bytes by the
+# release signing key (tools/seal_manifest.py write, on the release machine). A set without one is
+# not packed at all - shipping it would put kernels in the tarball that nothing can tell from a set
+# somebody else re-sealed.
 if [ -d "$build/npu/kernels" ]; then
     mkdir -p "$stage/npu/kernels"
     for set in "$build"/npu/kernels/*/; do
         setname=$(basename "$set")   # not $name: that is the package name tar uses below
         [ -f "$set/layout.json" ] || continue
+        [ -f "$set/manifest.json" ] || { echo "sealed set $setname has no manifest.json: it was never signed (tools/seal_manifest.py write $set --key <release key>)"; exit 1; }
+        [ -f "$set/manifest.sig" ] || { echo "sealed set $setname has no manifest.sig: its manifest is not signed (tools/seal_manifest.py write)"; exit 1; }
         mkdir -p "$stage/npu/kernels/$setname"
-        cp -a "$set/layout.json" "$stage/npu/kernels/$setname/"
+        cp -a "$set/layout.json" "$set/manifest.json" "$set/manifest.sig" "$stage/npu/kernels/$setname/"
         for layer in "$set"/layer1_*/; do
             [ -f "$layer/layer1.elf" ] || continue
             mkdir -p "$stage/npu/kernels/$setname/$(basename "$layer")"
             cp -a "$layer/layer1.elf" "$stage/npu/kernels/$setname/$(basename "$layer")/"
         done
     done
-    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels"
+    # the manifest has to describe the bytes that were just staged, not the ones in the build tree:
+    # check the staged copy, which is what the tarball carries. With the release public key in
+    # ONEBIT_SEAL_PUB the signature is verified too; without it the digests are all a package can say.
+    command -v python3 >/dev/null 2>&1 || { echo "no python3: the sealed sets' manifests cannot be verified (tools/seal_manifest.py)"; exit 1; }
+    for set in "$stage"/npu/kernels/*/; do
+        if [ -n "${ONEBIT_SEAL_PUB:-}" ]; then
+            python3 "$src/tools/seal_manifest.py" verify "$set" --pub "$ONEBIT_SEAL_PUB" || exit 1
+        else
+            python3 "$src/tools/seal_manifest.py" check "$set" || exit 1
+        fi
+    done
+    echo "  npu/kernels: $(ls "$stage/npu/kernels" | wc -l) sets, $(find "$stage/npu/kernels" -name layer1.elf | wc -l) sealed kernels, $(find "$stage/npu/kernels" -name manifest.json | wc -l) signed manifests$([ -n "${ONEBIT_SEAL_PUB:-}" ] || echo ' (digests only: no ONEBIT_SEAL_PUB, so no release public key to verify the signature with)')"
 fi
 
 # The NPU lane's GGUF path runs public helper scripts (the repack, its declared-scale guard and the
@@ -88,20 +107,41 @@ if [ -d "$build/npu" ]; then
     echo "  scripts, tools: the GGUF-on-NPU helpers ($(ls "$stage/scripts" "$stage/tools" | wc -l) files)"
 fi
 
+# Everything staged has to come from the build being packaged. This compares bytes with the same path under the
+# build, so it runs before pack_localize: localization rewrites every RUNPATH (and adds libomp.so, which the build
+# does not have), after which nothing would match.
+provenance_bad=$(pack_require_provenance "$stage" "$build" || true)
+[ -z "$provenance_bad" ] || { echo "files that did not come from this build:"; echo "$provenance_bad"; exit 1; }
+
 # Every program and library finds its libraries beside itself (scripts/pack-elf.sh): a library it
 # loads from elsewhere in the build tree (HRX's libhrx, libloomc) or LLVM's OpenMP runtime
 # (libomp.so, which ggml's CPU code links when TheRock's amdclang builds llama.cpp) is copied beside
 # it; RUNPATH entries outside the build tree (TheRock in /opt) stay, since HRX needs TheRock anyway.
 pack_localize "$stage" "$build"
+# pack_localize gives every program and library $ORIGIN plus whatever SDK entries its link needed; the
+# engine binary at the top of the tree is the one it does not visit (depth 1), so drop its rpath here.
 patchelf --remove-rpath "$stage/1bit"
+
+# every program the release promises has to load from the package; one that does not is a build problem, not
+# something to drop silently (the 2026-10-23 rc shipped llama-perplexity without its implementation library)
+tools_bad=""
+tools_bad+=$(pack_require_tools "$stage" hrx/llama/bin llama-server llama-bench llama-perplexity || true)
+tools_bad+=$(pack_require_tools "$stage" ds4/hip ds4-server ds4 ds4-bench || true)
+[ -z "$tools_bad" ] || { echo "shipped tools that cannot load:"; echo "$tools_bad"; exit 1; }
+
+# anything else that cannot load leaves the package rather than shipping broken
+pack_prune_unloadable "$stage"
 
 # symbol tables and debug info out of every program and library: the release ships compiled code
 # only (docs/releases.md, "Private components"); the dynamic symbols they link by stay
 pack_strip "$stage"
 
-# nothing may still point into the build machine's home
+# nothing may still point into the build machine's home, carry the compiler's identification, or load
+# through an absolute RUNPATH
 bad=$(pack_build_rpaths "$stage" "$build")
 [ -z "$bad" ] || { echo "RPATH into the build machine left:"; echo "$bad"; exit 1; }
+hygiene=$(pack_artifact_hygiene "$stage")
+[ -z "$hygiene" ] || { echo "artifact hygiene:"; echo "$hygiene"; exit 1; }
 
 cp "$src/LICENSE" "$src/NOTICE" "$src/LICENSE-BINARY" "$src/NOTICE-BINARY" "$stage/"
 # the stock Lemonade PPA's lemond (Ubuntu 26.04) runs our HRX llama-server through lemonade-hrx

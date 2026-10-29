@@ -86,11 +86,132 @@ pack_localize() {
     done
 }
 
+# A program or library ships only if every library it NEEDs resolves the way it will on a user's machine:
+# plain ldd, with **no** LD_LIBRARY_PATH, so only the ELF's own RUNPATH and the system are consulted. A
+# library path inherited from the build shell resolves against the build tree and hides exactly the defect
+# this check exists for. Prints "<file>: <lib>" for each NEEDED that cannot be found.
+pack_unresolved_needed() {
+    local stage=$1 f
+    while IFS= read -r -d '' f; do
+        pack_is_dynelf "$f" || continue
+        env -u LD_LIBRARY_PATH ROCR_VISIBLE_DEVICES=-1 ldd "$f" 2>/dev/null |
+            awk -v f="$f" '$2 == "=>" && $3 == "not" {print f": "$1}'
+    done < <(find "$stage" -type f -print0)
+}
+
+# Everything in the package has to come from the build being packaged. A binary copied in from another tree
+# (a hardware-gate cache, a drop) carries that tree's RUNPATH and its build's missing parts: in the 2026-10-23
+# rc, `llama-perplexity` came from a hardware-gate build and pointed at that build's directory. Compares each
+# staged file with the same relative path under the build and reports what has no counterpart there.
+pack_require_provenance() {  # <stage> <build>
+    local stage=$1 build=$2 f rel bad=0
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        rel=${f#"$stage"/}
+        if [ ! -f "$build/$rel" ]; then
+            echo "  $rel is not in the build being packaged"
+            bad=1
+        elif ! cmp -s "$f" "$build/$rel"; then
+            echo "  $rel differs from the build being packaged"
+            bad=1
+        fi
+    done < <(find "$stage" -type f -print0)
+    return $bad
+}
+
+# The programs `put` was asked for are the ones the release promises: if one of them cannot resolve, that is a
+# build problem (the tool came from another tree, or its implementation library was not built) and the package
+# has to fail rather than quietly lose the tool. Call once per directory group: pack_require_tools <stage>
+# <rel dir> <program ...>.
+pack_require_tools() {
+    local stage=$1 rel=$2 f bad=0
+    shift 2
+    for f in "$@"; do
+        if [ ! -f "$stage/$rel/$f" ]; then
+            echo "  missing from the package: $rel/$f"
+            bad=1
+            continue
+        fi
+        while IFS= read -r line; do
+            echo "  $rel/$f cannot load: ${line##*: }"
+            bad=1
+        done < <(pack_unresolved_needed "$stage" | grep -F "$stage/$rel/$f:")
+    done
+    return $bad
+}
+
+# Everything in the package has to come from the build being packaged. A binary copied in from another tree
+# (a hardware-gate cache, a drop) carries that tree's RUNPATH and its build's missing parts: in the 2026-10-23
+# rc, `llama-perplexity` came from a hardware-gate build and pointed at that build's directory. Compares each
+# staged file with the same relative path under the build and reports what has no counterpart there.
+pack_require_provenance() {  # <stage> <build>
+    local stage=$1 build=$2 f rel bad=0
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        rel=${f#"$stage"/}
+        if [ ! -f "$build/$rel" ]; then
+            echo "  $rel is not in the build being packaged"
+            bad=1
+        elif ! cmp -s "$f" "$build/$rel"; then
+            echo "  $rel differs from the build being packaged"
+            bad=1
+        fi
+    done < <(find "$stage" -type f -print0)
+    return $bad
+}
+
+# The programs `put` was asked for are the ones the release promises: if one of them cannot resolve, that is a
+# build problem (the tool came from another tree, or its implementation library was not built) and the package
+# has to fail rather than quietly lose the tool. Prints the offending programs.
+# A thin binary whose implementation library was not built has to leave the package rather than ship broken
+# (the 2026-10-23 rc shipped llama-perplexity without libllama-perplexity-impl.so). Removing the binary is
+# the safe direction: the tool is then absent instead of failing at first use.
+pack_prune_unloadable() {
+    local stage=$1 bad dropped=0
+    while IFS= read -r line; do
+        bad=${line%%:*}
+        [ -f "$bad" ] || continue
+        echo "  drop $(echo "$bad" | sed "s|^$stage/||"): needs a library the package does not carry"
+        rm -f "$bad"
+        dropped=$((dropped+1))
+    done < <(pack_unresolved_needed "$stage")
+    [ "$dropped" = 0 ] || echo "  $dropped program(s) dropped as unloadable"
+}
+
 pack_strip() {
     local f
     while IFS= read -r -d '' f; do
-        if pack_is_elf "$f"; then strip --strip-unneeded "$f"; fi
+        if pack_is_elf "$f"; then
+            strip --strip-unneeded "$f"
+            # .comment names the compiler and its version; it is not needed to load or link
+            objcopy --remove-section=.comment --remove-section=.note.gnu.gold-version "$f" 2>/dev/null || true
+        fi
     done < <(find "$1" -type f -print0)
+}
+
+# Everything a shipped program and library may not carry: a compiler identification section, a path
+# into a build machine, or an absolute RUNPATH. Prints one line per violation, empty when clean.
+pack_artifact_hygiene() {
+    local f out=""
+    while IFS= read -r -d '' f; do
+        pack_is_elf "$f" || continue
+        readelf -p .comment "$f" 2>/dev/null | grep -qE "clang version|GCC:" && out="$out
+$f: .comment names the compiler"
+        strings -a "$f" 2>/dev/null | grep -qE "^/(home|Users|root)/[A-Za-z0-9_./-]+" &&
+            out="$out
+$f: embedded build-machine path"
+        # An absolute RUNPATH is only acceptable under the toolchain root: some shipped programs link the
+        # SDK's own libraries (whose closure is far larger than the package), and the release needs that
+        # toolchain to run anyway.
+        readelf -d "$f" 2>/dev/null | grep -E 'R(UN)?PATH' |
+            sed -n 's/.*Library \(runpath\|rpath\): \[\(.*\)\]/\2/p' | tr ':' '\n' |
+            grep -E "^/" | grep -vE "^(${ONEBIT_TOOLCHAIN_ROOT:-/opt/rocm-therock})/" | grep -q . &&
+            out="$out\n$f: absolute RUNPATH outside the toolchain root"
+    done < <(find "$1" -type f -print0)
+    # every shipped program and library must resolve what it links against
+    while IFS= read -r line; do out="$out\n$line: a NEEDED library is not in the package or on the machine"; done \
+        < <(pack_unresolved_needed "$1")
+    [ -z "$out" ] || printf "%b\n" "$out"
 }
 
 pack_build_rpaths() {

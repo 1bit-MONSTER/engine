@@ -138,7 +138,10 @@ class H(BaseHTTPRequestHandler):
             # (what the hybrid handoff sets; tests/hybrid_route.sh reads them back)
             self._json(200, {"id": "x", "model": "fake-backend-id", "choices": [dict(index=0, finish_reason="stop", **msg)],
                              "timings": timings, "fake_id_slot": req.get("id_slot", -1),
-                             "fake_cache_prompt": req.get("cache_prompt", None)})
+                             "fake_cache_prompt": req.get("cache_prompt", None),
+                             # the sampling fields serve forwards (tests/greedy_shortcut.sh)
+                             "fake_top_k": req.get("top_k", None),
+                             "fake_temperature": req.get("temperature", None)})
             # "fake_exit": N: the backend exits with status N shortly after this reply, on its own
             # (a crashed backend; serve must notice and not wait its SIGTERM grace for a dead pid)
             if "fake_exit" in req:

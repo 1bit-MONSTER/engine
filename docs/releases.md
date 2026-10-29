@@ -72,14 +72,14 @@ before every run); **ours** = our sampler/batched standard (see the table legend
 the auto-opt database).
 
 **HRX speed (ours).** Qwen3.8-27B UD-Q4_K_XL with MTP, greedy 256-token chats: **36.0 / 26.8 / 29.9
-tok/s** on code / prose / short, from 25.9 / 20.5 / 21.9 before the verify kernels — 2–8-token
-K-quant verify took the step from 121 ms to 88 ms (`#487`). Decode without MTP stays 12.2 tok/s.
+tok/s** on code / prose / short, from 25.9 / 20.5 / 21.9 before the speculative verify pass was
+reworked — the step it took is 121 ms to 88 ms per step (`#487`). Decode without MTP stays 12.2 tok/s.
 
 | change | PR | measured |
 |---|---|---|
-| 2..8-token K-quant verify kernels | `#487` | 27B `--mtp` **+31–39 %** |
-| batched MoE decode on our kernels | `#521`, `#526` | pin `744bd713d968`: the top-1 batched window from 5 tokens; the batched cells below were measured one pin earlier (90 W cap, PCM pad (23 Oct)) |
-| split-K decode attention for gated head-256 | `#500` | Qwen3.5-4B 32K decode **23.7 → 47.1 tok/s**; 27B **7.5 → 11.0** |
+| speculative verify pass rework | `#487` | 27B `--mtp` **+31–39 %** |
+| batched MoE decode | `#521`, `#526` | pin `744bd713d968`: batching pays from five tokens per window; the batched cells below were measured one pin earlier (90 W cap, PCM pad (23 Oct)) |
+| decode attention for gated attention at long context | `#500` | Qwen3.5-4B 32K decode **23.7 → 47.1 tok/s**; 27B **7.5 → 11.0** |
 | MoE formats for Qwen3.8-Flash-Next | `#494` | **5.1 → 26 tok/s**, 50 with MTP |
 | HIP prompt flash attention, causal block skipping | `#491` | Qwen3-4B pp4096 **+45 %** |
 | m128 prefill tiles + raster groups | `#490` | 27B prefill **+1.6…2.5 %** |
@@ -174,6 +174,15 @@ kernel sets go beside `1bit` in `npu/kernels`, the build loads sealed kernels on
 (`ONEBIT_NPU_RELEASE`), the `lemond-onebit` launcher sets `ONEBIT_KCRYPT_REQUIRE_SEALED=1`, and the package checks refuse a plaintext kernel,
 an ELF for anything but the host, a symbol table in `1bit`, or a private source name in it. The
 release machine holds the kernel key in `ONEBIT_NPU_KEY_DIR` (default `~/.config/1bit-npu-key`).
+
+Sealing is confidentiality; each set is signed too (#574). Before a set is packed it gets
+`manifest.json` - every file the set ships, with the sha256 of its ciphertext - and `manifest.sig`,
+Ed25519 over that manifest by the release signing key (`tools/seal_manifest.py write <set> --key
+<release key>`, `ONEBIT_SEAL_KEY`). Packaging requires both: `scripts/package-linux.sh` and the
+weekly `package_checks` refuse a set without them or a manifest that does not match the files
+packed, and verify the signatures when `ONEBIT_SEAL_PUB` names the release public key.
+`1bit-release-check` proves the same on a written stick, so a set that was re-sealed or swapped
+fails the checks even though it still opens.
 
 ### Private components
 

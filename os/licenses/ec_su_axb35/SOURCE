@@ -1,0 +1,11 @@
+Board driver: ec_su_axb35 (Sixunited AXB35-02 embedded controller: fans, EC temperature, EC power mode)
+Ship: yes
+Project: ec-su_axb35-linux, https://github.com/cmetz/ec-su_axb35-linux
+Release: commit f62c2c228959a08683273a26ef3afd8991e69f6d ("Reset all fans to AUTO mode before unloading module (#31)")
+License: GPL-2.0 (LICENSE, shipped here); the module source in src/ is that commit, verbatim, and it is
+also installed into the image under /usr/share/licenses/1bit-os/ec_su_axb35/src, so the binary in the
+image always travels with the source it was built from.
+Build: out of tree against the image kernel, by os/mini/mkimage.sh:
+       make -C <copy of src> KERNEL_BUILD=/lib/modules/<kver>/build modules
+Why it ships: the kernel has no driver for this EC, so without it the appliance has no fan control and no
+EC power mode at all - the fans would sit on the firmware curve.

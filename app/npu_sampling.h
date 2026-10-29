@@ -21,6 +21,8 @@
 // ONEBIT_HRX.  The order of operations is llama.cpp's sampler chain
 // (third_party/llama.cpp/common/sampling.cpp:346-391): top_k and top_p filter the raw
 // logits, temperature scales the survivors, and the draw is a softmax over them.
+// Temperature divides logits and never probabilities: the distribution top_p reads is a
+// scratch view of the logits, not a place to write them back to.
 //
 // Greedy stays the default: temperature 0 (the value a body that names no sampling
 // field gets) is the argmax this route has always used, so existing callers decode
@@ -100,20 +102,24 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
         c.resize(size_t(p.top_k));
     }
 
-    // top_p: softmax the survivors, then keep the shortest prefix whose mass reaches p,
-    // but never fewer than min_keep (llama.cpp llama_sampler_top_p_apply).
+    // top_p: softmax the survivors into a distribution, then keep the shortest prefix
+    // whose mass reaches p, but never fewer than min_keep (llama.cpp
+    // llama_sampler_top_p_apply).  The probabilities live in `prob`, not in the
+    // candidates: c[i].logit stays a logit, because the next stage divides logits by the
+    // temperature (writing probabilities back here would make it divide probabilities,
+    // and exp() of a probability in [0,1] is within e^-1 of flat).
     if (p.top_p < 1.0f) {
-        const float max_l = std::min_element(c.begin(), c.end(), better)->logit;
-        double total = 0.0;
-        for (auto& x : c) {
-            x.logit = float(std::exp(double(x.logit - max_l)));
-            total += x.logit;
-        }
         std::sort(c.begin(), c.end(), better);
+        std::vector<double> prob(c.size());
+        double total = 0.0;
+        for (size_t i = 0; i < c.size(); i++) {
+            prob[i] = std::exp(double(c[i].logit - c[0].logit));
+            total += prob[i];
+        }
         double run = 0.0;
         size_t keep = c.size();
         for (size_t i = 0; i < c.size(); i++) {
-            run += c[i].logit / total;
+            run += prob[i] / total;
             if (run >= p.top_p && int(i + 1) >= p.min_keep) {
                 keep = i + 1;
                 break;
@@ -122,9 +128,11 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
         c.resize(keep);
     }
 
-    // temperature: scale what survived.  logits are probabilities' logs again, so the
-    // softmax below is over logit/temperature.
-    const float max_l = std::min_element(c.begin(), c.end(), better)->logit;
+    // temperature: divide the surviving logits, then draw from the cumulative sum of the
+    // softmax over logit/temperature (llama.cpp llama_sampler_temp_apply, then
+    // llama_sampler_dist_apply).
+    float max_l = c.front().logit;
+    for (const auto& x : c) max_l = std::max(max_l, x.logit);
     double sum = 0.0;
     for (auto& x : c) {
         x.logit = float(std::exp(double(x.logit - max_l) / double(p.temperature)));

@@ -20,6 +20,7 @@
 #include "npu_sampling.h"
 
 #include <cstdio>
+#include <cstdlib>
 #include <random>
 #include <string>
 #include <vector>
@@ -138,6 +139,59 @@ void test_sampler() {
     std::vector<char> none(3, 0);
     check(sample(three, hot, 1, &none) == -1, "an empty mask is refused");
     check(sample(three, SampleParams(), 1, &mask) == 2, "greedy still honors the mask");
+}
+
+// The draw has to match the distribution the logits define.  Temperature divides logits
+// and never probabilities: when the top_p stage wrote probabilities back over the logits,
+// the draw ran on exp(probability), which is flat to within e^-1, so a token llama.cpp
+// gives 4.6e-5 was drawn about one time in five instead of about once in 22000.
+// Every number below is hand-computed softmax(logit / temperature).
+void test_sampler_distribution() {
+    // softmax({10, 0, 0}) = {0.99990857, 0.00004572, 0.00004572}: the tail's 45.7 ppm is
+    // the reviewer's token.  20000 draws expect 0.91 of each tail token, so a correct
+    // draw sees a handful at most; the old chain's ~0.21 saw ~4200.
+    {
+        const std::vector<float> peaked = {10.0f, 0.0f, 0.0f};
+        SampleParams p;
+        p.temperature = 1.0f;
+        p.top_p = 0.5f;   // keeps the head alone...
+        p.min_keep = 3;   // ...except that min_keep keeps all three, so the tail is drawable
+        std::mt19937_64 rng(20261029);
+        int hits[3] = {0, 0, 0};
+        for (int i = 0; i < 20000; i++) hits[sample_token(peaked, p, rng)]++;
+        check(hits[0] >= 19990, "a 0.99991 token is drawn almost every time");
+        check(hits[1] <= 10 && hits[2] <= 10, "a 4.6e-5 token is drawn at 4.6e-5, not at 0.21");
+    }
+
+    // softmax({ln 3, 0, 0}) = {0.6, 0.2, 0.2}: 12000 and 4000 out of 20000, +-300
+    // (~5.3 sigma of a 0.2 binomial over 20000 draws).
+    {
+        const std::vector<float> three = {1.0986123f, 0.0f, 0.0f};  // ln 3
+        SampleParams p;
+        p.temperature = 1.0f;
+        p.top_p = 0.95f;
+        p.min_keep = 3;
+        std::mt19937_64 rng(625);
+        int hits[3] = {0, 0, 0};
+        for (int i = 0; i < 20000; i++) hits[sample_token(three, p, rng)]++;
+        check(std::abs(hits[0] - 12000) <= 300, "a 0.6 token is drawn 0.6 of the time");
+        check(std::abs(hits[1] - 4000) <= 300 && std::abs(hits[2] - 4000) <= 300,
+              "a 0.2 token is drawn 0.2 of the time");
+    }
+
+    // Temperature scales the logits: at temperature 0.5, {ln 3, 0, 0} is
+    // softmax({2 ln 3, 0, 0}) = {9/11, 1/11, 1/11} = {0.818, 0.0909, 0.0909}.
+    {
+        const std::vector<float> three = {1.0986123f, 0.0f, 0.0f};
+        SampleParams p;
+        p.temperature = 0.5f;  // top_p stays off: this case is the temperature stage alone
+        std::mt19937_64 rng(42);
+        int hits[3] = {0, 0, 0};
+        for (int i = 0; i < 20000; i++) hits[sample_token(three, p, rng)]++;
+        check(std::abs(hits[0] - 16364) <= 300, "temperature 0.5 sharpens 0.6 into 9/11");
+        check(std::abs(hits[1] - 1818) <= 250 && std::abs(hits[2] - 1818) <= 250,
+              "temperature 0.5 thins 0.2 into 1/11");
+    }
 }
 
 void test_stop() {
@@ -308,6 +362,7 @@ void test_request_parsing() {
 
 int main() {
     test_sampler();
+    test_sampler_distribution();
     test_stop();
     test_json_grammar();
     test_gbnf();

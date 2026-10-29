@@ -71,7 +71,8 @@ jobs:
             npu_full_elf_test npu_pack_test npu_q4nx_test npu_private_route_test \
             tokenizer_test think_split_test gguf_meta_test mem_admit_test pm_routes_test \
             laya_encoder_test http_guard_test moe_gguf_index_test laya_bounds_test \
-            npu_model_bounds_test npu_forward_loader_test tokenizer_linear_test hrx_placement_test hrx_cwsr_test -j
+            npu_model_bounds_test npu_forward_loader_test npu_sampling_test \
+            tokenizer_linear_test hrx_placement_test hrx_cwsr_test -j
       - name: Test
         # One hung test must not hold the job for hours: each test gets 10 minutes.
         run: ctest --test-dir build --output-on-failure --timeout 600

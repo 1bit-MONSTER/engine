@@ -121,6 +121,11 @@
    "model_type": "senryu2",
    "family": "Senryu-2.2 GDN2 + parallax-attention hybrid with repo-local n-gram tables",
    "watch": "report"
+  },
+  "GraniteSwitchForCausalLM": {
+   "model_type": "granite_switch",
+   "family": "Granite Switch 4.1 (dense all-attention Granite with N embedded per-token LoRA adapters, a zero adapter slot and weightless switch layers; upstream llama.cpp 157b81fe, not in the pin)",
+   "watch": "report"
   }
  }
 }

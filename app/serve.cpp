@@ -161,6 +161,7 @@ struct Options {
     std::string dflash;  // DFlash block-diffusion draft model for the target
     int moe_slots = 0;   // --moe-slots N: stream routed experts from the model file, N held in RAM (-1: auto)
     int moe_prefetch = 0;   // --moe-prefetch N: gate-ahead prefetch N MoE layers ahead (0: off)
+    std::string moe_predict;  // --moe-predict off|router|block: what the prefetch predicts with (docs/moe-streaming.md)
     std::string moe_subst;  // --moe-subst R: a resident expert scoring at least R x a missing one takes its place
     std::string mmproj;  // a vision (or audio) projector: image parts in chat messages
     int mtp_max = 0;
@@ -993,6 +994,10 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             env.push_back("ONEBIT_MOE_SLOTS=" + std::to_string(slots));
             // off unless asked: where the drive is the limit, wrong guesses cost more than right ones save
             env.push_back("ONEBIT_MOE_PREFETCH=" + std::to_string(o.moe_prefetch));
+            // what the prefetch predicts with: the gate-ahead router (the streamer's old form,
+            // wrong on hyper-connections) or the next layer's own block (docs/moe-streaming.md,
+            // "Predicting the next layer's experts"). Untested on device: off by default.
+            if (!o.moe_predict.empty()) env.push_back("ONEBIT_MOE_PREDICT=" + o.moe_predict);
             if (!o.moe_subst.empty()) env.push_back("ONEBIT_MOE_SUBST=" + o.moe_subst);
             // the experts stay file-backed: without these, llama.cpp copies every one into RAM
             // (a pinned host buffer, or a CPU repack), which is what streaming avoids
@@ -2618,6 +2623,9 @@ void usage(FILE* out) {
                  "                                    N held in RAM (auto: what fits); R: resident experts stand in for missing\n"
                  "                                    ones; prefetch N layers ahead (default 0). Not in this build: it moves\n"
                  "                                    to HRX with Qwen3.8-Flash-Next (docs/moe-streaming.md)\n"
+                 "                  [--moe-predict off|router|block]   what the prefetch predicts the next layer's experts with:\n"
+                 "                                    router (cheap) or block (that layer's own mixer block; untested on\n"
+                 "                                    device). Only with --moe-slots. Default off\n"
                  "                  [--mmproj MMPROJ.gguf]   images in chat messages (hrx, cpu)\n"
                  "                  [--parallel N]   N requests decoded together (continuous batching)\n"
 
@@ -2706,6 +2714,12 @@ int run_serve(int argc, char** argv) {
             o.moe_slots = v == "auto" ? -1 : std::stoi(v);
         }
         else if (a == "--moe-prefetch") o.moe_prefetch = std::stoi(next());
+        else if (a == "--moe-predict") {
+            o.moe_predict = next();
+            if (o.moe_predict != "off" && o.moe_predict != "router" && o.moe_predict != "block") {
+                throw std::runtime_error("--moe-predict takes off, router or block, not '" + o.moe_predict + "'");
+            }
+        }
         else if (a == "--moe-subst") o.moe_subst = next();
         else if (a == "--mmproj") o.mmproj = next();
         else if (a == "--mtp-max") o.mtp_max = std::stoi(next());

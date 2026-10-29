@@ -32,7 +32,8 @@ so it also works on its own with any OpenAI client.
            [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
            [--laya | --laya-model DIR] [--route-policy FILE]
            [--pm [--pm-experts FILE] [--lemonade-url URL]]
-           [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N]   # refused in this build, below
+           [--moe-slots N|auto] [--moe-subst R] [--moe-prefetch N] [--moe-predict off|router|block]
+                                                              # refused in this build, below
            [--parallel N]
            [--embed MODEL.gguf] [--rerank MODEL.gguf]
            [--npu-opt KEY=VALUE ...]
@@ -767,6 +768,14 @@ back later; on a shared box, give a number instead. The gate-ahead prefetch is o
 Prompts are slow when streaming: a batch larger than 8 tokens runs the experts on the CPU
 from the mapped file (Flash-Next: 0.4-0.8 tok/s of prompt). Keep prompts short, or see
 docs/moe-streaming.md, Next.
+
+`--moe-predict off|router|block` (default off; only with `--moe-slots`, and a prefetch to predict
+for means `--moe-prefetch 1`) chooses what the prefetch predicts the next layer's experts with. `block` runs the next layer's own mixer block
+on the current residual, which is what makes the prediction fit Flash-Next's hyper-connections;
+`router` keeps the cheap residual-only form. The predictor changes only which experts are read
+early, never the output (`docs/moe-streaming.md`, "The next layer's own block"). **Untested on
+device**: the predictor and its hit-rate table are built and unit-tested host-side, and it needs
+the HRX streamer to consume it.
 
 ## Many requests at once (`--parallel`)
 

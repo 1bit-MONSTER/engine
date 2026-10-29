@@ -194,6 +194,39 @@ Predicting 2 x top-k covers 93-98% of misses, but reads 5-10 times as many exper
 never used. Predictors that need only the trace (the previous token's experts,
 co-occurrence with the previous layer) cover under 30%.
 
+### The next layer's own block (Flash-Next; untested on device)
+
+The gate-ahead predictor above does not fit Qwen3.8-Flash-Next: its layers keep four 2560-wide
+residual streams (hyper-connections), so layer l+1's router input is l+1's own mixer applied to
+the residual *after* layer l's MoE, and applying l+1's router to layer l's FFN input mixes
+through the wrong weights. The measured result is in "Flash-Next, streamed" below: right about
+two times in three, and a loss on a drive that is already the limit.
+
+The predictor that does fit runs layer l+1's own token-mixer block on the current residual,
+before layer l's MoE output exists: l+1's PLE injection, its attention or DeltaNet block, its
+combine, then its FFN mixer and its router. Only the ranking of the router logits is used, and
+more candidates than the layer routes to are kept so the near misses are read too. The output of
+the model does not change: the block only decides which experts a prefetch reads, and whatever a
+token really routes to is still waited for.
+
+State writes of that speculative pass are suppressed where the exact pass would read them: the
+DeltaNet recurrent state and the conv histories are written into scratch tensors, and an
+attention successor needs nothing, because the exact block rewrites the same cache cell before
+anything reads it. The speculative nodes are also left out of the fused-op manifest, so they
+cannot make a fused dispatch claim the wrong tensor.
+
+`--moe-predict off|router|block` (env `ONEBIT_MOE_PREDICT`) selects it, and takes effect with
+`--moe-prefetch 1` once the HRX llama.cpp runs the streamer; `router` keeps the cheap
+residual-only form for comparison. `ONEBIT_MOE_PREDICT_DEPTH`, `_MARGIN` (read a deeper candidate
+only while its logit is within the given distance of the best one), `_MIN`, `_LAYERS` and
+`_OUT` (a trace of predictions and the routing that was really used) tune and measure it, and
+`ONEBIT_MOE_PREDICT_STATS=1` prints the hit rate per layer when the process exits.
+
+The graph side is `src/onebit-moe-predict.*` plus one hook in the `qwen4exp` graph in the
+llama.cpp pin, and it is **untested on device**: the predictor, its readback and the hit-rate
+table are built and unit-tested host-side (`tests/test-onebit-moe-predict.cpp`), and the
+prefetch consumer (the streamer's in-graph op) is the step that needs the GPU lane.
+
 ## The expert cache in the engine
 
 `moe/` holds the cache (Linux only, built into `1bit` as `ONEBIT_MOE`):
@@ -633,7 +666,9 @@ the change is within the noise (four rounds, 6.7 against 7.0 tok/s).
 2. **A better stand-in than the router's next choice.** On Flash-Next, r 0.5 costs a KL divergence
    of 0.07 ("Flash-Next, streamed"). Candidates: weighing a stand-in by how often it co-occurs
    with the missing expert, or reading only the missing expert's most-weighted rows.
-3. **Flash-Next's gate-ahead prediction.** Its layers keep four 2560-wide residual streams
-   (hyper-connections), so the predictor needs that model's mixing step before the router.
+3. **Flash-Next's prediction.** Its layers keep four 2560-wide residual streams
+   (hyper-connections), so the predictor needs that model's mixing step before the router. Built
+   as the next layer's own block ("The next layer's own block", above); it needs a device run to
+   rate it and the streamer to consume it.
 4. **The quants not on the box** (UD-Q2/Q3/Q4_K_XL): their decode speed, once there is room
    on the drive.

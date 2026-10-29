@@ -193,6 +193,45 @@ that runs the phase is private, like the kernels it runs.
 - **Repeatable:** every generation starts from a zeroed KV cache (#400), so identical greedy
   requests give identical text, whatever ran before them.
 
+### Sampling and structured output
+
+`1bit serve -m <NPU model dir> --device npu` serves through `1bit forward-serve`
+(app/forward_serve.cpp) in the same process. Every field below is optional, and the answer is
+**greedy when none of them is sent**, so a client written before them gets the same text it
+got before.
+
+| Request field | Meaning |
+|---|---|
+| `temperature` | `0` or absent decodes greedily (argmax); above `0` divides the logits before the draw |
+| `top_k` | keep the `k` highest logits; `0` or absent keeps all of them |
+| `top_p` | nucleus sampling, `1` or absent keeps all of them (`min_keep` candidates always stay) |
+| `seed` | the same seed and the same request give the same text; absent or `-1` seeds from the clock |
+| `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
+| `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema"}` is a 400 |
+
+A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema` needs a
+schema-to-GBNF converter this route does not have", "`gbnf: unterminated literal at line 1`"),
+never a silently ignored key. `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
+an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
+
+The sampler is llama.cpp's, without llama.cpp: `app/npu_sampling.h` repeats the semantics of
+`third_party/llama.cpp/src/llama-sampler.cpp` (top_k, then top_p, then temperature, then the
+cumulative-sum draw that `common/sampling.cpp`'s chain ends with) over the raw logits this route
+has, because llama.cpp's sampler needs a `llama_context` and a `llama_vocab` and the forward has
+neither. The grammar (`app/npu_grammar.h`) is the same rule model - one flat element vector per
+rule, `ALT`/`END` between alternatives - as a byte-level pushdown automaton: a token is only
+sampled when its decoded text leaves the grammar alive, which is checked per token against the
+byte ranges the grammar can continue with. Both headers are device-free, and
+`tests/npu_sampling_test.cpp` runs the sampler, the parser, the JSON grammar and the request
+parser in CI without a model or an NPU.
+
+```
+$ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France is", "max_tokens": 16,
+    "grammar": "root ::= \" Paris\" | \" Lyon\" | \" Marseille\""}'
+{"choices":[{"finish_reason":"length","index":0,"text":" Paris"},...]}
+```
+
 ## Add-on routes
 
 The engine keeps a hook for closed-source NPU add-ons (`npu/private_route.h`). Qwen3.6-35B-A3B

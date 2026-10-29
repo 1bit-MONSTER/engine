@@ -178,6 +178,12 @@ add_test(NAME think_split COMMAND think_split_test)
 add_executable(http_guard_test tests/http_guard_test.cpp)
 target_include_directories(http_guard_test PRIVATE app)
 add_test(NAME http_guard COMMAND http_guard_test)
+# The NPU route's sampling controls and GBNF output constraint (app/npu_sampling.h,
+# app/npu_grammar.h, docs/npu.md "Sampling and structured output"); header only, no device.
+add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
+target_include_directories(npu_sampling_test PRIVATE app)
+target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # general.architecture from a GGUF header (app/gguf_meta.h), which routes fork-only
 # architectures to our llama.cpp; header only, runs in CI.
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)

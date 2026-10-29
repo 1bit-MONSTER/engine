@@ -534,6 +534,14 @@ root_elfs_load() {   # <root>: name every ELF in the image root that cannot reso
     for d in lib lib64 usr/lib usr/lib64 usr/local/lib; do
         [ -d "$root/$d" ] && ldlibs="${ldlibs:+$ldlibs:}$root/$d"
     done
+    # The multiarch directories are where Debian/Ubuntu actually put the libraries, and they are not
+    # on the list above: without them every consumer of libtomcrypt, libzstd, libcurl and libz reports
+    # its symbols as undefined and a GOOD image fails the build. Measured on the 2026-10-28 rehearsal
+    # root (120 ELFs): 3 flagged without this loop (dropbear, dropbearkey, libtomcrypt.so.1 itself),
+    # 0 with it. Two further built roots (120 and 39 ELFs) go 0 as well.
+    for d in "$root"/lib/*-linux-gnu* "$root"/usr/lib/*-linux-gnu*; do
+        [ -d "$d" ] && ldlibs="${ldlibs:+$ldlibs:}$d"
+    done
     while IFS= read -r -d '' f; do
         [ -L "$f" ] && continue
         [ "$(head -c 4 "$f" 2>/dev/null)" = "$(printf '\177ELF')" ] || continue

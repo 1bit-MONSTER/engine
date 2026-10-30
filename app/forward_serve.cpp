@@ -20,14 +20,21 @@
 //
 //   GET  /health, /v1/health    200 once the model is on the device
 //   GET  /v1/models             the one model
-//   POST /v1/chat/completions   ChatML prompt, greedy decoding, optional SSE stream
+//   POST /v1/chat/completions   ChatML prompt, sampling controls, optional SSE stream
 //   POST /v1/completions        raw prompt
+//
+// Decoding is greedy unless the request asks for more: temperature, top_k, top_p and seed
+// sample, stop cuts the answer, and grammar (GBNF) or response_format {"type":
+// "json_object"} constrain it.  See app/npu_sampling.h, app/npu_grammar.h and
+// docs/npu.md "Sampling and structured output".
 //
 // Requests run one at a time: the forward holds one KV cache, and each request
 // resets it from position 0.
 #include "forward_serve.h"
 
 #include "../npu/forward/include/q4nx_forward.h"
+#include "npu_grammar.h"
+#include "npu_sampling.h"
 #include "tokenizer.h"
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
@@ -45,6 +52,7 @@
 #include <sys/file.h>
 #include <fstream>
 #include <mutex>
+#include <random>
 #include <stdexcept>
 #include <string>
 #include <thread>
@@ -65,6 +73,9 @@ struct ForwardEngine {
     int eos = -1;
     int endoftext = -1;
     int max_context = 0;   // config.json max_position_embeddings: prompt plus answer
+    // decode() of every vocabulary id, built on the first constrained request: the GBNF
+    // mask tests each token's text against the grammar state, per token.
+    std::vector<std::string> tok_text;
     std::mutex mu;
 };
 
@@ -132,6 +143,21 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         return;
     }
     const int max_tokens = body.value("max_completion_tokens", body.value("max_tokens", 256));
+    // Decode-time controls.  Every field is optional and absent means the greedy decode
+    // this route has always done, so existing callers see no change; a field the route
+    // cannot honour is a 400 rather than a silently ignored key.
+    npu::Options opts;
+    std::unique_ptr<npu::Grammar> grammar;
+    try {
+        opts = npu::options_from_body(body);
+        if (opts.json_object || !opts.grammar.empty())
+            grammar = std::make_unique<npu::Grammar>(opts.json_object ? npu::json_grammar() : opts.grammar);
+    } catch (const std::exception& ex) {
+        res.status = 400;
+        res.set_content(json{{"error", {{"message", ex.what()}}}}.dump(), "application/json");
+        return;
+    }
+    const npu::Grammar* gram = grammar.get();
     // A prompt this long cannot fit the context whatever it tokenizes to; refuse it before
     // spending time on it.
     if (prompt.size() > size_t(e.max_context) * 16) {
@@ -145,7 +171,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                                   std::chrono::system_clock::now().time_since_epoch()).count());
     const std::string object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
-    auto run = [&e, &req, prompt, max_tokens, chat](const std::function<bool(const std::string&)>& on_text) {
+    // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
+    // a stop sequence or a grammar that allows nothing more, "length" when the token
+    // budget ran out.
+    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram](const std::function<bool(const std::string&)>& on_text) {
+        std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.
         std::vector<int> ids = e.tok->encode(prompt);
         // A chat template that opens with {{- bos_token }} (MiniCPM5 and other
@@ -159,13 +189,6 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         if (room < 1) throw std::runtime_error("prompt longer than the context");
         const int limit = std::clamp(max_tokens, 0, room);
         std::lock_guard<std::mutex> lock(e.mu);
-
-        auto argmax = [](const std::vector<float>& v) {
-            int a = 0;
-            for (size_t i = 1; i < v.size(); i++)
-                if (v[i] > v[a]) a = (int)i;
-            return a;
-        };
 
         std::vector<float> logits;
         // Prefill in batched (M>1) passes of at most the kernel's row width: each
@@ -184,23 +207,78 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             }
         }
 
-        std::string pending;
-        bool stopped_at_eos = false;
+        // Sampler state: one generator per request, seeded so a run can be reproduced.
+        std::mt19937_64 rng(npu::resolve_seed(opts.sample.seed));
+        npu::Grammar::State grammar_state;
+        std::vector<char> allowed;
+        if (gram) {
+            grammar_state = gram->start();
+            // One decoded piece per vocabulary id: the mask below tests those against the
+            // grammar state.  A megabyte of small strings, built once per process.
+            if (e.tok_text.size() < logits.size()) {
+                e.tok_text.clear();
+                e.tok_text.reserve(logits.size());
+                for (size_t i = 0; i < logits.size(); i++) e.tok_text.push_back(e.tok->decode(int(i)));
+            }
+        }
+        // allowed[i] says token i can be appended without leaving the grammar.  The first
+        // byte test rejects almost every token cheaply (a JSON object at the start accepts
+        // a handful of first bytes out of 256), so only the survivors pay a full feed().
+        auto refresh_allowed = [&]() {
+            allowed.assign(logits.size(), 0);
+            const npu::ByteMask first = gram->next_bytes(grammar_state);
+            for (size_t i = 0; i < logits.size(); i++) {
+                const std::string& t = e.tok_text[i];
+                if (t.empty()) {
+                    allowed[i] = 1;  // an empty piece cannot leave the grammar
+                } else if (first.has(static_cast<unsigned char>(t[0]))) {
+                    npu::Grammar::State probe = grammar_state;
+                    allowed[i] = gram->feed(probe, t) ? 1 : 0;
+                }
+            }
+        };
+
+        std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
+        bool stopped_at_eos = false, stopped_at_stop = false;
+        int produced = 0;
         for (int n = 0; n < limit; n++) {
             if (req.is_connection_closed()) break;  // the client is gone: free the NPU
-            const int next = argmax(logits);
+            if (gram) refresh_allowed();
+            const int next = npu::sample_token(logits, opts.sample, rng, gram ? &allowed : nullptr);
+            // -1: the grammar allows no token here, so the answer ends where it is.  EOS is
+            // not masked by the grammar on purpose: a constrained answer is still allowed to
+            // stop early (the client validates it), which beats a runaway inside the mask.
+            if (next < 0) { stopped_at_eos = true; break; }
             if (next == e.eos || (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
+            if (gram) gram->feed(grammar_state, e.tok_text[next]);
             pending += e.tok->decode(next);
+            ++produced;
+            const size_t stop_at = npu::find_stop(pending, opts.stop);
+            if (stop_at != std::string::npos) {
+                if (stop_at > 0) on_text(pending.substr(0, stop_at));
+                stopped_at_stop = true;
+                break;
+            }
+            // Send what no stop sequence can still match, and keep the tail: the next
+            // token may complete a match that starts in it.
             const size_t cut = complete_utf8(pending);
-            if (cut > 0) {
-                const std::string out = pending.substr(0, cut);
-                pending.erase(0, cut);
+            const size_t hold = npu::stop_holdback(opts.stop);
+            size_t emit = cut > hold ? cut - hold : 0;
+            while (emit > 0 && (static_cast<unsigned char>(pending[emit]) & 0xC0) == 0x80) --emit;  // keep whole characters
+            if (emit > 0) {
+                const std::string out = pending.substr(0, emit);
+                pending.erase(0, emit);
                 if (!on_text(out)) break;
             }
             if (!e.fwd->step(next, (int)ids.size() + n, logits))
                 throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
         }
-        (void)stopped_at_eos;
+        if (!stopped_at_stop) {
+            const size_t cut = complete_utf8(pending);
+            if (cut > 0) on_text(pending.substr(0, cut));
+        }
+        if (produced >= limit && !stopped_at_eos && !stopped_at_stop) finish = "length";
+        return finish;
     };
 
     auto wrap = [&](const std::string& content, const std::string& finish) {
@@ -222,11 +300,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     try {
         if (!stream) {
             std::string content;
-            run([&](const std::string& t) {
+            const std::string finish = run([&](const std::string& t) {
                 content += t;
                 return true;
             });
-            res.set_content(wrap(content, "stop"), "application/json");
+            res.set_content(wrap(content, finish), "application/json");
         } else {
             // Build the SSE frames while the handler still owns its locals.  The
             // content provider below runs AFTER this handler returns, so it must
@@ -332,9 +410,15 @@ int run_forward_serve(int argc, char** argv) {
         }
     }
 
-    xrt::device dev(0);
-    if (!e.fwd->init(dev, model.c_str(), kernels))
-        throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
+    // Offline mode (npu/forward/include/q4nx_forward.h, init_host): with
+    // NPU_INFER_HOST_GEMM=1 the forward runs the model with host GEMMs and never opens
+    // the device, which is how the sampling and grammar path is exercised without an
+    // NPU.  Open the device only when the forward is going to use it.
+    const bool host_gemm = std::getenv("NPU_INFER_HOST_GEMM") != nullptr;
+    std::unique_ptr<xrt::device> dev;
+    if (!host_gemm) dev = std::make_unique<xrt::device>(0);
+    const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
+    if (!ok) throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
 
     std::atomic<bool> ready{false};
     httplib::Server srv;

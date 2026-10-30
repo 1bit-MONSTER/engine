@@ -5,12 +5,11 @@
   "quant": "Q4_K_M",
   "instrument": "wall clock per request + usage.completion_tokens, n_predict=128, temperature 0, greedy, distinct prompts",
   "repeats": 5,
-  "timestamp": "2026-10-30T06:52:21Z",
-  "source": "~/lb/612-hrx-20261030T064957Z (tools/showcase-612-hrx.sh 2 4 8 on strixhalo, under gpu-hold label 'pi i612')",
-  "id": "coder30b-hrx-parallel2-20261030",
+  "timestamp": "2026-10-30T21:16:28Z",
+  "source": "~/lb/612-hrx-20261030T211252Z (tools/showcase-612-hrx.sh 2 4 8 on an idle strixhalo, under gpu-hold label 'pi i612'); reproduces ~/lb/612-hrx-20261030T064957Z",
   "metric": {
     "name": "decode aggregate",
-    "value": 62.96,
+    "value": 63.45,
     "unit": "tok/s"
   },
   "settings": {
@@ -18,11 +17,12 @@
     "requests_in_flight": 2,
     "kv_unified": true,
     "n_ctx": 8192,
-    "per_stream_tok_s": 31.49,
-    "solo_same_server_tok_s": 84.22,
+    "per_stream_tok_s": 31.73,
+    "solo_same_server_tok_s": 84.33,
     "engine": "38e29a2 + i612-npu-streams (b78868c)",
     "llama_cpp": "40c4ccb76",
     "model_file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
   },
-  "notes": "Two requests in flight leave the engine slower in aggregate than one: a 2-row decode batch costs 29.0 ms/token per stream against 11.9 ms for one row (llama-server timings in server-np2.log), and with ONEBIT_HRX_DECODE_SPLIT=0 the same --parallel 2 server gives 57.59 tok/s aggregate from a 45 tok/s solo, i.e. the split path stops paying as soon as a second row is in the batch."
+  "notes": "0.75x: two requests in flight are slower in aggregate than one, and it reproduces (62.96 at 06:45Z, 63.45 here, on different clocks). A 2-row decode batch costs 29.0 ms/token per stream against 11.9 ms for one row; with ONEBIT_HRX_DECODE_SPLIT=0 the same server gives 57.59 from a 45 tok/s solo, so the vectorised decode-split path is the suspect -- not settled.",
+  "id": "coder30b-hrx-parallel2-20261030"
 }

@@ -5,12 +5,11 @@
   "quant": "Q4_K_M",
   "instrument": "wall clock per request + usage.completion_tokens, n_predict=128, temperature 0, greedy, distinct prompts",
   "repeats": 5,
-  "timestamp": "2026-10-30T06:52:21Z",
-  "source": "~/lb/612-hrx-20261030T064957Z (tools/showcase-612-hrx.sh 2 4 8 on strixhalo, under gpu-hold label 'pi i612')",
-  "id": "coder30b-hrx-parallel4-20261030",
+  "timestamp": "2026-10-30T21:16:28Z",
+  "source": "~/lb/612-hrx-20261030T211252Z (tools/showcase-612-hrx.sh 2 4 8 on an idle strixhalo, under gpu-hold label 'pi i612'); reproduces ~/lb/612-hrx-20261030T064957Z",
   "metric": {
     "name": "decode aggregate",
-    "value": 91.11,
+    "value": 87.73,
     "unit": "tok/s"
   },
   "settings": {
@@ -18,11 +17,12 @@
     "requests_in_flight": 4,
     "kv_unified": true,
     "n_ctx": 8192,
-    "per_stream_tok_s": 22.81,
-    "solo_same_server_tok_s": 84.46,
+    "per_stream_tok_s": 21.94,
+    "solo_same_server_tok_s": 84.22,
     "engine": "38e29a2 + i612-npu-streams (b78868c)",
     "llama_cpp": "40c4ccb76",
     "model_file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
   },
-  "notes": "Four streams recover what two lost: 1.08x aggregate, 22.8 tok/s per stream, llama-server reports all four slots decoding in one batch at 24.88 t/s each."
+  "notes": "1.04x: four streams only recover the single-stream baseline (91.11 / 1.08x at 06:45Z). llama-server reports all four slots decoding in one batch at 24.88 t/s each, so the batching is real; the aggregate is flat because the model is bandwidth-bound. No --parallel 8 row is published: at 8 streams the rate is non-stationary inside a run (llama-server's own tg per slot goes 14.99 15.12 14.34 12.10 7.09 6.78 5.70 5.64 as the answers grow, then 14.17 for a fresh batch, with die temp 61-71 C and iGPU sclk 694-2127 MHz swinging normally), so an 8-stream number is a function of where in that decay it is sampled: 112.89 / 1.34x at 06:45Z, 78.87 / 0.97x and 68.29 / 0.92x later the same day.",
+  "id": "coder30b-hrx-parallel4-20261030"
 }

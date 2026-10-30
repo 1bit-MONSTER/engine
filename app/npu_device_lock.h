@@ -19,8 +19,8 @@
 // amdxdna's npu4 sets hwctx_limit = 16 (drivers/accel/amdxdna/npu4_regs.c) and only
 // rejects a context past that -- but the two streams share one DMA engine and each
 // stream allocates its own copy of the weights, so a second serving process makes
-// the first slower and doubles the footprint. Measured on Qwen3-0.6B: 65.7 % of
-// solo per stream, 1.31x aggregate (docs/npu.md, "Two streams on one NPU").
+// the first slower and doubles the footprint: two engines on two models measured
+// 34.1 % and 70.4 % of solo, 0.41x aggregate (docs/npu.md, "Two streams on one NPU").
 //
 // So the lock is a policy, and the policy is exclusive unless the operator asks:
 //   streams <= 1  LOCK_EX  today's behaviour, and still what a bare run takes

@@ -90,7 +90,6 @@ start() {   # start <model dir> <port> <logfile>: echoes the pid once the serve 
     "$BIN" forward-serve -m "$model/model.q4nx" --kernels "$KERNELS" -p "$port" --npu-streams 2 \
         >> "$log" 2>&1 &
     local pid=$!
-    PIDS+=("$pid")
     for _ in $(seq 1 600); do
         grep -q "ready on" "$log" && { echo "$pid"; return 0; }
         kill -0 "$pid" 2>/dev/null || { say "server on $port died:" >&2; tail -5 "$log" >&2; return 1; }
@@ -100,9 +99,12 @@ start() {   # start <model dir> <port> <logfile>: echoes the pid once the serve 
     return 1
 }
 
-stop() {    # stop <pid>
+stop() {    # stop <pid>: kill it and forget it, leaving the other pids for the trap
     [ -n "${1:-}" ] || return 0
-    kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; PIDS=()
+    kill "$1" 2>/dev/null; wait "$1" 2>/dev/null
+    local keep=() p
+    for p in "${PIDS[@]:-}"; do [ -n "$p" ] && [ "$p" != "$1" ] && keep+=("$p"); done
+    PIDS=("${keep[@]:-}")
 }
 
 ask() {     # ask <port>: "tokens wall_seconds" for one request
@@ -140,6 +142,7 @@ for pair in "solo_a $MODEL $PORT_A" "solo_b $MODEL_B $PORT_B"; do
     set -- $pair
     arm=$1 model=$2 port=$3
     srv=$(start "$model" "$port" "$OUT/$arm.log") || die "$arm server did not start"
+    PIDS+=("$srv")
     for rep in $(seq 1 "$REPEATS"); do
         out=$(ask "$port") || die "$arm request failed at rep $rep"
         read -r n wall <<< "$out"
@@ -154,7 +157,9 @@ done
 # Concurrent: two models, two hwctx, one device.
 for rep in $(seq 1 "$REPEATS"); do
     pa=$(start "$MODEL" "$PORT_A" "$OUT/conc-a-$rep.log") || die "engine 1 did not start at rep $rep"
+    PIDS+=("$pa")
     pb=$(start "$MODEL_B" "$PORT_B" "$OUT/conc-b-$rep.log") || die "engine 2 did not start at rep $rep"
+    PIDS+=("$pb")
     # Both requests in flight at once: start them together, then read both walls.
     before=$(date +%s.%N)
     ask "$PORT_A" > "$OUT/a-$rep.txt" &

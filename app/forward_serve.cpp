@@ -394,8 +394,9 @@ int run_forward_serve(int argc, char** argv) {
     // Who may have the NPU (app/npu_device_lock.h): one process by default, N when the
     // operator asks with --npu-streams. It is a policy, not a hardware limit -- the
     // driver's npu4 sets hwctx_limit = 16 -- and the default stays exclusive because a
-    // second stream takes the same DMA engine and its own copy of the weights (65.7 %
-    // of solo per stream, 1.31x aggregate; docs/npu.md "Two streams on one NPU").
+    // second stream takes the same DMA engine and its own copy of the weights: two
+    // engines on two models measured 34.1 % / 70.4 % of solo, 0.41x aggregate
+    // (docs/npu.md "Two streams on one NPU").
     // Held for the life of the process (fd not closed), exactly like the per-process
     // ELF runner (npu_engine_universal), which takes the same exclusive lock.
     if (!std::getenv("NPU_NO_DEVICE_LOCK"))

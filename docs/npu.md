@@ -275,11 +275,11 @@ usable beside another NPU engine, and what its limits are:
   Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
   keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
   file is not slowed, not blocked and not detected.
-- **What happens when the other engine ignores it** is measured, not assumed: with the lock bypassed
-  (`NPU_NO_DEVICE_LOCK=1`), two of our contexts on Qwen3-0.6B ran at **65.7 % of solo each, 1.31x
-  aggregate** (3 reps, engine `a88ef00`, 2026-10-29). So an uncoordinated second engine costs the
-  first one about a third of its per-stream speed and buys less than a third in aggregate; the failure
-  mode is slow, not wrong.
+- **What happens when the other engine ignores it.** A runtime that skips the file is not blocked and
+  not detected, so it shares the device exactly the way a *co-ordinated* second engine does — and that
+  cost is measured: two engines on the shared lock lose 59 % of their aggregate throughput (the table
+  below). The failure mode is slow, not wrong; there is no run on this box that measures an
+  unco-ordinated second engine apart from that, so nothing more specific is claimed here.
 
 **Partitioning, and what it would take.** Two whole-array streams share one DMA engine, so they
 serialise; the September prototype that scaled (~100 % each) did it by giving each stream a *disjoint
@@ -301,15 +301,16 @@ engine's memory: this route reads only the geometry keys (`hidden_size`, `num_hi
 its own full ELFs under `--kernels`, which is why a model directory's `npu/` subdirectory is empty on
 purpose and why `addr_*` must not be used to reason about what this engine allocates.
 
-What it measures. Two rounds, both `max_tokens 8`, `temperature 0`, three reps per arm with rep 1
-dropped as warm-up (the first request after a load is ~2x the steady state), wall clock per request:
+What it measures. `max_tokens 8`, `temperature 0`, three reps per arm with rep 1 dropped as warm-up
+(the first request after a load is ~2x the steady state), wall clock per request, each model measured
+alone with the other not even loaded (strixhalo 2026-10-30, engine `38e29a2`, binary `b78868c`,
+kernels `~/lb/lfm2-npu/kernels_m16`, run `~/lb/612-npu-streams-20261030T112326Z`):
 
 | run | solo | both at once | per stream | aggregate |
 |---|---|---|---|---|
-| Qwen3-0.6B twice, lock bypassed (`a88ef00`, 2026-10-29) | 6.31 / 6.23 s | 9.51 / 9.51 s | 65.7 % | **1.31x** |
 | Qwen3-0.6B + Qwen3-4B, `--npu-streams 2` (`b78868c`, 2026-10-30) | 5.79 s / 25.08 s | 16.99 s / 35.61 s | **34.1 % / 70.4 %** | **0.41x** |
 
-The second row is the one the second engine exists for: two *different* models resident at once, each
+That row is the one the second engine exists for: two *different* models resident at once, each
 keeping its own weights and its own hwctx, both answering, with no lock bypass. Throughput gets
 **worse** -- 0.41x, i.e. running the two back to back is 2.4x faster than running them together --
 because two whole-array streams share one DMA engine: the per-token times add up (0.72 + 3.13 s solo

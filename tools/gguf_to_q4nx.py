@@ -290,11 +290,19 @@ def pack(args):
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
-    if args.tokenizer:
-        for n in ("tokenizer.json", "tokenizer_config.json"):
-            src = os.path.join(args.tokenizer, n)
-            if os.path.exists(src):
-                shutil.copyfile(src, os.path.join(args.out, n))
+    # A model directory is not servable without tokenizer.json (npu/tokenizer.cpp reads it), so
+    # fall back to the GGUF's own directory -- an HF snapshot or export dir usually has one -- and
+    # say so loudly when it is still missing, rather than reporting success on an unusable directory.
+    tokdir = args.tokenizer or os.path.dirname(os.path.abspath(args.gguf))
+    copied = []
+    for n in ("tokenizer.json", "tokenizer_config.json"):
+        src = os.path.join(tokdir, n)
+        if os.path.exists(src):
+            shutil.copyfile(src, os.path.join(args.out, n))
+            copied.append(n)
+    if "tokenizer.json" not in copied:
+        print(f"WARNING: no tokenizer.json in {tokdir}: {args.out} has model.q4nx and config.json "
+              "only, and 1bit forward-serve will refuse it. Pass --tokenizer <dir>.")
     print(f"wrote {args.out}/model.q4nx ({8 + len(header) + off} bytes)")
 
 

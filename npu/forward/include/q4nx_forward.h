@@ -414,8 +414,22 @@ private:
     int lin_khd_ = 0, lin_vhd_ = 0;      // head dims
     int lin_ck_ = 4;                     // depthwise conv kernel
     std::vector<float> wqkvlin_, wz_, woutlin_;          // [CD][H], [VD][H], [H][VD]
-    std::vector<float> wa_, wb_;                          // [nvh][H] alpha/beta
-    std::vector<float> lin_conv_w_, lin_norm_w_, lin_ssm_a_, lin_dt_;  // [CK][CD],[VHD],[nvh],[nvh]
+    // GDN members the HOST reads every token: the alpha/beta projections (the
+    // per-head dot products), the conv window, the gate norm and ssm_a/ssm_dt
+    // (the recurrence).  They are container constants, but the recurrence consumes
+    // a different one per layer, so a single shared buffer forced a re-dequant of
+    // all of them for every layer of every token: 299 ms/token on the 27B, 53% of
+    // all layer host time, for ~2 MB/layer.  Per layer, dequantised once.
+    // NPU_GDN_CACHE=0 restores the per-token reload.
+    struct GdnSmall {
+        std::vector<float> wa, wb;        // [nvh][H]
+        std::vector<float> conv;          // [CK][CD]
+        std::vector<float> norm;          // [VHD]
+        std::vector<float> ssm_a, dt;     // [nvh]
+        bool loaded = false;
+    };
+    std::vector<GdnSmall> gdn_small_;     // [layer]
+    bool gdn_cache_ = true;               // NPU_GDN_CACHE=0 disables
     std::vector<std::vector<float>> conv_state_, rec_state_;  // [CD][CK-1], [nvh][khd][vhd]
     // One GDN token step: xn is the normed input; out gets the out_proj result.
     bool gdn_layer(int l, const std::vector<float>& xn, std::vector<float>& out);

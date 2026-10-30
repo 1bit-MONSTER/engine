@@ -586,12 +586,20 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         wqkvlin_.resize(CD * (size_t)H);
         wz_.resize((size_t)lin_vd_ * (size_t)H);
         woutlin_.resize((size_t)H * (size_t)lin_vd_);
-        wa_.resize((size_t)lin_nvh_ * (size_t)H);
-        wb_.resize((size_t)lin_nvh_ * (size_t)H);
-        lin_conv_w_.resize((size_t)lin_ck_ * CD);
-        lin_norm_w_.resize((size_t)lin_vhd_);
-        lin_ssm_a_.resize((size_t)lin_nvh_);
-        lin_dt_.resize((size_t)lin_nvh_);
+        gdn_small_.resize((size_t)NL);
+        for (auto& g : gdn_small_) {
+            g.wa.resize((size_t)lin_nvh_ * (size_t)H);
+            g.wb.resize((size_t)lin_nvh_ * (size_t)H);
+            g.conv.resize((size_t)lin_ck_ * CD);
+            g.norm.resize((size_t)lin_vhd_);
+            g.ssm_a.resize((size_t)lin_nvh_);
+            g.dt.resize((size_t)lin_nvh_);
+        }
+        if (const char* v = getenv("NPU_GDN_CACHE")) {
+            gdn_cache_ = std::atoi(v) != 0;
+            std::fprintf(stderr, "[gdn] per-layer small-member cache %s (NPU_GDN_CACHE=%s)\n",
+                         gdn_cache_ ? "on" : "off", v);
+        }
         conv_state_.assign(NL, std::vector<float>((size_t)CD * (size_t)(lin_ck_ - 1), 0.0f));
         rec_state_.assign(NL, std::vector<float>((size_t)lin_nvh_ * (size_t)lin_khd_ * (size_t)lin_vhd_, 0.0f));
     }
@@ -1250,10 +1258,12 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!deq("linear_attn.ssm_out_proj.weight", woutlin_.data(), H, lin_vd_)) return false;
     }
     _t_ldg.stop();     // the three projections are done; the small members follow
-    if (!deq_pad("linear_attn.ssm_alpha_proj.weight", wa_.data(), lin_nvh_, H)) return false;
-    if (!deq_pad("linear_attn.ssm_beta_proj.weight", wb_.data(), lin_nvh_, H)) return false;
-    if (!bf16v("linear_attn.ssm_conv1d.weight", lin_conv_w_.data(), lin_ck_ * CD)) return false;
-    if (!bf16v("linear_attn.ssm_norm.weight", lin_norm_w_.data(), lin_vhd_)) return false;
+    GdnSmall& gs = gdn_small_[(size_t)l];
+    if (!gdn_cache_ || !gs.loaded) {
+    if (!deq_pad("linear_attn.ssm_alpha_proj.weight", gs.wa.data(), lin_nvh_, H)) return false;
+    if (!deq_pad("linear_attn.ssm_beta_proj.weight", gs.wb.data(), lin_nvh_, H)) return false;
+    if (!bf16v("linear_attn.ssm_conv1d.weight", gs.conv.data(), lin_ck_ * CD)) return false;
+    if (!bf16v("linear_attn.ssm_norm.weight", gs.norm.data(), lin_vhd_)) return false;
     {
         TensorDesc* da = tensor("linear_attn.ssm_a");
         TensorDesc* dd = tensor("linear_attn.ssm_dt.bias");
@@ -1263,8 +1273,10 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
             err_ = std::string("GDN: bad ssm_a/ssm_dt size ") + nm;
             return false;
         }
-        memcpy(lin_ssm_a_.data(), model_tensor_data(mw_, da), (size_t)lin_nvh_ * 4);
-        memcpy(lin_dt_.data(), model_tensor_data(mw_, dd), (size_t)lin_nvh_ * 4);
+        memcpy(gs.ssm_a.data(), model_tensor_data(mw_, da), (size_t)lin_nvh_ * 4);
+        memcpy(gs.dt.data(), model_tensor_data(mw_, dd), (size_t)lin_nvh_ * 4);
+    }
+    gs.loaded = true;
     }
     // The MLP runs on EVERY layer, but this path replaces load_layer()'s normal
     // tail for GDN layers -- without these three the MLP silently reused the
@@ -1372,8 +1384,8 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
     for (int c = 0; c < CD; c++) {
         const float* cs = st + (size_t)c * (CK - 1);
         float s = 0;
-        for (int j = 0; j < CK - 1; j++) s += cs[j] * lin_conv_w_[(size_t)j * CD + c];
-        s += qkv[c] * lin_conv_w_[(size_t)(CK - 1) * CD + c];
+        for (int j = 0; j < CK - 1; j++) s += cs[j] * gdn_small_[(size_t)l].conv[(size_t)j * CD + c];
+        s += qkv[c] * gdn_small_[(size_t)l].conv[(size_t)(CK - 1) * CD + c];
         co[c] = s / (1.0f + expf(-s));
     }
     for (int c = 0; c < CD; c++) {
@@ -1385,8 +1397,8 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
     LhScope _t_ab(LH_GDN_AB);
     std::vector<float> ah(NVH), bh(NVH);
     for (int h = 0; h < NVH; h++) {
-        const float* ra = wa_.data() + (size_t)h * H;
-        const float* rb = wb_.data() + (size_t)h * H;
+        const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)h * H;
+        const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)h * H;
         float sa = 0, sb = 0;
         for (int i = 0; i < H; i++) { sa += xn[i] * ra[i]; sb += xn[i] * rb[i]; }
         ah[h] = sa;
@@ -1414,7 +1426,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
     const float scale = 1.0f / sqrtf((float)KHD);
     std::vector<float> core((size_t)NVH * VHD), kvm(VHD);
     for (int h = 0; h < NVH; h++) {
-        const float eg = expf(lin_ssm_a_[h] * softplus_f(ah[h] + lin_dt_[h]));
+        const float eg = expf(gdn_small_[(size_t)l].ssm_a[h] * softplus_f(ah[h] + gdn_small_[(size_t)l].dt[h]));
         const float beta = 1.0f / (1.0f + expf(-bh[h]));
         float* sh = rs + (size_t)h * KHD * VHD;
         const float* kh = &kl[(size_t)h * KHD];
@@ -1441,7 +1453,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         for (int vd = 0; vd < VHD; vd++) {
             const float zz = z[(size_t)h * VHD + vd];
             core[(size_t)h * VHD + vd] = core[(size_t)h * VHD + vd] * inv *
-                lin_norm_w_[vd] * (zz / (1.0f + expf(-zz)));
+                gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
         }
     }
     _t_core.stop();
@@ -1523,8 +1535,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         for (int ch = 0; ch < CD; ch++) {
             const float* cs = st + (size_t)ch * (CK - 1);
             float s = 0;
-            for (int j = 0; j < CK - 1; j++) s += cs[j] * lin_conv_w_[(size_t)j * CD + ch];
-            s += qkv[ch] * lin_conv_w_[(size_t)(CK - 1) * CD + ch];
+            for (int j = 0; j < CK - 1; j++) s += cs[j] * gdn_small_[(size_t)l].conv[(size_t)j * CD + ch];
+            s += qkv[ch] * gdn_small_[(size_t)l].conv[(size_t)(CK - 1) * CD + ch];
             co[(size_t)ch] = s / (1.0f + expf(-s));
         }
         for (int ch = 0; ch < CD; ch++) {
@@ -1535,8 +1547,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         // alpha/beta on the host (N = NVH, below the GEMM tile width)
         const float* xm = xn.data() + (size_t)m * H;
         for (int hh = 0; hh < NVH; hh++) {
-            const float* ra = wa_.data() + (size_t)hh * H;
-            const float* rb = wb_.data() + (size_t)hh * H;
+            const float* ra = gdn_small_[(size_t)l].wa.data() + (size_t)hh * H;
+            const float* rb = gdn_small_[(size_t)l].wb.data() + (size_t)hh * H;
             float sa = 0, sb = 0;
             for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
             ah[(size_t)hh] = sa;
@@ -1564,7 +1576,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         // recurrent gated delta rule + scale-free gated RMSNorm
         float* rs = rec_state_[l].data();
         for (int hh = 0; hh < NVH; hh++) {
-            const float eg = expf(lin_ssm_a_[hh] * softplus_f(ah[(size_t)hh] + lin_dt_[hh]));
+            const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
             const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
             float* sh = rs + (size_t)hh * KHD * VHD;
             const float* kh = &kl[(size_t)hh * KHD];
@@ -1591,7 +1603,7 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
             for (int vd = 0; vd < VHD; vd++) {
                 const float zz = z[(size_t)hh * VHD + vd];
-                crow[vd] = crow[vd] * inv * lin_norm_w_[vd] * (zz / (1.0f + expf(-zz)));
+                crow[vd] = crow[vd] * inv * gdn_small_[(size_t)l].norm[vd] * (zz / (1.0f + expf(-zz)));
             }
         }
         if (dump_gb && l == 0 && m < 2) {

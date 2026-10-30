@@ -449,7 +449,14 @@ dispatches. Measured on the file itself, the host figure is right and the cause 
 **The section above's "76 % device" is a two-forward number compared against a one-forward pass.**
 1,353.5 ms is exactly two forwards of 676.8 ms, which is the same two-forwards reading that
 [#572's comment (b)](https://github.com/1bit-MONSTER/engine/issues/572) retracted; it survived here in the
-table. Per forward the device leg is 37.7 %, and #572's 41.9 % was the closer figure.
+table. Per forward the device leg is 37.7 %, and #572's 41.9 % was the closer figure. The bundle's own
+counts carry the same two-pass structure: 5,134 dispatches, and 334 dispatches of
+`ggml_mul_mat_f32_f32_wmma` where the phase profiler sees one pass of 2,566 dispatches per forward.
+
+The 676.8 ms above and the 618.6 ms below are the same device leg from two runs, and that 9 % is the
+profiler: kernel times come from a run with `HRX_PROFILE_FILE` set, and writing that bundle on the dispatch
+path inflates it relative to the `replay.wait` the unprofiled run times. The same sign and a similar size
+show up on the two control models below (2 % and 7 %).
 
 The host leg is real, and it is **not** the HRX backend: a graph compute on this model is 618.6 ms of
 `replay.wait` with the graph-program lookup, binding, cache key, transient lease, host-staging rebind,
@@ -467,15 +474,19 @@ shares - `hrx_dp_mm_q8_0_m128_w8_f2` 52.2 + 91.6 ms, `ggml_mul_mat_f32_f32_wmma`
 **What that CPU work is: one GET_ROWS, declined by a size cap.** `llama-server -lv 4` on the same file
 prints the placement of the prefill graph — `placement: 6060 nodes, 1 off HRX (GET_ROWS x 1), 3 graph
 splits`. One node, on the CPU, and it is the whole ~1.18 s. It reads
-`per_layer_token_embd.weight`, which this file carries as `IQ3_S [160, 320001536]` (~20 GB of table), and
-`dispatch_registration/common/dispatch-get-rows.cpp` declines it at
+`per_layer_token_embd.weight`, which this file carries as `IQ4_NL [160, 320001536]` - 18 bytes per 32
+values, so 28.80 GB of table (26.8 GiB), against `token_embd.weight`'s ordinary `Q8_0 [2560, 248320]` -
+and `dispatch_registration/common/dispatch-get-rows.cpp` declines it at
 `is_supported_row_count()`: `kMaxGetRowsRowCount` is 262,208, the table has 320,001,536 rows. A gather of
-512 rows out of a 20 GB table costs the page faults of touching it — and it grew with the token count
+512 rows out of a 28.8 GB table costs the page faults of touching it - and it grew with the token count
 (35 ms at `-p 128`, ~1.18 s at `-p 512`) because more rows means more of the table.
 
 That is the "GET_ROWS fallback" line in #572's own list, and it is the item to fix: either raise
-`kMaxGetRowsRowCount` for a table this shape or give the gather a dispatch that does not walk 20 GB on the
-host.
+`kMaxGetRowsRowCount` for a table this shape or give the gather a dispatch that does not walk 28.8 GB on the
+host. The cap mirrors a promise in the kernel rather than being arbitrary:
+`kernel-corpus/kernels/loom-libs/ops/get_rows_f32.loom` assumes `range(%token, 0, 262207)` on the row
+index, so raising the matcher's cap alone would read out of range until that bound becomes a compile-time
+config.
 
 **The controls.** A model whose graph has no off-HRX node shows no host leg at all, which is how the two
 legs are told apart:

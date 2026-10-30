@@ -23,10 +23,22 @@
 //                                    lane (docs/npu.md); for checks and benchmarks.
 //   1bit moe-cache [options]         replays an expert trace through the MoE expert
 //                                    cache against the model file (docs/moe-streaming.md).
+//   1bit ort-info                    the ONNX Runtime this binary links (pin, API version,
+//                                    built-in EPs and the device roster it can register),
+//                                    -DONEBIT_ORT builds (docs/onnx.md).
+//   1bit ort-run <model.onnx>        run a plain ONNX model through ORT with our plugin EP first
+//                                    and the CPU EP last (docs/onnx.md, "Qwen3-0.6B").
 //   1bit <command> [options]         a command a private NPU add-on registered
 //                                    (-DONEBIT_NPU_PRIVATE builds; docs/npu.md).
 //
 // See docs/PORTING.md for what lands next.
+
+#ifdef ONEBIT_ORT
+// onnx/ort_info.cpp: prints the ORT build we link and the EP roster, then exits.
+int onebit_ort_info_main(int argc, char** argv);
+// onnx/ort_run.cpp: a plain ONNX model through ORT with the plugin EP registered first.
+int onebit_ort_run_main(int argc, char** argv);
+#endif
 
 #ifdef ONEBIT_NPU
 #include "forward_serve.h"
@@ -77,6 +89,10 @@ void usage(FILE* out) {
 #endif
 #ifdef ONEBIT_MOE
                  "  moe-cache [options]         replay an expert trace through the MoE expert cache\n"
+#endif
+#ifdef ONEBIT_ORT
+                 "  ort-info                    the ONNX Runtime this binary links (pin, EP roster)\n"
+                 "  ort-run <model.onnx>        a plain ONNX model through ORT, our EP before the CPU\n"
 #endif
                  "  version                     print the version\n"
                  "  help                        show this help\n");
@@ -272,6 +288,14 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "1bit moe-cache: %s\n", e.what());
             return 1;
         }
+    }
+#endif
+#ifdef ONEBIT_ORT
+    if (cmd == "ort-info") {
+        return onebit_ort_info_main(argc - 1, argv + 1);
+    }
+    if (cmd == "ort-run") {
+        return onebit_ort_run_main(argc - 1, argv + 1);
     }
 #endif
     if (cmd == "version" || cmd == "--version") {

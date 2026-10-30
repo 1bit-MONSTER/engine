@@ -33,6 +33,7 @@
 #include "forward_serve.h"
 
 #include "../npu/forward/include/q4nx_forward.h"
+#include "npu_device_lock.h"
 #include "npu_grammar.h"
 #include "npu_sampling.h"
 #include "tokenizer.h"
@@ -48,8 +49,6 @@
 #include <cstdio>
 #include <cstdlib>
 #include <filesystem>
-#include <fcntl.h>
-#include <sys/file.h>
 #include <fstream>
 #include <mutex>
 #include <random>
@@ -66,6 +65,7 @@ using json = nlohmann::json;
 
 struct ForwardEngine {
     std::string id;
+    int lock_fd = -1;  // app/npu_device_lock.h: the device lock, held for the process's life
     std::unique_ptr<npu::Tokenizer> tok;
     int  bos_id  = -1;     // config.json bos_token_id (the chat template may open with it)
     bool add_bos = false;  // config.json add_bos_token: the rendered chat prompt needs BOS
@@ -352,7 +352,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
 
 int run_forward_serve(int argc, char** argv) {
     std::string model, kernels, host = "127.0.0.1", alias;
-    int port = 8000;
+    int port = 8000, streams = 1;
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -364,9 +364,14 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "-p" || a == "--port") port = std::stoi(next());
         else if (a == "--host") host = next();
         else if (a == "--alias") alias = next();
+        else if (a == "--npu-streams") streams = std::stoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
-    if (model.empty()) throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT]");
+    if (model.empty())
+        throw std::runtime_error("usage: 1bit forward-serve -m <model.q4nx> --kernels <dir> [-p PORT] [--npu-streams N]");
+    if (streams < 1 || streams > kNpuMaxStreams)
+        throw std::runtime_error("--npu-streams takes 1.." + std::to_string(kNpuMaxStreams) +
+                                 " (the device's hwctx limit), not " + std::to_string(streams));
     if (!std::filesystem::exists(model)) throw std::runtime_error(model + " does not exist");
 
     const std::string dir = std::filesystem::path(model).parent_path().string();
@@ -386,29 +391,16 @@ int run_forward_serve(int argc, char** argv) {
 
     e.fwd = std::make_unique<Q4nxNpuForward>();
 
-    // Serialise NPU access across processes.  The device exposes a single hardware
-    // context, so a second concurrent `1bit serve --device npu` fails inside
-    // the device rejects the context request with EINVAL and the whole serve exits 1 --
-    // which is what happened when several models were served at once.  The
-    // per-process ELF runner (npu_engine_universal) has always taken this lock;
-    // the serve route did not, so it could not be serialised against it or
-    // against a sibling serve.  Held for the life of the process (fd not closed),
-    // exactly like the runner.
-    if (!std::getenv("NPU_NO_DEVICE_LOCK")) {
-        // flock needs only a read fd, so the file stays 0644 and other users can
-        // still open it; O_NOFOLLOW refuses a symlink planted in /tmp.
-        const char* lk = "/tmp/1bit-npu-device.lock";
-        int lfd = ::open(lk, O_CREAT | O_RDONLY | O_NOFOLLOW | O_CLOEXEC, 0644);
-        if (lfd >= 0) {
-            if (::flock(lfd, LOCK_EX | LOCK_NB) != 0) {
-                std::fprintf(stderr, "[npu] waiting for the exclusive device lock (%s)...\n", lk);
-                if (::flock(lfd, LOCK_EX) != 0)
-                    std::fprintf(stderr, "[npu] device lock unavailable; continuing unlocked\n");
-                else
-                    std::fprintf(stderr, "[npu] device lock acquired\n");
-            }
-        }
-    }
+    // Who may have the NPU (app/npu_device_lock.h): one process by default, N when the
+    // operator asks with --npu-streams. It is a policy, not a hardware limit -- the
+    // driver's npu4 sets hwctx_limit = 16 -- and the default stays exclusive because a
+    // second stream takes the same DMA engine and its own copy of the weights: two
+    // engines on two models measured 34.1 % / 70.4 % of solo, 0.41x aggregate
+    // (docs/npu.md "Two streams on one NPU").
+    // Held for the life of the process (fd not closed), exactly like the per-process
+    // ELF runner (npu_engine_universal), which takes the same exclusive lock.
+    if (!std::getenv("NPU_NO_DEVICE_LOCK"))
+        e.lock_fd = take_npu_device_lock(streams);
 
     // Offline mode (npu/forward/include/q4nx_forward.h, init_host): with
     // NPU_INFER_HOST_GEMM=1 the forward runs the model with host GEMMs and never opens
@@ -456,8 +448,10 @@ int run_forward_serve(int argc, char** argv) {
     } stop{srv, listener};
 
     ready = true;
-    std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)\n",
-                 e.id.c_str(), host.c_str(), port, e.fwd->backend().c_str());
+    std::fprintf(stderr, "1bit forward-serve: %s ready on http://%s:%d (%s)", e.id.c_str(), host.c_str(), port,
+                 e.fwd->backend().c_str());
+    if (streams > 1) std::fprintf(stderr, " [npu-streams=%d]", streams);
+    std::fprintf(stderr, "\n");
 
     while (true) std::this_thread::sleep_for(std::chrono::seconds(3600));
     return 0;

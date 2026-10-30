@@ -240,12 +240,12 @@ def ask(port, prompt, max_tokens, timeout):
 def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
     """Start `1bit serve` once, run the three prompts, return (tps per prompt, texts)."""
     port = free_port()
-    # -lv 4: ggml-hrx's placement report rides the library INFO level, which llama-server drops below it.
-    cmd = [onebit, "serve", "-m", str(model), "--port", str(port), "-lv", "4"] + args
+    cmd = [onebit, "serve", "-m", str(model), "--port", str(port)] + args
     # GGML_HRX_STRICT=0: on this pin the MTP draft graph has one node (the head's PAD) off HRX, and
     # strict placement aborts the server on it -- the engine's own hardware gate runs its server the
-    # same way (scripts/hw-gate.sh), counting placement instead of aborting. The counts are recorded
-    # in the report. GGML_HRX_REPORT=2 is what makes them visible.
+    # same way (scripts/hw-gate.sh), counting placement instead of aborting. GGML_HRX_REPORT=2 asks
+    # ggml-hrx for the counts; `1bit serve` exposes no `-lv` passthrough, so they only surface when
+    # its own verbosity reaches the library's INFO level, and `placement` stays null otherwise.
     run_env = dict(os.environ, GGML_HRX_STRICT="0", GGML_HRX_REPORT="2")
     logtext = (out_dir / "serve.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(cmd, env=run_env, stdout=logtext, stderr=subprocess.STDOUT,

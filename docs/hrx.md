@@ -488,6 +488,36 @@ host. The cap mirrors a promise in the kernel rather than being arbitrary:
 index, so raising the matcher's cap alone would read out of range until that bound becomes a compile-time
 config.
 
+**The forward on a roofline.** Weights and shapes come from the GGUF tensor directory itself, FLOPs from
+TraceLens's `PerfModel` (`GEMM`/`flash_attention`), peaks from the measured Radeon 8060S spec TraceLens
+keeps for gfx1151 (256 GB/s, 59.39 TFLOP/s fp16, 118.78 TFLOP/s int4), and measured device time per class
+from the dispatch bundle of the same model (`~/lb/i572/roofline_fn.py`). At 512 tokens every one of the 512
+experts is touched (512 x 10 picks, E[untouched] = 0.02), so the expert weights are compulsory traffic,
+while the 28.8 GB PLE table is only gathered (one 90-byte row per token per layer) and is not streamed:
+
+| class | weights GB | touched GB | FLOPs T | mem roof ms | compute roof ms | measured ms |
+|---|---:|---:|---:|---:|---:|---:|
+| MoE experts | 59.52 | 59.52 | 2.416 | **232.5** | 20.3 | 306.1 |
+| gated-delta-net layers (36) | 2.25 | 2.25 | 2.126 | 8.8 | 35.8 | 33.7 |
+| token embedding + LM head | 1.20 | 1.20 | 0.651 | 4.7 | 11.0 | (in dense) |
+| full-attention layers (12) | 1.02 | 1.02 | 0.671 | 4.0 | 11.3 | (in dense) |
+| MoE shared expert + router | 0.50 | 0.50 | 0.306 | 2.0 | 5.2 | (in dense) |
+| hyper-connections | 0.34 | 0.34 | 0.644 | 1.3 | 10.8 | 35.1 |
+| PLE table | 28.80 | 0.002 | 0 | 0.0 | 0.0 | 0.5 |
+| **total** | **93.67** | **64.87** | **6.81** | **253** | 115 | **676.8** |
+
+The forward is memory-bound with 2.2x the compute roof, and the device leg runs at **37 % of its own
+compulsory-traffic roof — 2.7x the floor**. The MoE expert GEMMs are the class that is close to it (306 ms
+against a 232 ms floor, 76 %); the slack is elsewhere: 1,189 elementwise/copy/norm dispatches cost 106.6 ms
+for no weight traffic at all (~90 us each, dispatch-bound), the f32 small matmuls cost 58.4 ms over 273
+dispatches, and the dense projection GEMMs 136.3 ms over 395.
+
+Against that, the host leg is not a rounding error but the largest single line in the forward: the one CPU
+`GET_ROWS` costs ~1,177 ms, **4.6x the memory roof of the whole forward**, to move 2.2 MB of gathered rows
+— it is page faults on a cold 28.8 GB mmap'd table, not arithmetic, which is why it does not improve from
+one forward to the next (1,788.6 then 1,802.1 ms) while the device-side `get_rows` dispatches cost 0.5 ms.
+Give that gather a dispatch and the forward is ~620 ms of device, i.e. ~2.9x pp512 on this file.
+
 **The controls.** A model whose graph has no off-HRX node shows no host leg at all, which is how the two
 legs are told apart:
 

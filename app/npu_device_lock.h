@@ -34,7 +34,6 @@
 
 #include <cerrno>
 #include <cstdio>
-#include <cstdlib>
 #include <cstring>
 #include <fcntl.h>
 #include <sys/file.h>
@@ -42,15 +41,10 @@
 
 namespace onebit {
 
-// The path the NPU runner and every `1bit` NPU process serialise on.
-// ONEBIT_NPU_DEVICE_LOCK points the engine at another lock file (a second box, a test);
-// anything else that must interlock with it has to be told the same path.
+// The path the NPU runner and every `1bit` NPU process serialise on. A fixed path, not an
+// environment variable: flock(2) interlocking only works if everyone names the same file, and a
+// settable lock path is one more thing an operator can point somewhere unsafe (CodeQL cpp/path-injection).
 inline constexpr const char* kNpuDeviceLock = "/tmp/1bit-npu-device.lock";
-
-inline const char* npu_device_lock_path() {
-    const char* env = std::getenv("ONEBIT_NPU_DEVICE_LOCK");
-    return env && *env ? env : kNpuDeviceLock;
-}
 
 // How many hardware contexts the device advertises (npu4_regs.c hwctx_limit), which
 // is the ceiling --npu-streams may ask for. Past it the driver refuses the context
@@ -68,8 +62,7 @@ inline NpuLockMode npu_lock_mode_for(int streams) {
 // process (closing it, or exiting, releases the lock). Returns -1 when the lock
 // could not be taken: the caller keeps running unlocked, as it always has.
 // wait = false is for a caller that wants to know rather than queue (and the test).
-inline int take_npu_device_lock(int streams, const char* path = nullptr, bool wait = true) {
-    if (!path) path = npu_device_lock_path();
+inline int take_npu_device_lock(int streams, const char* path = kNpuDeviceLock, bool wait = true) {
     const bool shared = npu_lock_mode_for(streams) == NpuLockMode::Shared;
     const int op = shared ? LOCK_SH : LOCK_EX;
     // flock needs only a read fd, so the file stays 0644 and other users can still

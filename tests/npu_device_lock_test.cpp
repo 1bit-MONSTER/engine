@@ -68,15 +68,7 @@ int main() {
     expect(ex >= 0, "exclusive takes the device once every stream is gone");
     ::close(ex);
 
-    // ONEBIT_NPU_DEVICE_LOCK moves the file the engine takes by default (a second box, a test).
-    const std::string env_path = dir + "/from-env.lock";
-    ::setenv("ONEBIT_NPU_DEVICE_LOCK", env_path.c_str(), 1);
-    int envfd = onebit::take_npu_device_lock(1, nullptr, false);
-    expect(envfd >= 0, "ONEBIT_NPU_DEVICE_LOCK picks the lock file");
-    expect(::access(env_path.c_str(), F_OK) == 0, "the env-named lock file was created");
-    ::close(envfd);
-    ::unsetenv("ONEBIT_NPU_DEVICE_LOCK");
-    ::unlink(env_path.c_str());
+    expect(std::string(onebit::kNpuDeviceLock) == "/tmp/1bit-npu-device.lock", "the lock path is the fixed one");
 
     // No lock file is not a crash: the caller keeps running unlocked.
     expect(onebit::take_npu_device_lock(1, "/nonexistent-dir/npu.lock", false) < 0, "a missing lock file is -1");

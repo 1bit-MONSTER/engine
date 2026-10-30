@@ -34,8 +34,7 @@ PORT_B=${PORT_B:-18762}
 TOKS=${TOKS:-8}
 REPEATS=${REPEATS:-3}
 WAIT_MIN=${WAIT_MIN:-240}
-LOCK=${LOCK:-/tmp/1bit-npu-device.lock}
-export ONEBIT_NPU_DEVICE_LOCK=$LOCK   # the binary takes the same file this script waits on
+LOCK=/tmp/1bit-npu-device.lock
 TAG=$(date -u +%Y%m%dT%H%M%SZ)
 OUT=$HOME/lb/612-npu-streams-$TAG
 mkdir -p "$OUT" || exit 1

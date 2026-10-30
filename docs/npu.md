@@ -232,6 +232,45 @@ $ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France i
 {"choices":[{"finish_reason":"length","index":0,"text":" Paris"},...]}
 ```
 
+### Two streams on one NPU
+
+One process owns the NPU by default: it takes an exclusive `flock` on
+`/tmp/1bit-npu-device.lock` for its lifetime (`app/npu_device_lock.h`), so a second serve of the
+NPU route waits instead of contending. That is a policy, not a hardware limit -- the driver
+advertises 16 hardware contexts on this part (`hwctx_limit = 16`, `drivers/accel/amdxdna/npu4_regs.c`)
+and only refuses the 17th -- and the policy stays the default because a second stream buys much less
+than 2x:
+
+- **The DMA engine is shared.** Decode reads the model's int8 weights once per token (~24.3 GB at
+  ~2.2 GB/s effective on the 27B, [engine#587](https://github.com/1bit-MONSTER/engine/issues/587));
+  two streams split that bandwidth instead of doubling it.
+- **The weights are not shared.** Each stream packs its own copy of every layer's weight BO from the
+  model file, plus its own KV cache and scratch, so N streams cost N x the model's device footprint.
+  The NPU's memory is the box's own LPDDR5X, the same pool the CPU and the iGPU draw from, so two
+  27B streams do not fit.
+
+With that said, two streams do run, and the option is what says you meant it:
+
+```
+# stream 1 of 2, then stream 2 of 2, in two shells (different ports, same model)
+./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8000
+./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8001
+```
+
+`--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
+N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
+unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
+still keeps them all out, in either order, because they share one file and one `flock(2)`. It is
+advisory: a process that does not take the lock is not serialised against, which is what
+`NPU_NO_DEVICE_LOCK=1` does (an unsupported escape hatch, not a mode).
+
+What it measures, on Qwen3-0.6B-Q4_K_M (`max_tokens 8`, `temperature 0`, three reps, rep 1 dropped
+as warm-up, engine `a88ef00`, 2026-10-29): solo **6.31 / 6.23 s**, concurrent **9.51 / 9.51 s** --
+**65.7 % of solo per stream, 1.31x aggregate**. So it is worth it for two interactive sessions of a
+model small enough that two copies fit, and not for throughput. `tests/npu_device_lock_test.cpp`
+(ctest `npu_device_lock`, in CI) proves the lock discipline without a device: exclusive excludes
+everything, three shared streams co-exist, and an exclusive waits for the last one to go.
+
 ## Add-on routes
 
 The engine keeps a hook for closed-source NPU add-ons (`npu/private_route.h`). Qwen3.6-35B-A3B

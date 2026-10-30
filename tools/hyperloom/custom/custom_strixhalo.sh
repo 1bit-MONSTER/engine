@@ -43,4 +43,9 @@ if [ ! -x "$GPU_HOLD" ]; then
   exit 1
 fi
 
+# The HRX backend reaches its HSA runtime through IREE's loader, which has to be told where that
+# library is: without this the backend registers no device at all ("Available devices: (none)").
+LIBHSA=${HL_LIBHSA:-/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1}
+export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-$LIBHSA}
+
 exec "$GPU_HOLD" -l hyperloom -t "$HOLD_MIN" -- python3 "$HERE/benchmark.py"

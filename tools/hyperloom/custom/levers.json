@@ -1,4 +1,5 @@
 [
+  {"name": "mtp_off", "extra_envs": {"HL_MTP_MAX": "0"}},
   {"name": "ub1024", "extra_envs": {"HL_UB": "1024"}},
   {"name": "ub2048", "extra_envs": {"HL_UB": "2048"}},
   {"name": "b2048", "extra_envs": {"HL_B": "2048"}},

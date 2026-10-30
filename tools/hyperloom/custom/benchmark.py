@@ -123,17 +123,26 @@ def batch_args():
 
 
 def serve_lever_args():
-    """The levers that only `1bit serve` has: drafting and slots."""
+    """The levers that only `1bit serve` has: drafting and slots.
+
+    A GGUF that carries its own MTP head drafts with it on HRX **by default** (`1bit serve` says
+    so at startup), so `HL_MTP_MAX` is relative to that: unset keeps serve's own default, `0` turns
+    drafting off with `--no-mtp`, and N>0 caps the draft length at N. `HL_MTP_HEAD` names an
+    external head to draft with instead.
+    """
     args = batch_args()
     dflash = env("HL_DFLASH")
-    mtp_max = env_int("HL_MTP_MAX", 0)
+    mtp_max_raw = env("HL_MTP_MAX")
     if dflash and dflash not in ("0", "off", "false"):
         args += ["--dflash", env("HL_DFLASH_GGUF", "dflash.gguf")]
-        if mtp_max:
+    elif mtp_max_raw:
+        mtp_max = env_int("HL_MTP_MAX", 0)
+        if mtp_max <= 0:
+            args += ["--no-mtp"]
+        else:
+            if env("HL_MTP_HEAD"):
+                args += ["--mtp", env("HL_MTP_HEAD")]
             args += ["--mtp-max", str(mtp_max)]
-    elif mtp_max > 0:
-        # `--mtp` without `--mtp-max` drafts 3 tokens (llama-server's own default).
-        args += ["--mtp", env("HL_MTP_HEAD", "mtp.gguf"), "--mtp-max", str(mtp_max)]
     parallel = env_int("HL_PARALLEL", 0)
     if parallel:
         args += ["--parallel", str(parallel)]
@@ -231,9 +240,16 @@ def ask(port, prompt, max_tokens, timeout):
 def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
     """Start `1bit serve` once, run the three prompts, return (tps per prompt, texts)."""
     port = free_port()
-    cmd = [onebit, "serve", "-m", str(model), "--port", str(port)] + args
+    # -lv 4: ggml-hrx's placement report rides the library INFO level, which llama-server drops below it.
+    cmd = [onebit, "serve", "-m", str(model), "--port", str(port), "-lv", "4"] + args
+    # GGML_HRX_STRICT=0: on this pin the MTP draft graph has one node (the head's PAD) off HRX, and
+    # strict placement aborts the server on it -- the engine's own hardware gate runs its server the
+    # same way (scripts/hw-gate.sh), counting placement instead of aborting. The counts are recorded
+    # in the report. GGML_HRX_REPORT=2 is what makes them visible.
+    run_env = dict(os.environ, GGML_HRX_STRICT="0", GGML_HRX_REPORT="2")
     logtext = (out_dir / "serve.log").open("w", encoding="utf-8")
-    proc = subprocess.Popen(cmd, stdout=logtext, stderr=subprocess.STDOUT, stdin=subprocess.DEVNULL)
+    proc = subprocess.Popen(cmd, env=run_env, stdout=logtext, stderr=subprocess.STDOUT,
+                            stdin=subprocess.DEVNULL)
     tps, texts = {}, {}
     try:
         if not wait_healthy(port, proc, time.time() + timeout / 2):
@@ -254,7 +270,24 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
             proc.kill()
             proc.wait()
         logtext.close()
-    return tps, texts
+    return tps, texts, placement_summary(out_dir / "serve.log")
+
+
+PLACEMENT_RE = re.compile(r"placement: (\d+) nodes, (\d+) off HRX")
+
+
+def placement_summary(path):
+    """What the placement report saw, so the report says whether a graph left HRX."""
+    try:
+        text = path.read_text(encoding="utf-8", errors="replace")
+    except OSError:
+        return None
+    hits = [(int(n), int(off)) for n, off in PLACEMENT_RE.findall(text)]
+    if not hits:
+        return None
+    nodes, off = hits[-1]
+    return {"graphs_reported": len(hits), "nodes": nodes, "off_hrx": off,
+            "worst_graph_off_hrx": max((o for _, o in hits), default=0)}
 
 
 KLD_MEAN_RE = re.compile(r"^Mean\s+KLD\s*:\s*([-+0-9.eE]+)", re.M)
@@ -337,11 +370,12 @@ def main():
 
     # 2. serve: the decode-side legs and the greedy texts the gate compares.
     try:
-        tps, texts = serve_measure(onebit, model, serve_lever_args(), reps, tokens,
-                                   min(600, deadline - time.time()), out_dir)
+        tps, texts, placement = serve_measure(onebit, model, serve_lever_args(), reps, tokens,
+                                              min(600, deadline - time.time()), out_dir)
     except (RuntimeError, OSError) as exc:
         return finish(False, f"serve leg failed: {exc}", rc=1)
     result["bench_summary"]["serve_tok_s"] = {k: round(v, 2) for k, v in tps.items()}
+    result["bench_summary"]["placement"] = placement
     result["total_token_throughput"] = round(tps["code"], 2)
     result["request_throughput"] = round(tps["code"] / tokens, 4)
 

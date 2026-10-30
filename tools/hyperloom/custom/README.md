@@ -56,6 +56,9 @@ plus `hl_cli_login.py` and a `launch.sh` wrapper) is gone: upstream now knows th
   `llama_hrx` ExternalProject target writes. `HL_BIN` / `HL_ONEBIT` override those two paths.
 * The weights plus a drafting sidecar (optional but the levers that use them need them):
   the model under `--model`, `HL_MTP_HEAD` (default `<...>/MTP/mtp-*.gguf`) and `HL_DFLASH_GGUF`.
+* `IREE_HAL_AMDGPU_LIBHSA_PATH` pointing at the HSA runtime. The entrypoint defaults it to the
+TheRock's copy and `HL_LIBHSA` overrides it; without it the HRX backend registers **no device**
+("Available devices: (none)") and every leg fails.
 * `wiki.test.raw` for the KLD gate (`HL_WIKI`, default `~/models/qwen38/wikitext-2-raw/wiki.test.raw`).
 * A Hyperloom install (upstream, unpatched), `HYPERLOOM_BENCHMARK_BACKEND=bypass`, and Ray on a
   free port (`RAY_ADDRESS=127.0.0.1:6390`: 6379 is taken by a docker redis on this box).
@@ -73,7 +76,6 @@ $HOME/hyperloom-ws/.venv-2026-10-30/bin/python -m hyperloom optimize -v \
     --model "$MODEL" \
     --gpu-type radeon8060s --max-hours 4 \
     --extra-env HL_BUILD="$HOME/wt/hl-engine-build" \
-    --extra-env HL_MTP_HEAD="$HOME/models/qwen38/Qwen3.8-Flash-Next-GGUF/MTP/mtp-Qwen3.8-Flash-Next-shared-Q8_0.gguf" \
     --extra-env HL_DFLASH_GGUF="$HOME/models/qwen38/DFlash2/Qwen3.8-27B-DFlash2-q8_0.gguf"
 ```
 
@@ -126,7 +128,7 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 | `HL_B`, `HL_UB` | `-b`, `-ub` | batch / micro-batch, on both `llama-bench` and `serve` |
 | `HL_FA` | `-fa on\|off\|auto` | flash attention |
 | `HL_CTK`, `HL_CTV` | `-ctk`, `-ctv` | KV cache types (`f16`, `q8_0`, ...) |
-| `HL_MTP_MAX` | `--mtp <head> --mtp-max N` | `0` (default) = no drafting; draft length `N` |
+| `HL_MTP_MAX` | `--no-mtp` / `--mtp-max N` | A GGUF with its own MTP head drafts **by default** on HRX (`1bit serve` reports it); `0` turns drafting off, `N` caps the draft length, unset keeps serve's default (draft length 3 via its recipe). `HL_MTP_HEAD` names an external head instead. |
 | `HL_DFLASH` | `--dflash <drafter>` | block-diffusion drafter; exclusive with `--mtp` |
 | `HL_PARALLEL` | `--parallel N` | HRX runs one gated-delta-net sequence at a time, so this is expected flat on Qwen3.8 |
 | `GGML_HRX_*` | environment only | the knobs `docs/hrx.md` names (`Q8_PREFILL_RELAX`, `GRAPH_PROGRAM_CACHE`, ...) |

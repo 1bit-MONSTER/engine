@@ -35,7 +35,8 @@ Exit codes (the alert contract):
   0  no uncovered class among the newest models that warrants an alert, and no new
      FastFlowLM repo whose family this engine cannot serve
   1  an uncovered class arrived (the alert), or a new FastFlowLM repo arrived whose
-     architecture `registry/architectures.json` does not map — either one is enough
+     architecture `registry/architectures.json` does not map, or a new one arrived that
+     publishes a Q4NX pack for a family the NPU route does not serve — any one is enough
   2  runtime failure (no network, unreadable registry, an unreadable FastFlowLM
      listing or releases page, ...)
 
@@ -508,9 +509,32 @@ def flm_repo(record, archs):
     }
 
 
+def class_unmapped(repo):
+    """True when `registry/architectures.json` does not map the repo's architecture class."""
+    return not repo["derivative"] and not repo["mapped"]
+
+
 def unmapped(repo):
-    """True when a repo publishes a family this engine cannot serve (the FLM alert)."""
-    return not repo["mapped"] and not repo["derivative"]
+    """True when a repo publishes a family this engine cannot serve (the FLM alert).
+
+    Two ways that happens, and the second is the one the org's `*-NPU2` packs hit: the
+    class is not in the registry at all, or it is there only for a backend that cannot run
+    a Q4NX pack. FastFlowLM publishes NPU packs, so `qwen35`/`gemma4`/`dflash` — mapped to
+    `hrx` alone — read as mapped and served while the NPU route cannot load them at all
+    (the 2026-10 D3-* family, Nemotron-3.5-Bolt-E4B and its DFlash drafter arrived that
+    way, printed as `+ FLM ... npu route: no` and never alerted).
+    """
+    return class_unmapped(repo) or npu_gap(repo)
+
+
+def npu_gap(repo):
+    """True when the repo is a Q4NX (NPU) pack whose family the NPU route does not serve.
+
+    A repo with no `*.q4nx` file is not an NPU pack (a README-only or audio/vision-only
+    drop), and a config-less drop is a derivative of somebody else's model, so neither is
+    a coverage gap of ours.
+    """
+    return bool(repo["q4nx"]) and repo["mapped"] and not repo["npu"] and not repo["derivative"]
 
 
 def repo_detail_url(repo_id):
@@ -623,7 +647,7 @@ def flm_line(repo):
         parts.append("registry: none")
     if repo["derivative"]:
         parts.append("derivative drop (no config by design)")
-    marker = "!! NEW FLM" if unmapped(repo) else "+ FLM"
+    marker = "!! NPU FLM" if npu_gap(repo) else ("!! NEW FLM" if unmapped(repo) else "+ FLM")
     return f"{marker} {repo['id']}  ({repo['lastModified'][:10]})  " + "  ".join(parts)
 
 
@@ -635,10 +659,18 @@ def release_line(release):
 
 
 def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
-    """Print the FastFlowLM delta and return its exit code (1 on an unmapped family)."""
+    """Print the FastFlowLM delta and return its exit code (1 on an unserved family)."""
     shown_repos = repos if full else fresh_repos
     shown_releases = releases if full else fresh_releases
-    unmapped_repos = [repo["id"] for repo in shown_repos if unmapped(repo)]
+    unmapped_repos = [repo["id"] for repo in shown_repos if class_unmapped(repo)]
+    # Split the two reasons in the summary: "map the class" and "give the NPU route this
+    # family" are different pieces of work, and a Q4NX pack named for an HRX-only family
+    # is the second one.
+    gaps = {}
+    for repo in shown_repos:
+        if npu_gap(repo):
+            family = repo["registry_gguf"] or repo["registry_class"] or repo["architecture"]
+            gaps.setdefault(family, []).append(repo["id"])
     flagged = [r["tag"] for r in shown_releases if r["kernel_format"]]
     print(f"census-watch: FLM watch ({FLM_AUTHOR}): {len(repos)} repo(s), "
           f"{len(releases)} release(s) checked; {len(fresh_repos)} new/changed repo(s), "
@@ -651,12 +683,18 @@ def report_flm(repos, releases, fresh_repos, fresh_releases, full=False):
         print("census-watch: FLM: nothing new since the last run")
     if unmapped_repos:
         print(f"  -> {len(unmapped_repos)} FastFlowLM repo(s) publish a family this engine does "
-              f"not map: {', '.join(unmapped_repos)}")
+              f"not serve: {', '.join(unmapped_repos)}")
+    if gaps:
+        detail = "; ".join(f"{family} ({len(ids)} pack(s))" for family, ids in sorted(gaps.items()))
+        print(f"  -> {sum(len(i) for i in gaps.values())} Q4NX (NPU) pack(s) for a family the NPU "
+              f"route does not serve: {detail}")
+        print("     mapped for another backend only, so the census counts the family as covered: "
+              "the NPU route (or a recorded decision that it will not serve it) is what is missing")
     if flagged:
         print(f"  -> release(s) {', '.join(flagged)} name the Q4NX container format "
               f"({', '.join(KERNEL_FORMAT_MARKERS)}): read the notes before the pinned "
               f"npu/q4nx decoder moves")
-    return 1 if unmapped_repos else 0
+    return 1 if (unmapped_repos or gaps) else 0
 
 
 def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None):

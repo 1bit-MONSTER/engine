@@ -46,6 +46,7 @@ ARCHS = {
     "EmptyForCausalLM": {"gguf": "empty", "backends": []},
 }
 SIG = {"Qwen3_5MVLAAbsorbedForCausalLM": {"model_type": "qwen3_5_text", "family": "Qwen3.5 MVLA"}}
+FLM_LINE_PREFIXES = ("  + FLM FastFlowLM/", "  !! NEW FLM ", "  !! NPU FLM ")
 
 failures = []
 
@@ -378,6 +379,16 @@ check("flm org: an unmapped architecture is unmapped, not a guess",
 gguf = by_id["FastFlowLM/Qwen3.5-0.8B-gguf"]
 check("flm org: a config-less gguf drop is a derivative, not a new family",
       gguf["derivative"] and not cw.unmapped(gguf) and not gguf["mapped"])
+# The NPU-pack case (2026-10): a Q4NX pack whose family IS mapped, but only for a backend
+# that cannot run a Q4NX directory. D3-Mini is `qwen3_5_text` -> qwen35 -> hrx in the live
+# registry, and it ships model.q4nx + vision_weight.q4nx, so the NPU route cannot serve it.
+check("flm org: a Q4NX pack for an HRX-only family is an NPU gap",
+      d3["mapped"] and d3["q4nx"] and not d3["npu"] and cw.npu_gap(d3) and cw.unmapped(d3))
+check("flm org: a family the NPU route serves is not a gap",
+      not cw.npu_gap(qp) and not cw.unmapped(qp) and not cw.npu_gap(llama))
+check("flm org: a derivative drop is not an NPU gap", not cw.npu_gap(gguf))
+check("flm org: a repo with no q4nx file is not an NPU gap",
+      not cw.npu_gap({"id": "x/y", "q4nx": [], "mapped": True, "npu": False, "derivative": False}))
 
 # 17. File sizes come from the repo detail, and only where they are still unknown.
 calls = []
@@ -409,13 +420,18 @@ check("flm first run: both watches ran", flm_ok)
 check("flm first run: an unmapped family alerts (exit 1)", flm_rc == 1)
 check("flm report: one line per repo",
       len([ln for ln in first.splitlines()
-           if ln.startswith(("  + FLM FastFlowLM/", "  !! NEW FLM "))]) == 5)
+           if ln.startswith(FLM_LINE_PREFIXES)]) == 5)
 check("flm report: the unknown family is marked !! NEW FLM",
       "  !! NEW FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in first)
 check("flm report: a mapped family is not marked",
       "  + FLM FastFlowLM/Qwen3-8B-NPU2" in first and "!! NEW FLM FastFlowLM/Qwen3-8B-NPU2" not in first)
 check("flm report: the derivative drop does not alert",
       "!! NEW FLM FastFlowLM/Qwen3.5-0.8B-gguf" not in first)
+check("flm report: an NPU pack for an HRX-only family is marked !! NPU FLM",
+      "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" in first)
+check("flm report: the NPU gap is summarised by family",
+      "Q4NX (NPU) pack(s) for a family the NPU route does not serve" in first
+      and "qwen35 (1 pack(s))" in first)
 check("flm report: sizes are named in GiB, one line each",
       "GiB" in first and "npu route: qwen3" in first and "registry: none" in first)
 check("flm report: releases are listed with their tags",
@@ -431,9 +447,9 @@ second = buf.getvalue()
 check("flm delta: a second run is quiet and green",
       quiet_ok and quiet_rc == 0 and "nothing new since the last run" in second)
 check("flm delta: no repo line on a quiet day",
-      "  + FLM FastFlowLM/" not in second and "  !! NEW FLM" not in second)
+      not any(p[:7] in second for p in FLM_LINE_PREFIXES))
 moved = [dict(r) for r in fixture("org.json")]
-moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"
+moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"   # D3-Mini: qwen35, Q4NX, no npu route
 moved_repos = cw.sweep_org(live_archs, fetch=lambda url: moved)
 fresh, fresh_rel = cw.flm_deltas(state, moved_repos, cw.sweep_releases(fetch=flm_fetch))
 check("flm delta: only the moved repo is new", [r["id"] for r in fresh] == [moved[0]["id"]])
@@ -441,15 +457,23 @@ check("flm delta: known releases are not new", fresh_rel == [])
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     moved_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel)
-check("flm delta: one relocated line, still green (mapped family)",
-      moved_rc == 0 and buf.getvalue().count("  + FLM ") == 1)
+check("flm delta: a moved NPU-gap pack alerts (it is the 2026-10 D3 case)",
+      moved_rc == 1 and "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" in buf.getvalue())
+served = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json"))
+fresh2 = [r for r in served if r["id"] == "FastFlowLM/Qwen3-8B-NPU2"]   # qwen3: served on the NPU
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    served_rc = cw.report_flm(served, cw.sweep_releases(fetch=flm_fetch), fresh2, [])
+check("flm delta: a moved family the NPU route serves stays green",
+      served_rc == 0 and buf.getvalue().count("  + FLM ") == 1
+      and "!! NPU FLM" not in buf.getvalue())
 
 # 20. `--full` prints every repo and release on demand.
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     full_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), [], [], full=True)
 full = buf.getvalue()
-check("flm --full: every repo listed", full.count("  + FLM FastFlowLM/") + full.count("  !! NEW FLM ") == 5)
+check("flm --full: every repo listed", sum(full.count(p) for p in FLM_LINE_PREFIXES) == 5)
 check("flm --full: every release listed", full.count("  + FLM RELEASE ") == 3)
 check("flm --full: an unmapped repo in the listing still alerts", full_rc == 1)
 state_path = os.path.join(STATE_DIR, "round-trip.json")

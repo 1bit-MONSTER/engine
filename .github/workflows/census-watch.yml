@@ -103,7 +103,7 @@ jobs:
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
           fi
-          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|kernel-format" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
+          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|kernel-format|Q4NX (NPU)" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           if [ $rc -eq 1 ]; then echo "alert=true" >> "$GITHUB_OUTPUT"; fi
           exit $rc
@@ -118,7 +118,7 @@ jobs:
     permissions:
       issues: write
     steps:
-      - name: Open an issue unless one is already open
+      - name: File it, or append it to the open alert
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
@@ -126,28 +126,45 @@ jobs:
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh label create census-watch --color B60205 --description "Daily new-model watcher alert" 2>/dev/null || true
-          open=$(gh issue list --label census-watch --state open --json number --jq 'length')
-          if [ "$open" -gt 0 ]; then
-            echo "a census-watch issue is already open: skipping"
-            exit 0
-          fi
+          # One issue at a time, but a *new* breach must never be swallowed by an issue that is
+          # already open - that is what happened on 2026-10-27: #619 stayed open, so
+          # FastFlowLM/LFM3-1.7B-NPU2 (10-28) and MiniCPM-V-4.7-35B-A3B-NPU2 (10-30) alerted
+          # every day in CI and were recorded nowhere. The marker is a digest of the alert
+          # lines: the same breach is a no-op, a changed one is one comment on the open issue.
+          marker="<!-- census-watch: $(printf '%s' "$LINES" | sha256sum | cut -d' ' -f1) -->"
           {
-            echo "## Census coverage breach"
+            echo "## Census coverage breach ($(date -u +%Y-%m-%d))"
             echo ""
             echo "The daily new-model watcher found Hugging Face models whose architecture class is not"
-            echo "mapped by the engine registry (\`registry/architectures.json\`), or a FastFlowLM"
-            echo "repo publishing a model family this engine does not map (engine #588):"
+            echo "mapped by the engine registry (\`registry/architectures.json\`), a FastFlowLM"
+            echo "repo publishing a model family this engine does not serve, or a Q4NX (NPU) pack for"
+            echo "a family only a non-NPU backend serves (engine #588):"
             echo ""
             echo '```'
             printf '%s' "$LINES" | base64 -d
             echo '```'
             echo ""
             echo "Fix: map the class in \`registry/architectures.json\` when a pinned backend's code really"
-            echo "accepts the architecture, or record why it is not an alias in \`registry/significant.json\`"
+            echo "accepts the architecture, or serve the family on the NPU route when the pack asks for"
+            echo "it, or record why it is not an alias in \`registry/significant.json\`"
             echo "and \`docs/arch-gaps.md\` (a class reviewed as significant needs real engine support, not a"
             echo "mapping). Re-run \`python3 tools/census_watch.py\` to confirm."
             echo ""
             echo "Run: $RUN_URL"
+            echo ""
+            echo "$marker"
           } > /tmp/census_issue.md
+          open=$(gh issue list --label census-watch --state open --json number --jq '.[0].number // ""')
+          if [ -n "$open" ]; then
+            seen=$(gh issue view "$open" --json body,comments \
+              --jq '[.body // ""] + [.comments[].body // ""] | join("\n")' | grep -cF "$marker" || true)
+            if [ "${seen:-0}" -gt 0 ]; then
+              echo "#${open} already carries this breach: nothing to do"
+              exit 0
+            fi
+            gh issue comment "$open" --body-file /tmp/census_issue.md
+            echo "appended this breach to #${open}"
+            exit 0
+          fi
           gh issue create --title "census: new HF model class uncovered by the registry" \
             --label census-watch --body-file /tmp/census_issue.md

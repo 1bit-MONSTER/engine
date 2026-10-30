@@ -435,50 +435,55 @@ carries two multi-second gaps after `ggml_get_rows_f32` that the timed pass does
 1,355 ms device + ~0.4 s host), so those are bundle-write or cold-start cost, not the steady-state
 host gap.
 
-#### The host gap in a prefill forward: absent on the models that fit ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
+#### Where a prefill forward's time goes, and the ~1.0 s that is not HRX ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
 
-A later reading of #572 holds that device time is 755.7 ms of the 1,786 ms pp512 pass (41.9 %) and that
-the other ~1.0 s per forward is host work between dispatches. That does not agree with the 1,355 ms of
-1,786 ms (76 %) recorded in the section above, and two instruments say the host leg is in fact ~0:
+#572 reads the 1,786 ms pp512 pass as 755.7 ms of device time (41.9 %) and ~1.0 s of host time between
+dispatches. Measured on the file itself, the host figure is right and the cause is not the HRX host path:
 
-`GGML_HRX_HOST_GAP=1` (llama.cpp #154) times the host path of every graph compute. Fully offloaded,
-`llama-bench -ngl 99 -fa 1 -ub 512 -p 512 -dev HRX0`, steady-state forward:
+    Qwen3.8-Flash-Next UD-IQ4_XS (87.3 GiB), -ngl 99 -fa 1 -ub 512 -p 512 -dev HRX0
+      llama-bench:                              1,795.4 ms/forward  = 285.2 tok/s
+      libhrx dispatch bundle, 2 forwards:       1,353.5 ms of device kernels = 676.8 ms/forward (37.7 %)
+      HRX graph computes, per forward:          618.6 ms in `replay.wait` (the kernels), 0.13 ms of host
+      => outside the HRX backend:               ~1,177 ms/forward, 66 % of the forward
+
+**The section above's "76 % device" is a two-forward number compared against a one-forward pass.**
+1,353.5 ms is exactly two forwards of 676.8 ms, which is the same two-forwards reading that
+[#572's comment (b)](https://github.com/1bit-MONSTER/engine/issues/572) retracted; it survived here in the
+table. Per forward the device leg is 37.7 %, and #572's 41.9 % was the closer figure.
+
+The host leg is real, and it is **not** the HRX backend: a graph compute on this model is 618.6 ms of
+`replay.wait` with the graph-program lookup, binding, cache key, transient lease, host-staging rebind,
+upload, launch, flush and download together under 0.13 ms. What costs the other ~1.18 s is llama.cpp-side
+work - the CPU computing graph nodes that the HRX backend did not take (this model's graph runs as two
+graph computes per forward, a 2,566-dispatch HRX one and a 1-dispatch one, so the rest is CPU-resident
+work in llama.cpp's own graph, not a gap between HRX dispatches).
+
+`GGML_HRX_HOST_GAP=1` (llama.cpp #154) is the profiler that separates those legs, and `HRX_PROFILE_FILE`
++ `HRX_PROFILE_MODE=dispatch`, read with `iree-profile statistics`, is the only device-time source: that
+bundle reports 5,134 dispatches and 1,353.522 ms of kernels for the two forwards above, and per-kernel
+shares - `hrx_dp_mm_q8_0_m128_w8_f2` 52.2 + 91.6 ms, `ggml_mul_mat_f32_f32_wmma` 334 dispatches for
+94.8 ms, `hrx_hc_pre_gated` 42.9 ms.
+
+**The controls.** A model whose graph has no off-HRX node shows no host leg at all, which is how the two
+legs are told apart:
 
 | model | forward | `graph.lookup` | `graph.bind` | `replay.upload` | `replay.flush` | `replay.wait` (device) |
 |---|---:|---:|---:|---:|---:|---:|
 | Qwen3-Coder-30B-A3B Q4_K_M, 1,161 dispatches | 263.5 ms | 0.004 ms | 0.002 ms | 0.005 ms | 0.001 ms | 263.46 ms |
 | Qwen3.8-27B UD-Q4_K_XL, 1,519 dispatches | 870.2 ms | 0.003 ms | 0.003 ms | 0.004 ms | 0.001 ms | 870.14 ms |
 
-libhrx's own dispatch profile (`HRX_PROFILE_FILE=<bundle> HRX_PROFILE_MODE=dispatch`, read back with
-`iree-profile statistics`) agrees on the same runs. It is the only profiler that sees HRX dispatches:
-`rocprofv3 --kernel-trace` exits 0 and writes no trace, because HRX dlopens TheRock's
-`libhsa-runtime64.so.1` itself and libhrx writes the AQL packets, so the profiler's interposition never
-sees a dispatch.
+and libhrx's dispatch profile agrees on those two: 2,322 dispatches / 538.14 ms of device kernels over two
+forwards (103 % of the 523.8 ms they took) and 3,038 / 1,871.15 ms (113 % of 1,657.2 ms), the surplus being
+the profiler's own record writing. The host path does grow with the ubatch, but it stays small: `-p 4096
+-ub 2048` on the 30B-A3B is 1,143.7 ms of `replay.wait` in a 1,158.6 ms graph (98.7 %), with every other
+phase under 0.25 ms, plus a one-time 4.5 s on the first graph of a new ubatch for prepare and kernel JIT.
 
-| model | dispatches in the bundle | device kernel time | timed wall | device / wall |
-|---|---:|---:|---:|---:|
-| Qwen3-Coder-30B-A3B | 2,322 (2 forwards) | 538.14 ms | 523.8 ms | 103 % |
-| Qwen3.8-27B UD-Q4_K_XL | 3,038 (2 forwards) | 1,871.15 ms | 1,657.2 ms | 113 % |
+What a host leg looks like when the *whole* graph leaves HRX: the same 27B at `-ngl 20` runs 3,746 graph
+computes per forward instead of 2, and its host-staging upload alone becomes 145.7 ms per forward.
 
-The surplus is the profiler's own record writing. So a fully offloaded prefill forward on this build is
-the device, end to end: no graph-program re-match, no host copies, no CPU fallback. The host path does
-grow with the ubatch, but it stays small — `-p 4096 -ub 2048` on the 30B-A3B, steady state: 1143.7 ms of
-`replay.wait` in a 1158.6 ms graph (98.7 %), a whole replay function of 1145.5 ms, and the cache key,
-binding, transient lease, host-staging rebind, upload, launch, flush and download together under 0.25 ms
-(1.3 % of the graph). What that run does pay is one-time: the first graph of a new ubatch costs 4.5 s more
-than the following ones, which is the graph program's prepare and the kernel JIT for the new shapes, not
-this path.
-
-What a host leg does need is a graph that is not fully on HRX: the same 27B at `-ngl 20` runs **3,746
-graph computes per forward** instead of 2, and its host-staging upload alone becomes 145.7 ms per forward
-(39 µs per graph) with the CPU backend's own compute on top.
-
-Not measured here: the 87 GiB Flash-Next file itself. It needs 87.3 GiB of resident weights on a 124 GiB
-UMA box that is also holding the owner's 27B NPU job, which leaves 75-82 GiB available, so the run would
-swap and every number from it would be a swap number. `UD-IQ3_XXS` (76.4 GiB) is the one Flash-Next file
-that could be tried here, and only with that job stopped. One run of the profiler on either file settles
-whether Flash-Next has a host gap at all; until then, quote the 76 % in the section above rather than the
-41.9 %.
+`rocprofv3` cannot produce any of this: it exits 0 on an HRX run and writes no traceback files, because
+HRX dlopens TheRock's `libhsa-runtime64.so.1` itself and libhrx writes its own AQL packets, so the
+profiler's HSA interposition never sees a dispatch.
 
 ### Hadamard-rotated Q4_0 files ("H32", dropped)
 

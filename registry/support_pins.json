@@ -1,0 +1,38 @@
+{
+  "about": "Upstreams the NPU route depends on but does not vendor, each pinned to the commit that was last reviewed, plus the d3 weight repos that exist. tools/census_watch.py alerts when a pinned commit moves or a d3 repo appears that is not listed here, so both are looked at before they reach a release. To clear an alert, read the change, then update the commit and `reviewed` (or add the repo to `d3_sources.known`) in this file - that edit is the record of the review.",
+  "repos": {
+    "ROCm/FLM_Q4NX_Converter": {
+      "commit": "d1d5232d0b82871bf5265e990fa2d26cdad22327",
+      "reviewed": "2026-10-30",
+      "why": "The official gguf Q4_0/Q4_1 -> Q4NX converter with per-architecture configs (configs/*.json, 18 of them: gemma3, gemma4, gpt-oss, lfm2, llama, nanbeige, phi4, qwen2, qwen2vl, qwen3, qwen3.5_{0.8b,2b,4b,9b,a3b,omni}, qwen3vl). docs/npu.md's repack path runs it (scripts/repack_gguf.py, ONEBIT_Q4NX_CONVERTER) and fails its declared-scale guard when the converter or config drops a critical scale. A per-arch config here is what makes a family packable on our side at all."
+    },
+    "vllm-project/semantic-router": {
+      "commit": "632f0874beaa40c9b380531901cd0def382f8e18",
+      "reviewed": "2026-10-30",
+      "why": "The Decision 3.0 (d3) source: the router calls d3 for routing, guardrails and tool selection, and FastFlowLM v1.0.11 serves those weights through /v1/systemone with the same HTTP API as the upstream d3 server. Engine #653 is our side of that; a change here is what a new d3 pack would follow."
+    }
+  },
+  "d3_sources": {
+    "org": "vllm-sr",
+    "prefix": "d3",
+    "about": "HF repos under the vllm-sr org whose name starts with `d3` are the decision-model weights FastFlowLM packs as FastFlowLM/D3-*-NPU2 (base_model tags point here). A new one is a new pack on the way.",
+    "known": [
+      "vllm-sr/d3",
+      "vllm-sr/d3-FP8",
+      "vllm-sr/d3-NVFP4",
+      "vllm-sr/d3-NVFP4-AWQ",
+      "vllm-sr/d3-W4A16-AWQ",
+      "vllm-sr/d3-W4A16-GPTQ",
+      "vllm-sr/d3-edge",
+      "vllm-sr/d3-flash",
+      "vllm-sr/d3-lite",
+      "vllm-sr/d3-mini",
+      "vllm-sr/d3-nano",
+      "vllm-sr/d3-turbo",
+      "vllm-sr/d3-turbo-FP8",
+      "vllm-sr/d3-turbo-INT4",
+      "vllm-sr/d3-turbo-NVFP4",
+      "vllm-sr/d3-ultra"
+    ]
+  }
+}

@@ -36,7 +36,9 @@ Exit codes (the alert contract):
      FastFlowLM repo whose family this engine cannot serve
   1  an uncovered class arrived (the alert), or a new FastFlowLM repo arrived whose
      architecture `registry/architectures.json` does not map, or a new one arrived that
-     publishes a Q4NX pack for a family the NPU route does not serve — any one is enough
+     publishes a Q4NX pack for a family the NPU route does not serve, or a pinned
+     supporting upstream (`registry/support_pins.json`) moved, or a d3 weight repo
+     appeared — any one is enough
   2  runtime failure (no network, unreadable registry, an unreadable FastFlowLM
      listing or releases page, ...)
 
@@ -109,6 +111,14 @@ _NEXT = re.compile(r'<([^>]+)>;\s*rel="next"')
 FLM_AUTHOR = "FastFlowLM"
 FLM_LIMIT = 100
 GH_RELEASES = "https://api.github.com/repos/FastFlowLM/FastFlowLM/releases?per_page={limit}"
+
+# Supporting upstreams we depend on but do not vendor (registry/support_pins.json): the Q4NX
+# converter the repack path runs, and the d3 source behind the decision packs. Pinned by
+# commit, because CI carries no state - "the commit differs from the reviewed one" is a stable
+# fact, while "a new commit appeared" would be true on every run.
+SUPPORT_PINS_PATH = os.path.join(ROOT, "registry", "support_pins.json")
+GH_REPO_HEAD = "https://api.github.com/repos/{repo}/commits?per_page=1"
+HF_ORG_URL = "https://huggingface.co/api/models?author={org}&sort=createdAt&direction=-1&limit=100"
 GH_RELEASES_LIMIT = 20
 # Words that mean a release notes body or an asset name talks about the Q4NX container:
 # npu/q4nx.h pins that layout behind a chunk table, so a release that mentions any of
@@ -713,9 +723,9 @@ def watch_flm(archs, state, limit=FLM_LIMIT, full=False, fetch=None, detail=None
     return rc, True
 
 
-def exit_code(arch_rc, flm_rc, flm_ok):
-    """Combine the two watches into the documented exit code (see the module docstring)."""
-    if arch_rc or flm_rc:
+def exit_code(arch_rc, flm_rc, flm_ok, support_rc=0):
+    """Combine the watches into the documented exit code (see the module docstring)."""
+    if arch_rc or flm_rc or support_rc:
         return 1
     return 0 if flm_ok else 2
 
@@ -761,6 +771,70 @@ def report(models, res, previously_seen):
     return 1 if any(c not in quiet for c in res["classes"]) else 0
 
 
+def load_support_pins(path=SUPPORT_PINS_PATH):
+    """The pinned supporting upstreams (registry/support_pins.json)."""
+    with open(path) as f:
+        return json.load(f)
+
+
+def sweep_support(pins, fetch=None):
+    """(per-repo head vs pin, d3 weight repos that are not in the pinned list)."""
+    fetch = fetch or get_json
+    heads = {}
+    for repo, entry in sorted((pins.get("repos") or {}).items()):
+        commit = (fetch(GH_REPO_HEAD.format(repo=repo)) or [{}])[0] or {}
+        sha = commit.get("sha") or ""
+        heads[repo] = {
+            "repo": repo,
+            "commit": sha,
+            "date": ((commit.get("commit") or {}).get("committer") or {}).get("date") or "",
+            "pinned": (entry or {}).get("commit") or "",
+            "reviewed": (entry or {}).get("reviewed") or "",
+            "moved": sha != ((entry or {}).get("commit") or ""),
+        }
+    sources = pins.get("d3_sources") or {}
+    org, prefix = sources.get("org") or "", sources.get("prefix") or ""
+    known = set(sources.get("known") or ())
+    new_d3 = []
+    if org:
+        for record in fetch(HF_ORG_URL.format(org=org)) or []:
+            rid = (record or {}).get("id") or ""
+            if rid and rid.startswith(org + "/" + prefix) and rid not in known:
+                new_d3.append(rid)
+    return heads, new_d3
+
+
+def report_support(heads, new_d3, org="", prefix=""):
+    """Print the supporting pins; return 1 when one moved or an unpinned d3 repo appeared."""
+    moved = [h for h in heads.values() if h["moved"]]
+    for h in sorted(heads.values(), key=lambda x: x["repo"]):
+        if h["moved"]:
+            print(f"  !! SUPPORT MOVED {h['repo']}  head {h['commit'][:12]} ({h['date'][:10]})  "
+                  f"pinned {h['pinned'][:12]} reviewed {h['reviewed']}")
+        else:
+            print(f"  + SUPPORT PIN {h['repo']}  {h['commit'][:12]} ({h['date'][:10]}) reviewed {h['reviewed']}")
+    if moved:
+        print(f"  -> {len(moved)} pinned supporting upstream(s) moved: "
+              + ", ".join(h["repo"] for h in moved)
+              + " - read the change, then bump the commit and `reviewed` in registry/support_pins.json")
+    if new_d3:
+        print(f"  -> {len(new_d3)} {org}/{prefix}* repo(s) not in registry/support_pins.json: "
+              + ", ".join(new_d3[:10])
+              + " - a d3 pack for it is on the way; add it to the list once looked at")
+    return 1 if (moved or new_d3) else 0
+
+
+def watch_support(pins, fetch=None):
+    """Sweep the pinned upstreams and the d3 org: (exit code, did it run?)"""
+    try:
+        heads, new_d3 = sweep_support(pins, fetch)
+    except Exception as e:
+        print(f"census-watch: !! SUPPORT WATCH FAILED: {e}", file=sys.stderr)
+        return 0, False
+    sources = pins.get("d3_sources") or {}
+    return report_support(heads, new_d3, sources.get("org") or "", sources.get("prefix") or ""), True
+
+
 def main():
     ap = argparse.ArgumentParser(description=__doc__.split("\n")[0])
     ap.add_argument("--limit", type=int, default=DEFAULT_LIMIT,
@@ -769,6 +843,8 @@ def main():
                     help=f"state file (default {DEFAULT_STATE})")
     ap.add_argument("--full", action="store_true",
                     help="list every FastFlowLM repo and release, not just the delta")
+    ap.add_argument("--support-pins", default=SUPPORT_PINS_PATH,
+                    help="pinned supporting upstreams (default registry/support_pins.json)")
     a = ap.parse_args()
 
     archs, sig = load_registry()
@@ -790,13 +866,25 @@ def main():
     # a failure here cannot lose what the walk just classified; the exit code is the OR of
     # the two alerts (engine#588).
     flm_rc, flm_ok = watch_flm(archs, state, full=a.full)
-    rc = exit_code(rc, flm_rc, flm_ok)
+
+    # The supporting-upstream pins run last: they are the only watch whose "fix" is a reviewed
+    # edit to registry/support_pins.json rather than a registry mapping.
+    support_rc, support_ok = (0, True)
+    try:
+        support_rc, support_ok = watch_support(load_support_pins(a.support_pins))
+    except FileNotFoundError as e:
+        print(f"census-watch: !! SUPPORT PINS MISSING: {e}", file=sys.stderr)
+        support_ok = False
+    except Exception as e:
+        print(f"census-watch: !! SUPPORT WATCH FAILED: {e}", file=sys.stderr)
+        support_ok = False
+    rc = exit_code(rc, flm_rc, flm_ok, support_rc)
 
     save_state(a.state, state)
     print(f"census-watch: state {a.state}")
     if rc == 1:
-        print("census-watch: EXIT 1 (an alert is above: uncovered class and/or unmapped "
-              "FastFlowLM family)")
+        print("census-watch: EXIT 1 (an alert is above: uncovered class, unmapped FastFlowLM "
+              "family, moved supporting pin and/or a new d3 repo)")
     elif rc == 2:
         print("census-watch: EXIT 2 (a watch did not run — see the failure above)")
     return rc

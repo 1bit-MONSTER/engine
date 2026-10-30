@@ -476,6 +476,70 @@ full = buf.getvalue()
 check("flm --full: every repo listed", sum(full.count(p) for p in FLM_LINE_PREFIXES) == 5)
 check("flm --full: every release listed", full.count("  + FLM RELEASE ") == 3)
 check("flm --full: an unmapped repo in the listing still alerts", full_rc == 1)
+# 21. The supporting-upstream pins (registry/support_pins.json): a moved commit and a new d3
+#     repo both alert, an unchanged pin and a listed d3 repo do not, and a failed fetch is a
+#     runtime failure rather than a quiet day.
+PINS = {
+    "repos": {
+        "ROCm/FLM_Q4NX_Converter": {"commit": "aaa111", "reviewed": "2026-10-30", "why": "converter"},
+        "vllm-project/semantic-router": {"commit": "bbb222", "reviewed": "2026-10-30", "why": "d3"},
+    },
+    "d3_sources": {"org": "vllm-sr", "prefix": "d3", "known": ["vllm-sr/d3-lite", "vllm-sr/d3-turbo"]},
+}
+
+
+def support_fetch(converter="aaa111", router="bbb222", repos=("vllm-sr/d3-lite",)):
+    def fetch(url):
+        if "/commits" in url:
+            sha = converter if "Q4NX" in url else router
+            return [{"sha": sha, "commit": {"committer": {"date": "2026-10-30T00:00:00Z"}}}]
+        return [{"id": rid} for rid in repos]
+    return fetch
+
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sup_rc, sup_ok = cw.watch_support(PINS, fetch=support_fetch())
+steady = buf.getvalue()
+check("support pins: unchanged pins and listed d3 repos are green", sup_ok and sup_rc == 0)
+check("support pins: an unchanged pin is printed with its commit",
+      "+ SUPPORT PIN ROCm/FLM_Q4NX_Converter  aaa111" in steady)
+check("support pins: nothing is flagged moved", "!! SUPPORT MOVED" not in steady)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sup_rc, _ = cw.watch_support(PINS, fetch=support_fetch(converter="ccc333"))
+moved_text = buf.getvalue()
+check("support pins: a moved converter commit alerts", sup_rc == 1)
+check("support pins: the moved repo is named with both commits",
+      "!! SUPPORT MOVED ROCm/FLM_Q4NX_Converter" in moved_text and "ccc333" in moved_text
+      and "aaa111" in moved_text)
+check("support pins: the fix is in the pin file, and says so",
+      "bump the commit and `reviewed` in registry/support_pins.json" in moved_text)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sup_rc, _ = cw.watch_support(PINS, fetch=support_fetch(repos=("vllm-sr/d3-lite", "vllm-sr/d3-quasar")))
+check("support pins: a d3 repo not in the list alerts", sup_rc == 1)
+check("support pins: the new d3 repo is named", "vllm-sr/d3-quasar" in buf.getvalue())
+check("support pins: a non-d3 repo in the org is not this watch's business",
+      cw.watch_support(PINS, fetch=support_fetch(repos=("vllm-sr/mmbert-base-32k",)))[0] == 0)
+
+with contextlib.redirect_stderr(io.StringIO()):
+    sup_rc, sup_ok = cw.watch_support(PINS, fetch=lambda url: (_ for _ in ()).throw(RuntimeError("no network")))
+check("support pins: a failed fetch is a failure, not a quiet day", sup_rc == 0 and not sup_ok)
+check("support pins: a failure does not turn an alert green",
+      cw.exit_code(0, 0, True, 0) == 0 and cw.exit_code(0, 0, True, 1) == 1
+      and cw.exit_code(0, 0, False, 0) == 2 and cw.exit_code(0, 0, False, 1) == 1)
+
+committed = json.load(open(os.path.join(ROOT, "registry", "support_pins.json")))
+check("support pins: the committed file parses and pins both upstreams",
+      set(committed["repos"]) >= {"ROCm/FLM_Q4NX_Converter", "vllm-project/semantic-router"}
+      and all(len(e["commit"]) == 40 and e.get("reviewed") for e in committed["repos"].values()))
+check("support pins: every d3 source in the file is prefixed like the watch expects",
+      all(r.startswith(committed["d3_sources"]["org"] + "/" + committed["d3_sources"]["prefix"])
+          for r in committed["d3_sources"]["known"]))
+
 state_path = os.path.join(STATE_DIR, "round-trip.json")
 cw.save_state(state_path, state)
 reloaded = cw.load_state(state_path)

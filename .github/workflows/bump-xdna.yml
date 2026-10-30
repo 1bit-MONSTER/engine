@@ -33,6 +33,7 @@ on:
 
 permissions:
   contents: read
+  issues: write            # the failure step files/refreshes an issue (see the last step)
 
 concurrency:
   group: bump-xdna
@@ -97,3 +98,24 @@ jobs:
           ${log}
 
           CI here has no NPU. Before merging, on Strix Halo: build the out-of-tree amdxdna module from this commit, sign and load it, and run the NPU check (docs/npu.md, \"Checking the NPU\")."
+
+      # A failing scheduled job that tells no one is the defect (bump-hrx 2026-10-01..05 and bump-ds4
+      # 2026-10-21..30 both froze a pin that way). This step makes it speak.
+      - name: Report a failed sync so it cannot break silently
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
+        run: |
+          set -euo pipefail
+          title="bump-xdna: the scheduled XDNA driver pin bump is failing"
+          body="The scheduled run $GITHUB_RUN_ID failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          this pin is the \`amdxdna\` kernel driver only and nothing from it is built into the release, so a failure is the pin move itself (upstream \`amd/xdna-driver\` main moved, or the submodule update did not resolve). The driver still has to be checked on Strix Halo with the module loaded before the PR merges.
+
+          Why this step exists: bump-xdna had no failure step, so a red scheduled run told no one (2026-10-30; the DwarfStar sibling had been failing silently for ten days)."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

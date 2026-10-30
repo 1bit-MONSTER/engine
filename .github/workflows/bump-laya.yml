@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  issues: write            # the failure step files/refreshes an issue (see the last step)
 
 concurrency:
   group: bump-laya
@@ -98,3 +99,24 @@ jobs:
             --body "third_party/laya: \`${OUR_SRC:0:12}\` -> \`${SRC:0:12}\` (NandhaKishorM/laya main). config/laya.json revision: \`${OUR_REV:0:12}\` -> \`${REV:0:12}\` (convaiinnovations/laya).
 
           Before merging: scripts/fetch-laya.sh <dir> (verifies every file) and the Laya tests."
+
+      # A failing scheduled job that tells no one is the defect (bump-hrx 2026-10-01..05 and bump-ds4
+      # 2026-10-21..30 both froze a pin that way). This step makes it speak.
+      - name: Report a failed sync so it cannot break silently
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
+        run: |
+          set -euo pipefail
+          title="bump-laya: the scheduled Laya pin sync is failing"
+          body="The scheduled run $GITHUB_RUN_ID failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          the source gitlink (\`third_party/laya\`) and the model revision in \`config/laya.json\` move together; a failure here usually means upstream \`NandhaKishorM/laya\` main or the \`convaiinnovations/laya\` revision moved and one of the two updates did not apply. Check the token's access to the model repo, then re-run.
+
+          Why this step exists: bump-laya had no failure step, so a red scheduled run told no one (2026-10-30; the DwarfStar sibling had been failing silently for ten days)."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

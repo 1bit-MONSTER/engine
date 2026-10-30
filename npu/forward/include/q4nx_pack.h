@@ -52,6 +52,24 @@ extern "C" {
 #define Q4NX_MAX_DESIGNS 14
 #define Q4NX_ELF_NAME_MAX 64
 
+/* Activation tile (M) each design FAMILY is built for.  Two families share one
+ * role geometry, so the artifact name carries M only when it is not the
+ * prefill one:
+ *
+ *   full_i8_<ROLE>_K<K>_N<N>[_m16].elf
+ *
+ * PREFILL (128) is the family the engine shipped before the decode fix: one
+ * launch covers 128 activation rows, which suits a prefill chunk.  Decode is
+ * M=1, and streaming that through a 128-row kernel costs 128 A rows and 128 C
+ * rows for one useful row -- 8 of 32 compute tiles carry data and 1 of 128
+ * baked MAC rows is useful (0.78%).  DECODE (16) is the same role geometry at
+ * the smallest vectorized mmul M: one core row, all 8 columns, the column
+ * groups still looped inside the ELF (so one launch per role stays the
+ * contract).  Measured cost of an M=16 launch is ~0.34 ms against 3.4-4.9 ms
+ * for the M=128 path. */
+#define Q4NX_DESIGN_M_PREFILL 128
+#define Q4NX_DESIGN_M_DECODE 16
+
 typedef enum {
     Q4NX_DESIGN_QKV = 0,
     Q4NX_DESIGN_O,
@@ -156,6 +174,17 @@ int q4nx_num_designs(const Q4nxModelDims* d);
  * names are geometry-derived (full_i8_<ROLE>_K<K>_N<N>.elf) so nothing is keyed
  * on a model name or tag.  Returns the design count, or -1 on bad dims. */
 int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* designs);
+
+/* M=16 (decode) twins of an already-derived design set.  out[i] is the twin of
+ * designs[i], or zeroed (out[i].M == 0) when this geometry cannot be covered by
+ * the m16 kernel (m=16, k=64, n=128 over 8 columns, so K%64, N%128 and
+ * (N/128)%8 must all be 0).  The artifact name is the input's with "_m16"
+ * inserted before ".elf"; the bool result is the same test WITHOUT asking the
+ * file system, so the caller decides whether a missing ELF is fatal (it is
+ * not: the role then simply stays on its M=128 kernel).  Returns the number of
+ * usable twins. */
+int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,
+                               Q4nxDesignGeom* out);
 
 /* Look up the entry for a role in a derived set; NULL if absent. */
 const Q4nxDesignGeom* q4nx_find_design(const Q4nxDesignGeom* designs, int count,

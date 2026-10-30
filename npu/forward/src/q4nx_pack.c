@@ -98,8 +98,40 @@ static int derive_mla(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
 }
 
 static void set_elf_name(Q4nxDesignGeom* g, const char* role) {
-    snprintf(g->elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", role, g->K,
-             g->N);
+    /* The M=128 family is the one that shipped un-suffixed; a decode twin is
+     * distinguished by its M so both can sit in one artifact directory. */
+    if (g->M == Q4NX_DESIGN_M_PREFILL || g->M <= 0)
+        snprintf(g->elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", role,
+                 g->K, g->N);
+    else
+        snprintf(g->elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d_m%d.elf",
+                 role, g->K, g->N, g->M);
+}
+
+int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,
+                               Q4nxDesignGeom* out) {
+    int usable = 0;
+    if (!out) return 0;
+    for (int i = 0; i < count; i++) {
+        memset(&out[i], 0, sizeof(out[i]));
+        if (!designs) continue;
+        const Q4nxDesignGeom* g = &designs[i];
+        /* The m16 kernel is m=16 k=64 n=128 over 8 columns and 1 core row.  M=16
+         * is one row-group, so any source M is fine; the N grid must divide by
+         * 128 and fill whole 8-column groups (the groups are an in-ELF loop, so
+         * the whole N is still one launch).  A geometry that fails the test has
+         * no legal m16 build (e.g. the 24B's N=11776 dense MLP: 92 tiles, 92%8). */
+        if (g->K % 64 != 0 || g->N % 128 != 0 || (g->N / 128) % 8 != 0) continue;
+        const size_t len = strlen(g->elf_name);
+        if (len < 5 || len + 6 >= Q4NX_ELF_NAME_MAX) continue;   /* +"_m16" */
+        if (strcmp(g->elf_name + len - 4, ".elf") != 0) continue;
+        out[i] = *g;
+        out[i].M = Q4NX_DESIGN_M_DECODE;
+        snprintf(out[i].elf_name, Q4NX_ELF_NAME_MAX, "%.*s_m16.elf", (int)(len - 4),
+                 g->elf_name);
+        usable++;
+    }
+    return usable;
 }
 
 int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {

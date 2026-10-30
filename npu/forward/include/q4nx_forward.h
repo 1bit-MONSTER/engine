@@ -47,6 +47,91 @@ struct I8Ctx;
 
 #include "rt.h"  // xrt::device, xrt::bo: the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
+#include <chrono>
+#include <cstdlib>
+
+// ---- phase attribution (NPU_PHASE_PROF=1) --------------------------------
+// Named RAII timers, one accumulator per slot.  Header-resident (inline
+// variables) so that app/forward_serve.cpp -- which owns the request lifecycle
+// -- times the *request* phases (accept, tokenisation, reset, prefill, decode,
+// detokenisation, response) with the same machinery the layer loop uses, and a
+// request can print the delta of this array so its rows sum to its wall time.
+//
+// Slot order matters: the first LH_LAYER_N entries are the layer-loop rows the
+// per-token [lh] table ranks, the rest are request-level rows.
+namespace q4nx_lh {
+enum LhSlot {
+    LH_LOAD = 0,        // load_layer(): per-token f32 re-dequant
+    LH_LOAD_PROJ,       //   of which: GDN qkv/z/out projections
+    LH_LOAD_FFN,        //   of which: dense FFN tail (gate/up/down)
+    LH_LOAD_GDN_SMALL,  //   of which: alpha/beta, conv1d, norm, ssm_a/dt
+    LH_ASM,             // q4nx_assemble_B()
+    LH_GEMM,            // npu_gemm() total outside gdn_layer, incl. amax scan + out deq
+    LH_GEMM_GDN,        //   of which: npu_gemm() time spent inside gdn_layer()
+    LH_ATTN,            // attention(): rope, softmax, KV append
+    LH_GDN,             // gdn_layer() total
+    LH_GDN_AB,          //   of which: host alpha/beta dot products
+    LH_GDN_CORE,        //   of which: delta-rule recurrence + gated rmsnorm
+    LH_RMS,             // rmsnorm()
+    LH_RES,             // residual adds / layer_scale
+    LH_MLP,             // mlp(): SiLU/GELU * up
+    LH_LAYER_N,         // ---- end of the layer-loop slots ----
+    // Request-level rows (forward_serve.cpp handle_generate).
+    LH_RQ_ACCEPT = LH_LAYER_N,  // body parse + validate + options/grammar
+    LH_RQ_TOKENIZE,     // prompt -> token ids
+    LH_RQ_LOCK,         // wait for the engine mutex
+    LH_RQ_RESET,        //   of which (inside prefill): KV/conv/recurrent reset
+    LH_RQ_PREFILL,      // prefill chunk loop (contains reset + weight packs)
+    LH_RQ_DECODE,       // decode step() total
+    LH_RQ_SAMPLE,       //   of which: grammar mask + sample_token
+    LH_RQ_EMIT,         //   of which: detokenise the emitted token
+    LH_RQ_RESP,         // response serialise + write
+    LH_PACK_UPLOAD,     // weight BO create + pack + upload (wcache_ miss only)
+    LH_N
+};
+inline bool lh_on() {
+    static const bool on = std::getenv("NPU_PHASE_PROF") != nullptr;
+    return on;
+}
+inline double g_lh[LH_N];
+inline long   g_lh_n[LH_N];
+inline int    g_gdn_d = 0;   // >0 while inside a gdn_layer() scope
+inline bool lh_in_gdn() { return g_gdn_d > 0; }
+struct LhScope {
+    int  s; bool on;
+    std::chrono::steady_clock::time_point t;
+    explicit LhScope(int s_)
+        : s(s_), on(lh_on()),
+          t(on ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{}) {
+        if (on && s == LH_GDN) g_gdn_d++;
+    }
+    void stop() {
+        if (!on) return;
+        g_lh[s] += std::chrono::duration<double, std::milli>(
+                       std::chrono::steady_clock::now() - t).count();
+        g_lh_n[s]++;
+        if (s == LH_GDN) g_gdn_d--;
+        on = false;
+    }
+    ~LhScope() { stop(); }
+};
+// Table names, indexed by slot (shared by the per-token and per-request tables).
+inline const char* lh_name(int s) {
+    static const char* const kn[LH_N] = {
+        "load_layer", "  of-which: GDN proj deq", "  of-which: FFN tail deq",
+        "  of-which: GDN small deq", "assemble_B", "npu_gemm (total)",
+        "  of-which: gemm in gdn", "attention", "gdn_layer",
+        "  of-which: gdn alpha/beta", "  of-which: gdn recurrence", "rmsnorm",
+        "residual adds", "mlp (act*up)",
+        "request accept/validate", "tokenisation", "engine lock wait",
+        "  of-which: KV/rec state reset", "prefill (chunks)",
+        "decode (step loop)", "  of-which: sample+grammar",
+        "  of-which: detokenise token", "response write",
+        "  of-which: weight pack+upload (wcache miss)"};
+    return (s >= 0 && s < LH_N) ? kn[s] : "?";
+}
+}  // namespace q4nx_lh
+
 struct Q4nxForwardConfig {
     int H = 1024, NH = 16, NKV = 8, HD = 128, IM = 3072, NL = 28, NV = 151936;
     float eps = 1e-6f, theta = 1e6f;
@@ -111,6 +196,33 @@ private:
     // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
     void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
                        const float* Bmat, std::vector<float>& out, int wkey = -1);
+    // Phase-selected activation tile.  A one-row launch is decode, so it runs
+    // this design's M=16 twin (cheap single-row kernel); anything wider is
+    // prefill and keeps the M=128 kernel so a chunk still lands in one array
+    // pass.  Returns `prefill` unchanged when the twin is unavailable, so the
+    // callers never have to test for it.
+    I8Ctx* ctx_for(I8Ctx* prefill, int rows);
+    // Which role a context belongs to (prefill or decode twin); -1 if unknown.
+    int design_index(I8Ctx* c) const;
+    // Bit-equality gate for the decode family (NPU_M16_CHECK=1): run the same
+    // quantized activation and the same weight BO through both kernels and
+    // compare the int32 outputs, which must match exactly (int32 accumulation is
+    // exact, so a difference is a bug, never rounding).  Returns the int32
+    // maxdiff; records the worst case across the run.
+    int32_t m16_check_gemm(I8Ctx& ref, I8Ctx& fast, const float* A, int K, int N,
+                           const float* Bmat, xrt::bo* wbo, float as);
+    // The same gate for a multi-row pass (a prefill chunk of <= 16 rows also runs
+    // the twin): row m of both kernels must agree exactly.
+    int32_t m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A, int M, int K,
+                                int N, xrt::bo* wbo, const std::vector<float>& ascales);
+    // NPU_PROFILE per-role dispatch + timing accumulators, one per phase.
+    struct ProfAcc {
+        double pack = 0, quant = 0, wait = 0, rb = 0;
+        long   n = 0;
+    };
+    void prof_add(ProfAcc* acc, int design, double pack, double quant, double wait,
+                  double rb);
+    void prof_dump();
     // True when this layer's projection `wkey` is already packed in its own BO,
     // so the caller can skip both the Q4NX dequant (load_layer) and the f32->B
     // assembly for the rest of the run.
@@ -148,6 +260,21 @@ private:
     Q4nxDesignGeom designs_[Q4NX_MAX_DESIGNS];
     int ndesigns_ = 0;
     std::unique_ptr<I8Ctx> ctx_[Q4NX_MAX_DESIGNS];
+    // M=16 decode twins of the same roles (empty/skipped where no ELF or no legal
+    // geometry).  Index-aligned with designs_/ctx_ so ctx_for() can pair them.
+    Q4nxDesignGeom designs16_[Q4NX_MAX_DESIGNS];
+    std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
+    bool m16_ = false;          // at least one role has a working twin
+    bool m16_check_ = false;    // NPU_M16_CHECK=1: cross-check every decode launch
+    int32_t m16_worst_ = 0;     // worst int32 maxdiff seen by the check
+    long m16_bad_ = 0, m16_checked_ = 0;
+    std::vector<int32_t> m16_ref_;   // reference C row, reused per check
+    bool prof_ = false;              // NPU_PROFILE=1
+    ProfAcc prof_dec_[Q4NX_MAX_DESIGNS], prof_pre_[Q4NX_MAX_DESIGNS];
+    long prof_dec_n_ = 0;            // decode launches (dispatches/token)
+    long prof_pre_n_ = 0;
+    long prof_tok_n_ = 0;
+    int  prof_tick_ = 0;
     // Index of the design playing a role, or -1 when the model has no such
     // kernel (e.g. GU is absent on split models, G/U absent on fused ones).
     int idx_of(Q4nxDesign role) const;
@@ -241,6 +368,13 @@ private:
     // ffn_cache_default(), which is on for a GDN model on the NPU route; init
     // resolves it to 0 or 1.  NPU_FFN_CACHE=0|1 forces it either way.
     int ffn_cache_ = -1;
+    // The NPU LM head packs its B tiles ONCE into their own weight BOs, one per
+    // tile ([H][T] int8 + T per-column scales), instead of re-copying a 356 MB f32
+    // tile and re-running packB for every tile of every token.  With these
+    // resident the f32 head (lm_head_f_, 5.09 GB) and the f32 tile gather
+    // (lm_head_tiles_, 5.35 GB) are both dead on the NPU path and are released.
+    std::vector<PackedWeight> lm_head_packed_;
+    int                       lm_head_packed_T_ = 0;
     int cur_layer_ = 0;           // layer currently being processed
 
     // ── Gemma4 (per-layer embeddings + KV sharing + extra norms) ──

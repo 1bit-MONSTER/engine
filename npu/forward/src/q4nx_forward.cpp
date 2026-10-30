@@ -140,10 +140,16 @@ static float read_config_float(const std::string& cfg_path, const char* key, flo
     return (float)strtod(c + 1, nullptr);
 }
 
+// The named phase scopes live in q4nx_forward.h (namespace q4nx_lh) so the HTTP
+// handler can time request-level phases with the same machinery; keep every use
+// here unqualified.
+using namespace q4nx_lh;
+
 Q4nxNpuForward::Q4nxNpuForward() {}
 Q4nxNpuForward::~Q4nxNpuForward() = default;
 
 void Q4nxNpuForward::reset() {
+    LhScope _tlh_rst(LH_RQ_RESET);
     for (auto& v : kcache_) v.clear();
     for (auto& v : vcache_) v.clear();
     // A GDN layer carries a conv window and a recurrent state across positions.
@@ -456,7 +462,12 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     dims.q_lora = q_lora_; dims.kv_lora = kv_lora_; dims.rope_dim = rope_dim_;
     dims.qk_nope = qk_nope_; dims.dense_im = dense_im_;
     dims.H = c_.H; dims.NH = c_.NH; dims.NKV = c_.NKV; dims.HD = c_.HD;
-    dims.IM = c_.IM; dims.M = 128;
+    dims.IM = c_.IM;
+    // Activation tile of the PREFILL family.  It used to be the only family (a
+    // bare 128 here decided the whole engine's M); decode now selects the M=16
+    // twin instead -- see the m16 block after q4nx_derive_designs() and
+    // ctx_for().  Keep 128: prefill packs a whole chunk of rows per launch.
+    dims.M = Q4NX_DESIGN_M_PREFILL;
     dims.ple_dim = sem_.hidden_size_per_layer_input;
     dims.double_wide_mlp = sem_.double_wide_mlp;
     /* A second attention geometry when the head dim varies by layer type. */
@@ -571,6 +582,70 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s\n", role_tag(g->role),
                     g->M, g->K, g->N, elf.c_str());
         }
+    }
+
+    // ---- M=16 decode family ----
+    // Decode is one row, but every design above is M=128, so the host zero-pads
+    // 128 activation rows and the kernel streams all 128 through the array to
+    // deliver 1: 8 of 32 compute tiles hold data and 1 of 128 baked MAC rows is
+    // useful (0.78%).  The M=16 twins are the SAME role geometries at the
+    // smallest vectorized mmul M -- one core row, all 8 columns, column groups
+    // still looped inside the ELF, so one launch per role is unchanged -- and a
+    // launch measured ~0.34 ms against 3.4-4.9 ms for M=128.  Selection is by
+    // row count (ctx_for): rows <= 16 is decode or a short prefill chunk,
+    // anything wider keeps M=128 so long prefill does not regress.  A role with
+    // no twin ELF on disk simply stays on M=128, so the artifact directory can
+    // carry both families (or only the old one).  NPU_DECODE_M16=0 forces the
+    // all-M=128 path for A/B runs.
+    //
+    // Where the twins are looked for, first hit wins: NPU_KERNELS_M16, then
+    // <model dir>/kernels-m16, then <kernels>/m16, then <kernels> itself.  The
+    // point of the first two is that a model directory ships its own decode
+    // family, so a plain `--kernels <model>/kernels` serve runs M=16 with no
+    // extra flag; a shared kernel dir (one whose ELF set serves several models)
+    // stays untouched.
+    prof_ = getenv("NPU_PROFILE") != nullptr;
+    m16_check_ = getenv("NPU_M16_CHECK") != nullptr;
+    const char* m16_env = getenv("NPU_DECODE_M16");
+    const bool want_m16 = !m16_env || atoi(m16_env) != 0;
+    if (want_m16 && !host_gemm_) {
+        q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
+        std::vector<std::string> m16dirs;
+        if (const char* d = getenv("NPU_KERNELS_M16"))
+            if (*d) m16dirs.push_back(d);
+        m16dirs.push_back(mdir + "/kernels-m16");
+        m16dirs.push_back(dir + "/m16");
+        m16dirs.push_back(dir);
+        int made = 0, skipped = 0;
+        for (int i = 0; i < ndesigns_; i++) {
+            if (designs16_[i].M <= 0) { skipped++; continue; }
+            std::string elf;
+            for (const std::string& d : m16dirs) {
+                std::string cand = d + "/" + designs16_[i].elf_name;
+                if (file_exists(cand)) { elf = cand; break; }
+            }
+            if (elf.empty()) { skipped++; continue; }   // stay on M=128
+            ctx16_[i] = std::make_unique<I8Ctx>();
+            ctx16_[i]->MD = designs16_[i].M;
+            ctx16_[i]->KD = designs16_[i].K;
+            ctx16_[i]->ND = designs16_[i].N;
+            if (!ctx16_[i]->init_elf(*dev, elf.c_str(), designs16_[i].M,
+                                     designs16_[i].K, designs16_[i].N, 1)) {
+                fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "
+                                "this role keeps M=128\n", designs16_[i].elf_name);
+                ctx16_[i].reset();
+                skipped++;
+                continue;
+            }
+            made++;
+            fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (decode)\n",
+                    role_tag(designs_[i].role), designs16_[i].M, designs16_[i].K,
+                    designs16_[i].N, elf.c_str());
+        }
+        m16_ = made > 0;
+        fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
+                made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
+                want_m16 ? "" : " (NPU_DECODE_M16=0: disabled)");
     }
 
     // ---- Gemma4 per-layer embeddings (PLE) + KV sharing ----
@@ -832,6 +907,11 @@ bool Q4nxNpuForward::ffn_cache_default() const {
     const double tail_bytes = 3.0 * (double)c_.IM * (double)c_.H * 4.0;   // wg_+wu_+wd_
     return tail_bytes >= 256.0 * 1024.0 * 1024.0;
 }
+// ---- layer-loop host attribution ------------------------------------------
+// The `host=` residual of the [ph] line is layer time that is NOT any of the
+// gemm phases: 368 launches x ~6.5 ms with no timer on it.  These named
+// per-call-site scopes sum it back up so it can be ranked.  Purely additive:
+// nothing in the compute path reads any of this.
 
 // The three f32 FFN buffers (wg_/wu_/wd_) are read only by q4nx_assemble_B(),
 // which the MLP sections of step()/step_batch() skip once that layer's packed
@@ -1032,6 +1112,7 @@ bool Q4nxNpuForward::load_layer(int l) {
         return true;
     }
     if (!ffn_tail_cached()) {
+        LhScope _t_f(LH_LOAD_FFN);
         if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
         if (!deq(&lw->up_proj_weight, wu_.data(), im, H)) return false;
         if (!deq(&lw->down_proj_weight, wd_.data(), H, im)) return false;
@@ -1093,11 +1174,14 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
     // still refreshed.
     const bool proj_cached = weight_cache_ && weight_cached(0) && weight_cached(1) &&
                              weight_cached(6);
+    LhScope _t_ldg(LH_LOAD_GDN_SMALL);
     if (!proj_cached) {
+        LhScope _t_p(LH_LOAD_PROJ);
         if (!deq("linear_attn.qkv_proj.weight", wqkvlin_.data(), CD, H)) return false;
         if (!deq("self_attn.gate_proj.weight", wz_.data(), lin_vd_, H)) return false;
         if (!deq("linear_attn.ssm_out_proj.weight", woutlin_.data(), H, lin_vd_)) return false;
     }
+    _t_ldg.stop();     // the three projections are done; the small members follow
     if (!deq_pad("linear_attn.ssm_alpha_proj.weight", wa_.data(), lin_nvh_, H)) return false;
     if (!deq_pad("linear_attn.ssm_beta_proj.weight", wb_.data(), lin_nvh_, H)) return false;
     if (!bf16v("linear_attn.ssm_conv1d.weight", lin_conv_w_.data(), lin_ck_ * CD)) return false;
@@ -1177,6 +1261,7 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         return true;
     }
     if (!ffn_tail_cached()) {
+        LhScope _t_f(LH_LOAD_FFN);
         if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, H)) return false;
         if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, H)) return false;
         if (!deqT(&lw->down_proj_weight, wd_.data(), H, c_.IM)) return false;
@@ -1229,6 +1314,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         if (CK > 1) cs[CK - 2] = qkv[c];
     }
     // alpha/beta on the host (N = NVH < 128, below the GEMM tile width)
+    LhScope _t_ab(LH_GDN_AB);
     std::vector<float> ah(NVH), bh(NVH);
     for (int h = 0; h < NVH; h++) {
         const float* ra = wa_.data() + (size_t)h * H;
@@ -1238,6 +1324,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         ah[h] = sa;
         bh[h] = sb;
     }
+    _t_ab.stop();
     // q/k L2-normalised with NVH/NKH head repetition; v per v-head
     const int rep = NVH / NKH;
     std::vector<float> ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
@@ -1254,6 +1341,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         for (int d = 0; d < KHD; d++) { ql[(size_t)h*KHD+d] *= iq; kl[(size_t)h*KHD+d] *= ik; }
     }
     // recurrent gated delta rule, then scale-free gated RMSNorm, then out_proj
+    LhScope _t_core(LH_GDN_CORE);
     float* rs = rec_state_[l].data();
     const float scale = 1.0f / sqrtf((float)KHD);
     std::vector<float> core((size_t)NVH * VHD), kvm(VHD);
@@ -1288,6 +1376,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
                 lin_norm_w_[vd] * (zz / (1.0f + expf(-zz)));
         }
     }
+    _t_core.stop();
     if (getenv("NPU_INFER_DUMP_LAYERS")) {
         auto dmp = [&](const char* nm, const float* v, int n) {
             double s = 0;
@@ -1559,6 +1648,164 @@ void Q4nxNpuForward::build_ple_inputs(int token) {
 }
 
 // --------------------------------------------------------------------------
+// M=16 decode-family selection
+// --------------------------------------------------------------------------
+int Q4nxNpuForward::design_index(I8Ctx* c) const {
+    if (!c) return -1;
+    for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
+        if (ctx_[i].get() == c || (ctx16_[i] && ctx16_[i].get() == c)) return i;
+    return -1;
+}
+
+I8Ctx* Q4nxNpuForward::ctx_for(I8Ctx* prefill, int rows) {
+    // Rows that fit one M=16 row-block (decode's 1 row, or a short prompt's
+    // prefill chunk of <= 16) run the cheap twin: the M=128 kernel streams the
+    // same weights but walks 128 baked MAC rows to deliver <= 16, and a request
+    // pays one full weight pass in prefill whatever its prompt length.  Chunks
+    // wider than 16 keep M=128 (one launch per chunk), so long prefill is
+    // unchanged.
+    if (!m16_ || rows < 1 || rows > 16) return prefill;
+    for (int i = 0; i < ndesigns_ && i < Q4NX_MAX_DESIGNS; i++)
+        if (ctx_[i].get() == prefill && ctx16_[i]) return ctx16_[i].get();
+    return prefill;
+}
+
+int32_t Q4nxNpuForward::m16_check_gemm(I8Ctx& ref, I8Ctx& fast, const float* A, int K,
+                                       int N, const float* Bmat, xrt::bo* wbo, float as) {
+    // Same activation, same quantizer, same weight BO as the launch that just ran on
+    // the M=16 kernel -- only the ELF differs, so any output difference is the
+    // kernel's, not the plumbing's.
+    xrt::run r;
+    if (wbo) {
+        r = ref.launch_async_with_bo(*wbo, A, 1, K, as);
+    } else {
+        float s = 1.0f;
+        ref.packB(0, Bmat, K, N, s);
+        ref.quantize_async(A, 1, K, as);
+        r = ref.sync_and_launch(0);
+    }
+    ref.wait_kernel(r);
+    ref.readback();
+    int32_t maxd = 0;
+    long nmis = 0;
+    for (int n = 0; n < N; n++) {
+        const int32_t d = ref.Cm[n] - fast.Cm[n];
+        const int32_t ad = d < 0 ? -d : d;
+        if (ad) { nmis++; if (ad > maxd) maxd = ad; }
+    }
+    m16_checked_++;
+    if (maxd > m16_worst_) m16_worst_ = maxd;
+    if (maxd) {
+        m16_bad_++;
+        fprintf(stderr, "[m16check] MISMATCH N=%d int32 maxdiff=%d mismatched_cols=%ld "
+                        "(K=%d)\n", N, maxd, nmis, K);
+    } else if (m16_checked_ % 250 == 0) {
+        fprintf(stderr, "[m16check] n=%ld maxdiff=0 (bit-exact)\n", m16_checked_);
+    }
+    return maxd;
+}
+
+int32_t Q4nxNpuForward::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float* A,
+                                            int M, int K, int N, xrt::bo* wbo,
+                                            const std::vector<float>& ascales) {
+    // Same M rows, same per-row scales, same weight BO: only the ELF differs.
+    xrt::run r = wbo ? ref.launch_async_with_bo_rows(*wbo, A, M, K, ascales.data())
+                     : ref.launch_async_rows(0, A, M, K, ascales.data());
+    ref.wait_kernel(r);
+    ref.readback();
+    int32_t maxd = 0;
+    long nmis = 0;
+    for (int m = 0; m < M; m++) {
+        const int32_t* a = ref.Cm + (size_t)m * ref.ND;
+        const int32_t* b = fast.Cm + (size_t)m * fast.ND;
+        for (int n = 0; n < N; n++) {
+            const int32_t d = a[n] - b[n];
+            const int32_t ad = d < 0 ? -d : d;
+            if (ad) { nmis++; if (ad > maxd) maxd = ad; }
+        }
+    }
+    m16_checked_++;
+    if (maxd > m16_worst_) m16_worst_ = maxd;
+    if (maxd) {
+        m16_bad_++;
+        fprintf(stderr, "[m16check] MISMATCH rows=%d N=%d int32 maxdiff=%d "
+                        "mismatched_cols=%ld (K=%d)\n", M, N, maxd, nmis, K);
+    } else if (m16_checked_ % 250 == 0) {
+        fprintf(stderr, "[m16check] n=%ld maxdiff=0 (bit-exact)\n", m16_checked_);
+    }
+    return maxd;
+}
+
+// ---------------------------------------------------------------------------
+// Phase attribution (NPU_PHASE_PROF=1).  One line per decode step whose named
+// phases sum to that step's wall time.  Additive measurement only: nothing in
+// the compute path depends on it.
+// ---------------------------------------------------------------------------
+namespace {
+struct StepPhases {
+    double embed = 0, layer = 0, ffnorm = 0, head = 0, tail = 0;
+    double g_pack = 0, g_ql = 0, g_wait = 0, g_rb = 0;   // layer GEMMs only
+    double h_total = 0, h_memcpy = 0, h_pack = 0, h_ql = 0, h_wait = 0, h_rb = 0;
+    long   launches = 0;
+};
+StepPhases g_ph;
+bool       g_in_head = false;
+inline bool phprof_on() {
+    static const bool on = getenv("NPU_PHASE_PROF") != nullptr;
+    return on;
+}
+inline double ph_ms(std::chrono::steady_clock::time_point t) {
+    return std::chrono::duration<double, std::milli>(
+               std::chrono::steady_clock::now() - t).count();
+}
+}  // namespace
+
+void Q4nxNpuForward::prof_add(ProfAcc* acc, int design, double pack, double quant,
+                              double wait, double rb) {
+    if (phprof_on() && acc == prof_dec_ && !g_in_head) {
+        g_ph.g_pack += pack; g_ph.g_ql += quant;
+        g_ph.g_wait += wait; g_ph.g_rb += rb;
+        g_ph.launches++;
+    }
+    if (design < 0 || design >= Q4NX_MAX_DESIGNS) return;
+    ProfAcc& a = acc[design];
+    a.pack += pack; a.quant += quant; a.wait += wait; a.rb += rb;
+    a.n++;
+}
+
+void Q4nxNpuForward::prof_dump() {
+    fprintf(stderr, "[prof] ---- per-role launch cost (ms, window since last dump) ----\n");
+    fprintf(stderr, "[prof] %-5s %-5s %2s %8s %7s %9s %7s %9s %9s\n", "phase", "role",
+            "M", "launches", "pack", "quant+lnch", "wait", "readback", "ms/launch");
+    for (int ph = 0; ph < 2; ph++) {
+        ProfAcc* acc = ph ? prof_pre_ : prof_dec_;
+        for (int i = 0; i < ndesigns_; i++) {
+            const ProfAcc& a = acc[i];
+            if (!a.n) continue;
+            const double n = (double)a.n;
+            const int M = (ctx16_[i] && ph == 0) ? designs16_[i].M : designs_[i].M;
+            fprintf(stderr, "[prof] %-5s %-5s %2d %8ld %7.2f %9.2f %7.3f %9.3f %9.3f\n",
+                    ph ? "pre" : "dec", role_tag(designs_[i].role), M, a.n,
+                    a.pack / n, a.quant / n, a.wait / n, a.rb / n,
+                    (a.pack + a.quant + a.wait + a.rb) / n);
+        }
+    }
+    fprintf(stderr, "[prof] dispatch decode=%ld prefill=%ld tokens=%ld (decode/token=%.1f)"
+                    " m16=%d\n", prof_dec_n_, prof_pre_n_, prof_tok_n_,
+            prof_tok_n_ ? (double)prof_dec_n_ / (double)prof_tok_n_ : 0.0, (int)m16_);
+    if (m16_check_)
+        fprintf(stderr, "[m16check] ---- checks=%ld mismatched=%ld worst_int32_maxdiff=%d"
+                        " ----\n", m16_checked_, m16_bad_, m16_worst_);
+    /* Window semantics: each dump reports the launches since the previous dump,
+       so one burst of device contention cannot bias a whole run.  The dispatch /
+       token totals above stay cumulative. */
+    for (int i = 0; i < Q4NX_MAX_DESIGNS; i++) {
+        prof_dec_[i] = ProfAcc{};
+        prof_pre_[i] = ProfAcc{};
+    }
+}
+
+// --------------------------------------------------------------------------
 // one NPU GEMM: C[1,N] = A[1,K] x B[K,N]  (row-major B)
 // --------------------------------------------------------------------------
 void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
@@ -1574,14 +1821,18 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         }
         return;
     }
+    LhScope _tlh_gemm(lh_in_gdn() ? LH_GEMM_GDN : LH_GEMM);  // amax scan, A quant, out deq
     float amax = 0.0f;
     for (int i = 0; i < K; i++) {
         float a = std::fabs(A[i]);
         if (a > amax) amax = a;
     }
     const float as = amax > 0.0f ? amax / 127.0f : 1.0f;
-    const bool prof = getenv("NPU_PROFILE") != nullptr;
-    const auto tp = std::chrono::steady_clock::now();
+    // Phase-selected activation tile: a one-row call is decode, so it runs this
+    // role's M=16 twin (one core row instead of 128 rows / 8 live tiles).
+    I8Ctx& kctx = *ctx_for(&ctx, 1);
+    const bool prof = prof_;
+    const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     // Token-invariant weights (wkey >= 0) get their own BO, packed once and
     // reused; every other call (wkey < 0: routed experts, whose weights change
@@ -1593,44 +1844,47 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         auto& m = wcache_[size_t(cur_layer_)];
         auto  it = m.find(wkey);
         if (it == m.end()) {
+            // Cache miss only: this is the per-request re-pack/re-upload the
+            // `prefill` row would hide.  It must be zero for a warm process.
+            LhScope _tlh_pk(LH_PACK_UPLOAD);
             PackedWeight pw;
-            pw.bo = ctx.make_weight_bo(*dev_);
+            pw.bo = kctx.make_weight_bo(*dev_);
             float sout = 1.0f;
-            ctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
         gs = &slot->scales;
     } else {
         float sout = 1.0f;
-        ctx.packB(0, Bmat, K, N, sout);
-        ctx.quantize_async(A, 1, K, as);
-        gs = &ctx.group_scales[0];
+        kctx.packB(0, Bmat, K, N, sout);
+        kctx.quantize_async(A, 1, K, as);
+        gs = &kctx.group_scales[0];
     }
 
     const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    xrt::run r = slot ? ctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
-                      : ctx.sync_and_launch(0);
+    xrt::run r = slot ? kctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
+                      : kctx.sync_and_launch(0);
     const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ctx.wait_kernel(r);
+    kctx.wait_kernel(r);
     const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    ctx.readback();
+    kctx.readback();
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     out.resize((size_t)N);
     for (int n = 0; n < N; n++)
-        out[(size_t)n] = (float)ctx.Cm[n] * as * (*gs)[(size_t)n];
+        out[(size_t)n] = (float)kctx.Cm[n] * as * (*gs)[(size_t)n];
+
+    if (m16_check_ && &kctx != &ctx)
+        m16_check_gemm(ctx, kctx, A, K, N, Bmat, slot ? slot->bo.get() : nullptr, as);
 
     if (prof) {
-        static double sp = 0.0, sq = 0.0, sw = 0.0, sr = 0.0;
-        static long sn = 0;
-        sp += std::chrono::duration<double, std::milli>(tl - tp).count();
-        sq += std::chrono::duration<double, std::milli>(tq - tl).count();
-        sw += std::chrono::duration<double, std::milli>(tw - tq).count();
-        sr += std::chrono::duration<double, std::milli>(tr - tw).count();
-        if (++sn % 50 == 0)
-            std::fprintf(stderr, "[prof] npu_gemm n=%ld pack=%.1f quant+launch=%.1f wait=%.1f readback=%.1f ms (N=%d)\n",
-                         sn, sp / (double)sn, sq / (double)sn, sw / (double)sn, sr / (double)sn, N);
+        const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
+        const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
+        const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
+        const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
+        prof_add(prof_dec_, design_index(&kctx), dpk, dql, dwt, drb);
+        if (++prof_dec_n_ % 100 == 0) prof_dump();
     }
 }
 
@@ -1664,6 +1918,12 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
         }
         ascales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
     }
+    // Rows > 1 is prefill and keeps the M=128 kernel (one launch per chunk); a
+    // single row here is a decode step and gets the M=16 twin, exactly like
+    // npu_gemm().
+    I8Ctx& kctx = *ctx_for(&ctx, M);
+    const bool prof = prof_;
+    const auto tp = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     PackedWeight*             slot = nullptr;
     const std::vector<float>* gs = nullptr;
     if (weight_cache_ && wkey >= 0 && cur_layer_ >= 0 && cur_layer_ < c_.NL && dev_) {
@@ -1671,31 +1931,54 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
         auto& m = wcache_[size_t(cur_layer_)];
         auto  it = m.find(wkey);
         if (it == m.end()) {
+            LhScope _tlh_pk(LH_PACK_UPLOAD);
             PackedWeight pw;
-            pw.bo = ctx.make_weight_bo(*dev_);
+            pw.bo = kctx.make_weight_bo(*dev_);
             float sout = 1.0f;
-            ctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
         gs = &slot->scales;
     } else {
         float sout = 1.0f;
-        ctx.packB(0, Bmat, K, N, sout);
-        gs = &ctx.group_scales[0];
+        kctx.packB(0, Bmat, K, N, sout);
+        gs = &kctx.group_scales[0];
     }
+    const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     xrt::run r = slot
-                     ? ctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
-                     : ctx.launch_async_rows(0, A, M, K, ascales.data());
-    ctx.wait_kernel(r);
-    ctx.readback();
+                     ? kctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
+                     : kctx.launch_async_rows(0, A, M, K, ascales.data());
+    const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    kctx.wait_kernel(r);
+    const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+    kctx.readback();
+    const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     out.resize((size_t)M * N);
     for (int m = 0; m < M; m++) {
-        const int32_t* cm = ctx.Cm + (size_t)m * ctx.ND;
+        const int32_t* cm = kctx.Cm + (size_t)m * kctx.ND;
         const float asc = ascales[(size_t)m];
         float* o = out.data() + (size_t)m * N;
         for (int n = 0; n < N; n++)
             o[n] = (float)cm[n] * asc * (*gs)[(size_t)n];
+    }
+    if (m16_check_ && &kctx != &ctx)
+        m16_check_gemm_rows(ctx, kctx, A, M, K, N, slot ? slot->bo.get() : nullptr,
+                            ascales);
+    if (prof) {
+        const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
+        const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
+        const double dwt = std::chrono::duration<double, std::milli>(tw - tq).count();
+        const double drb = std::chrono::duration<double, std::milli>(tr - tw).count();
+        const int di = design_index(&kctx);
+        if (M == 1) {
+            prof_add(prof_dec_, di, dpk, dql, dwt, drb);
+            prof_dec_n_++;
+        } else {
+            prof_add(prof_pre_, di, dpk, dql, dwt, drb);
+            prof_pre_n_++;
+        }
+        if (prof_dec_n_ && (prof_dec_n_ + prof_pre_n_) % 100 == 0) prof_dump();
     }
 }
 
@@ -2002,6 +2285,7 @@ int Q4nxNpuForward::max_batch_rows() const {
 // host helpers (float32, matching the Python reference)
 // --------------------------------------------------------------------------
 float Q4nxNpuForward::rmsnorm(const float* x, const float* w, int n, float* out) const {
+    LhScope _tlh(LH_RMS);
     double ss = 0.0;
     for (int i = 0; i < n; i++) ss += (double)x[i] * (double)x[i];
     const float inv = 1.0f / std::sqrt((float)(ss / (double)n) + sem_.eps);
@@ -2550,6 +2834,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
 
 // SiLU(gate) * up from either a fused GU result or separate G and U results.
 bool Q4nxNpuForward::mlp(const std::vector<float>& gu, std::vector<float>& h, int im) {
+    LhScope _tlh(LH_MLP);
     h.resize(im);
     const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
     for (int i = 0; i < im; i++) {
@@ -2573,6 +2858,16 @@ bool Q4nxNpuForward::mlp(const std::vector<float>& gu, std::vector<float>& h, in
 // --------------------------------------------------------------------------
 bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
+    const long step_d0 = prof_dec_n_;
+    // Phase attribution (NPU_PHASE_PROF=1): named phases summing to this step's wall.
+    const bool ph = phprof_on();
+    const auto tp_step = ph ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+    auto tp_lap = tp_step;
+    if (ph) {
+        g_ph = StepPhases{};
+        for (int i = 0; i < LH_LAYER_N; i++) { g_lh[i] = 0.0; g_lh_n[i] = 0; }
+    }
     const int H = c_.H;
     if (token < 0 || token >= c_.NV) { err_ = "token out of range"; return false; }
 
@@ -2604,6 +2899,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
 
     // Gemma4 needs this token's per-layer inputs before the layer loop.
     if (ple_dim_ > 0) build_ple_inputs(token);
+    if (ph) { g_ph.embed = ph_ms(tp_step); tp_lap = std::chrono::steady_clock::now(); }
 
     for (int l = 0; l < c_.NL; l++) {
         cur_layer_ = l;
@@ -2612,7 +2908,10 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // Q4NX dequant.  GDN/MLA/PLE load members used outside the GEMMs, so they
         // keep loading every token.
         const bool dense_weights_cached = lin_kd_ == 0 && !mla_ && ple_dim_ == 0 && n_expert_ == 0 && weight_cached(0);
+        {
+            LhScope _tlh(LH_LOAD);
         if (!dense_weights_cached && !load_layer(l)) { if (err_.empty()) err_ = "dequant failed"; return false; }
+        }
         // MLA + MoE layers have no plain q/k/v/o or single-MLP structure, so they
         // take their own path through this loop body and skip the rest.
         if (mla_) {
@@ -2621,7 +2920,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             // a bug.
             rmsnorm(x.data(), in_norm_[l].data(), H, xn.data());
             if (!mla_attn(l, xn, o, pos)) return false;
-            for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_; }
 #ifdef NPU_INFER_DEBUG_DUMPS
             if (l == 0 && pos == 0 && getenv("NPU_INFER_DUMP_ATTN")) {
                 FILE* f = open_debug_dump(getenv("NPU_INFER_DUMP_ATTN"));
@@ -2634,7 +2934,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             } else {
                 if (!moe_mlp(l, xn, d)) return false;
             }
-            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_; }
             // Dump one layer's post-residual hidden state for the Python reference
             // comparison (NPU_INFER_DUMP_LN names the layer).
 #ifdef NPU_INFER_DEBUG_DUMPS
@@ -2702,6 +3003,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         // ---- attention ---- (or, for a GDN layer, gdn_layer below)
         rmsnorm(x.data(), in_norm_[l].data(), H, xn.data());
         if (lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR) {
+            LhScope _tlh(LH_GDN);
             if (!gdn_layer(l, xn, o)) return false;
         } else {
         {
@@ -2730,10 +3032,13 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             } else {
                 qkv_use = qkv;
             }
+            {
+            LhScope _tlh(LH_ATTN);
             if (!attention(qkv_use, pos, ctx, l_hd, l_nkv_heads, l_theta, l_rot, l_prop,
                            l_win, kv_layer, !kv_shared)) {
                 err_ = "attention failed";
                 return false;
+            }
             }
             if (gate_ptr)
                 for (int i = 0; i < nhd; i++)
@@ -2752,7 +3057,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             rmsnorm(o.data(), post_norm_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];
         } else {
-            for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += o[k] * residual_scale_; }
         }
         if (!nancheck("attention")) return false;
 
@@ -2771,7 +3077,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             // delta into d.  (deepseek2/GLM MoE layers never reach here -- the MLA
             // branch above handles attn+MoE and continues.)
             if (!moe_mlp(l, xn, d)) return false;
-            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_; }
             if (!nancheck("moe")) return false;
             continue;
         }
@@ -2813,7 +3120,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d, 4);
         }
         if (!gemma4_layer_) {
-            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_;
+            { LhScope _tlh(LH_RES);
+            for (int k = 0; k < H; k++) x[k] += d[k] * residual_scale_; }
             if (!nancheck("mlp")) return false;
             if (pos == 0 && getenv("NPU_INFER_DUMP_LAYERS")) {
                 double s = 0;
@@ -2872,8 +3180,10 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
         if (ls != 1.0f)
             for (int k = 0; k < H; k++) x[k] *= ls;
     }
+    if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
+    if (ph) { g_ph.ffnorm = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
     if (getenv("NPU_INFER_DUMP_HIDDEN")) {
         char hp[256];
         snprintf(hp, sizeof(hp), "/tmp/q4nx_hidden_%d.bin", pos);
@@ -2892,6 +3202,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     }
 #endif
     if (!run_lm_head(xn, logits)) return false;
+    if (ph) { g_ph.head = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
     if (getenv("NPU_INFER_DUMP_LAYERS")) {
         double s = 0; float mx = 0;
         for (float f : xn) { s += std::fabs(f); if (std::fabs(f) > mx) mx = std::fabs(f); }
@@ -2911,6 +3222,80 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     // the captured anchor answers are unchanged.
     if (logit_scale_ != 1.0f)
         for (size_t i = 0; i < logits.size(); i++) logits[i] /= logit_scale_;
+    if (prof_) {
+        // Dispatches for this token, i.e. the count the decode budget is made of.
+        prof_tok_n_++;
+        fprintf(stderr, "[prof] token %ld: decode dispatches=%ld (score=%zu of %zu)\n",
+                prof_tok_n_, prof_dec_n_ - step_d0, logits.size(), logits.size());
+    }
+    if (ph) {
+        const double total = ph_ms(tp_step);
+        const double tail = ph_ms(tp_lap);
+        const double gsum = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+        const double hsum = g_ph.h_memcpy + g_ph.h_pack + g_ph.h_ql + g_ph.h_wait + g_ph.h_rb;
+        fprintf(stderr,
+                "[ph] tok %d pos %d wall=%.1f | embed=%.1f | layers=%.1f (gemm pack=%.1f "
+                "ql=%.1f wait=%.1f rb=%.1f sum=%.1f host=%.1f n=%ld) | ffnorm=%.1f | "
+                "head=%.1f (memcpy=%.1f pack=%.1f ql=%.1f wait=%.1f rb=%.1f sum=%.1f "
+                "host=%.1f) | tail=%.1f\n",
+                token, pos, total, g_ph.embed, g_ph.layer, g_ph.g_pack, g_ph.g_ql, g_ph.g_wait,
+                g_ph.g_rb, gsum, g_ph.layer - gsum, g_ph.launches, g_ph.ffnorm, g_ph.head,
+                g_ph.h_memcpy, g_ph.h_pack, g_ph.h_ql, g_ph.h_wait, g_ph.h_rb, hsum,
+                g_ph.head - hsum, tail);
+        // Top-1 for the greedy-identity gate: <id> plus the margin over second.
+        int am = 0;
+        float a0 = -INFINITY, a1 = -INFINITY;
+        for (size_t i = 0; i < logits.size(); i++) {
+            const float v = logits[(size_t)i];
+            if (v > a0) { a1 = a0; a0 = v; am = (int)i; } else if (v > a1) { a1 = v; }
+        }
+        fprintf(stderr, "[ph] argmax=%d top=%.6f second=%.6f margin=%.6f\n",
+                am, a0, a1, a0 - a1);
+        // Ranked layer-loop host call sites: what the `host=` residual is made of.
+        // Nested rows (of-which) are inside their parent; the TOP-LEVEL SUM is the
+        // one the residual is compared against.
+        // host part of npu_gemm = whole call minus the four device phases it times;
+        // host part of gdn_layer = the scope minus the gemm launches it contains.
+        const double gs = g_ph.g_pack + g_ph.g_ql + g_ph.g_wait + g_ph.g_rb;
+        const double gemm_all  = g_lh[LH_GEMM] + g_lh[LH_GEMM_GDN];
+        const double gemm_host = gemm_all - gs;
+        const double gdn_host  = g_lh[LH_GDN] - g_lh[LH_GEMM_GDN];
+        const double top = g_lh[LH_LOAD] + g_lh[LH_ASM] + g_lh[LH_ATTN] + g_lh[LH_RMS] +
+                           g_lh[LH_RES] + g_lh[LH_MLP] + gdn_host + gemm_host;
+        fprintf(stderr, "[lh] tok %d layer-loop host call sites, ms/token (ranked):\n", token);
+        bool done[LH_LAYER_N] = {false};
+        for (int r = 0; r < LH_LAYER_N; r++) {
+            int best = -1;
+            for (int i = 0; i < LH_LAYER_N; i++) {
+                if (done[i] || g_lh[i] <= 0.0) continue;
+                if (best < 0 || g_lh[i] > g_lh[best]) best = i;
+            }
+            if (best < 0) break;
+            done[best] = true;
+            const double n = g_lh_n[best] ? (double)g_lh_n[best] : 1.0;
+            fprintf(stderr, "[lh]   %-26s %8.2f ms  n=%4ld  %7.3f ms/call  %5.1f%%\n",
+                    lh_name(best), g_lh[best], g_lh_n[best], g_lh[best] / n,
+                    100.0 * g_lh[best] / (g_ph.layer > 0 ? g_ph.layer : 1.0));
+        }
+        static const struct TlpRow { const char* n; double v; } tlp[] = {
+            {"load_layer",                g_lh[LH_LOAD]},
+            {"assemble_B",                g_lh[LH_ASM]},
+            {"gemm host (amax+deq)",      gemm_host},
+            {"gdn_layer (non-gemm)",      gdn_host},
+            {"mlp (act*up)",              g_lh[LH_MLP]},
+            {"rmsnorm",                   g_lh[LH_RMS]},
+            {"attention",                 g_lh[LH_ATTN]},
+            {"residual adds",             g_lh[LH_RES]},
+        };
+        fprintf(stderr, "[lh] TOP-LEVEL PARTITION (no double counting; npu_gemm %.2f "
+                        "- phases %.2f = %.2f host):\n", gemm_all, gs, gemm_host);
+        for (const TlpRow& r : tlp)
+            fprintf(stderr, "[lh]   %-26s %8.2f ms  %5.1f%% of gemm-free host\n", r.n, r.v,
+                    100.0 * r.v / (g_ph.layer - gs > 0 ? g_ph.layer - gs : 1.0));
+        fprintf(stderr, "[lh]   %-26s %8.2f ms\n", "ACCOUNTED", top);
+        fprintf(stderr, "[lh]   %-26s %8.2f ms   (layers=%.2f gemm_phases=%.2f)\n",
+                "UNATTRIBUTED", g_ph.layer - gs - top, g_ph.layer, gs);
+    }
     return true;
 }
 
@@ -2963,40 +3348,122 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     for (int k = 0; k < H; k++) hs[(size_t)k] = h[(size_t)k] * inv_es;
 
     const size_t tile_elems = (size_t)H * (size_t)T;
-    if (lm_head_tiles_.size() != (size_t)ntiles * tile_elems || lm_head_tiles_T_ != T) {
-        // Once per model: [tile][H][T], so each token copies sequentially instead
-        // of gathering the whole head with a T-float stride.
-        lm_head_tiles_.assign((size_t)ntiles * tile_elems, 0.0f);
+    // The head is ONE row of activations (the last token's hidden state), so it is
+    // decode and runs the M=16 twin of this geometry.  The head reuses the widest
+    // K=H design, so the twin is the same kernel the MLP's GU launch uses -- same
+    // N, same per-launch cost.
+    I8Ctx& lctx = *ctx_for(ctx_[i_qkv].get(), 1);
+    // ── Pack the head's B tiles ONCE ──────────────────────────────────────────
+    // Before this, every token copied all 15 f32 tiles out of lm_head_tiles_ (356 MB
+    // a tile) and re-ran packB -- a per-column int8 quantisation of all 89 M head
+    // weights -- on each one: 0.82 s of the 11.5 s decode step (measured: 203 ms of
+    // f32 copy + 618 ms of packB), the only per-token pack left in the model because
+    // wcache_ already holds every layer's projections.  Packing into dedicated
+    // weight BOs at first use makes it a load-time cost instead.
+    const bool head_packed = weight_cache_ && dev_ != nullptr;
+    if (head_packed &&
+        ((int)lm_head_packed_.size() != ntiles || lm_head_packed_T_ != T)) {
+        lm_head_packed_.clear();
+        std::vector<float> bt(tile_elems);
         for (int t = 0; t < ntiles; t++) {
             const int n0 = t * T, n1 = std::min(NV, n0 + T);
-            float* dst = lm_head_tiles_.data() + (size_t)t * tile_elems;
+            std::fill(bt.begin(), bt.end(), 0.0f);   // padded columns must be zero
             for (int n = n0; n < n1; n++)
-                for (int k = 0; k < H; k++)
-                    dst[(size_t)k * T + (n - n0)] = lm_at(n, k);
+                for (int k = 0; k < H; k++) bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
+            PackedWeight pw;
+            pw.bo = lctx.make_weight_bo(*dev_);
+            float sout = 1.0f;
+            // Same packer, same padded KD x ND BO, same per-column scales as the
+            // per-token packB below, so the packed bytes are bit-identical.
+            lctx.packB_into(*pw.bo, bt.data(), H, T, sout, pw.scales);
+            lm_head_packed_.push_back(std::move(pw));
         }
-        lm_head_tiles_T_ = T;
+        lm_head_packed_T_ = T;
+        // Both f32 copies are now dead on this path: lm_head_tiles_ was only ever
+        // read by the memcpy below, and lm_at() is reachable only from the
+        // host_gemm_ branch (which returns above) and from the gather just done.
+        lm_head_tiles_.clear();
+        lm_head_tiles_.shrink_to_fit();
+        lm_head_f_.clear();
+        lm_head_f_.shrink_to_fit();
+        fprintf(stderr, "  [forward] lm head: %d packed weight tile(s) resident "
+                        "(H=%d T=%d), f32 head + f32 tile gather released\n",
+                ntiles, H, T);
     }
-    std::vector<float> Bt(tile_elems);
+    std::vector<float> Bt;
+    if (!head_packed) {
+        if (lm_head_tiles_.size() != (size_t)ntiles * tile_elems || lm_head_tiles_T_ != T) {
+            // Once per model: [tile][H][T], so each token copies sequentially instead
+            // of gathering the whole head with a T-float stride.
+            lm_head_tiles_.assign((size_t)ntiles * tile_elems, 0.0f);
+            for (int t = 0; t < ntiles; t++) {
+                const int n0 = t * T, n1 = std::min(NV, n0 + T);
+                float* dst = lm_head_tiles_.data() + (size_t)t * tile_elems;
+                for (int n = n0; n < n1; n++)
+                    for (int k = 0; k < H; k++)
+                        dst[(size_t)k * T + (n - n0)] = lm_at(n, k);
+            }
+            lm_head_tiles_T_ = T;
+        }
+        Bt.assign(tile_elems, 0.0f);
+    }
+    // Phase attribution for the NPU head (NPU_PHASE_PROF=1): h_memcpy is the
+    // per-tile f32 copy, h_pack/h_ql/h_wait/h_rb come from the launch timers
+    // below, h_total is the whole call.
+    const bool ph = phprof_on();
+    g_in_head = ph;
+    g_ph.h_memcpy = g_ph.h_pack = g_ph.h_ql = g_ph.h_wait = g_ph.h_rb = 0;
+    const auto hp0 = ph ? std::chrono::steady_clock::now()
+                        : std::chrono::steady_clock::time_point{};
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);
-        std::memcpy(Bt.data(), lm_head_tiles_.data() + (size_t)t * tile_elems,
-                    tile_elems * sizeof(float));
-        float sout = 1.0f;
-        ctx_[i_qkv]->packB(0, Bt.data(), H, T, sout);
+        const auto hm0 = ph ? std::chrono::steady_clock::now()
+                            : std::chrono::steady_clock::time_point{};
+        if (!head_packed)
+            std::memcpy(Bt.data(), lm_head_tiles_.data() + (size_t)t * tile_elems,
+                        tile_elems * sizeof(float));
+        if (ph) g_ph.h_memcpy += ph_ms(hm0);
+        const auto h0 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         float amax = 0.0f;
         for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }
         const float as = amax > 0 ? amax / 127.0f : 1.0f;
-        ctx_[i_qkv]->quantize_async(hs.data(), 1, H, as);
-        xrt::run r = ctx_[i_qkv]->sync_and_launch(0);
-        ctx_[i_qkv]->wait_kernel(r);
-        ctx_[i_qkv]->readback();
-        const std::vector<float>& gs = ctx_[i_qkv]->group_scales[0];
+        xrt::run r = [&]() -> xrt::run {
+            if (head_packed)
+                return lctx.launch_async_with_bo(*lm_head_packed_[(size_t)t].bo,
+                                                 hs.data(), 1, H, as);
+            float sout = 1.0f;
+            lctx.packB(0, Bt.data(), H, T, sout);
+            lctx.quantize_async(hs.data(), 1, H, as);
+            return lctx.sync_and_launch(0);
+        }();
+        const auto h1 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        lctx.wait_kernel(r);
+        const auto h2 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        lctx.readback();
+        const auto h3 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+        const std::vector<float>& gs = head_packed ? lm_head_packed_[(size_t)t].scales
+                                                   : lctx.group_scales[0];
         for (int n = n0; n < n1; n++) {
-            float v = (float)ctx_[i_qkv]->Cm[n - n0] * as * gs[(size_t)(n - n0)];
+            float v = (float)lctx.Cm[n - n0] * as * gs[(size_t)(n - n0)];
             if (sem_.logit_softcap > 0)
                 v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
             logits[(size_t)n] = v;
         }
+        if (prof_) {
+            // h0 -> h1 is the weight work (packB in the fallback, a no-op amax scan +
+            // BO launch when packed), h1 -> h2 the kernel, h2 -> h3 the readback.
+            const double dpk = std::chrono::duration<double, std::milli>(h1 - h0).count();
+            const double dql = 0.0;
+            const double dwt = std::chrono::duration<double, std::milli>(h2 - h1).count();
+            const double drb = std::chrono::duration<double, std::milli>(h3 - h2).count();
+            prof_add(prof_dec_, i_qkv, dpk, dql, dwt, drb);
+            prof_dec_n_++;
+            if (ph) {
+                g_ph.h_pack += dpk; g_ph.h_ql += dql;
+                g_ph.h_wait += dwt; g_ph.h_rb += drb;
+            }
+        }
     }
+    if (ph) { g_ph.h_total = ph_ms(hp0); g_in_head = false; }
     return true;
 }

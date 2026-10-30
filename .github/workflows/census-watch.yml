@@ -103,7 +103,7 @@ jobs:
             echo "  !! UNCOVERED SimulatedForTestingClass (new class): 1 model(s), e.g. example/simulated" >> /tmp/census-watch.log
             rc=1
           fi
-          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|kernel-format|Q4NX (NPU)" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
+          lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX (NPU)|support_pins" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
           if [ $rc -eq 1 ]; then echo "alert=true" >> "$GITHUB_OUTPUT"; fi
           exit $rc
@@ -137,8 +137,9 @@ jobs:
             echo ""
             echo "The daily new-model watcher found Hugging Face models whose architecture class is not"
             echo "mapped by the engine registry (\`registry/architectures.json\`), a FastFlowLM"
-            echo "repo publishing a model family this engine does not serve, or a Q4NX (NPU) pack for"
-            echo "a family only a non-NPU backend serves (engine #588):"
+            echo "repo publishing a model family this engine does not serve, a Q4NX (NPU) pack for"
+            echo "a family only a non-NPU backend serves (engine #588), or a supporting upstream pinned"
+            echo "in \`registry/support_pins.json\` that moved or a new d3 weight repo:"
             echo ""
             echo '```'
             printf '%s' "$LINES" | base64 -d
@@ -148,7 +149,9 @@ jobs:
             echo "accepts the architecture, or serve the family on the NPU route when the pack asks for"
             echo "it, or record why it is not an alias in \`registry/significant.json\`"
             echo "and \`docs/arch-gaps.md\` (a class reviewed as significant needs real engine support, not a"
-            echo "mapping). Re-run \`python3 tools/census_watch.py\` to confirm."
+            echo "mapping); for a moved supporting upstream, read the change and bump its commit and"
+            echo "\`reviewed\` in \`registry/support_pins.json\`, or add the new d3 repo to its list."
+            echo "Re-run \`python3 tools/census_watch.py\` to confirm."
             echo ""
             echo "Run: $RUN_URL"
             echo ""

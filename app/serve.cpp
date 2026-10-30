@@ -14,7 +14,7 @@
 // limitations under the License.
 
 // `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|hybrid|cpu|ds4] [--mtp HEAD]`
-//                        [--npu-opt KEY=VALUE ...] [--prefill-provider PATH]
+//                        [--npu-opt KEY=VALUE ...] [--npu-streams N] [--prefill-provider PATH]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
 // OpenAI-compatible API. It is how the engine runs inside Lemonade: Lemonade's
@@ -170,6 +170,7 @@ struct Options {
     std::string embed, rerank;   // RAG: an embedding model and a reranker, served beside the chat model
     std::string role;            // "embedding" or "reranking": the model itself is served in that role
     std::vector<std::string> npu_opts;   // --npu-opt KEY=VALUE, for a private NPU route
+    int npu_streams = 1;   // --npu-streams N: N opted-in serves share the NPU (app/npu_device_lock.h)
     std::string prefill_provider;        // --prefill-provider PATH (or ONEBIT_HYBRID_PREFILL): --device hybrid's prefill (docs/hybrid.md)
     std::string laya_model;              // --laya-model DIR: route each request by the Laya scorer (docs/laya.md)
     bool laya_auto = false;              // --laya: the same with the installed checkpoint (laya_checkpoint())
@@ -934,6 +935,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     std::vector<std::string>& env = l.env;
     std::string& set_model = l.set_model;
     if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
+    if (o.npu_streams != 1 && device != "npu") throw std::runtime_error("--npu-streams works with --device npu");
+    if (o.npu_streams < 1 || o.npu_streams > 16)  // 16 = the device's hwctx limit (app/npu_device_lock.h)
+        throw std::runtime_error("--npu-streams takes 1..16 (the device's hwctx limit), not " + std::to_string(o.npu_streams));
     if (device == "hybrid") {
         // Hybrid (docs/hybrid.md, app/serve_hybrid.h): llama-server decodes on HRX (the CPU in a build
         // without HRX, so the path runs anywhere), from a KV cache an external prefill provider computed
@@ -2632,6 +2636,8 @@ void usage(FILE* out) {
                  "                  [--embed MODEL.gguf] [--rerank MODEL.gguf]   RAG: /v1/embeddings and /v1/rerank\n"
                  "                  [--embedding | --reranking]   serve the model itself as an embedding or reranking model\n"
                  "                  [--npu-opt KEY=VALUE ...]   an option for a private NPU route (docs/npu.md)\n"
+                 "                  [--npu-streams N]   with --device npu: this serve is one of N sharing the NPU\n"
+                 "                  (default 1, the device exclusive; docs/npu.md)\n"
                  "                  [--laya | --laya-model DIR] [--route-policy FILE]   with --device auto, Laya classifies\n"
                  "                  each conversation and the route policy picks its device (docs/laya.md)\n"
                  "                  [--recipes FILE | --no-recipes]   tuned llama-server settings per model and route\n"
@@ -2730,6 +2736,7 @@ int run_serve(int argc, char** argv) {
         else if (a == "--reranking") o.role = "reranking";
         else if (a == "--rerank") o.rerank = next();
         else if (a == "--npu-opt") o.npu_opts.push_back(next());
+        else if (a == "--npu-streams") o.npu_streams = std::stoi(next());
         else if (a == "--prefill-provider") o.prefill_provider = next();
         else if (a == "--laya-model") o.laya_model = next();
         else if (a == "--laya") o.laya_auto = true;
@@ -2893,6 +2900,7 @@ int run_serve(int argc, char** argv) {
         std::vector<std::string> args = {"-m", dir + "/model.q4nx", "--kernels", kernels,
                                          "-p", std::to_string(o.port), "--host", o.host};
         if (!o.alias.empty()) { args.push_back("--alias"); args.push_back(o.alias); }
+        if (o.npu_streams > 1) { args.push_back("--npu-streams"); args.push_back(std::to_string(o.npu_streams)); }
         std::vector<char*> av;
         for (auto& s : args) av.push_back(s.data());
         return run_forward_serve(int(av.size()), av.data());

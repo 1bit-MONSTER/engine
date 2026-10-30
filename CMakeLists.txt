@@ -184,6 +184,12 @@ add_executable(npu_sampling_test tests/npu_sampling_test.cpp)
 target_include_directories(npu_sampling_test PRIVATE app)
 target_link_libraries(npu_sampling_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME npu_sampling COMMAND npu_sampling_test)
+# Who may have the NPU (app/npu_device_lock.h, engine#612, docs/npu.md "Two streams on one
+# NPU"): the exclusive default and the shared --npu-streams >= 2 opt-in, on a lock file in a
+# temp dir; header only, no device, runs in CI.
+add_executable(npu_device_lock_test tests/npu_device_lock_test.cpp)
+target_include_directories(npu_device_lock_test PRIVATE app)
+add_test(NAME npu_device_lock COMMAND npu_device_lock_test)
 # general.architecture from a GGUF header (app/gguf_meta.h), which routes fork-only
 # architectures to our llama.cpp; header only, runs in CI.
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)

@@ -260,16 +260,51 @@ With that said, two streams do run, and the option is what says you meant it:
 `--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
 N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
 unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
-still keeps them all out, in either order, because they share one file and one `flock(2)`. It is
-advisory: a process that does not take the lock is not serialised against, which is what
-`NPU_NO_DEVICE_LOCK=1` does (an unsupported escape hatch, not a mode).
+still keeps them all out, in either order, because they share one file and one `flock(2)`.
+
+**The lock is one file and one protocol, across runtimes, and it is advisory** -- that is what makes it
+usable beside another NPU engine, and what its limits are:
+
+- **Path and modes.** `/tmp/1bit-npu-device.lock`, created `0644` if absent, `flock(2)` (not `fcntl`)
+  so it works across processes, users and runtimes on the box. `LOCK_SH` = "I am one of N streams, do
+  not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
+  open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
+  overlap, in either order, on one file.
+- **Who may take what.** Anything that honours the file interlocks with us: our serves
+  (`--npu-streams` decides which mode), the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+  Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
+  keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
+  file is not slowed, not blocked and not detected.
+- **What happens when the other engine ignores it** is measured, not assumed: with the lock bypassed
+  (`NPU_NO_DEVICE_LOCK=1`), two of our contexts on Qwen3-0.6B ran at **65.7 % of solo each, 1.31x
+  aggregate** (3 reps, engine `a88ef00`, 2026-10-29). So an uncoordinated second engine costs the
+  first one about a third of its per-stream speed and buys less than a third in aggregate; the failure
+  mode is slow, not wrong.
+
+**Partitioning, and what it would take.** Two whole-array streams share one DMA engine, so they
+serialise; the September prototype that scaled (~100 % each) did it by giving each stream a *disjoint
+half of the columns*, which halves per-stream weight reuse, and its xclbin pair is ABI-stale at this
+pin, so nothing in this tree can select a column split today: both of our instances run whole-array.
+What each engine costs is therefore the whole model per stream -- **one hwctx and one complete copy of
+the weight BOs, plus its own KV cache and scratch**, and the device's hwctx limit is 16. The accounting
+per engine is: `streams x (weights + KV + scratch)` must fit in the NPU's share of the box's LPDDR5X
+alongside whatever the other engine has already allocated, and both engines pull from the same DMA
+bandwidth. Two *different* models resident at once (the reason the second engine exists) is therefore
+bounded by memory first, not by hwctx: see the table below.
 
 What it measures, on Qwen3-0.6B-Q4_K_M (`max_tokens 8`, `temperature 0`, three reps, rep 1 dropped
-as warm-up, engine `a88ef00`, 2026-10-29): solo **6.31 / 6.23 s**, concurrent **9.51 / 9.51 s** --
-**65.7 % of solo per stream, 1.31x aggregate**. So it is worth it for two interactive sessions of a
-model small enough that two copies fit, and not for throughput. `tests/npu_device_lock_test.cpp`
-(ctest `npu_device_lock`, in CI) proves the lock discipline without a device: exclusive excludes
-everything, three shared streams co-exist, and an exclusive waits for the last one to go.
+as warm-up, engine `a88ef00`, 2026-10-29, lock bypassed): solo **6.31 / 6.23 s**, concurrent
+**9.51 / 9.51 s** -- **65.7 % of solo per stream, 1.31x aggregate**. So it is worth it for two
+interactive sessions of a model small enough that two copies fit, and not for throughput.
+`tests/npu_device_lock_test.cpp` (ctest `npu_device_lock`, in CI) proves the lock discipline without a
+device: exclusive excludes everything, three shared streams co-exist, and an exclusive waits for the
+last one to go.
+
+**The row this exists for.** On Linux the two engines are two instances of this runtime on two
+*different* models at the same time -- "all NPU models at once" -- and that is what
+`tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
+Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
+number stamped with the build that produced it.
 
 ## Add-on routes
 

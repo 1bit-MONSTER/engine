@@ -14,20 +14,22 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-# engine#612, row 1: two NPU streams through the supported opt-in (`--npu-streams 2`,
-# app/npu_device_lock.h) against the same model run solo, REPEATS reps of 8 greedy tokens each.
-# Every number carries its instrument, its repeat count and its timestamp; rep 1 is a warm-up and
-# is reported but not averaged, because the first request after a load is 2x the steady state.
+# engine#612, row 1: two NPU engines at once, through the supported opt-in (`--npu-streams 2`,
+# app/npu_device_lock.h). On Linux both engines are this runtime: MODEL and MODEL_B are two different
+# models resident side by side, each measured solo and then together, REPEATS reps of 8 greedy tokens
+# each. Every number carries its instrument, its repeat count and its timestamp; rep 1 of each arm is a
+# warm-up and is reported but not averaged.
 #
-#   BIN=... MODEL=... KERNELS=... tools/showcase-612-npu-streams.sh
+#   BIN=... MODEL=... MODEL_B=... tools/showcase-612-npu-streams.sh
 #
 # It waits for the NPU device lock to be free and never takes it from a running job: while another
 # process holds /tmp/1bit-npu-device.lock exclusively (the owner's own serve, the ELF runner) this
-# exits 75 and says who holds it. It kills only the two servers it started, by pid.
+# exits 75 and says who holds it. It kills only the servers it started, by pid.
 set -uo pipefail
 
 BIN=${BIN:-${PWD}/build/1bit}
 MODEL=${MODEL:-$HOME/models/npu/Qwen3-0.6B}
+MODEL_B=${MODEL_B:-$HOME/models/npu/Qwen3-4B}
 KERNELS=${KERNELS:-${ONEBIT_NPU_KERNELS:-$HOME/lb/lfm2-npu/kernels_m16}}
 PORT_A=${PORT_A:-18761}
 PORT_B=${PORT_B:-18762}
@@ -40,12 +42,15 @@ OUT=$HOME/lb/612-npu-streams-$TAG
 mkdir -p "$OUT" || exit 1
 LOG=$OUT/run.log
 PROMPT="Write one sentence about the sea."
+A=$(basename "$MODEL")
+B=$(basename "$MODEL_B")
 
 say() { echo "[$(date -Is)] $*" | tee -a "$LOG"; }
 die() { say "FAIL: $*"; exit 1; }
 
 [ -x "$BIN" ] || die "no binary at $BIN"
 [ -f "$MODEL/model.q4nx" ] || die "no model.q4nx in $MODEL"
+[ -f "$MODEL_B/model.q4nx" ] || die "no model.q4nx in $MODEL_B (set MODEL_B)"
 [ -d "$KERNELS" ] || die "no kernel (full ELF) directory at $KERNELS"
 
 # The device lock: wait for it to be free, never take it from a live job.
@@ -66,9 +71,11 @@ done
 say "device lock free; claiming the box for this run"
 
 say "pin: $("$BIN" --version 2>&1 | head -1) at $BIN"
-say "model: $MODEL/model.q4nx $(stat -Lc %s "$MODEL/model.q4nx") B sha256 $(sha256sum "$MODEL/model.q4nx" | cut -d' ' -f1)"
+for m in "$MODEL" "$MODEL_B"; do
+    say "model: $m/model.q4nx $(stat -Lc %s "$m/model.q4nx") B sha256 $(sha256sum "$m/model.q4nx" | cut -d' ' -f1)"
+done
 say "kernels: $KERNELS"
-say "protocol: max_tokens $TOKS, temperature 0, $REPEATS repeats, rep 1 dropped as warm-up"
+say "protocol: two engines of this runtime on $A and $B, max_tokens $TOKS, temperature 0, $REPEATS repeats per arm, rep 1 dropped as warm-up"
 
 PIDS=()
 cleanup() {
@@ -77,10 +84,10 @@ cleanup() {
 }
 trap cleanup EXIT
 
-start() {   # start <port> <logfile>
-    local port=$1 log=$2
+start() {   # start <model dir> <port> <logfile>: echoes the pid once the serve is ready
+    local model=$1 port=$2 log=$3
     : > "$log"
-    "$BIN" forward-serve -m "$MODEL/model.q4nx" --kernels "$KERNELS" -p "$port" --npu-streams 2 \
+    "$BIN" forward-serve -m "$model/model.q4nx" --kernels "$KERNELS" -p "$port" --npu-streams 2 \
         >> "$log" 2>&1 &
     local pid=$!
     PIDS+=("$pid")
@@ -91,6 +98,11 @@ start() {   # start <port> <logfile>
     done
     say "server on $port never became ready:" >&2; tail -5 "$log" >&2
     return 1
+}
+
+stop() {    # stop <pid>
+    [ -n "${1:-}" ] || return 0
+    kill "$1" 2>/dev/null; wait "$1" 2>/dev/null; PIDS=()
 }
 
 ask() {     # ask <port>: "tokens wall_seconds" for one request
@@ -121,63 +133,68 @@ PY
 }
 
 rows=$OUT/rows.csv
-echo "rep,arm,stream,tokens,wall_s,note" > "$rows"
+echo "rep,arm,model,tokens,wall_s,note" > "$rows"
 
-solo_srv=$(start "$PORT_A" "$OUT/solo.log") || die "solo server did not start"
-for rep in $(seq 1 "$REPEATS"); do
-    out=$(ask "$PORT_A") || die "solo request failed at rep $rep"
-    read -r n wall <<< "$out"
-    note=$([ "$rep" = 1 ] && echo warm-up)
-    echo "$rep,solo,1,$n,$wall,$note" >> "$rows"
-    say "rep $rep solo: $n tokens in ${wall}s${note:+ ($note)}"
+# Solo: each model alone on the device, the other not even loaded -- so "solo" means solo.
+for pair in "solo_a $MODEL $PORT_A" "solo_b $MODEL_B $PORT_B"; do
+    set -- $pair
+    arm=$1 model=$2 port=$3
+    srv=$(start "$model" "$port" "$OUT/$arm.log") || die "$arm server did not start"
+    for rep in $(seq 1 "$REPEATS"); do
+        out=$(ask "$port") || die "$arm request failed at rep $rep"
+        read -r n wall <<< "$out"
+        note=$([ "$rep" = 1 ] && echo warm-up)
+        echo "$rep,$arm,$(basename "$model"),$n,$wall,$note" >> "$rows"
+        say "rep $rep $arm ($(basename "$model")): $n tokens in ${wall}s${note:+ ($note)}"
+    done
+    say "lock mode on $arm: $(grep -o '[a-z]* device lock acquired[^)]*' "$OUT/$arm.log" | head -1)"
+    stop "$srv"
 done
-kill "$solo_srv" 2>/dev/null; wait "$solo_srv" 2>/dev/null
-PIDS=()
-say "shared lock taken by both streams: $(grep -c 'shared device lock acquired' "$OUT/solo.log") of 1"
 
+# Concurrent: two models, two hwctx, one device.
 for rep in $(seq 1 "$REPEATS"); do
-    a=$(start "$PORT_A" "$OUT/solo-$rep.log") || die "stream 1 did not start at rep $rep"
-    b=$(start "$PORT_B" "$OUT/stream2-$rep.log") || die "stream 2 did not start at rep $rep"
+    pa=$(start "$MODEL" "$PORT_A" "$OUT/conc-a-$rep.log") || die "engine 1 did not start at rep $rep"
+    pb=$(start "$MODEL_B" "$PORT_B" "$OUT/conc-b-$rep.log") || die "engine 2 did not start at rep $rep"
     # Both requests in flight at once: start them together, then read both walls.
     before=$(date +%s.%N)
     ask "$PORT_A" > "$OUT/a-$rep.txt" &
-    pa=$!
+    ra=$!
     ask "$PORT_B" > "$OUT/b-$rep.txt" &
-    pb=$!
-    wait "$pa" || die "stream 1 request failed at rep $rep"
-    wait "$pb" || die "stream 2 request failed at rep $rep"
+    rb=$!
+    wait "$ra" || die "engine 1 request failed at rep $rep"
+    wait "$rb" || die "engine 2 request failed at rep $rep"
     after=$(date +%s.%N)
     read -r na wa < "$OUT/a-$rep.txt"
     read -r nb wb < "$OUT/b-$rep.txt"
     note=$([ "$rep" = 1 ] && echo warm-up)
-    echo "$rep,concurrent,1,$na,$wa,$note" >> "$rows"
-    echo "$rep,concurrent,2,$nb,$wb,$note" >> "$rows"
-    say "rep $rep concurrent: stream 1 $na tokens in ${wa}s, stream 2 $nb tokens in ${wb}s, both in $(python3 -c "print(round($after-$before,3))")s${note:+ ($note)}"
-    kill "$a" "$b" 2>/dev/null; wait "$a" "$b" 2>/dev/null
-    PIDS=()
+    echo "$rep,concurrent_a,$A,$na,$wa,$note" >> "$rows"
+    echo "$rep,concurrent_b,$B,$nb,$wb,$note" >> "$rows"
+    say "rep $rep concurrent: $A $na tokens in ${wa}s, $B $nb tokens in ${wb}s, both in $(python3 -c "print(round($after-$before,3))")s${note:+ ($note)}"
+    stop "$pa"; stop "$pb"
 done
 
-python3 - "$rows" "$TOKS" <<'PY' | tee -a "$LOG"
+python3 - "$rows" "$TOKS" "$A" "$B" <<'PY' | tee -a "$LOG"
 import csv, sys, statistics
-TOKS = int(sys.argv[2])
-solo, conc = {}, {}
+TOKS, A, B = int(sys.argv[2]), sys.argv[3], sys.argv[4]
+walls = {}
 for r in csv.DictReader(open(sys.argv[1])):
     if r["note"] == "warm-up":
         continue
-    (solo if r["arm"] == "solo" else conc).setdefault(r["arm"] + r["stream"], []).append(float(r["wall_s"]))
-if not solo or not conc:
-    print("no measured rows (every rep was a warm-up)")
-    raise SystemExit(1)
-s = statistics.mean(next(iter(solo.values())))
-c1 = statistics.mean(conc.get("concurrent1", [0]))
-c2 = statistics.mean(conc.get("concurrent2", [0]))
-c = statistics.mean([c1, c2])
+    walls.setdefault(r["arm"], []).append(float(r["wall_s"]))
+for arm in ("solo_a", "solo_b", "concurrent_a", "concurrent_b"):
+    if not walls.get(arm):
+        print("no measured rows for %s" % arm)
+        raise SystemExit(1)
+sa, sb = statistics.mean(walls["solo_a"]), statistics.mean(walls["solo_b"])
+ca, cb = statistics.mean(walls["concurrent_a"]), statistics.mean(walls["concurrent_b"])
+n = len(walls["concurrent_a"])
 print("")
-print("| arm | wall (s), mean over %d measured reps | per-stream decode (tok/s) |" % len(next(iter(conc.values()))))
+print("| arm | wall (s), mean of %d measured reps | decode (tok/s) |" % n)
 print("|---|---|---|")
-print("| one stream, solo | %.2f | %.2f |" % (s, TOKS / s))
-print("| two streams, stream 1 | %.2f | %.2f (%.1f %% of solo) |" % (c1, TOKS / c1, 100 * s / c1))
-print("| two streams, stream 2 | %.2f | %.2f (%.1f %% of solo) |" % (c2, TOKS / c2, 100 * s / c2))
-print("| **aggregate** | | **%.2fx** |" % ((TOKS / c1 + TOKS / c2) / (TOKS / s)))
+print("| %s alone | %.2f | %.2f |" % (A, sa, TOKS / sa))
+print("| %s alone | %.2f | %.2f |" % (B, sb, TOKS / sb))
+print("| %s + %s at once: %s | %.2f | %.2f (%.1f %% of solo) |" % (A, B, A, ca, TOKS / ca, 100 * sa / ca))
+print("| %s + %s at once: %s | %.2f | %.2f (%.1f %% of solo) |" % (A, B, B, cb, TOKS / cb, 100 * sb / cb))
+print("| **aggregate** | | **%.2fx** |" % ((TOKS / ca + TOKS / cb) / (TOKS / sa + TOKS / sb)))
 PY
 say "rows in $rows, logs and answers in $OUT"

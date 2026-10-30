@@ -169,6 +169,37 @@ cpp-httplib (v0.47.0)
   License: MIT
 
 -------------------------------------------------------------------------------
+Linked at build time against a system package (not redistributed)
+-------------------------------------------------------------------------------
+
+ONNX Runtime (https://github.com/microsoft/onnxruntime)
+  Copyright (c) Microsoft Corporation. All rights reserved.
+  License: MIT. Built only with -DONEBIT_ORT=ON (docs/onnx.md): the engine then
+  links the distribution's libonnxruntime 1.23.2 (Ubuntu package
+  libonnxruntime1.23/libonnxruntime-dev 1.23.2+dfsg-6ubuntu1, served OrtApi v23;
+  sha256 of libonnxruntime.so.1.23.2 is recorded in onnx/README.md) and ships
+  libonebit_ep.so, our plugin execution provider, whose only ORT constants are
+  the ones its public headers declare. ONNX Runtime is not modified, and no
+  proprietary execution provider ships with it: AMD's VitisAI EP wheel is never
+  linked or redistributed here.
+  MIT license text, as ONNX Runtime ships it:
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+-------------------------------------------------------------------------------
 Redistributed on the 1bit OS image (os/mini/mkimage.sh)
 -------------------------------------------------------------------------------
 

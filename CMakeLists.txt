@@ -119,6 +119,12 @@ file(WRITE ${CMAKE_BINARY_DIR}/generated/hrx_archs.h
 set_property(DIRECTORY APPEND PROPERTY CMAKE_CONFIGURE_DEPENDS ${CMAKE_SOURCE_DIR}/registry/architectures.json)
 set_target_properties(onebit PROPERTIES OUTPUT_NAME 1bit)
 target_link_libraries(onebit PRIVATE nlohmann_json::nlohmann_json httplib::httplib Threads::Threads)
+if(ONEBIT_ORT)
+    add_subdirectory(onnx)
+    target_link_libraries(onebit PRIVATE onebit_ort_info onebit_ort_run)
+    target_compile_definitions(onebit PRIVATE ONEBIT_ORT=1)
+    message(STATUS "ONEBIT_ORT=ON — ONNX Runtime ${ONEBIT_ORT_PC_VERSION}: '1bit ort-info' + '1bit ort-run' + libonebit_ep.so")
+endif()
 # backends are compiled in by build-tree path; a package keeps that layout (app/built_path.h)
 # Backend paths are embedded RELATIVE to the build dir (see app/built_path.h): a shipped binary
 # must not name a build-machine path. Each define below is turned into its relative form first.
@@ -223,6 +229,12 @@ add_test(NAME pm_routes COMMAND pm_routes_test)
 # ── `1bit serve` end to end (docs/serve.md) ───────────────────────────────
 # Needs a GGUF (e.g. Qwen3-0.6B Q4_K_M); tests each device this build has.
 set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
+
+# ── ONNX Runtime in-process (docs/onnx.md) ───────────────────────────────
+# Off by default: it needs the libonnxruntime 1.23.2 dev package (pkg-config libonnxruntime) and
+# nothing in CI or a normal engine build should depend on it. ON adds `1bit ort-info` (the pin and
+# the EP roster this binary actually has) and links onnx/, which also builds libonebit_ep.so.
+option(ONEBIT_ORT "Link ONNX Runtime 1.23.2 in-process (1bit ort-info + the plugin EP)" OFF)
 
 # ── Step 2: HRX, the engine's GPU route (docs/hrx.md) ─────────────────────
 # Off by default: it needs TheRock/ROCm and the HRX submodules, and it only runs on AMD GPUs.

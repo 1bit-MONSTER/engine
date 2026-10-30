@@ -91,6 +91,7 @@ import os
 import re
 import sys
 import time
+import urllib.error
 import urllib.request
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -118,6 +119,33 @@ MODALITY_TOKENS = frozenset(("text", "vl", "vision", "audio", "image", "video", 
                              "instruct", "chat", "base", "mm", "multimodal"))
 FLM_ORG_URL = (f"{API}?author={FLM_AUTHOR}&sort=lastModified&direction=-1&limit={FLM_LIMIT}"
                "&expand[]=lastModified&expand[]=tags&expand[]=config&expand[]=siblings")
+# Gated (auto-access) repos answer the listing with no `config`, so their architecture stays
+# unknowable and the class is never seen - the blind spot behind engine#619's five
+# UNVERIFIABLE rows. Both names are what huggingface_hub and the `hf` CLI read; with no token
+# in the environment the request is byte-identical to what this watcher always sent, and an
+# invalid one only costs a 401 the retry loop already tolerates.
+TOKEN_VARS = ("HF_TOKEN", "HUGGING_FACE_HUB_TOKEN")
+
+
+def hf_token():
+    """The token to send, or '' - read per call so a test can set it."""
+    for var in TOKEN_VARS:
+        token = os.environ.get(var, "").strip()
+        if token:
+            return token
+    return ""
+
+
+_AUTH_REJECTED = False  # a 401 on the token turns it off for the rest of the run
+
+
+def request_headers():
+    """Headers for every HF request: the UA, plus Authorization when a token is present."""
+    headers = {"User-Agent": "1bit-census-watch"}
+    token = hf_token()
+    if token and not _AUTH_REJECTED:
+        headers["Authorization"] = "Bearer " + token
+    return headers
 
 # A derivative carries no config.json of its own by design (a quantized GGUF, a LoRA
 # adapter); the raw release it derives from carries the config and is what gets checked.
@@ -146,9 +174,22 @@ def hf_get_page(url, tries=4):
     """
     for t in range(tries):
         try:
-            req = urllib.request.Request(url, headers={"User-Agent": "1bit-census-watch"})
+            req = urllib.request.Request(url, headers=request_headers())
             with urllib.request.urlopen(req, timeout=60) as r:
                 return json.load(r), r.headers.get("Link", "")
+        except urllib.error.HTTPError as e:
+            # A rejected token must not cost the whole run: fall back to anonymous and say so.
+            # A gated repo then answers with no config again, which is what UNVERIFIABLE reports.
+            if e.code == 401 and "Authorization" in req.headers:
+                global _AUTH_REJECTED
+                _AUTH_REJECTED = True
+                print(f"hf_get_page {url}: the token was rejected (401); continuing without it",
+                      file=sys.stderr)
+                continue
+            if t == tries - 1:
+                print(f"hf_get_page {url}: {e}", file=sys.stderr)
+                return [], ""
+            time.sleep(2 * (t + 1))
         except Exception as e:
             if t == tries - 1:
                 print(f"hf_get_page {url}: {e}", file=sys.stderr)
@@ -673,8 +714,11 @@ def report(models, res, previously_seen):
             print(f"  !! UNCOVERED {cls} (new class): {len(ids)} model(s), e.g. {ids[0]}")
             print(f"     -> map it in registry/architectures.json (a pinned backend's code "
                   f"must accept the architecture)")
+    # say whether a token was already sent: "gated repos need a token" is misleading advice on a
+    # run that sent one and still got no config back
+    hint = " (HF_TOKEN sent, still no config)" if hf_token() else ""
     for mid in sorted(res[UNVERIFIABLE]):
-        print(f"  ? UNVERIFIABLE {mid} ({res['reasons'][mid]}) — gated repos need a token; "
+        print(f"  ? UNVERIFIABLE {mid} ({res['reasons'][mid]}) — gated repos need a token{hint}; "
               f"retried next run")
     return 1 if any(c not in quiet for c in res["classes"]) else 0
 

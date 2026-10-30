@@ -54,6 +54,11 @@ struct I8Ctx {
 
     bool isReady() { return initialized && kext && bA && bC; }
 
+    // Device weight layout: false = padded row-major [KD][ND] (every container
+    // before q4nx_weight_layout "b8"), true = the blocked 8x8-microtile image.
+    // Set by Q4nxNpuForward from the container's config before the first pack.
+    bool blocked_b = false;
+
     // ── Init: consume a FULL ELF directly ──
     // Kernel signature: (bo0, bo1, bo2) == (A, B, C). No instruction BO: the
     // TXN control stream lives in the ELF's .ctrltext. Kernel name is
@@ -64,6 +69,14 @@ struct I8Ctx {
         MD = M; KD = K; ND = N; NL = nlayers;
         fprintf(stderr, "  I8Ctx::init_elf ep=%s M=%d K=%d N=%d nl=%d\n",
                 ep, M, K, N, nlayers);
+        // The blocked image is built from whole 64x128 tiles: a geometry that is
+        // not a multiple of those has no blocked mapping, and silently packing it
+        // would index outside the tile grid.
+        if (blocked_b && ((size_t)KD % 64 != 0 || (size_t)ND % 128 != 0)) {
+            fprintf(stderr, "  I8Ctx::init_elf: the b8 layout needs K%%64==0 and N%%128==0 "
+                            "(K=%d N=%d)\n", KD, ND);
+            return false;
+        }
         try {
             elf = std::make_unique<xrt::elf>(std::string(ep));
             if (!elf->is_full_elf()) {
@@ -121,6 +134,24 @@ struct I8Ctx {
     // disjoint column blocks. Same amax, per-column scale, rounding and clamps:
     // the packed bytes and scales are bit-identical; only the order of the
     // diagnostic `ssum` accumulation differs.
+    // Where element (i,j) of the padded [KD][ND] weight image lives in the BO.
+    // Row-major is the historic layout.  blocked_b writes the image the way the
+    // M=16/M=128 kernels' B microkernel already indexes it -- 64x128 tiles of
+    // [kb][nb][8][8] (see mm_kernel_reference.cc, "B LAYOUT silicon-verified") --
+    // with the tiles laid out n-tile-major so a core's k-loop walks forward
+    // through memory.  Then each tile is ONE contiguous 8192-byte burst instead
+    // of 64 runs of 128 contiguous bytes strided by ND, which is worth 2.4-2.6x
+    // on every 27B phase (arena LEADERBOARD: 3.32 -> 8.13 GB/s on GU).
+    // The bytes are the same int8 codes with the same per-column scales, so the
+    // int32 result is bit-identical; only the address order changes.
+    inline size_t bpos(size_t i, size_t j) const {
+        if (!blocked_b) return i * (size_t)ND + j;
+        const size_t nt = j / 128, ki = i / 64;
+        const size_t kb = (i % 64) / 8, r = i % 8, nb = (j % 128) / 8, c = j % 8;
+        const size_t tile = nt * (size_t)(KD / 64) + ki;
+        return tile * 8192 + (((kb * 16 + nb) * 8 + r) * 8 + c);
+    }
+
     void packB_blocked(int8_t* Bm, const float* w, int K, int N,
                        std::vector<float>& col, double& ssum) {
         const int CB = 64;
@@ -145,14 +176,13 @@ struct I8Ctx {
             }
             for (int i = 0; i < K; i++) {
                 const float* row = w + (size_t)i * N + jb;
-                int8_t* brow = Bm + (size_t)i * ND + jb;
                 for (int b = 0; b < jn; b++) {
                     float v = row[b];
                     if (!std::isfinite(v)) v = 0.0f;
                     int x = (int)roundf(v * tis[b]);
                     if (x > 127) x = 127;
                     else if (x < -127) x = -127;
-                    brow[b] = (int8_t)x;
+                    Bm[bpos((size_t)i, (size_t)jb + b)] = (int8_t)x;
                 }
             }
         }

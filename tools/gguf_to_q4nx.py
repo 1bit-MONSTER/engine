@@ -287,6 +287,13 @@ def pack(args):
     vocab = table["model.embed_tokens.weight"]["shape"][0]
     cfg = config(r, vocab)
     cfg["q4nx_source"]["gguf"] = os.path.basename(args.gguf)
+    # Which device-side weight layout the kernels for this container must be
+    # built for.  It is a property of the artifacts, not of the payload: the
+    # engine packs the same int8 codes either way, so a container is "rm" unless
+    # the person building it also emitted the _b8 kernel family (the blocked
+    # 8x8-microtile layout is 2.4-2.6x faster to stream and produces the
+    # bit-identical int32 result; see docs/npu.md).
+    cfg["q4nx_weight_layout"] = args.weight_layout
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
@@ -362,6 +369,11 @@ def main():
     a.add_argument("gguf")
     a.add_argument("out")
     a.add_argument("--tokenizer", help="directory with tokenizer.json (and tokenizer_config.json)")
+    a.add_argument("--weight-layout", dest="weight_layout", choices=("rm", "b8"), default="rm",
+                   help="device weight layout the kernels will be built for: rm (default, "
+                        "row-major, matches every container before this) or b8 (blocked "
+                        "8x8 microtiles, needs the _b8 kernel family, streams 2.4-2.6x faster "
+                        "with a bit-identical result)")
     b = sub.add_parser("verify")
     b.add_argument("gguf")
     b.add_argument("out")

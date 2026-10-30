@@ -451,6 +451,15 @@ target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
 add_executable(npu_pack_test tests/npu_pack_test.cpp)
 target_link_libraries(npu_pack_test PRIVATE onebit_npu)
+
+# The device weight layout contract (q4nx_weight_layout): pure index math, no device
+# and no runtime.  CI builds an explicit target list, so the check compiles itself with
+# the build's compiler at test time (tests/npu_blocked_layout_test.sh) rather than being
+# one missing target away from "Not Run".
+add_test(NAME npu_blocked_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_blocked_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
+                 ${CMAKE_SOURCE_DIR}/tests/npu_blocked_layout_test.cpp)
 # Crafted model.q4nx files the loader and the packer must refuse (written at run time); runs in CI.
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)

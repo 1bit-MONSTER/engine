@@ -486,8 +486,37 @@ lemonade_package_checks() {  # lemonade_package_checks <tarball>
 }
 
 TAG_FILE=$W/tag
+# The sealed NPU kernel sets have to be signed between the build that produces them and the package that ships
+# them: `weekly.sh build` rebuilds $BUILD/npu/kernels and wipes their manifests, the manifest is the authenticity
+# half of a sealed set (engine #574: sealing is confidentiality), and package-linux.sh refuses to pack a set that
+# has none. Doing it here means one `weekly.sh build test package` - what the Sunday wrapper runs - produces a
+# shippable package; before this, every package stage after a build died with "sealed set … has no manifest.json",
+# which is only invisible while the lanes sign by hand between two separate invocations (as the release candidates
+# do). Fails loudly when the key is missing, because a box without it cannot make a shippable package at all.
+sign_npu_sets() {
+    local key=${ONEBIT_SEAL_KEY:-$HOME/.config/1bit-npu-key/seal.key}
+    local pub=${ONEBIT_SEAL_PUB:-$HOME/.config/1bit-npu-key/seal.pub} sd
+    [ -d "$BUILD/npu/kernels" ] || return 0     # a build without NPU kernel sets has nothing to sign
+    [ -f "$key" ] || { say "no release seal key at $key: the sealed NPU sets cannot be signed, so no package can be built"; return 1; }
+    if [ -f "$pub" ]; then
+        # package-linux.sh verifies each manifest's signature as well, but only when it is handed the public key;
+        # exporting it here means one weekly.sh invocation checks both halves
+        export ONEBIT_SEAL_PUB="${ONEBIT_SEAL_PUB:-$pub}"
+    fi
+    for sd in "$BUILD/npu/kernels"/*/; do
+        [ -d "$sd" ] || continue
+        # the build tree also holds layer1.work/ (plaintext MLIR, .o, intermediate ELFs); the manifest describes
+        # the shipped allowlist only, so the work directory goes before signing
+        find "$sd" -type d -name layer1.work -exec rm -rf {} + 2>/dev/null
+        rm -f "$sd/manifest.json" "$sd/manifest.sig"
+        python3 "$SRC/tools/seal_manifest.py" write "$sd" --key "$key" | tail -1
+        if [ -f "$pub" ]; then python3 "$SRC/tools/seal_manifest.py" verify "$sd" --pub "$pub" | tail -1; fi
+    done
+}
+
 stage_package() {
     local tag=${WEEKLY_TAG:-v$(date +%G.%V)} n=0
+    sign_npu_sets || return 1
     while gh release view "$tag" -R "$REPO" > /dev/null 2>&1; do n=$((n + 1)); tag=v$(date +%G.%V).$n; done
     echo "$tag" > "$TAG_FILE"
     # the image's licences step copies from the submodules of $SRC (checked out by build), not

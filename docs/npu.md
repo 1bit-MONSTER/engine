@@ -301,10 +301,26 @@ engine's memory: this route reads only the geometry keys (`hidden_size`, `num_hi
 its own full ELFs under `--kernels`, which is why a model directory's `npu/` subdirectory is empty on
 purpose and why `addr_*` must not be used to reason about what this engine allocates.
 
-What it measures, on Qwen3-0.6B-Q4_K_M (`max_tokens 8`, `temperature 0`, three reps, rep 1 dropped
-as warm-up, engine `a88ef00`, 2026-10-29, lock bypassed): solo **6.31 / 6.23 s**, concurrent
-**9.51 / 9.51 s** -- **65.7 % of solo per stream, 1.31x aggregate**. So it is worth it for two
-interactive sessions of a model small enough that two copies fit, and not for throughput.
+What it measures. Two rounds, both `max_tokens 8`, `temperature 0`, three reps per arm with rep 1
+dropped as warm-up (the first request after a load is ~2x the steady state), wall clock per request:
+
+| run | solo | both at once | per stream | aggregate |
+|---|---|---|---|---|
+| Qwen3-0.6B twice, lock bypassed (`a88ef00`, 2026-10-29) | 6.31 / 6.23 s | 9.51 / 9.51 s | 65.7 % | **1.31x** |
+| Qwen3-0.6B + Qwen3-4B, `--npu-streams 2` (`b78868c`, 2026-10-30) | 5.79 s / 25.08 s | 16.99 s / 35.61 s | **34.1 % / 70.4 %** | **0.41x** |
+
+The second row is the one the second engine exists for: two *different* models resident at once, each
+keeping its own weights and its own hwctx, both answering, with no lock bypass. Throughput gets
+**worse** -- 0.41x, i.e. running the two back to back is 2.4x faster than running them together --
+because two whole-array streams share one DMA engine: the per-token times add up (0.72 + 3.13 s solo
+per token = 3.85 s; concurrent rounds take 4.45 s) plus about 16 % of handoff overhead. The small model
+pays most (34 % of solo) because it is latency-bound; the 4B keeps 70 % because its token cost is its
+own 3.3 GB weight stream, which it would have spent anyway.
+
+So co-residency buys **availability, not throughput**: each model keeps answering while the other is
+loaded, instead of a 25-30 s reload. For a short answer, reloading still beats sharing the device --
+that is the trade, and it is why the exclusive default stays.
+
 `tests/npu_device_lock_test.cpp` (ctest `npu_device_lock`, in CI) proves the lock discipline without a
 device: exclusive excludes everything, three shared streams co-exist, and an exclusive waits for the
 last one to go.

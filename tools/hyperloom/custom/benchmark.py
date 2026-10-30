@@ -132,14 +132,35 @@ def sha256_head(path, limit=64 << 20):
     return h.hexdigest()
 
 
-def batch_args():
-    """The levers both legs share: micro-batch, batch, flash-attn, KV cache types."""
+def bench_args():
+    """The levers `llama-bench` / `llama-perplexity` take: batch, micro-batch, flash-attn, KV types.
+
+    A quantized KV cache is only usable with flash attention (without `-fa` the bench dies in
+    ``ggml_backend_sched_graph_compute_async failed with error -1`` on this fork), so asking for one
+    implies `-fa on` unless the caller says otherwise.
+    """
     args = []
     for key, flag in (("HL_B", "-b"), ("HL_UB", "-ub"), ("HL_FA", "-fa"),
                       ("HL_CTK", "-ctk"), ("HL_CTV", "-ctv")):
         value = env(key)
         if value:
             args += [flag, value]
+    if (env("HL_CTK") or env("HL_CTV")) and not env("HL_FA"):
+        args += ["-fa", "on"]
+    return args
+
+
+def serve_batch_args():
+    """The batch levers `1bit serve` accepts.
+
+    `1bit serve` is a wrapper with its own argument parser: it takes `-fa` (forwarded to its
+    llama-server child) but NOT `-b`/`-ub`/`-ctk`/`-ctv` -- it sets those itself per route, and it
+    rejects the flags with `unknown option`. So those levers move the llama-bench legs only; the
+    serve leg measures what serve would serve.
+    """
+    args = []
+    if env("HL_FA"):
+        args += ["-fa", env("HL_FA")]
     return args
 
 
@@ -151,7 +172,7 @@ def serve_lever_args():
     drafting off with `--no-mtp`, and N>0 caps the draft length at N. `HL_MTP_HEAD` names an
     external head to draft with instead.
     """
-    args = batch_args()
+    args = serve_batch_args()
     dflash = env("HL_DFLASH")
     mtp_max_raw = env("HL_MTP_MAX")
     if dflash and dflash not in ("0", "off", "false"):
@@ -380,7 +401,7 @@ def main():
         return rc
 
     # 1. llama-bench: prefill and decode throughput from one model load.
-    rc, text = run([str(bench), "-m", str(model), "-dev", "HRX0"] + batch_args()
+    rc, text = run([str(bench), "-m", str(model), "-dev", "HRX0"] + bench_args()
                    + ["-p", "512", "-n", "128", "-r", str(reps), "-o", "csv"],
                    "llama-bench", min(600, deadline - time.time()), out_dir)
     rows = bench_csv(text)
@@ -419,7 +440,7 @@ def main():
             ref_texts = {}
     establishing = not ref or not ref_texts or not base_kld.is_file()
 
-    kld_stat = kld(ppl, model, batch_args(), base_kld, wiki, min(900, deadline - time.time()), out_dir)
+    kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), out_dir)
     result["quality_gate"].update({"kld_max_mean": kld_max, "kld_mean": kld_stat["mean"],
                                    "kld_recorded": kld_stat["recorded"]})
     if establishing and kld_stat["recorded"] and kld_stat["mean"] is None:

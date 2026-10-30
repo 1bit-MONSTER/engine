@@ -125,9 +125,9 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 
 | Lever | Flags | Notes |
 | --- | --- | --- |
-| `HL_B`, `HL_UB` | `-b`, `-ub` | batch / micro-batch, on both `llama-bench` and `serve` |
-| `HL_FA` | `-fa on\|off\|auto` | flash attention |
-| `HL_CTK`, `HL_CTV` | `-ctk`, `-ctv` | KV cache types (`f16`, `q8_0`, ...) |
+| `HL_B`, `HL_UB` | `-b`, `-ub` | batch / micro-batch. `llama-bench` and the KLD leg only: `1bit serve` has its own parser and rejects them (`unknown option -ub`), setting batching per route itself. |
+| `HL_FA` | `-fa on\|off\|auto` | flash attention, on both legs. `off` reaches serve and then fails at decode (`decode() failed: Compute error`, HTTP 500) on this pin — a real finding, reported as a rejected candidate. |
+| `HL_CTK`, `HL_CTV` | `-ctk`, `-ctv` | KV cache types (`f16`, `q8_0`, ...), `llama-bench`/KLD only (serve has no such flag). A quantized cache implies `-fa on`: without it the bench dies in `graph_compute ... error -1`. |
 | `HL_MTP_MAX` | `--no-mtp` / `--mtp-max N` | A GGUF with its own MTP head drafts **by default** on HRX (`1bit serve` reports it); `0` turns drafting off, `N` caps the draft length, unset keeps serve's default (draft length 3 via its recipe). `HL_MTP_HEAD` names an external head instead. |
 | `HL_DFLASH` | `--dflash <drafter>` | block-diffusion drafter; exclusive with `--mtp` |
 | `HL_PARALLEL` | `--parallel N` | HRX runs one gated-delta-net sequence at a time, so this is expected flat on Qwen3.8 |

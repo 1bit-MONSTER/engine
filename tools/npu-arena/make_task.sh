@@ -2,6 +2,20 @@
 # Copyright 2026 bong-water-water-bong
 # SPDX-License-Identifier: Apache-2.0
 #
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
 # make_task.sh -- create or refresh a task bundle for one phase.
 #   make_task.sh GU|D|QKV|O|Z
 # The bundle is self-contained: kernel/ holds the source of the current leader
@@ -84,36 +98,25 @@ cat > "$D/README.md" <<EOF
 | geometry | K=$K, N=$N, activation tile M=16 (the decode twin; production decode fills 1 row, a short-prompt prefill chunk up to 16) |
 | B streamed | $(( K * N )) B ($(python3 -c "print(f'{$K*$N/1e6:.2f}')") MB) of packed int8 weights, one launch |
 | A + C | $(( 16 * K )) B in, $(( 16 * N * 4 )) B out |
-| current leader | the shipping M=16 twin: microkernel m=16 k=64 n=128, \`-c 8 -r 1\`, fifo depth 6, whole N in one in-ELF column-group loop |
-| measured | see LEADERBOARD.md (3.16–3.25 GB/s in the engine's own profile) |
+| starting point | the shipping M=16 twin: microkernel m=16 k=64 n=128, \`-c 8 -r 1\`, whole N in one in-ELF column-group loop |
 
-## Roofline (vai-peak-bandwidth-analysis method, applied to the numbers we have)
+## Roofline
 
-Achieved bandwidth = bytes / time. There is no AI Analyzer capture for a full-ELF design, so the
-side attribution comes from the design itself and from \`kern-exp2/VERIFIED-DESCRIPTORS.md\`:
-every 8 KiB B tile is emitted as \`[<8,139264>,<16,8>,<8,17408>,<8,1>]\` = **64 runs of 128
-contiguous bytes, row stride 17,408** — i.e. a short burst per descriptor, not a stream.
-
-| point | bytes/s | ms for this phase | verdict |
-|---|---|---|---|
-| this design (M=16 twin) | 3.2 GB/s | 27.9 | **memory-bound, DDR side, latency/burst-limited** |
-| the fused per-layer gate design (\`kern-sealed/1024x3072x16x8\`) | ~24 GB/s | 3.7 | what "good" looks like on this array |
-| practical LPDDR5X ceiling for the array | ~150 GB/s | 0.6 | not reachable from a single 8-column pass |
-| int8 compute peak of the array | ~196 TMAC/s | <0.1 | irrelevant: this phase needs 2·M = 32 int8 ops per weight byte |
-
-Arithmetic intensity is $(( 2 * 16 )) int8 ops per weight byte, so the phase is memory-bound by
-two orders of magnitude: **only bytes/second can move the score.** Nothing here is compute-bound,
-and \`kern-exp2\` already showed the issue/await discipline is worth +7% at most (2.86 → 3.07 GB/s)
-and that fifo depth 7+ hangs the array — so the levers are the descriptor shape, the number of
-cores actually streaming B, and how many of the 8 columns each launch keeps busy.
+This phase is memory-bound: it needs only 2*M int8 operations per weight byte, two orders of magnitude
+below what the array's matrix units can do, so the only thing that moves the score is bytes per
+second. The attainable ceiling for this phase's bytes on this box is measured by \`../../ceiling.sh\`
+(a pass-through probe with this phase's own taps and tile geometry); the measured tables and the
+probe kernel live in the private kernel tree (npu-kernels) with the rest of the ELF material. A
+submission is scored as a fraction of that ceiling.
 
 ## What a submission may change
 
 Anything that keeps the int8 x int8 -> int32 result byte-exact: tile geometry (m/k/n), column and
-core-row placement (\`-c\`, \`-r\`), fifo depth (\`-b\`), the generator's DMA issue/await discipline
-(\`n1_pipe.py\`'s windowed ring is the preserved experiment), RTP-driven shape parameters instead of
-per-shape ELFs (arXiv 2504.03083), and DMA-side layout transforms instead of host repacks. What it
-may not change: the packed int8 B the harness feeds, the microkernel's numerics, or the harness.
+core-row placement (\`-c\`, \`-r\`), fifo depth (\`-b\`), the generator's DMA issue/await discipline,
+RTP-driven shape parameters instead of per-shape ELFs, and DMA-side layout transforms instead of host
+repacks (the weight layout is declared by the container and implemented in
+npu/forward/include/q4nx_weight_layout.h). What it may not change: the packed int8 B the harness
+feeds, the microkernel's numerics, or the harness.
 
 ## How to run
 

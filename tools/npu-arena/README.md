@@ -1,3 +1,19 @@
+<!--
+Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
 # NPU kernel arena — Bonsai-2-27B single-launch phases on the XDNA2 NPU
 
 A competition bench for ONE kernel at a time, in the shape Quadric's Kernel Arena and GEAK's
@@ -5,14 +21,13 @@ task-dir contract use: a frozen task bundle anybody can build, a single oracle t
 submission from source, proves it byte-exact on the device and scores it in GB/s, a leaderboard
 you must beat from its own code, and a harvester that turns each win into a source change.
 
-Why here: the per-role design class this box ran (one ELF per role, 8 KB tiles, `-c 8 -r 1` for
-decode) streamed at **3.0–3.3 GB/s**.  Pre-blocking the weight buffer (`q4nx_weight_layout: "b8"`,
-npu/forward/include/q4nx_weight_layout.h) took every phase to **8.1–8.4 GB/s** with no microkernel
-change, which is what the engine ships now.  Our own dx route measures **55–59 GB/s** of effective
-weight streaming on the same array, so the arena's job is the remaining ~7x: 25.60 GB per Bonsai
-token at 8.2 GB/s is 3.12 s, at 55 GB/s it is 0.47 s, and a 2-bit ternary stream would put the same
-model at 6.4 GB/token (phase 3).  Phase 1 below measures the attainable ceiling per phase, so every
-entry is judged against a number from this box rather than against a kernel from another design class.
+Why here: a phase's score only means something as a fraction of what this box can actually stream
+for that phase's bytes.  So the arena measures that ceiling first (`ceiling.sh`), and every entry is
+judged against it rather than against another design class.  The layout that the engine ships today
+(`q4nx_weight_layout: "b8"`, npu/forward/include/q4nx_weight_layout.h) came out of this harness, and
+the remaining work is the stream structure (all 32 cores, N partitioned across rows) and a packed
+2-bit ternary weight stream; the measured records and the probe kernel live in the private kernel
+tree (npu-kernels) with the rest of the ELF material.
 
 `ceiling.sh` (phase 1) runs the per-phase DMA ceiling probe: the phase's own objectfifos, taps,
 blocked layout, tile geometry and column-group loop, with the matrix unit replaced by a
@@ -30,8 +45,7 @@ rows).  Its output is `CEILING.md`; every later leaderboard row reports "% of ce
     tasks/<PHASE>/        kernel/ (the leader's source), harness/ (frozen), README.md, SKILLS.md
     oracle.sh             rebuild from source -> byte-exact -> GB/s
     submissions/<PHASE>/  leader.elf + leader-src (the code a submission must start from)
-    LEADERBOARD.md        per phase: sha, GB/s, ms/launch, delta, why it is correct AND faster
-    HARVEST.md            every accepted win as a technique + the file that should absorb it
+    (records)             the leaderboard and harvest tables live in the private kernel tree
 
 Phases for the 27B geometry (H=5120, IM=17408), decode tile M=16:
 
@@ -66,8 +80,9 @@ device run in `gpu-hold -l "npu arena"`, and prints the leaderboard row on ACCEP
 4. **Same bytes.** A submission may not shrink the weight stream by changing the data format
    (the harness's B is the engine's packed int8 B). Changing *how* those bytes are moved is the
    whole point; changing *what* is computed is out of scope for this arena.
-5. Accepted entries are recorded in `LEADERBOARD.md` and the technique in `HARVEST.md`, and the
-   winner becomes the new `leader.elf` so the next entry has to beat it.
+5. Accepted entries and the technique behind each one are recorded in the private kernel tree
+   (npu-kernels: `LEADERBOARD.md`, `HARVEST.md`), and the winner becomes the new `leader.elf` so the
+   next entry has to beat it.
 
 ## Known risk the oracle carries
 

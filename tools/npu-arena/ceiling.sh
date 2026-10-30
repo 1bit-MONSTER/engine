@@ -2,14 +2,31 @@
 # Copyright 2026 bong-water-water-bong
 # SPDX-License-Identifier: Apache-2.0
 #
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
 # ceiling.sh -- phase 1 of the 2026-10-30 14:58 addendum: measure the attainable
 # weight-stream bandwidth for EACH phase's tap/tile geometry with the matrix unit
 # replaced by a pass-through kernel (probe/mm_dmabw.cc), 3 reps each, and write
 # CEILING.md.
 #
 # The probe keeps the phase's objectfifos, taps, blocked B layout, tile geometry
-# and column-group loop, so its GB/s is the ceiling that phase's bytes can reach
-# on this box -- the number every real kernel entry is judged against.
+# and column-group loop, with the matrix unit replaced by a pass-through
+# microkernel from the private kernel tree (npu-kernels: npu/probe/mm_dmabw.cc,
+# built by make_probe.sh).  Its GB/s is the ceiling that phase's bytes can reach
+# on this box -- the number a real kernel entry is judged against.  The measured
+# tables live in that private tree with the rest of the kernel records.
 #
 # Variants: nm16 = M=16 / 1 core row (8 cores, the shipped twin's shape)
 #           r4   = M=64 / 4 core rows (32 cores, same B taps, B broadcast down rows)
@@ -71,9 +88,8 @@ lines = ["# DMA ceiling per phase (phase 1 of the 14:58 addendum)", "",
          f"{rows and next(iter(rows.values()))[2] or 0} device reps per cell, gpu-hold, box otherwise idle.",
          "",
          "`nm16` = M=16 / 1 core row (8 cores, the shipped decode twin's shape);",
-         "`r4` = M=64 / 4 core rows (32 cores, the same B taps with B broadcast down the",
-         "four rows -- this is what the generator can place today; the real 32-core decode",
-         "needs N partitioned across rows, phase 2).",
+         "`r4` = M=64 / 4 core rows (32 cores, the same B taps with B broadcast down the four",
+         "rows).",
          "",
          "| phase | B streamed | nm16 GB/s | nm16 ms | r4 GB/s (32 cores) | r4 ms | r4 / nm16 |",
          "|---|---|---|---|---|---|---|"]
@@ -87,10 +103,9 @@ for phase in ["GU", "D", "QKV", "O", "Z"]:
     ratio = f"{b[0]/a[0]:.2f}x" if a and b else "-"
     lines.append(f"| {phase} | {gb:.2f} MB | {a[0]:.2f} | {a[1]:.2f} | {b[0] if b else 0:.2f} | "
                  f"{b[1] if b else 0:.2f} | {ratio} |")
-lines += ["", "Reference points: the dx route's own in-loop weight stream on Qwen3-1.7B/4B measured",
-          "45 GB/s (docs/npu-dx.md) and 55-59 GB/s effective (addendum 14:58); the Bonsai blocked-B",
-          "kernel runs at 8.1-8.4 GB/s in the arena, i.e. the same class as this ceiling divided by",
-          "the number below.", ""]
+lines += ["", "This file is written into tasks/<PHASE>/ or wherever CEILING.md points, and the",
+          "reference numbers it is compared against live with the kernel records in the private",
+          "kernel tree (npu-kernels).", ""]
 out.write_text("\n".join(lines) + "\n")
 print("\n".join(lines))
 PY

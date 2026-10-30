@@ -26,8 +26,8 @@
 //                   with the tiles laid out n-tile-major so a core's k-loop walks
 //                   forward through memory.  Each tile is then ONE contiguous
 //                   8192-byte DMA burst instead of 64 runs of 128 contiguous bytes
-//                   with a row stride of ND, which measured 2.4-2.6x on every
-//                   27B GEMM phase (3.32 -> 8.13 GB/s on the gate/up projection).
+//                   with a row stride of ND.  Measured on the 27B GEMM phases; the
+//                   numbers are in the kernel records, not here.
 //
 // The codes, the per-column scales and the arithmetic are identical in both
 // layouts: this is an address permutation, so the int32 result is bit-identical.

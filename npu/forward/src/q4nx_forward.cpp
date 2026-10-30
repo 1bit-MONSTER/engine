@@ -140,6 +140,34 @@ static float read_config_float(const std::string& cfg_path, const char* key, flo
     return (float)strtod(c + 1, nullptr);
 }
 
+// The device-side weight layout a container declares (`q4nx_weight_layout`).
+// Absent or "rm" is the layout every container built before today has: packB
+// writes a padded row-major [KD][ND] int8 image, and the ELF's B tap is the
+// 4-level [<k/8, 8N>, <n/8, 8>, <8, N>, <8, 1>] scatter that lands 64 runs of
+// 128 contiguous bytes per 8 KiB tile.  "b8" is the same bytes pre-blocked into
+// the microkernel's own [kb][nb][8][8] tile order, tile-n-major first, so each
+// tile is ONE contiguous 8 KiB burst (measured 3.32 -> 8.13 GB/s on the 27B GU
+// phase, and 2.4-2.6x on every other phase).  It is a layout, not a different
+// result: the quantizer, the scales and the int8 codes are identical, so the
+// int32 output is bit-identical.
+static std::string read_config_string(const std::string& cfg_path, const char* key,
+                                      const char* dflt) {
+    std::ifstream f(cfg_path);
+    if (!f) return dflt;
+    std::string s((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const char* p = strstr(s.c_str(), key);
+    if (!p) return dflt;
+    const char* c = strchr(p, ':');
+    if (!c) return dflt;
+    c++;
+    while (*c == ' ' || *c == '\t') c++;
+    if (*c != '"') return dflt;
+    const char* q = c + 1;
+    const char* e = strchr(q, '"');
+    if (!e) return dflt;
+    return std::string(q, e);
+}
+
 // The named phase scopes live in q4nx_forward.h (namespace q4nx_lh) so the HTTP
 // handler can time request-level phases with the same machinery; keep every use
 // here unqualified.
@@ -234,6 +262,16 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         cfg_path = mdir + "/config.json";
     }
     ModelConfig cfg = QWEN3_0_6B_CONFIG;
+    // Device-side weight layout this container declares (see read_config_string).
+    // "b8" makes the ELF set the _b8 family and packB write the blocked image;
+    // anything else keeps the layout every earlier container has.
+    {
+        const std::string lay = read_config_string(cfg_path, "\"q4nx_weight_layout\"", "rm");
+        weight_layout_b8_ = (lay == "b8");
+        fprintf(stderr, "  [forward] weight layout: %s (%s)\n",
+                weight_layout_b8_ ? "b8 blocked 8x8 microtiles, tile-n-major" : "rm row-major",
+                weight_layout_b8_ ? "kernels carry the _b8 suffix" : "q4nx_weight_layout absent/rm");
+    }
     cfg.hidden_size = q4nx_config_int(cfg_path.c_str(), "hidden_size", cfg.hidden_size);
     cfg.num_layers = q4nx_config_int(cfg_path.c_str(), "num_hidden_layers", cfg.num_layers);
     cfg.num_attention_heads = q4nx_config_int(cfg_path.c_str(), "num_attention_heads", cfg.num_attention_heads);
@@ -478,14 +516,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     dims.lin_vd = lin_vd_;
     dims.attn_output_gate = attn_gate_;
     {
+        // The artifact probes must use the same tag the designs will carry, or a
+        // b8 container would silently conclude "no fused GU kernel" and fall back
+        // to split G/U on a model that ships one.
+        const char* tag = weight_layout_b8_ ? "_b8" : "";
         char gu[512], g[512];
-        snprintf(gu, sizeof(gu), "%s/full_i8_GU_K%d_N%d.elf", dir.c_str(), dims.H, 2 * dims.IM);
-        snprintf(g, sizeof(g), "%s/full_i8_G_K%d_N%d.elf", dir.c_str(), dims.H, dims.IM);
+        snprintf(gu, sizeof(gu), "%s/full_i8_GU_K%d_N%d%s.elf", dir.c_str(), dims.H, 2 * dims.IM, tag);
+        snprintf(g, sizeof(g), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), dims.H, dims.IM, tag);
         dims.fused_gu = file_exists(gu) || !file_exists(g) ? 1 : 0;
     }
     ndesigns_ = q4nx_derive_designs(&dims, designs_);
     if (ndesigns_ <= 0) { err_ = "design derivation failed"; return false; }
-
     // Batched expert gate/up (MoE): one GEMM per projection over ALL top-k experts
     // at once, instead of one per expert.  Derived here rather than in
     // q4nx_derive_designs because it depends on top_k, which the dims struct does
@@ -495,8 +536,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         const int need = top_k_ * expert_im_;
         const int nb = 8192;   // the only K=H G/U kernel width >= 4096 in the set
         char gb[512], ub[512];
-        snprintf(gb, sizeof(gb), "%s/full_i8_G_K%d_N%d.elf", dir.c_str(), c_.H, nb);
-        snprintf(ub, sizeof(ub), "%s/full_i8_U_K%d_N%d.elf", dir.c_str(), c_.H, nb);
+        snprintf(gb, sizeof(gb), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), c_.H, nb,
+                 weight_layout_b8_ ? "_b8" : "");
+        snprintf(ub, sizeof(ub), "%s/full_i8_U_K%d_N%d%s.elf", dir.c_str(), c_.H, nb,
+                 weight_layout_b8_ ? "_b8" : "");
         if (need <= nb && file_exists(gb) && file_exists(ub)) {
             memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
             designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = c_.H; designs_[ndesigns_].N = nb;
@@ -556,10 +599,33 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     fprintf(stderr, "  [forward] derived %d designs (fused_gu=%d, H=%d NH=%d NKV=%d HD=%d IM=%d)\n",
             ndesigns_, dims.fused_gu, dims.H, dims.NH, dims.NKV, dims.HD, dims.IM);
 
+    // A blocked container needs the blocked-tap kernels: the tap lives in the
+    // ELF, so a row-major ELF on a blocked buffer would read the weights
+    // permuted and produce silent garbage.  Tagging every design's artifact
+    // name keeps the two families in one directory and makes a missing artifact
+    // a loud error instead of a wrong number.  The twins derive from these
+    // names, so they become "..._b8_m16.elf".
+    if (weight_layout_b8_) {
+        for (int i = 0; i < ndesigns_; i++) {
+            char* n = designs_[i].elf_name;
+            const size_t len = strlen(n);
+            if (len < 5 || len + 4 > Q4NX_ELF_NAME_MAX - 1 ||
+                strcmp(n + len - 4, ".elf") != 0) {
+                err_ = std::string("cannot tag the kernel name for the b8 layout: ") + n;
+                return false;
+            }
+            std::string tagged(n, len - 4);
+            tagged += "_b8.elf";
+            snprintf(n, Q4NX_ELF_NAME_MAX, "%s", tagged.c_str());
+        }
+    }
+
+
     for (int i = 0; i < ndesigns_; i++) {
         const Q4nxDesignGeom* g = &designs_[i];
         ctx_[i] = std::make_unique<I8Ctx>();
         ctx_[i]->MD = g->M; ctx_[i]->KD = g->K; ctx_[i]->ND = g->N;
+        ctx_[i]->blocked_b = weight_layout_b8_;
 
         if (host_gemm_) {
             // Offline mode: the geometry->artifact mapping is still asserted, but
@@ -630,6 +696,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             ctx16_[i]->MD = designs16_[i].M;
             ctx16_[i]->KD = designs16_[i].K;
             ctx16_[i]->ND = designs16_[i].N;
+            ctx16_[i]->blocked_b = weight_layout_b8_;
             if (!ctx16_[i]->init_elf(*dev, elf.c_str(), designs16_[i].M,
                                      designs16_[i].K, designs16_[i].N, 1)) {
                 fprintf(stderr, "  [forward] M=16 twin failed to load (%s); "

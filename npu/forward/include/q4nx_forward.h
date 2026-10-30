@@ -295,6 +295,9 @@ private:
     // The NPU LM head wants the head transposed into per-tile [H][T] blocks. That
     // gather transposes the whole NV x H matrix with a stride of T floats, so it
     // is built once here instead of on every token (it dominated decode time).
+    // Container-declared device weight layout (q4nx_weight_layout == "b8").
+    // False is the row-major layout every earlier container has.
+    bool weight_layout_b8_ = false;
     std::vector<float> lm_head_tiles_;
     int                lm_head_tiles_T_ = 0;
     float lm_at(int n, int k) const;

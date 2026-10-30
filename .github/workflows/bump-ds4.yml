@@ -79,9 +79,33 @@ jobs:
             if [ "$upstream" = "$ours_base" ]; then echo "changed=false"; else echo "changed=true"; fi
           } >> "$GITHUB_OUTPUT"
 
+      # A hold is a decision, not a failure: while config/ds4-hold.config names the pin the
+      # engine carries, the scheduled run says so and stops green. Without this, a deliberate
+      # hold looks exactly like the ten days of red runs and issue threads that bump-ds4 just
+      # came out of (2026-10-21..30).
+      - name: Is the pin held? (config/ds4-hold.config)
+        id: hold
+        env:
+          OURS: ${{ steps.pins.outputs.ours }}
+        run: |
+          set -euo pipefail
+          held=$(sed -n 's/^\([0-9a-f]\{40\}\)$/\1/p' config/ds4-hold.config 2>/dev/null | tail -n 1)
+          if [ -z "$held" ]; then
+            echo "no hold in config/ds4-hold.config"
+            echo "held=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          if [ "$held" != "${OURS:-}" ]; then
+            echo "::notice title=DwarfStar hold does not apply::config/ds4-hold.config names ${held:0:12}, the engine pins ${OURS:0:12}; merging as usual"
+            echo "held=false" >> "$GITHUB_OUTPUT"
+            exit 0
+          fi
+          echo "::notice title=DwarfStar pin held at ${held:0:12}::$(sed -n 's/^# HOLD: //p' config/ds4-hold.config | head -n 1)"
+          echo "held=true" >> "$GITHUB_OUTPUT"
+
       - name: Merge upstream into our 1bit/main
         id: fork
-        if: steps.pins.outputs.changed == 'true'
+        if: steps.pins.outputs.changed == 'true' && steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
@@ -130,7 +154,7 @@ jobs:
           } >> "$GITHUB_OUTPUT"
 
       - name: Open the bump PR
-        if: steps.pins.outputs.changed == 'true'
+        if: steps.pins.outputs.changed == 'true' && steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
           UPSTREAM: ${{ steps.pins.outputs.upstream }}
@@ -170,7 +194,7 @@ jobs:
       # the actual defect, so this step makes it speak (the same step bump-hrx has had since its
       # own five silent days).
       - name: Report a failed sync so it cannot break silently
-        if: failure()
+        if: failure() && steps.hold.outputs.held != 'true'
         env:
           GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
         run: |

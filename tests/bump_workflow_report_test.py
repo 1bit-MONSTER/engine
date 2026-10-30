@@ -68,14 +68,14 @@ def block_scalar(lines, start):
     return "\n".join(b[4 * (indent // 2 + 1):] if False else b for b in body)
 
 
-def step_script(text):
-    """(script, title) of the reporting step, or (None, None) when the workflow lacks it."""
+def step_script(text, name=STEP_NAME, want_failure=True):
+    """(script, title) of a named step, or (None, None) when the workflow lacks it."""
     lines = text.splitlines()
-    at = next((i for i, l in enumerate(lines) if f"- name: {STEP_NAME}" in l), None)
+    at = next((i for i, l in enumerate(lines) if f"- name: {name}" in l), None)
     if at is None:
         return None, None
     head = "\n".join(lines[at:at + 8])
-    if "if: failure()" not in head:
+    if want_failure and "if: failure()" not in head:
         return None, None
     script = block_scalar(lines, at)
     m = re.search(r'^ *title="([^"]+)"', script or "", re.M)
@@ -142,6 +142,55 @@ for wf in WORKFLOWS:
 
 dupes = {t: w for t, w in titles.items() if len(w) > 1}
 check("every workflow reports under its own title", not dupes, str(dupes))
+
+# ---- the DwarfStar hold (config/ds4-hold.config) -------------------------------------------
+# A deliberate hold must read as held, not as ten days of failures: the step says so and stops
+# green, the merge and PR steps do not run, and the failure reporter does not speak.
+HOLD_STEP = "Is the pin held? (config/ds4-hold.config)"
+HELD = "5b013dc1bb7594e7d7471e82d9b429180e666711"
+OTHER = "0123456789abcdef0123456789abcdef01234567"
+ds4 = open(os.path.join(ROOT, ".github", "workflows", "bump-ds4.yml")).read()
+hold_script, _ = step_script(ds4, HOLD_STEP, want_failure=False)
+check(f"bump-ds4: has the '{HOLD_STEP}' step", hold_script is not None)
+if hold_script is not None:
+    lines = ds4.splitlines()
+    order = [next((i for i, l in enumerate(lines) if f"- name: {n}" in l), -1)
+             for n in (HOLD_STEP, "Merge upstream into our 1bit/main", "Open the bump PR")]
+    check("bump-ds4: the hold is decided before anything is merged or opened",
+          0 <= order[0] < order[1] and 0 <= order[0] < order[2], str(order))
+    for name in ("Merge upstream into our 1bit/main", "Open the bump PR"):
+        at = next((i for i, l in enumerate(lines) if f"- name: {name}" in l), None)
+        cond = "\n".join(lines[at:at + 4]) if at is not None else ""
+        check(f"bump-ds4: '{name}' does not run while the pin is held", "steps.hold.outputs.held != 'true'" in cond, cond[:120])
+    p = subprocess.run(["bash", "-n"], input=hold_script, text=True, capture_output=True)
+    check("bump-ds4: the hold step's shell parses", p.returncode == 0, p.stderr.strip()[:120])
+
+    config = os.path.join(ROOT, "config", "ds4-hold.config")
+    check("config/ds4-hold.config exists", os.path.exists(config))
+    if os.path.exists(config):
+        pinned = re.findall(r"^([0-9a-f]{40})$", open(config).read(), re.M)
+        check("config/ds4-hold.config names at most one commit", len(pinned) <= 1, str(pinned))
+
+    def run_hold(fixture, ours):
+        """Run the hold step in a scratch root holding `fixture` as config/ds4-hold.config."""
+        with tempfile.TemporaryDirectory() as tmp:
+            os.makedirs(os.path.join(tmp, "config"))
+            open(os.path.join(tmp, "config", "ds4-hold.config"), "w").write(fixture)
+            out = os.path.join(tmp, "gh_output")
+            open(out, "w").close()
+            env = dict(os.environ, OURS=ours, GITHUB_OUTPUT=out)
+            p = subprocess.run(["bash", "-c", hold_script], cwd=tmp, env=env, capture_output=True, text=True)
+            return p.returncode, open(out).read(), p.stdout + p.stderr
+
+    rc, out, log = run_hold("# no commit line here\n", HELD)
+    check("hold lifted: nothing held", rc == 0 and "held=false" in out and "::notice" not in log, f"rc={rc} out={out!r}")
+    rc, out, log = run_hold(f"# HOLD: two CUDA entry points are missing from the HIP layer\n{HELD}\n", HELD)
+    check("pin held: reports held, names the sha and the reason, never fails",
+          rc == 0 and "held=true" in out and "::notice" in log and HELD[:12] in log and "entry points" in log,
+          f"rc={rc} out={out!r} log={log[:200]!r}")
+    rc, out, log = run_hold(f"# HOLD: two CUDA entry points are missing from the HIP layer\n{OTHER}\n", HELD)
+    check("hold naming another commit is ignored, not applied",
+          rc == 0 and "held=false" in out and "does not apply" in log, f"rc={rc} out={out!r} log={log[:200]!r}")
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

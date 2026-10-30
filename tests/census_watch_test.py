@@ -46,6 +46,7 @@ ARCHS = {
     "EmptyForCausalLM": {"gguf": "empty", "backends": []},
 }
 SIG = {"Qwen3_5MVLAAbsorbedForCausalLM": {"model_type": "qwen3_5_text", "family": "Qwen3.5 MVLA"}}
+FLM_LINE_PREFIXES = ("  + FLM FastFlowLM/", "  !! NEW FLM ", "  !! NPU FLM ")
 
 failures = []
 
@@ -378,6 +379,16 @@ check("flm org: an unmapped architecture is unmapped, not a guess",
 gguf = by_id["FastFlowLM/Qwen3.5-0.8B-gguf"]
 check("flm org: a config-less gguf drop is a derivative, not a new family",
       gguf["derivative"] and not cw.unmapped(gguf) and not gguf["mapped"])
+# The NPU-pack case (2026-10): a Q4NX pack whose family IS mapped, but only for a backend
+# that cannot run a Q4NX directory. D3-Mini is `qwen3_5_text` -> qwen35 -> hrx in the live
+# registry, and it ships model.q4nx + vision_weight.q4nx, so the NPU route cannot serve it.
+check("flm org: a Q4NX pack for an HRX-only family is an NPU gap",
+      d3["mapped"] and d3["q4nx"] and not d3["npu"] and cw.npu_gap(d3) and cw.unmapped(d3))
+check("flm org: a family the NPU route serves is not a gap",
+      not cw.npu_gap(qp) and not cw.unmapped(qp) and not cw.npu_gap(llama))
+check("flm org: a derivative drop is not an NPU gap", not cw.npu_gap(gguf))
+check("flm org: a repo with no q4nx file is not an NPU gap",
+      not cw.npu_gap({"id": "x/y", "q4nx": [], "mapped": True, "npu": False, "derivative": False}))
 
 # 17. File sizes come from the repo detail, and only where they are still unknown.
 calls = []
@@ -409,13 +420,18 @@ check("flm first run: both watches ran", flm_ok)
 check("flm first run: an unmapped family alerts (exit 1)", flm_rc == 1)
 check("flm report: one line per repo",
       len([ln for ln in first.splitlines()
-           if ln.startswith(("  + FLM FastFlowLM/", "  !! NEW FLM "))]) == 5)
+           if ln.startswith(FLM_LINE_PREFIXES)]) == 5)
 check("flm report: the unknown family is marked !! NEW FLM",
       "  !! NEW FLM FastFlowLM/MiniCPM-V-4.7-1B-NPU2" in first)
 check("flm report: a mapped family is not marked",
       "  + FLM FastFlowLM/Qwen3-8B-NPU2" in first and "!! NEW FLM FastFlowLM/Qwen3-8B-NPU2" not in first)
 check("flm report: the derivative drop does not alert",
       "!! NEW FLM FastFlowLM/Qwen3.5-0.8B-gguf" not in first)
+check("flm report: an NPU pack for an HRX-only family is marked !! NPU FLM",
+      "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" in first)
+check("flm report: the NPU gap is summarised by family",
+      "Q4NX (NPU) pack(s) for a family the NPU route does not serve" in first
+      and "qwen35 (1 pack(s))" in first)
 check("flm report: sizes are named in GiB, one line each",
       "GiB" in first and "npu route: qwen3" in first and "registry: none" in first)
 check("flm report: releases are listed with their tags",
@@ -431,9 +447,9 @@ second = buf.getvalue()
 check("flm delta: a second run is quiet and green",
       quiet_ok and quiet_rc == 0 and "nothing new since the last run" in second)
 check("flm delta: no repo line on a quiet day",
-      "  + FLM FastFlowLM/" not in second and "  !! NEW FLM" not in second)
+      not any(p[:7] in second for p in FLM_LINE_PREFIXES))
 moved = [dict(r) for r in fixture("org.json")]
-moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"
+moved[0]["lastModified"] = "2026-11-02T00:00:00.000Z"   # D3-Mini: qwen35, Q4NX, no npu route
 moved_repos = cw.sweep_org(live_archs, fetch=lambda url: moved)
 fresh, fresh_rel = cw.flm_deltas(state, moved_repos, cw.sweep_releases(fetch=flm_fetch))
 check("flm delta: only the moved repo is new", [r["id"] for r in fresh] == [moved[0]["id"]])
@@ -441,17 +457,89 @@ check("flm delta: known releases are not new", fresh_rel == [])
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     moved_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), fresh, fresh_rel)
-check("flm delta: one relocated line, still green (mapped family)",
-      moved_rc == 0 and buf.getvalue().count("  + FLM ") == 1)
+check("flm delta: a moved NPU-gap pack alerts (it is the 2026-10 D3 case)",
+      moved_rc == 1 and "  !! NPU FLM FastFlowLM/D3-Mini-NPU2" in buf.getvalue())
+served = cw.sweep_org(live_archs, fetch=lambda url: fixture("org.json"))
+fresh2 = [r for r in served if r["id"] == "FastFlowLM/Qwen3-8B-NPU2"]   # qwen3: served on the NPU
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    served_rc = cw.report_flm(served, cw.sweep_releases(fetch=flm_fetch), fresh2, [])
+check("flm delta: a moved family the NPU route serves stays green",
+      served_rc == 0 and buf.getvalue().count("  + FLM ") == 1
+      and "!! NPU FLM" not in buf.getvalue())
 
 # 20. `--full` prints every repo and release on demand.
 buf = io.StringIO()
 with contextlib.redirect_stdout(buf):
     full_rc = cw.report_flm(moved_repos, cw.sweep_releases(fetch=flm_fetch), [], [], full=True)
 full = buf.getvalue()
-check("flm --full: every repo listed", full.count("  + FLM FastFlowLM/") + full.count("  !! NEW FLM ") == 5)
+check("flm --full: every repo listed", sum(full.count(p) for p in FLM_LINE_PREFIXES) == 5)
 check("flm --full: every release listed", full.count("  + FLM RELEASE ") == 3)
 check("flm --full: an unmapped repo in the listing still alerts", full_rc == 1)
+# 21. The supporting-upstream pins (registry/support_pins.json): a moved commit and a new d3
+#     repo both alert, an unchanged pin and a listed d3 repo do not, and a failed fetch is a
+#     runtime failure rather than a quiet day.
+PINS = {
+    "repos": {
+        "ROCm/FLM_Q4NX_Converter": {"commit": "aaa111", "reviewed": "2026-10-30", "why": "converter"},
+        "vllm-project/semantic-router": {"commit": "bbb222", "reviewed": "2026-10-30", "why": "d3"},
+    },
+    "d3_sources": {"org": "vllm-sr", "prefix": "d3", "known": ["vllm-sr/d3-lite", "vllm-sr/d3-turbo"]},
+}
+
+
+def support_fetch(converter="aaa111", router="bbb222", repos=("vllm-sr/d3-lite",)):
+    def fetch(url):
+        if "/commits" in url:
+            sha = converter if "Q4NX" in url else router
+            return [{"sha": sha, "commit": {"committer": {"date": "2026-10-30T00:00:00Z"}}}]
+        return [{"id": rid} for rid in repos]
+    return fetch
+
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sup_rc, sup_ok = cw.watch_support(PINS, fetch=support_fetch())
+steady = buf.getvalue()
+check("support pins: unchanged pins and listed d3 repos are green", sup_ok and sup_rc == 0)
+check("support pins: an unchanged pin is printed with its commit",
+      "+ SUPPORT PIN ROCm/FLM_Q4NX_Converter  aaa111" in steady)
+check("support pins: nothing is flagged moved", "!! SUPPORT MOVED" not in steady)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sup_rc, _ = cw.watch_support(PINS, fetch=support_fetch(converter="ccc333"))
+moved_text = buf.getvalue()
+check("support pins: a moved converter commit alerts", sup_rc == 1)
+check("support pins: the moved repo is named with both commits",
+      "!! SUPPORT MOVED ROCm/FLM_Q4NX_Converter" in moved_text and "ccc333" in moved_text
+      and "aaa111" in moved_text)
+check("support pins: the fix is in the pin file, and says so",
+      "bump the commit and `reviewed` in registry/support_pins.json" in moved_text)
+
+buf = io.StringIO()
+with contextlib.redirect_stdout(buf):
+    sup_rc, _ = cw.watch_support(PINS, fetch=support_fetch(repos=("vllm-sr/d3-lite", "vllm-sr/d3-quasar")))
+check("support pins: a d3 repo not in the list alerts", sup_rc == 1)
+check("support pins: the new d3 repo is named", "vllm-sr/d3-quasar" in buf.getvalue())
+check("support pins: a non-d3 repo in the org is not this watch's business",
+      cw.watch_support(PINS, fetch=support_fetch(repos=("vllm-sr/mmbert-base-32k",)))[0] == 0)
+
+with contextlib.redirect_stderr(io.StringIO()):
+    sup_rc, sup_ok = cw.watch_support(PINS, fetch=lambda url: (_ for _ in ()).throw(RuntimeError("no network")))
+check("support pins: a failed fetch is a failure, not a quiet day", sup_rc == 0 and not sup_ok)
+check("support pins: a failure does not turn an alert green",
+      cw.exit_code(0, 0, True, 0) == 0 and cw.exit_code(0, 0, True, 1) == 1
+      and cw.exit_code(0, 0, False, 0) == 2 and cw.exit_code(0, 0, False, 1) == 1)
+
+committed = json.load(open(os.path.join(ROOT, "registry", "support_pins.json")))
+check("support pins: the committed file parses and pins both upstreams",
+      set(committed["repos"]) >= {"ROCm/FLM_Q4NX_Converter", "vllm-project/semantic-router"}
+      and all(len(e["commit"]) == 40 and e.get("reviewed") for e in committed["repos"].values()))
+check("support pins: every d3 source in the file is prefixed like the watch expects",
+      all(r.startswith(committed["d3_sources"]["org"] + "/" + committed["d3_sources"]["prefix"])
+          for r in committed["d3_sources"]["known"]))
+
 state_path = os.path.join(STATE_DIR, "round-trip.json")
 cw.save_state(state_path, state)
 reloaded = cw.load_state(state_path)

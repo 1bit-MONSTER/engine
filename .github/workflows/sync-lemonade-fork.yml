@@ -15,15 +15,24 @@
 #
 # Keep our Lemonade fork current (docs/lemonade.md): 1bit-MONSTER/lemonade is
 # upstream lemonade-sdk/lemonade plus the onebit backend that runs the engine.
-# Daily, this merges upstream's latest release (not main; Lemonade releases most
-# Fridays and our weekly release builds on it) into the fork:
-#   - a clean merge that still registers onebit is pushed to the fork's main;
-#   - a conflicting merge is left for a person: the release is pushed to a
-#     sync/<tag> branch and a PR is opened IN THE FORK listing the conflicts.
+# Daily, this ports upstream's latest release (not main; Lemonade releases most
+# Fridays and our weekly release builds on it) onto the fork's main:
+#   - the release's own commits are cherry-picked onto main, one commit for the
+#     whole port; if every one applies and onebit is still registered, it is
+#     pushed to the fork's main;
+#   - a commit the fork also changed is left for a person: the port is pushed to
+#     a sync/<tag> branch WITHOUT the colliding files (the fork's side is kept,
+#     never the release's) and a PR is opened IN THE FORK listing them.
+# The tag is never merged or checked out as a branch tip. Since fork #21 the
+# fork's main follows upstream's main (#3771 server refactor), while a release
+# tag is cut from the older release line: merging the tag would revert main.
+# Fork #27 arrived exactly that way - 524 files, -128k lines, 44 upstream commits
+# and our onebit registration moved back into the release's monolithic
+# server.cpp - so the port applies the release's changes to main's layout instead.
 # It then disables every workflow in the fork. Upstream's build, release,
-# website and PPA workflows must not run from the fork, so the merge never mirrors
+# website and PPA workflows must not run from the fork, so the port never mirrors
 # upstream's workflow files at all: the fork's own .github is put back over the
-# merge result. That also keeps the token out of the `workflow` scope.
+# result. That also keeps the token out of the `workflow` scope.
 #
 # Uses the secret HRX_BUMP_TOKEN, which needs Contents, Pull requests and Actions
 # read/write on 1bit-MONSTER/lemonade as well as on this repository. It does NOT need
@@ -96,7 +105,7 @@ jobs:
           echo "PASS actions: enabled and disabled workflow ${id}"
           echo "SELFTEST PASSED: the token can do everything the sync needs"
 
-      - name: Merge upstream's latest release into the fork
+      - name: Port upstream's latest release into the fork
         if: ${{ !inputs.selftest }}
         env:
           GH_TOKEN: ${{ secrets.HRX_BUMP_TOKEN }}
@@ -111,12 +120,43 @@ jobs:
           tag=$(gh release view --repo "$UPSTREAM" --json tagName --jq .tagName)   # latest, never a pre-release
           git fetch -q upstream "refs/tags/${tag}:refs/tags/${tag}"
           up=$(git rev-parse "${tag}^{commit}")
+          before=$(git rev-parse HEAD)
+          # Three ways this release can already be in the fork, cheapest first.
+          #
+          # 1. The tag is on main's own lineage (the pre-#3771 world: the fork followed
+          #    upstream's releases). Then it is simply an ancestor and there is nothing to do.
           if git merge-base --is-ancestor "$up" HEAD; then
             echo "fork already contains upstream ${tag} (${up:0:12})"
             exit 0
           fi
-          before=$(git rev-parse HEAD)
-          # keep_fork_github: put the fork's own .github back over whatever the merge
+          # 2. The tag was already ported and its PR merged. This is the case that matters since
+          #    fork #21: main follows upstream's *main* (the #3771 server refactor) while every
+          #    release tag is cut from the older release line, so a ported release is never an
+          #    ancestor and its commits are never patch-equivalent (the port lands in the
+          #    refactored files, e.g. services/model_options.cpp, not the release's server.cpp).
+          #    The sync branch is deleted when its PR merges, so the merged PR - not a branch
+          #    probe - is the durable record that this tag has been handed over.
+          merged=$(gh pr list --repo "$FORK" --state merged --head "sync/${tag}" --json number --jq '.[0].number // ""')
+          if [ -n "$merged" ]; then
+            echo "${tag} was already ported in ${FORK}#${merged}"
+            exit 0
+          fi
+          # 3. A previous run already handed this tag over and its PR is still open: the branch is
+          #    the record, and a second port would only add a duplicate commit.
+          branch="sync/${tag}"
+          if git ls-remote --exit-code origin "refs/heads/${branch}" > /dev/null; then
+            echo "${branch} exists: ${tag} is already waiting for a person on that branch"
+            exit 0
+          fi
+          # 4. Nothing left to apply: every commit the tag has and main lacks is already in main
+          #    by patch (`git cherry` marks those '-'; this is the pre-refactor case, where the
+          #    port is a cherry-pick of the same change).
+          picks=$(git cherry HEAD "$up" | awk '$1 == "+" { print $2 }')
+          if [ -z "$picks" ]; then
+            echo "fork already carries upstream ${tag} (${up:0:12}) by patch"
+            exit 0
+          fi
+          # keep_fork_github: put the fork's own .github back over whatever the port
           # produced. The fork disables every workflow it has (last step), so mirroring
           # upstream's workflow files buys nothing — and GitHub refuses a push that
           # creates or updates .github/workflows unless the token carries the `workflow`
@@ -126,34 +166,65 @@ jobs:
             git checkout "$before" -- .github
             git clean -fdq -- .github 2>/dev/null || true
           }
-          if git merge -q --no-commit --no-ff "$up"; then
-            keep_fork_github
-            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (${up:0:12})"
-            # The fork exists for the onebit backend: never push a merge that lost it.
-            grep -q '"onebit|onebit"' CMakeLists.txt || { echo "::error::onebit is no longer registered after the merge"; exit 1; }
-            test -f src/cpp/server/backends/onebit/onebit_server.cpp || { echo "::error::onebit_server.cpp is gone after the merge"; exit 1; }
-            git push -q origin HEAD:main
-            echo "merged upstream ${tag} (${up:0:12}) into ${FORK} main"
-          else
-            conflicts=$(git diff --name-only --diff-filter=U | sed 's/^/- /')
-            git merge --abort
-            branch="sync/${tag}"
-            if git ls-remote --exit-code origin "refs/heads/$branch" > /dev/null; then
-              echo "$branch already exists"; exit 0
+          # Port the release's own contribution onto main; never check the tag out into the
+          # branch. The tag's *tree* is the release line, which predates the #3771 refactor:
+          # merging it would revert everything main gained since the release branch was cut -
+          # fork #27 arrived that way, as a 524-file, -128k-line revert of 44 commits that also
+          # moved our onebit registration back into the release's monolithic server.cpp. Taking
+          # the commits git cherry marked '+' applies the release's changes to main's layout,
+          # which is what a pin actually needs.
+          git checkout -q -b "$branch" "$before"
+          conflicts=()
+          for c in $picks; do
+            # a merge inside the release range carries no patch of its own; the commits around it
+            # hold its content (git cherry reports it as '+' with an empty patch id)
+            if git rev-list --no-walk --merges "$c" | grep -q .; then
+              continue
             fi
-            # Same reason as above: hand the release over on a branch that carries the
-            # fork's .github, so the push needs contents write only.
-            git checkout -q -b "$branch" "$up"
-            keep_fork_github
-            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (conflicts; the fork's .github is kept)"
+            if git cherry-pick -x "$c" > /dev/null 2>&1; then
+              continue
+            fi
+            mapfile -t changed < <(git diff --name-only --diff-filter=U)
+            if [ "${#changed[@]}" -eq 0 ]; then
+              # failed without a content conflict (already applied, or an empty patch): drop it
+              GIT_EDITOR=true git cherry-pick --skip > /dev/null 2>&1 || git cherry-pick --abort
+              continue
+            fi
+            # The release and the fork both changed these files. Keep the fork's side: a sync
+            # branch may never revert main, and a person finishes the port from the release's
+            # version, which stays in commit $c. The branch is then main plus everything the
+            # release added that did not collide, and it does not have to build until the
+            # listed files are resolved.
+            conflicts+=("${changed[@]}")
+            git checkout --ours -- "${changed[@]}" 2>/dev/null || true
+            git add -A -- "${changed[@]}"
+            GIT_EDITOR=true git cherry-pick --continue > /dev/null
+          done
+          # One commit for the port, as the old merge produced: main's history stays one line per
+          # upstream release. keep_fork_github for the same reason as before - the push must not
+          # create or update a workflow file.
+          git reset -q --soft "$before"
+          keep_fork_github
+          if [ "${#conflicts[@]}" -eq 0 ]; then
+            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (${up:0:12})"
+            # The fork exists for the onebit backend: never push a port that lost it.
+            grep -q '"onebit|onebit"' CMakeLists.txt || { echo "::error::onebit is no longer registered after the port"; exit 1; }
+            test -f src/cpp/server/backends/onebit/onebit_server.cpp || { echo "::error::onebit_server.cpp is gone after the port"; exit 1; }
+            git push -q origin HEAD:main
+            echo "ported upstream ${tag} (${up:0:12}) into ${FORK} main"
+          else
+            git commit -q -m "Sync upstream ${UPSTREAM} ${tag} (conflicts; the fork's side is kept)"
+            conflict_list=$(printf '%s\n' "${conflicts[@]}" | sort -u | sed 's/^/- /')
             git push -q origin "${branch}:refs/heads/${branch}"
             gh pr create --repo "$FORK" --base main --head "$branch" \
               --title "Sync upstream ${UPSTREAM} ${tag} (conflicts)" \
-              --body "Upstream release ${tag} (\`${up:0:12}\`) does not merge cleanly into the fork. Conflicting files:
+              --body "Upstream release ${tag} (\`${up:0:12}\`) ported onto \`main\` (\`${before:0:12}\`), not merged as a tag. The release line predates the #3771 refactor, so the tag's tree is not a newer main: merging it would revert main (fork #27 arrived as a 524-file, -128k-line revert that way). The port keeps main plus every release change that applied cleanly.
 
-          ${conflicts}
+          Files the release also changed, kept on the fork's side (the release's version is in \`${up:0:12}\`):
 
-          Resolve so that the onebit backend stays registered, then merge."
+          ${conflict_list}
+
+          Resolve them in main's layout - for 44.1 that meant \`services/model_options.cpp\` and \`docs/api/openai.md\`, not the release's \`server.cpp\`/\`docs/api/lemonade.md\` - rebuild, run Lemonade's LLM suite through the onebit recipe on Strix Halo, and merge."
           fi
 
       - name: Keep the fork's workflows disabled

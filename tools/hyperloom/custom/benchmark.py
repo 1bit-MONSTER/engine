@@ -175,8 +175,15 @@ def serve_lever_args():
     args = serve_batch_args()
     dflash = env("HL_DFLASH")
     mtp_max_raw = env("HL_MTP_MAX")
+    p_min = env("HL_MTP_P_MIN")
     if dflash and dflash not in ("0", "off", "false"):
+        # --mtp-max/--mtp-p-min apply to the DFlash drafter too (docs/serve.md); without --mtp-max it
+        # drafts full blocks, which throws most of the gain away.
         args += ["--dflash", env("HL_DFLASH_GGUF", "dflash.gguf")]
+        if env_int("HL_MTP_MAX", 0) > 0:
+            args += ["--mtp-max", str(env_int("HL_MTP_MAX", 0))]
+        if p_min:
+            args += ["--mtp-p-min", p_min]
     elif mtp_max_raw:
         mtp_max = env_int("HL_MTP_MAX", 0)
         if mtp_max <= 0:
@@ -185,6 +192,8 @@ def serve_lever_args():
             if env("HL_MTP_HEAD"):
                 args += ["--mtp", env("HL_MTP_HEAD")]
             args += ["--mtp-max", str(mtp_max)]
+            if p_min:
+                args += ["--mtp-p-min", p_min]
     parallel = env_int("HL_PARALLEL", 0)
     if parallel:
         args += ["--parallel", str(parallel)]
@@ -195,7 +204,7 @@ def levers():
     """Echo the configuration into the report, so a KEEP is explicable months later."""
     return {
         k: env(k)
-        for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_DFLASH",
+        for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_MTP_P_MIN", "HL_DFLASH",
                   "HL_PARALLEL", "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
                   "GGML_HRX_TER_Q4_0", "ONEBIT_HRX_DECODE_SPLIT")
         if env(k)

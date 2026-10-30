@@ -80,6 +80,7 @@ jobs:
     outputs:
       alert: ${{ steps.watch.outputs.alert }}
       lines: ${{ steps.watch.outputs.lines }}
+      failure: ${{ steps.watch.outputs.failure }}
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1  # v7.0.1
         with:
@@ -105,27 +106,107 @@ jobs:
           fi
           lines=$(grep -E "UNCOVERED|UNVERIFIABLE|REMOTE-CODE|NEW FLM|NPU FLM|SUPPORT MOVED|kernel-format|Q4NX (NPU)|support_pins" /tmp/census-watch.log | tr -d '`@' | head -n 40 | base64 -w0)
           echo "lines=$lines" >> "$GITHUB_OUTPUT"
-          if [ $rc -eq 1 ]; then echo "alert=true" >> "$GITHUB_OUTPUT"; fi
-          exit $rc
+          # Three outcomes, and the run colour has to mean something (the watcher's contract:
+          # 0 quiet, 1 the alert, 2 the watch did not run).
+          #
+          # An ALERT IS NOT A BROKEN WORKFLOW. Until 2026-10-30 this step exited with the
+          # watcher's code, so an uncovered class turned the run red - every day, for as long
+          # as the class stayed unmapped - and a red run stopped meaning "the watch is broken".
+          # It went unnoticed for two weeks that way (runs 10-16..10-30 red, issue #619 open,
+          # the alert step skipping). The alert now lands in the summary below and in an issue;
+          # the run stays green so red keeps meaning "the daily watch did not run".
+          case "$rc" in
+            0) echo "alert=false" >> "$GITHUB_OUTPUT"; echo "census-watch: quiet" >> "$GITHUB_STEP_SUMMARY"; exit 0 ;;
+            1) echo "alert=true" >> "$GITHUB_OUTPUT"
+               {
+                 echo "## Census alert (the watcher ran; this is a finding, not a failure)"
+                 echo ""
+                 echo '```'
+                 printf '%s' "$lines" | base64 -d
+                 echo '```'
+               } >> "$GITHUB_STEP_SUMMARY"
+               exit 0 ;;
+            *) echo "alert=false" >> "$GITHUB_OUTPUT"
+               # one line, because a GITHUB_OUTPUT value cannot span lines: rc=<n>|<base64 log tail>
+               echo "failure=rc=${rc}|$(tail -n 20 /tmp/census-watch.log | tr -d '`@' | base64 -w0)" >> "$GITHUB_OUTPUT"
+               {
+                 echo "## The census watch did not run (rc=$rc)"
+                 echo ""
+                 echo '```'
+                 tail -n 20 /tmp/census-watch.log
+                 echo '```'
+               } >> "$GITHUB_STEP_SUMMARY"
+               echo "::error::census-watch did not run (rc=$rc): the registry is unverified today"
+               exit "$rc" ;;
+          esac
 
   alert:
     name: File a deduped alert issue
     needs: watch
-    # only when the watcher itself reported an uncovered class (not on checkout/setup failures)
-    if: always() && needs.watch.outputs.alert == 'true'
+    # Always, except when the run was cancelled: an alert needs recording, and so does a watch
+    # that did not run. The old condition (alert == 'true' only) meant a checkout/setup/network
+    # failure filed nothing at all - the exact way this workflow failed unnoticed for two weeks.
+    if: always() && needs.watch.result != 'cancelled' 
     runs-on: ubuntu-latest
     timeout-minutes: 5
     permissions:
       issues: write
     steps:
-      - name: File it, or append it to the open alert
+      - name: File the breach, or the fact that the watch did not run
         env:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
           LINES: ${{ needs.watch.outputs.lines }}
+          FAILURE: ${{ needs.watch.outputs.failure }}
+          WATCH_RESULT: ${{ needs.watch.result }}
           RUN_URL: ${{ github.server_url }}/${{ github.repository }}/actions/runs/${{ github.run_id }}
         run: |
           gh label create census-watch --color B60205 --description "Daily new-model watcher alert" 2>/dev/null || true
+
+          # Post the file to the open issue with this exact content once (as a comment when one
+          # is already open), or open it. $1 title, $2 marker, $3 file.
+          post() {
+            local title="$1" marker="$2" body="$3"
+            local open seen
+            open=$(gh issue list --label census-watch --state open --json number --jq '.[0].number // ""')
+            if [ -n "$open" ]; then
+              seen=$(gh issue view "$open" --json body,comments \
+                --jq '[.body // ""] + [.comments[].body // ""] | join("\n")' | grep -cF "$marker" || true)
+              if [ "${seen:-0}" -gt 0 ]; then
+                echo "#${open} already carries this: nothing to do"
+                return 0
+              fi
+              gh issue comment "$open" --body-file "$body"
+              echo "appended to #${open}"
+              return 0
+            fi
+            gh issue create --title "$title" --label census-watch --body-file "$body"
+          }
+
+          # A watch that did not run is the failure this workflow used to hide: red run, no
+          # issue, nobody told. It gets its own marker (the failure text), so the same breakage
+          # does not reopen daily and a *different* one does.
+          if [ "${WATCH_RESULT}" != "success" ]; then
+            fail_marker="<!-- census-watch-failure: $(printf '%s' "${FAILURE}" | sha256sum | cut -d' ' -f1) -->"
+            {
+              echo "## The daily census watch did not run ($(date -u +%Y-%m-%d))"
+              echo ""
+              echo "The watcher itself failed — this is not a coverage finding, it is the watch being"
+              echo "blind: no model class and no FastFlowLM repo was checked today. Everything the"
+              echo "registry claims about HF coverage is unverified until this is fixed."
+              echo ""
+              echo '```'
+              printf '%s' "${FAILURE#*|}" | base64 -d 2>/dev/null || echo "(no log captured)"
+              echo '```'
+              echo ""
+              echo "Run: ${RUN_URL}"
+              echo ""
+              echo "$fail_marker"
+            } > /tmp/census_issue.md
+            post "census: the daily watch did not run" "$fail_marker" /tmp/census_issue.md
+            exit 0
+          fi
+
           # One issue at a time, but a *new* breach must never be swallowed by an issue that is
           # already open - that is what happened on 2026-10-27: #619 stayed open, so
           # FastFlowLM/LFM3-1.7B-NPU2 (10-28) and MiniCPM-V-4.7-35B-A3B-NPU2 (10-30) alerted
@@ -157,17 +238,4 @@ jobs:
             echo ""
             echo "$marker"
           } > /tmp/census_issue.md
-          open=$(gh issue list --label census-watch --state open --json number --jq '.[0].number // ""')
-          if [ -n "$open" ]; then
-            seen=$(gh issue view "$open" --json body,comments \
-              --jq '[.body // ""] + [.comments[].body // ""] | join("\n")' | grep -cF "$marker" || true)
-            if [ "${seen:-0}" -gt 0 ]; then
-              echo "#${open} already carries this breach: nothing to do"
-              exit 0
-            fi
-            gh issue comment "$open" --body-file /tmp/census_issue.md
-            echo "appended this breach to #${open}"
-            exit 0
-          fi
-          gh issue create --title "census: new HF model class uncovered by the registry" \
-            --label census-watch --body-file /tmp/census_issue.md
+          post "census: new HF model class uncovered by the registry" "$marker" /tmp/census_issue.md

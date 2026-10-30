@@ -270,6 +270,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                 pending.erase(0, emit);
                 if (!on_text(out)) break;
             }
+            // No further token will be sampled after this one (limit reached), so the
+            // decode step that would only produce the NEXT position's logits is a whole
+            // weight stream -- 8.7 s on the 27B -- spent on a result nobody reads.  At
+            // max_tokens=1 that is half the request's latency.
+            if (n + 1 >= limit) break;
             if (!e.fwd->step(next, (int)ids.size() + n, logits))
                 throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
         }

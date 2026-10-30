@@ -407,6 +407,10 @@ if(Python3_Interpreter_FOUND)
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
     # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
+    # every scheduled bump workflow must report its own failure (engine #665): bump-hrx and
+    # bump-ds4 each froze their pin while going red every day unnoticed. The step is driven
+    # against a stubbed gh, with and without an open issue.
+    add_test(NAME bump_workflow_report COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/bump_workflow_report_test.py)
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
     # published FastFlowLM model goes through is proved to fire without the model at hand.

@@ -30,6 +30,7 @@ on:
 
 permissions:
   contents: read
+  issues: write            # the failure step files/refreshes an issue (see the last step)
 
 concurrency:
   group: bump-lemonade
@@ -95,3 +96,24 @@ jobs:
 
           CI here has no GPU. Before merging, on Strix Halo:
           \`scripts/build-lemonade.sh ~/.cache/lemonade-pin\`, then Lemonade's LLM suite through the onebit recipe (docs/lemonade.md)."
+
+      # A failing scheduled job that tells no one is the defect (bump-hrx 2026-10-01..05 and bump-ds4
+      # 2026-10-21..30 both froze a pin that way). This step makes it speak.
+      - name: Report a failed sync so it cannot break silently
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
+        run: |
+          set -euo pipefail
+          title="bump-lemonade: the scheduled Lemonade pin sync is failing"
+          body="The scheduled run $GITHUB_RUN_ID failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          this workflow only follows our fork (\`1bit-MONSTER/lemonade\` main), which \`sync-lemonade-fork.yml\` advances from upstream daily, so a failure is usually the fork being behind or the PR step losing a race. Check \`sync-lemonade-fork.yml\` first, then re-run this one.
+
+          Why this step exists: bump-lemonade had no failure step, so a red scheduled run told no one (2026-10-30; the DwarfStar sibling had been failing silently for ten days)."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

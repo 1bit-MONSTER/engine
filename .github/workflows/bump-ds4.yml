@@ -40,6 +40,7 @@ on:
 
 permissions:
   contents: read
+  issues: write            # the failure step files/refreshes an issue (see the last step)
 
 concurrency:
   group: bump-ds4
@@ -163,3 +164,28 @@ jobs:
 
           CI here has no GPU. Before merging, on Strix Halo:
           \`DS4_TEST=1 scripts/build-ds4.sh ~/.cache/ds4-pin rocm\` (builds, then runs DwarfStar's model-free routed-MoE GPU test), then \`1bit serve --device ds4 -m <DeepSeek V4 Flash Q2 .gguf> --ctx-size 8192\` and the same with its \`.1bp\` (\`gguf-tools/gguf_to_1bp.py\`) answer the same chat request (docs/dwarfstar.md)."
+
+      # This workflow failed on EVERY scheduled run from 2026-10-21 to 2026-10-30 and nobody
+      # noticed: the DwarfStar pin silently froze. A failing scheduled job that tells no one is
+      # the actual defect, so this step makes it speak (the same step bump-hrx has had since its
+      # own five silent days).
+      - name: Report a failed sync so it cannot break silently
+        if: failure()
+        env:
+          GH_TOKEN: ${{ github.token }}   # least privilege: no PAT needed to speak in this repo
+        run: |
+          set -euo pipefail
+          title="bump-ds4: the scheduled DwarfStar pin sync is failing"
+          body="The bump-ds4 run $GITHUB_RUN_ID failed: https://github.com/$GITHUB_REPOSITORY/actions/runs/$GITHUB_RUN_ID
+
+          Two things to look at, in this order:
+          1. **A merge conflict** in 'Merge upstream into 1bit/main' names the conflicting files in the log (2026-10-21..30: \`Makefile\`, on \`ds4.o\`'s prerequisites - our \`ds4_onebp.inc\` against upstream's \`ds4_deepseek41_dspark.h\`; the resolution keeps both). Resolve it on \`1bit-MONSTER/ds4\` \`1bit/main\` by hand, then re-run this workflow.
+          2. **A merge that builds but fails its own check**: since upstream's DeepSeek-V4-Flash CUDA work, \`ds4_deepseek41_cuda.cuh\` references \`ds4_gpu_attention_output_low_q8_rows_exact_tensor\` and \`ds4_gpu_matmul_q8_0_kslice_rows_tensor\`, which the HIP/ROCm layer does not implement, so \`DS4_TEST=1 scripts/build-ds4.sh\` fails linking \`tests/test_mxfp4_rocm\` (the shipped \`ds4\`/\`ds4-server\`/\`ds4-bench\` do build). That is a porting decision for the DwarfStar lane, not a release blocker: the engine keeps its current pin until it is made.
+
+          Why this step exists: bump-ds4 failed on every scheduled run from 2026-10-21 to 2026-10-30 without anyone noticing."
+          existing=$(gh issue list --repo "$GITHUB_REPOSITORY" --state open --search "in:title \"$title\"" --json number --jq '.[0].number // empty')
+          if [ -n "$existing" ]; then
+            gh issue comment "$existing" --repo "$GITHUB_REPOSITORY" --body "$body"
+          else
+            gh issue create --repo "$GITHUB_REPOSITORY" --title "$title" --body "$body"
+          fi

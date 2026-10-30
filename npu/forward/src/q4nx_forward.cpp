@@ -598,12 +598,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // carry both families (or only the old one).  NPU_DECODE_M16=0 forces the
     // all-M=128 path for A/B runs.
     //
-    // Where the twins are looked for, first hit wins: NPU_KERNELS_M16, then
-    // <model dir>/kernels-m16, then <kernels>/m16, then <kernels> itself.  The
-    // point of the first two is that a model directory ships its own decode
-    // family, so a plain `--kernels <model>/kernels` serve runs M=16 with no
-    // extra flag; a shared kernel dir (one whose ELF set serves several models)
-    // stays untouched.
+    // Where the twins are looked for, first hit wins: <model dir>/kernels-m16,
+    // then <kernels>/m16, then <kernels> itself.  The point of the first two is
+    // that a model directory ships its own decode family, so a plain
+    // `--kernels <model>/kernels` serve runs M=16 with no extra flag; a shared
+    // kernel dir (one whose ELF set serves several models) stays untouched.
+    // Both candidates are derived from paths the serve was already given
+    // (`-m` and `--kernels`), so no new user-controlled path reaches fopen:
+    // an earlier draft also read an NPU_KERNELS_M16 override, which is exactly
+    // the cpp/path-injection shape and is not needed for the documented use.
     prof_ = getenv("NPU_PROFILE") != nullptr;
     m16_check_ = getenv("NPU_M16_CHECK") != nullptr;
     const char* m16_env = getenv("NPU_DECODE_M16");
@@ -611,8 +614,6 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     if (want_m16 && !host_gemm_) {
         q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
         std::vector<std::string> m16dirs;
-        if (const char* d = getenv("NPU_KERNELS_M16"))
-            if (*d) m16dirs.push_back(d);
         m16dirs.push_back(mdir + "/kernels-m16");
         m16dirs.push_back(dir + "/m16");
         m16dirs.push_back(dir);

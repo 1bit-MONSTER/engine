@@ -98,14 +98,13 @@ static int derive_mla(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
 }
 
 static void set_elf_name(Q4nxDesignGeom* g, const char* role) {
-    /* The M=128 family is the one that shipped un-suffixed; a decode twin is
-     * distinguished by its M so both can sit in one artifact directory. */
-    if (g->M == Q4NX_DESIGN_M_PREFILL || g->M <= 0)
-        snprintf(g->elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", role,
-                 g->K, g->N);
-    else
-        snprintf(g->elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d_m%d.elf",
-                 role, g->K, g->N, g->M);
+    /* The prefill family is the one that shipped un-suffixed.  Decode twins are
+     * named in q4nx_derive_decode_designs() (a copy of this name with "_m16"
+     * inserted before ".elf"); keeping the "_m%d" branch here as well would be
+     * the same string built two ways, and every caller of this function is a
+     * prefill design. */
+    snprintf(g->elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d.elf", role,
+             g->K, g->N);
 }
 
 int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,

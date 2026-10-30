@@ -71,6 +71,23 @@ kver=${KVER:-$(uname -r)}
 # the kernel image: /boot/vmlinuz-<kver>, or VMLINUZ= (e.g. unpacked from its .deb where /boot is root-only);
 # the engine builds no kernel: the Strix Halo kernel packages come from our separate kernel build
 vmlinuz=${VMLINUZ:-/boot/vmlinuz-$kver}
+# Every module staged below is the one modprobe resolves for $kver, so the image only boots if $kver is the
+# kernel inside $vmlinuz. Defaulting kver to $(uname -r) is right on a box that boots what it builds, but the
+# release box can be running another kernel build: on 2026-10-30 it ran ...-perfopt+ while the image ships
+# ...-perfopt, and had that build's EC/NPU modules carried the enrolled MOK the build would have staged
+# modules for one kernel into an image holding another - a stick that boots and then cannot load amdgpu,
+# usbhid or the EC, with nothing in the build noticing. Ask the kernel image for its release and refuse on a
+# mismatch. The release string sits uncompressed in the setup header, which is what `file` reads; if that ever
+# stops parsing, the check is skipped (empty) rather than guessing.
+if [ -f "$vmlinuz" ]; then
+    vkver=$(file -b "$vmlinuz" 2>/dev/null | sed -n 's/.*version \([^ ]*\) .*/\1/p' | head -n 1 || true)
+    if [ -n "$vkver" ] && [ "$vkver" != "$kver" ]; then
+        echo "   the kernel image $vmlinuz is $vkver, but the modules were selected for $kver (KVER, or uname -r)"
+        echo "   set KVER=$vkver and stage the matching EC_MODULE/AMDXDNA_KO, or ship /boot/vmlinuz-$kver"
+        exit 1
+    fi
+    if [ -n "$vkver" ]; then echo "== the image kernel ($vkver, from $vmlinuz)"; fi
+fi
 here=$(cd "$(dirname "$0")" && pwd)
 tools=$HOME/.cache/1bit-os/tools/x
 # Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A

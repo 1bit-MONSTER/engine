@@ -1,0 +1,28 @@
+{
+  "host": "strixhalo",
+  "model": "Qwen3-Coder-30B-A3B-Instruct",
+  "route": "hrx",
+  "quant": "Q4_K_M",
+  "instrument": "wall clock per request + usage.completion_tokens, n_predict=128, temperature 0, greedy, distinct prompts",
+  "repeats": 5,
+  "timestamp": "2026-10-30T06:52:21Z",
+  "source": "~/lb/612-hrx-20261030T064957Z (tools/showcase-612-hrx.sh 2 4 8 on strixhalo, under gpu-hold label 'pi i612')",
+  "id": "coder30b-hrx-parallel4-20261030",
+  "metric": {
+    "name": "decode aggregate",
+    "value": 91.11,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "parallel": 4,
+    "requests_in_flight": 4,
+    "kv_unified": true,
+    "n_ctx": 8192,
+    "per_stream_tok_s": 22.81,
+    "solo_same_server_tok_s": 84.46,
+    "engine": "38e29a2 + i612-npu-streams (b78868c)",
+    "llama_cpp": "40c4ccb76",
+    "model_file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+  },
+  "notes": "Four streams recover what two lost: 1.08x aggregate, 22.8 tok/s per stream, llama-server reports all four slots decoding in one batch at 24.88 t/s each."
+}

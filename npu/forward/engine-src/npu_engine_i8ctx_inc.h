@@ -28,6 +28,8 @@
 #include <vector>
 #include <memory>
 #include <string>
+
+#include "q4nx_weight_layout.h"   // bpos(): the container's device weight layout
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
@@ -135,21 +137,12 @@ struct I8Ctx {
     // the packed bytes and scales are bit-identical; only the order of the
     // diagnostic `ssum` accumulation differs.
     // Where element (i,j) of the padded [KD][ND] weight image lives in the BO.
-    // Row-major is the historic layout.  blocked_b writes the image the way the
-    // M=16/M=128 kernels' B microkernel already indexes it -- 64x128 tiles of
-    // [kb][nb][8][8] (see mm_kernel_reference.cc, "B LAYOUT silicon-verified") --
-    // with the tiles laid out n-tile-major so a core's k-loop walks forward
-    // through memory.  Then each tile is ONE contiguous 8192-byte burst instead
-    // of 64 runs of 128 contiguous bytes strided by ND, which is worth 2.4-2.6x
-    // on every 27B phase (arena LEADERBOARD: 3.32 -> 8.13 GB/s on GU).
-    // The bytes are the same int8 codes with the same per-column scales, so the
-    // int32 result is bit-identical; only the address order changes.
+    // The mapping (and why the blocked layout is worth 2.4-2.6x) is documented in
+    // q4nx_weight_layout.h, which is also what tests/npu_blocked_layout_test.cpp
+    // checks; this is just the layout switch.
     inline size_t bpos(size_t i, size_t j) const {
-        if (!blocked_b) return i * (size_t)ND + j;
-        const size_t nt = j / 128, ki = i / 64;
-        const size_t kb = (i % 64) / 8, r = i % 8, nb = (j % 128) / 8, c = j % 8;
-        const size_t tile = nt * (size_t)(KD / 64) + ki;
-        return tile * 8192 + (((kb * 16 + nb) * 8 + r) * 8 + c);
+        return blocked_b ? q4nx_layout::blocked_index(i, j, KD, ND)
+                         : q4nx_layout::rowmajor_index(i, j, KD, ND);
     }
 
     void packB_blocked(int8_t* Bm, const float* w, int K, int N,

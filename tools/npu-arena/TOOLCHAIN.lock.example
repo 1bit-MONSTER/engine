@@ -1,0 +1,23 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# TOOLCHAIN.lock.example -- copy to TOOLCHAIN.lock (git-ignored) and fill in for
+# your box.  The arena resolves every path from the environment first, then from
+# TOOLCHAIN.lock, so CI and a shared box can pin different toolchains and every
+# score line records which one produced it.
+#
+# The AIE2P compile path is Loom's own MLIR (mlir-aie) + Peano.  Never xchesscc
+# or aietools at run time; the Vitis tree is consulted only for the AIE API
+# headers the microkernel includes.
+MLIR_AIE=/path/to/mlir-aie
+MLIR_AIE_INSTALL=/path/to/mlir-aie/install_tmp
+PEANO=/path/to/mlir-aie/.venv/lib/python3.14/site-packages/llvm-aie
+AIE_API_HEADERS=/path/to/Vitis/aietools/include
+# Kernel generators (the starting point of every submission): the ELF emitters
+# and the microkernel.  Not in this repository.
+GENERATORS=/path/to/engine/npu/generators
+# The engine build that produced libonebit_npu_rt.a (the arena runner links the
+# engine's own NPU runtime, ONEBIT_NPU_RT_DIR=1 build).
+ENGINE_BUILD=/path/to/engine/build
+NPU_RT_LIB=/path/to/engine/build/libonebit_npu_rt.a
+HOST_CXX=/usr/bin/g++-16

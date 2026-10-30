@@ -36,8 +36,21 @@ HERE=$PWD
 : "${RESULT_DIR:=$PWD}"
 export RESULT_DIR
 
-GPU_HOLD=${HL_GPU_HOLD:-$HOME/.local/bin/gpu-hold}
+# gpu-hold lives in the box user's ~/.local/bin, which is NOT $HOME when the caller runs under a
+# sandboxed HOME (a fresh home for the agent CLIs). Resolve it from the password database too, so the
+# measurement is never started outside the FIFO because of a HOME override.
+GPU_HOLD=${HL_GPU_HOLD:-}
 HOLD_MIN=${HL_GPU_HOLD_MINUTES:-20}
+if [ -z "$GPU_HOLD" ] && command -v gpu-hold >/dev/null 2>&1; then
+  GPU_HOLD=$(command -v gpu-hold)
+fi
+if [ -z "$GPU_HOLD" ]; then
+  REAL_HOME=$(getent passwd "$(id -u)" | cut -d: -f6)
+  for cand in "$HOME/.local/bin/gpu-hold" "${REAL_HOME:-/nonexistent}/.local/bin/gpu-hold"; do
+    [ -x "$cand" ] && { GPU_HOLD=$cand; break; }
+  done
+fi
+GPU_HOLD=${GPU_HOLD:-$HOME/.local/bin/gpu-hold}
 if [ ! -x "$GPU_HOLD" ]; then
   echo "[1bit-hl] FATAL: $GPU_HOLD is not executable; a measurement outside the GPU FIFO is not allowed" >&2
   exit 1

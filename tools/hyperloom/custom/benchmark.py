@@ -87,6 +87,27 @@ def log(msg):
     print(f"[1bit-hl] {msg}", flush=True)
 
 
+def user_home():
+    """The box user's home, even when $HOME is a sandbox the caller supplied.
+
+    Hyperloom writes the CLI credential into the ~/.claude of whatever HOME it runs under, so a run
+    on a shared box is normally sandboxed; the build, the weights and the reference state still live
+    in the real home. $HOME wins when it already holds what we are looking for.
+    """
+    home = pathlib.Path(os.path.expanduser("~"))
+    if os.environ.get("HL_REAL_HOME"):
+        return pathlib.Path(env("HL_REAL_HOME")).expanduser()
+    try:
+        import pwd
+
+        real = pathlib.Path(pwd.getpwuid(os.getuid()).pw_dir)
+        if (real / "wt").is_dir() or not (home / "wt").is_dir():
+            return real
+    except (ImportError, KeyError):
+        pass
+    return home
+
+
 def model_file():
     """The GGUF this measurement serves: ``$MODEL`` may be the file or the directory holding one."""
     raw = env("HL_MODEL") or env("MODEL")
@@ -315,7 +336,7 @@ def main():
 
     # Out-of-tree build (README.md): `1bit` at the build root, the HRX llama.cpp tools built by
     # the llama_hrx ExternalProject under hrx/llama/bin.
-    build = pathlib.Path(env("HL_BUILD") or pathlib.Path.home() / "wt/hl-engine-build").expanduser()
+    build = pathlib.Path(env("HL_BUILD") or user_home() / "wt/hl-engine-build").expanduser()
     bin_dir = pathlib.Path(env("HL_BIN") or build / "hrx/llama/bin").expanduser()
     onebit = pathlib.Path(env("HL_ONEBIT") or build / "1bit").expanduser()
     bench, ppl = bin_dir / "llama-bench", bin_dir / "llama-perplexity"
@@ -323,8 +344,8 @@ def main():
         if not os.access(path, os.X_OK):
             raise SystemExit(f"missing binary {path}: build the checkout first (README.md)")
 
-    wiki = pathlib.Path(env("HL_WIKI", str(pathlib.Path.home() / "models/qwen38/wikitext-2-raw/wiki.test.raw")))
-    state = pathlib.Path(env("HL_STATE") or pathlib.Path.home() / "lb/hl-gate" / model.stem)
+    wiki = pathlib.Path(env("HL_WIKI") or user_home() / "models/qwen38/wikitext-2-raw/wiki.test.raw")
+    state = pathlib.Path(env("HL_STATE") or user_home() / "lb/hl-gate" / model.stem)
     state.mkdir(parents=True, exist_ok=True)
     ref_path, texts_path, base_kld = state / "ref.json", state / "texts.json", state / "kld-base.kld"
     kld_max = env_float("HL_GATE_KLD_MAX", 1e-4)

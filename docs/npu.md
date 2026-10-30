@@ -292,6 +292,15 @@ alongside whatever the other engine has already allocated, and both engines pull
 bandwidth. Two *different* models resident at once (the reason the second engine exists) is therefore
 bounded by memory first, not by hwctx: see the table below.
 
+A model directory repacked from an FLM pack still carries FLM's own parameter map and version in
+`config.json` -- for Qwen3-0.6B, `addr_qk 9216`, `addr_kv 33792`, `addr_kk 45056`,
+`addr_l_begin_mha 53760`, `addr_l_end_mha 25088`, plus `flm_version 0.9.22`. Those are offsets into
+FLM's program layout for the AIE programs that live in the FLM install, not a description of this
+engine's memory: this route reads only the geometry keys (`hidden_size`, `num_hidden_layers`,
+`num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `vocab_size`, `head_dim`) and finds
+its own full ELFs under `--kernels`, which is why a model directory's `npu/` subdirectory is empty on
+purpose and why `addr_*` must not be used to reason about what this engine allocates.
+
 What it measures, on Qwen3-0.6B-Q4_K_M (`max_tokens 8`, `temperature 0`, three reps, rep 1 dropped
 as warm-up, engine `a88ef00`, 2026-10-29, lock bypassed): solo **6.31 / 6.23 s**, concurrent
 **9.51 / 9.51 s** -- **65.7 % of solo per stream, 1.31x aggregate**. So it is worth it for two

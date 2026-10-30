@@ -42,12 +42,22 @@ struct Kernel {
     int m = 0, k = 0, n = 0;
     std::string elf;
     std::unique_ptr<I8Ctx> ctx;
-    // Last packed weight, so repeated MatMuls against the same tensor do not re-quantise it.
-    // shortcut: one slot per kernel; two different weights of the same shape repack per call.
-    const float* w_ptr = nullptr;
-    int64_t w_k = 0, w_n = 0;
-    float w_scale = 1.0f;
+    // One resident weight per initialiser: the runtime keeps a weight BO per layer (layerB[l]), so a
+    // weight is packed once, on first use, and a steady-state token does no packing at all. Keyed by
+    // the initialiser pointer, which is stable for the life of the session's weights.
+    std::vector<const float*> slots;
+    std::vector<float> scales;
 };
+
+// Weight slots per kernel. A transformer has one weight per projection shape per layer, so this is
+// the depth a single shared NPU context needs at the moment; K*N*slots bytes of device memory.
+constexpr int kSlots = 24;
+
+// A fused QKV kernel is not a plain projection: its weights are packed per section (q/k/v, three
+// scale sets) and read back per section (I8Ctx::pack_qkv_sec / dequant_qkv_rows, the fix for #1699).
+// Driving one through packB/go_rows quantises three sections with one scale, which is exactly the
+// ~5%-per-layer error that flips tokens, so such ELFs are ignored until section support lands.
+bool sectioned_elf(const std::string& elf) { return elf.find("QKV") != std::string::npos; }
 
 // One process-wide NPU context: the device, the kernels, and the lock that keeps other processes
 // out. The EP is single-session in practice, so one is enough.
@@ -152,13 +162,20 @@ bool init(State& s) {
         int m = 0, k = 0, n = 0;
         if (sscanf(dims.c_str(), "%dx%dx%d", &m, &k, &n) != 3 || m <= 0 || k <= 0 || n <= 0)
             return fail(s, "ONEBIT_EP_NPU_ELFS: bad design dims '" + dims + "'");
+        if (sectioned_elf(elf)) {
+            fprintf(stderr,
+                    "onebit_npu: ignoring %s -- fused QKV kernel needs per-section weights "
+                    "(pack_qkv_sec), not a plain projection; that shape falls back to the CPU EP\n",
+                    elf.c_str());
+            continue;
+        }
         auto kernel = std::make_unique<Kernel>();
         kernel->m = m;
         kernel->k = k;
         kernel->n = n;
         kernel->elf = elf;
         kernel->ctx = std::make_unique<I8Ctx>();
-        if (!kernel->ctx->init_elf(*s.dev, elf.c_str(), m, k, n, 1))
+        if (!kernel->ctx->init_elf(*s.dev, elf.c_str(), m, k, n, kSlots))
             return fail(s, "I8Ctx init_elf failed for " + elf + " (" + dims + ")");
         s.kernels.push_back(std::move(kernel));
     }
@@ -181,12 +198,14 @@ bool has_kernel(int64_t k, int64_t n) {
             if (eq == std::string::npos) continue;
             int m = 0, kk = 0, nn = 0;
             if (sscanf(item.substr(0, eq).c_str(), "%dx%dx%d", &m, &kk, &nn) != 3) continue;
+            if (sectioned_elf(item.substr(eq + 1))) continue;
             if (kk == k && nn == n) return true;
         }
         return false;
     }
     int m = 0, kd = 0, nd = 0;
-    if (!env("ONEBIT_EP_NPU_ELF") || !env_int("ONEBIT_EP_NPU_M", &m) ||
+    if (!env("ONEBIT_EP_NPU_ELF") || sectioned_elf(env("ONEBIT_EP_NPU_ELF")) ||
+        !env_int("ONEBIT_EP_NPU_M", &m) ||
         !env_int("ONEBIT_EP_NPU_K", &kd) || !env_int("ONEBIT_EP_NPU_N", &nd))
         return false;
     return kd == k && nd == n;
@@ -222,12 +241,21 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
         return false;
     }
 
-    // Weights: int8 per column, one scale per column (packB).
-    if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
-        kern->ctx->packB(0, b, (int)k, (int)n, kern->w_scale);
-        kern->w_ptr = b;
-        kern->w_k = k;
-        kern->w_n = n;
+    // Weights: int8 per column, one scale per column (packB), packed once per initialiser.
+    int slot = -1;
+    for (size_t i = 0; i < kern->slots.size(); i++)
+        if (kern->slots[i] == b) slot = (int)i;
+    if (slot < 0) {
+        if ((int)kern->slots.size() >= kSlots) {
+            if (err)
+                *err = "no free NPU weight slot (" + std::to_string(kSlots) +
+                       " per shape) -- more distinct weights than the context holds";
+            return false;
+        }
+        slot = (int)kern->slots.size();
+        kern->slots.push_back(b);
+        kern->scales.resize((size_t)slot + 1, 1.0f);
+        kern->ctx->packB(slot, b, (int)k, (int)n, kern->scales[(size_t)slot]);
     }
 
     // Activations: one row group of the kernel's M at a time. Rows past `rows` are zero-padded
@@ -241,7 +269,7 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
             for (int64_t i = 0; i < k; i++) amax = std::max(amax, std::fabs(row[i]));
             scales[(size_t)r] = amax > 0.0f ? amax / 127.0f : 1.0f;
         }
-        if (!kern->ctx->go_rows(0, a + row0 * k, rows, (int)k, scales.data(), scales.data(),
+        if (!kern->ctx->go_rows(slot, a + row0 * k, rows, (int)k, scales.data(), scales.data(),
                                 1.0f, c + row0 * n, (int)n)) {
             if (err) *err = "I8Ctx go_rows failed";
             return false;

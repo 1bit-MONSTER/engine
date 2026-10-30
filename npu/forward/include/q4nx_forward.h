@@ -118,6 +118,13 @@ private:
         return weight_cache_ && cur_layer_ >= 0 && cur_layer_ < (int)wcache_.size() &&
                wcache_[(size_t)cur_layer_].find(key) != wcache_[(size_t)cur_layer_].end();
     }
+    // True when this layer's dense FFN tail (the f32 wg_/wu_/wd_ buffers) can be
+    // skipped: they are read only by q4nx_assemble_B(), which the MLP sections
+    // skip once the layer's packed weights are resident.  See the definition.
+    bool ffn_tail_cached() const;
+    // The default for the above when NPU_FFN_CACHE says nothing: on for a GDN
+    // model on the NPU route, with a size guard.  See the definition.
+    bool ffn_cache_default() const;
     bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
                    bool proportional, int window, int kv_layer, bool append_kv);
@@ -229,6 +236,11 @@ private:
     };
     std::vector<std::unordered_map<int, PackedWeight>> wcache_;   // [layer][wkey]
     bool weight_cache_ = true;    // NPU_NO_WCACHE=1 disables (A/B)
+    // Skip the per-token re-dequant of a layer's dense FFN tail once its packed
+    // weights are resident (see ffn_tail_cached()).  -1 asks
+    // ffn_cache_default(), which is on for a GDN model on the NPU route; init
+    // resolves it to 0 or 1.  NPU_FFN_CACHE=0|1 forces it either way.
+    int ffn_cache_ = -1;
     int cur_layer_ = 0;           // layer currently being processed
 
     // ── Gemma4 (per-layer embeddings + KV sharing + extra norms) ──

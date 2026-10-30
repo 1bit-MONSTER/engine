@@ -435,6 +435,110 @@ carries two multi-second gaps after `ggml_get_rows_f32` that the timed pass does
 1,355 ms device + ~0.4 s host), so those are bundle-write or cold-start cost, not the steady-state
 host gap.
 
+#### Where a prefill forward's time goes, and the ~1.0 s that is not HRX ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
+
+Issue #572 reads the 1,786 ms pp512 pass as 755.7 ms of device time (41.9 %) and ~1.0 s of host time between
+dispatches. Measured on the file itself, the host figure is right and the cause is not the HRX host path:
+
+    Qwen3.8-Flash-Next UD-IQ4_XS (87.3 GiB), -ngl 99 -fa 1 -ub 512 -p 512 -dev HRX0
+      llama-bench:                              1,795.4 ms/forward  = 285.2 tok/s
+      libhrx dispatch bundle, 2 forwards:       1,353.5 ms of device kernels = 676.8 ms/forward (37.7 %)
+      HRX graph computes, per forward:          618.6 ms in `replay.wait` (the kernels), 0.13 ms of host
+      => outside the HRX backend:               ~1,177 ms/forward, 66 % of the forward
+
+**The section above's "76 % device" is a two-forward number compared against a one-forward pass.**
+1,353.5 ms is exactly two forwards of 676.8 ms, which is the same two-forwards reading that
+[#572's comment (b)](https://github.com/1bit-MONSTER/engine/issues/572) retracted; it survived here in the
+table. Per forward the device leg is 37.7 %, and #572's 41.9 % was the closer figure. The bundle's own
+counts carry the same two-pass structure: 5,134 dispatches, and 334 dispatches of
+`ggml_mul_mat_f32_f32_wmma` where the phase profiler sees one pass of 2,566 dispatches per forward.
+
+The 676.8 ms above and the 618.6 ms below are the same device leg from two runs, and that 9 % is the
+profiler: kernel times come from a run with `HRX_PROFILE_FILE` set, and writing that bundle on the dispatch
+path inflates it relative to the `replay.wait` the unprofiled run times. The same sign and a similar size
+show up on the two control models below (2 % and 7 %).
+
+The host leg is real, and it is **not** the HRX backend: a graph compute on this model is 618.6 ms of
+`replay.wait` with the graph-program lookup, binding, cache key, transient lease, host-staging rebind,
+upload, launch, flush and download together under 0.13 ms. What costs the other ~1.18 s is llama.cpp-side
+work - the CPU computing graph nodes that the HRX backend did not take (this model's graph runs as two
+graph computes per forward, a 2,566-dispatch HRX one and a 1-dispatch one, so the rest is CPU-resident
+work in llama.cpp's own graph, not a gap between HRX dispatches).
+
+`GGML_HRX_HOST_GAP=1` (llama.cpp #154) is the profiler that separates those legs, and `HRX_PROFILE_FILE`
++ `HRX_PROFILE_MODE=dispatch`, read with `iree-profile statistics`, is the only device-time source: that
+bundle reports 5,134 dispatches and 1,353.522 ms of kernels for the two forwards above, and per-kernel
+shares - `hrx_dp_mm_q8_0_m128_w8_f2` 52.2 + 91.6 ms, `ggml_mul_mat_f32_f32_wmma` 334 dispatches for
+94.8 ms, `hrx_hc_pre_gated` 42.9 ms.
+
+**What that CPU work is: one GET_ROWS, declined by a size cap.** `llama-server -lv 4` on the same file
+prints the placement of the prefill graph — `placement: 6060 nodes, 1 off HRX (GET_ROWS x 1), 3 graph
+splits`. One node, on the CPU, and it is the whole ~1.18 s. It reads
+`per_layer_token_embd.weight`, which this file carries as `IQ4_NL [160, 320001536]` - 18 bytes per 32
+values, so 28.80 GB of table (26.8 GiB), against `token_embd.weight`'s ordinary `Q8_0 [2560, 248320]` -
+and `dispatch_registration/common/dispatch-get-rows.cpp` declines it at
+`is_supported_row_count()`: `kMaxGetRowsRowCount` is 262,208, the table has 320,001,536 rows. A gather of
+512 rows out of a 28.8 GB table costs the page faults of touching it - and it grew with the token count
+(35 ms at `-p 128`, ~1.18 s at `-p 512`) because more rows means more of the table.
+
+That is the "GET_ROWS fallback" line in #572's own list, and it is the item to fix: either raise
+`kMaxGetRowsRowCount` for a table this shape or give the gather a dispatch that does not walk 28.8 GB on the
+host. The cap mirrors a promise in the kernel rather than being arbitrary:
+`kernel-corpus/kernels/loom-libs/ops/get_rows_f32.loom` assumes `range(%token, 0, 262207)` on the row
+index, so raising the matcher's cap alone would read out of range until that bound becomes a compile-time
+config.
+
+**The forward on a roofline.** Weights and shapes come from the GGUF tensor directory itself, FLOPs from
+TraceLens's `PerfModel` (`GEMM`/`flash_attention`), peaks from the measured Radeon 8060S spec TraceLens
+keeps for gfx1151 (256 GB/s, 59.39 TFLOP/s fp16, 118.78 TFLOP/s int4), and measured device time per class
+from the dispatch bundle of the same model (`~/lb/i572/roofline_fn.py`). At 512 tokens every one of the 512
+experts is touched (512 x 10 picks, E[untouched] = 0.02), so the expert weights are compulsory traffic,
+while the 28.8 GB PLE table is only gathered (one 90-byte row per token per layer) and is not streamed:
+
+| class | weights GB | touched GB | FLOPs T | mem roof ms | compute roof ms | measured ms |
+|---|---:|---:|---:|---:|---:|---:|
+| MoE experts | 59.52 | 59.52 | 2.416 | **232.5** | 20.3 | 306.1 |
+| gated-delta-net layers (36) | 2.25 | 2.25 | 2.126 | 8.8 | 35.8 | 33.7 |
+| token embedding + LM head | 1.20 | 1.20 | 0.651 | 4.7 | 11.0 | (in dense) |
+| full-attention layers (12) | 1.02 | 1.02 | 0.671 | 4.0 | 11.3 | (in dense) |
+| MoE shared expert + router | 0.50 | 0.50 | 0.306 | 2.0 | 5.2 | (in dense) |
+| hyper-connections | 0.34 | 0.34 | 0.644 | 1.3 | 10.8 | 35.1 |
+| PLE table | 28.80 | 0.002 | 0 | 0.0 | 0.0 | 0.5 |
+| **total** | **93.67** | **64.87** | **6.81** | **253** | 115 | **676.8** |
+
+The forward is memory-bound with 2.2x the compute roof, and the device leg runs at **37 % of its own
+compulsory-traffic roof — 2.7x the floor**. The MoE expert GEMMs are the class that is close to it (306 ms
+against a 232 ms floor, 76 %); the slack is elsewhere: 1,189 elementwise/copy/norm dispatches cost 106.6 ms
+for no weight traffic at all (~90 us each, dispatch-bound), the f32 small matmuls cost 58.4 ms over 273
+dispatches, and the dense projection GEMMs 136.3 ms over 395.
+
+Against that, the host leg is not a rounding error but the largest single line in the forward: the one CPU
+`GET_ROWS` costs ~1,177 ms, **4.6x the memory roof of the whole forward**, to move 2.2 MB of gathered rows
+— it is page faults on a cold 28.8 GB mmap'd table, not arithmetic, which is why it does not improve from
+one forward to the next (1,788.6 then 1,802.1 ms) while the device-side `get_rows` dispatches cost 0.5 ms.
+Give that gather a dispatch and the forward is ~620 ms of device, i.e. ~2.9x pp512 on this file.
+
+**The controls.** A model whose graph has no off-HRX node shows no host leg at all, which is how the two
+legs are told apart:
+
+| model | forward | `graph.lookup` | `graph.bind` | `replay.upload` | `replay.flush` | `replay.wait` (device) |
+|---|---:|---:|---:|---:|---:|---:|
+| Qwen3-Coder-30B-A3B Q4_K_M, 1,161 dispatches | 263.5 ms | 0.004 ms | 0.002 ms | 0.005 ms | 0.001 ms | 263.46 ms |
+| Qwen3.8-27B UD-Q4_K_XL, 1,519 dispatches | 870.2 ms | 0.003 ms | 0.003 ms | 0.004 ms | 0.001 ms | 870.14 ms |
+
+and libhrx's dispatch profile agrees on those two: 2,322 dispatches / 538.14 ms of device kernels over two
+forwards (103 % of the 523.8 ms they took) and 3,038 / 1,871.15 ms (113 % of 1,657.2 ms), the surplus being
+the profiler's own record writing. The host path does grow with the ubatch, but it stays small: `-p 4096
+-ub 2048` on the 30B-A3B is 1,143.7 ms of `replay.wait` in a 1,158.6 ms graph (98.7 %), with every other
+phase under 0.25 ms, plus a one-time 4.5 s on the first graph of a new ubatch for prepare and kernel JIT.
+
+What a host leg looks like when the *whole* graph leaves HRX: the same 27B at `-ngl 20` runs 3,746 graph
+computes per forward instead of 2, and its host-staging upload alone becomes 145.7 ms per forward.
+
+`rocprofv3` cannot produce any of this: it exits 0 on an HRX run and writes no traceback files, because
+HRX dlopens TheRock's `libhsa-runtime64.so.1` itself and libhrx writes its own AQL packets, so the
+profiler's HSA interposition never sees a dispatch.
+
 ### Hadamard-rotated Q4_0 files ("H32", dropped)
 
 The engine dropped its own Hadamard-rotated Q4_0 format (owner, 2026-10-03): on HRX it was slower

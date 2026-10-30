@@ -181,6 +181,18 @@ each with its release, license and source; their license texts are on the image 
 /data/lemonade/licenses.
 
 -------------------------------------------------------------------------------
+Redistributed in this repository as data (configs/q4nx/)
+-------------------------------------------------------------------------------
+
+FLM_Q4NX_Converter configuration files (17 JSON files under configs/q4nx/)
+  https://github.com/ROCm/FLM_Q4NX_Converter
+  Copyright (c) 2026 Advanced Micro Devices, Inc. and the FLM_Q4NX_Converter contributors
+  License: Apache-2.0 (the same licence as this repository; the full text is LICENSE).
+  Copied verbatim at commit d1d5232 and carried unmodified as reference data for
+  tools/q4nx_diff.py and the format notes in docs/npu.md. No build target reads them and
+  no code is copied from that project; see configs/q4nx/README.md.
+
+-------------------------------------------------------------------------------
 Tools that scripts under tools/ drive (installed separately, not redistributed)
 -------------------------------------------------------------------------------
 

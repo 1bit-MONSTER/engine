@@ -209,6 +209,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                                const std::string& dir) {
     if (getenv("NPU_INFER_HOST_GEMM")) host_gemm_ = true;
     if (getenv("NPU_NO_WCACHE")) weight_cache_ = false;   // A/B: disable the packed-weight cache
+    if (const char* v = getenv("NPU_FFN_CACHE")) {
+        ffn_cache_ = std::atoi(v) != 0 ? 1 : 0;   // engine#587: force the dense-tail cache
+    }
     dev_ = dev;
 
     // ---- config.json FIRST, then model_load ----
@@ -660,6 +663,14 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 ple_dim_, sem_.num_kv_shared_layers, first_shared, sem_.double_wide_mlp);
     }
 
+    // engine#587: resolve the dense-tail cache once the config is known, and say
+    // which way it went, so a measurement can tell "off" from "never asked".
+    if (ffn_cache_ < 0) ffn_cache_ = ffn_cache_default() ? 1 : 0;
+    std::fprintf(stderr, "[ffn] dense-tail cache %s (%s; lin_kd=%d IM=%d H=%d)\n",
+                 ffn_cache_ ? "on" : "off",
+                 getenv("NPU_FFN_CACHE") ? "NPU_FFN_CACHE" : "default",
+                 lin_kd_, c_.IM, c_.H);
+
     backend_ = "full ELF";
     ready_ = true;
     return true;
@@ -805,6 +816,45 @@ void Q4nxNpuForward::layer_attn_dims(int l, int& hd, int& nkv) const {
         hd = c_.HD;
         nkv = c_.NKV;
     }
+}
+
+// engine#587: with NPU_FFN_CACHE unset the cache is on where it is safe and worth
+// it -- a GDN model (lin_kd_ > 0, the one case step()'s `dense_weights_cached`
+// can never cover, since that guard stops at lin_kd_ == 0), packed weights
+// actually being cached, and a dense tail big enough for the per-token reload to
+// be material.  Qwen3.8-27B-NPU2 (IM 17408 x H 5120) clears it with 1.07 GB per
+// layer, and measured 117.4 -> 104.5 s wall and 63.3 -> 22.9 s CPU per token on
+// an 8-token request with identical text (~/lb/587-cache-20261030).
+// The floor is a size guard, not a second measurement: below it the reload is
+// small enough that the behaviour change is not worth taking unasked.
+bool Q4nxNpuForward::ffn_cache_default() const {
+    if (host_gemm_ || !weight_cache_ || lin_kd_ <= 0) return false;
+    const double tail_bytes = 3.0 * (double)c_.IM * (double)c_.H * 4.0;   // wg_+wu_+wd_
+    return tail_bytes >= 256.0 * 1024.0 * 1024.0;
+}
+
+// The three f32 FFN buffers (wg_/wu_/wd_) are read only by q4nx_assemble_B(),
+// which the MLP sections of step()/step_batch() skip once that layer's packed
+// int8 weight is on the device (weight_cached(2|3|4)) -- the same argument as
+// proj_cached in load_gdn_layer, which skips the three GDN projection deqs and
+// leaves ~1 GB/layer/token of FFN dequant in place.
+//
+// step() never satisfies `dense_weights_cached` for a hybrid GDN model
+// (lin_kd_ > 0 is model-level), so a GDN model re-dequantised the 17408-wide
+// dense tail of all 64 layers on every token: 3 * 17408 * 5120 * 4 B = 1.07 GB
+// per layer, ~68 GB of f32 writes per token.  Gating on the packed-BO state
+// rather than assuming it keeps the first use of every layer correct, and a
+// host-GEMM run (which never packs) keeps its legacy behaviour.
+//
+// Keys: down is always 4; a fused gate/up design packs gate+up as key 2
+// (N = 2*IM), a split one as gate 2 + up 3.  Require 3 only when the model has
+// the split designs, so the guard is not silently dead on a fused-GU model.
+bool Q4nxNpuForward::ffn_tail_cached() const {
+    if (!ffn_cache_ || host_gemm_) return false;
+    if (!weight_cached(2) || !weight_cached(4)) return false;
+    if (idx_of(Q4NX_DESIGN_G) >= 0 && idx_of(Q4NX_DESIGN_U) >= 0)
+        return weight_cached(3);
+    return true;
 }
 
 bool Q4nxNpuForward::load_layer(int l) {
@@ -981,9 +1031,11 @@ bool Q4nxNpuForward::load_layer(int l) {
         if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
         return true;
     }
-    if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
-    if (!deq(&lw->up_proj_weight, wu_.data(), im, H)) return false;
-    if (!deq(&lw->down_proj_weight, wd_.data(), H, im)) return false;
+    if (!ffn_tail_cached()) {
+        if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
+        if (!deq(&lw->up_proj_weight, wu_.data(), im, H)) return false;
+        if (!deq(&lw->down_proj_weight, wd_.data(), H, im)) return false;
+    }
     return true;
 }
 
@@ -1124,9 +1176,11 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
         if (!load_bf16_opt("model.layers.%d.mlp.share_router.weight", share_router_, H)) share_router_.clear();
         return true;
     }
-    if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, H)) return false;
-    if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, H)) return false;
-    if (!deqT(&lw->down_proj_weight, wd_.data(), H, c_.IM)) return false;
+    if (!ffn_tail_cached()) {
+        if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, H)) return false;
+        if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, H)) return false;
+        if (!deqT(&lw->down_proj_weight, wd_.data(), H, c_.IM)) return false;
+    }
     return true;
 }
 

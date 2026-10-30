@@ -1,0 +1,17 @@
+[
+  {"name": "mtp_off", "extra_envs": {"HL_MTP_MAX": "0"}},
+  {"name": "ub1024", "extra_envs": {"HL_UB": "1024"}},
+  {"name": "ub2048", "extra_envs": {"HL_UB": "2048"}},
+  {"name": "b2048", "extra_envs": {"HL_B": "2048"}},
+  {"name": "fa_off", "extra_envs": {"HL_FA": "off"}},
+  {"name": "kv_k_q8", "extra_envs": {"HL_CTK": "q8_0"}},
+  {"name": "kv_kv_q8", "extra_envs": {"HL_CTK": "q8_0", "HL_CTV": "q8_0"}},
+  {"name": "mtp_3", "extra_envs": {"HL_MTP_MAX": "3"}},
+  {"name": "mtp_6", "extra_envs": {"HL_MTP_MAX": "6"}},
+  {"name": "mtp_8", "extra_envs": {"HL_MTP_MAX": "8"}},
+  {"name": "dflash", "extra_envs": {"HL_DFLASH": "1"}},
+  {"name": "parallel_2", "extra_envs": {"HL_PARALLEL": "2"}},
+  {"name": "parallel_4", "extra_envs": {"HL_PARALLEL": "4"}},
+  {"name": "q8_prefill_relax_off", "extra_envs": {"GGML_HRX_Q8_PREFILL_RELAX": "0"}},
+  {"name": "graph_cache_unbounded", "extra_envs": {"GGML_HRX_GRAPH_PROGRAM_CACHE": "0"}}
+]

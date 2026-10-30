@@ -14,20 +14,37 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# 1bit engine
+# 1bit engine: local LLM inference on AMD Ryzen AI MAX+ 395
 
-**Documentation:** [1bit.gg](https://1bit.gg/) · **Measured results:** [wiki](https://github.com/1bit-MONSTER/engine/wiki) · **Community:** [Discord](https://discord.gg/fa5m4Vawpa)
+[![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
+[![Lemonade Server v2026.44.1](https://img.shields.io/badge/Lemonade-v2026.44.1-f5c518)](https://github.com/lemonade-sdk/lemonade/releases/tag/v2026.44.1)
+[![Releases](https://img.shields.io/badge/releases-GitHub-24292f)](https://github.com/1bit-MONSTER/engine/releases)
+[![Documentation: 1bit.gg](https://img.shields.io/badge/docs-1bit.gg-1779e1)](https://1bit.gg/)
+[![Discord](https://img.shields.io/badge/chat-Discord-5865F2)](https://discord.gg/fa5m4Vawpa)
+
+**Documentation:** [1bit.gg](https://1bit.gg/) · **Downloads:** [releases](https://github.com/1bit-MONSTER/engine/releases) · **Measured results:** [wiki](https://github.com/1bit-MONSTER/engine/wiki) · **Community:** [Discord](https://discord.gg/fa5m4Vawpa)
 
 **Site:** [github.com/1bit-MONSTER/site](https://github.com/1bit-MONSTER/site) (builds 1bit.gg from this repository's README.md and docs/)
 
-**The 1bit engine is AMD's HRX runtime, our own HIP kernels on the Strix Halo GPU, and our NPU
-engine, all inside [Lemonade](https://github.com/lemonade-sdk/lemonade).** On a Ryzen AI Max+ 395,
-every graph node of every model and mode we test runs on the GPU: 43 of 43 configurations in the
-census, with 0 nodes on the CPU ([#476](https://github.com/1bit-MONSTER/engine/pull/476),
-[#480](https://github.com/1bit-MONSTER/engine/pull/480),
-[#481](https://github.com/1bit-MONSTER/engine/pull/481)). Qwen3.8-27B (UD-Q4_K_XL) with MTP
-speculative decoding decodes at 36.0 / 26.8 / 29.9 tok/s on code / prose / short chats
-([#487](https://github.com/1bit-MONSTER/engine/pull/487)).
+**The 1bit engine runs local LLMs on the AMD Ryzen AI MAX+ 395 (Strix Halo, gfx1151) inside AMD's
+[Lemonade Server](https://github.com/lemonade-sdk/lemonade) as its `onebit` backend**, pinned to
+Lemonade v2026.44.1. It drives the Radeon 8060S iGPU through HRX with our own HIP kernels, and the
+XDNA 2 NPU through our own NPU runtime (full-ELF kernel sets), behind an OpenAI-compatible API. It
+ships as a Linux tarball, a Lemonade+onebit package and a bootable 1bit OS live image (Secure Boot
+signed), from the [releases page](https://github.com/1bit-MONSTER/engine/releases). Every ggml
+weight type runs on HRX, including NVFP4, Q2_0, MXFP4 and the ternary TQ, PTQ and PQ formats.
+
+Measured on a Ryzen AI MAX+ 395:
+
+| model | file, route | measured |
+|---|---|---|
+| Qwen3.8-27B | UD-Q4_K_XL, HRX | decode 36.0 tok/s with MTP on code prompts; 56.6 tok/s with the DFlash2 drafter |
+| Qwen3.8-Flash-Next (MoE) | HRX | prefill 287 tok/s, decode 24.0 tok/s |
+| Zyphra ZAYA1-8B | Q4_K_M, HRX | decode 157 tok/s |
+| PrismML Ternary-Bonsai-2-27B | PQ2_0, 6.7 GiB, HRX | decode 43.3 tok/s with MTP |
+| Microsoft BitNet b1.58 2B-4T | TQ2_0 ternary GGUF (TQ1_0 runs too), 1.11 GiB, 2.06 bits per weight, HRX | end to end on the Radeon 8060S, no CPU fallback; decode tg128 123.4 tok/s after the TQ2_0 load-time repack onto the packed-ternary decode kernel (101.6 before it, same binary); perplexity 102.42 on HRX vs 102.56 on the CPU, same file |
+| Qwen3-0.6B | NPU route | decode 88.6 tok/s in the release gate |
+| gpt-oss-20b | MXFP4, HRX | runs on HRX |
 
 **Where it stands on 23 October 2026** (candidate `v2026.43`; numbers carry their standard and their
 power state — *lemonade bench standard* is Lemonade's own CI benchmark, *ours* is our sampler/batched

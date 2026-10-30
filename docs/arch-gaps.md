@@ -586,7 +586,7 @@ no `@ModelBase.register("Glm5NextForConditionalGeneration")` in `conversion/glm.
 `LLM_ARCH_NAMES` (`glm4`, `glm4moe`, `glm-dsa` only) and no `src/models/glm5-next.cpp`. Upstream
 `ggml-org/llama.cpp` added it in #27773 (`649dcb10`, 2026-09-30, `LLM_ARCH_GLM5_NEXT`,
 `src/models/glm5-next.cpp`, `MODEL_ARCH.GLM5_NEXT` in the GLM converter) and the MTP follow-up
-#29928 (`b9acf138`, 2026-10-07) - both after the fork's last upstream sync, so a later fork sync
+PR #29928 (`b9acf138`, 2026-10-07) - both after the fork's last upstream sync, so a later fork sync
 that reaches them maps the class automatically. At that point `tools/registry_build.py
 --check-gaps` fails until this entry records why (`mapped_ok`), which is the intended prompt for a
 person to confirm the sync really brought the KDA + DSA + hyper-connection layers before the class

@@ -464,6 +464,19 @@ bundle reports 5,134 dispatches and 1,353.522 ms of kernels for the two forwards
 shares - `hrx_dp_mm_q8_0_m128_w8_f2` 52.2 + 91.6 ms, `ggml_mul_mat_f32_f32_wmma` 334 dispatches for
 94.8 ms, `hrx_hc_pre_gated` 42.9 ms.
 
+**What that CPU work is: one GET_ROWS, declined by a size cap.** `llama-server -lv 4` on the same file
+prints the placement of the prefill graph — `placement: 6060 nodes, 1 off HRX (GET_ROWS x 1), 3 graph
+splits`. One node, on the CPU, and it is the whole ~1.18 s. It reads
+`per_layer_token_embd.weight`, which this file carries as `IQ3_S [160, 320001536]` (~20 GB of table), and
+`dispatch_registration/common/dispatch-get-rows.cpp` declines it at
+`is_supported_row_count()`: `kMaxGetRowsRowCount` is 262,208, the table has 320,001,536 rows. A gather of
+512 rows out of a 20 GB table costs the page faults of touching it — and it grew with the token count
+(35 ms at `-p 128`, ~1.18 s at `-p 512`) because more rows means more of the table.
+
+That is the "GET_ROWS fallback" line in #572's own list, and it is the item to fix: either raise
+`kMaxGetRowsRowCount` for a table this shape or give the gather a dispatch that does not walk 20 GB on the
+host.
+
 **The controls.** A model whose graph has no off-HRX node shows no host leg at all, which is how the two
 legs are told apart:
 

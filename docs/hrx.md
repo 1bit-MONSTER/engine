@@ -461,10 +461,17 @@ sees a dispatch.
 | Qwen3.8-27B UD-Q4_K_XL | 3,038 (2 forwards) | 1,871.15 ms | 1,657.2 ms | 113 % |
 
 The surplus is the profiler's own record writing. So a fully offloaded prefill forward on this build is
-the device, end to end: no graph-program re-match, no host copies, no CPU fallback. What a host leg does
-need is a graph that is not fully on HRX: the same 27B at `-ngl 20` runs **3,746 graph computes per
-forward** instead of 2, and its host-staging upload alone becomes 145.7 ms per forward (39 µs per graph)
-with the CPU backend's own compute on top.
+the device, end to end: no graph-program re-match, no host copies, no CPU fallback. The host path does
+grow with the ubatch, but it stays small — `-p 4096 -ub 2048` on the 30B-A3B, steady state: 1143.7 ms of
+`replay.wait` in a 1158.6 ms graph (98.7 %), a whole replay function of 1145.5 ms, and the cache key,
+binding, transient lease, host-staging rebind, upload, launch, flush and download together under 0.25 ms
+(1.3 % of the graph). What that run does pay is one-time: the first graph of a new ubatch costs 4.5 s more
+than the following ones, which is the graph program's prepare and the kernel JIT for the new shapes, not
+this path.
+
+What a host leg does need is a graph that is not fully on HRX: the same 27B at `-ngl 20` runs **3,746
+graph computes per forward** instead of 2, and its host-staging upload alone becomes 145.7 ms per forward
+(39 µs per graph) with the CPU backend's own compute on top.
 
 Not measured here: the 87 GiB Flash-Next file itself. It needs 87.3 GiB of resident weights on a 124 GiB
 UMA box that is also holding the owner's 27B NPU job, which leaves 75-82 GiB available, so the run would

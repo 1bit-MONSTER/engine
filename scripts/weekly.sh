@@ -210,6 +210,38 @@ lemonade_suite() {
 }
 
 # --- stages -------------------------------------------------------------------------------
+# The CI wait for one bump PR. `gh pr checks --watch` returns only when every check has finished, and a
+# check that stays queued never finishes: with coder-llm off (the owner, 2026-10-30) its pr_agent check
+# can sit queued for ever, and the Sunday release would wait on a review bot instead of on CI. So poll,
+# and decide per check: a failed one fails the bump as before; a queued one whose name matches
+# $WEEKLY_QUEUED_OK (default pr_agent) is not waited for; the whole wait is bounded by
+# $WEEKLY_CHECKS_TIMEOUT (default 2700 s), so a stuck CI holds the bump and never the release.
+checks_green() {  # <pr number>
+    local pr=$1 end=$((SECONDS + ${WEEKLY_CHECKS_TIMEOUT:-2700})) verdict
+    local ign=${WEEKLY_QUEUED_OK:-pr_agent}
+    while :; do
+        # "ok", "fail <names>" or "pending <names>" from the bucket GitHub itself assigns
+        verdict=$(gh pr checks "$pr" -R "$REPO" --json name,bucket 2>/dev/null | python3 -c '
+import json, re, sys
+ign = re.compile(sys.argv[1])
+rows = json.load(sys.stdin)
+fail = [r["name"] for r in rows if r.get("bucket") in ("fail", "cancel")]  # a cancelled run is not a pass
+wait = [r["name"] for r in rows if r.get("bucket") == "pending" and not ign.search(r["name"])]
+print("fail " + ", ".join(fail) if fail else "pending " + ", ".join(wait) if wait else "ok")' \
+            "$ign" 2>/dev/null) || verdict=pending
+        printf '%s %s\n' "$(date +%H:%M:%S)" "$verdict" >> "$LOGS/bump-$pr-checks.log"
+        case $verdict in
+            ok) return 0 ;;
+            fail*) say "  checks failed: ${verdict#fail }"; return 1 ;;
+        esac
+        if [ "$SECONDS" -ge "$end" ]; then
+            say "  checks still ${verdict#pending } after ${WEEKLY_CHECKS_TIMEOUT:-2700}s"
+            return 1
+        fi
+        sleep 30
+    done
+}
+
 stage_bumps() {
     local list=() n branch title log
     mapfile -t list < <(gh pr list -R "$REPO" --state open --limit 50 --json number,headRefName \
@@ -241,7 +273,7 @@ stage_bumps() {
         else
             gh pr update-branch "$n" -R "$REPO" > /dev/null 2>&1 || true
             sleep 20
-            if ! gh pr checks "$n" -R "$REPO" --watch --interval 30 > "$LOGS/bump-$n-checks.log" 2>&1; then
+            if ! checks_green "$n"; then
                 result=held why="CI failed"
             elif ! gh pr merge "$n" -R "$REPO" --squash --delete-branch > /dev/null; then
                 result=held why="merge refused"

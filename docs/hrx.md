@@ -437,7 +437,7 @@ host gap.
 
 #### Where a prefill forward's time goes, and the ~1.0 s that is not HRX ([engine#572](https://github.com/1bit-MONSTER/engine/issues/572))
 
-#572 reads the 1,786 ms pp512 pass as 755.7 ms of device time (41.9 %) and ~1.0 s of host time between
+Issue #572 reads the 1,786 ms pp512 pass as 755.7 ms of device time (41.9 %) and ~1.0 s of host time between
 dispatches. Measured on the file itself, the host figure is right and the cause is not the HRX host path:
 
     Qwen3.8-Flash-Next UD-IQ4_XS (87.3 GiB), -ngl 99 -fa 1 -ub 512 -p 512 -dev HRX0

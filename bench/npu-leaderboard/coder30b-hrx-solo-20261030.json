@@ -1,0 +1,25 @@
+{
+  "host": "strixhalo",
+  "model": "Qwen3-Coder-30B-A3B-Instruct",
+  "route": "hrx",
+  "quant": "Q4_K_M",
+  "instrument": "wall clock per request + usage.completion_tokens, n_predict=128, temperature 0, greedy, distinct prompts",
+  "repeats": 5,
+  "timestamp": "2026-10-30T06:52:21Z",
+  "source": "~/lb/612-hrx-20261030T064957Z (tools/showcase-612-hrx.sh 2 4 8 on strixhalo, under gpu-hold label 'pi i612')",
+  "id": "coder30b-hrx-solo-20261030",
+  "metric": {
+    "name": "decode",
+    "value": 84.2,
+    "unit": "tok/s"
+  },
+  "settings": {
+    "parallel": 1,
+    "requests_in_flight": 1,
+    "n_ctx": 8192,
+    "engine": "38e29a2 + i612-npu-streams (b78868c)",
+    "llama_cpp": "40c4ccb76",
+    "model_file": "Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf"
+  },
+  "notes": "One request at a time: the baseline the batched rows are read against. Measured as the solo arm of the --parallel 2/4/8 servers above (84.22 / 84.46 / 84.02, 15 requests over three loads) because a fresh load of the 18.5 GB file costs a minute and the clocks drift; a dedicated --parallel 1 load measured 88.05-88.34, so read this as +-4%."
+}

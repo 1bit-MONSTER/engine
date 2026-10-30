@@ -105,3 +105,28 @@ Naming: `--prefill-provider PATH` or `ONEBIT_HYBRID_PREFILL=PATH`; `ONEBIT_HYBRI
 The plumbing (this document) is public. The NPU prefill provider, its kernels and its state-file
 writer are the engine's private NPU work; what it measures on Strix Halo is reported there when it
 lands.
+
+**What this pin can measure, measured** (strixhalo, 2026-10-30, engine `38e29a2` + the #612 branch's
+lock commit, HRX llama-server `40c4ccb76`, Qwen3-Coder-30B-A3B-Instruct-Q4_K_M, ctx 8192, a 307-token
+prompt and 8 greedy tokens, 3 requests each, under `~/.local/bin/gpu-hold -l "pi i612"`):
+
+| route | wall for the request | the route's own breakdown |
+|---|---|---|
+| `--device hrx --parallel 1` | 101 / 102 ms, after one 559 ms warm-up | the backend prefills the prompt itself |
+| `--device hybrid` + `tests/fake_prefill_provider.py` | 356 / 370 / 390 ms | prefill 212-239 ms, **restore 6-7 ms**, first byte 351-385 ms |
+
+The number that outlives the fake provider is the **restore: 6-7 ms for 307 tokens**. That is all the
+handoff itself costs (`POST /slots/0?action=restore`), so a hybrid can only win if the provider beats
+the backend's own prefill of the prompt by more than that -- and the backend prefills these 307 tokens
+inside those ~95 ms. With the fake provider it cannot: that provider prefills by asking the same
+llama-server, so the request pays for the prompt twice (212-239 ms) and the row above is a loss by
+construction, which is exactly what it shows.
+
+**What this pin cannot measure, and why.** No real NPU prefill provider exists in this tree or in this
+build: it is the private NPU work (docs/npu.md, "Add-on routes"), and it needs the NPU device. The NPU
+prefill numbers this repository does have are four orders of magnitude from the gate above -- 58.14 s
+for a 5-token batched chunk on the 27B (docs/npu-leaderboard.md, record
+`27b-prefill-batched-20261027`, engine `800cf6f` era, add-on `npu-dx 1e89468d4`). So on this box the
+hybrid row is a **measured loss**, not a route waiting for a benchmark: at 58 s per chunk the handoff
+adds minutes where the backend needs 95 ms. It stays marked "not at this pin" in engine#612 until a
+real provider lands; quote that provider's own prefill figure when it does.

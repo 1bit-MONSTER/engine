@@ -232,6 +232,106 @@ $ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France i
 {"choices":[{"finish_reason":"length","index":0,"text":" Paris"},...]}
 ```
 
+### Two streams on one NPU
+
+One process owns the NPU by default: it takes an exclusive `flock` on
+`/tmp/1bit-npu-device.lock` for its lifetime (`app/npu_device_lock.h`), so a second serve of the
+NPU route waits instead of contending. That is a policy, not a hardware limit -- the driver
+advertises 16 hardware contexts on this part (`hwctx_limit = 16`, `drivers/accel/amdxdna/npu4_regs.c`)
+and only refuses the 17th -- and the policy stays the default because a second stream buys much less
+than 2x:
+
+- **The DMA engine is shared.** Decode reads the model's int8 weights once per token (~24.3 GB at
+  ~2.2 GB/s effective on the 27B, [engine#587](https://github.com/1bit-MONSTER/engine/issues/587));
+  two streams split that bandwidth instead of doubling it.
+- **The weights are not shared.** Each stream packs its own copy of every layer's weight BO from the
+  model file, plus its own KV cache and scratch, so N streams cost N x the model's device footprint.
+  The NPU's memory is the box's own LPDDR5X, the same pool the CPU and the iGPU draw from, so two
+  27B streams do not fit.
+
+With that said, two streams do run, and the option is what says you meant it:
+
+```
+# stream 1 of 2, then stream 2 of 2, in two shells (different ports, same model)
+./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8000
+./1bit serve -m <NPU model dir> --device npu --npu-streams 2 --port 8001
+```
+
+`--npu-streams N` (1..16, default 1) is `forward-serve`'s flag too: N = 1 keeps the exclusive lock,
+N >= 2 takes a **shared** lock, so the opted-in streams co-exist while any exclusive holder -- an
+unflagged `1bit serve`, the per-process ELF runner (`npu_engine_universal`), another build's serve --
+still keeps them all out, in either order, because they share one file and one `flock(2)`.
+
+**The lock is one file and one protocol, across runtimes, and it is advisory** -- that is what makes it
+usable beside another NPU engine, and what its limits are:
+
+- **Path and modes.** `/tmp/1bit-npu-device.lock`, created `0644` if absent, `flock(2)` (not `fcntl`)
+  so it works across processes, users and runtimes on the box. `LOCK_SH` = "I am one of N streams, do
+  not wait for other shared holders"; `LOCK_EX` = "I want the device to myself". A holder keeps its fd
+  open for the life of the process; closing or exiting releases it. `LOCK_EX` and `LOCK_SH` never
+  overlap, in either order, on one file.
+- **Who may take what.** Anything that honours the file interlocks with us: our serves
+  (`--npu-streams` decides which mode), the ELF runner (`LOCK_EX`, always). A foreign NPU runtime --
+  Lemonade's `ryzenai-llm` backend on Windows, an ONNX session, a benchmark -- may take `LOCK_EX` to
+  keep us out, or `LOCK_SH` to be one of the streams. Nothing forces it: a runtime that ignores the
+  file is not slowed, not blocked and not detected.
+- **What happens when the other engine ignores it.** A runtime that skips the file is not blocked and
+  not detected, so it shares the device exactly the way a *co-ordinated* second engine does — and that
+  cost is measured: two engines on the shared lock lose 59 % of their aggregate throughput (the table
+  below). The failure mode is slow, not wrong; there is no run on this box that measures an
+  unco-ordinated second engine apart from that, so nothing more specific is claimed here.
+
+**Partitioning, and what it would take.** Two whole-array streams share one DMA engine, so they
+serialise; the September prototype that scaled (~100 % each) did it by giving each stream a *disjoint
+half of the columns*, which halves per-stream weight reuse, and its xclbin pair is ABI-stale at this
+pin, so nothing in this tree can select a column split today: both of our instances run whole-array.
+What each engine costs is therefore the whole model per stream -- **one hwctx and one complete copy of
+the weight BOs, plus its own KV cache and scratch**, and the device's hwctx limit is 16. The accounting
+per engine is: `streams x (weights + KV + scratch)` must fit in the NPU's share of the box's LPDDR5X
+alongside whatever the other engine has already allocated, and both engines pull from the same DMA
+bandwidth. Two *different* models resident at once (the reason the second engine exists) is therefore
+bounded by memory first, not by hwctx: see the table below.
+
+A model directory repacked from an FLM pack still carries FLM's own parameter map and version in
+`config.json` -- for Qwen3-0.6B, `addr_qk 9216`, `addr_kv 33792`, `addr_kk 45056`,
+`addr_l_begin_mha 53760`, `addr_l_end_mha 25088`, plus `flm_version 0.9.22`. Those are offsets into
+FLM's program layout for the AIE programs that live in the FLM install, not a description of this
+engine's memory: this route reads only the geometry keys (`hidden_size`, `num_hidden_layers`,
+`num_attention_heads`, `num_key_value_heads`, `intermediate_size`, `vocab_size`, `head_dim`) and finds
+its own full ELFs under `--kernels`, which is why a model directory's `npu/` subdirectory is empty on
+purpose and why `addr_*` must not be used to reason about what this engine allocates.
+
+What it measures. `max_tokens 8`, `temperature 0`, three reps per arm with rep 1 dropped as warm-up
+(the first request after a load is ~2x the steady state), wall clock per request, each model measured
+alone with the other not even loaded (strixhalo 2026-10-30, engine `38e29a2`, binary `b78868c`,
+kernels `~/lb/lfm2-npu/kernels_m16`, run `~/lb/612-npu-streams-20261030T112326Z`):
+
+| run | solo | both at once | per stream | aggregate |
+|---|---|---|---|---|
+| Qwen3-0.6B + Qwen3-4B, `--npu-streams 2` (`b78868c`, 2026-10-30) | 5.79 s / 25.08 s | 16.99 s / 35.61 s | **34.1 % / 70.4 %** | **0.41x** |
+
+That row is the one the second engine exists for: two *different* models resident at once, each
+keeping its own weights and its own hwctx, both answering, with no lock bypass. Throughput gets
+**worse** -- 0.41x, i.e. running the two back to back is 2.4x faster than running them together --
+because two whole-array streams share one DMA engine: the per-token times add up (0.72 + 3.13 s solo
+per token = 3.85 s; concurrent rounds take 4.45 s) plus about 16 % of handoff overhead. The small model
+pays most (34 % of solo) because it is latency-bound; the 4B keeps 70 % because its token cost is its
+own 3.3 GB weight stream, which it would have spent anyway.
+
+So co-residency buys **availability, not throughput**: each model keeps answering while the other is
+loaded, instead of a 25-30 s reload. For a short answer, reloading still beats sharing the device --
+that is the trade, and it is why the exclusive default stays.
+
+`tests/npu_device_lock_test.cpp` (ctest `npu_device_lock`, in CI) proves the lock discipline without a
+device: exclusive excludes everything, three shared streams co-exist, and an exclusive waits for the
+last one to go.
+
+**The row this exists for.** On Linux the two engines are two instances of this runtime on two
+*different* models at the same time -- "all NPU models at once" -- and that is what
+`tools/showcase-612-npu-streams.sh` measures with `MODEL` and `MODEL_B` (default Qwen3-0.6B and
+Qwen3-4B, whose kernel sets are on this box): each model solo, then both at once, three reps, every
+number stamped with the build that produced it.
+
 ## Add-on routes
 
 The engine keeps a hook for closed-source NPU add-ons (`npu/private_route.h`). Qwen3.6-35B-A3B

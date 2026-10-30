@@ -240,6 +240,21 @@ that runs the phase is private, like the kernels it runs.
 - **Repeatable:** every generation starts from a zeroed KV cache (#400), so identical greedy
   requests give identical text, whatever ran before them.
 
+### The dense FFN tail cache (hybrid GDN models)
+
+On a GDN model the guard that skips the per-token Q4NX dequant in `step()` can never fire
+(`dense_weights_cached` requires `lin_kd_ == 0`, and `lin_kd_` is model-level), so a hybrid model
+re-dequantised each layer's 17408-wide dense FFN tail on every token even after those weights were
+packed on the device. `ffn_tail_cached()` (`npu/forward/src/q4nx_forward.cpp`) closes that: once a
+layer's packed gate/up/down BOs are resident, the f32 `wg_`/`wu_`/`wd_` buffers are no longer read,
+so the reload is skipped. It is on by default for a GDN model on the NPU route, when the packed
+weight cache is on, the run is not `NPU_INFER_HOST_GEMM`, and the tail is at least 256 MB per layer
+(the size guard; below that the reload is too small to be worth a behaviour change). `NPU_FFN_CACHE=0`
+or `=1` forces it either way, and the resolved state is logged once as
+`[ffn] dense-tail cache on|off (default|NPU_FFN_CACHE; lin_kd=… IM=… H=…)`. On Qwen3.8-27B-NPU2 an
+interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
+117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
+
 ### Sampling and structured output
 
 `1bit serve -m <NPU model dir> --device npu` serves through `1bit forward-serve`

@@ -33,6 +33,8 @@ import os
 import sys
 import shutil
 import tempfile
+import urllib.error
+import urllib.request
 import contextlib
 
 ROOT = os.path.dirname(os.path.dirname(os.path.abspath(__file__)))
@@ -510,7 +512,110 @@ check("family: a version bump is not a prefix match", cw.resolve_family("qwen3_6
 check("family: an unmapped family stays unmapped", cw.resolve_family("minicpmv4_7", FLM_ARCHS) is None)
 check("family: an empty name maps to nothing", cw.resolve_family("", FLM_ARCHS) is None)
 
+# 24. The 2026-10-27 census batch (engine#619) stays covered. Four classes were reported; each is
+#     now either reviewed report-only and documented, or recorded as a variant/remote-code class
+#     that is documented and deliberately left out of significant.json, so a *native* upload of
+#     it still alerts. GraniteSwitchForCausalLM was the batch's only live alert: the mirror the
+#     run named is gated, but the class is IBM's own and its configs are public, so it was
+#     reviewable after all (docs/arch-gaps.md, `granite_switch`).
+batch_619 = {
+    "LiveMemForCausalLM": ("livemem", "Popbones/LiveMem-RL-mlx-q4-backbone"),
+    "CDMMoELMPoincare": ("cdm_moe_poincare", "DuoNeural/Lattice-7-Hermes-CDM-Poincare-Instruct"),
+    "Senryu2ForCausalLM": ("senryu2", "KerzgrAI/Senryu-2.2-1B"),
+    "GraniteSwitchForCausalLM": ("granite_switch", "ibm-granite/granite-switch-4.1-8b"),
+}
+for cls, (model_type, mid) in batch_619.items():
+    entry = sig.get(cls) or {}
+    check(f"{cls} is reviewed report-only and documented",
+          entry.get("model_type") == model_type and entry.get("watch") == "report"
+          and cls not in archs and cls in gap_docs)
+    rc, res = rc_of([model(mid, cls)], archs, sig)
+    check(f"{cls} report-only -> exit 0, no alert",
+          rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == []
+          and res[cw.UNCOVERED] == [mid])
+_, out = text_of([model("ibm-granite/granite-switch-4.1-8b", "GraniteSwitchForCausalLM")], archs, sig)
+check("granite switch is printed as REVIEWED, not UNCOVERED",
+      ". REVIEWED GraniteSwitchForCausalLM" in out and "UNCOVERED" not in out)
+
+variant_619 = {
+    "LNewqForConditionalGeneration": "crussella0129/LNewq",
+    "Newq1ForConditionalGeneration": "crussella0129/Newq1",
+    "NewqForConditionalGeneration": "crussella0129/Newq",
+    "KeuralMoECausalLM": "hossain0909/keural-dpo2-final",
+}
+for cls, mid in variant_619.items():
+    check(f"{cls} is documented and not silenced in significant.json",
+          cls in gap_docs and cls not in sig and cls not in archs)
+    rc, res = rc_of([model(mid, cls, remote=True)], archs, sig)
+    check(f"{cls} custom-code upload -> reported, exit 0",
+          rc == 0 and res["remote_code"] == [cls])
+    rc, res = rc_of([model(f"native/{cls}", cls)], archs, sig)
+    check(f"{cls} without auto_map still alerts",
+          rc == 1 and res["significant"] == [] and res["remote_code"] == [])
+
+# The counts quoted in the docs come from the committed census, not from a live walk.
+with open(os.path.join(ROOT, "registry", "census.json")) as f:
+    counts = json.load(f)["raw"]["counts"]
+check("census.json records every engine#619 class",
+      all(counts.get(cls) for cls in list(batch_619) + list(variant_619)))
+check("census.json shows granite switch is not a one-off",
+      counts["GraniteSwitchForCausalLM"] > 1)
+
 shutil.rmtree(STATE_DIR, ignore_errors=True)
+# 16. Gated repos (engine#619): the request carries a token when one is in the environment, and
+#     the run says so instead of repeating "gated repos need a token" at a run that sent one.
+#     No network here; this pins the header construction and the report text, not HF's answer.
+for var in cw.TOKEN_VARS:
+    os.environ.pop(var, None)
+check("no token in the environment -> UA only",
+      cw.request_headers() == {"User-Agent": "1bit-census-watch"} and cw.hf_token() == "")
+os.environ[cw.TOKEN_VARS[0]] = "hf_example"
+check("HF_TOKEN -> Bearer header",
+      cw.request_headers().get("Authorization") == "Bearer hf_example")
+os.environ.pop(cw.TOKEN_VARS[0])
+os.environ[cw.TOKEN_VARS[1]] = "hf_second"
+check("HUGGING_FACE_HUB_TOKEN is the fallback",
+      cw.request_headers().get("Authorization") == "Bearer hf_second")
+check("the unverifiable line names the token it already sent",
+      "(HF_TOKEN sent, still no config)" in text_of([model("gated/one")])[1])
+os.environ.pop(cw.TOKEN_VARS[1], None)
+check("with no token the line stays the plain advice",
+      "HF_TOKEN sent" not in text_of([model("gated/one")])[1])
+
+# 17. A rejected token (401) must not cost the whole run: the page comes back anonymously.
+#     Pins the fallback that keeps engine#619's watcher useful on a stale HF_TOKEN.
+seen_auth = []
+
+
+class _Stub(io.BytesIO):
+    headers = {"Link": ""}
+
+    def __enter__(self):
+        return self
+
+    def __exit__(self, *a):
+        return False
+
+
+def _fake_urlopen(req, timeout=0):
+    seen_auth.append(req.headers.get("Authorization"))
+    if req.headers.get("Authorization"):
+        raise urllib.error.HTTPError(req.full_url, 401, "Unauthorized", {}, None)
+    return _Stub(b'[{"id": "x/y"}]')
+
+
+os.environ[cw.TOKEN_VARS[0]] = "hf_stale"
+cw._AUTH_REJECTED = False
+_real = urllib.request.urlopen
+urllib.request.urlopen = _fake_urlopen
+try:
+    page, _ = cw.hf_get_page("https://example.invalid/api/models")
+finally:
+    urllib.request.urlopen = _real
+    os.environ.pop(cw.TOKEN_VARS[0], None)
+    cw._AUTH_REJECTED = False
+check("a 401 falls back to anonymous instead of failing the run",
+      page == [{"id": "x/y"}] and seen_auth[0] == "Bearer hf_stale" and seen_auth[1] is None)
 
 if failures:
     print(f"\n{len(failures)} check(s) failed")

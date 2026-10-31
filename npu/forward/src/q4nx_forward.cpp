@@ -3490,7 +3490,31 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             if (kv_shared) { p.k = wq_.data(); p.v = wq_.data(); }
             if (!pb16i_ && !weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble qkv"; return false; }
             std::vector<float> qkv;
-            npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv");
+            if (pb16i_ && i_qhalf_ >= 0) {
+                // pb16i has no 14336-wide full-attention QKV kernel: four launches, the two
+                // q halves (q, and the output gate) plus k and v on their own geometry.
+                // They fill the same [q|gate|k|v] order the fused launch would.
+                const int nhd = c_.NH * c_.HD, nkv = c_.NKV * c_.HD;
+                std::vector<float> qh0, qh1, kvk, kvv;
+                const Q4nxDesignGeom* gq = &designs_[i_qhalf_];
+                const Q4nxDesignGeom* gk = &designs_[i_kv_];
+                npu_gemm(*ctx16_[i_qhalf_], xn.data(), gq->K, gq->N, nullptr, qh0, 10, "attn_q_h0");
+                npu_gemm(*ctx16_[i_qhalf_], xn.data(), gq->K, gq->N, nullptr, qh1, 11, "attn_q_h1");
+                npu_gemm(*ctx16_[i_kv_], xn.data(), gk->K, gk->N, nullptr, kvk, 12, "attn_k");
+                npu_gemm(*ctx16_[i_kv_], xn.data(), gk->K, gk->N, nullptr, kvv, 13, "attn_v");
+                if ((int)qh0.size() < nhd || (int)qh1.size() < nhd || (int)kvk.size() < nkv ||
+                    (int)kvv.size() < nkv || !err_.empty()) {
+                    if (err_.empty()) err_ = "pb16i full-attention QKV split returned short";
+                    return false;
+                }
+                qkv.assign((size_t)2 * nhd + (size_t)2 * nkv, 0.0f);
+                memcpy(qkv.data(), qh0.data(), (size_t)nhd * sizeof(float));
+                memcpy(qkv.data() + nhd, qh1.data(), (size_t)nhd * sizeof(float));
+                memcpy(qkv.data() + 2 * nhd, kvk.data(), (size_t)nkv * sizeof(float));
+                memcpy(qkv.data() + 2 * nhd + nkv, kvv.data(), (size_t)nkv * sizeof(float));
+            } else {
+                npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv");
+            }
             // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
             // must not see the gate half; the gate multiplies ctx afterwards.
             std::vector<float> qkv_use;

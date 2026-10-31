@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -189,6 +190,26 @@ bool init(State& s) {
     return true;
 }
 
+// #701 puts a canary in I8Ctx::readback(): a short result row is then detected instead of copied out as a
+// huge negative int32. This branch predates it, so the probe is written to compile on both trees and to start
+// working the moment the canary exists -- an `if constexpr` on a dependent type is not instantiated when the
+// method is absent. What must NOT happen is the silent version: a poisoned row going through the shared
+// epilogue and into the graph, which is the failure mode the canary exists to stop.
+template <class Ctx, class = void>
+struct has_canary : std::false_type {};
+template <class Ctx>
+struct has_canary<Ctx, std::void_t<decltype(std::declval<Ctx&>().canary_short())>> : std::true_type {};
+
+template <class Ctx>
+bool short_read(Ctx& ctx) {
+    if constexpr (has_canary<Ctx>::value) {
+        return ctx.canary_short();
+    } else {
+        (void)ctx;
+        return false;  // no canary in this tree: nothing to ask
+    }
+}
+
 // The QDQ kernel for one (K, N), built the first time it is asked for. Caller holds s.mu.
 Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
     for (auto& kern : s.q8_kernels)
@@ -236,6 +257,8 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
     // Weights: the graph's int8 bytes, in the device's own layout, exactly as packB would have written
     // them from floats -- but without the amax/127 step, because these bytes already carry the graph's
     // per-column scale.
+    // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
+    // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
     if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
         auto* Bm = (int8_t*)ctx.layerB[0]->map();
         std::memset(Bm, 0, (size_t)ctx.KD * ctx.ND);
@@ -255,10 +278,23 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
         std::memset(ctx.Am, 0, (size_t)ctx.MD * ctx.KD);
         for (int r = 0; r < rows; ++r)
             std::memcpy(ctx.Am + (size_t)r * ctx.KD, a + (row0 + r) * k, (size_t)k);
-        ctx.sync_A(0);
-        auto run = ctx.launch(0);
-        ctx.wait_kernel(run);
-        ctx.readback();
+        auto launch_and_read = [&ctx] {
+            ctx.sync_A(0);
+            auto run = ctx.launch(0);
+            ctx.wait_kernel(run);
+            ctx.readback();
+        };
+        launch_and_read();
+        if (short_read(ctx)) {
+            // Once, as #701's own call sites do: a short read is a race with the completion of the last
+            // row, not a systematic failure.
+            launch_and_read();
+            if (short_read(ctx)) {
+                if (err) *err = "short read (canary) for " + std::to_string(k) + "x" + std::to_string(n) +
+                                 " at row " + std::to_string(row0);
+                return false;  // gemm_q8 redoes every row on the host; never write a poisoned accumulator
+            }
+        }
         for (int r = 0; r < rows; ++r)
             for (int64_t j = 0; j < n; ++j) c[(row0 + r) * n + j] = ctx.Cm[(size_t)r * ctx.ND + j];
     }
@@ -318,6 +354,8 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
     }
 
     // Weights: int8 per column, one scale per column (packB).
+    // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
+    // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
     if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
         kern->ctx->packB(0, b, (int)k, (int)n, kern->w_scale);
         kern->w_ptr = b;

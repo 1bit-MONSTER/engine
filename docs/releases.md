@@ -323,6 +323,19 @@ rehearsal found these only after the build) and stops with a message naming what
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
 | `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device); the xdna-driver pin is the `amdxdna` kernel driver, which the release does not build: check it on Strix Halo with the module loaded ([npu.md](npu.md), "The XDNA driver") |
 
+A pin bump raised **by hand** (rather than by one of those workflows) has to do what the workflow does, or the
+gates above silently do not apply to it (engine#672):
+
+- **branch it `bump-<name>/<sha>`** or add the `hw-gate` label - `hw-gate.yml` runs on `bump-hrx/*` or on that label
+  (it reads `hw_gate: skipping` otherwise, which looks like a pass), and `scripts/weekly.sh`'s `bumps` stage only picks
+  up `bump-*` heads, so a differently named branch is invisible to the Sunday run as well;
+- **carry the data derived from the pinned backends**: `registry/architectures.json` is generated
+  (`tools/registry_build.py` with the submodules at their pins), and a class that starts being mapped needs its reviewed
+  entry in `registry/significant.json` (`mapped_ok`, or `--check-gaps` refuses it) plus its expectation in
+  `tests/census_watch_test.py` updated - otherwise `registry_pins` and `census_watch` fail at the new pin (engine#672:
+  DeepSeek-V4.1-Flash went from "reviewed report-only" to mapped);
+- run the checks in the table above, plus `hw-gate` (see [hw-gate.md](hw-gate.md), "When it runs").
+
 Before the build, every bump also checks that each pin it moves is on the branch `.gitmodules`
 names for that submodule (GitHub's compare API: the branch equals or contains the pin). A pin off
 its branch is held: the shallow clones follow the branch and cannot fetch it, and GitHub may drop

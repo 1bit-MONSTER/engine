@@ -298,6 +298,11 @@ private:
     std::vector<int32_t> m16_ref_;   // reference C row, reused per check
     bool prof_ = false;              // NPU_PROFILE=1
     ProfAcc prof_dec_[Q4NX_MAX_DESIGNS], prof_pre_[Q4NX_MAX_DESIGNS];
+    // The lm head has no design of its own (it borrows a K=H geometry and, under pb16i, an
+    // int8 context of its own), so it gets its own row: attributing it to a design put
+    // 15-16 launches of ~27 ms into the G row and made any per-role budget wrong by 0.4 s.
+    ProfAcc prof_head_;
+    int     prof_head_M_ = 0;
     long prof_dec_n_ = 0;            // decode launches (dispatches/token)
     long prof_pre_n_ = 0;
     long prof_tok_n_ = 0;

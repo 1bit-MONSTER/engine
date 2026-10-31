@@ -2096,6 +2096,13 @@ void Q4nxNpuForward::prof_dump() {
                     (a.pack + a.quant + a.wait + a.rb) / n);
         }
     }
+    if (prof_head_.n) {
+        const double n = (double)prof_head_.n;
+        fprintf(stderr, "[prof] %-5s %-5s %2d %8ld %7.2f %9.2f %7.3f %9.3f %9.3f\n", "dec",
+                "HEAD", prof_head_M_, prof_head_.n, prof_head_.pack / n, prof_head_.quant / n,
+                prof_head_.wait / n, prof_head_.rb / n,
+                (prof_head_.pack + prof_head_.quant + prof_head_.wait + prof_head_.rb) / n);
+    }
     fprintf(stderr, "[prof] dispatch decode=%ld prefill=%ld tokens=%ld (decode/token=%.1f)"
                     " m16=%d\n", prof_dec_n_, prof_pre_n_, prof_tok_n_,
             prof_tok_n_ ? (double)prof_dec_n_ / (double)prof_tok_n_ : 0.0, (int)m16_);
@@ -2109,6 +2116,7 @@ void Q4nxNpuForward::prof_dump() {
         prof_dec_[i] = ProfAcc{};
         prof_pre_[i] = ProfAcc{};
     }
+    prof_head_ = ProfAcc{};
 }
 
 // --------------------------------------------------------------------------
@@ -3961,7 +3969,8 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             const double dql = 0.0;
             const double dwt = std::chrono::duration<double, std::milli>(h2 - h1).count();
             const double drb = std::chrono::duration<double, std::milli>(h3 - h2).count();
-            prof_add(prof_dec_, i_qkv, dpk, dql, dwt, drb);
+            prof_head_M_ = lctx.MD;
+            prof_add(&prof_head_, 0, dpk, dql, dwt, drb);
             prof_dec_n_++;
             if (ph) {
                 g_ph.h_pack += dpk; g_ph.h_ql += dql;

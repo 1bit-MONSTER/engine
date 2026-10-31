@@ -3,8 +3,9 @@
  "classes": {
   "DeepseekV41ForCausalLM": {
    "model_type": "deepseek_v41",
-   "family": "DeepSeek V4.1 (engram embeddings + candidate-block sparse attention; the pinned deepseek4 path runs neither)",
-   "watch": "report"
+   "family": "DeepSeek V4.1 (engram embeddings + candidate-block sparse attention; NOT an alias of deepseek4 - different layer/head/expert shape, and the V4 path runs neither, which is why it needed its own port)",
+   "watch": "report",
+   "mapped_ok": "the pinned backend implements it as its own architecture: third_party/llama.cpp 5e6388a5a maps DeepseekV41ForCausalLM -> deepseek41 (conversion/__init__.py), registers LLM_ARCH_DEEPSEEK41 (src/llama-arch.cpp) and implements hparams/tensors/graph/engram in src/models/deepseek41.cpp - fork #156, the port of upstream #31086 + #31300. tools/registry_build.py --check-gaps stays quiet for this class; docs/arch-gaps.md carries the dated note."
   },
   "Qwen3Mamba3ForCausalLM": {
    "model_type": "qwen3_mamba3",

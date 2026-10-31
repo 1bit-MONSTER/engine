@@ -386,7 +386,10 @@ int run_cached(OrtSession* session, OrtMemoryInfo* mi, const Args& a, RunStats* 
                         rc = fail("read logits", s);
                     } else {
                         dump_row(p, count, vocab, a.dump, step);
-                        const float* row = p + (size_t)vocab * (size_t)(seq - 1);
+                        // The last row of whatever the graph returned: a graph that slices its own
+                        // output to the final position returns one row, a full-logits graph returns
+                        // `seq`. Indexing by seq-1 read past the end of the sliced one.
+                        const float* row = p + (size_t)count - (size_t)vocab;
                         const auto q0 = std::chrono::steady_clock::now();
                         int64_t best = 0;
                         for (int64_t id = 1; id < vocab; ++id)

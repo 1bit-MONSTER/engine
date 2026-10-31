@@ -36,7 +36,7 @@ Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the same 
 
 ## What it is
 
-The 1bit engine is Lemonade's `onebit` backend for the AMD Ryzen AI MAX+ 395 (Strix Halo). It runs the Radeon 8060S iGPU through HRX with our own HIP kernels, and the XDNA 2 NPU through our own NPU runtime, behind the OpenAI-compatible API Lemonade already gives you. Every model is checked on the hardware before it ships; the models and their measured numbers are one page: [docs/models.md](docs/models.md).
+One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face architecture, any GGUF quantization, Ryzen AI NPU packs and ONNX graphs, served by one Lemonade backend on the AMD Ryzen AI MAX+ 395 (Strix Halo). It runs the Radeon 8060S iGPU through HRX with our own HIP kernels, and the XDNA 2 NPU through our own NPU runtime, behind the OpenAI-compatible API Lemonade already gives you. Every model is checked on the hardware before it ships; the models and their measured numbers are one page: [docs/models.md](docs/models.md).
 
 ## Milestones
 

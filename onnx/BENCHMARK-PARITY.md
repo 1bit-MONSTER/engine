@@ -90,20 +90,75 @@ over 151936 logits, and it is not what either box is waiting on. Peak RSS is 8.2
 Raw blocks: `/tmp/bench_qwen3_amd.txt` (ryzen), `/tmp/bench_strixhalo_amd.txt` (strixhalo).
 `ctest` on the strixhalo build: 4/4 passed.
 
+## Round 2: our own cache buffers, and what it did not fix
+
+`run_cached` used to let ONNX Runtime allocate `present` on every step. It now ping-pongs two
+preallocated stacks bound through `OrtIoBinding` (`BindInput "past"`, `BindOutput "present"`,
+`BindOutputToDevice "logits"`), so the only cache traffic is the graph's own `Concat`. Numerics are
+unchanged (ids `13 16 13 16`, mean KL 1.238e-07 against transformers, max|dlogit| 2.12e-05).
+
+`ryzen`, 8 threads, fp32, 128 generated — before → after:
+
+| prompt | decode before | decode after | prefill before | prefill after | peak RSS before | peak RSS after |
+|---|---|---|---|---|---|---|
+| 128 | 16.73 tok/s | 16.70 | 1102.1 | 1051.0 | 8.20 GB | 7.98 GB |
+| 256 | 15.21 | 15.29 | 1220.0 | 1197.6 | | |
+| 512 | 13.12 | 12.66 | 1175.2 | 1072.0 | | |
+| 1024 | 9.87 | 9.89 | 777.8 | 866.3 | | |
+| 2048 | 6.73 | 6.60 | 639.1 | 620.5 | | |
+
+**The allocation-churn hypothesis was wrong.** Everything is inside noise, and the footprint barely
+moved, so the O(n) cost is not `malloc` and not the copy: it is the graph. At a 2048-token prompt the
+prefill alone materialises `logits [1,2048,151936]` (1.2 GB) and the attention intermediates, which is
+where the 8 GB peak comes from. The change is kept because the cache is now a known, bounded quantity
+two stacks wide instead of whatever the arena grew to, but it is not a speed fix and nothing here
+claims it is. The next levers, in order, are graph-side: keep only the last logits row (a
+`logits[:, -1:, :]` slice would delete most of the prefill's lm_head matmul) and profile the 56
+per-layer `Concat`s before touching them.
+
+## NPU row: our engine, the dx route
+
+Qwen3-0.6B through `1bit serve -m <dir> --device npu --npu-opt dx=<kernel dir>`, 64 generated tokens,
+3 repeats after 1 warmup, driven by `onnx/bench_npu.sh`. `strixhalo` (Ryzen AI Max+ 395), int4-weight
+AIE designs, one design per layer:
+
+| prompt tokens | prompt processing | token generation | ms/token | E2E |
+|---|---|---|---|---|
+| 162 | 77.69 tok/s | **72.64 tok/s** | 13.77 | 2.95 s |
+| 332 | 76.02 | 62.56 | 15.98 | 5.24 s |
+| 672 | 71.71 | 56.09 | 17.83 | 9.40 s |
+| 1335 | 63.30 | 47.70 | 20.97 | 22.41 s |
+
+Read against the CPU rows for the same model:
+
+- **Decode: the NPU wins 4–7×** (72.6 tok/s at 162 tokens against 16.7 fp32-CPU; 47.7 at 1335
+  against 6.6) and it degrades far more slowly — 1.5× from 162 to 1335 tokens, where the CPU loses
+  2.5×. That is the KV cache holding, plus kernels that re-read 224 KB/token instead of 2.4 GB.
+- **Prefill: the CPU wins 8–16×** (620–1200 tok/s against 63–78). NPU prompt processing is the weak
+  stage and it is the same gap the A/B harness records against FLM (native ~67 tok/s vs 1269). No row
+  here is a product claim until that closes.
+- The prompt token counts are measured, not requested: the chat template adds its own prefix, so
+  `--lens 1024,512,256,128` lands on 1335/672/332/162. AMD's block prints measured counts too, which
+  is why the column exists.
+- The route reports `prompt_ms` and `predicted_ms`, so `bench_npu_serve.py --mode json` reads those.
+  Its streamed chunks all arrive after the generation finishes, which makes chunk-arrival timing read
+  as 3 µs/token — measured once, discarded, and now the reason `--mode` exists (`stream` is for
+  servers that really stream, like `flm`).
+
 ## What this table says
 
 - The numbers are **not** comparable to AMD's published one as a speed claim: theirs is an int4 NPU
-  on Windows, ours is fp32 CPU on Linux. What is comparable is the definition, so a future NPU row
-  from our own engine drops into the same table without translation.
-- Four times the threads buys 1.4× at 128 tokens and 1.2× at 2048: this is a bandwidth-bound fp32
-  graph streaming a 2.4 GB weight file, not a compute-bound one. 32 threads on `strixhalo` and 8 on
-  `ryzen` land within 20% of each other at long context, which is the tell.
-- Our decode **degrades with context** (16.7 → 6.7 tok/s from 128 to 2048 tokens) although the graph
-  has a KV cache. The cache is an *output*: `present` is a fresh `[56,1,8,n,128]` stack, so each step
-  copies 224 KB/token (459 MB at n=2048). That copy is the O(n) cost, and it is the next thing to
-  fix — the attention itself is already cached.
-- Prefill is memory-bound: 639 tok/s at 2048 tokens against 1220 at 256, i.e. nothing scales
-  superlinearly, and TTFT at 2048 is 3.2 s.
+  on Windows, ours is fp32 CPU or our own int4 NPU route on Linux. What is comparable is the
+  definition, so any of our rows drop into their table without translation.
+- Four times the threads buys 1.4× at 128 tokens and 1.2× at 2048: the fp32 CPU graph is
+  bandwidth-bound, streaming a 2.4 GB weight file. 32 threads on `strixhalo` and 8 on `ryzen` land
+  within 20% of each other at long context, which is the tell.
+- The CPU graph's decode degrades with context (16.7 → 6.7 tok/s from 128 to 2048) and round 2 shows
+  it is not the cache buffers. The NPU route shows what the same model looks like when the cache is
+  actually held on device: 72.6 → 47.7 over a comparable range.
+- Prefill is memory-bound on CPU (639 tok/s at 2048 against 1220 at 256, TTFT 3.2 s) and compute-bound
+  on the NPU (63 tok/s, 21 s for the same prompt). Those are two different problems with two
+  different fixes.
 
 ## Reproducing
 
@@ -116,3 +171,15 @@ cmake -S onnx -B onnx/build -DCMAKE_BUILD_TYPE=Release && cmake --build onnx/bui
 Build the runtime yourself if you want the pin under your control: `onnx/build_ort.sh` (same tag,
 one `#include <cstdint>` patch for GCC 15). Parity against the distro package is checked in
 `onnx/README.md` ("Owning the runtime").
+
+```sh
+# the NPU row, on the box that has the NPU (kernel dir from addons/npu-dx/scripts/build-kernels.sh)
+ONEBIT_DX_KERNELS=~/wt/ross-npu-product/kern/1024x3072x16x8 onnx/bench_npu.sh \
+    --lens 1024,512,256,128 --gen 64 -w 1 -r 3 --mode json
+```
+
+`bench_npu.sh` owns the whole round trip — stage the model dir, start the serve, wait for health,
+drive it, tear it down — and refuses to start if something already answers on its port, because a
+stale server on that port once answered the health check and the bench then timed someone else's
+process. `--mode stream` measures chunk arrival for servers that stream incrementally (`flm`);
+`--mode json` reads the timings our routes report.

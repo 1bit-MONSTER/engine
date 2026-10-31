@@ -30,6 +30,12 @@ and #370. The hardware gate checks every HRX pin bump, and every PR that asks fo
 - **By hand.** Actions -> hw-gate -> Run workflow, with a ref (a branch, tag, SHA or `pull/N/head`).
   The run posts the commit status `hw-gate` on the commit it checked, so a PR shows the result.
 
+A pin bump raised **by hand** must therefore do one of the two automated things: name its branch `bump-hrx/<sha>`
+(the `bump-hrx` workflow's own convention) or add the `hw-gate` label. Neither is a formality - without one the job
+does not run and the PR simply reads `hw_gate: skipping`, which looks like a pass in a list of ticks (engine#672: a
+hand-raised llama.cpp bump on a `1bit/bump-hrx-<sha>` branch went to merge with no gate status until the label was
+added; the gate then ran normally).
+
 PRs from forks never run there: the runner is the owner's box.
 
 ## What it checks

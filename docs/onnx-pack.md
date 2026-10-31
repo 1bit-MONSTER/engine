@@ -96,9 +96,13 @@ model.
 
 ## What the pack does not do, deliberately
 
-- **No KV cache.** The exported graph re-runs the whole sequence per step, so its tokens/s is that
-  graph's rate and is never compared against a KV-cached server. A cached graph is a different, much
-  larger piece of work; pretending otherwise would put a misleading number in the release notes.
+- **KV cache: opt-in, not the default.** The default export re-runs the whole sequence per step, so its
+  tokens/s is that graph's rate. `--cached` exports the same model with the cache as an input and an
+  output (one stacked `[56, 1, 8, past, 128]` tensor), which decodes a 256-token prompt at 63.7 ms/token
+  against 291.2 — 4.6x, and the gap widens with context. Output matches transformers running the same
+  greedy loop to a mean KL of 1.2e-07 with top-1 identical at every step. What it is still not is a
+  *server*: no batching, no paged cache, one sequence at a time, so its number is never put next to a
+  serving stack's.
 - **No fp16, no int4 activations.** The kernel is int8 × int8 → int32; the 4-bit-ness of the
   checkpoint lives on disk and is a memory-bandwidth story, not a compute one. An int4 tensor-core
   kernel would need a different ELF, and nothing here blocks that later.

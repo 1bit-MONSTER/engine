@@ -3700,6 +3700,10 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     if (prof_) {
         // Dispatches for this token, i.e. the count the decode budget is made of.
         prof_tok_n_++;
+        // NPU_PROFILE_TOKEN=1 dumps the per-role table per token instead of every 100
+        // launches, so the decode budget can be summed from the SAME tokens as the wall
+        // (a 100-launch window straddles tokens, and its medians are not the token's cost).
+        if (getenv("NPU_PROFILE_TOKEN")) prof_dump();
         fprintf(stderr, "[prof] token %ld: decode dispatches=%ld (score=%zu of %zu)\n",
                 prof_tok_n_, prof_dec_n_ - step_d0, logits.size(), logits.size());
     }

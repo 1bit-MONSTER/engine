@@ -315,6 +315,23 @@ std::string node_name(const OrtNode* node) {
     return name ? name : "";
 }
 
+std::string node_domain(const OrtNode* node) {
+    const char* domain = nullptr;
+    if (OrtStatus* st = g_api->Node_GetDomain(node, &domain)) {
+        g_api->ReleaseStatus(st);
+        return {};
+    }
+    return domain ? domain : "";
+}
+
+// The two spellings of a QuantizeLinear/DequantizeLinear: the ONNX one, and the com.microsoft one that
+// ORT's own QDQ tooling (and Quark's exporter, which uses it) writes. Same operator, same inputs, same
+// attributes, ORT's own kernel -- but a vendor's fused op in another domain is not the pattern.
+bool qdq_domain(const OrtNode* node) {
+    const std::string domain = node_domain(node);
+    return domain.empty() || domain == "ai.onnx" || domain == "com.microsoft";
+}
+
 bool onnx_domain(const OrtNode* node) {
     const char* domain = nullptr;
     if (OrtStatus* st = g_api->Node_GetDomain(node, &domain)) {
@@ -958,6 +975,16 @@ bool qdq_fusion_enabled() {
     return !(v && *v == '0');
 }
 
+// ONEBIT_EP_QDQ_ONLY=1 claims the fused groups and nothing else. A quantised model still contains
+// float MatMuls the fused path cannot take -- attention's QK^T has no constant weight -- and on a
+// host build those would run on the naive float loop instead of the CPU EP's MLAS kernels, which
+// makes every measurement of the quantised graph meaningless. This is the knob that says "only the
+// part we are claiming to be good at".
+bool qdq_only() {
+    const char* v = std::getenv("ONEBIT_EP_QDQ_ONLY");
+    return v && *v && *v != '0';
+}
+
 // Matches the A8W8 QDQ group Quark's ONNX-to-ONNX flow emits (docs/onnx-pack.md):
 //
 //   x_q --DQ(s_x, 0)--> x_dq \
@@ -969,81 +996,121 @@ bool qdq_fusion_enabled() {
 // graph with either keeps the per-node path: slower, still correct.
 //
 // `group` comes back as the four nodes to fuse into one, in graph order: dq_x, dq_w, matmul, q_y.
-bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def) {
+// Why a candidate was refused, when someone is asking (ONEBIT_EP_QDQ_DEBUG=1 histograms these in
+// GetCapability). A matcher that only says "no" is impossible to use against an exporter whose output
+// you cannot change, which is exactly what a real quantised model is.
+bool qdq_no(const char** why, const char* reason) {
+    *why = reason;
+    return false;
+}
+
+// A formatted variant, for the refusals where the interesting part is the value we did not expect. The
+// histogram in GetCapability copies the string, so one buffer is enough.
+const char* qdq_why(const char* fmt, ...) {
+    static thread_local char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+
+bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def, const char** why) {
+    *why = "matched";
     std::vector<const OrtValueInfo*> mm_in, mm_out;
-    if (!node_inputs(mm, &mm_in) || mm_in.size() != 2) return false;
-    if (!node_outputs(mm, &mm_out) || mm_out.size() != 1) return false;
+    if (!node_inputs(mm, &mm_in) || mm_in.size() != 2)
+        return qdq_no(why, "matmul arity");
+    if (!node_outputs(mm, &mm_out) || mm_out.size() != 1)
+        return qdq_no(why, "matmul output arity");
 
     // Both MatMul inputs are a DequantizeLinear output, and this group is its only consumer.
     const OrtNode* dq[2] = {nullptr, nullptr};
     for (int i = 0; i < 2; ++i) {
         size_t out_index = 0;
         dq[i] = producer(mm_in[(size_t)i], &out_index);
-        if (!dq[i] || out_index != 0) return false;
-        if (node_op(dq[i]) != "DequantizeLinear" || !onnx_domain(dq[i])) return false;
-        if (!sole_consumer(mm_in[(size_t)i])) return false;
+        if (!dq[i] || out_index != 0) return qdq_no(why, "operand is not a node output");
+        if (node_op(dq[i]) != "DequantizeLinear" || !qdq_domain(dq[i]))
+            return qdq_no(why, qdq_why("operand op=%s dom=%s", node_op(dq[i]).c_str(),
+                                       node_domain(dq[i]).c_str()));
+        if (!sole_consumer(mm_in[(size_t)i]))
+            return qdq_no(why, "dequantised value has other consumers");
     }
 
     std::vector<const OrtValueInfo*> xin, win;
-    if (!node_inputs(dq[0], &xin) || xin.size() < 2 || xin.size() > 3) return false;
-    if (!node_inputs(dq[1], &win) || win.size() < 2 || win.size() > 3) return false;
+    if (!node_inputs(dq[0], &xin) || xin.size() < 2 || xin.size() > 3)
+        return qdq_no(why, "activation DequantizeLinear arity");
+    if (!node_inputs(dq[1], &win) || win.size() < 2 || win.size() > 3)
+        return qdq_no(why, "weight DequantizeLinear arity");
 
     ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     size_t rank = 0;
     // Activation: int8, rank 2 or 3, zero point zero (or absent).
-    if (!value_rank_type(xin[0], &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return false;
-    if (rank != 2 && rank != 3) return false;
+    if (!value_rank_type(xin[0], &elem, &rank)) return qdq_no(why, "activation type unknown");
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return qdq_no(why, "activation not int8");
+    if (rank != 2 && rank != 3) return qdq_no(why, "activation rank not 2 or 3");
     const size_t xrank = rank;
     if (xin.size() == 3 && zp_count(xin[2], node_axis(dq[0]), xrank == 2 ? 0 : -1, -1) < 0)
-        return false;
+        return qdq_no(why, "activation zero point not foldable");
 
     // Weight: a constant int8 [K, N], zero point zero (or absent).
-    if (!value_rank_type(win[0], &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != 2) return false;
-    if (!initializer(win[0])) return false;
-    if (win.size() == 3 && zp_count(win[2], node_axis(dq[1]), 1, -1) < 0) return false;
+    if (!value_rank_type(win[0], &elem, &rank)) return qdq_no(why, "weight type unknown");
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != 2)
+        return qdq_no(why, "weight not int8 rank 2");
+    if (!initializer(win[0])) return qdq_no(why, "weight is not a constant");
+    if (win.size() == 3 && zp_count(win[2], node_axis(dq[1]), 1, -1) < 0)
+        return qdq_no(why, "weight zero point not foldable");
     std::vector<int64_t> xd, wd;
-    if (!value_dims(xin[0], &xd) || !value_dims(win[0], &wd)) return false;
-    if (wd.size() != 2 || wd[0] <= 0 || wd[1] <= 0) return false;
-    if (xd.empty() || (xd.back() > 0 && xd.back() != wd[0])) return false;
+    if (!value_dims(xin[0], &xd)) return qdq_no(why, "activation shape unknown");
+    if (!value_dims(win[0], &wd)) return qdq_no(why, "weight shape unknown");
+    if (wd.size() != 2 || wd[0] <= 0 || wd[1] <= 0) return qdq_no(why, "weight shape not static");
+    if (xd.empty() || (xd.back() > 0 && xd.back() != wd[0]))
+        return qdq_no(why, "activation width is not the weight's K");
 
     // Scales: per-tensor, or per-axis along a dimension the epilogue can fold. The activation has to
     // be rank 2 for a per-row scale (a rank-3 activation's rows are batch*sequence, which no exporter
     // writes as one axis), and the weight's per-axis scale has to run along N.
-    if (!foldable_scale_len(xin[1], node_axis(dq[0]), xrank == 2 ? 0 : -1, xd.front())) return false;
-    if (!foldable_scale_len(win[1], node_axis(dq[1]), 1, wd[1])) return false;
+    if (!foldable_scale_len(xin[1], node_axis(dq[0]), xrank == 2 ? 0 : -1, xd.front()))
+        return qdq_no(why, "activation scale not foldable");
+    if (!foldable_scale_len(win[1], node_axis(dq[1]), 1, wd[1]))
+        return qdq_no(why, "weight scale not foldable");
 
     // The output side: the MatMul has exactly one consumer, a QuantizeLinear of that same value.
     size_t consumers = 0;
     if (OrtStatus* st = g_api->ValueInfo_GetValueNumConsumers(mm_out[0], &consumers)) {
         g_api->ReleaseStatus(st);
-        return false;
+        return qdq_no(why, "consumer count unreadable");
     }
-    if (consumers != 1) return false;
+    if (consumers != 1) return qdq_no(why, "matmul output has several consumers");
     const OrtNode* q = nullptr;
     int64_t q_input = -1;
     if (OrtStatus* st = g_api->ValueInfo_GetValueConsumers(mm_out[0], &q, &q_input, 1)) {
         g_api->ReleaseStatus(st);
-        return false;
+        return qdq_no(why, "consumers unreadable");
     }
-    if (!q || q_input != 0) return false;
-    if (node_op(q) != "QuantizeLinear" || !onnx_domain(q)) return false;
+    if (!q || q_input != 0) return qdq_no(why, "matmul output consumed by an unexpected input");
+    if (node_op(q) != "QuantizeLinear" || !qdq_domain(q))
+        return qdq_no(why, "matmul output consumer is not QuantizeLinear");
     std::vector<const OrtValueInfo*> qin, qout;
-    if (!node_inputs(q, &qin) || qin.size() < 2 || qin.size() > 3) return false;
-    if (qin[0] != mm_out[0]) return false;
-    if (!node_outputs(q, &qout) || qout.size() != 1) return false;
-    if (!float_scalar_init(qin[1])) return false;
+    if (!node_inputs(q, &qin) || qin.size() < 2 || qin.size() > 3)
+        return qdq_no(why, "QuantizeLinear arity");
+    if (qin[0] != mm_out[0]) return qdq_no(why, "QuantizeLinear takes another value");
+    if (!node_outputs(q, &qout) || qout.size() != 1) return qdq_no(why, "QuantizeLinear output");
+    if (!float_scalar_init(qin[1])) return qdq_no(why, "output scale not a float scalar constant");
     // The output zero point is added after the round, so it is always foldable -- but only as a
     // scalar: a per-axis output zero point would need the axis of the output, and nothing emits one.
     if (qin.size() == 3) {
         size_t zy_count = 0;
-        if (!value_rank_type(qin[2], &elem, &rank)) return false;
-        if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank > 1) return false;
-        if (!int8_init_data(qin[2], &zy_count) || zy_count != 1) return false;
+        if (!value_rank_type(qin[2], &elem, &rank))
+            return qdq_no(why, "output zero point type unknown");
+        if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank > 1)
+            return qdq_no(why, "output zero point not an int8 scalar");
+        if (!int8_init_data(qin[2], &zy_count) || zy_count != 1)
+            return qdq_no(why, "output zero point not a single constant");
     }
-    if (!value_rank_type(qout[0], &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != xd.size()) return false;
+    if (!value_rank_type(qout[0], &elem, &rank)) return qdq_no(why, "output type unknown");
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != xd.size())
+        return qdq_no(why, "output not int8 of the activation's rank");
 
     group[0] = dq[0];
     group[1] = dq[1];
@@ -1057,8 +1124,11 @@ bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def) {
     if (xin.size() == 3) def->zx_name = value_name(xin[2]);
     if (win.size() == 3) def->zw_name = value_name(win[2]);
     if (qin.size() == 3) def->zy_name = value_name(qin[2]);
-    return !def->x_name.empty() && !def->w_name.empty() && !def->sx_name.empty() &&
-           !def->sw_name.empty() && !def->sy_name.empty();
+    if (def->x_name.empty() || def->w_name.empty() || def->sx_name.empty() || def->sw_name.empty() ||
+        def->sy_name.empty())
+        return qdq_no(why, "a role has no value name");
+    *why = "matched";
+    return true;
 }
 
 OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
@@ -1071,6 +1141,9 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
     OrtStatus* st = g_api->Graph_GetNodes(graph, nodes, n);
     size_t claimed = 0;
     size_t fused_groups = 0;
+    // ONEBIT_EP_QDQ_DEBUG=1: why this graph's matmuls were not fused. A real exporter's graph is not
+    // ours to change, so "0 groups" on its own is not an answer.
+    std::map<std::string, size_t> refusals;
     for (size_t i = 0; !st && i < n; ++i) {
         const char* op = nullptr;
         const char* domain = nullptr;
@@ -1079,13 +1152,15 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
         if (OrtStatus* s = g_api->Node_GetOperatorType(nodes[i], &op)) g_api->ReleaseStatus(s);
         if (OrtStatus* s = g_api->Node_GetDomain(nodes[i], &domain)) g_api->ReleaseStatus(s);
         const bool onnx_domain = !domain || !*domain || std::strcmp(domain, "ai.onnx") == 0;
-        if (onnx_domain && claims_op("MatMul") && qdq_fusion_enabled()) {
+        if (onnx_domain && op && std::strcmp(op, "MatMul") == 0 && claims_op("MatMul") &&
+            qdq_fusion_enabled()) {
             // A QDQ group is claimed whole: fusing it is what keeps the dequantised float tensors
             // from ever existing. Only nodes in this group are named, and the group's output value
             // is the key Compile finds it by again.
             const OrtNode* group[4] = {nullptr, nullptr, nullptr, nullptr};
             QdqDef def;
-            if (match_qdq(nodes[i], group, &def)) {
+            const char* why = "matched";
+            if (match_qdq(nodes[i], group, &def, &why)) {
                 std::vector<const OrtValueInfo*> outs;
                 if (node_outputs(group[3], &outs) && outs.size() == 1) {
                     st = g_ep_api->EpGraphSupportInfo_AddNodesToFuse(support_info, group, 4, nullptr);
@@ -1094,13 +1169,16 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
                     continue;
                 }
             }
+            if (std::getenv("ONEBIT_EP_QDQ_DEBUG")) ++refusals[why];
         }
-        if (onnx_domain && can_compute(nodes[i], op)) {
+        if (onnx_domain && !qdq_only() && can_compute(nodes[i], op)) {
             st = g_ep_api->EpGraphSupportInfo_AddNodesToFuse(support_info, &nodes[i], 1, nullptr);
             ++claimed;
         }
     }
     std::free(nodes);
+    for (const auto& [reason, count] : refusals)
+        tracef("qdq_refused why=%s count=%zu", reason.c_str(), count);
     tracef("capability nodes=%zu claimed=%zu qdq_groups=%zu", n, claimed, fused_groups);
     if (verbose())
         std::fprintf(stderr, "onebit_ep: GetCapability %zu nodes -> %zu claimed, %zu QDQ groups fused\n",

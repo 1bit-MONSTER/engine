@@ -112,3 +112,10 @@ add_test(NAME onebit_ep_qdq_proof_unfused COMMAND onebit_ep_qdq_proof $<TARGET_F
 set_tests_properties(onebit_ep_qdq_proof_unfused PROPERTIES
     ENVIRONMENT "ONEBIT_EP_QDQ=0"
     PASS_REGULAR_EXPRESSION "PASS OneBitEp ran the A8W8 QDQ MatMul unfused")
+
+# The mode a quantised model is measured in (docs/onnx-pack.md, "A real Quark export"): fused groups
+# only, no single-node float claims, so nothing the fused path cannot take ends up on our host loop.
+add_test(NAME onebit_ep_qdq_proof_qdq_only COMMAND onebit_ep_qdq_proof $<TARGET_FILE:onebit_ep>)
+set_tests_properties(onebit_ep_qdq_proof_qdq_only PROPERTIES
+    ENVIRONMENT "ONEBIT_EP_QDQ_ONLY=1"
+    PASS_REGULAR_EXPRESSION "PASS OneBitEp fused the A8W8 QDQ group")

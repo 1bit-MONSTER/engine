@@ -27,24 +27,49 @@
 #include <cmath>
 #include <vector>
 #include <memory>
+#include <climits>
+#include <cstdlib>
+#include <map>
 #include <string>
 
 #include "q4nx_weight_layout.h"   // bpos(): the container's device weight layout
+#include "q4nx_pb16i.h"          // the pb16i image: integer-exact ternary decode weights
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 
+// One full ELF, one PDI, one hw_context -- and one kernel handle per instance name
+// ("main:<instance>").  This is not a convenience: switching hw_context costs ~2.7 ms on
+// this box, independent of the stream size (measured 2026-10-31: 0.488 ms per launch back
+// to back in one context, 3.005 alternating two, 3.203 alternating seven), so every design
+// whose ELF carries several instances shares one context and only the kernel handle
+// differs.  The pool below is process-wide because the engine opens one device and one
+// model; it is keyed by the ELF's canonical path, so two roles pointing at the same
+// artifact (G and U share one pb16i ELF today) also share its context.
+struct ElfHost {
+    std::unique_ptr<xrt::elf> elf;
+    std::unique_ptr<xrt::hw_context> hc;
+    std::map<std::string, std::unique_ptr<xrt::ext::kernel>> kernels;
+    xrt::ext::kernel* get(const std::string& inst) {
+        auto it = kernels.find(inst);
+        if (it != kernels.end()) return it->second.get();
+        auto k = std::make_unique<xrt::ext::kernel>(*hc, inst);
+        xrt::ext::kernel* raw = k.get();
+        kernels.emplace(inst, std::move(k));
+        return raw;
+    }
+};
+
 struct I8Ctx {
     int MD, KD, ND, NL;
-    std::unique_ptr<xrt::hw_context> hc;
     // Consume a `aiecc --generate-full-elf` artifact directly: the ELF bundles
     // the PDIs + TXN control code, so there is no instruction file. The
     // hw_context is created from the ELF, and kext is the resulting
     // xrt::ext::kernel whose signature is (A, B, C). Requires the design's
     // runtime sequence to load the ELF's PDI (aiex.npu.load_pdi; see
     // generators/build_zaya_m8.sh), otherwise the runtime never configures the array.
-    std::unique_ptr<xrt::elf> elf;
-    std::unique_ptr<xrt::ext::kernel> kext;
+    std::shared_ptr<ElfHost> host_;
+    xrt::ext::kernel* kext = nullptr;
     std::unique_ptr<xrt::bo> bA, bC;
     std::vector<std::unique_ptr<xrt::bo>> layerB;     // weight BOs
     int8_t* Am;
@@ -60,6 +85,24 @@ struct I8Ctx {
     // before q4nx_weight_layout "b8"), true = the blocked 8x8-microtile image.
     // Set by Q4nxNpuForward from the container's config before the first pack.
     bool blocked_b = false;
+
+    // Weight image "pb16i" (q4nx_weight_layout "pb16i"): the BO holds a pb16i sidecar
+    // unchanged (codes + int16 multipliers), there is no packing and no int8 scale --
+    // the per-column 2^e_ref table and the int32/int64 mode come from the sidecar's
+    // own `.ref` file, and the host applies the single rounding.  The output BO grows
+    // to two int32 planes for the int64 mode (S = hi*2^21 + lo), which the kernel
+    // writes as [M][2N]; bC is allocated for both modes so one BO serves either.
+    bool pb16i = false;
+    // int32 planes the pb16i ELF leaves its sum in: 1 (plain int32) or 2 (ACC64:
+    // lo = sum of (t & 2^21-1), hi = sum of (t >> 21), S = hi*2^21 + lo).  Both are
+    // exact, so a tensor whose own bound fits int32 may still run on the two-plane
+    // kernel; the reverse is not allowed, and load_pb16i_into refuses it.
+    int pb16i_planes = 1;
+
+    // Bytes of one weight image: the int8 layouts are KD*ND, pb16i is its own size.
+    size_t w_bytes() const {
+        return pb16i ? q4nx_pb16i::w_bytes(KD, ND) : (size_t)KD * (size_t)ND;
+    }
 
     // ── Init: consume a FULL ELF directly ──
     // Kernel signature: (bo0, bo1, bo2) == (A, B, C). No instruction BO: the
@@ -79,16 +122,36 @@ struct I8Ctx {
                             "(K=%d N=%d)\n", KD, ND);
             return false;
         }
+        if (pb16i && !q4nx_pb16i::fits(KD, ND)) {
+            fprintf(stderr, "  I8Ctx::init_elf: the pb16i layout needs K%%256==0 and N%%1024==0 "
+                            "(K=%d N=%d)\n", KD, ND);
+            return false;
+        }
         try {
-            elf = std::make_unique<xrt::elf>(std::string(ep));
-            if (!elf->is_full_elf()) {
-                fprintf(stderr, "  I8Ctx::init_elf: %s is not a full ELF\n", ep);
-                return false;
+            // One context per artifact: a second design on the same ELF reuses it, so
+            // going from one role to another inside that ELF does not pay a switch.
+            char canon[PATH_MAX];
+            const std::string key = realpath(ep, canon) ? std::string(canon) : std::string(ep);
+            static std::map<std::string, std::shared_ptr<ElfHost>> pool;
+            auto it = pool.find(key);
+            if (it != pool.end()) {
+                host_ = it->second;
+            } else {
+                auto h = std::make_shared<ElfHost>();
+                h->elf = std::make_unique<xrt::elf>(key);
+                if (!h->elf->is_full_elf()) {
+                    fprintf(stderr, "  I8Ctx::init_elf: %s is not a full ELF\n", ep);
+                    return false;
+                }
+                fprintf(stderr, "  full ELF ok: uuid=%s\n",
+                        h->elf->get_cfg_uuid().to_string().c_str());
+                h->hc = std::make_unique<xrt::hw_context>(d, *h->elf);
+                host_ = h;
+                pool.emplace(key, h);
             }
-            fprintf(stderr, "  full ELF ok: uuid=%s\n",
-                    elf->get_cfg_uuid().to_string().c_str());
-            hc = std::make_unique<xrt::hw_context>(d, *elf);
-            kext = std::make_unique<xrt::ext::kernel>(*hc, std::string(kname));
+            kext = host_->get(std::string(kname));
+            fprintf(stderr, "  I8Ctx::init_elf %s: %s instance %s (%zu in this context)\n",
+                    ep, key.c_str(), kname, host_->kernels.size());
         } catch (std::exception& ex) {
             fprintf(stderr, "  I8Ctx::init_elf failed: %s\n", ex.what());
             return false;
@@ -101,13 +164,15 @@ struct I8Ctx {
             return std::make_unique<xrt::bo>(b);
         };
         bA = mkbo((size_t)MD * KD);
-        bC = mkbo((size_t)MD * ND * 4);
+        // pb16i int64 mode returns two int32 planes ([M][2N]); allocate for both modes
+        // so the tensor's own mode byte, not the geometry, decides what is used.
+        bC = mkbo((size_t)MD * ND * 4 * (pb16i ? 2 : 1));
         Am = (int8_t*)bA->map();
         Cm = (int32_t*)bC->map();
         layerB.resize(NL);
         group_scales.resize(NL);   // packB() writes group_scales[l]
         for (int l = 0; l < NL; l++)
-            layerB[l] = mkbo((size_t)KD * ND);
+            layerB[l] = mkbo(w_bytes());
         initialized = true;
         return true;
     }
@@ -121,10 +186,66 @@ struct I8Ctx {
     std::unique_ptr<xrt::bo> make_weight_bo(xrt::device& d) {
         // The amdxdna driver rejects a group-less xrt::bo, so use the same
         // xrt::ext::bo allocation init_elf's mkbo uses.
-        xrt::ext::bo b{d, (size_t)KD * ND};
+        xrt::ext::bo b{d, w_bytes()};
         auto bo = std::make_unique<xrt::bo>(b);
-        if (void* m = bo->map()) memset(m, 0, (size_t)KD * ND);
+        if (void* m = bo->map()) memset(m, 0, w_bytes());
         return bo;
+    }
+
+    // ── pb16i: the weight image is the sidecar file, copied unchanged ──
+    // `<dir>/<stem>.pb16i` is the image and `<dir>/<stem>.ref` the side table
+    // (e_ref int16[N] + mode byte).  Nothing is requantised, so a mismatch is a
+    // wrong file, not a rounding difference: every check here is loud.
+    bool load_pb16i_into(xrt::bo& bo, const std::string& stem,
+                         std::vector<int16_t>& eref, int& mode) {
+        const size_t want = q4nx_pb16i::w_bytes(KD, ND);
+        const std::string imgp = stem + ".pb16i", refp = stem + ".ref";
+        FILE* f = fopen(imgp.c_str(), "rb");
+        if (!f) { fprintf(stderr, "  pb16i: cannot open %s\n", imgp.c_str()); return false; }
+        std::vector<uint8_t> img(want);
+        const size_t got = fread(img.data(), 1, want, f);
+        const int extra = fgetc(f);
+        fclose(f);
+        if (got != want || extra != EOF) {
+            fprintf(stderr, "  pb16i: %s is not %zu bytes (K=%d N=%d)\n", imgp.c_str(), want,
+                    KD, ND);
+            return false;
+        }
+        f = fopen(refp.c_str(), "rb");
+        if (!f) { fprintf(stderr, "  pb16i: cannot open %s\n", refp.c_str()); return false; }
+        std::vector<uint8_t> ref(q4nx_pb16i::ref_bytes(ND) + 1);
+        const size_t rgot = fread(ref.data(), 1, ref.size(), f);
+        fclose(f);
+        if (rgot != q4nx_pb16i::ref_bytes(ND) ||
+            !q4nx_pb16i::parse_ref(ref.data(), rgot, ND, &eref, &mode)) {
+            fprintf(stderr, "  pb16i: %s is not e_ref[%d] + one mode byte\n", refp.c_str(), ND);
+            return false;
+        }
+        if (bo.size() < want) {
+            fprintf(stderr, "  pb16i: weight BO is %zu B, needs %zu\n", (size_t)bo.size(), want);
+            return false;
+        }
+        memcpy(bo.map(), img.data(), want);
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        return true;
+    }
+
+    // C = float32(S * 2^e_ref) * ascale, the only rounding in the chain.  Row 0 is
+    // the decode row; am rows are written, each row being an int32 plane or the
+    // pair [lo | hi] of the int64 mode, exactly as the kernel wrote it, and each
+    // row is dequantised with its own activation scale.
+    void dequant_pb16i(float* out, int am, int an, const float* ascales,
+                       const std::vector<int16_t>& eref, int planes) {
+        const int row = planes > 1 ? 2 * ND : ND;
+        for (int m = 0; m < am; m++) {
+            const int32_t* lo = Cm + (size_t)m * (size_t)row;
+            const float asc = ascales[m];
+            for (int n = 0; n < an; n++) {
+                const int64_t s = q4nx_pb16i::sum_of(lo + n, lo + ND + n, planes > 1 ? 1 : 0);
+                out[(size_t)m * (size_t)an + n] =
+                    q4nx_pb16i::scale_i64(s, eref[(size_t)n]) * asc;
+            }
+        }
     }
 
     // Cache-friendly per-column int8 quantization into a [KD][ND] padded buffer.

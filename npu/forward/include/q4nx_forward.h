@@ -192,10 +192,14 @@ private:
     bool host_gemm_ = false;
     bool load_layer(int l);
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                  const float* Bmat, std::vector<float>& out, int wkey = -1);
+                  const float* Bmat, std::vector<float>& out, int wkey = -1,
+                  const char* sc = nullptr);
     // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
     void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
-                       const float* Bmat, std::vector<float>& out, int wkey = -1);
+                       const float* Bmat, std::vector<float>& out, int wkey = -1,
+                       const char* sc = nullptr);
+    // pb16i sidecar stem for (layer, tensor tag): <pb16i_dir>/blk_<l>_<tag>_weight
+    std::string pb16i_stem(int layer, const char* tag) const;
     // Phase-selected activation tile.  A one-row launch is decode, so it runs
     // this design's M=16 twin (cheap single-row kernel); anything wider is
     // prefill and keeps the M=128 kernel so a chunk still lands in one array
@@ -266,6 +270,29 @@ private:
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
     bool m16_ = false;          // at least one role has a working twin
     bool m16_check_ = false;    // NPU_M16_CHECK=1: cross-check every decode launch
+    // Weight image "pb16i" (container config q4nx_weight_layout): the decode family
+    // reads sidecar images instead of packing int8 from the f32 weights, so no
+    // f32 weight buffer is needed for a covered projection at all.  pb16i_dir_ is
+    // where blk_<layer>_<tag>_weight.{pb16i,ref} live (config q4nx_pb16i_dir, env
+    // Q4NX_PB16I_DIR wins).  Empty = the layout is off and nothing changes.
+    bool pb16i_ = false;
+    std::string pb16i_dir_;
+    // A sealed ELF carries every ternary instance in ONE full ELF (one PDI, one
+    // hw_context, 7 kernel instances), so changing phase costs nothing: measured on this
+    // box, a phase change inside the sealed context is 0 ms against ~2.7 ms between two
+    // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
+    // it the per-role `_pb16i.elf` files are used as before.
+    std::string pb16i_sealed_;
+    // Full-attention QKV as pb16i: the one 14336-wide fused launch has no kernel
+    // (its int64 q needs 448 columns per core), so it runs as the two q halves plus
+    // k and v -- the four launches the arena measured at 1.49 ms per layer.
+    int i_qhalf_ = -1, i_kv_ = -1;
+    // The lm head is not a PTQ1_0 tensor (the container stores it I8), so it has no
+    // pb16i image and keeps an int8 context of its own: the M=16 twin of the widest
+    // K=H design when one is on disk, else the M=128 ELF.  Without this, a pb16i
+    // container ran the head on the M=128 kernel and paid 30 ms a launch (~0.55 s a
+    // token, measured 2026-10-31 08:00).
+    std::unique_ptr<I8Ctx> ctx_head_;
     int32_t m16_worst_ = 0;     // worst int32 maxdiff seen by the check
     long m16_bad_ = 0, m16_checked_ = 0;
     std::vector<int32_t> m16_ref_;   // reference C row, reused per check
@@ -363,6 +390,9 @@ private:
     struct PackedWeight {
         std::unique_ptr<xrt::bo> bo;
         std::vector<float>       scales;
+        // pb16i: the sidecar's host side table.  Empty eref = an int8 pack.
+        std::vector<int16_t>     eref;
+        int                      pb16i_mode = 0;
     };
     std::vector<std::unordered_map<int, PackedWeight>> wcache_;   // [layer][wkey]
     bool weight_cache_ = true;    // NPU_NO_WCACHE=1 disables (A/B)

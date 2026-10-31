@@ -299,7 +299,14 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         } else {
             out["choices"] = json::array({{{"index", 0}, {"text", content}, {"finish_reason", finish}}});
         }
-        return out.dump();
+        // A tokenizer can emit bytes that are not valid UTF-8 on their own (a multi-byte
+        // character split across two tokens, or a byte-level BPE piece): the strict dump
+        // then throws type_error.316 and the whole completion is lost to the client, which
+        // is what happened on the 27B's own answers (measured 2026-10-31, 3 of 3 prompts
+        // failed to serialize while the model had answered).  Replace the invalid bytes
+        // instead of failing: the text is still what the model produced, minus bytes that
+        // could never have been JSON.
+        return out.dump(-1, ' ', false, json::error_handler_t::replace);
     };
 
     try {
@@ -330,7 +337,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                                                      {"finish_reason", nullptr}}});
                 else
                     chunk["choices"] = json::array({{{"index", 0}, {"text", t}, {"finish_reason", nullptr}}});
-                chunks->push_back("data: " + chunk.dump() + "\n\n");
+                chunks->push_back("data: " +
+                                  chunk.dump(-1, ' ', false, json::error_handler_t::replace) +
+                                  "\n\n");
                 return true;
             });
             auto cursor = std::make_shared<size_t>(0);

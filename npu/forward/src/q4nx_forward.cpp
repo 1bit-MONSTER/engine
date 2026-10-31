@@ -905,18 +905,31 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         if (i_head >= 0) {
             const Q4nxDesignGeom& g = designs_[i_head];
-            std::string n16(g.elf_name);
-            n16.resize(n16.size() - 4);
-            n16 += "_m16.elf";
+            // The head streams 1.33 GB of int8 weights a token, so its layout matters more
+            // than its row count: a blocked (_b8) ELF walks 8 KiB forward per tile at
+            // 8.25 GB/s where the row-major one runs 128 separate 128-byte reads at
+            // 3.3 GB/s (measured: 27 ms a launch either way for M=16 and M=128).  Try the
+            // blocked M=16 twin first, then whatever int8 family is on disk.
+            std::string stem(g.elf_name);
+            stem.resize(stem.size() - 4);                     // drop ".elf"
+            const std::string cands[] = {stem + "_b8_m16.elf", stem + "_m16.elf",
+                                         stem + "_b8.elf", g.elf_name};
             std::string elf;
-            for (const std::string& d : m16dirs_like_head(mdir, dir)) {
-                if (file_exists(d + "/" + n16)) { elf = d + "/" + n16; break; }
+            bool blocked = weight_layout_b8_;
+            for (const std::string& c : cands) {
+                for (const std::string& d : m16dirs_like_head(mdir, dir)) {
+                    if (file_exists(d + "/" + c)) { elf = d + "/" + c; break; }
+                }
+                if (!elf.empty()) {
+                    blocked = c.find("_b8") != std::string::npos;
+                    break;
+                }
             }
-            int m = Q4NX_DESIGN_M_DECODE;
+            int m = elf.find("_m16.elf") != std::string::npos ? Q4NX_DESIGN_M_DECODE : g.M;
             if (elf.empty()) { elf = dir + "/" + g.elf_name; m = g.M; }
             ctx_head_ = std::make_unique<I8Ctx>();
             ctx_head_->MD = m; ctx_head_->KD = g.K; ctx_head_->ND = g.N;
-            ctx_head_->blocked_b = weight_layout_b8_;
+            ctx_head_->blocked_b = blocked;
             if (!ctx_head_->init_elf(*dev, elf.c_str(), m, g.K, g.N, 1)) {
                 fprintf(stderr, "  [forward] lm head: cannot load %s; the head keeps the "
                                 "decode family\n", elf.c_str());

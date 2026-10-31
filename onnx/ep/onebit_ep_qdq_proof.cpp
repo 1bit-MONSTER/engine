@@ -84,11 +84,15 @@ struct Case {
     int32_t zp_y;  // output zero point; 0 unless the case is about asymmetry
     bool expect_fused;
     bool measure_rss;
+    int64_t batch;  // 0 = rank-2 activation, 1 = rank-3 [1, m, k] like a real export
 };
 
 int64_t kM = 8;
 int64_t kK = 16;
 int64_t kN = 6;
+// A real quantised model's activations are rank 3 ([batch, sequence, hidden]), not rank 2. 0 keeps the
+// proof's flat case.
+int64_t kBatch = 0;
 ScaleMode kXMode = kPerTensor;
 ScaleMode kWMode = kPerTensor;
 ZpMode kXZp = kZpZero;
@@ -308,14 +312,15 @@ OrtStatus* make_axis_attr(int64_t axis, OrtOpAttr** out) {
 }
 
 OrtStatus* build_model(OrtModel** out) {
-    const int64_t x_dims[2] = {kM, kK};
+    const int64_t x_dims[3] = {kBatch ? kBatch : kM, kBatch ? kM : kK, kBatch ? kK : 0};
     const int64_t w_dims[2] = {kK, kN};
-    const int64_t y_dims[2] = {kM, kN};
+    const int64_t y_dims[3] = {kBatch ? kBatch : kM, kBatch ? kM : kN, kBatch ? kN : 0};
+    const size_t x_rank = kBatch ? 3 : 2;
 
     OrtTypeInfo* x_type = nullptr;
     OrtTypeInfo* y_type = nullptr;
-    if (OrtStatus* st = make_type(x_dims, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &x_type)) return st;
-    if (OrtStatus* st = make_type(y_dims, 2, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &y_type)) {
+    if (OrtStatus* st = make_type(x_dims, x_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &x_type)) return st;
+    if (OrtStatus* st = make_type(y_dims, x_rank, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &y_type)) {
         api->ReleaseTypeInfo(x_type);
         return st;
     }
@@ -476,12 +481,13 @@ OrtStatus* make_session(OrtEnv* env, OrtModel* model, bool with_ep, const char* 
 }
 
 int run_once(OrtSession* session, std::vector<int8_t>* out) {
-    const int64_t x_dims[2] = {kM, kK};
+    const int64_t x_dims[3] = {kBatch ? kBatch : kM, kBatch ? kM : kK, kBatch ? kK : 0};
+    const size_t x_rank = kBatch ? 3 : 2;
     OrtMemoryInfo* mi = nullptr;
     if (OrtStatus* st = api->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &mi))
         return fail("cpu memory info", st);
     OrtValue* x = nullptr;
-    OrtStatus* st = api->CreateTensorWithDataAsOrtValue(mi, xq.data(), xq.size(), x_dims, 2,
+    OrtStatus* st = api->CreateTensorWithDataAsOrtValue(mi, xq.data(), xq.size(), x_dims, x_rank,
                                                         ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &x);
     api->ReleaseMemoryInfo(mi);
     if (st) return fail("input tensor", st);
@@ -616,11 +622,13 @@ Result run_case(const Case& c, const char* ep_lib, const char* trace_path) {
     kXZp = c.x_zp;
     kWZp = c.w_zp;
     kZpY = c.zp_y;
+    kBatch = c.batch;
     fill_inputs();
 
-    std::printf("onebit-ort-qdq: case %s m=%lld k=%lld n=%lld scales x=%s w=%s zp x=%s w=%s y=%d\n",
-                c.label, (long long)kM, (long long)kK, (long long)kN, mode_name(kXMode),
-                mode_name(kWMode), zp_mode_name(kXZp), zp_mode_name(kWZp), (int)kZpY);
+    std::printf("onebit-ort-qdq: case %s %s m=%lld k=%lld n=%lld scales x=%s w=%s zp x=%s w=%s y=%d\n",
+                c.label, kBatch ? "[1,seq,k] activation" : "[m,k] activation", (long long)kM,
+                (long long)kK, (long long)kN, mode_name(kXMode), mode_name(kWMode),
+                zp_mode_name(kXZp), zp_mode_name(kWZp), (int)kZpY);
 
     const size_t trace_mark = slurp(trace_path).size();
     OrtEnv* env = nullptr;
@@ -714,6 +722,16 @@ int main(int argc, char** argv) {
         // Asymmetric: a non-zero zero point on both operands and on the output.
         {"asym", 8, 16, 6, kPerTensor, kPerTensor, kZpScalar, kZpScalar, -7, true, false},
         {"asym-axis", 8, 16, 6, kPerAxisRows, kPerAxisCols, kZpAxis, kZpAxis, -7, true, false},
+        // What a Quark A8W8 export actually looks like: rank-3 activation, one scale and one zero point
+        // per output column of the weight, everything else per-tensor.
+        {"quark", 8, 64, 48, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        {"quark-asym", 8, 64, 48, kPerTensor, kPerAxisCols, kZpScalar, kZpAxis, -5, true, false, 1},
+        // The same shape one of Qwen3-0.6B's own projections has: 5 tokens x [1024 -> 2048].
+        {"quark-wide", 5, 1024, 2048, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        // The same, with enough values that a quantisation boundary is likely to be hit: 64x1024x2048
+        // is 131072 int8 outputs, and the CPU EP reaches each one through a float accumulation where
+        // the fused path rounds an exact int32 sum.
+        {"quark-stress", 64, 1024, 2048, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // A scale along K is not foldable: the group must stay on the per-node path.
         {"xaxis-K", 8, 16, 6, kPerAxisK, kPerTensor, kZpZero, kZpZero, 0, false, false},
         // x_dq is 1 MB of float32 and w_dq 4 MB, against 0.25 MB and 1 MB of int8.
@@ -722,6 +740,9 @@ int main(int argc, char** argv) {
 
     int rc = 0;
     int worst_tensor = 0, worst_axis = 0, worst_asym = 0, worst_asym_axis = 0, worst_refused = 0;
+    int worst_quark = 0, worst_quark_asym = 0, worst_quark_wide = 0;
+    int worst_quark_stress = 0;
+    size_t differing_quark_stress = 0;
     long peak_cpu = -1, peak_fused = -1;
     size_t fused_cases = 0;
     Result refused;
@@ -756,6 +777,15 @@ int main(int argc, char** argv) {
             worst_asym = r.worst;
         } else if (std::strcmp(c.label, "asym-axis") == 0) {
             worst_asym_axis = r.worst;
+        } else if (std::strcmp(c.label, "quark") == 0) {
+            worst_quark = r.worst;
+        } else if (std::strcmp(c.label, "quark-asym") == 0) {
+            worst_quark_asym = r.worst;
+        } else if (std::strcmp(c.label, "quark-stress") == 0) {
+            worst_quark_stress = r.worst;
+            differing_quark_stress = r.differing;
+        } else if (std::strcmp(c.label, "quark-wide") == 0) {
+            worst_quark_wide = r.worst;
         } else if (std::strcmp(c.label, "xaxis-K") == 0) {
             worst_refused = r.worst;
             refused = r;
@@ -782,12 +812,30 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL asymmetric per-axis case differs by %d LSB\n",
                          worst_asym_axis);
             rc = 1;
+        } else if (!fusion_off && worst_quark != 0) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL Quark-shaped (rank-3, per-column weight "
+                                 "scales) case differs by %d LSB\n",
+                         worst_quark);
+            rc = 1;
+        } else if (!fusion_off && worst_quark_stress > 1) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL stress case differs by %d LSB (%zu values)\n",
+                         worst_quark_stress, differing_quark_stress);
+            rc = 1;
+        } else if (!fusion_off && worst_quark_wide != 0) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL Quark-wide (5x1024x2048, per-column weight "
+                                 "scales) case differs by %d LSB\n",
+                         worst_quark_wide);
+            rc = 1;
+        } else if (!fusion_off && worst_quark_asym != 0) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL Quark-shaped asymmetric case differs by %d LSB\n",
+                         worst_quark_asym);
+            rc = 1;
         } else if (worst_refused > 1) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL the refused per-K-scale case differs by %d LSB\n",
                          worst_refused);
             rc = 1;
         } else if (!fusion_off) {
-            if (fused_cases < 4) {
+            if (fused_cases < 6) {
                 std::fprintf(stderr, "onebit-ort-qdq: FAIL only %zu case(s) were fused\n", fused_cases);
                 rc = 1;
             } else if (peak_cpu > 0 && peak_fused > 0 && peak_fused >= peak_cpu) {

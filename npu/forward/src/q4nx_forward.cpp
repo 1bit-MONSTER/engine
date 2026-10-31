@@ -1746,6 +1746,24 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         npu_gemm_rows(*ctx_[i_z], xn.data(), M, g->K, g->N, B_.data(), Z, 1, "attn_gate");
     }
 
+    // NPU_QKV_DUMP=<layer>: a GDN layer's projections as the engine sees them (q, k, v and the
+    // attn_gate/Z), rows 0 and 3, on both paths.  Layer 0 is the first divergent layer and its
+    // input is rmsnorm(embed(token)), identical in both paths, so this site answers "is the first
+    // differing op the QKV/Z projection itself".
+    if (const char* dl = getenv("NPU_QKV_DUMP")) {
+        if (l == atoi(dl)) {
+            for (int m = 0; m < M; m += (m == 0 ? 3 : 1)) {
+                const float* r = QKV.data() + (size_t)m * CD;
+                const float* zr = Z.data() + (size_t)m * VD;
+                fprintf(stderr, "[qkv-dump] l=%d m=%d", l, m);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " q%d=%.6g", i, (double)r[KD + i]);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " k%d=%.6g", i, (double)r[2 * KD + i]);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " v%d=%.6g", i, (double)r[i]);
+                for (int i = 0; i < 8; i++) fprintf(stderr, " gate%d=%.6g", i, (double)zr[i]);
+                fprintf(stderr, "\n");
+            }
+        }
+    }
     std::vector<float> CORE((size_t)M * VD, 0.0f);
     const bool dump_gb = getenv("NPU_INFER_DUMP_LAYERS") != nullptr;
     const int rep = NVH / NKH;
@@ -2199,6 +2217,23 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
         const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         out.resize((size_t)N);
         kctx.dequant_pb16i(out.data(), 1, N, &as, slot->eref, kctx.pb16i_planes);
+        // NPU_PB16I_TRACE=<layer>: one line for the named layer's launch in the MODEL LOOP, with
+        // the exact inputs and outputs, so the same A can be replayed through the frozen
+        // harness.  If the harness reproduces C, the kernel and the images are fine and the bug
+        // is what happens to C afterwards; if it does not, the activation quantisation is wrong.
+        if (const char* tl = getenv("NPU_PB16I_TRACE")) {
+            if (cur_layer_ == atoi(tl) && sc) {
+                fprintf(stderr, "[pb16i-trace] %s as=%.9g planes=%d A[0..7]=", sc, (double)as,
+                        kctx.pb16i_planes);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Am[i]);
+                fprintf(stderr, " Cm[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Cm[i]);
+                fprintf(stderr, " out[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.9g ", (double)out[(size_t)i]);
+                fprintf(stderr, " eref[0..3]=%d %d %d %d\n", (int)slot->eref[0], (int)slot->eref[1],
+                        (int)slot->eref[2], (int)slot->eref[3]);
+            }
+        }
         if (prof) {
             const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
             const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
@@ -2343,6 +2378,21 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
         const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         out.assign((size_t)M * (size_t)N, 0.0f);
         kctx.dequant_pb16i(out.data(), M, N, ascales.data(), slot->eref, kctx.pb16i_planes);
+        // The batched (prefill) twin of the trace above: a short prompt runs step_batch, so this
+        // is the path a 1-token request actually takes.
+        if (const char* tl = getenv("NPU_PB16I_TRACE")) {
+            if (cur_layer_ == atoi(tl) && sc) {
+                fprintf(stderr, "[pb16i-trace] %s M=%d as[0]=%.9g planes=%d A[0..7]=", sc, M,
+                        (double)ascales[0], kctx.pb16i_planes);
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Am[i]);
+                fprintf(stderr, " Cm[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Cm[i]);
+                fprintf(stderr, " out[0..7]=");
+                for (int i = 0; i < 8; i++) fprintf(stderr, "%.9g ", (double)out[(size_t)i]);
+                fprintf(stderr, " eref[0..3]=%d %d %d %d\n", (int)slot->eref[0], (int)slot->eref[1],
+                        (int)slot->eref[2], (int)slot->eref[3]);
+            }
+        }
         if (prof) {
             const double dpk = std::chrono::duration<double, std::milli>(tl - tp).count();
             const double dql = std::chrono::duration<double, std::milli>(tq - tl).count();
@@ -2581,6 +2631,26 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             const int l_nkv = (l_hd > 0 && g->k_rows > 0) ? g->k_rows / l_hd : c_.NKV;
             const int nhd = c_.NH * l_hd;
             const int ctx_w = nhd;
+            // NPU_QKV_DUMP=<layer>: the four parts of the assembled QKV as the engine sees them,
+            // rows 0 and 3, on BOTH paths - the int8 fused launch and the pb16i four-launch
+            // split fill the same [q|gate|k|v] layout, so this one site compares them directly.
+            if (const char* dl = getenv("NPU_QKV_DUMP")) {
+                if (l == atoi(dl)) {
+                    const int kw = (g->k_rows > 0) ? g->k_rows : c_.NKV * l_hd;
+                    for (int m = 0; m < M; m += (m == 0 ? 3 : 1)) {
+                        const float* r = QKV.data() + (size_t)m * g->N;
+                        fprintf(stderr, "[qkv-dump] l=%d m=%d", l, m);
+                        for (int i = 0; i < 8; i++) fprintf(stderr, " q%d=%.6g", i, (double)r[i]);
+                        for (int i = 0; i < 8; i++)
+                            fprintf(stderr, " gate%d=%.6g", i, (double)r[nhd + i]);
+                        for (int i = 0; i < 8; i++)
+                            fprintf(stderr, " k%d=%.6g", i, (double)r[2 * nhd + i]);
+                        for (int i = 0; i < 8; i++)
+                            fprintf(stderr, " v%d=%.6g", i, (double)r[2 * nhd + kw + i]);
+                        fprintf(stderr, "\n");
+                    }
+                }
+            }
             CTX.assign((size_t)M * (size_t)ctx_w, 0.0f);
             std::vector<float> qkv_use;
             for (int m = 0; m < M; m++) {

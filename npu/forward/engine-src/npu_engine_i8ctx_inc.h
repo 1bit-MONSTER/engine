@@ -227,6 +227,18 @@ struct I8Ctx {
         }
         memcpy(bo.map(), img.data(), want);
         bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        // NPU_PB16I_HASH=1: one line per image actually loaded, so a run can answer "is this
+        // tensor's image non-zero, and is it different from its neighbours" without a device
+        // probe.  The stem carries (layer, tag), which is what a per-launch gate cannot see.
+        if (getenv("NPU_PB16I_HASH")) {
+            unsigned long long h = 1469598103934665603ULL;
+            const size_t n = want < 4096 ? want : 4096;
+            for (size_t i = 0; i < n; i++) { h ^= img[i]; h *= 1099511628211ULL; }
+            unsigned long long nz = 0;
+            for (size_t i = 0; i < n; i++) nz += (img[i] != 0);
+            fprintf(stderr, "[pb16i-image] %s mode=%d planes=%d first4k_fnv=%016llx nonzero=%llu/%zu\n",
+                    stem.c_str(), mode, pb16i_planes, h, nz, n);
+        }
         return true;
     }
 

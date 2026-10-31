@@ -41,6 +41,11 @@ whose layout is fixed by `ORT_API_VERSION`, so a host built for another version 
 the wrong offsets instead of failing. `1bit ort-info` prints both numbers, and the version the
 headers compile against is checked against the version the loaded library serves.
 
+Same version, our own build: `onnx/build_ort.sh` clones tag `v1.23.2`, patches the one `#include
+<cstdint>` GCC 15 needs in `core/common/semver.h`, and installs to `~/vendor/onnxruntime-1.23.2`, so
+`pkg-config` finds it by `PKG_CONFIG_PATH` alone — nothing in `onnx/` changes. The MIT notice covers
+that build too (see `NOTICE`).
+
 ## Building it
 
 ```bash

@@ -228,9 +228,16 @@ Five tests, each proving a different claim:
 | `onebit_ep_proof_cpu_fallback` | with `ONEBIT_EP_OPS=none` the same graph is partitioned to the CPU EP (`claimed=0`), so the match above cannot come from the CPU running both sessions |
 | `onebit_ep_qdq_proof` | the four-node A8W8 QDQ group is claimed as one fused node: the trace has a `qdq` line and no `matmul` line, the int8 output is identical to the CPU EP's per-tensor, per-axis, asymmetric and asymmetric-per-axis (`worst |d| = 0` LSB), a per-axis scale along K is refused, and the run's peak RSS is ~6-7 MB smaller than the CPU EP's |
 | `onebit_ep_qdq_proof_unfused` | with `ONEBIT_EP_QDQ=0` the same graph goes through the per-node path (a `matmul` line, no `qdq` line), so the numbers above can only come from the fused kernel |
+| `onebit_ep_qdq_proof_qdq_only` | with `ONEBIT_EP_QDQ_ONLY=1` (the mode a quantised model is measured in) the fused groups are still claimed and no single-node float MatMul is |
 
-`onebit_npu_gemm_probe` (NPU builds only) is registered as a fourth test and **skips** when the
+`onebit_npu_gemm_probe` (NPU builds only) is registered as a sixth test and **skips** when the
 device is busy rather than failing someone else's run.
+
+`ort-run --basic` keeps a quantised graph's `DequantizeLinear`/`QuantizeLinear` nodes instead of letting
+ORT's graph transformations fold them back into float ops, which is what a quantised EP needs to see;
+`ONEBIT_EP_QDQ_ONLY=1` restricts the EP to the fused groups so a measurement of a real quantised model
+is not distorted by float matmuls landing on the host kernel. `ONEBIT_EP_QDQ_DEBUG=1` makes
+`GetCapability` log why each `MatMul` was refused.
 
 ## Status
 

@@ -34,7 +34,6 @@
 #include <algorithm>
 #include <cmath>
 #include <vector>
-
 #ifdef ONEBIT_EP_NPU
 #include "onebit_npu_gemm.h"
 #include <cstdio>
@@ -82,11 +81,16 @@ static inline int8_t q8_round_clamp(float v) {
 }
 
 void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, int64_t n,
-             float s_x, float s_w, float inv_s_y) {
-    // The whole dequantise/requantise chain collapses to one scale: C = C_s32 * s_x * s_w, then
-    // y_q = C / s_y. Multiplying by 1/s_y keeps it to one multiply per element.
-    const float scale = s_x * s_w * inv_s_y;
+             const float* s_x_row, float s_x, const float* s_w_col, float s_w, float inv_s_y) {
+    // The whole dequantise/requantise chain collapses to one scale per output element:
+    // C = C_s32 * s_x * s_w, then y_q = C / s_y.
     std::vector<int32_t> acc((size_t)n);
+    // The column half of that scale, folded with 1/s_y once per output element instead of per row.
+    std::vector<float> wmul((size_t)n);
+    const float sw = s_w * inv_s_y;
+    for (int64_t j = 0; j < n; ++j) wmul[(size_t)j] = s_w_col ? s_w_col[j] * inv_s_y : sw;
+    const bool per_tensor = !s_x_row && !s_w_col;
+    const float scale = s_x * s_w * inv_s_y;  // per-tensor only; hoisted out of both loops
     for (int64_t i = 0; i < m; ++i) {
         std::fill(acc.begin(), acc.end(), 0);
         // i-k-j: exact int32 accumulation, one B row walked once per A row.
@@ -97,7 +101,13 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
             for (int64_t j = 0; j < n; ++j) acc[(size_t)j] += aik * brow[j];
         }
         int8_t* yrow = y + i * n;
-        for (int64_t j = 0; j < n; ++j) yrow[j] = q8_round_clamp((float)acc[(size_t)j] * scale);
+        if (per_tensor) {
+            for (int64_t j = 0; j < n; ++j) yrow[j] = q8_round_clamp((float)acc[(size_t)j] * scale);
+        } else {
+            const float row = s_x_row ? s_x_row[i] : s_x;
+            for (int64_t j = 0; j < n; ++j)
+                yrow[j] = q8_round_clamp((float)acc[(size_t)j] * row * wmul[(size_t)j]);
+        }
     }
 }
 

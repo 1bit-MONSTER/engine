@@ -29,13 +29,18 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
 
 // The A8W8 QDQ multiply in the quantised domain: int8 x int8 -> int8, no float tensor in between.
 //
-//   y_q[m][n] = clamp(round( (Sum_k a_q[m][k]*w_q[k][n]) * s_x * s_w / s_y ), -128, 127)
+//   y_q[m][n] = clamp(round( (Sum_k a_q[m][k]*w_q[k][n]) * s_x[m] * s_w[n] / s_y ), -128, 127)
 //
 // which is what DequantizeLinear -> MatMul -> QuantizeLinear computes, with the dequantised
 // activations and weights never written anywhere. a is [m][k] int8 row-major, b is [k][n] int8
-// row-major, y is [m][n] int8. The accumulator is exact int32 and the only float work is one
-// multiply and one round-half-to-even per output element (ONNX QuantizeLinear's rounding).
+// row-major, y is [m][n] int8. The accumulator is exact int32 and the only float work is the scale
+// and one round-half-to-even per output element (ONNX QuantizeLinear's rounding).
+//
+// Per-tensor and per-axis scales in one signature: `s_x_row` (length m) and `s_w_col` (length n) are
+// the per-axis forms and, when null, the scalars `s_x` and `s_w` are used instead. Those are the two
+// per-axis forms that fold into this epilogue exactly -- a scale along K does not, because it weights
+// each product inside the sum (see docs/onnx-pack.md).
 void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, int64_t n,
-             float s_x, float s_w, float inv_s_y);
+             const float* s_x_row, float s_x, const float* s_w_col, float s_w, float inv_s_y);
 
 }  // namespace onebit_ep

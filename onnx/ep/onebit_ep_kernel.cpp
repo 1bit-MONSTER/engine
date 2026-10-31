@@ -31,6 +31,9 @@
 
 #include <cstdint>
 #include <cstring>
+#include <algorithm>
+#include <cmath>
+#include <vector>
 
 #ifdef ONEBIT_EP_NPU
 #include "onebit_npu_gemm.h"
@@ -66,6 +69,36 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
         }
     }
     return false;
+}
+
+// One output element of the folded QuantizeLinear: ONNX rounds half to even (nearbyint under the
+// default FE_TONEAREST) and saturates, so this is the CPU EP's own arithmetic on a value it reached
+// through two float tensors.
+static inline int8_t q8_round_clamp(float v) {
+    const float r = std::nearbyint(v);
+    if (r > 127.0f) return 127;
+    if (r < -128.0f) return -128;
+    return (int8_t)r;
+}
+
+void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, int64_t n,
+             float s_x, float s_w, float inv_s_y) {
+    // The whole dequantise/requantise chain collapses to one scale: C = C_s32 * s_x * s_w, then
+    // y_q = C / s_y. Multiplying by 1/s_y keeps it to one multiply per element.
+    const float scale = s_x * s_w * inv_s_y;
+    std::vector<int32_t> acc((size_t)n);
+    for (int64_t i = 0; i < m; ++i) {
+        std::fill(acc.begin(), acc.end(), 0);
+        // i-k-j: exact int32 accumulation, one B row walked once per A row.
+        for (int64_t p = 0; p < k; ++p) {
+            const int32_t aik = a[i * k + p];
+            if (aik == 0) continue;
+            const int8_t* brow = b + p * n;
+            for (int64_t j = 0; j < n; ++j) acc[(size_t)j] += aik * brow[j];
+        }
+        int8_t* yrow = y + i * n;
+        for (int64_t j = 0; j < n; ++j) yrow[j] = q8_round_clamp((float)acc[(size_t)j] * scale);
+    }
 }
 
 }  // namespace onebit_ep

@@ -96,11 +96,19 @@ set_tests_properties(onebit_ep_proof_cpu_fallback PROPERTIES
     ENVIRONMENT "ONEBIT_EP_OPS=none"
     PASS_REGULAR_EXPRESSION "PASS OneBitEp left alone the MatMul")
 
-# The A8W8 QDQ shape Quark's ONNX-to-ONNX flow emits: int8 in, int8 out, with the MatMul between two
-# DequantizeLinear nodes and our EP taking that MatMul (docs/onnx-pack.md).
+# The A8W8 QDQ shape Quark's ONNX-to-ONNX flow emits: int8 in, int8 out, the four nodes claimed as
+# ONE fused node so the dequantised float tensors never exist (docs/onnx-pack.md). The proof gates the
+# int8 outputs at worst |d| = 0 LSB against the CPU EP and measures the peak RSS of the run.
 add_executable(onebit_ep_qdq_proof onebit_ep_qdq_proof.cpp)
 target_link_libraries(onebit_ep_qdq_proof PRIVATE PkgConfig::ONEBIT_ORT_PC)
 add_dependencies(onebit_ep_qdq_proof onebit_ep)
 add_test(NAME onebit_ep_qdq_proof COMMAND onebit_ep_qdq_proof $<TARGET_FILE:onebit_ep>)
 set_tests_properties(onebit_ep_qdq_proof PROPERTIES
-    PASS_REGULAR_EXPRESSION "PASS OneBitEp ran the A8W8 QDQ MatMul|SKIP OneBitEp declined")
+    PASS_REGULAR_EXPRESSION "PASS OneBitEp fused the A8W8 QDQ group")
+
+# Negative control for the same graph: with fusion off the EP claims the MatMul alone and runs the
+# float kernel, so the fused numbers above can only come from the fused path.
+add_test(NAME onebit_ep_qdq_proof_unfused COMMAND onebit_ep_qdq_proof $<TARGET_FILE:onebit_ep>)
+set_tests_properties(onebit_ep_qdq_proof_unfused PROPERTIES
+    ENVIRONMENT "ONEBIT_EP_QDQ=0"
+    PASS_REGULAR_EXPRESSION "PASS OneBitEp ran the A8W8 QDQ MatMul unfused")

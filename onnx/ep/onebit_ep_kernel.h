@@ -27,4 +27,15 @@ namespace onebit_ep {
 // Returns true when the NPU did the multiply (false = the host loop ran).
 bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, int64_t n);
 
+// The A8W8 QDQ multiply in the quantised domain: int8 x int8 -> int8, no float tensor in between.
+//
+//   y_q[m][n] = clamp(round( (Sum_k a_q[m][k]*w_q[k][n]) * s_x * s_w / s_y ), -128, 127)
+//
+// which is what DequantizeLinear -> MatMul -> QuantizeLinear computes, with the dequantised
+// activations and weights never written anywhere. a is [m][k] int8 row-major, b is [k][n] int8
+// row-major, y is [m][n] int8. The accumulator is exact int32 and the only float work is one
+// multiply and one round-half-to-even per output element (ONNX QuantizeLinear's rounding).
+void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, int64_t n,
+             float s_x, float s_w, float inv_s_y);
+
 }  // namespace onebit_ep

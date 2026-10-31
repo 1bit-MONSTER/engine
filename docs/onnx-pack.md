@@ -151,23 +151,38 @@ intermediate float tensor then never exists.
 
 ### What works today, and what does not
 
-- **Works**: an A8W8 QDQ graph runs on our EP unchanged. `onebit_ep_qdq_proof` builds exactly that
-  pattern (int8 in / int8 out, `DequantizeLinear` → `MatMul` → `QuantizeLinear`) with the model
-  editor API, and our EP claims the single `MatMul` out of the four nodes and returns int8 outputs
-  identical to the CPU EP's (`worst |d| = 0` LSB, no saturation). The `DequantizeLinear` and
-  `QuantizeLinear` nodes stay on the CPU EP, which is correct but means the float tensors are still
-  materialised.
-- **Not done**: claiming the three-node group (`DQ, MatMul, Q`) as one fused node so the dequantised
-  floats never exist, feeding int8 activations straight into the kernel's input BO (no float
-  quantisation step), per-axis scale plumbing through `gemm_f32` (it takes one `amax/127` per row
-  today), and support for the asymmetric zero points Quark can emit. An asymmetric zero point is not
-  free: with `zp_x` or `zp_w` non-zero the product gains the correction terms
-  `-zp_x·Σ_k w_q[k][n]`, `-zp_w·Σ_k a_q[m][k]` and `+K·zp_x·zp_w`, so the EP claims only `zp = 0`
-  until those are folded into the kernel's epilogue.
+- **Works: the group is ONE node.** `onebit_ep_qdq_proof` builds exactly that pattern with the model
+  editor API (int8 in / int8 out, `DequantizeLinear` → `MatMul` → `QuantizeLinear`) and our EP claims
+  all four nodes as a single fused node, so neither `DequantizeLinear` nor `QuantizeLinear` runs and
+  the dequantised float tensors never exist. The int8 activations and the int8 weights go into the
+  kernel as they are; the readback folds both scales and the output scale into one multiply per
+  element (`y_q = clamp(round(C_s32 · s_x·s_w/s_y))`, ONNX's round-half-to-even), so int8 out comes
+  straight from the integer accumulator. Measured gate, `ctest -R onebit_ep_qdq_proof`:
+  int8 outputs identical to the CPU EP's, `worst |d| = 0` LSB on the 8×16×6 proof graph and also on
+  a 256×1024×1024 case (262144 of 262144 values equal, so the int32-first arithmetic is in fact
+  *more* exact than the CPU EP's float accumulation, which reaches the same function through two
+  float tensors). Peak RSS growth of the run, measured around the run with the peak reset and
+  `malloc_trim` between the warm-up and the measurement: **6404 kB for the CPU EP vs 260 kB fused**
+  on 256×1024×1024 (three runs: delta 6144, 6144, 6140 kB) — 6144 kB, which is exactly `x_dq`
+  (1 MB), `w_dq` (4 MB) and `y` (1 MB) of float32 that no longer get allocated. `ONEBIT_EP_QDQ=0`
+  is the control: the same binary then claims the
+  `MatMul` alone, logs a float `matmul` line, and the fused `qdq` line never appears.
+- **Not done: per-axis scales and asymmetric zero points.** The fused path takes one scale per
+  tensor: `s_x` and `s_w` are read as scalars, and a graph whose scales are per-axis vectors is left
+  on the per-node path (correct, slower). Zero points are claimed only when `zp = 0`, which is what
+  the proof's graph has; a non-zero `zp` is not free — with `zp_x` or `zp_w` non-zero the product
+  gains the correction terms `-zp_x·Σ_k w_q[k][n]`, `-zp_w·Σ_k a_q[m][k]` and `+K·zp_x·zp_w`, which
+  belong in the epilogue (column sums precomputed at weight load, row sums with the activation
+  quantisation), with a proof whose graph has `zp != 0`.
+- **Not done: the device leg of the fused path.** The fused node's int8 GEMM runs on the host today.
+  Feeding int8 activations straight into the device kernel's input BO needs a runtime entry that
+  writes `Am` from int8 and packs int8 weights without the `amax/127` quantisation step (`packB` is
+  float-in), and it cannot be validated without a window on the array. Until then the fused path is a
+  correctness-and-memory win, not a speed one on a real model — the shapes matter, not the pattern.
 - **Different kernels, not a configuration**: A16W8 needs int16 activations, MX/BFP16 need block
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
   natural split afterwards is our Q4NX pack for weight-only and the Quark QDQ path for A8W8.
 
 The proof is deliberately opset-21, domain-only, symmetric and per-tensor: it pins down the claim
-(our EP takes the MatMul inside the pattern and the arithmetic is right) without pretending the fused
-fast path exists yet.
+(our EP takes the whole group as one node and the arithmetic is exact) for the form Quark emits by
+default, and leaves the two documented gaps above for their own proofs.

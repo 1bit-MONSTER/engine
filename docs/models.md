@@ -24,11 +24,11 @@ formats.
 
 | model | file, route | measured |
 |---|---|---|
-| Qwen3.8-27B | UD-Q4_K_XL, HRX | decode 36.0 tok/s with MTP on code prompts; 56.6 tok/s with the DFlash2 drafter |
+| Qwen3.8-27B | UD-Q4_K_XL, HRX | decode 36.0 tok/s with MTP on code prompts; 56.6 tok/s with the DFlash2 drafter ([post](https://1bit.gg/blog-qwen38-27b-dflash2-and-hadamard.html)) |
 | Qwen3.8-Flash-Next (MoE) | HRX | prefill 287 tok/s, decode 24.0 tok/s |
 | Zyphra ZAYA1-8B | Q4_K_M, HRX | decode 157 tok/s |
-| PrismML Ternary-Bonsai-2-27B | PQ2_0, 6.7 GiB, HRX | decode 43.3 tok/s with MTP |
-| Microsoft BitNet b1.58 2B-4T | TQ2_0 ternary GGUF (TQ1_0 runs too), 1.11 GiB, 2.06 bits per weight, HRX | end to end on the Radeon 8060S, no CPU fallback; decode tg128 123.4 tok/s after the TQ2_0 load-time repack onto the packed-ternary decode kernel (101.6 before it, same binary); perplexity 102.42 on HRX vs 102.56 on the CPU, same file |
+| PrismML Ternary-Bonsai-2-27B | PQ2_0, 6.7 GiB, HRX | decode 43.3 tok/s with MTP ([NPU post](https://1bit.gg/blog-ternary-bonsai-on-the-npu.html)) |
+| Microsoft BitNet b1.58 2B-4T | TQ2_0 ternary GGUF (TQ1_0 runs too), 1.11 GiB, 2.06 bits per weight, HRX | end to end on the Radeon 8060S, no CPU fallback; decode tg128 123.4 tok/s after the TQ2_0 load-time repack onto the packed-ternary decode kernel (101.6 before it, same binary); perplexity 102.42 on HRX vs 102.56 on the CPU, same file ([post](https://1bit.gg/blog-bitnet-b158-on-hrx.html)) |
 | Qwen3-0.6B | NPU route | decode 88.6 tok/s in the release gate |
 | gpt-oss-20b | MXFP4, HRX | runs on HRX |
 

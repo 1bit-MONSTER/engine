@@ -73,6 +73,11 @@ struct State {
     // re-reading the environment or re-opening the device.
     std::vector<std::pair<std::string, std::string>> specs;
     std::vector<std::unique_ptr<Q8Kernel>> q8_kernels;
+    // Shapes whose QDQ kernel could not be built (a bad ELF, a design M that does not match it). Remembered
+    // because building one means parsing an ELF and creating a hw_context -- ~50 ms -- and retrying that on
+    // every call turns a fallback into a 20x slowdown: measured, 8 decode tokens went from 4 s to 87 s when
+    // every group paid a failed init_elf.
+    std::vector<std::pair<int64_t, int64_t>> q8_unavailable;
 };
 
 State& state() {
@@ -188,6 +193,8 @@ bool init(State& s) {
 Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
     for (auto& kern : s.q8_kernels)
         if (kern->k == (int)k && kern->n == (int)n) return kern.get();
+    for (const auto& [fk, fn] : s.q8_unavailable)
+        if (fk == k && fn == n) return nullptr;  // known bad: do not parse the ELF again
     for (const auto& [dims, elf] : s.specs) {
         int m = 0, kk = 0, nn = 0;
         if (sscanf(dims.c_str(), "%dx%dx%d", &m, &kk, &nn) != 3) continue;
@@ -199,7 +206,8 @@ Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
         kern->elf = elf;
         kern->ctx = std::make_unique<I8Ctx>();
         if (!kern->ctx->init_elf(*s.dev, elf.c_str(), m, kk, nn, 1)) {
-            s.why = "I8Ctx init_elf failed for " + elf + " (" + dims + ")";
+            s.why = "I8Ctx init_elf failed for " + elf + " (" + dims + ") -- check the design M";
+            s.q8_unavailable.emplace_back(k, n);
             return nullptr;
         }
         s.q8_kernels.push_back(std::move(kern));

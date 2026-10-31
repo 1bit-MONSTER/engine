@@ -245,6 +245,27 @@ split of those 564 us between dispatch and compute is **inferred** — the dx ro
 profile hook, so nobody has seen where the time goes. A profile is the first thing to add before
 choosing between the two levers, and it is cheaper than either.
 
+## Where a 2048-token prefill actually goes
+
+`ort_run --profile PREFIX` turns on ORT's own per-node trace (it writes `PREFIX_<timestamp>.json`) and
+`onnx/prof_summary.py` folds it by op. One 2048-token prefill on `ryzen`, 8 threads, fp32:
+
+| op | share of 4182 ms |
+|---|---|
+| `MatMul` | 40.1% |
+| `Add` | 16.0% |
+| `FusedMatMul` (attention) | 12.9% |
+| `Softmax` | 6.7% |
+| `Concat` (cache stacking) | 6.3% |
+| `Mul` / `Where` / `Expand` | 10.0% combined |
+
+So 53% is matmul — the part int8 speeds up and nothing else can — and **~22% is mask and broadcast
+elementwise work** (`Where` + `Expand` + most of `Add`), which is ours to delete: the causal mask is
+rebuilt as a `[1,1,2048,2048]` tensor inside the graph on every step. The single largest node in the
+whole run is one `Add` at 161.8 ms and one `Where` at 141.6 ms, both mask construction. The next graph
+change is therefore to hand the mask in as a dtype-correct input (the reason it was removed was a
+zero-length-`past` `Expand` failure, not cost), not to look for more matmul tricks.
+
 ## What this table says
 
 - The numbers are **not** comparable to AMD's published one as a speed claim: theirs is an int4 NPU

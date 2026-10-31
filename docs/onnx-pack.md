@@ -177,11 +177,22 @@ intermediate float tensor then never exists.
   (it weights the individual products inside the sum, which is SmoothQuant's job at export time), so
   the case gates on the EP *not* claiming the group — `claimed=1, qdq_groups=0`, the per-node path,
   and the same int8 output.
-- **Not done: asymmetric zero points.** Zero points are claimed only when every element is 0 (the
-  shape of `zp` does not matter — a scalar or a per-axis vector of zeros is symmetric either way);
-  a non-zero `zp` is not free: the product gains the correction terms `-zp_x·Σ_k w_q[k][n]`,
-  `-zp_w·Σ_k a_q[m][k]` and `+K·zp_x·zp_w`, which belong in the epilogue (column sums precomputed at
-  weight load, row sums with the activation quantisation), with a proof whose graph has `zp != 0`.
+- **Works: asymmetric zero points, folded into the same epilogue.** Writing the shifted product out,
+  `Σ_k (a-zx)(w-zw) = Σ_k a·w − zx·Σ_k w − zw·Σ_k a + K·zx·zw`, the GEMM already computes the first
+  term, the second is a **column sum of the weight** (computed once on the first run that needs it and
+  kept for the session — never per step), and the third is a **row sum of the activation** (one extra
+  add per k while the row is already being read). The output zero point is added after the
+  round-half-to-even, in that order, because rounding after an integer shift would move exact ties to
+  the wrong neighbour. All three are per-tensor or per-axis along the same axes as the scales, and the
+  corrections are exact int64. Measured, `ctest -R onebit_ep_qdq_proof`: `worst |d| = 0` LSB against
+  the CPU EP for `zp_x = −40, zp_w = −25, zp_y = −7` with per-tensor scales, **and** for the fully
+  per-axis case (8 row scales and 8 row zero points, 6 column scales and 6 column zero points, plus
+  `zp_y`); the EP trace for those runs reads `zp_x=8 zp_w=6 zp_y=-7` with a one-off
+  `qdq_colsum k=… n=…`. A symmetric graph never computes the column sums (its trace reads `zp_x=1
+  zp_w=1 zp_y=0` and no `qdq_colsum`), which is the point of doing it lazily.
+- **Not done: a zero point along K.** Like a scale along K it would weight the products inside the sum
+  — it needs `Σ_k zp_x[k]·w_q[k][n]`, a column-weighted vector of the weight that no kernel here
+  precomputes — so a graph with one keeps the per-node path.
 - **Not done: the device leg of the fused path.** The fused node's int8 GEMM runs on the host today.
   Feeding int8 activations straight into the device kernel's input BO needs a runtime entry that
   writes `Am` from int8 and packs int8 weights without the `amax/127` quantisation step (`packB` is
@@ -191,7 +202,6 @@ intermediate float tensor then never exists.
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
   natural split afterwards is our Q4NX pack for weight-only and the Quark QDQ path for A8W8.
 
-The proof is deliberately opset-21 and domain-only, and symmetric (zero point 0) throughout: it pins
-down the claim (our EP takes the whole group as one node and the arithmetic is exact) for the
-per-tensor and per-axis forms Quark emits by default, and leaves the two documented gaps above —
-asymmetric zero points and the device leg — for their own proofs.
+The proof is deliberately opset-21 and domain-only. It pins down the claim (our EP takes the whole
+group as one node and the arithmetic is exact) for the per-tensor, per-axis and asymmetric forms
+Quark emits by default, and leaves the one documented gap above — the device leg — for its own proof.

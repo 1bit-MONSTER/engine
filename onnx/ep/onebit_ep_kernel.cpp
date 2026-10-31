@@ -29,6 +29,8 @@
 //
 // This is deliberately not an interface or a dispatch table. One function, one call site.
 
+#include "onebit_ep_kernel.h"
+
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -70,43 +72,62 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
     return false;
 }
 
-// One output element of the folded QuantizeLinear: ONNX rounds half to even (nearbyint under the
-// default FE_TONEAREST) and saturates, so this is the CPU EP's own arithmetic on a value it reached
-// through two float tensors.
-static inline int8_t q8_round_clamp(float v) {
-    const float r = std::nearbyint(v);
-    if (r > 127.0f) return 127;
-    if (r < -128.0f) return -128;
-    return (int8_t)r;
+// One output element of the folded QuantizeLinear: round half to even (nearbyint under the default
+// FE_TONEAREST), add the zero point, saturate to int8. The order matters -- rounding after adding an
+// integer zero point would move exact ties to the wrong neighbour.
+static inline int8_t q8_quantize(float v, int32_t zp) {
+    float r = std::nearbyint(v);
+    // The output is int8 whatever happens next: keep the integer add in range.
+    if (r > 1.0e6f) r = 1.0e6f;
+    if (r < -1.0e6f) r = -1.0e6f;
+    const int32_t q = zp + (int32_t)r;
+    if (q > 127) return 127;
+    if (q < -128) return -128;
+    return (int8_t)q;
 }
 
 void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, int64_t n,
-             const float* s_x_row, float s_x, const float* s_w_col, float s_w, float inv_s_y) {
-    // The whole dequantise/requantise chain collapses to one scale per output element:
-    // C = C_s32 * s_x * s_w, then y_q = C / s_y.
-    std::vector<int32_t> acc((size_t)n);
-    // The column half of that scale, folded with 1/s_y once per output element instead of per row.
+             const Q8Epilogue& e) {
+    // The whole dequantise/requantise chain collapses to one scale per output element; the column half
+    // of it (and 1/s_y) is folded once, up front.
     std::vector<float> wmul((size_t)n);
-    const float sw = s_w * inv_s_y;
-    for (int64_t j = 0; j < n; ++j) wmul[(size_t)j] = s_w_col ? s_w_col[j] * inv_s_y : sw;
-    const bool per_tensor = !s_x_row && !s_w_col;
-    const float scale = s_x * s_w * inv_s_y;  // per-tensor only; hoisted out of both loops
+    const float sw = e.s_w * e.inv_s_y;
+    for (int64_t j = 0; j < n; ++j) wmul[(size_t)j] = e.s_w_col ? e.s_w_col[j] * e.inv_s_y : sw;
+
+    const bool asym = e.zp_x != 0 || e.zp_w != 0 || e.zp_x_row || e.zp_w_col || e.zp_y != 0;
+    const bool per_tensor = !asym && !e.s_x_row && !e.s_w_col;
+    const float scale = e.s_x * e.s_w * e.inv_s_y;  // per-tensor symmetric path, hoisted
+    std::vector<int32_t> acc((size_t)n);
     for (int64_t i = 0; i < m; ++i) {
         std::fill(acc.begin(), acc.end(), 0);
+        int64_t rowsum = 0;  // sum_k a_q[m][k]: only a non-zero zp_w needs it
         // i-k-j: exact int32 accumulation, one B row walked once per A row.
         for (int64_t p = 0; p < k; ++p) {
             const int32_t aik = a[i * k + p];
+            if (asym) rowsum += aik;
             if (aik == 0) continue;
             const int8_t* brow = b + p * n;
             for (int64_t j = 0; j < n; ++j) acc[(size_t)j] += aik * brow[j];
         }
         int8_t* yrow = y + i * n;
         if (per_tensor) {
-            for (int64_t j = 0; j < n; ++j) yrow[j] = q8_round_clamp((float)acc[(size_t)j] * scale);
-        } else {
-            const float row = s_x_row ? s_x_row[i] : s_x;
             for (int64_t j = 0; j < n; ++j)
-                yrow[j] = q8_round_clamp((float)acc[(size_t)j] * row * wmul[(size_t)j]);
+                yrow[j] = q8_quantize((float)acc[(size_t)j] * scale, 0);
+            continue;
+        }
+        const float sx_row = e.s_x_row ? e.s_x_row[i] : e.s_x;
+        const int64_t zx = e.zp_x_row ? e.zp_x_row[i] : e.zp_x;
+        for (int64_t j = 0; j < n; ++j) {
+            int64_t c = acc[(size_t)j];
+            if (asym) {
+                const int64_t zw = e.zp_w_col ? e.zp_w_col[j] : e.zp_w;
+                if (zx) c -= zx * (int64_t)e.colsum_w[j];
+                if (zw) {
+                    c -= zw * rowsum;
+                    c += (int64_t)k * zx * zw;
+                }
+            }
+            yrow[j] = q8_quantize((float)c * sx_row * wmul[(size_t)j], e.zp_y);
         }
     }
 }

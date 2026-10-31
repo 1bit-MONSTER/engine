@@ -70,11 +70,18 @@ enum ScaleMode {
     kPerAxisCols,  // weight: one scale per output column (DQ axis 1 on [K, N])
 };
 
+// How the zero points are shaped: absent (symmetric, 0), a non-zero scalar, or one value per row /
+// per output column -- the only per-axis forms the epilogue can fold.
+enum ZpMode { kZpZero, kZpScalar, kZpAxis };
+
 struct Case {
     const char* label;
     int64_t m, k, n;
     ScaleMode x_mode;
     ScaleMode w_mode;
+    ZpMode x_zp;
+    ZpMode w_zp;
+    int32_t zp_y;  // output zero point; 0 unless the case is about asymmetry
     bool expect_fused;
     bool measure_rss;
 };
@@ -84,12 +91,16 @@ int64_t kK = 16;
 int64_t kN = 6;
 ScaleMode kXMode = kPerTensor;
 ScaleMode kWMode = kPerTensor;
+ZpMode kXZp = kZpZero;
+ZpMode kWZp = kZpZero;
+int32_t kZpY = 0;
 
 // x_q and w_q are int8 and quantised from a deterministic zero-mean source, so a scale per tensor (or
 // per row/column) is enough to exercise the folding without hiding an error behind saturation.
 std::vector<int8_t> xq, wq;
 std::vector<int8_t> ref_out, ep_out;
 std::vector<float> s_x_vec, s_w_vec;  // per-axis scale vectors, sized by the case
+std::vector<int8_t> zp_x_vec, zp_w_vec;
 float s_x = 0.0f;
 float s_w = 0.0f;
 float s_y = 0.0f;
@@ -101,10 +112,40 @@ int fail(const char* what, const OrtStatus* st) {
     return 1;
 }
 
-// The activation scale to use for row m and the weight scale for output column n, whichever form the
-// case asked for.
+// The activation scale and zero point to use for row m, the weight's for output column n, whichever
+// form the case asked for.
 float sx_of(int64_t m) { return kXMode == kPerAxisRows ? s_x_vec[(size_t)m] : s_x; }
 float sw_of(int64_t n) { return kWMode == kPerAxisCols ? s_w_vec[(size_t)n] : s_w; }
+// The zero-point value the graph carries: 0 when symmetric, a constant when the case asks for a
+// scalar one, and the generated vector when the case is about a per-axis zero point.
+int32_t zx_of(int64_t m) {
+    switch (kXZp) {
+        case kZpZero: return 0;
+        case kZpScalar: return -40;
+        case kZpAxis: return zp_x_vec[(size_t)m];
+    }
+    return 0;
+}
+int32_t zw_of(int64_t n) {
+    switch (kWZp) {
+        case kZpZero: return 0;
+        case kZpScalar: return -25;
+        case kZpAxis: return zp_w_vec[(size_t)n];
+    }
+    return 0;
+}
+
+// A per-axis scale forces the zero point to be a vector of the same length (ONNX rejects a scalar
+// beside a per-axis scale), so the shape of the zero point follows the shape of the scale even when
+// its value is 0.
+bool x_zp_is_vector() { return kXMode != kPerTensor || kXZp == kZpAxis; }
+bool w_zp_is_vector() { return kWMode != kPerTensor || kWZp == kZpAxis; }
+
+int8_t q8_sat(int64_t v) {
+    if (v > 127) return 127;
+    if (v < -128) return -128;
+    return (int8_t)v;
+}
 
 void fill_inputs() {
     xq.assign((size_t)(kM * kK), 0);
@@ -127,8 +168,8 @@ void fill_inputs() {
     }
 
     // Per-axis candidates: one scale per activation row, per K column, per weight column. amax/127 is
-    // the convention the forward route uses, so a per-axis graph and a per-tensor graph differ only in
-    // how many scales they carry, not in how each one is derived.
+    // the convention the forward route uses; with a non-zero zero point the usable headroom is
+    // (127 - zp), so the largest value lands on 127 and nothing saturates.
     std::vector<float> row_amax((size_t)kM, 0.0f), kcol_amax((size_t)kK, 0.0f),
         wcol_amax((size_t)kN, 0.0f);
     for (int64_t m = 0; m < kM; ++m) {
@@ -144,44 +185,60 @@ void fill_inputs() {
             if (v > wcol_amax[(size_t)n]) wcol_amax[(size_t)n] = v;
         }
     }
-    auto to_scale = [](float amax) { return amax > 0.0f ? amax / 127.0f : 1.0f; };
+    // Negative zero points, so the shifted values stay inside int8: headroom is 127 - zp.
+    zp_x_vec.assign(x_zp_is_vector() ? (size_t)(kXMode == kPerAxisK ? kK : kM) : 0, 0);
+    for (size_t i = 0; i < zp_x_vec.size(); ++i)
+        zp_x_vec[i] = (int8_t)(kXZp == kZpAxis ? -(24 + (int32_t)(i % 8) * 4) : zx_of((int64_t)i));
+    zp_w_vec.assign(w_zp_is_vector() ? (size_t)kN : 0, 0);
+    for (size_t i = 0; i < zp_w_vec.size(); ++i)
+        zp_w_vec[i] = (int8_t)(kWZp == kZpAxis ? -(8 + (int32_t)(i % 4) * 6) : zw_of((int64_t)i));
+
+    auto to_scale = [](float amax, int32_t zp) {
+        const int32_t headroom = 127 - zp;
+        return amax > 0.0f ? amax / (float)(headroom > 0 ? headroom : 1) : 1.0f;
+    };
 
     float xmax = 0.0f, wmax = 0.0f;
-    for (float v : row_amax) xmax = v > xmax ? v : xmax;
-    for (float v : wcol_amax) wmax = v > wmax ? v : wmax;
-    s_x = to_scale(xmax);
-    s_w = to_scale(wmax);
+    for (int64_t m = 0; m < kM; ++m) xmax = row_amax[(size_t)m] > xmax ? row_amax[(size_t)m] : xmax;
+    for (int64_t n = 0; n < kN; ++n) wmax = wcol_amax[(size_t)n] > wmax ? wcol_amax[(size_t)n] : wmax;
+    s_x = to_scale(xmax, zx_of(0));
+    s_w = to_scale(wmax, zw_of(0));
     s_x_vec.resize(kXMode == kPerAxisK ? (size_t)kK : (size_t)kM);
     for (size_t i = 0; i < s_x_vec.size(); ++i)
-        s_x_vec[i] = to_scale(kXMode == kPerAxisK ? kcol_amax[i] : row_amax[i]);
+        s_x_vec[i] = to_scale(kXMode == kPerAxisK ? kcol_amax[i] : row_amax[i], zx_of((int64_t)i));
     s_w_vec.resize((size_t)kN);
-    for (int64_t n = 0; n < kN; ++n) s_w_vec[(size_t)n] = to_scale(wcol_amax[(size_t)n]);
+    for (size_t n = 0; n < s_w_vec.size(); ++n) s_w_vec[n] = to_scale(wcol_amax[n], zw_of((int64_t)n));
 
     for (int64_t m = 0; m < kM; ++m) {
         const bool per_k = kXMode == kPerAxisK;
         for (int64_t p = 0; p < kK; ++p) {
             const float s = per_k ? s_x_vec[(size_t)p] : sx_of(m);
-            xq[(size_t)(m * kK + p)] = (int8_t)std::lround(xf[(size_t)(m * kK + p)] / s);
+            // ONNX DequantizeLinear: x_dq = (x_q - zp) * s, so x_q = round(x/s) + zp.
+            xq[(size_t)(m * kK + p)] =
+                q8_sat(std::lround(xf[(size_t)(m * kK + p)] / s) + (per_k ? zp_x_vec[(size_t)p] : zx_of(m)));
         }
     }
     for (int64_t p = 0; p < kK; ++p)
         for (int64_t n = 0; n < kN; ++n)
-            wq[(size_t)(p * kN + n)] = (int8_t)std::lround(wf[(size_t)(p * kN + n)] / sw_of(n));
+            wq[(size_t)(p * kN + n)] =
+                q8_sat(std::lround(wf[(size_t)(p * kN + n)] / sw_of(n)) + zw_of(n));
 
-    // The output scale comes from the exact dequantised product, so y_q uses a fraction of the int8
-    // range instead of clipping: a saturated result would hide a scale-folding error rather than show
-    // it.
+    // The output scale comes from the exact shifted product, so y_q uses a fraction of the int8 range
+    // instead of clipping -- and leaves room for the output zero point.
     float ymax = 0.0f;
     for (int64_t m = 0; m < kM; ++m) {
         for (int64_t n = 0; n < kN; ++n) {
-            int32_t acc = 0;
-            for (int64_t p = 0; p < kK; ++p)
-                acc += (int32_t)xq[(size_t)(m * kK + p)] * wq[(size_t)(p * kN + n)];
+            int64_t acc = 0;
+            for (int64_t p = 0; p < kK; ++p) {
+                const int64_t zx = kXMode == kPerAxisK ? zp_x_vec[(size_t)p] : zx_of(m);
+                acc += ((int64_t)xq[(size_t)(m * kK + p)] - zx) *
+                       ((int64_t)wq[(size_t)(p * kN + n)] - zw_of(n));
+            }
             const float y = std::fabs((float)acc * sx_of(m) * sw_of(n));
             if (y > ymax) ymax = y;
         }
     }
-    s_y = ymax / 64.0f;
+    s_y = ymax / 48.0f;
 }
 
 OrtStatus* make_type(const int64_t* dims, size_t rank, ONNXTensorElementDataType elem,
@@ -275,25 +332,54 @@ OrtStatus* build_model(OrtModel** out) {
     if (!st) st = editor->SetGraphInputs(graph, &x_vi, 1);    // graph takes ownership
     if (!st) st = editor->SetGraphOutputs(graph, &y_vi, 1);   // graph takes ownership
 
-    const int8_t zp = 0;
     const bool x_per_axis = kXMode != kPerTensor;
     const bool w_per_axis = kWMode != kPerTensor;
-    if (!st) st = add_scalar(graph, "zp", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &zp, sizeof(zp));
-    if (!st && !x_per_axis)
-        st = add_scalar(graph, "s_x", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &s_x, sizeof(s_x));
-    if (!st && x_per_axis) {
-        const int64_t dims[1] = {(int64_t)s_x_vec.size()};
-        st = add_tensor(graph, "s_x", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, s_x_vec.data(),
-                        s_x_vec.size() * sizeof(float), dims, 1);
+    const bool x_zp_vec = x_zp_is_vector();
+    const bool w_zp_vec = w_zp_is_vector();
+    const int32_t zx_scalar = zx_of(0);
+    const int32_t zw_scalar = zw_of(0);
+
+    // Scales and zero points: a scalar (rank 0) or one value per row/column, plus the output pair.
+    if (!st) {
+        if (!x_per_axis) {
+            st = add_scalar(graph, "s_x", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &s_x, sizeof(s_x));
+        } else {
+            const int64_t dims[1] = {(int64_t)s_x_vec.size()};
+            st = add_tensor(graph, "s_x", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, s_x_vec.data(),
+                            s_x_vec.size() * sizeof(float), dims, 1);
+        }
     }
-    if (!st && !w_per_axis)
-        st = add_scalar(graph, "s_w", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &s_w, sizeof(s_w));
-    if (!st && w_per_axis) {
-        const int64_t dims[1] = {(int64_t)s_w_vec.size()};
-        st = add_tensor(graph, "s_w", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, s_w_vec.data(),
-                        s_w_vec.size() * sizeof(float), dims, 1);
+    if (!st) {
+        if (!w_per_axis) {
+            st = add_scalar(graph, "s_w", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &s_w, sizeof(s_w));
+        } else {
+            const int64_t dims[1] = {(int64_t)s_w_vec.size()};
+            st = add_tensor(graph, "s_w", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, s_w_vec.data(),
+                            s_w_vec.size() * sizeof(float), dims, 1);
+        }
+    }
+    if (!st) {
+        if (!x_zp_vec) {
+            const int8_t z = (int8_t)zx_scalar;
+            st = add_scalar(graph, "zp_x", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &z, sizeof(z));
+        } else {
+            const int64_t dims[1] = {(int64_t)zp_x_vec.size()};
+            st = add_tensor(graph, "zp_x", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, zp_x_vec.data(),
+                            zp_x_vec.size(), dims, 1);
+        }
+    }
+    if (!st) {
+        if (!w_zp_vec) {
+            const int8_t z = (int8_t)zw_scalar;
+            st = add_scalar(graph, "zp_w", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &z, sizeof(z));
+        } else {
+            const int64_t dims[1] = {(int64_t)zp_w_vec.size()};
+            st = add_tensor(graph, "zp_w", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, zp_w_vec.data(),
+                            zp_w_vec.size(), dims, 1);
+        }
     }
     if (!st) st = add_scalar(graph, "s_y", ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &s_y, sizeof(s_y));
+    if (!st) st = add_scalar(graph, "zp_y", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, &kZpY, sizeof(int8_t));
     if (!st) st = add_tensor(graph, "w_q", ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, wq.data(), wq.size(),
                              w_dims, 2);
     if (st) {
@@ -301,29 +387,28 @@ OrtStatus* build_model(OrtModel** out) {
         return st;
     }
 
-    const char* dq_x_in[3] = {"x_q", "s_x", "zp"};
-    const char* dq_w_in[3] = {"w_q", "s_w", "zp"};
+    const char* dq_x_in[3] = {"x_q", "s_x", "zp_x"};
+    const char* dq_w_in[3] = {"w_q", "s_w", "zp_w"};
     const char* mm_in[2] = {"x_dq", "w_dq"};
-    const char* q_in[3] = {"y", "s_y", "zp"};
+    const char* q_in[3] = {"y", "s_y", "zp_y"};
     const char* x_dq_out[1] = {"x_dq"};
     const char* w_dq_out[1] = {"w_dq"};
     const char* y_out[1] = {"y"};
     const char* yq_out[1] = {"y_q"};
 
-    // A per-axis scale says which dimension it runs along; the default is 1.
+    // A per-axis scale or zero point says which dimension it runs along; the default is 1. Both
+    // operands of one DequantizeLinear share the node's axis, which is what ONNX requires.
     OrtOpAttr* x_axis = nullptr;
     OrtOpAttr* w_axis = nullptr;
-    if (!st && x_per_axis) st = make_axis_attr(kXMode == kPerAxisRows ? 0 : 1, &x_axis);
-    if (!st && w_per_axis) st = make_axis_attr(1, &w_axis);
-    // A per-axis DequantizeLinear takes no zero point input: ONNX requires a per-axis zero point to
-    // match the scale's shape, and omitting it means the same thing (symmetric), which is also what
-    // an exporter writes for an A8W8 graph.
+    if (!st && x_zp_vec) st = make_axis_attr(kXMode == kPerAxisRows ? 0 : 1, &x_axis);
+    if (!st && w_zp_vec) st = make_axis_attr(1, &w_axis);
+    // Both DequantizeLinear nodes carry a zero point input in every case: ONNX requires a per-axis
+    // zero point to match the scale's shape (both vectors, as generated here), and for a per-tensor
+    // scale it is a scalar, which is what a symmetric graph writes as an explicit 0.
     if (!st)
-        st = add_node_attr(graph, "DequantizeLinear", "dq_x", dq_x_in, x_per_axis ? 2 : 3, x_dq_out, 1,
-                           x_axis);
+        st = add_node_attr(graph, "DequantizeLinear", "dq_x", dq_x_in, 3, x_dq_out, 1, x_axis);
     if (!st)
-        st = add_node_attr(graph, "DequantizeLinear", "dq_w", dq_w_in, w_per_axis ? 2 : 3, w_dq_out, 1,
-                           w_axis);
+        st = add_node_attr(graph, "DequantizeLinear", "dq_w", dq_w_in, 3, w_dq_out, 1, w_axis);
     if (!st) st = add_node(graph, "MatMul", "qdq_matmul", mm_in, 2, y_out, 1);
     if (!st) st = add_node(graph, "QuantizeLinear", "q_y", q_in, 3, yq_out, 1);
     // The OrtModelEditorApi takes the attribute into the node; releasing it here as well is a double
@@ -488,6 +573,15 @@ int compare(size_t* differing) {
     return worst;
 }
 
+const char* zp_mode_name(ZpMode z) {
+    switch (z) {
+        case kZpZero: return "0";
+        case kZpScalar: return "scalar";
+        case kZpAxis: return "per-axis";
+    }
+    return "?";
+}
+
 const char* mode_name(ScaleMode m) {
     switch (m) {
         case kPerTensor: return "per-tensor";
@@ -519,10 +613,14 @@ Result run_case(const Case& c, const char* ep_lib, const char* trace_path) {
     kN = c.n;
     kXMode = c.x_mode;
     kWMode = c.w_mode;
+    kXZp = c.x_zp;
+    kWZp = c.w_zp;
+    kZpY = c.zp_y;
     fill_inputs();
 
-    std::printf("onebit-ort-qdq: case %s m=%lld k=%lld n=%lld scales x=%s w=%s\n", c.label,
-                (long long)kM, (long long)kK, (long long)kN, mode_name(kXMode), mode_name(kWMode));
+    std::printf("onebit-ort-qdq: case %s m=%lld k=%lld n=%lld scales x=%s w=%s zp x=%s w=%s y=%d\n",
+                c.label, (long long)kM, (long long)kK, (long long)kN, mode_name(kXMode),
+                mode_name(kWMode), zp_mode_name(kXZp), zp_mode_name(kWZp), (int)kZpY);
 
     const size_t trace_mark = slurp(trace_path).size();
     OrtEnv* env = nullptr;
@@ -611,16 +709,19 @@ int main(int argc, char** argv) {
     if (fusion_off) std::printf("onebit-ort-qdq: control run: ONEBIT_EP_QDQ=0, fusion disabled\n");
 
     const Case cases[] = {
-        {"tensor", 8, 16, 6, kPerTensor, kPerTensor, true, false},
-        {"axis", 8, 16, 6, kPerAxisRows, kPerAxisCols, true, false},
+        {"tensor", 8, 16, 6, kPerTensor, kPerTensor, kZpZero, kZpZero, 0, true, false},
+        {"axis", 8, 16, 6, kPerAxisRows, kPerAxisCols, kZpZero, kZpZero, 0, true, false},
+        // Asymmetric: a non-zero zero point on both operands and on the output.
+        {"asym", 8, 16, 6, kPerTensor, kPerTensor, kZpScalar, kZpScalar, -7, true, false},
+        {"asym-axis", 8, 16, 6, kPerAxisRows, kPerAxisCols, kZpAxis, kZpAxis, -7, true, false},
         // A scale along K is not foldable: the group must stay on the per-node path.
-        {"xaxis-K", 8, 16, 6, kPerAxisK, kPerTensor, false, false},
+        {"xaxis-K", 8, 16, 6, kPerAxisK, kPerTensor, kZpZero, kZpZero, 0, false, false},
         // x_dq is 1 MB of float32 and w_dq 4 MB, against 0.25 MB and 1 MB of int8.
-        {"rss", 256, 1024, 1024, kPerTensor, kPerTensor, true, true},
+        {"rss", 256, 1024, 1024, kPerTensor, kPerTensor, kZpZero, kZpZero, 0, true, true},
     };
 
     int rc = 0;
-    int worst_tensor = 0, worst_axis = 0, worst_refused = 0;
+    int worst_tensor = 0, worst_axis = 0, worst_asym = 0, worst_asym_axis = 0, worst_refused = 0;
     long peak_cpu = -1, peak_fused = -1;
     size_t fused_cases = 0;
     Result refused;
@@ -651,6 +752,10 @@ int main(int argc, char** argv) {
             worst_tensor = r.worst;
         } else if (std::strcmp(c.label, "axis") == 0) {
             worst_axis = r.worst;
+        } else if (std::strcmp(c.label, "asym") == 0) {
+            worst_asym = r.worst;
+        } else if (std::strcmp(c.label, "asym-axis") == 0) {
+            worst_asym_axis = r.worst;
         } else if (std::strcmp(c.label, "xaxis-K") == 0) {
             worst_refused = r.worst;
             refused = r;
@@ -670,12 +775,19 @@ int main(int argc, char** argv) {
         } else if (!fusion_off && worst_axis != 0) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL per-axis case differs by %d LSB\n", worst_axis);
             rc = 1;
+        } else if (!fusion_off && worst_asym != 0) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL asymmetric case differs by %d LSB\n", worst_asym);
+            rc = 1;
+        } else if (!fusion_off && worst_asym_axis != 0) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL asymmetric per-axis case differs by %d LSB\n",
+                         worst_asym_axis);
+            rc = 1;
         } else if (worst_refused > 1) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL the refused per-K-scale case differs by %d LSB\n",
                          worst_refused);
             rc = 1;
         } else if (!fusion_off) {
-            if (fused_cases < 2) {
+            if (fused_cases < 4) {
                 std::fprintf(stderr, "onebit-ort-qdq: FAIL only %zu case(s) were fused\n", fused_cases);
                 rc = 1;
             } else if (peak_cpu > 0 && peak_fused > 0 && peak_fused >= peak_cpu) {
@@ -685,19 +797,19 @@ int main(int argc, char** argv) {
                              peak_fused, peak_cpu);
                 rc = 1;
             } else {
-                std::printf("onebit-ort-qdq: PASS OneBitEp fused the A8W8 QDQ group: per-tensor and "
-                            "per-axis (s_x[m], s_w[n]) worst |d|=%d/%d LSB (exact), per-K scale "
-                            "refused (worst |d|=%d), peak RSS -%ld kB\n",
-                            worst_tensor, worst_axis, worst_refused,
+                std::printf("onebit-ort-qdq: PASS OneBitEp fused the A8W8 QDQ group: worst |d| = "
+                            "%d/%d/%d/%d LSB (per-tensor, per-axis, asymmetric, asymmetric per-axis), "
+                            "per-K scale refused (worst |d|=%d), peak RSS -%ld kB\n",
+                            worst_tensor, worst_axis, worst_asym, worst_asym_axis, worst_refused,
                             peak_cpu > 0 ? peak_cpu - peak_fused : 0L);
             }
         } else {
             // The control only has to prove the per-node path still works; the other numbers are
             // measurements, not gates.
             std::printf("onebit-ort-qdq: PASS OneBitEp ran the A8W8 QDQ MatMul unfused "
-                        "(control: ONEBIT_EP_QDQ=0), per-tensor worst |d|=%d LSB, per-axis %d, "
-                        "per-K scale %d (informational)\n",
-                        worst_tensor, worst_axis, worst_refused);
+                        "(control: ONEBIT_EP_QDQ=0), per-tensor worst |d|=%d LSB, others %d/%d/%d/%d "
+                        "(informational)\n",
+                        worst_tensor, worst_axis, worst_asym, worst_asym_axis, worst_refused);
         }
     }
     (void)refused;

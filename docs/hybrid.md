@@ -130,3 +130,49 @@ for a 5-token batched chunk on the 27B (docs/npu-leaderboard.md, record
 hybrid row is a **measured loss**, not a route waiting for a benchmark: at 58 s per chunk the handoff
 adds minutes where the backend needs 95 ms. It stays marked "not at this pin" in engine#612 until a
 real provider lands; quote that provider's own prefill figure when it does.
+
+## Running beside the GPU
+
+Hybrid is the one route that needs the NPU and the iGPU at the same time: the provider prefills on the
+NPU while the llama-server decodes on `HRX0`. That used to be blocked by fleet policy -- every NPU run
+was serialised behind the GPU queue -- on the strength of a third-party report (halogen-flash-server
+0.16, 2026-10-02, never reproduced here) that concurrent GPU+NPU work could hang the box or corrupt NPU
+results while the GPU fabric clock (FCLK) changed level. **It was measured on strixhalo and it does not
+reproduce.** The fleet no longer serialises NPU work behind the GPU: an NPU run takes the NPU device
+lock (`/tmp/1bit-npu-device.lock`) and nothing else, and arena scoring carries a "GPU busy" column
+instead of demanding an idle box.
+
+What was run: 40 reps of the arena GU oracle (`~/wt/npu-arena/oracle.sh GU`, the b8 pre-blocked-B
+leader rebuilt from source each time, byte-exact int32 on seeds 1-3 plus a median of 5 launches) in
+four cells -- GPU idle or busy, FCLK `auto` or held at the top level (`manual` + top `pp_dpm_fclk`) --
+5 reps per cell in two independent passes. The GPU load was HRX `llama-bench` on Qwen3-4B-Q4_K_M,
+pp512/tg128 looping (34-52 bench rows per busy cell, so it ran throughout), started 20 s before the
+NPU reps. FCLK level, Tctl and GPU busy% were sampled at 1 Hz through every cell.
+
+| GPU | FCLK | ms/launch, median of 5 (two passes) | GB/s (two passes) | byte-exact | resets/MODE2 |
+|---|---|---|---|---|---|
+| idle | auto | 10.52 / 10.79 | 8.47 / 8.26 | 10/10 PASS | 0 |
+| idle | held | 10.76 / 10.92 | 8.29 / 8.16 | 10/10 PASS | 0 |
+| busy | auto | **12.04 / 12.04** | **7.40 / 7.40** | 10/10 PASS | 0 |
+| busy | held | 10.85 / 12.01 | 8.22 / 7.42 | 10/10 PASS | 0 |
+
+- **160 byte-exact checks, all PASS, and zero** amdgpu `GPU reset` / `MODE2` / ring-timeout lines in
+  `journalctl -k` in any cell of either pass. The fabric clock demonstrably changed level *during* NPU
+  runs in the auto cells (18 one-second samples at level 7 against 50 at level 6 in one busy cell).
+- Kernel `7.3.0-rc4-1bit-perfopt+`, SMU firmware `0x0a640700` (100.7.0), DMUB `0x09003F00`, device
+  `0x1586` (Radeon 8060S), BIOS 1.09 (2026-05-08). That is the hardware/firmware pair this verdict is
+  for; a vendor report about other firmware is neither confirmed nor denied by it.
+- **The number to plan hybrid around is the busy-GPU stream cost: a GPU-busy NPU stream keeps ~87 % of
+  its bandwidth**, 7.40 GB/s against 8.2-8.5 idle (per launch 10.5-10.9 ms -> 12.0 ms), and it is
+  7.40 to two decimals in both passes. Budget the provider at ~13 % below its solo figure while the
+  decoder is working.
+- **FCLK does not buy that back, and an earlier claim of ours that it did is retracted.** One pass had
+  the hold removing the penalty (10.85 ms held against 12.04 auto); the second had no difference at all
+  (12.01 against 12.04). The effect is inside the run-to-run spread. Setting the vendor hold
+  (`power_dpm_force_performance_level=manual` + top `pp_dpm_fclk`) is not a safety fix and not a
+  reliable bandwidth fix; it is a preference.
+
+Caveats worth keeping: the GPU load was weight-streaming `pp512`, not a decode loop or a render; each
+cell is a couple of minutes of NPU time, not a soak; and this is one kernel/firmware pair. A long
+concurrent run with a real provider is still the last unmeasured thing on this route -- but nothing in
+the fleet needs to serialise NPU behind GPU while waiting for it.

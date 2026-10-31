@@ -26,11 +26,13 @@
 // compared only where both do the same work (see docs/onnx.md, "Qwen3-0.6B").
 
 #include <fcntl.h>
+#include <sys/stat.h>
 #include <unistd.h>
 
 #include <onnxruntime_c_api.h>
 
 #include <algorithm>
+#include <cctype>
 #include <chrono>
 #include <cmath>
 #include <cstdio>
@@ -114,8 +116,57 @@ struct Args {
     int steps = 8;
     const char* dump = nullptr;
     bool mask = true;
+    bool cached = false;
     int threads = 1;
+    // AMD's benchmark protocol (Ryzen AI docs, npu_oga.html): -l prompt lengths, -g tokens to
+    // generate, -w warmup runs, -r repeats. The defaults are theirs, so the block we print is
+    // directly comparable with model_benchmark.exe output.
+    bool bench = false;
+    std::vector<int64_t> lens;
+    int gen = 128;
+    int warmup = 1;
+    int repeat = 5;
 };
+
+// Timing samples from one generation run: one TTFT, one entry per decode step, one per argmax.
+struct RunStats {
+    double ttft_ms = 0.0;
+    double e2e_ms = 0.0;
+    std::vector<double> token_ms;
+    std::vector<double> sample_ms;
+};
+
+struct Stat {
+    double avg = 0.0, p50 = 0.0, sd = 0.0;
+    size_t n = 0;
+};
+
+Stat stat_of(std::vector<double> v) {
+    Stat s;
+    s.n = v.size();
+    if (v.empty()) return s;
+    for (double x : v) s.avg += x;
+    s.avg /= (double)v.size();
+    std::sort(v.begin(), v.end());
+    s.p50 = v[v.size() / 2];
+    double var = 0.0;
+    for (double x : v) var += (x - s.avg) * (x - s.avg);
+    s.sd = std::sqrt(var / (double)v.size());  // population: these are all the samples there are
+    return s;
+}
+
+std::vector<int64_t> parse_lens(const char* p) {
+    std::vector<int64_t> out;
+    while (*p) {
+        char* end = nullptr;
+        const long v = std::strtol(p, &end, 10);
+        if (end == p) break;
+        out.push_back(v);
+        p = end;
+        while (*p == ' ' || *p == ',') ++p;
+    }
+    return out;
+}
 
 bool parse_args(int argc, char** argv, Args* a) {
     for (int i = 1; i < argc; ++i) {
@@ -127,6 +178,12 @@ bool parse_args(int argc, char** argv, Args* a) {
         else if (arg == "--dump-logits" && more) a->dump = argv[++i];
         else if (arg == "--threads" && more) a->threads = std::atoi(argv[++i]);
         else if (arg == "--no-mask") a->mask = false;
+        else if (arg == "--cached") a->cached = true;
+        else if (arg == "--bench") a->bench = true;
+        else if (arg == "--lens" && more) a->lens = parse_lens(argv[++i]);
+        else if (arg == "--gen" && more) a->gen = std::atoi(argv[++i]);
+        else if (arg == "--warmup" && more) a->warmup = std::atoi(argv[++i]);
+        else if (arg == "--repeat" && more) a->repeat = std::atoi(argv[++i]);
         else if (arg == "--ids" && more) {
             const char* p = argv[++i];
             while (*p) {
@@ -142,15 +199,35 @@ bool parse_args(int argc, char** argv, Args* a) {
             return false;
         }
     }
-    if (!a->model || a->ids.empty()) {
+    if (a->lens.empty()) a->lens = {2048, 1024, 512, 256, 128};  // AMD's default sweep
+    if (!a->model || (a->ids.empty() && !a->bench)) {
         std::fprintf(stderr,
                      "usage: ort-run --model <file.onnx> [--ep <lib.so>]... --ids \"<id> <id>\"\n"
-                     "               [-n N] [--dump-logits DIR] [--no-mask] [--threads N]\n"
+                     "               [-n N] [--dump-logits DIR] [--no-mask] [--threads N] [--cached]\n"
+                     "       ort-run --model <cached.onnx> --cached --bench [--lens \"2048,1024,512,256,128\"]\n"
+                     "               [--gen 128] [--warmup 1] [--repeat 5]\n"
+                     "       --bench prints AMD's model_benchmark.exe block (avg/p50/stddev per stage) so\n"
+                     "       the numbers sit next to their Ryzen AI runs; it needs a --cached graph.\n"
                      "       --ep may be repeated: the EPs are registered in the order given and the\n"
                      "       CPU EP is always appended last (docs/onnx.md, \"Two engines\").\n");
         return false;
     }
     return true;
+}
+
+// A dumped logits row is model output, so it is not created world-readable (tools/moe_trace.cpp
+// uses the same shape).
+int dump_row(const float* p, size_t count, int64_t vocab, const char* dir, int step) {
+    if (!dir || count < (size_t)vocab) return 0;
+    ::mkdir(dir, 0700);  // EEXIST is the normal case; a missing dir would silently drop every row
+    char path[512];
+    std::snprintf(path, sizeof(path), "%s/logits_%03d.bin", dir, step);
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
+    FILE* f = fd >= 0 ? ::fdopen(fd, "wb") : nullptr;
+    if (!f) return 0;
+    std::fwrite(p + (count - (size_t)vocab), sizeof(float), (size_t)vocab, f);
+    std::fclose(f);
+    return 0;
 }
 
 // The logits row of the last position: that is the distribution the next token comes from.
@@ -195,7 +272,196 @@ int run_step(OrtSession* session, OrtMemoryInfo* mi, const std::vector<int64_t>&
     return 0;
 }
 
+// Cached decode: the graph holds the KV cache, so the host stops feeding the prefix. Interface is
+// fixed to what onnx/export_qwen3.py --cached emits: `past` and `present` are each ONE stacked
+// (2*n_layers, 1, kv_heads, past, head_dim) tensor, so the loop carries a single OrtValue.
+int run_cached(OrtSession* session, OrtMemoryInfo* mi, const Args& a, RunStats* stats = nullptr) {
+    const char* in_n[] = {"input_ids", "past"};  // no mask/positions: the graph derives both
+    const char* out_n[] = {"logits", "present"};
+
+    OrtTypeInfo* ti = nullptr;
+    if (OrtStatus* st = api->SessionGetInputTypeInfo(session, 1, &ti)) return fail("past type", st);
+    const OrtTensorTypeAndShapeInfo* si = nullptr;
+    if (OrtStatus* st = api->CastTypeInfoToTensorInfo(ti, &si)) api->ReleaseStatus(st);
+    int64_t stacked[5] = {0, 0, 0, 0, 0};
+    size_t rank = 0;
+    if (si && !api->GetDimensionsCount(si, &rank) && rank == 5) api->GetDimensions(si, stacked, 5);
+    api->ReleaseTypeInfo(ti);
+    if (rank != 5) {
+        std::fprintf(stderr, "onebit-ort-run: FAIL `past` is not 5-D: not a cached graph\n");
+        return 2;
+    }
+    const int64_t n_kv = stacked[2], head_dim = stacked[4];
+
+    // Prefill has no past: the same stack with a zero-length sequence axis.
+    float dummy = 0.f;
+    const int64_t empty[5] = {stacked[0], stacked[1], n_kv, 0, head_dim};
+    OrtValue* past = nullptr;
+    if (OrtStatus* st = api->CreateTensorWithDataAsOrtValue(
+            mi, &dummy, 0, empty, 5, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, &past))
+        return fail("empty cache", st);
+
+    std::vector<int64_t> step_ids = a.ids;
+    std::vector<int64_t> gen;
+    std::vector<int64_t> shape;
+    int64_t vocab = 0;
+    double prefill_ms = 0.0, decode_ms = 0.0;
+    int rc = 0;
+
+    for (int step = -1; step < a.steps && !rc; ++step) {
+        const int64_t seq = (int64_t)step_ids.size();
+        const int64_t dims_ids[2] = {1, seq};
+
+        OrtValue* v_ids = nullptr;
+        OrtStatus* st = api->CreateTensorWithDataAsOrtValue(
+            mi, step_ids.data(), sizeof(int64_t) * step_ids.size(), dims_ids, 2,
+            ONNX_TENSOR_ELEMENT_DATA_TYPE_INT64, &v_ids);
+        OrtValue* outs[2] = {nullptr, nullptr};
+        if (!st) {
+            const OrtValue* vals[2] = {v_ids, past};
+            const auto s0 = std::chrono::steady_clock::now();
+            st = api->Run(session, nullptr, in_n, vals, 2, out_n, 2, outs);
+            const auto s1 = std::chrono::steady_clock::now();
+            const double dt = std::chrono::duration<double, std::milli>(s1 - s0).count();
+            if (!st) {
+                if (step < 0) prefill_ms = dt;
+                else {
+                    decode_ms += dt;
+                    if (stats) stats->token_ms.push_back(dt);
+                }
+                OrtTensorTypeAndShapeInfo* info = nullptr;
+                if (OrtStatus* s = api->GetTensorTypeAndShape(outs[0], &info)) {
+                    rc = fail("logits shape", s);
+                } else {
+                    size_t lrank = 0;
+                    api->GetDimensionsCount(info, &lrank);
+                    shape.assign(lrank, 0);
+                    api->GetDimensions(info, shape.data(), lrank);
+                    api->ReleaseTensorTypeAndShapeInfo(info);
+                    vocab = shape.empty() ? 0 : shape.back();
+                    size_t count = 1;
+                    for (int64_t d : shape) count *= (size_t)d;
+                    const float* p = nullptr;
+                    if (OrtStatus* s = api->GetTensorData(outs[0], (const void**)&p)) {
+                        rc = fail("read logits", s);
+                    } else {
+                        dump_row(p, count, vocab, a.dump, step);
+                        const float* row = p + (size_t)vocab * (size_t)(seq - 1);
+                        const auto q0 = std::chrono::steady_clock::now();
+                        int64_t best = 0;
+                        for (int64_t id = 1; id < vocab; ++id)
+                            if (row[id] > row[best]) best = id;
+                        if (stats && step >= 0)
+                            stats->sample_ms.push_back(
+                                std::chrono::duration<double, std::milli>(
+                                    std::chrono::steady_clock::now() - q0).count());
+                        gen.push_back(best);
+                        step_ids.assign(1, best);
+                    }
+                }
+            }
+            // this step's cache is the next step's past; the old one is dead once Run returns
+            api->ReleaseValue(past);
+            past = outs[1];
+            api->ReleaseValue(outs[0]);
+        }
+        api->ReleaseValue(v_ids);
+        if (st) rc = fail("Run", st);
+    }
+
+    api->ReleaseValue(past);
+    if (rc) return rc;
+
+    if (stats) {  // bench mode: hand the samples back and print nothing
+        stats->ttft_ms = prefill_ms;
+        stats->e2e_ms = prefill_ms + decode_ms;
+        return 0;
+    }
+
+    // gen[0] is the prefill's own argmax; the steps after it are the decode steps we time.
+    const size_t decoded = gen.empty() ? 0 : gen.size() - 1;
+    std::printf("  prefill : %zu tokens in %.1f ms (logits [%lld])\n", a.ids.size(), prefill_ms,
+                (long long)vocab);
+    std::printf("  kv      : %lld layers x %lld heads x %lld (%.1f KB/token)\n",
+                (long long)(stacked[0] / 2), (long long)n_kv, (long long)head_dim,
+                (double)stacked[0] * (double)n_kv * (double)head_dim * sizeof(float) / 1024.0);
+    std::printf("  decode  : %zu tokens in %.1f ms (%.2f tok/s, %.2f ms/token)\n", decoded, decode_ms,
+                decode_ms > 0.0 ? 1000.0 * (double)decoded / decode_ms : 0.0,
+                decoded ? decode_ms / (double)decoded : 0.0);
+    std::printf("  ids     :");
+    for (size_t i = 0; i + 1 < gen.size(); ++i) std::printf(" %lld", (long long)gen[i]);
+    std::printf("\n");
+    return 0;
+}
+
 }  // namespace
+
+long peak_rss_bytes() {
+    FILE* f = std::fopen("/proc/self/status", "r");
+    if (!f) return 0;
+    char line[256];
+    long kb = 0;
+    while (std::fgets(line, sizeof line, f))
+        if (std::strncmp(line, "VmHWM:", 6) == 0) {
+            kb = std::atol(line + 6);
+            break;
+        }
+    std::fclose(f);
+    return kb * 1024L;
+}
+
+// AMD's model_benchmark.exe block: same stages, same statistics, same defaults (-l/-g/-w/-r), so the
+// two outputs are read side by side without translation. Each repeat restarts from a zero-length
+// cache, which is their repeat loop resetting the OGA generator.
+int bench_amd(OrtSession* session, OrtMemoryInfo* mi, const Args& a) {
+    std::printf("-----------------------------\n");
+    for (size_t li = 0; li < a.lens.size(); ++li) {
+        const int64_t L = a.lens[li];
+        Args one = a;
+        one.steps = a.gen > 0 ? a.gen : 1;
+        one.dump = nullptr;
+        one.ids.assign((size_t)L, 0);
+        // Deterministic filler that exists in every model of AMD's set (Phi-3's vocab is 32064).
+        // They feed prompts.txt; for timing only the token count matters.
+        for (int64_t i = 0; i < L; ++i) one.ids[(size_t)i] = 100 + (i * 7919) % 30000;
+
+        std::vector<double> ttft_us, tok_us, sample_us, e2e_ms;
+        for (int i = 0; i < a.warmup + a.repeat; ++i) {
+            RunStats s;
+            if (const int rc = run_cached(session, mi, one, &s)) return rc;
+            if (i < a.warmup) continue;
+            ttft_us.push_back(s.ttft_ms * 1000.0);
+            e2e_ms.push_back(s.e2e_ms);
+            for (double ms : s.token_ms) tok_us.push_back(ms * 1000.0);
+            for (double ms : s.sample_ms) sample_us.push_back(ms * 1000.0);
+        }
+
+        const Stat t = stat_of(ttft_us), g = stat_of(tok_us), q = stat_of(sample_us);
+        const Stat e = stat_of(e2e_ms);
+        std::printf("Prompt\n  Number of Tokens: %lld\n", (long long)L);
+        std::printf("Batch size: 1, prompt tokens: %lld, tokens to generate: %d\n", (long long)L,
+                    one.steps);
+        std::printf("  Prompt processing (time to first token):\n");
+        std::printf("      avg (us): %.0f  avg (tokens/s): %.3f  p50 (us): %.0f  stddev (us): %.0f"
+                    "  n: %zu * %lld token(s)\n",
+                    t.avg, t.avg > 0.0 ? 1e6 * (double)L / t.avg : 0.0, t.p50, t.sd, t.n,
+                    (long long)L);
+        std::printf("  Token generation:\n");
+        std::printf("      avg (us): %.1f  avg (tokens/s): %.4f  p50 (us): %.1f  stddev (us): %.1f"
+                    "  n: %zu * 1 token(s)\n",
+                    g.avg, g.avg > 0.0 ? 1e6 / g.avg : 0.0, g.p50, g.sd, g.n);
+        std::printf("  Token sampling:\n");
+        std::printf("      avg (us): %.3f  avg (tokens/s): %.2f  p50 (us): %.3f  stddev (us): %.3f"
+                    "  n: %zu * 1 token(s)\n",
+                    q.avg, q.avg > 0.0 ? 1e6 / q.avg : 0.0, q.p50, q.sd, q.n);
+        std::printf("  E2E generation (entire generation loop):\n");
+        std::printf("      avg (ms): %.2f  p50 (ms): %.2f  stddev (ms): %.2f  n: %zu\n", e.avg,
+                    e.p50, e.sd, e.n);
+        std::printf("-----------------------------\n");
+    }
+    std::printf("Peak working set size (bytes): %ld\n", peak_rss_bytes());
+    return 0;
+}
 
 int onebit_ort_run_main(int argc, char** argv) {
     Args a;
@@ -233,6 +499,30 @@ int onebit_ort_run_main(int argc, char** argv) {
         std::printf("  ep%-6zu: %s\n", i + 1, a.eps[i]);
     if (a.eps.empty()) std::printf("  ep      : (CPU only)\n");
 
+    if (a.bench) {
+        if (!a.cached) {
+            std::fprintf(stderr,
+                         "onebit-ort-run: --bench needs a --cached graph (export_qwen3.py --cached)\n");
+            api->ReleaseSession(session);
+            api->ReleaseMemoryInfo(mi);
+            api->ReleaseEnv(env);
+            return 2;
+        }
+        const int rc = bench_amd(session, mi, a);
+        api->ReleaseSession(session);
+        api->ReleaseMemoryInfo(mi);
+        api->ReleaseEnv(env);
+        return rc;
+    }
+
+    if (a.cached) {
+        const int rc = run_cached(session, mi, a);
+        api->ReleaseSession(session);
+        api->ReleaseMemoryInfo(mi);
+        api->ReleaseEnv(env);
+        return rc;
+    }
+
     // Prefill, then greedy steps: each step re-runs the whole sequence (no KV cache in this graph),
     // so the loop time grows with the sequence. The printed rate is per decode step, measured over
     // the steps themselves, not over the prefill.
@@ -253,21 +543,9 @@ int onebit_ort_run_main(int argc, char** argv) {
         if (!a.dump) return;
         size_t count = 1;
         for (int64_t d : shape) count *= (size_t)d;
-        if (count < (size_t)vocab) return;
         const float* p = nullptr;
-        if (OrtStatus* st = api->GetTensorData(logits, (const void**)&p)) {
-            api->ReleaseStatus(st);
-            return;
-        }
-        char path[512];
-        std::snprintf(path, sizeof(path), "%s/logits_%03d.bin", a.dump, step);
-        // open-then-fdopen, the shape the rest of the engine uses (tools/moe_trace.cpp), with 0600:
-        // a dumped logits row is model output, so it is not created world-readable.
-        const int fd = ::open(path, O_WRONLY | O_CREAT | O_TRUNC | O_CLOEXEC, 0600);
-        if (FILE* f = fd >= 0 ? ::fdopen(fd, "wb") : nullptr) {
-            std::fwrite(p + (count - (size_t)vocab), sizeof(float), (size_t)vocab, f);
-            std::fclose(f);
-        }
+        if (count < (size_t)vocab || api->GetTensorData(logits, (const void**)&p)) return;
+        dump_row(p, count, vocab, a.dump, step);
     };
     dump(-1);
 

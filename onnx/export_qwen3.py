@@ -46,9 +46,14 @@ def main() -> int:
     ap.add_argument("--model-dir", required=True, help="HF directory with config.json + weights")
     ap.add_argument("--out", required=True, help="output .onnx path")
     ap.add_argument("--seq-len", type=int, default=8, help="trace length (axis is dynamic)")
-    # torch's torchscript exporter tops out at opset 20; asking for 21 only warns and exports 20.
-    ap.add_argument("--opset", type=int, default=20)
+    # The dynamo exporter emits opset 21+; the TorchScript one tops out at 20.
+    ap.add_argument("--opset", type=int, default=21)
     ap.add_argument("--check", action="store_true", help="census the exported graph")
+    ap.add_argument(
+        "--cached",
+        action="store_true",
+        help="export past/present KV inputs: incremental decode instead of re-running the prefix",
+    )
     ap.add_argument(
         "--keep-spill", action="store_true", help="leave torch's per-tensor weight files in place"
     )
@@ -56,6 +61,7 @@ def main() -> int:
 
     import torch
     from transformers import AutoModelForCausalLM
+    from transformers.cache_utils import DynamicCache
 
     # eager attention: sdpa traces into ops that are not plain MatMul and would hide the matmuls
     # from the EP's support query.
@@ -64,43 +70,100 @@ def main() -> int:
     )
     model.eval()
 
-    class Logits(torch.nn.Module):
-        def __init__(self, inner):
-            super().__init__()
-            self.inner = inner
+    n_layers = model.config.num_hidden_layers
+    n_kv = model.config.num_key_value_heads
+    head_dim = getattr(model.config, "head_dim", None) or (
+        model.config.hidden_size // model.config.num_attention_heads
+    )
+    if args.cached:
+        # One token in, one KV step appended. past=2 when tracing only fixes the shape family;
+        # the axis stays symbolic, so 0 (prefill) and 4096 (long context) trace the same graph.
+        past_len, seq = 2, 1
 
-        def forward(self, input_ids, attention_mask):
-            return self.inner(
-                input_ids=input_ids, attention_mask=attention_mask, use_cache=False
-            ).logits
+        class Cached(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
 
-    wrapper = Logits(model).eval()
-    ids = torch.ones((1, args.seq_len), dtype=torch.long)
-    mask = torch.ones((1, args.seq_len), dtype=torch.long)
+            def forward(self, input_ids, past):
+                # ONE stacked cache (2*n_layers, 1, kv_heads, past, head_dim) instead of 56 named
+                # inputs: dynamo cannot place 56 cache axes against its argument tree, and the
+                # runner then carries one tensor through instead of a per-layer name map.
+                # No attention_mask or position_ids: with past=0 the traced mask path expands a
+                # zero-length axis and ONNX Runtime rejects the shape, and for one contiguous
+                # sequence both are derivable from the cache length anyway.
+                tensors = past.unbind(0)
+                cache = DynamicCache(
+                    [(tensors[2 * i], tensors[2 * i + 1]) for i in range(n_layers)]
+                )
+                out = self.inner(
+                    input_ids=input_ids, past_key_values=cache, use_cache=True
+                )
+                return out.logits, torch.stack(
+                    [t for pair in out.past_key_values.to_legacy_cache() for t in pair]
+                )
+
+        wrapper = Cached(model).eval()
+        inputs = (
+            torch.ones((1, seq), dtype=torch.long),
+            torch.zeros((2 * n_layers, 1, n_kv, past_len, head_dim)),
+        )
+        input_names = ["input_ids", "past"]
+        output_names = ["logits", "present"]
+        # dynamic_shapes directly: the dynamic_axes compat shim cannot line a per-layer cache up with
+        # the argument tree, and a stacked cache needs exactly one dynamic axis anyway.
+        dim = torch.export.Dim.DYNAMIC
+        dynamic_shapes = ({1: dim}, {3: dim})
+        dynamic_axes = None
+    else:
+
+        class Logits(torch.nn.Module):
+            def __init__(self, inner):
+                super().__init__()
+                self.inner = inner
+
+            def forward(self, input_ids, attention_mask):
+                return self.inner(
+                    input_ids=input_ids, attention_mask=attention_mask, use_cache=False
+                ).logits
+
+        wrapper = Logits(model).eval()
+        inputs = (
+            torch.ones((1, args.seq_len), dtype=torch.long),
+            torch.ones((1, args.seq_len), dtype=torch.long),
+        )
+        input_names = ["input_ids", "attention_mask"]
+        output_names = ["logits"]
+        dynamic_shapes = None
+        dynamic_axes = {
+            "input_ids": {1: "seq"},
+            "attention_mask": {1: "seq"},
+            "logits": {1: "seq"},
+        }
 
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     with torch.no_grad():
         torch.onnx.export(
             wrapper,
-            (ids, mask),
+            inputs,
             args.out,
-            input_names=["input_ids", "attention_mask"],
-            output_names=["logits"],
-            dynamic_axes={
-                "input_ids": {1: "seq"},
-                "attention_mask": {1: "seq"},
-                "logits": {1: "seq"},
-            },
+            input_names=input_names,
+            output_names=output_names,
+            dynamic_axes=dynamic_axes,
+            dynamic_shapes=dynamic_shapes,
             opset_version=args.opset,
             do_constant_folding=True,
-            dynamo=False,
+            # dynamo, not TorchScript: transformers' mask construction vmaps (masking_utils.py),
+            # and the TorchScript exporter aborts on it with "unordered_map::at".
+            dynamo=True,
             # A 0.6B fp32 model is 3 GB of weights; protobuf caps a single file at 2 GB, and the
             # per-tensor spill files torch writes otherwise have no stable name to ship.
             external_data=True,
         )
-    # torch spills every large initializer into its own file next to the model (one per tensor,
-    # named after it). Repack into a single sidecar: one file to copy, one file ORT loads, and the
-    # per-tensor names never leak into the artifact.
+    # The TorchScript exporter spills every large initializer into its own file next to the model
+    # (one per tensor, named after it). Repack those into a single sidecar. The dynamo exporter
+    # already writes exactly one `<model>.data`, and re-saving that path appends to the file it is
+    # reading (2.38 GB became 4.77 GB), so only repack when the spills are something else.
     import onnx
 
     proto = onnx.load(args.out, load_external_data=False)
@@ -112,7 +175,7 @@ def main() -> int:
         if e.key == "location"
     }
     sidecar = os.path.basename(args.out) + ".data"
-    if spills or not args.keep_spill:
+    if spills != {sidecar} and spills and not args.keep_spill:
         model = onnx.load(args.out)
         onnx.save_model(
             model,

@@ -199,13 +199,17 @@ A Quark-quantised ONNX model is a *QDQ* graph (`DequantizeLinear` → `MatMul` �
 int8 tensors and float32 scales), and the `MatMul` inside it is the same int8 × int8 → int32 product
 our device kernel already computes. The EP claims the whole group — both `DequantizeLinear` nodes, the
 `MatMul` and the `QuantizeLinear` — as ONE fused node, so the dequantised float tensors are never
-materialised: int8 activations and int8 weights go into the kernel, int8 output comes back with
-`s_x·s_w/s_y` folded into one multiply per element (see
+materialised: int8 activations and int8 weights go into the kernel, int8 output comes back with the
+scales folded into one multiply per element. Per-tensor scales and the two per-axis forms the
+epilogue can fold — `s_w[n]` along the weight's output axis and `s_x[m]` along the activation's row
+axis — are both supported; a per-axis scale along **K** is refused and stays on the per-node path,
+because it weights the products inside the sum (see
 [onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits)). `ctest -R onebit_ep_qdq_proof` checks
-it end to end: int8-identical to the CPU EP (`worst |d| = 0` LSB, also on a 256×1024×1024 case) and
-6144 kB less peak RSS for the run, which is exactly the three float tensors it no longer allocates.
-The control, `ONEBIT_EP_QDQ=0`, runs the same graph through the per-node path and asserts that the
-float kernel — not the fused one — is what ran.
+four cases end to end: per-tensor and per-axis both int8-identical to the CPU EP (`worst |d| = 0`
+LSB, also on a 256×1024×1024 case), the per-K scale refused and correct anyway, and ~6-7 MB less peak
+RSS for the run, which is exactly the three float tensors it no longer allocates. The control,
+`ONEBIT_EP_QDQ=0`, runs the same graph through the per-node path and asserts that the float kernel —
+not the fused one — is what ran.
 
 ## Verifying
 
@@ -220,7 +224,7 @@ Five tests, each proving a different claim:
 | `ort_info` | the binary negotiated OrtApi v23 and can list its EP roster |
 | `onebit_ep_proof` | a two-node graph (`MatMul` then `Relu`) built in memory through the Model Editor API runs with the plugin EP registered first and the CPU EP last, our EP takes the `MatMul` (the trace has a `matmul` line, which only `Compute` can write), and the result matches the CPU EP |
 | `onebit_ep_proof_cpu_fallback` | with `ONEBIT_EP_OPS=none` the same graph is partitioned to the CPU EP (`claimed=0`), so the match above cannot come from the CPU running both sessions |
-| `onebit_ep_qdq_proof` | the four-node A8W8 QDQ group is claimed as one fused node: the trace has a `qdq` line and no `matmul` line, the int8 output is identical to the CPU EP's (`worst |d| = 0` LSB), and the run's peak RSS is 6144 kB smaller than the CPU EP's |
+| `onebit_ep_qdq_proof` | the four-node A8W8 QDQ group is claimed as one fused node: the trace has a `qdq` line and no `matmul` line, the int8 output is identical to the CPU EP's per-tensor and per-axis (`worst |d| = 0` LSB), a per-axis scale along K is refused, and the run's peak RSS is ~6-7 MB smaller than the CPU EP's |
 | `onebit_ep_qdq_proof_unfused` | with `ONEBIT_EP_QDQ=0` the same graph goes through the per-node path (a `matmul` line, no `qdq` line), so the numbers above can only come from the fused kernel |
 
 `onebit_npu_gemm_probe` (NPU builds only) is registered as a fourth test and **skips** when the
@@ -238,9 +242,9 @@ is q, k and v). The device backend is still off by default and is not part of an
 enabling it on a box where another process owns the NPU must stay an explicit decision.
 
 The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
-match, 6144 kB less peak RSS per run). Three things are still open and stay documented as such:
-per-axis scales (the kernel takes one scale per tensor), asymmetric zero points (claiming `zp = 0`
-keeps the arithmetic exact; a non-zero `zp` needs the correction terms folded into the epilogue), and
+match per-tensor and per-axis, ~6-7 MB less peak RSS per run). Two things are still open and stay
+documented as such: asymmetric zero points (claiming `zp = 0` keeps the arithmetic exact when every
+zero point element is zero; a non-zero `zp` needs the correction terms folded into the epilogue), and
 the device leg of the fused path — today its int8 GEMM runs on the host, so a real model's shapes are
 still a CPU-EP story until the NPU kernel takes int8 activations straight into its input BO.
 

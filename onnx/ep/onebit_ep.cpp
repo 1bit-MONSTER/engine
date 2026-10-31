@@ -49,6 +49,9 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <mutex>
+#include <memory>
 #include <vector>
 #include <string>
 
@@ -140,11 +143,15 @@ struct EpAllocator {
     size_t allocs;
     size_t frees;
     size_t bytes;
+    bool used;  // the host holds this slot; F_ReleaseAllocator frees it again
 };
 
+// The host creates one allocator per session and memory info it needs, and releases it when the
+// session goes away, so these are recycled rather than accumulated: a process that opens several
+// sessions (a bench, a model plus a warm-up session) would otherwise run out. Eight live at once is
+// already more than a single-device session ever asks for.
 constexpr size_t kMaxAllocators = 8;
 EpAllocator g_allocators[kMaxAllocators];
-size_t g_num_allocators = 0;
 
 void* ORT_API_CALL A_Alloc(OrtAllocator* self, size_t size) noexcept {
     // 256 bytes, not malloc's 16: ORT's kernels (MLAS) use aligned vector loads on tensor memory and
@@ -169,15 +176,19 @@ const OrtMemoryInfo* ORT_API_CALL A_Info(const OrtAllocator* self) noexcept {
 }
 
 OrtAllocator* new_allocator(const OrtMemoryInfo* mi) {
-    if (g_num_allocators >= kMaxAllocators) return nullptr;
-    EpAllocator* a = &g_allocators[g_num_allocators++];
-    std::memset(a, 0, sizeof(*a));
-    a->mi = mi;
-    a->self.version = ORT_API_VERSION;
-    a->self.Alloc = A_Alloc;
-    a->self.Free = A_Free;
-    a->self.Info = A_Info;
-    return &a->self;
+    for (size_t i = 0; i < kMaxAllocators; ++i) {
+        EpAllocator* a = &g_allocators[i];
+        if (a->used) continue;
+        std::memset(a, 0, sizeof(*a));
+        a->used = true;
+        a->mi = mi;
+        a->self.version = ORT_API_VERSION;
+        a->self.Alloc = A_Alloc;
+        a->self.Free = A_Free;
+        a->self.Info = A_Info;
+        return &a->self;
+    }
+    return nullptr;
 }
 
 // ------------------------------------------------------------------------- data transfer (must exist)
@@ -226,27 +237,252 @@ OrtStatus* ORT_API_CALL C_CreateState(OrtNodeComputeInfo*, OrtNodeComputeContext
 
 void ORT_API_CALL C_ReleaseState(OrtNodeComputeInfo*, void*) noexcept {}
 
-// Reads a rank-2/rank-3 float tensor's dims. Anything else is refused rather than guessed at: a
-// wrong shape here corrupts the graph silently, which is worse than a session that fails to load.
-OrtStatus* tensor_dims(const OrtValue* v, int64_t dims[3], size_t* rank) {
+// Reads a rank-2/rank-3 tensor's dims, refusing any other element type. Anything else is refused
+// rather than guessed at: a wrong shape or type here corrupts the graph silently, which is worse
+// than a session that fails to load.
+OrtStatus* tensor_dims(const OrtValue* v, ONNXTensorElementDataType want, int64_t dims[3],
+                       size_t* rank) {
     OrtTensorTypeAndShapeInfo* info = nullptr;
     if (OrtStatus* st = g_api->GetTensorTypeAndShape(v, &info)) return st;
     ONNXTensorElementDataType type = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     OrtStatus* st = g_api->GetTensorElementType(info, &type);
-    if (!st && type != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) {
+    if (!st && type != want) {
         st = g_api->CreateStatus(ORT_NOT_IMPLEMENTED,
-                                 "onebit_ep: only float32 tensors are supported yet");
+                                 "onebit_ep: tensor element type not supported by this kernel");
     }
     size_t ndim = 0;
     if (!st) st = g_api->GetDimensionsCount(info, &ndim);
     if (!st && (ndim < 2 || ndim > 3)) {
         st = g_api->CreateStatus(ORT_NOT_IMPLEMENTED,
-                                 "onebit_ep: only rank-2 and rank-3 MatMul are supported yet");
+                                 "onebit_ep: only rank-2 and rank-3 tensors are supported yet");
     }
     if (!st) st = g_api->GetDimensions(info, dims, ndim);
     if (!st) *rank = ndim;
     g_api->ReleaseTensorTypeAndShapeInfo(info);
     return st;
+}
+
+// ------------------------------------------------------------- graph introspection helpers
+
+// Everything below reads nodes and values out of the graph's type information. Each helper swallows
+// the OrtStatus instead of propagating it: a claim decision is a boolean, and a value with no type
+// information is simply one this EP cannot run.
+bool node_inputs(const OrtNode* node, std::vector<const OrtValueInfo*>* out) {
+    size_t n = 0;
+    if (OrtStatus* st = g_api->Node_GetNumInputs(node, &n)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    out->assign(n ? n : 1, nullptr);
+    if (OrtStatus* st = g_api->Node_GetInputs(node, out->data(), n)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    out->resize(n);
+    return true;
+}
+
+bool node_outputs(const OrtNode* node, std::vector<const OrtValueInfo*>* out) {
+    size_t n = 0;
+    if (OrtStatus* st = g_api->Node_GetNumOutputs(node, &n)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    out->assign(n ? n : 1, nullptr);
+    if (OrtStatus* st = g_api->Node_GetOutputs(node, out->data(), n)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    out->resize(n);
+    return true;
+}
+
+std::string node_op(const OrtNode* node) {
+    const char* op = nullptr;
+    if (OrtStatus* st = g_api->Node_GetOperatorType(node, &op)) {
+        g_api->ReleaseStatus(st);
+        return {};
+    }
+    return op ? op : "";
+}
+
+std::string node_name(const OrtNode* node) {
+    const char* name = nullptr;
+    if (OrtStatus* st = g_api->Node_GetName(node, &name)) {
+        g_api->ReleaseStatus(st);
+        return {};
+    }
+    return name ? name : "";
+}
+
+bool onnx_domain(const OrtNode* node) {
+    const char* domain = nullptr;
+    if (OrtStatus* st = g_api->Node_GetDomain(node, &domain)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    return !domain || !*domain || std::strcmp(domain, "ai.onnx") == 0;
+}
+
+std::string value_name(const OrtValueInfo* v) {
+    const char* name = nullptr;
+    if (OrtStatus* st = g_api->GetValueInfoName(v, &name)) {
+        g_api->ReleaseStatus(st);
+        return {};
+    }
+    return name ? name : "";
+}
+
+bool value_rank_type(const OrtValueInfo* v, ONNXTensorElementDataType* elem, size_t* rank) {
+    const OrtTypeInfo* ti = nullptr;
+    if (OrtStatus* st = g_api->GetValueInfoTypeInfo(v, &ti)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    const OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (OrtStatus* st = g_api->CastTypeInfoToTensorInfo(ti, &tsi)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!tsi) return false;
+    OrtStatus* e_st = g_api->GetTensorElementType(tsi, elem);
+    OrtStatus* r_st = g_api->GetDimensionsCount(tsi, rank);
+    if (e_st) g_api->ReleaseStatus(e_st);
+    if (r_st) g_api->ReleaseStatus(r_st);
+    return e_st == nullptr && r_st == nullptr;
+}
+
+// The value's dimensions, with -1 for every symbolic one.
+bool value_dims(const OrtValueInfo* v, std::vector<int64_t>* dims) {
+    const OrtTypeInfo* ti = nullptr;
+    if (OrtStatus* st = g_api->GetValueInfoTypeInfo(v, &ti)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    const OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (OrtStatus* st = g_api->CastTypeInfoToTensorInfo(ti, &tsi)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!tsi) return false;
+    size_t rank = 0;
+    if (OrtStatus* st = g_api->GetDimensionsCount(tsi, &rank)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    std::vector<int64_t> raw(rank, -1);
+    if (OrtStatus* st = g_api->GetDimensions(tsi, raw.data(), rank)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    *dims = std::move(raw);
+    return true;
+}
+
+// A value's constant data when it is an initializer. The OrtValue belongs to the graph (it dies with
+// it), so this is a look, never a cache: callers read what they need and keep nothing.
+const OrtValue* initializer(const OrtValueInfo* v) {
+    const OrtValue* value = nullptr;
+    if (OrtStatus* st = g_api->ValueInfo_GetInitializerValue(v, &value)) {
+        g_api->ReleaseStatus(st);
+        return nullptr;
+    }
+    return value;
+}
+
+// A per-tensor scale: a float initializer holding exactly one number.
+bool float_scalar_init(const OrtValueInfo* v) {
+    ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    size_t rank = 0;
+    if (!value_rank_type(v, &elem, &rank)) return false;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT || rank != 0) return false;
+    return initializer(v) != nullptr;
+}
+
+// How many values a zero point contributes, or -1 when it cannot be folded. A zero point folds when
+// it is a scalar, or a 1-D vector along the same axis its operand's epilogue term uses (the rows for
+// the activation, the output columns for the weight) -- the axes the scales use too, which is also
+// what ONNX requires of a per-axis zero point. A zero point along K would weight the products inside
+// the sum (one column-weighted vector of the weight, which no kernel here precomputes), so a graph
+// with one keeps the per-node path.
+int64_t zp_count(const OrtValueInfo* v, int64_t axis, int64_t required_axis, int64_t expected_len) {
+    ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    size_t rank = 0;
+    if (!value_rank_type(v, &elem, &rank)) return -1;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return -1;
+    if (!initializer(v)) return -1;
+    if (rank == 0) return 1;
+    if (rank != 1) return -1;
+    std::vector<int64_t> dims;
+    if (!value_dims(v, &dims) || dims.size() != 1 || dims[0] <= 0) return -1;
+    if (dims[0] == 1) return 1;
+    if (axis != required_axis) return -1;
+    if (expected_len > 0 && dims[0] != expected_len) return -1;
+    return dims[0];
+}
+
+// The elements of an int8 initializer, or nullptr. Used at Compile to decide whether a zero point is
+// worth folding at all and, if so, to compute the weight's column sums.
+const int8_t* int8_init_data(const OrtValueInfo* v, size_t* count) {
+    const OrtValue* value = initializer(v);
+    if (!value) return nullptr;
+    OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (OrtStatus* st = g_api->GetTensorTypeAndShape(value, &tsi)) {
+        g_api->ReleaseStatus(st);
+        return nullptr;
+    }
+    size_t n = 0;
+    OrtStatus* c_st = g_api->GetTensorShapeElementCount(tsi, &n);
+    g_api->ReleaseTensorTypeAndShapeInfo(tsi);
+    if (c_st) {
+        g_api->ReleaseStatus(c_st);
+        return nullptr;
+    }
+    const int8_t* data = nullptr;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(value), (void**)&data)) {
+        g_api->ReleaseStatus(st);
+        return nullptr;
+    }
+    *count = n;
+    return data;
+}
+
+// How many values a scale input holds: 1 for a scalar, the axis length for a per-axis vector.
+int64_t scale_count(const OrtValueInfo* v) {
+    std::vector<int64_t> dims;
+    if (!value_dims(v, &dims)) return 0;
+    if (dims.empty()) return 1;
+    if (dims.size() == 1 && dims[0] > 0) return dims[0];
+    return 0;
+}
+
+// How many values a zero point input holds. Unlike a scale it can be absent, which is 1 (zero).
+int64_t zp_element_count(const OrtValueInfo* v) {
+    const int64_t n = scale_count(v);
+    return n > 0 ? n : 1;
+}
+
+// The producer of a value and the output index it comes from, or nullptr.
+const OrtNode* producer(const OrtValueInfo* v, size_t* out_index) {
+    const OrtNode* node = nullptr;
+    size_t index = 0;
+    if (OrtStatus* st = g_api->ValueInfo_GetValueProducer(v, &node, &index)) {
+        g_api->ReleaseStatus(st);
+        return nullptr;
+    }
+    if (out_index) *out_index = index;
+    return node;
+}
+
+// Number of nodes that consume this value. A group we fuse must be the only consumer of the values
+// inside it, otherwise fusing removes a value someone else still reads.
+bool sole_consumer(const OrtValueInfo* v) {
+    size_t n = 0;
+    if (OrtStatus* st = g_api->ValueInfo_GetValueNumConsumers(v, &n)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    return n == 1;
 }
 
 OrtStatus* ORT_API_CALL C_Compute(OrtNodeComputeInfo*, void*, OrtKernelContext* ctx) noexcept {
@@ -257,8 +493,8 @@ OrtStatus* ORT_API_CALL C_Compute(OrtNodeComputeInfo*, void*, OrtKernelContext* 
 
     int64_t ad[3] = {0, 0, 0}, bd[3] = {0, 0, 0};
     size_t arank = 0, brank = 0;
-    if (OrtStatus* st = tensor_dims(av, ad, &arank)) return st;
-    if (OrtStatus* st = tensor_dims(bv, bd, &brank)) return st;
+    if (OrtStatus* st = tensor_dims(av, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, ad, &arank)) return st;
+    if (OrtStatus* st = tensor_dims(bv, ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT, bd, &brank)) return st;
 
     // A: [batch..., M, K], B: [batch..., K, N] with at most one of the two batched. The batch dims
     // of A and B must agree when both are present; B rank-2 is the broadcast case (one weight).
@@ -329,80 +565,292 @@ const OrtNodeComputeInfo g_nci = {
     /* ReleaseState */ C_ReleaseState,
 };
 
+// --------------------------------------------------- the fused A8W8 QDQ group (task 1)
+
+// One fused DequantizeLinear -> MatMul -> QuantizeLinear group, as the EP needs it at run time: two
+// int8 tensors and three scales. The float tensors the graph dequantises never exist, so there is
+// nothing else to carry.
+//
+// The initializers stay inputs of the fused node (no drop_constant_initializers), so the weight and
+// the scales are read out of the kernel context by index on every run: ORT owns that memory, it is
+// stable across runs, and the alternative -- copying the weight at Compile -- doubles it for nothing.
+struct QdqPlan {
+    size_t x_index;   // int8 activations [..., M, K]
+    size_t w_index;   // int8 weights [K, N], a constant initializer
+    size_t sx_index;  // float: activation scale, 1 value or one per row
+    size_t sw_index;  // float: weight scale, 1 value or one per output column
+    size_t sy_index;  // float scalar: output scale
+    int64_t k;
+    int64_t n;
+    int64_t sx_count;  // 1 = per-tensor, m = per-row
+    int64_t sw_count;  // 1 = per-tensor, n = per-column
+    // Zero points, same convention. Absent ones are (size_t)-1 with a count of 1 and a value of 0.
+    size_t zx_index;
+    size_t zw_index;
+    size_t zy_index;
+    int64_t zx_count;
+    int64_t zw_count;
+    // sum_k w_q[k][n], the `-zp_x * Sum_k w_q` term of the asymmetric epilogue. Computed on the first
+    // run that needs it and kept: recomputing per run would add O(K*N) to every decode step, and a
+    // symmetric graph never asks for it at all. The mutex is for the first run of two sessions that
+    // share a plan object; after that the vector is read-only.
+    std::mutex colsum_mu;
+    std::vector<int32_t> colsum_w;
+    const int8_t* colsum_source = nullptr;  // the weight these sums were taken from
+};
+
+// Compile runs per claimed node and the EP is a process-wide singleton, so the plans outlive the
+// session that registered them -- the same lifetime the static g_nci has always had.
+std::map<std::string, QdqPlan*> g_plans;  // fused node name -> plan
+std::vector<std::unique_ptr<QdqPlan>> g_plan_storage;
+
+OrtStatus* ORT_API_CALL QC_CreateState(OrtNodeComputeInfo*, OrtNodeComputeContext* context,
+                                       void** state) noexcept {
+    const char* name = g_ep_api->NodeComputeContext_NodeName(context);
+    auto it = name ? g_plans.find(name) : g_plans.end();
+    if (it == g_plans.end()) {
+        *state = nullptr;
+        return g_api->CreateStatus(ORT_FAIL,
+                                   "onebit_ep: a fused QDQ node has no plan (Compile did not see it)");
+    }
+    *state = it->second;
+    return nullptr;
+}
+
+// Reads a scale input as a pointer plus its number of values. ORT owns the memory (the scale stays an
+// input of the fused node), so this is a look, not a copy.
+bool input_scale(const OrtKernelContext* ctx, size_t index, const float** data, int64_t* count) {
+    const OrtValue* v = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetInput(ctx, index, &v)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!v) return false;
+    OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (OrtStatus* st = g_api->GetTensorTypeAndShape(v, &tsi)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    size_t n = 0;
+    OrtStatus* c_st = g_api->GetTensorShapeElementCount(tsi, &n);
+    g_api->ReleaseTensorTypeAndShapeInfo(tsi);
+    if (c_st) {
+        g_api->ReleaseStatus(c_st);
+        return false;
+    }
+    const float* p = nullptr;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(v), (void**)&p)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    *data = p;
+    *count = (int64_t)n;
+    return true;
+}
+
+// Reads an int8 input (a zero point) as a pointer plus its number of values.
+bool input_int8(const OrtKernelContext* ctx, size_t index, const int8_t** data, int64_t* count) {
+    const OrtValue* v = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetInput(ctx, index, &v)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!v) return false;
+    OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (OrtStatus* st = g_api->GetTensorTypeAndShape(v, &tsi)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    size_t n = 0;
+    OrtStatus* c_st = g_api->GetTensorShapeElementCount(tsi, &n);
+    g_api->ReleaseTensorTypeAndShapeInfo(tsi);
+    if (c_st) {
+        g_api->ReleaseStatus(c_st);
+        return false;
+    }
+    const int8_t* p = nullptr;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(v), (void**)&p)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    *data = p;
+    *count = (int64_t)n;
+    return true;
+}
+
+// Reads a float scalar input at run time.
+bool input_scalar(const OrtKernelContext* ctx, size_t index, float* out) {
+    const OrtValue* v = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetInput(ctx, index, &v)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!v) return false;
+    const float* p = nullptr;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(v), (void**)&p)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    *out = *p;
+    return true;
+}
+
+// sum_k w_q[k][n] for this plan's weight, computed once per (plan, weight) and reused. Only called for
+// a non-zero activation zero point: that is the term that makes it free rather than a second pass.
+void ensure_colsum(QdqPlan* plan, const int8_t* w) {
+    std::lock_guard<std::mutex> lock(plan->colsum_mu);
+    if (plan->colsum_source == w && plan->colsum_w.size() == (size_t)plan->n) return;
+    plan->colsum_w.assign((size_t)plan->n, 0);
+    for (int64_t p = 0; p < plan->k; ++p)
+        for (int64_t j = 0; j < plan->n; ++j)
+            plan->colsum_w[(size_t)j] += w[p * plan->n + j];
+    plan->colsum_source = w;
+    tracef("qdq_colsum k=%lld n=%lld", (long long)plan->k, (long long)plan->n);
+}
+
+OrtStatus* ORT_API_CALL QC_Compute(OrtNodeComputeInfo*, void* state, OrtKernelContext* context) noexcept {
+    QdqPlan* plan = (QdqPlan*)state;
+    const OrtValue* av = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetInput(context, plan->x_index, &av)) return st;
+    int64_t ad[3] = {0, 0, 0};
+    size_t arank = 0;
+    if (OrtStatus* st = tensor_dims(av, ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8, ad, &arank)) return st;
+    // Any number of leading dims is a batch here: the multiply only ever sees [rows, K], which is
+    // what a rank-3 activation ([batch, sequence, K]) from a real QDQ graph is.
+    int64_t rows = 1;
+    for (size_t i = 0; i + 1 < arank; ++i) rows *= ad[i];
+    if (ad[arank - 1] != plan->k) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ activation width changed since Compile");
+    }
+    int64_t out_dims[3] = {0, 0, 0};
+    for (size_t i = 0; i + 1 < arank; ++i) out_dims[i] = ad[i];
+    out_dims[arank - 1] = plan->n;
+    OrtValue* out = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetOutput(context, 0, out_dims, arank, &out)) return st;
+
+    const OrtValue* wv = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetInput(context, plan->w_index, &wv)) return st;
+    const int8_t* a = nullptr;
+    const int8_t* w = nullptr;
+    int8_t* y = nullptr;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(av), (void**)&a)) return st;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(wv), (void**)&w)) return st;
+    if (OrtStatus* st = g_api->GetTensorMutableData(out, (void**)&y)) return st;
+    const float* s_x = nullptr;
+    const float* s_w = nullptr;
+    int64_t s_x_count = 0, s_w_count = 0;
+    float s_y = 1.0f;
+    if (!input_scale(context, plan->sx_index, &s_x, &s_x_count) ||
+        !input_scale(context, plan->sw_index, &s_w, &s_w_count) ||
+        !input_scalar(context, plan->sy_index, &s_y)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ scales are unreadable");
+    }
+    if (s_y == 0.0f) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ output scale is zero");
+    }
+    // A per-axis scale has to cover the rows (activation) or the columns (weight) exactly. If the
+    // shape moved under us, fail instead of reading past the end of the vector.
+    if (s_x_count != 1 && s_x_count != rows) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ activation scale does not cover the rows");
+    }
+    if (s_w_count != 1 && s_w_count != plan->n) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ weight scale does not cover the columns");
+    }
+
+    onebit_ep::Q8Epilogue epilogue;
+    epilogue.s_x_row = s_x_count == 1 ? nullptr : s_x;
+    epilogue.s_x = s_x_count == 1 ? s_x[0] : 1.0f;
+    epilogue.s_w_col = s_w_count == 1 ? nullptr : s_w;
+    epilogue.s_w = s_w_count == 1 ? s_w[0] : 1.0f;
+    epilogue.inv_s_y = 1.0f / s_y;
+
+    // Zero points. Read from the kernel context like the scales, and all-zero ones are dropped here so
+    // the kernel's symmetric path stays the one that runs for a symmetric graph.
+    const int8_t* zx = nullptr;
+    const int8_t* zw = nullptr;
+    const int8_t* zy = nullptr;
+    int64_t zx_count = 1, zw_count = 1, zy_count = 1;
+    if (plan->zx_index != (size_t)-1 && !input_int8(context, plan->zx_index, &zx, &zx_count)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ zp_x is unreadable");
+    }
+    if (plan->zw_index != (size_t)-1 && !input_int8(context, plan->zw_index, &zw, &zw_count)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ zp_w is unreadable");
+    }
+    if (plan->zy_index != (size_t)-1 && !input_int8(context, plan->zy_index, &zy, &zy_count)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ zp_y is unreadable");
+    }
+    if (zx_count != 1 && zx_count != rows) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ activation zero point does not cover the rows");
+    }
+    if (zw_count != 1 && zw_count != plan->n) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ weight zero point does not cover the columns");
+    }
+    if (zy) epilogue.zp_y = zy[0];
+    bool zx_nonzero = false;
+    if (zx) {
+        for (int64_t i = 0; i < zx_count; ++i) zx_nonzero = zx_nonzero || zx[i] != 0;
+        if (zx_count == 1) epilogue.zp_x = zx[0];
+        else if (zx_nonzero) epilogue.zp_x_row = zx;
+    }
+    if (zw) {
+        bool nonzero = false;
+        for (int64_t i = 0; i < zw_count; ++i) nonzero = nonzero || zw[i] != 0;
+        if (zw_count == 1) epilogue.zp_w = zw[0];
+        else if (nonzero) epilogue.zp_w_col = zw;
+    }
+    if (epilogue.zp_x != 0 || epilogue.zp_x_row) {
+        ensure_colsum(plan, w);
+        epilogue.colsum_w = plan->colsum_w.data();
+    }
+
+    onebit_ep::gemm_q8(a, w, y, rows, plan->k, plan->n, epilogue);
+    // The int8-in / int8-out line, not the float MatMul one: the proof reads this trace back to
+    // prove which of the two ran.
+    tracef("qdq rows=%lld k=%lld n=%lld sx=%lld sw=%lld zp_x=%lld zp_w=%lld zp_y=%d",
+           (long long)rows, (long long)plan->k, (long long)plan->n, (long long)s_x_count,
+           (long long)s_w_count, (long long)zx_count, (long long)zw_count, (int)epilogue.zp_y);
+    if (verbose()) {
+        std::fprintf(stderr,
+                     "onebit_ep: qdq %lldx%lldx%lld int8 -> int8 (sx=%.9g%s, sw=%.9g%s, zp_x=%d%s, "
+                     "zp_w=%d%s, zp_y=%d)\n",
+                     (long long)rows, (long long)plan->k, (long long)plan->n,
+                     s_x_count == 1 ? s_x[0] : 0.0, s_x_count == 1 ? "" : " per row",
+                     s_w_count == 1 ? s_w[0] : 0.0, s_w_count == 1 ? "" : " per column",
+                     epilogue.zp_x, epilogue.zp_x_row ? " per row" : "", epilogue.zp_w,
+                     epilogue.zp_w_col ? " per column" : "", (int)epilogue.zp_y);
+    }
+    return nullptr;
+}
+
+const OrtNodeComputeInfo g_qdq_nci = {
+    /* ort_version_supported */ ORT_API_VERSION,
+    /* CreateState */ QC_CreateState,
+    /* Compute */ QC_Compute,
+    /* ReleaseState */ C_ReleaseState,
+};
+
 // ----------------------------------------------------------------------------------------- the EP
 
 const char* ORT_API_CALL E_GetName(const OrtEp*) noexcept { return kEpName; }
 
-// The rank and element type of one node input, read from the graph's type information. Symbolic
-// dimensions are fine: only the rank and the type decide what C_Compute can run.
+// The rank and element type of one node input.
 bool input_rank_type(const OrtNode* node, size_t index, ONNXTensorElementDataType* elem,
                      size_t* rank) {
-    size_t n = 0;
-    if (OrtStatus* st = g_api->Node_GetNumInputs(node, &n)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    if (index >= n) return false;
-    std::vector<const OrtValueInfo*> inputs(n, nullptr);
-    if (OrtStatus* st = g_api->Node_GetInputs(node, inputs.data(), n)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    const OrtTypeInfo* ti = nullptr;
-    if (OrtStatus* st = g_api->GetValueInfoTypeInfo(inputs[index], &ti)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    const OrtTensorTypeAndShapeInfo* tsi = nullptr;
-    if (OrtStatus* st = g_api->CastTypeInfoToTensorInfo(ti, &tsi)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    if (!tsi) return false;
-    OrtStatus* e_st = g_api->GetTensorElementType(tsi, elem);
-    OrtStatus* r_st = g_api->GetDimensionsCount(tsi, rank);
-    if (e_st) g_api->ReleaseStatus(e_st);
-    if (r_st) g_api->ReleaseStatus(r_st);
-    return e_st == nullptr && r_st == nullptr;
+    std::vector<const OrtValueInfo*> inputs;
+    if (!node_inputs(node, &inputs) || index >= inputs.size()) return false;
+    return value_rank_type(inputs[index], elem, rank);
 }
 
 // The node input's dimensions, with -1 for every symbolic one.
 bool input_dims(const OrtNode* node, size_t index, std::vector<int64_t>* dims) {
-    size_t n = 0;
-    if (OrtStatus* st = g_api->Node_GetNumInputs(node, &n)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    if (index >= n) return false;
-    std::vector<const OrtValueInfo*> inputs(n, nullptr);
-    if (OrtStatus* st = g_api->Node_GetInputs(node, inputs.data(), n)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    const OrtTypeInfo* ti = nullptr;
-    if (OrtStatus* st = g_api->GetValueInfoTypeInfo(inputs[index], &ti)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    const OrtTensorTypeAndShapeInfo* tsi = nullptr;
-    if (OrtStatus* st = g_api->CastTypeInfoToTensorInfo(ti, &tsi)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    if (!tsi) return false;
-    size_t rank = 0;
-    if (OrtStatus* st = g_api->GetDimensionsCount(tsi, &rank)) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    std::vector<int64_t> raw(rank, -1);
-    OrtStatus* st = g_api->GetDimensions(tsi, raw.data(), rank);
-    if (st) {
-        g_api->ReleaseStatus(st);
-        return false;
-    }
-    *dims = std::move(raw);
-    return true;
+    std::vector<const OrtValueInfo*> inputs;
+    if (!node_inputs(node, &inputs) || index >= inputs.size()) return false;
+    return value_dims(inputs[index], dims);
 }
 
 // MatMul's K and N when both are static (A is [..., M, K], B is [K, N] or [..., K, N]).
@@ -415,6 +863,47 @@ bool static_kn(const OrtNode* node, int64_t* k, int64_t* n) {
     *k = ak;
     *n = bn;
     return true;
+}
+
+// The DequantizeLinear `axis` attribute, which says which dimension a per-axis scale runs along.
+// Default 1 (the opset 13+ default), and ORT hands the default back for an unset optional attribute.
+int64_t node_axis(const OrtNode* node) {
+    const OrtOpAttr* attr = nullptr;
+    if (OrtStatus* st = g_api->Node_GetAttributeByName(node, "axis", &attr)) {
+        g_api->ReleaseStatus(st);
+        return 1;
+    }
+    if (!attr) return 1;
+    int64_t axis = 1;
+    size_t out = 0;
+    if (OrtStatus* st = g_api->ReadOpAttr(attr, ORT_OP_ATTR_INT, &axis, sizeof(axis), &out)) {
+        g_api->ReleaseStatus(st);
+        return 1;
+    }
+    return axis;
+}
+
+// How many values a DequantizeLinear scale contributes, or 0 when the shape cannot be folded into the
+// kernel's epilogue. 1 means per-tensor (a scalar, or a one-element vector). A per-axis scale is
+// folded only along `required_axis`: for the weight that is the output axis (so `s_w[n]` multiplies
+// output column n), for the activation the row axis (so `s_x[m]` scales output row m). Anything else --
+// notably an activation scale along K -- weights the individual products inside the sum and would
+// need a different kernel, so the graph keeps the per-node path instead.
+int64_t foldable_scale_len(const OrtValueInfo* scale, int64_t axis, int64_t required_axis,
+                           int64_t expected_len) {
+    ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    size_t rank = 0;
+    if (!value_rank_type(scale, &elem, &rank)) return 0;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_FLOAT) return 0;
+    if (!initializer(scale)) return 0;
+    if (rank == 0) return 1;
+    if (rank != 1) return 0;
+    std::vector<int64_t> dims;
+    if (!value_dims(scale, &dims) || dims.size() != 1 || dims[0] <= 0) return 0;
+    if (dims[0] == 1) return 1;
+    if (axis != required_axis) return 0;
+    if (expected_len > 0 && dims[0] != expected_len) return 0;
+    return dims[0];
 }
 
 // Claim a node only if it is one we can actually compute. Claiming by op name alone is the classic
@@ -450,6 +939,128 @@ bool can_compute(const OrtNode* node, const char* op) {
     return true;
 }
 
+// --------------------------------------------------------------- the A8W8 QDQ pattern
+
+// What GetCapability learned about one group, so Compile can turn the fused node back into a
+// QdqPlan. The fused node keeps the group's values as inputs under their original names, and the
+// three float scalars are indistinguishable by type and rank -- the names are the only honest way to
+// say which one is the activation scale, the weight scale and the output scale.
+struct QdqDef {
+    std::string x_name, w_name, sx_name, sw_name, sy_name;
+    std::string zx_name, zw_name, zy_name;  // empty when the group has no such zero point
+};
+
+std::map<std::string, QdqDef> g_qdq_defs;  // group output (y_q) value name -> roles
+
+// Fusion can be switched off (ONEBIT_EP_QDQ=0) so the proof can measure the same graph both ways.
+bool qdq_fusion_enabled() {
+    const char* v = std::getenv("ONEBIT_EP_QDQ");
+    return !(v && *v == '0');
+}
+
+// Matches the A8W8 QDQ group Quark's ONNX-to-ONNX flow emits (docs/onnx-pack.md):
+//
+//   x_q --DQ(s_x, 0)--> x_dq \
+//                              MatMul --> y --Q(s_y, 0)--> y_q
+//   w_q --DQ(s_w, 0)--> w_dq /
+//
+// Symmetric and per-tensor only. Per-axis scales need the kernel to take s_x[m] and s_w[n] and a
+// non-zero zero point needs the correction terms in the epilogue (tasks 2 and 3 of the brief), so a
+// graph with either keeps the per-node path: slower, still correct.
+//
+// `group` comes back as the four nodes to fuse into one, in graph order: dq_x, dq_w, matmul, q_y.
+bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def) {
+    std::vector<const OrtValueInfo*> mm_in, mm_out;
+    if (!node_inputs(mm, &mm_in) || mm_in.size() != 2) return false;
+    if (!node_outputs(mm, &mm_out) || mm_out.size() != 1) return false;
+
+    // Both MatMul inputs are a DequantizeLinear output, and this group is its only consumer.
+    const OrtNode* dq[2] = {nullptr, nullptr};
+    for (int i = 0; i < 2; ++i) {
+        size_t out_index = 0;
+        dq[i] = producer(mm_in[(size_t)i], &out_index);
+        if (!dq[i] || out_index != 0) return false;
+        if (node_op(dq[i]) != "DequantizeLinear" || !onnx_domain(dq[i])) return false;
+        if (!sole_consumer(mm_in[(size_t)i])) return false;
+    }
+
+    std::vector<const OrtValueInfo*> xin, win;
+    if (!node_inputs(dq[0], &xin) || xin.size() < 2 || xin.size() > 3) return false;
+    if (!node_inputs(dq[1], &win) || win.size() < 2 || win.size() > 3) return false;
+
+    ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    size_t rank = 0;
+    // Activation: int8, rank 2 or 3, zero point zero (or absent).
+    if (!value_rank_type(xin[0], &elem, &rank)) return false;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return false;
+    if (rank != 2 && rank != 3) return false;
+    const size_t xrank = rank;
+    if (xin.size() == 3 && zp_count(xin[2], node_axis(dq[0]), xrank == 2 ? 0 : -1, -1) < 0)
+        return false;
+
+    // Weight: a constant int8 [K, N], zero point zero (or absent).
+    if (!value_rank_type(win[0], &elem, &rank)) return false;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != 2) return false;
+    if (!initializer(win[0])) return false;
+    if (win.size() == 3 && zp_count(win[2], node_axis(dq[1]), 1, -1) < 0) return false;
+    std::vector<int64_t> xd, wd;
+    if (!value_dims(xin[0], &xd) || !value_dims(win[0], &wd)) return false;
+    if (wd.size() != 2 || wd[0] <= 0 || wd[1] <= 0) return false;
+    if (xd.empty() || (xd.back() > 0 && xd.back() != wd[0])) return false;
+
+    // Scales: per-tensor, or per-axis along a dimension the epilogue can fold. The activation has to
+    // be rank 2 for a per-row scale (a rank-3 activation's rows are batch*sequence, which no exporter
+    // writes as one axis), and the weight's per-axis scale has to run along N.
+    if (!foldable_scale_len(xin[1], node_axis(dq[0]), xrank == 2 ? 0 : -1, xd.front())) return false;
+    if (!foldable_scale_len(win[1], node_axis(dq[1]), 1, wd[1])) return false;
+
+    // The output side: the MatMul has exactly one consumer, a QuantizeLinear of that same value.
+    size_t consumers = 0;
+    if (OrtStatus* st = g_api->ValueInfo_GetValueNumConsumers(mm_out[0], &consumers)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (consumers != 1) return false;
+    const OrtNode* q = nullptr;
+    int64_t q_input = -1;
+    if (OrtStatus* st = g_api->ValueInfo_GetValueConsumers(mm_out[0], &q, &q_input, 1)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!q || q_input != 0) return false;
+    if (node_op(q) != "QuantizeLinear" || !onnx_domain(q)) return false;
+    std::vector<const OrtValueInfo*> qin, qout;
+    if (!node_inputs(q, &qin) || qin.size() < 2 || qin.size() > 3) return false;
+    if (qin[0] != mm_out[0]) return false;
+    if (!node_outputs(q, &qout) || qout.size() != 1) return false;
+    if (!float_scalar_init(qin[1])) return false;
+    // The output zero point is added after the round, so it is always foldable -- but only as a
+    // scalar: a per-axis output zero point would need the axis of the output, and nothing emits one.
+    if (qin.size() == 3) {
+        size_t zy_count = 0;
+        if (!value_rank_type(qin[2], &elem, &rank)) return false;
+        if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank > 1) return false;
+        if (!int8_init_data(qin[2], &zy_count) || zy_count != 1) return false;
+    }
+    if (!value_rank_type(qout[0], &elem, &rank)) return false;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != xd.size()) return false;
+
+    group[0] = dq[0];
+    group[1] = dq[1];
+    group[2] = mm;
+    group[3] = q;
+    def->x_name = value_name(xin[0]);
+    def->w_name = value_name(win[0]);
+    def->sx_name = value_name(xin[1]);
+    def->sw_name = value_name(win[1]);
+    def->sy_name = value_name(qin[1]);
+    if (xin.size() == 3) def->zx_name = value_name(xin[2]);
+    if (win.size() == 3) def->zw_name = value_name(win[2]);
+    if (qin.size() == 3) def->zy_name = value_name(qin[2]);
+    return !def->x_name.empty() && !def->w_name.empty() && !def->sx_name.empty() &&
+           !def->sw_name.empty() && !def->sy_name.empty();
+}
+
 OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
                                         OrtEpGraphSupportInfo* support_info) noexcept {
     size_t n = 0;
@@ -459,6 +1070,7 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
     if (!nodes) return g_api->CreateStatus(ORT_FAIL, "onebit_ep: out of memory");
     OrtStatus* st = g_api->Graph_GetNodes(graph, nodes, n);
     size_t claimed = 0;
+    size_t fused_groups = 0;
     for (size_t i = 0; !st && i < n; ++i) {
         const char* op = nullptr;
         const char* domain = nullptr;
@@ -467,15 +1079,105 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
         if (OrtStatus* s = g_api->Node_GetOperatorType(nodes[i], &op)) g_api->ReleaseStatus(s);
         if (OrtStatus* s = g_api->Node_GetDomain(nodes[i], &domain)) g_api->ReleaseStatus(s);
         const bool onnx_domain = !domain || !*domain || std::strcmp(domain, "ai.onnx") == 0;
+        if (onnx_domain && claims_op("MatMul") && qdq_fusion_enabled()) {
+            // A QDQ group is claimed whole: fusing it is what keeps the dequantised float tensors
+            // from ever existing. Only nodes in this group are named, and the group's output value
+            // is the key Compile finds it by again.
+            const OrtNode* group[4] = {nullptr, nullptr, nullptr, nullptr};
+            QdqDef def;
+            if (match_qdq(nodes[i], group, &def)) {
+                std::vector<const OrtValueInfo*> outs;
+                if (node_outputs(group[3], &outs) && outs.size() == 1) {
+                    st = g_ep_api->EpGraphSupportInfo_AddNodesToFuse(support_info, group, 4, nullptr);
+                    g_qdq_defs[value_name(outs[0])] = def;
+                    ++fused_groups;
+                    continue;
+                }
+            }
+        }
         if (onnx_domain && can_compute(nodes[i], op)) {
             st = g_ep_api->EpGraphSupportInfo_AddNodesToFuse(support_info, &nodes[i], 1, nullptr);
             ++claimed;
         }
     }
     std::free(nodes);
-    tracef("capability nodes=%zu claimed=%zu", n, claimed);
-    if (verbose()) std::fprintf(stderr, "onebit_ep: GetCapability %zu nodes -> %zu claimed\n", n, claimed);
+    tracef("capability nodes=%zu claimed=%zu qdq_groups=%zu", n, claimed, fused_groups);
+    if (verbose())
+        std::fprintf(stderr, "onebit_ep: GetCapability %zu nodes -> %zu claimed, %zu QDQ groups fused\n",
+                     n, claimed, fused_groups);
     return st;
+}
+
+// Turns a fused node back into the plan its compute needs. Returns false in `is_qdq` for a node that
+// was claimed on its own (the float MatMul path); a QDQ group whose input roles cannot be found is an
+// error, not a silent fallback -- computing it with the float kernel would read int8 as float.
+OrtStatus* qdq_plan_for(const OrtNode* node, bool* is_qdq) {
+    *is_qdq = false;
+    if (!node) return nullptr;
+    std::vector<const OrtValueInfo*> outs;
+    if (!node_outputs(node, &outs) || outs.size() != 1) return nullptr;
+    auto it = g_qdq_defs.find(value_name(outs[0]));
+    if (it == g_qdq_defs.end()) return nullptr;
+    const QdqDef& def = it->second;
+    *is_qdq = true;
+
+    auto plan = std::make_unique<QdqPlan>();
+    plan->x_index = plan->w_index = plan->sx_index = plan->sw_index = plan->sy_index =
+        plan->zx_index = plan->zw_index = plan->zy_index = (size_t)-1;
+    plan->zx_count = plan->zw_count = 1;
+    std::vector<const OrtValueInfo*> ins;
+    if (!node_inputs(node, &ins)) {
+        return g_api->CreateStatus(ORT_FAIL, "onebit_ep: fused QDQ node has unreadable inputs");
+    }
+    for (size_t i = 0; i < ins.size(); ++i) {
+        const std::string name = value_name(ins[i]);
+        if (name == def.x_name) {
+            plan->x_index = i;
+        } else if (name == def.w_name) {
+            plan->w_index = i;
+            std::vector<int64_t> wd;
+            if (!value_dims(ins[i], &wd) || wd.size() != 2 || wd[0] <= 0 || wd[1] <= 0) {
+                return g_api->CreateStatus(ORT_FAIL,
+                                           "onebit_ep: fused QDQ weight has no static [K, N]");
+            }
+            plan->k = wd[0];
+            plan->n = wd[1];
+        } else if (name == def.sx_name) {
+            plan->sx_index = i;
+            plan->sx_count = scale_count(ins[i]);
+        } else if (name == def.sw_name) {
+            plan->sw_index = i;
+            plan->sw_count = scale_count(ins[i]);
+        } else if (name == def.sy_name) {
+            plan->sy_index = i;
+        } else if (!def.zx_name.empty() && name == def.zx_name) {
+            plan->zx_index = i;
+            plan->zx_count = zp_element_count(ins[i]);
+        } else if (!def.zw_name.empty() && name == def.zw_name) {
+            plan->zw_index = i;
+            plan->zw_count = zp_element_count(ins[i]);
+        } else if (!def.zy_name.empty() && name == def.zy_name) {
+            plan->zy_index = i;
+        }
+    }
+    if (plan->x_index == (size_t)-1 || plan->w_index == (size_t)-1 ||
+        plan->sx_index == (size_t)-1 || plan->sw_index == (size_t)-1 ||
+        plan->sy_index == (size_t)-1) {
+        return g_api->CreateStatus(
+            ORT_FAIL, "onebit_ep: fused QDQ node does not carry the values GetCapability matched");
+    }
+    if (plan->sx_count <= 0 || plan->sw_count <= 0 ||
+        (plan->sw_count != 1 && plan->sw_count != plan->n)) {
+        return g_api->CreateStatus(ORT_FAIL, "onebit_ep: fused QDQ scales do not fit the weight");
+    }
+    // Read what the log needs before the plan is moved into its storage: after std::move, `plan` is
+    // null and dereferencing it is the kind of bug that only shows up in an optimized build.
+    const std::string fname = node_name(node);
+    const int64_t plan_k = plan->k, plan_n = plan->n;
+    g_plans[fname] = plan.get();
+    g_plan_storage.push_back(std::move(plan));
+    tracef("qdq_plan node=%s k=%lld n=%lld", fname.c_str(), (long long)plan_k, (long long)plan_n);
+    return nullptr;
 }
 
 OrtStatus* ORT_API_CALL E_Compile(OrtEp*, const OrtGraph** graphs, const OrtNode** fused_nodes,
@@ -486,14 +1188,17 @@ OrtStatus* ORT_API_CALL E_Compile(OrtEp*, const OrtGraph** graphs, const OrtNode
     // shapes for the log only; the kernel reads them again at run time, because claiming a node does
     // not promise its input shapes stay fixed across sessions.
     for (size_t i = 0; i < count; ++i) {
-        if (verbose() && fused_nodes) {
+        bool is_qdq = false;
+        if (OrtStatus* st = qdq_plan_for(fused_nodes ? fused_nodes[i] : nullptr, &is_qdq)) return st;
+        if (verbose()) {
             const char* op = nullptr;
             if (!g_api->Node_GetOperatorType(fused_nodes[i], &op)) {
-                std::fprintf(stderr, "onebit_ep: Compile fused[%zu] %s\n", i, op ? op : "?");
+                std::fprintf(stderr, "onebit_ep: Compile fused[%zu] %s (%s)\n", i, op ? op : "?",
+                             is_qdq ? "QDQ group" : "node");
             }
         }
-        tracef("compile node=%p", (const void*)fused_nodes[i]);
-        node_compute_infos[i] = (OrtNodeComputeInfo*)&g_nci;
+        tracef("compile node=%p qdq=%d", (const void*)fused_nodes[i], is_qdq ? 1 : 0);
+        node_compute_infos[i] = (OrtNodeComputeInfo*)(is_qdq ? &g_qdq_nci : &g_nci);
         if (ep_context_nodes) ep_context_nodes[i] = nullptr;
     }
     return nullptr;
@@ -615,7 +1320,14 @@ OrtStatus* ORT_API_CALL F_CreateAllocator(OrtEpFactory*, const OrtMemoryInfo* mi
     return *out ? nullptr : g_api->CreateStatus(ORT_FAIL, "onebit_ep: allocator table full");
 }
 
-void ORT_API_CALL F_ReleaseAllocator(OrtEpFactory*, OrtAllocator*) noexcept {}
+void ORT_API_CALL F_ReleaseAllocator(OrtEpFactory*, OrtAllocator* self) noexcept {
+    // The host is done with this allocator; hand the slot back. The struct itself stays put, so a
+    // stray late Alloc() call still lands on a valid object.
+    if (auto* a = reinterpret_cast<EpAllocator*>(self); a && a->used) {
+        a->used = false;
+        a->mi = nullptr;
+    }
+}
 
 OrtStatus* ORT_API_CALL F_CreateDataTransfer(OrtEpFactory*, OrtDataTransferImpl** out) noexcept {
     *out = (OrtDataTransferImpl*)&g_transfer;

@@ -197,11 +197,21 @@ rules make this work, and one of them is a bug we hit:
 
 A Quark-quantised ONNX model is a *QDQ* graph (`DequantizeLinear` → `MatMul` → `QuantizeLinear` with
 int8 tensors and float32 scales), and the `MatMul` inside it is the same int8 × int8 → int32 product
-our device kernel already computes. Such a graph runs on the EP unchanged today — the EP takes that
-`MatMul` and the surrounding `DequantizeLinear`/`QuantizeLinear` stay on the CPU EP — and the folding
-that removes the intermediate float tensors is designed in
-[onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits). `ctest -R onebit_ep_qdq_proof` checks the
-pattern end to end and requires int8-identical output.
+our device kernel already computes. The EP claims the whole group — both `DequantizeLinear` nodes, the
+`MatMul` and the `QuantizeLinear` — as ONE fused node, so the dequantised float tensors are never
+materialised: int8 activations and int8 weights go into the kernel, int8 output comes back with the
+scales folded into one multiply per element. Per-tensor scales, the two per-axis forms the epilogue
+can fold (`s_w[n]` along the weight's output axis, `s_x[m]` along the activation's row axis) and
+**asymmetric zero points** are all supported: `Σ_k (a−zx)(w−zw)` costs the GEMM's own sum plus a
+column sum of the weight (computed once per session), a row sum of the activation, and `K·zx·zw`, and
+the output zero point is added after the round. A per-axis scale or zero point along **K** cannot
+fold — it weights the products inside the sum — so such a graph is refused and stays on the per-node
+path (see [onnx-pack.md](onnx-pack.md#a8w8-qdq-the-shape-quark-emits)). `ctest -R onebit_ep_qdq_proof`
+checks six cases end to end: per-tensor, per-axis, asymmetric and asymmetric-per-axis all
+int8-identical to the CPU EP (`worst |d| = 0` LSB, also on a 256×1024×1024 case), the per-K scale
+refused and correct anyway, and ~6-7 MB less peak RSS for the run, which is exactly the three float
+tensors it no longer allocates. The control, `ONEBIT_EP_QDQ=0`, runs the same graph through the
+per-node path and asserts that the float kernel — not the fused one — is what ran.
 
 ## Verifying
 
@@ -209,13 +219,15 @@ pattern end to end and requires int8-identical output.
 cmake -S . -B build -DONEBIT_ORT=ON && cmake --build build -j && ctest --test-dir build -R "ort_info|onebit_ep"
 ```
 
-Three tests, each proving a different claim:
+Five tests, each proving a different claim:
 
 | test | proves |
 |------|--------|
 | `ort_info` | the binary negotiated OrtApi v23 and can list its EP roster |
 | `onebit_ep_proof` | a two-node graph (`MatMul` then `Relu`) built in memory through the Model Editor API runs with the plugin EP registered first and the CPU EP last, our EP takes the `MatMul` (the trace has a `matmul` line, which only `Compute` can write), and the result matches the CPU EP |
 | `onebit_ep_proof_cpu_fallback` | with `ONEBIT_EP_OPS=none` the same graph is partitioned to the CPU EP (`claimed=0`), so the match above cannot come from the CPU running both sessions |
+| `onebit_ep_qdq_proof` | the four-node A8W8 QDQ group is claimed as one fused node: the trace has a `qdq` line and no `matmul` line, the int8 output is identical to the CPU EP's per-tensor, per-axis, asymmetric and asymmetric-per-axis (`worst |d| = 0` LSB), a per-axis scale along K is refused, and the run's peak RSS is ~6-7 MB smaller than the CPU EP's |
+| `onebit_ep_qdq_proof_unfused` | with `ONEBIT_EP_QDQ=0` the same graph goes through the per-node path (a `matmul` line, no `qdq` line), so the numbers above can only come from the fused kernel |
 
 `onebit_npu_gemm_probe` (NPU builds only) is registered as a fourth test and **skips** when the
 device is busy rather than failing someone else's run.
@@ -231,8 +243,11 @@ model the EP takes the shapes it has a kernel for and the CPU EP takes the rest 
 is q, k and v). The device backend is still off by default and is not part of any release, because
 enabling it on a box where another process owns the NPU must stay an explicit decision.
 
-The A8W8 QDQ pattern is claimed and proven (`ctest -R onebit_ep_qdq_proof`, exact int8 match); the
-*fused* form that skips the dequantise/quantise pairs is designed, not built.
+The A8W8 QDQ group is claimed as one fused node and proven (`ctest -R onebit_ep_qdq_proof`, exact int8
+match for per-tensor, per-axis and asymmetric zero points, ~6-7 MB less peak RSS per run). One thing
+is still open and stays documented as such: the device leg of the fused path — today its int8 GEMM
+runs on the host, so a real model's shapes are still a CPU-EP story until the NPU kernel takes int8
+activations straight into its input BO.
 
 The two-engine order is implemented and exercised with a single library; a *second* EP library was
 not available to try it against (this ORT build ships no ROCM/HIP EP and there is no gfx1201 HIP EP

@@ -29,18 +29,40 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
 
 // The A8W8 QDQ multiply in the quantised domain: int8 x int8 -> int8, no float tensor in between.
 //
-//   y_q[m][n] = clamp(round( (Sum_k a_q[m][k]*w_q[k][n]) * s_x[m] * s_w[n] / s_y ), -128, 127)
+//   y_q[m][n] = saturate(round( (Sum_k (a_q[m][k]-zp_x)*(w_q[k][n]-zp_w)) * s_x[m] * s_w[n] / s_y )
+//                        + zp_y)
 //
 // which is what DequantizeLinear -> MatMul -> QuantizeLinear computes, with the dequantised
 // activations and weights never written anywhere. a is [m][k] int8 row-major, b is [k][n] int8
-// row-major, y is [m][n] int8. The accumulator is exact int32 and the only float work is the scale
-// and one round-half-to-even per output element (ONNX QuantizeLinear's rounding).
+// row-major, y is [m][n] int8. The accumulator is exact int32, the zero-point corrections are exact
+// int64, and the only float work is the scale and one round-half-to-even per output element (ONNX
+// QuantizeLinear's rounding, which happens *before* the output zero point is added).
 //
-// Per-tensor and per-axis scales in one signature: `s_x_row` (length m) and `s_w_col` (length n) are
-// the per-axis forms and, when null, the scalars `s_x` and `s_w` are used instead. Those are the two
-// per-axis forms that fold into this epilogue exactly -- a scale along K does not, because it weights
-// each product inside the sum (see docs/onnx-pack.md).
+// Asymmetric zero points do not cost a second pass. Writing the shifted product out,
+//
+//   Sum_k (a-zx)(w-zw) = Sum_k a*w  -  zx*Sum_k w  -  zw*Sum_k a  +  K*zx*zw
+//
+// the first term is what the GEMM accumulates, the second is a column sum of the weight (precomputed
+// once, see `colsum_w`), and the third is a row sum of the activation (one extra add per k while the
+// row is already being read).
+struct Q8Epilogue {
+    // Scales: per-tensor in the scalar, per-axis in the pointer (m values for the row axis, n for the
+    // column axis). A null pointer means "use the scalar"; the same convention for the zero points.
+    const float* s_x_row = nullptr;
+    const float* s_w_col = nullptr;
+    float s_x = 1.0f;
+    float s_w = 1.0f;
+    float inv_s_y = 1.0f;  // 1 / output scale
+    const int8_t* zp_x_row = nullptr;
+    const int8_t* zp_w_col = nullptr;
+    int32_t zp_x = 0;
+    int32_t zp_w = 0;
+    int32_t zp_y = 0;  // output zero point, added after rounding
+    // sum_k w_q[k][n], n values. Required when zp_x is (or may be) non-zero; may be null otherwise.
+    const int32_t* colsum_w = nullptr;
+};
+
 void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, int64_t n,
-             const float* s_x_row, float s_x, const float* s_w_col, float s_w, float inv_s_y);
+             const Q8Epilogue& epilogue);
 
 }  // namespace onebit_ep

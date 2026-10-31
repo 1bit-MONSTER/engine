@@ -49,6 +49,17 @@ struct Kernel {
     float w_scale = 1.0f;
 };
 
+// One QDQ-path kernel: the same ELF, but the weight BO holds the quantised graph's own int8 bytes and
+// nothing here knows about scales. Created on demand for the (K, N) a fused node asks for, because a
+// second I8Ctx per shape costs its BOs (bA + bC + one layerB) and most graphs ask for a few shapes.
+struct Q8Kernel {
+    int m = 0, k = 0, n = 0;
+    std::string elf;
+    std::unique_ptr<I8Ctx> ctx;
+    const int8_t* w_ptr = nullptr;  // the graph's weights whose bytes are in layerB[0]
+    int64_t w_k = 0, w_n = 0;
+};
+
 // One process-wide NPU context: the device, the kernels, and the lock that keeps other processes
 // out. The EP is single-session in practice, so one is enough.
 struct State {
@@ -58,6 +69,10 @@ struct State {
     int lock_fd = -1;
     std::unique_ptr<xrt::device> dev;
     std::vector<std::unique_ptr<Kernel>> kernels;
+    // Configured designs (MxKxN -> ELF), kept so a QDQ kernel can be built for a shape later without
+    // re-reading the environment or re-opening the device.
+    std::vector<std::pair<std::string, std::string>> specs;
+    std::vector<std::unique_ptr<Q8Kernel>> q8_kernels;
 };
 
 State& state() {
@@ -148,6 +163,7 @@ bool init(State& s) {
     }
     if (!s.dev) return fail(s, "no XRT device (amdxdna) found");
 
+    s.specs = spec;  // a QDQ kernel is built from these on first use
     for (const auto& [dims, elf] : spec) {
         int m = 0, k = 0, n = 0;
         if (sscanf(dims.c_str(), "%dx%dx%d", &m, &k, &n) != 3 || m <= 0 || k <= 0 || n <= 0)
@@ -168,7 +184,78 @@ bool init(State& s) {
     return true;
 }
 
+// The QDQ kernel for one (K, N), built the first time it is asked for. Caller holds s.mu.
+Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
+    for (auto& kern : s.q8_kernels)
+        if (kern->k == (int)k && kern->n == (int)n) return kern.get();
+    for (const auto& [dims, elf] : s.specs) {
+        int m = 0, kk = 0, nn = 0;
+        if (sscanf(dims.c_str(), "%dx%dx%d", &m, &kk, &nn) != 3) continue;
+        if (kk != (int)k || nn != (int)n) continue;
+        auto kern = std::make_unique<Q8Kernel>();
+        kern->m = m;
+        kern->k = kk;
+        kern->n = nn;
+        kern->elf = elf;
+        kern->ctx = std::make_unique<I8Ctx>();
+        if (!kern->ctx->init_elf(*s.dev, elf.c_str(), m, kk, nn, 1)) {
+            s.why = "I8Ctx init_elf failed for " + elf + " (" + dims + ")";
+            return nullptr;
+        }
+        s.q8_kernels.push_back(std::move(kern));
+        return s.q8_kernels.back().get();
+    }
+    return nullptr;
+}
+
 }  // namespace
+
+bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t* b, int32_t* c,
+                 std::string* err) {
+    State& s = state();
+    std::lock_guard<std::mutex> g(s.mu);
+    if (!init(s)) {
+        if (err) *err = s.why;
+        return false;
+    }
+    Q8Kernel* kern = q8_kernel(s, k, n);
+    if (!kern) {
+        if (err) *err = "no QDQ kernel for " + std::to_string(k) + "x" + std::to_string(n);
+        return false;
+    }
+    I8Ctx& ctx = *kern->ctx;
+
+    // Weights: the graph's int8 bytes, in the device's own layout, exactly as packB would have written
+    // them from floats -- but without the amax/127 step, because these bytes already carry the graph's
+    // per-column scale.
+    if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
+        auto* Bm = (int8_t*)ctx.layerB[0]->map();
+        std::memset(Bm, 0, (size_t)ctx.KD * ctx.ND);
+        for (int64_t p = 0; p < k; ++p)
+            for (int64_t j = 0; j < n; ++j)
+                Bm[ctx.bpos((size_t)p, (size_t)j)] = b[p * n + j];
+        ctx.layerB[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        kern->w_ptr = b;
+        kern->w_k = k;
+        kern->w_n = n;
+    }
+
+    // Activations: the graph's int8 bytes, M rows per launch (the ELF's design). Rows past `rows` are
+    // zeroed, which is what the kernel reads for them and what the host path also assumes.
+    for (int64_t row0 = 0; row0 < m; row0 += ctx.MD) {
+        const int rows = (int)std::min<int64_t>(ctx.MD, m - row0);
+        std::memset(ctx.Am, 0, (size_t)ctx.MD * ctx.KD);
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(ctx.Am + (size_t)r * ctx.KD, a + (row0 + r) * k, (size_t)k);
+        ctx.sync_A(0);
+        auto run = ctx.launch(0);
+        ctx.wait_kernel(run);
+        ctx.readback();
+        for (int r = 0; r < rows; ++r)
+            for (int64_t j = 0; j < n; ++j) c[(row0 + r) * n + j] = ctx.Cm[(size_t)r * ctx.ND + j];
+    }
+    return true;
+}
 
 bool has_kernel(int64_t k, int64_t n) {
     if (const char* list = env("ONEBIT_EP_NPU_ELFS")) {

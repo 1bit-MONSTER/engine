@@ -192,10 +192,14 @@ private:
     bool host_gemm_ = false;
     bool load_layer(int l);
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
-                  const float* Bmat, std::vector<float>& out, int wkey = -1);
+                  const float* Bmat, std::vector<float>& out, int wkey = -1,
+                  const char* sc = nullptr);
     // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
     void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
-                       const float* Bmat, std::vector<float>& out, int wkey = -1);
+                       const float* Bmat, std::vector<float>& out, int wkey = -1,
+                       const char* sc = nullptr);
+    // pb16i sidecar stem for (layer, tensor tag): <pb16i_dir>/blk_<l>_<tag>_weight
+    std::string pb16i_stem(int layer, const char* tag) const;
     // Phase-selected activation tile.  A one-row launch is decode, so it runs
     // this design's M=16 twin (cheap single-row kernel); anything wider is
     // prefill and keeps the M=128 kernel so a chunk still lands in one array
@@ -266,11 +270,39 @@ private:
     std::unique_ptr<I8Ctx> ctx16_[Q4NX_MAX_DESIGNS];
     bool m16_ = false;          // at least one role has a working twin
     bool m16_check_ = false;    // NPU_M16_CHECK=1: cross-check every decode launch
+    // Weight image "pb16i" (container config q4nx_weight_layout): the decode family
+    // reads sidecar images instead of packing int8 from the f32 weights, so no
+    // f32 weight buffer is needed for a covered projection at all.  pb16i_dir_ is
+    // where blk_<layer>_<tag>_weight.{pb16i,ref} live (config q4nx_pb16i_dir, env
+    // Q4NX_PB16I_DIR wins).  Empty = the layout is off and nothing changes.
+    bool pb16i_ = false;
+    std::string pb16i_dir_;
+    // A sealed ELF carries every ternary instance in ONE full ELF (one PDI, one
+    // hw_context, 7 kernel instances), so changing phase costs nothing: measured on this
+    // box, a phase change inside the sealed context is 0 ms against ~2.7 ms between two
+    // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
+    // it the per-role `_pb16i.elf` files are used as before.
+    std::string pb16i_sealed_;
+    // Full-attention QKV as pb16i: the one 14336-wide fused launch has no kernel
+    // (its int64 q needs 448 columns per core), so it runs as the two q halves plus
+    // k and v -- the four launches the arena measured at 1.49 ms per layer.
+    int i_qhalf_ = -1, i_kv_ = -1;
+    // The lm head is not a PTQ1_0 tensor (the container stores it I8), so it has no
+    // pb16i image and keeps an int8 context of its own: the M=16 twin of the widest
+    // K=H design when one is on disk, else the M=128 ELF.  Without this, a pb16i
+    // container ran the head on the M=128 kernel and paid 30 ms a launch (~0.55 s a
+    // token, measured 2026-10-31 08:00).
+    std::unique_ptr<I8Ctx> ctx_head_;
     int32_t m16_worst_ = 0;     // worst int32 maxdiff seen by the check
     long m16_bad_ = 0, m16_checked_ = 0;
     std::vector<int32_t> m16_ref_;   // reference C row, reused per check
     bool prof_ = false;              // NPU_PROFILE=1
     ProfAcc prof_dec_[Q4NX_MAX_DESIGNS], prof_pre_[Q4NX_MAX_DESIGNS];
+    // The lm head has no design of its own (it borrows a K=H geometry and, under pb16i, an
+    // int8 context of its own), so it gets its own row: attributing it to a design put
+    // 15-16 launches of ~27 ms into the G row and made any per-role budget wrong by 0.4 s.
+    ProfAcc prof_head_;
+    int     prof_head_M_ = 0;
     long prof_dec_n_ = 0;            // decode launches (dispatches/token)
     long prof_pre_n_ = 0;
     long prof_tok_n_ = 0;
@@ -363,6 +395,9 @@ private:
     struct PackedWeight {
         std::unique_ptr<xrt::bo> bo;
         std::vector<float>       scales;
+        // pb16i: the sidecar's host side table.  Empty eref = an int8 pack.
+        std::vector<int16_t>     eref;
+        int                      pb16i_mode = 0;
     };
     std::vector<std::unordered_map<int, PackedWeight>> wcache_;   // [layer][wkey]
     bool weight_cache_ = true;    // NPU_NO_WCACHE=1 disables (A/B)
@@ -414,8 +449,22 @@ private:
     int lin_khd_ = 0, lin_vhd_ = 0;      // head dims
     int lin_ck_ = 4;                     // depthwise conv kernel
     std::vector<float> wqkvlin_, wz_, woutlin_;          // [CD][H], [VD][H], [H][VD]
-    std::vector<float> wa_, wb_;                          // [nvh][H] alpha/beta
-    std::vector<float> lin_conv_w_, lin_norm_w_, lin_ssm_a_, lin_dt_;  // [CK][CD],[VHD],[nvh],[nvh]
+    // GDN members the HOST reads every token: the alpha/beta projections (the
+    // per-head dot products), the conv window, the gate norm and ssm_a/ssm_dt
+    // (the recurrence).  They are container constants, but the recurrence consumes
+    // a different one per layer, so a single shared buffer forced a re-dequant of
+    // all of them for every layer of every token: 299 ms/token on the 27B, 53% of
+    // all layer host time, for ~2 MB/layer.  Per layer, dequantised once.
+    // NPU_GDN_CACHE=0 restores the per-token reload.
+    struct GdnSmall {
+        std::vector<float> wa, wb;        // [nvh][H]
+        std::vector<float> conv;          // [CK][CD]
+        std::vector<float> norm;          // [VHD]
+        std::vector<float> ssm_a, dt;     // [nvh]
+        bool loaded = false;
+    };
+    std::vector<GdnSmall> gdn_small_;     // [layer]
+    bool gdn_cache_ = true;               // NPU_GDN_CACHE=0 disables
     std::vector<std::vector<float>> conv_state_, rec_state_;  // [CD][CK-1], [nvh][khd][vhd]
     // One GDN token step: xn is the normed input; out gets the out_proj result.
     bool gdn_layer(int l, const std::vector<float>& xn, std::vector<float>& out);

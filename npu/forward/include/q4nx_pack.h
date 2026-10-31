@@ -102,6 +102,12 @@ typedef enum {
      * <= the design's N, and reads back the first top_k*IM outputs. */
     Q4NX_DESIGN_GB,      /* batched expert gate: K=H, N>=top_k*IM                 */
     Q4NX_DESIGN_UB,      /* batched expert up:   K=H, N>=top_k*IM                 */
+    /* Only a pb16i container derives these: its kernels have no wide enough launch
+     * for a fused full-attention QKV, so the role runs as the two q halves and the k/v
+     * pair.  K=H, N=NH*HD for the halves (q and the output gate) and N=NKV*HD for k/v.
+     * Appended last so no existing enum value changes meaning. */
+    Q4NX_DESIGN_QKVFA_Q,
+    Q4NX_DESIGN_QKVFA_KV,
     Q4NX_DESIGN_COUNT
 } Q4nxDesign;
 

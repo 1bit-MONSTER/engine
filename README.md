@@ -22,8 +22,8 @@ limitations under the License.
 [![Documentation: 1bit.gg](https://img.shields.io/badge/docs-1bit.gg-1779e1)](https://1bit.gg/)
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2)](https://discord.gg/fa5m4Vawpa)
 
-Boot a USB stick, and your Strix Halo machine serves local LLMs on its GPU and NPU through AMD's
-[Lemonade Server](https://github.com/lemonade-sdk/lemonade). That is the whole setup.
+Boot a USB stick, and your AMD Ryzen AI MAX+ 395 (Strix Halo) machine serves local LLMs on its GPU and NPU,
+on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemonade). That is the whole setup.
 
 ## Get started
 
@@ -53,7 +53,8 @@ The release goes out when every item on the release checklist is done ([docs/rel
 
 ## Documentation
 
-- [1bit.gg](https://1bit.gg/): the docs site, built from this repository's `docs/`.
+- [1bit.gg](https://1bit.gg/): the docs site, built from this repository's `docs/`; [the blog](https://1bit.gg/blog.html) is the build log.
+- [HRX on the Radeon 8060S](https://1bit.gg/hrx.html) and [the NPU engine](https://1bit.gg/npu.html): the two device routes, on the site.
 - [docs/architecture.md](docs/architecture.md): how the engine is built, what runs where, the hardware gate, the kernel, the direction.
 - [docs/serve.md](docs/serve.md): `1bit serve` and its options.
 - [Measured results](https://github.com/1bit-MONSTER/engine/wiki): every number with how it was taken.

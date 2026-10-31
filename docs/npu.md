@@ -16,7 +16,8 @@ limitations under the License.
 -->
 # NPU engine
 
-The NPU engine is in progress: correctness first, speed next. Its kernels, built from source,
+The NPU engine runs models on the AMD NPU (the XDNA 2 NPU of the Ryzen AI MAX+ 395) on Linux, on our own
+runtime and kernels. It is in progress: correctness first, speed next. Its kernels, built from source,
 match an fp64 reference on Qwen3-0.6B, 1.7B and 4B. The layer kernel and lm head reach cosine
 similarity 0.9999 or better at every tested position, and greedy decoding matches the reference
 token for token.

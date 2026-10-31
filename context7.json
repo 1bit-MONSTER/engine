@@ -3,7 +3,7 @@
   "url": "https://context7.com/1bit-monster/engine",
   "public_key": "pk_woGfNaBfmOKTjJDCp8JpR",
   "projectTitle": "1bit engine",
-  "description": "C++ inference engine behind an OpenAI-compatible API, running inside Lemonade on AMD Ryzen AI: the XDNA 2 NPU, HRX with HIP kernels on the iGPU.",
+  "description": "1bit engine: model-agnostic local LLM inference on the AMD Ryzen AI MAX+ 395 (Strix Halo) inside Lemonade Server, on Linux: HRX with HIP kernels on the Radeon 8060S iGPU and our own runtime on the XDNA 2 NPU, behind an OpenAI-compatible API.",
   "folders": [
     "docs"
   ],

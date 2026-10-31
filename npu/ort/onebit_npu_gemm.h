@@ -46,4 +46,19 @@ bool has_kernel(int64_t k, int64_t n);
 bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
               float* c, std::string* err);
 
+// The A8W8 QDQ path: int8 activations and int8 weights straight into the kernel's
+// input and weight BOs, exact int32 accumulators out (C[m][n], row major).
+//
+// Different from gemm_f32 on purpose: no float anywhere. gemm_f32 quantises the
+// weights with packB (amax/127) and the activations per row, because the forward
+// route has floats; a quantised graph already has the int8 bytes and the scales,
+// so this writes both BOs verbatim and hands the raw accumulators back — the
+// caller applies the graph's own scales, zero points and rounding, so that
+// arithmetic exists in exactly one place (onnx/ep/onebit_ep_kernel.cpp) and a
+// device run and a host run of the same graph agree to the byte.
+// False means the device could not run it (no ELF for this K x N, device busy,
+// XRT failure); the caller keeps its host loop and must not claim the device.
+bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t* b,
+                 int32_t* c, std::string* err);
+
 }  // namespace onebit::npu

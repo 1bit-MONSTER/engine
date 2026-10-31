@@ -72,6 +72,14 @@ This page is the reviewed evidence for the second kind: what each family is, wha
   candidate-block sparse attention (and a scope decision for the vision tower),
   validated against reference logits from the HF implementation.
 
+* **Mapped since `5e6388a5a`** (2026-10-30, the pin engine PR "Bump HRX: llama.cpp 5e6388a5a" carries): the fork
+  now registers the class itself — `conversion/__init__.py` maps `DeepseekV41ForCausalLM` to `deepseek41`,
+  `src/llama-arch.cpp` registers `LLM_ARCH_DEEPSEEK41`, and `src/models/deepseek41.cpp` implements the hparams,
+  the tensor set, the graph and the engram/indexer machinery (fork #156, the port of upstream #31086 + #31300).
+  That is not an alias of `deepseek4`: it is a second architecture, which is what the reasoning above asked for,
+  and the recheck it quotes was against `6b397ee9`, before the port existed.
+  `registry/significant.json` records the same fact as a `mapped_ok` reason, so `--check-gaps` stays quiet.
+
 ## `qwen3mamba3` — Qwen3 + Mamba-3 hybrid
 
 * **Class / model_type**: `Qwen3Mamba3ForCausalLM` / `qwen3_mamba3`; example

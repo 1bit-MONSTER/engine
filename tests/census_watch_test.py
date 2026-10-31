@@ -302,14 +302,29 @@ for cls, mid in (
     ("NanochronoForCausalLM", "tensin320/round14_5_114_fitleech_sn38-2023-01"),
     # issue #437 (2026-10-17): upstream-only architecture, after the pin.
     ("MuseSparkForConditionalGeneration", "Interchained/Muse-Spark-Open-816B-A42B-GGUF"),
-    # issue #522 (2026-10-25): reviewed, documented, needs real support (engram + candidate blocks).
-    ("DeepseekV41ForCausalLM", "overhand/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored"),
+    # DeepseekV41ForCausalLM used to be here (issue #522, reviewed report-only, "needs real
+    # support: engram + candidate blocks"). Since pin 5e6388a5a it is *mapped* - the fork ships
+    # the deepseek41 architecture - so it is asserted below as covered, not as report-only.
 ):
     check(f"{cls} is reviewed report-only and documented",
           sig.get(cls, {}).get("watch") == "report" and cls not in archs and cls in gap_docs)
     rc, res = rc_of([model(mid, cls)], archs, sig)
     check(f"{cls} report-only -> exit 0, no alert",
           rc == 0 and res["reviewed_report"] == [cls] and res["significant"] == [])
+
+# --- a reviewed class the pin starts to implement is covered, not alerted (2026-10-30) ------------
+#
+# DeepSeek-V4.1-Flash was reviewed report-only at #522 because the pinned deepseek4 path ran
+# neither the engram nor the candidate-block machinery. Pin 5e6388a5a (fork #156, the port of
+# upstream #31086 + #31300) implements it as its own architecture, so the same model must now be
+# COVERED and silent: no "significant" alert, and no reviewed-report line either - alerting on a
+# class the engine supports would be the false alarm this watcher exists to avoid.
+rc, res = rc_of([model("overhand/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored", "DeepseekV41ForCausalLM")],
+                archs, sig)
+check("DeepseekV41ForCausalLM mapped at this pin -> covered, exit 0",
+      rc == 0 and res[cw.COVERED] == ["overhand/DeepSeek-V4.1-Flash-1017-MXFP4-uncensored"])
+check("DeepseekV41ForCausalLM mapped -> no significant alert and no reviewed_report line",
+      res["significant"] == [] and res["reviewed_report"] == [])
 
 # --- FastFlowLM org + releases watch (engine#588) ----------------------------------
 #

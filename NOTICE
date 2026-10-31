@@ -175,11 +175,14 @@ Linked at build time against a system package (not redistributed)
 ONNX Runtime (https://github.com/microsoft/onnxruntime)
   Copyright (c) Microsoft Corporation. All rights reserved.
   License: MIT. Built only with -DONEBIT_ORT=ON (docs/onnx.md): the engine then
-  links the distribution's libonnxruntime 1.23.2 (Ubuntu package
-  libonnxruntime1.23/libonnxruntime-dev 1.23.2+dfsg-6ubuntu1, served OrtApi v23;
-  sha256 of libonnxruntime.so.1.23.2 is recorded in onnx/README.md) and ships
-  libonebit_ep.so, our plugin execution provider, whose only ORT constants are
-  the ones its public headers declare. ONNX Runtime is not modified, and no
+  links libonnxruntime 1.23.2, either the distribution's (Ubuntu package
+  libonnxruntime1.23/libonnxruntime-dev 1.23.2+dfsg-6ubuntu1, served OrtApi v23)
+  or the one we build from upstream with onnx/build_ort.sh (same tag, unmodified
+  apart from one missing #include <cstdint> in core/common/semver.h that GCC 15
+  rejects; MIT, so the notice below covers that build too, and its sources are
+  the published tag). It ships libonebit_ep.so, our plugin
+  execution provider, whose only ORT constants are
+  the ones its public headers declare. ONNX Runtime is not modified in behaviour, and no
   proprietary execution provider ships with it: AMD's VitisAI EP wheel is never
   linked or redistributed here.
   MIT license text, as ONNX Runtime ships it:

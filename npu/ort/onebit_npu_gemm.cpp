@@ -79,6 +79,16 @@ struct State {
     // every call turns a fallback into a 20x slowdown: measured, 8 decode tokens went from 4 s to 87 s when
     // every group paid a failed init_elf.
     std::vector<std::pair<int64_t, int64_t>> q8_unavailable;
+
+    // The device lock is a raw descriptor, so it needs an owner that gives it back: ORT unloads the
+    // provider library when the Env that loaded it is released, which destroys this static and re-creates
+    // it on the next load. Without this, the second incarnation opened the lock file, flock()ed it, and got
+    // EAGAIN from the *first* incarnation's leaked descriptor -- in the same process -- so every MatMul after
+    // the first fell back to the CPU and said "held by another process". Measured on the QDQ proof graph:
+    // one case took the lock, nine were refused, and the trace read like device contention.
+    ~State() {
+        if (lock_fd >= 0) ::close(lock_fd);  // closing it releases the flock(2) as well
+    }
 };
 
 State& state() {
@@ -161,13 +171,21 @@ bool init(State& s) {
     }
 
     // 3. the device
+    // a real cause (a 64 MiB
+    // MAP_LOCKED heap BO failing EAGAIN because RLIMIT_MEMLOCK was 8 MB) into "no XRT device found", which
+    // reads as a missing driver. Keep the reason device 0 gave -- the last id in the loop is the *nonexistent*
+    // one, whose ENOENT says nothing about why the real device could not be opened.
+    std::string dev_why;
     for (int id = 0; id < 4 && !s.dev; id++) {
         try {
             s.dev = std::make_unique<xrt::device>(id);
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            if (dev_why.empty()) dev_why = std::string("device ") + std::to_string(id) + ": " + e.what();
         }
     }
-    if (!s.dev) return fail(s, "no XRT device (amdxdna) found");
+    if (!s.dev)
+        return fail(s, dev_why.empty() ? std::string("no XRT device (amdxdna) found")
+                                       : std::string("no XRT device (amdxdna): ") + dev_why);
 
     s.specs = spec;  // a QDQ kernel is built from these on first use
     for (const auto& [dims, elf] : spec) {

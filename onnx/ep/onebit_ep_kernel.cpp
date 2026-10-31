@@ -31,6 +31,9 @@
 
 #include "onebit_ep_kernel.h"
 
+#include <cstdarg>
+#include <cstdio>
+#include <unistd.h>
 #include <cstdint>
 #include <cstring>
 #include <algorithm>
@@ -44,18 +47,35 @@
 #endif
 
 namespace onebit_ep {
+namespace {
+
+// ONEBIT_EP_TRACE is a *flag* -- onebit_ep.cpp opens /tmp/onebit_ep_trace.<pid>.log when it is set --
+// so a fallback note has to be appended to that same file. Reading the variable as a path (which this
+// file did until it cost me a debugging session) opens a file literally named "1" in whatever the
+// current directory is, and the note is invisible exactly when someone is looking for it.
+void trace_fallback(const char* fmt, ...) {
+    const char* on = std::getenv("ONEBIT_EP_TRACE");
+    if (!on || !*on || *on == '0') return;
+    char path[64];
+    std::snprintf(path, sizeof(path), "/tmp/onebit_ep_trace.%ld.log", (long)::getpid());
+    FILE* f = std::fopen(path, "a");
+    if (!f) return;
+    va_list ap;
+    va_start(ap, fmt);
+    std::vfprintf(f, fmt, ap);
+    va_end(ap);
+    std::fputc('\n', f);
+    std::fclose(f);
+}
+
+}  // namespace
 
 // Returns true when the NPU did the multiply. Always writes all of C.
 bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, int64_t n) {
 #ifdef ONEBIT_EP_NPU
     std::string why;
     if (onebit::npu::gemm_f32(a, m, k, n, b, c, &why)) return true;
-    if (const char* trace = std::getenv("ONEBIT_EP_TRACE"))
-        if (FILE* f = std::fopen(trace, "a")) {
-            std::fprintf(f, "npu_fallback k=%lld n=%lld why=%s\n", (long long)k, (long long)n,
-                         why.c_str());
-            std::fclose(f);
-        }
+    trace_fallback("npu_fallback k=%lld n=%lld why=%s", (long long)k, (long long)n, why.c_str());
 #endif
     std::memset(c, 0, (size_t)m * (size_t)n * sizeof(float));
     // i-k-j instead of i-j-k: each B row is walked once per A row, which is what keeps this
@@ -138,12 +158,8 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
             for (int64_t i = 0; i < m; ++i) epilogue_row(acc.data() + i * n, i, y + i * n);
             return;
         }
-        if (const char* trace = std::getenv("ONEBIT_EP_TRACE"))
-            if (FILE* f = std::fopen(trace, "a")) {
-                std::fprintf(f, "npu_qdq_fallback k=%lld n=%lld why=%s\n", (long long)k,
-                             (long long)n, why.c_str());
-                std::fclose(f);
-            }
+        trace_fallback("npu_qdq_fallback k=%lld n=%lld why=%s", (long long)k, (long long)n,
+                       why.c_str());
     }
 #endif
 

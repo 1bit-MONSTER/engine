@@ -162,9 +162,10 @@ intermediate float tensor then never exists.
   a 256×1024×1024 case (262144 of 262144 values equal, so the int32-first arithmetic is in fact
   *more* exact than the CPU EP's float accumulation, which reaches the same function through two
   float tensors). Peak RSS growth of the run, measured around the run with the peak reset and
-  `malloc_trim` between the warm-up and the measurement: **~7000 kB for the CPU EP vs 264 kB fused**
-  on 256×1024×1024 (five runs: delta 6356, 6140, 6680, 6688, 6140 kB) — the 1 MB `x_dq` + 4 MB
-  `w_dq` + 1 MB `y` of float32 that no longer get allocated, plus the CPU EP's own arena churn.
+  `malloc_trim` between the warm-up and the measurement: **6404 kB for the CPU EP vs 248-268 kB
+  fused** on 256×1024×1024 (five runs on this tree: delta 6156, 6432, 6144, 6136, 6144 kB) — the
+  1 MB `x_dq` + 4 MB `w_dq` + 1 MB `y` of float32 that no longer get allocated, plus the CPU EP's
+  own arena churn.
   `ONEBIT_EP_QDQ=0` is the control: the same binary then claims the
   `MatMul` alone, logs a float `matmul` line, and the fused `qdq` line never appears.
 - **Works: per-axis scales, in the two forms the epilogue can fold.** `s_w[n]` (the weight's `axis 1`,

@@ -23,3 +23,6 @@ __pycache__/
 
 # Mesh runtime state (runs, leases, sessions, artifacts) - never commit
 .pi/mesh/
+
+# ctest run in the source tree (kept out of the PR by the copyright check)
+Testing/

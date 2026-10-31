@@ -134,29 +134,37 @@ OrtStatus* make_type(const int64_t* dims, size_t rank, ONNXTensorElementDataType
     return st;
 }
 
-// Adds a 1-D (rank 0 for scalars) initializer; the graph copies the data, so `data` only has to
-// outlive this call.
+// An initializer whose memory ORT owns, filled from a copy of `data`.
+//
+// Not CreateTensorWithDataAsOrtValue: that borrows the caller's memory, which then has to outlive the
+// session. The scales and the zero point are ordinary locals here, and borrowing them produced a
+// garbage zero point in a no-optimization build as soon as the stack slot was reused -- every int8
+// output then differed from the CPU EP's. ORT's own small-initializer path costs a memcpy and removes
+// the whole class.
+OrtStatus* add_initializer(OrtGraph* graph, const char* name, ONNXTensorElementDataType elem,
+                           const void* data, size_t bytes, const int64_t* dims, size_t rank) {
+    OrtAllocator* alloc = nullptr;
+    if (OrtStatus* st = api->GetAllocatorWithDefaultOptions(&alloc)) return st;
+    OrtValue* v = nullptr;
+    OrtStatus* st = api->CreateTensorAsOrtValue(alloc, dims, rank, elem, &v);
+    if (!st) {
+        void* p = nullptr;
+        st = api->GetTensorMutableData(v, &p);
+        if (!st) std::memcpy(p, data, bytes);
+    }
+    if (!st) return editor->AddInitializerToGraph(graph, name, v, false);  // takes ownership
+    if (v) api->ReleaseValue(v);
+    return st;
+}
+
 OrtStatus* add_scalar(OrtGraph* graph, const char* name, ONNXTensorElementDataType elem,
                       const void* data, size_t size) {
-    OrtMemoryInfo* mi = nullptr;
-    if (OrtStatus* st = api->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &mi)) return st;
-    OrtValue* v = nullptr;
-    OrtStatus* st = api->CreateTensorWithDataAsOrtValue(mi, const_cast<void*>(data), size, nullptr, 0,
-                                                        elem, &v);
-    api->ReleaseMemoryInfo(mi);
-    if (!st) st = editor->AddInitializerToGraph(graph, name, v, false);  // takes ownership
-    return st;
+    return add_initializer(graph, name, elem, data, size, nullptr, 0);
 }
 
 OrtStatus* add_matrix(OrtGraph* graph, const char* name, ONNXTensorElementDataType elem,
                       void* data, size_t size, const int64_t* dims) {
-    OrtMemoryInfo* mi = nullptr;
-    if (OrtStatus* st = api->CreateCpuMemoryInfo(OrtDeviceAllocator, OrtMemTypeDefault, &mi)) return st;
-    OrtValue* v = nullptr;
-    OrtStatus* st = api->CreateTensorWithDataAsOrtValue(mi, data, size, dims, 2, elem, &v);
-    api->ReleaseMemoryInfo(mi);
-    if (!st) st = editor->AddInitializerToGraph(graph, name, v, false);
-    return st;
+    return add_initializer(graph, name, elem, data, size, dims, 2);
 }
 
 OrtStatus* add_node(OrtGraph* graph, const char* op, const char* name, const char** in, size_t n_in,

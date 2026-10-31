@@ -50,6 +50,7 @@
 #include <cstdlib>
 #include <cstring>
 #include <map>
+#include <mutex>
 #include <memory>
 #include <vector>
 #include <string>
@@ -314,6 +315,23 @@ std::string node_name(const OrtNode* node) {
     return name ? name : "";
 }
 
+std::string node_domain(const OrtNode* node) {
+    const char* domain = nullptr;
+    if (OrtStatus* st = g_api->Node_GetDomain(node, &domain)) {
+        g_api->ReleaseStatus(st);
+        return {};
+    }
+    return domain ? domain : "";
+}
+
+// The two spellings of a QuantizeLinear/DequantizeLinear: the ONNX one, and the com.microsoft one that
+// ORT's own QDQ tooling (and Quark's exporter, which uses it) writes. Same operator, same inputs, same
+// attributes, ORT's own kernel -- but a vendor's fused op in another domain is not the pattern.
+bool qdq_domain(const OrtNode* node) {
+    const std::string domain = node_domain(node);
+    return domain.empty() || domain == "ai.onnx" || domain == "com.microsoft";
+}
+
 bool onnx_domain(const OrtNode* node) {
     const char* domain = nullptr;
     if (OrtStatus* st = g_api->Node_GetDomain(node, &domain)) {
@@ -398,38 +416,52 @@ bool float_scalar_init(const OrtValueInfo* v) {
     return initializer(v) != nullptr;
 }
 
-// A symmetric zero point: an int8 initializer whose every element is 0. Any shape counts -- a scalar,
-// or the per-axis vector ONNX wants beside a per-axis scale -- because "all zeros" is symmetric
-// either way. A non-zero zero point needs the correction terms folded into the epilogue
-// (docs/onnx-pack.md, "What works today"), so such a graph keeps the per-node path.
-bool int8_zero_init(const OrtValueInfo* v) {
+// How many values a zero point contributes, or -1 when it cannot be folded. A zero point folds when
+// it is a scalar, or a 1-D vector along the same axis its operand's epilogue term uses (the rows for
+// the activation, the output columns for the weight) -- the axes the scales use too, which is also
+// what ONNX requires of a per-axis zero point. A zero point along K would weight the products inside
+// the sum (one column-weighted vector of the weight, which no kernel here precomputes), so a graph
+// with one keeps the per-node path.
+int64_t zp_count(const OrtValueInfo* v, int64_t axis, int64_t required_axis, int64_t expected_len) {
     ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     size_t rank = 0;
-    if (!value_rank_type(v, &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return false;
+    if (!value_rank_type(v, &elem, &rank)) return -1;
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return -1;
+    if (!initializer(v)) return -1;
+    if (rank == 0) return 1;
+    if (rank != 1) return -1;
+    std::vector<int64_t> dims;
+    if (!value_dims(v, &dims) || dims.size() != 1 || dims[0] <= 0) return -1;
+    if (dims[0] == 1) return 1;
+    if (axis != required_axis) return -1;
+    if (expected_len > 0 && dims[0] != expected_len) return -1;
+    return dims[0];
+}
+
+// The elements of an int8 initializer, or nullptr. Used at Compile to decide whether a zero point is
+// worth folding at all and, if so, to compute the weight's column sums.
+const int8_t* int8_init_data(const OrtValueInfo* v, size_t* count) {
     const OrtValue* value = initializer(v);
-    if (!value) return false;
+    if (!value) return nullptr;
     OrtTensorTypeAndShapeInfo* tsi = nullptr;
     if (OrtStatus* st = g_api->GetTensorTypeAndShape(value, &tsi)) {
         g_api->ReleaseStatus(st);
-        return false;
+        return nullptr;
     }
-    size_t count = 0;
-    OrtStatus* c_st = g_api->GetTensorShapeElementCount(tsi, &count);
+    size_t n = 0;
+    OrtStatus* c_st = g_api->GetTensorShapeElementCount(tsi, &n);
     g_api->ReleaseTensorTypeAndShapeInfo(tsi);
     if (c_st) {
         g_api->ReleaseStatus(c_st);
-        return false;
+        return nullptr;
     }
-    if (count == 0 || count > (size_t)1 << 20) return false;
     const int8_t* data = nullptr;
     if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(value), (void**)&data)) {
         g_api->ReleaseStatus(st);
-        return false;
+        return nullptr;
     }
-    for (size_t i = 0; i < count; ++i)
-        if (data[i] != 0) return false;
-    return true;
+    *count = n;
+    return data;
 }
 
 // How many values a scale input holds: 1 for a scalar, the axis length for a per-axis vector.
@@ -439,6 +471,12 @@ int64_t scale_count(const OrtValueInfo* v) {
     if (dims.empty()) return 1;
     if (dims.size() == 1 && dims[0] > 0) return dims[0];
     return 0;
+}
+
+// How many values a zero point input holds. Unlike a scale it can be absent, which is 1 (zero).
+int64_t zp_element_count(const OrtValueInfo* v) {
+    const int64_t n = scale_count(v);
+    return n > 0 ? n : 1;
 }
 
 // The producer of a value and the output index it comes from, or nullptr.
@@ -563,6 +601,19 @@ struct QdqPlan {
     int64_t n;
     int64_t sx_count;  // 1 = per-tensor, m = per-row
     int64_t sw_count;  // 1 = per-tensor, n = per-column
+    // Zero points, same convention. Absent ones are (size_t)-1 with a count of 1 and a value of 0.
+    size_t zx_index;
+    size_t zw_index;
+    size_t zy_index;
+    int64_t zx_count;
+    int64_t zw_count;
+    // sum_k w_q[k][n], the `-zp_x * Sum_k w_q` term of the asymmetric epilogue. Computed on the first
+    // run that needs it and kept: recomputing per run would add O(K*N) to every decode step, and a
+    // symmetric graph never asks for it at all. The mutex is for the first run of two sessions that
+    // share a plan object; after that the vector is read-only.
+    std::mutex colsum_mu;
+    std::vector<int32_t> colsum_w;
+    const int8_t* colsum_source = nullptr;  // the weight these sums were taken from
 };
 
 // Compile runs per claimed node and the EP is a process-wide singleton, so the plans outlive the
@@ -614,6 +665,36 @@ bool input_scale(const OrtKernelContext* ctx, size_t index, const float** data, 
     return true;
 }
 
+// Reads an int8 input (a zero point) as a pointer plus its number of values.
+bool input_int8(const OrtKernelContext* ctx, size_t index, const int8_t** data, int64_t* count) {
+    const OrtValue* v = nullptr;
+    if (OrtStatus* st = g_api->KernelContext_GetInput(ctx, index, &v)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    if (!v) return false;
+    OrtTensorTypeAndShapeInfo* tsi = nullptr;
+    if (OrtStatus* st = g_api->GetTensorTypeAndShape(v, &tsi)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    size_t n = 0;
+    OrtStatus* c_st = g_api->GetTensorShapeElementCount(tsi, &n);
+    g_api->ReleaseTensorTypeAndShapeInfo(tsi);
+    if (c_st) {
+        g_api->ReleaseStatus(c_st);
+        return false;
+    }
+    const int8_t* p = nullptr;
+    if (OrtStatus* st = g_api->GetTensorMutableData(const_cast<OrtValue*>(v), (void**)&p)) {
+        g_api->ReleaseStatus(st);
+        return false;
+    }
+    *data = p;
+    *count = (int64_t)n;
+    return true;
+}
+
 // Reads a float scalar input at run time.
 bool input_scalar(const OrtKernelContext* ctx, size_t index, float* out) {
     const OrtValue* v = nullptr;
@@ -631,8 +712,21 @@ bool input_scalar(const OrtKernelContext* ctx, size_t index, float* out) {
     return true;
 }
 
+// sum_k w_q[k][n] for this plan's weight, computed once per (plan, weight) and reused. Only called for
+// a non-zero activation zero point: that is the term that makes it free rather than a second pass.
+void ensure_colsum(QdqPlan* plan, const int8_t* w) {
+    std::lock_guard<std::mutex> lock(plan->colsum_mu);
+    if (plan->colsum_source == w && plan->colsum_w.size() == (size_t)plan->n) return;
+    plan->colsum_w.assign((size_t)plan->n, 0);
+    for (int64_t p = 0; p < plan->k; ++p)
+        for (int64_t j = 0; j < plan->n; ++j)
+            plan->colsum_w[(size_t)j] += w[p * plan->n + j];
+    plan->colsum_source = w;
+    tracef("qdq_colsum k=%lld n=%lld", (long long)plan->k, (long long)plan->n);
+}
+
 OrtStatus* ORT_API_CALL QC_Compute(OrtNodeComputeInfo*, void* state, OrtKernelContext* context) noexcept {
-    const QdqPlan* plan = (const QdqPlan*)state;
+    QdqPlan* plan = (QdqPlan*)state;
     const OrtValue* av = nullptr;
     if (OrtStatus* st = g_api->KernelContext_GetInput(context, plan->x_index, &av)) return st;
     int64_t ad[3] = {0, 0, 0};
@@ -683,18 +777,69 @@ OrtStatus* ORT_API_CALL QC_Compute(OrtNodeComputeInfo*, void* state, OrtKernelCo
                                    "onebit_ep: fused QDQ weight scale does not cover the columns");
     }
 
-    onebit_ep::gemm_q8(a, w, y, rows, plan->k, plan->n, s_x_count == 1 ? nullptr : s_x,
-                       s_x_count == 1 ? s_x[0] : 1.0f, s_w_count == 1 ? nullptr : s_w,
-                       s_w_count == 1 ? s_w[0] : 1.0f, 1.0f / s_y);
+    onebit_ep::Q8Epilogue epilogue;
+    epilogue.s_x_row = s_x_count == 1 ? nullptr : s_x;
+    epilogue.s_x = s_x_count == 1 ? s_x[0] : 1.0f;
+    epilogue.s_w_col = s_w_count == 1 ? nullptr : s_w;
+    epilogue.s_w = s_w_count == 1 ? s_w[0] : 1.0f;
+    epilogue.inv_s_y = 1.0f / s_y;
+
+    // Zero points. Read from the kernel context like the scales, and all-zero ones are dropped here so
+    // the kernel's symmetric path stays the one that runs for a symmetric graph.
+    const int8_t* zx = nullptr;
+    const int8_t* zw = nullptr;
+    const int8_t* zy = nullptr;
+    int64_t zx_count = 1, zw_count = 1, zy_count = 1;
+    if (plan->zx_index != (size_t)-1 && !input_int8(context, plan->zx_index, &zx, &zx_count)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ zp_x is unreadable");
+    }
+    if (plan->zw_index != (size_t)-1 && !input_int8(context, plan->zw_index, &zw, &zw_count)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ zp_w is unreadable");
+    }
+    if (plan->zy_index != (size_t)-1 && !input_int8(context, plan->zy_index, &zy, &zy_count)) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT, "onebit_ep: fused QDQ zp_y is unreadable");
+    }
+    if (zx_count != 1 && zx_count != rows) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ activation zero point does not cover the rows");
+    }
+    if (zw_count != 1 && zw_count != plan->n) {
+        return g_api->CreateStatus(ORT_INVALID_ARGUMENT,
+                                   "onebit_ep: fused QDQ weight zero point does not cover the columns");
+    }
+    if (zy) epilogue.zp_y = zy[0];
+    bool zx_nonzero = false;
+    if (zx) {
+        for (int64_t i = 0; i < zx_count; ++i) zx_nonzero = zx_nonzero || zx[i] != 0;
+        if (zx_count == 1) epilogue.zp_x = zx[0];
+        else if (zx_nonzero) epilogue.zp_x_row = zx;
+    }
+    if (zw) {
+        bool nonzero = false;
+        for (int64_t i = 0; i < zw_count; ++i) nonzero = nonzero || zw[i] != 0;
+        if (zw_count == 1) epilogue.zp_w = zw[0];
+        else if (nonzero) epilogue.zp_w_col = zw;
+    }
+    if (epilogue.zp_x != 0 || epilogue.zp_x_row) {
+        ensure_colsum(plan, w);
+        epilogue.colsum_w = plan->colsum_w.data();
+    }
+
+    onebit_ep::gemm_q8(a, w, y, rows, plan->k, plan->n, epilogue);
     // The int8-in / int8-out line, not the float MatMul one: the proof reads this trace back to
     // prove which of the two ran.
-    tracef("qdq rows=%lld k=%lld n=%lld sx=%lld sw=%lld", (long long)rows, (long long)plan->k,
-           (long long)plan->n, (long long)s_x_count, (long long)s_w_count);
+    tracef("qdq rows=%lld k=%lld n=%lld sx=%lld sw=%lld zp_x=%lld zp_w=%lld zp_y=%d",
+           (long long)rows, (long long)plan->k, (long long)plan->n, (long long)s_x_count,
+           (long long)s_w_count, (long long)zx_count, (long long)zw_count, (int)epilogue.zp_y);
     if (verbose()) {
-        std::fprintf(stderr, "onebit_ep: qdq %lldx%lldx%lld int8 -> int8 (sx=%.9g%s, sw=%.9g%s)\n",
+        std::fprintf(stderr,
+                     "onebit_ep: qdq %lldx%lldx%lld int8 -> int8 (sx=%.9g%s, sw=%.9g%s, zp_x=%d%s, "
+                     "zp_w=%d%s, zp_y=%d)\n",
                      (long long)rows, (long long)plan->k, (long long)plan->n,
                      s_x_count == 1 ? s_x[0] : 0.0, s_x_count == 1 ? "" : " per row",
-                     s_w_count == 1 ? s_w[0] : 0.0, s_w_count == 1 ? "" : " per column");
+                     s_w_count == 1 ? s_w[0] : 0.0, s_w_count == 1 ? "" : " per column",
+                     epilogue.zp_x, epilogue.zp_x_row ? " per row" : "", epilogue.zp_w,
+                     epilogue.zp_w_col ? " per column" : "", (int)epilogue.zp_y);
     }
     return nullptr;
 }
@@ -819,6 +964,7 @@ bool can_compute(const OrtNode* node, const char* op) {
 // say which one is the activation scale, the weight scale and the output scale.
 struct QdqDef {
     std::string x_name, w_name, sx_name, sw_name, sy_name;
+    std::string zx_name, zw_name, zy_name;  // empty when the group has no such zero point
 };
 
 std::map<std::string, QdqDef> g_qdq_defs;  // group output (y_q) value name -> roles
@@ -827,6 +973,16 @@ std::map<std::string, QdqDef> g_qdq_defs;  // group output (y_q) value name -> r
 bool qdq_fusion_enabled() {
     const char* v = std::getenv("ONEBIT_EP_QDQ");
     return !(v && *v == '0');
+}
+
+// ONEBIT_EP_QDQ_ONLY=1 claims the fused groups and nothing else. A quantised model still contains
+// float MatMuls the fused path cannot take -- attention's QK^T has no constant weight -- and on a
+// host build those would run on the naive float loop instead of the CPU EP's MLAS kernels, which
+// makes every measurement of the quantised graph meaningless. This is the knob that says "only the
+// part we are claiming to be good at".
+bool qdq_only() {
+    const char* v = std::getenv("ONEBIT_EP_QDQ_ONLY");
+    return v && *v && *v != '0';
 }
 
 // Matches the A8W8 QDQ group Quark's ONNX-to-ONNX flow emits (docs/onnx-pack.md):
@@ -840,73 +996,121 @@ bool qdq_fusion_enabled() {
 // graph with either keeps the per-node path: slower, still correct.
 //
 // `group` comes back as the four nodes to fuse into one, in graph order: dq_x, dq_w, matmul, q_y.
-bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def) {
+// Why a candidate was refused, when someone is asking (ONEBIT_EP_QDQ_DEBUG=1 histograms these in
+// GetCapability). A matcher that only says "no" is impossible to use against an exporter whose output
+// you cannot change, which is exactly what a real quantised model is.
+bool qdq_no(const char** why, const char* reason) {
+    *why = reason;
+    return false;
+}
+
+// A formatted variant, for the refusals where the interesting part is the value we did not expect. The
+// histogram in GetCapability copies the string, so one buffer is enough.
+const char* qdq_why(const char* fmt, ...) {
+    static thread_local char buf[128];
+    va_list ap;
+    va_start(ap, fmt);
+    std::vsnprintf(buf, sizeof(buf), fmt, ap);
+    va_end(ap);
+    return buf;
+}
+
+
+bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def, const char** why) {
+    *why = "matched";
     std::vector<const OrtValueInfo*> mm_in, mm_out;
-    if (!node_inputs(mm, &mm_in) || mm_in.size() != 2) return false;
-    if (!node_outputs(mm, &mm_out) || mm_out.size() != 1) return false;
+    if (!node_inputs(mm, &mm_in) || mm_in.size() != 2)
+        return qdq_no(why, "matmul arity");
+    if (!node_outputs(mm, &mm_out) || mm_out.size() != 1)
+        return qdq_no(why, "matmul output arity");
 
     // Both MatMul inputs are a DequantizeLinear output, and this group is its only consumer.
     const OrtNode* dq[2] = {nullptr, nullptr};
     for (int i = 0; i < 2; ++i) {
         size_t out_index = 0;
         dq[i] = producer(mm_in[(size_t)i], &out_index);
-        if (!dq[i] || out_index != 0) return false;
-        if (node_op(dq[i]) != "DequantizeLinear" || !onnx_domain(dq[i])) return false;
-        if (!sole_consumer(mm_in[(size_t)i])) return false;
+        if (!dq[i] || out_index != 0) return qdq_no(why, "operand is not a node output");
+        if (node_op(dq[i]) != "DequantizeLinear" || !qdq_domain(dq[i]))
+            return qdq_no(why, qdq_why("operand op=%s dom=%s", node_op(dq[i]).c_str(),
+                                       node_domain(dq[i]).c_str()));
+        if (!sole_consumer(mm_in[(size_t)i]))
+            return qdq_no(why, "dequantised value has other consumers");
     }
 
     std::vector<const OrtValueInfo*> xin, win;
-    if (!node_inputs(dq[0], &xin) || xin.size() < 2 || xin.size() > 3) return false;
-    if (!node_inputs(dq[1], &win) || win.size() < 2 || win.size() > 3) return false;
+    if (!node_inputs(dq[0], &xin) || xin.size() < 2 || xin.size() > 3)
+        return qdq_no(why, "activation DequantizeLinear arity");
+    if (!node_inputs(dq[1], &win) || win.size() < 2 || win.size() > 3)
+        return qdq_no(why, "weight DequantizeLinear arity");
 
     ONNXTensorElementDataType elem = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
     size_t rank = 0;
     // Activation: int8, rank 2 or 3, zero point zero (or absent).
-    if (!value_rank_type(xin[0], &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return false;
-    if (rank != 2 && rank != 3) return false;
+    if (!value_rank_type(xin[0], &elem, &rank)) return qdq_no(why, "activation type unknown");
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8) return qdq_no(why, "activation not int8");
+    if (rank != 2 && rank != 3) return qdq_no(why, "activation rank not 2 or 3");
     const size_t xrank = rank;
-    if (xin.size() == 3 && !int8_zero_init(xin[2])) return false;
+    if (xin.size() == 3 && zp_count(xin[2], node_axis(dq[0]), xrank == 2 ? 0 : -1, -1) < 0)
+        return qdq_no(why, "activation zero point not foldable");
 
     // Weight: a constant int8 [K, N], zero point zero (or absent).
-    if (!value_rank_type(win[0], &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != 2) return false;
-    if (!initializer(win[0])) return false;
-    if (win.size() == 3 && !int8_zero_init(win[2])) return false;
+    if (!value_rank_type(win[0], &elem, &rank)) return qdq_no(why, "weight type unknown");
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != 2)
+        return qdq_no(why, "weight not int8 rank 2");
+    if (!initializer(win[0])) return qdq_no(why, "weight is not a constant");
+    if (win.size() == 3 && zp_count(win[2], node_axis(dq[1]), 1, -1) < 0)
+        return qdq_no(why, "weight zero point not foldable");
     std::vector<int64_t> xd, wd;
-    if (!value_dims(xin[0], &xd) || !value_dims(win[0], &wd)) return false;
-    if (wd.size() != 2 || wd[0] <= 0 || wd[1] <= 0) return false;
-    if (xd.empty() || (xd.back() > 0 && xd.back() != wd[0])) return false;
+    if (!value_dims(xin[0], &xd)) return qdq_no(why, "activation shape unknown");
+    if (!value_dims(win[0], &wd)) return qdq_no(why, "weight shape unknown");
+    if (wd.size() != 2 || wd[0] <= 0 || wd[1] <= 0) return qdq_no(why, "weight shape not static");
+    if (xd.empty() || (xd.back() > 0 && xd.back() != wd[0]))
+        return qdq_no(why, "activation width is not the weight's K");
 
     // Scales: per-tensor, or per-axis along a dimension the epilogue can fold. The activation has to
     // be rank 2 for a per-row scale (a rank-3 activation's rows are batch*sequence, which no exporter
     // writes as one axis), and the weight's per-axis scale has to run along N.
-    if (!foldable_scale_len(xin[1], node_axis(dq[0]), xrank == 2 ? 0 : -1, xd.front())) return false;
-    if (!foldable_scale_len(win[1], node_axis(dq[1]), 1, wd[1])) return false;
+    if (!foldable_scale_len(xin[1], node_axis(dq[0]), xrank == 2 ? 0 : -1, xd.front()))
+        return qdq_no(why, "activation scale not foldable");
+    if (!foldable_scale_len(win[1], node_axis(dq[1]), 1, wd[1]))
+        return qdq_no(why, "weight scale not foldable");
 
     // The output side: the MatMul has exactly one consumer, a QuantizeLinear of that same value.
     size_t consumers = 0;
     if (OrtStatus* st = g_api->ValueInfo_GetValueNumConsumers(mm_out[0], &consumers)) {
         g_api->ReleaseStatus(st);
-        return false;
+        return qdq_no(why, "consumer count unreadable");
     }
-    if (consumers != 1) return false;
+    if (consumers != 1) return qdq_no(why, "matmul output has several consumers");
     const OrtNode* q = nullptr;
     int64_t q_input = -1;
     if (OrtStatus* st = g_api->ValueInfo_GetValueConsumers(mm_out[0], &q, &q_input, 1)) {
         g_api->ReleaseStatus(st);
-        return false;
+        return qdq_no(why, "consumers unreadable");
     }
-    if (!q || q_input != 0) return false;
-    if (node_op(q) != "QuantizeLinear" || !onnx_domain(q)) return false;
+    if (!q || q_input != 0) return qdq_no(why, "matmul output consumed by an unexpected input");
+    if (node_op(q) != "QuantizeLinear" || !qdq_domain(q))
+        return qdq_no(why, "matmul output consumer is not QuantizeLinear");
     std::vector<const OrtValueInfo*> qin, qout;
-    if (!node_inputs(q, &qin) || qin.size() < 2 || qin.size() > 3) return false;
-    if (qin[0] != mm_out[0]) return false;
-    if (!node_outputs(q, &qout) || qout.size() != 1) return false;
-    if (!float_scalar_init(qin[1])) return false;
-    if (qin.size() == 3 && !int8_zero_init(qin[2])) return false;
-    if (!value_rank_type(qout[0], &elem, &rank)) return false;
-    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != xd.size()) return false;
+    if (!node_inputs(q, &qin) || qin.size() < 2 || qin.size() > 3)
+        return qdq_no(why, "QuantizeLinear arity");
+    if (qin[0] != mm_out[0]) return qdq_no(why, "QuantizeLinear takes another value");
+    if (!node_outputs(q, &qout) || qout.size() != 1) return qdq_no(why, "QuantizeLinear output");
+    if (!float_scalar_init(qin[1])) return qdq_no(why, "output scale not a float scalar constant");
+    // The output zero point is added after the round, so it is always foldable -- but only as a
+    // scalar: a per-axis output zero point would need the axis of the output, and nothing emits one.
+    if (qin.size() == 3) {
+        size_t zy_count = 0;
+        if (!value_rank_type(qin[2], &elem, &rank))
+            return qdq_no(why, "output zero point type unknown");
+        if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank > 1)
+            return qdq_no(why, "output zero point not an int8 scalar");
+        if (!int8_init_data(qin[2], &zy_count) || zy_count != 1)
+            return qdq_no(why, "output zero point not a single constant");
+    }
+    if (!value_rank_type(qout[0], &elem, &rank)) return qdq_no(why, "output type unknown");
+    if (elem != ONNX_TENSOR_ELEMENT_DATA_TYPE_INT8 || rank != xd.size())
+        return qdq_no(why, "output not int8 of the activation's rank");
 
     group[0] = dq[0];
     group[1] = dq[1];
@@ -917,8 +1121,14 @@ bool match_qdq(const OrtNode* mm, const OrtNode* group[4], QdqDef* def) {
     def->sx_name = value_name(xin[1]);
     def->sw_name = value_name(win[1]);
     def->sy_name = value_name(qin[1]);
-    return !def->x_name.empty() && !def->w_name.empty() && !def->sx_name.empty() &&
-           !def->sw_name.empty() && !def->sy_name.empty();
+    if (xin.size() == 3) def->zx_name = value_name(xin[2]);
+    if (win.size() == 3) def->zw_name = value_name(win[2]);
+    if (qin.size() == 3) def->zy_name = value_name(qin[2]);
+    if (def->x_name.empty() || def->w_name.empty() || def->sx_name.empty() || def->sw_name.empty() ||
+        def->sy_name.empty())
+        return qdq_no(why, "a role has no value name");
+    *why = "matched";
+    return true;
 }
 
 OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
@@ -931,6 +1141,9 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
     OrtStatus* st = g_api->Graph_GetNodes(graph, nodes, n);
     size_t claimed = 0;
     size_t fused_groups = 0;
+    // ONEBIT_EP_QDQ_DEBUG=1: why this graph's matmuls were not fused. A real exporter's graph is not
+    // ours to change, so "0 groups" on its own is not an answer.
+    std::map<std::string, size_t> refusals;
     for (size_t i = 0; !st && i < n; ++i) {
         const char* op = nullptr;
         const char* domain = nullptr;
@@ -939,13 +1152,15 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
         if (OrtStatus* s = g_api->Node_GetOperatorType(nodes[i], &op)) g_api->ReleaseStatus(s);
         if (OrtStatus* s = g_api->Node_GetDomain(nodes[i], &domain)) g_api->ReleaseStatus(s);
         const bool onnx_domain = !domain || !*domain || std::strcmp(domain, "ai.onnx") == 0;
-        if (onnx_domain && claims_op("MatMul") && qdq_fusion_enabled()) {
+        if (onnx_domain && op && std::strcmp(op, "MatMul") == 0 && claims_op("MatMul") &&
+            qdq_fusion_enabled()) {
             // A QDQ group is claimed whole: fusing it is what keeps the dequantised float tensors
             // from ever existing. Only nodes in this group are named, and the group's output value
             // is the key Compile finds it by again.
             const OrtNode* group[4] = {nullptr, nullptr, nullptr, nullptr};
             QdqDef def;
-            if (match_qdq(nodes[i], group, &def)) {
+            const char* why = "matched";
+            if (match_qdq(nodes[i], group, &def, &why)) {
                 std::vector<const OrtValueInfo*> outs;
                 if (node_outputs(group[3], &outs) && outs.size() == 1) {
                     st = g_ep_api->EpGraphSupportInfo_AddNodesToFuse(support_info, group, 4, nullptr);
@@ -954,13 +1169,16 @@ OrtStatus* ORT_API_CALL E_GetCapability(OrtEp*, const OrtGraph* graph,
                     continue;
                 }
             }
+            if (std::getenv("ONEBIT_EP_QDQ_DEBUG")) ++refusals[why];
         }
-        if (onnx_domain && can_compute(nodes[i], op)) {
+        if (onnx_domain && !qdq_only() && can_compute(nodes[i], op)) {
             st = g_ep_api->EpGraphSupportInfo_AddNodesToFuse(support_info, &nodes[i], 1, nullptr);
             ++claimed;
         }
     }
     std::free(nodes);
+    for (const auto& [reason, count] : refusals)
+        tracef("qdq_refused why=%s count=%zu", reason.c_str(), count);
     tracef("capability nodes=%zu claimed=%zu qdq_groups=%zu", n, claimed, fused_groups);
     if (verbose())
         std::fprintf(stderr, "onebit_ep: GetCapability %zu nodes -> %zu claimed, %zu QDQ groups fused\n",
@@ -983,7 +1201,8 @@ OrtStatus* qdq_plan_for(const OrtNode* node, bool* is_qdq) {
 
     auto plan = std::make_unique<QdqPlan>();
     plan->x_index = plan->w_index = plan->sx_index = plan->sw_index = plan->sy_index =
-        (size_t)-1;
+        plan->zx_index = plan->zw_index = plan->zy_index = (size_t)-1;
+    plan->zx_count = plan->zw_count = 1;
     std::vector<const OrtValueInfo*> ins;
     if (!node_inputs(node, &ins)) {
         return g_api->CreateStatus(ORT_FAIL, "onebit_ep: fused QDQ node has unreadable inputs");
@@ -1009,6 +1228,14 @@ OrtStatus* qdq_plan_for(const OrtNode* node, bool* is_qdq) {
             plan->sw_count = scale_count(ins[i]);
         } else if (name == def.sy_name) {
             plan->sy_index = i;
+        } else if (!def.zx_name.empty() && name == def.zx_name) {
+            plan->zx_index = i;
+            plan->zx_count = zp_element_count(ins[i]);
+        } else if (!def.zw_name.empty() && name == def.zw_name) {
+            plan->zw_index = i;
+            plan->zw_count = zp_element_count(ins[i]);
+        } else if (!def.zy_name.empty() && name == def.zy_name) {
+            plan->zy_index = i;
         }
     }
     if (plan->x_index == (size_t)-1 || plan->w_index == (size_t)-1 ||
@@ -1021,6 +1248,8 @@ OrtStatus* qdq_plan_for(const OrtNode* node, bool* is_qdq) {
         (plan->sw_count != 1 && plan->sw_count != plan->n)) {
         return g_api->CreateStatus(ORT_FAIL, "onebit_ep: fused QDQ scales do not fit the weight");
     }
+    // Read what the log needs before the plan is moved into its storage: after std::move, `plan` is
+    // null and dereferencing it is the kind of bug that only shows up in an optimized build.
     const std::string fname = node_name(node);
     const int64_t plan_k = plan->k, plan_n = plan->n;
     g_plans[fname] = plan.get();

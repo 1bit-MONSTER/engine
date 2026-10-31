@@ -177,11 +177,22 @@ intermediate float tensor then never exists.
   (it weights the individual products inside the sum, which is SmoothQuant's job at export time), so
   the case gates on the EP *not* claiming the group — `claimed=1, qdq_groups=0`, the per-node path,
   and the same int8 output.
-- **Not done: asymmetric zero points.** Zero points are claimed only when every element is 0 (the
-  shape of `zp` does not matter — a scalar or a per-axis vector of zeros is symmetric either way);
-  a non-zero `zp` is not free: the product gains the correction terms `-zp_x·Σ_k w_q[k][n]`,
-  `-zp_w·Σ_k a_q[m][k]` and `+K·zp_x·zp_w`, which belong in the epilogue (column sums precomputed at
-  weight load, row sums with the activation quantisation), with a proof whose graph has `zp != 0`.
+- **Works: asymmetric zero points, folded into the same epilogue.** Writing the shifted product out,
+  `Σ_k (a-zx)(w-zw) = Σ_k a·w − zx·Σ_k w − zw·Σ_k a + K·zx·zw`, the GEMM already computes the first
+  term, the second is a **column sum of the weight** (computed once on the first run that needs it and
+  kept for the session — never per step), and the third is a **row sum of the activation** (one extra
+  add per k while the row is already being read). The output zero point is added after the
+  round-half-to-even, in that order, because rounding after an integer shift would move exact ties to
+  the wrong neighbour. All three are per-tensor or per-axis along the same axes as the scales, and the
+  corrections are exact int64. Measured, `ctest -R onebit_ep_qdq_proof`: `worst |d| = 0` LSB against
+  the CPU EP for `zp_x = −40, zp_w = −25, zp_y = −7` with per-tensor scales, **and** for the fully
+  per-axis case (8 row scales and 8 row zero points, 6 column scales and 6 column zero points, plus
+  `zp_y`); the EP trace for those runs reads `zp_x=8 zp_w=6 zp_y=-7` with a one-off
+  `qdq_colsum k=… n=…`. A symmetric graph never computes the column sums (its trace reads `zp_x=1
+  zp_w=1 zp_y=0` and no `qdq_colsum`), which is the point of doing it lazily.
+- **Not done: a zero point along K.** Like a scale along K it would weight the products inside the sum
+  — it needs `Σ_k zp_x[k]·w_q[k][n]`, a column-weighted vector of the weight that no kernel here
+  precomputes — so a graph with one keeps the per-node path.
 - **Not done: the device leg of the fused path.** The fused node's int8 GEMM runs on the host today.
   Feeding int8 activations straight into the device kernel's input BO needs a runtime entry that
   writes `Am` from int8 and packs int8 weights without the `amax/127` quantisation step (`packB` is
@@ -191,7 +202,59 @@ intermediate float tensor then never exists.
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
   natural split afterwards is our Q4NX pack for weight-only and the Quark QDQ path for A8W8.
 
-The proof is deliberately opset-21 and domain-only, and symmetric (zero point 0) throughout: it pins
-down the claim (our EP takes the whole group as one node and the arithmetic is exact) for the
-per-tensor and per-axis forms Quark emits by default, and leaves the two documented gaps above —
-asymmetric zero points and the device leg — for their own proofs.
+### A real Quark export, through the EP
+
+`onnx/quantize_quark_a8w8.py` runs AMD's Quark ONNX flow (source tree, `release/0.13`) on
+`qwen3-0.6b.onnx`, calibrating on 32 x 512 tokens of local text (no dataset download). Quark writes the
+`QuantizeLinear`/`DequantizeLinear` pair in the **com.microsoft** domain, which the EP accepts as the
+same operator; it also quantises only what it is told to, so `--matmul-only` keeps attention's
+QK^T/AV (which have no constant weight) in float.
+
+On a 0.6B A8W8 export with per-channel weights, the graph ORT hands the EP (4169 nodes, ORT_ENABLE_BASIC
+so the DQ/Q pairs survive) partitions like this:
+
+| | count |
+|---|---|
+| `DequantizeLinear -> MatMul -> QuantizeLinear` groups fused into one node each | **197** (all the projections: 28x7 + lm_head) |
+| ONNX nodes those 197 groups replace | 788 |
+| `MatMul` left on the CPU EP | 57 (28 QK^T + 28 AV, whose activation is rank 4, + 1 rotary matmul whose weight is a `Cast`) |
+| everything else on the CPU EP | the remaining 3381 nodes: activation Q/DQ, LayerNorm, softmax, rope, elementwise |
+
+Measured, single-threaded, `1bit ort-run --basic` on the same 5-token prompt (`--dump-logits`), 16
+tokens generated:
+
+| run | tokens/s | ms/token | KL vs float (prefill logits) | top-1 |
+|---|---|---|---|---|
+| float32 graph, CPU EP | 7.39 | 135 | — | 12095 (" Paris") |
+| A8W8 per-channel, CPU EP | 1.43 | 699 | 2.19 nats | 9625 |
+| A8W8 per-channel, our EP | **2.09** | 479 | 2.81 nats | 279 |
+| A8W8 per-tensor, CPU EP | 3.09 | 323 | 6.49 nats | 279 |
+| A8W8 per-tensor, our EP | 2.06 | 486 | 6.49 nats | 279 |
+
+Three things that table says, none of them flattering and all of them worth knowing:
+
+1. **The fused path is 1.46x the CPU EP on the per-channel export and 0.67x on the per-tensor one.**
+   Per-channel `DequantizeLinear` is expensive on the CPU EP (it broadcasts a vector), so removing the
+   whole DQ -> float MatMul -> Q sequence pays off there; per-tensor DQ is cheap and MLAS's float
+   MatMul is faster than this host int8 kernel. This is a host-kernel measurement: the device leg is
+   where the 1.5x-per-projection argument in this document actually lands.
+2. **The quantisation, not the EP, is what costs accuracy.** KL 2.2-2.8 nats is my calibration's
+   fault (32 documents, MinMax, no AdaRound/QuaRot/SmoothQuant), and the per-tensor export (6.5 nats)
+   is worse still: one int8 scale per weight matrix is not enough for this model. AMD's own recipe is
+   the one that produces a usable model; this export exists to exercise the EP.
+3. **The Python `probe_dump` comparison is the honest correctness gate, not bit-identity.** On the
+   per-tensor export the two paths are bit-identical (KL 0.000 between them, 17 of 17 decode steps
+   the same). On the per-channel export the fused int8 kernel and the CPU EP's DQ -> float MatMul -> Q
+   agree exactly on the first 38 projection tensors and then differ on **1 value in 5120 (0.02 %)**:
+   the accumulator is -3090, the exact value is -3.499998 and rounds to -3, while the CPU EP's float32
+   accumulation lands on exactly -3.500000 and rounds half-to-even to -4. Both are right for their own
+   arithmetic; the difference then cascades, because every layer requantises to int8 and there is no KV
+   cache to damp it. That is why the fused path's KL is 2.81 and the CPU EP's 2.19 on the same graph,
+   and why the proof's gate is bit-exactness on graphs where the values are not on a boundary.
+
+The EP's debug knob for exactly this work is `ONEBIT_EP_QDQ_DEBUG=1`: it logs, per graph, why each
+`MatMul` was *not* fused (`qdq_refused why=... count=...`). Without it "0 groups" is not an answer.
+
+The proof is deliberately opset-21 and domain-only. It pins down the claim (our EP takes the whole
+group as one node and the arithmetic is exact) for the per-tensor, per-axis and asymmetric forms
+Quark emits by default, and leaves the one documented gap above — the device leg — for its own proof.

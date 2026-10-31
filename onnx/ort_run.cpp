@@ -56,10 +56,14 @@ int fail(const char* what, const OrtStatus* st) {
 // keeps it. That ordering is the whole point of the two-engine story: our NPU EP is asked first for
 // the matmul shapes it has an ELF for, a GPU EP (HIP/ROCM) is asked next, and the CPU EP mopped up.
 OrtStatus* make_session(OrtEnv* env, const char* model_path, const std::vector<const char*>& eps,
-                        int threads, OrtSession** out) {
+                        int threads, bool basic, OrtSession** out) {
     OrtSessionOptions* so = nullptr;
     if (OrtStatus* st = api->CreateSessionOptions(&so)) return st;
-    OrtStatus* st = api->SetSessionGraphOptimizationLevel(so, ORT_ENABLE_ALL);
+    // ALL is the right level for a float graph. A QDQ graph is the exception: ALL runs the graph
+    // transformations that fold DequantizeLinear/QuantizeLinear back into float ops (and into
+    // QLinearMatMul), which is exactly the pattern a quantised EP wants to claim, so --basic keeps the
+    // graph as it was exported.
+    OrtStatus* st = api->SetSessionGraphOptimizationLevel(so, basic ? ORT_ENABLE_BASIC : ORT_ENABLE_ALL);
     if (!st) st = api->SetIntraOpNumThreads(so, threads);
     std::vector<const OrtEpDevice*> order;                  // everything registered so far
     std::vector<std::vector<const OrtEpDevice*>> groups;    // one group per library, in order
@@ -122,6 +126,7 @@ struct Args {
     // generate, -w warmup runs, -r repeats. The defaults are theirs, so the block we print is
     // directly comparable with model_benchmark.exe output.
     bool bench = false;
+    bool basic = false;  // ORT_ENABLE_BASIC: keep a QDQ graph's DequantizeLinear/QuantizeLinear nodes
     std::vector<int64_t> lens;
     int gen = 128;
     int warmup = 1;
@@ -176,8 +181,10 @@ bool parse_args(int argc, char** argv, Args* a) {
         else if (arg == "--ep" && more) a->eps.push_back(argv[++i]);
         else if ((arg == "--steps" || arg == "-n") && more) a->steps = std::atoi(argv[++i]);
         else if (arg == "--dump-logits" && more) a->dump = argv[++i];
+        else if (arg == "--basic") a->basic = true;
         else if (arg == "--threads" && more) a->threads = std::atoi(argv[++i]);
         else if (arg == "--no-mask") a->mask = false;
+        else if (arg == "--basic") a->basic = true;
         else if (arg == "--cached") a->cached = true;
         else if (arg == "--bench") a->bench = true;
         else if (arg == "--lens" && more) a->lens = parse_lens(argv[++i]);
@@ -204,6 +211,8 @@ bool parse_args(int argc, char** argv, Args* a) {
         std::fprintf(stderr,
                      "usage: ort-run --model <file.onnx> [--ep <lib.so>]... --ids \"<id> <id>\"\n"
                      "               [-n N] [--dump-logits DIR] [--no-mask] [--threads N] [--cached]\n"
+                     "               [--basic]   (keep a QDQ graph's DQ/Q nodes: no graph-transformation\n"
+                     "                            folding, which is what a quantised EP claims)\n"
                      "       ort-run --model <cached.onnx> --cached --bench [--lens \"2048,1024,512,256,128\"]\n"
                      "               [--gen 128] [--warmup 1] [--repeat 5]\n"
                      "       --bench prints AMD's model_benchmark.exe block (avg/p50/stddev per stage) so\n"
@@ -377,7 +386,10 @@ int run_cached(OrtSession* session, OrtMemoryInfo* mi, const Args& a, RunStats* 
                         rc = fail("read logits", s);
                     } else {
                         dump_row(p, count, vocab, a.dump, step);
-                        const float* row = p + (size_t)vocab * (size_t)(seq - 1);
+                        // The last row of whatever the graph returned: a graph that slices its own
+                        // output to the final position returns one row, a full-logits graph returns
+                        // `seq`. Indexing by seq-1 read past the end of the sliced one.
+                        const float* row = p + (size_t)count - (size_t)vocab;
                         const auto q0 = std::chrono::steady_clock::now();
                         int64_t best = 0;
                         for (int64_t id = 1; id < vocab; ++id)
@@ -522,7 +534,7 @@ int onebit_ort_run_main(int argc, char** argv) {
     }
 
     OrtSession* session = nullptr;
-    if (OrtStatus* st = make_session(env, a.model, a.eps, a.threads, &session)) {
+    if (OrtStatus* st = make_session(env, a.model, a.eps, a.threads, a.basic, &session)) {
         int rc = fail("create session", st);
         api->ReleaseMemoryInfo(mi);
         api->ReleaseEnv(env);

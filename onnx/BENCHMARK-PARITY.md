@@ -132,6 +132,40 @@ claims it is. The next levers, in order, are graph-side: keep only the last logi
 `logits[:, -1:, :]` slice would delete most of the prefill's lm_head matmul) and profile the 56
 per-layer `Concat`s before touching them.
 
+## Round 3: the last-logits slice, and the prefill lever that was not there
+
+The cached graph used to return `logits [1,seq,151936]` for the whole prompt when the runner reads one
+row. Slicing it to the final position is one line, drops peak RSS by 1.4 GB, and **changed no timing**.
+That invited a second try — run the backbone, then apply the head to the last hidden row, so the head
+matmul is 1 row instead of `seq` — and that is no faster either. `ryzen`, 8 threads, 128 generated,
+four graphs in order of when they were built:
+
+| prompt | prefill base → bound cache → slice → head-last | decode base → bound cache → slice → head-last | peak RSS |
+|---|---|---|---|
+| 128 | 1102 → 1051 → 848 → 792 | 16.73 → 16.70 → 16.73 → 16.33 | |
+| 256 | 1220 → 1198 → 1149 → 1028 | 15.21 → 15.29 → 15.24 → 14.64 | |
+| 512 | 1175 → 1072 → 1141 → 909 | 13.12 → 12.66 → 12.98 → 12.34 | |
+| 1024 | 778 → 866 → 777 → 615 | 9.87 → 9.89 → 10.09 → 9.57 | |
+| 2048 | 639 → 621 → 567 → 640 | 6.73 → 6.60 → 6.67 → 6.43 | 8.20 → 7.98 → **6.60** → 6.60 GB |
+
+Read the spread against the noise: per-length stddev on these prefill numbers is 30–460 ms, so those
+columns are one number, not four. The only reproducible change across the whole round is memory.
+
+Why the head was never the lever: it is 155M of the model's 596M parameters. Prefill does
+2 x 0.596e9 x 2048 = 2.4 TFLOP for a 2048-token prompt and takes ~3.2 s, i.e. **~760 GFLOP/s on eight
+cores** — that is the machine's fp32 throughput, so the stage is compute-bound at the hardware, not
+slow because of graph shape. Deleting 155M of 596M params from one stage cannot show up.
+
+What that leaves, honestly:
+
+- **Prefill on CPU has no headroom left in the graph.** The fix is arithmetic density (int8/int4
+  weights instead of fp32) or a different device — which is exactly why the NPU row exists.
+- **Decode is bandwidth-bound** (2.4 GB of fp32 weights read per token), so it wants the same medicine:
+  narrower weights.
+- The slice is kept for the 1.4 GB it saves and nothing else. The one-line version beats the
+  backbone-plus-head version at equal memory, because it is one line and does not depend on HF
+  attribute names (`self.inner.model`, `self.inner.lm_head`) that transformers moves between releases.
+
 ## NPU row: our engine, the dx route
 
 Qwen3-0.6B through `1bit serve -m <dir> --device npu --npu-opt dx=<kernel dir>`, 64 generated tokens,
@@ -161,20 +195,76 @@ Read against the CPU rows for the same model:
   as 3 µs/token — measured once, discarded, and now the reason `--mode` exists (`stream` is for
   servers that really stream, like `flm`).
 
+**Does a 2048-token prompt complete on dx?** Yes. One bounded request (`--lens 2048 --gen 8 -w 0 -r 1`,
+`timeout 600`, single `flock`, port 52703) returned cleanly: the chat template turned the request into
+**2,678** prompt tokens, prefill ran at **54.76 tok/s = 48.9 s**, then 8 tokens at **41.11 tok/s**
+(24.3 ms/token), E2E 49.07 s, exit 0, device released.
+
+The earlier "hang" was the harness, not the route: that run asked for 128 tokens over 6 repetitions,
+i.e. ~52 s per repetition and over five minutes of silence with the client blocked in a read. Looks
+like a hang, is not one — recorded because the first write-up called it a hang.
+
+## The NPU prefill gap, in numbers
+
+Same model, same box, the two stages are not close:
+
+| prompt tokens | our prefill | our decode | FLM prefill (1k) | FLM decode |
+|---|---|---|---|---|
+| 162 | 77.69 tok/s | 72.64 tok/s | — | — |
+| 332 | 76.02 | 62.56 | — | — |
+| 672 | 71.71 | 56.09 | — | — |
+| 1335 | 63.30 | 47.70 | 1269 (at 1024) | ~73 |
+| 2678 | 54.76 | 41.11 | — | — |
+
+Three measurements that pin it down:
+
+1. **Our prefill runs at our decode rate** (63.3 vs 47.7 tok/s at 1335 tokens; 77.7 vs 72.6 at 162).
+   Prefill is therefore making one token-sized pass over the 28 layers per prompt token, exactly like
+   decode does, instead of batching the prompt into wider matmuls.
+2. **The budget per layer is the whole story.** At 1335 tokens prefill is 15.8 ms/token across 28
+   layers = ~564 us per layer dispatch. FLM at 1024 tokens is 1269 tok/s = 0.79 ms/token = ~28 us per
+   layer. Same AIE designs class, same weights, 20x apart.
+3. **Arithmetic cannot explain it.** Decode performs the same 28 layer matmuls per token, plus
+   attention over the whole cache plus sampling, and lands at 21 ms/token — the extra prefill-only cost
+   is not math.
+
+So the concrete next lever, in order:
+
+- **Collapse the per-layer host round trips.** One XRT submission per layer, 28 times per token, is
+  what the two numbers above say we pay. Submitting the layer chain as one runlist is the cheap
+  experiment, and the harness already knows how to pick that path (`npu_ab.sh --native-path
+  runlist|split` exists for exactly this comparison). Target: the ~20x that FLM's 28 us/layer shows is
+  reachable on this silicon.
+- **If the round trips are already collapsed, the lever is rows, not dispatch:** a multi-row design
+  (more activation rows per kernel invocation) makes prefill a batched matmul, which is what the stage
+  wants. That is a kernel-generation change in `addons/npu-dx/scripts/build-kernels.sh`, i.e. the next
+  generation of designs, not a tuning flag.
+
+What is measured and what is inferred, since the difference matters: the rates above are measured; the
+split of those 564 us between dispatch and compute is **inferred** — the dx route exposes no per-layer
+profile hook, so nobody has seen where the time goes. A profile is the first thing to add before
+choosing between the two levers, and it is cheaper than either.
+
 ## What this table says
 
 - The numbers are **not** comparable to AMD's published one as a speed claim: theirs is an int4 NPU
   on Windows, ours is fp32 CPU or our own int4 NPU route on Linux. What is comparable is the
   definition, so any of our rows drop into their table without translation.
-- Four times the threads buys 1.4× at 128 tokens and 1.2× at 2048: the fp32 CPU graph is
-  bandwidth-bound, streaming a 2.4 GB weight file. 32 threads on `strixhalo` and 8 on `ryzen` land
-  within 20% of each other at long context, which is the tell.
+- Four times the threads buys 1.4× at 128 tokens and 1.2× at 2048 of **decode**, which is
+  bandwidth-bound: it reads the 2.4 GB fp32 weight file per token. 32 threads on `strixhalo` and 8 on
+  `ryzen` land within 20% of each other at long context, which is the tell. Prefill does not behave
+  that way at all — see the next bullet — which is why the two stages need different fixes.
 - The CPU graph's decode degrades with context (16.7 → 6.7 tok/s from 128 to 2048) and round 2 shows
   it is not the cache buffers. The NPU route shows what the same model looks like when the cache is
   actually held on device: 72.6 → 47.7 over a comparable range.
-- Prefill is memory-bound on CPU (639 tok/s at 2048 against 1220 at 256, TTFT 3.2 s) and compute-bound
-  on the NPU (63 tok/s, 21 s for the same prompt). Those are two different problems with two
-  different fixes.
+- **Prefill on CPU is compute-bound at the hardware, decode is bandwidth-bound at it**, and round 3 is
+  what settled that: 2048 prompt tokens cost 2.4 TFLOP and take ~3.2 s, i.e. ~760 GFLOP/s on eight
+  cores, which is what those cores do. Deleting the head's matmul over the prompt changed nothing for
+  that reason. So neither stage has graph-level headroom left on CPU: both want narrower weights
+  (int8/int4) or another device, in that order of effort.
+- On the NPU the shape of the problem is different again: prefill 54–78 tok/s (compute-bound, and
+  ~20× off FLM's per-layer dispatch cost) with decode 41–73 tok/s on top of it. The lever there is
+  described in the prefill section, and it is a dispatch or design change, not a tuning flag.
 
 ## Reproducing
 

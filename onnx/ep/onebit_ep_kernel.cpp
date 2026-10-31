@@ -32,6 +32,7 @@
 #include "onebit_ep_kernel.h"
 
 #include <cstdarg>
+#include <fcntl.h>
 #include <cstdio>
 #include <unistd.h>
 #include <cstdint>
@@ -58,8 +59,17 @@ void trace_fallback(const char* fmt, ...) {
     if (!on || !*on || *on == '0') return;
     char path[64];
     std::snprintf(path, sizeof(path), "/tmp/onebit_ep_trace.%ld.log", (long)::getpid());
-    FILE* f = std::fopen(path, "a");
-    if (!f) return;
+    // open(0600) + fdopen, not fopen("a"): fopen creates with 0666 & ~umask, so under a permissive umask the
+    // note is world-writable in /tmp (CodeQL cpp/world-writable-file-creation), and it would follow a symlink
+    // planted at that path. This is exactly what the EP's own trace does (onebit_ep.cpp, tracef), so the two
+    // writers agree on the mode as well as the file.
+    const int fd = ::open(path, O_WRONLY | O_CREAT | O_APPEND | O_NOFOLLOW | O_CLOEXEC, 0600);
+    if (fd < 0) return;
+    FILE* f = ::fdopen(fd, "a");
+    if (!f) {
+        ::close(fd);
+        return;
+    }
     va_list ap;
     va_start(ap, fmt);
     std::vfprintf(f, fmt, ap);

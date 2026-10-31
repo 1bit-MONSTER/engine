@@ -112,9 +112,12 @@ model.
 
 ## Where the numbers live
 
-The device measurements (tokens/s with our EP on q/k/v vs the CPU-EP control, and KL(forward‖ort)
-against `1bit npu-run`) belong in `~/briefs/TORTEP-STATE.md` under deliverable 4, with the exact
-commands. This note is the design; the state file is the evidence.
+The measurements live in the tree, with the commands that produced them:
+[onnx/BENCHMARK-PARITY.md](../onnx/BENCHMARK-PARITY.md) holds the CPU rows (ryzen and Strix Halo, five
+prompt lengths, default and `--cached` exports) and the NPU row taken with the AMD `model_benchmark`
+protocol through `onnx/bench_npu.sh`; the execution-provider proof (MatMul on the NPU within 0.5 % of
+the CPU provider, the A8W8 QDQ pattern byte-identical) is on [ONNX Runtime](onnx.md). This note is the
+design; those two pages are the evidence.
 
 ## A8W8 QDQ, the shape Quark emits
 

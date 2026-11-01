@@ -197,6 +197,12 @@ public:
     bool step_batch(const std::vector<int>& tokens, int start_pos,
                     std::vector<float>& logits);
 
+    // The last position's hidden state after the final norm, H floats: what a d3 readout head pools
+    // (`pooling: last` in a pack's decision_config.json, npu/decision.h). Filled by the last
+    // successful step() or step_batch(), empty before that. This is the vector the LM head reads, not
+    // the raw residual, because that is what a packed decision head was trained against.
+    const std::vector<float>& last_hidden() const { return last_hidden_; }
+
     // Rows per batched launch. The activation BO holds exactly MD rows and the
     // per-op kernels are built M=MD wide, so a batch must not exceed this (the
     // batched quantizer refuses batches wider than MD rather than corrupting).
@@ -207,6 +213,7 @@ public:
 
 private:
     bool load_norms();
+    std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;

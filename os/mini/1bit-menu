@@ -227,8 +227,12 @@ pick() {
                 p_hint=${p_it#*|}
                 [ "$p_hint" = "$p_it" ] && p_hint=
                 if [ "$p_k" = "$p_i" ]; then
-                    printf '  %s> %s  %-10s%s' "$REV" "$p_k" "$p_lab" "$RESET"
-                    printf '  %s%s\033[K\n' "$BOLD" "$p_hint"
+                    # #707: the bar covers the whole row, not just " > 1  Chat ". Pad the row to the
+                    # terminal width BEFORE inverse video, so the number, the label and the description are
+                    # one bar (the c18 screenshots showed a short box offset from the menu text).
+                    p_txt=$(printf '> %s  %-10s  %s' "$p_k" "$p_lab" "$p_hint")
+                    while [ "${#p_txt}" -lt $((COLS - 2)) ]; do p_txt="$p_txt "; done
+                    printf '  %s%s%s\033[K\n' "$REV" "$p_txt" "$RESET"
                 else
                     printf '     %s  %-10s' "$p_k" "$p_lab"
                     printf '  %s%s%s\033[K\n' "$GREY" "$p_hint" "$RESET"

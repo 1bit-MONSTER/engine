@@ -112,10 +112,26 @@ a different iGPU:
 | 0.6B down 3072×1024 | 16384 | 4.03 ms / 25.6 | 9.71 ms / 10.6 |
 
 M ≤ 2048 reproduces within 3 %, and a fresh-process M-sweep puts a hard knee between M=2048
-(36.9 TFLOP-s) and M=4096 (12.5 TFLOP-s), linear above it. It is not the library (four different
-`libggml-hrx` builds agree to 0.5 %) and not clocks (2895 MHz, 72-78 C throughout); the box differs
-in that two live HRX serves are resident and GTT sits at 33-35 GB of 128 GB with 182 free 2 MiB
-blocks. Cause unproven; the effect is measured and reproducible.
+(36.9 TFLOP-s) and M=4096 (12.5 TFLOP-s), linear above it.
+
+The knee is a dispatch rule, not an accident: the Q4_K prefill path
+(`common.mul_mat.q4_k_q8_1_x4_prefill`) is capped at 256-2048 tokens, and Q4_K cannot use the
+split-tail relaxation because its head binds the weight in the packed Row64 layout, so every M above
+2048 rides `hip.dense_prefill.mm` instead. That alone is not a problem — on the `rc-2026-10-31c`
+binaries the same GEMM at M=16384 runs at **18.6 ms / 43.95 TFLOP-s** on this very boot, i.e. slightly
+better than the pre-reset numbers. The 12.4 TFLOP-s in the table above is what *current main* does
+with that kernel.
+
+That gap is a build regression, isolated by crossing the two libraries: today's `libggml-hrx` is slow
+even when driving the older `libhrx`/`libloomc`, and the older `libggml-hrx` is fast even when driving
+today's, with the same dispatch and the same kernel corpus (335 code objects) in all four arms. Both
+sides are on llama.cpp pin `4a58da9b0`, so it is build configuration rather than source. Filed as
+[engine#782](https://github.com/1bit-MONSTER/engine/issues/782); clocks (2895 MHz, 72-78 C) and the
+box's GTT occupancy were ruled out, several builds each.
+
+The consequence for the split is in the next table, and the honest reading of it is that a split's
+ceiling follows whatever the iGPU is currently doing — which, on main today, is 3.5x below what the
+same hardware does on the release candidate.
 
 At that 8:1 iGPU:NPU ratio the split *does* win, and at the balance point rather than at M-256:
 

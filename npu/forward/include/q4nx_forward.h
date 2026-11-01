@@ -159,6 +159,26 @@ public:
     // Clear the KV cache (start a new sequence).
     void reset();
 
+    // A prefix of the sequence in host memory, so a request that shares it can skip its prefill
+    // (app/npu_prefix_cache.h, issue #650).  Attention KV is per layer, per position [NKV][HD]; a
+    // GDN layer additionally carries a conv window and a recurrent state across positions, which is
+    // why a snapshot is not just kcache_/vcache_ (reset() had the same bug once).
+    struct StateSnapshot {
+        int tokens = 0;                     // positions covered, counted from 0
+        size_t per_pos = 0;                 // NKV*HD floats per layer per position
+        std::vector<std::vector<float>> k, v, conv, rec;  // [layer] -> the used part
+        size_t bytes() const;
+    };
+    // Copy the state of the first `tokens` positions out.  False when the forward is not ready or
+    // `tokens` exceeds what it holds.
+    bool snapshot_state(int tokens, StateSnapshot& out) const;
+    // Replace the state with the first `tokens` positions of `in`: the caller then continues at
+    // position `tokens`.  Restoring fewer positions than the snapshot holds is the normal case (a
+    // request resumes to just short of its own prompt and re-runs the last token), and restoring
+    // more than asked would append a duplicate of that token.  False when the snapshot does not fit
+    // this forward's geometry.
+    bool restore_state(const StateSnapshot& in, int tokens);
+
     // Grow the KV cache by n_tokens empty positions, in the exact per-layer
     // pos-major [NKV][HD] float layout attention() appends (2 x NKV x HD x NL
     // floats per token).  This is the "extend context" path of the capacity

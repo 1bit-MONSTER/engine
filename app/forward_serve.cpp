@@ -35,6 +35,7 @@
 #include "../npu/forward/include/q4nx_forward.h"
 #include "npu_device_lock.h"
 #include "npu_grammar.h"
+#include "npu_prefix_cache.h"
 #include "npu_sampling.h"
 #include "tokenizer.h"
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
@@ -76,7 +77,18 @@ struct ForwardEngine {
     // decode() of every vocabulary id, built on the first constrained request: the GBNF
     // mask tests each token's text against the grammar state, per token.
     std::vector<std::string> tok_text;
+    // Saved prompts (issue #650): the slot table decides what to keep, prefix_state holds each
+    // slot's attention KV and GDN state.  Only ever touched under mu.
+    std::unique_ptr<npu::PrefixCache> prefix;
+    std::vector<Q4nxNpuForward::StateSnapshot> prefix_state;
     std::mutex mu;
+};
+
+// What one request did, for the `usage` object and the prefix log line (issue #650).
+struct CallStats {
+    int prompt_tokens = 0;
+    int completion_tokens = 0;
+    npu::PrefixDecision prefix{-1, 0, "off"};  // "off" when --prefix-slots 0
 };
 
 // One generated token's log-probability entry, with the text that token produced.  The two travel
@@ -157,9 +169,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     std::unique_ptr<npu::Grammar> grammar;
     try {
         opts = npu::options_from_body(body);
-        // logprobs is served in the chat shape (choices[0].logprobs.content).  The legacy
-        // /v1/completions shape is a different object (tokens / token_logprobs arrays) that this
-        // route does not implement, and a silently dropped field is what it must not do.
+        // logprobs is served in the chat shape; the legacy /v1/completions shape is a different
+        // object this route does not implement, and a silently dropped field is what it must not do.
         if (!chat && opts.sample.logprobs)
             throw std::runtime_error("logprobs: served on /v1/chat/completions, not on /v1/completions");
         if (opts.json_object || !opts.grammar.empty())
@@ -183,13 +194,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                                   std::chrono::system_clock::now().time_since_epoch()).count());
     const std::string object = chat ? (stream ? "chat.completion.chunk" : "chat.completion") : "text_completion";
 
+    CallStats stats;  // filled by run(): token counts and the prefix decision
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    // `on_text` also receives the log-probability entries of the tokens whose bytes that piece
-    // carries (empty unless the request asked for logprobs), so a streamed delta and a
-    // non-streamed reply report the same entries in the same order.
-    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram](
+    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram, &stats](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.
@@ -199,6 +208,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         // carries it, and those models derail into their special tokens without it.
         if (chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
+        stats.prompt_tokens = int(ids.size());
         // The KV cache grows with every position: the prompt and the answer together stay
         // inside the model's context.
         const int room = e.max_context - int(ids.size());
@@ -213,13 +223,52 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         // M=128 wide, so a per-token pass leaves ~99% of the array idle).
         // step_batch falls back to per-token step() for the architectures it does
         // not model, so this is behavior-preserving.
+        // (issue #650) Resume from the longest saved prompt that is a prefix of this one, then
+        // prefill only the remainder.  Reuse stops one token short of the whole prompt even on a
+        // full-length hit: the answer is drawn from the last position's logits and a snapshot holds
+        // state, not logits, so that token is run again.
+        int resume = 0;
+        if (e.prefix && e.prefix->enabled()) {
+            const npu::PrefixDecision d = e.prefix->lookup(ids);
+            stats.prefix = d;
+            const int want = std::min(d.cached_tokens, int(ids.size()) - 1);
+            // The forward clears itself only when a batch starts at 0 (step_batch), and a resumed
+            // prefill starts above 0, so the previous request's state has to go first.
+            if (d.slot >= 0 && want > 0) {
+                e.fwd->reset();
+                if (e.fwd->restore_state(e.prefix_state[size_t(d.slot)], want)) {
+                    resume = want;
+                    stats.prefix.cached_tokens = resume;
+                } else {
+                    e.fwd->reset();
+                    stats.prefix = npu::PrefixDecision{-1, 0, "slot has no usable state"};
+                }
+            }
+            // One line per decision, as FLM logs it, so the behaviour is checkable without a debugger.
+            std::fprintf(stderr, "[prefix] slot=%d cached=%d of %zu reason=%s\n", stats.prefix.slot,
+                         stats.prefix.cached_tokens, ids.size(), stats.prefix.reason.c_str());
+        }
         {
             const int chunk_max = std::max(1, e.fwd->max_batch_rows());
-            for (int off = 0; off < (int)ids.size(); off += chunk_max) {
+            for (int off = resume; off < (int)ids.size(); off += chunk_max) {
                 const int take = std::min(chunk_max, (int)ids.size() - off);
                 std::vector<int> chunk(ids.begin() + off, ids.begin() + off + take);
                 if (!e.fwd->step_batch(chunk, off, logits))
                     throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+            }
+        }
+        // Save the prompt's own state for the next request that shares it: taken here, at the
+        // prefill boundary, because the decode loop appends the answer to the same cache.
+        if (e.prefix && e.prefix->enabled() && !ids.empty()) {
+            Q4nxNpuForward::StateSnapshot snap;
+            if (e.fwd->snapshot_state(int(ids.size()), snap)) {
+                std::string why;
+                const int slot = e.prefix->insert(ids, snap.bytes(), stats.prefix.slot, &why);
+                if (slot >= 0 && size_t(slot) < e.prefix_state.size()) {
+                    e.prefix_state[size_t(slot)] = std::move(snap);
+                    std::fprintf(stderr, "[prefix] saved slot=%d tokens=%zu bytes=%zu %s\n", slot, ids.size(),
+                                 e.prefix_state[size_t(slot)].bytes(), why.c_str());
+                }
             }
         }
 
@@ -255,9 +304,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         };
 
         std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
-        // Entries whose bytes are still held in `pending`, each with the bytes of its piece that have
-        // not been flushed yet.  An entry is released by the flush that emits its last byte, so a
-        // piece the stop-holdback split across two chunks still reports exactly once.
+        // Entries whose bytes are still held in `pending`, each with the bytes of its piece not yet
+        // flushed: an entry is released by the flush that emits its last byte, so a piece the
+        // stop-holdback splits across two chunks still reports exactly once.
         std::vector<std::pair<Emitted, size_t>> held;
         const bool want_lp = opts.sample.logprobs;
         auto take_held = [&held](size_t bytes) {
@@ -269,7 +318,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                     out.push_back(held.front().first);
                     held.erase(held.begin());
                 } else {
-                    held.front().second -= left;  // a later flush finishes this piece
+                    held.front().second -= left;
                     left = 0;
                 }
             }
@@ -289,10 +338,10 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             if (gram) gram->feed(grammar_state, e.tok_text[next]);
             const std::string piece = e.tok->decode(next);
             pending += piece;
-            // The values are the raw distribution: `logits` is the vector the sampler read and it
-            // is not modified by the call above, so this is pre-top_k/top_p/temperature and the
-            // grammar's mask cannot narrow it.
-            if (want_lp) held.emplace_back(Emitted{piece, npu::logprobs_of(logits, next, opts.sample.top_logprobs)}, piece.size());
+            // Raw distribution: sample_token() takes logits by const reference, so this is
+            // pre-top_k/top_p/temperature and the grammar mask cannot narrow it.
+            if (want_lp)
+                held.emplace_back(Emitted{piece, npu::logprobs_of(logits, next, opts.sample.top_logprobs)}, piece.size());
             ++produced;
             const size_t stop_at = npu::find_stop(pending, opts.stop);
             if (stop_at != std::string::npos) {
@@ -323,12 +372,25 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             const size_t cut = complete_utf8(pending);
             if (cut > 0) on_text(pending.substr(0, cut), take_held(cut));
         }
+        stats.completion_tokens = produced;
         if (produced >= limit && !stopped_at_eos && !stopped_at_stop) finish = "length";
         return finish;
     };
 
+    // OpenAI's usage object plus the two fields issue #650 reports: how many prompt tokens came
+    // from a saved prefix, and what the cache decided (which slot, and why).
+    auto usage_json = [](const CallStats& st) {
+        return json{{"prompt_tokens", st.prompt_tokens},
+                    {"completion_tokens", st.completion_tokens},
+                    {"total_tokens", st.prompt_tokens + st.completion_tokens},
+                    {"prompt_tokens_details", {{"cached_tokens", st.prefix.cached_tokens}}},
+                    {"flm_prefix_cache", {{"slot", st.prefix.slot},
+                                          {"cached_tokens", st.prefix.cached_tokens},
+                                          {"reason", st.prefix.reason}}}};
+    };
+
     // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely
-    // alternatives with theirs.  Only the chat shape is served (see the /v1/completions refusal).
+    // alternatives with theirs.  Only the chat shape is served.
     auto logprob_json = [&e](const Emitted& x) {
         json j{{"token", x.text}, {"logprob", x.lp.logprob}, {"top_logprobs", json::array()}};
         for (const auto& t : x.lp.top)
@@ -356,8 +418,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         } else {
             out["choices"] = json::array({{{"index", 0}, {"text", content}, {"finish_reason", finish}}});
         }
-        // A token piece can be half a character, and dump() throws on invalid UTF-8: replace
-        // rather than turn a reported logprob into a 500.
+        out["usage"] = usage_json(stats);
+        // A piece can be half a character and dump() throws on invalid UTF-8: replace rather than
+        // turn a reported logprob into a 500.
         return out.dump(-1, ' ', false, json::error_handler_t::replace);
     };
 
@@ -391,11 +454,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                                                      {"finish_reason", nullptr}}});
                 else
                     chunk["choices"] = json::array({{{"index", 0}, {"text", t}, {"finish_reason", nullptr}}});
-                if (opts.sample.logprobs && !lp.empty())
-                    chunk["choices"][0]["logprobs"] = logprobs_json(lp);
+                if (opts.sample.logprobs && !lp.empty()) chunk["choices"][0]["logprobs"] = logprobs_json(lp);
                 chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 return true;
             });
+            {
+                json tail = chunk_tpl;
+                tail["choices"] = json::array();
+                tail["usage"] = usage_json(stats);
+                chunks->push_back("data: " + tail.dump() + "\n\n");
+            }
             auto cursor = std::make_shared<size_t>(0);
             res.set_chunked_content_provider("text/event-stream",
                 [chunks, cursor](size_t, httplib::DataSink& sink) {
@@ -421,6 +489,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
 int run_forward_serve(int argc, char** argv) {
     std::string model, kernels, host = "127.0.0.1", alias;
     int port = 8000, streams = 1;
+    npu::PrefixOptions prefix_opts;  // --prefix-slots / --prefix-cache-mb / --prefix-min-gain (#650)
     for (int i = 0; i < argc; i++) {
         const std::string a = argv[i];
         auto next = [&]() -> std::string {
@@ -432,6 +501,9 @@ int run_forward_serve(int argc, char** argv) {
         else if (a == "-p" || a == "--port") port = std::stoi(next());
         else if (a == "--host") host = next();
         else if (a == "--alias") alias = next();
+        else if (a == "--prefix-slots") prefix_opts.slots = std::stoi(next());
+        else if (a == "--prefix-cache-mb") prefix_opts.cache_mb = std::stoul(next());
+        else if (a == "--prefix-min-gain") prefix_opts.min_gain = std::stoi(next());
         else if (a == "--npu-streams") streams = std::stoi(next());
         else throw std::runtime_error("unknown option " + a);
     }
@@ -456,6 +528,16 @@ int run_forward_serve(int argc, char** argv) {
     // q4nx_config_int finds the key at any depth (a text_config's too).
     e.max_context = q4nx_config_int(cfg.c_str(), "max_position_embeddings", 0);
     if (e.max_context <= 0) e.max_context = 32768;
+
+    // The prompt cache (#650): --prefix-slots 0 turns it off, and an invalid value is refused here
+    // rather than clamped, like every other option on this command.
+    if (prefix_opts.slots > 0) {
+        e.prefix = std::make_unique<npu::PrefixCache>(prefix_opts);
+        e.prefix_state.resize(size_t(prefix_opts.slots));
+        std::fprintf(stderr,
+                     "1bit forward-serve: prefix cache on: %d slots, %zu MB, min gain %d tokens\n",
+                     prefix_opts.slots, prefix_opts.cache_mb, prefix_opts.min_gain);
+    }
 
     e.fwd = std::make_unique<Q4nxNpuForward>();
 

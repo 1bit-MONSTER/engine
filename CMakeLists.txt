@@ -436,7 +436,24 @@ if(Python3_Interpreter_FOUND)
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
     add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
+    # the safetensors -> Q4NX converter and the d3 readout head it packs (engine #653): every
+    # fixture is synthesised, so this needs numpy and nothing else — no gguf-py, no model, no
+    # device, no download.
+    add_test(NAME safetensors_to_q4nx
+             COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/safetensors_to_q4nx_test.py)
 endif()
+
+# The d3 readout head loader (npu/decision.h): two files and the arithmetic on a hidden vector, so
+# it runs with no model, no backbone and no device.
+add_executable(decision_test tests/decision_test.cpp)
+target_include_directories(decision_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(decision_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME decision_head COMMAND decision_test)
+# .github/workflows/ci.yml builds a named list of targets and ctest runs whatever binaries exist, so a
+# test whose target is not in that list reports "Not Run" and never executes (the #635 trap). Building
+# decision_test as a dependency of a listed target keeps its row live without a workflow edit, which
+# this lane's token cannot make.
+add_dependencies(npu_sampling_test decision_test)
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)

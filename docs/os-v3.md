@@ -119,13 +119,14 @@ exists for the QEMU gate and prints a warning that the stick is not machine-boun
 | # | size | fs | label | contents | on v2 → v3 |
 |---|---|---|---|---|---|
 | 1 | 1 GiB | FAT32 | `1BIT-OS` | Ubuntu's shim + grub (Microsoft- and Canonical-signed), `grub.cfg`, `/boot/efi` | created |
-| 2 | `min(128 GiB, max(32 GiB, 25%))` | ext4 | `1BIT-ROOT` | the system, `/boot` (kernels and initramfs), `/var`, `/home`, an 8 GiB `/swap.img` | created |
+| 2 | 64 GiB | ext4 | `1BIT-ROOT` | the system, `/boot` (kernels and initramfs), `/var`, `/home`, an 8 GiB `/swap.img` | created |
 | 3 | the rest | ext4 | `1BIT-DATA` | models, Lemonade's cache and config, `hrx-jit`, NPU sets, keys — `/data` | **adopted, never formatted** |
 
 Numbers: 1 GiB is the Ubuntu default and the measured size of this box's ESP (1.1 GiB, 6.4 MB used, so
-two kernels and their initramfs fit with room); 32 GiB is the floor because a base Ubuntu 26.04 install
-plus the runtime subset measured below is about 5 GiB and `/var` grows; 128 GiB is the cap so a 2 TB disk
-gives the models the disk rather than the OS. No swap *partition*: Ubuntu's own `/swap.img` on the root
+two kernels and their initramfs fit with room); 64 GiB for the root because a base Ubuntu 26.04 install
+plus the 180 MB runtime below, its journal and `/var` fit in a tenth of that, and because the rest of the
+disk belongs to the models — a fixed number, not a percentage, so the same seed gives the same table on
+any disk (`size: -1` on partition 3 takes the remainder). No swap *partition*: Ubuntu's own `/swap.img` on the root
 filesystem keeps the partition table to what the appliance needs, and it is the image `unattended-upgrades`
 and hibernate-free servers already run.
 
@@ -245,7 +246,7 @@ The screen covers the *whole* install, which for v3 means one list that spans bo
 ```
  1  target disk and identity          /dev/nvme0n1  YMTC PC41Q-2TB  1.9 TB   user 1bit  host 1bit-strixhalo
  2  base system (Ubuntu 26.04 Server)   curtin: partitions, unpack, packages, bootloader
- 3  our repository from the stick      49 packages, 612 MB
+ 3  our repository from the stick      8 debs: kernel, modules, rocm, xrt, engine, lemonade, appliance, keyring
  4  kernel and modules                 vmlinuz-7.3.0-rc4-1bit-perfopt+, amdxdna, ec_su_axb35, initramfs
  5  Secure Boot key                    already enrolled  |  queued for MokManager at the next boot
  6  firmware boot entry                1bit OS -> \EFI\ubuntu\shimx64.efi   BootOrder 0000,...

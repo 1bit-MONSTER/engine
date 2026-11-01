@@ -466,6 +466,18 @@ add_test(NAME systemone_contract
 # built reports "Not Run" and silently never executes (#635). This lane's token cannot edit the
 # workflow, so the binary is built from a listed target until someone with workflow scope adds it.
 add_dependencies(npu_sampling_test systemone_test)
+
+# The HTTP half of the same contract (app/npu_systemone.h): the request envelope, the chat-template
+# wrapper around the user turn and the reply shape. Still no device, no model, no network.
+add_executable(systemone_route_test tests/systemone_route_test.cpp)
+target_include_directories(systemone_route_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(systemone_route_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME systemone_route
+         COMMAND systemone_route_test ${CMAKE_SOURCE_DIR}/tests/golden/systemone/prompts.json)
+# Same reason as decision_test and systemone_test: ci.yml builds a named list of targets, so a test
+# whose target is not built reports "Not Run" and silently never executes (#635). This lane's token
+# cannot edit the workflow.
+add_dependencies(npu_sampling_test systemone_route_test)
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
 add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)

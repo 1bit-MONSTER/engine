@@ -629,36 +629,78 @@ program is rebuilt.
 ### CWSR save-area placement (engine#315)
 
 The shipped configuration for engine#315 is amdgpu with CWSR **off** (`amdgpu.cwsr_enable=0` on the
-kernel command line and in `/etc/modprobe.d`). Nothing below changes that, and it stays the default.
-The replacement below was accepted by a soak on a CWSR-on boot (2026-10-18/19: 37 in-band arms, 9 h 03 min,
-0 faults, every graded arm's save area two GTT BOs and no SVM lookup; KNOWN-ISSUES.md, engine#315), so
-a box that runs CWSR on - for another workload, or by its owner's choice - gets the safe placement
-automatically.
+kernel command line and in `/etc/modprobe.d`). Nothing below changes that. The replacement below was
+accepted by a soak on a CWSR-on boot (2026-10-18/19: 37 in-band arms, 9 h 03 min, 0 faults, every graded
+arm's save area two GTT BOs and no SVM lookup; KNOWN-ISSUES.md, engine#315), and since **2026-10-31 it is
+the default for every HRX backend, CWSR on or off** - see the A/B below, where the pageable placement
+faulted on the first graph replay of a CWSR-**off** box.
 
-On a box that runs CWSR **on**, `1bit serve` moves each HRX queue's CWSR context save area out of
-pageable memory. By default libhsakmt allocates the save area as an SVM range. With
-`HSA_USE_SVM=0` and `HSA_USERPTR_FOR_PAGED_MEM=0` it allocates a KFD GTT buffer object instead.
-ROCr then reports no SVM, which HRX refuses unless `HRX_ALLOW_NO_SVM=1` is set; that gate is our
-hrx-system commit (`util/no_svm_gate.c`). serve adds the three variables to the environment of
-every HRX backend it starts (the chat server, the RAG servers, the Laya scorer), so they are in
-place before ROCr initialises in that process, and prints one line:
+On such a box, `1bit serve` moves each HRX queue's CWSR context save area out of pageable memory. By
+default libhsakmt allocates the save area as an SVM range. With `HSA_USE_SVM=0` and
+`HSA_USERPTR_FOR_PAGED_MEM=0` it allocates a KFD GTT buffer object instead. ROCr then reports no SVM,
+which HRX refuses unless `HRX_ALLOW_NO_SVM=1` is set; that gate is our hrx-system commit
+(`util/no_svm_gate.c`). serve adds the three variables to the environment of every HRX backend it starts
+(the chat server, the RAG servers, the Laya scorer), so they are in place before ROCr initialises in that
+process, and prints one line:
 
 ```
-1bit serve: HRX: CWSR is on; CWSR save area placed in GTT (engine#315)
+1bit serve: HRX: CWSR save area placed in GTT by default (engine#315; amdgpu cwsr_enable=0; --hrx-cwsr-placement=off or HRX_SVM=1 opts out)
 ```
 
 `--hrx-cwsr-placement` picks the mode:
 
 | value | what serve does |
 |---|---|
-| `auto` (default) | adds the three variables only when `/sys/module/amdgpu/parameters/cwsr_enable` reads `1` and you set none of them. With CWSR off it adds nothing and logs `HRX: CWSR is off; CWSR save-area placement unchanged (engine#315)` |
-| `on` | adds them whatever `cwsr_enable` says. A value you set yourself still wins |
+| `auto` (default) | adds the three variables, whatever `cwsr_enable` says. A value you set yourself still wins. `HRX_SVM=1` in the environment turns it off again (`HRX: HRX_SVM=1; CWSR save-area placement left to ROCr (engine#315)`) |
+| `on` | the same, but refuses to start in a build without the gate |
 | `off` | never adds them |
 
 A build whose hrx-system has no `HRX_ALLOW_NO_SVM` gate (CMake prints
 `HRX_ALLOW_NO_SVM gate in hrx-system: 0`) adds nothing in `auto` and refuses `on`, because
-`HSA_USE_SVM=0` would leave HRX with no device. `llama-server`, `llama-bench` or other HRX tools
-you start yourself get the variables only if you set them.
+`HSA_USE_SVM=0` would leave HRX with no device. `llama-server`, `llama-bench`, `test-backend-ops` or other
+HRX tools you start yourself get the variables only if you set them - `scripts/hw-gate.sh` exports them for
+its own direct runs for that reason.
+
+#### Why it is the default: the 2026-10-31 A/B (kernel `7.3.0-rc4-1bit-perfopt+`)
+
+After that kernel was rebuilt, **every** HRX process on strixhalo page-faulted on its first graph replay,
+the release tarball included: `wait for HRX graph replay commands failed: … ABORTED; AMDGPU memory access
+fault at device address 0x…`, and in `dmesg` `[gfxhub] page fault … client CPF`, `PERMISSION_FAULTS 0x8`,
+`WALKER_ERROR 0`, `MAPPING_ERROR 0`. Three HSA runtimes exist on the box; same binary (`llama-server` from
+`1bit/hrx-vulkan-patched` + #161), same Qwen3-0.6B file, same argv, one `gpu-hold` claim, 32 tokens per arm:
+
+| HSA runtime (sha256) | SVM mode | result | new gfxhub faults |
+|---|---|---|---:|
+| release-bundled `f6ef689d…` | `HSA_USE_SVM` unset, `HSA_USERPTR_FOR_PAGED_MEM=0` | **no HRX0 at all**: `--device: invalid device: HRX0` | 0 (nothing ran) |
+| release-bundled `f6ef689d…` | `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` | **no HRX0 at all**, same error | 0 (nothing ran) |
+| TheRock nightly `21a66824…` (10.3.0a20261031) | `HSA_USE_SVM` unset, `HSA_USERPTR_FOR_PAGED_MEM=0` | server up, first completion **HTTP 500**, 31 fault lines | **+1** |
+| TheRock nightly `21a66824…` | `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` | **HTTP 200, 260.1 tok/s** | **0** |
+
+So on a dev build the release-bundled libhsa cannot register HRX0 at all, and the nightly libhsa the engine
+picks page-faults in the mode above.
+
+**Which variable is responsible is narrower than "SVM":** a four-corner table on the same 0.6B file (same binary,
+cache limit 128) shows the fault needs the two knobs *together* — libhsakmt takes the SVM save-area path only when
+pageable userptr is also disabled:
+
+| `HSA_USE_SVM` | `HSA_USERPTR_FOR_PAGED_MEM` | result | new faults |
+|---|---|---|---:|
+| unset (1) | **0** | first completion fails | **+1** |
+| unset (1) | unset (1) — libhsakmt's real default | **ok** | 0 |
+| 0 | unset (1) | **ok** | 0 |
+| 0 | 0 (this placement) | **ok** | 0 |
+
+So the faulting mode is *SVM with pageable userptr disabled* — what the fleet's shell harness had been setting
+(`HSA_USERPTR_FOR_PAGED_MEM=0`, inherited from `612-hrx.sh`) — not libhsakmt's default. That makes this placement one
+of three working modes rather than the only one. It is still the mode `serve` can choose safely on a box whose
+defaults are not known to be clean, because it is the one the #315 soak covered; the true-defaults mode was clean on
+the 0.6B file and its 76 GiB measurement was still pending when this landed.
+
+Corroborating evidence from the same session: plain HIP through the same runtime is clean
+(`hipMalloc -> H2D -> memset -> kernel -> D2H -> pinned H2D`, `HIP_PATH_OK`, 0 faults), `rocminfo` reports
+`XNACK enabled: NO` and `Coherent Host Access: FALSE` for `gfx1151`, and `test-backend-ops -o TOP_K -b HRX0` passes
+484/484 with the placement in place and 0 fault lines. The box's `cwsr_enable` was `0` throughout, which is why
+`auto` no longer keys off it.
 
 Measured on strixhalo (performance mode, 120 W cap), engine `fce3a68` build with the gate:
 

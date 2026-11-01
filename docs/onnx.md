@@ -129,7 +129,10 @@ and int8 weights to the kernel unchanged — no `packB`, no `amax/127`, since th
 graph's scales — and reads int32 accumulators back into the **same epilogue** the host path runs, so a device
 result differs from the host one only if the accumulator does. A shape with no ELF falls back with
 `npu_qdq_fallback … why=no QDQ kernel for KxN`, and a run is only a device run if that line is absent for
-the shape you care about: `qdq rows=` is written by the shared epilogue either way.
+the shape you care about: `qdq rows=` is written by the shared epilogue either way. **An entry the runtime
+cannot load costs that design and nothing else**: `init_elf` returning false marks the shape unavailable
+(`no QDQ kernel for KxN: I8Ctx init_elf failed for <path> (MxKxN)`) while the other configured designs keep
+running, and only a configuration in which *every* design is refused disables the device as a whole.
 
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the

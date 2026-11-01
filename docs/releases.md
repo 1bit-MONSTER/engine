@@ -52,6 +52,7 @@ Qwen3.8-Flash-Next run on **HRX** here, and the catalogue carries no `ds4` recip
 | engine | `bcb28cc8f57387865ecdbe744a7e3cdcf65eb7ad` |
 | HRX (llama.cpp fork, ggml-hrx) | `4a58da9b087d` |
 | hrx-system | `82804197bcbe` |
+| HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`) |
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
 | kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
@@ -233,8 +234,9 @@ tar --zstd -xf lemonade-onebit-v2026.40-linux-x86_64.tar.zst
 lemonade-onebit-v2026.40/lemond-onebit           # lemond with the onebit recipe on the packaged engine
 ```
 
-The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE` on its Zen 5. HRX needs TheRock in
-`/opt/rocm-therock`; the NPU needs the `amdxdna` kernel driver. The closed NPU add-ons
+The builds target Strix Halo: the llama.cpp backends are built with `GGML_NATIVE` on its Zen 5. HRX builds with the
+pinned toolchain (`config/hrx-toolchain.config`, `scripts/fetch-rocm-sdk.sh`), or TheRock in `/opt/rocm-therock` when
+that is what the box has; the NPU needs the `amdxdna` kernel driver. The closed NPU add-ons
 ([npu.md](npu.md#add-on-routes)) are never in a release.
 
 ### The NPU engine
@@ -380,8 +382,10 @@ WEEKLY_DRY_RUN=1 WEEKLY_TAG=rehearsal-private scripts/weekly.sh ~/.cache/1bit-we
 Before the first stage runs, `weekly.sh` checks what the machine must have (the 2026-10-19
 rehearsal found these only after the build) and stops with a message naming what is missing:
 
-- **bumps, build:** TheRock in `/opt/rocm-therock`, or `-DONEBIT_HRX_TOOLCHAIN=<dir>` in
-  `WEEKLY_CMAKE_ARGS`; `hipcc` only for the optional DwarfStar build (`ONEBIT_DS4=ON`, off since v2026.44), in TheRock or `/opt/rocm`, or `ROCM_PATH`.
+- **bumps, build:** the pinned HRX toolchain, which `preflight` itself fetches with
+  `scripts/fetch-rocm-sdk.sh` at the pin in `config/hrx-toolchain.config` (`-DONEBIT_HRX_TOOLCHAIN=<dir>` in
+  `WEEKLY_CMAKE_ARGS` uses another, e.g. TheRock in `/opt/rocm-therock`); `hipcc` only for the optional DwarfStar build
+  (`ONEBIT_DS4=ON`, off since v2026.44), from that toolchain or `/opt/rocm`, or `ROCM_PATH`.
 - **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
   (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for 1bit OS,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).

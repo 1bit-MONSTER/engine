@@ -160,6 +160,10 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # dir, so no key, no device and no build: the four refusals are a set with no manifest, a file the
 # manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
+# engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
+# pin file's refusals, the completeness check against a fabricated tree, and that cmake, build-ds4.sh and
+# weekly.sh all use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
+add_test(NAME hrx_toolchain_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_toolchain_pin.sh)
 add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
 add_test(NAME prism_route COMMAND ${CMAKE_SOURCE_DIR}/tests/prism_route.sh $<TARGET_FILE:onebit>)

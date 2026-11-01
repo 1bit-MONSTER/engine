@@ -75,6 +75,13 @@ for f in cmake/hrx.cmake scripts/build-ds4.sh; do
 done
 grep -q "fetch-rocm-sdk.sh" "$root/scripts/weekly.sh" && ok "scripts/weekly.sh fetches the pinned toolchain" ||
     bad "scripts/weekly.sh does not fetch the pinned toolchain (scripts/fetch-rocm-sdk.sh)"
+# the HIP kernels are compiled by a separate amdclang++ invocation that does not inherit the llama.cpp
+# build's flags: without these two the compile step still needs HIP_DEVICE_LIB_PATH/ROCM_PATH in the
+# environment and takes the compiler from /opt (the gap pi-prs found in review)
+grep -q "GGML_HRX_HIP_FLAGS" "$root/cmake/hrx.cmake" && ok "the HIP kernel flags are passed (GGML_HRX_HIP_FLAGS)" ||
+    bad "cmake/hrx.cmake does not pass GGML_HRX_HIP_FLAGS: the HIP kernel compile needs the device library in the environment"
+grep -q "GGML_HRX_HIP_COMPILER" "$root/cmake/hrx.cmake" && ok "the HIP kernel compiler comes from the toolchain" ||
+    bad "cmake/hrx.cmake does not set GGML_HRX_HIP_COMPILER: ggml-hrx-hip.cmake would find /opt/rocm-therock first"
 grep -q "config/hrx-toolchain.config" "$root/cmake/hrx.cmake" "$root/scripts/fetch-rocm-sdk.sh" "$root/scripts/weekly.sh" &&
     ok "the pin file is what cmake, the fetch and the release run name" ||
     bad "the pin file config/hrx-toolchain.config is not named by cmake, the fetch and the release run"

@@ -137,6 +137,17 @@ if(ONEBIT_HRX_DEVICE_LIB)
 else()
     message(STATUS "ONEBIT_HRX: no device library under ${ONEBIT_HRX_TOOLCHAIN}; hipcc's default is used")
 endif()
+# The private HIP kernels are compiled by a separate amdclang++ invocation (ggml-hrx-hip.cmake), not by
+# hipcc, and it does not inherit the flags above: without GGML_HRX_HIP_FLAGS the device library has to come
+# from HIP_DEVICE_LIB_PATH in the environment. Pass the compiler from this toolchain (its own find_program
+# would otherwise take /opt/rocm-therock/bin before $ROCM_PATH) and the same device library in the flags.
+set(_hrx_hip_flags "-O3")
+if(ONEBIT_HRX_DEVICE_LIB)
+    string(APPEND _hrx_hip_flags " --rocm-device-lib-path=${ONEBIT_HRX_DEVICE_LIB}")
+endif()
+set(ONEBIT_HRX_HIP_COMPILER "${ONEBIT_HRX_TOOLCHAIN}/bin/amdclang++" CACHE FILEPATH
+    "amdclang++ that compiles the HRX HIP kernels")
+set(ONEBIT_HRX_HIP_FLAGS "${_hrx_hip_flags}" CACHE STRING "Extra flags for the HRX HIP kernels")
 set(_hrx_toolchain_env)
 if(_hrx_sdk_core)
     set(_hrx_toolchain_env ${CMAKE_COMMAND} -E env "ROCM_PATH=${_hrx_sdk_core}" "HIP_PATH=${_hrx_sdk_core}")
@@ -185,6 +196,8 @@ ExternalProject_Add(llama_hrx
         -DCMAKE_CXX_COMPILER=${ONEBIT_HRX_TOOLCHAIN}/bin/amdclang++
         -DHRX_SOURCE_DIR=${CMAKE_SOURCE_DIR}/third_party/hrx-system
         -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON
+        -DGGML_HRX_HIP_COMPILER=${ONEBIT_HRX_HIP_COMPILER}
+        "-DGGML_HRX_HIP_FLAGS=${ONEBIT_HRX_HIP_FLAGS}"
         -DLLAMA_BUILD_SERVER=ON -DLLAMA_CURL=OFF
         "-DCMAKE_C_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}${ONEBIT_HRX_EXTRA_FLAGS}"
         "-DCMAKE_CXX_FLAGS=${ONEBIT_HRX_PATH_MAP_FLAGS}${ONEBIT_HRX_EXTRA_FLAGS}"

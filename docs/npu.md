@@ -277,8 +277,9 @@ got before.
 
 `logprobs` keeps OpenAI's shape: non-streamed, every entry is `choices[0].logprobs.content[i] =
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
-chunk carries, so the deltas add up to the non-streamed reply. Token text that is half a character is reported
-with the invalid bytes replaced, never as a failed request. The `/v1/completions` route's legacy logprobs object
+chunk carries, so the deltas add up to the non-streamed reply. Token text that is half a character is reported with the invalid bytes replaced, never as a failed
+request. Entries exist for **`content` tokens only**: a reasoning delta and tool-call markup get no
+logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. The `/v1/completions` route's legacy logprobs object
 is not implemented and asking for it there is a 400, not a silently dropped field.
 
 `json_schema` is compiled to a grammar before the first token, by `app/npu_json_schema.h`, so the answer

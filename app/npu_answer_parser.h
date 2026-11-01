@@ -236,6 +236,35 @@ private:
     bool saw_text_ = false;
 };
 
+// Which of `pieces` (one generated token's text each, in order) belong to `content` -- not to
+// reasoning and not to call markup.  Callers that report a per-token value use this so reasoning and
+// call markup get no entry (issue #651 item 3).  A token that straddles a boundary ("</think>The")
+// counts as content: its text did reach the caller.
+inline std::vector<char> content_mask(const std::vector<std::string>& pieces, AnswerFamily family, bool tools_sent) {
+    AnswerStream s(family, tools_sent);
+    std::vector<char> mask;
+    mask.reserve(pieces.size());
+    std::vector<std::pair<bool, std::string>> out;
+    for (const auto& piece : pieces) {
+        out.clear();
+        s.feed(piece, out);
+        bool is_content = false;
+        for (const auto& [is_reasoning, text] : out) {
+            (void)text;
+            is_content = is_content || !is_reasoning;
+        }
+        mask.push_back(is_content ? 1 : 0);
+    }
+    // Whatever the holdback still holds at the end belongs to the content being flushed by finish().
+    out.clear();
+    s.finish(out);
+    for (const auto& [is_reasoning, text] : out) {
+        (void)text;
+        if (!is_reasoning && !mask.empty() && !mask.back()) mask.back() = 1;
+    }
+    return mask;
+}
+
 // The whole answer at once: the same splitter, so the two paths cannot disagree.
 inline ParsedAnswer parse_answer(const std::string& text, AnswerFamily family, bool tools_sent) {
     AnswerStream s(family, tools_sent);

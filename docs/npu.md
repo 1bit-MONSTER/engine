@@ -76,9 +76,12 @@ its rounding bound.
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model
-directory's `model.q4nx` and `config.json` from a GGUF (qwen3 only for now), and copies
-`tokenizer.json` from `--tokenizer`. It writes every projection and `lm_head` as q4_1
-tiles and the norms and embedding as bf16. A tied `lm_head` is made from `token_embd`.
+directory's `model.q4nx` and `config.json` from a GGUF (qwen3, qwen3moe and qwen2 for now),
+and copies `tokenizer.json` from `--tokenizer`. It writes every projection and `lm_head` as
+q4_1 tiles and the norms and embedding as bf16. A tied `lm_head` is made from `token_embd`.
+A MoE model's router stays bf16 and untiled (it runs on the host, and its top-k must be the
+GGUF's own), and its routed expert stacks become one tensor per layer and projection — see
+"Routed expert stacks" below.
 
 | GGUF type | To q4_1 | Error |
 |---|---|---|
@@ -96,6 +99,27 @@ weights over the bound. The Q6_K tensors (half of `v_proj` and `down_proj`, and
 `lm_head` from the Q6_K embedding) requantize to cosine 0.9969 and relative RMS error
 0.079. Served on the NPU, the repacked model decoded 24/24 greedy tokens the same as a CPU
 reference of the repacked weights, with every step's logits at cosine 0.99995 or better.
+
+### Routed expert stacks
+
+A MoE GGUF keeps its routed experts as one three-dimensional tensor per projection
+(`blk.N.ffn_{gate,up,down}_exps`, ggml `[cols, rows, experts]`), expert `e` on rows
+`[e*rows, (e+1)*rows)` of the stream. The converter writes each stack as ONE container
+tensor — `model.layers.N.mlp.experts.{gate,up,down}_proj.weight`, `I8`, shape
+`[experts * rows/32, cols/256, 5120]` — so expert `e` is tile rows `[e*rows/32, (e+1)*rows/32)`
+of a plain tile grid: a decode step points a kernel at one expert's 192 chunks (983,040 B on
+Qwen3-30B-A3B) without any gather.
+
+`model.q4nx`'s `__metadata__.moe` carries that decomposition so a caller never derives it:
+`experts`, `used`, `norm_topk_prob`, and per tensor `rows`, `cols`, `tile_rows`, `tile_cols`,
+`tiles`, `bytes` and the **byte offset of every expert** (`offsets`, `[experts]` entries,
+relative to the data section like every `data_offsets`). Those offsets are the list a
+per-dispatch chunk-address kernel takes (docs/npu.md, the DMA path in the engine's NPU lane).
+
+Measured on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (qwen3moe, 48 layers, 128 experts,
+top-8, expert_ffn 768, no shared expert): 579 tensors, 144 expert stacks x 128 expert
+offsets, header 302,144 B, container 19,528,322,120 B (18.19 GiB) — 18.13 GiB of it routed
+experts. `verify` result: see the TMOE-NPU lane's state file.
 
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
 `~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,

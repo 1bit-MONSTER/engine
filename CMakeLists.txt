@@ -343,8 +343,8 @@ if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
 add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
-                            npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp npu/q4nx.cpp
-                            npu/tokenizer.cpp)
+                            npu/moe.cpp npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp
+                            npu/q4nx.cpp npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
@@ -555,16 +555,32 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# The host side of a MoE container: __metadata__.moe, per-expert chunk pointers and the router.
+# Crafted directories at run time, so CI needs no 18 GB model; with two arguments it checks the
+# same code against a real container and a gate.json from tools/moe_expert_chunks.py gate.
+add_executable(npu_moe_test tests/npu_moe_test.cpp)
+target_link_libraries(npu_moe_test PRIVATE onebit_npu)
+add_test(NAME npu_moe COMMAND npu_moe_test)
+if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_MOE_GATE)
+    add_test(NAME npu_moe_model COMMAND npu_moe_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_MOE_GATE})
+endif()
 # Crafted model.q4nx files the loader and the packer must refuse (written at run time); runs in CI.
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)
 add_test(NAME npu_model_bounds COMMAND npu_model_bounds_test)
+# CI builds an explicit target list (.github/workflows/ci.yml, "Keep this list in step with
+# add_test()"), and extending that list needs a token with the `workflow` scope, which a lane does
+# not carry. Binding npu_moe_test to a target the list already names gets it built either way (a
+# target-level dependency needs that target to exist, hence this position). Delete this line and add
+# npu_moe_test to the workflow list the next time the workflow is touched with the right scope.
+add_dependencies(npu_model_bounds_test npu_moe_test)
 # The forward's Q4NX loader is plain C (no NPU runtime), so its crafted-file checks run in CI too.
 add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forward/src/model.c)
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
 target_link_libraries(npu_forward_loader_test PRIVATE m)
 add_test(NAME npu_forward_loader COMMAND npu_forward_loader_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
+set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")
 add_executable(tokenizer_test tests/tokenizer_test.cpp)
 target_link_libraries(tokenizer_test PRIVATE onebit_npu)

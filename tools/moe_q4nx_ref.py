@@ -184,7 +184,10 @@ class Forward:
         self.lm_head = None  # built on first use (1.2 GB for a 151936 x 2048 head)
         self.kv = KVCache(q.layers, q.kv_heads, q.head_dim)
         self.pos = 0
-        self.ntok = 0
+        self.capture_layer = -1   # set to L to keep layer L's MoE input row
+        self.capture_stop = False
+        self.capture = None
+        self.captured = None
 
     def reset(self):
         self.kv = KVCache(self.q.layers, self.q.kv_heads, self.q.head_dim)
@@ -198,6 +201,8 @@ class Forward:
         gqa = q.heads // q.kv_heads
         for L in range(q.layers):
             self._layer = L
+            # a kernel gate needs the MoE block's input, not the block's output
+            self.capture = L if L == self.capture_layer else None
             h = rmsnorm(x, q.weight(q.layer_name(L, "input_layernorm.weight")), q.eps)
             shape = (T, q.heads, q.head_dim)
             qv = (h @ q.weight(q.layer_name(L, "self_attn.q_proj.weight")).T).reshape(shape)
@@ -222,6 +227,10 @@ class Forward:
             attn = np.einsum("htp,phd->thd", probs, V).reshape(T, q.heads * q.head_dim)
             x = x + attn @ q.weight(q.layer_name(L, "self_attn.o_proj.weight")).T
             h = rmsnorm(x, q.weight(q.layer_name(L, "post_attention_layernorm.weight")), q.eps)
+            if self.capture is not None:
+                self.captured = h.copy()
+                if self.capture_stop:   # a gate needs one layer's input, not the logits
+                    return None
             if q.experts:
                 x = x + self.moe(h)
             else:
@@ -266,6 +275,89 @@ class Forward:
         lg = self.logits(tokens)[-1].astype(np.float64)
         m = lg.max()
         return lg - m - np.log(np.exp(lg - m).sum())
+
+
+# --- the same forward over the GGUF's own weights (no container) ------------------------------
+
+class GgufWeights:
+    """The container interface, backed by the GGUF itself: f32 from the original blocks.
+
+    This exists to measure ONE thing: how much of the container's distance from HRX is the
+    container's own quantisation. Same forward code, same tokenizer, different weights — so a
+    difference between this and the container is the repack, and nothing else.
+    """
+
+    def __init__(self, path):
+        import gguf
+        self.r = gguf.GGUFReader(path)
+        self.by_name = {t.name: t for t in self.r.tensors}
+        import gguf_to_q4nx as G
+        self.to_gguf = {}   # q4nx name -> gguf name
+        for t in self.r.tensors:
+            try:
+                self.to_gguf[G.hf_name(t.name)] = t.name
+            except SystemExit:
+                pass
+        arch = self.r.fields["general.architecture"].contents()
+        a = lambda k, d=None: self.r.fields.get(f"{arch}.{k}").contents() if f"{arch}.{k}" in self.r.fields else d  # noqa: E731
+        self.hidden = a("embedding_length")
+        self.layers = a("block_count")
+        self.heads = a("attention.head_count")
+        self.kv_heads = a("attention.head_count_kv", self.heads)
+        self.head_dim = a("attention.key_length", self.hidden // self.heads)
+        self.rope_theta = float(a("rope.freq_base"))
+        self.eps = float(a("attention.layer_norm_rms_epsilon"))
+        self.experts = a("expert_count", 0)
+        self.top_k = a("expert_used_count", 0)
+        self.norm_topk = True
+        self.moe_meta = {}
+        self.table = {n: {} for n in self.to_gguf}   # same keys Forward asks for
+        self._cache = {}
+
+    def layer_name(self, layer, suffix):
+        return f"model.layers.{layer}.{suffix}"
+
+    def _tensor(self, name):
+        t = self.by_name[self.to_gguf[name]]
+        return t
+
+    def _rowbytes(self, t):
+        import gguf
+        bs, ts = gguf.GGML_QUANT_SIZES[t.tensor_type]
+        return int(t.shape[0]) // bs * ts
+
+    def _deq_rows(self, t, r0, n):
+        """Rows [r0, r0+n) of a 2-D or 3-D ggml tensor, dequantised to f32 [n, cols]."""
+        import gguf
+        if len(t.shape) == 1:   # a norm: one row, so it broadcasts over the activations
+            return np.asarray(gguf.quants.dequantize(t.data, t.tensor_type),
+                              np.float32).reshape(1, int(t.shape[0]))
+        K = int(t.shape[0])
+        rb = self._rowbytes(t)
+        raw = np.asarray(t.data).reshape(-1)[r0 * rb:(r0 + n) * rb]
+        w = gguf.quants.dequantize(raw, t.tensor_type)
+        return np.asarray(w, np.float32).reshape(n, K)
+
+    def weight(self, name):
+        if name in self._cache:
+            return self._cache[name]
+        t = self._tensor(name)
+        w = self._deq_rows(t, 0, int(t.shape[1]) if len(t.shape) > 1 else 1)
+        self._cache[name] = w
+        return w
+
+    def bf16(self, name):
+        t = self._tensor(name)
+        return np.asarray(self._deq_rows(t, 0, int(t.shape[1]) if len(t.shape) > 1 else 1),
+                          np.float32)
+
+    def experts_weight(self, name, e):
+        t = self._tensor(name)
+        N = int(t.shape[1])
+        return self._deq_rows(t, e * N, N)
+
+    def close(self):
+        self._cache.clear()
 
 
 def topk(lp, k):
@@ -507,6 +599,69 @@ def agree(args):
     return 0 if len(good) == len(out) else 1
 
 
+def vs_gguf(args):
+    """Container vs the GGUF's own f32 weights vs the served route, on one prompt."""
+    import gc
+    import urllib.request
+
+    model = args.model
+    prompt = args.prompt
+    chat = Chat(model)
+    body = {"model": args.route_model, "messages": [{"role": "user", "content": prompt}],
+            "temperature": 0, "top_k": 1, "seed": 1234, "max_tokens": args.max_tokens,
+            "logprobs": True, "top_logprobs": 5, "cache_prompt": False, "ignore_eos": True,
+            "chat_template_kwargs": {"enable_thinking": False}}
+    req = urllib.request.Request(args.route.rstrip("/") + "/v1/chat/completions",
+                                data=json.dumps(body).encode(),
+                                headers={"Content-Type": "application/json"})
+    with urllib.request.urlopen(req, timeout=1800) as r:
+        res = json.loads(r.read())
+    toks = ((res.get("choices") or [{}])[0].get("logprobs") or {}).get("content") or []
+    ids = [t["id"] for t in toks]
+    route_lp = [float(np.float32(t["logprob"])) for t in toks]
+    route_top1 = [t["top"][0]["id"] if t.get("top") else t["id"] for t in toks]
+    prompt_ids = chat.encode(chat.render(prompt))
+    print(f"prompt ids {len(prompt_ids)}, route ids {len(ids)}", flush=True)
+
+    lps, top1 = {}, {}
+    want = {"container": Q4nx, "gguf": lambda m: GgufWeights(args.gguf)}
+    for label in (("container", "gguf") if args.only == "both" else (args.only,)):
+        weights = want[label](model)
+        fw = Forward(weights)
+        fw.reset()
+        t0 = time.time()
+        lp = fw.step(prompt_ids)
+        lps[label], top1[label] = [], []
+        for nxt in ids:
+            lps[label].append(float(np.float32(lp[nxt])))
+            top1[label].append(int(np.argmax(lp)))
+            lp = fw.step([nxt])
+        print(f"{label}: {len(lps[label])} positions in {time.time()-t0:.0f}s", flush=True)
+        del fw, weights
+        gc.collect()
+
+    def stats(a, b):
+        d = [abs(x - y) for x, y in zip(a, b)]
+        return (max(d) if d else 0.0, sum(d) / len(d) if d else 0.0)
+
+    ref = dict(lps)
+    ref["route"] = route_lp
+    out = {"prompt": prompt, "positions": len(ids), "per_position": ref}
+    pairs = [(a, b) for a in lps for b in ref if a != b]
+    for a, b in pairs:
+        ma, me = stats(ref[a], ref[b])
+        out[f"{a}_vs_{b}"] = (ma, me)
+        print(f"{a:9s} vs {b:6s} max|dlogp| {ma:.4e}  mean|dlogp| {me:.4e}")
+    for label in lps:
+        agree = sum(x == y for x, y in zip(top1[label], route_top1)) / len(route_top1)
+        out[f"{label}_top1_vs_route"] = agree
+        print(f"{label:9s} argmax == route's top-1: {agree:.3f}")
+    if args.out:
+        with open(args.out, "w") as f:
+            json.dump(out, f)
+    return 0
+
+
 def serve(args):
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
     ref = Ref(args.model, args.max_tokens, args.top_logprobs)
@@ -609,7 +764,19 @@ def main():
     ag.add_argument("--max-tokens", type=int, default=64)
     ag.add_argument("--prompt", action="append", help="override the built-in 8 prompts")
     ag.add_argument("--out")
+    v = sub.add_parser("vs-gguf", help="container vs the GGUF's own weights, on the route's tokens")
+    v.add_argument("model")
+    v.add_argument("--gguf", required=True)
+    v.add_argument("--prompt", required=True)
+    v.add_argument("--route", default="http://127.0.0.1:8090")
+    v.add_argument("--route-model", default="qwen3-coder")
+    v.add_argument("--max-tokens", type=int, default=64)
+    v.add_argument("--only", choices=("both", "container", "gguf"), default="both",
+                   help="which weights to run (gguf alone answers 'is the container the gap?')")
+    v.add_argument("--out")
     a = p.parse_args()
+    if a.cmd == "vs-gguf":
+        return vs_gguf(a)
     if a.cmd == "tokenizer":
         build_tokenizer(a.gguf, a.out)
         return 0

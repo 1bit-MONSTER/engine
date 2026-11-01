@@ -119,7 +119,26 @@ per-dispatch chunk-address kernel takes (docs/npu.md, the DMA path in the engine
 Measured on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (qwen3moe, 48 layers, 128 experts,
 top-8, expert_ffn 768, no shared expert): 579 tensors, 144 expert stacks x 128 expert
 offsets, header 302,144 B, container 19,528,322,120 B (18.19 GiB) — 18.13 GiB of it routed
-experts. `verify` result: see the TMOE-NPU lane's state file.
+experts.
+
+**The top-8 boundary is razor thin.** Measured with the same router tensor on the same token, the
+container's weights against the GGUF's own f32 weights: **32 of 48 layers pick a different 8-expert
+set**, always at the 8th slot, because the margin between rank 8 and rank 9 is **1.2e-3 in
+probability in one and 2.9e-4 in the other** (layer 2: expert 25 at 0.021700 vs expert 125 at
+0.020511, and the reverse). A hidden state that differs by 0.5 % — what requantising the Q6_K
+tensors costs — is enough to swap it.
+
+**That is a symptom, not the whole story, and the difference matters when judging a kernel.**
+Re-running the same comparison with the container's routing *pinned* for the f32 pass — same expert
+ids and weights at every layer of every position — the log-prob difference does not shrink at all
+(mean |dlogp| 14.36 nats pinned against 14.29 unpinned, over 16 teacher-forced positions). So the
+routing flips are not what separates the two weight sources; the per-layer hidden state (cos
+0.993-0.9996) compounding through 48 layers is, and it changes which token wins a peaky position.
+Two things follow, and they are the operative rules here: compare implementations on **aggregate**
+quality (KLD over a corpus, perplexity), never single-token argmax or per-token log-probs; and gate
+a kernel with the **expert ids held fixed** (A row + the router's own top-k + the expected int32 per
+expert, which is what `tools/moe_expert_chunks.py gate` emits), so the gate measures the kernel and
+not the model's own sensitivity. `verify` result: see the TMOE-NPU lane's state file.
 
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
 `~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,

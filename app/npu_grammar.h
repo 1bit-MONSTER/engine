@@ -628,23 +628,23 @@ inline bool Grammar::feed(State& st, const std::string& text) const {
     return true;
 }
 
-// The JSON grammar from third_party/llama.cpp/grammars/json.gbnf, for
-// response_format {"type": "json_object"}.
-inline const char* json_grammar() {
+// The rules a JSON grammar shares with a schema-constrained one (app/npu_json_schema.h): one
+// definition of what a JSON value, string, number, boolean, null and the optional whitespace are,
+// so a schema's grammar cannot drift from the unconstrained one in what it accepts.
+inline const char* json_shared_rules() {
     return R"GB(
-root   ::= object
-value  ::= object | array | string | number | ("true" | "false" | "null") ws
+any    ::= object | array | string | number | boolean | null
 
 object ::=
   "{" ws (
-            string ":" ws value
-    ("," ws string ":" ws value)*
+            string ":" ws any
+    ("," ws string ":" ws any)*
   )? "}" ws
 
 array  ::=
   "[" ws (
-            value
-    ("," ws value)*
+            any
+    ("," ws any)*
   )? "]" ws
 
 string ::=
@@ -655,9 +655,19 @@ string ::=
 
 number ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ("." [0-9]+)? ([eE] [-+]? [0-9] [1-9]{0,15})? ws
 
+integer ::= ("-"? ([0-9] | [1-9] [0-9]{0,15})) ws
+
+boolean ::= ("true" | "false") ws
+
+null ::= "null" ws
+
 # Optional space: by convention, applied in this grammar after literal chars when allowed
 ws ::= | " " | "\n" [ \t]{0,20}
 )GB";
 }
+
+// The JSON grammar from third_party/llama.cpp/grammars/json.gbnf, for
+// response_format {"type": "json_object"}: the shared rules, rooted at an object.
+inline std::string json_grammar() { return std::string("root ::= object\n") + json_shared_rules(); }
 
 }  // namespace onebit::npu

@@ -35,6 +35,7 @@ using onebit::npu::json_grammar;
 using onebit::npu::kRandomSeed;
 using onebit::npu::PrefixOptions;
 using onebit::npu::PrefixCache;
+using onebit::npu::json_schema_to_gbnf;
 using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
@@ -72,6 +73,16 @@ Feed run(const Grammar& g, const std::string& text) {
 std::string error_of(const nlohmann::json& body) {
     try {
         options_from_body(body);
+    } catch (const std::runtime_error& e) {
+        return e.what();
+    }
+    return {};
+}
+
+// The converter's refusal for a schema, or "" when it compiles.
+std::string schema_error(const std::string& schema_json) {
+    try {
+        json_schema_to_gbnf(nlohmann::json::parse(schema_json));
     } catch (const std::runtime_error& e) {
         return e.what();
     }
@@ -475,6 +486,111 @@ void test_prefix_cache() {
     }
 }
 
+void test_json_schema() {
+    // The structured-outputs subset from #652 item 1: a required string, an optional integer and an
+    // optional bounded array, with additionalProperties: false.
+    const Grammar g(json_schema_to_gbnf(nlohmann::json::parse(R"({
+        "type": "object",
+        "properties": {
+            "name": {"type": "string"},
+            "age":  {"type": "integer"},
+            "tags": {"type": "array", "items": {"type": "string"}, "minItems": 1, "maxItems": 2}
+        },
+        "required": ["name"],
+        "additionalProperties": false})")));
+
+    check(run(g, R"({"name": "x"})").can_stop, "a schema object accepts its required property alone");
+    check(run(g, R"({"name": "x", "age": 3})").can_stop, "an optional integer is accepted");
+    check(run(g, R"({"name": "x", "tags": ["a", "b"]})").can_stop, "an optional bounded array is accepted");
+    check(run(g, R"({"name": "x", "age": 3, "tags": ["a"]})").can_stop, "everything at once is accepted");
+    check(run(g, R"({"name": "x")").alive && !run(g, R"({"name": "x")").can_stop,
+          "a half-written object stays alive but may not end the answer");
+
+    check(!run(g, R"({"name": 1})").alive, "a string slot refuses an integer");
+    check(!run(g, R"({"name": "x", "age": "3"})").alive, "an integer slot refuses a string");
+    check(!run(g, R"({"age": 3})").alive, "a missing required property is refused");
+    check(!run(g, R"({"name": "x", "extra": 1})").alive, "a property the schema does not declare is refused");
+    check(!run(g, R"({"name": "x", "tags": []})").alive, "minItems 1 refuses an empty array");
+    check(!run(g, R"({"name": "x", "tags": ["a","b","c"]})").alive, "maxItems 2 refuses three items");
+    check(!run(g, "```json\n{\"name\": \"x\"}\n```").alive, "a Markdown fence is outside the grammar");
+    check(run(g, R"({"name": "x"} )").can_stop, "trailing space is still inside the grammar");
+
+    // enum and const are alternations of their literals, strings quoted as JSON writes them.
+    const Grammar e(json_schema_to_gbnf(nlohmann::json::parse(R"({"type": "string", "enum": ["a", "b"]})")));
+    check(run(e, R"("a")").can_stop && run(e, R"("b")").can_stop, "enum accepts each of its literals");
+    check(!run(e, R"("c")").alive, "enum refuses a value it does not list");
+    const Grammar c(json_schema_to_gbnf(nlohmann::json::parse(R"({"const": 42})")));
+    check(run(c, "42").can_stop && !run(c, "43").alive, "const accepts exactly its value");
+
+    // A type list is the nullable form: ["string", "null"].
+    const Grammar n(json_schema_to_gbnf(nlohmann::json::parse(R"({"type": ["string", "null"]})")));
+    check(run(n, R"("x")").can_stop && run(n, "null").can_stop, "a type list accepts either branch");
+    check(!run(n, "1").alive, "a type list refuses a type it does not list");
+
+    // Nested containers.
+    const Grammar nest(json_schema_to_gbnf(nlohmann::json::parse(R"({
+        "type": "object",
+        "properties": {"outer": {"type": "object", "properties": {"inner": {"type": "boolean"}},
+                                  "required": ["inner"]}},
+        "required": ["outer"]})")));
+    check(run(nest, R"({"outer": {"inner": true}})").can_stop, "a nested object is accepted");
+    check(!run(nest, R"({"outer": {"inner": 1}})").alive, "a nested wrong type is refused");
+
+    // oneOf is alternation.
+    const Grammar one(json_schema_to_gbnf(nlohmann::json::parse(
+        R"({"oneOf": [{"type": "string"}, {"type": "integer"}]})")));
+    check(run(one, R"("s")").can_stop && run(one, "7").can_stop, "oneOf accepts every branch");
+    check(!run(one, "true").alive, "oneOf refuses a value outside every branch");
+
+    // An empty schema is any JSON value, as in JSON Schema.
+    const Grammar any(json_schema_to_gbnf(nlohmann::json::parse("{}")));
+    check(run(any, R"({"a": [1, "x", null]})").can_stop, "an empty schema accepts any JSON");
+}
+
+void test_json_schema_refusals() {
+    // A constraint this converter cannot enforce is a 400 naming the keyword, never a silent drop.
+    for (const char* keyword : {"pattern", "$ref", "allOf", "minimum", "format", "uniqueItems"}) {
+        const std::string schema = std::string("{\"type\": \"string\", \"") + keyword + "\": \"x\"}";
+        check(schema_error(schema).find(keyword) != std::string::npos,
+              std::string("the refusal names ") + keyword);
+    }
+    check(schema_error(R"({"type": "object", "additionalProperties": {"type": "string"}})")
+                  .find("additionalProperties") != std::string::npos,
+          "additionalProperties as a schema is refused by name");
+    check(schema_error(R"({"type": "object", "properties": {"a": {"type": "string"}}, "required": ["b"]})")
+                  .find("required") != std::string::npos,
+          "required naming an undeclared property is refused");
+    check(!schema_error(R"({"type": "weird"})").empty(), "an unknown type is refused");
+    check(!schema_error(R"({"type": "string", "enum": []})").empty(), "an empty enum is refused");
+    check(!schema_error(R"({"type": "array", "items": {"type": "string"}, "minItems": 3, "maxItems": 2})")
+               .empty(),
+          "maxItems below minItems is refused");
+    check(!schema_error("[]").empty(), "a schema that is neither an object nor a boolean is refused");
+
+    // The OpenAI envelope, and the conflicts that used to be impossible because the type was refused.
+    auto starts_with = [](const std::string& s, const std::string& prefix) { return s.rfind(prefix, 0) == 0; };
+    check(starts_with(error_of(nlohmann::json::parse(R"({"response_format": {"type": "json_schema"}})")),
+                      "response_format:"),
+          "json_schema without the json_schema object is refused");
+    check(error_of(nlohmann::json::parse(
+                       R"({"response_format": {"type": "json_schema", "json_schema": {"name": "x"}}})"))
+                  .find("schema") != std::string::npos,
+          "json_schema without a schema is refused");
+    const auto schema_body = options_from_body(nlohmann::json::parse(
+        R"({"response_format": {"type": "json_schema", "json_schema": {"name": "p", "strict": true,
+             "schema": {"type": "object", "properties": {"a": {"type": "string"}}, "required": ["a"]}}}})"));
+    check(!schema_body.grammar.empty() && !schema_body.json_object, "a json_schema request becomes a grammar");
+    check(error_of(nlohmann::json::parse(
+                      R"({"response_format": {"type": "json_schema", "json_schema": {"schema": {}}}})"))
+               .empty(),
+          "the smallest valid envelope is accepted");
+    check(error_of(nlohmann::json::parse(
+                       R"({"grammar": "root ::= \"a\"", "response_format": {"type": "json_schema",
+                           "json_schema": {"schema": {"type": "object"}}}})"))
+                  .find("conflicts") != std::string::npos,
+          "grammar and json_schema together are refused");
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -510,9 +626,9 @@ void test_request_parsing() {
           "more stop sequences than the limit is refused");
     check(starts_with(error_of(nlohmann::json::parse(R"({"grammar": ""})")), "grammar:"), "an empty grammar is refused");
     check(starts_with(error_of(nlohmann::json::parse(R"({"grammar": 7})")), "grammar:"), "a non-string grammar is refused");
-    check(error_of(nlohmann::json::parse(R"({"response_format": {"type": "json_schema"}})")).find("grammar") !=
+    check(error_of(nlohmann::json::parse(R"({"response_format": {"type": "json_schema"}})")).find("json_schema") !=
               std::string::npos,
-          "json_schema points at grammar (GBNF), the converter it does not have");
+          "json_schema without its envelope is refused by name");
     check(error_of(nlohmann::json::parse(R"({"response_format": {"type": "nope"}})")).find("nope") != std::string::npos,
           "an unknown response_format type is refused");
     check(!error_of(nlohmann::json::parse(
@@ -535,6 +651,8 @@ int main() {
     test_logprobs();
     test_logprob_options();
     test_prefix_cache();
+    test_json_schema();
+    test_json_schema_refusals();
     test_request_parsing();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;

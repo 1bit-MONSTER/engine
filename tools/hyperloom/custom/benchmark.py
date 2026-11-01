@@ -70,6 +70,9 @@ DECODE_PROMPTS = {
 #: candidate sees the same prompt; the real token count comes back from the server and is reported.
 LONG_PROMPT_UNIT = ("The archive records a series of routine maintenance events on the northern line. "
                     "Each entry lists a date, a shift, an asset and the action taken. ")
+#: Measured on the box: this filler tokenises at ~4.85 characters per token (a 75,200-character prompt
+#: came back as 15,492 prompt tokens), so the size below hits the requested count rather than 4 chars/token.
+LONG_CHARS_PER_TOKEN = 4.85
 
 
 def env(name, default=""):
@@ -293,8 +296,8 @@ def ask(port, prompt, max_tokens, timeout):
 
 
 def long_prompt(n_tokens):
-    """A deterministic filler prompt of roughly ``n_tokens`` tokens (~4 characters per token)."""
-    return LONG_PROMPT_UNIT * max(1, int(n_tokens * 4 / len(LONG_PROMPT_UNIT)) + 1)
+    """A deterministic filler prompt of roughly ``n_tokens`` tokens at this filler's own ratio."""
+    return LONG_PROMPT_UNIT * max(1, int(n_tokens * LONG_CHARS_PER_TOKEN / len(LONG_PROMPT_UNIT)) + 1)
 
 
 def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0, longtok=128):
@@ -455,6 +458,9 @@ def main():
     if long_info:
         result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)
                                               for k, v in long_info.items()}
+        if long_info.get("ctx_tokens_actual"):
+            # Label the unit with the context the server actually saw, not the one we asked for.
+            result["throughput_unit"] = f"tok/s (decode at {long_info['ctx_tokens_actual']}-token ctx)"
     result["total_token_throughput"] = round(tps["long"] if longctx else tps["code"], 2)
     result["request_throughput"] = round(result["total_token_throughput"] / tokens, 4)
 

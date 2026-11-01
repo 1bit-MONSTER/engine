@@ -41,10 +41,11 @@ def load():
 def main():
     bench = load()
 
-    # The filler prompt: ~4 characters per token, so 18,800 tokens needs >= 75,200 characters,
-    # and the same request twice has to be byte-identical or candidates are not comparable.
+    # The filler prompt: measured at ~4.85 characters per token on this box (a 75,200-character prompt
+    # came back as 15,492 prompt tokens), so 18,800 tokens needs >= 18,800 * 4.85 characters, and the
+    # same request twice has to be byte-identical or candidates are not comparable.
     prompt = bench.long_prompt(18800)
-    assert len(prompt) >= 18800 * 4, len(prompt)
+    assert len(prompt) >= 18800 * 4.85, len(prompt)
     assert prompt == bench.long_prompt(18800)
     assert len(bench.long_prompt(512)) < len(prompt)
 

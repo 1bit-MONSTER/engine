@@ -88,11 +88,29 @@ def kat(url, *args):
     return p.returncode, p.stdout
 
 
+def script_invariants():
+    """The gate's lock placement, from the script itself (no GPU needed): engine#682 took ~/npu.lock off the
+    GPU steps, because an NPU serve and the GPU run concurrently here (engine#673 measured ~87 % of the NPU
+    stream's bandwidth with the GPU busy). A flock creeping back into gpu() would silently re-break it."""
+    bad = []
+    with open(os.path.join(ROOT, "scripts", "hw-gate.sh")) as f:
+        src = f.read()
+    start = src.find("\ngpu() {")
+    body = src[start + 1:]
+    body = body[:body.find("\n}\n")]
+    if start < 0 or "flock" in body:
+        bad.append("gpu() must not take ~/npu.lock (engine#682): the GPU step path holds no lock")
+    npu = src.find("if has npu;")
+    if npu < 0 or "flock" not in src[npu:]:
+        bad.append("the NPU phase must still hold ~/npu.lock: an NPU dispatch must not overlap another")
+    return bad
+
+
 def main():
     srv = http.server.ThreadingHTTPServer(("127.0.0.1", 0), H)
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     url = f"http://127.0.0.1:{srv.server_address[1]}"
-    bad = []
+    bad = script_invariants()
     with tempfile.TemporaryDirectory() as d:
         gold = os.path.join(d, "g.json")
         STATE["mode"] = "good"

@@ -157,8 +157,13 @@ def serve_batch_args():
     llama-server child) but NOT `-b`/`-ub`/`-ctk`/`-ctv` -- it sets those itself per route, and it
     rejects the flags with `unknown option`. So those levers move the llama-bench legs only; the
     serve leg measures what serve would serve.
+
+    `-c` is not a lever but a measurement condition: without it serve sizes the KV cache for the
+    model's OWN context (262144 on Qwen3.8-27B = 16.1 GiB of KV), which only fits when the box
+    happens to be idle -- under another lane's GTT the engine's fit check aborts the server and every
+    candidate fails for a reason that has nothing to do with the lever under test. `HL_CTX` overrides.
     """
-    args = []
+    args = ["-c", str(env_int("HL_CTX", 8192))]
     if env("HL_FA"):
         args += ["-fa", env("HL_FA")]
     return args
@@ -196,7 +201,7 @@ def levers():
     return {
         k: env(k)
         for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_DFLASH",
-                  "HL_PARALLEL", "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
+                  "HL_PARALLEL", "HL_CTX", "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
                   "GGML_HRX_TER_Q4_0", "ONEBIT_HRX_DECODE_SPLIT")
         if env(k)
     }

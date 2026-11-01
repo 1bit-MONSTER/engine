@@ -30,7 +30,7 @@ produces every number below.
    default configuration** (`--parallel 4`). The log-probabilities a client reads depend on how many
    sequences happened to decode with it. `--parallel 1` restores reproducibility. This is engine
    issue [#751](https://github.com/1bit-MONSTER/engine/issues/751) and is the decode-batch sibling
-   of the prefill case documented in [serve.md](serve.md#-precise-a-follow-up-turn-is-bitwise-identical-to-a-cold-run);
+   of the prefill case already documented in the `--precise` section of [serve.md](serve.md);
    `--precise` does not address it, because it only forces a re-prefill.
 3. **Two routes are not bit-identical, and today are not close.** Nothing pins a reduction order
    across a CPU ggml matmul and an HRX kernel, so log-probabilities from different devices differ

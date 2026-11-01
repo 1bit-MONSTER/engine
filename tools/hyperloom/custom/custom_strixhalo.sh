@@ -56,6 +56,14 @@ if [ ! -x "$GPU_HOLD" ]; then
   exit 1
 fi
 
+# The FIFO's state lives next to the REAL home, not next to a sandboxed HOME. gpu-hold defaults both
+# paths to $HOME, and Hyperloom runs this entrypoint under a fresh home (the preflight writes into
+# ~/.claude/config.json), so without this every measurement would take a private token and queue in a
+# private directory -- inside no queue at all, which is the one thing this claim exists to guarantee.
+REAL_HOME=${REAL_HOME:-$(getent passwd "$(id -u)" | cut -d: -f6)}
+export GPU_TOKEN_FILE=${GPU_TOKEN_FILE:-${REAL_HOME:-$HOME}/GPU-TOKEN}
+export GPU_QUEUE_DIR=${GPU_QUEUE_DIR:-${REAL_HOME:-$HOME}/GPU-QUEUE}
+
 # The HRX backend reaches its HSA runtime through IREE's loader, which has to be told where that
 # library is: without this the backend registers no device at all ("Available devices: (none)").
 LIBHSA=${HL_LIBHSA:-/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1}

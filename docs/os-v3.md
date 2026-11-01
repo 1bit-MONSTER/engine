@@ -416,8 +416,7 @@ enrolment is the machine's step, not a VM's.
 
 **Board gate** (the owner, on the Strix Halo box, stick in hand): boot the stick live, `1bit-release-check`
 (every row PASS or SKIP with a reason — the VM run's 18-row transcript is the reference for what each row
-asserts), then the install entry, watch the
-screen, then — **with the stick still in** — confirm the reboot lands on the installed machine; then
+asserts), then the install entry, watch the screen, then — **with the stick still in** — confirm the reboot lands on the installed machine; then
 `efibootmgr -v` (`1bit OS` first), `systemctl status` the unit set, `1bit-menu` on the monitor, ssh from
 the build machine with the carried key, HRX chat and NPU chat from `1bit-menu`, fans/power units active,
 and `apt upgrade` on the installed box. Secure Boot is on: the install queues our MOK, so the very first

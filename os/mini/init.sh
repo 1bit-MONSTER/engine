@@ -26,21 +26,55 @@ hostname -F /etc/hostname
 
 echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"; echo
 
+# #703: the cmdline boots the VT at loglevel=4, so the screen shows the appliance instead of every kernel
+# line. The serial transcript must keep the kernel log it had with ignore_loglevel - that log is what the
+# 26 Oct hardware debugging was read from. Two ways, in order of preference:
+#   1. a per-console level, where the kernel has it (/sys/class/console appears in 6.15+);
+#   2. this box's kernel does not have it (`ls /sys/class/console` -> No such file), so replay the ring buffer
+#      into ttyS0 and then follow it: /dev/kmsg is non-consuming (dmesg still works afterwards) and a fresh
+#      open starts at the oldest record, so the early boot lines are in the transcript too.
+# The VT is untouched by either, and init's own lines are printed at any kernel level, so the gates' serial
+# assertions (the LIVE banner, INSTALLED) are unaffected.
+if [ -w /sys/class/console/ttyS0/level ]; then
+    echo 7 > /sys/class/console/ttyS0/level
+elif [ -c /dev/ttyS0 ] && [ -r /dev/kmsg ]; then
+    ( cat /dev/kmsg > /dev/ttyS0 ) > /dev/null 2>&1 &
+fi
+
+# #709: efivars. The kernel config has CONFIG_EFIVAR_FS=m and the module was not in the image, so
+# `mount -t efivarfs` answered "No such device" on the live boot and 1bit-install could not register a
+# boot entry (the firmware kept its stale ubuntu entry and fell through to the stick). Mounted here, once,
+# for the whole boot - it is a handful of runtime variables, not a disk.
+modprobe -q efivarfs
+if [ -d /sys/firmware/efi ] && [ ! -e /sys/firmware/efi/efivars/BootOrder-8be4df61-93ca-11d2-aa0d-00e098032b8c ]; then
+    mkdir -p /sys/firmware/efi/efivars 2>/dev/null
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+fi
+
 # drivers, in the order the boot needs them: network, USB storage and the USB4/Type-C stack first, so
 # the machine is reachable and the stick readable even if a GPU probe is slow. sd_mod makes a USB
 # stick a disk (usb-storage only presents it as a SCSI device); the TYPEC/Thunderbolt modules are what
 # bring the USB4 ports up (they were in the image but nothing loaded them until now). realtek is the
 # PHY driver the wired NIC needs and must load first: without it r8169 fails with -49 and the machine
 # comes up with no network at all, which looks exactly like a hang.
-for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118 thunderbolt_net roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet; do modprobe -q "$m"; done
+for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb sdhci_pci intel_rapl_msr spd5118 thunderbolt_net roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
+
+# #705: one flow. Every wait says what it is waiting for, on the screen, on the serial line and (once
+# /data is mounted) in /data/boot.log - the c18 dry run had a 12 s chooser, then a blank "starting" while
+# DHCP and lemond came up, and no way to tell a wait from a hang. Defined here, before the first wait.
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
+    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
 
 # network: DHCP on every wired interface
 ip link set lo up
 for n in /sys/class/net/e*; do
     [ -e "$n" ] || continue
     i=${n##*/}; ip link set "$i" up
+    say "  network: waiting for DHCP on $i ($(cat /sys/class/net/$i/operstate 2>/dev/null || echo unknown))"
     udhcpc -i "$i" -b -q -t 5 -s /etc/udhcpc.script >/dev/null 2>&1
+    a=$(ip -4 -o addr show dev "$i" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    say "  network: ${a:-no address yet} on $i"
 done
 
 # models: the stick's 1BIT-DATA partition, if present (the internal disk is left alone)
@@ -49,13 +83,28 @@ data=
 # A USB 2.0 stick can take 45 s or more to appear on this machine (sd 1:0:0:0: [sda] at t=46.4 s in the
 # box's own log), and the old 20 s window expired before it did - so /data never mounted, the keys
 # never arrived and nothing was logged. Wait much longer, and say so as we go.
+# #711: mount THIS boot's own data partition, by the UUID its own boot chain names.
+# Two 1BIT-DATA partitions (the stick's and the installed disk's) are a normal state, and LABEL=1BIT-DATA
+# then answers with whichever the kernel enumerated first: on 2026-10-31 the firmware fell back to the stick
+# and this init mounted the internal NVMe's data partition, ran the stick's kernel on the installed system's
+# data and told the owner "live usb" while the facts on the banner came from the NVMe. mkimage.sh and
+# install.sh write 1bit.data=UUID=<their own data partition> into the grub.cfg of the ESP the firmware loads,
+# so the boot chain says where its data lives and a label collision cannot decide it.
+dataspec=$(sed -n 's/.*[[:space:]]1bit\.data=\([^[:space:]]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -n 1)
 i=0
 while [ $i -lt 90 ]; do
-    data=$(findfs LABEL=1BIT-DATA 2>/dev/null) && break
+    if [ -n "$dataspec" ]; then data=$(findfs "$dataspec" 2>/dev/null); else data=$(findfs LABEL=1BIT-DATA 2>/dev/null); fi
+    [ -n "$data" ] && break
     [ $i = 30 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
     [ $i = 60 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
     sleep 1; i=$((i+1))
 done
+# the disk that partition is on, and whether it is the stick: the banner has to say which system is running
+disk=${data#/dev/}; disk=${disk##*/}
+disk=$(basename "$(readlink -f "/sys/class/block/$disk/.." 2>/dev/null)" 2>/dev/null || echo "")
+removable=$(cat "/sys/class/block/${disk:-none}/removable" 2>/dev/null || echo 0)
+# a USB stick can report removable=0 (QEMU's usb-storage does): the bus it sits on is the honest answer
+case "$(readlink -f "/sys/class/block/${disk:-none}" 2>/dev/null)" in *usb*) removable=1 ;; esac
 if [ -n "$data" ]; then mount "$data" /data && echo "models: /data/models (from $data)"; fi
 
 # Evidence that outlives a live boot: stage markers on the stick, so a machine that hangs later can be
@@ -72,11 +121,7 @@ fi
 stage "stick mounted at ${data:-nothing}"
 
 # Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
-# screen you have to guess about. Defined before its first use: it used to sit below the kernel link
-# line, so the console lost that line to "say: not found" (seen in the VM's serial log).
-say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
-    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
-
+# screen you have to guess about. Defined above the first wait (#705).
 # The engine's own llama-server and the HSA runtime it loads are on the DATA PARTITION, not in the RAM
 # image (mkimage.sh: grub will not load an initrd over ~103 MB and this one is at 89.5 MB, so anything
 # added to the image after it is packed never reaches the stick - which is why 1bit.check said
@@ -164,21 +209,42 @@ grep -q " /data " /proc/mounts && [ -e /data/.installed ] && INSTALLED=1
 # below was silently lost (the installed boot reported INSTALLED on screen and no marker in /etc/1bit)
 mkdir -p /etc/1bit 2>/dev/null
 MODE=live
+# #711: which system is running, and on which device. "live usb is loaded up" while the banner facts came
+# from the NVMe is exactly what the owner saw after the first install.
+WHERE="no 1BIT-DATA partition"
+if [ -n "${disk:-}" ]; then
+    if [ "${removable:-0}" = 1 ]; then WHERE="USB /dev/$disk"; else WHERE="the internal disk /dev/$disk"; fi
+fi
+# #704: the version on the banner comes from the image itself. /etc/1bit/release-identity is written by
+# mkimage.sh out of the Lemonade package that is being shipped and the tree the image was built from, so
+# a banner can never again say v2026.43 on a stick carrying Lemonade 2026.46.0 - and 1bit-release-check
+# reports the same file instead of SKIPping a missing identity.
+ident() { sed -n "s/^$1: *//p" /etc/1bit/release-identity 2>/dev/null | head -n 1; }
+TAG=$(ident tag); TAG=${TAG:-dev}
+LEMVER=$(ident lemonade)
 if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
-      echo "  1bit OS, Lemonade Server appliance   v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  1bit OS, Lemonade Server appliance   $TAG${LEMVER:+  (Lemonade $LEMVER)}  -  LIVE: runs from RAM, nothing is installed, disks are never touched   [from $WHERE]"
       echo "  Lemonade Server by AMD, running on the 1bit engine"
       echo "  ------------------------------------------------------------------------------"
-      echo "   1) Lemonade appliance            (default, starts in 12s)"
+      echo "   1) Lemonade appliance            (default)"
       echo "   2) Lemonade, verbose, no GPU driver"
       echo "   3) Root shell (no services)"
       echo "   4) Power off"
       echo
     } | mc
     printf "  choice: " | mc
-    i=0
-    while [ $i -lt 12 ]; do
+    # #705: the selection timer is on the choice line itself - one screen, a countdown you can watch,
+    # instead of a menu that sits there for 12 s and then drops into a blank "starting". Any key picks.
+    repaint_choice() {
+        for c in /dev/console /dev/tty1; do
+            [ -w "$c" ] && printf '\r  choice [1]  starts in %2d s  ' "$i" > "$c" 2>/dev/null
+        done
+    }
+    i=12
+    while [ "$i" -gt 0 ]; do
+        repaint_choice
         if read -r -t 1 -n 1 c < /dev/console 2>/dev/null; then
             case "$c" in
                 2) MODE=nogpu;  break ;;
@@ -187,9 +253,12 @@ if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
                 1|"") break ;;
             esac
         fi
-        i=$((i+1))
+        i=$((i-1))
     done
-    printf "\n" | mc
+    for c in /dev/console /dev/tty1; do
+        [ -w "$c" ] && printf '\r  choice [%s]  starting\n' "$MODE" > "$c" 2>/dev/null
+    done
+    unset -f repaint_choice
 fi
 case "$MODE" in
     off)  say "powering off (choice 4)"; sync; poweroff -f ;;
@@ -303,6 +372,7 @@ if [ -f "$kf" ] && ! grep -q '^LEMONADE_API_KEY=..*' "$kf" 2>/dev/null; then
     } >> "$kf" && chmod 600 "$kf"
 fi
 # Lemonade's environment file (LEMONADE_API_KEY, LEMONADE_ADMIN_API_KEY, HF_TOKEN), for lemond only
+say "  Lemonade: starting"
 ( cd "$lem" || exit 1
   if [ -f lemond.conf ]; then set -a; . ./lemond.conf; set +a; fi
   exec lemond "$lem/cache" "$lem/config" ) > /tmp/lemond.log 2>&1 &
@@ -313,14 +383,39 @@ key=off; setkey LEMONADE_API_KEY && key=on
 [ "$key" = off ] && setkey LEMONADE_ADMIN_API_KEY && key="off, admin key only: /api and /v1 are open"
 lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-13305}
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
+# #705: say when it actually answers, so the wait for lemond is visible rather than a screen that says
+# "starting" until it happens. lemond binds localhost by default; ask the address it was configured with
+# first, then 127.0.0.1, so a host of 0.0.0.0 is not a 20 s false negative.
+lup=0
+for i in $(seq 1 20); do
+    for a in "$lhost" 127.0.0.1; do
+        case "$a" in 0.0.0.0|::|'') continue ;; esac
+        if wget -q -O /dev/null -T 1 "http://$a:$lport/" 2>/dev/null; then lup=1; break 2; fi
+    done
+    sleep 1
+done
+# a wildcard bind is not an address anyone can click: show the machine's own IPv4 when the config says 0.0.0.0
+case "$lhost" in 0.0.0.0|::|'') lshow=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1); lshow=${lshow:-$lhost} ;;
+                 *) lshow=$lhost ;; esac
+[ "$lup" = 1 ] && say "  Lemonade: up on http://$lshow:$lport/  (API key: $key)" ||
+    say "  Lemonade: not answering yet after 20 s (log: /tmp/lemond.log; API key: $key)"
+# and the engine behind it: the HRX device the onebit recipe needs, or the reason it is not there
+if [ -x /opt/1bit-llama/llama-server ]; then
+    say "  engine: probing the HRX device"
+    dev=$(timeout 20 /opt/1bit-llama/llama-server --list-devices 2>&1 | grep -m1 -i 'HRX' || true)
+    [ -n "$dev" ] && say "  engine: HRX0 ready - $(echo "$dev" | cut -c1-60)" ||
+        say "  engine: no HRX device listed (a GPU-less boot still serves on the CPU path; 1bit-release-check says why)"
+else
+    say "  engine: no llama-server on /data on this boot"
+fi
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
 if [ "$INSTALLED" = 1 ]; then
-    echo "MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is $(findfs LABEL=1BIT-DATA 2>/dev/null)."
+    echo "MODE: INSTALLED on ${disk:-an unknown disk} - 1bit OS runs from this machine's disk; /data is $data ($WHERE)."
     echo "      Reboot to restart it; the install is permanent (1bit-install, os/README.md)."
     touch /etc/1bit/installed 2>/dev/null
 else
-    echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
+    echo "MODE: LIVE from $WHERE - everything runs from RAM; no internal disk is mounted and nothing is installed."
     echo "      Reboot to discard everything; only /data on the stick persists."
     touch /etc/1bit/live 2>/dev/null
 fi
@@ -386,12 +481,12 @@ fi
 # PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
 # what happened on real hardware - the script finished, the final exec returned, and the machine
 # rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
-# Kernel messages stay in dmesg from here on, not over the console shell. The cmdline boots with
-# ignore_loglevel so every boot line is on the console and the serial log; the first hardware boot
-# (26 Oct) then kept printing USB connect/disconnect lines over the shell and the owner could not
-# use the prompt at all. Both knobs are runtime-writable; emergencies (level 0) still reach the console.
-# They matter for the menu too: a boot line painted over the frame is a mess the menu cannot clean up
-# (it only redraws on a keypress or, on Status, once a second).
+# Kernel messages stay in dmesg from here on, not over the console shell: the first hardware boot
+# (26 Oct) kept printing USB connect/disconnect lines over the prompt and the owner could not use it.
+# Both knobs are runtime-writable; emergencies (level 0) still reach the console. They matter for the menu
+# too: a boot line painted over the frame is a mess the menu cannot clean up (it only redraws on a
+# keypress or, on Status, once a second). Since #703 the cmdline already boots at level 4, so this only
+# has to hold it there - and to clear the old ignore_loglevel default on an image built before that.
 echo N > /sys/module/printk/parameters/ignore_loglevel 2>/dev/null
 echo "1 4 1 7" > /proc/sys/kernel/printk 2>/dev/null
 # with a tty1 this never returns (screen_login loops); the while keeps PID 1 alive if there is none

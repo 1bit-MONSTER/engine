@@ -139,10 +139,24 @@ URL=http://localhost:13305/
 APURL=http://localhost:13305/api/v1
 installed() { [ -e /data/.installed ] || [ -e /etc/1bit/installed ]; }
 
+# #711: which system is running, on which device. The same rule as init.sh: the partition init mounted is the
+# one this boot's own boot chain named, so the name comes from /proc/mounts rather than from a label lookup.
+bootdev() {
+    local p d
+    p=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts 2>/dev/null)
+    [ -n "$p" ] || { echo ""; return 0; }
+    d=${p#/dev/}; d=${d##*/}
+    d=$(basename "$(readlink -f "/sys/class/block/$d/.." 2>/dev/null)" 2>/dev/null)
+    [ -n "$d" ] || { echo ""; return 0; }
+    if [ "$(cat "/sys/class/block/$d/removable" 2>/dev/null || echo 0)" = 1 ]; then echo "USB /dev/$d"
+    else echo "the internal disk /dev/$d"; fi
+}
+
 facts() {
     IP=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
     [ -n "$IP" ] || IP="no address"
     if installed; then MODE=INSTALLED; else MODE=LIVE; fi
+    WHERE=$(bootdev)
     PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
     PORT=${PORT:-13305}
     URL="http://$IP:$PORT/"
@@ -157,9 +171,9 @@ header() {
     printf '%s  1bit OS - Lemonade Server appliance%s\n' "$CYAN" "$RESET"
     printf '  %s%s%s  ' "$mcol" "$MODE" "$RESET"
     if [ "$MODE" = INSTALLED ]; then
-        printf 'runs from this machine'"'"'s disk\n'
+        printf 'runs from this machine'"'"'s disk%s\n' "${WHERE:+ ($WHERE)}"
     else
-        printf 'runs from RAM, nothing installed, disks untouched\n'
+        printf 'runs from RAM, nothing installed, disks untouched%s\n' "${WHERE:+ (from $WHERE)}"
     fi
     # the things a person wants first: where to click, and where to point a client (and, where the
     # optional OpenWebUI package is installed, the second front end below). The web app is
@@ -227,8 +241,12 @@ pick() {
                 p_hint=${p_it#*|}
                 [ "$p_hint" = "$p_it" ] && p_hint=
                 if [ "$p_k" = "$p_i" ]; then
-                    printf '  %s> %s  %-10s%s' "$REV" "$p_k" "$p_lab" "$RESET"
-                    printf '  %s%s\033[K\n' "$BOLD" "$p_hint"
+                    # #707: the bar covers the whole row, not just " > 1  Chat ". Pad the row to the
+                    # terminal width BEFORE inverse video, so the number, the label and the description are
+                    # one bar (the c18 screenshots showed a short box offset from the menu text).
+                    p_txt=$(printf '> %s  %-10s  %s' "$p_k" "$p_lab" "$p_hint")
+                    while [ "${#p_txt}" -lt $((COLS - 2)) ]; do p_txt="$p_txt "; done
+                    printf '  %s%s%s\033[K\n' "$REV" "$p_txt" "$RESET"
                 else
                     printf '     %s  %-10s' "$p_k" "$p_lab"
                     printf '  %s%s%s\033[K\n' "$GREY" "$p_hint" "$RESET"

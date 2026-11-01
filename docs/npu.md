@@ -576,3 +576,34 @@ The NPU needs the `amdxdna` kernel driver. `third_party/xdna-driver` pins upstre
 against (the kernel's own copy also works); nothing from the pin is built into or shipped with
 the release. `.github/workflows/bump-xdna.yml` moves the pin when run by hand, because a driver
 move means rebuilding the module on Strix Halo and checking the NPU there first.
+
+### The MTP head (FastFlowLM's container -> ours)
+
+`tools/flm_head_import` (built as `flm-head-import`) turns a FastFlowLM MTP-head container
+(`model.mtp.q4nx`) into a sidecar directory of ours. The head is one Qwen3.5 full-attention layer plus an input
+fusion; the base model keeps its embedding, lm-head, tokenizer and RoPE, so this artifact is only the head.
+
+The container is safetensors-shaped and its quantised tensors are rank-3 `[nrb, ncb, 4736]` with dtype `"I8"`.
+That 4,736-byte cell **is our Q4_K chunk**: `u8 scale[g*32+n]` at 0, `u8 min[g*32+n]` at 256, nibbles at 512
+(byte `k*16 + n/2`, even n in the low nibble), `bf16 S[n]` at 4608, `bf16 M[n]` at 4672, and
+`w = q4 * (scale*S) + min*M`. Measured, not assumed: `q4nx::dequant_tile(Chunk::Q4K, …)` reproduces FastFlowLM's
+own decoder **bit for bit** on six cells recorded from six of the head's matrices (`tests/golden/flm-i8`, floats
+recorded from their published library; the layout facts are in amd-oss/npu-re
+`docs/FACTS-flm-q4nx-container-and-mtp-head.md`). Two things follow, and they are the reason this tool is small:
+
+* the default form copies every cell **unchanged** — no requantisation, nothing to lose, and the import
+  self-check re-decodes each matrix from the source and from the copy and compares;
+* the alternative `--form q4_1` writes our mode-1 chunk (5,120 B: `bf16 S[256]`, `bf16 M[256]`, 4,096 code
+  bytes, `w = code*S + M`) through `q4nx::q4k_to_q4_1`, whose only loss is rounding `S*scale` and `M*min` to
+  bf16. The tool prints that factorisation error rather than hiding it (measured on the 27B head: 0.67 % of
+  values unchanged, max |delta| 1.2e-3, mean |delta| 6.8e-5).
+
+    flm-head-import model.mtp.q4nx -o head-q4k               # cells copied unchanged
+    flm-head-import model.mtp.q4nx -o head-q4_1 --form q4_1  # our mode-1 chunks
+
+`tools/flm_head_pb16i.py` writes the third form, the `pb16i` image (`npu/forward/include/q4nx_pb16i.h`), and it
+is the one form this head cannot have exactly: `pb16i` carries one int16 magnitude per (32 K, column) with no
+per-group bias, while the source blocks are asymmetric (`w = q4*S + M`) and their magnitudes span about 100x
+inside a column, where an int16 with an 11-bit mantissa allows about 16x. Forcing it costs a measured 11-18 %
+relative L1 residual, so the mode-1 or Q4_K forms are the ones to run; the script keeps the measurement next to
+the images it writes.

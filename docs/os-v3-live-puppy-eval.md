@@ -95,8 +95,34 @@ the weekly kernel build appends the fragment before `make olddefconfig`. The cos
 and a new A-phase gate; the risk is that a `=y` symbol pulls something into the image that was not
 there, which is what the boot gate measures.
 
+One thing the first version of the fragment got wrong, found by reading our own config rather than by a
+build: a tristate cannot be `=y` while a symbol it `depends on` is `=m`, and `make olddefconfig` does not
+refuse — it **silently reduces the child back to `=m`**. Ours are `=m` all the way down (`SCSI`,
+`SCSI_MOD`, `SCSI_COMMON`, `CDROM`, `ATA`, `SATA_AHCI` in
+`/boot/config-7.3.0-rc4-1bit-perfopt+`), so `BLK_DEV_SR=y` on its own would have built a kernel that
+still could not read the ISO, with nothing in the build output saying so. The fragment now carries the
+chain above the drivers (24 symbols, from 20), and the per-symbol `grep -qx "$sym=y"` check in
+`os/v3/puppy/README.md` is what makes that class of mistake loud.
+
 Until that fragment is in a built kernel, **the Puppy base cannot boot on our kernel at all** — measured
-above, at 2.1 s into the boot.
+twice, and the second time on the real artifacts rather than on a borrowed initrd: the built ISO's own
+`initrd.gz` (2,369,371 B, 127 cpio entries, from `initrd-progs`) on the ISO's own `vmlinuz`
+(`7.3.0-rc4-1bit-perfopt+`) stops with
+
+```
+Waiting 5 seconds for slow storage devices [0/5] ... [4/5].
+Finding puppy main sfs file. failed
+  3: PSUBDIR= P_BP_FN= P_DEF_FN=puppy_upup64r_26.04.sfs
+  HAVE_PARTS=''      TRY_PARTS=''
+  6: ONE_PART= ONE_TRY_FN= PDRV=
+***  /puppy_upup64r_26.04.sfs not found.
+*** Error is too critical, dropping out to console...  ~ #
+```
+
+`HAVE_PARTS=''` is the part worth reading twice: the init did not fail to *mount* the medium, it found
+**no partitions at all** — no `/dev/sr0`, because `sr_mod` is a module and an initrd that cannot load
+modules has nothing to read the ISO with. That is precisely the first block of the fragment
+(`BLK_DEV_SR`, `ISO9660_FS`, `BLK_DEV_SD`, `BLK_DEV_NVME`, `USB_STORAGE`) set to `=y`.
 
 ## 3. Blocker 2: the binaries need glibc 2.43, so the base must be 26.04
 
@@ -186,7 +212,8 @@ Attempts on 2026-11-01, in order, each one a measured trap:
 | 5 | `3builddistro` → petbuild `busybox`: `chroot: failed to run command 'bash': No such file or directory` | the petbuild chroot is an **overlay mount**, and inside Docker the upper/work dirs sit on Docker's overlay rootfs — the kernel refuses it: `mount: ... bad superblock on petbuild`, so the rootfs is empty | build in a **host bind mount** (`BUILD_ROOT`, `/work`), not in the container's rootfs |
 | 6 | `3builddistro` → debootstrap of the `bdrv`: `cannot create … test-dev-null: Permission denied`, "mounted with noexec or nodev" | the petbuild overlay fix moved the build root to `/tmp`, and **`/tmp` here is tmpfs, `nodev`** — debootstrap needs a usable device node in its target | default `BUILD_ROOT` to `$HOME/wt/1bit-puppy-build` (ext4) and **refuse a nodev/noexec build root up front** |
 | 7 | `mk_iso.sh`, the last step: `mkdosfs: command not found`, then `losetup: /dev/loop16: failed to set up loop device` | the ISO wrapper builds a FAT EFI image with `mkdosfs` (the container had no `dosfstools`) and sets up a loop device (the container has no `/dev/loop-control`) | `dosfstools` in the container; `LOOP_DEVICE=1` passes `/dev/loop-control` through |
-| 8 | `mk_iso.sh` again | as above | — |
+| 7 (second defect) | **nowhere — it stayed green** and produced an ISO whose `initrd.gz` was **27 bytes** ("original size modulo 2^32 0") | `initrd-progs` packs the initrd with `find . \| cpio -o -H newc > ../initrd 2>/dev/null`: the container had no **`cpio`**, so the redirect created an empty file, stderr was suppressed, `gzip` compressed nothing, and `3builddistro` carried the result into a bootable-looking ISO | `cpio` in the package list, plus a `command -v cpio` refusal before `merge2out` — this trap's whole danger is that nothing fails |
+| 8 | `1download`: `DOWNLOAD FAIL: libnl-genl-3-200_3.12.0-2_amd64.deb`, all four mirrors | **not a recipe defect**: one package out of 1241, and the same URL answered `200 OK` minutes later. The real cost is that a fresh `BUILD_ROOT` re-downloads 2.6 GB and one mirror hiccup over a thousand files fails the build | reuse `local-repositories`: attempt 9 copied attempt 7's cache into the new build root and touched no mirror at all |
 
 Attempt 7 is the informative one: it went through `0setup` ✓, `1download` ✓, `2createpackages` ✓ and
 every stage of `3builddistro` up to `mk_iso.sh`, and **produced the payload** - `sandbox3/rootfs-complete`
@@ -194,6 +221,69 @@ every stage of `3builddistro` up to `mk_iso.sh`, and **produced the payload** - 
 from `kernel-kit/output`**. It died only in the ISO wrapper, on two container facilities (`mkdosfs`,
 `/dev/loop-control`), neither of which the *installed* (frugal) mode needs: a frugal install is the SFS
 files on a partition, not an ISO.
+
+### The ISO, finished on the host (attempt 7's payload, no rebuild)
+
+The two missing facilities are on this box (`/usr/sbin/mkfs.fat` from `dosfstools`, `/dev/loop-control`,
+passwordless `sudo`), so the wrapper did not need the container and did not need the 1.5-hour build
+repeated. Two steps, from `sandbox3`:
+
+```sh
+cd ../initrd-progs && sudo bash ./build.sh -prebuilt -auto -arch x86_64   # 27 B -> 2,369,371 B
+sudo cp initrd.gz ../sandbox3/build/initrd.gz
+cd ../sandbox3 && sudo bash ../support/mk_iso.sh                          # xorriso 1.5.6, mkfs.fat 4.2
+```
+
+`upup64r-26.04.iso`, **1,294,471,168 B** (632,066 sectors), sha256
+`805938104b7076b66f88046ae602eb94b16092ebc6746bc5cf213987ef9cc388`, md5
+`a27ddf2ad1ad054c3284abdd79f9367b`. What is inside it, as `xorriso -find` lists it:
+
+| file | bytes |
+|---|---|
+| `vmlinuz` | 11,563,520 — `7.3.0-rc4-1bit-perfopt+` (the string is in the image), from our huge tarball |
+| `initrd.gz` | 2,369,371 — 127 entries, `/init` present |
+| `puppy_upup64r_26.04.sfs` | 456,491,008 |
+| `zdrv_upup64r_26.04.sfs` | 104,599,552 — the 3819 modules + firmware the kernel boots with |
+| `fdrv_upup64r_26.04.sfs` | 698,683,392 |
+| `bdrv_upup64r_26.04.sfs` | 7,708,672 |
+| `/EFI/boot/{bootx64,grubx64,mmx64}.efi` | 960,080 / 3,854,336 / 850,176 — shim + grub + MokManager |
+| `/boot/efi.img` | 6,188,544 — the FAT image the UEFI El Torito entry boots |
+| `/isolinux.bin` | the BIOS El Torito entry ("isohybrid-suitable") |
+
+Both boot entries are real (`xorriso -report_el_torito`: BIOS → `/isolinux.bin` LBA 3063, UEFI →
+`/boot/efi.img` LBA 41). One honest gap: **`isohybrid` is not installed here**, so the image is not
+isohybrid-patched — it boots from a CD or an optical-emulated stick, and a raw `dd` to a stick would get
+no MBR. `syslinux-utils` is already in `build.sh`'s container list, so the container path would have it;
+the host run did not.
+
+The frugal payload (the mode the owner asked for) is those SFS files, and they are kept with the ISO in
+`~/wt/puppy-out-attempt7/` — 2.4 GB together.
+
+### Then the recipe itself, one command (attempt 9): `rc=0`, and a better ISO
+
+That host-side finish proved the payload and the wrapper but not the *recipe*, so the fixed `build.sh`
+was run end to end again — fresh build root, woof-CE passed as the 4th argument, `nice -n 19`, package
+cache pre-seeded from attempt 7 (trap 9). **`build.sh resolute64 … ` exited 0 and wrote the ISO itself**:
+`upup64r-26.04.iso`, **1,317,011,456 B**, sha256
+`41e23602269b3bc8bf5751c646c1a3f559a846aa44751a4e584ed090286f857e`, md5
+`d60cc2809fdcb5951a8bb70b90bca408`, in about 20 minutes in the 12 GB / 4 CPU container.
+
+Diffing its file list against the host-finished image leaves exactly two differences, and the second one
+makes it the better artifact:
+
+| file | attempt 7 (host-finished) | attempt 9 (the recipe) |
+|---|---|---|
+| `initrd.gz` | 2,369,371 | 2,369,395 — the 24 bytes are `DISTRO_PUPPYDATE` |
+| `ucode.cpio` | **0** — "Building without early microcode loading" | **21,672,960** — `amd-ucode` collected into the early-load cpio |
+| everything else | identical byte counts, both El Torito entries | |
+
+So the recipe's own output carries **early AMD microcode loading** as well, which the interrupted attempt
+7 tree never got to. `build.sh` now also copies the four SFS out of `sandbox3/build/` into `<out-dir>`
+next to the ISO, because those files *are* the frugal install.
+
+G2 was re-run on this second ISO too (`os/v3/puppy/g2-probe.sh`, exit 1): same banner, same
+`Finding puppy main sfs file. failed`, same `HAVE_PARTS=''`. Two independently built images behave
+alike, which is what a red gate should look like when the cause is the kernel config and not the image.
 
 The built **resolute64 (Ubuntu 26.04) rootfs** measured, which is the base the appliance would run on:
 
@@ -209,21 +299,24 @@ The built **resolute64 (Ubuntu 26.04) rootfs** measured, which is the base the a
 What is worth saying plainly: the build system is from 2009; it is maintained (a CI matrix builds five
 targets twice a month) and it is *interactive* and environment-sensitive in several places that matter,
 and every one of those places cost an attempt. A product build has to run `woof-code`'s stages from a
-script that answers them, on a filesystem that can host its mounts — which is what `build.sh` now is. A
-finished ISO is **not** claimed here; G1 stays open until one builds and boots.
+script that answers them, on a filesystem that can host its mounts — which is what `build.sh` now is.
+**A finished ISO exists, and the recipe produces it**: `build.sh` run end to end exits 0 and writes
+`upup64r-26.04.iso` (1,317,011,456 B, sha256 `41e23602…6f857e`) carrying our kernel, our initrd, both
+boot entries and early microcode. The first ISO here was finished on the host from attempt 7's payload
+(above), and the second was built by the recipe alone.
 
 ## The gates this evaluation would accept, and which of them are green
 
 | gate | what | status |
 |---|---|---|
-| G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **payload green** (attempt 7: rootfs-complete 1.5 GB, devx/nlsx/docx SFS, our kernel in the build); the **ISO wrapper** needs `dosfstools` + `/dev/loop-control` in the container (trap 7) — and the frugal install does not need an ISO at all |
-| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red**: our kernel's `=m` medium/layer drivers ([Blocker 1](#blocker-1-the-kernel-config)); the fix is `kernel-puppy.fragment` + a kernel rebuild |
+| G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **green**: `build.sh` alone exits 0 and writes `upup64r-26.04.iso` **1,317,011,456 B**, sha256 `41e23602…6f857e` — our `vmlinuz` (`7.3.0-rc4-1bit-perfopt+`), a 127-entry initrd, four SFS, early AMD microcode, `isolinux` + an EFI `efi.img` with shim/grub/MokManager |
+| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red, measured on both built ISOs**: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
 | G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
 | G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |
 | G5 | `lemond` + `1bit serve` run unchanged from the c18 tarball | **blocked by glibc on 24.04** (measured 2.43 vs 2.39); needs the resolute base |
 | G6 | `1bit-release-check` green as far as a VM allows | not run (needs G2+G5) |
 | G7 | a save layer persists across a reboot (frugal install on a qcow2, then reboot) | not run |
-| G8 | image size, boot time, idle RAM, against the c18 initramfs | size measured; boot time and RAM pending G2 |
+| G8 | image size, boot time, idle RAM, against the c18 initramfs | size measured (ISO 1.32 GB, rootfs 1.5 GB, frugal payload 1.27 GB of SFS); boot time and RAM pending G2 |
 
 ## Recommendation
 
@@ -258,7 +351,9 @@ medium, not of design.
   108.8 s, table above) with the harness that exists: a timestamping serial tee
   (`[NN.Ns] ` prefix per chunk) + `systemd-run --user --scope -p MemoryMax=6G`.
 - **the persistence round trip** (G7) and **Secure Boot with the swapped chain** (G4).
-- **the resolute64 ISO itself** — the build is the open item of this page.
+- **boot past `Finding puppy main sfs file`** (G2): the ISO exists and its init runs, but the kernel has
+  no built-in medium driver, so the init sees no partitions. This is the one item a kernel rebuild in
+  `docs/kernel.md` §1 closes — and that build is deliberately not done on this box.
 - **project health and licensing** beyond the facts stated: woof-CE builds five targets on CI; the
   recipes are GPL-2.0-or-later with the built distro's own licences; ResolutePup64 is community-built
   and its release notes are the only English documentation of the recipe.

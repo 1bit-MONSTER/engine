@@ -23,7 +23,9 @@ makes the **installed** machine a real OS: Ubuntu 26.04 LTS Server, installed un
 from the same stick, carrying our kernel, our drivers, our runtime, the engine, Lemonade and the
 appliance units as packages that `apt` updates.
 
-Nothing here is built yet: `os/v3` does not exist in the tree, `os/mini` keeps shipping in v2026.44, and
+The first slice is in the tree: `os/v3/pin.txt` (the pinned server ISO) and `os/v3/seed.sh` with its
+`seed-selftest.sh` (31 checks, no device). Everything after the seed — `mkstick.sh`, `mkdebs.sh`,
+`postinstall`, `steps`, the vmtest scripts — is design. `os/mini` keeps shipping in v2026.44, and
 engine#712 says v3 is the next release, not the Sunday one. What *is* measured is in
 [What is measured now](#what-is-measured-now) — most of it on the Strix Halo box this design was written
 on, which is itself the reference install: it runs Ubuntu 26.04.1 with our kernel, our out-of-tree
@@ -36,7 +38,7 @@ modules, TheRock's ROCm, the distro's XRT, the engine and Lemonade, and it serve
 | live medium | BusyBox initramfs, everything in RAM | Ubuntu rootfs squashfs + our debs | **unchanged**: the `os/mini` image is the try-it medium |
 | installed system | the same initramfs on the ESP + a `/data` partition | squashfs unpacked to ext4, our debs preinstalled | **Ubuntu 26.04 Server, installed by subiquity `autoinstall`** |
 | updates | reflash the stick | `apt` from `1bit.gg/apt` | `apt` from `1bit.gg/apt`, unattended security updates on |
-| users | root only, keys from `/data/ssh` | root only, keys from `/data` | **`1bit` with sudo**, keys carried from the stick, root locked |
+| users | root only, keys from `/data/ssh` | root only, keys from `/data` | **`onebit` with sudo**, keys carried from the stick, root locked |
 | firmware entry | none (engine#709) | `efibootmgr -c` when it exists | **created, ordered, stale entries removed** (engine#709) |
 | efivarfs | absent (module never staged, engine#709) | present (`CONFIG_EFIVAR_FS=m`, systemd loads it) | present, and a `release-check` row for it |
 | console | BusyBox shell + `1bit-menu` | `1bit-menu` on tty1, autologin | `1bit-menu` on tty1 as a unit, ssh and ttyS0 stay plain |
@@ -104,7 +106,7 @@ gains:
 
 ```sh
 prepare-stick.sh /dev/sdX --ssh-pubkey ~/.ssh/id_ed25519.pub \
-    --user 1bit --hostname 1bit-strixhalo --disk-serial YMA62T0KA2417407NP \
+    --user onebit --hostname 1bit-strixhalo --disk-serial YMA62T0KA2417407NP \
     --model ~/models/Qwen3-0.6B-Q4_K_M.gguf
 ```
 
@@ -232,7 +234,7 @@ install):
 | 4 | `update-initramfs -u -k <kver>`, `update-grub` | an initramfs with `amdgpu`, `amdxdna`, `efivarfs`, and one grub entry per kernel in `/boot` |
 | 5 | `mokutil --test-key /cdrom/1bit/mok/MOK-Kernel.der` else `mokutil --import` (password on stdin, twice) | the MokNew efivars the next boot's MokManager reads |
 | 6 | `efibootmgr -c -d <disk> -p 1 -L "1bit OS" -l '\EFI\ubuntu\shimx64.efi'`, `-o` first, `-n` BootNext, delete entries whose loader is not on this ESP | the firmware entry engine#709 asks for |
-| 7 | adopt `/data`: `chown 1bit`, `install -d models lemonade/cache lemonade/config cache/hrx-jit npu ssh`, copy `/data/ssh/host_ed25519` to `/etc/ssh/ssh_host_ed25519_key` | a machine whose SSH identity survives a reinstall |
+| 7 | adopt `/data`: `chown onebit`, `install -d models lemonade/cache lemonade/config cache/hrx-jit npu ssh`, copy `/data/ssh/host_ed25519` to `/etc/ssh/ssh_host_ed25519_key` | a machine whose SSH identity survives a reinstall |
 | 8 | verify: `mount -o ro` both partitions, `sha256sum /boot/vmlinuz-<kver>`, `dpkg-query -W '1bit-*'`, `systemctl is-enabled` the unit set, `1bit-release-check` | `/data/install.log` on both media, the screen, ttyS0 |
 
 The `1bit-appliance` postinst enables the unit set exactly as v2 does, including the measured
@@ -250,7 +252,7 @@ same lines as plain text, byte-for-byte, which is what the gates assert.
 The screen covers the *whole* install, which for v3 means one list that spans both processes:
 
 ```
- 1  target disk and identity          /dev/nvme0n1  YMTC PC41Q-2TB  1.9 TB   user 1bit  host 1bit-strixhalo
+ 1  target disk and identity          /dev/nvme0n1  YMTC PC41Q-2TB  1.9 TB   user onebit  host 1bit-strixhalo
  2  base system (Ubuntu 26.04 Server)   curtin: partitions, unpack, packages, bootloader
  3  our repository from the stick      8 debs: kernel, modules, rocm, xrt, engine, lemonade, appliance, keyring
  4  kernel and modules                 vmlinuz-7.3.0-rc4-1bit-perfopt+, amdxdna, ec_su_axb35, initramfs
@@ -359,10 +361,13 @@ move is a measured decision), which are `Package-Blacklist`ed and reported by `r
 row; `Automatic-Reboot "false"`, and the console menu shows "reboot required" instead. That is the
 appliance's contract: it cannot silently become a machine nobody measured.
 
-**User and ssh**: `1bit` in `sudo`, root locked, `ssh.socket` enabled with keys carried from the stick,
-`PasswordAuthentication no`, `PermitRootLogin no`. Headless means the console is the fallback, not the
-other way round: `1bit-menu` on tty1 can drop to a shell as `1bit` (sudo), and ttyS0 gets a console unit
-so a serial cable works when ssh does not.
+**User and ssh**: `onebit` in `sudo`, root locked, `ssh.socket` enabled with keys carried from the stick,
+`PasswordAuthentication no`, `PermitRootLogin no`. The account is `onebit` and not `1bit` because a Linux
+user name has to start with a letter — `adduser`'s default `NAME_REGEX` is `^[a-zA-Z][a-zA-Z0-9_-]*$`
+(measured in `/etc/adduser.conf` here) and the installer applies the same rule, so `1bit` is refused
+before the first byte is written; `seed.sh` refuses it too and its selftest pins that. Headless means the
+console is the fallback, not the other way round: `1bit-menu` on tty1 can drop to a shell as `onebit`
+(sudo), and ttyS0 gets a console unit so a serial cable works when ssh does not.
 
 **`1bit-menu` on tty1** is a unit (`1bit-console.service`, `Conflicts=getty@tty1.service`), not an
 autologin shell: it draws the banner (model, IP, API key hint, GPU/NPU state, pending updates), drives
@@ -380,14 +385,14 @@ BusyBox initramfs on the ESP and one ext4 `/data`; there is no dpkg database, no
 | models (`/data/models`) | left in place; `/data` mounted by UUID in the new fstab |
 | Lemonade's config, cache and backends | left in place; the unit's `HOME=/data/lemonade` is unchanged |
 | `hrx-jit` kernel cache, sealed NPU sets (`/data/npu`) | left in place; `GGML_HRX_JIT_CACHE_DIR` unchanged |
-| SSH host key and `authorized_keys` | `/data/ssh/host_ed25519` → `/etc/ssh/ssh_host_ed25519_key`; `authorized_keys` → `/home/1bit/.ssh/` |
+| SSH host key and `authorized_keys` | `/data/ssh/host_ed25519` → `/etc/ssh/ssh_host_ed25519_key`; `authorized_keys` → `/home/onebit/.ssh/` |
 | Lemonade's API key | `/data/lemonade/lemond.conf` read as before |
 
 | not carried, by design | why |
 |---|---|
 | v2's kernel and initramfs on the ESP | v3 keeps its kernels in `/boot` and its boot chain in the ESP; the old files are removed with the partition table |
 | `/data/.installed` | v3 has no live/installed marker; `release-check`'s `mode` row reads the mount, not the file |
-| root-only ssh | replaced by the `1bit` user; the same keys work |
+| root-only ssh | replaced by the `onebit` user; the same keys work |
 
 The stick for this is the v3 stick with the machine named: `prepare-stick.sh --disk-serial …`, then the
 install. The doc's rule is that a v2 machine can also be **returned** to v2 by writing the v2 image,
@@ -410,7 +415,7 @@ phase that is new because the install is new:
 | A (stick) | boot the stick's live entry | unchanged from c18: banner, `1bit-selftest`, `llama-server` on HRX0 |
 | R (release check) | `1bit-release-check` on the stick | unchanged, plus `sealed-sig` is still SKIP (the live image has no python3) |
 | I (install) | boot the install entry, unattended | the serial transcript contains every step line 1–9, the `1bit OS` boot entry and the printed `BootOrder`, `postinstall` exit 0, the install log written to both media |
-| B (installed) | boot the installed disk alone, same NVRAM | `efivarfs` mounted; `dpkg-query -W '1bit-*'` = 8 packages; `systemctl is-enabled` the unit set; `ssh.socket` listening; `getent passwd 1bit` and `sudo -l`; `/data` mounted from partition 3 by UUID; `apt-get update` and `apt-cache policy` from `1bit.gg/apt`; `unattended-upgrades --dry-run` clean; `1bit-release-check` PASS with `sealed-sig` now checked (`python3` present); `1bit-console` active on tty1 |
+| B (installed) | boot the installed disk alone, same NVRAM | `efivarfs` mounted; `dpkg-query -W '1bit-*'` = 8 packages; `systemctl is-enabled` the unit set; `ssh.socket` listening; `getent passwd onebit` and `sudo -l`; `/data` mounted from partition 3 by UUID; `apt-get update` and `apt-cache policy` from `1bit.gg/apt`; `unattended-upgrades --dry-run` clean; `1bit-release-check` PASS with `sealed-sig` now checked (`python3` present); `1bit-console` active on tty1 |
 | **V** (v2 → v3) | install a v2 image, then the v3 stick over it | `/data` contents identical before and after (manifest sha256), the ssh host key unchanged, the v2 ESP gone, the machine boots v3 |
 
 QEMU specifics, all measured as available on this box: `qemu-system-x86_64` with
@@ -449,11 +454,12 @@ Reference box (strixhalo, 2026-11-01, the machine this design was written on):
 | packages | kernel image 86 MB `.deb`, headers 10 MB; c18 `lemonade-onebit` 39 MB; live `.img.zst` 397 MB; live `.efi` 106 MB |
 | v2 in the field | ESP 512 MiB + `1BIT-DATA`; `1bit-install` writes `/data/.installed`; no efivarfs, no `efibootmgr` (engine#709) |
 | c18 gate | A/R/I/B green in QEMU, install writes ESP + `/data` (1.1 GB copied), the installed boot passes `1bit-release-check` 18 rows with `sealed-sig` SKIP for lack of python3 |
+| the install medium | `ubuntu-26.04.1-live-server-amd64.iso`, 2,927,861,760 bytes, sha256 `cc8a95cd…`, last modified 2026-08-26, volume label `Ubuntu-Server 26.04.1 LTS amd64` — the label read from the ISO's own primary volume descriptor, which is what casper matches; all four in `os/v3/pin.txt` |
 
 Not measured, and therefore the risk list for the build:
 
-- **the server ISO's own size, sha256 and volume label** — pinned in `os/v3/pin.txt` at the first build,
-  not quoted here; the QEMU phase I run is what makes the number real;
+- **the medium itself has never been booted** — the pin is verified (size, sha256, label) but the QEMU
+  phase I run is what proves casper finds `/cdrom` and subiquity takes the seed;
 - **subiquity's screen handoff** — whether our step lines appear in the tail it displays, or whether the
   renderer must take tty1 after curtin (the gate decides; both keep the serial transcript complete);
 - **`mokutil --import` reading its password from stdin** in a curtin chroot — if it refuses, the fallback
@@ -474,10 +480,11 @@ Not measured, and therefore the risk list for the build:
 
 | file | what |
 |---|---|
-| `pin.txt` | snapshot, server ISO (url, size, sha256, volume label), package pins |
+| `pin.txt` | the server ISO exactly (url, size, sha256, volume label, date) and the series; the engine/kernel/ROCm pins stay the release's own |
 | `mkstick.sh` | `mkrootfs`'s replacement: extract the pinned ISO to partition 2, add `/1bit/`, write the ESP from `os/mini`'s payload, `prepare-stick`-style identity |
 | `mkdebs.sh` | v2's `mkdebs.sh` plus `1bit-rocm` (subset derived from `ldd`), `1bit-xrt` (Depends), the kernel/modules pair, and the archive-keyring |
-| `seed.sh` | render `autoinstall.yaml` + `identity` from the stick's inputs; `--check` refuses a seed with no disk serial, no password hash, no key |
+| `seed.sh` | **in the tree**: renders `autoinstall.yaml` + `identity` from the stick's inputs, `check` validates a rendered seed (fields, mode, placeholders, and the YAML's structure with PyYAML), `selftest` proves both directions — 31 checks, no device |
+| `seed-selftest.sh` | the `selftest` target: good-seed acceptances, 15 refusals with their reasons, and six structure regressions (no `preserve: true`, a `file://` apt source, an unsubstituted placeholder, a root size the identity does not have, a `/data` that is not `1BIT-DATA`, an md5 hash) |
 | `postinstall` | the nine steps, `set -e` with the failure trap that keeps the screen |
 | `steps` | the renderer entry points `plan`, `step`, `failed` (v2's `os/mini/tui.sh`, Apache-noticed copy) |
 | `vmtest-v3.sh`, `vmtest-install-v3.sh` | phases A/B and I/V, transcripts in `/data` as v2's do — the host reads the guest's transcript, so no port forwarding decides a verdict |

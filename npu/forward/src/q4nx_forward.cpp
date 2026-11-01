@@ -239,6 +239,62 @@ using namespace q4nx_lh;
 Q4nxNpuForward::Q4nxNpuForward() {}
 Q4nxNpuForward::~Q4nxNpuForward() = default;
 
+size_t Q4nxNpuForward::StateSnapshot::bytes() const {
+    size_t n = 0;
+    for (const auto* per_layer : {&k, &v, &conv, &rec})
+        for (const auto& layer : *per_layer) n += layer.size() * sizeof(float);
+    return n;
+}
+
+bool Q4nxNpuForward::snapshot_state(int tokens, StateSnapshot& out) const {
+    if (!ready_ || tokens <= 0) return false;
+    const size_t per = size_t(c_.NKV) * size_t(c_.HD);
+    size_t held = 0;  // positions the KV caches hold (a layer that shares its KV holds none)
+    for (const auto& layer : kcache_) held = std::max(held, layer.size() / per);
+    if (size_t(tokens) > held) return false;
+    out.tokens = tokens;
+    out.per_pos = per;
+    const size_t want = size_t(tokens) * per;
+    auto copy = [&](const std::vector<std::vector<float>>& src, std::vector<std::vector<float>>& dst) {
+        dst.resize(src.size());
+        for (size_t l = 0; l < src.size(); l++) {
+            const size_t n = std::min(want, src[l].size());
+            dst[l].assign(src[l].begin(), src[l].begin() + long(n));
+        }
+    };
+    copy(kcache_, out.k);
+    copy(vcache_, out.v);
+    copy(conv_state_, out.conv);
+    copy(rec_state_, out.rec);
+    return true;
+}
+
+bool Q4nxNpuForward::restore_state(const StateSnapshot& in, int tokens) {
+    if (!ready_ || tokens <= 0 || tokens > in.tokens) return false;
+    const size_t per = size_t(c_.NKV) * size_t(c_.HD);
+    if (in.per_pos != per) return false;
+    const size_t want = size_t(tokens) * per;
+    auto put = [&](const std::vector<std::vector<float>>& src, std::vector<std::vector<float>>& dst) {
+        if (dst.size() < src.size()) return false;
+        for (size_t l = 0; l < src.size(); l++) {
+            // A layer that holds KV must cover the positions being restored, or attention() would
+            // read past the end of a shorter array.
+            if (!src[l].empty() && src[l].size() < want) return false;
+            if (src[l].empty()) {
+                // A layer whose KV is shared (Gemma style) carries none of its own: leave it empty
+                // rather than filling it with the owner's, which attention() reads by kv_layer.
+                dst[l].clear();
+                continue;
+            }
+            dst[l].assign(src[l].begin(), src[l].begin() + long(std::min(want, src[l].size())));
+        }
+        return true;
+    };
+    if (!put(in.k, kcache_) || !put(in.v, vcache_)) return false;
+    if (!put(in.conv, conv_state_) || !put(in.rec, rec_state_)) return false;
+    return true;
+}
+
 void Q4nxNpuForward::reset() {
     LhScope _tlh_rst(LH_RQ_RESET);
     for (auto& v : kcache_) v.clear();

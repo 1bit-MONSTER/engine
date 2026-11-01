@@ -102,7 +102,9 @@ fs::path write_dir(const Crafted& m, const std::string& tag) {
                 offs.push_back(o);
             }
             const std::string name = "model.layers.0." + std::string(proj);
-            add(name, {m.experts * (m.rows / 32), m.cols / 256, 5120}, "I8", stack_bytes);
+            // the tile-row count a stack declares: experts x rows/32, cast before the multiply
+            const int64_t tile_rows = int64_t(m.experts) * int64_t(m.rows / 32);
+            add(name, {tile_rows, m.cols / 256, 5120}, "I8", stack_bytes);
             tensors[name] = {{"experts", m.break_experts ? m.experts + 1 : m.experts},
                              {"rows", m.rows},
                              {"cols", m.cols},

@@ -342,7 +342,8 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/private_route.cpp npu/q4nx.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp
+                            npu/pack.cpp npu/pack_import.cpp npu/private_route.cpp npu/q4nx.cpp
                             npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
@@ -522,6 +523,15 @@ endif()
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
+add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)
+target_link_libraries(npu_pack_import_test PRIVATE onebit_npu)
+add_test(NAME npu_pack_import COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden)
+# The OGA pack importer against a real pack (1bit npu-pack), when one is on the box
+set(ONEBIT_OGA_PACK "" CACHE PATH "A Ryzen AI OGA NPU model pack directory")
+if(ONEBIT_OGA_PACK)
+    add_test(NAME npu_pack_import_oga
+             COMMAND npu_pack_import_test ${CMAKE_SOURCE_DIR}/tests/golden ${ONEBIT_OGA_PACK})
+endif()
 add_executable(npu_pack_test tests/npu_pack_test.cpp)
 add_executable(flm_head_import tools/flm_head_import.cpp)
 target_link_libraries(flm_head_import PRIVATE onebit_npu)
@@ -573,6 +583,10 @@ endif()
 add_executable(npu_private_route_test tests/npu_private_route_test.cpp)
 target_link_libraries(npu_private_route_test PRIVATE onebit_npu)
 add_test(NAME npu_private_route COMMAND npu_private_route_test)
+# `1bit npu-pack` is host-only: it reads a vendor pack's weights and writes our container,
+# so it belongs to a build without the device lane too (docs/npu.md, "OGA packs").
+target_link_libraries(onebit PRIVATE onebit_npu)
+target_compile_definitions(onebit PRIVATE ONEBIT_NPU_HOST)
 endif()  # ONEBIT_NPU_HOST
 
 # The lane itself: needs the NPU runtime and an XDNA NPU to run.

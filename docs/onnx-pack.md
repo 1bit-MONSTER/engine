@@ -196,11 +196,19 @@ intermediate float tensor then never exists.
 - **Not done: a zero point along K.** Like a scale along K it would weight the products inside the sum
   — it needs `Σ_k zp_x[k]·w_q[k][n]`, a column-weighted vector of the weight that no kernel here
   precomputes — so a graph with one keeps the per-node path.
-- **Not done: the device leg of the fused path.** The fused node's int8 GEMM runs on the host today.
-  Feeding int8 activations straight into the device kernel's input BO needs a runtime entry that
-  writes `Am` from int8 and packs int8 weights without the `amax/127` quantisation step (`packB` is
-  float-in), and it cannot be validated without a window on the array. Until then the fused path is a
-  correctness-and-memory win, not a speed one on a real model — the shapes matter, not the pattern.
+- **Works: the fused group runs on the NPU, and its int8 output is bit-identical there too.** With
+  `-DONEBIT_EP_NPU=ON` and `ONEBIT_EP_NPU_ELFS` naming the designs, `gemm_q8` writes the graph's int8
+  activations and int8 weights straight into the kernel's BOs (no `packB`, no `amax/127` — those bytes
+  already carry the graph's scales) and reads the int32 accumulators back into the **same epilogue** the
+  host path runs, so the two can only differ if the accumulator does. Measured on `strixhalo` under
+  `npu-hold` with `ONEBIT_EP_NPU_ELFS=128x2048x1024=…/full_i8_O_K2048_N1024.elf,128x3072x1024=…/full_i8_D_K3072_N1024.elf`:
+  `worst |d| = 0` LSB against the CPU EP over 5120 int8 values for **o_proj** (5×2048×1024) and
+  **down_proj** (5×3072×1024), with no `npu_qdq_fallback` line for either shape in the trace — the device
+  ran both. Two limits belong with that number. It needs **an ELF per (K, N)**, and on this box only those
+  two Qwen3-0.6B projections have one (q_proj's 1024×2048 and k/v's 1024×1024 do not), so the device share
+  of a real graph is 56 of 197 MatMuls and everything else keeps the host kernel. And it is a
+  **correctness** result so far, not a speed one: the ELFs are M=128 designs, so a decode step hands the
+  kernel one real row and 127 zeroed ones — measure before quoting tokens/s.
 - **Different kernels, not a configuration**: A16W8 needs int16 activations, MX/BFP16 need block
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
   natural split afterwards is our Q4NX pack for weight-only and the Quark QDQ path for A8W8.
@@ -239,8 +247,9 @@ Three things that table says, none of them flattering and all of them worth know
 1. **The fused path is 1.46x the CPU EP on the per-channel export and 0.67x on the per-tensor one.**
    Per-channel `DequantizeLinear` is expensive on the CPU EP (it broadcasts a vector), so removing the
    whole DQ -> float MatMul -> Q sequence pays off there; per-tensor DQ is cheap and MLAS's float
-   MatMul is faster than this host int8 kernel. This is a host-kernel measurement: the device leg is
-   where the 1.5x-per-projection argument in this document actually lands.
+   MatMul is faster than this host int8 kernel. This is a host-kernel measurement: the device leg runs the
+   same epilogue on the array, but only for the two shapes that have an ELF and only as a correctness
+   result so far, so it is not where the 1.5x-per-projection argument lands either.
 2. **The quantisation, not the EP, is what costs accuracy.** KL 2.2-2.8 nats is my calibration's
    fault (32 documents, MinMax, no AdaRound/QuaRot/SmoothQuant), and the per-tensor export (6.5 nats)
    is worse still: one int8 scale per weight matrix is not enough for this model. AMD's own recipe is
@@ -260,4 +269,5 @@ The EP's debug knob for exactly this work is `ONEBIT_EP_QDQ_DEBUG=1`: it logs, p
 
 The proof is deliberately opset-21 and domain-only. It pins down the claim (our EP takes the whole
 group as one node and the arithmetic is exact) for the per-tensor, per-axis and asymmetric forms
-Quark emits by default, and leaves the one documented gap above — the device leg — for its own proof.
+Quark emits by default, on the two device-relevant shapes as well, and leaves the device leg to its own
+configuration (`ONEBIT_EP_NPU_ELFS`, one ELF per shape) and its own evidence.

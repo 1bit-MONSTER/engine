@@ -16,8 +16,9 @@ limitations under the License.
 -->
 # Releases
 
-The first release goes out when every item on the release checklist is done; it is not published
-yet — see [v2026.44](#v202644-1-nov-2026--the-first-release) for the candidate that is ready.
+The first release, **v2026.44**, is a **draft**: it is not published, and nothing is tagged — see
+[v2026.44](#v202644-1-nov-2026--the-first-release-a-draft) for why, and for the candidate that replaces the one it was
+built from.
 
 1bit engine is pinned upstream: every backend it builds is a submodule at a fixed commit
 (`third_party/`), and the `bump-*` workflows open a PR whenever an upstream moves. The engine
@@ -27,49 +28,82 @@ everything from scratch at the current pins, so each release carries that week's
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
 
-## v2026.44 (1 Nov 2026) — the first release
+## v2026.44 (1 Nov 2026) — the first release, a draft
 
-Ships candidate **c18** (`rc-2026-10-31c`), published byte for byte: the three files on the release page are that
-gated candidate under their release names, nothing was rebuilt. Raw image (what the `.img.zst` decompresses to):
-**2,395,996,160 B**, sha256 `cd1ef96b9093d040ce7d8ace45e51845241ae06284a5582e9882b303e55bc509` — this is the value
-a stick write is verified against.
+**Not published.** Candidate **c19** (`rc-2026-11-01a`, engine `bcb28cc8f573`) passed every software gate below and
+was written to a 64 GB stick — and that is where it stopped: it was **never booted on hardware and never installed on
+hardware**, so the owner pulled v2026.44 back to a draft. Nothing here is a hardware result for c19.
+
+c19 is replaced by **candidate 20** (`rc-2026-11-01b`): built from `main` by `scripts/weekly.sh` once the issue board is
+clear, and gated with the whole checklist — the same software gates as below **plus the two that decide a release**: a
+live boot from the USB stick with Secure Boot on, and a full install to an internal disk, each with
+`1bit-release-check` **18 checks / 0 failures**. c20 is what becomes v2026.44 when the owner publishes.
+
+c19's raw image (what the `.img.zst` decompresses to): **2,395,996,160 B**, sha256
+`3c3c08c28072c534071bf87de141cf85f1f9e2b3d306c236153dcf80b3a4b588` — the value a stick write and its readback are
+verified against.
+
+**HIP kernels only:** this image has no DwarfStar backend (`ONEBIT_DS4=OFF`, see [dwarfstar.md](dwarfstar.md)) — the
+`ds4` route is antirez's CUDA kernels through a HIP shim plus hipBLAS, not our kernels. DeepSeek V4.x, GLM 5.x and
+Qwen3.8-Flash-Next run on **HRX** here, and the catalogue carries no `ds4` recipe.
 
 | component | pin |
 |---|---|
-| engine | `e7446eef35e4452ee26baff57407d1c289870cb2` |
+| engine | `bcb28cc8f57387865ecdbe744a7e3cdcf65eb7ad` |
 | HRX (llama.cpp fork, ggml-hrx) | `4a58da9b087d` |
 | hrx-system | `82804197bcbe` |
-| Lemonade Server | `2026.46.0~5.ef0f3b49` (our fork, the `onebit` recipe) |
+| Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
 | kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
 
-Artifacts — sizes and sha256 exactly as the release's own `SHA256SUMS` records them:
+Artifacts of the gated c19 candidate — sizes and sha256 exactly as its own `SHA256SUMS` records them:
 
 | file | size | sha256 |
 |---|---|---|
-| `1bit-os-v2026.44.img.zst` | 396,817,243 B | `516e061526d1f0974ab6715a20600e4674ba785c56afa44a688902855b4879c0` |
-| `1bit-os-v2026.44.efi` | 105,682,560 B | `c14bf687dac50055cede9c0cce1e43f331e8485142e6488ad9cb62aa85280815` |
-| `lemonade-onebit-v2026.44-linux-x86_64.tar.zst` | 38,926,645 B | `910f78ceab08451fd47ec83bcab28f4b764df1112b35f68fe51513292fb353e3` |
+| `1bit-os-v2026.44.img.zst` | 395,224,089 B | `c3a132e2a4d13fbdfac5350fedd63b59232e334a25d656e960fbba3ea64572dc` |
+| `1bit-os-v2026.44.efi` | 105,110,144 B | `57023fb8143184db9840b7bdfd25f5134f846e516dd86ffbf6260f0697b66b7a` |
+| `lemonade-onebit-v2026.44-linux-x86_64.tar.zst` | 25,061,222 B | `c6f55c73fd34406f92dcbbf2347b545686bd99dfdc52204953296fabb1c87e31` |
 
-What was measured before it shipped (Strix Halo, 31 October):
+What ran on **c19** (Strix Halo and QEMU, 1 November) — every gate except the two hardware rows:
 
 | check | result |
 |---|---|
-| build, `ctest`, package | PASS, **51/51** tests |
-| hardware gate at the shipped pins | **1959/1959** kernel ops, known answers 7 models × 9 cases, KLD 5/5 (mean ≤1e-6), needles 4/4, placement all-on-HRX |
-| NPU unit | **89.29 and 86.58 tok/s** (two independent rows, same M=16 decode twin) |
-| `1bit.check` (kernel/initrd and as-the-stick), VMTEST, VMTEST-RELEASE | PASS, PASS, **PASS (9 PASS, 9 SKIP, 0 FAIL)** |
-| QEMU boot phases A/R/I/B | exit 0 in all four; R and B `RESULT: PASS (18 checks, no failures)` |
-| live USB boot on the board, Secure Boot on, `1bit-release-check` | **18 checks, 0 failures**: HRX chat 299.5 tok/s, CPU chat 178.6 tok/s, TTFT 21.8 ms |
-| full install to the internal NVMe, then boot from it | **18/0 again**: HRX chat 301.8 tok/s, decode bench 178.3 tok/s |
-| `sha256sum -c SHA256SUMS`, `sbverify` on the `.efi` | 3/3 OK, signature OK |
+| build, `ctest`, package | PASS, **54/54** tests |
+| hardware gate at the candidate's pins, on the box's GPU | **1959/1959** kernel ops (76 s, 0 ring timeouts), fa-decode 6/6, KLD 5 models (6 PASS rows), needles 5 PASS rows, placement all-on-HRX |
+| NPU unit, on the box | **82.03 tok/s** (`oracle`, `greedy64`, `prefill`, `reproducible` all PASS) |
+| QEMU `vmtest` (live boot → install → boot the installed disk) | **PASS**, including `MODE: INSTALLED on nvme0n1` and the engine's llama-server running from that disk |
+| QEMU `vmtest-release` (`/bin/1bit-release-check` over SSH) | **PASS** (10 PASS, 9 SKIP, 0 FAIL — the SKIPs are the rows that need hardware a VM does not have) |
+| `sha256sum -c SHA256SUMS`, `sbverify`, module/kernel identity | 3/3 OK, signature OK, one module tree for the shipped kernel |
+| stick write | device readback `3c3c08c2…` **= the image**, `prepare-stick` 11/11 and `--check` exit 0, `/data` grown to the whole device |
+| no DwarfStar | **0** `ds4/` files and **0** `hipblaslt` references; the image's catalogue has no `ds4` recipe |
 
-Known issues in this image, all fixed in the next candidate (the os/v2 work): the kernel log scrolls over the boot
-screen and the chooser banner prints a stale Lemonade version (#703, #704); two menus at boot, no visible
-network/DHCP progress, a small menu font and a short highlight bar (#705, #707); the live stick's `/data` is 2 GB, so
-no catalogue model can be pulled on the live system (#706); `1bit-install` registers no firmware boot entry and shows
-little progress (#709, #710); booted from the stick with an installed disk present, the stick's kernel can take the
-disk's data partition (#711); the installed appliance is still the live image on disk (#712).
+**What did not run on c19: the hardware boot and the hardware install.** The only hardware evidence in this document is
+candidate **c18**'s — a different, earlier candidate (`rc-2026-10-31c`): live USB boot with Secure Boot on,
+`1bit-release-check` **18 checks / 0 failures** (HRX chat 299.5 tok/s, CPU chat 178.6 tok/s, TTFT 21.8 ms), then a full
+install to the internal NVMe and a boot from it, **18/0 again** (HRX 301.8 tok/s, decode bench 178.3 tok/s). Those
+numbers are c18's and must not be read as a hardware result for c19 or c20.
+
+What c20 has to show before v2026.44 is published (the runbook is `C20-HARDWARE-TEST.md` in the release lane): the same
+software gates above, then a **live USB boot on the board** with Secure Boot on — `1bit-release-check` 18 checks, 0
+failures, with the nine hardware rows **PASS rather than SKIP** — and a **full install** with `1bit-install` (sha256
+readbacks at step 6, the expected `#709` partial SKIP at step 9), a boot from the installed disk with the stick out
+(`INSTALLED on nvme0n1`), and the same 18/0 check again.
+
+What the os/v2 pass fixed in this image, against the c18 live-USB dry run: the boot screen is quiet while the serial
+transcript keeps the kernel log (#703); the banner and `/etc/1bit/release-identity` carry the version from the shipped
+package, not a constant (#704); one boot flow with a visible timer and live network/Lemonade progress (#705); a 16x32
+console font and a full-width selection bar (#707); the sound modules are out and `mkimage` refuses unsigned modules
+(#708); `prepare-stick` grows `/data` to the stick (#706); the installer shows every step with progress, sha256
+readbacks and a `/data/install.log` (#710); the boot chain names its own data partition, so the banner says
+`LIVE from USB /dev/sda` or `INSTALLED on nvme0n1` (#711).
+
+Known issues in this image:
+
+- **#709 is partial**: the shipped kernel has no `efivarfs` module, so the installer cannot register a firmware boot
+  entry. It ships `efibootmgr`, does everything else, and says on screen that the disk boots as
+  `\EFI\BOOT\BOOTX64.EFI` — pick the disk in the firmware menu once, or let the firmware fall back to it. The
+  complete fix lands with 1bit OS v3 (#712).
+- the installed appliance is still the live image on disk; the next release makes it a headless Ubuntu server (#712).
 
 ## v2026.43 (candidate, 23 Oct)
 

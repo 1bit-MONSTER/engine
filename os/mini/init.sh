@@ -119,6 +119,11 @@ if ! grep -q " /data " /proc/mounts; then
     fi
 fi
 stage "stick mounted at ${data:-nothing}"
+# #706: what /data can actually hold, in the log that outlives the boot. The partition is grown at prepare time
+# (prepare-stick.sh), so this is the first place the result is visible from inside the appliance.
+if grep -q " /data " /proc/mounts; then
+    stage "/data: $(df -h /data 2>/dev/null | awk 'NR==2 {print $2" total, "$4" free"}') on ${data:-?}"
+fi
 
 # Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
 # screen you have to guess about. Defined above the first wait (#705).

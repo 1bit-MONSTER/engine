@@ -227,6 +227,7 @@ private:
     void prof_add(ProfAcc* acc, int design, double pack, double quant, double wait,
                   double rb);
     void prof_dump();
+    bool load_hadamard(const std::string& path);
     // True when this layer's projection `wkey` is already packed in its own BO,
     // so the caller can skip both the Q4NX dequant (load_layer) and the f32->B
     // assembly for the rest of the run.
@@ -283,6 +284,17 @@ private:
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
     // it the per-role `_pb16i.elf` files are used as before.
     std::string pb16i_sealed_;
+    //  [[hadamard]]
+    // The PTQ1 fold: a folded container's weights are W_true rotated by a block-`had_block_`
+    // normalized Hadamard with a per-input-width sign vector, so an activation entering one of
+    // those GEMMs is rotated first, A' = H (A . s).  Config key `q4nx_hadamard` names the binary
+    // sign table (magic "HAD1", u32 count, count x (u32 width, u32 offset), f32 signs).
+    bool hadamard_ = false;
+    int had_block_ = 1024;
+    std::vector<float> had_buf_;
+    double had_ms_ = 0.0;      // host cost of the rotation, accumulated for the profile line
+    long had_n_ = 0;
+    std::unordered_map<int, std::vector<float>> had_signs_;   // input width -> signs
     // Full-attention QKV as pb16i: the one 14336-wide fused launch has no kernel
     // (its int64 q needs 448 columns per core), so it runs as the two q halves plus
     // k and v -- the four launches the arena measured at 1.49 ms per layer.

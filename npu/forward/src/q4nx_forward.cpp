@@ -99,6 +99,26 @@ static std::vector<std::string> m16dirs_like_head(const std::string& mdir,
     return {mdir + "/kernels-m16", dir + "/m16", dir};
 }
 
+// A <- H (A . s): the inverse of the fold a folded (PTQ1/Prism) container baked into its weights.
+// H is the normalized Sylvester-Walsh Hadamard over `block` (the butterfly is unnormalised, so
+// one multiply by 1/sqrt(block) follows).  Exact in f32 while |A| * block < 2^24; one pass of
+// adds and one multiply per element, which is what makes this affordable on the host.
+static void hadamard_rotate(const float* signs, float* a, int n, int block) {
+    for (int i = 0; i < n; i++) a[i] *= signs[i];
+    const float sc = 1.0f / std::sqrt((float)block);
+    for (int b = 0; b + block <= n; b += block) {
+        float* p = a + b;
+        for (int h = 1; h < block; h <<= 1)
+            for (int i = 0; i < block; i += (h << 1))
+                for (int j = i; j < i + h; j++) {
+                    const float x = p[j], y = p[j + h];
+                    p[j] = x + y;
+                    p[j + h] = x - y;
+                }
+        for (int i = 0; i < block; i++) p[i] *= sc;
+    }
+}
+
 static bool file_exists(const std::string& p, long min_size = 1) {
     FILE* f = fopen(p.c_str(), "rb");
     if (!f) return false;
@@ -311,6 +331,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             const char* e = getenv("Q4NX_PB16I_DIR");
             pb16i_dir_ = e ? e : read_config_string(cfg_path, "\"q4nx_pb16i_dir\"", "");
             pb16i_sealed_ = read_config_string(cfg_path, "\"q4nx_pb16i_sealed_elf\"", "");
+            // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
+            // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
+            // read in the stored (rotated) basis against un-rotated activations.
+            const std::string hf = read_config_string(cfg_path, "\"q4nx_hadamard\"", "");
+            had_block_ = q4nx_config_int(cfg_path.c_str(), "q4nx_hadamard_block", 1024);
+            if (!hf.empty()) {
+                const std::string hp = hf[0] == '/' ? hf : mdir + "/" + hf;
+                if (!load_hadamard(hp)) return false;
+            }
             if (pb16i_dir_.empty()) {
                 err_ = "q4nx_weight_layout is pb16i but no sidecar directory is set "
                        "(config q4nx_pb16i_dir, or Q4NX_PB16I_DIR)";
@@ -2124,6 +2153,9 @@ void Q4nxNpuForward::prof_dump() {
     fprintf(stderr, "[prof] dispatch decode=%ld prefill=%ld tokens=%ld (decode/token=%.1f)"
                     " m16=%d\n", prof_dec_n_, prof_pre_n_, prof_tok_n_,
             prof_tok_n_ ? (double)prof_dec_n_ / (double)prof_tok_n_ : 0.0, (int)m16_);
+    if (had_n_)
+        fprintf(stderr, "[prof] hadamard host: %.1f ms over %ld row-launch(es) = %.1f ms/token\n",
+                had_ms_, had_n_, prof_tok_n_ ? had_ms_ / (double)prof_tok_n_ : 0.0);
     if (m16_check_)
         fprintf(stderr, "[m16check] ---- checks=%ld mismatched=%ld worst_int32_maxdiff=%d"
                         " ----\n", m16_checked_, m16_bad_, m16_worst_);
@@ -2142,6 +2174,37 @@ void Q4nxNpuForward::prof_dump() {
 // --------------------------------------------------------------------------
 std::string Q4nxNpuForward::pb16i_stem(int layer, const char* tag) const {
     return pb16i_dir_ + "/" + q4nx_pb16i::sidecar_stem(layer, tag);
+}
+
+// The folded container's sign table: magic "HAD1", u32 count, count x (u32 width, u32 offset),
+// then the f32 signs those offsets index (the GGUF's prism.hadamard.sign_widths/sign_values).
+bool Q4nxNpuForward::load_hadamard(const std::string& path) {
+    std::ifstream f(path, std::ios::binary);
+    if (!f) { err_ = "q4nx_hadamard: cannot open " + path; return false; }
+    char magic[4] = {0};
+    uint32_t n = 0;
+    f.read(magic, 4);
+    f.read(reinterpret_cast<char*>(&n), 4);
+    if (!f || std::memcmp(magic, "HAD1", 4) != 0 || n == 0 || n > 16) {
+        err_ = "q4nx_hadamard: " + path + " is not a HAD1 sign table";
+        return false;
+    }
+    std::vector<uint32_t> width(n), off(n);
+    for (uint32_t i = 0; i < n; i++) {
+        f.read(reinterpret_cast<char*>(&width[i]), 4);
+        f.read(reinterpret_cast<char*>(&off[i]), 4);
+    }
+    std::vector<float> all;
+    float v = 0.0f;
+    while (f.read(reinterpret_cast<char*>(&v), 4)) all.push_back(v);
+    for (uint32_t i = 0; i < n; i++) {
+        if ((size_t)off[i] + width[i] > all.size()) { err_ = "q4nx_hadamard: short sign table"; return false; }
+        had_signs_[int(width[i])].assign(all.begin() + off[i], all.begin() + off[i] + width[i]);
+    }
+    hadamard_ = true;
+    fprintf(stderr, "  [forward] hadamard: %zu width(s) from %s, block %d (activations rotated "
+                    "into the folded basis)\n", had_signs_.size(), path.c_str(), had_block_);
+    return true;
 }
 
 void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
@@ -2208,22 +2271,66 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                    "role's ELF is the int32 one";
             return;
         }
+        // Folded basis: A' = H (A . s) with the sign vector of this input width, then the int8
+        // scale is taken from the rotated vector (that is the vector the kernel actually sees).
+        const float* Ab = A;
+        float asb = as;
+        if (hadamard_) {
+            auto hs = had_signs_.find(K);
+            if (hs == had_signs_.end()) {
+                err_ = "pb16i: no Hadamard sign vector for K=" + std::to_string(K);
+                return;
+            }
+            const auto h0 = std::chrono::steady_clock::now();
+            had_buf_.assign(A, A + K);
+            hadamard_rotate(hs->second.data(), had_buf_.data(), K, had_block_);
+            float am = 0.0f;
+            for (int i = 0; i < K; i++) {
+                const float a = std::fabs(had_buf_[(size_t)i]);
+                if (a > am) am = a;
+            }
+            asb = am > 0.0f ? am / 127.0f : 1.0f;
+            Ab = had_buf_.data();
+            had_ms_ += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - h0).count();
+            had_n_++;
+        }
+        if (const char* dump = getenv("NPU_PB16I_DUMP")) {
+            static bool done = false;
+            if (!done && cur_layer_ == atoi(dump) && sc && std::string(sc) == "attn_qkv") {
+                done = true;
+                FILE* f = fopen("/tmp/a0.bin", "wb");
+                if (f) {
+                    fwrite(&K, sizeof(int), 1, f);
+                    fwrite(A, sizeof(float), (size_t)K, f);
+                    fwrite(Ab, sizeof(float), (size_t)K, f);
+                    fwrite(kctx.Am, sizeof(int8_t), (size_t)K, f);
+                    fwrite(&asb, sizeof(float), 1, f);
+                    fclose(f);
+                }
+                fprintf(stderr, "[pb16i-dump] wrote /tmp/a0.bin for %s K=%d\n", sc, K);
+            }
+        }
         const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        xrt::run r = kctx.launch_async_with_bo(*slot->bo, A, 1, K, as);
+        xrt::run r = kctx.launch_async_with_bo(*slot->bo, Ab, 1, K, asb);
         const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         kctx.wait_kernel(r);
         const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         kctx.readback();
         const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         out.resize((size_t)N);
-        kctx.dequant_pb16i(out.data(), 1, N, &as, slot->eref, kctx.pb16i_planes);
+        kctx.dequant_pb16i(out.data(), 1, N, &asb, slot->eref, kctx.pb16i_planes);
         // NPU_PB16I_TRACE=<layer>: one line for the named layer's launch in the MODEL LOOP, with
         // the exact inputs and outputs, so the same A can be replayed through the frozen
         // harness.  If the harness reproduces C, the kernel and the images are fine and the bug
         // is what happens to C afterwards; if it does not, the activation quantisation is wrong.
         if (const char* tl = getenv("NPU_PB16I_TRACE")) {
             if (cur_layer_ == atoi(tl) && sc) {
-                fprintf(stderr, "[pb16i-trace] %s as=%.9g planes=%d A[0..7]=", sc, (double)as,
+                fprintf(stderr, "[pb16i-trace] %s raw[0..3]=", sc);
+                for (int i = 0; i < 4; i++) fprintf(stderr, "%.9g ", (double)A[(size_t)i]);
+                fprintf(stderr, " rot[0..3]=");
+                for (int i = 0; i < 4; i++) fprintf(stderr, "%.9g ", (double)Ab[(size_t)i]);
+                fprintf(stderr, " as=%.9g planes=%d A[0..7]=", (double)asb,
                         kctx.pb16i_planes);
                 for (int i = 0; i < 8; i++) fprintf(stderr, "%d ", (int)kctx.Am[i]);
                 fprintf(stderr, " Cm[0..7]=");
@@ -2369,8 +2476,34 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
                    "role's ELF is the int32 one";
             return;
         }
+        // Folded basis, batched form: rotate every row of A into the container's basis and take
+        // each row's int8 scale from the rotated vector, exactly as npu_gemm() does per launch.
+        const float* Ab = A;
+        if (hadamard_) {
+            auto hs = had_signs_.find(K);
+            if (hs == had_signs_.end()) {
+                err_ = "pb16i: no Hadamard sign vector for K=" + std::to_string(K);
+                return;
+            }
+            const auto h0 = std::chrono::steady_clock::now();
+            had_buf_.assign(A, A + (size_t)M * (size_t)K);
+            for (int m = 0; m < M; m++) {
+                float* row = had_buf_.data() + (size_t)m * (size_t)K;
+                hadamard_rotate(hs->second.data(), row, K, had_block_);
+                float am = 0.0f;
+                for (int k = 0; k < K; k++) {
+                    const float a = std::fabs(row[(size_t)k]);
+                    if (a > am) am = a;
+                }
+                ascales[(size_t)m] = am > 0.0f ? am / 127.0f : 1.0f;
+            }
+            Ab = had_buf_.data();
+            had_ms_ += std::chrono::duration<double, std::milli>(
+                std::chrono::steady_clock::now() - h0).count();
+            had_n_ += M;
+        }
         const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-        xrt::run r = kctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data());
+        xrt::run r = kctx.launch_async_with_bo_rows(*slot->bo, Ab, M, K, ascales.data());
         const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         kctx.wait_kernel(r);
         const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

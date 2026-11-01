@@ -79,6 +79,13 @@ struct ForwardEngine {
     std::mutex mu;
 };
 
+// One generated token's log-probability entry, with the text that token produced.  The two travel
+// together so a streamed chunk can carry exactly the entries whose bytes it carries.
+struct Emitted {
+    std::string text;
+    npu::TokenLogprob lp;
+};
+
 std::string chatml(const json& messages, bool thinking = true) {
     std::string p;
     for (const auto& m : messages) {
@@ -150,6 +157,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     std::unique_ptr<npu::Grammar> grammar;
     try {
         opts = npu::options_from_body(body);
+        // logprobs is served in the chat shape (choices[0].logprobs.content).  The legacy
+        // /v1/completions shape is a different object (tokens / token_logprobs arrays) that this
+        // route does not implement, and a silently dropped field is what it must not do.
+        if (!chat && opts.sample.logprobs)
+            throw std::runtime_error("logprobs: served on /v1/chat/completions, not on /v1/completions");
         if (opts.json_object || !opts.grammar.empty())
             grammar = std::make_unique<npu::Grammar>(opts.json_object ? npu::json_grammar() : opts.grammar);
     } catch (const std::exception& ex) {
@@ -174,7 +186,11 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram](const std::function<bool(const std::string&)>& on_text) {
+    // `on_text` also receives the log-probability entries of the tokens whose bytes that piece
+    // carries (empty unless the request asked for logprobs), so a streamed delta and a
+    // non-streamed reply report the same entries in the same order.
+    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram](
+                   const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
         // The tokenizer is const and keeps no per-call state, so it runs before the lock.
         std::vector<int> ids = e.tok->encode(prompt);
@@ -239,6 +255,26 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         };
 
         std::string pending;  // decoded, not yet sent: a stop sequence may still match in it
+        // Entries whose bytes are still held in `pending`, each with the bytes of its piece that have
+        // not been flushed yet.  An entry is released by the flush that emits its last byte, so a
+        // piece the stop-holdback split across two chunks still reports exactly once.
+        std::vector<std::pair<Emitted, size_t>> held;
+        const bool want_lp = opts.sample.logprobs;
+        auto take_held = [&held](size_t bytes) {
+            std::vector<Emitted> out;
+            size_t left = bytes;
+            while (!held.empty() && left > 0) {
+                if (held.front().second <= left) {
+                    left -= held.front().second;
+                    out.push_back(held.front().first);
+                    held.erase(held.begin());
+                } else {
+                    held.front().second -= left;  // a later flush finishes this piece
+                    left = 0;
+                }
+            }
+            return out;
+        };
         bool stopped_at_eos = false, stopped_at_stop = false;
         int produced = 0;
         for (int n = 0; n < limit; n++) {
@@ -251,11 +287,16 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             if (next < 0) { stopped_at_eos = true; break; }
             if (next == e.eos || (e.endoftext >= 0 && next == e.endoftext)) { stopped_at_eos = true; break; }
             if (gram) gram->feed(grammar_state, e.tok_text[next]);
-            pending += e.tok->decode(next);
+            const std::string piece = e.tok->decode(next);
+            pending += piece;
+            // The values are the raw distribution: `logits` is the vector the sampler read and it
+            // is not modified by the call above, so this is pre-top_k/top_p/temperature and the
+            // grammar's mask cannot narrow it.
+            if (want_lp) held.emplace_back(Emitted{piece, npu::logprobs_of(logits, next, opts.sample.top_logprobs)}, piece.size());
             ++produced;
             const size_t stop_at = npu::find_stop(pending, opts.stop);
             if (stop_at != std::string::npos) {
-                if (stop_at > 0) on_text(pending.substr(0, stop_at));
+                if (stop_at > 0) on_text(pending.substr(0, stop_at), take_held(stop_at));
                 stopped_at_stop = true;
                 break;
             }
@@ -268,7 +309,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             if (emit > 0) {
                 const std::string out = pending.substr(0, emit);
                 pending.erase(0, emit);
-                if (!on_text(out)) break;
+                if (!on_text(out, take_held(emit))) break;
             }
             // No further token will be sampled after this one (limit reached), so the
             // decode step that would only produce the NEXT position's logits is a whole
@@ -280,36 +321,56 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         }
         if (!stopped_at_stop) {
             const size_t cut = complete_utf8(pending);
-            if (cut > 0) on_text(pending.substr(0, cut));
+            if (cut > 0) on_text(pending.substr(0, cut), take_held(cut));
         }
         if (produced >= limit && !stopped_at_eos && !stopped_at_stop) finish = "length";
         return finish;
     };
 
-    auto wrap = [&](const std::string& content, const std::string& finish) {
+    // OpenAI's logprobs.content entry: the token's text, its log-probability, and the most likely
+    // alternatives with theirs.  Only the chat shape is served (see the /v1/completions refusal).
+    auto logprob_json = [&e](const Emitted& x) {
+        json j{{"token", x.text}, {"logprob", x.lp.logprob}, {"top_logprobs", json::array()}};
+        for (const auto& t : x.lp.top)
+            j["top_logprobs"].push_back({{"token", e.tok->decode(t.id)}, {"logprob", t.logprob}});
+        return j;
+    };
+    auto logprobs_json = [&logprob_json](const std::vector<Emitted>& entries) {
+        json content = json::array();
+        for (const auto& x : entries) content.push_back(logprob_json(x));
+        return json{{"content", content}};
+    };
+
+    auto wrap = [&](const std::string& content, const std::string& finish, const std::vector<Emitted>& lps) {
         json out;
         out["id"] = id;
         out["object"] = object;
         out["created"] = created;
         out["model"] = e.id;
         if (chat) {
-            out["choices"] = json::array({{{"index", 0},
-                                           {"message", {{"role", "assistant"}, {"content", content}}},
-                                           {"finish_reason", finish}}});
+            json choice{{"index", 0},
+                        {"message", {{"role", "assistant"}, {"content", content}}},
+                        {"finish_reason", finish}};
+            if (opts.sample.logprobs) choice["logprobs"] = logprobs_json(lps);
+            out["choices"] = json::array({choice});
         } else {
             out["choices"] = json::array({{{"index", 0}, {"text", content}, {"finish_reason", finish}}});
         }
-        return out.dump();
+        // A token piece can be half a character, and dump() throws on invalid UTF-8: replace
+        // rather than turn a reported logprob into a 500.
+        return out.dump(-1, ' ', false, json::error_handler_t::replace);
     };
 
     try {
         if (!stream) {
             std::string content;
-            const std::string finish = run([&](const std::string& t) {
+            std::vector<Emitted> lps;
+            const std::string finish = run([&](const std::string& t, const std::vector<Emitted>& lp) {
                 content += t;
+                lps.insert(lps.end(), lp.begin(), lp.end());
                 return true;
             });
-            res.set_content(wrap(content, finish), "application/json");
+            res.set_content(wrap(content, finish, lps), "application/json");
         } else {
             // Build the SSE frames while the handler still owns its locals.  The
             // content provider below runs AFTER this handler returns, so it must
@@ -322,7 +383,7 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             chunk_tpl["created"] = created;
             chunk_tpl["model"] = e.id;
             auto chunks = std::make_shared<std::vector<std::string>>();
-            run([&](const std::string& t) {
+            run([&](const std::string& t, const std::vector<Emitted>& lp) {
                 json chunk = chunk_tpl;
                 if (chat)
                     chunk["choices"] = json::array({{{"index", 0},
@@ -330,7 +391,9 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
                                                      {"finish_reason", nullptr}}});
                 else
                     chunk["choices"] = json::array({{{"index", 0}, {"text", t}, {"finish_reason", nullptr}}});
-                chunks->push_back("data: " + chunk.dump() + "\n\n");
+                if (opts.sample.logprobs && !lp.empty())
+                    chunk["choices"][0]["logprobs"] = logprobs_json(lp);
+                chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
                 return true;
             });
             auto cursor = std::make_shared<size_t>(0);

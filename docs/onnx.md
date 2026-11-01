@@ -123,6 +123,14 @@ than something the EP infers:
 | `ONEBIT_EP_NPU_M`, `_K`, `_N` | the design dims that ELF was built for; a MatMul of another shape falls back to the host |
 | `ONEBIT_EP_TRACE=1` | append one line per callback to `/tmp/onebit_ep_trace.<pid>.log` — the ownership evidence the tests read |
 
+The fused A8W8 QDQ path has its own entry beside `gemm_f32`: with `ONEBIT_EP_NPU_ELFS="MxKxN=path,…"`
+(one ELF per shape, because a QDQ group is claimed per (K, N)) `gemm_q8` hands the graph's int8 activations
+and int8 weights to the kernel unchanged — no `packB`, no `amax/127`, since those bytes already carry the
+graph's scales — and reads int32 accumulators back into the **same epilogue** the host path runs, so a device
+result differs from the host one only if the accumulator does. A shape with no ELF falls back with
+`npu_qdq_fallback … why=no QDQ kernel for KxN`, and a run is only a device run if that line is absent for
+the shape you care about: `qdq rows=` is written by the shared epilogue either way.
+
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the
 life of the process; when the lock is held it does not queue — it reports `device busy` and runs the

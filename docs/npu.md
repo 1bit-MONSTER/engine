@@ -313,6 +313,73 @@ $ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France i
 {"choices":[{"finish_reason":"length","index":0,"text":" Paris"},...]}
 ```
 
+### Decisions (`/v1/systemone`, issue #653)
+
+A **Decision 3.0 (d3) pack** does not generate text: you send a `state` and one or more questions and get
+a probability for every option. When the model directory carries the pack's decision head, `1bit
+forward-serve` serves that too, from the same process and the same weights:
+
+```
+<model dir>/model.q4nx            the Qwen3.5 GDN backbone, as any other model
+<model dir>/decision_config.json  the pack's codes, token ids, temperature, pooling
+<model dir>/decision.q4nx         the readout, [codes, hidden] F32 (tools/safetensors_to_q4nx.py decision)
+```
+
+| route | meaning |
+|---|---|
+| `POST /v1/systemone` (alias `POST /v1/decisions`) | `{"state": …, "questions": {id: question}}` → `{"model", "answers": {id: answer}, "usage"}` |
+| `GET /v1/systemone/models` | the decision model this build serves: name, description, `max_input_tokens`, `modalities` |
+
+`questions` is an **object**, and its ids come back as the keys of `answers` in request order. Question
+types are `choice` (1–255 options), `noul` and `score` (2–10 ordered levels); a decision runs one backbone
+prefill per question, pools the **last position's hidden state after the final norm** (`pooling: last`),
+multiplies it by the readout and takes a temperature softmax over that question's options. Nothing is
+sampled and nothing is generated, so `usage.output_tokens` is always `0` and `input_tokens` is the sum of
+the answered questions' prompt lengths.
+
+The prompt is the **pack's own contract**, not this route's ChatML: `npu/systemone.h` renders the
+`State:`/`Question:`/`Options:` turn byte for byte from the pack's `d3_format.py` (checked against
+fixtures it generated, `ctest systemone_contract`), and `app/npu_systemone.h` wraps it in the pack's chat
+template with `enable_thinking=False` — which opens the assistant turn with an **empty think block**.
+Those trailing bytes are part of what the model reads, so reusing `chatml()` here would be a different
+input. `state` is parsed as ordered JSON because upstream preserves the request's key order.
+
+Refusals follow the d3 server this route stands in for, so vLLM Semantic Router can point at it unchanged —
+which means **422 here, not the 400 the chat route uses**:
+
+| situation | answer |
+|---|---|
+| body is not a JSON object, an unknown field, `questions` missing/empty/not an object, an empty id | `422 {"detail": "<why>"}`, nothing runs |
+| any question is malformed (bad type, empty choice criteria, score levels out of range) | `422 {"detail": {"invalid_questions": {id: "<why>"}}}`, **nothing runs** |
+| a question is valid but its prompt is over the limit | inside `answers`: `{"type", "error": "max_length_exceeded", "message"}`, the other questions still answered, **nothing truncated** |
+| the readout could not turn the hidden state into an answer | inside `answers`: `error: "invalid_model_output"` |
+| `DECISION_API_KEY` is set and the bearer key is absent or wrong | `401`, `WWW-Authenticate: Bearer` (`/health` stays open and reports `"authentication": true`) |
+
+The limit is the smaller of the text path's 32,768 tokens per question and the backbone's own context.
+`GET /health` gains `model`, `max_input_tokens`, `modalities` and `authentication` when a head is loaded, and
+`/v1/models` keeps its OpenAI shape (the decision list is at `/v1/systemone/models`).
+
+Not served, and refused by name rather than ignored: `images`/`videos` (the vision tower and FFmpeg are a
+separate issue), so `box`/`track`/`assets` questions cannot be asked. Also not implemented: upstream's
+"state computed once per request" optimisation (a state read once and shared by every question — it is the
+prefix cache's job, #650) and the pack's `noncausal_full_attention` attention mode, so a d3 row measured
+here is not claimed to be upstream-equal in accuracy until it is measured against it.
+
+Send the body as JSON (`Content-Type: application/json`): httplib parses an
+`application/x-www-form-urlencoded` body as a form and caps it at 8 KB, which is a 413 before this route
+sees it — that applies to every route here, and a real d3 caller (a 32k-token state is ~100 KB) hits it
+only with a client that leaves the content type at curl's default.
+
+The shape of a reply (**numbers illustrative** — the choice depends on the pack's readout head):
+
+```
+$ curl -sS localhost:8000/v1/systemone -H 'Content-Type: application/json' \
+    -d '{"state": {"route": "refund", "amount": 42},
+         "questions": {"route": {"type": "choice", "criteria": {"fast": "handled today", "cheap": null}}}}'
+{"answers":{"route":{"choice":"fast","confidence":0.81,"probabilities":{"fast":0.98,"cheap":0.02},
+  "type":"choice"}},"model":"d3-lite","usage":{"input_tokens":96,"output_tokens":0}}
+```
+
 ### Two streams on one NPU
 
 One process owns the NPU by default: it takes an exclusive `flock` on

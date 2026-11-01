@@ -3100,6 +3100,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
     std::vector<float> fnorm(H);
     rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
+    last_hidden_ = fnorm;  // for last_hidden(): the same vector the head reads, last position only
     const bool ok = run_lm_head(fnorm, logits);
     if (getenv("NPU_INFER_DUMP_LAYERS")) {
         int best[5] = {-1, -1, -1, -1, -1};
@@ -4070,6 +4071,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
+    last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position
     if (ph) { g_ph.ffnorm = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
     if (getenv("NPU_INFER_DUMP_HIDDEN")) {
         char hp[256];

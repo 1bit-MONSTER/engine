@@ -389,6 +389,22 @@ if [ -z "$BIN" ]; then
     # configure once per add-on pin (a new pin can add kernel files the old configure never saw);
     # otherwise ninja re-runs cmake itself when a CMakeLists.txt changes
     [ "$(cat "$build/.gpu-kernels-pin" 2>/dev/null)" = "$addon_pin" ] || rm -f "$build/CMakeCache.txt"
+    # TheRock's SDK keeps the gfx device library (the amdgcn bitcode) in its pip tree, not under
+    # <root>/lib, since the 2026-10-31 rebuild; without it every HIP step dies with "cannot find ROCm
+    # device library" (this is what failed #772's gate). Read it from the toolchain, and hand it to
+    # the kernel-corpus compile too: ggml-hrx-hip.cmake runs its own amdclang++ that does not inherit
+    # CMAKE_C/CXX_FLAGS, and its find_program would otherwise take /opt/rocm-therock/bin before
+    # $ROCM_PATH. The same pair cmake/hrx.cmake passes (engine#713). A toolchain with no such
+    # directory keeps hipcc's default, exactly as before.
+    device_lib=""
+    for d in "$TOOLCHAIN" $TOOLCHAIN/lib/python3*/site-packages/_rocm_sdk_core; do
+      [ -d "$d/lib/llvm/amdgcn/bitcode" ] && { device_lib=$d/lib/llvm/amdgcn/bitcode; break; }
+    done
+    hip_flags="-O3"
+    [ -n "$device_lib" ] && hip_flags="-O3 --rocm-device-lib-path=$device_lib"
+    export HIP_DEVICE_LIB_PATH=${HIP_DEVICE_LIB_PATH:-$device_lib}
+    # a changed flag set must not be read from an existing cache
+    [ "$(cat "$build/.hip-flags" 2>/dev/null)" = "$hip_flags" ] || rm -f "$build/CMakeCache.txt"
     # the same configuration as cmake/hrx.cmake (llama_hrx), plus the two test tools
     : > "$OUT/build.log"
     built=1
@@ -400,8 +416,9 @@ if [ -z "$BIN" ]; then
           -DCMAKE_C_COMPILER_LAUNCHER=ccache -DCMAKE_CXX_COMPILER_LAUNCHER=ccache \
           -DHRX_SOURCE_DIR="$ROOT/third_party/hrx-system" "${addon_args[@]}" \
           -DGGML_HRX=ON -DGGML_VULKAN=OFF -DGGML_CUDA=OFF -DGGML_HIP=OFF -DGGML_NATIVE=ON -DGGML_CPU=ON \
+          -DGGML_HRX_HIP_COMPILER="$TOOLCHAIN/bin/amdclang++" "-DGGML_HRX_HIP_FLAGS=$hip_flags" \
           -DLLAMA_BUILD_SERVER=ON -DLLAMA_BUILD_TESTS=ON -DLLAMA_CURL=OFF >> "$OUT/build.log" 2>&1 &&
-          echo "$addon_pin" > "$build/.gpu-kernels-pin"; }; } &&
+          echo "$addon_pin" > "$build/.gpu-kernels-pin" && echo "$hip_flags" > "$build/.hip-flags"; }; } &&
       "$THERMAL" cmake --build "$build" -j "$JOBS" --target "${targets[@]}" >> "$OUT/build.log" 2>&1 && { built=0; break; }
       grep -q "error:" <(tail -n 40 "$OUT/build.log") && break   # a compile error, not heat
       note "build stopped (attempt $attempt, Tctl $(tctl) C); resuming"
@@ -456,6 +473,13 @@ if has ops; then
     result ops PASS $(( $(date +%s) - t0 )) "${passed} ($OPS; step ${held}s)"
   elif [ $rc = 76 ]; then
     result ops FAIL $(( $(date +%s) - t0 )) "could not run: the memory pre-check refused it (rc 76)"
+  elif [ -z "$fails" ] && grep -q "refusing to report a pass" "$log"; then
+    # The pin's zero-cases guard (tests/test-backend-ops.cpp, fork engine#657): a run that executed no case
+    # exits 1 and says "error: no test case ran (check -b/-o/-p and --test-file): refusing to report a
+    # pass". That is a *filter* problem, not a kernel result - and it must never read as a pass either.
+    # Report it as SKIP with the selection that produced it, so neither an empty run nor a broken filter
+    # can be mistaken for a measured one.
+    result ops SKIP $(( $(date +%s) - t0 )) "no case matched -b HRX0 -o \"$OPS\": the zero-cases guard refused to report a pass (fork engine#657) - fix the filter or the build"
   else
     unknown=$(printf '%s\n' "$fails" | grep -v -F "$FLAKY_CASES" | grep -c . || true)
     st=FAIL detail="${passed:-rc=$rc}: $(printf '%s' "$fails" | head -n 3 | tr '\n' ' ')"

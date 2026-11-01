@@ -1844,15 +1844,18 @@ int serve_child(const Options& given) {
                                      " GiB (" + v.box + ")";
             if (o.mem_check_only) {
                 std::printf("%s: %s: %s\n", id.c_str(), v.fits ? "fits" : "does not fit", line.c_str());
+                if (v.over_ceiling) std::printf("%s: %s\n", id.c_str(), v.ceiling_note.c_str());
                 for (const auto& w : v.warnings) std::printf("%s: warning: %s\n", id.c_str(), w.c_str());
                 return v.fits ? 0 : 3;
             }
             if (!v.fits) {
                 // exit 3, the same as --mem-check's "does not fit": Lemonade's loader logs the exit
                 // code and fails the load at once ("1bit serve failed to start"), with this line in
-                // its log
-                std::fprintf(stderr, "1bit serve: %s does not fit: %s; free memory, lower --ctx-size, or pass --no-mem-check\n",
-                             id.c_str(), line.c_str());
+                // its log. engine #680: a load past the GTT ceiling is refused here, before any
+                // backend exists, because that is the line where the device faulted.
+                std::fprintf(stderr, "1bit serve: %s does not fit: %s%s%s; free memory, lower --ctx-size, or pass --no-mem-check\n",
+                             id.c_str(), line.c_str(), v.over_ceiling ? "; " : "",
+                             v.over_ceiling ? v.ceiling_note.c_str() : "");
                 return 3;
             }
             std::fprintf(stderr, "1bit serve: memory: %s\n", line.c_str());

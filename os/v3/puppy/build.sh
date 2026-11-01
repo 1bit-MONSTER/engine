@@ -36,7 +36,9 @@
 set -euo pipefail
 [ $# -ge 3 ] || { sed -n '/^# build.sh/,/^# Inside the container/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 compat=$1 kernel=$2 out=$3
-woof=${4:-/tmp/woof-ce}
+# /tmp survives a session, not a reboot: the default clone lives under $HOME (measured 2026-11-01, the
+# first re-run after a restart stopped at "no woof-CE at /tmp/woof-ce")
+woof=${4:-$HOME/wt/woof-CE}
 # The build tree must live on a real filesystem that allows device nodes, for two measured reasons:
 #   * 3builddistro mounts an overlay for its petbuild chroots and overlay-on-overlay is refused ("mount:
 #     ... bad superblock on petbuild", the chroot has no bash, the build stops at busybox) - a container's
@@ -55,7 +57,7 @@ case ",$mnt_opts," in
     exit 1
     ;;
 esac
-[ -f "$woof/merge2out" ] || { echo "build: no woof-CE at $woof" >&2; exit 1; }
+[ -f "$woof/merge2out" ] || { echo "build: no woof-CE at $woof - clone https://github.com/puppylinux-woof-CE/woof-CE there, or pass the directory as the 4th argument" >&2; exit 1; }
 kernel=$(cd "$kernel" && pwd)
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
     echo "build: no huge-*.tar.* in $kernel (run mk-huge-kernel.sh first)" >&2; exit 1; }
@@ -73,7 +75,7 @@ export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config G
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends build-essential libc6-dev dc debootstrap librsvg2-bin \
     zstd xml2 syslinux-utils xorriso squashfs-tools wget curl git ca-certificates xz-utils file psmisc \
-    sudo mtools dosfstools
+    sudo mtools dosfstools cpio
 echo "dash dash/sh boolean false" | debconf-set-selections
 dpkg-reconfigure dash >/dev/null 2>&1 || true
 ln -sf bash /bin/ash
@@ -85,6 +87,11 @@ mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-outpu
 [ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
 install -m 755 local-repositories/vercmp /usr/local/bin/vercmp
 install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr/local/petget/categories.dat
+# initrd-progs packs its initrd with `find . | cpio -o -H newc > ../initrd 2>/dev/null`, so without cpio the
+# redirect still creates ../initrd, empty, and gzip obligingly compresses it to 27 bytes: the build stays
+# green all the way to a bootable-looking ISO whose initrd has 0 entries (paid for on attempt 7). The
+# package list above carries cpio; this refuses rather than producing that ISO again.
+command -v cpio >/dev/null || { echo "build: cpio missing, the initrd would come out empty" >&2; exit 1; }
 echo "== merge2out $COMPAT"
 # yes | cmd under pipefail: when merge2out exits, yes gets SIGPIPE and the pipeline fails, so the
 # status has to be taken from merge2out and not from yes
@@ -103,5 +110,9 @@ echo "== 3builddistro"; ./3builddistro release </dev/null
 echo "== output"
 ls -l woof-output-* 2>/dev/null | head -20
 cp -f woof-output-*/*.iso woof-output-*/*.sfs /out/ 2>/dev/null || true
+# the frugal/persistent install - the installed mode 1bit OS wants - is these SFS files on a partition,
+# with no installer writing a rootfs at all, so they belong in <out-dir> next to the ISO. 3builddistro
+# leaves them in sandbox3/build/ for the ISO, which is why they are not in woof-output-*.
+cp -f sandbox3/build/*.sfs /out/ 2>/dev/null || true
 echo "== in /out:"; ls -l /out
 '

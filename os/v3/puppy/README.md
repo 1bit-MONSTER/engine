@@ -42,7 +42,7 @@ less os/v3/puppy/kernel-puppy.fragment
 #    release kernel packages (linux-image-<kver>.deb + its headers), as docs/kernel.md describes.
 #    Verify the deltas actually landed before packaging. A fragment symbol that this version's Kconfig
 #    does not know is silently dropped by olddefconfig, so check every line of the fragment itself
-#    (20 symbols today) rather than a hand-written list that drifts:
+#    (24 symbols today) rather than a hand-written list that drifts:
 missing=0
 for sym in $(grep -oE '^CONFIG_[A-Z0-9_]+=y' os/v3/puppy/kernel-puppy.fragment | cut -d= -f1); do
     grep -qx "$sym=y" /boot/config-<kver> || { echo "MISSING $sym"; missing=$((missing+1)); }
@@ -73,7 +73,13 @@ os/v3/puppy/mk-huge-kernel.sh <stage> <out-dir>
 #    a usable device node in its target - /tmp on this box is tmpfs,nodev and fails both (measured, traps
 #    6 and 7 in the evaluation). BUILD_ROOT=<dir> overrides it, and a nodev/noexec root is refused
 #    before the downloads start.
-os/v3/puppy/build.sh resolute64 <out-dir> <puppy-out-dir>
+os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
+#    (woof-CE defaults to $HOME/wt/woof-CE - not /tmp, which a reboot empties; the 4th argument is the
+#    clone, and the build copies it into the build root itself)
+#    A new BUILD_ROOT downloads 2.6 GB again, and one mirror hiccup over a thousand files fails the
+#    build (measured: one package, all four mirrors, and the URL was fine minutes later). If the box has
+#    built before, seed the cache instead: sudo cp -a <old-build-root>/local-repositories <new-build-root>/
+#    <puppy-out-dir> gets the ISO and the four SFS - the SFS files are the frugal install.
 #    build.sh copies <out-dir>/huge-*.tar.* into woof-out_*/kernel-kit/output/ before 3builddistro,
 #    which is what makes the image carry OUR kernel. Empty that directory and woof-CE silently
 #    downloads a stock Ubuntu kernel instead - the trap the evaluation paid for.

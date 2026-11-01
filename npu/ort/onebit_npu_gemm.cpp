@@ -77,8 +77,13 @@ struct State {
     // Shapes whose QDQ kernel could not be built (a bad ELF, a design M that does not match it). Remembered
     // because building one means parsing an ELF and creating a hw_context -- ~50 ms -- and retrying that on
     // every call turns a fallback into a 20x slowdown: measured, 8 decode tokens went from 4 s to 87 s when
-    // every group paid a failed init_elf.
-    std::vector<std::pair<int64_t, int64_t>> q8_unavailable;
+    // every group paid a failed init_elf. The reason is kept with the shape, so a fallback names the ELF that
+    // was refused instead of only "no QDQ kernel for KxN".
+    struct Unavailable {
+        int64_t k, n;
+        std::string why;
+    };
+    std::vector<Unavailable> q8_unavailable;
 
     // The device lock is a raw descriptor, so it needs an owner that gives it back: ORT unloads the
     // provider library when the Env that loaded it is released, which destroys this static and re-creates
@@ -198,10 +203,22 @@ bool init(State& s) {
         kernel->n = n;
         kernel->elf = elf;
         kernel->ctx = std::make_unique<I8Ctx>();
-        if (!kernel->ctx->init_elf(*s.dev, elf.c_str(), m, k, n, 1))
-            return fail(s, "I8Ctx init_elf failed for " + elf + " (" + dims + ")");
+        if (!kernel->ctx->init_elf(*s.dev, elf.c_str(), m, k, n, 1)) {
+            // One unloadable design must cost that design, not the device. This used to fail the whole State,
+            // which meant a single bad entry in ONEBIT_EP_NPU_ELFS (an ELF from another kernel family, a
+            // design M that does not match) silently turned the device leg off for EVERY shape -- while the
+            // run still printed the host gate's |d| = 0. Measured: adding one m16 design that the runtime
+            // refuses made all six configured shapes fall back and blame that ELF.
+            s.q8_unavailable.push_back({k, n, "I8Ctx init_elf failed for " + elf + " (" + dims + ")"});
+            continue;
+        }
         s.kernels.push_back(std::move(kernel));
     }
+    // Every configured design was refused: say so once, with the first reason, instead of reporting
+    // "no QDQ kernel for KxN" on every call as if nothing had been configured.
+    if (s.kernels.empty() && !spec.empty())
+        return fail(s, "no configured design could be loaded: " +
+                           (s.q8_unavailable.empty() ? spec.front().second : s.q8_unavailable.front().why));
 
     s.ok = true;
     s.why.clear();
@@ -244,8 +261,8 @@ void poison_if_canaried(Ctx& ctx, int n) {
 Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
     for (auto& kern : s.q8_kernels)
         if (kern->k == (int)k && kern->n == (int)n) return kern.get();
-    for (const auto& [fk, fn] : s.q8_unavailable)
-        if (fk == k && fn == n) return nullptr;  // known bad: do not parse the ELF again
+    for (const auto& bad : s.q8_unavailable)
+        if (bad.k == k && bad.n == n) return nullptr;  // known bad: do not parse the ELF again
     for (const auto& [dims, elf] : s.specs) {
         int m = 0, kk = 0, nn = 0;
         if (sscanf(dims.c_str(), "%dx%dx%d", &m, &kk, &nn) != 3) continue;
@@ -257,8 +274,8 @@ Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
         kern->elf = elf;
         kern->ctx = std::make_unique<I8Ctx>();
         if (!kern->ctx->init_elf(*s.dev, elf.c_str(), m, kk, nn, 1)) {
-            s.why = "I8Ctx init_elf failed for " + elf + " (" + dims + ") -- check the design M";
-            s.q8_unavailable.emplace_back(k, n);
+            s.q8_unavailable.push_back(
+                {k, n, "I8Ctx init_elf failed for " + elf + " (" + dims + ") -- check the design M"});
             return nullptr;
         }
         s.q8_kernels.push_back(std::move(kern));
@@ -279,7 +296,12 @@ bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t*
     }
     Q8Kernel* kern = q8_kernel(s, k, n);
     if (!kern) {
-        if (err) *err = "no QDQ kernel for " + std::to_string(k) + "x" + std::to_string(n);
+        if (err) {
+            const std::string what = std::to_string(k) + "x" + std::to_string(n);
+            *err = "no QDQ kernel for " + what;
+            for (const auto& bad : s.q8_unavailable)
+                if (bad.k == k && bad.n == n) *err += ": " + bad.why;
+        }
         return false;
     }
     I8Ctx& ctx = *kern->ctx;

@@ -76,6 +76,15 @@ def main():
     texts["prose"] = "B"
     assert [k for k in bench.gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]] == ["prose"]
 
+    # Box rule 2026-11-01 12:13: the drafter at long context is the arm that faulted this box, so a
+    # candidate that asks for both must be refused (scores zero) and not load a drafter.
+    import os
+
+    for longctx, dflash, want in ((18800, "1", True), (18800, "", False), (0, "1", False)):
+        os.environ["HL_LONGCTX"], os.environ["HL_DFLASH"] = str(longctx), dflash
+        assert bench.longctx_drafter_conflict() is want, (longctx, dflash, want)
+    os.environ.pop("HL_LONGCTX"), os.environ.pop("HL_DFLASH")
+
     print("hyperloom_benchmark_test: OK")
     return 0
 

@@ -1,0 +1,68 @@
+[
+ {
+  "tensor": "model.mtp.fc.weight",
+  "tile_row": 0,
+  "tile_col": 0,
+  "n": 5120,
+  "k": 10240,
+  "tiles_per_tile_row": 40,
+  "tile": "fc_weight_0_0.tile.bin",
+  "want": "fc_weight_0_0.want.f32",
+  "generated_by": "cpu_ref::q4nx_tensor::dequant_block (libqwen3_8mtp_npu.so sha256 f907c9bb..., local FLM v1.0.7-93 build)"
+ },
+ {
+  "tensor": "model.mtp.fc.weight",
+  "tile_row": 0,
+  "tile_col": 17,
+  "n": 5120,
+  "k": 10240,
+  "tiles_per_tile_row": 40,
+  "tile": "fc_weight_0_17.tile.bin",
+  "want": "fc_weight_0_17.want.f32",
+  "generated_by": "cpu_ref::q4nx_tensor::dequant_block (libqwen3_8mtp_npu.so sha256 f907c9bb..., local FLM v1.0.7-93 build)"
+ },
+ {
+  "tensor": "model.mtp.layers.0.self_attn.q_proj.weight",
+  "tile_row": 0,
+  "tile_col": 0,
+  "n": 12288,
+  "k": 5120,
+  "tiles_per_tile_row": 20,
+  "tile": "q_proj_weight_0_0.tile.bin",
+  "want": "q_proj_weight_0_0.want.f32",
+  "generated_by": "cpu_ref::q4nx_tensor::dequant_block (libqwen3_8mtp_npu.so sha256 f907c9bb..., local FLM v1.0.7-93 build)"
+ },
+ {
+  "tensor": "model.mtp.layers.0.self_attn.k_proj.weight",
+  "tile_row": 0,
+  "tile_col": 19,
+  "n": 1024,
+  "k": 5120,
+  "tiles_per_tile_row": 20,
+  "tile": "k_proj_weight_0_19.tile.bin",
+  "want": "k_proj_weight_0_19.want.f32",
+  "generated_by": "cpu_ref::q4nx_tensor::dequant_block (libqwen3_8mtp_npu.so sha256 f907c9bb..., local FLM v1.0.7-93 build)"
+ },
+ {
+  "tensor": "model.mtp.layers.0.mlp.down_proj.weight",
+  "tile_row": 3,
+  "tile_col": 40,
+  "n": 5120,
+  "k": 17408,
+  "tiles_per_tile_row": 68,
+  "tile": "down_proj_weight_3_40.tile.bin",
+  "want": "down_proj_weight_3_40.want.f32",
+  "generated_by": "cpu_ref::q4nx_tensor::dequant_block (libqwen3_8mtp_npu.so sha256 f907c9bb..., local FLM v1.0.7-93 build)"
+ },
+ {
+  "tensor": "model.mtp.layers.0.mlp.gate_proj.weight",
+  "tile_row": 500,
+  "tile_col": 7,
+  "n": 17408,
+  "k": 5120,
+  "tiles_per_tile_row": 20,
+  "tile": "gate_proj_weight_500_7.tile.bin",
+  "want": "gate_proj_weight_500_7.want.f32",
+  "generated_by": "cpu_ref::q4nx_tensor::dequant_block (libqwen3_8mtp_npu.so sha256 f907c9bb..., local FLM v1.0.7-93 build)"
+ }
+]

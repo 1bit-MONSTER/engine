@@ -499,7 +499,7 @@ def main():
         result["bench_summary"]["score_geomean"] = round(geometric_mean(pp512, tg128, tps["code"]), 4)
         return finish(True, "reference_established")
 
-    differences = [k for k, v in ref_texts.items() if texts.get(k) != v]
+    differences = [k for k in gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]]
     identical = not differences
     result["quality_gate"]["texts_identical"] = identical
     result["quality_gate"]["texts_differing"] = differences
@@ -521,6 +521,18 @@ def geometric_mean(*values):
     if len(vals) < 3:
         return 0.0
     return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+
+def gated_text_keys(ref_texts):
+    """The replies the greedy-text gate compares: the short legs only.
+
+    The long reply depends on the context, not on the lever, so it is never part of the gate. Popping it
+    here rather than trusting the reference is what makes that true in the case that matters: a run that
+    *establishes* the reference with ``HL_LONGCTX`` set records a ``long`` reply (kept as evidence, it is
+    useful), and without this every later candidate — including a short-prompt run that never produces
+    that key — would be gated on it.
+    """
+    return [k for k in ref_texts if k != "long"]
 
 
 def score_of(pp512, tg128, tps, longctx):

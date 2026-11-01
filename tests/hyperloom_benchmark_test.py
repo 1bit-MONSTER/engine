@@ -59,6 +59,23 @@ def main():
     assert abs(geomean - (400.0 * 12.0 * 28.0) ** (1 / 3)) < 1e-9, geomean
     assert bench.geometric_mean(400.0, 12.0, 28.0) == geomean
 
+    # The gate compares the short legs only. A reference that carries a "long" reply — which happens when
+    # the reference is established by a long-context run — must not gate anyone on it, not even a short run
+    # that never produces that key. (pi-prs review on engine#769, 2026-11-01.)
+    assert bench.gated_text_keys({"code": "a", "prose": "b", "short": "c", "long": "d"}) == [
+        "code", "prose", "short"]
+    assert bench.gated_text_keys({"code": "a"}) == ["code"]
+    assert bench.gated_text_keys({}) == []
+
+    # The reviewer's exact scenario, as the gate line itself runs it: a reference carrying "long" and a run
+    # that only produced the short legs must compare clean, not fail on a missing key.
+    ref_texts = {"code": "a", "prose": "b", "short": "c", "long": "d"}
+    texts = {"code": "a", "prose": "b", "short": "c"}
+    assert [k for k in bench.gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]] == []
+    # And a short-leg difference is still caught.
+    texts["prose"] = "B"
+    assert [k for k in bench.gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]] == ["prose"]
+
     print("hyperloom_benchmark_test: OK")
     return 0
 

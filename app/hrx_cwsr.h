@@ -26,8 +26,10 @@
 // serve adds the three variables to every HRX backend's environment (the chat server, the RAG
 // servers and the Laya scorer) before it starts, so they are in place before ROCr initialises in
 // that process. --hrx-cwsr-placement picks the mode:
-//   auto (default)  only when /sys/module/amdgpu/parameters/cwsr_enable reads 1 and the user set
-//                   none of the three variables; CWSR off (the shipped default) changes nothing
+//   auto (default)  always, unless the user set HRX_SVM=1; a variable the user set still wins.
+//                   Since 2026-10-31 it no longer waits for cwsr_enable: with the TheRock nightly
+//                   libhsa the pageable-SVM placement page-faults on the first HRX graph replay
+//                   with CWSR *off*, the shipped configuration (docs/hrx.md, the A/B table)
 //   on              always (a variable the user set still wins, as for every serve variable)
 //   off             never
 // One line in serve's log says what was decided.
@@ -89,34 +91,39 @@ inline CwsrDecision decide_cwsr_placement(CwsrPlacement mode, int cwsr_enable, b
         for (size_t i = 0; i < sizeof kCwsrPlacementVars / sizeof *kCwsrPlacementVars; ++i)
             d.env.push_back(std::string(kCwsrPlacementVars[i]) + "=" + kCwsrPlacementValues[i]);
     };
+    if (mode == CwsrPlacement::Auto) {
+        // engine#315 candidate 1 is the default since 2026-10-31: with the TheRock nightly libhsa the
+        // pageable-SVM save area page-faults on the first HRX graph replay even with CWSR *off*, which is the
+        // shipped configuration here, so `auto` can no longer key off cwsr_enable. The opt-outs are
+        // --hrx-cwsr-placement=off and HRX_SVM=1 (a box whose ROCr does not need the GTT placement).
+        const char* svm_opt_out = getenv_fn("HRX_SVM");
+        if (svm_opt_out && std::string(svm_opt_out) == "1") {
+            d.log = "HRX: HRX_SVM=1; CWSR save-area placement left to ROCr (engine#315)";
+            return d;
+        }
+        if (!gate_built) {
+            d.log = "HRX: this build's hrx-system has no HRX_ALLOW_NO_SVM gate; CWSR save-area placement "
+                    "unchanged (engine#315)";
+            return d;
+        }
+        place();
+        d.log = std::string("HRX: CWSR save area placed in GTT by default (engine#315; amdgpu cwsr_enable=") +
+                (cwsr_enable == 1 ? "1" : cwsr_enable == 0 ? "0" : "unknown") +
+                "; --hrx-cwsr-placement=off or HRX_SVM=1 opts out)";
+        if (!user_set.empty()) d.log += "; kept from the environment: " + user_set;
+        return d;
+    }
     if (mode == CwsrPlacement::Off) {
         d.log = "HRX: --hrx-cwsr-placement=off; CWSR save-area placement left to ROCr (engine#315)";
         return d;
     }
-    if (mode == CwsrPlacement::On) {
-        if (!gate_built)
-            throw std::runtime_error("--hrx-cwsr-placement=on: this build's hrx-system has no HRX_ALLOW_NO_SVM gate, "
-                                     "so HSA_USE_SVM=0 would leave no HRX0 (engine#315)");
-        place();
-        d.log = "HRX: --hrx-cwsr-placement=on; CWSR save area placed in GTT (engine#315)";
-        if (!user_set.empty()) d.log += "; kept from the environment: " + user_set;
-        return d;
-    }
-    if (cwsr_enable != 1) {
-        d.log = cwsr_enable == 0 ? "HRX: CWSR is off; CWSR save-area placement unchanged (engine#315)"
-                                 : "HRX: CWSR state unknown (no readable amdgpu cwsr_enable); placement unchanged (engine#315)";
-        return d;
-    }
-    if (!user_set.empty()) {
-        d.log = "HRX: CWSR is on; " + user_set + " set in the environment, so serve leaves the placement to it (engine#315)";
-        return d;
-    }
-    if (!gate_built) {
-        d.log = "HRX: CWSR is on, but this build's hrx-system has no HRX_ALLOW_NO_SVM gate; placement unchanged (engine#315)";
-        return d;
-    }
+    // CwsrPlacement::On
+    if (!gate_built)
+        throw std::runtime_error("--hrx-cwsr-placement=on: this build's hrx-system has no HRX_ALLOW_NO_SVM gate, "
+                                 "so HSA_USE_SVM=0 would leave no HRX0 (engine#315)");
     place();
-    d.log = "HRX: CWSR is on; CWSR save area placed in GTT (engine#315)";
+    d.log = "HRX: --hrx-cwsr-placement=on; CWSR save area placed in GTT (engine#315)";
+    if (!user_set.empty()) d.log += "; kept from the environment: " + user_set;
     return d;
 }
 

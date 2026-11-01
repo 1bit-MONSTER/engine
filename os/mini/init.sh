@@ -94,6 +94,8 @@ done
 disk=${data#/dev/}; disk=${disk##*/}
 disk=$(basename "$(readlink -f "/sys/class/block/$disk/.." 2>/dev/null)" 2>/dev/null || echo "")
 removable=$(cat "/sys/class/block/${disk:-none}/removable" 2>/dev/null || echo 0)
+# a USB stick can report removable=0 (QEMU's usb-storage does): the bus it sits on is the honest answer
+case "$(readlink -f "/sys/class/block/${disk:-none}" 2>/dev/null)" in *usb*) removable=1 ;; esac
 if [ -n "$data" ]; then mount "$data" /data && echo "models: /data/models (from $data)"; fi
 
 # Evidence that outlives a live boot: stage markers on the stick, so a machine that hangs later can be
@@ -383,7 +385,10 @@ for i in $(seq 1 20); do
     done
     sleep 1
 done
-[ "$lup" = 1 ] && say "  Lemonade: up on http://$lhost:$lport/  (API key: $key)" ||
+# a wildcard bind is not an address anyone can click: show the machine's own IPv4 when the config says 0.0.0.0
+case "$lhost" in 0.0.0.0|::|'') lshow=$(ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1); lshow=${lshow:-$lhost} ;;
+                 *) lshow=$lhost ;; esac
+[ "$lup" = 1 ] && say "  Lemonade: up on http://$lshow:$lport/  (API key: $key)" ||
     say "  Lemonade: not answering yet after 20 s (log: /tmp/lemond.log; API key: $key)"
 # and the engine behind it: the HRX device the onebit recipe needs, or the reason it is not there
 if [ -x /opt/1bit-llama/llama-server ]; then

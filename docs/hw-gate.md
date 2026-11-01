@@ -132,9 +132,13 @@ exists, so the two take turns. `HW_GATE_TOKEN=none` skips the token for a caller
 holds it.
 
 Each of those steps:
-- **Lock.** It holds `~/npu.lock` (flock) only while it runs, so other GPU work keeps its turn between steps.
+- **No NPU lock.** A GPU step takes no `~/npu.lock` at all (engine#682): the NPU and the GPU run at the same
+  time on this box by measurement, not by assumption — engine#673 measured a GPU-busy NPU stream keeping
+  ~87 % of its bandwidth (7.40 GB/s against 8.2–8.5 idle; 10.5–10.9 ms → 12.0 ms per launch; 160/160
+  byte-exact, zero resets). The lock is what the **NPU phase** takes, below, because an NPU dispatch must
+  not overlap another NPU dispatch.
 - **Heat.** It waits for Tctl to drop to 75 C, then runs under `~/lb/thermal-run.sh`, which freezes it at 78 C and kills it at 93 C.
-- **Memory.** It runs under `scripts/mem-guard.sh` (kills the step below 12 GB MemAvailable). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then releases the lock and retries every minute, up to ten times.
+- **Memory.** It runs under `scripts/mem-guard.sh` (kills the step below 12 GB MemAvailable). Before a step starts, `tools/mem_budget.py` estimates it. A step that would take GTT to 95 GiB or more (the engine#315 fault zone), or past MemAvailable, is refused. The gate then waits for memory to free up and retries every minute, up to ten times.
 - **The PR-Agent model.** coder-llm (Vulkan, :8090) loses its device when long HRX dispatches starve it. The gate runs on `strixhalo-engine`, the runner that also runs the pr-agent jobs, and a runner takes one job at a time, so no review is generating during the gate. Before each step the gate also waits for coder-llm's slots to be idle. Afterwards it reports any new `ring ... timeout` in the kernel log.
 
 The build runs under thermal-run too, and resumes after a thermal kill. Build trees and ccache
@@ -202,9 +206,11 @@ Strix Halo, 2026-10-20, performance power mode, main 55929b5 (llama.cpp 00f2a68d
 | Qwen3-4B IQ4_XS: kat + KLD | 31 s |
 
 363 s of GPU time in all; the MoE model, the IQ model and the ZAYA1 needle add about 77 s of it.
-Waiting for `~/npu.lock` costs more than the gate
+Waiting for `~/npu.lock` used to cost more than the gate
 itself: flock is not first-come-first-served, and with about ten jobs queueing, each acquisition
-waited 10 to 60 minutes. The summary reports both numbers (waiting, holding).
+waited 10 to 60 minutes, twice cutting a candidate's gate short while an NPU serve held the lock.
+Since engine#682 a GPU step takes no NPU lock, so that wait is gone; the summary keeps reporting
+waiting (heat, memory) and the step's own time.
 
 What the goldens record at the release pin:
 - Qwen3-0.6B misses one short needle (`varied-720w`: "25"). The check holds that case to the golden's text instead of the answer.
@@ -225,9 +231,8 @@ That is the usual GPU-vs-CPU rounding gap of a 4-bit file, not a wrong kernel.
 
 ## Not covered yet
 
-- **Lock fairness.** `~/npu.lock` is a plain flock, so a job that re-queues quickly can starve the
-  gate for an hour. A first-come-first-served queue, or a reserved window for the gate, would bound
-  the wall time. The gate's own GPU time is 6 to 13 minutes.
+- **Lock fairness.** `~/npu.lock` is a plain flock, so a job that re-queues quickly can starve another
+  NPU job. GPU steps are no longer behind it (engine#682); the NPU phase and any NPU serve still are.
 - **Not exercised:** `1bit serve` itself (the gate talks to llama-server with serve's HRX flags),
   `--parallel`, `--mtp` / `--dflash`, vision, and contexts past 8K.
 - **One copy of the KLD bases** on the box. A spare copy of the release-pin set is on ryzen

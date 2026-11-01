@@ -147,6 +147,15 @@ echo "== kernel modules ($kver)"
 # USB4 v2 / Thunderbolt docks and what they expose (owner, 26 Oct): the Type-C stack (typec, typec_ucsi,
 # ucsi_acpi, typec_displayport, roles) for the port itself, thunderbolt_net, and the USB NIC drivers a dock
 # carries (r8152, ax88179_178a, cdc_ether, cdc_ncm, usbnet). Wi-Fi: mt7925e pulls mt76/mac80211/cfg80211.
+# #709: efivars, where the image kernel's module tree has it. `mount -t efivarfs` is how 1bit-install writes
+# a firmware boot entry, and CONFIG_EFIVAR_FS is a module in this kernel - if the module is not staged, the
+# installer can only say so. Staged conditionally and said out loud, so an image that cannot write boot
+# entries is never a surprise at install time.
+if [ -n "$(modprobe -S "$kver" --show-depends efivarfs 2>/dev/null)" ]; then
+    echo "== efivarfs.ko for $kver: staged (the installer can write a boot entry)"
+else
+    echo "== efivarfs.ko for $kver: NOT in this kernel's module tree - this image cannot write firmware boot entries (os #709)"
+fi
 # Every module the board binds on the build machine (os/mini/hwprobe.py, 26 Oct 2026): CPU temperature
 # (k10temp, what the fan logic and the checks read), SMBus and the DIMM sensors, the power controller,
 # the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), the SD reader, RAPL
@@ -155,9 +164,22 @@ echo "== kernel modules ($kver)"
 # (its signing key is not the kernel's) and then eleven "Unknown symbol snd_ctl_new1 (err -2)" lines
 # scrolled over the screen for every user. Dropping them is the whole fix: nothing else loads them.
 mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb sdhci_pci intel_rapl_msr spd5118 typec_ucsi roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet"
+# a module this tree does not have would otherwise abort the build with no message at all (set -o pipefail +
+# a `modprobe` that exits non-zero at the head of the pipeline): ask first, and name what is missing.
+missing_mods=
+for m in $mods efivarfs; do
+    modprobe -S "$kver" --show-depends "$m" > /dev/null 2>&1 || missing_mods="$missing_mods $m"
+done
+# efivarfs is the one module the installer needs and can do without (see above): everything else is what the
+# appliance boots with, so its absence is a build failure.
+missing_mods=$(printf '%s' "$missing_mods" | tr ' ' '\n' | grep -v -x efivarfs | tr '\n' ' ' || true)
+[ -z "${missing_mods// /}" ] || { echo "this kernel tree has no module(s): $missing_mods"; exit 1; }
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
+# efivarfs only when it exists: staged separately so the loop above can stay strict about everything else
+modprobe -S "$kver" --show-depends efivarfs 2>/dev/null | awk '$1 == "insmod" {print $2}' | sort -u |
+    while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
 cp /lib/modules/"$kver"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kver/" 2>/dev/null || true
 
 echo "== board driver (ec_su_axb35, GPL-2.0, source shipped in os/licenses/ec_su_axb35)"
@@ -414,6 +436,11 @@ rm -f "$root/bin/mke2fs"
 cp /usr/sbin/mke2fs "$root/bin/mke2fs"; chmod +x "$root/bin/mke2fs"
 copy_libs /usr/sbin/mke2fs
 cp /etc/mke2fs.conf "$root/etc/mke2fs.conf"
+# #709: efibootmgr, so the installer can register the boot entry itself. It was not in the image and neither
+# was efivarfs, so the first real install could only print "if the firmware asks, point it at
+# \\EFI\\BOOT\\BOOTX64.EFI" - and the firmware then tried the wiped Ubuntu's stale entry and fell through
+# to the stick instead of booting the disk.
+copy_elf /usr/bin/efibootmgr
 cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/1bit-release-check"
 install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
 mkdir -p "$root/etc/1bit"

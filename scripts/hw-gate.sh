@@ -60,10 +60,15 @@
 # is exit 2. Two gate runs (#481) died "server failed (rc 137)" loading models while Hyperloom held the token.
 # HW_GATE_TOKEN=none skips all of it (a caller that already holds the token).
 #
-# Every GPU step holds ~/npu.lock (flock) only while it runs, inside scripts/mem-guard.sh and
-# ~/lb/thermal-run.sh. Before each one it waits for the PR-Agent model (coder-llm, :8090) to be
-# idle, and afterwards it reports any new amdgpu ring timeout (HRX dispatches starve that
-# Vulkan service). Exit 0 = pass, 1 = a check failed, 2 = the box could not run the gate.
+# A GPU step takes NO ~/npu.lock (engine#682): an NPU serve and the GPU run concurrently on this box by
+# measurement, not by assumption - engine#673 measured a GPU-busy NPU stream keeping ~87 % of its bandwidth
+# (7.40 GB/s against 8.2-8.5 idle, 10.5-10.9 ms -> 12.0 ms per launch, 160/160 byte-exact, zero resets), so
+# waiting behind an NPU serve only made the gate miss its window (c16's gate was cut 3x by its own 20-minute
+# hold). ~/npu.lock is still what the NPU phase takes, below: an NPU dispatch must not overlap another NPU
+# dispatch. Each GPU step runs under scripts/mem-guard.sh and ~/lb/thermal-run.sh, waits for the PR-Agent
+# model (coder-llm, :8090) to be idle before it starts, and afterwards reports any new amdgpu ring timeout
+# (HRX dispatches starve that Vulkan service). Exit 0 = pass, 1 = a check failed, 2 = the box could not run
+# the gate.
 set -uo pipefail
 
 # -h/--help is answered before anything else, in particular before the GPU queue below: printing the
@@ -167,9 +172,9 @@ while [ $# -gt 0 ]; do
     --phases) PHASES=$2; shift 2 ;;
     --models) ONLY_MODELS=$2; shift 2 ;;
     --record) MODE=record; shift ;;
-    --cool)  # internal, inside the lock: wait for a cool box, check memory, then run the step
+    --cool)  # internal: wait for a cool box, check memory, then run the step
       shift; cool
-      [ -n "${HW_GATE_STAMP:-}" ] && date +%s > "$HW_GATE_STAMP"   # the lock is held from here
+      [ -n "${HW_GATE_STAMP:-}" ] && date +%s > "$HW_GATE_STAMP"   # the step starts here
       if [ "${1:-}" = --mem ]; then memcheck "$2" || exit 76; shift 2; fi
       exec "$@" ;;
     --serve-step) SERVE_STEP=1; shift; break ;;   # internal: one model's kat (+ needle) inside the lock
@@ -184,7 +189,7 @@ LIBHSA=$(find "$TOOLCHAIN" -path '*/libhsa-runtime64.so.1' 2>/dev/null | sort)
 LIBHSA=${LIBHSA%%$'\n'*}
 export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-$LIBHSA}
 
-# ---- internal: one model in one lock hold: serve it, run kat (and the needle), stop the server,
+# ---- internal: one model in one step: serve it, run kat (and the needle), stop the server,
 # then llama-perplexity for the KLD. Exit bits: 1 kat failed, 4 needle failed, 8 perplexity failed;
 # 3 = the server did not come up. The placement verdict is read from the server log afterwards.
 if [ "$SERVE_STEP" = 1 ]; then
@@ -299,7 +304,8 @@ release_token() {
 trap release_token EXIT
 trap 'exit 143' TERM INT HUP   # so a killed run (timeout, CI cancel) still releases it
 
-# run "$@" on the GPU: hold the GPU token, wait for coder-llm, hold the lock, mem-guard + thermal-run
+# run "$@" on the GPU: hold the GPU token, wait for coder-llm, run it under mem-guard + thermal-run
+# (no ~/npu.lock: engine#682, measured in engine#673)
 gpu() {
   if ! take_token; then
     result gpu-token FAIL "$TOKEN_WAIT" "$TOKEN held by another job for ${TOKEN_WAIT}s: $(cat "$TOKEN" 2> /dev/null)"
@@ -313,15 +319,15 @@ gpu() {
   export HW_GATE_STAMP=$OUT/.stamp
   rm -f "$HW_GATE_STAMP"
   while :; do
-    flock -w "$LOCK_WAIT" -E 75 "$LOCK" "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" "$MEM_FLOOR" "$THERMAL" "$@"
+    "$0" --cool --mem "${GPU_MODEL:--}" "$ROOT/scripts/mem-guard.sh" "$MEM_FLOOR" "$THERMAL" "$@"
     rc=$?
-    # 76: the memory pre-check said no; the lock is released, so other work can finish first
+    # 76: the memory pre-check said no; nothing is held, so other work can finish first
     [ $rc = 76 ] && [ $tries -lt "${HW_GATE_MEM_RETRIES:-10}" ] || break
     tries=$((tries + 1)); sleep 60
   done
   [ $rc = 76 ] && { note "::error::memory pre-check refused the step ${tries} times"; infra=1; }
   t1=$(date +%s)
-  # wall time split for the summary: waiting (lock, heat, memory) vs holding the lock
+  # wall time split for the summary: waiting (heat, memory) vs running the step
   if [ -f "$HW_GATE_STAMP" ]; then
     LAST_HOLD=$(( t1 - $(cat "$HW_GATE_STAMP") )); LAST_WAIT=$(( $(cat "$HW_GATE_STAMP") - t0 ))
   else
@@ -332,7 +338,6 @@ gpu() {
   if [ "$after" -gt "$before" ]; then
     note "::warning::new amdgpu ring timeout(s) in the kernel log during: $*"
   fi
-  if [ $rc = 75 ]; then note "::error::$LOCK still held after ${LOCK_WAIT}s"; infra=1; fi
   return $rc
 }
 
@@ -428,7 +433,7 @@ if has ops || has kat || has needle || has kld || has placement; then
 fi
 
 # ---- ops -----------------------------------------------------------------------------------
-# One test-backend-ops run for all the ops: one lock hold instead of one per op (on a shared box
+# One test-backend-ops run for all the ops: one step instead of one per op (on a shared box
 # every acquisition can wait minutes), with -j workers for the CPU reference.
 if has ops; then
   t0=$(date +%s); log=$OUT/ops.log
@@ -439,9 +444,9 @@ if has ops; then
   passed=$(grep -oE '[0-9]+/[0-9]+ tests passed' "$log" | tail -n 1)
   held=$LAST_HOLD
   if [ $rc = 0 ] && grep -q "Backend HRX0: OK" "$log"; then
-    result ops PASS $(( $(date +%s) - t0 )) "${passed} ($OPS; held the lock ${held}s)"
-  elif [ $rc = 75 ] || [ $rc = 76 ]; then
-    result ops FAIL $(( $(date +%s) - t0 )) "could not run: lock or memory (rc $rc)"
+    result ops PASS $(( $(date +%s) - t0 )) "${passed} ($OPS; step ${held}s)"
+  elif [ $rc = 76 ]; then
+    result ops FAIL $(( $(date +%s) - t0 )) "could not run: the memory pre-check refused it (rc 76)"
   else
     unknown=$(printf '%s\n' "$fails" | grep -v -F "$FLAKY_CASES" | grep -c . || true)
     st=FAIL detail="${passed:-rc=$rc}: $(printf '%s' "$fails" | head -n 3 | tr '\n' ' ')"
@@ -486,8 +491,8 @@ if has ops; then
       runs=$(grep -c '^== ' "$log" || true) pass=$(grep -c '^PASS$' "$log" || true)
       if [ $rc = 0 ] && [ "$runs" = 6 ] && [ "$pass" = 6 ]; then
         result fa-decode-q8 PASS $(( $(date +%s) - t0 )) "6/6 (K q8_0 x V f16 and q8_0; Hq/Hkv 16/8 and 32/8; n_kv 1031, 2048, 4103)"
-      elif [ $rc = 75 ] || [ $rc = 76 ]; then
-        result fa-decode-q8 FAIL $(( $(date +%s) - t0 )) "could not run: lock or memory (rc $rc)"
+      elif [ $rc = 76 ]; then
+        result fa-decode-q8 FAIL $(( $(date +%s) - t0 )) "could not run: the memory pre-check refused it (rc 76)"
       else
         result fa-decode-q8 FAIL $(( $(date +%s) - t0 )) "${pass}/6 passed (rc $rc): $(awk '/NMSE/ {l = $0} /^FAIL/ {print (l != "" ? l : $0); l = ""}' "$log" | head -n 2 | tr '\n' ' ' | cut -c1-240)"
       fi
@@ -495,7 +500,7 @@ if has ops; then
   fi
 fi
 
-# ---- kat + needle + KLD: one lock hold per model -------------------------------------------
+# ---- kat + needle + KLD: one step per model -----------------------------------------------
 if has kat || has needle || has kld; then
   [ -f "$TEXT" ] || { has kld && { result kld FAIL 0 "text missing: $TEXT"; infra=1; }; }
   while IFS='|' read -r name file repeat donee srvargs; do
@@ -516,7 +521,7 @@ if has kat || has needle || has kld; then
     GPU_MODEL=$model gpu "$0" --bin "$BIN" "${rec[@]}" --serve-step "$name" "$model" "$repeat" "$OUT" "$needle" "$dokat" "$dokld" "$base" "$doplace" "$srvargs"
     rc=$?
     secs=$(( $(date +%s) - t0 )) held=$LAST_HOLD
-    if [ $rc = 75 ] || [ $rc = 76 ]; then result "model $name" FAIL "$secs" "could not run: lock or memory (rc $rc)"; continue; fi
+    if [ $rc = 76 ]; then result "model $name" FAIL "$secs" "could not run: the memory pre-check refused it (rc 76)"; continue; fi
     if [ $rc = 3 ] || [ $rc -ge 16 ]; then
       result "model $name" FAIL "$secs" "server failed (rc $rc): $(tail -n 3 "$OUT/server-$name.log" 2>/dev/null | tr '\n' ' ' | cut -c1-200)"
       continue
@@ -566,8 +571,8 @@ fi
 # reproducible that repeated runs match byte for byte. Set HW_GATE_NPU_CHECK to the private
 # checker (it reads its own settings from the environment) and
 # HW_GATE_NPU_FLOOR to the tok/s floor (default 30). The NPU shares the box: this runs inside
-# the gate's GPU claim and holds ~/npu.lock, and is NOT wrapped in thermal-run (its freeze can
-# abort an NPU dispatch); cool() gates the start instead.
+# the gate's GPU claim and is the only phase that takes ~/npu.lock (GPU steps no longer do, engine#682),
+# and is NOT wrapped in thermal-run (its freeze can abort an NPU dispatch); cool() gates the start instead.
 if has npu; then
   t0=$(date +%s)
   if [ ! -e /dev/accel/accel0 ]; then
@@ -607,7 +612,7 @@ rings=$(ring_timeouts)
   awk -F'\t' '{ gsub(/\|/, "\\|", $4); printf "| %s | %s | %s | %s |\n", $1, $2, $3, $4 }' "$RESULTS"
   if [ -s "$OUT/timing.tsv" ]; then
     echo
-    echo "GPU steps: $(awk -F'\t' '{w+=$2; h+=$3} END {printf "%d s waiting (lock, heat, memory), %d s holding ~/npu.lock, longest hold %d s", w, h, m}' m="$(cut -f3 "$OUT/timing.tsv" | sort -n | tail -n 1)" "$OUT/timing.tsv")."
+    echo "GPU steps: $(awk -F'\t' '{w+=$2; h+=$3} END {printf "%d s waiting (heat, memory), %d s running the step, longest step %d s", w, h, m}' m="$(cut -f3 "$OUT/timing.tsv" | sort -n | tail -n 1)" "$OUT/timing.tsv")."
   fi
 } > "$OUT/summary.md"
 [ -n "${GITHUB_STEP_SUMMARY:-}" ] && cat "$OUT/summary.md" >> "$GITHUB_STEP_SUMMARY"

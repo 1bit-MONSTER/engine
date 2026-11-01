@@ -1,0 +1,15 @@
+{
+  "what": "q4_1 tiles of a synthetic (codes, scale, zero) tensor, as tools/gguf_to_q4nx.py writes them",
+  "rows_32": 32,
+  "cols_256": 256,
+  "tile_bytes": 5120,
+  "N": 64,
+  "K": 384,
+  "padded_K": 512,
+  "tiles": 4,
+  "codes": "(n*7 + k*13) % 16 for k < K, 0 in the padding",
+  "scale": "0.001 * (g % 7 + 1) for the 32-column group g, 0 in the padding",
+  "zero": "-0.05 * (g % 3) - 0.01 * (n % 5), 0 in the padding",
+  "generator": "tools/oga_pack_tiles_golden.py",
+  "sha256": "53e598e3a50452c5d2bf1a5dd384f756962172fb9645e3161b4288370aa79f60"
+}

@@ -21,6 +21,8 @@
 //                                    OpenAI endpoints; serve's NPU route.
 //   1bit npu-run [options]           token ids in, token ids out, on the NPU fast
 //                                    lane (docs/npu.md); for checks and benchmarks.
+//   1bit npu-pack <info|import>      turns a Ryzen AI OGA NPU model pack into a Q4NX
+//                                    model directory (docs/npu.md, "OGA packs").
 //   1bit moe-cache [options]         replays an expert trace through the MoE expert
 //                                    cache against the model file (docs/moe-streaming.md).
 //   1bit ort-info                    the ONNX Runtime this binary links (pin, API version,
@@ -39,7 +41,9 @@ int onebit_ort_info_main(int argc, char** argv);
 // onnx/ort_run.cpp: a plain ONNX model through ORT with the plugin EP registered first.
 int onebit_ort_run_main(int argc, char** argv);
 #endif
-
+#ifdef ONEBIT_NPU_HOST
+#include "pack_import.h"  // 1bit npu-pack: an OGA NPU pack -> a Q4NX model directory
+#endif
 #ifdef ONEBIT_NPU
 #include "forward_serve.h"
 #include "generate.h"
@@ -84,6 +88,10 @@ void usage(FILE* out) {
                  "  npu-run [options]           generate on the NPU fast lane (npu-run --help)\n"
                  "  forward-serve -m <model.q4nx> --kernels <dir>  serve a repacked GGUF on the NPU\n"
 #endif
+#ifdef ONEBIT_NPU_HOST
+                 "  npu-pack <info|import> <pack dir>  import a Ryzen AI OGA NPU pack (npu-pack --help)\n"
+#endif
+                 "  comfy <workflow.json>       run a ComfyUI workflow with ComfyUI.cpp (docs/comfyui.md)\n"
 #ifdef ONEBIT_LAYA
                  "  route [options]             pick a device for a request via the Laya scorer\n"
 #endif
@@ -236,6 +244,16 @@ int main(int argc, char** argv) {
             return 1;
         }
     }
+#ifdef ONEBIT_NPU_HOST
+    if (cmd == "npu-pack") {
+        try {
+            return onebit::npu::pack_import::run(argc - 2, argv + 2);
+        } catch (const std::exception& e) {
+            std::fprintf(stderr, "1bit npu-pack: %s\n", e.what());
+            return 1;
+        }
+    }
+#endif
 #ifdef ONEBIT_NPU
     if (cmd == "unified") {
         try {

@@ -24,10 +24,14 @@ conversion is lossy on top of the container's own requantisation. This tool does
 arena's input file per expert, and measures what it costs — the number that decides whether MoE
 decode on this route is worth the loss.
 
-  moe_expert_chunks.py chunks <model dir> <out dir> [--layers N] [--experts N]
+  moe_expert_chunks.py chunks <model dir> <out dir> [--layers N] [--experts N] [--pad-n N]
         per expert: `L<layer>_<gate|up|down>_e<expert>.tf16` = int4 codes as int8 [K][N] then
         fp16 d bits [K//128][N] (layout_w4.py's read_tf16 input), plus manifest.json with the
-        geometry the kernel generator needs (K, N, n-tiles at NW=32 and NW=16).
+        geometry the kernel generator needs (K, N, n-tiles at NW=32 and NW=16). The manifest
+        keeps the three sizes apart by format - `read_tf16_bytes` for the file this writes,
+        `pb16_bytes` for what the device streams once the arena packs it, `src_bytes` for the
+        container's own tiles - because they differ by 1.8x and a byte budget that mixes them is
+        wrong by that factor.
 
   moe_expert_chunks.py verify <model dir> <out dir> [--layer N] [--experts N]
         read every written chunk back and compare with the container's own weights for that
@@ -61,9 +65,10 @@ def container_expert(q, name, e):
 
 
 def pad_n(wt, n_pad):
-    """Zero-pad a [K][N] block to [K][n_pad]: the arena's n-tile geometry needs N a multiple of
-    1,024 at NW=32, and an expert's 768 columns are not."""
-    if n_pad == wt.shape[1]:
+    """Zero-pad a [K][N] block up to [K][n_pad]: the arena's n-tile geometry needs N a multiple of
+    1,024 at NW=32, and an expert's 768 columns are not. It only ever WIDENS - down_proj's 2,048
+    columns are already fine and must not be cut to some model-wide padding."""
+    if n_pad is None or n_pad <= wt.shape[1]:
         return wt
     out = np.zeros((wt.shape[0], n_pad), np.float32)
     out[:, :wt.shape[1]] = wt
@@ -108,8 +113,26 @@ def read_chunk(path, K, N):
     return codes, d
 
 
-def geometry(q, layer):
-    """What the kernel generator has to know for this model's experts.
+def sizes(K, N):
+    """The three sizes this tool has to keep apart, each named for the format it describes.
+
+    read_tf16_bytes  what chunks() WRITES per expert: int8 int4 codes [K][N] (one byte each,
+                     padded to N) followed by fp16 d [K//128][N]. This is layout_w4.py's
+                     read_tf16 INPUT, a host-side conversion artifact, not a device stream.
+    pb16_bytes       what the device streams after the arena packs those codes: nibble-packed
+                     K*N/2 plus one fp16 multiplier per 32 K-rows per column. This is the number
+                     a decode-byte budget is computed from.
+    src_bytes        the same expert in the container: q4_1 tiles, K*N/32 chunks of 5120 B.
+    """
+    return {
+        "read_tf16_bytes": K * N + (K // GROUP) * N * 2,
+        "pb16_bytes": K * N // 2 + (K // 32) * N * 2,
+        "src_bytes": K * N * 5 // 8,   # q4_1 tiles: 5120 B per 8192 weights
+    }
+
+
+def geometry(q, layer, pad_n=None):
+    """What the kernel generator has to know for this model's experts, padding included.
 
     The n-tile constraint is not N % 32: a core owns CW = N/(tiles across) columns of the weight,
     so at NW=32 the per-core slice CW = N/32 must itself be whole 32-wide tiles (N % 1024 == 0),
@@ -119,21 +142,31 @@ def geometry(q, layer):
     for proj, suffix in PROJ.items():
         info = q.moe_meta["tensors"][q.layer_name(layer, suffix)]
         K, N = info["cols"], info["rows"]
+        n_out = max(N, pad_n or N)
         out[proj] = {
-            "K": K, "N": N,
-            "chunk_bytes": K * N // 2 + (K // 32) * N * 2,  # pb16(i) stream, 5 bits/weight
-            "src_bytes_per_expert": info["bytes"],           # q4_1 tiles in the container
-            "cw_nw32": N // 32, "cw_nw16": N // 16,
-            "ok_at_nw32": N % 1024 == 0, "ok_at_nw16": N % 256 == 0,
+            "K": K, "N": N, "N_padded": n_out,
+            **sizes(K, n_out),
+            "src_bytes": info["bytes"],   # the container's own per-expert span, padding aside
+            "cw_nw32": n_out // 32, "cw_nw16": n_out // 16,
+            "ok_at_nw32": n_out % 1024 == 0, "ok_at_nw16": n_out % 256 == 0,
             "k_multiple_of_256": K % 256 == 0,
         }
     return out
 
 
-def token_stream(q, layer):
-    """Bytes one decode step streams: 48 layers x top-k experts x 3 projections."""
-    per_layer = sum(v["chunk_bytes"] for v in geometry(q, layer).values()) * q.top_k
-    return {"per_layer": per_layer, "per_token": per_layer * q.layers}
+def token_stream(q, layer, pad_n=None):
+    """Bytes one decode step streams, per format: layers x top-k experts x 3 projections.
+
+    Both are reported because they answer different questions and differ by 1.8x: pb16_bytes is
+    the device's decoder stream (the number a byte budget uses), read_tf16_bytes is what a host
+    reads to build it.
+    """
+    g = geometry(q, layer, pad_n)
+    out = {}
+    for key in ("pb16_bytes", "read_tf16_bytes", "src_bytes"):
+        per_layer = sum(v[key] for v in g.values()) * q.top_k
+        out[key.replace("_bytes", "_per_token")] = per_layer * q.layers
+    return out
 
 
 def chunks(args):
@@ -156,8 +189,8 @@ def chunks(args):
         "format": "int4 codes as int8 [K][N], then fp16 d [K//128][N] (layout_w4.py read_tf16)",
         "quantisation": "symmetric int4, one multiplier per 128 K-rows per column; the container's "
                         "q4_1 zero point is dropped, so verify's error is ON TOP of the container's",
-        "geometry": geometry(q, layers[0]),
-        "decode_stream": token_stream(q, layers[0]),
+        "geometry": geometry(q, layers[0], args.pad_n),
+        "decode_stream": token_stream(q, layers[0], args.pad_n),
         "files": wrote,
     }
     with open(os.path.join(args.out, "manifest.json"), "w") as f:

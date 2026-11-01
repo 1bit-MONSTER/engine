@@ -202,6 +202,10 @@ add_test(NAME npu_sampling COMMAND npu_sampling_test)
 add_executable(mtp_draft_test tests/mtp_draft_test.cpp)
 target_include_directories(mtp_draft_test PRIVATE npu)
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
+# ci.yml's build step lists every ctest target explicitly, and this branch cannot edit that file (the push
+# token has no `workflow` scope), so the binary is pulled in as a dependency of a listed test target. When a
+# workflow-scoped push is available, add `mtp_draft_test` to ci.yml's build list and delete this line.
+add_dependencies(npu_sampling_test mtp_draft_test)
 # Who may have the NPU (app/npu_device_lock.h, engine#612, docs/npu.md "Two streams on one
 # NPU"): the exclusive default and the shared --npu-streams >= 2 opt-in, on a lock file in a
 # temp dir; header only, no device, runs in CI.

@@ -109,6 +109,7 @@ patch there runs `git clean -fd` and would delete it.
 3. `llama-perplexity` KLD against the base logits (`-c 512 --chunks 8 -b 512 -ub 512`, the
    `scripts/hw-gate.sh` recipe), and the three serve replies compared with the baseline's.
 4. Score = geometric mean of pp512, tg128 and serve code tok/s, so a lever has to win on balance.
+   With `HL_LONGCTX` set, the score is instead the long-context decode rate (see Levers).
 
 The gate is fail-closed and has two halves; a candidate that fails either is rejected:
 
@@ -135,6 +136,8 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 | `HL_DFLASH` | `--dflash <drafter>` | block-diffusion drafter; exclusive with `--mtp` |
 | `HL_PARALLEL` | `--parallel N` | HRX runs one gated-delta-net sequence at a time, so this is expected flat on Qwen3.8 |
 | `GGML_HRX_*` | environment only | the knobs `docs/hrx.md` names (`Q8_PREFILL_RELAX`, `GRAPH_PROGRAM_CACHE`, ...) |
+| `HL_CTX` | `-c` | context the serve leg is started at (default 8192). Not a lever: without it serve sizes the KV cache for the model's own context and aborts on its own fit check whenever the box is busy. Raise it for a long-context workload. |
+| `HL_LONGCTX`, `HL_LONGTOK` | `-c` + the long request | **engine#679 metric.** `HL_LONGCTX=<tokens>` adds one long request to the serve leg, on a deterministic filler prompt sized at this filler's measured ~4.85 characters/token, and makes **its decode rate the score**; `HL_LONGTOK` is how many tokens it decodes (default 128). The short legs and the gate's code are unchanged, and `bench_summary.longctx` reports the context the server actually saw, the decode count and the prefill rate. The long reply is deliberately **never** compared by the greedy-text gate — it depends on the context, not on the lever — and that holds even when the reference was established by a long-context run and therefore carries a `long` reply: the gate compares the short legs only (`gated_text_keys()`), so a short-prompt run is never gated on a key it does not produce. |
 
 ## Box etiquette
 

@@ -25,6 +25,7 @@
 #include <unistd.h>
 
 #include <algorithm>
+#include <type_traits>
 #include <cmath>
 #include <cstdio>
 #include <cstdlib>
@@ -49,6 +50,17 @@ struct Kernel {
     float w_scale = 1.0f;
 };
 
+// One QDQ-path kernel: the same ELF, but the weight BO holds the quantised graph's own int8 bytes and
+// nothing here knows about scales. Created on demand for the (K, N) a fused node asks for, because a
+// second I8Ctx per shape costs its BOs (bA + bC + one layerB) and most graphs ask for a few shapes.
+struct Q8Kernel {
+    int m = 0, k = 0, n = 0;
+    std::string elf;
+    std::unique_ptr<I8Ctx> ctx;
+    const int8_t* w_ptr = nullptr;  // the graph's weights whose bytes are in layerB[0]
+    int64_t w_k = 0, w_n = 0;
+};
+
 // One process-wide NPU context: the device, the kernels, and the lock that keeps other processes
 // out. The EP is single-session in practice, so one is enough.
 struct State {
@@ -58,6 +70,25 @@ struct State {
     int lock_fd = -1;
     std::unique_ptr<xrt::device> dev;
     std::vector<std::unique_ptr<Kernel>> kernels;
+    // Configured designs (MxKxN -> ELF), kept so a QDQ kernel can be built for a shape later without
+    // re-reading the environment or re-opening the device.
+    std::vector<std::pair<std::string, std::string>> specs;
+    std::vector<std::unique_ptr<Q8Kernel>> q8_kernels;
+    // Shapes whose QDQ kernel could not be built (a bad ELF, a design M that does not match it). Remembered
+    // because building one means parsing an ELF and creating a hw_context -- ~50 ms -- and retrying that on
+    // every call turns a fallback into a 20x slowdown: measured, 8 decode tokens went from 4 s to 87 s when
+    // every group paid a failed init_elf.
+    std::vector<std::pair<int64_t, int64_t>> q8_unavailable;
+
+    // The device lock is a raw descriptor, so it needs an owner that gives it back: ORT unloads the
+    // provider library when the Env that loaded it is released, which destroys this static and re-creates
+    // it on the next load. Without this, the second incarnation opened the lock file, flock()ed it, and got
+    // EAGAIN from the *first* incarnation's leaked descriptor -- in the same process -- so every MatMul after
+    // the first fell back to the CPU and said "held by another process". Measured on the QDQ proof graph:
+    // one case took the lock, nine were refused, and the trace read like device contention.
+    ~State() {
+        if (lock_fd >= 0) ::close(lock_fd);  // closing it releases the flock(2) as well
+    }
 };
 
 State& state() {
@@ -140,14 +171,23 @@ bool init(State& s) {
     }
 
     // 3. the device
+    // a real cause (a 64 MiB
+    // MAP_LOCKED heap BO failing EAGAIN because RLIMIT_MEMLOCK was 8 MB) into "no XRT device found", which
+    // reads as a missing driver. Keep the reason device 0 gave -- the last id in the loop is the *nonexistent*
+    // one, whose ENOENT says nothing about why the real device could not be opened.
+    std::string dev_why;
     for (int id = 0; id < 4 && !s.dev; id++) {
         try {
             s.dev = std::make_unique<xrt::device>(id);
-        } catch (const std::exception&) {
+        } catch (const std::exception& e) {
+            if (dev_why.empty()) dev_why = std::string("device ") + std::to_string(id) + ": " + e.what();
         }
     }
-    if (!s.dev) return fail(s, "no XRT device (amdxdna) found");
+    if (!s.dev)
+        return fail(s, dev_why.empty() ? std::string("no XRT device (amdxdna) found")
+                                       : std::string("no XRT device (amdxdna): ") + dev_why);
 
+    s.specs = spec;  // a QDQ kernel is built from these on first use
     for (const auto& [dims, elf] : spec) {
         int m = 0, k = 0, n = 0;
         if (sscanf(dims.c_str(), "%dx%dx%d", &m, &k, &n) != 3 || m <= 0 || k <= 0 || n <= 0)
@@ -168,7 +208,132 @@ bool init(State& s) {
     return true;
 }
 
+// #701 puts a canary in I8Ctx::readback(): a short result row is then detected instead of copied out as a
+// huge negative int32. This branch predates it, so the probe is written to compile on both trees and to start
+// working the moment the canary exists -- an `if constexpr` on a dependent type is not instantiated when the
+// method is absent. What must NOT happen is the silent version: a poisoned row going through the shared
+// epilogue and into the graph, which is the failure mode the canary exists to stop.
+template <class Ctx, class = void>
+struct has_canary : std::false_type {};
+template <class Ctx>
+struct has_canary<Ctx, std::void_t<decltype(std::declval<Ctx&>().canary_short())>> : std::true_type {};
+
+template <class Ctx>
+bool short_read(Ctx& ctx) {
+    if constexpr (has_canary<Ctx>::value) {
+        return ctx.canary_short();
+    } else {
+        (void)ctx;
+        return false;  // no canary in this tree: nothing to ask
+    }
+}
+
+// The canary only sees anything if the row it watches is poisoned before the launch -- #701's own call sites
+// do this inside sync_and_launch(). Like short_read(), absent on a tree without #701.
+template <class Ctx>
+void poison_if_canaried(Ctx& ctx, int n) {
+    if constexpr (has_canary<Ctx>::value) {
+        ctx.poison_canary(n);
+    } else {
+        (void)ctx;
+        (void)n;
+    }
+}
+
+// The QDQ kernel for one (K, N), built the first time it is asked for. Caller holds s.mu.
+Q8Kernel* q8_kernel(State& s, int64_t k, int64_t n) {
+    for (auto& kern : s.q8_kernels)
+        if (kern->k == (int)k && kern->n == (int)n) return kern.get();
+    for (const auto& [fk, fn] : s.q8_unavailable)
+        if (fk == k && fn == n) return nullptr;  // known bad: do not parse the ELF again
+    for (const auto& [dims, elf] : s.specs) {
+        int m = 0, kk = 0, nn = 0;
+        if (sscanf(dims.c_str(), "%dx%dx%d", &m, &kk, &nn) != 3) continue;
+        if (kk != (int)k || nn != (int)n) continue;
+        auto kern = std::make_unique<Q8Kernel>();
+        kern->m = m;
+        kern->k = kk;
+        kern->n = nn;
+        kern->elf = elf;
+        kern->ctx = std::make_unique<I8Ctx>();
+        if (!kern->ctx->init_elf(*s.dev, elf.c_str(), m, kk, nn, 1)) {
+            s.why = "I8Ctx init_elf failed for " + elf + " (" + dims + ") -- check the design M";
+            s.q8_unavailable.emplace_back(k, n);
+            return nullptr;
+        }
+        s.q8_kernels.push_back(std::move(kern));
+        return s.q8_kernels.back().get();
+    }
+    return nullptr;
+}
+
 }  // namespace
+
+bool gemm_q8_raw(const int8_t* a, int64_t m, int64_t k, int64_t n, const int8_t* b, int32_t* c,
+                 std::string* err) {
+    State& s = state();
+    std::lock_guard<std::mutex> g(s.mu);
+    if (!init(s)) {
+        if (err) *err = s.why;
+        return false;
+    }
+    Q8Kernel* kern = q8_kernel(s, k, n);
+    if (!kern) {
+        if (err) *err = "no QDQ kernel for " + std::to_string(k) + "x" + std::to_string(n);
+        return false;
+    }
+    I8Ctx& ctx = *kern->ctx;
+
+    // Weights: the graph's int8 bytes, in the device's own layout, exactly as packB would have written
+    // them from floats -- but without the amax/127 step, because these bytes already carry the graph's
+    // per-column scale.
+    // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
+    // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
+    if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
+        auto* Bm = (int8_t*)ctx.layerB[0]->map();
+        std::memset(Bm, 0, (size_t)ctx.KD * ctx.ND);
+        for (int64_t p = 0; p < k; ++p)
+            for (int64_t j = 0; j < n; ++j)
+                Bm[ctx.bpos((size_t)p, (size_t)j)] = b[p * n + j];
+        ctx.layerB[0]->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        kern->w_ptr = b;
+        kern->w_k = k;
+        kern->w_n = n;
+    }
+
+    // Activations: the graph's int8 bytes, M rows per launch (the ELF's design). Rows past `rows` are
+    // zeroed, which is what the kernel reads for them and what the host path also assumes.
+    for (int64_t row0 = 0; row0 < m; row0 += ctx.MD) {
+        const int rows = (int)std::min<int64_t>(ctx.MD, m - row0);
+        std::memset(ctx.Am, 0, (size_t)ctx.MD * ctx.KD);
+        for (int r = 0; r < rows; ++r)
+            std::memcpy(ctx.Am + (size_t)r * ctx.KD, a + (row0 + r) * k, (size_t)k);
+        // Only row 0 of a launch is watched (that is what #701's canary covers, and deliberately: poisoning
+        // the padded last row of a batched launch fires on every prefill), so a block after the first is
+        // protected exactly as much as the rest of this file's batched paths are.
+        auto launch_and_read = [&ctx, n] {
+            ctx.sync_A(0);
+            poison_if_canaried(ctx, (int)n);
+            auto run = ctx.launch(0);
+            ctx.wait_kernel(run);
+            ctx.readback();
+        };
+        launch_and_read();
+        if (short_read(ctx)) {
+            // Once, as #701's own call sites do: a short read is a race with the completion of the last
+            // row, not a systematic failure.
+            launch_and_read();
+            if (short_read(ctx)) {
+                if (err) *err = "short read (canary) for " + std::to_string(k) + "x" + std::to_string(n) +
+                                 " at row " + std::to_string(row0);
+                return false;  // gemm_q8 redoes every row on the host; never write a poisoned accumulator
+            }
+        }
+        for (int r = 0; r < rows; ++r)
+            for (int64_t j = 0; j < n; ++j) c[(row0 + r) * n + j] = ctx.Cm[(size_t)r * ctx.ND + j];
+    }
+    return true;
+}
 
 bool has_kernel(int64_t k, int64_t n) {
     if (const char* list = env("ONEBIT_EP_NPU_ELFS")) {
@@ -223,6 +388,8 @@ bool gemm_f32(const float* a, int64_t m, int64_t k, int64_t n, const float* b,
     }
 
     // Weights: int8 per column, one scale per column (packB).
+    // ONNX initializers are immutable, so the tensor's address is its identity: a graph that rewrote the bytes
+    // in place would keep the old ones here, and re-uploading on every call would cost what this cache saves.
     if (kern->w_ptr != b || kern->w_k != k || kern->w_n != n) {
         kern->ctx->packB(0, b, (int)k, (int)n, kern->w_scale);
         kern->w_ptr = b;

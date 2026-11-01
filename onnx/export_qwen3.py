@@ -99,7 +99,12 @@ def main() -> int:
                 out = self.inner(
                     input_ids=input_ids, past_key_values=cache, use_cache=True
                 )
-                return out.logits, torch.stack(
+                # One row: the runner takes its argmax from the final position. Measured both ways --
+                # slicing `out.logits` here and running the backbone plus a head on the last hidden
+                # row -- and they are the same time on CPU (the head is 155M of 596M params, so the
+                # prompt cost is the layers). This keeps the 1.4 GB of logits a 2048-token prompt
+                # would otherwise materialise, and it is one line.
+                return out.logits[:, -1:, :], torch.stack(
                     [t for pair in out.past_key_values.to_legacy_cache() for t in pair]
                 )
 

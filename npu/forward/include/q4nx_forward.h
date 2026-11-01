@@ -445,6 +445,14 @@ private:
     // (lm_head_tiles_, 5.35 GB) are both dead on the NPU path and are released.
     std::vector<PackedWeight> lm_head_packed_;
     int                       lm_head_packed_T_ = 0;
+    // The lm head on ternary pb16i images (conv/pack_head_pb16i.py): output.weight is PTQ1_0 in
+    // the folded GGUF, so the image is exact, it is half the int8 codes' bytes, and it runs the
+    // same kernel the MLP's GU launch runs.  Off -- and the head keeps the int8 family -- when
+    // the images or the (K=H, N=<tile>) pb16i ELF are not on disk.
+    bool                      head_pb16i_ = false;
+    std::string head_pb16i_stem(int tile) const {
+        return pb16i_dir_ + "/head_t" + std::to_string(tile) + "_weight";
+    }
     int cur_layer_ = 0;           // layer currently being processed
 
     // ── Gemma4 (per-layer embeddings + KV sharing + extra norms) ──

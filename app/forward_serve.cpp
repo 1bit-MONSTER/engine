@@ -34,6 +34,7 @@
 
 #include "../npu/forward/include/q4nx_forward.h"
 #include "npu_device_lock.h"
+#include "npu_answer_parser.h"
 #include "npu_grammar.h"
 #include "npu_prefix_cache.h"
 #include "npu_sampling.h"
@@ -410,9 +411,24 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         out["created"] = created;
         out["model"] = e.id;
         if (chat) {
-            json choice{{"index", 0},
-                        {"message", {{"role", "assistant"}, {"content", content}}},
-                        {"finish_reason", finish}};
+            // (issue #652 item 3) one shared parser splits what the model wrote into OpenAI's three
+            // parts; a reply that is only tool calls says content: null.
+            const npu::ParsedAnswer ans =
+                npu::parse_answer(content, npu::AnswerFamily::qwen3, opts.tools_sent);
+            json message{{"role", "assistant"}};
+            message["content"] = ans.content_null ? json(nullptr) : json(ans.content);
+            if (!ans.reasoning.empty()) message["reasoning_content"] = ans.reasoning;
+            if (!ans.calls.empty()) {
+                json calls = json::array();
+                for (const auto& c : ans.calls)
+                    calls.push_back({{"id", c.id},
+                                     {"type", "function"},
+                                     {"function", {{"name", c.name}, {"arguments", c.arguments}}}});
+                message["tool_calls"] = calls;
+            }
+            std::string why = finish;
+            if (!ans.calls.empty() && why == "stop") why = "tool_calls";
+            json choice{{"index", 0}, {"message", message}, {"finish_reason", why}};
             if (opts.sample.logprobs) choice["logprobs"] = logprobs_json(lps);
             out["choices"] = json::array({choice});
         } else {
@@ -446,18 +462,54 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             chunk_tpl["created"] = created;
             chunk_tpl["model"] = e.id;
             auto chunks = std::make_shared<std::vector<std::string>>();
-            run([&](const std::string& t, const std::vector<Emitted>& lp) {
-                json chunk = chunk_tpl;
-                if (chat)
-                    chunk["choices"] = json::array({{{"index", 0},
-                                                     {"delta", {{"content", t}}},
-                                                     {"finish_reason", nullptr}}});
-                else
-                    chunk["choices"] = json::array({{{"index", 0}, {"text", t}, {"finish_reason", nullptr}}});
-                if (opts.sample.logprobs && !lp.empty()) chunk["choices"][0]["logprobs"] = logprobs_json(lp);
-                chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+            // The same splitter as the non-streamed path, fed piece by piece, so a streamed reply
+            // and a non-streamed one cannot disagree about what is reasoning and what is content.
+            npu::AnswerStream stream(npu::AnswerFamily::qwen3, opts.tools_sent);
+            auto emit_pieces = [&](const std::string& t, const std::vector<Emitted>& lp) {
+                std::vector<std::pair<bool, std::string>> pieces;
+                stream.feed(t, pieces);
+                for (const auto& [is_reasoning, text] : pieces) {
+                    json chunk = chunk_tpl;
+                    json delta = is_reasoning ? json{{"reasoning_content", text}} : json{{"content", text}};
+                    if (chat)
+                        chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}});
+                    else
+                        chunk["choices"] = json::array({{{"index", 0}, {"text", text}, {"finish_reason", nullptr}}});
+                    // logprobs describe content tokens only (issue #651 item 3): a reasoning delta
+                    // carries no entries.
+                    if (!is_reasoning && opts.sample.logprobs && !lp.empty())
+                        chunk["choices"][0]["logprobs"] = logprobs_json(lp);
+                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                }
                 return true;
-            });
+            };
+            run(emit_pieces);
+            {
+                std::vector<std::pair<bool, std::string>> tail;
+                stream.finish(tail);
+                for (const auto& [is_reasoning, text] : tail) {
+                    json chunk = chunk_tpl;
+                    json delta = is_reasoning ? json{{"reasoning_content", text}} : json{{"content", text}};
+                    chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", nullptr}}});
+                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                }
+                if (!stream.calls().empty()) {
+                    // The calls arrive whole, in one chunk: OpenAI streams argument fragments, and a
+                    // client that appends per index handles either; sending them once is what makes
+                    // the streamed sum equal the non-streamed reply.
+                    json calls = json::array();
+                    for (const auto& c : stream.calls())
+                        calls.push_back({{"index", int(calls.size())},
+                                         {"id", c.id},
+                                         {"type", "function"},
+                                         {"function", {{"name", c.name}, {"arguments", c.arguments}}}});
+                    json chunk = chunk_tpl;
+                    json delta{{"tool_calls", calls}};
+                    if (!chunk_tpl.contains("object") || chunk_tpl["object"].is_null()) chunk["object"] = "chat.completion.chunk";
+                    chunk["choices"] = json::array({{{"index", 0}, {"delta", delta}, {"finish_reason", "tool_calls"}}});
+                    chunks->push_back("data: " + chunk.dump(-1, ' ', false, json::error_handler_t::replace) + "\n\n");
+                }
+            }
             {
                 json tail = chunk_tpl;
                 tail["choices"] = json::array();

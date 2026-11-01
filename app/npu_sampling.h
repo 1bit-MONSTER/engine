@@ -40,6 +40,8 @@
 
 #include <nlohmann/json.hpp>
 
+#include "npu_json_schema.h"
+
 namespace onebit::npu {
 
 // Sentinel for "no seed given": the run picks one, like llama.cpp's LLAMA_DEFAULT_SEED.
@@ -308,11 +310,13 @@ inline Options options_from_body(const nlohmann::json& body) {
             throw std::runtime_error("stop: at most " + std::to_string(kMaxStop) + " sequences");
         o.stop = std::move(stop);
     }
+    bool client_grammar = false;
     if (body.contains("grammar")) {
         const auto& v = body.at("grammar");
         if (!v.is_string()) throw std::runtime_error("grammar: must be a GBNF string");
         o.grammar = v.get<std::string>();
         if (o.grammar.empty()) throw std::runtime_error("grammar: must not be empty");
+        client_grammar = true;
     }
     if (body.contains("response_format")) {
         const auto& v = body.at("response_format");
@@ -323,14 +327,22 @@ inline Options options_from_body(const nlohmann::json& body) {
         } else if (type == "text") {
             // unconstrained, the default
         } else if (type == "json_schema") {
-            throw std::runtime_error(
-                "response_format: json_schema needs a schema-to-GBNF converter this route does not have; "
-                "send grammar (GBNF) or type json_object");
+            // OpenAI's structured-outputs envelope: the schema is the JSON Schema to enforce, `name`
+            // and `strict` describe the caller's intent and are implied by generating inside the
+            // grammar.  A schema this converter cannot honour is a 400 naming what it refused.
+            if (client_grammar)
+                throw std::runtime_error("response_format: json_schema conflicts with grammar; send one of them");
+            if (!v.contains("json_schema")) throw std::runtime_error("response_format: json_schema needs a json_schema object");
+            const auto& envelope = v.at("json_schema");
+            if (!envelope.is_object()) throw std::runtime_error("response_format: json_schema must be an object");
+            if (!envelope.contains("schema"))
+                throw std::runtime_error("response_format: json_schema needs a json_schema.schema");
+            o.grammar = json_schema_to_gbnf(envelope.at("schema"));
         } else {
             throw std::runtime_error("response_format: unknown type '" + type + "'");
         }
     }
-    if (o.json_object && !o.grammar.empty())
+    if (o.json_object && client_grammar)
         throw std::runtime_error("response_format: json_object conflicts with grammar; send one of them");
     return o;
 }

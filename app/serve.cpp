@@ -2074,12 +2074,14 @@ int serve_child(const Options& given) {
                 return;
             }
             const size_t n = h.n_tokens;
-            const double prefill_ms = h.prefill_ms, restore_ms = h.restore_ms;
+            const double prefill_ms = h.prefill_ms, restore_ms = h.restore_ms, share_ms = h.share_ms;
             forward(backends[pick].port, held, -1, id, drop_model, set_model, o.precise, q, r, &watch, &body,
-                    [t0, n, prefill_ms, restore_ms, slot] {
+                    [t0, n, prefill_ms, restore_ms, share_ms, slot] {
                         const double ttft = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
-                        std::fprintf(stderr, "1bit serve: hybrid: %zu prompt tokens: prefill %.0f ms, restore %.0f ms, first byte %.0f ms\n",
-                                     n, prefill_ms, restore_ms, ttft);
+                        // share_ms is the target-1 fd handoff (0 on the file route, where restore_ms is the file)
+                        std::fprintf(stderr, "1bit serve: hybrid: %zu prompt tokens: prefill %.0f ms, restore %.0f ms,"
+                                     " share %.3f ms, first byte %.0f ms\n",
+                                     n, prefill_ms, restore_ms, share_ms, ttft);
                         if (slot->owns_lock()) slot->unlock();
                     });
             return;

@@ -59,6 +59,9 @@ plus `hl_cli_login.py` and a `launch.sh` wrapper) is gone: upstream now knows th
 * `IREE_HAL_AMDGPU_LIBHSA_PATH` pointing at the HSA runtime. The entrypoint defaults it to the
 TheRock's copy and `HL_LIBHSA` overrides it; without it the HRX backend registers **no device**
 ("Available devices: (none)") and every leg fails.
+* `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` on any box whose libhsa page-faults
+  an HRX allocation (engine #715, the nightly libhsa). The entrypoint defaults all three to those
+  values and an explicit setting still wins, so one candidate can measure SVM on if that is wanted.
 * `wiki.test.raw` for the KLD gate (`HL_WIKI`, default `~/models/qwen38/wikitext-2-raw/wiki.test.raw`).
 * A Hyperloom install (upstream, unpatched), `HYPERLOOM_BENCHMARK_BACKEND=bypass`, and Ray on a
   free port (`RAY_ADDRESS=127.0.0.1:6390`: 6379 is taken by a docker redis on this box).

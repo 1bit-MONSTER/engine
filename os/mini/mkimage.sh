@@ -406,7 +406,11 @@ lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([
     echo "tag: $tagv"
     echo "lemonade: $lemver"
     echo "engine: $(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
-    echo "hrx-system: $(git -C "$repo/third_party/hrx-system" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    # the pin the release actually ships: the gitlink recorded in this tree. `git -C third_party/hrx-system
+    # rev-parse HEAD` walks UP to the parent repository when the submodule is not checked out - which is how
+    # the release lane builds - and silently reported the ENGINE commit as the HRX pin (review of #720).
+    hrx=$(git -C "$repo" ls-tree HEAD third_party/hrx-system 2>/dev/null | awk '{print substr($3, 1, 12)}')
+    echo "hrx-system: ${hrx:-unknown}"
     echo "kernel: $kver"
     echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
 } > "$root/etc/1bit/release-identity"

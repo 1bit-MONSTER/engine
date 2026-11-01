@@ -671,18 +671,36 @@ fault at device address 0x…`, and in `dmesg` `[gfxhub] page fault … client C
 
 | HSA runtime (sha256) | SVM mode | result | new gfxhub faults |
 |---|---|---|---:|
-| release-bundled `f6ef689d…` | default | **no HRX0 at all**: `--device: invalid device: HRX0` | 0 (nothing ran) |
+| release-bundled `f6ef689d…` | `HSA_USE_SVM` unset, `HSA_USERPTR_FOR_PAGED_MEM=0` | **no HRX0 at all**: `--device: invalid device: HRX0` | 0 (nothing ran) |
 | release-bundled `f6ef689d…` | `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` | **no HRX0 at all**, same error | 0 (nothing ran) |
-| TheRock nightly `21a66824…` (10.3.0a20261031) | default | server up, first completion **HTTP 500**, 31 fault lines | **+1** |
+| TheRock nightly `21a66824…` (10.3.0a20261031) | `HSA_USE_SVM` unset, `HSA_USERPTR_FOR_PAGED_MEM=0` | server up, first completion **HTTP 500**, 31 fault lines | **+1** |
 | TheRock nightly `21a66824…` | `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1` | **HTTP 200, 260.1 tok/s** | **0** |
 
 So on a dev build the release-bundled libhsa cannot register HRX0 at all, and the nightly libhsa the engine
-picks page-faults under the SVM/userptr placement with CWSR off; the GTT placement is the only arm that both
-serves and stays fault-free. Corroborating evidence from the same session: plain HIP through the same runtime
-is clean (`hipMalloc -> H2D -> memset -> kernel -> D2H -> pinned H2D`, `HIP_PATH_OK`, 0 faults), `rocminfo`
-reports `XNACK enabled: NO` and `Coherent Host Access: FALSE` for `gfx1151`, and `test-backend-ops -o TOP_K -b
-HRX0` passes 484/484 with the placement in place and 0 fault lines. The box's `cwsr_enable` was `0`
-throughout, which is why `auto` no longer keys off it.
+picks page-faults in the mode above.
+
+**Which variable is responsible is narrower than "SVM":** a four-corner table on the same 0.6B file (same binary,
+cache limit 128) shows the fault needs the two knobs *together* — libhsakmt takes the SVM save-area path only when
+pageable userptr is also disabled:
+
+| `HSA_USE_SVM` | `HSA_USERPTR_FOR_PAGED_MEM` | result | new faults |
+|---|---|---|---:|
+| unset (1) | **0** | first completion fails | **+1** |
+| unset (1) | unset (1) — libhsakmt's real default | **ok** | 0 |
+| 0 | unset (1) | **ok** | 0 |
+| 0 | 0 (this placement) | **ok** | 0 |
+
+So the faulting mode is *SVM with pageable userptr disabled* — what the fleet's shell harness had been setting
+(`HSA_USERPTR_FOR_PAGED_MEM=0`, inherited from `612-hrx.sh`) — not libhsakmt's default. That makes this placement one
+of three working modes rather than the only one. It is still the mode `serve` can choose safely on a box whose
+defaults are not known to be clean, because it is the one the #315 soak covered; the true-defaults mode was clean on
+the 0.6B file and its 76 GiB measurement was still pending when this landed.
+
+Corroborating evidence from the same session: plain HIP through the same runtime is clean
+(`hipMalloc -> H2D -> memset -> kernel -> D2H -> pinned H2D`, `HIP_PATH_OK`, 0 faults), `rocminfo` reports
+`XNACK enabled: NO` and `Coherent Host Access: FALSE` for `gfx1151`, and `test-backend-ops -o TOP_K -b HRX0` passes
+484/484 with the placement in place and 0 fault lines. The box's `cwsr_enable` was `0` throughout, which is why
+`auto` no longer keys off it.
 
 Measured on strixhalo (performance mode, 120 W cap), engine `fce3a68` build with the gate:
 

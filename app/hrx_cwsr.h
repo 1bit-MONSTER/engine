@@ -28,8 +28,11 @@
 // that process. --hrx-cwsr-placement picks the mode:
 //   auto (default)  always, unless the user set HRX_SVM=1; a variable the user set still wins.
 //                   Since 2026-10-31 it no longer waits for cwsr_enable: with the TheRock nightly
-//                   libhsa the pageable-SVM placement page-faults on the first HRX graph replay
-//                   with CWSR *off*, the shipped configuration (docs/hrx.md, the A/B table)
+//                   libhsa, SVM placement *with pageable userptr disabled* page-faults on the first
+//                   HRX graph replay even with CWSR off (the shipped configuration). That combination
+//                   is what the fleet's shell harness set, not libhsakmt's default: with both knobs
+//                   at their defaults the 0.6B file ran clean, so this is one of three working modes
+//                   (docs/hrx.md, the two tables)
 //   on              always (a variable the user set still wins, as for every serve variable)
 //   off             never
 // One line in serve's log says what was decided.

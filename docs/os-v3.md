@@ -496,8 +496,10 @@ Not measured, and therefore the risk list for the build:
   not match the config is the phase-V gate's job, and if it wipes, the fallback is `1bit-install
   --adopt-data` grown from the live entry's v2 shell, which has `blkid` and `sfdisk` and can write the
   seed's storage section with explicit ids after inspecting the disk);
-- **the ROCm subset's completeness** — 173 MB is what `ldd` on the release's `llama-server`, `ds4` and
-  `libggml-hrx.so` needs *here*; a box with a different GPU path may want more, so `mkdebs` derives the
+- **the ROCm subset's completeness** — 173 MB is what `ldd` on the release's `llama-server` and
+  `libggml-hrx.so` needs *here*, measured while the release still carried DwarfStar's `ds4` (out of
+  the shipped build since v2026.44, [#757](https://github.com/1bit-MONSTER/engine/pull/757)), so today's
+  set is no larger; a box with a different GPU path may want more, so `mkdebs` derives the
   list from those binaries rather than from a hand-written list;
 - **the ISO repack** (`os/v3/mkstick.sh`) — extracting a pinned ISO to a partition keeps casper working on
   the media it was built for; the gate's phase I proves it, and if extraction is not enough the fallback

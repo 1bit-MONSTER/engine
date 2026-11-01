@@ -43,6 +43,11 @@ so it also works on its own with any OpenAI client.
            [--print-backend | --print-backend-env]
 ```
 
+> **The `ds4` route is not in the shipped build** (owner decision 2026-11-01: the release ships HIP kernels
+> only, so it is built with `-DONEBIT_DS4=OFF`, [#757](https://github.com/1bit-MONSTER/engine/pull/757)).
+> `--device ds4`, `--ds4` and `--ssd-streaming` stay documented below for a `-DONEBIT_DS4=ON` build, which is
+> also the only kind that provides the `ds4-server` they start ([dwarfstar.md](dwarfstar.md)).
+
 One model per process:
 
 | Endpoint | |
@@ -364,7 +369,7 @@ without a GPU.
 | `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
 | `.gguf` | `hybrid` | the HRX llama-server decodes, one slot, from a KV cache a prefill provider computed for the prompt (the NPU engine, named by `--prefill-provider` / `ONEBIT_HYBRID_PREFILL`) and serve restored into the slot; without a provider, HRX prefills too ([hybrid.md](hybrid.md)) |
-| DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md) |
+| DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md). **Not in the shipped build** (`ONEBIT_DS4=OFF`, [#757](https://github.com/1bit-MONSTER/engine/pull/757)): those models run on `hrx` |
 
 What `--device auto` does with a `.gguf` that HRX has no route for. Until RFC #213 stage 3 these
 fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
@@ -495,7 +500,9 @@ PM4-emulation probe, and then HRX registers no device. `serve` sets
 else the build's copy, else the first one under `/opt/rocm-therock`.
 
 The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
-then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH.
+then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH. The
+shipped build has no `-DONEBIT_DS4`, so the `ds4` route needs a `ds4-server` named by `$ONEBIT_DS4`
+or on PATH ([dwarfstar.md](dwarfstar.md)).
 
 Stopping `serve` (SIGTERM, SIGINT) sends each backend SIGTERM and waits
 `ONEBIT_BACKEND_STOP_GRACE_S` seconds (default 30) before SIGKILL, with a warning line

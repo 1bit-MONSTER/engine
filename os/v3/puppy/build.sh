@@ -66,13 +66,14 @@ free_gb=$(free -g | awk '/^Mem:/{print $7}')
 echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
+    ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config GITHUB_ACTIONS=true
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends build-essential libc6-dev dc debootstrap librsvg2-bin \
     zstd xml2 syslinux-utils xorriso squashfs-tools wget curl git ca-certificates xz-utils file psmisc \
-    sudo mtools
+    sudo mtools dosfstools
 echo "dash dash/sh boolean false" | debconf-set-selections
 dpkg-reconfigure dash >/dev/null 2>&1 || true
 ln -sf bash /bin/ash

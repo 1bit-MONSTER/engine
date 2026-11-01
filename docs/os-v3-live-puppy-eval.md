@@ -123,7 +123,7 @@ From the noble64 SFS (measured by extraction) and ResolutePup64's own release no
 
 | need | noble64 build | resolute64 recipe (per its notes) | what v3 must add |
 |---|---|---|---|
-| package manager | `dpkg` + PETget, no `apt` binary | apt + Synaptic | nothing if the notes hold; else ship `apt` |
+| package manager | `dpkg` + PETget, no `apt` binary | **built here: `dpkg` + PETget, no `apt` either** (the recipe's own notes claim apt/Synaptic; the built rootfs has `/usr/bin/apt` absent — measured) | **ship `apt`** if "updates from the Ubuntu feed" is the promise |
 | `python3` | yes (3.12) | yes | — (turns release-check's `sealed-sig` row from SKIP into a check) |
 | `efivarfs` | kernel `=y` | recipe uses the same built-in shape | our kernel: fragment above |
 | `efibootmgr` | yes, `/usr/bin/efibootmgr` | yes (dpkg) | — (engine#709's tool is there) |
@@ -185,11 +185,26 @@ Attempts on 2026-11-01, in order, each one a measured trap:
 | 4 | right after `merge2out`, no error | `set -o pipefail` + `yes \| merge2out`: when `merge2out` exits, `yes` gets SIGPIPE and the pipeline's status kills the build | `set +o pipefail` around that line |
 | 5 | `3builddistro` → petbuild `busybox`: `chroot: failed to run command 'bash': No such file or directory` | the petbuild chroot is an **overlay mount**, and inside Docker the upper/work dirs sit on Docker's overlay rootfs — the kernel refuses it: `mount: ... bad superblock on petbuild`, so the rootfs is empty | build in a **host bind mount** (`BUILD_ROOT`, `/work`), not in the container's rootfs |
 | 6 | `3builddistro` → debootstrap of the `bdrv`: `cannot create … test-dev-null: Permission denied`, "mounted with noexec or nodev" | the petbuild overlay fix moved the build root to `/tmp`, and **`/tmp` here is tmpfs, `nodev`** — debootstrap needs a usable device node in its target | default `BUILD_ROOT` to `$HOME/wt/1bit-puppy-build` (ext4) and **refuse a nodev/noexec build root up front** |
-| 7 | running | — | — |
+| 7 | `mk_iso.sh`, the last step: `mkdosfs: command not found`, then `losetup: /dev/loop16: failed to set up loop device` | the ISO wrapper builds a FAT EFI image with `mkdosfs` (the container had no `dosfstools`) and sets up a loop device (the container has no `/dev/loop-control`) | `dosfstools` in the container; `LOOP_DEVICE=1` passes `/dev/loop-control` through |
+| 8 | `mk_iso.sh` again | as above | — |
 
-Attempt 5 is the informative one: `0setup` ✓, `1download` ✓ (the 26.04 package set, 37k log lines),
-`2createpackages` ✓, then the petbuild stage. So the recipe is proven through package creation and the
-remaining dependency is a filesystem property of the build *environment*, not of Puppy or of our kernel.
+Attempt 7 is the informative one: it went through `0setup` ✓, `1download` ✓, `2createpackages` ✓ and
+every stage of `3builddistro` up to `mk_iso.sh`, and **produced the payload** - `sandbox3/rootfs-complete`
+(1.5 GB), `devx_upup64r_26.04.sfs` 168 MB, `nlsx` 115 MB, `docx` 53 MB, with **our kernel tarball taken
+from `kernel-kit/output`**. It died only in the ISO wrapper, on two container facilities (`mkdosfs`,
+`/dev/loop-control`), neither of which the *installed* (frugal) mode needs: a frugal install is the SFS
+files on a partition, not an ISO.
+
+The built **resolute64 (Ubuntu 26.04) rootfs** measured, which is the base the appliance would run on:
+
+| | resolute64 (built here) | noble64 (CI artifact) |
+|---|---|---|
+| glibc defines up to | **GLIBC_2.43** — exactly our binaries' floor | GLIBC_2.39 (too old: `1bit` and `lemond` need 2.43) |
+| python3 / dpkg / bash / curl | yes / yes / yes / yes | yes / yes / yes / yes |
+| **apt** | **no** (`/usr/bin/apt` absent) | no |
+| efibootmgr / mokutil / sshd | yes / **no** / **no** | yes / no / no |
+| rootfs | **1.5 GB** unpacked | 1.3 GB |
+| `/lib/modules` in the rootfs | empty, by design: the modules come from the zdrv at boot | same |
 
 What is worth saying plainly: the build system is from 2009; it is maintained (a CI matrix builds five
 targets twice a month) and it is *interactive* and environment-sensitive in several places that matter,
@@ -201,7 +216,7 @@ finished ISO is **not** claimed here; G1 stays open until one builds and boots.
 
 | gate | what | status |
 |---|---|---|
-| G1 | a resolute64 Puppy ISO builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **recipe proven through `2createpackages`** (attempt 5); `3builddistro`'s petbuild stage needs the host-filesystem build root that attempt 6 uses — ISO pending |
+| G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **payload green** (attempt 7: rootfs-complete 1.5 GB, devx/nlsx/docx SFS, our kernel in the build); the **ISO wrapper** needs `dosfstools` + `/dev/loop-control` in the container (trap 7) — and the frugal install does not need an ISO at all |
 | G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red**: our kernel's `=m` medium/layer drivers ([Blocker 1](#blocker-1-the-kernel-config)); the fix is `kernel-puppy.fragment` + a kernel rebuild |
 | G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
 | G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |

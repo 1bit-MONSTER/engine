@@ -199,6 +199,33 @@ are carried as data in `configs/q4nx/` so that gap is described rather than gues
 `--tokenizer` is omitted, and warns loudly when it is still missing: a directory without it is not
 servable, and the tool used to report success anyway.
 
+### MoE: a host reference, and the tokenizer the GGUF already carries
+
+`tools/moe_q4nx_ref.py` is the CPU reference a MoE decode path is judged against. It reads a
+Q4NX directory and nothing else, so a disagreement is the container's or the kernel's, never a
+second copy of the weights: float32 throughout, RMSNorm, GQA attention with per-head q/k norm and
+RoPE, and the MoE block exactly as the architecture says — float32 softmax over the bf16 router
+logits, top-k, renormalised weights (`norm_topk_prob`), each chosen expert's SwiGLU streamed from
+the packed tiles. The dense tensors are cached in float32, the experts are decoded per token: the
+same streaming the device routes do.
+
+| subcommand | what it is for |
+|---|---|
+| `tokenizer <gguf> <dir>` | build `tokenizer.json` + `tokenizer_config.json` from the GGUF's own vocabulary, merges and chat template (nothing downloaded, nothing taken from HF) |
+| `logprobs <dir> --prompt ...` | one greedy completion as JSON |
+| `serve <dir> --port 18110` | an OpenAI-compatible endpoint with `logprobs`, so `tools/logprob_agree.py` can compare it with another route |
+| `agree <dir> --route URL` | the same 8 prompts, but **teacher-forced**: the other route's own generated ids are scored by this forward, so every position it produced is compared, not only the positions where both routes happened to emit the same token |
+| `selftest` | the numerics a bug would silently pass |
+
+On `Qwen3-Coder-30B-A3B (Q4NX)`: for *"What is the capital of France? Answer in one word."* it
+returns `Paris`, with the top-3 next-token ids **identical** to the HRX route on the same GGUF
+(59604 / 12095 / 106004), the runner-ups differing by 0.33 nats at p ≈ 1e-6 — the Q6_K → q4_1
+requantisation of `down_proj`, `v_proj` and `lm_head` and nothing else. It is a **reference, not a
+route**: 6 s/token, and a 20-token prompt costs ~5 minutes, because a prompt's 160 expert
+selections per layer touch nearly all 128 experts and stream ~18 GB. MoE prefill belongs on the
+GPU route (`--moe-prefetch`, docs/serve.md); this is the thing that decides whether a kernel is
+right.
+
 ## Serving
 
 The 1bit NPU engine runs the model on the XDNA 2 NPU. With a release package that carries the NPU

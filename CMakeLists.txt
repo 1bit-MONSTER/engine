@@ -430,6 +430,7 @@ if(Python3_Interpreter_FOUND)
     # the HRX hardware gate's judges (docs/hw-gate.md) against a fake server and synthetic logs;
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
+    add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
 endif()
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
@@ -472,6 +473,13 @@ add_test(NAME npu_blocked_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_blocked_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_blocked_layout_test.cpp)
+# The pb16i weight image (q4nx_weight_layout "pb16i"): the same kind of contract, plus the
+# packer that builds the images (tools/q4nx_pb16i.py).  No device, no model: the real-GGUF
+# leg is skipped when the model is not on the machine.
+add_test(NAME npu_pb16i_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
+                 ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
 # Crafted model.q4nx files the loader and the packer must refuse (written at run time); runs in CI.
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)

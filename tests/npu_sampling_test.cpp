@@ -19,6 +19,7 @@
 #include "npu_grammar.h"
 #include "npu_sampling.h"
 
+#include <cmath>
 #include <cstdio>
 #include <cstdlib>
 #include <random>
@@ -31,6 +32,7 @@ using onebit::npu::find_stop;
 using onebit::npu::Grammar;
 using onebit::npu::json_grammar;
 using onebit::npu::kRandomSeed;
+using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
 using onebit::npu::SampleParams;
 using onebit::npu::sample_token;
@@ -309,6 +311,68 @@ void test_gbnf() {
     check(!bad(R"(root ::= "a"{3000})").empty(), "an absurd repetition count is refused");
 }
 
+void test_logprobs() {
+    // Two candidates, logits 0 and ln 2: probabilities 1/3 and 2/3.
+    const double ln2 = std::log(2.0);
+    const std::vector<float> logits = {0.0f, float(ln2)};
+    const auto lp = logprobs_of(logits, 1, 2);
+    check(lp.id == 1, "logprobs report the id that was drawn");
+    check(std::fabs(lp.logprob - float(std::log(2.0 / 3.0))) < 1e-6f,
+          "the drawn token's log-probability is log 2/3");
+    check(lp.top.size() == 2 && lp.top[0].id == 1 && lp.top[1].id == 0,
+          "top_logprobs are ordered by raw logit, highest first");
+    check(std::fabs(lp.top[0].logprob - float(std::log(2.0 / 3.0))) < 1e-6f, "the top entry carries log 2/3");
+    check(std::fabs(lp.top[1].logprob - float(std::log(1.0 / 3.0))) < 1e-6f, "the second entry carries log 1/3");
+
+    // A flat vocabulary: every token is -log(N), and top_logprobs 0 asks for no alternatives.
+    const auto flat = logprobs_of(std::vector<float>(8, 1.5f), 3, 0);
+    check(std::fabs(flat.logprob - float(std::log(1.0 / 8.0))) < 1e-6f, "a flat vocabulary gives -log N");
+    check(flat.top.empty(), "top_logprobs 0 reports no alternatives");
+
+    // Ties go to the lower id, the rule the sampler draws by.
+    const auto tied = logprobs_of(std::vector<float>{1.0f, 1.0f, 1.0f}, 0, 2);
+    check(tied.top.size() == 2 && tied.top[0].id == 0 && tied.top[1].id == 1, "ties keep the lower id first");
+
+    // More alternatives than the vocabulary reports what exists.
+    check(logprobs_of(logits, 1, 100).top.size() == 2, "top_n past the vocabulary reports all of it");
+
+    // The grammar mask can put the drawn token outside the top list, and it still carries its own
+    // value: this is the "before penalties and constraints" convention, measured.
+    const auto masked = logprobs_of(std::vector<float>{5.0f, 0.0f}, 1, 1);
+    check(masked.top.size() == 1 && masked.top[0].id == 0, "top_logprobs is the raw distribution, mask-free");
+    check(masked.logprob < masked.top[0].logprob, "a masked-in token reports its own, lower value");
+
+    // Degenerate inputs are reported, never fatal.
+    check(logprobs_of({}, 0, 4).top.empty(), "an empty vocabulary reports nothing");
+    check(logprobs_of(logits, -1, 1).logprob == 0.0f, "an id outside the vocabulary reports zero");
+}
+
+void test_logprob_options() {
+    auto starts_with = [](const std::string& s, const std::string& prefix) { return s.rfind(prefix, 0) == 0; };
+
+    const auto off = options_from_body(nlohmann::json::parse(R"({"prompt": "hi"})"));
+    check(!off.sample.logprobs && off.sample.top_logprobs == 0, "logprobs is off by default");
+
+    const auto on = options_from_body(nlohmann::json::parse(R"({"logprobs": true, "top_logprobs": 5})"));
+    check(on.sample.logprobs && on.sample.top_logprobs == 5, "logprobs and top_logprobs are read");
+
+    check(options_from_body(nlohmann::json::parse(R"({"logprobs": true})")).sample.top_logprobs == 0,
+          "logprobs without top_logprobs asks for no alternatives");
+    check(options_from_body(nlohmann::json::parse(R"({"logprobs": true, "top_logprobs": 100})")).sample.top_logprobs == 100,
+          "top_logprobs 100 is the top of the range and is accepted");
+
+    check(starts_with(error_of(nlohmann::json::parse(R"({"logprobs": 1})")), "logprobs:"),
+          "logprobs must be true or false, not a number");
+    check(starts_with(error_of(nlohmann::json::parse(R"({"logprobs": true, "top_logprobs": 101})")), "top_logprobs:"),
+          "top_logprobs above 100 is refused");
+    check(starts_with(error_of(nlohmann::json::parse(R"({"logprobs": true, "top_logprobs": -1})")), "top_logprobs:"),
+          "a negative top_logprobs is refused");
+    check(starts_with(error_of(nlohmann::json::parse(R"({"logprobs": true, "top_logprobs": 2.5})")), "top_logprobs:"),
+          "a fractional top_logprobs is refused");
+    check(starts_with(error_of(nlohmann::json::parse(R"({"top_logprobs": 3})")), "top_logprobs:"),
+          "top_logprobs without logprobs: true is refused rather than ignored");
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -354,7 +418,7 @@ void test_request_parsing() {
                .empty(),
           "grammar and json_object together are refused");
     // Nothing else in the body is inspected: the parser stays backward compatible.
-    check(error_of(nlohmann::json::parse(R"({"prompt": "hi", "n": 3, "logprobs": true})")).empty(),
+    check(error_of(nlohmann::json::parse(R"({"prompt": "hi", "n": 3})")).empty(),
           "fields this route does not implement are still ignored");
 }
 
@@ -366,6 +430,8 @@ int main() {
     test_stop();
     test_json_grammar();
     test_gbnf();
+    test_logprobs();
+    test_logprob_options();
     test_request_parsing();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;

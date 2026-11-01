@@ -29,6 +29,15 @@
 # kernel build already takes a fragment), then os/v3/puppy/mk-huge-kernel.sh packages the result.
 
 # --- the medium: CD (the ISO in QEMU, and a stick written as an ISO) -------------------------------
+# the chain UNDER the next four lines, and the reason they are here: kconfig will not let a tristate be
+# `=y` while a symbol it depends on is `=m` - `make olddefconfig` does not fail, it quietly reduces the
+# child back to `=m`. Ours are all `=m` today (measured in /boot/config-7.3.0-rc4-1bit-perfopt+: SCSI,
+# SCSI_MOD, SCSI_COMMON, CDROM, ATA, SATA_AHCI), so a fragment that set only the drivers would be
+# silently half-applied - the trap the per-symbol check in os/v3/puppy/README.md exists to catch.
+CONFIG_SCSI=y                           # [m]  every one of the medium drivers below depends on this
+CONFIG_CDROM=y                          # [m]  BLK_DEV_SR is the CD on top of it
+CONFIG_ATA=y                            # [m]  the q35/real controller the CD sits on
+CONFIG_SATA_AHCI=y                      # [m]  ... and its AHCI driver (QEMU -cdrom on q35 is ich9-ahci)
 CONFIG_BLK_DEV_SR=y                     # [m]  the initrd reads /dev/sr0 before any module load
 CONFIG_ISO9660_FS=y                     # [m]
 CONFIG_BLK_DEV_SD=y                     # [m]  a USB stick written the Puppy way

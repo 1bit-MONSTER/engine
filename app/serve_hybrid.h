@@ -58,6 +58,8 @@
 #if !defined(_WIN32)
 #include <fcntl.h>
 #include <signal.h>
+#include <sys/socket.h>
+#include <sys/un.h>
 #include <sys/wait.h>
 #include <unistd.h>
 #endif
@@ -70,7 +72,8 @@ struct Outcome {
     bool handed_over = false;   // the slot holds the provider's KV; the body carries id_slot/cache_prompt
     size_t n_tokens = 0;
     double prefill_ms = 0;      // the provider's own figure when it gave one, else wall time
-    double restore_ms = 0;
+    double restore_ms = 0;      // file route: the restore; shared route: the adopt
+    double share_ms = 0;        // shared route: export + fd handoff, before the provider runs
     std::string why;            // when not handed over: the reason, for one stderr line
 };
 
@@ -138,13 +141,106 @@ inline Run run_provider(const std::vector<std::string>& argv, const std::vector<
 #endif
 }
 
+#if !defined(_WIN32)
+
+// Target 1, cross-process: the decoder exports each of its KV buffers as a dma-buf and hands the fds over a unix
+// socket (Linux cannot reopen a dma-buf from /proc/<pid>/fd, measured). The engine is the middle of that: it
+// listens, receives {fd, offset, size, layout} per region, and passes the fds on to the provider as inherited
+// descriptors, so the provider maps the decoder's own KV memory instead of writing a state file.
+struct KvShare {
+    std::string header;      // the decoder's JSON: region descriptors + the context params it built its cache with
+    std::vector<int> fds;    // the regions, in the decoder's buffer order
+
+    void close_all() {
+        for (int fd : fds) {
+            if (fd >= 0) ::close(fd);
+        }
+        fds.clear();
+    }
+    ~KvShare() { close_all(); }
+};
+
+// bind + listen on the slot's socket path; -1 on failure (why set)
+inline int kvshare_listen(const std::string& path, std::string* why) {
+    const int fd = ::socket(AF_UNIX, SOCK_STREAM, 0);
+    if (fd < 0) { *why = std::string("socket: ") + std::strerror(errno); return -1; }
+    sockaddr_un addr{};
+    addr.sun_family = AF_UNIX;
+    if (path.size() >= sizeof(addr.sun_path)) { *why = "socket path too long"; ::close(fd); return -1; }
+    std::memcpy(addr.sun_path, path.c_str(), path.size() + 1);
+    ::unlink(path.c_str());
+    if (::bind(fd, reinterpret_cast<sockaddr*>(&addr), sizeof(addr)) != 0) {
+        *why = "bind " + path + ": " + std::strerror(errno);
+        ::close(fd);
+        return -1;
+    }
+    if (::listen(fd, 1) != 0) { *why = std::string("listen: ") + std::strerror(errno); ::close(fd); return -1; }
+    return fd;
+}
+
+// one message: [uint32 length][JSON header], the region fds riding along as SCM_RIGHTS
+inline bool kvshare_recv(int lfd, KvShare* out, std::string* why) {
+    const int fd = ::accept(lfd, nullptr, nullptr);
+    if (fd < 0) { *why = std::string("accept: ") + std::strerror(errno); return false; }
+
+    char buf[4 + 65536];
+    std::vector<char> control(CMSG_SPACE(64 * sizeof(int)));
+    size_t got = 0;
+    bool have_control = false;
+    for (;;) {
+        if (got >= 4) {
+            uint32_t len = 0;
+            std::memcpy(&len, buf, 4);
+            if (len > sizeof(buf) - 4) { *why = "the decoder's header is too large"; ::close(fd); return false; }
+            if (got >= 4 + (size_t) len) break;
+        }
+        ssize_t n;
+        if (!have_control) {
+            msghdr msg{};
+            iovec iov{ buf, sizeof(buf) };
+            msg.msg_iov = &iov;
+            msg.msg_iovlen = 1;
+            msg.msg_control = control.data();
+            msg.msg_controllen = control.size();
+            n = ::recvmsg(fd, &msg, 0);
+            if (n > 0) {
+                have_control = true;
+                for (cmsghdr* c = CMSG_FIRSTHDR(&msg); c != nullptr; c = CMSG_NXTHDR(&msg, c)) {
+                    if (c->cmsg_level != SOL_SOCKET || c->cmsg_type != SCM_RIGHTS) continue;
+                    const size_t n_fds = (c->cmsg_len - CMSG_LEN(0)) / sizeof(int);
+                    for (size_t i = 0; i < n_fds; ++i) {
+                        int region_fd = -1;
+                        std::memcpy(&region_fd, CMSG_DATA(c) + i * sizeof(int), sizeof(int));
+                        ::fcntl(region_fd, F_SETFD, 0); // the provider inherits them through exec
+                        out->fds.push_back(region_fd);
+                    }
+                }
+            }
+        } else {
+            n = ::recv(fd, buf + got, sizeof(buf) - got, 0);
+        }
+        if (n < 0 && errno == EINTR) continue;
+        if (n <= 0) { *why = "the decoder closed the socket before sending the regions"; ::close(fd); return false; }
+        got += (size_t) n;
+    }
+    ::close(fd);
+    uint32_t len = 0;
+    std::memcpy(&len, buf, 4);
+    out->header.assign(buf + 4, len);
+    return !out->fds.empty();
+}
+
+#endif
+
 class Prefill {
-public:
-    // provider: the program; elfs: passed as --elfs when not empty; slot_dir: the backend's
+public:    // provider: the program; elfs: passed as --elfs when not empty; slot_dir: the backend's
     // --slot-save-path (the state files go there, by bare name, as llama-server requires)
     Prefill(std::string provider, std::string elfs, std::string slot_dir, std::string model)
         : provider_(std::move(provider)), elfs_(std::move(elfs)), slot_dir_(std::move(slot_dir)), model_(std::move(model)) {
         if (const char* t = std::getenv("ONEBIT_HYBRID_PREFILL_TIMEOUT_S"); t && *t) timeout_s_ = std::max(1, std::atoi(t));
+        // target 1: the decoder exports its KV region (ONEBIT_KV_SHARE, which this process's children inherit) and
+        // the provider prefills into it instead of writing a state file
+        if (const char* v = std::getenv("ONEBIT_KV_SHARE"); v && *v) shared_ = true;
     }
 
     const std::string& provider() const { return provider_; }
@@ -194,6 +290,14 @@ public:
         const std::vector<int32_t> ids = tokenize(port, prompt, &o.why);
         if (ids.size() < 2) { if (o.why.empty()) o.why = "prompt shorter than 2 tokens"; return o; }
         o.n_tokens = ids.size();
+        if (shared_) {
+            Outcome shared = prepare_shared(port, ids, o);
+            if (shared.handed_over) {
+                body["id_slot"] = 0;
+                body["cache_prompt"] = true;
+            }
+            return shared;
+        }
         const unsigned n = ++seq_;
         const std::string stem = "hybrid-" + std::to_string(n);
         const std::filesystem::path tokens = std::filesystem::path(slot_dir_) / (stem + ".tokens");
@@ -262,7 +366,119 @@ public:
     }
 
 private:
+#if !defined(_WIN32)
+    // Target 1: the provider prefills into the decoder's own KV memory. No state file is written or read; the
+    // only things that cross a boundary are the region fds and a few hundred bytes of JSON.
+    Outcome prepare_shared(int port, const std::vector<int32_t>& ids, Outcome& o) {
+        const unsigned n = ++seq_;
+        const std::string stem = "kvshare-" + std::to_string(n);
+        const std::filesystem::path tokens = std::filesystem::path(slot_dir_) / (stem + ".tokens");
+        const std::filesystem::path layout = std::filesystem::path(slot_dir_) / (stem + ".json");
+        const std::filesystem::path sockpath = std::filesystem::path(slot_dir_) / (stem + ".sock");
+        {
+            std::ofstream f(tokens);
+            for (int32_t id : ids) f << id << '\n';
+            if (!f) { o.why = "cannot write " + tokens.string(); return o; }
+        }
+
+        // 1. listen, so the decoder has somewhere to hand the fds; 2. it exports and connects
+        std::string why;
+        const int lfd = kvshare_listen(sockpath.string(), &why);
+        if (lfd < 0) { o.why = "kv share: " + why; return o; }
+        httplib::Client c("127.0.0.1", port);
+        c.set_read_timeout(600);
+        const auto t0 = std::chrono::steady_clock::now();
+        auto r = c.Post("/slots/0?action=share", json{{"socket", sockpath.string()}}.dump(), "application/json");
+        if (!r || r->status != 200) {
+            ::close(lfd);
+            std::error_code ec;
+            std::filesystem::remove(tokens, ec);
+            std::filesystem::remove(sockpath, ec);
+            o.why = "share answered " + std::to_string(r ? r->status : -1) + (r ? ": " + r->body.substr(0, 200) : "");
+            return o;
+        }
+        // the decoder numbers every export; adopt has to quote it or it refuses the cells
+        uint64_t share_id = 0;
+        try {
+            share_id = json::parse(r->body).at("share_id").get<uint64_t>();
+        } catch (const std::exception&) {
+            ::close(lfd);
+            std::error_code ec;
+            std::filesystem::remove(tokens, ec);
+            std::filesystem::remove(sockpath, ec);
+            o.why = "share reply has no share_id";
+            return o;
+        }
+        KvShare share;
+        const bool got = kvshare_recv(lfd, &share, &why);
+        ::close(lfd);
+        std::error_code ec;
+        std::filesystem::remove(sockpath, ec);
+        o.share_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t0).count();
+        if (!got) {
+            std::filesystem::remove(tokens, ec);
+            o.why = "kv share: " + (why.empty() ? std::string("no regions from the decoder") : why);
+            return o;
+        }
+        {
+            std::ofstream f(layout);
+            f << share.header;
+            if (!f) { std::filesystem::remove(tokens, ec); o.why = "cannot write " + layout.string(); return o; }
+        }
+
+        // 3. the provider maps those fds as its own KV tensors and prefills the prompt into them
+        std::string fds_arg;
+        for (size_t i = 0; i < share.fds.size(); ++i) {
+            fds_arg += (i ? "," : "") + std::to_string(share.fds[i]);
+        }
+        std::vector<std::string> argv = {provider_, "--tokens", tokens.string(), "--model", model_,
+                                         "--layout", layout.string(), "--fds", fds_arg};
+        if (!elfs_.empty()) { argv.push_back("--elfs"); argv.push_back(elfs_); }
+        const auto t1 = std::chrono::steady_clock::now();
+        const Run run = run_provider(argv, {"ONEBIT_HYBRID_BACKEND_URL=http://127.0.0.1:" + std::to_string(port)}, timeout_s_);
+        o.prefill_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t1).count();
+        std::filesystem::remove(tokens, ec);
+        std::filesystem::remove(layout, ec);
+        if (run.code != 0) {
+            o.why = run.code == -2 ? "provider timed out after " + std::to_string(timeout_s_) + " s"
+                                   : "provider exited " + std::to_string(run.code);
+            return o;
+        }
+
+        // 4. the decoder takes the cells over: no file, no copy (llama_kv_cells_adopt)
+        json adopt = {{"tokens", ids}, {"share_id", share_id}};
+        const auto t2 = std::chrono::steady_clock::now();
+        auto ra = c.Post("/slots/0?action=adopt", adopt.dump(), "application/json");
+        o.restore_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();
+        if (!ra || ra->status != 200) {
+            o.why = "adopt answered " + std::to_string(ra ? ra->status : -1) + (ra ? ": " + ra->body.substr(0, 200) : "");
+            return o;
+        }
+        try {
+            const json j = json::parse(ra->body);
+            const size_t adopted = j.value("n_adopted", size_t(0));
+            if (adopted != ids.size()) {
+                o.why = "adopt took " + std::to_string(adopted) + " of " + std::to_string(ids.size()) + " cells";
+                return o;
+            }
+            if (j.contains("timings") && j["timings"].contains("adopt_ms")) o.restore_ms = j["timings"]["adopt_ms"].get<double>();
+        } catch (const std::exception&) {
+            o.why = "adopt reply is not JSON";
+            return o;
+        }
+        o.handed_over = true;
+        return o;
+    }
+#else
+    Outcome prepare_shared(int, const std::vector<int32_t>&, Outcome& o) {
+        o.why = "the shared KV handoff needs unix sockets (POSIX only)";
+        return o;
+    }
+#endif
+
+private:
     std::string provider_, elfs_, slot_dir_, model_;
+    bool shared_ = false;       // target 1: fds instead of a state file
     int timeout_s_ = 600;
     std::atomic<unsigned> seq_{0};
     std::mutex slot_mu_;

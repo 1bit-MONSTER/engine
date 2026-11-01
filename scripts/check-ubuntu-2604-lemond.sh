@@ -33,8 +33,11 @@ name=1bit-u2604-check-$$
 runtime=${CONTAINER_RUNTIME:-docker}
 opts=(-d --name "$name" -v "$pkg:/tmp/engine.tar.zst:ro" -v "$(dirname "$model"):/models:ro")
 if [ "$gpu" = --gpu ]; then
-    opts+=(--device /dev/kfd --device /dev/dri --group-add "$(getent group render | cut -d: -f3)"
-           --group-add "$(getent group video | cut -d: -f3)" -v /opt/rocm-therock:/opt/rocm-therock:ro)
+    render_gid=$(getent group render | cut -d: -f3)
+    video_gid=$(getent group video | cut -d: -f3)
+    opts+=(--device /dev/kfd --device /dev/dri --group-add "$render_gid"
+           --group-add "$video_gid" -v /opt/rocm-therock:/opt/rocm-therock:ro
+           -e RENDER_GID="$render_gid" -e VIDEO_GID="$video_gid")
 fi
 trap '$runtime rm -f "$name" >/dev/null 2>&1' EXIT
 $runtime run "${opts[@]}" ubuntu:26.04 sleep infinity >/dev/null
@@ -84,7 +87,18 @@ chown -R lemonade:lemonade /var/lib/lemonade
 
 step "lemond"
 cd /var/lib/lemonade
-runuser -u lemonade -- env HOME=/var/lib/lemonade $drop_env "${extra_env[@]}" /usr/bin/lemond >/tmp/lemond.log 2>&1 &
+# runuser gives the user only the groups of the container image /etc/group, so the
+# render GID that --group-add put on the main container process is gone by the time lemond runs:
+# /dev/kfd is root:render, HSA then cannot open it, libggml-hrx registers no device and
+# llama-server refuses --device HRX0 with "invalid device: HRX0" (measured 2026-10-31 on Strix
+# Halo). setpriv keeps the host render and video GIDs, so the --gpu path reaches HRX0.
+launcher=(runuser -u lemonade --)
+if [ "$GPU" = --gpu ]; then
+    # --init-groups and --groups are mutually exclusive in setpriv (it exits 1 on both), and the
+    # only supplementary groups this process needs are the two that open the GPU nodes.
+    launcher=(setpriv --reuid lemonade --regid "$(id -g lemonade)" --groups "$RENDER_GID,$VIDEO_GID" --)
+fi
+"${launcher[@]}" env HOME=/var/lib/lemonade $drop_env "${extra_env[@]}" /usr/bin/lemond >/tmp/lemond.log 2>&1 &
 for _ in $(seq 60); do curl -sf localhost:13305/api/v1/health >/dev/null && break; sleep 1; done
 curl -s localhost:13305/api/v1/models | python3 -c "import json,sys; [print(\"listed:\", m[\"id\"], m[\"recipe\"]) for m in json.load(sys.stdin)[\"data\"]]"
 curl -sf -m 600 localhost:13305/api/v1/load -H "Content-Type: application/json" -d "{\"model_name\": \"Check-HRX\", \"ctx_size\": 4096}"; echo
@@ -97,7 +111,10 @@ step "what lemond started"
 # which under pipefail would kill pgrep and abort the container script. (This block is a single-quoted
 # string, so no apostrophes and no $'...' in here: sed -n 1p reads to the end, head does not.)
 pid=$(pgrep -x llama-server | sed -n 1p)
-tr "\0" " " </proc/$pid/cmdline; echo
+# the argv is where the device is named: 1bit serve logs the memory it checked but not the device,
+# so grepping lemond.log for HRX0 (as this script did until 2026-10-31) fails on a working run
+cmdline=$(tr "\0" " " </proc/$pid/cmdline)
+printf "%s\n" "$cmdline"
 runuser -u lemonade -- cat /proc/$pid/environ | tr "\0" "\n" | grep -E "^(GGML_HRX|HSA_|HRX_|IREE_)" | sort
 grep -E "1bit serve|HRX|hrx" /tmp/lemond.log | tail -n 20
 fail=0
@@ -108,6 +125,7 @@ env2=$(runuser -u lemonade -- cat /proc/$pid/environ | tr "\0" "\n")
 grep -qx GGML_HRX_STRICT=1 <<<"$env2" || { echo "FAIL: no GGML_HRX_STRICT=1"; fail=1; }
 # hrx.hrx_bin set to a path skips Lemonade'"'"'s install of its own HRX build (cache/bin/llamacpp-hrx)
 [ ! -e /var/lib/lemonade/.cache/lemonade/bin/llamacpp-hrx ] || { echo "FAIL: lemond installed its own HRX build"; fail=1; }
-[ "$GPU" != --gpu ] || grep -q "HRX0" /tmp/lemond.log || { echo "FAIL: no HRX0 in the backend log"; fail=1; }
+# --gpu means the engine HRX llama-server on the GPU, i.e. the backend was started with --device HRX0
+[ "$GPU" != --gpu ] || grep -q -- "--device HRX0" <<<"$cmdline" || { echo "FAIL: the backend was not started on HRX0"; fail=1; }
 [ $fail = 0 ] && echo "PASS" || exit 1
 '

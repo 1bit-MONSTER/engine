@@ -17,7 +17,7 @@ limitations under the License.
 # Releases
 
 The first release goes out when every item on the release checklist is done; it is not published
-yet.
+yet — see [v2026.44](#v202644-1-nov-2026--the-first-release) for the candidate that is ready.
 
 1bit engine is pinned upstream: every backend it builds is a submodule at a fixed commit
 (`third_party/`), and the `bump-*` workflows open a PR whenever an upstream moves. The engine
@@ -26,6 +26,50 @@ everything from scratch at the current pins, so each release carries that week's
 
 Releases are tagged `v<ISO year>.<ISO week>` (`v2026.40`), like Lemonade's `2026.39.1`; a second
 release in the same week gets `.1`.
+
+## v2026.44 (1 Nov 2026) — the first release
+
+Ships candidate **c18** (`rc-2026-10-31c`), published byte for byte: the three files on the release page are that
+gated candidate under their release names, nothing was rebuilt. Raw image (what the `.img.zst` decompresses to):
+**2,395,996,160 B**, sha256 `cd1ef96b9093d040ce7d8ace45e51845241ae06284a5582e9882b303e55bc509` — this is the value
+a stick write is verified against.
+
+| component | pin |
+|---|---|
+| engine | `e7446eef35e4452ee26baff57407d1c289870cb2` |
+| HRX (llama.cpp fork, ggml-hrx) | `4a58da9b087d` |
+| hrx-system | `82804197bcbe` |
+| Lemonade Server | `2026.46.0~1.c4132113` (our fork, the `onebit` recipe) |
+| kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
+| NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
+
+Artifacts — sizes and sha256 exactly as the release's own `SHA256SUMS` records them:
+
+| file | size | sha256 |
+|---|---|---|
+| `1bit-os-v2026.44.img.zst` | 396,817,243 B | `516e061526d1f0974ab6715a20600e4674ba785c56afa44a688902855b4879c0` |
+| `1bit-os-v2026.44.efi` | 105,682,560 B | `c14bf687dac50055cede9c0cce1e43f331e8485142e6488ad9cb62aa85280815` |
+| `lemonade-onebit-v2026.44-linux-x86_64.tar.zst` | 38,926,645 B | `910f78ceab08451fd47ec83bcab28f4b764df1112b35f68fe51513292fb353e3` |
+
+What was measured before it shipped (Strix Halo, 31 October):
+
+| check | result |
+|---|---|
+| build, `ctest`, package | PASS, **51/51** tests |
+| hardware gate at the shipped pins | **1959/1959** kernel ops, known answers 7 models × 9 cases, KLD 5/5 (mean ≤1e-6), needles 4/4, placement all-on-HRX |
+| NPU unit | **89.29 and 86.58 tok/s** (two independent rows, same M=16 decode twin) |
+| `1bit.check` (kernel/initrd and as-the-stick), VMTEST, VMTEST-RELEASE | PASS, PASS, **PASS (9 PASS, 9 SKIP, 0 FAIL)** |
+| QEMU boot phases A/R/I/B | exit 0 in all four; R and B `RESULT: PASS (18 checks, no failures)` |
+| live USB boot on the board, Secure Boot on, `1bit-release-check` | **18 checks, 0 failures**: HRX chat 299.5 tok/s, CPU chat 178.6 tok/s, TTFT 21.8 ms |
+| full install to the internal NVMe, then boot from it | **18/0 again**: HRX chat 301.8 tok/s, decode bench 178.3 tok/s |
+| `sha256sum -c SHA256SUMS`, `sbverify` on the `.efi` | 3/3 OK, signature OK |
+
+Known issues in this image, all fixed in the next candidate (the os/v2 work): the kernel log scrolls over the boot
+screen and the chooser banner prints a stale Lemonade version (#703, #704); two menus at boot, no visible
+network/DHCP progress, a small menu font and a short highlight bar (#705, #707); the live stick's `/data` is 2 GB, so
+no catalogue model can be pulled on the live system (#706); `1bit-install` registers no firmware boot entry and shows
+little progress (#709, #710); booted from the stick with an installed disk present, the stick's kernel can take the
+disk's data partition (#711); the installed appliance is still the live image on disk (#712).
 
 ## v2026.43 (candidate, 23 Oct)
 

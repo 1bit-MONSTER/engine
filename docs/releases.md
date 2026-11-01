@@ -90,7 +90,7 @@ Release sha and pins (the submodules this candidate is built from):
 | private NPU runtime | `ce9fa59adf95` |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
-| DwarfStar / tokenizers | `5b013dc1bb` / `3012770722` |
+| DwarfStar (reference fork only, not shipped since v2026.44) / tokenizers | `5b013dc1bb` / `3012770722` |
 
 | artifact | status |
 |---|---|
@@ -179,7 +179,7 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend: HRX (and the CPU, from the same llama-server), DwarfStar, and the NPU engine's runtime (the NPU route is in progress, [below](#the-npu-engine)). No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the shipped build since v2026.44 (HIP kernels only, owner decision 2026-11-01; [dwarfstar.md](dwarfstar.md)); no Vulkan or ROCm llama.cpp since RFC #213 stage 3. No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
@@ -308,7 +308,7 @@ amdclang builds them; credited in `NOTICE-BINARY`) packed in `hrx/llama/bin`. Af
 - **Licensed:** `LICENSE`, `NOTICE`, `LICENSE-BINARY` and `NOTICE-BINARY` are in the tarball.
 - **Libraries found:** `ldd` (with `ROCR_VISIBLE_DEVICES=-1`) finds every library each packed
   program and library needs, except the TheRock runtime the package documents (HIP, hipBLAS(Lt),
-  rocBLAS, HSA, which DwarfStar links).
+  rocBLAS, HSA - the same libraries the reference DwarfStar build linked).
 - **Links inside:** every symlink in the engine tarball and in the Lemonade + onebit tarball is
   relative and resolves inside the package (`pack_outside_links`); the `libggml*.so` ->
   `.so.0` links stay links. Lemonade's build links its web app's KaTeX fonts to the build
@@ -347,7 +347,7 @@ Before the first stage runs, `weekly.sh` checks what the machine must have (the 
 rehearsal found these only after the build) and stops with a message naming what is missing:
 
 - **bumps, build:** TheRock in `/opt/rocm-therock`, or `-DONEBIT_HRX_TOOLCHAIN=<dir>` in
-  `WEEKLY_CMAKE_ARGS`; `hipcc` for DwarfStar, in TheRock or `/opt/rocm`, or `ROCM_PATH`.
+  `WEEKLY_CMAKE_ARGS`; `hipcc` only for the optional DwarfStar build (`ONEBIT_DS4=ON`, off since v2026.44), in TheRock or `/opt/rocm`, or `ROCM_PATH`.
 - **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
   (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for 1bit OS,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
@@ -363,7 +363,7 @@ rehearsal found these only after the build) and stops with a message naming what
 |---|---|
 | `bump-lemonade/*` | Lemonade's LLM suite through the onebit recipe on HRX ([lemonade.md](lemonade.md)) |
 | `bump-laya/*` | `tests/laya_route_e2e.sh` on the pinned checkpoint |
-| `bump-ds4/*` | DwarfStar's routed-MoE test (`DS4_TEST=1 scripts/build-ds4.sh`) |
+| `bump-ds4/*` | DwarfStar's routed-MoE test (`DS4_TEST=1 scripts/build-ds4.sh`) — kept for the reference fork; the backend is not shipped since v2026.44 |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
 | `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device); the xdna-driver pin is the `amdxdna` kernel driver, which the release does not build: check it on Strix Halo with the module loaded ([npu.md](npu.md), "The XDNA driver") |
 

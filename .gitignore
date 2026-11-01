@@ -26,3 +26,7 @@ __pycache__/
 
 # ctest run in the source tree (kept out of the PR by the copyright check)
 Testing/
+
+# the HRX toolchain the build fetches (scripts/fetch-rocm-sdk.sh, config/hrx-toolchain.config):
+# a multi-gigabyte venv of TheRock's ROCm SDK at the pinned version, not part of the source
+third_party/toolchain/

@@ -58,7 +58,8 @@ stays clean) and puts `ds4-server`, `ds4` and `ds4-bench` in `<prefix>/hip`.
 `DS4_TEST=1` then runs DwarfStar's model-free routed-MoE test on the GPU.
 
 **HIP (Strix Halo)** needs HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA and hipCUB. The
-script takes `ROCM_PATH`, else TheRock's SDK
+script takes `ROCM_PATH`, else the pinned toolchain under `third_party/toolchain`
+(`scripts/fetch-rocm-sdk.sh`, [hrx.md](hrx.md) "The toolchain"), else TheRock's SDK
 (`/opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel`), else `/opt/rocm`.
 It passes that SDK's `include/` with `-isystem`: clang otherwise searches it after
 `/usr/include`, and a distro HIP there (another version) shadows TheRock's headers

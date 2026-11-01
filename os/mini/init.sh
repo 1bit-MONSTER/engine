@@ -170,10 +170,17 @@ grep -q " /data " /proc/mounts && [ -e /data/.installed ] && INSTALLED=1
 # below was silently lost (the installed boot reported INSTALLED on screen and no marker in /etc/1bit)
 mkdir -p /etc/1bit 2>/dev/null
 MODE=live
+# #704: the version on the banner comes from the image itself. /etc/1bit/release-identity is written by
+# mkimage.sh out of the Lemonade package that is being shipped and the tree the image was built from, so
+# a banner can never again say v2026.43 on a stick carrying Lemonade 2026.46.0 - and 1bit-release-check
+# reports the same file instead of SKIPping a missing identity.
+ident() { sed -n "s/^$1: *//p" /etc/1bit/release-identity 2>/dev/null | head -n 1; }
+TAG=$(ident tag); TAG=${TAG:-dev}
+LEMVER=$(ident lemonade)
 if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
-      echo "  1bit OS, Lemonade Server appliance   v2026.43  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  1bit OS, Lemonade Server appliance   $TAG${LEMVER:+  (Lemonade $LEMVER)}  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
       echo "  Lemonade Server by AMD, running on the 1bit engine"
       echo "  ------------------------------------------------------------------------------"
       echo "   1) Lemonade appliance            (default, starts in 12s)"

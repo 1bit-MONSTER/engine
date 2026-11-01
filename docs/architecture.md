@@ -43,8 +43,11 @@ the README is the short version.
   stream is recorded there.
 - **ONNX Runtime**, linked in-process behind `-DONEBIT_ORT`, with our own execution provider that
   claims MatMul and runs it on the NPU runtime ([onnx.md](onnx.md), [onnx-pack.md](onnx-pack.md)).
-- **DwarfStar**, for DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next in its own GGUFs, with SSD
-  expert streaming ([dwarfstar.md](dwarfstar.md)).
+- ~~**DwarfStar**~~ — **out of the shipped build** since v2026.44 (owner decision, 2026-11-01): its DeepSeek V4
+  Flash / GLM 5.x / Qwen3.8-Flash-Next route is antirez's CUDA kernels through a HIP shim plus hipBLAS, not our HIP
+  kernels, and the release ships HIP kernels only. Those models run on **HRX**. The measurements and the SSD
+  streaming design stay on [dwarfstar.md](dwarfstar.md) as reference, and the fork
+  [1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4) is kept for it.
 - **Laya**, opt-in, which picks where each request runs ([laya.md](laya.md)), and **the Project
   Manager**, ZAYA1-8B delegating to expert models ([pm.md](pm.md)).
 - **Every Hugging Face model architecture**, mapped to a backend by a registry and kept current by
@@ -75,8 +78,8 @@ a written step list ([kernel.md](kernel.md)).
 ## Pinned sources
 
 HRX is pinned to AMD's hrx-system and ggml-hrx with our commits on top, kept current by `bump-hrx`
-([hrx.md](hrx.md#pinned-sources-kept-current)); Lemonade, Laya, the tokenizers library and
-DwarfStar each have their own bump workflow ([releases.md](releases.md#bumps)). A hand-raised bump
+([hrx.md](hrx.md#pinned-sources-kept-current)); Lemonade, Laya and the tokenizers library
+each have their own bump workflow ([releases.md](releases.md#bumps)); DwarfStar's is kept for the reference fork only. A hand-raised bump
 carries the branch name and the derived data the checks expect ([releases.md](releases.md)).
 
 ## Direction

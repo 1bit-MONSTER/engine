@@ -117,11 +117,45 @@ more than that. Two things grow after load, so they only warn:
 - the HRX graph-program cache (2-9 GiB as prompt shapes vary);
 - landing at or above 95 GiB of GTT, where engine #315's faults were seen.
 
+### The GTT ceiling: refused, not faulted (engine #680)
+
+Free memory is not the only wall. On this box the device page-faulted and reset (a gfxhub fault
+plus a MODE2 reset) twice at **GTT 106.5 GiB of 120**, i.e. 13.5 GiB of headroom was not enough
+once the runtime's own allocations landed. So serve refuses a load whose *landing* would be above a
+ceiling, even when the free-memory test above would admit it:
+
+```
+ceiling = GTT total - reserve          reserve = 16 GiB (GGML_HRX_GTT_RESERVE_MB)   -> 104 GiB of 120
+refuse  when GTT used now + the estimate > ceiling
+```
+
+The same reserve knob is what ggml-hrx charges its own allocations against (fork PR #166), so the
+pre-launch refusal and the allocation-time backstop cannot disagree about where the wall is. A
+refused load prints the numbers and exits 3, exactly like the free-memory refusal:
+
+```
+1bit serve: Qwen3.8-27B-UD-Q4_K_XL does not fit: need 96.00 GiB (...) at ctx 262144, free 60.1 GiB
+  (GTT 60.1 of 120.0 GiB free, MemAvailable 57.7 GiB); GTT after this load would reach 116.0 GiB of
+  the 104.0 GiB ceiling (120.0 GiB total, 16.0 GiB reserve, GGML_HRX_GTT_RESERVE_MB), where engine
+  #680 faulted; free GTT or raise the reserve; free memory, lower --ctx-size, or pass --no-mem-check
+```
+
+Consequences worth knowing:
+- with a 120 GiB pool and the default reserve, **at most 104 GiB of GTT is ever planned**, so the
+  >= 95 GiB warning now only fires in the 95-104 GiB band (and the graph-program-cache warning only
+  when MemAvailable is the binding limit, which under the ceiling it usually is not);
+- a box already holding more than the ceiling of GTT (another serve, another agent) refuses even a
+  small load - that is the intended behaviour: the wall is the wall, and `GGML_HRX_GTT_RESERVE_MB`
+  or freeing the other process is the way out;
+- `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) still skips all of it, ceiling included.
+
 - `--no-mem-check` (or `ONEBIT_MEM_CHECK=0`) skips the check.
 - `--mem-check` prints the estimate and exits: 0 when it fits, 3 when it does not.
 - A refused load exits with status 3 too.
 
-ctest `mem_admit` checks the KV and state sizes against HRX0 server logs:
+ctest `mem_admit` checks the KV and state sizes against HRX0 server logs, and the ceiling arithmetic
+(120 GiB total - 16 GiB reserve = 104 GiB; a load landing at 105 GiB is refused while 60 GiB is still
+free; a pool smaller than the reserve refuses at any size):
 
 | model | ctx | KV/state |
 |---|---|---|

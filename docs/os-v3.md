@@ -299,7 +299,7 @@ not re-built:
 | package | what | size (measured where noted) |
 |---|---|---|
 | `1bit-kernel-image-<kver>` | `/boot/vmlinuz`, config, `System.map`; postinst runs `update-initramfs`; versioned name = the rollback | 86 MB `.deb` (this box) |
-| `1bit-kernel-headers-<kver>` | for the out-of-tree modules on a kernel bump | 10 MB `.deb` (this box) |
+| `1bit-kernel-headers-<kver>` | installed only when the out-of-tree modules must be rebuilt on a kernel bump; not in the seed's package list, so a fresh install has the eight below | 10 MB `.deb` (this box) |
 | `1bit-kernel-modules-<kver>` | `amdxdna.ko` (0.18.0 pin) and `ec_su_axb35.ko` in `/lib/modules/<kver>/updates/`, signed with our MOK (`strixhalo Secure Boot Kernel`, measured) | 34 KB + 450 KB loaded |
 | `1bit-rocm` | the pinned TheRock user space the release was gated with, at its measured paths: `libhsa-runtime64.so.1`, `libamd_comgr.so.3`, `libamdhip64.so`, `librocblas`, `libhipblaslt`, `librocsolver`, `librocsparse`, `llvm/amdgcn/bitcode`; `/etc/1bit/libhsa.env` with the no-SVM trio | 173 MB + 3.5 MB bitcode |
 | `1bit-xrt` | `Depends:` the archive's `libxrt-npu2`, `libxrt-utils-npu`, `libxrt2` (measured 1:2.21.75+dfsg-4) — the device nodes and tools, not rebuilt | from the archive |
@@ -415,7 +415,8 @@ Boot stays off in the VM (`OVMF_CODE_4M.fd`, not `…secboot.fd`), exactly as v2
 enrolment is the machine's step, not a VM's.
 
 **Board gate** (the owner, on the Strix Halo box, stick in hand): boot the stick live, `1bit-release-check`
-(18 rows, 17/17 as c18 measured after the board driver and NPU rows), then the install entry, watch the
+(every row PASS or SKIP with a reason — the VM run's 18-row transcript is the reference for what each row
+asserts), then the install entry, watch the
 screen, then — **with the stick still in** — confirm the reboot lands on the installed machine; then
 `efibootmgr -v` (`1bit OS` first), `systemctl status` the unit set, `1bit-menu` on the monitor, ssh from
 the build machine with the carried key, HRX chat and NPU chat from `1bit-menu`, fans/power units active,
@@ -454,7 +455,7 @@ Not measured, and therefore the risk list for the build:
   key is already enrolled stays valid;
 - **`preserve: true` over a v2 partition table** — curtin's behaviour on a disk whose existing layout does
   not match the config is the phase-V gate's job, and if it wipes, the fallback is `1bit-install
-  --adopt-data` from the live entry (the v2 shell, which has `blkid` and `sfdisk` and can write the
+  --adopt-data` grown from the live entry's v2 shell, which has `blkid` and `sfdisk` and can write the
   seed's storage section with explicit ids after inspecting the disk);
 - **the ROCm subset's completeness** — 173 MB is what `ldd` on the release's `llama-server`, `ds4` and
   `libggml-hrx.so` needs *here*; a box with a different GPU path may want more, so `mkdebs` derives the

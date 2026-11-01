@@ -48,7 +48,7 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 | 2026-10-23 | First release candidate built, booted from USB on the hardware with Secure Boot on ([docs/releases.md](docs/releases.md)) |
 | 2026-10-25 | Microsoft BitNet b1.58 (TQ1_0 / TQ2_0) runs fully on HRX ([docs/models.md](docs/models.md)) |
 | 2026-10-30 | The HRX pin carries the DeepSeek-V4.1 port; ONNX Runtime runs in-process with our own execution provider on the NPU; the NPU and the GPU are measured running at the same time ([#672](https://github.com/1bit-MONSTER/engine/pull/672), [#647](https://github.com/1bit-MONSTER/engine/pull/647), [docs/hybrid.md](docs/hybrid.md)) |
-| 2026-11-01 | **v2026.44, the first release**: one signed 2.3 GiB image boots Strix Halo into Lemonade Server with the engine on the iGPU (HRX) and the NPU; gated on the hardware (1959/1959 kernel ops, 89.29 tok/s NPU, live-USB and installed-disk release checks 18/0) ([docs/releases.md](docs/releases.md)) |
+| 2026-11-01 | **v2026.44 is a draft**: candidate 19 is gated in software (1959/1959 kernel ops, NPU 82.03 tok/s, `VMTEST` pass through install and installed-disk boot, `VMTEST-RELEASE` 10 pass / 9 skip / 0 fail) but has **not** been booted or installed on hardware; candidate 20 takes the full gate, hardware boot and install included, before it is published ([docs/releases.md](docs/releases.md)) |
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 

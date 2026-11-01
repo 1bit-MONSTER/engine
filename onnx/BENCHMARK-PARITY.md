@@ -245,6 +245,46 @@ split of those 564 us between dispatch and compute is **inferred** — the dx ro
 profile hook, so nobody has seen where the time goes. A profile is the first thing to add before
 choosing between the two levers, and it is cheaper than either.
 
+## Where a 2048-token prefill actually goes
+
+`ort_run --profile PREFIX` turns on ORT's own per-node trace (it writes `PREFIX_<timestamp>.json`) and
+`onnx/prof_summary.py` folds it by op, one table per graph execution. One 2048-token **prefill execution**
+on `ryzen`, 8 threads, fp32:
+
+| op | share of 4182 ms |
+|---|---|
+| `MatMul` | 40.1% |
+| `Add` | 16.0% |
+| `FusedMatMul` (attention) | 12.9% |
+| `Softmax` | 6.7% |
+| `Concat` (cache stacking) | 6.3% |
+| `Mul` / `Where` / `Expand` | 10.0% combined |
+
+On `strixhalo` the same command does not reproduce that shape. 2048 prefill, 8 threads, fp32, measured
+under load 16 from other sessions (shares, not absolutes):
+
+| op | share of 4092 ms |
+|---|---|
+| `MatMul` | 67.8% |
+| `FusedMatMul` (attention) | 12.5% |
+| `Add` | 7.1% |
+| `Softmax` | 3.6% |
+| `Mul` | 2.4% |
+| `Concat` (cache stacking) | 1.6% |
+| `Expand` | 1.3% |
+
+with no `Where` in the top eight and the largest node in the run a `MatMul` at 374 ms, not an `Add` at
+161.8 ms. `FusedMatMul` (12-13%) and `Softmax` (4-7%) agree across the two boxes, which is a good sign the
+tool is measuring the same thing; the mask and broadcast elementwise work does not. So the lever depends
+on which profile you trust: on `ryzen`'s numbers **~22% is mask and broadcast elementwise work** (`Where`
++ `Expand` + most of `Add`), and on `strixhalo`'s it is ~8% (`Add` + `Expand`), with matmul at two thirds.
+Handing the mask in as a dtype-correct input (the reason it was removed was a zero-length-`past` `Expand`
+failure, not cost) is therefore worth doing **only if a profile on the box you care about shows those mask
+nodes**; where matmul is two thirds of the prefill, deleting 8% of elementwise work is the smaller of the
+two levers. Re-take it before acting on it — `--profile` plus `prof_summary.py` prints one table per
+execution, so prefill and decode no longer share one, and the all-runs total it still prints is labelled
+as blended.
+
 ## What this table says
 
 - The numbers are **not** comparable to AMD's published one as a speed claim: theirs is an int4 NPU

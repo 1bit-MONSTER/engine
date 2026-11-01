@@ -237,6 +237,9 @@ struct Options {
     std::vector<std::string> stop;
     std::string grammar;      // raw GBNF text; empty = unconstrained
     bool json_object = false; // response_format {"type": "json_object"}
+    // (issue #652 item 3) Whether the request carried `tools` decides whether <tool_call> markup in
+    // the answer is a call or text the caller asked for, so the answer parser has to know.
+    bool tools_sent = false;
 };
 
 // Read the decode options out of a request body.  A body that names none of them gets
@@ -311,6 +314,9 @@ inline Options options_from_body(const nlohmann::json& body) {
         o.stop = std::move(stop);
     }
     bool client_grammar = false;
+    // (issue #652 item 3) recorded before the grammar branches, because the answer parser needs it
+    // whether or not a grammar was installed.
+    if (body.contains("tools")) o.tools_sent = true;
     if (body.contains("grammar")) {
         const auto& v = body.at("grammar");
         if (!v.is_string()) throw std::runtime_error("grammar: must be a GBNF string");

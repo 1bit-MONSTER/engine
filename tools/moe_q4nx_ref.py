@@ -184,7 +184,10 @@ class Forward:
         self.lm_head = None  # built on first use (1.2 GB for a 151936 x 2048 head)
         self.kv = KVCache(q.layers, q.kv_heads, q.head_dim)
         self.pos = 0
-        self.ntok = 0
+        self.capture_layer = -1   # set to L to keep layer L's MoE input row
+        self.capture_stop = False
+        self.capture = None
+        self.captured = None
 
     def reset(self):
         self.kv = KVCache(self.q.layers, self.q.kv_heads, self.q.head_dim)
@@ -198,6 +201,8 @@ class Forward:
         gqa = q.heads // q.kv_heads
         for L in range(q.layers):
             self._layer = L
+            # a kernel gate needs the MoE block's input, not the block's output
+            self.capture = L if L == self.capture_layer else None
             h = rmsnorm(x, q.weight(q.layer_name(L, "input_layernorm.weight")), q.eps)
             shape = (T, q.heads, q.head_dim)
             qv = (h @ q.weight(q.layer_name(L, "self_attn.q_proj.weight")).T).reshape(shape)
@@ -222,6 +227,10 @@ class Forward:
             attn = np.einsum("htp,phd->thd", probs, V).reshape(T, q.heads * q.head_dim)
             x = x + attn @ q.weight(q.layer_name(L, "self_attn.o_proj.weight")).T
             h = rmsnorm(x, q.weight(q.layer_name(L, "post_attention_layernorm.weight")), q.eps)
+            if self.capture is not None:
+                self.captured = h.copy()
+                if self.capture_stop:   # a gate needs one layer's input, not the logits
+                    return None
             if q.experts:
                 x = x + self.moe(h)
             else:

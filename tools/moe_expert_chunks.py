@@ -188,8 +188,80 @@ def main():
     v.add_argument("out")
     v.add_argument("--layer", type=int, default=0)
     v.add_argument("--experts", type=int, default=2)
+    g = sub.add_parser("gate", help="expected int32 for one token, one layer, one projection")
+    g.add_argument("model")
+    g.add_argument("out")
+    g.add_argument("--prompt", required=True)
+    g.add_argument("--layer", type=int, default=0)
+    g.add_argument("--proj", default="gate", choices=sorted(PROJ))
+    g.add_argument("--experts", type=int, default=8)
     a = p.parse_args()
-    return chunks(a) if a.cmd == "chunks" else verify(a)
+    return {"chunks": chunks, "verify": verify, "gate": gate}[a.cmd](a)
+
+
+
+# --- the byte-exact gate a chunk-list kernel is judged by -------------------------------------
+
+def gate(args):
+    """Emit everything a device gate needs for ONE token, ONE layer, ONE projection.
+
+    The kernel's contract is int8 A x int4 W -> int32 with per-row A scales, so the expected
+    tensor is exact integer arithmetic, not a float comparison: this writes the activation row,
+    its int8 form and scale, the router's choice, and each chosen expert's expected int32.
+    """
+    import moe_q4nx_ref as R
+
+    q = Q4nx(args.model)
+    fw = R.Forward(q)
+    chat = R.Chat(args.model)
+    ids = chat.encode(chat.render(args.prompt))
+    fw.capture_layer = args.layer
+    fw.capture_stop = True
+    fw.logits(ids)
+    h = fw.captured[-1] if fw.captured is not None else None
+    if h is None:
+        raise SystemExit(f"layer {args.layer} did not run")
+    router = q.weight(q.layer_name(args.layer, "mlp.gate.weight"))
+    p = R.softmax((router @ h).astype(np.float64))
+    top = np.argsort(-p, kind="stable")[:args.experts]
+    w = p[top] / p[top].sum() if q.norm_topk else p[top]
+
+    # A: int8 per row with one scale, the convention the launch path takes (ascales)
+    ascale = float(np.abs(h).max() / 127.0) or 1.0
+    a8 = np.clip(np.rint(h / ascale), -127, 127).astype(np.int8)
+
+    name = q.layer_name(args.layer, PROJ[args.proj])
+    info = q.moe_meta["tensors"][name]
+    K, N = info["cols"], info["rows"]
+    os.makedirs(args.out, exist_ok=True)
+    expected = {}
+    for e in top:
+        codes, d = quantise(container_expert(q, name, int(e)))
+        exact = codes.astype(np.int32).T @ a8.astype(np.int32)      # [N]
+        expected[int(e)] = {"d_max": float(d.max()),
+                            "d_bits": d.astype(np.float16).view(np.uint16).tolist(),
+                            "int32": exact.tolist()}
+    out = {
+        "layer": args.layer, "proj": args.proj, "K": K, "N": N,
+        "prompt": args.prompt, "prompt_tokens": len(ids),
+        "router_top": [int(e) for e in top],
+        "router_weights": [float(x) for x in w],
+        "expert_weights": {int(e): float(x) for e, x in zip(top, w)},
+        "ascale": ascale,
+        "A_f32": h.tolist(),
+        "A_int8": a8.tolist(),
+        "expected_int32": expected,
+        "how": "expected_int32 = codes^T . a8 in int32 (exact); scale by d and ascale on the host",
+    }
+    with open(os.path.join(args.out, "gate.json"), "w") as f:
+        json.dump(out, f)
+    print(f"layer {args.layer} {args.proj}: experts {[int(e) for e in top]}, "
+          f"weights {[round(float(x), 4) for x in w]}, ascale {ascale:.6g}, K={K} N={N}")
+    print(f"A_int8 range [{a8.min()}, {a8.max()}], expected int32 range "
+          f"[{min(min(v['int32']) for v in expected.values())}, "
+          f"{max(max(v['int32']) for v in expected.values())}]")
+    print(f"wrote {args.out}/gate.json")
+    return 0
 
 
 if __name__ == "__main__":

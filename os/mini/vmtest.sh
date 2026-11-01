@@ -216,7 +216,9 @@ if [ -n "$nvme" ]; then
     refused "the live stick itself" 2 "$(ssh_vm "1bit-install /dev/sda --yes 2>&1; echo rc=\$?" 2>/dev/null)"
     refused "a device that does not exist" 2 "$(ssh_vm "1bit-install /dev/does-not-exist --yes 2>&1; echo rc=\$?" 2>/dev/null)"
 
-    inst=$(ssh_vm "1bit-install $nvme --yes 2>&1; echo rc=\$?" 2>/dev/null)
+    # #710: the installer now reboots the machine itself when it is done (on a real console), so the gate
+    # asks it not to: the checks below look at the installed disk before anything restarts.
+    inst=$(ssh_vm "1BIT_INSTALL_NO_REBOOT=1 1bit-install $nvme --yes 2>&1; echo rc=\$?" 2>/dev/null)
     case "$inst" in
         *"1bit OS is installed on $nvme"*"rc=0"*)
             echo "install onto $nvme: $(printf '%s' "$inst" | grep -E "partition [12]" | tr '\n' ' ' | cut -c1-150)";;

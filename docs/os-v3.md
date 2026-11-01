@@ -183,8 +183,12 @@ autoinstall:
   apt:
     geoip: false
     preserve_sources_list: false
+    # The archive, for the stock packages only. Ours come from the medium in postinstall and are *not* a
+    # persistent source: a file:///cdrom URI left in the target's sources.list is a dead source the moment
+    # the stick is out, so the installed machine's one source is 1bit.gg/apt (written by 1bit-appliance, as
+    # v2 does), and postinstall installs the medium's repo through a temporary source file it removes.
     primary:
-      - {uri: "file:///cdrom/1bit/repo", arches: [amd64]}   # ours first: the install needs no network
+      - {uri: "http://archive.ubuntu.com/ubuntu", arches: [amd64]}
     fallback: offline-install
   packages: [openssh-server, efibootmgr, mokutil, unattended-upgrades, ca-certificates, curl,
              python3-minimal, rsync, zstd, pciutils, lm-sensors, ethtool]
@@ -207,9 +211,9 @@ What each part is for, and what it is not:
 - **Our packages come from `/1bit/repo`, not from `packages:`**, in `postinstall`, because a deb install
   must run *after* the base is unpacked and before the first boot, and because it must be visible in the
   install screen's step list.
-- **`fallback: offline-install`** is the difference between a stick that installs on a machine with no
-  network and a subiquity that aborts at `apt update`. The archive is only needed for the stock
-  packages above; our repo is on the medium.
+- **`fallback: offline-install`** is what lets a machine with no network install at all: curtin then takes
+the stock packages from the ISO's own pool instead of aborting at `apt update`. Our own packages never
+depend on the network, because they are on the medium.
 - **`preserve: true` on partition 3** is the v2 → v3 path (see [Upgrade](#the-upgrade-path)). It is also
   what makes the installer idempotent: a second run over a v3 machine keeps `/data`.
 - **Not used, deliberately**: `source:` (we install the stock server variant), `drivers:`/`codecs:`

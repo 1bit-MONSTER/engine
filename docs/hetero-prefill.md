@@ -97,6 +97,46 @@ tuned NPU share (M/8 on this SoC) implies an NPU:GPU ratio near 1:7 in their sta
 path is a rocWMMA W4A16 kernel, not hipBLASLt-class throughput. Our GPU side is the fast half; there
 is nothing for the NPU to take that the GPU is slow at.
 
+### Re-measured after the 2026-11-01 11:13 GPU reset: the sentence above is conditional on the iGPU's state
+
+The table and the "never wins" verdict were measured on one boot (06:00-06:40 AST, before the reset).
+On the boot that followed the reset, the same harness, the same NPU kernel sets and the same shapes give
+a different iGPU:
+
+| shape | M | iGPU, pre-reset boot | iGPU, post-reset boot |
+|---|---|---|---|
+| 4B up_gate 2560×9728 | 2048 | 2.80 ms / 36.4 TFLOP-s | 2.88 ms / 35.4 TFLOP-s |
+| | 16384 | 20.03 ms / 40.7 TFLOP-s | **65.68 ms / 12.4 TFLOP-s** |
+| 4B down 9728×2560 | 16384 | 21.21 ms / 38.5 | **67.51 ms / 12.1** |
+| 0.6B up_gate 1024×3072 | 16384 | 8.58 ms / 11.9 | 12.39 ms / 8.3 |
+| 0.6B down 3072×1024 | 16384 | 4.03 ms / 25.6 | 9.71 ms / 10.6 |
+
+M ≤ 2048 reproduces within 3 %, and a fresh-process M-sweep puts a hard knee between M=2048
+(36.9 TFLOP-s) and M=4096 (12.5 TFLOP-s), linear above it. It is not the library (four different
+`libggml-hrx` builds agree to 0.5 %) and not clocks (2895 MHz, 72-78 C throughout); the box differs
+in that two live HRX serves are resident and GTT sits at 33-35 GB of 128 GB with 182 free 2 MiB
+blocks. Cause unproven; the effect is measured and reproducible.
+
+At that 8:1 iGPU:NPU ratio the split *does* win, and at the balance point rather than at M-256:
+
+| shape | M | iGPU alone | best split | speed-up |
+|---|---|---|---|---|
+| 4B up_gate | 16384 | 65.71 ms | m=14848, NPU 6 tiles | **1.098x** |
+| 4B down | 16384 | 67.66 ms | m=14592, NPU 7 tiles | **1.111x** |
+| 0.6B up_gate | 16384 | 12.73 ms | m=14592, NPU 7 tiles | **1.128x** |
+
+One formula covers both boots: balance the iGPU's per-row time against the NPU's per-256-row-tile time.
+At 40.7 TFLOP-s that puts the optimum at m≈15800 and a 1.036x ceiling (what the earlier sweep saw as
+1.013x at m=15872); at 12.1 TFLOP-s it puts it at m≈14600 and 1.10-1.13x (measured 1.098-1.128x).
+Overlap is effectively free either way: at the optimum the wall clock is within 0.5 % of the iGPU's own
+share of the rows, and `amdxdna` logged no errors across the runs.
+
+Read together, the numbers say the split is a *ratio* question, not an NPU-quality question, and that
+the ratio is not a property of this SoC alone. They also say the split is not a mitigation: 59.8 ms of
+split on the degraded boot is still 3x slower than 20.0 ms of iGPU-only on the healthy one. A 10 % win
+taken from a 3.3x loss is not a reason to build a split dispatcher; it is a reason to keep the iGPU
+numbers of this document dated, and to re-run the ratio before anyone quotes a ceiling from it.
+
 ## What transfers, and what we will not do
 
 **Transfers (worth doing regardless of the split):**

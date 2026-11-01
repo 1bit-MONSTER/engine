@@ -64,7 +64,11 @@ mkdir -p local-repositories petbuild-sources petbuild-cache petbuild-output
 install -m 755 local-repositories/vercmp /usr/local/bin/vercmp
 install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr/local/petget/categories.dat
 echo "== merge2out $COMPAT"
-yes "" | ./merge2out woof-distro/x86_64/ubuntu/"$COMPAT" </dev/null
+# yes | cmd under pipefail: when merge2out exits, yes gets SIGPIPE and the pipeline fails, so the
+# status has to be taken from merge2out and not from yes
+set +o pipefail
+yes "" | ./merge2out woof-distro/x86_64/ubuntu/"$COMPAT"
+set -o pipefail </dev/null
 cd ../woof-out_*
 echo "== our kernel into kernel-kit/output"
 mkdir -p kernel-kit/output

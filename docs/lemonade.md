@@ -91,10 +91,12 @@ release onto `main`** (never a pre-release, never `main` itself), so each engine
 carries the Lemonade release current when it was built. It ports rather than merges
 because the fork's `main` follows upstream's `main`: a release tag is cut from a release
 branch, so merging the tag's tree would revert every commit `main` has gained since that
-branch was cut (fork
-[#27](https://github.com/1bit-MONSTER/lemonade/pull/27) arrived exactly that way, as a
-524-file revert, which
-[#642](https://github.com/1bit-MONSTER/engine/pull/642) fixed). Concretely: the release's
+branch was cut: the sync built fork #27's branch from the tag (`4eb0319ef`, 44 commits behind
+`main`), and merging the tag was 530 files, +56,326/−128,510 against `main` — a revert of all
+44, our onebit registration included. The branch was then replaced in place by the content-only port the
+[PR](https://github.com/1bit-MONSTER/lemonade/pull/27) now shows (9 files, `a61ce765c`), and
+[#642](https://github.com/1bit-MONSTER/engine/pull/642) changed the workflow so its fallback
+starts from `main`. Concretely: the release's
 own commits are cherry-picked onto `main` in order; a commit that applies cleanly and
 still leaves `onebit` registered is pushed to `main`; a commit the fork also changed keeps
 the fork's side, goes to a `sync/<tag>` branch and is listed in a PR in the fork, so a

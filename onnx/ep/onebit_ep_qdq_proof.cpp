@@ -728,6 +728,11 @@ int main(int argc, char** argv) {
         {"quark-asym", 8, 64, 48, kPerTensor, kPerAxisCols, kZpScalar, kZpAxis, -5, true, false, 1},
         // The same shape one of Qwen3-0.6B's own projections has: 5 tokens x [1024 -> 2048].
         {"quark-wide", 5, 1024, 2048, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        // Qwen3-0.6B's o_proj shape, and the one a device ELF exists for on strixhalo
+        // (full_i8_O_K2048_N1024.elf): with ONEBIT_EP_NPU_ELFS configured this case is what runs the
+        // fused group on the array, and its |d| = 0 gate then compares the device's int32 accumulators
+        // with the CPU EP's float path exactly as the host case does.
+        {"quark-o", 5, 2048, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // The same, with enough values that a quantisation boundary is likely to be hit: 64x1024x2048
         // is 131072 int8 outputs, and the CPU EP reaches each one through a float accumulation where
         // the fused path rounds an exact int32 sum.
@@ -741,7 +746,7 @@ int main(int argc, char** argv) {
     int rc = 0;
     int worst_tensor = 0, worst_axis = 0, worst_asym = 0, worst_asym_axis = 0, worst_refused = 0;
     int worst_quark = 0, worst_quark_asym = 0, worst_quark_wide = 0;
-    int worst_quark_stress = 0;
+    int worst_quark_stress = 0, worst_quark_o = 0;
     size_t differing_quark_stress = 0;
     long peak_cpu = -1, peak_fused = -1;
     size_t fused_cases = 0;
@@ -781,6 +786,8 @@ int main(int argc, char** argv) {
             worst_quark = r.worst;
         } else if (std::strcmp(c.label, "quark-asym") == 0) {
             worst_quark_asym = r.worst;
+        } else if (std::strcmp(c.label, "quark-o") == 0) {
+            worst_quark_o = r.worst;
         } else if (std::strcmp(c.label, "quark-stress") == 0) {
             worst_quark_stress = r.worst;
             differing_quark_stress = r.differing;
@@ -817,6 +824,11 @@ int main(int argc, char** argv) {
                                  "scales) case differs by %d LSB\n",
                          worst_quark);
             rc = 1;
+        } else if (!fusion_off && worst_quark_o != 0) {
+            std::fprintf(stderr, "onebit-ort-qdq: FAIL Quark o_proj shape (5x2048x1024) differs by %d "
+                                 "LSB\n",
+                         worst_quark_o);
+            rc = 1;
         } else if (!fusion_off && worst_quark_stress > 1) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL stress case differs by %d LSB (%zu values)\n",
                          worst_quark_stress, differing_quark_stress);
@@ -835,7 +847,7 @@ int main(int argc, char** argv) {
                          worst_refused);
             rc = 1;
         } else if (!fusion_off) {
-            if (fused_cases < 6) {
+            if (fused_cases < 7) {
                 std::fprintf(stderr, "onebit-ort-qdq: FAIL only %zu case(s) were fused\n", fused_cases);
                 rc = 1;
             } else if (peak_cpu > 0 && peak_fused > 0 && peak_fused >= peak_cpu) {

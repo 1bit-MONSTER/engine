@@ -38,6 +38,10 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
 // int64, and the only float work is the scale and one round-half-to-even per output element (ONNX
 // QuantizeLinear's rounding, which happens *before* the output zero point is added).
 //
+// With ONEBIT_EP_NPU the accumulators can come from the device instead (the same exact int32 sum,
+// from the same int8 bytes): npu/ort's gemm_q8_raw writes the int8 activations and weights straight
+// into the kernel's BOs and hands back int32, and the epilogue below is shared by both paths.
+//
 // Asymmetric zero points do not cost a second pass. Writing the shifted product out,
 //
 //   Sum_k (a-zx)(w-zw) = Sum_k a*w  -  zx*Sum_k w  -  zw*Sum_k a  +  K*zx*zw

@@ -199,6 +199,7 @@ struct I8Ctx {
                                          int am, int ak, float ascale) {
         quantize_async(A, am, ak, ascale);
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        poison_canary(ND, am);   // engine#666: so readback() can tell "not written" from "written as 0"
         return (*kext)(*bA, wbo, *bC);
     }
 
@@ -211,6 +212,7 @@ struct I8Ctx {
                                               const float* ascales) {
         quantize_async_rows(A, am, ak, ascales);
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        poison_canary(ND, am);
         return (*kext)(*bA, wbo, *bC);
     }
 
@@ -329,6 +331,7 @@ struct I8Ctx {
 
     inline xrt::run sync_and_launch(int l) {
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        poison_canary(ND);
         bochk(l);
         return (*kext)(*bA, *layerB[l], *bC);
     }
@@ -402,12 +405,70 @@ struct I8Ctx {
     // is identical immediately before each launch, and yet the dequantized bA -- the host's reading of
     // that same bC -- differs. So the kernel's output buffer is the same and what the host gets back
     // from it is not. Checksumming right AFTER the sync isolates the transfer.
+    //
+    // engine#666: that sync IS the invalidate the issue asks for, and it is not enough. bo::sync() is
+    // `mfence; clflush x N; mfence` over the range (disassembled from libonebit_npu_rt.a, 2026-10-31), so
+    // the host's cache lines for bC are dropped before every read -- a stale line cannot survive it. A
+    // read that still comes back short therefore means the writes are NOT in memory yet (or never
+    // landed), not that the host read under them. The mitigation is the canary below: poison the row we
+    // read before the launch, and if that row is still poisoned after the invalidate, re-issue the launch
+    // once instead of dequantising garbage into a layer.
     inline void readback() {
         bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
+        if (canary_on_) verify_canary();
         if (getenv("NPU_DBG")) {
             static int n = 0;
             if (n < 8) { n++; fprintf(stderr, "[RBCHK] bC=%016llx\n", bo_fnv(*bC)); }
         }
+    }
+
+    // ── engine#666 canary: is the row we are about to dequantise actually written? ──
+    // One poison store per element of row 0 (the only row the decode path reads) before the launch, and a
+    // compare of the same row after the invalidate. A genuinely short tile leaves thousands of sentinels
+    // standing; an accumulator that happens to equal the sentinel is one element, so a threshold of 8 keeps
+    // false positives out while any real short tile trips it. Cost is two passes over N int32 (<= 68 KiB)
+    // per launch, measured below; ONEBIT_NPU_CANARY=0 turns it off, NPU_CANARY_STATS=1 reports it.
+    static constexpr int32_t kCanary = (int32_t)0x80000000;  // INT32_MIN: no accumulator of ours lands there by rounding
+    int canary_on_ = []() { const char* v = getenv("ONEBIT_NPU_CANARY"); return v == nullptr || atoi(v) != 0; }();
+    int short_row_ = 0;      // sentinels still standing in row 0 after the last invalidate
+    long canary_launches_ = 0;
+    long canary_retries_ = 0;
+    long canary_short_launches_ = 0;
+
+    // one sentinel every kCanaryStride elements: a dropped tile is hundreds of elements wide, so sampling
+    // catches it while the poison+scan stays a few KiB per launch instead of the whole 68 KiB row
+    static constexpr int kCanaryStride = 16;
+
+    // Row 0 only: it is the row every decode GEMM and every head tile reads back, and it is where this issue's
+    // own failures land (first_idx=832 and 9344 against N=17408). A batched (prefill) launch is NOT canaried
+    // beyond row 0: measured 2026-10-31 in the window, poisoning row am-1 there fires on every prefill launch
+    // (short=59..1304 survivors) because the kernel does not write the padded last row of the activation BO --
+    // a false positive that also doubles prefill work through the retry. Prefill numerics are NPU_M16_CHECK's job.
+    inline void poison_canary(int an, int /*am*/ = 1) {
+        if (!canary_on_ || Cm == nullptr) return;
+        const int n = std::min(an, ND);
+        for (int i = 0; i < n; i += kCanaryStride) Cm[i] = kCanary;
+        // Write the sentinels back NOW. Without this the poisoned lines sit dirty in the host cache and are
+        // evicted after the kernel has already written the same memory, so the eviction overwrites the device's
+        // result with the sentinel -- the canary then "detects" a short read it caused itself (measured: 1,416
+        // false positives on the shipping M=128 decode path, one per launch group, before this line existed).
+        bC->sync(XCL_BO_SYNC_BO_TO_DEVICE);
+    }
+
+    inline void verify_canary() {
+        int bad = 0;
+        for (int i = 0; i < ND; i += kCanaryStride) bad += (Cm[i] == kCanary);
+        short_row_ = bad > 8 ? bad : 0;
+        canary_launches_++;
+        if (short_row_) canary_short_launches_++;
+    }
+
+    inline bool canary_short() const { return short_row_ != 0; }
+
+    inline void canary_report(const char* tag, int l) const {
+        if (canary_short_launches_ == 0 && !getenv("NPU_CANARY_STATS")) return;
+        fprintf(stderr, "[canary] %s l=%d launches=%ld short=%ld retries=%ld last_short=%d\n", tag, l,
+                canary_launches_, canary_short_launches_, canary_retries_, short_row_);
     }
 
     inline void dequant_only(float* C, int am, int an, float ascale,

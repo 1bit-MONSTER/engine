@@ -47,10 +47,15 @@ be a kernel **config** gap of about fifteen `=y` symbols, not a fork.
 | unpacked root | ~106 MB (initramfs) | **1.3 GB** extracted |
 | package manager | none | `dpkg` + Puppy's PETget; **no apt** in noble64 (ResolutePup64's notes say apt/Synaptic — see [Blocker 4](#blocker-4-the-2604-base-and-what-it-carries)) |
 | update story | reflash the stick | new SFS + keep the save layer; apt where the recipe has it |
-| RAM at idle | not measured here (no `free` in the c18 gate transcript) | not measured headless: Puppy's first-run wizard takes the console before a shell exists (see [Not measured](#not-measured)) |
+| **boot to the first interactive screen** (QEMU, 2 vCPU, 2 GiB, serial timestamped from QEMU start) | **24.5 s** — the "1bit OS" banner and the menu | **108.8 s** — Puppy's first-run wizard (its own stock kernel; the wizard is interactive, not a shell) |
+| RAM at idle | not measured here (no `free` in the c18 gate transcript) | not measured headless: the wizard takes the console before a shell exists (see [Not measured](#not-measured)) |
 
-Size is the honest trade: **+850 MB on the stick and +1.2 GB on the installed disk** for a package
-manager, a save layer and a real userland. For a 58 GB stick and a 2 TB NVMe that is nothing; for the
+Size and time are the honest trade: **+850 MB on the stick, +1.2 GB on the installed disk, and +84 s
+to the first screen** (24.5 s → 108.8 s, measured on the same QEMU with the same timestamping) for a
+package manager, a save layer and a real userland. The c18 number is the boot of the published image as a
+USB stick (`-device usb-storage`, which is what the init requires: it refuses a non-removable disk so an
+internal disk's `/data` is never taken); the Puppy number is its stock kernel, so the comparison is the
+two media, not the two kernels. For a 58 GB stick and a 2 TB NVMe that is nothing; for the
 "100 MB EFI file" promise of today's image it is the whole OS.
 
 ## 2. The kernel is ours, and that is where the work is
@@ -220,10 +225,11 @@ medium, not of design.
 
 ## Not measured
 
-- **boot time and idle RAM**, headless, for either Puppy or our initramfs: Puppy's first-run wizard owns
-  the console before a shell exists, and the c18 gate's transcript has no `free`. Both need the
-  pre-answered first boot (or a serial-console hook) and a timestamped serial capture; the harness for
-  the latter is `~/wt/os3i/sertee.py` + `systemd-run --user -p MemoryMax=6G` on this box.
+- **idle RAM**, headless, for either: the c18 gate's transcript has no `free`, and Puppy's wizard owns
+  the console before a shell exists, so both need the pre-answered first boot (or a serial hook that runs
+  a `free`/`/proc/meminfo` after boot). The boot-time part of that item *is* measured now (24.5 s vs
+  108.8 s, table above) with the harness that exists: a timestamping serial tee
+  (`[NN.Ns] ` prefix per chunk) + `systemd-run --user --scope -p MemoryMax=6G`.
 - **the persistence round trip** (G7) and **Secure Boot with the swapped chain** (G4).
 - **the resolute64 ISO itself** — the build is the open item of this page.
 - **project health and licensing** beyond the facts stated: woof-CE builds five targets on CI; the

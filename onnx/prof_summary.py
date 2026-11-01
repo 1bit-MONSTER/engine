@@ -56,24 +56,35 @@ def main() -> int:
         runs[run].append(e)
 
     by_op = collections.Counter()
-    per_run = collections.Counter()
-    for r, evs in runs.items():
-        total = sum(e.get("dur", 0) for e in evs)
-        per_run[r] = total
+    for evs in runs.values():
         for e in evs:
             by_op[e.get("args", {}).get("op_name", "?")] += e.get("dur", 0)
 
     print(f"runs: {len(runs)}   nodes: {len(nodes)}")
-    print("\nper run (ms):")
-    for r in sorted(per_run):
-        print(f"  run {r}: {per_run[r] / 1000.0:9.1f}  ({sum(1 for e in runs[r])} nodes)")
+    # One table per execution, not one line: prefill and decode have different shapes, so a share table
+    # that spans both answers a question nobody asked (a 2048 prefill's MatMul share blended with a
+    # decode step's Concat/Expand share). The all-runs total below stays, labelled as blended.
+    print("\nper execution (ms, then that execution's own top ops):")
+    for r in sorted(runs):
+        evs = runs[r]
+        per = collections.Counter()
+        for e in evs:
+            per[e.get("args", {}).get("op_name", "?")] += e.get("dur", 0)
+        total = sum(per.values()) or 1
+        print(f"  run {r}: {total / 1000.0:9.1f} ms  ({len(evs)} nodes)")
+        for op, us in per.most_common(a.top):
+            print(f"      {op:<22} {us / 1000.0:9.1f} ms  {100.0 * us / total:5.1f}%")
 
     grand = sum(by_op.values()) or 1
-    print(f"\ntop ops over all runs (share of {grand / 1000.0:.0f} ms of node time):")
+    if len(runs) > 1:
+        print(f"\nall runs blended (share of {grand / 1000.0:.0f} ms of node time) -- read the per-execution"
+              f" tables above for a stage's own shares:")
+    else:
+        print(f"\ntop ops (share of {grand / 1000.0:.0f} ms of node time):")
     for op, us in by_op.most_common(a.top):
         print(f"  {op:<22} {us / 1000.0:9.1f} ms  {100.0 * us / grand:5.1f}%")
 
-    print(f"\ntop individual nodes:")
+    print(f"\ntop individual nodes (across all runs):")
     for e in sorted(nodes, key=lambda e: -e.get("dur", 0))[: a.top]:
         op = e.get("args", {}).get("op_name", "?")
         print(f"  {e.get('dur', 0) / 1000.0:8.1f} ms  {op:<20} {e.get('name', '')[:70]}")

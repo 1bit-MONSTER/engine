@@ -281,8 +281,9 @@ on which profile you trust: on `ryzen`'s numbers **~22% is mask and broadcast el
 Handing the mask in as a dtype-correct input (the reason it was removed was a zero-length-`past` `Expand`
 failure, not cost) is therefore worth doing **only if a profile on the box you care about shows those mask
 nodes**; where matmul is two thirds of the prefill, deleting 8% of elementwise work is the smaller of the
-two levers. Re-take it before acting on it — `--profile` plus `prof_summary.py` now prints one table per
-execution, so prefill and decode cannot be blended into one share table any more.
+two levers. Re-take it before acting on it — `--profile` plus `prof_summary.py` prints one table per
+execution, so prefill and decode no longer share one, and the all-runs total it still prints is labelled
+as blended.
 
 ## What this table says
 

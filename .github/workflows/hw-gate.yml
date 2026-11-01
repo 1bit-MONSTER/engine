@@ -30,8 +30,8 @@
 # the runner runs one job at a time, so no PR-Agent review (Vulkan coder-llm on :8090) generates
 # while the gate's HRX dispatches run (long HRX dispatches starve that model into a ring timeout).
 # The script also waits for coder-llm to be idle before each GPU step and reports any new ring
-# timeout. GPU steps hold ~/npu.lock one at a time (other GPU work on the box keeps priority
-# between steps), run under scripts/mem-guard.sh and ~/lb/thermal-run.sh.
+# timeout. GPU steps take no ~/npu.lock (engine#682: NPU and GPU run concurrently, engine#673),
+# and run under scripts/mem-guard.sh and ~/lb/thermal-run.sh.
 name: hw-gate
 
 on:
@@ -66,7 +66,7 @@ jobs:
     concurrency:
       group: hw-gate-${{ github.event.pull_request.number || inputs.ref }}
       cancel-in-progress: true
-    # the gate itself takes under 20 minutes; the rest is waiting for ~/npu.lock and a cold build
+    # the gate itself takes under 20 minutes; the rest is waiting for the GPU token, a cool box and a cold build
     timeout-minutes: 150
     steps:
       - uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1

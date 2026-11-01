@@ -88,6 +88,38 @@ match the version of the pinned llama.cpp (`third_party/llama.cpp`): the restore
 Naming: `--prefill-provider PATH` or `ONEBIT_HYBRID_PREFILL=PATH`; `ONEBIT_HYBRID_ELFS=DIR` adds
 `--elfs DIR`.
 
+### The shared route: no state file at all (`ONEBIT_KV_SHARE=1`)
+
+The contract above is the file route, and on Strix Halo the file is the whole cost: every byte of the
+prompt's KV is written by the provider and read back by the decoder, through the page cache, for a
+handoff that never leaves the box. `ONEBIT_KV_SHARE=1` on `1bit serve` (the child llama-server inherits
+it) replaces the file with two dma-buf fds:
+
+```
+<provider> --tokens <ids file> --model <model> --layout <header file> --fds <n[,n...]>
+```
+
+| | |
+|---|---|
+| `--layout` | the header the decoder sent: `{"n_regions", "regions": [{"offset", "size", "layout"}], "params": {"n_ctx", "n_batch", "n_ubatch", "n_seq_max", "flash_attn", "type_k", "type_v"}}`. A provider builds its context from `params`; the per-region `layout` hash is what the importer checks |
+| `--fds` | the region fds, in region order, inherited from serve (so no `/proc/<pid>/fd` reopening: Linux cannot reopen a dma-buf that way, measured) |
+| `--out` | not used on this route |
+
+Per request: `POST /slots/0?action=share {"socket": PATH}` makes the decoder export its KV buffers and
+hand the fds over an AF_UNIX socket that serve is listening on (`SCM_RIGHTS`, one length-prefixed JSON
+message); serve passes them to the provider as inherited descriptors; the provider maps them as its own
+KV tensors and prefills the prompt into them; `POST /slots/0?action=adopt {"tokens": [...]}` makes the
+decoder take cells 0..N-1 as positions 0..N-1 with no data movement (`llama_kv_cells_adopt`). The
+provider never writes a file, and the only bytes that cross a boundary are the fds and a few hundred
+bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is the reference provider:
+a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the
+same descriptors as XDNA BOs.
+
+Limits, so nobody reads more into the flag than it does: the region is `llama_kv_cache`, so a hybrid
+model's recurrent half (e.g. the 27B's GDN state) is not shared and `?action=share` refuses a hybrid
+cache rather than hand over half a prompt. Both sides must be the same pinned llama.cpp, the same model
+and `-fa`/`-c`/`-b`/`-ub`/KV types (`params` above); a mismatch is a refusal, not a wrong answer.
+
 ## Tests
 
 - `tests/hybrid_route.sh` (CTest `hybrid_route`, no model, no NPU): `tests/fake_backend.py` stands in

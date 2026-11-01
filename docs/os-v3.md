@@ -218,16 +218,18 @@ What each part is for, and what it is not:
 
 ### `postinstall` — our steps
 
-Runs in the target chroot (`curtin in-target`), so every path is the target's except `/cdrom`:
+Runs in the target chroot (`curtin in-target`), so every path is the target's except `/cdrom`. Its steps
+are the screen's steps 3–8, in this order (1 and 2 are the seed's identity line and curtin's own base
+install):
 
-| step | command | what it writes |
+| screen step | command | what it writes |
 |---|---|---|
-| 1 | `apt-get install` our repo's debs (`1bit-kernel-<kver>`, `1bit-kernel-modules-<kver>`, `1bit-rocm`, `1bit-xrt`, `1bit-engine`, `1bit-lemonade`, `1bit-appliance`, `1bit-archive-keyring`) | `/opt/1bit`, `/opt/lemonade`, `/boot/vmlinuz-<kver>`, `/lib/modules/<kver>/updates/{amdxdna,ec_su_axb35}.ko` |
-| 2 | `mokutil --test-key /cdrom/1bit/mok/MOK-Kernel.der` else `mokutil --import` (password on stdin, twice) | the MokNew efivars the next boot's MokManager reads |
-| 3 | `update-initramfs -u -k <kver>`, `update-grub` | an initramfs with `amdgpu`, `amdxdna`, `efivarfs`, and one grub entry per kernel in `/boot` |
-| 4 | `efibootmgr -c -d <disk> -p 1 -L "1bit OS" -l '\EFI\ubuntu\shimx64.efi'`, `-o` first, `-n` BootNext, delete entries whose loader is not on this ESP | the firmware entry engine#709 asks for |
-| 5 | adopt `/data`: `chown 1bit`, `install -d models lemonade/cache lemonade/config cache/hrx-jit npu ssh`, copy `/data/ssh/host_ed25519` to `/etc/ssh/ssh_host_ed25519_key` | a machine whose SSH identity survives a reinstall |
-| 6 | verify: `mount -o ro` both partitions, `sha256sum /boot/vmlinuz-<kver>`, `dpkg-query -W '1bit-*'`, `systemctl is-enabled` the unit set, `1bit-release-check` | `/data/install.log` on both media, the screen, ttyS0 |
+| 3 | `apt-get install` our repo's debs (`1bit-kernel-<kver>`, `1bit-kernel-modules-<kver>`, `1bit-rocm`, `1bit-xrt`, `1bit-engine`, `1bit-lemonade`, `1bit-appliance`, `1bit-archive-keyring`) | `/opt/1bit`, `/opt/lemonade`, `/boot/vmlinuz-<kver>`, `/lib/modules/<kver>/updates/{amdxdna,ec_su_axb35}.ko` |
+| 4 | `update-initramfs -u -k <kver>`, `update-grub` | an initramfs with `amdgpu`, `amdxdna`, `efivarfs`, and one grub entry per kernel in `/boot` |
+| 5 | `mokutil --test-key /cdrom/1bit/mok/MOK-Kernel.der` else `mokutil --import` (password on stdin, twice) | the MokNew efivars the next boot's MokManager reads |
+| 6 | `efibootmgr -c -d <disk> -p 1 -L "1bit OS" -l '\EFI\ubuntu\shimx64.efi'`, `-o` first, `-n` BootNext, delete entries whose loader is not on this ESP | the firmware entry engine#709 asks for |
+| 7 | adopt `/data`: `chown 1bit`, `install -d models lemonade/cache lemonade/config cache/hrx-jit npu ssh`, copy `/data/ssh/host_ed25519` to `/etc/ssh/ssh_host_ed25519_key` | a machine whose SSH identity survives a reinstall |
+| 8 | verify: `mount -o ro` both partitions, `sha256sum /boot/vmlinuz-<kver>`, `dpkg-query -W '1bit-*'`, `systemctl is-enabled` the unit set, `1bit-release-check` | `/data/install.log` on both media, the screen, ttyS0 |
 
 The `1bit-appliance` postinst enables the unit set exactly as v2 does, including the measured
 `ssh.socket` rule (enabling `ssh.service` as well makes a connection hang at banner exchange) and

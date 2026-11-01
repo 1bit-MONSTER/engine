@@ -64,6 +64,16 @@ DECODE_PROMPTS = {
     "short": "Translate to French: The quick brown fox jumps over the lazy dog, and then it goes home to sleep.",
 }
 
+#: The long-context leg (engine#679). When ``HL_LONGCTX`` is set, one more request carries a prompt of
+#: about that many tokens and the score becomes its decode rate -- the number #679 is about -- instead
+#: of the short-prompt geometric mean. The text is a fixed filler sentence repeated to length, so every
+#: candidate sees the same prompt; the real token count comes back from the server and is reported.
+LONG_PROMPT_UNIT = ("The archive records a series of routine maintenance events on the northern line. "
+                    "Each entry lists a date, a shift, an asset and the action taken. ")
+#: Measured on the box: this filler tokenises at ~4.85 characters per token (a 75,200-character prompt
+#: came back as 15,492 prompt tokens), so the size below hits the requested count rather than 4 chars/token.
+LONG_CHARS_PER_TOKEN = 4.85
+
 
 def env(name, default=""):
     return str(os.environ.get(name, default) or default).strip()
@@ -201,7 +211,8 @@ def levers():
     return {
         k: env(k)
         for k in ("HL_B", "HL_UB", "HL_FA", "HL_CTK", "HL_CTV", "HL_MTP_MAX", "HL_DFLASH",
-                  "HL_PARALLEL", "HL_CTX", "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
+                  "HL_PARALLEL", "HL_CTX", "HL_LONGCTX", "HL_LONGTOK",
+                  "GGML_HRX_Q8_PREFILL_RELAX", "GGML_HRX_GRAPH_PROGRAM_CACHE",
                   "GGML_HRX_TER_Q4_0", "ONEBIT_HRX_DECODE_SPLIT")
         if env(k)
     }
@@ -281,11 +292,16 @@ def ask(port, prompt, max_tokens, timeout):
         reply = json.load(r)
     if "timings" not in reply:
         raise RuntimeError("backend reported no timings")
-    return reply["timings"]["predicted_per_second"], reply["choices"][0]["message"]["content"]
+    return reply["timings"]["predicted_per_second"], reply["choices"][0]["message"]["content"], reply["timings"]
 
 
-def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
-    """Start `1bit serve` once, run the three prompts, return (tps per prompt, texts)."""
+def long_prompt(n_tokens):
+    """A deterministic filler prompt of roughly ``n_tokens`` tokens at this filler's own ratio."""
+    return LONG_PROMPT_UNIT * max(1, int(n_tokens * LONG_CHARS_PER_TOKEN / len(LONG_PROMPT_UNIT)) + 1)
+
+
+def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0, longtok=128):
+    """Start `1bit serve` once, run the three prompts (+ the long-context leg), return the numbers."""
     port = free_port()
     cmd = [onebit, "serve", "-m", str(model), "--port", str(port)] + args
     # GGML_HRX_STRICT=0: on this pin the MTP draft graph has one node (the head's PAD) off HRX, and
@@ -298,6 +314,7 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
     proc = subprocess.Popen(cmd, env=run_env, stdout=logtext, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL)
     tps, texts = {}, {}
+    long_info = {}
     try:
         if not wait_healthy(port, proc, time.time() + timeout / 2):
             raise RuntimeError(f"`1bit serve` did not become healthy (see {out_dir / 'serve.log'})")
@@ -305,10 +322,19 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
         for name, prompt in DECODE_PROMPTS.items():
             samples = []
             for _ in range(reps):
-                value, text = ask(port, prompt, tokens, timeout)
+                value, text, _ = ask(port, prompt, tokens, timeout)
                 samples.append(value)
                 texts.setdefault(name, text)
             tps[name] = statistics.median(samples)
+        if longctx:
+            # One request, not a median: the long leg costs a full prefill of the whole history, and a
+            # decode rate at 18.8k is what #679 compares. The server reports the prompt it actually saw.
+            value, text, timings = ask(port, long_prompt(longctx), longtok, timeout)
+            tps["long"] = value
+            texts["long"] = text
+            long_info.update({"ctx_tokens_requested": longctx, "ctx_tokens_actual": timings.get("prompt_n"),
+                              "decode_tokens": timings.get("predicted_n"),
+                              "prefill_tok_s": timings.get("prompt_per_second")})
     finally:
         proc.terminate()
         try:
@@ -317,7 +343,7 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir):
             proc.kill()
             proc.wait()
         logtext.close()
-    return tps, texts, placement_summary(out_dir / "serve.log")
+    return tps, texts, placement_summary(out_dir / "serve.log"), long_info
 
 
 PLACEMENT_RE = re.compile(r"placement: (\d+) nodes, (\d+) off HRX")
@@ -377,7 +403,10 @@ def main():
     kld_max = env_float("HL_GATE_KLD_MAX", 1e-4)
     reps = env_int("HL_REPS", 3)
     tokens = env_int("HL_TOKENS", 256)
-    deadline = time.time() + env_int("HL_BUDGET_SEC", 780)
+    # engine#679: an optional long-context decode leg, whose rate becomes the score.
+    longctx = env_int("HL_LONGCTX", 0)
+    longtok = env_int("HL_LONGTOK", 128)
+    deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     log(f"model={model} bin={bin_dir} state={state}")
     log(f"levers={levers() or '{}'}")
@@ -385,7 +414,8 @@ def main():
         "framework": "custom",
         "workload_kind": "scriptable",
         "model_id": f"{model.name} (HRX0, gfx1151)",
-        "throughput_unit": "tok/s (geomean of pp512, tg128, serve code)",
+        "throughput_unit": (f"tok/s (decode at {longctx}-token ctx)" if longctx
+                            else "tok/s (geomean of pp512, tg128, serve code)"),
         "output_throughput": 0.0,
         "total_token_throughput": 0.0,
         "request_throughput": 0.0,
@@ -417,14 +447,22 @@ def main():
 
     # 2. serve: the decode-side legs and the greedy texts the gate compares.
     try:
-        tps, texts, placement = serve_measure(onebit, model, serve_lever_args(), reps, tokens,
-                                              min(600, deadline - time.time()), out_dir)
+        tps, texts, placement, long_info = serve_measure(
+            onebit, model, serve_lever_args(), reps, tokens,
+            min(1200 if longctx else 600, deadline - time.time()), out_dir,
+            longctx=longctx, longtok=longtok)
     except (RuntimeError, OSError) as exc:
         return finish(False, f"serve leg failed: {exc}", rc=1)
     result["bench_summary"]["serve_tok_s"] = {k: round(v, 2) for k, v in tps.items()}
     result["bench_summary"]["placement"] = placement
-    result["total_token_throughput"] = round(tps["code"], 2)
-    result["request_throughput"] = round(tps["code"] / tokens, 4)
+    if long_info:
+        result["bench_summary"]["longctx"] = {k: (round(v, 2) if isinstance(v, float) else v)
+                                              for k, v in long_info.items()}
+        if long_info.get("ctx_tokens_actual"):
+            # Label the unit with the context the server actually saw, not the one we asked for.
+            result["throughput_unit"] = f"tok/s (decode at {long_info['ctx_tokens_actual']}-token ctx)"
+    result["total_token_throughput"] = round(tps["long"] if longctx else tps["code"], 2)
+    result["request_throughput"] = round(result["total_token_throughput"] / tokens, 4)
 
     # 3. the gate: reference halves are recorded on the first (baseline) measurement only.
     fingerprint = sha256_head(model)
@@ -456,9 +494,9 @@ def main():
                             encoding="utf-8")
         result["quality_gate"]["reason"] = "reference_established"
         result["quality_gate"]["skipped"] = False
-        score = geometric_mean(pp512, tg128, tps["code"])
+        score = score_of(pp512, tg128, tps, longctx)
         result["output_throughput"] = round(score, 4)
-        result["bench_summary"]["score_geomean"] = round(score, 4)
+        result["bench_summary"]["score_geomean"] = round(geometric_mean(pp512, tg128, tps["code"]), 4)
         return finish(True, "reference_established")
 
     differences = [k for k, v in ref_texts.items() if texts.get(k) != v]
@@ -468,9 +506,9 @@ def main():
     mean_kld = kld_stat["mean"]
     result["quality_gate"]["kld_ok"] = mean_kld is not None and mean_kld <= kld_max
 
-    score = geometric_mean(pp512, tg128, tps["code"])
+    score = score_of(pp512, tg128, tps, longctx)
     result["output_throughput"] = round(score, 4)
-    result["bench_summary"]["score_geomean"] = round(score, 4)
+    result["bench_summary"]["score_geomean"] = round(geometric_mean(pp512, tg128, tps["code"]), 4)
     if not result["quality_gate"]["kld_ok"]:
         return finish(False, f"KLD {mean_kld} > {kld_max}")
     if not identical:
@@ -483,6 +521,13 @@ def geometric_mean(*values):
     if len(vals) < 3:
         return 0.0
     return math.exp(sum(math.log(v) for v in vals) / len(vals))
+
+
+def score_of(pp512, tg128, tps, longctx):
+    """What the optimizer is asked to maximise: the #679 decode rate when the long leg runs."""
+    if longctx:
+        return tps.get("long") or 0.0
+    return geometric_mean(pp512, tg128, tps["code"])
 
 
 if __name__ == "__main__":

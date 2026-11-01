@@ -345,8 +345,16 @@ class Chat:
         self._tf = {}
         try:
             import jinja2
-            env = jinja2.Environment(trim_blocks=True, lstrip_blocks=True,
-                                     extensions=["jinja2.ext.loopcontrols"])
+            from jinja2.sandbox import SandboxedEnvironment
+            # The chat template arrives with the model directory, i.e. it is data from a
+            # downloaded file, so it runs in jinja's sandbox: a template cannot reach Python
+            # internals. Autoescape is declared rather than left defaulted, and it is off on
+            # purpose: the rendered text is a token sequence (<|im_start|>user ...), not HTML,
+            # so escaping would corrupt every marker. select_autoescape() keeps that explicit.
+            env = SandboxedEnvironment(
+                autoescape=jinja2.select_autoescape(default_for_string=False, default=False),
+                trim_blocks=True, lstrip_blocks=True,
+                extensions=["jinja2.ext.loopcontrols"])
             self._tf[tmpl] = env.from_string(tmpl)
         except ImportError:
             pass

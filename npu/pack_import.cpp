@@ -593,6 +593,14 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     r.refused = p.refused();
     if (!r.refused.empty() && !opt.allow_incomplete) return r;  // refuse by name, write nothing
 
+    bool tied = false;
+    {
+        std::ifstream cf(pack_dir + "/config.json");
+        if (cf) {
+            const auto c = json::parse(cf);
+            tied = c.value("tie_word_embeddings", false);
+        }
+    }
     const OnnxModel onnx = parse_onnx(pack_dir + "/model.onnx");
     std::map<std::string, const uint8_t*> ext;
     std::map<std::string, size_t> ext_size;
@@ -654,7 +662,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
 
         // self-check 1: tie_word_embeddings makes the pack's own fp16 embedding an
         // independent reference for the decode, with two wrong decoders as controls.
-        {
+        r.selfcheck_reference = tied;
+        if (tied) {
             double sum_abs = 0, sum_ref = 0;
             for (int n = 0; n < q.N; ++n)
                 for (int k = 0; k < q.K; ++k) {
@@ -814,10 +823,15 @@ int run(int argc, char** argv) {
         return 3;
     }
     std::printf("imported %d tensors, %lld q4_1 tiles into %s\n", r.tensors, r.tiles, out.c_str());
-    std::printf("  self-check: lm_head vs the pack's fp16 embedding  corr %.6f  rel_err %.6f\n",
-                r.lmhead_corr, r.lmhead_rel);
-    std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
-                r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+    if (r.selfcheck_reference) {
+        std::printf("  self-check: lm_head vs the pack's fp16 embedding  corr %.6f  rel_err %.6f\n",
+                    r.lmhead_corr, r.lmhead_rel);
+        std::printf("  controls:   nibble-swapped corr %.4f, no zero-point corr %.4f (both must fail)\n",
+                    r.ctrl_corr_nibble, r.ctrl_corr_nozp);
+    } else {
+        std::printf("  self-check: skipped -- the head is not tied to the embedding, so the pack\n"
+                    "              carries no independent reference to test the decode against\n");
+    }
     std::printf("  container:  read back through q4nx::dequant_tile  rel_err %.3e  max |diff| %.3e\n",
                 r.q4nx_rel, r.q4nx_max_abs);
     std::printf("  parameters: bf16 scale/zero exact for %.2f%% of 32-column groups (format limit)\n",

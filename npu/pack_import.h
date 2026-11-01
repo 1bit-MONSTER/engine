@@ -83,6 +83,9 @@ struct Report {
     // Self-check 1: the 4-bit decoder against the pack's own independent data. With
     // tie_word_embeddings the pack's lm_head must reproduce its fp16 embedding, so the
     // decode is checked against the embedding, and two wrong decoders are run as controls.
+    // An untied pack has no such reference and the numbers are left at 0 with
+    // selfcheck_reference false -- a wrong number would be worse than none.
+    bool selfcheck_reference = false;
     double lmhead_corr = 0, lmhead_rel = 0, ctrl_corr_nibble = 0, ctrl_corr_nozp = 0;
 
     // Self-check 2: the written container, read back, against the pack's dequantised values.

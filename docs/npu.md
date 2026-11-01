@@ -269,9 +269,17 @@ got before.
 | `top_k` | keep the `k` highest logits; `0` or absent keeps all of them |
 | `top_p` | nucleus sampling, `1` or absent keeps all of them (`min_keep` candidates always stay) |
 | `seed` | the same seed and the same request give the same text; absent or `-1` seeds from the clock |
+| `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
+| `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema"}` is a 400 |
+
+`logprobs` keeps OpenAI's shape: non-streamed, every entry is `choices[0].logprobs.content[i] =
+{token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
+chunk carries, so the deltas add up to the non-streamed reply. Token text that is half a character is reported
+with the invalid bytes replaced, never as a failed request. The `/v1/completions` route's legacy logprobs object
+is not implemented and asking for it there is a 400, not a silently dropped field.
 
 A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema` needs a
 schema-to-GBNF converter this route does not have", "`gbnf: unterminated literal at line 1`"),

@@ -45,6 +45,11 @@ DRY=${WEEKLY_DRY_RUN:-0}
 # the box is shared: a capped build leaves room for whatever else runs on Sunday
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
+# DwarfStar is out of the release (owner decision 2026-11-01): the build below defaults ONEBIT_DS4 to OFF, the
+# preflight reads ${ONEBIT_DS4:-OFF} and scripts/package-linux.sh requires the ds4 tools only when it is not OFF.
+# Exported here so all three read the same value from one place - a plain run (no ONEBIT_DS4 in the environment)
+# otherwise builds a no-DS4 engine and then fails at packaging looking for ds4 tools that were never built.
+export ONEBIT_DS4=${ONEBIT_DS4:-OFF}
 # the submodules the packages are built from (laya only on its bump)
 # (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
 SUBMODULES=(hrx-system llama.cpp lemonade ds4 tokenizers)

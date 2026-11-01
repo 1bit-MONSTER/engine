@@ -1,0 +1,55 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Kernel config fragment: what our kernel has to build in for a Puppy base.
+#
+# Measured 2026-11-01 (docs/os-v3-live-puppy-eval.md): Puppy's initrd mounts the medium and layers the
+# save file with these drivers and filesystems itself, so they must be in the image, not in a module the
+# initrd has no way to load yet. Our 7.3.0-rc4-1bit-perfopt+ has them as modules (Ubuntu's shape) and
+# the initrd stops 2.1 s into the boot with
+#
+#   *** /puppy_upup64n_24.04.sfs not found.   ... dropping out to console
+#
+# because it cannot read the ISO at all. Puppy's own stock kernel (6.8.12, from kernel-kit) has every one
+# of these =y; that is the comparison this fragment closes. Values in brackets are ours today.
+#
+# Build: scripts/... appends this file to the kernel .config before `make olddefconfig` (the weekly
+# kernel build already takes a fragment), then os/v3/puppy/mk-huge-kernel.sh packages the result.
+
+# --- the medium: CD (the ISO in QEMU, and a stick written as an ISO) -------------------------------
+CONFIG_BLK_DEV_SR=y                     # [m]  the initrd reads /dev/sr0 before any module load
+CONFIG_ISO9660_FS=y                     # [m]
+CONFIG_BLK_DEV_SD=y                     # [m]  a USB stick written the Puppy way
+CONFIG_BLK_DEV_NVME=y                   # [m]  the frugal install's own disk
+CONFIG_USB=y                            # [m]
+CONFIG_USB_XHCI_HCD=y                   # [m]
+CONFIG_USB_STORAGE=y                    # [m]
+
+# --- the layers: the SFS (ro) and the save file (rw) ----------------------------------------------
+CONFIG_SQUASHFS=y                       # [m]
+CONFIG_OVERLAY_FS=y                     # [m]  Puppy's union (no AUFS in this kernel, and none needed)
+CONFIG_BLK_DEV_LOOP=y                   # [m]  the save file is a filesystem inside a file
+CONFIG_EXT4_FS=y                        # [m]  ... on a frugal install's partition
+CONFIG_FAT_FS=y                         # [m]  ... or on the stick's vfat
+CONFIG_VFAT_FS=y                        # [m]
+CONFIG_NLS_CODEPAGE_437=y               # [m]
+CONFIG_NLS_ISO8859_1=y                  # [m]
+
+# --- the machine: efivars, a console, a keyboard --------------------------------------------------
+CONFIG_EFIVAR_FS=y                      # [m]  engine#709: efibootmgr in the installer and the installed box
+CONFIG_DEVTMPFS_MOUNT=y                 # [not set]  the initrd hands over to a populated /dev
+CONFIG_DRM_SIMPLEDRM=y                  # [not set]  tty1 on a box whose GPU driver is not up yet, and in a VM
+CONFIG_HID_GENERIC=y                    # [m]  the console keyboard (the os/mini image's first boots had none)
+CONFIG_USB_HID=y                        # [m]

@@ -429,7 +429,18 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
             std::string why = finish;
             if (!ans.calls.empty() && why == "stop") why = "tool_calls";
             json choice{{"index", 0}, {"message", message}, {"finish_reason", why}};
-            if (opts.sample.logprobs) choice["logprobs"] = logprobs_json(lps);
+            if (opts.sample.logprobs) {
+                // (issue #651 item 3) entries exist for content tokens only: reasoning and call
+                // markup get none, which is what the parser's own boundary says.
+                std::vector<std::string> texts;
+                texts.reserve(lps.size());
+                for (const auto& x : lps) texts.push_back(x.text);
+                const std::vector<char> keep = npu::content_mask(texts, npu::AnswerFamily::qwen3, opts.tools_sent);
+                std::vector<Emitted> content_lps;
+                for (size_t i = 0; i < lps.size(); i++)
+                    if (i < keep.size() && keep[i]) content_lps.push_back(lps[i]);
+                choice["logprobs"] = logprobs_json(content_lps);
+            }
             out["choices"] = json::array({choice});
         } else {
             out["choices"] = json::array({{{"index", 0}, {"text", content}, {"finish_reason", finish}}});

@@ -37,6 +37,11 @@ set -euo pipefail
 [ $# -ge 3 ] || { sed -n '/^# build.sh/,/^# Inside the container/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 compat=$1 kernel=$2 out=$3
 woof=${4:-/tmp/woof-ce}
+# The build tree must live on a real filesystem: 3builddistro mounts an overlay for its petbuild chroots,
+# and overlay-on-overlay is refused (measured: "mount: ... bad superblock on petbuild", then the chroot has
+# no bash and the build stops at busybox). A container's own rootfs is overlay, so the build root is a
+# host directory bind-mounted in.
+build_root=${BUILD_ROOT:-$(mktemp -d /tmp/1bit-puppy-build.XXXXXX)}
 [ -f "$woof/merge2out" ] || { echo "build: no woof-CE at $woof" >&2; exit 1; }
 kernel=$(cd "$kernel" && pwd)
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
@@ -45,8 +50,11 @@ mkdir -p "$out"; out=$(cd "$out" && pwd)
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
+mkdir -p "$build_root"
+build_root=$(cd "$build_root" && pwd)
+echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root"
 exec docker run --rm --privileged --memory=12g --cpus=4 \
-    -v "$woof":/woof -v "$kernel":/kernels:ro -v "$out":/out \
+    -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config GITHUB_ACTIONS=true
@@ -57,9 +65,11 @@ apt-get install -y -qq --no-install-recommends build-essential libc6-dev dc debo
 echo "dash dash/sh boolean false" | debconf-set-selections
 dpkg-reconfigure dash >/dev/null 2>&1 || true
 ln -sf bash /bin/ash
-cd /woof
-mkdir -p local-repositories petbuild-sources petbuild-cache petbuild-output
-[ -e ../local-repositories ] || ln -s /woof/local-repositories ../local-repositories
+# the whole build happens in /work, which is a host filesystem (ext4), so the petbuild overlay mounts work
+cp -a /woof /work/woof-CE
+cd /work/woof-CE
+mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
+[ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
 [ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
 install -m 755 local-repositories/vercmp /usr/local/bin/vercmp
 install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr/local/petget/categories.dat

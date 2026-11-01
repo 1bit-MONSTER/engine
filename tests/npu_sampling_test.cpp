@@ -36,6 +36,7 @@ using onebit::npu::AnswerFamily;
 using onebit::npu::AnswerStream;
 using onebit::npu::json_grammar;
 using onebit::npu::parse_answer;
+using onebit::npu::tool_call_gbnf;
 using onebit::npu::kRandomSeed;
 using onebit::npu::PrefixOptions;
 using onebit::npu::PrefixCache;
@@ -688,6 +689,105 @@ void test_answer_stream() {
     }
 }
 
+// Two tools: one with a required string field, one that declares no parameters at all.
+const char* kTools = R"([{"type": "function", "function": {"name": "get_weather",
+      "parameters": {"type": "object", "properties": {"city": {"type": "string"}},
+                     "required": ["city"], "additionalProperties": false}}},
+    {"type": "function", "function": {"name": "ping"}}])";
+
+void test_tool_grammar() {
+    const auto tools = nlohmann::json::parse(kTools);
+    // tool_choice "required", one call at a time: names and argument types are unforgeable.
+    const Grammar g(tool_call_gbnf(tools, nlohmann::json("required"), false));
+    check(run(g, R"(<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>)").can_stop,
+          "a well-formed call is accepted");
+    check(run(g, R"(<tool_call>{"name": "ping", "arguments": {}}</tool_call>)").can_stop,
+          "a tool that declares no parameters still takes an arguments object");
+    check(!run(g, R"(<tool_call>{"name": "get_weathr", "arguments": {"city": "Paris"}}</tool_call>)").alive,
+          "a misspelt tool name cannot be generated");
+    check(!run(g, R"(<tool_call>{"name": "get_weather", "arguments": {"city": 7}}</tool_call>)").alive,
+          "an argument of the wrong type cannot be generated");
+    check(!run(g, R"(<tool_call>{"name": "get_weather", "arguments": {}}</tool_call>)").alive,
+          "a missing required argument cannot be generated");
+    check(!run(g, R"(<tool_call>{"name": "get_weather", "arguments": {"city": "Paris", "x": 1}}</tool_call>)").alive,
+          "an argument the schema does not declare cannot be generated");
+    check(!run(g, R"(```json
+{"name": "get_weather", "arguments": {"city": "Paris"}}
+```)").alive,
+          "a Markdown fence cannot wrap the call");
+    check(!run(g, R"(<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>
+<tool_call>{"name": "ping", "arguments": {}}</tool_call>)").alive,
+          "parallel_tool_calls false refuses a second call");
+
+    // parallel_tool_calls true: one or more calls.
+    const Grammar par(tool_call_gbnf(tools, nlohmann::json("required"), true));
+    check(run(par, R"(<tool_call>{"name": "ping", "arguments": {}}</tool_call>
+<tool_call>{"name": "get_weather", "arguments": {"city": "Rome"}}</tool_call>)").can_stop,
+          "parallel_tool_calls true accepts several calls");
+
+    // The object form names one function: the other one is not generable.
+    const auto only = nlohmann::json::parse(R"({"type": "function", "function": {"name": "ping"}})");
+    const Grammar one(tool_call_gbnf(tools, only, false));
+    check(run(one, R"(<tool_call>{"name": "ping", "arguments": {}}</tool_call>)").can_stop,
+          "tool_choice function accepts that function");
+    check(!run(one, R"(<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>)").alive,
+          "tool_choice function refuses the other tools");
+
+    // "auto" and "none" install no grammar, and say so by returning "".
+    check(tool_call_gbnf(tools, nlohmann::json("auto"), true).empty(),
+          "tool_choice auto installs no grammar (a call-or-text alternation is not a CFG)");
+    check(tool_call_gbnf(tools, nlohmann::json("none"), true).empty(), "tool_choice none installs no grammar");
+    check(tool_call_gbnf(nlohmann::json::array(), nlohmann::json("required"), true).empty(),
+          "no tools means no tool grammar");
+}
+
+void test_tool_request_parsing() {
+    auto starts_with = [](const std::string& s, const std::string& prefix) { return s.rfind(prefix, 0) == 0; };
+    const std::string tools = std::string(R"({"tools": )") + kTools + "}";
+    // required -> a grammar is installed
+    auto req = options_from_body(nlohmann::json::parse(
+        std::string(R"({"tools": )") + kTools + R"(, "tool_choice": "required"})"));
+    check(!req.grammar.empty() && req.tool_grammar, "tool_choice required installs the call grammar");
+    // auto (the default) -> no grammar, and no error either
+    auto autod = options_from_body(nlohmann::json::parse(tools));
+    check(autod.grammar.empty() && !autod.tool_grammar, "tools with no tool_choice leave the answer free");
+    // parallel_tool_calls must be a bool, and needs tools
+    check(starts_with(error_of(nlohmann::json::parse(
+                          std::string(R"({"tools": )") + kTools + R"(, "tool_choice": "required", "parallel_tool_calls": 1})")),
+                      "parallel_tool_calls:"),
+          "parallel_tool_calls must be true or false");
+    check(starts_with(error_of(nlohmann::json::parse(R"({"tool_choice": "required"})")), "tool_choice:"),
+          "tool_choice without tools is refused");
+    check(!error_of(nlohmann::json::parse(
+                        std::string(R"({"tools": )") + kTools + R"(, "tool_choice": {"type": "function", "function": {"name": "nope"}}})"))
+               .empty(),
+          "tool_choice naming a tool that was not declared is refused");
+    check(!error_of(nlohmann::json::parse(R"({"tools": [{"function": {"name": "a"}}, {"function": {"name": "a"}}]})"))
+               .empty(),
+          "a duplicate function name is refused");
+    check(!error_of(nlohmann::json::parse(R"({"tools": [{"type": "other", "function": {"name": "a"}}]})")).empty(),
+          "a tool whose type is not function is refused");
+    check(!error_of(nlohmann::json::parse(
+                        R"({"tools": [{"function": {"name": "a", "parameters": {"type": "string", "pattern": "^x$"}}}],
+                            "tool_choice": "required"})"))
+               .empty(),
+          "under tool_choice required, an argument schema this converter cannot honour is refused");
+    check(error_of(nlohmann::json::parse(
+                      R"({"tools": [{"function": {"name": "a", "parameters": {"type": "string", "pattern": "^x$"}}}],
+                          "tool_choice": "auto"})"))
+              .empty(),
+          "under tool_choice auto no grammar is built, so no schema is rejected");
+    // one grammar at a time
+    check(starts_with(error_of(nlohmann::json::parse(
+                          std::string(R"({"grammar": "root ::= \"a\"", "tools": )") + kTools + "}")),
+                      "tools:"),
+          "grammar and tools together are refused");
+    check(starts_with(error_of(nlohmann::json::parse(
+                          std::string(R"({"response_format": {"type": "json_object"}, "tools": )") + kTools + "}")),
+                      "tools:"),
+          "response_format and tools together are refused");
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -752,6 +852,8 @@ int main() {
     test_json_schema_refusals();
     test_answer_parser();
     test_answer_stream();
+    test_tool_grammar();
+    test_tool_request_parsing();
     test_request_parsing();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;

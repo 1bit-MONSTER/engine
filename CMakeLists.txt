@@ -170,6 +170,11 @@ add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh
 # --device hybrid (docs/hybrid.md): the handoff with a fake backend and a fake provider; and, with a model,
 # end to end on the CPU llama-server (ONEBIT_SERVE_TEST_LLAMA_SERVER, else the build's own; skips without one)
 add_test(NAME hybrid_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_route.sh $<TARGET_FILE:onebit>)
+# target 1's shared route (ONEBIT_KV_SHARE=1): the fake backend speaks ?action=share/adopt and the fake
+# provider fails unless it was handed one readable fd per region -- so the socket, the inherited fds, the
+# share_id and the fallback are all pinned with no model, no GPU and no dma-buf. Needs no exporter, so CI can
+# run it (the GPU gate in ~/wt/zc-probes cannot).
+add_test(NAME hybrid_kvshare_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_kvshare_route.sh $<TARGET_FILE:onebit>)
 set(ONEBIT_SERVE_TEST_LLAMA_SERVER "" CACHE FILEPATH "llama-server for hybrid_e2e (default: the build's own)")
 if(ONEBIT_SERVE_TEST_GGUF)
     add_test(NAME hybrid_e2e

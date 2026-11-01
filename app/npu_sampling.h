@@ -41,6 +41,7 @@
 #include <nlohmann/json.hpp>
 
 #include "npu_json_schema.h"
+#include "npu_tool_grammar.h"
 
 namespace onebit::npu {
 
@@ -240,6 +241,9 @@ struct Options {
     // (issue #652 item 3) Whether the request carried `tools` decides whether <tool_call> markup in
     // the answer is a call or text the caller asked for, so the answer parser has to know.
     bool tools_sent = false;
+    // tools / tool_choice (#652 item 2): the grammar for tool_choice "required" and the
+    // {"type": "function"} form; empty for "auto", for "none", and when no tools were sent.
+    bool tool_grammar = false;  // the grammar above came from tools[], not from the client
 };
 
 // Read the decode options out of a request body.  A body that names none of them gets
@@ -316,7 +320,6 @@ inline Options options_from_body(const nlohmann::json& body) {
     bool client_grammar = false;
     // (issue #652 item 3) recorded before the grammar branches, because the answer parser needs it
     // whether or not a grammar was installed.
-    if (body.contains("tools")) o.tools_sent = true;
     if (body.contains("grammar")) {
         const auto& v = body.at("grammar");
         if (!v.is_string()) throw std::runtime_error("grammar: must be a GBNF string");
@@ -348,6 +351,30 @@ inline Options options_from_body(const nlohmann::json& body) {
             throw std::runtime_error("response_format: unknown type '" + type + "'");
         }
     }
+    if (body.contains("tools")) {
+        o.tools_sent = true;  // the answer parser's rule (issue #652 item 3) needs this either way
+        if (client_grammar)
+            throw std::runtime_error("tools: conflicts with grammar; send one of them");
+        if (body.contains("response_format"))
+            throw std::runtime_error("tools: conflicts with response_format; send one of them");
+        bool parallel = true;
+        if (body.contains("parallel_tool_calls")) {
+            const auto& v = body.at("parallel_tool_calls");
+            if (!v.is_boolean()) throw std::runtime_error("parallel_tool_calls: must be true or false");
+            parallel = v.get<bool>();
+        }
+        const nlohmann::json choice = body.contains("tool_choice") ? body.at("tool_choice") : nlohmann::json("auto");
+        std::string g = tool_call_gbnf(body.at("tools"), choice, parallel);
+        if (!g.empty()) {
+            o.grammar = std::move(g);
+            o.tool_grammar = true;
+        }
+        // "auto" and "none" install no grammar on purpose (app/npu_tool_grammar.h says why), so an
+        // empty result is not an error: the answer is unconstrained and the caller validates it.
+    } else if (body.contains("tool_choice") || body.contains("parallel_tool_calls")) {
+        throw std::runtime_error("tool_choice: needs tools; send the functions the answer may call");
+    }
+
     if (o.json_object && client_grammar)
         throw std::runtime_error("response_format: json_object conflicts with grammar; send one of them");
     return o;

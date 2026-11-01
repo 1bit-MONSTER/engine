@@ -67,38 +67,49 @@ int main() {
 
     const auto none = env_of({});
     {
-        // auto, CWSR on, nothing set: the three variables and the line the docs quote
-        const auto d = decide_cwsr_placement(CwsrPlacement::Auto, read_cwsr_enable(dir + "/on"), true, none);
-        expect(d.env == kAll, "auto + CWSR on: all three");
-        expect(d.log == "HRX: CWSR is on; CWSR save area placed in GTT (engine#315)", "auto + on log: " + d.log);
+        // auto since 2026-10-31 no longer waits for cwsr_enable: the GTT placement is the default whatever
+        // the module says, because SVM placement with pageable userptr disabled page-faults on the first
+        // HRX graph replay even with CWSR off (engine#715, docs/hrx.md)
+        for (const char* path : {"/on", "/off", "/auto", "/junk", "/missing"}) {
+            const auto d = decide_cwsr_placement(CwsrPlacement::Auto, read_cwsr_enable(dir + path), true, none);
+            expect(d.env == kAll, std::string("auto (cwsr ") + path + "): all three");
+            expect(d.log.find("placed in GTT by default") != std::string::npos,
+                   std::string("auto log names the default (") + path + "): " + d.log);
+            expect(d.log.find("--hrx-cwsr-placement=off or HRX_SVM=1 opts out") != std::string::npos,
+                   std::string("auto log names the opt-outs (") + path + "): " + d.log);
+        }
     }
     {
-        // auto, CWSR off (the shipped default): nothing changes, one line says so
-        const auto d = decide_cwsr_placement(CwsrPlacement::Auto, read_cwsr_enable(dir + "/off"), true, none);
-        expect(d.env.empty(), "auto + CWSR off: no variables");
-        expect(d.log.find("CWSR is off") != std::string::npos, "auto + off log: " + d.log);
-    }
-    for (const char* path : {"/auto", "/junk", "/missing"}) {
-        const auto d = decide_cwsr_placement(CwsrPlacement::Auto, read_cwsr_enable(dir + path), true, none);
-        expect(d.env.empty(), std::string("auto + unknown (") + path + "): no variables");
-        expect(d.log.find("unknown") != std::string::npos, "auto + unknown log: " + d.log);
+        // HRX_SVM=1 is the environment opt-out: nothing is added and the line says so
+        const auto d = decide_cwsr_placement(CwsrPlacement::Auto, 1, true, env_of({{"HRX_SVM", "1"}}));
+        expect(d.env.empty(), "auto + HRX_SVM=1: no variables");
+        expect(d.log.find("HRX_SVM=1") != std::string::npos, "auto + HRX_SVM=1 log: " + d.log);
+        const auto d0 = decide_cwsr_placement(CwsrPlacement::Auto, 0, true, env_of({{"HRX_SVM", "1"}}));
+        expect(d0.env.empty(), "auto + HRX_SVM=1 with CWSR off: no variables either");
+        const auto dother = decide_cwsr_placement(CwsrPlacement::Auto, 1, true, env_of({{"HRX_SVM", "0"}}));
+        expect(dother.env == kAll, "auto + HRX_SVM=0 is not the opt-out: all three");
     }
     for (const char* var : kCwsrPlacementVars) {
-        // auto, CWSR on, the user set one of the three (any value): serve adds none of them
+        // a value the user set still wins per variable: the other two are added, this one is left alone
         const auto d = decide_cwsr_placement(CwsrPlacement::Auto, 1, true, env_of({{var, "1"}}));
-        expect(d.env.empty(), std::string("auto + user ") + var + ": no variables");
-        expect(d.log.find(var) != std::string::npos, "auto + user log names it: " + d.log);
+        expect(d.env == kAll, std::string("auto + user ") + var + ": all three offered (the child keeps the user value)");
+        expect(d.log.find(std::string("kept from the environment: ") + var) != std::string::npos,
+               std::string("auto + user log names it: ") + d.log);
     }
     {
-        // the user set an empty value: still set by the user
+        // the user set an empty value: still set by the user, so it is named in the log
         const auto d = decide_cwsr_placement(CwsrPlacement::Auto, 1, true, env_of({{"HSA_USE_SVM", ""}}));
-        expect(d.env.empty(), "auto + user HSA_USE_SVM= (empty): no variables");
+        expect(d.env == kAll, "auto + user HSA_USE_SVM= (empty): all three offered");
+        expect(d.log.find("kept from the environment: HSA_USE_SVM") != std::string::npos,
+               "auto + user HSA_USE_SVM= (empty) log: " + d.log);
     }
     {
-        // auto, CWSR on, an hrx-system without the gate: nothing (HSA_USE_SVM=0 would leave no HRX0)
-        const auto d = decide_cwsr_placement(CwsrPlacement::Auto, 1, false, none);
-        expect(d.env.empty(), "auto + no gate: no variables");
-        expect(d.log.find("no HRX_ALLOW_NO_SVM gate") != std::string::npos, "auto + no gate log: " + d.log);
+        // an hrx-system without the gate: nothing (HSA_USE_SVM=0 would leave no HRX0), whatever cwsr_enable says
+        for (int c : {1, 0, -1}) {
+            const auto d = decide_cwsr_placement(CwsrPlacement::Auto, c, false, none);
+            expect(d.env.empty(), "auto + no gate: no variables");
+            expect(d.log.find("no HRX_ALLOW_NO_SVM gate") != std::string::npos, "auto + no gate log: " + d.log);
+        }
     }
     {
         // on: whatever cwsr_enable says

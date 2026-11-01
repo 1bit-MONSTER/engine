@@ -273,7 +273,7 @@ got before.
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
-| `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema"}` is a 400 |
+| `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
 
 `logprobs` keeps OpenAI's shape: non-streamed, every entry is `choices[0].logprobs.content[i] =
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
@@ -281,8 +281,17 @@ chunk carries, so the deltas add up to the non-streamed reply. Token text that i
 with the invalid bytes replaced, never as a failed request. The `/v1/completions` route's legacy logprobs object
 is not implemented and asking for it there is a 400, not a silently dropped field.
 
-A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema` needs a
-schema-to-GBNF converter this route does not have", "`gbnf: unterminated literal at line 1`"),
+`json_schema` is compiled to a grammar before the first token, by `app/npu_json_schema.h`, so the answer
+cannot leave the schema while it is being written rather than being validated afterwards. The covered subset
+is OpenAI's structured outputs: objects (`properties`, `required`, `additionalProperties: false`), arrays
+(`items`, `minItems`, `maxItems`), `string`, `number`, `integer`, `boolean`, `null`, a type list such as
+`["string", "null"]`, `enum`, `const`, and `oneOf`/`anyOf` as alternation. Anything outside it (`pattern`,
+`format`, `minimum`/`maximum`, `$ref`, `allOf`, …) is a 400 that names the keyword: a constraint quietly
+dropped from a schema would leave the caller believing the answer was validated. Properties are generated in
+the schema's order with the required ones first, so the object's key order is fixed for a given schema.
+
+A field the route cannot honour is a 400 whose `error.message` says why ("`json_schema`: pattern is not
+supported by this route's schema-to-GBNF converter", "`gbnf: unterminated literal at line 1`"),
 never a silently ignored key. `finish_reason` is `length` when `max_tokens` ran out, and `stop` for
 an end-of-sequence token, a stop sequence or a grammar that allows nothing more.
 
@@ -294,8 +303,8 @@ neither. The grammar (`app/npu_grammar.h`) is the same rule model - one flat ele
 rule, `ALT`/`END` between alternatives - as a byte-level pushdown automaton: a token is only
 sampled when its decoded text leaves the grammar alive, which is checked per token against the
 byte ranges the grammar can continue with. Both headers are device-free, and
-`tests/npu_sampling_test.cpp` runs the sampler, the parser, the JSON grammar and the request
-parser in CI without a model or an NPU.
+`tests/npu_sampling_test.cpp` runs the sampler, the parser, the JSON grammar, the schema converter and the
+request parser in CI without a model or an NPU.
 
 ```
 $ curl -sS localhost:8000/v1/completions -d '{"prompt": "The capital of France is", "max_tokens": 16,

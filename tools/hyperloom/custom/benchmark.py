@@ -396,6 +396,12 @@ def kld(ppl, model, args, base, wiki, timeout, out_dir):
 
 def main():
     started = time.time()
+    # Box rule first: nothing else in this run may even resolve if it asks for the forbidden shape.
+    if longctx_drafter_conflict():
+        raise SystemExit(
+            "refusing HL_DFLASH with HL_LONGCTX>0: the drafter at long context is the arm that faulted the "
+            "HRX graph on this box (27B, 18.8k, 2026-11-01 11:13 reset) and the box rule forbids it until "
+            "engine#764's refusal guardrail is merged")
     out_dir = pathlib.Path(env("RESULT_DIR") or ".").expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     name = env("RESULT_FILENAME") or "inferencex_result"
@@ -421,11 +427,6 @@ def main():
     # engine#679: an optional long-context decode leg, whose rate becomes the score.
     longctx = env_int("HL_LONGCTX", 0)
     longtok = env_int("HL_LONGTOK", 128)
-    if longctx_drafter_conflict():
-        raise SystemExit(
-            "refusing HL_DFLASH with HL_LONGCTX>0: the drafter at long context is the arm that faulted the "
-            "HRX graph on this box (27B, 18.8k, 2026-11-01 11:13 reset) and the box rule forbids it until "
-            "engine#764's refusal guardrail is merged")
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     log(f"model={model} bin={bin_dir} state={state}")

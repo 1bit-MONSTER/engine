@@ -75,6 +75,14 @@ for f in cmake/hrx.cmake scripts/build-ds4.sh; do
 done
 grep -q "fetch-rocm-sdk.sh" "$root/scripts/weekly.sh" && ok "scripts/weekly.sh fetches the pinned toolchain" ||
     bad "scripts/weekly.sh does not fetch the pinned toolchain (scripts/fetch-rocm-sdk.sh)"
+# the tree copy must be resolved from the pin's version+target, never by glob order: with two SDKs on disk a
+# glob takes whatever sorts first, and after a version bump that is the old one (pi-prs's review of #771)
+grep -q 'rocm-sdk-${_hrx_ver}-${_hrx_gfx}' "$root/cmake/hrx.cmake" && ok "cmake resolves the toolchain from the pin, not a glob" ||
+    bad "cmake/hrx.cmake does not resolve the toolchain from the pin's version+gfx"
+grep -qF 'rocm-sdk-$(sed -n' "$root/scripts/build-ds4.sh" && ok "build-ds4.sh resolves the toolchain from the pin, not a glob" ||
+    bad "scripts/build-ds4.sh does not resolve the toolchain from the pin's version+gfx"
+grep -q "removing stale toolchain" "$root/scripts/fetch-rocm-sdk.sh" && ok "the fetch drops a stale sibling tree after a bump" ||
+    bad "scripts/fetch-rocm-sdk.sh leaves a stale toolchain behind after a bump"
 # the HIP kernels are compiled by a separate amdclang++ invocation that does not inherit the llama.cpp
 # build's flags: without these two the compile step still needs HIP_DEVICE_LIB_PATH/ROCM_PATH in the
 # environment and takes the compiler from /opt (the gap pi-prs found in review)

@@ -33,20 +33,38 @@
 include(ExternalProject)
 
 # The toolchain (docs/hrx.md, "The toolchain"; engine#713): the pinned copy under the tree first,
-# because the build must need nothing outside the repository (scripts/fetch-rocm-sdk.sh fills it,
-# testing the pin config/hrx-toolchain.config names), then the box's TheRock, then a distro ROCm.
-# -DONEBIT_HRX_TOOLCHAIN=<dir>, or ROCM_PATH through the build scripts, overrides all three.
+# because the build must need nothing outside the repository (scripts/fetch-rocm-sdk.sh fills it at
+# the pin config/hrx-toolchain.config names), then the box's TheRock, then a distro ROCm.
+# The tree copy is resolved from the pin itself, version and target, not from a glob: a glob takes
+# whatever sorts first, so after a version bump the old SDK would win silently (pi-prs's review of
+# #771). -DONEBIT_HRX_TOOLCHAIN=<dir>, or ROCM_PATH through the build scripts, overrides all three.
 if(NOT ONEBIT_HRX_TOOLCHAIN)
-    file(GLOB _hrx_toolchains "${CMAKE_SOURCE_DIR}/third_party/toolchain/rocm-sdk-*-gfx*")
-    if(_hrx_toolchains)
-        list(SORT _hrx_toolchains)
-        list(GET _hrx_toolchains 0 _hrx_toolchain_pinned)
-    elseif(EXISTS "/opt/rocm-therock")
-        set(_hrx_toolchain_pinned "/opt/rocm-therock")
-    else()
-        set(_hrx_toolchain_pinned "/opt/rocm")
+    set(_hrx_toolchain_pinned "")
+    set(_hrx_pin "${CMAKE_SOURCE_DIR}/config/hrx-toolchain.config")
+    if(EXISTS "${_hrx_pin}")
+        file(STRINGS "${_hrx_pin}" _hrx_ver REGEX "^version=")
+        file(STRINGS "${_hrx_pin}" _hrx_gfx REGEX "^gfx=")
+        list(LENGTH _hrx_ver _hrx_ver_n)
+        list(LENGTH _hrx_gfx _hrx_gfx_n)
+        if(_hrx_ver_n GREATER 0 AND _hrx_gfx_n GREATER 0)
+            list(GET _hrx_ver 0 _hrx_ver)
+            list(GET _hrx_gfx 0 _hrx_gfx)
+            string(REPLACE "version=" "" _hrx_ver "${_hrx_ver}")
+            string(REPLACE "gfx=" "" _hrx_gfx "${_hrx_gfx}")
+            set(_hrx_pinned_dir "${CMAKE_SOURCE_DIR}/third_party/toolchain/rocm-sdk-${_hrx_ver}-${_hrx_gfx}")
+            if(EXISTS "${_hrx_pinned_dir}/bin/amdclang")
+                set(_hrx_toolchain_pinned "${_hrx_pinned_dir}")
+            endif()
+        endif()
     endif()
-    set(ONEBIT_HRX_TOOLCHAIN "${_hrx_toolchain_pinned}" CACHE PATH "ROCm/TheRock root: its amdclang builds llama.cpp and HRX")
+    if(_hrx_toolchain_pinned)
+        set(_hrx_toolchain_default "${_hrx_toolchain_pinned}")
+    elseif(EXISTS "/opt/rocm-therock")
+        set(_hrx_toolchain_default "/opt/rocm-therock")
+    else()
+        set(_hrx_toolchain_default "/opt/rocm")
+    endif()
+    set(ONEBIT_HRX_TOOLCHAIN "${_hrx_toolchain_default}" CACHE PATH "ROCm/TheRock root: its amdclang builds llama.cpp and HRX")
 endif()
 message(STATUS "ONEBIT_HRX: toolchain ${ONEBIT_HRX_TOOLCHAIN}")
 

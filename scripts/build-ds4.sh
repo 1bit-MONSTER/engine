@@ -61,8 +61,16 @@ jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}   # the weekly job and thermal guar
 
 rocm=${ROCM_PATH:-}
 if [ -z "$rocm" ]; then
-    for d in "$root"/third_party/toolchain/rocm-sdk-*-gfx* /opt/rocm-therock /opt/rocm; do
-        [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
+    # The pinned tree copy, resolved from the pin file (version and target) rather than from a glob: a
+    # glob takes whatever sorts first, so after a version bump the old SDK would win silently (pi-prs's
+    # review of #771). Then the box's TheRock, then a distro ROCm.
+    pinned=
+    pinfile=$root/config/hrx-toolchain.config
+    if [ -r "$pinfile" ]; then
+        pinned=$root/third_party/toolchain/rocm-sdk-$(sed -n 's/^version=//p' "$pinfile" | tail -1)-$(sed -n 's/^gfx=//p' "$pinfile" | tail -1)
+    fi
+    for d in "$pinned" /opt/rocm-therock /opt/rocm; do
+        [ -n "$d" ] && [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
     done
 fi
 [ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||

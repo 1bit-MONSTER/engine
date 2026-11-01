@@ -58,8 +58,7 @@ pin="$version $gfx"
 sdk_core() { local c; c=$(ls -d "$dest"/lib/python3*/site-packages/_rocm_sdk_core 2>/dev/null | head -1); echo "${c:-}"; }
 
 # verify <dest>: is this tree the pinned toolchain, complete enough to build with?
-verify() {
-    local f core
+verify() {    local f core
     [ "$(cat "$dest/.pin" 2>/dev/null || true)" = "$pin" ] ||
         { echo "$me: $dest is not the pinned toolchain (want '$pin', marker says '$(cat "$dest/.pin" 2>/dev/null || echo none)')" >&2; return 1; }
     for f in $require; do
@@ -77,7 +76,19 @@ if [ "$check" = 1 ]; then
     echo "$dest"
     exit 0
 fi
-if verify 2>/dev/null; then echo "$dest"; exit 0; fi
+# The toolchain directory is this script's by contract, and a stale tree from an older pin is exactly what
+# pi-prs found winning silently under the old glob order: whichever way we finish, the siblings go, so a bump
+# leaves exactly one toolchain behind and nothing can pick the wrong one.
+prune_stale() {
+    local old
+    for old in "$(dirname "$dest")"/rocm-sdk-*; do
+        [ "$old" = "$dest" ] && continue
+        [ -d "$old" ] || continue
+        echo "$me: removing stale toolchain $old (the pin is '$pin')" >&2
+        rm -rf "$old"
+    done
+}
+if verify 2>/dev/null; then prune_stale; echo "$dest"; exit 0; fi
 
 # A fresh fetch: the venv and the SDK at the pin. `rocm[...]` is the meta package, so the extras are
 # the four parts the build uses (hipcc and the compilers from devel, the libraries from libraries,
@@ -92,4 +103,5 @@ python3 -m venv "$dest" || { echo "$me: python3 -m venv $dest failed (needs pyth
     { echo "$me: cannot install rocm[libraries,devel,device-$gfx]==$version from $index" >&2; exit 1; }
 echo "$pin" > "$dest/.pin"
 verify || exit 1
+prune_stale
 echo "$dest"

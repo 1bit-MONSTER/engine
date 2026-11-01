@@ -27,10 +27,19 @@ hostname -F /etc/hostname
 echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"; echo
 
 # #703: the cmdline boots the VT at loglevel=4, so the screen shows the appliance instead of every kernel
-# line. ttyS0 is the console the QEMU gates read and it keeps the verbose log: kernels with per-console
-# levels expose /sys/class/console/<name>/level, and where they do not the global level stays at 4 (the
-# gates match init's own lines, which are printed regardless of the kernel level).
-[ -w /sys/class/console/ttyS0/level ] && echo 7 > /sys/class/console/ttyS0/level
+# line. The serial transcript must keep the kernel log it had with ignore_loglevel - that log is what the
+# 26 Oct hardware debugging was read from. Two ways, in order of preference:
+#   1. a per-console level, where the kernel has it (/sys/class/console appears in 6.15+);
+#   2. this box's kernel does not have it (`ls /sys/class/console` -> No such file), so replay the ring buffer
+#      into ttyS0 and then follow it: /dev/kmsg is non-consuming (dmesg still works afterwards) and a fresh
+#      open starts at the oldest record, so the early boot lines are in the transcript too.
+# The VT is untouched by either, and init's own lines are printed at any kernel level, so the gates' serial
+# assertions (the LIVE banner, INSTALLED) are unaffected.
+if [ -w /sys/class/console/ttyS0/level ]; then
+    echo 7 > /sys/class/console/ttyS0/level
+elif [ -c /dev/ttyS0 ] && [ -r /dev/kmsg ]; then
+    ( cat /dev/kmsg > /dev/ttyS0 ) > /dev/null 2>&1 &
+fi
 
 # drivers, in the order the boot needs them: network, USB storage and the USB4/Type-C stack first, so
 # the machine is reachable and the stick readable even if a GPU probe is slow. sd_mod makes a USB

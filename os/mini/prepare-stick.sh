@@ -129,6 +129,43 @@ partnode() {   # <disk-node-or-"/dev/loopN"> <start-sector> -> node on stdout
 }
 
 PART=
+# ---- grow the data partition to the end of the device (#706) ---------------------------------------
+# The image carries a 2 GiB data partition - that is what makes it a 2.3 GiB write - so on the 64 GiB stick
+# /data was 81 % full after boot and no catalogue model (22 HRX + 4 NPU entries) could be pulled: the live
+# appliance could only ever run its bundled Qwen3-0.6B. Growth happens here, at prepare time, not on first
+# boot: nothing is mounted, a failure leaves a working 2 GiB stick, and the assertions below prove the
+# result. A `--check` run never grows anything. sgdisk -e comes first, or the backup GPT is still at the end
+# of the 2 GiB image that was written to a 64 GiB device.
+GREW=0
+grow_data() {
+    [ -b "$TARGET" ] || return 0                  # an image file has nowhere to grow into
+    command -v sgdisk >/dev/null 2>&1 || { printf 'grow     sgdisk is missing; %s keeps its image size\n' "$TARGET"; return 0; }
+    dev_bytes=$(blockdev --getsize64 "$TARGET" 2>/dev/null || echo 0)
+    [ "${dev_bytes:-0}" -gt 0 ] || return 0
+    # the partition number is the node's trailing digits (sda2 -> 2, nvme0n1p2 -> 2)
+    pn=$(printf '%s\n' "$chosen" | sed -n 's|^/dev/[^:]*[^0-9]\([0-9]\{1,2\}\) :.*|\1|p' | head -n 1)
+    [ -n "$pn" ] || return 0
+    end=$(( (START + SIZE) * 512 ))
+    [ $(( dev_bytes - end )) -gt 1048576 ] || return 0   # no room worth growing into
+    SIZE0=$SIZE
+    printf 'grow     data partition ends at %.1f GiB of %.1f GiB: growing it to the end of the device\n' \
+        "$(awk -v b="$end" 'BEGIN { print b / 1073741824 }')" \
+        "$(awk -v b="$dev_bytes" 'BEGIN { print b / 1073741824 }')"
+    sgdisk -e "$TARGET" >/dev/null 2>&1 || printf 'grow     sgdisk -e reported a problem; continuing\n'
+    if ! printf 'start=%s, size=+, type=%s, name="%s"\n' "$START" "$LINUX_FS" "$DATA_NAME" |
+            sfdisk -N "$pn" --force "$TARGET" >/dev/null 2>&1; then
+        printf 'grow     sfdisk -N %s failed; the partition is left exactly as it was\n' "$pn"
+        return 0
+    fi
+    partx -u "$TARGET" 2>/dev/null || udevadm settle >/dev/null 2>&1 || sleep 1
+    # the start did not change, the size did: re-read it so the mount, the loop device and resize2fs
+    # below all use the partition that is actually there now
+    SIZE=$(sfdisk -d "$TARGET" 2>/dev/null | grep "name=\"$DATA_NAME\"" |
+           sed -n 's/.*size=[[:space:]]*\([0-9]\+\).*/\1/p' | head -n 1)
+    GREW=1
+}
+[ "$CHECK" = 1 ] || grow_data
+
 if [ -b "$TARGET" ]; then
     # a partition node has /sys/class/block/<name>/partition; a whole disk does not (and nvme0n1 ends
     # in a digit, so the name alone cannot tell them apart)
@@ -157,6 +194,16 @@ else
     fi
 fi
 printf 'node     %s\n' "$PART"
+
+# ---- the filesystem follows the partition (#706) ---------------------------------------------------
+# ext4 grows in place; the filesystem is not mounted yet, so this is an offline resize - the quick path.
+if [ "$GREW" = 1 ]; then
+    command -v resize2fs >/dev/null 2>&1 || die "resize2fs is missing; the data partition grew but its filesystem did not"
+    resize2fs "$PART" >/dev/null 2>&1 || die "resize2fs failed on $PART; the partition grew but the filesystem did not"
+    printf 'grown    %s now holds %.1f GiB of ext4 (was %.1f GiB)\n' "$PART" \
+        "$(awk -v s="$SIZE" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')" \
+        "$(awk -v s="$SIZE0" 'BEGIN { printf "%.1f", s * 512 / 1073741824 }')"
+fi
 
 # ---- mount ---------------------------------------------------------------------------------------
 if [ "$CHECK" = 1 ]; then MOUNT_OPTS=ro; else MOUNT_OPTS=rw; fi

@@ -60,6 +60,16 @@ def container_expert(q, name, e):
     return untile(raw.reshape(-1, TILE), info["rows"], info["cols"]).astype(np.float32).T
 
 
+def pad_n(wt, n_pad):
+    """Zero-pad a [K][N] block to [K][n_pad]: the arena's n-tile geometry needs N a multiple of
+    1,024 at NW=32, and an expert's 768 columns are not."""
+    if n_pad == wt.shape[1]:
+        return wt
+    out = np.zeros((wt.shape[0], n_pad), np.float32)
+    out[:, :wt.shape[1]] = wt
+    return out
+
+
 def quantise(wt):
     """[K][N] float32 -> (codes int8 symmetric int4, d float32 [K//GROUP][N])."""
     K, N = wt.shape
@@ -72,6 +82,10 @@ def quantise(wt):
 
 def dequantise(codes, d):
     return codes.astype(np.float32) * np.repeat(d, GROUP, axis=0)
+
+
+def info_n(q, name):
+    return q.moe_meta["tensors"][name]["rows"]
 
 
 def chunk_path(out, layer, proj, e):
@@ -132,7 +146,8 @@ def chunks(args):
         for proj, suffix in PROJ.items():
             name = q.layer_name(L, suffix)
             for e in experts:
-                write_chunk(chunk_path(args.out, L, proj, e), *quantise(container_expert(q, name, e)))
+                w = pad_n(container_expert(q, name, e), args.pad_n or info_n(q, name))
+                write_chunk(chunk_path(args.out, L, proj, e), *quantise(w))
                 wrote += 1
         print(f"layer {L}: 3 projections x {len(experts)} experts written", flush=True)
     manifest = {
@@ -183,6 +198,9 @@ def main():
     c.add_argument("out")
     c.add_argument("--layers", type=int, default=None, help="only the first N layers")
     c.add_argument("--experts", type=int, default=None, help="only the first N experts")
+    c.add_argument("--pad-n", dest="pad_n", type=int, default=None,
+                   help="zero-pad each expert's N to this many columns (the arena needs 1,024 "
+                        "multiples at NW=32; 768 -> 1024 costs 25 %% of the chunk)")
     v = sub.add_parser("verify")
     v.add_argument("model")
     v.add_argument("out")
@@ -195,6 +213,8 @@ def main():
     g.add_argument("--layer", type=int, default=0)
     g.add_argument("--proj", default="gate", choices=sorted(PROJ))
     g.add_argument("--experts", type=int, default=8)
+    g.add_argument("--pad-n", dest="pad_n", type=int, default=None,
+                   help="zero-pad N to this many columns (the arena's NW=32 geometry)")
     a = p.parse_args()
     return {"chunks": chunks, "verify": verify, "gate": gate}[a.cmd](a)
 
@@ -236,13 +256,14 @@ def gate(args):
     os.makedirs(args.out, exist_ok=True)
     expected = {}
     for e in top:
-        codes, d = quantise(container_expert(q, name, int(e)))
+        codes, d = quantise(pad_n(container_expert(q, name, int(e)), args.pad_n))
         exact = codes.astype(np.int32).T @ a8.astype(np.int32)      # [N]
         expected[int(e)] = {"d_max": float(d.max()),
                             "d_bits": d.astype(np.float16).view(np.uint16).tolist(),
                             "int32": exact.tolist()}
     out = {
         "layer": args.layer, "proj": args.proj, "K": K, "N": N,
+        "N_padded": int(args.pad_n or N),
         "prompt": args.prompt, "prompt_tokens": len(ids),
         "router_top": [int(e) for e in top],
         "router_weights": [float(x) for x in w],

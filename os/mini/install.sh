@@ -250,6 +250,10 @@ printf '\r  writing now      \n'
 esp=$(new_part "$DEV" 1)
 data=$(new_part "$DEV" 2)
 esp_mb=$ESP_MB
+# #711: this disk gets its own data-partition UUID, and the grub.cfg copied from the stick is pointed at it
+# once the copy has been proved identical (step 6). Without this the disk would inherit the stick's UUID and
+# the two systems would still be told apart by a label - the defect the first install exposed.
+datauuid=$(cat /proc/sys/kernel/random/uuid)
 
 : > "$STEPS"
 steps_add "target disk confirmed: $DEV ($model, ${gb} GB)"
@@ -282,7 +286,7 @@ done
 sleep 1
 
 run 3 mkdosfs -F 32 -n "$ESP_LABEL" "$esp"
-run 4 sh -c "$MKE2FS -q -t ext4 -L '$DATA_LABEL' '$data'"
+run 4 sh -c "$MKE2FS -q -t ext4 -L '$DATA_LABEL' -U '$datauuid' '$data'"
 
 mkdir -p /tmp/install/esp /tmp/install/data /tmp/install/live-esp
 [ -n "$live_esp" ] || live_esp=$(findfs LABEL=$ESP_LABEL 2>/dev/null || true)   # fallback: no /data mount
@@ -307,6 +311,14 @@ step_end 6 OK
 
 # 7: the data partition. The live ESP is unmounted here rather than earlier, because step 6 read from it.
 step_begin 7
+# #711: before the ESP goes, point this disk's grub.cfg at THIS disk's data partition. It is done after
+# step 6 on purpose: the copy is verified byte-for-byte against the source first, and only then does the
+# installed system's own copy differ in the one value that must differ.
+if [ -e /tmp/install/esp/EFI/BOOT/grub.cfg ]; then
+    sed -i "s/1bit\.data=UUID=[0-9a-fA-F-]*/1bit.data=UUID=$datauuid/g" /tmp/install/esp/EFI/BOOT/grub.cfg ||
+        fail 7 "cannot point the installed grub.cfg at this disk's data partition"
+    log "    grub.cfg on $esp: 1bit.data=UUID=$datauuid (this disk's data partition)"
+fi
 sync
 umount /tmp/install/live-esp 2>/dev/null || true
 umount /tmp/install/esp 2>/dev/null || fail 7 "cannot flush the new ESP"

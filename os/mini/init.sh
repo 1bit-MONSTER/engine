@@ -74,13 +74,26 @@ data=
 # A USB 2.0 stick can take 45 s or more to appear on this machine (sd 1:0:0:0: [sda] at t=46.4 s in the
 # box's own log), and the old 20 s window expired before it did - so /data never mounted, the keys
 # never arrived and nothing was logged. Wait much longer, and say so as we go.
+# #711: mount THIS boot's own data partition, by the UUID its own boot chain names.
+# Two 1BIT-DATA partitions (the stick's and the installed disk's) are a normal state, and LABEL=1BIT-DATA
+# then answers with whichever the kernel enumerated first: on 2026-10-31 the firmware fell back to the stick
+# and this init mounted the internal NVMe's data partition, ran the stick's kernel on the installed system's
+# data and told the owner "live usb" while the facts on the banner came from the NVMe. mkimage.sh and
+# install.sh write 1bit.data=UUID=<their own data partition> into the grub.cfg of the ESP the firmware loads,
+# so the boot chain says where its data lives and a label collision cannot decide it.
+dataspec=$(sed -n 's/.*[[:space:]]1bit\.data=\([^[:space:]]*\).*/\1/p' /proc/cmdline 2>/dev/null | head -n 1)
 i=0
 while [ $i -lt 90 ]; do
-    data=$(findfs LABEL=1BIT-DATA 2>/dev/null) && break
+    if [ -n "$dataspec" ]; then data=$(findfs "$dataspec" 2>/dev/null); else data=$(findfs LABEL=1BIT-DATA 2>/dev/null); fi
+    [ -n "$data" ] && break
     [ $i = 30 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
     [ $i = 60 ] && echo "still waiting for the 1BIT-DATA partition (t=${i}s)..."
     sleep 1; i=$((i+1))
 done
+# the disk that partition is on, and whether it is the stick: the banner has to say which system is running
+disk=${data#/dev/}; disk=${disk##*/}
+disk=$(basename "$(readlink -f "/sys/class/block/$disk/.." 2>/dev/null)" 2>/dev/null || echo "")
+removable=$(cat "/sys/class/block/${disk:-none}/removable" 2>/dev/null || echo 0)
 if [ -n "$data" ]; then mount "$data" /data && echo "models: /data/models (from $data)"; fi
 
 # Evidence that outlives a live boot: stage markers on the stick, so a machine that hangs later can be
@@ -185,6 +198,12 @@ grep -q " /data " /proc/mounts && [ -e /data/.installed ] && INSTALLED=1
 # below was silently lost (the installed boot reported INSTALLED on screen and no marker in /etc/1bit)
 mkdir -p /etc/1bit 2>/dev/null
 MODE=live
+# #711: which system is running, and on which device. "live usb is loaded up" while the banner facts came
+# from the NVMe is exactly what the owner saw after the first install.
+WHERE="no 1BIT-DATA partition"
+if [ -n "${disk:-}" ]; then
+    if [ "${removable:-0}" = 1 ]; then WHERE="USB /dev/$disk"; else WHERE="the internal disk /dev/$disk"; fi
+fi
 # #704: the version on the banner comes from the image itself. /etc/1bit/release-identity is written by
 # mkimage.sh out of the Lemonade package that is being shipped and the tree the image was built from, so
 # a banner can never again say v2026.43 on a stick carrying Lemonade 2026.46.0 - and 1bit-release-check
@@ -195,7 +214,7 @@ LEMVER=$(ident lemonade)
 if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
     {
       echo
-      echo "  1bit OS, Lemonade Server appliance   $TAG${LEMVER:+  (Lemonade $LEMVER)}  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
+      echo "  1bit OS, Lemonade Server appliance   $TAG${LEMVER:+  (Lemonade $LEMVER)}  -  LIVE: runs from RAM, nothing is installed, disks are never touched   [from $WHERE]"
       echo "  Lemonade Server by AMD, running on the 1bit engine"
       echo "  ------------------------------------------------------------------------------"
       echo "   1) Lemonade appliance            (default)"
@@ -378,11 +397,11 @@ fi
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
 if [ "$INSTALLED" = 1 ]; then
-    echo "MODE: INSTALLED - 1bit OS runs from this machine's disk; /data is $(findfs LABEL=1BIT-DATA 2>/dev/null)."
+    echo "MODE: INSTALLED on ${disk:-an unknown disk} - 1bit OS runs from this machine's disk; /data is $data ($WHERE)."
     echo "      Reboot to restart it; the install is permanent (1bit-install, os/README.md)."
     touch /etc/1bit/installed 2>/dev/null
 else
-    echo "MODE: LIVE - everything runs from RAM; no internal disk is mounted and nothing is installed."
+    echo "MODE: LIVE from $WHERE - everything runs from RAM; no internal disk is mounted and nothing is installed."
     echo "      Reboot to discard everything; only /data on the stick persists."
     touch /etc/1bit/live 2>/dev/null
 fi

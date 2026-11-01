@@ -177,9 +177,12 @@ missing_mods=$(printf '%s' "$missing_mods" | tr ' ' '\n' | grep -v -x efivarfs |
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
-# efivarfs only when it exists: staged separately so the loop above can stay strict about everything else
-modprobe -S "$kver" --show-depends efivarfs 2>/dev/null | awk '$1 == "insmod" {print $2}' | sort -u |
-    while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
+# efivarfs only when it exists: staged on its own (with the failure tolerated, or `set -o pipefail` would
+# abort the build on the `modprobe` that answers "not found" for it) so the loop above can stay strict.
+if [ -n "$(modprobe -S "$kver" --show-depends efivarfs 2>/dev/null)" ]; then
+    modprobe -S "$kver" --show-depends efivarfs 2>/dev/null | awk '$1 == "insmod" {print $2}' | sort -u |
+        while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
+fi
 cp /lib/modules/"$kver"/modules.{order,builtin,builtin.modinfo} "$root/lib/modules/$kver/" 2>/dev/null || true
 
 echo "== board driver (ec_su_axb35, GPL-2.0, source shipped in os/licenses/ec_su_axb35)"
@@ -666,6 +669,12 @@ chmod -R go-w "$root"; chmod 1777 "$root/tmp"; chmod 700 "$root/root"
 echo "== 1bit-os.efi (unified kernel image)"
 stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 # the GPU may use up to 120 GiB of RAM (the same limits as the development machine)
+# #711: the boot chain says where its own data lives. A fixed label cannot: once a machine is installed
+# there are two 1BIT-DATA partitions (the stick's and the disk's) and init would mount whichever the kernel
+# enumerated first - on 2026-10-31, the installed NVMe's data under the stick's kernel. The UUID is made
+# here (or given, for a reproducible image) and handed to init on the kernel command line, in the grub.cfg
+# of this ESP and of the disk that 1bit-install writes.
+datauuid=${DATA_UUID:-$(cat /proc/sys/kernel/random/uuid)}
 # #703: the screen is not a kernel log. The c18 dry run scrolled every kernel message over the VT
 # because the cmdline carried ignore_loglevel + loglevel=7. The serial console (ttyS0) is what the QEMU
 # gates read and it keeps the verbose log - init.sh's first act raises it there, per console. Level 4
@@ -673,7 +682,7 @@ stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 # #707: the appliance menu was unreadable from the chair - the VT's default 8x16 font on a panel that
 # is not 80x25 puts the whole menu in one corner. The image kernel is built with CONFIG_FONT_TER16x32=y,
 # so the console takes a 16x32 font at boot; no font file, no setfont and nothing to keep in the image.
-cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=font:TER16x32 fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
+cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=font:TER16x32 fbcon=nodefer vt.global_cursor_default=1 rdinit=/init 1bit.data=UUID=$datauuid"
 printf '%s' "$cmdline" > "$out/cmdline.txt"
 # section layout after the stub's own sections, each aligned to 64 KiB
 align() { echo $(( ($1 + 65535) / 65536 * 65536 )); }
@@ -1045,7 +1054,7 @@ elif [ -n "${LLAMA_SERVER:-}" ]; then
 else
     echo "no HRX llama-server in $build (build with -DONEBIT_HRX=ON; LLAMA_SERVER=<path> for a CPU-only test image)"; exit 1
 fi
-mkfs.ext4 -q -L 1BIT-DATA -d "$out/data.dir" "$out/data.part" $((data_mb))M
+mkfs.ext4 -q -L 1BIT-DATA -U "$datauuid" -d "$out/data.dir" "$out/data.part" $((data_mb))M
 img=$out/1bit-os.img; rm -f "$img"
 truncate -s $(( (efi_mb + data_mb + 2) * 1048576 )) "$img"
 printf 'label: gpt\nstart=2048, size=%s, type=U, name="EFI"\ntype=L, name="1BIT-DATA"\n' $((efi_mb * 2048)) | sfdisk -q "$img"

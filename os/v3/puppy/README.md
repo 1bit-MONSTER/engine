@@ -67,7 +67,12 @@ os/v3/puppy/mk-huge-kernel.sh <stage> <out-dir>
 #      - a module built for another kernel (modinfo -F vermagic),
 #      - an unsigned module (modinfo -F signer) - Secure Boot refuses those at load.
 
-# 5. rebuild the Puppy with it (about 15-25 min in the container, mostly downloads the first time):
+# 5. rebuild the Puppy with it (about 15-25 min in the container, mostly downloads the first time).
+#    The build root defaults to $HOME/wt/1bit-puppy-build because it has to be on a filesystem that
+#    allows device nodes: 3builddistro mounts an overlay for every petbuild chroot, and debootstrap needs
+#    a usable device node in its target - /tmp on this box is tmpfs,nodev and fails both (measured, traps
+#    6 and 7 in the evaluation). BUILD_ROOT=<dir> overrides it, and a nodev/noexec root is refused
+#    before the downloads start.
 os/v3/puppy/build.sh resolute64 <out-dir> <puppy-out-dir>
 #    build.sh copies <out-dir>/huge-*.tar.* into woof-out_*/kernel-kit/output/ before 3builddistro,
 #    which is what makes the image carry OUR kernel. Empty that directory and woof-CE silently

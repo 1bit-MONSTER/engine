@@ -16,6 +16,13 @@ limitations under the License.
 -->
 # DwarfStar
 
+> **Status: not part of the shipped 1bit builds since v2026.44** (owner decision, 2026-11-01: the release ships
+> **HIP kernels only**). The `ds4` route is antirez's CUDA kernels through a HIP shim plus hipBLAS — not our HIP
+> kernels — so the engine is built with `ONEBIT_DS4=OFF`, `1bit serve --device ds4` is not offered, and the shipped
+> Lemonade catalogue no longer lists a `ds4` recipe. DeepSeek V4 Flash, GLM 5.x and Qwen3.8-Flash-Next run on
+> **HRX**. This page is kept as the reference for that work, and the fork
+> [1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4) stays as its home.
+
 [DwarfStar](https://github.com/antirez/ds4) (`antirez/ds4`, MIT) is a native
 inference engine written for a few large MoE models: DeepSeek V4 Flash (and V4.1
 Flash and PRO on bigger machines), GLM 5.2/5.3 Flash and Qwen3.8-Flash-Next. It has

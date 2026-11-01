@@ -479,7 +479,34 @@ lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([
 # pass. Derived from the catalog rather than a hand-kept list, so it cannot drift from what Lemonade
 # actually ships; a catalogue without onebit entries writes a manifest with none, which the check
 # reports as such instead of failing.
+# c19 ships HIP kernels only: the DwarfStar (ds4) backend is antirez's CUDA kernels through a HIP shim plus
+# hipBLAS, not ours, so it is built out (ONEBIT_DS4=OFF) and its recipe cannot run. Lemonade's catalogue still
+# lists one entry whose recipe is "ds4"; drop it from the copy in the image so nothing offers a backend that is
+# not there (#713/#736 lineage, owner decision 2026-11-01).
 cat=$root/opt/lemonade/bin/resources/server_models.json
+if [ -f "$cat" ] && python3 - "$cat" <<'DROPDS4'
+import json, sys
+p = sys.argv[1]
+try:
+    d = json.load(open(p))
+except Exception:
+    raise SystemExit(0)
+b = json.dumps(d)
+if '"recipe": "ds4"' not in b and '"recipe":"ds4"' not in b:
+    raise SystemExit(0)
+def drop(o):
+    if isinstance(o, dict):
+        if o.get("recipe") == "ds4":
+            return None
+        return {k: drop(v) for k, v in o.items() if drop(v) is not None}
+    if isinstance(o, list):
+        return [x for x in (drop(v) for v in o) if x is not None]
+    return o
+nd = drop(d)
+json.dump(nd, open(p, "w"), indent=2)
+print("   catalogue: dropped the ds4 recipe entry (no DwarfStar backend in this image)")
+DROPDS4
+then :; fi
 if [ -f "$cat" ]; then
     python3 - "$cat" "$root/etc/1bit/onebit-models.txt" <<'ONEBIT_MODELS'
 import json, sys

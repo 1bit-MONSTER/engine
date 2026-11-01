@@ -212,7 +212,8 @@ Attempts on 2026-11-01, in order, each one a measured trap:
 | 5 | `3builddistro` → petbuild `busybox`: `chroot: failed to run command 'bash': No such file or directory` | the petbuild chroot is an **overlay mount**, and inside Docker the upper/work dirs sit on Docker's overlay rootfs — the kernel refuses it: `mount: ... bad superblock on petbuild`, so the rootfs is empty | build in a **host bind mount** (`BUILD_ROOT`, `/work`), not in the container's rootfs |
 | 6 | `3builddistro` → debootstrap of the `bdrv`: `cannot create … test-dev-null: Permission denied`, "mounted with noexec or nodev" | the petbuild overlay fix moved the build root to `/tmp`, and **`/tmp` here is tmpfs, `nodev`** — debootstrap needs a usable device node in its target | default `BUILD_ROOT` to `$HOME/wt/1bit-puppy-build` (ext4) and **refuse a nodev/noexec build root up front** |
 | 7 | `mk_iso.sh`, the last step: `mkdosfs: command not found`, then `losetup: /dev/loop16: failed to set up loop device` | the ISO wrapper builds a FAT EFI image with `mkdosfs` (the container had no `dosfstools`) and sets up a loop device (the container has no `/dev/loop-control`) | `dosfstools` in the container; `LOOP_DEVICE=1` passes `/dev/loop-control` through |
-| 8 | **nowhere — it stayed green** and produced an ISO whose `initrd.gz` was **27 bytes** ("original size modulo 2^32 0") | `initrd-progs` packs the initrd with `find . \| cpio -o -H newc > ../initrd 2>/dev/null`: the container had no **`cpio`**, so the redirect created an empty file, stderr was suppressed, `gzip` compressed nothing, and `3builddistro` carried the result into a bootable-looking ISO | `cpio` in the package list, plus a `command -v cpio` refusal before `merge2out` — this trap's whole danger is that nothing fails |
+| 7 (second defect) | **nowhere — it stayed green** and produced an ISO whose `initrd.gz` was **27 bytes** ("original size modulo 2^32 0") | `initrd-progs` packs the initrd with `find . \| cpio -o -H newc > ../initrd 2>/dev/null`: the container had no **`cpio`**, so the redirect created an empty file, stderr was suppressed, `gzip` compressed nothing, and `3builddistro` carried the result into a bootable-looking ISO | `cpio` in the package list, plus a `command -v cpio` refusal before `merge2out` — this trap's whole danger is that nothing fails |
+| 8 | `1download`: `DOWNLOAD FAIL: libnl-genl-3-200_3.12.0-2_amd64.deb`, all four mirrors | **not a recipe defect**: one package out of 1241, and the same URL answered `200 OK` minutes later. The real cost is that a fresh `BUILD_ROOT` re-downloads 2.6 GB and one mirror hiccup over a thousand files fails the build | reuse `local-repositories`: attempt 9 copied attempt 7's cache into the new build root and touched no mirror at all |
 
 Attempt 7 is the informative one: it went through `0setup` ✓, `1download` ✓, `2createpackages` ✓ and
 every stage of `3builddistro` up to `mk_iso.sh`, and **produced the payload** - `sandbox3/rootfs-complete`
@@ -258,6 +259,32 @@ the host run did not.
 The frugal payload (the mode the owner asked for) is those SFS files, and they are kept with the ISO in
 `~/wt/puppy-out-attempt7/` — 2.4 GB together.
 
+### Then the recipe itself, one command (attempt 9): `rc=0`, and a better ISO
+
+That host-side finish proved the payload and the wrapper but not the *recipe*, so the fixed `build.sh`
+was run end to end again — fresh build root, woof-CE passed as the 4th argument, `nice -n 19`, package
+cache pre-seeded from attempt 7 (trap 9). **`build.sh resolute64 … ` exited 0 and wrote the ISO itself**:
+`upup64r-26.04.iso`, **1,317,011,456 B**, sha256
+`41e23602269b3bc8bf5751c646c1a3f559a846aa44751a4e584ed090286f857e`, md5
+`d60cc2809fdcb5951a8bb70b90bca408`, in about 20 minutes in the 12 GB / 4 CPU container.
+
+Diffing its file list against the host-finished image leaves exactly two differences, and the second one
+makes it the better artifact:
+
+| file | attempt 7 (host-finished) | attempt 9 (the recipe) |
+|---|---|---|
+| `initrd.gz` | 2,369,371 | 2,369,395 — the 24 bytes are `DISTRO_PUPPYDATE` |
+| `ucode.cpio` | **0** — "Building without early microcode loading" | **21,672,960** — `amd-ucode` collected into the early-load cpio |
+| everything else | identical byte counts, both El Torito entries | |
+
+So the recipe's own output carries **early AMD microcode loading** as well, which the interrupted attempt
+7 tree never got to. `build.sh` now also copies the four SFS out of `sandbox3/build/` into `<out-dir>`
+next to the ISO, because those files *are* the frugal install.
+
+G2 was re-run on this second ISO too (`os/v3/puppy/g2-probe.sh`, exit 1): same banner, same
+`Finding puppy main sfs file. failed`, same `HAVE_PARTS=''`. Two independently built images behave
+alike, which is what a red gate should look like when the cause is the kernel config and not the image.
+
 The built **resolute64 (Ubuntu 26.04) rootfs** measured, which is the base the appliance would run on:
 
 | | resolute64 (built here) | noble64 (CI artifact) |
@@ -273,23 +300,23 @@ What is worth saying plainly: the build system is from 2009; it is maintained (a
 targets twice a month) and it is *interactive* and environment-sensitive in several places that matter,
 and every one of those places cost an attempt. A product build has to run `woof-code`'s stages from a
 script that answers them, on a filesystem that can host its mounts — which is what `build.sh` now is.
-**A finished ISO exists** (above): the payload from attempt 7, its empty initrd fixed, and the wrapper run
-on the host in under a minute. The container path carries all three fixes now (`dosfstools`,
-`LOOP_DEVICE=1`/`/dev/loop-control`, `cpio`) and is being re-run end to end; nothing in the numbers above
-depends on that re-run.
+**A finished ISO exists, and the recipe produces it**: `build.sh` run end to end exits 0 and writes
+`upup64r-26.04.iso` (1,317,011,456 B, sha256 `41e23602…6f857e`) carrying our kernel, our initrd, both
+boot entries and early microcode. The first ISO here was finished on the host from attempt 7's payload
+(above), and the second was built by the recipe alone.
 
 ## The gates this evaluation would accept, and which of them are green
 
 | gate | what | status |
 |---|---|---|
-| G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **green**: `upup64r-26.04.iso` 1,294,471,168 B, sha256 `80593810…9cc388`, carrying our `vmlinuz` (`7.3.0-rc4-1bit-perfopt+`), a real 127-entry initrd and the four SFS (payload from attempt 7, initrd + ISO wrapper finished on the host; `build.sh` now carries all three fixes, container re-run in flight) |
-| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red, now measured on the ISO itself**: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
+| G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **green**: `build.sh` alone exits 0 and writes `upup64r-26.04.iso` **1,317,011,456 B**, sha256 `41e23602…6f857e` — our `vmlinuz` (`7.3.0-rc4-1bit-perfopt+`), a 127-entry initrd, four SFS, early AMD microcode, `isolinux` + an EFI `efi.img` with shim/grub/MokManager |
+| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red, measured on both built ISOs**: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
 | G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
 | G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |
 | G5 | `lemond` + `1bit serve` run unchanged from the c18 tarball | **blocked by glibc on 24.04** (measured 2.43 vs 2.39); needs the resolute base |
 | G6 | `1bit-release-check` green as far as a VM allows | not run (needs G2+G5) |
 | G7 | a save layer persists across a reboot (frugal install on a qcow2, then reboot) | not run |
-| G8 | image size, boot time, idle RAM, against the c18 initramfs | size measured (ISO 1.29 GB, rootfs 1.5 GB, frugal payload 1.27 GB of SFS); boot time and RAM pending G2 |
+| G8 | image size, boot time, idle RAM, against the c18 initramfs | size measured (ISO 1.32 GB, rootfs 1.5 GB, frugal payload 1.27 GB of SFS); boot time and RAM pending G2 |
 
 ## Recommendation
 

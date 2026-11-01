@@ -76,6 +76,10 @@ os/v3/puppy/mk-huge-kernel.sh <stage> <out-dir>
 os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 #    (woof-CE defaults to $HOME/wt/woof-CE - not /tmp, which a reboot empties; the 4th argument is the
 #    clone, and the build copies it into the build root itself)
+#    A new BUILD_ROOT downloads 2.6 GB again, and one mirror hiccup over a thousand files fails the
+#    build (measured: one package, all four mirrors, and the URL was fine minutes later). If the box has
+#    built before, seed the cache instead: sudo cp -a <old-build-root>/local-repositories <new-build-root>/
+#    <puppy-out-dir> gets the ISO and the four SFS - the SFS files are the frugal install.
 #    build.sh copies <out-dir>/huge-*.tar.* into woof-out_*/kernel-kit/output/ before 3builddistro,
 #    which is what makes the image carry OUR kernel. Empty that directory and woof-CE silently
 #    downloads a stock Ubuntu kernel instead - the trap the evaluation paid for.

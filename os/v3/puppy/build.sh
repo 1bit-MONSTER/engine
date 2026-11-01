@@ -110,5 +110,9 @@ echo "== 3builddistro"; ./3builddistro release </dev/null
 echo "== output"
 ls -l woof-output-* 2>/dev/null | head -20
 cp -f woof-output-*/*.iso woof-output-*/*.sfs /out/ 2>/dev/null || true
+# the frugal/persistent install - the installed mode 1bit OS wants - is these SFS files on a partition,
+# with no installer writing a rootfs at all, so they belong in <out-dir> next to the ISO. 3builddistro
+# leaves them in sandbox3/build/ for the ISO, which is why they are not in woof-output-*.
+cp -f sandbox3/build/*.sfs /out/ 2>/dev/null || true
 echo "== in /out:"; ls -l /out
 '

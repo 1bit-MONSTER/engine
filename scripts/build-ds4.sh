@@ -32,6 +32,18 @@ prefix=$(cd "$prefix" && pwd)
 
 [ -f "$src/ds4_server.c" ] || { echo "third_party/ds4 is empty: git submodule update --init third_party/ds4"; exit 1; }
 
+out=$prefix/$backend
+# Reuse a ds4-server already staged at the prefix, unless DS4_REBUILD=1 asks for a fresh build. A CMake
+# custom target always runs its command, so on a box whose ROCm cannot compile these kernels (the
+# 2026-10-31 rebuild: no hipCUB/rocPRIM/rocWMMA headers) an already-present binary built from this pin
+# turned into a hard build failure for the whole engine - `1bit` depends on this target. Checked before
+# the ROCm lookup and before make, so the reuse works on a box with no usable hipcc at all.
+# The pin is printed so the record says what the binary is.
+if [ "${DS4_REBUILD:-0}" != 1 ] && [ -x "$out/ds4-server" ]; then
+    echo "DwarfStar ($backend): reusing $out/ds4-server ($(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo 'pin unknown'))"
+    exit 0
+fi
+
 work=$prefix/src/$backend
 mkdir -p "$work"
 # copy the tree, keeping objects from an earlier build of the same backend
@@ -56,15 +68,6 @@ if [ "${DS4_TEST:-0}" = 1 ]; then
         HIPCC="$rocm/bin/hipcc" ROCM_CFLAGS="$cflags" ROCM_LDLIBS="$libs")
 fi
 
-# Reuse a ds4-server already staged at the prefix unless DS4_REBUILD=1. The release build runs this
-# script from a CMake custom target, and a target always runs; on a box whose ROCm lacks hipCUB that
-# turned "the binary is already here, built from this exact pin" into a hard build failure
-# (2026-11-01). The pin is printed with the reuse so the record says what the binary is.
-out=$prefix/$backend
-if [ "${DS4_REBUILD:-0}" != 1 ] && [ -x "$out/ds4-server" ]; then
-    echo "DwarfStar ($backend): reusing $out/ds4-server ($(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo 'pin unknown'))"
-    exit 0
-fi
 mkdir -p "$out"
 for b in ds4-server ds4 ds4-bench; do cp "$work/$b" "$out/$b"; done
 commit=$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)

@@ -449,6 +449,11 @@ add_executable(decision_test tests/decision_test.cpp)
 target_include_directories(decision_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
 target_link_libraries(decision_test PRIVATE nlohmann_json::nlohmann_json)
 add_test(NAME decision_head COMMAND decision_test)
+# .github/workflows/ci.yml builds a named list of targets and ctest runs whatever binaries exist, so a
+# test whose target is not in that list reports "Not Run" and never executes (the #635 trap). Building
+# decision_test as a dependency of a listed target keeps its row live without a workflow edit, which
+# this lane's token cannot make.
+add_dependencies(npu_sampling_test decision_test)
 
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)

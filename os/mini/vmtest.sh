@@ -231,21 +231,26 @@ if [ -n "$nvme" ]; then
     # and it must have removed the entry whose loader file is gone. OVMF has a writable varstore here.
     # only an image whose kernel tree carries efivarfs can write a boot entry; say which case this is
     # instead of failing an install that is otherwise complete (os #709)
-    efi=$(ssh_vm "modprobe efivarfs 2>/dev/null; mkdir -p /sys/firmware/efi/efivars; mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null && echo efivars-ok" 2>/dev/null)
+    # `|| true`: this script runs under `set -euo pipefail`, so a probe whose ssh exits non-zero (no efivarfs in
+    # this image -> mount fails -> the whole ssh command fails) used to abort the run silently, right here, with no
+    # summary line - which is what made c19's qemu-gate fail with 255 while every check before it had passed.
+    efi=$(ssh_vm "modprobe efivarfs 2>/dev/null; mkdir -p /sys/firmware/efi/efivars; mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null && echo efivars-ok" 2>/dev/null || true)
     case "$efi" in
-        *efivars-ok*) boot=$(ssh_vm "efibootmgr 2>&1" 2>/dev/null);;
+        *efivars-ok*) boot=$(ssh_vm "efibootmgr 2>&1" 2>/dev/null || true);;
         *) boot=""
            echo "install boot entry: SKIP - this image's kernel has no efivarfs module, so the installer cannot write one (the disk still boots as \\EFI\\BOOT\\BOOTX64.EFI)";;
     esac
-    order=$(printf '%s\n' "$boot" | sed -n 's/^BootOrder: //p' | head -1)
-    ent=$(printf '%s\n' "$boot" | grep -E '^Boot[0-9A-Fa-f]{4}\* 1bit OS' | head -1)
+    # `|| true` for the same reason as the probe above: with no efivars the SKIP branch leaves $boot empty, the
+    # grep finds no line and exits 1, and under `set -euo pipefail` that would abort the script again
+    order=$(printf '%s\n' "$boot" | sed -n 's/^BootOrder: //p' | head -1 || true)
+    ent=$(printf '%s\n' "$boot" | grep -E '^Boot[0-9A-Fa-f]{4}\* 1bit OS' | head -1 || true)
     if [ -z "$boot" ]; then
         :   # the SKIP line above already said why
     elif [ -z "$ent" ]; then
         echo "install boot entry: no '1bit OS' entry in efibootmgr (got: $(printf '%s' "$boot" | grep '^Boot[0-9A-Fa-f]' | head -3 | tr '\n' ' '))"
         ok=0
     else
-        num=$(printf '%s\n' "$ent" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
+        num=$(printf '%s\n' "$ent" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' || true)
         first=${order%%,*}
         if [ "$first" = "$num" ]; then
             echo "install boot entry: Boot$num '1bit OS' is first in BootOrder ($order)"

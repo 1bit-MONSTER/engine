@@ -126,7 +126,13 @@ patchelf --remove-rpath "$stage/1bit"
 # something to drop silently (the 2026-10-23 rc shipped llama-perplexity without its implementation library)
 tools_bad=""
 tools_bad+=$(pack_require_tools "$stage" hrx/llama/bin llama-server llama-bench llama-perplexity || true)
-tools_bad+=$(pack_require_tools "$stage" ds4/hip ds4-server ds4 ds4-bench || true)
+# DwarfStar is out of the release by the owner's decision (2026-11-01): the ds4 backend is antirez's CUDA kernels
+# through a HIP shim plus hipBLAS, not our kernels, and c19 is built with ONEBIT_DS4=OFF. So the three ds4 tools are
+# only required of a build that says it ships them - keyed on the build's own switch, not on what happens to be on
+# disk, so a build with ONEBIT_DS4=ON that lost its binaries still fails here instead of shipping quietly.
+if [ "${ONEBIT_DS4:-ON}" != OFF ]; then
+    tools_bad+=$(pack_require_tools "$stage" ds4/hip ds4-server ds4 ds4-bench || true)
+fi
 [ -z "$tools_bad" ] || { echo "shipped tools that cannot load:"; echo "$tools_bad"; exit 1; }
 
 # anything else that cannot load leaves the package rather than shipping broken

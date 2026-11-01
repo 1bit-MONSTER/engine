@@ -952,7 +952,40 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             if (!ctx_[i] || designs_[i].K != c_.H || designs_[i].N <= 0) continue;
             if (i_head < 0 || designs_[i].N > designs_[i_head].N) i_head = i;
         }
-        if (i_head >= 0) {
+        // The head's ternary images come first, when the converter produced them: output.weight
+        // is PTQ1_0 (type 143) in the folded GGUF, so the image is exact rather than a
+        // requantisation, it is 0.75 GB against the int8 head's 1.33 GB, and it runs the same
+        // K=H kernel the MLP's GU launch runs.  Missing images are not an error: the head then
+        // keeps the int8 family below.
+        if (i_head >= 0 && !pb16i_dir_.empty() && file_exists(head_pb16i_stem(0) + ".pb16i")) {
+            const Q4nxDesignGeom& g = designs_[i_head];
+            std::string stem(g.elf_name);
+            stem.resize(stem.size() - 4);                     // drop ".elf"
+            const std::string cands[] = {stem + "_pb16i_m16.elf", stem + "_pb16i.elf"};
+            std::string pelf;
+            for (const std::string& c : cands) {
+                for (const std::string& d : m16dirs_like_head(mdir, dir)) {
+                    if (file_exists(d + "/" + c)) { pelf = d + "/" + c; break; }
+                }
+                if (!pelf.empty()) break;
+            }
+            if (!pelf.empty()) {
+                ctx_head_ = std::make_unique<I8Ctx>();
+                ctx_head_->MD = Q4NX_DESIGN_M_DECODE;
+                ctx_head_->KD = g.K;
+                ctx_head_->ND = g.N;
+                ctx_head_->pb16i = true;
+                ctx_head_->pb16i_planes = 1;   // the K=H design is the arena's one-plane family
+                if (ctx_head_->init_elf(*dev, pelf.c_str(), Q4NX_DESIGN_M_DECODE, g.K, g.N, 1)) {
+                    head_pb16i_ = true;
+                    fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s (pb16i ternary "
+                                    "images)\n", ctx_head_->MD, g.K, g.N, pelf.c_str());
+                } else {
+                    ctx_head_.reset();
+                }
+            }
+        }
+        if (!ctx_head_ && i_head >= 0) {
             const Q4nxDesignGeom& g = designs_[i_head];
             // The head streams 1.33 GB of int8 weights a token, so its layout matters more
             // than its row count: a blocked (_b8) ELF walks 8 KiB forward per tile at
@@ -4149,10 +4182,37 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // wcache_ already holds every layer's projections.  Packing into dedicated
     // weight BOs at first use makes it a load-time cost instead.
     const bool head_packed = weight_cache_ && dev_ != nullptr;
+    const bool head_pb16i = head_pb16i_ && head_packed && ctx_head_ != nullptr;
     if (head_packed &&
         ((int)lm_head_packed_.size() != ntiles || lm_head_packed_T_ != T)) {
         lm_head_packed_.clear();
         std::vector<float> bt(tile_elems);
+        if (head_pb16i) {
+            // The image is the file: no dequant, no pack, nothing to quantise on the host.  A
+            // tile whose side table asks for the two-plane accumulator is refused, not guessed:
+            // the K=H ELF family is a one-plane design.
+            for (int t = 0; t < ntiles; t++) {
+                PackedWeight pw;
+                pw.bo = lctx.make_weight_bo(*dev_);
+                if (!lctx.load_pb16i_into(*pw.bo, head_pb16i_stem(t), pw.eref, pw.pb16i_mode)) {
+                    err_ = "lm head: cannot load the ternary image for tile " + std::to_string(t);
+                    return false;
+                }
+                if (pw.pb16i_mode > ctx_head_->pb16i_planes) {
+                    err_ = "lm head: tile " + std::to_string(t) +
+                           " needs the two-plane accumulator, this ELF has one plane";
+                    return false;
+                }
+                lm_head_packed_.push_back(std::move(pw));
+            }
+            lm_head_packed_T_ = T;
+            lm_head_tiles_.clear();
+            lm_head_tiles_.shrink_to_fit();
+            lm_head_f_.clear();
+            lm_head_f_.shrink_to_fit();
+            fprintf(stderr, "  [forward] lm head: %d ternary image(s) resident (H=%d T=%d), "
+                            "f32 head released\n", ntiles, H, T);
+        } else {
         for (int t = 0; t < ntiles; t++) {
             const int n0 = t * T, n1 = std::min(NV, n0 + T);
             std::fill(bt.begin(), bt.end(), 0.0f);   // padded columns must be zero
@@ -4177,6 +4237,7 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         fprintf(stderr, "  [forward] lm head: %d packed weight tile(s) resident "
                         "(H=%d T=%d), f32 head + f32 tile gather released\n",
                 ntiles, H, T);
+        }
     }
     std::vector<float> Bt;
     if (!head_packed) {
@@ -4203,6 +4264,33 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     g_ph.h_memcpy = g_ph.h_pack = g_ph.h_ql = g_ph.h_wait = g_ph.h_rb = 0;
     const auto hp0 = ph ? std::chrono::steady_clock::now()
                         : std::chrono::steady_clock::time_point{};
+    // ---- the ternary head: rotate A once for all 15 tiles ---------------------
+    // Same fold and same scale rule as npu_gemm's pb16i branch (A' = H (A . s), int8 with its own
+    // column scale); the side table's per-column 2^e_ref finishes the arithmetic on the host, and
+    // the device only sums integers.
+    std::vector<float> hr;
+    std::vector<float> head_got;
+    float hasb = 1.0f;
+    if (head_pb16i) {
+        auto hsig = had_signs_.find(H);
+        if (hsig == had_signs_.end()) {
+            err_ = "pb16i head: no Hadamard sign vector for K=" + std::to_string(H);
+            return false;
+        }
+        const auto hh0 = std::chrono::steady_clock::now();
+        hr = hs;
+        hadamard_rotate(hsig->second.data(), hr.data(), H, had_block_);
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) {
+            const float a = std::fabs(hr[(size_t)k]);
+            if (a > amax) amax = a;
+        }
+        hasb = amax > 0.0f ? amax / 127.0f : 1.0f;
+        had_ms_ += std::chrono::duration<double, std::milli>(
+            std::chrono::steady_clock::now() - hh0).count();
+        had_n_++;
+        head_got.assign((size_t)T, 0.0f);
+    }
     for (int t = 0; t < ntiles; t++) {
         const int n0 = t * T, n1 = std::min(NV, n0 + T);
         const auto hm0 = ph ? std::chrono::steady_clock::now()
@@ -4211,6 +4299,34 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             std::memcpy(Bt.data(), lm_head_tiles_.data() + (size_t)t * tile_elems,
                         tile_elems * sizeof(float));
         if (ph) g_ph.h_memcpy += ph_ms(hm0);
+        if (head_pb16i) {
+            const auto q0 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            xrt::run hr_run = lctx.launch_async_with_bo(*lm_head_packed_[(size_t)t].bo, hr.data(),
+                                                        1, H, hasb);
+            const auto q1 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            lctx.wait_kernel(hr_run);
+            const auto q2 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            lctx.readback();
+            const auto q3 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
+            lctx.dequant_pb16i(head_got.data(), 1, T, &hasb, lm_head_packed_[(size_t)t].eref,
+                               ctx_head_->pb16i_planes);
+            for (int n = n0; n < n1; n++) {
+                float v = head_got[(size_t)(n - n0)];
+                if (sem_.logit_softcap > 0)
+                    v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                logits[(size_t)n] = v;
+            }
+            if (prof_) {
+                const double dql = std::chrono::duration<double, std::milli>(q1 - q0).count();
+                const double dwt = std::chrono::duration<double, std::milli>(q2 - q1).count();
+                const double drb = std::chrono::duration<double, std::milli>(q3 - q2).count();
+                prof_head_M_ = lctx.MD;
+                prof_add(&prof_head_, 0, 0.0, dql, dwt, drb);
+                prof_dec_n_++;
+                if (ph) { g_ph.h_ql += dql; g_ph.h_wait += dwt; g_ph.h_rb += drb; }
+            }
+            continue;
+        }
         const auto h0 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         float amax = 0.0f;
         for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }

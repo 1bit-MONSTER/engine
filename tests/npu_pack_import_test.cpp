@@ -51,6 +51,21 @@ void check(bool ok, const std::string& what) {
     }
 }
 
+// ── 0. external-data bounds are overflow-proof ──────────────────────────────
+// A crafted model.onnx can declare offset = UINT64_MAX - 4 with length = 8, which sums to 3 and used to pass
+// an `offset + length > size` check and then read 8 bytes from a wild pointer.
+void test_bounds() {
+    const uint64_t big = UINT64_MAX;
+    const uint64_t size = 1024;
+    check(!pi::ext_range_ok(size, big - 4, 8), "bounds: offset+length wrapping is refused");
+    check(!pi::ext_range_ok(size, big, 0), "bounds: an offset past the file is refused, even with length 0");
+    check(!pi::ext_range_ok(size, big - 1, 4), "bounds: a length that would wrap is refused");
+    check(pi::ext_range_ok(size, 0, size), "bounds: the whole file is in range");
+    check(pi::ext_range_ok(size, size, 0), "bounds: the empty range at EOF is in range");
+    check(!pi::ext_range_ok(size, size - 1, 2), "bounds: one byte past the end is refused");
+    check(!pi::ext_range_ok(size, size + 1, 0), "bounds: an offset one past the end is refused");
+}
+
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
@@ -299,6 +314,7 @@ int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
     try {
+        test_bounds();
         test_matmulnbits();
         test_tiles(golden_dir);
         if (!pack.empty() && fs::exists(pack + "/model.onnx")) test_pack(pack, golden_dir);

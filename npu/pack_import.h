@@ -39,6 +39,13 @@
 
 namespace onebit::npu::pack_import {
 
+// Is [offset, offset+length) inside a mapped file of `size` bytes? Both comparisons are overflow-proof —
+// each is against a value already smaller than `size` — so a crafted `model.onnx` cannot wrap them.
+// (`offset + length > size` does wrap: offset = UINT64_MAX - 4, length = 8 sums to 3.)
+inline bool ext_range_ok(uint64_t size, uint64_t offset, uint64_t length) {
+    return offset <= size && length <= size - offset;
+}
+
 // The model geometry the container's config.json needs.
 struct Dims {
     int hidden = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, intermediate = 0, vocab = 0;

@@ -801,7 +801,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         if (t.raw) return t.raw;
         const auto it = ext.find(t.location);
         if (it == ext.end()) throw std::runtime_error(t.name + ": no data");
-        if (t.offset + t.length > ext_size[t.location])
+        if (!ext_range_ok(ext_size[t.location], t.offset, t.length))
             throw std::runtime_error(t.name + ": external data past the end of " + t.location);
         return it->second + t.offset;
     };

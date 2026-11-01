@@ -362,8 +362,8 @@ echo "  To get back to the live stick, boot the stick again - the installed disk
 log "  install complete: 1bit OS is installed on $DEV ($esp, $data)"
 
 # #710: the machine reboots itself into the installed system, after saying so. Driven from a script (the
-# QEMU install gate) the reboot is skipped: 1BIT_INSTALL_NO_REBOOT=1, or no terminal on the console.
-if [ "${1BIT_INSTALL_NO_REBOOT:-0}" = 1 ] || [ ! -e "$SCREEN" ]; then
+# QEMU install gate) the reboot is skipped: ONEBIT_INSTALL_NO_REBOOT=1, or no terminal on the console.
+if [ "${ONEBIT_INSTALL_NO_REBOOT:-0}" = 1 ] || [ ! -e "$SCREEN" ]; then
     echo "  Remove the stick and boot the machine from this disk (no automatic reboot in this session)."
     exit 0
 fi

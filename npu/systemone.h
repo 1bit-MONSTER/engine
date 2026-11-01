@@ -160,8 +160,12 @@ inline Question question_of(const nlohmann::ordered_json& q) {
             out.texts.push_back(text);
             out.legend.push_back(detail::canonical(level));
         }
-        // A score is a choice over its ordered levels, with the level text as the option key.
-        for (const auto& text : out.texts) out.keys.push_back(text);
+        // A score is rendered as a choice over its ordered levels, and upstream's option KEY is the
+        // level's index while the level text is only what the prompt shows: d3_runtime's
+        // normalize_question() builds `[str(i) for i in range(len(levels))]` as the keys, and
+        // product_answer() keys `probabilities` and `legend` by them. Keying by the text instead is a
+        // different answer object for the same decision.
+        for (size_t i = 0; i < out.texts.size(); i++) out.keys.push_back(std::to_string(i));
     } else if (kind.empty()) {
         throw std::runtime_error("question: must name a type (choice, noul or score)");
     } else {

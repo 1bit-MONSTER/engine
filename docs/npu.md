@@ -119,7 +119,18 @@ per-dispatch chunk-address kernel takes (docs/npu.md, the DMA path in the engine
 Measured on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (qwen3moe, 48 layers, 128 experts,
 top-8, expert_ffn 768, no shared expert): 579 tensors, 144 expert stacks x 128 expert
 offsets, header 302,144 B, container 19,528,322,120 B (18.19 GiB) — 18.13 GiB of it routed
-experts. `verify` result: see the TMOE-NPU lane's state file.
+experts.
+
+**The top-8 boundary is razor thin, and that constrains what a comparison can mean.** Measured
+with the same router tensor on the same token, the container's weights against the GGUF's own f32
+weights: **32 of 48 layers pick a different 8-expert set**, always at the 8th slot, because the
+margin between rank 8 and rank 9 is **1.2e-3 in probability in one and 2.9e-4 in the other** (layer
+2: expert 25 at 0.021700 vs expert 125 at 0.020511, and the reverse). A hidden state that differs
+by 0.5 % — what requantising the Q6_K tensors costs — is enough to swap it. So two correct
+implementations of the same model can diverge in *which experts run*, and a per-token logprob or
+argmax comparison between them measures that, not their arithmetic: judge quality in aggregate
+(KLD over a corpus) and gate a kernel with the expert ids held fixed (A row + the router's own
+top-k + the expected int32 per expert, which is what `tools/moe_expert_chunks.py gate` emits). `verify` result: see the TMOE-NPU lane's state file.
 
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
 `~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,

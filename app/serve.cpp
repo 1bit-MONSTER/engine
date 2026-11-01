@@ -1051,12 +1051,21 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") argv.insert(argv.end(), {"-np", "1"});
         }
     } else if (device == "ds4") {
+#ifndef ONEBIT_DS4_SERVER
+        // Owner decision 2026-11-01: DwarfStar is out of the shipped builds (ONEBIT_DS4=OFF) - it runs antirez's
+        // CUDA kernels through a HIP shim plus hipBLAS, not our HIP kernels. A build without it must say so here,
+        // not go looking for a `ds4-server` on PATH and fail with "no such file".
+        throw std::runtime_error(
+            "--device ds4: this build has no DwarfStar route (built with ONEBIT_DS4=OFF). DeepSeek V4.x, GLM 5.x and "
+            "Qwen3.8-Flash-Next run on --device hrx (docs/dwarfstar.md)");
+#else
         // DwarfStar: its own GGUF layouts only; it opens its port after the model has loaded
         argv = {o.ds4.empty() ? default_ds4() : o.ds4, "-m", o.model,
                 "--host", "127.0.0.1", "--port", std::to_string(child_port)};
         if (o.ctx_size > 0) { argv.push_back("--ctx"); argv.push_back(std::to_string(o.ctx_size)); }
         if (o.ssd_streaming) argv.push_back("--ssd-streaming");
         l.ready_path = "/v1/models";
+#endif
     } else {
         refuse_removed_device(device);
         throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx, cpu or ds4)");
@@ -1626,7 +1635,11 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s is Hadamard-folded (prism.hadamard): HRX route\n", o.model.c_str());
     }
     if (onebp_file(o.model)) {
-        // DwarfStar (our fork) is the engine's 1BP reader
+        // DwarfStar (our fork) is the engine's 1BP reader; without it, a 1BP package has no route in this build
+#ifndef ONEBIT_DS4_SERVER
+        throw std::runtime_error(o.model + " is a 1BP package: this build has no DwarfStar route (ONEBIT_DS4=OFF). "
+            "Use a GGUF on --device hrx instead (docs/dwarfstar.md)");
+#endif
         if (o.device == "auto") o.device = "ds4";
         if (o.device != "ds4")
             throw std::runtime_error(o.model + " is a 1BP package: it runs on --device ds4 (docs/dwarfstar.md)");

@@ -179,7 +179,7 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the shipped build since v2026.44 (HIP kernels only, owner decision 2026-11-01; [dwarfstar.md](dwarfstar.md)); no Vulkan or ROCm llama.cpp since RFC #213 stage 3. No Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the shipped build since v2026.44 (HIP kernels only, owner decision 2026-11-01; [dwarfstar.md](dwarfstar.md)); no Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 

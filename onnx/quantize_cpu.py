@@ -23,17 +23,27 @@ same cores (VNNI). Nothing else in this directory changes speed on CPU.
 Activations stay float and are quantised per-call (dynamic), so no calibration data is needed and the
 KV cache keeps its fp32 contract with `ort_run --cached`.
 
-**Measured on `ryzen`, Qwen3-0.6B, 8 threads, 128-token fp32 graph as the reference** — dynamic int8 is
-not shippable and this file is kept as the evidence, not as a recommended step:
+**Measured on `ryzen` and re-measured on `strixhalo`** (Qwen3-0.6B, 8 threads, 128-token fp32 graph as the
+reference; the strixhalo run was under load ~10 from an NPU serve, so compare ratios, not absolutes) —
+dynamic int8 is not shippable and this file is kept as the evidence, not as a recommended step:
 
 | | fp32 | int8 dynamic |
 |---|---|---|
-| prefill 512 | 1141 tok/s | **1628** tok/s (+43%) |
-| prefill 2048 | 567 tok/s | **860** tok/s (+51%) |
-| decode 512 | 12.98 tok/s | 12.28 (−5%) |
-| decode 2048 | 6.67 tok/s | 6.36 (−5%) |
-| peak RSS | 6.60 GB | **4.68 GB** |
+| prefill 512 | 1141 (ryzen) / 1132 (strixhalo) tok/s | **1628 / 1635** tok/s (+43% / +44%) |
+| prefill 2048 | 567 (ryzen) / 680 (strixhalo) tok/s | **860 / 841** tok/s (+51% / +24%) |
+| decode 512 | 12.98 / 15.72 tok/s | 12.28 / 14.95 tok/s (−5% / −5%) |
+| decode 2048 | 6.67 / 8.43 tok/s | 6.36 / 8.06 tok/s (−5% / −4%) |
+| peak RSS | 6.60 GB / 7537 MB | 4.68 GB / **8011 MB** |
 | tokens for `15 23 40` | `13 16 13 16` | `13 220 16 24` |
+
+Two cells are a property of the baseline, not of int8, and are shown for both boxes rather than as one
+number: **prefill 2048** (the int8 side agrees, 860 vs 841; the fp32 baselines do not, 567 vs 680, so the
+headline is +51% or +24% depending on which box you stand on) and **peak RSS**, which does not move in the
+same direction on both: 6.60 -> 4.68 GB on ryzen, but 7537 -> 8011 MB on strixhalo (peak reset,
+`--warmup 1 --repeat 1`, both lens in one process), the plausible cause being the per-call
+quantise/dequantise buffers dynamic quantisation allocates at 2048 prefill and the fp32 side does not. Do
+not count the memory saving as a win; the weight file shrinking 4x is the durable part, and it is not what
+the RSS row measures.
 
 Accuracy is the blocker: mean KL **0.28 nats** over four steps, max|dlogit| 3.47, top-1 agreement 1/4 —
 the greedy answer changes at the second token. Variants measured, all worse: quantising attention's
@@ -44,8 +54,10 @@ a constant input) — excluding it explicitly changes nothing, byte for byte.
 So the error is entirely the 28 layers' **uint8 activations**, which is what dynamic quantisation does
 by design. The accurate route is static QDQ with calibration (real scales per activation tensor, which
 needs prompts to calibrate on) or int4 `MatMulNBits`, which is what the NPU side already runs. Prefill
-is where int8 pays (+43-51%) because it is the FLOP-bound stage; decode does not move (−5%) because it
-is latency/bandwidth-bound on the same 0.6 GB either way.
+is where int8 pays (+43% at 512 on both boxes; at 2048 it is +51% on ryzen's baseline and +24% on
+strixhalo's, and that difference is the baseline, not the quantisation), decode does not move (−4 to −5%)
+because it is latency/bandwidth-bound on the same 0.6 GB either way, and peak RSS is not a saving on either
+box once the per-call buffers are counted.
 
     python3 quantize_cpu.py --model ~/wt/onnx-artifacts/qwen3-0.6b-cached.onnx \\
                            --out ~/wt/onnx-artifacts/qwen3-0.6b-cached-int8.onnx

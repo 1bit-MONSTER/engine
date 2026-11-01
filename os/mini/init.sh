@@ -41,12 +41,21 @@ echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"
 for m in realtek r8169 mt7925e virtio_net xhci_pci usb_storage uas sd_mod nvme ahci vfat nls_cp437 nls_iso8859_1 nls_ascii ext4 phy-generic typec typec_ucsi ucsi_acpi typec_displayport thunderbolt usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118 thunderbolt_net roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet; do modprobe -q "$m"; done
 mdev -s 2>/dev/null
 
+# #705: one flow. Every wait says what it is waiting for, on the screen, on the serial line and (once
+# /data is mounted) in /data/boot.log - the c18 dry run had a 12 s chooser, then a blank "starting" while
+# DHCP and lemond came up, and no way to tell a wait from a hang. Defined here, before the first wait.
+say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
+    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
+
 # network: DHCP on every wired interface
 ip link set lo up
 for n in /sys/class/net/e*; do
     [ -e "$n" ] || continue
     i=${n##*/}; ip link set "$i" up
+    say "  network: waiting for DHCP on $i ($(cat /sys/class/net/$i/operstate 2>/dev/null || echo unknown))"
     udhcpc -i "$i" -b -q -t 5 -s /etc/udhcpc.script >/dev/null 2>&1
+    a=$(ip -4 -o addr show dev "$i" scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | head -1)
+    say "  network: ${a:-no address yet} on $i"
 done
 
 # models: the stick's 1BIT-DATA partition, if present (the internal disk is left alone)
@@ -78,11 +87,7 @@ fi
 stage "stick mounted at ${data:-nothing}"
 
 # Every message goes to the screen, the serial line and the stick: a live boot must never be a blank
-# screen you have to guess about. Defined before its first use: it used to sit below the kernel link
-# line, so the console lost that line to "say: not found" (seen in the VM's serial log).
-say() { echo "$*"; echo "$*" >> /data/boot.log 2>/dev/null
-    for c in /dev/console /dev/tty1; do [ -w "$c" ] && echo "$*" > "$c" 2>/dev/null; done; }
-
+# screen you have to guess about. Defined above the first wait (#705).
 # The engine's own llama-server and the HSA runtime it loads are on the DATA PARTITION, not in the RAM
 # image (mkimage.sh: grub will not load an initrd over ~103 MB and this one is at 89.5 MB, so anything
 # added to the image after it is packed never reaches the stick - which is why 1bit.check said
@@ -183,15 +188,23 @@ if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
       echo "  1bit OS, Lemonade Server appliance   $TAG${LEMVER:+  (Lemonade $LEMVER)}  -  LIVE: runs from RAM, nothing is installed, disks are never touched"
       echo "  Lemonade Server by AMD, running on the 1bit engine"
       echo "  ------------------------------------------------------------------------------"
-      echo "   1) Lemonade appliance            (default, starts in 12s)"
+      echo "   1) Lemonade appliance            (default)"
       echo "   2) Lemonade, verbose, no GPU driver"
       echo "   3) Root shell (no services)"
       echo "   4) Power off"
       echo
     } | mc
     printf "  choice: " | mc
-    i=0
-    while [ $i -lt 12 ]; do
+    # #705: the selection timer is on the choice line itself - one screen, a countdown you can watch,
+    # instead of a menu that sits there for 12 s and then drops into a blank "starting". Any key picks.
+    repaint_choice() {
+        for c in /dev/console /dev/tty1; do
+            [ -w "$c" ] && printf '\r  choice [1]  starts in %2d s  ' "$i" > "$c" 2>/dev/null
+        done
+    }
+    i=12
+    while [ "$i" -gt 0 ]; do
+        repaint_choice
         if read -r -t 1 -n 1 c < /dev/console 2>/dev/null; then
             case "$c" in
                 2) MODE=nogpu;  break ;;
@@ -200,9 +213,12 @@ if [ -c /dev/console ] && [ "$INSTALLED" = 0 ]; then
                 1|"") break ;;
             esac
         fi
-        i=$((i+1))
+        i=$((i-1))
     done
-    printf "\n" | mc
+    for c in /dev/console /dev/tty1; do
+        [ -w "$c" ] && printf '\r  choice [%s]  starting\n' "$MODE" > "$c" 2>/dev/null
+    done
+    unset -f repaint_choice
 fi
 case "$MODE" in
     off)  say "powering off (choice 4)"; sync; poweroff -f ;;
@@ -316,6 +332,7 @@ if [ -f "$kf" ] && ! grep -q '^LEMONADE_API_KEY=..*' "$kf" 2>/dev/null; then
     } >> "$kf" && chmod 600 "$kf"
 fi
 # Lemonade's environment file (LEMONADE_API_KEY, LEMONADE_ADMIN_API_KEY, HF_TOKEN), for lemond only
+say "  Lemonade: starting"
 ( cd "$lem" || exit 1
   if [ -f lemond.conf ]; then set -a; . ./lemond.conf; set +a; fi
   exec lemond "$lem/cache" "$lem/config" ) > /tmp/lemond.log 2>&1 &
@@ -326,6 +343,28 @@ key=off; setkey LEMONADE_API_KEY && key=on
 [ "$key" = off ] && setkey LEMONADE_ADMIN_API_KEY && key="off, admin key only: /api and /v1 are open"
 lhost=$(cfg host); lport=$(cfg port); lhost=${lhost:-localhost}; lport=${lport:-13305}
 echo "Lemonade: http://$lhost:$lport  (API key: $key; log: /tmp/lemond.log)"
+# #705: say when it actually answers, so the wait for lemond is visible rather than a screen that says
+# "starting" until it happens. lemond binds localhost by default; ask the address it was configured with
+# first, then 127.0.0.1, so a host of 0.0.0.0 is not a 20 s false negative.
+lup=0
+for i in $(seq 1 20); do
+    for a in "$lhost" 127.0.0.1; do
+        case "$a" in 0.0.0.0|::|'') continue ;; esac
+        if wget -q -O /dev/null -T 1 "http://$a:$lport/" 2>/dev/null; then lup=1; break 2; fi
+    done
+    sleep 1
+done
+[ "$lup" = 1 ] && say "  Lemonade: up on http://$lhost:$lport/  (API key: $key)" ||
+    say "  Lemonade: not answering yet after 20 s (log: /tmp/lemond.log; API key: $key)"
+# and the engine behind it: the HRX device the onebit recipe needs, or the reason it is not there
+if [ -x /opt/1bit-llama/llama-server ]; then
+    say "  engine: probing the HRX device"
+    dev=$(timeout 20 /opt/1bit-llama/llama-server --list-devices 2>&1 | grep -m1 -i 'HRX' || true)
+    [ -n "$dev" ] && say "  engine: HRX0 ready - $(echo "$dev" | cut -c1-60)" ||
+        say "  engine: no HRX device listed (a GPU-less boot still serves on the CPU path; 1bit-release-check says why)"
+else
+    say "  engine: no llama-server on /data on this boot"
+fi
 [ -f /data/1bit.conf ] && echo "note: /data/1bit.conf is no longer read; Lemonade serves at boot (/data/lemonade, os/README.md)"
 
 if [ "$INSTALLED" = 1 ]; then

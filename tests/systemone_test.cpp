@@ -154,8 +154,10 @@ void test_answers() {
     const auto sa = answer_of(score, {0.0f, 1.0f, 0.0f});
     check(sa["type"] == "score" && close(sa["score"].get<double>(), 1.0),
           "score is the level index weighted by its probability");
-    check(sa["probabilities"].size() == 3 && sa["legend"]["ok"] == "ok",
-          "a score carries its probabilities and a legend");
+    check(sa["probabilities"].size() == 3 && sa["probabilities"].contains("1") && sa["legend"]["1"] == "ok",
+          "a score keys its probabilities and legend by level index, as upstream does");
+    check(!sa["probabilities"].contains("ok") && !sa["legend"].contains("ok"),
+          "a score does not key by the level text (upstream's keys are \"0\"..\"n-1\")");
     const auto mid = answer_of(score, {0.0f, 1.0f, 0.0f});
     check(close(mid["confidence"].get<double>(), 1.0), "one level taking everything is full confidence");
 

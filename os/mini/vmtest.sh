@@ -278,6 +278,12 @@ if [ $ok = 1 ] && [ -f "$out/vdisk.img" ]; then
         echo "VM: the installed disk booted on its own (no USB attached)"
         if grep -q "INSTALLED" "$out/serial2.log" 2>/dev/null; then
             echo "INSTALLED banner on the console: $(grep -m1 "INSTALLED" "$out/serial2.log" | cut -c1-72)"
+            # #711: the installed boot must name the disk it runs from, not a label it happens to share
+            if grep -q "INSTALLED on nvme" "$out/serial2.log"; then
+                echo "installed banner names the device: $(grep -m1 "INSTALLED on nvme" "$out/serial2.log" | cut -c1-96)"
+            else
+                echo "installed banner does not name the device (wanted 'INSTALLED on nvme0n1')"; ok=0
+            fi
         else echo "INSTALLED banner on the console: missing"; ok=0; fi
         st2=$(ssh -q -i "$out/key" -p 2222 -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null root@127.0.0.1 \
             'test -e /etc/1bit/installed && echo marker-installed; test -e /etc/1bit/live && echo marker-live; \

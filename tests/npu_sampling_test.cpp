@@ -17,6 +17,7 @@
 // the sampler (app/npu_sampling.h) and the GBNF compiler (app/npu_grammar.h).
 // Header only, no device: runs in CI.
 #include "npu_grammar.h"
+#include "npu_prefix_cache.h"
 #include "npu_sampling.h"
 
 #include <cmath>
@@ -32,6 +33,8 @@ using onebit::npu::find_stop;
 using onebit::npu::Grammar;
 using onebit::npu::json_grammar;
 using onebit::npu::kRandomSeed;
+using onebit::npu::PrefixOptions;
+using onebit::npu::PrefixCache;
 using onebit::npu::json_schema_to_gbnf;
 using onebit::npu::logprobs_of;
 using onebit::npu::options_from_body;
@@ -489,6 +492,105 @@ void test_json_schema_refusals() {
           "grammar and json_schema together are refused");
 }
 
+void test_prefix_cache() {
+    auto ids = [](int n, int start = 1) {
+        std::vector<int> v;
+        for (int i = 0; i < n; i++) v.push_back(start + i);
+        return v;
+    };
+    PrefixOptions o;
+    o.slots = 4;
+    o.cache_mb = 1;
+    o.min_gain = 1;   // these rows keep small prompts; the 128 default has its own row below
+
+    {   // off
+        PrefixOptions off;
+        off.slots = 0;
+        PrefixCache c(off);
+        check(!c.enabled(), "prefix-slots 0 turns the cache off");
+        check(c.lookup(ids(10)).reason == "off", "an off cache reports why it did nothing");
+        check(c.insert(ids(10), 1024) == -1, "an off cache saves nothing");
+    }
+    {
+        PrefixCache c(o);
+        check(c.lookup(ids(10)).slot == -1, "an empty cache shares no prefix");
+        check(c.lookup(ids(10)).reason == "no slot shares a prefix", "the miss says what it looked for");
+        const int slot = c.insert(ids(10), 4096);
+        check(slot == 0, "the first prompt lands in slot 0");
+        const auto hit = c.lookup(ids(10));
+        check(hit.slot == slot && hit.cached_tokens == 10 && hit.reason == "hit", "the same prompt hits");
+        check(c.lookup(ids(10, 1)).slot == slot, "a longer prompt that starts the same way hits");
+        check(c.lookup(ids(10, 2)).slot == -1, "a prompt whose start differs misses");
+        check(c.lookup(ids(5)).slot == -1, "a shorter prompt does not hit a longer slot");
+    }
+    {   // the LONGEST matching slot wins, not the newest and not the immediately preceding one
+        PrefixCache c(o);
+        c.insert(ids(20), 1024);
+        const int b = c.insert(ids(60, 1), 1024);
+        check(b >= 0, "a second, longer prompt is saved");
+        check(c.lookup(ids(80)).cached_tokens == 60, "the longest saved prefix is the one reused");
+    }
+    {   // min-gain admission
+        PrefixOptions g;
+        g.slots = 4;
+        g.cache_mb = 1;
+        g.min_gain = 128;
+        PrefixCache c(g);
+        check(c.insert(ids(100), 1024) == -1, "a prompt under prefix-min-gain is not saved");
+        check(c.lookup(ids(100)).slot == -1, "and it is not there to hit");
+        const int big = c.insert(ids(200), 1024);
+        check(big >= 0, "a prompt over the gain is saved");
+        check(c.insert(ids(250), 1024, big) == -1, "50 more tokens do not beat min-gain 128");
+        check(c.insert(ids(400), 1024, big) == big, "200 more tokens replace the slot they extend");
+        check(c.slot_count() == 4, "min-gain does not consume slots");
+    }
+    {   // budget: refuse what can never fit, evict the least recently used otherwise
+        PrefixOptions b;
+        b.slots = 4;
+        b.cache_mb = 0;
+        b.min_gain = 1;
+        PrefixCache c(b);
+        check(c.insert(ids(10), 4096) == -1, "a snapshot over prefix-cache-mb is refused");
+        PrefixOptions b2 = b;
+        b2.cache_mb = 1;
+        PrefixCache c2(b2);
+        const int s0 = c2.insert(ids(10), 300000);
+        const int s1 = c2.insert(ids(11, 100), 300000);
+        check(s0 == 0 && s1 == 1 && c2.used_bytes() == 600000, "two snapshots fit under 1 MB");
+        c2.lookup(ids(10));  // s0 is now the most recently used
+        // 600000 + 500000 = 1.1 MB > 1 MB, so exactly one slot has to go: the older one.
+        const int s2 = c2.insert(ids(12, 200), 500000);
+        check(s2 >= 0, "a snapshot that needs room evicts");
+        check(c2.lookup(ids(10)).slot == s0, "the recently used slot survived the eviction");
+        check(c2.lookup(ids(11, 100)).slot == -1, "the least recently used slot was dropped");
+    }
+    {   // an invalid option is refused where it is set, not silently clamped
+        auto throws = [](const PrefixOptions& bad) {
+            try {
+                PrefixCache c(bad);
+            } catch (const std::runtime_error&) {
+                return true;
+            }
+            return false;
+        };
+        PrefixOptions bad;
+        bad.slots = 33;
+        check(throws(bad), "prefix-slots above 32 is refused");
+        bad.slots = -1;
+        check(throws(bad), "a negative prefix-slots is refused");
+        bad.slots = 8;
+        bad.min_gain = -1;
+        check(throws(bad), "a negative prefix-min-gain is refused");
+    }
+    {   // a request abandoned before it saves anything leaves the others' prompts alone
+        PrefixCache c(o);
+        const int a = c.insert(ids(10), 1024);
+        c.lookup(ids(10));       // request 1 hits
+        c.lookup(ids(10, 500));  // request 2, abandoned
+        check(c.lookup(ids(10)).slot == a, "an abandoned request does not evict anyone's prefix");
+    }
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -550,6 +652,7 @@ int main() {
     test_logprob_options();
     test_json_schema();
     test_json_schema_refusals();
+    test_prefix_cache();
     test_request_parsing();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;

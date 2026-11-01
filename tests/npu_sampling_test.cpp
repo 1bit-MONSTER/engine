@@ -16,6 +16,7 @@
 // npu_sampling_test: the decode controls `1bit forward-serve` gained in #625 --
 // the sampler (app/npu_sampling.h) and the GBNF compiler (app/npu_grammar.h).
 // Header only, no device: runs in CI.
+#include "npu_answer_parser.h"
 #include "npu_grammar.h"
 #include "npu_prefix_cache.h"
 #include "npu_sampling.h"
@@ -31,7 +32,10 @@ namespace {
 
 using onebit::npu::find_stop;
 using onebit::npu::Grammar;
+using onebit::npu::AnswerFamily;
+using onebit::npu::AnswerStream;
 using onebit::npu::json_grammar;
+using onebit::npu::parse_answer;
 using onebit::npu::kRandomSeed;
 using onebit::npu::PrefixOptions;
 using onebit::npu::PrefixCache;
@@ -591,6 +595,99 @@ void test_json_schema_refusals() {
           "grammar and json_schema together are refused");
 }
 
+void test_answer_parser() {
+    const auto F = AnswerFamily::qwen3;
+    {   // reasoning, then content: the Qwen3 shape this route sees on every answer
+        const auto a = parse_answer("<think>\nOkay, the user asked.", F, false);
+        check(a.reasoning == "\nOkay, the user asked.", "reasoning_content is the inside of <think>");
+        check(a.content.empty() && a.calls.empty(), "a reasoning-only answer has no content and no calls");
+        check(!a.content_null, "content is empty string, not null, when there are no calls");
+
+        const auto b = parse_answer("<think>hmm</think>The answer is 42.", F, false);
+        check(b.reasoning == "hmm" && b.content == "The answer is 42.", "reasoning and content are split apart");
+    }
+    {   // an unterminated <think> (a truncated reply) keeps the rest as reasoning
+        const auto a = parse_answer("<think>still thinking", F, false);
+        check(a.reasoning == "still thinking" && a.content.empty(), "an unclosed <think> owns the rest");
+    }
+    {   // markup is a call only when the request carried tools
+        const std::string call = R"(<tool_call>{"name": "get_weather", "arguments": {"city": "Paris"}}</tool_call>)";
+        const auto with = parse_answer(call, F, true);
+        check(with.calls.size() == 1, "a <tool_call> is a call when tools were sent");
+        check(with.calls[0].name == "get_weather", "the call carries the function name");
+        check(with.calls[0].arguments == R"({"city":"Paris"})", "arguments are the JSON object as a string");
+        check(with.calls[0].id == "call_0", "calls are numbered deterministically");
+        check(with.content.empty() && with.content_null, "a call-only reply has content: null");
+
+        const auto without = parse_answer(call, F, false);
+        check(without.calls.empty(), "the same markup is not a call when no tools were sent");
+        check(without.content.find("<tool_call>") != std::string::npos, "and it stays in content, marker included");
+        check(!without.content_null, "so content is not null");
+    }
+    {   // text plus a call: content is what the model said, the call is separate
+        const auto a = parse_answer(
+            "Let me check.<tool_call>{\"name\": \"get_time\", \"arguments\": {\"zone\": \"Rome\"}}</tool_call>",
+            F, true);
+        check(a.content == "Let me check." && a.calls.size() == 1 && !a.content_null,
+              "prose before a call stays content and the reply is not content: null");
+    }
+    {   // several calls, in order
+        const auto a = parse_answer(
+            R"(<tool_call>{"name": "a", "arguments": {}}</tool_call><tool_call>{"name": "b", "arguments": {"x": 1}}</tool_call>)",
+            F, true);
+        check(a.calls.size() == 2 && a.calls[0].name == "a" && a.calls[1].name == "b", "calls keep their order");
+        check(a.calls[1].id == "call_1", "ids are sequential");
+    }
+    {   // a malformed call block is not dropped
+        const auto a = parse_answer("<tool_call>not json</tool_call>", F, true);
+        check(a.calls.empty(), "an unparseable block is not a call");
+        check(a.content.find("not json") != std::string::npos, "and its text survives in content");
+    }
+    {   // an unterminated call block is put back, not swallowed
+        const auto a = parse_answer("<tool_call>{\"name\": \"x\"", F, true);
+        check(a.calls.empty(), "an unterminated block makes no call");
+        check(a.content.find("\"name\"") != std::string::npos, "its text survives in content");
+    }
+    {   // text that only looks like markup
+        const auto a = parse_answer("2 < 3 and 4 < 5", F, false);
+        check(a.content == "2 < 3 and 4 < 5", "a stray '<' is just text");
+        const auto b = parse_answer("use <thinking> not <think>", F, false);
+        check(b.content.find("<thinking>") != std::string::npos, "a longer tag is not the family's tag");
+    }
+}
+
+void test_answer_stream() {
+    // The invariant that matters: feeding the same text in chunks must produce exactly the pieces
+    // the whole-text parse produces -- that is what makes streamed deltas add up to the reply.
+    const std::string text =
+        "<think>\nLet me think about this.</think>Sure.<tool_call>{\"name\": \"f\", \"arguments\": {\"a\": 1}}</tool_call>";
+    const auto whole = parse_answer(text, AnswerFamily::qwen3, true);
+    for (size_t step : {1u, 2u, 3u, 5u, 7u, 13u}) {
+        AnswerStream s(AnswerFamily::qwen3, true);
+        std::vector<std::pair<bool, std::string>> pieces;
+        for (size_t i = 0; i < text.size(); i += step) s.feed(text.substr(i, step), pieces);
+        s.finish(pieces);
+        std::string reasoning, content;
+        for (const auto& [is_reasoning, t] : pieces) (is_reasoning ? reasoning : content) += t;
+        const std::string label = " at chunk size " + std::to_string(step);
+        check(reasoning == whole.reasoning, "streamed reasoning equals the whole-text parse" + label);
+        check(content == whole.content, "streamed content equals the whole-text parse" + label);
+        check(s.calls().size() == whole.calls.size() && s.calls()[0].name == "f",
+              "the call is found across chunk boundaries" + label);
+    }
+    {   // a tag split across the boundary is never emitted as text
+        AnswerStream s(AnswerFamily::qwen3, false);
+        std::vector<std::pair<bool, std::string>> pieces;
+        s.feed("hello <thi", pieces);
+        s.feed("nk>world</think>", pieces);
+        s.finish(pieces);
+        std::string all;
+        for (const auto& [r, t] : pieces) all += t;
+        check(all == "hello world", "a tag split across two chunks is not emitted");
+        check(s.reasoning() == "world", "and the split lands in reasoning");
+    }
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -653,6 +750,8 @@ int main() {
     test_prefix_cache();
     test_json_schema();
     test_json_schema_refusals();
+    test_answer_parser();
+    test_answer_stream();
     test_request_parsing();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;

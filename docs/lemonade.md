@@ -86,13 +86,20 @@ On Strix Halo the recipe passes Lemonade's own LLM test suite
 (`test/server_llm.py --wrapped-server onebit`) on HRX (the checklist below has the counts;
 Vulkan passed too before RFC #213 stage 3 removed it). It is not proposed upstream yet: the plan is to embed the engine fully
 in the fork first, then propose it upstream. The fork follows upstream's releases:
-`.github/workflows/sync-lemonade-fork.yml` checks daily and merges upstream's latest
-release tag (never a pre-release or `main`), so each engine release carries the Lemonade
-release current when it was built. It
-pushes only a clean merge that still registers `onebit`; otherwise it opens a PR
-in the fork that lists the conflicts. It also keeps the fork's own copies of
-upstream's workflows disabled. Lemonade asks for an RFC
-before a new backend.
+`.github/workflows/sync-lemonade-fork.yml` checks daily and **ports upstream's latest
+release onto `main`** (never a pre-release, never `main` itself), so each engine release
+carries the Lemonade release current when it was built. It ports rather than merges
+because the fork's `main` follows upstream's `main`: a release tag is cut from a release
+branch, so merging the tag's tree would revert every commit `main` has gained since that
+branch was cut (fork
+[#27](https://github.com/1bit-MONSTER/lemonade/pull/27) arrived exactly that way, as a
+524-file revert, which
+[#642](https://github.com/1bit-MONSTER/engine/pull/642) fixed). Concretely: the release's
+own commits are cherry-picked onto `main` in order; a commit that applies cleanly and
+still leaves `onebit` registered is pushed to `main`; a commit the fork also changed keeps
+the fork's side, goes to a `sync/<tag>` branch and is listed in a PR in the fork, so a
+sync branch can never revert `main`. It also keeps the fork's own copies of upstream's
+workflows disabled. Lemonade asks for an RFC before a new backend.
 
 ## Embedding checklist
 
@@ -102,7 +109,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 | device | 2026-09-25, start | now |
 |---|---|---|
-| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; release pre-check 2026-10-02, from the packaged tarballs) |
+| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; 2026-10-31, through the shipped `lemonade-onebit-rc-2026-10-31c` package: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0) |
 | NPU | 3 / 31 | in progress ([npu.md](npu.md)); the suite's small test models are GGUF |
 | Vulkan (removed in RFC #213 stage 3) | 19 / 31 | 29 / 29 run, all pass, before its removal |
 
@@ -131,7 +138,8 @@ declares neither.
 
 ## Ubuntu 26.04: the PPA's lemond
 
-On Ubuntu 26.04 Lemonade installs from its PPA, and that `lemond` (2026.42.1~26.04) is upstream's,
+On Ubuntu 26.04 Lemonade installs from its PPA, and that `lemond` (2026.44.1~26.04 on
+2026-10-31; 2026.42.1~26.04 when this path was written) is upstream's,
 with no `onebit` recipe. The fork's Debian 13 `.deb` does not install there either: it depends
 on `libcpp-httplib0.41`, which 26.04 does not have. So on 26.04 the engine plugs into the stock
 `lemond` through the HRX recipe it already has, `llamacpp-hrx`, with no patch to Lemonade:

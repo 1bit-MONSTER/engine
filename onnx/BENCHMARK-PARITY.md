@@ -248,7 +248,8 @@ choosing between the two levers, and it is cheaper than either.
 ## Where a 2048-token prefill actually goes
 
 `ort_run --profile PREFIX` turns on ORT's own per-node trace (it writes `PREFIX_<timestamp>.json`) and
-`onnx/prof_summary.py` folds it by op. One 2048-token prefill on `ryzen`, 8 threads, fp32:
+`onnx/prof_summary.py` folds it by op, one table per graph execution. One 2048-token **prefill execution**
+on `ryzen`, 8 threads, fp32:
 
 | op | share of 4182 ms |
 |---|---|
@@ -259,12 +260,29 @@ choosing between the two levers, and it is cheaper than either.
 | `Concat` (cache stacking) | 6.3% |
 | `Mul` / `Where` / `Expand` | 10.0% combined |
 
-So 53% is matmul — the part int8 speeds up and nothing else can — and **~22% is mask and broadcast
-elementwise work** (`Where` + `Expand` + most of `Add`), which is ours to delete: the causal mask is
-rebuilt as a `[1,1,2048,2048]` tensor inside the graph on every step. The single largest node in the
-whole run is one `Add` at 161.8 ms and one `Where` at 141.6 ms, both mask construction. The next graph
-change is therefore to hand the mask in as a dtype-correct input (the reason it was removed was a
-zero-length-`past` `Expand` failure, not cost), not to look for more matmul tricks.
+On `strixhalo` the same command does not reproduce that shape. 2048 prefill, 8 threads, fp32, measured
+under load 16 from other sessions (shares, not absolutes):
+
+| op | share of 4092 ms |
+|---|---|
+| `MatMul` | 67.8% |
+| `FusedMatMul` (attention) | 12.5% |
+| `Add` | 7.1% |
+| `Softmax` | 3.6% |
+| `Mul` | 2.4% |
+| `Concat` (cache stacking) | 1.6% |
+| `Expand` | 1.3% |
+
+with no `Where` in the top eight and the largest node in the run a `MatMul` at 374 ms, not an `Add` at
+161.8 ms. `FusedMatMul` (12-13%) and `Softmax` (4-7%) agree across the two boxes, which is a good sign the
+tool is measuring the same thing; the mask and broadcast elementwise work does not. So the lever depends
+on which profile you trust: on `ryzen`'s numbers **~22% is mask and broadcast elementwise work** (`Where`
++ `Expand` + most of `Add`), and on `strixhalo`'s it is ~8% (`Add` + `Expand`), with matmul at two thirds.
+Handing the mask in as a dtype-correct input (the reason it was removed was a zero-length-`past` `Expand`
+failure, not cost) is therefore worth doing **only if a profile on the box you care about shows those mask
+nodes**; where matmul is two thirds of the prefill, deleting 8% of elementwise work is the smaller of the
+two levers. Re-take it before acting on it — `--profile` plus `prof_summary.py` now prints one table per
+execution, so prefill and decode cannot be blended into one share table any more.
 
 ## What this table says
 

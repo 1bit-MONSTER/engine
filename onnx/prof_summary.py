@@ -46,7 +46,9 @@ def main() -> int:
     seen = set()
     run, runs = 0, collections.defaultdict(list)
     for e in nodes:
-        key = (e.get("name"), e.get("ts"))
+        # The name alone, not (name, ts): ts is a per-event timestamp, so a key that includes it is unique
+        # by construction, the boundary above can never fire, and N executions are reported as one run.
+        key = e.get("name")
         if key in seen:
             run += 1
             seen.clear()

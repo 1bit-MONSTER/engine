@@ -41,6 +41,16 @@ elif [ -c /dev/ttyS0 ] && [ -r /dev/kmsg ]; then
     ( cat /dev/kmsg > /dev/ttyS0 ) > /dev/null 2>&1 &
 fi
 
+# #709: efivars. The kernel config has CONFIG_EFIVAR_FS=m and the module was not in the image, so
+# `mount -t efivarfs` answered "No such device" on the live boot and 1bit-install could not register a
+# boot entry (the firmware kept its stale ubuntu entry and fell through to the stick). Mounted here, once,
+# for the whole boot - it is a handful of runtime variables, not a disk.
+modprobe -q efivarfs
+if [ -d /sys/firmware/efi ] && [ ! -e /sys/firmware/efi/efivars/BootOrder-8be4df61-93ca-11d2-aa0d-00e098032b8c ]; then
+    mkdir -p /sys/firmware/efi/efivars 2>/dev/null
+    mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2>/dev/null
+fi
+
 # drivers, in the order the boot needs them: network, USB storage and the USB4/Type-C stack first, so
 # the machine is reachable and the stick readable even if a GPU probe is slow. sd_mod makes a USB
 # stick a disk (usb-storage only presents it as a SCSI device); the TYPEC/Thunderbolt modules are what

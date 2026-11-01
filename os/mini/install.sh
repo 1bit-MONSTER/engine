@@ -260,6 +260,7 @@ steps_add "boot files copied from the live stick"
 steps_add "boot files verified (sha256, read back from the disk)"
 steps_add "data partition filled from the live boot"
 steps_add ".installed and the key material carried over"
+steps_add "firmware boot entry created (1bit OS, first in BootOrder)"
 steps_add "final verification (both partitions, read-only)"
 steps_draw
 
@@ -336,21 +337,72 @@ if [ -f /data/ssh/authorized_keys ]; then
 fi
 step_end 8 OK
 
-# 9: both partitions, read-only, the way the firmware will see them
+# 9: the firmware boot entry (#709).
+# The first real install wrote the ESP, the data partition and /data/.installed and then told the owner to go
+# and edit the firmware by hand. On the next boot the AMI firmware tried its stale `ubuntu` entry (the wiped
+# system's shim), failed, and fell through to the USB stick - the owner saw a live boot and thought the
+# install had failed. So: register \\EFI\\BOOT\\BOOTX64.EFI for this disk, put it first, set BootNext for the
+# first reboot, and remove entries whose loader file is gone from this disk.
 step_begin 9
+if [ ! -d /sys/firmware/efi ]; then
+    log "    no EFI firmware on this boot: nothing to register (the disk still boots as \\EFI\\BOOT\\BOOTX64.EFI)"
+    step_end 9 OK "no EFI firmware on this boot"
+elif ! command -v efibootmgr >/dev/null 2>&1; then
+    fail 9 "efibootmgr is missing from this image"
+elif [ ! -e /sys/firmware/efi/efivars/BootOrder-8be4df61-93ca-11d2-aa0d-00e098032b8c ]; then
+    # this image's kernel tree has no efivarfs module, so no boot entry can be written from here. Say exactly
+    # that - and leave the disk bootable the way it is today, by the firmware's own fallback - rather than
+    # stopping an otherwise complete install or, worse, claiming an entry that does not exist.
+    log "    efivars are not readable on this boot (no efivarfs in this image's kernel): no boot entry written"
+    log "    the disk still boots as \\EFI\\BOOT\\BOOTX64.EFI - point the firmware at it, or boot it once"
+    step_end 9 OK "no efivarfs in this kernel: firmware fallback"
+else
+    # the target ESP's partition GUID, so only entries for THIS disk are ever removed
+    esp_guid=$(sed -n 's/^PARTUUID=//p' "/sys/class/block/${esp##*/}/uevent" 2>/dev/null | head -n 1)
+    mkdir -p /tmp/install/esp-ro
+    mount -t vfat -o ro "$esp" /tmp/install/esp-ro 2>/dev/null || fail 9 "cannot mount the new ESP read-only"
+    removed=0
+    efibootmgr -v 2>/dev/null | while IFS= read -r line; do
+        case "$line" in Boot*File\(*\)*) ;; *) continue ;; esac
+        num=$(printf '%s\n' "$line" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p')
+        file=$(printf '%s\n' "$line" | sed -n 's/.*File(\([^)]*\)).*/\1/p' | tr '\\' '/' | tr 'A-Z' 'a-z')
+        # only an entry that points into THIS ESP, and only when the file it names is not there any more
+        [ -n "$esp_guid" ] || continue
+        case "$line" in *"$esp_guid"*) ;; *) continue ;; esac
+        [ -n "$file" ] || continue
+        if [ ! -e "/tmp/install/esp-ro/$file" ]; then
+            efibootmgr -b "$num" -B >/dev/null 2>&1 && { echo "efibootmgr: removed stale Boot$num ($file)" >> /tmp/install-step.log; removed=$((removed + 1)); }
+        fi
+    done
+    new=$(efibootmgr -c -d "$DEV" -p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>/tmp/install-step.log |
+          sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\*.*1bit OS.*/\1/p' | head -n 1)
+    [ -n "$new" ] || fail 9 "efibootmgr could not create the 1bit OS entry"
+    order=$(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | head -n 1)
+    rest=$(printf '%s\n' "$order" | tr ',' '\n' | grep -v -x -i "$new" | tr '\n' ',' | sed 's/,$//')
+    efibootmgr -o "$new${rest:+,$rest}" >/dev/null 2>>/tmp/install-step.log || fail 9 "efibootmgr could not set BootOrder"
+    efibootmgr -n "$new" >/dev/null 2>>/tmp/install-step.log || true
+    sync
+    log "    Boot$new* 1bit OS -> \\EFI\\BOOT\\BOOTX64.EFI on $DEV, BootNext set"
+    log "    BootOrder: $(efibootmgr 2>/dev/null | sed -n 's/^BootOrder: //p' | head -n 1)"
+    umount /tmp/install/esp-ro 2>/dev/null || true
+    step_end 9 OK "Boot$new first"
+fi
+
+# 10: both partitions, read-only, the way the firmware will see them
+step_begin 10
 sync
-umount /tmp/install/data 2>/dev/null || fail 9 "cannot flush the new data partition"
+umount /tmp/install/data 2>/dev/null || fail 10 "cannot flush the new data partition"
 mkdir -p /tmp/install/esp-ro /tmp/install/data-ro
-mount -t vfat -o ro "$esp" /tmp/install/esp-ro || fail 9 "cannot mount the new ESP read-only"
-mount -t ext4 -o ro "$data" /tmp/install/data-ro || fail 9 "cannot mount the new data partition read-only"
+mount -t vfat -o ro "$esp" /tmp/install/esp-ro || fail 10 "cannot mount the new ESP read-only"
+mount -t ext4 -o ro "$data" /tmp/install/data-ro || fail 10 "cannot mount the new data partition read-only"
 log "    ESP: $(find /tmp/install/esp-ro -type f 2>/dev/null | wc -l) files, data: $(find /tmp/install/data-ro -maxdepth 1 2>/dev/null | wc -l) entries"
 for f in EFI/BOOT/BOOTX64.EFI 1bit/vmlinuz 1bit/initramfs.img; do
     [ -e "/tmp/install/esp-ro/$f" ] && log "    $f $(sha256sum "/tmp/install/esp-ro/$f" | cut -d' ' -f1)"
 done
-[ -e /tmp/install/data-ro/.installed ] || fail 9 ".installed is missing on the new data partition"
+[ -e /tmp/install/data-ro/.installed ] || fail 10 ".installed is missing on the new data partition"
 umount /tmp/install/esp-ro 2>/dev/null || true
 umount /tmp/install/data-ro 2>/dev/null || true
-step_end 9 OK
+step_end 10 OK
 
 echo
 echo "1bit OS is installed on $DEV."

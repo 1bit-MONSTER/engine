@@ -29,7 +29,9 @@
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
-# config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
+# config/npu-runtime.config and config/gpu-kernels.config pin), the pinned HRX toolchain (preflight
+# fetches it with scripts/fetch-rocm-sdk.sh at the pin in config/hrx-toolchain.config, so a build
+# needs nothing outside this repository), and
 # what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
@@ -46,6 +48,9 @@ export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
 # the submodules the packages are built from (laya only on its bump)
 # (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
 SUBMODULES=(hrx-system llama.cpp lemonade ds4 tokenizers)
+# the pinned HRX toolchain preflight fetches (scripts/fetch-rocm-sdk.sh, engine#713); empty when
+# the caller names its own with -DONEBIT_HRX_TOOLCHAIN in WEEKLY_CMAKE_ARGS
+HRX_TOOLCHAIN=
 mkdir -p "$LOGS"
 # pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
 # shellcheck source=scripts/pack-elf.sh
@@ -123,6 +128,11 @@ build() {
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
+    # the pinned HRX toolchain preflight fetched (engine#713), unless the caller named another
+    case " ${WEEKLY_CMAKE_ARGS:-} " in
+        *ONEBIT_HRX_TOOLCHAIN=*) ;;
+        *) [ -n "$HRX_TOOLCHAIN" ] && extra+=(-DONEBIT_HRX_TOOLCHAIN="$HRX_TOOLCHAIN") ;;
+    esac
     # The NPU kernels (docs/releases.md, "The NPU engine"): sealed, packed beside 1bit in
     # npu/kernels. On by default (the npu gate phase passed on Strix Halo; WEEKLY_NPU_KERNELS=0
     # builds a package without them). The private checkout does the work through its one entry
@@ -591,16 +601,22 @@ preflight() {
     for s in $STAGES; do
         case "$s" in
             bumps|build)
-                # the HRX build's toolchain (cmake/hrx.cmake), unless WEEKLY_CMAKE_ARGS names another
+                # the HRX build's toolchain (cmake/hrx.cmake): the pinned copy fetched into the
+                # workdir, so a fresh box needs only this repository (scripts/fetch-rocm-sdk.sh,
+                # engine#713), unless WEEKLY_CMAKE_ARGS names another. Fetched here so a missing
+                # toolchain stops the run before stage one rather than an hour into the build.
                 case " ${WEEKLY_CMAKE_ARGS:-} " in
                     *ONEBIT_HRX_TOOLCHAIN=*) ;;
-                    *) [ -d /opt/rocm-therock ] ||
-                        { echo "preflight: no /opt/rocm-therock (the HRX toolchain): install TheRock there, or pass -DONEBIT_HRX_TOOLCHAIN=<dir> in WEEKLY_CMAKE_ARGS"; bad=1; } ;;
+                    *) if HRX_TOOLCHAIN=$("$(cd "$(dirname "$0")" && pwd)/fetch-rocm-sdk.sh" \
+                             "$(cd "$(dirname "$0")" && pwd)/../config/hrx-toolchain.config" "$W/hrx-toolchain" \
+                             2> "$LOGS/hrx-toolchain.log"); then :; else
+                           echo "preflight: cannot fetch the pinned HRX toolchain (config/hrx-toolchain.config): see $LOGS/hrx-toolchain.log"; bad=1
+                       fi ;;
                 esac
                 # DwarfStar (-DONEBIT_DS4=ON) builds with hipcc, found the way scripts/build-ds4.sh finds it
                 rocm=${ROCM_PATH:-}
                 if [ -z "$rocm" ]; then
-                    for d in /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
+                    for d in ${HRX_TOOLCHAIN:-} ${HRX_TOOLCHAIN:+"$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core} /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
                         [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
                     done
                 fi

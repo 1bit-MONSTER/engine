@@ -870,10 +870,20 @@ table: 16 f16 inputs and 4 f32 results per lane in wave64.
 ## Build
 
 ```bash
+scripts/fetch-rocm-sdk.sh                      # the pinned toolchain, into third_party/toolchain/
 git submodule update --init --depth 1 third_party/hrx-system third_party/llama.cpp
-cmake -B build -G Ninja -DONEBIT_HRX=ON          # needs TheRock at /opt/rocm-therock (ONEBIT_HRX_TOOLCHAIN)
+cmake -B build -G Ninja -DONEBIT_HRX=ON          # -DONEBIT_HRX_TOOLCHAIN=<dir> overrides the toolchain
 cmake --build build --target onebit
 ```
+
+- **The toolchain.** The build compiles with TheRock's ROCm SDK at one pinned version and one GPU
+  target, `config/hrx-toolchain.config` (engine#713): `scripts/fetch-rocm-sdk.sh` installs
+  `rocm[libraries,devel,device-gfx1151]` at that version from the nightly wheel index into
+  `third_party/toolchain/rocm-sdk-<version>-<gfx>`, and `cmake/hrx.cmake` defaults to that copy, so
+  a fresh box needs only this repository. `-DONEBIT_HRX_TOOLCHAIN` / `ROCM_PATH` still override it,
+  and an existing `/opt/rocm-therock` is used when the tree copy is absent. The device library
+  (the `amdgcn` bitcode) is read from the toolchain itself, so no `HIP_DEVICE_LIB_PATH`,
+  `ROCM_PATH` or `HIP_PATH` is needed in the environment.
 
 - **One external project.** llama.cpp's ggml-hrx builds hrx-system itself
   (`HRX_SOURCE_DIR`) with TheRock's `amdclang`.
@@ -890,7 +900,7 @@ cmake --build build --target onebit
   gfx1151, so HRX then registers no device. CMake finds TheRock's
   `libhsa-runtime64.so.1` (`ONEBIT_HRX_LIBHSA`), and `1bit serve` passes it to
   llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. Without a
-  build path it searches `/opt/rocm-therock`. To run
+  build path it searches the pinned toolchain, then `/opt/rocm-therock`. To run
   llama-server or llama-bench by hand, export that variable yourself.
 
 ### Private HIP kernels

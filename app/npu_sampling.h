@@ -48,12 +48,18 @@ inline constexpr uint64_t kRandomSeed = ~uint64_t(0);
 // At most this many stop sequences, as in the OpenAI API.
 inline constexpr size_t kMaxStop = 4;
 
+// OpenAI's cap on `top_logprobs` is 20; FLM serves 0..100, and a decoder with the logits in hand
+// pays nothing for the wider range, so this route takes FLM's number.
+inline constexpr int kMaxTopLogprobs = 100;
+
 struct SampleParams {
     float temperature = 0.0f;  // 0 = greedy (argmax), this route's historical decode
     int top_k = 0;             // 0 = off
     float top_p = 1.0f;        // 1 = off
     int min_keep = 1;          // top_p keeps at least this many candidates
     uint64_t seed = kRandomSeed;
+    bool logprobs = false;     // report each token's log-probability (chat completions only)
+    int top_logprobs = 0;      // how many alternatives per token, 0 = none, at most kMaxTopLogprobs
 
     bool greedy() const { return temperature <= 0.0f; }
 };
@@ -148,6 +154,54 @@ inline int sample_token(const std::vector<float>& logits, const SampleParams& p,
     return c.back().id;
 }
 
+// One candidate of the raw distribution, as the client reads it: the id and its log-probability.
+struct Logprob {
+    int id = 0;
+    float logprob = 0.0f;
+};
+
+// What one generated token's entry carries: the id that was drawn, its log-probability, and the
+// `top_logprobs` most likely ids.  `top` need not contain `id`: the draw happens inside the
+// grammar's mask while these values describe the raw distribution (see logprobs_of).
+struct TokenLogprob {
+    int id = 0;
+    float logprob = 0.0f;
+    std::vector<Logprob> top;
+};
+
+// The log-probabilities of `logits` over the whole vocabulary, as OpenAI and vLLM report them:
+// the values of the distribution *before* top_k, top_p, temperature and any grammar mask, which
+// is why this is computed from the untouched logits rather than inside the sampler's filtered
+// candidate set.  Top entries are the highest raw logits, with the sampler's tie rule (lower id
+// first), so the same seed and request always report the same list.
+inline TokenLogprob logprobs_of(const std::vector<float>& logits, int chosen, int top_n) {
+    TokenLogprob out;
+    out.id = chosen;
+    if (logits.empty()) return out;
+    // log-sum-exp in double: exp() of a float logit and then log() of the sum loses the tail that
+    // top_logprobs is read for.
+    float max_l = logits[0];
+    for (const float v : logits) max_l = std::max(max_l, v);
+    if (!std::isfinite(max_l)) return out;  // a vocabulary of infinities reports nothing meaningful
+    double sum = 0.0;
+    for (const float v : logits) sum += std::exp(double(v) - double(max_l));
+    const double log_z = double(max_l) + std::log(sum);
+    if (!std::isfinite(log_z)) return out;
+    if (chosen >= 0 && size_t(chosen) < logits.size()) out.logprob = float(double(logits[size_t(chosen)]) - log_z);
+    if (top_n <= 0) return out;
+    std::vector<Candidate> c;
+    c.reserve(logits.size());
+    for (size_t i = 0; i < logits.size(); i++) c.push_back({logits[i], int(i)});
+    auto better = [](const Candidate& a, const Candidate& b) {
+        return a.logit > b.logit || (a.logit == b.logit && a.id < b.id);
+    };
+    const size_t k = std::min(size_t(top_n), c.size());
+    std::partial_sort(c.begin(), c.begin() + k, c.end(), better);
+    out.top.reserve(k);
+    for (size_t i = 0; i < k; i++) out.top.push_back({c[i].id, float(double(c[i].logit) - log_z)});
+    return out;
+}
+
 // The bytes a decoder must hold back before it can be sure no stop sequence straddles
 // the boundary: the longest stop, minus one.
 inline size_t stop_holdback(const std::vector<std::string>& stops) {
@@ -221,6 +275,20 @@ inline Options options_from_body(const nlohmann::json& body) {
         if (s < 0) throw std::runtime_error("seed: must be zero or more");
         o.sample.seed = uint64_t(s);
     }
+    if (body.contains("logprobs")) {
+        const auto& v = body.at("logprobs");
+        if (!v.is_boolean()) throw std::runtime_error("logprobs: must be true or false");
+        o.sample.logprobs = v.get<bool>();
+    }
+    if (body.contains("top_logprobs")) {
+        const long long n = integer("top_logprobs");
+        if (n < 0 || n > kMaxTopLogprobs)
+            throw std::runtime_error("top_logprobs: must be 0 to " + std::to_string(kMaxTopLogprobs));
+        o.sample.top_logprobs = int(n);
+    }
+    // OpenAI refuses this too, and the alternative is a field that silently does nothing.
+    if (o.sample.top_logprobs > 0 && !o.sample.logprobs)
+        throw std::runtime_error("top_logprobs: needs logprobs: true");
     if (body.contains("stop")) {
         const auto& v = body.at("stop");
         std::vector<std::string> stop;

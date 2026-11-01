@@ -89,6 +89,11 @@ if [ -f "$vmlinuz" ]; then
     if [ -n "$vkver" ]; then echo "== the image kernel ($vkver, from $vmlinuz)"; fi
 fi
 here=$(cd "$(dirname "$0")" && pwd)
+# #704: the release name this image carries, in one place. No page or banner hard-codes a version (the
+# c18 dry run read "v2026.43" on a stick shipping Lemonade 2026.46.0): IMAGE_TAG is what the candidate
+# build passes (WEEKLY_TAG), and a hand-built image falls back to the engine tree's own describe.
+repo=$(cd "$here/../.." && pwd)
+tagv=${IMAGE_TAG:-$(git -C "$repo" describe --always --dirty 2>/dev/null || echo dev)}
 tools=$HOME/.cache/1bit-os/tools/x
 # Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A
 # cleaned ~/.cache used to stop the weekly release at "SSH (Dropbear)" (2026-10-01 rehearsal).
@@ -390,6 +395,21 @@ cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/
 install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
 mkdir -p "$root/etc/1bit"
 install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
+# #704: what this image is, measured at build time, written where the boot banner and 1bit-release-check
+# read it (os/mini/init.sh, os/mini/release-check.sh). The Lemonade version comes from the package that
+# is being shipped - `lemond --version` - never from a constant; the engine commit and the HRX pin come
+# from the tree this image was built out of. The artifact's own sha256 cannot be in the image it hashes,
+# so it stays in the release table beside the .img.zst and 1bit-release-check reports the tag.
+lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([^ ~]*\).*/\1/p' | head -n 1)
+[ -n "$lemver" ] || lemver=unknown
+{
+    echo "tag: $tagv"
+    echo "lemonade: $lemver"
+    echo "engine: $(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    echo "hrx-system: $(git -C "$repo/third_party/hrx-system" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    echo "kernel: $kver"
+    echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$root/etc/1bit/release-identity"
 # The onebit entries this image ships, so 1bit-release-check can prove Lemonade registers them. The
 # catalogue Lemonade reads at runtime is server_models.json; the check needs the *shipped* subset on
 # paper, because on a machine without a GPU or NPU Lemonade hides those entries and their absence there
@@ -670,7 +690,7 @@ if [ "$BOOT_LAYOUT" = grub ]; then
     cat > "$out/esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=12
 set default=0
-menuentry "1bit OS, Lemonade Server appliance v2026.43 - LIVE (runs from RAM, nothing installed)" {
+menuentry "1bit OS, Lemonade Server appliance ${tagv} - LIVE (runs from RAM, nothing installed)" {
     linux /1bit/vmlinuz $cmdline
     initrd /1bit/initramfs.img
 }

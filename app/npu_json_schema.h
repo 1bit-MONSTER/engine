@@ -82,18 +82,25 @@ inline std::string json_literal(const nlohmann::json& v) { return literal(v.dump
 
 }  // namespace schema_detail
 
-// Compiles an OpenAI structured-outputs schema into a complete GBNF document whose `root` accepts
-// exactly the JSON instances that schema allows. Throws std::runtime_error (-> 400) for a schema it
-// cannot honour, naming the keyword or the malformed part.
-inline std::string json_schema_to_gbnf(const nlohmann::json& schema) {
+// Compiles `schema` with every generated rule name prefixed by `prefix`, appending the rules to
+// `sink`, and returns the name of the rule that accepts it.  The shared rules (string, number, ws,
+// ...) are the caller's to append once: json_schema_to_gbnf() does that itself, and
+// app/npu_tool_grammar.h composes several argument schemas into one document, where a second copy
+// of those rules would be a duplicate definition.
+inline std::string json_schema_rule(const nlohmann::json& schema, const std::string& prefix, std::string& sink) {
     using nlohmann::json;
+    // GBNF rule names are [A-Za-z0-9-] only (app/npu_grammar.h, is_word_char): refuse a prefix that
+    // would emit a grammar nothing can parse, rather than fail later inside the Grammar ctor.
+    for (const char ch : prefix)
+        if (!((ch >= 'a' && ch <= 'z') || (ch >= 'A' && ch <= 'Z') || (ch >= '0' && ch <= '9') || ch == '-'))
+            throw std::runtime_error(std::string("json_schema: rule prefix \"") + prefix +
+                                     "\" has a character GBNF rule names do not allow");
     using schema_detail::json_literal;
 
-    std::vector<std::string> rules;  // "sN ::= ..." in the order they were generated
     size_t next = 0;
     auto new_rule = [&](const std::string& body) {
-        rules.push_back("s" + std::to_string(next) + " ::= " + body);
-        return "s" + std::to_string(next++);
+        sink += prefix + std::to_string(next) + " ::= " + body + "\n";
+        return prefix + std::to_string(next++);
     };
     auto alternation = [&](const std::vector<std::string>& parts) {
         std::string body = "( ";
@@ -270,11 +277,16 @@ inline std::string json_schema_to_gbnf(const nlohmann::json& schema) {
         return parts.size() == 1 ? parts[0] : alternation(parts);
     };
 
-    const std::string root = value_rule(schema);
-    std::string out = "root ::= " + root + "\n";
-    for (const auto& r : rules) out += r + "\n";
-    out += json_shared_rules();
-    return out;
+    return value_rule(schema);
+}
+
+// Compiles an OpenAI structured-outputs schema into a complete GBNF document whose `root` accepts
+// exactly the JSON instances that schema allows. Throws std::runtime_error (-> 400) for a schema it
+// cannot honour, naming the keyword or the malformed part.
+inline std::string json_schema_to_gbnf(const nlohmann::json& schema) {
+    std::string rules;
+    const std::string root = json_schema_rule(schema, "s", rules);
+    return "root ::= " + root + "\n" + rules + json_shared_rules();
 }
 
 }  // namespace onebit::npu

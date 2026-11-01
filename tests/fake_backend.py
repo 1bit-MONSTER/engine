@@ -77,6 +77,44 @@ class H(BaseHTTPRequestHandler):
             return
         if self.path.startswith("/slots/"):
             slot, _, action = self.path[len("/slots/"):].partition("?action=")
+            if action == "share":
+                # the shared-KV protocol (fork 1bit-MONSTER/llama.cpp#164, engine ONEBIT_KV_SHARE=1):
+                # connect to the engine's socket and send [uint32 length][JSON] with one fd, then report
+                # the export id. No dma-buf here -- any readable fd proves the plumbing (the real one is
+                # a dma-buf the provider mmaps). tests/hybrid_kvshare_route.sh
+                path = str(req.get("socket", ""))
+                import struct
+                fd = os.open(__file__, os.O_RDONLY)  # a real fd the provider can pread()
+                header = json.dumps({
+                    "n_regions": 1,
+                    "params": {"n_ctx": 4096, "n_batch": 2048, "n_ubatch": 512, "n_seq_max": 1,
+                               "flash_attn": 1, "type_k": 1, "type_v": 1},
+                    "regions": [{"offset": 0, "size": 4096, "layout": 1234567}],
+                }).encode()
+                sock = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+                try:
+                    sock.connect(path)
+                    sock.sendmsg([struct.pack("<I", len(header)) + header],
+                                 [(socket.SOL_SOCKET, socket.SCM_RIGHTS, struct.pack("<i", fd))])
+                finally:
+                    sock.close()
+                    os.close(fd)
+                _SHARE_ID = 7
+                self._json(200, {"id_slot": int(slot), "share_id": _SHARE_ID, "n_regions": 1,
+                                 "regions": [{"offset": 0, "size": 4096, "layout": 1234567}],
+                                 "params": {"n_ctx": 4096, "n_batch": 2048, "n_ubatch": 512, "n_seq_max": 1,
+                                            "flash_attn": 1, "type_k": 1, "type_v": 1},
+                                 "timings": {"share_ms": 0.25}})
+                return
+            if action == "adopt":
+                # the cells are only meaningful for the export they were written into
+                if req.get("share_id") != 7:
+                    self._json(400, {"error": {"message": "adopt must quote the share_id"}})
+                    return
+                toks = req.get("tokens") or []
+                self._json(200, {"id_slot": int(slot), "share_id": 7, "n_adopted": len(toks), "n_read": 0,
+                                 "timings": {"adopt_ms": 0.1}})
+                return
             if action != "restore":
                 self._json(400, {"error": {"message": "Invalid action"}})
                 return

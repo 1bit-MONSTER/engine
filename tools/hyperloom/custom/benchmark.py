@@ -179,6 +179,22 @@ def serve_batch_args():
     return args
 
 
+def dflash_on():
+    """True when the DFlash drafter is requested (`HL_DFLASH`; `0`/`off`/`false` mean off)."""
+    value = env("HL_DFLASH")
+    return bool(value) and value not in ("0", "off", "false")
+
+
+def longctx_drafter_conflict():
+    """The box rule (2026-11-01 12:13): no long-context measurement may draft.
+
+    The drafter at long context is the arm that faulted the HRX graph on this box (27B at 18.8k, the
+    11:13 MODE2 reset), so it is refused until engine#764's admission guardrail is merged. A refused
+    candidate scores zero and says why, rather than loading a drafter nobody may measure.
+    """
+    return env_int("HL_LONGCTX", 0) > 0 and dflash_on()
+
+
 def serve_lever_args():
     """The levers that only `1bit serve` has: drafting and slots.
 
@@ -188,9 +204,8 @@ def serve_lever_args():
     external head to draft with instead.
     """
     args = serve_batch_args()
-    dflash = env("HL_DFLASH")
     mtp_max_raw = env("HL_MTP_MAX")
-    if dflash and dflash not in ("0", "off", "false"):
+    if dflash_on():
         args += ["--dflash", env("HL_DFLASH_GGUF", "dflash.gguf")]
     elif mtp_max_raw:
         mtp_max = env_int("HL_MTP_MAX", 0)
@@ -406,6 +421,11 @@ def main():
     # engine#679: an optional long-context decode leg, whose rate becomes the score.
     longctx = env_int("HL_LONGCTX", 0)
     longtok = env_int("HL_LONGTOK", 128)
+    if longctx_drafter_conflict():
+        raise SystemExit(
+            "refusing HL_DFLASH with HL_LONGCTX>0: the drafter at long context is the arm that faulted the "
+            "HRX graph on this box (27B, 18.8k, 2026-11-01 11:13 reset) and the box rule forbids it until "
+            "engine#764's refusal guardrail is merged")
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
     log(f"model={model} bin={bin_dir} state={state}")

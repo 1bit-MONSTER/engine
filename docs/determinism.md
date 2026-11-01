@@ -36,9 +36,9 @@ produces every number below.
    across a CPU ggml matmul and an HRX kernel, so log-probabilities from different devices differ
    in the third significant figure at the median and by up to ~0.4 nats at the tail. Greedy
    continuations diverge on a substantial fraction of prompts.
-4. **The NPU route cannot currently take part in a log-prob agreement comparison at all** — two
-   independent reasons, both below: the in-process NPU path returns no log-probabilities, and the
-   NPU serves a *requantised* model, not the same weights.
+4. **The NPU route can be held to repetition but not to agreement with the others** — it is bitwise
+   repeatable, but it reports no token ids, cannot disable thinking, returns its tokens only in
+   logprobs, and serves *requantised* weights rather than the same ones. All four, below.
 
 Promises 3 and 4 are measurements, not bug reports: the routes genuinely compute different
 floating-point sums over different quantised weights. That is the same class of problem that
@@ -55,9 +55,11 @@ Binary `lemonade-onebit-rc-2026-10-31c` (c18).
 
 | Route | run-to-run | max \|Δlogp\| | tokens | text stable |
 |---|---|---|---|---|
-| `cpu` | bitwise-identical | 0 | 128 | yes |
-| `hrx` | bitwise-identical | 0 | 122 | yes |
-| `npu` | not answerable — no logprobs; text repeatable | — | — | yes |
+| `cpu` | bitwise-identical (5 repeats) | 0 | 128 | yes |
+| `hrx` | bitwise-identical (5 repeats) | 0 | 122 | yes |
+| `npu` (forward path) | bitwise-identical (3 repeats × 16 tokens) | 0 | 128 | yes |
+
+All three routes are bitwise repeatable. That is the only property all three share.
 
 ### Agreement, `cpu` vs `hrx`
 
@@ -108,11 +110,30 @@ batch width, not the build, is the variable.
 `hrx`, default `n_slots = 4`: copy0 vs alone `4/48` ids but **44/48** log-prob bits, i.e. the
 reported numbers move even where the tokens do not.
 
-### NPU: repeatable text, no log-probabilities
+### NPU: repeatable, but not comparable to the other two
 
-`1bit serve -m <q4nx dir> --device npu`, 8 prompts × 64 tokens × 5 repeats: token stream
-**repeatable 5/5** (text stable), log-probabilities **absent** — see below. Text identical to the
-CPU route on **2/8** prompts, where `cpu` vs `hrx` is 4/8.
+On a build that carries the NPU log-probabilities, the NPU route is **bitwise repeatable**: 8 prompts ×
+16 tokens × 3 repeats, 128 tokens, `max |Δlogp| = 0`, text stable, 0 non-float32 values. Three repeats
+rather than five because the per-op forward path measured ~0.48 s/token here (18.8 s for a 32-token
+reply), so the 8 × 5 × 64 matrix the other routes ran is not practical on it.
+
+It cannot join the *agreement* comparison, for four independent reasons — any one of them is enough:
+
+1. **It reports no token ids.** Each `logprobs.content` entry carries `token` (text) and `logprob` but
+   no `id`, and the same holds inside `top_logprobs`. `tools/logprob_agree.py` therefore falls back to
+   comparing token text when a route omits the id; comparing ids alone would "match" on `None == None`
+   at every position and report a perfect agreement between two unrelated routes.
+2. **Thinking cannot be turned off on that path.** `chat_template_kwargs.enable_thinking=false` is
+   honoured by the llama-server routes and ignored here: the stream opens `<think>`, `\n`, `Okay`, …,
+   so it diverges from the other two routes at token 0 for template reasons, not numerical ones.
+3. **The reply is not in `content`.** `message.content` comes back empty on that path; the tokens are
+   only in `logprobs`. A text-level comparison against `cpu`/`hrx` is therefore not meaningful either.
+4. **It does not serve the same weights.** A Q4NX weight is a q4_1 tile (bf16 scale and zero per 32
+   columns) and the pack is produced by requantising Q4_K, so NPU-vs-GGUF deltas contain a quantisation
+   change on top of any kernel arithmetic. Such a number is not comparable to `cpu` vs `hrx` and should
+   not be quoted as if it were.
+
+What the NPU route can be held to today is repetition — which it passes — and not agreement.
 
 ## Routes and logprobs
 
@@ -123,7 +144,8 @@ CPU route on **2/8** prompts, where `cpu` vs `hrx` is 4/8.
   (`app/serve.cpp` `run_unified`), which does not build log-probabilities. The reply is correct but
   carries no `logprobs` key even when asked. Issue
   [#651](https://github.com/1bit-MONSTER/engine/issues/651) is the NPU logprobs item; the
-  implementation landed on the `forward-serve` path only.
+  implementation is on the `forward-serve` path only, so `--device npu` with a directory is the
+  wrong route to measure on.
 - The NPU log-probabilities live in `app/forward_serve.cpp` + `app/npu_sampling.h`. Reach that path
   with `1bit forward-serve -m <dir>/model.q4nx --kernels <dir>`, which needs a directory of
   `full_i8_*.elf` designs — a shipped dx kernel directory (`npu/kernels/<H>x<IM>x<NH>x<NKV>/` of
@@ -151,8 +173,8 @@ HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1 \
   gpu-hold -l rlk -t 12 -- 1bit serve -m ~/models/Qwen3-0.6B-Q4_K_M.gguf --device hrx \
     --port 18111 --ctx-size 2048
 
-# npu — under the NPU claim, and only on a build whose forward path has logprobs
-npu-hold -l rlk -t 12 -- 1bit forward-serve -m ~/models/npu/Qwen3-0.6B/model.q4nx \
+# npu — under the NPU claim; the forward path is the only one with logprobs
+npu-hold -l rlk -t 18 -- 1bit forward-serve -m ~/models/npu/Qwen3-0.6B/model.q4nx \
   --kernels <full_i8 ELF dir> -p 18112 --host 127.0.0.1
 ```
 

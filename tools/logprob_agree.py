@@ -120,8 +120,8 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout):
     for tk in ((ch.get("logprobs") or {}).get("content") or []):
         top = []
         for x in tk.get("top_logprobs") or []:
-            top.append({"id": x.get("id"), "lp": x.get("logprob")})
-        toks.append({"id": tk.get("id"), "lp": tk.get("logprob"), "top": top})
+            top.append({"id": x.get("id"), "token": x.get("token"), "lp": x.get("logprob")})
+        toks.append({"id": tk.get("id"), "token": tk.get("token"), "lp": tk.get("logprob"), "top": top})
     return {
         "text": (ch.get("message") or {}).get("content") or "",
         "tokens": toks,
@@ -130,11 +130,22 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout):
     }
 
 
+def tok_key(tok):
+    """A generated token's identity: its id when the route reports one, else its text.
+
+    The NPU forward path reports token text and log-probability but no id, so comparing ids alone
+    would make every position "match" on None == None.  Falling back to the text keeps the
+    comparison honest across routes that report different subsets of the same fields.
+    """
+    i = tok.get("id")
+    return i if i is not None else tok.get("token")
+
+
 def first_divergence(a, b):
     """Index of the first token position whose log-prob bits differ, else the length mismatch."""
     n = min(len(a), len(b))
     for i in range(n):
-        if a[i]["id"] != b[i]["id"]:
+        if tok_key(a[i]) != tok_key(b[i]):
             return i
         if not usable(a[i]["lp"]) or not usable(b[i]["lp"]):
             continue
@@ -171,7 +182,7 @@ def determinism(runs):
     maxd = 0.0
     for r in runs[1:]:
         for a, b in zip(base["tokens"], r["tokens"]):
-            if a["id"] == b["id"] and usable(a["lp"]) and usable(b["lp"]):
+            if tok_key(a) == tok_key(b) and usable(a["lp"]) and usable(b["lp"]):
                 d = abs(f32(a["lp"]) - f32(b["lp"]))
                 deltas.append(d)
                 maxd = max(maxd, d)
@@ -206,13 +217,13 @@ def agreement(a, b):
     deltas = []
     first_tok = None
     for i in range(n):
-        ta_top = (ta[i]["top"] or [{}])[0].get("id")
-        tb_top = (tb[i]["top"] or [{}])[0].get("id")
-        if ta_top is not None and tb_top is not None:
+        ta_top = (ta[i]["top"] or [{}])[0]
+        tb_top = (tb[i]["top"] or [{}])[0]
+        if ta_top and tb_top:
             top1_n += 1
-            if ta_top == tb_top:
+            if tok_key(ta_top) == tok_key(tb_top):
                 top1_match += 1
-        if ta[i]["id"] != tb[i]["id"]:
+        if tok_key(ta[i]) != tok_key(tb[i]):
             if first_tok is None:
                 first_tok = i
             continue
@@ -237,7 +248,8 @@ def agreement(a, b):
 
 def selftest():
     """The comparison logic on synthetic runs: the checks a bug in it would silently pass."""
-    t = lambda i, lp, top=1: {"id": i, "lp": lp, "top": [{"id": top, "lp": lp}]}  # noqa: E731
+    t = lambda i, lp, top=1: {"id": i, "token": f"t{i}", "lp": lp,  # noqa: E731
+                              "top": [{"id": top, "token": f"t{top}", "lp": lp}]}
     # identical runs -> deterministic, no divergence
     a = {"tokens": [t(5, -0.5), t(6, -1.25)], "text": "x", "have_logprobs": True}
     assert determinism([a, a])["bit_identical"] is True
@@ -267,6 +279,15 @@ def selftest():
     det = determinism([nolp, nolp])
     assert det["logprobs_available"] is False and det["bit_identical"] is None
     assert det["same_text"] is True
+    # a route that reports no token ids must still be compared, on its text — not on None == None
+    noid_a = {"tokens": [{"id": None, "token": "A", "lp": -0.5, "top": []}], "text": "x",
+              "have_logprobs": True}
+    noid_b = {"tokens": [{"id": None, "token": "B", "lp": -0.5, "top": []}], "text": "x",
+              "have_logprobs": True}
+    assert first_divergence(noid_a["tokens"], noid_b["tokens"]) == 0
+    noid_c = {"tokens": [{"id": None, "token": "A", "lp": -0.5, "top": []}], "text": "x",
+              "have_logprobs": True}
+    assert first_divergence(noid_a["tokens"], noid_c["tokens"]) is None
     # length mismatch is a divergence at the shorter length
     e = {"tokens": [t(5, -0.5)], "text": "x", "have_logprobs": True}
     assert first_divergence(a["tokens"], e["tokens"]) == 1

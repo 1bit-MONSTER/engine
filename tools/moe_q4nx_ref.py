@@ -599,16 +599,6 @@ def agree(args):
     return 0 if len(good) == len(out) else 1
 
 
-def score(fw, prompt_ids, cont_ids):
-    """Feed the prompt, then score and feed each continuation id: one step per position."""
-    lp = fw.step(prompt_ids)
-    out = []
-    for nxt in cont_ids:
-        out.append(float(np.float32(lp[nxt])))
-        lp = fw.step([nxt])
-    return out
-
-
 def vs_gguf(args):
     """Container vs the GGUF's own f32 weights vs the served route, on one prompt."""
     import gc

@@ -34,6 +34,7 @@ using onebit::npu::find_stop;
 using onebit::npu::Grammar;
 using onebit::npu::AnswerFamily;
 using onebit::npu::AnswerStream;
+using onebit::npu::content_mask;
 using onebit::npu::json_grammar;
 using onebit::npu::parse_answer;
 using onebit::npu::tool_call_gbnf;
@@ -788,6 +789,40 @@ void test_tool_request_parsing() {
           "response_format and tools together are refused");
 }
 
+void test_content_mask() {
+    // One entry per generated token, in order; the mask says which of them are `content`, which is
+    // what issue #651 item 3 reports logprobs for.
+    const std::vector<std::string> pieces = {"<think>", "\n", "Okay", "</think>", "The", " answer", " is", " 42."};
+    const auto mask = content_mask(pieces, AnswerFamily::qwen3, false);
+    check(mask.size() == pieces.size(), "the mask has one bit per token");
+    check(mask[0] == 0 && mask[1] == 0 && mask[2] == 0, "reasoning tokens get no entry");
+    check(mask[3] == 0, "the </think> token is markup, not content");
+    check(mask[4] && mask[5] && mask[6] && mask[7], "the answer's tokens do");
+    {
+        // A token that straddles the boundary counts as content: its text did reach the caller.
+        const std::vector<std::string> straddle = {"<think>", "hmm</think>The", " answer"};
+        const auto m = content_mask(straddle, AnswerFamily::qwen3, false);
+        check(m[0] == 0 && m[1] == 1 && m[2] == 1, "a straddling token is content");
+    }
+    {
+        // Call markup gets no entry either, and the same text with no tools does (it is content then).
+        const std::vector<std::string> call = {"<tool_call>", "{\"name\": \"f\",", " \"arguments\": {}}", "</tool_call>"};
+        const auto with = content_mask(call, AnswerFamily::qwen3, true);
+        bool any = false;
+        for (char c : with) any = any || c;
+        check(!any, "call markup gets no logprob entry when tools were sent");
+        const auto without = content_mask(call, AnswerFamily::qwen3, false);
+        bool all = true;
+        for (char c : without) all = all && c;
+        check(all, "the same tokens are content when no tools were sent");
+    }
+    {
+        // Text held back to the end is still content.
+        const std::vector<std::string> tail = {"hello", " wor"};
+        check(content_mask(tail, AnswerFamily::qwen3, false)[1] == 1, "held-back text is content");
+    }
+}
+
 void test_request_parsing() {
     const auto plain = options_from_body(nlohmann::json::parse(R"({"prompt": "hi", "max_tokens": 8})"));
     check(plain.sample.greedy(), "a body without sampling fields stays greedy");
@@ -854,6 +889,7 @@ int main() {
     test_answer_stream();
     test_tool_grammar();
     test_tool_request_parsing();
+    test_content_mask();
     test_request_parsing();
     std::printf("%s\n", failures ? "FAILED" : "npu_sampling: ok");
     return failures ? 1 : 0;

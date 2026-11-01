@@ -136,9 +136,14 @@ build() {
         extra+=(-DONEBIT_NPU_PRIVATE="$W/npu-kernels" -DONEBIT_NPU_RELEASE=ON)
         say "NPU kernels $(git -C "$W/npu-kernels" rev-parse --short HEAD): $(ls "$BUILD/npu/kernels" | wc -l) sealed sets"
     fi
+    # ONEBIT_DS4=OFF builds without DwarfStar (third_party/ds4, `1bit serve --device ds4`). It is ON by
+    # default because the release ships that backend; the knob exists because the target needs hipCUB,
+    # hipBLAS, hipBLASLt and rocWMMA headers from ROCm, and a machine whose ROCm install lacks them
+    # cannot build it at all - better a declared, explicit build than a release that silently ships
+    # without the backend (2026-11-01: the rebuilt box's ROCm has no hipCUB headers).
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" \
-        -DONEBIT_DS4=ON -DONEBIT_HF_TOKENIZERS=ON \
+        -DONEBIT_DS4=${ONEBIT_DS4:-ON} -DONEBIT_HF_TOKENIZERS=ON \
         -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
     guard cmake --build "$BUILD" > "$LOGS/build.log" 2>&1

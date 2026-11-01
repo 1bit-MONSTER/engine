@@ -220,8 +220,10 @@ void test_tiles(const std::string& golden_dir) {
 void test_pack(const std::string& pack, const std::string& golden_dir) {
     const pi::Plan p = pi::plan(pack);
     const int layers = p.dims.layers;
-    check(p.dims.hidden == 896 && layers == 24 && p.dims.vocab == 151936,
+    const bool qwen05b = p.dims.hidden == 896 && layers == 24 && p.dims.vocab == 151936;
+    check(p.dims.hidden > 0 && layers > 0 && p.dims.vocab > 0,
           "pack: geometry from config.json and the embedding");
+    if (qwen05b) check(true, "pack: this is the Qwen2.5-0.5B geometry the lane started from");
     const auto refused = p.refused();
     check(int(refused.size()) == layers * 7 + 1,  // the projections, plus the final norm
           "pack: all " + std::to_string(layers * 7) + " projections and the final norm are refused by "
@@ -239,7 +241,11 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     }
     check(norms == layers * 2 + 1,
           "pack: 2 norms per layer plus the final norm are planned (the final one refused)");
-    check(tiles_planned == (151936 / 32) * 4, "pack: lm_head plans 4748 x 4 tiles (K 896 padded to 1024)");
+    // K is padded to the 256-column grid, so this holds for any hidden size
+    const int head_rows = int(p.tensors.at(1).shape.at(0));
+    check(tiles_planned == (head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
+          "pack: lm_head tile count follows from its shape and the 256-column grid");
+    if (qwen05b) check(tiles_planned == (151936 / 32) * 4, "pack: 0.5B lm_head plans 4748 x 4 tiles");
 
     // refusing must write nothing at all
     const std::string out = (fs::temp_directory_path() / "oga_pack_import_test").string();
@@ -263,17 +269,27 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     check(r.zero_exact_pct > 40.0 && r.zero_exact_pct < 50.0,
           "pack: the bf16 zero point is exact for ~43 % of groups as measured (" +
               std::to_string(r.zero_exact_pct) + " %)");
+    // engine#734: the geometry is MEASURED from the anchors, so it holds for any hidden size
+    check(r.stride > 0 && r.second_header > 0 && r.second_header < r.stride,
+          "pack: the .fconst layer stride and second header were located (" +
+              std::to_string(r.stride) + ", " + std::to_string(r.second_header) + ")");
+    check(r.stride % 64 == 0, "pack: the measured stride is 64-byte aligned");
     check(r.norm_anchors_ok == r.norm_anchors_total && r.norm_anchors_total == layers * 2,
-          "pack: every layer RMSNorm sits at its documented .fconst epsilon anchor (" +
+          "pack: every layer RMSNorm sits at its epsilon anchor, whatever the hidden size (" +
               std::to_string(r.norm_anchors_ok) + "/" + std::to_string(r.norm_anchors_total) + ")");
+    if (qwen05b)
+        check(r.stride == 8708288 && r.second_header == 1115968,
+              "pack: 0.5B reproduces the offsets that were measured by hand");
 
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
     const auto& head = m.tensor("lm_head.weight");
-    check(head.shape.at(0) == (151936 / 32) * 4, "pack: lm_head has 4748 x 4 tiles");
-    check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == 896,
-          "pack: a layer norm is 896 bf16 values");
-    check(m.dims().hidden == 896 && m.dims().layers == 24, "pack: config.json drives the loader");
+    check(head.shape.at(0) == int64_t((head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256)),
+          "pack: lm_head tile count matches the container");
+    check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
+          "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
+    check(m.dims().hidden == p.dims.hidden && m.dims().layers == layers,
+          "pack: config.json drives the loader");
     fs::remove_all(out);
 }
 

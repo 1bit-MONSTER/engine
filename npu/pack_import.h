@@ -98,8 +98,12 @@ struct Report {
     double q4nx_rel = 0, q4nx_max_abs = 0, zero_exact_pct = 0;
     long long codes_exact = 0, codes_total = 0;
 
-    // fconst norm anchors: per-layer RMSNorm weights are located by fixed offsets; a block
-    // is aligned right when its head carries the bf16 epsilon.
+    // The .fconst layer-block geometry, measured from the RMSNorm epsilon anchors rather than assumed
+    // (engine#734): the constants measured on one pack are functions of hidden size and of each
+    // projection's N and K, so they only work for that pack. stride/second_header are 0 when the
+    // anchors could not be resolved, with fconst_note saying why.
+    int64_t stride = 0, second_header = 0;
+    std::string fconst_note;
     int norm_anchors_ok = 0, norm_anchors_total = 0;
 };
 

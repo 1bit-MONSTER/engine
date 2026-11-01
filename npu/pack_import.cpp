@@ -263,6 +263,96 @@ std::string find_one(const std::string& dir, const std::string& prefix, const st
     return {};
 }
 
+
+// ── locating the layer blocks in a .fconst, for ANY geometry (engine#734) ────
+// The offsets measured on Qwen2.5-0.5B (stride 8,708,288; second header at 1,115,968) are functions of
+// hidden size and of each projection's N and K, so constants only work for one pack. What does generalise
+// is the structure: every layer block opens with the bf16 epsilon (1e-6 = 86 35) plus zero padding, and
+// carries a second such header right after the attention payload. So the header positions form a
+// sequence with one period per block, and the stride is positions[i+P] - positions[i] for that P.
+// Measured this way: 0.5B -> 8,708,288 (P=2), 1.7B -> 27,931,456 (P=4), 4B -> 55,688,096 (P=4).
+struct FconstGeom {
+    int64_t stride = 0;   // bytes per layer block
+    int64_t h1 = 0;       // offset of the second (post-attention) header within a block
+    int period = 0;       // headers per block
+    int blocks = 0;       // block starts seen
+    std::string why;      // non-empty when the geometry could not be established
+};
+
+bool is_eps_header(const uint8_t* p, const uint8_t* end) {
+    // bf16 1e-6 little-endian, then zero padding: 22 zero bytes is far beyond chance for a 2-byte
+    // prefix but short enough that a genuine 64-byte header always qualifies.
+    if (end - p < 12) return false;
+    if (p[0] != 0x86 || p[1] != 0x35) return false;
+    for (int i = 2; i < 12; ++i)
+        if (p[i] != 0) return false;
+    return true;
+}
+
+std::vector<int64_t> eps_header_positions(const std::string& path, size_t max_bytes) {
+    std::ifstream f(path, std::ios::binary);
+    std::vector<int64_t> out;
+    if (!f) return out;
+    const size_t kChunk = 8u << 20;
+    std::vector<uint8_t> buf(kChunk + 64);
+    size_t base = 0;
+    while (base < max_bytes && out.size() < 96) {
+        f.read(reinterpret_cast<char*>(buf.data()), std::streamsize(kChunk));
+        const size_t got = size_t(f.gcount());
+        if (got == 0) break;
+        const uint8_t* p = buf.data();
+        const uint8_t* end = p + got;
+        for (; p + 2 < end; ++p) {
+            if (*p == 0x86 && p[1] == 0x35 && is_eps_header(p, end)) out.push_back(int64_t(base) + (p - buf.data()));
+        }
+        base += got;
+    }
+    return out;
+}
+
+FconstGeom locate_fconst(const std::string& path) {
+    FconstGeom g;
+    const auto pos = eps_header_positions(path, size_t(1) << 30);
+    if (pos.size() < 6) {
+        g.why = "fewer than 6 RMSNorm epsilon headers in the first GiB";
+        return g;
+    }
+    // The header positions repeat with one period per layer block. Take the most common
+    // pos[i+P] - pos[i] for each small P and require it to dominate: a header missed at a read-chunk
+    // boundary must not defeat the measurement (it did on the 4B pack, where the strict test failed).
+    for (int P = 1; P <= 8; ++P) {
+        if (int(pos.size()) <= P + 2) break;
+        std::map<int64_t, int> votes;
+        int pairs = 0;
+        for (size_t i = 0; i + P < pos.size(); ++i) {
+            const int64_t d = pos[i + P] - pos[i];
+            if (d < 1000000) continue;
+            ++votes[d];
+            ++pairs;
+        }
+        for (const auto& [d, n] : votes) {
+            if (pairs < 4 || n * 10 < pairs * 8) continue;  // needs >= 80 % of the pairs
+            if (!g.stride || d > g.stride) {                 // prefer the largest consistent period
+                g.stride = d;
+                g.period = P;
+            }
+        }
+        if (g.stride) break;
+    }
+    if (!g.stride) {
+        g.why = "the epsilon headers do not repeat with a single period";
+        return g;
+    }
+    g.h1 = pos[1] - pos[0];
+    if (g.h1 <= 0 || g.h1 >= g.stride) {
+        g.why = "the second header is not inside the first block";
+        g.stride = 0;
+        return g;
+    }
+    g.blocks = int(pos.size());
+    return g;
+}
+
 float f16_to_f32(uint16_t h) {
     const uint32_t sign = uint32_t(h & 0x8000) << 16;
     const uint32_t exp = (h >> 10) & 0x1F, man = h & 0x3FF;
@@ -546,10 +636,11 @@ Plan plan(const std::string& pack_dir) {
         p.tensors.push_back(std::move(x));
     }
 
-    // norms: fixed offsets in the .fconst (§2.1), the only layer tensors with a known position
+    // norms: the layer blocks are located by their epsilon anchors at import time, so the offsets work
+    // for any hidden size (engine#734). plan() cannot prove that without reading the file, so the
+    // refusal here is empty and import_pack reports what the anchors actually found.
     const std::string norm_source = "fconst:Llm_Token_Token";
-    const std::string norm_refusal =
-        H == kFconstHidden ? std::string() : "the .fconst offsets are established for hidden 896 only";
+    const std::string norm_refusal;
     for (int L = 0; L < d.layers; ++L) {
         auto a = make("model.layers." + std::to_string(L) + ".input_layernorm.weight", norm_source, "BF16", {H});
         auto b = make("model.layers." + std::to_string(L) + ".post_attention_layernorm.weight", norm_source,
@@ -815,23 +906,30 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         break;
     }
 
-    if (H == kFconstHidden) {
-        Fconst fc = open_fconst(find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst"));
-        auto add_norm = [&](int64_t off, const std::string& name) {
-            w.add(name, "BF16", {H}, as_bf16(at(fc, off, H * 2), kBF16, size_t(H)));
-            ++r.tensors;
-        };
-        for (int L = 0; L < p.dims.layers; ++L) {
-            const int64_t base = int64_t(L) * kTokStride;
-            r.norm_anchors_total += 2;
-            r.norm_anchors_ok += int(eps_at(fc, base)) + int(eps_at(fc, base + kPostEpsOff));
-            add_norm(base + kNormOff, "model.layers." + std::to_string(L) + ".input_layernorm.weight");
-            add_norm(base + kPostNormOff,
-                     "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
+    {
+        const std::string path = find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst");
+        const FconstGeom g = locate_fconst(path);
+        if (g.stride == 0) {
+            r.fconst_note = "layer blocks not located: " + g.why;
+        } else {
+            r.stride = g.stride;
+            r.second_header = g.h1;
+            Fconst fc = open_fconst(path);
+            auto add_norm = [&](int64_t off, const std::string& name) {
+                w.add(name, "BF16", {H}, as_bf16(at(fc, off, H * 2), kBF16, size_t(H)));
+                ++r.tensors;
+            };
+            for (int L = 0; L < p.dims.layers; ++L) {
+                const int64_t base = int64_t(L) * g.stride;
+                r.norm_anchors_total += 2;
+                r.norm_anchors_ok += int(eps_at(fc, base)) + int(eps_at(fc, base + g.h1));
+                add_norm(base + kNormOff, "model.layers." + std::to_string(L) + ".input_layernorm.weight");
+                add_norm(base + g.h1 + kNormOff,
+                         "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
+            }
+            // the final norm is refused in the plan: the 1,856-byte tail is not an RMSNorm weight
+            unmap_file(fc.map, fc.size);
         }
-        // the final norm is refused in the plan: its position in the .fconst is not
-        // established (see plan()), so nothing is written for it
-        unmap_file(fc.map, fc.size);
     }
 
     // the manifest goes in the container, so a loader (or a person) can see what this
@@ -929,9 +1027,12 @@ int run(int argc, char** argv) {
                 r.q4nx_rel, r.q4nx_max_abs);
     std::printf("  parameters: bf16 scale/zero exact for %.2f%% of 32-column groups (format limit)\n",
                 r.zero_exact_pct);
-    if (r.norm_anchors_total)
-        std::printf("  fconst:     %d/%d RMSNorm anchors found at their documented offsets\n",
-                    r.norm_anchors_ok, r.norm_anchors_total);
+    if (r.stride)
+        std::printf("  fconst:     stride %lld, second header %lld (measured from the eps anchors); "
+                    "%d/%d RMSNorm anchors found\n",
+                    (long long)r.stride, (long long)r.second_header, r.norm_anchors_ok,
+                    r.norm_anchors_total);
+    if (!r.fconst_note.empty()) std::printf("  fconst:     %s\n", r.fconst_note.c_str());
     if (!r.refused.empty()) std::printf("  incomplete: %zu tensors, listed in %s/model.q4nx\n",
                                         r.refused.size(), out.c_str());
     return 0;

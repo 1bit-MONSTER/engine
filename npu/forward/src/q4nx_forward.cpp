@@ -26,6 +26,7 @@
 #include "q4nx_forward.h"
 #include <algorithm>
 #include <fcntl.h>
+#include <unistd.h>   // mkstemp/close: the pb16i activation probe's dump
 
 #include <chrono>
 #include <cmath>
@@ -49,6 +50,25 @@ static FILE* open_debug_dump(const char* path) {
     return fd >= 0 ? fdopen(fd, "wb") : nullptr;
 }
 #endif
+
+// The pb16i activation probe (NPU_PB16I_DUMP=<layer>) is runtime-gated, not debug-build gated,
+// so it makes its own file: mkstemp() gives O_CREAT|O_EXCL and mode 0600 with a unique name in
+// one step.  A fixed name in the shared /tmp cannot promise either (fopen creates it 0666 via
+// umask and follows a symlink), which is the file-creation-without-restricted-permissions
+// alert CodeQL raised on this probe.
+static FILE* open_probe_dump() {
+    char path[] = "/tmp/a0-XXXXXX";
+    const int fd = mkstemp(path);
+    if (fd < 0) return nullptr;
+    FILE* f = fdopen(fd, "wb");
+    if (!f) {
+        close(fd);
+        return nullptr;
+    }
+    fprintf(stderr, "[pb16i-dump] %s\n", path);
+    return f;
+}
+
 
 static inline float bf16_to_f32(uint16_t bf) {
     uint32_t bits = (uint32_t)bf << 16;
@@ -2321,7 +2341,7 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
             static bool done = false;
             if (!done && cur_layer_ == atoi(dump) && sc && std::string(sc) == "attn_qkv") {
                 done = true;
-                FILE* f = fopen("/tmp/a0.bin", "wb");
+                FILE* f = open_probe_dump();
                 if (f) {
                     fwrite(&K, sizeof(int), 1, f);
                     fwrite(A, sizeof(float), (size_t)K, f);
@@ -2330,7 +2350,7 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                     fwrite(&asb, sizeof(float), 1, f);
                     fclose(f);
                 }
-                fprintf(stderr, "[pb16i-dump] wrote /tmp/a0.bin for %s K=%d\n", sc, K);
+                fprintf(stderr, "[pb16i-dump] wrote the dump for %s K=%d\n", sc, K);
             }
         }
         const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};

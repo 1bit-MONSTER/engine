@@ -108,6 +108,110 @@ def synthetic(path, rng):
     w.close()
 
 
+def moe_synthetic(path, rng):
+    """A small qwen3moe GGUF: 4 experts, one shared-expert-free MoE block (Qwen3-30B-A3B's shape)."""
+    H, IM, E, NH, NKV, HD, V = 256, 512, 4, 2, 1, 128, 512
+    w = gguf.GGUFWriter(path, "qwen3moe")
+    w.add_block_count(1)
+    w.add_context_length(4096)
+    w.add_embedding_length(H)
+    w.add_feed_forward_length(1024)          # dense value, unused by the arch
+    w.add_head_count(NH)
+    w.add_head_count_kv(NKV)
+    w.add_key_length(HD)
+    w.add_value_length(HD)
+    w.add_rope_freq_base(1e6)
+    w.add_layer_norm_rms_eps(1e-6)
+    w.add_eos_token_id(1)
+    w.add_expert_count(E)
+    w.add_expert_used_count(2)
+    w.add_expert_feed_forward_length(IM)
+    w.add_expert_shared_feed_forward_length(0)
+
+    def quant(name, N, K, qt):
+        x = rng.standard_normal((N, K)).astype(np.float32) * 0.05
+        if qt == Q.Q4_K:
+            data = q4_k_blocks(rng, N, K)
+        elif qt == Q.F32:
+            data = x
+        else:
+            data = gguf.quants.quantize(x, qt)
+        w.add_tensor(name, data, raw_dtype=qt)
+
+    def quant_exps(name, N, K, qt):
+        """A routed expert stack: ggml 3-D [K, N, E], expert e on rows [e*N, (e+1)*N)."""
+        if qt == Q.Q4_K:
+            data = q4_k_blocks(rng, E * N, K).reshape(E, N, (K // 256) * 144)
+        else:
+            x = (rng.standard_normal((E * N, K)).astype(np.float32) * 0.05)
+            data = x.reshape(E, N, K)
+        w.add_tensor(name, data, raw_dtype=qt)
+
+    quant("token_embd.weight", V, H, Q.Q8_0)
+    w.add_tensor("output_norm.weight", rng.standard_normal(H).astype(np.float32))
+    for n in ("attn_norm", "ffn_norm"):
+        w.add_tensor(f"blk.0.{n}.weight", rng.standard_normal(H).astype(np.float32))
+    for n in ("attn_q_norm", "attn_k_norm"):
+        w.add_tensor(f"blk.0.{n}.weight", rng.standard_normal(HD).astype(np.float32))
+    quant("blk.0.attn_q.weight", NH * HD, H, Q.Q4_0)
+    quant("blk.0.attn_k.weight", NKV * HD, H, Q.Q4_1)
+    quant("blk.0.attn_v.weight", NKV * HD, H, Q.Q4_K)
+    quant("blk.0.attn_output.weight", H, NH * HD, Q.Q8_0)
+    w.add_tensor("blk.0.ffn_gate_inp.weight", rng.standard_normal((H, E)).astype(np.float32))
+    quant_exps("blk.0.ffn_gate_exps.weight", IM, H, Q.Q4_K)
+    quant_exps("blk.0.ffn_up_exps.weight", IM, H, Q.F32)     # requantized expert stack
+    quant_exps("blk.0.ffn_down_exps.weight", H, IM, Q.Q4_K)
+    w.write_header_to_file()
+    w.write_kv_data_to_file()
+    w.write_tensors_to_file()
+    w.close()
+
+
+def moe_check(gguf_path, out, ok):
+    """The expert decomposition: __metadata__.moe's offsets must point at THAT expert."""
+    import json
+    with open(os.path.join(out, "model.q4nx"), "rb") as f:
+        import struct
+        n = struct.unpack("<Q", f.read(8))[0]
+        hdr = json.loads(f.read(n))
+        base = 8 + n
+    mm = np.memmap(os.path.join(out, "model.q4nx"), dtype=np.uint8, mode="r")
+    moe = hdr["__metadata__"].get("moe")
+    checks = []
+    checks.append(("__metadata__.moe present with 4 experts / top-2",
+                   moe is not None and moe["experts"] == 4 and moe["used"] == 2))
+    gate = "model.layers.0.mlp.experts.gate_proj.weight"
+    checks.append((f"{gate} is an expert stack of 4",
+                   gate in (moe or {}).get("tensors", {})
+                   and len(moe["tensors"][gate]["offsets"]) == 4))
+    checks.append(("the router is bf16, not tiled",
+                   hdr["model.layers.0.mlp.gate.weight"]["dtype"] == "BF16"))
+    with open(os.path.join(out, "config.json")) as f:
+        cfg = json.load(f)
+    checks.append(("config.json carries the MoE fields",
+                   cfg["model_type"] == "qwen3moe" and cfg["num_experts"] == 4
+                   and cfg["num_experts_per_tok"] == 2 and cfg["norm_topk_prob"] is True
+                   and cfg["intermediate_size"] == 512))
+
+    r = gguf.GGUFReader(gguf_path)
+    for name, key in ((gate, "blk.0.ffn_gate_exps.weight"),
+                      ("model.layers.0.mlp.experts.down_proj.weight", "blk.0.ffn_down_exps.weight")):
+        t = next(t for t in r.tensors if t.name == key)
+        K, N = int(t.shape[0]), int(t.shape[1])
+        ref = gguf.quants.dequantize(t.data, t.tensor_type).astype(np.float64).reshape(4, N, K)
+        info = moe["tensors"][name]
+        bad = 0
+        for e in range(4):
+            lo = base + info["offsets"][e]
+            got = G.untile(np.asarray(mm[lo:lo + info["bytes"]]).reshape(-1, G.TILE), N, K)
+            bad += int((np.abs(got - ref[e]) > 1e-2).sum())
+        checks.append((f"each of {name}'s 4 offsets decodes to THAT expert", bad == 0))
+    for label, good in checks:
+        print(f"{'ok  ' if good else 'FAIL'} {label}")
+        ok = ok and good
+    return ok
+
+
 def main():
     ok = golden_tile()
     rng = np.random.default_rng(1)
@@ -122,6 +226,17 @@ def main():
                 print(r.stderr, end="")
                 print(f"FAIL {cmd[0]} exited {r.returncode}")
                 ok = False
+        mout = os.path.join(d, "moe")
+        moe_synthetic(os.path.join(d, "tiny-moe.gguf"), rng)
+        for cmd in (["pack", os.path.join(d, "tiny-moe.gguf"), mout],
+                    ["verify", "--all", os.path.join(d, "tiny-moe.gguf"), mout]):
+            r = subprocess.run([sys.executable, tool, *cmd], capture_output=True, text=True)
+            print(r.stdout, end="")
+            if r.returncode:
+                print(r.stderr, end="")
+                print(f"FAIL moe {cmd[0]} exited {r.returncode}")
+                ok = False
+        ok = moe_check(os.path.join(d, "tiny-moe.gguf"), mout, ok)
     print("PASS" if ok else "FAIL")
     return 0 if ok else 1
 

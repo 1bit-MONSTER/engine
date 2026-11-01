@@ -35,10 +35,20 @@ type gets there:
 
 The first three are exact apart from rounding scale and zero to bf16 (nearest even);
 verify checks every tensor against that bound and reports the error of the lossy ones.
-Norms and the embedding are stored as bf16. A tied lm_head (no output.weight) is made
-from token_embd.
+Norms, the embedding and the router are stored as bf16. A tied lm_head (no output.weight)
+is made from token_embd.
 
-Supported architectures: qwen3 (the dx route's model). Needs numpy and gguf (gguf-py).
+MoE (qwen3moe): the routed expert stacks (ffn_{gate,up,down}_exps, three-dimensional in the
+GGUF as [cols, rows, experts]) become ONE tensor per layer and projection, the experts
+stacked along the tile grid: [experts x rows/32, cols/256, 5120] tiles. Expert e is tile
+rows [e*rows/32, (e+1)*rows/32), so its chunks are contiguous — the span a decode dispatch
+points a kernel at — and __metadata__.moe records that decomposition with every expert's
+byte offset, i.e. the list a per-dispatch chunk-address kernel takes. The router
+(ffn_gate_inp) stays bf16 and untiled: it runs on the host and its top-k must be the
+GGUF's own. A shared expert (ffn_*_shexp, ffn_gate_inp_shexp) is packed like any dense
+projection; Qwen3-30B-A3B has none.
+
+Supported architectures: qwen3, qwen3moe and qwen2. Needs numpy and gguf (gguf-py).
 """
 import argparse
 import json
@@ -100,8 +110,10 @@ EXACT = {
 
 
 def to_q4_1(t):
-    """A GGUF 2-D tensor as (codes, scale, zero, exact)."""
+    """A GGUF tensor as (codes, scale, zero, exact); an expert stack as expert-major rows."""
     K, N = int(t.shape[0]), int(t.shape[1])  # ggml order: ne0 = columns
+    if len(t.shape) == 3:
+        N *= int(t.shape[2])  # expert e is rows [e*N, (e+1)*N) of the ggml stream
     if N % ROWS or K % COLS:
         raise SystemExit(f"{t.name}: {N} x {K} is not a whole number of 32 x 256 tiles")
     split = EXACT.get(t.tensor_type)
@@ -121,6 +133,20 @@ LAYER = {
 }
 TOP = {"token_embd": "model.embed_tokens", "output_norm": "model.norm", "output": "lm_head"}
 
+# MoE block parts (Qwen3MoE). The router is a plain linear on the hidden state; _exps are the
+# routed expert stacks; _shexp is a shared expert (some qwen3moe models have one, Qwen3-30B-A3B
+# does not).
+MOE = {
+    "ffn_gate_inp": "mlp.gate", "ffn_gate_inp_shexp": "mlp.shared_expert_gate",
+    "ffn_gate_exps": "mlp.experts.gate_proj", "ffn_up_exps": "mlp.experts.up_proj",
+    "ffn_down_exps": "mlp.experts.down_proj",
+    "ffn_gate_shexp": "mlp.shared_expert.gate_proj",
+    "ffn_up_shexp": "mlp.shared_expert.up_proj",
+    "ffn_down_shexp": "mlp.shared_expert.down_proj",
+}
+LAYER.update(MOE)
+ROUTER = {"ffn_gate_inp", "ffn_gate_inp_shexp"}
+
 
 def hf_name(name):
     base, _, suffix = name.rpartition(".")
@@ -136,26 +162,25 @@ def hf_name(name):
 
 def field(r, key, default=None):
     f = r.fields.get(key)
-    if f is None:
-        return default
-    v = f.parts[f.data[0]]
-    if f.types and f.types[0] == gguf.GGUFValueType.STRING:
-        return bytes(v).decode()
-    return v.tolist()[0] if len(v) == 1 else v.tolist()
+    return default if f is None else f.contents()
 
 
 def config(r, vocab):
     arch = field(r, "general.architecture")
-    if arch not in ("qwen3", "qwen2"):
-        raise SystemExit(f"architecture {arch!r}: only qwen3 and qwen2 are supported")
+    if arch not in ("qwen3", "qwen2", "qwen3moe"):
+        raise SystemExit(f"architecture {arch!r}: only qwen3, qwen2 and qwen3moe are supported")
     a = lambda k, d=None: field(r, f"{arch}.{k}", d)  # noqa: E731
     heads = a("attention.head_count")
     tied = not any(t.name == "output.weight" for t in r.tensors)
+    moe = arch == "qwen3moe"
+    # A MoE layer's FFN is the routed expert; the dense feed_forward_length is unused.
+    ff = a("expert_feed_forward_length") if moe else a("feed_forward_length")
     c = {
-        "architectures": [{"qwen3": "Qwen3ForCausalLM", "qwen2": "Qwen2ForCausalLM"}[arch]],
+        "architectures": [{"qwen3": "Qwen3ForCausalLM", "qwen2": "Qwen2ForCausalLM",
+                           "qwen3moe": "Qwen3MoeForCausalLM"}[arch]],
         "model_type": arch,
         "hidden_size": a("embedding_length"),
-        "intermediate_size": a("feed_forward_length"),
+        "intermediate_size": ff,
         "num_hidden_layers": a("block_count"),
         "num_attention_heads": heads,
         "num_key_value_heads": a("attention.head_count_kv", heads),
@@ -178,59 +203,145 @@ def config(r, vocab):
         c["attention_bias"] = any(t.name.endswith(("attn_q.bias", "attn_k.bias", "attn_v.bias"))
                                   for t in r.tensors)
         c["qk_norm"] = False
+    if moe:
+        shared = a("expert_shared_feed_forward_length", 0)
+        c.update({
+            "moe_intermediate_size": ff,
+            "num_experts": a("expert_count"),
+            "num_experts_per_tok": a("expert_used_count"),
+            "norm_topk_prob": True,  # Qwen3MoE renormalises the top-k weights (llama.cpp too)
+        })
+        if shared:
+            c["shared_expert_intermediate_size"] = shared
     return {k: v for k, v in c.items() if v is not None}
 
 
 def planned(r):
-    """(q4nx name, gguf tensor, kind) with kind 'tiles' or 'bf16'."""
+    """(q4nx name, gguf tensor, kind), kind 'tiles', 'expert-tiles' or 'bf16'.
+
+    The router stays bf16 (it runs on the host and its top-k must be the GGUF's own), as do the
+    norms and the embedding. A 3-D blk.N.ffn_*_exps tensor is a routed expert stack.
+    """
     out = []
     names = {t.name for t in r.tensors}
     for t in r.tensors:
         n = hf_name(t.name)
-        out.append((n, t, "bf16" if len(t.shape) == 1 or t.name == "token_embd.weight" else "tiles"))
+        if len(t.shape) == 1 or t.name == "token_embd.weight" or part_of(t.name) in ROUTER:
+            kind = "bf16"
+        else:
+            kind = "expert-tiles" if len(t.shape) == 3 else "tiles"
+        out.append((n, t, kind))
     if "output.weight" not in names:
         emb = next(t for t in r.tensors if t.name == "token_embd.weight")
         out.append(("lm_head.weight", emb, "tiles"))
     return out
 
 
+def part_of(name):
+    """The ggml part of a blk.N.<part>.<suffix> name, else ''."""
+    base = name.rpartition(".")[0]
+    return base.split(".", 2)[2] if base.startswith("blk.") else ""
+
+
+def grid(rows, cols):
+    """A rows x cols tensor's tile grid, after the 32 x 256 divisibility check."""
+    if rows % ROWS or cols % COLS:
+        raise SystemExit(f"{rows} x {cols} is not a whole number of 32 x 256 tiles")
+    return rows // ROWS, cols // COLS
+
+
+def blob_shape(t, kind):
+    """The shape the container records for this tensor's data."""
+    if kind == "bf16":
+        return [int(t.shape[1]), int(t.shape[0])] if len(t.shape) == 2 else [int(np.prod(t.shape))]
+    K, N = int(t.shape[0]), int(t.shape[1])
+    rows, cols = (N * int(t.shape[2]), K) if kind == "expert-tiles" else (N, K)
+    rt, kt = grid(rows, cols)
+    return [rt, kt, TILE]
+
+
+def blob_bytes(t, kind):
+    return int(np.prod(blob_shape(t, kind))) * (2 if kind == "bf16" else 1)
+
+
+def encode(t, kind):
+    """One tensor's container bytes, and whether the conversion was exact."""
+    if kind == "bf16":
+        w = dequantize(t.data, t.tensor_type).astype(np.float32)
+        return np.ascontiguousarray(bf16_bits(w if w.ndim == 2 else w.reshape(-1))).tobytes(), True
+    codes, scale, zero, exact = to_q4_1(t)
+    data = tiles(codes, scale, zero)
+    if kind == "expert-tiles":
+        rt, kt = grid(int(t.shape[1]), int(t.shape[0]))
+        data = data.reshape(int(t.shape[2]) * rt, kt, TILE)
+    return np.ascontiguousarray(data).tobytes(), exact
+
+
+def moe_meta(r, items, table):
+    """__metadata__.moe: the expert decomposition and every expert's byte offset."""
+    arch = field(r, "general.architecture")
+    tensors = {}
+    for name, t, kind in items:
+        if kind != "expert-tiles":
+            continue
+        K, N, E = int(t.shape[0]), int(t.shape[1]), int(t.shape[2])
+        rt, kt = grid(N, K)
+        chunk = rt * kt * TILE
+        lo, hi = table[name]["data_offsets"]
+        if hi - lo != E * chunk:
+            raise SystemExit(f"{name}: expert stack does not fill its blob")
+        tensors[name] = {
+            "experts": E, "rows": N, "cols": K, "tile_rows": rt, "tile_cols": kt,
+            "tiles": rt * kt, "bytes": chunk,
+            "offsets": [lo + e * chunk for e in range(E)],
+        }
+    return {
+        "arch": arch,
+        "experts": int(field(r, f"{arch}.expert_count")),
+        "used": int(field(r, f"{arch}.expert_used_count")),
+        "norm_topk_prob": True,
+        "tensors": tensors,
+    }
+
+
 def pack(args):
     r = gguf.GGUFReader(args.gguf)
     os.makedirs(args.out, exist_ok=True)
-    table, blobs, off = {}, [], 0
-    for name, t, kind in planned(r):
-        if kind == "tiles":
-            codes, scale, zero, exact = to_q4_1(t)
-            data = tiles(codes, scale, zero)
-            table[name] = {"dtype": "I8", "shape": list(data.shape)}
-            how = "exact" if exact else "requantized"
-        else:
-            w = dequantize(t.data, t.tensor_type).astype(np.float32)
-            if kind == "bf16" and w.ndim == 2:
-                table[name] = {"dtype": "BF16", "shape": list(w.shape)}
-            else:
-                w = w.reshape(-1)
-                table[name] = {"dtype": "BF16", "shape": [int(w.size)]}
-            data = bf16_bits(w)
-            how = "bf16"
-        b = np.ascontiguousarray(data).tobytes()
-        pad = (-off) % 64
-        if pad:
-            blobs.append(b"\0" * pad)
-            off += pad
-        table[name]["data_offsets"] = [off, off + len(b)]
-        blobs.append(b)
-        off += len(b)
-        print(f"{name:52s} {t.tensor_type.name:5s} -> {table[name]['dtype']} {table[name]['shape']} {how}")
-    table["__metadata__"] = {"format": "q4nx", "source": os.path.basename(args.gguf),
-                             "converter": "tools/gguf_to_q4nx.py"}
+    items = planned(r)
+    # Every blob's size follows from its shape, so the table (and so the header) is written
+    # before any weight is converted and the data is streamed to its offset in one pass: a 30B
+    # expert stack does not fit in memory as a list of blobs.
+    table, off = {}, 0
+    for name, t, kind in items:
+        off += (-off) % 64
+        n = blob_bytes(t, kind)
+        table[name] = {"dtype": "BF16" if kind == "bf16" else "I8",
+                       "shape": blob_shape(t, kind), "data_offsets": [off, off + n]}
+        off += n
+    meta = {"format": "q4nx", "source": os.path.basename(args.gguf),
+            "converter": "tools/gguf_to_q4nx.py"}
+    if field(r, "general.architecture") == "qwen3moe":
+        meta["moe"] = moe_meta(r, items, table)
+    table["__metadata__"] = meta
     header = json.dumps(table, separators=(",", ":")).encode()
     header += b" " * ((-len(header)) % 64)
-    with open(os.path.join(args.out, "model.q4nx"), "wb") as f:
+    path = os.path.join(args.out, "model.q4nx")
+    with open(path, "wb") as f:
         f.write(struct.pack("<Q", len(header)))
         f.write(header)
-        for b in blobs:
-            f.write(b)
+        f.truncate(8 + len(header) + off)  # sparse: the 64-byte pads stay zero
+        for name, t, kind in items:
+            data, exact = encode(t, kind)
+            lo, hi = table[name]["data_offsets"]
+            if len(data) != hi - lo:
+                raise SystemExit(f"{name}: wrote {len(data)} B, the table says {hi - lo} B")
+            f.seek(8 + len(header) + lo)
+            f.write(data)
+            how = "bf16" if kind == "bf16" else ("exact" if exact else "requantized")
+            if kind == "expert-tiles":
+                how += f" {int(t.shape[2])} experts"
+            print(f"{name:52s} {t.tensor_type.name:5s} -> {table[name]['dtype']} "
+                  f"{table[name]['shape']} {how}", flush=True)
     vocab = table["model.embed_tokens.weight"]["shape"][0]
     cfg = config(r, vocab)
     cfg["q4nx_source"]["gguf"] = os.path.basename(args.gguf)
@@ -273,35 +384,57 @@ def verify(args):
         lo, hi = hdr[name]["data_offsets"]
         raw = np.asarray(mm[base + lo:base + hi])
         ref = dequantize(t.data, t.tensor_type).astype(np.float64)
-        if kind == "tiles":
-            K, N = int(t.shape[0]), int(t.shape[1])
-            got = untile(raw, N, K).astype(np.float64)
-            ref = ref.reshape(N, K)
-            err = np.abs(got - ref)
-            if t.tensor_type in EXACT:
-                codes, scale, zero, _ = to_q4_1(t)
-                # rounding scale and zero to bf16 moves each weight by at most
-                # code * |ds| + |dz| (half a bf16 ulp each), plus one f32 ulp for the
-                # rounding inside gguf-py's own f32 dequantize (untile's is exact)
-                ds = np.abs(from_bf16(bf16_bits(scale)) - scale).astype(np.float64)
-                dz = np.abs(from_bf16(bf16_bits(zero)) - zero).astype(np.float64)
-                bound = codes.reshape(N, K // 32, 32) * ds[..., None] + dz[..., None]
-                bound = bound.reshape(N, K) + np.spacing(np.abs(ref).astype(np.float32))
-                over = int((err > bound).sum())
-                ok = over == 0
-                note = f"exact to bf16 scales: max err {err.max():.3g} (bound {bound.max():.3g}), {over} over"
-            else:
-                rel = np.sqrt((err ** 2).mean() / max((ref ** 2).mean(), 1e-30))
-                cos = float((got * ref).sum() / np.sqrt((got * got).sum() * (ref * ref).sum()))
-                ok = cos > 0.99
-                note = f"requantized: rel rms err {rel:.4f}, cos {cos:.6f}"
-        else:
+        if kind == "bf16":
             got = from_bf16(raw.view(np.uint16)).astype(np.float64).reshape(-1)
             ref = ref.reshape(-1)
             err = np.abs(got - ref)
             bound = np.abs(ref) * 2.0 ** -8 + 1e-30  # half a bf16 ulp is <= 2^-8 relative
             ok = bool((err <= bound).all())
             note = f"bf16: max rel err {(err / (np.abs(ref) + 1e-30)).max():.3g}"
+        else:
+            # One tile grid per expert for a routed stack, one for a dense projection.
+            K, N = int(t.shape[0]), int(t.shape[1])
+            E = int(t.shape[2]) if kind == "expert-tiles" else 1
+            rt, kt = grid(N, K)
+            tiles_e = raw.reshape(E, rt * kt, TILE)
+            ref = ref.reshape(E, N, K)
+            exact = t.tensor_type in EXACT
+            codes, scale, zero = (None, None, None)
+            if exact:
+                codes, scale, zero, _ = to_q4_1(t)
+                codes = codes.reshape(E, N, K)
+                scale, zero = scale.reshape(E, N, K // 32), zero.reshape(E, N, K // 32)
+            over, worst, worstb = 0, 0.0, 0.0
+            gse = rsse = dot = 0.0
+            for e in range(E):
+                got = untile(tiles_e[e], N, K).astype(np.float64)
+                err = np.abs(got - ref[e])
+                worst = max(worst, float(err.max()))
+                if exact:
+                    # rounding scale and zero to bf16 moves each weight by at most
+                    # code * |ds| + |dz| (half a bf16 ulp each), plus one f32 ulp for the
+                    # rounding inside gguf-py's own f32 dequantize (untile's is exact)
+                    ds = np.abs(from_bf16(bf16_bits(scale[e])) - scale[e]).astype(np.float64)
+                    dz = np.abs(from_bf16(bf16_bits(zero[e])) - zero[e]).astype(np.float64)
+                    bound = codes[e].reshape(N, K // 32, 32) * ds[..., None] + dz[..., None]
+                    bound = bound.reshape(N, K) + np.spacing(np.abs(ref[e]).astype(np.float32))
+                    over += int((err > bound).sum())
+                    worstb = max(worstb, float(bound.max()))
+                else:
+                    gse += float((got * got).sum())
+                    rsse += float((ref[e] * ref[e]).sum())
+                    dot += float((got * ref[e]).sum())
+            if exact:
+                ok = over == 0
+                note = (f"exact to bf16 scales: max err {worst:.3g} (bound {worstb:.3g}), "
+                        f"{over} over")
+            else:
+                rel = float(np.sqrt(max(gse + rsse - 2 * dot, 0.0) / max(rsse, 1e-30)))
+                cos = float(dot / np.sqrt(max(gse * rsse, 1e-30)))
+                ok = cos > 0.99
+                note = f"requantized: rel rms err {rel:.4f}, cos {cos:.6f}"
+            if E > 1:
+                note += f" ({E} experts)"
         bad += not ok
         if not ok or args.all or "layers." not in name or ".layers.0." in name:
             print(f"{'ok ' if ok else 'BAD'} {name:52s} {t.tensor_type.name:5s} {note}")

@@ -397,6 +397,18 @@ private:
             o.why = "share answered " + std::to_string(r ? r->status : -1) + (r ? ": " + r->body.substr(0, 200) : "");
             return o;
         }
+        // the decoder numbers every export; adopt has to quote it or it refuses the cells
+        uint64_t share_id = 0;
+        try {
+            share_id = json::parse(r->body).at("share_id").get<uint64_t>();
+        } catch (const std::exception&) {
+            ::close(lfd);
+            std::error_code ec;
+            std::filesystem::remove(tokens, ec);
+            std::filesystem::remove(sockpath, ec);
+            o.why = "share reply has no share_id";
+            return o;
+        }
         KvShare share;
         const bool got = kvshare_recv(lfd, &share, &why);
         ::close(lfd);
@@ -434,7 +446,7 @@ private:
         }
 
         // 4. the decoder takes the cells over: no file, no copy (llama_kv_cells_adopt)
-        json adopt = {{"tokens", ids}};
+        json adopt = {{"tokens", ids}, {"share_id", share_id}};
         const auto t2 = std::chrono::steady_clock::now();
         auto ra = c.Post("/slots/0?action=adopt", adopt.dump(), "application/json");
         o.restore_ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - t2).count();

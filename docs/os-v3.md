@@ -21,8 +21,8 @@ limitations under the License.
 The owner's direction of 2026-11-01 makes **Puppy** the base of v3, for the live/try stick *and* the
 installed system (a frugal install with a persistent save layer), with our kernel and drivers. The
 evaluation — sizes, the glibc ceiling, the kernel config gap, the package inventory, the build recipe and
-the gates table — is [os-v3-live-puppy-eval.md](os-v3-live-puppy-eval.md), with its recipe in
-`os/v3/puppy/`.
+the gates table — is `docs/os-v3-live-puppy-eval.md` (**PR #739**, which also carries the recipe in
+`os/v3/puppy/`; neither is in this PR).
 
 **If that evaluation's gates pass, the Puppy plan below is v3.** It is a different *medium* with the
 same *design* as everything on this page: the same ESP chain (shim → our MOK-signed grub → our
@@ -48,8 +48,9 @@ makes the **installed** machine a real OS: Ubuntu 26.04 LTS Server, installed un
 from the same stick, carrying our kernel, our drivers, our runtime, the engine, Lemonade and the
 appliance units as packages that `apt` updates.
 
-The first slice is in the tree: `os/v3/pin.txt` (the pinned server ISO) and `os/v3/seed.sh` with its
-`seed-selftest.sh` (31 checks, no device). Everything after the seed — `mkstick.sh`, `mkdebs.sh`,
+The first slice is `os/v3/pin.txt` (the pinned server ISO), `os/v3/seed.sh` and its `seed-selftest.sh`
+(**PR #732**, 32 checks, no device; not in this PR either, so this page stands alone at any merge
+order). Everything after the seed — `mkstick.sh`, `mkdebs.sh`,
 `postinstall`, `steps`, the vmtest scripts — is design. `os/mini` keeps shipping in v2026.44, and
 engine#712 says v3 is the next release, not the Sunday one. What *is* measured is in
 [What is measured now](#what-is-measured-now) — most of it on the Strix Halo box this design was written
@@ -344,8 +345,9 @@ not re-built:
 | `1bit-openwebui` | optional, as v2: published, installed by nobody, nothing depends on it | — |
 
 Two things v3 takes from the archive instead of building, because engine#712 is about the OS, not the
-supply chain: **`linux-firmware-amd-graphics` and `linux-firmware-amd-misc`** (26.04's split packages;
-`-amd-misc` is "Firmware for AMD NPU accelerators", measured 20260319.git217ca6e4-0ubuntu1.1, and it is
+supply chain: **`linux-firmware-amd-graphics` and `linux-firmware-amd-misc`** (26.04's split packages,
+on two revisions - measured here, `-amd-misc` `20260319.git217ca6e4-0ubuntu1.1` and `-amd-graphics`
+`20260319.git217ca6e4-0ubuntu3.1`; `-amd-misc` is "Firmware for AMD NPU accelerators", and it is
 what puts `amdnpu/17f0_11/npu.sbin.zst` under `/lib/firmware`), and **XRT**, as above. Both carry their
 own licences and land in `/usr/share/doc/<package>/copyright`, which is what `os/LICENSES.md` already
 records for the current image.
@@ -472,7 +474,7 @@ Reference box (strixhalo, 2026-11-01, the machine this design was written on):
 | out-of-tree modules | `amdxdna.ko`, `ec_su_axb35.ko` in `/lib/modules/<kver>/updates/`, both signed `strixhalo Secure Boot Kernel`, vermagic `<kver> SMP preempt mod_unload modversions` |
 | MOK | `CN=strixhalo Secure Boot Kernel, O=1bit-MONSTER`, self-signed, EKU Code Signing; Secure Boot enabled |
 | firmware | `efibootmgr` 10 entries; `Boot0000 Ubuntu` → `\EFI\ubuntu\shimx64.efi`; stale `Boot0002 1bit OS USB`; 97 efivars |
-| firmware packages | `linux-firmware-amd-graphics`, `linux-firmware-amd-misc` 20260319.git217ca6e4-0ubuntu1.1 (`amdnpu/17f0_11/npu.sbin.zst`) |
+| firmware packages | `linux-firmware-amd-misc` 20260319.git217ca6e4-**0ubuntu1.1** and `linux-firmware-amd-graphics` 20260319.git217ca6e4-**0ubuntu3.1** (two revisions, measured; the first is what carries `amdnpu/17f0_11/npu.sbin.zst`) |
 | XRT | `libxrt-npu2`, `libxrt-utils-npu`, `libxrt2` 1:2.21.75+dfsg-4 |
 | ROCm | `/opt/rocm-therock` 7.2 GB; the runtime subset 173 MB + 3.5 MB bitcode; `libhsa` `21a66824…` |
 | the three libhsa | `f6ef689d…` (release), `21a66824…` (nightly), `5b113248…` (distro 7.1) |
@@ -503,13 +505,16 @@ Not measured, and therefore the risk list for the build:
 
 ## The `os/v3` tree
 
+Everything in this table is what this page proposes; none of it lands in this PR. The two rows marked
+**#732** are that PR's files.
+
 | file | what |
 |---|---|
 | `pin.txt` | the server ISO exactly (url, size, sha256, volume label, date) and the series; the engine/kernel/ROCm pins stay the release's own |
 | `mkstick.sh` | `mkrootfs`'s replacement: extract the pinned ISO to partition 2, add `/1bit/`, write the ESP from `os/mini`'s payload, `prepare-stick`-style identity |
 | `mkdebs.sh` | v2's `mkdebs.sh` plus `1bit-rocm` (subset derived from `ldd`), `1bit-xrt` (Depends), the kernel/modules pair, and the archive-keyring |
-| `seed.sh` | **in the tree**: renders `autoinstall.yaml` + `identity` from the stick's inputs, `check` validates a rendered seed (fields, mode, placeholders, and the YAML's structure with PyYAML), `selftest` proves both directions — 31 checks, no device |
-| `seed-selftest.sh` | the `selftest` target: good-seed acceptances, 15 refusals with their reasons, and six structure regressions (no `preserve: true`, a `file://` apt source, an unsubstituted placeholder, a root size the identity does not have, a `/data` that is not `1BIT-DATA`, an md5 hash) |
+| `seed.sh` | **#732**: renders `autoinstall.yaml` + `identity` from the stick's inputs, `check` validates a rendered seed (fields, mode, placeholders, and the YAML's structure with PyYAML), `selftest` proves both directions |
+| `seed-selftest.sh` | **#732**: the `selftest` target — good-seed acceptances, 15 refusals with their reasons, and seven structure regressions (no `preserve: true`, a `file://` apt source, an unsubstituted placeholder, a root size the identity does not have, a `/data` that is not `1BIT-DATA`, an md5 hash, an ESP without `grub_device`); 32 checks, no device |
 | `postinstall` | the nine steps, `set -e` with the failure trap that keeps the screen |
 | `steps` | the renderer entry points `plan`, `step`, `failed` (v2's `os/mini/tui.sh`, Apache-noticed copy) |
 | `vmtest-v3.sh`, `vmtest-install-v3.sh` | phases A/B and I/V, transcripts in `/data` as v2's do — the host reads the guest's transcript, so no port forwarding decides a verdict |

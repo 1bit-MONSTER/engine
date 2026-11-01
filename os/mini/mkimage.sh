@@ -149,9 +149,12 @@ echo "== kernel modules ($kver)"
 # carries (r8152, ax88179_178a, cdc_ether, cdc_ncm, usbnet). Wi-Fi: mt7925e pulls mt76/mac80211/cfg80211.
 # Every module the board binds on the build machine (os/mini/hwprobe.py, 26 Oct 2026): CPU temperature
 # (k10temp, what the fan logic and the checks read), SMBus and the DIMM sensors, the power controller,
-# the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), audio (HDA and the
-# KVM's USB audio), the SD reader, RAPL power readings. BusyBox init has no udev: init.sh loads them.
-mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118 typec_ucsi roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet"
+# the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), the SD reader, RAPL
+# power readings. BusyBox init has no udev: init.sh loads them.
+# #708: no sound modules. The appliance has no audio, and on the c18 live boot snd_usbmidi_lib was refused
+# (its signing key is not the kernel's) and then eleven "Unknown symbol snd_ctl_new1 (err -2)" lines
+# scrolled over the screen for every user. Dropping them is the whole fix: nothing else loads them.
+mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb sdhci_pci intel_rapl_msr spd5118 typec_ucsi roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -253,6 +256,26 @@ else
     echo "   amdxdna: private build not found at $xdna - the stock module ships"
 fi
 depmod -b "$root" "$kver"
+
+# #708: refuse an unsigned module, the same way this script refuses a module built for another kernel.
+# Secure Boot is on for the owner, so an unsigned module is not a line in a log: it is a rejection and then
+# every symbol error of the module that depended on it. The signers are printed either way, because "the
+# module is signed" is not the question - signed by a key this kernel trusts is.
+unsigned=0
+while IFS= read -r ko; do
+    signer=$(modinfo -F signer "$ko" 2>/dev/null)
+    if [ -z "$signer" ]; then
+        echo "   UNSIGNED: ${ko#"$root"}"
+        unsigned=$((unsigned + 1))
+    fi
+done < <(find "$root/lib/modules" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \))
+if [ "$unsigned" != 0 ]; then
+    echo "this image would ship $unsigned unsigned module(s) (named above) into a Secure Boot machine; stopping"
+    exit 1
+fi
+while IFS= read -r ko; do modinfo -F signer "$ko" 2>/dev/null; done \
+    < <(find "$root/lib/modules" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \)) |
+    sort | uniq -c | sed 's/^/   signer: /'
 
 echo "== firmware (only what these chips load)"
 fw() {   # a pattern that matches nothing on this machine is skipped

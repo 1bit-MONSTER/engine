@@ -68,7 +68,7 @@ want 0 "rendered" "render: a seeded stick" \
     "$seed" render "$w/good" --disk-serial YMA62T0KA2417407NP --user onebit --hostname 1bit-strixhalo \
     --password-file "$w/pw" --ssh-pubkey "$w/testkey.pub" --timezone UTC
 want 0 "OK" "check: the seed it just rendered" "$seed" check "$w/good"
-contains 'serial: "YMA62T0KA2417407NP"' "$w/good/autoinstall.yaml" "the YAML matches the disk by serial"
+contains 'match: {size: largest}' "$w/good/autoinstall.yaml" "the YAML names the largest disk (the serial is the guard's)"
 contains 'hostname: "1bit-strixhalo"' "$w/good/autoinstall.yaml" "the YAML carries the hostname"
 if [ "$(stat -c %a "$w/good/identity")" = 600 ]; then ok "identity is 0600"
 else bad "identity is $(stat -c %a "$w/good/identity"), wanted 0600"; fi
@@ -132,6 +132,8 @@ broken "$w/bad4" 's#size: "64G"#size: "8G"#'
 want 2 "root partition is not 64G" "check: a root partition size the identity does not have" "$seed" check "$w/bad4"
 broken "$w/bad5" 's#label: 1BIT-DATA#label: 1BIT-DAT#; s#path: /data#path: /date#'
 want 2 "no 1BIT-DATA format" "check: a /data mount that is not 1BIT-DATA" "$seed" check "$w/bad5"
+broken "$w/bad7" 's#, flag: boot, grub_device: true#, flag: boot#'
+want 2 "no grub_device: true" "check: an ESP without grub_device (curtin refuses, measured)" "$seed" check "$w/bad7"
 rm -rf "$w/bad6"; cp -a "$w/good" "$w/bad6"
 # shellcheck disable=SC2016  # $1$ is an md5 hash, not a variable
 sed -i 's/^password_hash=.*/password_hash=$1$abcd$efgh/' "$w/bad6/identity"

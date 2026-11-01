@@ -85,9 +85,12 @@ autoinstall:
   storage:
     swap: {size: 0}
     config:
+      # curtin has no `serial` match key - measured, it answers "matched no disk" - so the disk is the
+      # largest one, and the serial the seed names is enforced by /1bit/steps (early-commands) before
+      # curtin runs: that guard refuses when the serial does not land on exactly this disk.
       - {type: disk, id: disk0, ptable: gpt, grub_device: true, preserve: false,
-         match: {serial: "@DISK_SERIAL@"}}
-      - {type: partition, id: part-esp, device: disk0, number: 1, size: 1G, flag: boot, wipe: superblock}
+         match: {size: largest}}
+      - {type: partition, id: part-esp, device: disk0, number: 1, size: 1G, flag: boot, grub_device: true, wipe: superblock}
       - {type: format, id: fmt-esp, volume: part-esp, fstype: fat32, label: 1BIT-OS}
       - {type: mount, id: mnt-esp, device: fmt-esp, path: /boot/efi}
       - {type: partition, id: part-root, device: disk0, number: 2, size: "@ROOT_SIZE@", wipe: superblock}
@@ -112,7 +115,9 @@ autoinstall:
   early-commands:
     - /cdrom/1bit/steps plan          # the whole step list, before subiquity draws (engine#710)
   late-commands:
-    - curtin in-target -- /cdrom/1bit/postinstall   # the steps in docs/os-v3.md
+    # in the live environment, not in-target: it needs /cdrom (the medium) and the console, and it
+    # drives the target itself with curtin in-target for each target-side command
+    - /cdrom/1bit/postinstall
   error-commands:
     - /cdrom/1bit/steps failed        # the failing step stays on screen with its output
   reporting:
@@ -194,7 +199,7 @@ except ImportError:
     need("interactive-sections: []" in text, "interactive-sections is not []")
     need('username: "%s"' % want["user"] in text, "identity.username is not %s" % want["user"])
     need('hostname: "%s"' % want["host"] in text, "identity.hostname is not %s" % want["host"])
-    need('serial: "%s"' % want["serial"] in text, "the disk match serial is not %s" % want["serial"])
+    need("match: {size: largest}" in text, "the disk is not matched by size: largest")
     need('size: "%s"' % want["root"] in text, "the root partition size is not %s" % want["root"])
     need("label: 1BIT-ROOT" in text and "path: /" in text, "no 1BIT-ROOT mounted at /")
     need("label: 1BIT-DATA" in text and "path: /data" in text, "no 1BIT-DATA mounted at /data")
@@ -219,8 +224,14 @@ else:
     cfg = st.get("config") or []
     disks = [e for e in cfg if e.get("type") == "disk"]
     need(len(disks) == 1, "storage.config has %d disks, wanted exactly 1" % len(disks))
-    need(bool(disks) and (disks[0].get("match") or {}).get("serial") == want["serial"],
-         "the disk match serial is not %s" % want["serial"])
+    # curtin has no serial match (measured: "matched no disk"); the serial is enforced by /1bit/steps
+    # before curtin runs, and the config names the largest disk
+    need(bool(disks) and (disks[0].get("match") or {}).get("size") == "largest",
+         "the disk is not matched by size: largest")
+    esp = [e for e in cfg if e.get("type") == "partition" and e.get("number") == 1]
+    need(bool(esp) and esp[0].get("grub_device") is True,
+         "partition 1 (the ESP) has no grub_device: true - curtin then refuses with "
+         "'did not create needed bootloader partition' (measured)")
     labels = {e.get("label"): e for e in cfg if e.get("type") == "format"}
     need("1BIT-ROOT" in labels, "no 1BIT-ROOT format")
     need("1BIT-DATA" in labels, "no 1BIT-DATA format")

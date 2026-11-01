@@ -1,0 +1,33 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+# The medium 1bit OS v3 installs from, pinned whole. v3 has no snapshot timestamp to pin the way
+# os/v2/pin.txt does: the installed base is unpacked from *this* ISO's own pool by curtin, so the ISO's
+# sha256 is the pin, and a stick built from a different ISO is a different operating system.
+#
+# Key=value, read by os/v3/seed.sh (the identity records iso_sha256 so the installed machine can answer
+# release-check's `identity` row) and by os/v3/mkstick.sh (it refuses an ISO whose size or sha256 differ).
+#
+# Measured 2026-11-01 from releases.ubuntu.com: size by HEAD, sha256 from the release's SHA256SUMS, the
+# label out of the ISO's own primary volume descriptor (block 16, offset 32768+40) - not guessed from the
+# file name, because casper finds its squashfs by that label and by nothing else.
+server_iso_url=https://releases.ubuntu.com/26.04/ubuntu-26.04.1-live-server-amd64.iso
+server_iso_size=2927861760
+server_iso_sha256=cc8a95cde20f6ced61a322420de00f10cc3c90ced545daa46cb9c1a117f1d927
+server_iso_label=Ubuntu-Server 26.04.1 LTS amd64
+server_iso_date=2026-08-26T05:14:44Z
+series=resolute
+# Not pinned here, on purpose: the engine, kernel, ROCm and Lemonade versions are the release's own pins
+# (the kernel .deb and the release tarball are its inputs, mkdebs.sh takes them), and the archive packages
+# the seed asks for by name are the 26.04 ones the ISO's pool and the archive carry on the day it installs.

@@ -177,21 +177,64 @@ int main() {
     expect("Tctl read", t && std::fabs(*t - 71.5) < 1e-9);
     expect("no box, no reading", !sysinfo::memory(d + "/nowhere").has_meminfo && !sysinfo::tctl_celsius(d + "/nowhere"));
 
+    // The fixture box reads 10 GiB of GTT free. With the ceiling in place (engine #680) that box is
+    // already past the ceiling, so the verdict tests use explicit readings instead of the fixture.
+    sysinfo::Memory box = mem;               // 120 GiB of GTT, 60 GiB in use: 60 GiB free, 104 GiB ceiling
+    box.gtt_used = 60ull << 30;
+
     admit::Need need;
     need.gpu = true;
     need.total = 12ull << 30;
-    auto v = admit::judge(need, mem);
-    expect("12 GiB on HRX with 10 GiB of GTT free: refused", v.checked && !v.fits && v.free == (10ull << 30));
-    need.total = 8ull << 30;
-    v = admit::judge(need, mem);
-    expect("8 GiB: fits, with a program-cache warning", v.fits && !v.warnings.empty());
+    auto v = admit::judge(need, box);
+    // free is min(GTT free, MemAvailable): 60 GiB of GTT free, 50 GiB available
+    expect("12 GiB on HRX with 60 GiB of GTT free: fits", v.checked && v.fits && v.free == (50ull << 30));
+    // a refusal that comes from RAM alone (no GTT in the reading) is still a plain free-memory refusal
+    sysinfo::Memory ram_only = box;
+    ram_only.has_gtt = false;
+    need.total = 50ull << 30;
+    v = admit::judge(need, ram_only);
+    expect("50 GiB on a box with 50 GiB available: refused by free memory, not by the ceiling",
+           !v.fits && !v.over_ceiling);
     need.gpu = false;
     need.total = 12ull << 30;
-    v = admit::judge(need, mem);
-    expect("12 GiB on the CPU: GTT does not count, MemAvailable 50 GiB does", v.fits && v.free == mem.mem_available);
+    v = admit::judge(need, box);
+    expect("12 GiB on the CPU: GTT does not count, MemAvailable 50 GiB does", v.fits && v.free == box.mem_available);
     need.total = 60ull << 30;
-    expect("60 GiB on the CPU: refused", !admit::judge(need, mem).fits);
+    expect("60 GiB on the CPU: refused", !admit::judge(need, box).fits);
     expect("a box with no /proc/meminfo: not checked", !admit::judge(need, sysinfo::memory(d + "/nowhere")).checked);
+
+    // The program-cache warning now needs MemAvailable to be the binding limit: under the ceiling there is
+    // never free-minus-need under 5 GiB on a 120 GiB pool (the ceiling is 104 GiB of it), which is the
+    // point of the ceiling.
+    sysinfo::Memory tight = box;
+    tight.mem_available = 30ull << 30;       // 120 GiB GTT free-by-ceiling, but only 30 GiB of RAM available
+    tight.gtt_used = 0;
+    need.gpu = true;
+    need.total = 26ull << 30;
+    v = admit::judge(need, tight);
+    expect("26 GiB with 30 GiB available: fits, with a program-cache warning", v.fits && !v.warnings.empty());
+
+    // engine #680: the GTT ceiling refuses a load that would land where the device faulted, even when
+    // the free-memory test alone would admit it. 120 GiB of GTT, 60 GiB in use, 16 GiB reserve.
+    need.gpu = true;
+    need.total = 40ull << 30;   // 60 + 40 = 100 GiB after the load
+    v = admit::judge(need, box);
+    expect("40 GiB more: fits under the ceiling", v.fits && !v.over_ceiling && v.ceiling == (104ull << 30));
+    need.total = 45ull << 30;   // 60 + 45 = 105 GiB after the load, past the 104 GiB ceiling
+    v = admit::judge(need, box);
+    expect("45 GiB more: refused by the ceiling although 60 GiB is free", !v.fits && v.over_ceiling &&
+                                                                      v.free >= need.total);
+    expect("the refusal names the ceiling and the reserve",
+           v.ceiling_note.find("ceiling") != std::string::npos &&
+               v.ceiling_note.find("GGML_HRX_GTT_RESERVE_MB") != std::string::npos);
+    need.total = 1ull << 30;    // 61 GiB after the load: inside the ceiling, and above #315's zone only warns
+    v = admit::judge(need, box);
+    expect("1 GiB more: fits, no ceiling note", v.fits && v.ceiling_note.empty());
+    sysinfo::Memory small = box;
+    small.gtt_total = 8ull << 30;   // smaller than the 16 GiB reserve: no ceiling to fit under
+    small.gtt_used = 0;
+    v = admit::judge(need, small);
+    expect("a pool smaller than the reserve: refused at any size", !v.fits && v.over_ceiling && v.ceiling == 0);
 
     fs::remove_all(dir);
     if (failures) std::printf("%d FAILED\n", failures);

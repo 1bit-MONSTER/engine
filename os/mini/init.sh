@@ -26,6 +26,12 @@ hostname -F /etc/hostname
 
 echo; echo "  1bit OS  —  Lemonade with the 1bit engine  —  https://1bit.gg"; echo
 
+# #703: the cmdline boots the VT at loglevel=4, so the screen shows the appliance instead of every kernel
+# line. ttyS0 is the console the QEMU gates read and it keeps the verbose log: kernels with per-console
+# levels expose /sys/class/console/<name>/level, and where they do not the global level stays at 4 (the
+# gates match init's own lines, which are printed regardless of the kernel level).
+[ -w /sys/class/console/ttyS0/level ] && echo 7 > /sys/class/console/ttyS0/level
+
 # drivers, in the order the boot needs them: network, USB storage and the USB4/Type-C stack first, so
 # the machine is reachable and the stick readable even if a GPU probe is slow. sd_mod makes a USB
 # stick a disk (usb-storage only presents it as a SCSI device); the TYPEC/Thunderbolt modules are what
@@ -386,12 +392,12 @@ fi
 # PID 1 must never exit: the kernel panics with "Attempted to kill init" if it does (that is exactly
 # what happened on real hardware - the script finished, the final exec returned, and the machine
 # rebooted 42 s into the boot). Give the console a shell in the background and keep init alive forever.
-# Kernel messages stay in dmesg from here on, not over the console shell. The cmdline boots with
-# ignore_loglevel so every boot line is on the console and the serial log; the first hardware boot
-# (26 Oct) then kept printing USB connect/disconnect lines over the shell and the owner could not
-# use the prompt at all. Both knobs are runtime-writable; emergencies (level 0) still reach the console.
-# They matter for the menu too: a boot line painted over the frame is a mess the menu cannot clean up
-# (it only redraws on a keypress or, on Status, once a second).
+# Kernel messages stay in dmesg from here on, not over the console shell: the first hardware boot
+# (26 Oct) kept printing USB connect/disconnect lines over the prompt and the owner could not use it.
+# Both knobs are runtime-writable; emergencies (level 0) still reach the console. They matter for the menu
+# too: a boot line painted over the frame is a mess the menu cannot clean up (it only redraws on a
+# keypress or, on Status, once a second). Since #703 the cmdline already boots at level 4, so this only
+# has to hold it there - and to clear the old ignore_loglevel default on an image built before that.
 echo N > /sys/module/printk/parameters/ignore_loglevel 2>/dev/null
 echo "1 4 1 7" > /proc/sys/kernel/printk 2>/dev/null
 # with a tty1 this never returns (screen_login loops); the while keeps PID 1 alive if there is none

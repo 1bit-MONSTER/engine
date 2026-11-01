@@ -596,7 +596,11 @@ chmod -R go-w "$root"; chmod 1777 "$root/tmp"; chmod 700 "$root/root"
 echo "== 1bit-os.efi (unified kernel image)"
 stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 # the GPU may use up to 120 GiB of RAM (the same limits as the development machine)
-cmdline="console=tty0 console=ttyS0,115200 ignore_loglevel loglevel=7 panic=600 oops=panic fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
+# #703: the screen is not a kernel log. The c18 dry run scrolled every kernel message over the VT
+# because the cmdline carried ignore_loglevel + loglevel=7. The serial console (ttyS0) is what the QEMU
+# gates read and it keeps the verbose log - init.sh's first act raises it there, per console. Level 4
+# is "warnings and errors only": a boot that goes wrong still says why on the VT.
+cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
 printf '%s' "$cmdline" > "$out/cmdline.txt"
 # section layout after the stub's own sections, each aligned to 64 KiB
 align() { echo $(( ($1 + 65535) / 65536 * 65536 )); }

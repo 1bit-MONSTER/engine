@@ -1,0 +1,187 @@
+{
+ "source": "vllm-sr/d3-lite d3_format.py (Apache-2.0), revision 2fc06364715b967f1860aea9cf38778875588b17",
+ "note": "expected_user_prompt is upstream d3_format.user_prompt() output, byte for byte",
+ "cases": [
+  {
+   "name": "choice_two_one_null",
+   "state": {
+    "x": 1,
+    "y": "z"
+   },
+   "question": {
+    "type": "choice",
+    "criteria": {
+     "a": null,
+     "b": "the b option"
+    }
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\n{\"x\": 1, \"y\": \"z\"}\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: a\nB: b: the b option\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "choice_three_json_desc",
+   "state": {
+    "route": "refund",
+    "amount": 42
+   },
+   "question": {
+    "type": "choice",
+    "criteria": {
+     "fast": {
+      "speed": "high",
+      "cost": 2
+     },
+     "cheap": null,
+     "safe": [
+      "a",
+      "b"
+     ]
+    }
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\n{\"route\": \"refund\", \"amount\": 42}\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: fast: {\"speed\": \"high\", \"cost\": 2}\nB: cheap\nC: safe: [\"a\", \"b\"]\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "choice_unicode",
+   "state": "état: déjà vu",
+   "question": {
+    "type": "choice",
+    "criteria": {
+     "ok": "c'est bon",
+     "no": null
+    }
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\nétat: déjà vu\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: ok: c'est bon\nB: no\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "choice_instructions",
+   "state": "ticket 9911",
+   "question": {
+    "type": "choice",
+    "criteria": {
+     "escalate": null,
+     "close": null
+    },
+    "instructions": "Decide the next action."
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\nticket 9911\n\nQuestion:\nDecide the next action.\n\nOptions:\nA: escalate\nB: close\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "noul_plain",
+   "state": {
+    "risk": 0.4
+   },
+   "question": {
+    "type": "noul"
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\n{\"risk\": 0.4}\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: No / false\nB: Yes / true\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "noul_criteria",
+   "state": {
+    "risk": 0.4
+   },
+   "question": {
+    "type": "noul",
+    "criteria": {
+     "false": "hold",
+     "true": "ship it"
+    }
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\n{\"risk\": 0.4}\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: hold\nB: ship it\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "noul_instructions",
+   "state": null,
+   "question": {
+    "type": "noul",
+    "instructions": "Ship or not?"
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\n(empty)\n\nQuestion:\nShip or not?\n\nOptions:\nA: No / false\nB: Yes / true\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "score_three_levels",
+   "state": "the answer was late",
+   "question": {
+    "type": "score",
+    "criteria": [
+     "bad",
+     "ok",
+     "great"
+    ]
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\nthe answer was late\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: bad\nB: ok\nC: great\n\nReply with only the code of the best option."
+  },
+  {
+   "name": "score_json_levels",
+   "state": {
+    "n": 3
+   },
+   "question": {
+    "type": "score",
+    "criteria": [
+     {
+      "k": 1
+     },
+     "mid",
+     {
+      "k": 3
+     }
+    ]
+   },
+   "codes": [
+    "A",
+    "B",
+    "C",
+    "D"
+   ],
+   "expected_user_prompt": "State:\n{\"n\": 3}\n\nQuestion:\nChoose the best matching option.\n\nOptions:\nA: {\"k\": 1}\nB: mid\nC: {\"k\": 3}\n\nReply with only the code of the best option."
+  }
+ ]
+}

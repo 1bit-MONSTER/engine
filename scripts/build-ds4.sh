@@ -39,9 +39,17 @@ out=$prefix/$backend
 # turned into a hard build failure for the whole engine - `1bit` depends on this target. Checked before
 # the ROCm lookup and before make, so the reuse works on a box with no usable hipcc at all.
 # The pin is printed so the record says what the binary is.
-if [ "${DS4_REBUILD:-0}" != 1 ] && [ -x "$out/ds4-server" ]; then
-    echo "DwarfStar ($backend): reusing $out/ds4-server ($(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo 'pin unknown'))"
-    exit 0
+# All three binaries, and the pin the staged ones were built from (`ds4.pin`, written below). `$src`'s HEAD is the
+# pin of the tree being built *today*, not of the binary that is already there, so the two are compared rather than
+# printed as if they were the same fact (the same defect #720 fixed for hrx-system).
+if [ "${DS4_REBUILD:-0}" != 1 ] && [ -x "$out/ds4-server" ] && [ -x "$out/ds4" ] && [ -x "$out/ds4-bench" ]; then
+    staged=$(cat "$out/ds4.pin" 2>/dev/null || echo unknown)
+    now=$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+    if [ "$staged" = "$now" ]; then
+        echo "DwarfStar ($backend, $staged): reusing $out/ds4-server"
+        exit 0
+    fi
+    echo "DwarfStar: staged $staged differs from pin $now - rebuilding"
 fi
 
 work=$prefix/src/$backend
@@ -71,4 +79,5 @@ fi
 mkdir -p "$out"
 for b in ds4-server ds4 ds4-bench; do cp "$work/$b" "$out/$b"; done
 commit=$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+echo "$commit" > "$out/ds4.pin"
 echo "DwarfStar ($backend, $commit): $out/ds4-server"

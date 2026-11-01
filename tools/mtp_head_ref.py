@@ -193,6 +193,67 @@ def gemv_pb16i(a, plan):
     return y.astype(np.float32)
 
 
+
+# ------------------------------------------------ loading a converted head
+Q4K_CELL = 4736   # one mode-0 cell = 32 rows x 256 K, exactly as the source container stores it
+
+def load_q4k_head(head_dir):
+    """Load a converted head (the q4_k form: the source's own cells) into W matrices + norms.
+
+    Because q4_k keeps the source cells, they are decoded with decode_mode0_tile() and no requantisation is
+    involved -- which is what makes this form the reference.  Returns (W, config).
+    """
+    import json
+    import os
+    import struct
+    cfg = json.load(open(os.path.join(head_dir, "config.json")))
+    blob = open(os.path.join(head_dir, "model.q4nx"), "rb").read()
+    hlen = struct.unpack("<Q", blob[:8])[0]
+    tensors = {t["name"]: t for t in cfg["tensors"]}
+    W = {}
+    name_of = {
+        "model.mtp.fc.weight": "fc",
+        "model.mtp.layers.0.self_attn.q_proj.weight": "q",
+        "model.mtp.layers.0.self_attn.k_proj.weight": "k",
+        "model.mtp.layers.0.self_attn.v_proj.weight": "v",
+        "model.mtp.layers.0.self_attn.o_proj.weight": "o",
+        "model.mtp.layers.0.mlp.gate_proj.weight": "gate",
+        "model.mtp.layers.0.mlp.up_proj.weight": "up",
+        "model.mtp.layers.0.mlp.down_proj.weight": "down",
+    }
+    norm_of = {
+        "model.mtp.pre_fc_norm_embedding.weight": "pre_fc_emb",
+        "model.mtp.pre_fc_norm_hidden.weight": "pre_fc_hid",
+        "model.mtp.layers.0.input_layernorm.weight": "ln_in",
+        "model.mtp.layers.0.post_attention_layernorm.weight": "ln_post",
+        "model.mtp.norm.weight": "norm",
+        "model.mtp.layers.0.self_attn.q_norm.weight": "q_norm",
+        "model.mtp.layers.0.self_attn.k_norm.weight": "k_norm",
+    }
+    off = 8 + hlen
+    for t in cfg["tensors"]:
+        n = t["bytes"]
+        raw = blob[off:off + n]
+        if len(raw) != n:
+            raise SystemExit(f"{head_dir}: short read for {t['name']}")
+        off += n
+        if t["name"] in name_of:
+            grid = [int(x) for x in t["shape"]]            # [N/32][K/256] cells, row-block major
+            n_out, k_tot = grid[0] * 32, grid[1] * 256
+            m = np.empty((n_out, k_tot), dtype=np.float32)
+            cells = np.frombuffer(raw, dtype=np.uint8).reshape(grid[0], grid[1], Q4K_CELL)
+            for rb in range(grid[0]):
+                for cb in range(grid[1]):
+                    m[rb * 32:(rb + 1) * 32, cb * 256:(cb + 1) * 256] = \
+                        decode_mode0_tile(cells[rb, cb].tobytes())
+            W[name_of[t["name"]]] = m
+        elif t["name"] in norm_of:
+            W[norm_of[t["name"]]] = bf16_to_f32(np.frombuffer(raw, dtype=np.uint16)).astype(np.float32)
+        else:
+            raise SystemExit(f"{head_dir}: unknown tensor {t['name']}")
+    return W, cfg
+
+
 # ------------------------------------------------ 3. the head, one step
 def head_step(hidden, tok_emb, W, cache=None, pos=None, g=GEOM):
     """One MTP draft step: (logits|None, new_hidden, cache).
@@ -386,11 +447,42 @@ def selftest():
     return ok
 
 
+def check_head(head_dir):
+    """Run the reference on a converted head: geometry, one step, a second step against the KV cache."""
+    W, cfg = load_q4k_head(head_dir)
+    H = GEOM["H"]
+    want = {"fc": (H, 2 * H), "q": (2 * GEOM["NH"] * GEOM["HD"], H), "k": (GEOM["NKV"] * GEOM["HD"], H),
+            "v": (GEOM["NKV"] * GEOM["HD"], H), "o": (H, GEOM["NH"] * GEOM["HD"]),
+            "gate": (GEOM["IM"], H), "up": (GEOM["IM"], H), "down": (H, GEOM["IM"])}
+    bad = [(k, W[k].shape, want[k]) for k in want if tuple(W[k].shape) != want[k]]
+    print(f"[1] shapes: {len(want) - len(bad)}/{len(want)} matrices match the descriptor"
+          + ("" if not bad else f"  MISMATCH {bad}"))
+    n_par = sum(int(np.prod(W[k].shape)) for k in want)
+    print(f"[2] loaded {n_par/1e6:.1f} M weights in float32 ({n_par*4/2**30:.2f} GiB) + 7 norm vectors; "
+          f"finite={all(np.isfinite(W[k]).all() for k in W)}")
+    rng = np.random.default_rng(0)
+    hidden = rng.standard_normal(H).astype(np.float32)   # unit-RMS: what the norms expect
+    emb = rng.standard_normal(H).astype(np.float32)
+    l1, h1, c1 = head_step(hidden, emb, W, pos=0)
+    l2, h2, c2 = head_step(hidden, emb, W, pos=0)
+    print(f"[3] one step on real weights: hidden rms={float(np.sqrt((h1**2).mean())):.4f} "
+          f"finite={np.isfinite(h1).all()} deterministic={bool(np.array_equal(h1, h2))}")
+    l3, h3, _ = head_step(h1, emb, W, cache=c1, pos=1)
+    print(f"[4] second step with the kv cache: hidden rms={float(np.sqrt((h3**2).mean())):.4f} "
+          f"finite={np.isfinite(h3).all()}  (cache {c1['k'].shape})")
+    print("[5] per-tensor |w| mean: " + ", ".join(f"{k}={float(np.abs(W[k]).mean()):.4f}"
+                                                  for k in ("fc", "q", "o", "gate", "down")))
+    return 0
+
+
 def main(argv):
     if "--selftest" in argv:
         return 0 if selftest() else 1
+    if "--head" in argv:
+        return check_head(argv[argv.index("--head") + 1])
     print(__doc__)
     return 0
+
 
 
 if __name__ == "__main__":

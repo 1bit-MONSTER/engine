@@ -175,21 +175,32 @@ with two things it does not say out loud and this evaluation found the hard way:
 2. `3builddistro` takes the kernel from `woof-out_*/kernel-kit/output/` and **otherwise downloads a
    stock Ubuntu kernel** — our huge tarball has to be dropped there, which `build.sh` does.
 
-Attempts on 2026-11-01, in order: (1) failed compiling `vercmp` — the container lacked `libc6-dev`;
-(2) stopped at `merge2out`'s refusal (missing `GITHUB_ACTIONS`); (3) stopped at `merge2out`'s "Press
-ENTER" because `</dev/null` on a `yes "" |` pipeline discards the pipe; (4) running
-`resolute64` with our kernel in place — the log is `~/wt/os3i/…/build-resolute.log` on the build box, and
-**the recipe is proven up to and including the point where woof-CE starts downloading packages**; a
-finished ISO is not claimed here. What is worth saying plainly: the build system is from 2009, it is
-maintained (a CI matrix builds five targets twice a month), it is *interactive* in several places that
-matter, and every one of those places cost an attempt. A product build should run
-`woof-code`'s stages from a script that answers them, which is what `build.sh` is.
+Attempts on 2026-11-01, in order, each one a measured trap:
+
+| # | stopped at | cause | fix in `build.sh` |
+|---|---|---|---|
+| 1 | the `vercmp` compile | the container had no `libc6-dev` | install `build-essential`/`libc6-dev` |
+| 2 | `merge2out`, "you will still need a Puppy ISO and devx" | **`merge2out` refuses to run outside a running Puppy unless `GITHUB_ACTIONS` is set** — CI sets it, a container build must too | `export GITHUB_ACTIONS=true` |
+| 3 | `merge2out`, "Press ENTER to continue" | `</dev/null` on a `yes "" \| ./merge2out` pipeline **discards the pipe** | drop the redirect; let `yes` feed it |
+| 4 | right after `merge2out`, no error | `set -o pipefail` + `yes \| merge2out`: when `merge2out` exits, `yes` gets SIGPIPE and the pipeline's status kills the build | `set +o pipefail` around that line |
+| 5 | `3builddistro` → petbuild `busybox`: `chroot: failed to run command 'bash': No such file or directory` | the petbuild chroot is an **overlay mount**, and inside Docker the upper/work dirs sit on Docker's overlay rootfs — the kernel refuses it: `mount: ... bad superblock on petbuild`, so the rootfs is empty | build in a **host bind mount** (`BUILD_ROOT`, `/work`), not in the container's rootfs |
+| 6 | running | — | — |
+
+Attempt 5 is the informative one: `0setup` ✓, `1download` ✓ (the 26.04 package set, 37k log lines),
+`2createpackages` ✓, then the petbuild stage. So the recipe is proven through package creation and the
+remaining dependency is a filesystem property of the build *environment*, not of Puppy or of our kernel.
+
+What is worth saying plainly: the build system is from 2009; it is maintained (a CI matrix builds five
+targets twice a month) and it is *interactive* and environment-sensitive in several places that matter,
+and every one of those places cost an attempt. A product build has to run `woof-code`'s stages from a
+script that answers them, on a filesystem that can host its mounts — which is what `build.sh` now is. A
+finished ISO is **not** claimed here; G1 stays open until one builds and boots.
 
 ## The gates this evaluation would accept, and which of them are green
 
 | gate | what | status |
 |---|---|---|
-| G1 | a resolute64 Puppy ISO builds from our recipe with **our** kernel tarball in `kernel-kit/output` | recipe runs; ISO pending (attempt 4) |
+| G1 | a resolute64 Puppy ISO builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **recipe proven through `2createpackages`** (attempt 5); `3builddistro`'s petbuild stage needs the host-filesystem build root that attempt 6 uses — ISO pending |
 | G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red**: our kernel's `=m` medium/layer drivers ([Blocker 1](#blocker-1-the-kernel-config)); the fix is `kernel-puppy.fragment` + a kernel rebuild |
 | G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
 | G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |

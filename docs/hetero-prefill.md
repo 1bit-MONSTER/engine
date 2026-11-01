@@ -143,10 +143,12 @@ HeteroMosaic executes on imported handles only because it submits to amdxdna by 
 
 ## Follow-ups filed
 
-- Engine issue: dma-buf import for the NPU submission path (XRT cannot bind an imported BO; today only
-  iGPU→NPU sharing is possible, and only for buffers the NPU cannot yet execute on).
-- Engine issue: split-prefill in the hybrid route, **blocked on** an NPU prefill GEMM with T>256 weight
-  reuse; the numbers above are the acceptance bar it has to clear.
+- [#753](https://github.com/1bit-MONSTER/engine/issues/753) — dma-buf import for the NPU submission
+  path: XRT cannot bind an imported BO, so today only iGPU→NPU sharing is possible, and only for
+  buffers the NPU cannot yet execute on.
+- [#754](https://github.com/1bit-MONSTER/engine/issues/754) — split-prefill in the hybrid route,
+  **blocked on** an NPU prefill GEMM with T>256 weight reuse; the numbers above are the acceptance bar
+  it has to clear.
 - `docs/hybrid.md`'s "Running beside the GPU" section already covers the other direction (an NPU stream
   under a busy GPU keeps 87 % of its bandwidth); this page adds the GPU-side view: the iGPU loses
   < 0.2 % when the NPU runs beside it.

@@ -561,11 +561,6 @@ add_test(NAME npu_pb16i_layout
 add_executable(npu_moe_test tests/npu_moe_test.cpp)
 target_link_libraries(npu_moe_test PRIVATE onebit_npu)
 add_test(NAME npu_moe COMMAND npu_moe_test)
-# CI builds an explicit target list (.github/workflows/ci.yml, "Keep this list in step with
-# add_test()"), and extending that list needs a token with the `workflow` scope, which a lane
-# does not carry. Binding the MoE test to a target the list already names gets it built either
-# way; delete this line and add npu_moe_test to that list the next time the workflow is touched.
-add_dependencies(npu_model_bounds_test npu_moe_test)
 if(ONEBIT_NPU_MODEL AND ONEBIT_NPU_MOE_GATE)
     add_test(NAME npu_moe_model COMMAND npu_moe_test ${ONEBIT_NPU_MODEL} ${ONEBIT_NPU_MOE_GATE})
 endif()
@@ -573,6 +568,12 @@ endif()
 add_executable(npu_model_bounds_test tests/npu_model_bounds_test.cpp)
 target_link_libraries(npu_model_bounds_test PRIVATE onebit_npu)
 add_test(NAME npu_model_bounds COMMAND npu_model_bounds_test)
+# CI builds an explicit target list (.github/workflows/ci.yml, "Keep this list in step with
+# add_test()"), and extending that list needs a token with the `workflow` scope, which a lane does
+# not carry. Binding npu_moe_test to a target the list already names gets it built either way (a
+# target-level dependency needs that target to exist, hence this position). Delete this line and add
+# npu_moe_test to the workflow list the next time the workflow is touched with the right scope.
+add_dependencies(npu_model_bounds_test npu_moe_test)
 # The forward's Q4NX loader is plain C (no NPU runtime), so its crafted-file checks run in CI too.
 add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forward/src/model.c)
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)

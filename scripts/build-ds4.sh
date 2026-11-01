@@ -19,8 +19,9 @@
 # Builds DwarfStar pinned in third_party/ds4 (upstream antirez/ds4) on its HIP backend
 # (Strix Halo, gfx1151; make strix-halo) into <prefix>/hip/ds4-server, with ds4 and
 # ds4-bench beside it. The engine builds DwarfStar on HIP only: no CUDA, Metal or CPU
-# builds. Needs HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA and hipCUB: ROCM_PATH, else
-# TheRock's SDK under /opt/rocm-therock, else /opt/rocm. ROCM_ARCH overrides gfx1151.
+# builds. Needs HIP, hipBLAS, hipBLASLt, rocBLAS, rocWMMA and hipCUB: ROCM_PATH, else the pinned
+# toolchain under third_party/toolchain (scripts/fetch-rocm-sdk.sh, config/hrx-toolchain.config),
+# else TheRock's SDK under /opt/rocm-therock, else /opt/rocm. ROCM_ARCH overrides gfx1151.
 # DS4_TEST=1 also runs DwarfStar's model-free routed-MoE test on the GPU (make test-mxfp4-rocm).
 set -euo pipefail
 prefix=${1:?usage: build-ds4.sh <prefix>}
@@ -60,14 +61,24 @@ jobs=${CMAKE_BUILD_PARALLEL_LEVEL:-$(nproc)}   # the weekly job and thermal guar
 
 rocm=${ROCM_PATH:-}
 if [ -z "$rocm" ]; then
-    for d in /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
+    for d in "$root"/third_party/toolchain/rocm-sdk-*-gfx* /opt/rocm-therock /opt/rocm; do
         [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
     done
 fi
-[ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] || { echo "no ROCm with bin/hipcc: set ROCM_PATH"; exit 1; }
+[ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||
+    { echo "no ROCm with bin/hipcc: set ROCM_PATH, or fetch the pinned toolchain (scripts/fetch-rocm-sdk.sh)"; exit 1; }
+# The gfx device library (the amdgcn bitcode) is inside the SDK's pip tree, not under <root>/lib, in
+# the 2026-10-31 layout: without --rocm-device-lib-path hipcc dies with "cannot find ROCm device
+# library", and the build then needs no HIP_DEVICE_LIB_PATH (engine#713).
+device_lib=
+for d in "$rocm" $rocm/lib/python3*/site-packages/_rocm_sdk_core; do
+    [ -d "$d/lib/llvm/amdgcn/bitcode" ] && { device_lib=$d/lib/llvm/amdgcn/bitcode; break; }
+done
+device_lib_flag=
+[ -n "$device_lib" ] && device_lib_flag=" --rocm-device-lib-path=$device_lib"
 # -isystem: clang otherwise appends the ROCm include directory after /usr/include,
 # so a distro HIP there (another version) shadows this one and the build fails
-cflags="-O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=${ROCM_ARCH:-gfx1151} -isystem $rocm/include"
+cflags="-O3 -ffast-math -g -fno-finite-math-only -pthread -D__HIP_PLATFORM_AMD__ -Wno-unused-command-line-argument --offload-arch=${ROCM_ARCH:-gfx1151} -isystem $rocm/include$device_lib_flag"
 libs="-L$rocm/lib -Wl,-rpath,$rocm/lib -lm -pthread -lhipblas -lhipblaslt -lrocblas"
 (cd "$work" && ROCM_PATH=$rocm HIP_PATH=$rocm make -j"$jobs" strix-halo \
     HIPCC="$rocm/bin/hipcc" ROCM_CFLAGS="$cflags" ROCM_LDLIBS="$libs")

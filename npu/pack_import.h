@@ -46,6 +46,15 @@ inline bool ext_range_ok(uint64_t size, uint64_t offset, uint64_t length) {
     return offset <= size && length <= size - offset;
 }
 
+// a*b without wrapping. Every read whose length comes from the file's own metadata (a shape product, N*K/block,
+// N*(K/block)*block/2) is computed through this, so a crafted model.onnx cannot wrap a length into a small
+// allocation and then fill it with the declared count.
+inline bool mul_ok(uint64_t a, uint64_t b, uint64_t& out) {
+    if (a != 0 && b > UINT64_MAX / a) return false;
+    out = a * b;
+    return true;
+}
+
 // The model geometry the container's config.json needs.
 struct Dims {
     int hidden = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, intermediate = 0, vocab = 0;

@@ -64,6 +64,14 @@ void test_bounds() {
     check(pi::ext_range_ok(size, size, 0), "bounds: the empty range at EOF is in range");
     check(!pi::ext_range_ok(size, size - 1, 2), "bounds: one byte past the end is refused");
     check(!pi::ext_range_ok(size, size + 1, 0), "bounds: an offset one past the end is refused");
+
+    // a length is only honoured when the product that produced it cannot wrap (the readers' second gate)
+    uint64_t out = 0;
+    check(!pi::mul_ok(UINT64_MAX, 2, out), "lengths: UINT64_MAX * 2 is refused, not wrapped");
+    check(!pi::mul_ok(UINT64_MAX, UINT64_MAX, out), "lengths: a 64x64 square that overflows is refused");
+    check(pi::mul_ok(0, UINT64_MAX, out) && out == 0, "lengths: 0 * anything is 0");
+    check(pi::mul_ok(1ULL << 32, 4, out) && out == (1ULL << 34), "lengths: a product that fits is exact");
+    check(pi::mul_ok(uint64_t(151936), 7, out) && out == 1063552, "lengths: the head's own N*groups is exact");
 }
 
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────

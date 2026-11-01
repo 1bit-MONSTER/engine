@@ -727,6 +727,12 @@ struct Writer {
     }
 };
 
+// one dim of a protobuf shape as a usable count: positive and not absurd
+uint64_t dim_count(const std::string& what, int64_t v) {
+    if (v <= 0) throw std::runtime_error(what + ": dimension " + std::to_string(v) + " is not positive");
+    return uint64_t(v);
+}
+
 std::vector<uint8_t> as_bf16(const uint8_t* src, int type, size_t count) {
     std::vector<uint8_t> out(count * 2);
     auto* d = reinterpret_cast<uint16_t*>(out.data());
@@ -797,12 +803,27 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         ext[t.location] = m;
         ext_size[t.location] = size;
     }
-    auto bytes_of = [&](const OnnxTensor& t) -> const uint8_t* {
-        if (t.raw) return t.raw;
+    // Every read below takes its *length* from the file's own declared metadata (protobuf dims, the node's
+    // N/K/block), so a length is only honoured when it is proved to lie inside the tensor. bytes_of(t, need)
+    // is the single gate: `need` is computed through mul_ok so the multiply cannot wrap, and it must fit in
+    // what the tensor actually carries (raw_len for an embedded tensor, its data_offsets span for external
+    // data). A blanket product(dims) == length check is not the rule: 4-bit packed weights deliberately do
+    // not satisfy it, so each call site states what it reads -- and `need` has no default, so a reader added
+    // later cannot opt out of the check by omitting it.
+    auto bytes_of = [&](const OnnxTensor& t, uint64_t need) -> const uint8_t* {
+        if (t.raw) {
+            if (need > t.raw_len)
+                throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, carries " +
+                                         std::to_string(t.raw_len));
+            return t.raw;
+        }
         const auto it = ext.find(t.location);
         if (it == ext.end()) throw std::runtime_error(t.name + ": no data");
         if (!ext_range_ok(ext_size[t.location], t.offset, t.length))
             throw std::runtime_error(t.name + ": external data past the end of " + t.location);
+        if (need > t.length)
+            throw std::runtime_error(t.name + ": needs " + std::to_string(need) + " B, declares " +
+                                     std::to_string(t.length) + " in " + t.location);
         return it->second + t.offset;
     };
 
@@ -814,9 +835,17 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     for (const auto& t : onnx.tensors)
         if (t.name == "model.embed_tokens.weight") embed = &t;
     if (!embed) throw std::runtime_error("no model.embed_tokens.weight");
+    if (embed->dims.size() != 2) throw std::runtime_error("model.embed_tokens.weight is not 2-D");
     const int64_t V = embed->dims.at(0), H = embed->dims.at(1);
-    const uint8_t* embed_bytes = bytes_of(*embed);
-    w.add("model.embed_tokens.weight", "BF16", {V, H}, as_bf16(embed_bytes, embed->type, size_t(V) * H));
+    const uint64_t Vc = dim_count("model.embed_tokens.weight", V), Hc = dim_count("model.embed_tokens.weight", H);
+    uint64_t elems = 0;
+    if (!mul_ok(Vc, Hc, elems)) throw std::runtime_error("model.embed_tokens.weight: V*H overflows");
+    const uint64_t src_width = embed->type == kF32 ? 4 : 2;
+    uint64_t embed_need = 0;
+    if (!mul_ok(elems, src_width, embed_need))
+        throw std::runtime_error("model.embed_tokens.weight: V*H*width overflows");
+    const uint8_t* embed_bytes = bytes_of(*embed, embed_need);
+    w.add("model.embed_tokens.weight", "BF16", {V, H}, as_bf16(embed_bytes, embed->type, size_t(elems)));
     ++r.tensors;
 
     for (const auto& mm : onnx.matmuls) {
@@ -828,15 +857,30 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         const auto zi = onnx.index.find(mm.zeros);
         const bool have_zp = zi != onnx.index.end();
 
-        std::vector<float> scales(size_t(mm.N) * (size_t(mm.K) / mm.block));
-        if (st.type == kF32) std::memcpy(scales.data(), bytes_of(st), scales.size() * 4);
+        if (mm.N <= 0 || mm.K <= 0 || mm.block <= 0 || mm.K % mm.block)
+            throw std::runtime_error("lm_head: bad MatMulNBits geometry N=" + std::to_string(mm.N) +
+                                     " K=" + std::to_string(mm.K) + " block=" + std::to_string(mm.block));
+        const uint64_t groups = uint64_t(mm.K) / uint64_t(mm.block);
+        const uint64_t nrows = uint64_t(mm.N);
+        uint64_t groups_n = 0;   // N * K/block
+        if (!mul_ok(nrows, groups, groups_n)) throw std::runtime_error("lm_head: N*K/block overflows");
+        std::vector<float> scales(static_cast<std::vector<float>::size_type>(groups_n));
+        const uint64_t scale_width = st.type == kF32 ? 4 : 2;
+        uint64_t scales_need = 0;
+        if (!mul_ok(groups_n, scale_width, scales_need))
+            throw std::runtime_error("lm_head: scales length overflows");
+        if (st.type == kF32) std::memcpy(scales.data(), bytes_of(st, scales_need), scales.size() * 4);
         else {
-            const auto b = as_bf16(bytes_of(st), st.type, scales.size());
+            const auto b = as_bf16(bytes_of(st, scales_need), st.type, scales.size());
             const auto* d = reinterpret_cast<const uint16_t*>(b.data());
             for (size_t i = 0; i < scales.size(); ++i) scales[i] = bf16_to_f32(d[i]);
         }
-        const uint8_t* zp = have_zp ? bytes_of(onnx.tensors[zi->second]) : nullptr;
-        const Q4 q = decode_matmulnbits(bytes_of(wt), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
+        uint64_t zp_need = 0;   // one nibble per (row, group)
+        if (!mul_ok(nrows, (groups + 1) / 2, zp_need)) throw std::runtime_error("lm_head: qzeros length overflows");
+        const uint8_t* zp = have_zp ? bytes_of(onnx.tensors[zi->second], zp_need) : nullptr;
+        uint64_t qw_need = 0;   // N * K/block * block/2
+        if (!mul_ok(groups_n, uint64_t(mm.block) / 2, qw_need)) throw std::runtime_error("lm_head: qweight length overflows");
+        const Q4 q = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K), mm.block);
 
         std::vector<uint8_t> tiled;
         long long zinexact = 0;
@@ -866,9 +910,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 }
             r.lmhead_rel = sum_abs / sum_ref;
             r.lmhead_corr = corr(q, embed_bytes, int(H), q.N);
-            const Q4 swap = decode_matmulnbits(bytes_of(wt), scales.data(), zp, int(mm.N), int(mm.K),
+            const Q4 swap = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), zp, int(mm.N), int(mm.K),
                                                mm.block, /*swap_nibbles*/ true, false);
-            const Q4 nozp = decode_matmulnbits(bytes_of(wt), scales.data(), nullptr, int(mm.N), int(mm.K),
+            const Q4 nozp = decode_matmulnbits(bytes_of(wt, qw_need), scales.data(), nullptr, int(mm.N), int(mm.K),
                                                mm.block, false, /*drop_zero*/ true);
             r.ctrl_corr_nibble = corr(swap, embed_bytes, int(H), 2048);
             r.ctrl_corr_nozp = corr(nozp, embed_bytes, int(H), 2048);

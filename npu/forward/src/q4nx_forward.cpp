@@ -1754,6 +1754,21 @@ int32_t Q4nxNpuForward::m16_check_gemm(I8Ctx& ref, I8Ctx& fast, const float* A, 
     }
     ref.wait_kernel(r);
     ref.readback();
+    // engine#666: a short read of the REFERENCE row would look like a kernel mismatch and be blamed on the
+    // M=16 twin. Re-issue the reference once before comparing.
+    if (ref.canary_short()) {
+        ref.canary_retries_++;
+        if (wbo) {
+            r = ref.launch_async_with_bo(*wbo, A, 1, K, as);
+        } else {
+            float s = 1.0f;
+            ref.packB(0, Bmat, K, N, s);
+            ref.quantize_async(A, 1, K, as);
+            r = ref.sync_and_launch(0);
+        }
+        ref.wait_kernel(r);
+        ref.readback();
+    }
     int32_t maxd = 0;
     long nmis = 0;
     for (int n = 0; n < N; n++) {
@@ -1781,6 +1796,13 @@ int32_t Q4nxNpuForward::m16_check_gemm_rows(I8Ctx& ref, I8Ctx& fast, const float
                      : ref.launch_async_rows(0, A, M, K, ascales.data());
     ref.wait_kernel(r);
     ref.readback();
+    if (ref.canary_short()) {   // engine#666, same reasoning as m16_check_gemm
+        ref.canary_retries_++;
+        r = wbo ? ref.launch_async_with_bo_rows(*wbo, A, M, K, ascales.data())
+                : ref.launch_async_rows(0, A, M, K, ascales.data());
+        ref.wait_kernel(r);
+        ref.readback();
+    }
     int32_t maxd = 0;
     long nmis = 0;
     for (int m = 0; m < M; m++) {
@@ -1931,17 +1953,36 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
     }
 
     const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    xrt::run r = slot ? kctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
-                      : kctx.sync_and_launch(0);
+    auto issue = [&]() -> xrt::run {
+        return slot ? kctx.launch_async_with_bo(*slot->bo, A, 1, K, as)
+                    : kctx.sync_and_launch(0);
+    };
+    xrt::run r = issue();
     const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     kctx.wait_kernel(r);
     const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     kctx.readback();
+    // engine#666: the row about to be dequantised is still the poison the launch was supposed to overwrite,
+    // so the writes are not in memory after the invalidate. Re-issue this launch once and read again, rather
+    // than silently pushing zeros into the layer. The retry is counted and reported (NPU_CANARY_STATS=1).
+    if (kctx.canary_short()) {
+        kctx.canary_retries_++;
+        r = issue();
+        kctx.wait_kernel(r);
+        kctx.readback();
+        if (phprof_on()) g_ph.h_rb += 0.0;   // the retry's cost is already inside the readback timer below
+    }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     out.resize((size_t)N);
     for (int n = 0; n < N; n++)
         out[(size_t)n] = (float)kctx.Cm[n] * as * (*gs)[(size_t)n];
+
+    if (kctx.canary_short()) {
+        // twice in a row: say so, loudly, and keep going -- an empty row here is a wrong activation either way
+        fprintf(stderr, "[canary] SHORT RESULT twice: role K=%d N=%d layer=%d short=%d retries=%ld\n",
+                K, N, cur_layer_, kctx.short_row_, kctx.canary_retries_);
+    }
 
     if (m16_check_ && &kctx != &ctx)
         m16_check_gemm(ctx, kctx, A, K, N, Bmat, slot ? slot->bo.get() : nullptr, as);
@@ -2014,13 +2055,24 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
         gs = &kctx.group_scales[0];
     }
     const auto tl = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
-    xrt::run r = slot
-                     ? kctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
-                     : kctx.launch_async_rows(0, A, M, K, ascales.data());
+    auto issue = [&]() -> xrt::run {
+        return slot ? kctx.launch_async_with_bo_rows(*slot->bo, A, M, K, ascales.data())
+                    : kctx.launch_async_rows(0, A, M, K, ascales.data());
+    };
+    xrt::run r = issue();
     const auto tq = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     kctx.wait_kernel(r);
     const auto tw = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     kctx.readback();
+    if (kctx.canary_short()) {   // engine#666: re-issue once rather than dequantise an unwritten row
+        kctx.canary_retries_++;
+        r = issue();
+        kctx.wait_kernel(r);
+        kctx.readback();
+        if (kctx.canary_short())
+            fprintf(stderr, "[canary] SHORT RESULT (rows) twice: M=%d K=%d N=%d layer=%d short=%d\n",
+                    M, K, N, cur_layer_, kctx.short_row_);
+    }
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
     out.resize((size_t)M * N);
     for (int m = 0; m < M; m++) {
@@ -3495,7 +3547,7 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
         float amax = 0.0f;
         for (int k = 0; k < H; k++) { float a = std::fabs(hs[(size_t)k]); if (a > amax) amax = a; }
         const float as = amax > 0 ? amax / 127.0f : 1.0f;
-        xrt::run r = [&]() -> xrt::run {
+        auto issue = [&]() -> xrt::run {
             if (head_packed)
                 return lctx.launch_async_with_bo(*lm_head_packed_[(size_t)t].bo,
                                                  hs.data(), 1, H, as);
@@ -3503,11 +3555,20 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             lctx.packB(0, Bt.data(), H, T, sout);
             lctx.quantize_async(hs.data(), 1, H, as);
             return lctx.sync_and_launch(0);
-        }();
+        };
+        xrt::run r = issue();
         const auto h1 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         lctx.wait_kernel(r);
         const auto h2 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         lctx.readback();
+        if (lctx.canary_short()) {   // engine#666: the head tile's row is not in memory; re-issue once
+            lctx.canary_retries_++;
+            r = issue();
+            lctx.wait_kernel(r);
+            lctx.readback();
+            if (lctx.canary_short())
+                fprintf(stderr, "[canary] SHORT RESULT (head) twice: tile=%d T=%d short=%d\n", t, T, lctx.short_row_);
+        }
         const auto h3 = prof_ ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
         const std::vector<float>& gs = head_packed ? lm_head_packed_[(size_t)t].scales
                                                    : lctx.group_scales[0];

@@ -37,11 +37,24 @@ set -euo pipefail
 [ $# -ge 3 ] || { sed -n '/^# build.sh/,/^# Inside the container/p' "$0" | sed 's/^# \{0,1\}//'; exit 1; }
 compat=$1 kernel=$2 out=$3
 woof=${4:-/tmp/woof-ce}
-# The build tree must live on a real filesystem: 3builddistro mounts an overlay for its petbuild chroots,
-# and overlay-on-overlay is refused (measured: "mount: ... bad superblock on petbuild", then the chroot has
-# no bash and the build stops at busybox). A container's own rootfs is overlay, so the build root is a
-# host directory bind-mounted in.
-build_root=${BUILD_ROOT:-$(mktemp -d /tmp/1bit-puppy-build.XXXXXX)}
+# The build tree must live on a real filesystem that allows device nodes, for two measured reasons:
+#   * 3builddistro mounts an overlay for its petbuild chroots and overlay-on-overlay is refused ("mount:
+#     ... bad superblock on petbuild", the chroot has no bash, the build stops at busybox) - a container's
+#     own rootfs is overlay, so the build root is a host directory bind-mounted in;
+#   * debootstrap refuses a target on a nodev mount ("cannot create ... test-dev-null ... mounted with
+#     noexec or nodev"), and /tmp on this box is exactly that: tmpfs, nodev.
+# So the default is under $HOME on the root filesystem, and a build root that cannot host the build is
+# refused before 20 minutes of downloads.
+build_root=${BUILD_ROOT:-$HOME/wt/1bit-puppy-build}
+mkdir -p "$build_root"; build_root=$(cd "$build_root" && pwd)
+mnt_opts=$(findmnt -T "$build_root" -no OPTIONS 2>/dev/null || true)
+case ",$mnt_opts," in
+*,nodev,* | *,noexec,*)
+    printf 'build: REFUSED: %s is mounted %s; the build needs device nodes and executables there\n' \
+        "$build_root" "$mnt_opts" >&2
+    exit 1
+    ;;
+esac
 [ -f "$woof/merge2out" ] || { echo "build: no woof-CE at $woof" >&2; exit 1; }
 kernel=$(cd "$kernel" && pwd)
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
@@ -50,9 +63,7 @@ mkdir -p "$out"; out=$(cd "$out" && pwd)
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
-mkdir -p "$build_root"
-build_root=$(cd "$build_root" && pwd)
-echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root"
+echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '

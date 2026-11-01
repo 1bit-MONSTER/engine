@@ -184,7 +184,8 @@ Attempts on 2026-11-01, in order, each one a measured trap:
 | 3 | `merge2out`, "Press ENTER to continue" | `</dev/null` on a `yes "" \| ./merge2out` pipeline **discards the pipe** | drop the redirect; let `yes` feed it |
 | 4 | right after `merge2out`, no error | `set -o pipefail` + `yes \| merge2out`: when `merge2out` exits, `yes` gets SIGPIPE and the pipeline's status kills the build | `set +o pipefail` around that line |
 | 5 | `3builddistro` → petbuild `busybox`: `chroot: failed to run command 'bash': No such file or directory` | the petbuild chroot is an **overlay mount**, and inside Docker the upper/work dirs sit on Docker's overlay rootfs — the kernel refuses it: `mount: ... bad superblock on petbuild`, so the rootfs is empty | build in a **host bind mount** (`BUILD_ROOT`, `/work`), not in the container's rootfs |
-| 6 | running | — | — |
+| 6 | `3builddistro` → debootstrap of the `bdrv`: `cannot create … test-dev-null: Permission denied`, "mounted with noexec or nodev" | the petbuild overlay fix moved the build root to `/tmp`, and **`/tmp` here is tmpfs, `nodev`** — debootstrap needs a usable device node in its target | default `BUILD_ROOT` to `$HOME/wt/1bit-puppy-build` (ext4) and **refuse a nodev/noexec build root up front** |
+| 7 | running | — | — |
 
 Attempt 5 is the informative one: `0setup` ✓, `1download` ✓ (the 26.04 package set, 37k log lines),
 `2createpackages` ✓, then the petbuild stage. So the recipe is proven through package creation and the

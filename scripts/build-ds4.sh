@@ -32,6 +32,26 @@ prefix=$(cd "$prefix" && pwd)
 
 [ -f "$src/ds4_server.c" ] || { echo "third_party/ds4 is empty: git submodule update --init third_party/ds4"; exit 1; }
 
+out=$prefix/$backend
+# Reuse a ds4-server already staged at the prefix, unless DS4_REBUILD=1 asks for a fresh build. A CMake
+# custom target always runs its command, so on a box whose ROCm cannot compile these kernels (the
+# 2026-10-31 rebuild: no hipCUB/rocPRIM/rocWMMA headers) an already-present binary built from this pin
+# turned into a hard build failure for the whole engine - `1bit` depends on this target. Checked before
+# the ROCm lookup and before make, so the reuse works on a box with no usable hipcc at all.
+# The pin is printed so the record says what the binary is.
+# All three binaries, and the pin the staged ones were built from (`ds4.pin`, written below). `$src`'s HEAD is the
+# pin of the tree being built *today*, not of the binary that is already there, so the two are compared rather than
+# printed as if they were the same fact (the same defect #720 fixed for hrx-system).
+if [ "${DS4_REBUILD:-0}" != 1 ] && [ -x "$out/ds4-server" ] && [ -x "$out/ds4" ] && [ -x "$out/ds4-bench" ]; then
+    staged=$(cat "$out/ds4.pin" 2>/dev/null || echo unknown)
+    now=$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+    if [ "$staged" = "$now" ]; then
+        echo "DwarfStar ($backend, $staged): reusing $out/ds4-server"
+        exit 0
+    fi
+    echo "DwarfStar: staged $staged differs from pin $now - rebuilding"
+fi
+
 work=$prefix/src/$backend
 mkdir -p "$work"
 # copy the tree, keeping objects from an earlier build of the same backend
@@ -56,8 +76,8 @@ if [ "${DS4_TEST:-0}" = 1 ]; then
         HIPCC="$rocm/bin/hipcc" ROCM_CFLAGS="$cflags" ROCM_LDLIBS="$libs")
 fi
 
-out=$prefix/$backend
 mkdir -p "$out"
 for b in ds4-server ds4 ds4-bench; do cp "$work/$b" "$out/$b"; done
 commit=$(git -C "$src" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)
+echo "$commit" > "$out/ds4.pin"
 echo "DwarfStar ($backend, $commit): $out/ds4-server"

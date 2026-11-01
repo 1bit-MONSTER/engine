@@ -17,7 +17,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
+    "llama.cpp": "4a58da9b087d23ac3596b35e58f3e69e29cd9f4b"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -40,7 +40,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
+    "llama.cpp": "4a58da9b087d23ac3596b35e58f3e69e29cd9f4b"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -63,7 +63,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
+    "llama.cpp": "4a58da9b087d23ac3596b35e58f3e69e29cd9f4b"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -86,7 +86,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
+    "llama.cpp": "4a58da9b087d23ac3596b35e58f3e69e29cd9f4b"
    },
    "text": {
     "file": "wiki.test.raw",
@@ -109,7 +109,7 @@
    },
    "recorded_at": {
     "hrx-system": "82804197bcbe060b1371d6548337fdc842034cdd",
-    "llama.cpp": "e7e5cd08f9bb9d4b7dcf9d25f8fcce5a036358a6"
+    "llama.cpp": "4a58da9b087d23ac3596b35e58f3e69e29cd9f4b"
    },
    "text": {
     "file": "wiki.test.raw",

@@ -61,4 +61,11 @@ fi
 LIBHSA=${HL_LIBHSA:-/opt/rocm-therock/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1}
 export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-$LIBHSA}
 
+# The nightly libhsa page-faults on an HRX allocation unless SVM is off (engine #715), so every HRX
+# launch on this box carries these three. Defaulted, not forced: a candidate that wants SVM back can
+# still set them, and the run records whichever value was in force.
+export HSA_USE_SVM=${HSA_USE_SVM:-0}
+export HSA_USERPTR_FOR_PAGED_MEM=${HSA_USERPTR_FOR_PAGED_MEM:-0}
+export HRX_ALLOW_NO_SVM=${HRX_ALLOW_NO_SVM:-1}
+
 exec "$GPU_HOLD" -l hyperloom -t "$HOLD_MIN" -- python3 "$HERE/benchmark.py"

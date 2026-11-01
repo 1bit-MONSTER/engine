@@ -112,16 +112,132 @@ model=$(cat "$sys/device/model" 2>/dev/null | tr -s ' ' | sed 's/^ //;s/ $//')
 [ -n "$model" ] || model="(no model reported)"
 bytes=$(blockdev --getsize64 "$DEV" 2>/dev/null || echo 0)
 gb=$((bytes / 1000000000))
+
+# --- the install screen (#710) -----------------------------------------------------------------------
+# The owner, after the first real install: "During the install you need to give the client visual feedback
+# of the entire install." Everything below runs through this screen: one line per step, listed up front,
+# flipping from pending to running to done with its elapsed time, and on to the next one as it happens. The
+# same lines go to ttyS0 (the QEMU install gate reads them) and to /data/install.log on the stick and, once
+# it is mounted, on the new disk. A failure stops on the step that failed, with the command's own output -
+# never a bare exit, and never a screen that looks the same whether it is working or stuck.
+ESC=$(printf '\033')
+SCREEN=/dev/tty1
+LOG=/data/install.log
+STEPS=/tmp/install-steps
+STEP_TOTAL=0
+STEP_T0=0
+
+log() { echo "$*" >> "$LOG" 2>/dev/null; [ -w /dev/ttyS0 ] && echo "$*" > /dev/ttyS0 2>/dev/null; return 0; }
+screen() { [ -w "$SCREEN" ] && printf '%s\n' "$*" > "$SCREEN" 2>/dev/null; return 0; }
+
+steps_add() {   # <title>: a pending step, drawn on the screen below the header
+    STEP_TOTAL=$((STEP_TOTAL + 1))
+    echo "$STEP_TOTAL|pending|$1" >> "$STEPS"
+}
+
+steps_draw() {  # the header and the pending list, then remember where the list starts
+    [ -w "$SCREEN" ] || return 0
+    printf '%s[H%s[J' "$ESC" "$ESC" > "$SCREEN"
+    {
+        echo "  1bit OS install"
+        echo "  target : $DEV  ($model, ${gb} GB)"
+        echo "  layout : GPT - partition 1 = ${ESP_MB} MB EFI system partition ($ESP_LABEL), the rest = ext4 ($DATA_LABEL)"
+        echo "  source : this live boot (the ESP it booted from, and its /data)"
+        echo
+    } >> "$SCREEN"
+    printf '%s7' "$ESC" > "$SCREEN"          # DECSC: the cursor stays at the first step row
+    while IFS='|' read -r n st title; do screen "  [ ] $title"; done < "$STEPS"
+}
+
+step_line() {   # <n> <marker> <text>: rewrite one step's row in place
+    [ -w "$SCREEN" ] || return 0
+    printf '%s8' "$ESC" > "$SCREEN"          # DECRC: back to the first step row
+    i=1
+    while [ "$i" -lt "$1" ]; do printf '%s[B' "$ESC" > "$SCREEN"; i=$((i + 1)); done
+    printf '\r  %s %s%s[K' "$2" "$3" "$ESC" > "$SCREEN"
+    printf '%s8' "$ESC" > "$SCREEN"
+}
+
+step_begin() {  # <n>: the step is running; its start time goes in STEP_T0
+    step_title=$(sed -n "s/^$1|pending|//p" "$STEPS")
+    sed -i "s/^$1|pending|/$1|running|/" "$STEPS"
+    step_line "$1" "[..]" "$step_title"
+    log "  [$1] running: $step_title"
+    STEP_T0=$(date +%s)
+}
+
+step_end() {    # <n> [OK|FAILED] [extra]
+    step_state=OK
+    [ "$#" -ge 2 ] && step_state=$2
+    step_extra=
+    [ "$#" -ge 3 ] && step_extra=$3
+    step_title=$(sed -n "s/^$1|running|//p" "$STEPS")
+    sed -i "s/^$1|running|/$1|$step_state|/" "$STEPS"
+    el=$(( $(date +%s) - STEP_T0 ))
+    if [ "$step_state" = OK ]; then
+        step_line "$1" "[ok]" "$step_title  (${el}s${step_extra:+ $step_extra})"
+        log "  [$1] done in ${el}s: $step_title${step_extra:+ $step_extra}"
+    else
+        step_line "$1" "[!!]" "$step_title  (${el}s)"
+        log "  [$1] FAILED after ${el}s: $step_title"
+    fi
+}
+
+fail() {        # <n> <why>: stop on the failing step, with the command's output, and do not touch it again
+    step_end "$1" FAILED
+    step_out=$(tail -n 12 /tmp/install-step.log 2>/dev/null)
+    log "  install stopped at step $1: $2"
+    [ -n "$step_out" ] && printf '%s\n' "$step_out" >> "$LOG" 2>/dev/null
+    screen ""
+    screen "  Install stopped at step $1: $2"
+    if [ -n "$step_out" ]; then
+        printf '%s\n' "$step_out" | while IFS= read -r l; do screen "    $l"; done
+    fi
+    screen ""
+    screen "  Nothing else was written; the disk is left as the failed step left it."
+    exit 3
+}
+
+run() {         # <n> <command...>: one step, its output kept, a failure stops the install
+    run_n=$1
+    shift
+    step_begin "$run_n"
+    if "$@" > /tmp/install-step.log 2>&1; then step_end "$run_n" OK
+    else fail "$run_n" "$*"; fi
+}
+
+copy_tree() {       # <n> <src-dir> <dst-dir>: copy a tree, showing MB copied / total, MB/s and ETA
+    cp_n=$1; cp_src=$2; cp_dst=$3
+    cp_total=$(du -sb "$cp_src" 2>/dev/null | cut -f1); cp_total=${cp_total:-0}
+    cp_tmb=$((cp_total / 1048576))
+    cp_t0=$(date +%s); cp_done=0; cp_rate=0
+    find "$cp_src" -type d > /tmp/install-dirs 2>/dev/null
+    while IFS= read -r d; do
+        mkdir -p "$cp_dst/${d#"$cp_src"}" || fail "$cp_n" "cannot create $cp_dst/${d#"$cp_src"}"
+    done < /tmp/install-dirs
+    find "$cp_src" \( -type f -o -type l \) > /tmp/install-files 2>/dev/null
+    while IFS= read -r f; do
+        rel=${f#"$cp_src"/}
+        cp -a "$f" "$cp_dst/$rel" 2>>/tmp/install-step.log || fail "$cp_n" "copying $rel failed"
+        [ -L "$f" ] || cp_done=$((cp_done + $(stat -c %s "$cp_dst/$rel" 2>/dev/null || echo 0)))
+        el=$(( $(date +%s) - cp_t0 )); [ "$el" -lt 1 ] && el=1
+        cp_mb=$((cp_done / 1048576))
+        cp_rate=$((cp_mb / el))
+        if [ "$cp_rate" -gt 0 ]; then cp_eta=$(( (cp_tmb - cp_mb) / cp_rate ))s; else cp_eta=unknown; fi
+        step_line "$cp_n" "[..]" "copying $cp_src -> $cp_dst: ${cp_mb}/${cp_tmb} MB, ${cp_rate} MB/s, ETA $cp_eta"
+    done < /tmp/install-files
+    rm -f /tmp/install-dirs /tmp/install-files
+    cp_summary="$cp_mb MB, ${cp_rate} MB/s"
+}
+
 echo "1bit OS install"
 echo "  target : $DEV  ($model, ${gb} GB)"
-echo "  layout : GPT - partition 1 = ${ESP_MB} MB EFI system partition ($ESP_LABEL), the rest = ext4 ($DATA_LABEL)"
-echo "  source : this live boot (the ESP it booted from, and its /data)"
 echo "  current contents of $DEV, about to be destroyed:"
 # sfdisk, not busybox fdisk: the image carries the real one for the layout, and it is the one tool here
 # that can read a GPT back (busybox fdisk is MBR-only and calls a GPT disk unrecognised)
 $SFDISK -l "$DEV" 2>/dev/null | sed 's/^/    /'
 echo
-echo "  Nothing is written for 10 seconds."
+echo "  Nothing is written for 10 seconds (Ctrl-C stops here, nothing has been touched)."
 i=10
 while [ "$i" -gt 0 ]; do
     printf '\r  starting in %2d s ' "$i"
@@ -135,60 +251,131 @@ esp=$(new_part "$DEV" 1)
 data=$(new_part "$DEV" 2)
 esp_mb=$ESP_MB
 
-# the same script mkimage.sh uses to build the live stick, so an installed disk and a stick are the
+: > "$STEPS"
+steps_add "target disk confirmed: $DEV ($model, ${gb} GB)"
+steps_add "partition table written (${esp_mb} MB ESP + $DATA_LABEL)"
+steps_add "ESP formatted ($ESP_LABEL, vfat)"
+steps_add "data partition formatted ($DATA_LABEL, ext4)"
+steps_add "boot files copied from the live stick"
+steps_add "boot files verified (sha256, read back from the disk)"
+steps_add "data partition filled from the live boot"
+steps_add ".installed and the key material carried over"
+steps_add "final verification (both partitions, read-only)"
+steps_draw
+
+# 1: nothing to do - the checks above decided it, and the screen says which disk it is
+step_begin 1
+step_end 1 OK
+
+# 2: the same script mkimage.sh uses to build the live stick, so an installed disk and a stick are the
 # same layout: 2048-sector start, EFI system partition, then the data partition filling the disk
-printf 'label: gpt\nstart=2048, size=%s, type=U, name="EFI"\ntype=L, name="%s"\n' \
-    $((esp_mb * 2048)) "$DATA_LABEL" | $SFDISK -q "$DEV" || { echo "1bit-install: sfdisk failed" >&2; exit 3; }
+run 2 sh -c "printf 'label: gpt\nstart=2048, size=%s, type=U, name=\"EFI\"\ntype=L, name=\"%s\"\n' $((esp_mb * 2048)) '$DATA_LABEL' | $SFDISK -q '$DEV'"
 
 # the kernel needs a moment to publish the new partitions
 i=0
 while [ ! -b "$esp" ] || [ ! -b "$data" ]; do
     i=$((i + 1))
-    [ "$i" -gt 20 ] && { echo "1bit-install: the kernel never published $esp / $data" >&2; exit 3; }
+    [ "$i" -gt 20 ] && fail 2 "the kernel never published $esp / $data"
     sleep 1
 done
 sleep 1
 
-mkdosfs -F 32 -n "$ESP_LABEL" "$esp" >/dev/null || { echo "1bit-install: mkdosfs failed" >&2; exit 3; }
-$MKE2FS -q -t ext4 -L "$DATA_LABEL" "$data" || { echo "1bit-install: mke2fs failed" >&2; exit 3; }
+run 3 mkdosfs -F 32 -n "$ESP_LABEL" "$esp"
+run 4 sh -c "$MKE2FS -q -t ext4 -L '$DATA_LABEL' '$data'"
 
 mkdir -p /tmp/install/esp /tmp/install/data /tmp/install/live-esp
 [ -n "$live_esp" ] || live_esp=$(findfs LABEL=$ESP_LABEL 2>/dev/null || true)   # fallback: no /data mount
-mount -t vfat "$esp" /tmp/install/esp || { echo "1bit-install: cannot mount the new ESP" >&2; exit 3; }
+run 5 sh -c "mount -t vfat '$esp' /tmp/install/esp && mount -t vfat -o ro '$live_esp' /tmp/install/live-esp && cp -a /tmp/install/live-esp/. /tmp/install/esp/"
+# the ESP copy is read back from the disk itself: a boot chain that is not byte-identical is not a boot
+# chain that boots, and this is the step that would have caught a truncated kernel or initramfs
+step_begin 6
+ver_bad=0
+for f in EFI/BOOT/BOOTX64.EFI EFI/BOOT/grubx64.efi EFI/BOOT/grub.cfg 1bit/vmlinuz 1bit/initramfs.img; do
+    [ -e "/tmp/install/live-esp/$f" ] || continue
+    a=$(sha256sum "/tmp/install/live-esp/$f" 2>/dev/null | cut -d' ' -f1)
+    b=$(sha256sum "/tmp/install/esp/$f" 2>/dev/null | cut -d' ' -f1)
+    if [ -z "$a" ] || [ "$a" != "$b" ]; then
+        echo "sha256 mismatch on $f: source ${a:-missing}, written ${b:-missing}" >> /tmp/install-step.log
+        ver_bad=$((ver_bad + 1))
+    else
+        log "    $f matches ($a)"
+    fi
+done
+[ "$ver_bad" = 0 ] || fail 6 "$ver_bad boot file(s) do not match the source"
+step_end 6 OK
 
-if [ -n "$live_esp" ] && mount -t vfat -o ro "$live_esp" /tmp/install/live-esp 2>/dev/null; then
-    # the files this boot came from: shim, grub, vmlinuz, initramfs, grub.cfg - the signed chain, byte
-    # for byte the same, which is why the MOK enrolment on the machine needs no change
-    cp -a /tmp/install/live-esp/. /tmp/install/esp/ || { echo "1bit-install: copying the ESP failed" >&2; exit 3; }
-    umount /tmp/install/live-esp
-else
-    echo "1bit-install: the live ESP is not mountable; the installed disk would not boot" >&2
-    umount /tmp/install/esp
-    exit 3
-fi
+# 7: the data partition. The live ESP is unmounted here rather than earlier, because step 6 read from it.
+step_begin 7
 sync
-umount /tmp/install/esp || { echo "1bit-install: cannot flush the ESP" >&2; exit 3; }
-
-mount -t ext4 "$data" /tmp/install/data || { echo "1bit-install: cannot mount the new data partition" >&2; exit 3; }
+umount /tmp/install/live-esp 2>/dev/null || true
+umount /tmp/install/esp 2>/dev/null || fail 7 "cannot flush the new ESP"
+mount -t ext4 "$data" /tmp/install/data || fail 7 "cannot mount the new data partition"
 if grep -q " /data " /proc/mounts; then
-    # models, Lemonade's backends/config/cache, the SSH keys, the NPU kernel sets: the appliance that
-    # the machine already knows, moved to the disk
-    cp -a /data/. /tmp/install/data/ || { echo "1bit-install: copying /data failed" >&2; exit 3; }
-    echo "1bit-install: copied /data ($(du -sh /data 2>/dev/null | cut -f1)) onto the disk"
+    # models, Lemonade's backends/config/cache, the SSH keys, the NPU kernel sets: the appliance the
+    # machine already knows, moved to the disk - with progress, because this is the long step
+    copy_tree 7 /data /tmp/install/data
+    log "  install: copied /data ($(du -sh /data 2>/dev/null | cut -f1)) onto the disk"
+    step_end 7 OK "$cp_summary"
 else
-    echo "1bit-install: no /data on this boot; the installed disk gets an empty data partition"
+    log "  install: no /data on this boot; the installed disk gets an empty data partition"
+    step_end 7 OK "no /data on this boot"
 fi
-# this is what makes the next boot say INSTALLED instead of LIVE (os/mini/init.sh)
+
+# 8: this is what makes the next boot say INSTALLED instead of LIVE (os/mini/init.sh). The key material
+# travels inside /data, so the step checks it arrived rather than assuming it did.
+step_begin 8
 : > /tmp/install/data/.installed
+if [ -f /data/lemonade/lemond.conf ] && [ ! -f /tmp/install/data/lemonade/lemond.conf ]; then
+    echo "lemonade/lemond.conf did not arrive on the new data partition" >> /tmp/install-step.log
+    fail 8 "the Lemonade configuration did not arrive on the new data partition"
+fi
+cp -a "$LOG" /tmp/install/data/install.log 2>/dev/null
+if [ -f /data/ssh/authorized_keys ]; then
+    [ -s /tmp/install/data/ssh/authorized_keys ] || fail 8 "the SSH keys did not arrive on the new data partition"
+    log "    ssh keys carried over ($(grep -c . /tmp/install/data/ssh/authorized_keys) key lines)"
+fi
+step_end 8 OK
+
+# 9: both partitions, read-only, the way the firmware will see them
+step_begin 9
 sync
-umount /tmp/install/data || { echo "1bit-install: cannot flush the data partition" >&2; exit 3; }
+umount /tmp/install/data 2>/dev/null || fail 9 "cannot flush the new data partition"
+mkdir -p /tmp/install/esp-ro /tmp/install/data-ro
+mount -t vfat -o ro "$esp" /tmp/install/esp-ro || fail 9 "cannot mount the new ESP read-only"
+mount -t ext4 -o ro "$data" /tmp/install/data-ro || fail 9 "cannot mount the new data partition read-only"
+log "    ESP: $(find /tmp/install/esp-ro -type f 2>/dev/null | wc -l) files, data: $(find /tmp/install/data-ro -maxdepth 1 2>/dev/null | wc -l) entries"
+for f in EFI/BOOT/BOOTX64.EFI 1bit/vmlinuz 1bit/initramfs.img; do
+    [ -e "/tmp/install/esp-ro/$f" ] && log "    $f $(sha256sum "/tmp/install/esp-ro/$f" | cut -d' ' -f1)"
+done
+[ -e /tmp/install/data-ro/.installed ] || fail 9 ".installed is missing on the new data partition"
+umount /tmp/install/esp-ro 2>/dev/null || true
+umount /tmp/install/data-ro 2>/dev/null || true
+step_end 9 OK
 
 echo
 echo "1bit OS is installed on $DEV."
 echo "  partition 1: $esp  ${esp_mb} MB, EFI system partition ($ESP_LABEL) - shim, grub, vmlinuz, initramfs, grub.cfg"
 echo "  partition 2: $data  ext4, $DATA_LABEL - the models, backends, configuration and keys"
 echo
-echo "  Next: power off, remove the stick, and boot the machine from this disk."
-echo "  If the firmware asks, its boot entry for this disk should point at \\\\EFI\\\\BOOT\\\\BOOTX64.EFI."
 echo "  Secure Boot needs no change: the kernel and initramfs are the same MOK-signed files the stick booted."
 echo "  To get back to the live stick, boot the stick again - the installed disk is not touched by it."
+log "  install complete: 1bit OS is installed on $DEV ($esp, $data)"
+
+# #710: the machine reboots itself into the installed system, after saying so. Driven from a script (the
+# QEMU install gate) the reboot is skipped: 1BIT_INSTALL_NO_REBOOT=1, or no terminal on the console.
+if [ "${1BIT_INSTALL_NO_REBOOT:-0}" = 1 ] || [ ! -e "$SCREEN" ]; then
+    echo "  Remove the stick and boot the machine from this disk (no automatic reboot in this session)."
+    exit 0
+fi
+i=10
+while [ "$i" -gt 0 ]; do
+    printf '\r  Install complete - remove the stick; rebooting into the installed system in %2d s ' "$i"
+    screen "  Install complete - remove the stick; rebooting into the installed system in ${i} s"
+    sleep 1
+    i=$((i - 1))
+done
+printf '\r  rebooting now\n'
+screen "  rebooting now"
+sync
+reboot -f 2>/dev/null || poweroff -f
+exit 0

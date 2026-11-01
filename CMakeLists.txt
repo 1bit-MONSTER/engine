@@ -327,7 +327,7 @@ option(ONEBIT_NPU_HOST "Build the NPU host library and its tests" ${_onebit_npu_
 if(ONEBIT_NPU_HOST)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(PCRE2 REQUIRED IMPORTED_TARGET libpcre2-8)
-add_library(onebit_npu STATIC npu/file_map.cpp npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/private_route.cpp npu/q4nx.cpp
+add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_elf.cpp npu/model.cpp npu/pack.cpp npu/private_route.cpp npu/q4nx.cpp
                             npu/tokenizer.cpp)
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
@@ -508,6 +508,11 @@ add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
 add_executable(npu_pack_test tests/npu_pack_test.cpp)
+add_executable(flm_head_import tools/flm_head_import.cpp)
+target_link_libraries(flm_head_import PRIVATE onebit_npu)
+add_executable(npu_flm_head_import_test tests/npu_flm_head_import_test.cpp)
+target_link_libraries(npu_flm_head_import_test PRIVATE onebit_npu)
+add_test(NAME npu_flm_head_import COMMAND npu_flm_head_import_test ${CMAKE_SOURCE_DIR}/tests/golden/flm-i8)
 target_link_libraries(npu_pack_test PRIVATE onebit_npu)
 
 # The device weight layout contract (q4nx_weight_layout): pure index math, no device

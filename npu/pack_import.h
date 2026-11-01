@@ -54,6 +54,12 @@ struct Planned {
     std::string dtype;    // "q4_1" tiles, or "BF16"
     std::vector<int64_t> shape;
     std::string refusal;  // empty when importable; otherwise the named reason
+    // What the pack's own cache/*_meta.json declares for this tensor (attrs N/K and the const
+    // tensor's byte size), when it declares it. The pack stating its own geometry is a stronger
+    // check on our plan than our own arithmetic, and it is what engine#734 needs to generalise
+    // the .fconst offsets beyond hidden 896.
+    int64_t declared_n = 0, declared_k = 0;
+    std::string declared_check;  // empty when it agrees, else what disagrees
 };
 
 struct Plan {

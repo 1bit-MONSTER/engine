@@ -289,6 +289,82 @@ Planned make(const std::string& name, const std::string& source, const std::stri
     return p;
 }
 
+
+// The pack's cache/*_meta.json (the JSON twin of the .meta protobuf) declares, per op, its attrs
+// N/K and every const tensor with dtype, shape and byte size. Reading it lets the plan check itself
+// against the vendor's own numbers instead of only against our arithmetic (engine#734).
+struct Declared {
+    int64_t n = 0, k = 0;      // from op attrs, per projection
+    int64_t bytes = 0;         // the preformat const tensor's size
+};
+using DeclaredMap = std::map<std::string, Declared>;
+
+// `/model/layers.7/attn/q_proj/MatMulNBits` -> `model.layers.7.self_attn.q_proj`
+std::string op_to_projection(const std::string& op) {
+    std::string s = op;
+    for (auto& c : s)
+        if (c == '/') c = '.';
+    while (!s.empty() && s.front() == '.') s.erase(s.begin());
+    if (s.size() > 12 && s.compare(s.size() - 12, 12, ".MatMulNBits") == 0) s.erase(s.size() - 12);
+    auto sub = [&](const char* from, const char* to) {
+        const auto p = s.find(from);
+        if (p != std::string::npos) s.replace(p, std::strlen(from), to);
+    };
+    sub(".attn.q_proj", ".self_attn.q_proj");
+    sub(".attn.k_proj", ".self_attn.k_proj");
+    sub(".attn.v_proj", ".self_attn.v_proj");
+    sub(".attn.o_proj", ".self_attn.o_proj");
+    sub(".mlp.", ".mlp.");
+    return s;
+}
+
+DeclaredMap read_declared(const std::string& pack_dir) {
+    DeclaredMap out;
+    for (const auto& e : fs::directory_iterator(pack_dir + "/cache")) {
+        const std::string n = e.path().filename().string();
+        if (n.size() < 10 || n.compare(n.size() - 10, 10, "_meta.json") != 0) continue;
+        std::ifstream f(e.path());
+        if (!f) continue;
+        json d;
+        try {
+            d = json::parse(f);
+        } catch (const std::exception&) {
+            continue;
+        }
+        if (!d.contains("op_list")) continue;
+        for (const auto& op : d["op_list"]) {
+            if (!op.contains("type") || op["type"] != "MladfMatMul") continue;
+            if (!op.contains("name")) continue;
+            Declared dec;
+            if (op.contains("attrs")) {
+                const auto& a = op["attrs"];
+                auto val = [&](const char* key) -> int64_t {
+                    if (!a.contains(key)) return 0;
+                    const auto& v = a[key];
+                    if (v.contains("value") && v["value"].is_array() && !v["value"].empty())
+                        return v["value"][0].is_string() ? std::atoll(v["value"][0].get<std::string>().c_str())
+                                                         : v["value"][0].get<int64_t>();
+                    return 0;
+                };
+                dec.n = val("N");
+                dec.k = val("K");
+            }
+            const std::string proj = op_to_projection(op["name"].get<std::string>());
+            if (op.contains("const_args") && d.contains("tensor_map")) {
+                for (const auto& ca : op["const_args"]) {
+                    const auto key = ca.get<std::string>();
+                    if (key.find("qweight.preformat") == std::string::npos) continue;
+                    if (!d["tensor_map"].contains(key)) continue;
+                    const auto& t = d["tensor_map"][key];
+                    if (t.contains("size_in_bytes")) dec.bytes = t["size_in_bytes"].get<int64_t>();
+                }
+            }
+            if (dec.n || dec.k) out[proj] = dec;
+        }
+    }
+    return out;
+}
+
 Dims read_dims(const json& c) {
     Dims d;
     d.hidden = c.at("hidden_size").get<int>();
@@ -423,9 +499,14 @@ std::string Plan::manifest() const {
                  {"rope_theta", dims.rope_theta},
                  {"model_type", dims.model_type}};
     json ts = json::array();
-    for (const auto& t : tensors)
-        ts.push_back({{"name", t.name}, {"source", t.source}, {"dtype", t.dtype}, {"shape", t.shape},
-                      {"refusal", t.refusal}});
+    for (const auto& t : tensors) {
+        json e = {{"name", t.name}, {"source", t.source}, {"dtype", t.dtype}, {"shape", t.shape},
+                  {"refusal", t.refusal}};
+        if (t.declared_n) e["declared_n"] = t.declared_n;
+        if (t.declared_k) e["declared_k"] = t.declared_k;
+        if (!t.declared_check.empty()) e["declared_check"] = t.declared_check;
+        ts.push_back(std::move(e));
+    }
     j["tensors"] = ts;
     j["incomplete"] = refused();
     return j.dump(2);
@@ -501,11 +582,23 @@ Plan plan(const std::string& pack_dir) {
                           {"mlp.gate_proj", d.intermediate, d.hidden},
                           {"mlp.up_proj", d.intermediate, d.hidden},
                           {"mlp.down_proj", d.hidden, d.intermediate}};
+    const DeclaredMap declared = read_declared(pack_dir);
     for (int L = 0; L < d.layers; ++L)
         for (const auto& pr : projs) {
-            auto x = make("model.layers." + std::to_string(L) + "." + pr.suffix + ".weight",
-                          "fconst:Llm_Token_Token", "q4_1", {pr.rows, pr.cols});
+            const std::string name = "model.layers." + std::to_string(L) + "." + pr.suffix + ".weight";
+            auto x = make(name, "fconst:Llm_Token_Token", "q4_1", {pr.rows, pr.cols});
             x.refusal = kRefuseFconst;
+            const std::string key = "model.layers." + std::to_string(L) + "." + pr.suffix;
+            if (const auto it = declared.find(key); it != declared.end()) {
+                x.declared_n = it->second.n;
+                x.declared_k = it->second.k;
+                if (it->second.n && it->second.n != pr.rows)
+                    x.declared_check = "N: plan " + std::to_string(pr.rows) + " vs pack " +
+                                       std::to_string(it->second.n);
+                else if (it->second.k && it->second.k != pr.cols)
+                    x.declared_check = "K: plan " + std::to_string(pr.cols) + " vs pack " +
+                                       std::to_string(it->second.k);
+            }
             p.tensors.push_back(std::move(x));
         }
     return p;

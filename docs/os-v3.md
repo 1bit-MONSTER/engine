@@ -16,6 +16,31 @@ limitations under the License.
 -->
 # 1bit OS v3 — the installed machine is an Ubuntu 26.04 Server
 
+## Two plans, and which one is the plan
+
+The owner's direction of 2026-11-01 makes **Puppy** the base of v3, for the live/try stick *and* the
+installed system (a frugal install with a persistent save layer), with our kernel and drivers. The
+evaluation — sizes, the glibc ceiling, the kernel config gap, the package inventory, the build recipe and
+the gates table — is [os-v3-live-puppy-eval.md](os-v3-live-puppy-eval.md), with its recipe in
+`os/v3/puppy/`.
+
+**If that evaluation's gates pass, the Puppy plan below is v3.** It is a different *medium* with the
+same *design* as everything on this page: the same ESP chain (shim → our MOK-signed grub → our
+MOK-signed kernel), the same firmware boot entry (#709), the same install screen (#710), the same seed
+of identity (user, keys, which disk), and the same package *content* (our kernel and modules, the
+runtime, the engine, Lemonade, the units). What changes is how the system is laid out at boot: Puppy's
+initrd layers a read-only SFS under a save file instead of installing a root filesystem, which is also
+the answer to #706.
+
+**The Ubuntu Server `autoinstall` plan on this page is the documented fallback**, and it stays the
+reference for the parts both plans share. It is the fallback for two measured reasons: it has no
+dependency on a kernel rebuild (the Puppy plan needs `os/v3/puppy/kernel-puppy.fragment` built in, and
+that is one kernel gate away), and its userland brings sshd, apt, efivarfs, a normal user and
+`unattended-upgrades` for free, where the Puppy plan adds them as packages and runs as root by model.
+Neither plan is a redesign of the other; switching is a change of medium.
+
+## The Ubuntu plan (the fallback)
+
 This is the design for engine#712. Today one image serves both roles: the live stick and the disk it
 installs to are the same BusyBox initramfs, so the installed machine has no package manager, no users,
 no updates and an empty efivarfs (engine#712, engine#709). v3 keeps that image as the *live* medium and

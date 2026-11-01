@@ -28,9 +28,13 @@
 //   state     gated delta-net recurrent state, per sequence
 //   compute   512 MiB (HRX measured 20-505 MiB)
 //   extras    mmproj and draft / MTP files, and the KV of a draft model
-// Refused only when that need is larger than what is free: min(GTT free, MemAvailable) on HRX
-// (the GTT pool is the same DRAM), MemAvailable on the CPU. The HRX graph-program cache (cap 64,
-// 2.2-8.7 GiB measured) and engine #315's 95 GiB zone only warn: they grow after load.
+// Refused when that need is larger than what is free: min(GTT free, MemAvailable) on HRX
+// (the GTT pool is the same DRAM), MemAvailable on the CPU - and refused outright when the load
+// would land past the GTT ceiling, whatever is free (engine #680): the ceiling is GTT total minus
+// a 16 GiB reserve (GGML_HRX_GTT_RESERVE_MB, the knob ggml-hrx uses too), and #680 is a gfxhub page
+// fault plus a MODE2 reset at 106.5 GiB of 120, i.e. 13.5 GiB of headroom was not enough once the
+// runtime's own allocations landed. The HRX graph-program cache (cap 64, 2.2-8.7 GiB measured) and
+// engine #315's 95 GiB zone still only warn inside the ceiling: they grow after load.
 #pragma once
 
 #include "sysinfo.h"
@@ -38,6 +42,7 @@
 #include <algorithm>
 #include <cstdint>
 #include <cstdio>
+#include <cstdlib>
 #include <cstring>
 #include <filesystem>
 #include <fstream>
@@ -49,6 +54,19 @@
 namespace onebit::admit {
 
 constexpr uint64_t kMiB = 1ull << 20, kGiB = 1ull << 30;
+
+// The GTT reserve the ceiling keeps free for the driver and for what grows after load (engine #680).
+// The same knob ggml-hrx reads (fork PR #166), so the pre-launch refusal and the allocation-time
+// backstop cannot disagree about where the wall is.
+constexpr uint64_t kGttReserveDefaultMiB = 16384;
+
+inline uint64_t gtt_reserve_bytes() {
+    if (const char* e = std::getenv("GGML_HRX_GTT_RESERVE_MB")) {
+        const long long mb = std::atoll(e);
+        if (mb >= 0) return uint64_t(mb) * kMiB;
+    }
+    return kGttReserveDefaultMiB * kMiB;
+}
 
 // The metadata a size estimate needs: integer scalars, integer arrays and general.architecture.
 struct GgufHeader {
@@ -311,6 +329,12 @@ struct Verdict {
     uint64_t free = 0;
     std::string box;        // "GTT 20.1 of 120.0 GiB free, MemAvailable 40.1 GiB"
     std::vector<std::string> warnings;
+    // engine #680: the GTT ceiling. `projected` is what GTT would hold after this load, `ceiling` is
+    // what it may hold (total minus the reserve). over_ceiling refuses the load even when `free` says
+    // there is room, because the fault line is absolute and not a matter of what is free right now.
+    bool over_ceiling = false;
+    uint64_t ceiling = 0, projected = 0;
+    std::string ceiling_note;   // the numbers, for the refusal line
 };
 
 // reserve: kept free for everything else (default 1 GiB)
@@ -325,8 +349,17 @@ inline Verdict judge(const Need& need, const sysinfo::Memory& mem, uint64_t rese
         const uint64_t gtt_free = mem.gtt_total > mem.gtt_used ? mem.gtt_total - mem.gtt_used : 0;
         v.free = std::min(v.free, gtt_free);
         v.box = "GTT " + gib(gtt_free) + " of " + gib(mem.gtt_total) + " GiB free, " + v.box;
+        const uint64_t gtt_reserve = gtt_reserve_bytes();
+        v.ceiling = mem.gtt_total > gtt_reserve ? mem.gtt_total - gtt_reserve : 0;
+        v.projected = mem.gtt_used + need.total;
+        v.over_ceiling = v.projected > v.ceiling;
+        if (v.over_ceiling) {
+            v.ceiling_note = "GTT after this load would reach " + gib(v.projected) + " GiB of the " + gib(v.ceiling) +
+                             " GiB ceiling (" + gib(mem.gtt_total) + " GiB total, " + gib(gtt_reserve) +
+                             " GiB reserve, GGML_HRX_GTT_RESERVE_MB), where engine #680 faulted; free GTT or raise the reserve";
+        }
     }
-    v.fits = need.total + reserve <= v.free;
+    v.fits = need.total + reserve <= v.free && !v.over_ceiling;
     if (v.fits && need.gpu && need.total + reserve + 4 * kGiB > v.free)
         v.warnings.push_back("little room left for the HRX graph-program cache (it grows to 2-9 GiB as prompt shapes vary)");
     if (v.fits && need.gpu && mem.has_gtt && mem.gtt_used + need.total >= 95 * kGiB)

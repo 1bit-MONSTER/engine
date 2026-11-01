@@ -39,7 +39,7 @@ a stick write is verified against.
 | engine | `e7446eef35e4452ee26baff57407d1c289870cb2` |
 | HRX (llama.cpp fork, ggml-hrx) | `4a58da9b087d` |
 | hrx-system | `82804197bcbe` |
-| Lemonade Server | `2026.46.0~1.c4132113` (our fork, the `onebit` recipe) |
+| Lemonade Server | `2026.46.0~5.ef0f3b49` (our fork, the `onebit` recipe) |
 | kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
 

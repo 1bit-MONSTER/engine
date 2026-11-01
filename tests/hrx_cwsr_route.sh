@@ -20,9 +20,9 @@
 #   - off: none of HSA_USE_SVM, HSA_USERPTR_FOR_PAGED_MEM, HRX_ALLOW_NO_SVM, and serve says so;
 #   - on, in a build whose hrx-system has the gate: all three; a value the user set wins;
 #   - on, in a build without the gate: refused at start, with the reason;
-#   - auto on a CWSR-on box: all three with the gate, none without it; with one of the three set
-#     by the user, none, and serve says so;
-#   - auto elsewhere (CWSR off, or no amdgpu, as in CI): none;
+#   - auto (the default) in a build with the gate: all three, whatever cwsr_enable says, and
+#     HRX_SVM=1 turns that off again; a value the user set still wins;
+#   - auto in a build without the gate: none, and serve says the gate is missing;
 #   - --device cpu: never any of them.
 #
 # usage: tests/hrx_cwsr_route.sh path/to/1bit
@@ -92,22 +92,21 @@ else
     check "--device cpu: none of the three, even with on" 'env_is "$scratch/cpu.json" "{}"'
 fi
 
-HSA_USE_SVM=1 run "$scratch/auto-user.json" --device hrx
-check "auto with HSA_USE_SVM set by the user: serve adds nothing" 'env_is "$scratch/auto-user.json" "{\"HSA_USE_SVM\": \"1\"}"'
-if [ "$(cat /sys/module/amdgpu/parameters/cwsr_enable 2>/dev/null)" = 1 ]; then
-    check "  and says the environment decides (CWSR on here)" 'grep -q "HSA_USE_SVM set in the environment" "$scratch/auto-user.json.log"'
-    run "$scratch/auto-on.json" --device hrx
-    if [ $gate = 1 ]; then
-        check "auto, CWSR on here: the HRX backend gets all three" 'env_is "$scratch/auto-on.json" "$all"'
-        check "  and serve logs the GTT line" 'grep -q "HRX: CWSR is on; CWSR save area placed in GTT (engine#315)" "$scratch/auto-on.json.log"'
-    else
-        check "auto, CWSR on here, no gate: none of the three" 'env_is "$scratch/auto-on.json" "{}"'
-        check "  and serve says the gate is missing" 'grep -q "no HRX_ALLOW_NO_SVM gate; placement unchanged" "$scratch/auto-on.json.log"'
-    fi
+HSA_USERPTR_FOR_PAGED_MEM=5 run "$scratch/auto-user.json" --device hrx
+if [ $gate = 1 ]; then
+    check "auto: a value the user set wins, the other two are still added" \
+        'env_is "$scratch/auto-user.json" "{\"HSA_USE_SVM\": \"0\", \"HSA_USERPTR_FOR_PAGED_MEM\": \"5\", \"HRX_ALLOW_NO_SVM\": \"1\"}"'
+    check "  and serve names it in the log" 'grep -q "kept from the environment: HSA_USERPTR_FOR_PAGED_MEM" "$scratch/auto-user.json.log"'
+    run "$scratch/auto.json" --device hrx
+    check "auto (the default): the HRX backend gets all three" 'env_is "$scratch/auto.json" "$all"'
+    check "  and serve logs the GTT default line" 'grep -q "CWSR save area placed in GTT by default" "$scratch/auto.json.log"'
+    HRX_SVM=1 run "$scratch/auto-off.json" --device hrx
+    check "auto with HRX_SVM=1: none of the three (the opt-out)" 'env_is "$scratch/auto-off.json" "{}"'
+    check "  and serve says HRX_SVM=1 decided it" 'grep -q "HRX_SVM=1; CWSR save-area placement left to ROCr" "$scratch/auto-off.json.log"'
 else
     run "$scratch/auto.json" --device hrx
-    check "auto, CWSR not on here: the HRX backend gets none of the three" 'env_is "$scratch/auto.json" "{}"'
-    check "  and serve says placement is unchanged" 'grep -q "placement unchanged (engine#315)" "$scratch/auto.json.log"'
+    check "auto, no gate: none of the three" 'env_is "$scratch/auto.json" "{}"'
+    check "  and serve says the gate is missing" 'grep -q "no HRX_ALLOW_NO_SVM gate; CWSR save-area placement unchanged" "$scratch/auto.json.log"'
 fi
 
 exit $fail

@@ -22,6 +22,8 @@
 //   GET  /v1/models             the one model
 //   POST /v1/chat/completions   ChatML prompt, sampling controls, optional SSE stream
 //   POST /v1/completions        raw prompt
+//   POST /v1/systemone          d3 decision questions (alias /v1/decisions), when the model
+//   GET  /v1/systemone/models   directory carries a decision head -- see docs/npu.md "Decisions"
 //
 // Decoding is greedy unless the request asks for more: temperature, top_k, top_p and seed
 // sample, stop cuts the answer, and grammar (GBNF) or response_format {"type":
@@ -38,7 +40,9 @@
 #include "npu_grammar.h"
 #include "npu_prefix_cache.h"
 #include "npu_sampling.h"
+#include "npu_systemone.h"
 #include "tokenizer.h"
+#include "../npu/decision.h"  // the d3 readout head (npu/decision.h, issue #653)
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 #include <httplib.h>
@@ -82,6 +86,10 @@ struct ForwardEngine {
     // slot's attention KV and GDN state.  Only ever touched under mu.
     std::unique_ptr<npu::PrefixCache> prefix;
     std::vector<Q4nxNpuForward::StateSnapshot> prefix_state;
+    // The d3 decision head (#653), loaded when decision_config.json and decision.q4nx sit next to the
+    // model: it is what turns this server into a decision endpoint as well as a chat one.
+    std::unique_ptr<npu::DecisionHead> head;
+    std::string head_error;  // why there is no head, for the 503 the decision route answers
     std::mutex mu;
 };
 
@@ -547,6 +555,108 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     }
 }
 
+// The per-question input limit of the decision route: the text path's own 32,768 tokens, or the
+// backbone's context when that is smaller. Either overflowing is the same failure to the model, so
+// the smaller one is the limit the request is checked against.
+size_t systemone_max_input(const ForwardEngine& e) {
+    const size_t ctx = e.max_context > 0 ? size_t(e.max_context) : npu::kSystemOneMaxInputTokens;
+    return std::min(ctx, npu::kSystemOneMaxInputTokens);
+}
+
+// DECISION_API_KEY, when set, gates the decision routes -- upstream d3_server.py's own access control,
+// so a deployment keeps the property it had when it pointed vLLM Semantic Router at that server.
+// /health stays open for probes and reports that authentication is on.
+bool decision_authorized(const httplib::Request& req) {
+    const char* key = std::getenv("DECISION_API_KEY");
+    if (!key || !*key) return true;
+    const std::string want = std::string("Bearer ") + key;
+    const std::string got = req.get_header_value("Authorization");
+    // Constant-time compare: a key checked byte by byte with an early exit leaks its prefix.
+    unsigned diff = unsigned(got.size() ^ want.size());
+    for (size_t i = 0; i < got.size() && i < want.size(); i++) diff |= unsigned(got[i] ^ want[i]);
+    return diff == 0;
+}
+
+// POST /v1/systemone (and its /v1/decisions alias): one backbone prefill per question, then the
+// pack's readout over the pooled last hidden state. No text is generated, so there is no sampling,
+// no grammar and no stream -- the answer is a probability for every option of the question.
+void handle_systemone(ForwardEngine& e, const httplib::Request& req, httplib::Response& res) {
+    auto refuse = [&res](int status, const json& detail) {
+        res.status = status;
+        res.set_content(json{{"detail", detail}}.dump(-1, ' ', false, json::error_handler_t::replace),
+                        "application/json");
+    };
+    if (!e.head) {
+        refuse(503, "no decision head loaded: " + e.head_error);
+        return;
+    }
+    // ordered_json: the request's key order is part of the prompt (npu/systemone.h).
+    nlohmann::ordered_json body;
+    try {
+        body = nlohmann::ordered_json::parse(req.body);
+    } catch (const std::exception& ex) {
+        refuse(422, std::string("could not read the body as JSON (") + ex.what() + ")");
+        return;
+    }
+    npu::SystemOneParsed parsed;
+    try {
+        parsed = npu::systemone_request_of(body);
+    } catch (const npu::SystemOneRefusal& ex) {
+        refuse(422, ex.what());
+        return;
+    }
+    // A malformed question makes the whole request a refusal, and nothing runs: a partial answer
+    // would leave the caller unable to tell an unanswered question from an unasked one.
+    if (!parsed.invalid.empty()) {
+        nlohmann::ordered_json bad = nlohmann::ordered_json::object();
+        for (const auto& [id, why] : parsed.invalid) bad[id] = why;
+        refuse(422, nlohmann::ordered_json{{"invalid_questions", bad}});
+        return;
+    }
+    const size_t limit = systemone_max_input(e);
+    const std::vector<std::string>& codes = e.head->config().codes;
+    nlohmann::ordered_json answers = nlohmann::ordered_json::object();
+    size_t input_tokens = 0;
+    try {
+        std::lock_guard<std::mutex> lock(e.mu);
+        std::vector<float> logits;
+        for (const auto& q : parsed.questions) {
+            const std::string prompt = npu::systemone_prompt(parsed.state, q.question, codes);
+            const std::vector<int> ids = e.tok->encode(prompt);
+            // Nothing is truncated: an over-long question is an error entry and the next one still runs.
+            if (ids.size() > limit) {
+                answers[q.id] = npu::systemone_question_error(q.question.kind, "max_length_exceeded",
+                                                              npu::systemone_length_message(ids.size(), limit));
+                continue;
+            }
+            e.fwd->reset();
+            if (!e.fwd->step_batch(ids, 0, logits))
+                throw std::runtime_error(std::string("forward step failed: ") + e.fwd->last_error());
+            std::vector<int> rows(q.question.keys.size());  // option i is readout row i (pack code order)
+            for (size_t i = 0; i < rows.size(); i++) rows[i] = int(i);
+            try {
+                const std::vector<float> probs =
+                    e.head->probabilities_over(e.head->logits(e.fwd->last_hidden()), rows);
+                answers[q.id] = npu::d3::answer_of(q.question, probs);
+            } catch (const std::exception& ex) {
+                // The model ran but its output cannot be read as an answer: that is this question's
+                // problem, not the request's (upstream's invalid_model_output).
+                answers[q.id] = npu::systemone_question_error(q.question.kind, "invalid_model_output", ex.what());
+                continue;
+            }
+            input_tokens += ids.size();
+        }
+    } catch (const std::exception& ex) {
+        res.status = 500;
+        res.set_content(json{{"detail", ex.what()}}.dump(-1, ' ', false, json::error_handler_t::replace),
+                        "application/json");
+        return;
+    }
+    res.set_content(npu::systemone_reply(e.id, answers, input_tokens).dump(-1, ' ', false,
+                                                                          json::error_handler_t::replace),
+                    "application/json");
+}
+
 }  // namespace
 
 int run_forward_serve(int argc, char** argv) {
@@ -625,17 +735,50 @@ int run_forward_serve(int argc, char** argv) {
     const bool ok = dev ? e.fwd->init(*dev, model.c_str(), kernels) : e.fwd->init_host(model.c_str(), kernels);
     if (!ok) throw std::runtime_error(std::string("forward init failed: ") + e.fwd->last_error());
 
+    // A d3 pack keeps its decision head next to model.q4nx (npu/decision.h). Both files present means
+    // the decision routes come up beside the chat ones; a pack without them is a chat model, which is
+    // the normal case, so this is not an error.
+    const std::string decision_cfg = dir + "/decision_config.json";
+    const std::string decision_readout = dir + "/decision.q4nx";
+    if (std::filesystem::exists(decision_cfg) && std::filesystem::exists(decision_readout)) {
+        auto head = std::make_unique<npu::DecisionHead>();
+        if (head->load(dir)) {
+            std::fprintf(stderr, "1bit forward-serve: d3 decision head: %zu options, hidden %zu, %s, pooling %s\n",
+                         head->options(), head->hidden(), head->config().format_id.c_str(),
+                         head->config().pooling.c_str());
+            e.head = std::move(head);
+        } else {
+            // Present but unusable is a 503 with the reason, not a silent fall back to chat only.
+            e.head_error = head->error();
+            std::fprintf(stderr, "1bit forward-serve: d3 decision head unusable: %s\n", e.head_error.c_str());
+        }
+    } else {
+        e.head_error = "no decision_config.json + decision.q4nx next to " + model;
+    }
+
     std::atomic<bool> ready{false};
     httplib::Server srv;
     install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
-    srv.Get("/health", [&](const httplib::Request&, httplib::Response& r) {
+    // /health is what a probe reads: the d3 fields appear only when a decision head is loaded, so a
+    // chat-only deployment keeps the body it had before this route existed.
+    auto health = [&](httplib::Response& r) {
         r.status = ready ? 200 : 503;
-        r.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");
-    });
-    srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& r) {
-        r.status = ready ? 200 : 503;
-        r.set_content(ready ? R"({"status":"ok"})" : R"({"status":"loading"})", "application/json");
-    });
+        if (!ready) {
+            r.set_content(R"({"status":"loading"})", "application/json");
+            return;
+        }
+        json h{{"status", "ok"}};
+        if (e.head) {
+            h["model"] = e.id;
+            h["max_input_tokens"] = systemone_max_input(e);
+            h["modalities"] = json::array({"text"});
+            const char* key = std::getenv("DECISION_API_KEY");
+            h["authentication"] = key && *key;
+        }
+        r.set_content(h.dump(), "application/json");
+    };
+    srv.Get("/health", [&](const httplib::Request&, httplib::Response& r) { health(r); });
+    srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& r) { health(r); });
     srv.Get("/v1/models", [&](const httplib::Request&, httplib::Response& r) {
         r.set_content(json{{"object", "list"},
                            {"data", json::array({{{"id", e.id}, {"object", "model"}, {"owned_by", "1bit"}}})}}.dump(),
@@ -651,6 +794,39 @@ int run_forward_serve(int argc, char** argv) {
     };
     srv.Post("/v1/chat/completions", [&](const httplib::Request& q, httplib::Response& r) { post(q, r, true); });
     srv.Post("/v1/completions", [&](const httplib::Request& q, httplib::Response& r) { post(q, r, false); });
+    // The d3 decision routes (#653), with upstream's alias and its own 422/401 refusals: this is the
+    // interop contract with vLLM Semantic Router, so it follows d3_server.py rather than the chat
+    // route's 400 habit (docs/npu.md, "Decisions").
+    auto decide = [&](const httplib::Request& q, httplib::Response& r) {
+        if (!ready) {
+            r.status = 503;
+            r.set_content(R"({"detail":"model is loading"})", "application/json");
+            return;
+        }
+        if (!decision_authorized(q)) {
+            r.status = 401;
+            r.set_header("WWW-Authenticate", "Bearer");
+            r.set_content(R"({"detail":"a valid bearer key is required"})", "application/json");
+            return;
+        }
+        handle_systemone(e, q, r);
+    };
+    srv.Post("/v1/systemone", decide);
+    srv.Post("/v1/decisions", decide);
+    srv.Get("/v1/systemone/models", [&](const httplib::Request& q, httplib::Response& r) {
+        if (!decision_authorized(q)) {
+            r.status = 401;
+            r.set_header("WWW-Authenticate", "Bearer");
+            r.set_content(R"({"detail":"a valid bearer key is required"})", "application/json");
+            return;
+        }
+        if (!e.head) {
+            r.status = 503;
+            r.set_content(json{{"detail", "no decision head loaded: " + e.head_error}}.dump(), "application/json");
+            return;
+        }
+        r.set_content(npu::systemone_models(e.id, systemone_max_input(e)).dump(), "application/json");
+    });
 
     if (!srv.bind_to_port(host, port)) throw std::runtime_error("cannot listen on " + host + ":" + std::to_string(port));
     std::thread listener([&] { srv.listen_after_bind(); });

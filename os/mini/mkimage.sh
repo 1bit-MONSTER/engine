@@ -624,7 +624,10 @@ stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 # because the cmdline carried ignore_loglevel + loglevel=7. The serial console (ttyS0) is what the QEMU
 # gates read and it keeps the verbose log - init.sh's first act raises it there, per console. Level 4
 # is "warnings and errors only": a boot that goes wrong still says why on the VT.
-cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
+# #707: the appliance menu was unreadable from the chair - the VT's default 8x16 font on a panel that
+# is not 80x25 puts the whole menu in one corner. The image kernel is built with CONFIG_FONT_TER16x32=y,
+# so the console takes a 16x32 font at boot; no font file, no setfont and nothing to keep in the image.
+cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=font:TER16x32 fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
 printf '%s' "$cmdline" > "$out/cmdline.txt"
 # section layout after the stub's own sections, each aligned to 64 KiB
 align() { echo $(( ($1 + 65535) / 65536 * 65536 )); }

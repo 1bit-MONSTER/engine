@@ -1797,21 +1797,37 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         const float* qh = &ql[(size_t)h * KHD];
         const float* vh = &vv[(size_t)h * VHD];
         for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-        for (int vd = 0; vd < VHD; vd++) {
-            float s = 0;
-            for (int kd = 0; kd < KHD; kd++) s += sh[kd * VHD + vd] * kh[kd];
-            kvm[vd] = s;
+        // The two matrix-vector products and the rank-1 update below were written with the
+        // KEY index innermost, i.e. every inner step jumped VHD floats in `sh` (a 512-byte
+        // stride): 107 ms a token, 21 % of the decode step, at ~1.4 GFLOP/s on a Zen 5 core.
+        // The same arithmetic with the VALUE index innermost is contiguous and vectorisable,
+        // and it is bit-for-bit the same: each output element still accumulates over kd in
+        // ascending order, and the rank-1 update still writes each element once from the same
+        // precomputed delta.  Only the loop nest changed.
+        float* kvp = kvm.data();
+        std::fill(kvp, kvp + VHD, 0.0f);
+        for (int kd = 0; kd < KHD; kd++) {
+            const float kk = kh[kd];
+            const float* row = sh + (size_t)kd * VHD;
+            for (int vd = 0; vd < VHD; vd++) kvp[vd] += kk * row[vd];
         }
-        for (int vd = 0; vd < VHD; vd++) {
-            const float delta = (vh[vd] - kvm[vd]) * beta;
-            for (int kd = 0; kd < KHD; kd++) sh[kd * VHD + vd] += kh[kd] * delta;
+        for (int vd = 0; vd < VHD; vd++) kvp[vd] = (vh[vd] - kvp[vd]) * beta;   // delta, in place
+        for (int kd = 0; kd < KHD; kd++) {
+            const float kk = kh[kd];
+            float* row = sh + (size_t)kd * VHD;
+            for (int vd = 0; vd < VHD; vd++) row[vd] += kk * kvp[vd];
+        }
+        float* cp = core.data() + (size_t)h * VHD;
+        std::fill(cp, cp + VHD, 0.0f);
+        for (int kd = 0; kd < KHD; kd++) {
+            const float qk = qh[kd];
+            const float* row = sh + (size_t)kd * VHD;
+            for (int vd = 0; vd < VHD; vd++) cp[vd] += qk * row[vd];
         }
         float ss = 0;
         for (int vd = 0; vd < VHD; vd++) {
-            float s = 0;
-            for (int kd = 0; kd < KHD; kd++) s += sh[kd * VHD + vd] * qh[kd];
-            core[(size_t)h * VHD + vd] = s * scale;
-            ss += core[(size_t)h * VHD + vd] * core[(size_t)h * VHD + vd];
+            cp[vd] *= scale;
+            ss += cp[vd] * cp[vd];
         }
         const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
         for (int vd = 0; vd < VHD; vd++) {

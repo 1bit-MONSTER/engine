@@ -89,6 +89,11 @@ if [ -f "$vmlinuz" ]; then
     if [ -n "$vkver" ]; then echo "== the image kernel ($vkver, from $vmlinuz)"; fi
 fi
 here=$(cd "$(dirname "$0")" && pwd)
+# #704: the release name this image carries, in one place. No page or banner hard-codes a version (the
+# c18 dry run read "v2026.43" on a stick shipping Lemonade 2026.46.0): IMAGE_TAG is what the candidate
+# build passes (WEEKLY_TAG), and a hand-built image falls back to the engine tree's own describe.
+repo=$(cd "$here/../.." && pwd)
+tagv=${IMAGE_TAG:-$(git -C "$repo" describe --always --dirty 2>/dev/null || echo dev)}
 tools=$HOME/.cache/1bit-os/tools/x
 # Dropbear, mtools and the EFI stub come from their Debian packages, unpacked here on first use. A
 # cleaned ~/.cache used to stop the weekly release at "SSH (Dropbear)" (2026-10-01 rehearsal).
@@ -144,9 +149,12 @@ echo "== kernel modules ($kver)"
 # carries (r8152, ax88179_178a, cdc_ether, cdc_ncm, usbnet). Wi-Fi: mt7925e pulls mt76/mac80211/cfg80211.
 # Every module the board binds on the build machine (os/mini/hwprobe.py, 26 Oct 2026): CPU temperature
 # (k10temp, what the fan logic and the checks read), SMBus and the DIMM sensors, the power controller,
-# the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), audio (HDA and the
-# KVM's USB audio), the SD reader, RAPL power readings. BusyBox init has no udev: init.sh loads them.
-mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb snd_hda_intel snd_usb_audio sdhci_pci intel_rapl_msr spd5118 typec_ucsi roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet"
+# the PS/2 path and raw serio, Bluetooth (its MT7925 firmware is already shipped), the SD reader, RAPL
+# power readings. BusyBox init has no udev: init.sh loads them.
+# #708: no sound modules. The appliance has no audio, and on the c18 live boot snd_usbmidi_lib was refused
+# (its signing key is not the kernel's) and then eleven "Unknown symbol snd_ctl_new1 (err -2)" lines
+# scrolled over the screen for every user. Dropping them is the whole fix: nothing else loads them.
+mods="nvme ahci amd_pmf amdgpu amdxdna r8169 realtek mt7925e xhci_pci usb_storage uas sd_mod vfat ext4 nls_iso8859_1 nls_cp437 nls_ascii virtio_net virtio_blk thunderbolt thunderbolt_net typec ucsi_acpi typec_displayport usbhid hid_generic evdev k10temp i2c_piix4 amd_pmc psmouse serio_raw btusb sdhci_pci intel_rapl_msr spd5118 typec_ucsi roles r8152 ax88179_178a cdc_ether cdc_ncm usbnet"
 for m in $mods; do
     modprobe -S "$kver" --show-depends "$m" 2>/dev/null | awk '$1 == "insmod" {print $2}'
 done | sort -u | while read -r ko; do mkdir -p "$root$(dirname "$ko")"; cp "$ko" "$root$ko"; done
@@ -248,6 +256,26 @@ else
     echo "   amdxdna: private build not found at $xdna - the stock module ships"
 fi
 depmod -b "$root" "$kver"
+
+# #708: refuse an unsigned module, the same way this script refuses a module built for another kernel.
+# Secure Boot is on for the owner, so an unsigned module is not a line in a log: it is a rejection and then
+# every symbol error of the module that depended on it. The signers are printed either way, because "the
+# module is signed" is not the question - signed by a key this kernel trusts is.
+unsigned=0
+while IFS= read -r ko; do
+    signer=$(modinfo -F signer "$ko" 2>/dev/null)
+    if [ -z "$signer" ]; then
+        echo "   UNSIGNED: ${ko#"$root"}"
+        unsigned=$((unsigned + 1))
+    fi
+done < <(find "$root/lib/modules" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \))
+if [ "$unsigned" != 0 ]; then
+    echo "this image would ship $unsigned unsigned module(s) (named above) into a Secure Boot machine; stopping"
+    exit 1
+fi
+while IFS= read -r ko; do modinfo -F signer "$ko" 2>/dev/null; done \
+    < <(find "$root/lib/modules" -type f \( -name '*.ko' -o -name '*.ko.xz' -o -name '*.ko.zst' \)) |
+    sort | uniq -c | sed 's/^/   signer: /'
 
 echo "== firmware (only what these chips load)"
 fw() {   # a pattern that matches nothing on this machine is skipped
@@ -390,6 +418,25 @@ cp "$here/release-check.sh" "$root/bin/1bit-release-check"; chmod +x "$root/bin/
 install -m 0755 "$here/board.sh" "$root/usr/sbin/1bit-board"
 mkdir -p "$root/etc/1bit"
 install -m 0644 "$here/power.conf.example" "$root/etc/1bit/power"
+# #704: what this image is, measured at build time, written where the boot banner and 1bit-release-check
+# read it (os/mini/init.sh, os/mini/release-check.sh). The Lemonade version comes from the package that
+# is being shipped - `lemond --version` - never from a constant; the engine commit and the HRX pin come
+# from the tree this image was built out of. The artifact's own sha256 cannot be in the image it hashes,
+# so it stays in the release table beside the .img.zst and 1bit-release-check reports the tag.
+lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([^ ~]*\).*/\1/p' | head -n 1)
+[ -n "$lemver" ] || lemver=unknown
+{
+    echo "tag: $tagv"
+    echo "lemonade: $lemver"
+    echo "engine: $(git -C "$repo" rev-parse --short=12 HEAD 2>/dev/null || echo unknown)"
+    # the pin the release actually ships: the gitlink recorded in this tree. `git -C third_party/hrx-system
+    # rev-parse HEAD` walks UP to the parent repository when the submodule is not checked out - which is how
+    # the release lane builds - and silently reported the ENGINE commit as the HRX pin (review of #720).
+    hrx=$(git -C "$repo" ls-tree HEAD third_party/hrx-system 2>/dev/null | awk '{print substr($3, 1, 12)}')
+    echo "hrx-system: ${hrx:-unknown}"
+    echo "kernel: $kver"
+    echo "built: $(date -u +%Y-%m-%dT%H:%M:%SZ)"
+} > "$root/etc/1bit/release-identity"
 # The onebit entries this image ships, so 1bit-release-check can prove Lemonade registers them. The
 # catalogue Lemonade reads at runtime is server_models.json; the check needs the *shipped* subset on
 # paper, because on a machine without a GPU or NPU Lemonade hides those entries and their absence there
@@ -600,7 +647,10 @@ stub=$tools/usr/lib/systemd/boot/efi/linuxx64.efi.stub
 # because the cmdline carried ignore_loglevel + loglevel=7. The serial console (ttyS0) is what the QEMU
 # gates read and it keeps the verbose log - init.sh's first act raises it there, per console. Level 4
 # is "warnings and errors only": a boot that goes wrong still says why on the VT.
-cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
+# #707: the appliance menu was unreadable from the chair - the VT's default 8x16 font on a panel that
+# is not 80x25 puts the whole menu in one corner. The image kernel is built with CONFIG_FONT_TER16x32=y,
+# so the console takes a 16x32 font at boot; no font file, no setfont and nothing to keep in the image.
+cmdline="console=tty0 console=ttyS0,115200 loglevel=4 panic=600 oops=panic fbcon=font:TER16x32 fbcon=nodefer vt.global_cursor_default=1 rdinit=/init"
 printf '%s' "$cmdline" > "$out/cmdline.txt"
 # section layout after the stub's own sections, each aligned to 64 KiB
 align() { echo $(( ($1 + 65535) / 65536 * 65536 )); }
@@ -670,7 +720,7 @@ if [ "$BOOT_LAYOUT" = grub ]; then
     cat > "$out/esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=12
 set default=0
-menuentry "1bit OS, Lemonade Server appliance v2026.43 - LIVE (runs from RAM, nothing installed)" {
+menuentry "1bit OS, Lemonade Server appliance ${tagv} - LIVE (runs from RAM, nothing installed)" {
     linux /1bit/vmlinuz $cmdline
     initrd /1bit/initramfs.img
 }

@@ -56,7 +56,7 @@ int fail(const char* what, const OrtStatus* st) {
 // keeps it. That ordering is the whole point of the two-engine story: our NPU EP is asked first for
 // the matmul shapes it has an ELF for, a GPU EP (HIP/ROCM) is asked next, and the CPU EP mopped up.
 OrtStatus* make_session(OrtEnv* env, const char* model_path, const std::vector<const char*>& eps,
-                        int threads, bool basic, OrtSession** out) {
+                        int threads, bool basic, const char* profile, OrtSession** out) {
     OrtSessionOptions* so = nullptr;
     if (OrtStatus* st = api->CreateSessionOptions(&so)) return st;
     // ALL is the right level for a float graph. A QDQ graph is the exception: ALL runs the graph
@@ -64,6 +64,8 @@ OrtStatus* make_session(OrtEnv* env, const char* model_path, const std::vector<c
     // QLinearMatMul), which is exactly the pattern a quantised EP wants to claim, so --basic keeps the
     // graph as it was exported.
     OrtStatus* st = api->SetSessionGraphOptimizationLevel(so, basic ? ORT_ENABLE_BASIC : ORT_ENABLE_ALL);
+    // ORT writes the trace when the session is destroyed, to <prefix>_<timestamp>.json.
+    if (!st && profile) st = api->EnableProfiling(so, profile);
     if (!st) st = api->SetIntraOpNumThreads(so, threads);
     std::vector<const OrtEpDevice*> order;                  // everything registered so far
     std::vector<std::vector<const OrtEpDevice*>> groups;    // one group per library, in order
@@ -127,6 +129,7 @@ struct Args {
     // directly comparable with model_benchmark.exe output.
     bool bench = false;
     bool basic = false;  // ORT_ENABLE_BASIC: keep a QDQ graph's DequantizeLinear/QuantizeLinear nodes
+    const char* profile = nullptr;  // ORT's own per-op JSON trace: decides what to optimise next
     std::vector<int64_t> lens;
     int gen = 128;
     int warmup = 1;
@@ -183,8 +186,8 @@ bool parse_args(int argc, char** argv, Args* a) {
         else if (arg == "--dump-logits" && more) a->dump = argv[++i];
         else if (arg == "--basic") a->basic = true;
         else if (arg == "--threads" && more) a->threads = std::atoi(argv[++i]);
+        else if (arg == "--profile" && more) a->profile = argv[++i];
         else if (arg == "--no-mask") a->mask = false;
-        else if (arg == "--basic") a->basic = true;
         else if (arg == "--cached") a->cached = true;
         else if (arg == "--bench") a->bench = true;
         else if (arg == "--lens" && more) a->lens = parse_lens(argv[++i]);
@@ -534,7 +537,7 @@ int onebit_ort_run_main(int argc, char** argv) {
     }
 
     OrtSession* session = nullptr;
-    if (OrtStatus* st = make_session(env, a.model, a.eps, a.threads, a.basic, &session)) {
+    if (OrtStatus* st = make_session(env, a.model, a.eps, a.threads, a.basic, a.profile, &session)) {
         int rc = fail("create session", st);
         api->ReleaseMemoryInfo(mi);
         api->ReleaseEnv(env);

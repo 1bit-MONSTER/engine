@@ -1,5 +1,18 @@
 #!/usr/bin/env bash
-# g7-probe.sh <img> <work> - G7: does a change made in the running appliance survive a reboot?
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
 # Boots the image, writes a marker into /etc (the save layer's job, not /data's), powers off from the serial
 # shell, then boots again and looks for the marker. A save FOLDER is pre-created on the data partition first,
 # because Puppy asks at shutdown otherwise and a dialog is not something a probe can answer.

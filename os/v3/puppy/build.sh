@@ -182,6 +182,11 @@ if [ -n "${PAYLOAD:-}" ]; then
     ln -sf /opt/1bit-package/lemond-onebit "$skeleton/usr/local/bin/lemond-onebit"
     ln -sf /opt/1bit-package/1bit/1bit "$skeleton/usr/local/bin/1bit"
     cp -a /recipe/embed/. "$skeleton/"
+    # the HRX row of release-check.sh asks for ${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
+    # (os/mini/release-check.sh:454), which is the path os/mini uses for the same binary the package keeps in
+    # 1bit/hrx/llama/bin. One compatibility symlink, so the check reads the appliance without being told
+    # a new path - pi-release asked for exactly this.
+    ln -sfn /opt/1bit-package/1bit/hrx/llama/bin "$skeleton/opt/1bit-llama"
     # root owns them: /recipe is a host bind mount, so cp -a carries the host uid into the squashfs and
     # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
     chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
@@ -231,7 +236,8 @@ if [ -n "${PAYLOAD:-}" ]; then
     for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/05onboard-data \
              etc/init.d/10lemonade \
              usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
-             etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports; do
+             etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
+             opt/1bit-llama/llama-server; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }

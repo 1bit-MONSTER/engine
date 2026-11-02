@@ -123,4 +123,12 @@ if changed:
 print("%d model(s) on the partition, %d in the registry" % (len(models), len(have)))
 PY
 
+# Sealed NPU kernel sets from the partition, exposed beside the engine: the package ships its own three in
+# 1bit/npu/kernels, and a set staged on /data is otherwise invisible to it (pi-release's U4 finding). Each
+# entry is linked, not the directory, because the directory already exists in the package.
+for d in "$DATA"/npu/kernels/*; do
+    [ -e "$d" ] || continue
+    ln -sfn "$d" "/opt/1bit-package/1bit/npu/kernels/${d##*/}" 2> /dev/null
+done
+
 echo "05onboard-data: $part at $DATA ($(df -h "$DATA" 2> /dev/null | awk 'NR==2 {print $2" total, "$4" free"}'))"

@@ -266,6 +266,16 @@ rows = [
     # U2 headless (owner, cycle 12 item 7): the default entry boots with no X, and tty1 is a login prompt.
     # Puppy's own chain does the second half - /etc/inittab has tty1::respawn:plogin and plogin execs
     # `getty -n -l /bin/autologin ... tty1` - so the row asserts the getty, which is what a person sees.
+    # Cycle 13 (pi-release, 18:39): a headless boot has to reach tty1's prompt BY ITSELF. ttyS0 is not the
+    # question - it is a root shell this image opens on purpose - so this row reads tty1's OWN screen: the
+    # VGA text buffer at /dev/vcsa1 (header 4 B, then a char/attribute pair per cell), which is what a person
+    # in front of the box sees. rc.country's first-boot dialogs (keyboard, locale, timezone) print there, so
+    # any of their words on that screen is a FAIL: nothing answers a console dialog on an appliance.
+    ("U2 tty1",      "head -c 8000 /dev/vcsa1 2>/dev/null | tr -cd '[:print:]\\n ' | tr -s ' ' | head -c 600; "
+                     "echo; "
+                     "if head -c 8000 /dev/vcsa1 2>/dev/null | tr -cd '[:print:]' "
+                     "| grep -qiE 'keyboard|locale|timezone|quicksetup|country'; then "
+                     "echo tty1-wizard-text; else echo tty1-no-wizard; fi", "tty1-no-wizard"),
     ("U2 headless",  "tr ' ' '\\n' < /proc/cmdline | grep '^pfix='; "
                      "pgrep -x Xorg > /dev/null && echo X-RUNNING || echo no-X-server; "
                      "pgrep -af 'getty.*tty1' | head -1; "

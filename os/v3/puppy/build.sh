@@ -188,6 +188,26 @@ echo "== login shells -> /bin/bash"
 bash /recipe/shell-login.sh "$skeleton" | sed "s/^/   /" || {
     echo "build: REFUSED: the login shells could not be moved to bash (shell-login.sh)" >&2; exit 1; }
 
+# Cycle 13 (pi-release, 2026-11-02 18:39): the headless default must reach the autologin getty on its own.
+# rc.country is what stops it: /tmp/bootcnt.txt exists on every pfix=nox boot (init creates it), so
+# ASKKMAP and ASKLANG are both yes, /etc/keymap missing means keymap-set cli asks on /dev/console, a missing
+# en_US.utf8 locale means chooselocale asks AND sets ASKCLOCK=yes, and timezone-set cli then asks for the
+# timezone on /dev/console. Nothing ever answers a console dialog on an appliance, so tty1 never reaches the
+# prompt. With the two flags off, rc.country takes its quiet path: keymap-set --startup --load (reads the
+# /etc/keymap this image ships: us), `chooselocale cli quiet` (localedef, no questions), and
+# set_hwclock_type -q (no prompt) with /etc/localtime -> UTC from the embed. The DESKTOP entry still offers
+# the wizard: quicksetup runs on the first X start, which this does not touch.
+echo "== rc.country: no console questions on a headless boot"
+[ -f "$skeleton/etc/rc.d/rc.country" ] || {
+    echo "build: REFUSED: no rootfs-skeleton/etc/rc.d/rc.country - the first-boot wizard would block tty1" >&2
+    exit 1; }
+sed -i -e "s|^ASKKMAP=\"yes\"|ASKKMAP=\"no\"|" -e "s|^ASKLANG=\"yes\"|ASKLANG=\"no\"|" \
+    -e "s|^if \[ -f /tmp/bootcnt.txt \] ; then.*|if false ; then # 1bit: a headless boot must not ask (cycle 13)|" \
+    "$skeleton/etc/rc.d/rc.country"
+grep -q "^if false ; then # 1bit: a headless boot must not ask (cycle 13)" "$skeleton/etc/rc.d/rc.country" || {
+    echo "build: REFUSED: could not stop rc.country from asking on the console" >&2; exit 1; }
+echo "   ok: rc.country asks nothing on the console (the keymap and timezone it reads are checked with the embed)"
+
 # U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
 # Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
 # itself - so this is a copy plus two symlinks and the boot service.
@@ -280,6 +300,14 @@ for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil usr/sbin/sfdisk 
 done
 [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
 echo "   ok: sudo, apt, sshd, mokutil, sfdisk, bash are in the image"
+rc_country=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/rc.country 2>/dev/null |
+    grep -c "^if false ; then # 1bit: a headless boot must not ask" || true)
+[ "${rc_country:-0}" = 1 ] || {
+    echo "build: REFUSED: the packed rc.country would still ask on the console (headless boot never reaches tty1)" >&2
+    exit 1; }
+in_image etc/keymap || { echo "build: REFUSED: the image has no /etc/keymap" >&2; exit 1; }
+in_image etc/localtime || { echo "build: REFUSED: the image has no /etc/localtime" >&2; exit 1; }
+echo "   ok: the packed rc.country asks nothing; /etc/keymap and /etc/localtime are in the image"
 modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
 [ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
     echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }
@@ -293,7 +321,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
              usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
-             etc/1bit/release-identity; do
+             etc/1bit/release-identity etc/keymap etc/localtime; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }

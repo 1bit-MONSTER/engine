@@ -68,6 +68,23 @@ inline int argmax(const float* p, int n) {
     return best;
 }
 
+// The bookkeeping of a drafter that keeps its own stream (the MTP layer attends over its own states, so its
+// cache must be the base model's committed stream, row by row).  There are only two numbers -- how many rows are
+// committed, and therefore which position the next row belongs at -- and getting them wrong is silent: the drafts
+// get worse and nothing crashes.  So the cursor is a thing the loop can check rather than a loose int: `at(pos)` is
+// the assertion a drafter makes before opening a chain, and `keep()` is the row count its cache must be cut back to.
+//
+// The two mistakes this exists to catch, both seen in the live path (#811): opening a chain at a position the
+// cursor does not agree with (a primed stream truncated to 0), and appending committed rows AFTER the open chain's
+// provisional rows instead of over them.
+struct DraftStream {
+    int committed = 0;                                  // committed rows == position of the next committed row
+    bool at(int pos) const { return pos == committed; }
+    int keep() const { return committed; }               // truncate the cache to this many rows
+    void commit(int pos, int keep_rows) { committed = pos + keep_rows; }
+    void reset() { committed = 0; }
+};
+
 class BaseModel {
 public:
     virtual ~BaseModel() = default;
@@ -138,6 +155,7 @@ struct Options {
 };
 
 struct Stats {
+    static constexpr int kMaxDepth = 16;
     int iterations = 0;        // speculative iterations (each = one step + one batch)
     int steps = 0;             // single-token passes
     int batches = 0;           // batched verification passes
@@ -146,6 +164,12 @@ struct Stats {
     int drafted = 0;
     int accepted = 0;
     int first_reject = 0;      // iterations where the very first draft was refused
+    // Per draft depth: rows offered at depth d, and how many of them the base model agreed with.  This is the
+    // shape the offline protocol reports, and the only form in which "live equals offline" can be checked.
+    int drafted_at[kMaxDepth] = {0}, accepted_at[kMaxDepth] = {0};
+    double hit_at(int d) const {
+        return (d >= 0 && d < kMaxDepth && drafted_at[d]) ? double(accepted_at[d]) / double(drafted_at[d]) : 0.0;
+    }
     double acceptance() const { return drafted ? double(accepted) / double(drafted) : 0.0; }
     double mean_accept_len() const { return iterations ? double(accepted) / double(iterations) : 0.0; }
     // Passes per emitted token: the number that has to fall for speculation to be a speed win at all.
@@ -216,6 +240,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         r.stats.batches++;
         r.stats.rows_verified += nd;
         r.stats.drafted += nd;
+        for (int i = 0; i < nd && i < Stats::kMaxDepth; i++) r.stats.drafted_at[i]++;
 
         // Draft i is accepted only if the model's own choice at that position is that token: draft 0 is
         // checked against the logits of the last step, draft i>0 against row i-1 of the batch.
@@ -234,6 +259,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             take++;
         }
         r.stats.accepted += a;              // acceptance is a property of the model, not of the budget
+        for (int i = 0; i < a && i < Stats::kMaxDepth; i++) r.stats.accepted_at[i]++;
         if (a == 0) r.stats.first_reject++;
 
         // Commit the accepted rows of the verify batch and discard the rest.  With a deferring base this
@@ -241,7 +267,12 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         if (!base.commit_verify(take)) { r.err = "commit_verify refused"; return r; }
         if (head && take > 0) {
             const std::vector<float>& rows = base.last_hidden_rows();
-            if (rows.size() == (size_t)take * (size_t)base.hidden_size()) {
+            if (rows.size() != (size_t)take * (size_t)base.hidden_size()) {
+                // A base that keeps no rows at all is legal (the drafter simply cannot advance); a base that
+                // keeps the WRONG number of them is a bug, and silently skipping the advance is how the live
+                // loop lost 1 token/pass for a day.  Fail instead of drifting.
+                if (!rows.empty()) { r.err = "drafter rows: base returned a partial batch hidden"; return r; }
+            } else {
                 std::vector<int> accepted(d.begin(), d.begin() + take);
                 head->commit_rows(accepted, rows, take);
             }

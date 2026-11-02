@@ -163,7 +163,7 @@ if [ -n "${PAYLOAD:-}" ]; then
     ln -sf /opt/1bit-package/lemond-onebit "$skeleton/usr/local/bin/lemond-onebit"
     ln -sf /opt/1bit-package/1bit/1bit "$skeleton/usr/local/bin/1bit"
     cp -a /recipe/embed/. "$skeleton/"
-    chmod 0755 "$skeleton/etc/init.d/10lemonade"
+    chmod 0755 "$skeleton"/etc/init.d/10lemonade "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console
     echo "   $(du -sh "$skeleton/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
 fi
 
@@ -191,7 +191,8 @@ echo "   ok: $modconf in the image, so rc.sysinit loads the EC driver"
 if [ -n "${PAYLOAD:-}" ]; then
     miss=""
     for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/10lemonade \
-             usr/local/bin/1bit etc/rc.d/MODULESCONFIG; do
+             usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
+             etc/init.d/20onboard-ssh etc/init.d/21serial-console; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }

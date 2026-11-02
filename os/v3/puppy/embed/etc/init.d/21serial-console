@@ -1,0 +1,28 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/21serial-console - a root shell on the serial port, only when the boot line asks for it.
+#
+# The appliance is headless, and the console Puppy leaves you with is tty1: the transcript of a boot goes
+# out on ttyS0, but nothing reads it there, so a machine in a rack with no monitor is unadministrable and
+# an automated VM run cannot type into it. Measured in QEMU: an ISO built from this recipe boots to the
+# quicksetup dialog on tty1 and every byte of the transcript arrives on ttyS0.
+#
+# It is opt-in because a root shell needs no password: append 1bit.serial=1 to the kernel command line
+# (GRUB edit, or the QEMU -append). Without it this script does nothing.
+grep -q '1bit.serial=1' /proc/cmdline 2>/dev/null || exit 0
+setsid sh -c 'exec /bin/sh -l < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+echo "21serial-console: root shell on ttyS0 (1bit.serial=1 on the command line)"

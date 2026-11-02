@@ -18,7 +18,9 @@
 usage: tests/q4nx_t2_test.py [--images DIR] [--limit N] [--quiet]
 
 Always-on part (no model needed, numpy only):
-  1. geometry: tiles*2176 bytes, 2.125 bits/weight, and a geometry that is not whole tiles refused;
+  1. geometry: tiles*2176 bytes, 2.125 bits/weight, a geometry that is not whole tiles refused, and
+     pad=True zero-padding it (real block bit-exact, padding exactly 0, so a padded K column
+     contributes nothing);
   2. a synthetic ternary tensor round-trips through pack()/unpack() exactly, for several (K, N);
   3. the reserved pattern is never emitted by pack() and is counted by reserved_count();
   4. from_pb16i() reproduces the pb16i image element for element (checked against
@@ -107,6 +109,31 @@ def always_on():
               f"{K}x{N} round-trips exactly")
         check(T.reserved_count(raw, K, N) == 0, f"{K}x{N} pack() emits no reserved pattern")
     check(T.nbytes(250, 32) == 0 and T.nbytes(256, 33) == 0, "a geometry that is not whole tiles is refused")
+    # 1b. a tensor that is not whole tiles: refused by default, zero-padded with pad=True. The
+    #     convention is what a consumer relies on, so assert the arithmetic and not just the size:
+    #     the real block is bit-exact, the padding is exactly 0 (code 0 x scale 0), so a padded K
+    #     column contributes nothing to a dot product whatever the activation is.
+    Kn, Nn = 384, 30                       # neither % 256 nor % 32 (128-wide scale groups, so 384)
+    c_n = rng.integers(-1, 2, size=(Nn, Kn)).astype(np.int8)
+    s_n = (rng.random((Nn, Kn // 128)) * 0.01).astype(np.float16)
+    try:
+        T.pack(c_n, s_n)
+        check(False, "pack() must refuse a tensor that is not whole tiles")
+    except ValueError:
+        pass
+    raw_n = T.pack(c_n, s_n, pad=True)
+    check(len(raw_n) == T.nbytes(512, 32), "pad=True pads 30x300 to the next whole-tile geometry (32x512)")
+    got_n = T.unpack(raw_n, 512, 32)
+    check(np.array_equal(got_n[:Nn, :Kn], c_n.astype(np.float32) * np.repeat(s_n.astype(np.float32), 128, axis=1)),
+          "pad=True leaves the real block bit-exact")
+    check(not got_n[Nn:, :].any() and not got_n[:, Kn:].any(), "the padding decodes as exactly 0 (code 0, scale 0)")
+    codes_p, scales_p = T.pad_to_tile(c_n, s_n)
+    check(not scales_p[Nn:, :].any() and not scales_p[:, Kn // 128:].any(),
+          "the padding carries a zero scale too (0.0, as the format doc says)")
+    act = rng.standard_normal(512).astype(np.float32)
+    check(float(np.abs(got_n @ act - got_n[:, :Kn] @ act[:Kn]).max()) == 0.0,
+          "a padded K column contributes exactly 0 to the reduction")
+
     try:
         T.pack(np.arange(256 * 32).reshape(32, 256) % 3 - 1, np.zeros((32, 2), np.float16))
         check(True, "pack() accepts codes in {-1,0,1}")

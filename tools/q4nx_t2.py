@@ -125,8 +125,12 @@ def pack(codes, scales, pad=False):
     return out.reshape(-1).tobytes()
 
 
-def unpack(raw, K, N):
-    """t2 bytes -> float32 [N, K] (the same arithmetic as npu/q4nx.cpp::dequant_tile)."""
+def unpack_bits(raw, K, N):
+    """t2 bytes -> (codes int8 [N][K] in {-1,0,1}, IEEE fp16 scale bits uint16 [N][K//GROUP]).
+
+    The scale stays as the bits the container stores, so a conversion back to an int16 image (see
+    `q4nx_t2s.from_t2`) re-derives the reference exponent instead of trusting a rounded float.
+    """
     if len(raw) != nbytes(K, N):
         raise ValueError(f"a {N}x{K} t2 tensor is {nbytes(K, N)} B, got {len(raw)}")
     rt, kt = N // ROWS, K // COLS
@@ -137,13 +141,16 @@ def unpack(raw, K, N):
         bits = (packed >> (2 * s)) & 3
         # the reserved pattern (3) decodes as 0, never as 2 * scale -- same rule as q4nx.cpp
         quad[..., s] = np.where(bits == RESERVED, 0, bits.astype(np.int8) - 1).astype(np.int8)
-    codes = quad.reshape(rt * kt, ROWS, 64 * 4).transpose(0, 1, 2)     # (tile, r, c) in tile order
-    sc = t[:, CODE_BYTES:].copy().view("<u2").reshape(rt * kt, ROWS, COLS // GROUP).astype(np.uint16)
-    scale = sc.view(np.float16).astype(np.float32)
-    codes3 = codes.reshape(rt, kt, ROWS, COLS).transpose(0, 2, 1, 3)
-    scale3 = scale.reshape(rt, kt, ROWS, COLS // GROUP).transpose(0, 2, 1, 3)
-    w = codes3.astype(np.float32) * np.repeat(scale3, GROUP, axis=3)
-    return w.reshape(N, K)
+    codes = quad.reshape(rt, kt, ROWS, COLS).transpose(0, 2, 1, 3).reshape(N, K)
+    sb = t[:, CODE_BYTES:].copy().view("<u2").reshape(rt, kt, ROWS, COLS // GROUP)
+    return codes, np.ascontiguousarray(sb.transpose(0, 2, 1, 3).reshape(N, K // GROUP))
+
+
+def unpack(raw, K, N):
+    """t2 bytes -> float32 [N, K] (the same arithmetic as npu/q4nx.cpp::dequant_tile)."""
+    codes, sb = unpack_bits(raw, K, N)
+    scale = sb.view(np.float16).astype(np.float32)
+    return codes.astype(np.float32) * np.repeat(scale, GROUP, axis=1)
 
 
 def reserved_count(raw, K, N):

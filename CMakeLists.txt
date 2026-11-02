@@ -571,6 +571,13 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# The t2s weight stream (q4nx_weight_layout "t2s"): the same integer-exact weights at 2.125 b/w,
+# expanded on the core.  Its host-side contract is the file size, so the test pins the tile against
+# the numbers tools/q4nx_t2s.py measured on a real image (50,135,040 -> 23,674,880 B for gate/up).
+add_test(NAME npu_t2s_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_t2s_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
+                 ${CMAKE_SOURCE_DIR}/tests/npu_t2s_layout_test.cpp)
 # The t2 chunk (npu/q4nx.h, "The t2 chunk kind"): the same kind of contract, but the thing under
 # test is the shipped decoder, so it compiles npu/q4nx.cpp as well.  No device, no model.
 add_test(NAME npu_t2_layout

@@ -31,6 +31,10 @@ and pb16i's int16 `ms * 2^e_ref`), and a bf16 re-encode is not exact -- measured
 Bonsai-2 images, 87.5 % of the scales are not bf16-representable (worst |rel| 3.9e-3) while 100 % are
 fp16-exact. Same two bytes, so 2176 B and 2.125 b/w do not change.
 
+A tensor that is not whole tiles is refused unless `pad=True`, which zero-pads it to the geometry
+(`pad_to_tile`): code 0 with scale 0.0, so a padded K column contributes exactly 0 and a padded N row
+is never read.
+
 Converters here: pb16i -> t2 (the engine's integer-exact image, lossless), and the GGUF kinds
 PTQ1_0 / TQ1_0 -> t2 (lossless: both are ternary with an fp16 scale) and TQ2_0 -> t2 (lossy, refused
 unless asked: TQ2_0's code 3 means +2, which a ternary chunk cannot hold).
@@ -66,9 +70,38 @@ def scale_offset(r, c):
 # ── pack / unpack ────────────────────────────────────────────────────────────────────────────────
 
 
-def pack(codes, scales):
-    """codes int8 [N, K] in {-1, 0, 1}, scales fp16 [N, K//128] -> t2 bytes."""
+def pad_to_tile(codes, scales):
+    """Zero-pad a tensor to t2 geometry (N -> % 32, K -> % 256). Returns (codes, scales).
+
+    This is the pinned convention for a tensor whose shape is not whole tiles (docs/npu.md): the
+    padding is code 0 with scale 0.0, so a padded K column is a weight of exactly 0 and contributes
+    0 to the reduction for any activation, and a padded N row is never read.  The caller keeps the
+    padded shape -- the chunk has no field to record the original one.
+    """
     codes = np.asarray(codes, dtype=np.int8)
+    scales = np.asarray(scales, dtype=np.float16)
+    N, K = codes.shape
+    if scales.shape != (N, K // GROUP):
+        raise ValueError(f"scales must be [N, K//128] = {(N, K // GROUP)}, got {scales.shape}")
+    Np, Kp = -(-N // ROWS) * ROWS, -(-K // COLS) * COLS
+    if (Np, Kp) == (N, K):
+        return codes, scales
+    c = np.zeros((Np, Kp), np.int8)
+    c[:N, :K] = codes
+    s = np.zeros((Np, Kp // GROUP), np.float16)
+    s[:N, :K // GROUP] = scales
+    return c, s
+
+
+def pack(codes, scales, pad=False):
+    """codes int8 [N, K] in {-1, 0, 1}, scales fp16 [N, K//128] -> t2 bytes.
+
+    pad=True zero-pads a tensor that is not whole tiles (pad_to_tile); default refuses it.
+    """
+    codes = np.asarray(codes, dtype=np.int8)
+    scales = np.asarray(scales, dtype=np.float16)
+    if pad:
+        codes, scales = pad_to_tile(codes, scales)
     N, K = codes.shape
     if N % ROWS or K % COLS:
         raise ValueError(f"t2 needs N % {ROWS} == 0 and K % {COLS} == 0, got {N}x{K}")
@@ -211,7 +244,7 @@ def _trits_base3(b, n_trits):
     return out
 
 
-def from_ptq1_0(rows, K, N):
+def from_ptq1_0(rows, K, N, pad=False):
     """PrismML PTQ1_0 (28 B / 128 values: qs[24], qh[2], fp16 d) -> t2. Lossless.
 
     The trit codec is q4nx_pb16i.read_ptq1_0's, not restated here: PTQ1_0 does not lay its 128
@@ -221,10 +254,10 @@ def from_ptq1_0(rows, K, N):
     import q4nx_pb16i as PB
     codes, dbits = PB.read_ptq1_0(bytes(rows), K, N)          # codes [K][N] int8, d bits [K/128][N]
     d = dbits.T.copy().view(np.float16)                       # [N][K/128]
-    return pack(codes.T.copy().astype(np.int8), d)
+    return pack(codes.T.copy().astype(np.int8), d, pad=pad)
 
 
-def from_tq1_0(rows, K, N):
+def from_tq1_0(rows, K, N, pad=False):
     """ggml TQ1_0 (QK_K=256: qs[48], qh[4], fp16 d = 54 B) -> t2. Lossless (ternary, one d per 256 K)."""
     QK, SZ = 256, 54
     rows = np.asarray(rows, dtype=np.uint8)
@@ -244,10 +277,10 @@ def from_tq1_0(rows, K, N):
     tr[:, :, 240:256] = t.transpose(2, 0, 1).reshape(N, K // QK, 16)
     d = np.frombuffer(b[:, :, 52:54].tobytes(), dtype="<f2").reshape(N, K // QK)
     # two 128-K t2 blocks per 256-K TQ1_0 block share the one d
-    return pack(tr.reshape(N, K), np.repeat(d.astype(np.float16), 2, axis=1))
+    return pack(tr.reshape(N, K), np.repeat(d.astype(np.float16), 2, axis=1), pad=pad)
 
 
-def from_tq2_0(rows, K, N, allow_nonternary=False):
+def from_tq2_0(rows, K, N, allow_nonternary=False, pad=False):
     """ggml TQ2_0 (QK_K=256: qs[64], fp16 d) -> t2.
 
     TQ2_0 is NOT ternary: its code 3 means +2. Converting it is refused unless allow_nonternary,
@@ -269,7 +302,7 @@ def from_tq2_0(rows, K, N, allow_nonternary=False):
                          f"not ternary, so not t2; pass allow_nonternary=True to clamp them to +1")
     tr = np.clip(tr, -1, 1)
     d = np.frombuffer(b[:, :, 64:66].tobytes(), dtype="<f2").reshape(N, K // QK)
-    return pack(tr.reshape(N, K), np.repeat(d.astype(np.float16), 2, axis=1)), n_plus2
+    return pack(tr.reshape(N, K), np.repeat(d.astype(np.float16), 2, axis=1), pad=pad), n_plus2
 
 
 if __name__ == "__main__":

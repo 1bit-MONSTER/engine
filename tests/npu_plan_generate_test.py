@@ -31,7 +31,7 @@ def check(ok, what):
         print(f"FAIL {what}")
 
 
-def model_dir(root, *, layout="rm", layers=2, layer_types=None, sealed=""):
+def model_dir(root, *, layout="rm", layers=2, layer_types=None, sealed="", **extra):
     d = os.path.join(root, "model")
     os.makedirs(os.path.join(d, "kernels"), exist_ok=True)
     cfg = {
@@ -48,6 +48,7 @@ def model_dir(root, *, layout="rm", layers=2, layer_types=None, sealed=""):
         "linear_value_head_dim": 128,
         "q4nx_weight_layout": layout,
     }
+    cfg.update(extra)
     if layer_types:
         cfg["layer_types"] = layer_types
     if sealed:
@@ -116,6 +117,16 @@ with tempfile.TemporaryDirectory() as root:
     # 5. The plan printer writes nothing.
     r = run(d2, "--print")
     check(r.returncode == 0 and '"format": "1bit-npu-plan/1"' in r.stdout, "--print emits the plan on stdout")
+
+    # 6. attn_output_gate (qwen3_5's q|gate): q_proj emits q AND the output gate, so the fused QKV
+    #    carries twice the q rows.  Found by running this generator on the real d3-lite pack, whose
+    #    q_proj is [4096,1024] with 8 heads of 256 while the tool asked for a 3072-wide kernel.
+    d3 = model_dir(os.path.join(root, "c"), layers=1, layer_types=["full_attention"],
+                   attn_output_gate=True)
+    run(d3)
+    p3 = json.load(open(os.path.join(d3, "plan.json")))
+    check(p3["layers"][0]["qkv"]["N"] == (2 * 16 + 2 * 8) * 128,
+          "attn_output_gate doubles the q rows in the attn QKV (q4nx_pack.c:150)")
 
 print("npu_plan_generate: ok" if not failures else "npu_plan_generate: FAILED")
 sys.exit(1 if failures else 0)

@@ -24,6 +24,7 @@
 //   [4] the base state after the loop is the same as plain decoding would leave (rollback is not "close");
 //   [5] k is clamped to max_batch_rows(), never silently widened past what one batch can hold.
 #include "mtp/draft.h"
+#include "mtp/mtp_head.h"
 
 #include <cstdio>
 #include <cstdlib>
@@ -66,6 +67,10 @@ public:
         logits_all.assign(tokens.size() * (size_t)V, 0.0f);
         for (size_t m = 0; m < tokens.size(); m++)
             fill_logits(start_pos + (int)m, logits_all, m * (size_t)V);
+        // Per-row hidden, the same quantity the real forward exposes for a drafter that must advance too: row m is
+        // the hidden after the token at start_pos+m (this toy's hidden is "positions consumed so far").
+        rows_.assign(tokens.size(), 0.0f);
+        for (size_t m = 0; m < tokens.size(); m++) rows_[m] = (float)(consumed_ + (int)m + 1);
         consumed_ += (int)tokens.size();
         pending_ = (int)tokens.size();     // these rows are a verify batch until commit_verify() decides
         batches_++;
@@ -78,6 +83,7 @@ public:
     bool commit_verify(int accepted) override {
         if (accepted < 0 || accepted > pending_) return false;
         consumed_ = consumed_ - pending_ + accepted;
+        rows_.resize((size_t)accepted);     // the accepted prefix only, as the engine's commit_verify_rows does now
         pending_ = 0;
         commits_++;
         last_commit_ = accepted;
@@ -89,6 +95,7 @@ public:
     int pending() const { return pending_; }
 
     const std::vector<float>& last_hidden() const override { return hidden_; }
+    const std::vector<float>& last_hidden_rows() const override { return rows_; }
 
     int consumed() const { return consumed_; }
     int steps() const { return steps_; }
@@ -108,12 +115,13 @@ private:
     int consumed_ = 0, steps_ = 0, batches_ = 0, commits_ = 0, last_commit_ = -1, pending_ = 0;
     int bad_pos_ = 0, over_batch_ = 0;
     std::vector<float> hidden_{0.0f};
+    std::vector<float> rows_;
 };
 
 // Knows the truth (reads the position out of the hidden state): every draft should be accepted.
 class PerfectHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
               std::vector<float>* conf = nullptr) override {
         if (conf) conf->assign((size_t)k, 1.0f);
         const int have = (int)hidden[0];                      // positions consumed so far
@@ -126,7 +134,7 @@ public:
 // Proposes the token AFTER the true one at every position: the base must refuse all of it.
 class GarbageHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
               std::vector<float>* conf = nullptr) override {
         if (conf) conf->assign((size_t)k, 0.1f);
         const int have = (int)hidden[0];
@@ -139,7 +147,7 @@ public:
 // Right for the first draft, wrong afterwards: exercises the longest-prefix accept AND the rollback.
 class HalfHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
               std::vector<float>* conf = nullptr) override {
         if (conf) { conf->assign((size_t)k, 0.1f); if (!conf->empty()) (*conf)[0] = 1.0f; }
         const int have = (int)hidden[0];
@@ -151,6 +159,51 @@ public:
 };
 
 bool same(const std::vector<int>& a, const std::vector<int>& b) { return a == b; }
+
+// ---- the drafter's own stream (MtpDrafter's cursor) ------------------------------------------------------------
+//
+// The MTP head attends over its own states, so a draft is worth something only when the drafter's cache IS the base
+// model's committed stream, row by row.  RealMtpDrafter below is the production class with its one device-shaped
+// piece (the head row) replaced by a toy: it knows the truth exactly when its cache length equals the position it is
+// drafting from, i.e. when it has seen the whole stream and nothing else.  That makes the cursor testable with no
+// weights and no device -- and it makes the failure silent in production *and* visible here.
+static onebit::npu::mtp::Weights g_no_weights;   // the toy never touches the head's matrices
+
+class StreamDrafter : public onebit::npu::mtp::MtpDrafter {
+public:
+    StreamDrafter()
+        : onebit::npu::mtp::MtpDrafter(
+              g_no_weights, [](int, std::vector<float>& e) { e.assign(1, 0.0f); return true; }, nullptr, 1) {
+        set_tau(0.0f);          // measure every depth, like the offline protocol
+        set_lm_head(false);
+    }
+
+    // The old live path, reproduced: rows land in the cache but the cursor is not advanced.  Kept so the check below
+    // states the bug instead of assuming it (npu/mtp/mtp_head.cpp prime() is the fixed version).
+    void legacy_prime(int pos) {
+        cache_.k.resize((size_t)pos + 1, 0.0f);
+        cache_.v.resize((size_t)pos + 1, 0.0f);
+        cache_.t = pos + 1;
+    }
+    int cache_rows() const { return cache_.t; }
+
+protected:
+    bool next_row(const float* hidden, int, int pos, std::vector<float>& next, std::vector<float>& logits) override {
+        const int rows = cache_.t + 1;                 // this row lands at index cache_.t
+        cache_.k.resize((size_t)rows, 0.0f);
+        cache_.v.resize((size_t)rows, 0.0f);
+        cache_.t = rows;
+        logits.assign((size_t)V, 0.0f);
+        // The toy reads two things a real head needs and a broken loop gets wrong: which position this row predicts
+        // (the base's own hidden says it) and whether the cache it attends over is the complete stream up to here.
+        const int pred = (int)hidden[0];
+        const int t = truth(pred);
+        (void)pos;
+        logits[(size_t)(rows == pred + 1 ? t : (t + 1) % V)] = 1.0f;   // right only if the stream is complete
+        next.assign(1, (float)(pred + 1));
+        return true;
+    }
+};
 
 int fails = 0;
 void check(bool cond, const char* what) {
@@ -252,6 +305,54 @@ int main() {
               "commit: the last commit was a prefix of the verified rows");
         std::printf("INFO half head k=4: commits=%d last_commit=%d accepted=%d drafted=%d\n", m.commits(),
                     m.last_commit(), r.stats.accepted, r.stats.drafted);
+    }
+
+    // [8] the drafter's stream: a chain must start where the base model's committed stream ends, and a committed
+    //     row must replace the open chain's provisional rows.  Two runs of the same loop, differing only in whether
+    //     the drafter's cursor knows about the primed prompt:
+    //       * primed (what the serve route does): every draft is accepted, because the head's cache is the base's
+    //         stream -- 0 stream mismatches;
+    //       * legacy_prime (the old live path, rows in the cache and the cursor at 0): almost nothing is accepted and
+    //         the mismatch counter says why.  That is the 0.62-vs-2.19 collapse, reproduced without weights.
+    {
+        const int P0 = (int)P.size();
+        {   // primed: the cursor is what makes the offline protocol's acceptance reachable in the live loop
+            ToyBase m(8); StreamDrafter sd;
+            for (int i = 0; i < P0; i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+            Options o = base_opt; o.k = 4; o.tau = 0.0f;      // every depth measured, like the offline protocol
+            const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+            check(r.ok && same(r.tokens, ref.tokens), "stream: primed drafter still emits plain-decode text");
+            check(sd.stream_mismatches() == 0, "stream: a primed drafter is never opened at the wrong position");
+            check(sd.stream().keep() == (int)P.size() + r.stats.emitted,
+                  "stream: the drafter's committed rows == prompt + emitted (its cache IS the base's stream)");
+            check(r.stats.accepted == r.stats.drafted,
+                  "stream: a drafter that has seen the stream accepts every draft (no bookkeeping loss)");
+            std::printf("INFO stream primed k=4: rows=%d, mismatches=%d, accepted %d/%d, passes/token %.3f\n",
+                        sd.stream().keep(), sd.stream_mismatches(), r.stats.accepted, r.stats.drafted,
+                        r.stats.passes_per_token());
+        }
+        {   // the old path: rows land, the cursor does not
+            ToyBase m(8); StreamDrafter sd;
+            for (int i = 0; i < P0; i++) sd.legacy_prime(i);
+            Options o = base_opt; o.k = 4; o.tau = 0.0f;
+            const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+            check(r.ok && same(r.tokens, ref.tokens), "stream: legacy path is text-correct too (drafts only cost time)");
+            check(sd.stream_mismatches() > 0, "stream: legacy path is reported as out of step, not silently bad");
+            check(r.stats.accepted * 4 < r.stats.drafted, "stream: legacy path collapses acceptance (the measured drift)");
+            std::printf("INFO stream legacy k=4: rows=%d, mismatches=%d, accepted %d/%d, passes/token %.3f\n",
+                        sd.stream().keep(), sd.stream_mismatches(), r.stats.accepted, r.stats.drafted,
+                        r.stats.passes_per_token());
+        }
+        // per-depth accounting exists and adds up to the totals (the live-vs-offline comparison needs it)
+        {
+            ToyBase m(8); StreamDrafter sd;
+            for (int i = 0; i < P0; i++) sd.prime(std::vector<float>{(float)(i + 1)}, 0, i);
+            Options o = base_opt; o.k = 4; o.tau = 0.0f;
+            const Result r = onebit::npu::mtp::run(m, &sd, P, o);
+            int d = 0, a = 0;
+            for (int i = 0; i < onebit::npu::mtp::Stats::kMaxDepth; i++) { d += r.stats.drafted_at[i]; a += r.stats.accepted_at[i]; }
+            check(d == r.stats.drafted && a == r.stats.accepted, "stream: per-depth counters add up to the totals");
+        }
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

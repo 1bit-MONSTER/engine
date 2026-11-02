@@ -203,8 +203,11 @@ add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # the base model agrees with, roll its state back.  Policy only -- a toy base model and toy draft heads stand
 # in for the forward and the MTP head, so the invariants (identical text whatever the head proposes, exact
 # rollback, k clamped to the batch width) are checked on every build without a device.
-add_executable(mtp_draft_test tests/mtp_draft_test.cpp)
+add_executable(mtp_draft_test tests/mtp_draft_test.cpp npu/mtp/mtp_head.cpp)
 target_include_directories(mtp_draft_test PRIVATE npu)
+if(TARGET OpenMP::OpenMP_CXX)
+    target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
 # ci.yml's build step lists every ctest target explicitly, and this branch cannot edit that file (the push
 # token has no `workflow` scope), so the binary is pulled in as a dependency of a listed test target. When a
@@ -455,6 +458,10 @@ if(Python3_Interpreter_FOUND)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)
+    # the 2-bit ternary stream the XDNA decode kernel reads (tools/q4nx_t2s.py): the expansion it derives
+    # must reproduce the pb16i image's own int4 code bytes, block for block. Synthetic weights only -- the
+    # real-image leg is the same check on 14 GB of Bonsai-2 images and is run by hand.
+    add_test(NAME q4nx_t2s COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2s_test.py)
     # the safetensors -> Q4NX converter and the d3 readout head it packs (engine #653): every
     # fixture is synthesised, so this needs numpy and nothing else — no gguf-py, no model, no
     # device, no download.
@@ -747,6 +754,16 @@ if(ONEBIT_NPU)
     target_link_libraries(mtp_batch_all_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test mtp_batch_all_test)
     add_test(NAME mtp_batch_all COMMAND mtp_batch_all_test)
+    # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
+    # step_batch_all(), commit the accepted prefix, repeat.  The head runs on the host in the pb16i-exact
+    # arithmetic, the base on the exact route.  Needs the device, so it is a tool, not a ctest.
+    add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
+    target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
+    target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(mtp_acceptance PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source

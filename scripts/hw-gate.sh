@@ -64,8 +64,8 @@
 # measurement, not by assumption - engine#673 measured a GPU-busy NPU stream keeping ~87 % of its bandwidth
 # (7.40 GB/s against 8.2-8.5 idle, 10.5-10.9 ms -> 12.0 ms per launch, 160/160 byte-exact, zero resets), so
 # waiting behind an NPU serve only made the gate miss its window (c16's gate was cut 3x by its own 20-minute
-# hold). ~/npu.lock is still what the NPU phase takes, below: an NPU dispatch must not overlap another NPU
-# dispatch. Each GPU step runs under scripts/mem-guard.sh and ~/lb/thermal-run.sh, waits for the PR-Agent
+# hold). The NPU phase, below, is the one that must not overlap another NPU dispatch - and it takes the whole
+# fleet's NPU queue for that, not ~/npu.lock alone (see the npu phase's own note).
 # model (coder-llm, :8090) to be idle before it starts, and afterwards reports any new amdgpu ring timeout
 # (HRX dispatches starve that Vulkan service). Exit 0 = pass, 1 = a check failed, 2 = the box could not run
 # the gate.
@@ -98,6 +98,29 @@ STORE=${HW_GATE_STORE:-$HOME/.cache/hw-gate}
 MODELS=${HW_GATE_MODELS:-$HOME/models}
 LOCK=${HW_GATE_LOCK:-$HOME/npu.lock}
 LOCK_WAIT=${HW_GATE_LOCK_WAIT:-5400}
+# The NPU array's fair claim, the one the rest of the box uses: npu-hold puts the command on ~/NPU-QUEUE and
+# ~/NPU-TOKEN, and npu-serve-keeper stops the owner's serve while a ticket waits. ~/npu.lock is a *private*
+# flock - only the gates that know about it take it - so on 2026-11-02 an npu phase held only ~/npu.lock while
+# another lane held ~/NPU-TOKEN: two AIE2 contexts were live at once and the firmware fired two TDRs
+# (aie2_legacy_tdr_detect, Context 6 and 8) inside a 65.49 tok/s row that had passed 50 minutes earlier.
+NPU_TOKEN=${HW_GATE_NPU_TOKEN:-$HOME/NPU-TOKEN}
+NPU_HOLD=${HW_GATE_NPU_HOLD_BIN:-$(command -v npu-hold 2> /dev/null || true)}
+if [ -z "$NPU_HOLD" ] && [ -x "$HOME/.local/bin/npu-hold" ]; then NPU_HOLD=$HOME/.local/bin/npu-hold; fi
+# Is <token file> held by an ancestor of this process? A chain already wrapped in one npu-hold (the release
+# lane runs "npu-hold -- gate.sh ops kat kld ...") must use that claim, not queue behind itself - the same
+# self-deadlock that wedged c18 for 51 min on the GPU queue. The token names its holder's pid.
+token_held_by_ancestor() {
+    local pid p
+    pid=$(sed -n 's/.*pid \([0-9][0-9]*\).*/\1/p' "$1" 2> /dev/null | tail -n 1)
+    [ -n "$pid" ] || return 1
+    p=$$
+    while [ "${p:-0}" -gt 1 ] 2> /dev/null; do
+        [ "$p" = "$pid" ] && return 0
+        p=$(sed 's/.*) //' "/proc/$p/stat" 2> /dev/null | awk '{print $2}')
+        [ -n "${p:-}" ] || return 1
+    done
+    return 1
+}
 THERMAL=${HW_GATE_THERMAL:-$HOME/lb/thermal-run.sh}
 MEM_FLOOR=${HW_GATE_MEM_FLOOR:-12}
 CODER_URL=${HW_GATE_CODER_URL:-http://127.0.0.1:8090}
@@ -599,9 +622,11 @@ fi
 # prompt + teacher-forced steps), greedy64 the 64-position build, prefill the prompt prefill,
 # reproducible that repeated runs match byte for byte. Set HW_GATE_NPU_CHECK to the private
 # checker (it reads its own settings from the environment) and
-# HW_GATE_NPU_FLOOR to the tok/s floor (default 30). The NPU shares the box: this runs inside
-# the gate's GPU claim and is the only phase that takes ~/npu.lock (GPU steps no longer do, engine#682),
-# and is NOT wrapped in thermal-run (its freeze can abort an NPU dispatch); cool() gates the start instead.
+# HW_GATE_NPU_FLOOR to the tok/s floor (default 30). The NPU shares the box: this runs under the fleet's NPU
+# claim (npu-hold: ~/NPU-QUEUE + ~/NPU-TOKEN), with ~/npu.lock as the inner guard, so it cannot overlap
+# another lane's NPU dispatch or the owner's serve - see the note at NPU_HOLD. HW_GATE_NPU_HOLD=0 uses only
+# ~/npu.lock (a caller that already holds ~/NPU-TOKEN is detected and does the same), and is NOT wrapped in
+# thermal-run (its freeze can abort an NPU dispatch); cool() gates the start instead.
 if has npu; then
   t0=$(date +%s)
   if [ ! -e /dev/accel/accel0 ]; then
@@ -611,7 +636,11 @@ if has npu; then
   else
     cool
     log=$OUT/npu.log
-    flock -w "$LOCK_WAIT" -E 75 "$LOCK" sh -c "$HW_GATE_NPU_CHECK" > "$log" 2>&1
+    hold_args=()
+    if [ "${HW_GATE_NPU_HOLD:-1}" != 0 ] && [ -n "$NPU_HOLD" ] && ! token_held_by_ancestor "$NPU_TOKEN"; then
+        hold_args=("$NPU_HOLD" -l hw-gate-npu -t "${HW_GATE_NPU_HOLD_MINUTES:-20}" -w "$LOCK_WAIT" --)
+    fi
+    "${hold_args[@]}" flock -w "$LOCK_WAIT" -E 75 "$LOCK" sh -c "$HW_GATE_NPU_CHECK" > "$log" 2>&1
     rc=$?
     floor=${HW_GATE_NPU_FLOOR:-30}
     get() { sed -n "s/^$1 //p" "$log" | tail -n 1; }

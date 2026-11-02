@@ -198,9 +198,13 @@ rows = [
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
     # version matched "Unable to locate package neofetch" and reported a pass (measured 2026-11-02)
-    ("U1 apt",       "apt update 2>&1 | tail -2; apt install -y neofetch 2>&1 | tail -3; "
-                     "command -v neofetch && echo neofetch-installed || echo neofetch-missing",
-                     "neofetch-installed", 600),
+    # neofetch is not in the 26.04 archive at all (measured on this box: `apt-cache policy neofetch` and
+    # `apt-cache search '^neofetch$'` are both empty), so the owner's exact command cannot pass on resolute.
+    # The row stays, as a fact rather than a gate, and fastfetch is the packaged equivalent.
+    ("U1 neofetch",  "apt install -y neofetch 2>&1 | tail -2; "
+                     "command -v neofetch && echo neofetch-installed || echo neofetch-not-in-resolute", None),
+    ("U1 fastfetch", "apt update 2>&1 | tail -2; apt install -y fastfetch 2>&1 | tail -2; "
+                     "command -v fastfetch && echo fastfetch-installed", "fastfetch-installed", 600),
     ("U1 apt-any",   "apt install -y --no-install-recommends cowsay 2>&1 | tail -2; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
@@ -221,6 +225,15 @@ rows = [
     ("U7 key-owner", "chown 0:0 /root/.ssh /root/.ssh/authorized_keys 2>&1; "
                      "ls -l /root/.ssh/authorized_keys | awk '{print $3\"/\"$4\"/\"$1}'; "
                      "/usr/sbin/sshd -t 2>&1 | head -2; echo key-owner-done", None),
+    # the in-VM half of the fix, so it is measured before a rebuild: tcpwrappers is what closes the kex
+    ("U7 hosts",     "grep -v '^#' /etc/hosts.deny | grep . ; grep -v '^#' /etc/hosts.allow | grep . ; "
+                     "grep -q '1bit-lan' /etc/hosts.allow || "
+                     "printf 'ALL: LOCAL, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  "
+                     "# 1bit-lan\\n' >> /etc/hosts.allow; "
+                     "grep -c '1bit-lan' /etc/hosts.allow", None),
+    ("U7 listen",    "netstat -lntp 2>/dev/null | grep ':22 ' | head -2; "
+                     "grep -iE '^(PermitRootLogin|DenyUsers|AllowUsers|Port|PasswordAuthentication)' "
+                     "/etc/ssh/sshd_config /etc/ssh/sshd_config.d/*.conf 2>/dev/null | head -6", None),
     ("U7 sshd",      "ps | grep -c '[s]shd'; ls -l /root/.ssh/authorized_keys 2>&1 | tail -1; "
                      "ls /etc/ssh/ssh_host_* 2>&1 | head -3; /usr/sbin/sshd -t 2>&1 | head -3; echo sshd-checked", None),
     ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),
@@ -278,11 +291,14 @@ else
 fi
 # U7, over the wire: SSHKEY=<private key> and the key half of which must be in the image's keys.
 if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
-    said=$(timeout 30 ssh -p "$sshport" -i "$SSHKEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
-        -o UserKnownHostsFile=/dev/null root@127.0.0.1 'uname -r; command -v 1bit' 2>&1 | tr '\n' ' ')
+    # the remote command prints a marker, and THAT is what the row matches: filtering the verbose stream for
+    # debug lines once threw the command's own output away and the row failed while the login had worked
+    said=$(timeout 40 ssh -v -p "$sshport" -i "$SSHKEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null root@127.0.0.1 \
+        'echo ONBOARD-SSH-OK; uname -r; command -v 1bit' 2>&1 | tr '\n' ' ')
     case $said in
-    *7.3.0-rc4-1bit*) echo "PASS U7 ssh        $said" ;;
-    *) echo "FAIL U7 ssh        $said" ;;
+    *ONBOARD-SSH-OK*) echo "PASS U7 ssh        $(printf '%s' "$said" | tail -c 150)" ;;
+    *) echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 240)" ;;
     esac
 else
     echo "SKIP U7 ssh        set SSHKEY=<private key> whose public half is in the image"

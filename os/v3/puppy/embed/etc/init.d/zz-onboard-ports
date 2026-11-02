@@ -34,4 +34,18 @@ open_port() {
 }
 open_port 13305   # Lemonade (U3)
 open_port 22      # ssh, the owner's key (U7)
+
+# And the other half of reachability, measured the same way: Puppy ships /etc/hosts.deny = "ALL: ALL" with
+# /etc/hosts.allow = "ALL: LOCAL", and LOCAL means this machine, so a client on the LAN is refused by
+# tcpwrappers before ssh's key exchange even starts - ssh says `kex_exchange_identification: Connection
+# closed by remote host` while sshd is listening on 0.0.0.0:22 and the port rule above is in place.
+# The RFC1918 ranges are added, not the world: sshd still wants the owner's key, and Lemonade still wants
+# its API key.
+if [ -f /etc/hosts.allow ] && ! grep -q '1bit-lan' /etc/hosts.allow 2> /dev/null; then
+    printf 'ALL: LOCAL, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  # 1bit-lan\n' \
+        >> /etc/hosts.allow
+fi
+grep -q '1bit-lan' /etc/hosts.allow 2> /dev/null && \
+    echo "zz-onboard-ports: the LAN is allowed through tcpwrappers (hosts.allow)" || \
+    echo "zz-onboard-ports: could not add the LAN to /etc/hosts.allow" >&2
 echo "zz-onboard-ports: $(iptables -S INPUT 2> /dev/null | grep -c 'dport') inbound port rule(s) live"

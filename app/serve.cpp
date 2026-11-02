@@ -2794,6 +2794,29 @@ int run_serve(int argc, char** argv) {
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
+    // engine#715: the trio goes into serve's own environment as well, not only into the backends' envp. Two reasons:
+    // a descendant that exec()s with the inherited environment (run_program's helpers, LayaDaemon's daemon) then has
+    // it too, and a spawn site added later cannot forget it. A value the caller set still wins.
+    if (const int added = apply_cwsr_env_to_self(hrx_cwsr_env(o)); added > 0 && !o.print_backend)
+        std::fprintf(stderr, "1bit serve: %d of the engine#315 save-area variables set in serve's own environment "
+                             "too, so every child process inherits them (engine#715)\n", added);
+    // engine#715: refuse a *deliberate* opt-out from the save-area trio on an HRX route. Narrow on purpose: the
+    // condition is the user's own choice (--hrx-cwsr-placement=off or HRX_SVM=1), not "the trio happens to be empty",
+    // because the trio is also empty in a build whose hrx-system has no HRX_ALLOW_NO_SVM gate -- that build logs its
+    // own line and cannot start HRX0 at all, and refusing there made every stubbed route test in CI fail (nine of
+    // them, 2026-11-02). ONEBIT_HRX_NO_TRIO_OK=1 is the acknowledgement for a box whose ROCr does not need the
+    // placement.
+    const bool cwsr_opted_out = o.cwsr_placement == CwsrPlacement::Off ||
+                                [] { const char* v = std::getenv("HRX_SVM"); return v != nullptr && std::string(v) == "1"; }();
+    if ((o.device == "hrx" || o.device == "auto") && cwsr_opted_out && !cwsr_env_present(hrx_cwsr_env(o))) {
+        const char* ok = std::getenv("ONEBIT_HRX_NO_TRIO_OK");
+        if (!ok || std::string(ok) != "1")
+            throw std::runtime_error(
+                    std::string("this serve would start HRX without the save-area variables that keep ROCr from page-")
+                    + "faulting on the first graph replay (engine#715, docs/hrx.md), because you asked for it with "
+                    + "--hrx-cwsr-placement=off or HRX_SVM=1. Either drop that, or set them yourself:\n    " + kCwsrRecipe
+                    + "\n  or set ONEBIT_HRX_NO_TRIO_OK=1 if this box's ROCr does not need them.");
+    }
     if (o.print_backend) {
         if (fs::is_directory(o.model)) return serve_only("an NPU model directory runs in serve's own process");
         if (o.device == "npu") return serve_only("--device npu runs in serve's own process");

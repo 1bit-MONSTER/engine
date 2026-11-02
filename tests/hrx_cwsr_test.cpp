@@ -140,6 +140,37 @@ int main() {
         expect(threw, "parse refuses yes");
     }
 
+    // engine#715: the trio is a process-level rule, not only a backend-environment one
+    {
+        const std::vector<std::string> full = {"HSA_USE_SVM=0", "HSA_USERPTR_FOR_PAGED_MEM=0", "HRX_ALLOW_NO_SVM=1"};
+        expect(cwsr_env_present(full), "present: the full trio");
+        expect(!cwsr_env_present({}), "missing: empty");
+        expect(!cwsr_env_present({"HSA_USE_SVM=0", "HRX_ALLOW_NO_SVM=1"}), "missing: one of three absent");
+        expect(!cwsr_env_present({"HSA_USE_SVM=0", "HSA_USERPTR_FOR_PAGED_MEM0=0", "HRX_ALLOW_NO_SVM=1"}),
+               "missing: a name that only starts with the same letters does not count");
+        expect(cwsr_env_present({"OTHER=1", "HSA_USE_SVM=1", "HSA_USERPTR_FOR_PAGED_MEM=1", "HRX_ALLOW_NO_SVM=0"}),
+               "present: the caller's own values count as present (the engine lets them win)");
+        expect(std::string(kCwsrRecipe) ==
+                       "HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1",
+               "the recipe names the trio in the order serve sets it");
+        // apply to self: adds what is absent, leaves a value the caller set alone
+        unsetenv("HSA_USE_SVM");
+        unsetenv("HSA_USERPTR_FOR_PAGED_MEM");
+        unsetenv("HRX_ALLOW_NO_SVM");
+        setenv("HRX_ALLOW_NO_SVM", "7", 1);   // a caller's own value must survive
+        const int added = apply_cwsr_env_to_self(full);
+        expect(added == 2, "apply: adds the two that were absent (got " + std::to_string(added) + ")");
+        expect(std::string(getenv("HSA_USE_SVM")) == "0", "apply: HSA_USE_SVM=0 in this process");
+        expect(std::string(getenv("HRX_ALLOW_NO_SVM")) == "7", "apply: a value the caller set wins");
+        expect(cwsr_env_present({"HSA_USE_SVM=" + std::string(getenv("HSA_USE_SVM")),
+                                 "HSA_USERPTR_FOR_PAGED_MEM=" + std::string(getenv("HSA_USERPTR_FOR_PAGED_MEM")),
+                                 "HRX_ALLOW_NO_SVM=" + std::string(getenv("HRX_ALLOW_NO_SVM"))}),
+               "apply: the process environment is complete afterwards");
+        unsetenv("HSA_USE_SVM");
+        unsetenv("HSA_USERPTR_FOR_PAGED_MEM");
+        unsetenv("HRX_ALLOW_NO_SVM");
+    }
+
     for (const char* n : {"on", "off", "auto", "junk"}) unlink((dir + "/" + n).c_str());
     rmdir(dir.c_str());
     if (failures) return 1;

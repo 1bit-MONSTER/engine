@@ -45,16 +45,18 @@ fi
 
 # root and every human account (uid >= 1000); system accounts keep their nologin/false shells
 tmp=$pw.new
-# root, every uid >= 1000, and any account whose shell is a real POSIX shell (/bin/sh, /bin/ash - Puppy's
-# `spot` is uid 502 and is a user a person can log in as). Service accounts keep their nologin/false.
+# root, every uid >= 1000, and Puppy's own `spot` (uid 502, the account the desktop apps run as and the only
+# non-root account a person logs in as). NOT every /bin/sh account: woof-CE's passwd gives `daemon` and
+# `nobody` /bin/sh too, and a service account with a login shell is not what "any user lands in bash" means
+# (measured: the first version of this script converted both, so uid 65534 - nobody - is excluded as well).
 awk -F: 'BEGIN { OFS = ":" }
-         $1 == "root" || ($3 + 0) >= 1000 || $7 == "/bin/sh" || $7 == "/bin/ash" { $7 = "/bin/bash" }
+         $1 == "root" || $1 == "spot" || (($3 + 0) >= 1000 && ($3 + 0) < 65534) { $7 = "/bin/bash" }
          { print }' "$pw" > "$tmp" || {
     echo "shell-login: REFUSED: could not rewrite $pw" >&2; exit 1; }
 cat "$tmp" > "$pw" || { echo "shell-login: REFUSED: could not write $pw" >&2; exit 1; }
 rm -f "$tmp"
 
-bad=$(awk -F: '($1 == "root" || ($3 + 0) >= 1000 || $7 == "/bin/sh" || $7 == "/bin/ash") && $7 != "/bin/bash" { printf "%s(%s) ", $1, $7 }' "$pw")
+bad=$(awk -F: '($1 == "root" || $1 == "spot" || (($3 + 0) >= 1000 && ($3 + 0) < 65534)) && $7 != "/bin/bash" { printf "%s(%s) ", $1, $7 }' "$pw")
 [ -z "$bad" ] || { echo "shell-login: REFUSED: still not bash: $bad" >&2; exit 1; }
-users=$(awk -F: '($1 == "root" || ($3 + 0) >= 1000 || $7 == "/bin/bash") { printf "%s ", $1 }' "$pw")
+users=$(awk -F: '($1 == "root" || $1 == "spot" || (($3 + 0) >= 1000 && ($3 + 0) < 65534)) { printf "%s ", $1 }' "$pw")
 echo "login shells -> /bin/bash: $users"

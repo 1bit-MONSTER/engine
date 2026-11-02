@@ -424,6 +424,12 @@ if [ "$GGUF_NAME" = none ]; then
     skip gguf "no /data/models/*.gguf on the data partition"
 elif [ -z "${MODELS:-}" ]; then
     skip gguf "'$GGUF_NAME.gguf' is on the data partition, but Lemonade listed no models, so it cannot be checked (see the lemonade row)"
+elif [ ! -e /dev/kfd ] && ! ls /dev/accel/accel* > /dev/null 2>&1; then
+    # The file is on the partition and the registry names it, but Lemonade hides every onebit entry on a
+    # machine with no AMD GPU and no NPU - so "not listed" here says nothing about the image. Measured in
+    # QEMU (cycle 12): /api/v1/models carried no onebit id at all on a VM, while the same image on the
+    # board lists the model. Same hardware test the gpu/npu/models rows use.
+    skip gguf "'$GGUF_NAME.gguf' is on the data partition; this machine has no GPU or NPU, so Lemonade hides the onebit entries that would list it"
 elif have_model "$GGUF_NAME" || have_model "$GGUF_NAME-1bit"; then
     # the local registry names a GGUF <name>-1bit (os/mini/init.sh and /etc/init.d/05onboard-data both
     # do), and llama.cpp lists the bare name; either answer means Lemonade knows this file
@@ -621,7 +627,7 @@ fi
 
 # ── licences and image identity ────────────────────────────────────────────────────────────────
 LIC=; NOT=; LOOKED=
-for d in /usr/share/licenses/1bit-os "$LEMDIR/bin/resources/../../.." "$LEMDIR" "$LEMDIR/bin" /; do
+for d in /usr/share/licenses/1bit-os "$LEMDIR/bin/resources/../../.." "$LEMDIR" "$LEMDIR/1bit" "$LEMDIR/bin" /; do
     LOOKED="$LOOKED $d"
     [ -f "$d/LICENSE-BINARY" ] && LIC=$d/LICENSE-BINARY
     [ -f "$d/NOTICE-BINARY" ] && NOT=$d/NOTICE-BINARY

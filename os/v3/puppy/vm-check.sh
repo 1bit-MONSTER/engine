@@ -304,7 +304,8 @@ rows = [
     # has to be 0 FAIL / 0 SKIP, and this row proves the tool runs and which rows it could not answer here.
     ("U4 release-check", "/usr/local/bin/1bit-release-check --self-test 2>&1 | tail -1; "
                      "/usr/local/bin/1bit-release-check > /tmp/release-check.log 2>&1; "
-                     "grep -E '^(FAIL|SKIP) ' /tmp/release-check.log | cut -d' ' -f1-2 | tr '\\n' ' '; echo; "
+                     "sed -n 's/^\\(FAIL\|SKIP\\)  *\\([a-z0-9-]*\\).*/\\1 \\2/p' /tmp/release-check.log "
+                     "| tr '\\n' ' '; echo; "
                      "grep '^RESULT' /tmp/release-check.log; "
                      "grep -c '^PASS ' /tmp/release-check.log", None, 900),
     # U6 (cycle 12 item 5): the installer the release ships, and the tools it needs on this boot.

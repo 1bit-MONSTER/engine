@@ -151,11 +151,13 @@ def read_until(token, timeout):
         log.write(d); buf += d
     return None
 
-# A disk image boots through grub, whose menu is also on the serial line; the shell entry is the second
-# one, so pick it the way a human at the console would: down, enter. Anything else boots entry 0.
+# A disk image boots through grub, whose menu is also on the serial line. The entries are, in order:
+# 0 headless console (the DEFAULT, owner 2026-11-02), 1 desktop, 2 root shell on the serial port - so the
+# harness picks the third the way a human at the console would: down, down, enter. The serial entry also
+# carries pfix=nox, so the rows below measure the headless boot the appliance now defaults to.
 if artifact.endswith(".img"):
     if read_until(b"serial root shell", 120) is not None:
-        s.sendall(b"\x1b[B\r")
+        s.sendall(b"\x1b[B\x1b[B\r")
         print("INFO boot           grub menu on serial, selected the serial-shell entry", flush=True)
 
 def read_until_re(pattern, timeout):
@@ -255,7 +257,19 @@ rows = [
                      "n=$(grep -c 'one_rescue 1' /initrd/init); echo paths-guarded=$n; "
                      "[ \"$n\" = 3 ] && grep -q 'trap .one_rescue' /initrd/init && echo init-guard-3-paths",
                      "init-guard-3-paths"),
+    # U1 as the board asked for it (owner, cycle 12): the LOGIN shell is bash, not only the bash binary
+    # being present. /etc/passwd is what plogin -> getty -n -l /bin/autologin ends in.
+    ("U1 login shell", "awk -F: '{print $1, $7}' /etc/passwd | head -4; "
+                     "rootsh=$(awk -F: '{if ($1 == \"root\") print $7}' /etc/passwd); echo root=$rootsh; "
+                     "[ \"$rootsh\" = /bin/bash ] && echo login-shell-bash", "login-shell-bash"),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
+    # U2 headless (owner, cycle 12 item 7): the default entry boots with no X, and tty1 is a login prompt.
+    # Puppy's own chain does the second half - /etc/inittab has tty1::respawn:plogin and plogin execs
+    # `getty -n -l /bin/autologin ... tty1` - so the row asserts the getty, which is what a person sees.
+    ("U2 headless",  "tr ' ' '\\n' < /proc/cmdline | grep '^pfix='; "
+                     "pgrep -x Xorg > /dev/null && echo X-RUNNING || echo no-X-server; "
+                     "pgrep -af 'getty.*tty1' | head -1; "
+                     "pgrep -af 'Xorg|X ' | head -1", "no-X-server"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
     # version matched "Unable to locate package neofetch" and reported a pass (measured 2026-11-02)
@@ -281,6 +295,22 @@ rows = [
     ("U4 addlist",   "grep -i '^ADDLIST' /etc/rc.d/MODULESCONFIG; lsmod | grep -c ec_su_axb35", "ec_su_axb35"),
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
                      "/opt/1bit-package"),
+    # U3's CLI (cycle 12 item 2): the owner is told `lemonade` works from bash, so it has to be there and
+    # it has to be the release package's binary, not something a package manager left behind.
+    ("U3 cli",       "ls -l /usr/local/bin/lemonade; readlink /usr/local/bin/lemonade; "
+                     "lemonade --version 2>&1 | head -2", "/opt/1bit-package/bin/lemonade"),
+    # U4 (cycle 12 item 4): the release check ships in the appliance. In the VM its GPU/NPU rows SKIP (no
+    # device), so this row records what it said instead of asserting a PASS: the board run is the one that
+    # has to be 0 FAIL / 0 SKIP, and this row proves the tool runs and which rows it could not answer here.
+    ("U4 release-check", "/usr/local/bin/1bit-release-check --self-test 2>&1 | tail -1; "
+                     "/usr/local/bin/1bit-release-check > /tmp/release-check.log 2>&1; "
+                     "grep -E '^(FAIL|SKIP) ' /tmp/release-check.log | cut -d' ' -f1-2 | tr '\\n' ' '; echo; "
+                     "grep '^RESULT' /tmp/release-check.log; "
+                     "grep -c '^PASS ' /tmp/release-check.log", None, 900),
+    # U6 (cycle 12 item 5): the installer the release ships, and the tools it needs on this boot.
+    ("U6 installer", "ls -l /usr/local/bin/1bit-install | tail -1; "
+                     "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "
+                     "command -v efibootmgr mkfs.vfat mkfs.ext4; echo installer-present", "installer-present"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
     # BEFORE any in-VM fix runs: on an image that carries the fixes these two say so (root, and 1), on an
     # older image they say what is missing. The fix rows below then repair it so the login can still be

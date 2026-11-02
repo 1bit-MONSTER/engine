@@ -88,15 +88,22 @@ if [ -n "${LIBHSA:-}" ]; then
     [ -f "$LIBHSA" ] || { echo "build: LIBHSA=$LIBHSA does not exist" >&2; exit 1; }
     libhsa=$(cd "$(dirname "$LIBHSA")" && pwd)/$(basename "$LIBHSA")
 fi
+# The release public key that verifies the sealed NPU sets' manifests, and the engine scripts the U4/U6 rows
+# need inside the image. All public material: the private seal key never enters the image or the container.
+sealpub=${SEALPUB:-$HOME/.config/1bit-npu-key/seal.pub}
+[ -f "$sealpub" ] || {
+    echo "build: no release seal public key at $sealpub (tools/seal_manifest.py keygen writes one)" >&2; exit 1; }
+repo=$(cd "$recipe/../../.." && pwd)   # the engine tree: os/mini/release-check.sh, tools/seal_manifest.py
+[ -f "$repo/os/mini/release-check.sh" ] || { echo "build: $repo does not look like the engine tree" >&2; exit 1; }
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
 echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
-    -v "$recipe":/recipe:ro \
+    -v "$recipe":/recipe:ro -v "$repo":/repo:ro -v "$sealpub":/seal.pub:ro \
     ${payload:+-v "$payload":/payload:ro} \
-    ${payload:+-e PAYLOAD=/payload} \
+    ${payload:+-e PAYLOAD=/payload -e PAYLOAD_NAME="$(basename "$payload")"} \
     ${libhsa:+-v "$libhsa":/libhsa.so.1:ro} \
     ${libhsa:+-e LIBHSA=/libhsa.so.1} \
     --device /dev/loop-control:/dev/loop-control \
@@ -106,7 +113,7 @@ export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config G
 apt-get update -qq
 apt-get install -y -qq --no-install-recommends build-essential libc6-dev dc debootstrap librsvg2-bin \
     zstd xml2 syslinux-utils xorriso squashfs-tools wget curl git ca-certificates xz-utils file psmisc \
-    sudo mtools dosfstools cpio
+    sudo mtools dosfstools cpio python3
 echo "dash dash/sh boolean false" | debconf-set-selections
 dpkg-reconfigure dash >/dev/null 2>&1 || true
 ln -sf bash /bin/ash
@@ -172,6 +179,15 @@ sed -i "s|^ADDLIST=.*|ADDLIST=ec_su_axb35|" "$skeleton/etc/rc.d/MODULESCONFIG"
 grep -qx "ADDLIST=ec_su_axb35" "$skeleton/etc/rc.d/MODULESCONFIG" || {
     echo "build: REFUSED: could not set ADDLIST in /etc/rc.d/MODULESCONFIG" >&2; exit 1; }
 
+# U1 (owner, cycle 12): root and every real user log in to bash, not to busybox ash. Measured in this tree:
+# rootfs-skeleton/etc/passwd ships root:x:0:0:root:/root:/bin/sh, and bin/plogin ends with
+# `exec getty -n -l /bin/autologin ... tty1`, so the login shell is exactly that passwd field.
+echo "== login shells -> /bin/bash"
+# In its own script (/recipe/shell-login.sh) because this block is single-quoted for docker and an awk
+# program in it ends the block early - the quoting trap that has now cost four builds (2026-11-02).
+bash /recipe/shell-login.sh "$skeleton" | sed "s/^/   /" || {
+    echo "build: REFUSED: the login shells could not be moved to bash (shell-login.sh)" >&2; exit 1; }
+
 # U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
 # Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
 # itself - so this is a copy plus two symlinks and the boot service.
@@ -188,6 +204,28 @@ if [ -n "${PAYLOAD:-}" ]; then
     # a new path - pi-release asked for exactly this. The check asserts the symlink and the real file
     # separately: a path THROUGH a symlink is not a path in the squashfs.
     ln -sfn /opt/1bit-package/1bit/hrx/llama/bin "$skeleton/opt/1bit-llama"
+    # Cycle 12, U3/U4/U6: the CLI the owner is told to use, the two tools the acceptance rows run, and what
+    # the sealed-set rows need. release-check.sh is the SAME file os/mini ships: its catalogue/bench paths
+    # were made layout-aware there rather than forked here, so one tool answers for both images.
+    ln -sfn /opt/1bit-package/bin/lemonade "$skeleton/usr/local/bin/lemonade"
+    install -D -m 755 /repo/os/mini/release-check.sh "$skeleton/usr/local/bin/1bit-release-check"
+    install -D -m 755 /recipe/1bit-install.sh "$skeleton/usr/local/bin/1bit-install"
+    install -D -m 644 /repo/tools/seal_manifest.py "$skeleton/usr/lib/1bit/seal_manifest.py"
+    install -D -m 644 /seal.pub "$skeleton/etc/1bit/seal-pub.txt"
+    ln -sfn /usr/local/bin/1bit-release-check "$skeleton/bin/1bit-release-check"
+    ln -sfn /usr/local/bin/1bit-install "$skeleton/bin/1bit-install"
+    # The onebit entries this image ships, written from the payload catalogue it ships: the models row of
+    # release-check compares the two, so a catalogue that lost its onebit entries is a FAIL and not a skip.
+    python3 /recipe/catalogue-manifest.py /payload/bin/resources/server_models.json \
+        "$skeleton/etc/1bit/onebit-models.txt" || {
+        echo "build: REFUSED: could not write /etc/1bit/onebit-models.txt from the payload catalogue" >&2
+        exit 1; }
+    { echo "payload=${PAYLOAD_NAME:-unknown}"
+      echo "engine_sha256=$(sha256sum /payload/1bit/1bit | cut -c1-64)"
+      if [ -n "${LIBHSA:-}" ]; then
+          echo "libhsa_sha256=$(sha256sum /libhsa.so.1 | cut -c1-64)"
+      else echo "libhsa_sha256=none"; fi
+      echo "built=$(date -u +%FT%TZ)"; } > "$skeleton/etc/1bit/release-identity"
     # root owns them: /recipe is a host bind mount, so cp -a carries the host uid into the squashfs and
     # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
     chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
@@ -237,11 +275,11 @@ printf "%s\n" "$listing" > /tmp/1bit-sfs-listing
 in_image() { grep -q "/$1$" /tmp/1bit-sfs-listing ; }
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 miss=""
-for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil; do
+for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil usr/sbin/sfdisk usr/bin/bash; do
     in_image "$b" || miss="$miss $b"
 done
 [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
-echo "   ok: sudo, apt, sshd, mokutil are in the image"
+echo "   ok: sudo, apt, sshd, mokutil, sfdisk, bash are in the image"
 modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
 [ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
     echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }
@@ -252,12 +290,16 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/init.d/05onboard-data etc/init.d/10lemonade \
              usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
              etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
-             opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server; do
+             opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
+             usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
+             usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
+             etc/1bit/release-identity; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }
     [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
-    echo "   ok: the engine, the launcher, the service and /usr/local/bin/1bit are in the image"
+    echo "   ok: engine, launcher, service, /usr/local/bin/{1bit,lemonade}, 1bit-release-check, 1bit-install"
+    echo "      onebit-models: $(grep -c ^hrx "$skeleton/etc/1bit/onebit-models.txt") HRX + $(grep -c ^npu "$skeleton/etc/1bit/onebit-models.txt") NPU entries from the payload catalogue"
 fi
 echo "== output"
 ls -l woof-output-* 2>/dev/null | head -20

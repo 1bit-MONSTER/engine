@@ -85,13 +85,50 @@ if [ -s "$DATA/ssh/ssh_host_ed25519_key" ]; then
     ln -sfn "$DATA/ssh/ssh_host_ed25519_key.pub" /etc/ssh/ssh_host_ed25519_key.pub
 fi
 
+# Sealed NPU kernel sets: the release check's `sealed` and `sealed-sig` rows read /data/npu/kernels, and the
+# three sets the release package ships (256 KB each, manifest.json + manifest.sig over the ciphertext) are
+# the method's only copy on the stick. Copied rather than linked so the partition keeps them when the
+# package is replaced by an update; each set carries its own manifest, so a partial copy is a FAIL, not a
+# silent half-set.
+for set in /opt/1bit-package/1bit/npu/kernels/*/; do
+    [ -d "$set" ] || continue
+    n=${set%/}; n=${n##*/}
+    if [ ! -d "$DATA/npu/kernels/$n" ]; then
+        cp -a "$set" "$DATA/npu/kernels/$n" 2> /dev/null && echo "05onboard-data: NPU kernel set $n onto $DATA"
+    fi
+done
+
 # Lemonade's registry, so /api/v1/models lists what is on the partition instead of only its catalogue.
 # Same shape os/mini writes (a directory with model.q4nx is the NPU format, so it says onebit_backend
 # npu; a .gguf is the HRX one). python3 is in this image, and it keeps the JSON valid.
+#
+# The NPU entry takes the CATALOGUE's own id for it (<name>-NPU-1bit) when the catalogue has one: the
+# plain <name>-1bit is the catalogue's HRX id for the same model, so registering a q4nx directory under it
+# put an NPU model behind the GPU id. Measured on the 2 Nov board: /v1/models listed one entry,
+# Qwen3-0.6B-1bit, which is a catalogue HRX id serving an NPU model - and the release check's chat-hrx row
+# would then have been answered by the NPU path and gone green for the wrong reason.
 python3 - "$DATA" <<'PY' 2> /dev/null && echo "05onboard-data: Lemonade registry updated from $DATA/models"
 import json, os, sys
 data = sys.argv[1]
 reg = os.path.join(data, "lemonade", "config", "user_models.json")
+cat = {}
+for c in ("/opt/1bit-package/bin/resources/server_models.json",
+          "/opt/lemonade/bin/resources/server_models.json"):
+    try:
+        with open(c) as f:
+            cat = json.load(f)
+        break
+    except Exception:
+        continue
+
+def catalogue_id(base, npu):
+    """the id the shipped catalogue uses for this model, if it names one"""
+    want = [base + ("-NPU-1bit" if npu else "-1bit"), base + "-1bit"]
+    for wid in want:
+        if isinstance(cat, dict) and wid in cat:
+            return wid
+    return None
+
 models = []
 mdir = os.path.join(data, "models")
 for name in sorted(os.listdir(mdir)) if os.path.isdir(mdir) else []:
@@ -99,7 +136,7 @@ for name in sorted(os.listdir(mdir)) if os.path.isdir(mdir) else []:
     if name.endswith(".gguf") and os.path.isfile(path):
         models.append((name[:-5].lower() + "-1bit", path, None))
     elif os.path.isfile(os.path.join(path, "model.q4nx")):
-        models.append((name + "-1bit", path, "npu"))
+        models.append((catalogue_id(name, True) or name + "-1bit", path, "npu"))
 try:
     with open(reg) as f:
         have = json.load(f)
@@ -110,6 +147,8 @@ changed = False
 for name, path, backend in models:
     if name in have:
         continue
+    # an id that is already registered is left alone: two models must never share one, and the existing
+    # entry is the one the board has been serving from
     entry = {"checkpoint": path, "source": "local_path", "recipe": "onebit"}
     if backend:
         entry["recipe_options"] = {"onebit_backend": backend}

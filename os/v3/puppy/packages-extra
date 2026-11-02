@@ -27,9 +27,14 @@
 #   U4  mokutil         - absent; the release check's Secure Boot row needs it to read the state
 #   U7  openssh-server  - absent (only openssh-client has a row), so the stick cannot be checked over ssh
 #
+#   U6  fdisk           - measured on the built rootfs: /usr/sbin/fdisk is there and /usr/sbin/sfdisk is
+#                         NOT, so 1bit-install cannot write a GPT (the 26.04 split ships both in the fdisk
+#                         package; the file that survives woof-CE's splitting is the one with a spec row)
+#
 # bash, dpkg, python3, efibootmgr, jwm, rox, xterm and curl are already in the merged set (measured).
 
 yes|apt|apt|exe,dev>null,doc>null,nls>null||deps:yes
 yes|sudo|sudo|exe,dev>null,doc>null,nls>null||deps:yes
 yes|mokutil|mokutil|exe,dev>null,doc>null,nls>null||deps:yes
 yes|openssh-server|openssh-server|exe,dev>null,doc>null,nls>null||deps:yes
+yes|fdisk|fdisk|exe,dev>null,doc>null,nls>null||deps:yes

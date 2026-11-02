@@ -35,8 +35,18 @@
 #   models/ ssh/ lemonade/{cache,config}/ npu/kernels/ cache/hrx-jit/
 #                    os/mini's data contract; /etc/init.d/05onboard-data wires it to /data at boot
 #
-# Boot entries in grub.cfg: normal, and a "root shell on the serial port" entry (1bit.serial=1) so a
-# headless machine is administrable without a monitor.
+# MODELS=<dir>     optional: *.gguf and */model.q4nx copied onto the data partition, so the stick boots
+#                  with a model the engine can serve. Cycle 12 ships an HRX (GPU) GGUF this way: without one
+#                  the artifact carries only the NPU set, and U4's chat-hrx row has nothing that runs on the
+#                  8060S (measured on the 2 Nov board: /v1/models listed one entry and it was the NPU model).
+#
+# OWNER (2026-11-02 17:4x): headless by DEFAULT. pfix=nox is the whole mechanism - Puppy then never runs
+# xwin, /etc/inittab's tty1 entry (plogin -> getty -n -l /bin/autologin) gives a login prompt, and Lemonade,
+# the engine and sshd come up exactly as before. The X packages stay in the image; the desktop is entry 1.
+#
+# Boot entries in grub.cfg, in this order: the DEFAULT is the headless console (pfix=nox: no X, a login on
+# tty1 from Puppy's own plogin -> getty chain), then the desktop (JWM, as before), then a root shell on the
+# serial port (1bit.serial=1) so a machine with no monitor is administrable.
 set -euo pipefail
 prog=$(basename "$0")
 usage() { sed -n "/^# $prog /,/^# Boot entries/p" "$0" | sed 's/^# \{0,1\}//'; }
@@ -120,18 +130,18 @@ search --no-floppy --label 1BIT-DATA --set=root
 # The boot media is PINNED on the kernel command line: pupsfs=1BIT-DATA sets Puppy's PDRV, and with PDRV set
 # the init does not scan any drive at all (measured in the initrd: LOOK_PUP stays empty). Before this, the
 # 2 Nov board boot scanned the JetKVM's USB mass storage and the internal NVMe's ESP and could not settle on
-# one, then dropped to its `exec /bin/sh` failure path, whose shell read EOF, exited 0 and panicked PID 1 at
+# one, then dropped to its \`exec /bin/sh\` failure path, whose shell read EOF, exited 0 and panicked PID 1 at
 # 26.7 s (panic-repro.sh reproduces the shape). PDRV also gets a 15 s blkid retry, which covers USB enumeration.
-menuentry "1bit OS (Puppy appliance, ${kver})" {
+menuentry "1bit OS (headless console, ${kver})" {
+    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy,nox console=tty0 console=ttyS0,115200
+    initrd /1bit/initrd.gz
+}
+menuentry "1bit OS (desktop, JWM)" {
     linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - serial root shell (1bit.serial=1)" {
-    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200 1bit.serial=1
-    initrd /1bit/initrd.gz
-}
-menuentry "1bit OS - no X, verbose (pfix=nox)" {
-    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=nox,fsck console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy,nox console=tty0 console=ttyS0,115200 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 GRUBCFG
@@ -143,12 +153,32 @@ d=$work/data; mkdir -p "$d/1bit" "$d/models" "$d/ssh" "$d/lemonade/cache" "$d/le
     "$d/npu/kernels" "$d/cache/hrx-jit"
 cp -L "$work/vmlinuz" "$work/initrd.gz" "$d/1bit/"
 for f in puppy zdrv fdrv bdrv; do cp -L "$src"/${f}_*.sfs "$d/1bit/"; done
+if [ -n "${MODELS:-}" ]; then
+    [ -d "$MODELS" ] || { echo "$prog: MODELS=$MODELS is not a directory" >&2; exit 1; }
+    n=0
+    for f in "$MODELS"/*.gguf; do
+        [ -f "$f" ] || continue
+        cp -f "$f" "$d/models/" || { echo "$prog: copying $f onto the data partition failed" >&2; exit 1; }
+        n=$((n + 1))
+    done
+    for m in "$MODELS"/*/model.q4nx; do
+        [ -f "$m" ] || continue
+        dir=$(dirname "$m")
+        cp -a "$dir" "$d/models/" || { echo "$prog: copying $dir onto the data partition failed" >&2; exit 1; }
+        n=$((n + 1))
+    done
+    [ "$n" -gt 0 ] || echo "$prog: WARNING: MODELS=$MODELS carried no *.gguf and no */model.q4nx"
+    echo "== models: $n entr(y/ies) onto $d/models ($(du -sh "$d/models" | cut -f1))"
+fi
 cat > "$d/models/README" <<'TXT'
 Put GGUF files here, and NPU model directories (a directory with model.q4nx) beside them.
 /etc/init.d/05onboard-data registers every one of them with Lemonade under /data/models, so
 /api/v1/models lists them; a .q4nx directory is registered with the NPU backend. Models Lemonade
 downloads itself go to lemonade/cache.
 TXT
+need_mb=$(du -sm "$d" | cut -f1)
+[ "$need_mb" -lt "$data_mb" ] || {
+    echo "$prog: REFUSED: the data partition would need ${need_mb} MB of ${data_mb} MB (raise data-mb)" >&2; exit 1; }
 rm -f "$work/data.part"
 mkfs.ext4 -q -F -L 1BIT-DATA -d "$d" "$work/data.part" $((data_mb))M
 

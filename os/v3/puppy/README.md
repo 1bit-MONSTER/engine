@@ -31,13 +31,16 @@ how to build it. The Ubuntu Server `autoinstall` design stays the documented fal
 | `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem |
 | `g2-probe.sh` | gate G2: boot the built ISO headless in QEMU and keep the init's transcript, so "it boots on our kernel" is a measurement |
 | `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, **that kernel image is signed**, its zdrv carries the module tree, and `amdxdna`/`ec_su_axb35` are built for that kernel and signed. `--cert <mok.pem>` requires the image's signature to be the enrolled MOK's; `--require-mok` for the release gate |
-| `mkimage.sh` | the shipped artifact: a GPT disk image (ESP with shim → grub, `1BIT-DATA` ext4 with the frugal install at `/1bit` and os/mini's data directories), so `os/mini/prepare-stick.sh` and the USB write work unchanged. All three grub entries **pin the boot media** (`pupsfs=1BIT-DATA`), so init never scans another drive — the board's scan had the JetKVM's USB mass storage and the internal NVMe in it — and refuses an unsigned kernel or an initrd whose init can exit. The ISO stays a side artifact |
+| `mkimage.sh` | the shipped artifact: a GPT disk image (ESP with shim → grub, `1BIT-DATA` ext4 with the frugal install at `/1bit` and os/mini's data directories), so `os/mini/prepare-stick.sh` and the USB write work unchanged. All three grub entries **pin the boot media** (`pupsfs=1BIT-DATA`), so init never scans another drive — the board's scan had the JetKVM's USB mass storage and the internal NVMe in it — and refuses an unsigned kernel or an initrd whose init can exit. **Entry 0 is the headless console** (`pfix=copy,nox`: no X, a login on tty1 from Puppy's own `plogin` → `getty -n -l /bin/autologin` chain), entry 1 is the JWM desktop, entry 2 the serial root shell (owner, 2026-11-02: headless by default, the desktop for whoever wants it). `MODELS=<dir>` copies `*.gguf` and `*/model.q4nx` onto the data partition, which is how an HRX (GPU) model ships. The ISO stays a side artifact |
 | `patch-init.sh` | the initrd's `/init` must never be able to exit: the 2 Nov board boot reached userspace, then panicked at 26.7 s with `Attempted to kill init! exitcode=0x00000000` because init's only failure path is `exec /bin/sh >/dev/console` and a shell whose reads fail exits 0. Installs `one_rescue`, traps `EXIT`, and replaces init's three `exec /bin/sh` failure paths, so a failed boot writes `/init-fail.log` (init log + dmesg + cmdline) onto `1BIT-DATA` and keeps a console alive for ever. `build.sh` runs it before `3builddistro` and verifies the packed initrd; `mkimage.sh` refuses an image without it |
 | `panic-repro.sh` | the board's boot as a measurement: the artifact as a USB stick (`snapshot=on`), a second disk carrying an ESP and an ext4 root (the board's internal NVMe), an extra USB mass-storage device (the JetKVM), Secure Boot ON, and the stick hot-plugged after `DELAY` seconds. `--no-media` pins a label that does not exist, so the same harness shows whether an image panics (PID 1 exit) or logs and keeps its console |
 | `vm-check.sh` | the TPUPPY-RELEASE rows that need no board, in QEMU over a serial root shell, **with Secure Boot on for the disk image** (`sb-vars.sh`'s store, `OVMF_CODE_4M.secboot.fd`, `smm=on`): bash + `sudo` + `apt install` (U1), lemond up with its key and `/api/v1/models` from inside the guest and over the forwarded port (U3), `1bit` on PATH and the EC driver in `ADDLIST` (U4). Hardware rows print as SKIP with the reason |
-| `packages-extra` | package rows the acceptance needs and woof-CE's set does not have (`sudo`, `apt`, `mokutil`, `openssh-server`), with the measurement that justifies each |
+| `shell-login.sh` | U1: root, every uid >= 1000 and every account whose shell is a real `sh` log in to `/bin/bash` (the board's `u1-login` FAIL). One field in `/etc/passwd`, rewritten in `rootfs-skeleton` before `3builddistro`; `build.sh` asserts the packed image carries `usr/bin/bash` |
+| `catalogue-manifest.py` | writes `etc/1bit/onebit-models.txt` (23 HRX + 4 NPU for the 2026-11-02 package) from the payload's `server_models.json`, the manifest `1bit-release-check`'s models row compares against the shipped catalogue |
+| `1bit-install.sh` | U6: installs this booted appliance onto one disk — the same GPT shape (ESP + `1BIT-DATA`), the stick's own shim → grub chain, the frugal install and `/data` copied across, `.installed` written, and an `efibootmgr` entry first in `BootOrder`. The one value that differs from the stick is the data partition's **UUID** (`search --fs-uuid`, `pupsfs=UUID=…`, `1bit.data=UUID=…`), because two `1BIT-DATA` labels exist the moment a machine is installed (engine#539/#711) |
+| `packages-extra` | package rows the acceptance needs and woof-CE's set does not have (`sudo`, `apt`, `mokutil`, `openssh-server`, `fdisk` — measured: the built rootfs had `fdisk` and no `sfdisk`, so the installer could not write a GPT), with the measurement that justifies each |
 | `spec-insert-rows.sh` | puts those rows inside `PKGS_SPECS_TABLE`, before its closing quote; idempotent |
-| `embed/` | the files PAYLOAD=... drops into the rootfs (into `rootfs-skeleton`, which is what `3builddistro` copies): `05onboard-data` (mounts `1BIT-DATA` at `/data` and wires the contract), `10lemonade` (the server), `20onboard-ssh` + `root/.ssh/authorized_keys` (U7: host keys, StrictModes' two modes, sshd), `21serial-console` (a root shell on ttyS0, only on `1bit.serial=1`), `etc/1bit/libhsa.env` (the no-SVM trio, engine#715), `etc/profile.d/90onboard-limits` (memlock) |
+| `embed/` | the files PAYLOAD=... drops into the rootfs (into `rootfs-skeleton`, which is what `3builddistro` copies): `05onboard-data` (mounts `1BIT-DATA` at `/data`, copies the package's sealed NPU sets onto it, and registers the models with Lemonade — a `.q4nx` directory under the **catalogue's** NPU id, so an NPU model is never registered behind an HRX id), `10lemonade` (the server), `20onboard-ssh` + `root/.ssh/authorized_keys` (U7: host keys, StrictModes' two modes, sshd), `21serial-console` (a root shell on ttyS0, only on `1bit.serial=1`), `etc/1bit/libhsa.env` (the no-SVM trio, engine#715), `etc/profile.d/90onboard-limits` (memlock) |
 
 ## A kernel bump, end to end
 
@@ -176,3 +179,29 @@ These scripts are Apache-2.0, like the rest of this repository. What they *packa
 and modules are signed with our MOK, the firmware belongs to its vendors under the licences
 `os/LICENSES.md` records, and Puppy's own tree is GPL-2.0-or-later with each recipe's licences carried
 into the built image.
+
+## What the 2 Nov board boot changed (cycle 12)
+
+The board ran `puppy-check.sh` over ssh and came back **20 PASS / 5 FAIL** (the log is the evidence:
+`/data/puppy-check.log` on the stick). Each FAIL is one item here, and each is now a measurement on the
+artifact rather than a claim:
+
+| board row | cause (measured) | what cycle 12 does |
+|---|---|---|
+| `u1-login` no account has bash as its shell | `rootfs-skeleton/etc/passwd` ships `root:…:/bin/sh`, and `plogin` → `getty -n -l /bin/autologin` ends in that field | `shell-login.sh` (build), `build.sh` asserts `usr/bin/bash` in the image |
+| `u3-service` "no lemond-onebit process" | the row looked for the launcher, not the server | the row (pi-release's) greps `[l]emond`; the image was right |
+| `u3-cli` no `lemonade` CLI | nothing installed it | `/usr/local/bin/lemonade` → `/opt/1bit-package/bin/lemonade` |
+| `u4-release-check` no `1bit-release-check` | the tool was never installed, and its catalogue/bench paths are `/opt/lemonade` (os/mini) rather than `/opt/1bit-package` | `build.sh` installs `os/mini/release-check.sh` unchanged; the script now **finds** the package directory, prefers a **downloaded** model for the chat rows, and never uses an NPU entry for `chat-hrx`. Also installed: `tools/seal_manifest.py` + the release **public** seal key, so `sealed-sig` runs instead of skipping |
+| `u6-installer` no `1bit-install` | neither the tool nor `sfdisk` was in the image | `1bit-install.sh` + a `fdisk` package row (26.04 ships `sfdisk` in it) |
+
+Two more measured facts behind item 6 and the headless default:
+
+* **23 HRX + 4 NPU** onebit entries are what the release catalogue carries (`server_models.json`, 27 with
+  `recipe: onebit`), and the build writes them into `etc/1bit/onebit-models.txt`. The board's
+  "catalogue = 1 model" came from `/v1/models`, which defaults to `show_all=false` (downloaded only) —
+  `/api/v1/models` lists the catalogue. The one model it did list was an **NPU** model registered under
+  the catalogue's **HRX** id (`Qwen3-0.6B-1bit`), which is why the registration now uses the catalogue's
+  `-NPU-1bit` id for a `.q4nx` directory.
+* **Headless is Puppy's own machinery**: `/etc/inittab` has `tty1::respawn:plogin`, and `plogin` execs
+  `getty -n -l /bin/autologin … tty1`. With `pfix=nox` there is no X and tty1 is a login prompt; nothing
+  new had to be written for it, only the entry order and the shell in `/etc/passwd`.

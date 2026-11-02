@@ -436,11 +436,16 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             const char* e = getenv(t2s_ ? "Q4NX_T2S_DIR" : "Q4NX_PB16I_DIR");
             pb16i_dir_ = e ? e : read_config_string(cfg_path,
                                                     t2s_ ? "\"q4nx_t2s_dir\"" : "\"q4nx_pb16i_dir\"", "");
-            // The sealed-ELF trick is the pb16i family's (one full ELF, every ternary instance).  A t2s
-            // container has no sealed set: its decode family is the per-role `_t2s_m16` kernels, so the
-            // field stays empty and the per-role lookup below is what runs.
-            if (!t2s_)
-                pb16i_sealed_ = read_config_string(cfg_path, "\"q4nx_pb16i_sealed_elf\"", "");
+            // The sealed-ELF trick (one full ELF, every ternary instance, one hw_context) was pb16i's
+            // first, and it is worth as much to a t2s container: the same measurement applies, because it
+            // is the hw_context switch that costs and not the layout.  Measured 2026-11-02 in-loop: a t2s
+            // decode family shipped as eight per-role ELFs paid **+2.0-2.3 ms on every launch** against
+            // this engine's own documented ~2.7 ms between two hw_contexts (include/q4nx_forward.h), which
+            // is more than the kernels' own device time and turned a 1.76x-faster kernel into a 1.8x
+            // slower model.  Each layout names its own key so a container cannot hand a t2s stream to a
+            // pb16i ELF (which would read 4,608-B tiles out of 2,176-B images).
+            pb16i_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_elf\"" : "\"q4nx_pb16i_sealed_elf\"", "");
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.

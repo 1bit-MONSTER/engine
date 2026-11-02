@@ -252,6 +252,17 @@ checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp
 against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
 of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
 
+**A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
+a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
+family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
+than the kernels' own device time — against the ~2.7 ms between two hw_contexts recorded at
+`npu/forward/include/q4nx_forward.h`. That tax turned a kernel that is 1.76x faster in the arena into a
+model that was 1.8x *slower* than pb16i. The fix is the same artifact shape pb16i uses: one full ELF
+carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's own key
+`q4nx_t2s_sealed_elf` (pb16i keeps `q4nx_pb16i_sealed_elf`; a layout never borrows the other's key, because
+a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
+`plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

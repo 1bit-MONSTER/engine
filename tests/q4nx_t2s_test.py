@@ -125,6 +125,30 @@ def main():
         except ValueError as ex:
             check(f"reserved code refused by {name}", "reserved" in str(ex))
 
+    # 7. wire format v2: the same weights, the same size, the same multipliers -- a different byte order inside
+    #    each 64-byte block, chosen so the kernel's plain two-store expansion is exact (no lane shuffle).
+    img = t2s.pack(codes, dbits, K, N)[0]
+    v1 = t2s.from_pb16i_image(img, K, N)
+    v2 = t2s.from_pb16i_image_v2(img, K, N)
+    check("v2 stream has the same size as v1", v1.shape == v2.shape, f"{v1.shape} vs {v2.shape}")
+    check("v2 stream is not the v1 stream (the order really changed)", not np.array_equal(v1, v2))
+    c1, m1 = t2s.decode(v1, K, N)
+    c2, m2 = t2s.decode_v2(v2, K, N)
+    check("decode_v2 recovers the same codes as decode", np.array_equal(c1, c2))
+    check("decode_v2 recovers the same multipliers", np.array_equal(m1, m2))
+    ref_c, ref_ms = t2s._split(np.asarray(img, dtype=np.uint8))
+    check("decode_v2 codes are the image's codes", np.array_equal(c2, ref_c))
+    check("v2 and v1 disagree only inside the code area (ms bytes identical)",
+          np.array_equal(v1[:, t2s.CODE_BYTES:], v2[:, t2s.CODE_BYTES:]) and
+          not np.array_equal(v1[:, :t2s.CODE_BYTES], v2[:, :t2s.CODE_BYTES]))
+    # the block algebra v2 is built on: operand byte b needs element 2b, and 2b = 16*(b/8) + 2*(b%8);
+    # byte 64+b needs 128 + 2b, i.e. 8 k rows down -- exactly what lanes 2/3 carry.
+    bb = np.arange(t2s.KC // 16 * 0 + 64)
+    k_lo, n0 = bb // 8, 2 * (bb % 8)
+    check("v2 lane0/1 land on operand element 2b", np.array_equal(16 * k_lo + n0, 2 * bb))
+    check("v2 lane2/3 land on operand element 2*(64+b)",
+          np.array_equal(16 * (k_lo + 8) + n0, 2 * (64 + bb)))
+
     print(f"\n{len(fails)} failure(s)")
     return 1 if fails else 0
 

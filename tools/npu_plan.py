@@ -192,7 +192,12 @@ def generate(model_dir: str, kernels: str) -> dict:
             "M": 16,
             "enabled": True,
             "dirs": decode_dirs(model_dir, kernels),
-            "sealed_elf": cfg.get("q4nx_pb16i_sealed_elf", "") if layout == "pb16i" else "",
+            # One full ELF per container: pb16i's key for pb16i, t2s's own key for t2s (a
+            # layout never borrows the other's image format).  A t2s decode family shipped as
+            # per-role ELFs pays a hw_context switch on every launch -- measured 2026-11-02 at
+            # +2.0-2.3 ms, more than the kernels themselves.
+            "sealed_elf": cfg.get("q4nx_t2s_sealed_elf" if layout == "t2s" else "q4nx_pb16i_sealed_elf", "")
+            if layout in ("pb16i", "t2s") else "",
         },
         "kernels": {"tag": tag},
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},

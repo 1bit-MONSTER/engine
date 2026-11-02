@@ -350,11 +350,19 @@ private:
     // `.ref` unchanged, and the kernels carry the `_t2s` suffix.  pb16i_ is set too: everything
     // downstream of the load is the same path, and only the file it reads differs.
     bool t2s_ = false;
+    // Which t2s wire order the container's images are in (q4nx_weight_layout_version 5 = v1, 6 = v2).  The two
+    // hold the same weights in different byte orders and are the same size, so they are told apart by the
+    // *artifact family*: v1 decode kernels are `_t2s_m16`, v2's are `_t2s2_m16`, and pairing one with the other
+    // is a silent permutation of the matrix rather than an error.  v2 is the one to ship: it is the same
+    // weights with the ordering chosen so the core's two contiguous stores are exact, i.e. no lane shuffle
+    // (measured on the array: 0.589 ms against the pb16i phase's 1.037 ms, 40.2 GB/s).
+    bool t2s_v2_ = false;
     std::string pb16i_dir_;
     // The artifact suffix and sidecar extension of the container's weight family, in one place so a
     // kernel name and the image it reads cannot drift apart.
     const char* family_tag() const {
-        return t2s_ ? "_t2s" : (pb16i_ ? "_pb16i" : (weight_layout_b8_ ? "_b8" : ""));
+        if (t2s_) return t2s_v2_ ? "_t2s2" : "_t2s";
+        return pb16i_ ? "_pb16i" : (weight_layout_b8_ ? "_b8" : "");
     }
     const char* image_ext() const { return t2s_ ? ".t2s" : ".pb16i"; }
     // A sealed ELF carries every ternary instance in ONE full ELF (one PDI, one

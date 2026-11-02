@@ -413,24 +413,39 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // variable wins so a run can point at a fresh set without editing the
             // container's config.
             // The image format has a version so a future change cannot be read as this
-            // one: the config may pin it, and anything but the layout's own version is
-            // refused (4 = pb16i's 4,608-B tiles, 5 = t2s's 2,176-B stream).
-            const int want_ver = t2s_ ? 5 : 4;
-            const int ver = q4nx_config_int(cfg_path.c_str(), "q4nx_weight_layout_version", want_ver);
-            if (ver != want_ver) {
+            // one: the config may pin it, and anything but a version this build knows is
+            // refused (4 = pb16i's 4,608-B tiles, 5 = t2s v1, 6 = t2s v2).
+            const int ver = q4nx_config_int(cfg_path.c_str(), "q4nx_weight_layout_version", 4);
+            if (t2s_) {
+                // v1 and v2 carry the same weights in different byte orders, at the same
+                // size, and reading one with the other's kernel is a silent permutation of
+                // the matrix.  So the version picks the artifact family, not just a flag:
+                // v1 kernels are `_t2s_m16`, v2 kernels are `_t2s2_m16`, and a container
+                // can only ever name the one its images were packed for.
+                if (ver != 5 && ver != 6) {
+                    err_ = "q4nx_weight_layout_version " + std::to_string(ver) +
+                           " is not a t2s stream this build reads (5 = v1, 6 = v2)";
+                    return false;
+                }
+                t2s_v2_ = (ver == 6);
+            } else if (ver != 4) {
                 err_ = "q4nx_weight_layout_version " + std::to_string(ver) +
-                       " is not an image format this build reads (" + std::to_string(want_ver) +
-                       (t2s_ ? " is t2s)" : " is pb16i)");
+                       " is not an image format this build reads (4 is pb16i)";
                 return false;
             }
             const char* e = getenv(t2s_ ? "Q4NX_T2S_DIR" : "Q4NX_PB16I_DIR");
             pb16i_dir_ = e ? e : read_config_string(cfg_path,
                                                     t2s_ ? "\"q4nx_t2s_dir\"" : "\"q4nx_pb16i_dir\"", "");
-            // The sealed-ELF trick is the pb16i family's (one full ELF, every ternary instance).  A t2s
-            // container has no sealed set: its decode family is the per-role `_t2s_m16` kernels, so the
-            // field stays empty and the per-role lookup below is what runs.
-            if (!t2s_)
-                pb16i_sealed_ = read_config_string(cfg_path, "\"q4nx_pb16i_sealed_elf\"", "");
+            // The sealed-ELF trick (one full ELF, every ternary instance, one hw_context) was pb16i's
+            // first, and it is worth as much to a t2s container: the same measurement applies, because it
+            // is the hw_context switch that costs and not the layout.  Measured 2026-11-02 in-loop: a t2s
+            // decode family shipped as eight per-role ELFs paid **+2.0-2.3 ms on every launch** against
+            // this engine's own documented ~2.7 ms between two hw_contexts (include/q4nx_forward.h), which
+            // is more than the kernels' own device time and turned a 1.76x-faster kernel into a 1.8x
+            // slower model.  Each layout names its own key so a container cannot hand a t2s stream to a
+            // pb16i ELF (which would read 4,608-B tiles out of 2,176-B images).
+            pb16i_sealed_ = read_config_string(
+                cfg_path, t2s_ ? "\"q4nx_t2s_sealed_elf\"" : "\"q4nx_pb16i_sealed_elf\"", "");
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -454,7 +469,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
         }
         fprintf(stderr, "  [forward] weight layout: %s (%s)\n",
-                t2s_ ? "t2s 2-bit ternary stream, expanded on the core"
+                t2s_ ? (t2s_v2_ ? "t2s v2 2-bit ternary stream, expanded on the core (no shuffle)"
+                                : "t2s v1 2-bit ternary stream, interleaved on the core")
                      : (pb16i_ ? "pb16i integer-exact ternary, sidecar images"
                                : (weight_layout_b8_ ? "b8 blocked 8x8 microtiles, tile-n-major"
                                                     : "rm row-major")),

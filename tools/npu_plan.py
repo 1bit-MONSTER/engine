@@ -150,15 +150,24 @@ def generate(model_dir: str, kernels: str) -> dict:
     layout = cfg.get("q4nx_weight_layout", "rm")
     if layout not in ("rm", "b8", "pb16i", "t2s"):
         raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8, pb16i or t2s")
-    tag = {"pb16i": "_pb16i", "t2s": "_t2s", "b8": "_b8"}.get(layout, "")
+    # a t2s container names its wire format by version: 5 = v1 (`_t2s`), 6 = v2 (`_t2s2`)
+    t2s_v2 = layout == "t2s" and cfg.get("q4nx_weight_layout_version", 5) == 6
+    tag = {"pb16i": "_pb16i", "b8": "_b8"}.get(layout, "_t2s2" if t2s_v2 else ("_t2s" if layout == "t2s" else ""))
 
     im = cfg.get("intermediate_size")
     fused_gu = True
     if isinstance(im, int) and im > 0:
         # The probe the plan replaces, run once and written down: the fused kernel wins, and when
         # neither exists the split layout is assumed (the forward then refuses by name).
-        gu = f"full_i8_GU_K{hidden}_N{2 * im}{tag}.elf"
-        g = f"full_i8_G_K{hidden}_N{im}{tag}.elf"
+        #
+        # The gate/up probe uses the *prefill* family's names, which is not the decode suffix: a b8 container
+        # blocks the tap at every M (so `_b8`), while a pb16i or t2s container's M=128 prefill stays the plain
+        # int8 family and only its decode kernels carry the stream's suffix.  Probing with the decode tag on a
+        # t2s container found neither artifact and wrote "fused", which the box's own pb16i container
+        # contradicts (split) -- 2026-11-02.
+        prefill_tag = "_b8" if layout == "b8" else ""
+        gu = f"full_i8_GU_K{hidden}_N{2 * im}{prefill_tag}.elf"
+        g = f"full_i8_G_K{hidden}_N{im}{prefill_tag}.elf"
         fused_gu = artifact(model_dir, kernels, gu) or not artifact(model_dir, kernels, g)
     else:
         raise SystemExit(f"{model_dir}/config.json: intermediate_size is {im!r}")
@@ -183,7 +192,12 @@ def generate(model_dir: str, kernels: str) -> dict:
             "M": 16,
             "enabled": True,
             "dirs": decode_dirs(model_dir, kernels),
-            "sealed_elf": cfg.get("q4nx_pb16i_sealed_elf", "") if layout == "pb16i" else "",
+            # One full ELF per container: pb16i's key for pb16i, t2s's own key for t2s (a
+            # layout never borrows the other's image format).  A t2s decode family shipped as
+            # per-role ELFs pays a hw_context switch on every launch -- measured 2026-11-02 at
+            # +2.0-2.3 ms, more than the kernels themselves.
+            "sealed_elf": cfg.get("q4nx_t2s_sealed_elf" if layout == "t2s" else "q4nx_pb16i_sealed_elf", "")
+            if layout in ("pb16i", "t2s") else "",
         },
         "kernels": {"tag": tag},
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},

@@ -72,7 +72,8 @@ void dequant_tile(Chunk kind, const uint8_t* tile, float* out, int ld);
 
 // t2 only: the ternary code and the fp16 scale of element (r, c) of a tile, exposed because the
 // converters and the layout test need the mapping without a float round trip. code_of() returns
-// -1, 0, +1, or 2 for the reserved bit pattern (kReserved), which no converter may emit.
+// -1, 0 or +1, and kReserved (2) for the reserved bit pattern, which no converter may emit.
+// kReserved is a SENTINEL, not a value: dequant_tile() decodes it as 0, never as 2 * scale.
 constexpr int kReserved = 2;
 int t2_code(const uint8_t* tile, int r, int c);
 float t2_scale(const uint8_t* tile, int r, int c);

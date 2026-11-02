@@ -123,9 +123,12 @@ void dequant_tile(Chunk kind, const uint8_t* t, float* out, int ld) {
                 const int code = (r % 2 == 0) ? (b & 15) : (b >> 4);
                 w = bf16(t + 4608 + 2 * r) * float(t[i]) * float(code) + bf16(t + 4672 + 2 * r) * float(t[256 + i]);
             } else if (kind == Chunk::T2) {
-                // A reserved code (3) decodes as 0 rather than as a weight nothing wrote: the
-                // converters refuse to emit it and t2_reserved() is what a loader checks.
-                w = (float)t2_code(t, r, c) * t2_scale(t, r, c);
+                // A reserved code (3) decodes as 0 -- a corrupt byte must not become a weight no
+                // converter wrote, and it must certainly not become +2 * scale, which is what the
+                // raw sentinel would multiply to. The converters refuse to emit one and
+                // t2_reserved() is what a loader checks; this is the decode-time half of that rule.
+                const int code = t2_code(t, r, c);
+                w = code == kReserved ? 0.0f : (float)code * t2_scale(t, r, c);
             } else {
                 w = bf16(t + 2 * i) * float(int8_t(t[512 + c * kRows + r]));
             }

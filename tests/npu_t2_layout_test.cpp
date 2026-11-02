@@ -112,15 +112,25 @@ int main() {
         check(t2_reserved(tile.data()) == 0, "no reserved code in this tile");
     }
 
-    // 4. the reserved pattern (3) is counted, and decodes as 0 rather than as a phantom weight
+    // 4. the reserved pattern (3) is counted, and decodes as 0 rather than as a phantom weight.
+    //    The scale is deliberately NON-zero here: with a zero scale every decoding looks like 0,
+    //    which is how a decoder that multiplied the raw sentinel (+2) passed this check before
+    //    pi-prs caught it. The tile below therefore carries 1.0 in every scale slot.
     {
         std::vector<uint8_t> tile(kT2Tile, 0);
+        for (int r = 0; r < kT2Rows; r++)
+            for (int b = 0; b < 2; b++) {
+                const size_t at = size_t(kT2CodeBytes) + size_t(r) * 4 + 2 * size_t(b);
+                tile[at] = uint8_t(kHalf1 & 0xFF);
+                tile[at + 1] = uint8_t(kHalf1 >> 8);
+            }
         tile[0] |= 0x03;  // row 0, column 0 -> bits 0..1 = 3
         check(t2_reserved(tile.data()) == 1, "one reserved code is counted");
         check(t2_code(tile.data(), 0, 0) == kReserved, "code 3 reports kReserved");
         std::vector<float> out(32 * 256, 12345.0f);
         dequant_tile(Chunk::T2, tile.data(), out.data(), 256);
-        check(out[0] == 0.0f, "a reserved code decodes as 0");
+        check(out[0] == 0.0f, "a reserved code decodes as 0, not as 2 * scale");
+        check(out[1] == -1.0f, "the neighbouring untouched slot is code -1, unchanged");
     }
 
     // 5. subnormal fp16 scales are not silently 0: 0x0001 is 5.96e-8, and a 27B ternary model can

@@ -101,7 +101,9 @@ def unpack(raw, K, N):
     packed = t[:, :CODE_BYTES].reshape(rt * kt, ROWS, 64)              # r, c//4
     quad = np.empty((rt * kt, ROWS, 64, 4), np.int8)
     for s in range(4):
-        quad[..., s] = ((packed >> (2 * s)) & 3).astype(np.int8) - 1
+        bits = (packed >> (2 * s)) & 3
+        # the reserved pattern (3) decodes as 0, never as 2 * scale -- same rule as q4nx.cpp
+        quad[..., s] = np.where(bits == RESERVED, 0, bits.astype(np.int8) - 1).astype(np.int8)
     codes = quad.reshape(rt * kt, ROWS, 64 * 4).transpose(0, 1, 2)     # (tile, r, c) in tile order
     sc = t[:, CODE_BYTES:].copy().view("<u2").reshape(rt * kt, ROWS, COLS // GROUP).astype(np.uint16)
     scale = sc.view(np.float16).astype(np.float32)

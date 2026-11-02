@@ -103,8 +103,7 @@ the 431 ternary Bonsai-2 images (416 layers + the 15 MTP head tensors, 25.66 G w
 nothing and costs the bit-exact gate. A target whose arithmetic wants bf16 converts at load, in the
 kernel, and owns that rounding — the chunk keeps the exact value.
 
-A reserved code (3) decodes as 0, so a corrupt byte cannot become a weight no converter wrote;
-`q4nx::t2_reserved()` counts them, and that is what a loader or a test refuses on.
+A reserved code (3) decodes as **0**, on both paths — `npu/q4nx.cpp::dequant_tile` and `tools/q4nx_t2.py::unpack` — so a corrupt byte cannot become a weight no converter wrote, and it can never be a `2 * scale` value that no ternary encoder can produce. No converter emits one; `q4nx::t2_reserved()` counts them, and that is what a loader or a test refuses on. (An all-zero code byte is **code -1**, not code 0 — the value table is `code - 1`, the same convention Q2_0 uses.)
 
 | what | measured |
 |---|---|

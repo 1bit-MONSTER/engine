@@ -118,11 +118,19 @@ def always_on():
     except ValueError:
         pass
 
-    # 2. the reserved pattern is counted
+    # 2. the reserved pattern is counted, and decodes as 0 -- with a NON-zero scale, because with a
+    #    zero one every wrong decoder looks right (that is how the C++ side shipped a +2 * scale bug
+    #    past its own test; pi-prs caught it)
     raw = bytearray(T.pack(np.zeros((32, 256), np.int8), np.ones((32, 2), np.float16)))
     check(T.reserved_count(bytes(raw), 256, 32) == 0, "an untouched tile carries no reserved pattern")
+    check(T.unpack(bytes(raw), 256, 32)[0, 1] == 0.0, "the zero code round-trips as 0.0")
+    # bits 00 mean -1: a zero-filled buffer is a tile of -1 weights, not a tile of zeros
+    zero_tile = bytearray(len(raw))
+    zero_tile[2048:] = raw[2048:]
+    check(T.unpack(bytes(zero_tile), 256, 32)[0, 1] == -1.0, "an all-zero code byte is code -1")
     raw[0] |= 0x03
     check(T.reserved_count(bytes(raw), 256, 32) == 1, "a reserved pattern is counted")
+    check(T.unpack(bytes(raw), 256, 32)[0, 0] == 0.0, "a reserved code decodes as 0, not as 2 * scale")
 
     # 3. from_pb16i against the repo's own packer and the header's own index rule
     for K, N in [(512, 1024), (1024, 3072)]:

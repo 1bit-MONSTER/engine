@@ -74,6 +74,148 @@ void test_bounds() {
     check(pi::mul_ok(uint64_t(151936), 7, out) && out == 1063552, "lengths: the head's own N*groups is exact");
 }
 
+
+// ── crafted model.onnx files the importer must refuse ───────────────────────
+// The lengths this reader takes come from the file's own metadata, so the only way to prove the wiring is a
+// file that overstates what it carries. Same pattern as moe_gguf_index_test: build the bytes at run time.
+namespace pb {
+void varint(std::string& o, uint64_t v) {
+    while (v >= 0x80) {
+        o.push_back(char((v & 0x7F) | 0x80));
+        v >>= 7;
+    }
+    o.push_back(char(v));
+}
+void tag(std::string& o, int field, int wire) { varint(o, (uint64_t(field) << 3) | uint64_t(wire)); }
+void ints(std::string& o, int field, int64_t v) {
+    tag(o, field, 0);
+    varint(o, uint64_t(v));
+}
+void str(std::string& o, int field, const std::string& v) {
+    tag(o, field, 2);
+    varint(o, v.size());
+    o += v;
+}
+std::string kv(const std::string& k, const std::string& v) {
+    std::string o;
+    str(o, 1, k);
+    str(o, 2, v);
+    return o;
+}
+// a tensor whose values live in an external file, optionally with dims that overstate it
+std::string tensor(const std::string& name, const std::vector<int64_t>& dims, const std::string& location,
+                   uint64_t offset, uint64_t length) {
+    std::string t;
+    for (auto d : dims) ints(t, 1, d);                 // dims
+    ints(t, 2, 1);                                     // data_type (FLOAT; the importer only uses it for width)
+    str(t, 8, name);
+    for (const auto& [k, v] : {std::pair<std::string, std::string>{"location", location},
+                               {"offset", std::to_string(offset)}, {"length", std::to_string(length)}}) {
+        tag(t, 13, 2);
+        const auto e = kv(k, v);
+        varint(t, e.size());
+        t += e;
+    }
+    ints(t, 14, 1);                                    // data_location = EXTERNAL
+    return t;
+}
+std::string matmulnbits(const std::string& name, const std::vector<std::string>& ins, int64_t K, int64_t N,
+                        int64_t bits, int64_t block) {
+    std::string n;
+    for (const auto& i : ins) str(n, 1, i);
+    str(n, 4, "MatMulNBits");
+    for (const auto& [k, v] : {std::pair<std::string, int64_t>{"K", K}, {"N", N}, {"bits", bits},
+                               {"block_size", block}}) {
+        std::string a;
+        str(a, 1, k);
+        ints(a, 3, v);
+        tag(n, 5, 2);
+        varint(n, a.size());
+        n += a;
+    }
+    return n;
+}
+std::string model(const std::vector<std::string>& tensors, const std::vector<std::string>& nodes) {
+    std::string g;
+    for (const auto& n : nodes) {
+        tag(g, 1, 2);
+        varint(g, n.size());
+        g += n;
+    }
+    str(g, 2, "crafted");
+    for (const auto& t : tensors) {
+        tag(g, 5, 2);
+        varint(g, t.size());
+        g += t;
+    }
+    std::string m;
+    ints(m, 1, 8);                                     // ir_version
+    tag(m, 7, 2);                                      // graph
+    varint(m, g.size());
+    m += g;
+    return m;
+}
+}  // namespace pb
+
+void put_file(const std::string& path, const std::string& bytes) {
+    std::ofstream f(path, std::ios::binary | std::ios::trunc);
+    f.write(bytes.data(), std::streamsize(bytes.size()));
+}
+
+// The two overstatements the readers must catch: declared dims larger than the external file, and a
+// MatMulNBits node whose N/K/block_size demand more qweight than the tensor declares.
+void test_crafted_refusals(const std::string& root) {
+    const fs::path dir = fs::path(root) / "crafted";
+    fs::remove_all(dir);
+    fs::create_directories(dir);
+    put_file((dir / "model.onnx.data").string(), std::string(4096, '\x11'));   // 4 KiB of "weights"
+    // the plan() step reads config.json before anything else; the crafted packs are only about the readers,
+    // so the geometry here is deliberately tiny
+    fs::create_directories(dir / "cache");   // plan() reads the pack's meta twins when they are there
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen2","hidden_size":16,"intermediate_size":32,"num_hidden_layers":1,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":8,"vocab_size":64,)"
+             R"("rope_theta":10000.0,"tie_word_embeddings":true})");
+
+    // 1. embed dims [1024, 1024] x 4 B = 4 MiB declared, 1 KiB present
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {1024, 1024}, "model.onnx.data", 0, 1024)}, {}));
+    pi::Options allow;
+    allow.allow_incomplete = true;   // so the plan's own refusals do not short-circuit before the readers
+    try {
+        const auto r = pi::import_pack(dir.string(), (dir / "out1").string(), allow);
+        check(false, "crafted: overstated embed dims were refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  crafted embed refusal: %s\n", what.c_str());
+        check(what.find("model.embed_tokens.weight") != std::string::npos,
+              "crafted: the refusal names the tensor (" + what + ")");
+    }
+    check(!fs::exists(dir / "out1" / "model.q4nx"), "crafted: nothing written for the overstated embed");
+
+    // 2. a MatMulNBits whose qweight tensor carries 256 B while N=64, K=512, block=128 demand 16 KiB
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {8, 8}, "model.onnx.data", 0, 256),
+                        // scales and zeros sized exactly as the node's N/K/block demand (N*(K/block)*4 and
+                        // N*(K/block+1)/2), so the refusal that fires is the qweight one
+                        pb::tensor("lm_head_scales", {}, "model.onnx.data", 256, 1024),
+                        pb::tensor("lm_head_zeros", {}, "model.onnx.data", 1280, 160),
+                        pb::tensor("lm_head_qweight", {}, "model.onnx.data", 1440, 256)},
+                       {pb::matmulnbits("lm_head", {"x", "lm_head_qweight", "lm_head_scales", "lm_head_zeros"},
+                                        512, 64, 4, 128)}));
+    try {
+        const auto r = pi::import_pack(dir.string(), (dir / "out2").string(), allow);
+        check(false, "crafted: overstated MatMulNBits geometry was refused");
+    } catch (const std::exception& e) {
+        const std::string what = e.what();
+        std::printf("  crafted matmulnbits refusal: %s\n", what.c_str());
+        check(what.find("lm_head_qweight") != std::string::npos,
+              "crafted: the refusal names the qweight tensor (" + what + ")");
+    }
+    check(!fs::exists(dir / "out2" / "model.q4nx"), "crafted: nothing written for the overstated MatMulNBits");
+    fs::remove_all(dir);
+}
+
 // ── 1. MatMulNBits: encode here, decode with the importer ────────────────────
 void test_matmulnbits() {
     const int N = 64, K = 256, B = 128;
@@ -323,6 +465,7 @@ int main(int argc, char** argv) {
     const std::string pack = argc > 2 ? argv[2] : "";
     try {
         test_bounds();
+        test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
         if (!pack.empty() && fs::exists(pack + "/model.onnx")) test_pack(pack, golden_dir);

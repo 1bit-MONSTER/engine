@@ -628,6 +628,34 @@ program is rebuilt.
 
 ### CWSR save-area placement (engine#315)
 
+### The trio belongs to every HRX process, not just to serve's backends (engine#715)
+
+`serve` puts the save-area variables in its backends' environment *and in its own* (`app/hrx_cwsr.h`,
+`apply_cwsr_env_to_self`), so a child that execs with the inherited environment — a helper started by
+`run_program`, the Laya daemon — inherits them too, and a spawn site added later cannot forget them.
+
+Everything else that initialises HRX on a box whose libhsa is the TheRock nightly needs them as well, because the
+fault they prevent happens inside ROCr/the HAL before any of our code runs: `test-backend-ops`, `llama-bench`,
+`llama-cli`, and any harness that starts `llama-server` itself. For scripts there is one definition to source:
+
+```sh
+. scripts/hrx-env.sh --check     # sets the trio, refuses to continue without it
+. scripts/hrx-env.sh             # sets it, no check
+```
+
+and the recipe itself, for anything that cannot source a file:
+
+```sh
+HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1
+```
+
+`HRX_SVM=1` and `--hrx-cwsr-placement=off` remain the opt-outs, but they are no longer silent: on an `hrx`/`auto` route
+`serve` refuses to start when *you* opted out and the trio is absent, and prints the recipe above — the mode those flags
+select is the one that page-faults on the first graph replay on this box. The refusal keys on the opt-out, deliberately
+not on "the trio happens to be empty": a build whose hrx-system has no `HRX_ALLOW_NO_SVM` gate also has an empty trio,
+and it cannot start HRX0 at all. `ONEBIT_HRX_NO_TRIO_OK=1` is the acknowledgement for a box whose
+ROCr does not need the placement. `--device cpu` and `--device npu` are never affected.
+
 The shipped configuration for engine#315 is amdgpu with CWSR **off** (`amdgpu.cwsr_enable=0` on the
 kernel command line and in `/etc/modprobe.d`). Nothing below changes that. The replacement below was
 accepted by a soak on a CWSR-on boot (2026-10-18/19: 37 in-band arms, 9 h 03 min, 0 faults, every graded

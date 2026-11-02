@@ -39,6 +39,7 @@
 #pragma once
 
 #include <cstdio>
+#include <cstdlib>
 #include <functional>
 #include <stdexcept>
 #include <string>
@@ -128,6 +129,46 @@ inline CwsrDecision decide_cwsr_placement(CwsrPlacement mode, int cwsr_enable, b
     d.log = "HRX: --hrx-cwsr-placement=on; CWSR save area placed in GTT (engine#315)";
     if (!user_set.empty()) d.log += "; kept from the environment: " + user_set;
     return d;
+}
+
+// engine#715: the trio is not serve's private business. Any process that initialises HRX on this box needs it --
+// test-backend-ops, llama-bench, a harness that starts llama-server itself -- because the fault it prevents happens
+// inside ROCr/the HAL, before any of our code runs. Three helpers so that rule lives in one place:
+//   * the recipe, for a message a human can paste;
+//   * "is the trio present in this environment", for a launch-time check;
+//   * apply it to *serve's own* environment, so that every child inherit it however it is spawned (Child builds an
+//     explicit envp, but run_program/LayaDaemon exec with the inherited one, and a future spawn site cannot forget).
+inline constexpr const char* kCwsrRecipe =
+        "HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1";
+
+// True when every one of the three names appears in a NAME=VALUE list. The *value* is not checked on purpose: a
+// caller's own value wins everywhere in the engine, and the fault is about the variables being set together.
+inline bool cwsr_env_present(const std::vector<std::string>& env) {
+    for (const char* want : kCwsrPlacementVars) {
+        bool found = false;
+        for (const std::string& e : env)
+            if (e.rfind(std::string(want) + "=", 0) == 0) { found = true; break; }
+        if (!found) return false;
+    }
+    return true;
+}
+
+// Put the trio in this process's environment. overwrite=0 (the default) means a value the caller already set wins,
+// exactly as for a backend's environment. Returns how many variables were added.
+inline int apply_cwsr_env_to_self(const std::vector<std::string>& env, bool overwrite = false) {
+    int added = 0;
+    for (const std::string& e : env) {
+        const size_t eq = e.find('=');
+        if (eq == std::string::npos) continue;
+        const std::string name = e.substr(0, eq);
+        if (!overwrite && std::getenv(name.c_str()) != nullptr) continue;
+#if defined(_WIN32)
+        if (_putenv_s(name.c_str(), e.c_str() + eq + 1) == 0) ++added;
+#else
+        if (::setenv(name.c_str(), e.c_str() + eq + 1, 1) == 0) ++added;
+#endif
+    }
+    return added;
 }
 
 }  // namespace onebit

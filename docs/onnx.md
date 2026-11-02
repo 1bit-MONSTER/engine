@@ -149,7 +149,10 @@ above are the evidence, not the file size).
 `gemm_q8_raw` and through the EP's own host loop with int8 operands, requires their exact int32 accumulators to
 be identical, and times both — `repeats` calls *timed* on each leg after one untimed device warm-up, and the
 min of three runs per cell. strixhalo, M=32 designs, `-O2` build, load 9–10 on 32 cores, in an `npu-hold`
-ticket:
+ticket. **The array ramps**: in a ticket whose *first* measurement is a small-row cell, every device figure comes
+out a uniform ~1.8× high and settles by the sixth configuration (measured, same shapes, same binary), so the
+first shapes of a cold run are not quotable — the table below was taken after nine warm-up configurations of the
+same shape.
 
 | shape | rows | device ms/call | host ms/call | device vs host |
 |---|---|---|---|---|

@@ -3160,6 +3160,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // residual here produced garbage logits (the M=1 self-check caught it).
     std::vector<float> fnorm(H);
     bool ok = true;
+    last_residual_.assign(X.begin() + (size_t)(M - 1) * H, X.end());
     if (batch_all_out_) {
         // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
         // row is normed and the head runs ONCE for the batch (the M=16 twin streams its weights once).

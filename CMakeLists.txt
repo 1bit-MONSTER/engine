@@ -747,6 +747,16 @@ if(ONEBIT_NPU)
     target_link_libraries(mtp_batch_all_test PRIVATE onebit_npu_forward)
     add_dependencies(npu_sampling_test mtp_batch_all_test)
     add_test(NAME mtp_batch_all COMMAND mtp_batch_all_test)
+    # The MTP drafter measured against the real base model (tools/mtp_acceptance.cpp): draft, verify through
+    # step_batch_all(), commit the accepted prefix, repeat.  The head runs on the host in the pb16i-exact
+    # arithmetic, the base on the exact route.  Needs the device, so it is a tool, not a ctest.
+    add_executable(mtp_acceptance tools/mtp_acceptance.cpp npu/mtp/mtp_head.cpp)
+    target_include_directories(mtp_acceptance PRIVATE npu npu/forward/include)
+    target_link_libraries(mtp_acceptance PRIVATE onebit_npu_forward)
+    find_package(OpenMP COMPONENTS CXX QUIET)
+    if(OpenMP_CXX_FOUND)
+        target_link_libraries(mtp_acceptance PRIVATE OpenMP::OpenMP_CXX)
+    endif()
     set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source

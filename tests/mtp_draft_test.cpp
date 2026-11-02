@@ -113,7 +113,7 @@ private:
 // Knows the truth (reads the position out of the hidden state): every draft should be accepted.
 class PerfectHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
               std::vector<float>* conf = nullptr) override {
         if (conf) conf->assign((size_t)k, 1.0f);
         const int have = (int)hidden[0];                      // positions consumed so far
@@ -126,7 +126,7 @@ public:
 // Proposes the token AFTER the true one at every position: the base must refuse all of it.
 class GarbageHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
               std::vector<float>* conf = nullptr) override {
         if (conf) conf->assign((size_t)k, 0.1f);
         const int have = (int)hidden[0];
@@ -139,7 +139,7 @@ public:
 // Right for the first draft, wrong afterwards: exercises the longest-prefix accept AND the rollback.
 class HalfHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
               std::vector<float>* conf = nullptr) override {
         if (conf) { conf->assign((size_t)k, 0.1f); if (!conf->empty()) (*conf)[0] = 1.0f; }
         const int have = (int)hidden[0];

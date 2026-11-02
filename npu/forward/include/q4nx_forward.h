@@ -212,6 +212,18 @@ public:
     // successful step() or step_batch(), empty before that. This is the vector the LM head reads, not
     // the raw residual, because that is what a packed decision head was trained against.
     const std::vector<float>& last_hidden() const { return last_hidden_; }
+    // One norm earlier: the last row's residual before the final RMSNorm.  The MTP drafter takes one of the
+    // two as its hidden input; which one it wants is measured, not assumed.
+    const std::vector<float>& last_residual() const { return last_residual_; }
+    // Logits of an arbitrary hidden vector through the SAME lm head this forward uses -- the drafter has no
+    // lm_head of its own, so this is how it turns its own hidden state into a token.
+    bool lm_head_logits(const std::vector<float>& h, std::vector<float>& logits) { return run_lm_head(h, logits); }
+    // One row of the embedding table (what a token means to the model): the MTP drafter's `pre_fc_norm_embedding`
+    // input.  It reads the same table the forward uses, so the drafter cannot drift from the model's embeddings.
+    void embed_row(int token, std::vector<float>& out) const {
+        out.resize((size_t)c_.H);
+        for (int k = 0; k < c_.H; k++) out[(size_t)k] = embed_at(token, k);
+    }
 
     // Rows per batched launch. The activation BO holds exactly MD rows and the
     // per-op kernels are built M=MD wide, so a batch must not exceed this (the
@@ -224,6 +236,7 @@ public:
 private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
+    std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;

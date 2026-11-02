@@ -108,7 +108,9 @@ public:
     // `conf`, when given, receives each proposal's own probability (softmax of the head's logits at that
     // position) so the loop can apply the tau gate; a head that cannot report it leaves `conf` empty and the
     // gate is skipped for that iteration rather than guessed.
-    virtual int draft(const std::vector<float>& hidden, int last_token, int k,
+    // `pos` is the absolute position of the FIRST drafted token (the chain is pos, pos+1, ...): a drafter
+    // with rope cannot guess it and the loop knows it exactly.
+    virtual int draft(const std::vector<float>& hidden, int last_token, int pos, int k,
                       std::vector<int>& out, std::vector<float>* conf = nullptr) = 0;
     virtual void reset() {}
 };
@@ -181,7 +183,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
 
         std::vector<int> d;
         std::vector<float> conf;
-        int nd = head->draft(base.last_hidden(), t1, k, d, &conf);
+        int nd = head->draft(base.last_hidden(), t1, have, k, d, &conf);
         if (nd <= 0) continue;
         nd = std::min(nd, k);
         d.resize((size_t)nd);

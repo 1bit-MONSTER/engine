@@ -145,6 +145,29 @@ case nor a design, so a new shape is one line in the `Case[]` table plus one bui
 bundle is larger than the xclbin-derived ELFs beside it, and the runtime accepts it — the `|d| = 0` results
 above are the evidence, not the file size).
 
+**What the device leg is worth, measured.** `onebit_npu_gemm_q8_probe` puts one shape through the same
+`gemm_q8_raw` and through the EP's own host loop with int8 operands, requires their exact int32 accumulators to
+be identical, and times both. strixhalo, M=32 designs, `-O2` build, load 4.9 on 32 cores, taken in an
+`npu-hold` ticket:
+
+| shape | rows | device ms/call | host ms/call | |
+|---|---|---|---|---|
+| 1024×2048 (q) | 1 | 1.478 | 0.161 | device 9× **slower** |
+| | 8 | 1.883 | 1.318 | 1.4× slower |
+| | 16 | 1.509 | 3.243 | 2.2× faster |
+| | 32 | 1.497 | 5.796 | 3.9× faster |
+| 1024×1024 (k, v) | 1 / 32 | 0.781 / 0.887 | 0.078 / 2.956 | |
+| 1024×3072 (gate, up) | 1 / 32 | 2.246 / 2.618 | 0.239 / 8.400 | |
+| 2048×1024 (o) | 1 / 32 | 1.441 / 1.469 | 0.158 / 5.686 | |
+| 3072×1024 (down) | 1 / 32 | 2.153 / 2.552 | 0.248 / 8.071 |
+
+A call costs the same at 1 row and at 32 (1.44–1.50 ms for q_proj, and an M=128 design at one row is 1.61 ms
+against M=32's 1.48), so it is **dispatch-bound**: a decode step pays one launch per projection — 196 of them on
+Qwen3-0.6B — and at one row that launch costs more than the host loop it replaces. So this is a prefill leg: it
+crosses over at ~8–16 rows and is 3–4× ahead at a full 32-row design. `docs/onnx-pack.md` therefore keeps it as
+correctness-only rather than quoting a device speedup, and a decode-side win would need fewer, longer launches
+(one launch covering many projections), not a smaller design.
+
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the
 life of the process; when the lock is held it does not queue — it reports `device busy` and runs the

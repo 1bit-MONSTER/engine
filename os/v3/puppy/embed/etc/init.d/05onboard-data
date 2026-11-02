@@ -1,0 +1,116 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/05onboard-data - the 1BIT-DATA partition becomes /data, before anything that needs it.
+#
+# The contract is os/mini's, so os/mini/prepare-stick.sh and 1bit-usb-write.sh keep working on this
+# image unchanged: /data carries models/, lemonade/{cache,config}/ + lemonade/lemond.conf (the one
+# persistent API key), ssh/authorized_keys (and the host key), npu/kernels and cache/hrx-jit. What this
+# script adds is the wiring: the API key file 10lemonade reads, the keys sshd uses, and Lemonade's own
+# registry so the catalogue lists what is actually on the partition.
+#
+# rc.services runs /etc/init.d/* in name order, so 05 runs before 10lemonade and 20onboard-ssh.
+DATA=/data
+# os/mini #711: a fixed label is wrong once a machine is installed (two 1BIT-DATA partitions exist, the
+# stick's and the disk's), so the boot line may name the partition. Default stays the label.
+spec=LABEL=1BIT-DATA
+case $(cat /proc/cmdline 2> /dev/null) in
+*1bit.data=*) spec=$(tr ' ' '\n' < /proc/cmdline | sed -n 's/^1bit.data=//p' | head -1) ;;
+esac
+
+i=0
+part=
+while [ $i -lt 20 ]; do
+    part=$(findfs "$spec" 2> /dev/null) && break
+    i=$((i + 1))
+    sleep 1
+done
+if [ -z "$part" ]; then
+    echo "05onboard-data: no $spec partition after 20 s: nothing on this boot persists"
+    exit 0
+fi
+mkdir -p "$DATA"
+mount -o rw "$part" "$DATA" 2> /dev/null || {
+    echo "05onboard-data: cannot mount $part at $DATA: nothing on this boot persists" >&2
+    exit 0
+}
+mkdir -p "$DATA/models" "$DATA/lemonade/cache" "$DATA/lemonade/config" "$DATA/ssh" \
+    "$DATA/npu/kernels" "$DATA/cache/hrx-jit"
+
+# The API key has to outlive the boot: 10lemonade reads /etc/1bit/lemond.conf and mints into it on first
+# boot, and with this symlink in place that mint lands in lemonade/lemond.conf on the partition.
+mkdir -p /etc/1bit
+[ -f "$DATA/lemonade/lemond.conf" ] || : > "$DATA/lemonade/lemond.conf"
+chmod 600 "$DATA/lemonade/lemond.conf"
+ln -sfn "$DATA/lemonade/lemond.conf" /etc/1bit/lemond.conf
+
+# Keys come from the partition (os/mini's contract: prepare-stick.sh writes ssh/authorized_keys). The
+# shipped /root/.ssh/authorized_keys stays as the fallback for a stick with no data partition yet.
+if [ -s "$DATA/ssh/authorized_keys" ]; then
+    mkdir -p /root/.ssh
+    cp -f "$DATA/ssh/authorized_keys" /root/.ssh/authorized_keys
+    chmod 700 /root/.ssh
+    chmod 600 /root/.ssh/authorized_keys
+    echo "05onboard-data: $(grep -c . /root/.ssh/authorized_keys) ssh key(s) from $DATA/ssh/authorized_keys"
+fi
+# A host key on the partition, so the fingerprint a client learned does not change every boot.
+if [ ! -s "$DATA/ssh/ssh_host_ed25519_key" ]; then
+    ssh-keygen -q -t ed25519 -N "" -C "1bit-os" -f "$DATA/ssh/ssh_host_ed25519_key" 2> /dev/null
+fi
+if [ -s "$DATA/ssh/ssh_host_ed25519_key" ]; then
+    ln -sfn "$DATA/ssh/ssh_host_ed25519_key" /etc/ssh/ssh_host_ed25519_key
+    ln -sfn "$DATA/ssh/ssh_host_ed25519_key.pub" /etc/ssh/ssh_host_ed25519_key.pub
+fi
+
+# Lemonade's registry, so /api/v1/models lists what is on the partition instead of only its catalogue.
+# Same shape os/mini writes (a directory with model.q4nx is the NPU format, so it says onebit_backend
+# npu; a .gguf is the HRX one). python3 is in this image, and it keeps the JSON valid.
+python3 - "$DATA" <<'PY' 2> /dev/null && echo "05onboard-data: Lemonade registry updated from $DATA/models"
+import json, os, sys
+data = sys.argv[1]
+reg = os.path.join(data, "lemonade", "config", "user_models.json")
+models = []
+mdir = os.path.join(data, "models")
+for name in sorted(os.listdir(mdir)) if os.path.isdir(mdir) else []:
+    path = os.path.join(mdir, name)
+    if name.endswith(".gguf") and os.path.isfile(path):
+        models.append((name[:-5].lower() + "-1bit", path, None))
+    elif os.path.isfile(os.path.join(path, "model.q4nx")):
+        models.append((name + "-1bit", path, "npu"))
+try:
+    with open(reg) as f:
+        have = json.load(f)
+    assert isinstance(have, dict)
+except Exception:
+    have = {}
+changed = False
+for name, path, backend in models:
+    if name in have:
+        continue
+    entry = {"checkpoint": path, "source": "local_path", "recipe": "onebit"}
+    if backend:
+        entry["recipe_options"] = {"onebit_backend": backend}
+    have[name] = entry
+    changed = True
+if changed:
+    tmp = reg + ".new"
+    with open(tmp, "w") as f:
+        json.dump(have, f, indent=2, sort_keys=True)
+    os.replace(tmp, reg)
+print("%d model(s) on the partition, %d in the registry" % (len(models), len(have)))
+PY
+
+echo "05onboard-data: $part at $DATA ($(df -h "$DATA" 2> /dev/null | awk 'NR==2 {print $2" total, "$4" free"}'))"

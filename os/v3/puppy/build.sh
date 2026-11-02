@@ -211,7 +211,8 @@ modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/d
 echo "   ok: $modconf in the image, so rc.sysinit loads the EC driver"
 if [ -n "${PAYLOAD:-}" ]; then
     miss=""
-    for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/10lemonade \
+    for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/05onboard-data \
+             etc/init.d/10lemonade \
              usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
              etc/init.d/20onboard-ssh etc/init.d/21serial-console; do
         in_image "$b" || miss="$miss $b"

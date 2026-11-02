@@ -31,6 +31,9 @@ KEYS=/root/.ssh/authorized_keys
 mkdir -p /run/sshd
 chmod 700 /root/.ssh
 chmod 600 "$KEYS"
+# 05onboard-data links the ed25519 host key on the data partition in, so the fingerprint a client learned
+# does not change per boot; with no data partition -A makes one here, and the other key types are then
+# off unless a client insists (they would be minted fresh each boot).
 [ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1
 touch /etc/ssh/sshd_not_to_be_run
 /usr/sbin/sshd && echo "20onboard-ssh: sshd up, $(wc -l < "$KEYS") key(s) authorised"

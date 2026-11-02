@@ -51,7 +51,19 @@ start() {
     # shellcheck disable=SC1090  # LEMONADE_API_KEY, minted above or shipped by the build
     . "$CONF"
     export LEMONADE_API_KEY
-    "$LEMONADE_ONEBIT" --port "$PORT" --host 0.0.0.0 >> "$LOG" 2>&1 &
+    # Where Lemonade keeps its state is os/mini's data contract: /data/lemonade/{cache,config}, so the
+    # catalogue, downloaded backends and the HRX JIT cache survive a reboot. Without a data partition it
+    # lives in RAM and says so, rather than pretending to persist.
+    if grep -q " /data " /proc/mounts 2> /dev/null; then
+        LEM=/data/lemonade
+        export GGML_HRX_JIT_CACHE_DIR=/data/cache/hrx-jit
+    else
+        LEM=/var/lib/lemonade
+        echo "10lemonade: no /data partition: Lemonade state is in RAM, nothing persists"
+    fi
+    mkdir -p "$LEM/cache" "$LEM/config"
+    # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides
+    "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host 0.0.0.0 >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     echo "10lemonade: started (pid $(cat "$PIDFILE"), :$PORT, log $LOG)"
 }

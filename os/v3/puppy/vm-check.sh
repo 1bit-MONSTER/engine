@@ -14,7 +14,12 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# vm-check.sh <iso> <work-dir> [seconds]
+# vm-check.sh <iso|img> <work-dir> [seconds]
+#
+# <iso>    booted the way g2-probe.sh does: -kernel/-initrd out of the image, entry 0
+# <img>    the shipped artifact (os/v3/puppy/mkimage.sh): GPT + ESP + 1BIT-DATA, booted through UEFI
+#          firmware as a USB disk - shim, grub, then the kernel and initrd off the data partition - and
+#          the serial menu entry selected over the serial line, which is how a headless box is driven
 #
 # The TPUPPY-RELEASE rows that can be answered without the board: U1 (a real shell, sudo, apt install),
 # U3 (lemond up at boot with its key, reachable over the network) and the software half of U4 (the engine
@@ -38,24 +43,41 @@ for t in qemu-system-x86_64 xorriso python3 systemd-run curl; do
 done
 mkdir -p "$work" || exit 2
 work=$(cd "$work" && pwd)
-[ -f "$work/vmlinuz" ] || xorriso -osirrox on -indev "$iso" \
-    -extract /vmlinuz "$work/vmlinuz" -extract /initrd.gz "$work/initrd.gz" > /dev/null 2>&1
-[ -s "$work/vmlinuz" ] && [ -s "$work/initrd.gz" ] || { echo "$prog: cannot extract the kernel from $iso" >&2; exit 2; }
+case $iso in
+*.img) : ;;   # the artifact boots itself; its kernel and initrd live on the data partition
+*)
+    [ -f "$work/vmlinuz" ] || xorriso -osirrox on -indev "$iso" \
+        -extract /vmlinuz "$work/vmlinuz" -extract /initrd.gz "$work/initrd.gz" > /dev/null 2>&1
+    [ -s "$work/vmlinuz" ] && [ -s "$work/initrd.gz" ] || { echo "$prog: cannot extract the kernel from $iso" >&2; exit 2; }
+    ;;
+esac
 
 rm -f "$work/ser" "$work/serial.log" "$work/qemu.out"
 # The guest's 13305 goes to 21305 on the host: another lane's lemond already holds 127.0.0.1:13305 here,
 # and the row is whether the appliance answers on its own port over a network, not which host port.
+# shellcheck disable=SC2054  # qemu arguments carry commas inside a single word
+net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:21305-:13305 -device virtio-net-pci,netdev=n0)
+case $iso in
+*.img)
+    # the shipped artifact: firmware boots the ESP, grub reads the data partition
+    vars=$work/OVMF_VARS.fd; [ -f "$vars" ] || cp /usr/share/OVMF/OVMF_VARS_4M.fd "$vars"
+    # shellcheck disable=SC2054  # same: commas belong to the qemu arguments
+    boot=(-drive file="$iso",format=raw,if=none,id=d0 -device usb-storage,drive=d0
+          -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
+          -drive if=pflash,format=raw,file="$vars")
+    ;;
+*)
+    boot=(-kernel "$work/vmlinuz" -initrd "$work/initrd.gz" -append "console=ttyS0 1bit.serial=1" -cdrom "$iso")
+    ;;
+esac
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
-    qemu-system-x86_64 -m 4096 -smp 4 -machine q35 \
-    -kernel "$work/vmlinuz" -initrd "$work/initrd.gz" \
-    -append "console=ttyS0 1bit.serial=1" \
-    -cdrom "$iso" -display none -vga std -no-reboot \
-    -netdev user,id=n0,hostfwd=tcp:127.0.0.1:21305-:13305 -device virtio-net-pci,netdev=n0 \
-    -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
+    qemu-system-x86_64 -m 4096 -smp 4 -machine q35 "${boot[@]}" -display none -vga std -no-reboot \
+    "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
-python3 - "$work" > "$work/rows.txt" 2>&1 <<'PY'
+ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
 import socket, sys, time, os, re
 work = sys.argv[1]
+artifact = sys.argv[2]
 log = open(os.path.join(work, "serial.log"), "ab", buffering=0)
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
 stop = time.time() + 60
@@ -89,6 +111,13 @@ def read_until(token, timeout):
         log.write(d); buf += d
     return None
 
+# A disk image boots through grub, whose menu is also on the serial line; the shell entry is the second
+# one, so pick it the way a human at the console would: down, enter. Anything else boots entry 0.
+if artifact.endswith(".img"):
+    if read_until(b"serial root shell", 120) is not None:
+        s.sendall(b"\x1b[B\r")
+        print("INFO boot           grub menu on serial, selected the serial-shell entry", flush=True)
+
 # The service prints this itself, so its arrival means the port is a shell and not just kernel log.
 if read_until(b"21serial-console: root shell on ttyS0", 240) is None:
     print("FAIL boot           no serial shell: the image has no 21serial-console, or it never ran", flush=True)
@@ -108,6 +137,10 @@ rows = [
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
                      "/opt/1bit-package"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
+    ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),
+    ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
+    ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),
+    ("data state",   "ls /data; grep -c . /data/lemonade/config/user_models.json 2>/dev/null || echo no-registry", None),
 ]
 for idx, (name, cmd, want) in enumerate(rows):
     sentinel = "__DONE%d__" % idx

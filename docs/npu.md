@@ -680,11 +680,13 @@ load failures, not style: the embedding keeps its **2-D shape** (the loader read
 `shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
 `config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
 
-What is still missing for a real d3 row is the **artifact set**: the forward asserts ELF existence even in
-`NPU_INFER_HOST_GEMM=1`, and this geometry needs six designs — `QKV K1024 N5120` (q|gate|k|v, `q_proj`
-carries the output gate), `O K2048 N1024` (GDN's `ssm_out` reuses it), `GU K1024 N7168`,
-`D K3584 N1024`, GDN `QKV K1024 N6144` and `Z K1024 N2048`. Without them the load stops at
-`forward init failed: … this model's plan needs the QKV kernel "full_i8_QKV_K1024_N5120.elf" … (missing)`.
+What is still missing for a real d3 row is the **artifact set** — but only for a *device* row. `NPU_INFER_HOST_GEMM=1`
+opens no device, so it needs no ELF: the backbone loads, answers, and serves as the numeric reference for a geometry
+whose kernels do not exist yet (this is how `d3-lite` is exercised before its six designs are built). A device row
+needs all six — `QKV K1024 N5120` (q|gate|k|v, `q_proj` carries the output gate), `O K2048 N1024` (GDN's `ssm_out`
+reuses it), `GU K1024 N7168`, `D K3584 N1024`, GDN `QKV K1024 N6144` and `Z K1024 N2048` — and without them the
+device path stops at `forward init failed: … this model's plan needs the QKV kernel "full_i8_QKV_K1024_N5120.elf" …
+(missing)`.
 
 Refusals follow the d3 server this route stands in for, so vLLM Semantic Router can point at it unchanged —
 which means **422 here, not the 400 the chat route uses**:

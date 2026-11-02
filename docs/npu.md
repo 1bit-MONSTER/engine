@@ -674,6 +674,13 @@ load failures, not style: the embedding keeps its **2-D shape** (the loader read
 `shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
 `config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
 
+`--dtype bf16` writes the same tensor set with **no q4_1 tiles at all** (every tensor keeps its source
+bf16, or the F32 a transform forces; `verify` reports 0 error rather than a loss). It is the container for
+*measuring*, not for serving: it holds the weights fixed so an engine run and a reference run differ only in
+the forward, and the cost of quantization becomes a separate delta instead of an unexplained one. The
+`d3-lite` parity row is measured that way (`--dtype bf16` vs the default `--dtype auto` container, same
+requests, against the pack's own `d3_runtime.py`).
+
 What is still missing for a real d3 row is the **artifact set** — but only for a *device* row. `NPU_INFER_HOST_GEMM=1`
 opens no device, so it needs no ELF: the backbone loads, answers, and serves as the numeric reference for a geometry
 whose kernels do not exist yet (this is how `d3-lite` is exercised before its six designs are built). A device row

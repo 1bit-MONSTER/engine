@@ -29,7 +29,7 @@ rather than depending on a downloaded pack:
 5. a d3-shaped (`qwen3_5`) pack: the GDN renames the engine loads, and the three transforms --
    `A_log` -> `-exp(A_log)` in F32, the `conv1d` transpose to tap-major, and the alpha/beta rows
    padded to a 32-row tile -- each with a known answer, plus the refusal for a tensor with no
-   mapping.
+   mapping, and `--dtype bf16` writing the same tensor set with no tiles at all.
 """
 import json
 import os
@@ -347,6 +347,22 @@ def main():
         v7 = run("verify", q["dir"], qout)
         check(v7.returncode == 0, f"verify accepts the converted d3 pack (out: {v7.stdout[-300:]})")
         check("MISSING" not in v7.stdout, "verify finds every renamed tensor")
+
+        # ---- --dtype bf16: no tiles at all, so a run can hold the weights fixed and ask
+        #      whether the forward agrees with a reference (engine #796's parity row).
+        qexact = os.path.join(tmp, "q4nx_qwen35_bf16")
+        r7b = run("pack", q["dir"], qexact, "--dtype", "bf16")
+        check(r7b.returncode == 0, f"pack --dtype bf16 succeeds (out: {r7b.stderr[-300:]})")
+        dt, _ = read_q4nx(os.path.join(qexact, "model.q4nx"))
+        kinds = {k: v["dtype"] for k, v in dt.items() if k != "__metadata__"}
+        check("I8" not in kinds.values(),
+              f"--dtype bf16 writes no q4_1 tiles (dtypes: {sorted(set(kinds.values()))})")
+        check(kinds.get("model.layers.0.linear_attn.ssm_a") == "F32",
+              "the transform-forced F32 tensor stays F32 under --dtype bf16")
+        check(kinds.get("model.layers.0.mlp.gate_proj.weight") == "BF16",
+              "a tileable projection is BF16 under --dtype bf16")
+        v7b = run("verify", q["dir"], qexact)
+        check(v7b.returncode == 0, f"verify accepts the bf16 container (out: {v7b.stdout[-300:]})")
 
         # ---- refusals: an unmapped qwen3_5 tensor is an error, not a silent drop
         bogus = qwen35_model(os.path.join(tmp, "hf_qwen35_bad"))

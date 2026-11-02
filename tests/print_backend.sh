@@ -116,6 +116,39 @@ out=$(GGML_HRX_STRICT=0 "$bin" serve -m "$scratch/small.gguf" --device hrx \
       --llama-server "$here/fake_backend.py" --no-mem-check --port 43129 --print-backend-env 2>"$scratch/err"); rc=$?
 check "--print-backend-env: a value the caller set is left out (exit $rc)" '[ "$rc" = 0 ] && ! printf "%s" "$out" | grep -q GGML_HRX_STRICT'
 
+# engine#715: the save-area trio is part of the *plan*, not only of serve's own children. Both Lemonade paths start
+# the backend from these two outputs (the one hop from the JSON env, lemonade-hrx from the NAME=VALUE lines), and a
+# caller that exports nothing is the shipped launcher's own environment.
+env -u HSA_USE_SVM -u HSA_USERPTR_FOR_PAGED_MEM -u HRX_ALLOW_NO_SVM -u HRX_SVM "$bin" serve -m "$scratch/small.gguf" \
+    --device hrx --llama-server "$here/fake_backend.py" --no-mem-check --port 43140 --hrx-cwsr-placement=on \
+    --print-backend-env >/dev/null 2>"$scratch/gate.err"
+if grep -q "no HRX_ALLOW_NO_SVM gate" "$scratch/gate.err"; then
+    echo "     (this build's hrx-system has no HRX_ALLOW_NO_SVM gate: the trio is not part of the plan)"
+else
+    out=$(env -u HSA_USE_SVM -u HSA_USERPTR_FOR_PAGED_MEM -u HRX_ALLOW_NO_SVM -u HRX_SVM "$bin" serve \
+          -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" --no-mem-check --port 43141 \
+          --print-backend 2>"$scratch/err"); rc=$?
+    check "hrx plan: the save-area trio is in env (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of HSA_USE_SVM)" = 0 ] &&
+        [ "$(env_of HSA_USERPTR_FOR_PAGED_MEM)" = 0 ] && [ "$(env_of HRX_ALLOW_NO_SVM)" = 1 ]'
+    out=$(env -u HSA_USE_SVM -u HSA_USERPTR_FOR_PAGED_MEM -u HRX_ALLOW_NO_SVM -u HRX_SVM "$bin" serve \
+          -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" --no-mem-check --port 43142 \
+          --print-backend-env 2>"$scratch/err"); rc=$?
+    check "--print-backend-env: the trio as NAME=VALUE lines (exit $rc)" '[ "$rc" = 0 ] &&
+        printf "%s\n" "$out" | grep -qx HSA_USE_SVM=0 &&
+        printf "%s\n" "$out" | grep -qx HSA_USERPTR_FOR_PAGED_MEM=0 &&
+        printf "%s\n" "$out" | grep -qx HRX_ALLOW_NO_SVM=1'
+    out=$(env -u HSA_USE_SVM -u HRX_ALLOW_NO_SVM -u HRX_SVM HSA_USERPTR_FOR_PAGED_MEM=5 "$bin" serve \
+          -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" --no-mem-check --port 43143 \
+          --print-backend 2>"$scratch/err"); rc=$?
+    check "hrx plan: a trio value the caller set is left out, the other two still arrive (exit $rc)" \
+        '[ "$rc" = 0 ] && [ "$(env_of HSA_USERPTR_FOR_PAGED_MEM)" = - ] && [ "$(env_of HSA_USE_SVM)" = 0 ] &&
+         [ "$(env_of HRX_ALLOW_NO_SVM)" = 1 ]'
+    out=$(env -u HSA_USE_SVM -u HSA_USERPTR_FOR_PAGED_MEM -u HRX_ALLOW_NO_SVM HRX_SVM=1 ONEBIT_HRX_NO_TRIO_OK=1 "$bin" serve \
+          -m "$scratch/small.gguf" --device hrx --llama-server "$here/fake_backend.py" --no-mem-check --port 43144 \
+          --print-backend 2>"$scratch/err"); rc=$?
+    check "hrx plan: HRX_SVM=1 keeps the trio out of the plan too (exit $rc)" '[ "$rc" = 0 ] && [ "$(env_of HSA_USE_SVM)" = - ]'
+fi
+
 # MTP by default from the model's own head, on hrx (docs/serve.md, "Multi-token prediction")
 mplan() { env -u ONEBIT_NO_MTP -u ONEBIT_NO_WARMUP "$bin" serve -m "$scratch/$1.gguf" --device "$2" \
           --llama-server "$here/fake_backend.py" --no-mem-check --port 43130 "${@:3}" --print-backend 2>"$scratch/err"; }

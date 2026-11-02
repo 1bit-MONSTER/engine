@@ -201,10 +201,41 @@ band, t2s is n-major within each 16x16 block: on the test fixture's 139,264 stre
 so they are never interchangeable and `from_t2` is the only crossing — the test asserts both the equality
 and that inequality, so a "simplification" that returns the chunk unchanged fails.
 
+#### Wire format v2: the ordering moves into the stream, not the core
+
+The mmul's operand byte for element `e = 16k + c` is `e/2`, so a 64-byte vector of 2-bit codes has to reach the
+operand's **even** bytes and the next 64 its **odd** bytes — a spread, not a copy. Under the original order (v1) that
+spread is a lane-crossing shuffle inside the core (`aie::interleave_zip`), and it was measured on the array: **11.1-12.6
+GB/s against 30-32 GB/s** for the plain contiguous stores with the wrong order. So v2 changes the order *inside each
+64-byte block* and nothing else:
+
+    v1: byte r*4 + j  ->  k = kb*16 + r,        n = nb*16 + 4j + {0,1,2,3}
+    v2: byte b        ->  lanes 0/1: k = kb*16 + b/8,     n = nb*16 + 2*(b%8), +1
+                          lanes 2/3: k = kb*16 + 8 + b/8, n = nb*16 + 2*(b%8), +1
+
+which is exactly the arithmetic the operand wants: byte `b` of the first store covers element `2b = 16*(b/8) + 2*(b%8)`,
+and byte `b` of the second store covers `2*(64+b) = 128 + 2b`, i.e. eight k rows down. The kernel's two contiguous
+stores are then correct with no shuffle and no table — **the same kernel binary** that had to interleave is byte-exact
+on v2 (3/3 seeds, 0 mismatches, `amdxdna` counter 0, measured 2026-11-02). The tile is still 2,176 B and the time order
+is unchanged, so the DMA descriptors and the tile count do not move; the ms area is byte-identical between the formats.
+
+`tools/q4nx_t2s.py` carries both: `from_pb16i_image()`/`stream()`/`decode()`/`expand()` are v1,
+`from_pb16i_image_v2()`/`decode_v2()` are v2, and `tests/q4nx_t2s_test.py` pins that they carry the same codes and the
+same multipliers, that only the code area differs, and the block algebra above. A container declares which one its
+images are with `q4nx_weight_layout_version` (5 = v1, 6 = v2): the two are **not** interchangeable — a v1 image read by
+the no-shuffle kernel is a silent permutation of the weight matrix, which is precisely the failure that took three
+single-code probes to name.
+
 #### The t2s stream in the engine (launch path)
 
-A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (with
-`"q4nx_weight_layout_version": 5`; pb16i is 4, and each layout refuses the other's version). The
+A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (pb16i is 4, and each layout
+refuses the other's version). **The version picks the artifact family**, because the two t2s wire orders hold the same
+weights at the same size in a different byte order and reading one with the other's kernel is a silent permutation of the
+matrix, not a crash: **5 = v1** -> `_t2s` / `_t2s_m16` (the expansion interleaves inside the core), **6 = v2** ->
+`_t2s2` / `_t2s2_m16` (the ordering is in the wire, so the core's two contiguous stores are exact — no lane shuffle), and
+any other version is refused by name at init. v2 is the one to ship: measured on the array for GU (K=5120 N=17408, M=16)
+against the pb16i phase in the same window, **0.589 ms vs 1.037 ms (1.76x), 40.2 GB/s** of stream against 48.4, with
+seeds 1/2/3 byte-exact and the `amdxdna` counter 0 (`~/wt/npu-arena/LEADERBOARD.md`, `submissions/GU16T2S`). The
 images are the pb16i sidecars' own set — `blk_<layer>_<tag>_weight.t2s` plus the **unchanged**
 `.ref` (`e_ref int16[N]` + mode byte, because the compaction changes neither the magnitudes nor
 e_ref) — in the directory named by `q4nx_t2s_dir` / `Q4NX_T2S_DIR`, and the kernels carry the
@@ -220,6 +251,17 @@ that is not `tiles x 2,176` bytes is refused by name (never read as a pb16i imag
 checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp` pins the tile
 against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
 of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
+
+**A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
+a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
+family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
+than the kernels' own device time — against the ~2.7 ms between two hw_contexts recorded at
+`npu/forward/include/q4nx_forward.h`. That tax turned a kernel that is 1.76x faster in the arena into a
+model that was 1.8x *slower* than pb16i. The fix is the same artifact shape pb16i uses: one full ELF
+carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's own key
+`q4nx_t2s_sealed_elf` (pb16i keeps `q4nx_pb16i_sealed_elf`; a layout never borrows the other's key, because
+a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
+`plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
 ### From a GGUF
 

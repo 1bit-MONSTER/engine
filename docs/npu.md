@@ -54,7 +54,7 @@ files happened to be in `--kernels`. Three of them, and each one used to be sile
 | decision | what the probe used to do |
 |---|---|
 | `fusion.gate_up` (`fused`/`split`) | the fused `full_i8_GU_*` kernel won, and with no split kernel on disk the split layout was assumed |
-| `kernels.tag` (`""`/`_b8`/`_pb16i`) | the artifact family came from `q4nx_weight_layout`, so a kernel dir of the other family changed which kernels ran |
+| `kernels.tag` (`""`/`_b8`/`_pb16i`/`_t2s`) | the artifact family came from `q4nx_weight_layout`, so a kernel dir of the other family changed which kernels ran |
 | `decode.dirs` | the M=16 twins were looked for in `<model>/kernels-m16`, then `<kernels>/m16`, then `<kernels>` |
 
 `tools/npu_plan.py <model dir>` writes one from `config.json` plus the kernel directory (it derives layer
@@ -200,6 +200,26 @@ tile order. The two forms are the same weights in **different orders** (t2 is k-
 band, t2s is n-major within each 16x16 block: on the test fixture's 139,264 stream bytes, 135,476 differ),
 so they are never interchangeable and `from_t2` is the only crossing — the test asserts both the equality
 and that inequality, so a "simplification" that returns the chunk unchanged fails.
+
+#### The t2s stream in the engine (launch path)
+
+A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (with
+`"q4nx_weight_layout_version": 5`; pb16i is 4, and each layout refuses the other's version). The
+images are the pb16i sidecars' own set — `blk_<layer>_<tag>_weight.t2s` plus the **unchanged**
+`.ref` (`e_ref int16[N]` + mode byte, because the compaction changes neither the magnitudes nor
+e_ref) — in the directory named by `q4nx_t2s_dir` / `Q4NX_T2S_DIR`, and the kernels carry the
+`_t2s` suffix (`full_i8_GU_K5120_N17408_t2s.elf`, and the `_t2s_m16` decode family).
+`tools/q4nx_t2s.py` writes those files from either form of the same weights — `from_pb16i_image()` for a
+container that ships pb16i sidecars, `from_t2()` for one that ships only t2 chunks ("derive the t2s stream
+from a t2 chunk, so the container is enough", #830); nothing is requantised in either crossing.
+
+Everything downstream of the load is pb16i's path: the same int32/int64 accumulation, the same
+host-side single rounding, the same per-column `2^e_ref`, and the same loud refusals. The one
+difference the host must respect is the file: `q4nx_t2s.h` gives the 2,176-B tile, and a `.t2s` file
+that is not `tiles x 2,176` bytes is refused by name (never read as a pb16i image). Two independent
+checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp` pins the tile
+against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
+of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
 
 ### From a GGUF
 

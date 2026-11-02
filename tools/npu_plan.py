@@ -150,15 +150,24 @@ def generate(model_dir: str, kernels: str) -> dict:
     layout = cfg.get("q4nx_weight_layout", "rm")
     if layout not in ("rm", "b8", "pb16i", "t2s"):
         raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8, pb16i or t2s")
-    tag = {"pb16i": "_pb16i", "t2s": "_t2s", "b8": "_b8"}.get(layout, "")
+    # a t2s container names its wire format by version: 5 = v1 (`_t2s`), 6 = v2 (`_t2s2`)
+    t2s_v2 = layout == "t2s" and cfg.get("q4nx_weight_layout_version", 5) == 6
+    tag = {"pb16i": "_pb16i", "b8": "_b8"}.get(layout, "_t2s2" if t2s_v2 else ("_t2s" if layout == "t2s" else ""))
 
     im = cfg.get("intermediate_size")
     fused_gu = True
     if isinstance(im, int) and im > 0:
         # The probe the plan replaces, run once and written down: the fused kernel wins, and when
         # neither exists the split layout is assumed (the forward then refuses by name).
-        gu = f"full_i8_GU_K{hidden}_N{2 * im}{tag}.elf"
-        g = f"full_i8_G_K{hidden}_N{im}{tag}.elf"
+        #
+        # The gate/up probe uses the *prefill* family's names, which is not the decode suffix: a b8 container
+        # blocks the tap at every M (so `_b8`), while a pb16i or t2s container's M=128 prefill stays the plain
+        # int8 family and only its decode kernels carry the stream's suffix.  Probing with the decode tag on a
+        # t2s container found neither artifact and wrote "fused", which the box's own pb16i container
+        # contradicts (split) -- 2026-11-02.
+        prefill_tag = "_b8" if layout == "b8" else ""
+        gu = f"full_i8_GU_K{hidden}_N{2 * im}{prefill_tag}.elf"
+        g = f"full_i8_G_K{hidden}_N{im}{prefill_tag}.elf"
         fused_gu = artifact(model_dir, kernels, gu) or not artifact(model_dir, kernels, g)
     else:
         raise SystemExit(f"{model_dir}/config.json: intermediate_size is {im!r}")

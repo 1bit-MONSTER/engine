@@ -228,8 +228,14 @@ single-code probes to name.
 
 #### The t2s stream in the engine (launch path)
 
-A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (with
-`"q4nx_weight_layout_version": 5`; pb16i is 4, and each layout refuses the other's version). The
+A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (pb16i is 4, and each layout
+refuses the other's version). **The version picks the artifact family**, because the two t2s wire orders hold the same
+weights at the same size in a different byte order and reading one with the other's kernel is a silent permutation of the
+matrix, not a crash: **5 = v1** -> `_t2s` / `_t2s_m16` (the expansion interleaves inside the core), **6 = v2** ->
+`_t2s2` / `_t2s2_m16` (the ordering is in the wire, so the core's two contiguous stores are exact — no lane shuffle), and
+any other version is refused by name at init. v2 is the one to ship: measured on the array for GU (K=5120 N=17408, M=16)
+against the pb16i phase in the same window, **0.589 ms vs 1.037 ms (1.76x), 40.2 GB/s** of stream against 48.4, with
+seeds 1/2/3 byte-exact and the `amdxdna` counter 0 (`~/wt/npu-arena/LEADERBOARD.md`, `submissions/GU16T2S`). The
 images are the pb16i sidecars' own set — `blk_<layer>_<tag>_weight.t2s` plus the **unchanged**
 `.ref` (`e_ref int16[N]` + mode byte, because the compaction changes neither the magnitudes nor
 e_ref) — in the directory named by `q4nx_t2s_dir` / `Q4NX_T2S_DIR`, and the kernels carry the

@@ -413,14 +413,24 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // variable wins so a run can point at a fresh set without editing the
             // container's config.
             // The image format has a version so a future change cannot be read as this
-            // one: the config may pin it, and anything but the layout's own version is
-            // refused (4 = pb16i's 4,608-B tiles, 5 = t2s's 2,176-B stream).
-            const int want_ver = t2s_ ? 5 : 4;
-            const int ver = q4nx_config_int(cfg_path.c_str(), "q4nx_weight_layout_version", want_ver);
-            if (ver != want_ver) {
+            // one: the config may pin it, and anything but a version this build knows is
+            // refused (4 = pb16i's 4,608-B tiles, 5 = t2s v1, 6 = t2s v2).
+            const int ver = q4nx_config_int(cfg_path.c_str(), "q4nx_weight_layout_version", 4);
+            if (t2s_) {
+                // v1 and v2 carry the same weights in different byte orders, at the same
+                // size, and reading one with the other's kernel is a silent permutation of
+                // the matrix.  So the version picks the artifact family, not just a flag:
+                // v1 kernels are `_t2s_m16`, v2 kernels are `_t2s2_m16`, and a container
+                // can only ever name the one its images were packed for.
+                if (ver != 5 && ver != 6) {
+                    err_ = "q4nx_weight_layout_version " + std::to_string(ver) +
+                           " is not a t2s stream this build reads (5 = v1, 6 = v2)";
+                    return false;
+                }
+                t2s_v2_ = (ver == 6);
+            } else if (ver != 4) {
                 err_ = "q4nx_weight_layout_version " + std::to_string(ver) +
-                       " is not an image format this build reads (" + std::to_string(want_ver) +
-                       (t2s_ ? " is t2s)" : " is pb16i)");
+                       " is not an image format this build reads (4 is pb16i)";
                 return false;
             }
             const char* e = getenv(t2s_ ? "Q4NX_T2S_DIR" : "Q4NX_PB16I_DIR");
@@ -454,7 +464,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
         }
         fprintf(stderr, "  [forward] weight layout: %s (%s)\n",
-                t2s_ ? "t2s 2-bit ternary stream, expanded on the core"
+                t2s_ ? (t2s_v2_ ? "t2s v2 2-bit ternary stream, expanded on the core (no shuffle)"
+                                : "t2s v1 2-bit ternary stream, interleaved on the core")
                      : (pb16i_ ? "pb16i integer-exact ternary, sidecar images"
                                : (weight_layout_b8_ ? "b8 blocked 8x8 microtiles, tile-n-major"
                                                     : "rm row-major")),

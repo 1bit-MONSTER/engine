@@ -117,7 +117,7 @@ struct Plan {
     bool pb16i = false;
     // kernel decisions that used to be filename probes
     bool fused_gu = true;          // "fused" vs "split" gate/up
-    std::string tag;               // "" | "_b8" | "_pb16i" | "_t2s": the artifact-name suffix
+    std::string tag;               // "" | "_b8" | "_pb16i" | "_t2s" | "_t2s2": the artifact-name suffix
     int prefill_m = 0;             // 0 = not stated (the engine keeps its own default)
     int decode_m = 0;
     bool decode_enabled = true;
@@ -177,9 +177,9 @@ struct Plan {
         if (j.contains("kernels")) {
             const auto& k = obj(j, "kernels", path);
             p.tag = k.value("tag", "");
-            if (p.tag != "" && p.tag != "_b8" && p.tag != "_pb16i" && p.tag != "_t2s")
+            if (p.tag != "" && p.tag != "_b8" && p.tag != "_pb16i" && p.tag != "_t2s" && p.tag != "_t2s2")
                 throw PlanError("plan: " + path + " kernels.tag \"" + p.tag +
-                                "\" is not \"\", \"_b8\", \"_pb16i\" or \"_t2s\"");
+                                "\" is not \"\", \"_b8\", \"_pb16i\", \"_t2s\" or \"_t2s2\"");
         }
         if (j.contains("decode")) {
             const auto& d = obj(j, "decode", path);
@@ -257,11 +257,11 @@ struct Plan {
             throw PlanError("plan: " + path + " names decode.sealed_elf but container.pb16i is false");
         if (p.tag == "_b8" && p.layout != "b8")
             throw PlanError("plan: " + path + " kernels.tag is _b8 but container.layout is " + p.layout);
-        if (p.tag == "_t2s" && p.layout != "t2s")
-            throw PlanError("plan: " + path + " kernels.tag is _t2s but container.layout is " + p.layout);
+        if ((p.tag == "_t2s" || p.tag == "_t2s2") && p.layout != "t2s")
+            throw PlanError("plan: " + path + " kernels.tag is " + p.tag + " but container.layout is " + p.layout);
         // _pb16i and _t2s are both the integer-exact ternary family (container.pb16i), and a plan
         // that claims one without the other would pick artifacts the images cannot feed.
-        const bool ternary_tag = p.tag == "_pb16i" || p.tag == "_t2s";
+        const bool ternary_tag = p.tag == "_pb16i" || p.tag == "_t2s" || p.tag == "_t2s2";
         if (ternary_tag != p.pb16i)
             throw PlanError("plan: " + path + " kernels.tag \"" + p.tag + "\" and container.pb16i " +
                             (p.pb16i ? "true" : "false") + " disagree");

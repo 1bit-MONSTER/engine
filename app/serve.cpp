@@ -222,27 +222,29 @@ constexpr bool kHrxNoSvmGate = true;
 constexpr bool kHrxNoSvmGate = false;
 #endif
 
-const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
+// One decision per process, made once and kept: the line it logs names the variables the *user* had set, and that can
+// only be answered before the trio is put into this process's own environment (apply_cwsr_env_to_self, engine#715).
+// Recomputing it later reads our own exports and reports every variable as "kept from the environment", which is
+// exactly what happened between #794 and this fix (tests/hrx_cwsr_route.sh's "and serve names it in the log").
+const CwsrDecision& hrx_cwsr_decision(const Options& o) {
     constexpr bool gate = kHrxNoSvmGate;
     static const CwsrDecision d = [&] {
         return decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
                                      [](const char* k) { return std::getenv(k); });
     }();
-    return d.env;
+    return d;
 }
+
+const std::vector<std::string>& hrx_cwsr_env(const Options& o) { return hrx_cwsr_decision(o).env; }
 
 // The decision line, printed at the first HRX backend that uses it. Deliberately NOT printed by hrx_cwsr_env(): that
 // would also print on paths that must emit exactly one line (the memory refusal, tests/mem_admit_route.sh counts
 // lines) and on routes that never touch HRX at all (engine#715).
 void announce_cwsr_env(const Options& o) {
-    (void) hrx_cwsr_env(o);
     static bool announced = false;
     if (announced) return;
     announced = true;
-    constexpr bool gate = kHrxNoSvmGate;
-    const CwsrDecision d = decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
-                                                 [](const char* k) { return std::getenv(k); });
-    std::fprintf(stderr, "1bit serve: %s\n", d.log.c_str());
+    std::fprintf(stderr, "1bit serve: %s\n", hrx_cwsr_decision(o).log.c_str());
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),

@@ -182,6 +182,10 @@ if [ -n "${PAYLOAD:-}" ]; then
     ln -sf /opt/1bit-package/lemond-onebit "$skeleton/usr/local/bin/lemond-onebit"
     ln -sf /opt/1bit-package/1bit/1bit "$skeleton/usr/local/bin/1bit"
     cp -a /recipe/embed/. "$skeleton/"
+    # root owns them: /recipe is a host bind mount, so cp -a carries the host uid into the squashfs and
+    # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
+    chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
+        "$skeleton/etc/profile.d" "$skeleton/root" "$skeleton/usr/local/bin" 2> /dev/null || true
     chmod 0755 "$skeleton"/etc/init.d/05onboard-data "$skeleton"/etc/init.d/10lemonade \
         "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
         "$skeleton"/etc/init.d/zz-onboard-ports

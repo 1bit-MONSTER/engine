@@ -217,6 +217,10 @@ rows = [
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
                      "/opt/1bit-package"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
+    # the fix, measured before it ships: StrictModes wants root-owned keys, and the image's file was not
+    ("U7 key-owner", "chown 0:0 /root/.ssh /root/.ssh/authorized_keys 2>&1; "
+                     "ls -l /root/.ssh/authorized_keys | awk '{print $3\"/\"$4\"/\"$1}'; "
+                     "/usr/sbin/sshd -t 2>&1 | head -2; echo key-owner-done", None),
     ("U7 sshd",      "ps | grep -c '[s]shd'; ls -l /root/.ssh/authorized_keys 2>&1 | tail -1; "
                      "ls /etc/ssh/ssh_host_* 2>&1 | head -3; /usr/sbin/sshd -t 2>&1 | head -3; echo sshd-checked", None),
     ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),

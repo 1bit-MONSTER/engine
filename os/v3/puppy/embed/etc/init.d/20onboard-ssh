@@ -29,6 +29,10 @@ KEYS=/root/.ssh/authorized_keys
 
 [ -s "$KEYS" ] || { echo "20onboard-ssh: no $KEYS, sshd not started"; exit 0; }
 mkdir -p /run/sshd
+# StrictModes checks the OWNER as well as the mode, and the image's files come out of git with whatever uid
+# built the squashfs: measured in a booted image, /root/.ssh/authorized_keys was `-rw------- ftp ftp` and sshd
+# accepted the connection and then refused to use the key. chown is not optional here.
+chown 0:0 /root/.ssh "$KEYS" 2> /dev/null
 chmod 700 /root/.ssh
 chmod 600 "$KEYS"
 # 05onboard-data links the ed25519 host key on the data partition in, so the fingerprint a client learned

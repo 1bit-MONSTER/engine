@@ -88,6 +88,11 @@ case $iso in
     boot=(-kernel "$work/vmlinuz" -initrd "$work/initrd.gz" -append "console=ttyS0 1bit.serial=1" -cdrom "$iso")
     ;;
 esac
+# systemd-run --scope runs qemu in place, so the timeout wrapper is what has to end: when the rows are done
+# the VM is stopped here by name instead of being left to its timeout. Three runs once overlapped and the
+# next one could not even open its image ("Failed to get write lock"), while the previous VM still held the
+# port the host probe was aimed at.
+vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$iso" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
     qemu-system-x86_64 -m 4096 -smp 4 -machine q35 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
@@ -238,6 +243,7 @@ for idx, (name, cmd, want) in enumerate(rows):
         print("FAIL %-13s %s" % (name, flat), flush=True)
 PY
 driver_rc=$?
+vmqemu
 cat "$work/rows.txt"
 
 # U3 over the network, from outside the guest.
@@ -264,6 +270,7 @@ if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
 else
     echo "SKIP U7 ssh        set SSHKEY=<private key> whose public half is in the image"
 fi
+vmqemu
 echo "SKIP U4 hardware   HRX chat on the 8060S, the NPU through Lemonade, efivarfs/Secure Boot, boot time: board rows"
 echo "== $iso, transcript $work/serial.log"
 [ "$driver_rc" = "0" ] || exit 2

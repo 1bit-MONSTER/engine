@@ -867,13 +867,21 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         ctx_[i]->blocked_b = weight_layout_b8_;
 
         if (host_gemm_) {
-            // Offline mode: the geometry->artifact mapping is still asserted, but
-            // no device is opened (the ELFs themselves are checked separately by
-            // tests/verify_design_elfs + tests/verify_full_elfs.sh).
+            // Offline mode: host GEMMs are plain float matmuls over the decoded weights, so
+            // no ELF is opened and none is required.  A model whose kernel set has not been
+            // built yet can be loaded and prompted, which is what makes it a usable
+            // numeric reference for a new geometry (engine #796: the d3-lite backbone
+            // answers on the host while its six designs do not exist).  The artifact is
+            // named when it is there; the ELF set itself is checked by
+            // tests/verify_design_elfs + tests/verify_full_elfs.sh, not by this path.
             std::string elf = dir + "/" + g->elf_name;
-            if (!file_exists(elf)) { err_ = missing_kernel(dir, g->elf_name, g->role); return false; }
-            fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
-                    role_tag(g->role), g->M, g->K, g->N, elf.c_str());
+            if (file_exists(elf)) {
+                fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
+                        role_tag(g->role), g->M, g->K, g->N, elf.c_str());
+            } else {
+                fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  (host-GEMM, no ELF: %s)\n",
+                        role_tag(g->role), g->M, g->K, g->N, g->elf_name);
+            }
         } else {
             std::string elf = dir + "/" + g->elf_name;
             if (!file_exists(elf)) {

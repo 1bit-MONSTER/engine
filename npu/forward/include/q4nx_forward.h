@@ -148,9 +148,10 @@ public:
     // artifact_dir holds the full ELFs (full_i8_*.elf).
     bool init(xrt::device& dev, const char* model_path, const std::string& artifact_dir);
     // Host-GEMM mode (NPU_INFER_HOST_GEMM=1): never opens the device.  Design
-    // derivation, ELF mapping, weight decode and the layer maths all run, but
-    // npu_gemm() does a plain float matmul.  This validates the whole forward
-    // against the Python reference offline, which is how the C++ GDN port is
+    // derivation, weight decode and the layer maths all run, but npu_gemm() does a
+    // plain float matmul, and **no ELF is required** — a geometry whose kernel set
+    // has not been built yet can still load and answer.  This validates the whole
+    // forward against the Python reference offline, which is how the C++ GDN port is
     // checked without the shared NPU (see docs/qwen35-4b-weight-format.md).
     bool init_host(const char* model_path, const std::string& artifact_dir);
     bool host_gemm() const { return host_gemm_; }

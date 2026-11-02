@@ -33,7 +33,8 @@ LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cff", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment", "*.example",
-      "*.service", "*.timer", "*.conf", "lemonade-hrx", "packages-extra", "10lemonade", "Dockerfile", "*.Dockerfile",
+      "*.service", "*.timer", "*.conf", "*.env", "lemonade-hrx", "packages-extra", "10lemonade", "20onboard-ssh",
+      "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # os/v2's packaged files: systemd units of kinds the list did not name yet, and the two '#'-comment
       # files a v2 build reads (the snapshot pin, and the board's power profile at /etc/1bit/power)
       "*.mount", "*.preset", "*.network", "power", "pin.txt"), "#"),

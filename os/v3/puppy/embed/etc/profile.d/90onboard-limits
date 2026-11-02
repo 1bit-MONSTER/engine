@@ -1,0 +1,15 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# /etc/profile.d/90onboard-limits - what every shell and every engine run on this board needs.
+#
+# /etc/profile sources every file in /etc/profile.d (measured in the built resolute64 rootfs: Puppy loops
+# over /etc/profile.d/* and not only *.sh), and line 21 of it already sets `ulimit -c 0`, so this is the
+# right hook without a shell-specific file.
+#
+# memlock: the NPU driver's own README asks for soft and hard memlock unlimited (a huge BO alloc fails with
+# "Lock limit exceeded" otherwise), and there is no systemd here to carry a LimitMEMLOCK=.
+ulimit -l unlimited 2>/dev/null
+# the pinned HRX runtime and the no-SVM trio, the same file the boot service reads
+[ -f /etc/1bit/libhsa.env ] && . /etc/1bit/libhsa.env
+true

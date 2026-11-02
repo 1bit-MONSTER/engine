@@ -36,6 +36,8 @@ PIDFILE=/run/lemond-onebit.pid
 
 start() {
     [ -x "$LEMONADE_ONEBIT" ] || { echo "10lemonade: $LEMONADE_ONEBIT is missing, nothing to start" >&2; return 0; }
+    # the NPU driver wants unlimited locked pages and there is no systemd LimitMEMLOCK= here
+    ulimit -l unlimited 2>/dev/null
     # shellcheck disable=SC1090  # the release build pins what HRX needs; the file may not exist
     if [ -f "$ENVFILE" ]; then . "$ENVFILE"; fi
     if [ ! -f "$CONF" ]; then

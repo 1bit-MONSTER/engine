@@ -25,6 +25,11 @@
 #   <out-dir>     where the built .iso and .sfs land
 #   [woof-ce-dir] the woof-CE clone (default $HOME/wt/woof-CE)
 #
+# LIBHSA=<file> installs the release-gated libhsa-runtime64.so.1 at /opt/1bit/libhsa, which is where
+# embed/etc/1bit/libhsa.env points ONEBIT_HRX_LIBHSA (engine#715). Without it the image carries the env file
+# telling HRX where a runtime it does not have would be, so the file is dropped and the build says so: HRX
+# cannot run on a GPU without it, and that is not a state to discover on the board.
+#
 # PAYLOAD=<dir> embeds the release package (TPUPPY-RELEASE U3/U4): the unpacked
 # lemonade-onebit-<tag>/ tree, whose lemond-onebit launcher resolves bin/ and 1bit/ BESIDE ITSELF. It is
 # copied to /opt/1bit-package, /etc/init.d/10lemonade from os/v3/puppy/embed starts it at boot (Puppy's
@@ -76,6 +81,11 @@ if [ -n "${PAYLOAD:-}" ]; then
     [ -x "$payload/lemond-onebit" ] && [ -x "$payload/1bit/1bit" ] || {
         echo "build: $payload is not the release package: want lemond-onebit and 1bit/1bit in it" >&2; exit 1; }
 fi
+libhsa=""
+if [ -n "${LIBHSA:-}" ]; then
+    [ -f "$LIBHSA" ] || { echo "build: LIBHSA=$LIBHSA does not exist" >&2; exit 1; }
+    libhsa=$(cd "$(dirname "$LIBHSA")" && pwd)/$(basename "$LIBHSA")
+fi
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
@@ -85,6 +95,8 @@ exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$recipe":/recipe:ro \
     ${payload:+-v "$payload":/payload:ro} \
     ${payload:+-e PAYLOAD=/payload} \
+    ${libhsa:+-v "$libhsa":/libhsa.so.1:ro} \
+    ${libhsa:+-e LIBHSA=/libhsa.so.1} \
     ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
@@ -165,6 +177,15 @@ if [ -n "${PAYLOAD:-}" ]; then
     cp -a /recipe/embed/. "$skeleton/"
     chmod 0755 "$skeleton"/etc/init.d/10lemonade "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console
     echo "   $(du -sh "$skeleton/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
+    if [ -n "${LIBHSA:-}" ]; then
+        mkdir -p "$skeleton/opt/1bit/libhsa"
+        cp /libhsa.so.1 "$skeleton/opt/1bit/libhsa/libhsa-runtime64.so.1"
+        chmod 0755 "$skeleton/opt/1bit/libhsa/libhsa-runtime64.so.1"
+        echo "   libhsa $(sha256sum /libhsa.so.1 | cut -c1-16) into /opt/1bit/libhsa"
+    else
+        rm -f "$skeleton/etc/1bit/libhsa.env"
+        echo "   WARNING: no LIBHSA=<libhsa-runtime64.so.1>: this image has no HRX runtime (U4 needs one)"
+    fi
 fi
 
 echo "== 3builddistro"; ./3builddistro release </dev/null
@@ -195,6 +216,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/init.d/20onboard-ssh etc/init.d/21serial-console; do
         in_image "$b" || miss="$miss $b"
     done
+    [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }
     [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
     echo "   ok: the engine, the launcher, the service and /usr/local/bin/1bit are in the image"
 fi

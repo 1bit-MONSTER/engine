@@ -20,11 +20,20 @@
 // M=16 twins verify up to 16 rows for the price of one row's weight stream.  So the draft head is worth
 // its cost exactly when it turns "one pass per emitted token" into "one pass per (accepted + 1) tokens".
 //
-// Rollback is a truncation, not a snapshot.  A snapshot of a 400-token context is ~100 MB and one per
-// iteration would cost more than the drafts save, while every cache here is position-indexed: the caller
-// supplies `pos`, so "forget everything past N" is a length bump for attention.  A GDN layer's recurrence is
-// the exception (it is not position-indexed), which is why BaseModel::truncate() may refuse -- the loop then
-// falls back to plain decode rather than emitting wrong tokens.
+// Rollback is a commit, not a snapshot, and not a rollback at all where it can be avoided.
+//
+// A snapshot of a 400-token context is ~100 MB and one per iteration would cost more than the drafts save, and
+// attention state needs no rollback whatsoever: it is position-indexed, the caller supplies `pos`, so
+// "forget everything past N" is a length bump.  The one state that cannot be re-indexed is a GDN layer's
+// recurrence.  So instead of rolling it back, the verify pass DEFERS it: the rows of a verification batch
+// store their recurrence inputs rather than applying them, and BaseModel::commit_verify(accepted) then
+// applies exactly the accepted rows and drops the rest.  Nothing is recomputed and nothing is snapshotted;
+// the cost is the storage of k rows of update inputs (per layer: the conv-ring rows plus the rank-1 update
+// inputs), which is kilobytes, not the 100 MB a state copy would take.
+//
+// A base that has not implemented deferral reports it from commit_verify() and the loop falls back to a
+// synchronous commit + position truncation -- correct, just not free.  Either way the emitted text is the
+// same; the difference is only what a rejected draft costs.
 //
 // The loop is policy only -- it owns no weights and no device state.  The base model arrives through
 // BaseModel (Q4nxNpuForward satisfies it through the adapter in npu/mtp/forward_base.h) and the draft head
@@ -77,11 +86,15 @@ public:
     virtual bool step_batch_all(const std::vector<int>& tokens, int start_pos,
                                std::vector<float>& logits_all) = 0;
 
-    // Forget every position at or past `tokens`, so the next step can run at `tokens`.  Cheap by design:
-    // attention state is position-indexed (the caller passes `pos`), so for a pure-attention model this is
-    // a length bump; a GDN/hybrid model must also roll its recurrent state back and returns false until it
-    // can (see the note at the top of this file -- that is the one engine gap speculation has).
-    virtual bool truncate(int tokens) = 0;
+    // After a verification batch of `rows` rows, keep the first `accepted` of them and discard the rest.
+    //   * attention: pure bookkeeping -- drop the positions of the rejected rows (they are position-indexed,
+    //     so nothing has to be undone);
+    //   * GDN/hybrid: apply the deferred recurrence updates of the accepted rows, drop the rejected ones.
+    //     That is the design this interface exists for: the updates were stored during the verify pass, not
+    //     applied, so committing a prefix is cheap and no state copy is involved.
+    // Returns false if this base cannot defer (no GDN deferral implemented); the loop then stops rather than
+    // pretending the state is consistent.
+    virtual bool commit_verify(int accepted) = 0;
 
     // The last row's hidden state (H floats) after the last step/step_batch_all: the MTP head's input.
     virtual const std::vector<float>& last_hidden() const = 0;
@@ -92,14 +105,22 @@ public:
     virtual ~DraftHead() = default;
     // The base model has just consumed `last_token` and `hidden` is the state after it.  Propose up to k
     // tokens; return how many were written to out (0 = no proposal, the iteration then costs nothing).
+    // `conf`, when given, receives each proposal's own probability (softmax of the head's logits at that
+    // position) so the loop can apply the tau gate; a head that cannot report it leaves `conf` empty and the
+    // gate is skipped for that iteration rather than guessed.
     virtual int draft(const std::vector<float>& hidden, int last_token, int k,
-                      std::vector<int>& out) = 0;
+                      std::vector<int>& out, std::vector<float>* conf = nullptr) = 0;
     virtual void reset() {}
 };
 
 struct Options {
     int k = 4;                 // drafts per iteration; clamped to max_batch_rows()
     int max_tokens = 64;       // tokens to emit, prompt excluded
+    // The chain is gated on the drafter's own confidence: keep drafting while the token's probability is at
+    // least `tau` (0.6 is the published setting for this head), stop the chain otherwise -- a low-confidence
+    // draft is verified anyway (it is already in the batch), it just does not get followed by more of them.
+    // tau <= 0 disables the gate.
+    float tau = 0.6f;
 };
 
 struct Stats {
@@ -159,10 +180,18 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         const int have = ++pos;
 
         std::vector<int> d;
-        int nd = head->draft(base.last_hidden(), t1, k, d);
+        std::vector<float> conf;
+        int nd = head->draft(base.last_hidden(), t1, k, d, &conf);
         if (nd <= 0) continue;
         nd = std::min(nd, k);
         d.resize((size_t)nd);
+        // tau gate: the chain only continues while the drafter is confident; the first draft below tau is
+        // still verified (it is in the batch anyway) but nothing is drafted after it.
+        if (opt.tau > 0.0f && conf.size() == d.size()) {
+            for (int i = 0; i < nd; i++)
+                if (conf[(size_t)i] < opt.tau) { nd = i + 1; break; }
+            d.resize((size_t)nd);
+        }
 
         if (!base.step_batch_all(d, have, all)) { r.err = "verify batch failed"; return r; }
         r.stats.iterations++;
@@ -189,21 +218,13 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         r.stats.accepted += a;              // acceptance is a property of the model, not of the budget
         if (a == 0) r.stats.first_reject++;
 
-        if (take < nd) {
-            // Forget the rows we are not using (refused drafts, or the budget cut us short), and take the
-            // logits that predict the next position from the batch row we stopped at.
-            if (!base.truncate(have + take)) { r.err = "truncate refused"; return r; }
-            if (take > 0)
-                logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
-                              all.begin() + (size_t)take * (size_t)V);
-            pos = have + take;
-        } else {
-            // Everything landed: the batch state is already right, and the last row's logits predict the
-            // next position (one free token per fully accepted iteration).
-            logits.assign(all.begin() + (size_t)(nd - 1) * (size_t)V,
-                          all.begin() + (size_t)nd * (size_t)V);
-            pos = have + nd;
-        }
+        // Commit the accepted rows of the verify batch and discard the rest.  With a deferring base this
+        // applies only the accepted rows' recurrence updates; without one it truncates by position.
+        if (!base.commit_verify(take)) { r.err = "commit_verify refused"; return r; }
+        if (take > 0)
+            logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
+                          all.begin() + (size_t)take * (size_t)V);
+        pos = have + take;
         if ((int)r.tokens.size() >= opt.max_tokens) break;
     }
 

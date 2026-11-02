@@ -169,6 +169,30 @@ Converters: `from_pb16i` (the engine's integer-exact image), `from_ptq1_0` and `
 ternary with an fp16 scale, lossless). `from_tq2_0` is refused unless asked, because TQ2_0's code 3
 means **+2** — it is not a ternary format, and clamping it to +1 changes weights.
 
+### The t2s stream (what the XDNA decode kernel reads)
+
+t2 is the container format: the decoder's byte order, for any consumer. The device does not want that
+order — the mmul takes int4 nibbles at element `e = r*16 + c` of a 16x16 block in byte `e/2` — so the
+kernel would have to transpose 2-bit codes across lanes. `tools/q4nx_t2s.py` derives the **stream** form
+of the same weights instead, which makes the on-core expansion a byte-local `1 -> 2` map:
+
+    2,176 B per k=256 x n=32 tile, 2.125 b/w (pb16i 4,608 B; 27B 14.44 GB -> 6.82 GB)
+    [0, 2048)    2-bit codes, n-major blocks: block (nb, kb) at (nb*16 + kb)*64, and inside a block
+                 byte r*4 + j holds the four codes for k = kb*16 + r, n = nb*16 + 4j + {0,1,2,3}
+    [2048, 2176) int16 multiplier per 128-K block per column, [nb 2][gb 2][16 c] -- pb16i's own `ms`
+                 at the granularity the model stores (pb16i repeats it 4x to reach 32-K granularity)
+    expansion: out[2i] = f(c0) | f(c1)<<4, out[2i+1] = f(c2) | f(c3)<<4, f(v) = v - 1 mod 16 = {15,0,1}
+
+The stream's contract is byte-exact against the image it came from, not statistical: `expand()` must
+reproduce the pb16i code bytes block for block (and `stream()`/`from_pb16i_image()` must agree byte for
+byte), which `tests/q4nx_t2s_test.py` checks synthetically and which was also run on the real Bonsai-2
+images (all 10,880 tiles of `blk_0_ffn_gate_weight.pb16i`, 0 of 44,564,480 code bytes differing,
+14.44 GB -> 6.82 GB — the same 6.82 GB the t2 chunk reports). `from_pb16i_image` **refuses**, with a
+named error, an image whose four 32-K multipliers inside a 128-K block are not equal: that is the one
+thing this compaction cannot hold, and it is the thing the t2 chunk's own gate measures at 100 % of
+blocks for Bonsai-2. The n-major order also makes one `nb` (1,024 B) a single contiguous DMA run, and
+the tile itself is streamed as one 2,176-B run: 2-bit must not cost contiguous-run length.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

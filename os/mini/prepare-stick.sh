@@ -15,10 +15,11 @@
 # limitations under the License.
 #
 # prepare-stick.sh <image.img | /dev/sdX> [--mint | --key <api key>] [--ssh-pubkey FILE]...
-#                   [--model FILE.gguf]... [--check] [--force]
+#                   [--model FILE.gguf]... [--npu-model DIR]... [--check] [--force]
 #
 # Prepares a 1bit OS stick or image from any Linux box: puts your SSH public keys where Dropbear reads
-# them, sets Lemonade's API key, and copies GGUFs into the models directory - then REMOUNTS THE
+# them, sets Lemonade's API key, and copies models into the models directory - GGUFs, and NPU model
+# directories (a directory holding model.q4nx, the engine's own NPU format) - then REMOUNTS THE
 # PARTITION READ-ONLY and proves what it wrote. Everything it refuses, it refuses before writing.
 #
 # The data partition is found the way the image describes it, never by a fixed offset: `sfdisk -d`
@@ -34,8 +35,15 @@
 # it was given, that there is no stray NUL byte, and that the SSH files have the modes Dropbear demands.
 #
 #   prepare-stick.sh /dev/sdb --mint --ssh-pubkey ~/.ssh/id_ed25519.pub --model qwen3-0.6b.gguf
+#   prepare-stick.sh /dev/sdb --npu-model ~/models/npu/Qwen3-0.6B   # name the directory for the entry you want
 #   prepare-stick.sh work/out/1bit-os.img --key "$(openssl rand -hex 24)" --ssh-pubkey my.pub
 #   prepare-stick.sh /dev/sdb --check            # assertions only, nothing is written
+#
+# --npu-model: the engine's NPU format is a DIRECTORY (model.q4nx + tokenizer + config), and init.sh
+# registers every /data/models/*/model.q4nx as `<directory name>-1bit` with onebit_backend npu. So the
+# directory name is the model's name: `--npu-model ~/models/npu/Qwen3-0.6B` becomes the entry
+# `Qwen3-0.6B-1bit` on the stick. Without an NPU model on the stick, Lemonade lists no NPU entry and
+# `1bit-release-check`'s chat-npu row can only SKIP - the NPU route is then never asked on hardware.
 #
 # Exit: 0 prepared and proved; 1 refused or an assertion failed (the reason says which).
 set -u
@@ -47,6 +55,7 @@ LOOP=
 KEY=
 KEYS=""
 MODELS=""
+NPUMODELS=""
 CHECK=0
 FORCE=0
 
@@ -62,6 +71,7 @@ while [ $# -gt 0 ]; do
         --mint)       KEY=mint ;;
         --ssh-pubkey) shift; [ $# -gt 0 ] || die "--ssh-pubkey needs a file"; KEYS="$KEYS $1" ;;
         --model)      shift; [ $# -gt 0 ] || die "--model needs a file"; MODELS="$MODELS $1" ;;
+        --npu-model)  shift; [ $# -gt 0 ] || die "--npu-model needs a directory"; NPUMODELS="$NPUMODELS $1" ;;
         --check)      CHECK=1 ;;
         --force)      FORCE=1 ;;   # do not refuse a partition that is already mounted
         --help|-h)    usage; exit 0 ;;
@@ -71,8 +81,19 @@ while [ $# -gt 0 ]; do
     shift
 done
 
-for p in "$TARGET" $KEYS $MODELS; do
+for p in "$TARGET" $KEYS $MODELS $NPUMODELS; do
     case "$p" in *" "*) die "paths with a space are not supported: $p" ;; esac
+done
+# An NPU model directory is validated here, before anything is mounted or written: a name that would register
+# the wrong entry (or no entry) is a refusal, not something to discover after the ssh keys are already on the stick.
+for d in $NPUMODELS; do
+    [ -d "$d" ] || die "npu model $d is not a directory (the NPU format is a directory, not a file)"
+    [ -s "$d/model.q4nx" ] || die "npu model $d carries no model.q4nx; that is the engine's NPU model file"
+    name=${d%/}; name=${name##*/}
+    [ -n "$name" ] || die "npu model $d has no directory name"
+    case "$name" in
+        *-1bit) die "the directory name '$name' already ends in -1bit, and init.sh registers <directory>-1bit: rename it to '${name%-1bit}' so the entry is '$name'" ;;
+    esac
 done
 [ -n "$TARGET" ] || { usage >&2; exit 1; }
 [ -e "$TARGET" ] || die "$TARGET does not exist"
@@ -290,6 +311,17 @@ if [ "$CHECK" = 0 ]; then
         chown 0:0 "$MNT/models" "$MNT/models/$(basename "$m")" 2>/dev/null
         printf 'model    models/%s (%s bytes)\n' "$(basename "$m")" "$(stat -c %s "$m")"
     done
+    for d in $NPUMODELS; do
+        name=${d%/}; name=${name##*/}
+        [ -d "$MNT/models" ] || mkdir -p "$MNT/models"
+        rm -rf "$MNT/models/$name" || die "could not clear $MNT/models/$name"
+        mkdir -p "$MNT/models/$name" || die "could not create $MNT/models/$name"
+        # -L: on a build box the model directory is symlinks into the FLM install; the stick needs the bytes
+        cp -fRL "$d"/. "$MNT/models/$name"/ || die "could not copy the NPU model $d into $MNT/models/$name"
+        chown -R 0:0 "$MNT/models/$name" 2>/dev/null
+        printf 'npu      models/%s (%s files, %s bytes)\n' "$name" \
+            "$(find "$MNT/models/$name" -type f | wc -l)" "$(du -sb "$MNT/models/$name" | cut -f1)"
+    done
     sync
     # remount read-only: the assertions below read the stick the way the appliance will, and if one
     # needs to say "what is there", there is nothing left that could still be writing
@@ -369,6 +401,25 @@ for m in $MODELS; do
     [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$(stat -c %s "$m")" ] &&
         ok "models/$(basename "$m") is there, same size as the source" ||
         bad "models/$(basename "$m") is missing or a different size"
+done
+
+# An NPU model directory is only usable if init.sh will find model.q4nx in it and the engine can read every
+# file: a dangling symlink inherited from a build box's model dir fails at load time, on the console, where
+# nobody can see why. Checked as the appliance reads it - on the read-only mount.
+for d in $NPUMODELS; do
+    name=${d%/}; name=${name##*/}
+    f=$MNT/models/$name
+    if [ -s "$f/model.q4nx" ] && [ "$(stat -c %s "$f/model.q4nx")" = "$(stat -c %s "$d/model.q4nx")" ]; then
+        ok "models/$name/model.q4nx is there, same size as the source ($(stat -c %s "$d/model.q4nx") bytes)"
+    else
+        bad "models/$name/model.q4nx is missing or a different size"
+    fi
+    broken=$(find "$f" -type l ! -exec test -e {} \; -print 2>/dev/null | head -5)
+    [ -z "$broken" ] && ok "models/$name has no dangling symlink (the bytes are on the stick)" ||
+        bad "models/$name holds symlinks that point nowhere on the stick: $broken"
+    [ "$(find "$f" -type l | wc -l)" = 0 ] && ok "models/$name is real files, no symlinks (init.sh + the engine read it as is)" ||
+        bad "models/$name still holds symlinks; copy it with -L (or re-run --npu-model)"
+    ok "models/$name registers as the entry '$name-1bit' (onebit_backend npu, by init.sh) and 1bit-release-check asks the NPU through it"
 done
 
 # a stick that would not survive a pull is worth knowing about now, not at the console

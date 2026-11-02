@@ -41,8 +41,20 @@ start() {   # start <log> [env...]: serve on a free port with the fake backend, 
         --llama-server "$here/fake_backend.py" --no-mem-check >"$log" 2>&1 &
     pid=$!
     api="http://127.0.0.1:$port"
-    local code=000
-    for _ in $(seq 1 100); do code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health"); [ "$code" = 200 ] && break; sleep 0.1; done
+    # A deadline in seconds, not a try count: the old 100-try loop took 6.7 s on a quiet box and 15.2 s on the
+    # same commit on a loaded CI runner, so a slow runner exhausted it and four checks failed as if routing had
+    # broken (engine #850).
+    local code=000 deadline=$((SECONDS + ${HYBRID_ROUTE_START_S:-60}))
+    while :; do
+        code=$(curl -s -o /dev/null -w '%{http_code}' "$api/health")
+        [ "$code" = 200 ] && break
+        [ $SECONDS -lt $deadline ] || break
+        sleep 0.1
+    done
+    if [ "$code" != 200 ]; then
+        echo "FAIL serve did not answer $api/health within $((SECONDS - deadline + ${HYBRID_ROUTE_START_S:-60}))s: last code $code, pid $pid $(kill -0 "$pid" 2>/dev/null && echo alive || echo gone)"
+        tail -5 "$log" 2>/dev/null
+    fi
     [ "$code" = 200 ]
 }
 stop() { kill "$pid" 2>/dev/null; wait "$pid" 2>/dev/null; pid=; }

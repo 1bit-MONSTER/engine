@@ -134,6 +134,17 @@ cannot load costs that design and nothing else**: `init_elf` returning false mar
 (`no QDQ kernel for KxN: I8Ctx init_elf failed for <path> (MxKxN)`) while the other configured designs keep
 running, and only a configuration in which *every* design is refused disables the device as a whole.
 
+**A shape with no design is a build, not a limit.** All seven of Qwen3-0.6B's projection shapes are covered
+on this box: o_proj (2048×1024) and down_proj (3072×1024) come with the xclbins, and q_proj (1024×2048),
+k_proj/v_proj (1024×1024) and gate_proj/up_proj (1024×3072) were emitted from the iso-build design generator —
+one `-M 128 -K <K> -N <N> -c 4` run of `n1_core_i8_v26.py` through the IRON/MLIR-AIE `aiecc` per shape, with
+the `load_pdi` injection `generators/elf_emit.sh` documents. The generator and the resulting ELFs live in that
+tree, never here. The proof's `quark-kv` and `quark-gu` cases are exactly the two shapes that had neither a
+case nor a design, so a new shape is one line in the `Case[]` table plus one build. On this toolchain
+`aiecc --full-elf-name` exits **0 and writes nothing**; `--get-full-elf` is the flag that emits the ELF (its
+bundle is larger than the xclbin-derived ELFs beside it, and the runtime accepts it — the `|d| = 0` results
+above are the evidence, not the file size).
+
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the
 life of the process; when the lock is held it does not queue — it reports `device busy` and runs the

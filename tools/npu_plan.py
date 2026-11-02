@@ -148,9 +148,9 @@ def generate(model_dir: str, kernels: str) -> dict:
     if not isinstance(n_layers, int) or n_layers <= 0:
         raise SystemExit(f"{model_dir}/config.json: num_hidden_layers is {n_layers!r}")
     layout = cfg.get("q4nx_weight_layout", "rm")
-    if layout not in ("rm", "b8", "pb16i"):
-        raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8 or pb16i")
-    tag = "_pb16i" if layout == "pb16i" else ("_b8" if layout == "b8" else "")
+    if layout not in ("rm", "b8", "pb16i", "t2s"):
+        raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8, pb16i or t2s")
+    tag = {"pb16i": "_pb16i", "t2s": "_t2s", "b8": "_b8"}.get(layout, "")
 
     im = cfg.get("intermediate_size")
     fused_gu = True
@@ -174,8 +174,8 @@ def generate(model_dir: str, kernels: str) -> dict:
         },
         "container": {
             "layout": layout,
-            "chunk_kind": "pb16i" if layout == "pb16i" else "mode0",
-            "pb16i": layout == "pb16i",
+            "chunk_kind": "pb16i" if layout in ("pb16i", "t2s") else "mode0",
+            "pb16i": layout in ("pb16i", "t2s"),
         },
         "fusion": {"gate_up": "fused" if fused_gu else "split"},
         "prefill": {"M": 128},

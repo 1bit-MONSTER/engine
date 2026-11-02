@@ -57,6 +57,12 @@ DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catal
 | kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
 
+The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
+`<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —
+`third_party/lemonade` is a `shallow = true` submodule, so a depth-1 clone reports `~1` for the same commit while a
+full clone reports `~1752` (both measured on 2026-11-02; c18 printed `~5`, i.e. built from a deeper clone). The `~N` is
+reproducible from the build tree, not from the release: it can differ between two candidates carrying the same code.
+
 Artifacts of the gated c19 candidate — sizes and sha256 exactly as its own `SHA256SUMS` records them:
 
 | file | size | sha256 |

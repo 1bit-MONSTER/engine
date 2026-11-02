@@ -338,6 +338,10 @@ int main() {
                 if (i && have <= r.stats.chain_at[i - 1]) adv = false;
             }
             check(adv, "positions: chain starts lie inside the stream and advance");
+            int acc_sum = 0;
+            for (int a : r.stats.chain_accepted) acc_sum += a;
+            check((int)r.stats.chain_drafts.size() == r.stats.iterations && acc_sum == r.stats.accepted,
+                  "positions: the recorded chains add up to the totals (drafts + accepted)");
             std::printf("INFO stream positions: %zu chain starts, first %d, last %d, stream %d rows\n",
                         r.stats.chain_at.size(), r.stats.chain_at.front(), r.stats.chain_at.back(),
                         sd.stream().keep());

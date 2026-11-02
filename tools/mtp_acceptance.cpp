@@ -105,7 +105,8 @@ struct DepthCounts {
 // computation sampled two ways rather than two computations that quietly differ.
 bool chain_stream(ForwardBase& base, const Weights& w, const std::vector<int>& stream,
                   const std::vector<std::vector<float>>& hidden, int k, const std::vector<int>& positions,
-                  DepthCounts& out, double* cos_sum = nullptr, int* cos_n = nullptr) {
+                  DepthCounts& out, double* cos_sum = nullptr, int* cos_n = nullptr,
+                  std::vector<int>* drafts = nullptr, std::vector<uint8_t>* hits = nullptr) {
     auto lm = [&base](const std::vector<float>& x, std::vector<float>& lg) { return base.lm_head(x, lg); };
     KvCache hc;                       // the head's own stream, primed position by position
     std::vector<float> emb, next, lg;
@@ -136,7 +137,10 @@ bool chain_stream(ForwardBase& base, const Weights& w, const std::vector<int>& s
     std::vector<int> which = positions;
     if (which.empty())
         for (size_t i = 0; i + 1 < hidden.size(); i++) which.push_back((int)i);
-    for (int i0 : which) {
+    if (drafts) drafts->assign(which.size() * (size_t)k, -1);
+    if (hits) hits->assign(which.size() * (size_t)k, 0);
+    for (size_t n = 0; n < which.size(); n++) {
+        const int i0 = which[n];
         if (i0 < 0 || (size_t)i0 + 1 >= hidden.size()) continue;
         const size_t i = (size_t)i0;
         KvCache c = cache_at[i];
@@ -152,6 +156,8 @@ bool chain_stream(ForwardBase& base, const Weights& w, const std::vector<int>& s
             if (!head_step(w, h.data(), e2.data(), pos, c, nx, lm, lg)) break;
             const int d = argmax_n(lg);
             const bool hit = (d == stream[i + j + 1]);
+            if (drafts) (*drafts)[n * (size_t)k + (size_t)j] = d;
+            if (hits) (*hits)[n * (size_t)k + (size_t)j] = hit ? 1 : 0;
             out.d_tot[j]++;
             if (hit) out.d_hit[j]++;
             if (prefix_ok) {
@@ -572,7 +578,10 @@ int main(int argc, char** argv) {
                 std::vector<int> pos_list;
                 for (int have : r.stats.chain_at) pos_list.push_back(have - 1);
                 DepthCounts m;
-                if (!chain_stream(base, w, stream, hid_plain, k, pos_list, m)) return 1;
+                std::vector<int> odrafts;
+                std::vector<uint8_t> ohits;
+                if (!chain_stream(base, w, stream, hid_plain, k, pos_list, m, nullptr, nullptr, &odrafts, &ohits))
+                    return 1;
                 matched.add(m);
                 std::printf("  match p%d: %zu offline chains at this loop's own positions (stream %zu rows)\n", pi,
                             pos_list.size(), hid_plain.size());
@@ -584,6 +593,48 @@ int main(int argc, char** argv) {
                                 lv, r.stats.accepted_at[d], r.stats.drafted_at[d], of, m.d_hit[d], m.d_tot[d],
                                 delta, (delta <= 2.0 && delta >= -2.0) ? "" : "  > 2 pp");
                 }
+                // Per-(position, depth) diff.  The aggregates can only say "less"; the drafts say WHICH:
+                //   * same draft token, different verdict -> the verification/feeding path disagrees with the
+                //     protocol on the same computation (a real loop defect, and here is its position);
+                //   * different draft token at depths 1-4 -> the chain itself was computed from a different state,
+                //     which points at the drafter's cache rows, not at the verdict.
+                // Only pairs both paths can score are counted, because offline stops at the stream end and the
+                // live loop keeps drafting (tau=0 always drafts k).  That tail alone is a few pairs, not a trend.
+                int pairs = 0, tok_diff = 0, verdict_diff = 0, verdict_diff_same_tok = 0, live_hit = 0, off_hit = 0;
+                int fpos = -1, fdep = -1, flive = -1, foff = -1, fstr = -1, vpos = -1, vdep = -1, vlive = -1, voff = -1;
+                for (size_t n = 0; n < r.stats.chain_at.size() && n < r.stats.chain_drafts.size(); n++) {
+                    const int i = r.stats.chain_at[n] - 1;
+                    for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
+                        const size_t idx = n * (size_t)k + (size_t)d;
+                        if (i < 0 || (size_t)(i + d + 1) >= stream.size() || idx >= odrafts.size()) continue;
+                        const int od = odrafts[idx];
+                        if (od < 0 || d >= (int)r.stats.chain_drafts[n].size()) continue;   // offline/loop stopped here
+                        const int ld = r.stats.chain_drafts[n][(size_t)d];
+                        const bool lh = d < r.stats.chain_accepted[n];
+                        const bool oh = ohits[idx] != 0;
+                        pairs++;
+                        if (lh) live_hit++;
+                        if (oh) off_hit++;
+                        if (ld != od && fpos < 0) { fpos = i + 1; fdep = d + 1; flive = ld; foff = od; fstr = stream[(size_t)(i + d + 1)]; }
+                        if (ld != od) tok_diff++;
+                        if (lh != oh) {
+                            verdict_diff++;
+                            if (ld == od) {
+                                verdict_diff_same_tok++;
+                                if (vpos < 0) { vpos = i + 1; vdep = d + 1; vlive = lh; voff = oh; }
+                            }
+                        }
+                    }
+                }
+                std::printf("    pairs %d: accepted live %d, offline %d; draft tokens differ %d; verdicts differ %d"
+                            " (%d of them on the SAME draft token)\n",
+                            pairs, live_hit, off_hit, tok_diff, verdict_diff, verdict_diff_same_tok);
+                if (fpos >= 0)
+                    std::printf("    first draft-token difference: stream position %d, depth %d: live %d, offline %d, "
+                                "stream says %d\n", fpos, fdep, flive, foff, fstr);
+                if (vpos >= 0)
+                    std::printf("    first verdict difference on the same token: stream position %d, depth %d: live %s, "
+                                "offline %s\n", vpos, vdep, vlive ? "accept" : "reject", voff ? "accept" : "reject");
             }
             if (!same) {
                 std::printf("  plain:");

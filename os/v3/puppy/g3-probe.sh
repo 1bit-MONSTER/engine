@@ -95,13 +95,19 @@ fi
 [ -d "$root/lib/modules/$kver" ] && ok "zdrv carries /lib/modules/$kver" ||
     bad "zdrv has no /lib/modules/$kver (a kernel bump that left the zdrv behind)"
 
-# the two out-of-tree modules are the difference between an appliance with fans and an NPU and one without
+# the two out-of-tree modules are the difference between an appliance with fans and an NPU and one without.
+# A kernel that ships its own `amdxdna` in drivers/accel AND a pinned one in updates/ has TWO files with the
+# same name; depmod resolves updates/ first, so that is the one the appliance loads and the one this checks
+# (the other is reported, not silently ignored).
 for m in amdxdna ec_su_axb35; do
-    ko=$(find "$root/lib/modules/$kver" -name "$m.ko*" 2> /dev/null | head -n 1)
+    ko=$(find "$root/lib/modules/$kver" -name "$m.ko*" 2> /dev/null |
+        awk -v m="/updates/" '{ if (index($0, m)) print 0, $0; else print 1, $0 }' | sort | head -n 1 | cut -d' ' -f2-)
+    others=$(find "$root/lib/modules/$kver" -name "$m.ko*" 2> /dev/null | grep -v -F "$ko" | tr '\n' ' ')
     if [ -z "$ko" ]; then
         bad "$m.ko is not in the zdrv for $kver"
         continue
     fi
+    [ -z "$others" ] || ok "$m: depmod resolves $ko (also present: $others)"
     magic=$(modinfo -F vermagic "$ko" 2> /dev/null | awk '{print $1}')
     signer=$(modinfo -F signer "$ko" 2> /dev/null)
     [ "$magic" = "$kver" ] && ok "$m.ko vermagic $magic" ||

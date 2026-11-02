@@ -123,7 +123,7 @@ private:
 
 int main(int argc, char** argv) {
     std::string model_dir, head_exact, head_q4k;
-    int tokens = 64, k = 4, prompts = 8;
+    int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
     bool residual = false, dry = false, selftest = false;
     std::string gold;
@@ -137,6 +137,7 @@ int main(int argc, char** argv) {
         else if (a == "--k") k = std::atoi(nexts().c_str());
         else if (a == "--tau") tau = (float)std::atof(nexts().c_str());
         else if (a == "--prompts") prompts = std::atoi(nexts().c_str());
+        else if (a == "--prompt-base") prompt_base = std::atoi(nexts().c_str());
         else if (a == "--residual") residual = true;
         else if (a == "--dry-head") dry = true;
         else if (a == "--selftest-head") selftest = true;
@@ -222,7 +223,8 @@ int main(int argc, char** argv) {
         o.tau = tau;
         o.max_tokens = tokens;
         std::vector<int> prompt_ids;
-        for (int i = 0; i < 8; i++) prompt_ids.push_back((p * 977 + i * 131 + 17) % (base.vocab() - 1) + 1);
+        const int pi = prompt_base + p;      // tickets run a slice of the 8 prompts
+        for (int i = 0; i < 8; i++) prompt_ids.push_back((pi * 977 + i * 131 + 17) % (base.vocab() - 1) + 1);
         fwd.reset();
         drafter.reset();
         const Result r = run(base, &drafter, prompt_ids, o);

@@ -42,6 +42,10 @@ import numpy as np
 
 sys.path.insert(0, os.path.join(os.path.dirname(os.path.abspath(__file__))))
 import mtp_head_ref as ref  # noqa: E402
+import mtp_head_pb16i_exact as exact_conv  # noqa: E402  (the converter's own packer: one tile order, one truth)
+
+_plan = exact_conv.exact_plan_from_cells
+_pack = exact_conv.pack_tiles
 
 G = 32
 M_ROWS = 16
@@ -124,6 +128,7 @@ def main(argv):
             y += A[:, g * G:(g + 1) * G].astype(np.float64).sum(axis=1)[:, None] * add[g, :].astype(np.float64)[None, :]
         y.astype("<f4").tofile(os.path.join(d, "harness", f"seed{a.seed}_expected_float.bin"))
         np.save(os.path.join(d, "HOST_ADD.npy"), add.astype(np.float32))
+        eref.astype("<i2").tofile(os.path.join(d, "EREF"))
         with open(os.path.join(d, "LAYOUT"), "w") as f:
             f.write(f"W_BYTES={img.nbytes}\n")
         with open(os.path.join(d, "ELF"), "w") as f:
@@ -133,6 +138,52 @@ def main(argv):
         made.append((name, elf_tag, K, N, img.nbytes, over))
         print(f"{name:5s} {K:6d}x{N:<6d} -> {elf_tag:20s} image {img.nbytes/1e6:6.2f} MB, "
               f"|C|max {over/1e6:8.2f} M, float-oracle rows written")
+    # q is 12,288 columns but the sealed QKVFAQ ELF is 6,144 wide: the head's q tensor is exactly two halves
+    # (q | output gate), and the source cell grid splits cleanly on the row-block axis, so each half is its own
+    # image in the sealed order -- two launches, one per ELF.
+    src = os.path.join(a.head, "q4_k", "model.q4nx")
+    blob = open(src, "rb").read()
+    import struct
+    hlen = struct.unpack("<Q", blob[:8])[0]
+    cfg = json.load(open(os.path.join(a.head, "q4_k", "config.json")))
+    tq = next(t for t in cfg["tensors"] if t["name"] == "model.mtp.layers.0.self_attn.q_proj.weight")
+    off = 8 + hlen + sum(x["bytes"] for x in cfg["tensors"][:cfg["tensors"].index(tq)])
+    grid = [int(x) for x in tq["shape"]]          # [N/32][K/256] = [384][20]
+    cells = np.frombuffer(blob[off:off + tq["bytes"]], dtype=np.uint8).reshape(grid[0], grid[1], 4736)
+    env = json.load(open(os.path.join(exact, "manifest.json")))
+    for half, sl in (("q_lo", slice(0, grid[0] // 2)), ("q_hi", slice(grid[0] // 2, grid[0]))):
+        K, N = grid[1] * 256, (sl.stop - sl.start) * 32
+        codes, ms, e_ref, add, w_exact, zeroed = _plan(cells[sl], [sl.stop - sl.start, grid[1]], N, K)
+        img = _pack(codes, ms)
+        d = os.path.join(a.out, half)
+        os.makedirs(os.path.join(d, "harness"), exist_ok=True)
+        with open(os.path.join(d, "harness", "geometry.txt"), "w") as f:
+            f.write(f"K {K}\nN {N}\nM {M_ROWS}\n")
+        A = rng.integers(-100, 101, size=(M_ROWS, K), dtype=np.int16).astype(np.int8)
+        A.tofile(os.path.join(d, "harness", f"seed{a.seed}_A.bin"))
+        C = np.zeros((M_ROWS, N), dtype=np.int64)
+        for g in range(K // G):
+            C += (A[:, g * G:(g + 1) * G].astype(np.int64) @ codes[g * G:(g + 1) * G, :].astype(np.int64)) \
+                 * ms[g, :].astype(np.int64)[None, :]
+        C.astype("<i4").tofile(os.path.join(d, "harness", f"seed{a.seed}_expected.bin"))
+        y = C.astype(np.float64) * np.exp2(e_ref.astype(np.float64))[None, :]
+        for g in range(K // G):
+            y += A[:, g * G:(g + 1) * G].astype(np.float64).sum(axis=1)[:, None] * add[g, :].astype(np.float64)[None, :]
+        y.astype("<f4").tofile(os.path.join(d, "harness", f"seed{a.seed}_expected_float.bin"))
+        np.save(os.path.join(d, "HOST_ADD.npy"), add.astype(np.float32))
+        e_ref.astype("<i2").tofile(os.path.join(d, "EREF"))
+        img_path = os.path.join(d, "image.pb16i")
+        img.astype(np.uint8).tofile(img_path)
+        with open(os.path.join(d, "LAYOUT"), "w") as f:
+            f.write(f"W_BYTES={img.nbytes}\n")
+        with open(os.path.join(d, "ELF"), "w") as f:
+            f.write("QKVFAQ_K5120_N6144\nfull_i8_QKVFAQ_K5120_N6144_pb16i_m16.elf\n")
+        with open(os.path.join(d, "IMAGE"), "w") as f:
+            f.write(img_path + "\n")
+        made.append((half, "QKVFAQ_K5120_N6144", K, N, img.nbytes, int(np.abs(C).max())))
+        print(f"{half:5s} {K:6d}x{N:<6d} -> QKVFAQ_K5120_N6144 image {img.nbytes/1e6:6.2f} MB, "
+              f"|C|max {int(np.abs(C).max())/1e6:8.2f} M")
+
     print(f"\n{made and len(made)} head-matrix task(s) under {a.out} "
           f"(fc excluded: K=10240 has no sealed ELF and runs on the host)")
     return 0

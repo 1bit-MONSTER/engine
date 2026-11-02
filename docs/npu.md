@@ -308,7 +308,9 @@ What converts, and how faithfully:
 | `model.embed_tokens.weight` | `model.onnx.data`, fp16 | bf16 | fp16 → bf16 rounding (10 → 7 mantissa bits) |
 | `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1 tiles | codes unchanged; `scale = s` (exactly bf16 in this pack), `zero = -zp*s` (bf16 rounding) |
 | `input_layernorm`, `post_attention_layernorm` | `.fconst`, bf16 at a fixed offset | bf16 | byte-exact |
-| the 24 x 7 projections | `.fconst` | — | **refused**, see below |
+| `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
+| `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
+| `mlp.{gate,up,down}_proj` (24 x 3) | `.fconst`, MLP section | — | **refused**, see below |
 | `model.norm` (final) | — | — | **refused**, see below |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
@@ -333,14 +335,46 @@ Two facts bound what the container can hold, and both are reported, not hidden:
   scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
   manifest and in `config.json`, and nothing reads a padding column as a weight.
 
+### The `.fconst` attention payload
+
+A layer block's attention payload sits between its two epsilon headers and is a whole number of
+**64-row tiles**: one tile is `2*(K/128) + 2` subvolumes of 2,176 B, a pair per (column half, K
+block of 128) plus the pair the writer puts its bias input in. Inside a weight subvolume,
+`[0, 2048)` are the quants (byte `(cp%4) + kk*4 + (cp/4)*512` holds rows `2*cp` and `2*cp+1` at
+column `kk` of the block), `[2048, 2064)` the zero points and `[2112, 2176)` 32 bf16 scales, one
+per row of the half. Codes and zero points are int4 in two's complement; the +8 an ONNX
+MatMulNBits adds cancels between the two fields, so the stored nibbles are used as they are.
+FACTS §7.13 established that layout by known-answer write and §7.15 against shipped bytes.
+
+Which tile belongs to which projection is **measured, not assumed**: on the shipped 0.5B pack the
+tiles' bias subvolumes matched the pack's own q/k/v bias vectors, which identifies the runs as
+k (2 tiles), q (14), v (2), o (14) — 32 tiles, the payload's whole size. A pack whose payload is
+not a whole number of tiles of that hidden size, or whose q/k/v/o row counts do not add up to the
+measured tile count, is refused by name with the numbers (`npu-pack info` reports the measurement).
+
+**Every tile read is its own check.** Before anything is written, each tile is decoded and
+re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That
+one comparison holds every field, index and nibble order at once, and it is why a tile whose
+fields we do not understand cannot be imported silently: on `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
+it passes **768/768** tiles of 24 layers. `tests/golden/oga_attn_tile.bin` is one of those tiles,
+copied verbatim from the pack by `tools/oga_attn_tile_golden.py`, so the same check runs in CI
+against the vendor writer's bytes with no vendor stack present. The fixture's identity is
+independent of this reader: the vendor packer (`matmulnbits_pack_const_float32`, `mladf_version
+v2`) reproduces the shipped tile from the arrays this decoder produces.
+
 **Refusals are named, and a refusal writes nothing.** Without `--allow-incomplete`, a pack the
 importer cannot represent exits 3 and lists every tensor it refused with the reason, so a
 partial model never lands in a model directory by accident. With `--allow-incomplete` it writes
 what it can and records the rest in the container's `__metadata__` (`incomplete`) and in
 `config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
-that is **50 tensors, 18992 tiles** (embedding, head, 48 layer norms) and **169 refusals**: the
-24 x 7 projections, whose weights live only in the `.fconst` and whose 4-bit tile packing is not
-established (FACTS §3), and the final norm, whose 1,856-byte tail envelope turned out to be
+that is now **218 tensors, 25,136 tiles** (embedding, head, 48 layer norms, 96 attention
+projections, 72 attention biases) and **73 refusals**: the 24 x 3 MLP projections, whose section of
+the `.fconst` is 16 subvolumes of 4,288 B per 128-row unit (64 output rows per column group, i.e. the
+vendor writer's `Nsubv 64` instance) carrying **one fused gate/up tensor whose rows interleave in
+32-row chunks** — the unit size and the interleave are established from the writer's own headers, the
+intra-subvolume byte order is not, and the packer this importer checks against emits only the
+2,176-byte instance for K=896, so those tiles cannot be re-encoded and byte-verified the way the
+attention tiles are; and the final norm, whose 1,856-byte tail envelope turned out to be
 `[eps][pad][448 f32]` and not an RMSNorm weight on either `.fconst`.
 
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
@@ -348,8 +382,8 @@ opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (re
 `npu_pack_import`, and as `npu_pack_import_oga` when `-DONEBIT_OGA_PACK=<dir>` is given) checks
 the decode, the tiling against `tests/golden/oga_pack_tiles.bin` — written by
 `tools/oga_pack_tiles_golden.py` with the same layout `tools/gguf_to_q4nx.py` has always used —
-and, against a real pack, the refusal list, the self-check numbers and that the container opens
-with `npu::Model`.
+the attention tile against `tests/golden/oga_attn_tile.bin`, and, against a real pack, the refusal
+list, the tile round trip, the self-check numbers and that the container opens with `npu::Model`.
 
 ### Cross-check against the official converter
 

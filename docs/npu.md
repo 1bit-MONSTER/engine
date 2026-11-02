@@ -124,6 +124,24 @@ t2 tile, 2176 bytes, 32 rows (N) x 256 columns (K) of one tensor
 Tile order is the container's everywhere: row-major over the `[N/32][K/256]` grid, so one
 32-column block's whole K extent is contiguous. Geometry: `N % 32 == 0`, `K % 256 == 0`.
 
+**A tensor that is not whole tiles is padded, not refused-and-forgotten.** The padding is code 0 with
+scale `0.0`, i.e. a weight of exactly 0: a padded K column contributes 0 to the reduction whatever the
+activation is, and a padded N row is never read. `tools/q4nx_t2.py` refuses such a tensor by default and
+pads it with `pad=True` (`pad_to_tile`). The chunk has no field for the original shape, so the padded
+shape is the tensor's shape and the consumer skips the rows the writer did not fill. All 431 ternary
+Bonsai-2 images are already whole tiles (5120 / 6144 / 17408-column rows), so this exists for GGUF
+tensors and for any projection whose width is not a multiple of 32.
+
+**The stored weight is the folded (post-rotation) one, and t2 carries no rotation of its own.** A folded
+container's `W'` already has the block Hadamard and the per-width signs baked into the weights; the
+consumer rotates the *activation* into that basis — `A' = H (A . s)`, signs first, then the normalized
+Sylvester-Walsh butterfly, then the `1/sqrt(block)` — and never touches the weight
+(`npu/forward/src/q4nx_forward.cpp::hadamard_rotate`). So a t2 tensor holds `W'` exactly as the pb16i
+image does, the fold declaration stays where it belongs (the container's `q4nx_hadamard`,
+`q4nx_hadamard_block` and the `HAD1` sign table), and the chunk needs no pre/post-rotation flag: reading
+a t2 tensor in the wrong basis is a consumer bug, not a format one. The inverse direction (the tied
+embedding, `inverse_weight_names` in the pack) is `S (H y)`, which round-trips to the identity.
+
 **The scale is fp16, not bf16, and that is load bearing.** Every source format already stores this
 scale as fp16 — PTQ1_0's, TQ1_0's and TQ2_0's `d` are `ggml_half`, and `pb16i`'s `ms * 2^e_ref` is an
 int16 with a per-column exponent — while bf16 has 8 significand bits against fp16's 11. Measured on
@@ -150,6 +168,30 @@ dequantisation of the same image, float for float, on all 431 images when they a
 Converters: `from_pb16i` (the engine's integer-exact image), `from_ptq1_0` and `from_tq1_0` (both
 ternary with an fp16 scale, lossless). `from_tq2_0` is refused unless asked, because TQ2_0's code 3
 means **+2** — it is not a ternary format, and clamping it to +1 changes weights.
+
+### The t2s stream (what the XDNA decode kernel reads)
+
+t2 is the container format: the decoder's byte order, for any consumer. The device does not want that
+order — the mmul takes int4 nibbles at element `e = r*16 + c` of a 16x16 block in byte `e/2` — so the
+kernel would have to transpose 2-bit codes across lanes. `tools/q4nx_t2s.py` derives the **stream** form
+of the same weights instead, which makes the on-core expansion a byte-local `1 -> 2` map:
+
+    2,176 B per k=256 x n=32 tile, 2.125 b/w (pb16i 4,608 B; 27B 14.44 GB -> 6.82 GB)
+    [0, 2048)    2-bit codes, n-major blocks: block (nb, kb) at (nb*16 + kb)*64, and inside a block
+                 byte r*4 + j holds the four codes for k = kb*16 + r, n = nb*16 + 4j + {0,1,2,3}
+    [2048, 2176) int16 multiplier per 128-K block per column, [nb 2][gb 2][16 c] -- pb16i's own `ms`
+                 at the granularity the model stores (pb16i repeats it 4x to reach 32-K granularity)
+    expansion: out[2i] = f(c0) | f(c1)<<4, out[2i+1] = f(c2) | f(c3)<<4, f(v) = v - 1 mod 16 = {15,0,1}
+
+The stream's contract is byte-exact against the image it came from, not statistical: `expand()` must
+reproduce the pb16i code bytes block for block (and `stream()`/`from_pb16i_image()` must agree byte for
+byte), which `tests/q4nx_t2s_test.py` checks synthetically and which was also run on the real Bonsai-2
+images (all 10,880 tiles of `blk_0_ffn_gate_weight.pb16i`, 0 of 44,564,480 code bytes differing,
+14.44 GB -> 6.82 GB — the same 6.82 GB the t2 chunk reports). `from_pb16i_image` **refuses**, with a
+named error, an image whose four 32-K multipliers inside a 128-K block are not equal: that is the one
+thing this compaction cannot hold, and it is the thing the t2 chunk's own gate measures at 100 % of
+blocks for Bonsai-2. The n-major order also makes one `nb` (1,024 B) a single contiguous DMA run, and
+the tile itself is streamed as one 2,176-B run: 2-bit must not cost contiguous-run length.
 
 ### From a GGUF
 
@@ -551,6 +593,30 @@ fixtures it generated, `ctest systemone_contract`), and `app/npu_systemone.h` wr
 template with `enable_thinking=False` — which opens the assistant turn with an **empty think block**.
 Those trailing bytes are part of what the model reads, so reusing `chatml()` here would be a different
 input. `state` is parsed as ordered JSON because upstream preserves the request's key order.
+
+**Converting a d3 pack** (engine #796) is `tools/safetensors_to_q4nx.py pack <pack> <model dir> --arch qwen3_5`
+(the arch is detected from the pack's `language_model.*` names, so `auto` is enough). It is not a rename
+job: three transforms in the pack's GDN tensors are silently wrong answers when they are wrong, so each is
+named here and covered by a known-answer test (`ctest safetensors_to_q4nx`):
+
+| from | to | transform |
+|---|---|---|
+| `linear_attn.A_log` | `linear_attn.ssm_a` | **`-exp(A_log)`, F32** — the forward computes `expf(ssm_a * softplus(dt))`, so the raw A_log decays backwards |
+| `linear_attn.conv1d.weight` `[CD,1,CK]` | `linear_attn.ssm_conv1d.weight` | **transpose to tap-major** `[CK,CD]`: the forward indexes `conv[j*CD + c]` |
+| `linear_attn.in_proj_a/b` | `ssm_alpha_proj`/`ssm_beta_proj` | rows **zero-padded to 32** so they tile; the forward dequantises at the stored height and keeps the first NVH rows (**q4_1 where the FLM config asks Q8_0** — a deviation `verify` measures rather than hides) |
+
+The remaining names come from `configs/q4nx/qwen3.5_0.8b.json`'s `q4nx_name` column (`in_proj_qkv` →
+`qkv_proj`, `in_proj_z` → `self_attn.gate_proj`, `out_proj` → `ssm_out_proj`, `dt_bias` → `ssm_dt.bias`), and
+`visual.*` is skipped because the forward runs the text path. Two converter rules exist because of measured
+load failures, not style: the embedding keeps its **2-D shape** (the loader reads vocab and hidden off
+`shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
+`config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
+
+What is still missing for a real d3 row is the **artifact set**: the forward asserts ELF existence even in
+`NPU_INFER_HOST_GEMM=1`, and this geometry needs six designs — `QKV K1024 N5120` (q|gate|k|v, `q_proj`
+carries the output gate), `O K2048 N1024` (GDN's `ssm_out` reuses it), `GU K1024 N7168`,
+`D K3584 N1024`, GDN `QKV K1024 N6144` and `Z K1024 N2048`. Without them the load stops at
+`forward init failed: … this model's plan needs the QKV kernel "full_i8_QKV_K1024_N5120.elf" … (missing)`.
 
 Refusals follow the d3 server this route stands in for, so vLLM Semantic Router can point at it unchanged —
 which means **422 here, not the 400 the chat route uses**:

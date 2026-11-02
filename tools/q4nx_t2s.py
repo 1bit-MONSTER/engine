@@ -46,8 +46,16 @@ The gate is byte-exact, not statistical: `expand()` must reproduce the pb16i ima
 for block and the multipliers must be identical, which `tests/q4nx_t2s_test.py` checks on every tile of a
 frozen fixture.  Nothing here runs on the device; the kernel's own copy of the expansion is
 `npu-kernels`, private.
+
+The stream is also derivable from the container alone: `from_t2()` takes a `q4nx_t2` chunk and returns
+the same bytes `from_pb16i_image()` returns for the image that chunk was made from, so a model shipped
+in the t2 form needs no pb16i sidecar to feed the kernel.  The two forms are the same weights in
+different orders (t2 is k-major per 32-row band, this is n-major per 16x16 block) and are never
+interchangeable, which is why the crossing is one function and not a byte copy.
 """
 import numpy as np
+
+import q4nx_t2
 
 from q4nx_pb16i import CODE_BYTES as PB_CODE_BYTES, KC, NW, ROWS as PB_ROWS, TILE as PB_TILE, pack, w_bytes as pb_w_bytes
 
@@ -123,6 +131,19 @@ def from_pb16i_image(img, K, N):
     ms_area = np.ascontiguousarray(ms4[:, :, :, 0, :]).astype("<i2").reshape(-1, MS_BYTES // 2)
     ms_area = ms_area.view(np.uint8).reshape(-1, MS_BYTES)
     return np.concatenate([area, ms_area], axis=1)
+
+
+def from_t2(chunk, K, N):
+    """A container's t2 chunk -> the t2s stream bytes, without the pb16i image.
+
+    Re-derives the image with the packer's own code (so the tile order and the int16 multipliers are
+    the packer's, not a second implementation of them) and then streams it; the result is byte-
+    identical to `from_pb16i_image()` on the image the chunk came from.  pb16i geometry applies on
+    top of t2's, i.e. N must be a multiple of 1,024 as well as 32.
+    """
+    codes, bits = q4nx_t2.unpack_bits(chunk, K, N)          # [N][K] and [N][K//128], fp16 bits
+    img, _eref, _mode = pack(codes.T.copy(), bits.T.copy(), K, N)
+    return from_pb16i_image(img.reshape(-1), K, N)
 
 
 def stream(codes, dbits, K, N):

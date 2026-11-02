@@ -327,6 +327,20 @@ int main() {
                   "stream: the drafter's committed rows == prompt + emitted (its cache IS the base's stream)");
             check(r.stats.accepted == r.stats.drafted,
                   "stream: a drafter that has seen the stream accepts every draft (no bookkeeping loss)");
+            // The chain positions are what `--offline --positions-in` scores, so they have to be exactly the
+            // loop's own starts: one per iteration, inside the committed stream, strictly advancing.
+            check((int)r.stats.chain_at.size() == r.stats.iterations,
+                  "positions: one chain start recorded per iteration");
+            bool adv = true;
+            for (size_t i = 0; i < r.stats.chain_at.size(); i++) {
+                const int have = r.stats.chain_at[i];
+                if (have < P0 || have > P0 + r.stats.emitted) adv = false;
+                if (i && have <= r.stats.chain_at[i - 1]) adv = false;
+            }
+            check(adv, "positions: chain starts lie inside the stream and advance");
+            std::printf("INFO stream positions: %zu chain starts, first %d, last %d, stream %d rows\n",
+                        r.stats.chain_at.size(), r.stats.chain_at.front(), r.stats.chain_at.back(),
+                        sd.stream().keep());
             std::printf("INFO stream primed k=4: rows=%d, mismatches=%d, accepted %d/%d, passes/token %.3f\n",
                         sd.stream().keep(), sd.stream_mismatches(), r.stats.accepted, r.stats.drafted,
                         r.stats.passes_per_token());

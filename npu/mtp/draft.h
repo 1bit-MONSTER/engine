@@ -167,6 +167,9 @@ struct Stats {
     // Per draft depth: rows offered at depth d, and how many of them the base model agreed with.  This is the
     // shape the offline protocol reports, and the only form in which "live equals offline" can be checked.
     int drafted_at[kMaxDepth] = {0}, accepted_at[kMaxDepth] = {0};
+    // The stream position of every chain this loop opened.  The offline protocol chains from EVERY position, so
+    // its per-depth table and this one are only the same measurement when it is scored at these positions.
+    std::vector<int> chain_at;
     double hit_at(int d) const {
         return (d >= 0 && d < kMaxDepth && drafted_at[d]) ? double(accepted_at[d]) / double(drafted_at[d]) : 0.0;
     }
@@ -223,6 +226,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
 
         std::vector<int> d;
         std::vector<float> conf;
+        r.stats.chain_at.push_back(have);
         int nd = head->draft(base.last_hidden(), t1, have, k, d, &conf);
         if (nd <= 0) continue;
         nd = std::min(nd, k);

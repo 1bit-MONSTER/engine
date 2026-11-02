@@ -124,6 +124,24 @@ t2 tile, 2176 bytes, 32 rows (N) x 256 columns (K) of one tensor
 Tile order is the container's everywhere: row-major over the `[N/32][K/256]` grid, so one
 32-column block's whole K extent is contiguous. Geometry: `N % 32 == 0`, `K % 256 == 0`.
 
+**A tensor that is not whole tiles is padded, not refused-and-forgotten.** The padding is code 0 with
+scale `0.0`, i.e. a weight of exactly 0: a padded K column contributes 0 to the reduction whatever the
+activation is, and a padded N row is never read. `tools/q4nx_t2.py` refuses such a tensor by default and
+pads it with `pad=True` (`pad_to_tile`). The chunk has no field for the original shape, so the padded
+shape is the tensor's shape and the consumer skips the rows the writer did not fill. All 431 ternary
+Bonsai-2 images are already whole tiles (5120 / 6144 / 17408-column rows), so this exists for GGUF
+tensors and for any projection whose width is not a multiple of 32.
+
+**The stored weight is the folded (post-rotation) one, and t2 carries no rotation of its own.** A folded
+container's `W'` already has the block Hadamard and the per-width signs baked into the weights; the
+consumer rotates the *activation* into that basis — `A' = H (A . s)`, signs first, then the normalized
+Sylvester-Walsh butterfly, then the `1/sqrt(block)` — and never touches the weight
+(`npu/forward/src/q4nx_forward.cpp::hadamard_rotate`). So a t2 tensor holds `W'` exactly as the pb16i
+image does, the fold declaration stays where it belongs (the container's `q4nx_hadamard`,
+`q4nx_hadamard_block` and the `HAD1` sign table), and the chunk needs no pre/post-rotation flag: reading
+a t2 tensor in the wrong basis is a consumer bug, not a format one. The inverse direction (the tied
+embedding, `inverse_weight_names` in the pack) is `S (H y)`, which round-trips to the identity.
+
 **The scale is fp16, not bf16, and that is load bearing.** Every source format already stores this
 scale as fp16 — PTQ1_0's, TQ1_0's and TQ2_0's `d` are `ggml_half`, and `pb16i`'s `ms * 2^e_ref` is an
 int16 with a per-column exponent — while bf16 has 8 significand bits against fp16's 11. Measured on

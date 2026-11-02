@@ -226,8 +226,10 @@ rows = [
     # Secure Boot as USERSPACE reads it: `mokutil` and `efibootmgr` both need efivarfs, and the appliance has
     # to have mounted it itself (03onboard-efivars) - a row that mounts it first proves nothing about the
     # image, which is the mistake pi-release's board script caught on cycle 9. So: read /proc/mounts BEFORE
-    # touching anything, then ask mokutil. Measured on cycle 9: kernel `Secure boot enabled`, userspace
-    # `EFI variables are not supported on this system` - a perfect chain and an unreadable state.
+    # touching anything, then ask mokutil. Measured on cycle 9: unmounted at row time (0 in /proc/mounts, 0
+    # SecureBoot- entries) - and the very next rows then printed `SecureBoot enabled` and OVMF's boot entries
+    # anyway, because **mokutil mounts efivarfs itself** when it cannot read efivars. That is precisely why
+    # the mount is its own row and runs first: a tool repairing the state must not make the image look whole.
     *([("efivarfs", "grep -c ' /sys/firmware/efi/efivars ' /proc/mounts; "
         "ls /sys/firmware/efi/efivars 2>/dev/null | grep -c '^SecureBoot-'; "
         "grep -q ' /sys/firmware/efi/efivars ' /proc/mounts && echo efivarfs-mounted",

@@ -110,6 +110,42 @@ batch width, not the build, is the variable.
 `hrx`, default `n_slots = 4`: copy0 vs alone `4/48` ids but **44/48** log-prob bits, i.e. the
 reported numbers move even where the tokens do not.
 
+### What the `hrx` width gate is, by name
+
+`GGML_HRX_LOG_DISPATCH=1` prints each dispatch registration the first time it matches
+(`dispatch_registry/dispatch-registry.cpp`), so the set of registrations a serve logs is the set of
+kernels its graphs actually ran. Keying that log on the root node's shape as well — a throwaway local
+patch, not proposed for merge — separates the widths, because a *solo* request also prefills at width
+>1. One `hrx` serve, Qwen3-0.6B, 48-token probe at `--parallel 4`, 26 registrations, and the decode
+step splits into two disjoint sets:
+
+| decode width | registrations seen only at that width |
+|---|---|
+| 1 (solo, and any sequential history) | `hip.qkv_rope`, `kquant.mul_mat.decode_f32`, `hip.dense_kquant_swiglu`, `hip.gemv_add_norm`, `common.mul_mat.f32_f32_decode` |
+| 2 (concurrent) | `hip.kquant_tokens.mm`, `hip.kquant_tokens.mm_add`, `hip.kquant_tokens.swiglu`, `common.rmsnorm_binary_f32` |
+
+Seventeen more registrations match at both widths, including the attention kernel
+(`common.flash_attention_decode_split_next_q8`): on `hrx`, unlike on `cpu`, attention is *not* where
+the width dependence comes from. What changes is the **fusion boundaries**. The residual add and
+RMSNorm are one kernel at width 1 (`hip.gemv_add_norm`) and two dispatches at width 2
+(`hip.kquant_tokens.mm_add` + `common.rmsnorm_binary_f32`); gate/up/SwiGLU is
+`hip.dense_kquant_swiglu` versus `hip.kquant_tokens.swiglu`; the K-quant matmul is the per-token
+decode family versus the `decode_tokens` family. So the width-2 graph is not the width-1 graph
+widened, it is a differently fused graph.
+
+**No single switch restores width invariance on `hrx`.** Six `GGML_HRX_DISABLE_DISPATCH=` arms were
+run, each verified to have taken effect by the changed registration set: disabling the width-2
+token-matmul family, the width-2 separate norm, the width-1 fused add+norm, and all four width-1
+fusions together each still left the width-2 numbers displaced from the solo ones — max |Δlogp|
+0.045-0.132 nats in every arm, against 0.092 for the unmodified server. Forcing both widths onto a
+single kernel set is not expressible at all: `hip.dense_kquant_swiglu` has no fallback, and with it
+disabled `GGML_HRX_STRICT=1` refuses the graph (`ffn_gate-27` `MUL_MAT f32 ne=[3072,1,1,1]` not placed
+on HRX, 2 of 986 nodes off HRX). Disabling the width-1 fused add+norm alone moves the *solo* numbers
+by 0.121 nats — as much as the width switch itself — so these fused kernels each reassociate a sum
+rather than being interchangeable extras. Contrast `cpu`, where one flag (`-DGGML_CPU_REPACK=OFF`)
+removes the width dependence entirely: on `hrx` the reproducible configuration is `--parallel 1`, and
+there is no equivalent env switch.
+
 ### NPU: repeatable, but not comparable to the other two
 
 On a build that carries the NPU log-probabilities, the NPU route is **bitwise repeatable**: 8 prompts ×
@@ -190,6 +226,11 @@ python3 tools/logprob_agree.py \
 Exit code 0 means every route was bitwise repeatable *and* every pair matched exactly; 1 means a
 route diverged on repeat, a route returned no log-probabilities, or a pair differs; 2 means a route
 was unreachable. `--selftest` checks the comparison logic without a server.
+
+To re-derive the `hrx` width gate rather than guess it, run the same serve with `GGML_HRX_LOG_DISPATCH=1`
+and issue a solo request in one process and a concurrent one in another; the registration sets differ by
+exactly the table above. `GGML_HRX_DISABLE_DISPATCH=<substring>` turns any one registration off, which is
+how each arm above was run.
 
 ## Two things that will waste your afternoon
 

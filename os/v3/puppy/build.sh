@@ -23,6 +23,13 @@
 #                 `lemond` need GLIBC_2.43 (measured), and noble64's Puppy has 2.39
 #   <kernel-dir>  the directory os/v3/puppy/mk-huge-kernel.sh wrote: huge-<kver>.tar.zst
 #   <out-dir>     where the built .iso and .sfs land
+#   [woof-ce-dir] the woof-CE clone (default $HOME/wt/woof-CE)
+#
+# PAYLOAD=<dir> embeds the release package (TPUPPY-RELEASE U3/U4): the unpacked
+# lemonade-onebit-<tag>/ tree, whose lemond-onebit launcher resolves bin/ and 1bit/ BESIDE ITSELF. It is
+# copied to /opt/1bit-package, /etc/init.d/10lemonade from os/v3/puppy/embed starts it at boot (Puppy's
+# rc.services runs every executable /etc/init.d script), and the build refuses an image whose rootfs lacks
+# the engine or the launcher. Without PAYLOAD the image is the plain Puppy base, as before.
 #
 # Two things the woof-CE build assumes that are not obvious, both measured here:
 #   * merge2out refuses to run unless $GITHUB_ACTIONS is set or the host is a running Puppy - CI sets it,
@@ -63,6 +70,12 @@ ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
     echo "build: no huge-*.tar.* in $kernel (run mk-huge-kernel.sh first)" >&2; exit 1; }
 mkdir -p "$out"; out=$(cd "$out" && pwd)
 recipe=$(cd "$(dirname "$0")" && pwd)   # os/v3/puppy, mounted at /recipe: packages-extra lives there
+payload=""
+if [ -n "${PAYLOAD:-}" ]; then
+    payload=$(cd "$PAYLOAD" 2>/dev/null && pwd) || { echo "build: PAYLOAD=$PAYLOAD does not exist" >&2; exit 1; }
+    [ -x "$payload/lemond-onebit" ] && [ -x "$payload/1bit/1bit" ] || {
+        echo "build: $payload is not the release package: want lemond-onebit and 1bit/1bit in it" >&2; exit 1; }
+fi
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
@@ -70,6 +83,7 @@ echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($m
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
     -v "$recipe":/recipe:ro \
+    ${payload:+-v "$payload":/payload:ro} \
     ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
@@ -120,6 +134,23 @@ ls -l kernel-kit/output/
 echo "== 0setup"; ./0setup </dev/null
 echo "== 1download"; ./1download </dev/null
 echo "== 2createpackages"; ./2createpackages </dev/null
+
+# U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
+# Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
+# itself - so this is a copy plus two symlinks and the boot service.
+if [ -n "${PAYLOAD:-}" ]; then
+    echo "== embed the release package"
+    rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
+    [ -n "$rootfs" ] || { echo "build: REFUSED: no rootfs-complete to embed into" >&2; exit 1; }
+    mkdir -p "$rootfs/opt/1bit-package" "$rootfs/usr/local/bin"
+    cp -a /payload/bin /payload/1bit /payload/lemond-onebit "$rootfs/opt/1bit-package/"
+    ln -sf /opt/1bit-package/lemond-onebit "$rootfs/usr/local/bin/lemond-onebit"
+    ln -sf /opt/1bit-package/1bit/1bit "$rootfs/usr/local/bin/1bit"
+    cp -a /recipe/embed/. "$rootfs/"
+    chmod 0755 "$rootfs/etc/init.d/10lemonade"
+    echo "   $(du -sh "$rootfs/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
+fi
+
 echo "== 3builddistro"; ./3builddistro release </dev/null
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
@@ -133,6 +164,15 @@ for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil; do
 done
 [ -z "$miss" ] || { echo "build: REFUSED: the rootfs is missing:$miss (packages-extra did not land)" >&2; exit 1; }
 echo "   ok: sudo, apt, sshd, mokutil are in $rootfs"
+if [ -n "${PAYLOAD:-}" ]; then
+    miss=""
+    [ -x "$rootfs/opt/1bit-package/1bit/1bit" ] || miss="$miss the engine"
+    [ -x "$rootfs/opt/1bit-package/lemond-onebit" ] || miss="$miss the lemond-onebit launcher"
+    [ -x "$rootfs/etc/init.d/10lemonade" ] || miss="$miss the boot service (not executable: rc.services only runs executable ones)"
+    [ -f "$rootfs/usr/local/bin/1bit" ] || miss="$miss /usr/local/bin/1bit"
+    [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
+    echo "   ok: the engine, the launcher, the service and /usr/local/bin/1bit are in the rootfs"
+fi
 echo "== output"
 ls -l woof-output-* 2>/dev/null | head -20
 cp -f woof-output-*/*.iso woof-output-*/*.sfs /out/ 2>/dev/null || true

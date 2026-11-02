@@ -3282,6 +3282,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         for (int m = 0; m < M; m++)
             rmsnorm(&X[(size_t)m * H], final_norm_.data(), H, &norm_all[(size_t)m * H]);
         std::copy(norm_all.begin() + (size_t)(M - 1) * H, norm_all.end(), fnorm.begin());
+        last_hidden_rows_ = norm_all;          // per-row normed hidden, for a drafter that must advance too
         ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
     } else {

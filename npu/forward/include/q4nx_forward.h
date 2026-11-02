@@ -224,6 +224,9 @@ public:
     // Logits of an arbitrary hidden vector through the SAME lm head this forward uses -- the drafter has no
     // lm_head of its own, so this is how it turns its own hidden state into a token.
     bool lm_head_logits(const std::vector<float>& h, std::vector<float>& logits) { return run_lm_head(h, logits); }
+    // The post-final-norm hidden of EVERY row of the last batched pass (M x H, row-major): a speculative drafter
+    // has to advance its own stream over the rows that were actually accepted, and those are exactly these.
+    const std::vector<float>& last_hidden_rows() const { return last_hidden_rows_; }
     // One row of the embedding table (what a token means to the model): the MTP drafter's `pre_fc_norm_embedding`
     // input.  It reads the same table the forward uses, so the drafter cannot drift from the model's embeddings.
     void embed_row(int token, std::vector<float>& out) const {
@@ -243,6 +246,7 @@ private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
     std::vector<float> last_residual_;  // and one norm earlier: the raw residual of the last position
+    std::vector<float> last_hidden_rows_;  // [M][H] normed hidden of the last batched pass
     // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
     // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
     std::vector<float>* batch_all_out_ = nullptr;

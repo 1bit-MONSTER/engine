@@ -98,6 +98,12 @@ public:
 
     // The last row's hidden state (H floats) after the last step/step_batch_all: the MTP head's input.
     virtual const std::vector<float>& last_hidden() const = 0;
+    // Every row's hidden of the last batched pass (M x hidden_size, row-major), or empty when the base does not
+    // keep it -- then the drafter simply cannot be advanced and its commit_rows() is not called.
+    virtual const std::vector<float>& last_hidden_rows() const {
+        static const std::vector<float> none;
+        return none;
+    }
 };
 
 class DraftHead {
@@ -113,6 +119,12 @@ public:
     virtual int draft(const std::vector<float>& hidden, int last_token, int pos, int k,
                       std::vector<int>& out, std::vector<float>* conf = nullptr) = 0;
     virtual void reset() {}
+    // Called once per iteration with the rows that were committed: `hidden_rows` is M x hidden_size and holds the
+    // base's post-norm hidden of each accepted position (row 0 = the first accepted draft).  A drafter keeps its
+    // own stream (the MTP layer attends over its own states), so it advances here -- without this it would see
+    // only the current chain and its drafts would be worth very little.
+    virtual void commit_rows(const std::vector<int>& /*tokens*/, const std::vector<float>& /*hidden_rows*/,
+                             int /*M*/) {}
 };
 
 struct Options {
@@ -180,6 +192,10 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         if (!base.step(t1, pos, logits)) { r.err = "step failed"; return r; }
         r.stats.steps++;
         const int have = ++pos;
+        // The drafter must advance over t1 too: it keeps its own stream (the MTP layer attends over its own
+        // states), so a position the base consumed outside the batch still has to reach it -- otherwise its cache
+        // misses one position per iteration and every draft after the first is drafted against a stale stream.
+        if (head) head->commit_rows(std::vector<int>{t1}, base.last_hidden(), 1);
 
         std::vector<int> d;
         std::vector<float> conf;
@@ -223,6 +239,13 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
         // Commit the accepted rows of the verify batch and discard the rest.  With a deferring base this
         // applies only the accepted rows' recurrence updates; without one it truncates by position.
         if (!base.commit_verify(take)) { r.err = "commit_verify refused"; return r; }
+        if (head && take > 0) {
+            const std::vector<float>& rows = base.last_hidden_rows();
+            if (rows.size() == (size_t)take * (size_t)base.hidden_size()) {
+                std::vector<int> accepted(d.begin(), d.begin() + take);
+                head->commit_rows(accepted, rows, take);
+            }
+        }
         if (take > 0)
             logits.assign(all.begin() + (size_t)(take - 1) * (size_t)V,
                           all.begin() + (size_t)take * (size_t)V);

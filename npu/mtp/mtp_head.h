@@ -66,6 +66,14 @@ struct KvCache {
     std::vector<float> k, v;   // [t][NKV][HD], grown per step
     int t = 0;
     void reset() { k.clear(); v.clear(); t = 0; }
+    // Drop the provisional positions a draft chain appended, keeping the committed prefix.
+    void truncate(int keep) {
+        if (keep < 0) keep = 0;
+        if (keep >= t) return;
+        k.resize((size_t)keep * kKV);
+        v.resize((size_t)keep * kKV);
+        t = keep;
+    }
 };
 
 // Load ~/models/npu/bonsai2-27b-mtp-head/pb16i-exact (manifest.json + <t>.pb16i/.add/.eref) and the q4_k norms.

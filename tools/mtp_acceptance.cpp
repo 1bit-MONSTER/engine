@@ -78,7 +78,7 @@ public:
         out.clear();
         if (conf) conf->clear();
         std::vector<float> emb, h = hidden, logits, next;
-        cache_.reset();                       // the chain starts from the accepted token each iteration
+        cache_.truncate(pos_);                 // keep the committed stream, drop the previous chain's drafts
         pos_ = pos;
         int tok = last_token;
         (void)0;
@@ -104,6 +104,23 @@ public:
     }
 
     void set_lm_head(bool on) { use_lm_head_ = on; }
+
+    // Advance the head over accepted positions: one head step per row, no drafting.
+    void commit_rows(const std::vector<int>& tokens, const std::vector<float>& hidden_rows, int M) override {
+        std::vector<float> emb, next, lg;
+        for (int m = 0; m < M; m++) {
+            base_.embed_into(tokens[(size_t)m], emb);
+            if (!head_step(w_, &hidden_rows[(size_t)m * kH], emb.data(), pos_, cache_, next, nullptr, lg)) break;
+            pos_++;
+        }
+    }
+    // Prime the head over a position of the prompt (same thing, before the loop starts).
+    void prime(const std::vector<float>& hidden, int token, int pos) {
+        std::vector<float> emb, next, lg;
+        base_.embed_into(token, emb);
+        head_step(w_, hidden.data(), emb.data(), pos, cache_, next, nullptr, lg);
+    }
+    void reset_stream() { cache_.reset(); pos_ = 0; }
     void set_tau(float t) { tau_ = t; }
 
     double head_ms = 0;
@@ -328,6 +345,7 @@ int main(int argc, char** argv) {
     base.set_vocab((int)probe.size());
     MtpDrafter drafter(w, base);
     drafter.set_lm_head(!dry);
+    drafter.set_tau(tau);          // the chain gate the run was asked for (offline forces its own)
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
 
@@ -352,9 +370,21 @@ int main(int argc, char** argv) {
                 plain.push_back(best);
                 if (!fwd.step(best, pos++, lg)) { std::fprintf(stderr, "step failed\n"); return 1; }
             }
-            // the speculative loop on the same prompt
+            // the speculative loop on the same prompt: reset the base, then prime the drafter over the prompt so it
+            // attends over the whole stream (that is what the offline protocol showed matters: 3 % -> 69 %)
             fwd.reset();
             drafter.reset();
+            drafter.reset_stream();
+            {
+                // Prime the drafter over every prompt position (its KV must cover the stream), then hand the base
+                // back at position 0 -- the loop prefills itself.
+                std::vector<float> lg2;
+                for (size_t i = 0; i < ids.size(); i++) {
+                    if (!fwd.step(ids[i], (int)i, lg2)) { std::fprintf(stderr, "prime prefill failed\n"); return 1; }
+                    drafter.prime(fwd.last_hidden(), ids[i], (int)i);
+                }
+                fwd.reset();
+            }
             Options o;
             o.k = k;
             o.tau = tau;

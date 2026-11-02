@@ -65,6 +65,7 @@ public:
         return use_residual_ ? fwd_.last_residual() : fwd_.last_hidden();
     }
     void use_residual(bool on) { use_residual_ = on; }
+    const std::vector<float>& last_hidden_rows() const { return fwd_.last_hidden_rows(); }
 
     // The drafter needs the base embedding of the token it is drafting from; the forward owns that table.
     void embed_into(int token, std::vector<float>& out) const { fwd_.embed_row(token, out); }

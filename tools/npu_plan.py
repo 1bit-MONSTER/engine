@@ -150,7 +150,9 @@ def generate(model_dir: str, kernels: str) -> dict:
     layout = cfg.get("q4nx_weight_layout", "rm")
     if layout not in ("rm", "b8", "pb16i", "t2s"):
         raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8, pb16i or t2s")
-    tag = {"pb16i": "_pb16i", "t2s": "_t2s", "b8": "_b8"}.get(layout, "")
+    # a t2s container names its wire format by version: 5 = v1 (`_t2s`), 6 = v2 (`_t2s2`)
+    t2s_v2 = layout == "t2s" and cfg.get("q4nx_weight_layout_version", 5) == 6
+    tag = {"pb16i": "_pb16i", "b8": "_b8"}.get(layout, "_t2s2" if t2s_v2 else ("_t2s" if layout == "t2s" else ""))
 
     im = cfg.get("intermediate_size")
     fused_gu = True

@@ -160,6 +160,24 @@ on `libcpp-httplib0.41`, which 26.04 does not have. So on 26.04 the engine plugs
   `--cache-reuse 256`, and `-kvu` above `--parallel 1`. A variable already set in `lemond`'s
   environment wins, as it does under serve.
 
+That printed environment is also the only place where the save-area trio
+(`HSA_USE_SVM=0`, `HSA_USERPTR_FOR_PAGED_MEM=0`, `HRX_ALLOW_NO_SVM=1`) can reach the backend
+Lemonade starts, since the package's `lemond-onebit` launcher does not export it and neither path
+can pass `--hrx-cwsr-placement` (engine#715, fixed in #816). So it is worth asking directly:
+
+```sh
+env -u HSA_USE_SVM -u HSA_USERPTR_FOR_PAGED_MEM -u HRX_ALLOW_NO_SVM \
+  1bit serve -m <model.gguf> --device hrx --print-backend-env | grep -c '^HRX_ALLOW_NO_SVM=1'
+```
+
+`1` is the pass. `0` means the one-hop backend and `scripts/lemonade-hrx`'s exec'd
+`llama-server` run without the trio, which is the configuration #715 page-faults in; nothing
+warns when it happens. Measured on Strix Halo with the trio unset in the shell:
+`lemonade-onebit-rc-2026-10-31c` (engine from before #794/#813) prints `0` and its serve log
+still says "CWSR is off; save-area placement unchanged"; `lemonade-onebit-rc-2026-11-01b`
+(save area placed in GTT by default) also prints `0`, because serve exported the trio into its
+own environment before building the plan — that is the bug #816 removes.
+
 To install:
 
 ```sh

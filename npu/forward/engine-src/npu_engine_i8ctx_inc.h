@@ -34,6 +34,7 @@
 
 #include "q4nx_weight_layout.h"   // bpos(): the container's device weight layout
 #include "q4nx_pb16i.h"          // the pb16i image: integer-exact ternary decode weights
+#include "q4nx_t2s.h"            // the t2s stream: the same weights at 2.125 bits/weight
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
@@ -93,14 +94,22 @@ struct I8Ctx {
     // to two int32 planes for the int64 mode (S = hi*2^21 + lo), which the kernel
     // writes as [M][2N]; bC is allocated for both modes so one BO serves either.
     bool pb16i = false;
+    // Weight stream "t2s" (q4nx_weight_layout "t2s"): the same integer-exact ternary contract as
+    // pb16i, with the codes at 2 bits and the multiplier once per 128-K block -- the kernel expands
+    // them to the int4 nibbles the mmul takes.  Everything else (the sidecar `.ref` side table, the
+    // int32/int64 accumulation, the host's single rounding) is pb16i's, so `pb16i` is set too and
+    // only the image's file extension and size differ.  A container never sets both layouts; the
+    // flag is on the context so a load cannot read a 4,608-B image as a 2,176-B one.
+    bool t2s = false;
     // int32 planes the pb16i ELF leaves its sum in: 1 (plain int32) or 2 (ACC64:
     // lo = sum of (t & 2^21-1), hi = sum of (t >> 21), S = hi*2^21 + lo).  Both are
     // exact, so a tensor whose own bound fits int32 may still run on the two-plane
     // kernel; the reverse is not allowed, and load_pb16i_into refuses it.
     int pb16i_planes = 1;
 
-    // Bytes of one weight image: the int8 layouts are KD*ND, pb16i is its own size.
+    // Bytes of one weight image: the int8 layouts are KD*ND, pb16i and t2s are their own sizes.
     size_t w_bytes() const {
+        if (t2s) return q4nx_t2s::w_bytes(KD, ND);
         return pb16i ? q4nx_pb16i::w_bytes(KD, ND) : (size_t)KD * (size_t)ND;
     }
 
@@ -122,7 +131,12 @@ struct I8Ctx {
                             "(K=%d N=%d)\n", KD, ND);
             return false;
         }
-        if (pb16i && !q4nx_pb16i::fits(KD, ND)) {
+        if (t2s && !q4nx_t2s::fits(KD, ND)) {
+            fprintf(stderr, "  I8Ctx::init_elf: the t2s layout needs K%%256==0 and N%%32==0 "
+                            "(K=%d N=%d)\n", KD, ND);
+            return false;
+        }
+        if (pb16i && !t2s && !q4nx_pb16i::fits(KD, ND)) {
             fprintf(stderr, "  I8Ctx::init_elf: the pb16i layout needs K%%256==0 and N%%1024==0 "
                             "(K=%d N=%d)\n", KD, ND);
             return false;
@@ -192,37 +206,38 @@ struct I8Ctx {
         return bo;
     }
 
-    // ── pb16i: the weight image is the sidecar file, copied unchanged ──
-    // `<dir>/<stem>.pb16i` is the image and `<dir>/<stem>.ref` the side table
-    // (e_ref int16[N] + mode byte).  Nothing is requantised, so a mismatch is a
-    // wrong file, not a rounding difference: every check here is loud.
+    // ── pb16i / t2s: the weight image is the sidecar file, copied unchanged ──
+    // `<dir>/<stem>.pb16i` (or `.t2s`) is the image and `<dir>/<stem>.ref` the side table
+    // (e_ref int16[N] + mode byte, the same file for both layouts).  Nothing is requantised, so
+    // a mismatch is a wrong file, not a rounding difference: every check here is loud.
     bool load_pb16i_into(xrt::bo& bo, const std::string& stem,
                          std::vector<int16_t>& eref, int& mode) {
-        const size_t want = q4nx_pb16i::w_bytes(KD, ND);
-        const std::string imgp = stem + ".pb16i", refp = stem + ".ref";
+        const char* const tag = t2s ? "t2s" : "pb16i";
+        const size_t want = t2s ? q4nx_t2s::w_bytes(KD, ND) : q4nx_pb16i::w_bytes(KD, ND);
+        const std::string imgp = stem + (t2s ? ".t2s" : ".pb16i"), refp = stem + ".ref";
         FILE* f = fopen(imgp.c_str(), "rb");
-        if (!f) { fprintf(stderr, "  pb16i: cannot open %s\n", imgp.c_str()); return false; }
+        if (!f) { fprintf(stderr, "  %s: cannot open %s\n", tag, imgp.c_str()); return false; }
         std::vector<uint8_t> img(want);
         const size_t got = fread(img.data(), 1, want, f);
         const int extra = fgetc(f);
         fclose(f);
         if (got != want || extra != EOF) {
-            fprintf(stderr, "  pb16i: %s is not %zu bytes (K=%d N=%d)\n", imgp.c_str(), want,
+            fprintf(stderr, "  %s: %s is not %zu bytes (K=%d N=%d)\n", tag, imgp.c_str(), want,
                     KD, ND);
             return false;
         }
         f = fopen(refp.c_str(), "rb");
-        if (!f) { fprintf(stderr, "  pb16i: cannot open %s\n", refp.c_str()); return false; }
+        if (!f) { fprintf(stderr, "  %s: cannot open %s\n", tag, refp.c_str()); return false; }
         std::vector<uint8_t> ref(q4nx_pb16i::ref_bytes(ND) + 1);
         const size_t rgot = fread(ref.data(), 1, ref.size(), f);
         fclose(f);
         if (rgot != q4nx_pb16i::ref_bytes(ND) ||
             !q4nx_pb16i::parse_ref(ref.data(), rgot, ND, &eref, &mode)) {
-            fprintf(stderr, "  pb16i: %s is not e_ref[%d] + one mode byte\n", refp.c_str(), ND);
+            fprintf(stderr, "  %s: %s is not e_ref[%d] + one mode byte\n", tag, refp.c_str(), ND);
             return false;
         }
         if (bo.size() < want) {
-            fprintf(stderr, "  pb16i: weight BO is %zu B, needs %zu\n", (size_t)bo.size(), want);
+            fprintf(stderr, "  %s: weight BO is %zu B, needs %zu\n", tag, (size_t)bo.size(), want);
             return false;
         }
         memcpy(bo.map(), img.data(), want);
@@ -236,8 +251,8 @@ struct I8Ctx {
             for (size_t i = 0; i < n; i++) { h ^= img[i]; h *= 1099511628211ULL; }
             unsigned long long nz = 0;
             for (size_t i = 0; i < n; i++) nz += (img[i] != 0);
-            fprintf(stderr, "[pb16i-image] %s mode=%d planes=%d first4k_fnv=%016llx nonzero=%llu/%zu\n",
-                    stem.c_str(), mode, pb16i_planes, h, nz, n);
+            fprintf(stderr, "[%s-image] %s mode=%d planes=%d first4k_fnv=%016llx nonzero=%llu/%zu\n",
+                    tag, stem.c_str(), mode, pb16i_planes, h, nz, n);
         }
         return true;
     }

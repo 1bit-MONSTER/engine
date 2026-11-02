@@ -110,7 +110,7 @@ The repositories this engine is built on, in order of importance:
 | 8 | [huggingface/tokenizers](https://github.com/huggingface/tokenizers) | Every model's `tokenizer.json`, byte-exact, behind our C ABI | Apache-2.0 |
 | 9 | [NandhaKishorM/laya](https://github.com/NandhaKishorM/laya) | The router that decides where each request runs | Apache-2.0 |
 | 10 | [ROCm/FastFlowLM](https://github.com/ROCm/FastFlowLM) | The Q4NX NPU model format and its models on Hugging Face (`FastFlowLM/*-NPU2`), which the engine's NPU route runs on its own kernels | MIT |
-| 11 | [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) | **reference only, not in the shipped build** since v2026.44: antirez's CUDA kernels through a HIP shim plus hipBLAS are not our HIP kernels. The fork [1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4) stays as the reference for the work ([dwarfstar.md](docs/dwarfstar.md)) | MIT |
+| 11 | [antirez/ds4](https://github.com/antirez/ds4) (DwarfStar) | **removed from the engine** (owner 2026-11-01, out of the tree 2026-11-02): antirez's CUDA kernels through a HIP shim plus hipBLAS are not our HIP kernels, and `--device ds4` now says it is gone. The fork [1bit-MONSTER/ds4](https://github.com/1bit-MONSTER/ds4) stays in the open as the reference for that work | MIT |
 
 Also built on [nlohmann/json](https://github.com/nlohmann/json) (MIT)
 and [yhirose/cpp-httplib](https://github.com/yhirose/cpp-httplib) (MIT).

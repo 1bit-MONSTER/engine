@@ -480,7 +480,7 @@ lemver=$("$lem/bin/lemond" --version 2>/dev/null | sed -n 's/^lemond version \([
 # actually ships; a catalogue without onebit entries writes a manifest with none, which the check
 # reports as such instead of failing.
 # c19 ships HIP kernels only: the DwarfStar (ds4) backend is antirez's CUDA kernels through a HIP shim plus
-# hipBLAS, not ours, so it is built out (ONEBIT_DS4=OFF) and its recipe cannot run. Lemonade's catalogue still
+# hipBLAS, not ours, and it is out of the tree since 2026-11-02, so its recipe cannot run. Lemonade's catalogue still
 # lists one entry whose recipe is "ds4"; drop it from the copy in the image so nothing offers a backend that is
 # not there (#713/#736 lineage, owner decision 2026-11-01).
 cat=$root/opt/lemonade/bin/resources/server_models.json

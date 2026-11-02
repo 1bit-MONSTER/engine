@@ -23,6 +23,7 @@ from it must
   2. expand back to **the pb16i image's own int4 code bytes**, block for block, on every tile;
   3. decode back to the image's codes and multipliers, with the 128-K compaction losing no value;
   4. be reproduced byte for byte by `stream()` (GGUF-side input) and `from_pb16i_image()` (image-side input);
+  4b. and be reproduced from a **t2 container chunk** by `from_t2()` — the pb16i image is not required;
   5. refuse, with a named error, an image whose four 32-K multipliers inside a 128-K block are not equal;
   6. refuse a stream carrying the reserved 2-bit pattern.
 
@@ -37,6 +38,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 import q4nx_pb16i                                    # noqa: E402
+import q4nx_t2                                       # noqa: E402
 import q4nx_t2s as t2s                               # noqa: E402
 
 K, N = 512, 1024                                     # whole phase-B tiles, 4 k-chunks x 32 columns
@@ -95,6 +97,12 @@ def main():
     st2, e_ref2, mode2 = t2s.stream(codes, dbits, K, N)
     check("stream() == from_pb16i_image()", np.array_equal(st, st2))
     check("the side table is the pb16i one", np.array_equal(e_ref, e_ref2) and mode == mode2)
+
+    # 4b. the container alone is enough: a t2 chunk re-streams to the same bytes, no pb16i image
+    chunk = q4nx_t2.pack(codes.T.copy(), dbits.T.copy().view(np.float16))
+    diff = int(np.count_nonzero(np.frombuffer(chunk, np.uint8) != st.reshape(-1)))
+    check("t2 and t2s are different byte orders", bool(diff), f"{diff} of {st.size} bytes differ")
+    check("from_t2(t2 chunk) == from_pb16i_image()", np.array_equal(t2s.from_t2(chunk, K, N), st))
 
     # 5. an image whose 32-K multipliers differ inside a 128-K block is refused, not rounded
     bad = img.copy()

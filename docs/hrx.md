@@ -423,7 +423,7 @@ time:
 
 The expert GEMMs are a third of the pass and already the fastest thing per token: the m64 tile is
 in play, so a wider MMQ tile is not the lever, and those kernels belong to the private add-on
-(`third_party/ds4`'s `ROCM_MMQ_Y` is a different route and does not appear in this bundle). The two
+(the removed DwarfStar tree's `ROCM_MMQ_Y` was a different route and never appeared in this bundle). The two
 levers that do appear are both decode-shaped code running on a prefill. `hrx_dp_mm_q8_0_*` is ~16%
 of it while its grid stays 4x10x1 and 4x40x1 workgroups — 40 and 160 workgroups on a 40-CU part —
 however many tokens the chunk carries. `ggml_mul_mat_f32_f32_wmma` is 8% of a 4.25 bpw model's

@@ -354,7 +354,21 @@ was written ("the zdrv carries MOK-signed `amdxdna` with the right vermagic") wa
 module could load at all. Reachability, ownership and module resolution are properties of the *running*
 system.
 
-**Still not run, on purpose:** G4 (Secure Boot with the swapped chain on the board), G5/G6 on hardware
+**The board's finding, 2026-11-02 14:5x — the sixth defect, and the first one only hardware could show:** with
+the stick in the Max+ 395 the chain `shim -> Canonical GRUB` loaded and then GRUB refused the kernel:
+`error: bad shim lock signature / you need to load the kernel first`. The Puppy `vmlinuz` came straight out of
+`make bindeb-pkg` and carried **no signature at all** (`sbverify --list` → "No signature table present"),
+while every out-of-tree module was properly MOK-signed — which is what G3 checked, so G3 was green. Secure
+Boot is ON on the board and **every VM row in this document ran with it off**; a `-kernel` QEMU boot verifies
+nothing, so no row in this lane could have seen it. Three fixes, none of which lowers a gate:
+
+| # | fix | where |
+|---|---|---|
+| a | the kernel image is signed with the machine's enrolled MOK before packaging; the key is never printed or copied off the box, and re-signing is a no-op | `sign-vmlinuz.sh`, and `mk-huge-kernel.sh`/`mkimage.sh` refuse an unsigned image |
+| b | G3 gains a **kernel-signature row**: unsigned `/vmlinuz` is a FAIL, and `--cert <mok.pem>` requires it to verify against the enrolled certificate. Measured on the pre-fix image: exactly one FAIL, the kernel; everything else in G3 stayed green | `g3-probe.sh` |
+| c | the VM boots the disk image with **Secure Boot on**: OVMF's secboot firmware with this machine's certificate enrolled in `db`. An unsigned kernel now stops at GRUB in the VM with the board's own message (`FAIL sb chain … you need to load the kernel first`), and the guest confirms the other way with `[0.000000] Secure boot enabled` + `integrity: Loaded X.509 cert '1bit-MONSTER: strixhalo Secure Boot Kernel'` | `sb-vars.sh`, `vm-check.sh` |
+
+**Still not run, on purpose:** G4 on the board (the VM half is now green — see above), G5/G6 on hardware
 (HRX chat on the 8060S, the NPU through Lemonade, `1bit-release-check`), U2's desktop on the console/JetKVM,
 U5's device rows, U6 (installer to a second disk), U8 (boot time, idle RAM, recording), and the save layer
 across a real reboot (G7) — that one is testable in a VM next and is the last software row left.
@@ -365,8 +379,8 @@ across a real reboot (G7) — that one is testable in a VM next and is the last 
 |---|---|---|
 | G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **green**: `build.sh` alone exits 0 and writes `upup64r-26.04.iso` **1,317,011,456 B**, sha256 `41e23602…6f857e` — our `vmlinuz` (`7.3.0-rc4-1bit-perfopt+`), a 127-entry initrd, four SFS, early AMD microcode, `isolinux` + an EFI `efi.img` with shim/grub/MokManager |
 | G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **green now** — the fragment kernel layers the medium and reaches Puppy's userspace (see the section above); this row records what it was before the fragment |: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
-| G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
-| G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |
+| G3 | `uname -r` is our kernel and **that kernel image is signed**, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | **green in the artifact** since the signing fix: `/vmlinuz` verifies against the enrolled MOK, zdrv carries `usr/lib/modules/<kver>` with 3780 modules, both OOT modules MOK-signed with the right vermagic, `amdgpu`/`amdnpu` firmware present. The board half (devices binding) is still U5's |
+| G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | **green in the VM**: the disk image boots with OVMF secboot + this machine's certificate in `db`, GRUB accepts the signed kernel, and the guest reports `Secure boot enabled` with our certificate loaded into the integrity keyring. The board's version of this row is what failed on 2 Nov and is now unblocked, not yet re-run |
 | G5 | `lemond` + `1bit serve` run unchanged from the c18 tarball | **blocked by glibc on 24.04** (measured 2.43 vs 2.39); needs the resolute base |
 | G6 | `1bit-release-check` green as far as a VM allows | not run (needs G2+G5) |
 | G7 | a save layer persists across a reboot (frugal install on a qcow2, then reboot) | not run |

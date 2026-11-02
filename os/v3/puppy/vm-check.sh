@@ -20,6 +20,10 @@
 # <img>    the shipped artifact (os/v3/puppy/mkimage.sh): GPT + ESP + 1BIT-DATA, booted through UEFI
 #          firmware as a USB disk - shim, grub, then the kernel and initrd off the data partition - and
 #          the serial menu entry selected over the serial line, which is how a headless box is driven
+#          With Secure Boot ON, from `sb-vars.sh`'s variable store (this machine's MOK in db): that is the
+#          one check a `-kernel` boot can never make, and it is the defect the 2 Nov board boot found -
+#          `error: bad shim lock signature` on a kernel image nothing had signed. The `sb state` row is the
+#          guest saying so from inside.
 #
 # The TPUPPY-RELEASE rows that can be answered without the board: U1 (a real shell, sudo, apt install),
 # U3 (lemond up at boot with its key, reachable over the network) and the software half of U4 (the engine
@@ -77,15 +81,25 @@ net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$hostport"-:13305,hostfwd=tcp:127
      -device virtio-net-pci,netdev=n0)
 case $iso in
 *.img)
-    # the shipped artifact: firmware boots the ESP, grub reads the data partition
-    vars=$work/OVMF_VARS.fd; [ -f "$vars" ] || cp /usr/share/OVMF/OVMF_VARS_4M.fd "$vars"
+    # the shipped artifact: firmware boots the ESP, grub reads the data partition. With Secure Boot on and
+    # this machine's certificate enrolled, an unsigned kernel stops at grub exactly as it did on the board.
+    "$(dirname "$0")/sb-vars.sh" "$work/OVMF_VARS_SB.fd" > "$work/sb-vars.txt" 2>&1 || {
+        cat "$work/sb-vars.txt" >&2
+        echo "$prog: cannot build the Secure Boot variable store (os/v3/puppy/sb-vars.sh) - refusing to
+       run the VM without Secure Boot, which is how a signing defect reached the board" >&2
+        exit 2; }
+    grep -E '^   ' "$work/sb-vars.txt"
     # shellcheck disable=SC2054  # same: commas belong to the qemu arguments
     boot=(-drive file="$iso",format=raw,if=none,id=d0 -device qemu-xhci -device usb-storage,drive=d0
-          -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
-          -drive if=pflash,format=raw,file="$vars")
+          -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
+          -drive if=pflash,format=raw,file="$work/OVMF_VARS_SB.fd"
+          -machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on)
+    export SBBOOT=1
     ;;
 *)
-    boot=(-kernel "$work/vmlinuz" -initrd "$work/initrd.gz" -append "console=ttyS0 1bit.serial=1" -cdrom "$iso")
+    boot=(-machine q35 -kernel "$work/vmlinuz" -initrd "$work/initrd.gz" -append "console=ttyS0 1bit.serial=1"
+          -cdrom "$iso")
+    echo "SKIP sb state      -kernel boots verify nothing; the Secure Boot row needs the .img (boot the artifact)"
     ;;
 esac
 # systemd-run --scope runs qemu in place, so the timeout wrapper is what has to end: when the rows are done
@@ -94,7 +108,7 @@ esac
 # port the host probe was aimed at.
 vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$iso" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
-    qemu-system-x86_64 -m 4096 -smp 4 -machine q35 "${boot[@]}" -display none -vga std -no-reboot \
+    qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
@@ -188,12 +202,26 @@ def wait_shell(timeout):
     return False
 
 if not wait_shell(240):
-    print("FAIL boot           no serial shell: no 21serial-console in the image, or it never ran", flush=True)
+    # name the firmware refusal instead of only "no shell": with Secure Boot on, an unsigned kernel stops at
+    # GRUB before init, which is exactly the failure that shipped to the board on 2 Nov
+    reason = ""
+    for line in open(os.path.join(work, "serial.log"), "rb").read().decode("utf-8", "replace").splitlines():
+        if "bad shim lock signature" in line or "need to load the kernel first" in line or \
+                "Access Denied" in line:
+            reason = line.strip()
+    if reason:
+        print("FAIL sb chain      firmware refused the kernel: %s" % reason, flush=True)
+    else:
+        print("FAIL boot           no serial shell: no 21serial-console in the image, or it never ran", flush=True)
     sys.exit(2)
 buf = b""   # the menu and the boot log are not row output
 s.sendall(b"\n")
 
 rows = [
+    # Secure Boot is what the board runs: the chain shim -> grub -> kernel has to verify, and the guest has to
+    # agree that it did. Only present when the VM booted with sb-vars.sh's store - a -kernel boot cannot.
+    *([("sb state", "mokutil --sb-state 2>&1 | head -2; dmesg | grep -i 'secure boot' | head -3",
+        "SecureBoot enabled")] if os.environ.get("SBBOOT") == "1" else []),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
@@ -247,6 +275,13 @@ rows = [
     ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
     ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),
     ("data state",   "ls /data; grep -c . /data/lemonade/config/user_models.json 2>/dev/null || echo no-registry", None),
+    # release identity: the package reports "1bit 0.0.1" whatever was built, so the binary hash is what ties
+    # the image to a payload. Compare it with `sha256sum <payload>/1bit/1bit` on the build machine.
+    ("U4 engine sha", "sha256sum /opt/1bit-package/1bit/1bit | cut -c1-32", None),
+    # the two paths pi-release asked for, asserted on a booted image rather than in a listing
+    ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
+                      "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
+    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels | tr '\n' ' '", None),
     # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
     # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
     # these two lines say whether that was the listener or the interface.

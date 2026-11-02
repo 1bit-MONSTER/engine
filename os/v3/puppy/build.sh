@@ -28,7 +28,7 @@
 # PAYLOAD=<dir> embeds the release package (TPUPPY-RELEASE U3/U4): the unpacked
 # lemonade-onebit-<tag>/ tree, whose lemond-onebit launcher resolves bin/ and 1bit/ BESIDE ITSELF. It is
 # copied to /opt/1bit-package, /etc/init.d/10lemonade from os/v3/puppy/embed starts it at boot (Puppy's
-# rc.services runs every executable /etc/init.d script), and the build refuses an image whose rootfs lacks
+# rc.services runs every executable /etc/init.d script), and the build refuses an image whose SFS set lacks
 # the engine or the launcher. Without PAYLOAD the image is the plain Puppy base, as before.
 #
 # Two things the woof-CE build assumes that are not obvious, both measured here:
@@ -140,53 +140,62 @@ echo "== 2createpackages"; ./2createpackages </dev/null
 # has no PCI modalias, so nothing auto-loads it - measured on the box, where lsmod has no entry and the fans
 # ride the firmware curve. The Puppy hook is ADDLIST in /etc/rc.d/MODULESCONFIG, read by rc.sysinit at boot;
 # it is a file woof-CE owns, so rewrite that one variable instead of shipping a whole replacement.
-rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
-[ -n "$rootfs" ] || { echo "build: REFUSED: no rootfs-complete after 2createpackages" >&2; exit 1; }
-if [ -f "$rootfs/etc/rc.d/MODULESCONFIG" ]; then
-    echo "== ec_su_axb35 into the ADDLIST of MODULESCONFIG"
-    sed -i "s|^ADDLIST=.*|ADDLIST=' ec_su_axb35 '|" "$rootfs/etc/rc.d/MODULESCONFIG"
-    grep -q "^ADDLIST=' ec_su_axb35 '" "$rootfs/etc/rc.d/MODULESCONFIG" || {
-        echo "build: REFUSED: could not set ADDLIST in /etc/rc.d/MODULESCONFIG" >&2; exit 1; }
-else
-    echo "build: REFUSED: no /etc/rc.d/MODULESCONFIG in the rootfs - cannot make the EC driver load at boot" >&2
-    exit 1
-fi
+# The hook is rootfs-skeleton and not sandbox3/rootfs-complete: 3builddistro starts with
+# rm -rf sandbox3/rootfs-complete and rebuilds it from rootfs-skeleton, so anything written into the
+# sandbox copy after 2createpackages is thrown away - and nothing fails, the image just comes out without
+# it. ADDLIST is read by rc.sysinit as `for MODULE in $ADDLIST`, so an unquoted value is enough.
+skeleton=rootfs-skeleton
+[ -f "$skeleton/etc/rc.d/MODULESCONFIG" ] || {
+    echo "build: REFUSED: no rootfs-skeleton/etc/rc.d/MODULESCONFIG - cannot make the EC driver load at boot" >&2
+    exit 1; }
+echo "== ec_su_axb35 into the ADDLIST of MODULESCONFIG"
+sed -i "s|^ADDLIST=.*|ADDLIST=ec_su_axb35|" "$skeleton/etc/rc.d/MODULESCONFIG"
+grep -qx "ADDLIST=ec_su_axb35" "$skeleton/etc/rc.d/MODULESCONFIG" || {
+    echo "build: REFUSED: could not set ADDLIST in /etc/rc.d/MODULESCONFIG" >&2; exit 1; }
 
 # U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
 # Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
 # itself - so this is a copy plus two symlinks and the boot service.
 if [ -n "${PAYLOAD:-}" ]; then
     echo "== embed the release package"
-    mkdir -p "$rootfs/opt/1bit-package" "$rootfs/usr/local/bin"
-    cp -a /payload/bin /payload/1bit /payload/lemond-onebit "$rootfs/opt/1bit-package/"
-    ln -sf /opt/1bit-package/lemond-onebit "$rootfs/usr/local/bin/lemond-onebit"
-    ln -sf /opt/1bit-package/1bit/1bit "$rootfs/usr/local/bin/1bit"
-    cp -a /recipe/embed/. "$rootfs/"
-    chmod 0755 "$rootfs/etc/init.d/10lemonade"
-    echo "   $(du -sh "$rootfs/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
+    mkdir -p "$skeleton/opt/1bit-package" "$skeleton/usr/local/bin"
+    cp -a /payload/bin /payload/1bit /payload/lemond-onebit "$skeleton/opt/1bit-package/"
+    ln -sf /opt/1bit-package/lemond-onebit "$skeleton/usr/local/bin/lemond-onebit"
+    ln -sf /opt/1bit-package/1bit/1bit "$skeleton/usr/local/bin/1bit"
+    cp -a /recipe/embed/. "$skeleton/"
+    chmod 0755 "$skeleton/etc/init.d/10lemonade"
+    echo "   $(du -sh "$skeleton/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
 fi
 
 echo "== 3builddistro"; ./3builddistro release </dev/null
+# 3builddistro consumes rootfs-complete, so the image is checked where it exists now: in the SFS set that
+# sandbox3/build ships and that Puppy unions at boot. One listing of every SFS, each line sfs-name/path,
+# because the answer to "is sudo in the image" is bdrv (debootstrap base), not the main puppy SFS.
+compgen -G "sandbox3/build/*.sfs" > /dev/null || {
+    echo "build: REFUSED: no SFS in sandbox3/build after 3builddistro" >&2; exit 1; }
+listing=$(for f in sandbox3/build/*.sfs; do
+    unsquashfs -l "$f" 2>/dev/null | sed -n "s|^squashfs-root/|$(basename "$f")/|p"
+done | sort -u)
+in_image() { printf "%s\n" "$listing" | grep -q "/$1$" ; }
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
-rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
-if [ -z "$rootfs" ]; then
-    echo "build: REFUSED: no sandbox3/rootfs-complete after 3builddistro, so the package set cannot be verified" >&2
-    exit 1
-fi
 miss=""
 for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil; do
-    [ -e "$rootfs/$b" ] || miss="$miss $b"
+    in_image "$b" || miss="$miss $b"
 done
-[ -z "$miss" ] || { echo "build: REFUSED: the rootfs is missing:$miss (packages-extra did not land)" >&2; exit 1; }
-echo "   ok: sudo, apt, sshd, mokutil are in $rootfs"
+[ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
+echo "   ok: sudo, apt, sshd, mokutil are in the image"
+modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=")
+[ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
+    echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }
+echo "   ok: $modconf in the image, so rc.sysinit loads the EC driver"
 if [ -n "${PAYLOAD:-}" ]; then
     miss=""
-    [ -x "$rootfs/opt/1bit-package/1bit/1bit" ] || miss="$miss the engine"
-    [ -x "$rootfs/opt/1bit-package/lemond-onebit" ] || miss="$miss the lemond-onebit launcher"
-    [ -x "$rootfs/etc/init.d/10lemonade" ] || miss="$miss the boot service (not executable: rc.services only runs executable ones)"
-    [ -f "$rootfs/usr/local/bin/1bit" ] || miss="$miss /usr/local/bin/1bit"
+    for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/10lemonade \
+             usr/local/bin/1bit etc/rc.d/MODULESCONFIG; do
+        in_image "$b" || miss="$miss $b"
+    done
     [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
-    echo "   ok: the engine, the launcher, the service and /usr/local/bin/1bit are in the rootfs"
+    echo "   ok: the engine, the launcher, the service and /usr/local/bin/1bit are in the image"
 fi
 echo "== output"
 ls -l woof-output-* 2>/dev/null | head -20

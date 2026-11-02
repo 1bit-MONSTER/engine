@@ -25,12 +25,14 @@ how to build it. The Ubuntu Server `autoinstall` design stays the documented fal
 | file | what it is |
 |---|---|
 | `kernel-puppy.fragment` | the kernel config delta: the medium/layer drivers Puppy's initrd needs **built in**. A fragment the kernel build appends, not a patch |
-| `mk-huge-kernel.sh` | our kernel as woof-CE's kernel package (`huge-<kver>.tar.*`: `vmlinuz-<kver>` + a zdrv SFS with the module tree, the firmware and a marker) |
+| `sign-vmlinuz.sh` | signs the kernel image with this machine's enrolled MOK, so Secure Boot's GRUB will load it. The key never leaves the box: a copy goes into a root-owned 0700 dir, is converted (it is an OpenSSH key) and is proved against the certificate before anything is signed. Idempotent |
+| `sb-vars.sh` | OVMF's variable store with our certificate enrolled in `db`, so a QEMU boot verifies the appliance the way the board does |
+| `mk-huge-kernel.sh` | our kernel as woof-CE's kernel package (`huge-<kver>.tar.*`: `vmlinuz-<kver>` + a zdrv SFS with the module tree, the firmware and a marker). **Refuses an unsigned kernel image** |
 | `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem |
 | `g2-probe.sh` | gate G2: boot the built ISO headless in QEMU and keep the init's transcript, so "it boots on our kernel" is a measurement |
-| `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, `/lib/modules/<kver>` in its zdrv, and `amdxdna`/`ec_su_axb35` built for that kernel and signed. `--require-mok` for the release gate |
+| `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, **that kernel image is signed**, its zdrv carries the module tree, and `amdxdna`/`ec_su_axb35` are built for that kernel and signed. `--cert <mok.pem>` requires the image's signature to be the enrolled MOK's; `--require-mok` for the release gate |
 | `mkimage.sh` | the shipped artifact: a GPT disk image (ESP with shim → grub, `1BIT-DATA` ext4 with the frugal install at `/1bit` and os/mini's data directories), so `os/mini/prepare-stick.sh` and the USB write work unchanged. The ISO stays a side artifact |
-| `vm-check.sh` | the TPUPPY-RELEASE rows that need no board, in QEMU over a serial root shell: bash + `sudo` + `apt install` (U1), lemond up with its key and `/api/v1/models` from inside the guest and over the forwarded port (U3), `1bit` on PATH and the EC driver in `ADDLIST` (U4). Hardware rows print as SKIP with the reason |
+| `vm-check.sh` | the TPUPPY-RELEASE rows that need no board, in QEMU over a serial root shell, **with Secure Boot on for the disk image** (`sb-vars.sh`'s store, `OVMF_CODE_4M.secboot.fd`, `smm=on`): bash + `sudo` + `apt install` (U1), lemond up with its key and `/api/v1/models` from inside the guest and over the forwarded port (U3), `1bit` on PATH and the EC driver in `ADDLIST` (U4). Hardware rows print as SKIP with the reason |
 | `packages-extra` | package rows the acceptance needs and woof-CE's set does not have (`sudo`, `apt`, `mokutil`, `openssh-server`), with the measurement that justifies each |
 | `spec-insert-rows.sh` | puts those rows inside `PKGS_SPECS_TABLE`, before its closing quote; idempotent |
 | `embed/` | the files PAYLOAD=... drops into the rootfs (into `rootfs-skeleton`, which is what `3builddistro` copies): `05onboard-data` (mounts `1BIT-DATA` at `/data` and wires the contract), `10lemonade` (the server), `20onboard-ssh` + `root/.ssh/authorized_keys` (U7: host keys, StrictModes' two modes, sshd), `21serial-console` (a root shell on ttyS0, only on `1bit.serial=1`), `etc/1bit/libhsa.env` (the no-SVM trio, engine#715), `etc/profile.d/90onboard-limits` (memlock) |
@@ -66,13 +68,24 @@ echo "$missing missing (0 is what a gate wants)"
 #      <stage>/boot/{vmlinuz,config}-<kver>   and   <stage>/lib/modules/<kver>/
 #    (image deb unpacked + the whole /lib/modules tree, updates/ included)
 
+# 3b. SIGN the kernel image, before it is packaged. `make bindeb-pkg` output is unsigned, and with Secure
+#    Boot on the chain stops at grub with `error: bad shim lock signature / you need to load the kernel
+#    first` - which is exactly what the 2 Nov board boot did, on a stick whose modules were all signed and
+#    whose every VM row passed, because a `-kernel` QEMU boot verifies nothing. Signing uses the same MOK
+#    the box's own Ubuntu kernel carries, on the box the key lives on, and the key is never printed or
+#    copied off it (a 0700 temp copy is converted, proved against the certificate, and wiped):
+os/v3/puppy/sign-vmlinuz.sh <stage>/boot/vmlinuz-<kver>
+#    prints the release string, the signer subject and the sha256 of the signed image; re-running on an
+#    already-signed image is a no-op (sbsign would otherwise stack a second signature).
+
 # 4. our kernel as woof-CE's kernel package:
 os/v3/puppy/mk-huge-kernel.sh <stage> <out-dir>
 #    writes <out-dir>/huge-<kver>.tar.zst  (vmlinuz + kernel-modules-zdrv-<kver>.sfs)
 #    and prints the module count, the sizes and each out-of-tree module's signer. It refuses:
 #      - a vmlinuz whose embedded release string is not <kver> (file(1) reads the setup header),
 #      - a module built for another kernel (modinfo -F vermagic),
-#      - an unsigned module (modinfo -F signer) - Secure Boot refuses those at load.
+#      - an unsigned module (modinfo -F signer) - Secure Boot refuses those at load,
+#      - an unsigned KERNEL IMAGE (sbverify) - step 3b, and grub refuses it under Secure Boot.
 
 # 5. rebuild the Puppy with it (about 15-25 min in the container, mostly downloads the first time).
 #    The build root defaults to $HOME/wt/1bit-puppy-build because it has to be on a filesystem that
@@ -97,10 +110,16 @@ os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 #    which is what makes the image carry OUR kernel. Empty that directory and woof-CE silently
 #    downloads a stock Ubuntu kernel instead - the trap the evaluation paid for.
 
-# 6. re-gate: G2 (boots on our kernel), G3 (amdgpu/amdxdna/ec_su_axb35 present and signed; devices on
-#    the board) and G4 (Secure Boot with the shim/MOK chain), then the release check inside the VM.
-#    g2-probe.sh <iso> <work> and g3-probe.sh <iso> <work> [--kver <kver>] [--require-mok] read the
-#    image, and vm-check.sh <iso> <work> boots it and answers the U1/U3/U4 rows over a serial shell.
+# 6. re-gate: G2 (boots on our kernel), G3 (the kernel image is signed, amdgpu/amdxdna/ec_su_axb35
+#    present and signed; devices on the board) and G4 (Secure Boot with the shim/MOK chain), then the
+#    release check inside the VM.
+#    g2-probe.sh <iso> <work> and g3-probe.sh <iso> <work> [--kver <kver>] [--cert <mok.pem>]
+#    [--require-mok] read the image; vm-check.sh <iso|img> <work> boots it and answers the U1/U3/U4 rows
+#    over a serial shell. For the .img it also builds sb-vars.sh's variable store and boots with Secure
+#    Boot ON (OVMF_CODE_4M.secboot.fd, smm=on), so an unsigned kernel is caught here and not on the board;
+#    the `sb state` row is the guest confirming it. A failed Secure Boot boot prints `FAIL sb chain` with
+#    grub's own message. The .iso cannot carry that row: a -kernel boot verifies nothing.
+os/v3/puppy/sb-vars.sh <work>/vars.fd    # what vm-check.sh runs for itself
 ```
 
 ## What runs in the image at boot

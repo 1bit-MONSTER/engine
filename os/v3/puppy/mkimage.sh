@@ -82,6 +82,15 @@ else
 fi
 [ -s "$work/initrd.gz" ] || { echo "$prog: the initrd is empty - the build had no cpio" >&2; exit 1; }
 kver=$(file -b "$work/vmlinuz" | sed -n 's/.*version \([^ ]*\).*/\1/p')
+# The image the stick boots has to be signed: with Secure Boot on, shim -> grub verifies it and refuses an
+# unsigned one before init (board, 2 Nov: `error: bad shim lock signature`). mk-huge-kernel.sh refuses the
+# same thing at packaging time; this is the artifact that actually ships and it costs one sbverify to say so.
+command -v sbverify > /dev/null || { echo "$prog: sbverify is missing (apt install sbsigntool)" >&2; exit 1; }
+ksig=$(sbverify --list "$work/vmlinuz" 2> /dev/null | sed -n 's/^ - //p' | head -n 1)
+[ -n "$ksig" ] || {
+    echo "$prog: REFUSED: the kernel image is unsigned - Secure Boot's GRUB refuses it (sign-vmlinuz.sh)" >&2
+    exit 1; }
+echo "   kernel $kver, signed by $ksig"
 
 echo "== ESP ($esp_mb MB): shim + grub + grub.cfg"
 rm -f "$work/efi.part"

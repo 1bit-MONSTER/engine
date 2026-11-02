@@ -39,7 +39,13 @@
 # A kernel bump: build/obtain the kernel .deb tree, run this again with the new <kver>, drop the new
 # tarball in kernel-kit/output, rebuild. No other file changes, which is what makes the bump a script.
 #
-# Exit: 0 ok, 1 usage, 2 refused (a module for another kernel, or an unsigned one), 3 a tool is missing.
+# The image must be SIGNED (`sign-vmlinuz.sh`, with the machine's enrolled MOK): with Secure Boot on, GRUB's
+# shim_lock verifier refuses an unsigned kernel and the appliance stops before init - measured on the board
+# on 2 Nov ("error: bad shim lock signature"). Nothing else in the chain checks this, and a `-kernel` QEMU
+# boot cannot show it, so it is refused here.
+#
+# Exit: 0 ok, 1 usage, 2 refused (a module for another kernel, an unsigned one, or an unsigned kernel
+# image), 3 a tool is missing.
 set -euo pipefail
 prog=mk-huge-kernel
 die() { printf '%s: REFUSED: %s\n' "$prog" "$*" >&2; exit 2; }
@@ -59,7 +65,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for t in mksquashfs depmod file tar zstd find; do
+for t in mksquashfs depmod file tar zstd find sbverify; do
     command -v "$t" >/dev/null 2>&1 || { printf '%s: %s is missing\n' "$prog" "$t" >&2; exit 3; }
 done
 
@@ -79,6 +85,12 @@ fi
 imgkver=$(file -b "$stage/boot/vmlinuz-$kver" | sed -n 's/.*version \([^ ]*\) .*/\1/p' | head -n 1 || true)
 [ -z "$imgkver" ] || [ "$imgkver" = "$kver" ] ||
     die "$stage/boot/vmlinuz-$kver is $imgkver, not $kver: the image and the modules are different kernels"
+
+# Secure Boot: the image has to carry a signature, and this is the last place that can say so before the
+# appliance ships. sbverify prints one ` - <subject>` line per issuer under "image signature issuers".
+imgsig=$(sbverify --list "$stage/boot/vmlinuz-$kver" 2> /dev/null | sed -n 's/^ - //p' | head -n 1)
+[ -n "$imgsig" ] ||
+    die "$stage/boot/vmlinuz-$kver is unsigned: with Secure Boot on GRUB refuses it (sign-vmlinuz.sh)"
 
 # every out-of-tree module must be this kernel's and signed, or the appliance boots without the NPU and
 # without its fans (the os/mini/mkimage.sh lesson, asserted here for the Puppy zdrv)
@@ -146,6 +158,7 @@ done
     echo "# Written by os/v3/puppy/mk-huge-kernel.sh"
     echo "kver=$kver"
     echo "image=$(sha256sum "$stage/boot/vmlinuz-$kver" | cut -d' ' -f1)"
+    echo "image_signer=$imgsig"
     echo "modules=$mods"
     echo "firmware=$firmware"
     for ko in "$updates"/*.ko "$updates"/*.ko.zst; do

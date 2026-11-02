@@ -497,7 +497,7 @@ Not measured, and therefore the risk list for the build:
   --adopt-data` grown from the live entry's v2 shell, which has `blkid` and `sfdisk` and can write the
   seed's storage section with explicit ids after inspecting the disk);
 - **the ROCm subset's completeness** — 173 MB is what `ldd` on the release's `llama-server` and
-  `libggml-hrx.so` needs *here*, measured while the release still carried DwarfStar's `ds4` (out of
+  `libggml-hrx.so` needs *here*, measured while the release still carried DwarfStar's `ds4` (removed 2026-11-02, out of
   the shipped build since v2026.44, [#757](https://github.com/1bit-MONSTER/engine/pull/757)), so today's
   set is no larger; a box with a different GPU path may want more, so `mkdebs` derives the
   list from those binaries rather than from a hand-written list;

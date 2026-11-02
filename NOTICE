@@ -110,12 +110,6 @@ HRX, HIP Runtime Extended (third_party/hrx-system)
   Copyright the HRX authors (Advanced Micro Devices, Inc.)
   License: Apache-2.0
 
-DwarfStar (third_party/ds4)
-  https://github.com/1bit-MONSTER/ds4
-  (a fork of https://github.com/antirez/ds4, with 1BP packages)
-  Copyright (c) 2026 The ds4.c authors
-  License: MIT; the fork's own files (1BP reader, converter and checker) Apache-2.0
-
 Lemonade (third_party/lemonade)
   https://github.com/1bit-MONSTER/lemonade
   (a fork of https://github.com/lemonade-sdk/lemonade, with the onebit recipe)

@@ -39,6 +39,9 @@
 #   prepare-stick.sh work/out/1bit-os.img --key "$(openssl rand -hex 24)" --ssh-pubkey my.pub
 #   prepare-stick.sh /dev/sdb --check            # assertions only, nothing is written
 #
+# Space: an IMAGE file's data partition is the image's 2 GiB until it is written to a device and grown (#706), so a
+# 0.6B GGUF (396 MB) and an NPU model directory (664 MB) do not both fit in one image prep. On a stick they do.
+#
 # --npu-model: the engine's NPU format is a DIRECTORY (model.q4nx + tokenizer + config), and init.sh
 # registers every /data/models/*/model.q4nx as `<directory name>-1bit` with onebit_backend npu. So the
 # directory name is the model's name: `--npu-model ~/models/npu/Qwen3-0.6B` becomes the entry
@@ -309,7 +312,7 @@ if [ "$CHECK" = 0 ]; then
         [ -d "$MNT/models" ] || mkdir -p "$MNT/models"
         cp -f "$m" "$MNT/models/$(basename "$m")" || die "could not copy $m into $MNT/models"
         chown 0:0 "$MNT/models" "$MNT/models/$(basename "$m")" 2>/dev/null
-        printf 'model    models/%s (%s bytes)\n' "$(basename "$m")" "$(stat -c %s "$m")"
+        printf 'model    models/%s (%s bytes)\n' "$(basename "$m")" "$(stat -Lc %s "$m")"
     done
     for d in $NPUMODELS; do
         name=${d%/}; name=${name##*/}
@@ -398,7 +401,9 @@ fi
 
 for m in $MODELS; do
     f=$MNT/models/$(basename "$m")
-    [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$(stat -c %s "$m")" ] &&
+    # -L: `--model` may be a symlink to the GGUF, and `stat -c %s` reports a link's own length (the target
+    # string), not the file's. Same one-liner as the NPU copy below, for the same reason.
+    [ -f "$f" ] && [ "$(stat -c %s "$f")" = "$(stat -Lc %s "$m")" ] &&
         ok "models/$(basename "$m") is there, same size as the source" ||
         bad "models/$(basename "$m") is missing or a different size"
 done
@@ -409,8 +414,10 @@ done
 for d in $NPUMODELS; do
     name=${d%/}; name=${name##*/}
     f=$MNT/models/$name
-    if [ -s "$f/model.q4nx" ] && [ "$(stat -c %s "$f/model.q4nx")" = "$(stat -c %s "$d/model.q4nx")" ]; then
-        ok "models/$name/model.q4nx is there, same size as the source ($(stat -c %s "$d/model.q4nx") bytes)"
+    if [ -s "$f/model.q4nx" ] && [ "$(stat -c %s "$f/model.q4nx")" = "$(stat -Lc %s "$d/model.q4nx")" ]; then
+        # -L on the source: a build box's model directory is symlinks into the FLM install, and `stat -c %s`
+        # reports a link's own length - the copy is right, the comparison was reading the link.
+        ok "models/$name/model.q4nx is there, same size as the source ($(stat -Lc %s "$d/model.q4nx") bytes)"
     else
         bad "models/$name/model.q4nx is missing or a different size"
     fi

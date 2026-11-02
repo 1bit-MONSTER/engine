@@ -252,8 +252,9 @@ rows = [
                      "tr ' ' '\\n' < /proc/cmdline | grep -c '^pupsfs=1BIT-DATA$'", "pupsfs=1BIT-DATA"),
     ("init guard",   "grep -c 'one_rescue' /initrd/init 2>/dev/null; "
                      "grep -c '1bit: PID 1 must never exit' /initrd/init 2>/dev/null; "
-                     "grep -c \"trap 'one_rescue" /initrd/init 2>/dev/null; "
-                     "grep -c 'one_rescue 1' /initrd/init 2>/dev/null", None),
+                     "n=$(grep -c 'one_rescue 1' /initrd/init); echo paths-guarded=$n; "
+                     "[ \"$n\" = 3 ] && grep -q 'trap .one_rescue' /initrd/init && echo init-guard-3-paths",
+                     "init-guard-3-paths"),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous

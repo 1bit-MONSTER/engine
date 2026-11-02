@@ -193,6 +193,14 @@ thing this compaction cannot hold, and it is the thing the t2 chunk's own gate m
 blocks for Bonsai-2. The n-major order also makes one `nb` (1,024 B) a single contiguous DMA run, and
 the tile itself is streamed as one 2,176-B run: 2-bit must not cost contiguous-run length.
 
+A model shipped in the **t2** form needs no pb16i image to feed this kernel: `from_t2(chunk, K, N)` takes
+the container's own chunk and returns the same bytes `from_pb16i_image()` returns for the image it was
+made from, by re-deriving the image with the packer's code rather than a second implementation of the
+tile order. The two forms are the same weights in **different orders** (t2 is k-major within each 32-row
+band, t2s is n-major within each 16x16 block: on the test fixture's 139,264 stream bytes, 135,476 differ),
+so they are never interchangeable and `from_t2` is the only crossing — the test asserts both the equality
+and that inequality, so a "simplification" that returns the chunk unchanged fails.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

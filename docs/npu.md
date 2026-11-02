@@ -369,10 +369,13 @@ what it can and records the rest in the container's `__metadata__` (`incomplete`
 `config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
 that is now **218 tensors, 25,136 tiles** (embedding, head, 48 layer norms, 96 attention
 projections, 72 attention biases) and **73 refusals**: the 24 x 3 MLP projections, whose section of
-the `.fconst` uses a 2,144-byte subvolume stride (a 32 B narrower metadata field) that no attribute
-set of the vendor packer emits — it emits 2,176 for every K=896 shape — so those tiles cannot be
-reproduced or byte-verified yet; and the final norm, whose 1,856-byte tail envelope turned out to
-be `[eps][pad][448 f32]` and not an RMSNorm weight on either `.fconst`.
+the `.fconst` is 16 subvolumes of 4,288 B per 128-row unit (64 output rows per column group, i.e. the
+vendor writer's `Nsubv 64` instance) carrying **one fused gate/up tensor whose rows interleave in
+32-row chunks** — the unit size and the interleave are established from the writer's own headers, the
+intra-subvolume byte order is not, and the packer this importer checks against emits only the
+2,176-byte instance for K=896, so those tiles cannot be re-encoded and byte-verified the way the
+attention tiles are; and the final norm, whose 1,856-byte tail envelope turned out to be
+`[eps][pad][448 f32]` and not an RMSNorm weight on either `.fconst`.
 
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as

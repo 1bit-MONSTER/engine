@@ -366,10 +366,12 @@ float f16_to_f32(uint16_t h) {
 }
 
 constexpr const char* kRefuseMlp =
-    "weights are in dd_metastate_*.fconst, and the MLP section uses a 2,144-byte subvolume stride (a 32 B "
-    "narrower metadata field) that no attribute set of the vendor packer on this box emits -- it emits 2,176 "
-    "for every K=896 shape -- so those tiles cannot be reproduced or byte-verified yet "
-    "(amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.16)";
+    "weights are in dd_metastate_*.fconst, in 4,288-byte subvolumes (64 output rows per column group, "
+    "128 rows per unit) carrying one fused gate/up tensor whose rows interleave in 32-row chunks. The unit "
+    "size and the interleave are established, the intra-subvolume byte order is not, and the vendor packer "
+    "on this box emits only the 2,176-byte instance for K=896, so these tiles cannot be re-encoded and "
+    "byte-verified the way the attention tiles are (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md "
+    "§7.16.4/§7.16.6)";
 
 Planned make(const std::string& name, const std::string& source, const std::string& dtype,
              std::vector<int64_t> shape) {

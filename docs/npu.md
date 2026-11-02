@@ -201,6 +201,31 @@ band, t2s is n-major within each 16x16 block: on the test fixture's 139,264 stre
 so they are never interchangeable and `from_t2` is the only crossing — the test asserts both the equality
 and that inequality, so a "simplification" that returns the chunk unchanged fails.
 
+#### Wire format v2: the ordering moves into the stream, not the core
+
+The mmul's operand byte for element `e = 16k + c` is `e/2`, so a 64-byte vector of 2-bit codes has to reach the
+operand's **even** bytes and the next 64 its **odd** bytes — a spread, not a copy. Under the original order (v1) that
+spread is a lane-crossing shuffle inside the core (`aie::interleave_zip`), and it was measured on the array: **11.1-12.6
+GB/s against 30-32 GB/s** for the plain contiguous stores with the wrong order. So v2 changes the order *inside each
+64-byte block* and nothing else:
+
+    v1: byte r*4 + j  ->  k = kb*16 + r,        n = nb*16 + 4j + {0,1,2,3}
+    v2: byte b        ->  lanes 0/1: k = kb*16 + b/8,     n = nb*16 + 2*(b%8), +1
+                          lanes 2/3: k = kb*16 + 8 + b/8, n = nb*16 + 2*(b%8), +1
+
+which is exactly the arithmetic the operand wants: byte `b` of the first store covers element `2b = 16*(b/8) + 2*(b%8)`,
+and byte `b` of the second store covers `2*(64+b) = 128 + 2b`, i.e. eight k rows down. The kernel's two contiguous
+stores are then correct with no shuffle and no table — **the same kernel binary** that had to interleave is byte-exact
+on v2 (3/3 seeds, 0 mismatches, `amdxdna` counter 0, measured 2026-11-02). The tile is still 2,176 B and the time order
+is unchanged, so the DMA descriptors and the tile count do not move; the ms area is byte-identical between the formats.
+
+`tools/q4nx_t2s.py` carries both: `from_pb16i_image()`/`stream()`/`decode()`/`expand()` are v1,
+`from_pb16i_image_v2()`/`decode_v2()` are v2, and `tests/q4nx_t2s_test.py` pins that they carry the same codes and the
+same multipliers, that only the code area differs, and the block algebra above. A container declares which one its
+images are with `q4nx_weight_layout_version` (5 = v1, 6 = v2): the two are **not** interchangeable — a v1 image read by
+the no-shuffle kernel is a silent permutation of the weight matrix, which is precisely the failure that took three
+single-code probes to name.
+
 #### The t2s stream in the engine (launch path)
 
 A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (pb16i is 4, and each layout

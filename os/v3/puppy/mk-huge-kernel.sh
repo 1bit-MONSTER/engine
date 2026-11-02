@@ -102,37 +102,44 @@ out=$(cd "$out" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 tree=$work/zdrv
-mkdir -p "$tree/lib/modules" "$tree/lib/firmware" "$tree/etc/1bit"
+# WHERE the tree goes matters more than it looks. Ubuntu 26.04 is usrmerged and the built puppy SFS carries
+# `/lib -> usr/lib` as a symlink (measured with unsquashfs -ll on cycle 4's puppet SFS), so a zdrv that puts
+# modules at /lib/modules/<kver> stacks under a symlink and is invisible in the running system: measured in
+# a booted appliance image, `ls /lib/modules/<kver>` said "No such file or directory" and `modprobe
+# virtio_net`/`e1000` said "not found in directory", so no module at all could load - no NIC, no amdgpu, no
+# NPU. Usrmerge layout plus a `lib -> usr/lib` link of our own is what makes both paths resolve.
+libroot=${ZDRV_LIBROOT:-usr/lib}
+mkdir -p "$tree/$libroot/modules" "$tree/$libroot/firmware" "$tree/etc/1bit"
+ln -sfn usr/lib "$tree/lib"   # for depmod and anything that still asks for /lib directly
 
 echo "== the modules ($kver)"
 # the tree without build/ and source/: those are symlinks to a headers tree the appliance does not carry,
 # and on a box where the headers have been removed they dangle and stop the copy
-mkdir -p "$tree/lib/modules/$kver"
+mkdir -p "$tree/$libroot/modules/$kver"
 tar -C "$stage/lib/modules/$kver" --exclude=./build --exclude=./source -cf - . |
-    tar -C "$tree/lib/modules/$kver" -xf -
+    tar -C "$tree/$libroot/modules/$kver" -xf -
 # modules.dep for this tree from this tree, so the depmod that Puppy's boot would otherwise need is done
 # once, at build time, and a missing dependency is a build error instead of a boot error
 if [ -f "$stage/boot/config-$kver" ]; then
-    mkdir -p "$work/lib/modules/$kver"
-    ln -sfn "$tree/lib/modules/$kver" "$work/lib/modules/$kver" 2>/dev/null || true
+    mkdir -p "$work/$libroot/modules"
     depmod -b "$tree" "$kver" 2>/dev/null || depmod -b "$tree" 2>/dev/null || true
 fi
 # Ubuntu ships its modules compressed (this kernel: .ko.xz, 3819 of them, measured); ours in updates/ are
 # not. The kernel's own module decompressor handles both, so the count and the checks take '*.ko*'.
-mods=$(find "$tree/lib/modules/$kver" -name '*.ko*' | wc -l)
+mods=$(find "$tree/$libroot/modules/$kver" -name '*.ko*' | wc -l)
 [ "$mods" -gt 1000 ] || printf '%s: note: only %s modules in the zdrv (a kernel package normally carries more)\n' "$prog" "$mods"
 
 echo "== the firmware ($firmware)"
 for d in $firmware; do
     if [ -d "/lib/firmware/$d" ]; then
-        mkdir -p "$tree/lib/firmware/$d"
-        cp -aL "/lib/firmware/$d/." "$tree/lib/firmware/$d/"
-        printf '   /lib/firmware/%s  %s\n' "$d" "$(du -sh "$tree/lib/firmware/$d" | cut -f1)"
+        mkdir -p "$tree/$libroot/firmware/$d"
+        cp -aL "/lib/firmware/$d/." "$tree/$libroot/firmware/$d/"
+        printf '   %s/firmware/%s  %s\n' "$libroot" "$d" "$(du -sh "$tree/$libroot/firmware/$d" | cut -f1)"
     else
         printf '%s: note: no /lib/firmware/%s on this build machine\n' "$prog" "$d" >&2
     fi
 done
-[ -n "$(ls -A "$tree/lib/firmware")" ] || printf '%s: note: the zdrv carries no firmware\n' "$prog" >&2
+[ -n "$(ls -A "$tree/$libroot/firmware")" ] || printf '%s: note: the zdrv carries no firmware\n' "$prog" >&2
 
 # what the machine is: release-check's `kernel` row and a human read this
 {

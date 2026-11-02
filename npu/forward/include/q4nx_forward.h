@@ -308,7 +308,8 @@ private:
     bool ffn_cache_default() const;
     bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
-                   bool proportional, int window, int kv_layer, bool append_kv);
+                   bool proportional, int window, int kv_layer, bool append_kv,
+                   int kv_len = 0);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
     float rmsnorm(const float* x, const float* w, int n, float* out) const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
@@ -370,6 +371,10 @@ private:
     // refusals, which name the plan that asked for a kernel that is not there.
     onebit::npu::plan::Plan plan_;
     std::string plan_path_;
+    // attention.mode from the plan: a noncausal pack's full-attention layers see the whole prompt, so a
+    // prompt-encoding forward (step_batch at start_pos 0) attends bidirectionally there and the GDN
+    // layers keep their recurrence.  Off unless the plan says so, so a causal model is untouched.
+    bool noncausal_attn_ = false;
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;

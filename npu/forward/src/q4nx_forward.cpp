@@ -484,6 +484,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         fprintf(stderr, "  [plan] %s: %zu layers, gate/up %s, family \"%s\", %zu decode dir(s) from the plan\n",
                 plan_path_.c_str(), plan_.layer_plans.size(), plan_.fused_gu ? "fused" : "split",
                 plan_.tag.empty() ? "rm" : plan_.tag.c_str(), plan_.decode_dirs.size());
+        noncausal_attn_ = plan_.noncausal();
+        if (noncausal_attn_)
+            fprintf(stderr, "  [plan] attention.mode noncausal_full_attention: full-attention layers read "
+                            "the whole prompt (a prompt-encoding model; it cannot generate)\n");
     }
     // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
     // and a container cannot disagree about which file the decode roles run.
@@ -3022,6 +3026,14 @@ bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_po
 bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                                 std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
+    // A noncausal pack reads the whole prompt at once, so a chunk that starts above 0 was already
+    // encoded causally by an earlier call and cannot be repaired here.  Named, not silently causal.
+    if (noncausal_attn_ && start_pos > 0) {
+        err_ = "attention.mode noncausal_full_attention encodes a prompt in one batched pass, but this "
+               "call starts at position " + std::to_string(start_pos) +
+               " (the positions before it were encoded causally); send the whole prompt as one batch";
+        return false;
+    }
     const int H = c_.H;
     const int M = (int)tokens.size();
     if (M <= 0) { err_ = "empty batch"; return false; }
@@ -3203,13 +3215,17 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 }
             }
             CTX.assign((size_t)M * (size_t)ctx_w, 0.0f);
-            std::vector<float> qkv_use;
-            for (int m = 0; m < M; m++) {
+            std::vector<float> qkv_use, ctx_scratch;
+            // One row of attention.  `append` is the K/V cache append, `kvlen` is how many cached
+            // positions to read (0 = up to and including `pos`, i.e. causal), and `dst` receives the
+            // context -- null when the pass only fills the cache (the noncausal first pass below).
+            auto row_attn = [&](int m, float* dst, bool append, int kvlen) -> bool {
                 qkv_row.assign(QKV.begin() + (size_t)m * g->N,
                                QKV.begin() + (size_t)(m + 1) * g->N);
                 // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
                 // must not see the gate half; the gate multiplies the context after.
                 const float* gate_ptr = nullptr;
+                const std::vector<float>* in = &qkv_row;
                 if (attn_gate_) {
                     const int kvsz = g->k_rows + g->v_rows;
                     qkv_use.assign((size_t)nhd + (size_t)kvsz, 0.0f);
@@ -3217,19 +3233,32 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                     memcpy(qkv_use.data() + nhd, qkv_row.data() + 2 * nhd,
                            (size_t)kvsz * sizeof(float));
                     gate_ptr = qkv_row.data() + nhd;
-                    if (!attention(qkv_use, start_pos + m, ctx_row, l_hd, l_nkv, l_theta,
-                                   l_rot, l_prop, l_win, l, true)) {
-                        err_ = "attention failed"; return false;
-                    }
-                } else if (!attention(qkv_row, start_pos + m, ctx_row, l_hd, l_nkv, l_theta,
-                                      l_rot, l_prop, l_win, l, true)) {
+                    in = &qkv_use;
+                }
+                if (!attention(*in, start_pos + m, dst ? ctx_row : ctx_scratch, l_hd, l_nkv, l_theta,
+                               l_rot, l_prop, l_win, l, append, kvlen)) {
                     err_ = "attention failed"; return false;
                 }
+                if (!dst) return true;
                 if (gate_ptr)
                     for (int i = 0; i < nhd; i++)
                         ctx_row[(size_t)i] *= 1.0f / (1.0f + expf(-gate_ptr[i]));
-                memcpy(CTX.data() + (size_t)m * ctx_w, ctx_row.data(),
-                       (size_t)ctx_w * sizeof(float));
+                memcpy(dst, ctx_row.data(), (size_t)ctx_w * sizeof(float));
+                return true;
+            };
+            // A noncausal pack: every full-attention layer reads the whole prompt, so the cache has to
+            // hold all M rows before any of them attends -- a row's keys come from the same layer, and
+            // the rows after it only exist once their projections ran.  The GDN layers keep their own
+            // causal recurrence (the reference keeps it too), and a sliding layer stays causal.
+            if (noncausal_attn_ && l_full) {
+                for (int m = 0; m < M; m++)
+                    if (!row_attn(m, nullptr, true, 0)) return false;
+                for (int m = 0; m < M; m++)
+                    if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, false, start_pos + M))
+                        return false;
+            } else {
+                for (int m = 0; m < M; m++)
+                    if (!row_attn(m, CTX.data() + (size_t)m * ctx_w, true, 0)) return false;
             }
             const Q4nxDesignGeom* go = &designs_[i_o_l];
             Q4nxProjections po{};
@@ -3827,7 +3856,7 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
                                std::vector<float>& ctx, int head_dim,
                                int n_kv_heads, float theta, int rotary_dim,
                                bool proportional, int window,
-                               int kv_layer, bool append_kv) {
+                               int kv_layer, bool append_kv, int kv_len) {
     const int NH = c_.NH;
     const int HD = head_dim;      /* per layer type (Gemma4: 256 or 512) */
     const int NKV = n_kv_heads;
@@ -3920,13 +3949,15 @@ bool Q4nxNpuForward::attention(const std::vector<float>& qkv, int pos,
         vcache_[kv_layer].insert(vcache_[kv_layer].end(), v.begin(), v.end());
     }
 
-    const int T = pos + 1;
+    // kv_len > 0 is a noncausal read: attend over that many cached positions instead of only the ones
+    // up to `pos`.  Everything above (rope, qk-norm, the cache append) is position-local and unchanged.
+    const int T = kv_len > 0 ? kv_len : pos + 1;
     // Gemma4 sets attention scaling to 1.0 (q/k carry an RMSNorm); everyone else
     // uses the usual 1/sqrt(head_dim).
     const float scale = sem_.attn_scaling_one ? 1.0f : 1.0f / std::sqrt((float)HD);
     // Sliding-window attention: ignore positions older than the window.
-    const int t0 = (window > 0 && pos + 1 > window)
-                       ? pos + 1 - window : 0;
+    const int t0 = (window > 0 && T > window)
+                       ? T - window : 0;
     ctx.assign((size_t)NH * HD, 0.0f);
     std::vector<float> score(T);
     for (int h = 0; h < NH; h++) {
@@ -3984,6 +4015,16 @@ bool Q4nxNpuForward::mlp(const std::vector<float>& gu, std::vector<float>& h, in
 // --------------------------------------------------------------------------
 bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
+    // Generation is causal by construction (one position at a time, keys only in the past), so a pack
+    // whose full-attention layers read the whole prompt cannot be run this way.  Refused by name
+    // rather than answered with a mask the pack was not trained with.
+    if (noncausal_attn_) {
+        err_ = "attention.mode noncausal_full_attention is a prompt-encoding mode and step() generates: "
+               "this model's full-attention layers read the whole prompt, so a one-token-at-a-time pass "
+               "would use a mask it was not trained with (use step_batch() with the whole prompt at "
+               "position 0)";
+        return false;
+    }
     const long step_d0 = prof_dec_n_;
     // Phase attribution (NPU_PHASE_PROF=1): named phases summing to this step's wall.
     const bool ph = phprof_on();

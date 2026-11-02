@@ -123,6 +123,18 @@ void test_valid() {
           "the pb16i family is read with its sealed ELF");
     check(pp.decode_dirs.size() == 2 && pp.decode_dirs[0].under_model, "a model-relative decode dir is kept");
 
+    // attention.mode is optional and defaults to causal, so a plan written before the field loads and
+    // still means what it meant then.
+    check(p.attention_mode == "causal" && !p.noncausal(), "a plan with no attention block is causal");
+    auto nc = base_plan();
+    nc["attention"] = {{"mode", "noncausal_full_attention"}};
+    const Plan np = Plan::load(write_plan("noncausal", nc));
+    check(np.noncausal() && np.attention_mode == "noncausal_full_attention",
+          "a noncausal pack's attention mode is read");
+    auto ca = base_plan();
+    ca["attention"] = {{"mode", "causal"}};
+    check(!Plan::load(write_plan("causal", ca)).noncausal(), "an explicit causal mode is causal");
+
     // the t2s family: the same integer-exact ternary container, its own artifact tag, and no sealed
     // ELF (its per-role `_t2s` kernels are the decode family, so the field stays empty by design)
     auto t2 = base_plan();
@@ -224,6 +236,18 @@ void test_refusals() {
         p["layers"][0]["qkv"] = {{"K", 1024}};  // N missing
         check(has(refusal(write_plan("halfproj", p)), "names only one of K and N"),
               "half a projection is refused rather than defaulted");
+    }
+    {
+        // The two modes give different numbers, so a third string is never guessed at.
+        auto p = base_plan();
+        p["attention"] = {{"mode", "bidirectional"}};
+        check(has(refusal(write_plan("attnmode", p)),
+                  "attention.mode \"bidirectional\" is not causal or noncausal_full_attention"),
+              "an unknown attention mode is refused by name");
+        auto q = base_plan();
+        q["attention"] = {{"mode", 1}};
+        check(has(refusal(write_plan("attntype", q)), "attention has no \"mode\" string"),
+              "a non-string attention mode is refused");
     }
     check(has(refusal("/nonexistent/plan.json"), "cannot read"), "a missing plan file is refused by path");
 }

@@ -148,6 +148,20 @@ static bool file_exists(const std::string& p, long min_size = 1) {
     return sz >= min_size;
 }
 
+// A sidecar directory comes from the container's config or from an environment variable, and every
+// weight image is opened under it, so it is checked once here instead of trusted at each fopen: an
+// absolute path with no ".." component and no NUL, which is what a converter writes (a relative one
+// would silently resolve against the serve's cwd).
+static bool valid_sidecar_dir(const std::string& d) {
+    if (d.empty() || d.size() > 4096 || d[0] != '/') return false;
+    if (d.find('\0') != std::string::npos) return false;
+    for (size_t i = 0; i + 1 < d.size(); i++)
+        if (d[i] == '.' && d[i + 1] == '.' && (i == 0 || d[i - 1] == '/') &&
+            (i + 2 == d.size() || d[i + 2] == '/'))
+            return false;
+    return true;
+}
+
 // Decode a quantized [rows, cols] tensor whatever chunk size it is stored in:
 // 5120 = q4_1, 4736 = OFLM Q4_K (flm_dtype_t 8, Qwen3.5-4B's projections),
 // 8704 = Q8 (Qwen3.5's tied table / ssm_alpha / ssm_beta).  The chunk size is
@@ -392,22 +406,31 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     {
         const std::string lay = read_config_string(cfg_path, "\"q4nx_weight_layout\"", "rm");
         weight_layout_b8_ = (lay == "b8");
-        pb16i_ = (lay == "pb16i");
+        t2s_ = (lay == "t2s");
+        pb16i_ = (lay == "pb16i") || t2s_;
         if (pb16i_) {
-            // Where the images live: blk_<layer>_<tag>_weight.{pb16i,ref}.  The env
+            // Where the images live: blk_<layer>_<tag>_weight.{pb16i|t2s,ref}.  The env
             // variable wins so a run can point at a fresh set without editing the
             // container's config.
             // The image format has a version so a future change cannot be read as this
-            // one: the config may pin it, and anything but 4 is refused.
-            const int ver = q4nx_config_int(cfg_path.c_str(), "q4nx_weight_layout_version", 4);
-            if (ver != 4) {
+            // one: the config may pin it, and anything but the layout's own version is
+            // refused (4 = pb16i's 4,608-B tiles, 5 = t2s's 2,176-B stream).
+            const int want_ver = t2s_ ? 5 : 4;
+            const int ver = q4nx_config_int(cfg_path.c_str(), "q4nx_weight_layout_version", want_ver);
+            if (ver != want_ver) {
                 err_ = "q4nx_weight_layout_version " + std::to_string(ver) +
-                       " is not an image format this build reads (4 is pb16i)";
+                       " is not an image format this build reads (" + std::to_string(want_ver) +
+                       (t2s_ ? " is t2s)" : " is pb16i)");
                 return false;
             }
-            const char* e = getenv("Q4NX_PB16I_DIR");
-            pb16i_dir_ = e ? e : read_config_string(cfg_path, "\"q4nx_pb16i_dir\"", "");
-            pb16i_sealed_ = read_config_string(cfg_path, "\"q4nx_pb16i_sealed_elf\"", "");
+            const char* e = getenv(t2s_ ? "Q4NX_T2S_DIR" : "Q4NX_PB16I_DIR");
+            pb16i_dir_ = e ? e : read_config_string(cfg_path,
+                                                    t2s_ ? "\"q4nx_t2s_dir\"" : "\"q4nx_pb16i_dir\"", "");
+            // The sealed-ELF trick is the pb16i family's (one full ELF, every ternary instance).  A t2s
+            // container has no sealed set: its decode family is the per-role `_t2s_m16` kernels, so the
+            // field stays empty and the per-role lookup below is what runs.
+            if (!t2s_)
+                pb16i_sealed_ = read_config_string(cfg_path, "\"q4nx_pb16i_sealed_elf\"", "");
             // A folded container also declares the fold: `q4nx_hadamard` names the sign table and
             // `q4nx_hadamard_block` the Hadamard block.  Without it the sidecar images would be
             // read in the stored (rotated) basis against un-rotated activations.
@@ -418,15 +441,23 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 if (!load_hadamard(hp)) return false;
             }
             if (pb16i_dir_.empty()) {
-                err_ = "q4nx_weight_layout is pb16i but no sidecar directory is set "
-                       "(config q4nx_pb16i_dir, or Q4NX_PB16I_DIR)";
+                err_ = std::string("q4nx_weight_layout is ") + (t2s_ ? "t2s" : "pb16i") +
+                       " but no sidecar directory is set (config q4nx_" +
+                       (t2s_ ? "t2s_dir" : "pb16i_dir") + ", or Q4NX_" +
+                       (t2s_ ? "T2S_DIR" : "PB16I_DIR") + ")";
+                return false;
+            }
+            if (!valid_sidecar_dir(pb16i_dir_)) {
+                err_ = std::string("the ") + (t2s_ ? "t2s" : "pb16i") +
+                       " sidecar directory must be an absolute path without \"..\": " + pb16i_dir_;
                 return false;
             }
         }
         fprintf(stderr, "  [forward] weight layout: %s (%s)\n",
-                pb16i_ ? "pb16i integer-exact ternary, sidecar images"
-                       : (weight_layout_b8_ ? "b8 blocked 8x8 microtiles, tile-n-major"
-                                            : "rm row-major"),
+                t2s_ ? "t2s 2-bit ternary stream, expanded on the core"
+                     : (pb16i_ ? "pb16i integer-exact ternary, sidecar images"
+                               : (weight_layout_b8_ ? "b8 blocked 8x8 microtiles, tile-n-major"
+                                                    : "rm row-major")),
                 pb16i_ ? pb16i_dir_.c_str()
                        : (weight_layout_b8_ ? "kernels carry the _b8 suffix"
                                             : "q4nx_weight_layout absent/rm"));
@@ -444,7 +475,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         // The plan may not disagree with the container about the kernel family, or the run would take
         // a different artifact than the weights need.
-        const std::string want = pb16i_ ? "_pb16i" : (weight_layout_b8_ ? "_b8" : "");
+        const std::string want = family_tag();
         if (plan_.tag != want) {
             err_ = "plan " + plan_path_ + ": kernels.tag \"" + plan_.tag + "\" but the container is \"" +
                    (want.empty() ? "rm" : want.substr(1)) + "\" (expected \"" + want + "\")";
@@ -708,7 +739,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // The artifact probes must use the same tag the designs will carry, or a
         // b8 container would silently conclude "no fused GU kernel" and fall back
         // to split G/U on a model that ships one.
-        const char* tag = pb16i_ ? "_pb16i" : (weight_layout_b8_ ? "_b8" : "");
+        const char* tag = family_tag();
         char gu[512], g[512];
         snprintf(gu, sizeof(gu), "%s/full_i8_GU_K%d_N%d%s.elf", dir.c_str(), dims.H, 2 * dims.IM, tag);
         snprintf(g, sizeof(g), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), dims.H, dims.IM, tag);
@@ -812,7 +843,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     if (pb16i_ && !mla_ && lin_kd_ > 0 && c_.NH > 0 && c_.HD > 0 && c_.NKV > 0 &&
         ndesigns_ + 2 <= Q4NX_MAX_DESIGNS) {
         const int nq = c_.NH * c_.HD, nkv = c_.NKV * c_.HD;
-        if (q4nx_pb16i::fits(c_.H, nq) && q4nx_pb16i::fits(c_.H, nkv)) {
+        const bool geo_ok = t2s_ ? (q4nx_t2s::fits(c_.H, nq) && q4nx_t2s::fits(c_.H, nkv))
+                                 : (q4nx_pb16i::fits(c_.H, nq) && q4nx_pb16i::fits(c_.H, nkv));
+        if (geo_ok) {
             auto add = [&](Q4nxDesign role, int N, const char* role_name) {
                 Q4nxDesignGeom& g = designs_[ndesigns_];
                 memset(&g, 0, sizeof(g));
@@ -820,17 +853,19 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 g.K = c_.H;
                 g.N = N;
                 g.role = role;
-                snprintf(g.elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d_pb16i.elf",
-                         role_name, g.K, g.N);
+                snprintf(g.elf_name, Q4NX_ELF_NAME_MAX, "full_i8_%s_K%d_N%d%s.elf",
+                         role_name, g.K, g.N, family_tag());
                 return ndesigns_++;
             };
             i_qhalf_ = add(Q4NX_DESIGN_QKVFA_Q, nq, "QKVFAQ");
             i_kv_ = add(Q4NX_DESIGN_QKVFA_KV, nkv, "QKVFAKV");
-            fprintf(stderr, "  [forward] pb16i: full-attention QKV as 2 launches of K%d_N%d "
-                            "(q|gate) + 2 of K%d_N%d (k, v)\n", c_.H, nq, c_.H, nkv);
+            fprintf(stderr, "  [forward] %s: full-attention QKV as 2 launches of K%d_N%d "
+                            "(q|gate) + 2 of K%d_N%d (k, v)\n", t2s_ ? "t2s" : "pb16i",
+                    c_.H, nq, c_.H, nkv);
         } else {
-            fprintf(stderr, "  [forward] pb16i: no full-attention QKV split (K=%d N=%d/%d is "
-                            "not a pb16i geometry)\n", c_.H, nq, nkv);
+            fprintf(stderr, "  [forward] %s: no full-attention QKV split (K=%d N=%d/%d is "
+                            "not a %s geometry)\n", t2s_ ? "t2s" : "pb16i", c_.H, nq, nkv,
+                    t2s_ ? "t2s" : "pb16i");
         }
     }
 
@@ -839,7 +874,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // permuted and produce silent garbage.  Tagging every design's artifact
     // name keeps the two families in one directory and makes a missing artifact
     // a loud error instead of a wrong number.  The twins derive from these
-    // names, so they become "..._b8_m16.elf".
+    // names, so they become "..._b8_m16.elf".  A t2s container is NOT tagged here: like pb16i, its
+    // M=128 designs still run the int8 family (the stream is a decode family only), and only the
+    // decode designs get the `_t2s` suffix, below.
     if (weight_layout_b8_) {
         for (int i = 0; i < ndesigns_; i++) {
             char* n = designs_[i].elf_name;
@@ -867,13 +904,21 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         ctx_[i]->blocked_b = weight_layout_b8_;
 
         if (host_gemm_) {
-            // Offline mode: the geometry->artifact mapping is still asserted, but
-            // no device is opened (the ELFs themselves are checked separately by
-            // tests/verify_design_elfs + tests/verify_full_elfs.sh).
+            // Offline mode: host GEMMs are plain float matmuls over the decoded weights, so
+            // no ELF is opened and none is required.  A model whose kernel set has not been
+            // built yet can be loaded and prompted, which is what makes it a usable
+            // numeric reference for a new geometry (engine #796: the d3-lite backbone
+            // answers on the host while its six designs do not exist).  The artifact is
+            // named when it is there; the ELF set itself is checked by
+            // tests/verify_design_elfs + tests/verify_full_elfs.sh, not by this path.
             std::string elf = dir + "/" + g->elf_name;
-            if (!file_exists(elf)) { err_ = missing_kernel(dir, g->elf_name, g->role); return false; }
-            fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
-                    role_tag(g->role), g->M, g->K, g->N, elf.c_str());
+            if (file_exists(elf)) {
+                fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
+                        role_tag(g->role), g->M, g->K, g->N, elf.c_str());
+            } else {
+                fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  (host-GEMM, no ELF: %s)\n",
+                        role_tag(g->role), g->M, g->K, g->N, g->elf_name);
+            }
         } else {
             std::string elf = dir + "/" + g->elf_name;
             if (!file_exists(elf)) {
@@ -918,18 +963,20 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     const bool want_m16 = !m16_env || atoi(m16_env) != 0;
     if (want_m16 && !host_gemm_) {
         q4nx_derive_decode_designs(designs_, ndesigns_, designs16_);
-        // A pb16i container's decode family is its own kernel set, not the int8 M=16
-        // twins: same M=16 activation tile, but the image (and so the tap) is pb16i,
-        // the ELF name carries _pb16i, and the geometry test is p16i's (K%256, N%1024)
-        // rather than the int8 twin's tiling.  A design that is pb16i-only skips the
-        // derivation entirely: its own entry already IS the decode design.
+        // An integer-exact ternary container's decode family is its own kernel set, not the int8
+        // M=16 twins: same M=16 activation tile, but the image (and so the tap) is pb16i's or
+        // t2s's, the ELF name carries that suffix, and the geometry test is the image's
+        // (pb16i: K%256, N%1024; t2s: K%256, N%32) rather than the int8 twin's tiling.  A design
+        // that is ternary-only skips the derivation entirely: its own entry already IS the decode
+        // design.
         if (pb16i_) {
+            const std::string ft = family_tag();
             for (int i = 0; i < ndesigns_; i++) {
                 if (i == i_qhalf_ || i == i_kv_) {
                     designs16_[i] = designs_[i];
                     continue;
                 }
-                // The wide fused full-attention QKV has no pb16i kernel (its int64 half
+                // The wide fused full-attention QKV has no ternary kernel (its int64 half
                 // needs 448 columns per core); when the split designs exist that role is
                 // covered by them, so this design simply has no decode kernel.
                 const Q4nxDesign r16 = designs_[i].role;
@@ -937,7 +984,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                     designs16_[i].M = 0;
                     continue;
                 }
-                if (designs16_[i].M <= 0 || !q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N)) {
+                const bool geo_ok = t2s_ ? q4nx_t2s::fits(designs16_[i].K, designs16_[i].N)
+                                         : q4nx_pb16i::fits(designs16_[i].K, designs16_[i].N);
+                if (designs16_[i].M <= 0 || !geo_ok) {
                     designs16_[i].M = 0;
                     continue;
                 }
@@ -947,7 +996,13 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 n16.resize(n16.size() - 4);                  // drop ".elf"
                 if (n16.size() >= 4 && n16.compare(n16.size() - 4, 4, "_m16") == 0)
                     n16.resize(n16.size() - 4);              // and the m16 twin's suffix
-                n16 += "_pb16i.elf";
+                n16 += ft;
+                // pb16i's decode family carries no `_m16` marker: M=16 is its only design and those
+                // files already exist under that name on every deployed container.  A t2s container's
+                // M=128 designs keep their int8 names (untagged), so its decode kernels are told
+                // apart by the marker the arena uses: full_i8_GU_K5120_N17408_t2s_m16.elf.
+                if (t2s_) n16 += "_m16";
+                n16 += ".elf";
                 snprintf(designs16_[i].elf_name, Q4NX_ELF_NAME_MAX, "%s", n16.c_str());
             }
         }
@@ -1013,6 +1068,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             ctx16_[i]->ND = designs16_[i].N;
             ctx16_[i]->blocked_b = weight_layout_b8_;
             ctx16_[i]->pb16i = pb16i_;
+            ctx16_[i]->t2s = t2s_;
             // Which pb16i ELFs leave two int32 planes (the arena's ACC64 family: D, O and
             // the full-attention q half).  This mirrors the ELF family contract rather
             // than inferring it, and load/launch refuse a tensor that needs two planes on
@@ -1041,8 +1097,8 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
         m16_ = made > 0;
         if (pb16i_ && made < ndesigns_ - 0) {
-            fprintf(stderr, "  [forward] pb16i: %d of %d designs have a decode kernel\n",
-                    made, ndesigns_);
+            fprintf(stderr, "  [forward] %s: %d of %d designs have a decode kernel\n",
+                    t2s_ ? "t2s" : "pb16i", made, ndesigns_);
         }
         fprintf(stderr, "  [forward] decode family: %d role(s) at M=%d, %d on M=%d%s\n",
                 made, Q4NX_DESIGN_M_DECODE, skipped, Q4NX_DESIGN_M_PREFILL,
@@ -1064,11 +1120,13 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // requantisation, it is 0.75 GB against the int8 head's 1.33 GB, and it runs the same
         // K=H kernel the MLP's GU launch runs.  Missing images are not an error: the head then
         // keeps the int8 family below.
-        if (i_head >= 0 && !pb16i_dir_.empty() && file_exists(head_pb16i_stem(0) + ".pb16i")) {
+        if (i_head >= 0 && !pb16i_dir_.empty() &&
+            file_exists(head_pb16i_stem(0) + image_ext())) {
             const Q4nxDesignGeom& g = designs_[i_head];
             std::string stem(g.elf_name);
             stem.resize(stem.size() - 4);                     // drop ".elf"
-            const std::string cands[] = {stem + "_pb16i_m16.elf", stem + "_pb16i.elf"};
+            const std::string ft = family_tag();
+            const std::string cands[] = {stem + ft + "_m16.elf", stem + ft + ".elf"};
             std::string pelf;
             for (const std::string& c : cands) {
                 for (const std::string& d : m16dirs_like_head(mdir, dir)) {
@@ -1082,6 +1140,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 ctx_head_->KD = g.K;
                 ctx_head_->ND = g.N;
                 ctx_head_->pb16i = true;
+                ctx_head_->t2s = t2s_;
                 ctx_head_->pb16i_planes = 1;   // the K=H design is the arena's one-plane family
                 if (ctx_head_->init_elf(*dev, pelf.c_str(), Q4NX_DESIGN_M_DECODE, g.K, g.N, 1)) {
                     head_pb16i_ = true;

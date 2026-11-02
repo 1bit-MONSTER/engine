@@ -57,11 +57,6 @@
 	url = https://github.com/1bit-MONSTER/lemonade.git
 	branch = main
 	shallow = true
-[submodule "third_party/ds4"]
-	path = third_party/ds4
-	url = https://github.com/1bit-MONSTER/ds4.git
-	branch = 1bit/main
-	shallow = true
 # ggmlc (MIT, monatis/ggmlc), our fork: its `laya` runs the Laya GGUFs (mys/laya-*-GGUF) on HRX0,
 # the router's fast scorer (docs/laya.md). 1bit/main = upstream + our HRX build. -DONEBIT_LAYA_GGML=ON.
 [submodule "third_party/ggmlc"]

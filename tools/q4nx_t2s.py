@@ -21,11 +21,25 @@ and one int16 multiplier per 32-K group.  t2s is the same weights and the same i
 and the `mmul`:
 
     2,176 B per k=256 x n=32 tile   (pb16i: 4,608 B)       27B decode: 6.11 GB/token instead of 12.93
-    [0, 2048)    2-bit codes, 4 per byte, n-major blocks: block (nb, kb) at (nb*16 + kb)*64, and inside a
-                 block byte r*4 + j holds the 4 codes for k = kb*16 + r, n = nb*16 + 4j + {0,1,2,3},
-                 code c at bits 2*c; 0 -> -1, 1 -> 0, 2 -> +1, 3 reserved
+    [0, 2048)    2-bit codes, 4 per byte, n-major blocks: block (nb, kb) at (nb*16 + kb)*64; 0 -> -1,
+                 1 -> 0, 2 -> +1, 3 reserved.  Two byte orders exist inside a block:
+                   v1  byte r*4 + j holds the 4 codes for k = kb*16 + r, n = nb*16 + 4j + {0,1,2,3}
+                   v2  byte b holds, at bits 2*lane:
+                         lane0 -> (k = kb*16 + b/8,     n = nb*16 + 2*(b%8))
+                         lane1 -> (k = kb*16 + b/8,     n = nb*16 + 2*(b%8) + 1)
+                         lane2 -> (k = kb*16 + 8 + b/8, n = nb*16 + 2*(b%8))
+                         lane3 -> (k = kb*16 + 8 + b/8, n = nb*16 + 2*(b%8) + 1)
     [2048, 2176) int16 multipliers, [nb 2][gb 2][16 c]: one per 128-K block per column, i.e. pb16i's own
                  multiplier at the granularity the model actually stores (see "why this is exact")
+
+Why v2 is the one to ship.  The mmul's operand byte for element `e = 16k + c` is `e/2`, so a 64-byte vector of
+codes has to land on the operand's even bytes (`out[2i]`) and the next 64 on its odd bytes (`out[2i+1]`): a
+spread, not a copy.  With v1's order the kernel has to interleave two vectors (`aie::interleave_zip`), which is
+a lane-crossing shuffle and was measured at 11.1-12.6 GB/s against 30-32 GB/s for the plain two-store path on
+this box.  v2's order makes the plain path produce exactly `out[2i]`/`out[2i+1]`: the operand byte `b` needs
+element `2b`, and `2b = 16*(b/8) + 2*(b%8)` is precisely the (k, n) v2 puts there; `64+b` needs `128 + 2b`,
+i.e. k + 8 rows down, which is what lanes 2 and 3 carry.  So v2 + the plain expansion is byte-exact (measured on
+the array 2026-11-02: 3/3 seeds, 0 mismatches, `amdxdna` counter 0) with no shuffle in the core at all.
 
 Why this is exact rather than a requantisation. The engine's pb16i image is built from a model whose scale
 is one fp16 `d` per 128 K per column: `q4nx_pb16i.pack` derives one `ms` per 128-K block and then repeats it
@@ -46,8 +60,16 @@ The gate is byte-exact, not statistical: `expand()` must reproduce the pb16i ima
 for block and the multipliers must be identical, which `tests/q4nx_t2s_test.py` checks on every tile of a
 frozen fixture.  Nothing here runs on the device; the kernel's own copy of the expansion is
 `npu-kernels`, private.
+
+The stream is also derivable from the container alone: `from_t2()` takes a `q4nx_t2` chunk and returns
+the same bytes `from_pb16i_image()` returns for the image that chunk was made from, so a model shipped
+in the t2 form needs no pb16i sidecar to feed the kernel.  The two forms are the same weights in
+different orders (t2 is k-major per 32-row band, this is n-major per 16x16 block) and are never
+interchangeable, which is why the crossing is one function and not a byte copy.
 """
 import numpy as np
+
+import q4nx_t2
 
 from q4nx_pb16i import CODE_BYTES as PB_CODE_BYTES, KC, NW, ROWS as PB_ROWS, TILE as PB_TILE, pack, w_bytes as pb_w_bytes
 
@@ -125,6 +147,37 @@ def from_pb16i_image(img, K, N):
     return np.concatenate([area, ms_area], axis=1)
 
 
+def from_t2(chunk, K, N):
+    """A container's t2 chunk -> the t2s stream bytes, without the pb16i image.
+
+    Re-derives the image with the packer's own code (so the tile order and the int16 multipliers are
+    the packer's, not a second implementation of them) and then streams it; the result is byte-
+    identical to `from_pb16i_image()` on the image the chunk came from.  pb16i geometry applies on
+    top of t2's, i.e. N must be a multiple of 1,024 as well as 32.
+    """
+    codes, bits = q4nx_t2.unpack_bits(chunk, K, N)          # [N][K] and [N][K//128], fp16 bits
+    img, _eref, _mode = pack(codes.T.copy(), bits.T.copy(), K, N)
+    return from_pb16i_image(img.reshape(-1), K, N)
+
+
+def from_pb16i_image_v2(img, K, N):
+    """The same weights in wire format v2: the plain two-store expansion is exact on it (see the module docstring).
+
+    Only the 64 bytes inside each (nb, kb) block change, so this reuses `from_pb16i_image` for every check and for
+    the ms area; the block address and the tile order are identical, which is what keeps the DMA descriptor the same.
+    """
+    v1 = from_pb16i_image(img, K, N)                     # geometry, ternary and multiplier checks all live there
+    codes, _ms = _split(np.asarray(img, dtype=np.uint8))
+    v = (codes + 1).astype(np.uint8)                     # [tile][kb][nb][16 r][16 c] -> 0,1,2
+    b = np.arange(ROWS * 4)                              # the 64 wire bytes of one block
+    k_lo, n0 = b // 8, 2 * (b % 8)
+    wire = ((v[:, :, :, k_lo, n0] << 0) | (v[:, :, :, k_lo, n0 + 1] << 2) |
+            (v[:, :, :, k_lo + 8, n0] << 4) | (v[:, :, :, k_lo + 8, n0 + 1] << 6)).astype(np.uint8)
+    out = np.array(v1, copy=True)
+    out[:, :CODE_BYTES] = wire.transpose(0, 2, 1, 3).reshape(-1, CODE_BYTES)
+    return out
+
+
 def stream(codes, dbits, K, N):
     """(codes int8 [K][N] in {-1,0,1}, d fp16 bits [K/128][N]) -> (stream bytes, e_ref int16[N], mode)."""
     img, e_ref, mode = pack(codes, dbits, K, N)                     # the pb16i image is the reference
@@ -149,6 +202,27 @@ def expand(stream_bytes, K, N):
     out[:, 0::2] = nib[:, :, 0] | (nib[:, :, 1] << 4)
     out[:, 1::2] = nib[:, :, 2] | (nib[:, :, 3] << 4)
     return out.reshape(-1, NB, KB, 2 * BLOCK).transpose(0, 2, 1, 3).reshape(-1, PB_CODE_BYTES)
+
+
+def decode_v2(stream_bytes, K, N):
+    """The inverse of `from_pb16i_image_v2`: -> (codes [tiles][kb][nb][16 r][16 c] int8, ms [tiles][nb][2][16 c])."""
+    t = _tiles(stream_bytes, K, N)
+    blocks = np.ascontiguousarray(t[:, :CODE_BYTES]).reshape(-1, NB, KB, BLOCK)   # [tile][nb][kb][64]
+    q = np.empty(blocks.shape + (4,), dtype=np.uint8)
+    for lane in range(4):
+        q[..., lane] = (blocks >> (2 * lane)) & 3
+    if (q == RESERVED).any():
+        raise ValueError("reserved code in the v2 stream")
+    v = (q.astype(np.int8) - 1).transpose(0, 2, 1, 3, 4)   # [tile][kb][nb][64][lane], the layout `codes` uses
+    b = np.arange(BLOCK)
+    k_lo, n0 = b // 8, 2 * (b % 8)
+    codes = np.empty((blocks.shape[0], KB, NB, ROWS, COLS), dtype=np.int8)
+    codes[:, :, :, k_lo, n0] = v[..., 0]
+    codes[:, :, :, k_lo, n0 + 1] = v[..., 1]
+    codes[:, :, :, k_lo + 8, n0] = v[..., 2]
+    codes[:, :, :, k_lo + 8, n0 + 1] = v[..., 3]
+    ms = np.ascontiguousarray(t[:, CODE_BYTES:]).view("<i2").reshape(-1, NB, 2, COLS)
+    return codes, ms
 
 
 def decode(stream_bytes, K, N):

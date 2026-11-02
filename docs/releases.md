@@ -43,9 +43,9 @@ c19's raw image (what the `.img.zst` decompresses to): **2,395,996,160 B**, sha2
 `3c3c08c28072c534071bf87de141cf85f1f9e2b3d306c236153dcf80b3a4b588` — the value a stick write and its readback are
 verified against.
 
-**HIP kernels only:** this image has no DwarfStar backend (`ONEBIT_DS4=OFF`, see [dwarfstar.md](dwarfstar.md)) — the
-`ds4` route is antirez's CUDA kernels through a HIP shim plus hipBLAS, not our kernels. DeepSeek V4.x, GLM 5.x and
-Qwen3.8-Flash-Next run on **HRX** here, and the catalogue carries no `ds4` recipe.
+**HIP kernels only:** this image has no DwarfStar backend — `--device ds4` was removed (owner 2026-11-01, out of
+the tree 2026-11-02), because that route is antirez's CUDA kernels through a HIP shim plus hipBLAS, not our kernels.
+DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catalogue carries no `ds4` recipe.
 
 | component | pin |
 |---|---|
@@ -56,6 +56,12 @@ Qwen3.8-Flash-Next run on **HRX** here, and the catalogue carries no `ds4` recip
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
 | kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
+
+The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
+`<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —
+`third_party/lemonade` is a `shallow = true` submodule, so a depth-1 clone reports `~1` for the same commit while a
+full clone reports `~1752` (both measured on 2026-11-02; c18 printed `~5`, i.e. built from a deeper clone). The `~N` is
+reproducible from the build tree, not from the release: it can differ between two candidates carrying the same code.
 
 Artifacts of the gated c19 candidate — sizes and sha256 exactly as its own `SHA256SUMS` records them:
 
@@ -125,7 +131,7 @@ Release sha and pins (the submodules this candidate is built from):
 | private NPU runtime | `ce9fa59adf95` |
 | Laya | source `6f0496f797dc`, model `7b928d828b7b` |
 | amdxdna (out-of-tree NPU driver) | `526c608197` |
-| DwarfStar (reference fork only, not shipped since v2026.44) / tokenizers | `5b013dc1bb` / `3012770722` |
+| tokenizers | `3012770722` |
 
 | artifact | status |
 |---|---|
@@ -214,7 +220,7 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 
 | file | what |
 |---|---|
-| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the shipped build since v2026.44 (HIP kernels only, owner decision 2026-11-01; [dwarfstar.md](dwarfstar.md)); no Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
+| `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the tree since 2026-11-02 (HIP kernels only, owner decision 2026-11-01); no Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
 | `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine as a bootable USB image ([os/README.md](../os/README.md)) |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
@@ -384,8 +390,8 @@ rehearsal found these only after the build) and stops with a message naming what
 
 - **bumps, build:** the pinned HRX toolchain, which `preflight` itself fetches with
   `scripts/fetch-rocm-sdk.sh` at the pin in `config/hrx-toolchain.config` (`-DONEBIT_HRX_TOOLCHAIN=<dir>` in
-  `WEEKLY_CMAKE_ARGS` uses another, e.g. TheRock in `/opt/rocm-therock`); `hipcc` only for the optional DwarfStar build
-  (`ONEBIT_DS4=ON`, off since v2026.44), from that toolchain or `/opt/rocm`, or `ROCM_PATH`.
+  `WEEKLY_CMAKE_ARGS` uses another, e.g. TheRock in `/opt/rocm-therock`); `hipcc` from that toolchain or `/opt/rocm`,
+  or `ROCM_PATH`. (The optional DwarfStar build that also wanted it is gone since 2026-11-02.)
 - **package:** `patchelf` (`scripts/package-linux.sh`); `node` and `npm` for Lemonade's web app
   (`LEMONADE_WEB_APP=1 scripts/build-lemonade.sh`; its `npm ci` needs the network); a readable kernel image for 1bit OS,
   `/boot/vmlinuz-$(uname -r)` or `VMLINUZ=<copy>` (Ubuntu's `/boot/vmlinuz-*` is root-only).
@@ -401,7 +407,6 @@ rehearsal found these only after the build) and stops with a message naming what
 |---|---|
 | `bump-lemonade/*` | Lemonade's LLM suite through the onebit recipe on HRX ([lemonade.md](lemonade.md)) |
 | `bump-laya/*` | `tests/laya_route_e2e.sh` on the pinned checkpoint |
-| `bump-ds4/*` | DwarfStar's routed-MoE test (`DS4_TEST=1 scripts/build-ds4.sh`) — kept for the reference fork; the backend is not shipped since v2026.44 |
 | `bump-hrx/*` | every `hrx` row of `registry/check_models.tsv` through `tools/registry_check.py` (serve end to end per architecture, ZAYA1 and the Qwen MoE models included); any FAIL holds the bump |
 | `bump-xdna/*`, `bump-tokenizers/*` | covered by build + ctest (serve end to end on each device); the xdna-driver pin is the `amdxdna` kernel driver, which the release does not build: check it on Strix Halo with the module loaded ([npu.md](npu.md), "The XDNA driver") |
 

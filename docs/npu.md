@@ -58,6 +58,7 @@ byte layouts).
 | 5120 B | q4_1: bf16 scale and zero per 32 columns of a row | `code * scale + zero` | Qwen3, Llama, Gemma, Phi models |
 | 4736 B | Q4_K: u8 scale and min per 32 columns, bf16 `S`, `M` per row | `S * scale * code + M * min` | Qwen3.5-4B projections |
 | 8704 B | Q8: bf16 scale per 32 columns, int8 codes | `d * code` | Qwen3.5-4B `lm_head` and embedding |
+| 2176 B | **t2**: 2-bit ternary codes, one fp16 scale per 128 columns of a row | `code * scale` | ternary models (Bonsai-2, PTQ1_0/TQ1_0 sources) |
 
 **Q8 has two code layouts under the same chunk size.** Qwen3.5-4B's lm_head (tied to the
 embedding) stores code (row r, column k) at byte `k*32 + r`. Qwen3.6-35B-A3B's Q8 tensors
@@ -67,11 +68,59 @@ apart. Decoding tile (0, 0) of each lm_head and comparing with a GGUF of the sam
 gives correlation 0.9998 with the right layout and about 0.01 with the other. `npu/q4nx`
 decodes the first layout.
 
-`npu/q4nx.h` decodes all three, and repacks Q4_K into q4_1 (exact apart from rounding
+`npu/q4nx.h` decodes all four, and repacks Q4_K into q4_1 (exact apart from rounding
 `S * scale` and `M * min` to bf16), so code that reads q4_1 runs Q4_K weights unchanged. Q8 does
-not fit q4_1. `tests/npu_q4nx_test.cpp` checks the decoders bit for bit against reference decoders
-on real Qwen3.5-4B and Qwen3-0.6B tiles (committed in `tests/golden/q4nx`), and the repack against
-its rounding bound.
+not fit q4_1, and neither does t2 (per-128 fp16 scale against q4_1's per-32 bf16 one): a t2 tensor
+is expanded on the target, never repacked. `tests/npu_q4nx_test.cpp` checks the decoders bit for bit
+against reference decoders on real Qwen3.5-4B and Qwen3-0.6B tiles (committed in
+`tests/golden/q4nx`), and the repack against its rounding bound; t2 has its own contract test
+(`tests/npu_t2_layout_test.sh`) and oracle (`tests/q4nx_t2_test.py`).
+
+#### The t2 chunk kind
+
+A ternary model stores every weight as `code * d` with `code` in {-1, 0, +1} and one `d` per 128
+columns of a row. t2 is that, in the same 32x256 tile grid as every other chunk, at **2.125
+bits/weight** — the stream a 27B ternary model is meant to be read at, instead of the 4.5 b/w
+`pb16i` image (int4 codes + one int16 magnitude per 32 K) that the exact path streams today.
+
+```
+t2 tile, 2176 bytes, 32 rows (N) x 256 columns (K) of one tensor
+  [0, 2048)     2-bit codes:  byte r*64 + c/4, code c%4 at bits 2*(c%4)
+                value 0 = -1, 1 = 0, 2 = +1, 3 = reserved (no converter emits it)
+  [2048, 2176)  IEEE fp16 scales: half at 2048 + r*4 + 2*g,  g = c/128
+                                                        w[r][c] = code * scale
+```
+
+Tile order is the container's everywhere: row-major over the `[N/32][K/256]` grid, so one
+32-column block's whole K extent is contiguous. Geometry: `N % 32 == 0`, `K % 256 == 0`.
+
+**The scale is fp16, not bf16, and that is load bearing.** Every source format already stores this
+scale as fp16 — PTQ1_0's, TQ1_0's and TQ2_0's `d` are `ggml_half`, and `pb16i`'s `ms * 2^e_ref` is an
+int16 with a per-column exponent — while bf16 has 8 significand bits against fp16's 11. Measured on
+the 431 ternary Bonsai-2 images (416 layers + the 15 MTP head tensors, 25.66 G weights):
+**174,982,781 of 200,499,200 scales (87.27 %) are not bf16-representable**, worst relative error
+3.89e-3; fp16 is exact on all 200,499,200. fp16 and bf16 are both two bytes, so asking for bf16 buys
+nothing and costs the bit-exact gate. A target whose arithmetic wants bf16 converts at load, in the
+kernel, and owns that rounding — the chunk keeps the exact value.
+
+A reserved code (3) decodes as 0, so a corrupt byte cannot become a weight no converter wrote;
+`q4nx::t2_reserved()` counts them, and that is what a loader or a test refuses on.
+
+| what | measured |
+|---|---|
+| ternary codes in the 431 images | all `{-1, 0, +1}`, no reserved pattern |
+| one scale per 128 K is enough (the four per-32 magnitudes agree) | 100 % of blocks |
+| fp16 scale exact vs the pb16i floats | 200,499,200 / 200,499,200 |
+| 27B size | pb16i 14.44 GB -> **t2 6.82 GB** (416 layers 6.46 GB, 15 head tensors 0.36 GB) |
+| 2.125 b/w | `2176*8/8192` exactly |
+
+The oracle is bit-exact, not approximate: `tools/q4nx_t2.py from_pb16i` refuses anything it cannot
+represent exactly (a non-ternary code, magnitudes that differ inside a 128-K block, a scale that is
+not fp16-exact), and `tests/q4nx_t2_test.py` re-decodes the result and compares against the pb16i
+dequantisation of the same image, float for float, on all 431 images when they are on the machine.
+Converters: `from_pb16i` (the engine's integer-exact image), `from_ptq1_0` and `from_tq1_0` (both
+ternary with an fp16 scale, lossless). `from_tq2_0` is refused unless asked, because TQ2_0's code 3
+means **+2** — it is not a ternary format, and clamping it to +1 changes weights.
 
 ### From a GGUF
 

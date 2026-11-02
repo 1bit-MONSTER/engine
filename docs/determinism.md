@@ -62,6 +62,7 @@ log-probabilities for think tokens.
 | `hrx` | bitwise-identical (5 repeats) | 0 | 122 | yes |
 | `npu` (forward path) | bitwise-identical (3 repeats × 16 tokens) | 0 | 128 | yes |
 | `npu`, thinking on | bitwise-identical (2 repeats × 24 tokens) | 0 | 192 | yes |
+| `npu`, thinking on, 64 tokens | bitwise-identical (2 repeats × 64 tokens) | 0 | 512 | yes |
 
 All three routes are bitwise repeatable, at both thinking settings. That is the only property all three
 share.
@@ -155,8 +156,13 @@ there is no equivalent env switch.
 
 The NPU route is **bitwise repeatable**: 8 prompts × 24 tokens × 2 repeats (192 tokens), `max |Δlogp| = 0`,
 0 non-float32 values, text stable — as well as the earlier 8 × 16 × 3 (128 tokens) run on the same build.
-The budget is 24 tokens rather than 64 because the per-op forward path measures ~0.5 s/token here
-(11.9 s for a 24-token reply), so the 8 × 5 × 64 matrix the other routes ran is not practical on it.
+It stays bitwise repeatable at the other routes' budget too: 8 prompts × **64** tokens × 2 repeats
+(512 tokens), `max |Δlogp| = 0`, 0 non-float32 values, text stable.
+
+The extra cost is time, not correctness. The per-op forward path measures ~0.5 s/token here, so the same
+8 × 64 × 2 matrix took **586 s of device time in one NPU claim** (against 34 s for `cpu` + `hrx` under one
+GPU claim). Five repeats — what the `cpu` and `hrx` columns use — would be ~25 min of the array, so the NPU
+column is 2 repeats at every budget.
 
 It **can** join the agreement comparison — the earlier version of this page said it could not — with two
 adjustments, both of which are flags on the tool rather than changes to the engine:
@@ -177,10 +183,24 @@ is populated. And the log-probabilities have to come from a build whose NPU path
 entries for **content** tokens only, so a thinking reply's `logprobs.content` is empty there — measure
 with a build before it, or with `#832` fixed.
 
-Qwen3-0.6B, 8 prompts × 24 tokens, greedy, thinking **on**, 2 repeats (NPU) / 5 repeats (cpu, hrx).
+Qwen3-0.6B, 8 prompts, greedy, thinking **on**, 2 repeats (NPU) / 5 repeats (cpu, hrx).
 One control first: the `cpu` route was measured in **two separate server runs**, and the two agree
-**192/192 positions, exact bits, `max |Δlogp| = 0`** — so comparing routes across runs (necessary here:
-the GPU and NPU claims are held separately) does not manufacture or hide a difference.
+**exactly, over both budgets** — 192/192 positions at 24 tokens and **512/512 at 64 tokens**, exact bits,
+`max |Δlogp| = 0` — so comparing routes across runs (necessary here: the GPU and NPU claims are held
+separately) does not manufacture or hide a difference.
+
+**At 64 tokens, the same budget the `cpu`/`hrx` table above uses:**
+
+| pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | prompts diverging |
+|---|---|---|---|---|---|---|
+| `cpu` vs `hrx` | 0.766 | 0.766 | 0.031 | 6.31e-01 | 4.62e-02 | 7 of 8 |
+| `cpu` vs `npu` | 0.264 | 0.264 | 0.000 | 6.71e-01 | 5.51e-02 | 8 of 8 |
+| `hrx` vs `npu` | 0.266 | 0.266 | 0.000 | 6.55e-01 | 5.19e-02 | 8 of 8 |
+
+(392 of the 512 positions carry the same token on `cpu`/`hrx`, 135 and 136 on the NPU pairs; deltas are
+over the common positions only.)
+
+**At 24 tokens**, for the shape of the same three pairs over a shorter stream:
 
 | pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | prompts diverging |
 |---|---|---|---|---|---|---|
@@ -188,12 +208,15 @@ the GPU and NPU claims are held separately) does not manufacture or hide a diffe
 | `cpu` vs `npu` | 0.641 | 0.641 | 0.000 | 6.71e-01 | 4.66e-02 | 7 of 8 |
 | `hrx` vs `npu` | 0.641 | 0.641 | 0.000 | 6.55e-01 | 4.21e-02 | 7 of 8 |
 
-(123 of the 192 positions carry the same token text on the NPU pairs, 184 on `cpu`/`hrx`; deltas are over
-the common positions only.)
+(123 of the 192 positions carry the same token text on the NPU pairs, 184 on `cpu`/`hrx`.)
 
 **The NPU is roughly equidistant from both — and that distance is not arithmetic-only.** It matches `cpu`
-and `hrx` at the same rate and with the same deltas (0.641, 4.2-4.7e-02 mean), and it is 1.6× further from
-`cpu` than `hrx` is, while sharing no exact bits with either (0.000 vs `cpu`/`hrx`'s 0.060). A Q4NX weight
+and `hrx` at the same rate, with the same deltas (0.641 and 4.2-4.7e-02 mean at 24 tokens; 0.26 and
+5.2-5.5e-02 at 64), and it shares **no exact bits with either** (0.000, against 0.031-0.060 for
+`cpu`/`hrx`). Its *distance* from `cpu` relative to `hrx`'s narrows as the stream lengthens — **1.6× at 24
+tokens, 1.2× at 64** — because a longer stream diverges more, which raises the `cpu`/`hrx` delta as well as
+the NPU's; the ordering (NPU furthest, `cpu`/`hrx` closest) is stable at both budgets and the exact-bit
+split is not budget-dependent. A Q4NX weight
 is a q4_1 tile (bf16 scale and zero per 32 columns) requantised from Q4_K, so the NPU number contains a
 **weight change plus** kernel arithmetic and is *not* the same quantity as `cpu` vs `hrx`. Quote it as
 "NPU pack vs GGUF" or not at all.
@@ -251,17 +274,17 @@ python3 tools/logprob_agree.py \
     --repeat 5 --max-tokens 64 --json agree.json
 ```
 
-With the NPU in the comparison, the same command with `--thinking on --match-by text`, and a 24-token
-budget (`--repeat 2` is what the NPU's ~0.5 s/token leaves room for): the forward path needs no
-`enable_thinking` and reports no token ids, so all routes run thinking on and tokens are matched by
-text. If the GPU and NPU claims cannot be held at once, run the pairs separately and compare the two
-reports with the tool's own comparator:
+With the NPU in the comparison, the same command with `--thinking on --match-by text`: the forward path
+needs no `enable_thinking` and reports no token ids, so all routes run thinking on and tokens are matched
+by text. The NPU tries 2 repeats at the same 64-token budget — ~10 min in one claim, which is what its
+~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
+compare the two reports with the tool's own comparator:
 
 ```sh
 python3 tools/logprob_agree.py --route cpu=… --route npu=… \
-    --thinking on --match-by text --repeat 2 --max-tokens 24 --json npu.json
+    --thinking on --match-by text --repeat 2 --max-tokens 64 --json npu.json
 python3 tools/logprob_agree.py --route cpu=… --route hrx=… \
-    --thinking on --repeat 5 --max-tokens 24 --json hrx.json
+    --thinking on --repeat 5 --max-tokens 64 --json hrx.json
 python3 - <<'PY'   # agreement across the two reports, by text
 import importlib.util, json
 s = importlib.util.spec_from_file_location("t", "tools/logprob_agree.py")
@@ -305,8 +328,10 @@ how each arm above was run.
   moves them; re-run rather than extrapolate.
 - The concurrency numbers were measured on a 0.6B model on one host; they show the effect exists
   and is not small, not how large it gets for other shapes.
-- The NPU agreement row is 24 tokens, 2 repeats, thinking on, matched by text, over a *requantised*
-  pack: it is shorter than the other routes' 64-token run and it is not an arithmetic-only distance.
-  It also depends on the build — a binary at `44d849d` or later masks the think tokens, so on that
-  build the NPU row cannot be reproduced until [#832](https://github.com/1bit-MONSTER/engine/issues/832)
-  is fixed.
+- The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
+  *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
+  budget difference, so all three columns can be read at one token count.
+- The NPU rows depend on the build. A binary at `44d849d` or later masks the think tokens, so on that
+  build the NPU row cannot be reproduced until
+  [#832](https://github.com/1bit-MONSTER/engine/issues/832) is fixed; the numbers above come from a
+  `main@1b3def2` build, which still emits log-probabilities for the think tokens.

@@ -81,6 +81,7 @@ public:
         cache_.reset();                       // the chain starts from the accepted token each iteration
         pos_ = pos;
         int tok = last_token;
+        (void)0;
         for (int i = 0; i < k; i++) {
             base_.embed_into(tok, emb);
             if (!head_step(w_, h.data(), emb.data(), pos_, cache_, next,
@@ -94,7 +95,7 @@ public:
             const int t = argmax_p(logits, conf ? &p : nullptr);
             out.push_back(t);
             if (conf) conf->push_back(p);
-            if (p < tau_) break;              // stop the chain here; the loop still verifies this draft
+            if (tau_ > 0.0f && p < tau_) break;   // stop the chain here; the loop still verifies this draft
             tok = t;
             h = next;
             pos_++;
@@ -103,6 +104,7 @@ public:
     }
 
     void set_lm_head(bool on) { use_lm_head_ = on; }
+    void set_tau(float t) { tau_ = t; }
 
     double head_ms = 0;
 
@@ -121,11 +123,125 @@ private:
 
 }  // namespace
 
+// --offline: measure the DRAFTER alone, without needing a rollback for the base's recurrent state.
+// Plain greedy decode records every position's hidden state and the token the model chose; then, offline, the
+// head chains k drafts from each position and they are compared with the tokens the model actually produced.
+// This is the same quantity the published numbers report (acceptance per draft depth, hit rate), and it is the
+// only honest protocol available while the engine has no GDN deferral -- with a snapshot-based rollback refused
+// by restore_state() (fixed-size conv/rec arrays), a live verify loop would drift the recurrence.
+// --offline: measure the DRAFTER alone, without needing a rollback for the base's recurrent state.
+//
+// Plain greedy decode records every position's hidden state and the token the model chose.  The head is then run
+// over the SAME stream in order -- its own KV cache primed position by position, exactly as the MTP layer is
+// trained: at position t it attends over the head's own states 0..t, not over itself alone.  From each position
+// the chain is continued k times and compared with the tokens the base actually produced.  That reports the
+// published quantity (acceptance per draft depth, hit rate) and needs no base-state surgery at all -- which is
+// what makes it the honest protocol while the engine has no GDN deferral.
+static int argmax_n(const std::vector<float>& v) {
+    int best = 0;
+    for (size_t i = 1; i < v.size(); i++) if (v[i] > v[best]) best = (int)i;
+    return best;
+}
+
+int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, const Weights& w, int prompts,
+                int tokens, int k, int prompt_base, bool residual) {
+    int d_hit[16] = {0}, d_tot[16] = {0};
+    double cos_sum = 0, rel_sum = 0;
+    int cos_n = 0;
+    std::vector<int> all_tokens;        // the token stream: prompt + emitted
+    std::vector<std::vector<float>> hidden;   // hidden[i] = base hidden after all_tokens[i]
+    for (int p = 0; p < prompts; p++) {
+        const int pi = prompt_base + p;
+        std::vector<int> ids;
+        for (int i = 0; i < 8; i++) ids.push_back((pi * 977 + i * 131 + 17) % (base.vocab() - 1) + 1);
+        fwd.reset();
+        std::vector<float> logits;
+        std::vector<int> emitted;
+        std::vector<std::vector<float>> hid;
+        for (size_t i = 0; i < ids.size(); i++) {
+            if (!fwd.step(ids[i], (int)i, logits)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+            hid.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+        }
+        int pos = (int)ids.size();
+        for (int t = 0; t < tokens; t++) {
+            int best = 0;
+            for (size_t i = 1; i < logits.size(); i++) if (logits[i] > logits[best]) best = (int)i;
+            emitted.push_back(best);
+            if (!fwd.step(best, pos++, logits)) { std::fprintf(stderr, "step failed\n"); return 1; }
+            hid.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+        }
+        std::vector<int> stream = ids;
+        stream.insert(stream.end(), emitted.begin(), emitted.end());
+        all_tokens = stream;
+        hidden = hid;
+
+        auto lm = [&base](const std::vector<float>& x, std::vector<float>& lg) { return base.lm_head(x, lg); };
+        KvCache hc;                       // the head's own stream, primed position by position
+        std::vector<float> emb, next, lg;
+        std::vector<KvCache> cache_at(hidden.size());
+        for (size_t i = 0; i < hidden.size(); i++) {
+            base.embed_into(all_tokens[i], emb);
+            if (!head_step(w, hidden[i].data(), emb.data(), (int)i, hc, next,
+                           (i + 1 < hidden.size()) ? std::function<bool(const std::vector<float>&,
+                                                                        std::vector<float>&)>(lm)
+                                                   : nullptr,
+                           lg)) {
+                std::fprintf(stderr, "head step failed at %zu\n", i);
+                return 1;
+            }
+            cache_at[i] = hc;
+            if (i + 1 < hidden.size() && !lg.empty()) {
+                // diagnostic: the head's hidden should approximate the base's NEXT hidden
+                double dot = 0, na = 0, nb = 0;
+                for (int q = 0; q < kH; q++) {
+                    dot += (double)next[(size_t)q] * hidden[i + 1][(size_t)q];
+                    na += (double)next[(size_t)q] * next[(size_t)q];
+                    nb += (double)hidden[i + 1][(size_t)q] * hidden[i + 1][(size_t)q];
+                }
+                cos_sum += dot / std::sqrt(na * nb + 1e-30);
+                cos_n++;
+            }
+        }
+        // from each position, chain k drafts off the primed cache and compare with the real continuation
+        for (size_t i = 0; i + 1 < hidden.size(); i++) {
+            KvCache c = cache_at[i];
+            std::vector<float> h = hidden[i], e2, nx;
+            int tok = all_tokens[i];
+            int pos = (int)i + 1;
+            for (int j = 0; j < k; j++) {
+                if (i + j + 1 >= hidden.size()) break;
+                base.embed_into(tok, e2);
+                if (!head_step(w, h.data(), e2.data(), pos, c, nx, lm, lg)) break;
+                int d = argmax_n(lg);
+                d_tot[j]++;
+                if (d == all_tokens[i + j + 1]) d_hit[j]++;
+                tok = d;
+                h = nx;
+                pos++;
+            }
+        }
+        std::printf("prompt %d: %zu tokens, %zu positions primed\n", p, hidden.size(), hidden.size());
+    }
+    double expected = 1.0;
+    std::printf("\n== offline drafter acceptance, %d prompts x %d tokens, k=%d, hidden=%s\n", prompts, tokens, k,
+                residual ? "residual" : "post-norm");
+    std::printf("  [diag] cos(head_hidden(t), base_hidden(t+1)) = %.4f over %d positions\n",
+                cos_n ? cos_sum / cos_n : 0.0, cos_n);
+    for (int j = 0; j < k; j++) {
+        const double r = d_tot[j] ? (double)d_hit[j] / d_tot[j] : 0.0;
+        std::printf("  draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, d_hit[j], d_tot[j]);
+        expected += r;
+    }
+    std::printf("  hit rate %d/%d = %.3f; expected tokens per pass (chain) %.2f\n", d_hit[0], d_tot[0],
+                d_tot[0] ? (double)d_hit[0] / d_tot[0] : 0.0, expected);
+    return 0;
+}
+
 int main(int argc, char** argv) {
     std::string model_dir, head_exact, head_q4k;
     int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
-    bool residual = false, dry = false, selftest = false;
+    bool residual = false, dry = false, selftest = false, offline = false;
     std::string gold;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -142,6 +258,8 @@ int main(int argc, char** argv) {
         else if (a == "--dry-head") dry = true;
         else if (a == "--selftest-head") selftest = true;
         else if (a == "--gold") gold = nexts();
+        else if (a == "--offline") offline = true;
+        else if (a == "--fc-hidden-first") g_fc_hidden_first = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
     // --selftest-head: no device.  Runs one head step on a frozen input and compares the hidden output with
@@ -211,6 +329,12 @@ int main(int argc, char** argv) {
     drafter.set_lm_head(!dry);
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
+
+    if (offline) {
+        drafter.set_tau(tau);      // tau=0 measures every depth unconditionally, which is what the offline
+                                   // protocol reports (the chain gate is a speed choice, not a quality one)
+        return run_offline(fwd, base, drafter, w, prompts, tokens, k, prompt_base, residual);
+    }
 
     // Prompts are token ids: acceptance does not depend on the text, and this keeps the run reproducible
     // without dragging the tokenizer into a measurement harness.

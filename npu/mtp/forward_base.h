@@ -26,6 +26,7 @@
 #include "mtp/mtp_head.h"
 #include "q4nx_forward.h"
 
+#include <cstdio>
 #include <memory>
 
 namespace onebit::npu::mtp {
@@ -51,11 +52,18 @@ public:
     }
 
     bool commit_verify(int accepted) override {
-        if (accepted < 0 || accepted > pending_) return false;
+        if (accepted < 0 || accepted > pending_) {
+            std::fprintf(stderr, "[commit] refused: accepted %d, pending %d\n", accepted, pending_);
+            return false;
+        }
         // Restore the state as it was before the verify batch, then replay the accepted rows so the
         // recurrence advances exactly as far as they did (attention alone would need nothing).
-        if (!snap_) return false;
-        if (!fwd_.restore_state(*snap_, snap_pos_)) return false;
+        if (!snap_) { std::fprintf(stderr, "[commit] refused: no snapshot\n"); return false; }
+        if (!fwd_.restore_state(*snap_, snap_pos_)) {
+            std::fprintf(stderr, "[commit] restore_state(%d of %d) refused: %s\n", snap_pos_, snap_->tokens,
+                         fwd_.last_error());
+            return false;
+        }
         for (int i = 0; i < accepted; i++) {
             std::vector<float> lg;
             if (!fwd_.step(last_tokens_[(size_t)i], snap_pos_ + i, lg)) return false;

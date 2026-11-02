@@ -53,6 +53,10 @@ struct Matrix {
     void matvec(const float* a, float* y) const;
 };
 
+// Which block of the fc input comes first.  The container's descriptor says "embedding + hidden
+// concatenated"; which half is which is settled by measurement (acceptance), never by assumption.
+extern bool g_fc_hidden_first;
+
 struct Weights {
     Matrix fc, q, k, v, o, gate, up, down;
     std::vector<float> pre_fc_emb, pre_fc_hid, ln_in, ln_post, norm, q_norm, k_norm;  // BF16 -> float

@@ -4152,6 +4152,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     }
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
+    last_residual_ = x;                        // one norm earlier, for a drafter that wants the residual
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
     last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position
     if (ph) { g_ph.ffnorm = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }

@@ -22,6 +22,9 @@
 #include <sstream>
 
 namespace onebit::npu::mtp {
+
+bool g_fc_hidden_first = false;
+
 namespace {
 
 uint16_t rd16(const uint8_t* p) { return (uint16_t)(p[0] | (p[1] << 8)); }
@@ -198,10 +201,14 @@ bool head_step(const Weights& w, const float* hidden, const float* tok_emb, int 
                std::vector<float>& logits_out) {
     // input fusion: [embedding block | hidden block], each RMS-normed by its own pre_fc_norm
     std::vector<float> u((size_t)2 * kH);
-    std::memcpy(u.data(), tok_emb, sizeof(float) * kH);
-    std::memcpy(u.data() + kH, hidden, sizeof(float) * kH);
-    rms_norm_inplace(u.data(), kH, w.pre_fc_emb.data());
-    rms_norm_inplace(u.data() + kH, kH, w.pre_fc_hid.data());
+    const float* first = g_fc_hidden_first ? hidden : tok_emb;
+    const float* second = g_fc_hidden_first ? tok_emb : hidden;
+    const float* w_first = g_fc_hidden_first ? w.pre_fc_hid.data() : w.pre_fc_emb.data();
+    const float* w_second = g_fc_hidden_first ? w.pre_fc_emb.data() : w.pre_fc_hid.data();
+    std::memcpy(u.data(), first, sizeof(float) * kH);
+    std::memcpy(u.data() + kH, second, sizeof(float) * kH);
+    rms_norm_inplace(u.data(), kH, w_first);
+    rms_norm_inplace(u.data() + kH, kH, w_second);
     std::vector<float> y((size_t)kH);
     w.fc.matvec(u.data(), y.data());
 

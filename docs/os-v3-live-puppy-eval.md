@@ -428,9 +428,38 @@ cannot see either: G3 was green on both the unsigned kernel and this.
 | G3 | `uname -r` is our kernel and **that kernel image is signed**, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | **green in the artifact** since the signing fix: `/vmlinuz` verifies against the enrolled MOK, zdrv carries `usr/lib/modules/<kver>` with 3780 modules, both OOT modules MOK-signed with the right vermagic, `amdgpu`/`amdnpu` firmware present. The board half (devices binding) is still U5's |
 | G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | **green in the VM**: the disk image boots with OVMF secboot + this machine's certificate in `db`, GRUB accepts the signed kernel, and the guest reports `Secure boot enabled` with our certificate loaded into the integrity keyring. The board's version of this row is what failed on 2 Nov and is now unblocked, not yet re-run |
 | G5 | `lemond` + `1bit serve` run unchanged from the c18 tarball | **blocked by glibc on 24.04** (measured 2.43 vs 2.39); needs the resolute base |
-| G6 | `1bit-release-check` green as far as a VM allows | not run (needs G2+G5) |
+| G6 | `1bit-release-check` green as far as a VM allows | **green in the VM (cycle 12)**: the tool now ships in the appliance (`/usr/local/bin/1bit-release-check`, `/bin/1bit-release-check`) with `tools/seal_manifest.py`, the release **public** seal key and `etc/1bit/onebit-models.txt`, so `sealed`/`sealed-sig` run instead of skipping: `RESULT: PASS (19 checks, no failures)` with only the GPU/NPU and `sha256sums` rows SKIPping. The board's version of this row is the one that must be 0 FAIL / 0 SKIP (U4) |
 | G7 | a save layer persists across a reboot (frugal install on a qcow2, then reboot) | not run |
 | G8 | image size, boot time, idle RAM, against the c18 initramfs | size measured (ISO 1.32 GB, rootfs 1.5 GB, frugal payload 1.27 GB of SFS); boot time and RAM pending G2 |
+
+## Cycle 12 (2026-11-02 18–19h): the board's five FAILs, closed and measured
+
+The cycle-10 stick booted on the Max+ 395 and `puppy-check.sh` came back 20 PASS / 5 FAIL. Cycle 12 is
+cycle 11 plus one change per FAIL, and one row in the evaluation is now a measurement rather than a plan:
+
+* **U1** — `os/v3/puppy/shell-login.sh` makes root, `spot` and every uid 1000–65533 log in to `/bin/bash`
+  (service accounts keep `nologin`/`false`; the first version gave `daemon` and `nobody` a login shell, which
+  is not what the row means). `build.sh` asserts `usr/bin/bash` in the packed image.
+* **U3** — `/usr/local/bin/lemonade` → `/opt/1bit-package/bin/lemonade`; `u3-service` was a false FAIL in
+  the board's copy of the check (it looked for the `lemond-onebit` launcher, not `lemond`).
+* **U4** — `1bit-release-check` ships, with the layout it needs: it *finds* the Lemonade package
+  (`/opt/lemonade` on os/mini, `/opt/1bit-package` here), prefers a **downloaded** model for the chat rows,
+  never lets an NPU entry answer `chat-hrx`, and looks for the licence files where this package keeps them.
+  The sealed NPU sets are copied onto `/data/npu/kernels` at boot and their manifests verify against the
+  release public key, so `sealed-sig` runs.
+* **U6** — `1bit-install` ships (and `sfdisk`, which the built rootfs did not have: the 26.04 `fdisk`
+  package carries it and the file needed a spec row of its own).
+* **Item 6** — the shipped catalogue carries **23 HRX + 4 NPU** onebit entries; `/v1/models` lists
+  **downloaded** models only (`show_all=false`), which is why the board saw one. The image now ships an HRX
+  GGUF as well as the NPU set, and a `.q4nx` directory is registered under the catalogue's own
+  `…-NPU-1bit` id instead of the HRX id it used to wear.
+* **Item 7** — headless is the default grub entry (`pfix=copy,nox`): no X, and tty1 is a login prompt from
+  Puppy's own `plogin` → `getty -n -l /bin/autologin`. The desktop is entry 1.
+
+On the artifact (`~/wt/puppy-out-c12/1bit-os-puppy.img`, sha256 `5d30b75f…`, 9,128,902,656 B): G2 green,
+G3 green with `--cert --require-mok`, G6 green in the VM, and `vm-check.sh` **23 PASS / 0 FAIL** under
+Secure Boot — including the two rows this cycle added to the appliance itself (`U1 login shell`,
+`U2 headless`), the CLI, the release check and the installer.
 
 ## Recommendation
 

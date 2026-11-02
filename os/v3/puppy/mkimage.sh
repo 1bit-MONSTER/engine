@@ -46,8 +46,14 @@ mkdir -p "$2"; out=$(cd "$2" && pwd)
 data_mb=${3:-8192}
 esp_mb=${ESP_MB:-512}
 
-iso=$(ls "$src"/*.iso 2> /dev/null | head -1)
-[ -n "$iso" ] || { echo "$prog: no ISO in $src (run build.sh first)" >&2; exit 1; }
+# <puppy-out-dir> is what build.sh wrote, but a build whose ISO wrapper failed still has everything the
+# artifact needs in its sandbox3/build, so take either: an ISO to pull vmlinuz and initrd out of, or those
+# two files directly. The appliance ships the disk image; the ISO is only a source of those two files.
+iso=$(ls "$src"/*.iso 2> /dev/null | head -1 || true)   # ls exits 2 with no match, and pipefail would end the script
+if [ -z "$iso" ]; then
+    [ -s "$src/vmlinuz" ] && [ -s "$src/initrd.gz" ] || {
+        echo "$prog: $src has neither an ISO nor vmlinuz + initrd.gz (run build.sh first)" >&2; exit 1; }
+fi
 for f in puppy zdrv fdrv bdrv; do
     ls "$src"/${f}_*.sfs > /dev/null 2>&1 || { echo "$prog: no ${f}_*.sfs in $src" >&2; exit 1; }
 done
@@ -64,10 +70,17 @@ grub=${GRUB:-/usr/lib/grub/x86_64-efi-signed/grubx64.efi.signed}
 [ -f "$grub" ] || { echo "$prog: no signed grub (set GRUB=)" >&2; exit 1; }
 
 work=$out/.mkimage; rm -rf "$work"; mkdir -p "$work"
-echo "== kernel and initrd out of $(basename "$iso")"
-xorriso -osirrox on -indev "$iso" -extract /vmlinuz "$work/vmlinuz" -extract /initrd.gz "$work/initrd.gz" \
-    > /dev/null 2>&1
-[ -s "$work/vmlinuz" ] || { echo "$prog: cannot extract /vmlinuz from $iso" >&2; exit 1; }
+if [ -n "$iso" ]; then
+    echo "== kernel and initrd out of $(basename "$iso")"
+    xorriso -osirrox on -indev "$iso" -extract /vmlinuz "$work/vmlinuz" -extract /initrd.gz "$work/initrd.gz" \
+        > /dev/null 2>&1
+    [ -s "$work/vmlinuz" ] || { echo "$prog: cannot extract /vmlinuz from $iso" >&2; exit 1; }
+else
+    echo "== kernel and initrd taken from the build tree itself"
+    cp -L "$src/vmlinuz" "$work/vmlinuz"
+    cp -L "$src/initrd.gz" "$work/initrd.gz"
+fi
+[ -s "$work/initrd.gz" ] || { echo "$prog: the initrd is empty - the build had no cpio" >&2; exit 1; }
 kver=$(file -b "$work/vmlinuz" | sed -n 's/.*version \([^ ]*\).*/\1/p')
 
 echo "== ESP ($esp_mb MB): shim + grub + grub.cfg"

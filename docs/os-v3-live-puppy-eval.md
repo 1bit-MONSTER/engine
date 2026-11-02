@@ -461,6 +461,21 @@ G3 green with `--cert --require-mok`, G6 green in the VM, and `vm-check.sh` **23
 Secure Boot — including the two rows this cycle added to the appliance itself (`U1 login shell`,
 `U2 headless`), the CLI, the release check and the installer.
 
+### Cycle 13: the headless default reaches tty1 unattended
+
+Cycle 12's default entry was headless, but the console never got to the prompt: `rc.country` asks its three
+questions there on every `pfix=nox` boot (`init` creates `/tmp/bootcnt.txt`, which sets `ASKKMAP` and
+`ASKLANG`; a missing `/etc/keymap` asks for the layout; a missing `en_US.utf8` locale sets `ASKCLOCK=yes`,
+and `timezone-set cli` then asks for the timezone on `/dev/console`). Cycle 13 turns the two flags off in
+`rc.country` (the build refuses a packed image that still asks) and ships `/etc/keymap` = `us` and
+`/etc/localtime` → UTC; the desktop entry keeps `quicksetup` on its first X start. The row that proves it
+reads tty1's own VGA text buffer through the image's new `/usr/local/bin/1bit-tty1`, not ttyS0:
+
+```
+PASS U2 tty1      ResolutePup64 | Linux 7.3.0-rc4-1bit-perfopt+ [x86_64 arch] | root@puppypc23253:~$ | tty1-no-wizard
+PASS U2 headless  pfix=copy,nox | no-X-server
+```
+
 ## Recommendation
 
 **Adopt Puppy for both roles — the live/try stick and the installed frugal system — on the resolute64

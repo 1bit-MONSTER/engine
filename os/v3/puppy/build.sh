@@ -250,6 +250,7 @@ if [ -n "${PAYLOAD:-}" ]; then
     # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
     chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
         "$skeleton/etc/profile.d" "$skeleton/root" "$skeleton/usr/local/bin" 2> /dev/null || true
+    chmod 0755 "$skeleton/usr/local/bin/1bit-tty1"
     chmod 0755 "$skeleton"/etc/init.d/03onboard-efivars "$skeleton"/etc/init.d/05onboard-data \
         "$skeleton"/etc/init.d/10lemonade \
         "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
@@ -320,6 +321,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
              opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
              usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
+             usr/local/bin/1bit-tty1 \
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
              etc/1bit/release-identity etc/keymap etc/localtime; do
         in_image "$b" || miss="$miss $b"

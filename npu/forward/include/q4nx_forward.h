@@ -148,9 +148,10 @@ public:
     // artifact_dir holds the full ELFs (full_i8_*.elf).
     bool init(xrt::device& dev, const char* model_path, const std::string& artifact_dir);
     // Host-GEMM mode (NPU_INFER_HOST_GEMM=1): never opens the device.  Design
-    // derivation, ELF mapping, weight decode and the layer maths all run, but
-    // npu_gemm() does a plain float matmul.  This validates the whole forward
-    // against the Python reference offline, which is how the C++ GDN port is
+    // derivation, weight decode and the layer maths all run, but npu_gemm() does a
+    // plain float matmul, and **no ELF is required** — a geometry whose kernel set
+    // has not been built yet can still load and answer.  This validates the whole
+    // forward against the Python reference offline, which is how the C++ GDN port is
     // checked without the shared NPU (see docs/qwen35-4b-weight-format.md).
     bool init_host(const char* model_path, const std::string& artifact_dir);
     bool host_gemm() const { return host_gemm_; }
@@ -343,7 +344,19 @@ private:
     // where blk_<layer>_<tag>_weight.{pb16i,ref} live (config q4nx_pb16i_dir, env
     // Q4NX_PB16I_DIR wins).  Empty = the layout is off and nothing changes.
     bool pb16i_ = false;
+    // Weight stream "t2s" (container config q4nx_weight_layout "t2s"): pb16i's integer-exact
+    // ternary contract at 2.125 bits/weight -- 2-bit codes expanded on the core, one multiplier per
+    // 128 K instead of four.  The image is `<stem>.t2s` at q4nx_t2s's size, the side table is pb16i's
+    // `.ref` unchanged, and the kernels carry the `_t2s` suffix.  pb16i_ is set too: everything
+    // downstream of the load is the same path, and only the file it reads differs.
+    bool t2s_ = false;
     std::string pb16i_dir_;
+    // The artifact suffix and sidecar extension of the container's weight family, in one place so a
+    // kernel name and the image it reads cannot drift apart.
+    const char* family_tag() const {
+        return t2s_ ? "_t2s" : (pb16i_ ? "_pb16i" : (weight_layout_b8_ ? "_b8" : ""));
+    }
+    const char* image_ext() const { return t2s_ ? ".t2s" : ".pb16i"; }
     // A sealed ELF carries every ternary instance in ONE full ELF (one PDI, one
     // hw_context, 7 kernel instances), so changing phase costs nothing: measured on this
     // box, a phase change inside the sealed context is 0 ms against ~2.7 ms between two
@@ -417,8 +430,7 @@ private:
     // is built once here instead of on every token (it dominated decode time).
     // Container-declared device weight layout (q4nx_weight_layout == "b8").
     // False is the row-major layout every earlier container has.
-    bool weight_layout_b8_ = false;
-    std::vector<float> lm_head_tiles_;
+    bool weight_layout_b8_ = false;    std::vector<float> lm_head_tiles_;
     int                lm_head_tiles_T_ = 0;
     float lm_at(int n, int k) const;
     std::vector<std::vector<float>> in_norm_, post_norm_;   // [NL][H]

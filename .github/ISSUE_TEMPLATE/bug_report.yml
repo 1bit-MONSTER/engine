@@ -42,7 +42,7 @@ body:
     id: device
     attributes:
       label: Device
-      options: [auto, npu, hrx, cpu, ds4, not sure]
+      options: [auto, npu, hrx, cpu, not sure]
     validations:
       required: true
   - type: input

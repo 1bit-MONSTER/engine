@@ -161,8 +161,8 @@ add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-chec
 # manifest does not list, a ciphertext byte flipped after signing, and a manifest signed by another key.
 add_test(NAME seal_manifest COMMAND ${CMAKE_SOURCE_DIR}/tests/seal_manifest_test.sh)
 # engine #713: the pinned HRX toolchain (config/hrx-toolchain.config, scripts/fetch-rocm-sdk.sh) -- the
-# pin file's refusals, the completeness check against a fabricated tree, and that cmake, build-ds4.sh and
-# weekly.sh all use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
+# pin file's refusals, the completeness check against a fabricated tree, and that cmake and
+# weekly.sh both use the pin instead of the box's /opt/rocm-therock. No network, no SDK, no GPU.
 add_test(NAME hrx_toolchain_pin COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_toolchain_pin.sh)
 add_test(NAME pm_route COMMAND ${CMAKE_SOURCE_DIR}/tests/pm_route.sh $<TARGET_FILE:onebit>)
 add_test(NAME bench_selftest COMMAND ${CMAKE_SOURCE_DIR}/tests/bench_selftest.sh $<TARGET_FILE:onebit>)
@@ -288,23 +288,13 @@ if(ONEBIT_HRX)
     endif()
 endif()
 
-# ── DwarfStar (docs/dwarfstar.md) ─────────────────────────────────────────
-# Off by default: it builds third_party/ds4 (antirez/ds4, MIT) with scripts/build-ds4.sh on
-# its HIP backend only (Strix Halo, gfx1151: HIP, hipBLAS(Lt), rocBLAS, rocWMMA, hipCUB).
-# `1bit serve --device ds4` then runs its ds4-server on DwarfStar's own GGUFs.
-option(ONEBIT_DS4 "Build DwarfStar (third_party/ds4) for --device ds4" OFF)
+# ── DwarfStar is gone (owner 2026-11-01, removed 2026-11-02) ───────────────
+# `--device ds4` ran DwarfStar (third_party/ds4: antirez's CUDA kernels behind a HIP shim plus
+# hipBLAS), and its ds4-server was the engine's only 1BP reader. It is out of the shipped builds
+# and out of the tree: serve lists it as a removed device, and nothing here builds it any more.
+# A stale -DONEBIT_DS4=ON is refused by name instead of being silently ignored.
 if(ONEBIT_DS4)
-    if(NOT EXISTS "${CMAKE_SOURCE_DIR}/third_party/ds4/ds4_server.c")
-        message(FATAL_ERROR "ONEBIT_DS4 needs third_party/ds4: git submodule update --init third_party/ds4")
-    endif()
-    set(ONEBIT_DS4_SERVER "${CMAKE_BINARY_DIR}/ds4/hip/ds4-server")
-    add_custom_target(ds4
-        COMMAND ${CMAKE_SOURCE_DIR}/scripts/build-ds4.sh ${CMAKE_BINARY_DIR}/ds4
-        BYPRODUCTS ${ONEBIT_DS4_SERVER}
-        USES_TERMINAL)
-    add_dependencies(onebit ds4)
-    onebit_build_relative(ONEBIT_DS4_SERVER _onebit_ds4_server)
-    target_compile_definitions(onebit PRIVATE ONEBIT_DS4_SERVER="${_onebit_ds4_server}")
+    message(FATAL_ERROR "ONEBIT_DS4 was removed with DwarfStar (owner 2026-11-01): drop the option and use --device hrx")
 endif()
 
 # ── Hugging Face tokenizers (docs/tokenizers.md) ───────────────────────────
@@ -443,9 +433,9 @@ if(Python3_Interpreter_FOUND)
     # payloads under tests/fixtures/fflm/ — engine #588), so a regression cannot leave the
     # daily alert permanently green.
     add_test(NAME census_watch COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/census_watch_test.py)
-    # every scheduled bump workflow must report its own failure (engine #665): bump-hrx and
-    # bump-ds4 each froze their pin while going red every day unnoticed. The step is driven
-    # against a stubbed gh, with and without an open issue.
+    # every scheduled bump workflow must report its own failure (engine #665): bump-hrx froze its
+    # pin while going red every day unnoticed. The step is driven against a stubbed gh, with and
+    # without an open issue.
     add_test(NAME bump_workflow_report COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/bump_workflow_report_test.py)
 
     # a Q4NX directory's chunk layout (engine #587): synthetic containers, so the check a
@@ -458,6 +448,10 @@ if(Python3_Interpreter_FOUND)
     # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
     # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
     add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)
+    # the 2-bit ternary stream the XDNA decode kernel reads (tools/q4nx_t2s.py): the expansion it derives
+    # must reproduce the pb16i image's own int4 code bytes, block for block. Synthetic weights only -- the
+    # real-image leg is the same check on 14 GB of Bonsai-2 images and is run by hand.
+    add_test(NAME q4nx_t2s COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2s_test.py)
     # the safetensors -> Q4NX converter and the d3 readout head it packs (engine #653): every
     # fixture is synthesised, so this needs numpy and nothing else — no gguf-py, no model, no
     # device, no download.
@@ -577,6 +571,13 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# The t2s weight stream (q4nx_weight_layout "t2s"): the same integer-exact weights at 2.125 b/w,
+# expanded on the core.  Its host-side contract is the file size, so the test pins the tile against
+# the numbers tools/q4nx_t2s.py measured on a real image (50,135,040 -> 23,674,880 B for gate/up).
+add_test(NAME npu_t2s_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_t2s_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
+                 ${CMAKE_SOURCE_DIR}/tests/npu_t2s_layout_test.cpp)
 # The t2 chunk (npu/q4nx.h, "The t2 chunk kind"): the same kind of contract, but the thing under
 # test is the shipped decoder, so it compiles npu/q4nx.cpp as well.  No device, no model.
 add_test(NAME npu_t2_layout

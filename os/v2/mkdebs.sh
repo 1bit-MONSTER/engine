@@ -95,7 +95,6 @@ case "$stage_in" in
             find "$stage_in/$rel" -maxdepth 1 \( -name '*.so' -o -name '*.so.*' \) -exec cp -a {} "$stage/$rel/" \;
         }
         put hrx/llama/bin llama-server llama-bench
-        put ds4/hip ds4-server ds4 ds4-bench
         # the sealed NPU sets: the artifact surface only (layout.json + layer1_*/layer1.elf)
         if [ -d "$stage_in/npu/kernels" ]; then
             mkdir -p "$stage/npu/kernels"
@@ -112,7 +111,7 @@ case "$stage_in" in
             done
         fi
         for d in scripts tools; do [ -d "$stage_in/$d" ] && cp -a "$stage_in/$d" "$stage/"; done
-        echo "   stage: $(du -sh "$stage" | cut -f1) from $stage_in (1bit, llama-server, ds4, npu sets, scripts)"
+        echo "   stage: $(du -sh "$stage" | cut -f1) from $stage_in (1bit, llama-server, npu sets, scripts)"
         ;;
 esac
 [ -x "$stage/1bit" ] || { echo "mkdebs: $stage has no 1bit binary"; exit 2; }

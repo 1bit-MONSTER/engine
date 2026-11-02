@@ -15,16 +15,47 @@
 # limitations under the License.
 """Repack a Hugging Face safetensors model into a Q4NX directory (docs/npu.md).
 
-usage: tools/safetensors_to_q4nx.py pack   <hf dir> <out dir> [--tokenizer <dir>]
+usage: tools/safetensors_to_q4nx.py pack   <hf dir> <out dir> [--tokenizer <dir>] [--dtype auto|bf16]
        tools/safetensors_to_q4nx.py verify <hf dir> <out dir>
        tools/safetensors_to_q4nx.py decision <hf dir> <out dir>
 
 `pack` is the safetensors counterpart of tools/gguf_to_q4nx.py and shares its packers
 (tools/q4nx_pack.py), so both write the same container: 8-byte header length, JSON tensor
-table, data.  The HF tensor names ARE the Q4NX names -- gguf_to_q4nx maps GGUF names onto
-these -- so nothing has to be translated here; every 2-D tensor except the embedding becomes
-q4_1 tiles (I8 [tiles, 5120]) and norms, biases and the embedding stay bf16.  config.json is
-the model's own HF config with the two Q4NX fields added, and the tokenizer files are copied.
+table, data.  Every 2-D tensor except the embedding becomes q4_1 tiles (I8 [tiles, 5120]) and
+norms, biases and the embedding stay bf16.  config.json is the model's own HF config with the
+two Q4NX fields added, and the tokenizer files are copied.
+
+`--dtype bf16` writes no tiles at all: every tensor keeps the source dtype (bf16, or the F32
+the transforms force).  That container is for measuring, not for serving -- quantization is
+what `--dtype auto` is for -- because it lets a run hold the weights fixed and ask whether the
+engine's forward and a reference agree (engine #796's parity row), and it makes the cost of
+q4_1 a separate, measurable delta instead of an unexplained one.
+
+Two name conventions exist and `--arch` picks one:
+
+* `hf` (default for a `model.layers.*` pack, e.g. Qwen3-0.6B): the HF tensor names ARE the Q4NX
+  names -- gguf_to_q4nx maps GGUF names onto these -- so nothing is translated.
+* `qwen3_5` (the d3 packs, engine #796): the language model is nested under `language_model.*`
+  and the GDN tensors carry qwen3_5's own names, so they are renamed to the names
+  Q4nxNpuForward loads (configs/q4nx/qwen3.5_0.8b.json's `q4nx_name` column is the authority)
+  and three transforms are applied.  Each of the three loads and computes garbage if it is
+  wrong, so each is named here and covered by a known-answer test in
+  tests/safetensors_to_q4nx_test.py:
+
+  1. `linear_attn.A_log` -> `linear_attn.ssm_a`, written **F32 as -exp(A_log)**.  The engine
+     computes `expf(ssm_a[h] * softplus(dt))` (q4nx_forward.cpp:1844), so `ssm_a` is the decay
+     log-rate and must be negative; the raw A_log is not.
+  2. `linear_attn.conv1d.weight` `[CD, 1, CK]` -> `linear_attn.ssm_conv1d.weight`, **transposed**
+     to `[CK, CD]` flattened: the engine indexes `conv[j*CD + c]` (q4nx_forward.cpp:1802), i.e.
+     tap-major, while HF is channel-major.
+  3. `linear_attn.in_proj_a/b.weight` `[NVH, H]` -> `ssm_alpha_proj`/`ssm_beta_proj` with the
+     rows **zero-padded to 32** so they tile as q4_1; the engine dequantises at the stored
+     height and keeps the first NVH rows (`deq_pad`, q4nx_forward.cpp:1640).  The official FLM
+     config asks for Q8_0 here; q4_1 is what this packer can write, and the loss is measured in
+     `verify` rather than assumed.
+
+  `visual.*` is skipped (the forward runs the text path) and the count is printed.  A
+  `language_model.*` tensor with no mapping is a refusal, never a silent drop.
 
 `decision` converts a Decision-3.0 pack's readout head -- `readout.safetensors` plus
 `decision_config.json` -- into `decision.q4nx` in the same container, so one loader reads both.
@@ -36,6 +67,7 @@ This exists because the d3 packs ship HF safetensors and the engine only had a G
 import argparse
 import json
 import os
+import re
 import shutil
 import struct
 import sys
@@ -47,6 +79,81 @@ from q4nx_pack import COLS, ROWS, bf16_bits, quantize_q4_1, tiles, untile
 # bf16 storage: 1-D tensors (norms, biases, rope tables) and the token embedding, as in the
 # GGUF converter, plus any tensor whose dimensions are not a whole number of 32x256 tiles.
 KEEP_BF16 = ("model.embed_tokens.weight",)
+
+# qwen3_5 (d3) tensor suffixes that only need the `language_model.` -> `model.` rename.
+QWEN35_PLAIN = (
+    "input_layernorm.weight", "post_attention_layernorm.weight",
+    "mlp.gate_proj.weight", "mlp.up_proj.weight", "mlp.down_proj.weight",
+    "self_attn.q_proj.weight", "self_attn.k_proj.weight", "self_attn.v_proj.weight",
+    "self_attn.o_proj.weight", "self_attn.q_norm.weight", "self_attn.k_norm.weight",
+)
+
+# qwen3_5 GDN names, from configs/q4nx/qwen3.5_0.8b.json's name_map (q4nx_name column), which
+# is what Q4nxNpuForward loads.  in_proj_z is the GDN output gate and goes to the SAME name a
+# full-attention layer's output gate uses, because that is the tensor the forward reads.
+QWEN35_GDN = {
+    "linear_attn.in_proj_qkv.weight": "linear_attn.qkv_proj.weight",
+    "linear_attn.in_proj_z.weight": "self_attn.gate_proj.weight",
+    "linear_attn.in_proj_a.weight": "linear_attn.ssm_alpha_proj.weight",
+    "linear_attn.in_proj_b.weight": "linear_attn.ssm_beta_proj.weight",
+    "linear_attn.out_proj.weight": "linear_attn.ssm_out_proj.weight",
+    "linear_attn.conv1d.weight": "linear_attn.ssm_conv1d.weight",
+    "linear_attn.norm.weight": "linear_attn.ssm_norm.weight",
+    "linear_attn.A_log": "linear_attn.ssm_a",
+    "linear_attn.dt_bias": "linear_attn.ssm_dt.bias",
+}
+
+
+def qwen35_rename(name):
+    """A d3 pack's HF tensor name -> the name Q4nxNpuForward loads (engine #796)."""
+    if name.startswith("visual."):
+        return None                      # the text path: the forward never reads these
+    if not name.startswith("language_model."):
+        raise SystemExit(f"{name}: not a qwen3_5 tensor; expected language_model.* or visual.*")
+    rest = name[len("language_model."):]
+    if rest in ("embed_tokens.weight", "norm.weight"):
+        return "model." + rest
+    m = re.match(r"layers\.(\d+)\.(.+)$", rest)
+    if not m:
+        raise SystemExit(f"{name}: no mapping for this tensor (a d3 pack has layers.N.* only)")
+    bid, suffix = m.group(1), m.group(2)
+    if suffix in QWEN35_PLAIN:
+        return f"model.layers.{bid}.{suffix}"
+    if suffix not in QWEN35_GDN:
+        raise SystemExit(f"{name}: no qwen3_5 mapping for "
+                         f"{suffix!r}; refusing rather than writing a tensor nothing loads")
+    return f"model.layers.{bid}.{QWEN35_GDN[suffix]}"
+
+
+def qwen35_transform(name, w):
+    """The three transforms, keyed on the renamed tensor.  Returns (array, forced dtype)."""
+    if name.endswith(".ssm_a"):
+        return -np.exp(np.asarray(w, dtype=np.float32)), "F32"
+    if name.endswith(".ssm_dt.bias"):
+        return np.asarray(w, dtype=np.float32), "F32"
+    if name.endswith(".ssm_conv1d.weight"):
+        if w.ndim != 3 or w.shape[1] != 1:
+            raise SystemExit(f"{name}: conv1d is expected as [CD, 1, CK], got {list(w.shape)}")
+        return np.ascontiguousarray(w.reshape(w.shape[0], w.shape[2]).T).reshape(-1), None
+    if name.endswith("ssm_alpha_proj.weight") or name.endswith("ssm_beta_proj.weight"):
+        prows = -(-w.shape[0] // ROWS) * ROWS
+        if prows == w.shape[0]:
+            return w, None
+        out = np.zeros((prows, w.shape[1]), dtype=np.float32)
+        out[:w.shape[0]] = w
+        return out, None
+    return w, None
+
+
+def transcode(name, w, arch):
+    """(q4nx name, transformed array, forced dtype), or None when the arch skips the tensor."""
+    if arch != "qwen3_5":
+        return name, w, None
+    q = qwen35_rename(name)
+    if q is None:
+        return None
+    out, dtype = qwen35_transform(q, w)
+    return q, out, dtype
 
 
 def read_header(path):
@@ -107,17 +214,44 @@ def tensors(hf_dir):
     return [(n, os.path.join(hf_dir, weight_map[n]), *loaded[weight_map[n]]) for n in names]
 
 
+def detect_arch(names):
+    """`qwen3_5` for a pack whose language model is nested under language_model.*, else `hf`."""
+    return "qwen3_5" if any(n.startswith("language_model.") for n in names) else "hf"
+
+
 def pack(args):
     os.makedirs(args.out, exist_ok=True)
     table, blobs, off = {}, [], 0
     count = 0
-    for name, path, header, data_off in tensors(args.hf):
+    entries = tensors(args.hf)
+    arch = detect_arch([n for n, *_ in entries]) if args.arch == "auto" else args.arch
+    print(f"arch {arch}")
+    skipped = 0
+    for name, path, header, data_off in entries:
+        if arch == "qwen3_5" and name.startswith("visual."):
+            skipped += 1                    # decided from the name, before reading its bytes
+            continue
         w = read_tensor(path, header, data_off, name)
-        kind = (len(w.shape) == 1 or name in KEEP_BF16 or w.shape[0] % ROWS or
-                (len(w.shape) == 2 and w.shape[1] % COLS))
-        if kind:
+        got = transcode(name, w, arch)
+        if got is None:
+            skipped += 1
+            continue
+        name, w, forced = got
+        kind = (forced != "F32" and
+                (args.dtype == "bf16" or len(w.shape) == 1 or name in KEEP_BF16 or
+                 w.shape[0] % ROWS or
+                 (len(w.shape) == 2 and w.shape[1] % COLS)))
+        if forced == "F32":
             flat = w.reshape(-1)
-            table[name] = {"dtype": "BF16", "shape": [int(flat.size)]}
+            table[name] = {"dtype": "F32", "shape": [int(flat.size)]}
+            data = np.ascontiguousarray(flat, dtype=np.float32).tobytes()
+            how = "f32"
+        elif kind:
+            flat = w.reshape(-1)
+            # The bf16 tensors keep the shape the source gave them: model_load reads the
+            # embedding's vocab and hidden off shape[0]/shape[1] (model.c:890), so a flattened
+            # [vocab*hidden] makes it derive vocab=vocab*hidden, hidden=0.
+            table[name] = {"dtype": "BF16", "shape": [int(d) for d in w.shape]}
             data = bf16_bits(flat)
             how = "bf16"
         else:
@@ -135,6 +269,8 @@ def pack(args):
         off += len(b)
         count += 1
         print(f"{name:52s} {str(list(w.shape)):14s} -> {table[name]['dtype']} {table[name]['shape']} {how}")
+    if skipped:
+        print(f"skipped {skipped} tensor(s) ({'visual.*, the text path' if arch == 'qwen3_5' else 'unpaired'})")
     table["__metadata__"] = {"format": "q4nx", "source": os.path.basename(args.hf.rstrip("/")),
                              "converter": "tools/safetensors_to_q4nx.py"}
     header = json.dumps(table, separators=(",", ":")).encode()
@@ -153,6 +289,13 @@ def pack(args):
     cfg["q4nx_source"].update({"converter": "tools/safetensors_to_q4nx.py",
                                "safetensors": os.path.basename(args.hf.rstrip("/"))})
     cfg["q4nx_weight_layout"] = args.weight_layout
+    if arch == "qwen3_5":
+        cfg["q4nx_source"]["arch"] = arch
+        # The engine reads config.json at depth 1 only (q4nx_semantics.c's value_for_top), so a pack
+        # that nests its language model under text_config loads with hidden_size=0 and a default
+        # layer count.  Lift those keys to the top; text_config stays for anyone reading the pack.
+        for k, v in cfg.get("text_config", {}).items():
+            cfg.setdefault(k, v)
     with open(os.path.join(args.out, "config.json"), "w") as f:
         json.dump(cfg, f, indent=2)
         f.write("\n")
@@ -176,15 +319,26 @@ def verify(args):
         table = json.loads(f.read(n))
         data = f.read()
     bad = 0
-    for name, path, header, data_off in tensors(args.hf):
+    entries = tensors(args.hf)
+    arch = detect_arch([n for n, *_ in entries]) if args.arch == "auto" else args.arch
+    for name, path, header, data_off in entries:
+        w = read_tensor(path, header, data_off, name)
+        got = transcode(name, w, arch)
+        if got is None:
+            continue
+        name, w, _forced = got
         if name not in table:
             print(f"MISSING {name}")
             bad += 1
             continue
         ent = table[name]
         lo, hi = ent["data_offsets"]
-        w = read_tensor(path, header, data_off, name)
-        if ent["dtype"] == "BF16":
+        if ent["dtype"] == "F32":
+            f32 = np.frombuffer(data[lo:hi], dtype=np.float32)
+            err = float(np.abs(f32 - w.reshape(-1)).max())
+            ok = err == 0.0                # exact by construction: the transform is f32 maths
+            print(f"{'ok  ' if ok else 'BAD '} {name:52s} f32 max err {err:.3g}")
+        elif ent["dtype"] == "BF16":
             got = (np.frombuffer(data[lo:hi], dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
             ref = w.reshape(-1)
             err = float(np.abs(got - ref).max()) if ref.size else 0.0
@@ -249,8 +403,15 @@ def main():
         p = sub.add_parser(name)
         p.add_argument("hf")
         p.add_argument("out")
+        if name != "decision":
+            p.add_argument("--arch", default="auto", choices=("auto", "hf", "qwen3_5"),
+                           help="hf: HF names are Q4NX names; qwen3_5: the d3 pack's renames and "
+                                "transforms; auto detects a language_model.* pack")
         if extra:
             p.add_argument("--tokenizer")
+            p.add_argument("--dtype", default="auto", choices=("auto", "bf16"),
+                           help="auto: q4_1 tiles where the shape allows (serving); bf16: no "
+                                "quantization, every tensor keeps its source dtype (measuring)")
             p.add_argument("--weight-layout", default="rm", choices=("rm", "b8"))
         p.set_defaults(fn=fn)
     args = ap.parse_args()

@@ -105,7 +105,12 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
             hd = cfg.get("head_dim") or (hidden // nh if nh else 0)
             if not (nh and hd and nkv):
                 raise SystemExit(f"layer {i} is attention but config.json lacks the head dimensions")
-            entry["qkv"] = {"K": hidden, "N": (nh + 2 * nkv) * hd, "fused": True}
+            # qwen3_5's attn_output_gate makes q_proj emit q|gate, so the fused QKV is
+            # [q | gate | k | v] -- the same doubling the engine's own derivation does
+            # (npu/forward/src/q4nx_pack.c:150).  Without this the plan asks for a 3072-wide
+            # QKV kernel on a container whose rows are 5120.
+            q = nh * hd * (2 if cfg.get("attn_output_gate") else 1)
+            entry["qkv"] = {"K": hidden, "N": q + 2 * nkv * hd, "fused": True}
         entry["gate_up"] = {"K": hidden, "N": 2 * im} if fused_gu else {"K": hidden, "N": im}
         entry["down"] = {"K": im, "N": hidden}
         out.append(entry)
@@ -143,9 +148,9 @@ def generate(model_dir: str, kernels: str) -> dict:
     if not isinstance(n_layers, int) or n_layers <= 0:
         raise SystemExit(f"{model_dir}/config.json: num_hidden_layers is {n_layers!r}")
     layout = cfg.get("q4nx_weight_layout", "rm")
-    if layout not in ("rm", "b8", "pb16i"):
-        raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8 or pb16i")
-    tag = "_pb16i" if layout == "pb16i" else ("_b8" if layout == "b8" else "")
+    if layout not in ("rm", "b8", "pb16i", "t2s"):
+        raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8, pb16i or t2s")
+    tag = {"pb16i": "_pb16i", "t2s": "_t2s", "b8": "_b8"}.get(layout, "")
 
     im = cfg.get("intermediate_size")
     fused_gu = True
@@ -169,8 +174,8 @@ def generate(model_dir: str, kernels: str) -> dict:
         },
         "container": {
             "layout": layout,
-            "chunk_kind": "pb16i" if layout == "pb16i" else "mode0",
-            "pb16i": layout == "pb16i",
+            "chunk_kind": "pb16i" if layout in ("pb16i", "t2s") else "mode0",
+            "pb16i": layout in ("pb16i", "t2s"),
         },
         "fusion": {"gate_up": "fused" if fused_gu else "split"},
         "prefill": {"M": 128},

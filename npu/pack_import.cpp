@@ -365,9 +365,13 @@ float f16_to_f32(uint16_t h) {
     return v;
 }
 
-constexpr const char* kRefuseFconst =
-    "weights are only in dd_metastate_*.fconst, and the 4-bit packing of the transposed tile is not "
-    "established (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §3)";
+constexpr const char* kRefuseMlp =
+    "weights are in dd_metastate_*.fconst, in 4,288-byte subvolumes (64 output rows per column group, "
+    "128 rows per unit) carrying one fused gate/up tensor whose rows interleave in 32-row chunks. The unit "
+    "size and the interleave are established, the intra-subvolume byte order is not, and the vendor packer "
+    "on this box emits only the 2,176-byte instance for K=896, so these tiles cannot be re-encoded and "
+    "byte-verified the way the attention tiles are (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md "
+    "§7.16.4/§7.16.6)";
 
 Planned make(const std::string& name, const std::string& source, const std::string& dtype,
              std::vector<int64_t> shape) {
@@ -566,6 +570,132 @@ void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact) 
     if (zero_inexact) *zero_inexact = inexact;
 }
 
+// ── the .fconst attention payload: 64-row tiles of q/k/v/o ───────────────────
+// amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.13 established this layout by known-answer write
+// and §7.15 confirmed it against shipped tiles; the field positions below are the ones that survive the
+// round trip below, which is run on every tile of every layer at import time.
+//
+// A tile is 2*(K/128) + 2 subvolumes of 2,176 B: one pair per (column half, K block of 128) plus the pair
+// the writer puts its bias input in. Inside a weight subvolume:
+//     +0             2,048 B of quants: byte (cp%4) + kk*4 + (cp/4)*512 holds rows 2*cp (low nibble)
+//                    and 2*cp+1 (high nibble) at column kk of the block
+//     +2,048         16 B of zero points, one nibble per (row/2) -- rows 0..15 low, 16..31 high
+//     +2,112         32 bf16 scales, one per row of the half
+// Codes and zero points are int4 in two's complement. An asymmetric 4-bit quantiser needs (code - zp), and
+// the +8 offset every ONNX MatMulNBits applies cancels between the two fields, so the stored nibbles can be
+// used as they are: w = (code_nibble - zp_nibble) * scale.
+constexpr int64_t kAttnOff = 1856;  // attention payload start within a layer block
+constexpr int64_t kSubvBytes = 2176;
+constexpr int64_t kZerosOff = 2048, kScalesOff = 2112;
+constexpr int kTileRows = 64, kSubvRows = 32, kKBlock = 128;
+
+int64_t attn_tile_bytes(int64_t k) {
+    if (k <= 0 || k % kKBlock) return 0;
+    return (2 * (k / kKBlock) + 2) * kSubvBytes;
+}
+
+TileW decode_tile(const uint8_t* tile, int k) {
+    if (k <= 0 || k % kKBlock) throw std::runtime_error("tile: K is not a positive multiple of 128");
+    const int kbs = k / kKBlock;
+    TileW t;
+    t.k = k;
+    t.code.assign(size_t(kTileRows) * size_t(k), 0);
+    t.scale.assign(size_t(kTileRows) * size_t(kbs), 0.0f);
+    t.zp.assign(size_t(kTileRows) * size_t(kbs), 0);
+    t.bias.assign(kTileRows, 0);
+    for (int h = 0; h < 2; ++h) {
+        const int r0 = h * kSubvRows;
+        for (int i = 0; i < kSubvRows; ++i)  // the bias subvolumes are 0 and 1
+            std::memcpy(&t.bias[size_t(r0 + i)], tile + int64_t(h) * kSubvBytes + 2 * i, 2);
+        for (int kb = 0; kb < kbs; ++kb) {
+            const uint8_t* s = tile + (2 + 2 * kb + h) * kSubvBytes;
+            for (int cp = 0; cp < 16; ++cp) {
+                const int n0 = r0 + 2 * cp;
+                const int64_t base = (cp % 4) + (cp / 4) * 512;
+                for (int kk = 0; kk < kKBlock; ++kk) {
+                    const uint8_t b = s[base + int64_t(kk) * 4];
+                    t.code[size_t(n0) * size_t(k) + size_t(kb * kKBlock + kk)] = b & 0x0F;
+                    t.code[size_t(n0 + 1) * size_t(k) + size_t(kb * kKBlock + kk)] = b >> 4;
+                }
+            }
+            for (int i = 0; i < 16; ++i) {
+                const uint8_t z = s[kZerosOff + i];
+                t.zp[size_t(r0 + i) * size_t(kbs) + size_t(kb)] = z & 0x0F;
+                t.zp[size_t(r0 + 16 + i) * size_t(kbs) + size_t(kb)] = z >> 4;
+            }
+            for (int i = 0; i < kSubvRows; ++i) {
+                uint16_t h16;
+                std::memcpy(&h16, s + kScalesOff + 2 * i, 2);
+                t.scale[size_t(r0 + i) * size_t(kbs) + size_t(kb)] = bf16_to_f32(h16);
+            }
+        }
+    }
+    return t;
+}
+
+std::vector<uint8_t> encode_tile(const TileW& t) {
+    if (t.k <= 0 || t.k % kKBlock) throw std::runtime_error("tile: K is not a positive multiple of 128");
+    const int kbs = t.k / kKBlock;
+    std::vector<uint8_t> out(size_t(2 * kbs + 2) * kSubvBytes, 0);
+    for (int h = 0; h < 2; ++h) {
+        const int r0 = h * kSubvRows;
+        for (int i = 0; i < kSubvRows; ++i)
+            std::memcpy(out.data() + int64_t(h) * kSubvBytes + 2 * i, &t.bias[size_t(r0 + i)], 2);
+        for (int kb = 0; kb < kbs; ++kb) {
+            uint8_t* s = out.data() + (2 + 2 * kb + h) * kSubvBytes;
+            for (int cp = 0; cp < 16; ++cp) {
+                const int n0 = r0 + 2 * cp;
+                const int64_t base = (cp % 4) + (cp / 4) * 512;
+                for (int kk = 0; kk < kKBlock; ++kk) {
+                    const size_t idx = size_t(n0) * size_t(t.k) + size_t(kb * kKBlock + kk);
+                    s[base + int64_t(kk) * 4] = uint8_t((t.code[idx] & 0x0F) |
+                                                        ((t.code[idx + size_t(t.k)] & 0x0F) << 4));
+                }
+            }
+            for (int i = 0; i < 16; ++i)
+                s[kZerosOff + i] = uint8_t((t.zp[size_t(r0 + i) * size_t(kbs) + size_t(kb)] & 0x0F) |
+                                           ((t.zp[size_t(r0 + 16 + i) * size_t(kbs) + size_t(kb)] & 0x0F) << 4));
+            for (int i = 0; i < kSubvRows; ++i) {
+                const uint16_t h16 = f32_to_bf16(t.scale[size_t(r0 + i) * size_t(kbs) + size_t(kb)]);
+                std::memcpy(s + kScalesOff + 2 * i, &h16, 2);
+            }
+        }
+    }
+    return out;
+}
+
+Q4 q_from_tiles(const std::vector<TileW>& tiles) {
+    if (tiles.empty()) throw std::runtime_error("no tiles");
+    const int k = tiles.at(0).k, kbs = k / kKBlock;
+    for (const auto& t : tiles)
+        if (t.k != k) throw std::runtime_error("tiles of different K");
+    Q4 q;
+    q.K = k;
+    q.block = kKBlock;
+    q.N = int(tiles.size()) * kTileRows;
+    q.codes.assign(size_t(q.N) * size_t(k), 0);
+    q.scale.assign(size_t(q.N) * size_t(k / 32), 0.0f);
+    q.zero.assign(size_t(q.N) * size_t(k / 32), 0.0f);
+    const int gpb = kKBlock / 32;  // a block's scale and zero point apply to its four 32-column groups
+    for (size_t ti = 0; ti < tiles.size(); ++ti) {
+        const TileW& t = tiles[ti];
+        for (int r = 0; r < kTileRows; ++r) {
+            const int row = int(ti) * kTileRows + r;
+            for (int i = 0; i < k; ++i) q.codes[size_t(row) * size_t(k) + size_t(i)] = t.code[size_t(r) * size_t(k) + size_t(i)];
+            for (int kb = 0; kb < kbs; ++kb) {
+                const float s = t.scale[size_t(r) * size_t(kbs) + size_t(kb)];
+                const float z = -float(t.zp[size_t(r) * size_t(kbs) + size_t(kb)]) * s;  // (code - zp) * s
+                for (int g = 0; g < gpb; ++g) {
+                    const size_t idx = size_t(row) * size_t(k / 32) + size_t(kb * gpb + g);
+                    q.scale[idx] = s;
+                    q.zero[idx] = z;
+                }
+            }
+        }
+    }
+    return q;
+}
+
 // ── plan ────────────────────────────────────────────────────────────────────
 std::vector<std::string> Plan::refused() const {
     std::vector<std::string> out;
@@ -598,6 +728,7 @@ std::string Plan::manifest() const {
         ts.push_back(std::move(e));
     }
     j["tensors"] = ts;
+    j["attention_payload"] = {{"tiles_measured", attn_tiles}, {"note", attn_note}};
     j["incomplete"] = refused();
     return j.dump(2);
 }
@@ -663,8 +794,43 @@ Plan plan(const std::string& pack_dir) {
                   "norm's position is not established (measured 2026-10-31)";
     p.tensors.push_back(std::move(fin));
 
-    // projections: the one thing a pack states and this importer cannot yet read
+    // projections: the attention payload (q/k/v/o) decodes tile by tile -- the layout is established and
+    // the import re-encodes every tile it reads and requires the same bytes back -- while the MLP section
+    // still does not decompose, so it is refused by name.
+    //
+    // The tile count is MEASURED here, not derived: the attention payload is whatever sits between the
+    // block's first epsilon header and its second one, and a pack whose payload is not a whole number of
+    // 64-row tiles (or whose q/k/v/o row split does not add up to them) is refused rather than guessed at.
     const int q_out = d.heads * d.head_dim, kv_out = d.kv_heads * d.head_dim;
+    {
+        const std::string tok = find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst");
+        const int64_t tile_bytes = attn_tile_bytes(H);
+        if (tok.empty()) {
+            p.attn_note = "no dd_metastate_Llm_Token_Token_*.fconst in the pack";
+        } else if (tile_bytes == 0) {
+            p.attn_note = "hidden " + std::to_string(H) + " is not a multiple of 128, so the attention "
+                                                                  "payload is not 64-row tiles of this shape";
+        } else {
+            const FconstGeom g = locate_fconst(tok);
+            if (g.stride == 0) {
+                p.attn_note = "layer blocks not located: " + g.why;
+            } else {
+                const int64_t payload = g.h1 - kAttnOff;
+                const int64_t want = (kv_out / 64) * 2 + (q_out / 64) * 2;  // k, q, v, o = 2/14/2/14 on 0.5B
+                if (payload <= 0 || payload % tile_bytes)
+                    p.attn_note = "attention payload is " + std::to_string(payload) + " B, not a whole number of " +
+                                  std::to_string(tile_bytes) + "-byte tiles";
+                else if (q_out != H)
+                    p.attn_note = "q_proj is " + std::to_string(q_out) + " rows against hidden " +
+                                  std::to_string(H) + ", so o_proj's K would not be the tile's K";
+                else if (payload / tile_bytes != want)
+                    p.attn_note = "attention payload holds " + std::to_string(payload / tile_bytes) +
+                                  " tiles; q/k/v/o at 64 rows each need " + std::to_string(want);
+                else
+                    p.attn_tiles = payload / tile_bytes;
+            }
+        }
+    }
     struct Proj { const char* suffix; int rows, cols; };
     const Proj projs[] = {{"self_attn.q_proj", q_out, d.hidden},
                           {"self_attn.k_proj", kv_out, d.hidden},
@@ -678,7 +844,9 @@ Plan plan(const std::string& pack_dir) {
         for (const auto& pr : projs) {
             const std::string name = "model.layers." + std::to_string(L) + "." + pr.suffix + ".weight";
             auto x = make(name, "fconst:Llm_Token_Token", "q4_1", {pr.rows, pr.cols});
-            x.refusal = kRefuseFconst;
+            const bool attention = std::string(pr.suffix).compare(0, 9, "self_attn") == 0;
+            if (!attention) x.refusal = kRefuseMlp;
+            else if (!p.attn_note.empty()) x.refusal = p.attn_note;
             const std::string key = "model.layers." + std::to_string(L) + "." + pr.suffix;
             if (const auto it = declared.find(key); it != declared.end()) {
                 x.declared_n = it->second.n;
@@ -691,6 +859,18 @@ Plan plan(const std::string& pack_dir) {
                                        std::to_string(it->second.k);
             }
             p.tensors.push_back(std::move(x));
+        }
+    // the attention biases are per-row data inside the tiles' bias subvolumes, byte-identical to the pack's
+    // own values; they are planned only when the attention payload itself is readable
+    for (int L = 0; L < d.layers; ++L)
+        for (const auto& [suffix, rows] : {std::pair<const char*, int>{"q_proj", q_out},
+                                           std::pair<const char*, int>{"k_proj", kv_out},
+                                           std::pair<const char*, int>{"v_proj", kv_out}}) {
+            auto b = make("model.layers." + std::to_string(L) + ".self_attn." + suffix + ".bias",
+                          "fconst:Llm_Token_Token", "BF16", {rows});
+            if (!p.attn_note.empty()) b.refusal = p.attn_note;
+            b.declared_check = "written only when the tile's bias subvolumes are not all zero";
+            p.tensors.push_back(std::move(b));
         }
     return p;
 }
@@ -953,6 +1133,10 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     {
         const std::string path = find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst");
         const FconstGeom g = locate_fconst(path);
+        // refusals decided while reading the payload (a tile that does not survive its own round trip,
+        // or an o_proj bias the container has nowhere to put); they land before anything is written
+        std::vector<std::string> late;
+        long long zero_inexact_all = 0, zero_groups_all = 0;
         if (g.stride == 0) {
             r.fconst_note = "layer blocks not located: " + g.why;
         } else {
@@ -972,7 +1156,85 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                          "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
             }
             // the final norm is refused in the plan: the 1,856-byte tail is not an RMSNorm weight
+
+            // ── the attention payload: q/k/v/o ─────────────────────────────────────────────────────
+            // The projection order is the one measured on the shipped pack: each tile's bias subvolumes
+            // matched the pack's own q/k/v bias bytes exactly, and that is what identified the runs
+            // (k 2 tiles, q 14, v 2, o 14 at hidden 896). Every tile read here is decoded, re-encoded and
+            // compared with the bytes it came from before any of it is written: a tile that does not
+            // survive that is a tile whose fields we do not understand, and it is refused by name.
+            if (p.attn_tiles) {
+                const int q_out = p.dims.heads * p.dims.head_dim;
+                const int kv_out = p.dims.kv_heads * p.dims.head_dim;
+                const int tile_bytes = int(attn_tile_bytes(H));
+                const int n_kv = kv_out / kTileRows, n_q = q_out / kTileRows;
+                struct Slot { const char* proj; int rows, first; };
+                const Slot slots[] = {{"k_proj", kv_out, 0},
+                                      {"q_proj", q_out, n_kv},
+                                      {"v_proj", kv_out, n_kv + n_q},
+                                      {"o_proj", int(H), n_kv + n_q + n_kv}};
+                for (int L = 0; L < p.dims.layers; ++L) {
+                    const int64_t base = int64_t(L) * g.stride + kAttnOff;
+                    for (const auto& sl : slots) {
+                        const int nt = sl.rows / kTileRows;
+                        std::vector<TileW> tiles;
+                        tiles.reserve(size_t(nt));
+                        bool exact = true;
+                        for (int i = 0; i < nt; ++i) {
+                            const uint8_t* src = at(fc, base + int64_t(sl.first + i) * tile_bytes, tile_bytes);
+                            tiles.push_back(decode_tile(src, int(H)));
+                            ++r.attn_tiles_total;
+                            const std::vector<uint8_t> back = encode_tile(tiles.back());
+                            if (std::memcmp(back.data(), src, size_t(tile_bytes)) == 0) ++r.attn_tiles_ok;
+                            else exact = false;
+                        }
+                        const std::string name = "model.layers." + std::to_string(L) + ".self_attn." + sl.proj;
+                        if (!exact) {
+                            late.push_back(name + ".weight: the .fconst tile does not survive decode->encode, "
+                                                   "so its fields are not understood");
+                            continue;
+                        }
+                        bool any_bias = false;
+                        for (const auto& t : tiles)
+                            for (uint16_t v : t.bias) any_bias |= (v != 0);
+                        if (std::string(sl.proj) == "o_proj" && any_bias) {
+                            late.push_back(name + ".weight: o_proj's bias subvolumes are not empty and the "
+                                                   "container has no o_proj bias");
+                            continue;
+                        }
+                        Q4 q = q_from_tiles(tiles);
+                        std::vector<uint8_t> tiled;
+                        long long zinexact = 0;
+                        tile_q4_1(q, tiled, &zinexact);
+                        zero_inexact_all += zinexact;
+                        zero_groups_all += (long long)q.scale.size();
+                        const int64_t nt_tiles = int64_t(tiled.size() / kTileBytes);
+                        r.tiles += nt_tiles;
+                        w.add(name + ".weight", "I8", {nt_tiles, int64_t(kTileBytes)}, std::move(tiled));
+                        ++r.tensors;
+                        ++r.attn_projections;
+                        if (std::string(sl.proj) != "o_proj" && any_bias) {
+                            std::vector<uint8_t> bytes;
+                            bytes.reserve(size_t(sl.rows) * 2);
+                            for (const auto& t : tiles)
+                                for (uint16_t v : t.bias) {
+                                    bytes.push_back(uint8_t(v & 0xFF));
+                                    bytes.push_back(uint8_t(v >> 8));
+                                }
+                            w.add(name + ".bias", "BF16", {sl.rows}, std::move(bytes));
+                            ++r.tensors;
+                            ++r.attn_bias_tensors;
+                        }
+                    }
+                }
+                r.attn_zero_inexact_pct =
+                    zero_groups_all ? 100.0 * double(zero_inexact_all) / double(zero_groups_all) : 0.0;
+            }
             unmap_file(fc.map, fc.size);
+        }
+        if (!late.empty()) {
+            for (auto& s : late) r.refused.push_back(std::move(s));
+            if (!opt.allow_incomplete) return r;  // nothing has been written yet
         }
     }
 
@@ -984,6 +1246,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         std::ifstream cf(pack_dir + "/config.json");
         json c = json::parse(cf);
         c["vocab_size"] = V;
+        c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
         c["q4nx_source"] = {{"converter", "1bit npu-pack import"},
                             {"pack", p.pack},
                             {"layout", "q4nx-1"},
@@ -1071,6 +1334,11 @@ int run(int argc, char** argv) {
                 r.q4nx_rel, r.q4nx_max_abs);
     std::printf("  parameters: bf16 scale/zero exact for %.2f%% of 32-column groups (format limit)\n",
                 r.zero_exact_pct);
+    if (r.attn_tiles_total)
+        std::printf("  attention:  %lld/%lld .fconst tiles survive decode->encode byte for byte; "
+                    "%d projections + %d bias tensors imported, bf16 zero exact for %.2f%% of groups\n",
+                    r.attn_tiles_ok, r.attn_tiles_total, r.attn_projections, r.attn_bias_tensors,
+                    100.0 - r.attn_zero_inexact_pct);
     if (r.stride)
         std::printf("  fconst:     stride %lld, second header %lld (measured from the eps anchors); "
                     "%d/%d RMSNorm anchors found\n",

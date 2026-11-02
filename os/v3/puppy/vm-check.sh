@@ -31,8 +31,11 @@
 # console is tty1 and nothing reads the serial port it writes to: the image's /etc/init.d/21serial-console
 # opens one when the kernel command line carries 1bit.serial=1.
 #
-# Rows that need the hardware (HRX chat on the 8060S, the NPU through Lemonade, efivarfs/Secure Boot,
-# boot time and idle RAM) are printed as SKIP with the reason: they are the board's rows.
+# Secure Boot is read as userspace reads it: the `efivarfs` row is /proc/mounts BEFORE anything is touched
+# (the appliance has to have mounted it), then `mokutil --sb-state`, then `efibootmgr` - U4's "Secure Boot
+# state readable and ON" and the tool U6's installer runs. Rows that need the hardware (HRX chat on the 8060S,
+# the NPU through Lemonade, the installer writing an entry for a second disk, boot time and idle RAM) are
+# printed as SKIP with the reason.
 #
 # exit 0 = every row that can run here passed, 1 = a row failed, 2 = the VM never came up.
 set -uo pipefail
@@ -220,13 +223,23 @@ s.sendall(b"\n")
 rows = [
     # Secure Boot is what the board runs: the chain shim -> grub -> kernel has to verify, and the guest has to
     # agree that it did. Only present when the VM booted with sb-vars.sh's store - a -kernel boot cannot.
-    # the marker has to be printed by the guest, not matched inside mokutil's own wording: on this image
-    # efivarfs is not mounted at row time, so mokutil says "EFI variables are not supported" while the
-    # KERNEL says "Secure boot enabled" and logs the enrolled certificate it loaded - which is the evidence
-    *([("sb state", "mokutil --sb-state 2>&1 | head -2; dmesg | grep -i 'secure boot' | head -3; "
-        "dmesg | grep -i 'integrity: Loaded X.509' | head -2; "
-        "dmesg | grep -qi 'secure boot enabled' && echo SB-ENABLED-AT-BOOT",
-        "SB-ENABLED-AT-BOOT")] if os.environ.get("SBBOOT") == "1" else []),
+    # Secure Boot as USERSPACE reads it: `mokutil` and `efibootmgr` both need efivarfs, and the appliance has
+    # to have mounted it itself (03onboard-efivars) - a row that mounts it first proves nothing about the
+    # image, which is the mistake pi-release's board script caught on cycle 9. So: read /proc/mounts BEFORE
+    # touching anything, then ask mokutil. Measured on cycle 9: kernel `Secure boot enabled`, userspace
+    # `EFI variables are not supported on this system` - a perfect chain and an unreadable state.
+    *([("efivarfs", "grep -c ' /sys/firmware/efi/efivars ' /proc/mounts; "
+        "ls /sys/firmware/efi/efivars 2>/dev/null | grep -c '^SecureBoot-'; "
+        "grep -q ' /sys/firmware/efi/efivars ' /proc/mounts && echo efivarfs-mounted",
+        "efivarfs-mounted"),
+       ("sb state", "mokutil --sb-state 2>&1 | head -2; dmesg | grep -i 'secure boot' | head -2; "
+        "dmesg | grep -i 'integrity: Loaded X.509' | head -1", "SecureBoot enabled"),
+       # U6's "a firmware boot entry written": efibootmgr is the tool the installer runs, and it needs the
+       # same efivars. BootCurrent is the firmware saying which entry it booted - the appliance's own name
+       # only appears once an installer writes one, so that half stays the second-disk run.
+       ("U6 efibootmgr", "efibootmgr 2>&1 | head -6; "
+        "efibootmgr 2>&1 | grep -c '^BootCurrent:'; efibootmgr 2>&1 | grep -c '^Boot0'",
+        "BootCurrent")] if os.environ.get("SBBOOT") == "1" else []),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
@@ -351,7 +364,8 @@ else
     echo "SKIP U7 ssh        set SSHKEY=<private key> whose public half is in the image"
 fi
 vmqemu
-echo "SKIP U4 hardware   HRX chat on the 8060S, the NPU through Lemonade, efivarfs/Secure Boot, boot time: board rows"
+echo "SKIP U4 board      HRX chat on the 8060S, the NPU through Lemonade, amdgpu/amdxdna binding: board rows"
+echo "SKIP U6 board      an installer writing a firmware entry for a SECOND disk, and booting from it: needs the disk"
 echo "== $iso, transcript $work/serial.log"
 [ "$driver_rc" = "0" ] || exit 2
 grep -q '^FAIL' "$work/rows.txt" && exit 1

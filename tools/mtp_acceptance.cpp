@@ -273,6 +273,7 @@ int main(int argc, char** argv) {
         int bad = 0, tot_emitted = 0, tot_steps = 0, tot_batches = 0, tot_acc = 0, tot_draft = 0, tot_iter = 0;
         int acc_live[Stats::kMaxDepth] = {0}, draft_live[Stats::kMaxDepth] = {0};
         double hit_live[Stats::kMaxDepth] = {0};
+        double tot_plain_s = 0, tot_spec_s = 0;
         for (int p = 0; p < prompts; p++) {
             const int pi = prompt_base + p;
             std::vector<int> ids;
@@ -281,6 +282,7 @@ int main(int argc, char** argv) {
             fwd.reset();
             std::vector<float> lg;
             std::vector<int> plain;
+            const double t_plain0 = now_ms();
             for (size_t i = 0; i < ids.size(); i++)
                 if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
             int pos = (int)ids.size();
@@ -290,6 +292,7 @@ int main(int argc, char** argv) {
                 plain.push_back(best);
                 if (!fwd.step(best, pos++, lg)) { std::fprintf(stderr, "step failed\n"); return 1; }
             }
+            const double plain_s = (now_ms() - t_plain0) / 1000.0;
             // the speculative loop on the same prompt: reset the base, then prime the drafter over the prompt so it
             // attends over the whole stream (that is what the offline protocol showed matters: 3 % -> 69 %)
             fwd.reset();
@@ -313,7 +316,9 @@ int main(int argc, char** argv) {
             o.k = k;
             o.tau = tau;
             o.max_tokens = tokens;
+            const double t_spec0 = now_ms();
             const Result r = run(base, &drafter, ids, o);
+            const double spec_s = (now_ms() - t_spec0) / 1000.0;
             if (!r.ok) { std::fprintf(stderr, "prompt %d: %s\n", p, r.err.c_str()); return 1; }
             const bool same = (r.tokens == plain);
             if (!same) bad++;
@@ -328,10 +333,30 @@ int main(int argc, char** argv) {
                 draft_live[d] += r.stats.drafted_at[d];
                 hit_live[d] = draft_live[d] ? (double)acc_live[d] / draft_live[d] : 0.0;
             }
-            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f, stream %d rows, %d mismatch\n", p,
+            // The two numbers the serve switch needs, measured in ONE process on the SAME prompt: the draft route
+            // against plain decode.  "tokens/pass (chain)" is 1 + accepted/iterations -- the quantity the offline
+            // protocol prints; it is NOT accepted/iterations alone (that is accept-len, one lower by the committed
+            // token), which is the factor-(1+x) trap that made the live and offline summaries look incomparable.
+            // `pi`, not `p`: with --prompt-base the slice index is not the prompt index, and a log that says
+            // "prompt 0" for prompt 5 is how two tickets' tables get compared with the wrong slice.
+            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f, stream %d rows, %d mismatch\n", pi,
                         same ? "TEXT IDENTICAL" : "TEXT DIVERGED", r.stats.emitted, r.stats.accepted,
                         r.stats.drafted, r.stats.passes_per_token(), drafter.stream().keep(),
                         drafter.stream_mismatches());
+            std::printf("  chain %.2f tokens/pass (accept-len %.2f + the committed token); plain %.2f s = %.3f s/tok, "
+                        "draft %.2f s = %.3f s/tok (speedup %.2fx)\n",
+                        1.0 + r.stats.mean_accept_len(), r.stats.mean_accept_len(), plain_s,
+                        tokens ? plain_s / tokens : 0.0, spec_s, tokens ? spec_s / tokens : 0.0,
+                        spec_s > 0 ? plain_s / spec_s : 0.0);
+            tot_plain_s += plain_s;
+            tot_spec_s += spec_s;
+            // Per-PROMPT depth counts, not just the run aggregate: the array is shared, so the 8-prompt table is
+            // assembled from several tickets/tickets-of-slices, and a per-prompt breakdown is the only form that can
+            // be summed correctly afterwards (adding percentages weights a 16-iteration prompt like a 36 one).
+            std::printf("  per-depth p%d:", pi);
+            for (int d = 0; d < k && d < Stats::kMaxDepth; d++)
+                std::printf(" %d %d/%d", d + 1, r.stats.accepted_at[d], r.stats.drafted_at[d]);
+            std::printf("\n");
             if (!same) {
                 std::printf("  plain:");
                 for (int t : plain) std::printf(" %d", t);
@@ -343,6 +368,11 @@ int main(int argc, char** argv) {
         std::printf("\n== live loop: %d/%d prompts text-identical, passes/token %.3f, accept-len %.2f, hit %.3f\n",
                     prompts - bad, prompts, tot_emitted ? (double)(tot_steps + tot_batches) / tot_emitted : 0.0,
                     tot_iter ? (double)tot_acc / tot_iter : 0.0, tot_draft ? (double)tot_acc / tot_draft : 0.0);
+        std::printf("   chain %.2f tokens/pass (= 1 + accept-len, the offline quantity; %.3f tokens/base-pass); "
+                    "wall plain %.1f s, draft %.1f s (speedup %.2fx)\n",
+                    tot_iter ? 1.0 + (double)tot_acc / tot_iter : 0.0,
+                    tot_emitted ? (double)tot_emitted / (tot_steps + tot_batches) : 0.0, tot_plain_s, tot_spec_s,
+                    tot_spec_s > 0 ? tot_plain_s / tot_spec_s : 0.0);
         // The comparison the deliverable asks for: the same quantity the offline protocol prints, per depth.
         std::printf("   per-depth acceptance:\n");
         for (int d = 0; d < k && d < Stats::kMaxDepth; d++)

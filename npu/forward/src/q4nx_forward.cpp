@@ -1918,6 +1918,114 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
 // Batched form of gdn_layer: the three projections run with M rows (one weight read
 // per chunk), the conv/recurrence loop runs per row exactly as the per-token path
 // does, so the numbers are identical and only the number of submits changes.
+// A verify batch will run up to `rows` draft positions from `start_pos`.  Take the one snapshot this needs
+// (conv ring + recurrent state per layer; the KV cache needs none -- it is position-indexed) and make room for
+// each row's recurrence inputs.  Cheap by construction: the buffers are allocated once and reused.
+void Q4nxNpuForward::begin_verify(int rows, int start_pos) {
+    verify_pos_ = start_pos;
+    verify_rows_ = rows;
+    verify_open_ = true;
+    if (snap_conv_.size() != conv_state_.size()) snap_conv_ = conv_state_;
+    else
+        for (size_t l = 0; l < conv_state_.size(); l++) snap_conv_[l] = conv_state_[l];
+    if (snap_rec_.size() != rec_state_.size()) snap_rec_ = rec_state_;
+    else
+        for (size_t l = 0; l < rec_state_.size(); l++) snap_rec_[l] = rec_state_[l];
+    row_in_.resize(rec_state_.size());
+    for (auto& v : row_in_) v.assign((size_t)rows, GdnRowIn{});
+}
+
+// Keep the first `accepted` rows of the verify batch and drop the rest: restore the snapshot, then re-apply the
+// accepted rows' recurrence (no projections, no GEMMs), and truncate the KV cache to the accepted prefix.
+bool Q4nxNpuForward::commit_verify_rows(int accepted) {
+    if (!verify_open_) { err_ = "commit_verify: no verify batch open"; return false; }
+    if (accepted < 0 || accepted > verify_rows_) { err_ = "commit_verify: accepted out of range"; return false; }
+    const size_t per = (size_t)c_.NKV * (size_t)c_.HD;
+    const size_t keep = (size_t)(verify_pos_ + accepted) * per;
+    for (size_t l = 0; l < kcache_.size(); l++) {
+        if (!kcache_[l].empty() && kcache_[l].size() > keep) kcache_[l].resize(keep);
+        if (!vcache_[l].empty() && vcache_[l].size() > keep) vcache_[l].resize(keep);
+    }
+    for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
+    for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];
+    verify_open_ = false;                        // the replay below must not re-record
+    if (accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
+    for (auto& v : row_in_) v.clear();
+    return true;
+}
+
+// The recurrence alone, re-applied from the restored snapshot: conv ring, q/k/v normalisation from the stored
+// conv input, the decay + rank-1 update.  The output is not recomputed -- the verify pass already produced the
+// logits for these rows, and only the STATE has to be made consistent with the accepted prefix.
+bool Q4nxNpuForward::gdn_apply_rows(int from, int to) {
+    const int KD = lin_kd_, CD = 2 * lin_kd_ + lin_vd_;
+    const int NKH = lin_nkh_, NVH = lin_nvh_, KHD = lin_khd_, VHD = lin_vhd_;
+    const int CK = lin_ck_;
+    const int rep = (NKH > 0) ? std::max(1, NVH / NKH) : 1;
+    std::vector<float> co((size_t)CD), ql((size_t)NVH * KHD), kl((size_t)NVH * KHD), vv((size_t)NVH * VHD);
+    std::vector<float> kvm((size_t)VHD);
+    for (int l = 0; l < (int)row_in_.size(); l++) {
+        if (row_in_[(size_t)l].empty() || rec_state_[(size_t)l].empty()) continue;
+        const int lt = (l < sem_.n_layer_types) ? sem_.layer_types[l] : Q4NX_LAYER_FULL;
+        if (!(lin_kd_ > 0 && lt == Q4NX_LAYER_LINEAR)) continue;    // only GDN layers carry this state
+        for (int m = from; m < to; m++) {
+            const GdnRowIn& rec = row_in_[(size_t)l][(size_t)m];
+            if (rec.qkv.empty()) continue;
+            float* st = conv_state_[(size_t)l].data();
+            for (int ch = 0; ch < CD; ch++) {
+                const float* cs = st + (size_t)ch * (CK - 1);
+                float ssum = 0;
+                for (int j = 0; j < CK - 1; j++) ssum += cs[j] * gdn_small_[(size_t)l].conv[(size_t)j * CD + ch];
+                ssum += rec.qkv[(size_t)ch] * gdn_small_[(size_t)l].conv[(size_t)(CK - 1) * CD + ch];
+                co[(size_t)ch] = ssum / (1.0f + expf(-ssum));
+            }
+            for (int ch = 0; ch < CD; ch++) {
+                float* cs = st + (size_t)ch * (CK - 1);
+                for (int j = 0; j + 1 < CK - 1; j++) cs[j] = cs[j + 1];
+                if (CK > 1) cs[CK - 2] = rec.qkv[(size_t)ch];
+            }
+            for (int hh = 0; hh < NVH; hh++) {
+                const int src = hh / rep;
+                for (int d = 0; d < KHD; d++) ql[(size_t)hh * KHD + d] = co[(size_t)src * KHD + d];
+                for (int d = 0; d < KHD; d++) kl[(size_t)hh * KHD + d] = co[KD + (size_t)src * KHD + d];
+                for (int d = 0; d < VHD; d++) vv[(size_t)hh * VHD + d] = co[2 * KD + (size_t)hh * VHD + d];
+            }
+            for (int hh = 0; hh < NVH; hh++) {
+                float sq = 0, sk = 0;
+                for (int d = 0; d < KHD; d++) {
+                    sq += ql[(size_t)hh * KHD + d] * ql[(size_t)hh * KHD + d];
+                    sk += kl[(size_t)hh * KHD + d] * kl[(size_t)hh * KHD + d];
+                }
+                const float iq = 1.0f / sqrtf(sq + 1e-6f), ik = 1.0f / sqrtf(sk + 1e-6f);
+                for (int d = 0; d < KHD; d++) {
+                    ql[(size_t)hh * KHD + d] *= iq;
+                    kl[(size_t)hh * KHD + d] *= ik;
+                }
+            }
+            float* rs = rec_state_[(size_t)l].data();
+            for (int hh = 0; hh < NVH; hh++) {
+                const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] *
+                                      softplus_f(rec.ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
+                const float beta = 1.0f / (1.0f + expf(-rec.bh[(size_t)hh]));
+                float* sh = rs + (size_t)hh * KHD * VHD;
+                const float* kh = &kl[(size_t)hh * KHD];
+                const float* vh = &vv[(size_t)hh * VHD];
+                for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
+                for (int vd = 0; vd < VHD; vd++) {
+                    float ssum = 0;
+                    for (int kd = 0; kd < KHD; kd++) ssum += sh[kd * VHD + vd] * kh[kd];
+                    kvm[(size_t)vd] = ssum;
+                }
+                for (int vd = 0; vd < VHD; vd++) {
+                    const float delta = (vh[vd] - kvm[(size_t)vd]) * beta;
+                    for (int kd = 0; kd < KHD; kd++) sh[kd * VHD + vd] += kh[kd] * delta;
+                }
+            }
+        }
+    }
+    return true;
+}
+
 bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                                      std::vector<float>& out) {
     const int H = c_.H;
@@ -2002,6 +2110,12 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
             for (int i = 0; i < H; i++) { sa += xm[i] * ra[i]; sb += xm[i] * rb[i]; }
             ah[(size_t)hh] = sa;
             bh[(size_t)hh] = sb;
+        }
+        if (verify_open_ && m < verify_rows_ && (int)row_in_.size() > l) {   // keep what a commit would need
+            auto& rec = row_in_[(size_t)l][(size_t)m];
+            rec.qkv.assign(qkv, qkv + CD);
+            rec.ah.assign(ah.begin(), ah.end());
+            rec.bh.assign(bh.begin(), bh.end());
         }
         // q/k L2-normalised with NVH/NKH head repetition; v per v-head
         for (int hh = 0; hh < NVH; hh++) {
@@ -3160,6 +3274,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // residual here produced garbage logits (the M=1 self-check caught it).
     std::vector<float> fnorm(H);
     bool ok = true;
+    last_residual_.assign(X.begin() + (size_t)(M - 1) * H, X.end());
     if (batch_all_out_) {
         // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
         // row is normed and the head runs ONCE for the batch (the M=16 twin streams its weights once).
@@ -3167,6 +3282,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         for (int m = 0; m < M; m++)
             rmsnorm(&X[(size_t)m * H], final_norm_.data(), H, &norm_all[(size_t)m * H]);
         std::copy(norm_all.begin() + (size_t)(M - 1) * H, norm_all.end(), fnorm.begin());
+        last_hidden_rows_ = norm_all;          // per-row normed hidden, for a drafter that must advance too
         ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
         logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
     } else {
@@ -4151,6 +4267,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
     }
     if (ph) { g_ph.layer = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }
 
+    last_residual_ = x;                        // one norm earlier, for a drafter that wants the residual
     rmsnorm(x.data(), final_norm_.data(), H, xn.data());
     last_hidden_ = xn;  // for last_hidden(): the post-final-norm state of this position
     if (ph) { g_ph.ffnorm = ph_ms(tp_lap); tp_lap = std::chrono::steady_clock::now(); }

@@ -84,6 +84,7 @@ exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
     -v "$recipe":/recipe:ro \
     ${payload:+-v "$payload":/payload:ro} \
+    ${payload:+-e PAYLOAD=/payload} \
     ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
@@ -135,13 +136,27 @@ echo "== 0setup"; ./0setup </dev/null
 echo "== 1download"; ./1download </dev/null
 echo "== 2createpackages"; ./2createpackages </dev/null
 
+# U5: our kernel ships ec_su_axb35 (the embedded controller of this board: fans, EC temperature, power caps) and it
+# has no PCI modalias, so nothing auto-loads it - measured on the box, where lsmod has no entry and the fans
+# ride the firmware curve. The Puppy hook is ADDLIST in /etc/rc.d/MODULESCONFIG, read by rc.sysinit at boot;
+# it is a file woof-CE owns, so rewrite that one variable instead of shipping a whole replacement.
+rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
+[ -n "$rootfs" ] || { echo "build: REFUSED: no rootfs-complete after 2createpackages" >&2; exit 1; }
+if [ -f "$rootfs/etc/rc.d/MODULESCONFIG" ]; then
+    echo "== ec_su_axb35 into the ADDLIST of MODULESCONFIG"
+    sed -i "s|^ADDLIST=.*|ADDLIST=' ec_su_axb35 '|" "$rootfs/etc/rc.d/MODULESCONFIG"
+    grep -q "^ADDLIST=' ec_su_axb35 '" "$rootfs/etc/rc.d/MODULESCONFIG" || {
+        echo "build: REFUSED: could not set ADDLIST in /etc/rc.d/MODULESCONFIG" >&2; exit 1; }
+else
+    echo "build: REFUSED: no /etc/rc.d/MODULESCONFIG in the rootfs - cannot make the EC driver load at boot" >&2
+    exit 1
+fi
+
 # U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
 # Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
 # itself - so this is a copy plus two symlinks and the boot service.
 if [ -n "${PAYLOAD:-}" ]; then
     echo "== embed the release package"
-    rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
-    [ -n "$rootfs" ] || { echo "build: REFUSED: no rootfs-complete to embed into" >&2; exit 1; }
     mkdir -p "$rootfs/opt/1bit-package" "$rootfs/usr/local/bin"
     cp -a /payload/bin /payload/1bit /payload/lemond-onebit "$rootfs/opt/1bit-package/"
     ln -sf /opt/1bit-package/lemond-onebit "$rootfs/usr/local/bin/lemond-onebit"

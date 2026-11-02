@@ -53,10 +53,18 @@ case $iso in
 esac
 
 rm -f "$work/ser" "$work/serial.log" "$work/qemu.out"
-# The guest's 13305 goes to 21305 on the host: another lane's lemond already holds 127.0.0.1:13305 here,
-# and the row is whether the appliance answers on its own port over a network, not which host port.
+# The host port is picked, not assumed: 13305 here belongs to another lane's lemond, and the previous
+# run's qemu can still hold the forward for a moment after its timeout, which fails qemu outright
+# ("Could not set up host forwarding rule") before firmware runs - measured on the second cycle-4 run.
+hostport=21305
+i=0
+while [ $i -lt 60 ]; do
+    ss -lnt 2> /dev/null | grep -q ":$hostport " || break
+    hostport=$((hostport + 2))
+    i=$((i + 1))
+done
 # shellcheck disable=SC2054  # qemu arguments carry commas inside a single word
-net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:21305-:13305 -device virtio-net-pci,netdev=n0)
+net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$hostport"-:13305 -device virtio-net-pci,netdev=n0)
 case $iso in
 *.img)
     # the shipped artifact: firmware boots the ESP, grub reads the data partition
@@ -196,11 +204,11 @@ cat "$work/rows.txt"
 key=$(awk '/^INFO U3 keyvalue/ {print $NF}' "$work/rows.txt" 2>/dev/null | tail -1)
 if [ -n "${key:-}" ]; then
     code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Authorization: Bearer $key" \
-        http://127.0.0.1:21305/api/v1/models 2>/dev/null)
+        "http://127.0.0.1:$hostport/api/v1/models" 2>/dev/null)
     if [ "$code" = "200" ]; then
-        echo "PASS U3 lan        http=200 on the forwarded :13305 with the image's key"
+        echo "PASS U3 lan        http=200 on the forwarded :13305 (host :$hostport) with the image's key"
     else
-        echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305"
+        echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305 (host :$hostport)"
     fi
 else
     echo "SKIP U3 lan        no key in the transcript"

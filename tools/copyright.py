@@ -47,7 +47,10 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # os/v2 packages: dpkg control files, apt/dpkg list files and the console banner are data
           # with no comment syntax - the same exemption patches/* and *.cfg get
           "os/v2/debian/*/control", "os/v2/debian/*/conffiles", "*.list",
-          "os/v2/debian/*/files/etc/issue", "os/v2/debian/*/files/etc/motd"]
+          "os/v2/debian/*/files/etc/issue", "os/v2/debian/*/files/etc/motd",
+          # os/v3 Puppy image: an ssh authorized_keys file is one key per line and a comment in it would be
+          # parsed as an option string, so it is data, not code (a build that ships it is what U7 asks for)
+          "*/authorized_keys"]
 
 
 def _match(name, patterns):

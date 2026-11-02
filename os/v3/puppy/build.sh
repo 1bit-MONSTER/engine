@@ -39,6 +39,8 @@
 # Two things the woof-CE build assumes that are not obvious, both measured here:
 #   * merge2out refuses to run unless $GITHUB_ACTIONS is set or the host is a running Puppy - CI sets it,
 #     so a container build has to as well;
+#   * `losetup` needs a /dev/loopN node, and the container only has 0-7: this script mknods them, because
+#     this box keeps ~20 loop devices busy (snaps, other lanes) and the free one is numbered above 7;
 #   * `3builddistro` takes the kernel from `woof-out_*/kernel-kit/output/` and otherwise downloads a stock
 #     Ubuntu kernel. Dropping our huge tarball there is what makes the image boots OUR kernel.
 #
@@ -97,7 +99,7 @@ exec docker run --rm --privileged --memory=12g --cpus=4 \
     ${payload:+-e PAYLOAD=/payload} \
     ${libhsa:+-v "$libhsa":/libhsa.so.1:ro} \
     ${libhsa:+-e LIBHSA=/libhsa.so.1} \
-    ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
+    --device /dev/loop-control:/dev/loop-control \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
 export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config GITHUB_ACTIONS=true
@@ -121,6 +123,11 @@ install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr
 # green all the way to a bootable-looking ISO whose initrd has 0 entries (paid for on attempt 7). The
 # package list above carries cpio; this refuses rather than producing that ISO again.
 command -v cpio >/dev/null || { echo "build: cpio missing, the initrd would come out empty" >&2; exit 1; }
+# 3builddistro loops the ESP image to fill it, and losetup needs /dev/loopN to exist. The container /dev
+# stops at loop7 while this box runs about twenty loop devices (snaps and other lanes), so loop-control
+# hands out a number with no node and the ISO stage dies with "losetup: /dev/loop20: failed to set up loop
+# device: No such file or directory" - after every package and every petbuild has been paid for.
+for i in $(seq 0 63); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 $i 2>/dev/null; done
 echo "== merge2out $COMPAT"
 # yes | cmd under pipefail: when merge2out exits, yes gets SIGPIPE and the pipeline fails, so the
 # status has to be taken from merge2out and not from yes

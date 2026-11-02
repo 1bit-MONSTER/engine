@@ -281,4 +281,82 @@ bool head_step(const Weights& w, const float* hidden, const float* tok_emb, int 
     return true;
 }
 
+int argmax_prob(const std::vector<float>& logits, float* prob) {
+    if (logits.empty()) return -1;
+    int best = 0;
+    for (size_t i = 1; i < logits.size(); i++)
+        if (logits[i] > logits[(size_t)best]) best = (int)i;
+    if (prob) {
+        const double mx = logits[(size_t)best];
+        double sum = 0;
+        for (float v : logits) sum += std::exp((double)v - mx);
+        *prob = (float)(1.0 / sum);
+    }
+    return best;
+}
+
+bool MtpDrafter::next_row(const float* hidden, int token, int pos, std::vector<float>& next,
+                          std::vector<float>& logits) {
+    std::vector<float> emb;
+    if (!embed_ || !embed_(token, emb) || (int)emb.size() != kH) return false;
+    if (!use_lm_head_ || !lm_) {
+        if (!head_step(w_, hidden, emb.data(), pos, cache_, next, nullptr, logits)) return false;
+        logits.assign((size_t)(vocab_ > 0 ? vocab_ : 1), 0.0f);
+        return true;
+    }
+    return head_step(w_, hidden, emb.data(), pos, cache_, next, lm_, logits);
+}
+
+bool MtpDrafter::prime(const std::vector<float>& hidden, int token, int pos) {
+    if ((int)hidden.size() != hidden_) return false;
+    cache_.truncate(stream_.keep());
+    if (!stream_.at(pos)) { mismatches_++; return false; }
+    std::vector<float> next, lg;
+    if (!next_row(hidden.data(), token, pos, next, lg)) return false;
+    stream_.commit(pos, 1);
+    return true;
+}
+
+int MtpDrafter::draft(const std::vector<float>& hidden, int last_token, int pos, int k, std::vector<int>& out,
+                      std::vector<float>* conf) {
+    out.clear();
+    if (conf) conf->clear();
+    if ((int)hidden.size() != hidden_ || k <= 0) return 0;
+    // Open the chain: the committed prefix stays, the previous chain's provisional rows go.  A `pos` that is not
+    // where the committed stream ends means the loop and the drafter are out of step -- count it and chain from the
+    // cursor, because drafting from an inconsistent cache is worse than drafting from a consistent one that lags.
+    cache_.truncate(stream_.keep());
+    if (!stream_.at(pos)) mismatches_++;
+    std::vector<float> h = hidden, next, logits;
+    int tok = last_token, p = stream_.keep();
+    for (int i = 0; i < k; i++) {
+        if (!next_row(h.data(), tok, p, next, logits)) break;
+        float prob = 1.0f;
+        const int t = argmax_prob(logits, conf ? &prob : nullptr);
+        if (t < 0) break;
+        out.push_back(t);
+        if (conf) conf->push_back(prob);
+        if (tau_ > 0.0f && prob < tau_) break;   // the loop still verifies this draft, it just stops chaining
+        tok = t;
+        h = next;
+        p++;
+    }
+    return (int)out.size();
+}
+
+void MtpDrafter::commit_rows(const std::vector<int>& tokens, const std::vector<float>& hidden_rows, int M) {
+    // The chain's provisional rows are not part of the stream, and an accepted row is never appended after them:
+    // cut back to the committed prefix first, then write the accepted rows from there.
+    cache_.truncate(stream_.keep());
+    const int from = stream_.keep();
+    std::vector<float> next, lg;
+    int at = from;
+    for (int m = 0; m < M; m++) {
+        if ((int)tokens.size() <= m || hidden_rows.size() < (size_t)(m + 1) * (size_t)hidden_) break;
+        if (!next_row(&hidden_rows[(size_t)m * (size_t)hidden_], tokens[(size_t)m], at, next, lg)) break;
+        at++;
+    }
+    stream_.commit(from, at - from);
+}
+
 }  // namespace onebit::npu::mtp

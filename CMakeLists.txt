@@ -203,8 +203,11 @@ add_test(NAME npu_sampling COMMAND npu_sampling_test)
 # the base model agrees with, roll its state back.  Policy only -- a toy base model and toy draft heads stand
 # in for the forward and the MTP head, so the invariants (identical text whatever the head proposes, exact
 # rollback, k clamped to the batch width) are checked on every build without a device.
-add_executable(mtp_draft_test tests/mtp_draft_test.cpp)
+add_executable(mtp_draft_test tests/mtp_draft_test.cpp npu/mtp/mtp_head.cpp)
 target_include_directories(mtp_draft_test PRIVATE npu)
+if(TARGET OpenMP::OpenMP_CXX)
+    target_link_libraries(mtp_draft_test PRIVATE OpenMP::OpenMP_CXX)
+endif()
 add_test(NAME mtp_draft COMMAND mtp_draft_test)
 # ci.yml's build step lists every ctest target explicitly, and this branch cannot edit that file (the push
 # token has no `workflow` scope), so the binary is pulled in as a dependency of a listed test target. When a

@@ -51,93 +51,6 @@ double now_ms() {
     return std::chrono::duration<double, std::milli>(clk::now() - t0).count();
 }
 
-// argmax + the max probability under a softmax over the whole vocabulary (the tau gate needs the probability,
-// not just the token).
-int argmax_p(const std::vector<float>& logits, float* prob) {
-    int best = 0;
-    for (size_t i = 1; i < logits.size(); i++)
-        if (logits[i] > logits[best]) best = (int)i;
-    if (prob) {
-        double mx = logits[(size_t)best];
-        double sum = 0;
-        for (float v : logits) sum += std::exp((double)v - mx);
-        *prob = (float)(1.0 / sum);
-    }
-    return best;
-}
-
-// The MTP drafter: one head step per proposed token, chained on its own hidden state and KV cache.
-class MtpDrafter : public DraftHead {
-public:
-    MtpDrafter(const Weights& w, ForwardBase& base) : w_(w), base_(base) {}
-
-    void reset() override { cache_.reset(); }
-
-    int draft(const std::vector<float>& hidden, int last_token, int pos, int k, std::vector<int>& out,
-              std::vector<float>* conf) override {
-        out.clear();
-        if (conf) conf->clear();
-        std::vector<float> emb, h = hidden, logits, next;
-        cache_.truncate(pos_);                 // keep the committed stream, drop the previous chain's drafts
-        pos_ = pos;
-        int tok = last_token;
-        (void)0;
-        for (int i = 0; i < k; i++) {
-            base_.embed_into(tok, emb);
-            if (!head_step(w_, h.data(), emb.data(), pos_, cache_, next,
-                           [this](const std::vector<float>& x, std::vector<float>& lg) {
-                               return base_lm_head(x, lg);
-                           },
-                           logits)) {
-                break;
-            }
-            float p = 1.0f;
-            const int t = argmax_p(logits, conf ? &p : nullptr);
-            out.push_back(t);
-            if (conf) conf->push_back(p);
-            if (tau_ > 0.0f && p < tau_) break;   // stop the chain here; the loop still verifies this draft
-            tok = t;
-            h = next;
-            pos_++;
-        }
-        return (int)out.size();
-    }
-
-    void set_lm_head(bool on) { use_lm_head_ = on; }
-
-    // Advance the head over accepted positions: one head step per row, no drafting.
-    void commit_rows(const std::vector<int>& tokens, const std::vector<float>& hidden_rows, int M) override {
-        std::vector<float> emb, next, lg;
-        for (int m = 0; m < M; m++) {
-            base_.embed_into(tokens[(size_t)m], emb);
-            if (!head_step(w_, &hidden_rows[(size_t)m * kH], emb.data(), pos_, cache_, next, nullptr, lg)) break;
-            pos_++;
-        }
-    }
-    // Prime the head over a position of the prompt (same thing, before the loop starts).
-    void prime(const std::vector<float>& hidden, int token, int pos) {
-        std::vector<float> emb, next, lg;
-        base_.embed_into(token, emb);
-        head_step(w_, hidden.data(), emb.data(), pos, cache_, next, nullptr, lg);
-    }
-    void reset_stream() { cache_.reset(); pos_ = 0; }
-    void set_tau(float t) { tau_ = t; }
-
-    double head_ms = 0;
-
-private:
-    bool base_lm_head(const std::vector<float>& x, std::vector<float>& lg) {
-        if (!use_lm_head_) { lg.assign(base_.vocab(), 0.0f); return true; }
-        return base_.lm_head(x, lg);
-    }
-    const Weights& w_;
-    ForwardBase& base_;
-    KvCache cache_;
-    int pos_ = 0;
-    bool use_lm_head_ = true;
-    float tau_ = 0.6f;
-};
-
 }  // namespace
 
 // --offline: measure the DRAFTER alone, without needing a rollback for the base's recurrent state.
@@ -255,6 +168,9 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
 }
 
 int main(int argc, char** argv) {
+    // Line-buffered: the engine's own chatter is unbuffered, and a run that is killed mid-init (device hang, hold
+    // limit) must still say how far it got -- that is the only evidence a post-mortem has.
+    std::setvbuf(stdout, nullptr, _IOLBF, 0);
     std::string model_dir, head_exact, head_q4k;
     int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
@@ -343,7 +259,9 @@ int main(int argc, char** argv) {
     fwd.reset();
     if (!fwd.step(1, 0, probe)) { std::fprintf(stderr, "probe step failed: %s\n", fwd.last_error()); return 1; }
     base.set_vocab((int)probe.size());
-    MtpDrafter drafter(w, base);
+    MtpDrafter drafter(w, [&base](int t, std::vector<float>& e) { base.embed_into(t, e); return true; },
+                      [&base](const std::vector<float>& x, std::vector<float>& lg) { return base.lm_head(x, lg); });
+    drafter.set_vocab(base.vocab());
     drafter.set_lm_head(!dry);
     drafter.set_tau(tau);          // the chain gate the run was asked for (offline forces its own)
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
@@ -353,6 +271,8 @@ int main(int argc, char** argv) {
         // The gate that matters for switching a serve over: the speculative loop must emit exactly the tokens
         // plain greedy decode does, at fewer passes per token.
         int bad = 0, tot_emitted = 0, tot_steps = 0, tot_batches = 0, tot_acc = 0, tot_draft = 0, tot_iter = 0;
+        int acc_live[Stats::kMaxDepth] = {0}, draft_live[Stats::kMaxDepth] = {0};
+        double hit_live[Stats::kMaxDepth] = {0};
         for (int p = 0; p < prompts; p++) {
             const int pi = prompt_base + p;
             std::vector<int> ids;
@@ -374,14 +294,18 @@ int main(int argc, char** argv) {
             // attends over the whole stream (that is what the offline protocol showed matters: 3 % -> 69 %)
             fwd.reset();
             drafter.reset();
-            drafter.reset_stream();
             {
                 // Prime the drafter over every prompt position (its KV must cover the stream), then hand the base
-                // back at position 0 -- the loop prefills itself.
+                // back at position 0 -- the loop prefills itself.  prime() advances the drafter's cursor, so from
+                // here on the chain the loop opens must start where the committed stream ends.
                 std::vector<float> lg2;
                 for (size_t i = 0; i < ids.size(); i++) {
                     if (!fwd.step(ids[i], (int)i, lg2)) { std::fprintf(stderr, "prime prefill failed\n"); return 1; }
-                    drafter.prime(fwd.last_hidden(), ids[i], (int)i);
+                    if (!drafter.prime(fwd.last_hidden(), ids[i], (int)i)) {
+                        std::fprintf(stderr, "prompt %d: drafter prime refused at %zu (committed %d)\n", p, i,
+                                     drafter.stream().keep());
+                        return 1;
+                    }
                 }
                 fwd.reset();
             }
@@ -399,9 +323,15 @@ int main(int argc, char** argv) {
             tot_acc += r.stats.accepted;
             tot_draft += r.stats.drafted;
             tot_iter += r.stats.iterations;
-            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f\n", p,
+            for (int d = 0; d < Stats::kMaxDepth; d++) {
+                acc_live[d] += r.stats.accepted_at[d];
+                draft_live[d] += r.stats.drafted_at[d];
+                hit_live[d] = draft_live[d] ? (double)acc_live[d] / draft_live[d] : 0.0;
+            }
+            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f, stream %d rows, %d mismatch\n", p,
                         same ? "TEXT IDENTICAL" : "TEXT DIVERGED", r.stats.emitted, r.stats.accepted,
-                        r.stats.drafted, r.stats.passes_per_token());
+                        r.stats.drafted, r.stats.passes_per_token(), drafter.stream().keep(),
+                        drafter.stream_mismatches());
             if (!same) {
                 std::printf("  plain:");
                 for (int t : plain) std::printf(" %d", t);
@@ -413,6 +343,10 @@ int main(int argc, char** argv) {
         std::printf("\n== live loop: %d/%d prompts text-identical, passes/token %.3f, accept-len %.2f, hit %.3f\n",
                     prompts - bad, prompts, tot_emitted ? (double)(tot_steps + tot_batches) / tot_emitted : 0.0,
                     tot_iter ? (double)tot_acc / tot_iter : 0.0, tot_draft ? (double)tot_acc / tot_draft : 0.0);
+        // The comparison the deliverable asks for: the same quantity the offline protocol prints, per depth.
+        std::printf("   per-depth acceptance:\n");
+        for (int d = 0; d < k && d < Stats::kMaxDepth; d++)
+            std::printf("     draft %d: %6.3f %% (%d/%d)\n", d + 1, 100.0 * hit_live[d], acc_live[d], draft_live[d]);
         return bad ? 1 : 0;
     }
 

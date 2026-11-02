@@ -466,7 +466,8 @@ What converts, and how faithfully:
 | `input_layernorm`, `post_attention_layernorm` | `.fconst`, bf16 at a fixed offset | bf16 | byte-exact |
 | `self_attn.{q,k,v,o}_proj` (24 x 4) | `.fconst`, 34,816-byte 64-row tiles | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
 | `self_attn.{q,k,v}_proj.bias` (24 x 3) | `.fconst`, the tiles' bias subvolumes | bf16 | byte-exact; written only where the pack has one |
-| `mlp.{gate,up,down}_proj` (24 x 3) | `.fconst`, MLP section | — | **refused**, see below |
+| `mlp.{gate,up}_proj` (24 x 2) | `.fconst`, MLP section, 4,288-byte subvolumes | q4_1 tiles | codes unchanged; `scale = s` (bf16), `zero = -zp*s` (bf16 rounding) |
+| `mlp.down_proj` (24 x 1) | `.fconst`, MLP section, 2,176-byte subvolumes | q4_1 tiles | same as the attention tiles |
 | `model.norm` (final) | — | — | **refused**, see below |
 | `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
 
@@ -502,6 +503,39 @@ per row of the half. Codes and zero points are int4 in two's complement; the +8 
 MatMulNBits adds cancels between the two fields, so the stored nibbles are used as they are.
 FACTS §7.13 established that layout by known-answer write and §7.15 against shipped bytes.
 
+### The `.fconst` MLP section
+
+The MLP section fills the rest of the layer block after the second norm, in three parts:
+
+| part | shape | layout |
+|---|---|---|
+| `gate` + `up` | ONE fused `hidden x 2*intermediate` tensor, its rows interleaved in 32-column chunks (gate 32, up 32, gate 32, …) | 128-column groups of 4,288-byte subvolumes, `2*(K/128) + 2` per group |
+| — | — | one 64-byte parameter subvolume (`01 00 …`, the same bytes in every layer block) |
+| `down_proj` | `intermediate x hidden` | 64-column groups of the 2,176-byte subvolume above, `2*(K/128) + 2` per group |
+
+The 4,288-byte subvolume is the same struct at a wider `Nsubv` (64 instead of 32): `[0, 4096)` quants,
+`[4096, 4160)` zero points with `(cp%4) + kk*4 + (cp/4)*512` as the quant index for `cp = (col%64)/2`,
+and `[4160, 4288)` 64 bf16 scales. The writers' own headers
+(`mladfQuantMatrix`/`mladfWgtSubv` in the vendor wheel's `ops_common/mladf_matmul_matrix.hpp`, and
+`concat_gate_up` in `matmulbias_weights_gateup.cpp`) are what it was derived from; the geometry is not a
+constant, it is a **measurement**: the three parts have to fill the block stride exactly, and if they do
+not the projections are refused by name with the size they did add up to (`npu-pack info` reports the
+measured unit and group counts).
+
+Two independent decodes agree on every byte of it, which is how the layout was established without a
+vendor instrument for this width (the packer segfaults on the fused `N=9728`): the decode program stores
+gate/up fused at `Nsubv 64`, while the **prefill** program stores them separately at `Nsubv 32` — the same
+weights in two different physical layouts, and the check between them is byte identity on codes, scales and
+zero points for all 24 layers x {gate, up, down}. `tests/golden/oga_mlp_gu_group.bin` is one 68,608-byte
+unit copied verbatim from the pack by `tools/oga_mlp_gu_golden.py`, with the container tiles its two
+projections give, so the same decode runs in CI against the vendor writer's bytes.
+
+**Scope, stated as a refusal rather than a hope:** this closed form fits hidden 896 / intermediate 4864
+exactly. Qwen3-1.7B (hidden 2048) and Qwen3-4B (hidden 2560) do not add up — their MLP sections are larger
+than this tiling predicts, i.e. their writer used different kernel shapes, which is the same
+runtime-supported-shapes table engine#734 ran into. Those packs refuse the MLP projections with the
+number.
+
 Which tile belongs to which projection is **measured, not assumed**: on the shipped 0.5B pack the
 tiles' bias subvolumes matched the pack's own q/k/v bias vectors, which identifies the runs as
 k (2 tiles), q (14), v (2), o (14) — 32 tiles, the payload's whole size. A pack whose payload is
@@ -523,15 +557,10 @@ importer cannot represent exits 3 and lists every tensor it refused with the rea
 partial model never lands in a model directory by accident. With `--allow-incomplete` it writes
 what it can and records the rest in the container's `__metadata__` (`incomplete`) and in
 `config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
-that is now **218 tensors, 25,136 tiles** (embedding, head, 48 layer norms, 96 attention
-projections, 72 attention biases) and **73 refusals**: the 24 x 3 MLP projections, whose section of
-the `.fconst` is 16 subvolumes of 4,288 B per 128-row unit (64 output rows per column group, i.e. the
-vendor writer's `Nsubv 64` instance) carrying **one fused gate/up tensor whose rows interleave in
-32-row chunks** — the unit size and the interleave are established from the writer's own headers, the
-intra-subvolume byte order is not, and the packer this importer checks against emits only the
-2,176-byte instance for K=896, so those tiles cannot be re-encoded and byte-verified the way the
-attention tiles are; and the final norm, whose 1,856-byte tail envelope turned out to be
-`[eps][pad][448 f32]` and not an RMSNorm weight on either `.fconst`.
+that is now **290 tensors, 67,088 tiles** (embedding, head, 48 layer norms, 96 attention
+projections, 72 attention biases, 72 MLP projections) and **one refusal**: the final norm, whose
+1,856-byte tail envelope turned out to be `[eps][pad][448 f32]` and not an RMSNorm weight on either
+`.fconst`.
 
 The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
 opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as

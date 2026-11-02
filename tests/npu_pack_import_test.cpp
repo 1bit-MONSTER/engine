@@ -26,9 +26,12 @@
 //    importer's decoder must re-encode it to the same bytes, and its container output must match
 //    the recorded q4_1 tiles. That checks the tile layout against the vendor writer's own
 //    output with no vendor stack present -- which is what a CI run has.
-// 5. With a pack dir: `1bit npu-pack`'s plan refuses the MLP projections and the final norm by
-//    name, imports the attention projections and their biases, and produces a container the
-//    engine's own Model can open.
+// 4b. The same, for the MLP section's 68,608-byte gate|up unit
+//    (tests/golden/oga_mlp_gu_group.bin, tools/oga_mlp_gu_golden.py): one decode, then the fused
+//    tensor split into gate and up, both against their recorded container tiles.
+// 5. With a pack dir: `1bit npu-pack`'s plan refuses only the final norm, imports the attention
+//    projections and their biases and the MLP projections, and produces a container the engine's
+//    own Model can open.
 
 #include "model.h"
 #include "pack.h"
@@ -513,6 +516,124 @@ void test_attn_tile(const std::string& golden_dir) {
                 tiled.size() / onebit::npu::kTileBytes);
 }
 
+// ── 3c. the .fconst gate|up unit against shipped pack bytes ─────────────────
+void test_mlp_gu(const std::string& golden_dir) {
+    if (golden_dir.empty()) return;
+    const std::string path = golden_dir + "/oga_mlp_gu_group.bin";
+    std::ifstream f(path, std::ios::binary);
+    if (!f) {
+        std::printf("skip MLP golden: %s absent\n", path.c_str());
+        return;
+    }
+    std::vector<uint8_t> group((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const int k = 896;
+    const int64_t want = pi::group_bytes(k, 128);
+    check(int64_t(group.size()) == want,
+          "MLP golden: the fixture is one " + std::to_string(want) + "-byte gate|up unit of K=" +
+              std::to_string(k) + " (got " + std::to_string(group.size()) + ")");
+    if (int64_t(group.size()) != want) return;
+
+    const pi::TileW g = pi::decode_tile(group.data(), k, 128);
+    check(g.rows == 128 && g.code.size() == 128u * size_t(k),
+          "MLP golden: the unit decodes to 128 columns");
+    const std::vector<uint8_t> back = pi::encode_tile(g);
+    check(back == group, "MLP golden: encode(decode(unit)) reproduces the pack's bytes exactly");
+    if (back != group)
+        for (size_t i = 0; i < std::min(back.size(), group.size()); ++i)
+            if (back[i] != group[i]) {
+                std::fprintf(stderr, "  first difference at byte %zu: ours %02x, pack %02x\n", i, back[i],
+                             group[i]);
+                break;
+            }
+    {
+        pi::TileW bad = g;
+        bad.code[70] ^= 0x01;
+        check(pi::encode_tile(bad) != group, "MLP golden: a single changed code nibble is caught");
+        pi::TileW bad2 = g;
+        bad2.scale[100] *= 1.004f;
+        check(pi::encode_tile(bad2) != group, "MLP golden: a one-ulp scale change is caught");
+    }
+
+    // engine#849's class at the MLP width: the round trip above cannot see the zero-point pairing (it is
+    // invariant under any permutation applied on both sides), and the fused unit's 4,288-byte subvolume
+    // carries 64 rows per half instead of 32, so the same two checks are made here at `rows = 128`.
+    {
+        const int kbs = k / 128;
+        const int64_t subv = pi::group_bytes(k, 128) / (2 * kbs + 2);
+        const int subv_rows = 64;                       // = rows / 2 for the fused width
+        std::vector<uint8_t> raw(size_t(pi::group_bytes(k, 128)), 0);
+        for (int h = 0; h < 2; ++h)
+            for (int kb = 0; kb < kbs; ++kb)
+                for (int i = 0; i < subv_rows / 2; ++i)
+                    raw[size_t((2 + 2 * kb + h) * subv + 64 * subv_rows + i)] = uint8_t(i | ((15 - i) << 4));
+        const pi::TileW z = pi::decode_tile(raw.data(), k, 128);
+        bool pairs_even_odd = true;
+        for (int h = 0; h < 2 && pairs_even_odd; ++h)
+            for (int kb = 0; kb < kbs && pairs_even_odd; ++kb)
+                for (int i = 0; i < subv_rows / 2; ++i)
+                    pairs_even_odd = z.zp[size_t(h * subv_rows + 2 * i) * size_t(kbs) + size_t(kb)] == uint8_t(i) &&
+                                     z.zp[size_t(h * subv_rows + 2 * i + 1) * size_t(kbs) + size_t(kb)] ==
+                                         uint8_t(15 - i);
+        check(pairs_even_odd, "MLP golden: zero-point nibbles pair with rows 2i / 2i+1 (even/odd) at 128 rows");
+
+        // and on the pack's own unit: a correctly paired zero point sits where its 128 codes cluster
+        double n = 0, sz = 0, sm = 0, szz = 0, smm = 0, szm = 0;
+        for (int r = 0; r < 128; ++r)
+            for (int b = 0; b < kbs; ++b) {
+                double sum = 0;
+                for (int c = 0; c < 128; ++c) sum += g.code[size_t(r) * size_t(k) + size_t(b * 128 + c)];
+                const double m = sum / 128.0, zz = double(g.zp[size_t(r) * size_t(kbs) + size_t(b)]);
+                n += 1; sz += zz; sm += m; szz += zz * zz; smm += m * m; szm += zz * m;
+            }
+        const double cov = szm / n - (sz / n) * (sm / n);
+        const double sd = std::sqrt(std::max(0.0, szz / n - (sz / n) * (sz / n)));
+        const double sm2 = std::sqrt(std::max(0.0, smm / n - (sm / n) * (sm / n)));
+        const double corr = (sd > 0 && sm2 > 0) ? cov / (sd * sm2) : 0.0;
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                      "MLP golden: the zero points sit under their own codes (corr %+0.4f, want > 0.9)", corr);
+        check(corr > 0.9, buf);
+    }
+
+    // the fused unit holds gate and up interleaved in 32-column chunks: both halves have to reproduce the
+    // container tiles recorded from an independent decode of the same bytes
+    std::ifstream qf(golden_dir + "/oga_mlp_gu_q4_1.bin", std::ios::binary);
+    std::vector<uint8_t> golden((std::istreambuf_iterator<char>(qf)), std::istreambuf_iterator<char>());
+    std::vector<uint8_t> tiled;
+    for (const bool up : {false, true}) {
+        const pi::Q4 q = pi::q_from_tiles({pi::gu_half(g, up)});
+        std::vector<uint8_t> part;
+        pi::tile_q4_1(q, part);
+        tiled.insert(tiled.end(), part.begin(), part.end());
+    }
+    check(golden.size() == tiled.size(),
+          "MLP golden: gate and up give " + std::to_string(tiled.size() / onebit::npu::kTileBytes) +
+              " container tiles of 64 rows each");
+    check(golden == tiled, "MLP golden: container tiles byte-identical to the recorded ones");
+    if (golden != tiled)
+        for (size_t i = 0; i < std::min(golden.size(), tiled.size()); ++i)
+            if (golden[i] != tiled[i]) {
+                std::fprintf(stderr, "  first tile difference at byte %zu: golden %02x, ours %02x\n", i,
+                             golden[i], tiled[i]);
+                break;
+            }
+
+    // the split has to be able to fail: swapping the two halves of one column-block must change the tiles
+    {
+        pi::TileW swapped = g;
+        const size_t kb = size_t(k);
+        for (int r = 0; r < 32; ++r) {
+            std::swap_ranges(&swapped.code[size_t(r) * kb], &swapped.code[size_t(r) * kb] + kb,
+                             &swapped.code[size_t(32 + r) * kb]);
+        }
+        std::vector<uint8_t> other;
+        pi::tile_q4_1(pi::q_from_tiles({pi::gu_half(swapped, false)}), other);
+        check(other != tiled, "MLP golden: a gate/up swap inside a column block is caught");
+    }
+    std::printf("MLP golden: 1 unit, encode/decode exact, %zu container tiles identical\n",
+                tiled.size() / onebit::npu::kTileBytes);
+}
+
 void test_pack(const std::string& pack, const std::string& golden_dir) {
     const pi::Plan p = pi::plan(pack);
     const int layers = p.dims.layers;
@@ -521,50 +642,39 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
           "pack: geometry from config.json and the embedding");
     if (qwen05b) check(true, "pack: this is the Qwen2.5-0.5B geometry the lane started from");
     const auto refused = p.refused();
-    // Refusals are counted by what they are, not by a total that only holds for one family: the MLP payload
-    // (#842) and the final norm (#844) are open for every pack, while the attention projections are refused
-    // only when the measured payload is not a whole number of tiles - which is the Llama pack's case and not
-    // the Qwen family's.  engine#734's acceptance is the FIRST row: no layer norm may be refused.
-    int mlp = 0, tail = 0, attn = 0, norm = 0, other = 0;
-    for (const auto& t : p.tensors) {
-        if (t.refusal.empty()) continue;
-        const std::string& n = t.name;
-        const bool is_norm = n.find("layernorm") != std::string::npos || n == "model.norm.weight";
-        if (is_norm && n != "model.norm.weight") ++norm;
-        else if (n == "model.norm.weight") ++tail;
-        else if (n.find("mlp.") != std::string::npos) ++mlp;
-        else if (n.find("self_attn") != std::string::npos) ++attn;
-        else ++other;
-    }
-    check(norm == 0, "pack: no layer norm is refused at hidden " + std::to_string(p.dims.hidden) +
-                         " (engine#734; 2 per layer planned, " + std::to_string(norm) + " refused)");
-    check(mlp == layers * 3, "pack: the " + std::to_string(layers * 3) + " MLP projections are refused by name, got " +
-                                 std::to_string(mlp));
-    check(tail == 1, "pack: the final norm is the one refused norm");
-    check(attn == (p.attn_note.empty() ? 0 : layers * 7),
-          "pack: attention projections are refused only when the payload does not tile (" +
-              std::to_string(attn) + " of " + std::to_string(layers * 7) + ")");
-    check(other == 0, "pack: no refusal falls outside the named classes");
+    // the MLP section is representable when its three parts fill the block stride; when they do not, all
+    // three projections per layer are refused by name, and the final norm always is
+    check(int(refused.size()) == (p.mlp_note.empty() ? 0 : layers * 3) + 1,
+          "pack: the MLP projections (refused only when their geometry does not add up) plus the final "
+          "norm, got " + std::to_string(refused.size()));
     bool named = true;
     for (const auto& s : refused)
-        if (s.find(".fconst") == std::string::npos && s.find("payload") == std::string::npos) named = false;
-    check(named, "pack: every refusal names the .fconst or the measured attention payload");
+        if (s.find("fconst") == std::string::npos && s.find("layer block") == std::string::npos) named = false;
+    check(named, "pack: every refusal names where the bytes are and the fact that is missing");
     check(p.attn_note.empty() == (p.attn_tiles > 0),
           "pack: the attention payload's tile count was measured, or the note says why not (" +
               std::to_string(p.attn_tiles) + " tiles)");
+    check(p.mlp_note.empty() == (p.mlp_gu_units > 0),
+          "pack: the MLP section's geometry was measured, or the note says why not (" +
+              std::to_string(p.mlp_gu_units) + " gate|up units)");
+    if (p.mlp_note.empty())
+        check(p.mlp_gu_units == p.dims.intermediate / 64 && p.mlp_down_groups == p.dims.hidden / 64,
+              "pack: 64 columns per gate|up unit and per down_proj group");
 
-    int norms = 0, attn_planned = 0, lm_tiles_planned = 0;
+    int norms = 0, attn = 0, mlp = 0, lm_tiles_planned = 0;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
             lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn_planned;
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn;
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp;
     }
     check(norms == layers * 2 + 1,
           "pack: 2 norms per layer plus the final norm are planned (the final one refused)");
-    check(p.attn_note.empty() ? attn_planned == layers * 4 : true,
-          "pack: the 4 attention projections per layer are planned when the payload tiled (" +
-              std::to_string(attn_planned) + ")");
+    check(attn == layers * 4, "pack: the 4 attention projections per layer are planned from the measurement");
+    check(mlp == (p.mlp_note.empty() ? layers * 3 : 0),
+          "pack: gate/up/down are planned when the MLP geometry adds up, refused otherwise (" +
+              std::to_string(mlp) + ")");
     // K is padded to the 256-column grid, so this holds for any hidden size
     const int head_rows = int(p.tensors.at(1).shape.at(0));
     check(lm_tiles_planned == (head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
@@ -619,6 +729,21 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
                   std::to_string(r.attn_tiles_total) + " tiles, " +
                   std::to_string(r.attn_bias_tensors) + " biases)");
 
+    // the MLP section, same contract: every group decoded and re-encoded byte-identically, and what came
+    // out of them is in the container
+    if (p.mlp_note.empty()) {
+        check(r.mlp_groups_total > 0 && r.mlp_groups_ok == r.mlp_groups_total,
+              "pack: every MLP group decoded and re-encoded byte-identically (" +
+                  std::to_string(r.mlp_groups_ok) + "/" + std::to_string(r.mlp_groups_total) + ")");
+        check(r.mlp_projections == layers * 3,
+              "pack: gate/up/down were imported for every layer (" +
+                  std::to_string(r.mlp_projections) + ")");
+        if (qwen05b)
+            check(r.mlp_groups_total == layers * (p.dims.intermediate / 64 + p.dims.hidden / 64),
+                  "pack: 0.5B imports 76 gate|up units and 14 down groups per layer (" +
+                      std::to_string(r.mlp_groups_total) + " groups)");
+    }
+
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
     const auto& head = m.tensor("lm_head.weight");
@@ -632,6 +757,16 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
               "pack: an imported projection is q4_1 chunks of the container's tile size");
         check(m.tensor("model.layers.0.self_attn.q_proj.bias").shape.at(0) == int64_t(p.dims.heads * p.dims.head_dim),
               "pack: the q_proj bias is one bf16 value per output row");
+    }
+    if (r.mlp_projections) {
+        const auto& gw = m.tensor("model.layers.0.mlp.gate_proj.weight");
+        const auto& dw = m.tensor("model.layers.0.mlp.down_proj.weight");
+        check(gw.shape.at(1) == int64_t(onebit::npu::kTileBytes) && dw.shape.at(1) == int64_t(onebit::npu::kTileBytes),
+              "pack: the MLP projections are q4_1 chunks of the container's tile size");
+        check(gw.shape.at(0) == int64_t((p.dims.intermediate / 32) * ((p.dims.hidden + 255) / 256)),
+              "pack: gate_proj's tile count follows from its shape and the 256-column grid");
+        check(dw.shape.at(0) == int64_t((p.dims.hidden / 32) * ((p.dims.intermediate + 255) / 256)),
+              "pack: down_proj's tile count follows from its shape and the 256-column grid");
     }
     check(m.dims().hidden == p.dims.hidden && m.dims().layers == layers,
           "pack: config.json drives the loader");
@@ -704,7 +839,7 @@ int main(int argc, char** argv) {
         test_matmulnbits();
         test_tiles(golden_dir);
         test_attn_tile(golden_dir);
-        test_fconst_eps(golden_dir.empty() ? "/tmp" : golden_dir);
+        test_mlp_gu(golden_dir);
         if (!pack.empty() && fs::exists(pack + "/model.onnx")) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given\n");
     } catch (const std::exception& e) {

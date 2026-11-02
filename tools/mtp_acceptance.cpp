@@ -76,6 +76,7 @@ static int argmax_n(const std::vector<float>& v) {
 int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, const Weights& w, int prompts,
                 int tokens, int k, int prompt_base, bool residual) {
     int d_hit[16] = {0}, d_tot[16] = {0};
+    int c_hit[16] = {0}, c_tot[16] = {0};    // conditional on the prefix being accepted (the live loop's estimator)
     double cos_sum = 0, rel_sum = 0;
     int cos_n = 0;
     std::vector<int> all_tokens;        // the token stream: prompt + emitted
@@ -142,14 +143,27 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
             std::vector<float> h = hidden[i], e2, nx;
             int tok = all_tokens[i];
             int pos = (int)i + 1;
+            // Two estimators, because they are not the same quantity and the live loop only produces one of them.
+            // Unconditional (d_hit/d_tot, what the published 3.19 is): depth j is scored at every position, even
+            // where draft j-1 was already wrong -- so the chain is running off-distribution for most of its length.
+            // Conditional (c_hit/c_tot): depth j is scored only while every earlier draft was accepted, which is
+            // exactly what the live loop does (a reject ends the chain).  Comparing the live loop's per-depth table
+            // against the unconditional one compares a conditional rate with an unconditional rate.
+            bool prefix_ok = true;
             for (int j = 0; j < k; j++) {
                 if (i + j + 1 >= hidden.size()) break;
                 base.embed_into(tok, e2);
                 if (!head_step(w, h.data(), e2.data(), pos, c, nx, lm, lg)) break;
                 int d = argmax_n(lg);
+                const bool hit = (d == all_tokens[i + j + 1]);
                 d_tot[j]++;
                 p_tot[j]++;
-                if (d == all_tokens[i + j + 1]) { d_hit[j]++; p_hit[j]++; }
+                if (hit) { d_hit[j]++; p_hit[j]++; }
+                if (prefix_ok) {
+                    c_tot[j]++;
+                    if (hit) c_hit[j]++;
+                    if (!hit) prefix_ok = false;
+                }
                 tok = d;
                 h = nx;
                 pos++;
@@ -170,6 +184,14 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
         std::printf("  draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, d_hit[j], d_tot[j]);
         expected += r;
     }
+    double c_expected = 1.0;
+    std::printf("  conditional on an accepted prefix (the live loop's estimator):\n");
+    for (int j = 0; j < k; j++) {
+        const double r = c_tot[j] ? (double)c_hit[j] / c_tot[j] : 0.0;
+        std::printf("    draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, c_hit[j], c_tot[j]);
+        c_expected += r;
+    }
+    std::printf("    expected tokens per pass (chain) %.2f\n", c_expected);
     std::printf("  hit rate %d/%d = %.3f; expected tokens per pass (chain) %.2f\n", d_hit[0], d_tot[0],
                 d_tot[0] ? (double)d_hit[0] / d_tot[0] : 0.0, expected);
     return 0;
@@ -182,7 +204,7 @@ int main(int argc, char** argv) {
     std::string model_dir, head_exact, head_q4k;
     int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
-    bool residual = false, dry = false, selftest = false, offline = false, live = false;
+    bool residual = false, dry = false, selftest = false, offline = false, live = false, batchcheck = false;
     std::string gold;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -201,6 +223,7 @@ int main(int argc, char** argv) {
         else if (a == "--gold") gold = nexts();
         else if (a == "--offline") offline = true;
         else if (a == "--live") live = true;
+        else if (a == "--batchcheck") batchcheck = true;
         else if (a == "--fc-hidden-first") g_fc_hidden_first = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
@@ -274,6 +297,102 @@ int main(int argc, char** argv) {
     drafter.set_tau(tau);          // the chain gate the run was asked for (offline forces its own)
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
+
+    if (batchcheck) {
+        // Does the deferred batch verify give the same answer as plain decode?
+        //
+        // This is the one engine property the draft loop rests on and the only one never checked directly: acceptance
+        // compares a draft against the BASE's own choice at that position, and it reads that choice from the M=nd
+        // verify batch (row i-1) for draft i, while draft 1 is read from a plain step.  So a batch whose per-row argmax
+        // differs from sequential decode would leave depth 1 untouched and depress every deeper depth -- exactly the
+        // signature the live loop shows.  Identical TEXT does not check this: the loop only ever emits from the row at
+        // the accepted-prefix boundary, and a wrongly REJECTED draft costs a pass, never a token.
+        //
+        // Pass A decodes greedily, recording the argmax at every position.  Pass B walks the same stream in nd-row
+        // batches (committing every row, since all of them are the stream's own tokens) and compares each row's argmax
+        // with pass A's.  Cost: one decode plus one pass at 1/nd the step count.
+        const int nd = std::min(k, base.max_batch_rows());
+        for (int p = 0; p < prompts; p++) {
+            const int pi = prompt_base + p;
+            std::vector<int> ids;
+            for (int i = 0; i < 8; i++) ids.push_back((pi * 977 + i * 131 + 17) % (base.vocab() - 1) + 1);
+            fwd.reset();
+            std::vector<float> lg;
+            std::vector<int> stream = ids, seq;
+            std::vector<std::vector<float>> hid_ref;   // pass A's hidden at every position
+            for (size_t i = 0; i < ids.size(); i++) {
+                if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+                hid_ref.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+            }
+            for (int t = 0; t < tokens; t++) {
+                int best = 0;
+                for (size_t i = 1; i < lg.size(); i++) if (lg[i] > lg[best]) best = (int)i;
+                seq.push_back(best);
+                stream.push_back(best);
+                if (!fwd.step(best, (int)ids.size() + t, lg)) { std::fprintf(stderr, "step failed\n"); return 1; }
+                hid_ref.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+            }
+            fwd.reset();
+            const int n = (int)stream.size();
+            int checked = 0, differ = 0, first_differ = -1;
+            int hid_rows = 0, worst_pos = -1;
+            double min_cos = 2.0, max_abs = 0;
+            int pos = 0;
+            // prefill the prompt one position at a time, so pass B starts from the same state pass A did
+            for (size_t i = 0; i < ids.size(); i++)
+                if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+            pos = (int)ids.size();
+            std::vector<float> all;
+            while (pos + nd <= n) {
+                std::vector<int> rows(stream.begin() + pos, stream.begin() + pos + nd);
+                if (!base.step_batch_all(rows, pos, all)) { std::fprintf(stderr, "batch failed\n"); return 1; }
+                for (int m = 0; m < nd; m++) {
+                    int best = 0;
+                    const float* l = &all[(size_t)m * (size_t)base.vocab()];
+                    for (int i = 1; i < base.vocab(); i++) if (l[i] > l[best]) best = i;
+                    // row m's logits predict the token AFTER position pos+m; pass A recorded that as seq[pos+m-7]
+                    const int want_at = pos + m - (int)ids.size() + 1;
+                    if (want_at < 0 || want_at >= (int)seq.size()) continue;
+                    checked++;
+                    if (best != seq[(size_t)want_at]) {
+                        differ++;
+                        if (first_differ < 0) first_differ = pos + m + 1;   // the position row m predicts
+                    }
+                }
+                {
+                    // The other half of "is the batch the same as decode": the batch's per-row HIDDEN, which is what
+                    // the drafter commits into its stream (last_hidden_rows()[m]).  The same argmax over a slightly
+                    // different hidden would still poison every later draft, and only this comparison sees it.
+                    const std::vector<float>& rows_h = base.last_hidden_rows();
+                    const size_t H = (size_t)base.hidden_size();
+                    for (int m = 0; m < nd && (pos + m) < (int)hid_ref.size(); m++) {
+                        if (rows_h.size() < (size_t)(m + 1) * H) break;
+                        const float* a = &rows_h[(size_t)m * H];
+                        const std::vector<float>& b = hid_ref[(size_t)pos + (size_t)m];
+                        double dot = 0, na = 0, nb = 0, md = 0;
+                        for (size_t q = 0; q < H && q < b.size(); q++) {
+                            dot += (double)a[q] * b[q];
+                            na += (double)a[q] * a[q];
+                            nb += (double)b[q] * b[q];
+                            const double d = std::fabs((double)a[q] - b[q]);
+                            if (d > md) md = d;
+                        }
+                        const double cos = dot / std::sqrt(na * nb + 1e-30);
+                        hid_rows++;
+                        if (cos < min_cos) { min_cos = cos; worst_pos = pos + m; }
+                        if (md > max_abs) max_abs = md;
+                    }
+                }
+                if (!base.commit_verify(nd)) { std::fprintf(stderr, "commit refused\n"); return 1; }
+                pos += nd;
+            }
+            std::printf("prompt %d: batch argmax vs sequential argmax: %d of %d rows differ (first at position %d)\n",
+                        pi, differ, checked, first_differ);
+            std::printf("  batch hidden rows vs sequential hidden: %d rows, min cos %.6f (position %d), max |diff| %.3e\n",
+                        hid_rows, min_cos, worst_pos, max_abs);
+        }
+        return 0;
+    }
 
     if (live) {
         // The gate that matters for switching a serve over: the speculative loop must emit exactly the tokens

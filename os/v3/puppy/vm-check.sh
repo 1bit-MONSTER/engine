@@ -63,8 +63,18 @@ while [ $i -lt 60 ]; do
     hostport=$((hostport + 2))
     i=$((i + 1))
 done
+# 22 is forwarded too: U7 is "the stick authorises the owner's key", and the only honest way to check it
+# is to log in with that key over the network rather than to look at the file.
+sshport=2222
+i=0
+while [ $i -lt 60 ]; do
+    ss -lnt 2> /dev/null | grep -q ":$sshport " || break
+    sshport=$((sshport + 2))
+    i=$((i + 1))
+done
 # shellcheck disable=SC2054  # qemu arguments carry commas inside a single word
-net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$hostport"-:13305 -device virtio-net-pci,netdev=n0)
+net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$hostport"-:13305,hostfwd=tcp:127.0.0.1:"$sshport"-:22
+     -device virtio-net-pci,netdev=n0)
 case $iso in
 *.img)
     # the shipped artifact: firmware boots the ESP, grub reads the data partition
@@ -126,6 +136,27 @@ if artifact.endswith(".img"):
         s.sendall(b"\x1b[B\r")
         print("INFO boot           grub menu on serial, selected the serial-shell entry", flush=True)
 
+def read_until_re(pattern, timeout):
+    """Like read_until, but for a regex; returns the text up to and including the match."""
+    global buf
+    stop = time.time() + timeout
+    while time.time() < stop:
+        m = re.search(pattern, buf)
+        if m:
+            out, buf = buf[:m.end()], buf[m.end():]
+            return out.decode("utf-8", "replace")
+        s.settimeout(0.5)
+        try:
+            d = s.recv(65536)
+        except socket.timeout:
+            continue
+        except OSError:
+            return None
+        if not d:
+            return None
+        log.write(d); buf += d
+    return None
+
 # Wait for the shell itself, not only for the service's banner: on the cycle-4 image the shell came up and
 # answered (root@puppypc31992:/$) while the banner never reached ttyS0, because rc.services' stdout at that
 # point is not the console. Either evidence is enough, and a bare newline coaxes a prompt out.
@@ -154,6 +185,8 @@ def wait_shell(timeout):
 if not wait_shell(240):
     print("FAIL boot           no serial shell: no 21serial-console in the image, or it never ran", flush=True)
     sys.exit(2)
+buf = b""   # the menu and the boot log are not row output
+s.sendall(b"\n")
 
 rows = [
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
@@ -180,13 +213,15 @@ rows = [
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]
 for idx, (name, cmd, want) in enumerate(rows):
-    sentinel = "__DONE%d__" % idx
-    s.sendall((cmd + "; echo " + sentinel + "\n").encode())
-    out = read_until(sentinel.encode(), 180)
+    # The sentinel is expanded by the shell, so the terminal's echo of the command line shows
+    # "__DONE_$(date +%s%N)__" and only the real answer carries digits. A literal sentinel matched its own
+    # echo: every row after the first came back with an empty body and was reported as a failure.
+    s.sendall((cmd + "; echo __DONE_$(date +%s%N)__\n").encode())
+    out = read_until_re(rb"__DONE_[0-9]{10,}__", 180)
     if out is None:
         print("FAIL %-13s no answer" % name, flush=True)
         continue
-    body = out.split(sentinel)[0]
+    body = re.sub(r"__DONE_[0-9]{10,}__", "", out)
     body = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", body)
     body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmd[:24] not in l)
     flat = body.replace("\n", " | ")
@@ -212,6 +247,17 @@ if [ -n "${key:-}" ]; then
     fi
 else
     echo "SKIP U3 lan        no key in the transcript"
+fi
+# U7, over the wire: SSHKEY=<private key> and the key half of which must be in the image's keys.
+if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
+    said=$(timeout 30 ssh -p "$sshport" -i "$SSHKEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
+        -o UserKnownHostsFile=/dev/null root@127.0.0.1 'uname -r; command -v 1bit' 2>&1 | tr '\n' ' ')
+    case $said in
+    *7.3.0-rc4-1bit*) echo "PASS U7 ssh        $said" ;;
+    *) echo "FAIL U7 ssh        $said" ;;
+    esac
+else
+    echo "SKIP U7 ssh        set SSHKEY=<private key> whose public half is in the image"
 fi
 echo "SKIP U4 hardware   HRX chat on the 8060S, the NPU through Lemonade, efivarfs/Secure Boot, boot time: board rows"
 echo "== $iso, transcript $work/serial.log"

@@ -147,26 +147,38 @@ above are the evidence, not the file size).
 
 **What the device leg is worth, measured.** `onebit_npu_gemm_q8_probe` puts one shape through the same
 `gemm_q8_raw` and through the EP's own host loop with int8 operands, requires their exact int32 accumulators to
-be identical, and times both. strixhalo, M=32 designs, `-O2` build, load 4.9 on 32 cores, taken in an
-`npu-hold` ticket:
+be identical, and times both — `repeats` calls *timed* on each leg after one untimed device warm-up, and the
+min of three runs per cell. strixhalo, M=32 designs, `-O2` build, load 9–10 on 32 cores, in an `npu-hold`
+ticket:
 
-| shape | rows | device ms/call | host ms/call | |
+| shape | rows | device ms/call | host ms/call | device vs host |
 |---|---|---|---|---|
-| 1024×2048 (q) | 1 | 1.478 | 0.161 | device 9× **slower** |
-| | 8 | 1.883 | 1.318 | 1.4× slower |
-| | 16 | 1.509 | 3.243 | 2.2× faster |
-| | 32 | 1.497 | 5.796 | 3.9× faster |
-| 1024×1024 (k, v) | 1 / 32 | 0.781 / 0.887 | 0.078 / 2.956 | |
-| 1024×3072 (gate, up) | 1 / 32 | 2.246 / 2.618 | 0.239 / 8.400 | |
-| 2048×1024 (o) | 1 / 32 | 1.441 / 1.469 | 0.158 / 5.686 | |
-| 3072×1024 (down) | 1 / 32 | 2.153 / 2.552 | 0.248 / 8.071 |
+| 1024×2048 (q) | 1 | 1.501 | 0.158 | 9.5× **slower** |
+| | 2 | 1.550 | 0.317 | 4.9× slower |
+| | 4 | 1.526 | 0.669 | 2.3× slower |
+| | 8 | 1.515 | 1.319 | 1.1× slower |
+| | 16 | 1.529 | 2.550 | 1.7× faster |
+| | 32 | 1.566 | 5.062 | 3.2× faster |
+| 1024×1024 (k, v) | 1 / 32 | 0.781 / 0.824 | 0.078 / 2.529 | 10× slower / 3.1× faster |
+| 1024×3072 (gate, up) | 1 / 32 | 2.440 / 2.425 | 0.235 / 7.765 | 10.4× slower / 3.2× faster |
+| 2048×1024 (o) | 1 / 32 | 1.499 / 1.493 | 0.180 / 5.017 | 8.3× slower / 3.4× faster |
+| 3072×1024 (down) | 1 / 32 | 2.209 / 2.311 | 0.250 / 7.602 | 8.8× slower / 3.3× faster |
 
-A call costs the same at 1 row and at 32 (1.44–1.50 ms for q_proj, and an M=128 design at one row is 1.61 ms
-against M=32's 1.48), so it is **dispatch-bound**: a decode step pays one launch per projection — 196 of them on
-Qwen3-0.6B — and at one row that launch costs more than the host loop it replaces. So this is a prefill leg: it
-crosses over at ~8–16 rows and is 3–4× ahead at a full 32-row design. `docs/onnx-pack.md` therefore keeps it as
-correctness-only rather than quoting a device speedup, and a decode-side win would need fewer, longer launches
-(one launch covering many projections), not a smaller design.
+A call costs the same at 1 row and at 32 — q_proj is 1.501 ms against 1.566 ms, i.e. 32× the work for 4 % more
+time — so it is **dispatch-bound**: a decode step pays one launch per projection (196 of them on Qwen3-0.6B) and
+at one row that launch costs 8–10× the host loop it replaces. This is therefore a **prefill** leg: it crosses over
+between 8 and 16 rows and is 3.1–3.4× ahead at a full 32-row design. Design M is not the lever — an M=128
+design at one row measured 1.233 ms against M=32's 1.499 ms on 2048×1024 in this run and 1.606 vs 1.441 in an
+earlier one, i.e. the two are within run-to-run variance at decode width and neither changes the picture. The
+host column is a **lower bound**: it is the accumulation loop only, while the EP's real fallback then runs
+`epilogue_row` (a float multiply and a `q8_quantize` per element), so the 8–16-row crossover is optimistic *for
+the device*. `docs/onnx-pack.md` therefore keeps the device leg correctness-only rather than quoting a device
+speedup, and a decode-side win would need fewer, longer launches (one launch covering many projections), not a
+smaller design.
+
+*(An earlier revision of this table was ~5 % low on the device column: the probe timed `repeats-1` calls and
+divided by `repeats`. The figures above are the corrected ones, and `repeats < 2` — which used to print
+`device 0.000 ms/call` and a four-digit speedup — is now refused with exit 2.)*
 
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the

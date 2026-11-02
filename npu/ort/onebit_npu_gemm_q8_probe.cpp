@@ -21,13 +21,19 @@
 // accumulators to be identical — an exact integer sum cannot differ, so a difference here is a
 // wrong layout or a truncated K, not rounding.
 //
-//   onebit_npu_gemm_q8_probe <K> <N> <M> [repeats]
+//   onebit_npu_gemm_q8_probe <K> <N> <M> [repeats]      (repeats >= 2: it is the sample count)
 //
-// The design M is a property of the ELF, so (K, N) and M must match it:
-//   ONEBIT_EP_NPU_ELFS=16x1024x2048=/path/full_i8_Q_K1024_N2048_m16.elf \
-//   onebit_npu_gemm_q8_probe 1024 2048 16 50
+// `repeats` is the number of calls *timed* on each leg, so both columns are an honest per-call
+// mean; one extra untimed device call runs first as the warm-up. repeats < 2 is refused, because a
+// timer with no sample would print 0.000 ms and a meaningless speedup.
 //
-// Exit: 0 the device ran the shape and matched, 1 the numbers differ, 2 bad usage,
+// The design M is a property of the ELF, so (K, N) and M must match it, and M=32 is the smallest this
+// family can emit (`n1_core_i8_v26.py` asserts M % m == 0 with the core tile m=32), so there is no _m16
+// design to point at:
+//   ONEBIT_EP_NPU_ELFS=32x1024x2048=/path/Q_K1024_N2048/design.elf \
+//   onebit_npu_gemm_q8_probe 1024 2048 32 50
+//
+// Exit: 0 the device ran the shape and matched, 1 the numbers differ, 2 bad usage (including repeats < 2),
 // 3 the device could not run it (no ELF for this K x N, busy, XRT failure) — nothing measured.
 #include "onebit_npu_gemm.h"
 
@@ -70,7 +76,7 @@ int main(int argc, char** argv) {
     }
     const int64_t k = atoll(argv[1]), n = atoll(argv[2]), m = atoll(argv[3]);
     const int repeats = argc > 4 ? atoi(argv[4]) : 20;
-    if (k <= 0 || n <= 0 || m <= 0 || repeats <= 0) return 2;
+    if (k <= 0 || n <= 0 || m <= 0 || repeats < 2) return 2;
     std::setvbuf(stdout, nullptr, _IOLBF, 0);
 
     // Sign-mixed int8 in the range a real A8W8 graph produces ([-127,127], never -128).
@@ -85,13 +91,15 @@ int main(int argc, char** argv) {
     for (auto& v : b) v = (int8_t)next();
 
     std::string err;
+    // Untimed: builds the kernel and takes the device lock, so it must not be inside d0.
     if (!onebit::npu::gemm_q8_raw(a.data(), m, k, n, b.data(), got.data(), &err)) {
         std::printf("NPU q8 gemm could not run: %s\n", err.c_str());
         return 3;
     }
 
+    // Exactly `repeats` timed calls on each leg, divided by `repeats` (see ms_per_call).
     const auto d0 = std::chrono::steady_clock::now();
-    for (int r = 1; r < repeats; r++) {
+    for (int r = 0; r < repeats; r++) {
         if (!onebit::npu::gemm_q8_raw(a.data(), m, k, n, b.data(), got.data(), &err)) {
             std::printf("NPU q8 gemm failed on repeat %d: %s\n", r, err.c_str());
             return 3;

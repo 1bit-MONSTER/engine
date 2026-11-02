@@ -233,14 +233,21 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
         std::printf("  draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, all.d_hit[j], all.d_tot[j]);
         expected += r;
     }
-    double c_expected = 1.0;
+    // A conditional rate is not a marginal, so the chain is NOT the sum of the rates printed below: by linearity
+    // E[tokens per pass] = 1 + sum_j P(draft j accepted) = 1 + sum_j c_hit[j]/c_tot[0] (c_tot[0] = chains scored),
+    // because P(accepted at depth j) = P(accepted at j | reached j) * P(reached j).
+    double c_expected = 1.0, c_mean_rate = 0.0;
+    const int chains = all.c_tot[0];
     std::printf("  conditional on an accepted prefix (the live loop's estimator):\n");
     for (int j = 0; j < k; j++) {
         const double r = all.c_tot[j] ? (double)all.c_hit[j] / all.c_tot[j] : 0.0;
         std::printf("    draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, all.c_hit[j], all.c_tot[j]);
-        c_expected += r;
+        c_mean_rate += r;
+        c_expected += chains ? (double)all.c_hit[j] / chains : 0.0;
     }
-    std::printf("    expected tokens per pass (chain) %.2f\n", c_expected);
+    std::printf("    mean conditional rate %.2f (rates at different depths are not additive, so this is not a chain)\n",
+                c_mean_rate);
+    std::printf("    expected tokens per pass (chain) %.2f = 1 + sum_j c_hit[j]/c_tot[0]\n", c_expected);
     std::printf("  hit rate %d/%d = %.3f; expected tokens per pass (chain) %.2f\n", all.d_hit[0], all.d_tot[0],
                 all.d_tot[0] ? (double)all.d_hit[0] / all.d_tot[0] : 0.0, expected);
     return 0;
@@ -549,7 +556,9 @@ int main(int argc, char** argv) {
             // be summed correctly afterwards (adding percentages weights a 16-iteration prompt like a 36 one).
             // Calls, not a claim: a full-vocab logits call is ~0.3-0.5 s of array dispatch chain, so this count is
             // the loop's real cost per iteration and the thing a cheaper head has to reduce.
-            std::printf("  logits calls %ld over %d iterations (%.2f/iter), %.1f ms/call of the draft phase\n", lm_used,
+            // The millisecond figure divides the WHOLE draft phase (base steps, verify batches, priming) by the
+            // logits count, so it is an amortised phase cost, not a head latency -- one call alone is ~0.3-0.5 s.
+            std::printf("  logits calls %ld over %d iterations (%.2f/iter), %.1f ms of the whole draft phase per call\n", lm_used,
                         r.stats.iterations, r.stats.iterations ? (double)lm_used / r.stats.iterations : 0.0,
                         lm_used ? 1000.0 * spec_s / (double)lm_used : 0.0);
             std::printf("  per-depth p%d:", pi);

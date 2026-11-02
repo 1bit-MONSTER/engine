@@ -196,13 +196,14 @@ s.sendall(b"\n")
 rows = [
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
-    ("U1 apt",       "apt update >/dev/null 2>&1; apt install -y neofetch >/dev/null 2>&1; command -v neofetch", "neofetch"),
+    ("U1 apt",       "apt update 2>&1 | tail -2; apt install -y neofetch 2>&1 | tail -2; command -v neofetch",
+                     "neofetch", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
     ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "
                      "echo key-on-data", "key-on-data"),
-    ("U3 catalogue", 'k=$(sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf); '
-                     'curl -s -H "Authorization: Bearer $k" http://127.0.0.1:13305/api/v1/models '
-                     '| tr "," "\n" | grep -c onebit', None),
+    ("U3 catalogue", "k=$(sed -n \"s/^LEMONADE_API_KEY=//p\" /etc/1bit/lemond.conf); "
+                     "curl -s -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models "
+                     "| grep -o onebit | wc -l", None),
     ("U3 api local", 'k=$(sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf); curl -s -o /dev/null '
                      '-w "http=%{http_code}" -H "Authorization: Bearer $k" http://127.0.0.1:13305/api/v1/models', "http=200"),
     ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf', None),
@@ -225,12 +226,14 @@ rows = [
     ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]
-for idx, (name, cmd, want) in enumerate(rows):
+for idx, row in enumerate(rows):
+    name, cmd, want = row[0], row[1], row[2]
+    limit = row[3] if len(row) > 3 else 180
     # The sentinel is expanded by the shell, so the terminal's echo of the command line shows
     # "__DONE_$(date +%s%N)__" and only the real answer carries digits. A literal sentinel matched its own
     # echo: every row after the first came back with an empty body and was reported as a failure.
     s.sendall((cmd + "; echo __DONE_$(date +%s%N)__\n").encode())
-    out = read_until_re(rb"__DONE_[0-9]{10,}__", 180)
+    out = read_until_re(rb"__DONE_[0-9]{10,}__", limit)
     if out is None:
         print("FAIL %-13s no answer" % name, flush=True)
         continue
@@ -247,7 +250,6 @@ for idx, (name, cmd, want) in enumerate(rows):
         print("FAIL %-13s %s" % (name, flat), flush=True)
 PY
 driver_rc=$?
-vmqemu
 cat "$work/rows.txt"
 
 # U3 over the network, from outside the guest.

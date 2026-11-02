@@ -29,10 +29,11 @@ how to build it. The Ubuntu Server `autoinstall` design stays the documented fal
 | `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem |
 | `g2-probe.sh` | gate G2: boot the built ISO headless in QEMU and keep the init's transcript, so "it boots on our kernel" is a measurement |
 | `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, `/lib/modules/<kver>` in its zdrv, and `amdxdna`/`ec_su_axb35` built for that kernel and signed. `--require-mok` for the release gate |
+| `mkimage.sh` | the shipped artifact: a GPT disk image (ESP with shim → grub, `1BIT-DATA` ext4 with the frugal install at `/1bit` and os/mini's data directories), so `os/mini/prepare-stick.sh` and the USB write work unchanged. The ISO stays a side artifact |
 | `vm-check.sh` | the TPUPPY-RELEASE rows that need no board, in QEMU over a serial root shell: bash + `sudo` + `apt install` (U1), lemond up with its key and `/api/v1/models` from inside the guest and over the forwarded port (U3), `1bit` on PATH and the EC driver in `ADDLIST` (U4). Hardware rows print as SKIP with the reason |
 | `packages-extra` | package rows the acceptance needs and woof-CE's set does not have (`sudo`, `apt`, `mokutil`, `openssh-server`), with the measurement that justifies each |
 | `spec-insert-rows.sh` | puts those rows inside `PKGS_SPECS_TABLE`, before its closing quote; idempotent |
-| `embed/` | the files PAYLOAD=... drops into the rootfs (into `rootfs-skeleton`, which is what `3builddistro` copies): `/etc/init.d/10lemonade` (the server), `20onboard-ssh` + `root/.ssh/authorized_keys` (U7: host keys, StrictModes' two modes, sshd), `21serial-console` (a root shell on ttyS0, only on `1bit.serial=1`) |
+| `embed/` | the files PAYLOAD=... drops into the rootfs (into `rootfs-skeleton`, which is what `3builddistro` copies): `05onboard-data` (mounts `1BIT-DATA` at `/data` and wires the contract), `10lemonade` (the server), `20onboard-ssh` + `root/.ssh/authorized_keys` (U7: host keys, StrictModes' two modes, sshd), `21serial-console` (a root shell on ttyS0, only on `1bit.serial=1`), `etc/1bit/libhsa.env` (the no-SVM trio, engine#715), `etc/profile.d/90onboard-limits` (memlock) |
 
 ## A kernel bump, end to end
 
@@ -111,6 +112,7 @@ this recipe ships are:
 
 | service | what it does |
 |---|---|
+| `05onboard-data` | finds `1BIT-DATA` (`1bit.data=` on the boot line, else the label), mounts it at `/data`, creates the contract dirs, points `/etc/1bit/lemond.conf` at `/data/lemonade/lemond.conf`, copies `/data/ssh/authorized_keys` and links the host key from `/data/ssh`, and registers `/data/models` in Lemonade's `user_models.json` |
 | `10lemonade` | starts `/opt/1bit-package/lemond-onebit`, mints `LEMONADE_API_KEY` into `/etc/1bit/lemond.conf` (mode 600) on first boot, binds `0.0.0.0:13305`, logs to `/var/log/lemond-onebit.log` |
 | `20onboard-ssh` | `ssh-keygen -A`, `/root/.ssh` 700 + `authorized_keys` 600, then sshd. An image with no key provisions no listener |
 | `21serial-console` | a root shell on `/dev/ttyS0`, only when the command line carries `1bit.serial=1` (that shell has no password, so it is opt-in) |

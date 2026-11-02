@@ -34,7 +34,12 @@ ROWS=0
 say() { printf '%s\n' "$*"; [ -w /data ] 2>/dev/null && printf '%s\n' "$*" >> "$LOG" 2>/dev/null; return 0; }
 pass() { ROWS=$((ROWS + 1)); say "PASS  $1 : $2"; }
 fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
-skip() { ROWS=$((ROWS + 1)); say "SKIP  $1 : $2"; }
+HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
+skip() {
+    ROWS=$((ROWS + 1))
+    case "$1" in gpu|npu|models|chat-hrx|chat-npu) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    say "SKIP  $1 : $2"
+}
 # Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
 # the whole check with no output - measured on the release candidate: 1bit-release-check sat in the
 # lemonade row until an external 20-minute limit killed the run, which on the owner's console would
@@ -615,7 +620,9 @@ fi
 say ""
 if [ "$FAILS" = 0 ]; then
     say "RESULT: PASS ($ROWS checks, no failures)"
-    say "Hardware-only rows (SKIP here): gpu, npu, models, chat-hrx, chat-npu - they need the Strix Halo GPU and NPU."
+    # Name only the rows that actually skipped. On the 2026-11-02 live boot four of these five PASSED on the board and
+    # this line still listed all five as skipped "here", which puts a false statement in the release evidence file.
+    [ -z "$HW_SKIPPED" ] || say "Hardware-only rows (SKIP here): $HW_SKIPPED - they need the Strix Halo GPU and NPU."
     exit 0
 fi
 say "RESULT: FAIL ($FAILS of $ROWS checks failed)"

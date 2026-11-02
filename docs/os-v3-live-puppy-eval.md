@@ -104,6 +104,15 @@ still could not read the ISO, with nothing in the build output saying so. The fr
 chain above the drivers (24 symbols, from 20), and the per-symbol `grep -qx "$sym=y"` check in
 `os/v3/puppy/README.md` is what makes that class of mistake loud.
 
+The same trap had a second half, and only a real build found it (2026-11-02): the *console* symbols were
+under-parented. `DRM_SIMPLEDRM`, `HID_GENERIC` and `USB_HID` are children of `DRM` and `HID`, both `=m`
+in our config, so with the fragment as it stood `olddefconfig` reduced exactly those three back to `=m`
+— 3 of 24 missing, reported by the fragment's own verification loop and by nothing else. `DRM` and `HID`
+are the only two a fragment can raise: `DRM_KMS_HELPER` and `DRM_GEM_SHMEM_HELPER` are select-only
+(`tristate` with no prompt) and follow `DRM_SIMPLEDRM=y`, so writing them into the fragment would be lines
+`olddefconfig` rewrites. The fragment is **26 symbols** with those two parents in it, and every one of the
+26 lands `=y` on v7.3-rc4.
+
 Until that fragment is in a built kernel, **the Puppy base cannot boot on our kernel at all** — measured
 twice, and the second time on the real artifacts rather than on a borrowed initrd: the built ISO's own
 `initrd.gz` (2,369,371 B, 127 cpio entries, from `initrd-progs`) on the ISO's own `vmlinuz`

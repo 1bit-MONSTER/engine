@@ -42,7 +42,7 @@ less os/v3/puppy/kernel-puppy.fragment
 #    release kernel packages (linux-image-<kver>.deb + its headers), as docs/kernel.md describes.
 #    Verify the deltas actually landed before packaging. A fragment symbol that this version's Kconfig
 #    does not know is silently dropped by olddefconfig, so check every line of the fragment itself
-#    (24 symbols today) rather than a hand-written list that drifts:
+#    (26 symbols today) rather than a hand-written list that drifts:
 missing=0
 for sym in $(grep -oE '^CONFIG_[A-Z0-9_]+=y' os/v3/puppy/kernel-puppy.fragment | cut -d= -f1); do
     grep -qx "$sym=y" /boot/config-<kver> || { echo "MISSING $sym"; missing=$((missing+1)); }

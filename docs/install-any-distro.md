@@ -28,9 +28,17 @@ Two packages, from two places:
 | piece | where it comes from | what it is |
 |---|---|---|
 | Lemonade server + CLI | Lemonade's own package (Ubuntu: its PPA, weekly) | `lemonade-server`, `lemond` |
-| the engine | `1bit-engine_<version>_amd64.deb`, or the `.tar.zst` on a non-deb distro | `1bit`, its HRX llama.cpp build (`hrx/llama/bin/llama-server`), the sealed NPU kernel sets, the HSA runtime it dlopens, and the `llama-server` shim |
+| the engine | `1bit-engine_<version>_amd64.deb`, or the `.tar.zst` on a non-deb distro | `1bit`, its HRX llama.cpp build (`hrx/llama/bin/llama-server`), the sealed NPU kernel sets, the HSA runtime it dlopens, and the engine's `lemonade-hrx` wrapper, which is what the recipe's `llama-server` name points at |
 
 The engine package is userspace only: no kernel module, no Python at runtime.
+
+One indirection carries the whole contract, and it matters: Lemonade's recipe hands a backend exactly one
+environment variable (`GGML_DISABLE_VULKAN=1`), so pointing `hrx_bin` at the engine's raw `llama-server`
+would start the HRX kernels without the environment `1bit serve` gives them. `lemonade-bin/llama-server`
+is therefore the engine's own `lemonade-hrx` wrapper: it asks `1bit serve --print-backend-env` for that
+environment and for serve's architecture and memory checks, then `exec`s the engine on Lemonade's argv,
+filling in serve's defaults for what the argv left out (`-ngl 99`, `--cache-reuse 256`, `-kvu` above one
+slot).
 
 ## Ubuntu 26.04 (resolute) / 24.04 (noble)
 
@@ -104,8 +112,9 @@ backend dlopens, and it is found because the recipe's libraries and ours share `
   that group must exist inside the image or the GID is dropped).
 * `amdgpu.cwsr_enable=0` is what the shipping hardware reports. In that configuration the engine
   sets `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1`; without it the kernels take
-  the ROCr SVM path and a nightly `libhsa` page-faults (engine#715). The package's shim sets them,
-  so Lemonade's child gets them even though Lemonade itself passes only `GGML_DISABLE_VULKAN=1`.
+  the ROCr SVM path and a nightly `libhsa` page-faults (engine#715). Those come from the engine's own
+  wrapper (`1bit serve --print-backend-env`), so Lemonade's child gets them even though Lemonade
+  itself passes only `GGML_DISABLE_VULKAN=1`.
 * Kernels: an HRX build needs a KFD that supports the device (gfx1151 here on
   `7.3.0-rc4-1bit-perfopt+`); it does not need a patched kernel.
 
@@ -142,10 +151,16 @@ is wrong:
 1bit-engine serve -m <model>.gguf --device npu          # NPU
 ```
 
-What this route does **not** do, compared with the fork's `onebit` recipe: no `1bit serve` preflight
-(no memory gate, no engine-side context sizing) — Lemonade's own auto-tune decides the context and
-passes `--ctx-size`; no NPU catalog rows; and the model list is Lemonade's own catalog, not ours.
-Our rows can be added on the side through the config directory's `user_models.json`:
+What this route does **not** do, compared with the fork's `onebit` recipe: the model list is Lemonade's
+own catalog, not our 27 rows — ours can be added on the side through the config directory's
+`user_models.json`, below — and there are no NPU catalog rows, because Lemonade has no recipe for our
+NPU route at all (NPU stays on the engine: `1bit serve --device npu`). The engine's own checks do run:
+the wrapper is `1bit serve --print-backend-env`, so a model that does not fit is refused by serve
+(exit 3) with Lemonade reporting the load failure, not silently started.
+
+Our own catalog rows can ride along through the config directory's `user_models.json`, which Lemonade
+reads at start and lists like its own (`recipe` must be `llamacpp-hrx`, and the checkpoint names a
+registry model, since this Lemonade version has no local-file registration):
 
 ```json
 {"Qwen3.6-35B-A3B-NPU-1bit": {"checkpoint": "owner/repo:VARIANT", "recipe": "llamacpp-hrx", "labels": ["chat"]}}
@@ -157,5 +172,6 @@ Our rows can be added on the side through the config directory's `user_models.js
 |---|---|---|
 | a stock Lemonade takes a backend binary from `hrx_bin` / `LEMONADE_HRX_HRX_BIN` | extracted PPA deb `2026.44.1~26.04` on the dev box, isolated cache/config | `llamacpp-hrx` backend `installable` → `installed`, both forms, with no fork and no patch |
 | the same recipe, both packages side by side | clean `ubuntu:26.04` container: PPA `lemonade-server` + this `.deb` | `lemond 2026.44.1` starts, `1bit-engine --version` and the shim run; the recipe's backend state is hardware-gated there (`unsupported: Unsupported GPU`), so the end-to-end chat is the hardware row below |
-| the shim, not Lemonade, provides the HRX environment | the recipe's own `build_server_environment()` in this tree vs the shim in this package | Lemonade passes its backend `GGML_DISABLE_VULKAN=1` only; the shim adds `HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1 GGML_HRX_STRICT=1` before `exec` |
+| the shim is the engine's own wrapper | `1bit/lemonade-hrx` from this repo's package (`scripts/package-linux.sh`) | it runs `1bit serve --print-backend-env` and then `exec`s the engine with serve's environment and defaults; `lemonade-bin/llama-server` is a symlink to it |
+| the recipe's env for its backend is one variable | this tree, `src/cpp/server/backends/hrx/hrx_server.cpp` `build_server_environment()` | Lemonade passes its backend `GGML_DISABLE_VULKAN=1` only — which is why the wrapper, not our binary, has to be what the recipe starts |
 | `amdxdna-dkms` from the PPA drags kernel bits | clean container, `apt-get -s install amdxdna-dkms` | `dkms`, `build-essential`, `linux-headers-7.0.0-42-generic`, `linux-headers-generic`, `amdxdna-dkms` |

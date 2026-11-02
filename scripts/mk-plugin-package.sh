@@ -55,28 +55,23 @@ mkdir -p "$root/opt/1bit/engine" "$root/usr/share/doc/$pkg" "$root/usr/share/1bi
          "$root/usr/bin" "$root/usr/lib/systemd/system/lemond.service.d" "$out"
 
 # the payload: 1bit, its backends, the sealed NPU kernel sets, the licences
-cp -a "$bundle/1bit" "$bundle/hrx" "$bundle/npu" "$bundle/NOTICE" "$bundle/NOTICE-BINARY" \
-      "$bundle/LICENSE" "$bundle/README.txt" "$root/opt/1bit/engine/"
+cp -a "$bundle/1bit" "$bundle/hrx" "$bundle/npu" "$bundle/lemonade-hrx" "$bundle/NOTICE" \
+      "$bundle/NOTICE-BINARY" "$bundle/LICENSE" "$bundle/README.txt" "$root/opt/1bit/engine/"
 chmod 0755 "$root/opt/1bit/engine/1bit"
 install -m 0644 "$libhsa" "$root/opt/1bit/engine/hrx/llama/bin/libhsa-runtime64.so.1"
 ln -s /opt/1bit/engine/1bit "$root/usr/bin/1bit-engine"
 
-# the shim: stock Lemonade's llamacpp-hrx recipe hands its backend only GGML_DISABLE_VULKAN=1, so
-# the engine's HRX environment is set here. Without the trio the HRX kernels take the ROCr SVM path
-# and a nightly libhsa page-faults (engine#715). A value the caller set wins.
+# the shim: the name the recipe resolves inside hrx_bin's directory. It is the bundle's own
+# lemonade-hrx wrapper, which runs `1bit serve --print-backend-env` (serve's architecture and memory
+# checks, and the environment serve gives an HRX backend: strict placement, the HSA runtime path,
+# the CWSR save-area trio, ternary decode) and then execs the engine's llama-server on Lemonade's
+# argv, with serve's defaults for what the argv left out (-ngl 99, --cache-reuse 256, -kvu above one
+# slot). Lemonade's own build_server_environment() hands a backend only GGML_DISABLE_VULKAN=1, which
+# is why the engine's wrapper and not our binary is what the recipe must start (engine#715).
+[ -x "$root/opt/1bit/engine/lemonade-hrx" ] || {
+    echo "the bundle has no lemonade-hrx wrapper; it is the shim this package installs" >&2; exit 1; }
 mkdir -p "$root/opt/1bit/engine/lemonade-bin"
-cat > "$root/opt/1bit/engine/lemonade-bin/llama-server" <<'SHIM'
-#!/bin/sh
-HSA_USE_SVM=${HSA_USE_SVM:-0}
-HSA_USERPTR_FOR_PAGED_MEM=${HSA_USERPTR_FOR_PAGED_MEM:-0}
-HRX_ALLOW_NO_SVM=${HRX_ALLOW_NO_SVM:-1}
-GGML_HRX_STRICT=${GGML_HRX_STRICT:-1}
-export HSA_USE_SVM HSA_USERPTR_FOR_PAGED_MEM HRX_ALLOW_NO_SVM GGML_HRX_STRICT
-# the engine's own llama.cpp default for HRX: every layer on the device
-case " $* " in *" -ngl "*) ;; *) set -- "$@" -ngl 99 ;; esac
-exec "$(dirname "$0")/../hrx/llama/bin/llama-server" "$@"
-SHIM
-chmod 0755 "$root/opt/1bit/engine/lemonade-bin/llama-server"
+ln -s ../lemonade-hrx "$root/opt/1bit/engine/lemonade-bin/llama-server"
 
 # wiring for an installed Lemonade: the unit drop-in (env form) and the config fragment (key form)
 cat > "$root/usr/lib/systemd/system/lemond.service.d/10-1bit-engine.conf" <<'UNIT'
@@ -111,7 +106,9 @@ Either form is enough (they are equivalent):
 
 Restart lemond, then load any `*-HRX` model: Lemonade execs
 `/opt/1bit/engine/lemonade-bin/llama-server` with
-`-m <gguf> --ctx-size N --device HRX0 --port P --jinja --metrics --parallel 1`.
+`-m <gguf> --ctx-size N --device HRX0 --port P --jinja --metrics --parallel 1`. That name is a link to
+this package's `lemonade-hrx`, which asks `1bit serve` for the backend environment and serve's checks
+before exec'ing the engine, so Lemonade's single `GGML_DISABLE_VULKAN=1` is not the whole story.
 
 `docs/install-any-distro.md` in the engine repo has the host prerequisites per device and the
 verification steps.

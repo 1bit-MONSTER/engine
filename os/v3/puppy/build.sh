@@ -182,7 +182,9 @@ if [ -n "${PAYLOAD:-}" ]; then
     ln -sf /opt/1bit-package/lemond-onebit "$skeleton/usr/local/bin/lemond-onebit"
     ln -sf /opt/1bit-package/1bit/1bit "$skeleton/usr/local/bin/1bit"
     cp -a /recipe/embed/. "$skeleton/"
-    chmod 0755 "$skeleton"/etc/init.d/10lemonade "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console
+    chmod 0755 "$skeleton"/etc/init.d/05onboard-data "$skeleton"/etc/init.d/10lemonade \
+        "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
+        "$skeleton"/etc/init.d/zz-onboard-ports
     echo "   $(du -sh "$skeleton/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
     if [ -n "${LIBHSA:-}" ]; then
         mkdir -p "$skeleton/opt/1bit/libhsa"
@@ -225,7 +227,7 @@ if [ -n "${PAYLOAD:-}" ]; then
     for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/05onboard-data \
              etc/init.d/10lemonade \
              usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
-             etc/init.d/20onboard-ssh etc/init.d/21serial-console; do
+             etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }

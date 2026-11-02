@@ -1,0 +1,37 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/zz-onboard-ports - the appliance's two inbound ports, opened after Puppy's firewall.
+#
+# Measured in a booted image: `iptables -S` shows `-P INPUT DROP` with `tcp_inbound` RETURNing to that
+# policy, so every new inbound TCP connection from outside is dropped. lemond binds 0.0.0.0:13305 and the
+# guest reaches it at its own address (and lemond itself answers 200), while the same request from another
+# machine got nothing at all - and after inserting these two rules by hand the outside request was answered
+# (401 without the key, which is lemond saying it is there). U3 is "the web app reachable on the LAN", so
+# this is the difference between an appliance and a machine that only talks to itself.
+#
+# The name is the mechanism: rc.services runs /etc/init.d/* in name order, `rc.firewall` sorts under "r",
+# and a numeric or earlier name would be overwritten by it. "zz-" is after every script woof-CE ships
+# (the last is `z-disable-spurious-gpe`), and -C makes a re-run a no-op.
+open_port() {
+    iptables -C INPUT -p tcp --dport "$1" -j ACCEPT 2> /dev/null && return 0
+    iptables -I INPUT 1 -p tcp --dport "$1" -j ACCEPT 2> /dev/null && return 0
+    echo "zz-onboard-ports: could not open tcp/$1" >&2
+    return 1
+}
+open_port 13305   # Lemonade (U3)
+open_port 22      # ssh, the owner's key (U7)
+echo "zz-onboard-ports: $(iptables -S INPUT 2> /dev/null | grep -c 'dport') inbound port rule(s) live"

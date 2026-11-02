@@ -24,6 +24,16 @@
 #
 # rc.services runs /etc/init.d/* in name order, so 05 runs before 10lemonade and 20onboard-ssh.
 DATA=/data
+# rc.services calls every service with start at boot and stop at shutdown. Puppy's save layer is the folder
+# /1bit on this same filesystem (psubdir), so it has to be clean before the shutdown write: sync and unmount
+# rather than leave a filesystem mounted that Puppy is about to snapshot.
+if [ "${1:-start}" = "stop" ]; then
+    if grep -q " $DATA " /proc/mounts 2> /dev/null; then
+        sync
+        umount "$DATA" 2> /dev/null && echo "05onboard-data: $DATA unmounted for the save write"
+    fi
+    exit 0
+fi
 # os/mini #711: a fixed label is wrong once a machine is installed (two 1BIT-DATA partitions exist, the
 # stick's and the disk's), so the boot line may name the partition. Default stays the label.
 spec=LABEL=1BIT-DATA

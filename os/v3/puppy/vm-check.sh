@@ -193,7 +193,11 @@ rows = [
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     ("U1 apt",       "apt update >/dev/null 2>&1; apt install -y neofetch >/dev/null 2>&1; command -v neofetch", "neofetch"),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
-    ("U3 key",       "ls -l /etc/1bit/lemond.conf; grep -c '^LEMONADE_API_KEY=' /etc/1bit/lemond.conf", "LEMONADE_API_KEY"),
+    ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "
+                     "echo key-on-data", "key-on-data"),
+    ("U3 catalogue", 'k=$(sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf); '
+                     'curl -s -H "Authorization: Bearer $k" http://127.0.0.1:13305/api/v1/models '
+                     '| tr "," "\n" | grep -c onebit', None),
     ("U3 api local", 'k=$(sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf); curl -s -o /dev/null '
                      '-w "http=%{http_code}" -H "Authorization: Bearer $k" http://127.0.0.1:13305/api/v1/models', "http=200"),
     ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf', None),
@@ -222,6 +226,7 @@ for idx, (name, cmd, want) in enumerate(rows):
         print("FAIL %-13s no answer" % name, flush=True)
         continue
     body = re.sub(r"__DONE_[0-9]{10,}__", "", out)
+    body = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", "", body)   # OSC: bash 5.3 emits ]3008;…
     body = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", body)
     body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmd[:24] not in l)
     flat = body.replace("\n", " | ")

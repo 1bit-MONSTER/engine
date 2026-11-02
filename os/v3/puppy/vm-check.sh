@@ -218,6 +218,10 @@ rows = [
     # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
     # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
     # these two lines say whether that was the listener or the interface.
+    # the durable assertion is the RULE, not the policy: whether rc.firewall has finished at the moment a
+    # row runs is a race, but an ACCEPT for tcp/13305 is what makes U3 reachable either way.
+    ("U3 port rule", "iptables -C INPUT -p tcp --dport 13305 -j ACCEPT && echo port-13305-open; "
+                     "iptables -C INPUT -p tcp --dport 22 -j ACCEPT && echo port-22-open", None),
     ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]

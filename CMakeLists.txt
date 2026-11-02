@@ -712,6 +712,15 @@ if(ONEBIT_NPU)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")
+    # step_batch_all(): per-row logits from ONE batched pass -- the contract speculative verification
+    # rests on (a draft token is accepted only when the model's own choice at that position matches it).
+    # Host-GEMM mode, no device; needs a Q4NX container, so it skips (77) unless ONEBIT_TEST_Q4NX names one.
+    add_executable(mtp_batch_all_test tests/mtp_batch_all_test.cpp)
+    target_include_directories(mtp_batch_all_test PRIVATE npu/forward/include)
+    target_link_libraries(mtp_batch_all_test PRIVATE onebit_npu_forward)
+    add_dependencies(npu_sampling_test mtp_batch_all_test)
+    add_test(NAME mtp_batch_all COMMAND mtp_batch_all_test)
+    set_tests_properties(mtp_batch_all PROPERTIES SKIP_RETURN_CODE 77)
     # The fast-lane end-to-end test (npu_lane_e2e) is retired: its kernels were FastFlowLM-derived
     # and its reference logits are lost. The NPU check is the private dx add-on's from-source
     # check, outside this repository (docs/npu.md, "Checking the NPU").

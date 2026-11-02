@@ -197,6 +197,15 @@ public:
     bool step_batch(const std::vector<int>& tokens, int start_pos,
                     std::vector<float>& logits);
 
+    // The same batched pass, but returning the logits of EVERY row (M x NV, row-major) instead of only
+    // the last one.  Speculative decoding needs them: a draft token is accepted only if the model's own
+    // choice AT THAT POSITION is that token, so the verifier has to see each row's logits, not just the
+    // tail of the batch.  The layer maths is the batched body step_batch already runs -- only the final
+    // norm and the LM head are applied per row, and the head is launched once for all M rows (the M=16
+    // twin streams its weights once for the batch, exactly like the layers).
+    bool step_batch_all(const std::vector<int>& tokens, int start_pos,
+                        std::vector<float>& logits_all);
+
     // The last position's hidden state after the final norm, H floats: what a d3 readout head pools
     // (`pooling: last` in a pack's decision_config.json, npu/decision.h). Filled by the last
     // successful step() or step_batch(), empty before that. This is the vector the LM head reads, not
@@ -214,6 +223,9 @@ public:
 private:
     bool load_norms();
     std::vector<float> last_hidden_;  // last_hidden(): the post-final-norm state of the last position
+    // Set only while step_batch_all() runs: the batched epilogue then norms every row and writes M x NV
+    // logits there instead of only the last row's.  Null on every other path, so nothing else changes.
+    std::vector<float>* batch_all_out_ = nullptr;
     bool init_impl(xrt::device* dev, const char* model_path,
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
@@ -276,6 +288,9 @@ private:
     float rmsnorm(const float* x, const float* w, int n, float* out) const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
     bool run_lm_head(const std::vector<float>& h, std::vector<float>& logits);
+    // M rows of hidden state -> M x NV logits, row-major.  Same head, same packed tiles: the rows ride
+    // one launch (per-row activation scales, which the batched launcher and the dequantiser already carry).
+    bool run_lm_head_rows(const std::vector<float>& h_rows, int M, std::vector<float>& logits_all);
 
     Q4nxForwardConfig c_;
     ModelWeights* mw_ = nullptr;

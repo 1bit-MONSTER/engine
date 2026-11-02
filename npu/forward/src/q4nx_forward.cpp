@@ -38,6 +38,7 @@
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
 #include "npu_engine_i8ctx_inc.h"   // I8Ctx
+#include "hadamard.h"                // the activation rotation, SIMD path + scalar reference
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
@@ -120,23 +121,10 @@ static std::vector<std::string> m16dirs_like_head(const std::string& mdir,
 }
 
 // A <- H (A . s): the inverse of the fold a folded (PTQ1/Prism) container baked into its weights.
-// H is the normalized Sylvester-Walsh Hadamard over `block` (the butterfly is unnormalised, so
-// one multiply by 1/sqrt(block) follows).  Exact in f32 while |A| * block < 2^24; one pass of
-// adds and one multiply per element, which is what makes this affordable on the host.
+// The transform itself lives in hadamard.h, because it runs once per projection (~430 times a decode token)
+// and its SIMD path has to be provable bit-identical to the scalar loop on every build, without a device.
 static void hadamard_rotate(const float* signs, float* a, int n, int block) {
-    for (int i = 0; i < n; i++) a[i] *= signs[i];
-    const float sc = 1.0f / std::sqrt((float)block);
-    for (int b = 0; b + block <= n; b += block) {
-        float* p = a + b;
-        for (int h = 1; h < block; h <<= 1)
-            for (int i = 0; i < block; i += (h << 1))
-                for (int j = i; j < i + h; j++) {
-                    const float x = p[j], y = p[j + h];
-                    p[j] = x + y;
-                    p[j + h] = x - y;
-                }
-        for (int i = 0; i < block; i++) p[i] *= sc;
-    }
+    q4nx_hadamard::rotate(signs, a, n, block);
 }
 
 static bool file_exists(const std::string& p, long min_size = 1) {

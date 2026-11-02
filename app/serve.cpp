@@ -216,19 +216,33 @@ std::string hrx_libhsa(const std::string& option) {
 
 // engine#315 candidate 1 (app/hrx_cwsr.h): the variables that put the CWSR save area in GTT, for
 // every HRX backend's environment. Decided once per serve, on the first HRX backend, with one log line.
-const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
 #if defined(ONEBIT_HRX_ALLOW_NO_SVM) && ONEBIT_HRX_ALLOW_NO_SVM
-    constexpr bool gate = true;
+constexpr bool kHrxNoSvmGate = true;
 #else
-    constexpr bool gate = false;
+constexpr bool kHrxNoSvmGate = false;
 #endif
+
+const std::vector<std::string>& hrx_cwsr_env(const Options& o) {
+    constexpr bool gate = kHrxNoSvmGate;
     static const CwsrDecision d = [&] {
-        CwsrDecision r = decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
-                                               [](const char* k) { return std::getenv(k); });
-        std::fprintf(stderr, "1bit serve: %s\n", r.log.c_str());
-        return r;
+        return decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
+                                     [](const char* k) { return std::getenv(k); });
     }();
     return d.env;
+}
+
+// The decision line, printed at the first HRX backend that uses it. Deliberately NOT printed by hrx_cwsr_env(): that
+// would also print on paths that must emit exactly one line (the memory refusal, tests/mem_admit_route.sh counts
+// lines) and on routes that never touch HRX at all (engine#715).
+void announce_cwsr_env(const Options& o) {
+    (void) hrx_cwsr_env(o);
+    static bool announced = false;
+    if (announced) return;
+    announced = true;
+    constexpr bool gate = kHrxNoSvmGate;
+    const CwsrDecision d = decide_cwsr_placement(o.cwsr_placement, read_cwsr_enable(), gate,
+                                                 [](const char* k) { return std::getenv(k); });
+    std::fprintf(stderr, "1bit serve: %s\n", d.log.c_str());
 }
 
 // The llama-server --device hrx and cpu run: the HRX build's (HRX0 and the CPU, no Vulkan),
@@ -1012,6 +1026,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (device == "hrx") {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            announce_cwsr_env(o);
             for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             // engine #390 (docs/serve.md, "Off-HRX placement"): the backend's placement observer
             // prints one line per graph when GGML_HRX_REPORT is set, and refuses the graph with
@@ -1186,6 +1201,7 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
         // the same ROCr the chat server gets, or the RAG server cannot open HRX0 ("invalid device: HRX0")
         if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty())
             l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+        announce_cwsr_env(o);
         for (const auto& e : hrx_cwsr_env(o)) l.env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
         // strict placement, as the model's own backend (app/hrx_strict.h); no report, no -lv 4
         if (strict_for(o.strict, "hrx")) l.env.push_back("GGML_HRX_STRICT=1");
@@ -1706,7 +1722,8 @@ int serve_child(const Options& given) {
             std::vector<std::string> env;
             if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
             if (!dev || !*dev || std::string(dev) == "hrx")
-                for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
+                announce_cwsr_env(o);
+            for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
                 bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);
             std::fprintf(stderr, "1bit serve: laya: %s through %s%s\n", gguf.c_str(), bin.c_str(), policy_note.c_str());
@@ -2794,12 +2811,10 @@ int run_serve(int argc, char** argv) {
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend
     if (o.cwsr_placement == CwsrPlacement::On) (void) hrx_cwsr_env(o);
-    // engine#715: the trio goes into serve's own environment as well, not only into the backends' envp. Two reasons:
-    // a descendant that exec()s with the inherited environment (run_program's helpers, LayaDaemon's daemon) then has
-    // it too, and a spawn site added later cannot forget it. A value the caller set still wins.
-    if (const int added = apply_cwsr_env_to_self(hrx_cwsr_env(o)); added > 0 && !o.print_backend)
-        std::fprintf(stderr, "1bit serve: %d of the engine#315 save-area variables set in serve's own environment "
-                             "too, so every child process inherits them (engine#715)\n", added);
+    // engine#715: both halves are for an HRX route only. --device cpu/npu/auto-with-no-HRX must not gain a line here,
+    // and the memory refusal (tests/mem_admit_route.sh) must stay exactly one line, so the refusal comes first and
+    // prints nothing of its own beyond the refusal itself.
+    const bool cwsr_route = o.device == "hrx" || o.device == "auto";
     // engine#715: refuse a *deliberate* opt-out from the save-area trio on an HRX route. Narrow on purpose: the
     // condition is the user's own choice (--hrx-cwsr-placement=off or HRX_SVM=1), not "the trio happens to be empty",
     // because the trio is also empty in a build whose hrx-system has no HRX_ALLOW_NO_SVM gate -- that build logs its
@@ -2808,14 +2823,20 @@ int run_serve(int argc, char** argv) {
     // placement.
     const bool cwsr_opted_out = o.cwsr_placement == CwsrPlacement::Off ||
                                 [] { const char* v = std::getenv("HRX_SVM"); return v != nullptr && std::string(v) == "1"; }();
-    if ((o.device == "hrx" || o.device == "auto") && cwsr_opted_out && !cwsr_env_present(hrx_cwsr_env(o))) {
+    if (cwsr_route && cwsr_opted_out && !cwsr_env_present(hrx_cwsr_env(o))) {
         const char* ok = std::getenv("ONEBIT_HRX_NO_TRIO_OK");
         if (!ok || std::string(ok) != "1")
             throw std::runtime_error(
                     std::string("this serve would start HRX without the save-area variables that keep ROCr from page-")
                     + "faulting on the first graph replay (engine#715, docs/hrx.md), because you asked for it with "
-                    + "--hrx-cwsr-placement=off or HRX_SVM=1. Either drop that, or set them yourself:\n    " + kCwsrRecipe
-                    + "\n  or set ONEBIT_HRX_NO_TRIO_OK=1 if this box's ROCr does not need them.");
+                    + "--hrx-cwsr-placement=off or HRX_SVM=1: either drop that, or set " + kCwsrRecipe
+                    + " yourself, or set ONEBIT_HRX_NO_TRIO_OK=1 if this box's ROCr does not need them.");
+    }
+    if (cwsr_route) {
+        // silent on purpose: the decision line announce_cwsr_env() prints at the first HRX backend already tells the
+        // operator the placement happened, and a second line here makes every path that counts output lines (the
+        // memory refusal, tests/mem_admit_route.sh) wrong for no diagnostic gain.
+        (void) apply_cwsr_env_to_self(hrx_cwsr_env(o));
     }
     if (o.print_backend) {
         if (fs::is_directory(o.model)) return serve_only("an NPU model directory runs in serve's own process");

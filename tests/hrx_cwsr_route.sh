@@ -118,10 +118,11 @@ if [ $gate = 1 ]; then
     HRX_SVM=1 ONEBIT_HRX_NO_TRIO_OK=1 run "$scratch/auto-off-ack.json" --device hrx
     check "auto with HRX_SVM=1 + acknowledgement: none of the three (the opt-out)" 'env_is "$scratch/auto-off-ack.json" "{}"'
     check "  and serve says HRX_SVM=1 decided it" 'grep -q "HRX_SVM=1; CWSR save-area placement left to ROCr" "$scratch/auto-off-ack.json.log"'
-    # engine#715: the trio is in serve's own environment too, so a child that inherits it gets it (the fake
-    # backend runs with the environment serve passed, so serve's own copy is what the extra check looks for)
-    check "serve's own environment carries the trio (engine#715)" \
-        'grep -q "of the engine#315 save-area variables set in serve.s own environment" "$scratch/auto.json.log"'
+    # engine#715: serve also puts the trio in its *own* environment so a child that inherits it gets it. That is not
+    # observable through this fake backend (serve passes an explicit envp), and it must not add a line here: the
+    # memory refusal counts lines (tests/mem_admit_route.sh). It is covered by tests/hrx_cwsr_test.cpp instead.
+    check "the placement decision is announced exactly once" \
+        '[ "$(grep -c "CWSR save area placed in GTT" "$scratch/auto.json.log")" = 1 ]'
 else
     run "$scratch/auto.json" --device hrx
     check "auto, no gate: none of the three" 'env_is "$scratch/auto.json" "{}"'

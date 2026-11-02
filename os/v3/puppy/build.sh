@@ -62,12 +62,14 @@ kernel=$(cd "$kernel" && pwd)
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
     echo "build: no huge-*.tar.* in $kernel (run mk-huge-kernel.sh first)" >&2; exit 1; }
 mkdir -p "$out"; out=$(cd "$out" && pwd)
+recipe=$(cd "$(dirname "$0")" && pwd)   # os/v3/puppy, mounted at /recipe: packages-extra lives there
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
 echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
+    -v "$recipe":/recipe:ro \
     ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
     -e COMPAT="$compat" ubuntu:24.04 bash -c '
 set -euo pipefail
@@ -99,6 +101,18 @@ set +o pipefail
 yes "" | ./merge2out woof-distro/x86_64/ubuntu/"$COMPAT"
 set -o pipefail </dev/null
 cd ../woof-out_*
+
+# The packages that the TPUPPY-RELEASE acceptance needs and the merged woof-CE set does not carry: on a
+# built resolute64 rootfs, `sudo`, `apt`, `mokutil` and `openssh-server` are simply absent (openssh-client
+# has a row, openssh-server does not) - which is the "sh: sudo: not found" class of gap from c20. The rows
+# in packages-extra have to go INSIDE PKGS_SPECS_TABLE (before its closing quote) or 0setup never sees them.
+if [ -s /recipe/packages-extra ]; then
+    echo "== 1bit package rows into the spec table"
+    grep -E "^yes\\|" /recipe/packages-extra > /work/1bit-packages-rows
+    for spec in ../woof-out_*/DISTRO_PKGS_SPECS-ubuntu-*; do
+        bash /recipe/spec-insert-rows.sh "$spec" /work/1bit-packages-rows
+    done
+fi
 echo "== our kernel into kernel-kit/output"
 mkdir -p kernel-kit/output
 cp /kernels/huge-*.tar.* kernel-kit/output/
@@ -107,6 +121,18 @@ echo "== 0setup"; ./0setup </dev/null
 echo "== 1download"; ./1download </dev/null
 echo "== 2createpackages"; ./2createpackages </dev/null
 echo "== 3builddistro"; ./3builddistro release </dev/null
+# an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
+rootfs=$(find sandbox3 -maxdepth 2 -type d -name rootfs-complete 2>/dev/null | head -n 1)
+if [ -z "$rootfs" ]; then
+    echo "build: REFUSED: no sandbox3/rootfs-complete after 3builddistro, so the package set cannot be verified" >&2
+    exit 1
+fi
+miss=""
+for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil; do
+    [ -e "$rootfs/$b" ] || miss="$miss $b"
+done
+[ -z "$miss" ] || { echo "build: REFUSED: the rootfs is missing:$miss (packages-extra did not land)" >&2; exit 1; }
+echo "   ok: sudo, apt, sshd, mokutil are in $rootfs"
 echo "== output"
 ls -l woof-output-* 2>/dev/null | head -20
 cp -f woof-output-*/*.iso woof-output-*/*.sfs /out/ 2>/dev/null || true

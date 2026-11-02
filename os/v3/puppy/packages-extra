@@ -1,0 +1,20 @@
+# Rows appended to woof-CE's DISTRO_PKGS_SPECS table by build.sh, before 0setup.
+# Format: yes|<generic name>|<comma-separated distro packages>|<splits>||deps:yes
+# No comments inside the table: 0setup reads it as a shell list of pipe-separated rows, so the "why" for
+# each row lives here, above the blank line, and nowhere else.
+#
+# Measured 2026-11-02 on the resolute64 rootfs (build root sandbox3/rootfs-complete, 1.5 GB) that the merged
+# package set does NOT carry, and that TPUPPY-RELEASE needs:
+#   U1  sudo            - absent from the rootfs and from the table entirely
+#   U1  apt             - absent; libapt-pkg7.0 only arrives as a dependency of xserver_xorg, so `apt` is
+#                         a missing binary, not a missing library ("sh: sudo: not found" on c20 was this
+#                         class of gap)
+#   U4  mokutil         - absent; the release check's Secure Boot row needs it to read the state
+#   U7  openssh-server  - absent (only openssh-client has a row), so the stick cannot be checked over ssh
+#
+# bash, dpkg, python3, efibootmgr, jwm, rox, xterm and curl are already in the merged set (measured).
+
+yes|apt|apt|exe,dev>null,doc>null,nls>null||deps:yes
+yes|sudo|sudo|exe,dev>null,doc>null,nls>null||deps:yes
+yes|mokutil|mokutil|exe,dev>null,doc>null,nls>null||deps:yes
+yes|openssh-server|openssh-server|exe,dev>null,doc>null,nls>null||deps:yes

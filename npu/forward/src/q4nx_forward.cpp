@@ -553,7 +553,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         const char* dt = etd->dtype;
         const size_t en = (size_t)NV * (size_t)H;
         if (dt && dt[0] && strncmp(dt, "BF16", 4) != 0) {
-            embed_f_.resize(en);
+            /* A quantised table is stored on the container's K grid, so it dequantises to kpad_
+             * wide rows (engine#845); the pad columns are zero, so the head's dot product over
+             * c_.H columns is unchanged. */
+            embed_f_.resize((size_t)NV * (size_t)kpad_);
+            lm_w_ = kpad_;
             const size_t esz = (size_t)etd->data_size;
             int rc;
             if (esz == en) {
@@ -566,7 +570,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 if (sd && !sc) { err_ = "model.embed_tokens.weight.scale is too small"; return false; }
                 rc = q4nx_dequant_plain_i8((const uint8_t*)e, sc, NV, H, embed_f_.data());
             } else {
-                rc = dequant_any((const uint8_t*)e, esz, NV, H, embed_f_.data());
+                rc = dequant_any((const uint8_t*)e, esz, NV, kpad_, embed_f_.data());
             }
             if (rc != 0) {
                 err_ = std::string("embedding dtype ") + dt + " but dequant failed";
@@ -582,6 +586,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 return false;
             }
             memcpy(embed_.data(), e, (size_t)NV * H * sizeof(uint16_t));
+            lm_w_ = H;   // raw bf16: the table has no pad
         }
     }
 
@@ -719,6 +724,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (sem_.num_global_kv_heads > 0 && bad_kv(sem_.num_global_kv_heads)) return false;
     }
 
+    /* Engine#845: the container's K grid.  Every dequantised projection is kpad_ wide and every
+     * design's K is q4nx_pad_k(real K); for a model already on the grid (every one validated
+     * before this) both are the identity. */
+    kpad_ = q4nx_pad_k(c_.H);
+    impad_ = q4nx_pad_k(c_.IM);
+    if (kpad_ != c_.H || impad_ != c_.IM)
+        fprintf(stderr, "  [forward] container K grid: H %d -> %d, IM %d -> %d (pad columns are zero)\n",
+                c_.H, kpad_, c_.IM, impad_);
+
     Q4nxModelDims dims{};
     dims.mla = mla_;
     dims.q_lora = q_lora_; dims.kv_lora = kv_lora_; dims.rope_dim = rope_dim_;
@@ -749,8 +763,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         // to split G/U on a model that ships one.
         const char* tag = family_tag();
         char gu[512], g[512];
-        snprintf(gu, sizeof(gu), "%s/full_i8_GU_K%d_N%d%s.elf", dir.c_str(), dims.H, 2 * dims.IM, tag);
-        snprintf(g, sizeof(g), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), dims.H, dims.IM, tag);
+        /* On the kernel's grids, exactly as q4nx_derive_designs() will name them (engine#845). */
+        snprintf(gu, sizeof(gu), "%s/full_i8_GU_K%d_N%d%s.elf", dir.c_str(), q4nx_pad_k(dims.H),
+                 q4nx_pad_n(2 * dims.IM), tag);
+        snprintf(g, sizeof(g), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), q4nx_pad_k(dims.H),
+                 q4nx_pad_n(dims.IM), tag);
         dims.fused_gu = file_exists(gu) || !file_exists(g) ? 1 : 0;
     }
     ndesigns_ = q4nx_derive_designs(&dims, designs_);
@@ -807,13 +824,15 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     const int max_nkv = (sem_.num_global_kv_heads > c_.NKV) ? sem_.num_global_kv_heads : c_.NKV;
     const size_t q_dim = (size_t)c_.NH * (size_t)max_hd;
     const size_t kv_dim = (size_t)max_nkv * (size_t)max_hd;
-    wq_.resize(q_dim * (size_t)H * (attn_gate_ ? 2 : 1));   // q|gate doubles it
-    wk_.resize(kv_dim * (size_t)H);
-    wv_.resize(kv_dim * (size_t)H);
-    wo_.resize((size_t)H * q_dim);
-    wg_.resize((size_t)c_.IM * (size_t)H);
-    wu_.resize((size_t)c_.IM * (size_t)H);
-    wd_.resize((size_t)H * (size_t)c_.IM);
+    // Widths are the container's padded K (engine#845): the f32 copy of a projection is stored the
+    // way the tensor is stored, and assemble_B's source stride is the same number.
+    wq_.resize(q_dim * (size_t)kpad_ * (attn_gate_ ? 2 : 1));   // q|gate doubles it
+    wk_.resize(kv_dim * (size_t)kpad_);
+    wv_.resize(kv_dim * (size_t)kpad_);
+    wo_.resize((size_t)H * (size_t)q4nx_pad_k((int)q_dim));
+    wg_.resize((size_t)c_.IM * (size_t)kpad_);
+    wu_.resize((size_t)c_.IM * (size_t)kpad_);
+    wd_.resize((size_t)H * (size_t)impad_);
 
     // GDN scratch + per-layer recurrence state (qwen3_5 linear_attention).
     if (lin_kd_ > 0) {
@@ -1210,9 +1229,10 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     if (!sem_.tie_embeddings) {
         TensorDesc* ltd = model_tensor_by_name(mw_, "lm_head.weight");
         if (ltd) {
-            lm_head_f_.assign((size_t)NV * (size_t)H, 0.0f);
+            lm_head_f_.assign((size_t)NV * (size_t)kpad_, 0.0f);
+            lm_w_ = kpad_;
             const uint8_t* lp = (const uint8_t*)model_tensor_data(mw_, ltd);
-            if (!lp || dequant_any(lp, (size_t)ltd->data_size, NV, H,
+            if (!lp || dequant_any(lp, (size_t)ltd->data_size, NV, kpad_,
                                    lm_head_f_.data()) != 0) {
                 err_ = "lm_head dequant failed";
                 return false;
@@ -1302,7 +1322,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
 
 float Q4nxNpuForward::embed_at(int token, int k) const {
     if (token < 0 || token >= c_.NV || k < 0 || k >= c_.H) return 0.0f;
-    if (embed_f32_) return embed_f_[(size_t)token * (size_t)c_.H + (size_t)k];
+    if (embed_f32_) return embed_f_[(size_t)token * (size_t)lm_w_ + (size_t)k];
     return bf16_to_f32(embed_[(size_t)token * (size_t)c_.H + (size_t)k]);
 }
 
@@ -1311,7 +1331,7 @@ float Q4nxNpuForward::embed_at(int token, int k) const {
 float Q4nxNpuForward::lm_at(int n, int k) const {
     if (n < 0 || n >= c_.NV || k < 0 || k >= c_.H) return 0.0f;
     if (!lm_head_f_.empty())
-        return lm_head_f_[(size_t)n * (size_t)c_.H + (size_t)k];
+        return lm_head_f_[(size_t)n * (size_t)lm_w_ + (size_t)k];
     return embed_at(n, k);
 }
 
@@ -1600,9 +1620,9 @@ bool Q4nxNpuForward::load_layer(int l) {
     const bool wide = kv_shared && sem_.double_wide_mlp;
     const int im = wide ? 2 * IM : IM;
     if (wide) {
-        wg_.resize((size_t)im * (size_t)H);
-        wu_.resize((size_t)im * (size_t)H);
-        wd_.resize((size_t)H * (size_t)im);
+        wg_.resize((size_t)im * (size_t)kpad_);
+        wu_.resize((size_t)im * (size_t)kpad_);
+        wd_.resize((size_t)H * (size_t)q4nx_pad_k(im));
     }
     // A pb16i container reads its decode weights from the sidecar images, so the f32
     // copies of the big projections are never needed: skipping them here is the
@@ -1610,12 +1630,12 @@ bool Q4nxNpuForward::load_layer(int l) {
     // one that opens 13.4 GB of images.  The norms and every small member still load.
     if (!pb16i_) {
         if (!deq(&lw->q_proj_weight, wq_.data(),
-                 NH * hd * (attn_gate_ ? 2 : 1), H)) return false;   // q|gate rows
+                 NH * hd * (attn_gate_ ? 2 : 1), kpad_)) return false;   // q|gate rows
         if (!kv_shared) {
-            if (!deq(&lw->k_proj_weight, wk_.data(), nkv * hd, H)) return false;
-            if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, H)) return false;
+            if (!deq(&lw->k_proj_weight, wk_.data(), nkv * hd, kpad_)) return false;
+            if (!deq(&lw->v_proj_weight, wv_.data(), nkv * hd, kpad_)) return false;
         }
-        if (!deq(&lw->o_proj_weight, wo_.data(), H, NH * hd)) return false;
+        if (!deq(&lw->o_proj_weight, wo_.data(), H, q4nx_pad_k(NH * hd))) return false;
     }
     if (n_expert_ > 0) {
         // Qwen MoE layer (qwen3moe / qwen35moe): a router + top-k routed experts
@@ -1668,9 +1688,9 @@ bool Q4nxNpuForward::load_layer(int l) {
     }
     if (!pb16i_ && !ffn_tail_cached()) {
         LhScope _t_f(LH_LOAD_FFN);
-        if (!deq(&lw->gate_proj_weight, wg_.data(), im, H)) return false;
-        if (!deq(&lw->up_proj_weight, wu_.data(), im, H)) return false;
-        if (!deq(&lw->down_proj_weight, wd_.data(), H, im)) return false;
+        if (!deq(&lw->gate_proj_weight, wg_.data(), im, kpad_)) return false;
+        if (!deq(&lw->up_proj_weight, wu_.data(), im, kpad_)) return false;
+        if (!deq(&lw->down_proj_weight, wd_.data(), H, q4nx_pad_k(im))) return false;
     }
     return true;
 }
@@ -1824,9 +1844,9 @@ bool Q4nxNpuForward::load_gdn_layer(int l) {
     }
     if (!ffn_tail_cached()) {
         LhScope _t_f(LH_LOAD_FFN);
-        if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, H)) return false;
-        if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, H)) return false;
-        if (!deqT(&lw->down_proj_weight, wd_.data(), H, c_.IM)) return false;
+        if (!deqT(&lw->gate_proj_weight, wg_.data(), c_.IM, kpad_)) return false;
+        if (!deqT(&lw->up_proj_weight, wu_.data(), c_.IM, kpad_)) return false;
+        if (!deqT(&lw->down_proj_weight, wd_.data(), H, impad_)) return false;
     }
     return true;
 }
@@ -4632,7 +4652,9 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     std::vector<float> hs((size_t)H);
     for (int k = 0; k < H; k++) hs[(size_t)k] = h[(size_t)k] * inv_es;
 
-    const size_t tile_elems = (size_t)H * (size_t)T;
+    /* The kernel's K is the padded width, so the packed B tile is kpad_ rows tall; lm_at() returns
+     * 0 for k >= c_.H, which fills the pad rows with zeros (engine#845). */
+    const size_t tile_elems = (size_t)kpad_ * (size_t)T;
     // The head is ONE row of activations (the last token's hidden state), so it is
     // decode and runs the M=16 twin of this geometry.  The head reuses the widest
     // K=H design, so the twin is the same kernel the MLP's GU launch uses -- same
@@ -4683,13 +4705,13 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
             const int n0 = t * T, n1 = std::min(NV, n0 + T);
             std::fill(bt.begin(), bt.end(), 0.0f);   // padded columns must be zero
             for (int n = n0; n < n1; n++)
-                for (int k = 0; k < H; k++) bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
+                for (int k = 0; k < kpad_; k++) bt[(size_t)k * T + (n - n0)] = lm_at(n, k);
             PackedWeight pw;
             pw.bo = lctx.make_weight_bo(*dev_);
             float sout = 1.0f;
             // Same packer, same padded KD x ND BO, same per-column scales as the
             // per-token packB below, so the packed bytes are bit-identical.
-            lctx.packB_into(*pw.bo, bt.data(), H, T, sout, pw.scales);
+            lctx.packB_into(*pw.bo, bt.data(), kpad_, T, sout, pw.scales);
             lm_head_packed_.push_back(std::move(pw));
         }
         lm_head_packed_T_ = T;
@@ -4715,7 +4737,7 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
                 const int n0 = t * T, n1 = std::min(NV, n0 + T);
                 float* dst = lm_head_tiles_.data() + (size_t)t * tile_elems;
                 for (int n = n0; n < n1; n++)
-                    for (int k = 0; k < H; k++)
+                    for (int k = 0; k < kpad_; k++)
                         dst[(size_t)k * T + (n - n0)] = lm_at(n, k);
             }
             lm_head_tiles_T_ = T;

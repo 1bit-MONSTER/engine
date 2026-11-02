@@ -632,6 +632,12 @@ add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test)
+# The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
+# model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
+add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c)
+target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
+target_link_libraries(npu_design_grid_test PRIVATE m)
+add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

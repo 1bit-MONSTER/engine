@@ -117,12 +117,34 @@ typedef struct {
     char elf_name[Q4NX_ELF_NAME_MAX];  /* geometry-derived artifact name */
     int q_rows, k_rows, v_rows;        /* row counts along N for QKV */
     int gate_rows, up_rows;            /* row counts along N for GU/G/U */
-    /* Real N before the kernel's n-tile pad; 0 means "same as N".  Only KVA
-     * (kv_lora+rope_dim = 576, padded to 640) needs it: assemble_B scatters
-     * real_n columns and zero-fills the rest, so the weight is never read out
-     * of bounds. */
+    /* Real N before the kernel's n-tile pad; 0 means "same as N".  assemble_B scatters only
+     * real_n columns and zero-fills the rest, so the weight is never read out of bounds.  A
+     * non-zero real_n also means the design's N was padded up to q4nx_pad_n(): Qwen2.5-0.5B's O
+     * projection is 896 rows of output in a 1024-column kernel (engine#845). */
     int real_n;
+    /* Real K before the container's chunk grid pad; equal to K when the model is already on the
+     * grid.  The pad rows are ZERO in the container (npu/pack_import.cpp writes scale 0, zero 0,
+     * codes 0), so a padded K adds exactly 0 to every dot product and the K=K design is an exact
+     * reading of the container rather than an approximation of it.  Callers that dequantise a
+     * container tensor must use K as the width, not the model's hidden/intermediate size. */
+    int real_k;
 } Q4nxDesignGeom;
+
+/* The two grids a design's K and N are expressed on, and the only padding in this file.  Both
+ * come from the kernels and the container, not from a model:
+ *
+ *   q4nx_pad_k  the Q4NX q4_1/Q8 chunk is 32 rows x 256 columns (npu/q4nx.h `kCols`), so a
+ *               container stores every tensor with K padded up to 256 -- Qwen2.5-0.5B's hidden
+ *               896 is stored as 1024 columns of zeros-and-weights.
+ *   q4nx_pad_n  a full ELF's N is built on the gemv family's column pass, 32 rows x 4 x cols(4)
+ *               = 512 columns (addons/npu-dx/forge pad_rows in the private kernel tree), and it
+ *               loops whole 512-column groups inside one ELF, so one launch still covers N.
+ *
+ * Both are identity for every model validated before this existed (hidden and N were already on
+ * both grids: 5120/6144/2048/14336/17408 ...), which is exactly why the mismatch went unseen
+ * until a pack with hidden 896 (engine#845). */
+int q4nx_pad_k(int k);
+int q4nx_pad_n(int n);
 
 /* Architecture dims a design set is derived from. */
 typedef struct {

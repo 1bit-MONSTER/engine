@@ -425,6 +425,17 @@ private:
     // kernel (e.g. GU is absent on split models, G/U absent on fused ones).
     int idx_of(Q4nxDesign role) const;
 
+    // The container stores every q4_1/Q8 tensor on the chunk's 256-column K grid (npu/q4nx.h
+    // kCols), so the projection width a container tensor is dequantised at is the PADDED hidden
+    // size (engine#845: Qwen2.5-0.5B's 896 is stored as 1024 columns, zeros in the pad).  The
+    // pad columns are zero in the container, so they add exactly 0 to every dot product.  The
+    // designs' K comes out of the same grid (q4nx_pad_k), which is what makes assemble_B's source
+    // stride and this width the same number.
+    int kpad_ = 0;        // c_.H on the container's K grid
+    int impad_ = 0;       // c_.IM on the container's K grid
+    // Row stride of the f32 table embed_at()/lm_at() read: the padded width when the table was
+    // dequantised from a container tensor, c_.H when it is the raw BF16 embedding.
+    int lm_w_ = 0;
     // BF16 host-side tensors
     std::vector<uint16_t> embed_;                 // [NV*H] bf16
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and

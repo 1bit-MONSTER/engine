@@ -133,6 +133,10 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
             }
         }
         // from each position, chain k drafts off the primed cache and compare with the real continuation
+        // Per-prompt counts as well as the run aggregate: the live loop is measured in slice tickets whose prompts
+        // differ by 2.5x in chain length, so an aggregate-vs-aggregate comparison mixes prompt effects with any
+        // real drift.  Same form as the live path prints, so the two can be joined prompt by prompt.
+        int p_hit[16] = {0}, p_tot[16] = {0};
         for (size_t i = 0; i + 1 < hidden.size(); i++) {
             KvCache c = cache_at[i];
             std::vector<float> h = hidden[i], e2, nx;
@@ -144,13 +148,17 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
                 if (!head_step(w, h.data(), e2.data(), pos, c, nx, lm, lg)) break;
                 int d = argmax_n(lg);
                 d_tot[j]++;
-                if (d == all_tokens[i + j + 1]) d_hit[j]++;
+                p_tot[j]++;
+                if (d == all_tokens[i + j + 1]) { d_hit[j]++; p_hit[j]++; }
                 tok = d;
                 h = nx;
                 pos++;
             }
         }
-        std::printf("prompt %d: %zu tokens, %zu positions primed\n", p, hidden.size(), hidden.size());
+        std::printf("prompt %d: %zu tokens, %zu positions primed\n", pi, hidden.size(), hidden.size());
+        std::printf("  per-depth p%d:", pi);
+        for (int j = 0; j < k; j++) std::printf(" %d %d/%d", j + 1, p_hit[j], p_tot[j]);
+        std::printf("\n");
     }
     double expected = 1.0;
     std::printf("\n== offline drafter acceptance, %d prompts x %d tokens, k=%d, hidden=%s\n", prompts, tokens, k,

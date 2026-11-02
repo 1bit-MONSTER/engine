@@ -31,6 +31,7 @@ how to build it. The Ubuntu Server `autoinstall` design stays the documented fal
 | `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, `/lib/modules/<kver>` in its zdrv, and `amdxdna`/`ec_su_axb35` built for that kernel and signed. `--require-mok` for the release gate |
 | `packages-extra` | package rows the acceptance needs and woof-CE's set does not have (`sudo`, `apt`, `mokutil`, `openssh-server`), with the measurement that justifies each |
 | `spec-insert-rows.sh` | puts those rows inside `PKGS_SPECS_TABLE`, before its closing quote; idempotent |
+| `embed/` | the files PAYLOAD=... drops into the rootfs: `/etc/init.d/10lemonade`, the boot service (Puppy's `rc.services` runs every executable `/etc/init.d` script) |
 
 ## A kernel bump, end to end
 
@@ -84,6 +85,9 @@ os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 #    build (measured: one package, all four mirrors, and the URL was fine minutes later). If the box has
 #    built before, seed the cache instead: sudo cp -a <old-build-root>/local-repositories <new-build-root>/
 #    <puppy-out-dir> gets the ISO and the four SFS - the SFS files are the frugal install.
+#    PAYLOAD=<unpacked lemonade-onebit-<tag>> embeds the release package (U3/U4): copied to
+#    /opt/1bit-package with /etc/init.d/10lemonade starting it at boot, and the build refuses an image
+#    whose rootfs lacks the engine, the launcher, /usr/local/bin/1bit or the service.
 #    build.sh copies <out-dir>/huge-*.tar.* into woof-out_*/kernel-kit/output/ before 3builddistro,
 #    which is what makes the image carry OUR kernel. Empty that directory and woof-CE silently
 #    downloads a stock Ubuntu kernel instead - the trap the evaluation paid for.

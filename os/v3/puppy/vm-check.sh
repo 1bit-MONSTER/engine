@@ -141,6 +141,11 @@ rows = [
     ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
     ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),
     ("data state",   "ls /data; grep -c . /data/lemonade/config/user_models.json 2>/dev/null || echo no-registry", None),
+    # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
+    # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
+    # these two lines say whether that was the listener or the interface.
+    ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
+    ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]
 for idx, (name, cmd, want) in enumerate(rows):
     sentinel = "__DONE%d__" % idx

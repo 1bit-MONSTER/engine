@@ -74,6 +74,18 @@ check "-ngl 99 and --cache-reuse 256 added" 'argv | grep -qx -- -ngl && argv | g
 check "no -kvu with one slot" '! argv | grep -qx -- -kvu'
 check "GGML_HRX_STRICT=1 from 1bit serve" '[ "$(envv GGML_HRX_STRICT)" = 1 ] && [ "$(envv GGML_HRX_REPORT)" = 1 ]'
 
+# engine#715: the save-area trio has to reach the llama-server this wrapper execs, in the environment
+# `1bit serve --print-backend-env` prints (a caller that exports nothing is the shipped launcher's own environment)
+env -u HSA_USE_SVM -u HSA_USERPTR_FOR_PAGED_MEM -u HRX_ALLOW_NO_SVM -u HRX_SVM "$bin" serve \
+    -m "$scratch/small.gguf" --device hrx --no-mem-check --llama-server "$here/fake_backend.py" \
+    --hrx-cwsr-placement=on --print-backend-env >/dev/null 2>"$scratch/gate.err"
+if grep -q "no HRX_ALLOW_NO_SVM gate" "$scratch/gate.err"; then
+    echo "     (this build's hrx-system has no HRX_ALLOW_NO_SVM gate: the trio is not part of the plan)"
+else
+    check "the save-area trio reaches the exec'd llama-server (engine#715)" \
+        '[ "$(envv HSA_USE_SVM)" = 0 ] && [ "$(envv HSA_USERPTR_FOR_PAGED_MEM)" = 0 ] && [ "$(envv HRX_ALLOW_NO_SVM)" = 1 ]'
+fi
+
 run env GGML_HRX_STRICT=0 "$pkg/lemonade-hrx" "${lemond[@]}"; rc=$?
 check "a GGML_HRX_STRICT already set wins (exit $rc)" '[ "$rc" = 0 ] && [ "$(envv GGML_HRX_STRICT)" = 0 ]'
 

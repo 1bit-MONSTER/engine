@@ -2834,11 +2834,17 @@ int run_serve(int argc, char** argv) {
                     + "--hrx-cwsr-placement=off or HRX_SVM=1: either drop that, or set " + kCwsrRecipe
                     + " yourself, or set ONEBIT_HRX_NO_TRIO_OK=1 if this box's ROCr does not need them.");
     }
-    if (cwsr_route) {
+    if (cwsr_route && !o.print_backend) {
         // silent on purpose: the decision line announce_cwsr_env() prints at the first HRX backend already tells the
         // operator the placement happened, and a second line here makes every path that counts output lines (the
         // memory refusal, tests/mem_admit_route.sh) wrong for no diagnostic gain.
         (void) apply_cwsr_env_to_self(hrx_cwsr_env(o));
+        // ... and NOT in the --print-backend / --print-backend-env modes: those start no backend here, the caller
+        // does, and it starts it with the plan's env -- which leaves out every variable already in *this* process
+        // (the "a value the caller set wins" filter below). Exporting the trio to ourselves first therefore hid it
+        // from Lemonade's two spawn paths (the one hop and scripts/lemonade-hrx), the exact configuration
+        // engine#715 is about: measured on the 2026-11-01b package, --print-backend-env printed GGML_HRX_STRICT and
+        // the libhsa path and no trio. Printed, and a value the caller set still wins by the same filter.
     }
     if (o.print_backend) {
         if (fs::is_directory(o.model)) return serve_only("an NPU model directory runs in serve's own process");

@@ -738,6 +738,13 @@ int main(int argc, char** argv) {
         // device run and no case exercised it, so nothing here would have caught a defect in that design --
         // found while answering pi-ortep's question about which designs our |d| = 0 gate actually covers.
         {"quark-d", 5, 3072, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        // Qwen3-0.6B's k_proj/v_proj shape (1024 -> 1024). No design for it existed on this box until it
+        // was generated from the iso-build generator (docs/onnx.md), which is why the device leg covered
+        // o_proj and down_proj only; with this design and the 1024 -> 2048 one the device share of a
+        // real A8W8 graph is 5 of the model's 7 projection shapes instead of 2.
+        {"quark-kv", 5, 1024, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        // Qwen3-0.6B's gate_proj/up_proj shape (1024 -> 3072). Same generator, cols=4 like o_proj's design.
+        {"quark-gu", 5, 1024, 3072, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // The same, with enough values that a quantisation boundary is likely to be hit: 64x1024x2048
         // is 131072 int8 outputs, and the CPU EP reaches each one through a float accumulation where
         // the fused path rounds an exact int32 sum.
@@ -859,7 +866,7 @@ int main(int argc, char** argv) {
                          worst_refused);
             rc = 1;
         } else if (!fusion_off) {
-            if (fused_cases < 8) {
+            if (fused_cases < 10) {
                 std::fprintf(stderr, "onebit-ort-qdq: FAIL only %zu case(s) were fused\n", fused_cases);
                 rc = 1;
             } else if (peak_cpu > 0 && peak_fused > 0 && peak_fused >= peak_cpu) {

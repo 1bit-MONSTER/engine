@@ -2778,6 +2778,16 @@ void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int
     }
 }
 
+bool Q4nxNpuForward::step_batch_all(const std::vector<int>& tokens, int start_pos,
+                                    std::vector<float>& logits_all) {
+    std::vector<float> last;
+    std::vector<float>* saved = batch_all_out_;
+    batch_all_out_ = &logits_all;
+    const bool ok = step_batch(tokens, start_pos, last);
+    batch_all_out_ = saved;
+    return ok;
+}
+
 bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                                 std::vector<float>& logits) {
     if (!ready_) { err_ = "not initialised"; return false; }
@@ -3097,11 +3107,23 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
     // The next-token logits come from the last row of the batch, after the final
     // norm -- step() applies final_norm_ before run_lm_head, and feeding the raw
     // residual here produced garbage logits (the M=1 self-check caught it).
-    std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
     std::vector<float> fnorm(H);
-    rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
+    bool ok = true;
+    if (batch_all_out_) {
+        // step_batch_all(): the verifier needs the model's own choice at every drafted position, so every
+        // row is normed and the head runs ONCE for the batch (the M=16 twin streams its weights once).
+        std::vector<float> norm_all((size_t)M * (size_t)H);
+        for (int m = 0; m < M; m++)
+            rmsnorm(&X[(size_t)m * H], final_norm_.data(), H, &norm_all[(size_t)m * H]);
+        std::copy(norm_all.begin() + (size_t)(M - 1) * H, norm_all.end(), fnorm.begin());
+        ok = run_lm_head_rows(norm_all, M, *batch_all_out_);
+        logits.assign(batch_all_out_->begin() + (size_t)(M - 1) * (size_t)c_.NV, batch_all_out_->end());
+    } else {
+        std::vector<float> last(X.begin() + (size_t)(M - 1) * H, X.end());
+        rmsnorm(last.data(), final_norm_.data(), H, fnorm.data());
+        ok = run_lm_head(fnorm, logits);
+    }
     last_hidden_ = fnorm;  // for last_hidden(): the same vector the head reads, last position only
-    const bool ok = run_lm_head(fnorm, logits);
     if (getenv("NPU_INFER_DUMP_LAYERS")) {
         int best[5] = {-1, -1, -1, -1, -1};
         for (int i = 0; i < (int)logits.size(); i++) {
@@ -4193,6 +4215,89 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
 }
 
 // tiled LM head: logits[K*t + n] = dot(embed[K*t + n], h); K = H, tile = QKV N
+bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
+                                     std::vector<float>& logits_all) {
+    const int H = c_.H, NV = c_.NV;
+    if (M <= 0) { err_ = "lm head rows: empty batch"; return false; }
+    if (M == 1 || h_rows.size() != (size_t)M * (size_t)H) {
+        std::vector<float> one(h_rows.begin(), h_rows.begin() + H);
+        std::vector<float> lg;
+        if (!run_lm_head(one, lg)) return false;
+        logits_all = std::move(lg);
+        return true;
+    }
+    logits_all.assign((size_t)M * (size_t)NV, 0.0f);
+    // One single-row call first: it prepares the packed tiles / f32 gather and refuses loudly (missing
+    // images, two-plane tile on a one-plane ELF) exactly as the token path does, so this function never
+    // has to duplicate that setup.  Its logits are the last row's.
+    {
+        std::vector<float> last(h_rows.begin() + (size_t)(M - 1) * H, h_rows.begin() + (size_t)M * H);
+        std::vector<float> lg;
+        if (!run_lm_head(last, lg)) return false;
+        std::copy(lg.begin(), lg.end(), logits_all.begin() + (size_t)(M - 1) * (size_t)NV);
+    }
+    const bool rows_supported = !host_gemm_ && head_pb16i_ && ctx_head_ != nullptr && !lm_head_packed_.empty();
+    if (!rows_supported) {
+        // host_gemm and the int8 head have no per-row launcher; the rows are rare (speculative verify only),
+        // so they go one at a time rather than growing a second code path in the hot token routine.
+        for (int m = 0; m + 1 < M; m++) {
+            std::vector<float> one(h_rows.begin() + (size_t)m * H, h_rows.begin() + (size_t)(m + 1) * H);
+            std::vector<float> lg;
+            if (!run_lm_head(one, lg)) return false;
+            std::copy(lg.begin(), lg.end(), logits_all.begin() + (size_t)m * (size_t)NV);
+        }
+        return true;
+    }
+    // The pb16i head, once for the whole batch: per-row rotation + per-row activation scale (the launcher and
+    // the dequantiser both carry per-row scales), one launch per tile, then the host finishing each row.
+    int i_qkv = -1;
+    for (int d = 0; d < ndesigns_; d++)
+        if (designs_[d].K == H && designs_[d].N > 0 && (i_qkv < 0 || designs_[d].N > designs_[i_qkv].N))
+            i_qkv = d;
+    if (i_qkv < 0) { err_ = "LM head rows: no GEMM design with K=H available"; return false; }
+    const int T = designs_[i_qkv].N;
+    const int ntiles = (NV + T - 1) / T;
+    if ((int)lm_head_packed_.size() != ntiles) { err_ = "LM head rows: packed tiles not resident"; return false; }
+    auto hsig = had_signs_.find(H);
+    if (hsig == had_signs_.end()) {
+        err_ = "pb16i head rows: no Hadamard sign vector for K=" + std::to_string(H);
+        return false;
+    }
+    std::vector<float> hr((size_t)M * (size_t)H), scales((size_t)M);
+    for (int m = 0; m < M; m++) {
+        const float* src = &h_rows[(size_t)m * H];
+        float* dst = &hr[(size_t)m * H];
+        std::copy(src, src + H, dst);
+        hadamard_rotate(hsig->second.data(), dst, H, had_block_);
+        float amax = 0.0f;
+        for (int k = 0; k < H; k++) {
+            const float a = std::fabs(dst[(size_t)k]);
+            if (a > amax) amax = a;
+        }
+        scales[(size_t)m] = amax > 0.0f ? amax / 127.0f : 1.0f;
+    }
+    I8Ctx& lctx = *ctx_head_;
+    std::vector<float> got((size_t)M * (size_t)T);
+    for (int t = 0; t < ntiles; t++) {
+        const int n0 = t * T, n1 = std::min(NV, n0 + T);
+        xrt::run run = lctx.launch_async_with_bo_rows(*lm_head_packed_[(size_t)t].bo, hr.data(), M, H,
+                                                      scales.data());
+        lctx.wait_kernel(run);
+        lctx.readback();
+        std::fill(got.begin(), got.end(), 0.0f);
+        lctx.dequant_pb16i(got.data(), M, T, scales.data(), lm_head_packed_[(size_t)t].eref,
+                           ctx_head_->pb16i_planes);
+        for (int m = 0; m < M; m++) {
+            for (int n = n0; n < n1; n++) {
+                float v = got[(size_t)m * T + (n - n0)];
+                if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+                logits_all[(size_t)m * (size_t)NV + (size_t)n] = v;
+            }
+        }
+    }
+    return true;
+}
+
 bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>& logits) {
     const int H = c_.H, NV = c_.NV;
     if (host_gemm_) {

@@ -221,6 +221,13 @@ rows = [
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
                      "/opt/1bit-package"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
+    # BEFORE any in-VM fix runs: on an image that carries the fixes these two say so (root, and 1), on an
+    # older image they say what is missing. The fix rows below then repair it so the login can still be
+    # measured on that image - which is the difference between "the fix works" and "this artifact has it".
+    ("image pre",    "ls -l /root/.ssh/authorized_keys | awk '{print \"key-owner=\"$3\"/\"$4}'; "
+                     "echo hosts-lan=$(grep -c 1bit-lan /etc/hosts.allow); "
+                     "ls /lib/modules/$(uname -r)/modules.dep >/dev/null 2>&1 && echo modules-tree=visible "
+                     "|| echo modules-tree=MISSING", None),
     # the fix, measured before it ships: StrictModes wants root-owned keys, and the image's file was not
     ("U7 key-owner", "chown 0:0 /root/.ssh /root/.ssh/authorized_keys 2>&1; "
                      "ls -l /root/.ssh/authorized_keys | awk '{print $3\"/\"$4\"/\"$1}'; "

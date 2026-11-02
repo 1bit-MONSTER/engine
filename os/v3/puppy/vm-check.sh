@@ -196,8 +196,13 @@ s.sendall(b"\n")
 rows = [
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
-    ("U1 apt",       "apt update 2>&1 | tail -2; apt install -y neofetch 2>&1 | tail -2; command -v neofetch",
-                     "neofetch", 600),
+    # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
+    # version matched "Unable to locate package neofetch" and reported a pass (measured 2026-11-02)
+    ("U1 apt",       "apt update 2>&1 | tail -2; apt install -y neofetch 2>&1 | tail -3; "
+                     "command -v neofetch && echo neofetch-installed || echo neofetch-missing",
+                     "neofetch-installed", 600),
+    ("U1 apt-any",   "apt install -y --no-install-recommends cowsay 2>&1 | tail -2; "
+                     "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
     ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "
                      "echo key-on-data", "key-on-data"),
@@ -212,6 +217,8 @@ rows = [
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
                      "/opt/1bit-package"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
+    ("U7 sshd",      "ps | grep -c '[s]shd'; ls -l /root/.ssh/authorized_keys 2>&1 | tail -1; "
+                     "ls /etc/ssh/ssh_host_* 2>&1 | head -3; /usr/sbin/sshd -t 2>&1 | head -3; echo sshd-checked", None),
     ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),
     ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
     ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),

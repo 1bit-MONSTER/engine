@@ -21,8 +21,14 @@
 //    (tools/gguf_to_q4nx.py); the same synthetic tensor is rebuilt here.
 // 3. The tiles as the engine reads them: q4nx::dequant_tile reproduces codes*scale+zero
 //    to the bf16 parameter bound, and the codes come back out unchanged, padding included.
-// 4. With a pack dir: `1bit npu-pack`'s plan refuses every projection by name, and an
-//    --allow-incomplete import produces a container the engine's own Model can open.
+// 4. One tile out of a real pack's `.fconst` (tests/golden/oga_attn_tile.bin, copied verbatim
+//    from Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K by tools/oga_attn_tile_golden.py): the
+//    importer's decoder must re-encode it to the same bytes, and its container output must match
+//    the recorded q4_1 tiles. That checks the tile layout against the vendor writer's own
+//    output with no vendor stack present -- which is what a CI run has.
+// 5. With a pack dir: `1bit npu-pack`'s plan refuses the MLP projections and the final norm by
+//    name, imports the attention projections and their biases, and produces a container the
+//    engine's own Model can open.
 
 #include "model.h"
 #include "pack.h"
@@ -382,6 +388,87 @@ void test_tiles(const std::string& golden_dir) {
 }
 
 // ── 4. a real pack ──────────────────────────────────────────────────────────
+// ── 3b. the .fconst attention tile against shipped pack bytes ───────────────
+void test_attn_tile(const std::string& golden_dir) {
+    if (golden_dir.empty()) return;
+    const std::string tile_path = golden_dir + "/oga_attn_tile.bin";
+    std::ifstream f(tile_path, std::ios::binary);
+    if (!f) {
+        std::printf("skip attention golden: %s absent\n", tile_path.c_str());
+        return;
+    }
+    std::vector<uint8_t> tile((std::istreambuf_iterator<char>(f)), std::istreambuf_iterator<char>());
+    const int k = 896;
+    const int64_t want = pi::attn_tile_bytes(k);
+    check(int64_t(tile.size()) == want,
+          "attention golden: the fixture is one " + std::to_string(want) + "-byte tile of K=" +
+              std::to_string(k) + " (got " + std::to_string(tile.size()) + ")");
+    if (int64_t(tile.size()) != want) return;
+
+    const pi::TileW t = pi::decode_tile(tile.data(), k);
+    check(t.bias.size() == 64 && t.code.size() == 64u * size_t(k),
+          "attention golden: the tile decodes to 64 rows");
+
+    // the self-check the importer runs on every tile: same bytes back, or the fields are not understood
+    const std::vector<uint8_t> back = pi::encode_tile(t);
+    check(back == tile, "attention golden: encode(decode(tile)) reproduces the pack's bytes exactly");
+    if (back != tile)
+        for (size_t i = 0; i < std::min(back.size(), tile.size()); ++i)
+            if (back[i] != tile[i]) {
+                std::fprintf(stderr, "  first difference at byte %zu: ours %02x, pack %02x\n", i, back[i],
+                             tile[i]);
+                break;
+            }
+
+    // ... and the check has to be able to fail: one nibble moved and one scale perturbed
+    {
+        pi::TileW bad = t;
+        bad.code[0] ^= 0x01;
+        check(pi::encode_tile(bad) != tile, "attention golden: a single changed code nibble is caught");
+        // a scale one bf16 ulp away (2^-8 relative) has to be caught: the encoder rounds to bf16, so a
+        // smaller perturbation would legitimately come back unchanged and prove nothing
+        pi::TileW bad2 = t;
+        bad2.scale[0] *= 1.004f;
+        check(pi::encode_tile(bad2) != tile, "attention golden: a one-ulp scale change is caught");
+        pi::TileW bad3 = t;
+        bad3.bias.at(3) ^= 0x0001;
+        check(pi::encode_tile(bad3) != tile, "attention golden: the bias slot is part of the check");
+    }
+
+    // the container tiles the importer derives from that tile, against the recorded ones
+    std::ifstream qf(golden_dir + "/oga_attn_tile_q4_1.bin", std::ios::binary);
+    std::vector<uint8_t> golden((std::istreambuf_iterator<char>(qf)), std::istreambuf_iterator<char>());
+    const pi::Q4 q = pi::q_from_tiles({t});
+    std::vector<uint8_t> tiled;
+    pi::tile_q4_1(q, tiled);
+    check(golden.size() == tiled.size(),
+          "attention golden: q4_1 tile count follows from 64 rows x the 256-column grid (" +
+              std::to_string(tiled.size() / onebit::npu::kTileBytes) + " tiles)");
+    check(golden == tiled, "attention golden: container tiles byte-identical to the recorded ones");
+    if (golden != tiled)
+        for (size_t i = 0; i < std::min(golden.size(), tiled.size()); ++i)
+            if (golden[i] != tiled[i]) {
+                std::fprintf(stderr, "  first tile difference at byte %zu: golden %02x, ours %02x\n", i,
+                             golden[i], tiled[i]);
+                break;
+            }
+
+    // what the tile says, recorded in the json beside it: the bias subvolumes are per-row data
+    std::ifstream jf(golden_dir + "/oga_attn_tile.json");
+    const std::string text((std::istreambuf_iterator<char>(jf)), std::istreambuf_iterator<char>());
+    if (!text.empty()) {
+        bool seen = text.find("bias_bf16") != std::string::npos;
+        for (int i = 0; i < 4; ++i) {
+            char buf[16];
+            std::snprintf(buf, sizeof buf, "%u", unsigned(t.bias[size_t(i)]));
+            seen = seen && text.find(buf) != std::string::npos;
+        }
+        check(seen, "attention golden: the first bias values match the json beside the fixture");
+    }
+    std::printf("attention golden: 1 tile, encode/decode exact, %zu container tiles identical\n",
+                tiled.size() / onebit::npu::kTileBytes);
+}
+
 void test_pack(const std::string& pack, const std::string& golden_dir) {
     const pi::Plan p = pi::plan(pack);
     const int layers = p.dims.layers;
@@ -390,27 +477,31 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
           "pack: geometry from config.json and the embedding");
     if (qwen05b) check(true, "pack: this is the Qwen2.5-0.5B geometry the lane started from");
     const auto refused = p.refused();
-    check(int(refused.size()) == layers * 7 + 1,  // the projections, plus the final norm
-          "pack: all " + std::to_string(layers * 7) + " projections and the final norm are refused by "
+    check(int(refused.size()) == layers * 3 + 1,  // gate/up/down, plus the final norm
+          "pack: the " + std::to_string(layers * 3) + " MLP projections and the final norm are refused by "
           "name, got " + std::to_string(refused.size()));
     bool named = true;
     for (const auto& s : refused)
         if (s.find(".fconst") == std::string::npos) named = false;
     check(named, "pack: every refusal names the .fconst and the missing layout fact");
+    check(p.attn_note.empty() && p.attn_tiles > 0,
+          "pack: the attention payload's tile count was measured (" + std::to_string(p.attn_tiles) + " tiles)");
 
-    int norms = 0, tiles_planned = 0;
+    int norms = 0, attn = 0, lm_tiles_planned = 0;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
-        if (t.dtype == "q4_1" && t.refusal.empty())
-            tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
+            lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn;
     }
     check(norms == layers * 2 + 1,
           "pack: 2 norms per layer plus the final norm are planned (the final one refused)");
+    check(attn == layers * 4, "pack: the 4 attention projections per layer are planned from the measurement");
     // K is padded to the 256-column grid, so this holds for any hidden size
     const int head_rows = int(p.tensors.at(1).shape.at(0));
-    check(tiles_planned == (head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
+    check(lm_tiles_planned == (head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
           "pack: lm_head tile count follows from its shape and the 256-column grid");
-    if (qwen05b) check(tiles_planned == (151936 / 32) * 4, "pack: 0.5B lm_head plans 4748 x 4 tiles");
+    if (qwen05b) check(lm_tiles_planned == (151936 / 32) * 4, "pack: 0.5B lm_head plans 4748 x 4 tiles");
 
     // refusing must write nothing at all
     const std::string out = (fs::temp_directory_path() / "oga_pack_import_test").string();
@@ -445,6 +536,17 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     if (qwen05b)
         check(r.stride == 8708288 && r.second_header == 1115968,
               "pack: 0.5B reproduces the offsets that were measured by hand");
+    // the attention payload: every tile of every layer survives its own round trip, and what came out of
+    // them is in the container -- 4 projections and, where the pack has them, the q/k/v biases
+    check(r.attn_tiles_total == layers * 32 && r.attn_tiles_ok == r.attn_tiles_total,
+          "pack: all " + std::to_string(layers * 32) + " .fconst attention tiles decode and re-encode "
+          "byte-identically (" + std::to_string(r.attn_tiles_ok) + ")");
+    check(r.attn_projections == layers * 4,
+          "pack: 4 attention projections per layer were imported (" +
+              std::to_string(r.attn_projections) + ")");
+    check(r.attn_bias_tensors == layers * 3,
+          "pack: q/k/v biases came out of the tiles' bias subvolumes (" +
+              std::to_string(r.attn_bias_tensors) + ")");
 
     // the container must open with the engine's own loader
     onebit::npu::Model m(out);
@@ -453,6 +555,13 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
           "pack: lm_head tile count matches the container");
     check(m.tensor("model.layers.0.input_layernorm.weight").shape.at(0) == p.dims.hidden,
           "pack: a layer norm is `hidden` bf16 values, whatever the hidden size");
+    if (r.attn_projections) {
+        const auto& qw = m.tensor("model.layers.0.self_attn.q_proj.weight");
+        check(qw.shape.at(1) == int64_t(onebit::npu::kTileBytes),
+              "pack: an imported projection is q4_1 chunks of the container's tile size");
+        check(m.tensor("model.layers.0.self_attn.q_proj.bias").shape.at(0) == int64_t(p.dims.heads * p.dims.head_dim),
+              "pack: the q_proj bias is one bf16 value per output row");
+    }
     check(m.dims().hidden == p.dims.hidden && m.dims().layers == layers,
           "pack: config.json drives the loader");
     fs::remove_all(out);
@@ -468,6 +577,7 @@ int main(int argc, char** argv) {
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
         test_matmulnbits();
         test_tiles(golden_dir);
+        test_attn_tile(golden_dir);
         if (!pack.empty() && fs::exists(pack + "/model.onnx")) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given\n");
     } catch (const std::exception& e) {

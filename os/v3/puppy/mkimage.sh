@@ -26,6 +26,9 @@
 # <out-dir>        where 1bit-os-puppy.img lands
 # [data-mb]        the 1BIT-DATA partition's size, default 8192; prepare-stick.sh grows it to the stick
 #
+# psubdir=1bit is what tells Puppy's init to look for the SFS in /1bit and to keep its save file (or save
+# folder) there too - measured in the initrd: PSUBDIR is both the search directory and SAVE_DIR.
+#
 # On the data partition, at the root:
 #   1bit/            vmlinuz, initrd.gz and the four SFS - Puppy's frugal install, and the save folder
 #                    Puppy creates lives here too, so U2's persistence is this same partition
@@ -87,15 +90,15 @@ terminal_input serial console
 terminal_output serial console
 search --no-floppy --label 1BIT-DATA --set=root
 menuentry "1bit OS (Puppy appliance, ${kver})" {
-    linux /1bit/vmlinuz pmedia=usbhd pfix=copy console=tty0 console=ttyS0,115200
+    linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - serial root shell (1bit.serial=1)" {
-    linux /1bit/vmlinuz pmedia=usbhd pfix=copy console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - no X, verbose (pfix=nox)" {
-    linux /1bit/vmlinuz pmedia=usbhd pfix=nox,fsck console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit pfix=nox,fsck console=tty0 console=ttyS0,115200 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 GRUBCFG
@@ -127,6 +130,12 @@ rm -rf "$work"
 
 echo "== $img"
 sfdisk -d "$img" 2> /dev/null | sed 's/^/   /'
+# mkimage needs root for mkfs/sfdisk on most boxes; the image it leaves behind is read by qemu, dd and
+# prepare-stick as the caller, so hand it over when we were called through sudo (measured: qemu as the
+# invoking user got "Could not open ... Permission denied" on a root-owned 644 image).
+if [ "$(id -u)" = "0" ] && [ -n "${SUDO_UID:-}" ]; then
+    chown "$SUDO_UID:${SUDO_GID:-$SUDO_UID}" "$img" 2> /dev/null || true
+fi
 ls -l "$img"
 echo "   kernel: ${kver:-unknown}, ESP ${esp_mb} MB, data ${data_mb} MB"
 echo "   write it: sudo dd if=$img of=/dev/sdX bs=4M conv=fsync   (then os/mini/prepare-stick.sh grows"

@@ -62,7 +62,7 @@ case $iso in
     # the shipped artifact: firmware boots the ESP, grub reads the data partition
     vars=$work/OVMF_VARS.fd; [ -f "$vars" ] || cp /usr/share/OVMF/OVMF_VARS_4M.fd "$vars"
     # shellcheck disable=SC2054  # same: commas belong to the qemu arguments
-    boot=(-drive file="$iso",format=raw,if=none,id=d0 -device usb-storage,drive=d0
+    boot=(-drive file="$iso",format=raw,if=none,id=d0 -device qemu-xhci -device usb-storage,drive=d0
           -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.fd
           -drive if=pflash,format=raw,file="$vars")
     ;;

@@ -25,8 +25,8 @@ so it also works on its own with any OpenAI client.
 
 ```sh
 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]
-           [--device auto|npu|hrx|hybrid|cpu|ds4] [--ctx-size N] [--alias NAME]
-           [--llama-server PATH] [--ds4 PATH] [--ssd-streaming] [--hrx-libhsa PATH]
+           [--device auto|npu|hrx|hybrid|cpu] [--ctx-size N] [--alias NAME]
+           [--llama-server PATH] [--hrx-libhsa PATH]
            [--prefill-provider PATH]      --device hybrid: NPU prefill, HRX decode (docs/hybrid.md)
            [--hrx-cwsr-placement=auto|on|off]
            [--mtp HEAD.gguf | --dflash DRAFT.gguf | --no-mtp] [--mtp-max N] [--mtp-p-min P] [--mmproj MMPROJ.gguf]
@@ -43,10 +43,11 @@ so it also works on its own with any OpenAI client.
            [--print-backend | --print-backend-env]
 ```
 
-> **The `ds4` route is not in the shipped build** (owner decision 2026-11-01: the release ships HIP kernels
-> only, so it is built with `-DONEBIT_DS4=OFF`, [#757](https://github.com/1bit-MONSTER/engine/pull/757)).
-> `--device ds4`, `--ds4` and `--ssd-streaming` stay documented below for a `-DONEBIT_DS4=ON` build, which is
-> also the only kind that provides the `ds4-server` they start ([dwarfstar.md](dwarfstar.md)).
+> **`--device ds4` was removed** (owner decision 2026-11-01, DwarfStar out of the tree 2026-11-02). It ran
+> DwarfStar, whose ds4-server was antirez's CUDA kernels through a HIP shim plus hipBLAS, not our HIP kernels, and
+> it was also the engine's only 1BP reader. `--device ds4`, `--ds4` and `--ssd-streaming` now fail with a message
+> that says so; DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on `--device hrx`, and a `.1bp` package has no
+> route (convert it to GGUF).
 
 One model per process:
 
@@ -66,7 +67,7 @@ One model per process:
 
 "llama-server devices" means `hrx` and `cpu`. These routes go to the llama-server
 behind the model, which is how Lemonade's llamacpp backend reaches them (the `onebit` recipe
-inherits it). On `npu` and `ds4` they answer 501.
+inherits it). On `npu` they answer 501.
 
 `1bit serve` has no authentication (SECURITY.md), so it refuses two kinds of request a web
 page could make with 403: on a loopback `--host`, any whose `Host` header is not a loopback
@@ -173,11 +174,11 @@ MiniCPM4-8B, at 2K-262K context.
 
 A hung GPU dispatch (a wedged HRX queue, a #315 fault) stops llama-server's main loop, while its
 HTTP thread keeps answering `/health` with 200. So `1bit serve` checks two things itself, for the
-backends it runs as child processes (`hrx`, `cpu`, `ds4`; the in-process NPU route
+backends it runs as child processes (`hrx`, `cpu`; the in-process NPU route
 is not covered):
 
 - **`/health` follows the backend.** Once the model is loaded, serve asks each backend's own
-  health route (`/health`, or `/v1/models` for DwarfStar) and answers 503 with the reason when
+  health route (`/health`, or `/v1/models` for a backend without `/slots`) and answers 503 with the reason when
   one has exited, does not answer within 1.5 s (Lemonade's probe gives up at 2 s), or the watchdog below has fired. Lemonade's
   BackendWatchdog probes this route.
 - **A progress watchdog.** Every chat, completion and Responses request serve forwards is
@@ -221,7 +222,7 @@ the restart policy; serve builds none):
 - `LEMONADE_BACKEND_WATCHDOG_*` tune Lemonade's side. `onebit_args` in a recipe passes
   `--watchdog` to serve.
 
-A backend with no `/slots` (DwarfStar, or a llama-server started with `--no-slots`)
+A backend with no `/slots` (a llama-server started with `--no-slots`)
 shows progress only by sending bytes, so on those only streamed requests are judged: a long
 non-streamed answer and a hang look the same from outside. `tests/watchdog_serve.sh` (ctest
 `watchdog_serve`, CI included) checks all of this against `tests/fake_backend.py`, whose
@@ -235,7 +236,7 @@ Lemonade's own `/metrics` already reports, per model:
 - GTT plus VRAM, as `lemonade_vram_used_gb`.
 
 So `GET /metrics` on serve adds only what the engine sees and Lemonade cannot, in Prometheus
-text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`, `ds4`).
+text (format 0.0.4), on every device serve runs as a child process (`hrx`, `cpu`).
 The in-process NPU route has none yet. serve's own series come first. The backend's own
 `/metrics` follows when it answers one: llama-server is started with `--metrics`, so its
 `llamacpp:*` series follow.
@@ -293,7 +294,7 @@ two processes (lemond, llama-server) instead of two hops and three.
 |---|---|---|
 | 0 | the plan is on stdout | starts it |
 | 3 | the model does not fit ([above](#will-it-fit)) | fails the load with serve's line in its log |
-| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `hybrid` or `ds4`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
+| 5 | the route needs serve in the request path: an NPU model directory, `--device npu`, `hybrid`, `--pm`, `--laya`, `--embed` or `--rerank` | runs `1bit serve` as before |
 
 Any other exit (an older engine without the flag) also falls back to `1bit serve`, and
 `LEMONADE_ONEBIT_ONE_HOP=0` in lemond's environment turns one hop off. `env` lists only variables
@@ -403,7 +404,6 @@ without a GPU.
 | `.gguf` | `auto`, `hrx` | the HRX build's llama-server on `HRX0` with our HIP kernels (docs/hrx.md), `--mtp` included; every node on HRX in all 43 configurations of the 2026-10-20 census (#476, #480, #481). `auto` exceptions: below |
 | `.gguf` | `cpu` | the same llama-server with no GPU layers; `auto` in a build without HRX |
 | `.gguf` | `hybrid` | the HRX llama-server decodes, one slot, from a KV cache a prefill provider computed for the prompt (the NPU engine, named by `--prefill-provider` / `ONEBIT_HYBRID_PREFILL`) and serve restored into the slot; without a provider, HRX prefills too ([hybrid.md](hybrid.md)) |
-| DwarfStar `.gguf` (DeepSeek V4 Flash, GLM 5.x, Qwen3.8-Flash-Next in its own layouts) | `ds4` | this build's DwarfStar `ds4-server` (HIP; `--ssd-streaming` streams routed experts; docs/dwarfstar.md). **Not in the shipped build** (`ONEBIT_DS4=OFF`, [#757](https://github.com/1bit-MONSTER/engine/pull/757)): those models run on `hrx` |
 
 What `--device auto` does with a `.gguf` that HRX has no route for. Until RFC #213 stage 3 these
 fell back to Vulkan (engine #271); with no Vulkan or ROCm build left:
@@ -533,10 +533,8 @@ PM4-emulation probe, and then HRX registers no device. `serve` sets
 `IREE_HAL_AMDGPU_LIBHSA_PATH` itself unless you did. It uses `--hrx-libhsa`,
 else the build's copy, else the first one under `/opt/rocm-therock`.
 
-The child binaries default to this build's (`-DONEBIT_HRX`, `-DONEBIT_DS4`),
-then `$ONEBIT_LLAMA_SERVER` / `$ONEBIT_DS4`, then `llama-server` / `ds4-server` on PATH. The
-shipped build has no `-DONEBIT_DS4`, so the `ds4` route needs a `ds4-server` named by `$ONEBIT_DS4`
-or on PATH ([dwarfstar.md](dwarfstar.md)).
+The child binaries default to this build's (`-DONEBIT_HRX`), then `$ONEBIT_LLAMA_SERVER`,
+then `llama-server` on PATH.
 
 Stopping `serve` (SIGTERM, SIGINT) sends each backend SIGTERM and waits
 `ONEBIT_BACKEND_STOP_GRACE_S` seconds (default 30) before SIGKILL, with a warning line
@@ -566,7 +564,7 @@ URL), which llama.cpp's mtmd encodes and places in the prompt. The mmproj comes 
 `convert_hf_to_gguf.py --mmproj` on the same checkpoint as the model. With it, llama-server runs
 with `-b 4096 -ub 4096`: an image is decoded as one ubatch, which models that attend to an image
 bidirectionally (ZAYA1-VL, Gemma 3) need. Zyphra's Zamba2-VL and ZAYA1-VL-8B were checked on the
-removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU and DwarfStar routes take no `--mmproj`.
+removed Vulkan build ([vulkan.md at 0baf286](https://github.com/1bit-MONSTER/engine/blob/0baf286/docs/vulkan.md)). The NPU route takes no `--mmproj`.
 
 ## Greedy requests (`temperature 0`)
 

@@ -201,13 +201,20 @@ intermediate float tensor then never exists.
   activations and int8 weights straight into the kernel's BOs (no `packB`, no `amax/127` — those bytes
   already carry the graph's scales) and reads the int32 accumulators back into the **same epilogue** the
   host path runs, so the two can only differ if the accumulator does. Measured on `strixhalo` under
-  `npu-hold` with `ONEBIT_EP_NPU_ELFS=128x2048x1024=…/full_i8_O_K2048_N1024.elf,128x3072x1024=…/full_i8_D_K3072_N1024.elf`:
-  `worst |d| = 0` LSB against the CPU EP over 5120 int8 values for **o_proj** (5×2048×1024) and
-  **down_proj** (5×3072×1024), with no `npu_qdq_fallback` line for either shape in the trace — the device
-  ran both. Two limits belong with that number. It needs **an ELF per (K, N)**, and on this box only those
-  two Qwen3-0.6B projections have one (q_proj's 1024×2048 and k/v's 1024×1024 do not), so the device share
-  of a real graph is 56 of 197 MatMuls and everything else keeps the host kernel. And it is a
-  **correctness** result so far, not a speed one: the ELFs are M=128 designs, so a decode step hands the
+  `npu-hold` with five designs configured
+  (`…/full_i8_O_K2048_N1024.elf`, `…/full_i8_D_K3072_N1024.elf`, and `Q_K1024_N2048`, `KV_K1024_N1024`,
+  `GU_K1024_N3072` generated from the iso-build design generator, all as `M=128` entries):
+  `worst |d| = 0` LSB against the CPU EP for **o_proj** (5×2048×1024, 5120 int8 values), **down_proj**
+  (5×3072×1024, 5120), **k_proj/v_proj** (5×1024×1024, 5120), **q_proj** (5×1024×2048, 10240) and
+  **gate_proj/up_proj** (5×1024×3072, 15360), with no `npu_qdq_fallback` line for any of those five
+  shapes in either run's trace — the device ran all of them. That is **196 of the 197** fused groups a
+  real Qwen3-0.6B A8W8 export has (28 layers × 7 projections + lm_head); `lm_head` (1024×151936) keeps the
+  host kernel because it needs a tiling of its own. Two limits belong with that number. It needs **an ELF
+  per (K, N)**, and a shape that has none is a build rather than a missing capability: o_proj's and
+  down_proj's ship beside the other xclbins, and q/k/v's and gate/up's came out of one `-M 128 -K <K>
+  -N <N> -c 4` run of the iso-build generator each (`n1_core_i8_v26.py` through the IRON/MLIR-AIE
+  `aiecc`), the artifacts living beside the other xclbins and never in this repository. And it is a
+  **correctness** result so far, not a speed one: these are M=128 designs, so a decode step hands the
   kernel one real row and 127 zeroed ones — measure before quoting tokens/s.
 - **Different kernels, not a configuration**: A16W8 needs int16 activations, MX/BFP16 need block
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
@@ -248,8 +255,8 @@ Three things that table says, none of them flattering and all of them worth know
    Per-channel `DequantizeLinear` is expensive on the CPU EP (it broadcasts a vector), so removing the
    whole DQ -> float MatMul -> Q sequence pays off there; per-tensor DQ is cheap and MLAS's float
    MatMul is faster than this host int8 kernel. This is a host-kernel measurement: the device leg runs the
-   same epilogue on the array, but only for the two shapes that have an ELF and only as a correctness
-   result so far, so it is not where the 1.5x-per-projection argument lands either.
+   same epilogue on the array for all seven projection shapes, but only as a correctness result so far, so
+   it is not where the 1.5x-per-projection argument lands either.
 2. **The quantisation, not the EP, is what costs accuracy.** KL 2.2-2.8 nats is my calibration's
    fault (32 documents, MinMax, no AdaRound/QuaRot/SmoothQuant), and the per-tensor export (6.5 nats)
    is worse still: one int8 scale per weight matrix is not enough for this model. AMD's own recipe is

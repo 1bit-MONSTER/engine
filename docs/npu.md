@@ -39,11 +39,41 @@ the model format, how `1bit serve` runs an NPU model, and how to build.
   model.q4nx             weights (safetensors layout, Q4NX tiles: "Q4NX chunks" below)
   config.json            Hugging Face config: dimensions, rope_theta, eos_token_id
   tokenizer.json         Hugging Face tokenizer
+  plan.json              the stream plan: fusion, kernel family, decode dirs ("plan.json" below)
   npu/                   the model's NPU kernels
 ```
 
 `1bit serve -m <model dir>` serves such a directory on the NPU behind the OpenAI-compatible API
 ([serve.md](serve.md)); inside Lemonade, that is what its `onebit` backend runs (`--onebit npu`).
+
+### plan.json: the stream plan (engine #799)
+
+A model directory may carry a **plan.json**: the decisions the runtime used to make by looking at which
+files happened to be in `--kernels`. Three of them, and each one used to be silent:
+
+| decision | what the probe used to do |
+|---|---|
+| `fusion.gate_up` (`fused`/`split`) | the fused `full_i8_GU_*` kernel won, and with no split kernel on disk the split layout was assumed |
+| `kernels.tag` (`""`/`_b8`/`_pb16i`) | the artifact family came from `q4nx_weight_layout`, so a kernel dir of the other family changed which kernels ran |
+| `decode.dirs` | the M=16 twins were looked for in `<model>/kernels-m16`, then `<kernels>/m16`, then `<kernels>` |
+
+`tools/npu_plan.py <model dir>` writes one from `config.json` plus the kernel directory (it derives layer
+roles from `layer_types` and projection shapes from the model's own dimensions, the way the forward does).
+`--check` re-generates and diffs against the file on disk, so a stale plan is a gate failure rather than a
+wrong number; `--print` shows it without writing.
+
+The forward reads the plan with `npu/plan/plan.h` and **refuses by name** anything it cannot honour — a
+`kernels.tag` that disagrees with the container, a sealed ELF named outside the pb16i family, a decode dir
+that is absolute or contains `..`, a layer count that disagrees with `layers[]`, or a kernel the plan names
+that is not in the directory (`forward init failed: plan <path>: this model's plan needs the QKV kernel
+"full_i8_QKV_K1024_N4096.elf" in <dir> (missing)`). A model directory **without** a plan keeps the probes,
+which is what makes this additive.
+
+Four plans are checked in under `configs/plans/`, one per model directory on the build box (Qwen3-0.6B,
+bonsai2-27b-NPU, bonsai2-27b-NPU-b8, bonsai2-27b-pb16i); `tools/npu_plan.py <dir> --check` proves the
+directory's copy still matches. `scripts/npu-window11.sh` is the gate the change passed: three fixed greedy
+prompts and the prof table, compared between a run with the plan and a run without it (`--compare A B`) —
+3/3 transcripts byte-identical and every prof row within 10%.
 
 ### Q4NX chunks
 

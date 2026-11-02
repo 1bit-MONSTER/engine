@@ -38,6 +38,7 @@
 #include <vector>
 
 #include "model.h"
+#include "plan/plan.h"  // plan.json (engine #799 P1): the stream plan replaces the filename probes
 #include "q4nx_pack.h"        // Q4nxDesignGeom / Q4nxModelDims (derived design table)
 #include "q4nx_semantics.h"   // Q4nxSemantics (config-derived architecture flags)
 #include <memory>
@@ -326,6 +327,16 @@ private:
     // hw_contexts.  Config `q4nx_pb16i_sealed_elf` names it in the kernels dir; without
     // it the per-role `_pb16i.elf` files are used as before.
     std::string pb16i_sealed_;
+    // plan.json (engine #799 P1), when the model directory carries one.  It states the three things
+    // this class used to decide by looking at which files exist in --kernels: fused gate/up, the
+    // artifact family (""/_b8/_pb16i), and where the M=16 decode twins live.  Absent = the legacy
+    // probes below, unchanged -- that is what makes the plan additive.  plan_path_ is kept for the
+    // refusals, which name the plan that asked for a kernel that is not there.
+    onebit::npu::plan::Plan plan_;
+    std::string plan_path_;
+    // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
+    // the plan file and the role, so "which description asked for this" needs no log reading.
+    std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;
     //  [[hadamard]]
     // The PTQ1 fold: a folded container's weights are W_true rotated by a block-`had_block_`
     // normalized Hadamard with a per-input-width sign vector, so an activation entering one of

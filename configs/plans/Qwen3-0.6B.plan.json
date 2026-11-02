@@ -1,0 +1,519 @@
+{
+ "format": "1bit-npu-plan/1",
+ "generated_by": "tools/npu_plan.py 1.0",
+ "model": {
+  "hidden": 1024,
+  "layers": 28,
+  "arch": "qwen3"
+ },
+ "container": {
+  "layout": "rm",
+  "chunk_kind": "mode0",
+  "pb16i": false
+ },
+ "fusion": {
+  "gate_up": "fused"
+ },
+ "prefill": {
+  "M": 128
+ },
+ "decode": {
+  "M": 16,
+  "enabled": true,
+  "dirs": [
+   {
+    "root": "kernels",
+    "path": "."
+   }
+  ],
+  "sealed_elf": ""
+ },
+ "kernels": {
+  "tag": ""
+ },
+ "moe": {
+  "batched_expert_gu": {
+   "enabled": false,
+   "K": 0,
+   "N": 0
+  }
+ },
+ "layers": [
+  {
+   "index": 0,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 1,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 2,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 3,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 4,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 5,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 6,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 7,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 8,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 9,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 10,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 11,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 12,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 13,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 14,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 15,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 16,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 17,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 18,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 19,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 20,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 21,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 22,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 23,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 24,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 25,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 26,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  },
+  {
+   "index": 27,
+   "role": "attn",
+   "qkv": {
+    "K": 1024,
+    "N": 4096,
+    "fused": true
+   },
+   "gate_up": {
+    "K": 1024,
+    "N": 6144
+   },
+   "down": {
+    "K": 3072,
+    "N": 1024
+   }
+  }
+ ]
+}

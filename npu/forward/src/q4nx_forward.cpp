@@ -382,6 +382,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         mdir = slash == std::string::npos ? std::string(".") : mp.substr(0, slash);
         cfg_path = mdir + "/config.json";
     }
+
     ModelConfig cfg = QWEN3_0_6B_CONFIG;
     // Device-side weight layout this container declares (see read_config_string).
     // "b8" makes the ELF set the _b8 family and packB write the blocked image;
@@ -430,6 +431,32 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                        : (weight_layout_b8_ ? "kernels carry the _b8 suffix"
                                             : "q4nx_weight_layout absent/rm"));
     }
+    // plan.json (engine #799 P1).  The model dir may carry one; when it does, the three decisions this
+    // file used to make by looking at which files exist are read from it instead.  A model without one
+    // keeps the probes below, which is what makes the plan additive rather than a migration.
+    plan_path_ = mdir + "/plan.json";
+    if (file_exists(plan_path_)) {
+        try {
+            plan_ = onebit::npu::plan::Plan::load(plan_path_);
+        } catch (const std::exception& ex) {
+            err_ = ex.what();     // the loader names the field: never a default for a broken plan
+            return false;
+        }
+        // The plan may not disagree with the container about the kernel family, or the run would take
+        // a different artifact than the weights need.
+        const std::string want = pb16i_ ? "_pb16i" : (weight_layout_b8_ ? "_b8" : "");
+        if (plan_.tag != want) {
+            err_ = "plan " + plan_path_ + ": kernels.tag \"" + plan_.tag + "\" but the container is \"" +
+                   (want.empty() ? "rm" : want.substr(1)) + "\" (expected \"" + want + "\")";
+            return false;
+        }
+        fprintf(stderr, "  [plan] %s: %zu layers, gate/up %s, family \"%s\", %zu decode dir(s) from the plan\n",
+                plan_path_.c_str(), plan_.layer_plans.size(), plan_.fused_gu ? "fused" : "split",
+                plan_.tag.empty() ? "rm" : plan_.tag.c_str(), plan_.decode_dirs.size());
+    }
+    // The plan is the runtime's copy of the sealed-ELF decision; when it names one it wins, so a plan
+    // and a container cannot disagree about which file the decode roles run.
+    if (plan_.loaded() && !plan_.sealed_elf.empty()) pb16i_sealed_ = plan_.sealed_elf;
     cfg.hidden_size = q4nx_config_int(cfg_path.c_str(), "hidden_size", cfg.hidden_size);
     cfg.num_layers = q4nx_config_int(cfg_path.c_str(), "num_hidden_layers", cfg.num_layers);
     cfg.num_attention_heads = q4nx_config_int(cfg_path.c_str(), "num_attention_heads", cfg.num_attention_heads);
@@ -673,7 +700,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     dims.lin_kd = lin_kd_;
     dims.lin_vd = lin_vd_;
     dims.attn_output_gate = attn_gate_;
-    {
+    if (plan_.loaded()) {
+        // What the plan says, not what happens to be in --kernels: this is the probe whose answer
+        // changed when the same model was served against a different kernel directory.
+        dims.fused_gu = plan_.fused_gu ? 1 : 0;
+    } else {
         // The artifact probes must use the same tag the designs will carry, or a
         // b8 container would silently conclude "no fused GU kernel" and fall back
         // to split G/U on a model that ships one.
@@ -692,13 +723,20 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // caller passes the real N = top_k*IM, so only those columns are packed.
     if (n_expert_ > 0 && top_k_ > 1 && expert_im_ > 0 && !mla_ && ndesigns_ + 2 <= Q4NX_MAX_DESIGNS) {
         const int need = top_k_ * expert_im_;
-        const int nb = 8192;   // the only K=H G/U kernel width >= 4096 in the set
-        char gb[512], ub[512];
-        snprintf(gb, sizeof(gb), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), c_.H, nb,
-                 weight_layout_b8_ ? "_b8" : "");
-        snprintf(ub, sizeof(ub), "%s/full_i8_U_K%d_N%d%s.elf", dir.c_str(), c_.H, nb,
-                 weight_layout_b8_ ? "_b8" : "");
-        if (need <= nb && file_exists(gb) && file_exists(ub)) {
+        int nb = 8192;   // the only K=H G/U kernel width >= 4096 in the set
+        bool batched = false;
+        if (plan_.loaded()) {
+            batched = plan_.moe_batched_gu.enabled;
+            if (batched) nb = plan_.moe_batched_gu.N;
+        } else {
+            char gb[512], ub[512];
+            snprintf(gb, sizeof(gb), "%s/full_i8_G_K%d_N%d%s.elf", dir.c_str(), c_.H, nb,
+                     weight_layout_b8_ ? "_b8" : "");
+            snprintf(ub, sizeof(ub), "%s/full_i8_U_K%d_N%d%s.elf", dir.c_str(), c_.H, nb,
+                     weight_layout_b8_ ? "_b8" : "");
+            batched = need <= nb && file_exists(gb) && file_exists(ub);
+        }
+        if (batched && need <= nb) {
             memset(&designs_[ndesigns_], 0, sizeof(designs_[ndesigns_]));
             designs_[ndesigns_].M = dims.M; designs_[ndesigns_].K = c_.H; designs_[ndesigns_].N = nb;
             designs_[ndesigns_].role = Q4NX_DESIGN_GB;
@@ -833,13 +871,13 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             // no device is opened (the ELFs themselves are checked separately by
             // tests/verify_design_elfs + tests/verify_full_elfs.sh).
             std::string elf = dir + "/" + g->elf_name;
-            if (!file_exists(elf)) { err_ = "missing full ELF " + elf; return false; }
+            if (!file_exists(elf)) { err_ = missing_kernel(dir, g->elf_name, g->role); return false; }
             fprintf(stderr, "  [forward] %-3s M=%d K=%d N=%d  %s (host-GEMM)\n",
                     role_tag(g->role), g->M, g->K, g->N, elf.c_str());
         } else {
             std::string elf = dir + "/" + g->elf_name;
             if (!file_exists(elf)) {
-                err_ = "missing full ELF " + elf;
+                err_ = missing_kernel(dir, g->elf_name, g->role);
                 return false;
             }
             if (!ctx_[i]->init_elf(*dev, elf.c_str(), g->M, g->K, g->N, 1)) {
@@ -914,9 +952,16 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
         }
         std::vector<std::string> m16dirs;
-        m16dirs.push_back(mdir + "/kernels-m16");
-        m16dirs.push_back(dir + "/m16");
-        m16dirs.push_back(dir);
+        if (plan_.loaded() && !plan_.decode_dirs.empty()) {
+            // The plan says which of the two given paths each candidate hangs off, so the runtime
+            // stops guessing which base a bare directory name meant.
+            for (const auto& d : plan_.decode_dirs)
+                m16dirs.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+        } else {
+            m16dirs.push_back(mdir + "/kernels-m16");
+            m16dirs.push_back(dir + "/m16");
+            m16dirs.push_back(dir);
+        }
         int made = 0, skipped = 0;
         for (int i = 0; i < ndesigns_; i++) {
             if (designs16_[i].M <= 0) { skipped++; continue; }
@@ -936,7 +981,9 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 elf = dir + "/" + pb16i_sealed_;
                 kname = inst;
                 if (!file_exists(elf)) {
-                    err_ = "pb16i: missing sealed ELF " + elf;
+                    err_ = plan_.loaded() ? ("plan " + plan_path_ + ": decode.sealed_elf \"" +
+                                             pb16i_sealed_ + "\" is not in " + dir + " (missing)")
+                                          : ("pb16i: missing sealed ELF " + elf);
                     return false;
                 }
             } else {
@@ -950,7 +997,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 // a slower path, it is a missing one (the int8 weights are not packed
                 // for these geometries under this layout).
                 if (pb16i_) {
-                    err_ = std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
+                    err_ = plan_.loaded()
+                               ? std::string("plan ") + plan_path_ + ": decode role " +
+                                     role_tag(designs16_[i].role) + " needs \"" + designs16_[i].elf_name +
+                                     "\" (missing)"
+                               : std::string("pb16i: missing decode ELF ") + designs16_[i].elf_name;
                     return false;
                 }
                 skipped++;
@@ -3150,6 +3201,14 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                      M, start_pos, c_.NL, (int)two_widths);
     }
     return ok;
+}
+
+std::string Q4nxNpuForward::missing_kernel(const std::string& dir, const char* elf_name,
+                                           Q4nxDesign role) const {
+    if (plan_.loaded())
+        return "plan " + plan_path_ + ": this model's plan needs the " + role_tag(role) + " kernel \"" +
+               elf_name + "\" in " + dir + " (missing)";
+    return "missing full ELF " + dir + "/" + elf_name;
 }
 
 int Q4nxNpuForward::max_batch_rows() const {

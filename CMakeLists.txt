@@ -494,6 +494,22 @@ add_test(NAME systemone_route
 # whose target is not built reports "Not Run" and silently never executes (#635). This lane's token
 # cannot edit the workflow.
 add_dependencies(npu_sampling_test systemone_route_test)
+
+# The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
+# replaced the filename probes.  No model, no container, no device.
+add_executable(npu_plan_test tests/npu_plan_test.cpp)
+target_include_directories(npu_plan_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_plan_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_plan COMMAND npu_plan_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635).  This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_plan_test)
+
+# The generator behind that loader: a synthetic model dir, so the fused/split decision and --check are
+# tested without a model or a kernel build.
+add_test(NAME npu_plan_generate
+         COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/npu_plan_generate_test.py
+                 ${CMAKE_SOURCE_DIR}/tools/npu_plan.py)
 add_executable(npu_full_elf_test tests/npu_full_elf_test.cpp)
 target_link_libraries(npu_full_elf_test PRIVATE onebit_npu)
 add_test(NAME npu_full_elf_md5 COMMAND npu_full_elf_test)
@@ -708,7 +724,9 @@ if(ONEBIT_NPU)
     endif()
     target_include_directories(onebit_npu_forward SYSTEM PUBLIC
         npu/forward/include npu/forward/engine-src npu)
-    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu_rt dl pthread m)
+    # plan.json (npu/plan/plan.h, engine #799 P1) is read with nlohmann's parser, and the header is
+    # part of this library's interface, so the dependency is PUBLIC.
+    target_link_libraries(onebit_npu_forward PUBLIC onebit_npu_rt nlohmann_json::nlohmann_json dl pthread m)
     target_sources(onebit PRIVATE app/forward_serve.cpp)
     target_link_libraries(onebit PRIVATE onebit_npu_forward)
     set(ONEBIT_NPU_KERNELS "" CACHE PATH "Kernel directory (layer_ctx{1,2,17}.elf, lmhead.elf, layer.pdi)")

@@ -17,12 +17,14 @@
 # engine#315 candidate 1 end to end, without a GPU: what `1bit serve --hrx-cwsr-placement` puts in an
 # HRX backend's environment (app/hrx_cwsr.h, docs/hrx.md "CWSR save-area placement"). A fake
 # llama-server records its environment.
-#   - off: none of HSA_USE_SVM, HSA_USERPTR_FOR_PAGED_MEM, HRX_ALLOW_NO_SVM, and serve says so;
+#   - off: refused at start with the recipe (engine#715) when the trio would be absent, unless
+#     ONEBIT_HRX_NO_TRIO_OK=1 acknowledges it, in which case none of the three and serve says so; the refusal keys on
+#     the opt-out, not on an empty trio, so a build without the gate is never refused;
 #   - on, in a build whose hrx-system has the gate: all three; a value the user set wins;
 #   - on, in a build without the gate: refused at start, with the reason;
 #   - auto (the default) in a build with the gate: all three, whatever cwsr_enable says, and
 #     HRX_SVM=1 turns that off again; a value the user set still wins;
-#   - auto in a build without the gate: none, and serve says the gate is missing;
+#   - auto in a build without the gate: refused the same way (no gate means no trio), acknowledged -> none;
 #   - --device cpu: never any of them.
 #
 # usage: tests/hrx_cwsr_route.sh path/to/1bit
@@ -72,9 +74,19 @@ run() {  # <record> [serve args]: the backend's three variables, as JSON, in <re
 env_is() { [ "$(cat "$1" 2>/dev/null)" = "$2" ]; }
 all='{"HSA_USE_SVM": "0", "HSA_USERPTR_FOR_PAGED_MEM": "0", "HRX_ALLOW_NO_SVM": "1"}'
 
+# engine#715: an HRX route without the trio is refused, with the recipe a human can paste
 run "$scratch/off.json" --device hrx --hrx-cwsr-placement off
-check "off: the HRX backend gets none of the three" 'env_is "$scratch/off.json" "{}"'
-check "  and serve says so" 'grep -q "hrx-cwsr-placement=off; CWSR save-area placement left to ROCr (engine#315)" "$scratch/off.json.log"'
+check "off: an HRX route is refused, no backend started" '[ ! -s "$scratch/off.json" ]'
+check "  and the refusal carries the recipe" \
+    'grep -q "HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1" "$scratch/off.json.log"'
+check "  and names the acknowledgement" 'grep -q "ONEBIT_HRX_NO_TRIO_OK=1" "$scratch/off.json.log"'
+ONEBIT_HRX_NO_TRIO_OK=1 run "$scratch/off-ack.json" --device hrx --hrx-cwsr-placement off
+check "off + ONEBIT_HRX_NO_TRIO_OK=1: the HRX backend gets none of the three" 'env_is "$scratch/off-ack.json" "{}"'
+check "  and serve says so" \
+    'grep -q "hrx-cwsr-placement=off; CWSR save-area placement left to ROCr (engine#315)" "$scratch/off-ack.json.log"'
+# --device cpu never initialises HRX, so it is never refused
+run "$scratch/cpu-off.json" --device cpu --hrx-cwsr-placement off
+check "--device cpu with off: not refused, no variables" 'env_is "$scratch/cpu-off.json" "{}"'
 
 run "$scratch/on.json" --device hrx --hrx-cwsr-placement=on
 gate=1
@@ -101,8 +113,16 @@ if [ $gate = 1 ]; then
     check "auto (the default): the HRX backend gets all three" 'env_is "$scratch/auto.json" "$all"'
     check "  and serve logs the GTT default line" 'grep -q "CWSR save area placed in GTT by default" "$scratch/auto.json.log"'
     HRX_SVM=1 run "$scratch/auto-off.json" --device hrx
-    check "auto with HRX_SVM=1: none of the three (the opt-out)" 'env_is "$scratch/auto-off.json" "{}"'
-    check "  and serve says HRX_SVM=1 decided it" 'grep -q "HRX_SVM=1; CWSR save-area placement left to ROCr" "$scratch/auto-off.json.log"'
+    check "auto with HRX_SVM=1: refused (the opt-out has to be acknowledged)" '[ ! -s "$scratch/auto-off.json" ]'
+    check "  and the refusal names HRX_SVM" 'grep -q "HRX_SVM=1" "$scratch/auto-off.json.log"'
+    HRX_SVM=1 ONEBIT_HRX_NO_TRIO_OK=1 run "$scratch/auto-off-ack.json" --device hrx
+    check "auto with HRX_SVM=1 + acknowledgement: none of the three (the opt-out)" 'env_is "$scratch/auto-off-ack.json" "{}"'
+    check "  and serve says HRX_SVM=1 decided it" 'grep -q "HRX_SVM=1; CWSR save-area placement left to ROCr" "$scratch/auto-off-ack.json.log"'
+    # engine#715: serve also puts the trio in its *own* environment so a child that inherits it gets it. That is not
+    # observable through this fake backend (serve passes an explicit envp), and it must not add a line here: the
+    # memory refusal counts lines (tests/mem_admit_route.sh). It is covered by tests/hrx_cwsr_test.cpp instead.
+    check "the placement decision is announced exactly once" \
+        '[ "$(grep -c "CWSR save area placed in GTT" "$scratch/auto.json.log")" = 1 ]'
 else
     run "$scratch/auto.json" --device hrx
     check "auto, no gate: none of the three" 'env_is "$scratch/auto.json" "{}"'

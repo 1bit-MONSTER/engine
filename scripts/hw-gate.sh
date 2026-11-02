@@ -189,14 +189,10 @@ LIBHSA=$(find "$TOOLCHAIN" -path '*/libhsa-runtime64.so.1' 2>/dev/null | sort)
 LIBHSA=${LIBHSA%%$'\n'*}
 export IREE_HAL_AMDGPU_LIBHSA_PATH=${IREE_HAL_AMDGPU_LIBHSA_PATH:-$LIBHSA}
 
-# engine#315 candidate 1 is the default for HRX since 2026-10-31 (app/hrx_cwsr.h, docs/hrx.md): with the
-# TheRock nightly libhsa, SVM placement *with pageable userptr disabled* page-faults on the first HRX graph
-# replay even with CWSR off (engine#715). `1bit serve` adds these itself, but this gate drives test-backend-ops,
-# llama-bench and llama-server directly and so bypasses serve -> it must export the GTT placement or every HRX
-# row here faults. A caller's own value still wins (HRX_SVM=1 opts the trio out in serve, not here).
-export HSA_USE_SVM=${HSA_USE_SVM:-0}
-export HSA_USERPTR_FOR_PAGED_MEM=${HSA_USERPTR_FOR_PAGED_MEM:-0}
-export HRX_ALLOW_NO_SVM=${HRX_ALLOW_NO_SVM:-1}
+# engine#315 candidate 1: the hardware gate runs test-backend-ops / llama-bench / llama-server itself, so it needs
+# the save-area trio in its own environment. engine#715 moved the definition into scripts/hrx-env.sh, which is the
+# same block every such script now sources; a caller's own value still wins there, and HRX_SVM=1 opts out.
+. "$(dirname "$0")/hrx-env.sh" --check
 
 # ---- internal: one model in one step: serve it, run kat (and the needle), stop the server,
 # then llama-perplexity for the KLD. Exit bits: 1 kat failed, 4 needle failed, 8 perplexity failed;

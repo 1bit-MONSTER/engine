@@ -51,7 +51,11 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           "os/v2/debian/*/files/etc/issue", "os/v2/debian/*/files/etc/motd",
           # os/v3 Puppy image: an ssh authorized_keys file is one key per line and a comment in it would be
           # parsed as an option string, so it is data, not code (a build that ships it is what U7 asks for)
-          "*/authorized_keys"]
+          "*/authorized_keys",
+          # os/v3 Puppy image, cycle 13: the presets a headless boot reads instead of asking. /etc/keymap is
+          # one keymap name ("us") and /etc/localtime is a symlink into /usr/share/zoneinfo - neither can
+          # carry a comment, and both are read by keymap-set and glibc verbatim
+          "os/v3/puppy/embed/etc/keymap", "os/v3/puppy/embed/etc/localtime"]
 
 
 def _match(name, patterns):

@@ -148,6 +148,20 @@ static bool file_exists(const std::string& p, long min_size = 1) {
     return sz >= min_size;
 }
 
+// A sidecar directory comes from the container's config or from an environment variable, and every
+// weight image is opened under it, so it is checked once here instead of trusted at each fopen: an
+// absolute path with no ".." component and no NUL, which is what a converter writes (a relative one
+// would silently resolve against the serve's cwd).
+static bool valid_sidecar_dir(const std::string& d) {
+    if (d.empty() || d.size() > 4096 || d[0] != '/') return false;
+    if (d.find('\0') != std::string::npos) return false;
+    for (size_t i = 0; i + 1 < d.size(); i++)
+        if (d[i] == '.' && d[i + 1] == '.' && (i == 0 || d[i - 1] == '/') &&
+            (i + 2 == d.size() || d[i + 2] == '/'))
+            return false;
+    return true;
+}
+
 // Decode a quantized [rows, cols] tensor whatever chunk size it is stored in:
 // 5120 = q4_1, 4736 = OFLM Q4_K (flm_dtype_t 8, Qwen3.5-4B's projections),
 // 8704 = Q8 (Qwen3.5's tied table / ssm_alpha / ssm_beta).  The chunk size is
@@ -431,6 +445,11 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                        " but no sidecar directory is set (config q4nx_" +
                        (t2s_ ? "t2s_dir" : "pb16i_dir") + ", or Q4NX_" +
                        (t2s_ ? "T2S_DIR" : "PB16I_DIR") + ")";
+                return false;
+            }
+            if (!valid_sidecar_dir(pb16i_dir_)) {
+                err_ = std::string("the ") + (t2s_ ? "t2s" : "pb16i") +
+                       " sidecar directory must be an absolute path without \"..\": " + pb16i_dir_;
                 return false;
             }
         }

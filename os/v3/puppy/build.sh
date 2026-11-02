@@ -204,7 +204,11 @@ compgen -G "sandbox3/build/*.sfs" > /dev/null || {
 listing=$(for f in sandbox3/build/*.sfs; do
     unsquashfs -l "$f" 2>/dev/null | sed -n "s|^squashfs-root/|$(basename "$f")/|p"
 done | sort -u)
-in_image() { printf "%s\n" "$listing" | grep -q "/$1$" ; }
+# Written to a file and grepped there, never piped into grep -q: with pipefail, grep -q exits at the first
+# match, the producer takes SIGPIPE, and the pipeline reports 141 - which reads as "not in the image" for
+# every file that IS in the image. That cost cycle 4 a refusal of its own good ISO (measured 2026-11-02).
+printf "%s\n" "$listing" > /tmp/1bit-sfs-listing
+in_image() { grep -q "/$1$" /tmp/1bit-sfs-listing ; }
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 miss=""
 for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil; do
@@ -212,7 +216,7 @@ for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil; do
 done
 [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
 echo "   ok: sudo, apt, sshd, mokutil are in the image"
-modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=")
+modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
 [ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
     echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }
 echo "   ok: $modconf in the image, so rc.sysinit loads the EC driver"

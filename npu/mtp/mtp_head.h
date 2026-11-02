@@ -124,6 +124,10 @@ public:
     void set_tau(float t) { tau_ = t; }
     void set_lm_head(bool on) { use_lm_head_ = on; }
     void set_vocab(int nv) { vocab_ = nv; }
+    // Full-vocabulary logits calls made so far.  One call is ~0.3-0.5 s on the device (15 ternary-image
+    // dispatches at M=16 for one useful row), so the loop's cost is this counter divided by the tokens it
+    // produced -- printing it is how "the head is expensive" becomes "these calls per iteration".
+    long lm_calls() const { return lm_calls_; }
 
     const DraftStream& stream() const { return stream_; }
     // Chains opened at a position the cursor disagreed with.  Non-zero means the loop and the drafter are feeding
@@ -146,6 +150,10 @@ protected:
     int vocab_ = 0;
     int mismatches_ = 0;
     bool use_lm_head_ = true;
+    // False while a row is being advanced only for its KV/hidden (commit_rows, prime): those callers discard the
+    // logits, and asking for them costs a whole lm-head dispatch chain per committed row.
+    bool need_logits_ = true;
+    long lm_calls_ = 0;
     float tau_ = 0.6f;
 };
 

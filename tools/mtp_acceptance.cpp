@@ -444,7 +444,9 @@ int main(int argc, char** argv) {
             o.tau = tau;
             o.max_tokens = tokens;
             const double t_spec0 = now_ms();
+            const long lm0 = drafter.lm_calls();
             const Result r = run(base, &drafter, ids, o);
+            const long lm_used = drafter.lm_calls() - lm0;
             const double spec_s = (now_ms() - t_spec0) / 1000.0;
             if (!r.ok) { std::fprintf(stderr, "prompt %d: %s\n", p, r.err.c_str()); return 1; }
             const bool same = (r.tokens == plain);
@@ -480,6 +482,11 @@ int main(int argc, char** argv) {
             // Per-PROMPT depth counts, not just the run aggregate: the array is shared, so the 8-prompt table is
             // assembled from several tickets/tickets-of-slices, and a per-prompt breakdown is the only form that can
             // be summed correctly afterwards (adding percentages weights a 16-iteration prompt like a 36 one).
+            // Calls, not a claim: a full-vocab logits call is ~0.3-0.5 s of array dispatch chain, so this count is
+            // the loop's real cost per iteration and the thing a cheaper head has to reduce.
+            std::printf("  logits calls %ld over %d iterations (%.2f/iter), %.1f ms/call of the draft phase\n", lm_used,
+                        r.stats.iterations, r.stats.iterations ? (double)lm_used / r.stats.iterations : 0.0,
+                        lm_used ? 1000.0 * spec_s / (double)lm_used : 0.0);
             std::printf("  per-depth p%d:", pi);
             for (int d = 0; d < k && d < Stats::kMaxDepth; d++)
                 std::printf(" %d %d/%d", d + 1, r.stats.accepted_at[d], r.stats.drafted_at[d]);

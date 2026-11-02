@@ -67,24 +67,32 @@ public:
         for (size_t m = 0; m < tokens.size(); m++)
             fill_logits(start_pos + (int)m, logits_all, m * (size_t)V);
         consumed_ += (int)tokens.size();
+        pending_ = (int)tokens.size();     // these rows are a verify batch until commit_verify() decides
         batches_++;
         return true;
     }
 
-    // Attention-only toy: truncation is a length bump, exactly like the real position-indexed caches.
-    bool truncate(int tokens) override {
-        if (tokens < 0 || tokens > consumed_) return false;
-        consumed_ = tokens;
-        restores_++;
+    // Toy base: no GDN deferral, so committing a verify prefix is the position bookkeeping a pure-attention
+    // model needs (drop the rejected rows).  It records the call so the test can check the loop commits
+    // exactly the accepted count and never more.
+    bool commit_verify(int accepted) override {
+        if (accepted < 0 || accepted > pending_) return false;
+        consumed_ = consumed_ - pending_ + accepted;
+        pending_ = 0;
+        commits_++;
+        last_commit_ = accepted;
         return true;
     }
+
+    int commits() const { return commits_; }
+    int last_commit() const { return last_commit_; }
+    int pending() const { return pending_; }
 
     const std::vector<float>& last_hidden() const override { return hidden_; }
 
     int consumed() const { return consumed_; }
     int steps() const { return steps_; }
     int batches() const { return batches_; }
-    int restores() const { return restores_; }
     int bad_pos() const { return bad_pos_; }
     int over_batch() const { return over_batch_; }
 
@@ -97,14 +105,17 @@ private:
     }
 
     int batch_rows_;
-    int consumed_ = 0, steps_ = 0, batches_ = 0, restores_ = 0, bad_pos_ = 0, over_batch_ = 0;
+    int consumed_ = 0, steps_ = 0, batches_ = 0, commits_ = 0, last_commit_ = -1, pending_ = 0;
+    int bad_pos_ = 0, over_batch_ = 0;
     std::vector<float> hidden_{0.0f};
 };
 
 // Knows the truth (reads the position out of the hidden state): every draft should be accepted.
 class PerfectHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out) override {
+    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (conf) conf->assign((size_t)k, 1.0f);
         const int have = (int)hidden[0];                      // positions consumed so far
         out.clear();
         for (int i = 0; i < k; i++) out.push_back(truth(have + i));
@@ -115,7 +126,9 @@ public:
 // Proposes the token AFTER the true one at every position: the base must refuse all of it.
 class GarbageHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out) override {
+    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (conf) conf->assign((size_t)k, 0.1f);
         const int have = (int)hidden[0];
         out.clear();
         for (int i = 0; i < k; i++) out.push_back((truth(have + i) + 1) % V);
@@ -126,7 +139,9 @@ public:
 // Right for the first draft, wrong afterwards: exercises the longest-prefix accept AND the rollback.
 class HalfHead : public DraftHead {
 public:
-    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out) override {
+    int draft(const std::vector<float>& hidden, int, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (conf) { conf->assign((size_t)k, 0.1f); if (!conf->empty()) (*conf)[0] = 1.0f; }
         const int have = (int)hidden[0];
         out.clear();
         if (k > 0) out.push_back(truth(have));                 // accepted
@@ -192,8 +207,8 @@ int main() {
         // [1] k=0 must be a bit-for-bit plain decode
         { ToyBase m(8); PerfectHead ph; Options o = base_opt; o.k = 0;
           const Result r = onebit::npu::mtp::run(m, &ph, P, o);
-          check(r.ok && same(r.tokens, ref.tokens) && m.batches() == 0 && m.restores() == 0,
-                "k=0: no batched pass, no rollback, same tokens"); }
+          check(r.ok && same(r.tokens, ref.tokens) && m.batches() == 0 && m.commits() == 0,
+                "k=0: no batched pass, no commit, same tokens"); }
     }
 
     // [2] the win condition, stated as a number: a perfect head at k=8 amortises the pass
@@ -215,6 +230,28 @@ int main() {
         check(r.stats.passes_per_token() > 1.0, "garbage head: more passes per token than plain decode");
         std::printf("INFO k=8 garbage: passes/token=%.3f (plain decode = 1.000), rows verified=%d\n",
                     r.stats.passes_per_token(), r.stats.rows_verified);
+    }
+
+    // [6] tau gate: a head whose first draft is below tau gets verified but not followed, so exactly one
+    //     row goes through the batch every iteration -- and the text still matches plain decode.
+    {
+        ToyBase m(8); GarbageHead gh; Options o = base_opt; o.k = 8; o.tau = 0.6f;
+        const Result r = onebit::npu::mtp::run(m, &gh, P, o);
+        check(r.ok && same(r.tokens, ref.tokens), "tau gate: text still identical to plain decode");
+        check(r.stats.rows_verified == r.stats.iterations,
+              "tau gate: a below-tau first draft is verified alone (1 row per iteration)");
+        std::printf("INFO tau=0.6 garbage head: rows verified=%d over %d iterations, passes/token=%.3f\n",
+                    r.stats.rows_verified, r.stats.iterations, r.stats.passes_per_token());
+    }
+    // [7] the loop commits exactly the accepted prefix, never the whole batch when the tail is refused
+    {
+        ToyBase m(8); HalfHead hh; Options o = base_opt; o.k = 4;
+        const Result r = onebit::npu::mtp::run(m, &hh, P, o);
+        check(r.ok && m.pending() == 0, "commit: no verify rows left uncommitted at the end");
+        check(m.last_commit() <= r.stats.drafted && m.last_commit() >= 0,
+              "commit: the last commit was a prefix of the verified rows");
+        std::printf("INFO half head k=4: commits=%d last_commit=%d accepted=%d drafted=%d\n", m.commits(),
+                    m.last_commit(), r.stats.accepted, r.stats.drafted);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

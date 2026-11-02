@@ -83,6 +83,12 @@ struct Plan {
     std::string pack;  // *_rai_1.8.0_npu_4K, from the directory name
     Dims dims;
     std::vector<Planned> tensors;
+    // The attention payload's geometry, MEASURED from the .fconst rather than assumed: how many 64-row
+    // tiles follow the block's first epsilon header, and the reason when that does not match the shape
+    // this decoder was established on. Zero tiles plus a note is what the projections' refusal cites.
+    // (engine#734's lesson: `info` must report the measurement, not the plan.)
+    int64_t attn_tiles = 0;
+    std::string attn_note;
 
     std::vector<std::string> refused() const;
     std::string manifest() const;  // JSON: format, layout version, source, geometry, tensors
@@ -121,6 +127,13 @@ struct Report {
     int64_t stride = 0, second_header = 0;
     std::string fconst_note;
     int norm_anchors_ok = 0, norm_anchors_total = 0;
+
+    // Self-check 3: the attention tiles' own round trip. Decoding a shipped tile and re-encoding it has to
+    // give the same 34,816 bytes back, every field at once (quants, zero points, scales and the writer's
+    // bias slots) -- so it fails if any index, nibble order or field offset in decode_tile() is wrong.
+    long long attn_tiles_ok = 0, attn_tiles_total = 0;
+    int attn_projections = 0, attn_bias_tensors = 0;
+    double attn_zero_inexact_pct = 0;  // per-32-group zero points that are not bf16-exact in the container
 };
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options&);
@@ -138,6 +151,27 @@ struct Q4 {
 };
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
                       int N, int K, int block, bool swap_nibbles = false, bool drop_zero = false);
+
+// One 64-row tile of the .fconst attention payload, as the pack stores it. Established byte-exactly
+// (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.13, §7.15): the tile is 2*(K/128)+2 subvolumes
+// of 2,176 B = one pair per (column half, K block of 128) plus the pair holding the writer's bias input.
+// Codes and zero points are stored as int4 (two's complement); `scale` is bf16 per (row, K block).
+struct TileW {
+    int k = 0;                  // the projection's K
+    std::vector<uint8_t> code;   // [64][k] stored nibbles
+    std::vector<float> scale;    // [64][k/128], widened from bf16 (exact, and bf16 again on the way back)
+    std::vector<uint8_t> zp;     // [64][k/128] stored zero points
+    std::vector<uint16_t> bias;  // [64] bf16
+};
+// Bytes in one 64-row tile of that layout: 2*(k/128) + 2 subvolumes of 2,176. 0 when k is not a
+// positive multiple of 128, i.e. when the payload cannot be tiles of this shape.
+int64_t attn_tile_bytes(int64_t k);
+TileW decode_tile(const uint8_t* tile, int k);
+// The exact inverse. Used only as the importer's self-check: a tile that does not survive
+// encode(decode(t)) == t is a tile whose fields we do not understand, and it is refused by name.
+std::vector<uint8_t> encode_tile(const TileW& t);
+// A projection assembled from consecutive tiles, in the form the container's writer takes.
+Q4 q_from_tiles(const std::vector<TileW>& tiles);
 
 // Q4NX q4_1 tiles of a Q4 tensor: [N/32 * K/256, 5120] bytes, plus the parameters
 // that were not exactly representable in bf16 (counted, not fixed up).

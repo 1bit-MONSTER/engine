@@ -196,9 +196,55 @@ static void on_grid_geometry(void) {
     check_int(nt, 4, "an on-grid model still derives every M=16 twin");
 }
 
+
+/* The A side of the same pad (engine#845 review).  The kernel is launched at the padded K while the
+ * forward's activation rows hold only real_k floats, so without q4nx_pad_a_f32() every read of
+ * A[m*K + k] for k >= real_k runs past the caller's buffer -- UB on the host path and, on the device
+ * path, the 128 overrun floats feed the int8 activation scale.  The source here is allocated at
+ * exactly M * real_k floats with a canary parked immediately after it, so a pad that reads past its
+ * input (rather than memcpy-ing the real width) shows up as a canary change and fails the suite. */
+static void activation_pad(void) {
+    const int M = 3, real_k = 896, K = 1024;
+    const size_t guard = 64;
+    float* src = (float*)malloc(sizeof(float) * (size_t)M * real_k + sizeof(float) * guard);
+    float* dst = (float*)malloc(sizeof(float) * (size_t)M * K);
+    check(src && dst, "activation pad: buffers allocated");
+    if (!src || !dst) { free(src); free(dst); return; }
+    for (int i = 0; i < M * real_k; i++) src[i] = (float)(i % 251) * 0.001f - 0.1f;
+    for (size_t i = 0; i < guard; i++) src[(size_t)M * real_k + i] = 1234.5f;   /* canary */
+    for (int i = 0; i < M * K; i++) dst[i] = -7.0f;                            /* poison */
+
+    q4nx_pad_a_f32(src, M, real_k, K, dst);
+
+    int bad_real = 0, bad_tail = 0, bad_canary = 0;
+    for (int m = 0; m < M; m++) {
+        for (int k = 0; k < real_k; k++)
+            if (dst[(size_t)m * K + k] != src[(size_t)m * real_k + k]) bad_real++;
+        for (int k = real_k; k < K; k++)
+            if (dst[(size_t)m * K + k] != 0.0f) bad_tail++;
+    }
+    for (size_t i = 0; i < guard; i++)
+        if (src[(size_t)M * real_k + i] != 1234.5f) bad_canary++;
+    check_int(bad_real, 0, "activation pad: every real column is copied verbatim");
+    check_int(bad_tail, 0, "activation pad: the 128 pad columns of every row are zero");
+    check_int(bad_canary, 0, "activation pad: nothing is read past the source buffer");
+
+    /* the two cases that must stay the identity: an on-grid model (real_k == K) and an MLA design
+     * that never sets real_k at all (0 -> treat as K) */
+    for (int i = 0; i < K; i++) dst[i] = -7.0f;
+    q4nx_pad_a_f32(src, 1, K, K, dst);
+    check_int(dst[K - 1] == src[K - 1] && dst[0] == src[0] ? 0 : 1, 0,
+              "activation pad: real_k == K is the identity");
+    for (int i = 0; i < K; i++) dst[i] = -7.0f;
+    q4nx_pad_a_f32(src, 1, 0, K, dst);
+    check_int(dst[K - 1] == src[K - 1] ? 0 : 1, 0, "activation pad: real_k 0 (MLA) copies K");
+    free(src); free(dst);
+}
+
 int main(void) {
     oga_geometry();
     on_grid_geometry();
+    activation_pad();
     printf("%s\n", failures ? "FAILED" : "all cases ok");
     return failures ? 1 : 0;
 }

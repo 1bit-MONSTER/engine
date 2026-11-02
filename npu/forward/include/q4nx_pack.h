@@ -146,6 +146,17 @@ typedef struct {
 int q4nx_pad_k(int k);
 int q4nx_pad_n(int n);
 
+/* Pad an activation batch from `real_k` columns per row up to the design's `K`, zero-filling the
+ * tail into `out` (M x K floats).  A kernel launched at a padded K reads A at stride K, while the
+ * forward's activation vectors hold only the model's real width (896 of 1024 columns for
+ * Qwen2.5-0.5B), so without this every A read runs past its buffer -- UB, and the device path also
+ * bakes it in by taking the int8 activation scale from the amax over the overrun.  The container's
+ * pad columns are zero, so the padded read is the same dot product, not an approximation
+ * (engine#845 review).  `real_k <= 0` or `real_k >= K` copies nothing extra, which keeps the MLA
+ * designs (they do not set real_k) on their existing path. */
+void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out);
+
+
 /* Architecture dims a design set is derived from. */
 typedef struct {
     int H;        /* hidden_size */

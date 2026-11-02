@@ -1870,14 +1870,14 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         Q4nxProjections p{};
         p.ple = wqkvlin_.data();
         if (!pb16i_ && !weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn qkv"; return false; }
-        npu_gemm(*ctx_[i_qkv], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv");
+        npu_gemm(*ctx_[i_qkv], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv", g->real_k);
     }
     {
         const Q4nxDesignGeom* g = &designs_[i_z];
         Q4nxProjections p{};
         p.ple = wz_.data();
         if (!pb16i_ && !weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn z"; return false; }
-        npu_gemm(*ctx_[i_z], xn.data(), g->K, g->N, B_.data(), z, 1, "attn_gate");
+        npu_gemm(*ctx_[i_z], xn.data(), g->K, g->N, B_.data(), z, 1, "attn_gate", g->real_k);
     }
     // depthwise causal conv1d (kernel CK) + SiLU over CD channels;
     // full = [state (CK-1) | current], new state = full[1:]
@@ -1996,7 +1996,7 @@ bool Q4nxNpuForward::gdn_layer(int l, const std::vector<float>& xn,
         // Key 6, not 2: key 2 is the FFN gate_proj of this same layer (N = IM),
         // so reusing it handed this N = H GEMM a BO packed for the other width.
         if (!pb16i_ && !weight_cached(6) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gdn out"; return false; }
-        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out, 6, "ssm_out");
+        npu_gemm(*ctx_[i_o], core.data(), g->K, g->N, B_.data(), out, 6, "ssm_out", g->real_k);
     }
     return true;
 }
@@ -2141,7 +2141,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         if (!pb16i_ && !weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) {
             err_ = "assemble gdn qkv"; return false;
         }
-        npu_gemm_rows(*ctx_[i_qkv], xn.data(), M, g->K, g->N, B_.data(), QKV, 0, "attn_qkv");
+        npu_gemm_rows(*ctx_[i_qkv], xn.data(), M, g->K, g->N, B_.data(), QKV, 0, "attn_qkv",
+                      g->real_k);
     }
     {
         const Q4nxDesignGeom* g = &designs_[i_z];
@@ -2150,7 +2151,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         if (!pb16i_ && !weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) {
             err_ = "assemble gdn z"; return false;
         }
-        npu_gemm_rows(*ctx_[i_z], xn.data(), M, g->K, g->N, B_.data(), Z, 1, "attn_gate");
+        npu_gemm_rows(*ctx_[i_z], xn.data(), M, g->K, g->N, B_.data(), Z, 1, "attn_gate",
+                      g->real_k);
     }
 
     // NPU_QKV_DUMP=<layer>: a GDN layer's projections as the engine sees them (q, k, v and the
@@ -2286,7 +2288,8 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         if (!pb16i_ && !weight_cached(6) && q4nx_assemble_B(g, &p, B_.data()) != 0) {
             err_ = "assemble gdn out"; return false;
         }
-        npu_gemm_rows(*ctx_[i_o], CORE.data(), M, g->K, g->N, B_.data(), out, 6, "ssm_out");
+        npu_gemm_rows(*ctx_[i_o], CORE.data(), M, g->K, g->N, B_.data(), out, 6, "ssm_out",
+                      g->real_k);
     }
     return true;
 }
@@ -2615,7 +2618,13 @@ bool Q4nxNpuForward::load_hadamard(const std::string& path) {
 
 void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                               const float* Bmat, std::vector<float>& out, int wkey,
-                              const char* sc) {
+                              const char* sc, int a_k) {
+    std::vector<float> a_pad;   // keeps every A read inside the caller's buffer at a padded K
+    if (a_k > 0 && a_k < K) {
+        a_pad.resize((size_t)K);
+        q4nx_pad_a_f32(A, 1, a_k, K, a_pad.data());
+        A = a_pad.data();
+    }
     if (host_gemm_) {
         // Bmat is B[K][N] row-major (ld = N); a plain float matvec.
         out.assign((size_t)N, 0.0f);
@@ -2833,7 +2842,13 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
 
 void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
                                    const float* Bmat, std::vector<float>& out, int wkey,
-                                   const char* sc) {
+                                   const char* sc, int a_k) {
+    std::vector<float> a_pad;   // as in npu_gemm(): A holds real_k columns, the kernel reads K
+    if (a_k > 0 && a_k < K) {
+        a_pad.resize((size_t)M * (size_t)K);
+        q4nx_pad_a_f32(A, M, a_k, K, a_pad.data());
+        A = a_pad.data();
+    }
     if (host_gemm_) {
         // Bmat is B[K][N] row-major (ld = N): a plain float matmul of A[M][K].
         out.assign((size_t)M * N, 0.0f);
@@ -3180,14 +3195,14 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 const Q4nxDesignGeom* gq = &designs_[i_qhalf_];
                 const Q4nxDesignGeom* gk = &designs_[i_kv_];
                 std::vector<float> qh0, qh1, kvk, kvv;
-                npu_gemm_rows(*ctx16_[i_qhalf_], XN.data(), M, gq->K, gq->N, nullptr, qh0,
-                              10, "attn_q_h0");
-                npu_gemm_rows(*ctx16_[i_qhalf_], XN.data(), M, gq->K, gq->N, nullptr, qh1,
-                              11, "attn_q_h1");
-                npu_gemm_rows(*ctx16_[i_kv_], XN.data(), M, gk->K, gk->N, nullptr, kvk,
-                              12, "attn_k");
-                npu_gemm_rows(*ctx16_[i_kv_], XN.data(), M, gk->K, gk->N, nullptr, kvv,
-                              13, "attn_v");
+                npu_gemm_rows(*ctx16_[i_qhalf_], XN.data(), M, gq->K, gq->N, nullptr, qh0, 10, "attn_q_h0",
+                              gq->real_k);
+                npu_gemm_rows(*ctx16_[i_qhalf_], XN.data(), M, gq->K, gq->N, nullptr, qh1, 11, "attn_q_h1",
+                              gq->real_k);
+                npu_gemm_rows(*ctx16_[i_kv_], XN.data(), M, gk->K, gk->N, nullptr, kvk, 12, "attn_k",
+                              gk->real_k);
+                npu_gemm_rows(*ctx16_[i_kv_], XN.data(), M, gk->K, gk->N, nullptr, kvv, 13, "attn_v",
+                              gk->real_k);
                 const size_t n_on = (size_t)2 * nhd + (size_t)2 * nkv;
                 if (qh0.size() < (size_t)M * nhd || qh1.size() < (size_t)M * nhd ||
                     kvk.size() < (size_t)M * nkv || kvv.size() < (size_t)M * nkv ||
@@ -3205,8 +3220,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                            (size_t)nkv * sizeof(float));
                 }
             } else {
-                npu_gemm_rows(*ctx_[i_qkv_l], XN.data(), M, g->K, g->N, B_.data(), QKV, 0,
-                              "attn_qkv");
+                npu_gemm_rows(*ctx_[i_qkv_l], XN.data(), M, g->K, g->N, B_.data(), QKV, 0, "attn_qkv",
+                              g->real_k);
             }
             // With attn_output_gate the fused QKV is [q | gate | k | v] and
             // g->q_rows covers q AND the gate, so the per-head width must divide
@@ -3290,8 +3305,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (!pb16i_ && !cached && q4nx_assemble_B(go, &po, B_.data()) != 0) {
                 err_ = "assemble o"; return false;
             }
-            npu_gemm_rows(*ctx_[i_o_l], CTX.data(), M, go->K, go->N, B_.data(), O, 1,
-                          l_full ? "attn_output" : "ssm_out");
+            npu_gemm_rows(*ctx_[i_o_l], CTX.data(), M, go->K, go->N, B_.data(), O, 1, l_full ? "attn_output" : "ssm_out",
+                          go->real_k);
         }
         for (int m = 0; m < M; m++)
             for (int k = 0; k < H; k++)
@@ -3323,8 +3338,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (!pb16i_ && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble gu"; return false;
             }
-            npu_gemm_rows(*ctx_[i_gu], XN.data(), M, g->K, g->N, B_.data(), ACT, 2,
-                          "ffn_gate_up");
+            npu_gemm_rows(*ctx_[i_gu], XN.data(), M, g->K, g->N, B_.data(), ACT, 2, "ffn_gate_up",
+                          g->real_k);
         } else if (i_g >= 0 && i_u >= 0) {
             std::vector<float> gv, uv, av((size_t)M * (size_t)im * 2);
             const Q4nxDesignGeom* gg = &designs_[i_g];
@@ -3332,15 +3347,15 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (!pb16i_ && !cached && q4nx_assemble_B(gg, &pg, B_.data()) != 0) {
                 err_ = "assemble g"; return false;
             }
-            npu_gemm_rows(*ctx_[i_g], XN.data(), M, gg->K, gg->N, B_.data(), gv, 2,
-                          "ffn_gate");
+            npu_gemm_rows(*ctx_[i_g], XN.data(), M, gg->K, gg->N, B_.data(), gv, 2, "ffn_gate",
+                          gg->real_k);
             const Q4nxDesignGeom* gu = &designs_[i_u];
             Q4nxProjections pu{}; pu.up = wu_.data();
             if (!pb16i_ && !cached && q4nx_assemble_B(gu, &pu, B_.data()) != 0) {
                 err_ = "assemble u"; return false;
             }
-            npu_gemm_rows(*ctx_[i_u], XN.data(), M, gu->K, gu->N, B_.data(), uv, 3,
-                          "ffn_up");
+            npu_gemm_rows(*ctx_[i_u], XN.data(), M, gu->K, gu->N, B_.data(), uv, 3, "ffn_up",
+                          gu->real_k);
             for (int m = 0; m < M; m++)
                 for (int i = 0; i < im; i++) {
                     av[(size_t)m * 2 * im + i] = gv[(size_t)m * im + i];
@@ -3365,8 +3380,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             if (!pb16i_ && !cached && q4nx_assemble_B(g, &p, B_.data()) != 0) {
                 err_ = "assemble d"; return false;
             }
-            npu_gemm_rows(*ctx_[i_d], HH.data(), M, g->K, g->N, B_.data(), D, 4,
-                          "ffn_down");
+            npu_gemm_rows(*ctx_[i_d], HH.data(), M, g->K, g->N, B_.data(), D, 4, "ffn_down",
+                          g->real_k);
         }
         for (int m = 0; m < M; m++)
             for (int k = 0; k < H; k++)
@@ -3529,7 +3544,7 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
         const Q4nxDesignGeom* g = &designs_[i_qa];
         Q4nxProjections p{}; p.q = w_qa_.data();
         if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_a"; return false; }
-        npu_gemm(*ctx_[i_qa], x.data(), g->K, g->N, B_.data(), qa, 0);
+        npu_gemm(*ctx_[i_qa], x.data(), g->K, g->N, B_.data(), qa, 0, nullptr, g->real_k);
     }
     qan.resize(q_lora_);
     rmsnorm(qa.data(), mla_qan_.data(), q_lora_, qan.data());
@@ -3537,13 +3552,13 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
         const Q4nxDesignGeom* g = &designs_[i_qb];
         Q4nxProjections p{}; p.k = w_qb_.data();
         if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble q_b"; return false; }
-        npu_gemm(*ctx_[i_qb], qan.data(), g->K, g->N, B_.data(), q, 1);
+        npu_gemm(*ctx_[i_qb], qan.data(), g->K, g->N, B_.data(), q, 1, nullptr, g->real_k);
     }
     {   // kv_a: [H] -> [kv_real] (+ zero pad to the kernel's n-tile)
         const Q4nxDesignGeom* g = &designs_[i_kva];
         Q4nxProjections p{}; p.v = w_kva_.data();
         if (!weight_cached(6) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble kv_a"; return false; }
-        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva, 6);
+        npu_gemm(*ctx_[i_kva], x.data(), g->K, g->N, B_.data(), kva, 6, nullptr, g->real_k);
     }
     if ((int)kva.size() < kv_real) { err_ = "kv_a short"; return false; }
     std::vector<float> kl(kv_lora_);
@@ -3622,7 +3637,7 @@ bool Q4nxNpuForward::mla_attn(int l, const std::vector<float>& x, std::vector<fl
         const Q4nxDesignGeom* g = &designs_[i_o];
         Q4nxProjections p{}; p.o = w_o_.data();
         if (!weight_cached(7) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
-        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o, 7);
+        npu_gemm(*ctx_[i_o], ctx.data(), g->K, g->N, B_.data(), o, 7, nullptr, g->real_k);
     }
     return true;
 }
@@ -3744,8 +3759,10 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
             }
         }
         std::vector<float> go_all, uo_all;
-        npu_gemm(*ctx_[i_gb], xn.data(), designs_[i_gb].K, N, Bg.data(), go_all);
-        npu_gemm(*ctx_[i_ub], xn.data(), designs_[i_ub].K, N, Bu.data(), uo_all);
+        npu_gemm(*ctx_[i_gb], xn.data(), designs_[i_gb].K, N, Bg.data(), go_all, -1, nullptr,
+                 designs_[i_gb].real_k);
+        npu_gemm(*ctx_[i_ub], xn.data(), designs_[i_ub].K, N, Bu.data(), uo_all, -1, nullptr,
+                 designs_[i_ub].real_k);
         for (int j = 0; j < tk; j++) {
             const int e = sel[j];
             std::vector<float> act((size_t)expert_im_);
@@ -3757,7 +3774,7 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
             std::vector<float> ed;
             Q4nxProjections p{}; p.down = ds[j].data();
             if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble expert down"; return false; }
-            npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), ed);
+            npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), ed, -1, nullptr, gd->real_k);
             if (dump) {
                 for (int i = 0; i < expert_im_; i++) { moe_g += go_all[(size_t)j * expert_im_ + i]; moe_u += uo_all[(size_t)j * expert_im_ + i]; }
                 for (float f : act) moe_sw += f;
@@ -3776,13 +3793,13 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
             const Q4nxDesignGeom* gg = &designs_[i_g];
             Q4nxProjections p{}; p.gate = g.data();
             if (q4nx_assemble_B(gg, &p, B_.data()) != 0) { err_ = "assemble expert gate"; return false; }
-            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), go);
+            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), go, -1, nullptr, gg->real_k);
         }
         {
             const Q4nxDesignGeom* gu = &designs_[i_u];
             Q4nxProjections p{}; p.up = u.data();
             if (q4nx_assemble_B(gu, &p, B_.data()) != 0) { err_ = "assemble expert up"; return false; }
-            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uo);
+            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uo, -1, nullptr, gu->real_k);
         }
         std::vector<float> act((size_t)expert_im_);
         for (int i = 0; i < expert_im_; i++)
@@ -3791,7 +3808,7 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
         std::vector<float> ed;
         Q4nxProjections p{}; p.down = dd.data();
         if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble expert down"; return false; }
-        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), ed);
+        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), ed, -1, nullptr, gd->real_k);
         if (dump) {
             for (float f : go) moe_g += f;
             for (float f : uo) moe_u += f;
@@ -3817,7 +3834,7 @@ bool Q4nxNpuForward::moe_mlp(int l, const std::vector<float>& xn, std::vector<fl
         Q4nxProjections p{}; p.down = share_d_.data();
         if (!weight_cached(5) && q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble shared down"; return false; }
         std::vector<float> sd;
-        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), sd, 5);
+        npu_gemm(*ctx_[i_d], act.data(), gd->K, gd->N, B_.data(), sd, 5, nullptr, gd->real_k);
         if (dump) {
             double ss = 0; for (float f : act) ss += f;
             fprintf(stderr, "  [moe] L%d expert gate=%.6f up=%.6f swiglu=%.6f down=%.6f weighted=%.6f | "
@@ -3851,13 +3868,13 @@ bool Q4nxNpuForward::dense_mlp(int l, const std::vector<float>& xn, std::vector<
         const Q4nxDesignGeom* gd = &designs_[i_dg];
         Q4nxProjections p{}; p.gate = dense_g_.data();
         if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble dense gate"; return false; }
-        npu_gemm(*ctx_[i_dg], xn.data(), gd->K, gd->N, B_.data(), g);
+        npu_gemm(*ctx_[i_dg], xn.data(), gd->K, gd->N, B_.data(), g, -1, nullptr, gd->real_k);
     }
     {
         const Q4nxDesignGeom* gd = &designs_[i_du];
         Q4nxProjections p{}; p.up = dense_u_.data();
         if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble dense up"; return false; }
-        npu_gemm(*ctx_[i_du], xn.data(), gd->K, gd->N, B_.data(), u);
+        npu_gemm(*ctx_[i_du], xn.data(), gd->K, gd->N, B_.data(), u, -1, nullptr, gd->real_k);
     }
     std::vector<float> act((size_t)dense_im_);
     for (int i = 0; i < dense_im_; i++)
@@ -3872,7 +3889,7 @@ bool Q4nxNpuForward::dense_mlp(int l, const std::vector<float>& xn, std::vector<
     const Q4nxDesignGeom* gd = &designs_[i_dd];
     Q4nxProjections p{}; p.down = dense_d_.data();
     if (q4nx_assemble_B(gd, &p, B_.data()) != 0) { err_ = "assemble dense down"; return false; }
-    npu_gemm(*ctx_[i_dd], act.data(), gd->K, gd->N, B_.data(), d);
+    npu_gemm(*ctx_[i_dd], act.data(), gd->K, gd->N, B_.data(), d, -1, nullptr, gd->real_k);
     return true;
 }
 
@@ -4215,10 +4232,14 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 std::vector<float> qh0, qh1, kvk, kvv;
                 const Q4nxDesignGeom* gq = &designs_[i_qhalf_];
                 const Q4nxDesignGeom* gk = &designs_[i_kv_];
-                npu_gemm(*ctx16_[i_qhalf_], xn.data(), gq->K, gq->N, nullptr, qh0, 10, "attn_q_h0");
-                npu_gemm(*ctx16_[i_qhalf_], xn.data(), gq->K, gq->N, nullptr, qh1, 11, "attn_q_h1");
-                npu_gemm(*ctx16_[i_kv_], xn.data(), gk->K, gk->N, nullptr, kvk, 12, "attn_k");
-                npu_gemm(*ctx16_[i_kv_], xn.data(), gk->K, gk->N, nullptr, kvv, 13, "attn_v");
+                npu_gemm(*ctx16_[i_qhalf_], xn.data(), gq->K, gq->N, nullptr, qh0, 10, "attn_q_h0",
+                         gq->real_k);
+                npu_gemm(*ctx16_[i_qhalf_], xn.data(), gq->K, gq->N, nullptr, qh1, 11, "attn_q_h1",
+                         gq->real_k);
+                npu_gemm(*ctx16_[i_kv_], xn.data(), gk->K, gk->N, nullptr, kvk, 12, "attn_k",
+                         gk->real_k);
+                npu_gemm(*ctx16_[i_kv_], xn.data(), gk->K, gk->N, nullptr, kvv, 13, "attn_v",
+                         gk->real_k);
                 if ((int)qh0.size() < nhd || (int)qh1.size() < nhd || (int)kvk.size() < nkv ||
                     (int)kvv.size() < nkv || !err_.empty()) {
                     if (err_.empty()) err_ = "pb16i full-attention QKV split returned short";
@@ -4230,7 +4251,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 memcpy(qkv.data() + 2 * nhd, kvk.data(), (size_t)nkv * sizeof(float));
                 memcpy(qkv.data() + 2 * nhd + nkv, kvv.data(), (size_t)nkv * sizeof(float));
             } else {
-                npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv");
+                npu_gemm(*ctx_[i_qkv_l], xn.data(), g->K, g->N, B_.data(), qkv, 0, "attn_qkv",
+                         g->real_k);
             }
             // attn_output_gate: the fused QKV is [q | gate | k | v], so attention()
             // must not see the gate half; the gate multiplies ctx afterwards.
@@ -4264,8 +4286,8 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             Q4nxProjections p{};
             p.o = wo_.data();
             if (!pb16i_ && !weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble o"; return false; }
-            npu_gemm(*ctx_[i_o_l], ctx.data(), g->K, g->N, B_.data(), o, 1,
-                     l_full ? "attn_output" : "ssm_out");
+            npu_gemm(*ctx_[i_o_l], ctx.data(), g->K, g->N, B_.data(), o, 1, l_full ? "attn_output" : "ssm_out",
+                     g->real_k);
         }
         }  // end non-GDN attention
         if (gemma4_layer_) {
@@ -4304,19 +4326,20 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             Q4nxProjections p{};
             p.gate = wg_.data(); p.up = wu_.data();
             if (!pb16i_ && !weight_cached(2) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble gu"; return false; }
-            npu_gemm(*ctx_[i_gu_l], xn.data(), g->K, g->N, B_.data(), act, 2, "ffn_gate_up");
+            npu_gemm(*ctx_[i_gu_l], xn.data(), g->K, g->N, B_.data(), act, 2, "ffn_gate_up",
+                     g->real_k);
         } else if (i_g >= 0 && i_u >= 0) {
             // split gate/up: two kernels, then SiLU(gate) * up
             std::vector<float> gv, uv;
             const Q4nxDesignGeom* gg = &designs_[i_g];
             Q4nxProjections pg{}; pg.gate = wg_.data();
             if (!pb16i_ && !weight_cached(2) && q4nx_assemble_B(gg, &pg, B_.data()) != 0) { err_ = "assemble g"; return false; }
-            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), gv, 2, "ffn_gate");
+            npu_gemm(*ctx_[i_g], xn.data(), gg->K, gg->N, B_.data(), gv, 2, "ffn_gate", gg->real_k);
 
             const Q4nxDesignGeom* gu = &designs_[i_u];
             Q4nxProjections pu{}; pu.up = wu_.data();
             if (!pb16i_ && !weight_cached(3) && q4nx_assemble_B(gu, &pu, B_.data()) != 0) { err_ = "assemble u"; return false; }
-            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uv, 3, "ffn_up");
+            npu_gemm(*ctx_[i_u], xn.data(), gu->K, gu->N, B_.data(), uv, 3, "ffn_up", gu->real_k);
 
             act.resize((size_t)im_l * 2);
             for (int i = 0; i < im_l; i++) {
@@ -4333,7 +4356,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
             Q4nxProjections p{};
             p.down = wd_.data();
             if (!pb16i_ && !weight_cached(4) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble d"; return false; }
-            npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d, 4, "ffn_down");
+            npu_gemm(*ctx_[i_d_l], h.data(), g->K, g->N, B_.data(), d, 4, "ffn_down", g->real_k);
         }
         if (!gemma4_layer_) {
             { LhScope _tlh(LH_RES);
@@ -4367,7 +4390,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 Q4nxProjections p{};
                 p.ple = inp_gate_[l].data();
                 if (!weight_cached(0) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble plegate"; return false; }
-                npu_gemm(*ctx_[i_pg], x.data(), g->K, g->N, B_.data(), pg, 0);
+                npu_gemm(*ctx_[i_pg], x.data(), g->K, g->N, B_.data(), pg, 0, nullptr, g->real_k);
             }
             const int gelu = (sem_.mlp_act == Q4NX_ACT_GELU);
             for (int i = 0; i < ple_dim_; i++) {
@@ -4386,7 +4409,7 @@ bool Q4nxNpuForward::step(int token, int pos, std::vector<float>& logits) {
                 Q4nxProjections p{};
                 p.ple = ple_proj_[l].data();
                 if (!weight_cached(1) && q4nx_assemble_B(g, &p, B_.data()) != 0) { err_ = "assemble pleproj"; return false; }
-                npu_gemm(*ctx_[i_pp], pg.data(), g->K, g->N, B_.data(), pp, 1);
+                npu_gemm(*ctx_[i_pp], pg.data(), g->K, g->N, B_.data(), pp, 1, nullptr, g->real_k);
             }
             rmsnorm(pp.data(), post_ln_[l].data(), H, xn.data());
             for (int k = 0; k < H; k++) x[k] += xn[k];

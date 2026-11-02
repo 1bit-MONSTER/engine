@@ -120,6 +120,16 @@ int q4nx_pad_n(int n) {
     return n <= 0 ? n : ((n + Q4NX_N_GRID - 1) / Q4NX_N_GRID) * Q4NX_N_GRID;
 }
 
+void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
+    if (!A || !out || M <= 0 || K <= 0) return;
+    const int w = (real_k <= 0 || real_k > K) ? K : real_k;
+    for (int m = 0; m < M; m++) {
+        float* d = out + (size_t)m * (size_t)K;
+        memcpy(d, A + (size_t)m * (size_t)w, sizeof(float) * (size_t)w);
+        if (w < K) memset(d + w, 0, sizeof(float) * (size_t)(K - w));
+    }
+}
+
 /* One standard design: the model's real K and N in, the kernel's grids out, the real widths kept
  * beside them.  Role-specific row counts (q_rows/k_rows/v_rows, gate_rows/up_rows) are the
  * caller's, because only it knows what fills N.  MLA keeps its own derivation: its KVA pad is the

@@ -255,13 +255,17 @@ private:
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
     bool load_layer(int l);
+    // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or
+    // intermediate size).  It is K whenever the model is already on the container's 256-column K
+    // grid, and smaller when it is not (Qwen2.5-0.5B: 896 of 1024), in which case the activation is
+    // zero-padded to K before the kernel sees it -- see q4nx_pad_a_f32() for why that is exact.
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                   const float* Bmat, std::vector<float>& out, int wkey = -1,
-                  const char* sc = nullptr);
+                  const char* sc = nullptr, int a_k = 0);
     // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
     void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
                        const float* Bmat, std::vector<float>& out, int wkey = -1,
-                       const char* sc = nullptr);
+                       const char* sc = nullptr, int a_k = 0);
     // pb16i sidecar stem for (layer, tensor tag): <pb16i_dir>/blk_<l>_<tag>_weight
     std::string pb16i_stem(int layer, const char* tag) const;
     // Phase-selected activation tile.  A one-row launch is decode, so it runs

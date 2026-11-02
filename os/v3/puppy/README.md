@@ -29,9 +29,10 @@ how to build it. The Ubuntu Server `autoinstall` design stays the documented fal
 | `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem |
 | `g2-probe.sh` | gate G2: boot the built ISO headless in QEMU and keep the init's transcript, so "it boots on our kernel" is a measurement |
 | `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, `/lib/modules/<kver>` in its zdrv, and `amdxdna`/`ec_su_axb35` built for that kernel and signed. `--require-mok` for the release gate |
+| `vm-check.sh` | the TPUPPY-RELEASE rows that need no board, in QEMU over a serial root shell: bash + `sudo` + `apt install` (U1), lemond up with its key and `/api/v1/models` from inside the guest and over the forwarded port (U3), `1bit` on PATH and the EC driver in `ADDLIST` (U4). Hardware rows print as SKIP with the reason |
 | `packages-extra` | package rows the acceptance needs and woof-CE's set does not have (`sudo`, `apt`, `mokutil`, `openssh-server`), with the measurement that justifies each |
 | `spec-insert-rows.sh` | puts those rows inside `PKGS_SPECS_TABLE`, before its closing quote; idempotent |
-| `embed/` | the files PAYLOAD=... drops into the rootfs: `/etc/init.d/10lemonade`, the boot service (Puppy's `rc.services` runs every executable `/etc/init.d` script) |
+| `embed/` | the files PAYLOAD=... drops into the rootfs (into `rootfs-skeleton`, which is what `3builddistro` copies): `/etc/init.d/10lemonade` (the server), `20onboard-ssh` + `root/.ssh/authorized_keys` (U7: host keys, StrictModes' two modes, sshd), `21serial-console` (a root shell on ttyS0, only on `1bit.serial=1`) |
 
 ## A kernel bump, end to end
 
@@ -87,14 +88,37 @@ os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 #    <puppy-out-dir> gets the ISO and the four SFS - the SFS files are the frugal install.
 #    PAYLOAD=<unpacked lemonade-onebit-<tag>> embeds the release package (U3/U4): copied to
 #    /opt/1bit-package with /etc/init.d/10lemonade starting it at boot, and the build refuses an image
-#    whose rootfs lacks the engine, the launcher, /usr/local/bin/1bit or the service.
+#    whose SFS set lacks the engine, the launcher, /usr/local/bin/1bit, the service, the owner's key or
+#    the ADDLIST line in the packed /etc/rc.d/MODULESCONFIG. It writes into rootfs-skeleton, because
+#    3builddistro deletes and rebuilds sandbox3/rootfs-complete from it (measured: writing into the
+#    sandbox copy is silently discarded, image still green).
 #    build.sh copies <out-dir>/huge-*.tar.* into woof-out_*/kernel-kit/output/ before 3builddistro,
 #    which is what makes the image carry OUR kernel. Empty that directory and woof-CE silently
 #    downloads a stock Ubuntu kernel instead - the trap the evaluation paid for.
 
 # 6. re-gate: G2 (boots on our kernel), G3 (amdgpu/amdxdna/ec_su_axb35 present and signed; devices on
 #    the board) and G4 (Secure Boot with the shim/MOK chain), then the release check inside the VM.
+#    g2-probe.sh <iso> <work> and g3-probe.sh <iso> <work> [--kver <kver>] [--require-mok] read the
+#    image, and vm-check.sh <iso> <work> boots it and answers the U1/U3/U4 rows over a serial shell.
 ```
+
+## What runs in the image at boot
+
+PID 1 is not systemd: `/etc/rc.d/rc.services` runs every **executable** script in `/etc/init.d` with
+`start` and every script there again with `stop` at shutdown (a built resolute64 rootfs ships 295 files
+under `/lib/systemd/system` and nothing reads them). So a service is executable-or-invisible, and the three
+this recipe ships are:
+
+| service | what it does |
+|---|---|
+| `10lemonade` | starts `/opt/1bit-package/lemond-onebit`, mints `LEMONADE_API_KEY` into `/etc/1bit/lemond.conf` (mode 600) on first boot, binds `0.0.0.0:13305`, logs to `/var/log/lemond-onebit.log` |
+| `20onboard-ssh` | `ssh-keygen -A`, `/root/.ssh` 700 + `authorized_keys` 600, then sshd. An image with no key provisions no listener |
+| `21serial-console` | a root shell on `/dev/ttyS0`, only when the command line carries `1bit.serial=1` (that shell has no password, so it is opt-in) |
+
+Two facts about the console that cost VM runs: the boot transcript is written to ttyS0 but the console
+Puppy leaves you with is **tty1**, so serial input goes nowhere without `21serial-console`; and `pfix=nox`
+is what makes `rc.country` ask for a keyboard layout and timezone (`init` creates `/tmp/bootcnt.txt`), so
+the appliance's normal boot asks nothing and those dialogs are a debug-mode artefact.
 
 Two naming rules make this work, and both are silent when broken:
 

@@ -570,6 +570,30 @@ template with `enable_thinking=False` — which opens the assistant turn with an
 Those trailing bytes are part of what the model reads, so reusing `chatml()` here would be a different
 input. `state` is parsed as ordered JSON because upstream preserves the request's key order.
 
+**Converting a d3 pack** (engine #796) is `tools/safetensors_to_q4nx.py pack <pack> <model dir> --arch qwen3_5`
+(the arch is detected from the pack's `language_model.*` names, so `auto` is enough). It is not a rename
+job: three transforms in the pack's GDN tensors are silently wrong answers when they are wrong, so each is
+named here and covered by a known-answer test (`ctest safetensors_to_q4nx`):
+
+| from | to | transform |
+|---|---|---|
+| `linear_attn.A_log` | `linear_attn.ssm_a` | **`-exp(A_log)`, F32** — the forward computes `expf(ssm_a * softplus(dt))`, so the raw A_log decays backwards |
+| `linear_attn.conv1d.weight` `[CD,1,CK]` | `linear_attn.ssm_conv1d.weight` | **transpose to tap-major** `[CK,CD]`: the forward indexes `conv[j*CD + c]` |
+| `linear_attn.in_proj_a/b` | `ssm_alpha_proj`/`ssm_beta_proj` | rows **zero-padded to 32** so they tile; the forward dequantises at the stored height and keeps the first NVH rows (**q4_1 where the FLM config asks Q8_0** — a deviation `verify` measures rather than hides) |
+
+The remaining names come from `configs/q4nx/qwen3.5_0.8b.json`'s `q4nx_name` column (`in_proj_qkv` →
+`qkv_proj`, `in_proj_z` → `self_attn.gate_proj`, `out_proj` → `ssm_out_proj`, `dt_bias` → `ssm_dt.bias`), and
+`visual.*` is skipped because the forward runs the text path. Two converter rules exist because of measured
+load failures, not style: the embedding keeps its **2-D shape** (the loader reads vocab and hidden off
+`shape[0]`/`shape[1]`), and `text_config`'s keys are **lifted to the top level**, because the engine reads
+`config.json` at depth 1 only. A tensor with no mapping is a refusal, never a dropped one.
+
+What is still missing for a real d3 row is the **artifact set**: the forward asserts ELF existence even in
+`NPU_INFER_HOST_GEMM=1`, and this geometry needs six designs — `QKV K1024 N5120` (q|gate|k|v, `q_proj`
+carries the output gate), `O K2048 N1024` (GDN's `ssm_out` reuses it), `GU K1024 N7168`,
+`D K3584 N1024`, GDN `QKV K1024 N6144` and `Z K1024 N2048`. Without them the load stops at
+`forward init failed: … this model's plan needs the QKV kernel "full_i8_QKV_K1024_N5120.elf" … (missing)`.
+
 Refusals follow the d3 server this route stands in for, so vLLM Semantic Router can point at it unchanged —
 which means **422 here, not the 400 the chat route uses**:
 

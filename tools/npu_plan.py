@@ -105,7 +105,12 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
             hd = cfg.get("head_dim") or (hidden // nh if nh else 0)
             if not (nh and hd and nkv):
                 raise SystemExit(f"layer {i} is attention but config.json lacks the head dimensions")
-            entry["qkv"] = {"K": hidden, "N": (nh + 2 * nkv) * hd, "fused": True}
+            # qwen3_5's attn_output_gate makes q_proj emit q|gate, so the fused QKV is
+            # [q | gate | k | v] -- the same doubling the engine's own derivation does
+            # (npu/forward/src/q4nx_pack.c:150).  Without this the plan asks for a 3072-wide
+            # QKV kernel on a container whose rows are 5120.
+            q = nh * hd * (2 if cfg.get("attn_output_gate") else 1)
+            entry["qkv"] = {"K": hidden, "N": q + 2 * nkv * hd, "fused": True}
         entry["gate_up"] = {"K": hidden, "N": 2 * im} if fused_gu else {"K": hidden, "N": im}
         entry["down"] = {"K": im, "N": hidden}
         out.append(entry)

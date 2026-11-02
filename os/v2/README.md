@@ -59,7 +59,7 @@ debugging tool, it judges nothing.
 
 | Package | What is in it |
 |---|---|
-| `1bit-engine` | `/opt/1bit`: the engine, the HRX `llama-server` and its libraries, the ds4 programs, the sealed NPU kernel sets, `1bit-selftest`, `1bit-release-check`, `/etc/1bit/engine.conf` |
+| `1bit-engine` | `/opt/1bit`: the engine, the HRX `llama-server` and its libraries, the sealed NPU kernel sets, `1bit-selftest`, `1bit-release-check`, `/etc/1bit/engine.conf` |
 | `1bit-lemonade` | `/opt/lemonade`: our build of Lemonade Server (`lemond`, the CLI, the web app) and its unit |
 | `1bit-kernel-image-<kver>` | `/boot/{vmlinuz,System.map,config}-<kver>`; its postinst runs `update-initramfs`. The **kver is in the name**, so an upgrade keeps the previous kernel installed — that is the rollback |
 | `1bit-kernel-modules-<kver>` | every module for `<kver>`, including the out-of-tree EC board driver (MOK-signed) and its source under `/usr/src/1bit-ec-<ver>` |
@@ -174,7 +174,7 @@ the `secureboot` row answers; enrolling the MOK is the machine's step, not a VM'
 
 ## Known gaps
 
-- **The ROCm userspace is not packaged.** The engine's HIP path (`llama-server`, `ds4`) links
+- **The ROCm userspace is not packaged.** The engine's HIP path (`llama-server`) links
   `libamdhip64`, rocBLAS, hipBLASLt, the HSA runtime and `libamd_comgr` from the SDK the build machine had.
   Ubuntu 26.04 has packages for them (`libamdhip64-7`, `libhipblaslt1`, `librocblas*`), but gfx1201
   support against the distro's ROCm is a hardware question, so the engine's `Depends` do not name them yet

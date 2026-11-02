@@ -13,7 +13,7 @@
 // See the License for the specific language governing permissions and
 // limitations under the License.
 
-// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|hybrid|cpu|ds4] [--mtp HEAD]`
+// `1bit serve -m <model> [--port 8000] [--device auto|npu|hrx|hybrid|cpu] [--mtp HEAD]`
 //                        [--npu-opt KEY=VALUE ...] [--npu-streams N] [--prefill-provider PATH]
 //
 // The engine's one front door (docs/serve.md): one model per process behind an
@@ -36,10 +36,8 @@
 //   a .gguf, --device hybrid                    -> the HRX llama-server decodes; the prompt's KV comes
 //                                                  from an external prefill provider (the NPU engine,
 //                                                  ONEBIT_HYBRID_PREFILL; app/serve_hybrid.h, docs/hybrid.md)
-//   a .1bp (1BP v5 package), --device auto|ds4 -> the same ds4-server (our DwarfStar fork reads 1BP)
-//   a DwarfStar .gguf, --device ds4             -> this build's DwarfStar ds4-server (DeepSeek
-//                                                  V4/V4.1 Flash, GLM 5.x, Qwen3.8-Flash-Next in
-//                                                  DwarfStar's own GGUFs; docs/dwarfstar.md)
+//   a .1bp (1BP v5 package)                     -> refused: the engine's only 1BP reader was DwarfStar's
+//                                                  ds4, and --device ds4 is removed (2026-11-02)
 //   --laya with --device auto                   -> Laya classifies each conversation and the route
 //                                                  policy picks the device (RFC #186, docs/laya.md)
 //   --pm [--pm-experts FILE] [--pm-router model|laya] [--lemonade-url U] [--pm-spawn-url URL]
@@ -154,8 +152,8 @@ struct Options {
     std::string model, host = "127.0.0.1", device = "auto", alias;
     int port = 8000, ctx_size = 0;
     std::string flash_attn;  // -fa on/off forwarded to the child llama-server
-    std::string llama_server, hrx_libhsa, ds4;
-    bool ssd_streaming = false;  // --device ds4: stream routed experts from the SSD
+    std::string llama_server, hrx_libhsa;
+    bool ssd_streaming_removed = false;  // --ssd-streaming: was --device ds4's knob, refused with a named message
     std::string mtp;
     bool no_mtp = false;  // --no-mtp (or ONEBIT_NO_MTP=1): no drafting from the GGUF's own MTP head (own_mtp_head)
     std::string dflash;  // DFlash block-diffusion draft model for the target
@@ -286,6 +284,11 @@ void refuse_removed_device(const std::string& device) {
         throw std::runtime_error("--device onnx was removed: the engine ships no ONNX Runtime (its NPU route is its own "
                                  "engine, --device npu). Lemonade's own backends serve ONNX models where they exist "
                                  "(ryzenai-llm on Windows, onnxruntime on the CPU; docs/lemonade.md)");
+    if (device == "ds4")
+        throw std::runtime_error("--device ds4 was removed: DwarfStar ran antirez's CUDA kernels through a HIP shim plus "
+                                 "hipBLAS, not our HIP kernels, and it is out of the shipped builds (owner 2026-11-01). "
+                                 "DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on --device hrx; a 1BP package has "
+                                 "no route any more (docs/serve.md)");
 }
 
 // An "H32" file: a Q4_0 whose matmul weights were rotated by a 32-point Walsh-Hadamard transform
@@ -320,22 +323,13 @@ bool prism_ternary_types(const std::string& model) {
     return ft == 128 || ft == 129 || ft == 141 || ft == 142 || ft == 143;
 }
 
-// A 1BP package (1bit-MONSTER's model format; our DwarfStar fork reads version 5, its
-// docs/1BP.md): its first four bytes are "1BP\0".
+// A 1BP package (1bit-MONSTER's model format; DwarfStar's fork read version 5, its docs/1BP.md):
+// its first four bytes are "1BP\0". The reader went with --device ds4, so serve names the file
+// instead of handing it to llama.cpp, which would fail on the magic.
 bool onebp_file(const std::string& model) {
     std::ifstream f(model, std::ios::binary);
     char magic[4] = {};
     return f.read(magic, 4) && std::memcmp(magic, "1BP\0", 4) == 0;
-}
-
-// DwarfStar's ds4-server (third_party/ds4, MIT), built by scripts/build-ds4.sh
-std::string default_ds4() {
-    if (const char* e = std::getenv("ONEBIT_DS4"); e && *e) return e;
-#ifdef ONEBIT_DS4_SERVER
-    return built_path(ONEBIT_DS4_SERVER);
-#else
-    return "ds4-server";
-#endif
 }
 
 // SIGTERM / SIGINT: stop serving and take the backend down with us.
@@ -950,7 +944,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     std::vector<std::string>& argv = l.argv;
     std::vector<std::string>& env = l.env;
     std::string& set_model = l.set_model;
-    if (o.ssd_streaming && device != "ds4") throw std::runtime_error("--ssd-streaming works with --device ds4");
+    if (o.ssd_streaming_removed) throw std::runtime_error("--ssd-streaming was removed with --device ds4 (2026-11-02)");
     if (o.npu_streams != 1 && device != "npu") throw std::runtime_error("--npu-streams works with --device npu");
     if (o.npu_streams < 1 || o.npu_streams > 16)  // 16 = the device's hwctx limit (app/npu_device_lock.h)
         throw std::runtime_error("--npu-streams takes 1..16 (the device's hwctx limit), not " + std::to_string(o.npu_streams));
@@ -1067,25 +1061,9 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
             const std::string arch = gguf_architecture(o.model);
             if (arch == "qwen35" || arch == "qwen35moe" || arch == "qwen3next") argv.insert(argv.end(), {"-np", "1"});
         }
-    } else if (device == "ds4") {
-#ifndef ONEBIT_DS4_SERVER
-        // Owner decision 2026-11-01: DwarfStar is out of the shipped builds (ONEBIT_DS4=OFF) - it runs antirez's
-        // CUDA kernels through a HIP shim plus hipBLAS, not our HIP kernels. A build without it must say so here,
-        // not go looking for a `ds4-server` on PATH and fail with "no such file".
-        throw std::runtime_error(
-            "--device ds4: this build has no DwarfStar route (built with ONEBIT_DS4=OFF). DeepSeek V4.x, GLM 5.x and "
-            "Qwen3.8-Flash-Next run on --device hrx (docs/dwarfstar.md)");
-#else
-        // DwarfStar: its own GGUF layouts only; it opens its port after the model has loaded
-        argv = {o.ds4.empty() ? default_ds4() : o.ds4, "-m", o.model,
-                "--host", "127.0.0.1", "--port", std::to_string(child_port)};
-        if (o.ctx_size > 0) { argv.push_back("--ctx"); argv.push_back(std::to_string(o.ctx_size)); }
-        if (o.ssd_streaming) argv.push_back("--ssd-streaming");
-        l.ready_path = "/v1/models";
-#endif
     } else {
         refuse_removed_device(device);
-        throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx, cpu or ds4)");
+        throw std::runtime_error("--device " + device + " cannot run a .gguf (hrx or cpu)");
     }
     if (o.parallel == 1) {
         // one slot: llama-server's own default is several, and a second slot can share a batch
@@ -1095,7 +1073,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (o.parallel > 1) {
         // continuous batching: N requests decode together, one read of the weights per step
         // for all of them; llama-server splits --ctx-size across the slots
-        if (device == "ds4") throw std::runtime_error("--parallel works on the llama.cpp devices (hrx, cpu)");
         argv.insert(argv.end(), {"-np", std::to_string(o.parallel)});
         if (device == "hrx") {
             // HRX runs attention on the GPU only with one KV stream: -kvu shares one cache across
@@ -1120,8 +1097,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
     if (!o.mtp.empty() || !o.dflash.empty() || own_mtp) {
         // the MTP head (--mtp) or a DFlash block-diffusion draft model (--dflash) drafts tokens
         // on the same device; the model checks them in one batch
-        const char* flag = o.mtp.empty() ? "--dflash" : "--mtp";
-        if (device == "ds4") throw std::runtime_error(std::string(flag) + " works on the llama.cpp devices (hrx, cpu)");
         l.mtp = true;
         if (!o.mtp.empty()) argv.insert(argv.end(), {"--spec-type", "draft-mtp", "-md", o.mtp, "-ngld", "99"});
         else if (own_mtp) argv.insert(argv.end(), {"--spec-type", "draft-mtp"});  // the head is in -m (own_mtp_head)
@@ -1140,7 +1115,6 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (!o.mtp_p_min.empty()) { argv.push_back("--spec-draft-p-min"); argv.push_back(o.mtp_p_min); }
     }
     if (!o.mmproj.empty()) {
-        if (device == "ds4") throw std::runtime_error("--mmproj works on the llama.cpp devices (hrx, cpu)");
         // an image is decoded as one ubatch: models that attend to it bidirectionally (ZAYA1-VL,
         // Gemma 3) need all of it in one, and Qwen2.5-VL towers cap an image at 4096 tokens
         argv.insert(argv.end(), {"--mmproj", o.mmproj, "-b", "4096", "-ub", "4096"});
@@ -1653,21 +1627,16 @@ int serve_child(const Options& given) {
         std::fprintf(stderr, "1bit serve: %s is Hadamard-folded (prism.hadamard): HRX route\n", o.model.c_str());
     }
     if (onebp_file(o.model)) {
-        // DwarfStar (our fork) is the engine's 1BP reader; without it, a 1BP package has no route in this build
-#ifndef ONEBIT_DS4_SERVER
-        throw std::runtime_error(o.model + " is a 1BP package: this build has no DwarfStar route (ONEBIT_DS4=OFF). "
-            "Use a GGUF on --device hrx instead (docs/dwarfstar.md)");
-#endif
-        if (o.device == "auto") o.device = "ds4";
-        if (o.device != "ds4")
-            throw std::runtime_error(o.model + " is a 1BP package: it runs on --device ds4 (docs/dwarfstar.md)");
-        if (o.laya_auto || !o.laya_model.empty())
-            throw std::runtime_error("--laya routes among devices; a 1BP package runs on ds4 only");
+        // DwarfStar was the engine's only 1BP reader (docs/1BP.md v5); it went with --device ds4, so a
+        // 1BP package has no route at all now. Say that, with the way out, instead of letting llama.cpp
+        // fail on "1BP\0". Owner decision 2026-11-01 (out of the shipped builds), removal 2026-11-02.
+        throw std::runtime_error(o.model + " is a 1BP package: the engine no longer reads 1BP - its reader was "
+            "DwarfStar (--device ds4), which was removed. Convert the model to GGUF and serve it on --device hrx "
+            "(docs/serve.md)");
     }
     if (o.print_backend) {
         // --print-backend (docs/serve.md, "One hop from Lemonade"): only a lone llama-server can be
         // started by Lemonade itself; these need serve in the request path
-        if (o.device == "ds4") return serve_only("--device ds4 is not a llama-server");
         if (o.device == "hybrid") return serve_only("--device hybrid hands each prompt's KV to llama-server in serve");
         if (o.pm) return serve_only("--pm runs its tool loop in serve");
         if (o.laya_auto || !o.laya_model.empty()) return serve_only("--laya routes each request in serve");
@@ -2127,7 +2096,7 @@ int serve_child(const Options& given) {
     srv.Post("/v1/completions", post);
     // The rest of llama-server's API, for the devices that run llama-server (Lemonade's
     // llamacpp backend, which the onebit recipe inherits, forwards these to us). They go to
-    // the first backend; the NPU and DwarfStar answer 501.
+    // the first backend; the NPU answers 501.
     const bool llama = device == "hrx" || device == "cpu" || device == "hybrid" ||
                        (laya && (backends[0].device == "hrx" || backends[0].device == "cpu"));
     auto unsupported = [&](const httplib::Request& q, httplib::Response& r) {
@@ -2278,7 +2247,7 @@ int serve_child(const Options& given) {
             return 1;
         }
         if (!hrx_run)
-            // --device auto that landed on the CPU, an NPU directory, ds4: no HRX backend, so no
+            // --device auto that landed on the CPU, an NPU directory: no HRX backend, so no
             // placement report and nothing for either flag to check.
             std::fprintf(stderr, "1bit serve: %s: no HRX backend in this run, nothing to check\n",
                          o.strict == StrictDevice::On ? "--strict-device" : "--placement-report");
@@ -2335,7 +2304,7 @@ int serve_child(const Options& given) {
                             probe[port] = 1;
                             watch.alive(port);
                         } else if (probe[port] == 0) {
-                            probe[port] = -1;   // DwarfStar, or llama-server --no-slots
+                            probe[port] = -1;   // llama-server --no-slots
                         }
                     }
                 }
@@ -2645,7 +2614,7 @@ std::string repack_gguf_lane(const std::string& gguf, const std::string& lane_di
 void usage(FILE* out) {
     std::fprintf(out,
                  "usage: 1bit serve -m <model> [--port 8000] [--host 127.0.0.1]\n"
-                 "                  [--device auto|npu|hrx|hybrid|cpu|ds4] [--ctx-size N] [--alias NAME]\n"
+                 "                  [--device auto|npu|hrx|hybrid|cpu] [--ctx-size N] [--alias NAME]\n"
                  "                  [--llama-server PATH] [--hrx-libhsa PATH]\n"
                  "                  [--prefill-provider PATH]   --device hybrid: the program that prefills each prompt\n"
                  "                  (the NPU engine) and writes its KV for llama-server, which decodes it on HRX\n"
@@ -2653,7 +2622,6 @@ void usage(FILE* out) {
                  "                  [--hrx-cwsr-placement=auto|on|off]   engine#315: HRX backends get HSA_USE_SVM=0\n"
                  "                  HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1, which puts the CWSR save area in\n"
                  "                  GTT. auto (the default) always does this; off, or HRX_SVM=1, turns it off (docs/hrx.md)\n"
-                 "                  [--ds4 PATH] [--ssd-streaming]   DwarfStar (--device ds4; docs/dwarfstar.md)\n"
                  "                  [--mtp HEAD.gguf] [--mtp-max N] [--mtp-p-min P]   multi-token prediction (hrx, cpu)\n"
                  "                  [--precise]             re-prefill each request in full: follow-up turns come out\n"
                  "                                          identical to a cold run, at the cost of the TTFT (ONEBIT_PRECISE=1)\n"
@@ -2700,7 +2668,7 @@ void usage(FILE* out) {
                  "                  (or ONEBIT_STRICT_DEVICE=0) lets HRX leave such nodes on the CPU (engine #390)\n"
                  "                  [--print-backend]   print the llama-server serve would start (argv and env, one\n"
                  "                  JSON line) and exit: 0 printed, 3 does not fit, 5 the route needs serve itself\n"
-                 "                  (NPU, ds4, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
+                 "                  (NPU, --pm, --laya, --embed/--rerank); Lemonade's onebit recipe starts\n"
                  "                  it directly, one hop (docs/serve.md)\n"
                  "                  [--print-backend-env]   as --print-backend, but only the environment, one\n"
                  "                  NAME=VALUE line each (lemonade-hrx, stock Lemonade's HRX recipe: docs/lemonade.md)\n"
@@ -2735,8 +2703,8 @@ int run_serve(int argc, char** argv) {
         else if (a == "--llama-server") o.llama_server = next();
         else if (a == "--zinc")
             throw std::runtime_error("--zinc was removed with the engine's ZINC build (docs/serve.md)");
-        else if (a == "--ds4") o.ds4 = next();
-        else if (a == "--ssd-streaming") o.ssd_streaming = true;
+        else if (a == "--ds4") { (void) next(); throw std::runtime_error("--ds4 was removed with --device ds4 (2026-11-02)"); }
+        else if (a == "--ssd-streaming") o.ssd_streaming_removed = true;
         else if (a == "--hrx-libhsa") o.hrx_libhsa = next();
         else if (a == "--hrx-cwsr-placement") o.cwsr_placement = parse_cwsr_placement(next());
         else if (a.rfind("--hrx-cwsr-placement=", 0) == 0)
@@ -2808,7 +2776,7 @@ int run_serve(int argc, char** argv) {
     if (o.model.empty()) { usage(stderr); return 2; }
     if (o.watchdog.secs < 0 || o.watchdog.prompt_tps < 0)
         throw std::runtime_error("--watchdog and --watchdog-prompt-tps take a number >= 0 (0 turns it off)");
-    if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "ds4" || o.device == "npu"))
+    if (o.strict == StrictDevice::On && (o.device == "cpu" || o.device == "npu"))
         throw std::runtime_error("--strict-device needs --device hrx or auto: it refuses a graph that is not all on HRX");
     refuse_removed_device(o.device);
     // engine#315: --hrx-cwsr-placement=on in a build without the gate fails here, not at the first backend

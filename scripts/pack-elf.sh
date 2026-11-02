@@ -33,7 +33,7 @@
 #                                   libraries ldd cannot find (ROCR_VISIBLE_DEVICES=-1: nothing
 #                                   touches a GPU), except PACK_EXTERNAL_LIBS, the TheRock runtime
 #                                   the package documents as a requirement (HIP, hipBLAS(Lt),
-#                                   rocBLAS, HSA: DwarfStar's ds4 links them)
+#                                   rocBLAS, HSA: the HIP llama-server links them)
 #   pack_localize_links <dir>       every symlink under <dir> that is absolute or resolves outside
 #                                   <dir> becomes a copy of what it points to; links inside the tree
 #                                   (libggml.so -> libggml.so.0) stay links. Lemonade's build links

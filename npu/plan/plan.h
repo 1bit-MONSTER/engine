@@ -33,14 +33,14 @@
 //     "format": "1bit-npu-plan/1",
 //     "generated_by": "tools/npu_plan.py 1.0",
 //     "model":   {"hidden": 1024, "layers": 28, "arch": "qwen3"},
-//     "container": {"layout": "rm"|"b8", "chunk_kind": "mode0|mode1|mode2|pb16i", "pb16i": false},
+//     "container": {"layout": "rm"|"b8"|"pb16i"|"t2s", "chunk_kind": "mode0|mode1|mode2|pb16i", "pb16i": false},
 //     "fusion":  {"gate_up": "fused"|"split"},
 //     "prefill": {"M": 128},
 //     "decode":  {"M": 16, "enabled": true, "sealed_elf": "",
 //                 "dirs": [{"root": "model", "path": "kernels-m16"},
 //                          {"root": "kernels", "path": "m16"},
 //                          {"root": "kernels", "path": "."}]},
-//     "kernels": {"tag": ""},                                  // "" | "_b8" | "_pb16i"
+//     "kernels": {"tag": ""},                                  // "" | "_b8" | "_pb16i" | "_t2s"
 //     "moe":     {"batched_expert_gu": {"enabled": false, "K": 0, "N": 0}},
 //     "layers":  [{"index": 0, "role": "attn"|"gdn"|"moe"|"mla",
 //                  "qkv": {"K": 1024, "N": 1536, "fused": true},
@@ -112,12 +112,12 @@ struct Plan {
     int hidden = 0, layers = 0;
     std::string arch;
     // container
-    std::string layout = "rm";     // "rm" | "b8"
+    std::string layout = "rm";     // "rm" | "b8" | "pb16i" | "t2s"
     std::string chunk_kind;        // informational: mode0|mode1|mode2|pb16i
     bool pb16i = false;
     // kernel decisions that used to be filename probes
     bool fused_gu = true;          // "fused" vs "split" gate/up
-    std::string tag;               // "" | "_b8" | "_pb16i": the artifact-name suffix
+    std::string tag;               // "" | "_b8" | "_pb16i" | "_t2s" | "_t2s2": the artifact-name suffix
     int prefill_m = 0;             // 0 = not stated (the engine keeps its own default)
     int decode_m = 0;
     bool decode_enabled = true;
@@ -161,9 +161,9 @@ struct Plan {
             p.layout = c.value("layout", "rm");
             p.chunk_kind = c.value("chunk_kind", "");
             p.pb16i = c.value("pb16i", false);
-            if (p.layout != "rm" && p.layout != "b8" && p.layout != "pb16i")
+            if (p.layout != "rm" && p.layout != "b8" && p.layout != "pb16i" && p.layout != "t2s")
                 throw PlanError("plan: " + path + " container.layout \"" + p.layout +
-                                "\" is not rm, b8 or pb16i");
+                                "\" is not rm, b8, pb16i or t2s");
         }
         if (j.contains("fusion")) {
             const auto& fz = obj(j, "fusion", path);
@@ -177,9 +177,9 @@ struct Plan {
         if (j.contains("kernels")) {
             const auto& k = obj(j, "kernels", path);
             p.tag = k.value("tag", "");
-            if (p.tag != "" && p.tag != "_b8" && p.tag != "_pb16i")
+            if (p.tag != "" && p.tag != "_b8" && p.tag != "_pb16i" && p.tag != "_t2s" && p.tag != "_t2s2")
                 throw PlanError("plan: " + path + " kernels.tag \"" + p.tag +
-                                "\" is not \"\", \"_b8\" or \"_pb16i\"");
+                                "\" is not \"\", \"_b8\", \"_pb16i\", \"_t2s\" or \"_t2s2\"");
         }
         if (j.contains("decode")) {
             const auto& d = obj(j, "decode", path);
@@ -257,7 +257,12 @@ struct Plan {
             throw PlanError("plan: " + path + " names decode.sealed_elf but container.pb16i is false");
         if (p.tag == "_b8" && p.layout != "b8")
             throw PlanError("plan: " + path + " kernels.tag is _b8 but container.layout is " + p.layout);
-        if ((p.tag == "_pb16i") != p.pb16i)
+        if ((p.tag == "_t2s" || p.tag == "_t2s2") && p.layout != "t2s")
+            throw PlanError("plan: " + path + " kernels.tag is " + p.tag + " but container.layout is " + p.layout);
+        // _pb16i and _t2s are both the integer-exact ternary family (container.pb16i), and a plan
+        // that claims one without the other would pick artifacts the images cannot feed.
+        const bool ternary_tag = p.tag == "_pb16i" || p.tag == "_t2s" || p.tag == "_t2s2";
+        if (ternary_tag != p.pb16i)
             throw PlanError("plan: " + path + " kernels.tag \"" + p.tag + "\" and container.pb16i " +
                             (p.pb16i ? "true" : "false") + " disagree");
         return p;

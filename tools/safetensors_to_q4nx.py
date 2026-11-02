@@ -15,7 +15,7 @@
 # limitations under the License.
 """Repack a Hugging Face safetensors model into a Q4NX directory (docs/npu.md).
 
-usage: tools/safetensors_to_q4nx.py pack   <hf dir> <out dir> [--tokenizer <dir>]
+usage: tools/safetensors_to_q4nx.py pack   <hf dir> <out dir> [--tokenizer <dir>] [--dtype auto|bf16]
        tools/safetensors_to_q4nx.py verify <hf dir> <out dir>
        tools/safetensors_to_q4nx.py decision <hf dir> <out dir>
 
@@ -24,6 +24,12 @@ usage: tools/safetensors_to_q4nx.py pack   <hf dir> <out dir> [--tokenizer <dir>
 table, data.  Every 2-D tensor except the embedding becomes q4_1 tiles (I8 [tiles, 5120]) and
 norms, biases and the embedding stay bf16.  config.json is the model's own HF config with the
 two Q4NX fields added, and the tokenizer files are copied.
+
+`--dtype bf16` writes no tiles at all: every tensor keeps the source dtype (bf16, or the F32
+the transforms force).  That container is for measuring, not for serving -- quantization is
+what `--dtype auto` is for -- because it lets a run hold the weights fixed and ask whether the
+engine's forward and a reference agree (engine #796's parity row), and it makes the cost of
+q4_1 a separate, measurable delta instead of an unexplained one.
 
 Two name conventions exist and `--arch` picks one:
 
@@ -232,7 +238,8 @@ def pack(args):
             continue
         name, w, forced = got
         kind = (forced != "F32" and
-                (len(w.shape) == 1 or name in KEEP_BF16 or w.shape[0] % ROWS or
+                (args.dtype == "bf16" or len(w.shape) == 1 or name in KEEP_BF16 or
+                 w.shape[0] % ROWS or
                  (len(w.shape) == 2 and w.shape[1] % COLS)))
         if forced == "F32":
             flat = w.reshape(-1)
@@ -402,6 +409,9 @@ def main():
                                 "transforms; auto detects a language_model.* pack")
         if extra:
             p.add_argument("--tokenizer")
+            p.add_argument("--dtype", default="auto", choices=("auto", "bf16"),
+                           help="auto: q4_1 tiles where the shape allows (serving); bf16: no "
+                                "quantization, every tensor keeps its source dtype (measuring)")
             p.add_argument("--weight-layout", default="rm", choices=("rm", "b8"))
         p.set_defaults(fn=fn)
     args = ap.parse_args()

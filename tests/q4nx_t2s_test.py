@@ -23,6 +23,7 @@ from it must
   2. expand back to **the pb16i image's own int4 code bytes**, block for block, on every tile;
   3. decode back to the image's codes and multipliers, with the 128-K compaction losing no value;
   4. be reproduced byte for byte by `stream()` (GGUF-side input) and `from_pb16i_image()` (image-side input);
+  4b. and be reproduced from a **t2 container chunk** by `from_t2()` — the pb16i image is not required;
   5. refuse, with a named error, an image whose four 32-K multipliers inside a 128-K block are not equal;
   6. refuse a stream carrying the reserved 2-bit pattern.
 
@@ -37,6 +38,7 @@ ROOT = pathlib.Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(ROOT / "tools"))
 
 import q4nx_pb16i                                    # noqa: E402
+import q4nx_t2                                       # noqa: E402
 import q4nx_t2s as t2s                               # noqa: E402
 
 K, N = 512, 1024                                     # whole phase-B tiles, 4 k-chunks x 32 columns
@@ -96,6 +98,12 @@ def main():
     check("stream() == from_pb16i_image()", np.array_equal(st, st2))
     check("the side table is the pb16i one", np.array_equal(e_ref, e_ref2) and mode == mode2)
 
+    # 4b. the container alone is enough: a t2 chunk re-streams to the same bytes, no pb16i image
+    chunk = q4nx_t2.pack(codes.T.copy(), dbits.T.copy().view(np.float16))
+    diff = int(np.count_nonzero(np.frombuffer(chunk, np.uint8) != st.reshape(-1)))
+    check("t2 and t2s are different byte orders", bool(diff), f"{diff} of {st.size} bytes differ")
+    check("from_t2(t2 chunk) == from_pb16i_image()", np.array_equal(t2s.from_t2(chunk, K, N), st))
+
     # 5. an image whose 32-K multipliers differ inside a 128-K block is refused, not rounded
     bad = img.copy()
     flat = np.ascontiguousarray(bad[:, q4nx_pb16i.CODE_BYTES:]).view("<i2").reshape(tiles, 256).copy()
@@ -116,6 +124,30 @@ def main():
             check(f"reserved code refused by {name}", False, "no exception")
         except ValueError as ex:
             check(f"reserved code refused by {name}", "reserved" in str(ex))
+
+    # 7. wire format v2: the same weights, the same size, the same multipliers -- a different byte order inside
+    #    each 64-byte block, chosen so the kernel's plain two-store expansion is exact (no lane shuffle).
+    img = t2s.pack(codes, dbits, K, N)[0]
+    v1 = t2s.from_pb16i_image(img, K, N)
+    v2 = t2s.from_pb16i_image_v2(img, K, N)
+    check("v2 stream has the same size as v1", v1.shape == v2.shape, f"{v1.shape} vs {v2.shape}")
+    check("v2 stream is not the v1 stream (the order really changed)", not np.array_equal(v1, v2))
+    c1, m1 = t2s.decode(v1, K, N)
+    c2, m2 = t2s.decode_v2(v2, K, N)
+    check("decode_v2 recovers the same codes as decode", np.array_equal(c1, c2))
+    check("decode_v2 recovers the same multipliers", np.array_equal(m1, m2))
+    ref_c, ref_ms = t2s._split(np.asarray(img, dtype=np.uint8))
+    check("decode_v2 codes are the image's codes", np.array_equal(c2, ref_c))
+    check("v2 and v1 disagree only inside the code area (ms bytes identical)",
+          np.array_equal(v1[:, t2s.CODE_BYTES:], v2[:, t2s.CODE_BYTES:]) and
+          not np.array_equal(v1[:, :t2s.CODE_BYTES], v2[:, :t2s.CODE_BYTES]))
+    # the block algebra v2 is built on: operand byte b needs element 2b, and 2b = 16*(b/8) + 2*(b%8);
+    # byte 64+b needs 128 + 2b, i.e. 8 k rows down -- exactly what lanes 2/3 carry.
+    bb = np.arange(t2s.KC // 16 * 0 + 64)
+    k_lo, n0 = bb // 8, 2 * (bb % 8)
+    check("v2 lane0/1 land on operand element 2b", np.array_equal(16 * k_lo + n0, 2 * bb))
+    check("v2 lane2/3 land on operand element 2*(64+b)",
+          np.array_equal(16 * (k_lo + 8) + n0, 2 * (64 + bb)))
 
     print(f"\n{len(fails)} failure(s)")
     return 1 if fails else 0

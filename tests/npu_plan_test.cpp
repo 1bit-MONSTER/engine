@@ -122,6 +122,29 @@ void test_valid() {
     check(pp.pb16i && pp.tag == "_pb16i" && pp.sealed_elf == "pb16i_sealed.elf",
           "the pb16i family is read with its sealed ELF");
     check(pp.decode_dirs.size() == 2 && pp.decode_dirs[0].under_model, "a model-relative decode dir is kept");
+
+    // the t2s family: the same integer-exact ternary container, its own artifact tag, and no sealed
+    // ELF (its per-role `_t2s` kernels are the decode family, so the field stays empty by design)
+    auto t2 = base_plan();
+    t2["container"] = {{"layout", "t2s"}, {"chunk_kind", "pb16i"}, {"pb16i", true}};
+    t2["kernels"]["tag"] = "_t2s";
+    t2["decode"]["sealed_elf"] = "";
+    const Plan tp = Plan::load(write_plan("t2s", t2));
+    check(tp.pb16i && tp.tag == "_t2s" && tp.layout == "t2s" && tp.sealed_elf.empty(),
+          "the t2s family is read as ternary with its own tag and no sealed ELF");
+
+    // t2s wire format v2: the same weights in a different byte order, so it is a different artifact family
+    // (_t2s2) and a plan that names one cannot silently drive kernels built for the other
+    auto t22 = t2;
+    t22["kernels"]["tag"] = "_t2s2";
+    const Plan t2p = Plan::load(write_plan("t2s2", t22));
+    check(t2p.pb16i && t2p.tag == "_t2s2" && t2p.layout == "t2s",
+          "the t2s v2 family is read with its own tag");
+    auto bad2 = t2;
+    bad2["kernels"]["tag"] = "_t2s2";                      // but container.layout stays "pb16i"
+    bad2["container"] = {{"layout", "pb16i"}, {"chunk_kind", "pb16i"}, {"pb16i", true}};
+    check(has(refusal(write_plan("t2sv2wronglayout", bad2)), "kernels.tag is _t2s2 but container.layout is pb16i"),
+          "a _t2s2 tag on a pb16i container is refused by name");
 }
 
 void test_refusals() {
@@ -161,6 +184,19 @@ void test_refusals() {
         p["kernels"]["tag"] = "_b8";  // while container.layout stays "rm"
         check(has(refusal(write_plan("b8tag", p)), "kernels.tag is _b8 but container.layout is rm"),
               "a _b8 kernel tag on a row-major container is refused");
+    }
+    {
+        auto p = base_plan();
+        p["kernels"]["tag"] = "_t2s";  // while container.layout stays "rm"
+        check(has(refusal(write_plan("t2stag", p)), "kernels.tag is _t2s but container.layout is rm"),
+              "a _t2s kernel tag on a row-major container is refused");
+    }
+    {
+        auto p = base_plan();
+        p["container"] = {{"layout", "t2s"}, {"chunk_kind", "pb16i"}, {"pb16i", false}};
+        p["kernels"]["tag"] = "_t2s";
+        check(has(refusal(write_plan("t2snopb16i", p)), "and container.pb16i false disagree"),
+              "a t2s tag on a container that does not claim the ternary family is refused");
     }
     {
         auto p = base_plan();

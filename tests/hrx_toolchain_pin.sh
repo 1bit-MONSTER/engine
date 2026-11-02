@@ -15,8 +15,8 @@
 # limitations under the License.
 #
 # The pinned HRX toolchain (docs/hrx.md, "The toolchain"; engine#713): config/hrx-toolchain.config
-# names it, scripts/fetch-rocm-sdk.sh fetches and verifies it, and cmake/hrx.cmake,
-# scripts/build-ds4.sh and scripts/weekly.sh must all use that pin. No network and no SDK: the
+# names it, scripts/fetch-rocm-sdk.sh fetches and verifies it, and cmake/hrx.cmake and
+# scripts/weekly.sh must both use that pin. No network and no SDK: the
 # checks are the pin file's refusals, the completeness check against a fabricated tree, and that
 # every consumer still names the pin file (a build that quietly went back to /opt/rocm-therock
 # would pass every other test on the release box and fail on a fresh one).
@@ -66,10 +66,10 @@ got=$("$fetch" --check "$pin" "$fake" 2>/dev/null)
 echo "$version ${gfx}x" > "$fake/.pin"                          # same tree, another pin
 "$fetch" --check "$pin" "$fake" > /dev/null 2>&1 && bad "a tree at another pin was accepted" || ok "a tree at another pin is refused"
 
-# 4. every consumer uses the pin, not the box's /opt/rocm-therock: the two build entry points default
-#    to the tree copy, and the release run fetches the same pin into its own workdir (it passes the
+# 4. every consumer uses the pin, not the box's /opt/rocm-therock: cmake defaults to the tree copy,
+#    and the release run fetches the same pin into its own workdir (it passes the
 #    path to cmake explicitly, so the checkout it builds does not have to hold it)
-for f in cmake/hrx.cmake scripts/build-ds4.sh; do
+for f in cmake/hrx.cmake; do
     grep -q "third_party/toolchain" "$root/$f" && ok "$f defaults to the tree toolchain" ||
         bad "$f does not default to the tree toolchain (third_party/toolchain)"
 done
@@ -79,8 +79,6 @@ grep -q "fetch-rocm-sdk.sh" "$root/scripts/weekly.sh" && ok "scripts/weekly.sh f
 # glob takes whatever sorts first, and after a version bump that is the old one (pi-prs's review of #771)
 grep -q 'rocm-sdk-${_hrx_ver}-${_hrx_gfx}' "$root/cmake/hrx.cmake" && ok "cmake resolves the toolchain from the pin, not a glob" ||
     bad "cmake/hrx.cmake does not resolve the toolchain from the pin's version+gfx"
-grep -qF 'rocm-sdk-$(sed -n' "$root/scripts/build-ds4.sh" && ok "build-ds4.sh resolves the toolchain from the pin, not a glob" ||
-    bad "scripts/build-ds4.sh does not resolve the toolchain from the pin's version+gfx"
 grep -q "removing stale toolchain" "$root/scripts/fetch-rocm-sdk.sh" && ok "the fetch drops a stale sibling tree after a bump" ||
     bad "scripts/fetch-rocm-sdk.sh leaves a stale toolchain behind after a bump"
 # the HIP kernels are compiled by a separate amdclang++ invocation that does not inherit the llama.cpp

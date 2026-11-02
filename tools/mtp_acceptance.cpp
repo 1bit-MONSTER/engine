@@ -241,7 +241,7 @@ int main(int argc, char** argv) {
     std::string model_dir, head_exact, head_q4k;
     int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
-    bool residual = false, dry = false, selftest = false, offline = false;
+    bool residual = false, dry = false, selftest = false, offline = false, live = false;
     std::string gold;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
@@ -259,6 +259,7 @@ int main(int argc, char** argv) {
         else if (a == "--selftest-head") selftest = true;
         else if (a == "--gold") gold = nexts();
         else if (a == "--offline") offline = true;
+        else if (a == "--live") live = true;
         else if (a == "--fc-hidden-first") g_fc_hidden_first = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
@@ -329,6 +330,61 @@ int main(int argc, char** argv) {
     drafter.set_lm_head(!dry);
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
+
+    if (live) {
+        // The gate that matters for switching a serve over: the speculative loop must emit exactly the tokens
+        // plain greedy decode does, at fewer passes per token.
+        int bad = 0, tot_emitted = 0, tot_steps = 0, tot_batches = 0, tot_acc = 0, tot_draft = 0, tot_iter = 0;
+        for (int p = 0; p < prompts; p++) {
+            const int pi = prompt_base + p;
+            std::vector<int> ids;
+            for (int i = 0; i < 8; i++) ids.push_back((pi * 977 + i * 131 + 17) % (base.vocab() - 1) + 1);
+            // reference: plain greedy
+            fwd.reset();
+            std::vector<float> lg;
+            std::vector<int> plain;
+            for (size_t i = 0; i < ids.size(); i++)
+                if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+            int pos = (int)ids.size();
+            for (int t = 0; t < tokens; t++) {
+                int best = 0;
+                for (size_t i = 1; i < lg.size(); i++) if (lg[i] > lg[best]) best = (int)i;
+                plain.push_back(best);
+                if (!fwd.step(best, pos++, lg)) { std::fprintf(stderr, "step failed\n"); return 1; }
+            }
+            // the speculative loop on the same prompt
+            fwd.reset();
+            drafter.reset();
+            Options o;
+            o.k = k;
+            o.tau = tau;
+            o.max_tokens = tokens;
+            const Result r = run(base, &drafter, ids, o);
+            if (!r.ok) { std::fprintf(stderr, "prompt %d: %s\n", p, r.err.c_str()); return 1; }
+            const bool same = (r.tokens == plain);
+            if (!same) bad++;
+            tot_emitted += r.stats.emitted;
+            tot_steps += r.stats.steps;
+            tot_batches += r.stats.batches;
+            tot_acc += r.stats.accepted;
+            tot_draft += r.stats.drafted;
+            tot_iter += r.stats.iterations;
+            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f\n", p,
+                        same ? "TEXT IDENTICAL" : "TEXT DIVERGED", r.stats.emitted, r.stats.accepted,
+                        r.stats.drafted, r.stats.passes_per_token());
+            if (!same) {
+                std::printf("  plain:");
+                for (int t : plain) std::printf(" %d", t);
+                std::printf("\n  spec :");
+                for (int t : r.tokens) std::printf(" %d", t);
+                std::printf("\n");
+            }
+        }
+        std::printf("\n== live loop: %d/%d prompts text-identical, passes/token %.3f, accept-len %.2f, hit %.3f\n",
+                    prompts - bad, prompts, tot_emitted ? (double)(tot_steps + tot_batches) / tot_emitted : 0.0,
+                    tot_iter ? (double)tot_acc / tot_iter : 0.0, tot_draft ? (double)tot_acc / tot_draft : 0.0);
+        return bad ? 1 : 0;
+    }
 
     if (offline) {
         drafter.set_tau(tau);      // tau=0 measures every depth unconditionally, which is what the offline

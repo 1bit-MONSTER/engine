@@ -207,6 +207,12 @@ public:
     bool step_batch_all(const std::vector<int>& tokens, int start_pos,
                         std::vector<float>& logits_all);
 
+    // Public: a speculative driver outside this class begins a verify batch, then commits a prefix of it.
+    void begin_verify(int rows, int start_pos);
+    bool commit_verify_rows(int accepted);
+    bool gdn_apply_rows(int from, int to);      // recurrence-only replay of stored rows [from, to)
+
+
     // The last position's hidden state after the final norm, H floats: what a d3 readout head pools
     // (`pooling: last` in a pack's decision_config.json, npu/decision.h). Filled by the last
     // successful step() or step_batch(), empty before that. This is the vector the LM head reads, not
@@ -554,6 +560,24 @@ private:
     std::vector<std::vector<float>> conv_state_, rec_state_;  // [CD][CK-1], [nvh][khd][vhd]
     // One GDN token step: xn is the normed input; out gets the out_proj result.
     bool gdn_layer(int l, const std::vector<float>& xn, std::vector<float>& out);
+    // ---- deferred GDN commit (speculative verify) ------------------------------------------------
+    // A verify batch runs k draft rows through the layers, so the recurrence is advanced over rows the
+    // verifier may reject.  A snapshot is not affordable (per layer the recurrent state is
+    // NVH*KHD*VHD floats; for the 27B that is 3 MB x 48 layers) and attention needs no rollback at all
+    // (it is position-indexed).  So: snapshot once per verify batch, keep every row's conv + gate inputs
+    // as the batch runs, and on commit() restore and re-apply ONLY the accepted rows.  The re-apply is the
+    // recurrence alone -- no projections, no GEMMs -- which is why it is cheap compared with the passes it
+    // saves.
+    struct GdnRowIn {
+        std::vector<float> qkv;   // [CD] the conv input of this row (to advance the conv ring)
+        std::vector<float> ah, bh; // [NVH] the gate inputs, so the decay/beta are reproduced exactly
+    };
+    // verify-batch deferral (see begin_verify): the snapshots are taken once per batch and reused
+    bool verify_open_ = false;
+    int verify_rows_ = 0, verify_pos_ = 0;
+    std::vector<std::vector<float>> snap_conv_, snap_rec_;
+    std::vector<std::vector<GdnRowIn>> row_in_;   // [layer][row]
+
     bool gdn_layer_batch(int l, const std::vector<float>& xn, int M,
                          std::vector<float>& out);
     bool load_gdn_layer(int l);

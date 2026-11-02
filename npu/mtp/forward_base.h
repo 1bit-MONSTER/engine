@@ -42,12 +42,13 @@ public:
     bool step(int token, int pos, std::vector<float>& logits) override { return fwd_.step(token, pos, logits); }
 
     bool step_batch_all(const std::vector<int>& tokens, int start_pos, std::vector<float>& logits_all) override {
-        // snapshot first: commit_verify() restores the accepted prefix from here
-        snap_ = std::make_unique<Q4nxNpuForward::StateSnapshot>();
-        if (!fwd_.snapshot_state(start_pos, *snap_)) return false;
+        // The engine defers the GDN recurrence across the batch: it snapshots once and keeps each row's
+        // recurrence inputs, so commit_verify() re-applies only the accepted rows.  No state copy per
+        // iteration and no prefix restore (restore_state() refuses those on a GDN model).
+        fwd_.begin_verify((int)tokens.size(), start_pos);
         snap_pos_ = start_pos;
         pending_ = (int)tokens.size();
-        last_tokens_ = tokens;   // commit_verify() replays exactly these when it cannot defer
+        last_tokens_ = tokens;
         return fwd_.step_batch_all(tokens, start_pos, logits_all);
     }
 
@@ -56,20 +57,8 @@ public:
             std::fprintf(stderr, "[commit] refused: accepted %d, pending %d\n", accepted, pending_);
             return false;
         }
-        // Restore the state as it was before the verify batch, then replay the accepted rows so the
-        // recurrence advances exactly as far as they did (attention alone would need nothing).
-        if (!snap_) { std::fprintf(stderr, "[commit] refused: no snapshot\n"); return false; }
-        if (!fwd_.restore_state(*snap_, snap_pos_)) {
-            std::fprintf(stderr, "[commit] restore_state(%d of %d) refused: %s\n", snap_pos_, snap_->tokens,
-                         fwd_.last_error());
-            return false;
-        }
-        for (int i = 0; i < accepted; i++) {
-            std::vector<float> lg;
-            if (!fwd_.step(last_tokens_[(size_t)i], snap_pos_ + i, lg)) return false;
-        }
         pending_ = 0;
-        return true;
+        return fwd_.commit_verify_rows(accepted);
     }
 
     const std::vector<float>& last_hidden() const override {

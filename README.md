@@ -27,10 +27,20 @@ on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemona
 
 ## Get started
 
-1. Download `1bit-os-<version>.img.zst` from the [releases page](https://github.com/1bit-MONSTER/engine/releases).
-2. Write it to a USB stick (8 GB or more).
-3. Boot the machine from the stick. Secure Boot can stay on; the image is signed.
-4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run `1bit-install <disk> --yes` there and the 1bit appliance is on the disk ([os/v2/README.md](os/v2/README.md#the-live-medium-and-what-an-install-writes)).
+1. Download the 1bit OS image from the [releases page](https://github.com/1bit-MONSTER/engine/releases).
+2. Write it to a USB stick (16 GB or more: the image is about 9 GB).
+3. Boot the machine from the stick. Secure Boot can stay on: shim, grub, the kernel and its modules are
+   all signed with our MOK.
+4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run
+   `1bit-install <disk> --yes` there and the same system is on the disk.
+
+**1bit OS is a Puppy Linux appliance**: `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
+"resolute" base, with Lemonade Server and this engine embedded in it, running our MOK-signed
+`7.3.0-rc4-1bit-perfopt` kernel rather than the distribution's. It boots **headless** by default, to a
+console login with no X, and a second boot entry, `1bit OS (desktop)`, starts Puppy's desktop on the
+same system. The userland is an ordinary one - `bash`, `sudo` and `apt` work - and everything that has
+to last (models, Lemonade's config and cache, SSH keys) lives on the `1BIT-DATA` partition
+([os/README.md](os/README.md), [docs/os-v3.md](docs/os-v3.md)).
 
 Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the same releases page adds the engine as a Lemonade backend; nothing else changes ([docs/lemonade.md](docs/lemonade.md)).
 
@@ -49,6 +59,7 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 | 2026-10-25 | Microsoft BitNet b1.58 (TQ1_0 / TQ2_0) runs fully on HRX ([docs/models.md](docs/models.md)) |
 | 2026-10-30 | The HRX pin carries the DeepSeek-V4.1 port; ONNX Runtime runs in-process with our own execution provider on the NPU; the NPU and the GPU are measured running at the same time ([#672](https://github.com/1bit-MONSTER/engine/pull/672), [#647](https://github.com/1bit-MONSTER/engine/pull/647), [docs/hybrid.md](docs/hybrid.md)) |
 | 2026-11-01 | **v2026.44 is a draft**: candidate 19 is gated in software (1959/1959 kernel ops, NPU 82.03 tok/s, `VMTEST` pass through install and installed-disk boot, `VMTEST-RELEASE` 10 pass / 9 skip / 0 fail) but has **not** been booted or installed on hardware; candidate 20 takes the full gate, hardware boot and install included, before it is published ([docs/releases.md](docs/releases.md)) |
+| 2026-11-02 | **1bit OS becomes a Puppy Linux appliance**: `ResolutePup64` (woof-CE, Ubuntu 26.04 base) with our MOK-signed kernel, Lemonade and the engine embedded, headless by default with a `desktop` boot entry, `apt` and a persistent `1BIT-DATA`; it boots on the board with Secure Boot on ([docs/os-v3.md](docs/os-v3.md), [os/README.md](os/README.md)) |
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 

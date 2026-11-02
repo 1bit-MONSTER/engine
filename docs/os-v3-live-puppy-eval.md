@@ -20,6 +20,17 @@ The owner's direction (2026-11-01): build 1bit OS v3 on **Puppy Linux** instead 
 Puppy for both roles, the live/try stick and the installed system (frugal install on the NVMe with a
 persistent save layer), headless, with **our** kernel and **our** drivers, not the distribution's.
 
+> **Update (2026-11-02): the four blockers are closed and Puppy is 1bit OS.** `kernel-puppy.fragment`
+> is built into our kernel and the initrd finds and layers the SFS (G2 green); `amdxdna` and
+> `ec_su_axb35` are present, signed and verify against the enrolled MOK (G3 green); the save layer
+> persists across a reboot (G7 green, `PUPMODE=12` on `1BIT-DATA`); and `apt`, `sudo`, `sshd` and
+> `mokutil` are in the image, which was the one open question in Blocker 4. The appliance **booted on
+> the Max+ 395 with Secure Boot on** on 2026-11-02: 20 of `puppy-check`'s 25 rows PASS (the 5 that do
+> not are the cycle-12 list), Lemonade answers on `:13305` with its key, chat 70.49 tok/s, TTFT 1.30 s,
+> 0 `amdxdna` errors. It boots headless by default, with a second boot entry, `1bit OS (desktop)`, for
+> Puppy's JWM desktop. **Nothing is published**: the next release carries it. The body of this page is
+> kept as the measurement that decided it.
+
 This page is the measurement, and the recommendation. Everything below is measured on strixhalo
 (2026-11-01) or in QEMU here unless it says otherwise; the numbers that are not measured yet say so.
 

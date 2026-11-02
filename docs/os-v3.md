@@ -14,30 +14,38 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# 1bit OS v3 — the installed machine is an Ubuntu 26.04 Server
+# 1bit OS v3 — the Puppy Linux appliance
 
-## Two plans, and which one is the plan
+## Which plan is v3
 
-The owner's direction of 2026-11-01 makes **Puppy** the base of v3, for the live/try stick *and* the
-installed system (a frugal install with a persistent save layer), with our kernel and drivers. The
-evaluation — sizes, the glibc ceiling, the kernel config gap, the package inventory, the build recipe and
-the gates table — is `docs/os-v3-live-puppy-eval.md` (**PR #739**, which also carries the recipe in
-`os/v3/puppy/`; neither is in this PR).
+**Puppy is v3, and Puppy is 1bit OS.** It is `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
+"resolute" base, with our kernel (`7.3.0-rc4-1bit-perfopt`, MOK-signed), our drivers, the engine and
+Lemonade inside it. The same image is the live/try stick and the frugal install, `/data` is Puppy's save
+layer on `1BIT-DATA`, the userland is `bash`, `sudo`, `apt` and `sshd`, and it boots **headless by
+default** - a console login, no X - with a second boot entry, `1bit OS (desktop)`, for Puppy's desktop.
+Secure Boot stays on: shim → our MOK-signed grub → our MOK-signed kernel → our signed modules.
 
-**If that evaluation's gates pass, the Puppy plan below is v3.** It is a different *medium* with the
-same *design* as everything on this page: the same ESP chain (shim → our MOK-signed grub → our
-MOK-signed kernel), the same firmware boot entry (#709), the same install screen (#710), the same seed
-of identity (user, keys, which disk), and the same package *content* (our kernel and modules, the
-runtime, the engine, Lemonade, the units). What changes is how the system is laid out at boot: Puppy's
-initrd layers a read-only SFS under a save file instead of installing a root filesystem, which is also
-the answer to #706.
+The evaluation - sizes, the glibc ceiling, the kernel config gap, the package inventory, the build recipe
+and the gates table - is [os-v3-live-puppy-eval.md](os-v3-live-puppy-eval.md); the build recipe is
+[`os/v3/puppy/`](../os/v3/puppy/README.md); the page for what the appliance is, is
+[os/README.md](../os/README.md).
 
-**The Ubuntu Server `autoinstall` plan on this page is the documented fallback**, and it stays the
+Where it stands, measured 2026-11-01 and 2026-11-02: every blocker of the evaluation is closed or
+answered - `kernel-puppy.fragment` is built into our kernel (G2 green, the initrd finds and layers the
+SFS), `amdxdna` and `ec_su_axb35` are present, signed and verify against the enrolled MOK (G3 green), the
+save layer persists across a reboot (G7 green, `PUPMODE=12` on `1BIT-DATA`), and `sudo`, `apt`, `sshd`
+and `mokutil` are in the image - and the appliance **booted on the Max+ 395 with Secure Boot on**: 20 of
+`puppy-check`'s 25 rows PASS (the 5 that do not are the cycle-12 list), Lemonade answers on `:13305`
+with its key, chat 70.49 tok/s, TTFT 1.30 s, 0 `amdxdna` errors. **Nothing is published**: the next
+release carries it.
+
+**The Ubuntu Server `autoinstall` plan below is the documented fallback**, and it stays the
 reference for the parts both plans share. It is the fallback for two measured reasons: it has no
 dependency on a kernel rebuild (the Puppy plan needs `os/v3/puppy/kernel-puppy.fragment` built in, and
 that is one kernel gate away), and its userland brings sshd, apt, efivarfs, a normal user and
 `unattended-upgrades` for free, where the Puppy plan adds them as packages and runs as root by model.
-Neither plan is a redesign of the other; switching is a change of medium.
+Neither plan is a redesign of the other; switching is a change of medium. Everything from
+[The Ubuntu plan](#the-ubuntu-plan-the-fallback) to the end of the page is that plan.
 
 ## The Ubuntu plan (the fallback)
 
@@ -59,20 +67,18 @@ modules, TheRock's ROCm, the distro's XRT, the engine and Lemonade, and it serve
 
 ## What changes, and what stays
 
-| | today (`os/mini`) | v2 (`os/v2`, in tree, not shipped) | v3 |
+| | today (`os/mini`) | v2 (`os/v2`, in tree, not shipped) | v3 (Puppy, what ships) |
 |---|---|---|---|
-| live medium | BusyBox initramfs, everything in RAM | Ubuntu rootfs squashfs + our debs | **unchanged**: the `os/mini` image is the try-it medium |
-| installed system | the same initramfs on the ESP + a `/data` partition | squashfs unpacked to ext4, our debs preinstalled | **Ubuntu 26.04 Server, installed by subiquity `autoinstall`** |
-| updates | reflash the stick | `apt` from `1bit.gg/apt` | `apt` from `1bit.gg/apt`, unattended security updates on |
-| users | root only, keys from `/data/ssh` | root only, keys from `/data` | **`onebit` with sudo**, keys carried from the stick, root locked |
-| firmware entry | none (engine#709) | `efibootmgr -c` when it exists | **created, ordered, stale entries removed** (engine#709) |
-| efivarfs | absent (module never staged, engine#709) | present (`CONFIG_EFIVAR_FS=m`, systemd loads it) | present, and a `release-check` row for it |
-| console | BusyBox shell + `1bit-menu` | `1bit-menu` on tty1, autologin | `1bit-menu` on tty1 as a unit, ssh and ttyS0 stay plain |
-| headless | yes, but no server software | yes | **yes, and it is a server**: sshd, apt, users, `python3`, journald, `unattended-upgrades` |
+| live medium | BusyBox initramfs, everything in RAM | Ubuntu rootfs squashfs + our debs | **the Puppy SFS on the stick, with the save layer on `1BIT-DATA`** |
+| installed system | the same initramfs on the ESP + a `/data` partition | squashfs unpacked to ext4, our debs preinstalled | **a frugal install: the SFS on a partition, the save layer on `1BIT-DATA`** |
+| updates | reflash the stick | `apt` from `1bit.gg/apt` | **`apt` and PETget are in the image; the OS itself is replaced by a new SFS, the save layer stays** |
+| users | root only, keys from `/data/ssh` | root only, keys from `/data` | **`root` with `sudo`, keys carried from the stick, `sshd` on** |
+| firmware entry | none (engine#709) | `efibootmgr -c` when it exists | **written during the install with `efibootmgr`** (engine#709) |
+| efivarfs | absent (module never staged, engine#709) | present (`CONFIG_EFIVAR_FS=m`, systemd loads it) | **built in, mounted at boot** |
+| console | BusyBox shell + `1bit-menu` | `1bit-menu` on tty1, autologin | **headless: a console login on tty1, no X; the `desktop` boot entry starts Puppy's JWM desktop** |
 
-The live side deliberately does not move. `os/mini` has passed the QEMU A/R/I/B gate and the owner's
-board test for v2026.44; rewriting the try-it medium in the same release that rewrites the installed
-machine would put both at risk and prove less. The stick gains one partition and one menu entry.
+The `os/mini` row is the BusyBox image, and it stays what it is: the CI/VM target of the QEMU gates,
+not 1bit OS. The rest of this page is the Ubuntu fallback's detail.
 
 ## The stick
 

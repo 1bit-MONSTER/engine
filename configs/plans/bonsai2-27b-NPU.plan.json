@@ -123,7 +123,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -215,7 +215,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -307,7 +307,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -399,7 +399,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -491,7 +491,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -583,7 +583,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -675,7 +675,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -767,7 +767,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -859,7 +859,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -951,7 +951,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -1043,7 +1043,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -1135,7 +1135,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -1227,7 +1227,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -1319,7 +1319,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -1411,7 +1411,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {
@@ -1503,7 +1503,7 @@
    "role": "attn",
    "qkv": {
     "K": 5120,
-    "N": 8192,
+    "N": 14336,
     "fused": true
    },
    "gate_up": {

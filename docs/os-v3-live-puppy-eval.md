@@ -314,12 +314,57 @@ script that answers them, on a filesystem that can host its mounts — which is 
 boot entries and early microcode. The first ISO here was finished on the host from attempt 7's payload
 (above), and the second was built by the recipe alone.
 
-## The gates this evaluation would accept, and which of them are green
+## Where the appliance stands (2026-11-02 13:4x)
+
+This section is newer than the gate table below it and supersedes it where they differ: everything here was
+measured on the artifact that ships, a **GPT disk image** (not an ISO), booted under UEFI firmware in QEMU and
+driven over a serial root shell.
+
+**The artifact** (`os/v3/puppy/mkimage.sh <puppy-out-dir> <out-dir>`): `1bit-os-puppy.img`,
+**9,128,902,656 B**, sha256 `2d13c1835876eb6068…` — an ESP (shim → grub → `grub.cfg` with a serial terminal)
+plus a `1BIT-DATA` ext4 partition holding the frugal install at `/1bit` and os/mini's data contract. The ISO
+(`upup64r-26.04.iso`, 1,362,100,224 B, sha256 `d6319f1de2c473cc0e…`) is a side artifact for booting without a
+disk. `os/mini/prepare-stick.sh` runs on it **unchanged** and passes its ten assertions (grow `1BIT-DATA`,
+mint `LEMONADE_API_KEY` into `lemonade/lemond.conf` at 0600, write `ssh/authorized_keys` at 0600 root:root).
+
+**Rows measured on that image** (`os/v3/puppy/vm-check.sh`, QEMU + OVMF + serial shell):
+
+| row | evidence |
+|---|---|
+| U1 shell, sudo | `SHELL=/bin/bash`, bash 5.3.9(1), `sudo -n id -un` → root |
+| U1 apt | `apt update` + install over the LAN (`fastfetch` → `/bin/fastfetch`, `cowsay` → `/usr/games/cowsay`). **`neofetch` is not in the 26.04 archive at all** — measured on the box, both `apt-cache policy` and `apt-cache search` are empty — so U1's literal test command cannot pass on resolute for anyone; `fastfetch` is the packaged equivalent |
+| U3 Lemonade | key resolves to `/data/lemonade/lemond.conf`, `http=200` on `/api/v1/models` inside the guest **and** on the forwarded port with that key; `zz-onboard-ports` opens 13305 and 22 after `rc.firewall` |
+| U4 engine | `1bit 0.0.1` from `/usr/local/bin/1bit`, `/opt/1bit-package` with both launchers, `ADDLIST=ec_su_axb35` in the running image |
+| data contract | `/data` mounted (7.8 G, 1.3 G used), `/etc/1bit/lemond.conf` and `/etc/ssh/ssh_host_ed25519_key` both symlinked onto the partition |
+| U7 ssh | a completed login over the network with the key on the stick (`debug1: Exit status 0`) |
+| modules | `/lib/modules/<kver>` visible, `enp0s3` up, `10.0.2.15/24` leased by connman, default route |
+
+**Five defects found by booting it, none visible to a probe that only reads the image:**
+
+| # | defect | what it looked like | fix |
+|---|---|---|---|
+| 1 | the zdrv put modules at `/lib/modules` while 26.04 is usrmerged and the puppy SFS carries `lib -> usr/lib` | **no module could load**: `modprobe virtio_net`/`e1000` "not found in directory", `ls /lib/modules/<kver>` missing, only `lo`, so no NIC, no `amdgpu`, no `amdxdna` | tree at `usr/lib/modules` + firmware at `usr/lib/firmware`, with the zdrv's own `lib -> usr/lib` (`mk-huge-kernel.sh`) |
+| 2 | `3builddistro` starts with `rm -rf sandbox3/rootfs-complete` and rebuilds it from `rootfs-skeleton` | the ADDLIST edit and the embedded engine were **silently discarded**; the image booted and simply had neither | write into `rootfs-skeleton`; verify the packed SFS and `unsquashfs -cat MODULESCONFIG` (`build.sh`) |
+| 3 | Puppy's firewall is `-P INPUT DROP` with `tcp_inbound` RETURNing to that policy | LAN clients could not reach lemond while loopback answered 200; inserting one ACCEPT turned the outside request into a 401 | `zz-onboard-ports`, named to sort **after** `rc.firewall` |
+| 4 | `/etc/hosts.deny` = `ALL: ALL` with `/etc/hosts.allow` = `ALL: LOCAL`, and `LOCAL` means this machine | ssh closed at `kex_exchange_identification` while sshd listened on 0.0.0.0:22; lemond was unaffected because it is not libwrap-linked | the RFC1918 ranges appended to `hosts.allow` (the LAN, not the world) |
+| 5 | installed files carried the builder's uid (`cp -a` from a host bind mount) | `/root/.ssh/authorized_keys` was `ftp ftp`, so sshd's StrictModes accepted the connection and refused the key | `chown 0:0` on the installed trees, and again in `20onboard-ssh` before sshd starts |
+
+The general lesson, and the reason `vm-check.sh` exists: **an artifact probe cannot see any of these.** G3 as it
+was written ("the zdrv carries MOK-signed `amdxdna` with the right vermagic") was green on an image where no
+module could load at all. Reachability, ownership and module resolution are properties of the *running*
+system.
+
+**Still not run, on purpose:** G4 (Secure Boot with the swapped chain on the board), G5/G6 on hardware
+(HRX chat on the 8060S, the NPU through Lemonade, `1bit-release-check`), U2's desktop on the console/JetKVM,
+U5's device rows, U6 (installer to a second disk), U8 (boot time, idle RAM, recording), and the save layer
+across a real reboot (G7) — that one is testable in a VM next and is the last software row left.
+
+## The gates this evaluation would accept, and which of them are green (as first written)
 
 | gate | what | status |
 |---|---|---|
 | G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **green**: `build.sh` alone exits 0 and writes `upup64r-26.04.iso` **1,317,011,456 B**, sha256 `41e23602…6f857e` — our `vmlinuz` (`7.3.0-rc4-1bit-perfopt+`), a 127-entry initrd, four SFS, early AMD microcode, `isolinux` + an EFI `efi.img` with shim/grub/MokManager |
-| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red, measured on both built ISOs**: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
+| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **green now** — the fragment kernel layers the medium and reaches Puppy's userspace (see the section above); this row records what it was before the fragment |: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
 | G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
 | G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |
 | G5 | `lemond` + `1bit serve` run unchanged from the c18 tarball | **blocked by glibc on 24.04** (measured 2.43 vs 2.39); needs the resolute base |

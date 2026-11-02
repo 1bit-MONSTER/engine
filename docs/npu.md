@@ -119,7 +119,26 @@ per-dispatch chunk-address kernel takes (docs/npu.md, the DMA path in the engine
 Measured on `Qwen3-Coder-30B-A3B-Instruct-Q4_K_M.gguf` (qwen3moe, 48 layers, 128 experts,
 top-8, expert_ffn 768, no shared expert): 579 tensors, 144 expert stacks x 128 expert
 offsets, header 302,144 B, container 19,528,322,120 B (18.19 GiB) — 18.13 GiB of it routed
-experts. `verify` result: see the TMOE-NPU lane's state file.
+experts.
+
+**The top-8 boundary is razor thin.** Measured with the same router tensor on the same token, the
+container's weights against the GGUF's own f32 weights: **32 of 48 layers pick a different 8-expert
+set**, always at the 8th slot, because the margin between rank 8 and rank 9 is **1.2e-3 in
+probability in one and 2.9e-4 in the other** (layer 2: expert 25 at 0.021700 vs expert 125 at
+0.020511, and the reverse). A hidden state that differs by 0.5 % — what requantising the Q6_K
+tensors costs — is enough to swap it.
+
+**That is a symptom, not the whole story, and the difference matters when judging a kernel.**
+Re-running the same comparison with the container's routing *pinned* for the f32 pass — same expert
+ids and weights at every layer of every position — the log-prob difference does not shrink at all
+(mean |dlogp| 14.36 nats pinned against 14.29 unpinned, over 16 teacher-forced positions). So the
+routing flips are not what separates the two weight sources; the per-layer hidden state (cos
+0.993-0.9996) compounding through 48 layers is, and it changes which token wins a peaky position.
+Two things follow, and they are the operative rules here: compare implementations on **aggregate**
+quality (KLD over a corpus, perplexity), never single-token argmax or per-token log-probs; and gate
+a kernel with the **expert ids held fixed** (A row + the router's own top-k + the expected int32 per
+expert, which is what `tools/moe_expert_chunks.py gate` emits), so the gate measures the kernel and
+not the model's own sensitivity. `verify` result: see the TMOE-NPU lane's state file.
 
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
 `~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,
@@ -151,6 +170,66 @@ dequantizing anything: `tools/check_q4nx_dir.py <dir>` reads the container heade
 quantized tensor's chunk kind, and refuses an unknown chunk size or a tensor shorter than its layout
 needs. It cannot tell the two Q8 layouts apart ("Q4NX chunks", above), because the container does
 not record which one it holds.
+
+### From a Ryzen AI OGA NPU pack
+
+`1bit npu-pack import <pack dir> -o <out dir>` reads a pack AMD publishes for Ryzen AI
+(`*_rai_*_npu_*`: `model.onnx`, `model.onnx.data`, `dd_metastate_*.fconst`, `config.json`,
+`genai_config.json`, the tokenizer) and writes a model directory. `1bit npu-pack info <pack dir>`
+prints what the pack states as JSON and writes nothing. The pack's weights and its config/tokenizer
+contract are the model; the reader is written from the pack-side facts in
+`amd-oss/npu-re/docs/FACTS-oga-pack-weight-layout.md`, and no vendor library, wheel or compiled
+program is called or shipped.
+
+What converts, and how faithfully:
+
+| pack tensor | where | to | fidelity |
+|---|---|---|---|
+| `model.embed_tokens.weight` | `model.onnx.data`, fp16 | bf16 | fp16 → bf16 rounding (10 → 7 mantissa bits) |
+| `lm_head` `MatMulNBits` (bits 4, block 128, asym) | `model.onnx.data` | q4_1 tiles | codes unchanged; `scale = s` (exactly bf16 in this pack), `zero = -zp*s` (bf16 rounding) |
+| `input_layernorm`, `post_attention_layernorm` | `.fconst`, bf16 at a fixed offset | bf16 | byte-exact |
+| the 24 x 7 projections | `.fconst` | — | **refused**, see below |
+| `model.norm` (final) | — | — | **refused**, see below |
+| `sin_cache_cos_cache` | `model.onnx.data` | not imported | the lane computes RoPE from `rope_theta` (`fill_rope`) |
+
+An OGA pack keeps its tensors inside the `If` branches: the top-level graph has **no
+initializers** and four nodes (`Shape`/`Constant`/`Equal`/`If`). The importer walks the
+subgraphs. The 4-bit decode is `w = (code - zp) * scale` with two codes per byte (low nibble
+= even k) and two zero points per byte; that decoder is checked against the pack's own data,
+because `tie_word_embeddings` makes `dequant(lm_head)` reproduce the fp16 embedding:
+
+    corr 0.999999, relative error 0.00070 on all 151936 x 896 weights
+    controls: nibble-swapped corr -0.0008, no zero-point corr 0.8788   (both rejected)
+
+Two facts bound what the container can hold, and both are reported, not hidden:
+
+* **A bf16 zero does not always hold a f32 one.** A q4_1 chunk stores bf16 scale and zero. This
+  pack's scales are already bf16 values (0 % rounded), but `-zp*s` is bf16-exact for only
+  43.5 % of 32-column groups. The residual is that rounding: 3.34e-3 relative, 2.4e-4 absolute
+  on the dequantized weights, with no code moved. Read back through `q4nx::dequant_tile` the
+  container matches the pack to that bound.
+* **K is padded to the 256-column grid.** Qwen2.5-0.5B has hidden 896 = 3.5 tiles, so
+  `lm_head` and q/k/v/o are stored as 4 column tiles with the last one zero-padded (codes 0,
+  scale 0, zero 0). That is 12.5 % more bytes than the pack; the true K is in the container's
+  manifest and in `config.json`, and nothing reads a padding column as a weight.
+
+**Refusals are named, and a refusal writes nothing.** Without `--allow-incomplete`, a pack the
+importer cannot represent exits 3 and lists every tensor it refused with the reason, so a
+partial model never lands in a model directory by accident. With `--allow-incomplete` it writes
+what it can and records the rest in the container's `__metadata__` (`incomplete`) and in
+`config.json` (`q4nx_source.incomplete`). On the shipped `Qwen2.5-0.5B-Instruct_rai_1.8.0_npu_4K`
+that is **50 tensors, 18992 tiles** (embedding, head, 48 layer norms) and **169 refusals**: the
+24 x 7 projections, whose weights live only in the `.fconst` and whose 4-bit tile packing is not
+established (FACTS §3), and the final norm, whose 1,856-byte tail envelope turned out to be
+`[eps][pad][448 f32]` and not an RMSNorm weight on either `.fconst`.
+
+The norms that *are* imported sit at the documented offsets, each confirmed by the epsilon that
+opens its layer block: **48/48 anchors found**. `tests/npu_pack_import_test` (registered as
+`npu_pack_import`, and as `npu_pack_import_oga` when `-DONEBIT_OGA_PACK=<dir>` is given) checks
+the decode, the tiling against `tests/golden/oga_pack_tiles.bin` — written by
+`tools/oga_pack_tiles_golden.py` with the same layout `tools/gguf_to_q4nx.py` has always used —
+and, against a real pack, the refusal list, the self-check numbers and that the container opens
+with `npu::Model`.
 
 ### Cross-check against the official converter
 

@@ -61,10 +61,15 @@ public:
     // model.layers.<layer>.<suffix>
     const Tensor& layer(int layer, const std::string& suffix) const;
     const Tensor* find_layer(int layer, const std::string& suffix) const;
+    // The container's __metadata__ member `key` as JSON text, "" when it is absent. The header
+    // is kept as text so this header carries no JSON dependency; nlohmann parses it in the one
+    // place that needs a member (npu/moe.cpp reads "moe").
+    std::string metadata(const std::string& key) const;
 
 private:
     uint8_t* map_ = nullptr;
     size_t size_ = 0;
+    std::string header_;
     std::map<std::string, Tensor> tensors_;
     Dims dims_;
 };

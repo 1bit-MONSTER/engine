@@ -29,7 +29,9 @@
 # WEEKLY_REF (default main) is what build checks out; bumps always works on main.
 # WEEKLY_JOBS (default 4, what ~/lb/thermal-run.sh allows on Strix Halo) caps build parallelism; heavy steps wait for WEEKLY_MIN_FREE_GB (16).
 # Needs gh (logged in, allowed to merge on the engine, and able to read the private repositories
-# config/npu-runtime.config and config/gpu-kernels.config pin), TheRock in /opt/rocm-therock, and
+# config/npu-runtime.config and config/gpu-kernels.config pin), the pinned HRX toolchain (preflight
+# fetches it with scripts/fetch-rocm-sdk.sh at the pin in config/hrx-toolchain.config, so a build
+# needs nothing outside this repository), and
 # what the build scripts each list; preflight (at the end) checks the toolchain, hipcc, patchelf and the kernel image.
 set -euo pipefail
 
@@ -43,9 +45,17 @@ DRY=${WEEKLY_DRY_RUN:-0}
 # the box is shared: a capped build leaves room for whatever else runs on Sunday
 JOBS=${WEEKLY_JOBS:-4}
 export CMAKE_BUILD_PARALLEL_LEVEL=$JOBS
+# DwarfStar is out of the release (owner decision 2026-11-01): the build below defaults ONEBIT_DS4 to OFF, the
+# preflight reads ${ONEBIT_DS4:-OFF} and scripts/package-linux.sh requires the ds4 tools only when it is not OFF.
+# Exported here so all three read the same value from one place - a plain run (no ONEBIT_DS4 in the environment)
+# otherwise builds a no-DS4 engine and then fails at packaging looking for ds4 tools that were never built.
+export ONEBIT_DS4=${ONEBIT_DS4:-OFF}
 # the submodules the packages are built from (laya only on its bump)
 # (not xdna-driver: it pins the amdxdna kernel driver, which the release does not build)
 SUBMODULES=(hrx-system llama.cpp lemonade ds4 tokenizers)
+# the pinned HRX toolchain preflight fetches (scripts/fetch-rocm-sdk.sh, engine#713); empty when
+# the caller names its own with -DONEBIT_HRX_TOOLCHAIN in WEEKLY_CMAKE_ARGS
+HRX_TOOLCHAIN=
 mkdir -p "$LOGS"
 # pack_missing_libs (package_checks); this script's own copy, so it works before build checks out $SRC
 # shellcheck source=scripts/pack-elf.sh
@@ -123,6 +133,11 @@ build() {
     [ -d "$HOME/models/laya-pinned" ] && extra+=(-DONEBIT_LAYA_ROOT="$HOME/models/laya-pinned")
     # shellcheck disable=SC2206
     extra+=(${WEEKLY_CMAKE_ARGS:-})
+    # the pinned HRX toolchain preflight fetched (engine#713), unless the caller named another
+    case " ${WEEKLY_CMAKE_ARGS:-} " in
+        *ONEBIT_HRX_TOOLCHAIN=*) ;;
+        *) [ -n "$HRX_TOOLCHAIN" ] && extra+=(-DONEBIT_HRX_TOOLCHAIN="$HRX_TOOLCHAIN") ;;
+    esac
     # The NPU kernels (docs/releases.md, "The NPU engine"): sealed, packed beside 1bit in
     # npu/kernels. On by default (the npu gate phase passed on Strix Halo; WEEKLY_NPU_KERNELS=0
     # builds a package without them). The private checkout does the work through its one entry
@@ -136,14 +151,13 @@ build() {
         extra+=(-DONEBIT_NPU_PRIVATE="$W/npu-kernels" -DONEBIT_NPU_RELEASE=ON)
         say "NPU kernels $(git -C "$W/npu-kernels" rev-parse --short HEAD): $(ls "$BUILD/npu/kernels" | wc -l) sealed sets"
     fi
-    # ONEBIT_DS4=OFF builds without DwarfStar (third_party/ds4, `1bit serve --device ds4`). It is ON by
-    # default because the release ships that backend; the knob exists because the target needs hipCUB,
-    # hipBLAS, hipBLASLt and rocWMMA headers from ROCm, and a machine whose ROCm install lacks them
-    # cannot build it at all - better a declared, explicit build than a release that silently ships
-    # without the backend (2026-11-01: the rebuilt box's ROCm has no hipCUB headers).
+    # ONEBIT_DS4=OFF is the default since 2026-11-01: the release ships HIP kernels only (owner decision - the ds4
+    # route is antirez's CUDA kernels through a HIP shim plus hipBLAS, not our kernels), and the target needs
+    # hipCUB/hipBLAS/hipBLASLt/rocWMMA headers that a given ROCm install may not carry. ONEBIT_DS4=ON still builds
+    # it for the reference fork.
     cmake -S "$SRC" -B "$BUILD" -G Ninja -DCMAKE_BUILD_TYPE=Release \
         -DONEBIT_HRX=ON -DONEBIT_GPU_PRIVATE="$W/gpu-kernels" \
-        -DONEBIT_DS4=${ONEBIT_DS4:-ON} -DONEBIT_HF_TOKENIZERS=ON \
+        -DONEBIT_DS4=${ONEBIT_DS4:-OFF} -DONEBIT_HF_TOKENIZERS=ON \
         -DONEBIT_NPU=ON -DONEBIT_NPU_RUNTIME=own -DONEBIT_NPU_RT_DIR="$npurt" \
         -DONEBIT_SERVE_TEST_GGUF="$GGUF" "${extra[@]}" > "$LOGS/configure.log" 2>&1
     guard cmake --build "$BUILD" > "$LOGS/build.log" 2>&1
@@ -189,6 +203,9 @@ bump_check() {  # bump_check <branch>
         bump-laya/*)
             "$SRC/scripts/fetch-laya.sh" "$W/laya" > "$LOGS/laya.log" 2>&1
             "$SRC/tests/laya_route_e2e.sh" "$BUILD/1bit" "$W/laya" >> "$LOGS/laya.log" 2>&1 ;;
+        # DwarfStar is out of the shipped build since 2026-11-01 (ONEBIT_DS4 defaults to OFF); this arm stays for
+        # the reference fork (1bit-MONSTER/ds4). It needs hipCUB/hipBLAS/hipBLASLt/rocWMMA headers, which a given
+        # ROCm install may not carry - the release build no longer touches it.
         bump-ds4/*) DS4_TEST=1 guard "$SRC/scripts/build-ds4.sh" "$W/ds4-test" > "$LOGS/ds4.log" 2>&1 ;;
         *) : ;;  # xdna (the kernel driver pin), tokenizers: covered by build + ctest
     esac
@@ -591,21 +608,30 @@ preflight() {
     for s in $STAGES; do
         case "$s" in
             bumps|build)
-                # the HRX build's toolchain (cmake/hrx.cmake), unless WEEKLY_CMAKE_ARGS names another
+                # the HRX build's toolchain (cmake/hrx.cmake): the pinned copy fetched into the
+                # workdir, so a fresh box needs only this repository (scripts/fetch-rocm-sdk.sh,
+                # engine#713), unless WEEKLY_CMAKE_ARGS names another. Fetched here so a missing
+                # toolchain stops the run before stage one rather than an hour into the build.
                 case " ${WEEKLY_CMAKE_ARGS:-} " in
                     *ONEBIT_HRX_TOOLCHAIN=*) ;;
-                    *) [ -d /opt/rocm-therock ] ||
-                        { echo "preflight: no /opt/rocm-therock (the HRX toolchain): install TheRock there, or pass -DONEBIT_HRX_TOOLCHAIN=<dir> in WEEKLY_CMAKE_ARGS"; bad=1; } ;;
+                    *) if HRX_TOOLCHAIN=$("$(cd "$(dirname "$0")" && pwd)/fetch-rocm-sdk.sh" \
+                             "$(cd "$(dirname "$0")" && pwd)/../config/hrx-toolchain.config" "$W/hrx-toolchain" \
+                             2> "$LOGS/hrx-toolchain.log"); then :; else
+                           echo "preflight: cannot fetch the pinned HRX toolchain (config/hrx-toolchain.config): see $LOGS/hrx-toolchain.log"; bad=1
+                       fi ;;
                 esac
-                # DwarfStar (-DONEBIT_DS4=ON) builds with hipcc, found the way scripts/build-ds4.sh finds it
-                rocm=${ROCM_PATH:-}
-                if [ -z "$rocm" ]; then
-                    for d in /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
-                        [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
-                    done
-                fi
-                [ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||
-                    { echo "preflight: no ROCm with bin/hipcc for the DwarfStar build (scripts/build-ds4.sh): set ROCM_PATH"; bad=1; } ;;
+                # DwarfStar needs hipcc, but only when it is being built: since 2026-11-01 the release ships HIP
+                # kernels only, so a box without hipcc must still be able to build a release.
+                if [ "${ONEBIT_DS4:-OFF}" != OFF ]; then
+                    rocm=${ROCM_PATH:-}
+                    if [ -z "$rocm" ]; then
+                        for d in ${HRX_TOOLCHAIN:-} ${HRX_TOOLCHAIN:+"$HRX_TOOLCHAIN"/lib/python3*/site-packages/_rocm_sdk_core} /opt/rocm-therock/lib/python3*/site-packages/_rocm_sdk_devel /opt/rocm; do
+                            [ -x "$d/bin/hipcc" ] && { rocm=$d; break; }
+                        done
+                    fi
+                    [ -n "$rocm" ] && [ -x "$rocm/bin/hipcc" ] ||
+                        { echo "preflight: no ROCm with bin/hipcc for the DwarfStar build (scripts/build-ds4.sh): set ROCM_PATH, or build with ONEBIT_DS4=OFF (the release default)"; bad=1; }
+                fi ;;
             package)
                 # scripts/package-linux.sh rewrites RPATHs with patchelf
                 command -v patchelf > /dev/null ||

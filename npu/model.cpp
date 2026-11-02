@@ -48,6 +48,7 @@ Model::Model(const std::string& dir) {
     std::memcpy(&header, map_, 8);
     if (header > size_ - 8) throw std::runtime_error(path + ": header past the end of the file");
     const uint64_t base = 8 + header;  // <= size_
+    header_.assign(reinterpret_cast<const char*>(map_ + 8), header);
     const auto table = nlohmann::json::parse(map_ + 8, map_ + 8 + header);
     for (const auto& [name, t] : table.items()) {
         if (!t.is_object() || !t.contains("data_offsets")) continue;  // __metadata__
@@ -95,6 +96,15 @@ const Tensor* Model::find(const std::string& name) const {
 const Tensor& Model::tensor(const std::string& name) const {
     if (const Tensor* t = find(name)) return *t;
     throw std::runtime_error("model has no tensor " + name);
+}
+
+std::string Model::metadata(const std::string& key) const {
+    if (header_.empty()) return {};
+    const auto table = nlohmann::json::parse(header_);
+    const auto it = table.find("__metadata__");
+    if (it == table.end() || !it->is_object()) return {};
+    const auto member = it->find(key);
+    return member == it->end() ? std::string() : member->dump();
 }
 
 const Tensor* Model::find_layer(int layer, const std::string& suffix) const {

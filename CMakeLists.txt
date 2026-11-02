@@ -452,6 +452,9 @@ if(Python3_Interpreter_FOUND)
     # the gate itself needs the GPU and runs on Strix Halo (.github/workflows/hw-gate.yml)
     add_test(NAME hw_gate_judges COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/hw_gate_test.py)
     add_test(NAME q4nx_pb16i COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_pb16i_test.py)
+    # the t2 chunk kind (docs/npu.md "The t2 chunk kind"): synthetic only, because the real-model
+    # leg needs 14 GB of Bonsai-2 images. Run tests/q4nx_t2_test.py without --no-model for the gate.
+    add_test(NAME q4nx_t2 COMMAND ${Python3_EXECUTABLE} ${CMAKE_SOURCE_DIR}/tests/q4nx_t2_test.py --no-model)
     # the safetensors -> Q4NX converter and the d3 readout head it packs (engine #653): every
     # fixture is synthesised, so this needs numpy and nothing else — no gguf-py, no model, no
     # device, no download.
@@ -571,6 +574,12 @@ add_test(NAME npu_pb16i_layout
          COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.sh
                  ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}/npu/forward/include
                  ${CMAKE_SOURCE_DIR}/tests/npu_pb16i_layout_test.cpp)
+# The t2 chunk (npu/q4nx.h, "The t2 chunk kind"): the same kind of contract, but the thing under
+# test is the shipped decoder, so it compiles npu/q4nx.cpp as well.  No device, no model.
+add_test(NAME npu_t2_layout
+         COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_t2_layout_test.sh
+                 ${CMAKE_CXX_COMPILER} ${CMAKE_SOURCE_DIR}
+                 ${CMAKE_SOURCE_DIR}/tests/npu_t2_layout_test.cpp)
 # The host side of a MoE container: __metadata__.moe, per-expert chunk pointers and the router.
 # Crafted directories at run time, so CI needs no 18 GB model; with two arguments it checks the
 # same code against a real container and a gate.json from tools/moe_expert_chunks.py gate.

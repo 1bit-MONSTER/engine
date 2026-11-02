@@ -242,6 +242,18 @@ rows = [
        ("U6 efibootmgr", "efibootmgr 2>&1 | head -6; "
         "efibootmgr 2>&1 | grep -c '^BootCurrent:'; efibootmgr 2>&1 | grep -c '^Boot0'",
         "BootCurrent")] if os.environ.get("SBBOOT") == "1" else []),
+    # The boot path the 2 Nov board panic made into a gate. Both rows read the RUNNING boot, not the tree:
+    # (1) the boot media is PINNED on the command line, so init never scans another drive - the board's scan
+    #     had the JetKVM's USB mass storage and the internal NVMe's ESP in it; (2) the initrd's own /init
+    #     carries the rescue guard, so a failed boot writes /init-fail.log to 1BIT-DATA and keeps a console
+    #     instead of exiting PID 1 (kernel panic, "Attempted to kill init! exitcode=0x00000000"). init copies
+    #     /init* into /pup_new/initrd before switch_root, so /initrd/init is the file that actually ran.
+    ("boot pin",     "tr ' ' '\\n' < /proc/cmdline | grep '^pupsfs='; "
+                     "tr ' ' '\\n' < /proc/cmdline | grep -c '^pupsfs=1BIT-DATA$'", "pupsfs=1BIT-DATA"),
+    ("init guard",   "grep -c 'one_rescue' /initrd/init 2>/dev/null; "
+                     "grep -c '1bit: PID 1 must never exit' /initrd/init 2>/dev/null; "
+                     "grep -c \"trap 'one_rescue" /initrd/init 2>/dev/null; "
+                     "grep -c 'one_rescue 1' /initrd/init 2>/dev/null", None),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous

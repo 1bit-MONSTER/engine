@@ -373,6 +373,52 @@ nothing, so no row in this lane could have seen it. Three fixes, none of which l
 U5's device rows, U6 (installer to a second disk), U8 (boot time, idle RAM, recording), and the save layer
 across a real reboot (G7) — that one is testable in a VM next and is the last software row left.
 
+**The board's finding, 2026-11-02 16:3x — the seventh defect, and the one that took the machine down:** with the
+cycle-10 stick in the Max+ 395 the chain `shim -> Canonical GRUB -> our signed kernel` all worked and then, at
+**26.7 s**, the board said
+
+```
+Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000
+Comm: sh   PID 1
+```
+
+A **clean** exit code on PID 1 is the whole diagnosis: Puppy's init script EXITED. Its only failure path is
+
+```
+exec /bin/sh >/dev/console 2>&1          init:164, init:174, init:1519
+```
+
+and a shell whose console reads fail (or return EOF) exits 0 — so a boot that could not settle on its medium
+took the machine down, with no log and no console. The JetKVM screen at ~3 s showed three candidates for that
+medium in the same box: the JetKVM's own USB mass storage (3-2:1.6), the Gigastone stick (4-1), and the internal
+NVMe carrying the Ubuntu ESP. Cycle 10's grub entries said `pmedia=usbhd psubdir=1bit` and nothing else, i.e.
+init was left to scan them all.
+
+Two fixes, and neither is a gate lowered:
+
+| # | fix | where |
+|---|---|---|
+| a | **the boot media is pinned** on the kernel command line: `pupsfs=1BIT-DATA` sets Puppy's `PDRV`, and with `PDRV` set the init does not scan any drive at all (`LOOK_PUP` stays empty). `pupsfs`/`pdrv`/`pdev1` are init's own parameters, and the pinned form also gets a 15 s `blkid` retry, which covers USB enumeration. All three grub entries carry it | `mkimage.sh` |
+| b | **init can no longer exit**: `one_rescue` is installed with `trap 'one_rescue $?' EXIT`, and init's three `exec /bin/sh` failure paths are replaced by it — exec runs no EXIT trap, so the trap alone would not have covered the paths that actually fire. On failure it writes `/init-fail.log` (`/proc/cmdline`, `/tmp/bootinit.log`, `dmesg`) onto the `1BIT-DATA` partition and keeps a shell on the console for ever, re-spawning it if it exits | `patch-init.sh`, run by `build.sh` before `3builddistro` and verified again on the packed `initrd.gz`; `mkimage.sh` refuses an image without it |
+
+**Measured in QEMU, on the board's device set** (`os/v3/puppy/panic-repro.sh`: the artifact as a USB stick, a
+second disk with an ESP **and** an ext4 root like the board's NVMe, an extra USB mass-storage device like the
+JetKVM, Secure Boot ON from this machine's enrolled store — and `--no-media`, which pins a label that does not
+exist so the failure happens on purpose):
+
+| image | configuration | transcript |
+|---|---|---|
+| cycle 10 (no pin, no guard) | pin broken | `Finding puppy main sfs file. failed` → `Partition NO-SUCH-LABEL not found.` → `Error is too critical, dropping out to console...` → a shell at `~ #`. That is the board's 26.7 s moment: on the board that shell's reads returned and it exited 0, so PID 1 died. In QEMU the same shell blocks on read, which is why this half alone does not panic here |
+| **cycle 11** (pin + guard) | pin broken | **no panic**: `*** 1bit: init stopped (status 1) - logging, and this console stays`, `*** 1bit: log written to 1BIT-DATA:/init-fail.log`, console alive — and the file is really on the partition: **41,409 B** carrying the command line, `/tmp/bootinit.log` and `dmesg`, read back off the image afterwards |
+| **cycle 11** | normal, board's device set | boots to the appliance: all four SFS layered, `Loading user-selected modules... ec_su_axb35`, `Setting up services` — with `pupsfs=1BIT-DATA` on the command line, i.e. no drive scan at all |
+
+So the two halves of the board's failure are now covered from both sides: the pin removes the *need* to scan
+(which is what made the medium ambiguous), and the guard makes any remaining init failure a logged, live
+console instead of a machine-wide panic. `vm-check.sh` gained two rows that read the **running** boot rather
+than the tree — `boot pin` (`pupsfs=1BIT-DATA` on `/proc/cmdline`) and `init guard` (`/initrd/init`, the file
+that actually ran, carries `one_rescue`, the trap and all three guarded paths) — because an artifact probe
+cannot see either: G3 was green on both the unsigned kernel and this.
+
 ## The gates this evaluation would accept, and which of them are green (as first written)
 
 | gate | what | status |

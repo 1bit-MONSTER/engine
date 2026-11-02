@@ -81,6 +81,12 @@ else
     cp -L "$src/initrd.gz" "$work/initrd.gz"
 fi
 [ -s "$work/initrd.gz" ] || { echo "$prog: the initrd is empty - the build had no cpio" >&2; exit 1; }
+# The initrd's /init must carry the 1bit rescue guard (patch-init.sh): on the 2 Nov board boot PID 1 exited
+# cleanly through init's `exec /bin/sh` failure path and the kernel panicked at 26.7 s. This is the artifact
+# that ships, so it is checked here as well as in build.sh - an image whose init can exit is not shippable.
+"$(dirname "$0")/patch-init.sh" --verify "$work/initrd.gz" > /dev/null || {
+    echo "$prog: REFUSED: this initrd's /init can exit (PID 1 exit = kernel panic) - patch-init.sh" >&2
+    exit 1; }
 kver=$(file -b "$work/vmlinuz" | sed -n 's/.*version \([^ ]*\).*/\1/p')
 # The image the stick boots has to be signed: with Secure Boot on, shim -> grub verifies it and refuses an
 # unsigned one before init (board, 2 Nov: `error: bad shim lock signature`). mk-huge-kernel.sh refuses the
@@ -111,16 +117,21 @@ serial --unit=0 --speed=115200
 terminal_input serial console
 terminal_output serial console
 search --no-floppy --label 1BIT-DATA --set=root
+# The boot media is PINNED on the kernel command line: pupsfs=1BIT-DATA sets Puppy's PDRV, and with PDRV set
+# the init does not scan any drive at all (measured in the initrd: LOOK_PUP stays empty). Before this, the
+# 2 Nov board boot scanned the JetKVM's USB mass storage and the internal NVMe's ESP and could not settle on
+# one, then dropped to its `exec /bin/sh` failure path, whose shell read EOF, exited 0 and panicked PID 1 at
+# 26.7 s (panic-repro.sh reproduces the shape). PDRV also gets a 15 s blkid retry, which covers USB enumeration.
 menuentry "1bit OS (Puppy appliance, ${kver})" {
-    linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200
+    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - serial root shell (1bit.serial=1)" {
-    linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - no X, verbose (pfix=nox)" {
-    linux /1bit/vmlinuz pmedia=usbhd psubdir=1bit pfix=nox,fsck console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=nox,fsck console=tty0 console=ttyS0,115200 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 GRUBCFG

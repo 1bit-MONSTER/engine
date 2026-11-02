@@ -208,12 +208,25 @@ if [ -n "${PAYLOAD:-}" ]; then
     fi
 fi
 
+# The initrd /init must not be able to exit: on the 2 Nov board boot PID 1 exited cleanly through the
+# init script failure path and the kernel panicked at 26.7 s (Attempted to kill init, exitcode 0).
+# 3builddistro packs ../initrd-progs/0initrd (woof-code/3builddistro:649-657), so the guard goes into
+# that source BEFORE the packer runs - then the ISO and the disk image mkimage.sh builds both carry it,
+# and nothing depends on patching an artifact afterwards.
+echo "== init guard into the initrd /init"
+bash /recipe/patch-init.sh /work 2>&1 | sed "s/^/   /" || {
+    echo "build: REFUSED: could not install the 1bit init guard (patch-init.sh)" >&2; exit 1; }
+
 echo "== 3builddistro"; ./3builddistro release </dev/null
 # 3builddistro consumes rootfs-complete, so the image is checked where it exists now: in the SFS set that
 # sandbox3/build ships and that Puppy unions at boot. One listing of every SFS, each line sfs-name/path,
 # because the answer to "is sudo in the image" is bdrv (debootstrap base), not the main puppy SFS.
 compgen -G "sandbox3/build/*.sfs" > /dev/null || {
     echo "build: REFUSED: no SFS in sandbox3/build after 3builddistro" >&2; exit 1; }
+# the packed initrd has to carry the guard too: patch-init.sh patched the source, this is the archive
+# 3builddistro actually produced, and it is the one mkimage.sh puts on the stick.
+bash /recipe/patch-init.sh --verify sandbox3/build/initrd.gz 2>&1 | sed "s/^/   /" || {
+    echo "build: REFUSED: the packed initrd lost the 1bit init guard" >&2; exit 1; }
 listing=$(for f in sandbox3/build/*.sfs; do
     unsquashfs -l "$f" 2>/dev/null | sed -n "s|^squashfs-root/|$(basename "$f")/|p"
 done | sort -u)

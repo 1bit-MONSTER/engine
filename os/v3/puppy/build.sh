@@ -185,7 +185,8 @@ if [ -n "${PAYLOAD:-}" ]; then
     # the HRX row of release-check.sh asks for ${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
     # (os/mini/release-check.sh:454), which is the path os/mini uses for the same binary the package keeps in
     # 1bit/hrx/llama/bin. One compatibility symlink, so the check reads the appliance without being told
-    # a new path - pi-release asked for exactly this.
+    # a new path - pi-release asked for exactly this. The check asserts the symlink and the real file
+    # separately: a path THROUGH a symlink is not a path in the squashfs.
     ln -sfn /opt/1bit-package/1bit/hrx/llama/bin "$skeleton/opt/1bit-llama"
     # root owns them: /recipe is a host bind mount, so cp -a carries the host uid into the squashfs and
     # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
@@ -237,7 +238,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              etc/init.d/10lemonade \
              usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
              etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
-             opt/1bit-llama/llama-server; do
+             opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }

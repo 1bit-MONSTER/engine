@@ -220,8 +220,13 @@ s.sendall(b"\n")
 rows = [
     # Secure Boot is what the board runs: the chain shim -> grub -> kernel has to verify, and the guest has to
     # agree that it did. Only present when the VM booted with sb-vars.sh's store - a -kernel boot cannot.
-    *([("sb state", "mokutil --sb-state 2>&1 | head -2; dmesg | grep -i 'secure boot' | head -3",
-        "SecureBoot enabled")] if os.environ.get("SBBOOT") == "1" else []),
+    # the marker has to be printed by the guest, not matched inside mokutil's own wording: on this image
+    # efivarfs is not mounted at row time, so mokutil says "EFI variables are not supported" while the
+    # KERNEL says "Secure boot enabled" and logs the enrolled certificate it loaded - which is the evidence
+    *([("sb state", "mokutil --sb-state 2>&1 | head -2; dmesg | grep -i 'secure boot' | head -3; "
+        "dmesg | grep -i 'integrity: Loaded X.509' | head -2; "
+        "dmesg | grep -qi 'secure boot enabled' && echo SB-ENABLED-AT-BOOT",
+        "SB-ENABLED-AT-BOOT")] if os.environ.get("SBBOOT") == "1" else []),
     ("U1 shell",     "echo SHELL=$SHELL; command -v bash; bash --version | head -1", "bash"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
@@ -281,7 +286,7 @@ rows = [
     # the two paths pi-release asked for, asserted on a booted image rather than in a listing
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
                       "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
-    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels | tr '\n' ' '", None),
+    ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
     # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
     # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
     # these two lines say whether that was the listener or the interface.

@@ -118,9 +118,33 @@ if artifact.endswith(".img"):
         s.sendall(b"\x1b[B\r")
         print("INFO boot           grub menu on serial, selected the serial-shell entry", flush=True)
 
-# The service prints this itself, so its arrival means the port is a shell and not just kernel log.
-if read_until(b"21serial-console: root shell on ttyS0", 240) is None:
-    print("FAIL boot           no serial shell: the image has no 21serial-console, or it never ran", flush=True)
+# Wait for the shell itself, not only for the service's banner: on the cycle-4 image the shell came up and
+# answered (root@puppypc31992:/$) while the banner never reached ttyS0, because rc.services' stdout at that
+# point is not the console. Either evidence is enough, and a bare newline coaxes a prompt out.
+def wait_shell(timeout):
+    global buf
+    stop = time.time() + timeout
+    last_nudge = 0.0
+    while time.time() < stop:
+        if b"21serial-console: root shell on ttyS0" in buf or \
+                re.search(rb"root@[^\r\n]{0,80}[$#] ", buf):
+            return True
+        if time.time() - last_nudge > 10:
+            s.sendall(b"\n"); last_nudge = time.time()
+        s.settimeout(0.5)
+        try:
+            d = s.recv(65536)
+        except socket.timeout:
+            continue
+        except OSError:
+            return False
+        if not d:
+            return False
+        log.write(d); buf += d
+    return False
+
+if not wait_shell(240):
+    print("FAIL boot           no serial shell: no 21serial-console in the image, or it never ran", flush=True)
     sys.exit(2)
 
 rows = [

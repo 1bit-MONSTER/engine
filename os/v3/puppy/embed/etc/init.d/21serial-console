@@ -25,4 +25,5 @@
 # (GRUB edit, or the QEMU -append). Without it this script does nothing.
 grep -q '1bit.serial=1' /proc/cmdline 2>/dev/null || exit 0
 setsid sh -c 'exec /bin/sh -l < /dev/ttyS0 > /dev/ttyS0 2>&1' &
-echo "21serial-console: root shell on ttyS0 (1bit.serial=1 on the command line)"
+# said on ttyS0 directly: rc.services' stdout at this point is not necessarily the console
+echo "21serial-console: root shell on ttyS0 (1bit.serial=1 on the command line)" > /dev/ttyS0

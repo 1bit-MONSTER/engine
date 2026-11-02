@@ -585,14 +585,50 @@ int main(int argc, char** argv) {
                 matched.add(m);
                 std::printf("  match p%d: %zu offline chains at this loop's own positions (stream %zu rows)\n", pi,
                             pos_list.size(), hid_plain.size());
+                // Three estimators live in this file and mixing them has already cost this lane two false alarms
+                // (13:40, 15:22), so name them here once:
+                //   marginal      P(draft d is the model's choice) at every position  -- the published 3.19 (d_*);
+                //   conditional   P(draft d | the prefix was accepted)               -- offline c_*, the drafter's
+                //                                                                     quality per depth;
+                //   joint         P(the whole chain 0..d was accepted)              -- the loop's accepted_at[d]/
+                //                                                                     drafted_at[d], which is a
+                //                                                                     survival curve, not a rate.
+                // The loop's per-depth acceptance is CONDITIONAL on reaching the depth (that is what a serve wants:
+                // how often does draft d get taken when the chain got there), so compare it with offline's c_*.
                 for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
-                    const double lv = r.stats.drafted_at[d] ? 100.0 * r.stats.accepted_at[d] / r.stats.drafted_at[d] : 0.0;
-                    const double of = m.d_tot[d] ? 100.0 * m.d_hit[d] / m.d_tot[d] : 0.0;
-                    const double delta = lv - of;
-                    std::printf("    depth %d: live %6.2f %% (%d/%d)  offline %6.2f %% (%d/%d)  delta %+6.2f pp%s\n", d + 1,
-                                lv, r.stats.accepted_at[d], r.stats.drafted_at[d], of, m.d_hit[d], m.d_tot[d],
-                                delta, (delta <= 2.0 && delta >= -2.0) ? "" : "  > 2 pp");
+                    const double joint = r.stats.drafted_at[d] ? 100.0 * r.stats.accepted_at[d] / r.stats.drafted_at[d] : 0.0;
+                    const int reached = d ? r.stats.accepted_at[d - 1] : r.stats.drafted_at[0];
+                    const double lv = reached ? 100.0 * r.stats.accepted_at[d] / reached : 0.0;
+                    const double oc = m.c_tot[d] ? 100.0 * m.c_hit[d] / m.c_tot[d] : 0.0;
+                    const double om = m.d_tot[d] ? 100.0 * m.d_hit[d] / m.d_tot[d] : 0.0;
+                    const double delta = lv - oc;
+                    std::printf("    depth %d: live %6.2f %% (%d/%d, reached)  offline conditional %6.2f %% (%d/%d)"
+                                "  delta %+6.2f pp%s   [live joint %6.2f %%, offline marginal %6.2f %%]\n",
+                                d + 1, lv, r.stats.accepted_at[d], reached, oc, m.c_hit[d], m.c_tot[d],
+                                delta, (delta <= 2.0 && delta >= -2.0) ? "" : "  > 2 pp", joint, om);
                 }
+                // ...and the form that needs no estimator at all: per chain position, how many drafts were accepted
+                // before the first refusal.  Identical machinery must give identical prefix lengths at every
+                // position, and a difference names its position and both lengths.
+                int pref_same = 0, pref_diff = 0, ppos = -1, plive = -1, poff = -1;
+                for (size_t n = 0; n < r.stats.chain_at.size() && n < r.stats.chain_accepted.size(); n++) {
+                    const int i = r.stats.chain_at[n] - 1;
+                    const int cap = std::min<int>(k, (int)stream.size() - 1 - i);
+                    if (cap <= 0) continue;
+                    int run = 0;
+                    for (int d = 0; d < cap; d++) {
+                        const size_t idx = n * (size_t)k + (size_t)d;
+                        if (idx >= ohits.size() || ohits[idx] == 0) break;
+                        run++;
+                    }
+                    const int lv = std::min<int>(r.stats.chain_accepted[n], cap);
+                    if (lv == run) pref_same++;
+                    else { pref_diff++; if (ppos < 0) { ppos = r.stats.chain_at[n]; plive = lv; poff = run; } }
+                }
+                std::printf("    accepted-prefix length equal at %d of %d positions", pref_same, pref_same + pref_diff);
+                if (ppos >= 0) std::printf(", first difference at stream position %d: live %d, offline %d", ppos,
+                                           plive, poff);
+                std::printf("\n");
                 // Per-(position, depth) diff.  The aggregates can only say "less"; the drafts say WHICH:
                 //   * same draft token, different verdict -> the verification/feeding path disagrees with the
                 //     protocol on the same computation (a real loop defect, and here is its position);
@@ -626,7 +662,7 @@ int main(int argc, char** argv) {
                         }
                     }
                 }
-                std::printf("    pairs %d: accepted live %d, offline %d; draft tokens differ %d; verdicts differ %d"
+                std::printf("    pairs %d: accepted live %d, offline %d (marginal); draft tokens differ %d; verdicts differ %d"
                             " (%d of them on the SAME draft token)\n",
                             pairs, live_hit, off_hit, tok_diff, verdict_diff, verdict_diff_same_tok);
                 if (fpos >= 0)
@@ -660,15 +696,17 @@ int main(int argc, char** argv) {
             // The brief's clause, measured instead of argued: the same drafter on the same stream at the same
             // positions, so the only difference left is how the live loop feeds it.
             int over = 0;
-            std::printf("   == live vs offline at the SAME positions (the 2 pp bar):\n");
+            std::printf("   == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching"
+                        " the depth (the 2 pp bar):\n");
             for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
-                const double lv = draft_live[d] ? 100.0 * acc_live[d] / draft_live[d] : 0.0;
-                const double of = matched.d_tot[d] ? 100.0 * matched.d_hit[d] / matched.d_tot[d] : 0.0;
+                const int reached = d ? acc_live[d - 1] : draft_live[0];
+                const double lv = reached ? 100.0 * acc_live[d] / reached : 0.0;
+                const double of = matched.c_tot[d] ? 100.0 * matched.c_hit[d] / matched.c_tot[d] : 0.0;
                 const double delta = lv - of;
                 const bool ok = (delta <= 2.0 && delta >= -2.0);
                 if (!ok) over++;
                 std::printf("     depth %d: live %6.2f %% (%d/%d)  offline %6.2f %% (%d/%d)  delta %+6.2f pp  %s\n",
-                            d + 1, lv, acc_live[d], draft_live[d], of, matched.d_hit[d], matched.d_tot[d], delta,
+                            d + 1, lv, acc_live[d], reached, of, matched.c_hit[d], matched.c_tot[d], delta,
                             ok ? "PASS" : "FAIL");
             }
             std::printf("   %d of %d depths within 2 pp at the same positions\n",

@@ -183,6 +183,18 @@ smaller design.
 divided by `repeats`. The figures above are the corrected ones, and `repeats < 2` — which used to print
 `device 0.000 ms/call` and a four-digit speedup — is now refused with exit 2.)*
 
+**What `gemm_q8` does with that number.** It routes by rows: below `kDeviceMinRows` — 16, declared once in
+`onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array; at or above
+it the device does. 16 is the first row count at which **no** measured projection shape was slower on the
+array, so the threshold is one constant rather than one per (K, N). A host-routed call is a choice, not a
+failure, and it does not look like one: it writes
+`npu_qdq_host_rows m=… k=… n=… min=16` to the trace. "The device ran this shape" therefore stays exactly
+"neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it" — an assertion a green `|d| = 0` line
+alone has never been (see `docs/onnx-pack.md`). `onebit_ep_qdq_proof` asserts the routing of *every* fused case
+against that same constant, so a decode-width routing regression and a prefill-width one fail in different
+places: with designs configured, `quark-stress` (64×1024×2048) must reach the device and every 5–8 row case must
+log `npu_qdq_host_rows`.
+
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the
 life of the process; when the lock is held it does not queue — it reports `device busy` and runs the

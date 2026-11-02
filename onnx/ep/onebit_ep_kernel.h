@@ -42,6 +42,14 @@ bool gemm_f32(const float* a, const float* b, float* c, int64_t m, int64_t k, in
 // from the same int8 bytes): npu/ort's gemm_q8_raw writes the int8 activations and weights straight
 // into the kernel's BOs and hands back int32, and the epilogue below is shared by both paths.
 //
+// A device call is dispatch-bound: 1.4-1.5 ms whatever the row count (docs/onnx.md), so below a few rows the
+// launch costs more than the host loop it replaces. `kDeviceMinRows` is the first row count at which no
+// measured Qwen3-0.6B projection shape was slower on the array, and gemm_q8 uses the host loop below it
+// whatever designs are configured. It applies only with ONEBIT_EP_NPU. A host-routed call is not a
+// fallback: it logs `npu_qdq_host_rows`, so the absence of both that line and `npu_qdq_fallback` is what
+// still means "the device ran this shape".
+inline constexpr int64_t kDeviceMinRows = 16;
+
 // Asymmetric zero points do not cost a second pass. Writing the shifted product out,
 //
 //   Sum_k (a-zx)(w-zw) = Sum_k a*w  -  zx*Sum_k w  -  zw*Sum_k a  +  K*zx*zw

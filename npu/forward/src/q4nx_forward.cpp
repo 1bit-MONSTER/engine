@@ -1948,6 +1948,13 @@ bool Q4nxNpuForward::commit_verify_rows(int accepted) {
     }
     for (size_t l = 0; l < conv_state_.size(); l++) conv_state_[l] = snap_conv_[l];
     for (size_t l = 0; l < rec_state_.size(); l++) rec_state_[l] = snap_rec_[l];
+    // The accepted prefix is the only thing a drafter may advance over: drop the rejected rows' hidden here, so
+    // that last_hidden_rows() is exactly `accepted` rows starting at verify_pos_.  Leaving all verify_rows_ made
+    // the draft loop's own size check fail, and it skipped the drafter advance without a word.
+    if (verify_rows_ > 0 && !last_hidden_rows_.empty()) {
+        const size_t stride = last_hidden_rows_.size() / (size_t)verify_rows_;
+        last_hidden_rows_.resize(stride * (size_t)accepted);
+    }
     verify_open_ = false;                        // the replay below must not re-record
     if (accepted > 0 && !gdn_apply_rows(0, accepted)) return false;
     for (auto& v : row_in_) v.clear();

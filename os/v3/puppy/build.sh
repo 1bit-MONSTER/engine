@@ -83,6 +83,19 @@ case ",$mnt_opts," in
     ;;
 esac
 [ -f "$woof/merge2out" ] || { echo "build: no woof-CE at $woof - clone https://github.com/puppylinux-woof-CE/woof-CE there, or pass the directory as the 4th argument" >&2; exit 1; }
+# The same trap one level in: $HOME/wt/woof-CE is a symlink into the build root on this box, and container-build.sh
+# starts with `rm -rf /work/woof-CE; cp -a /woof /work/woof-CE` - so a /woof that RESOLVES inside the build root
+# is the directory the copy is writing to, and those two lines empty the clone they are copying from. Measured on
+# 2026-11-03 (cycle-17 build): an empty root-owned woof-CE and a failure three lines later at "no such file
+# woof-code/3builddistro", which reads like an upstream change and is really a self-copy.
+woof_real=$(cd "$woof" 2>/dev/null && pwd -P) || { echo "build: cannot resolve $woof" >&2; exit 1; }
+case "$woof_real/" in
+"$build_root"/*)
+    printf 'build: REFUSED: %s resolves to %s, inside the build root %s; the container would copy that directory into\n' \
+        "$woof" "$woof_real" "$build_root" >&2
+    printf 'build:           itself and empty it. Pass a woof-CE clone that lives outside the build root (4th argument).\n' >&2
+    exit 1 ;;
+esac
 kernel=$(cd "$kernel" && pwd)
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
     echo "build: no huge-*.tar.* in $kernel (run mk-huge-kernel.sh first)" >&2; exit 1; }

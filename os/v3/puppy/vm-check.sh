@@ -84,6 +84,15 @@ net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$hostport"-:13305,hostfwd=tcp:127
      -device virtio-net-pci,netdev=n0)
 case $iso in
 *.img)
+    # Cycle 17 (pi-release, 3 Nov 10:4x): the artifact that gets handed off must NOT be the file this harness
+    # boots. A boot writes to the image (a journal, /data, the minted API key), so the sha256 published in a
+    # hand-off stops being the sha256 on disk the moment a VM has touched it - measured exactly that way: an
+    # image was hashed, then booted here, and the gate was right to refuse the pair. Boot a COPY, always.
+    bootimg=$work/artifact-under-test.img
+    if [ "$(cd "$(dirname "$iso")" && pwd -P)/$(basename "$iso")" != "$bootimg" ]; then
+        cp --sparse=always "$iso" "$bootimg" || { echo "$prog: cannot copy $iso for the boot" >&2; exit 2; }
+        echo "INFO artifact      booting a copy ($bootimg); the hand-off file $iso is left untouched"
+    fi
     # the shipped artifact: firmware boots the ESP, grub reads the data partition. With Secure Boot on and
     # this machine's certificate enrolled, an unsigned kernel stops at grub exactly as it did on the board.
     "$(dirname "$0")/sb-vars.sh" "$work/OVMF_VARS_SB.fd" > "$work/sb-vars.txt" 2>&1 || {
@@ -93,7 +102,7 @@ case $iso in
         exit 2; }
     grep -E '^   ' "$work/sb-vars.txt"
     # shellcheck disable=SC2054  # same: commas belong to the qemu arguments
-    boot=(-drive file="$iso",format=raw,if=none,id=d0 -device qemu-xhci -device usb-storage,drive=d0
+    boot=(-drive file="$bootimg",format=raw,if=none,id=d0 -device qemu-xhci -device usb-storage,drive=d0
           -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
           -drive if=pflash,format=raw,file="$work/OVMF_VARS_SB.fd"
           -machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on)
@@ -109,7 +118,10 @@ esac
 # the VM is stopped here by name instead of being left to its timeout. Three runs once overlapped and the
 # next one could not even open its image ("Failed to get write lock"), while the previous VM still held the
 # port the host probe was aimed at.
-vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$iso" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
+# the pattern has to name the file qemu was actually given: with the .img branch booting a copy, matching on
+# $iso would find nothing and leave the VM holding its image and its forwarded ports until its own timeout.
+qemuimg=${bootimg:-$iso}
+vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$qemuimg" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &

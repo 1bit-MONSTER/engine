@@ -3308,9 +3308,15 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             npu_gemm_rows(*ctx_[i_o_l], CTX.data(), M, go->K, go->N, B_.data(), O, 1, l_full ? "attn_output" : "ssm_out",
                           go->real_k);
         }
-        for (int m = 0; m < M; m++)
-            for (int k = 0; k < H; k++)
-                X[(size_t)m * H + k] += O[(size_t)m * H + k] * residual_scale_;
+        // The GEMM wrote M rows of the *design's* N, which is H only when H is already on the kernel's
+        // column grid (engine#854 pads it otherwise): reading at H put every row after the first at the
+        // wrong offset, which is why only position 0 of a prompt came out right (engine#855).
+        {
+            const int nrow = q4nx_pad_n(H);
+            for (int m = 0; m < M; m++)
+                for (int k = 0; k < H; k++)
+                    X[(size_t)m * H + k] += O[(size_t)m * nrow + k] * residual_scale_;
+        }
 
         // ---- MLP ----
         for (int m = 0; m < M; m++)
@@ -3356,10 +3362,12 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             npu_gemm_rows(*ctx_[i_u], XN.data(), M, gu->K, gu->N, B_.data(), uv, 3, "ffn_up",
                           gu->real_k);
+            // Each GEMM wrote M rows of its own design's N (padded, engine#854); the packed row is
+            // 2*im wide, so both reads go through the design's stride (identity when nothing is padded).
             for (int m = 0; m < M; m++)
                 for (int i = 0; i < im; i++) {
-                    av[(size_t)m * 2 * im + i] = gv[(size_t)m * im + i];
-                    av[(size_t)m * 2 * im + im + i] = uv[(size_t)m * im + i];
+                    av[(size_t)m * 2 * im + i] = gv[(size_t)m * gg->N + i];
+                    av[(size_t)m * 2 * im + im + i] = uv[(size_t)m * gu->N + i];
                 }
             ACT.swap(av);
         } else {
@@ -3367,11 +3375,15 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             return false;
         }
         HH.assign((size_t)M * (size_t)im, 0.0f);
-        for (int m = 0; m < M; m++) {
-            act_row.assign(ACT.begin() + (size_t)m * 2 * im,
-                           ACT.begin() + (size_t)(m + 1) * 2 * im);
-            if (!mlp(act_row, hh, im)) { err_ = "mlp failed"; return false; }
-            memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
+        {
+            // the fused design's N, for the same reason as O and D
+            const size_t act_w = (size_t)q4nx_pad_n(2 * im);
+            for (int m = 0; m < M; m++) {
+                act_row.assign(ACT.begin() + (size_t)m * act_w,
+                               ACT.begin() + (size_t)m * act_w + (size_t)2 * im);
+                if (!mlp(act_row, hh, im)) { err_ = "mlp failed"; return false; }
+                memcpy(HH.data() + (size_t)m * im, hh.data(), (size_t)im * sizeof(float));
+            }
         }
         {
             const Q4nxDesignGeom* g = &designs_[i_d];
@@ -3383,9 +3395,12 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             npu_gemm_rows(*ctx_[i_d], HH.data(), M, g->K, g->N, B_.data(), D, 4, "ffn_down",
                           g->real_k);
         }
-        for (int m = 0; m < M; m++)
-            for (int k = 0; k < H; k++)
-                X[(size_t)m * H + k] += D[(size_t)m * H + k] * residual_scale_;
+        {
+            const int nrow = q4nx_pad_n(H);   // as above: the design's N, identity when H is on the grid
+            for (int m = 0; m < M; m++)
+                for (int k = 0; k < H; k++)
+                    X[(size_t)m * H + k] += D[(size_t)m * nrow + k] * residual_scale_;
+        }
 
         // Same post-residual hidden-state dump as step() emits as [L], one row per
         // position, so the two paths can be compared layer by layer.

@@ -469,7 +469,10 @@ rows = [
     # connect, just the menu"): the screen a person sees must carry the CONNECT block - the address, the web UI,
     # the API base, the key's location, ssh and the mobile app - not just the menu. Read off tty1's own VGA
     # buffer, the same surface the U2 tty1 row uses, so this is the screen and not the script.
-    ("U2 menu connect", "s=$(1bit-tty1 1); printf '%s\\n' \"$s\" | head -10; "
+    # tr -s ' ': the screen is drawn by ONE OF TWO renderers now (the dialog menu, which collapses runs of spaces in
+    # a --menu prompt, and the ratatui TUI, which does not), so the row must not depend on how many spaces sit
+    # between "api" and its URL. Measured on both renders of the same facts.
+    ("U2 menu connect", "s=$(1bit-tty1 1 | tr -s ' '); printf '%s\\n' \"$s\" | head -10; "
                      "for w in CONNECT 'web UI http://' 'api http://' 'ssh root@' 'Lemonade Mobile'; do "
                      "printf '%s' \"$s\" | grep -qF \"$w\" || echo missing-\"$w\"; done; "
                      "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "

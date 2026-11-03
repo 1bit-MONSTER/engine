@@ -769,6 +769,7 @@ named here and covered by a known-answer test (`ctest safetensors_to_q4nx`):
 | `linear_attn.A_log` | `linear_attn.ssm_a` | **`-exp(A_log)`, F32** — the forward computes `expf(ssm_a * softplus(dt))`, so the raw A_log decays backwards |
 | `linear_attn.conv1d.weight` `[CD,1,CK]` | `linear_attn.ssm_conv1d.weight` | **transpose to tap-major** `[CK,CD]`: the forward indexes `conv[j*CD + c]` |
 | `linear_attn.in_proj_a/b` | `ssm_alpha_proj`/`ssm_beta_proj` | rows **zero-padded to 32** so they tile; the forward dequantises at the stored height and keeps the first NVH rows (**q4_1 where the FLM config asks Q8_0** — a deviation `verify` measures rather than hides) |
+| `self_attn.q_proj.weight` (only when `attn_output_gate`) | same name | rows **de-interleaved**: HF builds a gated layer's query as `view(*, -1, 2*head_dim)` + `chunk(2, -1)`, i.e. `[q_h \| gate_h]` **per head**, while the forward's fused QKV is `[q block \| gate block \| k \| v]` — the layout the FLM/OGA packs already use. Leaving the source order made the forward attend over half-gate rows and gate with half-query ones: measured on the real d3 pack, engine q vs the reference's q **cos 0.077**, and **0.999992** against the de-interleaved rows |
 
 The remaining names come from `configs/q4nx/qwen3.5_0.8b.json`'s `q4nx_name` column (`in_proj_qkv` →
 `qkv_proj`, `in_proj_z` → `self_attn.gate_proj`, `out_proj` → `ssm_out_proj`, `dt_bias` → `ssm_dt.bias`), and

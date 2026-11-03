@@ -148,6 +148,33 @@ seal_manifest_problems() {  # <set dir>: one line per problem, nothing and statu
     return $_bad
 }
 
+# The NPU's SECOND turn, decided from what the two streamed turns delivered. Pure, so --self-test drives it
+# and the row below uses the same code: <turn-1 deltas> <turn-2 deltas> <turn-2 transport rc> <new TDRs>.
+# Engine #911 (board, c17 stick, 2026-11-03 13:22): one short prompt answered at 96.6 tok/s, and the NEXT
+# request hung - 0 chunks, lemond's "Backend did not send [DONE]", and an amdxdna TDR in the same second.
+# A single-prompt row cannot tell "the route works" from "the route works once", which is why this exists.
+#
+# It counts DELTAS, not the [DONE] marker: lemond appends [DONE] itself when the backend never sent one, so a
+# row grepping for [DONE] would have passed the exact failure it exists to catch (measured in the board's own
+# lemond.log). Deltas of content and reasoning_content both count as "the route carried tokens": with
+# enable_thinking=false the content should come, but a route that ignores the flag and thinks is a wording
+# problem, not a hang, and the message reports the two counts so it cannot be mistaken for one.
+npu_turns_verdict() {
+    _t1=$1 _t2=$2 _rc=$3 _tdr=$4
+    case "${_tdr:-0}" in
+        ''|0) ;;
+        *) printf 'FAIL an amdxdna TDR appeared during the two turns (%s new line(s)): turn 1 %s chunks, turn 2 %s chunks - the device hung, engine #911 shape' "$_tdr" "${_t1:-0}" "${_t2:-0}"; return 0 ;;
+    esac
+    case "${_rc:-0}" in
+        0) ;;
+        28|124) printf 'FAIL turn 2 never finished (curl/timeout rc %s = the cap) after turn 1 delivered %s chunks: the second request hung, engine #911 shape' "$_rc" "${_t1:-0}"; return 0 ;;
+        *) printf 'FAIL turn 2 failed at the transport (rc %s) after turn 1 delivered %s chunks' "$_rc" "${_t1:-0}"; return 0 ;;
+    esac
+    if [ "${_t1:-0}" = 0 ]; then printf 'FAIL turn 1 (a long prompt) delivered no tokens at all'; return 0; fi
+    if [ "${_t2:-0}" = 0 ]; then printf 'FAIL turn 2 delivered 0 chunks after a long first turn (engine #911: the second request on this route hangs)'; return 0; fi
+    printf 'PASS answered both turns on the NPU (turn 1 %s chunks, turn 2 %s chunks carrying the history), no amdxdna TDR' "$_t1" "$_t2"
+}
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -168,6 +195,14 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(lemonade_verdict 000 '' 000)"                           # no server at all
     check FAIL "$(lemonade_verdict 200 '' 401)"                           # 200 with no model list
     check FAIL "$(lemonade_verdict 500 'error' 401)"                      # not a 200
+    # engine #911: the two-turn NPU row, on the shapes the board actually produced
+    check PASS "$(npu_turns_verdict 40 12 0 0)"                          # both turns answer
+    check FAIL "$(npu_turns_verdict 40 0 0 0)"                           # the board: 0 chunks on turn 2
+    check FAIL "$(npu_turns_verdict 40 5 0 2)"                           # a TDR during the row, even with chunks
+    check FAIL "$(npu_turns_verdict 40 3 28 0)"                          # turn 2 hung until the cap
+    check FAIL "$(npu_turns_verdict 0 9 0 0)"                            # a long first turn that said nothing
+    check FAIL "$(npu_turns_verdict 40 4 56 0)"                          # transport failure
+    check PASS "$(npu_turns_verdict 1 1 0 '')"                           # empty TDR count reads as none
     # engine #574: the sealed set's manifest, on sets built here (a manifest whose file list and
     # the set's files are not the same set of files is exactly what the packaging and this check
     # have to refuse)
@@ -577,10 +612,63 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     chat "$NPU"
     if [ -n "$TPS" ]; then pass chat-npu "$NPU (onebit, NPU) answered \"$ANSWER\" at ${TPS} tok/s"
     else fail chat-npu "$NPU (onebit, NPU) did not answer ($ANSWER)"; fi
+    # ---- chat-npu-multiturn: the second turn (#911) ------------------------------------------
+    # --- row: chat-npu-multiturn (rowproof-npu-multiturn.sh extracts this block) ---
+    # The board served the row above at 96.6 tok/s and then hung on the next request. Two streamed turns here:
+    # a long prompt (~70 words, the board's own repro) and a short follow-up that carries the history, both with
+    # thinking off (the route supports it: app/forward_serve.cpp -> npu_chatml.h). 240 s per turn is 30x the
+    # board's 7.5 s first answer, so only a hang reaches the cap.
+    _TDR() { { dmesg 2>/dev/null || journalctl -k 2>/dev/null || true; } | grep -c 'aie2_legacy_tdr_detect' 2>/dev/null || true; }
+    MT_CAP=${MT_CAP:-240}   # seam: the proof drives the timeout arm with a short cap
+    _NW=$(mktemp -d)
+    _tdr0=$(_TDR)
+    _long='Explain in three sentences why a compiler for an accelerator array must choose the tile shape before it schedules the loop nest, then sketch the trade off between a wider tile and a deeper pipeline for a matrix multiply whose intra layer memory is fixed.'
+    printf '{"model":"%s","messages":[{\"role\":\"user\",\"content\":\"%s\"}],"max_tokens":192,"temperature":0,"stream":true,"chat_template_kwargs":{"enable_thinking":false}}' \
+        "$NPU" "$_long" > "$_NW/t1.json"
+    _post() {  # <body file> <out file> -> transport rc
+        if command -v curl > /dev/null 2>&1; then
+            timeout $((MT_CAP + 20)) curl -sS -N --connect-timeout 5 --max-time "$MT_CAP" -o "$2" \
+                -H 'Content-Type: application/json' -H "Authorization: Bearer $KEY" \
+                --data-binary "@$1" "$API/api/v1/chat/completions" 2>/dev/null
+        else
+            timeout $((MT_CAP + 20)) wget -q -T "$MT_CAP" -t 1 -O "$2" --header='Content-Type: application/json' \
+                --header="Authorization: Bearer $KEY" --post-file="$1" "$API/api/v1/chat/completions" 2>/dev/null
+        fi
+    }
+    _deltas() { grep -o '"content"[[:space:]]*:[[:space:]]*"[^"]' "$1" 2>/dev/null | wc -l | tr -d ' '; }
+    _post "$_NW/t1.json" "$_NW/t1"
+    _dc=$(_deltas "$_NW/t1")
+    _dr=$(grep -o '"reasoning_content"[[:space:]]*:[[:space:]]*"[^"]' "$_NW/t1" 2>/dev/null | wc -l | tr -d ' ')
+    _t1=$((_dc + _dr))
+    if [ "$_t1" -gt 0 ]; then
+        _ans=$(sed -n 's/.*"content"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_NW/t1" 2>/dev/null | tr -s '[:space:]' ' ' | head -c 400)
+        [ -n "$_ans" ] || _ans=$(sed -n 's/.*"reasoning_content"[[:space:]]*:[[:space:]]*"\([^"]*\)".*/\1/p' "$_NW/t1" 2>/dev/null | tr -s '[:space:]' ' ' | head -c 400)
+        _ans=$(printf '%s' "$_ans" | tr -d '"\\' | tr -d '\000-\037')
+        printf '{"model":"%s","messages":[{\"role\":\"user\",\"content\":\"%s\"},{\"role\":\"assistant\",\"content\":\"%s\"},{\"role\":\"user\",\"content\":\"In one short sentence: what came first in what you just described?\"}],"max_tokens":96,"temperature":0,"stream":true,"chat_template_kwargs":{"enable_thinking":false}}' \
+            "$NPU" "$_long" "$_ans" > "$_NW/t2.json"
+    else
+        cp "$_NW/t1.json" "$_NW/t2.json"   # turn 1 said nothing; turn 2 has nothing to carry
+    fi
+    _post "$_NW/t2.json" "$_NW/t2"; _rc=$?
+    _t2c=$(_deltas "$_NW/t2")
+    _t2r=$(grep -o '"reasoning_content"[[:space:]]*:[[:space:]]*"[^"]' "$_NW/t2" 2>/dev/null | wc -l | tr -d ' ')
+    _t2=$((_t2c + _t2r))
+    _tdr1=$(_TDR)
+    case "$_tdr0" in ''|*[!0-9]*) _tdr0=0 ;; esac
+    case "$_tdr1" in ''|*[!0-9]*) _tdr1=$_tdr0 ;; esac
+    _v=$(npu_turns_verdict "$_t1" "$_t2" "$_rc" "$((_tdr1 - _tdr0))")
+    case "$_v" in
+        PASS*|pass*) pass chat-npu-multiturn "$NPU ${_v#???? }" ;;
+        *) fail chat-npu-multiturn "$NPU ${_v#???? } (turn 1 ${_t1} chunks, turn 2 ${_t2} chunks, transport rc ${_rc})" ;;
+    esac
+    rm -rf "$_NW"
+    # --- end row: chat-npu-multiturn ---
 elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+    skip chat-npu-multiturn "no /dev/accel/accel*: this machine has no NPU, so the second-turn row cannot run either"
 else
     skip chat-npu "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+    skip chat-npu-multiturn "no onebit NPU entry is listed by Lemonade, so there is nothing to ask twice"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

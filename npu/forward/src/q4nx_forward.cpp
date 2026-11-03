@@ -3204,19 +3204,22 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
                 npu_gemm_rows(*ctx16_[i_kv_], XN.data(), M, gk->K, gk->N, nullptr, kvv, 13, "attn_v",
                               gk->real_k);
                 const size_t n_on = (size_t)2 * nhd + (size_t)2 * nkv;
-                if (qh0.size() < (size_t)M * nhd || qh1.size() < (size_t)M * nhd ||
-                    kvk.size() < (size_t)M * nkv || kvv.size() < (size_t)M * nkv ||
+                if (qh0.size() < (size_t)M * gq->N || qh1.size() < (size_t)M * gq->N ||
+                    kvk.size() < (size_t)M * gk->N || kvv.size() < (size_t)M * gk->N ||
                     !err_.empty()) {
                     if (err_.empty()) err_ = "pb16i full-attention QKV split returned short";
                     return false;
                 }
                 QKV.assign((size_t)M * n_on, 0.0f);
+                // Each of the four GEMMs wrote M rows of *its* design's N (padded, engine#854), so the
+                // reads go through the design's stride -- the same class as O/D/gate-up below.
+                const size_t sq = (size_t)gq->N, skv = (size_t)gk->N;
                 for (int m = 0; m < M; m++) {
                     float* d = QKV.data() + (size_t)m * n_on;
-                    memcpy(d, qh0.data() + (size_t)m * nhd, (size_t)nhd * sizeof(float));
-                    memcpy(d + nhd, qh1.data() + (size_t)m * nhd, (size_t)nhd * sizeof(float));
-                    memcpy(d + 2 * nhd, kvk.data() + (size_t)m * nkv, (size_t)nkv * sizeof(float));
-                    memcpy(d + 2 * nhd + nkv, kvv.data() + (size_t)m * nkv,
+                    memcpy(d, qh0.data() + (size_t)m * sq, (size_t)nhd * sizeof(float));
+                    memcpy(d + nhd, qh1.data() + (size_t)m * sq, (size_t)nhd * sizeof(float));
+                    memcpy(d + 2 * nhd, kvk.data() + (size_t)m * skv, (size_t)nkv * sizeof(float));
+                    memcpy(d + 2 * nhd + nkv, kvv.data() + (size_t)m * skv,
                            (size_t)nkv * sizeof(float));
                 }
             } else {

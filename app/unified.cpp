@@ -391,6 +391,10 @@ int run_unified(int argc, char** argv) {
     httplib::Server srv;
     install_request_guard(srv, host);  // Host / Origin (app/http_guard.h)
     std::atomic<bool> ready{false};
+    // /health must never take e.mu or touch the device: Lemonade's BackendWatchdog probes it with a
+    // 2 s timeout while a request is ACTIVE, and three consecutive failures reset the backend (kill +
+    // reload), i.e. they would end a healthy turn. Measured under a 512-token generation in flight:
+    // 200 in 0.3-1.0 ms on six consecutive probes, while a chat request in the same window got 503.
     srv.Get("/v1/health", [&](const httplib::Request&, httplib::Response& res) {
         res.status = ready ? 200 : 503;
         res.set_content(json{{"status", ready ? "ok" : "loading"}, {"model", e.id}, {"device", "npu"}}.dump(),

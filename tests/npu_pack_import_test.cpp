@@ -564,16 +564,23 @@ void test_mlp_gu(const std::string& golden_dir) {
         std::vector<uint8_t> raw(size_t(pi::group_bytes(k, 128)), 0);
         for (int h = 0; h < 2; ++h)
             for (int kb = 0; kb < kbs; ++kb)
-                for (int i = 0; i < subv_rows / 2; ++i)
-                    raw[size_t((2 + 2 * kb + h) * subv + 64 * subv_rows + i)] = uint8_t(i | ((15 - i) << 4));
+                for (int i = 0; i < subv_rows / 2; ++i) {
+                    // a nibble holds 0..15, and the fused width uses 32 of these bytes per half, so the
+                    // pattern repeats: what matters is which row each nibble lands on, not that the 32
+                    // bytes are distinct.
+                    const int v = i & 0x0F;
+                    raw[size_t((2 + 2 * kb + h) * subv + 64 * subv_rows + i)] = uint8_t(v | ((15 - v) << 4));
+                }
         const pi::TileW z = pi::decode_tile(raw.data(), k, 128);
         bool pairs_even_odd = true;
         for (int h = 0; h < 2 && pairs_even_odd; ++h)
             for (int kb = 0; kb < kbs && pairs_even_odd; ++kb)
-                for (int i = 0; i < subv_rows / 2; ++i)
-                    pairs_even_odd = z.zp[size_t(h * subv_rows + 2 * i) * size_t(kbs) + size_t(kb)] == uint8_t(i) &&
+                for (int i = 0; i < subv_rows / 2; ++i) {
+                    const uint8_t v = uint8_t(i & 0x0F);
+                    pairs_even_odd = z.zp[size_t(h * subv_rows + 2 * i) * size_t(kbs) + size_t(kb)] == v &&
                                      z.zp[size_t(h * subv_rows + 2 * i + 1) * size_t(kbs) + size_t(kb)] ==
-                                         uint8_t(15 - i);
+                                         uint8_t(15 - v);
+                }
         check(pairs_even_odd, "MLP golden: zero-point nibbles pair with rows 2i / 2i+1 (even/odd) at 128 rows");
 
         // and on the pack's own unit: a correctly paired zero point sits where its 128 codes cluster

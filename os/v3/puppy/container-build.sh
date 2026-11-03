@@ -230,6 +230,26 @@ if [ -n "${PAYLOAD:-}" ]; then
     # dialog, which the merged package set already ships - asserted below, because a menu without dialog is a
     # box that falls back to a text prompt with no explanation.
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-console-menu "$skeleton/usr/local/bin/1bit-console-menu"
+    # Cycle 18 (pi-tui, ~/briefs/TCONSOLE-TUI.md): the full-screen console TUI replaces the dialog menu on tty1.
+    # It is a Rust/ratatui binary built OFF-image (console-tui/build-static.sh, musl-static so it needs nothing at
+    # run time) and handed in as CONSOLE_TUI_BIN, because a Rust toolchain has no business in this container. Two
+    # rules, both paid for elsewhere in this file: a binary that cannot RUN here is refused rather than installed
+    # (init skips a broken program in silence, which is how a console ends up a dead screen), and its absence is
+    # only a note - tty1 then keeps the dialog menu, which is the documented fallback.
+    if [ -n "${CONSOLE_TUI_BIN:-}" ]; then
+        [ -f "$CONSOLE_TUI_BIN" ] || {
+            echo "build: REFUSED: CONSOLE_TUI_BIN=$CONSOLE_TUI_BIN does not exist" >&2; exit 1; }
+        tuiv=$("$CONSOLE_TUI_BIN" --version 2>&1) || {
+            echo "build: REFUSED: the console TUI does not run here (--version said: $tuiv)" >&2; exit 1; }
+        case $tuiv in
+            1bit-console-tui*) ;;
+            *) echo "build: REFUSED: the console TUI printed '$tuiv' for --version" >&2; exit 1;;
+        esac
+        install -D -m 755 "$CONSOLE_TUI_BIN" "$skeleton/usr/local/bin/1bit-console-tui"
+        echo "   ok: the console TUI is in the image ($tuiv)"
+    else
+        echo "   note: CONSOLE_TUI_BIN is not set - tty1 keeps the dialog menu (the documented fallback)"
+    fi
     # Cycle 16, from the demo recording task (TDEMO-RECORD): the appliance has to be able to record its own demo
     # (`1bit-record`), and the desktop has to open a chat screen that WORKS in the browser this image ships -
     # measured 2026-11-02: Pale Moon renders Lemonade's UI but cannot run its streaming chat (it lacks
@@ -452,6 +472,14 @@ if [ -n "${PAYLOAD:-}" ]; then
     unsquashfs -ll sandbox3/build/puppy_*.sfs > /tmp/1bit-sfs-long 2> /dev/null || true
     grep -q '^-rwxr-xr-x .*usr/local/bin/1bit-console-menu$' /tmp/1bit-sfs-long || {
         echo "build: REFUSED: the packed 1bit-console-menu is not executable" >&2; exit 1; }
+    # and the TUI, when this build was given one: it is what tty1 actually execs first, so "in the image" is not
+    # enough - it has to be executable in the packed SFS, and `1bit-console` has to still name the fallback.
+    if [ -n "${CONSOLE_TUI_BIN:-}" ]; then
+        in_image usr/local/bin/1bit-console-tui || {
+            echo "build: REFUSED: the image has no /usr/local/bin/1bit-console-tui although CONSOLE_TUI_BIN was given" >&2; exit 1; }
+        grep -q '^-rwxr-xr-x .*usr/local/bin/1bit-console-tui$' /tmp/1bit-sfs-long || {
+            echo "build: REFUSED: the packed 1bit-console-tui is not executable" >&2; exit 1; }
+    fi
     echo "   ok: the console menu is in the image and executable (tty1's whole surface on a headless boot)"
 fi
 modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)

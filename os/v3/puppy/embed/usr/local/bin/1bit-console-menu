@@ -38,6 +38,8 @@
 #   1bit-console-menu --status     print the header and status block, exit 0 (no terminal needed)
 #   1bit-console-menu --run N      run menu item N non-interactively (1..9); exit 0 if it did its read half
 #   1bit-console-menu --selftest   --status plus every item; exit 0 only if all of them answered
+#   1bit-console-menu --action N   run menu item N interactively on this terminal - what the console TUI's keys
+#                                  2-7 hand off to, so those actions exist in exactly one place
 #
 # Exit: 0 ok, 1 an action failed, 2 usage.
 
@@ -185,7 +187,55 @@ status_text() {
     say "Temp $(temps_line)   Secure Boot $(sb_line)"
     say "Data $(data_line)   Models $(models_line | cut -c1-30)"
 }
-menu_text() { say "1-9 then Enter. Status redraws every 15 s. ssh users get bash, not this menu."; }
+menu_text() { say "1-9 then Enter. Refresh 2 s while booting, 15 s after. ssh = bash"; }
+
+# ── CONNECT (cycle 18, the owner: "when you first boot the headless there is no data to display on how to
+# connect, just the menu") ────────────────────────────────────────────────────────────────────────────────
+# The first screen after a headless boot is the moment a person needs to know where this machine is, so the block
+# sits ABOVE the menu and is built from what the machine says now, not from what it said at boot: while the wire or
+# Lemonade is still coming up it says what it is waiting for and the menu redraws every 2 s.
+spinner() { set -- '|' '/' '-' '\\'; shift $(( $(date +%s) % 4 )); printf '%s' "$1"; }
+net_up() { [ -n "$(first_ip)" ]; }
+lemonade_up() { [ "$(lemond_listening)" -gt 0 ] 2>/dev/null || lemond_up; }
+
+booting_text() {
+    if net_up; then
+        say "BOOT  network up $(first_ip) $(spinner)"
+    else
+        say "BOOT  waiting for network $(spinner) - plug the cable in, or menu 3 for a static address"
+    fi
+    if lemonade_up; then
+        say "      Lemonade is answering on :13305"
+    else
+        say "      waiting for Lemonade on :13305 $(spinner) - it starts once /data is mounted"
+    fi
+}
+# Four lines, each measured to fit one 78-column dialog row (a longer line wraps and pushes the last menu items off
+# the screen - cycle 14 measured item 9 disappearing exactly that way). The key is NOT printed here: menu item 1
+# shows it, and the console is the surface a screen recording catches.
+connect_text() {
+    ip=$(first_ip)
+    if [ -z "$ip" ]; then
+        say "CONNECT  no address yet - menu 3 (Network); DHCP is automatic once a cable is in"
+        return
+    fi
+    say "CONNECT  $(hostname_now)   web UI http://$ip:13305"
+    say "         api  http://$ip:13305/api/v1   (key: menu item 1)"
+    say "         ssh  root@$ip   (your key in /data/ssh/authorized_keys)"
+    say "         app  Lemonade Mobile: server http://$ip:13305 + that key"
+}
+# What the dialog shows. Nine lines with the nine menu rows, i.e. inside the 12 the 24-row box leaves free.
+status_brief() {
+    say "GPU $(gpu_line | cut -c1-46)   Data $(data_line | cut -c1-22)"
+    say "NPU $(npu_line | cut -c1-28)  Temp $(temps_line)  SB $(sb_line | cut -c1-9)"
+    say "Fans $(fans_line | cut -c1-40)  Models $(models_line | cut -c1-20)"
+}
+screen_text() {
+    header_line
+    if net_up && lemonade_up; then connect_text; else booting_text; fi
+    status_brief
+    menu_text
+}
 
 # ── the terminal ───────────────────────────────────────────────────────────────────────────────────────
 # dialog draws its widget on stdout and writes the RESULT to stderr, which is why the choice is captured through
@@ -505,9 +555,12 @@ run_item() {   # run_item <1..9>
 main_menu() {
     while : ; do
         if dialog_ok; then
+            # the first screen is redrawn every 2 s until the address and Lemonade are both there, then it backs
+            # off to 15: a booting appliance is the one time somebody is watching this box
+            if net_up && lemonade_up; then tmo=15; else tmo=2; fi
             choice=$(ui --clear --backtitle "1bit OS - $(hostname_now) - $(release_tag)" \
-                --title "1bit OS console" --timeout 15 \
-                --menu "$(status_text; menu_text)" 24 78 9 \
+                --title "1bit OS console" --timeout "$tmo" \
+                --menu "$(screen_text)" 24 78 9 \
                 1 "Show the API key" \
                 2 "Quick chat test (GPU and NPU)" \
                 3 "Network (DHCP, static, hostname)" \
@@ -530,9 +583,13 @@ main_menu() {
 }
 
 case "${1:-}" in
---status)   status_text; menu_text; exit 0 ;;
+--status)   status_text; connect_text; menu_text; exit 0 ;;
 --run)      [ $# -eq 2 ] || { say "usage: $0 --run <1..9>"; exit 2; }
             NONINT=1; run_item "$2"; exit $? ;;
+--action)   [ $# -eq 2 ] || { say "usage: $0 --action <1..9>"; exit 2; }
+            # ONE item, interactive, on this terminal (NONINT stays 0, so its dialogs work). 1bit-console-tui runs
+            # this for keys 2-7: the TUI never grows a second copy of an action that needs a typed answer.
+            run_item "$2"; exit $? ;;
 --selftest) NONINT=1; rc=0
             status_text
             for i in 1 2 3 4 5 6 7 8 9; do

@@ -476,6 +476,25 @@ PASS U2 tty1      ResolutePup64 | Linux 7.3.0-rc4-1bit-perfopt+ [x86_64 arch] | 
 PASS U2 headless  pfix=copy,nox | no-X-server
 ```
 
+### Cycle 14: the board boot that reached the engine, and the six reds it left
+
+Cycle 13 passed 25 of 29 acceptance rows on the Max+ 395 (NPU chat through Lemonade at 93.2/95.3 tok/s,
+`lemonade bench` decode 88.5 tok/s, `ec_su_axb35` loaded, Secure Boot on, ssh with the owner's key) and left
+six. All six are closed in the image, and each one was a measurement rather than a guess:
+
+| row | the cause, measured | the fix |
+|---|---|---|
+| `hrx-device` (no `HRX0` at all), `chat-hrx` | **nothing opened `libhsa-runtime64.so.1`.** `ONEBIT_HRX_LIBHSA` is a CMake *compile definition* (`CMakeLists.txt:279`), not a variable, so the line in `/etc/1bit/libhsa.env` was inert; the engine resolves `--hrx-libhsa` → the path baked at build time → a recursive scan of `/opt/rocm-therock` (`app/serve.cpp:201`), and the baked path is the release builder's TheRock. Second defect on the same path: the pinned libhsa is `RUNPATH=$ORIGIN` with four `librocm_sysdeps_*` + `librocprofiler-register` NEEDED entries, and the image carried the one file (`ldd`: 4 `not found`) | `LIBHSA_DIR` installs the whole set at `/opt/rocm-therock/lib`, `/opt/1bit/libhsa` symlinks to it, `libhsa.env` exports the trio and `LD_LIBRARY_PATH`, and the build refuses an incomplete or unloadable set |
+| boot cmdline | the appliance booted `amdgpu cwsr_enable=1` with no TTM parameters, while the install the image was validated against boots `amdgpu.cwsr_enable=0 ttm.pages_limit=31457280 ttm.page_pool_size=31457280` — and an APU serves models out of GTT, whose ceiling is that limit | every grub entry carries all three; row `boot gtt` reads them off the running boot |
+| `u2-console` | inittab's tty1 entry is `plogin`, whose tail is `exec getty -n -l /bin/autologin … tty1`; on that boot nothing ended up on tty1, while the same image gave a prompt in QEMU | inittab's tty1 entry is the appliance's own `1bit-console`: that last step on a headless boot, `plogin` on every other |
+| `gguf` | not a registration bug: `05onboard-data` registers a `.gguf` under the catalogue's lower-cased id and `release-check.sh` compared the file's own spelling, case-sensitively | the row compares case-insensitively |
+| `fans` SKIP | `os/mini/board.sh` was never installed in the appliance | `/usr/sbin/1bit-board` + `26onboard-board` |
+| boot time on the console | `pfix=copy` copies every SFS into RAM at the medium's speed before userspace exists, silently | two console lines from the init patch with the guest's own uptime: what it waits for, and how long it took |
+
+Plus the owner's `1bit OS - install to a disk (1bit.installer=1)` entry: the same system, a guarded console
+installer (disks with model and size, the boot disk refused by device *and* by a `1BIT-DATA` partition on
+it, the whole device name typed twice), and `1bit-install` doing the writing.
+
 ## Recommendation
 
 **Adopt Puppy for both roles — the live/try stick and the installed frugal system — on the resolute64

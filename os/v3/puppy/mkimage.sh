@@ -118,6 +118,7 @@ mm=${MOK_MANAGER:-/usr/lib/shim/mmx64.efi}
 [ -f "$mm" ] && cp -L "$mm" "$esp/EFI/BOOT/mmx64.efi"
 # The kernel and initrd are on the data partition, not on the ESP: grub reads ext4, and the frugal
 # install has to sit next to its save folder. search --label is why the label matters.
+setcmd="pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0"
 cat > "$esp/EFI/BOOT/grub.cfg" <<GRUBCFG
 set timeout=8
 set default=0
@@ -132,19 +133,42 @@ search --no-floppy --label 1BIT-DATA --set=root
 # 2 Nov board boot scanned the JetKVM's USB mass storage and the internal NVMe's ESP and could not settle on
 # one, then dropped to its \`exec /bin/sh\` failure path, whose shell read EOF, exited 0 and panicked PID 1 at
 # 26.7 s (panic-repro.sh reproduces the shape). PDRV also gets a 15 s blkid retry, which covers USB enumeration.
+#
+# The three TTM/amdgpu parameters are the working Ubuntu install's, measured on this box (2026-11-02):
+#   ttm.pages_limit=31457280 ttm.page_pool_size=31457280   the GTT ceiling in 4 KiB pages = 120 GiB. An APU
+#       serves models out of GTT, so the default ceiling is the difference between a model fitting and
+#       Lemonade refusing to load it. The cycle-13 board image booted WITHOUT them while the Ubuntu install
+#       it was validated against booted with them.
+#   amdgpu.cwsr_enable=0   the reference install's value; the no-SVM trio puts HRX's CWSR save area in GTT
+#       (engine#315), and the box that serves HRX today has CWSR off.
+# They are on every entry, so a person who picks the desktop or the shell gets the same machine.
 menuentry "1bit OS (headless console, ${kver})" {
-    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy,nox console=tty0 console=ttyS0,115200
+    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=tty0 console=ttyS0,115200
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS (desktop, JWM)" {
-    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy console=tty0 console=ttyS0,115200
+    linux /1bit/vmlinuz $setcmd pfix=copy console=tty0 console=ttyS0,115200
+    initrd /1bit/initrd.gz
+}
+menuentry "1bit OS - install to a disk (1bit.installer=1)" {
+    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=tty0 console=ttyS0,115200 1bit.installer=1
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - serial root shell (1bit.serial=1)" {
-    linux /1bit/vmlinuz pmedia=usbhd pupsfs=1BIT-DATA psubdir=1bit pfix=copy,nox console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=tty0 console=ttyS0,115200 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 GRUBCFG
+# The artifact is what ships, so the menu is checked here and not in the VM only: the headless entry stays the
+# default (an appliance boots to its console), the TTM/amdgpu parameters every entry needs for HRX are on the
+# line, and the owner's installer entry is in the menu it was asked for.
+grep -q 'ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0' "$esp/EFI/BOOT/grub.cfg" || {
+    echo "$prog: REFUSED: grub.cfg has no ttm/amdgpu parameters (HRX gets no GTT headroom)" >&2; exit 1; }
+grep -q 'menuentry "1bit OS - install to a disk (1bit.installer=1)"' "$esp/EFI/BOOT/grub.cfg" || {
+    echo "$prog: REFUSED: grub.cfg has no install-to-a-disk entry" >&2; exit 1; }
+grep -q 'set default=0' "$esp/EFI/BOOT/grub.cfg" || {
+    echo "$prog: REFUSED: the headless entry is no longer the default" >&2; exit 1; }
+echo "   menu: headless (default), desktop, install to a disk, serial shell; ttm/amdgpu parameters on all"
 MTOOLS_SKIP_CHECK=1 mcopy -s -i "$work/efi.part" "$esp"/* ::/ || {
     echo "$prog: copying the ESP tree into the FAT failed" >&2; exit 1; }
 

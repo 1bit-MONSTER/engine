@@ -25,10 +25,21 @@
 #   <out-dir>     where the built .iso and .sfs land
 #   [woof-ce-dir] the woof-CE clone (default $HOME/wt/woof-CE)
 #
-# LIBHSA=<file> installs the release-gated libhsa-runtime64.so.1 at /opt/1bit/libhsa, which is where
-# embed/etc/1bit/libhsa.env points ONEBIT_HRX_LIBHSA (engine#715). Without it the image carries the env file
-# telling HRX where a runtime it does not have would be, so the file is dropped and the build says so: HRX
-# cannot run on a GPU without it, and that is not a state to discover on the board.
+# LIBHSA_DIR=<dir> installs the WHOLE release-gated HSA runtime set at /opt/rocm-therock/lib: the pinned
+# libhsa-runtime64.so.1 plus every sibling it needs at load time (the TheRock `librocm_sysdeps_*` set and
+# librocprofiler-register.so.0). Cycle 13's board boot measured why the set and not one file (engine#715 +
+# the 2 Nov hardware run):
+#   * `ONEBIT_HRX_LIBHSA` is a CMake compile definition, not a variable - nothing in the engine reads it at
+#     run time (CMakeLists.txt:279, cmake/hrx.cmake). app/serve.cpp:201 resolves in the order --hrx-libhsa,
+#     the BAKED build-machine path if it exists, then a recursive scan of /opt/rocm-therock. On the appliance
+#     the baked path is a release-build directory that does not exist, so the scan is the only route left;
+#   * the pinned libhsa carries `RUNPATH=$ORIGIN` and NEEDED librocm_sysdeps_{elf,drm,drm_amdgpu,numa} +
+#     librocprofiler-register, so a lone file cannot load even when handed to the loader: measured `ldd` = 4
+#     `not found`. With the release kit's own directory on the path: 0 not found.
+# So the set is installed flat, /opt/1bit/libhsa becomes a symlink to it (v2's path and the identity row keep
+# working), and the build refuses a set that is incomplete or that `ldd` cannot resolve - the silent-absence
+# class this lane keeps paying for (an image with no HRX runtime looks exactly like an image whose HRX runtime
+# nobody loaded). Without LIBHSA_DIR the build warns, as before.
 #
 # PAYLOAD=<dir> embeds the release package (TPUPPY-RELEASE U3/U4): the unpacked
 # lemonade-onebit-<tag>/ tree, whose lemond-onebit launcher resolves bin/ and 1bit/ BESIDE ITSELF. It is
@@ -83,10 +94,28 @@ if [ -n "${PAYLOAD:-}" ]; then
     [ -x "$payload/lemond-onebit" ] && [ -x "$payload/1bit/1bit" ] || {
         echo "build: $payload is not the release package: want lemond-onebit and 1bit/1bit in it" >&2; exit 1; }
 fi
-libhsa=""
-if [ -n "${LIBHSA:-}" ]; then
-    [ -f "$LIBHSA" ] || { echo "build: LIBHSA=$LIBHSA does not exist" >&2; exit 1; }
-    libhsa=$(cd "$(dirname "$LIBHSA")" && pwd)/$(basename "$LIBHSA")
+libhsa_dir=""
+if [ -n "${LIBHSA_DIR:-}" ]; then
+    libhsa_dir=$(cd "$LIBHSA_DIR" 2>/dev/null && pwd) || { echo "build: LIBHSA_DIR=$LIBHSA_DIR does not exist" >&2; exit 1; }
+    if [ -n "${LIBHSA:-}" ]; then
+        echo "build: LIBHSA is the cycle-13 spelling; a lone libhsa cannot load (its \$ORIGIN siblings are needed)" >&2
+        echo "build: pass LIBHSA_DIR=<dir> holding libhsa-runtime64.so.1 and the librocm_sysdeps set" >&2
+        exit 1
+    fi
+fi
+# Every name the pinned libhsa NEEDs, plus the sysdeps' own deps. ldd on the box: all four of the first group
+# are "not found" with the file alone.
+libhsa_set="libhsa-runtime64.so.1 librocm_sysdeps_elf.so.1 librocm_sysdeps_drm.so.2 \
+librocm_sysdeps_drm_amdgpu.so.1 librocm_sysdeps_numa.so.1 librocprofiler-register.so.0 \
+librocm_sysdeps_z.so.1 librocm_sysdeps_zstd.so.1 librocm_sysdeps_liblzma.so.5 librocm_sysdeps_bz2.so"
+if [ -n "$libhsa_dir" ]; then
+    miss=""
+    for f in $libhsa_set; do [ -f "$libhsa_dir/$f" ] || miss="$miss $f"; done
+    [ -z "$miss" ] || {
+        echo "build: REFUSED: LIBHSA_DIR=$libhsa_dir is missing:$miss" >&2
+        echo "build:         (the release kit's 1bit-llama directory holds the full set beside its libhsa)" >&2
+        exit 1
+    }
 fi
 # The release public key that verifies the sealed NPU sets' manifests, and the engine scripts the U4/U6 rows
 # need inside the image. All public material: the private seal key never enters the image or the container.
@@ -99,244 +128,19 @@ free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
 echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
+# The container side is its own file (os/v3/puppy/container-build.sh, mounted at /recipe) since 2026-11-02:
+# it was a 300-line single-quoted `bash -c '...'` string here, where one apostrophe in a comment ended the
+# quote and bash reported a syntax error a hundred lines away - five builds in this lane, two of them in
+# cycle 13 - and where shellcheck could not check it at all. Parsing it here costs a second and catches a
+# broken recipe before the image pull and the 20-minute downloads.
+[ -f "$recipe/container-build.sh" ] || { echo "build: no $recipe/container-build.sh" >&2; exit 1; }
+bash -n "$recipe/container-build.sh" || { echo "build: REFUSED: $recipe/container-build.sh does not parse" >&2; exit 1; }
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
     -v "$recipe":/recipe:ro -v "$repo":/repo:ro -v "$sealpub":/seal.pub:ro \
     ${payload:+-v "$payload":/payload:ro} \
     ${payload:+-e PAYLOAD=/payload -e PAYLOAD_NAME="$(basename "$payload")"} \
-    ${libhsa:+-v "$libhsa":/libhsa.so.1:ro} \
-    ${libhsa:+-e LIBHSA=/libhsa.so.1} \
+    ${libhsa_dir:+-v "$libhsa_dir":/libhsa-runtime:ro} \
+    ${libhsa_dir:+-e LIBHSA_DIR=/libhsa-runtime} \
     --device /dev/loop-control:/dev/loop-control \
-    -e COMPAT="$compat" ubuntu:24.04 bash -c '
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config GITHUB_ACTIONS=true
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends build-essential libc6-dev dc debootstrap librsvg2-bin \
-    zstd xml2 syslinux-utils xorriso squashfs-tools wget curl git ca-certificates xz-utils file psmisc \
-    sudo mtools dosfstools cpio python3
-echo "dash dash/sh boolean false" | debconf-set-selections
-dpkg-reconfigure dash >/dev/null 2>&1 || true
-ln -sf bash /bin/ash
-# the whole build happens in /work, which is a host filesystem (ext4), so the petbuild overlay mounts work
-cp -a /woof /work/woof-CE
-cd /work/woof-CE
-mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
-[ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
-[ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
-install -m 755 local-repositories/vercmp /usr/local/bin/vercmp
-install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr/local/petget/categories.dat
-# initrd-progs packs its initrd with `find . | cpio -o -H newc > ../initrd 2>/dev/null`, so without cpio the
-# redirect still creates ../initrd, empty, and gzip obligingly compresses it to 27 bytes: the build stays
-# green all the way to a bootable-looking ISO whose initrd has 0 entries (paid for on attempt 7). The
-# package list above carries cpio; this refuses rather than producing that ISO again.
-command -v cpio >/dev/null || { echo "build: cpio missing, the initrd would come out empty" >&2; exit 1; }
-# 3builddistro loops the ESP image to fill it, and losetup needs /dev/loopN to exist. The container /dev
-# stops at loop7 while this box runs about twenty loop devices (snaps and other lanes), so loop-control
-# hands out a number with no node and the ISO stage dies with "losetup: /dev/loop20: failed to set up loop
-# device: No such file or directory" - after every package and every petbuild has been paid for.
-for i in $(seq 0 63); do [ -e /dev/loop$i ] || mknod /dev/loop$i b 7 $i 2>/dev/null; done
-echo "== merge2out $COMPAT"
-# yes | cmd under pipefail: when merge2out exits, yes gets SIGPIPE and the pipeline fails, so the
-# status has to be taken from merge2out and not from yes
-set +o pipefail
-yes "" | ./merge2out woof-distro/x86_64/ubuntu/"$COMPAT"
-set -o pipefail </dev/null
-cd ../woof-out_*
-
-# The packages that the TPUPPY-RELEASE acceptance needs and the merged woof-CE set does not carry: on a
-# built resolute64 rootfs, `sudo`, `apt`, `mokutil` and `openssh-server` are simply absent (openssh-client
-# has a row, openssh-server does not) - which is the "sh: sudo: not found" class of gap from c20. The rows
-# in packages-extra have to go INSIDE PKGS_SPECS_TABLE (before its closing quote) or 0setup never sees them.
-if [ -s /recipe/packages-extra ]; then
-    echo "== 1bit package rows into the spec table"
-    grep -E "^yes\\|" /recipe/packages-extra > /work/1bit-packages-rows
-    for spec in ../woof-out_*/DISTRO_PKGS_SPECS-ubuntu-*; do
-        bash /recipe/spec-insert-rows.sh "$spec" /work/1bit-packages-rows
-    done
-fi
-echo "== our kernel into kernel-kit/output"
-mkdir -p kernel-kit/output
-cp /kernels/huge-*.tar.* kernel-kit/output/
-ls -l kernel-kit/output/
-echo "== 0setup"; ./0setup </dev/null
-echo "== 1download"; ./1download </dev/null
-echo "== 2createpackages"; ./2createpackages </dev/null
-
-# U5: our kernel ships ec_su_axb35 (the embedded controller of this board: fans, EC temperature, power caps) and it
-# has no PCI modalias, so nothing auto-loads it - measured on the box, where lsmod has no entry and the fans
-# ride the firmware curve. The Puppy hook is ADDLIST in /etc/rc.d/MODULESCONFIG, read by rc.sysinit at boot;
-# it is a file woof-CE owns, so rewrite that one variable instead of shipping a whole replacement.
-# The hook is rootfs-skeleton and not sandbox3/rootfs-complete: 3builddistro starts with
-# rm -rf sandbox3/rootfs-complete and rebuilds it from rootfs-skeleton, so anything written into the
-# sandbox copy after 2createpackages is thrown away - and nothing fails, the image just comes out without
-# it. ADDLIST is read by rc.sysinit as `for MODULE in $ADDLIST`, so an unquoted value is enough.
-skeleton=rootfs-skeleton
-[ -f "$skeleton/etc/rc.d/MODULESCONFIG" ] || {
-    echo "build: REFUSED: no rootfs-skeleton/etc/rc.d/MODULESCONFIG - cannot make the EC driver load at boot" >&2
-    exit 1; }
-echo "== ec_su_axb35 into the ADDLIST of MODULESCONFIG"
-sed -i "s|^ADDLIST=.*|ADDLIST=ec_su_axb35|" "$skeleton/etc/rc.d/MODULESCONFIG"
-grep -qx "ADDLIST=ec_su_axb35" "$skeleton/etc/rc.d/MODULESCONFIG" || {
-    echo "build: REFUSED: could not set ADDLIST in /etc/rc.d/MODULESCONFIG" >&2; exit 1; }
-
-# U1 (owner, cycle 12): root and every real user log in to bash, not to busybox ash. Measured in this tree:
-# rootfs-skeleton/etc/passwd ships root:x:0:0:root:/root:/bin/sh, and bin/plogin ends with
-# `exec getty -n -l /bin/autologin ... tty1`, so the login shell is exactly that passwd field.
-echo "== login shells -> /bin/bash"
-# In its own script (/recipe/shell-login.sh) because this block is single-quoted for docker and an awk
-# program in it ends the block early - the quoting trap that has now cost four builds (2026-11-02).
-bash /recipe/shell-login.sh "$skeleton" | sed "s/^/   /" || {
-    echo "build: REFUSED: the login shells could not be moved to bash (shell-login.sh)" >&2; exit 1; }
-
-# Cycle 13 (pi-release, 2026-11-02 18:39): the headless default must reach the autologin getty on its own.
-# rc.country is what stops it: /tmp/bootcnt.txt exists on every pfix=nox boot (init creates it), so
-# ASKKMAP and ASKLANG are both yes, /etc/keymap missing means keymap-set cli asks on /dev/console, a missing
-# en_US.utf8 locale means chooselocale asks AND sets ASKCLOCK=yes, and timezone-set cli then asks for the
-# timezone on /dev/console. Nothing ever answers a console dialog on an appliance, so tty1 never reaches the
-# prompt. With the two flags off, rc.country takes its quiet path: keymap-set --startup --load (reads the
-# /etc/keymap this image ships: us), `chooselocale cli quiet` (localedef, no questions), and
-# set_hwclock_type -q (no prompt) with /etc/localtime -> UTC from the embed. The DESKTOP entry still offers
-# the wizard: quicksetup runs on the first X start, which this does not touch.
-echo "== rc.country: no console questions on a headless boot"
-[ -f "$skeleton/etc/rc.d/rc.country" ] || {
-    echo "build: REFUSED: no rootfs-skeleton/etc/rc.d/rc.country - the first-boot wizard would block tty1" >&2
-    exit 1; }
-sed -i -e "s|^ASKKMAP=\"yes\"|ASKKMAP=\"no\"|" -e "s|^ASKLANG=\"yes\"|ASKLANG=\"no\"|" \
-    -e "s|^if \[ -f /tmp/bootcnt.txt \] ; then.*|if false ; then # 1bit: a headless boot must not ask (cycle 13)|" \
-    "$skeleton/etc/rc.d/rc.country"
-grep -q "^if false ; then # 1bit: a headless boot must not ask (cycle 13)" "$skeleton/etc/rc.d/rc.country" || {
-    echo "build: REFUSED: could not stop rc.country from asking on the console" >&2; exit 1; }
-echo "   ok: rc.country asks nothing on the console (the keymap and timezone it reads are checked with the embed)"
-
-# U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
-# Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
-# itself - so this is a copy plus two symlinks and the boot service.
-if [ -n "${PAYLOAD:-}" ]; then
-    echo "== embed the release package"
-    mkdir -p "$skeleton/opt/1bit-package" "$skeleton/usr/local/bin"
-    cp -a /payload/bin /payload/1bit /payload/lemond-onebit "$skeleton/opt/1bit-package/"
-    ln -sf /opt/1bit-package/lemond-onebit "$skeleton/usr/local/bin/lemond-onebit"
-    ln -sf /opt/1bit-package/1bit/1bit "$skeleton/usr/local/bin/1bit"
-    cp -a /recipe/embed/. "$skeleton/"
-    # the HRX row of release-check.sh asks for ${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
-    # (os/mini/release-check.sh:454), which is the path os/mini uses for the same binary the package keeps in
-    # 1bit/hrx/llama/bin. One compatibility symlink, so the check reads the appliance without being told
-    # a new path - pi-release asked for exactly this. The check asserts the symlink and the real file
-    # separately: a path THROUGH a symlink is not a path in the squashfs.
-    ln -sfn /opt/1bit-package/1bit/hrx/llama/bin "$skeleton/opt/1bit-llama"
-    # Cycle 12, U3/U4/U6: the CLI the owner is told to use, the two tools the acceptance rows run, and what
-    # the sealed-set rows need. release-check.sh is the SAME file os/mini ships: its catalogue/bench paths
-    # were made layout-aware there rather than forked here, so one tool answers for both images.
-    ln -sfn /opt/1bit-package/bin/lemonade "$skeleton/usr/local/bin/lemonade"
-    install -D -m 755 /repo/os/mini/release-check.sh "$skeleton/usr/local/bin/1bit-release-check"
-    install -D -m 755 /recipe/1bit-install.sh "$skeleton/usr/local/bin/1bit-install"
-    install -D -m 644 /repo/tools/seal_manifest.py "$skeleton/usr/lib/1bit/seal_manifest.py"
-    install -D -m 644 /seal.pub "$skeleton/etc/1bit/seal-pub.txt"
-    ln -sfn /usr/local/bin/1bit-release-check "$skeleton/bin/1bit-release-check"
-    ln -sfn /usr/local/bin/1bit-install "$skeleton/bin/1bit-install"
-    # The onebit entries this image ships, written from the payload catalogue it ships: the models row of
-    # release-check compares the two, so a catalogue that lost its onebit entries is a FAIL and not a skip.
-    python3 /recipe/catalogue-manifest.py /payload/bin/resources/server_models.json \
-        "$skeleton/etc/1bit/onebit-models.txt" || {
-        echo "build: REFUSED: could not write /etc/1bit/onebit-models.txt from the payload catalogue" >&2
-        exit 1; }
-    { echo "payload=${PAYLOAD_NAME:-unknown}"
-      echo "engine_sha256=$(sha256sum /payload/1bit/1bit | cut -c1-64)"
-      if [ -n "${LIBHSA:-}" ]; then
-          echo "libhsa_sha256=$(sha256sum /libhsa.so.1 | cut -c1-64)"
-      else echo "libhsa_sha256=none"; fi
-      echo "built=$(date -u +%FT%TZ)"; } > "$skeleton/etc/1bit/release-identity"
-    # root owns them: /recipe is a host bind mount, so cp -a carries the host uid into the squashfs and
-    # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
-    chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
-        "$skeleton/etc/profile.d" "$skeleton/root" "$skeleton/usr/local/bin" 2> /dev/null || true
-    chmod 0755 "$skeleton/usr/local/bin/1bit-tty1"
-    chmod 0755 "$skeleton"/etc/init.d/03onboard-efivars "$skeleton"/etc/init.d/05onboard-data \
-        "$skeleton"/etc/init.d/10lemonade \
-        "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
-        "$skeleton"/etc/init.d/zz-onboard-ports
-    echo "   $(du -sh "$skeleton/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
-    if [ -n "${LIBHSA:-}" ]; then
-        mkdir -p "$skeleton/opt/1bit/libhsa"
-        cp /libhsa.so.1 "$skeleton/opt/1bit/libhsa/libhsa-runtime64.so.1"
-        chmod 0755 "$skeleton/opt/1bit/libhsa/libhsa-runtime64.so.1"
-        echo "   libhsa $(sha256sum /libhsa.so.1 | cut -c1-16) into /opt/1bit/libhsa"
-    else
-        rm -f "$skeleton/etc/1bit/libhsa.env"
-        echo "   WARNING: no LIBHSA=<libhsa-runtime64.so.1>: this image has no HRX runtime (U4 needs one)"
-    fi
-fi
-
-# The initrd /init must not be able to exit: on the 2 Nov board boot PID 1 exited cleanly through the
-# init script failure path and the kernel panicked at 26.7 s (Attempted to kill init, exitcode 0).
-# 3builddistro packs ../initrd-progs/0initrd (woof-code/3builddistro:649-657), so the guard goes into
-# that source BEFORE the packer runs - then the ISO and the disk image mkimage.sh builds both carry it,
-# and nothing depends on patching an artifact afterwards.
-echo "== init guard into the initrd /init"
-bash /recipe/patch-init.sh /work 2>&1 | sed "s/^/   /" || {
-    echo "build: REFUSED: could not install the 1bit init guard (patch-init.sh)" >&2; exit 1; }
-
-echo "== 3builddistro"; ./3builddistro release </dev/null
-# 3builddistro consumes rootfs-complete, so the image is checked where it exists now: in the SFS set that
-# sandbox3/build ships and that Puppy unions at boot. One listing of every SFS, each line sfs-name/path,
-# because the answer to "is sudo in the image" is bdrv (debootstrap base), not the main puppy SFS.
-compgen -G "sandbox3/build/*.sfs" > /dev/null || {
-    echo "build: REFUSED: no SFS in sandbox3/build after 3builddistro" >&2; exit 1; }
-# the packed initrd has to carry the guard too: patch-init.sh patched the source, this is the archive
-# 3builddistro actually produced, and it is the one mkimage.sh puts on the stick.
-bash /recipe/patch-init.sh --verify sandbox3/build/initrd.gz 2>&1 | sed "s/^/   /" || {
-    echo "build: REFUSED: the packed initrd lost the 1bit init guard" >&2; exit 1; }
-listing=$(for f in sandbox3/build/*.sfs; do
-    unsquashfs -l "$f" 2>/dev/null | sed -n "s|^squashfs-root/|$(basename "$f")/|p"
-done | sort -u)
-# Written to a file and grepped there, never piped into grep -q: with pipefail, grep -q exits at the first
-# match, the producer takes SIGPIPE, and the pipeline reports 141 - which reads as "not in the image" for
-# every file that IS in the image. That cost cycle 4 a refusal of its own good ISO (measured 2026-11-02).
-printf "%s\n" "$listing" > /tmp/1bit-sfs-listing
-in_image() { grep -q "/$1$" /tmp/1bit-sfs-listing ; }
-# an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
-miss=""
-for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil usr/sbin/sfdisk usr/bin/bash; do
-    in_image "$b" || miss="$miss $b"
-done
-[ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
-echo "   ok: sudo, apt, sshd, mokutil, sfdisk, bash are in the image"
-rc_country=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/rc.country 2>/dev/null |
-    grep -c "^if false ; then # 1bit: a headless boot must not ask" || true)
-[ "${rc_country:-0}" = 1 ] || {
-    echo "build: REFUSED: the packed rc.country would still ask on the console (headless boot never reaches tty1)" >&2
-    exit 1; }
-in_image etc/keymap || { echo "build: REFUSED: the image has no /etc/keymap" >&2; exit 1; }
-in_image etc/localtime || { echo "build: REFUSED: the image has no /etc/localtime" >&2; exit 1; }
-echo "   ok: the packed rc.country asks nothing; /etc/keymap and /etc/localtime are in the image"
-modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
-[ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
-    echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }
-echo "   ok: $modconf in the image, so rc.sysinit loads the EC driver"
-if [ -n "${PAYLOAD:-}" ]; then
-    miss=""
-    for b in opt/1bit-package/1bit/1bit opt/1bit-package/lemond-onebit etc/init.d/03onboard-efivars \
-             etc/init.d/05onboard-data etc/init.d/10lemonade \
-             usr/local/bin/1bit etc/rc.d/MODULESCONFIG root/.ssh/authorized_keys \
-             etc/init.d/20onboard-ssh etc/init.d/21serial-console etc/init.d/zz-onboard-ports \
-             opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
-             usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
-             usr/local/bin/1bit-tty1 \
-             usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
-             etc/1bit/release-identity etc/keymap etc/localtime; do
-        in_image "$b" || miss="$miss $b"
-    done
-    [ -z "${LIBHSA:-}" ] || { in_image opt/1bit/libhsa/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; }
-    [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss" >&2; exit 1; }
-    echo "   ok: engine, launcher, service, /usr/local/bin/{1bit,lemonade}, 1bit-release-check, 1bit-install"
-    echo "      onebit-models: $(grep -c ^hrx "$skeleton/etc/1bit/onebit-models.txt") HRX + $(grep -c ^npu "$skeleton/etc/1bit/onebit-models.txt") NPU entries from the payload catalogue"
-fi
-echo "== output"
-ls -l woof-output-* 2>/dev/null | head -20
-cp -f woof-output-*/*.iso woof-output-*/*.sfs /out/ 2>/dev/null || true
-# the frugal/persistent install - the installed mode 1bit OS wants - is these SFS files on a partition,
-# with no installer writing a rootfs at all, so they belong in <out-dir> next to the ISO. 3builddistro
-# leaves them in sandbox3/build/ for the ISO, which is why they are not in woof-output-*.
-cp -f sandbox3/build/*.sfs /out/ 2>/dev/null || true
-echo "== in /out:"; ls -l /out
-'
+    -e COMPAT="$compat" ubuntu:24.04 bash /recipe/container-build.sh

@@ -28,7 +28,8 @@ how to build it. The Ubuntu Server `autoinstall` design stays the documented fal
 | `sign-vmlinuz.sh` | signs the kernel image with this machine's enrolled MOK, so Secure Boot's GRUB will load it. The key never leaves the box: a copy goes into a root-owned 0700 dir, is converted (it is an OpenSSH key) and is proved against the certificate before anything is signed. Idempotent |
 | `sb-vars.sh` | OVMF's variable store with our certificate enrolled in `db`, so a QEMU boot verifies the appliance the way the board does |
 | `mk-huge-kernel.sh` | our kernel as woof-CE's kernel package (`huge-<kver>.tar.*`: `vmlinuz-<kver>` + a zdrv SFS with the module tree, the firmware and a marker). **Refuses an unsigned kernel image** |
-| `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem |
+| `build.sh` | woof-CE's CI recipe in a throwaway container, with our kernel and the build root on a host filesystem. Host side only: it resolves the inputs, then runs `container-build.sh` |
+| `container-build.sh` | what runs **inside** the container (merge2out → kernel into `kernel-kit/output` → 0setup → 1download → 2createpackages → 3builddistro, then the embed and the artifact checks). Its own file since cycle 14: as a 300-line single-quoted `bash -c '…'` string inside `build.sh`, one apostrophe in a comment ended the quote and bash reported a syntax error a hundred lines away — five builds in this lane — and shellcheck could not check it at all |
 | `g2-probe.sh` | gate G2: boot the built ISO headless in QEMU and keep the init's transcript, so "it boots on our kernel" is a measurement |
 | `g3-probe.sh` | gate G3, artifact half: the ISO carries our kernel, **that kernel image is signed**, its zdrv carries the module tree, and `amdxdna`/`ec_su_axb35` are built for that kernel and signed. `--cert <mok.pem>` requires the image's signature to be the enrolled MOK's; `--require-mok` for the release gate |
 | `mkimage.sh` | the shipped artifact: a GPT disk image (ESP with shim → grub, `1BIT-DATA` ext4 with the frugal install at `/1bit` and os/mini's data directories), so `os/mini/prepare-stick.sh` and the USB write work unchanged. All three grub entries **pin the boot media** (`pupsfs=1BIT-DATA`), so init never scans another drive — the board's scan had the JetKVM's USB mass storage and the internal NVMe in it — and refuses an unsigned kernel or an initrd whose init can exit. **Entry 0 is the headless console** (`pfix=copy,nox`: no X, a login on tty1 from Puppy's own `plogin` → `getty -n -l /bin/autologin` chain), entry 1 is the JWM desktop, entry 2 the serial root shell (owner, 2026-11-02: headless by default, the desktop for whoever wants it). `MODELS=<dir>` copies `*.gguf` and `*/model.q4nx` onto the data partition, which is how an HRX (GPU) model ships. The ISO stays a side artifact |
@@ -105,6 +106,13 @@ os/v3/puppy/build.sh resolute64 <kernel-out-dir> <puppy-out-dir> [woof-CE-dir]
 #    build (measured: one package, all four mirrors, and the URL was fine minutes later). If the box has
 #    built before, seed the cache instead: sudo cp -a <old-build-root>/local-repositories <new-build-root>/
 #    <puppy-out-dir> gets the ISO and the four SFS - the SFS files are the frugal install.
+#    LIBHSA_DIR=<dir> installs the WHOLE release-gated HSA runtime set at /opt/rocm-therock/lib
+#    (libhsa-runtime64.so.1 + the librocm_sysdeps_* set + librocprofiler-register.so.0) and points
+#    /opt/1bit/libhsa at it. The set, not one file: the engine resolves the runtime by scanning
+#    /opt/rocm-therock (ONEBIT_HRX_LIBHSA is a CMake definition, not a variable), and the pinned
+#    libhsa's RUNPATH is $ORIGIN, so it cannot load without its siblings - measured on the cycle-13
+#    board boot, which found no HRX device at all. The build refuses an incomplete set or one `ldd`
+#    cannot resolve. The release kit's own 1bit-llama directory holds a complete set.
 #    PAYLOAD=<unpacked lemonade-onebit-<tag>> embeds the release package (U3/U4): copied to
 #    /opt/1bit-package with /etc/init.d/10lemonade starting it at boot, and the build refuses an image
 #    whose SFS set lacks the engine, the launcher, /usr/local/bin/1bit, the service, the owner's key or
@@ -140,6 +148,13 @@ this recipe ships are:
 | `10lemonade` | starts `/opt/1bit-package/lemond-onebit`, mints `LEMONADE_API_KEY` into `/etc/1bit/lemond.conf` (mode 600) on first boot, binds `0.0.0.0:13305`, logs to `/var/log/lemond-onebit.log` |
 | `20onboard-ssh` | `ssh-keygen -A`, `/root/.ssh` 700 + `authorized_keys` 600, then sshd. An image with no key provisions no listener |
 | `21serial-console` | a root shell on `/dev/ttyS0`, only when the command line carries `1bit.serial=1` (that shell has no password, so it is opt-in) |
+| `26onboard-board` | `os/mini/board.sh` as `/usr/sbin/1bit-board` (the path release-check's `fans` row reads): EC fan curve, power profile and the detached boost loop, on a board whose DMI it knows; on any other machine it writes nothing and says so |
+| `27onboard-installer` | only on the `1bit.installer=1` boot entry: starts `1bit-console-install` on ttyS0 (when `1bit.serial=1`) or tty1 |
+
+tty1's login is `/usr/local/bin/1bit-console` (inittab), not Puppy's `plogin`: on a headless boot it is
+plogin's last step and nothing else (`getty -n -l /bin/autologin … tty1`), because on the 2026-11-02 board
+boot plogin's chain left **no prompt on tty1** while the same image gave one in QEMU. Every other boot still
+execs `plogin`, which is what lays out the first X session on the desktop entry.
 
 Two facts about the console that cost VM runs: the boot transcript is written to ttyS0 but the console
 Puppy leaves you with is **tty1**, so serial input goes nowhere without `21serial-console`; and `pfix=nox`
@@ -154,6 +169,27 @@ Two naming rules make this work, and both are silent when broken:
 - **the zdrv is where the modules live at boot**, mounted and unioned over `/` by Puppy's initrd, which
   is why the firmware sits inside it at `/lib/firmware/...` and why `modules.dep` is generated at build
   time (`depmod -b`) instead of on the machine.
+
+## Cycle 14: what the first board boot that reached the engine found
+
+The 2026-11-02 cycle-13 hardware boot passed 25 of 29 rows (NPU chat through Lemonade at 93–95 tok/s) and
+left six reds, each one a measurement rather than a guess. Cycle 14 closes them:
+
+| the board said | the cause, measured | the fix |
+|---|---|---|
+| `hrx-device`: `no HRX0` (`Available devices: (none)`), and `chat-hrx` never answered | **nothing ever opened `libhsa-runtime64.so.1`.** `ONEBIT_HRX_LIBHSA` is a CMake **compile definition**, not a variable (`CMakeLists.txt:279`, `cmake/hrx.cmake`), so the line in `/etc/1bit/libhsa.env` was inert; the engine resolves `--hrx-libhsa` → the path **baked at build time** → a recursive scan of `/opt/rocm-therock` (`app/serve.cpp:201`). The shipped binary's baked path is the release builder's TheRock, which an appliance does not have. Second defect on the same path: the pinned libhsa has `RUNPATH=$ORIGIN` and four `librocm_sysdeps_*` + `librocprofiler-register` NEEDED entries, and the image shipped the single file (`ldd`: 4 `not found`) | `build.sh LIBHSA_DIR=<dir>` installs the **whole set** flat at `/opt/rocm-therock/lib` (the path the scan walks), makes `/opt/1bit/libhsa` a symlink to it, exports `LD_LIBRARY_PATH` from `libhsa.env` (the trio there was never exported either), and **refuses** an incomplete set or one `ldd` cannot resolve. Row `U3 hsa runtime`: the set, `not-found=0`, and a `ctypes.CDLL` by **bare soname** in the guest |
+| the image booted with `amdgpu cwsr_enable=1` and no TTM parameters, unlike the install it was validated against | an APU serves models out of GTT (the ceiling is `ttm.pages_limit` in 4 KiB pages), and HRX's CWSR save area placement is the no-SVM trio's job | every grub entry now carries `ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0`; row `boot gtt` reads them off the running boot |
+| `u2-console`: no login prompt on tty1 | inittab respawns `plogin`, whose tail is `exec getty -n -l /bin/autologin … tty1`, and on that boot the chain left nothing on tty1 — while the same image gave a prompt in QEMU | inittab's tty1 entry is `/usr/local/bin/1bit-console`: that last step on a headless boot, `exec /bin/plogin` on every other (the desktop needs plogin). Row `U2 tty1 owner` says which process owns tty1 |
+| `gguf` FAIL on a model that was on the partition | not a registration bug: `05onboard-data` registers a `.gguf` under the **catalogue's** lower-cased id (`qwen3-0.6b-q4_k_m-1bit`) and `os/mini/release-check.sh` compared the file's own spelling with `grep -F` (case sensitive) | the row asks the same question case-insensitively (`have_model_ci`) |
+| `fans` SKIP: `no /usr/sbin/1bit-board` | the tool existed in `os/mini` and was never installed | `os/mini/board.sh` → `/usr/sbin/1bit-board`, started by `26onboard-board`. Row `U4 board tool` shows it present and silent on hardware it does not know |
+| the console sat on the kernel log for a long time | `pfix=copy` copies every SFS into RAM at the medium's speed before userspace exists, and nothing said so | `patch-init.sh` writes two console lines with the guest's own `/proc/uptime`: what it is waiting for, and how long it took. Row `U8 boot progress` reads them out of the transcript |
+
+And the owner's item: a **`1bit OS - install to a disk (1bit.installer=1)`** GRUB entry that boots the same
+system and starts `1bit-console-install`, which lists the disks with model and size, refuses the disk this
+system booted from (by device, and by any partition of it carrying `1BIT-DATA`), and requires the whole
+device name typed twice before `1bit-install` writes. Rows `U6 install entry` (the entry is in the image's
+own `grub.cfg`, read off the ESP it booted) and `U6 install guard` (`--check` on the boot disk exits 2,
+and so does the interactive path with the name fed in).
 
 ## Why the fragment exists
 

@@ -115,7 +115,7 @@ vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$iso" 2> /dev/null); do k
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
 ARTIFACT=$iso python3 - "$work" "$iso" > "$work/rows.txt" 2>&1 <<'PY'
-import socket, sys, time, os, re
+import socket, sys, time, os, re, subprocess, shutil
 work = sys.argv[1]
 artifact = sys.argv[2]
 log = open(os.path.join(work, "serial.log"), "ab", buffering=0)
@@ -151,14 +151,35 @@ def read_until(token, timeout):
         log.write(d); buf += d
     return None
 
-# A disk image boots through grub, whose menu is also on the serial line. The entries are, in order:
-# 0 headless console (the DEFAULT, owner 2026-11-02), 1 desktop, 2 root shell on the serial port - so the
-# harness picks the third the way a human at the console would: down, down, enter. The serial entry also
-# carries pfix=nox, so the rows below measure the headless boot the appliance now defaults to.
+def menu_downs(img, work):
+    """How many entries precede the serial root shell one, read out of the IMAGE's own grub.cfg.
+
+    The harness used to send two downs, because the menu was headless, desktop, serial. Cycle 14 added the
+    owner's "install to a disk" entry BEFORE the serial one, and a fixed count then booted the installer:
+    the run reported "no serial shell" while ssh answered, i.e. the machine was up and the harness was on the
+    wrong entry. Counting from the artifact means the rows follow the menu instead of a constant.
+    """
+    if not shutil.which("mcopy"):
+        return 2
+    try:
+        out = os.path.join(work, "grub.cfg.from-image")
+        subprocess.run(["mcopy", "-n", "-o", "-i", img + "@@1048576", "::/EFI/BOOT/grub.cfg", out],
+                       check=True, capture_output=True)
+        for i, line in enumerate(l for l in open(out) if l.startswith("menuentry ")):
+            if "serial root shell" in line:
+                return i
+    except Exception as e:                     # no mcopy, no FAT, a different layout: the old constant
+        print("INFO boot           grub.cfg not readable from the image (%s); assuming 2" % e, flush=True)
+    return 2
+
+# A disk image boots through grub, whose menu is also on the serial line. The serial entry carries pfix=nox,
+# so the rows below measure the headless boot the appliance defaults to.
 if artifact.endswith(".img"):
     if read_until(b"serial root shell", 120) is not None:
-        s.sendall(b"\x1b[B\x1b[B\r")
-        print("INFO boot           grub menu on serial, selected the serial-shell entry", flush=True)
+        downs = menu_downs(artifact, work)
+        s.sendall(b"\x1b[B" * downs + b"\r")
+        print("INFO boot           grub menu on serial, selected the serial-shell entry after %d down(s)" % downs,
+              flush=True)
 
 def read_until_re(pattern, timeout):
     """Like read_until, but for a regex; returns the text up to and including the match."""
@@ -257,6 +278,60 @@ rows = [
                      "n=$(grep -c 'one_rescue 1' /initrd/init); echo paths-guarded=$n; "
                      "[ \"$n\" = 3 ] && grep -q 'trap .one_rescue' /initrd/init && echo init-guard-3-paths",
                      "init-guard-3-paths"),
+    # Cycle 14, item 1 - the GPU blocker the board found: HRX registered no device because nothing ever opened
+    # libhsa-runtime64.so.1. `ONEBIT_HRX_LIBHSA` is a CMake compile definition, not a variable (measured in
+    # CMakeLists.txt:279 and app/serve.cpp:201), so the only runtime route on an appliance is the engine"'"'s
+    # scan of /opt/rocm-therock - and even handed the file, the pinned libhsa cannot load without its
+    # $ORIGIN siblings. This row asserts all three halves on the artifact: the set at the path the scan walks,
+    # no unresolved dependency, and a dlopen by BARE soname inside the guest (what libggml-hrx does when the
+    # engine has not exported IREE_HAL_AMDGPU_LIBHSA_PATH).
+    ("U3 hsa runtime", "ls -l /opt/rocm-therock/lib/libhsa-runtime64.so.1; "
+                     "echo not-found=$(LD_LIBRARY_PATH=/opt/rocm-therock/lib ldd "
+                     "/opt/rocm-therock/lib/libhsa-runtime64.so.1 2>&1 | grep -c 'not found'); "
+                     "ls -ld /opt/1bit/libhsa; ls /opt/rocm-therock/lib | wc -l; "
+                     "python3 -c 'import ctypes; ctypes.CDLL(\"/opt/rocm-therock/lib/libhsa-runtime64.so.1\"); "
+                     "print(\"hsa-abs-ok\")' 2>&1 | tail -1; "
+                     "LD_LIBRARY_PATH=/opt/rocm-therock/lib python3 -c 'import ctypes; "
+                     "ctypes.CDLL(\"libhsa-runtime64.so.1\"); print(\"hsa-soname-ok\")' 2>&1 | tail -1; "
+                     # the file's lines reach a CHILD only if they are exported - the cycle-13 file assigned
+                     # them as plain variables in a sourced file, which exports nothing. This is the same
+                     # question 10lemonade asks of it, answered by a subshell.
+                     "sh -c '. /etc/1bit/libhsa.env; echo exported LD_LIBRARY_PATH=$LD_LIBRARY_PATH "
+                     "SVM=$HSA_USE_SVM HRX=$HRX_ALLOW_NO_SVM' | grep -q 'LD_LIBRARY_PATH=/opt/rocm-therock/lib' "
+                     "&& echo libhsa-env-exported",
+                     "libhsa-env-exported"),
+    # Cycle 14, item 1 second half: the GTT ceiling and CWSR are on the boot line (the reference Ubuntu install
+    # runs ttm.pages_limit=31457280 ttm.page_pool_size=31457280 amdgpu.cwsr_enable=0; the cycle-13 image had
+    # none of them). Read off the RUNNING boot, so it is the cmdline the kernel got, not the tree.
+    ("boot gtt",     "tr ' ' '\\n' < /proc/cmdline | grep -E '^(ttm\\.|amdgpu\\.)'; "
+                     "tr ' ' '\\n' < /proc/cmdline | grep -c '^ttm.pages_limit=31457280$'",
+                     "ttm.pages_limit=31457280"),
+    # Cycle 14, item 2: who owns tty1. `U2 tty1` reads what a person sees; this says which process put it
+    # there, because the board run had a prompt in QEMU and none on the hardware and only this line names the
+    # difference. 1bit-console is the appliance's own entry (inittab), plogin is what it replaced.
+    ("U2 tty1 owner", "for p in /proc/[0-9]*; do t=$(readlink \"$p/fd/0\" 2>/dev/null); "
+                     "case \"$t\" in /dev/tty1) echo \"tty1-owner: $(tr -d '\\000' < $p/cmdline | tr '\\000' ' ')\";; esac; done | head -2; "
+                     "pgrep -af 'getty|plogin|1bit-console' | head -3; "
+                     "grep -c '^tty1::respawn:/usr/local/bin/1bit-console$' /etc/inittab", None),
+    # Cycle 14, item 5: release-check SKIPped `fans` on the board ("no /usr/sbin/1bit-board in this image").
+    # The tool is os/mini/board.sh, installed as the path that row reads. On a machine whose EC it does not
+    # know it must write nothing and say so - which is what this QEMU boot is.
+    ("U4 board tool", "ls -l /usr/sbin/1bit-board | tail -1; /usr/sbin/1bit-board known; echo known-rc=$?; "
+                     "/usr/sbin/1bit-board status 2>&1; /usr/sbin/1bit-board power-status 2>&1; "
+                     "[ -x /usr/sbin/1bit-board ] && echo board-tool-present", "board-tool-present"),
+    # Cycle 14, item 7 (owner): the "Install 1bit OS to a disk" entry, in the image"'"'s own grub.cfg - read off
+    # the ESP of the disk it booted, not from the tree.
+    ("U6 install entry", "mkdir -p /tmp/esp1; mount -o ro /dev/sda1 /tmp/esp1 2>/dev/null && { "
+                     "grep -c 'install to a disk' /tmp/esp1/EFI/BOOT/grub.cfg; "
+                     "grep -q 'install to a disk' /tmp/esp1/EFI/BOOT/grub.cfg && echo install-entry-grub; "
+                     "umount /tmp/esp1; }", "install-entry-grub"),
+    # ... and the guard, which is the part that must not be trusted to a person"'"'s typing: the boot disk is
+    # refused both ways (--check, and the interactive path with the disk name fed in), with nothing written.
+    ("U6 install guard", "1bit-console-install --check /dev/sda > /tmp/ci1.txt 2>&1; echo check-rc=$?; "
+                     "tail -2 /tmp/ci1.txt; "
+                     "printf '%s\\n' /dev/sda | 1bit-console-install > /tmp/ci2.txt 2>&1; "
+                     "echo typed-rc=$?; grep -c REFUSED /tmp/ci2.txt; "
+                     "1bit-console-install --list 2>&1 | head -4", "typed-rc=2"),
     # U1 as the board asked for it (owner, cycle 12): the LOGIN shell is bash, not only the bash binary
     # being present. /etc/passwd is what plogin -> getty -n -l /bin/autologin ends in.
     ("U1 login shell", "awk -F: '{print $1, $7}' /etc/passwd | head -4; "
@@ -391,6 +466,17 @@ for idx, row in enumerate(rows):
 PY
 driver_rc=$?
 cat "$work/rows.txt"
+
+# Cycle 14, item 6: the console says what it is waiting for. The two lines patch-init.sh puts in the initrd
+# print the guest's own /proc/uptime, so the transcript answers "how long is the copy to RAM" without a
+# stopwatch - and on the board, at USB speed, it is the number the owner was staring at.
+prog1=$(grep -ao '1bit: loading the system at [0-9.]*s' "$work/serial.log" 2>/dev/null | tail -1)
+prog2=$(grep -ao '1bit: system in RAM after [0-9.]*s' "$work/serial.log" 2>/dev/null | tail -1)
+if [ -n "$prog1" ]; then
+    echo "PASS U8 boot progress $prog1 | ${prog2:-no second line}"
+else
+    echo "FAIL U8 boot progress the console never said what it was doing (no progress line in the transcript)"
+fi
 
 # U3 over the network, from outside the guest.
 key=$(awk '/^INFO U3 keyvalue/ {print $NF}' "$work/rows.txt" 2>/dev/null | tail -1)

@@ -46,6 +46,13 @@ die() { echo "$prog: $*" >&2; exit 1; }
 MARK='1bit: PID 1 must never exit'
 FUNC_MARK='one_rescue()'
 
+# The console's progress lines (cycle 14, item 6). The board boot sat on the kernel log for a long time with
+# nothing saying why: with pfix=copy every SFS is copied into RAM at the medium's speed before the system is
+# up, and that is the slow part. Two lines, timestamped from /proc/uptime, so the wait has a name on the screen
+# and the duration is measurable afterwards (the VM rows read both).
+PROG1='*** 1bit: loading the system'
+PROG2='*** 1bit: system in RAM after'
+
 rescue_block() {
 cat <<'ONEBLOCK'
 # 1bit: PID 1 must never exit. Measured on the 2026-11-02 board boot: this script's failure path is
@@ -97,8 +104,10 @@ verify_initrd() {
         rm -rf "$tmp"; die "$gz: /init has no 1bit rescue guard (panic on any init failure) - patch-init.sh did not run"
     fi
     [ "$n" = 3 ] || { rm -rf "$tmp"; die "$gz: /init has $n of the 3 failure paths guarded"; }
+    grep -q "$PROG1" "$tmp/init" && grep -q "$PROG2" "$tmp/init" || {
+        rm -rf "$tmp"; die "$gz: /init has no 1bit boot-progress lines (the console says nothing while the SFS copy to RAM runs)"; }
     rm -rf "$tmp"
-    echo "ok: $gz: /init carries the guard and all 3 failure paths reach it"
+    echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, and both progress lines"
 }
 
 if [ "${1:-}" = "--verify" ]; then
@@ -136,6 +145,40 @@ else
     sh -n "$init" || die "the patched init does not parse (dash is the closest thing to busybox sh here)"
     echo "   three failure paths now reach one_rescue; trap installed on EXIT"
 fi
+
+# the two console progress lines, patched separately so the guard above stays greppable and idempotent
+patch_progress() {
+    local f=$1 tmp
+    grep -q "$PROG1" "$f" && grep -q "$PROG2" "$f" && return 0
+    grep -q '^#- handle pfix=copy pfix=ram pfix=nocopy' "$f" || {
+        echo "$prog: $f has no pfix=copy block - upstream changed, re-measure" >&2; return 1; }
+    grep -q '^echo "PUPMODE=\$PUPMODE"' "$f" || {
+        echo "$prog: $f has no PUPMODE line - upstream changed, re-measure" >&2; return 1; }
+    tmp=$(mktemp) || return 2
+    # the lines carry no single quotes on purpose: this awk program is single-quoted, and three of the last four
+    # build-side bugs in this lane were a quote inside a quoted block. `read up _ < /proc/uptime` avoids the
+    # -d' ' that would have needed one.
+    awk '
+        /^#- handle pfix=copy pfix=ram pfix=nocopy/ && !d1 {
+            print "\t# 1bit: say what the console is waiting for (pfix=copy copies the SFS into RAM at the medium speed)"
+            print "\tread up _ < /proc/uptime"
+            print "\techo \"'"$PROG1"' at ${up}s: with pfix=copy the SFS are copied into RAM, which is the slow part on USB\" > /dev/console"
+            d1 = 1
+        }
+        /^echo "PUPMODE=\$PUPMODE"/ && !d2 {
+            print "\tread up _ < /proc/uptime"
+            print "\techo \"'"$PROG2"' ${up}s; PUPMODE=$PUPMODE\" > /dev/console"
+            d2 = 1
+        }
+        { print }
+    ' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
+    grep -q "$PROG1" "$tmp" && grep -q "$PROG2" "$tmp" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$f" && rm -f "$tmp"
+}
+if ! patch_progress "$init"; then
+    die "could not add the 1bit boot-progress lines to $init"
+fi
+echo "   two console progress lines: the copy to RAM, and its duration"
 if [ "$master" ]; then
     if ! grep -q "$MARK" "$master"; then
         echo "== init guard into the woof-CE master copy ($master)"

@@ -349,6 +349,16 @@ have_model() {
     printf '%s' "${MODELS:-}" | grep -qF "\"user.$1\"" && return 0
     return 1
 }
+# Case-insensitive sibling, for comparing a FILE name against an id. The appliance registers a .gguf under
+# the shipped catalogue id, which is lower-cased (05onboard-data: name[:-5].lower() + "-1bit"), while the file
+# on the partition keeps the model's own spelling - so on the 2026-11-02 board boot
+# /data/models/Qwen3-0.6B-Q4_K_M.gguf WAS registered and served as qwen3-0.6b-q4_k_m-1bit, and this row
+# failed it with a case-sensitive grep. The row still asks the same question (does Lemonade list this file);
+# it just no longer answers it by spelling.
+have_model_ci() {
+    printf '%s' "${MODELS:-}" | grep -qiF "$1" && return 0
+    return 1
+}
 GGUF=$(ls /data/models/*.gguf 2>/dev/null | head -1)
 GGUF_NAME=$(basename "${GGUF:-none}" .gguf)
 
@@ -430,9 +440,10 @@ elif [ ! -e /dev/kfd ] && ! ls /dev/accel/accel* > /dev/null 2>&1; then
     # QEMU (cycle 12): /api/v1/models carried no onebit id at all on a VM, while the same image on the
     # board lists the model. Same hardware test the gpu/npu/models rows use.
     skip gguf "'$GGUF_NAME.gguf' is on the data partition; this machine has no GPU or NPU, so Lemonade hides the onebit entries that would list it"
-elif have_model "$GGUF_NAME" || have_model "$GGUF_NAME-1bit"; then
-    # the local registry names a GGUF <name>-1bit (os/mini/init.sh and /etc/init.d/05onboard-data both
-    # do), and llama.cpp lists the bare name; either answer means Lemonade knows this file
+elif have_model_ci "$GGUF_NAME"; then
+    # the local registry names a GGUF <name>-1bit (os/mini/init.sh and /etc/init.d/05onboard-data both do,
+    # the appliance under the catalogue's lower-cased id), and llama.cpp lists the bare name; either answer
+    # means Lemonade knows this file
     pass gguf "the stick's own model '$GGUF_NAME' is listed"
 else
     fail gguf "/data/models/$GGUF_NAME.gguf is on the data partition but Lemonade does not list it"

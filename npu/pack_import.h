@@ -59,6 +59,11 @@ inline bool mul_ok(uint64_t a, uint64_t b, uint64_t& out) {
 struct Dims {
     int hidden = 0, layers = 0, heads = 0, kv_heads = 0, head_dim = 0, intermediate = 0, vocab = 0;
     float rope_theta = 0;
+    // config.json's rms_norm_eps, and the two bytes it is stored as in the .fconst's block headers.
+    // engine#734: the layer-block locator looked for bf16 1e-6 (86 35) only, which is what the Qwen
+    // packs declare; Llama-3.2-1B declares 1e-5 (28 37) and so had no anchors at all.
+    float rms_norm_eps = 1e-6f;
+    unsigned short eps_bits = 0x3586;
     std::string model_type;
     std::vector<int> eos;
 };
@@ -168,6 +173,19 @@ struct TileW {
 };
 // Bytes in one 64-row tile of that layout: 2*(k/128) + 2 subvolumes of 2,176. 0 when k is not a
 // positive multiple of 128, i.e. when the payload cannot be tiles of this shape.
+// The layer-block geometry of a `.fconst`, measured from its epsilon anchors (engine#734). The anchors
+// are the pack's OWN bf16 rms_norm_eps, so `eps_bits` comes from its config.json via
+// `bf16_bits_of()`; the default is bf16 1e-6, which is what the Qwen family declares.
+struct FconstGeom {
+    int64_t stride = 0;   // bytes per layer block
+    int64_t h1 = 0;       // offset of the second (post-attention) header within a block
+    int period = 0;       // headers per block
+    int blocks = 0;       // block starts seen
+    std::string why;      // non-empty when the geometry could not be established
+};
+unsigned short bf16_bits_of(float v);
+FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
+
 int64_t attn_tile_bytes(int64_t k);
 TileW decode_tile(const uint8_t* tile, int k);
 // The exact inverse. Used only as the importer's self-check: a tile that does not survive

@@ -322,6 +322,14 @@ private:
     // one launch (per-row activation scales, which the batched launcher and the dequantiser already carry).
     bool run_lm_head_rows(const std::vector<float>& h_rows, int M, std::vector<float>& logits_all);
 
+    // ── the gemv (forge q4_1 GEMV) weight image ────────────────────────────────────────────────
+    // I8Ctx detects that family from each ELF's declared argument widths; when it is in use the
+    // weight BO holds the container's own q4_1 tiles instead of an int8 packing, because the kernel
+    // dequantises with each tile's bf16 scale/zero and repacking would throw those away.
+    static int role_from_tag(const char* sc);
+    bool gemv_tiles(int role, std::vector<uint8_t>& out);
+    bool run_lm_head_gemv(const std::vector<float>& h, std::vector<float>& logits);
+
     Q4nxForwardConfig c_;
     ModelWeights* mw_ = nullptr;
     xrt::device* dev_ = nullptr;
@@ -541,6 +549,10 @@ private:
     // (lm_head_tiles_, 5.35 GB) are both dead on the NPU path and are released.
     std::vector<PackedWeight> lm_head_packed_;
     int                       lm_head_packed_T_ = 0;
+    // gemv family: the head's tile stream is the whole image in one BO, copied once.
+    std::vector<uint8_t>      gemv_blob_;   // one design's tile stream, reused per upload
+    std::vector<uint8_t>      gemv_head_;
+    std::unique_ptr<xrt::bo>  head_bo_;
     // The lm head on ternary pb16i images (conv/pack_head_pb16i.py): output.weight is PTQ1_0 in
     // the folded GGUF, so the image is exact, it is half the int8 codes' bytes, and it runs the
     // same kernel the MLP's GU launch runs.  Off -- and the head keeps the int8 family -- when

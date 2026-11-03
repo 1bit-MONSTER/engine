@@ -33,17 +33,24 @@ install itself onto a disk: `1bit-install` copies the system you booted, so an i
 | | |
 |---|---|
 | stick | **16 GB or more**: the image is 9,128,902,656 bytes (8.5 GiB) and the data partition takes the rest of the stick |
-| image | the 1bit OS image from the [releases page](https://github.com/1bit-MONSTER/engine/releases) |
+| image | `1bit-os-puppy.img.xz` + `SHA256SUMS` from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS); the [releases page](https://github.com/1bit-MONSTER/engine/releases) carries the `lemonade-onebit` package and the release notes |
 | machine | an AMD Ryzen AI MAX+ 395 (Strix Halo) box, the machine this release is built and tested on |
 | firmware | UEFI, Secure Boot **on** (see [6](#6-secure-boot-and-our-mok)) |
 
-Write it and prepare it (the second line is what puts the API key, your SSH key and any models on the
-stick — see [1](#1-run-from-the-stick-no-install)):
+The image is on Hugging Face, not on the GitHub release, because a GitHub release asset is capped at
+2 GiB and this one is 9,128,902,656 B written (**2,212,389,580 B** as `.img.xz`). Fetch both files, check
+the checksum, then write it and prepare it (the last line is what puts the API key, your SSH key and any
+models on the stick — see [1](#1-run-from-the-stick-no-install)):
 
 ```sh
-sudo dd if=1bit-os-puppy.img of=/dev/sdX bs=4M conv=fsync status=progress
+# 1bit-os-puppy.img.xz and SHA256SUMS from https://huggingface.co/1bit-MONSTER/1bit-OS
+sha256sum -c SHA256SUMS --ignore-missing
+xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
 sudo os/mini/prepare-stick.sh /dev/sdX --mint --ssh-pubkey ~/.ssh/id_ed25519.pub
 ```
+
+Writing the `.img.xz` straight from balenaEtcher or Rufus (DD mode) is the same write with no shell
+line, but the `prepare-stick` line below is still what puts the API key on the stick.
 
 `prepare-stick` writes `/ssh/authorized_keys` and a freshly minted Lemonade API key into
 `/lemonade/lemond.conf` on the stick's `1BIT-DATA` partition, and copies `--model` files into

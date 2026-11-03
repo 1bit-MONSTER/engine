@@ -27,8 +27,20 @@ on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemona
 
 ## Get started
 
-1. Download the 1bit OS image from the [releases page](https://github.com/1bit-MONSTER/engine/releases).
-2. Write it to a USB stick (16 GB or more: the image is about 9 GB).
+1. Download the 1bit OS image from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS):
+   `1bit-os-puppy.img.xz` (2,212,389,580 B compressed, 9.1 GB written) with the `SHA256SUMS` beside
+   it. The image is served from Hugging Face because a GitHub release asset is capped at 2 GiB; the
+   [releases page](https://github.com/1bit-MONSTER/engine/releases) stays the home of the
+   `lemonade-onebit` package, the release notes and the release `SHA256SUMS`, and links there for the
+   image.
+2. Verify it, then write it to a USB stick (16 GB or more):
+
+   ```sh
+   sha256sum -c SHA256SUMS --ignore-missing
+   xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress
+   ```
+
+   balenaEtcher and Rufus (DD mode) write the `.img.xz` directly.
 3. Boot the machine from the stick. Secure Boot can stay on: shim, grub, the kernel and its modules are
    all signed with our MOK.
 4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run
@@ -44,7 +56,7 @@ same system. The userland is an ordinary one - `bash`, `sudo` and `apt` work - a
 to last (models, Lemonade's config and cache, SSH keys) lives on the `1BIT-DATA` partition
 ([os/README.md](os/README.md), [docs/os-v3.md](docs/os-v3.md)).
 
-Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the same releases page adds the engine as a Lemonade backend; nothing else changes ([docs/lemonade.md](docs/lemonade.md)).
+Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the [releases page](https://github.com/1bit-MONSTER/engine/releases) adds the engine as a Lemonade backend; nothing else changes ([docs/lemonade.md](docs/lemonade.md)).
 
 ## What it is
 

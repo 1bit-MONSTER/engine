@@ -230,13 +230,21 @@ rehearsal at `v7.3` and linux-next `next-20261022` (`#525`).
 | file | what |
 |---|---|
 | `lemonade-onebit-<tag>-linux-x86_64.tar.zst` | Lemonade (`lemond`, `lemonade`, its web app) from our fork with the onebit recipe, and the engine in `1bit/`: `1bit` and every backend it ships: **HRX** (and the CPU, from the same llama-server) and the NPU engine's runtime. DwarfStar is out of the tree since 2026-11-02 (HIP kernels only, owner decision 2026-11-01); no Vulkan or ROCm llama.cpp since RFC #213 stage 3 |
-| `1bit-os-<tag>.img.zst`, `1bit-os-<tag>.efi` | 1bit OS, a Lemonade appliance with the engine inside as a bootable USB image ([os/README.md](../os/README.md)). The c18-c20 candidates carried the BusyBox `os/mini` image under this name, which is the CI/VM target now, not 1bit OS |
+| `1bit-os-<tag>.img.xz`, `1bit-os-<tag>.efi` | **1bit OS image: [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS), not a GitHub release asset** — `1bit-os-puppy.img.xz` (2,212,389,580 B compressed, 9,128,902,656 B written) with its `SHA256SUMS`, because a GitHub release asset is capped at 2 GiB. This GitHub release carries the notes, `changes.json` and the asset `SHA256SUMS`, and links there for the image. 1bit OS is a Lemonade appliance with the engine inside as a bootable USB image ([os/README.md](../os/README.md)); the c18-c20 candidates carried the BusyBox `os/mini` image under the `img.zst` name, which is the CI/VM target now, not 1bit OS |
 | `changes.json`, `SHA256SUMS` | what moved upstream since the last release, as data; checksums |
 
 The engine is embedded in Lemonade, so it ships only inside those two: there is no standalone
 engine tarball and no Windows package (Lemonade has its own Windows build). On the GPU the engine
 is pure HRX with HIP kernels: no Vulkan, ROCm backend, Metal, ZINC or CUDA. Lemonade serves those
 with its own backends.
+
+The image is hosted on **[Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS)**, not among the
+release assets: GitHub caps one asset at 2 GiB, and the Puppy image is 9,128,902,656 B written,
+2,212,389,580 B as `1bit-os-puppy.img.xz`. `SHA256SUMS` travels with it, so the write path is
+`sha256sum -c SHA256SUMS --ignore-missing` then
+`xz -dc 1bit-os-puppy.img.xz | sudo dd of=/dev/sdX bs=4M conv=fsync status=progress` (balenaEtcher and
+Rufus DD-mode take the `.img.xz` directly; stick 16 GB or more). The repository is private until
+v2026.44 is published.
 
 The engine in `1bit/` keeps the build tree's layout (`scripts/package-linux.sh`): `1bit` finds each
 backend at the same path relative to itself as in the build (`app/built_path.h`), and every program

@@ -136,8 +136,10 @@ comes up in its own menu instead of booting, pick it there once.
 > correct, but two defects stop the first boot: installer step 5 writes `pupsfs=UUID=<uuid>`, which
 > Puppy's init does not resolve ([#865](https://github.com/1bit-MONSTER/engine/issues/865)), and step 7's
 > `BootNext` lands on the firmware's own boot-manager entry instead of the new one
-> ([#866](https://github.com/1bit-MONSTER/engine/issues/866)). Both are in the appliance lane for the
-> release; until they land, boot the installed disk by editing its `grub.cfg` entry to
+> ([#866](https://github.com/1bit-MONSTER/engine/issues/866)). Step 7 is **fixed on `main`**
+> ([#889](https://github.com/1bit-MONSTER/engine/pull/889), merged 2026-11-03); the init fix is
+> [#890](https://github.com/1bit-MONSTER/engine/pull/890), open at this writing. Until both are in an
+> image, boot the installed disk by editing its `grub.cfg` entry to
 > `pupsfs=1BIT-DATA 1bit.data=UUID=<uuid>` — measured to boot, with the models and the API key in place.
 
 Check the result from the installed system:
@@ -240,9 +242,10 @@ On the cycle-13 image (`sha256 dcc619ff74882f484e4c7dfb373980f294ce2f39b02291fb8
 | the image boots to Lemonade with Secure Boot on | boot, `lemond` on `0.0.0.0:13305`, web app on `/`, `ssh` on `22`, kernel signature OK |
 | `1bit-install` refuses the disk it booted from | `1bit-install: REFUSED: /dev/sda is the disk this system booted from (/dev/sda2 is on it)`, exit 2, the stick's UUIDs unchanged afterwards |
 | an install to a bare disk completes | all seven steps, exit 0: GPT `1BIT-OS` 512 MiB + `1BIT-DATA` 7.5 GiB, `grub.cfg` pinned to the new UUID, kernel sha256 read back equal, `.installed` and `install.log` written |
-| the firmware entry is written | `efibootmgr` lists `1bit OS` → `HD(1,GPT,<new ESP>)/\EFI\BOOT\BOOTX64.EFI` (id `0004`, not the `0000` the step's own log line printed — [#866](https://github.com/1bit-MONSTER/engine/issues/866)) |
+| the firmware entry is written | `efibootmgr` lists `1bit OS` → `HD(1,GPT,<new ESP>)/\EFI\BOOT\BOOTX64.EFI` (id `0004`, not the `0000` the step's own log line printed — [#866](https://github.com/1bit-MONSTER/engine/issues/866), fixed by
+[#889](https://github.com/1bit-MONSTER/engine/pull/889)) |
 | what the install copies | the installed data partition holds `/1bit` (`vmlinuz`, `initrd.gz`, the four SFS), `/data` with the models, `lemonade/` and `ssh/`, and `.installed` |
-| boot of the installed disk as written | **fails** on this image: init says `Partition UUID=<uuid> not found` and drops to the rescue console ([#865](https://github.com/1bit-MONSTER/engine/issues/865)) |
+| boot of the installed disk as written | **fails** on this image: init says `Partition UUID=<uuid> not found` and drops to the rescue console ([#865](https://github.com/1bit-MONSTER/engine/issues/865); fix open as [#890](https://github.com/1bit-MONSTER/engine/pull/890)) |
 | boot of the same disk with `pupsfs=1BIT-DATA` (label) instead of `pupsfs=UUID=…` | **boots**: `puppypc20143`, `/data/.installed` present, `lemond` up, `GET /api/v1/models` 401 without the key and 200 with it |
 | the boot device is rejected, not guessed | the refusal above is by device: `/proc/mounts` names `/dev/sda2` as `/data`, and the installer resolves the disk behind it |
 | `pmedia=usbhd` is not the cause | the failed boot was from a USB device, where `pmedia=usbhd` is the correct media class; the label/UUID A/B above isolates the cause to the UUID form |

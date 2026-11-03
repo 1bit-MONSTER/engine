@@ -41,11 +41,13 @@ The key is the only gate. Anything on the same network that has it can use the b
 
 ```sh
 hostname -I                 # e.g. 192.168.1.42
-hostname                    # puppypc19108 - Puppy names each machine from its MAC address
+hostname                    # 1bit-os - the name the image sets in /etc/hostname
 ```
 
-The hostname is **not** a fixed name: Puppy sets a per-machine `puppypc…` at boot, so read it off the box
-rather than guessing `1bit.local`. If you cannot get to a console, the router's client list shows the box
+**The name is `1bit-os`, not an address.** Puppy only invents a per-machine `puppypc<MAC digits>` while
+`/etc/hostname` still holds its stock word, and the shipped image sets `1bit-os` instead (measured: on the
+cycle-13 image it still booted as `puppypc19108`, which is why older notes name it that way). Read the
+address off the box rather than guessing `1bit.local` — mDNS is not claimed. If you cannot get to a console, the router's client list shows the box
 (the MAC of the wired or wireless interface), and the box announces the server on the LAN itself —
 `lemond` logs `Net Broadcast` on each RFC1918 interface, and `lemonade scan` (run anywhere on the same
 network with the CLI installed) lists the beacons it hears.
@@ -211,5 +213,5 @@ board run adds, and this page does not re-measure, is the onebit route itself: `
 through Lemonade on the Ryzen AI MAX+ 395.
 
 Not verified on this page: a phone against a real box on a real LAN (the app needs a device), and mDNS —
-avahi-daemon runs on the box, but the box's name is Puppy's per-machine `puppypc…`, so this page tells
-you to read the address instead of relying on `<name>.local`.
+avahi-daemon runs on the box, but this page does not claim `<name>.local` resolves, so read the address
+with `hostname -I` or the router instead.

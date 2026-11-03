@@ -53,6 +53,11 @@ FUNC_MARK='one_rescue()'
 PROG1='*** 1bit: loading the system'
 PROG2='*** 1bit: system in RAM after'
 
+# engine#865: Puppy's init resolves a partition by name or by a bare blkid token, but not by the `UUID=`/`LABEL=`
+# form - and the installer writes `pupsfs=UUID=<uuid>` so an installed disk can find its own data partition once two
+# 1BIT-DATA partitions exist (engine#539/#711). --verify greps the packed initrd for this marker.
+UUID_MARK='1bit: pupsfs=UUID'
+
 rescue_block() {
 cat <<'ONEBLOCK'
 # 1bit: say it on every console a person might be watching. Since cycle 15 the boot line ends with
@@ -128,8 +133,12 @@ verify_initrd() {
         rm -rf "$tmp"; die "$gz: /init has no one_console (the progress and rescue lines reach one console only)"; }
     grep -qF "one_console \"$PROG1" "$tmp/init" || {
         rm -rf "$tmp"; die "$gz: /init writes the progress lines to /dev/console only (nothing on ttyS0 for a headless box)"; }
+    # engine#865: an installed disk boots with pupsfs=UUID=<uuid>; an init that cannot resolve that form drops to the
+    # rescue console instead of booting, so the packed initrd has to carry the resolver too
+    grep -qF "$UUID_MARK" "$tmp/init" || {
+        rm -rf "$tmp"; die "$gz: /init cannot resolve pupsfs=UUID=<uuid> (engine#865: an installed disk would not boot)"; }
     rm -rf "$tmp"
-    echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, and both progress lines"
+    echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, both progress lines, and the pupsfs=UUID resolver"
 }
 
 if [ "${1:-}" = "--verify" ]; then
@@ -235,6 +244,47 @@ patch_progress() {
     grep -qF "one_console \"$PROG1" "$tmp" && grep -qF "one_console \"$PROG2" "$tmp" || { rm -f "$tmp"; return 1; }
     cat "$tmp" > "$f" && rm -f "$tmp"
 }
+# engine#865: wait_for_blkid() builds its blkid match out of the token it is given, which is a device name or a bare
+# label/UUID. With `UUID=<uuid>` the generated pattern was " UUID=.UUID=<uuid>" - it can never match, so an installed
+# system could not find the partition it had just booted from: measured "Partition UUID=... not found.", init exits
+# 1, rescue console. Prefixed tokens are matched against blkid's own UUID="..."/LABEL="..." fields (quotes optional:
+# util-linux and busybox blkid both print them today).
+patch_pupsfs_uuid() {
+    local f=$1 tmp prog
+    grep -qF "$UUID_MARK" "$f" && return 0
+    grep -qF 'PART="$(blkid | grep "$1"' "$f" || {
+        echo "$prog: $f has no wait_for_blkid blkid chain - upstream changed, re-measure" >&2
+        return 1; }
+    tmp=$(mktemp) || return 2
+    prog=$(mktemp) || return 2
+    # the awk program is a quoted here-doc: no shell expansion, so awk's own escaping is written as-is
+    cat > "$prog" <<'ONEAWK'
+index($0, "PART=\"$(blkid | grep \"$1\"") && !done {
+    print "\t# " mark ": a prefixed token is a blkid FIELD, not a substring (engine#865)"
+    print "\tcase \"$1\" in"
+    print "\t UUID=*)  w=\"${1#UUID=}\""
+    print "\t          PART=\"$(blkid 2>/dev/null | grep -E \" UUID=\\\"?${w}\\\"?( |$)\" | cut -f1 -d: | cut -f3 -d/)\" ;;"
+    print "\t LABEL=*) w=\"${1#LABEL=}\""
+    print "\t          PART=\"$(blkid 2>/dev/null | grep -E \" LABEL=\\\"?${w}\\\"?( |$)\" | cut -f1 -d: | cut -f3 -d/)\" ;;"
+    print "\t *) PART=\"$(blkid | grep \"$1\" | grep -E \"^/dev/$1| LABEL=.$1| UUID=.$1\" | cut -f1 -d: | cut -f3 -d/)\" ;;"
+    print "\tesac"
+    done = 1
+    next
+}
+{ print }
+ONEAWK
+    # the matched line is printed OVER by the case block above (print + next), so it is replaced, not duplicated
+    awk -v mark="$UUID_MARK" -f "$prog" "$f" > "$tmp" || { rm -f "$tmp" "$prog"; return 1; }
+    rm -f "$prog"
+    grep -qF "$UUID_MARK" "$tmp" || { rm -f "$tmp"; return 1; }
+    cat "$tmp" > "$f" && rm -f "$tmp"
+    return 0
+}
+if ! patch_pupsfs_uuid "$init"; then
+    die "could not teach init to resolve pupsfs=UUID=<uuid> (engine#865)"
+fi
+echo "   wait_for_blkid resolves UUID= and LABEL= tokens (engine#865)"
+
 if ! patch_progress "$init"; then
     die "could not add the 1bit boot-progress lines to $init"
 fi

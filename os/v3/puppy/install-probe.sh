@@ -69,7 +69,7 @@ rm -f "$work/ser" "$work/serial.log"
     -display none -vga std -no-reboot \
     -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
 
-prog_out=$(PUPSFS=$pupsfs python3 - "$work" "$img" <<'PY'
+prog_out=$(PUPSFS=$pupsfs PROBE_VARS=$vars python3 - "$work" "$img" <<'PY'
 import os, re, socket, subprocess, sys, time
 work, img = sys.argv[1], sys.argv[2]
 s = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
@@ -251,6 +251,85 @@ else:
         print("PASS grub.cfg     pupsfs=%s (and 1bit.data= stays on the UUID)" % got)
     if "1bit.data=UUID=" not in line:
         print("FAIL grub.cfg     the boot line lost 1bit.data=UUID= (#539/#711)"); ok = False
+
+# ---- engine#865's own question, when asked: boot the INSTALLED disk and see whether it reaches userspace. The
+# init resolves the boot line's pupsfs=...; with `UUID=<uuid>` an init that cannot resolve that form exits 1 into the
+# rescue console, which is what the issue measured. Only meaningful with PUPPY_ASSERT_PUPSFS=1 (the installer writes
+# the UUID form on purpose), so the #866 run stops here.
+if assert_pupsfs:
+    print("== booting the installed disk (init must resolve pupsfs=%s)" % got)
+    s.close()
+    log.close()
+    # the first VM still holds target.img (the installed disk) with a write lock, and this one would be refused with
+    # "Failed to get write lock" (measured). Stop it by the STICK image on its command line - the new VM's line names
+    # target.img instead, so this cannot kill what it is about to start.
+    subprocess.run(["pkill", "-f", "qemu-system-x86_64.*" + img],
+                   stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    time.sleep(2)
+    b = os.path.join(work, "ser-installed")
+    for f in (b, b + ".log"):
+        try: os.unlink(f)
+        except OSError: pass
+    q = ["qemu-system-x86_64", "-m", "4096", "-smp", "4",
+         "-drive", "file=" + os.path.join(work, "target.img") + ",format=raw,if=none,id=d0",
+         "-device", "qemu-xhci", "-device", "usb-storage,drive=d0",
+         "-drive", "if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd",
+         "-drive", "if=pflash,format=raw,file=" + os.environ["PROBE_VARS"],
+         "-machine", "q35,smm=on", "-global", "driver=cfi.pflash01,property=secure,value=on",
+         "-display", "none", "-vga", "std", "-no-reboot",
+         "-serial", "unix:" + b + ",server,nowait"]
+    proc = subprocess.Popen(["systemd-run", "--user", "--scope", "-q", "-p", "MemoryMax=6G", "--"] + q,
+                            stdout=open(os.path.join(work, "qemu-installed.out"), "wb"),
+                            stderr=subprocess.STDOUT)
+    ok2 = False
+    text = ""
+    try:
+        t = socket.socket(socket.AF_UNIX, socket.SOCK_STREAM)
+        end = time.time() + 90
+        while True:
+            try:
+                t.connect(b); break
+            except OSError:
+                if time.time() > end:
+                    print("FAIL installed    the second VM never opened its serial socket"); break
+                time.sleep(0.2)
+        t.settimeout(0.5)
+        end = time.time() + 240
+        while time.time() < end:
+            try:
+                d = t.recv(65536)
+            except socket.timeout:
+                continue
+            except OSError:
+                break
+            if not d:
+                break
+            text += d.decode("utf-8", "replace")
+            open(os.path.join(work, "serial-installed.log"), "w").write(text)
+            # from the initrd era to the running system: the 1bit progress line proves the SFS were found and layered
+            if "1bit: system in RAM after" in text or "ResolutePup64" in text:
+                ok2 = True
+                break
+            if "init stopped" in text or "not found." in text:
+                break
+    finally:
+        subprocess.run(["pkill", "-f", "qemu-system-x86_64.*" + os.path.join(work, "target.img")],
+                       stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+        try: proc.wait(timeout=10)
+        except Exception: pass
+    if ok2:
+        print("PASS installed    the installed disk reached userspace on its own boot line")
+    else:
+        # name the three ways this leg fails, because they belong to different issues: the firmware went to the
+        # boot-manager menu (engine#866: BootNext pointed at Boot0000), the init could not resolve the boot line
+        # (engine#865), or init gave up and dropped to the rescue console
+        why = "the firmware booted BootManagerMenuApp instead of 1bit OS (engine#866)" \
+            if "BootManagerMenuApp" in text and "ResolutePup64" not in text else \
+            ("the init could not resolve the boot line (engine#865)" if "not found." in text else \
+             ("init dropped to the rescue console" if "init stopped" in text else "no boot output"))
+        print("FAIL installed    the installed disk did not boot: %s (transcript %s)" %
+              (why, os.path.join(work, "serial-installed.log")))
+        ok = False
 
 print("== %s" % ("PASS" if ok else "FAIL"))
 sys.exit(0 if ok else 1)

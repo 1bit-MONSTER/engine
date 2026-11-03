@@ -83,6 +83,29 @@ a round (A B, then B A) in whatever drives the A/B pair: the script detects a co
 way and says so, because that is the second serve's warm-up, not noise. `scripts/npu-window11.sh --self-test` is
 the committed check of that policy.
 
+**The folded row (`--folded`), engine#876.** That gate ran on one `rm` Qwen3-0.6B container, which has no folded
+basis, no ternary LM head and no split full-attention QKV — so the parts of the forward the containers this box
+actually serves (`bonsai2-27b-pb16i`, `bonsai2-27b-t2s2`) depend on were never executed by it. Three defects that
+lived exactly there (engine#808) were invisible to a gate that had produced 108/108 identical transcripts, 9/9
+identical prof rows and 452 bit-identical logprob tokens: a dropped role→context resolution for ternary-only designs
+(the container refuses to answer), the activation rotation rewritten as an xor butterfly (a signed permutation of the
+true Hadamard — wrong activations on every projection, well-formed output), and `head_pb16i_` read as a
+self-referencing local (the LM head takes the int8 branch against a ternary ELF → `SIGSEGV` in `run_lm_head`). Text
+equality cannot see any of them, because two of the three keep the text plausible and the third kills the process.
+
+So `--folded` runs the same three transcripts against a folded container **with the container's own
+debug taps on** (`NPU_PB16I_TRACE` / `NPU_QKV_DUMP`, both already in the forward, so neither arm is instrumented
+differently) and records, per launch of the tapped layer, the raw activation, the rotated activation, the int8 codes
+the kernel was given, its int32 accumulator, the dequantised output and the side-table `eref`. Two runs must agree on
+those lines as well as on the text, and there the tap equality is the assertion that bites: with no measured control
+the ms/launch columns are printed but not scored (a hand-typed 2 % cannot be evaluated on this box, engine#834), and
+with `--control` they are scored like any other row. Cost: one container already on disk, ~2.5 min of device time for
+both sides of a comparison, no new artifacts. The row also caught the fourth defect, on `main` rather than in a pack:
+an `I8` embedding table dequantised against a K grid that was still 0 (engine#881, fixed ahead of this row). What it
+must accept and refuse is pinned without a device by `tests/npu_window11_compare.sh` (ctest `npu_window11_compare`):
+folded against folded passes, a single differing rotated activation fails, a folded log against a plain one fails, and
+the plain row keeps its tolerance.
+
 **`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
 `noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
 full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
@@ -364,6 +387,34 @@ quality (KLD over a corpus, perplexity), never single-token argmax or per-token 
 a kernel with the **expert ids held fixed** (A row + the router's own top-k + the expected int32 per
 expert, which is what `tools/moe_expert_chunks.py gate` emits), so the gate measures the kernel and
 not the model's own sensitivity. `verify` result: see the TMOE-NPU lane's state file.
+
+**A chunk-list dispatch shares ONE A across its chunks: exact for gate and up, impossible for down.**
+At batch 1 every selected expert of a layer sees the same activation row, so gate and up are one
+dispatch each — but `down_proj`'s input is each expert's own SwiGLU output, so it needs a per-chunk A
+or one dispatch per expert. On this model (48 layers; per layer q, gate, k, v, o in the pb16i split,
+then gate|up|down) that is **385 dispatches per token with the shared A and 721 without**, and that
+gap decides whether the case meets its own bar:
+
+| per-dispatch fixed cost | down shares one A | down per expert | Qwen3-4B dense, same arithmetic |
+|---|---|---|---|
+| 0.086 ms (fit below) | **11.05 tok/s (1.06x)** | 8.37 (0.80x) | 10.45 |
+| 0.116 ms (quoted floor) | 9.80 (1.01x) | 7.09 (0.73x) | 9.68 |
+
+That is at 34 GB/s in-loop over a **1,703,854,080 B/token** stream — routed experts 1,019,215,872
+(8 of 128 x 3 projections, pb16 NW=16) + attention 509,607,936 + `lm_head` 175,030,272, with
+`--pad-n 1024` on gate/up taking it to 1,930,346,496 — and the ratio holds across 34-43.4 GB/s:
+**0.97-1.06x the 4B-dense bar when down shares the dispatch, 0.68-0.80x when it cannot.** So the
+deciding term is the down_proj A shape, not the expert stream: sizing a MoE case on the expert
+bytes alone understates the stream by 40 % (they are 60 % of it) and misses the term that decides
+it.
+
+The fixed cost above is measured, not assumed. Two runs of the same 50,135,040-B weight chunk in
+the arena's chunk-list design — 1.051 ms for one chunk, 2.016 ms for two — fit a marginal rate of
+51.95 GB/s and **0.086 ms paid once per dispatch**, i.e. a second weight BO on the same dispatch
+costs nothing measurable (within the fit residual; the 2-chunk run is 4.1 % faster per chunk).
+Pricing N chunk BOs as N launches overcharges the dispatch column by that factor: it would add 672
+dispatches per token here (48 layers x gate and up x 8 chunks, against 96 real ones), +66.5 ms at
+0.099 ms each.
 
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
 `~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,
@@ -746,6 +797,7 @@ named here and covered by a known-answer test (`ctest safetensors_to_q4nx`):
 | `linear_attn.A_log` | `linear_attn.ssm_a` | **`-exp(A_log)`, F32** — the forward computes `expf(ssm_a * softplus(dt))`, so the raw A_log decays backwards |
 | `linear_attn.conv1d.weight` `[CD,1,CK]` | `linear_attn.ssm_conv1d.weight` | **transpose to tap-major** `[CK,CD]`: the forward indexes `conv[j*CD + c]` |
 | `linear_attn.in_proj_a/b` | `ssm_alpha_proj`/`ssm_beta_proj` | rows **zero-padded to 32** so they tile; the forward dequantises at the stored height and keeps the first NVH rows (**q4_1 where the FLM config asks Q8_0** — a deviation `verify` measures rather than hides) |
+| `self_attn.q_proj.weight` (only when `attn_output_gate`) | same name | rows **de-interleaved**: HF builds a gated layer's query as `view(*, -1, 2*head_dim)` + `chunk(2, -1)`, i.e. `[q_h \| gate_h]` **per head**, while the forward's fused QKV is `[q block \| gate block \| k \| v]` — the layout the FLM/OGA packs already use. Leaving the source order made the forward attend over half-gate rows and gate with half-query ones: measured on the real d3 pack, engine q vs the reference's q **cos 0.077**, and **0.999992** against the de-interleaved rows |
 
 The remaining names come from `configs/q4nx/qwen3.5_0.8b.json`'s `q4nx_name` column (`in_proj_qkv` →
 `qkv_proj`, `in_proj_z` → `self_attn.gate_proj`, `out_proj` → `ssm_out_proj`, `dt_bias` → `ssm_dt.bias`), and
@@ -768,6 +820,17 @@ needs all six — `QKV K1024 N5120` (q|gate|k|v, `q_proj` carries the output gat
 reuses it), `GU K1024 N7168`, `D K3584 N1024`, GDN `QKV K1024 N6144` and `Z K1024 N2048` — and without them the
 device path stops at `forward init failed: … this model's plan needs the QKV kernel "full_i8_QKV_K1024_N5120.elf" …
 (missing)`.
+
+**The norm convention is decided by the weights, not the name.** Qwen3.5's `Qwen3_5RMSNorm` is *zero-centered*:
+its weight is initialised to **0** and applied as `x/rms * (1 + w)`, so a checkpoint stores small deltas (the
+d3-lite pack's layer-0 `input_layernorm` has mean **0.2377** and negatives, min **-0.1143**). Older hybrid packs
+declare the same `model_type: qwen3_5` but keep the plain form, `x/rms * w`, with gains trained from 1 (the 27B
+packs on this box: mean **0.9704**, min **0.8711**, every value positive). Applying the wrong one is not a small
+error — it scales every norm output by roughly the weight's own magnitude — so `q4nx_semantics` sets a *probe* for
+`qwen3_5*` and the forward resolves it from the loaded layer-0 `input_layernorm.weight` (a negative value, or a
+mean below 0.5, is the zero-centered form), printing the evidence on the `[semantics]` line. The GDN gated norm
+(`linear_attn.norm`, `Qwen3_5RMSNormGated`) is **exempt**: it is initialised to ones and applied as `w`, which is
+what both packs store (mean 0.95 / 0.86). `ctest npu_rmsnorm_offset` covers the rule with both real shapes.
 
 Refusals follow the d3 server this route stands in for, so vLLM Semantic Router can point at it unchanged —
 which means **422 here, not the 400 the chat route uses**:

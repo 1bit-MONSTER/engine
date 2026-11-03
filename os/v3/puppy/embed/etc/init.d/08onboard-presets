@@ -1,0 +1,64 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/08onboard-presets - the two settings that must be the appliance's, not a package's or a server's.
+#
+# CYCLE 17 item 3 (hostname). The cycle-16 board came up as `strix` while /etc/hostname in the frozen image says
+# 1bit-os. rc.sysinit does `hostname -F /etc/hostname` and only rewrites a stock puppypc*, and no udhcpc/dhcpcd hook
+# exists in this image - but connman (Puppy's network service, the only DHCP client here) updates the system
+# hostname from whatever the DHCP server sends unless main.conf says otherwise: AllowHostnameUpdates defaults to
+# true (main.conf(5)). That is the one path by which a name nobody typed can become the appliance's name, so it is
+# turned off here, before connman starts (rc.services runs /etc/init.d in glob order and 08 sorts before 'connman').
+# Menu item 3 (Network -> Set the hostname) still changes it for the session.
+#
+# CYCLE 17 item 9 (clock). The embed ships /etc/localtime -> America/Moncton and the c16 image came out with
+# /etc/localtime -> Etc/GMT-0: an Ubuntu tzdata postinst during the build re-points it, so the desktop clock read
+# 12:07 when the wall clock was 08:07 AST (measured on the owner's own recording). Editing the packed SFS is not
+# an option, so the zone is pinned at boot from /etc/timezone - the file every Debian-family tool reads - and the
+# init says so. Nothing here changes the hardware clock: it stays UTC, as the boot line and `set_hwclock_type -q`
+# expect.
+TZNAME_FILE=/etc/timezone
+ZONE=/usr/share/zoneinfo
+
+pin_hostname() {
+    conf=/etc/connman/main.conf
+    [ -f "$conf" ] || { echo "08onboard-presets: no $conf, nothing to pin" >&2; return 0; }
+    grep -qx 'AllowHostnameUpdates = false' "$conf" && return 0
+    if grep -q '^[#[:space:]]*AllowHostnameUpdates' "$conf"; then
+        sed -i 's|^[#[:space:]]*AllowHostnameUpdates.*|AllowHostnameUpdates = false|' "$conf"
+    else
+        printf '\n[General]\nAllowHostnameUpdates = false\n' >> "$conf"
+    fi
+    grep -qx 'AllowHostnameUpdates = false' "$conf" || {
+        echo "08onboard-presets: could not pin AllowHostnameUpdates in $conf" >&2; return 1; }
+    echo "08onboard-presets: the DHCP server cannot rename this appliance (AllowHostnameUpdates = false)"
+}
+
+pin_timezone() {
+    tz=$(sed -n '1s/[[:space:]]*$//p' "$TZNAME_FILE" 2> /dev/null)
+    [ -n "$tz" ] || return 0
+    [ -f "$ZONE/$tz" ] || { echo "08onboard-presets: $TZNAME_FILE says $tz, which is not in $ZONE" >&2; return 1; }
+    [ "$(readlink /etc/localtime 2> /dev/null)" = "$ZONE/$tz" ] && return 0
+    # /etc is the copy-on-write layer over the squashfs, so this is a per-boot fix, not a save-file change
+    ln -sfn "$ZONE/$tz" /etc/localtime 2> /dev/null || {
+        echo "08onboard-presets: could not point /etc/localtime at $ZONE/$tz" >&2; return 1; }
+    echo "08onboard-presets: clock zone is $tz ($(date 2> /dev/null))"
+}
+
+case ${1:-start} in
+start) rc=0; pin_hostname || rc=1; pin_timezone || rc=1; exit $rc ;;
+*) : ;;
+esac

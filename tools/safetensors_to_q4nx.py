@@ -125,8 +125,23 @@ def qwen35_rename(name):
     return f"model.layers.{bid}.{QWEN35_GDN[suffix]}"
 
 
-def qwen35_transform(name, w):
-    """The three transforms, keyed on the renamed tensor.  Returns (array, forced dtype)."""
+def qwen35_transform(name, w, gate=None):
+    """The transforms, keyed on the renamed tensor.  Returns (array, forced dtype).
+
+    `gate` = (num_attention_heads, head_dim) when the pack declares `attn_output_gate`, else None.
+    """
+    if name.endswith(".q_proj.weight") and gate is not None:
+        # HF builds a gated layer's query as view(*, -1, 2*head_dim) then chunk(2, -1), i.e.
+        # [q_h | gate_h] PER HEAD, while the forward assembles the fused QKV as
+        # [q block | gate block | k | v] (the layout the FLM/OGA packs already use).  The container is
+        # a rename of the source, so the rows have to be de-interleaved here or the forward attends
+        # over half-gate rows and gates with half-query ones -- which is exactly what engine#796
+        # measured: engine q vs the reference's q cos 0.077, vs the block reading cos 0.999992.
+        nh, hd = gate
+        if w.ndim != 2 or w.shape[0] != 2 * nh * hd:
+            raise SystemExit(f"{name}: {list(w.shape)} is not [2*{nh}*{hd}, H] as attn_output_gate implies")
+        v = np.asarray(w).reshape(nh, 2, hd, w.shape[1])
+        return np.ascontiguousarray(np.concatenate([v[:, 0], v[:, 1]], axis=0).reshape(w.shape)), None
     if name.endswith(".ssm_a"):
         return -np.exp(np.asarray(w, dtype=np.float32)), "F32"
     if name.endswith(".ssm_dt.bias"):
@@ -145,14 +160,14 @@ def qwen35_transform(name, w):
     return w, None
 
 
-def transcode(name, w, arch):
+def transcode(name, w, arch, gate=None):
     """(q4nx name, transformed array, forced dtype), or None when the arch skips the tensor."""
     if arch != "qwen3_5":
         return name, w, None
     q = qwen35_rename(name)
     if q is None:
         return None
-    out, dtype = qwen35_transform(q, w)
+    out, dtype = qwen35_transform(q, w, gate)
     return q, out, dtype
 
 
@@ -219,6 +234,32 @@ def detect_arch(names):
     return "qwen3_5" if any(n.startswith("language_model.") for n in names) else "hf"
 
 
+def gate_geometry(hf_dir):
+    """(num_attention_heads, head_dim) when the pack declares attn_output_gate, else None.
+
+    The converter and the verifier must agree on this: `verify` compares the container against the
+    source, so it has to apply the same row reordering the packer did.
+    """
+    cfg_path = os.path.join(hf_dir, "config.json")
+    src_cfg = {}
+    if os.path.exists(cfg_path):
+        with open(cfg_path) as f:
+            src_cfg = json.load(f)
+    tc = src_cfg.get("text_config", {}) or {}
+
+    def pick(key):
+        v = tc.get(key, src_cfg.get(key))
+        return v
+
+    nh, hd, gated = pick("num_attention_heads"), pick("head_dim"), pick("attn_output_gate")
+    if not gated:
+        return None
+    if not (nh and hd):
+        raise SystemExit("config.json says attn_output_gate but gives no num_attention_heads/head_dim; "
+                         "the q_proj row order cannot be decided")
+    return (int(nh), int(hd))
+
+
 def pack(args):
     os.makedirs(args.out, exist_ok=True)
     table, blobs, off = {}, [], 0
@@ -226,13 +267,18 @@ def pack(args):
     entries = tensors(args.hf)
     arch = detect_arch([n for n, *_ in entries]) if args.arch == "auto" else args.arch
     print(f"arch {arch}")
+    # A gated attention layer's q_proj rows have to be de-interleaved (see qwen35_transform), which
+    # needs the head count and width, so read the pack's own config before the tensor loop.
+    gate = gate_geometry(args.hf) if arch == "qwen3_5" else None
+    if gate:
+        print(f"attn_output_gate: q_proj rows de-interleaved per head ({gate[0]} heads, head_dim {gate[1]})")
     skipped = 0
     for name, path, header, data_off in entries:
         if arch == "qwen3_5" and name.startswith("visual."):
             skipped += 1                    # decided from the name, before reading its bytes
             continue
         w = read_tensor(path, header, data_off, name)
-        got = transcode(name, w, arch)
+        got = transcode(name, w, arch, gate)
         if got is None:
             skipped += 1
             continue
@@ -321,9 +367,10 @@ def verify(args):
     bad = 0
     entries = tensors(args.hf)
     arch = detect_arch([n for n, *_ in entries]) if args.arch == "auto" else args.arch
+    gate = gate_geometry(args.hf) if arch == "qwen3_5" else None
     for name, path, header, data_off in entries:
         w = read_tensor(path, header, data_off, name)
-        got = transcode(name, w, arch)
+        got = transcode(name, w, arch, gate)
         if got is None:
             continue
         name, w, _forced = got

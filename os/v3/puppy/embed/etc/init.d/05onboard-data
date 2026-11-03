@@ -82,8 +82,16 @@ if [ -s "$DATA/ssh/authorized_keys" ]; then
     echo "05onboard-data: $(grep -c . /root/.ssh/authorized_keys) ssh key(s) from $DATA/ssh/authorized_keys"
 fi
 # A host key on the partition, so the fingerprint a client learned does not change every boot.
+# Cycle 17: a ZERO-BYTE key is a state this lane has measured on a built image (`ls -l /data/ssh` = 0 bytes), and
+# it defeats the code that follows - `[ -s ]` is false, so no symlink appears, sshd runs on the key the image
+# shipped, and the appliance silently gets a different host identity after every boot while `data ssh` (the row
+# that asserts the persistence) stays red. ssh-keygen will not overwrite a file that exists, so the size, not the
+# existence, decides, and a key that cannot be minted says why instead of leaving an empty file behind.
 if [ ! -s "$DATA/ssh/ssh_host_ed25519_key" ]; then
-    ssh-keygen -q -t ed25519 -N "" -C "1bit-os" -f "$DATA/ssh/ssh_host_ed25519_key" 2> /dev/null
+    rm -f "$DATA/ssh/ssh_host_ed25519_key" "$DATA/ssh/ssh_host_ed25519_key.pub"
+    if ! ssh-keygen -q -t ed25519 -N "" -C "1bit-os" -f "$DATA/ssh/ssh_host_ed25519_key" 2> /tmp/1bit-sshkeygen.err; then
+        echo "05onboard-data: no host key on $DATA: $(tail -1 /tmp/1bit-sshkeygen.err 2> /dev/null)" >&2
+    fi
 fi
 if [ -s "$DATA/ssh/ssh_host_ed25519_key" ]; then
     ln -sfn "$DATA/ssh/ssh_host_ed25519_key" /etc/ssh/ssh_host_ed25519_key

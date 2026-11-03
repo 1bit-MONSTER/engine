@@ -44,8 +44,17 @@
 API=http://127.0.0.1:13305
 CONF=/etc/1bit/lemond.conf
 LEMLOG=/var/log/lemond-onebit.log
+DESKTOP=/usr/local/bin/1bit-desktop
 NONINT=0
 say() { printf '%s\n' "$*"; }
+
+# Cycle 17 item 4: every status probe below asks the machine the same question release-check does, so it must run
+# with the same environment Lemonade runs with. Measured on the cycle-16 board: this menu said "GPU no HRX device
+# (the runtime registered none)" on a box that was serving chat-hrx at 303 tok/s, because `llama-server
+# --list-devices` was started without HSA_USE_SVM=0 / HRX_ALLOW_NO_SVM=1 and without LD_LIBRARY_PATH pointing at
+# the pinned HSA set - i.e. without /etc/1bit/libhsa.env, the file /etc/init.d/10lemonade sources before it starts
+# the engine. The menu reads it from the same place rather than growing a second opinion.
+[ -r /etc/1bit/libhsa.env ] && . /etc/1bit/libhsa.env
 
 # ── the facts the header and the status block are made of ──────────────────────────────────────────────
 release_tag() {
@@ -144,11 +153,13 @@ models_line() {
     k=$(api_key)
     list=""
     [ -n "$k" ] && list=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
-        grep -o '"id":"[^"]*"' | cut -d'"' -f4 | tr '\n' ' ')
+        grep -o '"id":"[^"]*"' | cut -d'"' -f4)
     if [ -n "$list" ]; then
-        echo "$(printf '%s\n' $list | wc -l) downloaded: $(printf '%s' "$list" | cut -c1-60)"
+        # the count is what the banner can hold whole; the ids are item 4's screen (no line here is cut mid-word -
+        # the cycle-16 board showed "firmware prese" for exactly that reason)
+        echo "$(printf '%s\n' $list | wc -l) downloaded"
     else
-        echo "none downloaded (or Lemonade is not answering)"
+        echo "none downloaded"
     fi
 }
 
@@ -165,9 +176,13 @@ status_text() {
     else
         say "Lemonade  DOWN (no lemond process; item 8 has its log)"
     fi
+    # Each line is measured to fit one 78-column dialog row: a long line WRAPS inside the menu box and pushes the
+    # last items off the screen (cycle 14 measured item 9 disappearing that way), so the fields are sized here and
+    # nothing is chopped in the middle of a word.
     say "GPU  $(gpu_line | cut -c1-68)"
-    say "NPU  $(npu_line | cut -c1-30)   Secure Boot  $(sb_line | cut -c1-30)"
-    say "Fans $(fans_line | cut -c1-40)   temps $(temps_line)"
+    say "NPU  $(npu_line | cut -c1-44)"
+    say "Fans $(fans_line | cut -c1-62)"
+    say "Temp $(temps_line)   Secure Boot $(sb_line)"
     say "Data $(data_line)   Models $(models_line | cut -c1-30)"
 }
 menu_text() { say "1-9 then Enter. Status redraws every 15 s. ssh users get bash, not this menu."; }
@@ -393,17 +408,27 @@ The disk is wiped. The installer refuses this boot's own disk and asks for the w
 }
 
 # 6 The desktop, for this session only: the headless entry is the default, and a person who wants JWM now
-# should not have to reboot. quicksetup still runs on the first X start (it is a desktop question, and there
-# is a keyboard in front of the screen when this item is used).
+# should not have to reboot. Cycle 16's board boot showed the cost of this item as it was written: pressing 6 RESET
+# the machine, and nothing was kept to say why (C17 item 1). So the work is done by /usr/local/bin/1bit-desktop:
+# the boot's logs are copied to /data/logs/<boot-id>/ first, xwin is started detached (this menu process stays
+# alive on tty1 either way) with a PATH whose first entry refuses reboot/poweroff, and every artefact - xwin's own
+# output, Xorg.0.log, xerrs.log - is copied out when the session ends. X failing can only return here.
 item_desktop() {
-    for b in /usr/bin/xwin /usr/bin/startx; do
-        [ -x "$b" ] || continue
-        if [ "$NONINT" = 1 ]; then say "desktop: $b available"; say "desktop-available"; return 0; fi
-        yesno "Start the desktop (JWM) for this session? The menu comes back when X exits." || return 0
-        clear; TERM=${TERM:-linux} "$b"; return 0
-    done
-    say "no xwin/startx in this image - the desktop entry in the boot menu is the way in"
-    return 1
+    if [ ! -x "$DESKTOP" ]; then
+        say "no $DESKTOP in this image - the desktop entry in the boot menu is the way in"
+        return 1
+    fi
+    if [ "$NONINT" = 1 ]; then
+        out=$("$DESKTOP" --check 2>&1)
+        printf '%s\n' "$out"
+        case $out in *desktop-available*) return 0 ;; *) return 1 ;; esac
+    fi
+    yesno "Start the desktop (JWM) for this session?
+
+The desktop entry '1bit OS (desktop, JWM)' in the boot menu is the proven path. From here it is unproven on the
+board, so this menu keeps running, logs the attempt to /data/logs, and refuses a reboot asked for by the session." || return 0
+    "$DESKTOP"
+    return 0
 }
 
 # 7 A shell, and the menu comes back on exit. This is the escape hatch for everything the menu does not do,
@@ -424,15 +449,24 @@ item_shell() {
     return 0
 }
 
-# 8 Logs: the two a person needs on this box, bounded, in one screen.
+# 8 Logs: what a person (and the next cycle) needs on this box, bounded, in one screen. The persistent copy is
+# item 2's: /data/logs/<boot-id>/ keeps the last five boots, which is where an X session's evidence comes from now.
 item_logs() {
     out=$(mktemp) || return 1
+    bootlogs=$(/usr/local/bin/1bit-logs dir 2> /dev/null || true)
     {
         say "=== $LEMLOG (tail 40)"
         tail -40 "$LEMLOG" 2>/dev/null || say "(no $LEMLOG)"
         say ""
         say "=== dmesg (tail 25)"
         dmesg 2>/dev/null | tail -25 || say "(no dmesg)"
+        if [ -n "$bootlogs" ] && [ -d "$bootlogs" ]; then
+            say ""
+            say "=== this boot's copy: $bootlogs"
+            ls -1 "$bootlogs" 2>/dev/null | tr '\n' ' '
+            say ""
+            [ -s "$bootlogs/xwin-console.log" ] && { say "--- xwin-console.log (tail 12)"; tail -12 "$bootlogs/xwin-console.log"; }
+        fi
     } > "$out"
     if [ "$NONINT" = 1 ]; then
         cat "$out"; rm -f "$out"; say "logs-shown"; return 0

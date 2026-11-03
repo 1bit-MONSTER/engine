@@ -51,8 +51,15 @@ typedef enum {
 
 typedef struct {
     /* RMSNorm convention: 0 -> y = x/rms * w ; 1 -> y = x/rms * (1 + w)
-     * Source: model_type/architectures (gemma* uses the offset form). */
+     * Source: model_type/architectures (gemma* uses the offset form), or, for a qwen3_5 pack, the
+     * layer-0 input_layernorm weight itself (see rmsnorm_offset_probe). */
     int rmsnorm_offset;
+    /* qwen3_5 declares ONE model_type for TWO norm conventions: the official release is zero-centered
+     * (Qwen3_5RMSNorm: y = x/rms * (1 + w), weight initialised to 0) while hybrid packs on this box keep
+     * the plain form (weight initialised to 1). The name cannot decide it, so the forward probes the
+     * loaded layer-0 input_layernorm weight once. 1 = probe, 0 = the convention is already known.
+     * Source: model_type/architectures == qwen3_5*, resolved against the weights. */
+    int rmsnorm_offset_probe;
     /* Per-head RMSNorm applied to q and k before RoPE.
      * Source: presence of self_attn.q_norm.weight / k_norm.weight. */
     int qk_norm;
@@ -188,6 +195,12 @@ int q4nx_semantics_linear_layers(const Q4nxSemantics* s);
 
 /* True when the model needs Gemma4-style per-layer embeddings (PLE). */
 int q4nx_semantics_uses_ple(const Q4nxSemantics* s);
+
+/* Zero-centered vs plain RMSNorm, decided from the loaded layer-0 input_layernorm weight itself: a
+ * checkpoint trained with the (1 + w) form stores deltas around 0 (the initialiser is 0, so the weight
+ * carries negatives and a mean well below 1), a plain one stores gains around 1. Returns 1 for the
+ * (1 + w) form, 0 for the plain w form. Exported so the rule is testable with no model present. */
+int q4nx_rmsnorm_offset_from_norm(const float* w, int n);
 
 /* Description of the layer-type mix, for error messages. */
 void q4nx_semantics_layer_mix(const Q4nxSemantics* s, char* out, size_t out_sz);

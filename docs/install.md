@@ -73,9 +73,10 @@ the key that was.
 1. Put the stick in the machine. On the Bosgame BeyondMax use the **front USB-A** port
    ([7](#7-the-bosgame-beyondmax-has-one-usable-usb-port)).
 2. Boot it. The default entry, `1bit OS (headless console, 7.3.0-rc4-1bit-perfopt+)`, comes up headless:
-   a console with no X. The second entry, `1bit OS (desktop, JWM)`, starts Puppy's desktop on the same
-   system; the third, `1bit OS - serial root shell`, gives a root shell on the serial port for a rack
-   machine with no monitor.
+   a console with no X. The second, `1bit OS (desktop, JWM)`, starts Puppy's desktop on the same system;
+   the third, `1bit OS - install to a disk (1bit.installer=1)`, opens the installer
+   ([2](#2-install-to-an-internal-disk)); the fourth, `1bit OS - serial root shell (1bit.serial=1)`, gives
+   a root shell on the serial port for a rack machine with no monitor.
 3. Nothing on the machine is written. The system runs in RAM from the stick's squashfs
    (`pfix=copy`); the models, Lemonade's config and cache, your SSH keys and the API key live on the
    stick's `1BIT-DATA` partition.
@@ -92,9 +93,15 @@ instead of `127.0.0.1` ([clients.md](clients.md)).
 
 **What persists on the stick**, all of it on `1BIT-DATA` (Puppy's save layer, `PUPMODE=12`):
 `models/`, `lemonade/config/`, `lemonade/cache/`, `lemonade/lemond.conf` (the API key), `ssh/` (host key
-and `authorized_keys`), `npu/kernels/`, `cache/hrx-jit/`. A file written elsewhere (`/etc`, `/root`, `/tmp`) lives in RAM: measured, a marker
-written in `/etc` and then `poweroff -f` was gone on the next boot, while the same boot's marker on
-`/data` was still there.
+and `authorized_keys`), `npu/kernels/`, `cache/hrx-jit/`. Those are written straight to the partition, so
+they survive any shutdown. A change elsewhere (`/etc`, `/root`, `/tmp`) is RAM-only until there is a save
+folder to put it in: measured on a stick with no save folder, a marker written in `/etc` was gone after
+`poweroff -f`, while the same boot's marker on `/data` was still there. Once a save folder exists on the
+data partition **and** the box shuts down normally, Puppy's save layer writes `/etc` and `/root` back with
+it — measured (`os/v3/puppy/g7-probe.sh:28-33,93-99`: save folder pre-created, marker written in `/etc`,
+normal `poweroff`, marker still there on the next boot), and `05onboard-data`'s own shutdown branch syncs
+and unmounts `/data` before that write. This release creates no save folder for you, so treat `/etc` as
+temporary unless you made one.
 
 ## 2. Install to an internal disk
 
@@ -198,7 +205,7 @@ for an existing Linux:
 | | |
 |---|---|
 | Lemonade with the engine as its backend | the `lemonade-onebit` package from the releases page, for a machine already running Lemonade ([docs/lemonade.md](lemonade.md)) |
-| the engine alone, packaged for a distribution | `scripts/mk-plugin-package.sh` builds `1bit-engine_<version>_amd64.deb` and a tarball and wires a stock Lemonade to it (PR [#860](https://github.com/1bit-MONSTER/engine/pull/860)) |
+| the engine alone, packaged for a distribution | `scripts/mk-plugin-package.sh` builds `1bit-engine_<version>_amd64.deb` and a tarball and wires a stock Lemonade to it. The script arrives with PR [#860](https://github.com/1bit-MONSTER/engine/pull/860), so it is **not in the tree until that merges** — until then an existing Linux has only the `lemonade-onebit` route above |
 
 Both are **advanced, and not the supported path for this release**: they put the engine on a system whose
 kernel, `amdxdna` driver and HSA runtime we did not choose, so the device rows of
@@ -207,15 +214,21 @@ parked.
 
 ## 6. Secure Boot and our MOK
 
-The stick and the install boot with **Secure Boot on**: shim → our MOK-signed grub → our MOK-signed
-kernel (`7.3.0-rc4-1bit-perfopt+`) → our signed modules (`amdgpu`, `amdxdna`, `ec_su_axb35`). Verified on
-the shipped image: `sbverify --cert MOK-Kernel.pem /1bit/vmlinuz` → `Signature verification OK`.
+The stick and the install boot with **Secure Boot on**: a Microsoft-signed shim → our MOK-signed grub →
+our MOK-signed kernel (`7.3.0-rc4-1bit-perfopt+`) → our signed modules (`amdgpu`, `amdxdna`,
+`ec_su_axb35`). That is a chain of signatures, and it is only trusted on a machine whose firmware already
+trusts our keys. Verified on the shipped image: `sbverify --cert MOK-Kernel.pem /1bit/vmlinuz` →
+`Signature verification OK`.
+
+Two keys are involved and they are not interchangeable ([kernel.md](kernel.md#2-sign--two-keys-on-the-box)):
+`MOK-Kernel` signs the kernel image, `MOK` signs every module we build — including the NPU and `ec`
+modules, so a machine that enrolled only the kernel key still refuses those.
 
 | your machine | what to do |
 |---|---|
 | our key is already enrolled (the box this release is tested on) | nothing — boot it |
 | our key is not enrolled | the firmware will refuse the kernel. **Turn Secure Boot off** in the firmware setup for now: the system runs, everything works, and Secure Boot is a signature check, not a feature of the appliance |
-| you want Secure Boot on anyway | enroll the public key with `mokutil --import MOK-Kernel.der` from an OS already installed on that machine, reboot, and confirm in MokManager (`Enroll MOK` → `Continue` → `Yes` → password) |
+| you want Secure Boot on anyway | copy **both** public certificates off the box that signed the image — `MOK-Kernel.der` (kernel) and `MOK.der` (every module we build) from `/var/lib/shim-signed/mok/` — then `mokutil --import MOK-Kernel.der` and `mokutil --import MOK.der`, reboot, and confirm **both** in MokManager (`Enroll MOK` → `Continue` → `Yes` → password). The import has to be run from an OS already installed on that machine, and enrolling only the kernel key leaves the signed modules untrusted |
 
 The release does **not** put the certificate on the stick — measured: the ESP carries `BOOTX64.EFI`,
 `grubx64.efi`, `mmx64.efi` and `grub.cfg`, and the image carries no `.der` file — so a machine without

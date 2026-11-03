@@ -45,8 +45,11 @@ Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is 
    ```
 
    balenaEtcher and Rufus (DD mode) write the `.img.xz` directly.
-3. Boot the machine from the stick. Secure Boot can stay on: shim, grub, the kernel and its modules are
-   all signed with our MOK.
+3. Boot the machine from the stick. Where our key is already enrolled, Secure Boot can stay on: the chain
+   is a Microsoft-signed shim → our MOK-signed grub → our MOK-signed kernel → our signed modules. A
+   machine that has never trusted our key refuses the kernel, and the certificates are not on the stick,
+   so enroll both public ones from the box that signed the image first — or turn Secure Boot off for now;
+   see [docs/install.md](docs/install.md#6-secure-boot-and-our-mok).
 4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run
    `1bit-install <disk> --yes` there and the same system is on the disk. The install options, what each
    one erases and the Secure Boot notes are [docs/install.md](docs/install.md); connecting a client —

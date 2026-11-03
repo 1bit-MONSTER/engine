@@ -60,6 +60,18 @@ yes "" | ./merge2out woof-distro/x86_64/ubuntu/"$COMPAT"
 set -o pipefail   # (no stdin redirect: `set` never reads it, and shellcheck is right to flag it)
 cd ../woof-out_*
 
+# 3builddistro packs `../initrd-progs/0initrd` (relative to its own sandbox3), so that tree is what the appliance
+# boots with - and a build root reused across cycles keeps the copy the PREVIOUS run patched. Cycle 15 paid for it:
+# the second build in the same root was refused with "/init writes the progress lines to /dev/console only" because
+# patch-init found the strings it greps for from the older patch and left the file alone, so the fix under test
+# never reached the image (the ISO had already been written). The container's /work/woof-CE is a fresh copy of the
+# clone every run, so the tree is refreshed from it before anything patches it.
+if [ -d initrd-progs ]; then
+    echo "== refresh initrd-progs from the woof-CE clone (a reused build root keeps the previous run's copy)"
+    rm -rf initrd-progs
+    cp -a /work/woof-CE/initrd-progs ./initrd-progs
+fi
+
 # The packages that the TPUPPY-RELEASE acceptance needs and the merged woof-CE set does not carry: on a
 # built resolute64 rootfs, `sudo`, `apt`, `mokutil` and `openssh-server` are simply absent (openssh-client
 # has a row, openssh-server does not) - which is the "sh: sudo: not found" class of gap from c20. The rows

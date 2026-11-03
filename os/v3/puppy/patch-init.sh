@@ -165,7 +165,16 @@ fi
 # the two console progress lines, patched separately so the guard above stays greppable and idempotent
 patch_progress() {
     local f=$1 tmp
-    grep -q "$PROG1" "$f" && grep -q "$PROG2" "$f" && return 0
+    # Idempotent, but only for THIS version: the pre-cycle-15 form wrote the lines to /dev/console alone, and with
+    # the cycle-15 console order that is the screen only - the serial port sees nothing. Accepting it silently is
+    # how a build root reused across cycles shipped an image whose fix was not in it (measured: two builds refused
+    # by --verify, each after its ISO had been written). Fail with the reason instead.
+    if grep -q "$PROG1" "$f" && grep -q "$PROG2" "$f"; then
+        grep -q 'one_console "' "$f" && return 0
+        echo "$prog: $f carries the pre-cycle-15 progress lines (/dev/console only, nothing on ttyS0) - the build" \
+             "root is stale; refresh initrd-progs from the woof-CE clone" >&2
+        return 1
+    fi
     grep -q '^#- handle pfix=copy pfix=ram pfix=nocopy' "$f" || {
         echo "$prog: $f has no pfix=copy block - upstream changed, re-measure" >&2; return 1; }
     grep -q '^echo "PUPMODE=\$PUPMODE"' "$f" || {

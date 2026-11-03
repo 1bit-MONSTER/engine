@@ -567,11 +567,19 @@ int main(int argc, char** argv) {
             std::printf("\n");
             // --positions-out records where each prompt's chains opened, so `--offline --positions-in` scores the
             // same positions and the two per-depth tables stop being a clustered subsample of each other.
-            if (pout) {
+            // An ofstream that was never opened still tests *true* (a default-constructed one is in the good state,
+            // no buffer and no failbit), so `if (pout)` printed "written to " with an empty path whenever --match ran
+            // without --positions-out.  Test the flag that decides whether the file exists, and never leave a short
+            // write behind: a truncated positions file would be scored silently by a later `--offline --positions-in`.
+            if (!positions_out.empty()) {
                 pout << pi;
                 for (int have : r.stats.chain_at) pout << ' ' << have;
                 pout << '\n';
                 pout.flush();
+                if (!pout) {
+                    std::fprintf(stderr, "write failed: %s\n", positions_out.c_str());
+                    return 1;
+                }
                 std::printf("  chain positions: %zu written to %s\n", r.stats.chain_at.size(),
                             positions_out.c_str());
             }

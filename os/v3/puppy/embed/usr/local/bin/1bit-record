@@ -1,0 +1,120 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-record start|stop|status|demo - screen-record the appliance's desktop to the data partition.
+#
+# The owner, 2026-11-02: "once we get a successful [boot] you need to screen record it ... open a browser and feed
+# it a prompt and then we record it". The demo has to be recorded ON the stick, in the same session as the chat,
+# so nothing may depend on a network, another machine, or a tool that is not in the image: ffmpeg's x11grab and
+# libx264 are both in the Puppy rootfs (checked in build.sh), and the file goes to /data - the 1BIT-DATA
+# partition, the only place on a live-USB boot that survives the power-off.
+#
+#   start    start recording DISPLAY (default :0) at 30 fps, libx264 crf 23, into $ONEBIT_RECORD_DIR
+#            (/data/recordings by default): 1bit-demo-<date>-<time>.mp4. Refuses to start twice.
+#   stop     stop it cleanly (SIGINT, so the mp4 is finalised) and print the file, its size and its duration
+#   status   what is recording now, or the last recording and its size
+#   demo     start, wait, stop - the one-shot an owner-facing menu item needs
+#
+# Env: ONEBIT_RECORD_DIR (default /data/recordings), ONEBIT_RECORD_DISPLAY (default $DISPLAY or :0),
+#      ONEBIT_RECORD_FPS (30), ONEBIT_RECORD_CRF (23).
+set -u
+DIR=${ONEBIT_RECORD_DIR:-/data/recordings}
+PIDFILE=${ONEBIT_RECORD_PIDFILE:-/tmp/1bit-record.pid}
+STATEFILE=${ONEBIT_RECORD_STATEFILE:-/tmp/1bit-record.last}
+DISP=${ONEBIT_RECORD_DISPLAY:-${DISPLAY:-:0}}
+FPS=${ONEBIT_RECORD_FPS:-30}
+CRF=${ONEBIT_RECORD_CRF:-23}
+say() { printf '%s\n' "$*"; }
+die() { printf '1bit-record: %s\n' "$*" >&2; exit 1; }
+
+running() {   # running -> the ffmpeg pid, or nothing
+    [ -f "$PIDFILE" ] || return 1
+    p=$(cat "$PIDFILE" 2> /dev/null)
+    [ -n "$p" ] && kill -0 "$p" 2> /dev/null || return 1
+    printf '%s' "$p"
+}
+
+screen_size() {
+    xdpyinfo -display "$DISP" 2> /dev/null | sed -n 's/.*dimensions: *\([0-9]*x[0-9]*\).*/\1/p' | head -1
+}
+
+start() {
+    command -v ffmpeg > /dev/null 2>&1 || die "ffmpeg is not in this image - nothing can record"
+    p=$(running) && die "already recording (pid $p) - '1bit-record stop' first"
+    size=$(screen_size)
+    [ -n "$size" ] || die "no X display $DISP (xdpyinfo cannot see it) - recording needs the desktop session"
+    mkdir -p "$DIR" || die "cannot create $DIR (is the 1BIT-DATA partition mounted at /data?)"
+    out=$DIR/1bit-demo-$(date +%Y%m%d-%H%M%S).mp4
+    # -movflags +faststart: a recording that is cut short (poweroff, dead battery) is still playable, because the
+    # index is written up front rather than only at the end. -pix_fmt yuv420p so any player takes it.
+    setsid ffmpeg -hide_banner -loglevel error -nostdin \
+        -f x11grab -framerate "$FPS" -video_size "$size" -i "$DISP+0,0" \
+        -c:v libx264 -preset veryfast -crf "$CRF" -pix_fmt yuv420p -movflags +faststart \
+        -y "$out" > "$DIR/.1bit-record.log" 2>&1 < /dev/null &
+    echo $! > "$PIDFILE"
+    printf '%s\n' "$out" > "$STATEFILE"
+    sleep 1
+    running > /dev/null || { tail -3 "$DIR/.1bit-record.log" 2> /dev/null >&2; rm -f "$PIDFILE"; die "ffmpeg died on start"; }
+    say "recording $DISP ${size} at ${FPS} fps -> $out"
+}
+
+human() {   # human <seconds> -> 1m02s
+    s=${1%.*}
+    [ -n "$s" ] || s=0
+    [ "$s" -ge 60 ] && printf '%dm%02ds' $((s / 60)) $((s % 60)) || printf '%ss' "$s"
+}
+
+stop() {
+    p=$(running) || { say "not recording"; return 1; }
+    out=$(cat "$STATEFILE" 2> /dev/null)
+    kill -INT "$p" 2> /dev/null
+    i=0
+    while kill -0 "$p" 2> /dev/null && [ $i -lt 50 ]; do sleep 0.1; i=$((i + 1)); done
+    kill -0 "$p" 2> /dev/null && kill -TERM "$p" 2> /dev/null
+    rm -f "$PIDFILE"
+    [ -f "$out" ] || { die "ffmpeg wrote no file - see $DIR/.1bit-record.log"; }
+    size=$(du -h "$out" | cut -f1)
+    secs=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out" 2> /dev/null)
+    say "recorded $out ${size} $( [ -n "$secs" ] && human "$secs")"
+}
+
+status() {
+    p=$(running) && { say "recording: $(cat "$STATEFILE" 2> /dev/null) (pid $p)"; return 0; }
+    last=$(head -1 "$STATEFILE" 2> /dev/null)
+    if [ -n "${last:-}" ] && [ -f "$last" ]; then
+        secs=$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$last" 2> /dev/null)
+        say "idle: last recording $last $(du -h "$last" | cut -f1) $( [ -n "$secs" ] && human "$secs")"
+    else
+        say "idle: nothing recorded yet (recordings land in $DIR)"
+    fi
+}
+
+case "${1:-}" in
+start)  start ;;
+stop)   stop ;;
+status) status ;;
+demo)   start || exit 1
+        # the owner-facing flow: record while they chat, and stop on a single click
+        if command -v xmessage > /dev/null 2>&1; then
+            xmessage -center -buttons STOP:0 "Recording the demo. Press STOP when you are done." > /dev/null 2>&1
+        else
+            say "press Ctrl-C when you are done"
+            sleep "${2:-30}"
+        fi
+        stop ;;
+*)      sed -n "/^# 1bit-record start/,/^# Env:/p" "$0" | sed 's/^# \{0,1\}//'
+        exit 2 ;;
+esac

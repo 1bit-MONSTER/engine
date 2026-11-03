@@ -35,6 +35,7 @@
 #include "q4nx_weight_layout.h"   // bpos(): the container's device weight layout
 #include "q4nx_pb16i.h"          // the pb16i image: integer-exact ternary decode weights
 #include "q4nx_t2s.h"            // the t2s stream: the same weights at 2.125 bits/weight
+#include "q4nx_pack.h"           // q4nx_elf_arg_sizes(): args_fit_elf() checks the ELF's own widths
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 

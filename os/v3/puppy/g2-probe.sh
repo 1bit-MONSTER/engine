@@ -84,8 +84,15 @@ if grep -aqE 'not found|dropping out to console' "$work/serial.log" 2> /dev/null
     echo "== G2: no shell; the init did not find its sfs (G2 red until the kernel carries the medium drivers)"
     exit 1
 fi
-if grep -aqE 'PUPMODE=|layered filesystem' "$work/serial.log" 2> /dev/null; then
+# The image booted if the init layered the main SFS and Puppy's own userspace then took over: the
+# "main file" line is the init, "Loading kernel modules"/"Setting up services" are rc.sysinit, and the
+# quicksetup dialog is the first thing a user sees. PUPMODE only appears once there is a save layer, so
+# requiring it was a gate that could not pass on a fresh image - cycle 1 booted to the keyboard-setup
+# dialog and this still answered "neither a layer nor the not-found error" (measured 2026-11-02).
+if grep -aqE "main file|PUPMODE=|layered filesystem" "$work/serial.log" 2> /dev/null; then
     echo "== G2: the sfs was found and layered - the base booted on our kernel"
+    grep -a -oE "ResolutePup64[^[]*|Loading the '[^']*' [a-z]+ file|Setting up services[^.]*|Set console keyboard layout" \
+        "$work/serial.log" 2> /dev/null | sort -u | sed 's/^/   /'
     exit 0
 fi
 echo "== G2: neither a layer nor the not-found error: read $work/serial.log"

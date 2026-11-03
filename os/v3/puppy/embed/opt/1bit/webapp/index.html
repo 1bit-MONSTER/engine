@@ -1,0 +1,157 @@
+<!doctype html>
+<!--
+  Copyright 2026 bong-water-water-bong
+  SPDX-License-Identifier: Apache-2.0
+
+  Licensed under the Apache License, Version 2.0 (the "License");
+  you may not use this file except in compliance with the License.
+  You may obtain a copy of the License at
+
+      http://www.apache.org/licenses/LICENSE-2.0
+
+  Unless required by applicable law or agreed to in writing, software
+  distributed under the License is distributed on an "AS IS" BASIS,
+  WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+  See the License for the specific language governing permissions and
+  limitations under the License.
+
+  1bit OS - the chat screen the appliance's desktop opens.
+
+  Why this page exists when Lemonade already ships a web UI. Measured on 2026-11-02, in the browser this image
+  ships (Pale Moon 33.0.1, Goanna 6.6): Lemonade's own UI RENDERS (chat page, model picker, composer - screenshots
+  in ~/briefs/demo-shots), but a prompt sent from it produced no request at the server, and a capability probe run
+  in that same browser names the gap - MISSING: TextDecoderStream, AbortSignal.timeout, CSS backdrop-filter, CSS
+  :has(). All three of the first are what a streaming chat client normally uses. The same browser streams happily
+  from fetch + response.body.getReader + TextDecoder, which is all this page uses: measured "198 SSE chunks, 0.9 s,
+  972 chars" against the release engine, twice. So the appliance's own demo surface avoids the missing APIs instead
+  of betting the demo on a browser feature the image does not have, and the real UI stays one click away in the
+  header. (The black rectangle that shows up in the xwd captures sits in the same place on every page in this
+  browser - it is a capture artifact of Xvfb + xwd, not something the pages paint.)
+
+  Opened as http://localhost:8080/?key=... by /usr/local/bin/1bit-lemonade-webapp (the desktop autostart), served by
+  /etc/init.d/24onboard-webapp. The key comes from /etc/1bit/lemond.conf via that launcher and is kept in
+  localStorage, so the owner never types it on camera. ?api= points it at a different server.
+-->
+<meta charset="utf-8">
+<title>1bit OS - chat</title>
+<style>
+  :root { color-scheme: dark; }
+  body { margin: 0; background: #101214; color: #e8eaed; font: 17px/1.5 system-ui, "DejaVu Sans", sans-serif; }
+  header { padding: 14px 20px; background: #17191c; border-bottom: 1px solid #2a2d31; display: flex; gap: 16px;
+           align-items: baseline; flex-wrap: wrap; }
+  header b { font-size: 20px; letter-spacing: .3px; }
+  header span { color: #9aa3ad; font-size: 14px; }
+  #wrap { padding: 18px 20px 120px; }
+  #out { white-space: pre-wrap; font-size: 18px; }
+  #out .u { color: #7fd1ff; }
+  #bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 14px 20px; background: #17191c;
+         border-top: 1px solid #2a2d31; display: flex; gap: 12px; }
+  input[type=text] { flex: 1; font-size: 18px; padding: 12px 14px; border-radius: 10px; border: 1px solid #3a3f45;
+                     background: #0d0f11; color: #e8eaed; }
+  button { font-size: 17px; padding: 12px 20px; border-radius: 10px; border: 1px solid #3a6ea5; background: #1d4f7c;
+           color: #eaf3ff; cursor: pointer; }
+  button:disabled { opacity: .5; cursor: default; }
+  #stat { color: #9aa3ad; font-size: 14px; padding: 6px 20px 0; }
+  a { color: #7fd1ff; }
+</style>
+<header>
+  <b>1bit OS</b><span id="who">chat</span><span id="srv"></span>
+  <span style="margin-left:auto"><a id="uibtn" href="#">Lemonade's own web UI</a></span>
+</header>
+<div id="wrap"><div id="out"></div></div>
+<div id="stat">ready</div>
+<div id="bar">
+  <input id="q" type="text" autofocus placeholder="Ask the appliance something and press Enter…">
+  <button id="go">Send</button>
+</div>
+<script>
+(function () {
+  var p = new URLSearchParams(location.search);
+  var api = (p.get("api") || "http://127.0.0.1:13305").replace(/\/+$/, "");
+  var model = p.get("model") || "";
+  var q = document.getElementById("q"), out = document.getElementById("out"), stat = document.getElementById("stat");
+  var go = document.getElementById("go"), ui = document.getElementById("uibtn");
+  var key = p.get("key") || localStorage.getItem("lemonade_api_key") || "";
+  if (p.get("key")) localStorage.setItem("lemonade_api_key", p.get("key"));
+  ui.href = api + "/";
+  document.getElementById("srv").textContent = api;
+  var host = location.hostname || "this machine";
+  document.getElementById("who").textContent = "chat on " + host + (model ? " / " + model : "");
+  var busy = false;
+
+  function headers() {
+    var h = { "Content-Type": "application/json" };
+    if (key) h["Authorization"] = "Bearer " + key;
+    return h;
+  }
+  function pickModel() {
+    if (model) return Promise.resolve(model);
+    return fetch(api + "/api/v1/models?show_all=true", { headers: headers() })
+      .then(function (r) { return r.json(); })
+      .then(function (j) {
+        var all = j.data || [];
+        // ONLY what is on the box: a catalogue entry that is not downloaded turns a demo into a 1-4 GB download
+        // (measured: the first onebit id in the list was an undownloaded catalogue entry and the page sat on
+        // "waiting for the first token"). Then a 1bit model, then anything downloaded at all.
+        var have = all.filter(function (m) { return m.downloaded !== false; });
+        var pick = have.filter(function (m) { return /1bit/i.test(m.id); })[0] || have[0];
+        if (!pick) throw new Error("the server lists no downloaded model - pull one from the console menu (item 4)");
+        var m = pick.id;
+        model = m;
+        document.getElementById("who").textContent = "chat on " + host + " / " + m;
+        return m;
+      });
+  }
+  function ask() {
+    var text = (q.value || "").trim();
+    if (!text || busy) return;
+    busy = true; go.disabled = true; q.value = "";
+    out.textContent += (out.textContent ? "\n\n" : "") + "> " + text + "\n";
+    var t0 = Date.now(), chunks = 0, first = 0;
+    stat.textContent = "waiting for the first token…";
+    pickModel().then(function (m) {
+      return fetch(api + "/api/v1/chat/completions", {
+        method: "POST", headers: headers(),
+        body: JSON.stringify({ model: m, messages: [{ role: "user", content: text }],
+                               max_tokens: 512, temperature: 0, stream: true })
+      });
+    }).then(function (r) {
+      if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf)"); }
+      if (!r.ok) { throw new Error("HTTP " + r.status); }
+      var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
+      function pump() {
+        return reader.read().then(function (res) {
+          if (res.done) {
+            stat.textContent = "done: " + chunks + " chunks in " + ((Date.now() - t0) / 1000).toFixed(1) + " s" +
+              (first ? " (first token after " + ((first - t0) / 1000).toFixed(1) + " s)" : "");
+            busy = false; go.disabled = false; q.focus();
+            return;
+          }
+          buf += dec.decode(res.value, { stream: true });
+          var lines = buf.split("\n"); buf = lines.pop();
+          lines.forEach(function (l) {
+            l = l.trim();
+            if (l.indexOf("data:") !== 0) return;
+            var pay = l.slice(5).trim();
+            if (pay === "[DONE]") return;
+            var j; try { j = JSON.parse(pay); } catch (e) { return; }
+            var d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
+            var t = d.content || "";
+            if (!first && t) { first = Date.now(); }
+            if (t) { out.textContent += t; chunks++; window.scrollTo(0, document.body.scrollHeight); }
+          });
+          return pump();
+        });
+      }
+      return pump();
+    }).catch(function (e) {
+      out.textContent += "[" + e + "]\n";
+      stat.textContent = "failed: " + e;
+      busy = false; go.disabled = false;
+    });
+  }
+  go.addEventListener("click", ask);
+  q.addEventListener("keydown", function (e) { if (e.key === "Enter") ask(); });
+  q.focus();
+})();
+</script>

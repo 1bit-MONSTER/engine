@@ -33,10 +33,15 @@ LINE_STYLES = [
     (("*.cpp", "*.h", "*.inc", "*.hpp", "*.c", "*.cc", "*.rs", "*.hip"), "//"),
     (("*.py", "*.sh", "*.yml", "*.yaml", "*.cff", "*.cmake", "*.cmake.in", "CMakeLists.txt", ".gitmodules",
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment", "*.example",
-      "*.service", "*.timer", "*.conf", "lemonade-hrx", "Dockerfile", "*.Dockerfile",
+      "*.service", "*.timer", "*.conf", "*.env", "lemonade-hrx", "packages-extra", "05onboard-data", "10lemonade", "zz-onboard-ports", "20onboard-ssh",
+      "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # os/v2's packaged files: systemd units of kinds the list did not name yet, and the two '#'-comment
       # files a v2 build reads (the snapshot pin, and the board's power profile at /etc/1bit/power)
-      "*.mount", "*.preset", "*.network", "power", "pin.txt"), "#"),
+      "*.mount", "*.preset", "*.network", "power", "pin.txt",
+      # os/v3 Puppy image, cycle 16: XDG desktop entries are ini-shaped with '#' line comments. The autostart
+      # that opens the appliance's chat screen is one, and CI is right to want a notice on it (it runs a
+      # program as root).
+      "*.desktop"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 
@@ -47,7 +52,17 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # os/v2 packages: dpkg control files, apt/dpkg list files and the console banner are data
           # with no comment syntax - the same exemption patches/* and *.cfg get
           "os/v2/debian/*/control", "os/v2/debian/*/conffiles", "*.list",
-          "os/v2/debian/*/files/etc/issue", "os/v2/debian/*/files/etc/motd"]
+          "os/v2/debian/*/files/etc/issue", "os/v2/debian/*/files/etc/motd",
+          # os/v3 Puppy image: an ssh authorized_keys file is one key per line and a comment in it would be
+          # parsed as an option string, so it is data, not code (a build that ships it is what U7 asks for)
+          "*/authorized_keys",
+          # os/v3 Puppy image, cycle 13: the presets a headless boot reads instead of asking. /etc/keymap is
+          # one keymap name ("us") and /etc/localtime is a symlink into /usr/share/zoneinfo - neither can
+          # carry a comment, and both are read by keymap-set and glibc verbatim
+          "os/v3/puppy/embed/etc/keymap", "os/v3/puppy/embed/etc/localtime",
+          # os/v3 Puppy image, cycle 15: the appliance's hostname is one word and is read verbatim by
+          # hostname(1), rc.sysinit and /etc/hosts - a comment line would BE the hostname
+          "os/v3/puppy/embed/etc/hostname"]
 
 
 def _match(name, patterns):

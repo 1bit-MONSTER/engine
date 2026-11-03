@@ -15,14 +15,15 @@
 
 // One row of activations, f32 -> int8 at a given 1/scale: the loop every NPU GEMM runs on the host before
 // its launch (I8Ctx::quantize_async / quantize_async_rows), extracted so it can be proven bit-identical and
-// made 7x cheaper.
+// made 6-7x cheaper.
 //
 // Why it is worth a file: it runs once per projection -- 288 projections, 2,310,144 A elements per decode
 // token on Bonsai-2 (the shipped container's own plan.json: 48 gdn layers x K = 5120, 5120, 6144, 5120,
 // 17408 and 16 attention layers x 5120, 5120, 17408) -- and the engine builds at the baseline x86-64 GCC
-// targets, where roundf() is a libm call.  Measured on strixhalo replaying exactly that mix, best of 7:
-// 3.96-4.05 ms/token scalar (1.72-1.76 ns/element) against 0.55 ms/token on the AVX2 path
-// (0.238 ns/element), 7.2-7.4x -- about 3.4 ms of a ~415 ms decode token.  Same story as hadamard.h next
+// targets, where roundf() is a libm call.  Measured on strixhalo replaying exactly that mix, best of 7, twice
+// independently (2026-11-03):
+// 3.56-4.05 ms/token scalar (1.54-1.76 ns/element) against 0.54-0.55 ms/token on the AVX2 path
+// (0.235-0.238 ns/element), 6.6-7.4x -- about 3.4-3.5 ms of a ~415 ms decode token.  Same story as hadamard.h next
 // door, and the same contract: byte-identical output, so a container's text cannot move.
 //
 // Bit identity is not luck here, it is the construction.  roundf is round-half-away-from-zero, and

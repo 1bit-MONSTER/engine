@@ -214,7 +214,17 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
                        float* col_scales);
 
+/* The three buffer widths a full ELF's runtime sequence declares (its .dynsym STT_OBJECT symbols
+ * named "0".."2"), read from the artifact instead of assumed.  A launcher must pass buffers at
+ * least that wide: the kernel's shim DMA touches exactly these widths, and a narrower buffer makes
+ * the DMA walk past the mapping (IO_PAGE_FAULTs, garbage results, no error).  Measured 2026-11-02:
+ * a pack whose ELF family is (weights, activations, output) = (655,360, 2,048, 4,096) B driven by a
+ * launcher that passed (16,384, 1,048,576, 65,536) B.  Returns the number of widths found (0..3) or
+ * -1 when the file is not a 32-bit LE ELF / has no .dynsym; undeclared entries stay 0. */
+int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]);
+
 #ifdef __cplusplus
+
 }
 #endif
 #endif /* NPU_INFER_Q4NX_PACK_H */

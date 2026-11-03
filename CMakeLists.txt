@@ -495,6 +495,16 @@ add_test(NAME systemone_route
 # cannot edit the workflow.
 add_dependencies(npu_sampling_test systemone_route_test)
 
+# The Qwen3-lane chat prompt of `1bit forward-serve` (app/npu_chatml.h): `chat_template_kwargs.enable_thinking`
+# and the bytes it produces, which is the half of issue #832 a test can pin without a model.
+add_executable(npu_chatml_test tests/npu_chatml_test.cpp)
+target_include_directories(npu_chatml_test PRIVATE ${CMAKE_SOURCE_DIR}/app ${CMAKE_SOURCE_DIR}/npu)
+target_link_libraries(npu_chatml_test PRIVATE nlohmann_json::nlohmann_json)
+add_test(NAME npu_chatml COMMAND npu_chatml_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_chatml_test)
+
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
 add_executable(npu_plan_test tests/npu_plan_test.cpp)

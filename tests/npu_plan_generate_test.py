@@ -139,6 +139,24 @@ with tempfile.TemporaryDirectory() as root:
     r = run(d2, "--print")
     check(r.returncode == 0 and '"format": "1bit-npu-plan/1"' in r.stdout, "--print emits the plan on stdout")
 
+    # 5b. attention.mode comes from the pack's own decision_config.json, which is the file the d3 runtime
+    #     obeys; no such file means causal, which is what every non-readout model on this box is.
+    check(json.load(open(os.path.join(d2, "plan.json")))["attention"]["mode"] == "causal",
+          "no decision_config.json -> attention causal")
+    with open(os.path.join(d2, "decision_config.json"), "w") as f:
+        json.dump({"attention_mode": "noncausal_full_attention", "format_id": "d3-code-readout-v1"}, f)
+    run(d2)
+    check(json.load(open(os.path.join(d2, "plan.json")))["attention"]["mode"] == "noncausal_full_attention",
+          "a noncausal pack's decision_config.json sets attention.mode")
+    r = run(d2, "--check")
+    check(r.returncode == 0, "--check passes with the attention block on disk")
+    with open(os.path.join(d2, "decision_config.json"), "w") as f:
+        json.dump({"attention_mode": "backwards"}, f)
+    r = run(d2)
+    check(r.returncode != 0 and "attention_mode" in r.stderr,
+          f"an unknown attention_mode is refused, not defaulted (rc={r.returncode})")
+    os.remove(os.path.join(d2, "decision_config.json"))
+
     # 6. attn_output_gate (qwen3_5's q|gate): q_proj emits q AND the output gate, so the fused QKV
     #    carries twice the q rows.  Found by running this generator on the real d3-lite pack, whose
     #    q_proj is [4096,1024] with 8 heads of 256 while the tool asked for a 3072-wide kernel.

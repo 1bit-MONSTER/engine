@@ -17,6 +17,13 @@
 //
 //   mtp_acceptance --model <dir> --head-exact <pb16i-exact dir> --head-q4k <q4_k dir>
 //                  [--tokens 64] [--k 4] [--tau 0.6] [--prompts 8] [--residual] [--dry-head]
+//                  [--offline [--positions-in F]] [--live [--positions-out F] [--match]]
+//
+// --match is the one that settles "live equals offline": the live loop records where it opened its chains
+// (`--positions-out` writes them; `--offline --positions-in` scores those positions only), and --match scores the
+// offline protocol at exactly those positions inside the same process, then prints live vs offline per depth with
+// the 2 pp bar.  Without it the two tables are different samples of the same drafter and the difference is mostly
+// which positions each one happened to reach.
 //
 // The base runs the exact route (pb16i container, kernels-m16) through Q4nxNpuForward; the drafter is the MTP
 // head on the host (npu/mtp/mtp_head.h, the pb16i-exact arithmetic: the same codes, magnitudes and host
@@ -38,6 +45,8 @@
 #include <cstdio>
 #include <cstdlib>
 #include <cstring>
+#include <map>
+#include <sstream>
 #include <string>
 #include <vector>
 
@@ -73,13 +82,103 @@ static int argmax_n(const std::vector<float>& v) {
     return best;
 }
 
-int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, const Weights& w, int prompts,
-                int tokens, int k, int prompt_base, bool residual) {
+// Per-depth acceptance counts: unconditional (d_*: every position, the estimator the published 3.19 uses) and
+// conditional on the earlier drafts having been accepted (c_*: what a correctly fed loop actually converts).
+struct DepthCounts {
     int d_hit[16] = {0}, d_tot[16] = {0};
+    int c_hit[16] = {0}, c_tot[16] = {0};
+    void add(const DepthCounts& o) {
+        for (int i = 0; i < 16; i++) {
+            d_hit[i] += o.d_hit[i];
+            d_tot[i] += o.d_tot[i];
+            c_hit[i] += o.c_hit[i];
+            c_tot[i] += o.c_tot[i];
+        }
+    }
+};
+
+// The offline protocol as one function: prime the head's own cache position by position over a stream (that priming
+// is the whole point -- the MTP layer attends over its own states, so it must be fed the stream in order), then
+// chain k drafts from each position in `positions` (empty = every position) and score them against the stream.
+// `positions` entries are stream indices whose hidden feeds the chain, i.e. the drafts predict position i+1.
+// The live loop calls this too, with the positions IT opened chains at, so "live vs offline per depth" is one
+// computation sampled two ways rather than two computations that quietly differ.
+bool chain_stream(ForwardBase& base, const Weights& w, const std::vector<int>& stream,
+                  const std::vector<std::vector<float>>& hidden, int k, const std::vector<int>& positions,
+                  DepthCounts& out, double* cos_sum = nullptr, int* cos_n = nullptr,
+                  std::vector<int>* drafts = nullptr, std::vector<uint8_t>* hits = nullptr) {
+    auto lm = [&base](const std::vector<float>& x, std::vector<float>& lg) { return base.lm_head(x, lg); };
+    KvCache hc;                       // the head's own stream, primed position by position
+    std::vector<float> emb, next, lg;
+    std::vector<KvCache> cache_at(hidden.size());
+    for (size_t i = 0; i < hidden.size(); i++) {
+        base.embed_into(stream[i], emb);
+        if (!head_step(w, hidden[i].data(), emb.data(), (int)i, hc, next,
+                       (i + 1 < hidden.size())
+                           ? std::function<bool(const std::vector<float>&, std::vector<float>&)>(lm)
+                           : nullptr,
+                       lg)) {
+            std::fprintf(stderr, "head step failed at %zu\n", i);
+            return false;
+        }
+        cache_at[i] = hc;
+        if (cos_sum && i + 1 < hidden.size() && !lg.empty()) {
+            // diagnostic: the head's hidden should approximate the base's NEXT hidden
+            double dot = 0, na = 0, nb = 0;
+            for (int q = 0; q < kH; q++) {
+                dot += (double)next[(size_t)q] * hidden[i + 1][(size_t)q];
+                na += (double)next[(size_t)q] * next[(size_t)q];
+                nb += (double)hidden[i + 1][(size_t)q] * hidden[i + 1][(size_t)q];
+            }
+            *cos_sum += dot / std::sqrt(na * nb + 1e-30);
+            (*cos_n)++;
+        }
+    }
+    std::vector<int> which = positions;
+    if (which.empty())
+        for (size_t i = 0; i + 1 < hidden.size(); i++) which.push_back((int)i);
+    if (drafts) drafts->assign(which.size() * (size_t)k, -1);
+    if (hits) hits->assign(which.size() * (size_t)k, 0);
+    for (size_t n = 0; n < which.size(); n++) {
+        const int i0 = which[n];
+        if (i0 < 0 || (size_t)i0 + 1 >= hidden.size()) continue;
+        const size_t i = (size_t)i0;
+        KvCache c = cache_at[i];
+        std::vector<float> h = hidden[i], e2, nx;
+        int tok = stream[i];
+        int pos = i0 + 1;
+        // Depth j is scored unconditionally (the chain runs off-distribution after a rejection, exactly like the
+        // published table) and conditionally (only while every earlier draft was accepted, which is the ceiling).
+        bool prefix_ok = true;
+        for (int j = 0; j < k; j++) {
+            if (i + j + 1 >= hidden.size()) break;
+            base.embed_into(tok, e2);
+            if (!head_step(w, h.data(), e2.data(), pos, c, nx, lm, lg)) break;
+            const int d = argmax_n(lg);
+            const bool hit = (d == stream[i + j + 1]);
+            if (drafts) (*drafts)[n * (size_t)k + (size_t)j] = d;
+            if (hits) (*hits)[n * (size_t)k + (size_t)j] = hit ? 1 : 0;
+            out.d_tot[j]++;
+            if (hit) out.d_hit[j]++;
+            if (prefix_ok) {
+                out.c_tot[j]++;
+                if (hit) out.c_hit[j]++;
+                if (!hit) prefix_ok = false;
+            }
+            tok = d;
+            h = nx;
+            pos++;
+        }
+    }
+    return true;
+}
+
+int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, const Weights& w, int prompts,
+                int tokens, int k, int prompt_base, bool residual,
+                const std::map<int, std::vector<int>>& only = {}) {
+    DepthCounts all;
     double cos_sum = 0, rel_sum = 0;
     int cos_n = 0;
-    std::vector<int> all_tokens;        // the token stream: prompt + emitted
-    std::vector<std::vector<float>> hidden;   // hidden[i] = base hidden after all_tokens[i]
     for (int p = 0; p < prompts; p++) {
         const int pi = prompt_base + p;
         std::vector<int> ids;
@@ -102,68 +201,55 @@ int run_offline(Q4nxNpuForward& fwd, ForwardBase& base, MtpDrafter& drafter, con
         }
         std::vector<int> stream = ids;
         stream.insert(stream.end(), emitted.begin(), emitted.end());
-        all_tokens = stream;
-        hidden = hid;
 
-        auto lm = [&base](const std::vector<float>& x, std::vector<float>& lg) { return base.lm_head(x, lg); };
-        KvCache hc;                       // the head's own stream, primed position by position
-        std::vector<float> emb, next, lg;
-        std::vector<KvCache> cache_at(hidden.size());
-        for (size_t i = 0; i < hidden.size(); i++) {
-            base.embed_into(all_tokens[i], emb);
-            if (!head_step(w, hidden[i].data(), emb.data(), (int)i, hc, next,
-                           (i + 1 < hidden.size()) ? std::function<bool(const std::vector<float>&,
-                                                                        std::vector<float>&)>(lm)
-                                                   : nullptr,
-                           lg)) {
-                std::fprintf(stderr, "head step failed at %zu\n", i);
-                return 1;
-            }
-            cache_at[i] = hc;
-            if (i + 1 < hidden.size() && !lg.empty()) {
-                // diagnostic: the head's hidden should approximate the base's NEXT hidden
-                double dot = 0, na = 0, nb = 0;
-                for (int q = 0; q < kH; q++) {
-                    dot += (double)next[(size_t)q] * hidden[i + 1][(size_t)q];
-                    na += (double)next[(size_t)q] * next[(size_t)q];
-                    nb += (double)hidden[i + 1][(size_t)q] * hidden[i + 1][(size_t)q];
-                }
-                cos_sum += dot / std::sqrt(na * nb + 1e-30);
-                cos_n++;
-            }
+        // --positions-in: score only the positions the live loop opened chains at.  Live's chain starts at `have`,
+        // the position of its first draft, so the equivalent chain here starts on stream index `have-1` (that
+        // hidden is what feeds the drafts).  Restricting the SAME computation to those positions is the only way
+        // the two per-depth tables measure the same thing; with 8 prompts, the sampled positions are what the
+        // 9-18 pp cluster error is.
+        std::vector<int> pos_list;
+        if (!only.empty()) {
+            auto it = only.find(pi);
+            if (it != only.end())
+                for (int have : it->second) pos_list.push_back(have - 1);
+            std::printf("  scored at the live loop's positions: %zu of %zu\n", pos_list.size(), hid.size());
         }
-        // from each position, chain k drafts off the primed cache and compare with the real continuation
-        for (size_t i = 0; i + 1 < hidden.size(); i++) {
-            KvCache c = cache_at[i];
-            std::vector<float> h = hidden[i], e2, nx;
-            int tok = all_tokens[i];
-            int pos = (int)i + 1;
-            for (int j = 0; j < k; j++) {
-                if (i + j + 1 >= hidden.size()) break;
-                base.embed_into(tok, e2);
-                if (!head_step(w, h.data(), e2.data(), pos, c, nx, lm, lg)) break;
-                int d = argmax_n(lg);
-                d_tot[j]++;
-                if (d == all_tokens[i + j + 1]) d_hit[j]++;
-                tok = d;
-                h = nx;
-                pos++;
-            }
-        }
-        std::printf("prompt %d: %zu tokens, %zu positions primed\n", p, hidden.size(), hidden.size());
+        DepthCounts pp;
+        if (!chain_stream(base, w, stream, hid, k, pos_list, pp, &cos_sum, &cos_n)) return 1;
+        all.add(pp);
+        std::printf("prompt %d: %zu tokens, %zu positions primed\n", pi, hid.size(), hid.size());
+        std::printf("  per-depth p%d:", pi);
+        for (int j = 0; j < k; j++) std::printf(" %d %d/%d", j + 1, pp.d_hit[j], pp.d_tot[j]);
+        std::printf("\n");
     }
     double expected = 1.0;
-    std::printf("\n== offline drafter acceptance, %d prompts x %d tokens, k=%d, hidden=%s\n", prompts, tokens, k,
-                residual ? "residual" : "post-norm");
+    std::printf("\n== offline drafter acceptance, %d prompts x %d tokens, k=%d, hidden=%s%s\n", prompts, tokens, k,
+                residual ? "residual" : "post-norm",
+                only.empty() ? "" : ", only at the live loop's chain positions");
     std::printf("  [diag] cos(head_hidden(t), base_hidden(t+1)) = %.4f over %d positions\n",
                 cos_n ? cos_sum / cos_n : 0.0, cos_n);
     for (int j = 0; j < k; j++) {
-        const double r = d_tot[j] ? (double)d_hit[j] / d_tot[j] : 0.0;
-        std::printf("  draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, d_hit[j], d_tot[j]);
+        const double r = all.d_tot[j] ? (double)all.d_hit[j] / all.d_tot[j] : 0.0;
+        std::printf("  draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, all.d_hit[j], all.d_tot[j]);
         expected += r;
     }
-    std::printf("  hit rate %d/%d = %.3f; expected tokens per pass (chain) %.2f\n", d_hit[0], d_tot[0],
-                d_tot[0] ? (double)d_hit[0] / d_tot[0] : 0.0, expected);
+    // A conditional rate is not a marginal, so the chain is NOT the sum of the rates printed below: by linearity
+    // E[tokens per pass] = 1 + sum_j P(draft j accepted) = 1 + sum_j c_hit[j]/c_tot[0] (c_tot[0] = chains scored),
+    // because P(accepted at depth j) = P(accepted at j | reached j) * P(reached j).
+    double c_expected = 1.0, c_mean_rate = 0.0;
+    const int chains = all.c_tot[0];
+    std::printf("  conditional on an accepted prefix (the live loop's estimator):\n");
+    for (int j = 0; j < k; j++) {
+        const double r = all.c_tot[j] ? (double)all.c_hit[j] / all.c_tot[j] : 0.0;
+        std::printf("    draft %d: %6.3f %% (%d/%d)\n", j + 1, 100.0 * r, all.c_hit[j], all.c_tot[j]);
+        c_mean_rate += r;
+        c_expected += chains ? (double)all.c_hit[j] / chains : 0.0;
+    }
+    std::printf("    mean conditional rate %.2f (rates at different depths are not additive, so this is not a chain)\n",
+                c_mean_rate);
+    std::printf("    expected tokens per pass (chain) %.2f = 1 + sum_j c_hit[j]/c_tot[0]\n", c_expected);
+    std::printf("  hit rate %d/%d = %.3f; expected tokens per pass (chain) %.2f\n", all.d_hit[0], all.d_tot[0],
+                all.d_tot[0] ? (double)all.d_hit[0] / all.d_tot[0] : 0.0, expected);
     return 0;
 }
 
@@ -174,8 +260,11 @@ int main(int argc, char** argv) {
     std::string model_dir, head_exact, head_q4k;
     int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
-    bool residual = false, dry = false, selftest = false, offline = false, live = false;
-    std::string gold;
+    bool residual = false, dry = false, selftest = false, offline = false, live = false, batchcheck = false;
+    bool match_mode = false;
+    std::string gold, positions_out, positions_in;
+    // prompt index -> the stream positions where the live loop opened its chains
+    std::map<int, std::vector<int>> only_positions;
     for (int i = 1; i < argc; i++) {
         const std::string a = argv[i];
         auto nexts = [&]() -> std::string { return (i + 1 < argc) ? argv[++i] : std::string(); };
@@ -193,6 +282,10 @@ int main(int argc, char** argv) {
         else if (a == "--gold") gold = nexts();
         else if (a == "--offline") offline = true;
         else if (a == "--live") live = true;
+        else if (a == "--batchcheck") batchcheck = true;
+        else if (a == "--match") match_mode = true;
+        else if (a == "--positions-out") positions_out = nexts();
+        else if (a == "--positions-in") positions_in = nexts();
         else if (a == "--fc-hidden-first") g_fc_hidden_first = true;
         else { std::fprintf(stderr, "unknown arg %s\n", a.c_str()); return 2; }
     }
@@ -267,12 +360,115 @@ int main(int argc, char** argv) {
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
 
+    if (batchcheck) {
+        // Does the deferred batch verify give the same answer as plain decode?
+        //
+        // This is the one engine property the draft loop rests on and the only one never checked directly: acceptance
+        // compares a draft against the BASE's own choice at that position, and it reads that choice from the M=nd
+        // verify batch (row i-1) for draft i, while draft 1 is read from a plain step.  So a batch whose per-row argmax
+        // differs from sequential decode would leave depth 1 untouched and depress every deeper depth -- exactly the
+        // signature the live loop shows.  Identical TEXT does not check this: the loop only ever emits from the row at
+        // the accepted-prefix boundary, and a wrongly REJECTED draft costs a pass, never a token.
+        //
+        // Pass A decodes greedily, recording the argmax at every position.  Pass B walks the same stream in nd-row
+        // batches (committing every row, since all of them are the stream's own tokens) and compares each row's argmax
+        // with pass A's.  Cost: one decode plus one pass at 1/nd the step count.
+        const int nd = std::min(k, base.max_batch_rows());
+        for (int p = 0; p < prompts; p++) {
+            const int pi = prompt_base + p;
+            std::vector<int> ids;
+            for (int i = 0; i < 8; i++) ids.push_back((pi * 977 + i * 131 + 17) % (base.vocab() - 1) + 1);
+            fwd.reset();
+            std::vector<float> lg;
+            std::vector<int> stream = ids, seq;
+            std::vector<std::vector<float>> hid_ref;   // pass A's hidden at every position
+            for (size_t i = 0; i < ids.size(); i++) {
+                if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+                hid_ref.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+            }
+            for (int t = 0; t < tokens; t++) {
+                int best = 0;
+                for (size_t i = 1; i < lg.size(); i++) if (lg[i] > lg[best]) best = (int)i;
+                seq.push_back(best);
+                stream.push_back(best);
+                if (!fwd.step(best, (int)ids.size() + t, lg)) { std::fprintf(stderr, "step failed\n"); return 1; }
+                hid_ref.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+            }
+            fwd.reset();
+            const int n = (int)stream.size();
+            int checked = 0, differ = 0, first_differ = -1;
+            int hid_rows = 0, worst_pos = -1;
+            double min_cos = 2.0, max_abs = 0;
+            int pos = 0;
+            // prefill the prompt one position at a time, so pass B starts from the same state pass A did
+            for (size_t i = 0; i < ids.size(); i++)
+                if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+            pos = (int)ids.size();
+            std::vector<float> all;
+            while (pos + nd <= n) {
+                std::vector<int> rows(stream.begin() + pos, stream.begin() + pos + nd);
+                if (!base.step_batch_all(rows, pos, all)) { std::fprintf(stderr, "batch failed\n"); return 1; }
+                for (int m = 0; m < nd; m++) {
+                    int best = 0;
+                    const float* l = &all[(size_t)m * (size_t)base.vocab()];
+                    for (int i = 1; i < base.vocab(); i++) if (l[i] > l[best]) best = i;
+                    // row m's logits predict the token AFTER position pos+m; pass A recorded that as seq[pos+m-7]
+                    const int want_at = pos + m - (int)ids.size() + 1;
+                    if (want_at < 0 || want_at >= (int)seq.size()) continue;
+                    checked++;
+                    if (best != seq[(size_t)want_at]) {
+                        differ++;
+                        if (first_differ < 0) first_differ = pos + m + 1;   // the position row m predicts
+                    }
+                }
+                {
+                    // The other half of "is the batch the same as decode": the batch's per-row HIDDEN, which is what
+                    // the drafter commits into its stream (last_hidden_rows()[m]).  The same argmax over a slightly
+                    // different hidden would still poison every later draft, and only this comparison sees it.
+                    const std::vector<float>& rows_h = base.last_hidden_rows();
+                    const size_t H = (size_t)base.hidden_size();
+                    for (int m = 0; m < nd && (pos + m) < (int)hid_ref.size(); m++) {
+                        if (rows_h.size() < (size_t)(m + 1) * H) break;
+                        const float* a = &rows_h[(size_t)m * H];
+                        const std::vector<float>& b = hid_ref[(size_t)pos + (size_t)m];
+                        double dot = 0, na = 0, nb = 0, md = 0;
+                        for (size_t q = 0; q < H && q < b.size(); q++) {
+                            dot += (double)a[q] * b[q];
+                            na += (double)a[q] * a[q];
+                            nb += (double)b[q] * b[q];
+                            const double d = std::fabs((double)a[q] - b[q]);
+                            if (d > md) md = d;
+                        }
+                        const double cos = dot / std::sqrt(na * nb + 1e-30);
+                        hid_rows++;
+                        if (cos < min_cos) { min_cos = cos; worst_pos = pos + m; }
+                        if (md > max_abs) max_abs = md;
+                    }
+                }
+                if (!base.commit_verify(nd)) { std::fprintf(stderr, "commit refused\n"); return 1; }
+                pos += nd;
+            }
+            std::printf("prompt %d: batch argmax vs sequential argmax: %d of %d rows differ (first at position %d)\n",
+                        pi, differ, checked, first_differ);
+            std::printf("  batch hidden rows vs sequential hidden: %d rows, min cos %.6f (position %d), max |diff| %.3e\n",
+                        hid_rows, min_cos, worst_pos, max_abs);
+        }
+        return 0;
+    }
+
     if (live) {
         // The gate that matters for switching a serve over: the speculative loop must emit exactly the tokens
         // plain greedy decode does, at fewer passes per token.
+        std::ofstream pout;
+        if (!positions_out.empty()) {
+            pout.open(positions_out, std::ios::trunc);
+            if (!pout) { std::fprintf(stderr, "cannot write %s\n", positions_out.c_str()); return 1; }
+        }
         int bad = 0, tot_emitted = 0, tot_steps = 0, tot_batches = 0, tot_acc = 0, tot_draft = 0, tot_iter = 0;
         int acc_live[Stats::kMaxDepth] = {0}, draft_live[Stats::kMaxDepth] = {0};
         double hit_live[Stats::kMaxDepth] = {0};
+        double tot_plain_s = 0, tot_spec_s = 0;
+        DepthCounts matched;      // --match: the offline protocol scored where THIS run opened its chains
         for (int p = 0; p < prompts; p++) {
             const int pi = prompt_base + p;
             std::vector<int> ids;
@@ -281,15 +477,21 @@ int main(int argc, char** argv) {
             fwd.reset();
             std::vector<float> lg;
             std::vector<int> plain;
-            for (size_t i = 0; i < ids.size(); i++)
+            std::vector<std::vector<float>> hid_plain;   // --match: the stream the offline protocol is scored on
+            const double t_plain0 = now_ms();
+            for (size_t i = 0; i < ids.size(); i++) {
                 if (!fwd.step(ids[i], (int)i, lg)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+                if (match_mode) hid_plain.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
+            }
             int pos = (int)ids.size();
             for (int t = 0; t < tokens; t++) {
                 int best = 0;
                 for (size_t i = 1; i < lg.size(); i++) if (lg[i] > lg[best]) best = (int)i;
                 plain.push_back(best);
                 if (!fwd.step(best, pos++, lg)) { std::fprintf(stderr, "step failed\n"); return 1; }
+                if (match_mode) hid_plain.push_back(residual ? fwd.last_residual() : fwd.last_hidden());
             }
+            const double plain_s = (now_ms() - t_plain0) / 1000.0;
             // the speculative loop on the same prompt: reset the base, then prime the drafter over the prompt so it
             // attends over the whole stream (that is what the offline protocol showed matters: 3 % -> 69 %)
             fwd.reset();
@@ -313,7 +515,11 @@ int main(int argc, char** argv) {
             o.k = k;
             o.tau = tau;
             o.max_tokens = tokens;
+            const double t_spec0 = now_ms();
+            const long lm0 = drafter.lm_calls();
             const Result r = run(base, &drafter, ids, o);
+            const long lm_used = drafter.lm_calls() - lm0;
+            const double spec_s = (now_ms() - t_spec0) / 1000.0;
             if (!r.ok) { std::fprintf(stderr, "prompt %d: %s\n", p, r.err.c_str()); return 1; }
             const bool same = (r.tokens == plain);
             if (!same) bad++;
@@ -328,10 +534,153 @@ int main(int argc, char** argv) {
                 draft_live[d] += r.stats.drafted_at[d];
                 hit_live[d] = draft_live[d] ? (double)acc_live[d] / draft_live[d] : 0.0;
             }
-            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f, stream %d rows, %d mismatch\n", p,
+            // The two numbers the serve switch needs, measured in ONE process on the SAME prompt: the draft route
+            // against plain decode.  "tokens/pass (chain)" is 1 + accepted/iterations -- the quantity the offline
+            // protocol prints; it is NOT accepted/iterations alone (that is accept-len, one lower by the committed
+            // token), which is the factor-(1+x) trap that made the live and offline summaries look incomparable.
+            // `pi`, not `p`: with --prompt-base the slice index is not the prompt index, and a log that says
+            // "prompt 0" for prompt 5 is how two tickets' tables get compared with the wrong slice.
+            std::printf("prompt %d: %s, %d tokens, accepted %d/%d, passes/token %.3f, stream %d rows, %d mismatch\n", pi,
                         same ? "TEXT IDENTICAL" : "TEXT DIVERGED", r.stats.emitted, r.stats.accepted,
                         r.stats.drafted, r.stats.passes_per_token(), drafter.stream().keep(),
                         drafter.stream_mismatches());
+            std::printf("  chain %.2f tokens/pass (accept-len %.2f + the committed token); plain %.2f s = %.3f s/tok, "
+                        "draft %.2f s = %.3f s/tok (speedup %.2fx)\n",
+                        1.0 + r.stats.mean_accept_len(), r.stats.mean_accept_len(), plain_s,
+                        tokens ? plain_s / tokens : 0.0, spec_s, tokens ? spec_s / tokens : 0.0,
+                        spec_s > 0 ? plain_s / spec_s : 0.0);
+            tot_plain_s += plain_s;
+            tot_spec_s += spec_s;
+            // Per-PROMPT depth counts, not just the run aggregate: the array is shared, so the 8-prompt table is
+            // assembled from several tickets/tickets-of-slices, and a per-prompt breakdown is the only form that can
+            // be summed correctly afterwards (adding percentages weights a 16-iteration prompt like a 36 one).
+            // Calls, not a claim: a full-vocab logits call is ~0.3-0.5 s of array dispatch chain, so this count is
+            // the loop's real cost per iteration and the thing a cheaper head has to reduce.
+            // The millisecond figure divides the WHOLE draft phase (base steps, verify batches, priming) by the
+            // logits count, so it is an amortised phase cost, not a head latency -- one call alone is ~0.3-0.5 s.
+            std::printf("  logits calls %ld over %d iterations (%.2f/iter), %.1f ms of the whole draft phase per call\n", lm_used,
+                        r.stats.iterations, r.stats.iterations ? (double)lm_used / r.stats.iterations : 0.0,
+                        lm_used ? 1000.0 * spec_s / (double)lm_used : 0.0);
+            std::printf("  per-depth p%d:", pi);
+            for (int d = 0; d < k && d < Stats::kMaxDepth; d++)
+                std::printf(" %d %d/%d", d + 1, r.stats.accepted_at[d], r.stats.drafted_at[d]);
+            std::printf("\n");
+            // --positions-out records where each prompt's chains opened, so `--offline --positions-in` scores the
+            // same positions and the two per-depth tables stop being a clustered subsample of each other.
+            if (pout) {
+                pout << pi;
+                for (int have : r.stats.chain_at) pout << ' ' << have;
+                pout << '\n';
+                pout.flush();
+                std::printf("  chain positions: %zu written to %s\n", r.stats.chain_at.size(),
+                            positions_out.c_str());
+            }
+            // --match: the deliverable's actual clause.  Score the OFFLINE protocol -- same function, same weights,
+            // same primed stream -- at exactly the positions this live loop opened chains at, in this process, and
+            // print live vs offline per depth.  Anything left over is then neither prompt composition nor a
+            // subsample: it is the loop's feeding or the verify batch, both already proven exact digit for digit.
+            if (match_mode) {
+                if (!same)
+                    std::printf("  match p%d: TEXT DIVERGED, so this comparison is against a different stream\n", pi);
+                std::vector<int> stream = ids;
+                stream.insert(stream.end(), plain.begin(), plain.end());
+                std::vector<int> pos_list;
+                for (int have : r.stats.chain_at) pos_list.push_back(have - 1);
+                DepthCounts m;
+                std::vector<int> odrafts;
+                std::vector<uint8_t> ohits;
+                if (!chain_stream(base, w, stream, hid_plain, k, pos_list, m, nullptr, nullptr, &odrafts, &ohits))
+                    return 1;
+                matched.add(m);
+                std::printf("  match p%d: %zu offline chains at this loop's own positions (stream %zu rows)\n", pi,
+                            pos_list.size(), hid_plain.size());
+                // Three estimators live in this file and mixing them has already cost this lane two false alarms
+                // (13:40, 15:22), so name them here once:
+                //   marginal      P(draft d is the model's choice) at every position  -- the published 3.19 (d_*);
+                //   conditional   P(draft d | the prefix was accepted)               -- offline c_*, the drafter's
+                //                                                                     quality per depth;
+                //   joint         P(the whole chain 0..d was accepted)              -- the loop's accepted_at[d]/
+                //                                                                     drafted_at[d], which is a
+                //                                                                     survival curve, not a rate.
+                // The loop's per-depth acceptance is CONDITIONAL on reaching the depth (that is what a serve wants:
+                // how often does draft d get taken when the chain got there), so compare it with offline's c_*.
+                for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
+                    const double joint = r.stats.drafted_at[d] ? 100.0 * r.stats.accepted_at[d] / r.stats.drafted_at[d] : 0.0;
+                    const int reached = d ? r.stats.accepted_at[d - 1] : r.stats.drafted_at[0];
+                    const double lv = reached ? 100.0 * r.stats.accepted_at[d] / reached : 0.0;
+                    const double oc = m.c_tot[d] ? 100.0 * m.c_hit[d] / m.c_tot[d] : 0.0;
+                    const double om = m.d_tot[d] ? 100.0 * m.d_hit[d] / m.d_tot[d] : 0.0;
+                    const double delta = lv - oc;
+                    std::printf("    depth %d: live %6.2f %% (%d/%d, reached)  offline conditional %6.2f %% (%d/%d)"
+                                "  delta %+6.2f pp%s   [live joint %6.2f %%, offline marginal %6.2f %%]\n",
+                                d + 1, lv, r.stats.accepted_at[d], reached, oc, m.c_hit[d], m.c_tot[d],
+                                delta, (delta <= 2.0 && delta >= -2.0) ? "" : "  > 2 pp", joint, om);
+                }
+                // ...and the form that needs no estimator at all: per chain position, how many drafts were accepted
+                // before the first refusal.  Identical machinery must give identical prefix lengths at every
+                // position, and a difference names its position and both lengths.
+                int pref_same = 0, pref_diff = 0, ppos = -1, plive = -1, poff = -1;
+                for (size_t n = 0; n < r.stats.chain_at.size() && n < r.stats.chain_accepted.size(); n++) {
+                    const int i = r.stats.chain_at[n] - 1;
+                    const int cap = std::min<int>(k, (int)stream.size() - 1 - i);
+                    if (cap <= 0) continue;
+                    int run = 0;
+                    for (int d = 0; d < cap; d++) {
+                        const size_t idx = n * (size_t)k + (size_t)d;
+                        if (idx >= ohits.size() || ohits[idx] == 0) break;
+                        run++;
+                    }
+                    const int lv = std::min<int>(r.stats.chain_accepted[n], cap);
+                    if (lv == run) pref_same++;
+                    else { pref_diff++; if (ppos < 0) { ppos = r.stats.chain_at[n]; plive = lv; poff = run; } }
+                }
+                std::printf("    accepted-prefix length equal at %d of %d positions", pref_same, pref_same + pref_diff);
+                if (ppos >= 0) std::printf(", first difference at stream position %d: live %d, offline %d", ppos,
+                                           plive, poff);
+                std::printf("\n");
+                // Per-(position, depth) diff.  The aggregates can only say "less"; the drafts say WHICH:
+                //   * same draft token, different verdict -> the verification/feeding path disagrees with the
+                //     protocol on the same computation (a real loop defect, and here is its position);
+                //   * different draft token at depths 1-4 -> the chain itself was computed from a different state,
+                //     which points at the drafter's cache rows, not at the verdict.
+                // Only pairs both paths can score are counted, because offline stops at the stream end and the
+                // live loop keeps drafting (tau=0 always drafts k).  That tail alone is a few pairs, not a trend.
+                int pairs = 0, tok_diff = 0, verdict_diff = 0, verdict_diff_same_tok = 0, live_hit = 0, off_hit = 0;
+                int fpos = -1, fdep = -1, flive = -1, foff = -1, fstr = -1, vpos = -1, vdep = -1, vlive = -1, voff = -1;
+                for (size_t n = 0; n < r.stats.chain_at.size() && n < r.stats.chain_drafts.size(); n++) {
+                    const int i = r.stats.chain_at[n] - 1;
+                    for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
+                        const size_t idx = n * (size_t)k + (size_t)d;
+                        if (i < 0 || (size_t)(i + d + 1) >= stream.size() || idx >= odrafts.size()) continue;
+                        const int od = odrafts[idx];
+                        if (od < 0 || d >= (int)r.stats.chain_drafts[n].size()) continue;   // offline/loop stopped here
+                        const int ld = r.stats.chain_drafts[n][(size_t)d];
+                        const bool lh = d < r.stats.chain_accepted[n];
+                        const bool oh = ohits[idx] != 0;
+                        pairs++;
+                        if (lh) live_hit++;
+                        if (oh) off_hit++;
+                        if (ld != od && fpos < 0) { fpos = i + 1; fdep = d + 1; flive = ld; foff = od; fstr = stream[(size_t)(i + d + 1)]; }
+                        if (ld != od) tok_diff++;
+                        if (lh != oh) {
+                            verdict_diff++;
+                            if (ld == od) {
+                                verdict_diff_same_tok++;
+                                if (vpos < 0) { vpos = i + 1; vdep = d + 1; vlive = lh; voff = oh; }
+                            }
+                        }
+                    }
+                }
+                std::printf("    pairs %d: accepted live %d, offline %d (marginal); draft tokens differ %d; verdicts differ %d"
+                            " (%d of them on the SAME draft token)\n",
+                            pairs, live_hit, off_hit, tok_diff, verdict_diff, verdict_diff_same_tok);
+                if (fpos >= 0)
+                    std::printf("    first draft-token difference: stream position %d, depth %d: live %d, offline %d, "
+                                "stream says %d\n", fpos, fdep, flive, foff, fstr);
+                if (vpos >= 0)
+                    std::printf("    first verdict difference on the same token: stream position %d, depth %d: live %s, "
+                                "offline %s\n", vpos, vdep, vlive ? "accept" : "reject", voff ? "accept" : "reject");
+            }
             if (!same) {
                 std::printf("  plain:");
                 for (int t : plain) std::printf(" %d", t);
@@ -343,17 +692,60 @@ int main(int argc, char** argv) {
         std::printf("\n== live loop: %d/%d prompts text-identical, passes/token %.3f, accept-len %.2f, hit %.3f\n",
                     prompts - bad, prompts, tot_emitted ? (double)(tot_steps + tot_batches) / tot_emitted : 0.0,
                     tot_iter ? (double)tot_acc / tot_iter : 0.0, tot_draft ? (double)tot_acc / tot_draft : 0.0);
+        std::printf("   chain %.2f tokens/pass (= 1 + accept-len, the offline quantity; %.3f tokens/base-pass); "
+                    "wall plain %.1f s, draft %.1f s (speedup %.2fx)\n",
+                    tot_iter ? 1.0 + (double)tot_acc / tot_iter : 0.0,
+                    tot_emitted ? (double)tot_emitted / (tot_steps + tot_batches) : 0.0, tot_plain_s, tot_spec_s,
+                    tot_spec_s > 0 ? tot_plain_s / tot_spec_s : 0.0);
         // The comparison the deliverable asks for: the same quantity the offline protocol prints, per depth.
         std::printf("   per-depth acceptance:\n");
         for (int d = 0; d < k && d < Stats::kMaxDepth; d++)
             std::printf("     draft %d: %6.3f %% (%d/%d)\n", d + 1, 100.0 * hit_live[d], acc_live[d], draft_live[d]);
+        if (match_mode) {
+            // The brief's clause, measured instead of argued: the same drafter on the same stream at the same
+            // positions, so the only difference left is how the live loop feeds it.
+            int over = 0;
+            std::printf("   == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching"
+                        " the depth (the 2 pp bar):\n");
+            for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
+                const int reached = d ? acc_live[d - 1] : draft_live[0];
+                const double lv = reached ? 100.0 * acc_live[d] / reached : 0.0;
+                const double of = matched.c_tot[d] ? 100.0 * matched.c_hit[d] / matched.c_tot[d] : 0.0;
+                const double delta = lv - of;
+                const bool ok = (delta <= 2.0 && delta >= -2.0);
+                if (!ok) over++;
+                std::printf("     depth %d: live %6.2f %% (%d/%d)  offline %6.2f %% (%d/%d)  delta %+6.2f pp  %s\n",
+                            d + 1, lv, acc_live[d], reached, of, matched.c_hit[d], matched.c_tot[d], delta,
+                            ok ? "PASS" : "FAIL");
+            }
+            std::printf("   %d of %d depths within 2 pp at the same positions\n",
+                        std::min(k, Stats::kMaxDepth) - over, std::min(k, Stats::kMaxDepth));
+        }
         return bad ? 1 : 0;
     }
 
     if (offline) {
         drafter.set_tau(tau);      // tau=0 measures every depth unconditionally, which is what the offline
                                    // protocol reports (the chain gate is a speed choice, not a quality one)
-        return run_offline(fwd, base, drafter, w, prompts, tokens, k, prompt_base, residual);
+        if (!positions_in.empty()) {
+            std::ifstream in(positions_in);
+            if (!in) { std::fprintf(stderr, "cannot read %s\n", positions_in.c_str()); return 1; }
+            std::string line;
+            while (std::getline(in, line)) {
+                std::istringstream ls(line);
+                int pi;
+                if (!(ls >> pi)) continue;
+                int have;
+                while (ls >> have) only_positions[pi].push_back(have);
+            }
+            if (only_positions.empty()) {
+                std::fprintf(stderr, "%s holds no positions\n", positions_in.c_str());
+                return 1;
+            }
+            std::printf("scoring only the live loop's chain positions from %s (%zu prompts)\n", positions_in.c_str(),
+                        only_positions.size());
+        }
+        return run_offline(fwd, base, drafter, w, prompts, tokens, k, prompt_base, residual, only_positions);
     }
 
     // Prompts are token ids: acceptance does not depend on the text, and this keeps the run reproducible

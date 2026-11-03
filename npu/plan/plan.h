@@ -41,6 +41,7 @@
 //                          {"root": "kernels", "path": "m16"},
 //                          {"root": "kernels", "path": "."}]},
 //     "kernels": {"tag": ""},                                  // "" | "_b8" | "_pb16i" | "_t2s"
+//     "attention": {"mode": "causal"|"noncausal_full_attention"},   // optional, default causal
 //     "moe":     {"batched_expert_gu": {"enabled": false, "K": 0, "N": 0}},
 //     "layers":  [{"index": 0, "role": "attn"|"gdn"|"moe"|"mla",
 //                  "qkv": {"K": 1024, "N": 1536, "fused": true},
@@ -121,6 +122,12 @@ struct Plan {
     int prefill_m = 0;             // 0 = not stated (the engine keeps its own default)
     int decode_m = 0;
     bool decode_enabled = true;
+    // The attention mask the container's own pack declares (`decision_config.json`'s attention_mode).
+    // "causal" is the default and the only mode that can generate; "noncausal_full_attention" is a
+    // prompt-encoding mode (every full-attention layer sees the whole prompt, which is what a d3
+    // readout pack is trained with), so the forward refuses to generate with it by name.
+    std::string attention_mode = "causal";
+    bool noncausal() const { return attention_mode == "noncausal_full_attention"; }
     // Where the decode family is looked for, in order: which given path it hangs off, and the
     // relative directory under it ("." = that directory itself).
     struct DecodeDir { bool under_model = false; std::string path; };
@@ -174,6 +181,17 @@ struct Plan {
                                 "\" is not fused or split");
         }
         if (j.contains("prefill")) p.prefill_m = positive_or_zero(obj(j, "prefill", path), "M", path);
+        // Optional and defaulted on purpose: a plan written before this field existed must load and
+        // mean exactly what it meant then (causal), so this is not a format bump.
+        if (j.contains("attention")) {
+            const auto& a = obj(j, "attention", path);
+            if (!a.contains("mode") || !a.at("mode").is_string())
+                throw PlanError("plan: " + path + " attention has no \"mode\" string");
+            p.attention_mode = a.at("mode").get<std::string>();
+            if (p.attention_mode != "causal" && p.attention_mode != "noncausal_full_attention")
+                throw PlanError("plan: " + path + " attention.mode \"" + p.attention_mode +
+                                "\" is not causal or noncausal_full_attention");
+        }
         if (j.contains("kernels")) {
             const auto& k = obj(j, "kernels", path);
             p.tag = k.value("tag", "");

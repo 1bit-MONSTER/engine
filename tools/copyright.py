@@ -35,6 +35,9 @@ LINE_STYLES = [
       ".gitignore", ".gitattributes", ".clang-format", "*.toml", "*.config", "*.fragment", "*.example",
       "*.service", "*.timer", "*.conf", "*.env", "lemonade-hrx", "packages-extra", "05onboard-data", "10lemonade", "zz-onboard-ports", "20onboard-ssh",
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
+      # cycle 17: Puppy's switch that skips its first-run Quick Setup is an empty marker file whose only content
+      # is this notice - Puppy tests for its existence, so a comment is free
+      "personal_settings_popup_disabled",
       # os/v2's packaged files: systemd units of kinds the list did not name yet, and the two '#'-comment
       # files a v2 build reads (the snapshot pin, and the board's power profile at /etc/1bit/power)
       "*.mount", "*.preset", "*.network", "power", "pin.txt",

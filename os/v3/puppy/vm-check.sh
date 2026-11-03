@@ -424,6 +424,11 @@ rows = [
                      "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
                      "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
                      "webapp-key-not-in-url"),
+    # Cycle 17 item 3: the appliance's name is /etc/hostname, not the DHCP server's opinion - connman's
+    # AllowHostnameUpdates defaults to true, which is the one path a name nobody typed can take.
+    ("U1 hostname pin", "grep -n '^AllowHostnameUpdates' /etc/connman/main.conf; "
+                     "grep -q '^AllowHostnameUpdates = false' /etc/connman/main.conf && echo hostname-dhcp-pinned",
+                     "hostname-dhcp-pinned"),
     # Cycle 17 item 2: the boot's evidence is on the DATA partition, not in RAM.
     ("U3 boot logs", "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
                      "ls /data/logs/*/dmesg.log > /dev/null 2>&1 && grep -q cmdline /data/logs/*/BOOT && "

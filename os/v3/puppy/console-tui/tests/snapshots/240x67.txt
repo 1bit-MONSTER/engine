@@ -1,0 +1,67 @@
+1bit OS rc-2026-11-03-c16 strix  192.168.50.110  up 2h 13m  Secure Boot enabled  SoC 43C
+ CONNECT ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+  web UI http://192.168.50.110:13305
+  api  http://192.168.50.110:13305/api/v1   (API key: press 1)
+  ssh  root@192.168.50.110   (your key in /data/ssh/authorized_keys)
+  app  Lemonade Mobile: server http://192.168.50.110:13305 + that key
+ LEMONADE ---------------------------------------------------------------------- GPU --------------------------------------------------------------------------- NPU -------------------------------------------------------------------------
+up (pid 8882)                                                                   HRX0: AMD Radeon 8060S Graphics                                                 amdxdna loaded
+http://192.168.50.110:13305                                                     74158 MiB free                                                                  firmware present
+API key: set, press 1                                                           VRAM 2G of 120G used, GTT 512M of 61G                                           accel0 idle
+                                                                                43C
+ MODELS ------------------------------------------------------------------------ FANS / TEMPS ------------------------------------------------------------------ DATA ------------------------------------------------------------------------
+2 downloaded                                                                    fans: controlled (fan1 0 rpm fan2 0 rpm)                                        58G total, 52G free
+Qwen3-0.6B-NPU-1bit                                                             temps max 43C                                                                   last request 330.8 tok/s, first token 10 ms
+qwen3-0.6b-q4_k_m-1bit                                                                                                                                          4 requests served
+loaded: qwen3-0.6b-q4_k_m-1bit
+ LOGS newest -----------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
+KRN [ 1.100000] amdgpu 0000:c7:00.0: HRX runtime registered HRX0
+KRN [ 1.200000] amdxdna 0000:c7:00.1: firmware loaded
+LEM 2026-11-03 12:07:38 llama-server: listening on 127.0.0.1:8001
+LEM 2026-11-03 12:07:41 lemond: POST /api/v1/chat/completions 200 (327 tokens, 330.75 tok/s)
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+
+1 Show the API key   2 Quick chat test (GPU and NPU)   3 Network (DHCP, static, hostname)   4 Models (list, pull, delete)   5 Install 1bit OS to a disk   6 Start the desktop (JWM) for this session   7 Shell (bash, returns here on exit)
+8 Logs (Lemonade, kernel)   9 Reboot / power off
+1-9 actions arrows scroll f newest r refresh 8 logs q stays on this screen

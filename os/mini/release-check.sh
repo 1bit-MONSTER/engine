@@ -37,7 +37,7 @@ fail() { ROWS=$((ROWS + 1)); FAILS=$((FAILS + 1)); say "FAIL  $1 : $2"; }
 HW_SKIPPED=   # the hardware-only rows that actually skipped, for the footer; empty means none did
 skip() {
     ROWS=$((ROWS + 1))
-    case "$1" in gpu|npu|models|chat-hrx|chat-npu) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
+    case "$1" in gpu|npu|models|chat-hrx|chat-npu|chat-npu-followup) HW_SKIPPED="${HW_SKIPPED:+$HW_SKIPPED, }$1" ;; esac
     say "SKIP  $1 : $2"
 }
 # Every fetch is capped. Without that, a Lemonade that accepts the connection and never answers hangs
@@ -148,6 +148,48 @@ seal_manifest_problems() {  # <set dir>: one line per problem, nothing and statu
     return $_bad
 }
 
+# The NPU chat row's follow-up decision (engine #911). The board's cycle-17 demo lost the second
+# turn after a long first one - 0 chunks, then one amdxdna TDR - while this check's single short
+# prompt stayed green, so a row is needed that asks twice and looks at the kernel log. Pure, so
+# --self-test drives it and the row below uses the same code:
+#   <turn 1 body> <turn 2 body> <TDRs before> <TDRs after>
+followup_verdict() {
+    _r1=$1 _r2=$2 _t0=$3 _t1=$4
+    case "$_r1" in
+        *'"error"'*) printf 'FAIL the long turn answered an error: %.100s' "$_r1"; return 0 ;;
+        *'"finish_reason"'*) ;;
+        *) printf 'FAIL the long turn did not finish: %.100s' "${_r1:-no body}"; return 0 ;;
+    esac
+    case "$_r2" in
+        *'"error"'*) printf 'FAIL the follow-up answered an error: %.100s' "$_r2"; return 0 ;;
+    esac
+    if [ -z "$(json_str "$_r2" content)" ] && [ -z "$(json_str "$_r2" reasoning_content)" ]; then
+        printf 'FAIL the follow-up gave no content and no reasoning: %.100s' "${_r2:-no body}"; return 0
+    fi
+    case "$_r2" in
+        *'"finish_reason"'*) ;;
+        *) printf 'FAIL the follow-up came back without a finish_reason, i.e. a cut reply: %.100s' "$_r2"; return 0 ;;
+    esac
+    # An unreadable kernel log (empty count) is said out loud rather than counted as clean.
+    if [ -z "$_t0" ] || [ -z "$_t1" ]; then
+        printf 'PASS the follow-up answered; the kernel log was not readable, so no TDR was ruled out'
+        return 0
+    fi
+    if [ "$_t1" -gt "$_t0" ]; then
+        printf 'FAIL the NPU logged a TDR during the two turns (%s -> %s): see dmesg' "$_t0" "$_t1"; return 0
+    fi
+    printf 'PASS the follow-up answered after a long turn, no TDR (still %s)' "$_t1"
+}
+
+# The first value of a JSON key - quoted or not, since usage counts are bare numbers - for the row's
+# small bodies (one line, one message: the same assumption chat() already makes).
+json_str() { printf '%s' "$1" | sed -n "s/.*\"$2\"[[:space:]]*:[[:space:]]*\"\{0,1\}\([^\",}]*\)\"\{0,1\}.*/\\1/p" | head -1; }
+
+# Text on its way into a JSON string: no control characters (a newline would end the line) and the
+# two characters JSON escapes. Used to replay the long turn's own answer as the follow-up's history,
+# as the web page does.
+json_text() { printf '%s' "$1" | tr '\n\r\t' '   ' | sed 's/\\/\\\\/g; s/"/\\"/g'; }
+
 # --self-test: assert the lemonade verdict on the cases that matter (tests/release_check_row.sh runs
 # this in CI). The unprepared-stick case is the one that used to false-PASS: 200 with the key, an empty
 # body and no status without it.
@@ -168,6 +210,20 @@ if [ "${1:-}" = --self-test ]; then
     check FAIL "$(lemonade_verdict 000 '' 000)"                           # no server at all
     check FAIL "$(lemonade_verdict 200 '' 401)"                           # 200 with no model list
     check FAIL "$(lemonade_verdict 500 'error' 401)"                      # not a 200
+    # engine #911: the NPU follow-up row. The board's shape is the second case: a long turn that
+    # finished, then a follow-up with no content at all and a TDR in the kernel log.
+    check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
+    check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"error":{"message":"dx: position out of range"}}' 0 0)"
+    check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":""},"finish_reason":"length"}]}' 0 0)"
+    check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 1)"
+    check FAIL "$(followup_verdict '{"error":{"message":"no answer"}}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' 0 0)"
+    check FAIL "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT"}}]}' 0 0)"
+    check PASS "$(followup_verdict '{"choices":[{"finish_reason":"length"}]}' '{"choices":[{"message":{"content":"1BIT OK"},"finish_reason":"length"}]}' '' '')"
+    # the history that goes back into the request has to survive a JSON string
+    jt=$(json_text 'a "quoted" \\ line
+next')
+    if printf '{"x":"%s"}' "$jt" | grep -q '\\"quoted\\"'; then printf 'ok   json_text escapes quotes and drops the newline\n'
+    else printf 'FAIL json_text left the text unsafe for JSON: %s\n' "$jt"; rc=1; fi
     # engine #574: the sealed set's manifest, on sets built here (a manifest whose file list and
     # the set's files are not the same set of files is exactly what the packaging and this check
     # have to refuse)
@@ -581,6 +637,63 @@ elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
     skip chat-npu "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
 else
     skip chat-npu "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
+fi
+
+# ── NPU chat, twice: a 512-token turn, then a short prompt like the page's (engine #911) ────────
+# The cycle-17 board demo lost the second turn of a chat - the page itself printed "done: 0 chunks in
+# 5.9 s", Lemonade logged "Backend did not send [DONE] marker", and the kernel logged one amdxdna TDR -
+# while this check's NPU row, one short question on a freshly loaded model, stayed green all evening.
+# A fault that needs a long context first cannot appear in that row.
+#
+# The page is not a multi-turn client: index.html posts `messages: [{role: user, content: text}]`,
+# the latest message only, so the demo's second turn was a SHORT PROMPT alone after a long one, on
+# the same device state. That is arm A here. Arm B sends the stricter shape - the long turn's answer
+# replayed as history - which the page never does, so the row covers both. dmesg's TDR line is
+# counted between the arms, so a TDR during any of the three requests fails the row.
+#
+# The prompt is ~70 words with the answer space left open and the first turn is allowed the page's
+# 512 tokens, so turn 2 starts from the context the demo had. Each request keeps got_slow's 120 s cap:
+# 512 tokens is ~8 s on the 0.6B entry, and the same row runs on the 4B entry at 17 tok/s (30 s).
+tdr_count() {  # the kernel's TDR lines so far; empty when the kernel log cannot be read
+    _d=$(dmesg 2>/dev/null) || return 0
+    [ -n "$_d" ] && printf '%s\n' "$_d" | grep -c 'aie2_legacy_tdr_detect'
+    return 0
+}
+if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
+    TDR0=$(tdr_count)
+    Q_LONG='/no_think Explain in detail how tides work: the moon and the sun, the shape of ocean basins, why some coasts have two high tides a day and others one, and what an amphidromic point is'
+    _post() {  # <json body> -> the reply
+        got_slow --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" \
+            --post-data="$1" "$API/api/v1/chat/completions"
+    }
+    R1=$(_post "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":$(json_text "$Q_LONG" | sed 's/.*/"&"/')}],\"max_tokens\":512,\"temperature\":0}")
+    A1=$(json_str "$R1" content)
+    N1=$(json_str "$R1" completion_tokens)
+    TDR1=$(tdr_count)
+    # Arm A is the page's own shape: index.html posts `messages: [{role: user, content: text}]`
+    # - the latest message only, no history - so the demo's second turn was a SHORT PROMPT after a
+    # long one, on the same device state. Arm B is the stricter shape the web page does not send:
+    # the long turn's own answer replayed as history.
+    RA=$(_post "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0}")
+    TDRA=$(tdr_count)
+    RB=$(_post "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":$(json_text "$Q_LONG" | sed 's/.*/"&"/')},{\"role\":\"assistant\",\"content\":\"$(json_text "$A1")\"},{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0}")
+    TDRB=$(tdr_count)
+    VA=$(followup_verdict "$R1" "$RA" "$TDR1" "$TDRA")
+    VB=$(followup_verdict "$R1" "$RB" "$TDRA" "$TDRB")
+    _tdrs() { if [ -n "$TDR0" ] && [ -n "$TDRB" ]; then
+                  printf 'TDRs %s -> %s -> %s -> %s' "$TDR0" "$TDR1" "$TDRA" "$TDRB"
+              else printf 'dmesg not readable, so the TDR count is unknown'; fi; }
+    if [ -n "$TDR0" ] && [ "$TDR1" -gt "$TDR0" ]; then
+        fail chat-npu-followup "$NPU: a TDR landed during the 512-token turn ($(_tdrs))"
+    elif [ "${VA%% *}" != PASS ] || [ "${VB%% *}" != PASS ]; then
+        fail chat-npu-followup "$NPU: short follow-up -> $VA | with history -> $VB ($(_tdrs))"
+    else
+        pass chat-npu-followup "$NPU answered a 512-token turn (${N1:-?} tokens), then \"$(json_str "$RA" content | cut -c1-24)\" alone (as the page sends it) and again with that turn as history ($(_tdrs))"
+    fi
+elif ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-followup "no /dev/accel/accel*: this machine has no NPU, so no NPU entry can run"
+else
+    skip chat-npu-followup "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────

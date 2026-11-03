@@ -2616,6 +2616,104 @@ bool Q4nxNpuForward::load_hadamard(const std::string& path) {
     return true;
 }
 
+// ── the gemv family's weight image ────────────────────────────────────────────────────────────
+// The container's own q4_1 tiles for this design's projections, concatenated in the design's N
+// order and padded with zero row-tiles up to the kernel's N.  One tile is 5,120 B = 32 rows x 256
+// K-columns, and a tensor's chunks are stored row-tile-major / k-chunk inner (the order the kernel
+// and the vendor's packer both use, which the bit-exact bench on 2026-11-01 confirmed on real
+// weights), so the stream is a byte copy, never a repack.
+int Q4nxNpuForward::role_from_tag(const char* sc) {
+    if (!sc) return -1;
+    const std::string t(sc);
+    if (t == "attn_qkv") return Q4NX_DESIGN_QKV;
+    if (t == "attn_output" || t == "ssm_out") return Q4NX_DESIGN_O;
+    if (t == "ffn_gate_up") return Q4NX_DESIGN_GU;
+    if (t == "ffn_gate") return Q4NX_DESIGN_G;
+    if (t == "ffn_up") return Q4NX_DESIGN_U;
+    if (t == "ffn_down") return Q4NX_DESIGN_D;
+    return -1;
+}
+
+bool Q4nxNpuForward::gemv_tiles(int role, std::vector<uint8_t>& out) {
+    const int ri = idx_of((Q4nxDesign)role);
+    if (ri < 0) { err_ = "gemv: no design for this role"; return false; }
+    const Q4nxDesignGeom* g = &designs_[ri];
+    if (g->K % 256 || g->N % 32) { err_ = "gemv: K/N are not on the tile grid"; return false; }
+    const int kc = g->K / 256;
+    const size_t tile = 5120;
+    out.assign((size_t)kc * (size_t)(g->N / 32) * tile, 0);
+    size_t at = 0;
+    auto append = [&](const char* suffix, int rows) -> bool {
+        char nm[192];
+        std::snprintf(nm, sizeof nm, "model.layers.%d.%s", cur_layer_, suffix);
+        TensorDesc* d = model_tensor_by_name(mw_, nm);
+        if (!d) { err_ = std::string("gemv: missing ") + nm; return false; }
+        const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+        const size_t need = (size_t)kc * (size_t)(rows / 32) * tile;
+        if (!raw || (size_t)d->data_size < need) {
+            err_ = std::string("gemv: ") + nm + " holds fewer tiles than the design needs";
+            return false;
+        }
+        if (at + need > out.size()) { err_ = "gemv: the design's N is smaller than its parts"; return false; }
+        std::memcpy(out.data() + at, raw, need);
+        at += need;
+        return true;
+    };
+    bool ok = true;
+    switch (role) {
+        case Q4NX_DESIGN_QKV:
+            ok = append("self_attn.q_proj.weight", g->q_rows) &&
+                 append("self_attn.k_proj.weight", g->k_rows) &&
+                 append("self_attn.v_proj.weight", g->v_rows);
+            break;
+        case Q4NX_DESIGN_O: ok = append("self_attn.o_proj.weight", g->real_n > 0 ? g->real_n : g->N); break;
+        case Q4NX_DESIGN_GU:
+            ok = append("mlp.gate_proj.weight", g->gate_rows) && append("mlp.up_proj.weight", g->up_rows);
+            break;
+        case Q4NX_DESIGN_G: ok = append("mlp.gate_proj.weight", g->real_n > 0 ? g->real_n : g->N); break;
+        case Q4NX_DESIGN_U: ok = append("mlp.up_proj.weight", g->real_n > 0 ? g->real_n : g->N); break;
+        case Q4NX_DESIGN_D: ok = append("mlp.down_proj.weight", g->real_n > 0 ? g->real_n : g->N); break;
+        default: err_ = "gemv: unsupported role"; return false;
+    }
+    if (!ok) return false;
+    // rows past the real N stay zero tiles (scale 0, zero 0, codes 0 -> dequantises to 0)
+    return true;
+}
+
+// The head on the gemv family: the pack ships the head as q4_1 tiles of its own, so the same byte
+// copy works.  Only a tied bf16 table (a GGUF-converted container) has no tile stream, and that
+// case is refused by name rather than silently quantised here.
+bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<float>& logits) {
+    const int H = c_.H, NV = c_.NV;
+    if (!ctx_head_ || !ctx_head_->gemv) { err_ = "gemv: no gemv head context"; return false; }
+    if (gemv_head_.empty()) {
+        TensorDesc* d = model_tensor_by_name(mw_, "lm_head.weight");
+        if (!d) { err_ = "gemv head: no lm_head.weight tensor"; return false; }
+        const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
+        const size_t want = I8Ctx::gemv_w_bytes(kpad_, ctx_head_->ND);
+        if (!raw || (size_t)d->data_size < want) {
+            err_ = "gemv head: the container has no q4_1 tile stream for the head";
+            return false;
+        }
+        gemv_head_.assign(raw, raw + want);
+        if (!head_bo_) head_bo_ = ctx_head_->make_weight_bo(*dev_);
+        if (!ctx_head_->upload_tiles_into(*head_bo_, gemv_head_.data(), gemv_head_.size())) {
+            err_ = "gemv head: upload failed"; return false;
+        }
+    }
+    auto r = ctx_head_->launch_async_with_bo(*head_bo_, h.data(), 1, H, 1.0f);
+    ctx_head_->wait_kernel(r);
+    ctx_head_->readback();
+    logits.assign((size_t)NV, 0.0f);
+    const int n = std::min(NV, ctx_head_->ND);
+    for (int i = 0; i < n; i++) {
+        float v = ctx_head_->Cg[i];
+        if (sem_.logit_softcap > 0) v = sem_.logit_softcap * std::tanh(v / sem_.logit_softcap);
+        logits[(size_t)i] = v;
+    }
+    return true;
+}
+
 void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                               const float* Bmat, std::vector<float>& out, int wkey,
                               const char* sc, int a_k) {
@@ -2782,12 +2880,25 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
             LhScope _tlh_pk(LH_PACK_UPLOAD);
             PackedWeight pw;
             pw.bo = kctx.make_weight_bo(*dev_);
-            float sout = 1.0f;
-            kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            if (kctx.gemv) {
+                // The gemv family dequantises from the container's own tiles: upload them unchanged.
+                const int role = role_from_tag(sc);
+                if (role < 0) { err_ = std::string("gemv: no role for ") + (sc ? sc : "(null)"); return; }
+                if (!gemv_tiles(role, gemv_blob_)) return;
+                if (!kctx.upload_tiles_into(*pw.bo, gemv_blob_.data(), gemv_blob_.size())) {
+                    err_ = "gemv: tile upload failed"; return;
+                }
+            } else {
+                float sout = 1.0f;
+                kctx.packB_into(*pw.bo, Bmat, K, N, sout, pw.scales);
+            }
             it = m.emplace(wkey, std::move(pw)).first;
         }
         slot = &it->second;
         gs = &slot->scales;
+    } else if (kctx.gemv) {
+        err_ = "gemv: this family needs the weight cache (NPU_NO_WCACHE=1 is not supported with it)";
+        return;
     } else {
         float sout = 1.0f;
         kctx.packB(0, Bmat, K, N, sout);
@@ -2818,10 +2929,14 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
     const auto tr = prof ? std::chrono::steady_clock::now() : std::chrono::steady_clock::time_point{};
 
     out.resize((size_t)N);
-    for (int n = 0; n < N; n++)
-        out[(size_t)n] = (float)kctx.Cm[n] * as * (*gs)[(size_t)n];
+    if (kctx.gemv) {
+        for (int n = 0; n < N; n++) out[(size_t)n] = kctx.Cg[n];
+    } else {
+        for (int n = 0; n < N; n++)
+            out[(size_t)n] = (float)kctx.Cm[n] * as * (*gs)[(size_t)n];
+    }
 
-    if (kctx.canary_short()) {
+    if (!kctx.gemv && kctx.canary_short()) {
         // twice in a row: say so, loudly, and keep going -- an empty row here is a wrong activation either way
         fprintf(stderr, "[canary] SHORT RESULT twice: role K=%d N=%d layer=%d short=%d retries=%ld\n",
                 K, N, cur_layer_, kctx.short_row_, kctx.canary_retries_);
@@ -2843,6 +2958,20 @@ void Q4nxNpuForward::npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
 void Q4nxNpuForward::npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
                                    const float* Bmat, std::vector<float>& out, int wkey,
                                    const char* sc, int a_k) {
+    if (ctx.gemv) {
+        // The gemv family is one row per launch (its `_m16` ELFs are the same one-row design), so a
+        // batch is a loop of single-row launches.  Correct, and slower per row than a batched
+        // kernel -- that gap is issue #671 item 2's m128 work, not something to hide here.
+        out.assign((size_t)M * (size_t)N, 0.0f);
+        const int astride = (a_k > 0 && a_k < K) ? a_k : K;
+        for (int m = 0; m < M; m++) {
+            std::vector<float> one;
+            npu_gemm(ctx, A + (size_t)m * (size_t)astride, K, N, Bmat, one, wkey, sc, a_k);
+            if (!err_.empty()) return;
+            std::copy(one.begin(), one.end(), out.begin() + (size_t)m * (size_t)N);
+        }
+        return;
+    }
     std::vector<float> a_pad;   // as in npu_gemm(): A holds real_k columns, the kernel reads K
     if (a_k > 0 && a_k < K) {
         a_pad.resize((size_t)M * (size_t)K);
@@ -4574,6 +4703,18 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
                                      std::vector<float>& logits_all) {
     const int H = c_.H, NV = c_.NV;
     if (M <= 0) { err_ = "lm head rows: empty batch"; return false; }
+    if (ctx_head_ && ctx_head_->gemv) {
+        // one row per launch on this family; the batch is a loop
+        logits_all.assign((size_t)M * (size_t)NV, 0.0f);
+        std::vector<float> one;
+        for (int m = 0; m < M; m++) {
+            const std::vector<float> row(h_rows.begin() + (size_t)m * H,
+                                        h_rows.begin() + (size_t)(m + 1) * H);
+            if (!run_lm_head_gemv(row, one)) return false;
+            std::copy(one.begin(), one.end(), logits_all.begin() + (size_t)m * (size_t)NV);
+        }
+        return true;
+    }
     if (M == 1 || h_rows.size() != (size_t)M * (size_t)H) {
         std::vector<float> one(h_rows.begin(), h_rows.begin() + H);
         std::vector<float> lg;
@@ -4656,6 +4797,7 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
 
 bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>& logits) {
     const int H = c_.H, NV = c_.NV;
+    if (!host_gemm_ && ctx_head_ && ctx_head_->gemv) return run_lm_head_gemv(h, logits);
     if (host_gemm_) {
         // Offline mode: plain float matvec against the (possibly dequantized)
         // tied table, matching the Python reference.  No I8Ctx is touched.

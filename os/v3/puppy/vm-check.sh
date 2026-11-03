@@ -525,11 +525,22 @@ for idx, row in enumerate(rows):
     # it one exchange out of step, which is what a silently discarded line looks like in a row table (measured on
     # the cycle-15 image before 21serial-console stopped using readline: row 1 waited its whole 180 s, and rows 2..n
     # each reported the PREVIOUS row's output). The resend is the harness being suspicious of its own transport.
+    # The retry needs a sentinel that identifies THIS attempt, and the reason is a bug this retry caused on the
+    # cycle-16 prepared copy (19 PASS / 19 FAIL, every row holding the previous row's answer): when the first line
+    # HAD run but its answer was slow, the resend queued a second identical command, the row matched the first
+    # answer, and the second answer became the next row's body. With a per-attempt token a stale answer can never
+    # match, and whatever a duplicate leaves behind is dropped instead of being fed to the next row.
     out = None
     for attempt in (1, 2):
-        s.sendall((cmd + "; echo __DONE_$(date +%s%N)__\n").encode())
-        out = read_until_re(rb"__DONE_[0-9]{10,}__", limit)
+        # the token must NOT be a literal in the command line: the terminal echoes the line, so a fixed token
+        # matched its own echo and every row came back empty (measured). `$(date +%s%N)` is expanded only when the
+        # command RUNS, and the per-attempt number in front keeps a stale attempt from matching this one.
+        s.sendall((cmd + "; echo __DONE_" + str(attempt) + "_$(date +%s%N)__\n").encode())
+        out = read_until_re(("__DONE_" + str(attempt) + r"_[0-9]{10,}__").encode(), limit)
         if out is not None:
+            if attempt == 2:
+                time.sleep(0.3)
+                buf = b""      # a duplicate's tail must not become the next row's body
             break
         if attempt == 1:
             print("INFO %-13s no answer in %ss, sending it again" % (name, limit), flush=True)
@@ -539,6 +550,14 @@ for idx, row in enumerate(rows):
     body = re.sub(r"__DONE_[0-9]{10,}__", "", out)
     body = re.sub(r"\x1b\][^\x07\x1b]*(\x07|\x1b\\)", "", body)   # OSC: bash 5.3 emits ]3008;…
     body = re.sub(r"\x1b\[[0-9;?]*[A-Za-z]", "", body)
+    # ANY sentinel text that survived into the body is noise from a resend or a late duplicate: it made
+    # `awk '{print $NF}'` pick a sentinel instead of the API key and turned U3 lan into a 401 (measured). Strip every
+    # one of them before anything reads the body.
+    body = re.sub(r"__DONE_[0-9]+_[0-9]{10,}__", "", body)
+    # and keep only what came after the LAST echo of this command: on a resend the earlier attempt's output is
+    # still in the stream, and reporting it as this row's answer is how a table starts lying.
+    if cmd[:24] in body:
+        body = body[body.rindex(cmd[:24]):]
     body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmd[:24] not in l)
     flat = body.replace("\n", " | ")
     if want is None:

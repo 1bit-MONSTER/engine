@@ -37,7 +37,11 @@ LINE_STYLES = [
       "21serial-console", "90onboard-limits", "Dockerfile", "*.Dockerfile",
       # os/v2's packaged files: systemd units of kinds the list did not name yet, and the two '#'-comment
       # files a v2 build reads (the snapshot pin, and the board's power profile at /etc/1bit/power)
-      "*.mount", "*.preset", "*.network", "power", "pin.txt"), "#"),
+      "*.mount", "*.preset", "*.network", "power", "pin.txt",
+      # os/v3 Puppy image, cycle 16: XDG desktop entries are ini-shaped with '#' line comments. The autostart
+      # that opens the appliance's chat screen is one, and CI is right to want a notice on it (it runs a
+      # program as root).
+      "*.desktop"), "#"),
 ]
 BLOCK_STYLES = [(("*.md", "*.html", "*.svg"), ("<!--", "-->")), (("*.css", "*.js"), ("/*", "*/"))]
 

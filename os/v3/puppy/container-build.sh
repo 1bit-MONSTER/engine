@@ -236,7 +236,7 @@ if [ -n "${PAYLOAD:-}" ]; then
       echo "built=$(date -u +%FT%TZ)"; } > "$skeleton/etc/1bit/release-identity"
     # root owns them: /recipe is a host bind mount, so cp -a carries the host uid into the squashfs and
     # sshd StrictModes then refuses the key it was given (measured: authorized_keys owned by ftp)
-    chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
+    chown -R 0:0 "$skeleton/opt/1bit-package" "$skeleton/etc" "$skeleton/etc/1bit" "$skeleton/etc/init.d" \
         "$skeleton/etc/profile.d" "$skeleton/root" "$skeleton/usr/local/bin" 2> /dev/null || true
     chmod 0755 "$skeleton/usr/local/bin/1bit-tty1"
     chmod 0755 "$skeleton"/etc/init.d/03onboard-efivars "$skeleton"/etc/init.d/05onboard-data \
@@ -284,6 +284,21 @@ librocm_sysdeps_z.so.1 librocm_sysdeps_zstd.so.1 librocm_sysdeps_liblzma.so.5 li
     fi
 fi
 
+# SECURITY (pi-prs on cycle 15, blocker): nothing in the image may be owned by the user this container runs as.
+# Measured on the cycle-15 artifact: /etc/modprobe.d (the directory AND 1bit-quiet.conf), /etc/hostname, /etc/keymap,
+# /usr/local/petget/find_cat and the whole zdrv module tree were owned by uid/gid 1000 - and inside the image uid
+# 1000 is `ftp`. A group-writable file in /etc/modprobe.d is a `install <module> /bin/sh` line away from root code,
+# and a module tree owned by 1000 is a loadable .ko planted by anyone in that group. So: the whole skeleton is
+# normalised here (the per-directory chown above only covered directories this recipe writes), group/other write is
+# stripped from /etc and from the root-run petget scripts, and the packed SFS is checked again below - the check is
+# what a future edit cannot silently undo.
+echo "== ownership: the whole skeleton -> root:root, nothing group/other-writable in /etc"
+chown -R 0:0 "$skeleton" 2> /dev/null || true
+chmod -R go-w "$skeleton/etc" "$skeleton/usr/local/petget" 2> /dev/null || true
+gw=$(find "$skeleton/etc" "$skeleton/usr/local/petget" \( -perm -0020 -o -perm -0002 \) 2> /dev/null | head -5)
+[ -z "$gw" ] || { echo "build: REFUSED: still group/other-writable in the tree:" >&2; printf '   %s\n' $gw >&2; exit 1; }
+echo "   ok: skeleton is root-owned and /etc is not group/other-writable"
+
 # The initrd /init must not be able to exit: on the 2 Nov board boot PID 1 exited cleanly through the
 # init script failure path and the kernel panicked at 26.7 s (Attempted to kill init, exitcode 0).
 # 3builddistro packs ../initrd-progs/0initrd (woof-code/3builddistro:649-657), so the guard goes into
@@ -311,6 +326,30 @@ done | sort -u)
 # every file that IS in the image. That cost cycle 4 a refusal of its own good ISO (measured 2026-11-02).
 printf "%s\n" "$listing" > /tmp/1bit-sfs-listing
 in_image() { grep -q "/$1$" /tmp/1bit-sfs-listing ; }
+# SECURITY, checked on the ARTIFACT and not on the tree: any packed entry owned by a uid or gid >= 1000 fails the
+# build, with the entries printed. unsquashfs prints a name when the id resolves in THIS container (root, shadow,
+# mail, man, syslog, ubuntu...) and a number when it does not, so both are resolved through id/getent; anything
+# unresolvable is treated as an unknown user (> 1000), which is the safe direction.
+echo "== uid/gid check on the packed SFS"
+: > /tmp/1bit-bad-owners
+for f in sandbox3/build/*.sfs; do
+    for owner in $(unsquashfs -ll "$f" 2> /dev/null | awk -F'[ \t]+' 'NF > 1 {print $2}' | sort -u); do
+        u=${owner%%/*}; g=${owner##*/}
+        case $u in ''|*[!0-9]*) uid=$(id -u "$u" 2> /dev/null || echo 65534) ;; *) uid=$u ;; esac
+        case $g in ''|*[!0-9]*) gid=$(getent group "$g" 2> /dev/null | cut -d: -f3) ;; *) gid=$g ;; esac
+        case ${gid:-} in ''|*[!0-9]*) gid=65534 ;; esac
+        [ "$uid" -ge 1000 ] || [ "$gid" -ge 1000 ] || continue
+        printf '%s: owner %s (uid %s, gid %s)\n' "$(basename "$f")" "$owner" "$uid" "$gid" >> /tmp/1bit-bad-owners
+        unsquashfs -ll "$f" 2> /dev/null | awk -F'[ \t]+' -v o="$owner" '$2 == o {print "   " $6}' | head -20 >> /tmp/1bit-bad-owners
+    done
+done
+if [ -s /tmp/1bit-bad-owners ]; then
+    echo "build: REFUSED: the image carries entries owned by a non-system uid/gid (uid 1000 is 'ftp' inside the image:" >&2
+    echo "  a group-writable modprobe.d or a module tree owned by it is root code for anyone in that group):" >&2
+    sed 's/^/   /' /tmp/1bit-bad-owners >&2
+    exit 1
+fi
+echo "   ok: every packed entry is owned by a system account (uid and gid < 1000)"
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 miss=""
 # the demo path needs a browser, a recorder and an encoder; an image without them cannot show or record itself

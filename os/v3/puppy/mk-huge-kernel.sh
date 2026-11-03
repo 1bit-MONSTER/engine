@@ -65,7 +65,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for t in mksquashfs depmod file tar zstd find sbverify; do
+for t in mksquashfs unsquashfs depmod file tar zstd find sbverify; do
     command -v "$t" >/dev/null 2>&1 || { printf '%s: %s is missing\n' "$prog" "$t" >&2; exit 3; }
 done
 
@@ -170,11 +170,23 @@ done
 cp "$stage/boot/vmlinuz-$kver" "$out/vmlinuz-$kver"
 echo "== the zdrv"
 rm -f "$out/kernel-modules-zdrv-$kver.sfs"
-# xz like the distribution's own zdrv (DISTRO_SPECS SFS compression), noappend so a re-run replaces it
-mksquashfs "$tree" "$out/kernel-modules-zdrv-$kver.sfs" -comp xz -noappend -no-progress >/dev/null
+# xz like the distribution's own zdrv (DISTRO_SPECS SFS compression), noappend so a re-run replaces it.
+# -all-root is a security fix, not tidiness (pi-prs on cycle 15): this script builds the tree on the build machine
+# as an ordinary user, so without it every one of the ~5300 module files is owned by uid/gid 1000 - and uid 1000 is
+# `ftp` inside the image, so anyone in that group could plant a .ko that root's modprobe then loads. Measured on the
+# cycle-15 artifact: the whole zdrv was bcloud/bcloud. mksquashfs keeps ownership unless told otherwise.
+mksquashfs "$tree" "$out/kernel-modules-zdrv-$kver.sfs" -comp xz -noappend -no-progress -all-root >/dev/null
+# the SFS is root-owned inside itself, but the tar header would still carry this user's uid to the next unpacker
+nonroot=$(unsquashfs -ll "$out/kernel-modules-zdrv-$kver.sfs" 2>/dev/null |
+    awk -F'[ \t]+' 'NR > 1 && $2 != "root/root" {n++} END {print n + 0}')
+[ "${nonroot:-1}" = 0 ] || {
+    echo "$prog: REFUSED: the zdrv carries $nonroot entries that are not root/root (a module owned by uid 1000 is loadable root code)" >&2
+    exit 1; }
+echo "   every zdrv entry is root/root"
 echo "== the kernel package"
 rm -f "$out/huge-$kver.tar.zst"
-tar -C "$out" --zstd -cf "$out/huge-$kver.tar.zst" "vmlinuz-$kver" "kernel-modules-zdrv-$kver.sfs"
+tar -C "$out" --zstd --owner=0 --group=0 -cf "$out/huge-$kver.tar.zst" \
+    "vmlinuz-$kver" "kernel-modules-zdrv-$kver.sfs"
 printf '%s: vmlinuz-%s %s, zdrv %s, huge-%s.tar.zst %s (%s modules, firmware: %s)\n' \
     "$prog" "$kver" "$(du -h "$out/vmlinuz-$kver" | cut -f1)" \
     "$(du -h "$out/kernel-modules-zdrv-$kver.sfs" | cut -f1)" "$kver" \

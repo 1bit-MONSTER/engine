@@ -551,12 +551,22 @@ struct I8Ctx {
     // zeroed and rows [0, am) quantised, the only rows that may hold host data are [0, am). Leaving it at MD was
     // the bug in the first version of this change -- it re-zeroed 127 of 128 rows on every decode launch, i.e.
     // 99.2 % of the memset it was written to remove, which the target-2 gate measured as no change at all.
-    int a_written_rows_ = MD;   // rows [0, a_written_rows_) may hold host data
+    //
+    // -1, not MD: MD is declared without an initialiser (`int MD, KD, ND, NL` above) and is only assigned in
+    // init_elf(), while a non-static member initialiser here runs at construction. Contexts are built with
+    // std::make_unique<I8Ctx>() and given their geometry afterwards (q4nx_forward.cpp:931, onnx/onebit_npu_gemm.cpp:205);
+    // make_unique value-initialises, so the zero-fill sets MD to 0 before this initialiser runs -- measured, not
+    // assumed: `Ctx{int MD; int w = MD;}` printed `MD=0 w=0` through make_unique and through placement-new on 0xAA.
+    // So `= MD` starts at 0, "no rows known", and the first ak == KD launch zeroes nothing, leaving the pad rows
+    // to whatever the BO was allocated with. That is the defect this line closes: -1 means "nothing known yet",
+    // which costs one whole-BO zero on the first launch and cannot depend on the allocation or on member order.
+    int a_written_rows_ = -1;   // rows [0, a_written_rows_) may hold host data; -1 = nothing known yet
 
     inline void prepare_activation(int am, int ak) {
-        if (ak != KD) {
-            // a K shorter than the padded geometry leaves a column tail in rows [0, am) that the quantiser does
-            // not write: fall back to the whole-BO zero, exactly as before, rather than reason about it
+        if (ak != KD || a_written_rows_ < 0) {
+            // (a) a K shorter than the padded geometry leaves a column tail in rows [0, am) that the quantiser does
+            //     not write, and (b) before the first launch nobody knows what the BO holds: both fall back to the
+            //     whole-BO zero, exactly as the code did unconditionally before this change
             memset(Am, 0, (size_t)MD * KD);
             a_written_rows_ = am;
             return;

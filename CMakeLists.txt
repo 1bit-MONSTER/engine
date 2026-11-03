@@ -285,6 +285,11 @@ if(ONEBIT_HRX)
             # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS)
             set_tests_properties(serve_e2e_${_dev} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
+        # Placement must not change the answer (engine #674): the same greedy prompt through the CPU, through the device
+        # with every layer assigned to the CPU, and fully offloaded, compared byte for byte.
+        add_test(NAME hrx_cpu_weight_parity
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cpu_weight_parity.sh ${ONEBIT_HRX_SERVER} ${ONEBIT_SERVE_TEST_GGUF})
+        set_tests_properties(hrx_cpu_weight_parity PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()
 
@@ -632,6 +637,25 @@ add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test)
+# The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
+# statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
+# writes itself, so there is no target for the build list to miss.
+add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh --self-test)
+# The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
+# model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
+add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c)
+target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
+target_link_libraries(npu_design_grid_test PRIVATE m)
+add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
+# A PLAIN bf16 tensor (rows*cols*2 bytes, no tile header) must decode as bf16, not as 5120-byte
+# q4_1 tiles, and a buffer of any other size must be refused (engine#875).  Plain C, no device.
+add_executable(npu_dequant_bf16_test tests/npu_dequant_bf16_test.c npu/forward/src/q4nx_dequant.c)
+target_include_directories(npu_dequant_bf16_test PRIVATE npu/forward/include)
+add_test(NAME npu_dequant_bf16 COMMAND npu_dequant_bf16_test)
+# ci.yml's target list needs the `workflow` scope to extend, so bind this binary to a target the list
+# already builds (same reason as npu_forward_loader_test above); drop this line when the workflow is next
+# touched with that scope and add npu_dequant_bf16_test to the list itself.
+add_dependencies(npu_forward_loader_test npu_dequant_bf16_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

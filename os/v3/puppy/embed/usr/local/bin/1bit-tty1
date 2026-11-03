@@ -1,0 +1,52 @@
+#!/usr/bin/env python3
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-tty1 [N] - print what is on the console N (default 1), as text.
+#
+# The appliance is headless: the boot transcript goes out on ttyS0 (and /etc/init.d/21serial-console opens a
+# root shell there), but the console a person in front of the machine sees is tty1 - and until cycle 13
+# nothing read it, so the first-boot wizard could sit there through a whole boot unnoticed (pi-release,
+# 2026-11-02 18:39).
+#
+# This reads the kernel's own VGA text buffer, /dev/vcsa<N>: 4 header bytes (rows, columns, cursor x, y)
+# then one character byte and one attribute byte per cell. Text and attributes are split, so no OCR and no
+# screenshot is involved - it is the exact characters the console holds.
+import sys
+
+
+def main(argv):
+    tty = argv[1] if len(argv) > 1 else "1"
+    path = "/dev/vcsa%s" % tty
+    try:
+        with open(path, "rb") as f:
+            data = f.read()
+    except OSError as e:
+        sys.exit("1bit-tty1: %s: %s" % (path, e.strerror))
+    if len(data) < 4:
+        sys.exit("1bit-tty1: %s is too short to be a console buffer" % path)
+    rows, cols = data[0], data[1]
+    if not rows or not cols:
+        sys.exit("1bit-tty1: %s reports %d rows x %d columns" % (path, rows, cols))
+    chars = data[4:4 + rows * cols * 2:2]
+    if len(chars) < rows * cols:
+        sys.exit("1bit-tty1: %s holds %d of %d cells" % (path, len(chars), rows * cols))
+    for r in range(rows):
+        row = chars[r * cols:(r + 1) * cols].decode("latin-1").rstrip()
+        sys.stdout.write(row + "\n")
+
+
+if __name__ == "__main__":
+    main(sys.argv)

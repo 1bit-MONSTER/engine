@@ -57,8 +57,16 @@ CONFIG_NLS_CODEPAGE_437=y               # [m]
 CONFIG_NLS_ISO8859_1=y                  # [m]
 
 # --- the machine: efivars, a console, a keyboard --------------------------------------------------
+# The console trio needs its parents in the image for the same reason the medium chain does, and that was
+# measured the hard way on v7.3-rc4 (the first build of this fragment, 2026-11-02): with the three symbols
+# below set and DRM/HID still =m, `olddefconfig` reduced all three back to =m - 3 of 24 silently missing.
+# DRM and HID are the only two a fragment can raise at all: DRM_KMS_HELPER and DRM_GEM_SHMEM_HELPER are
+# select-only (`tristate` with no prompt), so they follow DRM_SIMPLEDRM=y and writing them here would be
+# a line `olddefconfig` rewrites.
 CONFIG_EFIVAR_FS=y                      # [m]  engine#709: efibootmgr in the installer and the installed box
 CONFIG_DEVTMPFS_MOUNT=y                 # [not set]  the initrd hands over to a populated /dev
+CONFIG_DRM=y                            # [m]  parent of DRM_SIMPLEDRM (and of its two select-only helpers)
 CONFIG_DRM_SIMPLEDRM=y                  # [not set]  tty1 on a box whose GPU driver is not up yet, and in a VM
+CONFIG_HID=y                            # [m]  parent of HID_GENERIC and USB_HID
 CONFIG_HID_GENERIC=y                    # [m]  the console keyboard (the os/mini image's first boots had none)
 CONFIG_USB_HID=y                        # [m]

@@ -123,12 +123,31 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
     return 0;
 }
 
+int q4nx_dequant_plain_bf16(const uint8_t* data, int rows, int cols,
+                           float* out) {
+    if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    const size_t n = (size_t)rows * (size_t)cols;
+    for (size_t i = 0; i < n; i++) out[i] = bf16_to_f32(le16(data + 2 * i));
+    return 0;
+}
+
 int q4nx_dequant_tensor(const uint8_t* data, size_t nbytes, int rows, int cols,
                         float* out) {
     if (!data || !out || rows <= 0 || cols <= 0) return -1;
+    /* A PLAIN bf16 tensor is exactly two bytes per element and carries no tile header:
+     * `tools/safetensors_to_q4nx.py pack --dtype bf16` writes one.  The size test below
+     * only asked for `nbytes >= need`, so such a tensor was accepted and its first
+     * nbytes/5120 tiles were read as q4_1 — it loaded, computed, and answered on garbage
+     * (engine#875: a bf16 container is 2/0.625 = 3.2x the tile size, so two thirds of the
+     * buffer were never read and the rest was noise).  Recognise it here, before the
+     * tile geometry test, because plain bf16 needs no 32x256 alignment. */
+    if (nbytes == (size_t)rows * (size_t)cols * sizeof(uint16_t))
+        return q4nx_dequant_plain_bf16(data, rows, cols, out);
     if (rows % Q4NX_TILE_ROWS || cols % Q4NX_TILE_COLS) return -1;
     const size_t need = q4nx_tensor_bytes(rows, cols);
-    if (need == 0 || nbytes < need) return -1;
+    /* Exact, not `>=`: a container family whose chunk size nobody taught this decoder
+     * must be refused rather than read as q4_1 tiles (engine#875). */
+    if (need == 0 || nbytes != need) return -1;
 
     const int ntr = rows / Q4NX_TILE_ROWS;
     const int ntc = cols / Q4NX_TILE_COLS;

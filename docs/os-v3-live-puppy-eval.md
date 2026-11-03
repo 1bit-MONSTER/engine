@@ -115,6 +115,15 @@ still could not read the ISO, with nothing in the build output saying so. The fr
 chain above the drivers (24 symbols, from 20), and the per-symbol `grep -qx "$sym=y"` check in
 `os/v3/puppy/README.md` is what makes that class of mistake loud.
 
+The same trap had a second half, and only a real build found it (2026-11-02): the *console* symbols were
+under-parented. `DRM_SIMPLEDRM`, `HID_GENERIC` and `USB_HID` are children of `DRM` and `HID`, both `=m`
+in our config, so with the fragment as it stood `olddefconfig` reduced exactly those three back to `=m`
+— 3 of 24 missing, reported by the fragment's own verification loop and by nothing else. `DRM` and `HID`
+are the only two a fragment can raise: `DRM_KMS_HELPER` and `DRM_GEM_SHMEM_HELPER` are select-only
+(`tristate` with no prompt) and follow `DRM_SIMPLEDRM=y`, so writing them into the fragment would be lines
+`olddefconfig` rewrites. The fragment is **26 symbols** with those two parents in it, and every one of the
+26 lands `=y` on v7.3-rc4.
+
 Until that fragment is in a built kernel, **the Puppy base cannot boot on our kernel at all** — measured
 twice, and the second time on the real artifacts rather than on a borrowed initrd: the built ISO's own
 `initrd.gz` (2,369,371 B, 127 cpio entries, from `initrd-progs`) on the ISO's own `vmlinuz`
@@ -316,18 +325,186 @@ script that answers them, on a filesystem that can host its mounts — which is 
 boot entries and early microcode. The first ISO here was finished on the host from attempt 7's payload
 (above), and the second was built by the recipe alone.
 
-## The gates this evaluation would accept, and which of them are green
+## Where the appliance stands (2026-11-02 13:4x)
+
+This section is newer than the gate table below it and supersedes it where they differ: everything here was
+measured on the artifact that ships, a **GPT disk image** (not an ISO), booted under UEFI firmware in QEMU and
+driven over a serial root shell.
+
+**The artifact** (`os/v3/puppy/mkimage.sh <puppy-out-dir> <out-dir>`): `1bit-os-puppy.img`,
+**9,128,902,656 B**, sha256 `2d13c1835876eb6068…` — an ESP (shim → grub → `grub.cfg` with a serial terminal)
+plus a `1BIT-DATA` ext4 partition holding the frugal install at `/1bit` and os/mini's data contract. The ISO
+(`upup64r-26.04.iso`, 1,362,100,224 B, sha256 `d6319f1de2c473cc0e…`) is a side artifact for booting without a
+disk. `os/mini/prepare-stick.sh` runs on it **unchanged** and passes its ten assertions (grow `1BIT-DATA`,
+mint `LEMONADE_API_KEY` into `lemonade/lemond.conf` at 0600, write `ssh/authorized_keys` at 0600 root:root).
+
+**Rows measured on that image** (`os/v3/puppy/vm-check.sh`, QEMU + OVMF + serial shell):
+
+| row | evidence |
+|---|---|
+| U1 shell, sudo | `SHELL=/bin/bash`, bash 5.3.9(1), `sudo -n id -un` → root |
+| U1 apt | `apt update` + install over the LAN (`fastfetch` → `/bin/fastfetch`, `cowsay` → `/usr/games/cowsay`). **`neofetch` is not in the 26.04 archive at all** — measured on the box, both `apt-cache policy` and `apt-cache search` are empty — so U1's literal test command cannot pass on resolute for anyone; `fastfetch` is the packaged equivalent |
+| U3 Lemonade | key resolves to `/data/lemonade/lemond.conf`, `http=200` on `/api/v1/models` inside the guest **and** on the forwarded port with that key; `zz-onboard-ports` opens 13305 and 22 after `rc.firewall` |
+| U4 engine | `1bit 0.0.1` from `/usr/local/bin/1bit`, `/opt/1bit-package` with both launchers, `ADDLIST=ec_su_axb35` in the running image |
+| data contract | `/data` mounted (7.8 G, 1.3 G used), `/etc/1bit/lemond.conf` and `/etc/ssh/ssh_host_ed25519_key` both symlinked onto the partition |
+| U7 ssh | a completed login over the network with the key on the stick (`debug1: Exit status 0`) |
+| modules | `/lib/modules/<kver>` visible, `enp0s3` up, `10.0.2.15/24` leased by connman, default route |
+
+**Five defects found by booting it, none visible to a probe that only reads the image:**
+
+| # | defect | what it looked like | fix |
+|---|---|---|---|
+| 1 | the zdrv put modules at `/lib/modules` while 26.04 is usrmerged and the puppy SFS carries `lib -> usr/lib` | **no module could load**: `modprobe virtio_net`/`e1000` "not found in directory", `ls /lib/modules/<kver>` missing, only `lo`, so no NIC, no `amdgpu`, no `amdxdna` | tree at `usr/lib/modules` + firmware at `usr/lib/firmware`, with the zdrv's own `lib -> usr/lib` (`mk-huge-kernel.sh`) |
+| 2 | `3builddistro` starts with `rm -rf sandbox3/rootfs-complete` and rebuilds it from `rootfs-skeleton` | the ADDLIST edit and the embedded engine were **silently discarded**; the image booted and simply had neither | write into `rootfs-skeleton`; verify the packed SFS and `unsquashfs -cat MODULESCONFIG` (`build.sh`) |
+| 3 | Puppy's firewall is `-P INPUT DROP` with `tcp_inbound` RETURNing to that policy | LAN clients could not reach lemond while loopback answered 200; inserting one ACCEPT turned the outside request into a 401 | `zz-onboard-ports`, named to sort **after** `rc.firewall` |
+| 4 | `/etc/hosts.deny` = `ALL: ALL` with `/etc/hosts.allow` = `ALL: LOCAL`, and `LOCAL` means this machine | ssh closed at `kex_exchange_identification` while sshd listened on 0.0.0.0:22; lemond was unaffected because it is not libwrap-linked | the RFC1918 ranges appended to `hosts.allow` (the LAN, not the world) |
+| 5 | installed files carried the builder's uid (`cp -a` from a host bind mount) | `/root/.ssh/authorized_keys` was `ftp ftp`, so sshd's StrictModes accepted the connection and refused the key | `chown 0:0` on the installed trees, and again in `20onboard-ssh` before sshd starts |
+
+The general lesson, and the reason `vm-check.sh` exists: **an artifact probe cannot see any of these.** G3 as it
+was written ("the zdrv carries MOK-signed `amdxdna` with the right vermagic") was green on an image where no
+module could load at all. Reachability, ownership and module resolution are properties of the *running*
+system.
+
+**The board's finding, 2026-11-02 14:5x — the sixth defect, and the first one only hardware could show:** with
+the stick in the Max+ 395 the chain `shim -> Canonical GRUB` loaded and then GRUB refused the kernel:
+`error: bad shim lock signature / you need to load the kernel first`. The Puppy `vmlinuz` came straight out of
+`make bindeb-pkg` and carried **no signature at all** (`sbverify --list` → "No signature table present"),
+while every out-of-tree module was properly MOK-signed — which is what G3 checked, so G3 was green. Secure
+Boot is ON on the board and **every VM row in this document ran with it off**; a `-kernel` QEMU boot verifies
+nothing, so no row in this lane could have seen it. Three fixes, none of which lowers a gate:
+
+| # | fix | where |
+|---|---|---|
+| a | the kernel image is signed with the machine's enrolled MOK before packaging; the key is never printed or copied off the box, and re-signing is a no-op | `sign-vmlinuz.sh`, and `mk-huge-kernel.sh`/`mkimage.sh` refuse an unsigned image |
+| b | G3 gains a **kernel-signature row**: unsigned `/vmlinuz` is a FAIL, and `--cert <mok.pem>` requires it to verify against the enrolled certificate. Measured on the pre-fix image: exactly one FAIL, the kernel; everything else in G3 stayed green | `g3-probe.sh` |
+| c | the VM boots the disk image with **Secure Boot on**: OVMF's secboot firmware with this machine's certificate enrolled in `db`. An unsigned kernel now stops at GRUB in the VM with the board's own message (`FAIL sb chain … you need to load the kernel first`), and the guest confirms the other way with `[0.000000] Secure boot enabled` + `integrity: Loaded X.509 cert '1bit-MONSTER: strixhalo Secure Boot Kernel'` | `sb-vars.sh`, `vm-check.sh` |
+
+**Still not run, on purpose:** G4 on the board (the VM half is now green — see above), G5/G6 on hardware
+(HRX chat on the 8060S, the NPU through Lemonade, `1bit-release-check`), U2's desktop on the console/JetKVM,
+U5's device rows, U6 (installer to a second disk), U8 (boot time, idle RAM, recording), and the save layer
+across a real reboot (G7) — that one is testable in a VM next and is the last software row left.
+
+**The board's finding, 2026-11-02 16:3x — the seventh defect, and the one that took the machine down:** with the
+cycle-10 stick in the Max+ 395 the chain `shim -> Canonical GRUB -> our signed kernel` all worked and then, at
+**26.7 s**, the board said
+
+```
+Kernel panic - not syncing: Attempted to kill init! exitcode=0x00000000
+Comm: sh   PID 1
+```
+
+A **clean** exit code on PID 1 is the whole diagnosis: Puppy's init script EXITED. Its only failure path is
+
+```
+exec /bin/sh >/dev/console 2>&1          init:164, init:174, init:1519
+```
+
+and a shell whose console reads fail (or return EOF) exits 0 — so a boot that could not settle on its medium
+took the machine down, with no log and no console. The JetKVM screen at ~3 s showed three candidates for that
+medium in the same box: the JetKVM's own USB mass storage (3-2:1.6), the Gigastone stick (4-1), and the internal
+NVMe carrying the Ubuntu ESP. Cycle 10's grub entries said `pmedia=usbhd psubdir=1bit` and nothing else, i.e.
+init was left to scan them all.
+
+Two fixes, and neither is a gate lowered:
+
+| # | fix | where |
+|---|---|---|
+| a | **the boot media is pinned** on the kernel command line: `pupsfs=1BIT-DATA` sets Puppy's `PDRV`, and with `PDRV` set the init does not scan any drive at all (`LOOK_PUP` stays empty). `pupsfs`/`pdrv`/`pdev1` are init's own parameters, and the pinned form also gets a 15 s `blkid` retry, which covers USB enumeration. All three grub entries carry it | `mkimage.sh` |
+| b | **init can no longer exit**: `one_rescue` is installed with `trap 'one_rescue $?' EXIT`, and init's three `exec /bin/sh` failure paths are replaced by it — exec runs no EXIT trap, so the trap alone would not have covered the paths that actually fire. On failure it writes `/init-fail.log` (`/proc/cmdline`, `/tmp/bootinit.log`, `dmesg`) onto the `1BIT-DATA` partition and keeps a shell on the console for ever, re-spawning it if it exits | `patch-init.sh`, run by `build.sh` before `3builddistro` and verified again on the packed `initrd.gz`; `mkimage.sh` refuses an image without it |
+
+**Measured in QEMU, on the board's device set** (`os/v3/puppy/panic-repro.sh`: the artifact as a USB stick, a
+second disk with an ESP **and** an ext4 root like the board's NVMe, an extra USB mass-storage device like the
+JetKVM, Secure Boot ON from this machine's enrolled store — and `--no-media`, which pins a label that does not
+exist so the failure happens on purpose):
+
+| image | configuration | transcript |
+|---|---|---|
+| cycle 10 (no pin, no guard) | pin broken | `Finding puppy main sfs file. failed` → `Partition NO-SUCH-LABEL not found.` → `Error is too critical, dropping out to console...` → a shell at `~ #`. That is the board's 26.7 s moment: on the board that shell's reads returned and it exited 0, so PID 1 died. In QEMU the same shell blocks on read, which is why this half alone does not panic here |
+| **cycle 11** (pin + guard) | pin broken | **no panic**: `*** 1bit: init stopped (status 1) - logging, and this console stays`, `*** 1bit: log written to 1BIT-DATA:/init-fail.log`, console alive — and the file is really on the partition: **41,409 B** carrying the command line, `/tmp/bootinit.log` and `dmesg`, read back off the image afterwards |
+| **cycle 11** | normal, board's device set | boots to the appliance: all four SFS layered, `Loading user-selected modules... ec_su_axb35`, `Setting up services` — with `pupsfs=1BIT-DATA` on the command line, i.e. no drive scan at all |
+
+So the two halves of the board's failure are now covered from both sides: the pin removes the *need* to scan
+(which is what made the medium ambiguous), and the guard makes any remaining init failure a logged, live
+console instead of a machine-wide panic. `vm-check.sh` gained two rows that read the **running** boot rather
+than the tree — `boot pin` (`pupsfs=1BIT-DATA` on `/proc/cmdline`) and `init guard` (`/initrd/init`, the file
+that actually ran, carries `one_rescue`, the trap and all three guarded paths) — because an artifact probe
+cannot see either: G3 was green on both the unsigned kernel and this.
+
+## The gates this evaluation would accept, and which of them are green (as first written)
 
 | gate | what | status |
 |---|---|---|
 | G1 | a resolute64 Puppy image builds from our recipe with **our** kernel tarball in `kernel-kit/output` | **green**: `build.sh` alone exits 0 and writes `upup64r-26.04.iso` **1,317,011,456 B**, sha256 `41e23602…6f857e` — our `vmlinuz` (`7.3.0-rc4-1bit-perfopt+`), a 127-entry initrd, four SFS, early AMD microcode, `isolinux` + an EFI `efi.img` with shim/grub/MokManager |
-| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **red, measured on both built ISOs**: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
-| G3 | `uname -r` is our kernel, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | kernel half measured (tarball 3819 modules, both OOT modules signed), boot half blocked by G2 |
-| G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | not run; the chain is today's and the ISO carries a shim/MokManager |
+| G2 | that ISO boots in QEMU under our kernel, headless (`pfix=nox`), to a shell | **green now** — the fragment kernel layers the medium and reaches Puppy's userspace (see the section above); this row records what it was before the fragment |: our initrd on our kernel stops at `Finding puppy main sfs file. failed` with `HAVE_PARTS=''` in `/tmp/bootinit.log` — no partitions seen, because the medium/layer drivers are `=m` ([Blocker 1](#blocker-1-the-kernel-config)). The fix is `kernel-puppy.fragment` + a kernel rebuild |
+| G3 | `uname -r` is our kernel and **that kernel image is signed**, and `amdgpu`, `amdxdna`, `ec_su_axb35` are present and signed (VM: modules present; board: devices) | **green in the artifact** since the signing fix: `/vmlinuz` verifies against the enrolled MOK, zdrv carries `usr/lib/modules/<kver>` with 3780 modules, both OOT modules MOK-signed with the right vermagic, `amdgpu`/`amdnpu` firmware present. The board half (devices binding) is still U5's |
+| G4 | Secure Boot with our shim/MOK chain, kernel verifies, MOK enrolment is one console step | **green in the VM**: the disk image boots with OVMF secboot + this machine's certificate in `db`, GRUB accepts the signed kernel, and the guest reports `Secure boot enabled` with our certificate loaded into the integrity keyring. The board's version of this row is what failed on 2 Nov and is now unblocked, not yet re-run |
 | G5 | `lemond` + `1bit serve` run unchanged from the c18 tarball | **blocked by glibc on 24.04** (measured 2.43 vs 2.39); needs the resolute base |
-| G6 | `1bit-release-check` green as far as a VM allows | not run (needs G2+G5) |
+| G6 | `1bit-release-check` green as far as a VM allows | **green in the VM (cycle 12)**: the tool now ships in the appliance (`/usr/local/bin/1bit-release-check`, `/bin/1bit-release-check`) with `tools/seal_manifest.py`, the release **public** seal key and `etc/1bit/onebit-models.txt`, so `sealed`/`sealed-sig` run instead of skipping: `RESULT: PASS (19 checks, no failures)` with only the GPU/NPU and `sha256sums` rows SKIPping. The board's version of this row is the one that must be 0 FAIL / 0 SKIP (U4) |
 | G7 | a save layer persists across a reboot (frugal install on a qcow2, then reboot) | not run |
 | G8 | image size, boot time, idle RAM, against the c18 initramfs | size measured (ISO 1.32 GB, rootfs 1.5 GB, frugal payload 1.27 GB of SFS); boot time and RAM pending G2 |
+
+## Cycle 12 (2026-11-02 18–19h): the board's five FAILs, closed and measured
+
+The cycle-10 stick booted on the Max+ 395 and `puppy-check.sh` came back 20 PASS / 5 FAIL. Cycle 12 is
+cycle 11 plus one change per FAIL, and one row in the evaluation is now a measurement rather than a plan:
+
+* **U1** — `os/v3/puppy/shell-login.sh` makes root, `spot` and every uid 1000–65533 log in to `/bin/bash`
+  (service accounts keep `nologin`/`false`; the first version gave `daemon` and `nobody` a login shell, which
+  is not what the row means). `build.sh` asserts `usr/bin/bash` in the packed image.
+* **U3** — `/usr/local/bin/lemonade` → `/opt/1bit-package/bin/lemonade`; `u3-service` was a false FAIL in
+  the board's copy of the check (it looked for the `lemond-onebit` launcher, not `lemond`).
+* **U4** — `1bit-release-check` ships, with the layout it needs: it *finds* the Lemonade package
+  (`/opt/lemonade` on os/mini, `/opt/1bit-package` here), prefers a **downloaded** model for the chat rows,
+  never lets an NPU entry answer `chat-hrx`, and looks for the licence files where this package keeps them.
+  The sealed NPU sets are copied onto `/data/npu/kernels` at boot and their manifests verify against the
+  release public key, so `sealed-sig` runs.
+* **U6** — `1bit-install` ships (and `sfdisk`, which the built rootfs did not have: the 26.04 `fdisk`
+  package carries it and the file needed a spec row of its own).
+* **Item 6** — the shipped catalogue carries **23 HRX + 4 NPU** onebit entries; `/v1/models` lists
+  **downloaded** models only (`show_all=false`), which is why the board saw one. The image now ships an HRX
+  GGUF as well as the NPU set, and a `.q4nx` directory is registered under the catalogue's own
+  `…-NPU-1bit` id instead of the HRX id it used to wear.
+* **Item 7** — headless is the default grub entry (`pfix=copy,nox`): no X, and tty1 is a login prompt from
+  Puppy's own `plogin` → `getty -n -l /bin/autologin`. The desktop is entry 1.
+
+On the artifact (`~/wt/puppy-out-c12/1bit-os-puppy.img`, sha256 `5d30b75f…`, 9,128,902,656 B): G2 green,
+G3 green with `--cert --require-mok`, G6 green in the VM, and `vm-check.sh` **23 PASS / 0 FAIL** under
+Secure Boot — including the two rows this cycle added to the appliance itself (`U1 login shell`,
+`U2 headless`), the CLI, the release check and the installer.
+
+### Cycle 13: the headless default reaches tty1 unattended
+
+Cycle 12's default entry was headless, but the console never got to the prompt: `rc.country` asks its three
+questions there on every `pfix=nox` boot (`init` creates `/tmp/bootcnt.txt`, which sets `ASKKMAP` and
+`ASKLANG`; a missing `/etc/keymap` asks for the layout; a missing `en_US.utf8` locale sets `ASKCLOCK=yes`,
+and `timezone-set cli` then asks for the timezone on `/dev/console`). Cycle 13 turns the two flags off in
+`rc.country` (the build refuses a packed image that still asks) and ships `/etc/keymap` = `us` and
+`/etc/localtime` → UTC; the desktop entry keeps `quicksetup` on its first X start. The row that proves it
+reads tty1's own VGA text buffer through the image's new `/usr/local/bin/1bit-tty1`, not ttyS0:
+
+```
+PASS U2 tty1      ResolutePup64 | Linux 7.3.0-rc4-1bit-perfopt+ [x86_64 arch] | root@puppypc23253:~$ | tty1-no-wizard
+PASS U2 headless  pfix=copy,nox | no-X-server
+```
+
+### Cycle 14: the board boot that reached the engine, and the six reds it left
+
+Cycle 13 passed 25 of 29 acceptance rows on the Max+ 395 (NPU chat through Lemonade at 93.2/95.3 tok/s,
+`lemonade bench` decode 88.5 tok/s, `ec_su_axb35` loaded, Secure Boot on, ssh with the owner's key) and left
+six. All six are closed in the image, and each one was a measurement rather than a guess:
+
+| row | the cause, measured | the fix |
+|---|---|---|
+| `hrx-device` (no `HRX0` at all), `chat-hrx` | **nothing opened `libhsa-runtime64.so.1`.** `ONEBIT_HRX_LIBHSA` is a CMake *compile definition* (`CMakeLists.txt:279`), not a variable, so the line in `/etc/1bit/libhsa.env` was inert; the engine resolves `--hrx-libhsa` → the path baked at build time → a recursive scan of `/opt/rocm-therock` (`app/serve.cpp:201`), and the baked path is the release builder's TheRock. Second defect on the same path: the pinned libhsa is `RUNPATH=$ORIGIN` with four `librocm_sysdeps_*` + `librocprofiler-register` NEEDED entries, and the image carried the one file (`ldd`: 4 `not found`) | `LIBHSA_DIR` installs the whole set at `/opt/rocm-therock/lib`, `/opt/1bit/libhsa` symlinks to it, `libhsa.env` exports the trio and `LD_LIBRARY_PATH`, and the build refuses an incomplete or unloadable set |
+| boot cmdline | the appliance booted `amdgpu cwsr_enable=1` with no TTM parameters, while the install the image was validated against boots `amdgpu.cwsr_enable=0 ttm.pages_limit=31457280 ttm.page_pool_size=31457280` — and an APU serves models out of GTT, whose ceiling is that limit | every grub entry carries all three; row `boot gtt` reads them off the running boot |
+| `u2-console` | inittab's tty1 entry is `plogin`, whose tail is `exec getty -n -l /bin/autologin … tty1`; on that boot nothing ended up on tty1, while the same image gave a prompt in QEMU | inittab's tty1 entry is the appliance's own `1bit-console`: that last step on a headless boot, `plogin` on every other |
+| `gguf` | not a registration bug: `05onboard-data` registers a `.gguf` under the catalogue's lower-cased id and `release-check.sh` compared the file's own spelling, case-sensitively | the row compares case-insensitively |
+| `fans` SKIP | `os/mini/board.sh` was never installed in the appliance | `/usr/sbin/1bit-board` + `26onboard-board` |
+| boot time on the console | `pfix=copy` copies every SFS into RAM at the medium's speed before userspace exists, silently | two console lines from the init patch with the guest's own uptime: what it waits for, and how long it took |
+
+Plus the owner's `1bit OS - install to a disk (1bit.installer=1)` entry: the same system, a guarded console
+installer (disks with model and size, the boot disk refused by device *and* by a `1BIT-DATA` partition on
+it, the whole device name typed twice), and `1bit-install` doing the writing.
 
 ## Recommendation
 

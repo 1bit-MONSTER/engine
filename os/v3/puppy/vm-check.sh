@@ -414,11 +414,13 @@ rows = [
     # block, so an edit that drops either is a red row rather than a nicer-looking menu.
     ("U2 menu env", "grep -c 'libhsa.env' /usr/local/bin/1bit-console-menu; "
                      "1bit-console-menu --status | awk 'length($0) > 78 {print \"long-line:\" $0}'; "
-                     "1bit-console-menu --status | grep -q 'firmware prese' && echo truncated || echo lines-whole",
+                     # the c16 board's line was cut mid-word ("firmware prese"): the whole words must be there
+                     "1bit-console-menu --status | grep -q 'firmware present' && echo lines-whole || echo truncated",
                      "lines-whole"),
     # Cycle 17 item 8: the key is not in the page or its URL, and the same-origin proxy still answers WITH it.
     # 401 direct on 13305 is the other half: the key is still enforced where it matters.
-    ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -c 'key='); "
+    # (the page's own text mentions "?key=" in a comment, so the count is of a KEY-SHAPED value, not of the word)
+    ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -Ec 'key=[0-9a-f]{16,}'); "
                      "a=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/models); "
                      "b=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
                      "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "

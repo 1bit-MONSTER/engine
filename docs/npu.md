@@ -365,6 +365,34 @@ a kernel with the **expert ids held fixed** (A row + the router's own top-k + th
 expert, which is what `tools/moe_expert_chunks.py gate` emits), so the gate measures the kernel and
 not the model's own sensitivity. `verify` result: see the TMOE-NPU lane's state file.
 
+**A chunk-list dispatch shares ONE A across its chunks: exact for gate and up, impossible for down.**
+At batch 1 every selected expert of a layer sees the same activation row, so gate and up are one
+dispatch each — but `down_proj`'s input is each expert's own SwiGLU output, so it needs a per-chunk A
+or one dispatch per expert. On this model (48 layers; per layer q, gate, k, v, o in the pb16i split,
+then gate|up|down) that is **385 dispatches per token with the shared A and 721 without**, and that
+gap decides whether the case meets its own bar:
+
+| per-dispatch fixed cost | down shares one A | down per expert | Qwen3-4B dense, same arithmetic |
+|---|---|---|---|
+| 0.086 ms (fit below) | **11.05 tok/s (1.06x)** | 8.37 (0.80x) | 10.45 |
+| 0.116 ms (quoted floor) | 9.80 (1.01x) | 7.09 (0.73x) | 9.68 |
+
+That is at 34 GB/s in-loop over a **1,703,854,080 B/token** stream — routed experts 1,019,215,872
+(8 of 128 x 3 projections, pb16 NW=16) + attention 509,607,936 + `lm_head` 175,030,272, with
+`--pad-n 1024` on gate/up taking it to 1,930,346,496 — and the ratio holds across 34-43.4 GB/s:
+**0.97-1.06x the 4B-dense bar when down shares the dispatch, 0.68-0.80x when it cannot.** So the
+deciding term is the down_proj A shape, not the expert stream: sizing a MoE case on the expert
+bytes alone understates the stream by 40 % (they are 60 % of it) and misses the term that decides
+it.
+
+The fixed cost above is measured, not assumed. Two runs of the same 50,135,040-B weight chunk in
+the arena's chunk-list design — 1.051 ms for one chunk, 2.016 ms for two — fit a marginal rate of
+51.95 GB/s and **0.086 ms paid once per dispatch**, i.e. a second weight BO on the same dispatch
+costs nothing measurable (within the fit residual; the 2-chunk run is 4.1 % faster per chunk).
+Pricing N chunk BOs as N launches overcharges the dispatch column by that factor: it would add 672
+dispatches per token here (48 layers x gate and up x 8 chunks, against 96 real ones), +66.5 ms at
+0.099 ms each.
+
 `1bit serve -m <model.gguf> --device npu` repacks a GGUF itself, caches the result under
 `~/.cache/1bit/q4nx/`, and serves it. The repack runs the engine's own `scripts/repack_gguf.py`,
 which the package ships beside `1bit` (`scripts/`, with its declared-scale guard;

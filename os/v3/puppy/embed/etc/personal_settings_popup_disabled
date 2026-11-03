@@ -1,0 +1,22 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/personal_settings_popup_disabled - Puppy skips its first-run Quick Setup when this file exists.
+#
+# Cycle 17 item 9. /usr/sbin/delayedrun runs quicksetup once per fresh data partition and its questions are
+# desktop questions the appliance answers for itself: /etc/keymap is us, /etc/localtime is the owner's zone, and
+# /etc/hostname is 1bit-os. On the cycle-16 board recording the wizard did not appear and the clock still read
+# UTC, so the wizard's absence and the missing timezone were both accidental. Nothing about the wizard is wanted
+# on a demo box, so the switch Puppy itself provides is thrown here.

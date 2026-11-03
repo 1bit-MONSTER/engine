@@ -14,15 +14,20 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 #
-# npu-window11.sh -- the identical-text + prof-table gate (engine #799 P1).
+# npu-window11.sh -- the identical-text + prof-table gate (engine #799 P1), and the folded-container row
+#                     that adds the numeric taps (engine#876).
 #
 #   scripts/npu-window11.sh <model.q4nx> <kernels dir> --label NAME --out FILE [--port N] [--max-tokens N]
+#                           [--folded [--tap-layer N]]
 #   scripts/npu-window11.sh --compare A.log B.log (--tol PCT | --control C1.log C2.log)
 #   scripts/npu-window11.sh --self-test
 #
 # Three fixed greedy prompts, run against one served model, recorded as
 #   text <i> sha256=<hash> chars=<n> text=<prefix>
 #   prof <phase> <role> M=<m> ms=<ms/launch>
+# and, with --folded,
+#   folded layer=<n> taps=<count>
+#   tap <the container's own [pb16i-trace]/[qkv-dump] line, whitespace-normalised>
 # so two runs can be compared without trusting a human to eyeball two terminals.  The gate a change has to
 # pass is: 3/3 transcripts byte-identical, the prof table's rows (phase, role, M) identical, and no row's
 # ms/launch outside the tolerance.
@@ -42,6 +47,18 @@
 # several rounds per row carries the same `prof`/`text` lines once per round, in round order: append the rounds
 # of one arm into one file, and alternate the order inside a round (A B, then B A) so the second serve does not
 # pay for the warm-up in every round.
+#
+# **--folded is the row for a folded (pb16i/t2s) container.**  Such a container needs a folded basis (its
+# activations are rotated before every projection), a ternary LM head and a split full-attention QKV, none of
+# which the `rm` Qwen3-0.6B the row above was written for has -- so defects living in exactly those parts were
+# invisible to it (engine#876: three of them, engine#808).  With --folded the serve runs with the container's own
+# debug taps on (NPU_PB16I_TRACE / NPU_QKV_DUMP, both already in the forward, so no arm is instrumented
+# differently) and the taps of layer N are recorded per launch: the rotated activations, the int8 codes the
+# kernel was given, the int32 accumulator, the dequantised output and the side-table `eref`.  Two runs then have
+# to agree on those lines too -- the tap equality is the assertion that bites: a wrong rotation still produces
+# well-formed text, and it cannot produce the same intermediate numbers.  With no numbers to be had from the
+# text, ms/launch on a folded row is only scored against a measured `--control` pair (engine#834); a hand-typed
+# `--tol` is reported there and not asserted.
 #
 # It starts the serve itself, on the device (no NPU_INFER_HOST_GEMM here): the point is the real kernel
 # path.  Call it under npu-hold; it does not take a ticket of its own.
@@ -86,7 +103,7 @@ if tol is None and control is None:
 
 
 def load(path):
-    texts, prof, order = {}, {}, []
+    texts, prof, order, taps, head = {}, {}, [], [], {}
     for line in open(path, encoding="utf-8", errors="replace"):
         m = re.match(r"text (\d+) sha256=(\S+) chars=(\d+) text=(.*)$", line)
         if m:
@@ -99,7 +116,14 @@ def load(path):
                 prof[key] = []
                 order.append(key)
             prof[key].append(float(m.group(4)))
-    return texts, prof, order
+            continue
+        m = re.match(r"folded layer=(\d+) taps=(\d+)$", line)
+        if m:
+            head = {"layer": int(m.group(1)), "taps": int(m.group(2))}
+            continue
+        if line.startswith("tap "):
+            taps.append(line[4:].rstrip("\n"))
+    return texts, prof, order, taps, head
 
 
 def stat_row(pa, pb, paired_ok):
@@ -117,8 +141,8 @@ def stat_row(pa, pb, paired_ok):
 
 def spread(c1, c2):
     """One binary run twice: its own spread is the only tolerance this box can justify."""
-    _, p1, o1 = load(c1)
-    _, p2, _ = load(c2)
+    _, p1, o1, _, _ = load(c1)
+    _, p2, _, _, _ = load(c2)
     rows = [k for k in o1 if k in p2]
     if not rows:
         die("compare: the control logs share no prof rows")
@@ -161,13 +185,15 @@ if control is not None:
 else:
     tol_from = "--tol"
 
-ta, pa, oa = load(a)
-tb, pb, ob = load(b)
-fail = 0
+ta, pa, oa, ka, ha = load(a)
+tb, pb, ob, kb, hb = load(b)
 
 rounds = {k: min(len(pa[k]), len(pb[k])) for k in set(pa) & set(pb)}
 paired_ok = bool(rounds) and min(rounds.values()) >= 2
 stat_name = "median-of-ratios" if paired_ok else "ratio-of-medians"
+# A folded row's assertion is its taps; with no control pair its ms/launch is reported, not asserted (engine#834).
+tol_scored = not (ka or kb) or control is not None
+fail = 0
 
 if len(ta) != 3 or len(tb) != 3:
     print(f"FAIL only {len(ta)}/{len(tb)} transcript prompts recorded (3 expected)"); fail = 1
@@ -177,6 +203,30 @@ for i in sorted(ta):
     if i in tb and ta[i] != tb[i]:
         print(f"  MISMATCH prompt {i}: {ta[i][:1]} vs {tb[i][:1]}")
 if same != 3: fail = 1
+
+# The folded row: a run that carries taps may only be compared with a run that carries the same ones.
+# This is deliberately not "compare the taps if they happen to be there": a folded log against a non-folded
+# one is a comparison of two different questions, which is the failure this row exists to prevent.
+if ha or hb:
+    if not (ha and hb):
+        print(f"FAIL one side is a folded run and the other is not "
+              f"(layers {ha.get('layer')} / {hb.get('layer')})"); fail = 1
+    elif ha["layer"] != hb["layer"]:
+        print(f"FAIL tap layers differ: {ha['layer']} vs {hb['layer']}"); fail = 1
+    elif not ka or len(ka) != len(kb):
+        print(f"FAIL tap lines: A {len(ka)}, B {len(kb)} (must be equal and non-empty)"); fail = 1
+    elif ka != kb:
+        for i, (x, y) in enumerate(zip(ka, kb)):
+            if x != y:
+                print(f"FAIL tap {i} differs:")
+                print(f"   A {x[:200]}")
+                print(f"   B {y[:200]}")
+                break
+        fail = 1
+    else:
+        print(f"taps: {len(ka)} lines identical (layer {ha['layer']}, "
+              f"{sum(1 for t in ka if t.startswith('[pb16i-trace]'))} launches + "
+              f"{sum(1 for t in ka if t.startswith('[qkv-dump]'))} qkv dumps)")
 
 rows_a, rows_b = set(pa), set(pb)
 if rows_a != rows_b:
@@ -196,11 +246,13 @@ for k in sorted(rows_a & rows_b):
     med, paired = stat_row(pa[k], pb[k], paired_ok)
     used = abs(paired) if (paired_ok and paired is not None) else abs(med)
     flag = "" if used <= tol else "  <-- outside tolerance"
+    if not tol_scored and used > tol:
+        flag = "  (reported, not scored on the folded row: engine#834)"
     shown = f"ratio-of-medians {med:+6.1f}%"
     if paired_ok and paired is not None:
         shown += f"  median-of-ratios {paired:+6.1f}%"
     print(f"  {k[0]:3} {k[1]:5} M={k[2]:3} {va:8.3f} -> {vb:8.3f} ms  {shown}{flag}")
-    if used > tol: fail = 1
+    if used > tol and tol_scored: fail = 1
 print("window11: PASS" if not fail else "window11: FAIL")
 sys.exit(1 if fail else 0)
 PY
@@ -295,25 +347,41 @@ sys.exit(1 if failures else 0)
 PY
 fi
 
-MODEL="${1:-}"; KERNELS="${2:-}"; LABEL="run"; OUT=""; PORT=8110; MAXTOK=8
+MODEL="${1:-}"; KERNELS="${2:-}"; LABEL="run"; OUT=""; PORT=8110; MAXTOK=8; TOKSET=0; FOLDED=0; TAPLAYER=0
 shift 2 2>/dev/null || true
 while [ $# -gt 0 ]; do
     case "$1" in
         --label) LABEL="${2:-}"; shift 2;;
         --out)   OUT="${2:-}";   shift 2;;
         --port)  PORT="${2:-}";  shift 2;;
-        --max-tokens) MAXTOK="${2:-}"; shift 2;;
+        --max-tokens) MAXTOK="${2:-}"; TOKSET=1; shift 2;;
+        --folded) FOLDED=1; shift;;
+        --tap-layer) TAPLAYER="${2:-0}"; shift 2;;
         *) echo "unknown option $1" >&2; exit 2;;
     esac
 done
 [ -n "$MODEL" ] && [ -n "$KERNELS" ] || { echo "usage: $0 <model.q4nx> <kernels> --label NAME --out FILE" >&2; exit 2; }
+# A folded container is a 27B thinking model: at the 0.6B row's 8 tokens every reply is the same preamble stub, so the
+# text signal would compare nothing (measured 2026-11-03: prompts 1 and 2 came back with the same sha).  32 tokens
+# gets past the preamble for ~40 s of decode per arm; the caller can still ask for less.
+if [ "$FOLDED" = 1 ] && [ "$TOKSET" = 0 ]; then MAXTOK=32; fi
 [ -n "$OUT" ] || OUT="/tmp/window11-$LABEL.log"
 BIN="${ONEBIT_BIN:-$(dirname "$0")/../1bit}"
 [ -x "$BIN" ] || { echo "no 1bit at $BIN (set ONEBIT_BIN)" >&2; exit 2; }
 
 : > "$OUT"
-NPU_PROFILE=1 NPU_NO_DEVICE_LOCK=1 "$BIN" forward-serve -m "$MODEL" --kernels "$KERNELS" -p "$PORT" \
-    > "$OUT.serve" 2>&1 &
+# --folded: the container's own debug taps, so the row compares numbers and not just plausible text.  Both
+# taps already exist in the forward; setting them here means neither arm of a comparison is instrumented
+# differently (engine#876).
+TAPENV=()
+if [ "$FOLDED" = 1 ]; then
+    TAPENV=(NPU_PB16I_TRACE="$TAPLAYER" NPU_QKV_DUMP="$TAPLAYER")
+    echo "folded layer=$TAPLAYER taps=0" > "$OUT"     # rewritten below with the real count
+fi
+# `env` and not a bare array expansion: in command position bash reads `NPU_PB16I_TRACE=0` as the command name
+# (measured: every arm "served" for 0 s and the log said `NPU_PB16I_TRACE=0: command not found`).
+NPU_PROFILE=1 NPU_NO_DEVICE_LOCK=1 env "${TAPENV[@]}" "$BIN" forward-serve -m "$MODEL" --kernels "$KERNELS" \
+    -p "$PORT" > "$OUT.serve" 2>&1 &
 SPID=$!
 trap 'kill $SPID 2>/dev/null; wait $SPID 2>/dev/null' EXIT INT TERM
 
@@ -383,4 +451,30 @@ print(f"{len(acc)} prof rows")
 PY
 
 echo "wrote $OUT"
+
+# The folded row's taps: every [pb16i-trace] / [qkv-dump] line the serve emitted, in order, whitespace
+# normalised (the forward pads its fields for a human; two runs that compute the same numbers differ only in
+# that padding).  Written after the prof rows so the header line can carry the real count.
+if [ "$FOLDED" = 1 ]; then
+    python3 - "$OUT.serve" "$OUT" "$TAPLAYER" <<'PY'
+import re, sys
+serve, out, layer = sys.argv[1], sys.argv[2], int(sys.argv[3])
+taps, launches, dumps = [], 0, 0
+for line in open(serve, encoding="utf-8", errors="replace"):
+    if line.startswith("[pb16i-trace]") or line.startswith("[qkv-dump]"):
+        taps.append(re.sub(r"\s+", " ", line).strip())
+        launches += line.startswith("[pb16i-trace]")
+        dumps += line.startswith("[qkv-dump]")
+lines = open(out, encoding="utf-8").read().splitlines()
+lines[0] = f"folded layer={layer} taps={len(taps)}"
+with open(out, "w", encoding="utf-8") as f:
+    f.write("\n".join(lines) + "\n")
+    for t in taps:
+        f.write(f"tap {t}\n")
+print(f"{len(taps)} tap lines ({launches} launches, {dumps} qkv dumps) at layer {layer}")
+if not taps:
+    print("wrote NO taps: --folded on a container with no fold would compare nothing", file=sys.stderr)
+PY
+fi
+
 grep -c '^text ' "$OUT" | sed 's/^/transcripts: /'

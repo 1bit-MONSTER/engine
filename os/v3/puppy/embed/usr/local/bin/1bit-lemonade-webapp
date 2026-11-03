@@ -21,29 +21,55 @@
 #     AbortSignal.timeout, which Pale Moon does not have - so the chat screen served by 24onboard-webapp is what
 #     opens (see /opt/1bit/webapp/index.html for the capability probe behind that), and the real UI is one link
 #     away in the page header;
-#   * the API key has to be in the URL or the first thing the owner does on camera is type a 48-character secret:
-#     it is read from /etc/1bit/lemond.conf (the file 10lemonade mints at first boot) and passed once; the page
-#     keeps it in localStorage from then on.
+#   * the API key must NOT be in the URL (cycle 17 item 8: the cycle-16 demo recording showed
+#     http://localhost:8080/?key=… in the address bar, i.e. in the recording). The key is injected by
+#     1bit-webapp-proxy on 127.0.0.1:8080, so this launcher opens a bare URL and the page needs no secret at all.
 #
 # Runs once per X session (the autostart can fire again when the WM restarts).
 [ -e /tmp/1bit-webapp-opened ] && exit 0
-CONF=$(readlink -f /etc/1bit/lemond.conf 2> /dev/null || echo /etc/1bit/lemond.conf)
-KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' "$CONF" 2> /dev/null | head -1)
-# wait for the server to answer at all (it is what serves the model list the page asks for): up to 60 s, and do not
-# hold the X session up while waiting
+# Cycle 17 item 9: Pale Moon's first-run prefs (item: no "make this the default browser?" prompt). The file has to
+# be in the application directory before the browser creates its profile, and it cannot be shipped there - woof-CE
+# installs Pale Moon with `mv`, which refuses a non-empty /opt/palemoon (measured: that broke a build). /opt is a
+# copy-on-write layer over the squashfs, so writing it here is the same thing a shipped file would be.
+for d in /opt/palemoon /usr/lib/palemoon /usr/lib64/palemoon; do
+    [ -d "$d/defaults" ] || continue
+    if [ -r /etc/1bit/palemoon-prefs.js ]; then
+        mkdir -p "$d/defaults/pref" 2> /dev/null &&
+            cp -f /etc/1bit/palemoon-prefs.js "$d/defaults/pref/1bit-os.js" 2> /dev/null
+    fi
+    break
+done
+# wait for the page to answer (24onboard-webapp serves it; the proxy inside it also reaches Lemonade): up to 60 s,
+# and do not hold the X session up while waiting
 i=0
 while [ $i -lt 60 ]; do
-    curl -s -o /dev/null -m 2 "http://127.0.0.1:13305/" && break
+    curl -s -o /dev/null -m 2 "http://127.0.0.1:${ONEBIT_WEBAPP_PORT:-8080}/" && break
     sleep 1; i=$((i + 1))
 done
 URL="http://localhost:${ONEBIT_WEBAPP_PORT:-8080}/"
-[ -n "${KEY:-}" ] && URL="$URL?key=$KEY"
 BROWSER=
 for b in /opt/palemoon/palemoon /usr/bin/palemoon /usr/bin/epiphany-browser /usr/bin/firefox; do
     [ -x "$b" ] && { BROWSER=$b; break; }
 done
 : > /tmp/1bit-webapp-opened 2> /dev/null
 if [ -n "$BROWSER" ]; then
+    # Cycle 17 item 9: start maximised. Pale Moon has no "open maximised" switch and the control is the window
+    # manager's, so the window is sized after it maps - xdotool ships in this image (measured: /usr/bin/xdotool in
+    # the c16 rootfs). The poll is bounded and silent: a desktop without xdotool still opens the page.
+    if command -v xdotool > /dev/null 2>&1; then
+        (
+            i=0
+            while [ $i -lt 120 ]; do
+                w=$(xdotool search --onlyvisible --name 'Pale Moon' 2> /dev/null | head -1)
+                if [ -n "$w" ]; then
+                    xdotool windowsize "$w" 100% 100% 2> /dev/null
+                    xdotool windowmove "$w" 0 0 2> /dev/null
+                    break
+                fi
+                sleep 0.5; i=$((i + 1))
+            done
+        ) > /dev/null 2>&1 &
+    fi
     # --no-remote: a second copy of the profile would refuse to start, and this is the first window of the session
     case $BROWSER in
     *palemoon*) exec "$BROWSER" --no-remote "$URL" ;;

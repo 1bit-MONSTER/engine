@@ -144,6 +144,19 @@ void test_valid() {
     const Plan tp = Plan::load(write_plan("t2s", t2));
     check(tp.pb16i && tp.tag == "_t2s" && tp.layout == "t2s" && tp.sealed_elf.empty(),
           "the t2s family is read as ternary with its own tag and no sealed ELF");
+
+    // t2s wire format v2: the same weights in a different byte order, so it is a different artifact family
+    // (_t2s2) and a plan that names one cannot silently drive kernels built for the other
+    auto t22 = t2;
+    t22["kernels"]["tag"] = "_t2s2";
+    const Plan t2p = Plan::load(write_plan("t2s2", t22));
+    check(t2p.pb16i && t2p.tag == "_t2s2" && t2p.layout == "t2s",
+          "the t2s v2 family is read with its own tag");
+    auto bad2 = t2;
+    bad2["kernels"]["tag"] = "_t2s2";                      // but container.layout stays "pb16i"
+    bad2["container"] = {{"layout", "pb16i"}, {"chunk_kind", "pb16i"}, {"pb16i", true}};
+    check(has(refusal(write_plan("t2sv2wronglayout", bad2)), "kernels.tag is _t2s2 but container.layout is pb16i"),
+          "a _t2s2 tag on a pb16i container is refused by name");
 }
 
 void test_refusals() {

@@ -756,7 +756,7 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
                                   "pack: 4 attention projections per layer were imported (" +
                                       std::to_string(r.attn_projections) + ")");
     if (qwen05b)  // the geometry the tile layout is measured on
-        check(r.attn_tiles_total == layers * 32 && r.attn_bias_tensors == layers * 3,
+        check(r.attn_tiles_total == int64_t(layers) * 32 && r.attn_bias_tensors == layers * 3,
               "pack: 0.5B imports 32 tiles and 3 biases per layer (" +
                   std::to_string(r.attn_tiles_total) + " tiles, " +
                   std::to_string(r.attn_bias_tensors) + " biases)");
@@ -771,7 +771,7 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
               "pack: gate/up/down were imported for every layer (" +
                   std::to_string(r.mlp_projections) + ")");
         if (qwen05b)
-            check(r.mlp_groups_total == layers * (p.dims.intermediate / 64 + p.dims.hidden / 64),
+            check(r.mlp_groups_total == int64_t(layers) * (p.dims.intermediate / 64 + p.dims.hidden / 64),
                   "pack: 0.5B imports 76 gate|up units and 14 down groups per layer (" +
                       std::to_string(r.mlp_groups_total) + " groups)");
     }

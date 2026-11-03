@@ -4582,9 +4582,10 @@ bool Q4nxNpuForward::run_lm_head_rows(const std::vector<float>& h_rows, int M,
     // the dequantiser both carry per-row scales), one launch per tile, then the host finishing each row.
     int i_qkv = -1;
     for (int d = 0; d < ndesigns_; d++)
-        if (designs_[d].K == H && designs_[d].N > 0 && (i_qkv < 0 || designs_[d].N > designs_[i_qkv].N))
+        if (designs_[d].K == kpad_ && designs_[d].N > 0 && (i_qkv < 0 || designs_[d].N > designs_[i_qkv].N))
             i_qkv = d;
-    if (i_qkv < 0) { err_ = "LM head rows: no GEMM design with K=H available"; return false; }
+    if (i_qkv < 0) { err_ = "LM head rows: no GEMM design on the kernel K grid (kpad=" + std::to_string(kpad_) + ")";
+        return false; }
     const int T = designs_[i_qkv].N;
     const int ntiles = (NV + T - 1) / T;
     if ((int)lm_head_packed_.size() != ntiles) { err_ = "LM head rows: packed tiles not resident"; return false; }
@@ -4651,16 +4652,18 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // read out of designs_[-1] -- garbage, and the ntiles division below raised
     // SIGFPE.  Only this NPU path uses T (the host path is a plain matvec), which is
     // why GLM crashed here the first time the ELF path was exercised.
-    // Pick the WIDEST design with K=H for the head.  Each tile is a separate
-    // synchronous launch (~one NPU round-trip each, ~constant regardless of N),
-    // so fewer/larger tiles mean fewer launches for the same math.
+    /* Pick the WIDEST design whose K is the kernel grid this container's hidden width lands on, kpad_
+     * (engine#845): fewer/larger tiles mean fewer synchronous launches for the same math.  It used to
+     * compare against H, which is the same rule only while a model's hidden is already on the grid -- after
+     * the K pad it matched nothing, so the first OGA pack (hidden 896) failed right here with
+     * "no GEMM design with K=H available" although all five designs had loaded. */
     int i_qkv = -1;
     for (int d = 0; d < ndesigns_; d++) {
-        if (designs_[d].K != H || designs_[d].N <= 0) continue;
+        if (designs_[d].K != kpad_ || designs_[d].N <= 0) continue;
         if (i_qkv < 0 || designs_[d].N > designs_[i_qkv].N) i_qkv = d;
     }
     if (i_qkv < 0) {
-        err_ = "LM head: no GEMM design with K=H available";
+        err_ = "LM head: no GEMM design on the kernel K grid (kpad=" + std::to_string(kpad_) + ")";
         return false;
     }
     const int T = designs_[i_qkv].N;

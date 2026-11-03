@@ -43,7 +43,7 @@ prog=$(basename "$0")
 [ $# -ge 2 ] || { sed -n "/^# $prog/,/^# exit 0/p" "$0" | sed 's/^# \{0,1\}//' >&2; exit 2; }
 iso=$(cd "$(dirname "$1")" 2>/dev/null && pwd)/$(basename "$1")
 work=$2
-secs=${3:-300}
+secs=${3:-600}
 [ -f "$iso" ] || { echo "$prog: no such image: $iso" >&2; exit 2; }
 for t in qemu-system-x86_64 xorriso python3 systemd-run curl; do
     command -v "$t" > /dev/null || { echo "$prog: $t is missing" >&2; exit 2; }
@@ -122,6 +122,12 @@ esac
 # $iso would find nothing and leave the VM holding its image and its forwarded ports until its own timeout.
 qemuimg=${bootimg:-$iso}
 vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$qemuimg" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
+# A host-side row (U3 lan, U7 ssh) measures a FORWARD, and a forward exists only while qemu does. The cycle-18 run
+# had both of them fail "connection refused" while every in-guest row passed: the rows run after the row driver, the
+# qemu budget (${secs}s) had expired, and the table read that as an image defect. Ask whether the VM is still there
+# and say so, so a budget overrun can never be mistaken for a broken image again.
+vm_alive() { pgrep -f "qemu-system-x86_64 -m.*$qemuimg" > /dev/null 2>&1; }
+vm_gone() { echo "the VM was no longer running when this row ran (qemu budget ${secs}s) - not an image finding"; }
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
@@ -457,11 +463,22 @@ rows = [
     # the API base, the key's location, ssh and the mobile app - not just the menu. Read off tty1's own VGA
     # buffer, the same surface the U2 tty1 row uses, so this is the screen and not the script.
     ("U2 menu connect", "s=$(1bit-tty1 1); printf '%s\\n' \"$s\" | head -10; "
-                     "for w in CONNECT 'web UI http://' 'api  http://' 'ssh  root@' 'Lemonade Mobile'; do "
+                     "for w in CONNECT 'web UI http://' 'api http://' 'ssh root@' 'Lemonade Mobile'; do "
                      "printf '%s' \"$s\" | grep -qF \"$w\" || echo missing-\"$w\"; done; "
                      "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "
                      "echo menu-connect-block",
                      "menu-connect-block"),
+    # The mechanism behind U3-lan and U7 (cycle 15's finding, and the row the c16 refactor folded away): inbound
+    # connections from the LAN pass only if the appliance opened the ports AFTER Puppy's rc.firewall (which ends
+    # in `-P INPUT DROP`) and let the RFC1918 ranges through tcpwrappers. Printing all three - the rules, the
+    # listener, hosts.allow - is what tells "the image never opened them" apart from "something else answered".
+    ("U3 inbound", "iptables -S INPUT 2> /dev/null | head -8; "
+                     "r=$(iptables -S INPUT 2> /dev/null | grep -c dport); "
+                     "l=$(netstat -lnt 2> /dev/null | grep -cE ':22 |:13305 '); "
+                     "a=$(grep -c 1bit-lan /etc/hosts.allow 2> /dev/null); "
+                     "echo \"dport-rules=$r listeners=$l hosts-allow-lan=${a:-0}\"; "
+                     "[ \"$r\" -ge 2 ] && [ \"$l\" -ge 2 ] && [ \"${a:-0}\" -ge 1 ] && echo inbound-open",
+                     "inbound-open"),
     # Cycle 17 item 3: the appliance's name is /etc/hostname, not the DHCP server's opinion - connman's
     # AllowHostnameUpdates defaults to true, which is the one path a name nobody typed can take.
     ("U1 hostname pin", "grep -n '^AllowHostnameUpdates' /etc/connman/main.conf; "
@@ -662,6 +679,8 @@ if [ -n "${key:-}" ]; then
         "http://127.0.0.1:$hostport/api/v1/models" 2>/dev/null)
     if [ "$code" = "200" ]; then
         echo "PASS U3 lan        http=200 on the forwarded :13305 (host :$hostport) with the image's key"
+    elif ! vm_alive; then
+        echo "FAIL U3 lan        http=${code:-none} - $(vm_gone)"
     else
         echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305 (host :$hostport)"
     fi
@@ -682,7 +701,8 @@ if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
     case $said in
     *ONBOARD-SSH-OK*ssh-bash*) echo "PASS U7 ssh        $(printf '%s' "$said" | tail -c 200)" ;;
     *ONBOARD-SSH-OK*) echo "FAIL U7 ssh        the login works but the shell is not bash: $(printf '%s' "$said" | tail -c 200)" ;;
-    *) echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 240)" ;;
+    *) if vm_alive; then echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 240)"
+       else echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 160) - $(vm_gone)"; fi ;;
     esac
 else
     echo "SKIP U7 ssh        set SSHKEY=<private key> whose public half is in the image"

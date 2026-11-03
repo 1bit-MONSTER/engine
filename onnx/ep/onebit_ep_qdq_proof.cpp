@@ -45,6 +45,8 @@
 
 #include <onnxruntime_c_api.h>
 
+#include "onebit_ep_kernel.h"  // kDeviceMinRows: the routing the proof asserts against, in one place
+
 #include <unistd.h>
 
 #include <malloc.h>
@@ -604,6 +606,7 @@ struct Result {
     size_t differing = 0;
     bool fused = false;      // the fused kernel ran (trace: a qdq line)
     bool float_mm = false;   // the float MatMul kernel ran (trace: a matmul line)
+    bool host_rows = false;  // gemm_q8 chose the host loop on rows (trace: npu_qdq_host_rows)
     long peak_cpu = -1;
     long peak_fused = -1;
     int rc = 0;
@@ -663,6 +666,7 @@ Result run_case(const Case& c, const char* ep_lib, const char* trace_path) {
     const std::string slice = trace_mark < trace.size() ? trace.substr(trace_mark) : std::string();
     r.fused = slice.find("qdq rows=") != std::string::npos;
     r.float_mm = slice.find("matmul batch=") != std::string::npos;
+    r.host_rows = slice.find("npu_qdq_host_rows") != std::string::npos;
     std::printf("onebit-ort-qdq: case %s: %zu of %zu int8 values differ, worst |d|=%d LSB, "
                 "path=%s\n",
                 c.label, r.differing, ref_out.size(), r.worst, r.fused ? "fused" : "per-node");
@@ -777,6 +781,23 @@ int main(int argc, char** argv) {
                          c.label);
             rc = 1;
             break;
+        }
+        // With designs configured, every fused case must take the leg the threshold names: the host loop
+        // below kDeviceMinRows (a decode step), the device at or above it (a prefill chunk). Without ELFs the
+        // device is unused either way, so the rule is not asserted there.
+        if (r.fused && std::getenv("ONEBIT_EP_NPU_ELFS")) {
+            const bool want_host_rows = c.m < onebit_ep::kDeviceMinRows;
+            if (r.host_rows != want_host_rows) {
+                std::fprintf(stderr,
+                             "onebit-ort-qdq: FAIL case %s (m=%lld): %s, expected %s "
+                             "(kDeviceMinRows=%lld)\n",
+                             c.label, (long long)c.m,
+                             r.host_rows ? "the host loop on rows" : "the device leg",
+                             want_host_rows ? "the host loop on rows" : "the device leg",
+                             (long long)onebit_ep::kDeviceMinRows);
+                rc = 1;
+                break;
+            }
         }
         const bool want_fused = c.expect_fused && !fusion_off;
         if (r.fused != want_fused) {

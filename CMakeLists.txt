@@ -360,6 +360,24 @@ add_library(onebit_npu STATIC npu/file_map.cpp npu/flm_head_import.cpp npu/full_
 target_include_directories(onebit_npu PUBLIC npu)
 target_link_libraries(onebit_npu PUBLIC nlohmann_json::nlohmann_json PRIVATE PkgConfig::PCRE2)
 
+# ── npu/forward's forward C++ compiles without the NPU runtime (engine #898) ───────────────
+# CI configures without ONEBIT_NPU, so npu/forward/src/q4nx_forward.cpp - where every A1 defect so
+# far has lived (engine #808, #874) - reached a green build without being compiled. This OBJECT
+# library compiles it and links nothing: the runtime's symbols are only needed at link time, and
+# the in-tree npu/rt.h needs no XRT. `onebit` depends on it, so the CI build job (which builds
+# `onebit`) compiles it without a workflow change.
+add_library(onebit_npu_forward_syntax OBJECT npu/forward/src/q4nx_forward.cpp)
+target_compile_definitions(onebit_npu_forward_syntax PRIVATE ONEBIT_NPU_RUNTIME_OWN)
+target_include_directories(onebit_npu_forward_syntax PRIVATE
+    npu/forward/include npu/forward/engine-src npu)
+target_link_libraries(onebit_npu_forward_syntax PRIVATE nlohmann_json::nlohmann_json)
+# Same OpenMP flags as onebit_npu_forward, so `#pragma omp` clauses are parsed here too.
+find_package(OpenMP)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(onebit_npu_forward_syntax PRIVATE OpenMP::OpenMP_CXX)
+endif()
+add_dependencies(onebit onebit_npu_forward_syntax)
+
 # ── MoE expert streaming (docs/moe-streaming.md) ─────────────────────────
 # The routed-expert cache: pinned RAM slots filled with O_DIRECT reads, and
 # `1bit moe-cache`, which replays expert traces through it. Linux only.

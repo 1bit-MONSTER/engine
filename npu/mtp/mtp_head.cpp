@@ -299,11 +299,14 @@ bool MtpDrafter::next_row(const float* hidden, int token, int pos, std::vector<f
                           std::vector<float>& logits) {
     std::vector<float> emb;
     if (!embed_ || !embed_(token, emb) || (int)emb.size() != kH) return false;
-    if (!use_lm_head_ || !lm_) {
+    if (!use_lm_head_ || !lm_ || !need_logits_) {
+        // head_step with no lm head still computes the full head hidden and writes the KV row, so `next` and the
+        // cache are identical to the logits-producing call -- only the vocabulary projection is skipped.
         if (!head_step(w_, hidden, emb.data(), pos, cache_, next, nullptr, logits)) return false;
         logits.assign((size_t)(vocab_ > 0 ? vocab_ : 1), 0.0f);
         return true;
     }
+    lm_calls_++;
     return head_step(w_, hidden, emb.data(), pos, cache_, next, lm_, logits);
 }
 
@@ -312,7 +315,10 @@ bool MtpDrafter::prime(const std::vector<float>& hidden, int token, int pos) {
     cache_.truncate(stream_.keep());
     if (!stream_.at(pos)) { mismatches_++; return false; }
     std::vector<float> next, lg;
-    if (!next_row(hidden.data(), token, pos, next, lg)) return false;
+    need_logits_ = false;               // prime() keeps the row, never the logits
+    const bool ok = next_row(hidden.data(), token, pos, next, lg);
+    need_logits_ = true;
+    if (!ok) return false;
     stream_.commit(pos, 1);
     return true;
 }
@@ -351,11 +357,13 @@ void MtpDrafter::commit_rows(const std::vector<int>& tokens, const std::vector<f
     const int from = stream_.keep();
     std::vector<float> next, lg;
     int at = from;
+    need_logits_ = false;               // commit_rows keeps the rows, never the logits
     for (int m = 0; m < M; m++) {
         if ((int)tokens.size() <= m || hidden_rows.size() < (size_t)(m + 1) * (size_t)hidden_) break;
         if (!next_row(&hidden_rows[(size_t)m * (size_t)hidden_], tokens[(size_t)m], at, next, lg)) break;
         at++;
     }
+    need_logits_ = true;
     stream_.commit(from, at - from);
 }
 

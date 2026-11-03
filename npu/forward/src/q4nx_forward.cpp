@@ -1218,6 +1218,54 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         }
     }
 
+    // ---- the lm head on the q4_1 gemv family ----
+    // That family has no int8 packer: its weight BO holds the container's own q4_1 tile stream and the
+    // launch dequantises from those tiles, so the tiled int8 head above cannot express it -- packing an
+    // int8 image into a tile BO both overruns the BO by (KD*ND - tile bytes) and means nothing to the
+    // kernel.  The head is therefore ONE launch whose N is the vocabulary: the only width whose output
+    // is the whole logits row, which is what run_lm_head_gemv() gathers the container's head tiles for.
+    if (!host_gemm_ && !ctx_head_) {
+        bool any_gemv = false;
+        for (int i = 0; i < ndesigns_ && !any_gemv; i++)
+            any_gemv = (ctx_[i] && ctx_[i]->gemv) || (ctx16_[i] && ctx16_[i]->gemv);
+        if (any_gemv) {
+            // The head ELF's N is on the gemv column grid, so try the padded vocabulary first and the
+            // raw one after: the pack's vocab 151936 is 152064 on the grid.
+            std::string elf;
+            for (int nn : {q4nx_pad_n(c_.NV), c_.NV}) {
+                for (const char* suf : {"_m16.elf", ".elf"}) {
+                    const std::string n = "full_i8_LMHEAD_K" + std::to_string(kpad_) + "_N" +
+                                          std::to_string(nn) + suf;
+                    for (const std::string& d : m16dirs_like_head(mdir, dir)) {
+                        if (file_exists(d + "/" + n)) { elf = d + "/" + n; break; }
+                    }
+                    if (!elf.empty()) break;
+                }
+                if (!elf.empty()) break;
+            }
+            if (elf.empty()) {
+                err_ = "lm head: this container's kernels are the q4_1 gemv family, whose head is one "
+                       "launch at N=vocab, and no head ELF is on disk (want full_i8_LMHEAD_K" +
+                       std::to_string(kpad_) + "_N" + std::to_string(q4nx_pad_n(c_.NV)) + "[_m16].elf)";
+                return false;
+            }
+            const int m = elf.find("_m16.elf") != std::string::npos ? Q4NX_DESIGN_M_DECODE
+                                                                   : Q4NX_DESIGN_M_PREFILL;
+            const int n = (elf.find("_N" + std::to_string(q4nx_pad_n(c_.NV))) != std::string::npos)
+                              ? q4nx_pad_n(c_.NV) : c_.NV;
+            ctx_head_ = std::make_unique<I8Ctx>();
+            ctx_head_->MD = m; ctx_head_->KD = kpad_; ctx_head_->ND = n;
+            if (!ctx_head_->init_elf(*dev, elf.c_str(), m, kpad_, n, 1) || !ctx_head_->gemv) {
+                err_ = "lm head: " + elf + " does not load as the gemv head (K=" +
+                       std::to_string(kpad_) + " N=" + std::to_string(n) + ")";
+                ctx_head_.reset();
+                return false;
+            }
+            fprintf(stderr, "  [forward] lm head M=%d K=%d N=%d  %s (q4_1 gemv tiles)\n", m, kpad_, n,
+                    elf.c_str());
+        }
+    }
+
     // ---- Gemma4 per-layer embeddings (PLE) + KV sharing ----
     // Every tensor here is read out of the model's own index (name + dtype checked
     // rather than assumed); the shapes are BF16 except the per-layer token table,
@@ -2693,11 +2741,17 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
         if (!d) { err_ = "gemv head: no lm_head.weight tensor"; return false; }
         const uint8_t* raw = (const uint8_t*)model_tensor_data(mw_, d);
         const size_t want = I8Ctx::gemv_w_bytes(kpad_, ctx_head_->ND);
-        if (!raw || (size_t)d->data_size < want) {
+        // The container stores the head's tiles at the REAL vocabulary width, and the head ELF's N is
+        // that width on the column grid (151936 -> 152064 for the 0.5B pack).  The tail between them is
+        // columns past the vocabulary, so it stays zero tiles -- the same rule the fused designs use for
+        // a padded tail -- and only the first NV logits are ever read.
+        const size_t have = I8Ctx::gemv_w_bytes(kpad_, NV);
+        if (!raw || (size_t)d->data_size < have) {
             err_ = "gemv head: the container has no q4_1 tile stream for the head";
             return false;
         }
-        gemv_head_.assign(raw, raw + want);
+        gemv_head_.assign(want, 0);
+        std::memcpy(gemv_head_.data(), raw, std::min(have, (size_t)d->data_size));
         if (!head_bo_) head_bo_ = ctx_head_->make_weight_bo(*dev_);
         if (!ctx_head_->upload_tiles_into(*head_bo_, gemv_head_.data(), gemv_head_.size())) {
             err_ = "gemv head: upload failed"; return false;
@@ -4857,6 +4911,14 @@ bool Q4nxNpuForward::run_lm_head(const std::vector<float>& h, std::vector<float>
     // The head keeps the int8 family even in a pb16i container: lm_head is not a
     // PTQ1_0 ternary tensor and has no image, and packB below is the int8 packer.
     I8Ctx& lctx = ctx_head_ ? *ctx_head_ : *ctx_for(ctx_[i_qkv].get(), 1);
+    // Belt for the gemv family: packB_into writes a KD*ND int8 image, which is larger than that
+    // family's tile-stream BO.  The head context above handles this family; reaching here means a
+    // container with no head ELF, and a loud refusal beats a heap overrun (measured: it aborted a
+    // 0.5B pack in run_lm_head, ASan named the memset).
+    if (!host_gemm_ && lctx.gemv) {
+        err_ = "lm head: the int8 tiled head cannot run on the q4_1 gemv family (no head ELF loaded)";
+        return false;
+    }
     // ── Pack the head's B tiles ONCE ──────────────────────────────────────────
     // Before this, every token copied all 15 f32 tiles out of lm_head_tiles_ (356 MB
     // a tile) and re-ran packB -- a per-column int8 quantisation of all 89 M head

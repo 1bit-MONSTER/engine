@@ -34,6 +34,15 @@
   forwards to Lemonade (cycle 17 item 8 - the cycle-16 demo recording had `?key=…` in the address bar). ?api= still
   points the page at a different server; a ?key= left over from an older launcher is used once and then dropped
   from the address bar, so it cannot end up in a recording or in history.
+
+  Cycle 18 (from the c17 board demo) fixed two things about the conversation itself, both visible in the owner's
+  recording: a thinking model (Qwen3) put its whole reply in `reasoning_content`, so the page - which read only
+  `delta.content` - showed a mid-sentence stop and then "done: 0 chunks", and the model could only be chosen with
+  ?model= in the URL. So the page now asks for `enable_thinking: false` by default (Lemonade's own extension;
+  "show thinking" sends true and renders the reasoning dimmed above the answer), gives the answer 1024 tokens
+  instead of 512, and has a dropdown built from /api/v1/models that names each model's backend (GPU / NPU). A
+  stream that ends without [DONE], or one that produced reasoning and no answer, now says so in its own words
+  instead of reporting zero chunks.
 -->
 <meta charset="utf-8">
 <title>1bit OS - chat</title>
@@ -45,10 +54,17 @@
   header b { font-size: 20px; letter-spacing: .3px; }
   header span { color: #9aa3ad; font-size: 14px; }
   #wrap { padding: 18px 20px 120px; }
-  #out { white-space: pre-wrap; font-size: 18px; }
+  #out { font-size: 18px; }
   #out .u { color: #7fd1ff; }
+  /* the model's thinking, when it shows any: dimmed, so an answer never looks like it starts mid-sentence */
+  #out .think { color: #8b949e; font-style: italic; white-space: pre-wrap; }
+  #out .ans { white-space: pre-wrap; }
+  #out .turn { margin: 0 0 14px; }
   #bar { position: fixed; left: 0; right: 0; bottom: 0; padding: 14px 20px; background: #17191c;
-         border-top: 1px solid #2a2d31; display: flex; gap: 12px; }
+         border-top: 1px solid #2a2d31; display: flex; gap: 12px; align-items: center; }
+  #model { font-size: 16px; padding: 12px 10px; border-radius: 10px; border: 1px solid #3a3f45;
+           background: #0d0f11; color: #e8eaed; max-width: 30%; }
+  #thinkl { color: #9aa3ad; font-size: 14px; white-space: nowrap; }
   input[type=text] { flex: 1; font-size: 18px; padding: 12px 14px; border-radius: 10px; border: 1px solid #3a3f45;
                      background: #0d0f11; color: #e8eaed; }
   button { font-size: 17px; padding: 12px 20px; border-radius: 10px; border: 1px solid #3a6ea5; background: #1d4f7c;
@@ -64,17 +80,20 @@
 <div id="wrap"><div id="out"></div></div>
 <div id="stat">ready</div>
 <div id="bar">
+  <select id="model" title="the model this page talks to, from /api/v1/models"></select>
   <input id="q" type="text" autofocus placeholder="Ask the appliance something and press Enter…">
   <button id="go">Send</button>
+  <label id="thinkl" title="off: the model answers directly (enable_thinking:false). on: it reasons first, shown dimmed above the answer."><input
+    type="checkbox" id="think"> show thinking</label>
 </div>
 <script>
 (function () {
   var p = new URLSearchParams(location.search);
   // same origin by default: the server that served this page IS the proxy that holds the key
   var api = (p.get("api") || "").replace(/\/+$/, "");
-  var model = p.get("model") || "";
   var q = document.getElementById("q"), out = document.getElementById("out"), stat = document.getElementById("stat");
   var go = document.getElementById("go"), ui = document.getElementById("uibtn");
+  var sel = document.getElementById("model"), think = document.getElementById("think");
   // an old ?key= link keeps working, but the secret is taken out of the address bar immediately (no history entry
   // to read it from, nothing for a screen recording to catch). New launchers do not use it at all.
   var key = p.get("key") || "";
@@ -85,82 +104,165 @@
   ui.title = "Lemonade's own web UI asks for the API key (console menu item 1 shows it)";
   document.getElementById("srv").textContent = api || (location.origin + " (Lemonade key held here)");
   var host = location.hostname || "this machine";
-  document.getElementById("who").textContent = "chat on " + host + (model ? " / " + model : "");
   var busy = false;
+  // Cycle 18, item 1: a thinking model (Qwen3) spends its budget inside reasoning_content, so `content` arrives
+  // empty and a 512-token reply reads "done: 0 chunks" - measured on the c17 board demo, where the visible answer
+  // was cut mid-sentence and the follow-up printed "done: 0 chunks in 5.9 s". So: ask for no reasoning by default
+  // (Lemonade's own extension, bin/resources/docs/api/openai.md: `enable_thinking: false`), keep a switch for it,
+  // and give the answer a budget that the reasoning cannot swallow whole.
+  var MAXTOK = 1024;
+  var want = p.get("model") || "";       // ?model= still pins one; the dropdown is the normal way now
+  var model = "";                        // the id this page is chatting with
+  think.checked = p.get("think") === "1";
+  var have = [];                         // the models on this machine, as /api/v1/models lists them
 
   function headers() {
     var h = { "Content-Type": "application/json" };
     if (key) h["Authorization"] = "Bearer " + key;
     return h;
   }
-  function pickModel() {
-    if (model) return Promise.resolve(model);
+  function backend(m) {
+    var o = (m && m.recipe_options) || {};
+    if (o.onebit_backend === "npu" || /-NPU-1bit$/i.test(m.id || "")) return "NPU";
+    if (m.recipe === "onebit") return "GPU";
+    return m.recipe || "";
+  }
+  function label(m) {
+    var b = backend(m);
+    return m.id + (b ? "  ·  " + b : "");
+  }
+  function show() {
+    var m = null, i;
+    for (i = 0; i < have.length; i++) { if (have[i].id === model) m = have[i]; }
+    document.getElementById("who").textContent = "chat on " + host + (model ? " / " + (m ? label(m) : model) : "");
+  }
+  // The picker is the fix for "no model picker on the chat page: only ?model= in the URL" (cycle 18, item 2).
+  // Only what is ON the machine: a catalogue entry that is not downloaded turns a demo into a 1-4 GB download
+  // (measured on 2026-11-02: the first onebit id in the list was an undownloaded catalogue entry and the page sat
+  // on "waiting for the first token"). GPU/NPU comes from the model's own recipe_options, and an NPU set is what
+  // the board's dx route serves, so the two are distinguishable before a prompt is typed.
+  function fill() {
     return fetch(api + "/api/v1/models?show_all=true", { headers: headers() })
       .then(function (r) { return r.json(); })
       .then(function (j) {
-        var all = j.data || [];
-        // ONLY what is on the box: a catalogue entry that is not downloaded turns a demo into a 1-4 GB download
-        // (measured: the first onebit id in the list was an undownloaded catalogue entry and the page sat on
-        // "waiting for the first token"). Then a 1bit model, then anything downloaded at all.
-        var have = all.filter(function (m) { return m.downloaded !== false; });
-        var pick = have.filter(function (m) { return /1bit/i.test(m.id); })[0] || have[0];
-        if (!pick) throw new Error("the server lists no downloaded model - pull one from the console menu (item 4)");
-        var m = pick.id;
-        model = m;
-        document.getElementById("who").textContent = "chat on " + host + " / " + m;
-        return m;
+        var all = (j && j.data) || [];
+        have = all.filter(function (m) { return m.downloaded !== false; });
+        // a 1bit model first: this page is the appliance's chat, and the appliance's models are ours
+        have.sort(function (a, b) { return (/1bit/i.test(b.id) ? 1 : 0) - (/1bit/i.test(a.id) ? 1 : 0); });
+        while (sel.options.length) { sel.remove(0); }
+        if (!have.length) {
+          var o = document.createElement("option");
+          o.textContent = "no model on this machine - console menu item 4, Models";
+          o.disabled = true; sel.appendChild(o); sel.disabled = true;
+          throw new Error("the server lists no downloaded model - pull one from the console menu (item 4)");
+        }
+        have.forEach(function (m) {
+          var o = document.createElement("option");
+          o.value = m.id; o.textContent = label(m);
+          sel.appendChild(o);
+        });
+        sel.disabled = false;
+        // a pick already made survives a refill - ask() refills before every prompt, and resetting the model
+        // there silently threw the dropdown's choice away (measured in the cycle-18 browser probe: the header
+        // said qwen3-0.6b-q4_k_m-1bit and the request carried the NPU model)
+        if (want && have.some(function (m) { return m.id === want; })) model = want;
+        else if (!model || !have.some(function (m) { return m.id === model; })) model = have[0].id;
+        sel.value = model;
+        show();
+        return model;
       });
   }
+  sel.addEventListener("change", function () { model = sel.value; show(); q.focus(); });
+
   function ask() {
     var text = (q.value || "").trim();
     if (!text || busy) return;
-    busy = true; go.disabled = true; q.value = "";
-    out.textContent += (out.textContent ? "\n\n" : "") + "> " + text + "\n";
-    var t0 = Date.now(), chunks = 0, first = 0;
+    busy = true; go.disabled = true; sel.disabled = true; q.value = "";
+    var turn = document.createElement("div");
+    turn.className = "turn";
+    var hu = document.createElement("div");
+    hu.className = "u"; hu.textContent = "> " + text;
+    var th = document.createElement("div");
+    th.className = "think";
+    var an = document.createElement("div");
+    an.className = "ans";
+    turn.appendChild(hu); turn.appendChild(th); turn.appendChild(an);
+    out.appendChild(turn);
+    var t0 = Date.now(), chunks = 0, rchunks = 0, first = 0, finish = "", done = false;
     stat.textContent = "waiting for the first token…";
-    pickModel().then(function (m) {
-      return fetch(api + "/api/v1/chat/completions", {
-        method: "POST", headers: headers(),
-        body: JSON.stringify({ model: m, messages: [{ role: "user", content: text }],
-                               max_tokens: 512, temperature: 0, stream: true })
-      });
+    window.scrollTo(0, document.body.scrollHeight);
+    function add(el, t) { el.appendChild(document.createTextNode(t)); window.scrollTo(0, document.body.scrollHeight); }
+    function end() {
+      var bits = [chunks + " answer chunk" + (chunks === 1 ? "" : "s")];
+      if (rchunks) bits.push(rchunks + " thinking chunk" + (rchunks === 1 ? "" : "s") + " (dimmed above)");
+      bits.push(((Date.now() - t0) / 1000).toFixed(1) + " s");
+      if (first) bits.push("first token after " + ((first - t0) / 1000).toFixed(1) + " s");
+      var s = "done: " + bits.join(", ");
+      if (finish) s += " (" + finish + ")";
+      if (!done) s += " - the backend ended the stream without [DONE]";
+      // The two shapes that used to look identical from the outside ("done: 0 chunks"): thinking ate the budget,
+      // and thinking is all the model did. Both name the switch that fixes them.
+      if (!chunks && rchunks) s += " - no answer text: the model spent its budget thinking, untick 'show thinking'";
+      else if (!chunks && finish === "length") s += " - no answer text before max_tokens (" + MAXTOK + ")";
+      stat.textContent = s;
+      out.appendChild(document.createElement("div"));
+      if (th.textContent) th.textContent = "[thinking] " + th.textContent;
+      busy = false; go.disabled = false; sel.disabled = false; q.focus();
+    }
+    fill().then(function (m) {
+      var body = { model: m, messages: [{ role: "user", content: text }],
+                   max_tokens: MAXTOK, temperature: 0, stream: true,
+                   enable_thinking: !!think.checked };
+      return fetch(api + "/api/v1/chat/completions", { method: "POST", headers: headers(),
+                                                       body: JSON.stringify(body) });
     }).then(function (r) {
       if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf, and only 1bit-webapp-proxy on :8080 can use it)"); }
       if (!r.ok) { throw new Error("HTTP " + r.status); }
       var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
       function pump() {
         return reader.read().then(function (res) {
-          if (res.done) {
-            stat.textContent = "done: " + chunks + " chunks in " + ((Date.now() - t0) / 1000).toFixed(1) + " s" +
-              (first ? " (first token after " + ((first - t0) / 1000).toFixed(1) + " s)" : "");
-            busy = false; go.disabled = false; q.focus();
-            return;
-          }
+          if (res.done) { end(); return; }
           buf += dec.decode(res.value, { stream: true });
           var lines = buf.split("\n"); buf = lines.pop();
           lines.forEach(function (l) {
             l = l.trim();
             if (l.indexOf("data:") !== 0) return;
             var pay = l.slice(5).trim();
-            if (pay === "[DONE]") return;
+            if (pay === "[DONE]") { done = true; return; }
             var j; try { j = JSON.parse(pay); } catch (e) { return; }
-            var d = (j.choices && j.choices[0] && j.choices[0].delta) || {};
-            var t = d.content || "";
-            if (!first && t) { first = Date.now(); }
-            if (t) { out.textContent += t; chunks++; window.scrollTo(0, document.body.scrollHeight); }
+            var ch = (j.choices && j.choices[0]) || {};
+            if (ch.finish_reason) finish = ch.finish_reason;
+            var d = ch.delta || {};
+            if (d.reasoning_content) {
+              rchunks++;
+              add(th, d.reasoning_content);
+              if (!chunks) stat.textContent = "thinking… " + rchunks + " chunk" + (rchunks === 1 ? "" : "s") +
+                " (the model reasons before it answers; untick 'show thinking' for a direct answer)";
+            }
+            if (d.content) {
+              if (!first) first = Date.now();
+              chunks++;
+              add(an, d.content);
+              stat.textContent = "streaming… " + chunks + " chunk" + (chunks === 1 ? "" : "s");
+            }
           });
           return pump();
         });
       }
       return pump();
     }).catch(function (e) {
-      out.textContent += "[" + e + "]\n";
+      var err = document.createElement("div");
+      err.className = "ans"; err.textContent = "[" + e + "]";
+      out.appendChild(err);
       stat.textContent = "failed: " + e;
-      busy = false; go.disabled = false;
+      busy = false; go.disabled = false; sel.disabled = false;
     });
   }
   go.addEventListener("click", ask);
   q.addEventListener("keydown", function (e) { if (e.key === "Enter") ask(); });
+  // The picker fills itself at load, so the model is on screen before the first prompt (item 2's ask). A failure
+  // here is not fatal: ask() retries it, and the line says what the server said.
+  fill().catch(function (e) { stat.textContent = "no model list yet: " + e; });
   q.focus();
 })();
 </script>

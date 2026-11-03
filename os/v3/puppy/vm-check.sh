@@ -438,6 +438,20 @@ rows = [
                      "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
                      "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
                      "webapp-key-not-in-url"),
+    # Cycle 18 items 1-2, from the c17 board demo: a thinking model (Qwen3) spent the whole token budget in
+    # reasoning_content, so the page - which read only delta.content - showed a mid-sentence stop and then
+    # "done: 0 chunks"; and the model could only be chosen with ?model= in the URL. The page the proxy actually
+    # serves must ask for enable_thinking:false, render reasoning_content, give the answer 1024 tokens, and carry
+    # the picker. It is read off the RUNNING server (8080), not off the file in the tree.
+    ("U3 webapp page", "p=$(curl -s -m 5 http://127.0.0.1:8080/); "
+                     "t=$(printf '%s' \"$p\" | grep -c enable_thinking); "
+                     "r=$(printf '%s' \"$p\" | grep -c reasoning_content); "
+                     "k=$(printf '%s' \"$p\" | grep -c 'select id=.model.'); "
+                     "m=$(printf '%s' \"$p\" | grep -c 'MAXTOK = 1024'); "
+                     "echo \"thinking=$t reasoning=$r picker=$k max_tokens=$m\"; "
+                     "[ \"$t\" -ge 1 ] && [ \"$r\" -ge 1 ] && [ \"$k\" = 1 ] && [ \"$m\" = 1 ] && "
+                     "echo webapp-thinking-and-picker",
+                     "webapp-thinking-and-picker"),
     # Cycle 17 item 3: the appliance's name is /etc/hostname, not the DHCP server's opinion - connman's
     # AllowHostnameUpdates defaults to true, which is the one path a name nobody typed can take.
     ("U1 hostname pin", "grep -n '^AllowHostnameUpdates' /etc/connman/main.conf; "

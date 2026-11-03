@@ -248,6 +248,19 @@ def run(cmd, name, timeout, out_dir):
     return rc, text
 
 
+def log_dir_for(out_dir, name):
+    """The directory one measurement's raw logs go in.
+
+    They used to share fixed names with the result directory itself, so a second measurement in the same
+    RESULT_DIR silently overwrote the first one's serve.log / llama-bench.log / kld.log: measured on
+    2026-11-02, the 19:01 arm destroyed the 18:45 baseline's raw logs, and a pair's two halves (A, B) would
+    have collided the same way. One directory per RESULT_FILENAME makes the raw evidence survive the run.
+    """
+    log_dir = out_dir / f"logs-{name}"
+    log_dir.mkdir(parents=True, exist_ok=True)
+    return log_dir
+
+
 def bench_csv(text):
     """Parse `llama-bench -o csv` into {(n_prompt, n_gen): tok/s}, keyed by header names."""
     lines = [ln for ln in text.splitlines() if ln.strip()]
@@ -315,7 +328,7 @@ def long_prompt(n_tokens):
     return LONG_PROMPT_UNIT * max(1, int(n_tokens * LONG_CHARS_PER_TOKEN / len(LONG_PROMPT_UNIT)) + 1)
 
 
-def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0, longtok=128):
+def serve_measure(onebit, model, args, reps, tokens, timeout, log_dir, longctx=0, longtok=128):
     """Start `1bit serve` once, run the three prompts (+ the long-context leg), return the numbers."""
     port = free_port()
     cmd = [onebit, "serve", "-m", str(model), "--port", str(port)] + args
@@ -325,14 +338,14 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0
     # ggml-hrx for the counts; `1bit serve` exposes no `-lv` passthrough, so they only surface when
     # its own verbosity reaches the library's INFO level, and `placement` stays null otherwise.
     run_env = dict(os.environ, GGML_HRX_STRICT="0", GGML_HRX_REPORT="2")
-    logtext = (out_dir / "serve.log").open("w", encoding="utf-8")
+    logtext = (log_dir / "serve.log").open("w", encoding="utf-8")
     proc = subprocess.Popen(cmd, env=run_env, stdout=logtext, stderr=subprocess.STDOUT,
                             stdin=subprocess.DEVNULL)
     tps, texts = {}, {}
     long_info = {}
     try:
         if not wait_healthy(port, proc, time.time() + timeout / 2):
-            raise RuntimeError(f"`1bit serve` did not become healthy (see {out_dir / 'serve.log'})")
+            raise RuntimeError(f"`1bit serve` did not become healthy (see {log_dir / 'serve.log'})")
         ask(port, "hi", 4, timeout)  # warm-up: pays the first-token compile, not the measurement
         for name, prompt in DECODE_PROMPTS.items():
             samples = []
@@ -358,7 +371,7 @@ def serve_measure(onebit, model, args, reps, tokens, timeout, out_dir, longctx=0
             proc.kill()
             proc.wait()
         logtext.close()
-    return tps, texts, placement_summary(out_dir / "serve.log"), long_info
+    return tps, texts, placement_summary(log_dir / "serve.log"), long_info
 
 
 PLACEMENT_RE = re.compile(r"placement: (\d+) nodes, (\d+) off HRX")
@@ -381,13 +394,13 @@ def placement_summary(path):
 KLD_MEAN_RE = re.compile(r"^Mean\s+KLD\s*:\s*([-+0-9.eE]+)", re.M)
 
 
-def kld(ppl, model, args, base, wiki, timeout, out_dir):
+def kld(ppl, model, args, base, wiki, timeout, log_dir):
     """Prefill-path KLD against the stored base logits; records the base when it is missing."""
     cmd = [ppl, "-m", str(model), "-f", str(wiki), "-c", "512", "--chunks", "8",
            "--device", "HRX0", "-ngl", "99"] + (args or ["-b", "512", "-ub", "512"])
     recording = not base.is_file()
     cmd += ["--kl-divergence-base", str(base)] + ([] if recording else ["--kl-divergence"])
-    rc, text = run(cmd, "kld-record" if recording else "kld", timeout, out_dir)
+    rc, text = run(cmd, "kld-record" if recording else "kld", timeout, log_dir)
     if recording:
         return {"recorded": rc == 0 and base.is_file(), "mean": None}
     match = KLD_MEAN_RE.search(text)
@@ -405,6 +418,7 @@ def main():
     out_dir = pathlib.Path(env("RESULT_DIR") or ".").expanduser()
     out_dir.mkdir(parents=True, exist_ok=True)
     name = env("RESULT_FILENAME") or "inferencex_result"
+    log_dir = log_dir_for(out_dir, name)
     model = model_file()
 
     # Out-of-tree build (README.md): `1bit` at the build root, the HRX llama.cpp tools built by
@@ -459,7 +473,7 @@ def main():
     # 1. llama-bench: prefill and decode throughput from one model load.
     rc, text = run([str(bench), "-m", str(model), "-dev", "HRX0"] + bench_args()
                    + ["-p", "512", "-n", "128", "-r", str(reps), "-o", "csv"],
-                   "llama-bench", min(600, deadline - time.time()), out_dir)
+                   "llama-bench", min(600, deadline - time.time()), log_dir)
     rows = bench_csv(text)
     pp512, tg128 = rows.get((512, 0)), rows.get((0, 128))
     if rc != 0 or not pp512 or not tg128:
@@ -470,7 +484,7 @@ def main():
     try:
         tps, texts, placement, long_info = serve_measure(
             onebit, model, serve_lever_args(), reps, tokens,
-            min(1200 if longctx else 600, deadline - time.time()), out_dir,
+            min(1200 if longctx else 600, deadline - time.time()), log_dir,
             longctx=longctx, longtok=longtok)
     except (RuntimeError, OSError) as exc:
         return finish(False, f"serve leg failed: {exc}", rc=1)
@@ -504,7 +518,7 @@ def main():
             ref_texts = {}
     establishing = not ref or not ref_texts or not base_kld.is_file()
 
-    kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), out_dir)
+    kld_stat = kld(ppl, model, bench_args(), base_kld, wiki, min(900, deadline - time.time()), log_dir)
     result["quality_gate"].update({"kld_max_mean": kld_max, "kld_mean": kld_stat["mean"],
                                    "kld_recorded": kld_stat["recorded"]})
     if establishing and kld_stat["recorded"] and kld_stat["mean"] is None:

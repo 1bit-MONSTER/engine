@@ -3340,6 +3340,12 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             continue;
         }
+        // ACT is read below at the *fused* design's N, so both branches have to hand it rows at that
+        // stride.  The fused branch does that by construction (npu_gemm_rows writes M rows of the
+        // design's N); the split branch packs its own buffer at the same width rather than at 2*im, so
+        // there is one layout and one stride -- reading a real-width buffer at the design stride is
+        // what the review of #885 caught (latent until a container has im % 256 != 0, then an OOB read).
+        const size_t act_w = (size_t)q4nx_pad_n(2 * im);
         if (i_gu >= 0) {
             const Q4nxDesignGeom* g = &designs_[i_gu];
             Q4nxProjections p{};
@@ -3350,7 +3356,7 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             npu_gemm_rows(*ctx_[i_gu], XN.data(), M, g->K, g->N, B_.data(), ACT, 2, "ffn_gate_up",
                           g->real_k);
         } else if (i_g >= 0 && i_u >= 0) {
-            std::vector<float> gv, uv, av((size_t)M * (size_t)im * 2);
+            std::vector<float> gv, uv, av((size_t)M * act_w, 0.0f);
             const Q4nxDesignGeom* gg = &designs_[i_g];
             Q4nxProjections pg{}; pg.gate = wg_.data();
             if (!pb16i_ && !cached && q4nx_assemble_B(gg, &pg, B_.data()) != 0) {
@@ -3365,12 +3371,13 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
             }
             npu_gemm_rows(*ctx_[i_u], XN.data(), M, gu->K, gu->N, B_.data(), uv, 3, "ffn_up",
                           gu->real_k);
-            // Each GEMM wrote M rows of its own design's N (padded, engine#854); the packed row is
-            // 2*im wide, so both reads go through the design's stride (identity when nothing is padded).
+            // Each GEMM wrote M rows of its own design's N (padded, engine#854), so both are read at
+            // their design's stride and packed at act_w -- the same layout the fused branch produces.
+            // The pad columns stay 0 (av is zeroed), matching what assemble_B leaves in the fused case.
             for (int m = 0; m < M; m++)
                 for (int i = 0; i < im; i++) {
-                    av[(size_t)m * 2 * im + i] = gv[(size_t)m * gg->N + i];
-                    av[(size_t)m * 2 * im + im + i] = uv[(size_t)m * gu->N + i];
+                    av[(size_t)m * act_w + i] = gv[(size_t)m * gg->N + i];
+                    av[(size_t)m * act_w + im + i] = uv[(size_t)m * gu->N + i];
                 }
             ACT.swap(av);
         } else {
@@ -3379,8 +3386,8 @@ bool Q4nxNpuForward::step_batch(const std::vector<int>& tokens, int start_pos,
         }
         HH.assign((size_t)M * (size_t)im, 0.0f);
         {
-            // the fused design's N, for the same reason as O and D
-            const size_t act_w = (size_t)q4nx_pad_n(2 * im);
+            // act_w is the stride both branches above leave ACT at; only the first 2*im columns of a
+            // row are real (the rest is the kernel's zero column pad).
             for (int m = 0; m < M; m++) {
                 act_row.assign(ACT.begin() + (size_t)m * act_w,
                                ACT.begin() + (size_t)m * act_w + (size_t)2 * im);

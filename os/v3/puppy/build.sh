@@ -23,10 +23,35 @@
 #                 `lemond` need GLIBC_2.43 (measured), and noble64's Puppy has 2.39
 #   <kernel-dir>  the directory os/v3/puppy/mk-huge-kernel.sh wrote: huge-<kver>.tar.zst
 #   <out-dir>     where the built .iso and .sfs land
+#   [woof-ce-dir] the woof-CE clone (default $HOME/wt/woof-CE)
+#
+# LIBHSA_DIR=<dir> installs the WHOLE release-gated HSA runtime set at /opt/rocm-therock/lib: the pinned
+# libhsa-runtime64.so.1 plus every sibling it needs at load time (the TheRock `librocm_sysdeps_*` set and
+# librocprofiler-register.so.0). Cycle 13's board boot measured why the set and not one file (engine#715 +
+# the 2 Nov hardware run):
+#   * `ONEBIT_HRX_LIBHSA` is a CMake compile definition, not a variable - nothing in the engine reads it at
+#     run time (CMakeLists.txt:279, cmake/hrx.cmake). app/serve.cpp:201 resolves in the order --hrx-libhsa,
+#     the BAKED build-machine path if it exists, then a recursive scan of /opt/rocm-therock. On the appliance
+#     the baked path is a release-build directory that does not exist, so the scan is the only route left;
+#   * the pinned libhsa carries `RUNPATH=$ORIGIN` and NEEDED librocm_sysdeps_{elf,drm,drm_amdgpu,numa} +
+#     librocprofiler-register, so a lone file cannot load even when handed to the loader: measured `ldd` = 4
+#     `not found`. With the release kit's own directory on the path: 0 not found.
+# So the set is installed flat, /opt/1bit/libhsa becomes a symlink to it (v2's path and the identity row keep
+# working), and the build refuses a set that is incomplete or that `ldd` cannot resolve - the silent-absence
+# class this lane keeps paying for (an image with no HRX runtime looks exactly like an image whose HRX runtime
+# nobody loaded). Without LIBHSA_DIR the build warns, as before.
+#
+# PAYLOAD=<dir> embeds the release package (TPUPPY-RELEASE U3/U4): the unpacked
+# lemonade-onebit-<tag>/ tree, whose lemond-onebit launcher resolves bin/ and 1bit/ BESIDE ITSELF. It is
+# copied to /opt/1bit-package, /etc/init.d/10lemonade from os/v3/puppy/embed starts it at boot (Puppy's
+# rc.services runs every executable /etc/init.d script), and the build refuses an image whose SFS set lacks
+# the engine or the launcher. Without PAYLOAD the image is the plain Puppy base, as before.
 #
 # Two things the woof-CE build assumes that are not obvious, both measured here:
 #   * merge2out refuses to run unless $GITHUB_ACTIONS is set or the host is a running Puppy - CI sets it,
 #     so a container build has to as well;
+#   * `losetup` needs a /dev/loopN node, and the container only has 0-7: this script mknods them, because
+#     this box keeps ~20 loop devices busy (snaps, other lanes) and the free one is numbered above 7;
 #   * `3builddistro` takes the kernel from `woof-out_*/kernel-kit/output/` and otherwise downloads a stock
 #     Ubuntu kernel. Dropping our huge tarball there is what makes the image boots OUR kernel.
 #
@@ -62,57 +87,60 @@ kernel=$(cd "$kernel" && pwd)
 ls "$kernel"/huge-*.tar.* >/dev/null 2>&1 || {
     echo "build: no huge-*.tar.* in $kernel (run mk-huge-kernel.sh first)" >&2; exit 1; }
 mkdir -p "$out"; out=$(cd "$out" && pwd)
+recipe=$(cd "$(dirname "$0")" && pwd)   # os/v3/puppy, mounted at /recipe: packages-extra lives there
+payload=""
+if [ -n "${PAYLOAD:-}" ]; then
+    payload=$(cd "$PAYLOAD" 2>/dev/null && pwd) || { echo "build: PAYLOAD=$PAYLOAD does not exist" >&2; exit 1; }
+    [ -x "$payload/lemond-onebit" ] && [ -x "$payload/1bit/1bit" ] || {
+        echo "build: $payload is not the release package: want lemond-onebit and 1bit/1bit in it" >&2; exit 1; }
+fi
+libhsa_dir=""
+if [ -n "${LIBHSA_DIR:-}" ]; then
+    libhsa_dir=$(cd "$LIBHSA_DIR" 2>/dev/null && pwd) || { echo "build: LIBHSA_DIR=$LIBHSA_DIR does not exist" >&2; exit 1; }
+    if [ -n "${LIBHSA:-}" ]; then
+        echo "build: LIBHSA is the cycle-13 spelling; a lone libhsa cannot load (its \$ORIGIN siblings are needed)" >&2
+        echo "build: pass LIBHSA_DIR=<dir> holding libhsa-runtime64.so.1 and the librocm_sysdeps set" >&2
+        exit 1
+    fi
+fi
+# Every name the pinned libhsa NEEDs, plus the sysdeps' own deps. ldd on the box: all four of the first group
+# are "not found" with the file alone.
+libhsa_set="libhsa-runtime64.so.1 librocm_sysdeps_elf.so.1 librocm_sysdeps_drm.so.2 \
+librocm_sysdeps_drm_amdgpu.so.1 librocm_sysdeps_numa.so.1 librocprofiler-register.so.0 \
+librocm_sysdeps_z.so.1 librocm_sysdeps_zstd.so.1 librocm_sysdeps_liblzma.so.5 librocm_sysdeps_bz2.so"
+if [ -n "$libhsa_dir" ]; then
+    miss=""
+    for f in $libhsa_set; do [ -f "$libhsa_dir/$f" ] || miss="$miss $f"; done
+    [ -z "$miss" ] || {
+        echo "build: REFUSED: LIBHSA_DIR=$libhsa_dir is missing:$miss" >&2
+        echo "build:         (the release kit's 1bit-llama directory holds the full set beside its libhsa)" >&2
+        exit 1
+    }
+fi
+# The release public key that verifies the sealed NPU sets' manifests, and the engine scripts the U4/U6 rows
+# need inside the image. All public material: the private seal key never enters the image or the container.
+sealpub=${SEALPUB:-$HOME/.config/1bit-npu-key/seal.pub}
+[ -f "$sealpub" ] || {
+    echo "build: no release seal public key at $sealpub (tools/seal_manifest.py keygen writes one)" >&2; exit 1; }
+repo=$(cd "$recipe/../../.." && pwd)   # the engine tree: os/mini/release-check.sh, tools/seal_manifest.py
+[ -f "$repo/os/mini/release-check.sh" ] || { echo "build: $repo does not look like the engine tree" >&2; exit 1; }
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
 echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
+# The container side is its own file (os/v3/puppy/container-build.sh, mounted at /recipe) since 2026-11-02:
+# it was a 300-line single-quoted `bash -c '...'` string here, where one apostrophe in a comment ended the
+# quote and bash reported a syntax error a hundred lines away - five builds in this lane, two of them in
+# cycle 13 - and where shellcheck could not check it at all. Parsing it here costs a second and catches a
+# broken recipe before the image pull and the 20-minute downloads.
+[ -f "$recipe/container-build.sh" ] || { echo "build: no $recipe/container-build.sh" >&2; exit 1; }
+bash -n "$recipe/container-build.sh" || { echo "build: REFUSED: $recipe/container-build.sh does not parse" >&2; exit 1; }
 exec docker run --rm --privileged --memory=12g --cpus=4 \
     -v "$woof":/woof:ro -v "$build_root":/work -v "$kernel":/kernels:ro -v "$out":/out \
-    ${LOOP_DEVICE:+--device /dev/loop-control:/dev/loop-control} \
-    -e COMPAT="$compat" ubuntu:24.04 bash -c '
-set -euo pipefail
-export DEBIAN_FRONTEND=noninteractive HOME=/root XDG_CONFIG_HOME=/root/.config GITHUB_ACTIONS=true
-apt-get update -qq
-apt-get install -y -qq --no-install-recommends build-essential libc6-dev dc debootstrap librsvg2-bin \
-    zstd xml2 syslinux-utils xorriso squashfs-tools wget curl git ca-certificates xz-utils file psmisc \
-    sudo mtools dosfstools cpio
-echo "dash dash/sh boolean false" | debconf-set-selections
-dpkg-reconfigure dash >/dev/null 2>&1 || true
-ln -sf bash /bin/ash
-# the whole build happens in /work, which is a host filesystem (ext4), so the petbuild overlay mounts work
-cp -a /woof /work/woof-CE
-cd /work/woof-CE
-mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
-[ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
-[ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
-install -m 755 local-repositories/vercmp /usr/local/bin/vercmp
-install -D -m 644 woof-code/rootfs-skeleton/usr/local/petget/categories.dat /usr/local/petget/categories.dat
-# initrd-progs packs its initrd with `find . | cpio -o -H newc > ../initrd 2>/dev/null`, so without cpio the
-# redirect still creates ../initrd, empty, and gzip obligingly compresses it to 27 bytes: the build stays
-# green all the way to a bootable-looking ISO whose initrd has 0 entries (paid for on attempt 7). The
-# package list above carries cpio; this refuses rather than producing that ISO again.
-command -v cpio >/dev/null || { echo "build: cpio missing, the initrd would come out empty" >&2; exit 1; }
-echo "== merge2out $COMPAT"
-# yes | cmd under pipefail: when merge2out exits, yes gets SIGPIPE and the pipeline fails, so the
-# status has to be taken from merge2out and not from yes
-set +o pipefail
-yes "" | ./merge2out woof-distro/x86_64/ubuntu/"$COMPAT"
-set -o pipefail </dev/null
-cd ../woof-out_*
-echo "== our kernel into kernel-kit/output"
-mkdir -p kernel-kit/output
-cp /kernels/huge-*.tar.* kernel-kit/output/
-ls -l kernel-kit/output/
-echo "== 0setup"; ./0setup </dev/null
-echo "== 1download"; ./1download </dev/null
-echo "== 2createpackages"; ./2createpackages </dev/null
-echo "== 3builddistro"; ./3builddistro release </dev/null
-echo "== output"
-ls -l woof-output-* 2>/dev/null | head -20
-cp -f woof-output-*/*.iso woof-output-*/*.sfs /out/ 2>/dev/null || true
-# the frugal/persistent install - the installed mode 1bit OS wants - is these SFS files on a partition,
-# with no installer writing a rootfs at all, so they belong in <out-dir> next to the ISO. 3builddistro
-# leaves them in sandbox3/build/ for the ISO, which is why they are not in woof-output-*.
-cp -f sandbox3/build/*.sfs /out/ 2>/dev/null || true
-echo "== in /out:"; ls -l /out
-'
+    -v "$recipe":/recipe:ro -v "$repo":/repo:ro -v "$sealpub":/seal.pub:ro \
+    ${payload:+-v "$payload":/payload:ro} \
+    ${payload:+-e PAYLOAD=/payload -e PAYLOAD_NAME="$(basename "$payload")"} \
+    ${libhsa_dir:+-v "$libhsa_dir":/libhsa-runtime:ro} \
+    ${libhsa_dir:+-e LIBHSA_DIR=/libhsa-runtime} \
+    --device /dev/loop-control:/dev/loop-control \
+    -e COMPAT="$compat" ubuntu:24.04 bash /recipe/container-build.sh

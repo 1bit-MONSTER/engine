@@ -1,0 +1,40 @@
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# Rows appended to woof-CE's DISTRO_PKGS_SPECS table by build.sh, before 0setup.
+# Format: yes|<generic name>|<comma-separated distro packages>|<splits>||deps:yes
+# No comments inside the table: 0setup reads it as a shell list of pipe-separated rows, so the "why" for
+# each row lives here, above the blank line, and nowhere else.
+#
+# Measured 2026-11-02 on the resolute64 rootfs (build root sandbox3/rootfs-complete, 1.5 GB) that the merged
+# package set does NOT carry, and that TPUPPY-RELEASE needs:
+#   U1  sudo            - absent from the rootfs and from the table entirely
+#   U1  apt             - absent; libapt-pkg7.0 only arrives as a dependency of xserver_xorg, so `apt` is
+#                         a missing binary, not a missing library ("sh: sudo: not found" on c20 was this
+#                         class of gap)
+#   U4  mokutil         - absent; the release check's Secure Boot row needs it to read the state
+#   U7  openssh-server  - absent (only openssh-client has a row), so the stick cannot be checked over ssh
+#
+#   U6  fdisk           - measured on the built rootfs: /usr/sbin/fdisk is there and /usr/sbin/sfdisk is
+#                         NOT, so 1bit-install cannot write a GPT (the 26.04 split ships both in the fdisk
+#                         package; the file that survives woof-CE's splitting is the one with a spec row)
+#
+# bash, dpkg, python3, efibootmgr, jwm, rox, xterm and curl are already in the merged set (measured).
+
+yes|apt|apt|exe,dev>null,doc>null,nls>null||deps:yes
+yes|sudo|sudo|exe,dev>null,doc>null,nls>null||deps:yes
+yes|mokutil|mokutil|exe,dev>null,doc>null,nls>null||deps:yes
+yes|openssh-server|openssh-server|exe,dev>null,doc>null,nls>null||deps:yes
+yes|fdisk|fdisk|exe,dev>null,doc>null,nls>null||deps:yes

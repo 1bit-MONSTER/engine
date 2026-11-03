@@ -467,6 +467,27 @@ float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
  *
  * Returns the number of argument widths found (0..3), or -1 when the file is not a 32-bit
  * little-endian ELF or has no .dynsym.  out[] entries that were not declared stay 0. */
+/* Which launch family does an artifact's declaration describe?
+ *
+ * The forge-built q4_1 GEMV family takes (weights, activations, outputs) = (a whole tile stream,
+ * K bf16, N f32) and its .dynsym symbols are PER CORE: measured 2026-11-02 on the OGA 0.5B pack's
+ * five ELFs, arg0 and arg2 are 1/cores of the stream and of the output, while arg1 (the whole
+ * activation row) is not split.  K=N=0 means "no opinion", -1 an unusable declaration.
+ *
+ * Kept here, as arithmetic over the declarations, so the rule that decides how a launch is shaped
+ * can be tested without a device or an artifact (tests/npu_elf_args_test.c).
+ */
+int q4nx_gemv_family(const uint64_t declared[3], int K, int N) {
+    if (!declared || K <= 0 || N <= 0) return 0;
+    if (K % 256 || N % 32) return 0;
+    if (!declared[0] || !declared[1] || !declared[2]) return 0;
+    const uint64_t want_w = (uint64_t)(K / 256) * (uint64_t)(N / 32) * 5120u;
+    if (want_w % declared[0]) return 0;
+    const uint64_t cores = want_w / declared[0];
+    if (cores < 1) return 0;
+    return declared[1] == (uint64_t)K * 2u && declared[2] * cores == (uint64_t)N * 4u;
+}
+
 int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]) {
     if (out) { out[0] = out[1] = out[2] = 0; }
     if (!elf || !out || n < 52) return -1;

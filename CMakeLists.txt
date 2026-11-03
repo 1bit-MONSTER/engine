@@ -608,6 +608,16 @@ add_executable(npu_forward_loader_test tests/npu_forward_loader_test.c npu/forwa
 target_include_directories(npu_forward_loader_test PRIVATE npu/forward/include)
 target_link_libraries(npu_forward_loader_test PRIVATE m)
 add_test(NAME npu_forward_loader COMMAND npu_forward_loader_test)
+# The activation rotation a folded container needs (npu/forward/include/hadamard.h): its SIMD path must be
+# bit-identical to the shipped scalar loop on every shape a container carries, and the scalar loop must still
+# be the Hadamard transform.  Header only, no device, no model: runs in CI.
+add_executable(hadamard_rotate_test tests/hadamard_rotate_test.cpp)
+target_include_directories(hadamard_rotate_test PRIVATE npu/forward/include)
+add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
+# ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind the new
+# binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
+# workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
+add_dependencies(npu_forward_loader_test hadamard_rotate_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

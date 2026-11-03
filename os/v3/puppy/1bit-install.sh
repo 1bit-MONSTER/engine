@@ -180,9 +180,32 @@ umount "$ESP_MOUNT" || fail "cannot flush the new ESP"
 umount "$DATA_MOUNT" || fail "cannot flush the new data partition"
 
 say "== 7/7 firmware boot entry (#709)"
-new=$(efibootmgr -c -d "$dev" -p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI' 2>> "$LOG" |
-      sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\).*/\1/p' | head -1)
-[ -n "$new" ] || fail "efibootmgr could not create the 1bit OS entry (its output is in $LOG)"
+# engine#866: `efibootmgr -c` prints the WHOLE updated list, so the first Boot#### in it is whatever already existed -
+# on the measured machine Boot0000 BootManagerMenuApp - and BootNext/-Order then pointed at the UEFI menu, which on a
+# headless box waits for input for ever. So the entry is created first, then found again by the two things that
+# identify THIS one: the label it was created with and this disk's ESP partition GUID, which is what the firmware
+# prints in `efibootmgr -v` as HD(1,GPT,<partuuid>,...).
+esppart=$(blkid -s PARTUUID -o value "${dev}1" 2> /dev/null | head -1)
+[ -n "$esppart" ] || fail "cannot read the ESP's PARTUUID on ${dev}1, so the created entry cannot be identified"
+efibootmgr -c -d "$dev" -p 1 -L "1bit OS" -l '\EFI\BOOT\BOOTX64.EFI' >> "$LOG" 2>&1
+fwm=$(efibootmgr -v 2> /dev/null)
+new=$(printf '%s\n' "$fwm" | sed -n "s/^Boot\([0-9A-Fa-f]\{4\}\)\* 1bit OS.*${esppart}.*/\1/p" | head -1)
+if [ -z "$new" ]; then
+    # No entry carries this disk's GUID. Either the firmware does not print HD(1,GPT,...) in -v, or the creation did
+    # not land - and the two must not be confused, because the wrong answer is the bug this step exists to avoid. A
+    # label-only fallback is taken ONLY when the firmware shows no PARTUUID anywhere; a fresh entry is appended, so
+    # its id is the last label match.
+    if ! printf '%s\n' "$fwm" | grep -q 'HD([0-9]*,GPT,'; then
+        new=$(printf '%s\n' "$fwm" | sed -n 's/^Boot\([0-9A-Fa-f]\{4\}\)\* 1bit OS.*/\1/p' | tail -1)
+        [ -n "$new" ] && say "   (this firmware prints no partition GUID in efibootmgr -v; matched the label, last entry)"
+    fi
+fi
+[ -n "$new" ] || {
+    efibootmgr >> "$LOG" 2>&1; printf '%s\n' "$fwm" >> "$LOG"
+    fail "no firmware entry for 1bit OS on $dev (ESP PARTUUID $esppart) - the list is in $LOG"; }
+# and it must still be the right one: the id comes from the firmware, not from our own arithmetic
+printf '%s\n' "$fwm" | grep -q "^Boot$new\* 1bit OS" ||
+    fail "Boot$new is not the 1bit OS entry (list in $LOG)"
 order=$(efibootmgr 2> /dev/null | sed -n 's/^BootOrder: //p' | head -1)
 rest=$(printf '%s' "$order" | tr ',' '\n' | grep -v "^$new$" | tr '\n' ',' | sed 's/,$//')
 efibootmgr -o "$new${rest:+,$rest}" >> "$LOG" 2>&1 || fail "efibootmgr could not set BootOrder"

@@ -452,6 +452,16 @@ rows = [
                      "[ \"$t\" -ge 1 ] && [ \"$r\" -ge 1 ] && [ \"$k\" = 1 ] && [ \"$m\" = 1 ] && "
                      "echo webapp-thinking-and-picker",
                      "webapp-thinking-and-picker"),
+    # Cycle 18 item 4 (the owner: "when you first boot the headless there is no data to display on how to
+    # connect, just the menu"): the screen a person sees must carry the CONNECT block - the address, the web UI,
+    # the API base, the key's location, ssh and the mobile app - not just the menu. Read off tty1's own VGA
+    # buffer, the same surface the U2 tty1 row uses, so this is the screen and not the script.
+    ("U2 menu connect", "s=$(1bit-tty1 1); printf '%s\\n' \"$s\" | head -10; "
+                     "for w in CONNECT 'web UI http://' 'api  http://' 'ssh  root@' 'Lemonade Mobile'; do "
+                     "printf '%s' \"$s\" | grep -qF \"$w\" || echo missing-\"$w\"; done; "
+                     "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "
+                     "echo menu-connect-block",
+                     "menu-connect-block"),
     # Cycle 17 item 3: the appliance's name is /etc/hostname, not the DHCP server's opinion - connman's
     # AllowHostnameUpdates defaults to true, which is the one path a name nobody typed can take.
     ("U1 hostname pin", "grep -n '^AllowHostnameUpdates' /etc/connman/main.conf; "

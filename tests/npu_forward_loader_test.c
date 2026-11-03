@@ -105,6 +105,28 @@ int main(void) {
         check(1, "an unterminated header is parsed inside the file");
         if (m) model_free(m);
     }
+    {   /* engine#845: the importer's own manifest lives under `__metadata__` and repeats every
+         * tensor's name, dtype and shape (a `q4_1` source dtype, no data_offsets).  A flat walk of
+         * the JSON paired those records with the real table and resolved this model's embedding to
+         * a 4-bit descriptor over the next tensor's bytes, so init failed on a dequant of the wrong
+         * thing.  The real table must win, and the manifest must contribute no tensor at all. */
+        const char* h =
+            "{\"__metadata__\":{\"format\":\"q4nx\",\"tensors\":["
+            "{\"name\":\"model.embed_tokens.weight\",\"dtype\":\"q4_1\",\"shape\":[8,4]},"
+            "{\"name\":\"lm_head.weight\",\"dtype\":\"q4_1\",\"shape\":[8,4]}]},"
+            "\"model.embed_tokens.weight\":{\"dtype\":\"BF16\",\"shape\":[8,4],\"data_offsets\":[0,64]}}";
+        ModelWeights* m = load(write_file("meta.q4nx", strlen(h), h, 64));
+        check(m != NULL, "a container with a __metadata__ manifest loads");
+        if (m) {
+            TensorDesc* t = model_tensor_by_name(m, "model.embed_tokens.weight");
+            check(t && strcmp(t->dtype, "BF16") == 0 && t->data_size == 64,
+                  "the real tensor table wins over the manifest record with the same name");
+            TensorDesc* lm = model_tensor_by_name(m, "lm_head.weight");
+            check(lm == NULL || lm->data_size == 0,
+                  "a manifest entry creates no tensor of its own");
+            model_free(m);
+        }
+    }
     {   /* reversed, wrapping and past-the-end data_offsets */
         const char* cases[][2] = {
             {"rev.q4nx", "{\"w.weight\":{\"dtype\":\"BF16\",\"shape\":[4],\"data_offsets\":[8,0]}}"},

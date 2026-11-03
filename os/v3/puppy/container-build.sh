@@ -48,6 +48,24 @@ cp -a /woof /work/woof-CE
 # root-owned tree. It also keeps the image's ownership policy true from the first file.
 chown -R 0:0 /work/woof-CE
 cd /work/woof-CE
+# OWNERSHIP (pi-prs, blocker) second half: 3builddistro unpacks the PET packages into rootfs-complete AFTER the
+# skeleton chown below, and mksquashfs keeps whatever ownership it finds - the frugalpup docs arrived owned by
+# 6975/2030 and the packed-SFS check refused exactly those three files on cycle 16d. So the trees are normalised
+# immediately before woof-CE packs them. -all-root is not available here (SFSCOMP is woof-CE's own), so the tree is
+# chowned; the patch is idempotent, counted, and `bash -n`'d, because a silently unapplied patch would be a silent
+# regression of a security fix.
+if ! grep -q '1bit: ownership before pack' woof-code/3builddistro; then
+    sed -i \
+        -e 's@^\(\s*\)mksquashfs rootfs-complete @\1chown -R 0:0 rootfs-complete 2>/dev/null || true   # 1bit: ownership before pack\n\1mksquashfs rootfs-complete @' \
+        -e 's@^\(\s*\)mksquashfs sandbox3/devx @\1chown -R 0:0 sandbox3/devx 2>/dev/null || true   # 1bit: ownership before pack\n\1mksquashfs sandbox3/devx @' \
+        woof-code/3builddistro
+fi
+n=$(grep -c '1bit: ownership before pack' woof-code/3builddistro)
+[ "$n" = 2 ] || {
+    echo "build: REFUSED: the woof-CE ownership patch landed $n times in woof-code/3builddistro (expected 2) - upstream changed, re-measure" >&2
+    exit 1; }
+bash -n woof-code/3builddistro || { echo "build: REFUSED: the patched 3builddistro does not parse" >&2; exit 1; }
+echo "   ok: 3builddistro chowns rootfs-complete and devx before packing them"
 mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
 [ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
 [ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -

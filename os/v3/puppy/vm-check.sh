@@ -241,7 +241,24 @@ if not wait_shell(240):
         print("FAIL boot           no serial shell: no 21serial-console in the image, or it never ran", flush=True)
     sys.exit(2)
 buf = b""   # the menu and the boot log are not row output
-s.sendall(b"\n")
+
+# The shell has to be READY FOR INPUT, not merely started: 21serial-console spawns it and prints its banner, and
+# bash's readline setup then flushes the tty's pending input (TCSAFLUSH). A row sent in that window is simply
+# discarded - measured on the cycle-15 image, where the first row sat waiting its whole 180 s and every row after
+# it read one exchange behind (that shift is what a silent lost line looks like in a row table). So: a handshake.
+# Each attempt sends a unique token and waits for it; only a shell that answers has finished initialising.
+def handshake(tries=30):
+    for i in range(tries):
+        token = "1BIT-READY-%d" % i
+        s.sendall(("echo %s\n" % token).encode())
+        if read_until(token.encode(), 12) is not None:   # the echo alone proves the shell is reading
+            return True
+    return False
+
+if not handshake():
+    print("FAIL boot           the serial shell never answered a handshake (the harness would lose every row)",
+          flush=True)
+    sys.exit(2)
 
 rows = [
     # Secure Boot is what the board runs: the chain shim -> grub -> kernel has to verify, and the guest has to
@@ -484,8 +501,18 @@ for idx, row in enumerate(rows):
     # The sentinel is expanded by the shell, so the terminal's echo of the command line shows
     # "__DONE_$(date +%s%N)__" and only the real answer carries digits. A literal sentinel matched its own
     # echo: every row after the first came back with an empty body and was reported as a failure.
-    s.sendall((cmd + "; echo __DONE_$(date +%s%N)__\n").encode())
-    out = read_until_re(rb"__DONE_[0-9]{10,}__", limit)
+    # A row is sent once, and once again if it got no answer: a LINE THAT NEVER RAN must not move every row after
+    # it one exchange out of step, which is what a silently discarded line looks like in a row table (measured on
+    # the cycle-15 image before 21serial-console stopped using readline: row 1 waited its whole 180 s, and rows 2..n
+    # each reported the PREVIOUS row's output). The resend is the harness being suspicious of its own transport.
+    out = None
+    for attempt in (1, 2):
+        s.sendall((cmd + "; echo __DONE_$(date +%s%N)__\n").encode())
+        out = read_until_re(rb"__DONE_[0-9]{10,}__", limit)
+        if out is not None:
+            break
+        if attempt == 1:
+            print("INFO %-13s no answer in %ss, sending it again" % (name, limit), flush=True)
     if out is None:
         print("FAIL %-13s no answer" % name, flush=True)
         continue

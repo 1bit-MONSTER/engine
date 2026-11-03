@@ -24,6 +24,18 @@
 # It is opt-in because a root shell needs no password: append 1bit.serial=1 to the kernel command line
 # (GRUB edit, or the QEMU -append). Without it this script does nothing.
 grep -q '1bit.serial=1' /proc/cmdline 2>/dev/null || exit 0
-setsid sh -c 'exec /bin/sh -l < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+# The shell is started with NO readline and TERM=dumb, and that is a fix, not a preference. Cycle 15 measured what
+# readline costs on this wire: bash 5.3's interactive mode toggles bracketed-paste around every prompt
+# (`?2004h`/`?2004l`), and a line that arrives during that toggle is flushed mid-way by the terminal's
+# TCSAFLUSH - the shell then sits at a `>` continuation prompt with an unterminated quote and executes nothing.
+# Over a serial cable that is exactly what an administrator's paste looks like, and it broke the automated row
+# driver: its first row vanished for 180 s and every row after it read one exchange behind.
+# `--noediting` removes readline entirely, so there is nothing to toggle and nothing to flush; TERM=dumb keeps
+# bash's shell-integration escapes off the wire as well. A serial admin shell wants lines, not line editing.
+if [ -x /bin/bash ]; then
+	setsid sh -c 'TERM=dumb exec /bin/bash --noediting -i < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+else
+	setsid sh -c 'TERM=dumb exec /bin/sh -l < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+fi
 # said on ttyS0 directly: rc.services' stdout at this point is not necessarily the console
 echo "21serial-console: root shell on ttyS0 (1bit.serial=1 on the command line)" > /dev/ttyS0

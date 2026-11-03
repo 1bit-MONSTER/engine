@@ -321,8 +321,14 @@ if [ -n "${PAYLOAD:-}" ]; then
         echo "build: REFUSED: the image has no /usr/local/bin/1bit-console-menu - tty1 would respawn nothing" >&2; exit 1; }
     # and it has to be EXECUTABLE in the packed SFS: init skips a non-executable script in silence, which is the
     # trap the Lemonade service and 03onboard-efivars already paid for
-    unsquashfs -ll sandbox3/build/puppy_*.sfs 2>/dev/null |
-        grep -q '^-rwxr-xr-x .*usr/local/bin/1bit-console-menu$' || {
+    # Written to a file and grepped THERE, for the reason spelled out above: under `set -o pipefail` a
+    # `producer | grep -q` pipeline reports 141 as soon as grep matches and exits, so the producer takes SIGPIPE
+    # and the check reads "not in the image" for a file that is in the image. That is exactly what happened on the
+    # first cycle-15 build: it refused its own good SFS (measured: the packed line is
+    # `-rwxr-xr-x root/root 23818 ... squashfs-root/usr/local/bin/1bit-console-menu`). The existing listing above
+    # already avoids this; this check did not.
+    unsquashfs -ll sandbox3/build/puppy_*.sfs > /tmp/1bit-sfs-long 2> /dev/null || true
+    grep -q '^-rwxr-xr-x .*usr/local/bin/1bit-console-menu$' /tmp/1bit-sfs-long || {
         echo "build: REFUSED: the packed 1bit-console-menu is not executable" >&2; exit 1; }
     echo "   ok: the console menu is in the image and executable (tty1's whole surface on a headless boot)"
 fi

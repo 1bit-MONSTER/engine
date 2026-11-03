@@ -55,6 +55,18 @@ PROG2='*** 1bit: system in RAM after'
 
 rescue_block() {
 cat <<'ONEBLOCK'
+# 1bit: say it on every console a person might be watching. Since cycle 15 the boot line ends with
+# `console=ttyS0,115200 console=tty0`, and the LAST console= is what /dev/console resolves to - the screen. That
+# fixed the owner's "it hangs hard here" (the progress lines had been going to the serial port only) and broke the
+# other half: a userspace write to /dev/console no longer reaches ttyS0, so a headless box on a serial cable - and
+# the VM harness, which drives the guest over ttyS0 - saw nothing. Measured on the cycle-15 image: `U8 boot
+# progress` failed with "the console never said what it was doing" while the same lines were on tty0.
+one_console() {
+	for ONE_C in /dev/console /dev/ttyS0; do
+		[ -e "$ONE_C" ] && printf '%s\n' "$*" > "$ONE_C" 2>/dev/null
+	done
+	return 0
+}
 # 1bit: PID 1 must never exit. Measured on the 2026-11-02 board boot: this script's failure path is
 # `exec /bin/sh`, a shell that reads EOF exits 0, and PID 1 exiting is a kernel panic
 # ("Attempted to kill init! exitcode=0x00000000"). one_rescue is the only way out now.
@@ -62,8 +74,8 @@ ONE_RESCUE_LABEL='1BIT-DATA'
 ONE_RESCUE_MT='/mnt/1bit-rescue'
 one_rescue() {
 	ONE_STATUS=${1:-0}
-	echo "" > /dev/console
-	echo "*** 1bit: init stopped (status $ONE_STATUS) - logging, and this console stays" > /dev/console
+	one_console ""
+	one_console "*** 1bit: init stopped (status $ONE_STATUS) - logging, and this console stays"
 	ONE_P=$(blkid 2>/dev/null | grep -m1 "LABEL=\"$ONE_RESCUE_LABEL\"" | cut -d: -f1)
 	[ "$ONE_P" ] || { sleep 3; ONE_P=$(blkid 2>/dev/null | grep -m1 "LABEL=\"$ONE_RESCUE_LABEL\"" | cut -d: -f1); }
 	if [ "$ONE_P" ] && mkdir -p $ONE_RESCUE_MT && mount "$ONE_P" $ONE_RESCUE_MT 2>/dev/null; then
@@ -74,13 +86,13 @@ one_rescue() {
 			echo "--- dmesg"; dmesg 2>/dev/null
 		} > $ONE_RESCUE_MT/init-fail.log 2>/dev/null
 		sync
-		echo "*** 1bit: log written to $ONE_RESCUE_LABEL:/init-fail.log" > /dev/console
+		one_console "*** 1bit: log written to $ONE_RESCUE_LABEL:/init-fail.log"
 	else
-		echo "*** 1bit: $ONE_RESCUE_LABEL not mountable - the log is only in /tmp/bootinit.log" > /dev/console
+		one_console "*** 1bit: $ONE_RESCUE_LABEL not mountable - the log is only in /tmp/bootinit.log"
 	fi
 	while : ; do
-		echo "*** 1bit rescue: this console stays alive. 'reboot -f' restarts; the log is on" \
-			"$ONE_RESCUE_LABEL:/init-fail.log" > /dev/console
+		one_console "*** 1bit rescue: this console stays alive. 'reboot -f' restarts; the log is on" \
+			"$ONE_RESCUE_LABEL:/init-fail.log"
 		/bin/sh </dev/console >/dev/console 2>&1
 		sleep 5
 	done
@@ -106,6 +118,10 @@ verify_initrd() {
     [ "$n" = 3 ] || { rm -rf "$tmp"; die "$gz: /init has $n of the 3 failure paths guarded"; }
     grep -q "$PROG1" "$tmp/init" && grep -q "$PROG2" "$tmp/init" || {
         rm -rf "$tmp"; die "$gz: /init has no 1bit boot-progress lines (the console says nothing while the SFS copy to RAM runs)"; }
+    # and they (and the rescue messages) have to reach BOTH consoles: /dev/console is the screen now, and a
+    # headless box on a serial cable - the VM rows, and the panic-repro harness - reads ttyS0
+    grep -q 'one_console()' "$tmp/init" && grep -q "one_console \"$PROG1" "$tmp/init" || {
+        rm -rf "$tmp"; die "$gz: /init writes the progress lines to /dev/console only (nothing on ttyS0 for a headless box)"; }
     rm -rf "$tmp"
     echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, and both progress lines"
 }
@@ -162,12 +178,12 @@ patch_progress() {
         /^#- handle pfix=copy pfix=ram pfix=nocopy/ && !d1 {
             print "\t# 1bit: say what the console is waiting for (pfix=copy copies the SFS into RAM at the medium speed)"
             print "\tread up _ < /proc/uptime"
-            print "\techo \"'"$PROG1"' at ${up}s: with pfix=copy the SFS are copied into RAM, which is the slow part on USB\" > /dev/console"
+            print "\tone_console \"'"$PROG1"' at ${up}s: with pfix=copy the SFS are copied into RAM, which is the slow part on USB\""
             d1 = 1
         }
         /^echo "PUPMODE=\$PUPMODE"/ && !d2 {
             print "\tread up _ < /proc/uptime"
-            print "\techo \"'"$PROG2"' ${up}s; PUPMODE=$PUPMODE\" > /dev/console"
+            print "\tone_console \"'"$PROG2"' ${up}s; PUPMODE=$PUPMODE\""
             d2 = 1
         }
         { print }

@@ -373,6 +373,38 @@ int main() {
         }
     }
 
+    // [9] the live-vs-offline depth verdict: a depth with no denominator on a side is UNSCORED, not 0.00 %.
+    // The old rule, kept here so the bug stays stated: a missing denominator became 0.00 %, so two tables that both
+    // measured nothing compared equal to each other and counted as a pass.  The counts are p0's tau=0.6 chain
+    // (`per-depth p0: 1 30/34 2 1/1 3 0/0 4 0/0`, TMTPLOOP-STATE 2026-11-02 16:50): the chain gate stops at depth 2,
+    // so at the time this read "4 of 4 depths within 2 pp" for a comparison that scored 2 depths.
+    {
+        auto legacy_within = [](int lh, int lr, int oh, int orr) {
+            const double lv = lr ? 100.0 * lh / lr : 0.0;
+            const double of = orr ? 100.0 * oh / orr : 0.0;
+            return (lv - of) <= 2.0 && (lv - of) >= -2.0;
+        };
+        check(legacy_within(0, 0, 0, 0), "verdict: the OLD rule calls an unscored depth a pass (the defect)");
+        const int lh[4] = {30, 1, 0, 0}, lr[4] = {34, 30, 0, 0};       // accepted_at[d], reached[d]
+        const int oh[4] = {30, 1, 0, 0}, ot[4] = {34, 30, 0, 0};       // offline c_hit[d], c_tot[d]
+        check(!onebit::npu::mtp::depth_verdict(lh[2], lr[2], oh[2], ot[2]).scored, "verdict: 0/0 is n/a, not a pass");
+        check(!onebit::npu::mtp::depth_verdict(0, 0, 5, 9).scored, "verdict: live reached nothing -> n/a");
+        check(!onebit::npu::mtp::depth_verdict(5, 9, 0, 0).scored, "verdict: offline scored nothing -> n/a");
+        int scored = 0, within = 0;
+        for (int d = 0; d < 4; d++) {
+            const auto v = onebit::npu::mtp::depth_verdict(lh[d], lr[d], oh[d], ot[d]);
+            if (!v.scored) continue;
+            scored++;
+            if (v.within) within++;
+        }
+        check(scored == 2 && within == 2, "verdict: the tau=0.6 chain scores 2 depths, never 4");
+        const auto gap = onebit::npu::mtp::depth_verdict(40, 100, 60, 100);
+        check(gap.scored && !gap.within && gap.delta < -19.9 && gap.delta > -20.1,
+              "verdict: a real 20 pp gap still fails, by its own amount");
+        std::printf("INFO verdict tau=0.6 shape: %d of 4 depths scored, %d within 2 pp (old rule said 4 of 4)\n", scored,
+                    within);
+    }
+
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);
     return fails ? 1 : 0;
 }

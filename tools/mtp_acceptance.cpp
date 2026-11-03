@@ -615,14 +615,18 @@ int main(int argc, char** argv) {
                 for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
                     const double joint = r.stats.drafted_at[d] ? 100.0 * r.stats.accepted_at[d] / r.stats.drafted_at[d] : 0.0;
                     const int reached = d ? r.stats.accepted_at[d - 1] : r.stats.drafted_at[0];
-                    const double lv = reached ? 100.0 * r.stats.accepted_at[d] / reached : 0.0;
-                    const double oc = m.c_tot[d] ? 100.0 * m.c_hit[d] / m.c_tot[d] : 0.0;
+                    const DepthVerdict v = depth_verdict(r.stats.accepted_at[d], reached, m.c_hit[d], m.c_tot[d]);
                     const double om = m.d_tot[d] ? 100.0 * m.d_hit[d] / m.d_tot[d] : 0.0;
-                    const double delta = lv - oc;
+                    if (!v.scored) {   // no chain on one side: 0/0 is not agreement (see depth_verdict)
+                        std::printf("    depth %d: n/a (live %d/%d reached, offline %d/%d)  not scored"
+                                    "   [live joint %6.2f %%, offline marginal %6.2f %%]\n",
+                                    d + 1, r.stats.accepted_at[d], reached, m.c_hit[d], m.c_tot[d], joint, om);
+                        continue;
+                    }
                     std::printf("    depth %d: live %6.2f %% (%d/%d, reached)  offline conditional %6.2f %% (%d/%d)"
                                 "  delta %+6.2f pp%s   [live joint %6.2f %%, offline marginal %6.2f %%]\n",
-                                d + 1, lv, r.stats.accepted_at[d], reached, oc, m.c_hit[d], m.c_tot[d],
-                                delta, (delta <= 2.0 && delta >= -2.0) ? "" : "  > 2 pp", joint, om);
+                                d + 1, v.live, r.stats.accepted_at[d], reached, v.offline, m.c_hit[d], m.c_tot[d],
+                                v.delta, v.within ? "" : "  > 2 pp", joint, om);
                 }
                 // ...and the form that needs no estimator at all: per chain position, how many drafts were accepted
                 // before the first refusal.  Identical machinery must give identical prefix lengths at every
@@ -712,22 +716,26 @@ int main(int argc, char** argv) {
         if (match_mode) {
             // The brief's clause, measured instead of argued: the same drafter on the same stream at the same
             // positions, so the only difference left is how the live loop feeds it.
-            int over = 0;
+            int over = 0, scored = 0;
             std::printf("   == live vs offline at the SAME positions, per-depth acceptance CONDITIONAL on reaching"
                         " the depth (the 2 pp bar):\n");
             for (int d = 0; d < k && d < Stats::kMaxDepth; d++) {
                 const int reached = d ? acc_live[d - 1] : draft_live[0];
-                const double lv = reached ? 100.0 * acc_live[d] / reached : 0.0;
-                const double of = matched.c_tot[d] ? 100.0 * matched.c_hit[d] / matched.c_tot[d] : 0.0;
-                const double delta = lv - of;
-                const bool ok = (delta <= 2.0 && delta >= -2.0);
-                if (!ok) over++;
+                const DepthVerdict v = depth_verdict(acc_live[d], reached, matched.c_hit[d], matched.c_tot[d]);
+                if (!v.scored) {   // 0/0 used to read as "delta +0.00 pp PASS" and inflate the bar
+                    std::printf("     depth %d: n/a (live %d/%d reached, offline %d/%d)  not scored\n", d + 1,
+                                acc_live[d], reached, matched.c_hit[d], matched.c_tot[d]);
+                    continue;
+                }
+                scored++;
+                if (!v.within) over++;
                 std::printf("     depth %d: live %6.2f %% (%d/%d)  offline %6.2f %% (%d/%d)  delta %+6.2f pp  %s\n",
-                            d + 1, lv, acc_live[d], reached, of, matched.c_hit[d], matched.c_tot[d], delta,
-                            ok ? "PASS" : "FAIL");
+                            d + 1, v.live, acc_live[d], reached, v.offline, matched.c_hit[d], matched.c_tot[d],
+                            v.delta, v.within ? "PASS" : "FAIL");
             }
-            std::printf("   %d of %d depths within 2 pp at the same positions\n",
-                        std::min(k, Stats::kMaxDepth) - over, std::min(k, Stats::kMaxDepth));
+            const int depths = std::min(k, Stats::kMaxDepth);
+            std::printf("   %d of %d scored depths within 2 pp at the same positions%s\n", scored - over, scored,
+                        scored < depths ? " (a depth with no chain on either side is n/a, never a pass)" : "");
         }
         return bad ? 1 : 0;
     }

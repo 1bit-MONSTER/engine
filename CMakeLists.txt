@@ -497,6 +497,10 @@ add_dependencies(npu_sampling_test systemone_route_test)
 
 # The plan.json loader (npu/plan/plan.h, engine #799 P1): schema, refusals and the decision fields that
 # replaced the filename probes.  No model, no container, no device.
+add_executable(npu_elf_args_test tests/npu_elf_args_test.c npu/forward/src/q4nx_pack.c)
+target_include_directories(npu_elf_args_test PRIVATE npu/forward/include)
+target_link_libraries(npu_elf_args_test PRIVATE m)
+add_test(NAME npu_elf_args COMMAND npu_elf_args_test)
 add_executable(npu_plan_test tests/npu_plan_test.cpp)
 target_include_directories(npu_plan_test PRIVATE ${CMAKE_SOURCE_DIR}/npu)
 target_link_libraries(npu_plan_test PRIVATE nlohmann_json::nlohmann_json)

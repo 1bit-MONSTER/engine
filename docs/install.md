@@ -33,12 +33,14 @@ install itself onto a disk: `1bit-install` copies the system you booted, so an i
 | | |
 |---|---|
 | stick | **16 GB or more**: the image is 9,128,902,656 bytes (8.5 GiB) and the data partition takes the rest of the stick |
-| image | `1bit-os-puppy.img.xz` + `SHA256SUMS` from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS); the [releases page](https://github.com/1bit-MONSTER/engine/releases) carries the `lemonade-onebit` package and the release notes |
+| image | `1bit-os-puppy.img.xz` + `SHA256SUMS` from [Hugging Face](https://huggingface.co/1bit-MONSTER/1bit-OS), **private until v2026.44 is published**; the [releases page](https://github.com/1bit-MONSTER/engine/releases) carries the `lemonade-onebit` package and the release notes |
 | machine | an AMD Ryzen AI MAX+ 395 (Strix Halo) box, the machine this release is built and tested on |
 | firmware | UEFI, Secure Boot **on** (see [6](#6-secure-boot-and-our-mok)) |
 
 The image is on Hugging Face, not on the GitHub release, because a GitHub release asset is capped at
-2 GiB and this one is 9,128,902,656 B written (**2,212,389,580 B** as `.img.xz`). Fetch both files, check
+2 GiB and this one is 9,128,902,656 B written (**2,212,389,580 B** as `.img.xz`). That repository is
+private until v2026.44 is published, so from that day the lines below are the download; an earlier
+release carries only the BusyBox `os/mini` image, which is the CI/VM target. Fetch both files, check
 the checksum, then write it and prepare it (the last line is what puts the API key, your SSH key and any
 models on the stick — see [1](#1-run-from-the-stick-no-install)):
 

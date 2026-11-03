@@ -32,7 +32,8 @@ on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemona
    it. The image is served from Hugging Face because a GitHub release asset is capped at 2 GiB; the
    [releases page](https://github.com/1bit-MONSTER/engine/releases) stays the home of the
    `lemonade-onebit` package, the release notes and the release `SHA256SUMS`, and links there for the
-   image.
+   image. The Hugging Face repository is private until v2026.44 is published, so until then that link
+   answers 401; from publication day this step is the download.
 2. Verify it, then write it to a USB stick (16 GB or more):
 
    ```sh

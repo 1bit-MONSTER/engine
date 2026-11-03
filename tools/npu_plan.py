@@ -38,7 +38,7 @@ import json
 import os
 import sys
 
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 FORMAT = "1bit-npu-plan/1"
 
 
@@ -115,6 +115,28 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
         entry["down"] = {"K": im, "N": hidden}
         out.append(entry)
     return out
+
+
+def attention_mode(model_dir: str) -> str:
+    """The mask the pack itself declares, from `decision_config.json` beside the model.
+
+    A d3 readout pack is trained noncausal on its full-attention layers and says so; every other model
+    on this box has no `decision_config.json` and is causal, which is also the field's default in
+    `npu/plan/plan.h`.  An unknown value is refused here rather than defaulted, because the two modes
+    produce different numbers and a guessed mask is a silently different model.
+    """
+    path = os.path.join(model_dir, "decision_config.json")
+    if not os.path.isfile(path):
+        return "causal"
+    try:
+        with open(path, "rb") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{path}: cannot read the attention mode ({exc})")
+    mode = cfg.get("attention_mode", "causal")
+    if mode not in ("causal", "noncausal_full_attention"):
+        raise SystemExit(f"{path}: attention_mode {mode!r} is not causal or noncausal_full_attention")
+    return mode
 
 
 def artifact(model_dir: str, kernels: str, name: str) -> bool:
@@ -200,6 +222,7 @@ def generate(model_dir: str, kernels: str) -> dict:
             if layout in ("pb16i", "t2s") else "",
         },
         "kernels": {"tag": tag},
+        "attention": {"mode": attention_mode(model_dir)},
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},
         "layers": layers,
     }
@@ -269,7 +292,8 @@ def main(argv=None) -> int:
         f.write(text)
     os.replace(tmp, out)
     print(f"wrote {out} ({len(plan['layers'])} layers, gate/up {plan['fusion']['gate_up']}, "
-          f"layout {plan['container']['layout']}, tag {plan['kernels']['tag'] or 'none'})")
+          f"layout {plan['container']['layout']}, tag {plan['kernels']['tag'] or 'none'}, "
+          f"attention {plan['attention']['mode']})")
     return 0
 
 

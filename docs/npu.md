@@ -75,6 +75,21 @@ directory's copy still matches. `scripts/npu-window11.sh` is the gate the change
 prompts and the prof table, compared between a run with the plan and a run without it (`--compare A B`) —
 3/3 transcripts byte-identical and every prof row within 10%.
 
+**`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
+`noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
+full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
+bidirectionally: `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
+so row *r* sees rows after it. The GDN layers keep their causal recurrence (the pack's own runtime keeps it
+too), a sliding layer stays causal, and the mode reads the same numbers only in one shape:
+
+- **the whole prompt, one batched pass, at position 0** (`POST /v1/systemone` does exactly that). A batch
+  that starts above 0 is refused by name — its earlier positions were already encoded causally.
+- **it cannot generate.** `step()` (one position at a time, keys only in the past) refuses with the mode's
+  name, so a d3 pack served on the chat route is an error rather than a silently causal answer.
+
+An unknown mode string is a plan refusal, never a default: the two modes give different numbers, and a
+guessed mask is a different model.
+
 ### Q4NX chunks
 
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on

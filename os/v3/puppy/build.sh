@@ -149,6 +149,14 @@ tui_bin=${CONSOLE_TUI_BIN:-}
 if [ -n "$tui_bin" ]; then
     [ -f "$tui_bin" ] || { echo "build: REFUSED: CONSOLE_TUI_BIN=$tui_bin does not exist" >&2; exit 1; }
     tui_bin=$(cd "$(dirname "$tui_bin")" && pwd)/$(basename "$tui_bin")
+    # container-build.sh installs and verifies the TUI inside its PAYLOAD block (it is part of the embedded
+    # appliance, not of a bare Puppy rootfs), so a build with CONSOLE_TUI_BIN and no PAYLOAD would accept the
+    # binary here and then skip it in silence - the same failure this file just fixed one layer up. Refuse it.
+    if [ -z "${payload:-}" ]; then
+        echo "build: REFUSED: CONSOLE_TUI_BIN=$tui_bin needs PAYLOAD - the console TUI is installed in the" >&2
+        echo "  embedded-package block of container-build.sh, so a plain-Puppy build would silently omit it" >&2
+        exit 1
+    fi
     echo "build: console TUI $tui_bin ($(sha256sum "$tui_bin" | cut -c1-16))"
 fi
 

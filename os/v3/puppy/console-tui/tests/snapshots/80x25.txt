@@ -1,10 +1,9 @@
 1bit OS rc-2026-11-03-c16 strix  192.168.50.110  up 2h 13m  Secure Boot enabled
  CONNECT -----------------------------------------------------------------------
-  web UI   http://192.168.50.110:13305
-  API base http://192.168.50.110:13305/api/v1
-  API key  press 1
-  ssh      root@192.168.50.110
-  mobile   Lemonade Mobile: server http://192.168.50.110:13305, key from 1
+  web UI http://192.168.50.110:13305
+  api  http://192.168.50.110:13305/api/v1   (API key: press 1)
+  ssh  root@192.168.50.110   (your key in /data/ssh/authorized_keys)
+  app  Lemonade Mobile: server http://192.168.50.110:13305 + that key
 LEMONADE up (pid 8882) http://192.168.50.110:13305 API key: set, press 1
 GPU HRX0: AMD Radeon 8060S Graphics 74158 MiB free VRAM 2G of 120G used, GTT
   512M of 61G 43C
@@ -15,6 +14,7 @@ FANS / TEMPS fans: controlled (fan1 0 rpm fan2 0 rpm) temps max 43C
 DATA 58G total, 52G free last request 330.8 tok/s, first token 10 ms 4 requests
   served
  LOGS newest -------------------------------------------------------------------
+LEM 2026-11-03 12:07:38 llama-server: listening on 127.0.0.1:8001
 LEM 2026-11-03 12:07:41 lemond: POST /api/v1/chat/completions 200 (327 tokens,
   330.75 tok/s)
 1 Show the API key   2 Quick chat test (GPU and NPU)

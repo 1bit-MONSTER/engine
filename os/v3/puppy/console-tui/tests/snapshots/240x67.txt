@@ -1,10 +1,9 @@
 1bit OS rc-2026-11-03-c16 strix  192.168.50.110  up 2h 13m  Secure Boot enabled  SoC 43C
  CONNECT ---------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------------
-  web UI   http://192.168.50.110:13305
-  API base http://192.168.50.110:13305/api/v1
-  API key  press 1
-  ssh      root@192.168.50.110
-  mobile   Lemonade Mobile: server http://192.168.50.110:13305, key from 1
+  web UI http://192.168.50.110:13305
+  api  http://192.168.50.110:13305/api/v1   (API key: press 1)
+  ssh  root@192.168.50.110   (your key in /data/ssh/authorized_keys)
+  app  Lemonade Mobile: server http://192.168.50.110:13305 + that key
  LEMONADE ---------------------------------------------------------------------- GPU --------------------------------------------------------------------------- NPU -------------------------------------------------------------------------
 up (pid 8882)                                                                   HRX0: AMD Radeon 8060S Graphics                                                 amdxdna loaded
 http://192.168.50.110:13305                                                     74158 MiB free                                                                  firmware present
@@ -20,6 +19,7 @@ KRN [ 1.100000] amdgpu 0000:c7:00.0: HRX runtime registered HRX0
 KRN [ 1.200000] amdxdna 0000:c7:00.1: firmware loaded
 LEM 2026-11-03 12:07:38 llama-server: listening on 127.0.0.1:8001
 LEM 2026-11-03 12:07:41 lemond: POST /api/v1/chat/completions 200 (327 tokens, 330.75 tok/s)
+
 
 
 

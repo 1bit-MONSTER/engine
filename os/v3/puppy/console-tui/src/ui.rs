@@ -169,6 +169,10 @@ fn header(f: &Facts) -> Line<'static> {
 /// facts on every draw, so it cannot go stale, and while the box is still coming up it says which half is
 /// missing instead of showing a URL that does not answer yet.
 pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> {
+    /// The wording is the dialog menu's own CONNECT block (cycle 18, pi-os3): vm-check's `U2 menu connect` row
+    /// greps these exact strings off tty1 (`web UI http://`, `api  http://`, `ssh  root@`, `Lemonade Mobile`), so
+    /// the two surfaces say the same thing and that row keeps passing whichever of them is on the console.
+    const IND: &str = "  ";
     let mut out = Vec::new();
     let state = if f.ips.is_empty() {
         Some(format!("waiting for network {spin}"))
@@ -184,58 +188,39 @@ pub fn connect_block(f: &Facts, spin: &str, width: usize) -> Vec<Line<'static>> 
     out.push(rule(&title, width));
 
     let host = f.ip().unwrap_or("-");
-    let body = Style::default().fg(Color::Gray);
-    let key = if f.key.is_some() {
-        "press 1"
-    } else {
-        "no key file yet (1 tells you why)"
-    };
-    let rows: Vec<(&str, String)> = vec![
-        ("web UI", format!("http://{host}:13305")),
-        ("API base", format!("http://{host}:13305/api/v1")),
-        ("API key", key.to_string()),
-        ("ssh", format!("root@{host}")),
-        (
-            "mobile",
-            format!("Lemonade Mobile: server http://{host}:13305, key from 1"),
-        ),
+    let rows = [
+        format!("web UI http://{host}:13305"),
+        format!("api  http://{host}:13305/api/v1   (API key: press 1)"),
+        format!("ssh  root@{host}   (your key in /data/ssh/authorized_keys)"),
+        format!("app  Lemonade Mobile: server http://{host}:13305 + that key"),
     ];
-    for (label, value) in rows {
-        let lead = format!("  {label:<9}");
-        let pad = lead.chars().count();
-        let indent = " ".repeat(pad);
-        let mut wrapped = wrap_words(&value, width.saturating_sub(pad).max(8));
-        if wrapped.is_empty() {
-            wrapped.push(String::new());
-        }
-        for (i, w) in wrapped.into_iter().enumerate() {
+    for value in rows {
+        let indent = IND.len();
+        let style = Style::default().fg(Color::Gray);
+        let avail = width.saturating_sub(indent).max(8);
+        // a row that fits is emitted VERBATIM: its two spaces are part of what the gate greps for (`api  http://`),
+        // and wrap_words normalises runs of spaces by design
+        let pieces = if value.chars().count() <= avail { vec![value.clone()] } else { wrap_words(&value, avail) };
+        for (i, w) in pieces.into_iter().enumerate() {
             if i == 0 {
                 out.push(Line::from(vec![
-                    Span::styled(lead.clone(), Style::default().fg(Color::Cyan)),
-                    Span::styled(
-                        w,
-                        Style::default()
-                            .fg(Color::White)
-                            .add_modifier(Modifier::BOLD),
-                    ),
+                    Span::styled(IND, Style::default().fg(Color::Cyan)),
+                    Span::styled(w, Style::default().fg(Color::White).add_modifier(Modifier::BOLD)),
                 ]));
             } else {
-                out.push(Line::from(vec![
-                    Span::raw(indent.clone()),
-                    Span::styled(w, body),
-                ]));
+                out.push(Line::from(vec![Span::raw(" ".repeat(indent)), Span::styled(w, style)]));
             }
         }
     }
 
     if f.ips.is_empty() {
         out.push(Line::from(Span::styled(
-            "  no network yet - press 3 to renew DHCP, set a static address or the hostname",
+            format!("{IND}no address yet - press 3 (Network); DHCP is automatic once a cable is in"),
             Style::default().fg(Color::Yellow),
         )));
     } else if !f.lemond_listening {
         out.push(Line::from(Span::styled(
-            "  Lemonade is not listening on 13305 yet - 8 shows its log",
+            format!("{IND}Lemonade is not answering on 13305 yet - 8 shows its log"),
             Style::default().fg(Color::Yellow),
         )));
     }
@@ -745,6 +730,22 @@ mod tests {
             assert!(
                 joined.contains(want),
                 "CONNECT block does not mention {want:?}:\n{joined}"
+            );
+        }
+    }
+
+    #[test]
+    fn the_c18_gate_row_finds_its_strings_on_this_screen() {
+        // vm-check.sh's `U2 menu connect` row (pi-os3, cycle 18) greps these fixed strings off tty1: if the TUI
+        // is what tty1 gets, that row must keep passing, so the block uses the dialog menu's own wording.
+        for (w, h) in [(240u16, 67u16), (80, 25)] {
+            let text = render_snapshot(&app(c16_board()), w, h);
+            for want in ["CONNECT", "web UI http://", "api  http://", "ssh  root@", "Lemonade Mobile"] {
+                assert!(text.contains(want), "{w}x{h}: the U2 menu connect row would go red - {want:?} is missing");
+            }
+            assert!(
+                text.contains("web UI http://192.168.50.110:13305"),
+                "{w}x{h}: the row's address regex would not match"
             );
         }
     }

@@ -632,6 +632,10 @@ add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
 add_dependencies(npu_forward_loader_test hadamard_rotate_test)
+# The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
+# statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
+# writes itself, so there is no target for the build list to miss.
+add_test(NAME npu_window11_policy COMMAND bash ${CMAKE_SOURCE_DIR}/scripts/npu-window11.sh --self-test)
 # The GEMM designs are derived on the container's K grid and the kernel's N grid (engine#845); a
 # model already on both is unchanged.  Pure arithmetic + one assemble_B, so it runs without a model.
 add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src/q4nx_pack.c)

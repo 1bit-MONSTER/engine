@@ -136,11 +136,23 @@ tensors and for any projection whose width is not a multiple of 32.
 container's `W'` already has the block Hadamard and the per-width signs baked into the weights; the
 consumer rotates the *activation* into that basis — `A' = H (A . s)`, signs first, then the normalized
 Sylvester-Walsh butterfly, then the `1/sqrt(block)` — and never touches the weight
-(`npu/forward/src/q4nx_forward.cpp::hadamard_rotate`). So a t2 tensor holds `W'` exactly as the pb16i
+(`npu/forward/include/hadamard.h`, called from `q4nx_forward.cpp`). So a t2 tensor holds `W'` exactly as the pb16i
 image does, the fold declaration stays where it belongs (the container's `q4nx_hadamard`,
 `q4nx_hadamard_block` and the `HAD1` sign table), and the chunk needs no pre/post-rotation flag: reading
 a t2 tensor in the wrong basis is a consumer bug, not a format one. The inverse direction (the tied
 embedding, `inverse_weight_names` in the pack) is `S (H y)`, which round-trips to the identity.
+
+**This rotation is host work on the critical path, so it is SIMD, and it must stay bit-identical.** It runs
+once per projection — ~430 times a decode token on Bonsai-2 — and the scalar butterfly cost 14.2 us per
+5120-float vector in-loop: 15.8 ms/token in a quiet window and 39.0 ms/token on a loaded one, i.e. pure
+CPU contention that a device-side win cannot touch. `hadamard.h` keeps the scalar loop as the reference and
+adds an AVX2 path (dispatched at run time) that performs the *same* adds and subtracts on the same operands
+in the same stage order — stages 1, 2 and 4 as an 8-lane in-register butterfly, every later stage as
+contiguous 8-lane add/sub — so the rotated vector is bit-identical and no container's text moves: 7.6 ->
+2.4 us per 5120-float vector, 40.0 -> 16.8 us per 17408-float one. `tests/hadamard_rotate_test.cpp` is the
+gate that runs on every build, on any host: bit-for-bit equality against the scalar loop for every block a
+container can carry and for the fleet's real activation widths, plus a check that the scalar loop really is
+the Hadamard transform (compared against a direct sum over the sign pattern).
 
 **The scale is fp16, not bf16, and that is load bearing.** Every source format already stores this
 scale as fp16 — PTQ1_0's, TQ1_0's and TQ2_0's `d` are `ggml_half`, and `pb16i`'s `ms * 2^e_ref` is an

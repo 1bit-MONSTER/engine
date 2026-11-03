@@ -47,6 +47,10 @@ if(ONEBIT_EP_NPU)
 
     set(_npu_src
         ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/ort/onebit_npu_gemm.cpp
+        # I8Ctx::args_fit_elf() (#869) calls q4nx_elf_arg_sizes(), implemented here.  The header is
+        # npu/forward/include (already on _npu_incs), the definition is not: without this the EP's
+        # targets compile and then fail to link, which is how #874 stayed green in CI.
+        ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/forward/src/q4nx_pack.c
         "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp"
         "${ONEBIT_NPU_RT_DIR}/npu_rt_api.cpp")
     set(_npu_incs ${ONEBIT_NPU_ENGINE_INCS} ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/ort ${ONEBIT_NPU_RT_DIR})

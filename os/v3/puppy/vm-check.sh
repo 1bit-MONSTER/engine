@@ -417,9 +417,15 @@ rows = [
     # The row stays, as a fact rather than a gate, and fastfetch is the packaged equivalent.
     ("U1 neofetch",  "apt install -y neofetch 2>&1 | tail -2; "
                      "command -v neofetch && echo neofetch-installed || echo neofetch-not-in-resolute", None),
-    ("U1 fastfetch", "apt update 2>&1 | tail -2; apt install -y fastfetch 2>&1 | tail -2; "
+    # Both apt rows wait for dpkg to be idle first: U1 fastfetch's install leaves a postinst running (Puppy's
+    # menu/desktop hooks print `find: /usr/X11R7/bin`), and the row that follows was measured failing on the lock
+    # rather than on the package - cowsay is in the 26.04 archive (`apt-cache policy cowsay`), so a red row here
+    # would have been the harness, not the image. The tail is 3 lines so a real apt error is visible.
+    ("U1 fastfetch", "for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dpkg > /dev/null || break; sleep 3; done; "
+                     "apt update 2>&1 | tail -2; apt install -y fastfetch 2>&1 | tail -3; "
                      "command -v fastfetch && echo fastfetch-installed", "fastfetch-installed", 600),
-    ("U1 apt-any",   "apt install -y --no-install-recommends cowsay 2>&1 | tail -2; "
+    ("U1 apt-any",   "for i in 1 2 3 4 5 6 7 8 9 10; do pgrep -x dpkg > /dev/null || break; sleep 3; done; "
+                     "apt install -y --no-install-recommends cowsay 2>&1 | tail -3; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
     ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "

@@ -648,10 +648,16 @@ add_test(NAME npu_forward_loader COMMAND npu_forward_loader_test)
 add_executable(hadamard_rotate_test tests/hadamard_rotate_test.cpp)
 target_include_directories(hadamard_rotate_test PRIVATE npu/forward/include)
 add_test(NAME hadamard_rotate COMMAND hadamard_rotate_test)
+# The A-row quantiser every NPU GEMM runs on the host before its launch (npu/forward/include/quant_i8.h): its
+# AVX2 path must be byte-identical to the shipped scalar loop, including the .5 boundaries, the NaN/inf inputs
+# and the values past 2^31 that the (int) cast saturates.  Header only, no device, no model: runs in CI.
+add_executable(quant_i8_row_test tests/quant_i8_row_test.cpp)
+target_include_directories(quant_i8_row_test PRIVATE npu/forward/include)
+add_test(NAME quant_i8_row COMMAND quant_i8_row_test)
 # ci.yml's build step names its targets explicitly and needs the `workflow` scope to extend, so bind the new
 # binary to a target the list already builds (same reason as npu_moe_test above); drop this line when the
 # workflow is next touched with that scope and add hadamard_rotate_test to the list itself.
-add_dependencies(npu_forward_loader_test hadamard_rotate_test)
+add_dependencies(npu_forward_loader_test hadamard_rotate_test quant_i8_row_test)
 # The window11 gate's comparison policy (engine#834): no tolerance without a measurement behind it, the
 # statistic named, and a control pair setting the tolerance from its own spread.  Shell + the fixtures it
 # writes itself, so there is no target for the build list to miss.

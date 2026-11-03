@@ -165,7 +165,9 @@ intermediate float tensor then never exists.
   `malloc_trim` between the warm-up and the measurement: the fused side is stable at **248-268 kB**,
   the CPU EP side is **6.1-7.0 MB** on 256×1024×1024. Both are ranges on purpose — the CPU EP figure
   is that process's arena growth, not a tensor size, so it moves run to run (eight runs on this tree:
-  6156, 6432, 6144, 6136, 6144, 6368, 7004, 6524 kB). What does not move is the bottom of that range:
+  6156, 6432, 6144, 6136, 6144, 6368, 7004, 6524 kB; a later run of this gate on the same tree measured
+  7236 kB, which is the same arena churn with a wider tail — read the band as indicative, not as a bound).
+  What does not move is the bottom of that range:
   6136 kB is the 1 MB `x_dq` + 4 MB `w_dq` + 1 MB `y` of float32 that no longer get allocated, and
   what sits above it is the CPU EP's own arena churn.
   `ONEBIT_EP_QDQ=0` is the control: the same binary then claims the

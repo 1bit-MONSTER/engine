@@ -23,7 +23,8 @@
 // targets, where roundf() is a libm call.  Measured on strixhalo replaying exactly that mix, best of 7, twice
 // independently (2026-11-03):
 // 3.56-4.05 ms/token scalar (1.54-1.76 ns/element) against 0.54-0.55 ms/token on the AVX2 path
-// (0.235-0.238 ns/element), 6.6-7.4x -- about 3.4-3.5 ms of a ~415 ms decode token.  Same story as hadamard.h next
+// (0.235-0.238 ns/element), 6.6-7.4x -- a saving of 3.0-3.5 ms in a ~415 ms decode token (scalar minus AVX2
+// across the two runs: 3.56-0.54 to 4.05-0.55).  Same story as hadamard.h next
 // door, and the same contract: byte-identical output, so a container's text cannot move.
 //
 // Bit identity is not luck here, it is the construction.  roundf is round-half-away-from-zero, and

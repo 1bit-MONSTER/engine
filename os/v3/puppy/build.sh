@@ -140,6 +140,18 @@ repo=$(cd "$recipe/../../.." && pwd)   # the engine tree: os/mini/release-check.
 free_gb=$(free -g | awk '/^Mem:/{print $7}')
 [ "${free_gb:-0}" -ge 16 ] || echo "build: WARNING: ${free_gb} GB available; the container is capped at 12 GB" >&2
 
+# The console TUI (#921) is a Rust binary built off this box by os/v3/puppy/console-tui/build-static.sh: no Rust
+# toolchain in this container, so it is handed in. Two things are needed and BOTH were missing until cycle 19 -
+# docker forwards only what `-e` names, and the file has to be mounted to exist inside: a host CONSOLE_TUI_BIN
+# therefore reached container-build.sh as the empty string and the image silently came out with the dialog menu
+# (measured: cycle 19's first build printed "note: CONSOLE_TUI_BIN is not set" with the variable set on the host).
+tui_bin=${CONSOLE_TUI_BIN:-}
+if [ -n "$tui_bin" ]; then
+    [ -f "$tui_bin" ] || { echo "build: REFUSED: CONSOLE_TUI_BIN=$tui_bin does not exist" >&2; exit 1; }
+    tui_bin=$(cd "$(dirname "$tui_bin")" && pwd)/$(basename "$tui_bin")
+    echo "build: console TUI $tui_bin ($(sha256sum "$tui_bin" | cut -c1-16))"
+fi
+
 echo "build: woof-CE $woof, kernel $kernel, out $out, build root $build_root ($mnt_opts)"
 # The container side is its own file (os/v3/puppy/container-build.sh, mounted at /recipe) since 2026-11-02:
 # it was a 300-line single-quoted `bash -c '...'` string here, where one apostrophe in a comment ended the
@@ -155,5 +167,7 @@ exec docker run --rm --privileged --memory=12g --cpus=4 \
     ${payload:+-e PAYLOAD=/payload -e PAYLOAD_NAME="$(basename "$payload")"} \
     ${libhsa_dir:+-v "$libhsa_dir":/libhsa-runtime:ro} \
     ${libhsa_dir:+-e LIBHSA_DIR=/libhsa-runtime} \
+    ${tui_bin:+-v "$tui_bin":/console-tui:ro} \
+    ${tui_bin:+-e CONSOLE_TUI_BIN=/console-tui} \
     --device /dev/loop-control:/dev/loop-control \
     -e COMPAT="$compat" ubuntu:24.04 bash /recipe/container-build.sh

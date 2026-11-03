@@ -429,7 +429,21 @@ rows = [
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
     ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "
-                     "echo key-on-data", "key-on-data"),
+                     "echo key-on-data", "key-on-data"),    # engine#867 (dd-written stick had NO key at all, so Lemonade served the LAN unauthenticated): two rows that can
+    # only pass if the key exists AND the server enforces it. On a prepared stick and on a bare `dd` copy both must
+    # be green - the bare copy is the case that was broken, and it is what makes these rows a gate rather than a
+    # restatement of "the file is there".
+    ("U3 key file",  "f=$(readlink -f /etc/1bit/lemond.conf); echo \"$f $(stat -c %s \"$f\" 2>/dev/null) bytes$(stat -c %a \"$f\" 2>/dev/null | sed 's/^/ mode /')\"; "
+                     "grep -c '^LEMONADE_API_KEY=[0-9a-f]\\{32,\\}$' \"$f\" 2>/dev/null; "
+                     "grep -q '^LEMONADE_API_KEY=[0-9a-f]\\{32,\\}$' \"$f\" 2>/dev/null && echo key-minted-48-hex",
+                     "key-minted-48-hex"),
+    ("U3 auth",      "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf); "
+                     "n=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
+                     "y=$(curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models); "
+                     "echo no-key=$n with-key=$y; "
+                     "[ \"$n\" = 401 ] && [ \"$y\" = 200 ] && echo lemonade-auth-enforced",
+                     "lemonade-auth-enforced"),
+
     ("U3 catalogue", "k=$(sed -n \"s/^LEMONADE_API_KEY=//p\" /etc/1bit/lemond.conf); "
                      "curl -s -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models "
                      "| grep -o onebit | wc -l", None),

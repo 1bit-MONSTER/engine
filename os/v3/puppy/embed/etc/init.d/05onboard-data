@@ -63,8 +63,13 @@ mkdir -p "$DATA/models" "$DATA/lemonade/cache" "$DATA/lemonade/config" "$DATA/ss
 # The API key has to outlive the boot: 10lemonade reads /etc/1bit/lemond.conf and mints into it on first
 # boot, and with this symlink in place that mint lands in lemonade/lemond.conf on the partition.
 mkdir -p /etc/1bit
-[ -f "$DATA/lemonade/lemond.conf" ] || : > "$DATA/lemonade/lemond.conf"
-chmod 600 "$DATA/lemonade/lemond.conf"
+# engine#867: do NOT pre-create an empty lemond.conf. 10lemonade mints the key, and its guard used to be
+# "does the file exist" - so a file created empty here meant the mint never ran and Lemonade came up on
+# 0.0.0.0 with NO API key at all on any stick that did not go through prepare-stick --mint (measured on a
+# dd-written stick: 200 without an Authorization header, on the second boot too). What this service owes the
+# mint is the directory, and the symlink so the key lands on the partition.
+mkdir -p "$DATA/lemonade" 2> /dev/null
+if [ -f "$DATA/lemonade/lemond.conf" ]; then chmod 600 "$DATA/lemonade/lemond.conf"; fi
 ln -sfn "$DATA/lemonade/lemond.conf" /etc/1bit/lemond.conf
 
 # Keys come from the partition (os/mini's contract: prepare-stick.sh writes ssh/authorized_keys). The

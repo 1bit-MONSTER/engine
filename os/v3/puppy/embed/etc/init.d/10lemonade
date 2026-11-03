@@ -40,17 +40,27 @@ start() {
     ulimit -l unlimited 2>/dev/null
     # shellcheck disable=SC1090  # the release build pins what HRX needs; the file may not exist
     if [ -f "$ENVFILE" ]; then . "$ENVFILE"; fi
-    if [ ! -f "$CONF" ]; then
-        # first boot with no key: mint one and keep it, so the appliance is never open without it
-        mkdir -p /etc/1bit 2>/dev/null
+    # engine#867: mint on "there is no KEY", not on "there is no file". A file that exists but is empty - an older
+    # image pre-created one, and prepare-stick writes it - left the key unset, and lemond then serves every
+    # endpoint including /internal/* to the whole LAN (zz-onboard-ports opens 13305 on purpose). Measured on a
+    # dd-written stick: 0-byte file, 200 without an Authorization header, second boot identical.
+    key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$CONF" 2> /dev/null | head -1)
+    if [ -z "$key" ]; then
+        mkdir -p /etc/1bit 2> /dev/null
         key=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
-        printf 'LEMONADE_API_KEY=%s\n' "$key" > "$CONF" && chmod 600 "$CONF" ||
-            { echo "10lemonade: cannot write $CONF" >&2; return 1; }
-        echo "10lemonade: minted an API key in $CONF"
+        if printf 'LEMONADE_API_KEY=%s\n' "$key" > "$CONF" 2> /dev/null; then
+            chmod 600 "$CONF" 2> /dev/null
+            echo "10lemonade: minted an API key in $CONF"
+        else
+            key=
+            echo "10lemonade: cannot write $CONF - Lemonade will serve loopback only" >&2
+        fi
     fi
-    # shellcheck disable=SC1090  # LEMONADE_API_KEY, minted above or shipped by the build
-    . "$CONF"
-    export LEMONADE_API_KEY
+    # a shipped file may carry more than the key (v2's unit read the same path as an EnvironmentFile)
+    # shellcheck disable=SC1090  # the file is the appliance's own env file
+    if [ -s "$CONF" ]; then . "$CONF"; fi
+    key=${LEMONADE_API_KEY:-$key}
+    export LEMONADE_API_KEY="$key"
     # Where Lemonade keeps its state is os/mini's data contract: /data/lemonade/{cache,config}, so the
     # catalogue, downloaded backends and the HRX JIT cache survive a reboot. Without a data partition it
     # lives in RAM and says so, rather than pretending to persist.
@@ -63,7 +73,11 @@ start() {
     fi
     mkdir -p "$LEM/cache" "$LEM/config"
     # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides
-    "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host 0.0.0.0 >> "$LOG" 2>&1 &
+    # engine#867 second half: with no key there is nothing between the LAN and Lemonade's control endpoints, so the
+    # fallback is loopback (the console menu and ssh still reach it) rather than 0.0.0.0 plus a warning nobody reads.
+    host=0.0.0.0
+    [ -n "$key" ] || host=127.0.0.1
+    "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host "$host" >> "$LOG" 2>&1 &
     echo $! > "$PIDFILE"
     echo "10lemonade: started (pid $(cat "$PIDFILE"), :$PORT, log $LOG)"
 }

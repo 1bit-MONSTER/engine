@@ -1,0 +1,129 @@
+<!-- Copyright 2026 bong-water-water-bong
+SPDX-License-Identifier: Apache-2.0
+
+Licensed under the Apache License, Version 2.0 (the "License");
+you may not use this file except in compliance with the License.
+You may obtain a copy of the License at
+
+    http://www.apache.org/licenses/LICENSE-2.0
+
+Unless required by applicable law or agreed to in writing, software
+distributed under the License is distributed on an "AS IS" BASIS,
+WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+See the License for the specific language governing permissions and
+limitations under the License.
+-->
+
+# 1bit-console-tui - the appliance console on tty1
+
+What `/etc/inittab` respawns on tty1 of the 1bit OS Puppy appliance, instead of the `dialog` menu. One Rust
+binary, ratatui + crossterm, `x86_64-unknown-linux-musl`, no runtime dependency of any kind.
+
+Why it exists, in the owner's words: *"can we make that a tui instead of this style"* (the dialog-box console
+menu), then, on the cycle-18 board boot, *"when you first boot the headless there is no data to display on how to
+connect, just the menu"*. The first block on the screen is therefore **CONNECT**, and it is composed from live
+facts on every draw.
+
+## The screen
+
+```
+1bit OS rc-2026-11-03-c21 strix  192.168.50.110  up 2h 13m  Secure Boot enabled  SoC 43C
+ CONNECT -------------------------------------------------------------------------------
+  web UI   http://192.168.50.110:13305
+  API base http://192.168.50.110:13305/api/v1
+  API key  press 1
+  ssh      root@192.168.50.110
+  mobile   Lemonade Mobile: server http://192.168.50.110:13305, key from 1
+ LEMONADE -------------------- GPU ---------------------------- NPU ----------------------
+ MODELS ---------------------- FANS / TEMPS ------------------- DATA ---------------------
+ LOGS newest ----------------------------------------------------------------------------
+ 1 Show the API key   2 Quick chat test (GPU and NPU)   ...   9 Reboot / power off
+```
+
+Two layouts off ONE set of facts, chosen by width:
+
+| size | what you get |
+|---|---|
+| 240x67 (tty1 on a monitor) | CONNECT block, six panels in a 3x2 grid, a tall log pane, the nine actions on two rows |
+| 80x25 (serial/VGA console, what the QEMU rows read) | the same block and panels one line each, a 2-line log pane, the SAME action labels - `Show the API key` and `Reboot / power off` are never abbreviated, because `vm-check.sh`'s `U2 menu` row looks for exactly those strings on tty1 |
+
+The log pane gets whatever rows are left. Key **8** is the full-screen, scrollable view.
+
+## Keys
+
+| key | what it does |
+|---|---|
+| **1** | show the API key (confirmed first: it is a bearer token and this screen can be on a KVM recording) |
+| **2** | quick chat test on GPU and NPU -> `1bit-console-menu --action 2` |
+| **3** | network: DHCP, static address, hostname -> `--action 3` |
+| **4** | models: list, pull, delete -> `--action 4` |
+| **5** | install 1bit OS to a disk (guarded; the installer asks for the whole device name) -> `--action 5` |
+| **6** | start the desktop (JWM) for this session, logged by `1bit-desktop` -> `--action 6` |
+| **7** | bash; the console comes back on exit -> `--action 7` |
+| **8** | full-screen logs; **8** or **q** returns |
+| **9** | reboot / power off, with a confirmation |
+| arrows, PgUp/PgDn, Home/End | scroll the log (one keypress = one record, oldest to newest) |
+| **f** | follow the newest line again |
+| **r** | re-read the facts now (they refresh every 2 s while the box is coming up, every 3 s after) |
+| **q** | stays on this screen: this console never drops to a bare prompt |
+
+Keys 2-7 hand the terminal to `1bit-console-menu --action N` - the *same* code `vm-check.sh`'s `U2 menu actions`
+and `--selftest` rows exercise. Nothing that needs a typed answer is re-implemented here, so the two surfaces
+cannot drift, and an action the gate proves is an action the screen has.
+
+## What it reads, and why from there
+
+Every number comes from where the rest of the image reads it - no second source of truth (`src/facts.rs`):
+
+| panel | source |
+|---|---|
+| header | `/data/RELEASE-TAG` or `payload=` in `/etc/1bit/release-identity`, `/proc/sys/kernel/hostname`, `ip -4`, `/proc/uptime`, the `SecureBoot-*` efivar (the value byte is the fifth: efivarfs refuses partial reads, and a `dd skip=4` reads as "disabled" on a Secure Boot box) |
+| Lemonade | the process table, an actual TCP connect to 127.0.0.1:13305, `LEMONADE_API_KEY=` in `/etc/1bit/lemond.conf` |
+| GPU | `llama-server --list-devices`, i.e. the runtime's own answer, plus `/sys/class/drm/card*/device/mem_info_{vram,gtt}_{used,total}` and hwmon |
+| NPU | `/proc/modules` for `amdxdna`, `/lib/firmware/amdnpu`, `/dev/accel/*`, and Lemonade's health for busy/idle |
+| Models | `GET /api/v1/models` (downloaded only) and `GET /api/v1/health` (loaded) |
+| last request | `GET /api/v1/stats` - `tokens_per_second`, the same number the release checks quote |
+| Fans / temps | `/usr/sbin/1bit-board status`, else hwmon fans; max hwmon temp |
+| Data | `df -B1 /data` |
+| Logs | the tail of `/var/log/lemond-onebit.log` (by offset: a 40 MB log costs 256 KiB) plus `dmesg` filtered to amdgpu/amdxdna/hrx/accel |
+
+**The GPU probe runs with Lemonade's environment**, and that is the point of `facts::lemonade_env()`: an
+`/etc/inittab` respawn inherits neither `LD_LIBRARY_PATH` nor the no-SVM trio, which is why the dialog menu said
+"GPU no HRX device" on a board serving 303 tok/s (cycle 13, measured). The environment is obtained by *sourcing
+`/etc/1bit/libhsa.env`* rather than by re-implementing its `${LD_LIBRARY_PATH:+:$LD_LIBRARY_PATH}` expansion, so
+there is exactly one place that decides what HRX needs.
+
+Nothing is clipped. Every string the widgets see has already been through `wrap_words`, which is why
+`firmware present` cannot become `firmware prese` (cycle 16's board) at any width - there is a test that walks
+widths 8..60 and fails on any output word that is not an input word.
+
+## Build and install
+
+```sh
+os/v3/puppy/console-tui/build-static.sh        # cargo test + musl release build, prints the binary path
+CONSOLE_TUI_BIN=<that path> bash os/v3/puppy/build.sh resolute64
+```
+
+`container-build.sh` installs the binary as `/usr/local/bin/1bit-console-tui`, refuses a `CONSOLE_TUI_BIN` that
+does not *run* (`--version` must print `1bit-console-tui ...` - a program init cannot exec is how a console
+becomes a dead screen), refuses a packed copy that is not executable, and merely notes the binary's absence:
+then tty1 keeps the dialog menu, which is the documented fallback. `1bit-console` tries the TUI first and execs
+the menu on any exit, zero or not, so there is no path from this screen to a bare prompt.
+
+There is no Rust toolchain on the appliance; the binary is static on purpose and `build-static.sh` refuses a
+dynamic one (`readelf` PT_INTERP, `ldd`).
+
+## Tests
+
+```sh
+cargo test                                    # 25 tests: the probe parsers + the two renders
+cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
+cargo run -- --snapshot 80x25 --fixture
+cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)
+```
+
+The parsers are tested against recorded samples, not invented ones: the board's own `HRX0: AMD Radeon 8060S
+Graphics (Node 1) (gfx1151) (122880 MiB, 74158 MiB free)`, the `(none)` of runs A and D in the libhsa
+measurement, the efivar bytes `06 00 00 00 01`, the documented `/v1/models`, `/v1/health` and `/v1/stats` bodies,
+chunked and plain HTTP, `df`, the c16 status lines. `tests/snapshots/*.txt` are the rendered frames for the c16
+board sample: changing the layout without meaning to fails the build.

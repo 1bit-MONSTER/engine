@@ -204,11 +204,13 @@ install to disk. Every check prints its own PASS/FAIL/SKIP line, a transcript la
 It checks the boot mode (LIVE or INSTALLED), the kernel and the Secure Boot state, the GPU and NPU
 devices, that Lemonade answers with its API key and refuses without it, that `/api/v1/models` lists
 the onebit entries the build shipped (22 on HRX, plus the NPU entries whose sealed kernel set is on
-the data partition) and the stick's own GGUF, one chat per backend the machine can run, one
+the data partition) and the stick's own GGUF, one chat per backend the machine can run, on the NPU two
+more requests after a 512-token one - a short prompt alone, as the page sends it, and one with that turn
+as history (`chat-npu-followup`, engine #911: the board demo lost the page-shaped one), one
 `lemonade bench` chat-short row on the default model, that every file under `/data/npu/kernels` is a
 sealed artifact, that `LICENSE-BINARY`/`NOTICE-BINARY` are present, and the image's tag + sha256.
-The rows that need the hardware - `gpu`, `npu`, `models`, `chat-hrx`, `chat-npu` - report
-`SKIP(reason)` in a VM.
+The rows that need the hardware - `gpu`, `npu`, `models`, `chat-hrx`, `chat-npu`,
+`chat-npu-followup` - report `SKIP(reason)` in a VM.
 
 ## Install it on the machine's own disk
 

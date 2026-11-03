@@ -32,7 +32,9 @@ on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemona
 3. Boot the machine from the stick. Secure Boot can stay on: shim, grub, the kernel and its modules are
    all signed with our MOK.
 4. Lemonade comes up with its catalog and web UI. Try it from the live session; to keep it, run
-   `1bit-install <disk> --yes` there and the same system is on the disk.
+   `1bit-install <disk> --yes` there and the same system is on the disk. The install options, what each
+   one erases and the Secure Boot notes are [docs/install.md](docs/install.md); connecting a client —
+   `curl`, the web app, the phone app, the OpenAI SDKs — is [docs/clients.md](docs/clients.md).
 
 **1bit OS is a Puppy Linux appliance**: `ResolutePup64`, built with woof-CE on the Ubuntu 26.04
 "resolute" base, with Lemonade Server and this engine embedded in it, running our MOK-signed

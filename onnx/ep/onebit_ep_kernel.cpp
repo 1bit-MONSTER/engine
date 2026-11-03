@@ -161,7 +161,13 @@ void gemm_q8(const int8_t* a, const int8_t* b, int8_t* y, int64_t m, int64_t k, 
 #ifdef ONEBIT_EP_NPU
     // The device leg: int8 in, exact int32 accumulators out, the epilogue above on the way back. A
     // graph whose (K, N) has no ELF, or a busy device, leaves the row blocks to the host loop below.
-    {
+    // Below kDeviceMinRows the host loop is the faster leg -- the call is dispatch-bound, not work-bound --
+    // so that case is a policy choice, logged with its own name: a run is a device run only when neither
+    // this line nor npu_qdq_fallback is written for the shape.
+    if (m < kDeviceMinRows) {
+        trace_fallback("npu_qdq_host_rows m=%lld k=%lld n=%lld min=%lld", (long long)m, (long long)k,
+                       (long long)n, (long long)kDeviceMinRows);
+    } else {
         std::vector<int32_t> acc((size_t)m * (size_t)n);
         std::string why;
         if (onebit::npu::gemm_q8_raw(a, m, k, n, b, acc.data(), &why)) {

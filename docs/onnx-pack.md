@@ -214,8 +214,14 @@ intermediate float tensor then never exists.
   down_proj's ship beside the other xclbins, and q/k/v's and gate/up's came out of one `-M 128 -K <K>
   -N <N> -c 4` run of the iso-build generator each (`n1_core_i8_v26.py` through the IRON/MLIR-AIE
   `aiecc`), the artifacts living beside the other xclbins and never in this repository. And it is a
-  **correctness** result so far, not a speed one: these are M=128 designs, so a decode step hands the
-  kernel one real row and 127 zeroed ones — measure before quoting tokens/s.
+  **correctness** result so far; it is *not* a decode-side speed one, because a device call is
+  dispatch-bound. So `gemm_q8` routes by rows: below `kDeviceMinRows` — 16, one constant in
+  `onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array, and at
+  or above it the device does. A host-routed call logs `npu_qdq_host_rows m=… k=… n=… min=16`, so "the device
+  ran this shape" stays "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it". 16 is the
+  first row count at which no measured projection shape was slower on the array; at one row the launch costs
+  8–10× the host loop it replaces (`docs/onnx.md` carries the measurement). A decode-side win needs fewer,
+  longer launches rather than a smaller design.
 - **Different kernels, not a configuration**: A16W8 needs int16 activations, MX/BFP16 need block
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
   natural split afterwards is our Q4NX pack for weight-only and the Quark QDQ path for A8W8.

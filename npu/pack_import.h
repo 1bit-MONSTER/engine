@@ -156,6 +156,9 @@ Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t
 // (amd-oss/npu-re docs/FACTS-oga-pack-weight-layout.md §7.13, §7.15): the tile is 2*(K/128)+2 subvolumes
 // of 2,176 B = one pair per (column half, K block of 128) plus the pair holding the writer's bias input.
 // Codes and zero points are stored as int4 (two's complement); `scale` is bf16 per (row, K block).
+// Both narrow fields pair with rows the same way -- byte `i` of a subvolume carries rows 2i and 2i+1
+// (low nibble = even row) -- so a per-row bug in one of them cannot hide behind the other, and a
+// decode->encode round trip cannot see the pairing at all (engine#849).
 struct TileW {
     int k = 0;                  // the projection's K
     std::vector<uint8_t> code;   // [64][k] stored nibbles

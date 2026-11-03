@@ -361,6 +361,13 @@ rows = [
     ("boot console", "tr ' ' '\\n' < /proc/cmdline | grep '^console='; "
                      "last=$(tr ' ' '\\n' < /proc/cmdline | sed -n 's/^console=//p' | tail -1); "
                      "[ \"$last\" = tty0 ] && echo console-is-tty0", "console-is-tty0"),
+    # Cycle 15, item D: the board's only non-fault dmesg lines were a pcspkr double registration (snd_pcsp and
+    # pcspkr both bind the PC speaker; the ALSA one is blacklisted in the image) and an HDMI infoframe error that
+    # amdgpu prints on an unconnected output and that is left alone. This row reads the file that does it and
+    # what actually bound, so a later edit that drops the file is visible here rather than in a boot log nobody reads.
+    ("boot quiet",   "grep -H 'blacklist' /etc/modprobe.d/1bit-quiet.conf 2>&1 | head -2; "
+                     "echo snd_pcsp-loaded=$(lsmod | grep -c '^snd_pcsp'); "
+                     "dmesg | grep -ci 'pcspkr' ; echo quiet-boot-checked", "quiet-boot-checked"),
     # Cycle 15, item B: the appliance is 1bit-os. rc.sysinit only invents puppypcNNNNN while /etc/hostname still
     # holds the stock word, so this reads the running hostname AND the file that decides the next boot.
     ("U1 hostname",  "hostname; cat /etc/hostname; grep -c 1bit-os /etc/hosts; "
@@ -371,13 +378,15 @@ rows = [
     # own 1bit-tty1, the reader the U2 tty1 row already uses); (2) the status block behind it answers every line
     # the owner asked for, as data; (3) every item runs without a keyboard (--selftest) - an item that only works
     # when a human presses it is exactly what a later run cannot re-check.
-    ("U2 menu",      "1bit-tty1 1 | head -12; "
+    ("U2 menu",      "1bit-tty1 1 | head -30; "
                      "if 1bit-tty1 1 | grep -q 'Show the API key' && 1bit-tty1 1 | grep -q 'Reboot / power off'; then "
                      "echo tty1-menu; elif 1bit-tty1 1 | grep -q 'root@'; then echo tty1-bare-shell; "
                      "else echo tty1-nothing; fi", "tty1-menu"),
+    # every line the owner asked for, by name and present rather than at column 0 (two of them share a line);
+    # `Secure` matches "Secure Boot", and the four-letter words are unambiguous in this block
     ("U2 menu status", "1bit-console-menu --status 2>&1 | head -10; "
-                     "for w in Lemonade GPU NPU Secure Boot Fans Data Models; do "
-                     "1bit-console-menu --status 2>&1 | grep -q \"^$w\" || echo missing-line-$w; done; "
+                     "for w in Lemonade GPU NPU Secure Fans Data Models; do "
+                     "1bit-console-menu --status 2>&1 | grep -q \"$w\" || echo missing-line-$w; done; "
                      "1bit-console-menu --status 2>&1 | grep -q 'http://' && echo menu-status-lines",
                      "menu-status-lines"),
     ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "

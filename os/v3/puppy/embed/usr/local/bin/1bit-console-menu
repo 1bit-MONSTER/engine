@@ -253,10 +253,13 @@ chat_one() {   # chat_one <model id> -> "id<TAB>answer<TAB>tok/s"
 }
 item_chat() {
     k=$(api_key)
-    if [ -z "$k" ]; then say "no API key: cannot chat (item 8 shows the lemons log)"; return 1; fi
+    if [ -z "$k" ]; then say "no API key: cannot chat (item 8 shows the Lemonade log)"; return 1; fi
     ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
         grep -o '"id":"[^"]*"' | cut -d'"' -f4)
-    [ -n "$ids" ] || { say "Lemonade lists no downloaded model - item 4 pulls one"; return 1; }
+    # "nothing downloaded" is not a broken menu item: a machine with no model, and every VM (Lemonade hides the
+    # onebit entries when there is no GPU and no NPU), legitimately has nothing to chat with. It is a SKIP with
+    # the reason, so --selftest stays green for the right reason and a real request failure still fails.
+    [ -n "$ids" ] || { say "no downloaded model on this machine - item 4 pulls one (chat-skipped)"; return 0; }
     # the backend is in the id ("...-NPU-1bit"), which is how release-check tells the two apart as well
     npu=$(printf '%s\n' "$ids" | grep -i 'npu' | head -1)
     hrx=$(printf '%s\n' "$ids" | grep -vi 'npu' | head -1)
@@ -280,57 +283,61 @@ item_chat() {
 # and the hostname. Nothing here writes a connman profile: the appliance's own DHCP is connman's and a second
 # client racing it was rejected as a fix in cycle 13 - this is the emergency path for a boot that came up with
 # no address at all, and it says so on the screen.
+net_status() {
+    say "hostname   $(hostname_now)"
+    say "addresses  $(ips)"
+    ip -4 route 2> /dev/null | head -3
+    say "link       $(iface_first)"
+    command -v connmanctl > /dev/null 2>&1 && say "connman    present" || say "connman    absent"
+}
 iface_first() {
     i=$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR == 1 {print $2}')
     [ -n "$i" ] || i=$(ip -o link show 2>/dev/null | awk -F': ' '$2 !~ /^(lo|sit|ip6)/ {print $2; exit}')
     printf '%s' "$i"
 }
 item_network() {
-    out=$(mktemp) || return 1
-    {
-        say "hostname   $(hostname_now)"
-        say "addresses  $(ips)"
-        ip -4 route 2>/dev/null | head -3
-        say ""
-        command -v connmanctl > /dev/null 2>&1 && say "connman    present" || say "connman    absent"
-        say "link       $(iface_first)"
-    } > "$out"
     if [ "$NONINT" = 1 ]; then
-        cat "$out"; rm -f "$out"; say "network-reported"; return 0
+        net_status; say "network-reported"; return 0
     fi
     while : ; do
-        c=$(ui --title " Network " --menu "$(cat "$out")" 20 76 4 \
+        c=$(ui --title " Network " --menu "$(net_status)" 20 76 4 \
             1 "Renew the DHCP lease (one shot, this session)" \
             2 "Set a static address (this session only)" \
             3 "Set the hostname" \
             4 "Back" ) || c=4
-        rm -f "$out"
         case $c in
-        1) i=$(iface_first); [ -n "$i" ] || { say_text "Network" "no network interface at all:
-the kernel has no driver loaded for the card. Check 'lsmod | grep -E virtio|e1000|r8169' - a module tree that
-is not visible is the cycle-13 defect, not a DHCP one."; out=$(mktemp); continue; }
-           udhcpc -n -q -i "$i" > /tmp/1bit-dhcp.log 2>&1 && say_text "Network" "lease renewed on $i:
-$(ips)" || say_text "Network" "udhcpc failed on $i:
-$(tail -3 /tmp/1bit-dhcp.log 2>/dev/null)" ;;
+        1) i=$(iface_first)
+           if [ -z "$i" ]; then
+               say_text "Network" "no network interface at all: the kernel has no driver bound to the card.
+Check 'lsmod | grep -E virtio|e1000|r8169' - a module tree that is not visible is the cycle-13 defect, not a
+DHCP one (the appliance has no interface until the driver loads)."
+               continue
+           fi
+           if udhcpc -n -q -i "$i" > /tmp/1bit-dhcp.log 2>&1; then
+               say_text "Network" "lease renewed on $i: $(ips)"
+           else
+               say_text "Network" "udhcpc failed on $i: $(tail -3 /tmp/1bit-dhcp.log 2>/dev/null)"
+           fi ;;
         2) a=$(ui --title " Static address " --inputbox "address/prefix (e.g. 192.168.50.111/24)" 10 70 "") || a=""
-           [ -n "$a" ] || { out=$(mktemp); continue; }
+           [ -n "$a" ] || continue
            g=$(ui --title " Static address " --inputbox "default gateway" 10 70 "") || g=""
            i=$(iface_first)
-           ip addr add "$a" dev "$i" 2>/tmp/1bit-static.log &&
-               { [ -z "$g" ] || ip route replace default via "$g" dev "$i" 2>>/tmp/1bit-static.log; }
-           say_text "Network" "static $a on $i (gateway ${g:-none}):
-$(ips)
-This lives until reboot unless the save layer keeps it." ;;
+           if ip addr add "$a" dev "$i" 2> /tmp/1bit-static.log &&
+              { [ -z "$g" ] || ip route replace default via "$g" dev "$i" 2>> /tmp/1bit-static.log; }; then
+               say_text "Static address" "$a on ${i:-no link} (gateway ${g:-none}): $(ips)
+This lives until reboot unless the save layer keeps it."
+           else
+               say_text "Static address" "$(tail -3 /tmp/1bit-static.log 2>/dev/null)"
+           fi ;;
         3) h=$(ui --title " Hostname " --inputbox "hostname" 10 70 "$(hostname_now)") || h=""
            if [ -n "$h" ]; then
                echo "$h" > /etc/hostname
-               hostname "$h" 2>/dev/null
+               hostname "$h" 2> /dev/null
                grep -q " $h" /etc/hosts || sed -i "s/^127.0.0.1.*/127.0.0.1 localhost $h/" /etc/hosts
-               say_text "Hostname" "hostname is now $h (and /etc/hosts agrees)"
+               say_text "Hostname" "the appliance is now $h (and /etc/hosts agrees)"
            fi ;;
-        *) out=$(mktemp); return 0 ;;
+        *) return 0 ;;
         esac
-        out=$(mktemp)
     done
 }
 
@@ -407,7 +414,13 @@ item_shell() {
         say "shell: $(command -v bash)"; say "shell-bash"; return 0
     fi
     clear
-    TERM=${TERM:-linux} bash -l </dev/tty1 >/dev/tty1 2>&1
+    # tty1 is where a person is standing; a run over the serial console has no /dev/tty1, so fall back rather
+    # than open a shell with a dead stdin and look like a hang
+    if [ -e /dev/tty1 ]; then
+        TERM=${TERM:-linux} bash -l < /dev/tty1 > /dev/tty1 2>&1
+    else
+        TERM=${TERM:-linux} bash -l
+    fi
     return 0
 }
 

@@ -1,0 +1,8 @@
+[Desktop Entry]
+Type=Application
+Name=1bit OS chat screen
+Comment=Open the appliance's chat screen in the browser (Lemonade on 13305 underneath)
+Exec=/usr/local/bin/1bit-lemonade-webapp
+Terminal=false
+NoDisplay=false
+Categories=Utility;

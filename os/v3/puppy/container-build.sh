@@ -207,6 +207,17 @@ if [ -n "${PAYLOAD:-}" ]; then
     # dialog, which the merged package set already ships - asserted below, because a menu without dialog is a
     # box that falls back to a text prompt with no explanation.
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-console-menu "$skeleton/usr/local/bin/1bit-console-menu"
+    # Cycle 16, from the demo recording task (TDEMO-RECORD): the appliance has to be able to record its own demo
+    # (`1bit-record`), and the desktop has to open a chat screen that WORKS in the browser this image ships -
+    # measured 2026-11-02: Pale Moon renders Lemonade's UI but cannot run its streaming chat (it lacks
+    # TextDecoderStream and AbortSignal.timeout), while it streams fine from plain fetch + getReader, which is what
+    # /opt/1bit/webapp/index.html uses. 24onboard-webapp serves that page on loopback, the autostart opens it.
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-record "$skeleton/usr/local/bin/1bit-record"
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-lemonade-webapp "$skeleton/usr/local/bin/1bit-lemonade-webapp"
+    install -D -m 755 /recipe/embed/etc/init.d/24onboard-webapp "$skeleton/etc/init.d/24onboard-webapp"
+    install -D -m 644 /recipe/embed/opt/1bit/webapp/index.html "$skeleton/opt/1bit/webapp/index.html"
+    install -D -m 644 /recipe/embed/etc/xdg/autostart/1bit-lemonade-webapp.desktop \
+        "$skeleton/etc/xdg/autostart/1bit-lemonade-webapp.desktop"
     install -D -m 644 /repo/tools/seal_manifest.py "$skeleton/usr/lib/1bit/seal_manifest.py"
     install -D -m 644 /seal.pub "$skeleton/etc/1bit/seal-pub.txt"
     ln -sfn /usr/local/bin/1bit-release-check "$skeleton/bin/1bit-release-check"
@@ -302,7 +313,9 @@ printf "%s\n" "$listing" > /tmp/1bit-sfs-listing
 in_image() { grep -q "/$1$" /tmp/1bit-sfs-listing ; }
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 miss=""
-for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil usr/sbin/sfdisk usr/bin/bash; do
+# the demo path needs a browser, a recorder and an encoder; an image without them cannot show or record itself
+for b in usr/bin/sudo usr/bin/apt usr/sbin/sshd usr/bin/mokutil usr/sbin/sfdisk usr/bin/bash \
+         usr/bin/ffmpeg usr/bin/ffprobe usr/bin/python3 opt/palemoon/palemoon; do
     in_image "$b" || miss="$miss $b"
 done
 [ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (packages-extra did not land)" >&2; exit 1; }
@@ -365,6 +378,9 @@ if [ -n "${PAYLOAD:-}" ]; then
              usr/local/bin/1bit-tty1 usr/local/bin/1bit-console usr/local/bin/1bit-console-install \
              usr/local/bin/1bit-console-menu \
              usr/sbin/1bit-board etc/init.d/26onboard-board \
+             usr/local/bin/1bit-record usr/local/bin/1bit-lemonade-webapp \
+             etc/init.d/24onboard-webapp opt/1bit/webapp/index.html \
+             etc/xdg/autostart/1bit-lemonade-webapp.desktop \
              etc/init.d/27onboard-installer \
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
              etc/1bit/release-identity etc/keymap etc/localtime; do

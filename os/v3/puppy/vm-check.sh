@@ -454,15 +454,25 @@ rows = [
                      "r=$(printf '%s' \"$p\" | grep -c reasoning_content); "
                      "k=$(printf '%s' \"$p\" | grep -c 'select id=.model.'); "
                      "m=$(printf '%s' \"$p\" | grep -c 'MAXTOK = 1024'); "
-                     "echo \"thinking=$t reasoning=$r picker=$k max_tokens=$m\"; "
+                     # engine#924: Lemonade does not retry a 503 device_busy on the request path, so the page is
+                     # the only layer that can - and the refusal reaches it as EITHER a 503 + Retry-After or, for a
+                     # streaming request (what this page sends), one `data: {"error":...}` frame before [DONE].
+                     # Both spellings and the retry text must be in the served page, not only in the source.
+                     "b=$(printf '%s' \"$p\" | grep -c 'device_busy'); "
+                     "w=$(printf '%s' \"$p\" | grep -c 'NPU busy, retrying'); "
+                     "echo \"thinking=$t reasoning=$r picker=$k max_tokens=$m busy=$b retry-text=$w\"; "
                      "[ \"$t\" -ge 1 ] && [ \"$r\" -ge 1 ] && [ \"$k\" = 1 ] && [ \"$m\" = 1 ] && "
-                     "echo webapp-thinking-and-picker",
-                     "webapp-thinking-and-picker"),
+                     "[ \"$b\" -ge 1 ] && [ \"$w\" -ge 1 ] && "
+                     "echo webapp-thinking-picker-busy",
+                     "webapp-thinking-picker-busy"),
     # Cycle 18 item 4 (the owner: "when you first boot the headless there is no data to display on how to
     # connect, just the menu"): the screen a person sees must carry the CONNECT block - the address, the web UI,
     # the API base, the key's location, ssh and the mobile app - not just the menu. Read off tty1's own VGA
     # buffer, the same surface the U2 tty1 row uses, so this is the screen and not the script.
-    ("U2 menu connect", "s=$(1bit-tty1 1); printf '%s\\n' \"$s\" | head -10; "
+    # tr -s ' ': the screen is drawn by ONE OF TWO renderers now (the dialog menu, which collapses runs of spaces in
+    # a --menu prompt, and the ratatui TUI, which does not), so the row must not depend on how many spaces sit
+    # between "api" and its URL. Measured on both renders of the same facts.
+    ("U2 menu connect", "s=$(1bit-tty1 1 | tr -s ' '); printf '%s\\n' \"$s\" | head -10; "
                      "for w in CONNECT 'web UI http://' 'api http://' 'ssh root@' 'Lemonade Mobile'; do "
                      "printf '%s' \"$s\" | grep -qF \"$w\" || echo missing-\"$w\"; done; "
                      "printf '%s' \"$s\" | grep -qE 'web UI http://[0-9]+\\.[0-9]+\\.[0-9]+\\.[0-9]+:13305' && "

@@ -154,7 +154,7 @@ check "the CPU answers at all" '[ -n "$cpu" ]'
 kMinSteps=12
 
 compare() { # $1 left tag, $2 right tag; prints "<overlap> <median> <steps> <scored> <fork> <verdict>"
-    python3 - "$work/$1.json" "$work/$2.json" <<'PY'
+    python3 - "$work/$1.json" "$work/$2.json" "$kMinSteps" <<'PY'
 import json, sys
 def load(p):
     cp = json.load(open(p)).get("completion_probabilities", [])
@@ -167,8 +167,14 @@ steps = min(len(a), len(b))
 # their distributions describe different computations.
 fork = next((i for i in range(steps) if a[i]["id"] != b[i]["id"]), -1)
 scored = steps if fork < 0 else fork + 1
+# A fork before the floor leaves too little shared history to judge on, and failing there would report a coin flip as
+# placement corruption. Step 0 is ALWAYS like-for-like (both arms read the same prompt), and a placement bug collapses
+# its overlap, so in that case the verdict is taken on step 0 alone and the status line says so. Passed in from the
+# shell so the floor is stated in one place.
+kmin = int(sys.argv[3])
+judged = scored if scored >= kmin else (1 if steps >= 1 else 0)
 ds, shared, possible = [], 0, 0
-for i in range(scored):
+for i in range(judged):
     right = dict(b[i]["top"])
     for tok, lp in a[i]["top"]:
         possible += 1
@@ -184,12 +190,12 @@ median = float("nan") if not n else (ds[n // 2] if n % 2 else 0.5 * (ds[n // 2 -
 # The verdict is decided HERE, on the full-precision values; the two printed numbers are rounded for reading. Comparing
 # the rounded strings let 0.50004 pass a <= 0.50 limit by exactly the amount that was hidden.
 verdict = "ok" if (overlap >= 0.30 and median == median and median <= 0.50) else "limit"
-print(f"{overlap:.2f} {median:.4f} {steps} {scored} {fork} {verdict}")
+print(f"{overlap:.2f} {median:.4f} {steps} {scored} {fork} {verdict} {judged}")
 PY
 }
 agree() { # $1 description, $2 left, $3 right
-    local overlap median steps scored fork verdict where
-    read -r overlap median steps scored fork verdict <<<"$(compare "$2" "$3")"
+    local overlap median steps scored fork verdict judged where why
+    read -r overlap median steps scored fork verdict judged <<<"$(compare "$2" "$3")"
     if [ "$fork" -lt 0 ]; then
         if [ "$steps" -eq 0 ]; then where="n/a (one arm returned no comparable steps)"
         else where="none (the texts are identical over the $steps compared steps)"; fi
@@ -201,13 +207,12 @@ agree() { # $1 description, $2 left, $3 right
         fail=1
         return
     fi
-    if [ "$scored" -lt $kMinSteps ]; then
-        echo "FAIL $1"
-        echo "     the texts fork at $where, so only $scored step(s) share a history, below the $kMinSteps floor. After a"
-        echo "     fork the two arms condition on different tokens, so comparing their distributions past it compares two"
-        echo "     different computations — not evidence either way."
-        fail=1
-        return
+    # The arms forked before the floor could be met: the verdict above was taken on step 0 alone, which is always
+    # like-for-like (same prompt). Say that, so nobody reads a 1-step judgement as a 24-step one.
+    if [ "$judged" != "$scored" ]; then
+        why="step 0 only (the arms fork at $where, so $scored step(s) share a history, below the $kMinSteps floor;"
+        why="$why step 0 is judged because both arms read the same prompt there and a placement bug collapses its overlap)"
+        echo "     judged on $why"
     fi
     if [ "$verdict" = ok ]; then
         echo "ok   $1"

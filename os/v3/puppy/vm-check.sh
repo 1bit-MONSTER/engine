@@ -355,6 +355,34 @@ rows = [
                      "pgrep -x Xorg > /dev/null && echo X-RUNNING || echo no-X-server; "
                      "pgrep -af 'getty.*tty1' | head -1; "
                      "pgrep -af 'Xorg|X ' | head -1", "no-X-server"),
+    # Cycle 15, item C, read off the RUNNING boot: the LAST console= wins, and it has to be tty0 or the screen
+    # shows nothing while the SFS are copied into RAM - the owner's "it hangs hard here" on the c14 board boot,
+    # where /dev/console was ttyS0 and every userspace progress line went to the serial port instead.
+    ("boot console", "tr ' ' '\\n' < /proc/cmdline | grep '^console='; "
+                     "last=$(tr ' ' '\\n' < /proc/cmdline | sed -n 's/^console=//p' | tail -1); "
+                     "[ \"$last\" = tty0 ] && echo console-is-tty0", "console-is-tty0"),
+    # Cycle 15, item B: the appliance is 1bit-os. rc.sysinit only invents puppypcNNNNN while /etc/hostname still
+    # holds the stock word, so this reads the running hostname AND the file that decides the next boot.
+    ("U1 hostname",  "hostname; cat /etc/hostname; grep -c 1bit-os /etc/hosts; "
+                     "[ \"$(hostname)\" = 1bit-os ] && [ \"$(cat /etc/hostname)\" = 1bit-os ] && echo hostname-1bit-os",
+                     "hostname-1bit-os"),
+    # Cycle 15, item A - the headline. Three rows, because "a menu exists" and "a person can use it" are two
+    # different claims: (1) the SCREEN a person sees carries the menu (tty1's own VGA text buffer via the image's
+    # own 1bit-tty1, the reader the U2 tty1 row already uses); (2) the status block behind it answers every line
+    # the owner asked for, as data; (3) every item runs without a keyboard (--selftest) - an item that only works
+    # when a human presses it is exactly what a later run cannot re-check.
+    ("U2 menu",      "1bit-tty1 1 | head -12; "
+                     "if 1bit-tty1 1 | grep -q 'Show the API key' && 1bit-tty1 1 | grep -q 'Reboot / power off'; then "
+                     "echo tty1-menu; elif 1bit-tty1 1 | grep -q 'root@'; then echo tty1-bare-shell; "
+                     "else echo tty1-nothing; fi", "tty1-menu"),
+    ("U2 menu status", "1bit-console-menu --status 2>&1 | head -10; "
+                     "for w in Lemonade GPU NPU Secure Boot Fans Data Models; do "
+                     "1bit-console-menu --status 2>&1 | grep -q \"^$w\" || echo missing-line-$w; done; "
+                     "1bit-console-menu --status 2>&1 | grep -q 'http://' && echo menu-status-lines",
+                     "menu-status-lines"),
+    ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "
+                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
+                     "/tmp/menu-self.txt | tr '\\n' ' '", "selftest-rc=0"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
     # version matched "Unable to locate package neofetch" and reported a pass (measured 2026-11-02)
@@ -494,12 +522,17 @@ fi
 # U7, over the wire: SSHKEY=<private key> and the key half of which must be in the image's keys.
 if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then
     # the remote command prints a marker, and THAT is what the row matches: filtering the verbose stream for
-    # debug lines once threw the command's own output away and the row failed while the login had worked
+    # debug lines once threw the command's own output away and the row failed while the login had worked.
+    # Cycle 15: the same login also has to land in BASH, not in the console menu. The menu is inittab's tty1
+    # surface and nothing else runs it, so this is the row that says so - a menu that also caught ssh would
+    # make every remote administrator open a console UI first (measured: `$0` is /bin/bash and BASH_VERSION set).
     said=$(timeout 40 ssh -v -p "$sshport" -i "$SSHKEY" -o BatchMode=yes -o StrictHostKeyChecking=no \
         -o UserKnownHostsFile=/dev/null root@127.0.0.1 \
-        'echo ONBOARD-SSH-OK; uname -r; command -v 1bit' 2>&1 | tr '\n' ' ')
+        'echo ONBOARD-SSH-OK; uname -r; command -v 1bit; echo ssh-shell=$0; \
+         [ -n "$BASH_VERSION" ] && echo ssh-bash; 1bit-console-menu --status | head -1' 2>&1 | tr '\n' ' ')
     case $said in
-    *ONBOARD-SSH-OK*) echo "PASS U7 ssh        $(printf '%s' "$said" | tail -c 150)" ;;
+    *ONBOARD-SSH-OK*ssh-bash*) echo "PASS U7 ssh        $(printf '%s' "$said" | tail -c 200)" ;;
+    *ONBOARD-SSH-OK*) echo "FAIL U7 ssh        the login works but the shell is not bash: $(printf '%s' "$said" | tail -c 200)" ;;
     *) echo "FAIL U7 ssh        $(printf '%s' "$said" | tail -c 240)" ;;
     esac
 else

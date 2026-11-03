@@ -23,10 +23,11 @@
 # tty1 - while the same image gave a prompt on tty1 in QEMU. A console-only machine whose console has nothing
 # to log into is not headless, it is unreachable, so the appliance's own console cannot depend on that chain.
 #
-# On a headless boot (pfix=nox) this is plogin's last step and nothing else: busybox init already opened the
-# tty for us, getty with -n skips the login banner and -l /bin/autologin logs root in, which is what the rows
-# and the tty1 reader (1bit-tty1) expect. Every other boot still runs plogin, because it is what lays out the
-# first X session on the desktop entry.
+# On a headless boot (pfix=nox) this is the appliance's own CONSOLE MENU: the owner's words on the cycle-14
+# board boot were "no menu system", and a bare root prompt is not an appliance - a person in front of the box
+# needs to see Lemonade/GPU/NPU/Secure Boot/fans/data and to reach the six things the box can do without a
+# browser. 1bit-console-menu owns that surface and item 7 is bash, so nothing is lost by replacing the prompt.
+# Every other boot still runs plogin, because it is what lays out the first X session on the desktop entry.
 # The "Install 1bit OS to a disk" entry (owner, cycle 14): tty1 IS the installer there. It is done here
 # rather than by a service of its own so nothing else competes for the same terminal - a getty and the
 # installer both reading tty1 would eat each other's keystrokes.
@@ -36,4 +37,4 @@ fi
 if ! grep -q 'pfix=[^ ]*nox' /proc/cmdline 2> /dev/null; then
     exec /bin/plogin
 fi
-exec getty -n -l /bin/autologin 115200,38400,9600 tty1
+exec /usr/local/bin/1bit-console-menu

@@ -136,7 +136,27 @@ echo "== tty1 login"
 sed -i 's|^tty1::respawn:plogin$|tty1::respawn:/usr/local/bin/1bit-console|' "$skeleton/etc/inittab"
 grep -q '^tty1::respawn:/usr/local/bin/1bit-console$' "$skeleton/etc/inittab" || {
     echo "build: REFUSED: could not point the inittab tty1 entry at 1bit-console" >&2; exit 1; }
-echo "   ok: inittab tty1 -> /usr/local/bin/1bit-console (plogin on the desktop entry, a getty on a headless one)"
+echo "   ok: inittab tty1 -> /usr/local/bin/1bit-console (plogin on the desktop entry, the console menu on a headless one)"
+
+# Cycle 15, item B (owner): the appliance is `1bit-os`, not `puppypc22557`. rc.sysinit only invents a
+# hostname when /etc/hostname still holds the stock word (`if [ "$(cat /etc/hostname)" = puppypc ]`), so a
+# skeleton that already says 1bit-os is left alone - and /etc/hosts has to agree or sudo, sshd banners and
+# every log line carry a name that does not resolve. Both are edited here rather than shipped as whole
+# files, because /etc/hosts is woof-CE's and has two lines (v4 and v6).
+# mDNS (1bit-os.local) is NOT shipped: avahi-daemon is not in this rootfs and adding it would mean dbus
+# activation on a non-systemd Puppy, and QEMU's user-mode network forwards no multicast, so nothing here
+# could measure whether it worked. The board reads the address off the console menu instead - said plainly
+# in the hand-off rather than shipped blind.
+echo "== hostname 1bit-os"
+[ -f "$skeleton/etc/hosts" ] || {
+    echo "build: REFUSED: no rootfs-skeleton/etc/hosts - the appliance name would not resolve" >&2; exit 1; }
+printf '1bit-os\n' > "$skeleton/etc/hostname"
+sed -i 's/\bpuppypc\b/1bit-os/g' "$skeleton/etc/hosts"
+grep -q '^1bit-os$' "$skeleton/etc/hostname" || {
+    echo "build: REFUSED: could not write the appliance hostname" >&2; exit 1; }
+grep -q '1bit-os' "$skeleton/etc/hosts" || {
+    echo "build: REFUSED: /etc/hosts does not name the appliance" >&2; exit 1; }
+echo "   ok: hostname 1bit-os, and /etc/hosts agrees (rc.sysinit only renames a stock puppypc)"
 
 # U3/U4: the release package goes into the rootfs BEFORE 3builddistro, which packs it into the puppy SFS.
 # Nothing is installed into it - the payload is relocatable and lemond-onebit finds bin/ and 1bit/ beside
@@ -165,6 +185,10 @@ if [ -n "${PAYLOAD:-}" ]; then
     install -D -m 755 /repo/os/mini/board.sh "$skeleton/usr/sbin/1bit-board"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-console-install "$skeleton/usr/local/bin/1bit-console-install"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-console "$skeleton/usr/local/bin/1bit-console"
+    # Cycle 15, item A (owner: "no menu system"): the console menu tty1 gets on a headless boot. It needs
+    # dialog, which the merged package set already ships - asserted below, because a menu without dialog is a
+    # box that falls back to a text prompt with no explanation.
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-console-menu "$skeleton/usr/local/bin/1bit-console-menu"
     install -D -m 644 /repo/tools/seal_manifest.py "$skeleton/usr/lib/1bit/seal_manifest.py"
     install -D -m 644 /seal.pub "$skeleton/etc/1bit/seal-pub.txt"
     ln -sfn /usr/local/bin/1bit-release-check "$skeleton/bin/1bit-release-check"
@@ -278,7 +302,30 @@ unsquashfs -cat sandbox3/build/puppy_*.sfs etc/inittab 2> /dev/null |
     grep -q '^tty1::respawn:/usr/local/bin/1bit-console$' || {
     echo "build: REFUSED: the packed inittab tty1 entry is not 1bit-console (no login on a headless console)" >&2
     exit 1; }
-echo "   ok: the packed inittab gives tty1 a login (1bit-console), and /etc/keymap + /etc/localtime are in the image"
+echo "   ok: the packed inittab gives tty1 a login (1bit-console, i.e. the console menu), and /etc/keymap + /etc/localtime are in the image"
+# Cycle 15: the console menu is the appliance's whole on-box surface, so the packed image - not the tree - has
+# to carry it, the dialog it draws with, the hostname it prints, and the quiet boot. Each of these fails
+# silently otherwise: a missing menu is a respawn loop, a missing dialog is a text prompt.
+miss=""
+for b in usr/bin/dialog etc/hostname etc/modprobe.d/1bit-quiet.conf; do
+    in_image "$b" || miss="$miss $b"
+done
+# the menu itself is installed with the release package (it is part of the embed), so it is asserted with the
+# rest of the payload below - and dialog/modprobe/hostname stand alone, because they are the skeleton's.
+[ -z "$miss" ] || { echo "build: REFUSED: the image is missing:$miss (the console menu would not run)" >&2; exit 1; }
+hn=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/hostname 2>/dev/null | head -1)
+[ "$hn" = 1bit-os ] || { echo "build: REFUSED: the packed hostname is '${hn:-<none>}' (board row reads 1bit-os)" >&2; exit 1; }
+echo "   ok: dialog + hostname 1bit-os + the quiet-boot modprobe file are in the image"
+if [ -n "${PAYLOAD:-}" ]; then
+    in_image usr/local/bin/1bit-console-menu || {
+        echo "build: REFUSED: the image has no /usr/local/bin/1bit-console-menu - tty1 would respawn nothing" >&2; exit 1; }
+    # and it has to be EXECUTABLE in the packed SFS: init skips a non-executable script in silence, which is the
+    # trap the Lemonade service and 03onboard-efivars already paid for
+    unsquashfs -ll sandbox3/build/puppy_*.sfs 2>/dev/null |
+        grep -q '^-rwxr-xr-x .*usr/local/bin/1bit-console-menu$' || {
+        echo "build: REFUSED: the packed 1bit-console-menu is not executable" >&2; exit 1; }
+    echo "   ok: the console menu is in the image and executable (tty1's whole surface on a headless boot)"
+fi
 modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
 [ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
     echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }
@@ -292,6 +339,7 @@ if [ -n "${PAYLOAD:-}" ]; then
              opt/1bit-llama opt/1bit-package/1bit/hrx/llama/bin/llama-server \
              usr/local/bin/lemonade usr/local/bin/1bit-release-check usr/local/bin/1bit-install \
              usr/local/bin/1bit-tty1 usr/local/bin/1bit-console usr/local/bin/1bit-console-install \
+             usr/local/bin/1bit-console-menu \
              usr/sbin/1bit-board etc/init.d/26onboard-board \
              etc/init.d/27onboard-installer \
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \

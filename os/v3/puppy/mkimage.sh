@@ -142,20 +142,27 @@ search --no-floppy --label 1BIT-DATA --set=root
 #   amdgpu.cwsr_enable=0   the reference install's value; the no-SVM trio puts HRX's CWSR save area in GTT
 #       (engine#315), and the box that serves HRX today has CWSR off.
 # They are on every entry, so a person who picks the desktop or the shell gets the same machine.
+# The console order IS the fix for the owner's "it hangs hard here" (cycle-14 board boot, 2026-11-02 ~21:00): the
+# boot line said "console=tty0 console=ttyS0,115200", so /dev/console was ttyS0 (the LAST console= wins) and
+# every userspace line - Puppy's "Copying ... to ram", rc.sysinit's progress, the init patch's own two lines -
+# went to the serial port while the screen showed nothing but the kernel log for ~90 s. tty0 last makes the
+# screen /dev/console, and the serial port still gets the same bytes because printk and /dev/console both fan
+# out to every registered console. The VM rows are unaffected: they drive the guest through
+# /etc/init.d/21serial-console, which opens /dev/ttyS0 explicitly.
 menuentry "1bit OS (headless console, ${kver})" {
-    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=tty0 console=ttyS0,115200
+    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=ttyS0,115200 console=tty0
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS (desktop, JWM)" {
-    linux /1bit/vmlinuz $setcmd pfix=copy console=tty0 console=ttyS0,115200
+    linux /1bit/vmlinuz $setcmd pfix=copy console=ttyS0,115200 console=tty0
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - install to a disk (1bit.installer=1)" {
-    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=tty0 console=ttyS0,115200 1bit.installer=1
+    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=ttyS0,115200 console=tty0 1bit.installer=1
     initrd /1bit/initrd.gz
 }
 menuentry "1bit OS - serial root shell (1bit.serial=1)" {
-    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=tty0 console=ttyS0,115200 1bit.serial=1
+    linux /1bit/vmlinuz $setcmd pfix=copy,nox console=ttyS0,115200 console=tty0 1bit.serial=1
     initrd /1bit/initrd.gz
 }
 GRUBCFG
@@ -168,7 +175,16 @@ grep -q 'menuentry "1bit OS - install to a disk (1bit.installer=1)"' "$esp/EFI/B
     echo "$prog: REFUSED: grub.cfg has no install-to-a-disk entry" >&2; exit 1; }
 grep -q 'set default=0' "$esp/EFI/BOOT/grub.cfg" || {
     echo "$prog: REFUSED: the headless entry is no longer the default" >&2; exit 1; }
-echo "   menu: headless (default), desktop, install to a disk, serial shell; ttm/amdgpu parameters on all"
+# The screen has to be /dev/console: the last console= on the line wins, and every entry must put tty0 last or
+# the box looks hung on a monitor for the whole SFS copy (cycle 14's owner report). Both spellings are counted
+# so an entry that lost the parameter cannot pass on the others' company.
+n=$(grep -c 'console=ttyS0,115200 console=tty0' "$esp/EFI/BOOT/grub.cfg")
+m=$(grep -c '^ *linux ' "$esp/EFI/BOOT/grub.cfg")
+[ "$n" = "$m" ] || {
+    echo "$prog: REFUSED: $n of $m grub entries put tty0 last (the screen would stay blank while the SFS copy runs)" >&2
+    exit 1; }
+echo "   menu: headless (default), desktop, install to a disk, serial shell; ttm/amdgpu parameters on all," \
+     "console=ttyS0,115200 console=tty0 on all $m (the screen is /dev/console)"
 MTOOLS_SKIP_CHECK=1 mcopy -s -i "$work/efi.part" "$esp"/* ::/ || {
     echo "$prog: copying the ESP tree into the FAT failed" >&2; exit 1; }
 

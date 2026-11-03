@@ -55,7 +55,10 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # os/v3 Puppy image, cycle 13: the presets a headless boot reads instead of asking. /etc/keymap is
           # one keymap name ("us") and /etc/localtime is a symlink into /usr/share/zoneinfo - neither can
           # carry a comment, and both are read by keymap-set and glibc verbatim
-          "os/v3/puppy/embed/etc/keymap", "os/v3/puppy/embed/etc/localtime"]
+          "os/v3/puppy/embed/etc/keymap", "os/v3/puppy/embed/etc/localtime",
+          # os/v3 Puppy image, cycle 15: the appliance's hostname is one word and is read verbatim by
+          # hostname(1), rc.sysinit and /etc/hosts - a comment line would BE the hostname
+          "os/v3/puppy/embed/etc/hostname"]
 
 
 def _match(name, patterns):

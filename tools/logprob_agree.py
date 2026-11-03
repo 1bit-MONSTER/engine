@@ -27,12 +27,13 @@ Answers two different questions, because they fail for different reasons:
 Both are measured on OpenAI /v1/chat/completions with logprobs=true. Greedy throughout
 (temperature 0, top_k 1) and cache_prompt false so no route is measured through a different
 prompt-cache path. Thinking is disabled by default; --thinking on is what a route that cannot be
-told to stop thinking (the NPU forward path ignores enable_thinking) has to be measured with, and
-then all routes must run with it on or the streams differ from token 0 for template reasons.
+told to stop thinking has to be measured with (the NPU forward path accepted and ignored
+enable_thinking until engine PR #864), and then all routes must run with it on or the streams
+differ from token 0 for template reasons.
 Deliberately not a training-vs-rollout harness: it takes already-served endpoints, so it measures
 the routes as users get them.
 
-  logprob_agree.py --route cpu=... --route npu=... --thinking on --match-by text
+  logprob_agree.py --route cpu=... --route npu=... --thinking off --match-by text
 
   logprob_agree.py --route cpu=http://127.0.0.1:18110 --route hrx=http://127.0.0.1:18111
   logprob_agree.py --route cpu=http://127.0.0.1:18110 --repeat 5 --json out.json

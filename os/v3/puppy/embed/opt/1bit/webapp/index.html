@@ -271,10 +271,15 @@
                   // engine#924's streaming refusal is ONE `data: {"error":{"message":...}}` frame and then
                   // [DONE] - and it carries no `type`, so the message is what says "the NPU is busy with another
                   // request". A stream that failed before it produced anything is retried whatever it said (that
-                  // is exactly the c17 "0 chunks" shape); one that failed mid-answer is reported, not repeated.
+                  // is exactly the c17 "0 chunks" shape).
                   var why = (j.error && j.error.message) || "the backend reported an error";
-                  if (isBusy(j) || /busy/i.test(why) || !chunks) throw busyErr(1000, why);
-                  throw new Error(why);
+                  // Retry ONLY on a stream that has produced NOTHING - no answer chunk and no reasoning chunk -
+                  // because a retry clears this turn's two output elements: doing it after any text would
+                  // silently replace what the reader already has, and reasoning-only output is text too
+                  // (engine#924's own refusal shape is a reasoning-only stream). A failure after output is
+                  // reported and the output is kept.
+                  if (!chunks && !rchunks) throw busyErr(1000, why);
+                  throw new Error(why + " (after " + (chunks + rchunks) + " chunk(s); the partial answer is kept)");
                 }
                 var ch = (j.choices && j.choices[0]) || {};
                 if (ch.finish_reason) finish = ch.finish_reason;

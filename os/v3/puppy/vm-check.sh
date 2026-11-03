@@ -409,6 +409,36 @@ rows = [
     ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "
                      "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
                      "/tmp/menu-self.txt | tr '\\n' ' '", "selftest-rc=0"),
+    # Cycle 17 item 4: the menu's probes run with Lemonade's environment, and no line is cut in the middle of a
+    # word (the c16 board showed "firmware prese"). Both are read off the shipped script and its own status
+    # block, so an edit that drops either is a red row rather than a nicer-looking menu.
+    ("U2 menu env", "grep -c 'libhsa.env' /usr/local/bin/1bit-console-menu; "
+                     "1bit-console-menu --status | awk 'length($0) > 78 {print \"long-line:\" $0}'; "
+                     "1bit-console-menu --status | grep -q 'firmware prese' && echo truncated || echo lines-whole",
+                     "lines-whole"),
+    # Cycle 17 item 8: the key is not in the page or its URL, and the same-origin proxy still answers WITH it.
+    # 401 direct on 13305 is the other half: the key is still enforced where it matters.
+    ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -c 'key='); "
+                     "a=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/models); "
+                     "b=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
+                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
+                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
+                     "webapp-key-not-in-url"),
+    # Cycle 17 item 2: the boot's evidence is on the DATA partition, not in RAM.
+    ("U3 boot logs", "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
+                     "ls /data/logs/*/dmesg.log > /dev/null 2>&1 && grep -q cmdline /data/logs/*/BOOT && "
+                     "echo boot-logs-on-data", "boot-logs-on-data"),
+    # Cycle 17 item 1: menu item 6 can never reset the machine - the guard is built and a reboot THROUGH it is
+    # refused, which is the same call xwin's exit path makes (`exec reboot`) and the WM's shutdown menu makes.
+    ("U2 desktop safe", "1bit-desktop --check | tail -3; 1bit-desktop --guard-test 2>&1 | tail -2",
+                     "reboot-refused"),
+    # Cycle 17 item 9: the desktop's first run is preset (zone, no Quick Setup, the browser's default-browser
+    # prompt off) and the chat screen has a startup hook Puppy actually runs.
+    ("U2 desktop preset", "readlink /etc/localtime; ls /etc/personal_settings_popup_disabled "
+                     "/root/Startup/1bit-lemonade-webapp /opt/palemoon/defaults/pref/1bit-os.js 2>&1; "
+                     "grep -c checkDefaultBrowser /opt/palemoon/defaults/pref/1bit-os.js; "
+                     "[ \"$(readlink /etc/localtime)\" = /usr/share/zoneinfo/America/Moncton ] && "
+                     "echo desktop-preset-ok", "desktop-preset-ok"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
     # version matched "Unable to locate package neofetch" and reported a pass (measured 2026-11-02)

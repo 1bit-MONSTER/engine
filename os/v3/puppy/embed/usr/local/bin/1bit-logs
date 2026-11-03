@@ -1,0 +1,150 @@
+#!/bin/sh
+# Copyright 2026 bong-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-logs - keep the boot's evidence on the 1BIT-DATA partition, not in RAM.
+#
+# Cycle 16's board boot lost the only log that could have explained a failure: the desktop session's dmesg and
+# Xorg log lived in /tmp and the next power-on erased them (C17 item 1/2). So every boot writes to
+# /data/logs/<boot-id>/ and the last five boots are kept:
+#
+#   dmesg.log                the kernel ring, appended as it grows (a wrap is marked, not silently re-copied)
+#   messages.log             /var/log/messages
+#   xorg.log                 /var/log/Xorg.0.log (only exists once X has run)
+#   xerrs.log                /tmp/xerrs.log, xwin's own capture of the X server
+#   lemond.log               /var/log/lemond-onebit.log
+#   webapp.log               /var/log/1bit-webapp.log
+#   BOOT                     date, kernel command line, uptime, release - what machine and entry this was
+#
+# Usage:
+#   1bit-logs dir            print (and create) this boot's directory
+#   1bit-logs snap [why]     append what is new in every source; `why` is written to the directory as a marker
+#   1bit-logs daemon         snap every 15 s and prune to the last five boots (that is what /etc/init.d/06onboard-logs runs)
+#   1bit-logs prune          keep only the five newest boot directories
+#
+# Exit: 0 ok, 1 nothing persists (no /data) or the directory cannot be made.
+set -u
+DATA=${ONEBIT_LOG_DATA:-/data}
+ROOT=$DATA/logs
+KEEP=5
+BOOTID_FILE=${ONEBIT_BOOTID_FILE:-/tmp/1bit-logs.bootid}
+say() { printf '%s\n' "$*"; }
+
+# The id has to be stable within one boot and different across boots, and it must not need a clock read on every
+# call (the daemon and every snap would otherwise name a different directory). /proc/sys/kernel/random/boot_id is
+# exactly that; the wall clock is only a label for a person reading the directory listing.
+bootid() {
+    [ -s "$BOOTID_FILE" ] && { cat "$BOOTID_FILE"; return 0; }
+    id=$(date -u +%Y%m%dT%H%M%S 2> /dev/null)-$(cut -c1-8 /proc/sys/kernel/random/boot_id 2> /dev/null)
+    mkdir -p "${BOOTID_FILE%/*}" 2> /dev/null
+    printf '%s' "$id" > "$BOOTID_FILE" 2> /dev/null
+    printf '%s' "$id"
+}
+
+dir() {
+    mkdir -p "$ROOT" 2> /dev/null || return 1
+    d=$ROOT/$(bootid)
+    mkdir -p "$d" 2> /dev/null || return 1
+    if [ ! -f "$d/BOOT" ]; then
+        {
+            say "date     $(date -u +%FT%TZ 2> /dev/null)"
+            say "uptime   $(cut -d' ' -f1 /proc/uptime 2> /dev/null) s"
+            say "kernel   $(uname -r 2> /dev/null)"
+            say "cmdline  $(cat /proc/cmdline 2> /dev/null)"
+            say "release  $(head -1 /data/RELEASE-TAG 2> /dev/null || sed -n 's/^payload=//p' /etc/1bit/release-identity 2> /dev/null)"
+        } > "$d/BOOT" 2> /dev/null
+    fi
+    printf '%s\n' "$d"
+}
+
+# append_new <sink name> <source>: append the bytes of <source> that the previous snap has not written yet.
+# The offset is the source's own size, so this is a tail -c, not a growing copy of a growing file. A source that
+# SHRANK is a ring buffer (dmesg) that wrapped or a log that was truncated; that is marked in the sink rather
+# than passed off as new output.
+append_new() {
+    name=$1 src=$2 d=$3
+    case $src in
+    dmesg*) ;;                      # a command, not a file: the ring is whatever `dmesg` prints now
+    *) [ -r "$src" ] || return 0 ;;
+    esac
+    case $src in
+    dmesg*) size=$(dmesg 2> /dev/null | wc -c) ;;
+    *) size=$(wc -c < "$src" 2> /dev/null || echo 0) ;;
+    esac
+    off=$(cat "$d/.$name.off" 2> /dev/null || echo 0)
+    case $off in ''|*[!0-9]*) off=0 ;; esac
+    if [ "$size" -lt "$off" ]; then
+        off=0
+        say "" >> "$d/$name.log"
+        say "--- source shrank at $(date -u +%FT%TZ 2> /dev/null) (ring buffer wrapped): restarting the copy ---" \
+            >> "$d/$name.log"
+    fi
+    [ "$size" -gt "$off" ] || return 0
+    case $src in
+    dmesg*) dmesg 2> /dev/null | tail -c +$((off + 1)) >> "$d/$name.log" ;;
+    *)      tail -c +$((off + 1)) "$src" >> "$d/$name.log" 2> /dev/null ;;
+    esac
+    printf '%s' "$size" > "$d/.$name.off" 2> /dev/null
+}
+
+snap() {
+    d=$(dir) || { say "1bit-logs: nothing persists (no $DATA)"; return 1; }
+    [ -n "${1:-}" ] && printf '%s %s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$1" >> "$d/markers"
+    append_new dmesg dmesg "$d"
+    append_new messages /var/log/messages "$d"
+    append_new xorg /var/log/Xorg.0.log "$d"
+    append_new xerrs /tmp/xerrs.log "$d"
+    append_new lemond /var/log/lemond-onebit.log "$d"
+    append_new webapp /var/log/1bit-webapp.log "$d"
+    # the offsets are this boot's bookkeeping, not evidence
+    chmod 600 "$d"/.*.off 2> /dev/null
+    return 0
+}
+
+prune() {
+    [ -d "$ROOT" ] || return 0
+    # shellcheck disable=SC2046  # the boot directories ARE the words, oldest first
+    set -- $(ls -1d "$ROOT"/*/ 2> /dev/null | sort)
+    n=$#
+    while [ "$n" -gt "$KEEP" ]; do
+        rm -rf "$1" 2> /dev/null
+        shift
+        n=$((n - 1))
+    done
+    return 0
+}
+
+daemon() {
+    # rc.services runs this with `start` at boot; a boot with no data partition keeps nothing and says so once,
+    # rather than looping over a directory that cannot exist.
+    d=$(dir) || { say "1bit-logs: no $DATA, this boot's logs stay in RAM"; exit 0; }
+    prune
+    n=0
+    while : ; do
+        snap
+        n=$((n + 1))
+        [ $((n % 40)) = 0 ] && prune
+        sleep 15
+    done
+}
+
+case ${1:-} in
+'')           snap ;;
+dir)          dir ;;
+snap)         shift; snap "${1:-}" ;;
+daemon)       daemon ;;
+prune)        prune ;;
+*)            say "usage: $0 [dir|snap [why]|daemon|prune]"; exit 2 ;;
+esac

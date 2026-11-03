@@ -1,0 +1,143 @@
+#!/bin/sh
+# Copyright 2026 bong-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-desktop - what console menu item 6 runs: start Puppy's X/JWM session and come back to the menu.
+#
+# Cycle 16's board boot, item 6 ("Start the desktop (JWM) for this session") RESET THE MACHINE, and the logs that
+# would have said why lived in RAM (C17 items 1, 2 and 10). Two things are certain from the code:
+#
+#  * Puppy's /usr/bin/xwin has exactly ONE reboot path: it `exec reboot`s when /tmp/wmexitmode.txt says so, and
+#    that file is written by wmreboot/wmpoweroff - i.e. by the shutdown menu of the window manager that xwin
+#    started. Nothing else in the X start-up path calls reboot, so a session started from this menu can hand the
+#    machine to a reboot nobody at the console menu asked for.
+#  * There is no evidence, because nothing was kept. So this script keeps it before and after: the kernel ring,
+#    xwin's own output, Xorg's log and xerrs.log go to /data/logs/<boot-id>/ (1bit-logs), and xwin runs DETACHED,
+#    so the menu process is still alive on tty1 whatever X does.
+#
+# The guard: xwin is started with a PATH whose first entry holds `reboot`/`poweroff`/`shutdown` stubs. If the
+# session asks for a reboot, the request is refused and written to the log instead - a session started from the
+# headless console menu cannot reset the box; menu item 9 is the way to reboot, and the GRUB "desktop" entry is
+# the proven way into a desktop. Everything else about the session is Puppy's, unchanged.
+#
+# Usage: 1bit-desktop [--check|--guard-test|--run-x]     (no argument: start the desktop)
+# Exit: 0 started (or explainable), 1 cannot start X here, 2 usage.
+set -u
+XWIN=/usr/bin/xwin
+LOGS=/usr/local/bin/1bit-logs
+GUARD=/run/1bit-desktop-guard
+CONF=/etc/X11/xorg.conf
+say() { printf '%s\n' "$*"; }
+
+logdir() {
+    if [ -x "$LOGS" ]; then "$LOGS" dir 2> /dev/null; else printf '/var/log/1bit-logs\n'; fi
+}
+
+# --check is what menu item 6's read-only half runs: no terminal needed, no X started, and it says which of the
+# preconditions is missing so a console row can assert it.
+check() {
+    missing=
+    [ -x "$XWIN" ] && say "xwin $XWIN" || { say "xwin missing ($XWIN)"; missing="$missing xwin"; }
+    command -v Xorg > /dev/null 2>&1 && say "xserver $(command -v Xorg)" || {
+        say "xserver missing (no Xorg on PATH)"; missing="$missing Xorg"; }
+    if [ -s "$CONF" ]; then
+        say "xorg.conf present ($CONF, driver $(sed -n 's/^[[:space:]]*Driver[[:space:]]*"\([^"]*\)".*/\1/p' "$CONF" | head -1))"
+    elif command -v xorgwizard-automatic > /dev/null 2>&1; then
+        say "xorg.conf absent (xwin will run xorgwizard-automatic on the first start)"
+    else
+        say "xorg.conf absent and no xorgwizard-automatic: X cannot be configured"
+        missing="$missing xorg.conf"
+    fi
+    say "logdir $(logdir)"
+    if [ -n "$missing" ]; then say "desktop-unavailable:$missing"; return 1; fi
+    say "desktop-available"
+    return 0
+}
+
+# The stubs are the point of the guard: same name, same call sites (`exec reboot` from xwin, `reboot` from a WM
+# shutdown menu), a refusal instead of a reset, and a line in the boot's log.
+make_guard() {
+    mkdir -p "$GUARD" 2> /dev/null || return 1
+    d=$(logdir); mkdir -p "$d" 2> /dev/null
+    for b in reboot poweroff shutdown; do
+        cat > "$GUARD/$b" <<EOF
+#!/bin/sh
+echo "1bit-desktop: refused $b from the desktop session started by console menu item 6 ($(date -u +%FT%TZ 2>/dev/null))" >&2
+echo "\$(date -u +%FT%TZ 2> /dev/null) refused $b (menu item 6 desktop session)" >> "$d/markers" 2> /dev/null
+exit 1
+EOF
+        chmod 755 "$GUARD/$b" 2> /dev/null || return 1
+    done
+    return 0
+}
+
+# --run-x is the detached child: xwin in the foreground of ITS session, and every artefact copied out afterwards.
+run_x() {
+    d=$(logdir)
+    say "== 1bit-desktop: xwin starting at $(date -u +%FT%TZ 2> /dev/null)"
+    say "PATH=$PATH"
+    PATH=$GUARD:$PATH
+    export PATH
+    TERM=${TERM:-linux}; export TERM
+    "$XWIN"
+    rc=$?
+    say "== 1bit-desktop: xwin returned $rc at $(date -u +%FT%TZ 2> /dev/null)"
+    # The X log and xerrs.log are the two files a boot would lose; the boot's own copy is what makes the next
+    # failure diagnosable even though /var/log is tmpfs.
+    [ -x "$LOGS" ] && "$LOGS" snap "xwin-returned-$rc" > /dev/null 2>&1
+    say "== 1bit-desktop: logs in $d/xorg.log and $d/xerrs.log"
+    return 0
+}
+
+start() {
+    check > /dev/null || {
+        check
+        say ""
+        say "the desktop cannot start from here: boot the GRUB entry '1bit OS (desktop, JWM)' instead."
+        return 1
+    }
+    if pgrep -x Xorg > /dev/null 2>&1 || pgrep -x X > /dev/null 2>&1; then
+        say "X is already running on this machine: nothing to start."
+        return 0
+    fi
+    make_guard || say "1bit-desktop: cannot build the reboot guard in $GUARD - continuing without it"
+    d=$(logdir)
+    [ -x "$LOGS" ] && "$LOGS" snap desktop-requested > /dev/null 2>&1
+    # A stale request from a previous session would reboot the machine the moment xwin exits; the guard refuses
+    # it in any case, and removing it keeps the log honest.
+    rm -f /tmp/wmexitmode.txt
+    setsid "$0" --run-x < /dev/null > "$d/xwin-console.log" 2>&1 &
+    say "the desktop is starting on the screen (Ctrl+Alt+F1 comes back to this menu)."
+    say "This menu keeps running: if X fails, you are back here and the reason is in $d/xwin-console.log."
+    say "A reboot asked for from inside the session is refused; menu item 9 reboots this machine."
+    say "desktop-started"
+    return 0
+}
+
+case ${1:-} in
+'')      start ;;
+--check) check ;;
+--run-x) run_x ;;
+# --guard-test is the row a VM can run: it builds the guard exactly as start does and tries a reboot THROUGH it, so
+# "menu item 6 cannot reset this machine" is measured instead of asserted. It never touches the real reboot path.
+--guard-test)
+    make_guard || { say "guard-unavailable"; exit 1; }
+    out=$(PATH=$GUARD:$PATH reboot 2>&1); rc=$?
+    say "guard rc=$rc: $out"
+    [ "$rc" -ne 0 ] && say "reboot-refused" && exit 0
+    say "guard-did-not-refuse"
+    exit 1 ;;
+*)       say "usage: $0 [--check|--guard-test|--run-x]"; exit 2 ;;
+esac

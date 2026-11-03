@@ -1,0 +1,47 @@
+#!/bin/sh
+# Copyright 2026 bong-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/06onboard-logs - keep this boot's logs on the 1BIT-DATA partition (C17 item 2).
+#
+# Puppy's console boot has no syslog on disk: dmesg is a RAM ring and /var/log is tmpfs, so a boot that ends
+# badly (cycle 16: the desktop session and then a reset) leaves nothing to read. 1bit-logs writes /data/logs/
+# <boot-id>/ and keeps the last five boots; this unit is the thing that keeps it current, so the evidence is
+# already on the stick when the failure happens.
+LOGS=/usr/local/bin/1bit-logs
+PIDFILE=/run/1bit-logs.pid
+
+start() {
+    [ -x "$LOGS" ] || { echo "06onboard-logs: $LOGS is missing" >&2; return 0; }
+    grep -q " /data " /proc/mounts 2> /dev/null || {
+        echo "06onboard-logs: no /data partition: this boot's logs stay in RAM" >&2; return 0; }
+    "$LOGS" daemon > /var/log/1bit-logs.log 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "06onboard-logs: writing /data/logs/$(cat /tmp/1bit-logs.bootid 2> /dev/null) (pid $(cat "$PIDFILE"))"
+}
+
+stop() {
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2> /dev/null
+    rm -f "$PIDFILE"
+    [ -x "$LOGS" ] && "$LOGS" snap shutdown
+}
+
+case ${1:-start} in
+start) start ;;
+stop) stop ;;
+restart) stop; sleep 1; start ;;
+status) [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2> /dev/null && echo running || echo stopped ;;
+*) echo "usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac

@@ -649,14 +649,37 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
           "pack: geometry from config.json and the embedding");
     if (qwen05b) check(true, "pack: this is the Qwen2.5-0.5B geometry the lane started from");
     const auto refused = p.refused();
-    // the MLP section is representable when its three parts fill the block stride; when they do not, all
-    // three projections per layer are refused by name, and the final norm always is
-    check(int(refused.size()) == (p.mlp_note.empty() ? 0 : layers * 3) + 1,
-          "pack: the MLP projections (refused only when their geometry does not add up) plus the final "
-          "norm, got " + std::to_string(refused.size()));
+    // Refusals are counted by what they are, not by a total that only holds for one family: the MLP
+    // payload is open whenever its three parts fill the block stride, the final norm is always refused,
+    // and the attention projections are refused only when the measured payload is not a whole number of
+    // tiles -- which is the Llama and Qwen3 packs' case and not the Qwen2.5-0.5B family's. engine#734's
+    // acceptance is the FIRST row: no layer norm may be refused.
+    int mlp = 0, tail = 0, attn = 0, norm = 0, other = 0;
+    for (const auto& t : p.tensors) {
+        if (t.refusal.empty()) continue;
+        const std::string& n = t.name;
+        const bool is_norm = n.find("layernorm") != std::string::npos || n == "model.norm.weight";
+        if (is_norm && n != "model.norm.weight") ++norm;
+        else if (n == "model.norm.weight") ++tail;
+        else if (n.find("mlp.") != std::string::npos) ++mlp;
+        else if (n.find("self_attn") != std::string::npos) ++attn;
+        else ++other;
+    }
+    check(norm == 0, "pack: no layer norm is refused at hidden " + std::to_string(p.dims.hidden) +
+                         " (engine#734; 2 per layer planned, " + std::to_string(norm) + " refused)");
+    check(mlp == (p.mlp_note.empty() ? 0 : layers * 3),
+          "pack: the " + std::to_string(layers * 3) + " MLP projections are planned when their geometry "
+          "adds up and refused by name when it does not (" + std::to_string(mlp) + ")");
+    check(tail == 1, "pack: the final norm is the one refused norm (got " + std::to_string(tail) + ")");
+    check(attn == (p.attn_note.empty() ? 0 : layers * 7),
+          "pack: attention projections are refused only when the payload does not tile (" +
+              std::to_string(attn) + " of " + std::to_string(layers * 7) + ")");
+    check(other == 0, "pack: no refusal falls outside the named classes (" + std::to_string(other) + ")");
     bool named = true;
     for (const auto& s : refused)
-        if (s.find("fconst") == std::string::npos && s.find("layer block") == std::string::npos) named = false;
+        if (s.find("fconst") == std::string::npos && s.find("layer block") == std::string::npos &&
+            s.find("payload") == std::string::npos)
+            named = false;
     check(named, "pack: every refusal names where the bytes are and the fact that is missing");
     check(p.attn_note.empty() == (p.attn_tiles > 0),
           "pack: the attention payload's tile count was measured, or the note says why not (" +
@@ -668,20 +691,22 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         check(p.mlp_gu_units == p.dims.intermediate / 64 && p.mlp_down_groups == p.dims.hidden / 64,
               "pack: 64 columns per gate|up unit and per down_proj group");
 
-    int norms = 0, attn = 0, mlp = 0, lm_tiles_planned = 0;
+    int norms = 0, attn_planned = 0, mlp_planned = 0, lm_tiles_planned = 0;
     for (const auto& t : p.tensors) {
         if (t.name.find("layernorm") != std::string::npos || t.name == "model.norm.weight") ++norms;
         if (t.dtype == "q4_1" && t.refusal.empty() && t.name.compare(0, 9, "lm_head.w") == 0)
             lm_tiles_planned = int((t.shape[0] / 32) * ((t.shape[1] + 255) / 256));
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn;
-        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp;
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find("self_attn") != std::string::npos) ++attn_planned;
+        if (t.dtype == "q4_1" && t.refusal.empty() && t.name.find(".mlp.") != std::string::npos) ++mlp_planned;
     }
     check(norms == layers * 2 + 1,
           "pack: 2 norms per layer plus the final norm are planned (the final one refused)");
-    check(attn == layers * 4, "pack: the 4 attention projections per layer are planned from the measurement");
-    check(mlp == (p.mlp_note.empty() ? layers * 3 : 0),
+    check(p.attn_note.empty() ? attn_planned == layers * 4 : true,
+          "pack: the 4 attention projections per layer are planned when the payload tiles (" +
+              std::to_string(attn_planned) + ")");
+    check(mlp_planned == (p.mlp_note.empty() ? layers * 3 : 0),
           "pack: gate/up/down are planned when the MLP geometry adds up, refused otherwise (" +
-              std::to_string(mlp) + ")");
+              std::to_string(mlp_planned) + ")");
     // K is padded to the 256-column grid, so this holds for any hidden size
     const int head_rows = int(p.tensors.at(1).shape.at(0));
     check(lm_tiles_planned == (head_rows / 32) * ((p.tensors.at(1).shape.at(1) + 255) / 256),
@@ -840,6 +865,11 @@ void test_fconst_eps(const std::string& root) {
 int main(int argc, char** argv) {
     const std::string golden_dir = argc > 1 ? argv[1] : "";
     const std::string pack = argc > 2 ? argv[2] : "";
+    // The pack leg is the only one that can regress a real pack, and ctest runs this binary with the
+    // golden dir only (CMakeLists add_test npu_pack_import), so the leg self-skips. That skip must not
+    // be reported as a pass: three of the four packs on this box were red behind a green
+    // "all npu-pack checks passed" line (engine#842 review). The final line now says which legs ran.
+    const bool pack_ran = !pack.empty() && fs::exists(pack + "/model.onnx");
     try {
         test_bounds();
         test_crafted_refusals(golden_dir.empty() ? "." : golden_dir);
@@ -847,8 +877,8 @@ int main(int argc, char** argv) {
         test_tiles(golden_dir);
         test_attn_tile(golden_dir);
         test_mlp_gu(golden_dir);
-        if (!pack.empty() && fs::exists(pack + "/model.onnx")) test_pack(pack, golden_dir);
-        else std::printf("skip pack: no pack directory given\n");
+        if (pack_ran) test_pack(pack, golden_dir);
+        else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {
         std::fprintf(stderr, "FAIL exception: %s\n", e.what());
         return 1;
@@ -857,6 +887,7 @@ int main(int argc, char** argv) {
         std::fprintf(stderr, "%d check(s) failed\n", failures);
         return 1;
     }
-    std::printf("all npu-pack checks passed\n");
+    std::printf("all npu-pack checks passed%s\n",
+                pack_ran ? " (including the pack leg)" : " -- pack leg SKIPPED, no pack directory given");
     return 0;
 }

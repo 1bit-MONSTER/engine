@@ -302,8 +302,16 @@ librocm_sysdeps_z.so.1 librocm_sysdeps_zstd.so.1 librocm_sysdeps_liblzma.so.5 li
             exit 1; }
         echo "   HSA runtime set ($(ls "$skeleton/opt/rocm-therock/lib" | wc -l) files, libhsa $(sha256sum /libhsa-runtime/libhsa-runtime64.so.1 | cut -c1-16)) into /opt/rocm-therock/lib, ldd clean"
     else
+        # pi-prs' review guide asked why an embedded appliance may be built without an HRX runtime. It may not: an
+        # image with the release engine and no libhsa is exactly the cycle-13 appliance that booted, served CPU, and
+        # had HRX register NO device on the board (the board's `hrx-device`/`chat-hrx` rows failed on it). The
+        # runtime is part of the appliance, not an option, so this is a refusal now - for a PAYLOAD image only, since
+        # a plain Puppy base (no PAYLOAD) has no engine that could use one.
         rm -f "$skeleton/etc/1bit/libhsa.env"
-        echo "   WARNING: no LIBHSA_DIR=<dir>: this image has no HRX runtime (U4 needs one)"
+        echo "build: REFUSED: PAYLOAD is set but LIBHSA_DIR is not - an appliance with the release engine and no" >&2
+        echo "  HSA runtime cannot serve HRX (that is the cycle-13 board failure). Pass LIBHSA_DIR=<dir> with the" >&2
+        echo "  10-file runtime set." >&2
+        exit 1
     fi
 fi
 

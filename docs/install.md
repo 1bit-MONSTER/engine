@@ -18,8 +18,7 @@ limitations under the License.
 
 1bit OS is the Puppy Linux appliance in [os/README.md](../os/README.md): Lemonade Server with this engine
 inside, our MOK-signed kernel, headless by default. It runs from the stick it was written to, and it can
-install itself onto a disk: `1bit-install` copies the system you booted, so an install downloads nothing
-and takes about a minute.
+install itself onto a disk: `1bit-install` copies the system you booted, so an install downloads nothing.
 
 | what you want | how | what it erases |
 |---|---|---|

@@ -300,7 +300,11 @@ fi
 echo "== ownership: the whole skeleton -> root:root, nothing group/other-writable in /etc"
 chown -R 0:0 "$skeleton" 2> /dev/null || true
 chmod -R go-w "$skeleton/etc" "$skeleton/usr/local/petget" 2> /dev/null || true
-gw=$(find "$skeleton/etc" "$skeleton/usr/local/petget" \( -perm -0020 -o -perm -0002 \) 2> /dev/null | head -5)
+# regular files and directories only: a SYMLINK is always 777 and chmod cannot change it, so five links in the
+# stock skeleton (/etc/localtime, /etc/ppp/resolv.conf, ...) were reported as group-writable files by the first
+# version of this check and refused a good tree (measured). What matters is the mode of the file the link names.
+gw=$(find "$skeleton/etc" "$skeleton/usr/local/petget" \( -type f -o -type d \) \
+    \( -perm -0020 -o -perm -0002 \) 2> /dev/null | head -5)
 [ -z "$gw" ] || { echo "build: REFUSED: still group/other-writable in the tree:" >&2; printf '   %s\n' $gw >&2; exit 1; }
 echo "   ok: skeleton is root-owned and /etc is not group/other-writable"
 

@@ -458,3 +458,67 @@ float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
     }
     return (float)(ssum / (double)N);
 }
+
+/* ── The launch contract: the argument widths a full ELF declares ───────────────────────────────
+ *
+ * An aiecc full ELF carries one STT_OBJECT symbol per kernel argument in .dynsym, named "0", "1",
+ * "2", whose st_size is the byte width the kernel's shim DMA touches — the driver patches those very
+ * symbols, so this is the artifact's own contract and not a copy of one.  A launcher that passes a
+ * narrower buffer does not fail loudly: the DMA runs past the mapping, the IOMMU logs IO_PAGE_FAULTs
+ * and the kernel multiplies whatever follows (measured 2026-11-02 on the 896-hidden OGA pack, whose
+ * ELF family is (weights, activations, output) = (655,360, 2,048, 4,096) B while the int8 launcher
+ * passed (16,384, 1,048,576, 65,536) B: 639 KB of weight stream read past a 16 KB BO).  Reading the
+ * widths here lets a load refuse instead of dispatching.
+ *
+ * Returns the number of argument widths found (0..3), or -1 when the file is not a 32-bit
+ * little-endian ELF or has no .dynsym.  out[] entries that were not declared stay 0. */
+int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]) {
+    if (out) { out[0] = out[1] = out[2] = 0; }
+    if (!elf || !out || n < 52) return -1;
+    const uint8_t* b = (const uint8_t*)elf;
+    if (memcmp(b, "\x7f" "ELF", 4) || b[4] != 1 || b[5] != 1) return -1;   /* ELF32, LSB */
+#define RD16(p) ((uint32_t)(p)[0] | ((uint32_t)(p)[1] << 8))
+#define RD32(p) ((uint64_t)(p)[0] | ((uint64_t)(p)[1] << 8) | ((uint64_t)(p)[2] << 16) | \
+                 ((uint64_t)(p)[3] << 24))
+    const uint64_t shoff = RD32(b + 0x20);
+    const uint32_t shentsize = RD16(b + 0x2E), shnum = RD16(b + 0x30);
+    if (shentsize < 40 || !shnum || shnum > 512) return -1;      /* real artifacts have ~13 */
+    if (shoff + (uint64_t)shentsize * shnum > n) return -1;
+    struct sh { uint64_t off, size, link, entsize, type; };
+    struct sh sect[512];
+    for (uint32_t i = 0; i < shnum; i++) {
+        const uint8_t* p = b + shoff + (uint64_t)i * shentsize;
+        sect[i].type = RD32(p + 4);
+        sect[i].off = RD32(p + 16);
+        sect[i].size = RD32(p + 20);
+        sect[i].link = RD32(p + 24);
+        sect[i].entsize = RD32(p + 36);
+        if (sect[i].type != 8 /* SHT_NOBITS */ && sect[i].off + sect[i].size > n) return -1;
+    }
+    int found = 0;
+    for (uint32_t i = 0; i < shnum; i++) {
+        if (sect[i].type != 11 /* SHT_DYNSYM */ || sect[i].link >= shnum) continue;
+        const struct sh* st = &sect[sect[i].link];              /* the symbols' string table */
+        const uint32_t esz = sect[i].entsize ? (uint32_t)sect[i].entsize : 16;
+        if (esz < 16) continue;
+        for (uint64_t s = 1; s * esz + 16 <= sect[i].size; s++) {
+            const uint8_t* sym = b + sect[i].off + s * esz;
+            const uint64_t name = RD32(sym);
+            const uint64_t size = RD32(sym + 8);
+            const uint8_t info = sym[12];
+            if ((info & 0xF) != 1 /* STT_OBJECT */ || !size) continue;
+            if (name >= st->size) continue;
+            const uint8_t* nm = b + st->off + name;
+            const uint64_t room = st->size - name;
+            if (room < 1) continue;
+            /* the argument symbols are named by their index: "0", "1", "2" */
+            if (room >= 2 && nm[1] != 0) continue;
+            if (nm[0] < '0' || nm[0] > '2') continue;
+            const int idx = nm[0] - '0';
+            if (!out[idx]) { out[idx] = size; found++; }
+        }
+    }
+#undef RD16
+#undef RD32
+    return found ? found : -1;
+}

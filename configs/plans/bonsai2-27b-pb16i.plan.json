@@ -1,6 +1,6 @@
 {
  "format": "1bit-npu-plan/1",
- "generated_by": "tools/npu_plan.py 1.0",
+ "generated_by": "tools/npu_plan.py 1.1",
  "model": {
   "hidden": 5120,
   "layers": 64,
@@ -34,6 +34,9 @@
  },
  "kernels": {
   "tag": "_pb16i"
+ },
+ "attention": {
+  "mode": "causal"
  },
  "moe": {
   "batched_expert_gu": {

@@ -69,6 +69,19 @@ if(ONEBIT_EP_NPU)
     set_tests_properties(onebit_npu_gemm_probe PROPERTIES
         PASS_REGULAR_EXPRESSION "PASS NPU gemm matches"
         SKIP_REGULAR_EXPRESSION "NPU unavailable")
+
+    # The A8W8 kernel on both legs: exact int32 accumulators required identical, ms/call each way.
+    # It measures the kernel a fused QDQ group runs (the QDQ proof gates its arithmetic), so it
+    # skips rather than fails when the shape's design is not configured.
+    add_executable(onebit_npu_gemm_q8_probe ${CMAKE_CURRENT_SOURCE_DIR}/../../npu/ort/onebit_npu_gemm_q8_probe.cpp
+        ${_npu_src})
+    target_include_directories(onebit_npu_gemm_q8_probe PRIVATE ${_npu_incs})
+    target_compile_definitions(onebit_npu_gemm_q8_probe PRIVATE ${_npu_defs})
+    target_link_libraries(onebit_npu_gemm_q8_probe PRIVATE ${_npu_libs})
+    add_test(NAME onebit_npu_gemm_q8_probe COMMAND onebit_npu_gemm_q8_probe 1024 1024 16 5)
+    set_tests_properties(onebit_npu_gemm_q8_probe PROPERTIES
+        PASS_REGULAR_EXPRESSION "PASS NPU q8 gemm matches"
+        SKIP_REGULAR_EXPRESSION "could not run")
 endif()
 set_target_properties(onebit_ep PROPERTIES
     OUTPUT_NAME onebit_ep

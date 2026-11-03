@@ -469,20 +469,48 @@ if [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1; then
             HRXLIB=$(cat /etc/1bit/libhsa 2>/dev/null)
             [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
         fi
-        # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
-        # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
-        # on stderr and that text is the diagnostic.
-        LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
-        # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
-        # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
-        # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
-        HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
-        if [ -n "$HRXDEV" ]; then
-            pass hrx-device "$HRXDEV"
-        elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
-            fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+        # Cycle 14, measured on the cycle-13 board: this row printed "no HRX0 listed ... (Available devices: (none))",
+        # which reads as a GPU fault. The GPU was fine. The appliance names the runtime in /etc/1bit/libhsa.env as
+        # ONEBIT_HRX_LIBHSA - a build-time CMake name that no code reads from the environment - and ships that runtime
+        # ALONE, with five NEEDED libraries missing, so the dlopen fails whoever names it. So: take the path from either
+        # file and either key, then ask the loader whether the file can be loaded BEFORE asking llama-server for devices,
+        # and give the two failures different words.
+        if [ -z "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && [ -r /etc/1bit/libhsa.env ]; then
+            HRXLIB=$(sed -n 's/^IREE_HAL_AMDGPU_LIBHSA_PATH=//p;s/^ONEBIT_HRX_LIBHSA=//p' /etc/1bit/libhsa.env 2>/dev/null | head -1)
+            [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
+        fi
+        HRXUNLOADABLE=
+        if [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ]; then
+            # ldd where it exists (it lists EVERY missing library); the loader itself where it does not - and the loader
+            # refuses a library with missing dependencies without printing any "=> not found" line at all:
+            #   <path>: error while loading shared libraries: librocm_sysdeps_elf.so.1: cannot open shared object file
+            # so both shapes are read here. (Measured on the cycle-13 runtime: the loader form is the only one it gives.)
+            if command -v ldd > /dev/null 2>&1; then HRXLOAD=$(ldd "$IREE_HAL_AMDGPU_LIBHSA_PATH" 2>&1)
+            else HRXLOAD=$(/lib64/ld-linux-x86-64.so.2 --list "$IREE_HAL_AMDGPU_LIBHSA_PATH" 2>&1); fi
+            HRXMISS=$(printf '%s\n' "$HRXLOAD" | sed -n 's/^[[:space:]]*\([^[:space:]]*\)[[:space:]]*=>[[:space:]]*not found.*/\1/p; s/.*error while loading shared libraries: \([^:]*\):.*/\1/p' | sort -u | tr '\n' ' ')
+            if [ -n "$HRXMISS" ]; then
+                fail hrx-device "the HRX runtime $IREE_HAL_AMDGPU_LIBHSA_PATH cannot be dlopened: it needs ${HRXMISS}- the image must ship them flat beside it (os/mini/mkimage.sh does), so this is a wiring defect, not a GPU one"
+                HRXUNLOADABLE=1
+            fi
+        fi
+        if [ -n "$HRXUNLOADABLE" ]; then
+            :   # already reported above, with the cause; do not ask llama-server and blame the device
         else
-            fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+            # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
+            # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
+            # on stderr and that text is the diagnostic.
+            LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
+            # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
+            # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
+            # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
+            HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
+            if [ -n "$HRXDEV" ]; then
+                pass hrx-device "$HRXDEV"
+            elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
+                fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+            else
+                fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+            fi
         fi
     fi
 else

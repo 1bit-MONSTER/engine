@@ -83,6 +83,29 @@ a round (A B, then B A) in whatever drives the A/B pair: the script detects a co
 way and says so, because that is the second serve's warm-up, not noise. `scripts/npu-window11.sh --self-test` is
 the committed check of that policy.
 
+**The folded row (`--folded`), engine#876.** That gate ran on one `rm` Qwen3-0.6B container, which has no folded
+basis, no ternary LM head and no split full-attention QKV — so the parts of the forward the containers this box
+actually serves (`bonsai2-27b-pb16i`, `bonsai2-27b-t2s2`) depend on were never executed by it. Three defects that
+lived exactly there (engine#808) were invisible to a gate that had produced 108/108 identical transcripts, 9/9
+identical prof rows and 452 bit-identical logprob tokens: a dropped role→context resolution for ternary-only designs
+(the container refuses to answer), the activation rotation rewritten as an xor butterfly (a signed permutation of the
+true Hadamard — wrong activations on every projection, well-formed output), and `head_pb16i_` read as a
+self-referencing local (the LM head takes the int8 branch against a ternary ELF → `SIGSEGV` in `run_lm_head`). Text
+equality cannot see any of them, because two of the three keep the text plausible and the third kills the process.
+
+So `--folded` runs the same three transcripts against a folded container **with the container's own
+debug taps on** (`NPU_PB16I_TRACE` / `NPU_QKV_DUMP`, both already in the forward, so neither arm is instrumented
+differently) and records, per launch of the tapped layer, the raw activation, the rotated activation, the int8 codes
+the kernel was given, its int32 accumulator, the dequantised output and the side-table `eref`. Two runs must agree on
+those lines as well as on the text, and there the tap equality is the assertion that bites: with no measured control
+the ms/launch columns are printed but not scored (a hand-typed 2 % cannot be evaluated on this box, engine#834), and
+with `--control` they are scored like any other row. Cost: one container already on disk, ~2.5 min of device time for
+both sides of a comparison, no new artifacts. The row also caught the fourth defect, on `main` rather than in a pack:
+an `I8` embedding table dequantised against a K grid that was still 0 (engine#881, fixed ahead of this row). What it
+must accept and refuse is pinned without a device by `tests/npu_window11_compare.sh` (ctest `npu_window11_compare`):
+folded against folded passes, a single differing rotated activation fails, a folded log against a plain one fails, and
+the plain row keeps its tolerance.
+
 **`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
 `noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
 full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt

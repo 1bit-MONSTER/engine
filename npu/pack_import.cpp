@@ -243,8 +243,9 @@ Fconst open_fconst(const std::string& path) {
     return f;
 }
 
-bool eps_at(const Fconst& f, int64_t off) {
-    return off >= 0 && size_t(off) + 4 <= f.size && f.map[off] == 0x86 && f.map[off + 1] == 0x35;
+bool eps_at(const Fconst& f, int64_t off, unsigned short eps_bits) {
+    return off >= 0 && size_t(off) + 4 <= f.size && f.map[off] == uint8_t(eps_bits & 0xFF) &&
+           f.map[off + 1] == uint8_t(eps_bits >> 8);
 }
 
 const uint8_t* at(const Fconst& f, int64_t off, int64_t len) {
@@ -270,26 +271,20 @@ std::string find_one(const std::string& dir, const std::string& prefix, const st
 // is the structure: every layer block opens with the bf16 epsilon (1e-6 = 86 35) plus zero padding, and
 // carries a second such header right after the attention payload. So the header positions form a
 // sequence with one period per block, and the stride is positions[i+P] - positions[i] for that P.
-// Measured this way: 0.5B -> 8,708,288 (P=2), 1.7B -> 27,931,456 (P=4), 4B -> 55,688,096 (P=4).
-struct FconstGeom {
-    int64_t stride = 0;   // bytes per layer block
-    int64_t h1 = 0;       // offset of the second (post-attention) header within a block
-    int period = 0;       // headers per block
-    int blocks = 0;       // block starts seen
-    std::string why;      // non-empty when the geometry could not be established
-};
-
-bool is_eps_header(const uint8_t* p, const uint8_t* end) {
-    // bf16 1e-6 little-endian, then zero padding: 22 zero bytes is far beyond chance for a 2-byte
-    // prefix but short enough that a genuine 64-byte header always qualifies.
+// Measured this way on the npu_4K packs: 0.5B -> 8,708,288 (P=2), 1.7B -> 27,931,456 (P=4), 4B -> 55,308,096
+// (P=4). The 0.5B hybrid pack shares the 0.5B hidden size and has stride 8,786,048, so this is not a table.
+bool is_eps_header(const uint8_t* p, const uint8_t* end, unsigned short eps_bits) {
+    // The pack's own bf16 epsilon little-endian, then zero padding: ten zero bytes is far beyond
+    // chance for a 2-byte prefix but short enough that a genuine 64-byte header always qualifies.
     if (end - p < 12) return false;
-    if (p[0] != 0x86 || p[1] != 0x35) return false;
+    if (p[0] != uint8_t(eps_bits & 0xFF) || p[1] != uint8_t(eps_bits >> 8)) return false;
     for (int i = 2; i < 12; ++i)
         if (p[i] != 0) return false;
     return true;
 }
 
-std::vector<int64_t> eps_header_positions(const std::string& path, size_t max_bytes) {
+std::vector<int64_t> eps_header_positions(const std::string& path, size_t max_bytes,
+                                          unsigned short eps_bits) {
     std::ifstream f(path, std::ios::binary);
     std::vector<int64_t> out;
     if (!f) return out;
@@ -303,54 +298,13 @@ std::vector<int64_t> eps_header_positions(const std::string& path, size_t max_by
         const uint8_t* p = buf.data();
         const uint8_t* end = p + got;
         for (; p + 2 < end; ++p) {
-            if (*p == 0x86 && p[1] == 0x35 && is_eps_header(p, end)) out.push_back(int64_t(base) + (p - buf.data()));
+            if (*p == uint8_t(eps_bits & 0xFF) && p[1] == uint8_t(eps_bits >> 8) &&
+                is_eps_header(p, end, eps_bits))
+                out.push_back(int64_t(base) + (p - buf.data()));
         }
         base += got;
     }
     return out;
-}
-
-FconstGeom locate_fconst(const std::string& path) {
-    FconstGeom g;
-    const auto pos = eps_header_positions(path, size_t(1) << 30);
-    if (pos.size() < 6) {
-        g.why = "fewer than 6 RMSNorm epsilon headers in the first GiB";
-        return g;
-    }
-    // The header positions repeat with one period per layer block. Take the most common
-    // pos[i+P] - pos[i] for each small P and require it to dominate: a header missed at a read-chunk
-    // boundary must not defeat the measurement (it did on the 4B pack, where the strict test failed).
-    for (int P = 1; P <= 8; ++P) {
-        if (int(pos.size()) <= P + 2) break;
-        std::map<int64_t, int> votes;
-        int pairs = 0;
-        for (size_t i = 0; i + P < pos.size(); ++i) {
-            const int64_t d = pos[i + P] - pos[i];
-            if (d < 1000000) continue;
-            ++votes[d];
-            ++pairs;
-        }
-        for (const auto& [d, n] : votes) {
-            if (pairs < 4 || n * 10 < pairs * 8) continue;  // needs >= 80 % of the pairs
-            if (!g.stride || d > g.stride) {                 // prefer the largest consistent period
-                g.stride = d;
-                g.period = P;
-            }
-        }
-        if (g.stride) break;
-    }
-    if (!g.stride) {
-        g.why = "the epsilon headers do not repeat with a single period";
-        return g;
-    }
-    g.h1 = pos[1] - pos[0];
-    if (g.h1 <= 0 || g.h1 >= g.stride) {
-        g.why = "the second header is not inside the first block";
-        g.stride = 0;
-        return g;
-    }
-    g.blocks = int(pos.size());
-    return g;
 }
 
 float f16_to_f32(uint16_t h) {
@@ -470,6 +424,8 @@ Dims read_dims(const json& c) {
     d.vocab = c.value("vocab_size", 0);
     d.rope_theta = c.value("rope_theta", 10000.0f);
     d.model_type = c.value("model_type", "");
+    d.rms_norm_eps = c.value("rms_norm_eps", 1e-6f);
+    d.eps_bits = bf16_bits_of(d.rms_norm_eps);
     if (c.contains("eos_token_id")) {
         const auto& e = c["eos_token_id"];
         if (e.is_array()) d.eos = e.get<std::vector<int>>();
@@ -479,6 +435,59 @@ Dims read_dims(const json& c) {
 }
 
 }  // namespace
+
+// engine#734: exported so the epsilon anchor itself can be tested against a crafted .fconst, without a pack.
+// The two bytes a bf16 epsilon is stored as (little-endian): round the f32 to nearest-even bf16.
+unsigned short bf16_bits_of(float v) {
+    uint32_t u = 0;
+    std::memcpy(&u, &v, 4);
+    u += 0x7fffu + ((u >> 16) & 1u);
+    return (unsigned short)(u >> 16);
+}
+
+FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits) {
+    FconstGeom g;
+    const auto pos = eps_header_positions(path, size_t(1) << 30, eps_bits);
+    if (pos.size() < 6) {
+        g.why = "fewer than 6 RMSNorm epsilon headers in the first GiB";
+        return g;
+    }
+    // The header positions repeat with one period per layer block. Take the most common
+    // pos[i+P] - pos[i] for each small P and require it to dominate: a header missed at a read-chunk
+    // boundary must not defeat the measurement (it did on the 4B pack, where the strict test failed).
+    for (int P = 1; P <= 8; ++P) {
+        if (int(pos.size()) <= P + 2) break;
+        std::map<int64_t, int> votes;
+        int pairs = 0;
+        for (size_t i = 0; i + P < pos.size(); ++i) {
+            const int64_t d = pos[i + P] - pos[i];
+            if (d < 1000000) continue;
+            ++votes[d];
+            ++pairs;
+        }
+        for (const auto& [d, n] : votes) {
+            if (pairs < 4 || n * 10 < pairs * 8) continue;  // needs >= 80 % of the pairs
+            if (!g.stride || d > g.stride) {                 // prefer the largest consistent period
+                g.stride = d;
+                g.period = P;
+            }
+        }
+        if (g.stride) break;
+    }
+    if (!g.stride) {
+        g.why = "the epsilon headers do not repeat with a single period";
+        return g;
+    }
+    g.h1 = pos[1] - pos[0];
+    if (g.h1 <= 0 || g.h1 >= g.stride) {
+        g.why = "the second header is not inside the first block";
+        g.stride = 0;
+        return g;
+    }
+    g.blocks = int(pos.size());
+    return g;
+}
+
 
 // ── MatMulNBits → (codes, scale, zero) per 32-column group ───────────────────
 Q4 decode_matmulnbits(const uint8_t* qweight, const float* scales, const uint8_t* zeros,
@@ -814,7 +823,7 @@ Plan plan(const std::string& pack_dir) {
             p.attn_note = "hidden " + std::to_string(H) + " is not a multiple of 128, so the attention "
                                                                   "payload is not 64-row tiles of this shape";
         } else {
-            const FconstGeom g = locate_fconst(tok);
+            const FconstGeom g = locate_fconst(tok, p.dims.eps_bits);
             if (g.stride == 0) {
                 p.attn_note = "layer blocks not located: " + g.why;
             } else {
@@ -1135,7 +1144,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
 
     {
         const std::string path = find_one(pack_dir, "dd_metastate_Llm_Token_Token_", ".fconst");
-        const FconstGeom g = locate_fconst(path);
+        const FconstGeom g = locate_fconst(path, p.dims.eps_bits);
         // refusals decided while reading the payload (a tile that does not survive its own round trip,
         // or an o_proj bias the container has nowhere to put); they land before anything is written
         std::vector<std::string> late;
@@ -1153,7 +1162,8 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
             for (int L = 0; L < p.dims.layers; ++L) {
                 const int64_t base = int64_t(L) * g.stride;
                 r.norm_anchors_total += 2;
-                r.norm_anchors_ok += int(eps_at(fc, base)) + int(eps_at(fc, base + g.h1));
+                r.norm_anchors_ok += int(eps_at(fc, base, p.dims.eps_bits)) +
+                                 int(eps_at(fc, base + g.h1, p.dims.eps_bits));
                 add_norm(base + kNormOff, "model.layers." + std::to_string(L) + ".input_layernorm.weight");
                 add_norm(base + g.h1 + kNormOff,
                          "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");

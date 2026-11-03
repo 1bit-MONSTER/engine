@@ -111,6 +111,36 @@ int main(void) {
     check(q4nx_elf_arg_sizes(elf, 16, z) == -1, "a truncated header is refused");
     check(q4nx_elf_arg_sizes(NULL, len, z) == -1, "a null image is refused");
 
+    // ── the gemv family's rule, which decides how a launch is shaped (engine#855) ──
+    // Declarations measured on the OGA 0.5B pack's five ELFs: (stream/4, 2K, N) at K=1024/4864.
+    // The per-core split is real, so a rule that compared arg0 or arg2 against the FULL width would
+    // mis-classify every one of them -- which is exactly what happened before this rule existed.
+    {
+        struct { int K, N; uint64_t decl[3]; int want; const char* what; } cases[] = {
+            {1024, 1536,   {245760, 2048, 1536},    1, "QKV K=1024 N=1536 (per-core stream, whole row)"},
+            {1024, 1024,   {163840, 2048, 1024},    1, "O K=1024 N=1024"},
+            {1024, 9728,   {1556480, 2048, 9728},   1, "GU K=1024 N=9728"},
+            {4864, 1024,   {778240, 9728, 1024},    1, "D K=4864 N=1024 (arg1 is 2*K)"},
+            {1024, 152064, {24330240, 2048, 152064}, 1, "head K=1024 N=152064"},
+            // the int8 per-tile family: (tile, K int8, N int32) -- must NOT be taken for gemv
+            {6144, 5120,   {512, 1024, 4096},       0, "an int8 per-tile ELF"},
+            // near misses: full-width stream, wrong output width, wrong K grid, arg1 not 2K
+            {1024, 1536,   {983040, 2048, 1536},    0, "stream given whole instead of per core"},
+            {1024, 1536,   {245760, 2048, 1536 * 4}, 0, "output given in bytes instead of elements"},
+            {1024, 1536,   {245760, 1024, 1536},    0, "int8-width activations"},
+            {1000, 1536,   {245760, 2000, 1536},    0, "K not on the 256 grid"},
+            {1024, 1500,   {0, 2048, 1536},         0, "zero stream width"},
+        };
+        for (size_t i = 0; i < sizeof cases / sizeof cases[0]; i++) {
+            const int got = q4nx_gemv_family(cases[i].decl, cases[i].K, cases[i].N);
+            if (got != cases[i].want) {
+                printf("FAIL gemv family: %s\n", cases[i].what);
+                failures++;
+            }
+        }
+        printf("gemv family: %zu declarations classified\n", sizeof cases / sizeof cases[0]);
+    }
+
     free(elf); free(e2); free(bad);
     printf("%s\n", failures ? "FAILED" : "all cases ok");
     return failures ? 1 : 0;

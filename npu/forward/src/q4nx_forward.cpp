@@ -2751,7 +2751,9 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
             return false;
         }
         gemv_head_.assign(want, 0);
-        std::memcpy(gemv_head_.data(), raw, std::min(have, (size_t)d->data_size));
+        // Bound by the DESTINATION, not the source: `want` is this buffer's size, and the tail past
+        // the container's tiles is zero-fill by construction.
+        std::memcpy(gemv_head_.data(), raw, std::min(want, have));
         if (!head_bo_) head_bo_ = ctx_head_->make_weight_bo(*dev_);
         if (!ctx_head_->upload_tiles_into(*head_bo_, gemv_head_.data(), gemv_head_.size())) {
             err_ = "gemv head: upload failed"; return false;

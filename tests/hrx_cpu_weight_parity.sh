@@ -41,20 +41,32 @@
 # is therefore not achievable across backends, and a row that demands it reports coin flips as placement bugs.
 #
 # So the row compares the DISTRIBUTION: each device arm against the CPU arm, and the two device arms against each other,
-# must still overlap and still agree. Calibration from the same two stacks (see the table above and below):
+# must still overlap and still agree. Calibration from the same two stacks, scored the way this row scores them (see
+# "shared history" below):
 #
-#   correct stack                               overlap 0.63-0.78, median |dlogprob| 0.038-0.094 nats
-#   engine #674's corruption (garbage output)   overlap 0.00,      median undefined (nothing shared)
+#   correct stack (c21 `ca1d42f`, cpu vs weightscpu / offload / weightscpu vs offload)
+#                                                      overlap 0.96-0.97, median |dlogprob| 0.036-0.085 nats
+#   engine #674's corruption (garbage output)          overlap 0.00,      median undefined (nothing shared, 1 shared step)
 #
-# Thresholds: overlap >= 0.30 and median |dlogprob| <= 0.50 nats. Those sit an order of magnitude clear of a correct
-# stack in both metrics and cannot survive the corruption, which shares no top-5 candidate at all. The texts are still
-# printed, with the step they fork at and the number of steps compared, because a human reading a failure wants
-# them — they just do not decide the verdict. A pair with fewer than kMinSteps comparable steps fails: a truncated
-# arm agrees by construction over the one step it produced.
+# Thresholds: overlap >= 0.30 and median |dlogprob| <= 0.50 nats, judged on the FULL-PRECISION values (the printed
+# numbers are rounded for reading only, so 0.50004 cannot pass a 0.50 limit). They sit ~3x clear of a correct stack in
+# both metrics and cannot survive the corruption, which shares no top-5 candidate at all. The texts are still printed,
+# with the step they fork at and the number of steps compared, because a human reading a failure wants them — they just
+# do not decide the verdict.
+#
+# SHARED HISTORY, which is what makes those numbers mean anything. At temperature 0 the arms produce the same tokens
+# until one step flips, and from the NEXT step on each arm is conditioning on its own different prefix: comparing their
+# distributions there compares two different computations, and it drags a correct stack's overlap down to 0.63-0.78 for
+# no reason. So a pair is scored only over the steps whose input history is the same for both arms — every step up to and
+# including the first fork (the fork step itself is comparable: identical prefix, different sample) — and it is judged
+# only when that shared prefix is at least kMinSteps long. A pair that forks before then fails, and the message says so
+# explicitly rather than blaming truncation: after a fork the distributions are not comparable at all.
 #
 # KNOWN LIMIT, stated rather than implied: this row detects placement changing the *distribution* (the #674 class: wrong
 # numbers, garbage, a collapsed or shifted top-5). It does not certify bit-identical arithmetic across backends, and it
-# would not catch a bug that perturbs the answer by less than the cross-backend spread measured above.
+# would not catch a bug that perturbs the answer by less than the cross-backend spread measured above. It also cannot
+# judge a pair that diverges inside the first kMinSteps steps, where it fails closed (correct stack forks at step 14 and
+# 18, so the margin is four steps).
 #
 # The device arm is also the only row that notices the silent no-device trap: on this box the #715 trio is necessary but
 # not sufficient (`IREE_HAL_AMDGPU_LIBHSA_PATH` decides whether the HAL finds a runtime that can open the device at all),
@@ -137,10 +149,11 @@ check "the CPU answers at all" '[ -n "$cpu" ]'
 # How many steps a pair must share before its numbers mean anything. An arm that ends early (EOS, a truncated
 # response, or a placement bug that stops the graph) leaves only a short comparable prefix, and a short prefix always
 # agrees: one step of two identical top-5 lists is overlap 1.00 and median 0.0000. That is the failure this row exists
-# to catch, so a pair is judged only when it has at least this many steps.
+# to catch, so a pair is judged only when it has at least this many steps, and only over steps the two arms share a
+# history for (see SHARED HISTORY above).
 kMinSteps=12
 
-compare() { # $1 left tag, $2 right tag; prints "<overlap> <median|d|> <steps> <fork>"
+compare() { # $1 left tag, $2 right tag; prints "<overlap> <median> <steps> <scored> <fork> <verdict>"
     python3 - "$work/$1.json" "$work/$2.json" <<'PY'
 import json, sys
 def load(p):
@@ -149,8 +162,13 @@ def load(p):
              "top": [(t["token"], t["logprob"]) for t in s.get("top_logprobs", [])]} for s in cp]
 a, b = load(sys.argv[1]), load(sys.argv[2])
 steps = min(len(a), len(b))
+# First step whose sampled token differs. Every step before it had an identical history, and that step had one too (same
+# prefix, different sample), so the comparable prefix is [0, fork]. After it the arms condition on different tokens and
+# their distributions describe different computations.
+fork = next((i for i in range(steps) if a[i]["id"] != b[i]["id"]), -1)
+scored = steps if fork < 0 else fork + 1
 ds, shared, possible = [], 0, 0
-for i in range(steps):
+for i in range(scored):
     right = dict(b[i]["top"])
     for tok, lp in a[i]["top"]:
         possible += 1
@@ -163,26 +181,40 @@ n = len(ds)
 # True median: an even sample averages its two middle values (the upper-middle element is not the median). nan when
 # nothing is shared, so the printed number says "undefined" instead of a 0.0 that looks like agreement.
 median = float("nan") if not n else (ds[n // 2] if n % 2 else 0.5 * (ds[n // 2 - 1] + ds[n // 2]))
-fork = next((i for i in range(steps) if a[i]["id"] != b[i]["id"]), -1)   # first step where the sampled token differs
-print(f"{overlap:.2f} {median:.4f} {steps} {fork}")
+# The verdict is decided HERE, on the full-precision values; the two printed numbers are rounded for reading. Comparing
+# the rounded strings let 0.50004 pass a <= 0.50 limit by exactly the amount that was hidden.
+verdict = "ok" if (overlap >= 0.30 and median == median and median <= 0.50) else "limit"
+print(f"{overlap:.2f} {median:.4f} {steps} {scored} {fork} {verdict}")
 PY
 }
 agree() { # $1 description, $2 left, $3 right
-    local overlap median steps fork where
-    read -r overlap median steps fork <<<"$(compare "$2" "$3")"
-    if [ "$fork" -lt 0 ]; then where="none (the texts are identical over the $steps compared steps)"
+    local overlap median steps scored fork verdict where
+    read -r overlap median steps scored fork verdict <<<"$(compare "$2" "$3")"
+    if [ "$fork" -lt 0 ]; then
+        if [ "$steps" -eq 0 ]; then where="n/a (one arm returned no comparable steps)"
+        else where="none (the texts are identical over the $steps compared steps)"; fi
     else where="step $fork"; fi
-    echo "     $2 vs $3: top-5 overlap $overlap, median |dlogprob| $median nats over $steps steps, texts fork at $where"
+    echo "     $2 vs $3: top-5 overlap $overlap, median |dlogprob| $median nats over $scored shared-history step(s) of $steps, texts fork at $where"
     if [ "$steps" -lt $kMinSteps ]; then
         echo "FAIL $1"
         echo "     only $steps comparable step(s), the floor is $kMinSteps: an arm that stops early is not evidence of agreement"
         fail=1
         return
     fi
-    if python3 -c "import sys; sys.exit(0 if $overlap >= 0.30 and $median <= 0.50 else 1)"; then
+    if [ "$scored" -lt $kMinSteps ]; then
+        echo "FAIL $1"
+        echo "     the texts fork at $where, so only $scored step(s) share a history, below the $kMinSteps floor. After a"
+        echo "     fork the two arms condition on different tokens, so comparing their distributions past it compares two"
+        echo "     different computations — not evidence either way."
+        fail=1
+        return
+    fi
+    if [ "$verdict" = ok ]; then
         echo "ok   $1"
     else
         echo "FAIL $1"
+        echo "     thresholds are top-5 overlap >= 0.30 and median |dlogprob| <= 0.50 nats, judged on the full-precision"
+        echo "     values ($overlap and $median here, rounded for printing)."
         fail=1
     fi
 }

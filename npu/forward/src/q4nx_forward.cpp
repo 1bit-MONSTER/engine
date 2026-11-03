@@ -116,7 +116,12 @@ static const char* pb16i_instance(Q4nxDesign r) {
 // Where an M=16 int8 twin is looked for, first hit wins: <model dir>/kernels-m16,
 // <kernels>/m16, then <kernels> itself.
 static std::vector<std::string> m16dirs_like_head(const std::string& mdir,
-                                                  const std::string& dir) {
+                                                  const std::string& dir,
+                                                  const std::vector<std::string>& plan_dirs = {}) {
+    // A plan that names its decode directories wins, the same rule the projection lookup uses: with
+    // decode ELFs under e.g. <model>/kernels-m16-seq the projections load from there, and a head lookup
+    // restricted to the built-in guesses cannot find its ELF beside them (engine#910 review).
+    if (!plan_dirs.empty()) return plan_dirs;
     return {mdir + "/kernels-m16", dir + "/m16", dir};
 }
 
@@ -1036,11 +1041,13 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
             }
         }
         std::vector<std::string> m16dirs;
+        plan_decode_dirs_.clear();
         if (plan_.loaded() && !plan_.decode_dirs.empty()) {
             // The plan says which of the two given paths each candidate hangs off, so the runtime
             // stops guessing which base a bare directory name meant.
             for (const auto& d : plan_.decode_dirs)
-                m16dirs.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+                plan_decode_dirs_.push_back((d.under_model ? mdir : dir) + "/" + d.path);
+            for (const auto& p : plan_decode_dirs_) m16dirs.push_back(p);
         } else {
             m16dirs.push_back(mdir + "/kernels-m16");
             m16dirs.push_back(dir + "/m16");
@@ -1236,7 +1243,7 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
                 for (const char* suf : {"_m16.elf", ".elf"}) {
                     const std::string n = "full_i8_LMHEAD_K" + std::to_string(kpad_) + "_N" +
                                           std::to_string(nn) + suf;
-                    for (const std::string& d : m16dirs_like_head(mdir, dir)) {
+                    for (const std::string& d : m16dirs_like_head(mdir, dir, plan_decode_dirs_)) {
                         if (file_exists(d + "/" + n)) { elf = d + "/" + n; break; }
                     }
                     if (!elf.empty()) break;
@@ -2765,8 +2772,21 @@ bool Q4nxNpuForward::run_lm_head_gemv(const std::vector<float>& h, std::vector<f
         // columns past the vocabulary, so it stays zero tiles -- the same rule the fused designs use for
         // a padded tail -- and only the first NV logits are ever read.
         const size_t have = I8Ctx::gemv_w_bytes(kpad_, NV);
-        if (!raw || (size_t)d->data_size < have) {
-            err_ = "gemv head: the container has no q4_1 tile stream for the head";
+        // The gemv family reads q4_1 TILES. A BF16 or Q8 head can easily be at least `have` bytes, and
+        // copying one into the tile stream produced invalid logits instead of a refusal (engine#910
+        // review), so the dtype is checked by name and the length has to BE the stream size -- at the
+        // real vocabulary width, or at the padded one when a container stores the padding too.
+        const std::string dt(d->dtype);
+        if (dt != "q4_1" && dt != "I8") {
+            err_ = "gemv head: lm_head.weight is " + dt + ", not the q4_1 tile stream this family reads";
+            return false;
+        }
+        const size_t stored = size_t(d->data_size);
+        if (!raw || (stored != have && stored != want)) {
+            err_ = "gemv head: lm_head.weight is " + std::to_string(stored) + " B, which is neither " +
+                   std::to_string(have) + " (the real vocabulary width) nor " + std::to_string(want) +
+                   " (the padded grid): not a q4_1 tile stream for K=" + std::to_string(kpad_) +
+                   " N=" + std::to_string(NV);
             return false;
         }
         gemv_head_.assign(want, 0);

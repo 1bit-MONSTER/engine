@@ -58,7 +58,30 @@ mkdir -p "$root/opt/1bit/engine" "$root/usr/share/doc/$pkg" "$root/usr/share/1bi
 cp -a "$bundle/1bit" "$bundle/hrx" "$bundle/npu" "$bundle/lemonade-hrx" "$bundle/NOTICE" \
       "$bundle/NOTICE-BINARY" "$bundle/LICENSE" "$bundle/README.txt" "$root/opt/1bit/engine/"
 chmod 0755 "$root/opt/1bit/engine/1bit"
-install -m 0644 "$libhsa" "$root/opt/1bit/engine/hrx/llama/bin/libhsa-runtime64.so.1"
+
+# The HSA runtime is NOT a standalone file. A TheRock libhsa lists TheRock's own libraries in NEEDED
+# (librocm_sysdeps_elf.so.1, librocm_sysdeps_drm.so.2, librocm_sysdeps_numa.so.1, librocm_sysdeps_z*…,
+# librocprofiler-register.so.0) and carries RUNPATH=$ORIGIN, so the set has to land FLAT beside it or the
+# backend's dlopen fails and HRX registers no device. Measured 2026-11-02 on the appliance's own libhsa
+# (sha256 f6ef689d…): shipped as one file in /opt/1bit/libhsa it answered "librocm_sysdeps_elf.so.1: cannot
+# open shared object file", and the board booted with a GPU it could not use. ldd is the arbiter here: the
+# private siblings are copied in, and anything still unresolved refuses the build.
+hsa_dir=$root/opt/1bit/engine/hrx/llama/bin
+install -m 0644 "$libhsa" "$hsa_dir/libhsa-runtime64.so.1"
+srcdir=$(cd "$(dirname "$libhsa")" && pwd)
+libdirs=$srcdir:$srcdir/rocm_sysdeps/lib:$srcdir/../../_rocm_sdk_core/lib:$srcdir/../../_rocm_sdk_core/lib/rocm_sysdeps/lib:${LD_LIBRARY_PATH:-}
+copied=0
+for so in $(LD_LIBRARY_PATH=$libdirs ldd "$libhsa" | awk '/=> \// {print $3}' | sort -u); do
+    case "$so" in /lib/* | /usr/lib/*) continue ;; esac   # the distro's own: dpkg-deb Depends, not ours to ship
+    install -m 0644 "$so" "$hsa_dir/$(basename "$so")"
+    copied=$((copied + 1))
+done
+missing=$(LD_LIBRARY_PATH=$hsa_dir ldd "$hsa_dir/libhsa-runtime64.so.1" | awk '/not found/ {print $1}' | tr '\n' ' ')
+[ -z "${missing// /}" ] || {
+    echo "libhsa needs $missing and this build could not stage it beside the runtime;
+pass LIBHSA=<a runtime whose sibling libraries are next to it> (the release-gated TheRock set)" >&2
+    exit 1; }
+echo "   HSA runtime: $(basename "$libhsa") + $copied sibling libraries, ldd clean"
 ln -s /opt/1bit/engine/1bit "$root/usr/bin/1bit-engine"
 
 # the shim: the name the recipe resolves inside hrx_bin's directory. It is the bundle's own

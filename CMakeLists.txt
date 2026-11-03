@@ -285,6 +285,11 @@ if(ONEBIT_HRX)
             # hrx skips without a gfx1151 (ONEBIT_HRX_E2E_TARGETS)
             set_tests_properties(serve_e2e_${_dev} PROPERTIES SKIP_RETURN_CODE 77)
         endforeach()
+        # Placement must not change the answer (engine #674): the same greedy prompt through the CPU, through the device
+        # with every layer assigned to the CPU, and fully offloaded, compared byte for byte.
+        add_test(NAME hrx_cpu_weight_parity
+                 COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cpu_weight_parity.sh ${ONEBIT_HRX_SERVER} ${ONEBIT_SERVE_TEST_GGUF})
+        set_tests_properties(hrx_cpu_weight_parity PROPERTIES SKIP_RETURN_CODE 77)
     endif()
 endif()
 

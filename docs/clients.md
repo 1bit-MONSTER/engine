@@ -44,10 +44,11 @@ hostname -I                 # e.g. 192.168.1.42
 hostname                    # 1bit-os - the name the image sets in /etc/hostname
 ```
 
-**The name is `1bit-os`, not an address.** Puppy only invents a per-machine `puppypc<MAC digits>` while
+**The name is `1bit-os`, not an address.** Puppy only invents a per-machine `puppypc<digits>` while
 `/etc/hostname` still holds its stock word, and the shipped image sets `1bit-os` instead (measured: on the
 cycle-13 image it still booted as `puppypc19108`, which is why older notes name it that way). Read the
-address off the box rather than guessing `1bit.local` — mDNS is not claimed. If you cannot get to a console, the router's client list shows the box
+address off the box rather than guessing `1bit.local` — mDNS is not claimed. If you cannot get to a
+console, the router's client list shows the box
 (the MAC of the wired or wireless interface), and the box announces the server on the LAN itself —
 `lemond` logs `Net Broadcast` on each RFC1918 interface, and `lemonade scan` (run anywhere on the same
 network with the CLI installed) lists the beacons it hears.

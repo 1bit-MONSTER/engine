@@ -34,6 +34,10 @@ set(ONEBIT_EP_NPU_COMMON_SRC
 
 # Include dirs and defines that both configurations share. ONEBIT_NPU_RUNTIME_OWN is what npu/rt.h
 # requires before it will alias npu_rt_api as xrt::.
+#
+# These are FALLBACKS, and consumers must list them after their own configurable tree: a build that
+# sets ONEBIT_NPU_ENGINE_INCS is selecting another NPU tree (onnx/ep/README.md) and it has to win for
+# the headers it carries, or the EP compiles an in-tree I8Ctx against someone else's runtime.
 set(ONEBIT_EP_NPU_COMMON_INCS
     ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/engine-src
     ${CMAKE_CURRENT_LIST_DIR}/../../npu/forward/include

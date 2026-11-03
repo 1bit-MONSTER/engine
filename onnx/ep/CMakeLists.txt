@@ -52,7 +52,14 @@ if(ONEBIT_EP_NPU)
     set(_npu_src ${ONEBIT_EP_NPU_COMMON_SRC}
         "${ONEBIT_NPU_RT_DIR}/npu_rt.cpp"
         "${ONEBIT_NPU_RT_DIR}/npu_rt_api.cpp")
-    set(_npu_incs ${ONEBIT_EP_NPU_COMMON_INCS} ${ONEBIT_NPU_ENGINE_INCS} ${ONEBIT_NPU_RT_DIR})
+    # ORDER MATTERS: the caller's ONEBIT_NPU_ENGINE_INCS comes first, because it is how a build
+    # selects *another* NPU tree (onnx/ep/README.md, "The NPU backend": the private tree the shipped
+    # engine builds against). The shared dirs after it are fallbacks for what that tree does not carry
+    # -- including npu/forward/include, where q4nx_pack.h lives. Reversing the two silently compiles
+    # the in-tree I8Ctx against a runtime the caller did not select (Copilot caught exactly that on
+    # #918; reproduced with an alternate tree whose header is a hard #error: reversed, the build
+    # succeeds, i.e. the configured tree lost).
+    set(_npu_incs ${ONEBIT_NPU_ENGINE_INCS} ${ONEBIT_EP_NPU_COMMON_INCS} ${ONEBIT_NPU_RT_DIR})
     set(_npu_defs ${ONEBIT_EP_NPU_COMMON_DEFS})
     set(_npu_libs Threads::Threads)
 

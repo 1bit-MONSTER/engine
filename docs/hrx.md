@@ -930,6 +930,20 @@ cmake --build build --target onebit
   llama-server as `IREE_HAL_AMDGPU_LIBHSA_PATH`, unless it is already set. Without a
   build path it searches the pinned toolchain, then `/opt/rocm-therock`. To run
   llama-server or llama-bench by hand, export that variable yourself.
+- **The runtime is named at init (engine#713).** Three `libhsa-runtime64.so.1` exist on a
+  box (the release-shipped one, the pinned toolchain's, the distro's) and they are not
+  interchangeable: the release-shipped one does not register `HRX0` for a dev build. So the
+  first HRX backend `serve` starts logs the file HRX will dlopen and its digest, once:
+
+  ```
+  1bit serve: HRX: HSA runtime /home/you/engine/third_party/toolchain/rocm-sdk-10.3.0a20261031-gfx1151/lib/python3.14/site-packages/_rocm_sdk_core/lib/libhsa-runtime64.so.1 sha256 21a6682452e159cfcdc6bdc84676f6b7f9c1236f3a2957a97a2e7170889cdfa3
+  ```
+
+  Check it against `sha256sum <path>`, and against the digest the release table records
+  ([releases.md](releases.md), "Pins") — a run that fell back to another copy is visible
+  there instead of passing silently. The line comes from `app/hrx_runtime.h`; `--hrx-libhsa
+  <file>` overrides the path, and a file that cannot be read is still named, without a
+  digest.
 
 ### Private HIP kernels
 

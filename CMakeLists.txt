@@ -171,6 +171,9 @@ add_test(NAME laya_gguf_route COMMAND ${CMAKE_SOURCE_DIR}/tests/laya_gguf_route.
 add_test(NAME mem_admit_route COMMAND ${CMAKE_SOURCE_DIR}/tests/mem_admit_route.sh $<TARGET_FILE:onebit>)
 # engine#315: what --hrx-cwsr-placement puts in an HRX backend's environment (app/hrx_cwsr.h); fake backend, no GPU.
 add_test(NAME hrx_cwsr_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_cwsr_route.sh $<TARGET_FILE:onebit>)
+# engine#713 criterion 4 end to end without a GPU: a fake runtime file and a fake backend, the line
+# serve prints and the IREE_HAL_AMDGPU_LIBHSA_PATH it hands over, sha256 included.
+add_test(NAME hrx_runtime_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hrx_runtime_route.sh $<TARGET_FILE:onebit>)
 # --device hybrid (docs/hybrid.md): the handoff with a fake backend and a fake provider; and, with a model,
 # end to end on the CPU llama-server (ONEBIT_SERVE_TEST_LLAMA_SERVER, else the build's own; skips without one)
 add_test(NAME hybrid_route COMMAND ${CMAKE_SOURCE_DIR}/tests/hybrid_route.sh $<TARGET_FILE:onebit>)
@@ -242,6 +245,12 @@ add_test(NAME hrx_placement COMMAND hrx_placement_test)
 add_executable(hrx_cwsr_test tests/hrx_cwsr_test.cpp)
 target_include_directories(hrx_cwsr_test PRIVATE app)
 add_test(NAME hrx_cwsr COMMAND hrx_cwsr_test)
+# engine#713 criterion 4's runtime identity (app/hrx_runtime.h, docs/hrx.md "The HSA runtime"):
+# sha256 of a buffer and of a file, and the line that names the runtime HRX will dlopen; FIPS 180-4
+# vectors, no GPU, no runtime.
+add_executable(hrx_runtime_test tests/hrx_runtime_test.cpp)
+target_include_directories(hrx_runtime_test PRIVATE app)
+add_test(NAME hrx_runtime COMMAND hrx_runtime_test)
 # --pm-router's class -> expert table and its flag values (app/pm.cpp, docs/pm.md "Routing with
 # Laya"); no GPU, no checkpoint, no Lemonade: config in, mapping out.
 add_executable(pm_routes_test tests/pm_routes_test.cpp app/pm.cpp)
@@ -551,6 +560,7 @@ endif()
 
 # Q4NX chunk decoders against 1bit-MONSTER's verified decoders, on committed real tiles
 add_executable(npu_q4nx_test tests/npu_q4nx_test.cpp)
+target_include_directories(npu_q4nx_test PRIVATE app)
 target_link_libraries(npu_q4nx_test PRIVATE onebit_npu)
 add_test(NAME npu_q4nx COMMAND npu_q4nx_test ${CMAKE_SOURCE_DIR}/tests/golden/q4nx)
 add_executable(npu_pack_import_test tests/npu_pack_import_test.cpp)

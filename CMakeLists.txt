@@ -152,6 +152,11 @@ add_test(NAME device_route COMMAND ${CMAKE_SOURCE_DIR}/tests/device_route.sh $<T
 add_test(NAME npu_repack_path COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_repack_path.sh $<TARGET_FILE:onebit>)
 # a build without the NPU lane has no repack path: the test says skip (77) there, not fail
 set_tests_properties(npu_repack_path PROPERTIES SKIP_RETURN_CODE 77)
+# engine#876: the gate row for a folded (pb16i/t2s) container.  Its device half needs the array, but its
+# assertion does not: these are the accept/refuse cases of `scripts/npu-window11.sh --compare` on hand-written
+# logs -- folded against folded passes, one differing rotated activation fails, a folded log against a plain one
+# fails, and the plain row keeps its old ms tolerance.  No device, no model, no build products.
+add_test(NAME npu_window11_compare COMMAND ${CMAKE_SOURCE_DIR}/tests/npu_window11_compare.sh)
 # the OS image's own release check: its lemonade row must prove the API key is enforced, not infer it
 # from an empty body (os/mini/release-check.sh --self-test; no device and no build needed)
 add_test(NAME release_check_row COMMAND ${CMAKE_SOURCE_DIR}/os/mini/release-check.sh --self-test)

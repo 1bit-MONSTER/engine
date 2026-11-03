@@ -196,6 +196,18 @@ def config(r, vocab):
         "hidden_act": "silu",
         "q4nx_source": {"converter": "tools/gguf_to_q4nx.py"},
     }
+    # The tokenizer's add_bos/add_eos flags are part of the prompt, not decoration.
+    # app/forward_serve.cpp reads config.json's add_bos_token ("the rendered chat prompt needs
+    # BOS") and defaults to 0 when the key is absent, so a checkpoint whose tokenizer_config.json
+    # sets add_bos_token: true is served chat prompts with NO BOS.  Measured on Zyphra/ZR1-1.5B
+    # (a Qwen2 fine-tune): the GGUF's metadata says true, the container's config.json was silent,
+    # and the forward built a 5-token prompt where llama.cpp built 6 -- its reply opened with the
+    # end-of-turn token.  Carry both flags through while the GGUF still has them.
+    for gguf_key, hf_key in (("tokenizer.ggml.add_bos_token", "add_bos_token"),
+                             ("tokenizer.ggml.add_eos_token", "add_eos_token")):
+        flag = field(r, gguf_key)
+        if flag is not None:
+            c[hf_key] = bool(flag)
     if arch == "qwen2":
         # qwen2 differs from qwen3 in exactly two attention ways: no per-head q/k
         # RMSNorm, and q/k/v projection bias.  Both are declared here so a consumer

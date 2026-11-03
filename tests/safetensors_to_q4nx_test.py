@@ -97,6 +97,10 @@ def make_model(d, weights):
         json.dump(cfg, f)
     with open(os.path.join(d, "tokenizer.json"), "w") as f:
         f.write("{}")
+    # The flag the engine's forward reads from config.json (app/forward_serve.cpp, "the rendered
+    # chat prompt needs BOS") but every HF pack keeps in tokenizer_config.json.
+    with open(os.path.join(d, "tokenizer_config.json"), "w") as f:
+        json.dump({"add_bos_token": True, "add_eos_token": False}, f)
     return d
 
 
@@ -197,6 +201,9 @@ def main():
         check(cfg["hidden_size"] == 256 and cfg["model_type"] == "qwen3", "the HF config is carried over")
         check(cfg["q4nx_source"]["converter"] == "tools/safetensors_to_q4nx.py", "the source is recorded")
         check(os.path.exists(os.path.join(out, "tokenizer.json")), "the tokenizer is copied")
+        check(cfg.get("add_bos_token") is True,
+              "tokenizer_config.json's add_bos_token is carried into config.json")
+        check(cfg.get("add_eos_token") is False, "and add_eos_token with it")
 
         # The tiles really hold the projection: decode them back.
         ent = table["model.layers.0.self_attn.q_proj.weight"]

@@ -618,10 +618,13 @@ TileW decode_tile(const uint8_t* tile, int k) {
                     t.code[size_t(n0 + 1) * size_t(k) + size_t(kb * kKBlock + kk)] = b >> 4;
                 }
             }
+            // The zero-point nibbles pair with rows exactly as the codes do (even/odd), not in halves:
+            // a correct zero point sits where its 128 codes cluster, and on the shipped pack's own tiles
+            // only even/odd satisfies that (corr(zp, mean code) +0.998 vs -0.023 for halves). FACTS §7.17.
             for (int i = 0; i < 16; ++i) {
                 const uint8_t z = s[kZerosOff + i];
-                t.zp[size_t(r0 + i) * size_t(kbs) + size_t(kb)] = z & 0x0F;
-                t.zp[size_t(r0 + 16 + i) * size_t(kbs) + size_t(kb)] = z >> 4;
+                t.zp[size_t(r0 + 2 * i) * size_t(kbs) + size_t(kb)] = z & 0x0F;
+                t.zp[size_t(r0 + 2 * i + 1) * size_t(kbs) + size_t(kb)] = z >> 4;
             }
             for (int i = 0; i < kSubvRows; ++i) {
                 uint16_t h16;
@@ -652,9 +655,9 @@ std::vector<uint8_t> encode_tile(const TileW& t) {
                                                         ((t.code[idx + size_t(t.k)] & 0x0F) << 4));
                 }
             }
-            for (int i = 0; i < 16; ++i)
-                s[kZerosOff + i] = uint8_t((t.zp[size_t(r0 + i) * size_t(kbs) + size_t(kb)] & 0x0F) |
-                                           ((t.zp[size_t(r0 + 16 + i) * size_t(kbs) + size_t(kb)] & 0x0F) << 4));
+            for (int i = 0; i < 16; ++i)  // rows 2i, 2i+1, the pairing decode_tile() reads
+                s[kZerosOff + i] = uint8_t((t.zp[size_t(r0 + 2 * i) * size_t(kbs) + size_t(kb)] & 0x0F) |
+                                           ((t.zp[size_t(r0 + 2 * i + 1) * size_t(kbs) + size_t(kb)] & 0x0F) << 4));
             for (int i = 0; i < kSubvRows; ++i) {
                 const uint16_t h16 = f32_to_bf16(t.scale[size_t(r0 + i) * size_t(kbs) + size_t(kb)]);
                 std::memcpy(s + kScalesOff + 2 * i, &h16, 2);

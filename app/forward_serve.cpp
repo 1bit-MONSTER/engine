@@ -37,6 +37,7 @@
 #include "../npu/forward/include/q4nx_forward.h"
 #include "npu_device_lock.h"
 #include "npu_answer_parser.h"
+#include "npu_chatml.h"
 #include "npu_grammar.h"
 #include "npu_prefix_cache.h"
 #include "npu_sampling.h"
@@ -107,25 +108,6 @@ struct Emitted {
     npu::TokenLogprob lp;
 };
 
-std::string chatml(const json& messages, bool thinking = true) {
-    std::string p;
-    for (const auto& m : messages) {
-        std::string content;
-        const auto& c = m.at("content");
-        if (c.is_string()) {
-            content = c;
-        } else if (c.is_array()) {
-            for (const auto& part : c)
-                if (part.value("type", "") == "text") content += part.value("text", "");
-        }
-        p += "<|im_start|>" + m.at("role").get<std::string>() + "\n" + content + "<|im_end|>\n";
-    }
-    p += "<|im_start|>assistant\n";
-    (void)thinking;  // the <think> block is a Qwen3-lane idiom; the model-generic
-    // route serves arbitrary archs, whose tokenizers do not know it.
-    return p;
-}
-
 size_t complete_utf8(const std::string& s) {
     size_t lead = s.size();
     while (lead > 0 && s.size() - lead < 4 && (static_cast<unsigned char>(s[lead - 1]) & 0xC0) == 0x80) --lead;
@@ -161,10 +143,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     }
     std::string prompt;
     try {
-        bool thinking = true;
-        if (body.contains("chat_template_kwargs") && body["chat_template_kwargs"].is_object())
-            thinking = body["chat_template_kwargs"].value("enable_thinking", true);
-        prompt = chat ? chatml(body.at("messages"), thinking) : body.at("prompt").get<std::string>();
+        prompt = chat ? npu::chatml(body.at("messages"), npu::thinking_from_body(body))
+                      : body.at("prompt").get<std::string>();
     } catch (const std::exception& ex) {
         res.status = 400;
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");

@@ -638,6 +638,7 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
 
@@ -645,7 +646,9 @@ got before.
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
 chunk carries, so the deltas add up to the non-streamed reply. Token text that is half a character is reported with the invalid bytes replaced, never as a failed
 request. Entries exist for **`content` tokens only**: a reasoning delta and tool-call markup get no
-logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. The `/v1/completions` route's legacy logprobs object
+logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. On a Qwen3 model that
+means a thinking reply reports none at all, which is why `chat_template_kwargs.enable_thinking: false` is
+what a logprob comparison wants. The `/v1/completions` route's legacy logprobs object
 is not implemented and asking for it there is a 400, not a silently dropped field.
 
 `json_schema` is compiled to a grammar before the first token, by `app/npu_json_schema.h`, so the answer

@@ -167,12 +167,14 @@ column is 2 repeats at every budget.
 It **can** join the agreement comparison — the earlier version of this page said it could not — with two
 adjustments, both of which are flags on the tool rather than changes to the engine:
 
-1. **Every route must run with thinking on** (`--thinking on`). The NPU forward path ignores
-   `chat_template_kwargs.enable_thinking=false` (issue
-   [#832](https://github.com/1bit-MONSTER/engine/issues/832)), so its stream always opens `<think>`; the
-   llama-server routes honour the kwarg. Run all three with thinking on and the templates agree. This was
-   the real blocker: run two routes with `enable_thinking=false` against this one and they diverge at
-   position 0 for template reasons, which looks exactly like a numerical disagreement.
+1. **Every route runs with thinking on** (`--thinking on`), which is how the tables below were measured.
+   That was a *requirement* until #864 fixed issue
+   [#832](https://github.com/1bit-MONSTER/engine/issues/832): the NPU forward path accepted
+   `chat_template_kwargs.enable_thinking=false` and dropped it, so its stream always opened `<think>` while
+   the llama-server routes honoured the kwarg, and two routes run with it set diverged at position 0 for
+   template reasons — which looks exactly like a numerical disagreement. With #864 the NPU path honours it
+   (`app/npu_chatml.h`), so `--thinking off` now works on every route; it has not been re-measured that
+   way, and the numbers below are the thinking-on ones.
 2. **Match tokens by text, not by id** (`--match-by text`). The NPU reports `token` and `logprob` but no
    `id`, in `logprobs.content` and in `top_logprobs` alike, so an id-keyed comparison between it and
    `cpu`/`hrx` matches nothing at all.
@@ -180,8 +182,8 @@ adjustments, both of which are flags on the tool rather than changes to the engi
 `message.content` being empty on that path does not matter: the comparison reads `logprobs.content`, which
 is populated. And the log-probabilities have to come from a build whose NPU path emits them (see
 [Routes and logprobs](#routes-and-logprobs)). One build detail matters here: `44d849d` onward emits
-entries for **content** tokens only, so a thinking reply's `logprobs.content` is empty there — measure
-with a build before it, or with `#832` fixed.
+entries for **content** tokens only, so a thinking reply's `logprobs.content` is empty there: measure
+with a build before `44d849d`, or with `--thinking off` on a build carrying #864 (the #832 fix).
 
 Qwen3-0.6B, 8 prompts, greedy, thinking **on**, 2 repeats (NPU) / 5 repeats (cpu, hrx).
 One control first: the `cpu` route was measured in **two separate server runs**, and the two agree
@@ -240,9 +242,10 @@ an agreement threshold. No pair is bitwise, and no pair is within RL-Kernel's `m
   `full_i8_*.elf` designs — a shipped dx kernel directory (`npu/kernels/<H>x<IM>x<NH>x<NKV>/` of
   `layer*.elf`) does not contain them. A release binary older than that change has no NPU logprobs
   anywhere (`strings <bin> | grep top_logprobs` is the check).
-- `chat_template_kwargs.enable_thinking=false` is honoured by the llama-server routes and not by
-  the NPU forward path, which can return a `<think>` block where the others do not. Compare token
-  streams only with the same template behaviour, or the divergence you measure is the template.
+- `chat_template_kwargs.enable_thinking=false` is honoured by every route, the NPU forward path
+  included since #864 (`app/npu_chatml.h`); before that it was accepted and dropped there, so an NPU
+  reply could open a `<think>` block where the others did not. Compare token streams only with the same
+  template behaviour, or the divergence you measure is the template.
 
 The weight caveat above is why the NPU's agreement numbers are reported with the pack named and not
 folded into the `cpu` vs `hrx` column: the measured tables are above.
@@ -275,8 +278,8 @@ python3 tools/logprob_agree.py \
 ```
 
 With the NPU in the comparison, the same command with `--thinking on --match-by text`: the forward path
-needs no `enable_thinking` and reports no token ids, so all routes run thinking on and tokens are matched
-by text. The NPU tries 2 repeats at the same 64-token budget — ~10 min in one claim, which is what its
+reports no token ids, so tokens are matched by text, and `--thinking on` is what the numbers above were
+taken with (on a build carrying #864, `--thinking off` works there too). The NPU tries 2 repeats at the same 64-token budget — ~10 min in one claim, which is what its
 ~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
 compare the two reports with the tool's own comparator:
 

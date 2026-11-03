@@ -165,7 +165,9 @@ intermediate float tensor then never exists.
   `malloc_trim` between the warm-up and the measurement: the fused side is stable at **248-268 kB**,
   the CPU EP side is **6.1-7.0 MB** on 256×1024×1024. Both are ranges on purpose — the CPU EP figure
   is that process's arena growth, not a tensor size, so it moves run to run (eight runs on this tree:
-  6156, 6432, 6144, 6136, 6144, 6368, 7004, 6524 kB). What does not move is the bottom of that range:
+  6156, 6432, 6144, 6136, 6144, 6368, 7004, 6524 kB; a later run of this gate on the same tree measured
+  7236 kB, which is the same arena churn with a wider tail — read the band as indicative, not as a bound).
+  What does not move is the bottom of that range:
   6136 kB is the 1 MB `x_dq` + 4 MB `w_dq` + 1 MB `y` of float32 that no longer get allocated, and
   what sits above it is the CPU EP's own arena churn.
   `ONEBIT_EP_QDQ=0` is the control: the same binary then claims the
@@ -218,10 +220,26 @@ intermediate float tensor then never exists.
   dispatch-bound. So `gemm_q8` routes by rows: below `kDeviceMinRows` — 16, one constant in
   `onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array, and at
   or above it the device does. A host-routed call logs `npu_qdq_host_rows m=… k=… n=… min=16`, so "the device
-  ran this shape" stays "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it". 16 is the
-  first row count at which no measured projection shape was slower on the array; at one row the launch costs
-  8–10× the host loop it replaces (`docs/onnx.md` carries the measurement). A decode-side win needs fewer,
-  longer launches rather than a smaller design.
+  ran this shape" stays "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it". 12 is the
+  first row count at which no measured projection shape was slower on the array and 16 is the first that keeps
+  more margin than the box's own run-to-run spread; at one row the launch costs 8–10× the host loop it replaces
+  (`docs/onnx.md` carries the measurement). A decode-side win needs fewer, longer launches rather than a smaller
+  design.
+
+  **Which row count the gate above is taken at, because the threshold changed it.** Those five numbers came
+  from 5-row cases, which are decode width: once `gemm_q8` routed by rows they stopped reaching the array at
+  all, so for a while o_proj, down_proj and gate/up had no device gate while this page said they were covered —
+  the same "host gate dressed as a device one" failure this file has recorded before, in its quietest form:
+  the run still printed `PASS` and `worst |d| = 0`. Each of those three shapes now has a **32-row** device case
+  (`quark-o32`, `quark-d32`, `quark-gu32`), and `onebit_ep_qdq_proof` asserts both halves — a fused case at or
+  above the threshold must **not** log `npu_qdq_fallback`, and one below it must log `npu_qdq_host_rows` — so the
+  claim is checked in the test rather than in a lane script. The gate needs an ELF for the shape, not a
+  particular design M: 32 rows through an M=128 design pads to 128 and is equally a device run, which is
+  how the 5-row cases reached the array before the threshold existed. Their gate is **one** LSB rather than zero, and
+  that is arithmetic, not slack: the CPU EP dequantises and accumulates in float32 while the fused path sums
+  exact int32 and rounds once, so at a quantisation boundary the two can round to different neighbours —
+  measured as 0 of 32768 on down_proj and gate/up and 1 of 32768 on o_proj (the same 1-in-5120 the real Quark
+  export showed). Above one LSB is a defect: a wrong weight layout or a truncated K reads as hundreds.
 - **Different kernels, not a configuration**: A16W8 needs int16 activations, MX/BFP16 need block
   scales, and Int4 weight-only is the format our *own* forward route already stores (Q4NX), so the
   natural split afterwards is our Q4NX pack for weight-only and the Quark QDQ path for A8W8.

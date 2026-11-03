@@ -537,6 +537,17 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // Embedding: BF16 for most models, but Gemma4 stores it QUANTIZED (dtype I8).
     // Reading a quantized tensor as bf16 yields ~zero, which invalidated the whole
     // forward and the tied LM head (all-zero logits); dequantize it once instead.
+    /* Engine#881: the K grid has to be known before the FIRST dequant, not just before the
+     * projections are sized: a quantised embedding table dequantises to kpad_ wide rows, and the
+     * assignment below used to sit after this block (engine#845 put it next to the design grid),
+     * so kpad_ was still 0 there and every container with an I8 embedding - the 27B rm/b8/pb16i
+     * packs - failed with "embedding dtype I8 but dequant failed". */
+    kpad_ = q4nx_pad_k(c_.H);
+    impad_ = q4nx_pad_k(c_.IM);
+    if (kpad_ != c_.H || impad_ != c_.IM)
+        fprintf(stderr, "  [forward] container K grid: H %d -> %d, IM %d -> %d (pad columns are zero)\n",
+                c_.H, kpad_, c_.IM, impad_);
+
     embed_.resize((size_t)NV * H);
     {
         /* A tied model may store the table ONLY as `lm_head.weight` (Qwen3.5-4B's
@@ -723,15 +734,6 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
         if (bad_kv(c_.NKV)) return false;
         if (sem_.num_global_kv_heads > 0 && bad_kv(sem_.num_global_kv_heads)) return false;
     }
-
-    /* Engine#845: the container's K grid.  Every dequantised projection is kpad_ wide and every
-     * design's K is q4nx_pad_k(real K); for a model already on the grid (every one validated
-     * before this) both are the identity. */
-    kpad_ = q4nx_pad_k(c_.H);
-    impad_ = q4nx_pad_k(c_.IM);
-    if (kpad_ != c_.H || impad_ != c_.IM)
-        fprintf(stderr, "  [forward] container K grid: H %d -> %d, IM %d -> %d (pad columns are zero)\n",
-                c_.H, kpad_, c_.IM, impad_);
 
     Q4nxModelDims dims{};
     dims.mla = mla_;

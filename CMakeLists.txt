@@ -671,6 +671,15 @@ add_test(NAME npu_dequant_bf16 COMMAND npu_dequant_bf16_test)
 # already builds (same reason as npu_forward_loader_test above); drop this line when the workflow is next
 # touched with that scope and add npu_dequant_bf16_test to the list itself.
 add_dependencies(npu_forward_loader_test npu_dequant_bf16_test)
+# qwen3_5 ships BOTH RMSNorm conventions under one model_type, so the forward resolves (1 + w) vs w from
+# the layer-0 input_layernorm weight (engine#796).  The rule is exported and checked here with the two
+# real shapes on this box; no model, no device.  Plain C.
+add_executable(npu_rmsnorm_offset_test tests/npu_rmsnorm_offset_test.c npu/forward/src/q4nx_semantics.c)
+target_include_directories(npu_rmsnorm_offset_test PRIVATE npu/forward/include)
+target_link_libraries(npu_rmsnorm_offset_test PRIVATE m)
+add_test(NAME npu_rmsnorm_offset COMMAND npu_rmsnorm_offset_test)
+# Same ci.yml workaround as above: npu_sampling_test is in the workflow's target list, this binary is not.
+add_dependencies(npu_sampling_test npu_rmsnorm_offset_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

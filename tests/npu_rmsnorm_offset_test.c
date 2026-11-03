@@ -1,0 +1,81 @@
+// Copyright 2026 bong-water-water-bong
+// SPDX-License-Identifier: Apache-2.0
+//
+// Licensed under the Apache License, Version 2.0 (the "License");
+// you may not use this file except in compliance with the License.
+// You may obtain a copy of the License at
+//
+//     http://www.apache.org/licenses/LICENSE-2.0
+//
+// Unless required by applicable law or agreed to in writing, software
+// distributed under the License is distributed on an "AS IS" BASIS,
+// WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+// See the License for the specific language governing permissions and
+// limitations under the License.
+
+// npu_rmsnorm_offset_test -- qwen3_5 packs the two RMSNorm conventions under one model_type, so the
+// forward decides from the layer-0 input_layernorm weight (engine#796). This checks that rule against
+// the two real shapes on this box, with no model and no device:
+//
+//   * the official release's Qwen3_5RMSNorm weight is a delta trained from 0 -- mean 0.2377, min
+//     -0.1143 on d3-lite layer 0 -- and must resolve to the (1 + w) form;
+//   * the hybrid 27B pack's weight is a gain trained from 1 -- mean 0.9704, min 0.8711 -- and must
+//     stay the plain w form.
+//
+// The measured consequence, from the same diagnostic: numpy rmsnorm(embed, w) reproduces the engine's
+// own xn (cos 1.000000) and rmsnorm(embed, 1 + w) reproduces the reference's (cos 0.999999), so this
+// one bit is the whole 0.6367-token-probability gap in engine#796's causal arm.
+#include "q4nx_semantics.h"
+
+#include <math.h>
+#include <stdio.h>
+
+static int failures = 0;
+
+static void check(int ok, const char* what) {
+    printf("%s %s\n", ok ? "ok  " : "FAIL", what);
+    if (!ok) failures++;
+}
+
+int main(void) {
+    /* Shape 1: zero-centered (the d3-lite / Qwen3.5 release form). Values echo the real tensor's
+     * statistics: a delta around 0.24 with negatives in it. */
+    float zero_centered[64];
+    for (int i = 0; i < 64; i++) zero_centered[i] = 0.2377f + (float)sin((double)i) * 0.15f;
+    check(q4nx_rmsnorm_offset_from_norm(zero_centered, 64) == 1,
+          "mean 0.24 with negatives -> (1 + w)");
+
+    /* A delta whose negatives happen to be absent still has a mean far below 1. */
+    float no_negatives[64];
+    for (int i = 0; i < 64; i++) no_negatives[i] = 0.35f + 0.01f * (float)(i % 7);
+    check(q4nx_rmsnorm_offset_from_norm(no_negatives, 64) == 1,
+          "all-positive delta, mean 0.38 -> (1 + w)");
+
+    /* Shape 2: plain gain (the hybrid 27B pack). Every value around 1, none negative. */
+    float plain[64];
+    for (int i = 0; i < 64; i++) plain[i] = 0.9704f + (float)sin((double)i) * 0.06f;
+    check(q4nx_rmsnorm_offset_from_norm(plain, 64) == 0, "mean 0.97, min 0.87 -> plain w");
+
+    /* Exactly 1 everywhere (an untrained plain norm) must stay plain. */
+    float ones[8] = {1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f, 1.0f};
+    check(q4nx_rmsnorm_offset_from_norm(ones, 8) == 0, "all ones -> plain w");
+
+    /* A plain gain with a single negative gain is the ambiguous case; the rule takes the (1 + w) form
+     * because a plain norm weight with a negative channel is not a trained gain. */
+    float mixed[4] = {1.1f, 0.9f, -0.2f, 1.0f};
+    check(q4nx_rmsnorm_offset_from_norm(mixed, 4) == 1, "a negative plain gain -> (1 + w)");
+
+    /* Degenerate inputs must not be read as a convention. */
+    check(q4nx_rmsnorm_offset_from_norm(NULL, 16) == 0, "null -> plain w");
+    check(q4nx_rmsnorm_offset_from_norm(ones, 0) == 0, "empty -> plain w");
+
+    /* And the real tensors' two statistics, as constants: if a future pack ever lands between the two
+     * shapes, whichever side of 0.5 it falls on is visible here rather than in a serving log. */
+    float real_d3[4] = {1.0f, 0.2949f, 0.5352f, -0.1143f};
+    float real_27b[4] = {0.9704f, 0.8711f, 1.2344f, 0.9500f};
+    check(q4nx_rmsnorm_offset_from_norm(real_d3, 4) == 1, "d3-lite layer-0 head -> (1 + w)");
+    check(q4nx_rmsnorm_offset_from_norm(real_27b, 4) == 0, "bonsai 27B layer-0 head -> plain w");
+
+    printf(failures ? "npu_rmsnorm_offset: %d FAILED\n" : "npu_rmsnorm_offset: ok\n", failures);
+    return failures ? 1 : 0;
+}

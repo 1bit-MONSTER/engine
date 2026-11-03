@@ -1248,6 +1248,25 @@ bool Q4nxNpuForward::init_impl(xrt::device* dev, const char* model_path,
     // scalar) are only read when gemma4_layer_ is set, so loading them before the
     // config was parsed left those vectors empty and crashed the first step.
     if (!load_norms()) return false;
+    // qwen3_5 declares one model_type for two RMSNorm conventions and this box carries one of each (the
+    // official 0.8B release is zero-centered; the hybrid 27B packs are plain gains). Resolve it from the
+    // weight that was just loaded, and print the evidence so a surprising answer is visible rather than
+    // buried. Every other model_type keeps the convention it already decided above.
+    if (sem_.rmsnorm_offset_probe && !in_norm_.empty() && c_.H > 0) {
+        const std::vector<float>& w0 = in_norm_[0];
+        double sum = 0.0;
+        float mn = w0[0];
+        for (int i = 0; i < c_.H; i++) {
+            sum += (double)w0[(size_t)i];
+            if (w0[(size_t)i] < mn) mn = w0[(size_t)i];
+        }
+        sem_.rmsnorm_offset = q4nx_rmsnorm_offset_from_norm(w0.data(), c_.H);
+        fprintf(stderr,
+                "  [semantics] rmsnorm_offset=%d  <- model.layers.0.input_layernorm.weight: mean %.4f "
+                "min %.4f (qwen3_5 ships both the zero-centered (1+w) form and the plain w form; the "
+                "weight decides)\n",
+                sem_.rmsnorm_offset, sum / (double)c_.H, (double)mn);
+    }
     if (ple_dim_ > 0) {
         const int H = c_.H, NL = c_.NL;
         auto read_named = [&](const char* nm, float* dst, int n) -> bool {

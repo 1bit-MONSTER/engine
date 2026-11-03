@@ -820,6 +820,17 @@ reuses it), `GU K1024 N7168`, `D K3584 N1024`, GDN `QKV K1024 N6144` and `Z K102
 device path stops at `forward init failed: … this model's plan needs the QKV kernel "full_i8_QKV_K1024_N5120.elf" …
 (missing)`.
 
+**The norm convention is decided by the weights, not the name.** Qwen3.5's `Qwen3_5RMSNorm` is *zero-centered*:
+its weight is initialised to **0** and applied as `x/rms * (1 + w)`, so a checkpoint stores small deltas (the
+d3-lite pack's layer-0 `input_layernorm` has mean **0.2377** and negatives, min **-0.1143**). Older hybrid packs
+declare the same `model_type: qwen3_5` but keep the plain form, `x/rms * w`, with gains trained from 1 (the 27B
+packs on this box: mean **0.9704**, min **0.8711**, every value positive). Applying the wrong one is not a small
+error — it scales every norm output by roughly the weight's own magnitude — so `q4nx_semantics` sets a *probe* for
+`qwen3_5*` and the forward resolves it from the loaded layer-0 `input_layernorm.weight` (a negative value, or a
+mean below 0.5, is the zero-centered form), printing the evidence on the `[semantics]` line. The GDN gated norm
+(`linear_attn.norm`, `Qwen3_5RMSNormGated`) is **exempt**: it is initialised to ones and applied as `w`, which is
+what both packs store (mean 0.95 / 0.86). `ctest npu_rmsnorm_offset` covers the rule with both real shapes.
+
 Refusals follow the d3 server this route stands in for, so vLLM Semantic Router can point at it unchanged —
 which means **422 here, not the 400 the chat route uses**:
 

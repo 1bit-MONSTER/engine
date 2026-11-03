@@ -102,6 +102,22 @@ struct I8Ctx {
     // only the image's file extension and size differ.  A container never sets both layouts; the
     // flag is on the context so a load cannot read a 4,608-B image as a 2,176-B one.
     bool t2s = false;
+    // Weight stream "gemv": the forge-built q4_1 GEMV family.  Its runtime sequence declares
+    // (arg0 = the tensor's own q4_1 tile stream, arg1 = K bf16 activations, arg2 = N f32 outputs) --
+    // another order and another dtype set than the int8 per-tile family this launcher was written
+    // for, so the family is detected from the artifact's own declared widths at load (see
+    // args_fit_elf) and this flag carries it.  One row per launch: the family has no M dimension (its
+    // `_m16` ELFs are byte-identical to the one-row design), which is why the batched paths fall back
+    // to per-row launches.  Measured 2026-11-02 on the OGA 0.5B pack's five ELFs.
+    bool gemv = false;
+    uint16_t* Ag = nullptr;   // gemv: the bf16 activation BO, mapped
+    float*    Cg = nullptr;   // gemv: the f32 output BO, mapped
+
+    // Bytes of the gemv weight stream: one 5,120-byte q4_1 tile per (32 rows, 256 K columns).
+    static size_t gemv_w_bytes(int K, int N) {
+        return (size_t)(K / 256) * (size_t)(N / 32) * 5120u;
+    }
+
     // int32 planes the pb16i ELF leaves its sum in: 1 (plain int32) or 2 (ACC64:
     // lo = sum of (t & 2^21-1), hi = sum of (t >> 21), S = hi*2^21 + lo).  Both are
     // exact, so a tensor whose own bound fits int32 may still run on the two-plane
@@ -110,6 +126,7 @@ struct I8Ctx {
 
     // Bytes of one weight image: the int8 layouts are KD*ND, pb16i and t2s are their own sizes.
     size_t w_bytes() const {
+        if (gemv) return gemv_w_bytes(KD, ND);
         if (t2s) return q4nx_t2s::w_bytes(KD, ND);
         return pb16i ? q4nx_pb16i::w_bytes(KD, ND) : (size_t)KD * (size_t)ND;
     }
@@ -174,16 +191,27 @@ struct I8Ctx {
         // A group-less xrt::bo is rejected by the amdxdna driver ("unsupported
         // buffer type: none flag") under the system XRT; xrt::ext::bo picks a
         // valid host-accessible memory group for the device.
+        // Which launch family is this artifact?  The declared widths answer it: the gemv family takes
+        // (weights = its tile stream, activations = K bf16, outputs = N f32), the int8 families take
+        // (activations = MD*K int8, weights, outputs = MD*N int32).  Decided here, before any BO is
+        // sized, because the widths follow from it.
+        gemv = elf_is_gemv(ep);
+        if (gemv && (KD % 256 || ND % 32)) {
+            fprintf(stderr, "  I8Ctx::init_elf: the gemv family needs K%%256==0 and N%%32==0 (K=%d N=%d)\n",
+                    KD, ND);
+            return false;
+        }
         auto mkbo = [&](size_t sz) {
             xrt::ext::bo b{d, sz};
             return std::make_unique<xrt::bo>(b);
         };
-        bA = mkbo((size_t)MD * KD);
+        bA = mkbo(gemv ? (size_t)KD * 2 : (size_t)MD * KD);
         // pb16i int64 mode returns two int32 planes ([M][2N]); allocate for both modes
         // so the tensor's own mode byte, not the geometry, decides what is used.
-        bC = mkbo((size_t)MD * ND * 4 * (pb16i ? 2 : 1));
+        bC = mkbo(gemv ? (size_t)ND * 4 : (size_t)MD * ND * 4 * (pb16i ? 2 : 1));
         Am = (int8_t*)bA->map();
         Cm = (int32_t*)bC->map();
+        if (gemv) { Ag = (uint16_t*)Am; Cg = (float*)Cm; }
         layerB.resize(NL);
         group_scales.resize(NL);   // packB() writes group_scales[l]
         for (int l = 0; l < NL; l++)
@@ -202,6 +230,32 @@ struct I8Ctx {
     // (16,384, 1,048,576, 65,536) B).  The check is one-directional on purpose: a declared width may
     // be *smaller* than the buffer (the tile-family ELFs address a tile of a larger BO through the
     // control text), but it may never be larger.
+    // Does this artifact declare the gemv family's widths?  All three have to match: a tile stream for
+    // arg0, 2*K bf16 activations for arg1, N f32 outputs for arg2.  Anything else is one of the int8
+    // families (whose contract the guard below checks).
+    bool elf_is_gemv(const char* ep) {
+        std::vector<uint8_t> raw;
+        std::FILE* f = std::fopen(ep, "rb");
+        if (!f) return false;
+        std::fseek(f, 0, SEEK_END);
+        const long len = std::ftell(f);
+        std::rewind(f);
+        if (len <= 0) { std::fclose(f); return false; }
+        raw.resize((size_t)len);
+        const size_t got = std::fread(raw.data(), 1, raw.size(), f);
+        std::fclose(f);
+        if (got != raw.size()) return false;
+        uint64_t declared[3] = {0, 0, 0};
+        if (q4nx_elf_arg_sizes(raw.data(), raw.size(), declared) < 0) return false;
+        // The .dynsym symbols are PER CORE (the driver patches each core's own object): the gemv
+        // family's arg0 and arg2 are 1/cores of the stream and of the output, while arg1 (the whole
+        // activation row) is not split.  Measured on these five ELFs 2026-11-02: QKV K=1024 N=1536
+        // declares 245,760 / 2,048 / 1,536 (= w/4, 2K, N) and the head 97,320,960/4 / 2,048 / 152,064.
+        // So the core count is inferred from arg0 and the other two are checked against it, rather
+        // than assuming four.
+        return q4nx_gemv_family(declared, KD, ND) != 0;
+    }
+
     bool args_fit_elf(const char* ep) {
         std::vector<uint8_t> raw;
         {
@@ -218,9 +272,13 @@ struct I8Ctx {
         }
         uint64_t declared[3] = {0, 0, 0};
         if (q4nx_elf_arg_sizes(raw.data(), raw.size(), declared) < 0) return true;   // not our shape
-        const uint64_t passed[3] = {(uint64_t)MD * (uint64_t)KD,
-                                    (uint64_t)w_bytes(),
-                                    (uint64_t)MD * (uint64_t)ND * 4u * (pb16i ? 2u : 1u)};
+        // passed[] is what this launcher hands the kernel for the family in use: the gemv family takes
+        // (weights, activations, outputs) in that order, everything else (activations, weights, outputs).
+        uint64_t passed[3] = {
+            gemv ? (uint64_t)w_bytes() : (uint64_t)MD * (uint64_t)KD,
+            gemv ? (uint64_t)KD * 2u : (uint64_t)w_bytes(),
+            gemv ? (uint64_t)ND * 4u
+                 : (uint64_t)MD * (uint64_t)ND * 4u * (pb16i ? 2u : 1u)};
         // I8Ctx carries no error string; the caller's err_ names the ELF, so print the numbers here.
         static const char* const kWhat[3] = {"activations", "weights", "output"};
         for (int i = 0; i < 3; i++) {
@@ -234,6 +292,25 @@ struct I8Ctx {
                          (unsigned long long)passed[i], MD, KD, ND);
             return false;
         }
+        return true;
+    }
+
+    // ── The gemv weight image: the container's own q4_1 tile stream, copied, never repacked ──
+    // The kernel dequantises with each tile's own bf16 scale/zero, so passing the container's bytes
+    // unchanged is both the cheapest thing to do and the only lossless one (packB's int8 image would
+    // throw those parameters away).  blen is the tensor's byte count; the rest of the BO is left as
+    // the zero tiles the row pad needs.
+    bool upload_tiles_into(xrt::bo& bo, const uint8_t* blob, size_t blen) {
+        if (!gemv) return false;
+        if (blen > bo.size()) {
+            std::fprintf(stderr, "  I8Ctx::upload_tiles_into: %zu B of tiles does not fit a %llu B BO\n",
+                         blen, (unsigned long long)bo.size());
+            return false;
+        }
+        uint8_t* p = (uint8_t*)bo.map();
+        std::memset(p, 0, bo.size());
+        if (blob && blen) std::memcpy(p, blob, blen);
+        bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
         return true;
     }
 
@@ -393,7 +470,8 @@ struct I8Ctx {
                                          int am, int ak, float ascale) {
         quantize_async(A, am, ak, ascale);
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        poison_canary(ND, am);   // engine#666: so readback() can tell "not written" from "written as 0"
+        if (!gemv) poison_canary(ND, am);   // engine#666: so readback() can tell "not written" from "written as 0"
+        if (gemv) return (*kext)(wbo, *bA, *bC);
         return (*kext)(*bA, wbo, *bC);
     }
 
@@ -441,7 +519,28 @@ struct I8Ctx {
     }
 
     // ── Quantize activations into bA ──
+    // bf16 of one activation row, round-to-nearest-even: the gemv family takes bf16 in, and the kernel
+    // does its own quantisation, so there is no scale for the host to choose.
+    static inline uint16_t f32_to_bf16_bits(float v) {
+        uint32_t u;
+        std::memcpy(&u, &v, 4);
+        if ((u & 0x7F800000u) != 0x7F800000u) u += 0x7FFFu + ((u >> 16) & 1u);
+        return (uint16_t)(u >> 16);
+    }
+    inline uint16_t* quantize_bf16(const float* A, int am, int ak) {
+        if (am != 1) { std::fprintf(stderr, "  I8Ctx: the gemv family takes one row per launch (am=%d)\n", am); return Ag; }
+        const int n = ak < KD ? ak : KD;
+        for (int k = 0; k < n; k++) {
+            float v = A[k];
+            if (!std::isfinite(v)) v = 0.0f;
+            Ag[k] = f32_to_bf16_bits(v);
+        }
+        for (int k = n; k < KD; k++) Ag[k] = 0;   // K pad columns read as 0, like the container's
+        return Ag;
+    }
+
     inline int8_t* quantize_async(const float* A, int am, int ak, float ascale) {
+        if (gemv) { quantize_bf16(A, am, ak); return Am; }
         float ais = 1.0f / ascale;
         // Zero-pad ALL MD rows: the M=128 stream reads rows
         // [am, MD) every launch; zeroing only rows [0, am) left stale BO
@@ -525,8 +624,11 @@ struct I8Ctx {
 
     inline xrt::run sync_and_launch(int l) {
         bA->sync(XCL_BO_SYNC_BO_TO_DEVICE);
-        poison_canary(ND);
+        if (!gemv) poison_canary(ND);   // the canary is an int32 sentinel; the gemv output is f32
         bochk(l);
+        // The gemv family's argument order is (weights, activations, outputs); every int8 family
+        // this launcher was written for takes (activations, weights, outputs).
+        if (gemv) return (*kext)(*layerB[l], *bA, *bC);
         return (*kext)(*bA, *layerB[l], *bC);
     }
 
@@ -609,7 +711,7 @@ struct I8Ctx {
     // once instead of dequantising garbage into a layer.
     inline void readback() {
         bC->sync(XCL_BO_SYNC_BO_FROM_DEVICE);
-        if (canary_on_) verify_canary();
+        if (canary_on_ && !gemv) verify_canary();
         if (getenv("NPU_DBG")) {
             static int n = 0;
             if (n < 8) { n++; fprintf(stderr, "[RBCHK] bC=%016llx\n", bo_fnv(*bC)); }
@@ -667,6 +769,10 @@ struct I8Ctx {
 
     inline void dequant_only(float* C, int am, int an, float ascale,
                              float Bscale, int layer = -1) {
+        if (gemv) {   // no scales left to apply: the kernel returns N f32 outputs for the one row
+            for (int n = 0; n < an && n < ND; n++) C[n] = Cg[n];
+            return;
+        }
         const float* gs = nullptr;
         if (layer >= 0 && (size_t)layer < group_scales.size() &&
             (int)group_scales[layer].size() == an)
@@ -684,6 +790,10 @@ struct I8Ctx {
     inline void dequant_only_rows(float* C, int am, int an,
                                   const float* ascales, float Bscale,
                                   int layer = -1) {
+        if (gemv) {   // the family is one row per launch, so a batched read never happens here
+            for (int n = 0; n < an && n < ND; n++) C[n] = Cg[n];
+            return;
+        }
         const float* gs = nullptr;
         if (layer >= 0 && (size_t)layer < group_scales.size() &&
             (int)group_scales[layer].size() == an)

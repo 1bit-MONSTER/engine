@@ -37,16 +37,15 @@ bundle=$(cd "$1" && pwd) out=$2 ver=$3
 [ -x "$bundle/1bit" ] || { echo "not a 1bit bundle: $bundle (no 1bit binary)" >&2; exit 1; }
 [ -d "$bundle/hrx/llama/bin" ] || { echo "not a 1bit bundle: $bundle (no hrx/llama/bin)" >&2; exit 1; }
 
-libhsa=${LIBHSA:-}
-if [ -z "$libhsa" ]; then
-    for c in "$bundle/hrx/llama/bin/libhsa-runtime64.so.1" \
-             /usr/lib/x86_64-linux-gnu/libhsa-runtime64.so.1 \
-             /usr/lib64/libhsa-runtime64.so.1; do
-        [ -f "$c" ] && { libhsa=$c; break; }
-    done
-fi
-[ -n "$libhsa" ] && [ -f "$libhsa" ] || {
-    echo "no libhsa-runtime64.so.1 found; set LIBHSA=<path> (the HRX backend dlopens it)" >&2; exit 1; }
+# Only a runtime that registers gfx1151 will do. The distro's libhsa-runtime64 rejects the
+# HSA_AMD_AGENT_INFO_PM4_EMULATION probe on gfx1151, so HRX then registers no device (docs/hrx.md:932-941) —
+# and a clean `ldd` says nothing about that probe. So the bundle's own runtime is the default and there is no
+# distro fallback; a bundle without one has to name a TheRock/gfx1151 runtime explicitly.
+libhsa=${LIBHSA:-$bundle/hrx/llama/bin/libhsa-runtime64.so.1}
+[ -f "$libhsa" ] || {
+    echo "no libhsa-runtime64.so.1 at $libhsa; set LIBHSA=<the TheRock/gfx1151 runtime>" >&2
+    echo "the distro's ROCr is not a substitute: it rejects the PM4-emulation probe on gfx1151 and HRX gets no device" >&2
+    exit 1; }
 
 pkg=1bit-engine
 root=$(mktemp -d)/root
@@ -54,10 +53,24 @@ trap 'rm -rf "$(dirname "$root")"' EXIT
 mkdir -p "$root/opt/1bit/engine" "$root/usr/share/doc/$pkg" "$root/usr/share/1bit" \
          "$root/usr/bin" "$root/usr/lib/systemd/system/lemond.service.d" "$out"
 
-# the payload: 1bit, its backends, the sealed NPU kernel sets, the licences
+# the payload: 1bit, its backends, the sealed NPU kernel sets, the licences. LICENSE-BINARY travels with
+# NOTICE-BINARY because LICENSE-BINARY section 2 ("every copy is accompanied by this license and
+# NOTICE-BINARY") covers the HRX/NPU binaries in this payload, and package-linux.sh ships both in the
+# bundle for the same reason.
 cp -a "$bundle/1bit" "$bundle/hrx" "$bundle/npu" "$bundle/lemonade-hrx" "$bundle/NOTICE" \
-      "$bundle/NOTICE-BINARY" "$bundle/LICENSE" "$bundle/README.txt" "$root/opt/1bit/engine/"
+      "$bundle/NOTICE-BINARY" "$bundle/LICENSE" "$bundle/LICENSE-BINARY" "$bundle/README.txt" \
+      "$root/opt/1bit/engine/"
 chmod 0755 "$root/opt/1bit/engine/1bit"
+
+# The GGUF-on-NPU path is public helper scripts, not code compiled into 1bit: the binary looks for them
+# BESIDE ITSELF (app/built_path.h:44-56 -> packaged_path("scripts/repack_gguf.py") at app/serve.cpp:2482,
+# packaged_path("tools/gguf_to_q4nx.py") at app/serve.cpp:2589). Without them `1bit serve -m model.gguf
+# --device npu` fails with "Q4NX repack script not found" even with python3 and the converter installed, so
+# the payload keeps the two directories package-linux.sh stages (scripts/package-linux.sh:98-105).
+for d in "$bundle/scripts" "$bundle/tools"; do
+    [ -d "$d" ] || { echo "not a 1bit bundle: $d is missing (the NPU helper scripts travel beside 1bit)" >&2; exit 1; }
+done
+cp -a "$bundle/scripts" "$bundle/tools" "$root/opt/1bit/engine/"
 
 # The HSA runtime is NOT a standalone file. A TheRock libhsa lists TheRock's own libraries in NEEDED
 # (librocm_sysdeps_elf.so.1, librocm_sysdeps_drm.so.2, librocm_sysdeps_numa.so.1, librocm_sysdeps_z*…,

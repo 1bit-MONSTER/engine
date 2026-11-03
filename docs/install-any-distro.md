@@ -56,7 +56,11 @@ sudo apt-get install -y lemonade-server
 # 2. the engine
 sudo apt-get install -y ./1bit-engine_<version>_amd64.deb
 
-# 3. point Lemonade at it (either form; the package ships both)
+# 3. point Lemonade at it. The package already ships this drop-in as
+#    /usr/lib/systemd/system/lemond.service.d/10-1bit-engine.conf, so on a stock systemd install there is
+#    nothing to do here; a local override is only for a different path. Both forms are shipped, and
+#    /usr/share/1bit/lemonade-config-fragment.json is the config-key form.
+sudo mkdir -p /etc/systemd/system/lemond.service.d
 sudo tee /etc/systemd/system/lemond.service.d/10-1bit-engine.conf >/dev/null <<'EOF'
 [Service]
 Environment=LEMONADE_HRX_HRX_BIN=/opt/1bit/engine/lemonade-bin

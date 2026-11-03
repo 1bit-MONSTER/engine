@@ -59,7 +59,8 @@ reply=$(ask)
 check "the reply comes through" '[[ "$reply" == *Paris* ]]'
 check "the request was pinned to slot 0" '[[ "$reply" == *"\"fake_id_slot\":0"* ]]'
 sleep 0.3
-check "the handoff ran (share + adopt, not the file route)" 'grep -q "hybrid: .* share 0\.[0-9]* ms, first byte" "$scratch/a.log"'
+# the share time is logged with %.3f ms, so a sub-millisecond match would assert the box's load, not the path
+check "the handoff ran (share + adopt, not the file route)" 'grep -q "hybrid: .* share [0-9.]* ms, first byte" "$scratch/a.log"'
 check "no fallback happened" '! grep -q "the backend prefills this request itself" "$scratch/a.log"'
 check "the provider got one readable fd per region" \
     'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); sys.exit(0 if d[\"fds\"]==1 and d[\"readable\"]==[16] and d[\"n_ctx\"]==4096 else 1)" "$scratch/provider.json" 2>/dev/null'
@@ -73,7 +74,7 @@ check "serve starts with a provider that refuses the protocol" \
 reply=$(ask)
 check "the reply still comes through" '[[ "$reply" == *Paris* ]]'
 check "the fallback is named once" 'grep -q "the backend prefills this request itself" "$scratch/b.log"'
-check "no share/adopt line was reported" '! grep -q "hybrid: .* share 0\.[0-9]* ms, first byte" "$scratch/b.log"'
+check "no share/adopt line was reported" '! grep -q "hybrid: .* share [0-9.]* ms, first byte" "$scratch/b.log"'
 stop
 
 if [ $fail -ne 0 ]; then echo "--- log (tail)"; tail -30 "$scratch/a.log"; echo FAIL; exit 1; fi

@@ -1,0 +1,33 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 27onboard-installer - the "Install 1bit OS to a disk" GRUB entry's other half.
+#
+# The entry adds 1bit.installer=1 to the same boot line the appliance normally uses (so the kernel, modules,
+# /data and the engine are all exactly the shipped ones), and this starts the guarded console installer on the
+# console that boot selected: ttyS0 when 1bit.serial=1, tty1 otherwise. Nothing runs on a normal boot.
+#
+# It does NOT install by itself: 1bit-console-install lists the disks, refuses the disk this system booted
+# from, and requires the whole device name typed twice. 1bit-install is what writes.
+grep -q '1bit.installer=1' /proc/cmdline 2> /dev/null || exit 0
+# On the screen, tty1's inittab entry (1bit-console) already IS the installer, so only the serial case needs
+# starting here - two readers of one terminal would eat each other's keystrokes.
+if grep -q '1bit.serial=1' /proc/cmdline 2> /dev/null; then
+    echo "27onboard-installer: install entry: the console installer is on /dev/ttyS0" >&2
+    ( /usr/local/bin/1bit-console-install < /dev/ttyS0 > /dev/ttyS0 2>&1 & )
+else
+    echo "27onboard-installer: install entry: the installer is tty1's login (1bit-console)" >&2
+fi

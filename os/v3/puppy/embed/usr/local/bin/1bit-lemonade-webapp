@@ -1,0 +1,55 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-lemonade-webapp - what the desktop autostart runs: open the appliance's chat screen in a browser.
+#
+# Owner, 2026-11-02: "open a browser and feed it a prompt and then we record it". Two measured facts shape this:
+#   * Lemonade's own web UI at 13305 RENDERS in the image's Pale Moon but its chat needs TextDecoderStream and
+#     AbortSignal.timeout, which Pale Moon does not have - so the chat screen served by 24onboard-webapp is what
+#     opens (see /opt/1bit/webapp/index.html for the capability probe behind that), and the real UI is one link
+#     away in the page header;
+#   * the API key has to be in the URL or the first thing the owner does on camera is type a 48-character secret:
+#     it is read from /etc/1bit/lemond.conf (the file 10lemonade mints at first boot) and passed once; the page
+#     keeps it in localStorage from then on.
+#
+# Runs once per X session (the autostart can fire again when the WM restarts).
+[ -e /tmp/1bit-webapp-opened ] && exit 0
+CONF=$(readlink -f /etc/1bit/lemond.conf 2> /dev/null || echo /etc/1bit/lemond.conf)
+KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' "$CONF" 2> /dev/null | head -1)
+# wait for the server to answer at all (it is what serves the model list the page asks for): up to 60 s, and do not
+# hold the X session up while waiting
+i=0
+while [ $i -lt 60 ]; do
+    curl -s -o /dev/null -m 2 "http://127.0.0.1:13305/" && break
+    sleep 1; i=$((i + 1))
+done
+URL="http://localhost:${ONEBIT_WEBAPP_PORT:-8080}/"
+[ -n "${KEY:-}" ] && URL="$URL?key=$KEY"
+BROWSER=
+for b in /opt/palemoon/palemoon /usr/bin/palemoon /usr/bin/epiphany-browser /usr/bin/firefox; do
+    [ -x "$b" ] && { BROWSER=$b; break; }
+done
+: > /tmp/1bit-webapp-opened 2> /dev/null
+if [ -n "$BROWSER" ]; then
+    # --no-remote: a second copy of the profile would refuse to start, and this is the first window of the session
+    case $BROWSER in
+    *palemoon*) exec "$BROWSER" --no-remote "$URL" ;;
+    *)          exec "$BROWSER" "$URL" ;;
+    esac
+fi
+# no browser: at least say where the screen is, on the console and in the log
+echo "1bit-lemonade-webapp: no browser found - the chat screen is $URL" > /dev/ttyS0 2> /dev/null
+echo "1bit-lemonade-webapp: no browser found - the chat screen is $URL" >> /var/log/1bit-webapp.log 2> /dev/null

@@ -1,0 +1,513 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-console-menu - what /etc/inittab respawns on tty1 (a headless boot).
+#
+# The OWNER, on the cycle-14 board boot (2026-11-02 ~21:00): "no menu system". The appliance's console was a
+# bare root prompt, which is not an appliance: a person in front of the box (JetKVM or a monitor) needs to see
+# what the machine is doing and to reach the six things the box can do without a browser, and every one of
+# them used to be an ssh session.
+#
+# Design decisions, each one paid for by an earlier cycle:
+#   * tty1 only. ssh users get bash - a menu that traps a remote administrator is a worse appliance. inittab
+#     names this script; there is nothing here that sshd runs.
+#   * it never exits to a dead console. A dialog that dies, a terminal that cannot redraw, an action that
+#     returns garbage: every path redraws. inittab respawns it as a backstop, but a respawn loop on a broken
+#     terminal looks like a crash, so the fallback is a plain-text menu on the same terminal.
+#   * every status number is read where the rest of the image reads it (/proc, /sys, 1bit-board, lemond's own
+#     API) - no second source of truth, and no number that a stale file can fake.
+#   * every menu item can be run WITHOUT a keyboard: `--run N` does the item's read-only half and says what
+#     it would do, and `--selftest` runs all nine. That is not a courtesy to the VM rows - a console menu
+#     whose actions have never run is untested code on the one surface nobody can attach a debugger to.
+#
+# Usage:
+#   1bit-console-menu              the menu on this terminal (that is what tty1 gets)
+#   1bit-console-menu --status     print the header and status block, exit 0 (no terminal needed)
+#   1bit-console-menu --run N      run menu item N non-interactively (1..9); exit 0 if it did its read half
+#   1bit-console-menu --selftest   --status plus every item; exit 0 only if all of them answered
+#
+# Exit: 0 ok, 1 an action failed, 2 usage.
+
+API=http://127.0.0.1:13305
+CONF=/etc/1bit/lemond.conf
+LEMLOG=/var/log/lemond-onebit.log
+NONINT=0
+say() { printf '%s\n' "$*"; }
+
+# ── the facts the header and the status block are made of ──────────────────────────────────────────────
+release_tag() {
+    if [ -r /data/RELEASE-TAG ]; then head -1 /data/RELEASE-TAG
+    elif [ -r /etc/1bit/release-identity ]; then sed -n 's/^payload=//p' /etc/1bit/release-identity | head -1
+    else echo unknown; fi
+}
+hostname_now() { hostname 2>/dev/null || cat /etc/hostname 2>/dev/null || echo 1bit-os; }
+ips() {
+    ip -4 -o addr show scope global 2>/dev/null | awk '{print $4}' | cut -d/ -f1 | tr '\n' ' ' |
+        sed 's/ *$//'
+}
+api_key() {
+    f=$(readlink -f "$CONF" 2>/dev/null || echo "$CONF")
+    sed -n 's/^LEMONADE_API_KEY=//p' "$f" 2>/dev/null | head -1
+}
+lemond_up() { [ -n "$(lemond_pid)" ]; }
+lemond_pid() {
+    ps 2>/dev/null | awk '/[l]emond /{print $1; exit}'
+}
+lemond_listening() { netstat -lnt 2>/dev/null | awk '$4 ~ /:13305$/ {n++} END {print n+0}'; }
+
+# The GPU line asks the runtime, not the device node: /dev/kfd present with no HRX0 registered is the cycle-13
+# failure this lane spent a board boot on, and "a device exists" would have hidden it. llama-server --list-devices
+# is the same question release-check's hrx-device row asks, cached for two minutes because the menu redraws.
+gpu_line() {
+    if [ ! -e /dev/kfd ] || ! ls /dev/dri/renderD* >/dev/null 2>&1; then
+        echo "none (no /dev/kfd or /dev/dri/renderD* on this machine)"; return
+    fi
+    cache=/tmp/1bit-menu-gpu
+    age=999999
+    [ -s "$cache" ] && age=$(( $(date +%s) - $(stat -c %Y "$cache" 2>/dev/null || echo 0) ))
+    if [ "$age" -gt 120 ]; then
+        lsrv=${ONEBIT_HRX_LLAMA_SERVER:-/opt/1bit-llama/llama-server}
+        if [ -x "$lsrv" ]; then
+            timeout 20 "$lsrv" --list-devices 2>&1 |
+                sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' |
+                grep -vi INCOMPATIBLE | head -1 > "$cache"
+        else
+            echo "no llama-server at $lsrv" > "$cache"
+        fi
+    fi
+    d=$(head -1 "$cache" 2>/dev/null)
+    if [ -n "$d" ]; then
+        free=$(printf '%s' "$d" | sed -n 's/.*(\([0-9]*\) MiB free).*/\1/p')
+        [ -n "$free" ] && echo "${d%%:*}, $free MiB free" || echo "${d%%:*}"
+    else
+        echo "no HRX device (the runtime registered none)"
+    fi
+}
+npu_line() {
+    m=absent
+    grep -q '^amdxdna ' /proc/modules 2>/dev/null && m=loaded
+    fw=absent
+    ls /lib/firmware/amdnpu >/dev/null 2>&1 && fw=present
+    dev=absent
+    [ -e /dev/accel/accel0 ] && dev=accel0
+    echo "amdxdna $m, firmware $fw, $dev"
+}
+sb_line() {
+    f=$(ls /sys/firmware/efi/efivars/SecureBoot-* 2>/dev/null | head -1)
+    if [ -z "$f" ]; then echo "unknown (efivarfs not mounted)"; return; fi
+    # efivarfs does not support partial reads: `dd skip=4` seeks and gets nothing, which read as "disabled" on a
+    # Secure Boot machine the first time this was written (measured here: dd skip=4 empty, od of the whole
+    # variable 6 0 0 0 1). Read the 5 bytes and take the last one - 4 attribute bytes, then the value.
+    v=$(od -An -tu1 < "$f" 2>/dev/null | awk '{print $5}')
+    [ "$v" = 1 ] && echo enabled || echo "disabled (SecureBoot=$v)"
+}
+fans_line() {
+    s=$(/usr/sbin/1bit-board status 2>/dev/null | head -1)
+    if [ -n "$s" ]; then echo "$s"
+    else
+        n=0; rpm=""
+        for f in /sys/class/hwmon/hwmon*/fan*_input; do
+            [ -r "$f" ] || continue
+            rpm="$rpm $(basename "$f" _input)=$(cat "$f")"; n=$((n + 1))
+        done
+        [ "$n" -gt 0 ] && echo "fans:$rpm" || echo "not readable (no EC driver, no hwmon fan)"
+    fi
+}
+temps_line() {
+    max=0
+    for f in /sys/class/hwmon/hwmon*/temp*_input; do
+        [ -r "$f" ] || continue
+        t=$(cat "$f" 2>/dev/null); [ -n "$t" ] || continue
+        t=$((t / 1000))
+        [ "$t" -gt "$max" ] && max=$t
+    done
+    [ "$max" -gt 0 ] && echo "max ${max}C" || echo "no sensor"
+}
+data_line() {
+    d=$(df -h /data 2>/dev/null | awk 'NR == 2 {print $2", "$4" free"}')
+    [ -n "$d" ] && echo "$d" || echo "not mounted"
+}
+models_line() {
+    k=$(api_key)
+    list=""
+    [ -n "$k" ] && list=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+        grep -o '"id":"[^"]*"' | cut -d'"' -f4 | tr '\n' ' ')
+    if [ -n "$list" ]; then
+        echo "$(printf '%s\n' $list | wc -l) downloaded: $(printf '%s' "$list" | cut -c1-60)"
+    else
+        echo "none downloaded (or Lemonade is not answering)"
+    fi
+}
+
+header_line() { say "1bit OS $(release_tag)   $(hostname_now)   $(first_ip)"; }
+first_ip() { ips | awk '{print $1}'; }
+# The block is SEVEN lines on purpose: tty1 is an 80x25 text console, and a dialog that needs more room than
+# that clips its own menu (measured here: at 22 rows with a 12-line prompt, item 9 "Reboot / power off" was
+# not drawn at all and there was no way to reach it from the console).
+status_text() {
+    ip=$(first_ip)
+    header_line
+    if lemond_up; then
+        say "Lemonade  up (pid $(lemond_pid)) - http://${ip:-127.0.0.1}:13305"
+    else
+        say "Lemonade  DOWN (no lemond process; item 8 has its log)"
+    fi
+    say "GPU  $(gpu_line | cut -c1-68)"
+    say "NPU  $(npu_line | cut -c1-30)   Secure Boot  $(sb_line | cut -c1-30)"
+    say "Fans $(fans_line | cut -c1-40)   temps $(temps_line)"
+    say "Data $(data_line)   Models $(models_line | cut -c1-30)"
+}
+menu_text() { say "1-9 then Enter. Status redraws every 15 s. ssh users get bash, not this menu."; }
+
+# ── the terminal ───────────────────────────────────────────────────────────────────────────────────────
+# dialog draws its widget on stdout and writes the RESULT to stderr, which is why the choice is captured through
+# the 3>&1 1>&2 2>&3 dance. `--no-mouse` is not cosmetic: without it ncurses initialises gpm and dialog prints
+# `libgpm: zero screen dimension...` on stderr - i.e. INSIDE the captured value - measured here as
+# `choice=libgpm:...`, which made every menu item do nothing. An appliance console has no gpm either, so the
+# mouse is off and the warning is gone. -timeout redraws the menu (and so the status) every 15 s.
+ui() {   # ui <dialog args...> -> the widget on the terminal, the result on stdout
+    TERM=${TERM:-linux} dialog --no-shadow --no-mouse "$@" 3>&1 1>&2 2>&3
+}
+dialog_ok() { command -v dialog > /dev/null 2>&1; }
+
+# The fallback: a terminal dialog cannot draw on still gets the same information and the same choices. This
+# is not decoration - "the console never goes dead" is the promise, and a menu that only exists if ncurses
+# works breaks it on the one machine nobody can log into.
+text_choice() {
+    printf '\033[H\033[2J'
+    status_text
+    menu_text
+    printf '  [1-9] '
+    read -r answer || answer=""
+    printf '%s' "$answer"
+}
+
+show_text() {   # show_text <title> <file>
+    if [ "$NONINT" = 1 ] || ! dialog_ok; then cat "$2"; return 0; fi
+    ui --title " $1 " --textbox "$2" 22 78
+}
+yesno() {   # yesno <question> -> 0 = yes
+    [ "$NONINT" = 1 ] && return 0
+    dialog_ok || return 0
+    ui --title " 1bit OS " --yesno "$1" 10 70
+}
+say_text() {   # say_text <title> <text...>
+    t=$(mktemp) || return 1
+    printf '%s\n' "$2" > "$t"
+    show_text "$1" "$t"
+    rm -f "$t"
+}
+
+# ── items ─────────────────────────────────────────────────────────────────────────────────────────────
+# 1 Show API key. Confirmed first: the key is a bearer token, and a console that prints it on any stray Enter
+# is a console that leaks it into a JetKVM recording.
+item_api_key() {
+    k=$(api_key)
+    if [ -z "$k" ]; then
+        say "no API key: $CONF has no LEMONADE_API_KEY line (first boot mints one; see item 8)"
+        return 1
+    fi
+    if [ "$NONINT" = 1 ]; then
+        say "api-key: $k"
+        [ ${#k} -ge 32 ] && { say "api-key-shown"; return 0; }
+        return 1
+    fi
+    yesno "Show the Lemonade API key on this screen?
+It is a bearer token: anyone who can read this screen can use the appliance." || return 0
+    say_text "API key" "Lemonade API key
+
+$k
+
+As a header:   Authorization: Bearer $k
+Try it:        curl -H \"Authorization: Bearer $k\" $API/api/v1/models"
+}
+
+# 2 Quick chat test: one request per backend that this machine can actually run, printing the answer and the
+# rate. The rate is Lemonade's own predicted_per_second, which is what release-check's chat rows report, so the
+# menu and the acceptance run cannot disagree about how fast the box is.
+chat_one() {   # chat_one <model id> -> "id<TAB>answer<TAB>tok/s"
+    k=$(api_key)
+    r=$(curl -s -m 300 -H 'Content-Type: application/json' -H "Authorization: Bearer $k" \
+        --data-binary "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":32,\"temperature\":0}" \
+        "$API/api/v1/chat/completions" 2>/dev/null)
+    case $r in
+    *'"content"'*)
+        a=$(printf '%s' "$r" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)
+        t=$(printf '%s' "$r" | sed -n 's/.*"predicted_per_second":\([0-9.]*\).*/\1/p' | head -1)
+        printf '%s\t%s\t%s\n' "$1" "${a:-<empty>}" "${t:-?}" ;;
+    *) printf '%s\tno answer: %s\t-\n' "$1" "$(printf '%s' "${r:-}" | head -c 100)" ;;
+    esac
+}
+item_chat() {
+    k=$(api_key)
+    if [ -z "$k" ]; then say "no API key: cannot chat (item 8 shows the Lemonade log)"; return 1; fi
+    ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+        grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+    # "nothing downloaded" is not a broken menu item: a machine with no model, and every VM (Lemonade hides the
+    # onebit entries when there is no GPU and no NPU), legitimately has nothing to chat with. It is a SKIP with
+    # the reason, so --selftest stays green for the right reason and a real request failure still fails.
+    [ -n "$ids" ] || { say "no downloaded model on this machine - item 4 pulls one (chat-skipped)"; return 0; }
+    # the backend is in the id ("...-NPU-1bit"), which is how release-check tells the two apart as well
+    npu=$(printf '%s\n' "$ids" | grep -i 'npu' | head -1)
+    hrx=$(printf '%s\n' "$ids" | grep -vi 'npu' | head -1)
+    out=$(mktemp) || return 1
+    : > "$out"
+    for m in "$hrx" "$npu"; do
+        [ -n "$m" ] || continue
+        line=$(chat_one "$m")
+        printf '%-34s %s   (%s tok/s)\n' "$(printf '%s' "$line" | cut -f1)" \
+            "$(printf '%s' "$line" | cut -f2)" "$(printf '%s' "$line" | cut -f3)" >> "$out"
+    done
+    say "chat test ($(hostname_now)):"
+    cat "$out"
+    if grep -q '1BIT OK' "$out"; then say "chat-ok"; rc=0; else rc=1; fi
+    [ "$NONINT" = 1 ] || show_text "Chat test" "$out"
+    rm -f "$out"
+    return $rc
+}
+
+# 3 Network: what the wire looks like, a one-shot DHCP lease when it has none, a session-only static address,
+# and the hostname. Nothing here writes a connman profile: the appliance's own DHCP is connman's and a second
+# client racing it was rejected as a fix in cycle 13 - this is the emergency path for a boot that came up with
+# no address at all, and it says so on the screen.
+net_status() {
+    say "hostname   $(hostname_now)"
+    say "addresses  $(ips)"
+    ip -4 route 2> /dev/null | head -3
+    say "link       $(iface_first)"
+    command -v connmanctl > /dev/null 2>&1 && say "connman    present" || say "connman    absent"
+}
+iface_first() {
+    i=$(ip -4 -o addr show scope global 2>/dev/null | awk 'NR == 1 {print $2}')
+    [ -n "$i" ] || i=$(ip -o link show 2>/dev/null | awk -F': ' '$2 !~ /^(lo|sit|ip6)/ {print $2; exit}')
+    printf '%s' "$i"
+}
+item_network() {
+    if [ "$NONINT" = 1 ]; then
+        net_status; say "network-reported"; return 0
+    fi
+    while : ; do
+        c=$(ui --title " Network " --menu "$(net_status)" 20 76 4 \
+            1 "Renew the DHCP lease (one shot, this session)" \
+            2 "Set a static address (this session only)" \
+            3 "Set the hostname" \
+            4 "Back" ) || c=4
+        case $c in
+        1) i=$(iface_first)
+           if [ -z "$i" ]; then
+               say_text "Network" "no network interface at all: the kernel has no driver bound to the card.
+Check 'lsmod | grep -E virtio|e1000|r8169' - a module tree that is not visible is the cycle-13 defect, not a
+DHCP one (the appliance has no interface until the driver loads)."
+               continue
+           fi
+           if udhcpc -n -q -i "$i" > /tmp/1bit-dhcp.log 2>&1; then
+               say_text "Network" "lease renewed on $i: $(ips)"
+           else
+               say_text "Network" "udhcpc failed on $i: $(tail -3 /tmp/1bit-dhcp.log 2>/dev/null)"
+           fi ;;
+        2) a=$(ui --title " Static address " --inputbox "address/prefix (e.g. 192.168.50.111/24)" 10 70 "") || a=""
+           [ -n "$a" ] || continue
+           g=$(ui --title " Static address " --inputbox "default gateway" 10 70 "") || g=""
+           i=$(iface_first)
+           if ip addr add "$a" dev "$i" 2> /tmp/1bit-static.log &&
+              { [ -z "$g" ] || ip route replace default via "$g" dev "$i" 2>> /tmp/1bit-static.log; }; then
+               say_text "Static address" "$a on ${i:-no link} (gateway ${g:-none}): $(ips)
+This lives until reboot unless the save layer keeps it."
+           else
+               say_text "Static address" "$(tail -3 /tmp/1bit-static.log 2>/dev/null)"
+           fi ;;
+        3) h=$(ui --title " Hostname " --inputbox "hostname" 10 70 "$(hostname_now)") || h=""
+           if [ -n "$h" ]; then
+               echo "$h" > /etc/hostname
+               hostname "$h" 2> /dev/null
+               grep -q " $h" /etc/hosts || sed -i "s/^127.0.0.1.*/127.0.0.1 localhost $h/" /etc/hosts
+               say_text "Hostname" "the appliance is now $h (and /etc/hosts agrees)"
+           fi ;;
+        *) return 0 ;;
+        esac
+    done
+}
+
+# 4 Models: what is downloaded, pull by Hub id, delete. All three are the release CLI's own verbs, with the
+# appliance's key, so the menu cannot drift from what `lemonade` does from a shell.
+item_models() {
+    k=$(api_key); export LEMONADE_API_KEY="$k" LEMONADE_PORT=13305
+    ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+        grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+    if [ "$NONINT" = 1 ]; then
+        say "downloaded:"; printf '%s\n' "${ids:-<none>}"
+        say "models-listed"; return 0
+    fi
+    while : ; do
+        c=$(ui --title " Models " --menu "downloaded:
+$(printf '%s\n' "${ids:-<none>}" | head -12)" 22 76 3 \
+            1 "List downloaded models" 2 "Pull a model by Hugging Face id" 3 "Delete a downloaded model" \
+            4 "Back") || c=4
+        case $c in
+        1) say_text "Models" "${ids:-no model downloaded}" ;;
+        2) h=$(ui --title " Pull " --inputbox "Hugging Face id (e.g. Qwen/Qwen3-0.6B-GGUF)" 10 76 "") || h=""
+           [ -n "$h" ] || continue
+           ( ui --title " Pull " --infobox "pulling $h - this can take minutes" 6 70;
+             timeout 3600 lemonade pull "$h" > /tmp/1bit-pull.log 2>&1 )
+           say_text "Pull" "$(tail -12 /tmp/1bit-pull.log 2>/dev/null)" ;;
+        3) [ -n "$ids" ] || { say_text "Models" "nothing downloaded"; continue; }
+           pairs=""
+           for i in $ids; do pairs="$pairs $i $i"; done
+           # shellcheck disable=SC2086  # the pairs ARE words: dialog --menu takes tag/description pairs
+           m=$(ui --title " Delete " --menu "which model" 20 76 10 $pairs) || continue
+           yesno "Delete $m from this machine?" || continue
+           lemonade delete "$m" > /tmp/1bit-delete.log 2>&1
+           say_text "Delete" "$(tail -5 /tmp/1bit-delete.log 2>/dev/null)" ;;
+        *) return 0 ;;
+        esac
+        ids=$(curl -s -m 5 -H "Authorization: Bearer $k" "$API/v1/models" 2>/dev/null |
+            grep -o '"id":"[^"]*"' | cut -d'"' -f4)
+    done
+}
+
+# 5 The guarded installer the GRUB entry also runs. The menu does not grow a second copy of that logic.
+item_install() {
+    if [ ! -x /usr/local/bin/1bit-console-install ]; then
+        say "no /usr/local/bin/1bit-console-install in this image"; return 1
+    fi
+    if [ "$NONINT" = 1 ]; then
+        /usr/local/bin/1bit-console-install --list 2>&1 | head -6
+        say "install-guard-checked"; return 0
+    fi
+    yesno "Install 1bit OS to a disk?
+The disk is wiped. The installer refuses this boot's own disk and asks for the whole device name." || return 0
+    /usr/local/bin/1bit-console-install
+}
+
+# 6 The desktop, for this session only: the headless entry is the default, and a person who wants JWM now
+# should not have to reboot. quicksetup still runs on the first X start (it is a desktop question, and there
+# is a keyboard in front of the screen when this item is used).
+item_desktop() {
+    for b in /usr/bin/xwin /usr/bin/startx; do
+        [ -x "$b" ] || continue
+        if [ "$NONINT" = 1 ]; then say "desktop: $b available"; say "desktop-available"; return 0; fi
+        yesno "Start the desktop (JWM) for this session? The menu comes back when X exits." || return 0
+        clear; TERM=${TERM:-linux} "$b"; return 0
+    done
+    say "no xwin/startx in this image - the desktop entry in the boot menu is the way in"
+    return 1
+}
+
+# 7 A shell, and the menu comes back on exit. This is the escape hatch for everything the menu does not do,
+# and it is why ssh does not need the menu.
+item_shell() {
+    if [ "$NONINT" = 1 ]; then
+        command -v bash > /dev/null 2>&1 || return 1
+        say "shell: $(command -v bash)"; say "shell-bash"; return 0
+    fi
+    clear
+    # tty1 is where a person is standing; a run over the serial console has no /dev/tty1, so fall back rather
+    # than open a shell with a dead stdin and look like a hang
+    if [ -e /dev/tty1 ]; then
+        TERM=${TERM:-linux} bash -l < /dev/tty1 > /dev/tty1 2>&1
+    else
+        TERM=${TERM:-linux} bash -l
+    fi
+    return 0
+}
+
+# 8 Logs: the two a person needs on this box, bounded, in one screen.
+item_logs() {
+    out=$(mktemp) || return 1
+    {
+        say "=== $LEMLOG (tail 40)"
+        tail -40 "$LEMLOG" 2>/dev/null || say "(no $LEMLOG)"
+        say ""
+        say "=== dmesg (tail 25)"
+        dmesg 2>/dev/null | tail -25 || say "(no dmesg)"
+    } > "$out"
+    if [ "$NONINT" = 1 ]; then
+        cat "$out"; rm -f "$out"; say "logs-shown"; return 0
+    fi
+    show_text "Logs" "$out"
+    rm -f "$out"
+}
+
+# 9 Reboot or power off, confirmed. In test mode it says what it would do and touches nothing.
+item_power() {
+    if [ "$NONINT" = 1 ]; then say "power: would offer reboot/poweroff"; say "power-noop"; return 0; fi
+    c=$(ui --title " Reboot / power off " --menu "what should the box do?" 14 60 2 \
+        1 "Reboot" 2 "Power off") || return 0
+    case $c in
+    1) yesno "Reboot now?" && { clear; sync; reboot; } ;;
+    2) yesno "Power off now?" && { clear; sync; poweroff; } ;;
+    esac
+    return 0
+}
+
+run_item() {   # run_item <1..9>
+    case $1 in
+    1) item_api_key ;;
+    2) item_chat ;;
+    3) item_network ;;
+    4) item_models ;;
+    5) item_install ;;
+    6) item_desktop ;;
+    7) item_shell ;;
+    8) item_logs ;;
+    9) item_power ;;
+    *) say "no menu item '$1' (1..9)"; return 2 ;;
+    esac
+}
+
+main_menu() {
+    while : ; do
+        if dialog_ok; then
+            choice=$(ui --clear --backtitle "1bit OS - $(hostname_now) - $(release_tag)" \
+                --title "1bit OS console" --timeout 15 \
+                --menu "$(status_text; menu_text)" 24 78 9 \
+                1 "Show the API key" \
+                2 "Quick chat test (GPU and NPU)" \
+                3 "Network (DHCP, static, hostname)" \
+                4 "Models (list, pull, delete)" \
+                5 "Install 1bit OS to a disk" \
+                6 "Start the desktop (JWM) for this session" \
+                7 "Shell (bash, returns here on exit)" \
+                8 "Logs (Lemonade, kernel)" \
+                9 "Reboot / power off") || choice=""
+        else
+            choice=$(text_choice)
+        fi
+        case "${choice:-}" in
+        1|2|3|4|5|6|7|8|9) run_item "$choice" ;;
+        "") : ;;                       # timeout (255) or ESC: redraw with fresh status, never exit
+        *) say "press a number 1-9" ;;
+        esac
+        sleep 1
+    done
+}
+
+case "${1:-}" in
+--status)   status_text; menu_text; exit 0 ;;
+--run)      [ $# -eq 2 ] || { say "usage: $0 --run <1..9>"; exit 2; }
+            NONINT=1; run_item "$2"; exit $? ;;
+--selftest) NONINT=1; rc=0
+            status_text
+            for i in 1 2 3 4 5 6 7 8 9; do
+                say "--- item $i"
+                run_item "$i" || { say "item $i FAILED"; rc=1; }
+            done
+            [ "$rc" = 0 ] && say "menu-selftest-ok"
+            exit "$rc" ;;
+-h|--help)  sed -n "/^# Usage:/,/^# Exit:/p" "$0" | sed 's/^# \{0,1\}//' ;;
+"")         main_menu ;;
+*)          say "unknown argument '$1' (usage: $0 [--status|--run N|--selftest|--help])"; exit 2 ;;
+esac

@@ -1,0 +1,44 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/03onboard-efivars - efivarfs mounted before anything that reads an EFI variable.
+#
+# U4 is "Secure Boot state readable (efivarfs) and ON" and U6 writes a firmware boot entry; both need
+# efivars, and nothing else in the image mounts it. Puppy ships /etc/init.d/efivarfs, and it cannot do the
+# job: it acts only `if [ -d /sys/firmware/efi/efivars ]`, a directory that does not exist until efivarfs IS
+# mounted - dead logic, and `rc.services` runs it faithfully. Measured on cycle 9's image under Secure Boot
+# (2 Nov): the kernel said `Secure boot enabled` and userspace said `EFI variables are not supported on this
+# system`, so `mokutil --sb-state` and `efibootmgr` both fail on an appliance whose Secure Boot is perfect.
+# Nothing was missing - this kernel carries efivarfs builtin (the zdrv's modules.builtin lists
+# kernel/fs/efivarfs/efivarfs.ko and modules.dep has no entry for it). The mount was missing.
+#
+# rc.services runs /etc/init.d/* in name order, so 03 runs before 05onboard-data, 10lemonade, 20onboard-ssh
+# and before anything the boot does with EFI. `modprobe efivarfs` first: it is builtin today, and a future
+# kernel that makes it a module must not turn this into a no-op.
+if [ ! -d /sys/firmware/efi ]; then
+    exit 0   # booted without EFI (or a legacy boot): nothing to mount, and nothing to complain about
+fi
+if grep -q ' /sys/firmware/efi/efivars ' /proc/mounts 2> /dev/null; then
+    exit 0   # already mounted by the firmware path or an earlier script
+fi
+modprobe efivarfs 2> /dev/null || true
+mkdir -p /sys/firmware/efi/efivars
+if mount -t efivarfs efivarfs /sys/firmware/efi/efivars 2> /dev/null; then
+    echo "03onboard-efivars: /sys/firmware/efi/efivars mounted"
+else
+    echo "03onboard-efivars: could not mount efivarfs - Secure Boot state and efibootmgr stay unreadable" >&2
+fi
+exit 0

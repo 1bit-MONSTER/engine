@@ -66,7 +66,10 @@ def decode(tile: bytes):
             c[:, 1::2] = b >> 4
             code[r0:r0 + 32, kb * 128:(kb + 1) * 128] = c.T
             z = s[2048:2064]
-            zp[r0:r0 + 32, kb] = np.concatenate([z & 0x0F, z >> 4])
+            # the zero-point nibbles pair with rows even/odd, exactly as the codes do -- a correct zero
+            # point sits where its 128 codes cluster, and only this pairing satisfies that on the shipped
+            # tiles (engine#849). Pairing them in halves puts another row's zero point in half the rows.
+            zp[r0:r0 + 32, kb] = np.stack([z & 0x0F, z >> 4], axis=-1).reshape(32)
             scale[r0:r0 + 32, kb] = (np.frombuffer(s[2112:2176].tobytes(), dtype=np.uint16).astype(np.uint32) << 16).view(np.float32)
     return code, scale, zp, bias
 

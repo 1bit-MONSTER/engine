@@ -35,6 +35,7 @@
 #include "pack_import.h"
 #include "q4nx.h"
 
+#include <algorithm>
 #include <cmath>
 #include <cstdio>
 #include <cstring>
@@ -433,6 +434,49 @@ void test_attn_tile(const std::string& golden_dir) {
         pi::TileW bad3 = t;
         bad3.bias.at(3) ^= 0x0001;
         check(pi::encode_tile(bad3) != tile, "attention golden: the bias slot is part of the check");
+    }
+
+    // engine#849: the zero-point nibbles pair with rows even/odd, exactly like the codes. The round trip
+    // above cannot see this class -- it is invariant under any permutation applied on both sides -- so it
+    // gets two checks of its own.
+    {
+        // (a) structural, off bytes whose nibbles are all distinct: byte i must give rows 2i and 2i+1.
+        const int kbs = k / 128;
+        const int64_t subv = pi::attn_tile_bytes(k) / (2 * kbs + 2);
+        std::vector<uint8_t> raw(size_t(pi::attn_tile_bytes(k)), 0);
+        for (int h = 0; h < 2; ++h)
+            for (int kb = 0; kb < kbs; ++kb)
+                for (int i = 0; i < 16; ++i)
+                    raw[size_t((2 + 2 * kb + h) * subv + 2048 + i)] = uint8_t(i | ((15 - i) << 4));
+        const pi::TileW z = pi::decode_tile(raw.data(), k);
+        bool pairs_even_odd = true;
+        for (int h = 0; h < 2 && pairs_even_odd; ++h)
+            for (int kb = 0; kb < kbs && pairs_even_odd; ++kb)
+                for (int i = 0; i < 16; ++i)
+                    pairs_even_odd = z.zp[size_t(h * 32 + 2 * i) * size_t(kbs) + size_t(kb)] == uint8_t(i) &&
+                                     z.zp[size_t(h * 32 + 2 * i + 1) * size_t(kbs) + size_t(kb)] ==
+                                         uint8_t(15 - i);
+        check(pairs_even_odd, "attention tile: zero-point nibbles pair with rows 2i / 2i+1 (even/odd)");
+
+        // (b) on the pack's own tile: a correctly paired zero point sits where its 128 codes cluster, so
+        // corr(zp, mean code) is near 1 (measured +0.9977); pairing in halves scores 0 (-0.0227).
+        double n = 0, sz = 0, sm = 0, szz = 0, smm = 0, szm = 0;
+        for (int r = 0; r < 64; ++r)
+            for (int b = 0; b < kbs; ++b) {
+                double sum = 0;
+                for (int c = 0; c < 128; ++c) sum += t.code[size_t(r) * size_t(k) + size_t(b * 128 + c)];
+                const double m = sum / 128.0, zz = double(t.zp[size_t(r) * size_t(kbs) + size_t(b)]);
+                n += 1; sz += zz; sm += m; szz += zz * zz; smm += m * m; szm += zz * m;
+            }
+        const double cov = szm / n - (sz / n) * (sm / n);
+        const double sd = std::sqrt(std::max(0.0, szz / n - (sz / n) * (sz / n)));
+        const double sm2 = std::sqrt(std::max(0.0, smm / n - (sm / n) * (sm / n)));
+        const double corr = (sd > 0 && sm2 > 0) ? cov / (sd * sm2) : 0.0;
+        char buf[160];
+        std::snprintf(buf, sizeof buf,
+                      "attention tile: the zero points sit under their own codes (corr %+0.4f, want > 0.9)",
+                      corr);
+        check(corr > 0.9, buf);
     }
 
     // the container tiles the importer derives from that tile, against the recorded ones

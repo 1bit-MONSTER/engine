@@ -1,0 +1,43 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/20onboard-ssh - the owner's ssh key, and sshd up, at boot (TPUPPY-RELEASE U7).
+#
+# Puppy ships /etc/init.d/ssh and rc.services runs it, but nothing ever generated host keys: on a built
+# resolute64 image /etc/ssh has moduli, ssh_config and sshd_config and no ssh_host_* at all, and sshd
+# refuses to start without them. Permissions are the other half: /opt/1bit-package and the image files
+# come out of git with 644/755, and sshd's StrictModes rejects an authorized_keys that is not 600 in a
+# 700 directory.
+#
+# This runs before Puppy's own ssh script (rc.services runs /etc/init.d/* in name order) and owns sshd,
+# so that script is told to stand down through the marker it already honours. An image with no key
+# provisions no listener, which is the right default for a release that has not been keyed yet.
+KEYS=/root/.ssh/authorized_keys
+
+[ -s "$KEYS" ] || { echo "20onboard-ssh: no $KEYS, sshd not started"; exit 0; }
+mkdir -p /run/sshd
+# StrictModes checks the OWNER as well as the mode, and the image's files come out of git with whatever uid
+# built the squashfs: measured in a booted image, /root/.ssh/authorized_keys was `-rw------- ftp ftp` and sshd
+# accepted the connection and then refused to use the key. chown is not optional here.
+chown 0:0 /root/.ssh "$KEYS" 2> /dev/null
+chmod 700 /root/.ssh
+chmod 600 "$KEYS"
+# 05onboard-data links the ed25519 host key on the data partition in, so the fingerprint a client learned
+# does not change per boot; with no data partition -A makes one here, and the other key types are then
+# off unless a client insists (they would be minted fresh each boot).
+[ -f /etc/ssh/ssh_host_ed25519_key ] || ssh-keygen -A >/dev/null 2>&1
+touch /etc/ssh/sshd_not_to_be_run
+/usr/sbin/sshd && echo "20onboard-ssh: sshd up, $(wc -l < "$KEYS") key(s) authorised"

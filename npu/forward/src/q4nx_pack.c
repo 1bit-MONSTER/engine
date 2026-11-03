@@ -107,6 +107,44 @@ static void set_elf_name(Q4nxDesignGeom* g, const char* role) {
              g->K, g->N);
 }
 
+/* The container's K grid (npu/q4nx.h `kCols`: the q4_1/Q8 chunk is 32 x 256) and the kernel's
+ * column pass (32 x 4 x cols, cols=4 -> 512).  See q4nx_pack.h for why both exist. */
+#define Q4NX_K_GRID 256
+#define Q4NX_N_GRID 512
+
+int q4nx_pad_k(int k) {
+    return k <= 0 ? k : ((k + Q4NX_K_GRID - 1) / Q4NX_K_GRID) * Q4NX_K_GRID;
+}
+
+int q4nx_pad_n(int n) {
+    return n <= 0 ? n : ((n + Q4NX_N_GRID - 1) / Q4NX_N_GRID) * Q4NX_N_GRID;
+}
+
+void q4nx_pad_a_f32(const float* A, int M, int real_k, int K, float* out) {
+    if (!A || !out || M <= 0 || K <= 0) return;
+    const int w = (real_k <= 0 || real_k > K) ? K : real_k;
+    for (int m = 0; m < M; m++) {
+        float* d = out + (size_t)m * (size_t)K;
+        memcpy(d, A + (size_t)m * (size_t)w, sizeof(float) * (size_t)w);
+        if (w < K) memset(d + w, 0, sizeof(float) * (size_t)(K - w));
+    }
+}
+
+/* One standard design: the model's real K and N in, the kernel's grids out, the real widths kept
+ * beside them.  Role-specific row counts (q_rows/k_rows/v_rows, gate_rows/up_rows) are the
+ * caller's, because only it knows what fills N.  MLA keeps its own derivation: its KVA pad is the
+ * kernel's 128-column n-tile, not this grid. */
+static void geom(Q4nxDesignGeom* g, int M, int K, int N, Q4nxDesign role, const char* tag) {
+    memset(g, 0, sizeof(*g));
+    g->M = M;
+    g->real_k = K;
+    g->K = q4nx_pad_k(K);
+    g->real_n = (q4nx_pad_n(N) != N) ? N : 0;
+    g->N = q4nx_pad_n(N);
+    g->role = role;
+    set_elf_name(g, tag);
+}
+
 int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,
                                Q4nxDesignGeom* out) {
     int usable = 0;
@@ -115,12 +153,16 @@ int q4nx_derive_decode_designs(const Q4nxDesignGeom* designs, int count,
         memset(&out[i], 0, sizeof(out[i]));
         if (!designs) continue;
         const Q4nxDesignGeom* g = &designs[i];
-        /* The m16 kernel is m=16 k=64 n=128 over 8 columns and 1 core row.  M=16
-         * is one row-group, so any source M is fine; the N grid must divide by
-         * 128 and fill whole 8-column groups (the groups are an in-ELF loop, so
-         * the whole N is still one launch).  A geometry that fails the test has
-         * no legal m16 build (e.g. the 24B's N=11776 dense MLP: 92 tiles, 92%8). */
-        if (g->K % 64 != 0 || g->N % 128 != 0 || (g->N / 128) % 8 != 0) continue;
+        /* The m16 kernel is m=16 k=64 n=128 over whole column groups, and the groups are an
+         * in-ELF loop, so one launch still covers the whole N.  What a geometry needs is the
+         * column pass on the grid the family is built on, q4nx_pad_n() (512 columns: 32 rows x 4
+         * x cols(4)).  This used to demand N % 1024 == 0 ("whole 8-column groups"), which the
+         * family that was actually built contradicts: the oga-qwen25-0.5b set's QKV (N 1536),
+         * GU (9728) and lm_head (152064) are all 512-grid ELFs that ran bit-exact over their full
+         * width on the array (npu-kernels ogaload/oga-qwen25-0.5b-bench-20261101), and 1024 would
+         * have refused three of the five.  A geometry whose twin is simply absent still falls
+         * back to its M=128 kernel: the caller probes the filesystem. */
+        if (g->K % 64 != 0 || g->N % Q4NX_N_GRID != 0) continue;
         const size_t len = strlen(g->elf_name);
         if (len < 5 || len + 6 >= Q4NX_ELF_NAME_MAX) continue;   /* +"_m16" */
         if (strcmp(g->elf_name + len - 4, ".elf") != 0) continue;
@@ -144,64 +186,35 @@ int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
     int i = 0;
 
     /* QKV: K = H, N = q | k | v   (q doubles under attn_output_gate) */
-    memset(&out[i], 0, sizeof(out[i]));
-    out[i].M = d->M;
-    out[i].K = d->H;
-    out[i].N = q_rows * (d->attn_output_gate ? 2 : 1) + 2 * kv_rows;
-    out[i].role = Q4NX_DESIGN_QKV;
+    geom(&out[i], d->M, d->H, q_rows * (d->attn_output_gate ? 2 : 1) + 2 * kv_rows,
+         Q4NX_DESIGN_QKV, "QKV");
     out[i].q_rows = q_rows * (d->attn_output_gate ? 2 : 1);
     out[i].k_rows = kv_rows;
     out[i].v_rows = kv_rows;
-    set_elf_name(&out[i], "QKV");
 
     /* O: K = NH*HD, N = H */
     i++;
-    memset(&out[i], 0, sizeof(out[i]));
-    out[i].M = d->M;
-    out[i].K = q_rows;
-    out[i].N = d->H;
-    out[i].role = Q4NX_DESIGN_O;
-    set_elf_name(&out[i], "O");
+    geom(&out[i], d->M, q_rows, d->H, Q4NX_DESIGN_O, "O");
 
     /* gate/up: fused into GU, or split into G and U */
     if (d->fused_gu) {
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = 2 * d->IM;
-        out[i].role = Q4NX_DESIGN_GU;
+        geom(&out[i], d->M, d->H, 2 * d->IM, Q4NX_DESIGN_GU, "GU");
         out[i].gate_rows = d->IM;
         out[i].up_rows = d->IM;
-        set_elf_name(&out[i], "GU");
     } else {
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = d->IM;
-        out[i].role = Q4NX_DESIGN_G;
+        geom(&out[i], d->M, d->H, d->IM, Q4NX_DESIGN_G, "G");
         out[i].gate_rows = d->IM;
-        set_elf_name(&out[i], "G");
 
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = d->IM;
-        out[i].role = Q4NX_DESIGN_U;
+        geom(&out[i], d->M, d->H, d->IM, Q4NX_DESIGN_U, "U");
         out[i].up_rows = d->IM;
-        set_elf_name(&out[i], "U");
     }
 
     /* D: K = IM, N = H */
     i++;
-    memset(&out[i], 0, sizeof(out[i]));
-    out[i].M = d->M;
-    out[i].K = d->IM;
-    out[i].N = d->H;
-    out[i].role = Q4NX_DESIGN_D;
-    set_elf_name(&out[i], "D");
+    geom(&out[i], d->M, d->IM, d->H, Q4NX_DESIGN_D, "D");
 
     /* Gemma4 varies the attention width by layer type: its full_attention
      * layers use global_head_dim where its sliding layers use head_dim, so a
@@ -212,42 +225,22 @@ int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
         const int kv_rows2 = nkv2 * d->HD2;
 
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = q_rows2 + 2 * kv_rows2;
-        out[i].role = Q4NX_DESIGN_QKV2;
+        geom(&out[i], d->M, d->H, q_rows2 + 2 * kv_rows2, Q4NX_DESIGN_QKV2, "QKV");
         out[i].q_rows = q_rows2;
         out[i].k_rows = kv_rows2;
         out[i].v_rows = kv_rows2;
-        set_elf_name(&out[i], "QKV");
 
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = q_rows2;
-        out[i].N = d->H;
-        out[i].role = Q4NX_DESIGN_O2;
-        set_elf_name(&out[i], "O");
+        geom(&out[i], d->M, q_rows2, d->H, Q4NX_DESIGN_O2, "O");
     }
 
     /* Gemma4 per-layer embeddings: a gate H->ple and a projection ple->H. */
     if (d->ple_dim > 0) {
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = d->ple_dim;
-        out[i].role = Q4NX_DESIGN_PLEGATE;
-        set_elf_name(&out[i], "PLEGATE");
+        geom(&out[i], d->M, d->H, d->ple_dim, Q4NX_DESIGN_PLEGATE, "PLEGATE");
 
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->ple_dim;
-        out[i].N = d->H;
-        out[i].role = Q4NX_DESIGN_PLEPROJ;
-        set_elf_name(&out[i], "PLEPROJ");
+        geom(&out[i], d->M, d->ple_dim, d->H, Q4NX_DESIGN_PLEPROJ, "PLEPROJ");
     }
 
     /* Gemma4 use_double_wide_mlp: the KV-shared layers carry an MLP that is twice
@@ -256,44 +249,24 @@ int q4nx_derive_designs(const Q4nxModelDims* d, Q4nxDesignGeom* out) {
      * packed rows of layer 0's, while its config sets use_double_wide_mlp=true. */
     if (d->double_wide_mlp) {
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = 4 * d->IM;
-        out[i].role = Q4NX_DESIGN_GU2;
-        out[i].gate_rows = 2 * d->IM;
-        out[i].up_rows = 2 * d->IM;
         /* The ELF name is geometry-derived (N = 4*IM already distinguishes it
          * from the narrow GU), matching the artifacts emitted for Gemma4-E2B. */
-        set_elf_name(&out[i], "GU");
+        geom(&out[i], d->M, d->H, 4 * d->IM, Q4NX_DESIGN_GU2, "GU");
+        out[i].gate_rows = 2 * d->IM;
+        out[i].up_rows = 2 * d->IM;
 
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = 2 * d->IM;
-        out[i].N = d->H;
-        out[i].role = Q4NX_DESIGN_D2;
-        set_elf_name(&out[i], "D");
+        geom(&out[i], d->M, 2 * d->IM, d->H, Q4NX_DESIGN_D2, "D");
     }
 
     /* GDN linear attention (qwen3_5): a fused q|k|v projection and the gated
      * norm's z projection.  Same kernel format, new N. */
     if (d->lin_kd > 0) {
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = 2 * d->lin_kd + d->lin_vd;
-        out[i].role = Q4NX_DESIGN_QKVLIN;
-        set_elf_name(&out[i], "QKV");
+        geom(&out[i], d->M, d->H, 2 * d->lin_kd + d->lin_vd, Q4NX_DESIGN_QKVLIN, "QKV");
 
         i++;
-        memset(&out[i], 0, sizeof(out[i]));
-        out[i].M = d->M;
-        out[i].K = d->H;
-        out[i].N = d->lin_vd;
-        out[i].role = Q4NX_DESIGN_Z;
-        set_elf_name(&out[i], "Z");
+        geom(&out[i], d->M, d->H, d->lin_vd, Q4NX_DESIGN_Z, "Z");
     }
 
     return i + 1;
@@ -332,9 +305,24 @@ static void scatter_transposed(const float* src, int K, int rows, int n0, int N,
     }
 }
 
+/* Zero the B columns [from, N) of every row: the kernel's n-tile pad.  The pad columns are never
+ * read as weights, but they are multiplied, so they must be zero rather than whatever the previous
+ * design left in the shared scratch buffer. */
+static void zero_cols(float* B, int K, int N, int from) {
+    if (from >= N) return;
+    const size_t n = (size_t)(N - from) * sizeof(float);
+    for (int i = 0; i < K; i++) memset(B + (size_t)i * (size_t)N + from, 0, n);
+}
+
 int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B) {
     if (!g || !p || !B || g->K <= 0 || g->N <= 0) return -1;
     const int K = g->K, N = g->N;
+    /* real_n is the projection's real output width; the kernel's N may be wider (engine#845: a
+     * 1024-column O kernel on an 896-row projection).  Each arm scatters real rows only and
+     * reports how many columns it filled; the tail is zeroed once, below. */
+    const int rn = g->real_n > 0 ? g->real_n : N;
+    if (rn > N) return -1;
+    int filled = -1;
 
     // attn_output_gate: q_rows counts q AND the output gate, but they are ONE
     // stored projection ([q(all heads) | gate(all heads)]); p->q already holds
@@ -347,20 +335,30 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
             scatter_transposed(p->q, K, g->q_rows, n0, N, B); n0 += g->q_rows;
             scatter_transposed(p->k, K, g->k_rows, n0, N, B); n0 += g->k_rows;
             scatter_transposed(p->v, K, g->v_rows, n0, N, B); n0 += g->v_rows;
-            return n0 == N ? 0 : -1;
+            filled = n0;
+            break;
         }
         case Q4NX_DESIGN_O:
         case Q4NX_DESIGN_O2: {
             if (!p->o) return -1;
-            scatter_transposed(p->o, K, N, 0, N, B);
-            return 0;
+            scatter_transposed(p->o, K, rn, 0, N, B);
+            filled = rn;
+            break;
+        }
+        case Q4NX_DESIGN_G:
+        case Q4NX_DESIGN_DG: {
+            if (!p->gate) return -1;
+            scatter_transposed(p->gate, K, rn, 0, N, B);
+            filled = rn;
+            break;
         }
         case Q4NX_DESIGN_GU: {
             if (!p->gate || !p->up) return -1;
             int n0 = 0;
             scatter_transposed(p->gate, K, g->gate_rows, n0, N, B); n0 += g->gate_rows;
             scatter_transposed(p->up, K, g->up_rows, n0, N, B); n0 += g->up_rows;
-            return n0 == N ? 0 : -1;
+            filled = n0;
+            break;
         }
         /* MLA projections.  QA/QB are plain single-matrix scatters; KVA is
          * stored at kv_lora+rope_dim (576) but the kernel's n-tile forces N=640,
@@ -370,51 +368,44 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
          * the leading dense layer. */
         case Q4NX_DESIGN_QA: {
             if (!p->q) return -1;
-            scatter_transposed(p->q, K, N, 0, N, B);
-            return 0;
+            scatter_transposed(p->q, K, rn, 0, N, B);
+            filled = rn;
+            break;
         }
         case Q4NX_DESIGN_QB: {
             if (!p->k) return -1;
-            scatter_transposed(p->k, K, N, 0, N, B);
-            return 0;
+            scatter_transposed(p->k, K, rn, 0, N, B);
+            filled = rn;
+            break;
         }
         case Q4NX_DESIGN_KVA: {
             if (!p->v) return -1;
-            const int rn = g->real_n > 0 ? g->real_n : N;
-            if (rn > N) return -1;
-            if (rn < N) memset(B, 0, (size_t)K * (size_t)N * sizeof(float));
             scatter_transposed(p->v, K, rn, 0, N, B);
-            return 0;
-        }
-        case Q4NX_DESIGN_G:
-        case Q4NX_DESIGN_DG: {
-            if (!p->gate) return -1;
-            scatter_transposed(p->gate, K, N, 0, N, B);
-            return 0;
+            filled = rn;
+            break;
         }
         case Q4NX_DESIGN_U:
         case Q4NX_DESIGN_DU: {
             if (!p->up) return -1;
-            scatter_transposed(p->up, K, N, 0, N, B);
-            return 0;
+            scatter_transposed(p->up, K, rn, 0, N, B);
+            filled = rn;
+            break;
         }
         case Q4NX_DESIGN_D:
-        case Q4NX_DESIGN_DD: {
+        case Q4NX_DESIGN_DD:
+        case Q4NX_DESIGN_D2: {
             if (!p->down) return -1;
-            scatter_transposed(p->down, K, N, 0, N, B);
-            return 0;
+            scatter_transposed(p->down, K, rn, 0, N, B);
+            filled = rn;
+            break;
         }
         case Q4NX_DESIGN_GU2: {
             if (!p->gate || !p->up) return -1;
             int n0 = 0;
             scatter_transposed(p->gate, K, g->gate_rows, n0, N, B); n0 += g->gate_rows;
             scatter_transposed(p->up, K, g->up_rows, n0, N, B); n0 += g->up_rows;
-            return n0 == N ? 0 : -1;
-        }
-        case Q4NX_DESIGN_D2: {
-            if (!p->down) return -1;
-            scatter_transposed(p->down, K, N, 0, N, B);
-            return 0;
+            filled = n0;
+            break;
         }
         case Q4NX_DESIGN_PLEGATE:
         case Q4NX_DESIGN_PLEPROJ:
@@ -424,12 +415,16 @@ int q4nx_assemble_B(const Q4nxDesignGeom* g, const Q4nxProjections* p, float* B)
              * Q4nxProjections::ple.  QKVLIN is the GDN fused q|k|v (N=2*KD+VD),
              * Z is the gated norm's in_proj_z (N=VD). */
             if (!p->ple) return -1;
-            scatter_transposed(p->ple, K, N, 0, N, B);
-            return 0;
+            scatter_transposed(p->ple, K, rn, 0, N, B);
+            filled = rn;
+            break;
         }
         default:
             return -1;
     }
+    if (filled < 0 || filled > N) return -1;
+    zero_cols(B, K, N, filled);
+    return 0;
 }
 
 float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
@@ -457,4 +452,68 @@ float q4nx_pack_B_int8(const float* B, int K, int N, int8_t* out, int ld,
         ssum += (double)ts;
     }
     return (float)(ssum / (double)N);
+}
+
+/* ── The launch contract: the argument widths a full ELF declares ───────────────────────────────
+ *
+ * An aiecc full ELF carries one STT_OBJECT symbol per kernel argument in .dynsym, named "0", "1",
+ * "2", whose st_size is the byte width the kernel's shim DMA touches — the driver patches those very
+ * symbols, so this is the artifact's own contract and not a copy of one.  A launcher that passes a
+ * narrower buffer does not fail loudly: the DMA runs past the mapping, the IOMMU logs IO_PAGE_FAULTs
+ * and the kernel multiplies whatever follows (measured 2026-11-02 on the 896-hidden OGA pack, whose
+ * ELF family is (weights, activations, output) = (655,360, 2,048, 4,096) B while the int8 launcher
+ * passed (16,384, 1,048,576, 65,536) B: 639 KB of weight stream read past a 16 KB BO).  Reading the
+ * widths here lets a load refuse instead of dispatching.
+ *
+ * Returns the number of argument widths found (0..3), or -1 when the file is not a 32-bit
+ * little-endian ELF or has no .dynsym.  out[] entries that were not declared stay 0. */
+int q4nx_elf_arg_sizes(const void* elf, size_t n, uint64_t out[3]) {
+    if (out) { out[0] = out[1] = out[2] = 0; }
+    if (!elf || !out || n < 52) return -1;
+    const uint8_t* b = (const uint8_t*)elf;
+    if (memcmp(b, "\x7f" "ELF", 4) || b[4] != 1 || b[5] != 1) return -1;   /* ELF32, LSB */
+#define RD16(p) ((uint32_t)(p)[0] | ((uint32_t)(p)[1] << 8))
+#define RD32(p) ((uint64_t)(p)[0] | ((uint64_t)(p)[1] << 8) | ((uint64_t)(p)[2] << 16) | \
+                 ((uint64_t)(p)[3] << 24))
+    const uint64_t shoff = RD32(b + 0x20);
+    const uint32_t shentsize = RD16(b + 0x2E), shnum = RD16(b + 0x30);
+    if (shentsize < 40 || !shnum || shnum > 512) return -1;      /* real artifacts have ~13 */
+    if (shoff + (uint64_t)shentsize * shnum > n) return -1;
+    struct sh { uint64_t off, size, link, entsize, type; };
+    struct sh sect[512];
+    for (uint32_t i = 0; i < shnum; i++) {
+        const uint8_t* p = b + shoff + (uint64_t)i * shentsize;
+        sect[i].type = RD32(p + 4);
+        sect[i].off = RD32(p + 16);
+        sect[i].size = RD32(p + 20);
+        sect[i].link = RD32(p + 24);
+        sect[i].entsize = RD32(p + 36);
+        if (sect[i].type != 8 /* SHT_NOBITS */ && sect[i].off + sect[i].size > n) return -1;
+    }
+    int found = 0;
+    for (uint32_t i = 0; i < shnum; i++) {
+        if (sect[i].type != 11 /* SHT_DYNSYM */ || sect[i].link >= shnum) continue;
+        const struct sh* st = &sect[sect[i].link];              /* the symbols' string table */
+        const uint32_t esz = sect[i].entsize ? (uint32_t)sect[i].entsize : 16;
+        if (esz < 16) continue;
+        for (uint64_t s = 1; s * esz + 16 <= sect[i].size; s++) {
+            const uint8_t* sym = b + sect[i].off + s * esz;
+            const uint64_t name = RD32(sym);
+            const uint64_t size = RD32(sym + 8);
+            const uint8_t info = sym[12];
+            if ((info & 0xF) != 1 /* STT_OBJECT */ || !size) continue;
+            if (name >= st->size) continue;
+            const uint8_t* nm = b + st->off + name;
+            const uint64_t room = st->size - name;
+            if (room < 1) continue;
+            /* the argument symbols are named by their index: "0", "1", "2" */
+            if (room >= 2 && nm[1] != 0) continue;
+            if (nm[0] < '0' || nm[0] > '2') continue;
+            const int idx = nm[0] - '0';
+            if (!out[idx]) { out[idx] = size; found++; }
+        }
+    }
+#undef RD16
+#undef RD32
+    return found ? found : -1;
 }

@@ -35,6 +35,7 @@
 #include "q4nx_weight_layout.h"   // bpos(): the container's device weight layout
 #include "q4nx_pb16i.h"          // the pb16i image: integer-exact ternary decode weights
 #include "q4nx_t2s.h"            // the t2s stream: the same weights at 2.125 bits/weight
+#include "q4nx_pack.h"           // q4nx_elf_arg_sizes(): args_fit_elf() checks the ELF's own widths
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
@@ -187,7 +188,52 @@ struct I8Ctx {
         group_scales.resize(NL);   // packB() writes group_scales[l]
         for (int l = 0; l < NL; l++)
             layerB[l] = mkbo(w_bytes());
+        if (!args_fit_elf(ep)) return false;
         initialized = true;
+        return true;
+    }
+
+    // ── The launch contract, checked against the artifact ──
+    // A full ELF declares each argument's byte width in .dynsym (the driver patches those very
+    // symbols), and the kernel's shim DMA touches exactly that much.  Passing a narrower buffer does
+    // not fail: the DMA walks past the mapping, the IOMMU logs IO_PAGE_FAULTs and the run returns
+    // garbage (measured 2026-11-02 on the 896-hidden OGA pack, whose ELF family is
+    // (weights, activations, output) = (655,360, 2,048, 4,096) B while the int8 launcher passed
+    // (16,384, 1,048,576, 65,536) B).  The check is one-directional on purpose: a declared width may
+    // be *smaller* than the buffer (the tile-family ELFs address a tile of a larger BO through the
+    // control text), but it may never be larger.
+    bool args_fit_elf(const char* ep) {
+        std::vector<uint8_t> raw;
+        {
+            std::FILE* f = std::fopen(ep, "rb");
+            if (!f) return true;                       // cannot read it: nothing to check against
+            std::fseek(f, 0, SEEK_END);
+            const long len = std::ftell(f);
+            std::rewind(f);
+            if (len <= 0) { std::fclose(f); return true; }
+            raw.resize((size_t)len);
+            const size_t got = std::fread(raw.data(), 1, raw.size(), f);
+            std::fclose(f);
+            if (got != raw.size()) return true;
+        }
+        uint64_t declared[3] = {0, 0, 0};
+        if (q4nx_elf_arg_sizes(raw.data(), raw.size(), declared) < 0) return true;   // not our shape
+        const uint64_t passed[3] = {(uint64_t)MD * (uint64_t)KD,
+                                    (uint64_t)w_bytes(),
+                                    (uint64_t)MD * (uint64_t)ND * 4u * (pb16i ? 2u : 1u)};
+        // I8Ctx carries no error string; the caller's err_ names the ELF, so print the numbers here.
+        static const char* const kWhat[3] = {"activations", "weights", "output"};
+        for (int i = 0; i < 3; i++) {
+            if (!declared[i] || declared[i] <= passed[i]) continue;
+            std::fprintf(stderr,
+                         "  I8Ctx::init_elf: %s declares argument %d (%s) = %llu B, this launch would "
+                         "pass %llu B -- the kernel's DMA would run past the buffer (M=%d K=%d N=%d). "
+                         "The artifact's argument width is its contract and this ELF family is not the "
+                         "one this launcher drives; refusing before any dispatch.\n",
+                         ep, i, kWhat[i], (unsigned long long)declared[i],
+                         (unsigned long long)passed[i], MD, KD, ND);
+            return false;
+        }
         return true;
     }
 

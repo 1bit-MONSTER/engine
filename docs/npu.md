@@ -72,8 +72,31 @@ which is what makes this additive.
 Four plans are checked in under `configs/plans/`, one per model directory on the build box (Qwen3-0.6B,
 bonsai2-27b-NPU, bonsai2-27b-NPU-b8, bonsai2-27b-pb16i); `tools/npu_plan.py <dir> --check` proves the
 directory's copy still matches. `scripts/npu-window11.sh` is the gate the change passed: three fixed greedy
-prompts and the prof table, compared between a run with the plan and a run without it (`--compare A B`) —
-3/3 transcripts byte-identical and every prof row within 10%.
+prompts and the prof table, compared between a run with the plan and a run without it — 3/3 transcripts
+byte-identical and every prof row within the tolerance. The tolerance is not a constant of the script: on this
+box the same binary against itself moves by more than a couple of percent (engine #834 measured up to 7.7 %), so
+`--compare` **refuses to run without either `--tol PCT` or `--control C1.log C2.log`** — the same-binary pair
+whose own spread becomes the tolerance, rounded up. Every row prints both statistics and the header names the one
+the tolerance applies to: `ratio-of-medians` (median of each side) or `median-of-ratios` (paired per round, the
+honest one for a no-regression claim, and the one applied when both logs carry rounds). Alternate the order inside
+a round (A B, then B A) in whatever drives the A/B pair: the script detects a control whose rows all move the same
+way and says so, because that is the second serve's warm-up, not noise. `scripts/npu-window11.sh --self-test` is
+the committed check of that policy.
+
+**`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
+`noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
+full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
+bidirectionally: `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
+so row *r* sees rows after it. The GDN layers keep their causal recurrence (the pack's own runtime keeps it
+too), a sliding layer stays causal, and the mode reads the same numbers only in one shape:
+
+- **the whole prompt, one batched pass, at position 0** (`POST /v1/systemone` does exactly that). A batch
+  that starts above 0 is refused by name — its earlier positions were already encoded causally.
+- **it cannot generate.** `step()` (one position at a time, keys only in the past) refuses with the mode's
+  name, so a d3 pack served on the chat route is an error rather than a silently causal answer.
+
+An unknown mode string is a plan refusal, never a default: the two modes give different numbers, and a
+guessed mask is a different model.
 
 ### Q4NX chunks
 
@@ -136,11 +159,23 @@ tensors and for any projection whose width is not a multiple of 32.
 container's `W'` already has the block Hadamard and the per-width signs baked into the weights; the
 consumer rotates the *activation* into that basis — `A' = H (A . s)`, signs first, then the normalized
 Sylvester-Walsh butterfly, then the `1/sqrt(block)` — and never touches the weight
-(`npu/forward/src/q4nx_forward.cpp::hadamard_rotate`). So a t2 tensor holds `W'` exactly as the pb16i
+(`npu/forward/include/hadamard.h`, called from `q4nx_forward.cpp`). So a t2 tensor holds `W'` exactly as the pb16i
 image does, the fold declaration stays where it belongs (the container's `q4nx_hadamard`,
 `q4nx_hadamard_block` and the `HAD1` sign table), and the chunk needs no pre/post-rotation flag: reading
 a t2 tensor in the wrong basis is a consumer bug, not a format one. The inverse direction (the tied
 embedding, `inverse_weight_names` in the pack) is `S (H y)`, which round-trips to the identity.
+
+**This rotation is host work on the critical path, so it is SIMD, and it must stay bit-identical.** It runs
+once per projection — ~430 times a decode token on Bonsai-2 — and the scalar butterfly cost 14.2 us per
+5120-float vector in-loop: 15.8 ms/token in a quiet window and 39.0 ms/token on a loaded one, i.e. pure
+CPU contention that a device-side win cannot touch. `hadamard.h` keeps the scalar loop as the reference and
+adds an AVX2 path (dispatched at run time) that performs the *same* adds and subtracts on the same operands
+in the same stage order — stages 1, 2 and 4 as an 8-lane in-register butterfly, every later stage as
+contiguous 8-lane add/sub — so the rotated vector is bit-identical and no container's text moves: 7.6 ->
+2.4 us per 5120-float vector, 40.0 -> 16.8 us per 17408-float one. `tests/hadamard_rotate_test.cpp` is the
+gate that runs on every build, on any host: bit-for-bit equality against the scalar loop for every block a
+container can carry and for the fleet's real activation widths, plus a check that the scalar loop really is
+the Hadamard transform (compared against a direct sum over the sign pattern).
 
 **The scale is fp16, not bf16, and that is load bearing.** Every source format already stores this
 scale as fp16 — PTQ1_0's, TQ1_0's and TQ2_0's `d` are `ggml_half`, and `pb16i`'s `ms * 2^e_ref` is an
@@ -228,8 +263,14 @@ single-code probes to name.
 
 #### The t2s stream in the engine (launch path)
 
-A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (with
-`"q4nx_weight_layout_version": 5`; pb16i is 4, and each layout refuses the other's version). The
+A container streams t2s when its `config.json` says `"q4nx_weight_layout": "t2s"` (pb16i is 4, and each layout
+refuses the other's version). **The version picks the artifact family**, because the two t2s wire orders hold the same
+weights at the same size in a different byte order and reading one with the other's kernel is a silent permutation of the
+matrix, not a crash: **5 = v1** -> `_t2s` / `_t2s_m16` (the expansion interleaves inside the core), **6 = v2** ->
+`_t2s2` / `_t2s2_m16` (the ordering is in the wire, so the core's two contiguous stores are exact — no lane shuffle), and
+any other version is refused by name at init. v2 is the one to ship: measured on the array for GU (K=5120 N=17408, M=16)
+against the pb16i phase in the same window, **0.589 ms vs 1.037 ms (1.76x), 40.2 GB/s** of stream against 48.4, with
+seeds 1/2/3 byte-exact and the `amdxdna` counter 0 (`~/wt/npu-arena/LEADERBOARD.md`, `submissions/GU16T2S`). The
 images are the pb16i sidecars' own set — `blk_<layer>_<tag>_weight.t2s` plus the **unchanged**
 `.ref` (`e_ref int16[N]` + mode byte, because the compaction changes neither the magnitudes nor
 e_ref) — in the directory named by `q4nx_t2s_dir` / `Q4NX_T2S_DIR`, and the kernels carry the
@@ -245,6 +286,17 @@ that is not `tiles x 2,176` bytes is refused by name (never read as a pb16i imag
 checks keep the contract honest without a device: `tests/npu_t2s_layout_test.cpp` pins the tile
 against the numbers the tool measured on a real image (gate/up: 50,135,040 B of pb16i → 23,674,880 B
 of stream), and `tests/q4nx_t2s_test.py` pins the code order byte for byte.
+
+**A t2s container wants a sealed set for the same reason a pb16i one does.** The layout is not what makes
+a phase change expensive: the **hw_context** is. Measured on this box in-loop on 2026-11-02, a t2s decode
+family shipped as eight per-role `_t2s2_m16` ELFs paid **+2.0-2.3 ms on every launch, in every role** — more
+than the kernels' own device time — against the ~2.7 ms between two hw_contexts recorded at
+`npu/forward/include/q4nx_forward.h`. That tax turned a kernel that is 1.76x faster in the arena into a
+model that was 1.8x *slower* than pb16i. The fix is the same artifact shape pb16i uses: one full ELF
+carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's own key
+`q4nx_t2s_sealed_elf` (pb16i keeps `q4nx_pb16i_sealed_elf`; a layout never borrows the other's key, because
+a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
+`plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
 ### From a GGUF
 
@@ -609,6 +661,7 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
 
@@ -616,7 +669,9 @@ got before.
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
 chunk carries, so the deltas add up to the non-streamed reply. Token text that is half a character is reported with the invalid bytes replaced, never as a failed
 request. Entries exist for **`content` tokens only**: a reasoning delta and tool-call markup get no
-logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. The `/v1/completions` route's legacy logprobs object
+logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. On a Qwen3 model that
+means a thinking reply reports none at all, which is why `chat_template_kwargs.enable_thinking: false` is
+what a logprob comparison wants. The `/v1/completions` route's legacy logprobs object
 is not implemented and asking for it there is a 400, not a silently dropped field.
 
 `json_schema` is compiled to a grammar before the first token, by `app/npu_json_schema.h`, so the answer

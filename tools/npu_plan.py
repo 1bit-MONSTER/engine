@@ -38,8 +38,24 @@ import json
 import os
 import sys
 
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 FORMAT = "1bit-npu-plan/1"
+
+# The two grids a projection's K and N live on, mirroring npu/forward/include/q4nx_pack.h
+# (q4nx_pad_k / q4nx_pad_n).  They are the container's chunk width (npu/q4nx.h kCols = 256) and the
+# full ELF's column pass (32 rows x 4 x cols(4) = 512).  A model already on both grids -- every one
+# validated before this existed -- is unchanged; a pack with hidden 896 is stored as K=1024 and its
+# kernels are built and named on the same grid (engine#845).
+K_GRID = 256
+N_GRID = 512
+
+
+def pad_k(k: int) -> int:
+    return (k + K_GRID - 1) // K_GRID * K_GRID
+
+
+def pad_n(n: int) -> int:
+    return (n + N_GRID - 1) // N_GRID * N_GRID
 
 
 def read_config(model_dir: str) -> dict:
@@ -96,9 +112,9 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
             vd = cfg.get("linear_num_value_heads", 0) * cfg.get("linear_value_head_dim", 0)
             if not (kh and vd):
                 raise SystemExit(f"layer {i} is GDN but config.json lacks the linear_* head dimensions")
-            entry["qkv"] = {"K": hidden, "N": 2 * kh + vd, "fused": True}
-            entry["attn_gate"] = {"K": hidden, "N": vd}
-            entry["ssm_out"] = {"K": vd, "N": hidden}
+            entry["qkv"] = {"K": pad_k(hidden), "N": pad_n(2 * kh + vd), "fused": True}
+            entry["attn_gate"] = {"K": pad_k(hidden), "N": pad_n(vd)}
+            entry["ssm_out"] = {"K": pad_k(vd), "N": pad_n(hidden)}
         else:
             nh = cfg.get("num_attention_heads", 0)
             nkv = cfg.get("num_key_value_heads", nh)
@@ -110,11 +126,33 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
             # (npu/forward/src/q4nx_pack.c:150).  Without this the plan asks for a 3072-wide
             # QKV kernel on a container whose rows are 5120.
             q = nh * hd * (2 if cfg.get("attn_output_gate") else 1)
-            entry["qkv"] = {"K": hidden, "N": q + 2 * nkv * hd, "fused": True}
-        entry["gate_up"] = {"K": hidden, "N": 2 * im} if fused_gu else {"K": hidden, "N": im}
-        entry["down"] = {"K": im, "N": hidden}
+            entry["qkv"] = {"K": pad_k(hidden), "N": pad_n(q + 2 * nkv * hd), "fused": True}
+        entry["gate_up"] = {"K": pad_k(hidden), "N": pad_n(2 * im if fused_gu else im)}
+        entry["down"] = {"K": pad_k(im), "N": pad_n(hidden)}
         out.append(entry)
     return out
+
+
+def attention_mode(model_dir: str) -> str:
+    """The mask the pack itself declares, from `decision_config.json` beside the model.
+
+    A d3 readout pack is trained noncausal on its full-attention layers and says so; every other model
+    on this box has no `decision_config.json` and is causal, which is also the field's default in
+    `npu/plan/plan.h`.  An unknown value is refused here rather than defaulted, because the two modes
+    produce different numbers and a guessed mask is a silently different model.
+    """
+    path = os.path.join(model_dir, "decision_config.json")
+    if not os.path.isfile(path):
+        return "causal"
+    try:
+        with open(path, "rb") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{path}: cannot read the attention mode ({exc})")
+    mode = cfg.get("attention_mode", "causal")
+    if mode not in ("causal", "noncausal_full_attention"):
+        raise SystemExit(f"{path}: attention_mode {mode!r} is not causal or noncausal_full_attention")
+    return mode
 
 
 def artifact(model_dir: str, kernels: str, name: str) -> bool:
@@ -150,15 +188,27 @@ def generate(model_dir: str, kernels: str) -> dict:
     layout = cfg.get("q4nx_weight_layout", "rm")
     if layout not in ("rm", "b8", "pb16i", "t2s"):
         raise SystemExit(f"{model_dir}/config.json: q4nx_weight_layout {layout!r} is not rm, b8, pb16i or t2s")
-    tag = {"pb16i": "_pb16i", "t2s": "_t2s", "b8": "_b8"}.get(layout, "")
+    # a t2s container names its wire format by version: 5 = v1 (`_t2s`), 6 = v2 (`_t2s2`)
+    t2s_v2 = layout == "t2s" and cfg.get("q4nx_weight_layout_version", 5) == 6
+    tag = {"pb16i": "_pb16i", "b8": "_b8"}.get(layout, "_t2s2" if t2s_v2 else ("_t2s" if layout == "t2s" else ""))
 
     im = cfg.get("intermediate_size")
     fused_gu = True
     if isinstance(im, int) and im > 0:
         # The probe the plan replaces, run once and written down: the fused kernel wins, and when
         # neither exists the split layout is assumed (the forward then refuses by name).
-        gu = f"full_i8_GU_K{hidden}_N{2 * im}{tag}.elf"
-        g = f"full_i8_G_K{hidden}_N{im}{tag}.elf"
+        #
+        # The gate/up probe uses the *prefill* family's names, which is not the decode suffix: a b8 container
+        # blocks the tap at every M (so `_b8`), while a pb16i or t2s container's M=128 prefill stays the plain
+        # int8 family and only its decode kernels carry the stream's suffix.  Probing with the decode tag on a
+        # t2s container found neither artifact and wrote "fused", which the box's own pb16i container
+        # contradicts (split) -- 2026-11-02.
+        #
+        # K and N are the padded grids (engine#845), the same ones the forward derives: a pack whose hidden is
+        # not a multiple of 256 has no artifact named after its un-padded shape.
+        prefill_tag = "_b8" if layout == "b8" else ""
+        gu = f"full_i8_GU_K{pad_k(hidden)}_N{pad_n(2 * im)}{prefill_tag}.elf"
+        g = f"full_i8_G_K{pad_k(hidden)}_N{pad_n(im)}{prefill_tag}.elf"
         fused_gu = artifact(model_dir, kernels, gu) or not artifact(model_dir, kernels, g)
     else:
         raise SystemExit(f"{model_dir}/config.json: intermediate_size is {im!r}")
@@ -183,9 +233,15 @@ def generate(model_dir: str, kernels: str) -> dict:
             "M": 16,
             "enabled": True,
             "dirs": decode_dirs(model_dir, kernels),
-            "sealed_elf": cfg.get("q4nx_pb16i_sealed_elf", "") if layout == "pb16i" else "",
+            # One full ELF per container: pb16i's key for pb16i, t2s's own key for t2s (a
+            # layout never borrows the other's image format).  A t2s decode family shipped as
+            # per-role ELFs pays a hw_context switch on every launch -- measured 2026-11-02 at
+            # +2.0-2.3 ms, more than the kernels themselves.
+            "sealed_elf": cfg.get("q4nx_t2s_sealed_elf" if layout == "t2s" else "q4nx_pb16i_sealed_elf", "")
+            if layout in ("pb16i", "t2s") else "",
         },
         "kernels": {"tag": tag},
+        "attention": {"mode": attention_mode(model_dir)},
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},
         "layers": layers,
     }
@@ -199,10 +255,10 @@ def moe_batched(cfg: dict, hidden: int, model_dir: str, kernels: str) -> dict:
     if not (isinstance(experts, int) and experts > 0 and isinstance(top_k, int) and top_k > 1):
         return {"enabled": False, "K": 0, "N": 0}
     for n in (8192, 16384):  # the widths the kernel set carries
-        if artifact(model_dir, kernels, f"full_i8_G_K{hidden}_N{n}.elf") and artifact(
-            model_dir, kernels, f"full_i8_U_K{hidden}_N{n}.elf"
+        if artifact(model_dir, kernels, f"full_i8_G_K{pad_k(hidden)}_N{n}.elf") and artifact(
+            model_dir, kernels, f"full_i8_U_K{pad_k(hidden)}_N{n}.elf"
         ):
-            return {"enabled": True, "K": hidden, "N": n}
+            return {"enabled": True, "K": pad_k(hidden), "N": n}
     return {"enabled": False, "K": 0, "N": 0}
 
 
@@ -255,7 +311,8 @@ def main(argv=None) -> int:
         f.write(text)
     os.replace(tmp, out)
     print(f"wrote {out} ({len(plan['layers'])} layers, gate/up {plan['fusion']['gate_up']}, "
-          f"layout {plan['container']['layout']}, tag {plan['kernels']['tag'] or 'none'})")
+          f"layout {plan['container']['layout']}, tag {plan['kernels']['tag'] or 'none'}, "
+          f"attention {plan['attention']['mode']})")
     return 0
 
 

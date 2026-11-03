@@ -71,8 +71,12 @@ git clone --depth 1 --branch <tag> https://git.kernel.org/pub/scm/linux/kernel/g
 cd ~/wt/k74/<tag>
 cp <box>:/boot/config-$(uname -r of the box) .config      # or the config of record, see below
 scripts/config --file .config --set-str LOCALVERSION "-1bit-perfopt"
-# only while the tag lacks the series:
-git am --3way iommu-amd-perfopt.patch
+# only while the tag lacks the series: our patch files are plain `diff --git` (a prose paragraph, then
+# the diff), so `git am` refuses them with "Patch format detection failed" - strip to the first diff
+# header and apply, then commit so the tree is clean (a dirty tree makes setlocalversion append its own
+# '+', and the release string becomes -1bit-perfopt++):
+sed -n '/^diff --git /,$p' iommu-amd-perfopt.patch | git apply -
+git commit -qam "iommu/amd: the IOMMU PerfOpt backports"
 make LLVM=1 olddefconfig
 export LLVM=1                    # dpkg-buildpackage re-enters make: export it, do not just pass it
 nice -n 19 make LLVM=1 -j12 bindeb-pkg
@@ -85,6 +89,8 @@ nice -n 19 make LLVM=1 -j12 bindeb-pkg
   debug info (28 lines, nothing workload-specific).
 - `bindeb-pkg` needs `debhelper`, `libelf-dev` and the LLVM tools (`llvm-21`, `lld-21`); the kernel
   is clang-built, so a gcc-only host silently builds the wrong compiler unless `LLVM=1` is exported.
+  On a host with the versioned tools only, put `/usr/lib/llvm-21/bin` on `PATH` (that is where the
+  unversioned `llvm-objcopy` the modules step calls lives).
 - Artefacts land in the **parent** directory: `linux-image-<version>_<arch>.deb` and
   `linux-headers-<version>_<arch>.deb`.
 - `make install` on the box also works (that is how the current kernel was installed before the

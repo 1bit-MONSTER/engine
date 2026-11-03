@@ -41,6 +41,7 @@
 //                          {"root": "kernels", "path": "m16"},
 //                          {"root": "kernels", "path": "."}]},
 //     "kernels": {"tag": ""},                                  // "" | "_b8" | "_pb16i" | "_t2s"
+//     "attention": {"mode": "causal"|"noncausal_full_attention"},   // optional, default causal
 //     "moe":     {"batched_expert_gu": {"enabled": false, "K": 0, "N": 0}},
 //     "layers":  [{"index": 0, "role": "attn"|"gdn"|"moe"|"mla",
 //                  "qkv": {"K": 1024, "N": 1536, "fused": true},
@@ -117,10 +118,16 @@ struct Plan {
     bool pb16i = false;
     // kernel decisions that used to be filename probes
     bool fused_gu = true;          // "fused" vs "split" gate/up
-    std::string tag;               // "" | "_b8" | "_pb16i" | "_t2s": the artifact-name suffix
+    std::string tag;               // "" | "_b8" | "_pb16i" | "_t2s" | "_t2s2": the artifact-name suffix
     int prefill_m = 0;             // 0 = not stated (the engine keeps its own default)
     int decode_m = 0;
     bool decode_enabled = true;
+    // The attention mask the container's own pack declares (`decision_config.json`'s attention_mode).
+    // "causal" is the default and the only mode that can generate; "noncausal_full_attention" is a
+    // prompt-encoding mode (every full-attention layer sees the whole prompt, which is what a d3
+    // readout pack is trained with), so the forward refuses to generate with it by name.
+    std::string attention_mode = "causal";
+    bool noncausal() const { return attention_mode == "noncausal_full_attention"; }
     // Where the decode family is looked for, in order: which given path it hangs off, and the
     // relative directory under it ("." = that directory itself).
     struct DecodeDir { bool under_model = false; std::string path; };
@@ -174,12 +181,23 @@ struct Plan {
                                 "\" is not fused or split");
         }
         if (j.contains("prefill")) p.prefill_m = positive_or_zero(obj(j, "prefill", path), "M", path);
+        // Optional and defaulted on purpose: a plan written before this field existed must load and
+        // mean exactly what it meant then (causal), so this is not a format bump.
+        if (j.contains("attention")) {
+            const auto& a = obj(j, "attention", path);
+            if (!a.contains("mode") || !a.at("mode").is_string())
+                throw PlanError("plan: " + path + " attention has no \"mode\" string");
+            p.attention_mode = a.at("mode").get<std::string>();
+            if (p.attention_mode != "causal" && p.attention_mode != "noncausal_full_attention")
+                throw PlanError("plan: " + path + " attention.mode \"" + p.attention_mode +
+                                "\" is not causal or noncausal_full_attention");
+        }
         if (j.contains("kernels")) {
             const auto& k = obj(j, "kernels", path);
             p.tag = k.value("tag", "");
-            if (p.tag != "" && p.tag != "_b8" && p.tag != "_pb16i" && p.tag != "_t2s")
+            if (p.tag != "" && p.tag != "_b8" && p.tag != "_pb16i" && p.tag != "_t2s" && p.tag != "_t2s2")
                 throw PlanError("plan: " + path + " kernels.tag \"" + p.tag +
-                                "\" is not \"\", \"_b8\", \"_pb16i\" or \"_t2s\"");
+                                "\" is not \"\", \"_b8\", \"_pb16i\", \"_t2s\" or \"_t2s2\"");
         }
         if (j.contains("decode")) {
             const auto& d = obj(j, "decode", path);
@@ -257,11 +275,11 @@ struct Plan {
             throw PlanError("plan: " + path + " names decode.sealed_elf but container.pb16i is false");
         if (p.tag == "_b8" && p.layout != "b8")
             throw PlanError("plan: " + path + " kernels.tag is _b8 but container.layout is " + p.layout);
-        if (p.tag == "_t2s" && p.layout != "t2s")
-            throw PlanError("plan: " + path + " kernels.tag is _t2s but container.layout is " + p.layout);
+        if ((p.tag == "_t2s" || p.tag == "_t2s2") && p.layout != "t2s")
+            throw PlanError("plan: " + path + " kernels.tag is " + p.tag + " but container.layout is " + p.layout);
         // _pb16i and _t2s are both the integer-exact ternary family (container.pb16i), and a plan
         // that claims one without the other would pick artifacts the images cannot feed.
-        const bool ternary_tag = p.tag == "_pb16i" || p.tag == "_t2s";
+        const bool ternary_tag = p.tag == "_pb16i" || p.tag == "_t2s" || p.tag == "_t2s2";
         if (ternary_tag != p.pb16i)
             throw PlanError("plan: " + path + " kernels.tag \"" + p.tag + "\" and container.pb16i " +
                             (p.pb16i ? "true" : "false") + " disagree");

@@ -25,9 +25,15 @@ Answers two different questions, because they fail for different reasons:
                 the bits equal.
 
 Both are measured on OpenAI /v1/chat/completions with logprobs=true. Greedy throughout
-(temperature 0, top_k 1), cache_prompt false so no route is measured through a different
-prompt-cache path, and thinking disabled. Deliberately not a training-vs-rollout harness: it
-takes already-served endpoints, so it measures the routes as users get them.
+(temperature 0, top_k 1) and cache_prompt false so no route is measured through a different
+prompt-cache path. Thinking is disabled by default; --thinking on is what a route that cannot be
+told to stop thinking has to be measured with (the NPU forward path accepted and ignored
+enable_thinking until engine PR #864), and then all routes must run with it on or the streams
+differ from token 0 for template reasons.
+Deliberately not a training-vs-rollout harness: it takes already-served endpoints, so it measures
+the routes as users get them.
+
+  logprob_agree.py --route cpu=... --route npu=... --thinking off --match-by text
 
   logprob_agree.py --route cpu=http://127.0.0.1:18110 --route hrx=http://127.0.0.1:18111
   logprob_agree.py --route cpu=http://127.0.0.1:18110 --repeat 5 --json out.json
@@ -94,7 +100,7 @@ def usable(x):
     return x is not None and isinstance(x, (int, float)) and not (math.isnan(x) or math.isinf(x))
 
 
-def ask(url, model, prompt, max_tokens, top_logprobs, timeout):
+def ask(url, model, prompt, max_tokens, top_logprobs, timeout, thinking=False):
     """One greedy request; returns the generated token ids with their log-probs."""
     body = {
         "model": model,
@@ -106,7 +112,7 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout):
         "cache_prompt": False,
         "logprobs": True,
         "top_logprobs": top_logprobs,
-        "chat_template_kwargs": {"enable_thinking": False},
+        "chat_template_kwargs": {"enable_thinking": thinking},
     }
     t = time.time()
     try:
@@ -130,22 +136,25 @@ def ask(url, model, prompt, max_tokens, top_logprobs, timeout):
     }
 
 
-def tok_key(tok):
-    """A generated token's identity: its id when the route reports one, else its text.
+def tok_key(tok, by="id"):
+    """A generated token's identity: its id when asked for, else its text.
 
-    The NPU forward path reports token text and log-probability but no id, so comparing ids alone
-    would make every position "match" on None == None.  Falling back to the text keeps the
-    comparison honest across routes that report different subsets of the same fields.
+    Within one route ids are the exact identity.  Across routes one side may report no id at all
+    (the NPU forward path reports text + log-probability only), so ids alone would make every
+    position "match" on None == None; --match-by text compares the detokenised text on both
+    sides instead, which is the only field the routes share.
     """
     i = tok.get("id")
-    return i if i is not None else tok.get("token")
+    if by == "text" or i is None:
+        return tok.get("token")
+    return i
 
 
-def first_divergence(a, b):
+def first_divergence(a, b, by="id"):
     """Index of the first token position whose log-prob bits differ, else the length mismatch."""
     n = min(len(a), len(b))
     for i in range(n):
-        if tok_key(a[i]) != tok_key(b[i]):
+        if tok_key(a[i], by) != tok_key(b[i], by):
             return i
         if not usable(a[i]["lp"]) or not usable(b[i]["lp"]):
             continue
@@ -154,7 +163,7 @@ def first_divergence(a, b):
     return None if len(a) == len(b) else n
 
 
-def determinism(runs):
+def determinism(runs, by="id"):
     """Compare every repeat against the first.  Returns the summary dict.
 
     A route that returns no log-probabilities at all (the NPU in-process path does this) cannot
@@ -178,11 +187,11 @@ def determinism(runs):
         for x in r["tokens"]:
             if usable(x["lp"]) and f32(x["lp"]) != x["lp"]:
                 non_f32 += 1
-    divs = [first_divergence(base["tokens"], r["tokens"]) for r in runs[1:]]
+    divs = [first_divergence(base["tokens"], r["tokens"], by) for r in runs[1:]]
     maxd = 0.0
     for r in runs[1:]:
         for a, b in zip(base["tokens"], r["tokens"]):
-            if tok_key(a) == tok_key(b) and usable(a["lp"]) and usable(b["lp"]):
+            if tok_key(a, by) == tok_key(b, by) and usable(a["lp"]) and usable(b["lp"]):
                 d = abs(f32(a["lp"]) - f32(b["lp"]))
                 deltas.append(d)
                 maxd = max(maxd, d)
@@ -199,7 +208,7 @@ def determinism(runs):
     }
 
 
-def agreement(a, b):
+def agreement(a, b, by="id"):
     """Cross-route summary over one prompt's generated tokens.
 
     Token-id and top-1 rates are over every aligned position, because a position whose token ids
@@ -221,9 +230,9 @@ def agreement(a, b):
         tb_top = (tb[i]["top"] or [{}])[0]
         if ta_top and tb_top:
             top1_n += 1
-            if tok_key(ta_top) == tok_key(tb_top):
+            if tok_key(ta_top, by) == tok_key(tb_top, by):
                 top1_match += 1
-        if tok_key(ta[i]) != tok_key(tb[i]):
+        if tok_key(ta[i], by) != tok_key(tb[i], by):
             if first_tok is None:
                 first_tok = i
             continue
@@ -291,6 +300,11 @@ def selftest():
     # length mismatch is a divergence at the shorter length
     e = {"tokens": [t(5, -0.5)], "text": "x", "have_logprobs": True}
     assert first_divergence(a["tokens"], e["tokens"]) == 1
+    # --match-by text: ids may differ while the detokenised text agrees (the NPU reports no ids)
+    id_only = {"tokens": [dict(noid_a["tokens"][0], id=7)], "text": "x", "have_logprobs": True}
+    assert first_divergence(noid_a["tokens"], id_only["tokens"], "text") is None
+    assert first_divergence(noid_a["tokens"], id_only["tokens"], "id") == 0
+    assert agreement(noid_a, id_only, "text")["exact_bit_match_rate"] == 1.0
     print("logprob_agree selftest: ok")
 
 
@@ -302,6 +316,12 @@ def main(argv=None):
     p.add_argument("--repeat", type=int, default=5, help="identical requests per prompt (default 5)")
     p.add_argument("--max-tokens", type=int, default=64, help="tokens per prompt (default 64)")
     p.add_argument("--top-logprobs", type=int, default=5, help="alternatives per token (default 5)")
+    p.add_argument("--thinking", choices=["on", "off"], default="off",
+                   help="enable_thinking sent to every route (default off); a route that ignores it "
+                        "has to be measured with on, and then every route must run with it on")
+    p.add_argument("--match-by", choices=["id", "text"], default="id",
+                   help="compare tokens by id (default) or by text, which is the only field the "
+                        "NPU forward path shares with the llama-server routes")
     p.add_argument("--timeout", type=float, default=300.0)
     p.add_argument("--json", default=None, help="write the full report here")
     p.add_argument("--selftest", action="store_true", help="check the comparison logic and exit")
@@ -340,15 +360,17 @@ def main(argv=None):
           f"{a.max_tokens} tokens, {a.repeat} repeats, greedy")
 
     report = {"model": model, "max_tokens": a.max_tokens, "repeat": a.repeat,
-              "top_logprobs": a.top_logprobs, "time": time.strftime("%FT%T%z"),
+              "top_logprobs": a.top_logprobs, "thinking": a.thinking, "match_by": a.match_by,
+              "time": time.strftime("%FT%T%z"),
               "routes": {}, "determinism": {}, "agreement": {}, "errors": []}
+    thinking = a.thinking == "on"
 
     for label, url in routes:
         per_prompt = []
         for pi, prompt in enumerate(PROMPTS):
             runs = []
             for _ in range(a.repeat):
-                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout)
+                r = ask(url, model, prompt, a.max_tokens, a.top_logprobs, a.timeout, thinking)
                 if "error" in r:
                     report["errors"].append(f"{label} prompt {pi}: {r['error']}")
                     break
@@ -366,7 +388,7 @@ def main(argv=None):
             print(f"{label:<6} NO DATA")
             failed = True
             continue
-        agg = [determinism(pp["runs"]) for pp in per_prompt]
+        agg = [determinism(pp["runs"], a.match_by) for pp in per_prompt]
         have_lp = agg[0]["logprobs_available"]
         d = {
             "logprobs_available": have_lp,
@@ -404,7 +426,7 @@ def main(argv=None):
                 print(f"{la} vs {lb:<6} NO DATA")
                 failed = True
                 continue
-            gs = [agreement(x["runs"][0], y["runs"][0]) for x, y in zip(pa, pb)]
+            gs = [agreement(x["runs"][0], y["runs"][0], a.match_by) for x, y in zip(pa, pb)]
             tot_common = sum(g["common_token_positions"] for g in gs)
             tot_pos = sum(g["positions"] for g in gs)
             g = {

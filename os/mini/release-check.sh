@@ -198,6 +198,15 @@ if [ "${1:-}" = --self-test ]; then
 fi
 
 
+# Where this image keeps the Lemonade package. os/mini installs it at /opt/lemonade; the Puppy appliance
+# (os/v3/puppy) embeds the same release package at /opt/1bit-package. Found, not configured, so one tool
+# answers for both artifacts instead of drifting into two copies.
+LEMDIR=
+for _d in /opt/lemonade /opt/1bit-package; do
+    if [ -d "$_d/bin" ]; then LEMDIR=$_d; break; fi
+done
+LEMDIR=${LEMDIR:-/opt/lemonade}
+
 PORT=$(sed -n 's/.*"port"[^0-9]*\([0-9]\+\).*/\1/p' /data/lemonade/config/config.json 2>/dev/null | head -1)
 PORT=${PORT:-13305}
 # The key the running lemond actually holds, read from the environment of the process that listens on
@@ -220,7 +229,7 @@ lemond_key() {
 KEY=$(lemond_key)
 [ -n "$KEY" ] || KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | tail -n 1)
 API="http://127.0.0.1:$PORT"
-CATALOG=/opt/lemonade/bin/resources/server_models.json
+CATALOG=$LEMDIR/bin/resources/server_models.json
 PLAIN_TOTAL=$(find /data/npu/kernels -name 'layer1.elf' 2>/dev/null | wc -l)
 
 say "1bit OS release check   $(date -u +%FT%TZ)"
@@ -340,6 +349,16 @@ have_model() {
     printf '%s' "${MODELS:-}" | grep -qF "\"user.$1\"" && return 0
     return 1
 }
+# Case-insensitive sibling, for comparing a FILE name against an id. The appliance registers a .gguf under
+# the shipped catalogue id, which is lower-cased (05onboard-data: name[:-5].lower() + "-1bit"), while the file
+# on the partition keeps the model's own spelling - so on the 2026-11-02 board boot
+# /data/models/Qwen3-0.6B-Q4_K_M.gguf WAS registered and served as qwen3-0.6b-q4_k_m-1bit, and this row
+# failed it with a case-sensitive grep. The row still asks the same question (does Lemonade list this file);
+# it just no longer answers it by spelling.
+have_model_ci() {
+    printf '%s' "${MODELS:-}" | grep -qiF "$1" && return 0
+    return 1
+}
 GGUF=$(ls /data/models/*.gguf 2>/dev/null | head -1)
 GGUF_NAME=$(basename "${GGUF:-none}" .gguf)
 
@@ -348,7 +367,7 @@ MAN=/etc/1bit/onebit-models.txt
 if [ -z "${MODELS:-}" ]; then
     fail models "Lemonade did not answer, so the model list cannot be checked"
 elif [ ! -f "$MAN" ] && ! ( [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1 ) && ! ls /dev/accel/accel* >/dev/null 2>&1; then
-    CAT=/opt/lemonade/bin/resources/server_models.json
+    CAT=$LEMDIR/bin/resources/server_models.json
     WANT_HRX=$(grep -oE '"recipe"[[:space:]]*:[[:space:]]*"onebit"' "$CAT" 2>/dev/null | wc -l)
     WANT_NPU=$(grep -oE '"onebit_backend"[[:space:]]*:[[:space:]]*"npu"' "$CAT" 2>/dev/null | wc -l)
     skip models "no GPU or NPU here, so Lemonade hides the onebit entries ($WANT_HRX HRX + $WANT_NPU NPU in the catalog; $MAN records the shipped subset when the build writes it)"
@@ -383,7 +402,7 @@ else
     # catalogue the image ships: the stick simply carries one model, so Lemonade offered only that one.
     # The question this row can actually answer on any machine is whether the manifest and the shipped
     # catalogue agree; how many are downloaded is context, and chat-hrx is the row that proves serving.
-    CAT=/opt/lemonade/bin/resources/server_models.json
+    CAT=$LEMDIR/bin/resources/server_models.json
     HRX_REG=0; NPU_REG=0; NOTCAT=
     while read -r kind id; do
         [ -n "${id:-}" ] || continue
@@ -415,7 +434,16 @@ if [ "$GGUF_NAME" = none ]; then
     skip gguf "no /data/models/*.gguf on the data partition"
 elif [ -z "${MODELS:-}" ]; then
     skip gguf "'$GGUF_NAME.gguf' is on the data partition, but Lemonade listed no models, so it cannot be checked (see the lemonade row)"
-elif have_model "$GGUF_NAME"; then
+elif [ ! -e /dev/kfd ] && ! ls /dev/accel/accel* > /dev/null 2>&1; then
+    # The file is on the partition and the registry names it, but Lemonade hides every onebit entry on a
+    # machine with no AMD GPU and no NPU - so "not listed" here says nothing about the image. Measured in
+    # QEMU (cycle 12): /api/v1/models carried no onebit id at all on a VM, while the same image on the
+    # board lists the model. Same hardware test the gpu/npu/models rows use.
+    skip gguf "'$GGUF_NAME.gguf' is on the data partition; this machine has no GPU or NPU, so Lemonade hides the onebit entries that would list it"
+elif have_model_ci "$GGUF_NAME"; then
+    # the local registry names a GGUF <name>-1bit (os/mini/init.sh and /etc/init.d/05onboard-data both do,
+    # the appliance under the catalogue's lower-cased id), and llama.cpp lists the bare name; either answer
+    # means Lemonade knows this file
     pass gguf "the stick's own model '$GGUF_NAME' is listed"
 else
     fail gguf "/data/models/$GGUF_NAME.gguf is on the data partition but Lemonade does not list it"
@@ -436,6 +464,16 @@ chat() {   # chat <model id> [slow] -> sets ANSWER and TPS
     esac
 }
 pick() { printf '%s' "${MODELS:-}" | tr '{' '\n' | sed -n "s/.*\"id\":\"\($1\)\".*/\1/p" | head -1; }
+# The ids Lemonade has already downloaded, one per line. The model object carries "downloaded": true|false,
+# and the entries that are false would have to be pulled from the Hub before they can answer - so a chat row
+# that picked one would either download 400 MB during a gate or fail offline on a machine with no network.
+# /v1/models defaults to show_all=false, i.e. exactly this list; /api/v1/models carries the same records.
+# Falls back to pick() when nothing matches (an older Lemonade without the flag reads as "none downloaded").
+listed() {   # <ere over the id>
+    printf '%s' "${MODELS:-}" | tr '{' '\n' |
+        grep -E '"downloaded"[[:space:]]*:[[:space:]]*true' |
+        sed -n "s/.*\"id\"[[:space:]]*:[[:space:]]*\"\($1\)\".*/\1/p"
+}
 
 VMODEL=$(pick '[^"]*')
 if [ -n "$VMODEL" ]; then
@@ -469,27 +507,60 @@ if [ -e /dev/kfd ] && ls /dev/dri/renderD* >/dev/null 2>&1; then
             HRXLIB=$(cat /etc/1bit/libhsa 2>/dev/null)
             [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
         fi
-        # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
-        # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
-        # on stderr and that text is the diagnostic.
-        LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
-        # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
-        # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
-        # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
-        HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
-        if [ -n "$HRXDEV" ]; then
-            pass hrx-device "$HRXDEV"
-        elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
-            fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+        # Cycle 14, measured on the cycle-13 board: this row printed "no HRX0 listed ... (Available devices: (none))",
+        # which reads as a GPU fault. The GPU was fine. The appliance names the runtime in /etc/1bit/libhsa.env as
+        # ONEBIT_HRX_LIBHSA - a build-time CMake name that no code reads from the environment - and ships that runtime
+        # ALONE, with five NEEDED libraries missing, so the dlopen fails whoever names it. So: take the path from either
+        # file and either key, then ask the loader whether the file can be loaded BEFORE asking llama-server for devices,
+        # and give the two failures different words.
+        if [ -z "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ] && [ -r /etc/1bit/libhsa.env ]; then
+            HRXLIB=$(sed -n 's/^IREE_HAL_AMDGPU_LIBHSA_PATH=//p;s/^ONEBIT_HRX_LIBHSA=//p' /etc/1bit/libhsa.env 2>/dev/null | head -1)
+            [ -n "$HRXLIB" ] && export IREE_HAL_AMDGPU_LIBHSA_PATH="$HRXLIB"
+        fi
+        HRXUNLOADABLE=
+        if [ -n "${IREE_HAL_AMDGPU_LIBHSA_PATH:-}" ]; then
+            # ldd where it exists (it lists EVERY missing library); the loader itself where it does not - and the loader
+            # refuses a library with missing dependencies without printing any "=> not found" line at all:
+            #   <path>: error while loading shared libraries: librocm_sysdeps_elf.so.1: cannot open shared object file
+            # so both shapes are read here. (Measured on the cycle-13 runtime: the loader form is the only one it gives.)
+            if command -v ldd > /dev/null 2>&1; then HRXLOAD=$(ldd "$IREE_HAL_AMDGPU_LIBHSA_PATH" 2>&1)
+            else HRXLOAD=$(/lib64/ld-linux-x86-64.so.2 --list "$IREE_HAL_AMDGPU_LIBHSA_PATH" 2>&1); fi
+            HRXMISS=$(printf '%s\n' "$HRXLOAD" | sed -n 's/^[[:space:]]*\([^[:space:]]*\)[[:space:]]*=>[[:space:]]*not found.*/\1/p; s/.*error while loading shared libraries: \([^:]*\):.*/\1/p' | sort -u | tr '\n' ' ')
+            if [ -n "$HRXMISS" ]; then
+                fail hrx-device "the HRX runtime $IREE_HAL_AMDGPU_LIBHSA_PATH cannot be dlopened: it needs ${HRXMISS}- the image must ship them flat beside it (os/mini/mkimage.sh does), so this is a wiring defect, not a GPU one"
+                HRXUNLOADABLE=1
+            fi
+        fi
+        if [ -n "$HRXUNLOADABLE" ]; then
+            :   # already reported above, with the cause; do not ask llama-server and blame the device
         else
-            fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+            # --list-devices prints the devices ggml can see; an HRX backend that registered appears as
+            # "HRX0: <name>". Capture both streams: a runtime that refuses prints its INCOMPATIBLE line
+            # on stderr and that text is the diagnostic.
+            LD=$(timeout 120 "$LSRV" --list-devices 2>&1)
+            # A device that registered but says INCOMPATIBLE still prints "HRX0: INCOMPATIBLE (...)", so it
+            # must be rejected BEFORE the match is accepted - otherwise this row passes on the exact failure
+            # it exists to catch (candidate 5 printed HRX0: INCOMPATIBLE and had no usable device).
+            HRXDEV=$(printf '%s\n' "$LD" | sed -n 's/^[[:space:]]*\(HRX[0-9][0-9]*\): *\(.*\)$/\1: \2/p' | grep -vi 'INCOMPATIBLE' | head -1)
+            if [ -n "$HRXDEV" ]; then
+                pass hrx-device "$HRXDEV"
+            elif printf '%s' "$LD" | grep -qi "INCOMPATIBLE\|only systems with SVM"; then
+                fail hrx-device "no HRX0 listed: $(printf '%s\n' "$LD" | grep -i 'INCOMPATIBLE\|only systems with SVM' | head -1)"
+            else
+                fail hrx-device "no HRX0 listed by $LSRV (${LD:+$(printf '%s' "$LD" | tr '\n' ' ' | cut -c1-120)})"
+            fi
         fi
     fi
 else
     skip hrx-device "no /dev/kfd or no /dev/dri/renderD*: this machine has no AMD GPU, so no HRX device can register"
 fi
 
-HRX=$(pick '[^"]*-1bit')
+# A downloaded entry first, and never an NPU one for the HRX row: the ids say which backend they are for
+# ("-NPU-1bit"), and a machine can have both downloaded at once. Without this, the first "-1bit" id in the
+# catalogue order was picked and the HRX row could be answered by the NPU model - a green row that proves
+# nothing about the GPU path the row exists for.
+HRX=$(listed '[^"]*-1bit' | grep -vi 'npu' | head -1)
+[ -n "$HRX" ] || HRX=$(pick '[^"]*-1bit')
 if [ -e /dev/kfd ] && [ -n "$HRX" ]; then
     # slow: the first HRX call compiles Loom kernels (see got_slow)
     chat "$HRX" slow
@@ -500,7 +571,8 @@ elif [ ! -e /dev/kfd ]; then
 else
     skip chat-hrx "no onebit HRX entry is listed by Lemonade, so there is nothing to ask"
 fi
-NPU=$(pick '[^"]*-NPU-1bit')
+NPU=$(listed '[^"]*-1bit' | grep -i 'npu' | head -1)
+[ -n "$NPU" ] || NPU=$(pick '[^"]*-NPU-1bit')
 if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     chat "$NPU"
     if [ -n "$TPS" ]; then pass chat-npu "$NPU (onebit, NPU) answered \"$ANSWER\" at ${TPS} tok/s"
@@ -512,7 +584,7 @@ else
 fi
 
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────
-BENCH=/opt/lemonade/bin/lemonade
+BENCH=$LEMDIR/bin/lemonade
 if [ ! -x "$BENCH" ]; then
     skip bench "no $BENCH in the image"
 elif [ -z "$VMODEL" ]; then
@@ -594,7 +666,7 @@ fi
 
 # ── licences and image identity ────────────────────────────────────────────────────────────────
 LIC=; NOT=; LOOKED=
-for d in /usr/share/licenses/1bit-os /opt/lemonade/bin/resources/../../.. /opt/lemonade /opt/lemonade/bin /; do
+for d in /usr/share/licenses/1bit-os "$LEMDIR/bin/resources/../../.." "$LEMDIR" "$LEMDIR/1bit" "$LEMDIR/bin" /; do
     LOOKED="$LOOKED $d"
     [ -f "$d/LICENSE-BINARY" ] && LIC=$d/LICENSE-BINARY
     [ -f "$d/NOTICE-BINARY" ] && NOT=$d/NOTICE-BINARY

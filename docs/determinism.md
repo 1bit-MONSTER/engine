@@ -36,9 +36,10 @@ produces every number below.
    across a CPU ggml matmul and an HRX kernel, so log-probabilities from different devices differ
    in the third significant figure at the median and by up to ~0.4 nats at the tail. Greedy
    continuations diverge on a substantial fraction of prompts.
-4. **The NPU route can be held to repetition but not to agreement with the others** — it is bitwise
-   repeatable, but it reports no token ids, cannot disable thinking, returns its tokens only in
-   logprobs, and serves *requantised* weights rather than the same ones. All four, below.
+4. **All three routes are bitwise repeatable run-to-run**, and the NPU can be *compared* to the other
+   two — but only with thinking on and tokens matched by text, and its distance from both carries a
+   weight requantisation on top of the arithmetic. Its numbers are therefore not the arithmetic-only
+   distance that `cpu` vs `hrx` is. Method and measurements below.
 
 Promises 3 and 4 are measurements, not bug reports: the routes genuinely compute different
 floating-point sums over different quantised weights. That is the same class of problem that
@@ -48,8 +49,11 @@ meaningful bitwise gate can only be asserted **within** one route, at a fixed ba
 ## Measured
 
 Qwen3-0.6B Q4_K_M, 8 prompts, 64 tokens each, greedy (`temperature 0`, `top_k 1`), fixed seed,
-`logprobs=true`, `top_logprobs=5`, `cache_prompt=false`, thinking off, 5 repeats per prompt.
-Binary `lemonade-onebit-rc-2026-10-31c` (c18).
+`logprobs=true`, `top_logprobs=5`, `cache_prompt=false`, 5 repeats per prompt, thinking off except
+where a table says otherwise. Binary `lemonade-onebit-rc-2026-10-31c` (c18) for the thinking-off
+measurements, and `main@692cfa2` + #864 for the thinking-off three-route row (it reproduces the c18
+`cpu`/`hrx` numbers digit for digit, as that section says); the thinking-on ones ran on a build of
+`main` at `1b3def2`, which still emits NPU log-probabilities for think tokens.
 
 ### Repetition, per route (requests served one at a time)
 
@@ -58,8 +62,11 @@ Binary `lemonade-onebit-rc-2026-10-31c` (c18).
 | `cpu` | bitwise-identical (5 repeats) | 0 | 128 | yes |
 | `hrx` | bitwise-identical (5 repeats) | 0 | 122 | yes |
 | `npu` (forward path) | bitwise-identical (3 repeats × 16 tokens) | 0 | 128 | yes |
+| `npu`, thinking on | bitwise-identical (2 repeats × 24 tokens) | 0 | 192 | yes |
+| `npu`, thinking on, 64 tokens | bitwise-identical (2 repeats × 64 tokens) | 0 | 512 | yes |
 
-All three routes are bitwise repeatable. That is the only property all three share.
+All three routes are bitwise repeatable, at both thinking settings. That is the only property all three
+share.
 
 ### Agreement, `cpu` vs `hrx`
 
@@ -110,30 +117,152 @@ batch width, not the build, is the variable.
 `hrx`, default `n_slots = 4`: copy0 vs alone `4/48` ids but **44/48** log-prob bits, i.e. the
 reported numbers move even where the tokens do not.
 
-### NPU: repeatable, but not comparable to the other two
+### What the `hrx` width gate is, by name
 
-On a build that carries the NPU log-probabilities, the NPU route is **bitwise repeatable**: 8 prompts ×
-16 tokens × 3 repeats, 128 tokens, `max |Δlogp| = 0`, text stable, 0 non-float32 values. Three repeats
-rather than five because the per-op forward path measured ~0.48 s/token here (18.8 s for a 32-token
-reply), so the 8 × 5 × 64 matrix the other routes ran is not practical on it.
+`GGML_HRX_LOG_DISPATCH=1` prints each dispatch registration the first time it matches
+(`dispatch_registry/dispatch-registry.cpp`), so the set of registrations a serve logs is the set of
+kernels its graphs actually ran. Keying that log on the root node's shape as well — a throwaway local
+patch, not proposed for merge — separates the widths, because a *solo* request also prefills at width
+>1. One `hrx` serve, Qwen3-0.6B, 48-token probe at `--parallel 4`, 26 registrations, and the decode
+step splits into two disjoint sets:
 
-It cannot join the *agreement* comparison, for four independent reasons — any one of them is enough:
+| decode width | registrations seen only at that width |
+|---|---|
+| 1 (solo, and any sequential history) | `hip.qkv_rope`, `kquant.mul_mat.decode_f32`, `hip.dense_kquant_swiglu`, `hip.gemv_add_norm`, `common.mul_mat.f32_f32_decode` |
+| 2 (concurrent) | `hip.kquant_tokens.mm`, `hip.kquant_tokens.mm_add`, `hip.kquant_tokens.swiglu`, `common.rmsnorm_binary_f32` |
 
-1. **It reports no token ids.** Each `logprobs.content` entry carries `token` (text) and `logprob` but
-   no `id`, and the same holds inside `top_logprobs`. `tools/logprob_agree.py` therefore falls back to
-   comparing token text when a route omits the id; comparing ids alone would "match" on `None == None`
-   at every position and report a perfect agreement between two unrelated routes.
-2. **Thinking cannot be turned off on that path.** `chat_template_kwargs.enable_thinking=false` is
-   honoured by the llama-server routes and ignored here: the stream opens `<think>`, `\n`, `Okay`, …,
-   so it diverges from the other two routes at token 0 for template reasons, not numerical ones.
-3. **The reply is not in `content`.** `message.content` comes back empty on that path; the tokens are
-   only in `logprobs`. A text-level comparison against `cpu`/`hrx` is therefore not meaningful either.
-4. **It does not serve the same weights.** A Q4NX weight is a q4_1 tile (bf16 scale and zero per 32
-   columns) and the pack is produced by requantising Q4_K, so NPU-vs-GGUF deltas contain a quantisation
-   change on top of any kernel arithmetic. Such a number is not comparable to `cpu` vs `hrx` and should
-   not be quoted as if it were.
+Seventeen more registrations match at both widths, including the attention kernel
+(`common.flash_attention_decode_split_next_q8`): on `hrx`, unlike on `cpu`, attention is *not* where
+the width dependence comes from. What changes is the **fusion boundaries**. The residual add and
+RMSNorm are one kernel at width 1 (`hip.gemv_add_norm`) and two dispatches at width 2
+(`hip.kquant_tokens.mm_add` + `common.rmsnorm_binary_f32`); gate/up/SwiGLU is
+`hip.dense_kquant_swiglu` versus `hip.kquant_tokens.swiglu`; the K-quant matmul is the per-token
+decode family versus the `decode_tokens` family. So the width-2 graph is not the width-1 graph
+widened, it is a differently fused graph.
 
-What the NPU route can be held to today is repetition — which it passes — and not agreement.
+**No single switch restores width invariance on `hrx`.** Six `GGML_HRX_DISABLE_DISPATCH=` arms were
+run, each verified to have taken effect by the changed registration set: disabling the width-2
+token-matmul family, the width-2 separate norm, the width-1 fused add+norm, and all four width-1
+fusions together each still left the width-2 numbers displaced from the solo ones — max |Δlogp|
+0.045-0.132 nats in every arm, against 0.092 for the unmodified server. Forcing both widths onto a
+single kernel set is not expressible at all: `hip.dense_kquant_swiglu` has no fallback, and with it
+disabled `GGML_HRX_STRICT=1` refuses the graph (`ffn_gate-27` `MUL_MAT f32 ne=[3072,1,1,1]` not placed
+on HRX, 2 of 986 nodes off HRX). Disabling the width-1 fused add+norm alone moves the *solo* numbers
+by 0.121 nats — as much as the width switch itself — so these fused kernels each reassociate a sum
+rather than being interchangeable extras. Contrast `cpu`, where one flag (`-DGGML_CPU_REPACK=OFF`)
+removes the width dependence entirely: on `hrx` the reproducible configuration is `--parallel 1`, and
+there is no equivalent env switch.
+
+### NPU: repeatable, and comparable with two adjustments
+
+The NPU route is **bitwise repeatable**: 8 prompts × 24 tokens × 2 repeats (192 tokens), `max |Δlogp| = 0`,
+0 non-float32 values, text stable — as well as the earlier 8 × 16 × 3 (128 tokens) run on the same build.
+It stays bitwise repeatable at the other routes' budget too: 8 prompts × **64** tokens × 2 repeats
+(512 tokens), `max |Δlogp| = 0`, 0 non-float32 values, text stable.
+
+The extra cost is time, not correctness. The per-op forward path measures ~0.5 s/token here, so the same
+8 × 64 × 2 matrix took **586 s of device time in one NPU claim** (against 34 s for `cpu` + `hrx` under one
+GPU claim). Five repeats — what the `cpu` and `hrx` columns use — would be ~25 min of the array, so the NPU
+column is 2 repeats at every budget.
+
+It **can** join the agreement comparison — the earlier version of this page said it could not — with two
+adjustments, both of which are flags on the tool rather than changes to the engine:
+
+1. **Thinking has to be the same on both sides of a pair.** It used to be a *requirement* that every
+   route run with thinking **on** (`--thinking on`), because the NPU forward path accepted
+   `chat_template_kwargs.enable_thinking=false` and dropped it
+   ([#832](https://github.com/1bit-MONSTER/engine/issues/832)), so its stream always opened `<think>` while
+   the llama-server routes honoured the kwarg and the pair diverged at position 0 for template reasons —
+   which looks exactly like a numerical disagreement. With [#864](https://github.com/1bit-MONSTER/engine/pull/864)
+   the NPU path honours it (`app/npu_chatml.h`), so `--thinking off` works on all three routes and that is
+   the configuration measured in [All three routes, thinking off](#all-three-routes-thinking-off) below.
+   The tables *in this section* are the thinking-on ones, taken on a pre-#748 build.
+2. **Match tokens by text, not by id** (`--match-by text`). The NPU reports `token` and `logprob` but no
+   `id`, in `logprobs.content` and in `top_logprobs` alike, so an id-keyed comparison between it and
+   `cpu`/`hrx` matches nothing at all.
+
+`message.content` being empty on that path does not matter: the comparison reads `logprobs.content`, which
+is populated. And the log-probabilities have to come from a build whose NPU path emits them (see
+[Routes and logprobs](#routes-and-logprobs)). One build detail matters here: `44d849d` onward emits
+entries for **content** tokens only, so a thinking reply's `logprobs.content` is empty there: measure
+with a build before `44d849d`, or with `--thinking off` on a build carrying #864 (the #832 fix).
+
+Qwen3-0.6B, 8 prompts, greedy, thinking **on**, 2 repeats (NPU) / 5 repeats (cpu, hrx).
+One control first: the `cpu` route was measured in **two separate server runs**, and the two agree
+**exactly, over both budgets** — 192/192 positions at 24 tokens and **512/512 at 64 tokens**, exact bits,
+`max |Δlogp| = 0` — so comparing routes across runs (necessary here: the GPU and NPU claims are held
+separately) does not manufacture or hide a difference.
+
+**At 64 tokens, the same budget the `cpu`/`hrx` table above uses:**
+
+| pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | prompts diverging |
+|---|---|---|---|---|---|---|
+| `cpu` vs `hrx` | 0.766 | 0.766 | 0.031 | 6.31e-01 | 4.62e-02 | 7 of 8 |
+| `cpu` vs `npu` | 0.264 | 0.264 | 0.000 | 6.71e-01 | 5.51e-02 | 8 of 8 |
+| `hrx` vs `npu` | 0.266 | 0.266 | 0.000 | 6.55e-01 | 5.19e-02 | 8 of 8 |
+
+(392 of the 512 positions carry the same token on `cpu`/`hrx`, 135 and 136 on the NPU pairs; deltas are
+over the common positions only.)
+
+**At 24 tokens**, for the shape of the same three pairs over a shorter stream:
+
+| pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | prompts diverging |
+|---|---|---|---|---|---|---|
+| `cpu` vs `hrx` | 0.958 | 0.958 | 0.060 | 6.25e-01 | 2.83e-02 | 1 of 8 |
+| `cpu` vs `npu` | 0.641 | 0.641 | 0.000 | 6.71e-01 | 4.66e-02 | 7 of 8 |
+| `hrx` vs `npu` | 0.641 | 0.641 | 0.000 | 6.55e-01 | 4.21e-02 | 7 of 8 |
+
+(123 of the 192 positions carry the same token text on the NPU pairs, 184 on `cpu`/`hrx`.)
+
+**The NPU is roughly equidistant from both — and that distance is not arithmetic-only.** It matches `cpu`
+and `hrx` at the same rate, with the same deltas (0.641 and 4.2-4.7e-02 mean at 24 tokens; 0.26 and
+5.2-5.5e-02 at 64), and it shares **no exact bits with either** (0.000, against 0.031-0.060 for
+`cpu`/`hrx`). Its *distance* from `cpu` relative to `hrx`'s narrows as the stream lengthens — **1.6× at 24
+tokens, 1.2× at 64** — because a longer stream diverges more, which raises the `cpu`/`hrx` delta as well as
+the NPU's; the ordering (NPU furthest, `cpu`/`hrx` closest) is stable at both budgets and the exact-bit
+split is not budget-dependent. A Q4NX weight
+is a q4_1 tile (bf16 scale and zero per 32 columns) requantised from Q4_K, so the NPU number contains a
+**weight change plus** kernel arithmetic and is *not* the same quantity as `cpu` vs `hrx`. Quote it as
+"NPU pack vs GGUF" or not at all.
+
+### All three routes, thinking off
+
+Thinking off is the configuration a log-probability comparison actually wants (a thinking stream opens with
+stereotyped tokens that make every pair look closer than it is), and it is only measurable on a build
+carrying [#864](https://github.com/1bit-MONSTER/engine/pull/864). This row was taken on
+**`main@692cfa2` + #864 (`ce1af72`)** — #864 was still open when it ran, so the commit is named here
+rather than a merge sha. Qwen3-0.6B Q4_K_M, 8 prompts × 64 tokens, greedy, `--thinking off`,
+`--match-by text`, NPU at `--prefix-slots 0`.
+
+| Route | repetitions | run-to-run | max \|Δlogp\| | tokens | text stable |
+|---|---|---|---|---|---|
+| `cpu` | 5 | **bitwise-identical** | 0 | 128 | yes |
+| `hrx` | 5 | **bitwise-identical** | 0 | 122 | yes |
+| `npu` (forward path) | 2 | **bitwise-identical** | 0 | 131 | yes |
+
+| pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | common tokens | prompts diverging |
+|---|---|---|---|---|---|---|---|
+| `cpu` vs `hrx` | 0.721 | 0.721 | 0.080 | 3.98e-01 | 4.03e-02 | 88/122 | 4 of 8 |
+| `cpu` vs `npu` | 0.331 | 0.331 | 0.000 | 6.23e-01 | 8.62e-02 | 39/118 | 6 of 8 |
+| `hrx` vs `npu` | 0.410 | 0.410 | 0.000 | 5.87e-01 | 8.89e-02 | 48/117 | 6 of 8 |
+
+The two runs were separate device claims, so the `cpu` route was served twice and is the control: the two
+`cpu` reports agree **128/128 positions, exact bits, `max |Δlogp| = 0`**.
+
+Two things this row adds to the thinking-on tables above:
+
+- **The `cpu`/`hrx` row reproduces the c18 binary digit for digit.** Same 122 aligned positions, 88 common,
+token match 0.721, exact-bit 0.080, max 3.98e-01, mean 4.03e-02 as the first measurement of this page
+(`lemonade-onebit-rc-2026-10-31c`). Nothing in the CPU or HRX decode path moved between that binary and
+`main@692cfa2`, which is the llama.cpp pin's own claim and now also a measurement.
+- **Thinking off moves the NPU pairs further away, not closer.** Mean \|Δlogp\| is 8.6-8.9e-02 here against
+5.2-5.5e-02 with thinking on, and the token-match rate is higher (0.33-0.41 against 0.26) because thinking
+streams are long runs of near-deterministic tokens that both routes pick identically. Neither row is a
+better row: they answer different questions ("the same 64 tokens" against "the same 64 tokens of a
+reasoning stream"), and the thinking-off one is the one a numeric gate would be written against.
+
+What can be promised today, then: repetition on all three routes, and cross-route agreement numbers — not
+an agreement threshold. No pair is bitwise, and no pair is within RL-Kernel's `max_abs_dlogp <= 0.06` gate.
 
 ## Routes and logprobs
 
@@ -151,14 +280,13 @@ What the NPU route can be held to today is repetition — which it passes — an
   `full_i8_*.elf` designs — a shipped dx kernel directory (`npu/kernels/<H>x<IM>x<NH>x<NKV>/` of
   `layer*.elf`) does not contain them. A release binary older than that change has no NPU logprobs
   anywhere (`strings <bin> | grep top_logprobs` is the check).
-- `chat_template_kwargs.enable_thinking=false` is honoured by the llama-server routes and not by
-  the NPU forward path, which can return a `<think>` block where the others do not. Compare token
-  streams only with the same template behaviour, or the divergence you measure is the template.
+- `chat_template_kwargs.enable_thinking=false` is honoured by every route, the NPU forward path
+  included since #864 (`app/npu_chatml.h`); before that it was accepted and dropped there, so an NPU
+  reply could open a `<think>` block where the others did not. Compare token streams only with the same
+  template behaviour, or the divergence you measure is the template.
 
-**The NPU does not serve the same weights.** A Q4NX weight is a q4_1 tile (bf16 scale and zero per
-32 columns) and the pack is produced by requantising Q4_K, so NPU-vs-GGUF log-prob differences
-contain a quantisation change, not only kernel arithmetic. A log-prob agreement number across that
-boundary is not comparable to `cpu` vs `hrx` and should not be quoted as if it were.
+The weight caveat above is why the NPU's agreement numbers are reported with the pack named and not
+folded into the `cpu` vs `hrx` column: the measured tables are above.
 
 ## How to re-run
 
@@ -187,9 +315,36 @@ python3 tools/logprob_agree.py \
     --repeat 5 --max-tokens 64 --json agree.json
 ```
 
+With the NPU in the comparison, the same command with `--thinking off --match-by text`, on a build carrying
+#864: the forward path reports no token ids, so tokens are matched by text, and thinking off is what the
+last three-route row was taken with (`--thinking on` also works there and is what the earlier rows used).
+The NPU tries 2 repeats at the same 64-token budget — ~2.5 min in one claim with thinking off, ~10 min with
+thinking on, which is what its ~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
+compare the two reports with the tool's own comparator:
+
+```sh
+python3 tools/logprob_agree.py --route cpu=… --route npu=… \
+    --thinking on --match-by text --repeat 2 --max-tokens 64 --json npu.json
+python3 tools/logprob_agree.py --route cpu=… --route hrx=… \
+    --thinking on --repeat 5 --max-tokens 64 --json hrx.json
+python3 - <<'PY'   # agreement across the two reports, by text
+import importlib.util, json
+s = importlib.util.spec_from_file_location("t", "tools/logprob_agree.py")
+t = importlib.util.module_from_spec(s); s.loader.exec_module(t)
+load = lambda p, r: json.load(open(p))["routes"][r]
+npu, hrx = load("npu.json", "npu"), load("hrx.json", "hrx")
+print(t.agreement(npu[0]["runs"][0], hrx[0]["runs"][0], "text"))
+PY
+```
+
 Exit code 0 means every route was bitwise repeatable *and* every pair matched exactly; 1 means a
 route diverged on repeat, a route returned no log-probabilities, or a pair differs; 2 means a route
 was unreachable. `--selftest` checks the comparison logic without a server.
+
+To re-derive the `hrx` width gate rather than guess it, run the same serve with `GGML_HRX_LOG_DISPATCH=1`
+and issue a solo request in one process and a concurrent one in another; the registration sets differ by
+exactly the table above. `GGML_HRX_DISABLE_DISPATCH=<substring>` turns any one registration off, which is
+how each arm above was run.
 
 ## Two things that will waste your afternoon
 
@@ -215,3 +370,10 @@ was unreachable. `--selftest` checks the comparison logic without a server.
   moves them; re-run rather than extrapolate.
 - The concurrency numbers were measured on a 0.6B model on one host; they show the effect exists
   and is not small, not how large it gets for other shapes.
+- The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
+  *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
+  budget difference, so all three columns can be read at one token count.
+- The NPU rows depend on the build. A binary at `44d849d` or later masks the think tokens, so a *thinking*
+  reply reports no entries on it at all: the thinking-on rows come from a `main@1b3def2` build, which still
+  emits log-probabilities for the think tokens. The thinking-off row needs neither that build nor an
+  unfixed engine — it ran on `main@692cfa2` + #864, i.e. exactly what a client gets once #832's fix lands.

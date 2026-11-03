@@ -114,9 +114,48 @@ with tempfile.TemporaryDirectory() as root:
     check(p2["kernels"]["tag"] == "_pb16i" and p2["decode"]["sealed_elf"] == "pb16i_sealed.elf",
           "pb16i layout -> _pb16i tag and the sealed ELF named")
 
+    # 4b. t2s names its OWN sealed ELF.  A t2s decode family shipped as eight per-role ELFs pays a
+    #     hw_context switch on every launch -- measured 2026-11-02 in-loop at +2.0-2.3 ms against this
+    #     engine's documented ~2.7 ms between contexts, more than the kernels' own device time -- so the
+    #     one-context sealed set is the t2s layout's lever too, not a pb16i special case.
+    d2b = model_dir(os.path.join(root, "b2"), layout="t2s", q4nx_weight_layout_version=6,
+                    q4nx_t2s_sealed_elf="SEALED-T2S.elf",
+                    layer_types=["full_attention", "full_attention"])
+    touch(os.path.join(d2b, "kernels", "full_i8_G_K1024_N3072_t2s2_m16.elf"))
+    run(d2b)
+    p2b = json.load(open(os.path.join(d2b, "plan.json")))
+    check(p2b["kernels"]["tag"] == "_t2s2" and p2b["decode"]["sealed_elf"] == "SEALED-T2S.elf",
+          "t2s v2 layout -> _t2s2 tag and its own sealed ELF named")
+
+    # 4c. and a layout never borrows the other's key: a t2s container carrying only the pb16i key must stay
+    #     per-role, because a pb16i ELF reads 4,608-byte tiles out of 2,176-byte images.
+    d2c = model_dir(os.path.join(root, "b3"), layout="t2s", q4nx_weight_layout_version=6,
+                    sealed="pb16i_sealed.elf", layer_types=["full_attention", "full_attention"])
+    run(d2c)
+    check(json.load(open(os.path.join(d2c, "plan.json")))["decode"]["sealed_elf"] == "",
+          "a t2s container does not inherit q4nx_pb16i_sealed_elf")
+
     # 5. The plan printer writes nothing.
     r = run(d2, "--print")
     check(r.returncode == 0 and '"format": "1bit-npu-plan/1"' in r.stdout, "--print emits the plan on stdout")
+
+    # 5b. attention.mode comes from the pack's own decision_config.json, which is the file the d3 runtime
+    #     obeys; no such file means causal, which is what every non-readout model on this box is.
+    check(json.load(open(os.path.join(d2, "plan.json")))["attention"]["mode"] == "causal",
+          "no decision_config.json -> attention causal")
+    with open(os.path.join(d2, "decision_config.json"), "w") as f:
+        json.dump({"attention_mode": "noncausal_full_attention", "format_id": "d3-code-readout-v1"}, f)
+    run(d2)
+    check(json.load(open(os.path.join(d2, "plan.json")))["attention"]["mode"] == "noncausal_full_attention",
+          "a noncausal pack's decision_config.json sets attention.mode")
+    r = run(d2, "--check")
+    check(r.returncode == 0, "--check passes with the attention block on disk")
+    with open(os.path.join(d2, "decision_config.json"), "w") as f:
+        json.dump({"attention_mode": "backwards"}, f)
+    r = run(d2)
+    check(r.returncode != 0 and "attention_mode" in r.stderr,
+          f"an unknown attention_mode is refused, not defaulted (rc={r.returncode})")
+    os.remove(os.path.join(d2, "decision_config.json"))
 
     # 6. attn_output_gate (qwen3_5's q|gate): q_proj emits q AND the output gate, so the fused QKV
     #    carries twice the q rows.  Found by running this generator on the real d3-lite pack, whose

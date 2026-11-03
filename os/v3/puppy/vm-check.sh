@@ -440,8 +440,9 @@ rows = [
     # Cycle 17 item 9: the desktop's first run is preset (zone, no Quick Setup, the browser's default-browser
     # prompt off) and the chat screen has a startup hook Puppy actually runs.
     ("U2 desktop preset", "readlink /etc/localtime; ls /etc/personal_settings_popup_disabled "
-                     "/root/Startup/1bit-lemonade-webapp /opt/palemoon/defaults/pref/1bit-os.js 2>&1; "
-                     "grep -c checkDefaultBrowser /opt/palemoon/defaults/pref/1bit-os.js; "
+                     "/root/Startup/1bit-lemonade-webapp /etc/1bit/palemoon-prefs.js 2>&1; "
+                     "grep -c checkDefaultBrowser /etc/1bit/palemoon-prefs.js; "
+                     "grep -c 'defaults/pref/1bit-os.js' /usr/local/bin/1bit-lemonade-webapp; "
                      "[ \"$(readlink /etc/localtime)\" = /usr/share/zoneinfo/America/Moncton ] && "
                      "echo desktop-preset-ok", "desktop-preset-ok"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),

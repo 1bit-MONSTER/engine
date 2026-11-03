@@ -16,9 +16,12 @@
 
   Pale Moon's first run on 1bit OS (cycle 17 item 9).
 
-  Read from the application directory, like channel-prefs.js beside it: every Gecko browser loads
-  <app>/defaults/pref/*.js before it has a profile, so this applies to the profile the browser creates on the
-  appliance's first desktop session - no per-profile path to guess and nothing to write at run time.
+  This file lives in /etc/1bit and is COPIED into <app>/defaults/pref/1bit-os.js by 1bit-lemonade-webapp just
+  before the browser starts. Why not shipped straight into the application directory: woof-CE installs Pale Moon
+  by moving the whole unpacked tree onto /opt/palemoon (`mv palemoon/ /opt/palemoon`), so a directory that exists
+  there at that moment breaks the build ("cannot move ... Directory not empty", measured 2026-11-03). Every Gecko
+  browser reads <app>/defaults/pref/*.js before it has a profile - channel-prefs.js is loaded the same way - so
+  the copy lands before the first profile exists, and no per-profile path has to be guessed.
 
   The only question the appliance answers here is the first-run "make Pale Moon the default browser?" prompt: on
   a demo box the browser is the point, and a modal the owner has to dismiss on camera is not. The window size is

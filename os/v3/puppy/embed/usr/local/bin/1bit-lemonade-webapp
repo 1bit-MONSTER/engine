@@ -27,6 +27,18 @@
 #
 # Runs once per X session (the autostart can fire again when the WM restarts).
 [ -e /tmp/1bit-webapp-opened ] && exit 0
+# Cycle 17 item 9: Pale Moon's first-run prefs (item: no "make this the default browser?" prompt). The file has to
+# be in the application directory before the browser creates its profile, and it cannot be shipped there - woof-CE
+# installs Pale Moon with `mv`, which refuses a non-empty /opt/palemoon (measured: that broke a build). /opt is a
+# copy-on-write layer over the squashfs, so writing it here is the same thing a shipped file would be.
+for d in /opt/palemoon /usr/lib/palemoon /usr/lib64/palemoon; do
+    [ -d "$d/defaults" ] || continue
+    if [ -r /etc/1bit/palemoon-prefs.js ]; then
+        mkdir -p "$d/defaults/pref" 2> /dev/null &&
+            cp -f /etc/1bit/palemoon-prefs.js "$d/defaults/pref/1bit-os.js" 2> /dev/null
+    fi
+    break
+done
 # wait for the page to answer (24onboard-webapp serves it; the proxy inside it also reaches Lemonade): up to 60 s,
 # and do not hold the X session up while waiting
 i=0

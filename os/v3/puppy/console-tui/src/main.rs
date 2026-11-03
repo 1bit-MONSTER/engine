@@ -168,7 +168,6 @@ fn run() -> ExitCode {
     });
 
     let mut app = App::new(Facts::collect());
-    let mut _msg_clock = Instant::now();
     let mut last_spin = Instant::now();
     let rc = loop {
         while let Ok(f) = rx.try_recv() {

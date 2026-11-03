@@ -38,6 +38,10 @@
 #include "pack_import.h"
 #include "q4nx.h"
 
+#include <nlohmann/json.hpp>
+
+#include <unistd.h>
+
 #include <algorithm>
 #include <cmath>
 #include <cstdio>
@@ -49,6 +53,8 @@
 #include <vector>
 
 namespace {
+
+using json = nlohmann::json;
 
 namespace pi = onebit::npu::pack_import;
 namespace fs = std::filesystem;
@@ -456,7 +462,10 @@ void test_attn_tile(const std::string& golden_dir) {
         for (int h = 0; h < 2 && pairs_even_odd; ++h)
             for (int kb = 0; kb < kbs && pairs_even_odd; ++kb)
                 for (int i = 0; i < 16; ++i)
-                    pairs_even_odd = z.zp[size_t(h * 32 + 2 * i) * size_t(kbs) + size_t(kb)] == uint8_t(i) &&
+                    // accumulate: assigning here would let an early wrong pair be hidden by a later
+                    // right one, so only the last pair of each block was ever checked
+                    pairs_even_odd = pairs_even_odd &&
+                                     z.zp[size_t(h * 32 + 2 * i) * size_t(kbs) + size_t(kb)] == uint8_t(i) &&
                                      z.zp[size_t(h * 32 + 2 * i + 1) * size_t(kbs) + size_t(kb)] ==
                                          uint8_t(15 - i);
         check(pairs_even_odd, "attention tile: zero-point nibbles pair with rows 2i / 2i+1 (even/odd)");
@@ -577,7 +586,8 @@ void test_mlp_gu(const std::string& golden_dir) {
             for (int kb = 0; kb < kbs && pairs_even_odd; ++kb)
                 for (int i = 0; i < subv_rows / 2; ++i) {
                     const uint8_t v = uint8_t(i & 0x0F);
-                    pairs_even_odd = z.zp[size_t(h * subv_rows + 2 * i) * size_t(kbs) + size_t(kb)] == v &&
+                    pairs_even_odd = pairs_even_odd &&
+                                     z.zp[size_t(h * subv_rows + 2 * i) * size_t(kbs) + size_t(kb)] == v &&
                                      z.zp[size_t(h * subv_rows + 2 * i + 1) * size_t(kbs) + size_t(kb)] ==
                                          uint8_t(15 - v);
                 }
@@ -633,9 +643,14 @@ void test_mlp_gu(const std::string& golden_dir) {
             std::swap_ranges(&swapped.code[size_t(r) * kb], &swapped.code[size_t(r) * kb] + kb,
                              &swapped.code[size_t(32 + r) * kb]);
         }
-        std::vector<uint8_t> other;
-        pi::tile_q4_1(pi::q_from_tiles({pi::gu_half(swapped, false)}), other);
-        check(other != tiled, "MLP golden: a gate/up swap inside a column block is caught");
+        std::vector<uint8_t> other;  // gate AND up, as `tiled` is: a gate-only stream differs in length
+        for (const bool up : {false, true}) {
+            std::vector<uint8_t> part;
+            pi::tile_q4_1(pi::q_from_tiles({pi::gu_half(swapped, up)}), part);
+            other.insert(other.end(), part.begin(), part.end());
+        }
+        check(other.size() == tiled.size() && other != tiled,
+              "MLP golden: a gate/up swap inside a column block is caught");
     }
     std::printf("MLP golden: 1 unit, encode/decode exact, %zu container tiles identical\n",
                 tiled.size() / onebit::npu::kTileBytes);
@@ -714,7 +729,10 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     if (qwen05b) check(lm_tiles_planned == (151936 / 32) * 4, "pack: 0.5B lm_head plans 4748 x 4 tiles");
 
     // refusing must write nothing at all
-    const std::string out = (fs::temp_directory_path() / "oga_pack_import_test").string();
+    // Per-process scratch dir: two concurrent runs of this binary (or two ctest shards) otherwise write
+    // into the same directory and one dies with "cannot write .../model.q4nx" (measured 2026-11-03).
+    const std::string out = (fs::temp_directory_path() /
+                             ("oga_pack_import_test." + std::to_string(::getpid()))).string();
     fs::remove_all(out);
     const pi::Report r0 = pi::import_pack(pack, out, pi::Options{});
     check(!r0.refused.empty() && !fs::exists(out + "/model.q4nx"),
@@ -723,6 +741,42 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
     if (golden_dir.empty()) { /* unreachable in practice */ }
 
     const pi::Report r = pi::import_pack(pack, out, pi::Options{true});
+    // A container written with --allow-incomplete has to SAY what it is missing. The plan's manifest cannot
+    // know what only the import discovers (a group that does not survive decode->encode, a nonempty bias
+    // subvolume, a missing tail envelope), so the runtime refusals must be merged into it: attributed to the
+    // tensor they name, and listed in `incomplete`. Checks the file itself, not the in-memory report.
+    if (!r.refused.empty()) {
+        std::ifstream cf(out + "/model.q4nx", std::ios::binary);
+        uint64_t hlen = 0;
+        cf.read(reinterpret_cast<char*>(&hlen), 8);
+        std::string header(size_t(hlen), '\0');
+        cf.read(header.data(), std::streamsize(hlen));
+        while (!header.empty() && (header.back() == ' ' || header.back() == '\0')) header.pop_back();
+        const auto doc = json::parse(header);
+        const auto& inc = doc.at("__metadata__").at("incomplete");
+        bool every = true;
+        for (const auto& s : r.refused) {
+            bool listed = false;
+            for (const auto& e : inc)
+                if (e.is_string() && e.get<std::string>() == s) listed = true;
+            every = every && listed;
+        }
+        check(every, "pack: --allow-incomplete lists every runtime refusal in the manifest's incomplete "
+                     "list (" + std::to_string(inc.size()) + " listed, " + std::to_string(r.refused.size()) +
+                         " refused)");
+        bool attributed = true;
+        for (const auto& s : r.refused) {
+            const size_t c = s.find(": ");
+            if (c == std::string::npos) continue;
+            const std::string name = s.substr(0, c);
+            bool found = false;
+            for (const auto& t : doc.at("__metadata__").at("tensors"))
+                if (t.value("name", std::string()) == name)
+                    found = t.value("imported", true) == false;
+            attributed = attributed && found;
+        }
+        check(attributed, "pack: each runtime-refused tensor is marked imported=false in the manifest");
+    }
     check(r.lmhead_corr > 0.999, "pack: the decode reproduces the fp16 embedding (corr " +
                                      std::to_string(r.lmhead_corr) + ")");
     check(r.ctrl_corr_nibble < 0.5 && r.ctrl_corr_nozp < 0.95,
@@ -877,6 +931,7 @@ int main(int argc, char** argv) {
         test_tiles(golden_dir);
         test_attn_tile(golden_dir);
         test_mlp_gu(golden_dir);
+        test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

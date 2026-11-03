@@ -1439,9 +1439,35 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
         }
     }
 
-    // the manifest goes in the container, so a loader (or a person) can see what this
-    // pack did and did not contribute without re-reading the pack
-    w.finish(json::parse(p.manifest()));
+    // The manifest goes in the container, so a loader (or a person) can see what this pack did and did
+    // not contribute without re-reading the pack. The plan's manifest cannot know what only the import
+    // discovers -- a group that does not survive decode->encode, a nonempty bias subvolume, a missing
+    // tail envelope -- so the runtime refusals are merged in here: each is attributed to the tensor it
+    // names, and all of them land in `incomplete` too. Without this a container written with
+    // --allow-incomplete reported `incomplete: []` while silently missing those weights (CodeRabbit/Copilot
+    // review of #842 and #844).
+    std::string manifest = p.manifest();
+    if (!r.refused.empty()) {
+        json m = json::parse(manifest);
+        auto& inc = m["incomplete"];
+        for (const auto& s : r.refused) {
+            const size_t c = s.find(": ");
+            const std::string name = c == std::string::npos ? std::string() : s.substr(0, c);
+            const std::string why = c == std::string::npos ? s : s.substr(c + 2);
+            if (!name.empty())
+                for (auto& t : m["tensors"])
+                    if (t.value("name", std::string()) == name) {
+                        t["refusal"] = why;
+                        t["imported"] = false;
+                    }
+            bool seen = false;
+            for (const auto& e : inc)
+                if (e.is_string() && e.get<std::string>() == s) seen = true;
+            if (!seen) inc.push_back(s);
+        }
+        manifest = m.dump(2);
+    }
+    w.finish(json::parse(manifest));
 
     {
         std::ifstream cf(pack_dir + "/config.json");

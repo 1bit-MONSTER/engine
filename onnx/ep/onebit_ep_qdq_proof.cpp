@@ -607,6 +607,7 @@ struct Result {
     bool fused = false;      // the fused kernel ran (trace: a qdq line)
     bool float_mm = false;   // the float MatMul kernel ran (trace: a matmul line)
     bool host_rows = false;  // gemm_q8 chose the host loop on rows (trace: npu_qdq_host_rows)
+    bool fallback = false;   // the device was configured but did not run it (trace: npu_qdq_fallback)
     long peak_cpu = -1;
     long peak_fused = -1;
     int rc = 0;
@@ -667,6 +668,7 @@ Result run_case(const Case& c, const char* ep_lib, const char* trace_path) {
     r.fused = slice.find("qdq rows=") != std::string::npos;
     r.float_mm = slice.find("matmul batch=") != std::string::npos;
     r.host_rows = slice.find("npu_qdq_host_rows") != std::string::npos;
+    r.fallback = slice.find("npu_qdq_fallback") != std::string::npos;
     std::printf("onebit-ort-qdq: case %s: %zu of %zu int8 values differ, worst |d|=%d LSB, "
                 "path=%s\n",
                 c.label, r.differing, ref_out.size(), r.worst, r.fused ? "fused" : "per-node");
@@ -733,14 +735,15 @@ int main(int argc, char** argv) {
         // The same shape one of Qwen3-0.6B's own projections has: 5 tokens x [1024 -> 2048].
         {"quark-wide", 5, 1024, 2048, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // Qwen3-0.6B's o_proj shape, and the one a device ELF exists for on strixhalo
-        // (full_i8_O_K2048_N1024.elf): with ONEBIT_EP_NPU_ELFS configured this case is what runs the
-        // fused group on the array, and its |d| = 0 gate then compares the device's int32 accumulators
-        // with the CPU EP's float path exactly as the host case does.
+        // (full_i8_O_K2048_N1024.elf). At 5 rows it is a decode-width case, so since gemm_q8 routes by
+        // rows it is a HOST case (see quark-o32 for the device half); it is kept because it is what the
+        // routing assertion below checks on the host side.
         {"quark-o", 5, 2048, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // Qwen3-0.6B's down_proj shape, and the second design strixhalo has an ELF for
-        // (full_i8_D_K3072_N1024.elf). The device gates have been configured with that ELF since the first
-        // device run and no case exercised it, so nothing here would have caught a defect in that design --
-        // found while answering pi-ortep's question about which designs our |d| = 0 gate actually covers.
+        // (full_i8_D_K3072_N1024.elf). The device gates had been configured with that ELF since the first
+        // device run and no case exercised its shape, so nothing here would have caught a defect in that
+        // design -- found while answering pi-ortep's question about which designs our gate covers. Like
+        // quark-o this is a 5-row (host-routed) case; quark-d32 is its device half.
         {"quark-d", 5, 3072, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // Qwen3-0.6B's k_proj/v_proj shape (1024 -> 1024). No design for it existed on this box until it
         // was generated from the iso-build generator (docs/onnx.md), which is why the device leg covered
@@ -748,6 +751,7 @@ int main(int argc, char** argv) {
         // real A8W8 graph is 5 of the model's 7 projection shapes instead of 2.
         {"quark-kv", 5, 1024, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // Qwen3-0.6B's gate_proj/up_proj shape (1024 -> 3072). Same generator, cols=4 like o_proj's design.
+        // 5 rows again, so this is the host-routed case; quark-gu32 is the device one.
         {"quark-gu", 5, 1024, 3072, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
         // The same, with enough values that a quantisation boundary is likely to be hit: 64x1024x2048
         // is 131072 int8 outputs, and the CPU EP reaches each one through a float accumulation where
@@ -757,13 +761,33 @@ int main(int argc, char** argv) {
         {"xaxis-K", 8, 16, 6, kPerAxisK, kPerTensor, kZpZero, kZpZero, 0, false, false},
         // x_dq is 1 MB of float32 and w_dq 4 MB, against 0.25 MB and 1 MB of int8.
         {"rss", 256, 1024, 1024, kPerTensor, kPerTensor, kZpZero, kZpZero, 0, true, true},
+        // o_proj, down_proj and gate/up at a row count the device actually takes. `gemm_q8` routes by
+        // rows (`kDeviceMinRows`), so the 5-row cases above are decode-width cases and by design they
+        // never reach the array -- which left those three projection shapes with no device gate at all,
+        // while `docs/onnx-pack.md` claimed all five. These are the cases that make that claim true:
+        // 32 rows is the design width, so each one is device-confirmed by the assertions below.
+        // They run after `rss` so their arena cannot move that measurement.
+        //
+        // Why the bound on these is one LSB and not zero: the CPU EP dequantises and then accumulates in
+        // float32, while the fused path sums exact int32 and rounds once, so at a quantisation boundary
+        // the two can round to different neighbours -- measured here as 1 of 32768 values on o_proj and 0
+        // on down_proj and gate/up, and as the same 1-in-5120 on a real Quark export (#695). Above one
+        // LSB is a defect (a wrong weight layout or a truncated K reads as hundreds), which is what the
+        // bound is for.
+        {"quark-o32", 32, 2048, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        {"quark-d32", 32, 3072, 1024, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
+        {"quark-gu32", 32, 1024, 3072, kPerTensor, kPerAxisCols, kZpZero, kZpZero, 0, true, false, 1},
     };
 
     int rc = 0;
     int worst_tensor = 0, worst_axis = 0, worst_asym = 0, worst_asym_axis = 0, worst_refused = 0;
     int worst_quark = 0, worst_quark_asym = 0, worst_quark_wide = 0;
     int worst_quark_stress = 0, worst_quark_o = 0, worst_quark_d = 0;
+    // Max over the device-width projection cases (32-row o_proj, down_proj, gate/up), which are the
+    // device gate for those shapes; see the cases table.
+    int worst_dev_width = 0;
     size_t differing_quark_stress = 0;
+    size_t differing_dev_width = 0;
     long peak_cpu = -1, peak_fused = -1;
     size_t fused_cases = 0;
     Result refused;
@@ -787,6 +811,18 @@ int main(int argc, char** argv) {
         // device is unused either way, so the rule is not asserted there.
         if (r.fused && std::getenv("ONEBIT_EP_NPU_ELFS")) {
             const bool want_host_rows = c.m < onebit_ep::kDeviceMinRows;
+            // A case at or above the threshold is a device gate, and a device gate that fell back proves
+            // nothing: the host kernel then produces the |d| = 0 the run prints. That is the exact failure
+            // mode a lane script once reported as "device accumulators match" (TQDQ-STATE
+            // 2026-10-31T15:15), so it is asserted here instead of living only in that script.
+            if (!want_host_rows && r.fallback) {
+                std::fprintf(stderr,
+                             "onebit-ort-qdq: FAIL case %s (m=%lld): the device was configured but the "
+                             "kernel fell back, so this is a host gate, not a device one\n",
+                             c.label, (long long)c.m);
+                rc = 1;
+                break;
+            }
             if (r.host_rows != want_host_rows) {
                 std::fprintf(stderr,
                              "onebit-ort-qdq: FAIL case %s (m=%lld): %s, expected %s "
@@ -826,6 +862,11 @@ int main(int argc, char** argv) {
         } else if (std::strcmp(c.label, "quark-stress") == 0) {
             worst_quark_stress = r.worst;
             differing_quark_stress = r.differing;
+        } else if (std::strcmp(c.label, "quark-o32") == 0 ||
+                   std::strcmp(c.label, "quark-d32") == 0 ||
+                   std::strcmp(c.label, "quark-gu32") == 0) {
+            if (r.worst > worst_dev_width) worst_dev_width = r.worst;
+            differing_dev_width += r.differing;
         } else if (std::strcmp(c.label, "quark-wide") == 0) {
             worst_quark_wide = r.worst;
         } else if (std::strcmp(c.label, "xaxis-K") == 0) {
@@ -873,6 +914,13 @@ int main(int argc, char** argv) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL stress case differs by %d LSB (%zu values)\n",
                          worst_quark_stress, differing_quark_stress);
             rc = 1;
+        } else if (!fusion_off && worst_dev_width > 1) {
+            // One LSB, not zero: see the cases table for why that is the arithmetic bound and not slack.
+            std::fprintf(stderr,
+                         "onebit-ort-qdq: FAIL a device-width projection case (32 rows: o_proj, "
+                         "down_proj, gate/up) differs by %d LSB (%zu values)\n",
+                         worst_dev_width, differing_dev_width);
+            rc = 1;
         } else if (!fusion_off && worst_quark_wide != 0) {
             std::fprintf(stderr, "onebit-ort-qdq: FAIL Quark-wide (5x1024x2048, per-column weight "
                                  "scales) case differs by %d LSB\n",
@@ -887,7 +935,7 @@ int main(int argc, char** argv) {
                          worst_refused);
             rc = 1;
         } else if (!fusion_off) {
-            if (fused_cases < 10) {
+            if (fused_cases < 13) {
                 std::fprintf(stderr, "onebit-ort-qdq: FAIL only %zu case(s) were fused\n", fused_cases);
                 rc = 1;
             } else if (peak_cpu > 0 && peak_fused > 0 && peak_fused >= peak_cpu) {
@@ -899,9 +947,10 @@ int main(int argc, char** argv) {
             } else {
                 std::printf("onebit-ort-qdq: PASS OneBitEp fused the A8W8 QDQ group: worst |d| = "
                             "%d/%d/%d/%d LSB (per-tensor, per-axis, asymmetric, asymmetric per-axis), "
-                            "per-K scale refused (worst |d|=%d), peak RSS -%ld kB\n",
+                            "per-K scale refused (worst |d|=%d), device-width projections (32 rows: "
+                            "o_proj, down_proj, gate/up) worst |d|=%d, peak RSS -%ld kB\n",
                             worst_tensor, worst_axis, worst_asym, worst_asym_axis, worst_refused,
-                            peak_cpu > 0 ? peak_cpu - peak_fused : 0L);
+                            worst_dev_width, peak_cpu > 0 ? peak_cpu - peak_fused : 0L);
             }
         } else {
             // The control only has to prove the per-node path still works; the other numbers are

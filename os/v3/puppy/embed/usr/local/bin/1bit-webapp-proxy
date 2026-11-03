@@ -1,0 +1,138 @@
+#!/usr/bin/env python3
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-webapp-proxy - serve /opt/1bit/webapp and hand the Lemonade API key to the page without a URL.
+#
+# Cycle 17 item 8, from the demo recording: the desktop autostart opened
+#   http://localhost:8080/?key=93112a22cafee2ad…
+# so the appliance's bearer token sat in the address bar, in the browser's history and in every frame of the
+# recording. The key belongs in a header, not in a URL a person (or a camera) can read:
+#
+#   * this process serves the chat page on 127.0.0.1:8080 exactly as `python3 -m http.server` did, and
+#   * it forwards /api/… to Lemonade on 127.0.0.1:13305 with `Authorization: Bearer <key from lemond.conf>`
+#     added to the request. The page then has no key at all - it uses same-origin URLs - and streaming works
+#     because the response is copied through in 4 KiB chunks, not buffered.
+#
+# Loopback only, in both directions: the page is not exposed to the LAN (it never was) and the injected header
+# cannot be used as a general proxy for it (only /api/ and /internal/ are forwarded, and the key is the one this
+# machine minted). Nothing is written: the directory is served read-only, as before.
+import http.client
+import os
+import sys
+from http.server import SimpleHTTPRequestHandler, ThreadingHTTPServer
+
+APP = os.environ.get("ONEBIT_WEBAPP_APP", "/opt/1bit/webapp")
+CONF = os.environ.get("ONEBIT_WEBAPP_CONF", "/etc/1bit/lemond.conf")
+PORT = int(os.environ.get("ONEBIT_WEBAPP_PORT", "8080"))
+UPSTREAM = ("127.0.0.1", int(os.environ.get("ONEBIT_WEBAPP_UPSTREAM_PORT", "13305")))
+FORWARD = ("/api/", "/internal/")
+HOP = ("connection", "keep-alive", "transfer-encoding", "content-length", "host", "authorization")
+
+
+def api_key():
+    """The key 10lemonade minted; empty if there is none (Lemonade then answers 401 and the page says so)."""
+    try:
+        with open(CONF, "r", encoding="utf-8", errors="replace") as f:
+            for line in f:
+                if line.startswith("LEMONADE_API_KEY="):
+                    return line.split("=", 1)[1].strip()
+    except OSError:
+        pass
+    return ""
+
+
+class Handler(SimpleHTTPRequestHandler):
+    protocol_version = "HTTP/1.1"
+
+    def __init__(self, *a, **kw):
+        super().__init__(*a, directory=APP, **kw)
+
+    def log_message(self, fmt, *args):  # one line per request, never headers (the key never appears here)
+        sys.stderr.write("%s %s\n" % (self.log_date_time_string(), fmt % args))
+
+    def _forward(self):
+        length = int(self.headers.get("Content-Length") or 0)
+        body = self.rfile.read(length) if length > 0 else None
+        headers = {k: v for k, v in self.headers.items() if k.lower() not in HOP}
+        key = api_key()
+        if key:
+            headers["Authorization"] = "Bearer " + key
+        try:
+            conn = http.client.HTTPConnection(*UPSTREAM, timeout=900)
+            conn.request(self.command, self.path, body=body, headers=headers)
+            resp = conn.getresponse()
+        except OSError as e:
+            # Lemonade not up yet is the ordinary case at boot; the page shows the text and stays usable.
+            msg = ("1bit-webapp-proxy: Lemonade is not answering on %s:%d (%s)\n"
+                   % (UPSTREAM[0], UPSTREAM[1], e)).encode()
+            self.send_response(502)
+            self.send_header("Content-Type", "text/plain; charset=utf-8")
+            self.send_header("Content-Length", str(len(msg)))
+            self.end_headers()
+            self.wfile.write(msg)
+            return
+        try:
+            self.send_response(resp.status)
+            for k, v in resp.getheaders():
+                if k.lower() in HOP:
+                    continue
+                self.send_header(k, v)
+            # no length: the body is delimited by the close, so SSE arrives as it is produced
+            self.send_header("Connection", "close")
+            self.end_headers()
+            self.close_connection = True
+            read = getattr(resp, "read1", resp.read)
+            while True:
+                chunk = read(4096)
+                if not chunk:
+                    break
+                self.wfile.write(chunk)
+                self.wfile.flush()
+        finally:
+            conn.close()
+
+    def do_GET(self):
+        return self._forward() if self.path.startswith(FORWARD) else super().do_GET()
+
+    def do_HEAD(self):
+        return self._forward() if self.path.startswith(FORWARD) else super().do_HEAD()
+
+    def do_POST(self):
+        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+
+    def do_DELETE(self):
+        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+
+    def do_PUT(self):
+        return self._forward() if self.path.startswith(FORWARD) else self.send_error(405)
+
+
+def main():
+    if not os.path.isfile(os.path.join(APP, "index.html")):
+        sys.exit("1bit-webapp-proxy: no %s/index.html" % APP)
+    srv = ThreadingHTTPServer(("127.0.0.1", PORT), Handler)
+    srv.daemon_threads = True
+    print("1bit-webapp-proxy: serving %s on 127.0.0.1:%d, /api/ -> %s:%d%s"
+          % (APP, PORT, UPSTREAM[0], UPSTREAM[1],
+             "" if api_key() else " (no API key in %s)" % CONF), flush=True)
+    try:
+        srv.serve_forever()
+    except KeyboardInterrupt:
+        pass
+
+
+if __name__ == "__main__":
+    main()

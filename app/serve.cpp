@@ -67,6 +67,7 @@
 #include "gguf_meta.h"
 #include "hrx_archs.h"
 #include "hrx_cwsr.h"
+#include "hrx_runtime.h"
 #include "hrx_strict.h"
 #include "mem_admit.h"
 #include "pm.h"
@@ -234,6 +235,24 @@ const CwsrDecision& hrx_cwsr_decision(const Options& o) {
 }
 
 const std::vector<std::string>& hrx_cwsr_env(const Options& o) { return hrx_cwsr_decision(o).env; }
+
+// engine#713 criterion 4 (app/hrx_runtime.h, docs/hrx.md "The HSA runtime"): name the HSA runtime HRX will dlopen -
+// path and sha256 - once per serve, at the first HRX backend. Three libhsa-runtime64.so.1 exist on a box and they are
+// not interchangeable, so a run that silently fell back to another copy must be visible in the log. Printed before the
+// CWSR decision line so the runtime is identified first.
+void announce_hrx_runtime(const Options& o) {
+    static bool announced = false;
+    if (announced) return;
+    announced = true;
+    const std::string path = hrx_libhsa(o.hrx_libhsa);
+    if (path.empty()) {
+        std::fprintf(stderr,
+                     "1bit serve: HRX: no HSA runtime found (--hrx-libhsa, the build's pinned toolchain, "
+                     "/opt/rocm-therock); HRX will not register a device (docs/hrx.md)\n");
+        return;
+    }
+    std::fprintf(stderr, "1bit serve: %s\n", hrx_runtime_line(path, sha256_file(path)).c_str());
+}
 
 // The decision line, printed at the first HRX backend that uses it. Deliberately NOT printed by hrx_cwsr_env(): that
 // would also print on paths that must emit exactly one line (the memory refusal, tests/mem_admit_route.sh counts
@@ -1022,6 +1041,7 @@ Launch launch_for(const Options& o, const std::string& device, int child_port) {
         if (device == "hrx") {
             const std::string hsa = hrx_libhsa(o.hrx_libhsa);
             if (!hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+            announce_hrx_runtime(o);
             announce_cwsr_env(o);
             for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             // engine #390 (docs/serve.md, "Off-HRX placement"): the backend's placement observer
@@ -1177,6 +1197,7 @@ Launch rag_launch(const Options& o, const std::string& model, const char* role, 
         // the same ROCr the chat server gets, or the RAG server cannot open HRX0 ("invalid device: HRX0")
         if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty())
             l.env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
+        announce_hrx_runtime(o);
         announce_cwsr_env(o);
         for (const auto& e : hrx_cwsr_env(o)) l.env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
         // strict placement, as the model's own backend (app/hrx_strict.h); no report, no -lv 4
@@ -1692,8 +1713,10 @@ int serve_child(const Options& given) {
             // the GGUF scorer, with the HSA runtime HRX needs (docs/hrx.md)
             std::vector<std::string> env;
             if (const std::string hsa = hrx_libhsa(o.hrx_libhsa); !hsa.empty()) env.push_back("IREE_HAL_AMDGPU_LIBHSA_PATH=" + hsa);
-            if (!dev || !*dev || std::string(dev) == "hrx")
+            if (!dev || !*dev || std::string(dev) == "hrx") {
+                announce_hrx_runtime(o);
                 announce_cwsr_env(o);
+            }
             for (const auto& e : hrx_cwsr_env(o)) env.push_back(e);  // engine#315 (app/hrx_cwsr.h)
             laya_daemon = std::make_unique<LayaDaemon>(std::vector<std::string>{
                 bin, "daemon", gguf, "--family", "typed-decisions", "--device", dev && *dev ? dev : "hrx"}, env);

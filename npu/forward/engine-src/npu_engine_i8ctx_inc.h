@@ -36,6 +36,7 @@
 #include "q4nx_pb16i.h"          // the pb16i image: integer-exact ternary decode weights
 #include "q4nx_t2s.h"            // the t2s stream: the same weights at 2.125 bits/weight
 #include "q4nx_pack.h"           // q4nx_elf_arg_sizes(): args_fit_elf() checks the ELF's own widths
+#include "quant_i8.h"             // the A-row quantiser: scalar reference + an AVX2 path, byte-identical
 #include <algorithm>
 #include "rt.h"  // the own NPU runtime (ONEBIT_NPU_RT_DIR)
 
@@ -549,14 +550,7 @@ struct I8Ctx {
         // interaction.
         memset(Am, 0, (size_t)MD * KD);
         for (int m = 0; m < am; m++)
-            for (int k = 0; k < ak; k++) {
-                float v = A[m * ak + k];
-                if (!std::isfinite(v)) v = 0;
-                int q = (int)roundf(v * ais);
-                if (q > 127) q = 127;
-                else if (q < -127) q = -127;
-                Am[m * KD + k] = (int8_t)q;
-            }
+            q4nx_quant_i8::row(A + (size_t)m * ak, ak, ais, Am + (size_t)m * KD);
         return Am;
     }
 
@@ -581,17 +575,8 @@ struct I8Ctx {
             return Am;
         }
         memset(Am, 0, (size_t)MD * KD);
-        for (int m = 0; m < am; m++) {
-            float ais = 1.0f / ascales[m];
-            for (int k = 0; k < ak; k++) {
-                float v = A[m * ak + k];
-                if (!std::isfinite(v)) v = 0;
-                int q = (int)roundf(v * ais);
-                if (q > 127) q = 127;
-                else if (q < -127) q = -127;
-                Am[m * KD + k] = (int8_t)q;
-            }
-        }
+        for (int m = 0; m < am; m++)
+            q4nx_quant_i8::row(A + (size_t)m * ak, ak, 1.0f / ascales[m], Am + (size_t)m * KD);
         return Am;
     }
 

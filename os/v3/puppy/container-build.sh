@@ -236,6 +236,22 @@ if [ -n "${PAYLOAD:-}" ]; then
     # TextDecoderStream and AbortSignal.timeout), while it streams fine from plain fetch + getReader, which is what
     # /opt/1bit/webapp/index.html uses. 24onboard-webapp serves that page on loopback, the autostart opens it.
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-record "$skeleton/usr/local/bin/1bit-record"
+    # Cycle 17: the key never goes in the URL (1bit-webapp-proxy injects the header on 8080), the desktop item is
+    # 1bit-desktop (it logs the attempt and refuses a reboot), and the boot's logs go to /data/logs (1bit-logs).
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-webapp-proxy "$skeleton/usr/local/bin/1bit-webapp-proxy"
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-desktop "$skeleton/usr/local/bin/1bit-desktop"
+    install -D -m 755 /recipe/embed/usr/local/bin/1bit-logs "$skeleton/usr/local/bin/1bit-logs"
+    install -D -m 755 /recipe/embed/etc/init.d/06onboard-logs "$skeleton/etc/init.d/06onboard-logs"
+    install -D -m 755 /recipe/embed/etc/init.d/08onboard-presets "$skeleton/etc/init.d/08onboard-presets"
+    install -D -m 755 /recipe/embed/root/Startup/1bit-lemonade-webapp \
+        "$skeleton/root/Startup/1bit-lemonade-webapp"
+    install -D -m 644 /recipe/embed/etc/personal_settings_popup_disabled \
+        "$skeleton/etc/personal_settings_popup_disabled"
+    # Pale Moon's first-run prefs live in /etc/1bit, NOT in /opt/palemoon: woof-CE installs the browser with
+    # `mv palemoon/ /opt/palemoon`, which refuses a target that already exists - measured 2026-11-03, one build
+    # lost to it ("cannot move ... Directory not empty"). 1bit-lemonade-webapp copies the file into the
+    # application directory before the browser creates its profile.
+    install -D -m 644 /recipe/embed/etc/1bit/palemoon-prefs.js "$skeleton/etc/1bit/palemoon-prefs.js"
     install -D -m 755 /recipe/embed/usr/local/bin/1bit-lemonade-webapp "$skeleton/usr/local/bin/1bit-lemonade-webapp"
     install -D -m 755 /recipe/embed/etc/init.d/24onboard-webapp "$skeleton/etc/init.d/24onboard-webapp"
     install -D -m 644 /recipe/embed/opt/1bit/webapp/index.html "$skeleton/opt/1bit/webapp/index.html"
@@ -263,10 +279,11 @@ if [ -n "${PAYLOAD:-}" ]; then
         "$skeleton/etc/profile.d" "$skeleton/root" "$skeleton/usr/local/bin" 2> /dev/null || true
     chmod 0755 "$skeleton/usr/local/bin/1bit-tty1"
     chmod 0755 "$skeleton"/etc/init.d/03onboard-efivars "$skeleton"/etc/init.d/05onboard-data \
+        "$skeleton"/etc/init.d/06onboard-logs "$skeleton"/etc/init.d/08onboard-presets \
         "$skeleton"/etc/init.d/10lemonade \
         "$skeleton"/etc/init.d/20onboard-ssh "$skeleton"/etc/init.d/21serial-console \
-        "$skeleton"/etc/init.d/26onboard-board "$skeleton"/etc/init.d/27onboard-installer \
-        "$skeleton"/etc/init.d/zz-onboard-ports
+        "$skeleton"/etc/init.d/24onboard-webapp "$skeleton"/etc/init.d/26onboard-board \
+        "$skeleton"/etc/init.d/27onboard-installer "$skeleton"/etc/init.d/zz-onboard-ports
     echo "   $(du -sh "$skeleton/opt/1bit-package" | cut -f1) in /opt/1bit-package, service in /etc/init.d"
     if [ -n "${LIBHSA_DIR:-}" ]; then
         # The whole runtime set, flat, at the path the engine own fallback scan walks: app/serve.cpp:207
@@ -453,11 +470,14 @@ if [ -n "${PAYLOAD:-}" ]; then
              usr/local/bin/1bit-console-menu \
              usr/sbin/1bit-board etc/init.d/26onboard-board \
              usr/local/bin/1bit-record usr/local/bin/1bit-lemonade-webapp \
+             usr/local/bin/1bit-webapp-proxy usr/local/bin/1bit-desktop usr/local/bin/1bit-logs \
+             etc/init.d/06onboard-logs etc/init.d/08onboard-presets root/Startup/1bit-lemonade-webapp \
+             etc/personal_settings_popup_disabled etc/1bit/palemoon-prefs.js \
              etc/init.d/24onboard-webapp opt/1bit/webapp/index.html \
              etc/xdg/autostart/1bit-lemonade-webapp.desktop \
              etc/init.d/27onboard-installer \
              usr/lib/1bit/seal_manifest.py etc/1bit/seal-pub.txt etc/1bit/onebit-models.txt \
-             etc/1bit/release-identity etc/keymap etc/localtime; do
+             etc/1bit/release-identity etc/keymap etc/localtime etc/timezone; do
         in_image "$b" || miss="$miss $b"
     done
     [ -z "${LIBHSA_DIR:-}" ] || { in_image opt/rocm-therock/lib/libhsa-runtime64.so.1 || miss="$miss the HRX libhsa"; \

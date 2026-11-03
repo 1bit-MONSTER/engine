@@ -169,12 +169,14 @@ same shape.
 
 A call costs the same at 1 row and at 32 — q_proj is 1.501 ms against 1.566 ms, i.e. 32× the work for 4 % more
 time — so it is **dispatch-bound**: a decode step pays one launch per projection (196 of them on Qwen3-0.6B) and
-at one row that launch costs 8–10× the host loop it replaces. This is therefore a **prefill** leg: it crosses over
-between 8 and 16 rows and is 3.1–3.4× ahead at a full 32-row design. Design M is not the lever — an M=128
+at one row that launch costs 8–10× the host loop it replaces. This is therefore a **prefill** leg: every
+measured shape is faster from **12** rows up and 3.1–3.4× ahead at a full 32-row design (the 45-cell sweep puts
+the worst shape at 0.86× of the host loop at 12 rows), and the threshold is 16 so that nothing sits near the
+crossover on a box whose timing moves 1.2–1.3× between runs. Design M is not the lever — an M=128
 design at one row measured 1.233 ms against M=32's 1.499 ms on 2048×1024 in this run and 1.606 vs 1.441 in an
 earlier one, i.e. the two are within run-to-run variance at decode width and neither changes the picture. The
 host column is a **lower bound**: it is the accumulation loop only, while the EP's real fallback then runs
-`epilogue_row` (a float multiply and a `q8_quantize` per element), so the 8–16-row crossover is optimistic *for
+`epilogue_row` (a float multiply and a `q8_quantize` per element), so the 12–16-row crossover is optimistic *for
 the device*. `docs/onnx-pack.md` therefore keeps the device leg correctness-only rather than quoting a device
 speedup, and a decode-side win would need fewer, longer launches (one launch covering many projections), not a
 smaller design.
@@ -185,15 +187,19 @@ divided by `repeats`. The figures above are the corrected ones, and `repeats < 2
 
 **What `gemm_q8` does with that number.** It routes by rows: below `kDeviceMinRows` — 16, declared once in
 `onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array; at or above
-it the device does. 16 is the first row count at which **no** measured projection shape was slower on the
-array, so the threshold is one constant rather than one per (K, N). A host-routed call is a choice, not a
+it the device does. 12 is the first row count at which **no** measured projection shape was slower on the
+array; 16 is the first that keeps more margin than the box's own run-to-run spread, so the threshold is one
+constant rather than one per (K, N). A host-routed call is a choice, not a
 failure, and it does not look like one: it writes
 `npu_qdq_host_rows m=… k=… n=… min=16` to the trace. "The device ran this shape" therefore stays exactly
 "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it" — an assertion a green `|d| = 0` line
 alone has never been (see `docs/onnx-pack.md`). `onebit_ep_qdq_proof` asserts the routing of *every* fused case
-against that same constant, so a decode-width routing regression and a prefill-width one fail in different
-places: with designs configured, `quark-stress` (64×1024×2048) must reach the device and every 5–8 row case must
-log `npu_qdq_host_rows`.
+against that same constant, and it asserts that a case at or above it did **not** fall back, so a decode-width
+routing regression, a prefill-width one and a device that quietly declined to run are three different red lines:
+with designs configured, `quark-stress` (64×1024×2048) and the three 32-row projection cases (`quark-o32`,
+`quark-d32`, `quark-gu32`) must reach the array, and every 5–8 row case must log `npu_qdq_host_rows`. Those three
+exist because the 5-row cases are host-routed by design: without them o_proj, down_proj and gate/up had no device
+gate at all, while this page claimed the shapes were covered.
 
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the

@@ -52,18 +52,21 @@ sudo os/mini/prepare-stick.sh /dev/sdX --mint --ssh-pubkey ~/.ssh/id_ed25519.pub
 ```
 
 Writing the `.img.xz` straight from balenaEtcher or Rufus (DD mode) is the same write with no shell
-line, but the `prepare-stick` line below is still what puts the API key on the stick.
+line. The `prepare-stick` line below is still the one to run if you want the key in your hand before the
+box boots — a `dd`-only stick gets one on its first boot instead.
 
 `prepare-stick` writes `/ssh/authorized_keys` and a freshly minted Lemonade API key into
 `/lemonade/lemond.conf` on the stick's `1BIT-DATA` partition, and copies `--model` files into
-`/models`. A stick written with `dd` alone has **no API key**: the appliance boots, but Lemonade says so
-in its log and serves every endpoint unauthenticated
-(`Serving on non-loopback host '0.0.0.0' without an API key ... all endpoints ... are reachable from
-other machines unauthenticated`), which is why `--mint` is part of the protocol. That the appliance does
-not mint one itself when the file is empty is a defect of this image
-([#867](https://github.com/1bit-MONSTER/engine/issues/867)); until it is fixed, treat `--mint` as
-mandatory, and check a stick you did not prepare with
-`sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf` — an empty answer means open.
+`/models`. A stick written with `dd` alone starts with no key, but the appliance mints one on its first
+boot: `05onboard-data` no longer pre-creates an empty `lemond.conf`, and `10lemonade` asks "is there a
+key", not "is there a file", before minting ([#867](https://github.com/1bit-MONSTER/engine/issues/867),
+fixed on `main` by [#828](https://github.com/1bit-MONSTER/engine/pull/828)). On the **cycle-13 image**
+that was not true: a `dd`-written stick booted Lemonade on `0.0.0.0:13305` with no key at all and served
+every endpoint — `/internal/*` included — unauthenticated, on every boot. So if your image predates that
+fix, treat `--mint` as mandatory. Read the key either way with
+`sudo sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf`; an empty answer on a box that has
+booted once means no key was minted and the box is open, and the console's **1 → Show API key** prints
+the key that was.
 
 ## 1. Run from the stick (no install)
 
@@ -136,11 +139,13 @@ comes up in its own menu instead of booting, pick it there once.
 > correct, but two defects stop the first boot: installer step 5 writes `pupsfs=UUID=<uuid>`, which
 > Puppy's init does not resolve ([#865](https://github.com/1bit-MONSTER/engine/issues/865)), and step 7's
 > `BootNext` lands on the firmware's own boot-manager entry instead of the new one
-> ([#866](https://github.com/1bit-MONSTER/engine/issues/866)). Step 7 is **fixed on `main`**
-> ([#889](https://github.com/1bit-MONSTER/engine/pull/889), merged 2026-11-03); the init fix is
-> [#890](https://github.com/1bit-MONSTER/engine/pull/890), open at this writing. Until both are in an
-> image, boot the installed disk by editing its `grub.cfg` entry to
-> `pupsfs=1BIT-DATA 1bit.data=UUID=<uuid>` — measured to boot, with the models and the API key in place.
+> ([#866](https://github.com/1bit-MONSTER/engine/issues/866)). Both are **fixed on `main`**: step 7 by
+> [#889](https://github.com/1bit-MONSTER/engine/pull/889), and the init by
+> [#890](https://github.com/1bit-MONSTER/engine/pull/890) (both merged 2026-11-03), the latter measured
+> on a disk installed by `1bit-install` and booted as the only disk in QEMU with Secure Boot on. An
+> image built from `main` therefore boots the installed disk as written. On the cycle-13 image, boot it
+> by editing its `grub.cfg` entry to `pupsfs=1BIT-DATA 1bit.data=UUID=<uuid>` — measured to boot, with
+> the models and the API key in place.
 
 Check the result from the installed system:
 
@@ -245,7 +250,7 @@ On the cycle-13 image (`sha256 dcc619ff74882f484e4c7dfb373980f294ce2f39b02291fb8
 | the firmware entry is written | `efibootmgr` lists `1bit OS` → `HD(1,GPT,<new ESP>)/\EFI\BOOT\BOOTX64.EFI` (id `0004`, not the `0000` the step's own log line printed — [#866](https://github.com/1bit-MONSTER/engine/issues/866), fixed by
 [#889](https://github.com/1bit-MONSTER/engine/pull/889)) |
 | what the install copies | the installed data partition holds `/1bit` (`vmlinuz`, `initrd.gz`, the four SFS), `/data` with the models, `lemonade/` and `ssh/`, and `.installed` |
-| boot of the installed disk as written | **fails** on this image: init says `Partition UUID=<uuid> not found` and drops to the rescue console ([#865](https://github.com/1bit-MONSTER/engine/issues/865); fix open as [#890](https://github.com/1bit-MONSTER/engine/pull/890)) |
+| boot of the installed disk as written | **fails** on this image: init says `Partition UUID=<uuid> not found` and drops to the rescue console ([#865](https://github.com/1bit-MONSTER/engine/issues/865); fixed on `main` by [#890](https://github.com/1bit-MONSTER/engine/pull/890), merged 2026-11-03) |
 | boot of the same disk with `pupsfs=1BIT-DATA` (label) instead of `pupsfs=UUID=…` | **boots**: `puppypc20143`, `/data/.installed` present, `lemond` up, `GET /api/v1/models` 401 without the key and 200 with it |
 | the boot device is rejected, not guessed | the refusal above is by device: `/proc/mounts` names `/dev/sda2` as `/data`, and the installer resolves the disk behind it |
 | `pmedia=usbhd` is not the cause | the failed boot was from a USB device, where `pmedia=usbhd` is the correct media class; the label/UUID A/B above isolates the cause to the UUID form |

@@ -22,14 +22,20 @@
 # page itself, from its own files, on loopback only: no extra network surface, nothing to download, and the same
 # engine and the same key as the real UI. /usr/local/bin/1bit-lemonade-webapp opens it in the browser.
 #
-# Loopback only (-b 127.0.0.1) and read-only (the directory is root-owned): this is a viewer of /opt/1bit/webapp,
+# Loopback only (127.0.0.1) and read-only (the directory is root-owned): this is a viewer of /opt/1bit/webapp,
 # not a place to put files.
+#
+# Cycle 17 item 8: it is 1bit-webapp-proxy, not `python3 -m http.server`, because the page must not need the API
+# key in its URL - the proxy adds the Authorization header to /api/ itself (see that file). Same port, same
+# directory, same read-only surface.
 APP=/opt/1bit/webapp
 PORT=${ONEBIT_WEBAPP_PORT:-8080}
+PROXY=/usr/local/bin/1bit-webapp-proxy
 [ -f "$APP/index.html" ] || exit 0
+[ -x "$PROXY" ] || {
+    echo "24onboard-webapp: $PROXY is missing, the chat screen is not served" > /dev/ttyS0 2> /dev/null; exit 0; }
 command -v python3 > /dev/null 2>&1 || {
     echo "24onboard-webapp: no python3, the chat screen is not served" > /dev/ttyS0 2> /dev/null; exit 0; }
-setsid python3 -m http.server "$PORT" --bind 127.0.0.1 --directory "$APP" \
-    > /var/log/1bit-webapp.log 2>&1 < /dev/null &
-echo "24onboard-webapp: serving $APP on 127.0.0.1:$PORT" > /dev/ttyS0 2> /dev/null
+ONEBIT_WEBAPP_PORT=$PORT setsid "$PROXY" > /var/log/1bit-webapp.log 2>&1 < /dev/null &
+echo "24onboard-webapp: serving $APP on 127.0.0.1:$PORT (key injected for /api/)" > /dev/ttyS0 2> /dev/null
 exit 0

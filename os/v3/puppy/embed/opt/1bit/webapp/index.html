@@ -28,9 +28,12 @@
   header. (The black rectangle that shows up in the xwd captures sits in the same place on every page in this
   browser - it is a capture artifact of Xvfb + xwd, not something the pages paint.)
 
-  Opened as http://localhost:8080/?key=... by /usr/local/bin/1bit-lemonade-webapp (the desktop autostart), served by
-  /etc/init.d/24onboard-webapp. The key comes from /etc/1bit/lemond.conf via that launcher and is kept in
-  localStorage, so the owner never types it on camera. ?api= points it at a different server.
+  Opened as http://localhost:8080/ by /usr/local/bin/1bit-lemonade-webapp (the desktop autostart), served by
+  /etc/init.d/24onboard-webapp. There is NO key in that URL and none in this page: the server on 8080 is
+  1bit-webapp-proxy, which adds `Authorization: Bearer <key from /etc/1bit/lemond.conf>` to every /api/ request it
+  forwards to Lemonade (cycle 17 item 8 - the cycle-16 demo recording had `?key=…` in the address bar). ?api= still
+  points the page at a different server; a ?key= left over from an older launcher is used once and then dropped
+  from the address bar, so it cannot end up in a recording or in history.
 -->
 <meta charset="utf-8">
 <title>1bit OS - chat</title>
@@ -67,14 +70,20 @@
 <script>
 (function () {
   var p = new URLSearchParams(location.search);
-  var api = (p.get("api") || "http://127.0.0.1:13305").replace(/\/+$/, "");
+  // same origin by default: the server that served this page IS the proxy that holds the key
+  var api = (p.get("api") || "").replace(/\/+$/, "");
   var model = p.get("model") || "";
   var q = document.getElementById("q"), out = document.getElementById("out"), stat = document.getElementById("stat");
   var go = document.getElementById("go"), ui = document.getElementById("uibtn");
-  var key = p.get("key") || localStorage.getItem("lemonade_api_key") || "";
-  if (p.get("key")) localStorage.setItem("lemonade_api_key", p.get("key"));
-  ui.href = api + "/";
-  document.getElementById("srv").textContent = api;
+  // an old ?key= link keeps working, but the secret is taken out of the address bar immediately (no history entry
+  // to read it from, nothing for a screen recording to catch). New launchers do not use it at all.
+  var key = p.get("key") || "";
+  if (p.get("key") || p.get("api")) {
+    try { history.replaceState({}, "", location.pathname); } catch (e) {}
+  }
+  ui.href = "http://127.0.0.1:13305/";
+  ui.title = "Lemonade's own web UI asks for the API key (console menu item 1 shows it)";
+  document.getElementById("srv").textContent = api || (location.origin + " (Lemonade key held here)");
   var host = location.hostname || "this machine";
   document.getElementById("who").textContent = "chat on " + host + (model ? " / " + model : "");
   var busy = false;
@@ -116,7 +125,7 @@
                                max_tokens: 512, temperature: 0, stream: true })
       });
     }).then(function (r) {
-      if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf)"); }
+      if (r.status === 401) { throw new Error("401 - the API key is wrong or missing (this image mints one in /etc/1bit/lemond.conf, and only 1bit-webapp-proxy on :8080 can use it)"); }
       if (!r.ok) { throw new Error("HTTP " + r.status); }
       var reader = r.body.getReader(), dec = new TextDecoder(), buf = "";
       function pump() {

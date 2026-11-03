@@ -161,7 +161,10 @@ def qwen35_model(d):
     cfg = {"architectures": ["Qwen3_5ForConditionalGeneration"], "model_type": "qwen3_5",
            "text_config": {"hidden_size": H, "num_hidden_layers": 2, "vocab_size": 8,
                            "linear_num_value_heads": NVH, "linear_key_head_dim": KHD,
-                           "linear_value_head_dim": VHD, "linear_conv_kernel_dim": CK}}
+                           "linear_value_head_dim": VHD, "linear_conv_kernel_dim": CK,
+                           # the gated-attention geometry: q_proj is [2*NH*HD, H] and its rows are
+                           # per-head [q_h | gate_h] in the source, block-wise in the container
+                           "num_attention_heads": 2, "head_dim": H // 2, "attn_output_gate": True}}
     json.dump(cfg, open(os.path.join(d, "config.json"), "w"))
     open(os.path.join(d, "tokenizer.json"), "w").write("{}")
     return {"dir": d, "weights": weights, "A_log": A_log, "dt_bias": dt_bias,
@@ -361,6 +364,33 @@ def main():
               "the transform-forced F32 tensor stays F32 under --dtype bf16")
         check(kinds.get("model.layers.0.mlp.gate_proj.weight") == "BF16",
               "a tileable projection is BF16 under --dtype bf16")
+        # ---- attn_output_gate: the q_proj rows are DE-INTERLEAVED, because the forward's fused QKV is
+        #      [q block | gate block | k | v] while HF stores [q_h | gate_h] per head.  Measured on the
+        #      real d3 pack (engine#796): engine q vs HF q cos 0.077, vs the block reading 0.999992.
+        dt2, d2 = read_q4nx(os.path.join(qexact, "model.q4nx"))
+        ent = dt2["model.layers.1.self_attn.q_proj.weight"]
+        lo, hi = ent["data_offsets"]
+        gotq = Q.from_bf16(np.frombuffer(d2[lo:hi], dtype=np.uint16)).reshape(2 * H, H)
+        srcq = bf16r(q["weights"]["language_model.layers.1.self_attn.q_proj.weight"]).reshape(2, 2, H // 2, H)
+        want = np.concatenate([srcq[:, 0], srcq[:, 1]], axis=0).reshape(2 * H, H)
+        check(np.array_equal(gotq, want), "q_proj rows are [q block | gate block]")
+        check(not np.array_equal(gotq, srcq.reshape(2 * H, H)),
+              "the rows are NOT the source's per-head [q_h | gate_h] order")
+        check("de-interleaved per head" in r7b.stdout, "the converter says it reordered the rows")
+
+        # ---- a config that declares the gate but not the geometry is refused, not guessed
+        bad = os.path.join(tmp, "hf_qwen35_nogate_geom")
+        os.makedirs(bad, exist_ok=True)
+        for n in os.listdir(q["dir"]):
+            if n != "config.json":
+                os.symlink(os.path.join(q["dir"], n), os.path.join(bad, n))
+        cfg = json.load(open(os.path.join(q["dir"], "config.json")))
+        del cfg["text_config"]["head_dim"]
+        json.dump(cfg, open(os.path.join(bad, "config.json"), "w"))
+        rb = run("pack", bad, os.path.join(tmp, "q4nx_nogate_geom"))
+        check(rb.returncode != 0 and "attn_output_gate" in (rb.stderr + rb.stdout),
+              "attn_output_gate without num_attention_heads/head_dim is refused by name")
+
         v7b = run("verify", q["dir"], qexact)
         check(v7b.returncode == 0, f"verify accepts the bf16 container (out: {v7b.stdout[-300:]})")
 

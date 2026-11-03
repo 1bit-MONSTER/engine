@@ -59,10 +59,22 @@ DeepSeek V4.x, GLM 5.x and Qwen3.8-Flash-Next run on **HRX** here, and the catal
 | engine | `bcb28cc8f57387865ecdbe744a7e3cdcf65eb7ad` |
 | HRX (llama.cpp fork, ggml-hrx) | `4a58da9b087d` |
 | hrx-system | `82804197bcbe` |
-| HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`) |
+| HRX toolchain (ROCm/TheRock SDK) | `10.3.0a20261031`, `gfx1151` (`config/hrx-toolchain.config`), HSA runtime `21a6682452e159cf…` |
 | Lemonade Server | `2026.46.0~1.ef0f3b49` (our fork, the `onebit` recipe) |
 | kernel in the image | `7.3.0-rc4-1bit-perfopt` (IOMMU PerfOpt backports, MOK-signed) |
 | NPU kernel sets | 3 sealed sets, 30 kernels, every manifest signed |
+
+The pinned toolchain's HSA runtime, so a bump is a diff here and a wrong runtime is visible
+without a GPU (`scripts/fetch-rocm-sdk.sh --check` prints the tree; the engine's first HRX backend
+logs this same file and digest — `docs/hrx.md`, "The HSA runtime"):
+
+| what | value |
+|---|---|
+| `libhsa-runtime64.so.1` in `rocm-sdk-10.3.0a20261031-gfx1151` | 5,141,585 B, sha256 `21a6682452e159cfcdc6bdc84676f6b7f9c1236f3a2957a97a2e7170889cdfa3` |
+| measured capabilities, Strix Halo `gfx1151` (rocminfo from the pinned tree, 2026-11-03) | `XNACK enabled: NO`, `Coherent Host Access: FALSE`, `Memory Properties: APU`, Runtime Version 1.22, System Timestamp Freq. 1000 MHz |
+
+That runtime is the one a dev tree must use: the release-shipped copy does not register `HRX0` for a
+dev build, and a distro `libhsa-runtime64` is untested (engine#713's acceptance table).
 
 The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
 `<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —

@@ -84,6 +84,15 @@ net=(-netdev user,id=n0,hostfwd=tcp:127.0.0.1:"$hostport"-:13305,hostfwd=tcp:127
      -device virtio-net-pci,netdev=n0)
 case $iso in
 *.img)
+    # Cycle 17 (pi-release, 3 Nov 10:4x): the artifact that gets handed off must NOT be the file this harness
+    # boots. A boot writes to the image (a journal, /data, the minted API key), so the sha256 published in a
+    # hand-off stops being the sha256 on disk the moment a VM has touched it - measured exactly that way: an
+    # image was hashed, then booted here, and the gate was right to refuse the pair. Boot a COPY, always.
+    bootimg=$work/artifact-under-test.img
+    if [ "$(cd "$(dirname "$iso")" && pwd -P)/$(basename "$iso")" != "$bootimg" ]; then
+        cp --sparse=always "$iso" "$bootimg" || { echo "$prog: cannot copy $iso for the boot" >&2; exit 2; }
+        echo "INFO artifact      booting a copy ($bootimg); the hand-off file $iso is left untouched"
+    fi
     # the shipped artifact: firmware boots the ESP, grub reads the data partition. With Secure Boot on and
     # this machine's certificate enrolled, an unsigned kernel stops at grub exactly as it did on the board.
     "$(dirname "$0")/sb-vars.sh" "$work/OVMF_VARS_SB.fd" > "$work/sb-vars.txt" 2>&1 || {
@@ -93,7 +102,7 @@ case $iso in
         exit 2; }
     grep -E '^   ' "$work/sb-vars.txt"
     # shellcheck disable=SC2054  # same: commas belong to the qemu arguments
-    boot=(-drive file="$iso",format=raw,if=none,id=d0 -device qemu-xhci -device usb-storage,drive=d0
+    boot=(-drive file="$bootimg",format=raw,if=none,id=d0 -device qemu-xhci -device usb-storage,drive=d0
           -drive if=pflash,format=raw,readonly=on,file=/usr/share/OVMF/OVMF_CODE_4M.secboot.fd
           -drive if=pflash,format=raw,file="$work/OVMF_VARS_SB.fd"
           -machine q35,smm=on -global driver=cfi.pflash01,property=secure,value=on)
@@ -109,7 +118,10 @@ esac
 # the VM is stopped here by name instead of being left to its timeout. Three runs once overlapped and the
 # next one could not even open its image ("Failed to get write lock"), while the previous VM still held the
 # port the host probe was aimed at.
-vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$iso" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
+# the pattern has to name the file qemu was actually given: with the .img branch booting a copy, matching on
+# $iso would find nothing and leave the VM holding its image and its forwarded ports until its own timeout.
+qemuimg=${bootimg:-$iso}
+vmqemu() { for p in $(pgrep -f "qemu-system-x86_64 -m.*$qemuimg" 2> /dev/null); do kill "$p" 2> /dev/null; done; }
 ( timeout "$secs" systemd-run --user --scope -q -p MemoryMax=6G -- \
     qemu-system-x86_64 -m 4096 -smp 4 "${boot[@]}" -display none -vga std -no-reboot \
     "${net[@]}" -serial unix:"$work/ser",server,nowait ) > "$work/qemu.out" 2>&1 &
@@ -409,6 +421,44 @@ rows = [
     ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "
                      "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
                      "/tmp/menu-self.txt | tr '\\n' ' '", "selftest-rc=0"),
+    # Cycle 17 item 4: the menu's probes run with Lemonade's environment, and no line is cut in the middle of a
+    # word (the c16 board showed "firmware prese"). Both are read off the shipped script and its own status
+    # block, so an edit that drops either is a red row rather than a nicer-looking menu.
+    ("U2 menu env", "grep -c 'libhsa.env' /usr/local/bin/1bit-console-menu; "
+                     "1bit-console-menu --status | awk 'length($0) > 78 {print \"long-line:\" $0}'; "
+                     # the c16 board's line was cut mid-word ("firmware prese"): the whole words must be there
+                     "1bit-console-menu --status | grep -q 'firmware present' && echo lines-whole || echo truncated",
+                     "lines-whole"),
+    # Cycle 17 item 8: the key is not in the page or its URL, and the same-origin proxy still answers WITH it.
+    # 401 direct on 13305 is the other half: the key is still enforced where it matters.
+    # (the page's own text mentions "?key=" in a comment, so the count is of a KEY-SHAPED value, not of the word)
+    ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -Ec 'key=[0-9a-f]{16,}'); "
+                     "a=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/models); "
+                     "b=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
+                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
+                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
+                     "webapp-key-not-in-url"),
+    # Cycle 17 item 3: the appliance's name is /etc/hostname, not the DHCP server's opinion - connman's
+    # AllowHostnameUpdates defaults to true, which is the one path a name nobody typed can take.
+    ("U1 hostname pin", "grep -n '^AllowHostnameUpdates' /etc/connman/main.conf; "
+                     "grep -q '^AllowHostnameUpdates = false' /etc/connman/main.conf && echo hostname-dhcp-pinned",
+                     "hostname-dhcp-pinned"),
+    # Cycle 17 item 2: the boot's evidence is on the DATA partition, not in RAM.
+    ("U3 boot logs", "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
+                     "ls /data/logs/*/dmesg.log > /dev/null 2>&1 && grep -q cmdline /data/logs/*/BOOT && "
+                     "echo boot-logs-on-data", "boot-logs-on-data"),
+    # Cycle 17 item 1: menu item 6 can never reset the machine - the guard is built and a reboot THROUGH it is
+    # refused, which is the same call xwin's exit path makes (`exec reboot`) and the WM's shutdown menu makes.
+    ("U2 desktop safe", "1bit-desktop --check | tail -3; 1bit-desktop --guard-test 2>&1 | tail -2",
+                     "reboot-refused"),
+    # Cycle 17 item 9: the desktop's first run is preset (zone, no Quick Setup, the browser's default-browser
+    # prompt off) and the chat screen has a startup hook Puppy actually runs.
+    ("U2 desktop preset", "cat /etc/timezone; readlink /etc/localtime; date; ls /etc/personal_settings_popup_disabled "
+                     "/root/Startup/1bit-lemonade-webapp /etc/1bit/palemoon-prefs.js 2>&1; "
+                     "grep -c checkDefaultBrowser /etc/1bit/palemoon-prefs.js; "
+                     "grep -c 'defaults/pref/1bit-os.js' /usr/local/bin/1bit-lemonade-webapp; "
+                     "[ \"$(readlink /etc/localtime)\" = /usr/share/zoneinfo/America/Moncton ] && "
+                     "echo desktop-preset-ok", "desktop-preset-ok"),
     ("U1 sudo",      "id -un; sudo -n id -un 2>&1 | tail -2", "root"),
     # the wanted string must be evidence of an INSTALL, not the word appearing in an error: the previous
     # version matched "Unable to locate package neofetch" and reported a pass (measured 2026-11-02)

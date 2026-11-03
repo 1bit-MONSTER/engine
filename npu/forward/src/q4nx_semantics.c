@@ -211,9 +211,13 @@ int q4nx_semantics_from_config(const char* json_path, const char* model_dir,
                           strstr(arch, "Gemma4") != NULL;
     const int is_qwen3 = starts_with(model_type, "qwen3") || starts_with(arch, "Qwen3");
     const int is_phi = starts_with(model_type, "phi") || starts_with(arch, "Phi");
+    const int is_qwen35 = starts_with(model_type, "qwen3_5") || starts_with(arch, "Qwen3_5");
 
     /* RMSNorm convention: gemma2/gemma3 scale by (1 + w); gemma4 by w. */
     s->rmsnorm_offset = (is_gemma && !is_gemma4) ? 1 : 0;
+    /* qwen3_5 ships both conventions under the same model_type, so the forward resolves it from the
+     * layer-0 input_layernorm weight it loads (a config-only answer would be a guess). */
+    s->rmsnorm_offset_probe = (is_qwen35 && !is_gemma) ? 1 : 0;
 
     /* per-head q/k RMSNorm: qwen3* and gemma* have q_norm/k_norm; llama/phi do not */
     s->qk_norm = (is_qwen3 || is_gemma) ? 1 : 0;
@@ -421,6 +425,19 @@ int q4nx_config_int(const char* json_path, const char* key, int def) {
 
 int q4nx_semantics_uses_ple(const Q4nxSemantics* s) {
     return s && s->hidden_size_per_layer_input > 0;
+}
+
+int q4nx_rmsnorm_offset_from_norm(const float* w, int n) {
+    if (!w || n <= 0) return 0;
+    double sum = 0.0;
+    float mn = w[0];
+    for (int i = 0; i < n; i++) {
+        sum += (double)w[i];
+        if (w[i] < mn) mn = w[i];
+    }
+    /* A (1 + w) checkpoint's norm weight is a delta trained from 0, so it carries negatives and a mean
+     * well under 1; a plain norm weight is a gain trained from 1. Either signal alone is enough. */
+    return (mn < 0.0f || (sum / (double)n) < 0.5) ? 1 : 0;
 }
 
 int q4nx_semantics_linear_layers(const Q4nxSemantics* s) {

@@ -583,6 +583,54 @@ else
     skip chat-npu "no onebit NPU entry is listed by Lemonade, so there is nothing to ask"
 fi
 
+# ── NPU chat, the row a single short prompt cannot see (engine#911) ─────────────────────────────
+# chat-npu above is ONE short non-streaming request, and that is why this gate was green on the stick
+# whose demo failed: the failure was a *streamed* request that was the second prompt of a session (a
+# long one had just run), and it reached the user as "0 chunks in 5.9 s" plus a kernel TDR. So this row
+# runs the demo's shape on the same entry -- a long prompt, then a short follow-up, both streamed -- and
+# it counts the reasoning chunks a page that renders only delta.content throws away (on the board the
+# first answer was 367 reasoning chunks and 134 content ones, so the visible text read as truncated).
+# It also reads the kernel log across the row: an amdxdna TDR during it fails the row, whatever the
+# text said. The TDR count is taken after the rows above so it covers only this one.
+sse() {  # sse <body-file> -> the SSE body on stdout, capped so a hung backend cannot stall the check
+    if command -v curl >/dev/null 2>&1; then
+        curl -sN --connect-timeout 5 --max-time 90 -H 'Content-Type: application/json'             --header "Authorization: Bearer $KEY" --data-binary "@$1" "$API/api/v1/chat/completions" 2>/dev/null
+    else
+        wget -q -T 90 -t 1 -O - --header='Content-Type: application/json'             --header="Authorization: Bearer $KEY" --post-file="$1" "$API/api/v1/chat/completions" 2>/dev/null
+    fi
+}
+tdr_now() { dmesg 2>/dev/null | grep -c 'TDR timeout detected' 2>/dev/null || true; }
+if ! ls /dev/accel/accel* >/dev/null 2>&1; then
+    skip chat-npu-turn "no /dev/accel/accel*: this machine has no NPU"
+elif [ -z "$NPU" ]; then
+    skip chat-npu-turn "no onebit NPU entry is listed by Lemonade"
+else
+    TDR_BEFORE=$(tdr_now)
+    TURNLONG=/tmp/rc-npu-long.json
+    TURNSHORT=/tmp/rc-npu-short.json
+    printf '%s' '{"model":"'"$NPU"'","messages":[{"role":"user","content":"Explain in one paragraph why the ocean is salty. Start with the weathering of continental rock and the ions that rivers carry to the sea, then mention hydrothermal vents at mid-ocean ridges, the long residence time of sodium compared with water, and why the ocean has not simply filled up with salt over geological time."}],"max_tokens":512,"temperature":0,"stream":true}' > "$TURNLONG"
+    printf '%s' '{"model":"'"$NPU"'","messages":[{"role":"user","content":"In one short sentence, what is the capital of France?"}],"max_tokens":128,"temperature":0,"stream":true}' > "$TURNSHORT"
+    LONGOUT=$(sse "$TURNLONG")
+    LONGC=$(printf '%s' "$LONGOUT" | grep -o '"content":"' | wc -l | tr -d ' ')
+    LONGR=$(printf '%s' "$LONGOUT" | grep -o '"reasoning_content":"' | wc -l | tr -d ' ')
+    SHORTOUT=$(sse "$TURNSHORT")
+    SHORTC=$(printf '%s' "$SHORTOUT" | grep -o '"content":"' | wc -l | tr -d ' ')
+    SHORTR=$(printf '%s' "$SHORTOUT" | grep -o '"reasoning_content":"' | wc -l | tr -d ' ')
+    SHORTANSWER=$(printf '%s' "$SHORTOUT" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | tr -d '\n' | head -c 80)
+    TDR_AFTER=$(tdr_now)
+    if [ -z "$SHORTOUT" ]; then
+        fail chat-npu-turn "the follow-up streamed nothing at all (long prompt: ${LONGC} content / ${LONGR} reasoning)"
+    elif [ "$SHORTC" -eq 0 ]; then
+        fail chat-npu-turn "the follow-up streamed $SHORTR reasoning chunks and no content: a chat page that renders only delta.content shows nothing (engine#911). Long prompt: ${LONGC} content / ${LONGR} reasoning"
+    elif [ -n "$TDR_BEFORE" ] && [ -n "$TDR_AFTER" ] && [ "$TDR_AFTER" != "$TDR_BEFORE" ]; then
+        fail chat-npu-turn "the NPU raised a TDR during the row ($TDR_BEFORE -> $TDR_AFTER); the answer itself was \"$SHORTANSWER\""
+    elif [ -z "$TDR_BEFORE" ]; then
+        pass chat-npu-turn "long prompt then follow-up streamed ($LONGC content / $LONGR reasoning, then $SHORTC content / $SHORTR reasoning, \"$SHORTANSWER\"); kernel log not readable, so no TDR assertion"
+    else
+        pass chat-npu-turn "long prompt then follow-up streamed ($LONGC content / $LONGR reasoning, then $SHORTC content / $SHORTR reasoning, \"$SHORTANSWER\"), no new TDR"
+    fi
+fi
+
 # ── lemonade bench, one chat-short row on the default model ─────────────────────────────────────
 BENCH=$LEMDIR/bin/lemonade
 if [ ! -x "$BENCH" ]; then

@@ -39,7 +39,13 @@
 # A kernel bump: build/obtain the kernel .deb tree, run this again with the new <kver>, drop the new
 # tarball in kernel-kit/output, rebuild. No other file changes, which is what makes the bump a script.
 #
-# Exit: 0 ok, 1 usage, 2 refused (a module for another kernel, or an unsigned one), 3 a tool is missing.
+# The image must be SIGNED (`sign-vmlinuz.sh`, with the machine's enrolled MOK): with Secure Boot on, GRUB's
+# shim_lock verifier refuses an unsigned kernel and the appliance stops before init - measured on the board
+# on 2 Nov ("error: bad shim lock signature"). Nothing else in the chain checks this, and a `-kernel` QEMU
+# boot cannot show it, so it is refused here.
+#
+# Exit: 0 ok, 1 usage, 2 refused (a module for another kernel, an unsigned one, or an unsigned kernel
+# image), 3 a tool is missing.
 set -euo pipefail
 prog=mk-huge-kernel
 die() { printf '%s: REFUSED: %s\n' "$prog" "$*" >&2; exit 2; }
@@ -59,7 +65,7 @@ while [ $# -gt 0 ]; do
     esac
 done
 
-for t in mksquashfs depmod file tar zstd find; do
+for t in mksquashfs unsquashfs depmod file tar zstd find sbverify; do
     command -v "$t" >/dev/null 2>&1 || { printf '%s: %s is missing\n' "$prog" "$t" >&2; exit 3; }
 done
 
@@ -79,6 +85,12 @@ fi
 imgkver=$(file -b "$stage/boot/vmlinuz-$kver" | sed -n 's/.*version \([^ ]*\) .*/\1/p' | head -n 1 || true)
 [ -z "$imgkver" ] || [ "$imgkver" = "$kver" ] ||
     die "$stage/boot/vmlinuz-$kver is $imgkver, not $kver: the image and the modules are different kernels"
+
+# Secure Boot: the image has to carry a signature, and this is the last place that can say so before the
+# appliance ships. sbverify prints one ` - <subject>` line per issuer under "image signature issuers".
+imgsig=$(sbverify --list "$stage/boot/vmlinuz-$kver" 2> /dev/null | sed -n 's/^ - //p' | head -n 1)
+[ -n "$imgsig" ] ||
+    die "$stage/boot/vmlinuz-$kver is unsigned: with Secure Boot on GRUB refuses it (sign-vmlinuz.sh)"
 
 # every out-of-tree module must be this kernel's and signed, or the appliance boots without the NPU and
 # without its fans (the os/mini/mkimage.sh lesson, asserted here for the Puppy zdrv)
@@ -102,43 +114,51 @@ out=$(cd "$out" && pwd)
 work=$(mktemp -d)
 trap 'rm -rf "$work"' EXIT
 tree=$work/zdrv
-mkdir -p "$tree/lib/modules" "$tree/lib/firmware" "$tree/etc/1bit"
+# WHERE the tree goes matters more than it looks. Ubuntu 26.04 is usrmerged and the built puppy SFS carries
+# `/lib -> usr/lib` as a symlink (measured with unsquashfs -ll on cycle 4's puppet SFS), so a zdrv that puts
+# modules at /lib/modules/<kver> stacks under a symlink and is invisible in the running system: measured in
+# a booted appliance image, `ls /lib/modules/<kver>` said "No such file or directory" and `modprobe
+# virtio_net`/`e1000` said "not found in directory", so no module at all could load - no NIC, no amdgpu, no
+# NPU. Usrmerge layout plus a `lib -> usr/lib` link of our own is what makes both paths resolve.
+libroot=${ZDRV_LIBROOT:-usr/lib}
+mkdir -p "$tree/$libroot/modules" "$tree/$libroot/firmware" "$tree/etc/1bit"
+ln -sfn usr/lib "$tree/lib"   # for depmod and anything that still asks for /lib directly
 
 echo "== the modules ($kver)"
 # the tree without build/ and source/: those are symlinks to a headers tree the appliance does not carry,
 # and on a box where the headers have been removed they dangle and stop the copy
-mkdir -p "$tree/lib/modules/$kver"
+mkdir -p "$tree/$libroot/modules/$kver"
 tar -C "$stage/lib/modules/$kver" --exclude=./build --exclude=./source -cf - . |
-    tar -C "$tree/lib/modules/$kver" -xf -
+    tar -C "$tree/$libroot/modules/$kver" -xf -
 # modules.dep for this tree from this tree, so the depmod that Puppy's boot would otherwise need is done
 # once, at build time, and a missing dependency is a build error instead of a boot error
 if [ -f "$stage/boot/config-$kver" ]; then
-    mkdir -p "$work/lib/modules/$kver"
-    ln -sfn "$tree/lib/modules/$kver" "$work/lib/modules/$kver" 2>/dev/null || true
+    mkdir -p "$work/$libroot/modules"
     depmod -b "$tree" "$kver" 2>/dev/null || depmod -b "$tree" 2>/dev/null || true
 fi
 # Ubuntu ships its modules compressed (this kernel: .ko.xz, 3819 of them, measured); ours in updates/ are
 # not. The kernel's own module decompressor handles both, so the count and the checks take '*.ko*'.
-mods=$(find "$tree/lib/modules/$kver" -name '*.ko*' | wc -l)
+mods=$(find "$tree/$libroot/modules/$kver" -name '*.ko*' | wc -l)
 [ "$mods" -gt 1000 ] || printf '%s: note: only %s modules in the zdrv (a kernel package normally carries more)\n' "$prog" "$mods"
 
 echo "== the firmware ($firmware)"
 for d in $firmware; do
     if [ -d "/lib/firmware/$d" ]; then
-        mkdir -p "$tree/lib/firmware/$d"
-        cp -aL "/lib/firmware/$d/." "$tree/lib/firmware/$d/"
-        printf '   /lib/firmware/%s  %s\n' "$d" "$(du -sh "$tree/lib/firmware/$d" | cut -f1)"
+        mkdir -p "$tree/$libroot/firmware/$d"
+        cp -aL "/lib/firmware/$d/." "$tree/$libroot/firmware/$d/"
+        printf '   %s/firmware/%s  %s\n' "$libroot" "$d" "$(du -sh "$tree/$libroot/firmware/$d" | cut -f1)"
     else
         printf '%s: note: no /lib/firmware/%s on this build machine\n' "$prog" "$d" >&2
     fi
 done
-[ -n "$(ls -A "$tree/lib/firmware")" ] || printf '%s: note: the zdrv carries no firmware\n' "$prog" >&2
+[ -n "$(ls -A "$tree/$libroot/firmware")" ] || printf '%s: note: the zdrv carries no firmware\n' "$prog" >&2
 
 # what the machine is: release-check's `kernel` row and a human read this
 {
     echo "# Written by os/v3/puppy/mk-huge-kernel.sh"
     echo "kver=$kver"
     echo "image=$(sha256sum "$stage/boot/vmlinuz-$kver" | cut -d' ' -f1)"
+    echo "image_signer=$imgsig"
     echo "modules=$mods"
     echo "firmware=$firmware"
     for ko in "$updates"/*.ko "$updates"/*.ko.zst; do
@@ -150,11 +170,23 @@ done
 cp "$stage/boot/vmlinuz-$kver" "$out/vmlinuz-$kver"
 echo "== the zdrv"
 rm -f "$out/kernel-modules-zdrv-$kver.sfs"
-# xz like the distribution's own zdrv (DISTRO_SPECS SFS compression), noappend so a re-run replaces it
-mksquashfs "$tree" "$out/kernel-modules-zdrv-$kver.sfs" -comp xz -noappend -no-progress >/dev/null
+# xz like the distribution's own zdrv (DISTRO_SPECS SFS compression), noappend so a re-run replaces it.
+# -all-root is a security fix, not tidiness (pi-prs on cycle 15): this script builds the tree on the build machine
+# as an ordinary user, so without it every one of the ~5300 module files is owned by uid/gid 1000 - and uid 1000 is
+# `ftp` inside the image, so anyone in that group could plant a .ko that root's modprobe then loads. Measured on the
+# cycle-15 artifact: the whole zdrv was bcloud/bcloud. mksquashfs keeps ownership unless told otherwise.
+mksquashfs "$tree" "$out/kernel-modules-zdrv-$kver.sfs" -comp xz -noappend -no-progress -all-root >/dev/null
+# the SFS is root-owned inside itself, but the tar header would still carry this user's uid to the next unpacker
+nonroot=$(unsquashfs -ll "$out/kernel-modules-zdrv-$kver.sfs" 2>/dev/null |
+    awk -F'[ \t]+' 'NR > 1 && $2 != "root/root" {n++} END {print n + 0}')
+[ "${nonroot:-1}" = 0 ] || {
+    echo "$prog: REFUSED: the zdrv carries $nonroot entries that are not root/root (a module owned by uid 1000 is loadable root code)" >&2
+    exit 1; }
+echo "   every zdrv entry is root/root"
 echo "== the kernel package"
 rm -f "$out/huge-$kver.tar.zst"
-tar -C "$out" --zstd -cf "$out/huge-$kver.tar.zst" "vmlinuz-$kver" "kernel-modules-zdrv-$kver.sfs"
+tar -C "$out" --zstd --owner=0 --group=0 -cf "$out/huge-$kver.tar.zst" \
+    "vmlinuz-$kver" "kernel-modules-zdrv-$kver.sfs"
 printf '%s: vmlinuz-%s %s, zdrv %s, huge-%s.tar.zst %s (%s modules, firmware: %s)\n' \
     "$prog" "$kver" "$(du -h "$out/vmlinuz-$kver" | cut -f1)" \
     "$(du -h "$out/kernel-modules-zdrv-$kver.sfs" | cut -f1)" "$kver" \

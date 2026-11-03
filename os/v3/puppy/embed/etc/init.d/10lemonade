@@ -1,0 +1,96 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/10lemonade - 1bit OS's server, started at boot.
+#
+# The contract is Puppy's, not systemd's (measured in a built resolute64 rootfs): /etc/rc.d/rc.services
+# runs every EXECUTABLE script in /etc/init.d with `start` at boot and `stop` at shutdown, so this file
+# has to be executable and nothing else registers it. (Ubuntu packages ship 295 files under
+# /lib/systemd/system in that rootfs, but nothing reads them: PID 1 is not systemd.)
+#
+# What it starts is the release package's own launcher, which resolves lemond/the engine BESIDE ITSELF
+# (LEMONADE_ONEBIT_BIN defaults to $here/1bit/1bit), so the whole package lives in one directory and
+# nothing has to be on PATH. The two pieces of configuration:
+#   /etc/1bit/lemond.conf   LEMONADE_API_KEY=... (mode 600) - minted at build time, or here on first boot
+#   /etc/1bit/libhsa.env    optional; what the release build pins for HRX (v2's lemond unit used the same
+#                           file as its EnvironmentFile, so an image built for v2 stays valid)
+LEMONADE_ONEBIT=/opt/1bit-package/lemond-onebit
+CONF=/etc/1bit/lemond.conf
+ENVFILE=/etc/1bit/libhsa.env
+LOG=/var/log/lemond-onebit.log
+PORT=13305
+PIDFILE=/run/lemond-onebit.pid
+
+start() {
+    [ -x "$LEMONADE_ONEBIT" ] || { echo "10lemonade: $LEMONADE_ONEBIT is missing, nothing to start" >&2; return 0; }
+    # the NPU driver wants unlimited locked pages and there is no systemd LimitMEMLOCK= here
+    ulimit -l unlimited 2>/dev/null
+    # shellcheck disable=SC1090  # the release build pins what HRX needs; the file may not exist
+    if [ -f "$ENVFILE" ]; then . "$ENVFILE"; fi
+    # engine#867: mint on "there is no KEY", not on "there is no file". A file that exists but is empty - an older
+    # image pre-created one, and prepare-stick writes it - left the key unset, and lemond then serves every
+    # endpoint including /internal/* to the whole LAN (zz-onboard-ports opens 13305 on purpose). Measured on a
+    # dd-written stick: 0-byte file, 200 without an Authorization header, second boot identical.
+    key=$(sed -n 's/^LEMONADE_API_KEY=//p' "$CONF" 2> /dev/null | head -1)
+    if [ -z "$key" ]; then
+        mkdir -p /etc/1bit 2> /dev/null
+        key=$(head -c 24 /dev/urandom | od -An -tx1 | tr -d ' \n')
+        if printf 'LEMONADE_API_KEY=%s\n' "$key" > "$CONF" 2> /dev/null; then
+            chmod 600 "$CONF" 2> /dev/null
+            echo "10lemonade: minted an API key in $CONF"
+        else
+            key=
+            echo "10lemonade: cannot write $CONF - Lemonade will serve loopback only" >&2
+        fi
+    fi
+    # a shipped file may carry more than the key (v2's unit read the same path as an EnvironmentFile)
+    # shellcheck disable=SC1090  # the file is the appliance's own env file
+    if [ -s "$CONF" ]; then . "$CONF"; fi
+    key=${LEMONADE_API_KEY:-$key}
+    export LEMONADE_API_KEY="$key"
+    # Where Lemonade keeps its state is os/mini's data contract: /data/lemonade/{cache,config}, so the
+    # catalogue, downloaded backends and the HRX JIT cache survive a reboot. Without a data partition it
+    # lives in RAM and says so, rather than pretending to persist.
+    if grep -q " /data " /proc/mounts 2> /dev/null; then
+        LEM=/data/lemonade
+        export GGML_HRX_JIT_CACHE_DIR=/data/cache/hrx-jit
+    else
+        LEM=/var/lib/lemonade
+        echo "10lemonade: no /data partition: Lemonade state is in RAM, nothing persists"
+    fi
+    mkdir -p "$LEM/cache" "$LEM/config"
+    # lemond's positionals are cache_dir config_dir (lemond --help); the rest are the runtime overrides
+    # engine#867 second half: with no key there is nothing between the LAN and Lemonade's control endpoints, so the
+    # fallback is loopback (the console menu and ssh still reach it) rather than 0.0.0.0 plus a warning nobody reads.
+    host=0.0.0.0
+    [ -n "$key" ] || host=127.0.0.1
+    "$LEMONADE_ONEBIT" "$LEM/cache" "$LEM/config" --port "$PORT" --host "$host" >> "$LOG" 2>&1 &
+    echo $! > "$PIDFILE"
+    echo "10lemonade: started (pid $(cat "$PIDFILE"), :$PORT, log $LOG)"
+}
+
+stop() {
+    [ -f "$PIDFILE" ] && kill "$(cat "$PIDFILE")" 2>/dev/null
+    rm -f "$PIDFILE"
+}
+
+case ${1:-start} in
+start) start ;;
+stop) stop ;;
+restart) stop; sleep 1; start ;;
+status) [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE")" 2>/dev/null && echo running || echo stopped ;;
+*) echo "usage: $0 {start|stop|restart|status}" >&2; exit 2 ;;
+esac

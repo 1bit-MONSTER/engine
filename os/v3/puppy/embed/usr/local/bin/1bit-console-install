@@ -1,0 +1,152 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# 1bit-console-install [--list] [--check /dev/DISK]
+#
+# The guarded console front end the "Install 1bit OS to a disk" GRUB entry runs on the appliance's own
+# system (owner, 2026-11-02 ~19:5x: "also should have options to install also"). It does no partitioning
+# itself: 1bit-install writes the disk and already refuses the device this boot came from. What this adds
+# is the part a person at a console needs, and the part that stops an accident:
+#
+#   * the candidate disks, with model and size, so the choice is made against hardware and not a letter;
+#   * the disk this boot came from, refused by name - before anything is typed into 1bit-install, so a
+#     mistyped confirmation cannot reach the installer with the stick's own device;
+#   * an exact-name confirmation (the whole device name, not "y"), because the next step erases a disk.
+#
+# Usage (root, from the GRUB entry or by hand):
+#   1bit-console-install                    list, refuse the boot disk, type the device to confirm, install
+#   1bit-console-install --list             the candidates, one per line, boot disk marked (no prompt)
+#   1bit-console-install --check /dev/sdX   the guard only: exit 0 if it would be offered, 2 if refused
+#
+# Exit: 0 installed (or --check allowed), 1 usage/cancelled, 2 refused (nothing written), 3 1bit-install failed.
+set -u
+
+say() { printf '%s\n' "$*"; }
+INSTALL=/usr/local/bin/1bit-install
+
+# The device this system booted from: /data is mounted from the boot partition by /etc/init.d/05onboard-data,
+# and on a boot where it is not mounted yet the partition is still named. Both answers go through lsblk, so
+# an nvme partition (/dev/nvme0n1p2) names its disk (/dev/nvme0n1) and a stick (/dev/sda2) names /dev/sda.
+boot_disk() {
+    p=$(awk '$2 == "/data" { print $1; exit }' /proc/mounts 2> /dev/null)
+    # no /data (a boot that could not mount it) or not root: any block device in /proc/mounts will do, which
+    # is what a hand-mounted partition of this same disk looks like - measured on the build box, where
+    # `blkid -L 1BIT-DATA` needs root and the check silently allowed the stick it was booted from.
+    [ "$p" ] || p=$(awk '$1 ~ /^\/dev\/(sd|nvme|mmcblk|vd)/ && $2 != "/" { print $1; exit }' /proc/mounts 2> /dev/null)
+    [ "$p" ] || p=$(blkid -L 1BIT-DATA 2> /dev/null | head -1)
+    [ "$p" ] || return 0
+    d=$(lsblk -no PKNAME "$p" 2> /dev/null | head -1)
+    [ "$d" ] && echo "/dev/$d" || echo "$p"
+}
+
+# Candidates: whole disks only, no loops/zram/rom, and the boot disk is shown with a marker rather than hidden
+# - a person who cannot see the stick in the list types its name and gets a clear refusal instead of a mystery.
+list_disks() {
+    boot=$(boot_disk)
+    lsblk -dpno NAME,SIZE,MODEL 2> /dev/null | while read -r name size model; do
+        case "$name" in
+            /dev/loop* | /dev/zram* | /dev/sr* | /dev/ram*) continue ;;
+        esac
+        if [ "$name" = "$boot" ]; then
+            say "  $name  $size  $model   <- this boot (refused)"
+        else
+            say "  $name  $size  $model"
+        fi
+    done
+}
+
+refused() {   # refused <dev>: 2 when it is the boot disk or not a whole disk, 0 otherwise
+    dev=$1
+    case $dev in
+        /dev/*) ;;
+        *) say "not a device name: '$dev'"; return 2 ;;
+    esac
+    [ -b "$dev" ] || { say "$dev is not a block device"; return 2; }
+    boot=$(boot_disk)
+    if [ "$dev" = "$boot" ]; then
+        say "REFUSED: $dev is the disk this system booted from"
+        return 2
+    fi
+    # a partition (sdX1, nvme0n1p2) is not a target: 1bit-install writes a whole disk
+    if [ "$(lsblk -no TYPE "$dev" 2> /dev/null | head -1)" != disk ]; then
+        say "REFUSED: $dev is not a whole disk"
+        return 2
+    fi
+    # the boot disk by another name: any partition of it that carries 1BIT-DATA
+    for part in $(lsblk -lno NAME "$dev" 2> /dev/null | tail -n +2); do
+        if [ "$(blkid -o value -s LABEL "/dev/$part" 2> /dev/null)" = 1BIT-DATA ]; then
+            say "REFUSED: /dev/$part on $dev carries this system (LABEL=1BIT-DATA)"
+            return 2
+        fi
+    done
+    return 0
+}
+
+case ${1:-} in
+--list)
+    list_disks
+    exit 0
+    ;;
+--check)
+    [ $# -eq 2 ] || { say "usage: $0 --check /dev/DISK"; exit 1; }
+    refused "$2" && exit 0
+    exit 2
+    ;;
+-h | --help)
+    sed -n '/^# 1bit-console-install/,/^# Exit:/p' "$0" | sed 's/^# \{0,1\}//'
+    exit 0
+    ;;
+"") ;;
+*)
+    say "unknown argument '$1' (usage: $0 [--list|--check /dev/DISK])"
+    exit 1
+    ;;
+esac
+
+say ""
+say "1bit OS - install to a disk"
+say ""
+say "This ERASES the disk you name: it writes an EFI system partition and a 1BIT-DATA partition, this"
+say "system's files, and a firmware boot entry. Everything on that disk is lost."
+say ""
+say "Disks:"
+list_disks
+say ""
+boot=$(boot_disk)
+[ "$boot" ] && say "This system booted from ${boot}: it cannot be the target."
+say ""
+say "Type the whole device name of the target (for example /dev/nvme0n1), or q to quit:"
+read -r dev || exit 1
+case ${dev:-} in
+q | Q | quit | "") say "cancelled: nothing written"; exit 1 ;;
+esac
+refused "$dev" || exit 2
+say ""
+say "$dev will be ERASED. Type the device name again to confirm:"
+read -r again || exit 1
+[ "$again" = "$dev" ] || { say "cancelled: '$again' is not '$dev', nothing written"; exit 1; }
+say ""
+say "installing to $dev ..."
+"$INSTALL" "$dev" --yes
+rc=$?
+if [ $rc -eq 0 ]; then
+    say ""
+    say "done: $dev now boots 1bit OS. Remove the stick and reboot; the firmware entry is first in BootOrder."
+else
+    say ""
+    say "1bit-install exited $rc; nothing else was touched (see /tmp/1bit-install.log)"
+fi
+exit $rc

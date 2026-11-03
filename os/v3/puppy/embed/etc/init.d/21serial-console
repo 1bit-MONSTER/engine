@@ -1,0 +1,44 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/21serial-console - a root shell on the serial port, only when the boot line asks for it.
+#
+# The appliance is headless, and the console Puppy leaves you with is tty1: the transcript of a boot goes
+# out on ttyS0, but nothing reads it there, so a machine in a rack with no monitor is unadministrable and
+# an automated VM run cannot type into it. Measured in QEMU: an ISO built from this recipe boots to the
+# quicksetup dialog on tty1 and every byte of the transcript arrives on ttyS0.
+#
+# It is opt-in because a root shell needs no password: append 1bit.serial=1 to the kernel command line
+# (GRUB edit, or the QEMU -append). Without it this script does nothing.
+grep -q '1bit.serial=1' /proc/cmdline 2>/dev/null || exit 0
+# The shell is started with NO readline and TERM=dumb, and that is a fix, not a preference. Cycle 15 measured what
+# readline costs on this wire: bash 5.3's interactive mode toggles bracketed-paste around every prompt
+# (`?2004h`/`?2004l`), and a line that arrives during that toggle is flushed mid-way by the terminal's
+# TCSAFLUSH - the shell then sits at a `>` continuation prompt with an unterminated quote and executes nothing.
+# Over a serial cable that is exactly what an administrator's paste looks like, and it broke the automated row
+# driver: its first row vanished for 180 s and every row after it read one exchange behind.
+# `--noediting` removes readline entirely, so there is nothing to toggle and nothing to flush; TERM=dumb keeps
+# bash's shell-integration escapes off the wire as well. A serial admin shell wants lines, not line editing.
+if [ -x /bin/bash ]; then
+	# -l as well as -i: a login shell is what sources /etc/profile, and Puppy's PATH entries (e.g. /usr/games)
+	# live there. Without it the appliance's serial shell differed from every other login on the box - measured by
+	# the U1 apt-any row, which installed cowsay to /usr/games and then could not see it.
+	setsid sh -c 'TERM=dumb exec /bin/bash --noediting -li < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+else
+	setsid sh -c 'TERM=dumb exec /bin/sh -l < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+fi
+# said on ttyS0 directly: rc.services' stdout at this point is not necessarily the console
+echo "21serial-console: root shell on ttyS0 (1bit.serial=1 on the command line)" > /dev/ttyS0

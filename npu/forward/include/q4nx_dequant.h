@@ -88,13 +88,23 @@ int q4nx_dequant_tensor_chunked(const uint8_t* data, size_t nbytes, int rows,
 void q4nx_dequant_tile(const uint8_t* tile, float* out, int ld);
 
 /* Dequantize a whole INT4 tensor of logical shape [rows, cols] whose packed
- * bytes are a row-major grid of 32x256 tiles.  out must hold rows*cols floats
- * (row-major).  Returns 0 on success, -1 on a geometry mismatch. */
+ * bytes are a row-major grid of 32x256 tiles, or a PLAIN bf16 tensor of that
+ * shape.  out must hold rows*cols floats (row-major).  `nbytes` must be exactly
+ * rows*cols*2 (plain bf16) or exactly the tile grid's size; anything else is a
+ * format this decoder does not know and is refused.  Returns 0 on success, -1
+ * otherwise. */
 int q4nx_dequant_tensor(const uint8_t* data, size_t nbytes, int rows, int cols,
                         float* out);
 
 /* Bytes a [rows, cols] tensor occupies in the packed grid. */
 size_t q4nx_tensor_bytes(int rows, int cols);
+
+/* PLAIN bf16, row-major, no tile header (`tools/safetensors_to_q4nx.py pack --dtype
+ * bf16` writes these): out[r*cols + c] = bf16(data)[r*cols + c].  q4nx_dequant_tensor()
+ * takes this path when the buffer is exactly rows*cols*2 bytes, so a bf16 container is
+ * no longer decoded as 5120-byte q4_1 tiles (engine#875).  Returns 0, or -1 on a
+ * geometry argument that cannot describe a tensor. */
+int q4nx_dequant_plain_bf16(const uint8_t* data, int rows, int cols, float* out);
 
 /* PLAIN int8 with a per-32-column F32 scale (Gemma4 stores `embed_tokens` and
  * `per_layer_token_embd` this way instead of the packed tile grid):

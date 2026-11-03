@@ -639,14 +639,20 @@ fault they prevent happens inside ROCr/the HAL before any of our code runs: `tes
 `llama-cli`, and any harness that starts `llama-server` itself. For scripts there is one definition to source:
 
 ```sh
-. scripts/hrx-env.sh --check     # sets the trio, refuses to continue without it
+. scripts/hrx-env.sh --check     # sets the trio and the runtime path, refuses to continue without the trio
 . scripts/hrx-env.sh             # sets it, no check
 ```
+
+The script also fills `IREE_HAL_AMDGPU_LIBHSA_PATH` when the caller has not set it, because the trio is not enough on a
+box whose device only opens through TheRock's runtime: without it the HAL resolves the system ROCr, registers no `HRX0`,
+and `--list-devices` prints `(none)` — a harness then measures nothing and looks like a null result. `scripts/hw-gate.sh`
+has always had to do this itself; now the recipe does it once, and a caller's value still wins.
 
 and the recipe itself, for anything that cannot source a file:
 
 ```sh
 HSA_USE_SVM=0 HSA_USERPTR_FOR_PAGED_MEM=0 HRX_ALLOW_NO_SVM=1
+IREE_HAL_AMDGPU_LIBHSA_PATH=<therock>/lib/libhsa-runtime64.so.1
 ```
 
 `HRX_SVM=1` and `--hrx-cwsr-placement=off` remain the opt-outs, but they are no longer silent: on an `hrx`/`auto` route
@@ -964,6 +970,13 @@ build directory, delete `build/hrx/llama` (its CMake cache keeps the setting).
 was `tests/hrx_lemonade_e2e.sh`, through the engine's former embedded Lemonade:
 `unsloth/Qwen3-0.6B-GGUF:Q4_0` answered "Paris" on `Vulkan0` and on `HRX0`. The
 same build now passes `tests/serve_e2e.sh` on both devices through `1bit serve`.
+
+`tests/hrx_cpu_weight_parity.sh` (engine #674) is the row that compares placements instead of just checking that each one
+answers: the same greedy prompt through the CPU (`-dev none`), through the device with **every layer assigned to the CPU**
+(`-dev HRX0 -ngl 0`, the partial-offload path where the device still claims nodes and materializes their weights) and fully
+offloaded (`-ngl 99`) must come back byte-identical. It skips without a gfx1151, and it fails rather than skips when the
+machine has a GPU but the HRX runtime cannot open it — the `IREE_HAL_AMDGPU_LIBHSA_PATH` case `scripts/hrx-env.sh` now
+resolves for hand-run tools.
 
 llama-bench, Qwen3-0.6B, pp512 / tg128 tok/s, against the previous build (April
 llama.cpp with ggml-hrx2 on `HRX20`):

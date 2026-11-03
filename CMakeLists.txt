@@ -642,6 +642,15 @@ add_executable(npu_design_grid_test tests/npu_design_grid_test.c npu/forward/src
 target_include_directories(npu_design_grid_test PRIVATE npu/forward/include)
 target_link_libraries(npu_design_grid_test PRIVATE m)
 add_test(NAME npu_design_grid COMMAND npu_design_grid_test)
+# A PLAIN bf16 tensor (rows*cols*2 bytes, no tile header) must decode as bf16, not as 5120-byte
+# q4_1 tiles, and a buffer of any other size must be refused (engine#875).  Plain C, no device.
+add_executable(npu_dequant_bf16_test tests/npu_dequant_bf16_test.c npu/forward/src/q4nx_dequant.c)
+target_include_directories(npu_dequant_bf16_test PRIVATE npu/forward/include)
+add_test(NAME npu_dequant_bf16 COMMAND npu_dequant_bf16_test)
+# ci.yml's target list needs the `workflow` scope to extend, so bind this binary to a target the list
+# already builds (same reason as npu_forward_loader_test above); drop this line when the workflow is next
+# touched with that scope and add npu_dequant_bf16_test to the list itself.
+add_dependencies(npu_forward_loader_test npu_dequant_bf16_test)
 set(ONEBIT_NPU_MODEL "" CACHE PATH "Q4NX model directory (model.q4nx + config.json)")
 set(ONEBIT_NPU_MOE_GATE "" CACHE FILEPATH "gate.json from tools/moe_expert_chunks.py gate")
 set(ONEBIT_NPU_BO_DUMP "" CACHE PATH "The reference lane's buffer dump (RT_DUMP_BOS)")

@@ -72,8 +72,16 @@ which is what makes this additive.
 Four plans are checked in under `configs/plans/`, one per model directory on the build box (Qwen3-0.6B,
 bonsai2-27b-NPU, bonsai2-27b-NPU-b8, bonsai2-27b-pb16i); `tools/npu_plan.py <dir> --check` proves the
 directory's copy still matches. `scripts/npu-window11.sh` is the gate the change passed: three fixed greedy
-prompts and the prof table, compared between a run with the plan and a run without it (`--compare A B`) —
-3/3 transcripts byte-identical and every prof row within 10%.
+prompts and the prof table, compared between a run with the plan and a run without it — 3/3 transcripts
+byte-identical and every prof row within the tolerance. The tolerance is not a constant of the script: on this
+box the same binary against itself moves by more than a couple of percent (engine #834 measured up to 7.7 %), so
+`--compare` **refuses to run without either `--tol PCT` or `--control C1.log C2.log`** — the same-binary pair
+whose own spread becomes the tolerance, rounded up. Every row prints both statistics and the header names the one
+the tolerance applies to: `ratio-of-medians` (median of each side) or `median-of-ratios` (paired per round, the
+honest one for a no-regression claim, and the one applied when both logs carry rounds). Alternate the order inside
+a round (A B, then B A) in whatever drives the A/B pair: the script detects a control whose rows all move the same
+way and says so, because that is the second serve's warm-up, not noise. `scripts/npu-window11.sh --self-test` is
+the committed check of that policy.
 
 **`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
 `noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every

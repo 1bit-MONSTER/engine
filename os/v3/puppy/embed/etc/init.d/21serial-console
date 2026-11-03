@@ -33,7 +33,10 @@ grep -q '1bit.serial=1' /proc/cmdline 2>/dev/null || exit 0
 # `--noediting` removes readline entirely, so there is nothing to toggle and nothing to flush; TERM=dumb keeps
 # bash's shell-integration escapes off the wire as well. A serial admin shell wants lines, not line editing.
 if [ -x /bin/bash ]; then
-	setsid sh -c 'TERM=dumb exec /bin/bash --noediting -i < /dev/ttyS0 > /dev/ttyS0 2>&1' &
+	# -l as well as -i: a login shell is what sources /etc/profile, and Puppy's PATH entries (e.g. /usr/games)
+	# live there. Without it the appliance's serial shell differed from every other login on the box - measured by
+	# the U1 apt-any row, which installed cowsay to /usr/games and then could not see it.
+	setsid sh -c 'TERM=dumb exec /bin/bash --noediting -li < /dev/ttyS0 > /dev/ttyS0 2>&1' &
 else
 	setsid sh -c 'TERM=dumb exec /bin/sh -l < /dev/ttyS0 > /dev/ttyS0 2>&1' &
 fi

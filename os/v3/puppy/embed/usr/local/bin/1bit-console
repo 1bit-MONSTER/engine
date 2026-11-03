@@ -43,6 +43,12 @@ fi
 # the fallback the cycle-15 gates were written against. Nothing to fall back from if the binary is absent.
 if [ -x /usr/local/bin/1bit-console-tui ]; then
     /usr/local/bin/1bit-console-tui
-    printf '\n1bit-console-tui exited (%s) - starting the dialog menu\n' "$?" > /dev/tty1 2> /dev/null || true
+    # WHY it left, kept: the TUI prints its own reason to stderr (a terminal it cannot drive, raw mode refused) and
+    # this line carries the status, on the screen for the person in front of the box AND in /data/logs for the one
+    # reading afterwards. Both halves matter: a console that falls back silently is a defect nobody can name later.
+    rc=$?
+    printf '\n1bit-console-tui exited (%s) - starting the dialog menu\n' "$rc" > /dev/tty1 2> /dev/null || true
+    printf '1bit-console-tui exited (%s) at %s\n' "$rc" "$(date -Is)" \
+        >> /data/logs/console-tui.log 2> /dev/null || true
 fi
 exec /usr/local/bin/1bit-console-menu

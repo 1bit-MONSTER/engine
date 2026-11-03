@@ -391,8 +391,12 @@ fn log_lines(a: &App, height: usize, width: usize) -> Vec<Line<'static>> {
         )];
     }
     let end = total.saturating_sub(a.log_scroll.min(total.saturating_sub(1)));
-    let mut visual: Vec<(Option<Color>, String)> = Vec::new();
-    for rec in &a.facts.logs[..end] {
+    // collected BACKWARDS and stopped as soon as the pane is full: drawing the log then costs what is on screen
+    // instead of the wrapped length of all 400 records, which is pi-prs' second focus area (a record with no
+    // spaces costs its own bytes and nothing more)
+    let mut blocks: Vec<Vec<(Option<Color>, String)>> = Vec::new();
+    let mut lines = 0usize;
+    for rec in a.facts.logs[..end].iter().rev() {
         let color = if rec.starts_with("KRN") {
             Some(Color::Magenta)
         } else if rec.contains("error") || rec.contains("ERROR") || rec.contains("fail") {
@@ -400,9 +404,20 @@ fn log_lines(a: &App, height: usize, width: usize) -> Vec<Line<'static>> {
         } else {
             Some(Color::Gray)
         };
-        for (i, w) in wrap_words(rec, width).into_iter().enumerate() {
-            visual.push((color, if i == 0 { w } else { format!("  {w}") }));
+        let block: Vec<(Option<Color>, String)> = wrap_words(rec, width)
+            .into_iter()
+            .enumerate()
+            .map(|(i, w)| (color, if i == 0 { w } else { format!("  {w}") }))
+            .collect();
+        lines += block.len();
+        blocks.push(block);
+        if lines >= height {
+            break;
         }
+    }
+    let mut visual: Vec<(Option<Color>, String)> = Vec::new();
+    for block in blocks.into_iter().rev() {
+        visual.extend(block);
     }
     let start = visual.len().saturating_sub(height);
     visual[start..]

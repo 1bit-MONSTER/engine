@@ -400,19 +400,34 @@ pub fn sysfs_u64(path: &str) -> u64 {
         .unwrap_or(0)
 }
 
-fn gpu_mem(gpu: &mut Gpu) {
-    for card in ["card0", "card1", "card2"] {
-        let base = format!("/sys/class/drm/{card}/device");
-        let total = sysfs_u64(&format!("{base}/mem_info_vram_total"));
+/// The first DRM card that reports VRAM at all. The cards are READ from the directory rather than assumed to be
+/// `card0..card2`: the node's number depends on probe order, and a machine with a display controller that reports
+/// nothing (or a fourth card) would otherwise show the wrong device's memory or none (pi-prs' first focus area).
+pub fn gpu_mem_in(drm: &str, gpu: &mut Gpu) {
+    let Ok(rd) = fs::read_dir(drm) else { return };
+    let mut cards: Vec<std::path::PathBuf> = rd
+        .flatten()
+        .filter(|e| e.file_name().to_string_lossy().starts_with("card"))
+        .map(|e| e.path())
+        .collect();
+    cards.sort();
+    for card in cards {
+        let base = card.join("device");
+        let p = |n: &str| base.join(n).to_string_lossy().into_owned();
+        let total = sysfs_u64(&p("mem_info_vram_total"));
         if total == 0 {
             continue;
         }
         gpu.vram_total = total;
-        gpu.vram_used = sysfs_u64(&format!("{base}/mem_info_vram_used"));
-        gpu.gtt_total = sysfs_u64(&format!("{base}/mem_info_gtt_total"));
-        gpu.gtt_used = sysfs_u64(&format!("{base}/mem_info_gtt_used"));
+        gpu.vram_used = sysfs_u64(&p("mem_info_vram_used"));
+        gpu.gtt_total = sysfs_u64(&p("mem_info_gtt_total"));
+        gpu.gtt_used = sysfs_u64(&p("mem_info_gtt_used"));
         return;
     }
+}
+
+fn gpu_mem(gpu: &mut Gpu) {
+    gpu_mem_in("/sys/class/drm", gpu);
 }
 
 fn gpu_probe() -> Gpu {
@@ -1100,6 +1115,33 @@ mod tests {
     fn df_row_is_total_and_free() {
         let df = "Filesystem      1B-blocks       Used   Available Use% Mounted on\n/dev/sda2    62277025792 6000000000 55800000000  10% /data\n";
         assert_eq!(df_from(df), Some((62277025792, 55800000000)));
+    }
+
+    #[test]
+    fn gpu_mem_reads_whichever_card_reports_vram() {
+        // a machine whose first DRM node reports nothing (the appliance's own layout: card0 is the display
+        // controller, the APU reports VRAM) - a hardcoded card0..card2 list would show 0 there
+        let root = std::env::temp_dir().join(format!("1bit-tui-drm-{}", std::process::id()));
+        let _ = fs::remove_dir_all(&root);
+        fs::create_dir_all(root.join("card0/device")).unwrap();
+        fs::create_dir_all(root.join("card1/device")).unwrap();
+        fs::write(root.join("card0/device/mem_info_vram_total"), "0\n").unwrap();
+        fs::write(root.join("card1/device/mem_info_vram_total"), "128849018880\n").unwrap();
+        fs::write(root.join("card1/device/mem_info_vram_used"), "2147483648\n").unwrap();
+        fs::write(root.join("card1/device/mem_info_gtt_total"), "65498251264\n").unwrap();
+        fs::write(root.join("card1/device/mem_info_gtt_used"), "536870912\n").unwrap();
+        let mut g = Gpu::default();
+        gpu_mem_in(&root.to_string_lossy(), &mut g);
+        assert_eq!(g.vram_total, 128849018880);
+        assert_eq!(g.vram_used, 2147483648);
+        assert_eq!(g.gtt_total, 65498251264);
+        // and a directory with no card at all leaves the struct alone rather than inventing numbers
+        let empty = root.join("none");
+        fs::create_dir_all(&empty).unwrap();
+        let mut g2 = Gpu::default();
+        gpu_mem_in(&empty.to_string_lossy(), &mut g2);
+        assert_eq!(g2.vram_total, 0);
+        let _ = fs::remove_dir_all(&root);
     }
 
     #[test]

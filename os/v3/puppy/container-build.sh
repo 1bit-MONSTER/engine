@@ -35,6 +35,12 @@ echo "dash dash/sh boolean false" | debconf-set-selections
 dpkg-reconfigure dash >/dev/null 2>&1 || true
 ln -sf bash /bin/ash
 # the whole build happens in /work, which is a host filesystem (ext4), so the petbuild overlay mounts work
+# REMOVED first: `cp -a /woof /work/woof-CE` into a directory that already exists copies /woof *inside* it and
+# leaves the old tree in place - and the old tree is the one the previous cycle's patch-init patched. That is the
+# second half of the staleness that cost cycles 15c and 15d (each wrote an ISO and was then refused by
+# `patch-init --verify`, because the refreshed initrd-progs came from /work/woof-CE, which was itself two cycles
+# old). The host clone is mounted read-only at /woof and is never patched, so it is the honest source.
+rm -rf /work/woof-CE
 cp -a /woof /work/woof-CE
 cd /work/woof-CE
 mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output

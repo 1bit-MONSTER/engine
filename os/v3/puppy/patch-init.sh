@@ -63,6 +63,10 @@ cat <<'ONEBLOCK'
 # progress` failed with "the console never said what it was doing" while the same lines were on tty0.
 one_console() {
 	for ONE_C in /dev/console /dev/ttyS0; do
+		# the initramfs carries no /dev at all: the kernel creates /dev/console for init itself, and nothing
+		# creates the serial node - so it is mknod'd here (ttyS0 is 4,64), which is what any initrd with a serial
+		# console has to do. After switch_root the real devtmpfs replaces this directory.
+		[ -e "$ONE_C" ] || { [ "$ONE_C" = /dev/ttyS0 ] && { mkdir -p /dev; mknod "$ONE_C" c 4 64 2>/dev/null; }; }
 		[ -e "$ONE_C" ] && printf '%s\n' "$*" > "$ONE_C" 2>/dev/null
 	done
 	return 0
@@ -116,11 +120,13 @@ verify_initrd() {
         rm -rf "$tmp"; die "$gz: /init has no 1bit rescue guard (panic on any init failure) - patch-init.sh did not run"
     fi
     [ "$n" = 3 ] || { rm -rf "$tmp"; die "$gz: /init has $n of the 3 failure paths guarded"; }
-    grep -q "$PROG1" "$tmp/init" && grep -q "$PROG2" "$tmp/init" || {
+    grep -qF "$PROG1" "$tmp/init" && grep -qF "$PROG2" "$tmp/init" || {
         rm -rf "$tmp"; die "$gz: /init has no 1bit boot-progress lines (the console says nothing while the SFS copy to RAM runs)"; }
     # and they (and the rescue messages) have to reach BOTH consoles: /dev/console is the screen now, and a
     # headless box on a serial cable - the VM rows, and the panic-repro harness - reads ttyS0
-    grep -q 'one_console()' "$tmp/init" && grep -q "one_console \"$PROG1" "$tmp/init" || {
+    grep -qF 'one_console()' "$tmp/init" || {
+        rm -rf "$tmp"; die "$gz: /init has no one_console (the progress and rescue lines reach one console only)"; }
+    grep -qF "one_console \"$PROG1" "$tmp/init" || {
         rm -rf "$tmp"; die "$gz: /init writes the progress lines to /dev/console only (nothing on ttyS0 for a headless box)"; }
     rm -rf "$tmp"
     echo "ok: $gz: /init carries the guard, all 3 failure paths reach it, and both progress lines"
@@ -145,9 +151,27 @@ init=${cands[0]}
 master=$root/woof-CE/initrd-progs/0initrd/init
 [ -f "$master" ] || master=''
 
-if grep -q "$MARK" "$init" && [ "$(grep -c 'one_rescue 1' "$init")" = 3 ]; then
+# "Already patched" is only true for THIS version of the block: a block inserted by an older patch-init carries the
+# old messages (cycle 15: the progress lines and the rescue text went to /dev/console alone, which the new console
+# order turned into "the screen only"). The block is always inserted at line 2, so an older one is dropped from
+# line 2 to its `trap ... one_rescue` line and the current one installed in its place. Measured twice: refusing
+# instead of re-patching cost two whole builds, because the refusal happens after the ISO is written.
+strip_old_block() {   # strip_old_block <file> -> the file without a previously inserted rescue block
+    awk 'NR == 1 { print; next } $0 ~ /^trap .one_rescue/ && !seen { seen = 1; next } !seen { next } { print }' "$1"
+}
+if grep -q "$MARK" "$init" && grep -qF 'one_console()' "$init" && \
+   [ "$(grep -c 'one_rescue 1' "$init")" = 3 ]; then
     echo "== init guard: already patched ($init)"
 else
+    if grep -q "$MARK" "$init"; then
+        echo "== init guard: an OLDER block is in $init - replacing it with the current one"
+        tmp=$(mktemp) || exit 2
+        strip_old_block "$init" > "$tmp" && cat "$tmp" > "$init" && rm -f "$tmp"
+        # the `&` in 2>&1 is sed's "the whole match" in a replacement, so it has to be escaped - unescaped it
+        # rewrote the three paths into `... 2one_rescue 11` and the insert path below then refused the file it had
+        # just produced (measured while re-patching cycle 15d's initrd)
+        sed -i 's|one_rescue 1|exec /bin/sh >/dev/console 2>\&1|g' "$init"
+    fi
     echo "== init guard into $init"
     grep -q '^#!' "$init" || die "$init is not a script"
     grep -q 'exec /bin/sh >/dev/console 2>&1' "$init" || die "$init has none of the 3 failure paths - upstream changed, re-measure"
@@ -165,15 +189,26 @@ fi
 # the two console progress lines, patched separately so the guard above stays greppable and idempotent
 patch_progress() {
     local f=$1 tmp
-    # Idempotent, but only for THIS version: the pre-cycle-15 form wrote the lines to /dev/console alone, and with
-    # the cycle-15 console order that is the screen only - the serial port sees nothing. Accepting it silently is
-    # how a build root reused across cycles shipped an image whose fix was not in it (measured: two builds refused
-    # by --verify, each after its ISO had been written). Fail with the reason instead.
-    if grep -q "$PROG1" "$f" && grep -q "$PROG2" "$f"; then
-        grep -q 'one_console "' "$f" && return 0
-        echo "$prog: $f carries the pre-cycle-15 progress lines (/dev/console only, nothing on ttyS0) - the build" \
-             "root is stale; refresh initrd-progs from the woof-CE clone" >&2
-        return 1
+    # Current form? Both progress lines written through one_console. Testing for "one_console" anywhere is not
+    # enough - the rescue block's own messages use it, so a file with the OLD `echo ... > /dev/console` progress
+    # lines passed that test and shipped with the lines on one console only (measured re-patching cycle 15d).
+    if grep -qF "one_console \"$PROG1" "$f" && grep -qF "one_console \"$PROG2" "$f"; then return 0; fi
+    # An older patch's two lines, upgraded in place: the redirect goes, one_console goes on. Done with awk so the
+    # *** in the strings is not a regex, and so nothing else in the file is touched.
+    if grep -qF "$PROG1" "$f" || grep -qF "$PROG2" "$f"; then
+        tmp=$(mktemp) || return 2
+        awk -v p1="$PROG1" -v p2="$PROG2" '
+            index($0, p1) || index($0, p2) {
+                line = $0
+                sub(/^[ \t]*echo /, "", line)
+                sub(/ > \/dev\/console$/, "", line)
+                print "\tone_console " line
+                next
+            }
+            { print }
+        ' "$f" > "$tmp" && cat "$tmp" > "$f"
+        rm -f "$tmp"
+        grep -qF "one_console \"$PROG1" "$f" && grep -qF "one_console \"$PROG2" "$f" && return 0
     fi
     grep -q '^#- handle pfix=copy pfix=ram pfix=nocopy' "$f" || {
         echo "$prog: $f has no pfix=copy block - upstream changed, re-measure" >&2; return 1; }
@@ -197,7 +232,7 @@ patch_progress() {
         }
         { print }
     ' "$f" > "$tmp" || { rm -f "$tmp"; return 1; }
-    grep -q "$PROG1" "$tmp" && grep -q "$PROG2" "$tmp" || { rm -f "$tmp"; return 1; }
+    grep -qF "one_console \"$PROG1" "$tmp" && grep -qF "one_console \"$PROG2" "$tmp" || { rm -f "$tmp"; return 1; }
     cat "$tmp" > "$f" && rm -f "$tmp"
 }
 if ! patch_progress "$init"; then

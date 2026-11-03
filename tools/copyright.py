@@ -63,6 +63,9 @@ EXEMPT = ["third_party/*", "os/licenses/*", "config/draft-vocab/*", "patches/*",
           # one keymap name ("us") and /etc/localtime is a symlink into /usr/share/zoneinfo - neither can
           # carry a comment, and both are read by keymap-set and glibc verbatim
           "os/v3/puppy/embed/etc/keymap", "os/v3/puppy/embed/etc/localtime",
+          # cycle 17: /etc/timezone is one zone name, read verbatim by every Debian-family tool (and by
+          # 08onboard-presets, which pins /etc/localtime to it) - a comment line would BE the zone
+          "os/v3/puppy/embed/etc/timezone",
           # os/v3 Puppy image, cycle 15: the appliance's hostname is one word and is read verbatim by
           # hostname(1), rc.sysinit and /etc/hosts - a comment line would BE the hostname
           "os/v3/puppy/embed/etc/hostname"]

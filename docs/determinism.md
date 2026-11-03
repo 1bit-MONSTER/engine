@@ -51,8 +51,9 @@ meaningful bitwise gate can only be asserted **within** one route, at a fixed ba
 Qwen3-0.6B Q4_K_M, 8 prompts, 64 tokens each, greedy (`temperature 0`, `top_k 1`), fixed seed,
 `logprobs=true`, `top_logprobs=5`, `cache_prompt=false`, 5 repeats per prompt, thinking off except
 where a table says otherwise. Binary `lemonade-onebit-rc-2026-10-31c` (c18) for the thinking-off
-measurements; the thinking-on ones below ran on a build of `main` at `1b3def2`, which still emits NPU
-log-probabilities for think tokens.
+measurements, and `main@692cfa2` + #864 for the thinking-off three-route row (it reproduces the c18
+`cpu`/`hrx` numbers digit for digit, as that section says); the thinking-on ones ran on a build of
+`main` at `1b3def2`, which still emits NPU log-probabilities for think tokens.
 
 ### Repetition, per route (requests served one at a time)
 
@@ -167,12 +168,15 @@ column is 2 repeats at every budget.
 It **can** join the agreement comparison — the earlier version of this page said it could not — with two
 adjustments, both of which are flags on the tool rather than changes to the engine:
 
-1. **Every route must run with thinking on** (`--thinking on`). The NPU forward path ignores
-   `chat_template_kwargs.enable_thinking=false` (issue
-   [#832](https://github.com/1bit-MONSTER/engine/issues/832)), so its stream always opens `<think>`; the
-   llama-server routes honour the kwarg. Run all three with thinking on and the templates agree. This was
-   the real blocker: run two routes with `enable_thinking=false` against this one and they diverge at
-   position 0 for template reasons, which looks exactly like a numerical disagreement.
+1. **Thinking has to be the same on both sides of a pair.** It used to be a *requirement* that every
+   route run with thinking **on** (`--thinking on`), because the NPU forward path accepted
+   `chat_template_kwargs.enable_thinking=false` and dropped it
+   ([#832](https://github.com/1bit-MONSTER/engine/issues/832)), so its stream always opened `<think>` while
+   the llama-server routes honoured the kwarg and the pair diverged at position 0 for template reasons —
+   which looks exactly like a numerical disagreement. With [#864](https://github.com/1bit-MONSTER/engine/pull/864)
+   the NPU path honours it (`app/npu_chatml.h`), so `--thinking off` works on all three routes and that is
+   the configuration measured in [All three routes, thinking off](#all-three-routes-thinking-off) below.
+   The tables *in this section* are the thinking-on ones, taken on a pre-#748 build.
 2. **Match tokens by text, not by id** (`--match-by text`). The NPU reports `token` and `logprob` but no
    `id`, in `logprobs.content` and in `top_logprobs` alike, so an id-keyed comparison between it and
    `cpu`/`hrx` matches nothing at all.
@@ -180,8 +184,8 @@ adjustments, both of which are flags on the tool rather than changes to the engi
 `message.content` being empty on that path does not matter: the comparison reads `logprobs.content`, which
 is populated. And the log-probabilities have to come from a build whose NPU path emits them (see
 [Routes and logprobs](#routes-and-logprobs)). One build detail matters here: `44d849d` onward emits
-entries for **content** tokens only, so a thinking reply's `logprobs.content` is empty there — measure
-with a build before it, or with `#832` fixed.
+entries for **content** tokens only, so a thinking reply's `logprobs.content` is empty there: measure
+with a build before `44d849d`, or with `--thinking off` on a build carrying #864 (the #832 fix).
 
 Qwen3-0.6B, 8 prompts, greedy, thinking **on**, 2 repeats (NPU) / 5 repeats (cpu, hrx).
 One control first: the `cpu` route was measured in **two separate server runs**, and the two agree
@@ -221,7 +225,43 @@ is a q4_1 tile (bf16 scale and zero per 32 columns) requantised from Q4_K, so th
 **weight change plus** kernel arithmetic and is *not* the same quantity as `cpu` vs `hrx`. Quote it as
 "NPU pack vs GGUF" or not at all.
 
-What can be promised today, then: repetition on all three routes, and a cross-route agreement number — not
+### All three routes, thinking off
+
+Thinking off is the configuration a log-probability comparison actually wants (a thinking stream opens with
+stereotyped tokens that make every pair look closer than it is), and it is only measurable on a build
+carrying [#864](https://github.com/1bit-MONSTER/engine/pull/864). This row was taken on
+**`main@692cfa2` + #864 (`ce1af72`)** — #864 was still open when it ran, so the commit is named here
+rather than a merge sha. Qwen3-0.6B Q4_K_M, 8 prompts × 64 tokens, greedy, `--thinking off`,
+`--match-by text`, NPU at `--prefix-slots 0`.
+
+| Route | repetitions | run-to-run | max \|Δlogp\| | tokens | text stable |
+|---|---|---|---|---|---|
+| `cpu` | 5 | **bitwise-identical** | 0 | 128 | yes |
+| `hrx` | 5 | **bitwise-identical** | 0 | 122 | yes |
+| `npu` (forward path) | 2 | **bitwise-identical** | 0 | 131 | yes |
+
+| pair | token match | top-1 | exact-bit match | max \|Δlogp\| | mean \|Δlogp\| | common tokens | prompts diverging |
+|---|---|---|---|---|---|---|---|
+| `cpu` vs `hrx` | 0.721 | 0.721 | 0.080 | 3.98e-01 | 4.03e-02 | 88/122 | 4 of 8 |
+| `cpu` vs `npu` | 0.331 | 0.331 | 0.000 | 6.23e-01 | 8.62e-02 | 39/118 | 6 of 8 |
+| `hrx` vs `npu` | 0.410 | 0.410 | 0.000 | 5.87e-01 | 8.89e-02 | 48/117 | 6 of 8 |
+
+The two runs were separate device claims, so the `cpu` route was served twice and is the control: the two
+`cpu` reports agree **128/128 positions, exact bits, `max |Δlogp| = 0`**.
+
+Two things this row adds to the thinking-on tables above:
+
+- **The `cpu`/`hrx` row reproduces the c18 binary digit for digit.** Same 122 aligned positions, 88 common,
+token match 0.721, exact-bit 0.080, max 3.98e-01, mean 4.03e-02 as the first measurement of this page
+(`lemonade-onebit-rc-2026-10-31c`). Nothing in the CPU or HRX decode path moved between that binary and
+`main@692cfa2`, which is the llama.cpp pin's own claim and now also a measurement.
+- **Thinking off moves the NPU pairs further away, not closer.** Mean \|Δlogp\| is 8.6-8.9e-02 here against
+5.2-5.5e-02 with thinking on, and the token-match rate is higher (0.33-0.41 against 0.26) because thinking
+streams are long runs of near-deterministic tokens that both routes pick identically. Neither row is a
+better row: they answer different questions ("the same 64 tokens" against "the same 64 tokens of a
+reasoning stream"), and the thinking-off one is the one a numeric gate would be written against.
+
+What can be promised today, then: repetition on all three routes, and cross-route agreement numbers — not
 an agreement threshold. No pair is bitwise, and no pair is within RL-Kernel's `max_abs_dlogp <= 0.06` gate.
 
 ## Routes and logprobs
@@ -240,9 +280,10 @@ an agreement threshold. No pair is bitwise, and no pair is within RL-Kernel's `m
   `full_i8_*.elf` designs — a shipped dx kernel directory (`npu/kernels/<H>x<IM>x<NH>x<NKV>/` of
   `layer*.elf`) does not contain them. A release binary older than that change has no NPU logprobs
   anywhere (`strings <bin> | grep top_logprobs` is the check).
-- `chat_template_kwargs.enable_thinking=false` is honoured by the llama-server routes and not by
-  the NPU forward path, which can return a `<think>` block where the others do not. Compare token
-  streams only with the same template behaviour, or the divergence you measure is the template.
+- `chat_template_kwargs.enable_thinking=false` is honoured by every route, the NPU forward path
+  included since #864 (`app/npu_chatml.h`); before that it was accepted and dropped there, so an NPU
+  reply could open a `<think>` block where the others did not. Compare token streams only with the same
+  template behaviour, or the divergence you measure is the template.
 
 The weight caveat above is why the NPU's agreement numbers are reported with the pack named and not
 folded into the `cpu` vs `hrx` column: the measured tables are above.
@@ -274,10 +315,11 @@ python3 tools/logprob_agree.py \
     --repeat 5 --max-tokens 64 --json agree.json
 ```
 
-With the NPU in the comparison, the same command with `--thinking on --match-by text`: the forward path
-needs no `enable_thinking` and reports no token ids, so all routes run thinking on and tokens are matched
-by text. The NPU tries 2 repeats at the same 64-token budget — ~10 min in one claim, which is what its
-~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
+With the NPU in the comparison, the same command with `--thinking off --match-by text`, on a build carrying
+#864: the forward path reports no token ids, so tokens are matched by text, and thinking off is what the
+last three-route row was taken with (`--thinking on` also works there and is what the earlier rows used).
+The NPU tries 2 repeats at the same 64-token budget — ~2.5 min in one claim with thinking off, ~10 min with
+thinking on, which is what its ~0.5 s/token allows. If the GPU and NPU claims cannot be held at once, run the pairs separately and
 compare the two reports with the tool's own comparator:
 
 ```sh
@@ -331,7 +373,7 @@ how each arm above was run.
 - The NPU agreement rows are 2 repeats (the other routes' 5 would be ~25 min of the array) and, over a
   *requantised* pack, they are not an arithmetic-only distance. The 64-token row removes the earlier
   budget difference, so all three columns can be read at one token count.
-- The NPU rows depend on the build. A binary at `44d849d` or later masks the think tokens, so on that
-  build the NPU row cannot be reproduced until
-  [#832](https://github.com/1bit-MONSTER/engine/issues/832) is fixed; the numbers above come from a
-  `main@1b3def2` build, which still emits log-probabilities for the think tokens.
+- The NPU rows depend on the build. A binary at `44d849d` or later masks the think tokens, so a *thinking*
+  reply reports no entries on it at all: the thinking-on rows come from a `main@1b3def2` build, which still
+  emits log-probabilities for the think tokens. The thinking-off row needs neither that build nor an
+  unfixed engine — it ran on `main@692cfa2` + #864, i.e. exactly what a client gets once #832's fix lands.

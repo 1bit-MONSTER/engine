@@ -255,13 +255,17 @@ private:
                    const std::string& artifact_dir);
     bool host_gemm_ = false;
     bool load_layer(int l);
+    // `a_k` is the activation's REAL width per row (the design's real_k, i.e. the model's hidden or
+    // intermediate size).  It is K whenever the model is already on the container's 256-column K
+    // grid, and smaller when it is not (Qwen2.5-0.5B: 896 of 1024), in which case the activation is
+    // zero-padded to K before the kernel sees it -- see q4nx_pad_a_f32() for why that is exact.
     void npu_gemm(I8Ctx& ctx, const float* A, int K, int N,
                   const float* Bmat, std::vector<float>& out, int wkey = -1,
-                  const char* sc = nullptr);
+                  const char* sc = nullptr, int a_k = 0);
     // Batched (M>1) GEMM: M rows in one launch, with per-row activation scales.
     void npu_gemm_rows(I8Ctx& ctx, const float* A, int M, int K, int N,
                        const float* Bmat, std::vector<float>& out, int wkey = -1,
-                       const char* sc = nullptr);
+                       const char* sc = nullptr, int a_k = 0);
     // pb16i sidecar stem for (layer, tensor tag): <pb16i_dir>/blk_<l>_<tag>_weight
     std::string pb16i_stem(int layer, const char* tag) const;
     // Phase-selected activation tile.  A one-row launch is decode, so it runs
@@ -308,7 +312,8 @@ private:
     bool ffn_cache_default() const;
     bool attention(const std::vector<float>& qkv, int pos, std::vector<float>& ctx,
                    int head_dim, int n_kv_heads, float theta, int rotary_dim,
-                   bool proportional, int window, int kv_layer, bool append_kv);
+                   bool proportional, int window, int kv_layer, bool append_kv,
+                   int kv_len = 0);
     bool mlp(const std::vector<float>& gu, std::vector<float>& h, int im);
     float rmsnorm(const float* x, const float* w, int n, float* out) const;
     float rmsnorm_noweight(const float* x, int n, float* out) const;
@@ -378,6 +383,10 @@ private:
     // refusals, which name the plan that asked for a kernel that is not there.
     onebit::npu::plan::Plan plan_;
     std::string plan_path_;
+    // attention.mode from the plan: a noncausal pack's full-attention layers see the whole prompt, so a
+    // prompt-encoding forward (step_batch at start_pos 0) attends bidirectionally there and the GDN
+    // layers keep their recurrence.  Off unless the plan says so, so a causal model is untouched.
+    bool noncausal_attn_ = false;
     // The refusal for a kernel a design needs but the directory does not have.  With a plan it names
     // the plan file and the role, so "which description asked for this" needs no log reading.
     std::string missing_kernel(const std::string& dir, const char* elf_name, Q4nxDesign role) const;
@@ -420,6 +429,17 @@ private:
     // kernel (e.g. GU is absent on split models, G/U absent on fused ones).
     int idx_of(Q4nxDesign role) const;
 
+    // The container stores every q4_1/Q8 tensor on the chunk's 256-column K grid (npu/q4nx.h
+    // kCols), so the projection width a container tensor is dequantised at is the PADDED hidden
+    // size (engine#845: Qwen2.5-0.5B's 896 is stored as 1024 columns, zeros in the pad).  The
+    // pad columns are zero in the container, so they add exactly 0 to every dot product.  The
+    // designs' K comes out of the same grid (q4nx_pad_k), which is what makes assemble_B's source
+    // stride and this width the same number.
+    int kpad_ = 0;        // c_.H on the container's K grid
+    int impad_ = 0;       // c_.IM on the container's K grid
+    // Row stride of the f32 table embed_at()/lm_at() read: the padded width when the table was
+    // dequantised from a container tensor, c_.H when it is the raw BF16 embedding.
+    int lm_w_ = 0;
     // BF16 host-side tensors
     std::vector<uint16_t> embed_;                 // [NV*H] bf16
     // Some models store the embedding QUANTIZED (Gemma4-E2B/E4B: dtype I8), and

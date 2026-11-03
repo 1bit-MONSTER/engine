@@ -75,6 +75,21 @@ directory's copy still matches. `scripts/npu-window11.sh` is the gate the change
 prompts and the prof table, compared between a run with the plan and a run without it (`--compare A B`) —
 3/3 transcripts byte-identical and every prof row within 10%.
 
+**`attention.mode`** (optional, default `causal`) is the mask, not a kernel decision. A pack that declares
+`noncausal_full_attention` in its own `decision_config.json` — a d3 readout pack, trained with every
+full-attention layer seeing the whole prompt — is generated as such, and the forward then encodes a prompt
+bidirectionally: `step_batch()` fills the K/V cache for every row of the batch first and only then attends,
+so row *r* sees rows after it. The GDN layers keep their causal recurrence (the pack's own runtime keeps it
+too), a sliding layer stays causal, and the mode reads the same numbers only in one shape:
+
+- **the whole prompt, one batched pass, at position 0** (`POST /v1/systemone` does exactly that). A batch
+  that starts above 0 is refused by name — its earlier positions were already encoded causally.
+- **it cannot generate.** `step()` (one position at a time, keys only in the past) refuses with the mode's
+  name, so a d3 pack served on the chat route is an error rather than a silently causal answer.
+
+An unknown mode string is a plan refusal, never a default: the two modes give different numbers, and a
+guessed mask is a different model.
+
 ### Q4NX chunks
 
 Q4NX is [FastFlowLM](https://github.com/ROCm/FastFlowLM)'s NPU model format (MIT), and its models on
@@ -136,11 +151,23 @@ tensors and for any projection whose width is not a multiple of 32.
 container's `W'` already has the block Hadamard and the per-width signs baked into the weights; the
 consumer rotates the *activation* into that basis — `A' = H (A . s)`, signs first, then the normalized
 Sylvester-Walsh butterfly, then the `1/sqrt(block)` — and never touches the weight
-(`npu/forward/src/q4nx_forward.cpp::hadamard_rotate`). So a t2 tensor holds `W'` exactly as the pb16i
+(`npu/forward/include/hadamard.h`, called from `q4nx_forward.cpp`). So a t2 tensor holds `W'` exactly as the pb16i
 image does, the fold declaration stays where it belongs (the container's `q4nx_hadamard`,
 `q4nx_hadamard_block` and the `HAD1` sign table), and the chunk needs no pre/post-rotation flag: reading
 a t2 tensor in the wrong basis is a consumer bug, not a format one. The inverse direction (the tied
 embedding, `inverse_weight_names` in the pack) is `S (H y)`, which round-trips to the identity.
+
+**This rotation is host work on the critical path, so it is SIMD, and it must stay bit-identical.** It runs
+once per projection — ~430 times a decode token on Bonsai-2 — and the scalar butterfly cost 14.2 us per
+5120-float vector in-loop: 15.8 ms/token in a quiet window and 39.0 ms/token on a loaded one, i.e. pure
+CPU contention that a device-side win cannot touch. `hadamard.h` keeps the scalar loop as the reference and
+adds an AVX2 path (dispatched at run time) that performs the *same* adds and subtracts on the same operands
+in the same stage order — stages 1, 2 and 4 as an 8-lane in-register butterfly, every later stage as
+contiguous 8-lane add/sub — so the rotated vector is bit-identical and no container's text moves: 7.6 ->
+2.4 us per 5120-float vector, 40.0 -> 16.8 us per 17408-float one. `tests/hadamard_rotate_test.cpp` is the
+gate that runs on every build, on any host: bit-for-bit equality against the scalar loop for every block a
+container can carry and for the fleet's real activation widths, plus a check that the scalar loop really is
+the Hadamard transform (compared against a direct sum over the sign pattern).
 
 **The scale is fp16, not bf16, and that is load bearing.** Every source format already stores this
 scale as fp16 — PTQ1_0's, TQ1_0's and TQ2_0's `d` are `ggml_half`, and `pb16i`'s `ms * 2^e_ref` is an
@@ -626,6 +653,7 @@ got before.
 | `logprobs` | `true` reports each generated token's log-probability on `/v1/chat/completions` (streamed or not); the values are the raw distribution, before `top_k`/`top_p`/`temperature` and before any grammar mask, as OpenAI and vLLM report them |
 | `top_logprobs` | `0`-`100` alternatives per token, highest raw logit first; needs `logprobs: true` |
 | `stop` | up to 4 strings: generation stops before the first match, and the tail is held back so a stop split across two tokens still matches |
+| `chat_template_kwargs` | `{"enable_thinking": false}` makes the assistant turn start with the empty `<think>\n\n</think>\n\n` block Qwen3's own template emits, so the answer goes to `content` instead of into a `<think>` block (and its tokens get logprob entries). Default `true`; a non-boolean is a 400 |
 | `grammar` | a GBNF grammar in llama.cpp's format (`third_party/llama.cpp/grammars/*.gbnf`) the answer cannot leave |
 | `response_format` | `{"type": "json_object"}` constrains the answer to JSON; `{"type": "json_schema", "json_schema": {"schema": …}}` constrains it to that JSON Schema |
 
@@ -633,7 +661,9 @@ got before.
 {token, logprob, top_logprobs: [{token, logprob}]}`; streamed, each chunk carries the entries whose bytes that
 chunk carries, so the deltas add up to the non-streamed reply. Token text that is half a character is reported with the invalid bytes replaced, never as a failed
 request. Entries exist for **`content` tokens only**: a reasoning delta and tool-call markup get no
-logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. The `/v1/completions` route's legacy logprobs object
+logprobs entry, because `app/npu_answer_parser.h` says where the content boundary is. On a Qwen3 model that
+means a thinking reply reports none at all, which is why `chat_template_kwargs.enable_thinking: false` is
+what a logprob comparison wants. The `/v1/completions` route's legacy logprobs object
 is not implemented and asking for it there is a 400, not a silently dropped field.
 
 `json_schema` is compiled to a grammar before the first token, by `app/npu_json_schema.h`, so the answer

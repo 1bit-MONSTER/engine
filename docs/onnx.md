@@ -134,6 +134,67 @@ cannot load costs that design and nothing else**: `init_elf` returning false mar
 (`no QDQ kernel for KxN: I8Ctx init_elf failed for <path> (MxKxN)`) while the other configured designs keep
 running, and only a configuration in which *every* design is refused disables the device as a whole.
 
+**A shape with no design is a build, not a limit.** All seven of Qwen3-0.6B's projection shapes are covered
+on this box: o_proj (2048×1024) and down_proj (3072×1024) come with the xclbins, and q_proj (1024×2048),
+k_proj/v_proj (1024×1024) and gate_proj/up_proj (1024×3072) were emitted from the iso-build design generator —
+one `-M 128 -K <K> -N <N> -c 4` run of `n1_core_i8_v26.py` through the IRON/MLIR-AIE `aiecc` per shape, with
+the `load_pdi` injection `generators/elf_emit.sh` documents. The generator and the resulting ELFs live in that
+tree, never here. The proof's `quark-kv` and `quark-gu` cases are exactly the two shapes that had neither a
+case nor a design, so a new shape is one line in the `Case[]` table plus one build. On this toolchain
+`aiecc --full-elf-name` exits **0 and writes nothing**; `--get-full-elf` is the flag that emits the ELF (its
+bundle is larger than the xclbin-derived ELFs beside it, and the runtime accepts it — the `|d| = 0` results
+above are the evidence, not the file size).
+
+**What the device leg is worth, measured.** `onebit_npu_gemm_q8_probe` puts one shape through the same
+`gemm_q8_raw` and through the EP's own host loop with int8 operands, requires their exact int32 accumulators to
+be identical, and times both — `repeats` calls *timed* on each leg after one untimed device warm-up, and the
+min of three runs per cell. strixhalo, M=32 designs, `-O2` build, load 9–10 on 32 cores, in an `npu-hold`
+ticket. **The array ramps**: in a ticket whose *first* measurement is a small-row cell, every device figure comes
+out a uniform ~1.8× high and settles by the sixth configuration (measured, same shapes, same binary), so the
+first shapes of a cold run are not quotable — the table below was taken after nine warm-up configurations of the
+same shape.
+
+| shape | rows | device ms/call | host ms/call | device vs host |
+|---|---|---|---|---|
+| 1024×2048 (q) | 1 | 1.501 | 0.158 | 9.5× **slower** |
+| | 2 | 1.550 | 0.317 | 4.9× slower |
+| | 4 | 1.526 | 0.669 | 2.3× slower |
+| | 8 | 1.515 | 1.319 | 1.1× slower |
+| | 16 | 1.529 | 2.550 | 1.7× faster |
+| | 32 | 1.566 | 5.062 | 3.2× faster |
+| 1024×1024 (k, v) | 1 / 32 | 0.781 / 0.824 | 0.078 / 2.529 | 10× slower / 3.1× faster |
+| 1024×3072 (gate, up) | 1 / 32 | 2.440 / 2.425 | 0.235 / 7.765 | 10.4× slower / 3.2× faster |
+| 2048×1024 (o) | 1 / 32 | 1.499 / 1.493 | 0.180 / 5.017 | 8.3× slower / 3.4× faster |
+| 3072×1024 (down) | 1 / 32 | 2.209 / 2.311 | 0.250 / 7.602 | 8.8× slower / 3.3× faster |
+
+A call costs the same at 1 row and at 32 — q_proj is 1.501 ms against 1.566 ms, i.e. 32× the work for 4 % more
+time — so it is **dispatch-bound**: a decode step pays one launch per projection (196 of them on Qwen3-0.6B) and
+at one row that launch costs 8–10× the host loop it replaces. This is therefore a **prefill** leg: it crosses over
+between 8 and 16 rows and is 3.1–3.4× ahead at a full 32-row design. Design M is not the lever — an M=128
+design at one row measured 1.233 ms against M=32's 1.499 ms on 2048×1024 in this run and 1.606 vs 1.441 in an
+earlier one, i.e. the two are within run-to-run variance at decode width and neither changes the picture. The
+host column is a **lower bound**: it is the accumulation loop only, while the EP's real fallback then runs
+`epilogue_row` (a float multiply and a `q8_quantize` per element), so the 8–16-row crossover is optimistic *for
+the device*. `docs/onnx-pack.md` therefore keeps the device leg correctness-only rather than quoting a device
+speedup, and a decode-side win would need fewer, longer launches (one launch covering many projections), not a
+smaller design.
+
+*(An earlier revision of this table was ~5 % low on the device column: the probe timed `repeats-1` calls and
+divided by `repeats`. The figures above are the corrected ones, and `repeats < 2` — which used to print
+`device 0.000 ms/call` and a four-digit speedup — is now refused with exit 2.)*
+
+**What `gemm_q8` does with that number.** It routes by rows: below `kDeviceMinRows` — 16, declared once in
+`onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array; at or above
+it the device does. 16 is the first row count at which **no** measured projection shape was slower on the
+array, so the threshold is one constant rather than one per (K, N). A host-routed call is a choice, not a
+failure, and it does not look like one: it writes
+`npu_qdq_host_rows m=… k=… n=… min=16` to the trace. "The device ran this shape" therefore stays exactly
+"neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it" — an assertion a green `|d| = 0` line
+alone has never been (see `docs/onnx-pack.md`). `onebit_ep_qdq_proof` asserts the routing of *every* fused case
+against that same constant, so a decode-width routing regression and a prefill-width one fail in different
+places: with designs configured, `quark-stress` (64×1024×2048) must reach the device and every 5–8 row case must
+log `npu_qdq_host_rows`.
+
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the
 life of the process; when the lock is held it does not queue — it reports `device busy` and runs the

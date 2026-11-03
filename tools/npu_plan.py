@@ -38,8 +38,24 @@ import json
 import os
 import sys
 
-TOOL_VERSION = "1.0"
+TOOL_VERSION = "1.1"
 FORMAT = "1bit-npu-plan/1"
+
+# The two grids a projection's K and N live on, mirroring npu/forward/include/q4nx_pack.h
+# (q4nx_pad_k / q4nx_pad_n).  They are the container's chunk width (npu/q4nx.h kCols = 256) and the
+# full ELF's column pass (32 rows x 4 x cols(4) = 512).  A model already on both grids -- every one
+# validated before this existed -- is unchanged; a pack with hidden 896 is stored as K=1024 and its
+# kernels are built and named on the same grid (engine#845).
+K_GRID = 256
+N_GRID = 512
+
+
+def pad_k(k: int) -> int:
+    return (k + K_GRID - 1) // K_GRID * K_GRID
+
+
+def pad_n(n: int) -> int:
+    return (n + N_GRID - 1) // N_GRID * N_GRID
 
 
 def read_config(model_dir: str) -> dict:
@@ -96,9 +112,9 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
             vd = cfg.get("linear_num_value_heads", 0) * cfg.get("linear_value_head_dim", 0)
             if not (kh and vd):
                 raise SystemExit(f"layer {i} is GDN but config.json lacks the linear_* head dimensions")
-            entry["qkv"] = {"K": hidden, "N": 2 * kh + vd, "fused": True}
-            entry["attn_gate"] = {"K": hidden, "N": vd}
-            entry["ssm_out"] = {"K": vd, "N": hidden}
+            entry["qkv"] = {"K": pad_k(hidden), "N": pad_n(2 * kh + vd), "fused": True}
+            entry["attn_gate"] = {"K": pad_k(hidden), "N": pad_n(vd)}
+            entry["ssm_out"] = {"K": pad_k(vd), "N": pad_n(hidden)}
         else:
             nh = cfg.get("num_attention_heads", 0)
             nkv = cfg.get("num_key_value_heads", nh)
@@ -110,11 +126,33 @@ def layers_from_config(cfg: dict, n_layers: int, fused_gu: bool) -> list[dict]:
             # (npu/forward/src/q4nx_pack.c:150).  Without this the plan asks for a 3072-wide
             # QKV kernel on a container whose rows are 5120.
             q = nh * hd * (2 if cfg.get("attn_output_gate") else 1)
-            entry["qkv"] = {"K": hidden, "N": q + 2 * nkv * hd, "fused": True}
-        entry["gate_up"] = {"K": hidden, "N": 2 * im} if fused_gu else {"K": hidden, "N": im}
-        entry["down"] = {"K": im, "N": hidden}
+            entry["qkv"] = {"K": pad_k(hidden), "N": pad_n(q + 2 * nkv * hd), "fused": True}
+        entry["gate_up"] = {"K": pad_k(hidden), "N": pad_n(2 * im if fused_gu else im)}
+        entry["down"] = {"K": pad_k(im), "N": pad_n(hidden)}
         out.append(entry)
     return out
+
+
+def attention_mode(model_dir: str) -> str:
+    """The mask the pack itself declares, from `decision_config.json` beside the model.
+
+    A d3 readout pack is trained noncausal on its full-attention layers and says so; every other model
+    on this box has no `decision_config.json` and is causal, which is also the field's default in
+    `npu/plan/plan.h`.  An unknown value is refused here rather than defaulted, because the two modes
+    produce different numbers and a guessed mask is a silently different model.
+    """
+    path = os.path.join(model_dir, "decision_config.json")
+    if not os.path.isfile(path):
+        return "causal"
+    try:
+        with open(path, "rb") as f:
+            cfg = json.load(f)
+    except (OSError, ValueError) as exc:
+        raise SystemExit(f"{path}: cannot read the attention mode ({exc})")
+    mode = cfg.get("attention_mode", "causal")
+    if mode not in ("causal", "noncausal_full_attention"):
+        raise SystemExit(f"{path}: attention_mode {mode!r} is not causal or noncausal_full_attention")
+    return mode
 
 
 def artifact(model_dir: str, kernels: str, name: str) -> bool:
@@ -165,9 +203,12 @@ def generate(model_dir: str, kernels: str) -> dict:
         # int8 family and only its decode kernels carry the stream's suffix.  Probing with the decode tag on a
         # t2s container found neither artifact and wrote "fused", which the box's own pb16i container
         # contradicts (split) -- 2026-11-02.
+        #
+        # K and N are the padded grids (engine#845), the same ones the forward derives: a pack whose hidden is
+        # not a multiple of 256 has no artifact named after its un-padded shape.
         prefill_tag = "_b8" if layout == "b8" else ""
-        gu = f"full_i8_GU_K{hidden}_N{2 * im}{prefill_tag}.elf"
-        g = f"full_i8_G_K{hidden}_N{im}{prefill_tag}.elf"
+        gu = f"full_i8_GU_K{pad_k(hidden)}_N{pad_n(2 * im)}{prefill_tag}.elf"
+        g = f"full_i8_G_K{pad_k(hidden)}_N{pad_n(im)}{prefill_tag}.elf"
         fused_gu = artifact(model_dir, kernels, gu) or not artifact(model_dir, kernels, g)
     else:
         raise SystemExit(f"{model_dir}/config.json: intermediate_size is {im!r}")
@@ -200,6 +241,7 @@ def generate(model_dir: str, kernels: str) -> dict:
             if layout in ("pb16i", "t2s") else "",
         },
         "kernels": {"tag": tag},
+        "attention": {"mode": attention_mode(model_dir)},
         "moe": {"batched_expert_gu": moe_batched(cfg, hidden, model_dir, kernels)},
         "layers": layers,
     }
@@ -213,10 +255,10 @@ def moe_batched(cfg: dict, hidden: int, model_dir: str, kernels: str) -> dict:
     if not (isinstance(experts, int) and experts > 0 and isinstance(top_k, int) and top_k > 1):
         return {"enabled": False, "K": 0, "N": 0}
     for n in (8192, 16384):  # the widths the kernel set carries
-        if artifact(model_dir, kernels, f"full_i8_G_K{hidden}_N{n}.elf") and artifact(
-            model_dir, kernels, f"full_i8_U_K{hidden}_N{n}.elf"
+        if artifact(model_dir, kernels, f"full_i8_G_K{pad_k(hidden)}_N{n}.elf") and artifact(
+            model_dir, kernels, f"full_i8_U_K{pad_k(hidden)}_N{n}.elf"
         ):
-            return {"enabled": True, "K": hidden, "N": n}
+            return {"enabled": True, "K": pad_k(hidden), "N": n}
     return {"enabled": False, "K": 0, "N": 0}
 
 
@@ -269,7 +311,8 @@ def main(argv=None) -> int:
         f.write(text)
     os.replace(tmp, out)
     print(f"wrote {out} ({len(plan['layers'])} layers, gate/up {plan['fusion']['gate_up']}, "
-          f"layout {plan['container']['layout']}, tag {plan['kernels']['tag'] or 'none'})")
+          f"layout {plan['container']['layout']}, tag {plan['kernels']['tag'] or 'none'}, "
+          f"attention {plan['attention']['mode']})")
     return 0
 
 

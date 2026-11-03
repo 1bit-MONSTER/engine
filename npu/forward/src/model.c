@@ -1189,6 +1189,28 @@ static int parse_json_metadata(const uint8_t* json_data, uint64_t json_len,
         
         ptrdiff_t key_len = key_end - key_start;
         const char* key_str = key_start;
+
+        /* The importer's own manifest lives under `__metadata__` and is a nested list of
+         * {name, dtype, shape, source} records: it carries a "dtype" and a "shape" like a
+         * tensor, and it has no "data_offsets", so a flat walk pairs its fields with the real
+         * table's (a `1bit npu-pack import` container resolved its embedding to the manifest's
+         * `q4_1` record plus the lm_head's byte range, and init then failed on a dequant of the
+         * wrong thing).  Skip the whole object, so metadata can never shadow a tensor.
+         * shortcut: brace counting, not a JSON scanner -- a brace inside a *string* value would
+         * end the skip early; upgrade if a metadata note ever contains one. */
+        if (key_len == 12 && memcmp(key_str, "__metadata__", 12) == 0) {
+            const char* open = key_end;
+            while (open < end && *open != '{') open++;
+            if (open >= end) break;
+            int depth = 0;
+            const char* q = open;
+            for (; q < end; q++) {
+                if (*q == '{') depth++;
+                else if (*q == '}' && --depth == 0) { q++; break; }
+            }
+            p = q;
+            continue;
+        }
         
         /* A tensor entry is any key whose value object carries a "dtype" (or a
          * "...weight" name).  The plain decoder uses exact ".weight" keys and

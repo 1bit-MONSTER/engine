@@ -14,7 +14,7 @@ WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
 See the License for the specific language governing permissions and
 limitations under the License.
 -->
-# 1bit engine: local LLMs on the AMD Ryzen AI MAX+ 395
+# 1bit engine: local LLM inference on AMD Strix Halo (Ryzen AI MAX+ 395)
 
 [![License: Apache-2.0](https://img.shields.io/badge/license-Apache--2.0-blue)](LICENSE)
 [![Lemonade pin: last bump](https://img.shields.io/github/last-commit/1bit-MONSTER/engine?path=third_party%2Flemonade&label=Lemonade%20pin&color=f5c518)](https://github.com/1bit-MONSTER/engine/tree/main/third_party/lemonade)
@@ -22,8 +22,11 @@ limitations under the License.
 [![Documentation: 1bit.gg](https://img.shields.io/badge/docs-1bit.gg-1779e1)](https://1bit.gg/)
 [![Discord](https://img.shields.io/badge/chat-Discord-5865F2)](https://discord.gg/fa5m4Vawpa)
 
-Boot a USB stick, and your AMD Ryzen AI MAX+ 395 (Strix Halo) machine serves local LLMs on its GPU and NPU,
-on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemonade). That is the whole setup.
+One binary to rule them all: the 1bit engine is a model-agnostic local LLM inference engine for the
+AMD Ryzen AI MAX+ 395 (Strix Halo) on Linux. It serves any GGUF on the Radeon 8060S iGPU (`gfx1151`)
+through HRX with our own HIP kernels, and models on the XDNA 2 NPU through our own NPU runtime, as a
+backend of AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemonade) and its OpenAI-compatible API.
+Boot a USB stick, and the machine serves local LLMs on its GPU and NPU. That is the whole setup.
 
 ## Get started
 
@@ -34,7 +37,7 @@ on Linux, through AMD's [Lemonade Server](https://github.com/lemonade-sdk/lemona
 
 Already running Lemonade on Ubuntu? The `lemonade-onebit` package from the same releases page adds the engine as a Lemonade backend; nothing else changes ([docs/lemonade.md](docs/lemonade.md)).
 
-## What it is
+## What it is: one model-agnostic binary for the GPU and the NPU
 
 One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face architecture, any GGUF quantization, Ryzen AI NPU packs and ONNX graphs, served by one Lemonade backend on the AMD Ryzen AI MAX+ 395 (Strix Halo). It runs the Radeon 8060S iGPU through HRX with our own HIP kernels, and the XDNA 2 NPU through our own NPU runtime, behind the OpenAI-compatible API Lemonade already gives you. Every model is checked on the hardware before it ships; the models and their measured numbers are one page: [docs/models.md](docs/models.md).
 
@@ -52,7 +55,7 @@ One binary to rule them all. The 1bit engine is model agnostic: any Hugging Face
 
 The release goes out when every item on the release checklist is done ([docs/releases.md](docs/releases.md)); the weekly Lemonade pin moves with Lemonade's releases.
 
-## Documentation
+## Documentation and measured results
 
 - [1bit.gg](https://1bit.gg/): the docs site, built from this repository's `docs/`; [the blog](https://1bit.gg/blog.html) is the build log.
 - [HRX on the Radeon 8060S](https://1bit.gg/hrx.html) and [the NPU engine](https://1bit.gg/npu.html): the two device routes, on the site.

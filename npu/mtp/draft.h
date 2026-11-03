@@ -167,6 +167,13 @@ struct Stats {
     // Per draft depth: rows offered at depth d, and how many of them the base model agreed with.  This is the
     // shape the offline protocol reports, and the only form in which "live equals offline" can be checked.
     int drafted_at[kMaxDepth] = {0}, accepted_at[kMaxDepth] = {0};
+    // The stream position of every chain this loop opened, and what that chain produced.  The offline protocol
+    // chains from EVERY position, so its per-depth table and this one are only the same measurement when it is
+    // scored at these positions -- and the drafts themselves are the only way to tell a feeding difference from a
+    // verification difference when the two disagree.
+    std::vector<int> chain_at;
+    std::vector<std::vector<int>> chain_drafts;
+    std::vector<int> chain_accepted;
     double hit_at(int d) const {
         return (d >= 0 && d < kMaxDepth && drafted_at[d]) ? double(accepted_at[d]) / double(drafted_at[d]) : 0.0;
     }
@@ -223,6 +230,7 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
 
         std::vector<int> d;
         std::vector<float> conf;
+        r.stats.chain_at.push_back(have);
         int nd = head->draft(base.last_hidden(), t1, have, k, d, &conf);
         if (nd <= 0) continue;
         nd = std::min(nd, k);
@@ -259,6 +267,8 @@ inline Result run(BaseModel& base, DraftHead* head, const std::vector<int>& prom
             take++;
         }
         r.stats.accepted += a;              // acceptance is a property of the model, not of the budget
+        r.stats.chain_drafts.push_back(std::vector<int>(d.begin(), d.begin() + nd));
+        r.stats.chain_accepted.push_back(a);
         for (int i = 0; i < a && i < Stats::kMaxDepth; i++) r.stats.accepted_at[i]++;
         if (a == 0) r.stats.first_reject++;
 

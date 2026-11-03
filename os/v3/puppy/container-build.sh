@@ -42,6 +42,11 @@ ln -sf bash /bin/ash
 # old). The host clone is mounted read-only at /woof and is never patched, so it is the honest source.
 rm -rf /work/woof-CE
 cp -a /woof /work/woof-CE
+# and root-owned, because `cp -a` carries the host user: we run as root in here, and git refuses a repository owned
+# by another uid ("detected dubious ownership in repository at /work/woof-CE") - which merge2out hits when it undoes
+# its VCS workarounds. Measured on the first cycle-16 build: that step failed once the fresh copy replaced the old
+# root-owned tree. It also keeps the image's ownership policy true from the first file.
+chown -R 0:0 /work/woof-CE
 cd /work/woof-CE
 mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
 [ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories

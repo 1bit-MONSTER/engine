@@ -163,14 +163,22 @@ def cmd(c, timeout=600):
     return re.sub(r"__E[0-9]+__[0-9]{10,}\s*$", "", out.decode("utf-8", "replace"))
 
 rows = []
+ANSI = re.compile(r"\x1b\[[0-9;]*[A-Za-z]|\x1b\][^\x07]*\x07")
+def clean(text):
+    """the console's own noise: colours, and the prompt that prefixes the first line of output"""
+    text = ANSI.sub("", text)
+    text = re.sub(r"[a-z0-9_-]+@[a-z0-9_-]+:[^$#]*[$#]\s*", "", text)
+    text = re.sub(r"bash-[0-9.]+#\s*", "", text)
+    return text
+
 def row(name, cmdline, timeout=600):
-    t0 = time.time()
     out = cmd(cmdline, timeout)
     if out is None:
         rows.append(("FAIL", name, "no answer")); return ""
-    body = "\n".join(l.strip() for l in out.splitlines() if l.strip() and cmdline[:20] not in l)
+    body = clean(out)
+    body = "\n".join(l.strip() for l in body.splitlines() if l.strip() and cmdline[:20] not in l)
     rows.append(("INFO", name, body.replace("\n", " | ")[:400]))
-    return out
+    return body
 
 # 1. the firmware as it is BEFORE the install, so the "first Boot####" trap is visible by name
 row("fw before", "efibootmgr | head -6")
@@ -187,9 +195,9 @@ espuuid = [l.strip() for l in espuuid.splitlines() if re.match(r"^[0-9a-fA-F-]{8
 espuuid = espuuid[-1] if espuuid else ""
 
 # ---- the verdicts, on the firmware state rather than on the installer's log line
-bootnext = re.search(r"^BootNext: ([0-9A-Fa-f]{4})", after or "", re.M)
-bootorder = re.search(r"^BootOrder: (.*)$", after or "", re.M)
-entries = dict(re.findall(r"^Boot([0-9A-Fa-f]{4})\* ([^\r\n]+)", after or "", re.M))
+bootnext = re.search(r"BootNext: ([0-9A-Fa-f]{4})", after or "")
+bootorder = re.search(r"BootOrder: ([0-9A-Fa-f,]+)", after or "")
+entries = dict(re.findall(r"Boot([0-9A-Fa-f]{4})\* ([^\r\n]+)", after or ""))
 onebit = [i for i, l in entries.items() if l.strip().startswith("1bit OS")]
 
 print("== %s" % img)

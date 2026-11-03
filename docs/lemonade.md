@@ -70,6 +70,15 @@ The recipe lives in our Lemonade fork,
 Lemonade plus the `onebit` backend (fork PR #1). Build `lemond` from the fork and
 put `1bit` on PATH (or set `$LEMONADE_ONEBIT_BIN`).
 
+Without the engine the recipe is still listed, but its models are not: `/api/v1/models?show_all=true`
+answers **180 rows, 0 of them `onebit`**, against **207 rows, 27 `onebit` (4 of them `*-NPU-1bit`) with
+`LEMONADE_ONEBIT_BIN` set** — measured on the packaged `lemond` of `lemonade-onebit-rc-2026-11-02`, the
+release's own. `/api/v1/system-info` says why: the recipe's `hrx`/`npu` backends read `state: installable`,
+"the 1bit binary was not found", against `installed`/`0.0.1` when it is. `/models` itself carries no
+reason, so the row count is the check — which is the argument for starting lemond through the release
+package's own `lemond-onebit` launcher: a unit that ran `bin/lemond` directly would serve an appliance
+with no onebit models and no error.
+
 The engine pins the Lemonade it is tested with: `third_party/lemonade` is the fork at a
 fixed commit. It is never linked into the engine. `scripts/build-lemonade.sh` builds
 `lemond` and the `lemonade` CLI from it:

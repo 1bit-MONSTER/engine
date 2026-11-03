@@ -37,4 +37,12 @@ fi
 if ! grep -q 'pfix=[^ ]*nox' /proc/cmdline 2> /dev/null; then
     exec /bin/plogin
 fi
+# Cycle 18 (pi-tui, ~/briefs/TCONSOLE-TUI.md): the full-screen TUI is the console when the image has one. It does
+# not exit on `q` on purpose (a console that drops to a bare prompt is the cycle-13 defect), so BOTH a zero exit and
+# a non-zero one mean the same thing here: something went wrong or a person quit the screen, and the dialog menu is
+# the fallback the cycle-15 gates were written against. Nothing to fall back from if the binary is absent.
+if [ -x /usr/local/bin/1bit-console-tui ]; then
+    /usr/local/bin/1bit-console-tui
+    printf '\n1bit-console-tui exited (%s) - starting the dialog menu\n' "$?" > /dev/tty1 2> /dev/null || true
+fi
 exec /usr/local/bin/1bit-console-menu

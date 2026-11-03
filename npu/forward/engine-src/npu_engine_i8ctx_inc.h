@@ -25,6 +25,7 @@
 #include <cstring>
 #include <cstdint>
 #include <cmath>
+#include <chrono>
 #include <vector>
 #include <memory>
 #include <climits>
@@ -321,12 +322,15 @@ struct I8Ctx {
     // the critical path (~30ms/tok for 20 layers). Instead allocate one
     // weight BO per (layer, expert) at startup, pack+sync once, and pass the
     // BO handle directly at decode.
-    std::unique_ptr<xrt::bo> make_weight_bo(xrt::device& d) {
+    // `zero` is false only where the whole BO is about to be overwritten by an image read
+    // (load_pb16i_into zeroes whatever tail it does not write itself), because for the
+    // pb16i/t2s containers the memset was 6.8 GB of writes per serve that nothing read.
+    std::unique_ptr<xrt::bo> make_weight_bo(xrt::device& d, bool zero = true) {
         // The amdxdna driver rejects a group-less xrt::bo, so use the same
         // xrt::ext::bo allocation init_elf's mkbo uses.
         xrt::ext::bo b{d, w_bytes()};
         auto bo = std::make_unique<xrt::bo>(b);
-        if (void* m = bo->map()) memset(m, 0, w_bytes());
+        if (zero) if (void* m = bo->map()) memset(m, 0, w_bytes());
         return bo;
     }
 
@@ -339,12 +343,25 @@ struct I8Ctx {
         const char* const tag = t2s ? "t2s" : "pb16i";
         const size_t want = t2s ? q4nx_t2s::w_bytes(KD, ND) : q4nx_pb16i::w_bytes(KD, ND);
         const std::string imgp = stem + (t2s ? ".t2s" : ".pb16i"), refp = stem + ".ref";
+        // The image IS the BO's contents, so read it straight into the mapping: the old path
+        // zero-filled a `want`-byte vector, then memcpy'd it in, which is four passes over the
+        // whole 6.8 GB of decode weights per serve (measured with NPU_PB16I_TIMING=1; see the
+        // 2026-11-02 cold-start entry).  NPU_FILL_COPY=1 keeps the copying path for an A/B.
+        if (bo.size() < want) {   // before the read: the direct path reads into the mapping
+            fprintf(stderr, "  %s: weight BO is %zu B, needs %zu\n", tag, (size_t)bo.size(), want);
+            return false;
+        }
+        const bool direct = getenv("NPU_FILL_COPY") == nullptr;
+        std::vector<uint8_t> img(direct ? 0 : want);
+        uint8_t* buf = direct ? (uint8_t*)bo.map() : img.data();
+        if (!buf) { fprintf(stderr, "  %s: cannot map the weight BO\n", tag); return false; }
+        const auto f0 = std::chrono::steady_clock::now();
         FILE* f = fopen(imgp.c_str(), "rb");
         if (!f) { fprintf(stderr, "  %s: cannot open %s\n", tag, imgp.c_str()); return false; }
-        std::vector<uint8_t> img(want);
-        const size_t got = fread(img.data(), 1, want, f);
+        const size_t got = fread(buf, 1, want, f);
         const int extra = fgetc(f);
         fclose(f);
+        const auto f1 = std::chrono::steady_clock::now();
         if (got != want || extra != EOF) {
             fprintf(stderr, "  %s: %s is not %zu bytes (K=%d N=%d)\n", tag, imgp.c_str(), want,
                     KD, ND);
@@ -360,21 +377,32 @@ struct I8Ctx {
             fprintf(stderr, "  %s: %s is not e_ref[%d] + one mode byte\n", tag, refp.c_str(), ND);
             return false;
         }
-        if (bo.size() < want) {
-            fprintf(stderr, "  %s: weight BO is %zu B, needs %zu\n", tag, (size_t)bo.size(), want);
-            return false;
+        if (direct) {
+            if (bo.size() > want)   // the padded tail the kernel never writes: keep it zero
+                memset((uint8_t*)bo.map() + want, 0, (size_t)bo.size() - want);
+        } else {
+            memcpy(bo.map(), img.data(), want);
         }
-        memcpy(bo.map(), img.data(), want);
+        const auto f2 = std::chrono::steady_clock::now();
         bo.sync(XCL_BO_SYNC_BO_TO_DEVICE);
+        const auto f3 = std::chrono::steady_clock::now();
+        if (getenv("NPU_PB16I_TIMING")) {
+            auto ms = [](auto a, auto b) {
+                return std::chrono::duration<double, std::milli>(b - a).count();
+            };
+            fprintf(stderr, "[fill] %-8s %s bytes=%zu read=%.2f copy=%.2f sync=%.2f ms\n",
+                    direct ? "direct" : "copy", stem.c_str(), want, ms(f0, f1), ms(f1, f2),
+                    ms(f2, f3));
+        }
         // NPU_PB16I_HASH=1: one line per image actually loaded, so a run can answer "is this
         // tensor's image non-zero, and is it different from its neighbours" without a device
         // probe.  The stem carries (layer, tag), which is what a per-launch gate cannot see.
         if (getenv("NPU_PB16I_HASH")) {
             unsigned long long h = 1469598103934665603ULL;
             const size_t n = want < 4096 ? want : 4096;
-            for (size_t i = 0; i < n; i++) { h ^= img[i]; h *= 1099511628211ULL; }
+            for (size_t i = 0; i < n; i++) { h ^= buf[i]; h *= 1099511628211ULL; }
             unsigned long long nz = 0;
-            for (size_t i = 0; i < n; i++) nz += (img[i] != 0);
+            for (size_t i = 0; i < n; i++) nz += (buf[i] != 0);
             fprintf(stderr, "[%s-image] %s mode=%d planes=%d first4k_fnv=%016llx nonzero=%llu/%zu\n",
                     tag, stem.c_str(), mode, pb16i_planes, h, nz, n);
         }

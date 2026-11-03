@@ -321,6 +321,29 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
+#### The image fill (what a fresh serve costs)
+
+A pb16i/t2s container's weights *are* the sidecar images, so a cold serve is a file read and nothing
+else: `load_pb16i_into()` `fread`s each image **straight into the weight BO's mapping**, then syncs
+once. The earlier path zero-filled a `want`-byte vector, `fread` into it, `memcpy`'d it into the BO and
+allocated the BO zeroed as well — four passes over the whole 6.8 GB of decode weights — and nothing
+read the zeros. `NPU_FILL_COPY=1` keeps that path so the two can be A/B'd, and `NPU_PB16I_TIMING=1`
+prints `[fill] <mode> <stem> bytes= read= copy= sync=` per image (431 images, one line each):
+
+| (Bonsai-2 t2s, 431 images, 6.82 GB) | read | copy | sync | first request, 8 tok |
+|---|---|---|---|---|
+| copying loader | 0.25 s | 0.39 s | 0.09 s | 6.35 s |
+| **read into the BO** | 0.36 s | **0.01 s** | 0.11 s | **5.92 s** |
+
+Same greedy text, `amdxdna` errors 0. Both halves ran in one ticket with the page cache warmed first,
+because otherwise the second half reads from cache and the difference looks like a loader win.
+
+**The rest of the "cold start" is the disk, not the loader.** `dd iflag=direct` over the image set reads
+**2.16 GB/s**, so 6.82 GB is **3.2 s** of device time the loader cannot avoid; with a warm page cache
+the same fill is 0.47 s. A first request on a fresh serve therefore costs one fill (0.5 s warm, ~3.2 s
+cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
+per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model

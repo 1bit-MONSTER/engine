@@ -1,0 +1,58 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/18onboard-mdns - the appliance announces itself as `1bit-os.local` (cycle 21, owner 2026-11-04: the
+# clickable-links ask, so http://1bit-os.local:13305 works from ryzen or a phone without reading an address off the
+# console).
+#
+# Two things the rootfs does not do for itself, both measured on the built resolute64 tree before this shipped:
+#   * PID 1 is not systemd, so nothing starts a D-Bus SYSTEM bus - and avahi-daemon exits without one ("Failed to
+#     connect to system bus"). /usr/bin/dbus-daemon is in the image; there is simply no service that starts it.
+#   * the `avahi` (and `messagebus`) ACCOUNT is missing: woof-CE installs a package by unpacking it, so the adduser
+#     in Debian's postinst never ran, and avahi-daemon drops to `avahi` and chroots to /run/avahi-daemon before it
+#     will run. Rather than invent a system account in the image, it is given --no-drop-root --no-chroot: this
+#     appliance runs its services as root anyway (10lemonade, sshd), and the two flags only skip the privilege drop.
+#
+# rc.services runs every executable script in /etc/init.d with `start`; the mode is part of the gate. Nothing on the
+# box depends on mDNS - it is how a CLIENT finds the box - so a failure here is logged and never stops the boot.
+LOG=/var/log/mdns.log
+say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$@" >> "$LOG" 2>/dev/null; }
+
+[ -x /usr/sbin/avahi-daemon ] || { say "no /usr/sbin/avahi-daemon in this image; 1bit-os.local is not announced"; exit 0; }
+
+mkdir -p /run/dbus /run/avahi-daemon
+
+if [ ! -S /run/dbus/system_bus_socket ]; then
+    if command -v dbus-daemon >/dev/null 2>&1; then
+        dbus-daemon --system --fork 2>>"$LOG" || say "dbus-daemon --system failed; avahi cannot start without a bus"
+    else
+        say "no dbus-daemon in this image; avahi cannot start without a system bus"
+    fi
+fi
+
+avahi_pid() { cat /run/avahi-daemon/pid 2>/dev/null; }
+if pid=$(avahi_pid) && [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    say "avahi-daemon already running (pid $pid)"
+elif [ -S /run/dbus/system_bus_socket ]; then
+    if /usr/sbin/avahi-daemon --daemonize --no-drop-root --no-chroot 2>>"$LOG"; then
+        say "avahi-daemon up: $(hostname).local is announced on this network"
+    else
+        say "avahi-daemon failed to start (see the lines above); the console menu still prints the address"
+    fi
+else
+    say "no system bus, so 1bit-os.local is not announced; the console menu still prints the address"
+fi
+exit 0

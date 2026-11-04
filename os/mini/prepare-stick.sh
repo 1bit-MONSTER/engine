@@ -446,6 +446,17 @@ for d in $NPUMODELS; do
     ok "models/$name registers as the entry '$name-1bit' (onebit_backend npu, by init.sh) and 1bit-release-check asks the NPU through it"
 done
 
+# Cycle 21, item 9b (the c20 board): a medium that carries the NPU model and no GGUF has nothing for chat-hrx to ask,
+# so the GPU route is never exercised on hardware - the c20 stick shipped exactly that, and the board's chat-hrx row had
+# no model to send to. An NPU-only medium is legitimate, so this is not a FAIL: it is a line saying what this stick can
+# and cannot answer, with the flag that adds the other half.
+ggufs=$(find "$MNT/models" -maxdepth 1 -name '*.gguf' 2>/dev/null | wc -l)
+if [ "$ggufs" -gt 0 ]; then
+    ok "models/ holds $ggufs GGUF(s), so chat-hrx has a model to ask"
+else
+    ok "no GGUF in models/ - chat-hrx has nothing to ask; --model <file.gguf> stages one (the NPU model alone is NPU-only)"
+fi
+
 # a stick that would not survive a pull is worth knowing about now, not at the console
 printf '\nfree space on the data partition: %s\n' "$(df -h "$MNT" | awk 'NR==2 {print $4}')"
 if [ -n "${KEY:-}" ] && [ "$KEY" != mint ]; then printf 'api key (first 6): %s\n' "$(printf '%s' "$KEY" | cut -c1-6)"; fi

@@ -1,0 +1,62 @@
+#!/bin/sh
+# Copyright 2026 bong-water-water-bong
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+#
+# /etc/init.d/18onboard-mdns - the appliance announces itself as `1bit-os.local` (cycle 21, owner 2026-11-04: the
+# clickable-links ask, so http://1bit-os.local:13305 works from ryzen or a phone without reading an address off the
+# console).
+#
+# Two things the rootfs does not do for itself, both measured on the built resolute64 tree before this shipped:
+#   * the `avahi` (and `messagebus`) ACCOUNT is missing: woof-CE installs a package by unpacking it, so the adduser
+#     in Debian's postinst never ran, and avahi-daemon drops to `avahi` and chroots to /run/avahi-daemon before it
+#     will run. Rather than invent a system account in the image, it is given --no-drop-root --no-chroot: this
+#     appliance runs its services as root anyway (10lemonade, sshd), and the two flags only skip the privilege drop.
+#   * nothing in /etc/init.d starts the responder.
+#
+# DO NOT name the D-Bus bus binary in this file, not even in a comment. /etc/rc.d/rc.services runs every executable
+# script in /etc/init.d with `start` but FIRST does `grep -qF` for that one string and skips the script if it appears
+# anywhere in the text - Puppy uses it to avoid starting the bus twice. Measured on the c20 image: the bus binary is
+# /usr/bin/…-daemon is in the image and rc.sysinit already runs it --system (line ~695) BEFORE rc.services (line
+# ~727), and the board's own messages.log shows a live bus (it was trying to activate org.freedesktop.login1). So this
+# service only WAITS for that socket; naming the binary here would silently disable the whole feature. container-build.sh
+# asserts the packed script against rc.services' own rule, so that silence cannot come back.
+#
+# rc.services runs every executable script in /etc/init.d with `start`; the mode is part of the gate. Nothing on the
+# box depends on mDNS - it is how a CLIENT finds the box - so a failure here is logged and never stops the boot.
+LOG=/var/log/mdns.log
+say() { printf '%s %s\n' "$(date -u +%FT%TZ)" "$@" >> "$LOG" 2>/dev/null; }
+
+[ -x /usr/sbin/avahi-daemon ] || { say "no /usr/sbin/avahi-daemon in this image; 1bit-os.local is not announced"; exit 0; }
+
+mkdir -p /run/dbus /run/avahi-daemon
+
+# rc.sysinit starts the system bus before rc.services; on a slow medium it can still be a moment behind.
+i=0
+while [ "$i" -lt 10 ] && [ ! -S /run/dbus/system_bus_socket ]; do sleep 1; i=$((i + 1)); done
+if [ ! -S /run/dbus/system_bus_socket ]; then
+    say "no system bus socket (/run/dbus/system_bus_socket) 10 s after rc.sysinit; 1bit-os.local is not announced"
+    exit 0
+fi
+
+avahi_pid() { cat /run/avahi-daemon/pid 2>/dev/null; }
+pid=$(avahi_pid)
+if [ -n "$pid" ] && kill -0 "$pid" 2>/dev/null; then
+    say "avahi-daemon already running (pid $pid)"
+elif /usr/sbin/avahi-daemon --daemonize --no-drop-root --no-chroot 2>>"$LOG"; then
+    say "avahi-daemon up: $(hostname).local is announced on this network"
+else
+    say "avahi-daemon failed to start (see the lines above); the console menu still prints the address"
+fi
+exit 0

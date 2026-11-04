@@ -580,15 +580,22 @@ rows = [
     # it has to be the release package's binary, not something a package manager left behind.
     ("U3 cli",       "ls -l /usr/local/bin/lemonade; readlink /usr/local/bin/lemonade; "
                      "lemonade --version 2>&1 | head -2", "/opt/1bit-package/bin/lemonade"),
-    # U4 (cycle 12 item 4): the release check ships in the appliance. In the VM its GPU/NPU rows SKIP (no
-    # device), so this row records what it said instead of asserting a PASS: the board run is the one that
-    # has to be 0 FAIL / 0 SKIP, and this row proves the tool runs and which rows it could not answer here.
+    # U4 (cycle 12 item 4): the release check ships in the appliance. Its GPU/NPU rows SKIP in the VM (no device), and
+    # the board run is the one that has to be 0 FAIL. Cycle 21: this row no longer just RECORDS the result - the c20
+    # image reached the owner with release-check saying `FAIL models` and every chat row SKIPped while this row printed
+    # it as INFO. It now fails on the same line the board reads.
     ("U4 release-check", "/usr/local/bin/1bit-release-check --self-test 2>&1 | tail -1; "
                      "/usr/local/bin/1bit-release-check > /tmp/release-check.log 2>&1; "
                      "sed -n 's/^\\(FAIL\|SKIP\\)  *\\([a-z0-9-]*\\).*/\\1 \\2/p' /tmp/release-check.log "
                      "| tr '\\n' ' '; echo; "
                      "grep '^RESULT' /tmp/release-check.log; "
-                     "grep -c '^PASS ' /tmp/release-check.log", None, 900),
+                     "grep -c '^PASS ' /tmp/release-check.log", "RESULT: PASS", 900),
+    # Item 10 (owner 2026-11-04): the appliance announces itself as 1bit-os.local, so http://1bit-os.local:13305 is a
+    # link a phone can click. Two halves are asserted HERE: a responder is up, and the name resolves on the box.
+    # Whether a PEER on the LAN sees it needs multicast from outside the guest, which a QEMU user-mode network does
+    # not carry - that is the board's row, and the hand-off says so instead of implying this one covers it.
+    ("U2 mdns", "tail -2 /var/log/mdns.log 2>/dev/null; pidof avahi-daemon >/dev/null 2>&1 && echo avahi-up; "
+                "getent hosts 1bit-os.local", "1bit-os.local"),
     # U6 (cycle 12 item 5): the installer the release ships, and the tools it needs on this boot.
     ("U6 installer", "ls -l /usr/local/bin/1bit-install | tail -1; "
                      "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "

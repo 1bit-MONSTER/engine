@@ -378,6 +378,16 @@ if(OpenMP_CXX_FOUND)
 endif()
 add_dependencies(onebit onebit_npu_forward_syntax)
 
+# What one MTP head step costs on the HOST (tools/mtp_head_bench.cpp).  The draft route's per-iteration cost is two
+# base passes plus the drafter's logits calls (both on the array) and the head's own arithmetic (this host), so this
+# is the only term measurable without the device -- and the term a maths change has to be stated on.  It also prints
+# a hash of every output hidden, so "no number moves" is checked bit for bit instead of argued.
+add_executable(mtp_head_bench tools/mtp_head_bench.cpp npu/mtp/mtp_head.cpp)
+target_include_directories(mtp_head_bench PRIVATE npu)
+if(OpenMP_CXX_FOUND)
+    target_link_libraries(mtp_head_bench PRIVATE OpenMP::OpenMP_CXX)
+endif()
+
 # ── MoE expert streaming (docs/moe-streaming.md) ─────────────────────────
 # The routed-expert cache: pinned RAM slots filled with O_DIRECT reads, and
 # `1bit moe-cache`, which replays expert traces through it. Linux only.

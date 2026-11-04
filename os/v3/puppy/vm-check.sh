@@ -712,6 +712,11 @@ rows = [
                      "iptables -C INPUT -p udp --dport 5353 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null && echo udp-5353-open; "
                      "pidof avahi-daemon > /dev/null && echo avahi-up; tail -1 /var/log/mdns.log 2>&1",
                      "udp-5353-open"),
+    # cycle 24: the outbound half, a row of its own rather than a second substring in the row above (one row matches
+    # ONE substring, so a second token there would print and never be compared - the #989 lesson).
+    ("U3 mdns out",  "iptables -S OUTPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
+                     "iptables -C OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2>/dev/null && echo udp-5353-out",
+                     "udp-5353-out"),
     ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]

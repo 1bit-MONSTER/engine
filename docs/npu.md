@@ -505,6 +505,19 @@ contract are the model; the reader is written from the pack-side facts in
 `amd-oss/npu-re/docs/FACTS-oga-pack-weight-layout.md`, and no vendor library, wheel or compiled
 program is called or shipped.
 
+**A pack can be the weights without the text.** AMD's `_rai_1.8.0_npu_4K` repos do publish the
+model's own `tokenizer.json`, `tokenizer_config.json`, `vocab.json`, `merges.txt`,
+`chat_template.jinja`, `special_tokens_map.json`, `added_tokens.json` and `generation_config.json`,
+but they are separate files in a repo of ~70, so a pack fetched weight by weight — which is how they
+are pulled on this box — can be `model.onnx` + `model.onnx.data` + `dd_metastate_*.fconst` +
+`config.json` and nothing else (engine#1024). The importer copies whatever text is there and,
+because the command that fails without it is `1bit serve` ("not an NPU model directory"), both
+commands now say which artifacts the pack has: `npu-pack info` carries
+`text_artifacts: {present, missing, servable}` and `npu-pack import` prints the split, or a
+`WARNING:` naming `tokenizer.json` when the pack has none. The split is also recorded in the
+container's `config.json` (`q4nx_source.text_artifacts`), so a container states whether it ever had
+the text.
+
 What converts, and how faithfully:
 
 | pack tensor | where | to | fidelity |

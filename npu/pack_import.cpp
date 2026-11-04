@@ -862,6 +862,11 @@ std::string Plan::manifest() const {
                         {"down_groups_measured", mlp_down_groups},
                         {"note", mlp_note}};
     j["incomplete"] = refused();
+    const TextArtifacts text = scan_text_artifacts(dir);
+    j["text_artifacts"] = {{"present", text.present},
+                           {"missing", text.missing},
+                           // a container is servable only with tokenizer.json (docs/npu.md)
+                           {"servable", text.tokenizer}};
     return j.dump(2);
 }
 
@@ -1162,6 +1167,27 @@ double corr(const Q4& q, const uint8_t* embed, int H, int rows) {
 }
 
 }  // namespace
+
+// The pack's text artifacts, in one place: the importer copies exactly these, and `info` reports
+// which are there before anything is written.
+static const char* const kTextFiles[] = {"tokenizer.json",
+                                         "tokenizer_config.json",
+                                         "vocab.json",
+                                         "merges.txt",
+                                         "added_tokens.json",
+                                         "special_tokens_map.json",
+                                         "chat_template.jinja",
+                                         "generation_config.json"};
+
+TextArtifacts scan_text_artifacts(const std::string& pack_dir) {
+    TextArtifacts t;
+    for (const char* f : kTextFiles) {
+        if (fs::exists(pack_dir + "/" + f)) t.present.push_back(f);
+        else t.missing.push_back(f);
+    }
+    t.tokenizer = fs::exists(pack_dir + "/tokenizer.json");
+    return t;
+}
 
 Report import_pack(const std::string& pack_dir, const std::string& out_dir, const Options& opt) {
     const Plan p = plan(pack_dir);
@@ -1575,18 +1601,20 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
     {
         std::ifstream cf(pack_dir + "/config.json");
         json c = json::parse(cf);
+        const TextArtifacts ta = scan_text_artifacts(pack_dir);
         c["vocab_size"] = V;
         c["attention_bias"] = r.attn_bias_tensors > 0;  // what the container actually carries
         c["q4nx_source"] = {{"converter", "1bit npu-pack import"},
                             {"pack", p.pack},
                             {"layout", "q4nx-1"},
-                            {"incomplete", r.refused.size()}};
+                            {"incomplete", r.refused.size()},
+                            // so a container read months later states whether it ever had text
+                            {"text_artifacts", ta.present.empty() ? "none in the pack"
+                                                                  : "copied from the pack"}};
         std::ofstream out(out_dir + "/config.json");
         out << c.dump(2) << "\n";
     }
-    for (const char* f : {"tokenizer.json", "tokenizer_config.json", "vocab.json", "merges.txt",
-                          "added_tokens.json", "special_tokens_map.json", "chat_template.jinja",
-                          "generation_config.json"}) {
+    for (const char* f : kTextFiles) {
         const std::string src = pack_dir + "/" + f;
         if (fs::exists(src)) fs::copy_file(src, out_dir + "/" + f, fs::copy_options::overwrite_existing);
     }
@@ -1602,7 +1630,7 @@ int run(int argc, char** argv) {
         "  <pack dir>  a Ryzen AI OGA NPU model pack (*_rai_*_npu_*: model.onnx,\n"
         "              model.onnx.data, dd_metastate_*.fconst, config.json, tokenizer)\n"
         "  info        print what the pack states as JSON; writes nothing\n"
-        "  import      write <out dir>/model.q4nx + config.json (+ tokenizer files)\n"
+        "  import      write <out dir>/model.q4nx + config.json (+ the pack's text files, if any)\n"
         "  --allow-incomplete  write what is representable and list the rest in the\n"
         "              container's manifest instead of refusing\n";
     if (argc < 1) {
@@ -1682,6 +1710,26 @@ int run(int argc, char** argv) {
     if (!r.fconst_note.empty()) std::printf("  fconst:     %s\n", r.fconst_note.c_str());
     if (!r.refused.empty()) std::printf("  incomplete: %zu tensors, listed in %s/model.q4nx\n",
                                         r.refused.size(), out.c_str());
+    const TextArtifacts ta = scan_text_artifacts(dir);
+    if (ta.tokenizer) {
+        std::printf("  text:       %zu of %zu tokenizer/chat files copied", ta.present.size(),
+                    sizeof(kTextFiles) / sizeof(*kTextFiles));
+        if (!ta.missing.empty()) {
+            std::printf(", absent from the pack:");
+            for (const auto& f : ta.missing) std::printf(" %s", f.c_str());
+        }
+        std::printf("\n");
+    } else {
+        // Not every pack has them, and the run that fails without them is two commands later.
+        std::printf("  text:       none -- this pack ships no tokenizer.json\n");
+        std::fprintf(stderr,
+                     "WARNING: %s carries no tokenizer.json, so %s has weights and config.json\n"
+                     "  only and `1bit serve` will refuse it as not an NPU model directory. Put the\n"
+                     "  model's own text artifacts there (tokenizer.json, tokenizer_config.json,\n"
+                     "  vocab.json, merges.txt, chat_template.jinja) -- e.g. from the upstream\n"
+                     "  checkpoint the pack was built from.\n",
+                     dir.c_str(), out.c_str());
+    }
     return 0;
 }
 

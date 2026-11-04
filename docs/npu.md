@@ -772,9 +772,11 @@ $ curl -sS localhost:8000/v1/completions -d '{"prompt": [151646, 785, 6722, 315,
 
 Supplied ids are used exactly as given — nothing is tokenized and no BOS is inserted — which is what a
 parity run against llama.cpp needs: the same *text* reaches the two engines through two tokenizers and one
-prompt-construction rule each, so only supplied ids make the comparison about the forward. An id outside
-the vocabulary, a non-integer element, or an empty array is a 400 that names the position, never a clamped
-or dropped one. OpenAI's array-of-strings batch form is not implemented and is refused by the same rule.
+prompt-construction rule each, so only supplied ids make the comparison about the forward. `151646` above is
+*Zyphra/ZR1-1.5B's* BOS id; another container's BOS is a different id, and pasting the wrong one is the
+out-of-vocabulary 400 below rather than a silently different prompt. An id outside the vocabulary, a
+non-integer element, or an empty array is a 400 that names the position, never a clamped or dropped one.
+OpenAI's array-of-strings batch form is not implemented and is refused by the same rule.
 
 ### Decisions (`/v1/systemone`, issue #653)
 

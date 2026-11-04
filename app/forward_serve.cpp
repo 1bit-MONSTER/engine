@@ -150,10 +150,12 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
         return;
     }
-    std::string prompt;
+    std::string prompt;  // the chat template, or a string prompt; documents say nothing for an ids prompt
     // Set when /v1/completions was given the prompt as token ids (llama.cpp's shape): the ids are then
     // the prompt and nothing is tokenized or prepended -- that is what makes a two-engine parity run
-    // compare the forward instead of the tokenizer (app/npu_prompt_ids.h).
+    // compare the forward instead of the tokenizer (app/npu_prompt_ids.h).  `prompt` stays empty on that
+    // path and nothing reads it: the token count, the context guard and the prefix-cache key all come
+    // from `ids`.  Do not log `prompt` as the request's text without handling this case first.
     std::vector<int> prompt_ids;
     bool prompt_is_ids = false;
     try {

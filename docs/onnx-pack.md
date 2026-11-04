@@ -215,9 +215,23 @@ intermediate float tensor then never exists.
   per (K, N)**, and a shape that has none is a build rather than a missing capability: o_proj's and
   down_proj's ship beside the other xclbins, and q/k/v's and gate/up's came out of one `-M 128 -K <K>
   -N <N> -c 4` run of the iso-build generator each (`n1_core_i8_v26.py` through the IRON/MLIR-AIE
-  `aiecc`), the artifacts living beside the other xclbins and never in this repository. And it is a
-  **correctness** result so far; it is *not* a decode-side speed one, because a device call is
-  dispatch-bound. So `gemm_q8` routes by rows: below `kDeviceMinRows` — 16, one constant in
+  `aiecc`), the artifacts living beside the other xclbins and never in this repository. It is a
+  **correctness** result — and at model level it is **not yet a speed one**, which is now measured rather
+  than suspected. Same export, a Release build of this tree, a quiet box (load 1.2–1.4), one thread, a
+  32-token prompt and 8 generated tokens: the array's arm does **1074 / 1105 ms/token against the host
+  kernel's 947 / 951**, i.e. 1.13–1.16× *slower* than the leg it replaces (and 1.7× behind the A8W8 CPU EP
+  at 625 / 628, 4.8× behind float32 at 226); the 32-token prefill is a wash, 805 / 809 against 843 / 845.
+  The kernels are ahead **in isolation** — 1.54–1.89× per call at a decode step's 36 rows and 3.1× at a
+  32-row prefill block — and that advantage does not survive the model. These measurements do not, by
+  themselves, say which of the two candidate reasons it is: 196 dispatches per pass, each paying BO
+  writes, two syncs and a wait; or the host loop being faster on the graph's real operands than on the
+  probe's synthetic ones (`docs/onnx.md` explains why the second cannot be excluded). What is measured is
+  the sign, not the cause; `NPU_C_SYNC_PROF=1` on one call is the next step. (Those arms, like every
+  number on this page, come from a Release build: the EP targets carry no `-O2` of their own, and an
+  unoptimized host loop inflates the device-against-host ratio by ~25×.)
+  `docs/onnx.md` ("What the device leg is worth at model level") carries the four-arm table, the per-shape
+  accounting and the trace evidence. A decode-side win needs fewer, longer launches. So
+  `gemm_q8` routes by rows: below `kDeviceMinRows` — 16, one constant in
   `onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array, and at
   or above it the device does. A host-routed call logs `npu_qdq_host_rows m=… k=… n=… min=16`, so "the device
   ran this shape" stays "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it". 12 rows is where

@@ -229,6 +229,20 @@ def main():
         silent = pathlib.Path(tmp) / "silent.log"
         silent.write_text("I slot print_timing: id 0 | task 1 | eval time\n", encoding="utf-8")
         assert bench.placement_summary(silent) is None, bench.placement_summary(silent)
+    # The artifact has to name the *model file* too, and by the hash its own gate keys on: the references
+    # in HL_STATE are per box and a changed file silently drops them, so before this a report could not say
+    # which file its score and its KLD verdict belonged to (all 150 result JSONs on this box name the model
+    # only by file name, inside a hardcoded `model_id` string).
+    with tempfile.TemporaryDirectory() as tmp:
+        model = pathlib.Path(tmp) / "Qwen3.8-27B-UD-Q4_K_XL.gguf"
+        model.write_bytes(b"GGUF" + b"\0" * 4096)
+        ident = bench.model_identity(model)
+        assert ident["path"] == str(model), ident
+        assert ident["sha256"] == bench.sha256_head(model), ident
+        assert ident["sha256"] == hashlib.sha256(model.read_bytes()).hexdigest(), ident
+        # A different file under the same name is a different model, which is the point.
+        model.write_bytes(b"GGUF" + b"\0" * 4095)
+        assert bench.model_identity(model)["sha256"] != ident["sha256"]
 
     print("hyperloom_benchmark_test: OK")
     return 0

@@ -302,6 +302,21 @@ def build_identity(onebit, bin_dir):
     }
 
 
+def model_identity(model):
+    """Name the model file, with the fingerprint the quality gate itself compares against.
+
+    Same class as ``build_identity`` and ``device_stack``, one level closer to the number: the gate's
+    references are per box in ``HL_STATE`` and are keyed by this fingerprint (``ref.json``'s ``model``), so
+    a report that names the model only by file name cannot say which file its score and its KLD verdict
+    belong to. That case is not hypothetical here: the weights were re-downloaded after a restore while
+    the gate references survived, i.e. the same file name on this box can be a different file.
+    ``sha256_head`` is the gate's own notion of model identity (header + first tensors, not 17 GB), so a
+    result and a reference can be checked against each other by hash rather than by name.
+    """
+    model = pathlib.Path(model)
+    return {"path": str(model), "sha256": sha256_head(model)}
+
+
 def device_stack():
     """Name the device stack the measurement came from: kernel and the HSA runtime HRX loads.
 
@@ -569,6 +584,7 @@ def main():
     longtok = env_int("HL_LONGTOK", 128)
     deadline = time.time() + env_int("HL_BUDGET_SEC", 780 if not longctx else 1200)
 
+    model_ident = model_identity(model)
     log(f"model={model} bin={bin_dir} state={state}")
     log(f"device={device_stack()}")
     log(f"levers={levers() or '{}'}")
@@ -585,6 +601,7 @@ def main():
         "total_output_tokens": tokens,
         "quality_gate": {"passed": False, "reason": "not run"},
         "bench_summary": {"levers": levers(), "runner_type": env("RUNNER_TYPE"),
+                          "model": model_ident,
                           "build": build_identity(onebit, bin_dir),
                           "device_stack": device_stack(),
                           "drafting": drafting_identity(),
@@ -631,7 +648,7 @@ def main():
     result["request_throughput"] = round(result["total_token_throughput"] / tokens, 4)
 
     # 3. the gate: reference halves are recorded on the first (baseline) measurement only.
-    fingerprint = sha256_head(model)
+    fingerprint = model_ident["sha256"]
     ref = {}
     if ref_path.is_file():
         try:

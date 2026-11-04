@@ -623,6 +623,28 @@ rows = [
     ("U6 installer", "ls -l /usr/local/bin/1bit-install | tail -1; "
                      "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "
                      "command -v efibootmgr mkfs.vfat mkfs.ext4; echo installer-present", "installer-present"),
+    # Cycle 21 (owner: "the stick moves to Linux 7.4-rc1"). What this row can say is what the ARTIFACT carries: its
+    # kernel release. BTF gets its OWN row below, because a row passes on ONE substring (`want in body`): with the BTF
+    # probe folded in here, a board with no /sys/kernel/btf/vmlinux still printed PASS as long as uname matched - the
+    # report-without-failing class this row exists to close (pi-prs' #989 verdict, 4 Nov).
+    ("U4 kernel",   "uname -r", "7.4.0-rc1-1bit"),
+    # BTF is a 7.4 fact worth a row because the 7.4 board boot showed it working (systemd attaches bpf-restrict-fs
+    # instead of logging "Failed to load BPF object"). -s, not ls: an empty file is not a BTF blob.
+    ("U4 btf",      "ls -l /sys/kernel/btf/vmlinux 2>&1 | awk '{print $5\" bytes\"}'; "
+                    "[ -s /sys/kernel/btf/vmlinux ] && echo btf-vmlinux-present", "btf-vmlinux-present"),
+    # OUR driver, never the in-tree one (owner word). The kernel ships an in-tree amdxdna as well, so presence proves
+    # nothing: the assertion is the RESOLVED PATH - depmod gives updates/ priority, and a renamed or dropped module
+    # would silently load the in-tree driver.
+    ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -n ec_su_axb35",
+                      "/updates/amdxdna.ko"),
+    # And the module has to be the one THIS kernel can load and this appliance trusts: vermagic must name the image's
+    # release and the signer must be our MOK. Both are asserted in one token, because one substring per row is all the
+    # harness compares - printing them and matching the path, as this row did before pi-prs' verdict, passed a module
+    # built for another kernel or signed by someone else.
+    ("U4 driver sig", "s=$(modinfo -F signer amdxdna); v=$(modinfo -F vermagic amdxdna | cut -d' ' -f1); "
+                      "echo signer=$s; echo vermagic=$v; "
+                      "[ \"$s\" = 'strixhalo Secure Boot Kernel' ] && [ \"$v\" = '7.4.0-rc1-1bit' ] && "
+                      "echo driver-signed-and-vermagic-ok", "driver-signed-and-vermagic-ok"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
     # BEFORE any in-VM fix runs: on an image that carries the fixes these two say so (root, and 1), on an
     # older image they say what is missing. The fix rows below then repair it so the login can still be
@@ -690,6 +712,11 @@ rows = [
                      "iptables -C INPUT -p udp --dport 5353 -s 10.0.0.0/8 -j ACCEPT 2>/dev/null && echo udp-5353-open; "
                      "pidof avahi-daemon > /dev/null && echo avahi-up; tail -1 /var/log/mdns.log 2>&1",
                      "udp-5353-open"),
+    # cycle 24: the outbound half, a row of its own rather than a second substring in the row above (one row matches
+    # ONE substring, so a second token there would print and never be compared - the #989 lesson).
+    ("U3 mdns out",  "iptables -S OUTPUT | grep -E -- '-p udp.*--dport 5353.*-j ACCEPT' | head -2; "
+                     "iptables -C OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2>/dev/null && echo udp-5353-out",
+                     "udp-5353-out"),
     ("net addr",     "ip -4 -o addr show 2>/dev/null | tr -s ' '", None),
     ("net route",    "ip -4 route 2>/dev/null | head -3", None),
 ]

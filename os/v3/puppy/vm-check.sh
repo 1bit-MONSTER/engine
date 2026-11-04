@@ -498,9 +498,26 @@ rows = [
                      "grep -q '^AllowHostnameUpdates = false' /etc/connman/main.conf && echo hostname-dhcp-pinned",
                      "hostname-dhcp-pinned"),
     # Cycle 17 item 2: the boot's evidence is on the DATA partition, not in RAM.
-    ("U3 boot logs", "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
-                     "ls /data/logs/*/dmesg.log > /dev/null 2>&1 && grep -q cmdline /data/logs/*/BOOT && "
+    # Cycle 22 (TOS3-NOTE-c21-logs): the log has to be ON the partition AND the daemon has to be alive. The 4 Nov
+    # failure was a boot whose /data mounted after 06onboard-logs' one-shot test: no log on the stick, no daemon, and
+    # nothing failing. A 1bit-logs that only tested "can I mkdir" would have written the "persisted" log to RAM and
+    # reported success, which is why the mount point is part of the marker.
+    ("U3 boot logs", "grep -q ' /data ' /proc/mounts && echo data-is-mount; "
+                     "pgrep -f '1bit-logs daemon' > /dev/null && echo logs-daemon-running; "
+                     "ls -d /data/logs/*/ 2> /dev/null | tail -2; "
+                     "grep -q cmdline /data/logs/*/BOOT 2> /dev/null && "
+                     "grep -q ' /data ' /proc/mounts && pgrep -f '1bit-logs daemon' > /dev/null && "
                      "echo boot-logs-on-data", "boot-logs-on-data"),
+    # The same mechanism, by hand, in the guest: the daemon is pointed at a directory that is NOT a mount point
+    # (nothing may be written there - that is the RAM log), then a tmpfs is mounted over it late, which is /data
+    # arriving after 06onboard-logs ran. The log must appear without anything restarting the daemon.
+    ("U3 logs wait", "d=/tmp/logs-late; umount $d 2> /dev/null; rm -rf $d; mkdir -p $d; "
+                     "ONEBIT_LOG_DATA=$d 1bit-logs daemon > /tmp/logs-late.out 2> /tmp/logs-late.err & "
+                     "p=$!; sleep 4; pre=$(ls $d 2> /dev/null | wc -l); "
+                     "mount -t tmpfs none $d && sleep 10; post=$(find $d -name BOOT 2> /dev/null | wc -l); "
+                     "kill $p 2> /dev/null; umount $d 2> /dev/null; "
+                     "echo \"logs-wait pre=$pre post=$post\"; tail -2 /tmp/logs-late.err; "
+                     "[ \"$pre\" = 0 ] && [ \"$post\" -ge 1 ] && echo logs-wait-for-data", "logs-wait-for-data"),
     # Cycle 17 item 1: menu item 6 can never reset the machine - the guard is built and a reboot THROUGH it is
     # refused, which is the same call xwin's exit path makes (`exec reboot`) and the WM's shutdown menu makes.
     ("U2 desktop safe", "1bit-desktop --check | tail -3; 1bit-desktop --guard-test 2>&1 | tail -2",

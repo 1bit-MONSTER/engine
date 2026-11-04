@@ -42,6 +42,12 @@ KEEP=5
 BOOTID_FILE=${ONEBIT_BOOTID_FILE:-/tmp/1bit-logs.bootid}
 say() { printf '%s\n' "$*"; }
 
+# Is $DATA a mounted partition? Not "can I mkdir" - $DATA is a directory even when the partition never mounted
+# (05onboard-data mkdirs it before mounting), so a missing mount would put the "persisted" log on the RAM-backed
+# root instead, and nothing would say so. Measured 4 Nov (TOS3-NOTE-c21-logs): four of five boots kept no log on the
+# partition and nothing was logged anywhere.
+mounted() { grep -q " $DATA " /proc/mounts 2> /dev/null; }
+
 # The id has to be stable within one boot and different across boots, and it must not need a clock read on every
 # call (the daemon and every snap would otherwise name a different directory). /proc/sys/kernel/random/boot_id is
 # exactly that; the wall clock is only a label for a person reading the directory listing.
@@ -54,6 +60,7 @@ bootid() {
 }
 
 dir() {
+    mounted || return 1
     mkdir -p "$ROOT" 2> /dev/null || return 1
     d=$ROOT/$(bootid)
     mkdir -p "$d" 2> /dev/null || return 1
@@ -100,7 +107,7 @@ append_new() {
 }
 
 snap() {
-    d=$(dir) || { say "1bit-logs: nothing persists (no $DATA)"; return 1; }
+    d=$(dir) || { say "1bit-logs: nothing persists ($DATA is not a mounted partition)"; return 1; }
     [ -n "${1:-}" ] && printf '%s %s\n' "$(date -u +%FT%TZ 2> /dev/null)" "$1" >> "$d/markers"
     append_new dmesg dmesg "$d"
     append_new messages /var/log/messages "$d"
@@ -127,9 +134,15 @@ prune() {
 }
 
 daemon() {
-    # rc.services runs this with `start` at boot; a boot with no data partition keeps nothing and says so once,
-    # rather than looping over a directory that cannot exist.
-    d=$(dir) || { say "1bit-logs: no $DATA, this boot's logs stay in RAM"; exit 0; }
+    # rc.services runs this with `start` at boot, and the partition can mount AFTER that point (measured 4 Nov: /data
+    # mounted 3.7 min into a boot, and a one-shot test is what lost that boot's log). So wait for it instead of
+    # giving up: a boot where /data ever mounts has its evidence, and one where it never does is said once.
+    waited=
+    while ! d=$(dir); do
+        [ -n "$waited" ] || { say "1bit-logs: $DATA is not mounted yet - waiting for it (nothing is persisted until then)"; waited=1; }
+        sleep 5
+    done
+    [ -n "$waited" ] && say "1bit-logs: $DATA is mounted after waiting, this boot's logs go to $d"
     prune
     n=0
     while : ; do

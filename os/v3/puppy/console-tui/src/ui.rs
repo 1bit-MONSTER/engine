@@ -714,26 +714,9 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     let mut top: Vec<Line<'static>> = Vec::new();
     let mut menu: Vec<Line<'static>> = Vec::new();
     let mut qr: Option<(u16, Vec<Line<'static>>)> = None;
-    if !a.full_logs {
-        top.push(header(&a.facts));
-        top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
-        // the QR is drawn to the RIGHT of the CONNECT rows, so the block has to be as tall as the code; when the
-        // screen cannot hold both (80x25 - the URL there is plain text, which a phone's camera reads too) it is
-        // absent rather than squeezed into the log pane's rows
-        if let Some((qw, rows)) = qr_panel(&a.facts, &top[1..], w, h) {
-            top.resize(top.len().max(2 + rows.len()), Line::from(""));
-            qr = Some((qw, rows));
-        }
-        if wide {
-            top.extend(panel_grid(&a.facts, w));
-        } else {
-            top.extend(compact_status(&a.facts, w));
-        }
-        // the MENU sits between the facts and the log, always whole, one numbered row per action
-        menu.push(rule("MENU", w));
-        menu.extend(menu_rows(w));
-    }
 
+    // The footer is built here, before the QR, because the code has to be charged for the rows it costs: the
+    // frame is exactly the terminal, and a code that does not fit takes a rule or the panel grid with it.
     let mut footer: Vec<String> = vec![if a.full_logs {
         "q back   arrows scroll   f newest   r refresh   1-9 actions".to_string()
     } else {
@@ -752,6 +735,31 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
         .flat_map(|s| wrap_words(s, w))
         .map(|s| styled(s, Some(Color::DarkGray), false))
         .collect();
+
+    if !a.full_logs {
+        top.push(header(&a.facts));
+        top.extend(connect_block(&a.facts, crate::facts::token(a.spin), w));
+        let facts: Vec<Line<'static>> = if wide {
+            panel_grid(&a.facts, w)
+        } else {
+            compact_status(&a.facts, w)
+        };
+        // the MENU sits between the facts and the log, always whole, one numbered row per action
+        menu.push(rule("MENU", w));
+        menu.extend(menu_rows(w));
+        // The QR is drawn to the RIGHT of the CONNECT rows, so the block has to be as tall as the code. It is only
+        // drawn when the WHOLE frame still fits (a log title and one log row are the floor): the first version
+        // charged it 12 rows, counted by hand, which at 104x29 let it take the panel grid's rows and paint its
+        // quiet zone over the MENU rule (measured; `the_qr_never_costs_another_block_a_row` sweeps the sizes).
+        if let Some((qw, rows)) = qr_panel(&a.facts, &top[1..], w) {
+            let padded = top.len().max(2 + rows.len());
+            if padded + facts.len() + menu.len() + 2 + footer.len() <= h {
+                top.resize(padded, Line::from(""));
+                qr = Some((qw, rows));
+            }
+        }
+        top.extend(facts);
+    }
 
     // the log pane is the only flexible row: it gets what the fixed rows leave, and the pane's own title is the
     // first of its rows (counting it twice left the last console row blank at 80x25 - measured)
@@ -842,12 +850,7 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
 /// The web UI URL as a scannable block, drawn on paper (black on white: a scanner wants dark-on-light) to the
 /// right of the CONNECT rows. `None` when the screen cannot hold both - the QR is 33 columns wide for a
 /// 27-character URL and 80x25 has no 33 free columns beside the block, so there the URL stays plain text.
-fn qr_panel(
-    f: &Facts,
-    connect: &[Line<'static>],
-    w: usize,
-    h: usize,
-) -> Option<(u16, Vec<Line<'static>>)> {
+fn qr_panel(f: &Facts, connect: &[Line<'static>], w: usize) -> Option<(u16, Vec<Line<'static>>)> {
     let url = format!("http://{}:13305", f.ip()?);
     let rows = crate::qr::code(&url)?;
     let qw = rows[0].chars().count();
@@ -864,9 +867,9 @@ fn qr_panel(
         })
         .max()
         .unwrap_or(0);
-    // one column of air between the block and the code, and enough rows left for the panels, the nine menu rows,
-    // three log rows and the footer: a code that pushes the menu off the screen would be the cycle-14 failure again
-    if w < widest + qw + 2 || h < rows.len() + 12 {
+    // one column of air between the block and the code. The rows are the CALLER's question: it knows the panel
+    // grid, the nine menu rows, the log floor and the footer it is about to draw, and only it can count them.
+    if w < widest + qw + 2 {
         return None;
     }
     let paper = Style::default().fg(Color::Black).bg(Color::White);
@@ -1414,6 +1417,67 @@ mod tests {
         // menu rows or the three log rows off the screen. The URL stays plain text.
         let text = render_snapshot(&app(c16_board()), 80, 25);
         assert!(!text.contains('█'), "the QR took the 80x25 screen:\n{text}");
+    }
+
+    #[test]
+    fn the_qr_never_costs_another_block_a_row() {
+        // Measured on the shipped mode (blank key: six CONNECT rows, the widest block) at 104x29 - a plain ssh
+        // window - the code fit the width test, the layout then had one row too many, and ratatui gave the panel
+        // grid's rows to the code: `LEMONADE` was gone and the code's bottom quiet zone painted over the MENU
+        // rule (it came back as `MENU ----      -`). The frame is the terminal exactly, so the code is drawn only
+        // when every block still gets its rows.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [
+            (101u16, 29u16),
+            (104, 29),
+            (104, 33),
+            (104, 39),
+            (110, 34),
+            (120, 40),
+            (140, 40),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal"
+            );
+            assert!(
+                lines.last().is_some_and(|l| l.contains("1-9 actions")),
+                "{w}x{h}: the footer is not on the last row:\n{text}"
+            );
+            // a rule is its label and then nothing but dashes: a hole in one means the code was drawn over it
+            for label in ["CONNECT", "MENU"] {
+                let row = lines
+                    .iter()
+                    .find(|l| l.trim_start().starts_with(label))
+                    .unwrap_or_else(|| panic!("{w}x{h}: no {label} rule:\n{text}"));
+                let tail = row.trim_start().split_once(label).unwrap().1;
+                assert!(
+                    tail.trim().chars().all(|c| c == '-'),
+                    "{w}x{h}: the {label} rule has a hole in it ({row:?}):\n{text}"
+                );
+            }
+            // the panel grid is the block the old row budget used to eat
+            if w >= 100 {
+                assert!(
+                    text.contains("LEMONADE"),
+                    "{w}x{h}: the status panels lost their rows to the code:\n{text}"
+                );
+            }
+            // and the nine actions are whole, at every size
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} missing"
+                );
+            }
+        }
+        // the code still IS drawn where it fits - the fix must not have deleted it
+        assert!(render_snapshot(&app(c16_board()), 240, 67).contains('█'));
     }
 
     #[test]

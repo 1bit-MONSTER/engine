@@ -119,7 +119,7 @@ EXACT = {
 def to_q4_1(t):
     """A GGUF tensor as (codes, scale, zero, exact); an expert stack as expert-major rows."""
     K, N = int(t.shape[0]), int(t.shape[1])  # ggml order: ne0 = columns
-    if len(t.shape) == 3:
+    if is_expert_stack(t):
         N *= int(t.shape[2])  # expert e is rows [e*N, (e+1)*N) of the ggml stream
     if N % ROWS or K % COLS:
         raise SystemExit(f"{t.name}: {N} x {K} is not a whole number of 32 x 256 tiles")
@@ -235,11 +235,25 @@ def config(r, vocab):
     return {k: v for k, v in c.items() if v is not None}
 
 
+# The routed expert stacks, by NAME. Rank is not the test: a conv or an SSM/CCA kernel is 3-D too,
+# and taking `len(shape) == 3` as "expert stack" decomposed such a tensor into shape[2] "experts"
+# of shape[1] rows -- silently, because __metadata__.moe is only written for qwen3moe and verify()
+# runs planned() as well, so it checks the same wrong shape. A Zaya-style model (CCA conv weights)
+# would have packed garbage and verified clean.
+EXPERT_PARTS = {"ffn_gate_exps", "ffn_up_exps", "ffn_down_exps"}
+
+
+def is_expert_stack(t):
+    """A routed expert stack: 3-D AND one of the ggml ffn_*_exps parts, [K, N, E]."""
+    return len(t.shape) == 3 and part_of(t.name) in EXPERT_PARTS
+
+
 def planned(r):
     """(q4nx name, gguf tensor, kind), kind 'tiles', 'expert-tiles' or 'bf16'.
 
     The router stays bf16 (it runs on the host and its top-k must be the GGUF's own), as do the
-    norms and the embedding. A 3-D blk.N.ffn_*_exps tensor is a routed expert stack.
+    norms and the embedding. A 3-D blk.N.ffn_*_exps tensor is a routed expert stack; any other 3-D
+    tensor is refused here, by name, because the container has no way to record a conv kernel.
     """
     out = []
     names = {t.name for t in r.tensors}
@@ -247,8 +261,15 @@ def planned(r):
         n = hf_name(t.name)
         if len(t.shape) == 1 or t.name == "token_embd.weight" or part_of(t.name) in ROUTER:
             kind = "bf16"
+        elif is_expert_stack(t):
+            kind = "expert-tiles"
         else:
-            kind = "expert-tiles" if len(t.shape) == 3 else "tiles"
+            if len(t.shape) == 3:
+                raise SystemExit(
+                    f"{t.name}: 3-D tensor {'x'.join(str(d) for d in t.shape)} is not a routed expert "
+                    f"stack (only {', '.join(sorted(EXPERT_PARTS))} are); a dense 3-D weight cannot be "
+                    "tiled into 32 x 256 chunks")
+            kind = "tiles"
         out.append((n, t, kind))
     if "output.weight" not in names:
         emb = next(t for t in r.tensors if t.name == "token_embd.weight")

@@ -424,6 +424,19 @@ def placement_summary(path):
 KLD_MEAN_RE = re.compile(r"^Mean\s+KLD\s*:\s*([-+0-9.eE]+)", re.M)
 
 
+def gate_reference(ref, base_kld, texts_path):
+    """What a gate verdict is relative to.
+
+    A KLD mean is a distance to *these* base logits, and `HL_STATE` is per-box and regenerated when
+    the base is missing, so the same number reads `PASS` against a different reference. The result
+    JSON carried the half's own verdict (`kld_mean`, `texts_identical`) and nothing about the
+    reference, so a report from one session could not be compared with — or re-checked against —
+    another's.
+    """
+    return {"model": ref.get("model"), "levers": ref.get("levers"),
+            "base_kld_sha256": sha256_head(base_kld), "texts_sha256": sha256_head(texts_path)}
+
+
 def kld(ppl, model, args, base, wiki, timeout, out_dir):
     """Prefill-path KLD against the stored base logits; records the base when it is missing."""
     cmd = [ppl, "-m", str(model), "-f", str(wiki), "-c", "512", "--chunks", "8",
@@ -566,6 +579,8 @@ def main():
         result["bench_summary"]["score_geomean"] = round(geometric_mean(pp512, tg128, tps["code"]), 4)
         return finish(True, "reference_established")
 
+    # Only reachable when all three references exist (otherwise the run established them above).
+    result["quality_gate"]["reference"] = gate_reference(ref, base_kld, texts_path)
     differences = [k for k in gated_text_keys(ref_texts) if texts.get(k) != ref_texts[k]]
     identical = not differences
     result["quality_gate"]["texts_identical"] = identical

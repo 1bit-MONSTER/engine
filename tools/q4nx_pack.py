@@ -20,11 +20,16 @@ therefore pack identically; these functions live here so they cannot drift, and 
 that has no GGUF input does not need `gguf-py` installed to import them.
 
 Layout (npu/q4nx.h): a 2-D projection becomes q4_1 tiles of 32 rows x 256 columns, each tile
-5120 bytes -- bf16 scale and zero per row and 32-column group, then 4-bit codes.
+5120 bytes -- bf16 scale and zero per row and 32-column group, then 4-bit codes. A tensor a
+caller names on the command line can instead be stored as Q8 tiles (8704 bytes: the same bf16
+scale per row and 32-column group, then int8 codes at `column*32 + row`, the layout npu/q4nx.cpp
+and npu/forward/src/q4nx_dequant.c decode), which is what keeps a tensor that was never 4-bit
+(a Q6_K/Q8_0 source) at 8 bits instead of crushing it to 16 levels.
 """
 import numpy as np
 
 ROWS, COLS, GROUP, TILE = 32, 256, 32, 5120
+Q8 = 8704  # Chunk::Q8: 256 bf16 scales (512 B) + 32 x 256 int8 codes
 
 
 def bf16_bits(x):
@@ -69,6 +74,37 @@ def tiles(codes, scale, zero):
     packed = c[:, :, :, 0] | (c[:, :, :, 1] << 4)  # rt, h, r2, kt, g, j
     packed = packed.transpose(0, 3, 1, 4, 5, 2).reshape(RT * KT, 4096)  # rt, kt, h, g, j, r2
     return np.concatenate([plane(scale).view(np.uint8), plane(zero).view(np.uint8), packed], axis=1)
+
+
+def quantize_q8(w):
+    """f32 [N, K] -> symmetric int8 per 32-column group: codes int8, scale bf16."""
+    N, K = w.shape
+    g = w.reshape(N, K // GROUP, GROUP)
+    scale = from_bf16(bf16_bits(np.abs(g).max(-1) / 127.0))
+    safe = np.where(scale > 0, scale, 1.0)
+    codes = np.clip(np.rint(g / safe[..., None]), -127, 127).astype(np.int8)
+    return codes.reshape(N, K), scale
+
+
+def tiles_q8(codes, scale):
+    """Q8 parts -> [tiles, 8704]: bf16 scales (index g*32 + r), then int8 codes at c*32 + r."""
+    N, K = codes.shape
+    RT, KT = N // ROWS, K // COLS
+    sc = bf16_bits(scale).reshape(RT, ROWS, KT, 8)
+    sc = sc.transpose(0, 2, 3, 1).reshape(RT * KT, 256).view(np.uint8)
+    c = codes.reshape(RT, ROWS, KT, COLS).transpose(0, 2, 3, 1).reshape(RT * KT, COLS * ROWS)
+    return np.concatenate([sc, c.view(np.uint8)], axis=1)
+
+
+def untile_q8(raw, N, K):
+    """[tiles, 8704] Q8 -> f32 [N, K] (the decoder of npu/q4nx.cpp)."""
+    RT, KT = N // ROWS, K // COLS
+    t = raw.reshape(RT, KT, Q8)
+    sc = from_bf16(t[..., :512].copy().view(np.uint16)).reshape(RT, KT, 8, ROWS)
+    sc = sc.transpose(0, 3, 1, 2)  # rt, r, kt, g
+    c = t[..., 512:].copy().view(np.int8).reshape(RT, KT, COLS, ROWS).transpose(0, 3, 1, 2)
+    c = c.reshape(RT, ROWS, KT, COLS // GROUP, GROUP)  # column c = group*32 + inner
+    return (c.astype(np.float32) * sc[..., None]).reshape(N, K)
 
 
 def untile(raw, N, K):

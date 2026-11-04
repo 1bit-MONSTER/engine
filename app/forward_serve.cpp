@@ -40,6 +40,7 @@
 #include "npu_chatml.h"
 #include "npu_grammar.h"
 #include "npu_prefix_cache.h"
+#include "npu_prompt_ids.h"
 #include "npu_sampling.h"
 #include "npu_systemone.h"
 #include "tokenizer.h"
@@ -149,10 +150,20 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
         res.set_content(R"({"error":{"message":"request body is not JSON"}})", "application/json");
         return;
     }
-    std::string prompt;
+    std::string prompt;  // the chat template, or a string prompt; documents say nothing for an ids prompt
+    // Set when /v1/completions was given the prompt as token ids (llama.cpp's shape): the ids are then
+    // the prompt and nothing is tokenized or prepended -- that is what makes a two-engine parity run
+    // compare the forward instead of the tokenizer (app/npu_prompt_ids.h).  `prompt` stays empty on that
+    // path and nothing reads it: the token count, the context guard and the prefix-cache key all come
+    // from `ids`.  Do not log `prompt` as the request's text without handling this case first.
+    std::vector<int> prompt_ids;
+    bool prompt_is_ids = false;
     try {
-        prompt = chat ? npu::chatml(body.at("messages"), npu::thinking_from_body(body))
-                      : body.at("prompt").get<std::string>();
+        if (chat) prompt = npu::chatml(body.at("messages"), npu::thinking_from_body(body));
+        else {
+            prompt_is_ids = npu::prompt_ids_from_body(body, e.tok->size(), prompt_ids);
+            if (!prompt_is_ids) prompt = body.at("prompt").get<std::string>();
+        }
     } catch (const std::exception& ex) {
         res.status = 400;
         res.set_content(json{{"error", {{"message", std::string("bad request: ") + ex.what()}}}}.dump(), "application/json");
@@ -179,8 +190,8 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     }
     const npu::Grammar* gram = grammar.get();
     // A prompt this long cannot fit the context whatever it tokenizes to; refuse it before
-    // spending time on it.
-    if (prompt.size() > size_t(e.max_context) * 16) {
+    // spending time on it.  An id prompt states its own length, so the check runs on ids below.
+    if (!prompt_is_ids && prompt.size() > size_t(e.max_context) * 16) {
         res.status = 400;
         res.set_content(R"({"error":{"message":"prompt longer than the context"}})", "application/json");
         return;
@@ -195,15 +206,18 @@ void handle_generate(ForwardEngine& e, const httplib::Request& req, httplib::Res
     // Returns the finish_reason the request earned: "stop" for an end-of-sequence token,
     // a stop sequence or a grammar that allows nothing more, "length" when the token
     // budget ran out.
-    auto run = [&e, &req, prompt, max_tokens, chat, &opts, gram, &stats](
+    auto run = [&e, &req, prompt, prompt_ids, prompt_is_ids, max_tokens, chat, &opts, gram, &stats](
                    const std::function<bool(const std::string&, const std::vector<Emitted>&)>& on_text) {
         std::string finish = "stop";
-        // The tokenizer is const and keeps no per-call state, so it runs before the lock.
-        std::vector<int> ids = e.tok->encode(prompt);
+        // The tokenizer is const and keeps no per-call state, so it runs before the lock.  A caller
+        // that sent ids already stated the positions: they are used exactly, with no BOS inserted
+        // on top (inserting one there would re-introduce the one-token prompt difference an id
+        // prompt exists to remove).
+        std::vector<int> ids = prompt_is_ids ? prompt_ids : e.tok->encode(prompt);
         // A chat template that opens with {{- bos_token }} (MiniCPM5 and other
         // llama-class models) needs the BOS id: the ChatML prompt built above never
         // carries it, and those models derail into their special tokens without it.
-        if (chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
+        if (!prompt_is_ids && chat && e.add_bos && e.bos_id >= 0) ids.insert(ids.begin(), e.bos_id);
         if (ids.empty()) throw std::runtime_error("empty prompt");
         stats.prompt_tokens = int(ids.size());
         // The KV cache grows with every position: the prompt and the answer together stay

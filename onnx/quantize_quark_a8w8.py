@@ -164,10 +164,13 @@ def main() -> int:
     ap.add_argument(
         "--matmul-only",
         action="store_true",
-        help="exclude every node that is not a MatMul from quantisation. Quark's static flow also "
-        "quantises the activations of Mul/Sigmoid/Reshape/Transpose (attention's masking, rotary and "
-        "reshapes), and with a small calibration set those are what wreck the model: this flag keeps "
-        "A8W8 where the epilogue folds it and leaves everything else float",
+        help="exclude every node that is not a MatMul from being quantised as an op. Measured on a 0.6B "
+        "export: the 196 projection MatMuls get an activation Q/DQ, the 57 MatMuls without a constant "
+        "weight (attention's QK^T and AV, the rotary one) get none, and Quark still puts a Q/DQ pair on "
+        "the tensors those projections consume -- after 84 Mul and 28 Reshape nodes, all of which feed a "
+        "MatMul. That is the int8 activation side, not a non-MatMul op being quantised; without this flag "
+        "Quark also quantises the masking/softmax path, which with a small calibration set is what wrecks "
+        "the model",
     )
     args = ap.parse_args()
 

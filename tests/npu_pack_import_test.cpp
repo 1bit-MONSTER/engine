@@ -968,6 +968,111 @@ void test_qwen3_attn_sections() {
     }
 }
 
+// engine#1003: the post_attention_layernorm weight is the bytes after the block's post-attention header.
+// On a 2-header block that is the second header; on a Qwen3 4-header block it is the FOURTH, because the
+// second and third open the per-head QK norms. Reading the second one on every pack imported the k_norm
+// section's padding as post_attention_layernorm -- measured on Qwen3-1.7B: 1,920 of 2,048 values zero,
+// max 6.97, against the pack's real post-attention norm (all nonzero, 0.9919 correlated with the upstream
+// checkpoint). The crafted pack below puts a different recognisable value behind each header, so the check
+// is a known answer rather than a shape: the imported weight must be the last header's ramp and must NOT
+// be the second header's marker.
+void test_post_attn_norm_header(const std::string& root) {
+    const fs::path dir = fs::path(root) / "post-attn-hdr";
+    fs::remove_all(dir);
+    fs::create_directories(dir / "cache");
+    const int H = 128, L = 8;                 // locate_fconst wants >= 6 headers in the first GiB
+    const int64_t stride = 1 << 20;           // the locator ignores periods below 1e6
+    const int64_t h2 = 262144, h3 = 524288, h4 = 786432;   // the three in-block headers after the first
+    std::string fc(size_t(int64_t(L) * stride + 64 + H * 2), '\0');
+    auto put_bf16 = [&](int64_t off, float v) {
+        const uint16_t bits = pi::bf16_bits_of(v);
+        fc[size_t(off)] = char(bits & 0xFF);
+        fc[size_t(off) + 1] = char(bits >> 8);
+    };
+    for (int l = 0; l < L; ++l) {
+        const int64_t base = int64_t(l) * stride;
+        for (int64_t h : {int64_t(0), h2, h3, h4}) put_bf16(base + h, 1e-6f);   // bf16 0x3586, the Qwen eps
+        for (int i = 0; i < H; ++i) {
+            put_bf16(base + h2 + 64 + 2 * i, -3.0f);          // the k_norm section: NOT the post-attention norm
+            put_bf16(base + h4 + 64 + 2 * i, float(i + 1));   // the post-attention norm
+        }
+    }
+    put_bf16(int64_t(L) * stride, 1e-6f);     // the tail envelope's header
+    put_file((dir / "config.json").string(),
+             R"({"model_type":"qwen3","hidden_size":128,"intermediate_size":256,"num_hidden_layers":8,)"
+             R"("num_attention_heads":2,"num_key_value_heads":1,"head_dim":64,"vocab_size":128,)"
+             R"("rope_theta":1000000.0,"tie_word_embeddings":true,"rms_norm_eps":1e-06})");
+    put_file((dir / "model.onnx.data").string(), std::string(size_t(H) * size_t(H) * 4, '\x11'));
+    put_file((dir / "model.onnx").string(),
+             pb::model({pb::tensor("model.embed_tokens.weight", {H, H}, "model.onnx.data", 0,
+                                   int64_t(H) * H * 4)}, {}));
+    const std::string tok = (dir / "dd_metastate_Llm_Token_Token_crafted.fconst").string();
+    put_file(tok, fc);
+
+    const pi::FconstGeom g = pi::locate_fconst(tok, 0x3586);
+    check(g.stride == stride && g.period == 4,
+          "post-attn header: the crafted 4-header .fconst is locatable (stride " +
+              std::to_string(g.stride) + ", period " + std::to_string(g.period) +
+              (g.why.empty() ? "" : ", why: " + g.why) + ")");
+    check(g.h1 == h2, "post-attn header: h1 is the block's second header (" + std::to_string(g.h1) + ")");
+    check(g.post_attn_hdr() == h4,
+          "post-attn header: the post-attention header on a 4-header block is the LAST one (" +
+              std::to_string(g.post_attn_hdr()) + " vs " + std::to_string(h4) + ")");
+    check(g.post_attn_hdr() != g.h1,
+          "post-attn header: it is not h1, which is where the k_norm section opens");
+    {   // the 2-header case must be unchanged by the rule
+        std::string two(size_t(int64_t(L) * stride + 64 + H * 2), '\0');
+        for (int l = 0; l < L; ++l) {
+            const int64_t base = int64_t(l) * stride;
+            two[size_t(base)] = char(0x86);
+            two[size_t(base) + 1] = char(0x35);
+            two[size_t(base + h2)] = char(0x86);
+            two[size_t(base + h2) + 1] = char(0x35);
+        }
+        two[size_t(int64_t(L) * stride)] = char(0x86);
+        const std::string p2 = (dir / "dd_metastate_Llm_Token_Token_two.fconst").string();
+        put_file(p2, two);
+        const pi::FconstGeom g2 = pi::locate_fconst(p2, 0x3586);
+        check(g2.period == 2 && g2.post_attn_hdr() == g2.h1,
+              "post-attn header: on a 2-header block it is still h1 (" + std::to_string(g2.h1) + ")");
+        fs::remove(p2);
+    }
+
+    pi::Options allow;
+    allow.allow_incomplete = true;   // the crafted block has no tiles, so the payload legs are refused
+    const std::string out = (fs::temp_directory_path() /
+                             ("oga_pack_import_pa." + std::to_string(::getpid()))).string();
+    fs::remove_all(out);
+    try {
+        const pi::Report r = pi::import_pack(dir.string(), out, allow);
+        check(r.stride == stride, "post-attn header: the import read the crafted stride");
+        check(fs::exists(fs::path(out) / "model.q4nx"),
+              "post-attn header: the import wrote a container to inspect");
+        if (fs::exists(fs::path(out) / "model.q4nx")) {
+            onebit::npu::Model m(out);
+            for (int l : {0, L - 1}) {
+                const std::string n = "model.layers." + std::to_string(l) +
+                                      ".post_attention_layernorm.weight";
+                const auto& t = m.tensor(n);
+                bool ramp = t.bytes >= size_t(H) * 2, not_marker = true;
+                for (int i = 0; ramp && i < H; ++i) {
+                    const uint16_t want = pi::bf16_bits_of(float(i + 1));
+                    ramp = t.data[2 * i] == uint8_t(want & 0xFF) && t.data[2 * i + 1] == uint8_t(want >> 8);
+                    const uint16_t marker = pi::bf16_bits_of(-3.0f);
+                    not_marker = not_marker && !(t.data[2 * i] == uint8_t(marker & 0xFF) &&
+                                                 t.data[2 * i + 1] == uint8_t(marker >> 8));
+                }
+                check(ramp, n + " is the bytes after the block's LAST header");
+                check(not_marker, n + " is not the k_norm section's marker (the engine#1003 bug)");
+            }
+        }
+    } catch (const std::exception& e) {
+        check(false, std::string("post-attn header: the crafted pack imported: ") + e.what());
+    }
+    fs::remove_all(out);
+    fs::remove_all(dir);
+}
+
 void test_fconst_eps(const std::string& root) {    const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
     fs::create_directories(dir);
@@ -1038,6 +1143,7 @@ int main(int argc, char** argv) {
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
         test_attn_payload_off();
         test_qwen3_attn_sections();
+        test_post_attn_norm_header(golden_dir.empty() ? "." : golden_dir);
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

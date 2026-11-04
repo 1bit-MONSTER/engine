@@ -87,7 +87,11 @@ echo "  kernel: $kver"
 if [ -n "$want" ]; then
     [ "$kver" = "$want" ] && ok "release string is $want" || bad "release string is $kver, expected $want"
 else
-    case $kver in *-1bit-*) ok "release string carries our kernel ($kver)" ;; *) bad "not our kernel: $kver" ;; esac
+    # Two spellings are ours: LOCALVERSION=-1bit-perfopt+ on the 7.3 kernel (a `-1bit-` infix) and
+    # LOCALVERSION=-1bit on the 7.4 one, where the string ENDS with `-1bit`. The pattern only had the infix
+    # form, so the very first 7.4 image (cycle 22, 2026-11-04) read as "not our kernel" here whenever the run
+    # did not pass --kver - a correct artifact failed a gate for its naming.
+    case $kver in *-1bit|*-1bit-*) ok "release string carries our kernel ($kver)" ;; *) bad "not our kernel: $kver" ;; esac
 fi
 case $kver in *++*) bad "the release string has a doubled '+' ($kver): the build tree added to LOCALVERSION" ;; esac
 

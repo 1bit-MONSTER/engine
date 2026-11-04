@@ -119,10 +119,17 @@ def check(path, verbose=True):
             if k in kinds:
                 print(f"  {k:5s} {CHUNKS_REV[k]:5d} B  {kinds[k]:4d} tensor(s)")
         if q8:
+            # Our own converter can say which of the two 8704-B Q8 layouts it wrote: it packs
+            # code (row, column) at column*32 + row, the one npu/q4nx.cpp decodes, and records
+            # the --dtype8 pattern that selected the tensors.
+            own = table.get("__metadata__", {}).get("converter") == "tools/gguf_to_q4nx.py"
+            how = ("packed by tools/gguf_to_q4nx.py --dtype8, so they use the layout "
+                   "npu/q4nx.cpp decodes (code at column*32 + row)" if own else
+                   "two code layouts share the 8704-byte chunk and the container does not say "
+                   "which (npu/q4nx.h) - do not dequantize these with the q4_1-style decoder "
+                   "unless the model is verified")
             print(f"  Q8: {len(q8)} tensor(s) ({', '.join(q8[:3])}{', ...' if len(q8) > 3 else ''}): "
-                  "two code layouts share the 8704-byte chunk and the container does not say which "
-                  "(npu/q4nx.h) - do not dequantize these with the q4_1-style decoder unless the "
-                  "model is verified")
+                  f"{how}")
         if unscanned:
             print(f"  {unscanned} tensor(s) of an uncounted dtype (not quantized weights)")
     return errors, {"kinds": kinds, "tensors": sum(kinds.values()), "q8": len(q8), "bytes": chunk_bytes}

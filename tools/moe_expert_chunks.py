@@ -59,6 +59,12 @@ def container_expert(q, name, e):
     info = q.moe_meta["tensors"][name]
     rt, kt = q.shape(name)[0], q.shape(name)[1]
     rte = rt // info["experts"]
+    chunk = q.shape(name)[-1]
+    if chunk != TILE:
+        # The arena chunks this tool writes are q4_1 (int4 codes); a --dtype8 container holds
+        # int8 codes here and the re-quantisation below would silently read them as q4_1.
+        raise SystemExit(f"{name} is a {chunk}-byte chunk, not q4_1 ({TILE}): pack the container "
+                         "without --dtype8 for this stack")
     lo = info["offsets"][e]
     raw = np.asarray(q.mm[q.base + lo:q.base + lo + info["bytes"]]).reshape(rte, kt, TILE)
     return untile(raw.reshape(-1, TILE), info["rows"], info["cols"]).astype(np.float32).T

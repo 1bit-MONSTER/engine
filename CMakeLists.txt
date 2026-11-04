@@ -273,6 +273,23 @@ set(ONEBIT_SERVE_TEST_GGUF "" CACHE FILEPATH "GGUF the serve_e2e tests load")
 # the EP roster this binary actually has) and links onnx/, which also builds libonebit_ep.so.
 option(ONEBIT_ORT "Link ONNX Runtime 1.23.2 in-process (1bit ort-info + the plugin EP)" OFF)
 
+# ── the ONNX EP's NPU leg compiles and links without ORT, the device or the runtime (#874) ───────
+# npu/ort/onebit_npu_gemm.cpp is built only by onnx/ep when ONEBIT_EP_NPU=ON, and that needs ONNX
+# Runtime *and* the private NPU runtime -- so no configuration CI has ever built it, and #874 (a call
+# to q4nx_elf_arg_sizes with no declaration, then the file defining it missing from the link) was
+# green for a week. This target compiles onnx/ep's own source list (onnx/ep/npu_sources.cmake, the
+# list the EP builds) and links it against onnx/ep/npu_runtime_ci_stub.cpp instead of the private
+# runtime, so a broken leg turns the `build` job red. `onebit` depends on it because that is the
+# target the CI build step names; nothing here is linked into `onebit` or into libonebit_ep.so.
+if(NOT WIN32 AND EXISTS ${CMAKE_CURRENT_SOURCE_DIR}/onnx/ep/npu_sources.cmake)
+    include(${CMAKE_CURRENT_SOURCE_DIR}/onnx/ep/npu_sources.cmake)
+    add_executable(onebit_ep_npu_linkcheck ${ONEBIT_EP_NPU_COMMON_SRC}
+        onnx/ep/npu_runtime_ci_stub.cpp onnx/ep/npu_linkcheck.cpp)
+    target_include_directories(onebit_ep_npu_linkcheck PRIVATE ${ONEBIT_EP_NPU_COMMON_INCS})
+    target_compile_definitions(onebit_ep_npu_linkcheck PRIVATE ${ONEBIT_EP_NPU_COMMON_DEFS})
+    add_dependencies(onebit onebit_ep_npu_linkcheck)
+endif()
+
 # ── Step 2: HRX, the engine's GPU route (docs/hrx.md) ─────────────────────
 # Off by default: it needs TheRock/ROCm and the HRX submodules, and it only runs on AMD GPUs.
 # `1bit serve --device hrx` (and auto for a .gguf) then uses this llama-server on HRX0, and

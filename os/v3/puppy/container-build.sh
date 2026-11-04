@@ -52,20 +52,27 @@ cd /work/woof-CE
 # skeleton chown below, and mksquashfs keeps whatever ownership it finds - the frugalpup docs arrived owned by
 # 6975/2030 and the packed-SFS check refused exactly those three files on cycle 16d. So the trees are normalised
 # immediately before woof-CE packs them. -all-root is not available here (SFSCOMP is woof-CE's own), so the tree is
-# chowned; the patch is idempotent, counted, and `bash -n`'d, because a silently unapplied patch would be a silent
-# regression of a security fix.
+# chowned - but a bare `chown -R` ALSO strips every setuid/setgid bit it touches (POSIX: chown clears them), and
+# that is what the c20 board hit as "Activated service 'org.freedesktop.login1' failed: The permission of the setuid
+# helper is not correct" - measured, the built tree has 12 setuid helpers and the packed image had none, so passwd,
+# su and the dbus launch helper could not work. /recipe/fix-ownership.sh does chown+restore and refuses a tree whose
+# count changed. The patch is idempotent, counted, and `bash -n`'d, because a silently unapplied patch would be a
+# silent regression of a security fix.
 if ! grep -q '1bit: ownership before pack' woof-code/3builddistro; then
     sed -i \
-        -e 's@^\(\s*\)mksquashfs rootfs-complete @\1chown -R 0:0 rootfs-complete 2>/dev/null || true   # 1bit: ownership before pack\n\1mksquashfs rootfs-complete @' \
-        -e 's@^\(\s*\)mksquashfs sandbox3/devx @\1chown -R 0:0 sandbox3/devx 2>/dev/null || true   # 1bit: ownership before pack\n\1mksquashfs sandbox3/devx @' \
+        -e 's@^\(\s*\)mksquashfs rootfs-complete @\1sh /recipe/fix-ownership.sh rootfs-complete   # 1bit: ownership before pack\n\1mksquashfs rootfs-complete @' \
+        -e 's@^\(\s*\)mksquashfs sandbox3/devx @\1sh /recipe/fix-ownership.sh sandbox3/devx   # 1bit: ownership before pack\n\1mksquashfs sandbox3/devx @' \
         woof-code/3builddistro
 fi
 n=$(grep -c '1bit: ownership before pack' woof-code/3builddistro)
 [ "$n" = 2 ] || {
     echo "build: REFUSED: the woof-CE ownership patch landed $n times in woof-code/3builddistro (expected 2) - upstream changed, re-measure" >&2
     exit 1; }
+grep -q 'sh /recipe/fix-ownership.sh' woof-code/3builddistro || {
+    echo "build: REFUSED: 3builddistro still chowns with a bare chown -R, which strips the image's setuid bits" >&2
+    exit 1; }
 bash -n woof-code/3builddistro || { echo "build: REFUSED: the patched 3builddistro does not parse" >&2; exit 1; }
-echo "   ok: 3builddistro chowns rootfs-complete and devx before packing them"
+echo "   ok: 3builddistro normalises rootfs-complete and devx before packing, keeping their setuid bits"
 mkdir -p /work/local-repositories petbuild-sources petbuild-cache petbuild-output
 [ -e ../local-repositories ] || ln -s /work/local-repositories ../local-repositories
 [ -f local-repositories/vercmp ] || curl -fsSL https://raw.githubusercontent.com/puppylinux-woof-CE/initrd_progs/master/pkg/w_apps_static/w_apps/vercmp.c | gcc -x c -o local-repositories/vercmp -
@@ -422,6 +429,30 @@ if [ -s /tmp/1bit-bad-owners ]; then
     exit 1
 fi
 echo "   ok: every packed entry is owned by a system account (uid and gid < 1000)"
+# SECURITY, on the ARTIFACT: the chown that makes the ownership policy true also clears setuid/setgid (POSIX), so the
+# restore has to be proved in the packed image and not in the tree. A helper that lost its bit still LOOKS present,
+# and what it breaks (login1 activation, passwd, su) is not in the boot path, so nothing else would ever notice.
+echo "== setuid/setgid check on the packed SFS"
+: > /tmp/1bit-suid-report
+for f in sandbox3/build/*.sfs; do
+    unsquashfs -ll "$f" 2> /dev/null | awk -v F="$(basename "$f")" '$1 ~ /^-.{2}[sS]/ || $1 ~ /^d.{2}[sS]/ {print F": "$1" "$6}' >> /tmp/1bit-suid-report
+done
+suid_n=$(grep -cv "dbus-daemon-launch-helper" /tmp/1bit-suid-report 2> /dev/null || true)
+if ! grep -q 'dbus-daemon-launch-helper' /tmp/1bit-suid-report; then
+    echo "build: REFUSED: no setuid dbus-daemon-launch-helper in the packed image. The pre-pack chown stripped it," >&2
+    echo "       and without it D-Bus cannot activate login1/hostname1/wpa_supplicant (the c20 board's" >&2
+    echo "       'permission of the setuid helper is not correct'). Entries found: $suid_n" >&2
+    sed 's/^/   /' /tmp/1bit-suid-report >&2
+    exit 1
+fi
+[ "${suid_n:-0}" -ge 5 ] || {
+    echo "build: REFUSED: only ${suid_n:-0} setuid/setgid entries in the packed image (expected the 12 helpers the" >&2
+    echo "       packages ship: passwd, chsh, chfn, sudo, ssh-keysign, mount/umount/su-FULL, fusermount3, ntfs-3g," >&2
+    echo "       gpasswd, the dbus launch helper); the pre-pack chown stripped them again." >&2
+    sed 's/^/   /' /tmp/1bit-suid-report >&2
+    exit 1
+}
+echo "   ok: $suid_n setuid/setgid entries survive the pre-pack chown, incl. the D-Bus launch helper"
 # an image that is missing sudo/apt/sshd/mokutil is not a 1bit OS, and nothing else in the build says so
 miss=""
 # the demo path needs a browser, a recorder and an encoder; an image without them cannot show or record itself

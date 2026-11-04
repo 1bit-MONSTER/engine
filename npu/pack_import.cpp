@@ -1020,7 +1020,7 @@ Plan plan(const std::string& pack_dir) {
                            "or 4 (q/k/v, two per-head QK norms, o_proj) -- recorded 2026-11-04 on Qwen3");
                 }
                 // the MLP section starts right after the block's post-attention norm
-                const int64_t mlp_off = g.hdr.back() + kNormOff + H * 2;
+                const int64_t mlp_off = g.post_attn_hdr() + kNormOff + H * 2;
                 const MlpGeom mg = mlp_geom(H, d.intermediate, mlp_off, g.stride);
                 p.mlp_note = mg.why;
                 if (mg.ok()) {
@@ -1359,9 +1359,9 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                 const int64_t base = int64_t(L) * g.stride;
                 r.norm_anchors_total += 2;
                 r.norm_anchors_ok += int(eps_at(fc, base, p.dims.eps_bits)) +
-                                 int(eps_at(fc, base + g.h1, p.dims.eps_bits));
+                                 int(eps_at(fc, base + g.post_attn_hdr(), p.dims.eps_bits));
                 add_norm(base + kNormOff, "model.layers." + std::to_string(L) + ".input_layernorm.weight");
-                add_norm(base + g.h1 + kNormOff,
+                add_norm(base + g.post_attn_hdr() + kNormOff,
                          "model.layers." + std::to_string(L) + ".post_attention_layernorm.weight");
             }
             // the final norm is refused in the plan: the 1,856-byte tail is not an RMSNorm weight

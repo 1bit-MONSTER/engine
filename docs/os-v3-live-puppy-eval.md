@@ -336,7 +336,9 @@ driven over a serial root shell.
 plus a `1BIT-DATA` ext4 partition holding the frugal install at `/1bit` and os/mini's data contract. The ISO
 (`upup64r-26.04.iso`, 1,362,100,224 B, sha256 `d6319f1de2c473cc0e…`) is a side artifact for booting without a
 disk. `os/mini/prepare-stick.sh` runs on it **unchanged** and passes its ten assertions (grow `1BIT-DATA`,
-mint `LEMONADE_API_KEY` into `lemonade/lemond.conf` at 0600, write `ssh/authorized_keys` at 0600 root:root).
+write `ssh/authorized_keys` at 0600 root:root, and mint `LEMONADE_API_KEY` into `lemonade/lemond.conf` at 0600
+only when asked with `--mint` — since cycle 20 the appliance ships with **no key**, like stock Lemonade, and the
+console's menu item 1 turns one on for a shared network).
 
 **Rows measured on that image** (`os/v3/puppy/vm-check.sh`, QEMU + OVMF + serial shell):
 

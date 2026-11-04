@@ -39,8 +39,8 @@ open_port 22      # ssh, the owner's key (U7)
 # /etc/hosts.allow = "ALL: LOCAL", and LOCAL means this machine, so a client on the LAN is refused by
 # tcpwrappers before ssh's key exchange even starts - ssh says `kex_exchange_identification: Connection
 # closed by remote host` while sshd is listening on 0.0.0.0:22 and the port rule above is in place.
-# The RFC1918 ranges are added, not the world: sshd still wants the owner's key, and Lemonade still wants
-# its API key.
+# The RFC1918 ranges are added, not the world: sshd still wants the owner's key, and Lemonade wants its API key
+# only when one was turned on (cycle 20: blank is the shipped mode, so the LAN reaches Lemonade without one).
 if [ -f /etc/hosts.allow ] && ! grep -q '1bit-lan' /etc/hosts.allow 2> /dev/null; then
     printf 'ALL: LOCAL, 10.0.0.0/255.0.0.0, 172.16.0.0/255.240.0.0, 192.168.0.0/255.255.0.0  # 1bit-lan\n' \
         >> /etc/hosts.allow

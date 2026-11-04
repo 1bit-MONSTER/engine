@@ -23,6 +23,8 @@
 // `app/unified.cpp`'s lane has always honoured it, and this emits the same bytes.
 #pragma once
 
+#include "tokenizer.h"
+
 #include <nlohmann/json.hpp>
 
 #include <string>
@@ -57,6 +59,20 @@ inline std::string chatml(const nlohmann::json& messages, bool thinking = true) 
     p += "<|im_start|>assistant\n";
     if (!thinking) p += kEmptyThink;
     return p;
+}
+
+// Whether the container's tokenizer can represent the prompt above.  `chatml()` is rendered for
+// every container (#832), and a tokenizer without the anchors spells `<|im_start|>` as ordinary
+// pieces, so the model is prompted with text its own template never produces (#963: on
+// Zyphra/ZR1-1.5B, whose specials are DeepSeek's, 33 tokens rendered against 15 under the model's
+// template).  The route answers 400 in that case instead of answering plausibly from the wrong
+// prompt.
+//
+// A necessary condition read off the container itself, not a proof that the template *is* ChatML: a
+// container may carry both anchors and still use a different template.  Packing the model's own
+// `chat_template` is the real fix and a format decision, not this check.
+inline bool chatml_supported(const Tokenizer& tok) {
+    return tok.token_id("<|im_start|>") >= 0 && tok.token_id("<|im_end|>") >= 0;
 }
 
 }  // namespace onebit::npu

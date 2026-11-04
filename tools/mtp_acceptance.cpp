@@ -17,6 +17,7 @@
 //
 //   mtp_acceptance --model <dir> --head-exact <pb16i-exact dir> --head-q4k <q4_k dir>
 //                  [--tokens 64] [--k 4] [--tau 0.6] [--prompts 8] [--residual] [--dry-head]
+//                  [--probe-lm N]
 //                  [--offline [--positions-in F]] [--live [--positions-out F] [--match]]
 //
 // --match is the one that settles "live equals offline": the live loop records where it opened its chains
@@ -40,6 +41,7 @@
 #include "mtp/mtp_head.h"
 #include "rt.h"
 
+#include <algorithm>
 #include <chrono>
 #include <fstream>
 #include <cstdio>
@@ -261,6 +263,7 @@ int main(int argc, char** argv) {
     int tokens = 64, k = 4, prompts = 8, prompt_base = 0;
     float tau = 0.6f;
     bool residual = false, dry = false, selftest = false, offline = false, live = false, batchcheck = false;
+    int probe_lm = 0;
     bool match_mode = false;
     std::string gold, positions_out, positions_in;
     // prompt index -> the stream positions where the live loop opened its chains
@@ -283,6 +286,7 @@ int main(int argc, char** argv) {
         else if (a == "--offline") offline = true;
         else if (a == "--live") live = true;
         else if (a == "--batchcheck") batchcheck = true;
+        else if (a == "--probe-lm") { const std::string v = (i + 1 < argc) ? argv[++i] : "10"; probe_lm = std::atoi(v.c_str()); }
         else if (a == "--match") match_mode = true;
         else if (a == "--positions-out") positions_out = nexts();
         else if (a == "--positions-in") positions_in = nexts();
@@ -359,6 +363,24 @@ int main(int argc, char** argv) {
     drafter.set_tau(tau);          // the chain gate the run was asked for (offline forces its own)
     std::printf("forward ready: vocab %d, max_batch_rows %d, hidden source %s\n", base.vocab(),
                 base.max_batch_rows(), residual ? "pre-norm residual" : "post-final-norm");
+
+    if (probe_lm > 0) {
+        // What ONE full-vocab logits call costs on the array, measured rather than fitted.  The draft loop makes
+        // k of them for its k drafts (plus 1 + accepted more that the logits-skip fix drops), so this single number
+        // decides whether the draft route's cost is the head's maths (host, tools/mtp_head_bench.cpp) or its
+        // vocabulary projection (array).  The hidden is the probe step's own, i.e. exactly what the drafter hands
+        // the head; a repeat call is the same work every time.
+        std::vector<float> h = residual ? fwd.last_residual() : fwd.last_hidden(), lg2;
+        std::vector<double> ms;
+        for (int r = 0; r < probe_lm; r++) {
+            const double t0 = now_ms();
+            if (!base.lm_head(h, lg2)) { std::fprintf(stderr, "lm head probe failed\n"); return 1; }
+            ms.push_back(now_ms() - t0);
+        }
+        std::sort(ms.begin(), ms.end());
+        std::printf("lm head probe: %d calls over vocab %d, median %.1f ms, min %.1f, max %.1f\n", probe_lm,
+                    (int)lg2.size(), ms[ms.size() / 2], ms.front(), ms.back());
+    }
 
     if (batchcheck) {
         // Does the deferred batch verify give the same answer as plain decode?
@@ -452,6 +474,39 @@ int main(int argc, char** argv) {
                         pi, differ, checked, first_differ);
             std::printf("  batch hidden rows vs sequential hidden: %d rows, min cos %.6f (position %d), max |diff| %.3e\n",
                         hid_rows, min_cos, worst_pos, max_abs);
+            // How a verify batch's cost scales with its row count.  The loop's own accounting calls an iteration "two
+            // passes" (one step + one M=nd batch), which is only true if a batch costs a step.  The kernels are sealed at
+            // M=16, so either a 5-row batch is free (pad rows are idle) or it is linear in rows (the GDN/conv work is per
+            // row) -- and that decides whether the draft route's cost is the base (batch it harder, #805's leaf fill) or
+            // the head.  Measured here, on the same stream, at nd = 1, 2, k+1 and max_batch_rows.
+            {
+                const int widths[] = {1, 2, std::min(k + 1, base.max_batch_rows()), base.max_batch_rows()};
+                std::printf("  verify-batch cost, same stream, --tokens %d:\n", tokens);
+                std::vector<int> last_width;
+                for (int w : widths) {
+                    if (w < 1 || w > base.max_batch_rows()) continue;
+                    if (!last_width.empty() && last_width.back() == w) continue;
+                    last_width.push_back(w);
+                    fwd.reset();
+                    std::vector<float> lg3;
+                    for (size_t i = 0; i < ids.size(); i++)
+                        if (!fwd.step(ids[i], (int)i, lg3)) { std::fprintf(stderr, "prefill failed\n"); return 1; }
+                    std::vector<float> all3;
+                    int p3 = (int)ids.size(), batches = 0;
+                    const double t0 = now_ms();
+                    while (p3 + w <= n) {
+                        std::vector<int> rows(stream.begin() + p3, stream.begin() + p3 + w);
+                        if (!base.step_batch_all(rows, p3, all3)) { std::fprintf(stderr, "batch failed\n"); return 1; }
+                        if (!base.commit_verify(w)) { std::fprintf(stderr, "commit refused\n"); return 1; }
+                        p3 += w;
+                        batches++;
+                    }
+                    const double ms = now_ms() - t0;
+                    std::printf("    M %2d rows: %2d batches, %7.2f ms/batch, %5.2f ms/row, %6.1f rows/s\n", w, batches,
+                                batches ? ms / batches : 0.0, batches ? ms / (double)(batches * w) : 0.0,
+                                ms > 0 ? 1000.0 * (double)(batches * w) / ms : 0.0);
+                }
+            }
         }
         return 0;
     }

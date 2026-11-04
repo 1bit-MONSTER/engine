@@ -321,6 +321,29 @@ carrying every instance (`main:gu|d|qkv|o|z|qh|kv`), named by the container's ow
 a pb16i ELF would read 4,608-byte tiles out of 2,176-byte images). `tools/npu_plan.py` writes the key into
 `plan.json`'s `decode.sealed_elf`, and the engine runs every decode role inside that one context.
 
+#### The image fill (what a fresh serve costs)
+
+A pb16i/t2s container's weights *are* the sidecar images, so a cold serve is a file read and nothing
+else: `load_pb16i_into()` `fread`s each image **straight into the weight BO's mapping**, then syncs
+once. The earlier path zero-filled a `want`-byte vector, `fread` into it, `memcpy`'d it into the BO and
+allocated the BO zeroed as well — four passes over the whole 6.8 GB of decode weights — and nothing
+read the zeros. `NPU_FILL_COPY=1` keeps that path so the two can be A/B'd, and `NPU_PB16I_TIMING=1`
+prints `[fill] <mode> <stem> bytes= read= copy= sync=` per image (431 images, one line each):
+
+| (Bonsai-2 t2s, 431 images, 6.82 GB) | read | copy | sync | first request, 8 tok |
+|---|---|---|---|---|
+| copying loader | 0.25 s | 0.39 s | 0.09 s | 6.35 s |
+| **read into the BO** | 0.36 s | **0.01 s** | 0.11 s | **5.92 s** |
+
+Same greedy text, `amdxdna` errors 0. Both halves ran in one ticket with the page cache warmed first,
+because otherwise the second half reads from cache and the difference looks like a loader win.
+
+**The rest of the "cold start" is the disk, not the loader.** `dd iflag=direct` over the image set reads
+**2.16 GB/s**, so 6.82 GB is **3.2 s** of device time the loader cannot avoid; with a warm page cache
+the same fill is 0.47 s. A first request on a fresh serve therefore costs one fill (0.5 s warm, ~3.2 s
+cold) on top of its prefill, and every request after it on the same serve costs none. Do not read a
+per-serve benchmark's request wall as a decode number: `[ph]`/`[lh]` are the per-token instruments.
+
 ### From a GGUF
 
 `tools/gguf_to_q4nx.py pack <model.gguf> <out dir> --tokenizer <dir>` writes a model
@@ -345,6 +368,23 @@ is otherwise served a chat prompt with no BOS: measured on ZR1-1.5B, the forward
 | Q4_1 | scale `d`, zero `m`, codes unchanged | bf16 rounding of scale and zero |
 | Q4_K | per 32-column sub-block: scale `d*sc`, zero `-dmin*mn`, codes unchanged (a Q4_K super-block is one tile row's 256 columns) | bf16 rounding of scale and zero |
 | Q5_K, Q6_K, Q8_0, F16, BF16, F32 | dequantized, then min/max q4_1 per 32 columns | lossy |
+| the same, named by `--dtype8` | dequantized, then symmetric int8 per 32 columns (a Q8 chunk: `d*code`, bf16 `d`, codes at `column*32 + row`) | int8 rounding (rel rms ~0.005) |
+
+`pack --dtype8 REGEX` (a Q4NX-name regex, e.g. `'v_proj|down_proj|lm_head'`) stores the
+matching tensors as Q8 chunks instead of crushing them to q4_1, and leaves any tensor whose
+source was already exact at 4 bits alone (a Q4_K_M mixes types layer by layer). It exists
+because q4_1 spends 4 of every 32-value group's bits on a min and has 16 levels: a tensor
+that was Q6_K or Q8_0 in the source is both worse and *bigger* after the crush. On
+`Zyphra/ZR1-1.5B` Q4_K_M the pattern names 57 tensors and 29 of them are Q6_K (14 `v_proj`,
+14 `down_proj`, `lm_head`); the other 28 are Q4_K and stay q4_1. Those 29 as Q8 move the
+container's wikitext-2 KLD against BF16 from **0.204038 to 0.129436** (PPL 85.4513 ->
+79.7284) for **+180 MiB** (1,431,806,280 -> 1,620,611,528 B), which is better than the
+Q4_K_M arm it was packed from (0.138010) but still 1,546 MiB against that arm's 1,066. The
+Q8 chunk decodes in `npu/q4nx.cpp` and `npu/forward/src/q4nx_dequant.c`, and
+`tools/q4nx_to_gguf.py` writes it back as Q8_0 (the same f16 `d` + int8 `code` blocks), so
+a `--dtype8` container is still one model on both sides. The **dx route cannot run it
+today**: `q4nx::as_q4_1()` throws for Q8 (8-bit codes do not fit q4_1), so a container
+carrying Q8 tensors is for a consumer that reads the chunk kinds, not the narrowed path.
 
 `tools/gguf_to_q4nx.py verify <model.gguf> <out dir>` decodes every tensor it wrote and
 compares it with the GGUF, dequantized. For the exact types, every weight must lie

@@ -128,27 +128,44 @@ void rope_partial(float* x, int pos, int rot) {
 
 void Matrix::matvec(const float* a, float* y) const {
     const int G = K / kG;
-    std::vector<double> acc((size_t)N, 0.0);
+    // Codes are laid out [k][n], so ONE row of a's products walks n with a stride of 1 byte and the columns a
+    // thread touches are scattered N bytes apart.  Doing one n at a time (the first form of this function) is
+    // therefore a 64-byte cache line per 1-byte code: 424 M codes ~ 27 GB of traffic per head step, measured
+    // 331 ms for the eight matrices of a step (0.7-4.8 GF/s, TMTPLOOP-STATE 2026-11-04 02:4x).
+    //
+    // Blocking n fixes the access pattern without touching the arithmetic: for a block of NB columns the k loop
+    // reads NB CONTIGUOUS code bytes per row, and each column's accumulation keeps its exact order (g ascending,
+    // k ascending, then the additive-min pass), so the result is bit-identical to the unblocked form -- asserted
+    // in tests/mtp_draft_test.cpp [10] against the old code kept there as the reference.
+    constexpr int NB = 64;
+    const int nblocks = (N + NB - 1) / NB;
 #pragma omp parallel for schedule(static)
-    for (int n = 0; n < N; n++) {
-        double acc_n = 0.0;
-        for (int g = 0; g < G; g++) {
-            const int8_t* cg = &codes[(size_t)(g * kG) * N + n];
-            double P = 0.0;
-            for (int k = 0; k < kG; k++) P += (double)a[g * kG + k] * (double)cg[(size_t)k * N];
-            acc_n += P * ((double)ms[(size_t)g * N + n] * std::ldexp(1.0, (int)eref[(size_t)n]));
+    for (int nb = 0; nb < nblocks; nb++) {
+        const int n0 = nb * NB, w = std::min(N - n0, NB);
+        double acc[NB], P[NB], ex[NB];
+        for (int i = 0; i < w; i++) {
+            acc[i] = 0.0;
+            ex[i] = std::ldexp(1.0, (int)eref[(size_t)n0 + i]);
         }
-        double ag_sum = 0.0;
+        for (int g = 0; g < G; g++) {
+            for (int i = 0; i < w; i++) P[i] = 0.0;
+            for (int k = 0; k < kG; k++) {
+                const double av = (double)a[g * kG + k];
+                const int8_t* ck = &codes[(size_t)(g * kG + k) * N + n0];
+                for (int i = 0; i < w; i++) P[i] += av * (double)ck[i];
+            }
+            const int16_t* mg = &ms[(size_t)g * N + n0];
+            for (int i = 0; i < w; i++) acc[i] += P[i] * ((double)mg[i] * ex[i]);
+        }
+        // the source's additive min, second pass over g exactly as before
         for (int g = 0; g < G; g++) {
             double s = 0.0;
             for (int k = 0; k < kG; k++) s += a[g * kG + k];
-            acc_n += s * (double)add[(size_t)g * N + n];
-            ag_sum += s;
+            const float* ad = &add[(size_t)g * N + n0];
+            for (int i = 0; i < w; i++) acc[i] += s * (double)ad[i];
         }
-        (void)ag_sum;
-        acc[(size_t)n] = acc_n;
+        for (int i = 0; i < w; i++) y[n0 + i] = (float)acc[i];
     }
-    for (int n = 0; n < N; n++) y[n] = (float)acc[(size_t)n];
 }
 
 bool load_weights(const std::string& exact_dir, const std::string& q4k_dir, Weights& w, std::string& err) {

@@ -31,6 +31,16 @@ WORDS = ["The", " capital", " of", " France", " is", " Paris", "."]
 WEDGED = threading.Event()
 
 
+def _record_slot_action(action, body):
+    """Write the slot action's request body where a test can read it (FAKE_SLOT_MARKER): the handoff's own
+    contract is what tests/hybrid_route.sh and tests/hybrid_kvshare_route.sh assert, and it is not visible in
+    the reply."""
+    marker = os.environ.get("FAKE_SLOT_MARKER")
+    if marker:
+        with open(marker, "w") as f:
+            json.dump({"action": action, "body": body}, f)
+
+
 class H(BaseHTTPRequestHandler):
     def log_message(self, *a):
         pass
@@ -112,6 +122,7 @@ class H(BaseHTTPRequestHandler):
                     self._json(400, {"error": {"message": "adopt must quote the share_id"}})
                     return
                 toks = req.get("tokens") or []
+                _record_slot_action("adopt", req)
                 self._json(200, {"id_slot": int(slot), "share_id": 7, "n_adopted": len(toks), "n_read": 0,
                                  "timings": {"adopt_ms": 0.1}})
                 return
@@ -132,6 +143,7 @@ class H(BaseHTTPRequestHandler):
                 return
             with open(path) as f:
                 n = sum(1 for line in f if line.strip())
+            _record_slot_action("restore", dict(req, n_tokens_in_state_file=n))
             self._json(200, {"id_slot": int(slot), "filename": req["filename"], "n_restored": n, "n_read": 0,
                              "timings": {"restore_ms": 1.5}})
             return

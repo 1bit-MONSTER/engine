@@ -73,6 +73,26 @@ status() {
     printf '%s' "${c:-000}"
 }
 
+# The Authorization header, and ONLY when this machine has a key (cycle 21, item 9a's other half, from the c20
+# board). Blank mode is the shipped state and its contract is stock Lemonade's: a request with NO header at all.
+# Cycle 20 sent `Authorization: Bearer none` on every call to keep one code path; on the board a header-less curl
+# answered 200 and the NPU answered long then short with 0 TDR, so the header-less shape is the one that worked.
+# Defined next to the fetchers so the keyed and blank shapes cannot drift apart.
+auth_get() {  # <url>
+    if [ -n "$KEY" ]; then got --header="Authorization: Bearer $KEY" "$1"; else got "$1"; fi
+}
+auth_status() {  # <url> -> HTTP status
+    if [ -n "$KEY" ]; then status --header="Authorization: Bearer $KEY" "$1"; else status "$1"; fi
+}
+auth_post() {  # <json body> <url> [slow] -> the reply
+    if [ "${3:-}" = slow ]; then _ag=got_slow; else _ag=got; fi
+    if [ -n "$KEY" ]; then
+        $_ag --header='Content-Type: application/json' --header="Authorization: Bearer $KEY" --post-data="$1" "$2"
+    else
+        $_ag --header='Content-Type: application/json' --post-data="$1" "$2"
+    fi
+}
+
 # Readiness: on a cold stick lemond takes tens of seconds to answer its first request (catalog, web
 # app, engine spawn). The capped fetches above then see "status 000" and the row fails although the
 # server is fine - candidate 4 (25 Oct) failed exactly so, where candidate 3's uncapped wget had simply
@@ -318,10 +338,9 @@ lemond_key() {
 }
 KEY=$(lemond_key)
 [ -n "$KEY" ] || KEY=$(sed -n 's/^LEMONADE_API_KEY=//p' /data/lemonade/lemond.conf 2>/dev/null | tail -n 1)
-# Cycle 20, the owner's "blank key": blank mode is the SHIPPED state, and its contract is stock Lemonade's - the
-# server answers without a key and any placeholder is accepted. So every request below sends ${KEY:-none}: one code
-# path, and on a keyed machine it is the real key (a wrong one there is still a 401, which the auth row asserts).
-KEYH=${KEY:-none}
+# Cycle 20, the owner's "blank key": blank mode is the SHIPPED state. Cycle 21: a request in blank mode carries no
+# Authorization header at all (auth_get/auth_status/auth_post above), and on a keyed machine the same calls carry the
+# real key (a wrong one is still a 401, which the auth row asserts).
 API="http://127.0.0.1:$PORT"
 CATALOG=$LEMDIR/bin/resources/server_models.json
 PLAIN_TOTAL=$(find /data/npu/kernels -name 'layer1.elf' 2>/dev/null | wc -l)
@@ -433,8 +452,8 @@ elif ! lemonade_ready; then
     # Not the same row as a wrong key: nothing answered on the port at all within the wait.
     fail lemonade "lemond did not answer $API within ${READY_WAIT}s (see /tmp/lemond.log)"
 else
-    MODELS=$(got --header="Authorization: Bearer $KEYH" "$API/api/v1/models")
-    WITH=$(status --header="Authorization: Bearer $KEYH" "$API/api/v1/models")
+    MODELS=$(auth_get "$API/api/v1/models")
+    WITH=$(auth_status "$API/api/v1/models")
     BODY=$(got "$API/api/v1/models")
     WITHOUT=$(status "$API/api/v1/models")
     case "$(lemonade_verdict "$WITH" "$MODELS" "$WITHOUT")" in
@@ -560,10 +579,8 @@ fi
 # ── one chat per backend that this machine can actually run ─────────────────────────────────────
 chat() {   # chat <model id> [slow] -> sets ANSWER and TPS
     ANSWER=; TPS=
-    _get=got; [ "${2:-}" = slow ] && _get=got_slow
-    R=$($_get --header='Content-Type: application/json' --header="Authorization: Bearer $KEYH" \
-        --post-data="{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0}" \
-        "$API/api/v1/chat/completions")
+    R=$(auth_post "{\"model\":\"$1\",\"messages\":[{\"role\":\"user\",\"content\":\"/no_think Reply with exactly: 1BIT OK\"}],\"max_tokens\":48,\"temperature\":0}" \
+        "$API/api/v1/chat/completions" "${2:-}")
     case "$R" in
         *'"content"'*)
             ANSWER=$(printf '%s' "$R" | sed -n 's/.*"content":"\([^"]*\)".*/\1/p' | head -1)
@@ -715,8 +732,7 @@ if ls /dev/accel/accel* >/dev/null 2>&1 && [ -n "$NPU" ]; then
     TDR0=$(tdr_count)
     Q_LONG='/no_think Explain in detail how tides work: the moon and the sun, the shape of ocean basins, why some coasts have two high tides a day and others one, and what an amphidromic point is'
     _post() {  # <json body> -> the reply
-        got_slow --header='Content-Type: application/json' --header="Authorization: Bearer $KEYH" \
-            --post-data="$1" "$API/api/v1/chat/completions"
+        auth_post "$1" "$API/api/v1/chat/completions" slow
     }
     R1=$(_post "{\"model\":\"$NPU\",\"messages\":[{\"role\":\"user\",\"content\":$(json_text "$Q_LONG" | sed 's/.*/"&"/')}],\"max_tokens\":512,\"temperature\":0}")
     A1=$(json_str "$R1" content)
@@ -759,7 +775,11 @@ else
     # `lemonade bench` prints one human row per run: "Run 1/1... TTFT=30.6ms PP=881.6t/s TPS=120.2".
     # That line is the evidence; --json/--output is only a fallback because its shape moves between
     # Lemonade versions (and it wrote nothing to stdout in the 2026-10-23 candidate image).
-    BL=$(LEMONADE_API_KEY="$KEYH" timeout 900 "$BENCH" bench "$VMODEL" --scenarios chat-short --runs 1 --warmup 0 \
+    # Blank mode hands the CLI NO key at all: the variable is unset rather than set to a placeholder, so the
+    # command runs exactly as a person's would on a keyless stick.
+    unset LEMONADE_API_KEY
+    [ -n "$KEY" ] && export LEMONADE_API_KEY="$KEY"
+    BL=$(timeout 900 "$BENCH" bench "$VMODEL" --scenarios chat-short --runs 1 --warmup 0 \
             --json --output "$BLF" 2>/tmp/bench.err) || BL=
     BTT=$(printf '%s\n' "$BL" | sed -n 's/.*TTFT=\([0-9.]*\)ms.*/\1/p' | head -1)
     BPP=$(printf '%s\n' "$BL" | sed -n 's/.*PP=\([0-9.]*\)t\/s.*/\1/p' | head -1)

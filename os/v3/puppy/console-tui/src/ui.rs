@@ -1622,55 +1622,6 @@ mod tests {
     }
 
     #[test]
-    fn the_menu_rule_gives_way_before_an_action_does() {
-        // Measured on the shipped binary before this: 80x10, 56x11, 40x12 and 30x16 are all exactly one row short
-        // of the MENU rule plus the nine actions plus the footer, and the rule was charged as fixed while ratatui
-        // clipped the END of the menu - `9 Reboot / power off`, a gate string - with the footer still promising
-        // "1-9 actions". These are ordinary pane sizes (a tmux split, an ssh window on a phone). The rule is
-        // decoration; the actions are the screen, so the rule goes first.
-        let mut f = c16_board();
-        f.key = None;
-        for (w, h) in [(80u16, 10u16), (56, 11), (40, 12), (30, 16)] {
-            let text = render_snapshot(&app(f.clone()), w, h);
-            let lines: Vec<&str> = text.lines().collect();
-            assert_eq!(
-                lines.len(),
-                h as usize,
-                "{w}x{h}: frame is not the terminal"
-            );
-            for n in 1..=9 {
-                assert!(
-                    text.contains(&format!("{n} ")),
-                    "{w}x{h}: action {n} is off the screen:\n{text}"
-                );
-            }
-            assert!(
-                text.contains("stays") || text.contains("quits"),
-                "{w}x{h}: the footer was paid for the rule ({text})"
-            );
-            assert!(
-                !text.contains("MENU"),
-                "{w}x{h}: the rule is still on a frame with no row for it:\n{text}"
-            );
-        }
-        // ...and where a row IS free, the rule is still drawn: the fix must not have deleted it
-        for (w, h) in [
-            (80u16, 11u16),
-            (56, 12),
-            (40, 13),
-            (30, 17),
-            (80, 25),
-            (240, 67),
-        ] {
-            let text = render_snapshot(&app(f.clone()), w, h);
-            assert!(
-                text.contains("MENU"),
-                "{w}x{h}: the MENU rule is missing where it fits:\n{text}"
-            );
-        }
-    }
-
-    #[test]
     fn the_modal_hint_is_never_the_row_that_goes() {
         // A frame too short for the whole dialog used to clip its END - the hint, i.e. the only row that says how to
         // answer. Measured on the shipped binary in ptys: at 40x11, 40x10, 30x12 and 24x12 the blank-key confirm
@@ -1742,6 +1693,55 @@ mod tests {
                     "{w}x{h}: the dialog does not say how to answer it ({hint:?}):\n{text}"
                 );
             }
+        }
+    }
+
+    #[test]
+    fn the_menu_rule_gives_way_before_an_action_does() {
+        // Measured on the shipped binary before this: 80x10, 56x11, 40x12 and 30x16 are all exactly one row short
+        // of the MENU rule plus the nine actions plus the footer, and the rule was charged as fixed while ratatui
+        // clipped the END of the menu - `9 Reboot / power off`, a gate string - with the footer still promising
+        // "1-9 actions". These are ordinary pane sizes (a tmux split, an ssh window on a phone). The rule is
+        // decoration; the actions are the screen, so the rule goes first.
+        let mut f = c16_board();
+        f.key = None;
+        for (w, h) in [(80u16, 10u16), (56, 11), (40, 12), (30, 16)] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal"
+            );
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} is off the screen:\n{text}"
+                );
+            }
+            assert!(
+                text.contains("stays") || text.contains("quits"),
+                "{w}x{h}: the footer was paid for the rule ({text})"
+            );
+            assert!(
+                !text.contains("MENU"),
+                "{w}x{h}: the rule is still on a frame with no row for it:\n{text}"
+            );
+        }
+        // ...and where a row IS free, the rule is still drawn: the fix must not have deleted it
+        for (w, h) in [
+            (80u16, 11u16),
+            (56, 12),
+            (40, 13),
+            (30, 17),
+            (80, 25),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&app(f.clone()), w, h);
+            assert!(
+                text.contains("MENU"),
+                "{w}x{h}: the MENU rule is missing where it fits:\n{text}"
+            );
         }
     }
 }

@@ -65,12 +65,6 @@ ssh window at 80x18 still shows all nine actions and `Reboot / power off`; befor
 and the footer went on promising "1-9 actions" (`a_short_window_keeps_the_nine_actions_and_the_footer_whole` sweeps
 ten sizes).
 
-**When the frame is one row short of the menu itself** - 80x10, 56x11, 40x12, 30x16: a tmux split or an ssh window on
-a phone - the `MENU` rule goes before any action does. It is decoration, and it used to be charged first, so ratatui
-clipped the end of the menu: `9 Reboot / power off` (a `vm-check.sh` string) was off the screen while the footer still
-promised "1-9 actions". Swept over 13 widths x 19 heights, 72 sizes gained that row and none lost the
-frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
-
 **The same rule inside a dialog.** A confirmation box is `title | the question | the hint`, and the hint is the only
 row that says how to answer, so a frame too short for the whole box loses the question first, whole rows at a time,
 and then the title - never the hint. Before this the box was clamped to the frame and ratatui clipped its end: at
@@ -78,6 +72,12 @@ and then the title - never the hint. Before this the box was clamped to the fram
 and at 40x12 half of one, while `y` still worked - for the reboot confirm that is `y reboots the box, n cancels`
 missing from the screen that is about to reboot
 (`the_modal_hint_is_never_the_row_that_goes` sweeps four dialogs at eight sizes).
+
+**When the frame is one row short of the menu itself** - 80x10, 56x11, 40x12, 30x16: a tmux split or an ssh window on
+a phone - the `MENU` rule goes before any action does. It is decoration, and it used to be charged first, so ratatui
+clipped the end of the menu: `9 Reboot / power off` (a `vm-check.sh` string) was off the screen while the footer still
+promised "1-9 actions". Swept over 13 widths x 19 heights, 72 sizes gained that row and none lost the
+frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
 
 ## Keys
 

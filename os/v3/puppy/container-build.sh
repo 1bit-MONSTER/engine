@@ -575,6 +575,20 @@ if [ -n "${PAYLOAD:-}" ]; then
     fi
     echo "   ok: the console menu is in the image and executable (tty1's whole surface on a headless boot)"
 fi
+# Cycle 22 (TOS3-NOTE-c21-logs): the boot's log capture has to survive /data mounting AFTER the service started.
+# Both spellings that lost four of five boots' logs are refused by name, because each one fails silently: the
+# one-shot "is /data mounted?" guard in the service (nothing re-ran the test), and a 1bit-logs whose dir() only
+# tested "can I mkdir" ($DATA is a directory even when nothing is mounted on it, so the log went to RAM and
+# reported success).
+packed_logsvc=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/init.d/06onboard-logs 2> /dev/null || true)
+packed_logs=$(unsquashfs -cat sandbox3/build/puppy_*.sfs usr/local/bin/1bit-logs 2> /dev/null || true)
+case $packed_logsvc in *"this boot's logs stay in RAM"*)
+    echo "build: REFUSED: the packed 06onboard-logs gives up when /data is not mounted yet, so those boots keep no log" >&2
+    exit 1;; esac
+printf '%s\n' "$packed_logs" | grep -q '^mounted() ' || {
+    echo "build: REFUSED: the packed 1bit-logs has no mount-point test, so it would log to RAM when /data is not mounted" >&2
+    exit 1; }
+echo "   ok: the boot's log capture waits for /data (1bit-logs carries the mount-point test)"
 modconf=$(unsquashfs -cat sandbox3/build/puppy_*.sfs etc/rc.d/MODULESCONFIG 2>/dev/null | grep "^ADDLIST=" || true)
 [ "$modconf" = "ADDLIST=ec_su_axb35" ] || {
     echo "build: REFUSED: the image would not load the EC driver at boot (ADDLIST is $modconf)" >&2; exit 1; }

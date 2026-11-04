@@ -581,17 +581,29 @@ zero points for all 24 layers x {gate, up, down}. `tests/golden/oga_mlp_gu_group
 unit copied verbatim from the pack by `tools/oga_mlp_gu_golden.py`, with the container tiles its two
 projections give, so the same decode runs in CI against the vendor writer's bytes.
 
-**Scope, stated as a refusal rather than a hope:** this closed form fits hidden 896 / intermediate 4864
-exactly. Qwen3-1.7B (hidden 2048) and Qwen3-4B (hidden 2560) do not add up — their MLP sections are larger
-than this tiling predicts, i.e. their writer used different kernel shapes, which is the same
-runtime-supported-shapes table engine#734 ran into. Those packs refuse the MLP projections with the
-number.
+**Scope:** this closed form fits all four shipped `_rai_1.8.0_npu_4K` packs exactly — hidden 896
+(0.5B), 2,048 (Llama-3.2-1B and Qwen3-1.7B) and 2,560 (Qwen3-4B) — once the section starts at its
+measured offset. An earlier note here said Qwen3's MLP sections "do not add up ... their writer used
+different kernel shapes"; that was this reader's error, not the packs': the section was located from
+the wrong boundary, so the geometry check (`total == stride`) failed and was read as a shape
+difference. With §7.24's boundaries the gap closes to the byte on all four (FACTS §7.24.1).
 
 Which tile belongs to which projection is **measured, not assumed**: on the shipped 0.5B pack the
 tiles' bias subvolumes matched the pack's own q/k/v bias vectors, which identifies the runs as
 k (2 tiles), q (14), v (2), o (14) — 32 tiles, the payload's whole size. A pack whose payload is
 not a whole number of tiles of that hidden size, or whose q/k/v/o row counts do not add up to the
 measured tile count, is refused by name with the numbers (`npu-pack info` reports the measurement).
+
+**The section is not always one uniform run** (engine#979). The Qwen3 packs carry *four* epsilon
+headers per layer block instead of two, and the three sections between them are `[q, k, v tiles at
+K = hidden]`, `[64-byte header + k_norm, bf16 [head_dim]]`, `[64-byte header + q_norm, bf16
+[head_dim]]` followed by **o_proj's tiles at K = q_proj's output width** — the pack declares
+`o_proj N=2560 K=4096` on Qwen3-4B, where hidden is 2,560. So o_proj needs its own payload offset
+and its own K, and the two per-head gains are ordinary bf16 `[head_dim]` RMSNorm weights (Qwen3's
+are `[128]`, i.e. 256 B, which is why the section between them is 320 B on both packs although
+their hidden sizes differ). `plan()` accepts a block of 2 or 4 headers, checks each section against
+that arithmetic to the byte, and refuses any other count by name. FACTS §7.24 has the tables and
+the checkpoint evidence.
 
 **Every tile read is its own check.** Before anything is written, each tile is decoded and
 re-encoded; the encoder has to reproduce the 34,816 bytes it came from, bias slots included. That

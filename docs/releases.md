@@ -63,11 +63,24 @@ logs this same file and digest — `docs/hrx.md`, "The HSA runtime"):
 
 | what | value |
 |---|---|
-| `libhsa-runtime64.so.1` in `rocm-sdk-10.3.0a20261031-gfx1151` | 5,141,585 B, sha256 `21a6682452e159cfcdc6bdc84676f6b7f9c1236f3a2957a97a2e7170889cdfa3` |
+| `libhsa-runtime64.so.1` in `rocm-sdk-10.3.0a20261031-gfx1151` (the pin a dev tree uses) | 5,141,585 B, sha256 `21a6682452e159cfcdc6bdc84676f6b7f9c1236f3a2957a97a2e7170889cdfa3`, ROCr build id `1.22.0-local-build-430d3d8f`, clang 24 |
+| the runtime the image ships, `/opt/rocm-therock/lib/libhsa-runtime64.so.1` (`/opt/1bit/libhsa` → that dir) | 4,957,049 B, sha256 `f6ef689d163b42ded68cb99ffa4f9103251f05ba91fc3ca70f4a1d1909d9c34a`, ROCr build id `1.21.0-local-build-d134b782`, clang 23 — a different compilation, so this is the digest a release check's `identity` row prints |
 | measured capabilities, Strix Halo `gfx1151` (rocminfo from the pinned tree, 2026-11-03) | `XNACK enabled: NO`, `Coherent Host Access: FALSE`, `Memory Properties: APU`, Runtime Version 1.22, System Timestamp Freq. 1000 MHz |
 
-That runtime is the one a dev tree must use: the release-shipped copy does not register `HRX0` for a
-dev build, and a distro `libhsa-runtime64` is untested (engine#713's acceptance table).
+Match each digest to its own row: a dev build logs the **pin** (`21a66824…`), while `1bit-release-check`'s
+`identity` line reports the **image copy** (`f6ef689d…`, unchanged on the c17, c19 and c20 board boots). The
+image's ROCr 1.21.0 exports every one of the 121 HSA entry points the pinned HAL resolves by name, so the two
+are interchangeable by symbol set (1.22 adds five the driver never resolves). Two things the digest alone does
+not tell you, both measured:
+
+* **Every binary in the set must be there.** `dlopen` of a single-file copy of those same bytes in a directory
+  without its eight `librocm_sysdeps_*.so*` siblings fails (`librocm_sysdeps_elf.so.1: cannot open shared object
+  file`) — the same digest, in a directory that cannot load it. The image installs the full 10-file flat set, and
+  that one loads. Digest **plus closure** identifies a usable runtime, so check both (`sha256sum`, `ldd`).
+* **A distro `libhsa-runtime64` cannot work.** ROCr `1.18.0` (`5b11324814140eb5…`, 3,902,416 B) lacks
+  `hsa_amd_queue_create`, one of the 121, so an HRX process that resolves the bare soname from the system path gets
+  no device (engine#713's acceptance table). A payload dir may also carry the pin **relocated** (`f5462dc3…`: the
+  same 5,141,585 B with 185 bytes changed, `DT_RPATH`→`DT_RUNPATH $ORIGIN`).
 
 The Lemonade pin is the sha (`ef0f3b49`), not the string around it: `tools/version.py` derives the dev version as
 `<week>.0~<commit count>.<sha>`, and that count is the number of commits in the **checkout it was built in** —

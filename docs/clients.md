@@ -66,7 +66,17 @@ reading an address: the responder, and your LAN — the CONNECT block prints
 `name http://1bit-os.local:13305 (mDNS)` only while `avahi-daemon` is running and
 `(mDNS - avahi not running)` when it is not (`os/v3/puppy/console-tui/src/ui.rs:213-216`), and a network
 that drops multicast does not resolve the name at all. Sticks through the cycle-20 image do not announce
-it. If you cannot get to a console, the router's client list shows the box
+it. **The cycle-22 board also showed the name announced and never answered**: avahi logged
+`avahi-daemon up: … is announced on this network`, a query from another machine got nothing back, and the
+cause is Puppy's `rc.firewall` — `-P INPUT DROP` with an `udp_inbound` chain that only lets DHCP through,
+so every new inbound UDP packet (a query on 5353 is one) hits the policy, while the box's own announcements
+leave fine because the same file ends with `-A OUTPUT -p ALL -j ACCEPT`. Cycle 23 opens it in
+`zz-onboard-ports` for the LAN ranges only (`open_mdns`, `os/v3/puppy/embed/etc/init.d/zz-onboard-ports:55-66`),
+and the gate grows a row that fails an image without the rule (`vm-check.sh:676-679`). What that fix has not
+proved is the last hop: the measured packets were avahi's own multicast loopback, not a query from a peer,
+so "a phone on this LAN can click the name" is still the board's row to prove.
+
+If you cannot get to a console, the router's client list shows the box
 (the MAC of the wired or wireless interface), and the box announces the server on the LAN itself —
 `lemond` logs `Net Broadcast` on each RFC1918 interface, and `lemonade scan` (run anywhere on the same
 network with the CLI installed) lists the beacons it hears.
@@ -244,7 +254,7 @@ Against the cycle-13 appliance image booted in QEMU (`sha256 dcc619ff…`, kerne
 |---|---|
 | Lemonade listens on every interface | `netstat`: `lemond` on `0.0.0.0:13305`, WebSocket `9000`, `sshd` on `0.0.0.0:22` |
 | `/api/v1` and `/v1` are the API | `GET /api/v1/models` and `GET /v1/models` both answer |
-| the key is required, and only the key (cycle-13 image, which minted one) | with a key minted: no key and a wrong key → **401**, the right key → **200** (both paths). Cycle 20 ships blank instead: the appliance's own gate asserts **200 with no header** in blank mode and 401/200 keyed (`os/v3/puppy/vm-check.sh:740-754`) |
+| the key is required, and only the key (cycle-13 image, which minted one) | with a key minted: no key and a wrong key → **401**, the right key → **200** (both paths). Cycle 20 ships blank instead: the appliance's own gate asserts **200 with no header** in blank mode and 401/200 keyed (`os/v3/puppy/vm-check.sh:749-762`) |
 | the key's file | `readlink -f /etc/1bit/lemond.conf` → `/data/lemonade/lemond.conf`, `0600 root`; a key written there plus `/etc/init.d/10lemonade restart` takes effect on the next request |
 | the web app | `GET http://<box>:13305/` → 200, `text/html`, `<title>Lemonade App</title>`, with and without a key (it is static; its own API calls are what 401) |
 | the `curl` chat example | `POST /api/v1/chat/completions` with `chat_template_kwargs.enable_thinking=false`: **200**, `content: "Sure! 😊"`, `finish_reason: stop` |

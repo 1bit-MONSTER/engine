@@ -180,9 +180,11 @@ design at one row measured 1.233 ms against M=32's 1.499 ms on 2048×1024 in thi
 earlier one, i.e. the two are within run-to-run variance at decode width and neither changes the picture. The
 host column is a **lower bound**: it is the accumulation loop only, while the EP's real fallback then runs
 `epilogue_row` (a float multiply and a `q8_quantize` per element), so the 12–16-row crossover is optimistic *for
-the device*. `docs/onnx-pack.md` therefore keeps the device leg correctness-only rather than quoting a device
-speedup, and a decode-side win would need fewer, longer launches (one launch covering many projections), not a
-smaller design.
+the device*. A decode-side win would need fewer, longer launches (one launch covering many projections), not a
+smaller design — and "What the device leg is worth at model level" below is the four-arm measurement that shows
+the same thing from the graph's side: kernel-level wins of 1.5–1.9× do not survive 196 dispatch cycles per pass.
+`docs/onnx-pack.md` quotes that model-level result rather than a device speedup, because the sign of it is not
+what a speedup would claim.
 
 *(An earlier revision of this table was ~5 % low on the device column: the probe timed `repeats-1` calls and
 divided by `repeats`. The figures above are the corrected ones, and `repeats < 2` — which used to print
@@ -236,6 +238,73 @@ with designs configured, `quark-stress` (64×1024×2048) and the three 32-row pr
 `quark-d32`, `quark-gu32`) must reach the array, and every 5–8 row case must log `npu_qdq_host_rows`. Those three
 exist because the 5-row cases are host-routed by design: without them o_proj, down_proj and gate/up had no device
 gate at all, while this page claimed the shapes were covered.
+
+**What the device leg is worth at model level, and it is not yet a win.** The rows table above times one
+shape; this times the graph. Four arms on one graph — the real Quark A8W8 export of `qwen3-0.6b.onnx`
+(196 fused groups, the 197th being `lm_head`, whose weight is a `Cast`, so it stays float) — a Release build of
+this tree (the EP targets carry no `-O2` of their own: a bare `cmake -S onnx -B` compiles the host loop
+unoptimized, which inflates the device-against-host ratio by about 25× — measured, 129.6 ms against 5.0 ms for the
+same probe call), one thread, a 32-token prompt, 8 generated tokens, quiet box
+(load 1.17–1.35 for every arm), two runs each and the second quoted:
+
+| arm | prefill 32 tokens | decode ms/token | tok/s |
+|---|---|---|---|
+| float32, CPU EP | 207 / 212 ms | 225.6 / 226.0 | 4.43 |
+| A8W8, CPU EP | 635 / 645 ms | 625.1 / 628.1 | 1.59–1.60 |
+| our EP, host kernel | 843 / 845 ms | 947.4 / 950.6 | 1.05–1.06 |
+| our EP, **array** | 805 / 809 ms | **1073.7 / 1105.1** | 0.90–0.93 |
+
+So at model level the array is **1.13–1.16× slower than the host kernel it replaces**, 1.7× behind the A8W8 CPU
+EP and 4.8× behind float32; only the 32-token prefill is ahead of the host leg, by 4–5 %, and still 1.3× behind
+the CPU EP. Correctness is exact where it matters: the device arm generated **the same ids as the host arm** and
+its KL against float is the same number (5.6787 nats both; the A8W8 CPU EP's own arm scores 7.2085 with a
+different continuation), and its trace is `qdq runs=1764` (= 196 groups × 9 passes), `host-rows policy=0`,
+`device fallbacks=0`, `device-busy=0` — every fused group went to the array, and nothing was dressed up as one.
+The 5-token counter-example is the other half of that claim: same binary, same designs, 8 tokens in 2159 ms
+(3.70 tok/s), trace `host-rows policy=1764` and no device call at all, because a 5-token prompt never reaches 16
+rows.
+
+**Why the kernels being 1.5–1.9× ahead does not reach the model.** One probe per design at the decode width
+(m=36, which is two blocks per launch — 32 rows + 4 — so it measures what a decode step really issues), 20 timed
+calls each, same build and same window:
+
+| shape | groups/pass | device ms/call | host ms/call | device ms/pass |
+|---|---|---|---|---|
+| q 1024×2048 | 28 | 3.663 | 5.629 | 102.6 |
+| k/v 1024×1024 | 56 | 1.670 | 2.874 | 93.5 |
+| gate/up 1024×3072 | 56 | 5.287 | 8.769 | 296.1 |
+| o 2048×1024 | 28 | 3.292 | 5.638 | 92.2 |
+| down 3072×1024 | 28 | 4.560 | 8.626 | 127.7 |
+| **196 groups** | | | | **device 712.0, host 1209.0 (1.7×)** |
+
+At m=32 the same probe reproduces the rows table's q cell — `device 1.632 / host 5.166` against the published
+`1.566 / 5.062`, i.e. 4 % and 2 % — so the two measurements describe the same kernel. And the host column is a
+**unit** measurement, not an additive one: it sums to 1209 ms/pass, which is *above* the whole host arm's 947
+ms/token. The likely reason is that the probe's operands are synthetic int8 while the graph's are not and the
+host loop skips `aik == 0` — a hypothesis, not something measured here. Either way the host column is a unit
+measurement: do not subtract the two rows above to explain the arms, compare arms to arms.
+
+**Which means the cause of the model-level loss is not established, only its sign.** Two explanations fit every
+number on this page, and these measurements do not separate them:
+
+1. **Dispatch.** 196 calls per pass, two launches each at 33–40 rows, each paying the A upload, two syncs and a
+   wait: at ~1.3 ms of non-kernel work per call that is 250 ms of a 1074 ms pass.
+2. **The host loop is faster on real data than on the probe's.** The probe's host column (5.629 ms for q at 36
+   rows) is what makes "the kernels are 1.7× ahead" true in isolation; if the graph's sparser activations let the
+   `aik == 0` skip cut that by 30 %, the host arm's kernel time falls to ~850 ms/pass, the device's 712 ms
+   becomes a far smaller win, and the two arms land where they are measured — the device slightly behind.
+
+The bound that *is* rigorous, and it is tight enough to matter: the probe's host column sums to 1209 ms/pass
+while the whole host arm — kernel plus every other node in the graph — is 947 ms/token, so the graph's real
+operands make the host loop **at least 1.28× faster** than the probe's synthetic ones. The device's 1.7×
+kernel-level advantage is therefore at most **1.33×**, and it could be none at all, which is the whole reason the
+cause is stated as open rather than as dispatch.
+
+The next step is a profile, not a redesign: `NPU_C_SYNC_PROF=1` (engine#988) prints the C-sync counters per call,
+and a per-call timer inside `gemm_q8` separates launch, wait, sync and epilogue. What a *fix* would look like if
+(1) dominates is one launch covering many projections — a resident weight layout and a pass-level submission,
+rather than the per-projection ELF this leg uses — which is also why the threshold discussion above stands
+unchanged: `kDeviceMinRows` is about one call, and the model-level question is about 196 of them.
 
 **The device lock.** The NPU is shared, and the rule is that a plugin never evicts the owner's
 serve. The EP takes `/tmp/1bit-npu-device.lock` with `flock(2)` **non-blocking** and holds it for the

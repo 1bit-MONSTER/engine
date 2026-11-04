@@ -40,16 +40,24 @@ tested) on any machine.
 2. **The provider prefills.** serve writes the ids to a file in the backend's slot directory and runs
    the provider. It writes a llama.cpp sequence-state file for the prompt.
 3. **Restore into slot 0.** `POST /slots/0?action=restore` loads the file into the one slot; serve
-   checks the slot holds the tokens the provider prefilled (the prompt's, less its last). The request
-   carries `leave_one_token` so the backend records the handoff as an in-place context checkpoint - a
-   checkpoint with bookkeeping and no data (`common_prompt_checkpoint::load_tgt` returns at once for
-   it), which is what lets the prompt-cache search find the prefix instead of re-processing it.
+   checks the slot holds the tokens the provider prefilled (the prompt's, less its last). Because the
+   handoff is one token short of the prompt, the ordinary prompt-cache prefix search finds it and the
+   backend evaluates only that last token (step 4).
 4. **Decode.** The request is forwarded with `id_slot` 0 and `cache_prompt` true. llama-server finds
    the prompt in the slot and evaluates its last token - one token, not the prompt. That one token is
    not an artefact: a hybrid model's recurrent memory keeps its whole prefix in a single cell, so the
    backend cannot trim a cell back the way it trims a KV position, and a handoff that covered the whole
    prompt would leave it nothing legal to evaluate (it would re-process the prompt, or abort). The
    reply, streamed or not, is relayed as for every device.
+
+**`leave_one_token`, and what the pin does with it.** Both handoff requests also carry
+`"leave_one_token": true`. A backend that knows the field (fork
+`1bit-MONSTER/llama.cpp#189`, not yet in the pinned `third_party/llama.cpp`) records the handoff as an
+in-place context checkpoint: bookkeeping only, no state data, so its restore is a no-op by construction
+(`common_prompt_checkpoint::load_tgt` returns at once for an empty `data_tgt`). That is what makes the
+prompt-cache search reuse a handoff across requests that arrive later. At the **current pin**
+(`d8bd0ff60`) nothing reads the field, it is silently ignored, and the one-token saving above comes from
+the ordinary prefix search instead - the field is forward-looking, not a claim about today's backend.
 
 One line per request on stderr: `hybrid: N prompt tokens: prefill X ms, restore Y ms, first byte Z ms`
 (the provider's own `prefill_ms` when it reports one, else its wall time; the restore from the backend's
@@ -117,9 +125,8 @@ Per request: `POST /slots/0?action=share {"socket": PATH}` makes the decoder exp
 hand the fds over an AF_UNIX socket that serve is listening on (`SCM_RIGHTS`, one length-prefixed JSON
 message); serve passes them to the provider as inherited descriptors; the provider maps them as its own
 KV tensors and prefills the prompt into them; `POST /slots/0?action=adopt {"tokens": [...],
-"share_id": N, "leave_one_token": true}` makes the
-decoder take cells 0..N-1 as positions 0..N-1 with no data movement (`llama_kv_cells_adopt`) and record
-them as an in-place checkpoint. The
+"share_id": N}` makes the
+decoder take cells 0..N-1 as positions 0..N-1 with no data movement (`llama_kv_cells_adopt`). The
 provider never writes a file, and the only bytes that cross a boundary are the fds and a few hundred
 bytes of JSON. `llama-kvshare-prefill` (llama.cpp `tools/kvshare-prefill`) is the reference provider:
 a CPU prefill, so the plumbing can be gated with no NPU; the NPU engine is the real one, mapping the

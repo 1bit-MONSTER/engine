@@ -69,8 +69,8 @@ check "cache_prompt on (fake_cache_prompt)" '[[ "$reply" == *"\"fake_cache_promp
 sleep 0.3
 check "stderr: the per-request line (prefill, restore, first byte)" 'grep -q "hybrid: 30 prompt tokens: prefill .* ms, restore .* ms, first byte .* ms" "$scratch/a.log"'
 check "stderr: the startup line names the provider" 'grep -q "hybrid: prefill by .*fake_prefill_provider.py" "$scratch/a.log"'
-# engine#941: the state file holds the prompt minus its last token, and restore says so, so the backend leaves
-# that token to evaluate instead of re-processing the prompt
+# engine#941: the state file holds the prompt minus its last token, and restore says so. This pins the request
+# shape only - what the backend does with `leave_one_token` is fork 1bit-MONSTER/llama.cpp#189, not in the pin yet
 check "the provider was handed one token less than the prompt (29 of 30)" \
     'python3 -c "import json,sys; d=json.load(open(sys.argv[1])); b=d[\"body\"]; sys.exit(0 if d[\"action\"]==\"restore\" and b.get(\"leave_one_token\") is True and b.get(\"n_tokens_in_state_file\")==29 else 1)" "$scratch/slot.json" 2>/dev/null'
 reply=$(curl -s "$api/v1/completions" -H 'Content-Type: application/json' -d '{"model": "hybrid-model", "prompt": "Hello hybrid"}')

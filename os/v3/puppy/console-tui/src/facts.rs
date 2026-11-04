@@ -99,6 +99,8 @@ pub struct Facts {
     pub secure_boot: SecureBoot,
     pub ips: Vec<String>,
     pub key: Option<String>,
+    /// avahi-daemon is running, i.e. the `1bit-os.local` name the CONNECT block prints can answer
+    pub mdns: bool,
     pub lemond_pid: Option<u32>,
     pub lemond_listening: bool,
     /// the port is listed in `netstat -lnt` (true while the socket exists, even if nothing answers on it)
@@ -133,7 +135,8 @@ impl Facts {
             secure_boot: secure_boot(),
             ips: ips(),
             key: api_key(),
-            lemond_pid: lemond_pid(),
+            mdns: false,
+            lemond_pid: None,
             lemond_listening: lemond_listening(),
             lemond_listed: false,
             gpu: Gpu::default(),
@@ -145,6 +148,10 @@ impl Facts {
             stats: Stats::default(),
             logs: Vec::new(),
         };
+        // one `ps` for both questions: lemond and the mDNS responder are looked up in the same snapshot
+        let ps = ps_snapshot();
+        f.lemond_pid = pid_of(&ps, "lemond");
+        f.mdns = pid_of(&ps, "avahi-daemon").is_some();
         f.lemond_listed = Command::new("netstat")
             .args(["-lnt"])
             .output()
@@ -307,13 +314,13 @@ pub fn pid_of(ps_out: &str, name: &str) -> Option<u32> {
     })
 }
 
-fn lemond_pid() -> Option<u32> {
-    let out = Command::new("ps")
-        .arg("-eo")
-        .arg("pid=,comm=")
+/// `ps -eo pid=,comm=` once per refresh; a box without `ps` gets an empty string, not a panic.
+fn ps_snapshot() -> String {
+    Command::new("ps")
+        .args(["-eo", "pid=,comm="])
         .output()
-        .ok()?;
-    pid_of(&String::from_utf8_lossy(&out.stdout), "lemond")
+        .map(|o| String::from_utf8_lossy(&o.stdout).into_owned())
+        .unwrap_or_default()
 }
 
 pub fn listens_on_13305(netstat: &str) -> bool {
@@ -954,6 +961,8 @@ pub fn c16_board() -> Facts {
         secure_boot: SecureBoot::Enabled,
         ips: vec!["192.168.50.110".into()],
         key: Some("93112a22cafee2ad".into()),
+        // the c16 payload shipped no avahi, which is why the recorded sample shows the name as not answering
+        mdns: false,
         lemond_pid: Some(8882),
         lemond_listening: true,
         lemond_listed: true,
@@ -1126,9 +1135,17 @@ mod tests {
         fs::create_dir_all(root.join("card0/device")).unwrap();
         fs::create_dir_all(root.join("card1/device")).unwrap();
         fs::write(root.join("card0/device/mem_info_vram_total"), "0\n").unwrap();
-        fs::write(root.join("card1/device/mem_info_vram_total"), "128849018880\n").unwrap();
+        fs::write(
+            root.join("card1/device/mem_info_vram_total"),
+            "128849018880\n",
+        )
+        .unwrap();
         fs::write(root.join("card1/device/mem_info_vram_used"), "2147483648\n").unwrap();
-        fs::write(root.join("card1/device/mem_info_gtt_total"), "65498251264\n").unwrap();
+        fs::write(
+            root.join("card1/device/mem_info_gtt_total"),
+            "65498251264\n",
+        )
+        .unwrap();
         fs::write(root.join("card1/device/mem_info_gtt_used"), "536870912\n").unwrap();
         let mut g = Gpu::default();
         gpu_mem_in(&root.to_string_lossy(), &mut g);

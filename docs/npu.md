@@ -544,7 +544,10 @@ Two facts bound what the container can hold, and both are reported, not hidden:
 
 A layer block's attention payload sits between its two epsilon headers and is a whole number of
 **64-row tiles**: one tile is `2*(K/128) + 2` subvolumes of 2,176 B, a pair per (column half, K
-block of 128) plus the pair the writer puts its bias input in. Inside a weight subvolume,
+block of 128) plus the pair the writer puts its bias input in. It starts at `64 + 2*hidden` bytes
+past the block's first header — the 64-byte header, then `input_layernorm` as bf16 `[hidden]` — which
+reads 1,856 on a hidden-896 pack and 4,160 on Llama-3.2-1B's hidden 2,048. It is not a constant;
+reading it as one made every other hidden look like "whole tiles plus a stray run" (engine#979). Inside a weight subvolume,
 `[0, 2048)` are the quants (byte `(cp%4) + kk*4 + (cp/4)*512` holds rows `2*cp` and `2*cp+1` at
 column `kk` of the block), `[2048, 2064)` the zero points and `[2112, 2176)` 32 bf16 scales, one
 per row of the half. Codes and zero points are int4 in two's complement; the +8 an ONNX

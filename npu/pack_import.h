@@ -207,6 +207,11 @@ unsigned short bf16_bits_of(float v);
 FconstGeom locate_fconst(const std::string& path, unsigned short eps_bits = 0x3586);
 
 int64_t attn_tile_bytes(int64_t k);
+// Where a layer block's attention payload starts: the block's 64-byte header, then its
+// input_layernorm weight as bf16 [hidden]. So it is `64 + 2 x hidden`, not a constant. It reads 1,856 on
+// the 0.5B pack (hidden 896) and 4,160 on Llama-3.2-1B (hidden 2,048); reading it as the constant is what
+// made every pack with a different hidden look like "whole tiles plus a stray run" (engine#979).
+int64_t attn_payload_off(int64_t hidden);
 TileW decode_tile(const uint8_t* tile, int k, int rows = 64);
 // The exact inverse. Used only as the importer's self-check: a tile that does not survive
 // encode(decode(t)) == t is a tile whose fields we do not understand, and it is refused by name.

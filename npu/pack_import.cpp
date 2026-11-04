@@ -601,7 +601,8 @@ void tile_q4_1(const Q4& q, std::vector<uint8_t>& out, long long* zero_inexact) 
 // Codes and zero points are int4 in two's complement. An asymmetric 4-bit quantiser needs (code - zp), and
 // the +8 offset every ONNX MatMulNBits applies cancels between the two fields, so the stored nibbles can be
 // used as they are: w = (code_nibble - zp_nibble) * scale.
-constexpr int64_t kAttnOff = 1856;  // attention payload start within a layer block
+// (the attention payload's offset is not a constant: it is `kNormOff + 2 x hidden`, i.e. just past the
+// block's input_layernorm weight -- see its two use sites)
 constexpr int64_t kSubvBytes = 2176;  // 64 columns of K=128: 2,048 quants + 64 zeros + 32 bf16 scales
 constexpr int64_t kZerosOff = 2048, kScalesOff = 2112;
 constexpr int kTileRows = 64, kSubvRows = 32, kKBlock = 128;
@@ -628,6 +629,7 @@ int64_t group_bytes(int64_t k, int rows) {
 }
 
 int64_t attn_tile_bytes(int64_t k) { return group_bytes(k, kTileRows); }
+int64_t attn_payload_off(int64_t hidden) { return kNormOff + hidden * 2; }
 
 TileW decode_tile(const uint8_t* tile, int k, int rows) {
     if (k <= 0 || k % kKBlock) throw std::runtime_error("tile: K is not a positive multiple of 128");
@@ -941,14 +943,17 @@ Plan plan(const std::string& pack_dir) {
                 p.attn_note = "layer blocks not located: " + g.why;
                 p.mlp_note = p.attn_note;
             } else {
-                const int64_t payload = g.h1 - kAttnOff;
+                // The payload starts just past the block's input_layernorm weight, so its offset is
+                // `attn_payload_off(hidden)` (engine#979).
+                const int64_t payload = g.h1 - attn_payload_off(H);
                 const int64_t want = (kv_out / 64) * 2 + (q_out / 64) * 2;  // k, q, v, o = 2/14/2/14 on 0.5B
                 if (payload <= 0 || payload % tile_bytes)
                     p.attn_note = "attention payload is " + std::to_string(payload) + " B, not a whole number of " +
                                   std::to_string(tile_bytes) + "-byte tiles";
                 else if (q_out != H)
-                    p.attn_note = "q_proj is " + std::to_string(q_out) + " rows against hidden " +
-                                  std::to_string(H) + ", so o_proj's K would not be the tile's K";
+                    p.attn_note = "the attention payload's q_proj is " + std::to_string(q_out) +
+                                  " rows against hidden " + std::to_string(H) +
+                                  ", so o_proj's K would not be the tile's K";
                 else if (payload / tile_bytes != want)
                     p.attn_note = "attention payload holds " + std::to_string(payload / tile_bytes) +
                                   " tiles; q/k/v/o at 64 rows each need " + std::to_string(want);
@@ -1309,7 +1314,7 @@ Report import_pack(const std::string& pack_dir, const std::string& out_dir, cons
                                       {"v_proj", kv_out, n_kv + n_q},
                                       {"o_proj", int(H), n_kv + n_q + n_kv}};
                 for (int L = 0; L < p.dims.layers; ++L) {
-                    const int64_t base = int64_t(L) * g.stride + kAttnOff;
+                    const int64_t base = int64_t(L) * g.stride + attn_payload_off(H);
                     for (const auto& sl : slots) {
                         const int nt = sl.rows / kTileRows;
                         std::vector<TileW> tiles;

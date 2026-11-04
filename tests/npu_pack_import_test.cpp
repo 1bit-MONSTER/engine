@@ -855,8 +855,12 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
         const auto& qw = m.tensor("model.layers.0.self_attn.q_proj.weight");
         check(qw.shape.at(1) == int64_t(onebit::npu::kTileBytes),
               "pack: an imported projection is q4_1 chunks of the container's tile size");
-        check(m.tensor("model.layers.0.self_attn.q_proj.bias").shape.at(0) == int64_t(p.dims.heads * p.dims.head_dim),
-              "pack: the q_proj bias is one bf16 value per output row");
+        // Not every family carries attention biases: Llama-3.2 has none, and its attention section now
+        // tiles (engine#979), so the check has to ask the pack rather than the geometry.
+        if (r.attn_bias_tensors)
+            check(m.tensor("model.layers.0.self_attn.q_proj.bias").shape.at(0) ==
+                      int64_t(p.dims.heads * p.dims.head_dim),
+                  "pack: the q_proj bias is one bf16 value per output row");
     }
     if (r.mlp_projections) {
         const auto& gw = m.tensor("model.layers.0.mlp.gate_proj.weight");
@@ -881,6 +885,39 @@ void test_pack(const std::string& pack, const std::string& golden_dir) {
 // amd/Llama-3.2-1B declares rms_norm_eps 1e-5 (bf16 0x3728, bytes 28 37) and so had no anchors at all and
 // refused all 33 of its layer norms.  Two crafted .fconst files here, one per epsilon: each must locate the
 // same geometry with its own epsilon, and each must find NOTHING with the other one.
+// ── the attention payload's offset is derived from hidden, not a constant (engine#979) ──────────────
+// The importer located the payload at the constant 1,856, which is correct only for hidden 896 (the 0.5B
+// pack: 64 + 2 x 896). Every other pack was then measured from 2 x (hidden - 896) bytes early, so its
+// payload came out as "whole tiles plus a stray run" and the attention section was refused. The two
+// numbers below are the packs' OWN measured second-header offsets, so this is a known-answer test: with
+// the derived offset each section is exactly the tiles q/k/v/o need, and with the old constant it is not.
+void test_attn_payload_off() {
+    check(pi::attn_payload_off(896) == 1856,
+          "attn off: hidden 896 is the 1,856 the importer shipped with (64 + 2 x 896)");
+    check(pi::attn_payload_off(2048) == 4160, "attn off: hidden 2,048 gives 4,160, not 1,856");
+    check(pi::attn_payload_off(2560) == 5184, "attn off: hidden 2,560 gives 5,184");
+
+    // Llama-3.2-1B (hidden 2,048, q/k/v/o = 2048/512/512/2048 rows): the second header is at 5,922,880 B.
+    const int64_t h = 2048, h1 = 5922880, tile = pi::attn_tile_bytes(h);
+    const int64_t derived = h1 - pi::attn_payload_off(h);
+    check(tile == 73984, "attn off: a hidden-2,048 tile is 73,984 B");
+    check(derived == 80 * tile,
+          "attn off: Llama's payload is exactly 80 tiles from the derived offset (" + std::to_string(derived) +
+              " B), and " + std::to_string(h1 - 1856) + " B from the old constant = 80 tiles + " +
+              std::to_string(h1 - 1856 - 80 * tile) + " strip");
+    const int want = (512 / 64) * 2 + (2048 / 64) * 2;
+    check(derived / tile == want, "attn off: the derived count is the 80 tiles q/k/v/o need (" +
+                                      std::to_string(want) + ")");
+    // The 0.5B is unchanged by the fix, which is why it never showed the bug.
+    const int64_t h1_05 = 1115968;
+    check(h1_05 - pi::attn_payload_off(896) == 32 * pi::attn_tile_bytes(896),
+          "attn off: the 0.5B payload is still 32 tiles at the derived offset");
+    std::printf("attn off: 896 -> 1,856 B, 2,048 -> 4,160 B, 2,560 -> 5,184 B; Llama's 5,922,880 B header is "
+                "exactly %d tiles (the old constant gave %lld B = %d tiles + %lld strip)\n",
+                int(derived / tile), (long long)(h1 - 1856), int((h1 - 1856) / tile),
+                (long long)(h1 - 1856 - 80 * tile));
+}
+
 void test_fconst_eps(const std::string& root) {
     const fs::path dir = fs::path(root) / "fconst-eps";
     fs::remove_all(dir);
@@ -950,6 +987,7 @@ int main(int argc, char** argv) {
         test_attn_tile(golden_dir);
         test_mlp_gu(golden_dir);
         test_fconst_eps(golden_dir.empty() ? "." : golden_dir);
+        test_attn_payload_off();
         if (pack_ran) test_pack(pack, golden_dir);
         else std::printf("skip pack: no pack directory given (the crafted and golden legs only)\n");
     } catch (const std::exception& e) {

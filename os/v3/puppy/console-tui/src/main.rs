@@ -40,6 +40,7 @@
 //! Exit: 0 clean (1bit-console then shows the dialog menu), 1 the screen could not be set up.
 
 mod facts;
+mod qr;
 mod ui;
 
 use std::io::stdout;
@@ -72,7 +73,7 @@ fn main() -> ExitCode {
                 "  1bit-console-tui --version           print the version",
                 "",
                 "keys: 1-9 actions, arrows/PgUp/PgDn scroll the log, f follow, r refresh, 8 full-screen logs,",
-                "      q stays on this screen (this console never drops to a bare prompt).",
+                "      q quits over ssh and stays on tty1 (the console never drops to a bare prompt).",
             ] {
                 println!("{l}");
             }
@@ -119,6 +120,52 @@ fn parse_size(s: &str) -> Option<(u16, u16)> {
 fn suspend() {
     let _ = disable_raw_mode();
     let _ = execute!(stdout(), LeaveAlternateScreen, crossterm::cursor::Show);
+}
+
+/// Was this process started from an ssh session? `sshd` sets both of these, and neither exists on tty1, which is
+/// what makes them the honest question (rather than "is there a terminal", which tty1 answers yes to).
+fn ssh_session(conn: Option<&str>, tty: Option<&str>) -> bool {
+    conn.is_some_and(|v| !v.is_empty()) || tty.is_some_and(|v| !v.is_empty())
+}
+
+fn over_ssh() -> bool {
+    ssh_session(
+        std::env::var("SSH_CONNECTION").ok().as_deref(),
+        std::env::var("SSH_TTY").ok().as_deref(),
+    )
+}
+
+/// OSC 8 hyperlinks are a terminal-emulator feature. The VGA console (TERM=linux) has no clickable anything and
+/// would print the escapes; JetKVM and a serial terminal are the same case.
+fn hyperlinks_wanted(term: Option<&str>) -> bool {
+    matches!(term, Some(t) if !t.is_empty() && t != "linux" && t != "dumb")
+}
+
+/// Underline what was drawn and wrap it in OSC 8 with its own text as the target. Written AFTER the frame: ratatui
+/// has no hyperlink style, and the two rules that make this safe are that the text is identical to the cells it
+/// overwrites and that the link is re-stated on every frame (the next paint would otherwise drop it).
+///
+/// The style is not `\x1b[4m` alone: an SGR with no colour would inherit whatever the last drawn cell left current,
+/// so the link is set to the CONNECT rows' own white+bold through the same crossterm commands ratatui uses, and
+/// reset after - the cell keeps the pixel it had, plus the underline that says it can be clicked.
+fn emit_links(links: &[ui::Link]) {
+    if links.is_empty() {
+        return;
+    }
+    use crossterm::cursor::MoveTo;
+    use crossterm::style::{Attribute, Color, Print, SetAttribute, SetForegroundColor};
+    let mut out = stdout();
+    for l in links {
+        let _ = execute!(
+            out,
+            MoveTo(l.x, l.y),
+            SetForegroundColor(Color::White),
+            SetAttribute(Attribute::Bold),
+            SetAttribute(Attribute::Underlined),
+            Print(format!("\x1b]8;;{u}\x1b\\{u}\x1b]8;;\x1b\\", u = l.text)),
+            SetAttribute(Attribute::Reset),
+        );
+    }
 }
 
 fn resume(t: &mut Terminal<CrosstermBackend<std::io::Stdout>>) {
@@ -168,6 +215,8 @@ fn run() -> ExitCode {
     });
 
     let mut app = App::new(Facts::collect());
+    // asked once: sshd sets SSH_CONNECTION/SSH_TTY for the whole session, tty1 respawn sets neither
+    app.ssh = over_ssh();
     let mut last_spin = Instant::now();
     let rc = loop {
         while let Ok(f) = rx.try_recv() {
@@ -184,8 +233,14 @@ fn run() -> ExitCode {
             app.spin = app.spin.wrapping_add(1);
             last_spin = Instant::now();
         }
-        if term.draw(|f| ui::draw(f, &app)).is_err() {
+        let mut links = Vec::new();
+        if term.draw(|f| ui::draw(f, &app, &mut links)).is_err() {
             break 1;
+        }
+        // over ssh the screen is a terminal emulator, so the CONNECT URLs can be clickable (OSC 8). On the VGA
+        // console (TERM=linux) the same bytes would print as garbage - or worse, as text nobody can click.
+        if hyperlinks_wanted(std::env::var("TERM").ok().as_deref()) {
+            emit_links(&links);
         }
 
         if !event::poll(Duration::from_millis(250)).unwrap_or(false) {
@@ -291,6 +346,10 @@ fn handle(
         KeyCode::Char('q') | KeyCode::Char('Q') | KeyCode::Esc => {
             if app.full_logs {
                 app.full_logs = false;
+            } else if app.ssh {
+                // the owner, 2026-11-04: the TUI is used through ryzen over ssh, where q is the normal way out
+                // of a full-screen program. tty1 keeps the old promise: q never drops that console to a prompt.
+                return Some(0);
             } else {
                 app.say("q stays: no bare prompt here (7 shell, 9 reboot)");
             }
@@ -366,7 +425,8 @@ fn handoff(app: &mut App, term: &mut Terminal<CrosstermBackend<std::io::Stdout>>
     app.modal = Some(Modal::Busy {
         title: format!("action {n}"),
     });
-    let _ = term.draw(|f| ui::draw(f, &*app));
+    let mut links = Vec::new();
+    let _ = term.draw(|f| ui::draw(f, &*app, &mut links));
     suspend();
     let status = std::process::Command::new(facts::MENU)
         .arg("--action")
@@ -382,7 +442,34 @@ fn handoff(app: &mut App, term: &mut Terminal<CrosstermBackend<std::io::Stdout>>
 
 #[cfg(test)]
 mod tests {
-    use super::parse_size;
+    use super::{hyperlinks_wanted, parse_size, ssh_session};
+
+    #[test]
+    fn q_is_the_way_out_only_where_a_prompt_is_harmless() {
+        // sshd sets both; a tty1 respawn sets neither, and that console must never fall back to a bare prompt
+        assert!(ssh_session(Some("10.0.0.2 51234 10.0.0.5 22"), None));
+        assert!(ssh_session(None, Some("/dev/pts/3")));
+        assert!(!ssh_session(None, None));
+        assert!(!ssh_session(Some(""), Some("")));
+    }
+
+    #[test]
+    fn hyperlinks_are_for_terminal_emulators_not_the_vga_console() {
+        for term in [
+            "xterm-256color",
+            "screen-256color",
+            "tmux-256color",
+            "alacritty",
+            "kitty",
+        ] {
+            assert!(hyperlinks_wanted(Some(term)), "{term}");
+        }
+        // TERM=linux is the appliance's own VGA console and a serial line: the escapes would be printed, not used
+        for term in ["linux", "dumb", ""] {
+            assert!(!hyperlinks_wanted(Some(term)), "{term}");
+        }
+        assert!(!hyperlinks_wanted(None));
+    }
 
     #[test]
     fn snapshot_sizes() {

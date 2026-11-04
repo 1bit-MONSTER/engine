@@ -93,6 +93,17 @@ bool head_step(const Weights& w, const float* hidden, const float* tok_emb, int 
 // the probability, not just the token).
 int argmax_prob(const std::vector<float>& logits, float* prob);
 
+// One depth of the live-loop-vs-offline-protocol comparison, computed from the two tables' own counts.  `scored`
+// is false as soon as either side has no denominator: a depth no chain reached is not a 0 % that agrees with
+// another 0 %, it is unmeasured, and reporting it as "delta +0.00 pp PASS" turns "nothing was measured" into a
+// pass -- which is what happens at tau>0, where the chain gate stops before depths 3-4.
+struct DepthVerdict {
+    bool scored = false;
+    double live = 0, offline = 0, delta = 0;
+    bool within = false;
+};
+DepthVerdict depth_verdict(int live_hits, int live_reached, int offline_hits, int offline_reached, double bar_pp = 2.0);
+
 // The drafter: one head step per proposed token, chained on its own hidden state and its own KV stream.  It lives
 // here rather than in the measurement tool because (a) the serving route needs the same class and (b) its stream
 // cursor is the one part of the live loop that must be testable without the 1.6 GiB head -- the class of bug it

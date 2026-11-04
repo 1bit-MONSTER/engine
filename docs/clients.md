@@ -144,6 +144,12 @@ model catalogue, downloads, settings and logs. The page itself loads without a k
 blank mode (the default) it needs nothing; once the box is keyed, every request it makes needs the key,
 so the first time it asks for it; paste the key from [1](#1-find-the-box-and-its-key).
 
+That page is Lemonade's own, served by `lemond`. The image also carries a second chat page,
+`1bit-webapp-proxy` on `127.0.0.1:8080` (`os/v3/puppy/embed/etc/init.d/24onboard-webapp:32,39`), which
+injects the key itself so a URL never holds one. It is not offered on the c19/c20 boards: the boot logs
+`OSError: [Errno 98] Address already in use` for `127.0.0.1:8080`, and since engine#959 the log names the
+process holding the port instead of printing a traceback (engine#958). Use `:13305` above.
+
 ## 4. Lemonade Mobile on a phone
 
 Lemonade's phone client is **Lemonade Mobile**, by Geramy Loveless, and it is the front door to the same

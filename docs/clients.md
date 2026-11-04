@@ -49,7 +49,12 @@ hostname                    # 1bit-os - the name the image sets in /etc/hostname
 
 **The name is `1bit-os`, not an address.** Puppy only invents a per-machine `puppypc<digits>` while
 `/etc/hostname` still holds its stock word, and the shipped image sets `1bit-os` instead (measured: on the
-cycle-13 image it still booted as `puppypc19108`, which is why older notes name it that way). Read the
+cycle-13 image it still booted as `puppypc19108`, which is why older notes name it that way). A name that
+is neither is a person's rename, not a fault: console **3** (Network) then **3** (Set the hostname) writes
+`/etc/hostname` and applies it live (`1bit-console-menu:437,463-466`; the top-level row is
+`1bit-console-menu:632`). The cycle-16 board booted as
+`strix` for exactly that reason while the frozen bytes still read `1bit-os`, so check the address, not the
+name. Read the
 address off the box rather than guessing `1bit.local` — mDNS is not claimed. If you cannot get to a
 console, the router's client list shows the box
 (the MAC of the wired or wireless interface), and the box announces the server on the LAN itself —

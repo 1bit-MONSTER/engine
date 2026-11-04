@@ -25,7 +25,13 @@
 //!   * the code is drawn on PAPER - black modules on a white background - because a scanner wants dark-on-light,
 //!     and a terminal's dark background is precisely the inversion that many phone scanners refuse.
 //!
-//! Nothing here is guessed: the matrix is the encoder's, and `blocks()` is a pure function with a known-answer test.
+//! Nothing here is guessed: the matrix is the encoder's, and what this module draws from it is pinned by two
+//! known-answer tests - `blocks_draws_two_module_rows_per_text_row` (a hand-drawn 2x2) and
+//! `a_known_url_renders_to_these_exact_rows` (the appliance's own URL, all 17 rows, literal). That the drawn code
+//! really scans is not something a test can assert cheaply: it was measured once, on this box, by rendering the
+//! 240x67 frame to a PNG and reading it back with zxing-cpp - it returned `http://192.168.50.110:13305` (2026-11-04).
+//! Re-run that by hand if the encoder, the ECC level or the quiet zone is ever changed; the literal test below will
+//! fail first, which is the point.
 
 use qrcodegen::{QrCode, QrCodeEcc};
 
@@ -78,7 +84,7 @@ mod tests {
     use super::*;
 
     #[test]
-    fn two_module_rows_become_one_text_row() {
+    fn blocks_draws_two_module_rows_per_text_row() {
         // a 2x2 matrix, drawn by hand: the quiet zone, then `▀` (dark over light) and `▄` (light over dark)
         let m = vec![vec![true, false], vec![false, true]];
         let rows = blocks(&m);
@@ -88,6 +94,36 @@ mod tests {
         assert_eq!(rows[2], "    ▀▄    ");
         assert_eq!(rows[3], " ".repeat(10));
         assert_eq!(rows[4], " ".repeat(10));
+    }
+
+    #[test]
+    fn a_known_url_renders_to_these_exact_rows() {
+        // The known answer, not a fit check: the appliance's URL in, these 17 rows of 33 cells out. Every rule this
+        // module owns is visible here - 4 modules of quiet zone on each side (the two blank rows at the top and the
+        // two at the bottom), two module rows per text row (`▀` upper only, `▄` lower only, `█` both), spaces for
+        // light. If the encoder, the ECC level (L), the version (2 for 27 characters) or the drawing changes, this
+        // fails and somebody has to look at a scanner again rather than ship a code nobody can read.
+        let want = [
+            "                                 ",
+            "                                 ",
+            "    █▀▀▀▀▀█ ▄ █ ▀█▄▄  █▀▀▀▀▀█    ",
+            "    █ ███ █ ▄▄▄ █▄ █▄ █ ███ █    ",
+            "    █ ▀▀▀ █ ▄█ ▄▄ ▀▄▄ █ ▀▀▀ █    ",
+            "    ▀▀▀▀▀▀▀ ▀▄█▄▀ █▄█ ▀▀▀▀▀▀▀    ",
+            "    ▀███▀ ▀▀█▀▄▀█▀▄▀▀█ ▀ ▀ █     ",
+            "    ▀▀█▄▀▄▀ █ ▀   ▄▀▄ ▀▀▄▀ ▀█    ",
+            "    ██▄ ▀▀▀█ ▀▀▄▄▀▄   ▀▀▀▄▀█▀    ",
+            "    █ ▄ ▀ ▀▄▄   █  █ ▀ ▀ █ ▀█    ",
+            "    ▀ ▀▀  ▀ █ █▄▄█▄ █▀▀▀█▄█      ",
+            "    █▀▀▀▀▀█ ▀ ▄▄▄▀ ▄█ ▀ ██▀█▀    ",
+            "    █ ███ █ █▀▄▄▄▀▄██▀███▀█▄▄    ",
+            "    █ ▀▀▀ █ █▀ ▄▄ ▄ ▄▀▄▄▄▄▀ █    ",
+            "    ▀▀▀▀▀▀▀ ▀▀   ▀ ▀ ▀▀▀▀▀▀▀▀    ",
+            "                                 ",
+            "                                 ",
+        ];
+        let got = code("http://192.168.50.110:13305").expect("the URL fits");
+        assert_eq!(got, want);
     }
 
     #[test]

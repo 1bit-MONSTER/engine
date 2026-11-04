@@ -94,7 +94,10 @@ the terminal it finds itself on:
   garbage - and no link is emitted for a URL that wrapping split, because half a URL opens the wrong thing.
 * **A QR code** of the web UI URL, to the right of the CONNECT rows, two modules per cell (17 rows for the
   appliance's 27-character URL: version 2, ECC L, `qrcodegen`, the only new dependency and one with no
-  transitive ones), drawn **black on white** because a scanner wants dark-on-light. It is only drawn where it
+  transitive ones), drawn **black on white** because a scanner wants dark-on-light. The drawn code was read back
+  with zxing-cpp from a PNG of the 240x67 frame and decoded to `http://192.168.50.110:13305` (2026-11-04, by hand);
+  `a_known_url_renders_to_these_exact_rows` pins the 17 rows literally, so a change to the encoder, the ECC level or
+  the quiet zone fails the build instead of shipping a code nobody can read. It is only drawn where it
   fits: at 80x25 there are no 33 free columns beside the block and squeezing it in would push the menu or the log
   off the screen, so there the URL stays plain text - which a phone camera reads too.
 * **The mDNS name** `http://1bit-os.local:13305`, next to the address, with `(mDNS)` when the box's own
@@ -146,7 +149,7 @@ dynamic one (`readelf` PT_INTERP, `ldd`).
 ## Tests
 
 ```sh
-cargo test                                    # 42 tests: the probe parsers, the QR drawing, the links, the two renders
+cargo test                                    # 43 tests: the probe parsers, the QR drawing (incl. a literal known answer), the links, the two renders
 cargo run -- --snapshot 240x67 --fixture      # the frame tests/snapshots/240x67.txt holds
 cargo run -- --snapshot 80x25 --fixture
 cargo run -- --status                         # the same facts as plain text (what a shell or a gate row can read)

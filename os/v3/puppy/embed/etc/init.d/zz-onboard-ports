@@ -47,7 +47,8 @@ open_port 22      # ssh, the owner's key (U7)
 #
 # so every NEW inbound UDP packet falls through to the DROP policy, and 5353 is UDP. A query is exactly that
 # packet, which is why the responder never saw one; its own announcements did reach the wire, because the same
-# file ends with `-A OUTPUT -p ALL -j ACCEPT` - so this needs no OUTPUT rule, only the query that confirms it.
+# file lifts the OUTPUT side: `-P OUTPUT DROP` at line 334 is followed by an unconditional
+# `-A OUTPUT -p ALL -j ACCEPT` at line 687, so outbound mDNS was never blocked - the query was the whole bug.
 #
 # LAN-only, the same ranges as hosts.allow below, plus link-local (avahi's fallback when there is no lease):
 # announcing to a phone on the LAN is the point, being a public responder is not. `-I INPUT 1` puts these ahead
@@ -59,6 +60,17 @@ open_mdns() {
         echo "zz-onboard-ports: could not open udp/5353 for $src" >&2
         return 1
     done
+    # The outbound half (cycle 24). This is NOT the c23 fix: measured in the packed c23 sfs, rc.firewall accepts
+    # all output (line 687 above), so avahi's queries, announcements and responses already leave the box - the
+    # c23 board row failed with "out: NONE" because that ROW demanded a 5353 rule the image correctly lacks, and
+    # it was re-adjudicated as a checker bug (it now judges the effective verdict). The rule is here so the
+    # intent is stated where the INPUT half is, and so mDNS keeps answering if a future rc.firewall replaces
+    # that accept-all with a smaller set.
+    # shortcut: IPv4 and the mDNS group only; a unicast response to a LAN querier rides the general outbound
+    # path, so if that path is ever tightened this needs the LAN ranges as -d too.
+    iptables -C OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2> /dev/null ||
+        iptables -I OUTPUT 1 -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT 2> /dev/null ||
+        { echo "zz-onboard-ports: could not open outbound udp/5353 to 224.0.0.251" >&2; return 1; }
 }
 # shortcut: IPv4 only. 18onboard-mdns's responder answers on both families, but this image's IPv6 is
 # unconfigured (no global address, and the board reaches it at 192.168.50.110), so a v6 rule would be untested

@@ -21,6 +21,9 @@
 # with the wrong source, or one re-added on every boot), so it gets a check that runs anywhere:
 #
 #   * one insert per LAN range, four of them, with the four sources the file intends;
+#   * one outbound insert to the mDNS group (224.0.0.251), which is intent rather than a fix: the shipped
+#     rc.firewall already accepts all output, so this rule cannot change the verdict - it is asserted here so
+#     nobody re-adds it per boot or drops it by accident;
 #   * a second run against the same ruleset inserts nothing (`-C` first, which is what keeps a re-run a no-op);
 #   * the two pre-existing TCP ports are still opened - this script must not have moved them.
 #
@@ -55,24 +58,30 @@ chmod +x "$work/bin/iptables"
 PATH="$work/bin:$PATH" sh "$script" > "$work/run1.log" 2>&1
 i1=$(grep -c -- '^-I ' "$CALLS")
 c1=$(grep -c -- '-dport 5353' "$CALLS")
-u1=$(grep -c -- '^-I .* -p udp --dport 5353 ' "$CALLS")
+in1=$(grep -c -- '^-I INPUT 1 -p udp --dport 5353 ' "$CALLS")
+out1=$(grep -c -- '^-I OUTPUT 1 -p udp --dport 5353 ' "$CALLS")
 PATH="$work/bin:$PATH" sh "$script" > "$work/run2.log" 2>&1
 i2=$(grep -c -- '^-I ' "$CALLS")
-u2=$(grep -c -- '^-I .* -p udp --dport 5353 ' "$CALLS")
+in2=$(grep -c -- '^-I INPUT 1 -p udp --dport 5353 ' "$CALLS")
+out2=$(grep -c -- '^-I OUTPUT 1 -p udp --dport 5353 ' "$CALLS")
 c2=$(grep -c -- '-dport 5353' "$CALLS")
 
-echo "run 1: $i1 insert(s), $u1 of them udp/5353, $c1 udp/5353 command(s)"
+u2=$((in2 + out2))
+
+echo "run 1: $i1 insert(s): $in1 inbound udp/5353, $out1 outbound, $c1 udp/5353 command(s)"
 echo "run 2 (same ruleset): $((i2 - i1)) insert(s), $((c2 - c1)) udp/5353 command(s) - all -C, none -I"
 fail=
-[ "$i1" -ge 6 ] || fail="$fail first-run-inserts=$i1(expected 6: two TCP ports, four udp/5353)"
-[ "$u1" -eq 4 ] || fail="$fail udp5353-inserts=$u1(expected 4)"
-[ "$u2" -eq 4 ] || fail="$fail re-run-inserted-udp5353=$u2(not idempotent)"
-[ "$((c2 - c1))" -eq 4 ] || fail="$fail re-run-udp5353-commands=$((c2 - c1))(expected 4 -C and no -I)"
+[ "$i1" -ge 7 ] || fail="$fail first-run-inserts=$i1(expected 7: two TCP ports, four inbound udp/5353, one outbound)"
+[ "$in1" -eq 4 ] || fail="$fail inbound-udp5353-inserts=$in1(expected 4)"
+[ "$out1" -eq 1 ] || fail="$fail outbound-udp5353-inserts=$out1(expected 1 to 224.0.0.251)"
+[ "$u2" -eq $((in1 + out1)) ] || fail="$fail re-run-inserted-udp5353=$u2(not idempotent)"
+[ "$((c2 - c1))" -eq 5 ] || fail="$fail re-run-udp5353-commands=$((c2 - c1))(expected 5 -C and no -I)"
 for src in 10.0.0.0/8 172.16.0.0/12 192.168.0.0/16 169.254.0.0/16; do
     grep -qxF "INPUT -p udp --dport 5353 -s $src -j ACCEPT" "$STATE" || fail="$fail missing-rule-$src"
 done
+grep -qxF "OUTPUT -p udp --dport 5353 -d 224.0.0.251 -j ACCEPT" "$STATE" || fail="$fail missing-outbound-group-rule"
 if [ -n "$fail" ]; then
     echo "RESULT: FAIL -$fail"
     exit 1
 fi
-echo "RESULT: PASS (four udp/5353 rules inserted once, the re-run inserts nothing, sources as intended)"
+echo "RESULT: PASS (four inbound udp/5353 rules, one outbound to the mDNS group, inserted once each; the re-run inserts nothing)"

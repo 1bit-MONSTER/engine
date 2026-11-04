@@ -142,6 +142,14 @@ the bar as specified, and `HL_GATE_KLD_MAX` moves it without touching code.
 | `HL_CTX` | `-c` | context the serve leg is started at (default 8192). Not a lever: without it serve sizes the KV cache for the model's own context and aborts on its own fit check whenever the box is busy. Raise it for a long-context workload; `HL_LONGCTX` must fit inside it (`HL_CTX >= HL_LONGCTX + HL_LONGTOK`), and a run that does not fit is refused before anything loads. |
 | `HL_LONGCTX`, `HL_LONGTOK` | `-c` + the long request | **engine#679 metric.** `HL_LONGCTX=<tokens>` adds one long request to the serve leg, on a deterministic filler prompt sized at this filler's measured ~4.85 characters/token, and makes **its decode rate the score**; `HL_LONGTOK` is how many tokens it decodes (default 128). The short legs and the gate's code are unchanged, and `bench_summary.longctx` reports the context the server actually saw, the decode count and the prefill rate. The long reply is deliberately **never** compared by the greedy-text gate — it depends on the context, not on the lever — and that holds even when the reference was established by a long-context run and therefore carries a `long` reply: the gate compares the short legs only (`gated_text_keys()`), so a short-prompt run is never gated on a key it does not produce. |
 
+Every serve leg is also started with `--placement-report`, which is the second measurement
+condition rather than a lever: `GGML_HRX_REPORT=2` alone does nothing, because llama-server drops the
+library's INFO lines below `-lv 4` and only that flag lifts them, so before it `bench_summary.placement`
+was `null` in every artifact and a graph that left HRX was indistinguishable from one nobody looked
+at (`docs/serve.md`, engine#390). It reports; `GGML_HRX_STRICT=0` (set for the whole measurement)
+keeps it from refusing anything. Numbers from before it was added were measured at serve's default
+verbosity and are not directly comparable with numbers after it.
+
 ## Box etiquette
 
 * Every measurement runs inside `gpu-hold -l hyperloom -t 20`, so the box's fair FIFO is held for

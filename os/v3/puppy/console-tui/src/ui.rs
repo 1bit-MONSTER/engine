@@ -704,6 +704,51 @@ pub struct Link {
     pub text: String,
 }
 
+/// The footer's legend as separate words, so a short frame can give up its tail instead of giving up an action.
+/// `1-9 actions` leads (or, in the full-log view, closes) the line: it is the string the gates read.
+fn keys_segments(a: &App) -> Vec<&'static str> {
+    if a.full_logs {
+        vec![
+            "q back",
+            "arrows scroll",
+            "f newest",
+            "r refresh",
+            "1-9 actions",
+        ]
+    } else if a.ssh {
+        vec![
+            "1-9 actions",
+            "arrows scroll",
+            "f newest",
+            "r refresh",
+            "8 logs",
+            "q quits",
+        ]
+    } else {
+        // the tty1 promise: this console never drops to a bare prompt
+        vec![
+            "1-9 actions",
+            "arrows scroll",
+            "f newest",
+            "r refresh",
+            "8 logs",
+            "q stays",
+        ]
+    }
+}
+
+/// The legend line(s), then - while something is being said - the message under them.
+fn footer_lines(segments: &[&str], message: Option<&str>, width: usize) -> Vec<Line<'static>> {
+    let mut rows = vec![segments.join("   ")];
+    if let Some(m) = message {
+        rows.push(m.to_string());
+    }
+    rows.iter()
+        .flat_map(|s| wrap_words(s, width))
+        .map(|s| styled(s, Some(Color::DarkGray), false))
+        .collect()
+}
+
 pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     let area = f.area();
     let w = area.width as usize;
@@ -716,26 +761,37 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
     let mut facts: Vec<Line<'static>> = Vec::new();
     let mut qr: Option<(u16, Vec<Line<'static>>)> = None;
 
-    // The footer is built here, before the QR, because the code has to be charged for the rows it costs: the
-    // frame is exactly the terminal, and a code that does not fit takes a rule or the panel grid with it.
-    let mut footer: Vec<String> = vec![if a.full_logs {
-        "q back   arrows scroll   f newest   r refresh   1-9 actions".to_string()
+    // The nine actions are ROWS and the footer is WORDS, so when the frame is short the words give way first.
+    // Before this, in a 40-column window whose pane is 12 rows, the frame was exactly the nine actions and two
+    // footer rows; one keypress added a two-row message and ratatui clipped the END of the MENU - `9 Reboot /
+    // power off`, a `vm-check.sh` / `menugate` string - for the message's 12 s, with the footer still promising
+    // `1-9 actions` (issue #1015). So: the legend's tail words, then the legend line, and the nine rows are
+    // never charged for any of it.
+    let actions = if a.full_logs {
+        Vec::new()
     } else {
-        if a.ssh {
-            "1-9 actions   arrows scroll   f newest   r refresh   8 logs   q quits".to_string()
+        menu_rows(w)
+    };
+    let full = keys_segments(a);
+    let mut segments = full.clone();
+    let mut message = a.message.as_ref().map(|(m, _)| m.clone());
+    let budget = h.saturating_sub(actions.len());
+    let mut footer = footer_lines(&segments, message.as_deref(), w);
+    // the legend's tail gives way first, then the legend itself, and the message is the last thing dropped: it is
+    // the feedback for the key that was just pressed, and `1-9 actions` is only read by the gates at 80x25 and
+    // 240x67, where none of this trims.
+    while footer.len() > budget {
+        if segments.len() > 1 {
+            segments.pop();
+        } else if !segments.is_empty() {
+            segments.clear();
+        } else if message.take().is_some() {
+            segments = full.clone();
         } else {
-            // the tty1 promise: this console never drops to a bare prompt
-            "1-9 actions   arrows scroll   f newest   r refresh   8 logs   q stays".to_string()
+            break;
         }
-    }];
-    if let Some((m, _)) = &a.message {
-        footer.push(m.clone());
+        footer = footer_lines(&segments, message.as_deref(), w);
     }
-    let footer: Vec<Line> = footer
-        .iter()
-        .flat_map(|s| wrap_words(s, w))
-        .map(|s| styled(s, Some(Color::DarkGray), false))
-        .collect();
 
     if !a.full_logs {
         top.push(header(&a.facts));
@@ -751,7 +807,6 @@ pub fn draw(f: &mut Frame, a: &App, out_links: &mut Vec<Link>) {
         // `9 Reboot / power off` needed and ratatui clipped the END of the menu while the footer still promised
         // "1-9 actions". Swept over 13 widths x 19 heights: 72 sizes gained that row, none lost the
         // frame-is-the-terminal invariant (`the_menu_rule_gives_way_before_an_action_does`).
-        let actions = menu_rows(w);
         if 1 + actions.len() + footer.len() <= h {
             menu.push(rule("MENU", w));
         }
@@ -1743,5 +1798,76 @@ mod tests {
                 "{w}x{h}: the MENU rule is missing where it fits:\n{text}"
             );
         }
+    }
+
+    #[test]
+    fn a_message_gives_way_before_an_action_does() {
+        // Issue #1015, reproduced on the shipped binary first: a 40-column window whose pane is 12 rows is exactly
+        // the nine actions plus the two rows the legend wraps to. One keypress added the message's own two rows,
+        // the frame was over-subscribed, and ratatui clipped the END of the MENU - `9 Reboot / power off`, a
+        // `vm-check.sh` / `menugate` string - for the message's 12 s, with the footer still promising
+        // `1-9 actions`. The legend is words, the actions are rows: the legend gives way, whole, for the message.
+        const SAID: &str = "this console never exits: 7 opens a shell, 9 reboots";
+        let mut a = app(c16_board());
+        a.say(SAID);
+        for (w, h) in [
+            (40u16, 12u16), // the reproduced case: the message fits only once the legend is gone
+            (40, 13),
+            (56, 12),
+            (80, 10), // nine actions leave one row, and that row is the message
+            (80, 11),
+            (100, 13),
+            (30, 16),
+            (80, 25),
+            (240, 67),
+        ] {
+            let text = render_snapshot(&a, w, h);
+            let lines: Vec<&str> = text.lines().collect();
+            assert_eq!(
+                lines.len(),
+                h as usize,
+                "{w}x{h}: frame is not the terminal:\n{text}"
+            );
+            for n in 1..=9 {
+                assert!(
+                    text.contains(&format!("{n} ")),
+                    "{w}x{h}: action {n} is off the screen for the message:\n{text}"
+                );
+            }
+            // the message is never CUT: it is drawn whole, or not at all
+            let flat = text.split_whitespace().collect::<Vec<_>>().join(" ");
+            assert!(
+                flat.contains(SAID),
+                "{w}x{h}: the message was cut instead of the legend:\n{text}"
+            );
+        }
+        // where the legend still has the rows it is untouched: the fix is not a permanent diet (80x25, 240x67 are
+        // the sizes the gates read)
+        for (w, h) in [(80u16, 25u16), (240, 67), (100, 13)] {
+            let text = render_snapshot(&a, w, h);
+            assert!(
+                text.contains("1-9 actions") && text.contains("q stays"),
+                "{w}x{h}: the whole legend fits here and was trimmed:\n{text}"
+            );
+        }
+        // ...and where not even the message fits beside the nine actions (40x11: ten menu rows, one footer row,
+        // the message wraps to two), the message is the thing that goes - the actions and the gate string stay
+        let text = render_snapshot(&a, 40, 11);
+        let lines: Vec<&str> = text.lines().collect();
+        assert_eq!(lines.len(), 11, "40x11: frame is not the terminal");
+        for n in 1..=9 {
+            assert!(
+                text.contains(&format!("{n} ")),
+                "40x11: action {n} is off the screen:\n{text}"
+            );
+        }
+        assert!(
+            text.contains("1-9 actions"),
+            "40x11: no gate string:\n{text}"
+        );
+        assert!(
+            !text.contains("this console never exits"),
+            "40x11: the message is on a frame with no row for it:\n{text}"
+        );
     }
 }

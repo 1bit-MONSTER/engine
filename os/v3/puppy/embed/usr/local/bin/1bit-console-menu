@@ -44,7 +44,11 @@
 # Exit: 0 ok, 1 an action failed, 2 usage.
 
 API=http://127.0.0.1:13305
-CONF=/etc/1bit/lemond.conf
+# The two paths item 1 writes through, overridable so the ONE new write path in this image can be tested
+# (pi-prs on #934, note 2: reachable only from a dialog, with a hard-coded CONF, so nothing could point it at a
+# temp file). The defaults are the appliance's own and nothing in a boot changes them; `--mint-selftest` sets both.
+CONF=${ONEBIT_LEMOND_CONF:-/etc/1bit/lemond.conf}
+LEMOND_INIT=${ONEBIT_LEMOND_INIT:-/etc/init.d/10lemonade}
 LEMLOG=/var/log/lemond-onebit.log
 DESKTOP=/usr/local/bin/1bit-desktop
 NONINT=0
@@ -306,7 +310,7 @@ key_on() {
     mkdir -p /etc/1bit 2> /dev/null
     { [ -f "$f" ] && grep -v '^LEMONADE_API_KEY=' "$f"; printf 'LEMONADE_API_KEY=%s\n' "$k"; } > "$f.new" 2> /dev/null &&
         mv "$f.new" "$f" && chmod 600 "$f" || { say "cannot write $f - the key was not turned on"; return 1; }
-    /etc/init.d/10lemonade restart > /dev/null 2>&1
+    "$LEMOND_INIT" restart > /dev/null 2>&1
     say "api-key: turned ON (lemond restarted in keyed mode)"
     say_text "API key" "Lemonade now requires this key
 
@@ -321,7 +325,7 @@ Menu item 1 again turns it off."
 key_off() {
     f=$(key_file)
     [ -f "$f" ] && { grep -v '^LEMONADE_API_KEY=' "$f" > "$f.new" 2> /dev/null && mv "$f.new" "$f"; }
-    /etc/init.d/10lemonade restart > /dev/null 2>&1
+    "$LEMOND_INIT" restart > /dev/null 2>&1
     say "api-key: turned OFF (blank mode - anyone on this network can use Lemonade)"
     return 0
 }
@@ -330,7 +334,14 @@ item_api_key() {
     if [ "$NONINT" = 1 ]; then
         # The read-only half: the mode, and the key when there is one. --selftest and the image's own rows run this
         # path, so it must never mint, remove or restart anything.
-        if [ -n "$k" ]; then say "api-key: $k"; say "api-key-shown"; else say "api-key: none ($CONF has no LEMONADE_API_KEY line)"; fi
+        if [ -n "$k" ]; then
+            say "api-key: $k"
+            # "shown" means the file holds something key-SHAPED (.conf is one line, but a hand-edited or glued line
+            # can hold a fragment that is still non-empty), so the 48-hex mint is what the marker asserts
+            [ ${#k} -ge 32 ] && say "api-key-shown"
+        else
+            say "api-key: none ($CONF has no LEMONADE_API_KEY line)"
+        fi
         if keyed; then say "auth-mode: keyed"; else say "auth-mode: blank"; fi
         return 0
     fi
@@ -645,6 +656,31 @@ case "${1:-}" in
             # ONE item, interactive, on this terminal (NONINT stays 0, so its dialogs work). 1bit-console-tui runs
             # this for keys 2-7: the TUI never grows a second copy of an action that needs a typed answer.
             run_item "$2"; exit $? ;;
+--mint-selftest) [ $# -eq 2 ] || { say "usage: $0 --mint-selftest <dir>"; exit 2; }
+            # Drives key_on/key_off on a throwaway conf and a no-op "restart": the file it writes, the mode it sets,
+            # the lines it keeps and the one it removes. Nothing outside <dir> is touched and Lemonade is not
+            # restarted, which is why this can run inside the image (vm-check's U3 key toggle row does).
+            d=$2
+            [ -d "$d" ] || { say "mint-selftest: $d is not a directory"; exit 2; }
+            CONF=$d/lemond.conf; LEMOND_INIT=true; NONINT=1
+            rc=0
+            printf 'LEMONADE_PORT=13305\n#LEMONADE_ADMIN_API_KEY=x\n' > "$CONF" || exit 2
+            key_on > /tmp/1bit-mint-selftest.log 2>&1 || rc=1
+            # grep -c prints 0 AND exits 1 when it finds nothing, so `|| echo 0` would make the value "0\n0" -
+            # measured here (the first run of this selftest failed on exactly that)
+            n=$(grep -c '^LEMONADE_API_KEY=' "$CONF" 2>/dev/null || true)
+            hex=$(sed -n 's/^LEMONADE_API_KEY=\([0-9a-f]*\)$/\1/p' "$CONF" 2>/dev/null | head -1)
+            mode=$(stat -c %a "$CONF" 2>/dev/null)
+            kept=$(grep -c '^LEMONADE_PORT=13305$' "$CONF" 2>/dev/null || true)
+            say "mint: lines=$n hex=${#hex} mode=$mode other-lines-kept=$kept"
+            [ "$n" = 1 ] && [ ${#hex} -eq 48 ] && [ "$mode" = 600 ] && [ "$kept" = 1 ] || rc=1
+            key_off > /tmp/1bit-mint-selftest.log 2>&1 || rc=1
+            n2=$(grep -c '^LEMONADE_API_KEY=' "$CONF" 2>/dev/null || true)
+            left=$([ -e "$CONF.new" ] && echo temp-file-left || echo clean)
+            say "off:  lines=$n2 $left"
+            [ "$n2" = 0 ] && [ "$left" = clean ] || rc=1
+            [ "$rc" = 0 ] && say "mint-selftest-ok"
+            exit "$rc" ;;
 --selftest) NONINT=1; rc=0
             status_text
             for i in 1 2 3 4 5 6 7 8 9; do

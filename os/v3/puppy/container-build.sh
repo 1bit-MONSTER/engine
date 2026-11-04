@@ -58,7 +58,14 @@ cd /work/woof-CE
 # su and the dbus launch helper could not work. /recipe/fix-ownership.sh does chown+restore and refuses a tree whose
 # count changed. The patch is idempotent, counted, and `bash -n`'d, because a silently unapplied patch would be a
 # silent regression of a security fix.
-if ! grep -q '1bit: ownership before pack' woof-code/3builddistro; then
+# The guard has to ask for the CALL, not for the comment: a build root or a woof-CE clone reused from a cycle that carried
+# the previous version of this patch already holds the marker comment on a bare `chown -R 0:0 rootfs-complete ...` line, so
+# a comment-based guard skipped the sed and then refused with a message that blamed upstream. Measured on the cycle-21
+# build (2026-11-04): the woof-CE clone at $HOME/wt/1bit-puppy-build11 was dirty with exactly those two lines, and every
+# build from it refused. So a line carrying the marker comment IS a previous version of this patch, it is dropped first,
+# and the current one is inserted: the patch upgrades itself instead of testing for its own history.
+if ! grep -q 'sh /recipe/fix-ownership.sh' woof-code/3builddistro; then
+    sed -i '/1bit: ownership before pack/d' woof-code/3builddistro
     sed -i \
         -e 's@^\(\s*\)mksquashfs rootfs-complete @\1sh /recipe/fix-ownership.sh rootfs-complete   # 1bit: ownership before pack\n\1mksquashfs rootfs-complete @' \
         -e 's@^\(\s*\)mksquashfs sandbox3/devx @\1sh /recipe/fix-ownership.sh sandbox3/devx   # 1bit: ownership before pack\n\1mksquashfs sandbox3/devx @' \
@@ -68,8 +75,13 @@ n=$(grep -c '1bit: ownership before pack' woof-code/3builddistro)
 [ "$n" = 2 ] || {
     echo "build: REFUSED: the woof-CE ownership patch landed $n times in woof-code/3builddistro (expected 2) - upstream changed, re-measure" >&2
     exit 1; }
-grep -q 'sh /recipe/fix-ownership.sh' woof-code/3builddistro || {
-    echo "build: REFUSED: 3builddistro still chowns with a bare chown -R, which strips the image's setuid bits" >&2
+n=$(grep -c 'sh /recipe/fix-ownership.sh' woof-code/3builddistro)
+[ "$n" = 2 ] || {
+    echo "build: REFUSED: 3builddistro calls fix-ownership.sh $n times (expected 2) - a bare chown -R strips the image's" >&2
+    echo "       setuid bits, so the image would ship without passwd, su or the D-Bus launch helper (the c20 board finding)" >&2
+    exit 1; }
+! grep -q 'chown -R .*rootfs-complete\|chown -R .*sandbox3/devx' woof-code/3builddistro || {
+    echo "build: REFUSED: 3builddistro still chowns a tree with a bare chown -R next to fix-ownership.sh" >&2
     exit 1; }
 bash -n woof-code/3builddistro || { echo "build: REFUSED: the patched 3builddistro does not parse" >&2; exit 1; }
 echo "   ok: 3builddistro normalises rootfs-complete and devx before packing, keeping their setuid bits"

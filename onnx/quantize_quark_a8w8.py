@@ -81,6 +81,37 @@ class NpzCalibrationDataReader:
         return self.count
 
 
+def shared_concat_outputs(model) -> list:
+    """Concat outputs read by more than one node, with the reader count.
+
+    Quark's A8W8 refinement runs `align_quantize_info(..., align_concat=True)` (the config default) and
+    that step asserts every Concat output has exactly one reader
+    (`quark/onnx/utils/model_utils.py:_find_node_output_qdq`:
+    `assert len(self.in_name_to_nodes[tensor_name]) == 1`). An eager cache-less transformer export
+    shares two of them across the whole stack: the rotary frequency concat feeds `Cos` and `Sin`, and
+    the additive attention mask feeds one `Expand` per attention block -- 56 readers on Qwen3-0.6B.
+    Any such graph dies in refinement with a bare `AssertionError` and no node named, before a single
+    weight is written.
+
+    Splitting the tensor with an `Identity` does not survive: `onnxruntime.quantization` removes
+    Identity nodes and renames the producer's output, so the share reappears (measured -- the
+    assertion then names the Identity's own output, with all 56 readers). The supported escape is the
+    step's own knob, `extra_options['AlignConcat']`; this function is what decides when to use it.
+    """
+    readers = {}
+    for node in model.graph.node:
+        for inp in node.input:
+            if inp:
+                readers[inp] = readers.get(inp, 0) + 1
+    return [
+        (out, readers[out])
+        for node in model.graph.node
+        if node.op_type == "Concat"
+        for out in node.output
+        if readers.get(out, 0) > 1
+    ]
+
+
 def count_qdq_groups(path: str) -> int:
     """MatMuls whose two operands are DequantizeLinear outputs and whose weight side is a constant.
 
@@ -176,6 +207,22 @@ def main() -> int:
         quant_config.nodes_to_exclude = excluded
         print(f"quantize_quark_a8w8: excluding {len(excluded)} nodes, quantising "
               f"{len(model.graph.node) - len(excluded)} projection matmuls")
+    # Quark's align_concat step asserts one reader per Concat output, which an eager cache-less export
+    # violates by construction (see shared_concat_outputs). The step only rewrites the quantisation
+    # parameters of Concats that carry Q/DQ on both sides, so it is a no-op on a graph where no Concat is
+    # quantised -- which is every graph this flag combination exports -- and on any other graph skipping
+    # it costs DPU alignment, never numerics.
+    shared = shared_concat_outputs(model)
+    if shared:
+        for tensor, count in shared:
+            print(f"quantize_quark_a8w8: Concat output {tensor} has {count} readers, so align_concat would "
+                  f"assert -> AlignConcat off for this graph")
+        quant_config.extra_options["AlignConcat"] = False
+        excluded_names = set(quant_config.nodes_to_exclude or [])
+        quantised_concats = [n.name for n in model.graph.node
+                             if n.op_type == "Concat" and n.name not in excluded_names]
+        print(f"  Concat nodes that would be quantised anyway: {len(quantised_concats)}")
+
     config = Config(global_quant_config=quant_config)
     print(f"quantize_quark_a8w8: config {args.config}")
     print(f"  activation={quant_config.activation_type} weight={quant_config.weight_type} "

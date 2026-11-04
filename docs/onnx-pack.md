@@ -220,11 +220,11 @@ intermediate float tensor then never exists.
   dispatch-bound. So `gemm_q8` routes by rows: below `kDeviceMinRows` — 16, one constant in
   `onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array, and at
   or above it the device does. A host-routed call logs `npu_qdq_host_rows m=… k=… n=… min=16`, so "the device
-  ran this shape" stays "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it". 12 is the
-  first row count at which no measured projection shape was slower on the array and 16 is the first that keeps
-  more margin than the box's own run-to-run spread; at one row the launch costs 8–10× the host loop it replaces
-  (`docs/onnx.md` carries the measurement). A decode-side win needs fewer, longer launches rather than a smaller
-  design.
+  ran this shape" stays "neither `npu_qdq_host_rows` nor `npu_qdq_fallback` was written for it". 12 rows is where
+  the five projection shapes reach break-even to 1.2× and 16 is the first count that keeps more margin than the
+  box's own run-to-run spread (1.4–1.7×); at one row the launch costs 8.5–10.9× the host loop it replaces
+  (`docs/onnx.md` carries the measurement and its re-measurement on a second boot). A decode-side win needs fewer,
+  longer launches rather than a smaller design.
 
   **Which row count the gate above is taken at, because the threshold changed it.** Those five numbers came
   from 5-row cases, which are decode width: once `gemm_q8` routed by rows they stopped reaching the array at

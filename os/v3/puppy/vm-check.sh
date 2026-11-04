@@ -425,7 +425,7 @@ rows = [
                      "1bit-console-menu --status 2>&1 | grep -q 'http://' && echo menu-status-lines",
                      "menu-status-lines"),
     ("U2 menu actions", "1bit-console-menu --selftest > /tmp/menu-self.txt 2>&1; echo selftest-rc=$?; "
-                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
+                     "grep -E '^(--- item|item [0-9] FAILED|api-key-shown|auth-mode|models-listed|install-guard-checked|desktop-available|shell-bash|logs-shown|power-noop)' "
                      "/tmp/menu-self.txt | tr '\\n' ' '", "selftest-rc=0"),
     # Cycle 17 item 4: the menu's probes run with Lemonade's environment, and no line is cut in the middle of a
     # word (the c16 board showed "firmware prese"). Both are read off the shipped script and its own status
@@ -436,13 +436,16 @@ rows = [
                      "1bit-console-menu --status | grep -q 'firmware present' && echo lines-whole || echo truncated",
                      "lines-whole"),
     # Cycle 17 item 8: the key is not in the page or its URL, and the same-origin proxy still answers WITH it.
-    # 401 direct on 13305 is the other half: the key is still enforced where it matters.
+    # Cycle 20: the direct probe follows the MODE - blank (the shipped default) answers 200 without a header, keyed
+    # answers 401 - so the row proves the mode is coherent rather than pinning one auth behaviour.
     # (the page's own text mentions "?key=" in a comment, so the count is of a KEY-SHAPED value, not of the word)
     ("U3 webapp key", "n=$(curl -s -m 5 http://127.0.0.1:8080/ | grep -Ec 'key=[0-9a-f]{16,}'); "
                      "a=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/models); "
                      "b=$(curl -s -m 5 -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
-                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b\"; "
-                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = 401 ] && echo webapp-key-not-in-url",
+                     "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "if [ -n \"$k\" ]; then mode=keyed want=401; else mode=blank want=200; fi; "
+                     "echo \"key-in-page=$n proxy=$a direct-no-key=$b mode=$mode\"; "
+                     "[ \"$n\" = 0 ] && [ \"$a\" = 200 ] && [ \"$b\" = \"$want\" ] && echo webapp-key-not-in-url",
                      "webapp-key-not-in-url"),
     # Cycle 18 items 1-2, from the c17 board demo: a thinking model (Qwen3) spent the whole token budget in
     # reasoning_content, so the page - which read only delta.content - showed a mid-sentence stop and then
@@ -529,28 +532,46 @@ rows = [
                      "apt install -y --no-install-recommends cowsay 2>&1 | tail -3; "
                      "command -v cowsay && echo apt-install-works", "apt-install-works", 600),
     ("U3 service",   "ps | grep -c '[l]emond'; netstat -lntp 2>/dev/null | grep -c 13305", None),
-    ("U3 key",       "grep -q '^LEMONADE_API_KEY=..' \"$(readlink -f /etc/1bit/lemond.conf)\" && "
-                     "echo key-on-data", "key-on-data"),    # engine#867 (dd-written stick had NO key at all, so Lemonade served the LAN unauthenticated): two rows that can
-    # only pass if the key exists AND the server enforces it. On a prepared stick and on a bare `dd` copy both must
-    # be green - the bare copy is the case that was broken, and it is what makes these rows a gate rather than a
-    # restatement of "the file is there".
-    ("U3 key file",  "f=$(readlink -f /etc/1bit/lemond.conf); echo \"$f $(stat -c %s \"$f\" 2>/dev/null) bytes$(stat -c %a \"$f\" 2>/dev/null | sed 's/^/ mode /')\"; "
-                     "grep -c '^LEMONADE_API_KEY=[0-9a-f]\\{32,\\}$' \"$f\" 2>/dev/null; "
-                     "grep -q '^LEMONADE_API_KEY=[0-9a-f]\\{32,\\}$' \"$f\" 2>/dev/null && echo key-minted-48-hex",
-                     "key-minted-48-hex"),
-    ("U3 auth",      "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf); "
+    ("U3 key",       "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "if [ -n \"$k\" ]; then echo \"auth-mode=keyed (${#k} hex chars)\"; "
+                     "else echo 'auth-mode=blank (no LEMONADE_API_KEY line)'; fi",
+                     "auth-mode=blank"),
+    # Cycle 20, the owner's "blank key": blank is the SHIPPED state, so these rows assert the MODE and the mode's own
+    # contract rather than a key nobody asked for. `U3 key` names what this image ships; `U3 auth` proves it (blank:
+    # 200 with no header at all; keyed: 401 without the key, 200 with it) as one token, whichever mode is in force.
+    ("U3 key file",  "readlink -f /etc/1bit/lemond.conf; "
+                     "readlink -f /etc/1bit/lemond.conf | grep -q '/data/lemonade/lemond.conf' && echo key-file-on-data",
+                     "key-file-on-data"),
+    ("U3 auth",      "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
                      "n=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:13305/api/v1/models); "
+                     "if [ -n \"$k\" ]; then "
                      "y=$(curl -s -o /dev/null -w '%{http_code}' -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models); "
-                     "echo no-key=$n with-key=$y; "
-                     "[ \"$n\" = 401 ] && [ \"$y\" = 200 ] && echo lemonade-auth-enforced",
-                     "lemonade-auth-enforced"),
+                     "echo keyed no-key=$n with-key=$y; [ \"$n\" = 401 ] && [ \"$y\" = 200 ] && echo auth-mode-ok; "
+                     "else echo blank keyless=$n; [ \"$n\" = 200 ] && echo auth-mode-ok; fi",
+                     "auth-mode-ok"),
 
-    ("U3 catalogue", "k=$(sed -n \"s/^LEMONADE_API_KEY=//p\" /etc/1bit/lemond.conf); "
-                     "curl -s -H \"Authorization: Bearer $k\" http://127.0.0.1:13305/api/v1/models "
+    ("U3 catalogue", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "curl -s ${k:+-H \"Authorization: Bearer $k\"} http://127.0.0.1:13305/api/v1/models "
                      "| grep -o onebit | wc -l", None),
-    ("U3 api local", 'k=$(sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf); curl -s -o /dev/null '
-                     '-w "http=%{http_code}" -H "Authorization: Bearer $k" http://127.0.0.1:13305/api/v1/models', "http=200"),
-    ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf', None),
+    ("U3 api local", "k=$(sed -n 's/^LEMONADE_API_KEY=//p' /etc/1bit/lemond.conf 2>/dev/null | head -1); "
+                     "curl -s -o /dev/null -w 'http=%{http_code}' ${k:+-H \"Authorization: Bearer $k\"} "
+                     "http://127.0.0.1:13305/api/v1/models", "http=200"),
+    ("U3 keyvalue",  'sed -n "s/^LEMONADE_API_KEY=//p" /etc/1bit/lemond.conf 2>/dev/null | head -1', None),
+    # Cycle 20, pi-prs' note 2 on #934: item 1's mint is the ONE new write path in this image and it was reachable
+    # only from a dialog. The menu carries its own selftest for it, driven on a throwaway conf with the restart
+    # replaced by `true`, so this row proves the write (one 48-hex line, mode 600, the other lines kept) and the
+    # removal (no line, no temp file) INSIDE the image without touching /etc/1bit or restarting Lemonade.
+    ("U3 key toggle", "d=$(mktemp -d); 1bit-console-menu --mint-selftest \"$d\" | tail -2; rm -rf \"$d\"",
+                     "mint-selftest-ok"),
+    # Cycle 20 item 6 and item 5 in one row: the box's own Lemonade UI works THROUGH the key-injecting proxy (health
+    # 200), a same-origin page is served, and a request that carries a foreign Origin is refused before the key is
+    # attached - i.e. the proxy cannot be borrowed as a key-adding open relay by a page from anywhere else.
+    ("U3 proxy",     "h=$(curl -s -o /dev/null -w '%{http_code}' http://127.0.0.1:8080/api/v1/health); "
+                     "o=$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://localhost:8080' http://127.0.0.1:8080/api/v1/health); "
+                     "x=$(curl -s -o /dev/null -w '%{http_code}' -H 'Origin: http://evil.example' http://127.0.0.1:8080/api/v1/health); "
+                     "echo proxy-health=$h same-origin=$o cross-origin=$x; "
+                     "[ \"$h\" = 200 ] && [ \"$o\" = 200 ] && [ \"$x\" = 403 ] && echo webapp-proxy-keyed-and-guarded",
+                     "webapp-proxy-keyed-and-guarded"),
     ("U4 engine",    "command -v 1bit; 1bit --version 2>&1 | head -2", "1bit"),
     ("U4 addlist",   "grep -i '^ADDLIST' /etc/rc.d/MODULESCONFIG; lsmod | grep -c ec_su_axb35", "ec_su_axb35"),
     ("U4 package",   "ls /opt/1bit-package | tr '\\n' ' '; ls -l /usr/local/bin/1bit /usr/local/bin/lemond-onebit | tail -2",
@@ -596,7 +617,11 @@ rows = [
     ("U7 sshd",      "ps | grep -c '[s]shd'; ls -l /root/.ssh/authorized_keys 2>&1 | tail -1; "
                      "ls /etc/ssh/ssh_host_* 2>&1 | head -3; /usr/sbin/sshd -t 2>&1 | head -3; echo sshd-checked", None),
     ("data mount",   "grep -c ' /data ' /proc/mounts; df -h /data 2>/dev/null | tail -1", "/data"),
-    ("data key",     "ls -l /etc/1bit/lemond.conf; head -c 0 /data/lemonade/lemond.conf && echo persists-on-data", "persists-on-data"),
+    # Cycle 20: blank is the shipped mode, so there may be NO key file yet - what this row owes is that when one is
+    # turned on it lands on /data (the symlink 05onboard-data makes), not that a key exists.
+    ("data key",     "ls -l /etc/1bit/lemond.conf; readlink -f /etc/1bit/lemond.conf; "
+                     "readlink -f /etc/1bit/lemond.conf | grep -q '/data/lemonade/lemond.conf' && echo key-path-on-data",
+                     "key-path-on-data"),
     ("data ssh",     "ls -l /etc/ssh/ssh_host_ed25519_key; readlink -f /etc/ssh/ssh_host_ed25519_key", "/data/ssh/"),
     ("data state",   "ls /data; grep -c . /data/lemonade/config/user_models.json 2>/dev/null || echo no-registry", None),
     # release identity: the package reports "1bit 0.0.1" whatever was built, so the binary hash is what ties
@@ -682,20 +707,24 @@ else
     echo "FAIL U8 boot progress the console never said what it was doing (no progress line in the transcript)"
 fi
 
-# U3 over the network, from outside the guest.
+# U3 over the network, from outside the guest. Cycle 20: blank mode is the shipped default, so an empty key is not a
+# reason to SKIP - the probe then carries no Authorization header, which is what a stock-Lemonade client does.
 key=$(awk '/^INFO U3 keyvalue/ {print $NF}' "$work/rows.txt" 2>/dev/null | tail -1)
 if [ -n "${key:-}" ]; then
     code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' -H "Authorization: Bearer $key" \
         "http://127.0.0.1:$hostport/api/v1/models" 2>/dev/null)
-    if [ "$code" = "200" ]; then
-        echo "PASS U3 lan        http=200 on the forwarded :13305 (host :$hostport) with the image's key"
-    elif ! vm_alive; then
-        echo "FAIL U3 lan        http=${code:-none} - $(vm_gone)"
-    else
-        echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305 (host :$hostport)"
-    fi
+    mode=" with the image's key"
 else
-    echo "SKIP U3 lan        no key in the transcript"
+    code=$(curl -s -o /dev/null -m 10 -w '%{http_code}' \
+        "http://127.0.0.1:$hostport/api/v1/models" 2>/dev/null)
+    mode=" with no key (blank mode)"
+fi
+if [ "$code" = "200" ]; then
+    echo "PASS U3 lan        http=200 on the forwarded :13305 (host :$hostport)$mode"
+elif ! vm_alive; then
+    echo "FAIL U3 lan        http=${code:-none} - $(vm_gone)"
+else
+    echo "FAIL U3 lan        http=${code:-none} on the forwarded :13305 (host :$hostport)$mode"
 fi
 # U7, over the wire: SSHKEY=<private key> and the key half of which must be in the image's keys.
 if [ -n "${SSHKEY:-}" ] && [ -f "$SSHKEY" ]; then

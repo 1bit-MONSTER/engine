@@ -36,24 +36,33 @@ facts on every draw.
   mobile   Lemonade Mobile: server http://192.168.50.110:13305, key from 1
  LEMONADE -------------------- GPU ---------------------------- NPU ----------------------
  MODELS ---------------------- FANS / TEMPS ------------------- DATA ---------------------
+ MENU -----------------------------------------------------------------------------------
+ 1 Show the API key
+ 2 Quick chat test (GPU and NPU)
+ ...
+ 9 Reboot / power off
  LOGS newest ----------------------------------------------------------------------------
- 1 Show the API key   2 Quick chat test (GPU and NPU)   ...   9 Reboot / power off
 ```
+
+Top to bottom, in this order and with nothing between (the owner, cycle 20: *"can we place the menu above the
+scrolling logs and below the technical information"*): **header, CONNECT, the status facts, the MENU, the
+scrolling log**, then one footer line.
 
 Two layouts off ONE set of facts, chosen by width:
 
 | size | what you get |
 |---|---|
-| 240x67 (tty1 on a monitor) | CONNECT block, six panels in a 3x2 grid, a tall log pane, the nine actions on two rows |
-| 80x25 (serial/VGA console, what the QEMU rows read) | the same block and panels one line each, a 2-line log pane, the SAME action labels - `Show the API key` and `Reboot / power off` are never abbreviated, because `vm-check.sh`'s `U2 menu` row looks for exactly those strings on tty1 |
+| 240x67 (tty1 on a monitor) | CONNECT block, six panels in a 3x2 grid, the nine menu rows, then the log pane |
+| 80x25 (serial/VGA console, what the QEMU rows read) | the same block, the same six facts on two compact rows, all nine menu rows, and the log pane left four rows - `Show the API key` and `Reboot / power off` are never abbreviated, because `vm-check.sh`'s `U2 menu` row looks for exactly those strings on tty1 |
 
-The log pane gets whatever rows are left. Key **8** is the full-screen, scrollable view.
+The MENU is whole and always on screen at both sizes; the log pane gets whatever rows are left (at least three at
+80x25). Key **8** is the full-screen, scrollable view.
 
 ## Keys
 
 | key | what it does |
 |---|---|
-| **1** | show the API key (confirmed first: it is a bearer token and this screen can be on a KVM recording) |
+| **1** | show the API key (confirmed first: it is a bearer token and this screen can be on a KVM recording). The label is the same whether or not the box has a key - `vm-check.sh`'s `U2 menu` row greps it - and on a blank box the CONNECT block says anyone on the network can use Lemonade (cycle 20's blank-key default, item 7) |
 | **2** | quick chat test on GPU and NPU -> `1bit-console-menu --action 2` |
 | **3** | network: DHCP, static address, hostname -> `--action 3` |
 | **4** | models: list, pull, delete -> `--action 4` |

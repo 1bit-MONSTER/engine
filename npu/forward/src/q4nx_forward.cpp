@@ -42,6 +42,21 @@
 #include "q4nx_dequant.h"
 #include "q4nx_pack.h"
 
+#if defined(_OPENMP)
+#include <omp.h>
+#endif
+// How many threads one head-parallel loop in the GDN layer may take: three quarters of the cores, because the
+// forward's own array-submit thread and the serve's HTTP thread need one each.  OMP_NUM_THREADS below that wins.
+static inline int omp_heads_threads() {
+#if defined(_OPENMP)
+    const int cap = (3 * omp_get_num_procs()) / 4;
+    const int want = omp_get_max_threads();
+    return want < cap ? (want > 0 ? want : 1) : (cap > 0 ? cap : 1);
+#else
+    return 1;
+#endif
+}
+
 #ifdef NPU_INFER_DEBUG_DUMPS
 // Debug dumps to a path named by an environment variable (NPU_INFER_DUMP_ATTN, _LN/_L0,
 // _HEAD): compiled only into debug builds (cmake -DONEBIT_NPU_DEBUG_DUMPS=ON), written
@@ -2257,33 +2272,55 @@ bool Q4nxNpuForward::gdn_layer_batch(int l, const std::vector<float>& xn, int M,
         // one loop in the GDN layer that parallelises: perf puts gdn_layer_batch at 76% of the
         // host cycles and this state update at 2*KHD*VHD MACs per head.  kvm is per-head scratch.
         float* rs = rec_state_[l].data();
-#pragma omp parallel for schedule(static)
+        // Never take the whole box.  The forward also needs a core for the array's submit thread and the serve
+        // needs one for HTTP, so 32 threads on 32 cores measured 25% SLOWER than 16 on a 149-token prefill and
+        // 24 was level with 16 (2026-11-04, same window, same binary).  OMP_NUM_THREADS still wins downward;
+        // this only stops the default from oversubscribing.
+        const int gdn_nt = omp_heads_threads();
+#pragma omp parallel for schedule(static) num_threads(gdn_nt)
         for (int hh = 0; hh < NVH; hh++) {
-            std::vector<float> kvm((size_t)VHD);
+            // One scratch row for kvm and one for the delta, ONE allocation: this runs 48 heads x 48 layers x rows
+            // per token, and a per-head allocation inside a parallel region is the mistake that cost the mla
+            // attempt 2x on 2026-11-03.
+            std::vector<float> scratch((size_t)2 * VHD);
+            float* kvm = scratch.data();
+            float* delta = kvm + VHD;
             const float eg = expf(gdn_small_[(size_t)l].ssm_a[hh] * softplus_f(ah[(size_t)hh] + gdn_small_[(size_t)l].dt[hh]));
             const float beta = 1.0f / (1.0f + expf(-bh[(size_t)hh]));
             float* sh = rs + (size_t)hh * KHD * VHD;
             const float* kh = &kl[(size_t)hh * KHD];
             const float* qh = &ql[(size_t)hh * KHD];
             const float* vh = &vv[(size_t)hh * VHD];
+#pragma omp simd
             for (int i = 0; i < KHD * VHD; i++) sh[i] *= eg;
-            for (int vd = 0; vd < VHD; vd++) {
-                float s = 0;
-                for (int kd = 0; kd < KHD; kd++) s += sh[kd * VHD + vd] * kh[kd];
-                kvm[(size_t)vd] = s;
+            // Loops EXCHANGED (kd outer, vd inner) so the inner loop walks sh and vh contiguously instead of
+            // gathering with stride VHD.  Each output element still accumulates over kd in increasing order, so
+            // the result is the same sequence of operations -- verified by the greedy text being byte-identical.
+            for (int vd = 0; vd < VHD; vd++) kvm[vd] = 0.0f;
+            for (int kd = 0; kd < KHD; kd++) {
+                const float k = kh[kd];
+                const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) kvm[vd] += srow[vd] * k;
             }
-            for (int vd = 0; vd < VHD; vd++) {
-                const float delta = (vh[vd] - kvm[(size_t)vd]) * beta;
-                for (int kd = 0; kd < KHD; kd++) sh[kd * VHD + vd] += kh[kd] * delta;
+#pragma omp simd
+            for (int vd = 0; vd < VHD; vd++) delta[vd] = (vh[vd] - kvm[vd]) * beta;
+            for (int kd = 0; kd < KHD; kd++) {
+                const float k = kh[kd];
+                float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) srow[vd] += k * delta[vd];
             }
             float ss = 0;
             float* crow = CORE.data() + (size_t)m * VD + (size_t)hh * VHD;
-            for (int vd = 0; vd < VHD; vd++) {
-                float s = 0;
-                for (int kd = 0; kd < KHD; kd++) s += sh[kd * VHD + vd] * qh[kd];
-                crow[vd] = s * scale;
-                ss += crow[vd] * crow[vd];
+            for (int vd = 0; vd < VHD; vd++) crow[vd] = 0.0f;
+            for (int kd = 0; kd < KHD; kd++) {
+                const float q = qh[kd];
+                const float* srow = sh + (size_t)kd * VHD;
+#pragma omp simd
+                for (int vd = 0; vd < VHD; vd++) crow[vd] += srow[vd] * q;
             }
+            for (int vd = 0; vd < VHD; vd++) { crow[vd] *= scale; ss += crow[vd] * crow[vd]; }
             const float inv = 1.0f / sqrtf(ss / (float)VHD + sem_.eps);
             for (int vd = 0; vd < VHD; vd++) {
                 const float zz = z[(size_t)hh * VHD + vd];

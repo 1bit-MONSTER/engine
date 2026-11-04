@@ -158,6 +158,22 @@ public:
     }
 };
 
+// Every draft is the true token, but the head is confident only in the first: tau cuts the chain at nd=2, so BOTH
+// drafted tokens are accepted and the chain stops because the GATE stopped it, not because the base refused one.
+// That is the shape of a per-depth denominator the loop never drafted (see [9]).
+class PerfectGatedHead : public DraftHead {
+public:
+    int draft(const std::vector<float>& hidden, int, int /*pos*/, int k, std::vector<int>& out,
+              std::vector<float>* conf = nullptr) override {
+        if (conf) conf->assign((size_t)k, 0.1f);
+        const int have = (int)hidden[0];
+        out.clear();
+        for (int i = 0; i < k; i++) out.push_back(truth(have + i));
+        if (conf && !conf->empty()) (*conf)[0] = 1.0f;
+        return (int)out.size();
+    }
+};
+
 bool same(const std::vector<int>& a, const std::vector<int>& b) { return a == b; }
 
 // ---- the drafter's own stream (MtpDrafter's cursor) ------------------------------------------------------------
@@ -371,6 +387,86 @@ int main() {
             for (int i = 0; i < onebit::npu::mtp::Stats::kMaxDepth; i++) { d += r.stats.drafted_at[i]; a += r.stats.accepted_at[i]; }
             check(d == r.stats.drafted && a == r.stats.accepted, "stream: per-depth counters add up to the totals");
         }
+    }
+
+    // [9] the live-vs-offline depth verdict: a depth the loop never drafted is UNSCORED, not 0.00 %.
+    // Two defects are kept stated here.  (a) The old rule turned a missing denominator into 0.00 %, so two tables
+    // that both measured nothing compared equal to each other and counted as a pass (legacy_within).  (b) The
+    // denominator itself was `d ? accepted_at[d-1] : drafted_at[0]`, and under a tau gate that counts a chain that
+    // stopped right after ACCEPTING depth d-1 -- so a depth the loop never drafted was scored live 0 % against an
+    // offline rate that was measured, and inflated the bar's scored count.  The live side below is a REAL gated toy
+    // run, read through the same Stats fields both print sites read (accepted_at / reached_at), and the offline side
+    // is the same head on the same stream ungated -- the protocol always drafts every depth, which is why its
+    // denominator is positive where the gated loop's is zero.
+    {
+        auto legacy_within = [](int lh, int lr, int oh, int orr) {
+            const double lv = lr ? 100.0 * lh / lr : 0.0;
+            const double of = orr ? 100.0 * oh / orr : 0.0;
+            return (lv - of) <= 2.0 && (lv - of) >= -2.0;
+        };
+        check(legacy_within(0, 0, 0, 0), "verdict: the OLD rule calls an unscored depth a pass (the defect)");
+
+        ToyBase gated_base(8);
+        PerfectGatedHead gated;
+        Options gopt = base_opt;
+        gopt.k = 4;
+        gopt.tau = 0.6f;
+        const Result g = onebit::npu::mtp::run(gated_base, &gated, P, gopt);
+        ToyBase open_base(8);                 // the same chain with the gate off: every depth drafted (the protocol)
+        PerfectGatedHead open_head;
+        Options oopt = gopt;
+        oopt.tau = 0.0f;
+        const Result o = onebit::npu::mtp::run(open_base, &open_head, P, oopt);
+        const auto& gs = g.stats;
+        const auto& os = o.stats;
+        check(g.ok && o.ok && gs.iterations > 0, "verdict: the gated toy chain ran");
+        check(gs.accepted_at[1] > 0 && gs.drafted_at[2] == 0 && gs.reached_at[2] == 0,
+              "verdict: the gate stopped after accepting depth 2, so depth 3 was never drafted");
+        check(gs.reached_at[0] == gs.drafted_at[0] && gs.reached_at[1] == gs.accepted_at[0],
+              "verdict: a reached depth is a drafted depth once the prefix was accepted");
+
+        // Read the live side through the SAME construction both print sites use, not through hand-typed counts:
+        // if the report ever derives the denominator differently again, this stops matching the loop.
+        onebit::npu::mtp::LiveDepths live;
+        onebit::npu::mtp::add_live_depths(gs, live);
+        onebit::npu::mtp::LiveDepths open_live;
+        onebit::npu::mtp::add_live_depths(os, open_live);
+        check(live.hit[2] == gs.accepted_at[2] && live.reached[2] == gs.reached_at[2],
+              "verdict: the report's live counts are the loop's own accepted_at/reached_at");
+
+        int scored = 0, within = 0, legacy_scored = 0;
+        for (int d = 0; d < 4; d++) {
+            const auto v = onebit::npu::mtp::depth_verdict(live.hit[d], live.reached[d], open_live.hit[d],
+                                                          open_live.reached[d]);
+            if (v.scored) scored++;
+            if (v.scored && v.within) within++;
+            const int legacy_reached = d ? gs.accepted_at[d - 1] : gs.drafted_at[0];
+            if (onebit::npu::mtp::depth_verdict(gs.accepted_at[d], legacy_reached, os.accepted_at[d], os.drafted_at[d])
+                    .scored)
+                legacy_scored++;
+        }
+        check(scored == 2, "verdict: only the depths the gated loop drafted are scored");
+        check(legacy_scored == 3, "verdict: the OLD denominator scored the undrafted depth (the defect, stated)");
+        check(within == scored, "verdict: the gated chain agrees with the ungated one at the depths it reached");
+
+        check(!onebit::npu::mtp::depth_verdict(0, gs.reached_at[2], 5, 9).scored,
+              "verdict: live offered no draft at the depth -> n/a, whatever offline measured");
+        check(!onebit::npu::mtp::depth_verdict(0, 0, 0, 0).scored, "verdict: 0/0 is n/a, not a pass");
+        check(!onebit::npu::mtp::depth_verdict(0, 0, 5, 9).scored, "verdict: live reached nothing -> n/a");
+        check(!onebit::npu::mtp::depth_verdict(5, 9, 0, 0).scored, "verdict: offline scored nothing -> n/a");
+        const auto gap = onebit::npu::mtp::depth_verdict(40, 100, 60, 100);
+        check(gap.scored && !gap.within && gap.delta < -19.9 && gap.delta > -20.1,
+              "verdict: a real 20 pp gap still fails, by its own amount");
+        // The number that must not move: at tau=0 the new denominator IS the old one, so every published table
+        // (tau=0, 8 prompts x 64 tokens) reads exactly as it did before this change.
+        int differ = 0;
+        for (int d = 0; d < 4; d++)
+            if (os.reached_at[d] != (d ? os.accepted_at[d - 1] : os.drafted_at[0])) differ++;
+        check(differ == 0, "verdict: at tau=0 the denominator equals accepted_at[d-1] at every depth (no number moves)");
+        std::printf("INFO verdict gated chain: drafted %d/%d/%d/%d accepted %d/%d/%d/%d, %d of 4 depths scored (old"
+                    " denominator: %d)\n",
+                    gs.drafted_at[0], gs.drafted_at[1], gs.drafted_at[2], gs.drafted_at[3], gs.accepted_at[0],
+                    gs.accepted_at[1], gs.accepted_at[2], gs.accepted_at[3], scored, legacy_scored);
     }
 
     std::printf(fails ? "\n%d CHECK(S) FAILED\n" : "\nall checks passed\n", fails);

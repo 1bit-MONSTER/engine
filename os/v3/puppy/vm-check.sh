@@ -683,16 +683,19 @@ rows = [
     ("U4 hrx path",   "ls -l /opt/1bit-llama/llama-server 2>&1 | tail -1; "
                       "/opt/1bit-llama/llama-server --version 2>&1 | head -2", None),
     ("U4 npu sets",   "ls /opt/1bit-package/1bit/npu/kernels", None),
-    # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU deterministically - 400 and 480
-    # max_tokens clean, 600 -> `code 614 / state 8` and a TDR power-cycle - and the fix is the hang detector's
-    # timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row loads the module and reads what
-    # the kernel actually took, which is the only form the board row also accepts. The module loads without NPU
-    # hardware, so the value is readable in the VM even though nothing can be dispatched here.
-    ("U5 npu tdr",    "modprobe amdxdna 2>&1 | head -2; "
-                     "grep -h 'tdr_timeout' /etc/modprobe.d/*.conf 2>&1; "
-                     "v=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null); "
-                     "echo tdr-loaded=${v:-none}; modinfo -F filename amdxdna 2>&1",
-                     "tdr-loaded=15000"),
+    # Cycle 23 (c22 board, 4 Nov): a chat that crosses ~512 positions wedged the NPU, and the fix is the hang
+    # detector's timeout in /etc/modprobe.d/amdxdna.conf. The build asserts the FILE; this row asserts kmod's own
+    # resolved view of it (`modprobe -c`), which is what the kernel will apply.
+    # It does NOT assert the loaded value, and that is measured, not convenience: in this harness `modprobe amdxdna`
+    # is refused `Key was rejected by service`, because sb-vars.sh enrolls ONE certificate in db (the one that signs
+    # the kernel, /var/lib/shim-signed/mok/MOK-Kernel.pem, SKI 27:68:3E:38:…) while the modules are signed by a
+    # DIFFERENT certificate with the same CN (sig_key 35:5C:A4:8A:…). The board trusts it - it loads this module - so
+    # the runtime reading belongs there: /sys/module/amdxdna/parameters/tdr_timeout_ms must be 15000 on the board.
+    ("U5 npu tdr",    "o=$(modprobe -c 2>/dev/null | grep -c 'amdxdna.*tdr_timeout_ms=15000'); "
+                      "c=$(grep -h 'tdr_timeout_ms=15000' /etc/modprobe.d/*.conf 2>/dev/null | grep -c amdxdna); "
+                      "echo kmod-view=$o conf-file=$c; modprobe amdxdna 2>&1 | head -1; "
+                      "echo runtime=$(cat /sys/module/amdxdna/parameters/tdr_timeout_ms 2>/dev/null || echo not-loaded); "
+                      "[ \"$o\" -ge 1 ] && echo tdr-config-15000", "tdr-config-15000"),
     # U3 says "reachable on the LAN", so whether the appliance has an address at all is a row, not a
     # footnote: the cycle-2 image booted with no /data and answered nothing on the forwarded port, and
     # these two lines say whether that was the listener or the interface.

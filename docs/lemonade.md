@@ -120,7 +120,7 @@ What "fully embedded" still needs, measured on Strix Halo. The runs use the pinn
 
 | device | 2026-09-25, start | now |
 |---|---|---|
-| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; 2026-10-31, through the shipped `lemonade-onebit-rc-2026-10-31c` package: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0) |
+| HRX | 19 / 31 | **29 / 29 run, all pass** (2 skipped; 2026-11-04, through `lemonade-onebit-rc-2026-11-03-c22`, the package the board boots: `test/server_llm.py --wrapped-server onebit --backend hrx`, exit status 0, 104 s, every backend on `HRX0`) |
 | NPU | 3 / 31 | in progress ([npu.md](npu.md)); the suite's small test models are GGUF |
 | Vulkan (removed in RFC #213 stage 3) | 19 / 31 | 29 / 29 run, all pass, before its removal |
 
@@ -185,7 +185,12 @@ warns when it happens. Measured on Strix Halo with the trio unset in the shell:
 `lemonade-onebit-rc-2026-10-31c` (engine from before #794/#813) prints `0` and its serve log
 still says "CWSR is off; save-area placement unchanged"; `lemonade-onebit-rc-2026-11-01b`
 (save area placed in GTT by default) also prints `0`, because serve exported the trio into its
-own environment before building the plan — that is the bug #816 removes.
+own environment before building the plan, and the plan's env filter keeps only names the
+caller did not already have — that is the bug #816 removes. **`lemonade-onebit-rc-2026-11-03-c22`
+(any package built after #816) prints `1`**, and `--print-backend`'s `env` carries the trio as
+well, so the one-hop llama-server is started with all three while the caller exports none
+(checked in its `/proc/<pid>/environ`), and the filter still leaves out a name the caller did
+set (`GGML_HRX_STRICT=0` in the shell removes that line from the printed env).
 
 To install:
 

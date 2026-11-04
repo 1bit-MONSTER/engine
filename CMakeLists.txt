@@ -227,6 +227,18 @@ add_dependencies(npu_sampling_test mtp_draft_test)
 add_executable(npu_device_lock_test tests/npu_device_lock_test.cpp)
 target_include_directories(npu_device_lock_test PRIVATE app)
 add_test(NAME npu_device_lock COMMAND npu_device_lock_test)
+# The snapshot's two kinds of plane (npu/forward/include/q4nx_state_planes.h): the KV cut to the positions being
+# snapshotted, and the GDN conv window and recurrent state carried whole, since those are one fixed block per layer
+# that every position updates rather than appends to. Header only, no device, runs in CI. Regression it pins: the
+# whole planes used to be cut with the per-position count, so restore_state refused every snapshot the prefix cache
+# offered (`slot has no usable state`) and every shared-prefix request re-prefilled the prompt from 0.
+add_executable(q4nx_state_planes_test tests/q4nx_state_planes_test.cpp)
+target_include_directories(q4nx_state_planes_test PRIVATE npu/forward/include app)
+add_test(NAME q4nx_state_planes COMMAND q4nx_state_planes_test)
+# ci.yml's build step lists every ctest target explicitly and this branch cannot edit that file (the push token has
+# no `workflow` scope), so as with mtp_draft_test the binary is pulled in as a dependency of a listed target.
+add_dependencies(npu_sampling_test q4nx_state_planes_test)
+
 # general.architecture from a GGUF header (app/gguf_meta.h), which routes fork-only
 # architectures to our llama.cpp; header only, runs in CI.
 add_executable(gguf_meta_test tests/gguf_meta_test.cpp)

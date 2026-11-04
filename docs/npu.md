@@ -773,6 +773,35 @@ or `=1` forces it either way, and the resolved state is logged once as
 interleaved 5-round A/B (`~/lb/587-cache-20261030`) measured an 8-token request at 104.5 s against
 117.4 s (**−11%**), CPU per token 22.9 s against 63.3 s (**−64%**), same text in every arm.
 
+### The prefix cache's snapshot: two kinds of plane
+
+`snapshot_state`/`restore_state` (`npu/forward/include/q4nx_forward.h`) hand a prefill's state to the next
+request that shares its prompt (`app/npu_prefix_cache.h`, issue #650). A snapshot is not just the KV: a GDN layer
+also carries a conv window and a recurrent state, and the two kinds of plane are cut differently.
+
+- **Per position** (`kcache_`, `vcache_`): a layer holds `[NKV][HD]` floats for every position it has seen, so a
+  snapshot of the first `tokens` positions keeps exactly `tokens * NKV * HD` floats of each.
+- **Whole** (`conv_state_`, `rec_state_`): the conv window and the recurrent state are one fixed block per layer
+  that each position *updates*, not appends to, so they are carried and restored whole at any prompt length.
+
+Both live in `npu/forward/include/q4nx_state_planes.h`, header-only and unit-tested without a device
+(`tests/q4nx_state_planes_test.cpp`, ctest `q4nx_state_planes`). Cutting the whole planes with the per-position
+count was the shipped behaviour until 2026-11-04, and it cost the cache every request: on a GDN model the conv
+plane (30,720 floats for Bonsai-2-27B) can never cover `tokens * 1024`, so `restore_state` refused every snapshot
+of a prompt longer than 30 tokens and the serve logged `[prefix] slot=-1 cached=0 … reason=slot has no usable
+state` and re-prefilled from 0 — 5 of 5 long requests measured, and a repeat of an 849-token prompt paid its full
+prefill twice. Shorter prompts had the mirror-image problem: below 768 tokens the 786,432-float recurrent plane
+was silently truncated (23 % of it kept at 180 tokens). A truncated plane is now *refused* rather than installed
+short, so the fallback is a full prefill instead of a wrong state.
+
+The whole planes also fix where the snapshot may be *taken*: they are updated in place, so there is no "restore
+these positions of that state". `forward-serve` therefore saves a prompt's state one token short of the prompt —
+splitting the final prefill chunk, one extra launch — and the resume point is `cached - 1`, running the last token
+again to get the logits the answer is drawn from. Restoring `cached - 1` positions out of a snapshot taken at
+`cached` is what the KV alone would allow, and it applies the last token's GDN update twice: measured on the first
+version of this fix, the cache hit (`[prefix] slot=0 cached=179 of 180 reason=hit`, TTFT 5.3 s against 15.6 s) and
+answered the same prompt with different, fragmented text.
+
 ### Sampling and structured output
 
 `1bit serve -m <NPU model dir> --device npu` serves through `1bit forward-serve`

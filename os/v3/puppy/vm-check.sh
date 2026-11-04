@@ -623,6 +623,18 @@ rows = [
     ("U6 installer", "ls -l /usr/local/bin/1bit-install | tail -1; "
                      "ls /bin/1bit-install; sfdisk --version 2>&1 | head -1; "
                      "command -v efibootmgr mkfs.vfat mkfs.ext4; echo installer-present", "installer-present"),
+    # Cycle 21 (owner: "the stick moves to Linux 7.4-rc1"). What this row can say is what the ARTIFACT carries: its
+    # kernel release and its BTF. BTF is a 7.4 fact worth a row because the 7.4 board boot showed it working
+    # (systemd attaches bpf-restrict-fs instead of logging "Failed to load BPF object").
+    ("U4 kernel",   "uname -r; ls -l /sys/kernel/btf/vmlinux 2>&1 | awk '{print $5\" bytes\"}'; echo btf-present",
+                     "7.4.0-rc1-1bit"),
+    # OUR driver, never the in-tree one (owner word). The kernel ships an in-tree amdxdna as well, so presence proves
+    # nothing: the assertion is the RESOLVED PATH - depmod gives updates/ priority, and a renamed or dropped module
+    # would silently load the in-tree driver. vermagic is the other half: a module built for another kernel is refused
+    # at load time on the board, with nothing here saying so. Measured on the 7.4 artifact: srcversion
+    # EBC78CDA6FD7F3F6E824064, signer strixhalo Secure Boot Kernel.
+    ("U4 our driver", "modinfo -n amdxdna; modinfo -F srcversion amdxdna; modinfo -F signer amdxdna; "
+                      "modinfo -F vermagic amdxdna | cut -d' ' -f1; modinfo -n ec_su_axb35", "/updates/amdxdna.ko"),
     ("U3 log",       "tail -3 /var/log/lemond-onebit.log 2>&1", None),
     # BEFORE any in-VM fix runs: on an image that carries the fixes these two say so (root, and 1), on an
     # older image they say what is missing. The fix rows below then repair it so the login can still be

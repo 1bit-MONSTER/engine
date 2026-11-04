@@ -178,12 +178,14 @@
   }
   sel.addEventListener("change", function () { model = sel.value; show(); q.focus(); });
 
-  // engine#924: a request that cannot have the NPU (the device is one cache, one generation at a time) is
-  // REFUSED with a status, never parked silently: 503 + Retry-After + {"error":{"type":"device_busy"}} when the
-  // engine refuses before it starts answering, and - for a streaming request, which is what this page sends - one
-  // `data: {"error":...}` frame followed by `data: [DONE]`, because a stream that ends without [DONE] is what
-  // Lemonade reports as a hung backend (the c17 board's "0 chunks in 5.9 s"). Both shapes mean the same thing and
-  // both are retried here, up to RETRIES times, saying so on the status line while it waits.
+  // engine#924 / #1024: a request that cannot have the NPU (the device is one cache, one generation at a time)
+  // QUEUES now, and this page streams - so the engine keeps the stream alive with an empty delta once a second
+  // while it waits (a queued reply is no longer parked silently, which is what the c17 board's "0 chunks in 5.9 s"
+  // was). The refusal shapes are still handled because they are the two ways a chat can still lose the device: a
+  // non-streamed request (not this page) waits at most --queue-ms-plain and then gets 503 + Retry-After +
+  // {"error":{"type":"device_busy"}}; any request whose wait passes --queue-ms gets one `data: {"error":...}` frame
+  // followed by `data: [DONE]`, because a stream that ends without [DONE] is what Lemonade reports as a hung
+  // backend. Both shapes are retried here, up to RETRIES times, saying so on the status line while it waits.
   var RETRIES = 3;
   function isBusy(json) {
     var e = (json && json.error) || json || {};

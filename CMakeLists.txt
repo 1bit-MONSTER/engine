@@ -595,6 +595,15 @@ add_test(NAME npu_chatml COMMAND npu_chatml_test ${CMAKE_SOURCE_DIR}/tests/data/
 # target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
 add_dependencies(npu_sampling_test npu_chatml_test)
 
+# `1bit unified`'s wait for the single NPU (app/npu_queue.h, engine#1024): bounded, and a queued request says so
+# instead of leaving a stream silent past the proxy's no-data timer. Device-free.
+add_executable(npu_queue_test tests/npu_queue_test.cpp)
+target_include_directories(npu_queue_test PRIVATE ${CMAKE_SOURCE_DIR}/app)
+add_test(NAME npu_queue COMMAND npu_queue_test)
+# Same reason as the other device-free tests: ci.yml builds a named list of targets, so a test whose
+# target is not built reports "Not Run" (#635). This lane's token cannot edit the workflow.
+add_dependencies(npu_sampling_test npu_queue_test)
+
 # `forward-serve`'s /v1/completions prompt as text or as the caller's exact token ids (app/npu_prompt_ids.h):
 # the acceptance rules and the refusals that keep an out-of-vocabulary id from reaching the embedding
 # lookup.  Device-free, model-free.

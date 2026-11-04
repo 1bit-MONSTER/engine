@@ -169,10 +169,12 @@ same shape.
 
 A call costs the same at 1 row and at 32 — q_proj is 1.501 ms against 1.566 ms, i.e. 32× the work for 4 % more
 time — so it is **dispatch-bound**: a decode step pays one launch per projection (196 of them on Qwen3-0.6B) and
-at one row that launch costs 8–10× the host loop it replaces. This is therefore a **prefill** leg: every
-measured shape is faster from **12** rows up and 3.1–3.4× ahead at a full 32-row design (the 45-cell sweep puts
-the worst shape at 0.86× of the host loop at 12 rows), and the threshold is 16 so that nothing sits near the
-crossover on a box whose timing moves 1.2–1.3× between runs. Design M is not the lever — an M=128
+at one row that launch costs 8–10× the host loop it replaces. This is therefore a **prefill** leg: at a full
+32-row design the five projection shapes are 2.9–3.6× ahead of the host loop and at 16 rows 1.4–1.7×, while
+**12 rows is break-even rather than a win** — k/v measures 0.98–1.06× there and the other four 1.13–1.22× (the
+45-cell sweep behind this table put its worst shape at 0.86× of the host loop *time*, i.e. 1.16×, which is the
+same statement inside that sweep's own spread). The threshold is 16 so that nothing sits near that crossover on
+a box whose timing moves 1.2–1.3× between runs. Design M is not the lever — an M=128
 design at one row measured 1.233 ms against M=32's 1.499 ms on 2048×1024 in this run and 1.606 vs 1.441 in an
 earlier one, i.e. the two are within run-to-run variance at decode width and neither changes the picture. The
 host column is a **lower bound**: it is the accumulation loop only, while the EP's real fallback then runs
@@ -185,10 +187,25 @@ smaller design.
 divided by `repeats`. The figures above are the corrected ones, and `repeats < 2` — which used to print
 `device 0.000 ms/call` and a four-digit speedup — is now refused with exit 2.)*
 
+**Re-measured on a second boot** (`main` `9eb991f`, the five M=32 designs, three rounds of 30 timed calls per
+cell, `~/wt/qdq-quiet-timing.sh` + `~/wt/qdq-quiet-medians.py`): the table above reproduces — one row
+**8.5–10.9× slower** (table: 8.3–10.4×), 16 rows **1.40–1.65× faster** across the five shapes (the table's
+single q figure there is 1.7×), 32 rows **2.86–3.63×** (3.1–3.4×), and the device column stays flat between 1
+and 32 rows (q: 1.693 ms at one row against 1.724 ms at 32). The box was
+not quiet — load 5.2 at round 1 rising to 13.8 at round 3, another lane's `ort_run` at 382 % CPU — and *both*
+columns move with it (round 3 is 1.3–2.2× slower on the device as well as on the host), so the 1-, 12- and
+16-row cells are quoted from rounds 1–2 only. A second estimator agrees with the first: taking each cell's **minimum**
+over all three rounds (the least-contended sample) gives k/v 1.06× at 12 rows, the other four 1.13–1.19×, 16 rows
+1.49–1.63× and 32 rows 3.00–3.17×, so the boundary sentence changed above is not an artefact of which average was
+picked. Every one of those 75 probe runs also asserts the device's exact
+int32 accumulators equal the host loop's, so it is a correctness re-check of `gemm_q8_raw` on five shapes at
+four row counts as well as a timing one. A genuinely quiet-box table is still owed: this box has not been quiet
+for any of the three attempts so far.
+
 **What `gemm_q8` does with that number.** It routes by rows: below `kDeviceMinRows` — 16, declared once in
 `onnx/ep/onebit_ep_kernel.h` — the host loop runs the multiply and the call never reaches the array; at or above
-it the device does. 12 is the first row count at which **no** measured projection shape was slower on the
-array; 16 is the first that keeps more margin than the box's own run-to-run spread, so the threshold is one
+it the device does. 12 rows is where the five projection shapes reach **break-even to 1.2×**, and 16 is the
+first count that keeps more margin than the box's own run-to-run spread, so the threshold is one
 constant rather than one per (K, N). A host-routed call is a choice, not a
 failure, and it does not look like one: it writes
 `npu_qdq_host_rows m=… k=… n=… min=16` to the trace. "The device ran this shape" therefore stays exactly
